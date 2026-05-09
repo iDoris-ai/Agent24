@@ -19,7 +19,7 @@
 
 ---
 
-## 架构
+## 架构（M2 — Backend Daemon）
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -27,94 +27,72 @@
 │                                                                 │
 │  Main Process (Node.js)              Renderer (React)          │
 │  ┌─────────────────────────────┐    ┌────────────────────────┐  │
-│  │  kernel.ts                  │IPC │  模块管理面板            │  │
-│  │  @auraaihq/core ────────────┼────┤  对话 / 任务状态         │  │
-│  │  @auraaihq/memory           │    │  设置                   │  │
-│  │  @auraaihq/ai-bridge        │    └────────────────────────┘  │
-│  │                             │                                 │
-│  │  动态加载能力模块：           │                                 │
-│  │  @auraaihq/publish-blog     │                                 │
-│  │  @auraaihq/publish-*        │                                 │
-│  │  @auraaihq/scrape-*         │                                 │
-│  │  @auraaihq/module-*         │                                 │
+│  │  BackendManager             │IPC │  Chat  / Workbench     │  │
+│  │   └─ fork() backend daemon  │────┤  Models / Settings     │  │
+│  │  registerIpcHandlers()      │    │  backendProxy()        │  │
+│  │   └─ BackendProxy IPC       │    └────────────────────────┘  │
 │  └─────────────────────────────┘                                 │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │  file: (开发) / npm registry (生产)
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│       AuraAIHQ/auraai-packages（SDK + 能力包 monorepo）            │
-│                                                                 │
-│  packages/   ← 内核（框架直接依赖，紧耦合）                         │
-│  ├── @auraaihq/core        模块加载 / 生命周期 / 依赖排序           │
-│  ├── @auraaihq/sdk         模块开发 API（defineModule 等）         │
-│  ├── @auraaihq/memory      L0 KV 存储（SQLite，命名空间隔离）       │
-│  ├── @auraaihq/ai-bridge   AI 路由（多适配器 + fallback）          │
-│  └── @auraaihq/cli         命令行工具                             │
-│                                                                 │
-│  publishers/ scrapers/ community/ idoris/  ← 可插拔能力模块       │
+│                    │ child_process.fork                          │
+│                    ▼                                             │
+│  ┌─────────────────────────────┐                                 │
+│  │  Backend Daemon :8765       │                                 │
+│  │  ├─ /health                 │                                 │
+│  │  ├─ /api/llm/chat           │                                 │
+│  │  ├─ /api/llm/usage          │                                 │
+│  │  └─ CapabilityModule routes │                                 │
+│  │                             │                                 │
+│  │  LLM Gateway                │                                 │
+│  │   ├─ oMLX  :8000 (default)  │                                 │
+│  │   ├─ Ollama :11434          │                                 │
+│  │   ├─ LM Studio              │                                 │
+│  │   └─ Remote OpenAI-compat.  │                                 │
+│  └─────────────────────────────┘                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+> **M1 → M3 演进**：M1 用 `@auraaihq/core` 内核（见 PR #3）；M2 用独立 Node.js daemon + LLM Gateway；M3 将迁移到 Python FastAPI（原生 MLX 绑定）。
+
 ### 核心组件
 
-| 组件 | 包 / 路径 | 职责 |
-|------|----------|------|
-| **内核** | `@auraaihq/core` | 模块注册、load/unload/invoke、生命周期状态机、依赖图排序 |
-| **模块 SDK** | `@auraaihq/sdk` | `defineModule`、`ModuleManifest`、`MemoryHandle`、`AIHandle` |
-| **记忆层** | `@auraaihq/memory` | SQLite KV、命名空间隔离、`get/set/has/list/namespace` |
-| **AI 路由** | `@auraaihq/ai-bridge` | 多适配器统一接口、优先级 fallback、并发信号量 |
-| **Electron 壳** | `src/main/kernel.ts` | 内核单例、SQLite 路径（userData）、Electron 生命周期绑定 |
-| **IPC 桥** | `src/main/ipc/` | `KernelListModules` / `KernelLoadModule` / `KernelInvoke` |
-| **参考模块** | `@auraaihq/publish-blog` | 第一个能力模块，也是模块开发的参考实现 |
+| 组件 | 路径 | 职责 |
+|------|------|------|
+| **BackendManager** | `src/main/backend-manager.ts` | fork/health-check/auto-restart backend daemon |
+| **Backend Daemon** | `src/backend/server.ts` | Node.js http 服务，聚合路由，不依赖 Electron |
+| **LLM Gateway** | `src/backend/llm-gateway.ts` | 统一 LLM 调用、token 统计、运行时切换 |
+| **CapabilityModule** | `src/backend/capabilities/` | 可插拔能力模块接口 `register(router, ctx)` |
+| **IPC 桥** | `src/main/ipc/index.ts` | `BackendProxy` IPC 转发 + 参数校验 |
+| **Preload** | `src/main/preload.ts` | `backendProxy()` 暴露给 Renderer |
 
-### 能力模块生命周期
+### 能力模块开发
 
-```
-开发者用 @auraaihq/sdk 的 defineModule() 实现模块
-       ↓
-kernel.load(moduleId)  →  验证 manifest → module.load(context)
-       ↓
-context 注入：
-  context.memory  = @auraaihq/memory  （SQLite KV，按模块 id 自动隔离）
-  context.ai      = @auraaihq/ai-bridge（多模型统一调用）
-  context.invoke  = 调用其他模块的跨模块入口
-       ↓
-kernel.invoke(moduleId, { kind, payload })  →  module.invoke(intent)
-       ↓
-kernel.unload(moduleId)  →  module.unload() → 释放资源
+```ts
+// 实现 CapabilityModule 接口
+export const myModule: CapabilityModule = {
+  id: 'my-capability',
+  register(router, ctx) {
+    router.get('/api/capabilities/my-capability', (req, res) => {
+      // ctx.llm 可调用 LLM Gateway
+      res.end(JSON.stringify({ ok: true }))
+    })
+  },
+}
 ```
 
-### AI Layer
+### LLM 运行时（可在设置页切换）
 
-```
-AILayer（@auraaihq/ai-bridge）
-├── iDoris    主 AI — 个人全景洞察，本地运行
-├── Claude    云端 fallback
-├── OpenAI    云端 fallback
-└── Local     LLaVA / Qwen2-VL — 离线视觉
-```
-
-业务层只调用 `ai.complete(prompt)`，AI Layer 按策略路由（隐私敏感 → iDoris；复杂推理 → Claude）。
-
-### Memory Layer
-
-| 层 | 内容 | 存储 |
-|----|------|------|
-| L0 | 会话上下文 + 工作记忆 | SQLite KV（`@auraaihq/memory`） |
-| L1 | 重要事实 | SQLite 全文索引 |
-| L2 | 主题相关记忆（按需加载） | SQLite |
-| L3 | ATIF 轨迹归档（DGM-style） | YAML 多文档 |
-| **Skill** | **从 archive 蒸馏的可执行 skill** | **SKILL.md + index** |
-
-跨设备同步通过 Nostr relay（NIP-44 加密）。
+| 运行时 | 端点 | 说明 |
+|--------|------|------|
+| **oMLX**（默认） | `localhost:8000/v1` | Apple Silicon 原生，最低延迟 |
+| Ollama | `localhost:11434` | 跨平台，模型丰富 |
+| LM Studio | `localhost:1234/v1` | 图形界面管理 |
+| Remote API | 自定义 | OpenAI 兼容接口 |
 
 ---
 
 ## 文档
 
-- [产品计划与架构](docs/PLAN.md) — 完整设计、模块化架构、SkillClaw 借鉴、自进化路线
-- [Roadmap M1-M5](docs/ROADMAP.md) — 里程碑与交付物
-- [决策日志](docs/decision.md) — ADR-001 ~ ADR-018
+- [工作站规划](docs/WORKSTATION_PLAN.md) — oMLX API 调研、64GB Mac 模型清单、能力 TODO
+- [决策日志](docs/decision.md) — ADR-001 ~ ADR-025
 
 ## 参考实现
 
