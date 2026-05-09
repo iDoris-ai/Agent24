@@ -105,9 +105,9 @@ export function App(): JSX.Element {
           <button
             className="theme-toggle-btn"
             onClick={() => setDarkMode(d => !d)}
-            title={darkMode ? '切换白天模式' : '切换暗色模式'}
+            title={darkMode ? '切换白天模式' : '切换夜间模式'}
           >
-            {darkMode ? '☀️' : '🌙'}
+            {darkMode ? '🌙' : '☀️'}
           </button>
         </div>
 

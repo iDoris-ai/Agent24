@@ -30,7 +30,7 @@ a { color: var(--accent); text-decoration: none; }
 button { cursor: pointer; font-family: var(--font); }
 
 /* ── Layout ── */
-.app { display: flex; height: 100vh; }
+.app { display: flex; height: 100vh; background: var(--bg); color: var(--text); }
 
 /* ── Sidebar ── */
 .sidebar {
@@ -64,26 +64,26 @@ button { cursor: pointer; font-family: var(--font); }
 /* Collapse button inside sidebar */
 .sidebar-collapse-btn {
   width: 26px; height: 26px; border-radius: 6px; background: transparent;
-  border: 1px solid var(--border); color: var(--muted); font-size: 13px;
+  border: 1px solid var(--accent); color: var(--accent); font-size: 14px;
   display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   cursor: pointer; margin-top: 2px;
-  transition: color 0.12s, background 0.12s;
+  transition: background 0.12s;
   -webkit-app-region: no-drag;
 }
-.sidebar-collapse-btn:hover { color: var(--text); background: var(--surface2); }
+.sidebar-collapse-btn:hover { background: var(--accent-dim); }
 
 /* Floating expand button when sidebar is hidden */
 .sidebar-expand-btn {
   position: fixed; left: 0; top: 50%; transform: translateY(-50%);
-  width: 20px; height: 40px; background: var(--surface);
-  border: 1px solid var(--border); border-left: none;
-  border-radius: 0 8px 8px 0; color: var(--muted); font-size: 12px;
+  width: 20px; height: 44px; background: var(--accent);
+  border: none; border-radius: 0 8px 8px 0;
+  color: #000; font-size: 13px; font-weight: 700;
   display: flex; align-items: center; justify-content: center;
   cursor: pointer; z-index: 200;
-  transition: color 0.12s, background 0.12s;
+  transition: opacity 0.12s;
   -webkit-app-region: no-drag;
 }
-.sidebar-expand-btn:hover { color: var(--text); background: var(--surface2); }
+.sidebar-expand-btn:hover { opacity: 0.85; }
 .sidebar-nav { flex: 1; padding: 4px 0; }
 .nav-item {
   display: flex;
