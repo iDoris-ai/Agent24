@@ -133,6 +133,8 @@ button { cursor: pointer; font-family: var(--font); }
   flex-shrink: 0;
   -webkit-app-region: drag;
 }
+/* macOS traffic lights occupy ~76px from left when sidebar is hidden */
+.sidebar-hidden .topbar { padding-left: 80px; }
 .topbar button, .topbar a, .topbar input { -webkit-app-region: no-drag; }
 .topbar-title { font-size: 14px; font-weight: 600; flex: 1; }
 .topbar-sub { font-size: 12px; color: var(--muted); }

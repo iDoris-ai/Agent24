@@ -96,7 +96,7 @@ export function App(): JSX.Element {
       </aside>
 
       {/* ── Main ── */}
-      <div className="main">
+      <div className={`main${sidebarOpen ? '' : ' sidebar-hidden'}`}>
         <div className="topbar">
           <span className="topbar-title">{PAGE_TITLES[page]}</span>
           {page === 'chat' && (
