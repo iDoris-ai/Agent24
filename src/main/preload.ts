@@ -3,13 +3,17 @@
 // contextBridge. Capability modules will extend this surface in M1+.
 
 import { contextBridge, ipcRenderer } from 'electron'
-import { IpcChannels, type BackendProxyRequest } from '../shared/ipc-types'
+import {
+  IpcChannels,
+  type BackendProxyRequest,
+  type BackendProxyResponse,
+} from '../shared/ipc-types'
 
 const api = {
   ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
   getAppVersion: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppVersion),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
-  backendProxy: (req: BackendProxyRequest): Promise<unknown> =>
+  backendProxy: (req: BackendProxyRequest): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.BackendProxy, req),
 } as const
 

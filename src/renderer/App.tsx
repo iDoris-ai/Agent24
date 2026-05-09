@@ -29,13 +29,15 @@ export function App(): JSX.Element {
   const [page, setPage] = useState<Page>('chat')
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
   const [version, setVersion] = useState<string>('')
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [darkMode, setDarkMode] = useState(true)
 
   useEffect(() => {
     void window.agent24.getAppVersion().then(setVersion)
 
     const check = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/health' })
-        .then(() => setBackendOk(true))
+        .then((res) => setBackendOk(res.ok))
         .catch(() => setBackendOk(false))
     }
     check()
@@ -44,12 +46,20 @@ export function App(): JSX.Element {
   }, [])
 
   return (
-    <div className="app">
+    <div className={`app${darkMode ? '' : ' light'}`}>
+      {/* Floating expand button shown only when sidebar is collapsed */}
+      {!sidebarOpen && (
+        <button className="sidebar-expand-btn" onClick={() => setSidebarOpen(true)}>›</button>
+      )}
+
       {/* ── Sidebar ── */}
-      <aside className="sidebar">
+      <aside className={`sidebar${sidebarOpen ? '' : ' collapsed'}`}>
         <div className="sidebar-logo">
-          Agent24
-          <span>v{version || '…'}</span>
+          <div className="sidebar-logo-text">
+            Agent24
+            <span>v{version || '…'}</span>
+          </div>
+          <button className="sidebar-collapse-btn" onClick={() => setSidebarOpen(false)}>‹</button>
         </div>
 
         <nav className="sidebar-nav">
@@ -92,6 +102,13 @@ export function App(): JSX.Element {
           {page === 'chat' && (
             <span className="topbar-sub">Qwen3-30B-A3B · oMLX</span>
           )}
+          <button
+            className="theme-toggle-btn"
+            onClick={() => setDarkMode(d => !d)}
+            title={darkMode ? '切换白天模式' : '切换暗色模式'}
+          >
+            {darkMode ? '☀️' : '🌙'}
+          </button>
         </div>
 
         {page === 'chat'      && <ChatPage />}

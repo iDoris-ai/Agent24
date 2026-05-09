@@ -1,11 +1,13 @@
-// Agent24-Desktop main process entry — M1 scaffolding.
+// Agent24-Desktop main process entry — M2: integrates BackendManager daemon.
 // Capability modules will register IPC handlers via the loader (M1 next tasks).
 
 import { app, BrowserWindow, session } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
+import { BackendManager } from './backend-manager'
 
 const isDev = process.env.NODE_ENV === 'development'
+const backendManager = new BackendManager()
 
 function createMainWindow(): BrowserWindow {
   const win = new BrowserWindow({
@@ -17,7 +19,9 @@ function createMainWindow(): BrowserWindow {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true,
+      // sandbox disabled: preload uses require('../shared/ipc-types') which
+      // Electron's sandboxed require blocks. Re-enable after bundling preload.
+      sandbox: false,
     },
   })
 
@@ -41,6 +45,7 @@ process.on('unhandledRejection', (reason) => {
 })
 
 app.whenReady().then(() => {
+  backendManager.start()
   // Enforce a strict Content-Security-Policy. 'unsafe-inline' on style-src
   // is required for React's inline styles; remove if switching to CSS modules.
   // M2 will tighten this further (no 'unsafe-inline' on style-src) once the
@@ -51,10 +56,10 @@ app.whenReady().then(() => {
         ...details.responseHeaders,
         'Content-Security-Policy': [
           "default-src 'self'; " +
-          "script-src 'self'; " +
+          "script-src 'self'" + (isDev ? " 'unsafe-inline' 'unsafe-eval' http://localhost:5173" : "") + "; " +
           "style-src 'self' 'unsafe-inline'; " +
           "img-src 'self' data:; " +
-          "connect-src 'self'" + (isDev ? " ws://localhost:5173" : "") + "; " +
+          "connect-src 'self'" + (isDev ? " http://localhost:5173 ws://localhost:5173 http://localhost:8765" : "") + "; " +
           "font-src 'self'",
         ],
       },
@@ -69,6 +74,10 @@ app.whenReady().then(() => {
       createMainWindow()
     }
   })
+})
+
+app.on('will-quit', () => {
+  backendManager.stop()
 })
 
 app.on('window-all-closed', () => {

@@ -15,7 +15,7 @@
     "types": ["node"],
     "noEmitOnError": true
   },
-  "include": ["src/main/**/*", "src/shared/**/*"],
+  "include": ["src/main/**/*", "src/shared/**/*", "src/backend/**/*"],
   "exclude": [
     "node_modules",
     "dist",
