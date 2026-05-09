@@ -683,6 +683,147 @@ Deprecated（archive 只读，README 引导到新位置）:
 
 ---
 
+## ADR-019：LLM Gateway 模式（能力模块不直接调用 LLM API）
+
+**日期**：2026-05-09
+**状态**：✅ 采纳
+
+### 背景
+
+M2 开始引入能力模块，每个模块都需要调用 LLM。备选方案：
+- A. 每个模块直接调用 LLM API（Ollama/OpenAI/Claude）
+- B. 统一 LLM Gateway，模块只调 `llm.chat()` 接口
+
+### 论证
+
+**直接调用（A）的问题**：
+- Token 用量分散，无法统计哪个模块消耗了多少资源
+- 每个模块各自实现错误处理、重试、超时，代码重复
+- 切换底层模型需要改所有模块
+- 无法在不改模块的前提下增加配额限制、响应缓存、审计日志
+- 模块作者需要知道 Ollama API 细节，耦合底层
+
+**Gateway 模式（B）的优势**：
+- 统一统计：按模块维度追踪 token 消耗，M3 可持久化到 SQLite
+- 可替换性：底层从 Ollama 切换到 OpenAI 兼容接口只改 Gateway，模块零感知
+- 权限控制：Gateway 可为不同模块设置不同配额（防止单个模块耗尽资源）
+- 缓存：相同 prompt 命中缓存，减少 Ollama 调用延迟（M3 实现）
+- 审计日志：所有 LLM 调用统一记录，满足 ADR-017 隐私追踪需求
+- 能力模块接口稳定：`llm.chat(req)` 签名不变，底层实现可独立演进
+
+### 决策
+
+**B**。所有能力模块只知道 `CapabilityContext.llm.chat()` 接口，不直接依赖 Ollama / OpenAI / Claude SDK。LLM Gateway 作为 `src/backend/llm-gateway.ts` 实现，M2 底层对接 Ollama，M3 扩展为可配置（通过 `LLM_BACKEND` 环境变量选择 Ollama / OpenAI 兼容 / Claude API）。
+
+---
+
+## ADR-020：后端 Daemon 技术选型（TypeScript + Node http，localhost:8765）
+
+**日期**：2026-05-09
+**状态**：✅ 采纳
+
+### 背景
+
+能力模块需要一个进程内 HTTP 服务，提供 REST 接口给 Electron renderer（通过 IPC proxy）和未来的 CLI 消费者。备选框架：
+- A. Python + FastAPI（跨语言 daemon）
+- B. Node.js + Express（老牌框架）
+- C. Node.js + Fastify（高性能 TypeScript 友好框架）
+- D. Node.js 内置 `http` 模块（零依赖，M2 过渡方案）
+
+### 论证
+
+**Python FastAPI（A）的问题**：
+- 语言上下文切换：团队主栈是 TypeScript，Python 会引入两套工具链（pip/poetry vs pnpm）
+- 打包体积：macOS 打包需带 Python runtime，增加 50-80MB
+- IPC 类型安全：跨语言时 TypeScript 类型无法端到端贯通
+
+**Express（B）vs Fastify（C）的对比**：
+- Fastify 性能比 Express 快约 35%（官方 benchmark）
+- Fastify 原生支持 JSON Schema 路由验证，与 TypeScript 配合更好
+- Fastify 插件系统与 CapabilityModule 注册模式天然契合
+
+**内置 http（D）的取舍**：
+- 零额外 npm 依赖，不增加 package.json 复杂度，M2 PR review 最简洁
+- 功能完全够 M2 需求（路由 + JSON 解析）
+- 注释标注"生产版本替换为 Fastify"，M3 升级时接口不变
+
+**端口选择**：
+- 8765：不与 3000（React dev）、5173（Vite）、8080（常见代理）、11434（Ollama）冲突
+- localhost 绑定：仅本机访问，不暴露公网
+
+**进程管理**：Electron main 通过 `child_process.fork()` 启动，共享 Node 运行时（比 spawn 省 50-100ms 启动时间），MessageChannel 可用于进程间快速通信（M3 扩展）。
+
+### 决策
+
+**D（M2）→ C（M3）**。M2 用 Node.js 内置 `http` 模块实现零依赖服务器，端口 8765，TypeScript 类型完整。M3 在不改变路由接口的前提下替换为 Fastify，获得验证、插件、更好的错误处理。Electron main 通过 BackendManager（`src/main/backend-manager.ts`）管理进程生命周期。
+
+---
+
+## ADR-021：一站式安装 — Zero-CLI Onboarding
+
+**日期**：2026-05-09
+**状态**：✅ 采纳（M2 实现 Onboarding Wizard，M3 完善 Ollama 捆绑）
+
+### 背景
+
+用户要求："面向小白的框架。安装之后打开做一个简单的配置，比如说下载对应的模型，不要让它去运行任何命令。"
+
+核心约束：**用户全程不触碰终端**。
+
+### 备选方案
+
+- **A. 仅安装 Electron App，文档说明手动装 Ollama**：最简，但有命令行操作，违背约束
+- **B. App 内引导用户去 Ollama 官网手动下载**：次优，减少命令行但有跳转摩擦
+- **C. App 启动时自动检测 + 下载安装 Ollama + 拉取模型**：完全无 CLI，用户体验最佳
+- **D. 把 Ollama 二进制捆绑进安装包**：最自包含，但 macOS .dmg 体积 +150-200MB
+
+### 论证
+
+**Ollama 下载策略**（C vs D）：
+| 维度 | C（运行时下载）| D（捆绑安装包）|
+|------|---------------|----------------|
+| 安装包大小 | < 200MB | ~350MB+ |
+| 离线首次使用 | ❌ 需联网 | ✅ |
+| Ollama 版本更新 | 自动（下载最新）| 需重新打包 App |
+| 实现复杂度 | 中 | 低 |
+| 竞品做法（Jan.ai）| 运行时检测 | — |
+
+M2 采用 C：检测 Ollama → 未装则下载安装包（GitHub releases API）→ 静默安装 → 拉取推荐模型。
+
+**硬件检测 → 模型推荐逻辑**：
+| RAM | 推荐模型 | 量化 |
+|-----|----------|------|
+| < 8GB | 提示"配置偏低，将使用云端 API 模式" | — |
+| 8-16GB | llama3:8b / qwen2.5:7b | Q4_K_M |
+| 16-32GB | llama3:13b / qwen2.5:14b | Q4_K_M |
+| > 32GB | llama3:70b / qwen2.5:32b | Q4_K_M |
+
+GPU 检测（Metal/CUDA 可用时）可升一档模型。
+
+**Onboarding Wizard 流程**（首次启动）：
+```
+Step 1: 欢迎页 — 说明 Agent24 是什么
+Step 2: 环境检测 — 检测 RAM/GPU/已有 Ollama（自动，2-3秒）
+Step 3: 推荐方案 — 展示推荐模型及理由，可手动选其他
+Step 4: 安装进度 — Ollama 下载/安装 + 模型拉取（进度条）
+Step 5: 就绪 — 首次对话界面
+```
+
+如果用户已有 Ollama（检测到 localhost:11434 响应），跳过 Step 4 的 Ollama 安装部分，只拉取模型。
+
+### 决策
+
+**实现路径**：
+- `src/main/ollama-manager.ts`：检测 → 下载安装 → 启动/停止 Ollama 进程
+- `src/renderer/onboarding/`：5 步 Wizard UI（React）
+- `src/main/hardware-detect.ts`：RAM + GPU 检测（Node `os.totalmem()` + systeminformation 包）
+- Wizard 完成状态持久化到 `userData/onboarding-complete.json`，已完成则直接进主界面
+
+**打包策略**：Ollama 二进制**不**捆绑进 .dmg，运行时下载（M3 重新评估是否捆绑）。
+**更新**：Ollama 由 App 管理，不依赖用户系统已有的 Ollama，避免版本冲突。
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
