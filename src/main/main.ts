@@ -73,10 +73,9 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
-  try {
-    void getKernel().shutdown()
-  } catch {
-    // kernel was never initialised — nothing to shut down
-  }
+app.on('before-quit', (e) => {
+  const k = (() => { try { return getKernel() } catch { return null } })()
+  if (!k) return
+  e.preventDefault()
+  void k.shutdown().finally(() => app.quit())
 })
