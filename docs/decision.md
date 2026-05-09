@@ -824,6 +824,169 @@ Step 5: 就绪 — 首次对话界面
 
 ---
 
+## ADR-022：LLM 运行时默认 MLX，UI 可切换
+
+**日期**：2026-05-09
+**状态**：✅ 采纳（修正 ADR-019/021 中"默认 Ollama"的假设）
+
+### 背景
+
+用户明确要求："不一定 Ollama，默认我想用 oMLX，但是用户可以切换为 Ollama 或者其他类似工具，在界面配置即可。"
+
+ADR-019 的 LLM Gateway 设计假设底层是 Ollama，需要修正。
+
+### 备选 LLM 运行时（Apple Silicon Mac 场景）
+
+| 运行时 | 特点 | 适合场景 |
+|--------|------|----------|
+| **MLX**（默认）| Apple 官方 ML 框架，Metal GPU 原生，Apple Silicon 最优 | 日常对话、本地隐私 |
+| **Ollama** | 最流行，生态最广，API 兼容 OpenAI | 跨平台、丰富模型库 |
+| **Rapid-MLX** | 号称比 Ollama 快 4.2×，专注极致性能 | 高频调用、延迟敏感 |
+| **LM Studio** | 图形化，开箱即用，有 REST API | 不熟命令行的用户 |
+| **远程 API** | Claude / OpenAI / DeepSeek | 本地算力不足时 |
+
+### 论证
+
+**MLX 作为默认**：
+- Apple Silicon Mac 用户（M1/M2/M3/M4）占本框架目标用户大多数
+- MLX 由 Apple 维护，Metal GPU 加速原生，统一内存利用率最高
+- MLX 是 Python 库，天然与 Python 后端（ADR-023）集成
+- Rapid-MLX 作为 MLX 的性能加强版值得关注（benchmark 验证后可切换）
+
+**可切换的必要性**：
+- 不同用户硬件不同（非 Apple Silicon 无法用 MLX）
+- 不同任务偏好不同模型生态
+- 避免供应商锁定
+
+**LLM Gateway 抽象层（ADR-019）的价值在此体现**：所有能力模块只调 `llm.chat()`，底层运行时通过配置切换，模块代码零改动。
+
+### 决策
+
+- **默认**：MLX（`mlx-lm` 库）
+- **可切换**：Ollama / Rapid-MLX / LM Studio API / 远程 OpenAI-compatible API
+- **切换入口**：设置页 → LLM 运行时配置（下拉选择 + 地址/端口/API Key 输入）
+- **Gateway 适配层**：每个运行时实现同一 `LLMAdapter` 接口（`chat(messages) → AsyncGenerator`）
+
+---
+
+## ADR-023：后端语言从 Node.js 切换到 Python FastAPI（M3 执行）
+
+**日期**：2026-05-09
+**状态**：✅ 采纳（部分修正 ADR-020，M3 执行切换）
+
+### 背景
+
+ADR-020 选择了 Node.js + 内置 http（M2 过渡）。但 ADR-022 确定 MLX 为默认运行时后，Python 成为后端的自然选择。
+
+用户提供的参考文档明确推荐：**Python 3.11+ + FastAPI + uvicorn**。
+
+### 论证
+
+**为什么 Python**：
+| 能力需求 | Node.js | Python |
+|----------|---------|--------|
+| MLX 集成 | ❌ 需跨进程调用 | ✅ 原生 `import mlx` |
+| ComfyUI / SD 集成 | 仅 HTTP 调用 | ✅ 原生调用 + HTTP |
+| LangChain / LlamaIndex | 有 JS 版但不完整 | ✅ 最成熟生态 |
+| Playwright 自动化 | ✅ 同等 | ✅ 同等 |
+| asyncio 工作流引擎 | 需要额外设计 | ✅ 原生 asyncio.Queue |
+| FastAPI（类型、文档、异步）| — | ✅ 生产成熟 |
+
+**M2 Node.js 实现的价值**：
+- 证明了 Electron main → 后端 daemon → LLM Gateway 的架构可行性
+- IPC 接口、健康检查、进程管理逻辑可直接复用
+- M2 作为骨架，M3 替换后端语言，前端和 IPC 接口不变
+
+### 决策
+
+| 阶段 | 后端实现 |
+|------|---------|
+| M2（当前）| Node.js 内置 http，零依赖，验证架构 |
+| M3 | Python 3.11 + FastAPI + uvicorn，端口保持 8765 |
+| M4+ | 同一 Python 进程内集成 MLX / ComfyUI / Playwright |
+
+**接口约定**：M3 Python 后端实现与 M2 完全相同的 REST 接口（`/health`、`/api/llm/chat`、`/api/llm/usage`、能力模块路由），Electron 侧 BackendManager 无需改动。
+
+---
+
+## ADR-024：工作流引擎 — asyncio.Queue + Step 模式
+
+**日期**：2026-05-09
+**状态**：✅ 采纳
+
+### 背景
+
+后台需要支持多步骤异步工作流（如"生成文案 → 生成图片 → 合成视频 → 发布"），需要选择任务调度方案。
+
+### 备选
+
+- **A. Prefect / Temporal**：企业级，功能完整，但重——需要独立服务
+- **B. Celery + Redis**：成熟，但需要 Redis，增加部署依赖
+- **C. Python asyncio.Queue + Step**：轻量，无外部依赖，适合单机场景
+
+### 论证
+
+本框架定位是"个人/小团队私有化生产力中台"，单机运行，无需分布式调度：
+- Prefect/Temporal 引入了协调服务，违背"零命令行"原则
+- asyncio.Queue 是标准库，零依赖，与 FastAPI 天然集成
+- 每个 Step 实现为 `async def step(ctx) -> StepResult`，可调用任意能力（MLX / ComfyUI / Playwright / 外部 API）
+- 进度通过 WebSocket 实时推送给前端
+
+### 核心 API 端点（同文档规范）
+
+```
+POST /api/v1/chat              — 多轮对话（调 LLM Gateway）
+POST /api/v1/workflow/run      — 启动工作流（返回 task_id）
+GET  /api/v1/task/{id}         — 任务状态查询（进度、日志、结果）
+WS   /ws/task/{id}             — 实时进度推送（WebSocket）
+POST /api/v1/files/upload      — 媒体文件上传
+GET  /api/v1/files/{id}        — 结果文件下载
+```
+
+所有路径加版本号 `/api/v1/...`，预留升级空间。
+
+### 内置工作流模板（初期硬编码）
+
+- `short-video`：文案生成 → 图生视频 → 字幕合成 → 导出
+- `social-publish`：内容生成 → 审核 → 多平台发布
+- `research-digest`：网页抓取 → 提炼摘要 → 邮件/推送
+
+### 决策
+
+**asyncio.Queue + Step + WebSocket 推送**。SQLite 持久化任务记录（`aiosqlite` 库），无需外部数据库。
+
+---
+
+## ADR-025：内存管理 — 串行 LLM 推理 + 模型热切换限制
+
+**日期**：2026-05-09
+**状态**：✅ 采纳
+
+### 背景
+
+64GB 统一内存虽大，但同时运行 LLM + ComfyUI + Playwright 可能吃紧。需要显式的并发控制策略。
+
+### 数据参考（64GB Mac）
+
+| 场景 | 内存占用 |
+|------|---------|
+| 70B Q4 LLM | ~40GB |
+| 34B Q4 LLM | ~20GB |
+| 13B Q4 LLM | ~8GB |
+| ComfyUI + SD XL | ~8-12GB |
+| macOS + Electron + 后台 | ~6-8GB |
+
+同时跑 34B LLM + ComfyUI + 系统 = ~36GB，勉强可行但有风险。
+
+### 决策
+
+1. **LLM 推理串行**：任务队列中同一时刻最多 1 个 LLM 推理，后续请求排队等待
+2. **能力模块并发**：非 LLM 步骤（Playwright 抓取、文件处理）可并发
+3. **模型卸载策略**：Ollama 模式下换模型时自动卸载旧模型；MLX 模式下显式 `del model; gc.collect()` 释放
+4. **内存警告**：后台监控系统内存，低于阈值（默认 6GB）时暂停新任务入队并推送告警到前端
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
