@@ -9,6 +9,12 @@ import ChatPage from './pages/Chat'
 import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
+import HelloModule from './pages/modules/HelloModule'
+
+// Static module route map — M2 will replace this with dynamic import()
+const MODULE_PAGES: Record<string, React.ComponentType> = {
+  '/modules/hello': HelloModule,
+}
 
 type BuiltinPage = 'chat' | 'workbench' | 'models' | 'settings'
 type Page = BuiltinPage | string  // string = module route
@@ -176,18 +182,19 @@ export function App(): JSX.Element {
         {page === 'workbench' && <WorkbenchPage />}
         {page === 'models'    && <ModelsPage />}
         {page === 'settings'  && <SettingsPage />}
-        {/* Module UI pages rendered by route */}
-        {moduleNavItems.map((m) =>
-          page === m.navItem!.route ? (
-            <div key={m.id} className="content">
-              <div className="page-title">{m.name}</div>
-              <div className="page-sub">{m.description}</div>
-              <p style={{ color: 'var(--muted)', fontSize: 13 }}>
-                Module UI component loading not yet implemented (M2).
-              </p>
-            </div>
-          ) : null
-        )}
+        {/* Module UI pages — static map in M1, dynamic import() in M2 */}
+        {moduleNavItems.map((m) => {
+          if (page !== m.navItem!.route) return null
+          const ModulePage = MODULE_PAGES[m.navItem!.route]
+          return ModulePage
+            ? <ModulePage key={m.id} />
+            : (
+              <div key={m.id} className="content">
+                <div className="page-title">{m.name}</div>
+                <p style={{ color: 'var(--muted)', fontSize: 13 }}>Component not registered in MODULE_PAGES.</p>
+              </div>
+            )
+        })}
       </div>
     </div>
   )
