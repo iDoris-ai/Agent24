@@ -137,9 +137,11 @@ export function registerIpcHandlers(): void {
     return { ok: true, url: `http://127.0.0.1:${port ?? 8000}` }
   })
 
-  // oMLX: stop server
+  // oMLX: stop server — kills both app-spawned and externally-started processes
   ipcMain.handle(IpcChannels.OmlxStop, (): OmlxStopResult => {
     if (omlxProcess) { omlxProcess.kill('SIGTERM'); omlxProcess = null }
+    // Also kill any omlx serve process not started by us (e.g. manual terminal launch)
+    execFile('pkill', ['-f', 'omlx serve'], () => { /* ignore exit code */ })
     return { ok: true }
   })
   ipcMain.handle(IpcChannels.AppPing, () => 'pong')

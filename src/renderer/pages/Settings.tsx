@@ -1,15 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 
 type OmlxStatus = 'detecting' | 'connected' | 'disconnected' | 'starting' | 'stopping'
+type TestResult = { ok: boolean; msg: string } | null
 
 export default function SettingsPage() {
   const [omlxStatus, setOmlxStatus] = useState<OmlxStatus>('detecting')
   const [omlxUrl, setOmlxUrl] = useState('http://127.0.0.1:8088')
   const [omlxApiKey, setOmlxApiKey] = useState('')
+  const [showApiKey, setShowApiKey] = useState(false)
   const [omlxModels, setOmlxModels] = useState<string[]>([])
   const [omlxActiveModel, setOmlxActiveModel] = useState('')
-  const [omlxPort, setOmlxPort] = useState('8000')
+  const [omlxPort, setOmlxPort] = useState('8088')
   const [detectError, setDetectError] = useState('')
+  const [testResult, setTestResult] = useState<TestResult>(null)
+  const testTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const detectRan = useRef(false)
 
   useEffect(() => {
@@ -17,6 +21,12 @@ export default function SettingsPage() {
     detectRan.current = true
     autoDetect()
   }, [])
+
+  function showTestResult(result: TestResult) {
+    setTestResult(result)
+    if (testTimer.current) clearTimeout(testTimer.current)
+    testTimer.current = setTimeout(() => setTestResult(null), 4000)
+  }
 
   async function autoDetect() {
     setOmlxStatus('detecting')
@@ -30,34 +40,53 @@ export default function SettingsPage() {
       setOmlxStatus('connected')
     } else {
       setOmlxStatus('disconnected')
-      setDetectError('未检测到运行中的 oMLX 服务，请手动填写地址或点击启动')
+      setDetectError('No running AI model service detected. Fill in the URL below or click Start.')
     }
   }
 
   async function testConnection() {
-    setOmlxStatus('detecting')
+    setTestResult(null)
     setDetectError('')
+    const prev = omlxStatus
+    setOmlxStatus('detecting')
     const result = await window.agent24.omlxModels(omlxUrl, omlxApiKey)
     if (result.ok) {
       setOmlxModels(result.models)
-      setOmlxActiveModel(result.models[0] ?? '')
+      setOmlxActiveModel((m) => m || result.models[0] || '')
       setOmlxStatus('connected')
+      showTestResult({ ok: true, msg: `Connected — ${result.models.length} model(s) found` })
     } else {
-      setOmlxStatus('disconnected')
-      setDetectError(result.error ?? '连接失败')
+      setOmlxStatus(prev === 'connected' ? 'disconnected' : 'disconnected')
+      showTestResult({ ok: false, msg: result.error ?? 'Connection failed — check URL and API key' })
     }
   }
 
   async function startServer() {
     setOmlxStatus('starting')
-    const port = parseInt(omlxPort, 10) || 8000
+    setDetectError('')
+    const port = parseInt(omlxPort, 10) || 8088
     const result = await window.agent24.omlxStart(port, omlxApiKey)
     if (result.ok) {
       setOmlxUrl(result.url)
-      setTimeout(() => testConnection(), 3000)
+      // Poll until the server is ready (up to 8s)
+      let attempts = 0
+      const poll = async () => {
+        const r = await window.agent24.omlxModels(result.url, omlxApiKey)
+        if (r.ok) {
+          setOmlxModels(r.models)
+          setOmlxActiveModel(r.models[0] ?? '')
+          setOmlxStatus('connected')
+        } else if (++attempts < 4) {
+          setTimeout(poll, 2000)
+        } else {
+          setOmlxStatus('disconnected')
+          setDetectError('Service started but not responding yet — try "Auto-detect" in a moment')
+        }
+      }
+      setTimeout(poll, 2000)
     } else {
       setOmlxStatus('disconnected')
-      setDetectError(result.error ?? '启动失败')
+      setDetectError(result.error ?? 'Failed to start')
     }
   }
 
@@ -73,8 +102,8 @@ export default function SettingsPage() {
   const isBusy = omlxStatus === 'detecting' || omlxStatus === 'starting' || omlxStatus === 'stopping'
 
   const statusLabel: Record<OmlxStatus, string> = {
-    detecting: '探测中…', connected: '已连接',
-    disconnected: '未连接', starting: '启动中…', stopping: '停止中…',
+    detecting: 'Detecting…', connected: 'Connected',
+    disconnected: 'Disconnected', starting: 'Starting…', stopping: 'Stopping…',
   }
   const statusDotColor: Record<OmlxStatus, string> = {
     detecting: '#888', connected: '#4caf50',
@@ -83,12 +112,12 @@ export default function SettingsPage() {
 
   return (
     <div className="content">
-      <div className="page-title">设置</div>
-      <div className="page-sub">配置 LLM 运行时、后端服务和应用偏好</div>
+      <div className="page-title">Settings</div>
+      <div className="page-sub">Configure AI model service, backend daemon and app preferences</div>
 
-      {/* ── oMLX 推理服务 ── */}
+      {/* ── AI Model Service ── */}
       <div className="settings-section">
-        <h3>oMLX 推理服务</h3>
+        <h3>AI Model Service</h3>
 
         {/* Status bar */}
         <div className="setting-row" style={{ background: 'var(--surface2)', marginBottom: 2 }}>
@@ -101,29 +130,30 @@ export default function SettingsPage() {
             <span style={{ fontSize: 13 }}>{statusLabel[omlxStatus]}</span>
             {isConnected && (
               <span style={{ fontSize: 11, color: 'var(--muted)' }}>
-                {omlxUrl} · {omlxModels.length} 个模型
+                {omlxUrl} · {omlxModels.length} model(s)
               </span>
             )}
           </div>
           <div style={{ display: 'flex', gap: 6 }}>
             <button className="btn btn-ghost" onClick={autoDetect} disabled={isBusy}
               style={{ fontSize: 12, padding: '4px 10px' }}>
-              自动探测
+              Auto-detect
             </button>
             {isConnected ? (
               <button className="btn btn-ghost" onClick={stopServer} disabled={isBusy}
                 style={{ fontSize: 12, padding: '4px 10px', color: '#f44336', borderColor: '#f44336' }}>
-                停止服务
+                Stop Service
               </button>
             ) : (
               <button className="btn btn-primary" onClick={startServer} disabled={isBusy}
                 style={{ fontSize: 12, padding: '4px 10px' }}>
-                启动 oMLX
+                Start oMLX
               </button>
             )}
           </div>
         </div>
 
+        {/* Error message */}
         {detectError && (
           <div style={{
             fontSize: 12, color: '#f44336', padding: '6px 18px', marginBottom: 2,
@@ -133,80 +163,106 @@ export default function SettingsPage() {
           </div>
         )}
 
-        {/* URL */}
+        {/* URL + Test button + inline result */}
         <div className="setting-row">
           <div>
-            <label>服务地址</label>
-            <p>OpenAI 兼容 API 端点</p>
+            <label>Service URL</label>
+            <p>OpenAI-compatible API endpoint</p>
           </div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <input type="text" value={omlxUrl} onChange={(e) => setOmlxUrl(e.target.value)}
-              style={{ width: 210 }} placeholder="http://127.0.0.1:8000" />
+              style={{ width: 210 }} placeholder="http://127.0.0.1:8088" />
             <button className="btn btn-ghost" onClick={testConnection} disabled={isBusy}
               style={{ fontSize: 12, padding: '4px 10px', whiteSpace: 'nowrap' }}>
-              测试连接
+              {isBusy ? 'Testing…' : 'Test'}
             </button>
+            {testResult && (
+              <span style={{
+                fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap',
+                color: testResult.ok ? '#4caf50' : '#f44336',
+              }}>
+                {testResult.ok ? '✓' : '✗'} {testResult.msg}
+              </span>
+            )}
           </div>
         </div>
 
-        {/* API Key */}
+        {/* API Key with eye toggle */}
         <div className="setting-row">
           <div>
             <label>API Key</label>
-            <p>留空则不鉴权</p>
+            <p>Leave empty if no auth required</p>
           </div>
-          <input type="password" value={omlxApiKey} onChange={(e) => setOmlxApiKey(e.target.value)}
-            style={{ width: 200 }} placeholder="可选" />
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <input
+              type={showApiKey ? 'text' : 'password'}
+              value={omlxApiKey}
+              onChange={(e) => setOmlxApiKey(e.target.value)}
+              style={{ width: 180 }}
+              placeholder="optional"
+            />
+            <button
+              onClick={() => setShowApiKey((v) => !v)}
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                color: 'var(--muted)', fontSize: 15, padding: '2px 4px',
+                lineHeight: 1,
+              }}
+              title={showApiKey ? 'Hide' : 'Show'}
+            >
+              {showApiKey ? '🙈' : '👁'}
+            </button>
+          </div>
         </div>
 
         {/* Launch port — only when disconnected */}
         {!isConnected && (
           <div className="setting-row">
             <div>
-              <label>启动端口</label>
-              <p>点击"启动 oMLX"时使用的端口</p>
+              <label>Start Port</label>
+              <p>Port used when clicking "Start oMLX"</p>
             </div>
             <input type="text" value={omlxPort} onChange={(e) => setOmlxPort(e.target.value)}
               style={{ width: 80 }} />
           </div>
         )}
 
-        {/* Model selector */}
+        {/* Active model selector */}
         <div className="setting-row">
           <div>
-            <label>活跃模型</label>
-            <p>对话和 Agent 任务默认使用的模型</p>
+            <label>Active Model</label>
+            <p>Default model for chat and agent tasks</p>
           </div>
           {omlxModels.length > 0 ? (
             <select value={omlxActiveModel} onChange={(e) => setOmlxActiveModel(e.target.value)}
-              style={{ maxWidth: 280 }}>
+              style={{ maxWidth: 300 }}>
               {omlxModels.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           ) : (
             <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-              {isBusy ? '加载中…' : '连接后自动列出'}
+              {isBusy ? 'Loading…' : 'Connect to list models'}
             </span>
           )}
         </div>
       </div>
 
-      {/* ── 后端服务 ── */}
+      {/* ── Backend Daemon ── */}
       <div className="settings-section">
-        <h3>后端服务</h3>
+        <h3>Backend Daemon</h3>
         <div className="setting-row">
           <div>
-            <label>Daemon 端口</label>
-            <p>Agent24 内部服务监听端口</p>
+            <label>Daemon Port</label>
+            <p>Agent24 internal service port</p>
           </div>
           <input type="text" defaultValue="8765" style={{ width: 80 }} />
         </div>
       </div>
 
-      {/* ── 界面 ── */}
+      {/* ── Appearance ── */}
       <div className="settings-section">
-        <h3>界面</h3>
+        <h3>Appearance</h3>
         <div className="setting-row">
-          <div><label>语言</label><p>界面显示语言</p></div>
+          <div><label>Language</label><p>UI display language</p></div>
           <select defaultValue="zh">
             <option value="zh">中文</option>
             <option value="en">English</option>
@@ -215,8 +271,8 @@ export default function SettingsPage() {
       </div>
 
       <div style={{ marginTop: 8 }}>
-        <button className="btn btn-primary">保存设置</button>
-        <button className="btn btn-ghost" style={{ marginLeft: 8 }}>重置默认</button>
+        <button className="btn btn-primary">Save Settings</button>
+        <button className="btn btn-ghost" style={{ marginLeft: 8 }}>Reset Defaults</button>
       </div>
     </div>
   )
