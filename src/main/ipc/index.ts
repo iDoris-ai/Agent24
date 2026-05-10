@@ -2,12 +2,58 @@
 // register their own handlers here via the module loader (later M1 task).
 
 import http from 'node:http'
+import { execFile, type ChildProcess } from 'node:child_process'
 import { app, ipcMain, shell } from 'electron'
 import { IpcChannels } from '../../shared/ipc-types'
-import type { BackendProxyRequest, BackendProxyResponse } from '../../shared/ipc-types'
+import type {
+  BackendProxyRequest,
+  BackendProxyResponse,
+  OmlxDetectResult,
+  OmlxModelsResult,
+  OmlxStartResult,
+  OmlxStopResult,
+} from '../../shared/ipc-types'
 
 const BACKEND_PORT = 8765
 const BACKEND_HOST = '127.0.0.1'
+
+// oMLX server management
+let omlxProcess: ChildProcess | null = null
+const OMLX_PROBE_CANDIDATES = [
+  { url: 'http://127.0.0.1:8088', apiKey: 'xiaobao8088' },
+  { url: 'http://127.0.0.1:8000', apiKey: '' },
+  { url: 'http://127.0.0.1:8001', apiKey: '' },
+  { url: 'http://localhost:8088', apiKey: 'xiaobao8088' },
+]
+
+function fetchOmlxModels(url: string, apiKey: string): Promise<string[]> {
+  return new Promise((resolve) => {
+    const headers: Record<string, string> = { 'Accept': 'application/json' }
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+    const parsedUrl = new URL(`${url}/v1/models`)
+    const options: http.RequestOptions = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 80,
+      path: parsedUrl.pathname,
+      method: 'GET',
+      headers,
+      timeout: 2000,
+    }
+    const req = http.request(options, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (c: Buffer) => chunks.push(c))
+      res.on('end', () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString()) as { data?: { id: string }[] }
+          resolve((body.data ?? []).map((m) => m.id))
+        } catch { resolve([]) }
+      })
+    })
+    req.on('error', () => resolve([]))
+    req.on('timeout', () => { req.destroy(); resolve([]) })
+    req.end()
+  })
+}
 
 // Allowlist of URL prefixes permitted for shell.openExternal. Anything
 // not matching is rejected silently — prevents IPC injection opening
@@ -65,6 +111,37 @@ function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
 }
 
 export function registerIpcHandlers(): void {
+  // oMLX: auto-detect running server
+  ipcMain.handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | null> => {
+    for (const candidate of OMLX_PROBE_CANDIDATES) {
+      const models = await fetchOmlxModels(candidate.url, candidate.apiKey)
+      if (models.length > 0) return { ...candidate, models }
+    }
+    return null
+  })
+
+  // oMLX: list models from given url+key
+  ipcMain.handle(IpcChannels.OmlxModels, async (_event, url: unknown, apiKey: unknown): Promise<OmlxModelsResult> => {
+    if (typeof url !== 'string') return { ok: false, models: [], error: 'invalid url' }
+    const models = await fetchOmlxModels(url, typeof apiKey === 'string' ? apiKey : '')
+    return models.length > 0 ? { ok: true, models } : { ok: false, models: [], error: 'no response or no models' }
+  })
+
+  // oMLX: start server via `omlx serve`
+  ipcMain.handle(IpcChannels.OmlxStart, (_event, port: unknown, apiKey: unknown): OmlxStartResult => {
+    if (omlxProcess) return { ok: true, url: `http://127.0.0.1:${port ?? 8000}` }
+    const args = ['serve', '--port', String(port ?? 8000)]
+    if (typeof apiKey === 'string' && apiKey) args.push('--api-key', apiKey)
+    omlxProcess = execFile('omlx', args, { env: { ...process.env } })
+    omlxProcess.on('exit', () => { omlxProcess = null })
+    return { ok: true, url: `http://127.0.0.1:${port ?? 8000}` }
+  })
+
+  // oMLX: stop server
+  ipcMain.handle(IpcChannels.OmlxStop, (): OmlxStopResult => {
+    if (omlxProcess) { omlxProcess.kill('SIGTERM'); omlxProcess = null }
+    return { ok: true }
+  })
   ipcMain.handle(IpcChannels.AppPing, () => 'pong')
   ipcMain.handle(IpcChannels.AppVersion, () => app.getVersion())
   ipcMain.handle(IpcChannels.ShellOpenExternal, (_event, url: unknown) => {

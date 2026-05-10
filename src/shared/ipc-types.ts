@@ -4,12 +4,12 @@
 export const IpcChannels = {
   AppPing: 'app:ping',
   AppVersion: 'app:version',
-  // Opens a URL in the system browser via shell.openExternal (main process).
-  // Renderer must never open external URLs directly — always route via this.
   ShellOpenExternal: 'shell:open-external',
-  // Proxies an HTTP request to the backend daemon (localhost:8765).
-  // Renderer never calls the daemon directly — always goes through this channel.
   BackendProxy: 'backend:proxy',
+  OmlxDetect: 'omlx:detect',
+  OmlxModels: 'omlx:models',
+  OmlxStart: 'omlx:start',
+  OmlxStop: 'omlx:stop',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
@@ -26,4 +26,26 @@ export interface BackendProxyResponse {
   ok: boolean
   status: number
   data: unknown
+}
+
+export interface OmlxDetectResult {
+  url: string
+  apiKey: string
+  models: string[]
+}
+
+export interface OmlxModelsResult {
+  ok: boolean
+  models: string[]
+  error?: string
+}
+
+export interface OmlxStartResult {
+  ok: boolean
+  url: string
+  error?: string
+}
+
+export interface OmlxStopResult {
+  ok: boolean
 }
