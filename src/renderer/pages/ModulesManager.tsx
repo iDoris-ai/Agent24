@@ -1,32 +1,50 @@
 // @vitest-environment jsdom (for future tests)
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import type { ModuleInfo } from '../../shared/ipc-types'
 
 export default function ModulesManagerPage() {
   const [modules, setModules] = useState<ModuleInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [toggling, setToggling] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  // Request sequence counter prevents stale load() responses overwriting newer ones
+  const loadSeq = useRef(0)
 
   useEffect(() => {
     void load()
   }, [])
 
   async function load() {
+    const seq = ++loadSeq.current
     setLoading(true)
-    const mods = await window.agent24.modulesList()
-    setModules(mods)
-    setLoading(false)
+    setError(null)
+    try {
+      const mods = await window.agent24.modulesList()
+      if (seq === loadSeq.current) setModules(mods)
+    } catch {
+      if (seq === loadSeq.current) {
+        setModules([])
+        setError('加载模块列表失败，请重试')
+      }
+    } finally {
+      if (seq === loadSeq.current) setLoading(false)
+    }
   }
 
   async function toggle(mod: ModuleInfo) {
     setToggling(mod.id)
+    setError(null)
     try {
-      if (mod.enabled) {
-        await window.agent24.modulesDisable(mod.id)
+      const result = mod.enabled
+        ? await window.agent24.modulesDisable(mod.id)
+        : await window.agent24.modulesEnable(mod.id)
+      if (result.ok) {
+        await load()
       } else {
-        await window.agent24.modulesEnable(mod.id)
+        setError(`${mod.enabled ? '停用' : '启用'} ${mod.name} 失败`)
       }
-      await load()
+    } catch {
+      setError(`切换 ${mod.name} 时网络错误`)
     } finally {
       setToggling(null)
     }
@@ -42,6 +60,12 @@ export default function ModulesManagerPage() {
         <button className="btn btn-ghost" onClick={() => void load()} style={{ fontSize: 12 }}>↻ 刷新</button>
       </div>
       <div className="page-sub">安装的能力模块 — 切换启停立即生效，无需重启</div>
+
+      {error && (
+        <div style={{ color: '#f44336', fontSize: 12, padding: '8px 12px', marginTop: 8, background: 'rgba(244,67,54,0.1)', borderRadius: 6, border: '1px solid rgba(244,67,54,0.3)' }}>
+          {error}
+        </div>
+      )}
 
       {loading ? (
         <div style={{ color: 'var(--muted)', fontSize: 13, padding: '24px 0', textAlign: 'center' }}>加载中…</div>
