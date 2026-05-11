@@ -4,7 +4,7 @@
 import http from 'node:http'
 import { URL } from 'node:url'
 import { LLMGateway } from './llm-gateway'
-import { registerAll } from './capability-registry'
+import { registerAll, MODULES } from './capability-registry'
 import type { SimpleRouter, RouteContext, RouteHandler } from './capabilities/base'
 import type { LLMRequest } from './types'
 
@@ -83,6 +83,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
 function registerCoreRoutes(): void {
   routes.set('GET /health', () => ({ status: 'ok', ts: Date.now() }))
+
+  // Return manifests of all registered capability modules
+  routes.set('GET /api/modules', () => MODULES.map((m) => m.manifest))
 
   routes.set('GET /api/llm/usage', () => gateway.getUsage())
 

@@ -7,6 +7,8 @@ import {
   IpcChannels,
   type BackendProxyRequest,
   type BackendProxyResponse,
+  type LlmStatusResult,
+  type ModuleManifest,
   type OmlxDetectResult,
   type OmlxModelsResult,
   type OmlxStartResult,
@@ -30,6 +32,10 @@ const api = {
     ipcRenderer.invoke(IpcChannels.OmlxStop),
   omlxWarmup: (url: string, apiKey: string, modelId: string): Promise<OmlxWarmupResult> =>
     ipcRenderer.invoke(IpcChannels.OmlxWarmup, url, apiKey, modelId),
+  modulesList: (): Promise<ModuleManifest[]> =>
+    ipcRenderer.invoke(IpcChannels.ModulesList),
+  llmStatus: (): Promise<LlmStatusResult> =>
+    ipcRenderer.invoke(IpcChannels.LlmStatus),
 } as const
 
 contextBridge.exposeInMainWorld('agent24', api)

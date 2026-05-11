@@ -11,6 +11,8 @@ export const IpcChannels = {
   OmlxStart: 'omlx:start',
   OmlxStop: 'omlx:stop',
   OmlxWarmup: 'omlx:warmup',
+  ModulesList: 'modules:list',
+  LlmStatus: 'llm:status',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
@@ -55,4 +57,33 @@ export interface OmlxWarmupResult {
   model: string
   ok: boolean
   error?: string
+}
+
+// ── Module system ─────────────────────────────────────────────────────────────
+
+export type ModuleType = 'ui' | 'headless' | 'hybrid'
+
+export type Permission =
+  | 'llm' | 'memory' | 'network' | 'filesystem' | 'wechat' | 'nostr'
+
+export interface ModuleNavItem {
+  icon: string
+  label: string
+  route: string
+}
+
+export interface ModuleManifest {
+  id: string
+  version: string
+  name: string
+  description: string
+  type: ModuleType
+  permissions: Permission[]
+  navItem?: ModuleNavItem
+}
+
+export interface LlmStatusResult {
+  provider: 'omlx' | 'ollama' | 'none'
+  url: string
+  model: string
 }

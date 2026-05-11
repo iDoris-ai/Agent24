@@ -39,7 +39,11 @@ export default function ChatPage() {
           messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
         },
       })
-      const reply = (res as { message?: { content?: string } })?.message?.content ?? '（模型未返回内容）'
+      if (!res.ok) {
+        const error = (res.data as { error?: string } | null)?.error ?? `HTTP ${res.status}`
+        throw new Error(error)
+      }
+      const reply = (res.data as { message?: { content?: string } })?.message?.content ?? '（模型未返回内容）'
       setMessages(prev => [...prev, { role: 'assistant', content: reply }])
     } catch (e) {
       setMessages(prev => [...prev, {
