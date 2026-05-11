@@ -12,6 +12,8 @@ export const IpcChannels = {
   OmlxStop: 'omlx:stop',
   OmlxWarmup: 'omlx:warmup',
   ModulesList: 'modules:list',
+  ModulesEnable: 'modules:enable',
+  ModulesDisable: 'modules:disable',
   LlmStatus: 'llm:status',
 } as const
 
@@ -80,6 +82,11 @@ export interface ModuleManifest {
   type: ModuleType
   permissions: Permission[]
   navItem?: ModuleNavItem
+}
+
+// ModuleManifest extended with runtime enable/disable state
+export interface ModuleInfo extends ModuleManifest {
+  enabled: boolean
 }
 
 export interface LlmStatusResult {

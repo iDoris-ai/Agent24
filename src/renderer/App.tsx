@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Agent24API } from '../main/preload'
-import type { ModuleManifest } from '../shared/ipc-types'
+import type { ModuleInfo } from '../shared/ipc-types'
 
 declare global {
   interface Window { agent24: Agent24API }
@@ -36,7 +36,7 @@ export function App(): JSX.Element {
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
-  const [modules, setModules] = useState<ModuleManifest[]>([])
+  const [modules, setModules] = useState<ModuleInfo[]>([])
   const [llmLabel, setLlmLabel] = useState('Detecting…')
   const initDone = useRef(false)
 
