@@ -1,13 +1,16 @@
 // Agent24-Desktop main process entry — M2: integrates BackendManager daemon.
 // Capability modules will register IPC handlers via the loader (M1 next tasks).
 
-import { app, BrowserWindow, session } from 'electron'
+import { app, BrowserWindow, Menu, Tray, nativeImage, session } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager } from './backend-manager'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
+
+// Keep tray reference alive — GC would destroy it otherwise
+let tray: Tray | null = null
 
 function createMainWindow(): BrowserWindow {
   const win = new BrowserWindow({
@@ -67,11 +70,43 @@ app.whenReady().then(() => {
   })
 
   registerIpcHandlers()
-  createMainWindow()
+  const win = createMainWindow()
+
+  // ── System tray (M2) ─────────────────────────────────────────────────────
+  tray = new Tray(nativeImage.createEmpty())
+  if (process.platform === 'darwin') {
+    tray.setTitle('⚡A24')
+  }
+  tray.setToolTip('Agent24 — 本地 AI 助理')
+
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: 'Show Window',
+      click: () => {
+        win.show()
+        if (process.platform === 'darwin') app.focus()
+      },
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit Agent24',
+      click: () => {
+        app.quit()
+      },
+    },
+  ])
+  tray.setContextMenu(contextMenu)
+  tray.on('double-click', () => {
+    win.show()
+    if (process.platform === 'darwin') app.focus()
+  })
+  // ─────────────────────────────────────────────────────────────────────────
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createMainWindow()
+    } else {
+      win.show()
     }
   })
 })
@@ -80,6 +115,10 @@ app.on('will-quit', () => {
   backendManager.stop()
 })
 
+// M2: When all windows are closed, hide rather than quit — the daemon (tray)
+// keeps running. User must use tray "Quit Agent24" to fully exit.
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  // Hide all windows to keep the daemon alive in the background.
+  // On all platforms: quit only via tray context menu.
+  BrowserWindow.getAllWindows().forEach((w) => w.hide())
 })
