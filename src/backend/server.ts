@@ -67,7 +67,17 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   // Special: module enable/disable (parameterised — not in the routes Map)
   const enableMatch = url.pathname.match(/^\/api\/modules\/([^/]+)\/(enable|disable)$/)
   if (enableMatch && method === 'POST') {
-    const id = decodeURIComponent(enableMatch[1])
+    let id: string
+    try {
+      id = decodeURIComponent(enableMatch[1])
+    } catch {
+      send(res, 400, { error: 'Invalid module id encoding' })
+      return
+    }
+    if (!MODULES.some((m) => m.manifest.id === id)) {
+      send(res, 404, { error: 'Unknown module', id })
+      return
+    }
     const action = enableMatch[2] as 'enable' | 'disable'
     setEnabled(id, action === 'enable')
     send(res, 200, { ok: true, id, enabled: action === 'enable' })

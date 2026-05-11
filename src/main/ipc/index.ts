@@ -180,14 +180,18 @@ export function registerIpcHandlers(): void {
   // modules:enable / modules:disable — toggle module state via backend
   ipcMain.handle(IpcChannels.ModulesEnable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
     if (typeof id !== 'string') return { ok: false }
-    const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
-    return res.ok ? { ok: true } : { ok: false }
+    try {
+      const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
+      return { ok: res.ok }
+    } catch { return { ok: false } }
   })
 
   ipcMain.handle(IpcChannels.ModulesDisable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
     if (typeof id !== 'string') return { ok: false }
-    const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
-    return res.ok ? { ok: true } : { ok: false }
+    try {
+      const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
+      return { ok: res.ok }
+    } catch { return { ok: false } }
   })
 
   // llm:status — current active LLM provider + model
