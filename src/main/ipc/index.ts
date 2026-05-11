@@ -8,6 +8,8 @@ import { IpcChannels } from '../../shared/ipc-types'
 import type {
   BackendProxyRequest,
   BackendProxyResponse,
+  LlmStatusResult,
+  ModuleManifest,
   OmlxDetectResult,
   OmlxModelsResult,
   OmlxStartResult,
@@ -160,10 +162,36 @@ export function registerIpcHandlers(): void {
   // oMLX: stop server — kills both app-spawned and externally-started processes
   ipcMain.handle(IpcChannels.OmlxStop, (): OmlxStopResult => {
     if (omlxProcess) { omlxProcess.kill('SIGTERM'); omlxProcess = null }
-    // Also kill any omlx serve process not started by us (e.g. manual terminal launch)
-    execFile('pkill', ['-f', 'omlx serve'], () => { /* ignore exit code */ })
+    // pkill is macOS/Linux only; on Windows this is a no-op (omlx is not supported there yet)
+    if (process.platform !== 'win32') {
+      execFile('pkill', ['-f', 'omlx serve'], () => { /* ignore exit code */ })
+    }
     return { ok: true }
   })
+  // modules:list — returns manifests of all registered capability modules
+  ipcMain.handle(IpcChannels.ModulesList, async (): Promise<ModuleManifest[]> => {
+    try {
+      const res = await proxyToBackend({ method: 'GET', path: '/api/modules' })
+      if (res.ok) return res.data as ModuleManifest[]
+    } catch { /* daemon may not be ready yet */ }
+    return []
+  })
+
+  // llm:status — current active LLM provider + model
+  ipcMain.handle(IpcChannels.LlmStatus, async (): Promise<LlmStatusResult> => {
+    // Try oMLX first
+    const omlxModels = await fetchOmlxModels('http://127.0.0.1:8088', 'xiaobao8088')
+    if (omlxModels.length > 0) {
+      return { provider: 'omlx', url: 'http://127.0.0.1:8088', model: omlxModels[0] }
+    }
+    // Try Ollama
+    const ollamaModels = await fetchOmlxModels('http://127.0.0.1:11434', '')
+    if (ollamaModels.length > 0) {
+      return { provider: 'ollama', url: 'http://127.0.0.1:11434', model: ollamaModels[0] }
+    }
+    return { provider: 'none', url: '', model: '' }
+  })
+
   ipcMain.handle(IpcChannels.AppPing, () => 'pong')
   ipcMain.handle(IpcChannels.AppVersion, () => app.getVersion())
   ipcMain.handle(IpcChannels.ShellOpenExternal, (_event, url: unknown) => {

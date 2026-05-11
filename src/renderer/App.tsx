@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Agent24API } from '../main/preload'
+import type { ModuleManifest } from '../shared/ipc-types'
 
 declare global {
   interface Window { agent24: Agent24API }
@@ -8,21 +9,25 @@ import ChatPage from './pages/Chat'
 import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
+import HelloModule from './pages/modules/HelloModule'
 
-type Page = 'chat' | 'workbench' | 'models' | 'settings'
+// Static module route map — M2 will replace this with dynamic import()
+const MODULE_PAGES: Record<string, React.ComponentType> = {
+  '/modules/hello': HelloModule,
+}
 
-const NAV: { id: Page; icon: string; label: string }[] = [
+type BuiltinPage = 'chat' | 'workbench' | 'models' | 'settings'
+type Page = BuiltinPage | string  // string = module route
+
+const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
   { id: 'chat',      icon: '💬', label: '对话' },
   { id: 'workbench', icon: '🔧', label: '工作台' },
   { id: 'models',    icon: '🤖', label: '模型' },
   { id: 'settings',  icon: '⚙️', label: '设置' },
 ]
 
-const PAGE_TITLES: Record<Page, string> = {
-  chat:      '对话',
-  workbench: '工作台',
-  models:    '模型管理',
-  settings:  '设置',
+const BUILTIN_TITLES: Record<BuiltinPage, string> = {
+  chat: '对话', workbench: '工作台', models: '模型管理', settings: '设置',
 }
 
 export function App(): JSX.Element {
@@ -31,23 +36,68 @@ export function App(): JSX.Element {
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
+  const [modules, setModules] = useState<ModuleManifest[]>([])
+  const [llmLabel, setLlmLabel] = useState('Detecting…')
+  const initDone = useRef(false)
 
   useEffect(() => {
+    if (initDone.current) return
+    initDone.current = true
+
     void window.agent24.getAppVersion().then(setVersion)
 
-    const check = () => {
+    // Backend health + module list polling
+    const checkBackend = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/health' })
-        .then((res) => setBackendOk(res.ok))
+        .then((res) => {
+          setBackendOk(res.ok)
+          if (res.ok) {
+            void window.agent24.modulesList().then(setModules)
+          }
+        })
         .catch(() => setBackendOk(false))
     }
-    check()
-    const t = setInterval(check, 5000)
-    return () => clearInterval(t)
+    checkBackend()
+    const backendTimer = setInterval(checkBackend, 5000)
+
+    // oMLX auto-detect on startup
+    void (async () => {
+      const detected = await window.agent24.omlxDetect()
+      if (detected) {
+        setLlmLabel(`${detected.models[0] ?? 'unknown'} · oMLX`)
+      } else {
+        // Try to start oMLX
+        const started = await window.agent24.omlxStart(8088, 'xiaobao8088')
+        if (started.ok) {
+          // Poll until ready
+          for (let i = 0; i < 5; i++) {
+            await new Promise((r) => setTimeout(r, 2000))
+            const r = await window.agent24.omlxModels(started.url, 'xiaobao8088')
+            if (r.ok && r.models.length > 0) {
+              setLlmLabel(`${r.models[0]} · oMLX`)
+              break
+            }
+          }
+        } else {
+          setLlmLabel('No AI runtime')
+        }
+      }
+    })()
+
+    return () => clearInterval(backendTimer)
   }, [])
+
+  // UI modules with navItem get injected into sidebar
+  const moduleNavItems = modules.filter(
+    (m) => (m.type === 'ui' || m.type === 'hybrid') && m.navItem,
+  )
+
+  const pageTitle = BUILTIN_TITLES[page as BuiltinPage]
+    ?? modules.find((m) => m.navItem?.route === page)?.name
+    ?? page
 
   return (
     <div className={`app${darkMode ? '' : ' light'}`}>
-      {/* Floating expand button shown only when sidebar is collapsed */}
       {!sidebarOpen && (
         <button className="sidebar-expand-btn" onClick={() => setSidebarOpen(true)}>›</button>
       )}
@@ -63,7 +113,7 @@ export function App(): JSX.Element {
         </div>
 
         <nav className="sidebar-nav">
-          {NAV.map(item => (
+          {BUILTIN_NAV.map(item => (
             <button
               key={item.id}
               className={`nav-item ${page === item.id ? 'active' : ''}`}
@@ -74,15 +124,32 @@ export function App(): JSX.Element {
             </button>
           ))}
 
-          <div className="nav-section">能力模块</div>
-          <button className="nav-item" style={{ opacity: 0.5, cursor: 'default' }}>
-            <span className="icon">📚</span>
-            <span>小黑书 <span style={{ fontSize: 10 }}>模块</span></span>
-          </button>
-          <button className="nav-item" style={{ opacity: 0.5, cursor: 'default' }}>
-            <span className="icon">➕</span>
-            <span>安装模块</span>
-          </button>
+          {/* Dynamically injected UI module nav items */}
+          {moduleNavItems.length > 0 && (
+            <>
+              <div className="nav-section">能力模块</div>
+              {moduleNavItems.map((m) => (
+                <button
+                  key={m.id}
+                  className={`nav-item ${page === m.navItem!.route ? 'active' : ''}`}
+                  onClick={() => setPage(m.navItem!.route)}
+                >
+                  <span className="icon">{m.navItem!.icon}</span>
+                  <span>{m.navItem!.label}</span>
+                </button>
+              ))}
+            </>
+          )}
+
+          {moduleNavItems.length === 0 && (
+            <>
+              <div className="nav-section">能力模块</div>
+              <button className="nav-item" style={{ opacity: 0.5, cursor: 'default' }}>
+                <span className="icon">➕</span>
+                <span>安装模块</span>
+              </button>
+            </>
+          )}
         </nav>
 
         <div className="sidebar-footer">
@@ -98,9 +165,9 @@ export function App(): JSX.Element {
       {/* ── Main ── */}
       <div className={`main${sidebarOpen ? '' : ' sidebar-hidden'}`}>
         <div className="topbar">
-          <span className="topbar-title">{PAGE_TITLES[page]}</span>
+          <span className="topbar-title">{pageTitle}</span>
           {page === 'chat' && (
-            <span className="topbar-sub">Qwen3-30B-A3B · oMLX</span>
+            <span className="topbar-sub">{llmLabel}</span>
           )}
           <button
             className="theme-toggle-btn"
@@ -115,6 +182,19 @@ export function App(): JSX.Element {
         {page === 'workbench' && <WorkbenchPage />}
         {page === 'models'    && <ModelsPage />}
         {page === 'settings'  && <SettingsPage />}
+        {/* Module UI pages — static map in M1, dynamic import() in M2 */}
+        {moduleNavItems.map((m) => {
+          if (page !== m.navItem!.route) return null
+          const ModulePage = MODULE_PAGES[m.navItem!.route]
+          return ModulePage
+            ? <ModulePage key={m.id} />
+            : (
+              <div key={m.id} className="content">
+                <div className="page-title">{m.name}</div>
+                <p style={{ color: 'var(--muted)', fontSize: 13 }}>Component not registered in MODULE_PAGES.</p>
+              </div>
+            )
+        })}
       </div>
     </div>
   )

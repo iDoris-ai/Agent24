@@ -1,7 +1,5 @@
-// CapabilityModule interface — every capability registers its routes via this contract.
-// M3: replace SimpleRouter with FastifyInstance once Fastify is introduced.
-
 import type { CapabilityContext } from '../types'
+import type { ModuleManifest } from '../../shared/ipc-types'
 
 export interface SimpleRouter {
   get(path: string, handler: RouteHandler): void
@@ -16,7 +14,17 @@ export interface RouteContext {
 
 export type RouteHandler = (ctx: RouteContext) => Promise<unknown> | unknown
 
+/**
+ * UI module (type='ui'|'hybrid'):
+ *   - Declares navItem → shell injects it into sidebar automatically
+ *   - Ships a React component loaded lazily by the renderer
+ *   - Communicates back to daemon via window.agent24.backendProxy()
+ *
+ * Headless module (type='headless'):
+ *   - Registers daemon-side routes only, no renderer component
+ *   - Results surface through chat bubbles or notifications
+ */
 export interface CapabilityModule {
-  id: string
+  manifest: ModuleManifest
   register(router: SimpleRouter, ctx: CapabilityContext): void
 }

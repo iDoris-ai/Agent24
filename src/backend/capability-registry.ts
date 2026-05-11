@@ -1,12 +1,18 @@
 import type { CapabilityModule, SimpleRouter } from './capabilities/base'
 import type { CapabilityContext } from './types'
 import pingModule from './capabilities/example-ping'
+import summarizeModule from './capabilities/example-summarize'
+import helloUiModule from './capabilities/example-hello-ui'
 
-const MODULES: CapabilityModule[] = [pingModule]
+export const MODULES: CapabilityModule[] = [
+  pingModule,
+  summarizeModule,
+  helloUiModule,
+]
 
 export function registerAll(router: SimpleRouter, llmCtx: Omit<CapabilityContext, 'moduleId'>): void {
   for (const mod of MODULES) {
-    const ctx: CapabilityContext = { ...llmCtx, moduleId: mod.id }
+    const ctx: CapabilityContext = { ...llmCtx, moduleId: mod.manifest.id }
     mod.register(router, ctx)
   }
 }
