@@ -59,6 +59,9 @@ export function isServiceAvailable(): boolean {
 const registry = new Map<string, ServiceEntry>()
 // In-flight start promises — prevents concurrent double-start for the same moduleId (H1/H5)
 const starting = new Map<string, Promise<StartResult>>()
+// Boxes created but not yet healthy — tracked so stopAll() can clean them up (M2)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const pending = new Map<string, any>()
 
 function httpGet(url: string): Promise<number> {
   return new Promise((resolve) => {
@@ -111,6 +114,9 @@ async function doStartService(moduleId: string, cfg: ContainerConfig): Promise<S
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 
+  // M2: track box before health check so stopAll() can clean it up during startup window
+  pending.set(moduleId, box)
+
   // H4 fix: exec argv array directly, never via sh -c to avoid shell injection.
   // The service must be started with nohup via its own shell if needed — caller's responsibility.
   if (cfg.startCmd && cfg.startCmd.length > 0) {
@@ -129,6 +135,7 @@ async function doStartService(moduleId: string, cfg: ContainerConfig): Promise<S
   }
 
   const healthy = await waitHealthy(hostPort, healthPath)
+  pending.delete(moduleId)
   if (!healthy) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (box as any).stop().catch(() => {/* best-effort */})
@@ -161,7 +168,12 @@ export async function stopService(moduleId: string): Promise<void> {
 }
 
 export async function stopAll(): Promise<void> {
-  await Promise.all([...registry.keys()].map(stopService))
+  // M2: stop both running and pending (started but not yet healthy) containers
+  const pendingStops = [...pending.entries()].map(async ([id, box]) => {
+    pending.delete(id)
+    await (box as { stop(): Promise<void> }).stop().catch(() => {/* best-effort */})
+  })
+  await Promise.all([...[...registry.keys()].map(stopService), ...pendingStops])
 }
 
 export function getHostPort(moduleId: string): number | null {

@@ -6,7 +6,7 @@ import helloUiModule from './capabilities/example-hello-ui'
 import codeboxModule from './capabilities/example-codebox'
 import serviceBoxModule from './capabilities/example-service-box'
 import { discoverInstalledModules, loadInstalledModule } from './module-installer'
-import { startService } from './boxlite-service'
+import { startService, stopService } from './boxlite-service'
 
 // Built-in bundled modules (always present)
 export const MODULES: CapabilityModule[] = [
@@ -68,10 +68,12 @@ export function registerCommunityModule(
 }
 
 // Remove a community module from the registry (routes stay until restart).
+// M6: also stops any running service container for this module.
 export function unregisterCommunityModule(moduleId: string): boolean {
   const idx = _communityModules.findIndex((m) => m.manifest.id === moduleId)
   if (idx === -1) return false
   _communityModules.splice(idx, 1)
+  void stopService(moduleId)
   return true
 }
 
