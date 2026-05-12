@@ -88,9 +88,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const body = method === 'POST' ? await readBody(req) : undefined
     try {
       const result = await proxyToService(moduleId, method, subPath, url.search, body)
-      const payload = JSON.stringify(result.body)
-      res.writeHead(result.status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) })
-      res.end(payload)
+      // L2: forward container response headers and raw body without re-encoding
+      res.writeHead(result.status, { ...result.headers, 'Content-Length': result.rawBody.length })
+      res.end(result.rawBody)
     } catch (err) {
       send(res, 502, { error: err instanceof Error ? err.message : 'Proxy error' })
     }

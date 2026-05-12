@@ -1,14 +1,16 @@
 // ServiceBox example — long-running Python HTTP service inside a BoxLite VM.
 // Demonstrates the M4 pattern: manifest.container → auto-start → /api/svc/<id>/* proxy.
 // The service responds to GET /health and GET /api/echo?msg=<text>.
+//
+// L3: startCmd writes the service script to a temp file inside the VM rather than
+// passing it via `python -c '...'` to avoid argument-length limits and injection risk.
 
 import type { CapabilityModule, SimpleRouter } from './base'
 import type { CapabilityContext } from '../types'
 import { getHostPort } from '../boxlite-service'
 
-// Inline Python service — no Dockerfile needed.
-const PYTHON_SERVICE = `
-import json, time
+// Python service script written to /tmp/svc.py inside the VM at container start.
+const PYTHON_SERVICE_SCRIPT = `import json, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -32,7 +34,15 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 HTTPServer(('0.0.0.0', 8000), H).serve_forever()
-`.trim()
+`
+
+// Encode as base64 so the shell command contains no special characters (no escaping needed).
+// Inside the VM: decode → write /tmp/svc.py → run with python.
+const SCRIPT_B64 = Buffer.from(PYTHON_SERVICE_SCRIPT).toString('base64')
+const START_CMD = [
+  'sh', '-c',
+  `echo ${SCRIPT_B64} | base64 -d > /tmp/svc.py && python /tmp/svc.py`,
+]
 
 const serviceBoxModule: CapabilityModule = {
   manifest: {
@@ -50,7 +60,7 @@ const serviceBoxModule: CapabilityModule = {
     container: {
       image: 'python:slim',
       port: 8000,
-      startCmd: ['python', '-c', PYTHON_SERVICE],
+      startCmd: START_CMD,
       healthPath: '/health',
       memoryMib: 256,
     },

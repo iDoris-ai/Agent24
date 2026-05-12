@@ -186,14 +186,14 @@ export function isRegistered(moduleId: string): boolean {
 }
 
 // Proxy an HTTP request to the service container.
-// Returns { status, body } or throws on connection error.
+// Returns { status, headers, rawBody } — caller forwards headers and body as-is.
 export async function proxyToService(
   moduleId: string,
   method: 'GET' | 'POST',
   subPath: string,
   query: string,
   body?: unknown,
-): Promise<{ status: number; body: unknown }> {
+): Promise<{ status: number; headers: Record<string, string>; rawBody: Buffer }> {
   const entry = registry.get(moduleId)
   if (!entry) throw Object.assign(new Error(`Service ${moduleId} not running`), { statusCode: 503 })
 
@@ -214,10 +214,14 @@ export async function proxyToService(
       const chunks: Buffer[] = []
       res.on('data', (c: Buffer) => chunks.push(c))
       res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString()
-        let parsed: unknown
-        try { parsed = JSON.parse(raw) } catch { parsed = raw }
-        resolve({ status: res.statusCode ?? 200, body: parsed })
+        // L2: pass container headers through transparently (strip hop-by-hop headers)
+        const fwd: Record<string, string> = {}
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (!['transfer-encoding', 'connection', 'keep-alive'].includes(k.toLowerCase()) && typeof v === 'string') {
+            fwd[k] = v
+          }
+        }
+        resolve({ status: res.statusCode ?? 200, headers: fwd, rawBody: Buffer.concat(chunks) })
       })
     })
     req.on('error', reject)
