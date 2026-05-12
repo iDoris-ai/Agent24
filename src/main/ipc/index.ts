@@ -9,7 +9,7 @@ import type {
   BackendProxyRequest,
   BackendProxyResponse,
   LlmStatusResult,
-  ModuleManifest,
+  ModuleInfo,
   OmlxDetectResult,
   OmlxModelsResult,
   OmlxStartResult,
@@ -168,13 +168,30 @@ export function registerIpcHandlers(): void {
     }
     return { ok: true }
   })
-  // modules:list — returns manifests of all registered capability modules
-  ipcMain.handle(IpcChannels.ModulesList, async (): Promise<ModuleManifest[]> => {
+  // modules:list — returns manifests + enabled state of all registered capability modules
+  ipcMain.handle(IpcChannels.ModulesList, async (): Promise<ModuleInfo[]> => {
     try {
       const res = await proxyToBackend({ method: 'GET', path: '/api/modules' })
-      if (res.ok) return res.data as ModuleManifest[]
+      if (res.ok) return res.data as ModuleInfo[]
     } catch { /* daemon may not be ready yet */ }
     return []
+  })
+
+  // modules:enable / modules:disable — toggle module state via backend
+  ipcMain.handle(IpcChannels.ModulesEnable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
+    if (typeof id !== 'string') return { ok: false }
+    try {
+      const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/enable` })
+      return { ok: res.ok }
+    } catch { return { ok: false } }
+  })
+
+  ipcMain.handle(IpcChannels.ModulesDisable, async (_event, id: unknown): Promise<{ ok: boolean }> => {
+    if (typeof id !== 'string') return { ok: false }
+    try {
+      const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
+      return { ok: res.ok }
+    } catch { return { ok: false } }
   })
 
   // llm:status — current active LLM provider + model

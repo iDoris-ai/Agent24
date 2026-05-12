@@ -5,6 +5,7 @@ import http from 'node:http'
 import { URL } from 'node:url'
 import { LLMGateway } from './llm-gateway'
 import { registerAll, MODULES } from './capability-registry'
+import { loadState, isEnabled, setEnabled } from './module-state'
 import type { SimpleRouter, RouteContext, RouteHandler } from './capabilities/base'
 import type { LLMRequest } from './types'
 
@@ -13,17 +14,22 @@ const HOST = '127.0.0.1'
 
 type RouteKey = `${'GET' | 'POST'} ${string}`
 
-const routes = new Map<RouteKey, RouteHandler>()
+interface RouteEntry {
+  handler: RouteHandler
+  moduleId: string
+}
+
+const routes = new Map<RouteKey, RouteEntry>()
 
 const gateway = new LLMGateway()
 
-function buildRouter(): SimpleRouter {
+function buildRouter(moduleId: string): SimpleRouter {
   return {
     get(path: string, handler: RouteHandler) {
-      routes.set(`GET ${path}`, handler)
+      routes.set(`GET ${path}`, { handler, moduleId })
     },
     post(path: string, handler: RouteHandler) {
-      routes.set(`POST ${path}`, handler)
+      routes.set(`POST ${path}`, { handler, moduleId })
     },
   }
 }
@@ -58,9 +64,35 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   const url = new URL(req.url ?? '/', base)
   const method = (req.method ?? 'GET').toUpperCase() as 'GET' | 'POST'
 
-  const handler = routes.get(`${method} ${url.pathname}` as RouteKey)
-  if (!handler) {
+  // Special: module enable/disable (parameterised — not in the routes Map)
+  const enableMatch = url.pathname.match(/^\/api\/modules\/([^/]+)\/(enable|disable)$/)
+  if (enableMatch && method === 'POST') {
+    let id: string
+    try {
+      id = decodeURIComponent(enableMatch[1])
+    } catch {
+      send(res, 400, { error: 'Invalid module id encoding' })
+      return
+    }
+    if (!MODULES.some((m) => m.manifest.id === id)) {
+      send(res, 404, { error: 'Unknown module', id })
+      return
+    }
+    const action = enableMatch[2] as 'enable' | 'disable'
+    setEnabled(id, action === 'enable')
+    send(res, 200, { ok: true, id, enabled: action === 'enable' })
+    return
+  }
+
+  const entry = routes.get(`${method} ${url.pathname}` as RouteKey)
+  if (!entry) {
     send(res, 404, { error: 'Not found', path: url.pathname })
+    return
+  }
+
+  // Check module enabled state (system routes use moduleId 'system' — always pass)
+  if (entry.moduleId !== 'system' && !isEnabled(entry.moduleId)) {
+    send(res, 503, { error: 'Module disabled', id: entry.moduleId })
     return
   }
 
@@ -72,7 +104,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   }
 
   try {
-    const result = await handler(ctx)
+    const result = await entry.handler(ctx)
     send(res, 200, result)
   } catch (err) {
     const statusCode = (err as { statusCode?: number }).statusCode ?? 500
@@ -82,26 +114,33 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 }
 
 function registerCoreRoutes(): void {
-  routes.set('GET /health', () => ({ status: 'ok', ts: Date.now() }))
+  routes.set('GET /health', { handler: () => ({ status: 'ok', ts: Date.now() }), moduleId: 'system' })
 
-  // Return manifests of all registered capability modules
-  routes.set('GET /api/modules', () => MODULES.map((m) => m.manifest))
+  // Return manifests + enabled state for all registered capability modules
+  routes.set('GET /api/modules', {
+    handler: () => MODULES.map((m) => ({ ...m.manifest, enabled: isEnabled(m.manifest.id) })),
+    moduleId: 'system',
+  })
 
-  routes.set('GET /api/llm/usage', () => gateway.getUsage())
+  routes.set('GET /api/llm/usage', { handler: () => gateway.getUsage(), moduleId: 'system' })
 
-  routes.set('POST /api/llm/chat', async (ctx) => {
-    const req = ctx.body as LLMRequest
-    if (!req.messages || !Array.isArray(req.messages)) {
-      throw Object.assign(new Error('messages array required'), { statusCode: 400 })
-    }
-    const message = await gateway.chat(req, 'direct')
-    return { message }
+  routes.set('POST /api/llm/chat', {
+    handler: async (ctx) => {
+      const req = ctx.body as LLMRequest
+      if (!req.messages || !Array.isArray(req.messages)) {
+        throw Object.assign(new Error('messages array required'), { statusCode: 400 })
+      }
+      const message = await gateway.chat(req, 'direct')
+      return { message }
+    },
+    moduleId: 'system',
   })
 }
 
 function start(): void {
+  loadState()
   registerCoreRoutes()
-  registerAll(buildRouter(), { llm: gateway })
+  registerAll((moduleId) => buildRouter(moduleId), { llm: gateway })
 
   const server = http.createServer((req, res) => {
     void handleRequest(req, res)

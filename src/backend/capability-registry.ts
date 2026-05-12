@@ -10,8 +10,12 @@ export const MODULES: CapabilityModule[] = [
   helloUiModule,
 ]
 
-export function registerAll(router: SimpleRouter, llmCtx: Omit<CapabilityContext, 'moduleId'>): void {
+export function registerAll(
+  routerFactory: (moduleId: string) => SimpleRouter,
+  llmCtx: Omit<CapabilityContext, 'moduleId'>,
+): void {
   for (const mod of MODULES) {
+    const router = routerFactory(mod.manifest.id)
     const ctx: CapabilityContext = { ...llmCtx, moduleId: mod.manifest.id }
     mod.register(router, ctx)
   }

@@ -27,12 +27,12 @@ describe('MODULES', () => {
 describe('registerAll', () => {
   it('calls register on every module with correct moduleId in context', () => {
     const registeredRoutes: string[] = []
-    const router: SimpleRouter = {
+    const routerFactory = (_moduleId: string): SimpleRouter => ({
       get: (path) => { registeredRoutes.push(`GET ${path}`) },
       post: (path) => { registeredRoutes.push(`POST ${path}`) },
-    }
+    })
     const mockLlm = { chat: vi.fn(), getUsage: vi.fn(), clearUsage: vi.fn() }
-    registerAll(router, { llm: mockLlm as never })
+    registerAll(routerFactory, { llm: mockLlm as never })
 
     expect(registeredRoutes).toContain('GET /api/capabilities/ping')
     expect(registeredRoutes).toContain('POST /api/capabilities/summarize')
