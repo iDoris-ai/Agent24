@@ -1,6 +1,7 @@
-// BoxLite Host — singleton availability check and CodeBox factory.
-// BoxLite requires the platform-native NAPI binding (@boxlite-ai/boxlite-darwin-arm64 on M-series).
-// If the binding is unavailable (CI, wrong platform) all APIs return a graceful error.
+// BoxLite Host — availability check and CodeBox factory.
+// Requires: Apple Silicon macOS 12+ (Hypervisor.framework) or Linux x86_64/ARM64 with KVM.
+// On unsupported hardware the native NAPI binding will fail to load — we surface a clear
+// hardware-requirements message rather than a degraded experience.
 
 let CodeBoxClass: (new () => { run(code: string): Promise<string>; stop(): Promise<void> }) | null = null
 let initError: string | null = null
@@ -10,14 +11,15 @@ function ensureInit(): void {
   if (initialized) return
   initialized = true
   try {
-    // Dynamic require to avoid top-level import failure when native binding is absent.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require('@boxlite-ai/boxlite') as { CodeBox: typeof CodeBoxClass }
     CodeBoxClass = mod.CodeBox
     console.log('[boxlite] native binding loaded')
   } catch (err) {
-    initError = err instanceof Error ? err.message : String(err)
-    console.warn('[boxlite] native binding unavailable:', initError)
+    const raw = err instanceof Error ? err.message : String(err)
+    // Replace low-level NAPI/binding errors with a human-readable hardware requirement message.
+    initError = `需要 Apple Silicon macOS 12+（Hypervisor.framework）或 Linux x86_64/ARM64（KVM）。技术详情：${raw}`
+    console.warn('[boxlite] hardware not supported:', raw)
   }
 }
 

@@ -11,11 +11,38 @@ interface RunResult {
   error?: string
 }
 
-const PLACEHOLDER = `# 在这里输入 Python 代码
-import sys
+const PLACEHOLDER = `import sys
 print(f"Python {sys.version}")
 print("Hello from BoxLite sandbox!")
 `
+
+function UnsupportedScreen({ error }: { error: string }) {
+  return (
+    <div className="content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ textAlign: 'center', maxWidth: 420 }}>
+        <div style={{ fontSize: 48, marginBottom: 16 }}>🖥️</div>
+        <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>此设备不支持 Python 沙箱</div>
+        <div style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.7, marginBottom: 20 }}>
+          Python 沙箱需要 Apple Silicon（M1/M2/M3）macOS 12+ 的 Hypervisor.framework，
+          或 Linux x86_64/ARM64 with KVM。
+        </div>
+        <div style={{
+          fontSize: 11,
+          fontFamily: 'monospace',
+          color: '#e57373',
+          background: 'var(--surface2)',
+          border: '1px solid var(--border)',
+          borderRadius: 8,
+          padding: '10px 14px',
+          textAlign: 'left',
+          wordBreak: 'break-all',
+        }}>
+          {error}
+        </div>
+      </div>
+    </div>
+  )
+}
 
 export default function CodeSandboxPage() {
   const [code, setCode] = useState(PLACEHOLDER)
@@ -32,10 +59,16 @@ export default function CodeSandboxPage() {
       .catch(() => setStatus({ available: false, error: 'Backend unavailable' }))
   }, [])
 
+  // Not yet loaded — blank while checking
+  if (status === null) return <div className="content" />
+
+  // Hardware not supported — full-page notice, no degraded editor
+  if (!status.available) return <UnsupportedScreen error={status.error ?? '未知错误'} />
+
   async function run() {
     if (running) return
     setRunning(true)
-    setOutput('Running…')
+    setOutput('启动沙箱容器… (首次运行需拉取 python:slim 镜像，约需 1-2 分钟)')
     abortRef.current = false
     try {
       const res = await window.agent24.backendProxy({
@@ -45,11 +78,7 @@ export default function CodeSandboxPage() {
       })
       if (abortRef.current) return
       const data = res.data as RunResult
-      if (data.ok) {
-        setOutput(data.output ?? '(no output)')
-      } else {
-        setOutput(`Error: ${data.error ?? 'unknown'}`)
-      }
+      setOutput(data.ok ? (data.output ?? '(no output)') : `Error: ${data.error ?? 'unknown'}`)
     } catch (err) {
       if (!abortRef.current) setOutput(`Error: ${String(err)}`)
     } finally {
@@ -57,35 +86,20 @@ export default function CodeSandboxPage() {
     }
   }
 
-  const available = status?.available ?? true
-
   return (
     <div className="content">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
         <div className="page-title">Python 沙箱</div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {status !== null && (
-            <span style={{ fontSize: 11, color: available ? 'var(--accent)' : 'var(--muted)' }}>
-              {available ? '● BoxLite 就绪' : '● BoxLite 不可用'}
-            </span>
-          )}
-          <button
-            className="btn btn-primary"
-            style={{ fontSize: 12 }}
-            onClick={() => void run()}
-            disabled={running || !available}
-          >
-            {running ? '运行中…' : '▶ 运行'}
-          </button>
-        </div>
+        <button
+          className="btn btn-primary"
+          style={{ fontSize: 12 }}
+          onClick={() => void run()}
+          disabled={running}
+        >
+          {running ? '运行中…' : '▶ 运行'}
+        </button>
       </div>
-      <div className="page-sub">BoxLite 隔离沙箱 · 每次运行独立容器 · 支持 Python 3</div>
-
-      {status !== null && !available && (
-        <div style={{ fontSize: 12, color: '#e57373', marginBottom: 12, padding: '8px 12px', background: 'var(--surface2)', borderRadius: 8 }}>
-          BoxLite 原生绑定不可用：{status.error ?? '未知错误'}
-        </div>
-      )}
+      <div className="page-sub">BoxLite 硬件级 VM 隔离 · 每次运行独立容器 · Apple Silicon Hypervisor.framework</div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12, flex: 1 }}>
         <div>
@@ -132,7 +146,7 @@ export default function CodeSandboxPage() {
               margin: 0,
             }}
           >
-            {output || '点击"运行"执行代码'}
+            {output || '点击"▶ 运行"执行代码'}
           </pre>
         </div>
       </div>
