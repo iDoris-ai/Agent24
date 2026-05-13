@@ -14,6 +14,8 @@ export const IpcChannels = {
   ModulesList: 'modules:list',
   ModulesEnable: 'modules:enable',
   ModulesDisable: 'modules:disable',
+  ModulesInstall: 'modules:install',
+  ModulesUninstall: 'modules:uninstall',
   LlmStatus: 'llm:status',
 } as const
 
@@ -82,6 +84,8 @@ export interface ModuleManifest {
   type: ModuleType
   permissions: Permission[]
   navItem?: ModuleNavItem
+  /** M3: LLM models this module needs — Gateway will ensure they're loaded on register */
+  models?: string[]
 }
 
 // ModuleManifest extended with runtime enable/disable state
@@ -93,4 +97,15 @@ export interface LlmStatusResult {
   provider: 'omlx' | 'ollama' | 'none'
   url: string
   model: string
+}
+
+export interface ModuleInstallResult {
+  ok: boolean
+  id?: string        // module id if successfully loaded
+  error?: string
+}
+
+export interface ModuleUninstallResult {
+  ok: boolean
+  error?: string
 }

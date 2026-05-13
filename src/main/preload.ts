@@ -9,6 +9,8 @@ import {
   type BackendProxyResponse,
   type LlmStatusResult,
   type ModuleInfo,
+  type ModuleInstallResult,
+  type ModuleUninstallResult,
   type OmlxDetectResult,
   type OmlxModelsResult,
   type OmlxStartResult,
@@ -38,6 +40,10 @@ const api = {
     ipcRenderer.invoke(IpcChannels.ModulesEnable, id),
   modulesDisable: (id: string): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke(IpcChannels.ModulesDisable, id),
+  modulesInstall: (packageName: string): Promise<ModuleInstallResult> =>
+    ipcRenderer.invoke(IpcChannels.ModulesInstall, packageName),
+  modulesUninstall: (packageName: string, id?: string): Promise<ModuleUninstallResult> =>
+    ipcRenderer.invoke(IpcChannels.ModulesUninstall, packageName, id),
   llmStatus: (): Promise<LlmStatusResult> =>
     ipcRenderer.invoke(IpcChannels.LlmStatus),
 } as const

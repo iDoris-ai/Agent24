@@ -10,6 +10,8 @@ import type {
   BackendProxyResponse,
   LlmStatusResult,
   ModuleInfo,
+  ModuleInstallResult,
+  ModuleUninstallResult,
   OmlxDetectResult,
   OmlxModelsResult,
   OmlxStartResult,
@@ -192,6 +194,31 @@ export function registerIpcHandlers(): void {
       const res = await proxyToBackend({ method: 'POST', path: `/api/modules/${encodeURIComponent(id)}/disable` })
       return { ok: res.ok }
     } catch { return { ok: false } }
+  })
+
+  // modules:install — install a community module from npm
+  ipcMain.handle(IpcChannels.ModulesInstall, async (_event, packageName: unknown): Promise<ModuleInstallResult> => {
+    if (typeof packageName !== 'string' || !packageName) return { ok: false, error: 'packageName required' }
+    try {
+      const res = await proxyToBackend({ method: 'POST', path: '/api/modules/install', body: { packageName } })
+      if (res.ok) {
+        const data = res.data as { ok: boolean; id?: string }
+        return { ok: true, id: data.id }
+      }
+      const data = res.data as { error?: string }
+      return { ok: false, error: data?.error ?? 'Install failed' }
+    } catch { return { ok: false, error: 'Backend unreachable' } }
+  })
+
+  // modules:uninstall — remove a community module
+  ipcMain.handle(IpcChannels.ModulesUninstall, async (_event, packageName: unknown, id: unknown): Promise<ModuleUninstallResult> => {
+    if (typeof packageName !== 'string' || !packageName) return { ok: false, error: 'packageName required' }
+    try {
+      const body: Record<string, string> = { packageName }
+      if (typeof id === 'string') body.id = id
+      const res = await proxyToBackend({ method: 'POST', path: '/api/modules/uninstall', body })
+      return { ok: res.ok, error: res.ok ? undefined : (res.data as { error?: string })?.error }
+    } catch { return { ok: false, error: 'Backend unreachable' } }
   })
 
   // llm:status — current active LLM provider + model

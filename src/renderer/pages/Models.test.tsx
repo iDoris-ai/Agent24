@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeAll } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import ModelsPage from './Models'
+
+beforeAll(() => {
+  window.agent24 = {
+    backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: [] }),
+  } as never
+})
 
 describe('ModelsPage', () => {
   it('renders model list title', () => {

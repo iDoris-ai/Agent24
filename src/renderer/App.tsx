@@ -9,25 +9,30 @@ import ChatPage from './pages/Chat'
 import WorkbenchPage from './pages/Workbench'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
+import ModulesManagerPage from './pages/ModulesManager'
 import HelloModule from './pages/modules/HelloModule'
+import CodeSandboxPage from './pages/CodeSandbox'
 
 // Static module route map — M2 will replace this with dynamic import()
 const MODULE_PAGES: Record<string, React.ComponentType> = {
   '/modules/hello': HelloModule,
+  'codebox': CodeSandboxPage,
 }
 
-type BuiltinPage = 'chat' | 'workbench' | 'models' | 'settings'
+type BuiltinPage = 'chat' | 'workbench' | 'models' | 'settings' | 'modules-manager'
 type Page = BuiltinPage | string  // string = module route
 
 const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
-  { id: 'chat',      icon: '💬', label: '对话' },
-  { id: 'workbench', icon: '🔧', label: '工作台' },
-  { id: 'models',    icon: '🤖', label: '模型' },
-  { id: 'settings',  icon: '⚙️', label: '设置' },
+  { id: 'chat',            icon: '💬', label: '对话' },
+  { id: 'workbench',       icon: '🔧', label: '工作台' },
+  { id: 'models',          icon: '🤖', label: '模型' },
+  { id: 'modules-manager', icon: '🧩', label: '模块管理' },
+  { id: 'settings',        icon: '⚙️', label: '设置' },
 ]
 
 const BUILTIN_TITLES: Record<BuiltinPage, string> = {
-  chat: '对话', workbench: '工作台', models: '模型管理', settings: '设置',
+  chat: '对话', workbench: '工作台', models: '模型管理',
+  'modules-manager': '模块管理', settings: '设置',
 }
 
 export function App(): JSX.Element {
@@ -144,7 +149,11 @@ export function App(): JSX.Element {
           {moduleNavItems.length === 0 && (
             <>
               <div className="nav-section">能力模块</div>
-              <button className="nav-item" style={{ opacity: 0.5, cursor: 'default' }}>
+              <button
+                className="nav-item"
+                onClick={() => setPage('modules-manager')}
+                style={{ opacity: 0.7 }}
+              >
                 <span className="icon">➕</span>
                 <span>安装模块</span>
               </button>
@@ -178,10 +187,11 @@ export function App(): JSX.Element {
           </button>
         </div>
 
-        {page === 'chat'      && <ChatPage />}
-        {page === 'workbench' && <WorkbenchPage />}
-        {page === 'models'    && <ModelsPage />}
-        {page === 'settings'  && <SettingsPage />}
+        {page === 'chat'             && <ChatPage />}
+        {page === 'workbench'        && <WorkbenchPage />}
+        {page === 'models'           && <ModelsPage />}
+        {page === 'modules-manager'  && <ModulesManagerPage />}
+        {page === 'settings'         && <SettingsPage />}
         {/* Module UI pages — static map in M1, dynamic import() in M2 */}
         {moduleNavItems.map((m) => {
           if (page !== m.navItem!.route) return null

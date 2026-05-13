@@ -4,8 +4,15 @@
 import http from 'node:http'
 import { URL } from 'node:url'
 import { LLMGateway } from './llm-gateway'
-import { registerAll, MODULES } from './capability-registry'
+import {
+  registerAll,
+  getAllModules,
+  loadCommunityModules,
+  registerCommunityModule,
+  unregisterCommunityModule,
+} from './capability-registry'
 import { loadState, isEnabled, setEnabled } from './module-state'
+import { installModule, uninstallModule, loadInstalledModule } from './module-installer'
 import type { SimpleRouter, RouteContext, RouteHandler } from './capabilities/base'
 import type { LLMRequest } from './types'
 
@@ -74,13 +81,55 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       send(res, 400, { error: 'Invalid module id encoding' })
       return
     }
-    if (!MODULES.some((m) => m.manifest.id === id)) {
+    if (!getAllModules().some((m) => m.manifest.id === id)) {
       send(res, 404, { error: 'Unknown module', id })
       return
     }
     const action = enableMatch[2] as 'enable' | 'disable'
     setEnabled(id, action === 'enable')
     send(res, 200, { ok: true, id, enabled: action === 'enable' })
+    return
+  }
+
+  // Special: module install (POST /api/modules/install)
+  if (url.pathname === '/api/modules/install' && method === 'POST') {
+    const body = await readBody(req) as { packageName?: string }
+    const packageName = body?.packageName
+    if (typeof packageName !== 'string' || !packageName) {
+      send(res, 400, { ok: false, error: 'packageName required' })
+      return
+    }
+    const result = await installModule(packageName)
+    if (!result.ok || !result.modulePath) {
+      send(res, 500, { ok: false, error: result.error })
+      return
+    }
+    const mod = loadInstalledModule(result.modulePath)
+    if (!mod) {
+      // Roll back: uninstall the package so the system stays consistent
+      await uninstallModule(packageName)
+      send(res, 500, { ok: false, error: 'Package installed but does not export a valid CapabilityModule — rolled back' })
+      return
+    }
+    registerCommunityModule(mod, buildRouter, { llm: gateway })
+    send(res, 200, { ok: true, id: mod.manifest.id, manifest: mod.manifest })
+    return
+  }
+
+  // Special: module uninstall (POST /api/modules/uninstall)
+  if (url.pathname === '/api/modules/uninstall' && method === 'POST') {
+    const body = await readBody(req) as { packageName?: string; id?: string }
+    const packageName = body?.packageName
+    const id = body?.id
+    if (typeof packageName !== 'string' || !packageName) {
+      send(res, 400, { ok: false, error: 'packageName required' })
+      return
+    }
+    if (typeof id === 'string') {
+      unregisterCommunityModule(id)
+    }
+    const result = await uninstallModule(packageName)
+    send(res, result.ok ? 200 : 500, { ok: result.ok, error: result.error })
     return
   }
 
@@ -118,11 +167,17 @@ function registerCoreRoutes(): void {
 
   // Return manifests + enabled state for all registered capability modules
   routes.set('GET /api/modules', {
-    handler: () => MODULES.map((m) => ({ ...m.manifest, enabled: isEnabled(m.manifest.id) })),
+    handler: () => getAllModules().map((m) => ({ ...m.manifest, enabled: isEnabled(m.manifest.id) })),
     moduleId: 'system',
   })
 
   routes.set('GET /api/llm/usage', { handler: () => gateway.getUsage(), moduleId: 'system' })
+
+  // M3: list all models known to oMLX with load status
+  routes.set('GET /api/llm/models', {
+    handler: () => gateway.listModels(),
+    moduleId: 'system',
+  })
 
   routes.set('POST /api/llm/chat', {
     handler: async (ctx) => {
@@ -139,6 +194,7 @@ function registerCoreRoutes(): void {
 
 function start(): void {
   loadState()
+  loadCommunityModules()       // M3: load previously installed community modules
   registerCoreRoutes()
   registerAll((moduleId) => buildRouter(moduleId), { llm: gateway })
 

@@ -2,104 +2,99 @@
 
 > 主里程碑列表见 [PLAN.md 第六节](PLAN.md#六roadmap里程碑)。本文档维护当前进度。
 > 所有重大决策见 [decision.md](decision.md)。
+> 最后更新：2026-05-12
 
 ---
 
-## M0（Bootstrap）— 进行中
+## M0（Bootstrap）— ✅ 完成
 
-### 已完成
 - [x] 创建 `AuraAIHQ/Agent24-Desktop` 仓库
-- [x] 引入 `vendor/xiaoheishu` submodule（参考实现）
-- [x] 写产品计划 `docs/PLAN.md`
-- [x] 写决策日志 `docs/decision.md`（11 个 ADR）
-- [x] 注册 npm scope `@auraaihq`
-- [x] 模块分类与命名规则确认（三层 + iDoris 子层）
-
-### 进行中
-- [ ] 创建 `AuraAIHQ/auraai-packages` monorepo 仓库
-- [ ] 初始化 pnpm workspace 骨架（packages/ + community/ + publishers/ + scrapers/ + idoris/）
-- [ ] 第一批占位包（core / sdk / cli），README + package.json，无实现
-
-### 待完成（M0 收尾）
-- [ ] CI 框架（pnpm + turbo + changesets）
-- [ ] devcontainer / 开发文档
+- [x] 写产品计划 `docs/PLAN.md`、决策日志 `docs/decision.md`（ADR-001~025）
+- [x] 注册 npm scope `@auraaihq`，模块分类与命名规则确认
 
 ---
 
-## M1（4-6 周）— Desktop 内核 + 第一批模块
+## M1（Desktop 内核 + 第一批模块）— ✅ 完成（已合并 main，2026-05-12）
 
-### 内核提取（从 vendor/xiaoheishu/desktop）
-- [ ] `electron/main.ts` → `Agent24-Desktop/src/main/main.ts`
-- [ ] `electron/preload.ts` → `Agent24-Desktop/src/main/preload.ts`
-- [ ] `electron/db.ts` → `@auraaihq/memory` (sqlite backend)
-- [ ] `electron/ai.ts` → `@auraaihq/ai-local` (拆出 node-llama-cpp 部分)
-- [ ] `electron/settings.ts` → `Agent24-Desktop/src/main/config/`
+**核心架构**
+- [x] Electron + React + TypeScript 骨架（Vite HMR，CSP 合规）
+- [x] IPC bridge：`contextBridge` 暴露 `window.agent24`，typed preload
+- [x] 后端 daemon：Node.js HTTP 服务，`127.0.0.1:8765`，零外部依赖
+- [x] `BackendManager`：主进程生命周期管理，健康检测 + 自动重启（连续 3 次失败）
 
-### 第一批占位模块（M1 末有可运行 demo）
-- [ ] `@auraaihq/core` — 模块加载器骨架
-- [ ] `@auraaihq/sdk` — 模块开发者公共 API
-- [ ] `@auraaihq/ai-bridge` — AI Layer 路由
-- [ ] `@auraaihq/ai-claude` — Claude 适配
-- [ ] `@auraaihq/ai-local` — node-llama-cpp 适配
-- [ ] `@auraaihq/memory` — L0-L1 实现（SQLite）
+**能力模块框架**
+- [x] `CapabilityModule` 接口（`base.ts`）：`manifest` + `register(router, ctx)`
+- [x] `capability-registry.ts`：静态 MODULES 注册表，`registerAll()` 批量注册
+- [x] `LLMGateway`：oMLX（端口 8088）→ Ollama（端口 11434）优先级路由 + failover
+- [x] 3 个内置参考模块：`ping`（headless）、`example-summarize`（headless+LLM）、`example-hello`（ui）
 
-### 第一个真实模块（参考实现）
-- [ ] `@auraaihq/publish-blog` — 抽离 xiaoheishu 的 blog 发布逻辑（最简单的 publisher）
+**UI**
+- [x] 动态 sidebar：从 daemon manifest 自动注入 `ui`/`hybrid` 模块导航项（5 秒轮询）
+- [x] Chat、Workbench、Models、Settings 页面骨架
+- [x] oMLX 开机自启动检测（`omlxDetect` → `omlxStart` → 轮询）
 
-### 接口规格 v0.1（M1 末）
-- [ ] 总结 publish-blog + memory 的实现共性 → 提出 `CapabilityModule` 接口规格
-
----
-
-## M2（6-8 周）— Agent 永远在线 + 通信 + iDoris-SDK 合并 + 模块管理 UI
-
-- [ ] Tray icon + 后台 daemon
-- [ ] Conversation Layer：任务分解 + 调度
-- [ ] MCP bridge 接 Agent24 skills
-- [ ] `@auraaihq/module-comm` — agent-speaker bridge
-- [ ] `@auraaihq/module-identity` — AirAccount 集成
-- [ ] **模块管理 UI（新增，详见 PLAN 七.6）**
-  - [ ] Desktop main process: 暴露 `ModuleManagerAPI`（list / enable / disable / getDetails）
-  - [ ] preload bridge 暴露给 renderer
-  - [ ] Renderer: 模块列表面板 + toggle 启停
-  - [ ] toggle on → `kernel.load(id)` / toggle off → `kernel.unload(id)`
-  - [ ] 显示模块 manifest（version / permissions / lifecycle）
-- [ ] **iDoris-SDK 合并到 monorepo（ADR-013）**
-  - [ ] 代码迁入 `auraai-packages/communication/wechat-bridge/`
-  - [ ] npm 包改名 `@agent-wechat/core` → `@auraaihq/wechat-bridge`
-  - [ ] 老包 deprecate
-  - [ ] simple-agent 升级依赖
-  - [ ] AuraAIHQ/iDoris-SDK 归档
-- [ ] `@auraaihq/module-wechat` 适配模块（包装 wechat-bridge 给 desktop 用）
-- [ ] 第二批 publisher：xiaohongshu / xiaoheishu / wechat-mp / twitter
+**质量保障**
+- [x] 单元测试覆盖（87%+ 行覆盖率），Vitest + @testing-library/react
+- [x] TypeScript 全量 typecheck（renderer + electron 两个 tsconfig）
+- [x] PR#8 通过 David review 并合并
 
 ---
 
-## M3（8-10 周）— Memory + Evolver + Agent24 替代
+## M2（系统托盘 + 模块启停 + 管理 UI）— ✅ 完成（已合并 main，2026-05-12）
 
-- [ ] `@auraaihq/memory` 升级到 L0-L3 完整分层
-- [ ] `@auraaihq/skill-bank` —（SkillRL 风格）
-- [ ] `@auraaihq/evolver` —（SkillClaw 风格守护进程）
-- [ ] ATIF 轨迹采集（Conversation Layer 写入 archive）
-- [ ] Codex 评估作为 validated publish gate
-- [ ] **Agent24 → npm 包迁移（ADR-014）**
-  - [ ] `@auraaihq/skills-evolve` / `skills-evaluate` / `skills-setup` / `skills-org-sync`
-  - [ ] `@auraaihq/cli install <skill>` 替代 install.sh
-  - [ ] AuraAIHQ/Agent24 标记为 **deprecated**：仓库 archive 只读 + README 顶部加显眼 deprecated banner 引导到新 npm 包
-- [ ] **Agent24-Desktop 改名为 Agent24（ADR-015）**
-  - [ ] 仓库 rename: AuraAIHQ/Agent24-Desktop → AuraAIHQ/Agent24（旧 Agent24 已归档，名字空出来）
-  - [ ] 应用产品名：去掉 "Desktop" 后缀
-  - [ ] 为未来 mobile 端做准备（Electron + Capacitor 或 Tauri 路径）
+**系统托盘（PR#9）**
+- [x] macOS 系统托盘图标：关闭窗口后 daemon 保持运行
+- [x] `isQuitting` flag + `before-quit` 事件：Cmd+Q / 菜单 Quit 正确退出
+- [x] `showOrCreateWindow()`：托盘点击、Dock 点击、`activate` 共用同一逻辑，防 destroyed-window crash
+- [x] 托盘菜单：「显示 Agent24」「退出」两个菜单项
+
+**模块启停（PR#10）**
+- [x] `~/.agent24/module-state.json` 持久化 enable/disable 状态（重启保留）
+- [x] `module-state.ts`：`loadState()` 带结构验证（防止损坏 JSON 导致崩溃）
+- [x] 后端 API：`POST /api/modules/:id/enable|disable`，带 URI decode 防护 + 404 校验
+- [x] IPC handlers：`ModulesEnable`、`ModulesDisable`，带 try/catch 返回 `{ ok: false }`
+
+**模块管理 UI（PR#11/12）**
+- [x] `ModulesManager.tsx`：列出所有模块（内置 + 社区），enable/disable toggle
+- [x] `loadSeq` ref 防止 stale async 竞态
+- [x] 错误 state 显示：toggle 失败时 UI 内联报错
 
 ---
 
-## M3 中后期补充（接续 M2 模块管理 UI）
+## M3（社区模块安装器 + BoxLite 沙箱 + oMLX 模型管理）— 🚧 进行中（PR#13 open）
 
-- [ ] **模块装/卸载流程**（PLAN 七.6 阶段 3）
-  - [ ] Desktop 加 npm install runner（独立 child process）
-  - [ ] `ModuleManagerAPI.install(packageName)` / `uninstall(id)`
-  - [ ] 安装后自动 register 到 kernel + UI 即时反映
-  - [ ] 失败回滚 + UI 错误提示
+### 已完成（当前 feat/m3-module-installer 分支）
+
+**社区模块 npm 安装器**
+- [x] `src/backend/module-installer.ts`：`installModule()` / `uninstallModule()` / `loadInstalledModule()` / `discoverInstalledModules()`
+- [x] 包名合法性校验（`isValidPackageName`，防命令注入）
+- [x] 安装失败自动回滚（load 失败 → 自动 npm uninstall，系统状态保持一致）
+- [x] 社区模块持久化：安装的模块写入 `~/.agent24/modules/`，重启后自动加载
+- [x] `capability-registry.ts` 扩展：`_communityModules[]`、`loadCommunityModules()`、`registerCommunityModule()`、`unregisterCommunityModule()`
+- [x] 后端 API：`POST /api/modules/install`（含回滚）、`POST /api/modules/uninstall`
+- [x] IPC 类型：`ModulesInstall`、`ModulesUninstall`，`ModuleInstallResult`、`ModuleUninstallResult`
+- [x] `ModulesManager.tsx` 新增 npm 安装面板（包名输入 + 安装按钮 + 反馈消息）
+
+**LLM 模型声明（oMLX model management）**
+- [x] `ModuleManifest.models?: string[]`：模块可声明所需 LLM 模型
+- [x] `LLMGateway.ensureModel(id)` / `ensureModels(ids[])`：注册时自动加载/下载模型（non-blocking）
+- [x] oMLX 管理 API 封装：`omlxListModels()` / `omlxLoadModel()` / `omlxDownloadModel()` / `omlxPollDownload()`
+- [x] 后端 API：`GET /api/llm/models`（返回 oMLX 实时模型状态列表）
+- [x] Models 页面：实时 oMLX 模型状态（加载/未加载状态点）+ 静态推荐目录
+
+**BoxLite Python 沙箱**
+- [x] 安装 `@boxlite-ai/boxlite` + `@boxlite-ai/boxlite-darwin-arm64` 原生绑定
+- [x] `src/backend/boxlite-host.ts`：懒加载单例，原生绑定不可用时优雅降级（CI 安全）
+- [x] `src/backend/capabilities/example-codebox.ts`：hybrid 模块，`POST /api/codebox/run`（每次独立容器）+ `GET /api/codebox/status`
+- [x] `src/renderer/pages/CodeSandbox.tsx`：Python 代码编辑器 + 运行按钮 + 输出面板 + BoxLite 可用性状态
+- [x] 全部 67 个测试通过，TypeScript typecheck 通过
+
+### 已全部完成（2026-05-12 确认）
+
+- [x] Chat 页面接入真实 LLM（`POST /api/llm/chat`，oMLX → Ollama failover，用户已验证可用）
+- [x] IPC bridge：`modules:install` / `modules:uninstall` handlers 在 `ipc/index.ts` + preload 均已实现
+- [ ] Workbench 页面功能实现（当前为占位骨架，M4 规划）
+- [ ] PR#13 David review → merge
 
 ---
 

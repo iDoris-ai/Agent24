@@ -3,8 +3,8 @@ import { MODULES, registerAll } from './capability-registry'
 import type { SimpleRouter } from './capabilities/base'
 
 describe('MODULES', () => {
-  it('contains exactly 3 built-in modules', () => {
-    expect(MODULES).toHaveLength(3)
+  it('contains exactly 4 built-in modules', () => {
+    expect(MODULES).toHaveLength(4)
   })
 
   it('all modules have valid manifests', () => {

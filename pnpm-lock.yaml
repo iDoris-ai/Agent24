@@ -8,6 +8,12 @@ importers:
 
   .:
     dependencies:
+      '@boxlite-ai/boxlite':
+        specifier: ^0.9.3
+        version: 0.9.3
+      '@boxlite-ai/boxlite-darwin-arm64':
+        specifier: ^0.9.3
+        version: 0.9.3
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -186,6 +192,21 @@ packages:
   '@bcoe/v8-coverage@1.0.2':
     resolution: {integrity: sha512-6zABk/ECA/QYSCQ1NGiVwwbQerUCZ+TQbp64Q3AgmfNvurHH0j8TtXa1qbShXA6qqkpAj4V5W8pP6mLe1mcMqA==}
     engines: {node: '>=18'}
+
+  '@boxlite-ai/boxlite-darwin-arm64@0.9.3':
+    resolution: {integrity: sha512-i8xKqAfHzTqLSB4j42C7VX4Gjo0uExh18E0bEkeyKJvSXjRVqQafOUSvDEIt76j7//viclSfVlZSX0CdmALs0g==}
+    engines: {node: '>=18.0.0'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@boxlite-ai/boxlite@0.9.3':
+    resolution: {integrity: sha512-TVuq4qbTfzcPvjOi5wKt6sMclvN4TyU9FnFrHRGdHS4Yj+5DqZ0r0c9FKvVMPL12DvAgY3cFPpmCvQcIUT2eqQ==}
+    engines: {node: '>=18.0.0'}
+    peerDependencies:
+      playwright-core: '>=1.58.0'
+    peerDependenciesMeta:
+      playwright-core:
+        optional: true
 
   '@bramus/specificity@2.4.2':
     resolution: {integrity: sha512-ctxtJ/eA+t+6q2++vj5j7FYX3nRu311q1wfYH3xjlLOsczhlhxAg2FWNUXhpGvAw3BWo1xBcvOV6/YLc2r5FJw==}
@@ -2951,6 +2972,12 @@ snapshots:
       '@babel/helper-validator-identifier': 7.28.5
 
   '@bcoe/v8-coverage@1.0.2': {}
+
+  '@boxlite-ai/boxlite-darwin-arm64@0.9.3': {}
+
+  '@boxlite-ai/boxlite@0.9.3':
+    optionalDependencies:
+      '@boxlite-ai/boxlite-darwin-arm64': 0.9.3
 
   '@bramus/specificity@2.4.2':
     dependencies:
