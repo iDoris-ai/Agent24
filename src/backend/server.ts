@@ -240,12 +240,11 @@ function start(): void {
     process.exit(1)
   })
 
-  // H2: stop all service containers before exiting so no orphan VMs remain
-  process.on('SIGTERM', () => {
-    server.close(() => {
-      void stopAll().finally(() => process.exit(0))
-    })
-  })
+  // H2: stop all service containers before exiting so no orphan VMs remain.
+  // SIGINT covers Ctrl+C in dev; SIGTERM covers production process managers.
+  const shutdown = () => server.close(() => void stopAll().finally(() => process.exit(0)))
+  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', shutdown)
 }
 
 start()
