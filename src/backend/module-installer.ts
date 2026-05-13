@@ -28,6 +28,8 @@ function ensureModulesDir(): void {
 }
 
 // Validate package name: allow @scope/name and plain name formats only.
+// Version specifiers (e.g. "pkg@1.0.0") are intentionally rejected — we always
+// install the latest published version to keep the install path predictable.
 function isValidPackageName(name: string): boolean {
   return /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/.test(name)
 }
@@ -48,10 +50,7 @@ export async function installModule(packageName: string): Promise<{ ok: boolean;
     })
 
     // Resolve the installed package path
-    const pkgName = packageName.split('@').filter(Boolean)[0]
-    const modulePath = path.join(MODULES_DIR, 'node_modules', packageName.startsWith('@')
-      ? packageName
-      : pkgName)
+    const modulePath = path.join(MODULES_DIR, 'node_modules', packageName)
 
     if (!fs.existsSync(modulePath)) {
       return { ok: false, error: `Package installed but module path not found: ${modulePath}` }
