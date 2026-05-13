@@ -86,6 +86,14 @@ export interface ModuleManifest {
   navItem?: ModuleNavItem
   /** M3: LLM models this module needs — Gateway will ensure they're loaded on register */
   models?: string[]
+  /** M4: OCI container service — BoxLite starts the container and proxies /api/svc/<id>/* to it */
+  container?: {
+    image: string         // OCI image, e.g. 'python:slim'
+    port: number          // guest port inside container
+    startCmd?: string[]   // command to start the service (defaults to image entrypoint)
+    healthPath?: string   // health-check path polled until 200 (default: '/health')
+    memoryMib?: number    // default 512
+  }
 }
 
 // ModuleManifest extended with runtime enable/disable state

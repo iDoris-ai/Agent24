@@ -1,10 +1,21 @@
 import { describe, it, expect, vi } from 'vitest'
+
+// Mock boxlite-service so registerAll doesn't try to start real containers in tests
+vi.mock('./boxlite-service', () => ({
+  startService: vi.fn().mockResolvedValue({ ok: true, hostPort: 18000 }),
+  stopService: vi.fn().mockResolvedValue(undefined),
+  stopAll: vi.fn().mockResolvedValue(undefined),
+  getHostPort: vi.fn().mockReturnValue(null),
+  isServiceAvailable: vi.fn().mockReturnValue(false),
+  proxyToService: vi.fn().mockResolvedValue({ status: 200, body: {} }),
+}))
+
 import { MODULES, registerAll } from './capability-registry'
 import type { SimpleRouter } from './capabilities/base'
 
 describe('MODULES', () => {
-  it('contains exactly 4 built-in modules', () => {
-    expect(MODULES).toHaveLength(4)
+  it('contains exactly 5 built-in modules', () => {
+    expect(MODULES).toHaveLength(5)
   })
 
   it('all modules have valid manifests', () => {
