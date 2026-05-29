@@ -1,4 +1,4 @@
-// Agent24-Desktop main process entry — M2: integrates BackendManager daemon.
+// Agent24 main process entry — M2: integrates BackendManager daemon.
 
 import { app, BrowserWindow, Menu, Tray, nativeImage, session } from 'electron'
 import path from 'node:path'

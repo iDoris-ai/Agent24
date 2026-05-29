@@ -1,10 +1,10 @@
-# Agent24-Desktop
+# Agent24
 
 > 跨平台 Electron 桌面框架——为 Agent24 生态提供统一的"个人 AI 助手"承载壳，支持可插拔能力模块、多 AI 适配、分层记忆、跨 agent 通信。
 
 ## 定位
 
-**Agent24-Desktop 是框架，不是应用。** 我们提供：
+**Agent24 是框架，不是应用。** 我们提供：
 
 - 跨平台分发（macOS / Windows）
 - 后台 daemon + 用户交互一致性
@@ -15,7 +15,7 @@
 
 **应用方**（如小黑书、博客、社区工具等）从本框架 fork，搭载具体场景的能力模块。
 
-> **重命名计划**：M3 末 `AuraAIHQ/Agent24-Desktop` → `AuraAIHQ/Agent24`（旧 Agent24 仓库届时归档，名字空出来，详见 [ADR-015](docs/decision.md)）。
+> **重命名计划**：M3 末 `AuraAIHQ/Agent24` → `AuraAIHQ/Agent24`（旧 Agent24 仓库届时归档，名字空出来，详见 [ADR-015](docs/decision.md)）。
 
 ---
 

@@ -1,6 +1,6 @@
-# Agent24-Desktop 产品计划与架构
+# Agent24 产品计划与架构
 
-> 完整设计文档，记录从 xiaoheishu/desktop 借鉴 → Agent24-Desktop 通用框架 → 应用方 fork 这一演进路径上的所有决策。
+> 完整设计文档，记录从 xiaoheishu/desktop 借鉴 → Agent24 通用框架 → 应用方 fork 这一演进路径上的所有决策。
 > 创建日期：2026-04-27
 
 ---
@@ -256,7 +256,7 @@ SkillBank 主分支
 
 ```
 M1 (4-6周) — Desktop 壳 + 模块化骨架
-  □ AuraAIHQ/Agent24-Desktop 仓库（已建）
+  □ AuraAIHQ/Agent24 仓库（已建）
   □ 借鉴 vendor/xiaoheishu/desktop 的 Electron + Vite + React 架构
   □ 抽象 CapabilityModule 接口
   □ xiaoheishu 发布逻辑包装为第一批模块（blog / 小红书 / 微信公众号）
@@ -293,10 +293,10 @@ M5 (后续) — 生态
 ## 七、与 xiaoheishu 的兼容与演进
 
 - **当前**：xiaoheishu/desktop 是源参考，作为 submodule 引入
-- **M1 完成后**：从 xiaoheishu/desktop 提取通用代码到 Agent24-Desktop 主目录，xiaoheishu 特定能力（小红书发布等）抽离为独立模块
-- **M2-M3**：xiaoheishu 切换为基于 Agent24-Desktop fork，自身只维护小红书相关模块和 UI 差异
+- **M1 完成后**：从 xiaoheishu/desktop 提取通用代码到 Agent24 主目录，xiaoheishu 特定能力（小红书发布等）抽离为独立模块
+- **M2-M3**：xiaoheishu 切换为基于 Agent24 fork，自身只维护小红书相关模块和 UI 差异
 - **接口契约**：双方共同维护 `CapabilityModule` 接口，保持向后兼容
-- **同步策略**：Agent24-Desktop 是源，xiaoheishu 周期性 rebase 上游
+- **同步策略**：Agent24 是源，xiaoheishu 周期性 rebase 上游
 
 ---
 
@@ -322,12 +322,12 @@ M5 (后续) — 生态
 - agent-config.yaml 作为 skills-evolve 默认 config
 - hooks 作为各 skill 包自带
 - `AuraAIHQ/Agent24` 仓库标记为 **deprecated**：archive 只读，README 顶部加 deprecated banner 引导到 npm 包
-- M3 末紧接着 `AuraAIHQ/Agent24-Desktop` rename → `AuraAIHQ/Agent24`（详见 ADR-015）
+- M3 末紧接着 `AuraAIHQ/Agent24` rename → `AuraAIHQ/Agent24`（详见 ADR-015）
 
 ### 整合后生态规模
 
 活跃 repo: 7 → **3-4**
-- AuraAIHQ/Agent24-Desktop (Electron 应用)
+- AuraAIHQ/Agent24 (Electron 应用)
 - AuraAIHQ/auraai-packages (npm monorepo)
 - AuraAIHQ/iDoris (AI 模型)
 - AuraAIHQ/agent-speaker (Go 通信，不进 npm)
@@ -346,7 +346,7 @@ M5 (后续) — 生态
 
 ```
 ┌────────── 用户面 ──────────┐
-│  Agent24-Desktop UI        │   ← 模块管理面板
+│  Agent24 UI        │   ← 模块管理面板
 │  ┌───────────────────────┐ │
 │  │ ☑ identity   (启用)   │ │
 │  │ ☑ wallet     (启用)   │ │   ← toggle on/off
@@ -460,9 +460,9 @@ pnpm publish
 | 仓库 | 角色 | URL |
 |------|------|-----|
 | AuraAIHQ/Agent24 | 自进化 Skills 系统（Claude Code skills）| https://github.com/AuraAIHQ/Agent24 |
-| AuraAIHQ/Agent24-Desktop | 跨平台 Electron 框架（本仓库）| https://github.com/AuraAIHQ/Agent24-Desktop |
+| AuraAIHQ/Agent24 | 跨平台 Electron 框架（本仓库）| https://github.com/AuraAIHQ/Agent24 |
 | AuraAIHQ/iDoris | 个人全景洞察 AI（Prism 启发）| https://github.com/AuraAIHQ/iDoris |
 | AuraAIHQ/iDoris-SDK | 微信桥接 SDK（前 MushroomDAO/Agent-WeChat-SDK）| https://github.com/AuraAIHQ/iDoris-SDK |
 | AuraAIHQ/agent-speaker | Nostr-based agent 通信 | https://github.com/AuraAIHQ/agent-speaker |
 | AuraAIHQ/simple-agent | 微信场景的 Level 1 agent | https://github.com/AuraAIHQ/simple-agent |
-| MushroomDAO/Xiaoheishu | 应用参考（M1 后从 Agent24-Desktop fork）| https://github.com/MushroomDAO/Xiaoheishu |
+| MushroomDAO/Xiaoheishu | 应用参考（M1 后从 Agent24 fork）| https://github.com/MushroomDAO/Xiaoheishu |
