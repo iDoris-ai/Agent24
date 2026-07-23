@@ -11,7 +11,7 @@ function ensureInit(): void {
   if (initialized) return
   initialized = true
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const mod = require('@boxlite-ai/boxlite') as { CodeBox: typeof CodeBoxClass }
     CodeBoxClass = mod.CodeBox
     console.log('[boxlite] native binding loaded')

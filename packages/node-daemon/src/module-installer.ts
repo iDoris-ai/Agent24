@@ -85,7 +85,7 @@ export async function uninstallModule(packageName: string): Promise<{ ok: boolea
 // The package must export { manifest, register } at its main entry.
 export function loadInstalledModule(modulePath: string): CapabilityModule | null {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const mod = require(modulePath) as { manifest?: unknown; register?: unknown }
     if (
       mod &&

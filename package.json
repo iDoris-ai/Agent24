@@ -1,91 +1,30 @@
 {
-  "name": "agent24-desktop",
+  "name": "agent24-monorepo",
   "version": "0.0.0",
   "private": true,
-  "description": "Cross-platform Electron framework for Agent24 — pluggable capability modules + AI layer + memory + agent communication",
+  "description": "Agent24 — 24/7 personal & community agent platform (Electron shell + daemon + protocol)",
   "license": "Apache-2.0",
-  "main": "dist/main/main.js",
   "engines": {
     "node": ">=22"
   },
   "packageManager": "pnpm@9.12.0",
   "scripts": {
-    "dev": "concurrently --kill-others-on-fail \"pnpm dev:vite\" \"pnpm dev:electron\"",
-    "dev:vite": "vite",
-    "dev:electron": "wait-on http://localhost:5173 && tsc -p tsconfig.electron.json && cross-env NODE_ENV=development electron .",
-    "build": "vite build && tsc -p tsconfig.electron.json",
-    "build:win": "pnpm build && electron-builder --win",
-    "build:mac": "pnpm build && electron-builder --mac",
-    "build:linux": "pnpm build && electron-builder --linux",
-    "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "lint": "eslint src --ext .ts,.tsx",
-    "format": "prettier --write \"src/**/*.{ts,tsx,css}\""
-  },
-  "dependencies": {
-    "@boxlite-ai/boxlite": "^0.9.3",
-    "@boxlite-ai/boxlite-darwin-arm64": "^0.9.3",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "dev": "pnpm --filter @agent24/node-daemon build && pnpm --filter @agent24/desktop dev",
+    "build": "pnpm --filter @agent24/node-daemon build && pnpm --filter @agent24/desktop build",
+    "typecheck": "pnpm --filter @agent24/desktop typecheck && pnpm --filter @agent24/node-daemon typecheck",
+    "test": "pnpm --filter @agent24/desktop test && pnpm --filter @agent24/node-daemon test",
+    "test:contract": "pnpm --filter @agent24/contract-tests test",
+    "lint": "eslint apps/desktop/src packages/node-daemon/src --ext .ts,.tsx",
+    "format": "prettier --write \"apps/desktop/src/**/*.{ts,tsx,css}\" \"packages/node-daemon/src/**/*.ts\"",
+    "build:mac": "pnpm --filter @agent24/desktop build:mac",
+    "build:win": "pnpm --filter @agent24/desktop build:win",
+    "build:linux": "pnpm --filter @agent24/desktop build:linux"
   },
   "devDependencies": {
-    "@testing-library/jest-dom": "^6.9.1",
-    "@testing-library/react": "^16.3.2",
-    "@types/node": "^22.0.0",
-    "@types/react": "^18.3.1",
-    "@types/react-dom": "^18.3.0",
     "@typescript-eslint/eslint-plugin": "^7",
     "@typescript-eslint/parser": "^7",
-    "@vitejs/plugin-react": "^4.3.0",
-    "@vitest/coverage-v8": "^4.1.5",
-    "concurrently": "^9.0.0",
-    "cross-env": "^7.0.3",
-    "electron": "^34.5.8",
-    "electron-builder": "^25.0.0",
     "eslint": "^8",
-    "jsdom": "^29.1.1",
-    "typescript": "^5.6.0",
-    "vite": "^6.0.0",
-    "vitest": "^4.1.5",
-    "wait-on": "^8.0.0"
-  },
-  "build": {
-    "appId": "ai.auraai.agent24",
-    "productName": "Agent24",
-    "directories": {
-      "output": "release",
-      "buildResources": "assets"
-    },
-    "files": [
-      "dist/**/*",
-      "package.json"
-    ],
-    "extraResources": [
-      {
-        "from": "dist/backend",
-        "to": "backend",
-        "filter": [
-          "**/*"
-        ]
-      }
-    ],
-    "mac": {
-      "category": "public.app-category.productivity",
-      "target": [
-        "dmg"
-      ]
-    },
-    "win": {
-      "target": [
-        "nsis"
-      ]
-    },
-    "linux": {
-      "target": [
-        "AppImage"
-      ],
-      "category": "Utility"
-    }
+    "prettier": "^3.3.0",
+    "typescript": "^5.6.0"
   }
 }

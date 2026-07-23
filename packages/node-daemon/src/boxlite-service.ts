@@ -41,7 +41,7 @@ function ensureServiceInit(): void {
   if (serviceInitialized) return
   serviceInitialized = true
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const mod = require('@boxlite-ai/boxlite') as { SimpleBox: typeof SimpleBoxClass }
     SimpleBoxClass = mod.SimpleBox
     console.log('[svc] SimpleBox native binding loaded')

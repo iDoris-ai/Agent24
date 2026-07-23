@@ -64,6 +64,9 @@ export interface OmlxWarmupResult {
 }
 
 // ── Module system ─────────────────────────────────────────────────────────────
+// MIRROR NOTICE: packages/node-daemon/src/manifest.ts keeps an identical copy;
+// machine-readable truth is protocol/module.schema.json. Unified via generated
+// api-client in task A6 — keep in lockstep until then.
 
 export type ModuleType = 'ui' | 'headless' | 'hybrid'
 
@@ -94,6 +97,8 @@ export interface ModuleManifest {
     healthPath?: string   // health-check path polled until 200 (default: '/health')
     memoryMib?: number    // default 512
   }
+  /** RESERVED (E5): AgentStore / PGL charter metadata — see protocol/module.schema.json */
+  pgl?: Record<string, unknown>
 }
 
 // ModuleManifest extended with runtime enable/disable state
