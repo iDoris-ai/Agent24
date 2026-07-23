@@ -15,8 +15,8 @@
   "properties": {
     "id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]*$",
-      "description": "Unique module id (kebab-case)"
+      "pattern": "^(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*$",
+      "description": "Unique module id — a plain or scoped npm package name (same rule as module-installer.ts isValidPackageName; community modules use their package name as id). Note this deliberately allows npm-legal plain names like foo.bar/foo_x, not just kebab-case."
     },
     "version": {
       "type": "string",

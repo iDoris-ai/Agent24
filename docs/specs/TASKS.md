@@ -4,7 +4,7 @@
 > 状态值：`pending` → `in-progress` → `in-pr(#N)` → `merged` ｜ `blocked(原因)`
 > loop 每轮：取「状态 pending 且依赖均为 in-pr/merged」中序号最靠前的任务执行（见 LOOP.md）。
 > 每完成一步（提 PR / 收到 merge）由 loop 更新本文件并 commit。
-> 最后更新：2026-07-23（A0 #21、A1 #23 已 merge；A2 in-pr #24 base=main）
+> 最后更新：2026-07-23（A0 #21、A1 #23、A2 #24 已 merge；A3 in-pr #25）
 
 ## 执行顺序总览（最佳路径）
 
@@ -19,8 +19,8 @@
 |---|---|---|---|---|
 | A0 | 提交现有设计文档 PR | — | merged | #21 |
 | A1 | `protocol/` v1 真源：openapi.yaml | A0 | merged | #23 |
-| A2 | `protocol/` 事件与模块 schema | A1 | in-pr | #24 |
-| A3 | contract-tests 包（对现 node daemon） | A1 | pending | |
+| A2 | `protocol/` 事件与模块 schema | A1 | merged | #24 |
+| A3 | contract-tests 包（对现 node daemon） | A1 | in-pr | #25 |
 | A4 | 仓库重构为 pnpm workspace 目标布局 | A3 | pending | |
 | A5 | node-daemon v1 适配层（mock daemon） | A4 | pending | |
 | A6 | api-client 生成管道 + CI 三 job | A5 | pending | |
@@ -39,8 +39,8 @@
 - 验收：两文件过 ajv 校验（含每类事件至少一个合法示例 fixture，fixtures 放 `protocol/fixtures/`）。
 
 ### A3 contract-tests 包
-- 新建 `packages/contract-tests/`（vitest，独立 package.json，读 `BASE_URL` env 默认 `http://127.0.0.1:8765`）。覆盖现 node daemon 已有能力在 v1 出现前的现状端点（/health、/api/llm/chat、/api/llm/models、/api/llm/usage）各正/错例，并为 v1 端点建好按 milestone 跳过的测试骨架（`describe.todo`）。
-- 验收：本地起 daemon 后 `pnpm -F contract-tests test` 全绿；不依赖 Electron。
+- 新建 `packages/contract-tests/`（vitest，独立 package.json，读 `A24_BASE_URL` env 默认 `http://127.0.0.1:8765`——不可用 `BASE_URL`，Vite 内置变量会被 vitest 注入覆盖）。覆盖现 node daemon 已有能力在 v1 出现前的现状端点（/health、/api/llm/chat、/api/llm/models、/api/llm/usage）各正/错例，并为 v1 端点建好按 milestone 跳过的测试骨架（`describe.todo`）。
+- 验收：本地起 daemon 后 `pnpm --dir packages/contract-tests test` 全绿（`-F` workspace 过滤待 A4 落地后启用）；不依赖 Electron。
 
 ### A4 仓库重构为 pnpm workspace
 - `src/main+renderer+shared` → `apps/desktop/src/…`；`src/backend` → `packages/node-daemon/`；根建 `pnpm-workspace.yaml`；各 tsconfig/vite/vitest/eslint 路径、electron-builder 配置、CI 同步更新；`rust/` 建空目录占位（README 说明）。
