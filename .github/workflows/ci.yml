@@ -126,7 +126,7 @@ jobs:
           done
           curl -sf http://127.0.0.1:8765/api/v1/health
 
-      - name: Run contract tests (LLM contract: down)
+      - name: "Run contract tests (A24_EXPECT_LLM=down)"
         env:
           A24_EXPECT_LLM: down
         run: pnpm test:contract
