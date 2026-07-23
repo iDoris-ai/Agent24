@@ -11,6 +11,8 @@ allow = [
   "ISC",
   "Zlib",
   "Unicode-3.0",
+  # webpki-roots (Mozilla CA data via rustls/reqwest) — permissive data license
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
