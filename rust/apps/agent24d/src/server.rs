@@ -140,13 +140,18 @@ pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::
             #[cfg(not(unix))]
             std::future::pending::<()>().await;
         };
+        let sigint = async {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                // Mirror the SIGTERM arm: a registration failure must never be
+                // indistinguishable from a real signal — park forever instead
+                // of resolving the select and triggering a spurious shutdown.
+                tracing::error!("SIGINT handler failed: {err}");
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
-            _ = sigterm => {},
-            r = tokio::signal::ctrl_c() => {
-                if let Err(err) = r {
-                    tracing::error!("SIGINT handler failed: {err}");
-                }
-            },
+            () = sigterm => {},
+            () = sigint => {},
         }
         tracing::info!("shutdown signal received");
         signal_cancel.cancel();
