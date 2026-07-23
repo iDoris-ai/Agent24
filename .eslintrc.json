@@ -41,6 +41,7 @@
     "vendor/",
     "*.config.ts",
     "*.config.js",
-    "packages/contract-tests/"
+    "packages/contract-tests/",
+    "packages/api-client/src/"
   ]
 }
