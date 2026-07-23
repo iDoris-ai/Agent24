@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent24_models::ProviderRegistry;
 use agent24_protocol::{ErrorBody, ErrorEnvelope, Health};
 use axum::Router;
 use axum::body::Body;
@@ -10,7 +11,7 @@ use axum::extract::State;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use rand::RngCore;
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +23,22 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct AppState {
     pub token: Arc<String>,
+    pub registry: Arc<ProviderRegistry>,
+    pub usage: Arc<crate::routes::UsageCounters>,
+    /// Daemon-wide shutdown token; handlers derive request tokens from it so
+    /// shutdown cancels in-flight provider calls (run-level cancel joins in C2)
+    pub shutdown: CancellationToken,
+}
+
+impl AppState {
+    pub fn new(token: String, registry: ProviderRegistry, shutdown: CancellationToken) -> Self {
+        Self {
+            token: Arc::new(token),
+            registry: Arc::new(registry),
+            usage: Arc::new(crate::routes::UsageCounters::default()),
+            shutdown,
+        }
+    }
 }
 
 pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
@@ -83,6 +100,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/chat", post(crate::routes::post_chat))
+        .route("/api/v1/models", get(crate::routes::get_models))
+        .route("/api/v1/usage", get(crate::routes::get_usage))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
@@ -96,9 +116,7 @@ pub fn generate_token() -> String {
 
 pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::Error> {
     let token = generate_token();
-    let state = AppState {
-        token: Arc::new(token.clone()),
-    };
+    let state = AppState::new(token.clone(), ProviderRegistry::from_env(), cancel.clone());
     let router = build_router(state);
 
     // 127.0.0.1 only — never a public bind (SPEC-001 §9)
@@ -184,9 +202,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn state() -> AppState {
-        AppState {
-            token: Arc::new("testtoken".to_owned()),
-        }
+        AppState::new(
+            "testtoken".to_owned(),
+            ProviderRegistry::new(vec![]),
+            CancellationToken::new(),
+        )
     }
 
     async fn body_json(res: Response) -> serde_json::Value {
@@ -265,14 +285,14 @@ mod tests {
         let res = router
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/models")
+                    .uri("/api/v1/definitely-not-a-route")
                     .header("Authorization", "Bearer testtoken")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        // B2: no routes beyond health yet — authorized requests hit the v1 404 envelope
+        // authorized but unknown route → v1 404 envelope
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let json = body_json(res).await;
         assert_eq!(json["error"]["code"], "not_found");
