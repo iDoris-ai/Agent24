@@ -4,8 +4,10 @@
 // NOTE: plain BASE_URL is unusable — it is a Vite builtin ('/' by default) that
 // vitest injects into process.env, silently shadowing any external value.
 
-// `||` (not ??) so an empty-string env var still falls back to the default
-export const BASE_URL = process.env['A24_BASE_URL'] || 'http://127.0.0.1:8765'
+// `||` (not ??) so an empty-string env var still falls back to the default.
+// Trailing slash is stripped: the daemon routes by exact pathname match, so
+// `http://host:8765/` + `/health` would otherwise become `//health` → 404.
+export const BASE_URL = (process.env['A24_BASE_URL'] || 'http://127.0.0.1:8765').replace(/\/$/, '')
 export const TOKEN = process.env['A24_TOKEN'] || ''
 
 export interface JsonResponse {
