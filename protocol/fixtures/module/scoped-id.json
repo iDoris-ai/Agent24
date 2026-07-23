@@ -1,0 +1,10 @@
+{
+  "id": "@auraaihq/example-summarize",
+  "version": "0.1.0",
+  "name": "Summarize",
+  "description": "community module installed from npm — id is the scoped package name",
+  "type": "headless",
+  "permissions": [
+    "llm"
+  ]
+}

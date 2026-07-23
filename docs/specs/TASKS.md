@@ -39,8 +39,8 @@
 - 验收：两文件过 ajv 校验（含每类事件至少一个合法示例 fixture，fixtures 放 `protocol/fixtures/`）。
 
 ### A3 contract-tests 包
-- 新建 `packages/contract-tests/`（vitest，独立 package.json，读 `BASE_URL` env 默认 `http://127.0.0.1:8765`）。覆盖现 node daemon 已有能力在 v1 出现前的现状端点（/health、/api/llm/chat、/api/llm/models、/api/llm/usage）各正/错例，并为 v1 端点建好按 milestone 跳过的测试骨架（`describe.todo`）。
-- 验收：本地起 daemon 后 `pnpm -F contract-tests test` 全绿；不依赖 Electron。
+- 新建 `packages/contract-tests/`（vitest，独立 package.json，读 `A24_BASE_URL` env 默认 `http://127.0.0.1:8765`——不可用 `BASE_URL`，Vite 内置变量会被 vitest 注入覆盖）。覆盖现 node daemon 已有能力在 v1 出现前的现状端点（/health、/api/llm/chat、/api/llm/models、/api/llm/usage）各正/错例，并为 v1 端点建好按 milestone 跳过的测试骨架（`describe.todo`）。
+- 验收：本地起 daemon 后 `pnpm --dir packages/contract-tests test` 全绿（`-F` workspace 过滤待 A4 落地后启用）；不依赖 Electron。
 
 ### A4 仓库重构为 pnpm workspace
 - `src/main+renderer+shared` → `apps/desktop/src/…`；`src/backend` → `packages/node-daemon/`；根建 `pnpm-workspace.yaml`；各 tsconfig/vite/vitest/eslint 路径、electron-builder 配置、CI 同步更新；`rust/` 建空目录占位（README 说明）。

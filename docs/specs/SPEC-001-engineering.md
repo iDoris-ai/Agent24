@@ -104,7 +104,7 @@ Agent24/
 
 | 类型 | 位置 | 要求 |
 |---|---|---|
-| Contract tests | `packages/contract-tests/` | 参数化 `BASE_URL`（+可选 token）；对协议中每个 endpoint/事件类型至少一条正例一条错例；**必须能对 node-daemon 与 agent24d 双跑** |
+| Contract tests | `packages/contract-tests/` | 参数化 `A24_BASE_URL`（+可选 `A24_TOKEN`；不可用 `BASE_URL`——Vite 内置变量会被 vitest 注入覆盖）；对协议中每个 endpoint/事件类型至少一条正例一条错例；**必须能对 node-daemon 与 agent24d 双跑** |
 | Rust 单测 | 各 crate `#[cfg(test)]` | 状态机穷举关键转移；审批表测 Drop=Abort；调度器测 pre-advance 防重复（用 mock clock，禁止 sleep 真实时间） |
 | TS 单测 | 各包 | 维持现有覆盖率阈值 |
 | 集成 | M-C 起 | `agent24d` 起真进程跑 contract tests（CI job） |
