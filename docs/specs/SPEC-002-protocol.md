@@ -11,7 +11,7 @@
 1. **两类消息**：流式/状态变化 = WS **notification**（单向，无回包）；需要用户决策 = **request**（带 id，客户端必须经 REST 回包）。目前唯一的 request 类事件是 `approval.required`。
 2. 所有路径带版本前缀 `/api/v1/`。旧的非版本化路由（`/api/modules` 等模块系统）在 M-E 前保持原样并存，不纳入 v1 契约。
 3. 命名：JSON 字段一律 `snake_case`；事件类型 `名词.动词过去式/现在时`（`run.started`）；id 均为字符串（ULID）。
-4. 时间戳：ISO 8601 UTC 字符串（`2026-07-23T12:00:00Z`）。
+4. 时间戳：ISO 8601 UTC 字符串（`2026-07-23T12:00:00Z`）。**可空字段在 wire 上恒出现**（值为 `null`），不允许省略字段——保证 Rust serde 与 TS 生成类型一致。
 5. 客户端类型不手写：TS 从 openapi.yaml 生成（`packages/api-client`）。**真源分两阶段**：B1 之前，`protocol/` 手写文件是唯一真源；B1 起，`agent24-protocol` Rust 类型成为生成源（schemars/utoipa 导出并覆盖 `protocol/` 文件），CI 校验「导出结果 == 仓库内文件」零漂移。
 
 ## 1. 核心数据结构
@@ -129,7 +129,7 @@ M-B agent24d 起动态端口 + `Authorization: Bearer <token>`（启动时 stdou
 | POST | `/runs/{id}/cancel` | 请求取消（幂等；任何状态可调） | M-C |
 | GET | `/approvals?status=pending` | 待审批列表（TUI/UI 轮询兜底） | M-C |
 | POST | `/approvals/{id}` | body = Decision；对已决议/过期返回 409 `approval_already_resolved` | M-C |
-| POST | `/schedules` | 创建（body = Schedule 去 id/last_run_at/next_run_at/consecutive_failures）→ 201 Schedule | M-C |
+| POST | `/schedules` | 创建（body = Schedule 去 id/last_run_at/next_run_at/consecutive_failures；`enabled` 默认 true、`delivery` 默认 `[]`）→ 201 Schedule | M-C |
 | GET | `/schedules` · `/schedules/{id}` | 列表 / 详情 | M-C |
 | PATCH | `/schedules/{id}` | 部分更新（name/enabled/spec/action/delivery 任意子集）→ 200 Schedule（spec 变更即重算 next_run_at） | M-C |
 | DELETE | `/schedules/{id}` | 删除 → 204 | M-C |
@@ -177,7 +177,7 @@ Electron/CLI spawn: agent24d serve --port 0
 agent24d stdout 首行: {"type":"ready","port":49317,"token":"<32B 随机>","version":"…"}
 之后所有请求: Authorization: Bearer <token>
 ```
-- 只绑定 `127.0.0.1`；token 每次启动重新生成；拒绝带浏览器 `Origin` 头的 WS 升级（防 CSRF）
+- 只绑定 `127.0.0.1`；token 每次启动重新生成；拒绝带浏览器 `Origin` 头的 WS 升级（防 CSRF）；**唯一免认证端点：`GET /api/v1/health`**（存活探测）
 - mock（node-daemon）豁免 token 但必须实现同样的 ready 行（token 可为空串），保证 BackendManager 逻辑统一
 
 ## 5. 错误格式

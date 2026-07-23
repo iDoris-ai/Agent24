@@ -9,10 +9,14 @@
 
 ```
 1. 同步状态
-   - git fetch；检查已提交 PR 的状态（gh pr list --author @me）
-   - 有 PR 被 merge → 更新 TASKS.md 状态为 merged
-   - 有 PR 收到用户 review 意见 → 【优先级最高】切到该分支处理意见，
-     修复 → 重跑本地验证 → 回复每条意见 → push；本轮到此为止
+   - git fetch；检查已提交 PR 的状态与 review 结论（gh pr list / gh pr view --json reviews）
+   - 外部 reviewer bot（另一 GitHub 账号，约每 10 分钟一轮）会 review 每个 PR：
+     · **APPROVED** → loop 执行 squash merge 进 main（**不带 --delete-branch**）→
+       先将后续 stacked 分支 `git rebase --onto main <旧base>` 并 force-push、
+       确认子 PR base 已指向 main，**然后才删除旧 base 分支**
+       （教训：先删分支会让 GitHub 直接 close 子 PR 且无法 reopen）→ 更新 TASKS.md 为 merged
+     · **CHANGES_REQUESTED** → 【优先级最高】切到该分支逐条修复 → 重跑本地验证 →
+       回复每条意见 → push，等 bot 复审（循环直到 APPROVED）
    - 有 PR CI 红 → 修 CI，同上优先处理
 
 2. 选任务
@@ -58,7 +62,7 @@
 
 ## 硬性纪律（每轮自检）
 
-1. **一个任务一个 PR**，不合并任务、不夹带无关改动、不动用户的未提交修改
+1. **一个任务一个 PR**，不合并任务、不夹带无关改动、不动用户的未提交修改；merge 仅在外部 reviewer APPROVED 后执行（squash），从不 merge 无 APPROVED 的 PR
 2. 审批/安全语义必须 **fail-closed**；测试里出现 sleep 真实时间即返工（用 mock clock）
 3. `packages/api-client` 只能生成，不能手改
 4. `vendor/reference/` 只读；GPL 仓库（zerostack）只看思路，禁止复制代码

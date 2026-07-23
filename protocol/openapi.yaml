@@ -1,0 +1,980 @@
+openapi: 3.1.0
+info:
+  title: Agent24 Daemon API
+  version: 1.0.0
+  summary: v1 contract for agent24d (Rust) and node-daemon (mock/reference)
+  description: |
+    Single source of truth for the Agent24 daemon REST API (phase 1: hand-written;
+    from task B1 on, generated from the `agent24-protocol` Rust crate and CI-checked
+    for zero drift). Human-readable spec: `docs/specs/SPEC-002-protocol.md`.
+
+    Conventions:
+    - All fields snake_case; ids are ULID strings; timestamps are ISO 8601 UTC.
+    - Paths marked `x-milestone: M-C` are not implemented by the M-A mock daemon.
+    - WS event protocol lives in `protocol/events.schema.json` (not in this file).
+    - Auth: `Authorization: Bearer <token>` (agent24d). The M-A mock daemon on
+      127.0.0.1:8765 accepts an empty token. Clients MUST ignore unknown fields
+      and unknown enum values (forward compatibility).
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+  contact:
+    name: Agent24
+    url: https://github.com/iDoris-ai/Agent24
+
+servers:
+  - url: http://127.0.0.1:8765/api/v1
+    description: M-A mock daemon (node-daemon, fixed port, empty token allowed)
+  - url: http://127.0.0.1:{port}/api/v1
+    description: agent24d (dynamic port + token from the stdout ready line)
+    variables:
+      port:
+        default: "0"
+        description: Dynamic port announced by the agent24d ready line
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: system
+  - name: chat
+  - name: sessions
+  - name: runs
+  - name: approvals
+  - name: schedules
+  - name: tools
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [system]
+      summary: Liveness and backend identity
+      security: []
+      responses:
+        "200":
+          description: Daemon is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /chat:
+    post:
+      operationId: postChat
+      tags: [chat]
+      summary: Pass-through chat (compat path; superseded by runs long-term)
+      description: |
+        Stateless from the client's perspective, but the server creates a
+        **transient Run** (session_id = null) per call and emits the normal
+        `run.started` / `model.delta` / `run.completed` events for it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: Completed chat response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ProviderUnavailable"
+
+  /models:
+    get:
+      operationId: listModels
+      tags: [system]
+      summary: List known models with tier and load status
+      responses:
+        "200":
+          description: Model list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [models]
+                properties:
+                  models:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Model"
+
+  /usage:
+    get:
+      operationId: getUsage
+      tags: [system]
+      summary: Aggregate token/cost usage since daemon start
+      responses:
+        "200":
+          description: Aggregate usage
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Usage"
+
+  /sessions:
+    post:
+      operationId: createSession
+      x-milestone: M-C
+      tags: [sessions]
+      summary: Create a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionCreate"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    get:
+      operationId: listSessions
+      x-milestone: M-C
+      tags: [sessions]
+      summary: List sessions
+      responses:
+        "200":
+          description: Session list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Session"
+
+  /sessions/{id}:
+    get:
+      operationId: getSession
+      x-milestone: M-C
+      tags: [sessions]
+      summary: Get one session
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /runs:
+    post:
+      operationId: createRun
+      x-milestone: M-C
+      tags: [runs]
+      summary: Start an agent run (async; progress via WS events)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunCreate"
+      responses:
+        "202":
+          description: Run accepted (status=queued)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    get:
+      operationId: listRuns
+      x-milestone: M-C
+      tags: [runs]
+      summary: List runs, optionally filtered by status
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/RunStatus"
+      responses:
+        "200":
+          description: Run list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Run"
+
+  /runs/{id}:
+    get:
+      operationId: getRun
+      x-milestone: M-C
+      tags: [runs]
+      summary: Get one run
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /runs/{id}/cancel:
+    post:
+      operationId: cancelRun
+      x-milestone: M-C
+      tags: [runs]
+      summary: Request cancellation (idempotent; valid in any state)
+      description: |
+        Idempotent: cancelling an already-terminal run returns 202 with the
+        current (unchanged) run. Cancellation of a streaming run must take
+        effect within 1s (see TASKS C2 acceptance).
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "202":
+          description: Cancellation requested (or run already terminal)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /approvals:
+    get:
+      operationId: listApprovals
+      x-milestone: M-C
+      tags: [approvals]
+      summary: List approvals (polling fallback for TUI/UI)
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/ApprovalStatus"
+      responses:
+        "200":
+          description: Approval list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [approvals]
+                properties:
+                  approvals:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Approval"
+
+  /approvals/{id}:
+    post:
+      operationId: decideApproval
+      x-milestone: M-C
+      tags: [approvals]
+      summary: Submit the decision for a pending approval
+      description: |
+        Body is a Decision object. The decision type MUST be one of the
+        `available_decisions` advertised on the approval. Fail-closed semantics:
+        an expired or otherwise resolved approval returns 409
+        `approval_already_resolved` and the submitted decision is discarded.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Decision"
+      responses:
+        "200":
+          description: Decision applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Approval"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Approval already resolved or expired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: approval_already_resolved
+                  message: Approval apr_01H… was already resolved (status=timed_out)
+
+  /schedules:
+    post:
+      operationId: createSchedule
+      x-milestone: M-C
+      tags: [schedules]
+      summary: Create a schedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScheduleCreate"
+      responses:
+        "201":
+          description: Created (next_run_at computed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    get:
+      operationId: listSchedules
+      x-milestone: M-C
+      tags: [schedules]
+      summary: List schedules
+      responses:
+        "200":
+          description: Schedule list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schedules]
+                properties:
+                  schedules:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Schedule"
+
+  /schedules/{id}:
+    get:
+      operationId: getSchedule
+      x-milestone: M-C
+      tags: [schedules]
+      summary: Get one schedule
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Schedule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: updateSchedule
+      x-milestone: M-C
+      tags: [schedules]
+      summary: Partially update a schedule
+      description: |
+        Any subset of name/enabled/spec/action/delivery. Changing `spec`
+        recomputes `next_run_at` immediately.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScheduleUpdate"
+      responses:
+        "200":
+          description: Updated schedule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteSchedule
+      x-milestone: M-C
+      tags: [schedules]
+      summary: Delete a schedule
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /schedules/{id}/run_now:
+    post:
+      operationId: runScheduleNow
+      x-milestone: M-C
+      tags: [schedules]
+      summary: Trigger one run immediately (does not change next_run_at)
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "202":
+          description: Run started
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id]
+                properties:
+                  run_id:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /tools:
+    get:
+      operationId: listTools
+      x-milestone: M-C
+      tags: [tools]
+      summary: List registered tools (builtin / mcp / module)
+      responses:
+        "200":
+          description: Tool list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tools]
+                properties:
+                  tools:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ToolInfo"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Token from the agent24d stdout ready line
+        (`{"type":"ready","port":…,"token":"…"}`). The M-A mock daemon accepts
+        an empty token; agent24d requires a non-empty one and rejects WebSocket
+        upgrades that carry a browser Origin header.
+
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Malformed or invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ProviderUnavailable:
+      description: No LLM provider reachable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Health:
+      type: object
+      required: [status, version, backend]
+      properties:
+        status:
+          type: string
+          const: ok
+        version:
+          type: string
+        backend:
+          type: string
+          description: Open enum — clients must tolerate unknown values
+          examples: [node, rust]
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          description: Open enum
+          examples: [system, user, assistant]
+        content:
+          type: string
+
+    ChatRequest:
+      type: object
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        model:
+          type: [string, "null"]
+          description: Model id override; null/omitted = daemon default
+
+    ChatResponse:
+      type: object
+      required: [message, usage]
+      properties:
+        message:
+          $ref: "#/components/schemas/ChatMessage"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    Session:
+      type: object
+      required: [id, title, channel, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        channel:
+          type: string
+          description: Open enum
+          examples: [desktop, cli, tui, schedule, wechat, nostr]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SessionCreate:
+      type: object
+      properties:
+        title:
+          type: string
+          default: ""
+        channel:
+          type: string
+          default: desktop
+
+    RunStatus:
+      type: string
+      description: |
+        State machine (only legal transitions):
+        queued → running → completed | failed | cancelled;
+        running ⇄ awaiting_approval;
+        queued|running|awaiting_approval → cancelled.
+      enum: [queued, running, awaiting_approval, completed, failed, cancelled]
+
+    RunInput:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+        model_override:
+          type: [string, "null"]
+
+    RunOutput:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+
+    Run:
+      type: object
+      required:
+        [id, session_id, status, input, output, error, usage,
+         schedule_id, created_at, started_at, ended_at]
+      properties:
+        id:
+          type: string
+        session_id:
+          type: [string, "null"]
+          description: Null for transient runs (e.g. created by /chat)
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        input:
+          $ref: "#/components/schemas/RunInput"
+        output:
+          oneOf:
+            - $ref: "#/components/schemas/RunOutput"
+            - type: "null"
+          description: Present when status=completed
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorBody"
+            - type: "null"
+          description: Present when status=failed
+        usage:
+          $ref: "#/components/schemas/Usage"
+        schedule_id:
+          type: [string, "null"]
+          description: Set when the run was fired by a schedule
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        ended_at:
+          type: [string, "null"]
+          format: date-time
+
+    RunCreate:
+      type: object
+      required: [prompt]
+      properties:
+        session_id:
+          type: [string, "null"]
+          description: Omit/null to create a transient run
+        prompt:
+          type: string
+        model_override:
+          type: [string, "null"]
+
+    ToolCallStatus:
+      type: string
+      enum: [running, completed, failed, denied]
+
+    ToolCall:
+      type: object
+      required: [id, run_id, tool, input, status, output_summary, started_at, ended_at]
+      properties:
+        id:
+          type: string
+        run_id:
+          type: string
+        tool:
+          type: string
+        input:
+          type: object
+          description: Tool input (full detail persisted for audit; summarized externally)
+          additionalProperties: true
+        status:
+          $ref: "#/components/schemas/ToolCallStatus"
+        output_summary:
+          type: [string, "null"]
+          description: Null while running
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: [string, "null"]
+          format: date-time
+
+    ApprovalStatus:
+      type: string
+      description: timed_out is equivalent to a denial (fail-closed)
+      enum: [pending, approved, denied, aborted, timed_out]
+
+    Approval:
+      type: object
+      required:
+        [id, run_id, tool_call_id, kind, summary, payload, available_decisions,
+         status, decision, expires_at, created_at, decided_at]
+      properties:
+        id:
+          type: string
+        run_id:
+          type: string
+        tool_call_id:
+          type: string
+        kind:
+          type: string
+          description: Open enum
+          examples: [exec, fs_write, network, module]
+        summary:
+          type: string
+          description: Human-readable one-liner of what is being requested
+        payload:
+          type: object
+          description: Kind-specific detail (e.g. command argv, cwd, reason)
+          additionalProperties: true
+        available_decisions:
+          type: array
+          description: |
+            Server-driven decision set. UIs MUST render exactly this list and
+            MUST NOT hardcode decision options (open set — tolerate unknown values).
+          items:
+            type: string
+          examples: [[approve, approve_for_session, deny, abort]]
+        status:
+          $ref: "#/components/schemas/ApprovalStatus"
+        decision:
+          oneOf:
+            - $ref: "#/components/schemas/Decision"
+            - type: "null"
+          description: Set once resolved
+        expires_at:
+          type: string
+          format: date-time
+          description: After this instant the approval resolves to timed_out
+        created_at:
+          type: string
+          format: date-time
+        decided_at:
+          type: [string, "null"]
+          format: date-time
+
+    Decision:
+      type: object
+      required: [type]
+      description: |
+        OPEN SET, server-driven: valid `type` values for a given approval are
+        exactly its `available_decisions` — clients submit one of those and
+        MUST NOT assume a fixed list; servers reject types not advertised
+        (400 invalid_request). Known types and their semantics:
+        - `approve` — approve this request only
+        - `approve_for_session` — approve and skip future approvals of the
+          same kind in this session
+        - `deny` — deny but let the run continue (`reason` REQUIRED and fed
+          back to the model)
+        - `abort` — deny and cancel the whole run
+        Future types (e.g. `approve_and_remember`) may carry extra fields —
+        hence additionalProperties: true.
+        Fail-closed: the implementation default (broken channel, cancelled
+        run, daemon restart) is equivalent to abort/deny — never approve.
+      properties:
+        type:
+          type: string
+          description: Open enum
+          examples: [approve, approve_for_session, deny, abort]
+        reason:
+          type: string
+          description: Required when type=deny
+      additionalProperties: true
+
+    ScheduleSpec:
+      description: When to fire
+      oneOf:
+        - title: cron
+          type: object
+          required: [type, expr]
+          properties:
+            type:
+              type: string
+              const: cron
+            expr:
+              type: string
+              description: 5/6-field cron expression
+            tz:
+              type: string
+              description: IANA timezone (e.g. Asia/Shanghai); default UTC
+        - title: every
+          type: object
+          required: [type, secs]
+          properties:
+            type:
+              type: string
+              const: every
+            secs:
+              type: integer
+              minimum: 60
+              maximum: 86400
+        - title: at
+          type: object
+          required: [type, ts]
+          description: One-shot
+          properties:
+            type:
+              type: string
+              const: at
+            ts:
+              type: string
+              format: date-time
+      discriminator:
+        propertyName: type
+
+    ScheduleAction:
+      type: object
+      required: [type, prompt]
+      properties:
+        type:
+          type: string
+          const: agent_run
+        prompt:
+          type: string
+        session_id:
+          type: [string, "null"]
+          description: Null = each firing creates a transient run
+        model_override:
+          type: [string, "null"]
+
+    DeliveryTarget:
+      type: object
+      required: [type]
+      description: Open set — M-F adds channel/webhook/email targets
+      properties:
+        type:
+          type: string
+          examples: [desktop_notification]
+      additionalProperties: true
+
+    Schedule:
+      type: object
+      required:
+        [id, name, enabled, spec, action, delivery,
+         last_run_at, next_run_at, consecutive_failures]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        enabled:
+          type: boolean
+        spec:
+          $ref: "#/components/schemas/ScheduleSpec"
+        action:
+          $ref: "#/components/schemas/ScheduleAction"
+        delivery:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeliveryTarget"
+        last_run_at:
+          type: [string, "null"]
+          format: date-time
+        next_run_at:
+          type: [string, "null"]
+          format: date-time
+          description: Null when disabled or one-shot already fired
+        consecutive_failures:
+          type: integer
+          description: Auto-disables the schedule at 5 (emits schedule.disabled)
+
+    ScheduleCreate:
+      type: object
+      required: [name, spec, action]
+      properties:
+        name:
+          type: string
+        enabled:
+          type: boolean
+          default: true
+        spec:
+          $ref: "#/components/schemas/ScheduleSpec"
+        action:
+          $ref: "#/components/schemas/ScheduleAction"
+        delivery:
+          type: array
+          default: []
+          items:
+            $ref: "#/components/schemas/DeliveryTarget"
+
+    ScheduleUpdate:
+      type: object
+      description: Any subset; changing spec recomputes next_run_at
+      minProperties: 1
+      properties:
+        name:
+          type: string
+        enabled:
+          type: boolean
+        spec:
+          $ref: "#/components/schemas/ScheduleSpec"
+        action:
+          $ref: "#/components/schemas/ScheduleAction"
+        delivery:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeliveryTarget"
+
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+        cost_usd:
+          type: number
+          default: 0
+
+    Model:
+      type: object
+      required: [id, provider, tier, loaded]
+      properties:
+        id:
+          type: string
+        provider:
+          type: string
+          description: Open enum
+          examples: [omlx, ollama, remote]
+        tier:
+          type: string
+          description: Open enum — routing tier (M-D)
+          examples: [local, remote, lora]
+        loaded:
+          type: boolean
+
+    ToolInfo:
+      type: object
+      required: [name, source, description]
+      properties:
+        name:
+          type: string
+        source:
+          type: string
+          description: Open enum
+          examples: [builtin, mcp, module]
+        description:
+          type: string
+        requires_approval:
+          type: boolean
+          default: false
+
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Open enum: invalid_request, unauthorized, not_found, conflict,
+            approval_already_resolved, provider_unavailable,
+            run_not_cancellable (reserved), internal
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorBody"

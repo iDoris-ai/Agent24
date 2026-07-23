@@ -4,7 +4,7 @@
 > 状态值：`pending` → `in-progress` → `in-pr(#N)` → `merged` ｜ `blocked(原因)`
 > loop 每轮：取「状态 pending 且依赖均为 in-pr/merged」中序号最靠前的任务执行（见 LOOP.md）。
 > 每完成一步（提 PR / 收到 merge）由 loop 更新本文件并 commit。
-> 最后更新：2026-07-23（A0 → in-pr #21）
+> 最后更新：2026-07-23（A0 merged #21；A1 → in-pr #23（base=main；#22 因 base 先删被关，作废））
 
 ## 执行顺序总览（最佳路径）
 
@@ -17,8 +17,8 @@
 
 | ID | 任务 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| A0 | 提交现有设计文档 PR | — | in-pr | #21 |
-| A1 | `protocol/` v1 真源：openapi.yaml | A0 | pending | |
+| A0 | 提交现有设计文档 PR | — | merged | #21 |
+| A1 | `protocol/` v1 真源：openapi.yaml | A0 | in-pr | #23 |
 | A2 | `protocol/` 事件与模块 schema | A1 | pending | |
 | A3 | contract-tests 包（对现 node daemon） | A1 | pending | |
 | A4 | 仓库重构为 pnpm workspace 目标布局 | A3 | pending | |

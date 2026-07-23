@@ -43,7 +43,7 @@ Agent24/
 - **一个任务 = 一个 PR**。禁止把多个任务塞进一个 PR；禁止在任务分支上夹带无关改动。
 - **不碰用户的未提交改动**：工作区内不属于当前任务的 modified 文件（如 README、TRADEMARK 等历史遗留修改）一律不 stage、不提交、不回退。
 - Commit 遵循 Conventional Commits（`feat:` `fix:` `docs:` `refactor:` `test:` `chore:`），commit message 末尾带 Claude-Session 链接（harness 会注入）。
-- **merge 由用户执行**。loop 永不自行 merge PR；提完 PR 即基于该分支继续下一个任务（stacked）。
+- **merge 门槛**：外部 reviewer bot（用户另一账号）APPROVED 后由 loop 执行 **squash merge** 进 main；CHANGES_REQUESTED 则修复 push 等复审。无 APPROVED 绝不 merge。merge 后立即把后续 stacked 分支 rebase --onto main。提完 PR 即基于该分支继续下一个任务（stacked），不等 merge。
 
 ## 3. Review 流程（每个 PR 提交前的硬性门槛）
 
