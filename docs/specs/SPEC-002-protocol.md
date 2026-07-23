@@ -12,7 +12,7 @@
 2. 所有路径带版本前缀 `/api/v1/`。旧的非版本化路由（`/api/modules` 等模块系统）在 M-E 前保持原样并存，不纳入 v1 契约。
 3. 命名：JSON 字段一律 `snake_case`；事件类型 `名词.动词过去式/现在时`（`run.started`）；id 均为字符串（ULID）。
 4. 时间戳：ISO 8601 UTC 字符串（`2026-07-23T12:00:00Z`）。**可空字段在 wire 上恒出现**（值为 `null`），不允许省略字段——保证 Rust serde 与 TS 生成类型一致。
-5. 客户端类型不手写：TS 从 openapi.yaml 生成（`packages/api-client`）。**真源分两阶段**：B1 之前，`protocol/` 手写文件是唯一真源；B1 起，`agent24-protocol` Rust 类型成为生成源（schemars/utoipa 导出并覆盖 `protocol/` 文件），CI 校验「导出结果 == 仓库内文件」零漂移。
+5. 客户端类型不手写：TS 从 openapi.yaml 生成（`packages/api-client`）。**真源分两阶段**：生成源切换前，`protocol/` 手写文件是唯一真源，`agent24-protocol` Rust 类型经 **fixtures 往返测试**与其锁步（B1 起）；**B4 完成生成源切换**——Rust 类型导出并覆盖 `protocol/` 文件，CI 校验「导出结果 == 仓库内文件」零漂移。
 
 ## 1. 核心数据结构
 

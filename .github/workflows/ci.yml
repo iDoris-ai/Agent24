@@ -50,8 +50,6 @@ jobs:
     name: Rust (fmt + clippy + test)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Placeholder until task B1 lands the Cargo workspace (SPEC-001 §7)
-    if: false
 
     steps:
       - name: Checkout
@@ -62,6 +60,15 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+
       - name: fmt
         run: cargo fmt --check --manifest-path rust/Cargo.toml
 
@@ -70,6 +77,13 @@ jobs:
 
       - name: test
         run: cargo test --workspace --manifest-path rust/Cargo.toml
+
+      - name: License / bans check (cargo-deny)
+        # Tag-pinned (org convention is sha-pinning; TODO pin sha once vetted)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/Cargo.toml
+          command: check licenses bans sources
 
   contract:
     name: Contract Tests + Codegen Drift

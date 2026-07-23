@@ -1,0 +1,15 @@
+[package]
+name = "agent24-protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent24 v1 protocol types — locked to protocol/ via fixture tests (B1); becomes the generation source in B4"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+[lints]
+workspace = true

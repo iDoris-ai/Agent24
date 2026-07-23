@@ -4,7 +4,7 @@
 > 状态值：`pending` → `in-progress` → `in-pr(#N)` → `merged` ｜ `blocked(原因)`
 > loop 每轮：取「状态 pending 且依赖均为 in-pr/merged」中序号最靠前的任务执行（见 LOOP.md）。
 > 每完成一步（提 PR / 收到 merge）由 loop 更新本文件并 commit。
-> 最后更新：2026-07-23（A0-A5 全部 merge；A6 in-pr #28 base=main）
+> 最后更新：2026-07-23（M-A 全部 merge ✅；B1 in-progress）
 
 ## 执行顺序总览（最佳路径）
 
@@ -23,7 +23,7 @@
 | A3 | contract-tests 包（对现 node daemon） | A1 | merged | #25 |
 | A4 | 仓库重构为 pnpm workspace 目标布局 | A3 | merged | #26 |
 | A5 | node-daemon v1 适配层（mock daemon） | A4 | merged | #27 |
-| A6 | api-client 生成管道 + CI 三 job | A5 | in-pr | #28 |
+| A6 | api-client 生成管道 + CI 三 job | A5 | merged | #28 |
 
 ### A0 提交现有设计文档 PR
 - 范围：仅 stage 本次架构工作新增文件——`docs/ADR-026-rust-core-polyglot.md`、`docs/reference-notes/{codex,openfang}.md`、`docs/specs/*`、`.gitignore`（vendor/reference 条目）。**不得**卷入工作区里其他历史修改（README、TRADEMARK*、docs/PLAN 等）。
@@ -60,7 +60,7 @@
 
 | ID | 任务 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| B1 | Cargo workspace + agent24-protocol | A6 | pending | |
+| B1 | Cargo workspace + agent24-protocol | A6 | in-progress | |
 | B2 | agent24d 骨架：health + 握手 + 优雅关闭 | B1 | pending | |
 | B3 | ModelProvider trait + chat 透传 | B2 | pending | |
 | B4 | WS 事件通道 | B3 | pending | |
@@ -80,7 +80,7 @@
 - 验收：对 agent24d 跑 contract-tests 的 chat/models/usage 全绿（需本机 oMLX 或 Ollama；CI 用 mock provider feature 跑单测）；cancel 传入后请求确实中断（单测用挂起 mock 验证）。
 
 ### B4 WS 事件通道
-- `/api/v1/events`：axum WS + 强类型事件 enum（serde tag）；内部 `broadcast` 总线 → per-连接转发（容量按 codex 经验放大出站缓冲）；拒绝带 Origin 头的升级；chat 触发 run 生命周期事件（对齐 A5 mock 行为）。
+- `/api/v1/events`：axum WS + 强类型事件 enum（serde tag）；内部 `broadcast` 总线 → per-连接转发（容量按 codex 经验放大出站缓冲）；拒绝带 Origin 头的升级；chat 触发 run 生命周期事件（对齐 A5 mock 行为）。**生成源切换**：从 agent24-protocol 导出 events.schema.json（schemars）并覆盖 `protocol/`，CI 加零漂移检查（openapi.yaml 的导出切换随 utoipa 引入同步完成）。
 - 验收：contract-tests 事件用例双后端语义一致；断连不影响 run 继续。
 
 ### B5 BackendManager 双后端开关 + contract 双跑

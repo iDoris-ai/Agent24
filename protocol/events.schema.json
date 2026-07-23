@@ -2,107 +2,268 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/iDoris-ai/Agent24/protocol/events.schema.json",
   "title": "Agent24 v1 WebSocket Event Protocol",
-  "description": "Single source of truth for messages on GET /api/v1/events (phase 1: hand-written; from task B1 on, generated from the agent24-protocol Rust crate and CI-checked for zero drift). Human-readable spec: docs/specs/SPEC-002-protocol.md §3. Two message classes: NOTIFICATION (one-way, no reply — x-kind: notification) and REQUEST (client MUST answer via REST — x-kind: request; currently only approval.required, answered via POST /api/v1/approvals/{id}). Conventions: snake_case fields; ULID string ids; ISO 8601 UTC timestamps; nullable fields are ALWAYS present on the wire with value null; `seq` is monotonically increasing per connection (a gap means the client must reconcile via REST — v1 has no replay); clients MUST ignore unknown event types and unknown fields (forward compatibility). Rust: #[serde(tag = \"type\")] enum with explicit per-variant #[serde(rename = \"run.started\")] dotted names — never rename_all.",
+  "description": "Single source of truth for messages on GET /api/v1/events (hand-written until task B4 switches generation to the agent24-protocol Rust crate with a CI zero-drift check; since B1 the Rust types are locked to this file via fixture round-trip tests). Human-readable spec: docs/specs/SPEC-002-protocol.md §3. Two message classes: NOTIFICATION (one-way, no reply — x-kind: notification) and REQUEST (client MUST answer via REST — x-kind: request; currently only approval.required, answered via POST /api/v1/approvals/{id}). Conventions: snake_case fields; ULID string ids; ISO 8601 UTC timestamps; nullable fields are ALWAYS present on the wire with value null; `seq` is monotonically increasing per connection (a gap means the client must reconcile via REST — v1 has no replay); clients MUST ignore unknown event types and unknown fields (forward compatibility). Rust: #[serde(tag = \"type\")] enum with explicit per-variant #[serde(rename = \"run.started\")] dotted names — never rename_all.",
   "oneOf": [
-    { "$ref": "#/$defs/RunStarted" },
-    { "$ref": "#/$defs/RunCompleted" },
-    { "$ref": "#/$defs/RunFailed" },
-    { "$ref": "#/$defs/RunCancelled" },
-    { "$ref": "#/$defs/ModelDelta" },
-    { "$ref": "#/$defs/ToolStarted" },
-    { "$ref": "#/$defs/ToolCompleted" },
-    { "$ref": "#/$defs/ApprovalRequired" },
-    { "$ref": "#/$defs/ApprovalResolved" },
-    { "$ref": "#/$defs/ScheduleFired" },
-    { "$ref": "#/$defs/ScheduleDisabled" }
+    {
+      "$ref": "#/$defs/RunStarted"
+    },
+    {
+      "$ref": "#/$defs/RunCompleted"
+    },
+    {
+      "$ref": "#/$defs/RunFailed"
+    },
+    {
+      "$ref": "#/$defs/RunCancelled"
+    },
+    {
+      "$ref": "#/$defs/ModelDelta"
+    },
+    {
+      "$ref": "#/$defs/ToolStarted"
+    },
+    {
+      "$ref": "#/$defs/ToolCompleted"
+    },
+    {
+      "$ref": "#/$defs/ApprovalRequired"
+    },
+    {
+      "$ref": "#/$defs/ApprovalResolved"
+    },
+    {
+      "$ref": "#/$defs/ScheduleFired"
+    },
+    {
+      "$ref": "#/$defs/ScheduleDisabled"
+    }
   ],
   "$defs": {
     "Envelope": {
       "type": "object",
       "description": "Common envelope for every WS message",
-      "required": ["v", "seq", "ts", "type", "payload"],
+      "required": [
+        "v",
+        "seq",
+        "ts",
+        "type",
+        "payload"
+      ],
       "properties": {
-        "v": { "const": 1, "description": "Protocol major version" },
-        "seq": { "type": "integer", "minimum": 0, "description": "Monotonic per-connection sequence number" },
-        "ts": { "type": "string", "format": "date-time" },
-        "type": { "type": "string" },
-        "payload": { "type": "object" }
+        "v": {
+          "const": 1,
+          "description": "Protocol major version"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic per-connection sequence number"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "type": {
+          "type": "string"
+        },
+        "payload": {
+          "type": "object"
+        }
       }
     },
     "Usage": {
       "type": "object",
-      "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
+      "required": [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens"
+      ],
       "properties": {
-        "prompt_tokens": { "type": "integer" },
-        "completion_tokens": { "type": "integer" },
-        "total_tokens": { "type": "integer" },
-        "cost_usd": { "type": "number", "default": 0 }
+        "prompt_tokens": {
+          "type": "integer"
+        },
+        "completion_tokens": {
+          "type": "integer"
+        },
+        "total_tokens": {
+          "type": "integer"
+        },
+        "cost_usd": {
+          "type": "number",
+          "default": 0
+        }
       }
     },
     "ErrorBody": {
       "type": "object",
-      "required": ["code", "message"],
+      "required": [
+        "code",
+        "message"
+      ],
       "properties": {
         "code": {
           "type": "string",
           "description": "Open enum — see openapi.yaml ErrorBody"
         },
-        "message": { "type": "string" },
-        "details": { "type": "object" }
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "object"
+        }
       }
     },
     "Decision": {
       "type": "object",
       "description": "Open set, server-driven — see openapi.yaml Decision. Known types: approve, approve_for_session, deny (reason required), abort. Fail-closed: implementation default equals abort/deny, never approve.",
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "properties": {
-        "type": { "type": "string", "examples": ["approve", "approve_for_session", "deny", "abort"] },
-        "reason": { "type": "string", "description": "Required when type=deny" }
+        "type": {
+          "type": "string",
+          "examples": [
+            "approve",
+            "approve_for_session",
+            "deny",
+            "abort"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "description": "Required when type=deny"
+        }
       },
       "additionalProperties": true
     },
     "Approval": {
       "type": "object",
-      "description": "Mirror of openapi.yaml Approval (kept in lockstep until B1 generation unifies both files from Rust types)",
+      "description": "Mirror of openapi.yaml Approval (kept in lockstep until B4 generation unifies both files from Rust types)",
       "required": [
-        "id", "run_id", "tool_call_id", "kind", "summary", "payload",
-        "available_decisions", "status", "decision", "expires_at",
-        "created_at", "decided_at"
+        "id",
+        "run_id",
+        "tool_call_id",
+        "kind",
+        "summary",
+        "payload",
+        "available_decisions",
+        "status",
+        "decision",
+        "expires_at",
+        "created_at",
+        "decided_at"
       ],
       "properties": {
-        "id": { "type": "string" },
-        "run_id": { "type": "string" },
-        "tool_call_id": { "type": "string" },
-        "kind": { "type": "string", "description": "Open enum", "examples": ["exec", "fs_write", "network", "module"] },
-        "summary": { "type": "string" },
-        "payload": { "type": "object", "additionalProperties": true },
+        "id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Open enum",
+          "examples": [
+            "exec",
+            "fs_write",
+            "network",
+            "module"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": true
+        },
         "available_decisions": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Server-driven open set — UIs render exactly this list, never a hardcoded one"
         },
-        "status": { "type": "string", "enum": ["pending", "approved", "denied", "aborted", "timed_out"] },
-        "decision": { "oneOf": [{ "$ref": "#/$defs/Decision" }, { "type": "null" }] },
-        "expires_at": { "type": "string", "format": "date-time" },
-        "created_at": { "type": "string", "format": "date-time" },
-        "decided_at": { "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "approved",
+            "denied",
+            "aborted",
+            "timed_out"
+          ]
+        },
+        "decision": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Decision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decided_at": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
       }
     },
-
     "RunStarted": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "run.started" },
+            "type": {
+              "const": "run.started"
+            },
             "payload": {
               "type": "object",
-              "required": ["run_id", "session_id", "schedule_id"],
+              "required": [
+                "run_id",
+                "session_id",
+                "schedule_id"
+              ],
               "properties": {
-                "run_id": { "type": "string" },
-                "session_id": { "type": ["string", "null"], "description": "Null for transient runs (e.g. /chat)" },
-                "schedule_id": { "type": ["string", "null"], "description": "Set when fired by a schedule" }
+                "run_id": {
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Null for transient runs (e.g. /chat)"
+                },
+                "schedule_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Set when fired by a schedule"
+                }
               }
             }
           }
@@ -112,21 +273,39 @@
     "RunCompleted": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "run.completed" },
+            "type": {
+              "const": "run.completed"
+            },
             "payload": {
               "type": "object",
-              "required": ["run_id", "output", "usage"],
+              "required": [
+                "run_id",
+                "output",
+                "usage"
+              ],
               "properties": {
-                "run_id": { "type": "string" },
+                "run_id": {
+                  "type": "string"
+                },
                 "output": {
                   "type": "object",
-                  "required": ["text"],
-                  "properties": { "text": { "type": "string" } }
+                  "required": [
+                    "text"
+                  ],
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  }
                 },
-                "usage": { "$ref": "#/$defs/Usage" }
+                "usage": {
+                  "$ref": "#/$defs/Usage"
+                }
               }
             }
           }
@@ -136,16 +315,27 @@
     "RunFailed": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "run.failed" },
+            "type": {
+              "const": "run.failed"
+            },
             "payload": {
               "type": "object",
-              "required": ["run_id", "error"],
+              "required": [
+                "run_id",
+                "error"
+              ],
               "properties": {
-                "run_id": { "type": "string" },
-                "error": { "$ref": "#/$defs/ErrorBody" }
+                "run_id": {
+                  "type": "string"
+                },
+                "error": {
+                  "$ref": "#/$defs/ErrorBody"
+                }
               }
             }
           }
@@ -155,14 +345,24 @@
     "RunCancelled": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "run.cancelled" },
+            "type": {
+              "const": "run.cancelled"
+            },
             "payload": {
               "type": "object",
-              "required": ["run_id"],
-              "properties": { "run_id": { "type": "string" } }
+              "required": [
+                "run_id"
+              ],
+              "properties": {
+                "run_id": {
+                  "type": "string"
+                }
+              }
             }
           }
         }
@@ -171,16 +371,28 @@
     "ModelDelta": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "model.delta" },
+            "type": {
+              "const": "model.delta"
+            },
             "payload": {
               "type": "object",
-              "required": ["run_id", "text"],
+              "required": [
+                "run_id",
+                "text"
+              ],
               "properties": {
-                "run_id": { "type": "string" },
-                "text": { "type": "string", "description": "Streaming text increment" }
+                "run_id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Streaming text increment"
+                }
               }
             }
           }
@@ -190,18 +402,36 @@
     "ToolStarted": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "tool.started" },
+            "type": {
+              "const": "tool.started"
+            },
             "payload": {
               "type": "object",
-              "required": ["run_id", "tool_call_id", "tool", "input_summary"],
+              "required": [
+                "run_id",
+                "tool_call_id",
+                "tool",
+                "input_summary"
+              ],
               "properties": {
-                "run_id": { "type": "string" },
-                "tool_call_id": { "type": "string" },
-                "tool": { "type": "string" },
-                "input_summary": { "type": "string", "description": "Summarized — full input is audit-only" }
+                "run_id": {
+                  "type": "string"
+                },
+                "tool_call_id": {
+                  "type": "string"
+                },
+                "tool": {
+                  "type": "string"
+                },
+                "input_summary": {
+                  "type": "string",
+                  "description": "Summarized — full input is audit-only"
+                }
               }
             }
           }
@@ -211,18 +441,43 @@
     "ToolCompleted": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "tool.completed" },
+            "type": {
+              "const": "tool.completed"
+            },
             "payload": {
               "type": "object",
-              "required": ["run_id", "tool_call_id", "status", "output_summary"],
+              "required": [
+                "run_id",
+                "tool_call_id",
+                "status",
+                "output_summary"
+              ],
               "properties": {
-                "run_id": { "type": "string" },
-                "tool_call_id": { "type": "string" },
-                "status": { "type": "string", "enum": ["completed", "failed", "denied"] },
-                "output_summary": { "type": ["string", "null"] }
+                "run_id": {
+                  "type": "string"
+                },
+                "tool_call_id": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "completed",
+                    "failed",
+                    "denied"
+                  ]
+                },
+                "output_summary": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
               }
             }
           }
@@ -233,11 +488,17 @@
       "x-kind": "request",
       "description": "REQUEST class: the client MUST answer via POST /api/v1/approvals/{payload.id}. Fail-closed: no answer before payload.expires_at resolves to timed_out (equivalent to denial).",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "approval.required" },
-            "payload": { "$ref": "#/$defs/Approval" }
+            "type": {
+              "const": "approval.required"
+            },
+            "payload": {
+              "$ref": "#/$defs/Approval"
+            }
           }
         }
       ]
@@ -246,17 +507,32 @@
       "x-kind": "notification",
       "description": "Broadcast so every connected client converges (e.g. TUI approves, desktop dismisses its dialog)",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "approval.resolved" },
+            "type": {
+              "const": "approval.resolved"
+            },
             "payload": {
               "type": "object",
-              "required": ["approval_id", "run_id", "decision_type"],
+              "required": [
+                "approval_id",
+                "run_id",
+                "decision_type"
+              ],
               "properties": {
-                "approval_id": { "type": "string" },
-                "run_id": { "type": "string" },
-                "decision_type": { "type": "string", "description": "Open enum — the Decision.type that resolved it, or timed_out/aborted" }
+                "approval_id": {
+                  "type": "string"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "decision_type": {
+                  "type": "string",
+                  "description": "Open enum — the Decision.type that resolved it, or timed_out/aborted"
+                }
               }
             }
           }
@@ -266,16 +542,27 @@
     "ScheduleFired": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "schedule.fired" },
+            "type": {
+              "const": "schedule.fired"
+            },
             "payload": {
               "type": "object",
-              "required": ["schedule_id", "run_id"],
+              "required": [
+                "schedule_id",
+                "run_id"
+              ],
               "properties": {
-                "schedule_id": { "type": "string" },
-                "run_id": { "type": "string" }
+                "schedule_id": {
+                  "type": "string"
+                },
+                "run_id": {
+                  "type": "string"
+                }
               }
             }
           }
@@ -285,16 +572,31 @@
     "ScheduleDisabled": {
       "x-kind": "notification",
       "allOf": [
-        { "$ref": "#/$defs/Envelope" },
+        {
+          "$ref": "#/$defs/Envelope"
+        },
         {
           "properties": {
-            "type": { "const": "schedule.disabled" },
+            "type": {
+              "const": "schedule.disabled"
+            },
             "payload": {
               "type": "object",
-              "required": ["schedule_id", "reason"],
+              "required": [
+                "schedule_id",
+                "reason"
+              ],
               "properties": {
-                "schedule_id": { "type": "string" },
-                "reason": { "type": "string", "description": "Open enum", "examples": ["consecutive_failures"] }
+                "schedule_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string",
+                  "description": "Open enum",
+                  "examples": [
+                    "consecutive_failures"
+                  ]
+                }
               }
             }
           }
