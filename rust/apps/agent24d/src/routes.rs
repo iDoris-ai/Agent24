@@ -1,6 +1,6 @@
 //! v1 REST handlers beyond health (B3: chat / models / usage).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use agent24_models::{CompletionRequest, ModelError};
 use agent24_protocol::{ChatRequest, ChatResponse, Model, Usage};
@@ -14,30 +14,25 @@ use crate::server::{AppState, error_response};
 /// 1 MiB body cap — mirrors the node daemon (loopback is not a DoS boundary)
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// Single guarded value (not three independent atomics): record+snapshot are
+/// each atomic as a whole, so a snapshot can never observe a torn update where
+/// total != prompt + completion (review finding on B3).
 #[derive(Default)]
 pub struct UsageCounters {
-    pub prompt_tokens: AtomicU64,
-    pub completion_tokens: AtomicU64,
-    pub total_tokens: AtomicU64,
+    inner: Mutex<Usage>,
 }
 
 impl UsageCounters {
     fn record(&self, usage: &Usage) {
-        self.prompt_tokens
-            .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
-        self.completion_tokens
-            .fetch_add(usage.completion_tokens, Ordering::Relaxed);
-        self.total_tokens
-            .fetch_add(usage.total_tokens, Ordering::Relaxed);
+        if let Ok(mut u) = self.inner.lock() {
+            u.prompt_tokens = u.prompt_tokens.saturating_add(usage.prompt_tokens);
+            u.completion_tokens = u.completion_tokens.saturating_add(usage.completion_tokens);
+            u.total_tokens = u.total_tokens.saturating_add(usage.total_tokens);
+        }
     }
 
     fn snapshot(&self) -> Usage {
-        Usage {
-            prompt_tokens: self.prompt_tokens.load(Ordering::Relaxed),
-            completion_tokens: self.completion_tokens.load(Ordering::Relaxed),
-            total_tokens: self.total_tokens.load(Ordering::Relaxed),
-            cost_usd: 0.0,
-        }
+        self.inner.lock().map(|u| u.clone()).unwrap_or_default()
     }
 }
 
@@ -54,11 +49,29 @@ pub async fn get_usage(State(state): State<AppState>) -> Response {
 pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Response {
     let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
-        Err(_) => {
+        Err(err) => {
+            // Only an actual length-limit hit is 413; disconnects / malformed
+            // transfer encodings are the client's bad request, not "too large"
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+            let mut is_limit = false;
+            while let Some(e) = source {
+                if e.is::<http_body_util::LengthLimitError>() {
+                    is_limit = true;
+                    break;
+                }
+                source = e.source();
+            }
+            if is_limit {
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "payload_too_large",
+                    &format!("Request body exceeds {MAX_BODY_BYTES} bytes"),
+                );
+            }
             return error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "payload_too_large",
-                &format!("Request body exceeds {MAX_BODY_BYTES} bytes"),
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "failed to read request body",
             );
         }
     };

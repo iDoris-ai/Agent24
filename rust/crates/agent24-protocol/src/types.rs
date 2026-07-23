@@ -15,7 +15,7 @@ pub struct Health {
     pub backend: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
