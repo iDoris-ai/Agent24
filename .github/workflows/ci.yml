@@ -162,3 +162,76 @@ jobs:
       - name: Daemon log on failure
         if: failure()
         run: cat daemon.log || true
+
+  contract-rust:
+    name: Contract (agent24d)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa  # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: pnpm install --frozen-lockfile
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-contract-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+
+      - name: Build agent24d
+        working-directory: rust
+        run: cargo build -p agent24d
+
+      - name: Start agent24d and capture ready line
+        run: |
+          ./rust/target/debug/agent24d serve --port 0 > daemon.log 2>daemon.err &
+          echo $! > daemon.pid
+          for i in $(seq 1 240); do
+            grep -q '"type":"ready"' daemon.log && break
+            sleep 0.25
+          done
+          READY=$(grep '"type":"ready"' daemon.log | head -1)
+          if [ -z "$READY" ]; then
+            echo "::error::agent24d never printed a ready line within 60s"
+            cat daemon.log daemon.err || true
+            exit 1
+          fi
+          echo "ready line captured"
+          echo "A24_BASE_URL=http://127.0.0.1:$(echo "$READY" | node -e 'process.stdin.once("data",d=>console.log(JSON.parse(d).port))')" >> "$GITHUB_ENV"
+          echo "A24_TOKEN=$(echo "$READY" | node -e 'process.stdin.once("data",d=>console.log(JSON.parse(d).token))')" >> "$GITHUB_ENV"
+
+      - name: "Run contract tests (target rust, A24_EXPECT_LLM=down)"
+        env:
+          A24_TARGET: rust
+          A24_EXPECT_LLM: down
+        run: pnpm test:contract
+
+      - name: Stop daemon
+        if: always()
+        run: if [ -f daemon.pid ]; then kill "$(cat daemon.pid)" 2>/dev/null || true; fi
+
+      - name: Daemon logs on failure
+        if: failure()
+        run: cat daemon.log daemon.err || true

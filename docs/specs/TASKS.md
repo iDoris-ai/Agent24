@@ -64,7 +64,7 @@
 | B2 | agent24d 骨架：health + 握手 + 优雅关闭 | B1 | merged | #30 |
 | B3 | ModelProvider trait + chat 透传 | B2 | in-pr | #31 |
 | B4 | WS 事件通道 | B3 | in-pr | #32 |
-| B5 | BackendManager 双后端开关 + contract 双跑 | B4 | pending | |
+| B5 | BackendManager 双后端开关 + contract 双跑 | B4 | in-pr | 待填 |
 | B6 | agent24-cli 骨架 | B5 | pending | |
 
 ### B1 Cargo workspace + agent24-protocol
