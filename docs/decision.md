@@ -872,7 +872,7 @@ ADR-019 的 LLM Gateway 设计假设底层是 Ollama，需要修正。
 ## ADR-023：后端语言从 Node.js 切换到 Python FastAPI（M3 执行）
 
 **日期**：2026-05-09
-**状态**：✅ 采纳（部分修正 ADR-020，M3 执行切换）
+**状态**：⛔ Superseded by [ADR-026](ADR-026-rust-core-polyglot.md)（2026-07-23：后端内核改为 Rust，Python 降级为 ML Worker）
 
 ### 背景
 
