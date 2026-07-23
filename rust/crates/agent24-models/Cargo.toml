@@ -1,0 +1,24 @@
+[package]
+name = "agent24-models"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent24 model gateway — minimal ModelProvider trait, OpenAI-compatible adapter, ordered registry (ADR-026: routing/health logic lives above the trait, never inside providers)"
+
+[dependencies]
+agent24-protocol = { path = "../agent24-protocol" }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

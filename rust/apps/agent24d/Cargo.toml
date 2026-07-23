@@ -7,9 +7,11 @@ repository.workspace = true
 description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — health, auth handshake, graceful shutdown)"
 
 [dependencies]
+agent24-models = { path = "../../crates/agent24-models" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
 rand = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -20,7 +22,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 
 [lints]
 workspace = true
