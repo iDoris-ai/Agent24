@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "seq": 5,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "model.delta",
+  "payload": {
+    "run_id": "run_01H0000000000000000000TEST",
+    "text": "Hel"
+  }
+}

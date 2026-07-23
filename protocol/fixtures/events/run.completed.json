@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "seq": 2,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "run.completed",
+  "payload": {
+    "run_id": "run_01H0000000000000000000TEST",
+    "output": {
+      "text": "Done. Summary attached."
+    },
+    "usage": {
+      "prompt_tokens": 120,
+      "completion_tokens": 48,
+      "total_tokens": 168,
+      "cost_usd": 0
+    }
+  }
+}

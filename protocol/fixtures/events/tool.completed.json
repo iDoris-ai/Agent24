@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "seq": 7,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "tool.completed",
+  "payload": {
+    "run_id": "run_01H0000000000000000000TEST",
+    "tool_call_id": "tc_01H0000000000000000000TEST",
+    "status": "completed",
+    "output_summary": "200 OK, 12 items"
+  }
+}

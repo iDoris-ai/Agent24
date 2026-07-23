@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "seq": 4,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "run.cancelled",
+  "payload": {
+    "run_id": "run_01H0000000000000000000TEST"
+  }
+}

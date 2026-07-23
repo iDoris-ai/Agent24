@@ -1,0 +1,33 @@
+{
+  "v": 1,
+  "seq": 8,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "approval.required",
+  "payload": {
+    "id": "apr_01H0000000000000000000TEST",
+    "run_id": "run_01H0000000000000000000TEST",
+    "tool_call_id": "tc_01H0000000000000000000TEST",
+    "kind": "exec",
+    "summary": "Run shell command: rm -rf ~/Downloads/tmp",
+    "payload": {
+      "command": [
+        "rm",
+        "-rf",
+        "/Users/u/Downloads/tmp"
+      ],
+      "cwd": "/Users/u",
+      "reason": "cleanup requested by prompt"
+    },
+    "available_decisions": [
+      "approve",
+      "approve_for_session",
+      "deny",
+      "abort"
+    ],
+    "status": "pending",
+    "decision": null,
+    "expires_at": "2026-07-23T12:05:00Z",
+    "created_at": "2026-07-23T12:00:00Z",
+    "decided_at": null
+  }
+}

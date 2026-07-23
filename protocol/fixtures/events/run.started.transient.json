@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "seq": 1,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "run.started",
+  "payload": {
+    "run_id": "run_01H0000000000000000000TRAN",
+    "session_id": null,
+    "schedule_id": null
+  }
+}

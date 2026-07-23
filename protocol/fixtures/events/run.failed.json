@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "seq": 3,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "run.failed",
+  "payload": {
+    "run_id": "run_01H0000000000000000000TEST",
+    "error": {
+      "code": "provider_unavailable",
+      "message": "No LLM provider reachable"
+    }
+  }
+}

@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/iDoris-ai/Agent24/protocol/module.schema.json",
+  "title": "Agent24 Module Manifest",
+  "description": "JSON Schema for the Agent24 capability-module manifest (today: the TS ModuleManifest in the node daemon; M-E: the cross-process Capability Provider manifest). Forward compatibility: consumers MUST ignore unknown fields; string 'enums' below are open sets unless a closed enum is declared. The `pgl` object is reserved for AgentStore / Digital Public Goods Charter metadata (pgl.yml projection) — schema to be defined in task E5. AUTHORITY NOTE: historical docs (docs/decision.md ADR-016/M1 draft, docs/PLAN.md) use an older draft permission vocabulary (fs:read, net, ai, …); this schema and src/shared/ipc-types.ts are authoritative — vocabulary unification is deferred to M-E (see docs/ADR-016-consume-auraai-packages.md permission mapping table).",
+  "type": "object",
+  "required": [
+    "id",
+    "version",
+    "name",
+    "description",
+    "type",
+    "permissions"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Unique module id (kebab-case)"
+    },
+    "version": {
+      "type": "string",
+      "description": "Semver, e.g. 0.1.0"
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable display name"
+    },
+    "description": {
+      "type": "string"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "ui",
+        "headless",
+        "hybrid"
+      ],
+      "description": "ui/hybrid declare navItem and ship a renderer component; headless registers daemon routes only"
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "llm",
+          "memory",
+          "network",
+          "filesystem",
+          "wechat",
+          "nostr"
+        ],
+        "description": "Closed enum matching src/shared/ipc-types.ts Permission (a validator must catch typos); M-E may extend alongside the TS union"
+      },
+      "description": "Declared capability permissions checked at load/dispatch time"
+    },
+    "navItem": {
+      "type": "object",
+      "required": [
+        "icon",
+        "label",
+        "route"
+      ],
+      "description": "Sidebar entry injected by the shell (required in practice for type=ui|hybrid)",
+      "properties": {
+        "icon": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "route": {
+          "type": "string"
+        }
+      }
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Model ids this module needs; the gateway ensures they are loaded on register (non-blocking)"
+    },
+    "container": {
+      "type": "object",
+      "required": [
+        "image",
+        "port"
+      ],
+      "description": "OCI service container — BoxLite starts it and the daemon proxies /api/svc/<id>/* to it",
+      "properties": {
+        "image": {
+          "type": "string",
+          "description": "OCI image, e.g. python:slim"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Guest port inside the container"
+        },
+        "startCmd": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "argv passed to exec (no shell string concatenation — injection safety)"
+        },
+        "healthPath": {
+          "type": "string",
+          "default": "/health",
+          "description": "Polled until 2xx"
+        },
+        "memoryMib": {
+          "type": "integer",
+          "minimum": 64,
+          "default": 512
+        }
+      }
+    },
+    "pgl": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "RESERVED (E5): AgentStore / PGL charter metadata — signing status, revenue split (Supplier/Wrapper/Seller), onboarding mode"
+    }
+  }
+}

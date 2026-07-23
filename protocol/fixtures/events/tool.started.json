@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "seq": 6,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "tool.started",
+  "payload": {
+    "run_id": "run_01H0000000000000000000TEST",
+    "tool_call_id": "tc_01H0000000000000000000TEST",
+    "tool": "http_fetch",
+    "input_summary": "GET https://example.com/rss.xml"
+  }
+}
