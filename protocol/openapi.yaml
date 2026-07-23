@@ -4,9 +4,10 @@ info:
   version: 1.0.0
   summary: v1 contract for agent24d (Rust) and node-daemon (mock/reference)
   description: |
-    Single source of truth for the Agent24 daemon REST API (phase 1: hand-written;
-    from task B1 on, generated from the `agent24-protocol` Rust crate and CI-checked
-    for zero drift). Human-readable spec: `docs/specs/SPEC-002-protocol.md`.
+    Single source of truth for the Agent24 daemon REST API (hand-written until
+    task B4 switches generation to the `agent24-protocol` Rust crate with a CI
+    zero-drift check; since B1 the Rust types are locked to this contract via
+    fixture round-trip tests). Human-readable spec: `docs/specs/SPEC-002-protocol.md`.
 
     Conventions:
     - All fields snake_case; ids are ULID strings; timestamps are ISO 8601 UTC.

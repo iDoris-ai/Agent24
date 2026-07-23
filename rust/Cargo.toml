@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/agent24-protocol"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/iDoris-ai/Agent24"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# SPEC-001 §5: no unwrap/expect outside tests
+unwrap_used = "deny"
+expect_used = "deny"

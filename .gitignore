@@ -9,6 +9,7 @@ coverage/
 .vscode/
 .idea/
 *.tsbuildinfo
+rust/target/
 CLAUDE.md
 
 # Local-only reference clones for code study (NOT submodules, never committed)

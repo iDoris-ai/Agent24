@@ -6,7 +6,7 @@
  */
 
 /**
- * Single source of truth for messages on GET /api/v1/events (phase 1: hand-written; from task B1 on, generated from the agent24-protocol Rust crate and CI-checked for zero drift). Human-readable spec: docs/specs/SPEC-002-protocol.md §3. Two message classes: NOTIFICATION (one-way, no reply — x-kind: notification) and REQUEST (client MUST answer via REST — x-kind: request; currently only approval.required, answered via POST /api/v1/approvals/{id}). Conventions: snake_case fields; ULID string ids; ISO 8601 UTC timestamps; nullable fields are ALWAYS present on the wire with value null; `seq` is monotonically increasing per connection (a gap means the client must reconcile via REST — v1 has no replay); clients MUST ignore unknown event types and unknown fields (forward compatibility). Rust: #[serde(tag = "type")] enum with explicit per-variant #[serde(rename = "run.started")] dotted names — never rename_all.
+ * Single source of truth for messages on GET /api/v1/events (hand-written until task B4 switches generation to the agent24-protocol Rust crate with a CI zero-drift check; since B1 the Rust types are locked to this file via fixture round-trip tests). Human-readable spec: docs/specs/SPEC-002-protocol.md §3. Two message classes: NOTIFICATION (one-way, no reply — x-kind: notification) and REQUEST (client MUST answer via REST — x-kind: request; currently only approval.required, answered via POST /api/v1/approvals/{id}). Conventions: snake_case fields; ULID string ids; ISO 8601 UTC timestamps; nullable fields are ALWAYS present on the wire with value null; `seq` is monotonically increasing per connection (a gap means the client must reconcile via REST — v1 has no replay); clients MUST ignore unknown event types and unknown fields (forward compatibility). Rust: #[serde(tag = "type")] enum with explicit per-variant #[serde(rename = "run.started")] dotted names — never rename_all.
  */
 export type Agent24V1WebSocketEventProtocol =
   | RunStarted
@@ -187,7 +187,7 @@ export interface ErrorBody {
   [k: string]: unknown;
 }
 /**
- * Mirror of openapi.yaml Approval (kept in lockstep until B1 generation unifies both files from Rust types)
+ * Mirror of openapi.yaml Approval (kept in lockstep until B4 generation unifies both files from Rust types)
  */
 export interface Approval {
   id: string;
