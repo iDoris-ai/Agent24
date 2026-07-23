@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import Ajv2020 from 'ajv/dist/2020.js'
 import addFormats from 'ajv-formats'
-import { BASE_URL, get, post, resolveLlmExpectation } from './helpers.js'
+import WsClient from 'ws'
+import { BASE_URL, TOKEN, get, post, resolveLlmExpectation } from './helpers.js'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const WS_URL = BASE_URL.replace(/^http/, 'ws') + '/api/v1/events'
@@ -26,17 +27,21 @@ beforeAll(async () => {
 })
 
 // Collect WS events while `action` runs, until a terminal run event or timeout.
+// Uses the `ws` client (not the global WebSocket): agent24d requires the
+// bearer token on the upgrade request, which browser-style clients cannot set.
 async function collectEventsDuring(action: () => Promise<void>): Promise<Array<Record<string, unknown>>> {
   const events: Array<Record<string, unknown>> = []
-  const ws = new WebSocket(WS_URL)
+  const ws = new WsClient(WS_URL, {
+    headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {},
+  })
   await new Promise<void>((resolve, reject) => {
-    ws.addEventListener('open', () => resolve())
-    ws.addEventListener('error', () => reject(new Error(`WS connect failed: ${WS_URL}`)))
+    ws.on('open', () => resolve())
+    ws.on('error', (err) => reject(new Error(`WS connect failed: ${WS_URL}: ${String(err)}`)))
   })
   const done = new Promise<void>((resolve) => {
     const timer = setTimeout(() => resolve(), 10_000)
-    ws.addEventListener('message', (msg) => {
-      const doc = JSON.parse(String(msg.data)) as Record<string, unknown>
+    ws.on('message', (data) => {
+      const doc = JSON.parse(String(data)) as Record<string, unknown>
       events.push(doc)
       const t = doc['type']
       if (t === 'run.completed' || t === 'run.failed' || t === 'run.cancelled') {
@@ -98,9 +103,13 @@ describe('v1 M-A (live since A5)', () => {
   })
 
   it('WS upgrade carrying a browser Origin header is rejected', async () => {
-    const { default: WsClient } = await import('ws')
     const outcome = await new Promise<string>((resolve) => {
-      const ws = new WsClient(WS_URL, { headers: { Origin: 'http://evil.example' } })
+      const ws = new WsClient(WS_URL, {
+        headers: {
+          Origin: 'http://evil.example',
+          ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+        },
+      })
       ws.on('open', () => { ws.close(); resolve('open') })
       ws.on('error', () => resolve('rejected'))
       setTimeout(() => resolve('timeout'), 5000)

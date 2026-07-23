@@ -3,7 +3,10 @@
 use std::sync::Mutex;
 
 use agent24_models::{CompletionRequest, ModelError};
-use agent24_protocol::{ChatRequest, ChatResponse, Model, Usage};
+use agent24_protocol::{
+    ChatRequest, ChatResponse, ErrorBody, EventBody, Model, ModelDeltaPayload, RunCompletedPayload,
+    RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
+};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -91,6 +94,16 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         messages: chat.messages,
         model: chat.model,
     };
+    // Transient run: session_id null, full run lifecycle events (SPEC-002 §2)
+    let run_id = format!("run_{}", crate::events::ulid());
+    state
+        .events
+        .broadcast(EventBody::RunStarted(RunStartedPayload {
+            run_id: run_id.clone(),
+            session_id: None,
+            schedule_id: None,
+        }));
+
     // Child of the daemon shutdown token — shutdown cancels in-flight provider
     // calls; run-level cancellation joins this in C2
     let cancel = state.shutdown.child_token();
@@ -98,24 +111,51 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         Ok((provider, res)) => {
             tracing::debug!("chat served by {provider}");
             state.usage.record(&res.usage);
+            let text = res.message.content.clone();
+            state
+                .events
+                .broadcast(EventBody::ModelDelta(ModelDeltaPayload {
+                    run_id: run_id.clone(),
+                    text: text.clone(),
+                }));
+            state
+                .events
+                .broadcast(EventBody::RunCompleted(RunCompletedPayload {
+                    run_id,
+                    output: RunOutputPayload { text },
+                    usage: res.usage.clone(),
+                }));
             Json(ChatResponse {
                 message: res.message,
                 usage: res.usage,
             })
             .into_response()
         }
-        Err(ModelError::Unavailable(msg)) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "provider_unavailable",
-            &format!("All LLM providers unavailable. Last error: {msg}"),
-        ),
-        Err(ModelError::Cancelled) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            "request cancelled",
-        ),
-        Err(ModelError::Provider(msg)) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &msg)
+        Err(err) => {
+            let (status, code, message) = match err {
+                ModelError::Unavailable(msg) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provider_unavailable",
+                    format!("All LLM providers unavailable. Last error: {msg}"),
+                ),
+                ModelError::Cancelled => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "request cancelled".to_owned(),
+                ),
+                ModelError::Provider(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg),
+            };
+            state
+                .events
+                .broadcast(EventBody::RunFailed(RunFailedPayload {
+                    run_id,
+                    error: ErrorBody {
+                        code: code.to_owned(),
+                        message: message.clone(),
+                        details: None,
+                    },
+                }));
+            error_response(status, code, &message)
         }
     }
 }
