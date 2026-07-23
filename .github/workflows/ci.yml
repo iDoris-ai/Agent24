@@ -70,13 +70,16 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
 
       - name: fmt
-        run: cargo fmt --check --manifest-path rust/Cargo.toml
+        working-directory: rust
+        run: cargo fmt --check
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets --manifest-path rust/Cargo.toml -- -D warnings
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test
-        run: cargo test --workspace --manifest-path rust/Cargo.toml
+        working-directory: rust
+        run: cargo test --workspace
 
       - name: License / bans check (cargo-deny)
         # Tag-pinned (org convention is sha-pinning; TODO pin sha once vetted)

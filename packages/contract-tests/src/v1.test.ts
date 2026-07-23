@@ -184,7 +184,14 @@ describe('v1 M-A (live since A5)', () => {
   })
 
   describe('agent24d only (B2+)', () => {
-    it.todo('requests without bearer token → 401 unauthorized (mock daemon exempt)')
+    const IS_RUST = (process.env['A24_TARGET'] || 'node') !== 'node'
+    it('requests without bearer token → 401 unauthorized envelope', async (ctx) => {
+      if (!IS_RUST) return ctx.skip() // mock daemon is exempt from auth
+      const res = await fetch(`${BASE_URL}/api/v1/models`) // deliberately no Authorization
+      expect(res.status).toBe(401)
+      const body = (await res.json()) as { error: { code: string } }
+      expect(body.error.code).toBe('unauthorized')
+    })
   })
 })
 
