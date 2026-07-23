@@ -191,6 +191,10 @@ export class BackendManager {
       // process may already be gone
     }
     this.child = null
+    // Clear immediately: with child already nulled, the exit handler's
+    // identity guard will (correctly) skip its own cleanup — without this,
+    // stop() would leave a stale dead endpoint exposed forever (review B5)
+    currentEndpoint = null
   }
 
   stop(): void {
