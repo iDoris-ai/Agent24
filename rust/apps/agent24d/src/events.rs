@@ -115,11 +115,11 @@ async fn client_loop(mut socket: WebSocket, hub: EventsHub) {
                 match received {
                     Ok((ts, body)) => {
                         let event = Event { v: 1, seq, ts, body };
-                        seq += 1;
                         let Ok(text) = serde_json::to_string(&event) else { continue };
                         if socket.send(Message::Text(text.into())).await.is_err() {
                             break; // client gone
                         }
+                        seq += 1; // only after a successful send — no seq holes
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("events client lagged by {n}, disconnecting");

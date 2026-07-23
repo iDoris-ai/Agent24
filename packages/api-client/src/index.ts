@@ -4,22 +4,24 @@
 // REST: OpenAPI paths/components (protocol/openapi.yaml)
 export type { paths, components, operations } from './openapi'
 
-// WS events (protocol/events.schema.json)
+// WS events (protocol/events.schema.json — GENERATED from agent24-protocol
+// since B4; payload-level types replace the old per-event wrapper types)
 export type {
   Agent24V1WebSocketEventProtocol as V1Event,
-  Envelope,
-  RunStarted,
-  RunCompleted,
-  RunFailed,
-  RunCancelled,
-  ModelDelta,
-  ToolStarted,
-  ToolCompleted,
-  ApprovalRequired,
-  ApprovalResolved,
-  ScheduleFired,
-  ScheduleDisabled,
+  RunStartedPayload,
+  ModelDeltaPayload,
+  RunCompletedPayload,
+  RunOutputPayload,
+  RunFailedPayload,
+  RunCancelledPayload,
+  ToolStartedPayload,
+  ToolCompletedPayload,
+  ToolCompletedStatus,
+  ApprovalResolvedPayload,
+  ScheduleFiredPayload,
+  ScheduleDisabledPayload,
   Approval,
+  ApprovalStatus,
   Decision,
   Usage,
   ErrorBody,

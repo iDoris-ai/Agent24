@@ -6,220 +6,228 @@
  */
 
 /**
- * Single source of truth for messages on GET /api/v1/events (hand-written until task B4 switches generation to the agent24-protocol Rust crate with a CI zero-drift check; since B1 the Rust types are locked to this file via fixture round-trip tests). Human-readable spec: docs/specs/SPEC-002-protocol.md §3. Two message classes: NOTIFICATION (one-way, no reply — x-kind: notification) and REQUEST (client MUST answer via REST — x-kind: request; currently only approval.required, answered via POST /api/v1/approvals/{id}). Conventions: snake_case fields; ULID string ids; ISO 8601 UTC timestamps; nullable fields are ALWAYS present on the wire with value null; `seq` is monotonically increasing per connection (a gap means the client must reconcile via REST — v1 has no replay); clients MUST ignore unknown event types and unknown fields (forward compatibility). Rust: #[serde(tag = "type")] enum with explicit per-variant #[serde(rename = "run.started")] dotted names — never rename_all.
+ * GENERATED from the agent24-protocol Rust crate (task B4) — do not edit by hand; regenerate with `cargo run -p agent24-protocol --bin export-schema`. Wire contract details: docs/specs/SPEC-002-protocol.md §3 (message classes: approval.required is the only REQUEST-class event, answered via POST /api/v1/approvals/{id}; everything else is NOTIFICATION). Conventions: snake_case; ULID ids; ISO 8601 UTC ts; nullable fields always present as null; per-connection monotonic seq; clients ignore unknown types/fields.
  */
-export type Agent24V1WebSocketEventProtocol =
-  | RunStarted
-  | RunCompleted
-  | RunFailed
-  | RunCancelled
-  | ModelDelta
-  | ToolStarted
-  | ToolCompleted
-  | ApprovalRequired
-  | ApprovalResolved
-  | ScheduleFired
-  | ScheduleDisabled;
-export type RunStarted = Envelope & {
-  type?: "run.started";
-  payload?: {
-    run_id: string;
-    /**
-     * Null for transient runs (e.g. /chat)
-     */
-    session_id: string | null;
-    /**
-     * Set when fired by a schedule
-     */
-    schedule_id: string | null;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-export type RunCompleted = Envelope & {
-  type?: "run.completed";
-  payload?: {
-    run_id: string;
-    output: {
-      text: string;
-      [k: string]: unknown;
-    };
-    usage: Usage;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-export type RunFailed = Envelope & {
-  type?: "run.failed";
-  payload?: {
-    run_id: string;
-    error: ErrorBody;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-export type RunCancelled = Envelope & {
-  type?: "run.cancelled";
-  payload?: {
-    run_id: string;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-export type ModelDelta = Envelope & {
-  type?: "model.delta";
-  payload?: {
-    run_id: string;
-    /**
-     * Streaming text increment
-     */
-    text: string;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-export type ToolStarted = Envelope & {
-  type?: "tool.started";
-  payload?: {
-    run_id: string;
-    tool_call_id: string;
-    tool: string;
-    /**
-     * Summarized — full input is audit-only
-     */
-    input_summary: string;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-export type ToolCompleted = Envelope & {
-  type?: "tool.completed";
-  payload?: {
-    run_id: string;
-    tool_call_id: string;
-    status: "completed" | "failed" | "denied";
-    output_summary: string | null;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-/**
- * REQUEST class: the client MUST answer via POST /api/v1/approvals/{payload.id}. Fail-closed: no answer before payload.expires_at resolves to timed_out (equivalent to denial).
- */
-export type ApprovalRequired = Envelope & {
-  type?: "approval.required";
-  payload?: Approval;
-  [k: string]: unknown;
-};
-/**
- * Broadcast so every connected client converges (e.g. TUI approves, desktop dismisses its dialog)
- */
-export type ApprovalResolved = Envelope & {
-  type?: "approval.resolved";
-  payload?: {
-    approval_id: string;
-    run_id: string;
-    /**
-     * Open enum — the Decision.type that resolved it, or timed_out/aborted
-     */
-    decision_type: string;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-export type ScheduleFired = Envelope & {
-  type?: "schedule.fired";
-  payload?: {
-    schedule_id: string;
-    run_id: string;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-export type ScheduleDisabled = Envelope & {
-  type?: "schedule.disabled";
-  payload?: {
-    schedule_id: string;
-    /**
-     * Open enum
-     */
-    reason: string;
-    [k: string]: unknown;
-  };
-  [k: string]: unknown;
-};
-
-/**
- * Common envelope for every WS message
- */
-export interface Envelope {
-  /**
-   * Protocol major version
-   */
-  v: 1;
-  /**
-   * Monotonic per-connection sequence number
-   */
+export type Agent24V1WebSocketEventProtocol = {
   seq: number;
   ts: string;
-  type: string;
-  payload: {
-    [k: string]: unknown;
-  };
+  /**
+   * Protocol major version — always 1
+   */
+  v: 1;
+  [k: string]: unknown;
+} & (
+  | {
+      payload: RunStartedPayload;
+      type: "run.started";
+      [k: string]: unknown;
+    }
+  | {
+      payload: ModelDeltaPayload;
+      type: "model.delta";
+      [k: string]: unknown;
+    }
+  | {
+      payload: RunCompletedPayload;
+      type: "run.completed";
+      [k: string]: unknown;
+    }
+  | {
+      payload: RunFailedPayload;
+      type: "run.failed";
+      [k: string]: unknown;
+    }
+  | {
+      payload: RunCancelledPayload;
+      type: "run.cancelled";
+      [k: string]: unknown;
+    }
+  | {
+      payload: ToolStartedPayload;
+      type: "tool.started";
+      [k: string]: unknown;
+    }
+  | {
+      payload: ToolCompletedPayload;
+      type: "tool.completed";
+      [k: string]: unknown;
+    }
+  | {
+      payload: Approval;
+      type: "approval.required";
+      [k: string]: unknown;
+    }
+  | {
+      payload: ApprovalResolvedPayload;
+      type: "approval.resolved";
+      [k: string]: unknown;
+    }
+  | {
+      payload: ScheduleFiredPayload;
+      type: "schedule.fired";
+      [k: string]: unknown;
+    }
+  | {
+      payload: ScheduleDisabledPayload;
+      type: "schedule.disabled";
+      [k: string]: unknown;
+    }
+);
+/**
+ * Closed set per protocol/events.schema.json (a running tool never emits
+ * tool.completed)
+ */
+export type ToolCompletedStatus = "completed" | "failed" | "denied";
+/**
+ * timed_out is equivalent to a denial (fail-closed)
+ */
+export type ApprovalStatus = "pending" | "approved" | "denied" | "aborted" | "timed_out";
+
+export interface RunStartedPayload {
+  run_id: string;
+  /**
+   * Set when fired by a schedule
+   */
+  schedule_id: string | null;
+  /**
+   * Null for transient runs (e.g. /chat)
+   */
+  session_id: string | null;
+  [k: string]: unknown;
+}
+export interface ModelDeltaPayload {
+  run_id: string;
+  /**
+   * Streaming text increment
+   */
+  text: string;
+  [k: string]: unknown;
+}
+export interface RunCompletedPayload {
+  output: RunOutputPayload;
+  run_id: string;
+  usage: Usage;
+  [k: string]: unknown;
+}
+export interface RunOutputPayload {
+  text: string;
   [k: string]: unknown;
 }
 export interface Usage {
-  prompt_tokens: number;
   completion_tokens: number;
-  total_tokens: number;
   cost_usd?: number;
+  prompt_tokens: number;
+  total_tokens: number;
+  [k: string]: unknown;
+}
+export interface RunFailedPayload {
+  error: ErrorBody;
+  run_id: string;
   [k: string]: unknown;
 }
 export interface ErrorBody {
   /**
-   * Open enum — see openapi.yaml ErrorBody
+   * Open enum: invalid_request, unauthorized, not_found, conflict,
+   * approval_already_resolved, provider_unavailable,
+   * run_not_cancellable (reserved), payload_too_large, internal
    */
   code: string;
-  message: string;
   details?: {
     [k: string]: unknown;
-  };
+  } | null;
+  message: string;
   [k: string]: unknown;
 }
-/**
- * Mirror of openapi.yaml Approval (kept in lockstep until B4 generation unifies both files from Rust types)
- */
-export interface Approval {
-  id: string;
+export interface RunCancelledPayload {
   run_id: string;
-  tool_call_id: string;
+  [k: string]: unknown;
+}
+export interface ToolStartedPayload {
   /**
-   * Open enum
+   * Summarized — full input is audit-only
+   */
+  input_summary: string;
+  run_id: string;
+  tool: string;
+  tool_call_id: string;
+  [k: string]: unknown;
+}
+export interface ToolCompletedPayload {
+  output_summary: string | null;
+  run_id: string;
+  status: ToolCompletedStatus;
+  tool_call_id: string;
+  [k: string]: unknown;
+}
+export interface Approval {
+  /**
+   * Server-driven open set — UIs render exactly this list
+   */
+  available_decisions: string[];
+  created_at: string;
+  decided_at: string | null;
+  /**
+   * Set once resolved
+   */
+  decision: Decision | null;
+  /**
+   * After this instant the approval resolves to timed_out
+   */
+  expires_at: string;
+  id: string;
+  /**
+   * Open enum: exec | fs_write | network | module
    */
   kind: string;
-  summary: string;
+  /**
+   * Kind-specific detail (e.g. command argv, cwd, reason)
+   */
   payload: {
     [k: string]: unknown;
   };
-  /**
-   * Server-driven open set — UIs render exactly this list, never a hardcoded one
-   */
-  available_decisions: string[];
-  status: "pending" | "approved" | "denied" | "aborted" | "timed_out";
-  decision: Decision | null;
-  expires_at: string;
-  created_at: string;
-  decided_at: string | null;
+  run_id: string;
+  status: ApprovalStatus;
+  summary: string;
+  tool_call_id: string;
   [k: string]: unknown;
 }
 /**
- * Open set, server-driven — see openapi.yaml Decision. Known types: approve, approve_for_session, deny (reason required), abort. Fail-closed: implementation default equals abort/deny, never approve.
+ * OPEN SET, server-driven: valid `type` values for a given approval are
+ * exactly its `available_decisions`. Known: approve, approve_for_session,
+ * deny (reason required), abort. Future types may carry extra fields (kept
+ * in `extra` via flatten). Fail-closed: the implementation default (broken
+ * channel, cancelled run, daemon restart) is equivalent to abort/deny.
  */
 export interface Decision {
-  type: string;
   /**
-   * Required when type=deny
+   * Required when kind == "deny"
    */
-  reason?: string;
+  reason?: string | null;
+  type: string;
+  [k: string]: unknown;
+}
+/**
+ * Broadcast so every connected client converges
+ */
+export interface ApprovalResolvedPayload {
+  approval_id: string;
+  /**
+   * Open enum — the Decision.type that resolved it, or timed_out/aborted
+   */
+  decision_type: string;
+  run_id: string;
+  [k: string]: unknown;
+}
+export interface ScheduleFiredPayload {
+  run_id: string;
+  schedule_id: string;
+  [k: string]: unknown;
+}
+export interface ScheduleDisabledPayload {
+  /**
+   * Open enum; currently only consecutive_failures
+   */
+  reason: string;
+  schedule_id: string;
   [k: string]: unknown;
 }
