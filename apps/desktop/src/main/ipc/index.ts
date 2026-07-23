@@ -4,6 +4,7 @@
 import http from 'node:http'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { app, ipcMain, shell } from 'electron'
+import { getBackendEndpoint } from '../backend-manager'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
   BackendProxyRequest,
@@ -19,7 +20,6 @@ import type {
   OmlxWarmupResult,
 } from '../../shared/ipc-types'
 
-const BACKEND_PORT = 8765
 const BACKEND_HOST = '127.0.0.1'
 
 // oMLX server management
@@ -68,13 +68,25 @@ const EXTERNAL_URL_ALLOWLIST = ['https://', 'http://'] as const
 function proxyToBackend(req: BackendProxyRequest): Promise<BackendProxyResponse> {
   return new Promise((resolve) => {
     const body = req.body !== undefined ? JSON.stringify(req.body) : undefined
+    // Endpoint comes from the backend's ready line (dynamic port + token for
+    // agent24d; fixed 8765 + empty token for the node mock)
+    const endpoint = getBackendEndpoint()
+    if (!endpoint) {
+      resolve({
+        ok: false,
+        status: 503,
+        data: { error: { code: 'backend_not_ready', message: 'Backend daemon has not announced readiness yet' } },
+      })
+      return
+    }
     const options: http.RequestOptions = {
       host: BACKEND_HOST,
-      port: BACKEND_PORT,
+      port: endpoint.port,
       path: req.path,
       method: req.method,
       headers: {
         'Content-Type': 'application/json',
+        ...(endpoint.token ? { 'Authorization': 'Bearer ' + endpoint.token } : {}),
         ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
       },
     }

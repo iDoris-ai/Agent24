@@ -55,7 +55,7 @@ export function App(): JSX.Element {
 
     // Backend health + module list polling
     const checkBackend = () => {
-      window.agent24.backendProxy({ method: 'GET', path: '/health' })
+      window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
           if (res.ok) {
