@@ -4,7 +4,7 @@
 > 状态值：`pending` → `in-progress` → `in-pr(#N)` → `merged` ｜ `blocked(原因)`
 > loop 每轮：取「状态 pending 且依赖均为 in-pr/merged」中序号最靠前的任务执行（见 LOOP.md）。
 > 每完成一步（提 PR / 收到 merge）由 loop 更新本文件并 commit。
-> 最后更新：2026-07-23（M-A ✅；B1 merged #29；B2 merged #30；B3 #31、B4 #32、B5 #33 in-pr）
+> 最后更新：2026-07-23（M-A ✅；B1 merged #29；B2 #30 merged；B3-B6 = #31/#32/#33/#34 stacked 在审——M-B 代码全部完成）
 
 ## 执行顺序总览（最佳路径）
 
@@ -65,7 +65,7 @@
 | B3 | ModelProvider trait + chat 透传 | B2 | in-pr | #31 |
 | B4 | WS 事件通道 | B3 | merged | #32 |
 | B5 | BackendManager 双后端开关 + contract 双跑 | B4 | in-pr | #33 |
-| B6 | agent24-cli 骨架 | B5 | in-pr | 待填 |
+| B6 | agent24-cli 骨架 | B5 | in-pr | #34 |
 
 ### B1 Cargo workspace + agent24-protocol
 - `rust/` workspace（edition 2024，`forbid(unsafe_code)`，workspace lints：clippy deny warnings + unwrap_used）；`agent24-protocol` crate：SPEC-002 §1/§3 全部类型（serde snake_case + schemars）；`cargo deny` 配置（禁 GPL/AGPL）。

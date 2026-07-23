@@ -71,6 +71,28 @@ pub fn write(state: &DaemonState) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Lifetime singleton lock for non-ephemeral daemons: acquired (non-blocking)
+/// at startup and held until process exit. A second daemon fails fast instead
+/// of racing — this closes the concurrent-`daemon start` double-spawn leak
+/// (two CLIs both deciding "nothing running" and both spawning).
+/// Returns Ok(None) when another daemon already holds the lock.
+pub fn try_acquire_singleton() -> std::io::Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    let Some(dir) = state_dir() else {
+        return Err(std::io::Error::other("HOME not set"));
+    };
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("daemon.singleton.lock"))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Read the state file. Returns None if absent/unreadable/stale (pid dead).
 /// pid liveness is ONLY a stale-file heuristic — never a kill target; daemon
 /// termination goes through the authenticated /api/v1/shutdown endpoint.

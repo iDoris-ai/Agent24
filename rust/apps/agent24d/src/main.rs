@@ -23,6 +23,10 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Ephemeral instance (CLI standalone mode): skip the singleton lock
+        /// and the discovery state file
+        #[arg(long, default_value_t = false)]
+        ephemeral: bool,
     },
 }
 
@@ -37,11 +41,11 @@ fn main() -> std::process::ExitCode {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { port } => run_serve(port),
+        Command::Serve { port, ephemeral } => run_serve(port, ephemeral),
     }
 }
 
-fn run_serve(port: u16) -> std::process::ExitCode {
+fn run_serve(port: u16, ephemeral: bool) -> std::process::ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(err) => {
@@ -51,7 +55,7 @@ fn run_serve(port: u16) -> std::process::ExitCode {
     };
 
     let cancel = CancellationToken::new();
-    let result = runtime.block_on(server::serve(port, cancel));
+    let result = runtime.block_on(server::serve(port, ephemeral, cancel));
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {

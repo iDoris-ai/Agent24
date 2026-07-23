@@ -96,7 +96,12 @@ fn agent24d_binary() -> String {
 async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::Child), String> {
     let bin = agent24d_binary();
     let mut cmd = tokio::process::Command::new(&bin);
-    cmd.args(["serve", "--port", "0"])
+    let mut args = vec!["serve", "--port", "0"];
+    if ephemeral {
+        // Private instance: no singleton lock, no discovery file
+        args.push("--ephemeral");
+    }
+    cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         // Ephemeral children die with the CLI no matter which return path runs
@@ -251,7 +256,29 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     return Ok(());
                 }
             }
-            let (state, child) = spawn_daemon(false).await?;
+            let (state, child) = match spawn_daemon(false).await {
+                Ok(v) => v,
+                Err(err) => {
+                    // Lost a concurrent-start race? The winner holds the
+                    // singleton lock and our child exited before ready. The
+                    // winner may still be booting — poll briefly for its
+                    // state file before giving up.
+                    for _ in 0..30 {
+                        if let Some(state) = state_file::read_live() {
+                            let base = format!("http://127.0.0.1:{}", state.port);
+                            if health_ok(&base, &state.token).await {
+                                println!(
+                                    "daemon already running (pid {}, port {})",
+                                    state.pid, state.port
+                                );
+                                return Ok(());
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    return Err(err);
+                }
+            };
             // Detach: without kill_on_drop, dropping the handle leaves the
             // daemon running (same session — production autostart is F1's
             // launchd/systemd job; this is the dev/manual path).

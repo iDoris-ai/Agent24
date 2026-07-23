@@ -131,7 +131,28 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::Error> {
+pub async fn serve(
+    port: u16,
+    ephemeral: bool,
+    cancel: CancellationToken,
+) -> Result<(), std::io::Error> {
+    // Non-ephemeral daemons are singletons: hold an exclusive lifetime lock so
+    // a concurrently-started second daemon fails fast instead of leaking as an
+    // untracked process (review B6). Ephemeral instances skip both the lock
+    // and the discovery file — they are private to one CLI invocation.
+    let _singleton = if ephemeral {
+        None
+    } else {
+        match agent24_protocol::state_file::try_acquire_singleton()? {
+            Some(guard) => Some(guard),
+            None => {
+                return Err(std::io::Error::other(
+                    "another agent24d is already running (singleton lock held)",
+                ));
+            }
+        }
+    };
+
     let token = generate_token();
     let state = AppState::new(token.clone(), ProviderRegistry::from_env(), cancel.clone());
     let router = build_router(state);
@@ -145,13 +166,14 @@ pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::
     // Discovery state file BEFORE the ready line: a CLI that has seen the
     // ready line may immediately rely on attached-mode discovery.
     let daemon_pid = std::process::id();
-    if let Err(err) =
-        agent24_protocol::state_file::write(&agent24_protocol::state_file::DaemonState {
-            port: local.port(),
-            token: token.clone(),
-            pid: daemon_pid,
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        })
+    if !ephemeral
+        && let Err(err) =
+            agent24_protocol::state_file::write(&agent24_protocol::state_file::DaemonState {
+                port: local.port(),
+                token: token.clone(),
+                pid: daemon_pid,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            })
     {
         tracing::warn!("could not write daemon state file: {err}");
     }
@@ -223,7 +245,9 @@ pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::
         }
     };
     // Only remove our own state file — a newer daemon may have replaced it
-    agent24_protocol::state_file::remove_if_owner(daemon_pid);
+    if !ephemeral {
+        agent24_protocol::state_file::remove_if_owner(daemon_pid);
+    }
     result
 }
 

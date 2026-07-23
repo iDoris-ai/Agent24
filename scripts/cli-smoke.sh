@@ -18,6 +18,7 @@ echo "=== help ==="
 
 echo "=== ensure clean slate ==="
 "$CLI" daemon stop >/dev/null 2>&1 || true
+pkill -f "agent24d serve" 2>/dev/null || true   # orphans from previous runs
 sleep 1
 
 echo "=== daemon start ==="
@@ -40,8 +41,19 @@ fi
 
 echo "=== daemon stop ==="
 "$CLI" daemon stop
+sleep 2.5   # allow the full graceful-shutdown grace window before racing
+"$CLI" daemon status | grep -q "not running"
+
+echo "=== concurrent start race: exactly one daemon must win ==="
+"$CLI" daemon start & "$CLI" daemon start & wait
+sleep 1
+COUNT=$(pgrep -f "agent24d serve" | wc -l | tr -d ' ')
+echo "daemon count: $COUNT"
+[ "$COUNT" = "1" ] || { echo "RACE LEAK: $COUNT daemons"; exit 1; }
+"$CLI" daemon stop
 sleep 1
 "$CLI" daemon status | grep -q "not running"
+pgrep -f "agent24d serve" >/dev/null && { echo "daemon lingered after stop"; exit 1; }
 
 echo "=== standalone chat (ephemeral daemon) ==="
 if "$CLI" chat "hi"; then
