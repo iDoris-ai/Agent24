@@ -1,0 +1,22 @@
+[package]
+name = "agent24-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent24 persistence — sqlx SQLite repositories enforcing agent24-core transitions, plus a hash-chained audit log"
+
+[dependencies]
+agent24-core = { path = "../agent24-core" }
+agent24-protocol = { path = "../agent24-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
