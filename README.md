@@ -92,6 +92,25 @@ export const myModule: CapabilityModule = {
 
 ---
 
+## CLI 快速开始（Rust daemon，M-B 起）
+
+```bash
+# 构建
+cd rust && cargo build -p agent24d -p agent24-cli
+
+# 常驻模式：启动 daemon（~/.agent24/daemon.json 供发现）
+./target/debug/agent24 daemon start
+./target/debug/agent24 daemon status     # running · pid … · backend rust
+./target/debug/agent24 models            # 需本地 oMLX(8088)/Ollama(11434)
+./target/debug/agent24 chat "你好"        # attached：连上已运行的 daemon
+./target/debug/agent24 daemon stop
+
+# 无 daemon 时直接 chat：自动拉起临时 daemon，用完即走
+./target/debug/agent24 chat "hi"
+```
+
+端到端冒烟：`scripts/cli-smoke.sh`。Electron 壳切换 Rust 后端：`AGENT24_BACKEND=rust pnpm dev`。
+
 ## 文档
 
 - [工作站规划](docs/WORKSTATION_PLAN.md) — oMLX API 调研、64GB Mac 模型清单、能力 TODO

@@ -65,7 +65,7 @@
 | B3 | ModelProvider trait + chat 透传 | B2 | in-pr | #31 |
 | B4 | WS 事件通道 | B3 | merged | #32 |
 | B5 | BackendManager 双后端开关 + contract 双跑 | B4 | in-pr | #33 |
-| B6 | agent24-cli 骨架 | B5 | pending | |
+| B6 | agent24-cli 骨架 | B5 | in-pr | 待填 |
 
 ### B1 Cargo workspace + agent24-protocol
 - `rust/` workspace（edition 2024，`forbid(unsafe_code)`，workspace lints：clippy deny warnings + unwrap_used）；`agent24-protocol` crate：SPEC-002 §1/§3 全部类型（serde snake_case + schemars）；`cargo deny` 配置（禁 GPL/AGPL）。
