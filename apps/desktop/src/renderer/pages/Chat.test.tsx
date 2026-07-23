@@ -39,7 +39,7 @@ describe('ChatPage', () => {
       expect(screen.getByText('Hello from AI!')).toBeInTheDocument()
     })
     expect(mockBackendProxy).toHaveBeenCalledWith(
-      expect.objectContaining({ method: 'POST', path: '/api/llm/chat' }),
+      expect.objectContaining({ method: 'POST', path: '/api/v1/chat' }),
     )
   })
 
@@ -47,7 +47,7 @@ describe('ChatPage', () => {
     mockBackendProxy.mockResolvedValue({
       ok: false,
       status: 503,
-      data: { error: 'Service unavailable' },
+      data: { error: { code: 'provider_unavailable', message: 'Service unavailable' } },
     })
 
     render(<ChatPage />)

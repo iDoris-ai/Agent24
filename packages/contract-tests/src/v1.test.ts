@@ -4,20 +4,181 @@
 // goes live with the Rust daemon (tasks C1..C5). Keep names in sync with
 // docs/specs/SPEC-002-protocol.md §2/§3.
 
-import { describe, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import Ajv2020 from 'ajv/dist/2020.js'
+import addFormats from 'ajv-formats'
+import { BASE_URL, get, post, resolveLlmExpectation } from './helpers.js'
 
-describe('v1 M-A (activate in A5)', () => {
-  it.todo('GET /api/v1/health → 200 {status:"ok", version, backend}')
-  it.todo('POST /api/v1/chat → 200 {message, usage} and emits run.started/model.delta/run.completed for a transient run')
-  it.todo('POST /api/v1/chat without messages → 400 invalid_request error envelope')
-  it.todo('GET /api/v1/models → 200 {models:[{id, provider, tier, loaded}]}')
-  it.todo('GET /api/v1/usage → 200 Usage aggregate')
-  it.todo('WS /api/v1/events → envelope {v:1, seq, ts, type, payload}, seq monotonic')
-  it.todo('WS /api/v1/events → messages validate against protocol/events.schema.json')
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+const WS_URL = BASE_URL.replace(/^http/, 'ws') + '/api/v1/events'
+
+let llmUp = false
+let validateEvent: ((doc: unknown) => boolean) & { errors?: unknown } = Object.assign(() => false, {})
+beforeAll(async () => {
+  llmUp = await resolveLlmExpectation()
+  const schema = JSON.parse(readFileSync(join(repoRoot, 'protocol', 'events.schema.json'), 'utf8')) as Record<string, unknown>
+  const ajv = new Ajv2020.default({ strict: false })
+  addFormats.default(ajv)
+  validateEvent = ajv.compile(schema) as typeof validateEvent
+})
+
+// Collect WS events while `action` runs, until a terminal run event or timeout.
+async function collectEventsDuring(action: () => Promise<void>): Promise<Array<Record<string, unknown>>> {
+  const events: Array<Record<string, unknown>> = []
+  const ws = new WebSocket(WS_URL)
+  await new Promise<void>((resolve, reject) => {
+    ws.addEventListener('open', () => resolve())
+    ws.addEventListener('error', () => reject(new Error(`WS connect failed: ${WS_URL}`)))
+  })
+  const done = new Promise<void>((resolve) => {
+    const timer = setTimeout(() => resolve(), 10_000)
+    ws.addEventListener('message', (msg) => {
+      const doc = JSON.parse(String(msg.data)) as Record<string, unknown>
+      events.push(doc)
+      const t = doc['type']
+      if (t === 'run.completed' || t === 'run.failed' || t === 'run.cancelled') {
+        clearTimeout(timer)
+        resolve()
+      }
+    })
+  })
+  await action()
+  await done
+  ws.close()
+  return events
+}
+
+describe('v1 M-A (live since A5)', () => {
+  it('GET /api/v1/health → 200 {status:"ok", version, backend}', async () => {
+    const res = await get('/api/v1/health')
+    expect(res.status).toBe(200)
+    const body = res.body as { status: string; version: string; backend: string }
+    expect(body.status).toBe('ok')
+    expect(typeof body.version).toBe('string')
+    expect(body.version.length).toBeGreaterThan(0)
+    expect(typeof body.backend).toBe('string')
+  })
+
+  it('POST /api/v1/chat without messages → 400 invalid_request envelope', async () => {
+    const res = await post('/api/v1/chat', { model: 'whatever' })
+    expect(res.status).toBe(400)
+    const body = res.body as { error: { code: string; message: string } }
+    expect(body.error.code).toBe('invalid_request')
+    expect(typeof body.error.message).toBe('string')
+  })
+
+  it('unknown v1 route → 404 not_found envelope', async () => {
+    const res = await get('/api/v1/definitely-not-a-route')
+    expect(res.status).toBe(404)
+    expect((res.body as { error: { code: string } }).error.code).toBe('not_found')
+  })
+
+  it('bare /api/v1 (no trailing slash) → 404 v1 envelope, never legacy shape', async () => {
+    const res = await get('/api/v1')
+    expect(res.status).toBe(404)
+    const body = res.body as { error: { code: string; message: string } }
+    expect(body.error.code).toBe('not_found')
+    expect(typeof body.error.message).toBe('string')
+  })
+
+  it('oversized chat body → 413 payload_too_large envelope', async () => {
+    const big = 'x'.repeat(1024 * 1024 + 100)
+    const res = await post('/api/v1/chat', { messages: [{ role: 'user', content: big }] })
+    expect(res.status).toBe(413)
+    expect((res.body as { error: { code: string } }).error.code).toBe('payload_too_large')
+  })
+
+  it('WS upgrade carrying a browser Origin header is rejected', async () => {
+    const { default: WsClient } = await import('ws')
+    const outcome = await new Promise<string>((resolve) => {
+      const ws = new WsClient(WS_URL, { headers: { Origin: 'http://evil.example' } })
+      ws.on('open', () => { ws.close(); resolve('open') })
+      ws.on('error', () => resolve('rejected'))
+      setTimeout(() => resolve('timeout'), 5000)
+    })
+    expect(outcome).toBe('rejected')
+  })
+
+  it('GET /api/v1/models → 200 {models:[{id, provider, tier, loaded}]}', async () => {
+    const res = await get('/api/v1/models')
+    expect(res.status).toBe(200)
+    const body = res.body as { models: Array<Record<string, unknown>> }
+    expect(Array.isArray(body.models)).toBe(true)
+    for (const m of body.models) {
+      expect(typeof m['id']).toBe('string')
+      expect(typeof m['provider']).toBe('string')
+      expect(typeof m['tier']).toBe('string')
+      expect(typeof m['loaded']).toBe('boolean')
+    }
+  })
+
+  it('GET /api/v1/usage → 200 Usage aggregate', async () => {
+    const res = await get('/api/v1/usage')
+    expect(res.status).toBe(200)
+    const body = res.body as Record<string, unknown>
+    for (const k of ['prompt_tokens', 'completion_tokens', 'total_tokens']) {
+      expect(typeof body[k], k).toBe('number')
+    }
+  })
+
+  it('chat success emits run.started → model.delta → run.completed; envelope valid, seq monotonic', async (ctx) => {
+    if (!llmUp) return ctx.skip()
+    let chatRes: { status: number; body: unknown } | null = null
+    const events = await collectEventsDuring(async () => {
+      chatRes = await post('/api/v1/chat', {
+        messages: [{ role: 'user', content: 'Reply with the single word: pong' }],
+      })
+    })
+    expect(chatRes!.status).toBe(200)
+    const resBody = chatRes!.body as { message: { role: string; content: string }; usage: Record<string, unknown> }
+    expect(resBody.message.role).toBe('assistant')
+    expect(typeof resBody.usage['total_tokens']).toBe('number')
+
+    // Correlate by the first run.started's run_id — shields against bystander
+    // events if the daemon under test serves concurrent traffic.
+    const started = events.find((e) => e['type'] === 'run.started')
+    expect(started).toBeDefined()
+    const runId = (started!['payload'] as { run_id: string }).run_id
+    expect(runId).toMatch(/^run_[0-9A-HJKMNP-TV-Z]{26}$/) // ULID (Crockford base32)
+    const mine = events.filter((e) => (e['payload'] as { run_id?: string }).run_id === runId)
+    const types = mine.map((e) => e['type'])
+    expect(types[0]).toBe('run.started')
+    expect(types).toContain('model.delta')
+    expect(types[types.length - 1]).toBe('run.completed')
+    let prevSeq = -1
+    for (const ev of mine) {
+      expect(validateEvent(ev), JSON.stringify(validateEvent.errors)).toBe(true)
+      expect(ev['v']).toBe(1)
+      expect(ev['seq']).toBeGreaterThan(prevSeq)
+      prevSeq = ev['seq'] as number
+    }
+  })
+
+  it('chat failure emits run.started → run.failed with provider_unavailable envelope', async (ctx) => {
+    if (llmUp) return ctx.skip()
+    let chatRes: { status: number; body: unknown } | null = null
+    const events = await collectEventsDuring(async () => {
+      chatRes = await post('/api/v1/chat', { messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(chatRes!.status).toBe(503)
+    expect((chatRes!.body as { error: { code: string } }).error.code).toBe('provider_unavailable')
+    const started = events.find((e) => e['type'] === 'run.started')
+    expect(started).toBeDefined()
+    const runId = (started!['payload'] as { run_id: string }).run_id
+    const mine = events.filter((e) => (e['payload'] as { run_id?: string }).run_id === runId)
+    const types = mine.map((e) => e['type'])
+    expect(types[0]).toBe('run.started')
+    expect(types[types.length - 1]).toBe('run.failed')
+    for (const ev of mine) {
+      expect(validateEvent(ev), JSON.stringify(validateEvent.errors)).toBe(true)
+    }
+  })
 
   describe('agent24d only (B2+)', () => {
     it.todo('requests without bearer token → 401 unauthorized (mock daemon exempt)')
-    it.todo('WS upgrade with browser Origin header is rejected')
   })
 })
 

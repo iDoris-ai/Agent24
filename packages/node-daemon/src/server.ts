@@ -15,6 +15,8 @@ import {
 import { loadState, isEnabled, setEnabled } from './module-state'
 import { installModule, uninstallModule, loadInstalledModule } from './module-installer'
 import { proxyToService, getHostPort, stopAll } from './boxlite-service'
+import { EventsHub } from './v1/events-hub'
+import { createV1Handler } from './v1/routes'
 import type { SimpleRouter, RouteContext, RouteHandler } from './capabilities/base'
 import type { LLMRequest } from './types'
 
@@ -31,6 +33,8 @@ interface RouteEntry {
 const routes = new Map<RouteKey, RouteEntry>()
 
 const gateway = new LLMGateway()
+const eventsHub = new EventsHub()
+const handleV1 = createV1Handler(gateway, eventsHub)
 
 function buildRouter(moduleId: string): SimpleRouter {
   return {
@@ -72,6 +76,22 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   const base = `http://${HOST}`
   const url = new URL(req.url ?? '/', base)
   const method = (req.method ?? 'GET').toUpperCase() as 'GET' | 'POST'
+
+  // A5: v1 protocol adapter — own dispatch + v1 error envelope; a thrown error
+  // inside v1 must NEVER surface as the legacy flat { error: string } shape.
+  if (url.pathname === '/api/v1' || url.pathname.startsWith('/api/v1/')) {
+    try {
+      await handleV1(req, res, url.pathname, method)
+    } catch (err) {
+      if (!res.headersSent) {
+        const statusCode = (err as { statusCode?: number }).statusCode ?? 500
+        const code = statusCode === 413 ? 'payload_too_large' : 'internal'
+        const message = err instanceof Error ? err.message : 'Internal error'
+        send(res, statusCode, { error: { code, message } })
+      }
+    }
+    return
+  }
 
   // M4: service container proxy — prefix match /api/svc/:moduleId/*
   if (url.pathname.startsWith('/api/svc/')) {
@@ -231,7 +251,13 @@ function start(): void {
     })
   })
 
+  eventsHub.attach(server)
+
   server.listen(PORT, HOST, () => {
+    // SPEC-002 §4 ready line — mock daemon: fixed port, empty token.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+    const version = (require('../package.json') as { version: string }).version
+    console.log(JSON.stringify({ type: 'ready', port: PORT, token: '', version }))
     console.log(`[backend] listening on http://${HOST}:${PORT}`)
   })
 

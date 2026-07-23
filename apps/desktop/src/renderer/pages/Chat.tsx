@@ -34,14 +34,15 @@ export default function ChatPage() {
     try {
       const res = await window.agent24.backendProxy({
         method: 'POST',
-        path: '/api/llm/chat',
+        path: '/api/v1/chat',
         body: {
           messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
         },
       })
       if (!res.ok) {
-        const error = (res.data as { error?: string } | null)?.error ?? `HTTP ${res.status}`
-        throw new Error(error)
+        // v1 error envelope { error: { code, message } }
+        const err = (res.data as { error?: { message?: string } } | null)?.error
+        throw new Error(err?.message ?? `HTTP ${res.status}`)
       }
       const reply = (res.data as { message?: { content?: string } })?.message?.content ?? '（模型未返回内容）'
       setMessages(prev => [...prev, { role: 'assistant', content: reply }])
