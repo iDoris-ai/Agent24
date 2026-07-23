@@ -11,8 +11,10 @@
 1. 同步状态
    - git fetch；检查已提交 PR 的状态与 review 结论（gh pr list / gh pr view --json reviews）
    - 外部 reviewer bot（另一 GitHub 账号，约每 10 分钟一轮）会 review 每个 PR：
-     · **APPROVED** → loop 执行 squash merge 进 main → 更新 TASKS.md 为 merged →
-       将后续 stacked 分支 `git rebase --onto main <旧base>` 并 force-push（PR base 会自动指向 main）
+     · **APPROVED** → loop 执行 squash merge 进 main（**不带 --delete-branch**）→
+       先将后续 stacked 分支 `git rebase --onto main <旧base>` 并 force-push、
+       确认子 PR base 已指向 main，**然后才删除旧 base 分支**
+       （教训：先删分支会让 GitHub 直接 close 子 PR 且无法 reopen）→ 更新 TASKS.md 为 merged
      · **CHANGES_REQUESTED** → 【优先级最高】切到该分支逐条修复 → 重跑本地验证 →
        回复每条意见 → push，等 bot 复审（循环直到 APPROVED）
    - 有 PR CI 红 → 修 CI，同上优先处理
