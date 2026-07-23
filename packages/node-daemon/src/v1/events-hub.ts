@@ -34,8 +34,10 @@ export class EventsHub {
         socket.destroy()
         return
       }
-      // Reject upgrades carrying a browser Origin header (SPEC-002 §4)
-      if (req.headers['origin']) {
+      // Reject upgrades carrying a browser Origin header (SPEC-002 §4).
+      // Presence check (not truthiness): an empty-string Origin must also be
+      // rejected — browsers may send `Origin: null` for opaque origins.
+      if (req.headers['origin'] !== undefined) {
         socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
         socket.destroy()
         return

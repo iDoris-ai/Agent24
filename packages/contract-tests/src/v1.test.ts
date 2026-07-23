@@ -70,6 +70,12 @@ describe('v1 M-A (live since A5)', () => {
     expect(typeof body.error.message).toBe('string')
   })
 
+  it('POST /api/v1/chat with a literal null body → 400 (never 500/internal leak)', async () => {
+    const res = await post('/api/v1/chat', null)
+    expect(res.status).toBe(400)
+    expect((res.body as { error: { code: string } }).error.code).toBe('invalid_request')
+  })
+
   it('unknown v1 route → 404 not_found envelope', async () => {
     const res = await get('/api/v1/definitely-not-a-route')
     expect(res.status).toBe(404)

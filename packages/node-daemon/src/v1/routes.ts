@@ -29,6 +29,7 @@ interface ChatBody {
 
 function isValidChatBody(b: ChatBody): b is { messages: Array<{ role: string; content: string }>; model?: string } {
   return (
+    typeof b === 'object' && b !== null &&
     Array.isArray(b.messages) &&
     b.messages.length > 0 &&
     b.messages.every((m) => typeof m?.role === 'string' && typeof m?.content === 'string') &&
