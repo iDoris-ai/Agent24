@@ -4,7 +4,7 @@
 > 状态值：`pending` → `in-progress` → `in-pr(#N)` → `merged` ｜ `blocked(原因)`
 > loop 每轮：取「状态 pending 且依赖均为 in-pr/merged」中序号最靠前的任务执行（见 LOOP.md）。
 > 每完成一步（提 PR / 收到 merge）由 loop 更新本文件并 commit。
-> 最后更新：2026-07-23（A0-A4 全部 merge；A5 in-pr #27）
+> 最后更新：2026-07-23（A0-A5 全部 merge；A6 in-pr #28 base=main）
 
 ## 执行顺序总览（最佳路径）
 
@@ -22,8 +22,8 @@
 | A2 | `protocol/` 事件与模块 schema | A1 | merged | #24 |
 | A3 | contract-tests 包（对现 node daemon） | A1 | merged | #25 |
 | A4 | 仓库重构为 pnpm workspace 目标布局 | A3 | merged | #26 |
-| A5 | node-daemon v1 适配层（mock daemon） | A4 | in-pr | #27 |
-| A6 | api-client 生成管道 + CI 三 job | A5 | pending | |
+| A5 | node-daemon v1 适配层（mock daemon） | A4 | merged | #27 |
+| A6 | api-client 生成管道 + CI 三 job | A5 | in-pr | #28 |
 
 ### A0 提交现有设计文档 PR
 - 范围：仅 stage 本次架构工作新增文件——`docs/ADR-026-rust-core-polyglot.md`、`docs/reference-notes/{codex,openfang}.md`、`docs/specs/*`、`.gitignore`（vendor/reference 条目）。**不得**卷入工作区里其他历史修改（README、TRADEMARK*、docs/PLAN 等）。

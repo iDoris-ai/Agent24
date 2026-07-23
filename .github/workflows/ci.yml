@@ -38,10 +38,103 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck
-        run: pnpm typecheck
+        run: pnpm typecheck && pnpm --filter @agent24/api-client typecheck
 
       - name: Lint
         run: pnpm lint
 
       - name: Test
         run: pnpm test
+
+  rust:
+    name: Rust (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Placeholder until task B1 lands the Cargo workspace (SPEC-001 §7)
+    if: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: fmt
+        run: cargo fmt --check --manifest-path rust/Cargo.toml
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --manifest-path rust/Cargo.toml -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --manifest-path rust/Cargo.toml
+
+  contract:
+    name: Contract Tests + Codegen Drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa  # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: pnpm install --frozen-lockfile
+
+      - name: Codegen drift check (api-client must match protocol/)
+        run: |
+          pnpm gen:api
+          STATUS=$(git status --porcelain --untracked-files=all -- packages/api-client/src)
+          if [ -n "$STATUS" ]; then
+            echo "::error::packages/api-client/src is out of sync with protocol/ — run 'pnpm gen:api' and commit"
+            echo "$STATUS"
+            exit 1
+          fi
+          EXPECTED=$'packages/api-client/src/events.d.ts\npackages/api-client/src/index.ts\npackages/api-client/src/openapi.d.ts'
+          ACTUAL=$(git ls-files packages/api-client/src | sort)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::unexpected tracked files under packages/api-client/src"
+            diff <(echo "$EXPECTED") <(echo "$ACTUAL") || true
+            exit 1
+          fi
+
+      - name: Build node daemon
+        run: pnpm --filter @agent24/node-daemon build
+
+      - name: Start daemon and wait for /health
+        run: |
+          node packages/node-daemon/dist/server.js > daemon.log 2>&1 &
+          echo $! > daemon.pid
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8765/health && break
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:8765/api/v1/health
+
+      - name: "Run contract tests (A24_EXPECT_LLM=down)"
+        env:
+          A24_EXPECT_LLM: down
+        run: pnpm test:contract
+
+      - name: Stop daemon
+        if: always()
+        run: if [ -f daemon.pid ]; then kill "$(cat daemon.pid)" 2>/dev/null || true; fi
+
+      - name: Daemon log on failure
+        if: failure()
+        run: cat daemon.log || true

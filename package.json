@@ -18,7 +18,8 @@
     "format": "prettier --write \"apps/desktop/src/**/*.{ts,tsx,css}\" \"packages/node-daemon/src/**/*.ts\"",
     "build:mac": "pnpm --filter @agent24/desktop build:mac",
     "build:win": "pnpm --filter @agent24/desktop build:win",
-    "build:linux": "pnpm --filter @agent24/desktop build:linux"
+    "build:linux": "pnpm --filter @agent24/desktop build:linux",
+    "gen:api": "pnpm --filter @agent24/api-client gen"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^7",
