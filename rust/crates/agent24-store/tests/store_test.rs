@@ -226,6 +226,17 @@ async fn tool_call_finishes_exactly_once() {
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::Conflict(_)));
+    // truly missing id → NotFound (not Conflict) — API taxonomy mirror of approvals
+    let err = store
+        .finish_tool_call(
+            "tc_never_existed",
+            ToolCallStatus::Completed,
+            None,
+            TS.to_owned(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
     let calls = store.list_tool_calls("run_1").await.unwrap();
     assert_eq!(calls[0].status, ToolCallStatus::Completed);
     assert_eq!(calls[0].output_summary.as_deref(), Some("200 OK"));

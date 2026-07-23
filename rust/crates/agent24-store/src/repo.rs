@@ -278,9 +278,19 @@ impl Store {
         .execute(self.pool())
         .await?;
         if result.rows_affected() == 0 {
-            return Err(StoreError::Conflict(format!(
-                "tool call {id} is not running (missing or already finished)"
-            )));
+            // Mirror resolve_approval's taxonomy: distinguish a missing row
+            // (404) from an already-finished one (409). Terminal states absorb,
+            // so this follow-up classification is stable.
+            let exists = sqlx::query("SELECT 1 FROM tool_calls WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?
+                .is_some();
+            return Err(if exists {
+                StoreError::Conflict(format!("tool call {id} already finished"))
+            } else {
+                StoreError::NotFound(format!("tool call {id}"))
+            });
         }
         Ok(())
     }
