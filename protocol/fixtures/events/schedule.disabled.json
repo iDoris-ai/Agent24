@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "seq": 11,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "schedule.disabled",
+  "payload": {
+    "schedule_id": "sch_01H0000000000000000000TEST",
+    "reason": "consecutive_failures"
+  }
+}

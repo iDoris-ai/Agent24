@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "seq": 9,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "approval.resolved",
+  "payload": {
+    "approval_id": "apr_01H0000000000000000000TEST",
+    "run_id": "run_01H0000000000000000000TEST",
+    "decision_type": "approve"
+  }
+}

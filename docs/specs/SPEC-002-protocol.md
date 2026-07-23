@@ -150,7 +150,7 @@ M-B agent24d 起动态端口 + `Authorization: Bearer <token>`（启动时 stdou
 
 | type | payload 要点 |
 |---|---|
-| `run.started` | `{ run_id, session_id?, schedule_id? }`（transient run 的 session_id 为 null） |
+| `run.started` | `{ run_id, session_id, schedule_id }`（后两者恒出现、可为 null：transient run 的 session_id 为 null；非 schedule 触发的 schedule_id 为 null） |
 | `run.completed` | `{ run_id, output, usage }` |
 | `run.failed` | `{ run_id, error }` |
 | `run.cancelled` | `{ run_id }` |
@@ -159,7 +159,7 @@ M-B agent24d 起动态端口 + `Authorization: Bearer <token>`（启动时 stdou
 | `tool.completed` | `{ run_id, tool_call_id, status, output_summary }` |
 | `approval.resolved` | `{ approval_id, run_id, decision_type }`（多客户端同步收敛） |
 | `schedule.fired` | `{ schedule_id, run_id }` |
-| `schedule.disabled` | `{ schedule_id, reason: "consecutive_failures" }` |
+| `schedule.disabled` | `{ schedule_id, reason }`（reason 为开放枚举，当前唯一取值 `consecutive_failures`） |
 
 **Request（必须回包，经 REST）**：
 

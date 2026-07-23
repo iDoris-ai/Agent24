@@ -1,0 +1,30 @@
+{
+  "id": "example-service-box",
+  "version": "0.1.0",
+  "name": "服务容器示例",
+  "description": "BoxLite 长期运行服务容器演示",
+  "type": "hybrid",
+  "permissions": [
+    "network"
+  ],
+  "navItem": {
+    "icon": "📦",
+    "label": "服务容器",
+    "route": "service-box"
+  },
+  "models": [
+    "Qwen3-8B-4bit"
+  ],
+  "container": {
+    "image": "python:slim",
+    "port": 8000,
+    "startCmd": [
+      "sh",
+      "-c",
+      "python /tmp/svc.py"
+    ],
+    "healthPath": "/health",
+    "memoryMib": 256
+  },
+  "pgl": {}
+}
