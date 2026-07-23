@@ -1,9 +1,9 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import http from 'node:http'
 
 // Start the server in-process and query it via http
 // Use a random port to avoid conflicts
-let server: http.Server | null = null
+const server: http.Server | null = null
 const PORT = 8765
 
 beforeAll(async () => {

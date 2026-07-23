@@ -3,7 +3,9 @@
     "target": "ES2022",
     "module": "CommonJS",
     "moduleResolution": "node",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,
@@ -12,10 +14,15 @@
     "isolatedModules": true,
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "noEmitOnError": true
   },
-  "include": ["src/main/**/*", "src/shared/**/*", "src/backend/**/*"],
+  "include": [
+    "src/main/**/*",
+    "src/shared/**/*"
+  ],
   "exclude": [
     "node_modules",
     "dist",

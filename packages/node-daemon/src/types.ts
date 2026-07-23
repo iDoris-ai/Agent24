@@ -1,5 +1,5 @@
 import type { LLMGateway } from './llm-gateway'
-export type { ModuleManifest, ModuleType, Permission } from '../shared/ipc-types'
+export type { ModuleManifest, ModuleType, Permission } from './manifest'
 
 // ── LLM ──────────────────────────────────────────────────────────────────────
 

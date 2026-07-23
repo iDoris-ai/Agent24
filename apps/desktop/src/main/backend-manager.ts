@@ -11,9 +11,9 @@ const isDev = process.env['NODE_ENV'] === 'development'
 
 function resolveServerEntry(): string {
   if (isDev) {
-    // rootDir=src, outDir=dist → src/backend/server.ts → dist/backend/server.js
-    // __dirname here is dist/main/, so go up one level to dist/
-    return path.join(__dirname, '..', 'backend', 'server.js')
+    // Workspace dep: @agent24/node-daemon main → packages/node-daemon/dist/server.js
+    // (run `pnpm -F @agent24/node-daemon build` first — the root dev script does)
+    return require.resolve('@agent24/node-daemon')
   }
   // In production: packed into resources/backend/server.js via electron-builder extraResources.
   return path.join(process.resourcesPath, 'backend', 'server.js')

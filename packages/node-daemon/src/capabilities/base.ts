@@ -1,5 +1,5 @@
 import type { CapabilityContext } from '../types'
-import type { ModuleManifest } from '../../shared/ipc-types'
+import type { ModuleManifest } from '../manifest'
 
 export interface SimpleRouter {
   get(path: string, handler: RouteHandler): void
