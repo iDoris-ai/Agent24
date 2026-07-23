@@ -451,6 +451,33 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /shutdown:
+    post:
+      operationId: shutdownDaemon
+      tags: [system]
+      summary: Request graceful daemon shutdown (authenticated)
+      description: |
+        The bearer token proves the caller owns this daemon instance — the CLI
+        uses this instead of signalling a pid from a possibly-stale state file.
+        agent24d only until the node mock gains parity.
+      responses:
+        "202":
+          description: Shutdown initiated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /tools:
     get:
       operationId: listTools

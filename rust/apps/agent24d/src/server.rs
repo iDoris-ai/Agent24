@@ -62,6 +62,19 @@ async fn health() -> Json<Health> {
     })
 }
 
+/// Authenticated shutdown (bearer token proves the caller owns this daemon —
+/// unlike a pid from a possibly-stale state file, this can never kill an
+/// unrelated reused-pid process). Used by `agent24 daemon stop`.
+async fn shutdown_handler(State(state): State<AppState>) -> Response {
+    tracing::info!("shutdown requested via /api/v1/shutdown");
+    state.shutdown.cancel();
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
+}
+
 async fn fallback() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
 }
@@ -106,6 +119,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/models", get(crate::routes::get_models))
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/events", get(crate::events::ws_events))
+        .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
@@ -117,7 +131,28 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::Error> {
+pub async fn serve(
+    port: u16,
+    ephemeral: bool,
+    cancel: CancellationToken,
+) -> Result<(), std::io::Error> {
+    // Non-ephemeral daemons are singletons: hold an exclusive lifetime lock so
+    // a concurrently-started second daemon fails fast instead of leaking as an
+    // untracked process (review B6). Ephemeral instances skip both the lock
+    // and the discovery file — they are private to one CLI invocation.
+    let _singleton = if ephemeral {
+        None
+    } else {
+        match agent24_protocol::state_file::try_acquire_singleton()? {
+            Some(guard) => Some(guard),
+            None => {
+                return Err(std::io::Error::other(
+                    "another agent24d is already running (singleton lock held)",
+                ));
+            }
+        }
+    };
+
     let token = generate_token();
     let state = AppState::new(token.clone(), ProviderRegistry::from_env(), cancel.clone());
     let router = build_router(state);
@@ -128,6 +163,21 @@ pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::
 
     // SPEC-002 §4 ready line: parsers scan stdout for the first type=="ready"
     // JSON line. stdout carries nothing else (logs go to stderr).
+    // Discovery state file BEFORE the ready line: a CLI that has seen the
+    // ready line may immediately rely on attached-mode discovery.
+    let daemon_pid = std::process::id();
+    if !ephemeral
+        && let Err(err) =
+            agent24_protocol::state_file::write(&agent24_protocol::state_file::DaemonState {
+                port: local.port(),
+                token: token.clone(),
+                pid: daemon_pid,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            })
+    {
+        tracing::warn!("could not write daemon state file: {err}");
+    }
+
     println!(
         "{}",
         serde_json::json!({
@@ -184,7 +234,7 @@ pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::
 
     // Force-exit backstop: once cancelled, in-flight requests get
     // SHUTDOWN_GRACE to finish, then the process exits regardless.
-    tokio::select! {
+    let result = tokio::select! {
         result = server => result,
         () = async {
             cancel.cancelled().await;
@@ -193,7 +243,12 @@ pub async fn serve(port: u16, cancel: CancellationToken) -> Result<(), std::io::
             tracing::warn!("graceful shutdown exceeded {SHUTDOWN_GRACE:?}; forcing exit");
             Ok(())
         }
+    };
+    // Only remove our own state file — a newer daemon may have replaced it
+    if !ephemeral {
+        agent24_protocol::state_file::remove_if_owner(daemon_pid);
     }
+    result
 }
 
 #[cfg(test)]

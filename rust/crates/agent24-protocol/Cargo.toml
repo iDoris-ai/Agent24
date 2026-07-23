@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Agent24 v1 protocol types — locked to protocol/ via fixture tests (B1); becomes the generation source in B4"
 
 [dependencies]
+fs2 = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
