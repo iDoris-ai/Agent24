@@ -25,6 +25,7 @@ pub struct AppState {
     pub token: Arc<String>,
     pub registry: Arc<ProviderRegistry>,
     pub usage: Arc<crate::routes::UsageCounters>,
+    pub events: crate::events::EventsHub,
     /// Daemon-wide shutdown token; handlers derive request tokens from it so
     /// shutdown cancels in-flight provider calls (run-level cancel joins in C2)
     pub shutdown: CancellationToken,
@@ -36,6 +37,7 @@ impl AppState {
             token: Arc::new(token),
             registry: Arc::new(registry),
             usage: Arc::new(crate::routes::UsageCounters::default()),
+            events: crate::events::EventsHub::default(),
             shutdown,
         }
     }
@@ -103,6 +105,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
         .route("/api/v1/usage", get(crate::routes::get_usage))
+        .route("/api/v1/events", get(crate::events::ws_events))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)

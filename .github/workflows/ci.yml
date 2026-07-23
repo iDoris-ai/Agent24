@@ -81,6 +81,13 @@ jobs:
         working-directory: rust
         run: cargo test --workspace
 
+      - name: Events schema drift (Rust is the generation source since B4)
+        working-directory: rust
+        run: |
+          cargo run -q -p agent24-protocol --bin export-schema > /tmp/events.schema.json
+          diff /tmp/events.schema.json ../protocol/events.schema.json \
+            || (echo "::error::protocol/events.schema.json is out of sync — run 'cargo run -p agent24-protocol --bin export-schema > ../protocol/events.schema.json' (from rust/) and commit" && exit 1)
+
       - name: License / bans check (cargo-deny)
         # Tag-pinned (org convention is sha-pinning; TODO pin sha once vetted)
         uses: EmbarkStudios/cargo-deny-action@v2

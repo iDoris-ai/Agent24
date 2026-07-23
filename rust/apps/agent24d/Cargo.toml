@@ -9,7 +9,7 @@ description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — heal
 [dependencies]
 agent24-models = { path = "../../crates/agent24-models" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
 rand = "0.9"
