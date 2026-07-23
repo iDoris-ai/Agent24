@@ -4,7 +4,7 @@
 > 状态值：`pending` → `in-progress` → `in-pr(#N)` → `merged` ｜ `blocked(原因)`
 > loop 每轮：取「状态 pending 且依赖均为 in-pr/merged」中序号最靠前的任务执行（见 LOOP.md）。
 > 每完成一步（提 PR / 收到 merge）由 loop 更新本文件并 commit。
-> 最后更新：2026-07-24（M-A ✅ M-B ✅ #21-#34 全部 merge；alpha tag 待用户确认；C1 in-pr）；#32/#33/#34 stacked 在审）
+> 最后更新：2026-07-24（M-A ✅ M-B ✅ #21-#34 全部 merge；alpha tag 待用户确认；C1 in-pr #35）；#32/#33/#34 stacked 在审）
 
 ## 执行顺序总览（最佳路径）
 
@@ -98,7 +98,7 @@
 
 | ID | 任务 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| C1 | agent24-core 领域模型 + agent24-store | B5 | in-pr | 待填 |
+| C1 | agent24-core 领域模型 + agent24-store | B5 | in-pr | #35 |
 | C2 | Agent Loop v1（runs 端到端） | C1 | pending | |
 | C3 | Tool trait + registry + 基础工具 | C2 | pending | |
 | C4 | 审批系统 | C3 | pending | |
