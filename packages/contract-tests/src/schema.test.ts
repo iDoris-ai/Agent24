@@ -43,6 +43,31 @@ describe('events schema — canonical negatives (fail-closed guards)', () => {
     ).toBe(false)
   })
 
+  it('rejects tool.completed missing its always-present nullable output_summary', () => {
+    expect(
+      validate({
+        ...ENVELOPE,
+        type: 'tool.completed',
+        payload: { run_id: 'r', tool_call_id: 't', status: 'completed' },
+      }),
+    ).toBe(false)
+  })
+
+  it('rejects approval.required missing its always-present nullable decision/decided_at', () => {
+    expect(
+      validate({
+        ...ENVELOPE,
+        type: 'approval.required',
+        payload: {
+          id: 'apr_x', run_id: 'r', tool_call_id: 't', kind: 'exec', summary: 's',
+          payload: {}, available_decisions: ['approve'], status: 'pending',
+          expires_at: '2026-07-23T12:05:00Z', created_at: '2026-07-23T12:00:00Z',
+          // decision + decided_at deliberately omitted
+        },
+      }),
+    ).toBe(false)
+  })
+
   it('rejects a bad closed-enum value', () => {
     expect(
       validate({

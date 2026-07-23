@@ -15,6 +15,11 @@ use tokio::sync::broadcast;
 
 use crate::server::AppState;
 
+/// A client that never drains its receive buffer must not pin this task
+/// forever — bound each send and disconnect on expiry (same treatment as the
+/// provider-side request timeouts in B3).
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Outbound bus capacity — sized generously (codex-rs practice) so a briefly
 /// slow client survives a turn's burst; laggards get RecvError::Lagged and are
 /// disconnected to reconcile via REST (v1 has no replay).
@@ -116,10 +121,18 @@ async fn client_loop(mut socket: WebSocket, hub: EventsHub) {
                     Ok((ts, body)) => {
                         let event = Event { v: 1, seq, ts, body };
                         let Ok(text) = serde_json::to_string(&event) else { continue };
-                        if socket.send(Message::Text(text.into())).await.is_err() {
-                            break; // client gone
+                        match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(text.into())))
+                            .await
+                        {
+                            Ok(Ok(())) => {
+                                seq += 1; // only after a successful send — no seq holes
+                            }
+                            Ok(Err(_)) => break, // client gone
+                            Err(_) => {
+                                tracing::warn!("events client stalled >{SEND_TIMEOUT:?}, disconnecting");
+                                break;
+                            }
                         }
-                        seq += 1; // only after a successful send — no seq holes
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("events client lagged by {n}, disconnecting");
