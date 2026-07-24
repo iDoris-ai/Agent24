@@ -6,6 +6,7 @@
 mod approvals;
 mod events;
 mod mcp;
+mod overrides;
 mod routes;
 mod runs;
 mod schedules;
