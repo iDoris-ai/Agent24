@@ -294,7 +294,10 @@ fn extract_json_value(content: &str) -> Option<Value> {
 }
 
 /// Strip a single surrounding ```/```json fence, if present. Anything malformed
-/// is returned as-is so the strict `from_str` below rejects it.
+/// — no fence, no closing fence, or NON-WHITESPACE content after the closing
+/// fence — is returned as-is (with the leading backticks intact) so the strict
+/// `from_str` below rejects it. This closes the fence-path fail-open: trailing
+/// junk after a fenced object must escalate, not be silently discarded.
 fn strip_code_fence(s: &str) -> &str {
     let Some(rest) = s.strip_prefix("```") else {
         return s;
@@ -304,10 +307,12 @@ fn strip_code_fence(s: &str) -> &str {
         return s;
     };
     let after_open = &rest[newline + 1..];
-    // Drop the closing fence, if there is one.
+    // Drop the closing fence — but ONLY if nothing but whitespace follows it.
     match after_open.rfind("```") {
-        Some(close) => &after_open[..close],
-        None => after_open,
+        Some(close) if after_open[close + 3..].trim().is_empty() => &after_open[..close],
+        // No closing fence, or trailing content after it → not a clean single
+        // fenced block. Hand back the original (still fenced) so from_str fails.
+        _ => s,
     }
 }
 
@@ -533,6 +538,27 @@ mod tests {
         let a = parse_assessment(content).unwrap();
         assert_eq!(a.level, RiskLevel::High);
         assert_eq!(a.rationale, "rm -rf is irreversible");
+    }
+
+    #[test]
+    fn parse_fenced_with_trailing_junk_after_close_escalates() {
+        // Codex: a fenced low followed by trailing content after the closing
+        // fence must escalate, not be silently truncated away.
+        let content =
+            "```json\n{\"risk_level\":\"low\",\"rationale\":\"safe\"}\n```\n then {\"wrapper\":";
+        assert!(matches!(
+            parse_assessment(content).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
+    }
+
+    #[test]
+    fn parse_unclosed_fence_escalates() {
+        let content = "```json\n{\"risk_level\":\"low\",\"rationale\":\"safe\"}";
+        assert!(matches!(
+            parse_assessment(content).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
     }
 
     #[test]
