@@ -123,8 +123,20 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     };
 
     let request = CompletionRequest {
-        messages: chat.messages,
+        // /chat is the plain conversational surface — no tools offered here;
+        // tool-using work goes through /runs (the agent loop)
+        messages: chat
+            .messages
+            .iter()
+            .map(|m| agent24_models::Msg {
+                role: m.role.clone(),
+                content: Some(m.content.clone()),
+                tool_calls: vec![],
+                tool_call_id: None,
+            })
+            .collect(),
         model: chat.model,
+        tools: vec![],
     };
     // Transient run: session_id null, full run lifecycle events (SPEC-002 §2)
     let run_id = format!("run_{}", agent24_core::util::ulid());
@@ -143,7 +155,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         Ok((provider, res)) => {
             tracing::debug!("chat served by {provider}");
             state.usage.record(&res.usage);
-            let text = res.message.content.clone();
+            let text = res.message.content.clone().unwrap_or_default();
             state
                 .events
                 .broadcast(EventBody::ModelDelta(ModelDeltaPayload {
@@ -154,11 +166,14 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 .events
                 .broadcast(EventBody::RunCompleted(RunCompletedPayload {
                     run_id,
-                    output: RunOutputPayload { text },
+                    output: RunOutputPayload { text: text.clone() },
                     usage: res.usage.clone(),
                 }));
             Json(ChatResponse {
-                message: res.message,
+                message: agent24_protocol::ChatMessage {
+                    role: res.message.role,
+                    content: text,
+                },
                 usage: res.usage,
             })
             .into_response()
@@ -190,4 +205,10 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
             error_response(status, code, &message)
         }
     }
+}
+
+/// `GET /api/v1/tools` — the registered tool list (builtin/mcp/module), with
+/// `requires_approval` visible so clients can explain the C3 fail-closed stub.
+pub async fn get_tools(State(state): State<AppState>) -> Response {
+    Json(serde_json::json!({ "tools": state.tools.list() })).into_response()
 }

@@ -11,20 +11,84 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_protocol::{ChatMessage, Model, Usage};
+use agent24_protocol::{Model, Usage};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+
+/// A tool advertised to the model (OpenAI function-calling wire shape is
+/// produced by the adapter; this stays provider-neutral).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the tool input object
+    pub parameters: Value,
+}
+
+/// A tool invocation the model asked for. `arguments` is the raw JSON string
+/// exactly as the model produced it — parsing (and rejecting) it is the
+/// caller's job, not the transport's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Conversation message for the agent loop. Richer than the /chat wire
+/// `ChatMessage` (which stays a plain role+content pair): assistant turns may
+/// carry tool calls, and `role: "tool"` turns answer them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Msg {
+    pub role: String,
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCallRequest>,
+    /// Set on `role: "tool"` messages: which call this answers
+    pub tool_call_id: Option<String>,
+}
+
+impl Msg {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_owned(),
+            content: Some(content.into()),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant(content: Option<String>, tool_calls: Vec<ToolCallRequest>) -> Self {
+        Self {
+            role: "assistant".to_owned(),
+            content,
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_owned(),
+            content: Some(content.into()),
+            tool_calls: vec![],
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionRequest {
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Msg>,
     pub model: Option<String>,
+    /// Empty = the model cannot call tools this turn
+    pub tools: Vec<ToolSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionResponse {
-    pub message: ChatMessage,
+    pub message: Msg,
     pub usage: Usage,
 }
 
@@ -113,9 +177,84 @@ impl OpenAiCompatProvider {
     }
 }
 
+// ── OpenAI wire shapes (serialize requests, deserialize responses) ──────────
+
+#[derive(Serialize, Deserialize)]
+struct OaFunctionCall {
+    name: String,
+    /// JSON-encoded string per the OpenAI protocol
+    arguments: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OaToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: OaFunctionCall,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OaMessage {
+    role: String,
+    // Explicit null is how the wire says "tool-calls-only assistant turn"
+    content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OaToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+impl From<&Msg> for OaMessage {
+    fn from(msg: &Msg) -> Self {
+        Self {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            tool_calls: if msg.tool_calls.is_empty() {
+                None
+            } else {
+                Some(
+                    msg.tool_calls
+                        .iter()
+                        .map(|tc| OaToolCall {
+                            id: tc.id.clone(),
+                            kind: "function".to_owned(),
+                            function: OaFunctionCall {
+                                name: tc.name.clone(),
+                                arguments: tc.arguments.clone(),
+                            },
+                        })
+                        .collect(),
+                )
+            },
+            tool_call_id: msg.tool_call_id.clone(),
+        }
+    }
+}
+
+impl From<OaMessage> for Msg {
+    fn from(msg: OaMessage) -> Self {
+        Self {
+            role: msg.role,
+            content: msg.content,
+            tool_calls: msg
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tc| ToolCallRequest {
+                    id: tc.id,
+                    name: tc.function.name,
+                    arguments: tc.function.arguments,
+                })
+                .collect(),
+            tool_call_id: msg.tool_call_id,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct OaChoice {
-    message: ChatMessage,
+    message: OaMessage,
 }
 
 #[derive(Deserialize)]
@@ -164,11 +303,29 @@ impl ModelProvider for OpenAiCompatProvider {
         req: &CompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<CompletionResponse, ModelError> {
-        let body = serde_json::json!({
+        let messages: Vec<OaMessage> = req.messages.iter().map(OaMessage::from).collect();
+        let mut body = serde_json::json!({
             "model": req.model.as_deref().unwrap_or(&self.default_model),
-            "messages": req.messages,
+            "messages": messages,
             "stream": false,
         });
+        if !req.tools.is_empty() {
+            body["tools"] = Value::Array(
+                req.tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters,
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+        }
         let fut = self
             .authed(
                 self.client
@@ -211,7 +368,7 @@ impl ModelProvider for OpenAiCompatProvider {
             },
         );
         Ok(CompletionResponse {
-            message: choice.message,
+            message: choice.message.into(),
             usage,
         })
     }
@@ -359,10 +516,7 @@ mod tests {
             _cancel: &CancellationToken,
         ) -> Result<CompletionResponse, ModelError> {
             Ok(CompletionResponse {
-                message: ChatMessage {
-                    role: "assistant".to_owned(),
-                    content: format!("from {}", self.0),
-                },
+                message: Msg::assistant(Some(format!("from {}", self.0)), vec![]),
                 usage: Usage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
@@ -397,11 +551,9 @@ mod tests {
 
     fn req() -> CompletionRequest {
         CompletionRequest {
-            messages: vec![ChatMessage {
-                role: "user".to_owned(),
-                content: "hi".to_owned(),
-            }],
+            messages: vec![Msg::user("hi")],
             model: None,
+            tools: vec![],
         }
     }
 
@@ -468,7 +620,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (name, res) = registry.complete(&req(), &cancel).await.unwrap();
         assert_eq!(name, "second");
-        assert_eq!(res.message.content, "from second");
+        assert_eq!(res.message.content.as_deref(), Some("from second"));
     }
 
     #[tokio::test]

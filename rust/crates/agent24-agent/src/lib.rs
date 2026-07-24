@@ -7,8 +7,10 @@
 //! (whose transactions enforce the core transition matrix), and every
 //! lifecycle change is emitted through an [`EventSink`].
 //!
-//! C2 iterates a single provider completion (MAX_ITERATIONS scaffold in
-//! place); tool-call parsing/execution joins in C3.
+//! C3: the loop iterates provider completions, executing model tool calls
+//! through the [`agent24_tools::ToolRegistry`] dispatch pipeline (whitelist +
+//! fail-closed approval stub + timeout) up to `MAX_ITERATIONS` per run. Every
+//! tool call is persisted, evented, and — when denied by policy — audited.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,13 +18,23 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use agent24_core::util::{now_iso8601, ulid};
-use agent24_models::{CompletionRequest, ModelError, ProviderRegistry};
+use agent24_models::{CompletionRequest, ModelError, Msg, ProviderRegistry, ToolSpec};
 use agent24_protocol::{
     ErrorBody, EventBody, ModelDeltaPayload, Run, RunCancelledPayload, RunCompletedPayload,
-    RunCreate, RunFailedPayload, RunInput, RunOutputPayload, RunStartedPayload, RunStatus, Usage,
+    RunCreate, RunFailedPayload, RunInput, RunOutputPayload, RunStartedPayload, RunStatus,
+    ToolCall, ToolCallStatus, ToolCompletedPayload, ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{RunPatch, Store, StoreError};
+use agent24_tools::{ToolContext, ToolError, ToolRegistry, summarize_input, truncate};
 use tokio_util::sync::CancellationToken;
+
+/// Completion→tools round trips per run before the run is failed. A model
+/// stuck asking for tools forever must terminate deterministically.
+pub const MAX_ITERATIONS: usize = 10;
+
+/// Cap for the externally-visible `output_summary` (full output goes back to
+/// the model; full input is audit-only in the store row).
+const SUMMARY_MAX_BYTES: usize = 500;
 
 /// Where lifecycle events go (the daemon adapts this onto its WS hub).
 pub trait EventSink: Send + Sync + 'static {
@@ -46,9 +58,20 @@ fn zero_usage() -> Usage {
     }
 }
 
+fn add_usage(mut total: Usage, delta: &Usage) -> Usage {
+    total.prompt_tokens = total.prompt_tokens.saturating_add(delta.prompt_tokens);
+    total.completion_tokens = total
+        .completion_tokens
+        .saturating_add(delta.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(delta.total_tokens);
+    total.cost_usd += delta.cost_usd;
+    total
+}
+
 pub struct RunManager {
     store: Store,
     registry: Arc<ProviderRegistry>,
+    tools: Arc<ToolRegistry>,
     sink: Arc<dyn EventSink>,
     /// Daemon-wide shutdown token; every run token is a child of it
     shutdown: CancellationToken,
@@ -62,12 +85,14 @@ impl RunManager {
     pub fn new(
         store: Store,
         registry: Arc<ProviderRegistry>,
+        tools: Arc<ToolRegistry>,
         sink: Arc<dyn EventSink>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             registry,
+            tools,
             sink,
             shutdown,
             cancels: Mutex::new(HashMap::new()),
@@ -201,25 +226,58 @@ impl RunManager {
             schedule_id: run.schedule_id.clone(),
         }));
 
-        // C2 loop body: one provider completion. (MAX_ITERATIONS + tool-call
-        // parsing/execution arrive with the C3 tool registry.)
-        let request = CompletionRequest {
-            messages: vec![agent24_protocol::ChatMessage {
-                role: "user".to_owned(),
-                content: run.input.prompt.clone(),
-            }],
-            model: run.input.model_override.clone(),
-        };
+        // C3 loop body: completion → tool execution round trips, bounded by
+        // MAX_ITERATIONS. Usage accumulates across iterations.
+        let tool_specs: Vec<ToolSpec> = self
+            .tools
+            .adverts()
+            .into_iter()
+            .map(|a| ToolSpec {
+                name: a.name,
+                description: a.description,
+                parameters: a.parameters,
+            })
+            .collect();
+        let mut messages = vec![Msg::user(run.input.prompt.clone())];
+        let mut usage_total = zero_usage();
 
-        let outcome = tokio::select! {
-            r = self.registry.complete(&request, &cancel) => r,
-            () = cancel.cancelled() => Err(ModelError::Cancelled),
-        };
+        for _ in 0..MAX_ITERATIONS {
+            let request = CompletionRequest {
+                messages: messages.clone(),
+                model: run.input.model_override.clone(),
+                tools: tool_specs.clone(),
+            };
+            let outcome = tokio::select! {
+                r = self.registry.complete(&request, &cancel) => r,
+                () = cancel.cancelled() => Err(ModelError::Cancelled),
+            };
 
-        match outcome {
-            Ok((provider, res)) => {
-                tracing::debug!("run {run_id} served by {provider}");
-                let text = res.message.content.clone();
+            let res = match outcome {
+                Ok((provider, res)) => {
+                    tracing::debug!("run {run_id} served by {provider}");
+                    res
+                }
+                Err(ModelError::Cancelled) => {
+                    self.finish_cancelled(&run_id).await;
+                    return;
+                }
+                Err(err) => {
+                    let (code, message) = match &err {
+                        ModelError::Unavailable(msg) => (
+                            "provider_unavailable",
+                            format!("All LLM providers unavailable. Last error: {msg}"),
+                        ),
+                        other => ("internal", other.to_string()),
+                    };
+                    self.finish_failed(&run_id, code, &message).await;
+                    return;
+                }
+            };
+            usage_total = add_usage(usage_total, &res.usage);
+
+            if res.message.tool_calls.is_empty() {
+                // Final answer
+                let text = res.message.content.clone().unwrap_or_default();
                 self.sink.emit(EventBody::ModelDelta(ModelDeltaPayload {
                     run_id: run_id.clone(),
                     text: text.clone(),
@@ -231,7 +289,7 @@ impl RunManager {
                         RunStatus::Completed,
                         RunPatch {
                             output: Some(agent24_protocol::RunOutput { text: text.clone() }),
-                            usage: Some(res.usage.clone()),
+                            usage: Some(usage_total.clone()),
                             ended_at: Some(now_iso8601()),
                             ..Default::default()
                         },
@@ -241,24 +299,183 @@ impl RunManager {
                     Ok(_) => self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
                         run_id,
                         output: RunOutputPayload { text },
-                        usage: res.usage,
+                        usage: usage_total,
                     })),
                     Err(err) => tracing::error!("run completion persist failed: {err}"),
                 }
+                return;
             }
-            Err(ModelError::Cancelled) => {
-                self.finish_cancelled(&run_id).await;
+
+            // Tool round trip: echo the assistant turn, then answer every call
+            let calls = res.message.tool_calls.clone();
+            messages.push(res.message);
+            for call in &calls {
+                if cancel.is_cancelled() {
+                    self.finish_cancelled(&run_id).await;
+                    return;
+                }
+                match self.run_tool_call(&run_id, call, &cancel).await {
+                    Ok(content) => messages.push(Msg::tool_result(call.id.clone(), content)),
+                    Err(()) => {
+                        // Cancelled mid-tool
+                        self.finish_cancelled(&run_id).await;
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.finish_failed(
+            &run_id,
+            "max_iterations",
+            &format!("run exceeded {MAX_ITERATIONS} completion iterations without a final answer"),
+        )
+        .await;
+    }
+
+    /// Execute one model-requested tool call through the registry pipeline:
+    /// persist running → dispatch → persist terminal + event (+ audit on
+    /// policy denial). Returns the content handed back to the model, or
+    /// `Err(())` when the run was cancelled mid-call.
+    async fn run_tool_call(
+        &self,
+        run_id: &str,
+        call: &agent24_models::ToolCallRequest,
+        cancel: &CancellationToken,
+    ) -> Result<String, ()> {
+        let (input, parse_error) = if call.arguments.trim().is_empty() {
+            (serde_json::Map::new(), None)
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                Ok(serde_json::Value::Object(map)) => (map, None),
+                Ok(other) => {
+                    // Preserved raw for audit; the call itself is rejected
+                    let mut m = serde_json::Map::new();
+                    m.insert("_raw".to_owned(), other);
+                    (m, Some("tool arguments must be a JSON object".to_owned()))
+                }
+                Err(err) => {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "_raw".to_owned(),
+                        serde_json::Value::String(call.arguments.clone()),
+                    );
+                    (m, Some(format!("tool arguments are not valid JSON: {err}")))
+                }
+            }
+        };
+
+        let tc = ToolCall {
+            id: format!("tc_{}", ulid()),
+            run_id: run_id.to_owned(),
+            tool: call.name.clone(),
+            input: input.clone(),
+            status: ToolCallStatus::Running,
+            output_summary: None,
+            started_at: now_iso8601(),
+            ended_at: None,
+        };
+        if let Err(err) = self.store.insert_tool_call(&tc).await {
+            tracing::error!("tool call persist failed: {err}");
+            return Ok("tool error: internal persistence failure".to_owned());
+        }
+        self.sink.emit(EventBody::ToolStarted(ToolStartedPayload {
+            run_id: run_id.to_owned(),
+            tool_call_id: tc.id.clone(),
+            tool: call.name.clone(),
+            input_summary: summarize_input(&input),
+        }));
+
+        let outcome = match parse_error {
+            Some(msg) => Err(ToolError::Invalid(msg)),
+            None => {
+                let ctx = ToolContext {
+                    run_id: run_id.to_owned(),
+                };
+                self.tools.dispatch(&call.name, &ctx, &input, cancel).await
+            }
+        };
+
+        let (status, summary, content, cancelled) = match outcome {
+            Ok(output) => {
+                let summary = truncate(&output, SUMMARY_MAX_BYTES);
+                (ToolCallStatus::Completed, summary, output, false)
+            }
+            Err(ToolError::Denied(msg)) => {
+                // Fail-closed policy denial — audited, and the model is told
+                let detail = serde_json::json!({
+                    "run_id": run_id,
+                    "tool_call_id": tc.id,
+                    "tool": call.name,
+                    "reason": msg,
+                });
+                if let Err(err) = self
+                    .store
+                    .append_audit(&now_iso8601(), "policy", "tool.denied", &detail)
+                    .await
+                {
+                    tracing::error!("audit append failed: {err}");
+                }
+                let content = format!("denied by policy: {msg}");
+                (ToolCallStatus::Denied, content.clone(), content, false)
+            }
+            Err(ToolError::Cancelled) => {
+                let content = "cancelled".to_owned();
+                (ToolCallStatus::Failed, content.clone(), content, true)
             }
             Err(err) => {
-                let (code, message) = match &err {
-                    ModelError::Unavailable(msg) => (
-                        "provider_unavailable",
-                        format!("All LLM providers unavailable. Last error: {msg}"),
-                    ),
-                    other => ("internal", other.to_string()),
-                };
-                self.finish_failed(&run_id, code, &message).await;
+                let content = format!("tool error: {err}");
+                (ToolCallStatus::Failed, content.clone(), content, false)
             }
+        };
+
+        if let Err(err) = self
+            .store
+            .finish_tool_call(&tc.id, status, Some(summary.clone()), now_iso8601())
+            .await
+        {
+            tracing::error!("tool call finish persist failed: {err}");
+        }
+        self.sink
+            .emit(EventBody::ToolCompleted(ToolCompletedPayload {
+                run_id: run_id.to_owned(),
+                tool_call_id: tc.id.clone(),
+                status: match status {
+                    ToolCallStatus::Completed => ToolCompletedStatus::Completed,
+                    ToolCallStatus::Denied => ToolCompletedStatus::Denied,
+                    _ => ToolCompletedStatus::Failed,
+                },
+                output_summary: Some(summary),
+            }));
+
+        if cancelled { Err(()) } else { Ok(content) }
+    }
+
+    /// Land the failed terminal state + event.
+    async fn finish_failed(&self, run_id: &str, code: &str, message: &str) {
+        let body = ErrorBody {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            details: None,
+        };
+        match self
+            .store
+            .transition_run(
+                run_id,
+                RunStatus::Failed,
+                RunPatch {
+                    error: Some(body.clone()),
+                    ended_at: Some(now_iso8601()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => self.sink.emit(EventBody::RunFailed(RunFailedPayload {
+                run_id: run_id.to_owned(),
+                error: body,
+            })),
+            Err(err) => tracing::error!("run failure persist failed: {err}"),
         }
     }
 
@@ -320,8 +537,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use agent24_models::{CompletionResponse, ModelProvider};
-    use agent24_protocol::ChatMessage;
+    use agent24_models::{CompletionResponse, ModelProvider, ToolCallRequest};
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
@@ -333,6 +549,15 @@ mod tests {
             if let Ok(mut v) = self.0.lock() {
                 v.push(body.wire_type().to_owned());
             }
+        }
+    }
+
+    fn usage_one() -> Usage {
+        Usage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cost_usd: 0.0,
         }
     }
 
@@ -349,16 +574,60 @@ mod tests {
             _cancel: &CancellationToken,
         ) -> Result<CompletionResponse, ModelError> {
             Ok(CompletionResponse {
-                message: ChatMessage {
-                    role: "assistant".to_owned(),
-                    content: "pong".to_owned(),
-                },
-                usage: Usage {
-                    prompt_tokens: 1,
-                    completion_tokens: 1,
-                    total_tokens: 2,
-                    cost_usd: 0.0,
-                },
+                message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                usage: usage_one(),
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Plays a fixed sequence of assistant turns, then echoes the last tool
+    /// result as the final answer.
+    struct ScriptedProvider {
+        turns: StdMutex<Vec<Msg>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(turns: Vec<Msg>) -> Self {
+            Self {
+                turns: StdMutex::new(turns),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+        async fn complete(
+            &self,
+            req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            let next = self.turns.lock().unwrap().pop();
+            let message = match next {
+                Some(turn) => turn,
+                None => {
+                    // Script exhausted: answer with the last tool result
+                    let last_tool = req
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "tool")
+                        .and_then(|m| m.content.clone())
+                        .unwrap_or_else(|| "no tool result".to_owned());
+                    Msg::assistant(Some(format!("tool said: {last_tool}")), vec![])
+                }
+            };
+            Ok(CompletionResponse {
+                message,
+                usage: usage_one(),
             })
         }
         async fn models(
@@ -392,18 +661,26 @@ mod tests {
         }
     }
 
-    async fn manager_with(
+    async fn manager_with_tools(
         provider: Arc<dyn ModelProvider>,
+        tools: ToolRegistry,
     ) -> (Arc<RunManager>, Arc<RecordingSink>, Store) {
         let store = Store::open_memory().await.unwrap();
         let sink = Arc::new(RecordingSink(StdMutex::new(vec![])));
         let manager = RunManager::new(
             store.clone(),
             Arc::new(ProviderRegistry::new(vec![provider])),
+            Arc::new(tools),
             sink.clone(),
             CancellationToken::new(),
         );
         (manager, sink, store)
+    }
+
+    async fn manager_with(
+        provider: Arc<dyn ModelProvider>,
+    ) -> (Arc<RunManager>, Arc<RecordingSink>, Store) {
+        manager_with_tools(provider, ToolRegistry::new()).await
     }
 
     fn create() -> RunCreate {
@@ -549,5 +826,173 @@ mod tests {
         assert_eq!(done.error.unwrap().code, "provider_unavailable");
         let events = sink.0.lock().unwrap().clone();
         assert_eq!(events, vec!["run.started", "run.failed"]);
+    }
+
+    // ── C3: tool execution in the loop ───────────────────────────────────────
+
+    /// Canned-response HTTP fixture on a real socket.
+    async fn http_fixture(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    fn tool_call_turn(name: &str, arguments: String) -> Msg {
+        Msg::assistant(
+            None,
+            vec![ToolCallRequest {
+                id: "call_1".to_owned(),
+                name: name.to_owned(),
+                arguments,
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn model_fetches_a_url_through_http_fetch() {
+        let url = http_fixture("fixture payload 42").await;
+        // allow_local: the fixture lives on loopback
+        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let provider = ScriptedProvider::new(vec![tool_call_turn(
+            "http_fetch",
+            serde_json::json!({ "url": url }).to_string(),
+        )]);
+        let (manager, sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let run = manager.start_run(create()).await.unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        let text = done.output.unwrap().text;
+        assert!(text.contains("fixture payload 42"), "{text}");
+        // two completions' usage accumulated
+        assert_eq!(done.usage.total_tokens, 4);
+
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "run.started",
+                "tool.started",
+                "tool.completed",
+                "model.delta",
+                "run.completed"
+            ]
+        );
+        let calls = store.list_tool_calls(&run.id).await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "http_fetch");
+        assert_eq!(calls[0].status, ToolCallStatus::Completed);
+        assert!(calls[0].ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn approval_stub_denial_is_persisted_audited_and_survivable() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::builtin(dir.path().to_path_buf());
+        let provider = ScriptedProvider::new(vec![tool_call_turn(
+            "shell_exec",
+            serde_json::json!({ "argv": ["/bin/echo", "hi"] }).to_string(),
+        )]);
+        let (manager, sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let run = manager.start_run(create()).await.unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        // The denial goes back to the model, which still answers → completed
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(done.output.unwrap().text.contains("denied by policy"));
+
+        let calls = store.list_tool_calls(&run.id).await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, ToolCallStatus::Denied);
+
+        let events = sink.0.lock().unwrap().clone();
+        assert!(events.contains(&"tool.started".to_owned()));
+        assert!(events.contains(&"tool.completed".to_owned()));
+
+        // audit chain has the denial and still verifies
+        store.verify_audit_chain().await.unwrap();
+        let entries = store.list_audit().await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == "tool.denied" && e.actor == "policy")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_fail_the_call_not_the_run() {
+        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let provider =
+            ScriptedProvider::new(vec![tool_call_turn("http_fetch", "{not json".to_owned())]);
+        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let run = manager.start_run(create()).await.unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        let calls = store.list_tool_calls(&run.id).await.unwrap();
+        assert_eq!(calls[0].status, ToolCallStatus::Failed);
+        assert!(
+            calls[0]
+                .output_summary
+                .as_deref()
+                .unwrap()
+                .contains("not valid JSON")
+        );
+    }
+
+    #[tokio::test]
+    async fn endless_tool_requests_hit_max_iterations() {
+        /// Always asks for another tool call — never a final answer.
+        struct GreedyProvider;
+        #[async_trait]
+        impl ModelProvider for GreedyProvider {
+            fn name(&self) -> &str {
+                "greedy"
+            }
+            async fn complete(
+                &self,
+                _req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                Ok(CompletionResponse {
+                    message: Msg::assistant(
+                        None,
+                        vec![ToolCallRequest {
+                            id: "call_x".to_owned(),
+                            name: "nope".to_owned(),
+                            arguments: "{}".to_owned(),
+                        }],
+                    ),
+                    usage: usage_one(),
+                })
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let (manager, _sink, store) =
+            manager_with_tools(Arc::new(GreedyProvider), ToolRegistry::new()).await;
+        let run = manager.start_run(create()).await.unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(done.error.unwrap().code, "max_iterations");
+        let calls = store.list_tool_calls(&run.id).await.unwrap();
+        assert_eq!(calls.len(), MAX_ITERATIONS);
+        assert!(calls.iter().all(|c| c.status == ToolCallStatus::Failed));
     }
 }

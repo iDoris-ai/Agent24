@@ -26,6 +26,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 pub struct AppState {
     pub token: Arc<String>,
     pub registry: Arc<ProviderRegistry>,
+    pub tools: Arc<agent24_tools::ToolRegistry>,
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
     pub store: Store,
@@ -39,20 +40,24 @@ impl AppState {
     pub fn new(
         token: String,
         registry: ProviderRegistry,
+        tools: agent24_tools::ToolRegistry,
         store: Store,
         shutdown: CancellationToken,
     ) -> Self {
         let registry = Arc::new(registry);
+        let tools = Arc::new(tools);
         let events = crate::events::EventsHub::default();
         let runs = agent24_agent::RunManager::new(
             store.clone(),
             Arc::clone(&registry),
+            Arc::clone(&tools),
             StdArc::new(events.clone()),
             shutdown.clone(),
         );
         Self {
             token: Arc::new(token),
             registry,
+            tools,
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
             store,
@@ -137,6 +142,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
         .route("/api/v1/usage", get(crate::routes::get_usage))
+        .route("/api/v1/tools", get(crate::routes::get_tools))
         .route("/api/v1/events", get(crate::events::ws_events))
         .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
         .route(
@@ -210,9 +216,16 @@ pub async fn serve(
     if orphans > 0 {
         tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
     }
+    // Tool workspace: the fs whitelist root + shell cwd. Created up front so
+    // the canonicalized whitelist is non-empty from the first request.
+    let workspace = agent24_protocol::state_file::state_dir()
+        .ok_or_else(|| std::io::Error::other("HOME not set"))?
+        .join("workspace");
+    std::fs::create_dir_all(&workspace)?;
     let state = AppState::new(
         token.clone(),
         ProviderRegistry::from_env(),
+        agent24_tools::ToolRegistry::builtin(workspace),
         store,
         cancel.clone(),
     );
@@ -324,6 +337,7 @@ mod tests {
         AppState::new(
             "testtoken".to_owned(),
             ProviderRegistry::new(vec![]),
+            agent24_tools::ToolRegistry::new(),
             Store::open_memory().await.unwrap(),
             CancellationToken::new(),
         )

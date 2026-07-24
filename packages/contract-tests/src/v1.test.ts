@@ -354,5 +354,34 @@ describe('v1 M-C sessions (live since C2, agent24d only)', () => {
     expect(bad.status).toBe(404)
   })
 
-  it.todo('GET /api/v1/tools → 200 {tools:[...]} (activate in C3)')
+})
+
+describe('v1 M-C tools (live since C3, agent24d only)', () => {
+  it('GET /api/v1/tools → 200 with the builtin set and approval flags', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await get('/api/v1/tools')
+    expect(res.status).toBe(200)
+    const tools = (res.body as { tools: Array<{ name: string; source: string; description: string; requires_approval: boolean }> }).tools
+    const byName = new Map(tools.map((t) => [t.name, t]))
+    for (const name of ['http_fetch', 'fs_read', 'fs_write', 'shell_exec']) {
+      const tool = byName.get(name)
+      expect(tool, `missing builtin ${name}`).toBeDefined()
+      expect(tool?.source).toBe('builtin')
+      expect(tool?.description.length).toBeGreaterThan(0)
+    }
+    // C3 fail-closed approval stub: these two are flagged (and auto-denied
+    // at dispatch until C4)
+    expect(byName.get('shell_exec')?.requires_approval).toBe(true)
+    expect(byName.get('fs_write')?.requires_approval).toBe(true)
+    expect(byName.get('http_fetch')?.requires_approval).toBe(false)
+    expect(byName.get('fs_read')?.requires_approval).toBe(false)
+  })
+
+  it('GET /api/v1/tools without token → 401 envelope', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await fetch(`${BASE_URL}/api/v1/tools`)
+    expect(res.status).toBe(401)
+    const body = (await res.json()) as { error: { code: string } }
+    expect(body.error.code).toBeTruthy()
+  })
 })
