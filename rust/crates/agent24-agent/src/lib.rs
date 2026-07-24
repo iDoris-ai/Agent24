@@ -336,9 +336,13 @@ impl RunManager {
         // messages back to the policy's keep window — losing the oldest history
         // beats an unusable prompt, and unlike refusing to record it leaves the
         // session live so a recovered summarizer heals it.
+        // Normalize max_recent the same way CanonicalSession::append does: a
+        // custom max_recent of 0 would make the ceiling 0, which `keep >= 1` can
+        // never satisfy — the "hard" ceiling would be unenforceable.
         let ceiling = memory
             .policy
             .max_recent
+            .max(1)
             .saturating_mul(RECENT_HARD_CEILING_FACTOR);
         if session.recent.len() > ceiling {
             // Clamp against the ceiling: a degenerate custom policy (e.g.
@@ -565,16 +569,32 @@ impl RunManager {
                 // memory (review D5b). Bounded by MEMORY_WRITE_BUDGET (and the
                 // daemon shutdown token inside the summarizer) so a stuck
                 // provider can never hang a finished run.
-                if tokio::time::timeout(
+                //
+                // This widens the window in which the run is still non-terminal,
+                // so it MUST stay cancellable: `cancel works in any non-terminal
+                // state` is the C2 contract, and a 30s uncancellable finalization
+                // would break it (review D5b).
+                let memory_write = tokio::time::timeout(
                     MEMORY_WRITE_BUDGET,
                     self.remember_exchange(run.session_id.as_deref(), &run.input.prompt, &text),
-                )
-                .await
-                .is_err()
-                {
+                );
+                let timed_out = tokio::select! {
+                    r = memory_write => r.is_err(),
+                    () = cancel.cancelled() => {
+                        self.finish_cancelled(&run_id).await;
+                        return;
+                    }
+                };
+                if timed_out {
                     tracing::warn!(
                         "run {run_id} session memory write exceeded {MEMORY_WRITE_BUDGET:?}; completing without recording the turn"
                     );
+                }
+                // Re-check: a cancel that landed just as the write finished must
+                // still win rather than be overwritten by Completed.
+                if cancel.is_cancelled() {
+                    self.finish_cancelled(&run_id).await;
+                    return;
                 }
                 match self
                     .store
@@ -1238,6 +1258,69 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(session.recent.len(), WRITERS * 2, "{texts:?}");
+    }
+
+    /// A summarizer that blocks long enough to sit inside the memory-write
+    /// window, so a cancel can land there.
+    struct SlowSummarizer;
+
+    #[async_trait]
+    impl Summarizer for SlowSummarizer {
+        async fn summarize(
+            &self,
+            _prior: Option<&str>,
+            _messages: &[Msg],
+        ) -> std::result::Result<String, String> {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok("summary".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_during_the_memory_write_still_cancels_the_run() {
+        // Codex (regression I introduced): moving the memory write before
+        // transition_run leaves the run non-terminal for up to
+        // MEMORY_WRITE_BUDGET. Cancel must still win in that window — "cancel
+        // works in any non-terminal state" is the C2 contract.
+        let store = Store::open_memory().await.unwrap();
+        let sink = Arc::new(RecordingSink(StdMutex::new(vec![])));
+        let kv = KvStore::open_memory().await.unwrap();
+        // max_recent 1 → the very first turn overflows, so compaction (and the
+        // slow summarizer) runs inside the memory write.
+        let policy = CompactionPolicy {
+            max_recent: 1,
+            keep_recent: 0,
+            max_summary_chars: 500,
+        };
+        let manager = RunManager::with_memory(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(
+                Arc::new(FixedProvider),
+                Tier::Local,
+            )])),
+            Arc::new(ToolRegistry::new()),
+            sink,
+            CancellationToken::new(),
+            Some(SessionMemory::new(kv, Arc::new(SlowSummarizer)).with_policy(policy)),
+        );
+        seed_session(&store, "sess_cancel").await;
+        let run = manager
+            .start_run(RunCreate {
+                session_id: Some("sess_cancel".to_owned()),
+                prompt: "hi".to_owned(),
+                model_override: None,
+            })
+            .await
+            .unwrap();
+        // Let the model turn finish so we're inside the memory write, then cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = manager.cancel_run(&run.id).await;
+        let final_run = wait_terminal(&store, &run.id).await;
+        assert_eq!(
+            final_run.status,
+            RunStatus::Cancelled,
+            "cancel was ignored during the memory write"
+        );
     }
 
     #[tokio::test]
