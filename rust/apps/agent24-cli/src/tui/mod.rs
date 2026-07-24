@@ -88,16 +88,29 @@ impl Conn {
     }
 
     async fn cancel_run(&self, run_id: &str) -> Result<(), String> {
-        self.auth(
-            self.client()
-                .post(format!("{}/api/v1/runs/{run_id}/cancel", self.base)),
-        )
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-        Ok(())
+        let res = self
+            .auth(
+                self.client()
+                    .post(format!("{}/api/v1/runs/{run_id}/cancel", self.base)),
+            )
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("cancel rejected: {}", res.status()))
+        }
     }
 }
+
+/// Bounded so a stalled UI can't let WS events accumulate without limit
+/// (review C6). On overflow the WS reader drops the frame; the resulting seq
+/// gap — and the periodic reconcile — repair the view from REST truth.
+const EVENT_CHANNEL_CAP: usize = 1024;
+/// Safety-net reconcile cadence: even with no events, the view can never stay
+/// stale (or miss an approval created in a subscription gap) longer than this.
+const RECONCILE_EVERY: Duration = Duration::from_secs(15);
 
 /// Messages the async tasks feed into the single-threaded UI loop.
 enum Msg {
@@ -107,37 +120,38 @@ enum Msg {
 }
 
 /// Spawn the WS reader. It emits [`Msg::Event`] per frame and [`Msg::WsClosed`]
-/// when the socket ends, then the loop re-arms it.
-fn spawn_ws(base: String, token: String, tx: mpsc::UnboundedSender<Msg>) {
+/// when the socket ends, then the loop re-arms it. Sends are non-blocking: on a
+/// full channel the frame is dropped (the seq gap + periodic reconcile repair
+/// it) so the reader never stalls or deadlocks against a busy UI.
+fn spawn_ws(base: String, token: String, tx: mpsc::Sender<Msg>) {
     tokio::spawn(async move {
         // http(s)://host → ws(s)://host
         let ws_url = format!("{}/api/v1/events", base.replacen("http", "ws", 1));
         let request = match build_ws_request(&ws_url, &token) {
             Ok(req) => req,
             Err(_) => {
-                let _ = tx.send(Msg::WsClosed);
+                let _ = tx.try_send(Msg::WsClosed);
                 return;
             }
         };
-        match tokio_tungstenite::connect_async(request).await {
-            Ok((mut socket, _)) => {
-                while let Some(frame) = socket.next().await {
-                    match frame {
-                        Ok(tungstenite::Message::Text(text)) => {
-                            if let Ok(event) = serde_json::from_str::<Event>(&text)
-                                && tx.send(Msg::Event(event)).is_err()
-                            {
-                                return; // UI gone
+        if let Ok((mut socket, _)) = tokio_tungstenite::connect_async(request).await {
+            while let Some(frame) = socket.next().await {
+                match frame {
+                    Ok(tungstenite::Message::Text(text)) => {
+                        if let Ok(event) = serde_json::from_str::<Event>(&text) {
+                            match tx.try_send(Msg::Event(event)) {
+                                Err(mpsc::error::TrySendError::Closed(_)) => return, // UI gone
+                                Err(mpsc::error::TrySendError::Full(_)) => {} // drop → gap repairs
+                                Ok(()) => {}
                             }
                         }
-                        Ok(tungstenite::Message::Close(_)) | Err(_) => break,
-                        _ => {}
                     }
+                    Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                    _ => {}
                 }
             }
-            Err(_) => { /* fall through to reconnect */ }
         }
-        let _ = tx.send(Msg::WsClosed);
+        let _ = tx.try_send(Msg::WsClosed);
     });
 }
 
@@ -158,19 +172,46 @@ fn build_ws_request(
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-fn setup_terminal() -> io::Result<Tui> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(cursor::Hide)?;
-    Terminal::new(CrosstermBackend::new(stdout))
+/// Owns the raw-mode / alternate-screen terminal and restores it on Drop —
+/// covers the `?` early-return AND panic-unwind paths (review C6), so the
+/// user's shell is never left in raw mode. Partial setup failure is unwound
+/// before returning.
+struct TerminalGuard {
+    terminal: Tui,
 }
 
-fn restore_terminal(terminal: &mut Tui) {
-    let _ = disable_raw_mode();
-    let _ = terminal.backend_mut().execute(LeaveAlternateScreen);
-    let _ = terminal.backend_mut().execute(cursor::Show);
-    let _ = terminal.show_cursor();
+impl TerminalGuard {
+    fn new() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        // If entering the alternate screen fails, undo raw mode before erroring
+        if let Err(err) = stdout
+            .execute(EnterAlternateScreen)
+            .and_then(|s| s.execute(cursor::Hide))
+        {
+            let _ = disable_raw_mode();
+            return Err(err);
+        }
+        match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(err) => {
+                let mut out = io::stdout();
+                let _ = out.execute(LeaveAlternateScreen);
+                let _ = out.execute(cursor::Show);
+                let _ = disable_raw_mode();
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = self.terminal.backend_mut().execute(LeaveAlternateScreen);
+        let _ = self.terminal.backend_mut().execute(cursor::Show);
+        let _ = self.terminal.show_cursor();
+    }
 }
 
 fn map_key(code: KeyCode) -> Option<Key> {
@@ -183,27 +224,34 @@ fn map_key(code: KeyCode) -> Option<Key> {
         KeyCode::Char('q') => Some(Key::Quit),
         KeyCode::Char('c') => Some(Key::Cancel),
         KeyCode::Char(c) => Some(Key::Char(c)),
+        KeyCode::Backspace => Some(Key::Backspace),
         _ => None,
     }
 }
 
 /// Entry point for `agent24 tui`.
 pub async fn run(conn: Conn) -> Result<(), String> {
-    let mut terminal = setup_terminal().map_err(|e| e.to_string())?;
-    let result = run_loop(&mut terminal, conn).await;
-    restore_terminal(&mut terminal);
-    result
+    let mut guard = TerminalGuard::new().map_err(|e| e.to_string())?;
+    // The guard's Drop restores the terminal on every exit path — normal
+    // return, `?`, or panic unwind.
+    run_loop(&mut guard.terminal, conn).await
 }
 
 async fn run_loop(terminal: &mut Tui, conn: Conn) -> Result<(), String> {
     let mut app = App::new();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    let (tx, mut rx) = mpsc::channel::<Msg>(EVENT_CHANNEL_CAP);
 
-    // Initial REST reconcile so the UI is populated before the first frame.
-    reconcile(&conn, &mut app).await;
+    // Subscribe to the WS stream BEFORE the initial reconcile: any
+    // approval.required created during reconcile then sits buffered in the
+    // channel and applies afterwards, instead of vanishing into the
+    // no-replay subscription gap (review C6 blocker).
     spawn_ws(conn.base.clone(), conn.token.clone(), tx.clone());
+    reconcile(&conn, &mut app).await;
 
     let mut keys = EventStream::new();
+    let mut ticker = tokio::time::interval(RECONCILE_EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // consume the immediate first tick
     let mut redraw = true;
 
     loop {
@@ -254,6 +302,12 @@ async fn run_loop(terminal: &mut Tui, conn: Conn) -> Result<(), String> {
                     _ => {}
                 }
             }
+            // Safety-net periodic reconcile — repairs anything a dropped frame
+            // or subscription gap might have missed
+            _ = ticker.tick() => {
+                reconcile(&conn, &mut app).await;
+                redraw = true;
+            }
         }
     }
 }
@@ -271,17 +325,27 @@ async fn perform(conn: &Conn, app: &mut App, action: Action) {
         }
         Action::CancelRun { run_id } => {
             let _ = conn.cancel_run(&run_id).await;
+            // Refresh so the run's new status shows even if the WS event races
+            reconcile(conn, app).await;
         }
         Action::Quit | Action::None => {}
     }
 }
 
+/// REST reconcile. `needs_reconcile` is cleared ONLY when BOTH lists refresh —
+/// a transient failure must not mark stale state clean (review C6), so the
+/// loop keeps retrying until a full refresh lands.
 async fn reconcile(conn: &Conn, app: &mut App) {
-    if let Ok(runs) = conn.list_runs().await {
-        app.set_runs(runs);
+    let mut ok = true;
+    match conn.list_runs().await {
+        Ok(runs) => app.set_runs(runs),
+        Err(_) => ok = false,
     }
-    if let Ok(approvals) = conn.list_pending_approvals().await {
-        app.set_approvals(approvals);
+    match conn.list_pending_approvals().await {
+        Ok(approvals) => app.set_approvals(approvals),
+        Err(_) => ok = false,
     }
-    app.needs_reconcile = false;
+    // set_runs/set_approvals each clear the flag; only a fully-successful pass
+    // leaves it cleared.
+    app.needs_reconcile = !ok;
 }

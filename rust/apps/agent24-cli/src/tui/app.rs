@@ -14,6 +14,9 @@ use std::collections::HashMap;
 
 use agent24_protocol::{Approval, Decision, Event, EventBody, Run, RunStatus};
 
+/// Per-run event-log cap (oldest lines drop past this) — bounds memory.
+const MAX_LOG_LINES: usize = 500;
+
 /// Which panel currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -155,14 +158,25 @@ impl App {
             .and_then(|id| self.runs.iter().position(|r| r.id == id))
             .unwrap_or(0)
             .min(self.runs.len().saturating_sub(1));
+        // Prune event logs for runs no longer listed — bounds run_events by the
+        // number of live runs (review C6).
+        self.run_events
+            .retain(|id, _| self.runs.iter().any(|r| r.id == *id));
     }
 
-    /// Replace the pending-approval list (REST truth). Closes the modal if its
+    /// Replace the pending-approval list (REST truth). Keeps the cursor on the
+    /// same approval id when possible (index-based would silently re-point at a
+    /// different approval after a reorder — review C6). Closes the modal if its
     /// approval is no longer pending (resolved elsewhere / timed out).
     pub fn set_approvals(&mut self, approvals: Vec<Approval>) {
+        let anchor = self
+            .approvals
+            .get(self.approval_cursor)
+            .map(|a| a.id.clone());
         self.approvals = approvals;
-        self.approval_cursor = self
-            .approval_cursor
+        self.approval_cursor = anchor
+            .and_then(|id| self.approvals.iter().position(|a| a.id == id))
+            .unwrap_or(0)
             .min(self.approvals.len().saturating_sub(1));
         if let Some(modal) = &self.modal
             && !self.approvals.iter().any(|a| a.id == modal.approval.id)
@@ -187,7 +201,15 @@ impl App {
         match &event.body {
             EventBody::RunStarted(p) => {
                 self.log(&p.run_id, "run started".to_owned());
-                self.mark_status(&p.run_id, RunStatus::Running);
+                // A run created while the TUI is open isn't in the list yet;
+                // the event lacks the full Run (prompt/created_at), so flag a
+                // reconcile to pull it in rather than synthesizing a stub
+                // (review C6).
+                if !self.runs.iter().any(|r| r.id == p.run_id) {
+                    self.needs_reconcile = true;
+                } else {
+                    self.mark_status(&p.run_id, RunStatus::Running);
+                }
             }
             EventBody::ModelDelta(p) => self.log(&p.run_id, format!("δ {}", oneline(&p.text))),
             EventBody::ToolStarted(p) => self.log(
@@ -251,10 +273,14 @@ impl App {
     }
 
     fn log(&mut self, run_id: &str, line: String) {
-        self.run_events
-            .entry(run_id.to_owned())
-            .or_default()
-            .push(line);
+        let lines = self.run_events.entry(run_id.to_owned()).or_default();
+        lines.push(line);
+        // Cap per-run history so a long-lived stream can't grow without bound
+        // (review C6). Drop oldest lines past the cap.
+        if lines.len() > MAX_LOG_LINES {
+            let excess = lines.len() - MAX_LOG_LINES;
+            lines.drain(0..excess);
+        }
     }
 
     fn mark_status(&mut self, run_id: &str, status: RunStatus) {
@@ -318,7 +344,7 @@ impl App {
                 }
                 Action::None
             }
-            Key::Char(_) | Key::Esc => Action::None,
+            Key::Char(_) | Key::Esc | Key::Backspace => Action::None,
         }
     }
 
@@ -361,6 +387,9 @@ impl App {
                 }
                 Key::Char(c) => reason.push(c),
                 Key::Cancel => reason.push('c'),
+                Key::Backspace => {
+                    reason.pop();
+                }
                 _ => {}
             }
             return Action::None;
@@ -440,6 +469,7 @@ pub enum Key {
     Enter,
     Esc,
     Tab,
+    Backspace,
     /// 'q' — quit
     Quit,
     /// 'c' — cancel run (or a literal 'c' during reason entry)
@@ -692,5 +722,109 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.on_key(Key::Quit), Action::Quit);
         assert!(app.should_quit);
+    }
+
+    // ── review-C6 hardening regressions ──────────────────────────────────────
+
+    #[test]
+    fn approval_cursor_follows_the_same_approval_across_reorder() {
+        let mut app = App::new();
+        app.set_approvals(vec![
+            approval("apr_a", &["approve"]),
+            approval("apr_b", &["approve"]),
+        ]);
+        app.focus = Focus::Approvals;
+        app.on_key(Key::Down); // cursor -> apr_b
+        assert_eq!(app.approvals()[app.approval_cursor()].id, "apr_b");
+        // reconcile drops apr_a and reorders — cursor must stay on apr_b, not
+        // silently re-point at whatever now sits at the old index
+        app.set_approvals(vec![
+            approval("apr_c", &["approve"]),
+            approval("apr_b", &["approve"]),
+        ]);
+        assert_eq!(app.approvals()[app.approval_cursor()].id, "apr_b");
+    }
+
+    #[test]
+    fn run_started_for_an_unknown_run_requests_reconcile() {
+        let mut app = App::new();
+        // no runs known yet
+        let ev = Event {
+            v: 1,
+            seq: 1,
+            ts: "t".to_owned(),
+            body: EventBody::RunStarted(agent24_protocol::RunStartedPayload {
+                run_id: "run_new".to_owned(),
+                session_id: None,
+                schedule_id: None,
+            }),
+        };
+        app.apply_event(&ev);
+        assert!(
+            app.needs_reconcile,
+            "an unknown run must trigger a reconcile to pull its full record"
+        );
+    }
+
+    #[test]
+    fn event_log_is_capped() {
+        let mut app = App::new();
+        app.set_runs(vec![run("run_1", RunStatus::Running)]);
+        for i in 0..(MAX_LOG_LINES + 50) {
+            let ev = Event {
+                v: 1,
+                seq: (i + 1) as u64,
+                ts: "t".to_owned(),
+                body: EventBody::ModelDelta(agent24_protocol::ModelDeltaPayload {
+                    run_id: "run_1".to_owned(),
+                    text: format!("chunk {i}"),
+                }),
+            };
+            app.apply_event(&ev);
+        }
+        assert_eq!(app.selected_run_events().len(), MAX_LOG_LINES);
+        // oldest lines dropped, newest kept
+        let last = app.selected_run_events().last().unwrap();
+        assert!(last.contains(&format!("chunk {}", MAX_LOG_LINES + 49)));
+    }
+
+    #[test]
+    fn set_runs_prunes_logs_for_vanished_runs() {
+        let mut app = App::new();
+        app.set_runs(vec![run("run_1", RunStatus::Running)]);
+        let ev = Event {
+            v: 1,
+            seq: 1,
+            ts: "t".to_owned(),
+            body: EventBody::RunCancelled(agent24_protocol::RunCancelledPayload {
+                run_id: "run_1".to_owned(),
+            }),
+        };
+        app.apply_event(&ev);
+        assert!(!app.selected_run_events().is_empty());
+        // run_1 no longer listed → its log is pruned
+        app.set_runs(vec![run("run_2", RunStatus::Running)]);
+        // selecting the (now only) run_2 has no leaked run_1 lines
+        assert!(app.selected_run_events().is_empty());
+    }
+
+    #[test]
+    fn backspace_edits_the_deny_reason() {
+        let mut app = App::new();
+        open_modal(&mut app);
+        app.on_key(Key::Down);
+        app.on_key(Key::Down); // deny
+        app.on_key(Key::Enter); // reason entry
+        app.on_key(Key::Char('a'));
+        app.on_key(Key::Char('x'));
+        app.on_key(Key::Backspace);
+        app.on_key(Key::Char('b'));
+        let action = app.on_key(Key::Enter);
+        match action {
+            Action::Decide { decision, .. } => {
+                assert_eq!(decision.reason.as_deref(), Some("ab"));
+            }
+            other => panic!("expected deny Decide, got {other:?}"),
+        }
     }
 }
