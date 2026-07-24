@@ -189,10 +189,26 @@ impl ApprovalBroker {
                 {
                     tracing::warn!("approval {id} force-timed-out by watchdog");
                     (emit)(EventBody::ApprovalResolved(ApprovalResolvedPayload {
-                        approval_id: id,
-                        run_id,
+                        approval_id: id.clone(),
+                        run_id: run_id.clone(),
                         decision_type: "timed_out".to_owned(),
                     }));
+                    // The fail-closed backstop must be audited like every
+                    // other resolution path (review C4 R2)
+                    if let Err(err) = store
+                        .append_audit(
+                            &now_iso8601(),
+                            "policy",
+                            "approval.resolved",
+                            &serde_json::json!({
+                                "approval_id": id, "run_id": run_id,
+                                "resolution": "timed_out", "via": "watchdog",
+                            }),
+                        )
+                        .await
+                    {
+                        tracing::error!("watchdog audit append failed: {err}");
+                    }
                 }
             });
         }

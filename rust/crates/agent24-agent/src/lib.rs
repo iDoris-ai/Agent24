@@ -1121,6 +1121,11 @@ mod approval_tests {
         let h = harness(dir.path().to_path_buf()).await;
         let run = h.manager.start_run(create()).await.unwrap();
         let id = wait_pending(&h.store).await;
+        // While the approval is pending the run is AWAITING_APPROVAL (SPEC
+        // §1.2) — the pending row is created inside the gate, which runs
+        // strictly after the awaiting transition, so this read is race-free
+        let blocked = h.store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(blocked.status, RunStatus::AwaitingApproval);
         h.broker
             .resolve(&id, decision("approve", None))
             .await
