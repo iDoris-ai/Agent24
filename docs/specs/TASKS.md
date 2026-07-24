@@ -103,7 +103,7 @@
 | C3 | Tool trait + registry + 基础工具 | C2 | merged | #37 |
 | C4 | 审批系统 | C3 | in-pr | #38 |
 | C5 | Schedule 调度器 | C2 | in-pr | #39 |
-| C6 | `agent24 tui` 最小版 | C4, C5 | pending | |
+| C6 | `agent24 tui` 最小版 | C4, C5 | in-pr | #40 |
 | C7 | 桌面端 Runs/Schedules/Approvals UI | C4, C5 | pending | |
 | C8 | v0.1.0 发布工程 | C6, C7 | pending | |
 
