@@ -110,10 +110,28 @@ impl RunManager {
             return Err(err.into());
         }
 
+        // Supervised execution: execute() runs in its OWN task whose join
+        // result is observed. A panic anywhere in the execution path (the
+        // ModelProvider trait object is effectively arbitrary code) must
+        // still land the run in a terminal state and clean the cancels map —
+        // otherwise the run is wedged non-terminal for the process lifetime
+        // and cancel_run cannot recover it (review #36).
         let manager = Arc::clone(self);
         let run_id = run.id.clone();
         tokio::spawn(async move {
-            manager.execute(run_id.clone(), token).await;
+            let task = tokio::spawn({
+                let manager = Arc::clone(&manager);
+                let run_id = run_id.clone();
+                async move { manager.execute(run_id, token).await }
+            });
+            if let Err(err) = task.await
+                && err.is_panic()
+            {
+                tracing::error!("run {run_id}: execution task panicked");
+                manager
+                    .finish_failed(&run_id, "internal", "run execution panicked")
+                    .await;
+            }
             manager.cancels.lock().await.remove(&run_id);
         });
 
@@ -239,31 +257,36 @@ impl RunManager {
                     ),
                     other => ("internal", other.to_string()),
                 };
-                let body = ErrorBody {
-                    code: code.to_owned(),
-                    message: message.clone(),
-                    details: None,
-                };
-                match self
-                    .store
-                    .transition_run(
-                        &run_id,
-                        RunStatus::Failed,
-                        RunPatch {
-                            error: Some(body.clone()),
-                            ended_at: Some(now_iso8601()),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => self.sink.emit(EventBody::RunFailed(RunFailedPayload {
-                        run_id,
-                        error: body,
-                    })),
-                    Err(err) => tracing::error!("run failure persist failed: {err}"),
-                }
+                self.finish_failed(&run_id, code, &message).await;
             }
+        }
+    }
+
+    /// Land the failed terminal state + event.
+    async fn finish_failed(&self, run_id: &str, code: &str, message: &str) {
+        let body = ErrorBody {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            details: None,
+        };
+        match self
+            .store
+            .transition_run(
+                run_id,
+                RunStatus::Failed,
+                RunPatch {
+                    error: Some(body.clone()),
+                    ended_at: Some(now_iso8601()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => self.sink.emit(EventBody::RunFailed(RunFailedPayload {
+                run_id: run_id.to_owned(),
+                error: body,
+            })),
+            Err(err) => tracing::error!("run failure persist failed: {err}"),
         }
     }
 
@@ -457,6 +480,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::SessionNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn panicking_provider_still_lands_a_terminal_state() {
+        // review #36: a panic in the execution path must not wedge the run
+        // non-terminal — the supervisor lands Failed and cleans the token map
+        struct PanickingProvider;
+        #[async_trait]
+        impl ModelProvider for PanickingProvider {
+            fn name(&self) -> &str {
+                "panics"
+            }
+            async fn complete(
+                &self,
+                _req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                panic!("provider blew up");
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let (manager, sink, store) = manager_with(Arc::new(PanickingProvider)).await;
+        let run = manager.start_run(create()).await.unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Failed);
+        assert_eq!(done.error.unwrap().code, "internal");
+        // the cancels map entry is gone: cancel after the panic is a no-op
+        // on an already-terminal run, not a dangling token
+        let after = manager.cancel_run(&run.id).await.unwrap();
+        assert_eq!(after.status, RunStatus::Failed);
+        assert!(manager.cancels.lock().await.is_empty());
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(events, vec!["run.started", "run.failed"]);
     }
 
     #[tokio::test]
