@@ -55,12 +55,13 @@ function resolveNodeEntry(): string {
 function resolveRustBinary(): string {
   const override = process.env['AGENT24D_BIN']
   if (override) return override
+  const exe = process.platform === 'win32' ? 'agent24d.exe' : 'agent24d'
   if (isDev) {
-    return path.join(repoRootDev(), 'rust', 'target', 'debug', 'agent24d')
+    return path.join(repoRootDev(), 'rust', 'target', 'debug', exe)
   }
-  // Packaged: electron-builder copies the release binary into
-  // Resources/backend/agent24d (see the desktop package.json build config).
-  return path.join(process.resourcesPath, 'backend', 'agent24d')
+  // Packaged: electron-builder copies the platform-native release binary into
+  // Resources/backend/<exe> (per-platform extraResources in package.json).
+  return path.join(process.resourcesPath, 'backend', exe)
 }
 
 function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {

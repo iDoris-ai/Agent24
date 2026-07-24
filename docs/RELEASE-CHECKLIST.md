@@ -53,17 +53,24 @@ a config file:
 > commands; they are also what a human runs if doing it by hand.
 
 - [ ] Tag: `git tag -a v0.1.0 -m "Agent24 v0.1.0" && git push origin v0.1.0`
-- [ ] GitHub Release from the tag, body = the `0.1.0` CHANGELOG section:
-      `gh release create v0.1.0 --title "Agent24 v0.1.0" --notes-file <(sed -n '/## \[0.1.0\]/,/## \[/p' CHANGELOG.md | sed '$d')`
+- [ ] GitHub Release from the tag. For this first release the whole CHANGELOG
+      *is* the 0.1.0 notes, so use it directly (no fragile sed range that
+      could truncate):
+      `gh release create v0.1.0 --title "Agent24 v0.1.0" --notes-file CHANGELOG.md`
+      (Future releases: extract just their section with
+      `awk '/^## \[X\.Y\.Z\]/{f=1} f&&/^## \[/&&!/X\.Y\.Z/{exit} f' CHANGELOG.md`.)
 - [ ] Upload the installer + CLI as release assets:
-      `gh release upload v0.1.0 apps/desktop/release/Agent24-0.1.0*.dmg rust/target/release/agent24 rust/target/release/agent24d`
+      `gh release upload v0.1.0 apps/desktop/release/*.dmg rust/target/release/agent24 rust/target/release/agent24d`
 - [ ] Verify the Release page lists the dmg + `agent24` + `agent24d`.
 
 ## Known limitations (v0.1.0)
 
-- **Windows/Linux packaging is untested**: the `agent24d` extraResources entry
-  uses the Unix binary name; Windows needs `agent24d.exe` (both the
-  `extraResources.from` path and `resolveRustBinary`'s suffix). macOS dmg is the
-  supported v0.1.0 artifact.
-- Cross-compiling `agent24d` for other platforms is a CI concern (each platform
-  builds its own native binary).
+- **Only the macOS dmg is verified** for v0.1.0. Windows (`nsis`) and Linux
+  (`AppImage`) packaging IS configured — per-platform `extraResources` embed
+  the native `agent24d` (Windows uses `agent24d.exe`, matched by
+  `resolveRustBinary`) — but those installers are unbuilt/untested here. Each
+  platform must build its own native binary (`build:rust` runs on that OS); no
+  cross-compilation.
+- `build:rust` and `extraResources` share Cargo's **default** target dir. If
+  `CARGO_TARGET_DIR` is set in the environment, the binary lands elsewhere and
+  electron-builder won't find it — unset it (or don't set it) when packaging.

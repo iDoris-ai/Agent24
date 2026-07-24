@@ -7,8 +7,9 @@
   "scripts": {
     "dev": "concurrently --kill-others-on-fail \"pnpm dev:vite\" \"pnpm dev:electron\"",
     "dev:vite": "vite",
-    "dev:electron": "wait-on http://localhost:5173 && pnpm --filter @agent24/node-daemon build && tsc -p tsconfig.electron.json && cross-env NODE_ENV=development electron .",
+    "dev:electron": "wait-on http://localhost:5173 && pnpm build:rust:debug && pnpm --filter @agent24/node-daemon build && tsc -p tsconfig.electron.json && cross-env NODE_ENV=development electron .",
     "build": "vite build && tsc -p tsconfig.electron.json",
+    "build:rust:debug": "cargo build -p agent24d --manifest-path ../../rust/Cargo.toml",
     "build:rust": "cargo build --release -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
     "build:mac": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --mac",
     "build:win": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --win",
@@ -58,28 +59,42 @@
         "filter": [
           "**/*"
         ]
-      },
-      {
-        "from": "../../rust/target/release/agent24d",
-        "to": "backend/agent24d"
       }
     ],
     "mac": {
       "category": "public.app-category.productivity",
       "target": [
         "dmg"
+      ],
+      "extraResources": [
+        {
+          "from": "../../rust/target/release/agent24d",
+          "to": "backend/agent24d"
+        }
       ]
     },
     "win": {
       "target": [
         "nsis"
+      ],
+      "extraResources": [
+        {
+          "from": "../../rust/target/release/agent24d.exe",
+          "to": "backend/agent24d.exe"
+        }
       ]
     },
     "linux": {
       "target": [
         "AppImage"
       ],
-      "category": "Utility"
+      "category": "Utility",
+      "extraResources": [
+        {
+          "from": "../../rust/target/release/agent24d",
+          "to": "backend/agent24d"
+        }
+      ]
     }
   }
 }
