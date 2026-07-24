@@ -14,7 +14,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use agent24_protocol::ToolInfo;
+use agent24_protocol::{RiskClass, ToolInfo};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -112,15 +112,20 @@ fn str_arg<'a>(input: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 #[async_trait]
 impl Tool for HttpFetchTool {
     fn info(&self) -> ToolInfo {
-        ToolInfo {
-            name: "http_fetch".to_owned(),
-            source: "builtin".to_owned(),
-            description: "Fetch a public http(s) URL (GET/HEAD). Returns status and body \
-                          (truncated at 256 KiB). Private/internal addresses are blocked; \
-                          redirects are returned, not followed."
-                .to_owned(),
-            requires_approval: false,
-        }
+        // RiskClass::Read, deliberately — a GET/HEAD changes nothing off the
+        // machine, so it is not `External`. What makes it dangerous is
+        // exfiltration, which is a taint-propagation concern; filing it under
+        // `External` would make it eligible for target-scoped standing grants
+        // (H4), which is the wrong semantics for a tool whose "target" is an
+        // arbitrary URL.
+        ToolInfo::new(
+            "http_fetch",
+            "builtin",
+            "Fetch a public http(s) URL (GET/HEAD). Returns status and body \
+             (truncated at 256 KiB). Private/internal addresses are blocked; \
+             redirects are returned, not followed.",
+            RiskClass::Read,
+        )
     }
 
     fn parameters(&self) -> Value {

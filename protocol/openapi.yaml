@@ -498,6 +498,96 @@ paths:
                     items:
                       $ref: "#/components/schemas/ToolInfo"
 
+  /tool-overrides:
+    get:
+      operationId: listToolOverrides
+      x-milestone: M-H
+      tags: [tools]
+      summary: List the user's local risk overrides
+      description: >-
+        User-local rules adjusting a tool's risk_class. NEVER written by a
+        module, persona, or MCP server: a package may declare which tools it
+        wants, but only the user decides how far to trust them.
+      responses:
+        "200":
+          description: Override list, most specific rule first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [overrides]
+                properties:
+                  overrides:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RiskOverride"
+
+  /tool-overrides/{pattern}:
+    parameters:
+      - name: pattern
+        in: path
+        required: true
+        description: >-
+          Glob over tool names (`*` any run, `?` one char). It is the rule's
+          identity, so writing the same pattern twice replaces it.
+        schema:
+          type: string
+        examples:
+          server: { value: "mcp_fs_*" }
+          exact: { value: "mcp_fs_read-file" }
+    put:
+      operationId: setToolOverride
+      x-milestone: M-H
+      tags: [tools]
+      summary: Create or replace one risk override
+      description: >-
+        The rule is stored as written. Whether it takes EFFECT is decided at
+        dispatch: a builtin's class may be tightened but never relaxed, since
+        `external` on third-party code is a guess the user may correct while a
+        builtin's class is not. A stored-but-inert rule stays listed and
+        revocable rather than being silently dropped.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [risk_class]
+              properties:
+                risk_class:
+                  $ref: "#/components/schemas/RiskClass"
+                source:
+                  type: string
+                  description: Surface the user acted from. Audit metadata, NOT authorization.
+                  examples: [desktop, cli, tui]
+      responses:
+        "200":
+          description: The stored rule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RiskOverride"
+        "400":
+          description: Empty pattern
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      operationId: deleteToolOverride
+      x-milestone: M-H
+      tags: [tools]
+      summary: Remove one risk override
+      responses:
+        "204":
+          description: Removed
+        "404":
+          description: No such rule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -980,9 +1070,46 @@ components:
           examples: [builtin, mcp, module]
         description:
           type: string
+        risk_class:
+          $ref: '#/components/schemas/RiskClass'
         requires_approval:
           type: boolean
           default: false
+          description: >-
+            DERIVED from risk_class (true for anything but `read`). Present for
+            pre-H1 clients; new consumers should read risk_class, which carries
+            strictly more information. Absent (pre-H1 daemon) means the class is
+            unknown, which is treated as `external`, not as `read`.
+
+    RiskClass:
+      type: string
+      description: >-
+        A tool's intrinsic side-effect category (H1). Each class earns a
+        different exemption path, which is the reason for the split: only
+        `external` may ever be covered by a target-scoped standing grant;
+        `exec` is asked every time. `read` covers network reads (an http GET
+        changes nothing) — exfiltration is a taint concern, not a side effect.
+        Omitted by a pre-H1 daemon, in which case treat it as `external`.
+      enum: [read, write_local, exec, external]
+      examples: [read, external]
+
+    RiskOverride:
+      type: object
+      required: [pattern, risk_class, source, created_at]
+      properties:
+        pattern:
+          type: string
+          description: Glob over tool names; also the rule's identity.
+          examples: [mcp_fs_*]
+        risk_class:
+          $ref: '#/components/schemas/RiskClass'
+        source:
+          type: string
+          description: Surface the user acted from. Audit metadata, NOT authorization.
+          examples: [desktop, cli, tui]
+        created_at:
+          type: string
+          format: date-time
 
     ErrorBody:
       type: object
