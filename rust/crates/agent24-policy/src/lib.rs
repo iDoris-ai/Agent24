@@ -119,12 +119,17 @@ impl ApprovalBroker {
         })
     }
 
-    async fn audit(&self, action: &str, detail: Value) {
-        if let Err(err) = self
-            .store
-            .append_audit(&now_iso8601(), "policy", action, &detail)
+    /// Append an audit record, propagating the store error. Used where the
+    /// audit is a HARD precondition (an unattended auto-approval).
+    async fn try_audit(&self, action: &str, detail: &Value) -> std::result::Result<(), StoreError> {
+        self.store
+            .append_audit(&now_iso8601(), "policy", action, detail)
             .await
-        {
+            .map(|_| ())
+    }
+
+    async fn audit(&self, action: &str, detail: Value) {
+        if let Err(err) = self.try_audit(action, &detail).await {
             tracing::error!("audit append failed: {err}");
         }
     }
@@ -161,6 +166,11 @@ impl ApprovalBroker {
         // D3 Guardian: a low-risk verdict auto-approves (audited, no human ask);
         // every other outcome falls through to the human flow below. Fail-closed
         // — the guardian never DENIES here, only "approve now" or "ask a human".
+        //
+        // NOTE ON ORDERING: the guardian is consulted AFTER the session-grant
+        // fast path above. A prior `approve_for_session` is an EXPLICIT human
+        // pre-authorisation and outranks the model's per-call opinion, so a
+        // granted (session, tool) never re-consults the guardian — by design.
         if let Some(guardian) = &self.guardian {
             let assess = AssessInput {
                 tool,
@@ -168,23 +178,55 @@ impl ApprovalBroker {
                 summary: &summary,
                 payload: &payload,
             };
-            match guardian.evaluate(&assess, cancel).await {
+            // Bound the assessment by the approval timeout: a stuck local model
+            // must not hang the dispatch. Cancellation is already threaded into
+            // evaluate(); this backstops a model that hangs without cancelling.
+            // On timeout we fail closed to a human (AssessorUnavailable).
+            let decision = match tokio::time::timeout(
+                self.timeout,
+                guardian.evaluate(&assess, cancel),
+            )
+            .await
+            {
+                Ok(decision) => decision,
+                Err(_) => GuardianDecision::Escalate(guardian::Escalation::AssessorUnavailable(
+                    "assessment timed out".to_owned(),
+                )),
+            };
+            match decision {
                 GuardianDecision::AutoApprove(assessment) => {
                     // No human saw this call, so the audit must prove WHAT was
                     // auto-approved — full payload, not just the summary (the
-                    // human path's approval.required does the same).
-                    self.audit(
-                        "approval.auto_approved",
-                        serde_json::json!({
-                            "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
-                            "kind": kind, "risk_level": "low",
-                            "rationale": assessment.rationale, "summary": summary,
-                            "payload": payload,
-                        }),
-                    )
-                    .await;
-                    tracing::info!("guardian auto-approved {tool} for run {run_id}");
-                    return Verdict::Approved;
+                    // human path's approval.required does the same). The audit
+                    // is a HARD precondition: if it cannot be recorded we must
+                    // NOT auto-approve — fall through to a human instead.
+                    let detail = serde_json::json!({
+                        "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
+                        "kind": kind, "risk_level": "low",
+                        "rationale": assessment.rationale, "summary": summary,
+                        "payload": payload,
+                    });
+                    match self.try_audit("approval.auto_approved", &detail).await {
+                        Ok(()) => {
+                            tracing::info!("guardian auto-approved {tool} for run {run_id}");
+                            return Verdict::Approved;
+                        }
+                        Err(err) => {
+                            // Fail-closed: no audit → no auto-approval. Best-effort
+                            // record of the downgrade, then the human flow runs.
+                            tracing::error!(
+                                "guardian auto-approval audit failed ({err}); escalating to human"
+                            );
+                            self.audit(
+                                "approval.guardian_escalated",
+                                serde_json::json!({
+                                    "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
+                                    "kind": kind, "reason": "audit_failed",
+                                }),
+                            )
+                            .await;
+                        }
+                    }
                 }
                 GuardianDecision::Escalate(reason) => {
                     // Record WHY the guardian handed this to a human, then fall
@@ -588,6 +630,24 @@ mod tests {
 
     fn guardian_rating(level: guardian::RiskLevel) -> Arc<Guardian> {
         Arc::new(Guardian::new(Arc::new(FixedAssessor(level))))
+    }
+
+    /// An assessor that never returns in time — used to prove the broker bounds
+    /// guardian latency and fails closed.
+    struct HangingAssessor;
+
+    #[async_trait]
+    impl guardian::RiskAssessor for HangingAssessor {
+        async fn assess(
+            &self,
+            _input: &guardian::AssessInput<'_>,
+            _cancel: &CancellationToken,
+        ) -> std::result::Result<guardian::RiskAssessment, guardian::AssessError> {
+            // Far longer than any test's broker timeout; the timeout wrapper
+            // must drop this future rather than wait it out.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            unreachable!("hanging assessor should be cancelled by the broker timeout")
+        }
     }
 
     async fn seed_run(store: &Store, id: &str) {
@@ -1060,6 +1120,39 @@ mod tests {
                 .contains(&"approval.required".to_owned())
         );
         store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn guardian_slow_assessor_is_bounded_and_fails_closed() {
+        // A hung assessor must not hang the dispatch: the broker timeout bounds
+        // it, the guardian escalates, and the human flow then times out closed.
+        let hanging = Arc::new(Guardian::new(Arc::new(HangingAssessor)));
+        let (broker, _events, store) = broker_with(Duration::from_millis(80), Some(hanging)).await;
+        seed_run(&store, "run_1").await;
+        let verdict = broker
+            .request(
+                "run_1",
+                Some("sess_1"),
+                "tc_1",
+                "shell_exec",
+                "exec",
+                "s".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(verdict, Verdict::Denied(ref r) if r.contains("timed out")),
+            "{verdict:?}"
+        );
+        // The escalation was audited as an assessor problem, and a human row
+        // was created (proving we fell through, not silently approved).
+        let audits = store.list_audit().await.unwrap();
+        assert!(audits.iter().any(|a| {
+            a.action == "approval.guardian_escalated"
+                && a.detail["reason"] == "assessor_unavailable"
+        }));
+        assert_eq!(store.list_approvals(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
