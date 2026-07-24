@@ -3,6 +3,22 @@
 version = 4
 
 [[package]]
+name = "agent24-agent"
+version = "0.1.0"
+dependencies = [
+ "agent24-core",
+ "agent24-models",
+ "agent24-protocol",
+ "agent24-store",
+ "async-trait",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "agent24-cli"
 version = "0.1.0"
 dependencies = [
@@ -19,6 +35,7 @@ name = "agent24-core"
 version = "0.1.0"
 dependencies = [
  "agent24-protocol",
+ "rand 0.9.5",
  "thiserror",
 ]
 
@@ -65,8 +82,11 @@ dependencies = [
 name = "agent24d"
 version = "0.1.0"
 dependencies = [
+ "agent24-agent",
+ "agent24-core",
  "agent24-models",
  "agent24-protocol",
+ "agent24-store",
  "axum",
  "clap",
  "http-body-util",

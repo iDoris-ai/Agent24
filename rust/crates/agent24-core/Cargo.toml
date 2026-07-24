@@ -8,6 +8,7 @@ description = "Agent24 domain core — pure state machines over the protocol typ
 
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
+rand = "0.9"
 thiserror = "2"
 
 [lints]

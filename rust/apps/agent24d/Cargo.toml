@@ -7,7 +7,10 @@ repository.workspace = true
 description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — health, auth handshake, graceful shutdown)"
 
 [dependencies]
+agent24-agent = { path = "../../crates/agent24-agent" }
+agent24-core = { path = "../../crates/agent24-core" }
 agent24-models = { path = "../../crates/agent24-models" }
+agent24-store = { path = "../../crates/agent24-store" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }

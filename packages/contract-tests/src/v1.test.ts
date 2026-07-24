@@ -26,10 +26,15 @@ beforeAll(async () => {
   validateEvent = ajv.compile(schema) as typeof validateEvent
 })
 
-// Collect WS events while `action` runs, until a terminal run event or timeout.
+// Collect WS events while `action` runs, until `until` matches (default: any
+// terminal run event) or timeout. Predicate-driven so shared-daemon bystander
+// events can't end collection early.
 // Uses the `ws` client (not the global WebSocket): agent24d requires the
 // bearer token on the upgrade request, which browser-style clients cannot set.
-async function collectEventsDuring(action: () => Promise<void>): Promise<Array<Record<string, unknown>>> {
+async function collectEventsDuring(
+  action: () => Promise<void>,
+  until?: (doc: Record<string, unknown>) => boolean,
+): Promise<Array<Record<string, unknown>>> {
   const events: Array<Record<string, unknown>> = []
   const ws = new WsClient(WS_URL, {
     headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {},
@@ -40,11 +45,15 @@ async function collectEventsDuring(action: () => Promise<void>): Promise<Array<R
   })
   const done = new Promise<void>((resolve) => {
     const timer = setTimeout(() => resolve(), 10_000)
+    const isTerminal = (doc: Record<string, unknown>) => {
+      const t = doc['type']
+      return t === 'run.completed' || t === 'run.failed' || t === 'run.cancelled'
+    }
+    const done_ = until ?? isTerminal
     ws.on('message', (data) => {
       const doc = JSON.parse(String(data)) as Record<string, unknown>
       events.push(doc)
-      const t = doc['type']
-      if (t === 'run.completed' || t === 'run.failed' || t === 'run.cancelled') {
+      if (done_(doc)) {
         clearTimeout(timer)
         resolve()
       }
@@ -204,12 +213,100 @@ describe('v1 M-A (live since A5)', () => {
   })
 })
 
-describe('v1 M-C runs (activate in C2)', () => {
-  it.todo('POST /api/v1/runs → 202 Run(status=queued), then run.started event')
-  it.todo('GET /api/v1/runs/{id} → 200 Run; unknown id → 404')
-  it.todo('GET /api/v1/runs?status=running filters correctly')
-  it.todo('POST /api/v1/runs/{id}/cancel → 202; streaming run emits run.cancelled within 1s')
-  it.todo('cancel is idempotent: cancelling a terminal run returns 202 with unchanged run')
+// runs/sessions are Rust-daemon endpoints (M-C); the node mock stops at M-A
+const IS_RUST_TARGET = (process.env['A24_TARGET'] || 'node') !== 'node'
+
+describe('v1 M-C runs (live since C2, agent24d only)', () => {
+  it('POST /api/v1/runs → 202 queued, then run.started and a terminal event', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    let created: { status: number; body: unknown } | null = null
+    const events = await collectEventsDuring(
+      async () => {
+        created = await post('/api/v1/runs', { prompt: 'contract run' })
+      },
+      (doc) => {
+        const t = doc['type']
+        const rid = (doc['payload'] as { run_id?: string }).run_id
+        const target = (created?.body as { id?: string } | undefined)?.id
+        return (
+          (t === 'run.completed' || t === 'run.failed' || t === 'run.cancelled') &&
+          rid !== undefined &&
+          rid === target
+        )
+      },
+    )
+    expect(created!.status).toBe(202)
+    const run = created!.body as { id: string; status: string; session_id: string | null }
+    expect(run.status).toBe('queued')
+    expect(run.id).toMatch(/^run_[0-9A-HJKMNP-TV-Z]{26}$/)
+    const mine = events.filter((e) => (e['payload'] as { run_id?: string }).run_id === run.id)
+    const types = mine.map((e) => e['type'])
+    expect(types[0]).toBe('run.started')
+    expect(['run.completed', 'run.failed']).toContain(types[types.length - 1])
+    for (const ev of mine) expect(validateEvent(ev), JSON.stringify(validateEvent.errors)).toBe(true)
+
+    // persisted terminal state matches the event
+    const fetched = await get(`/api/v1/runs/${run.id}`)
+    expect(fetched.status).toBe(200)
+    const body = fetched.body as { status: string; started_at: string | null; ended_at: string | null }
+    expect(['completed', 'failed']).toContain(body.status)
+    expect(body.started_at).not.toBeNull()
+    expect(body.ended_at).not.toBeNull()
+  })
+
+  it('GET /api/v1/runs/{id} unknown id → 404 envelope', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await get('/api/v1/runs/run_00000000000000000000000000')
+    expect(res.status).toBe(404)
+    expect((res.body as { error: { code: string } }).error.code).toBe('not_found')
+  })
+
+  it('GET /api/v1/runs?status= filters correctly', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await get('/api/v1/runs?status=queued')
+    expect(res.status).toBe(200)
+    const body = res.body as { runs: Array<{ status: string }> }
+    for (const r of body.runs) expect(r.status).toBe('queued')
+  })
+
+  it('cancel is idempotent: terminal run returns 202 unchanged', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const created = await post('/api/v1/runs', { prompt: 'to finish' })
+    const run = created.body as { id: string }
+    // wait for terminal
+    let status = ''
+    for (let i = 0; i < 50 && !['completed', 'failed', 'cancelled'].includes(status); i++) {
+      await new Promise((r) => setTimeout(r, 100))
+      status = ((await get(`/api/v1/runs/${run.id}`)).body as { status: string }).status
+    }
+    expect(['completed', 'failed']).toContain(status)
+    const cancel = await post(`/api/v1/runs/${run.id}/cancel`)
+    expect(cancel.status).toBe(202)
+    expect((cancel.body as { status: string }).status).toBe(status) // unchanged
+  })
+
+  it('POST /api/v1/runs without prompt → 400 invalid_request', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await post('/api/v1/runs', {})
+    expect(res.status).toBe(400)
+    expect((res.body as { error: { code: string } }).error.code).toBe('invalid_request')
+  })
+
+  it('invalid ?status= filter → 400 envelope (never a plain-text rejection)', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await get('/api/v1/runs?status=sprinting')
+    expect(res.status).toBe(400)
+    expect((res.body as { error: { code: string } }).error.code).toBe('invalid_request')
+  })
+
+  it('oversized run body → 413 envelope', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await post('/api/v1/runs', { prompt: 'x'.repeat(1024 * 1024 + 100) })
+    expect(res.status).toBe(413)
+    expect((res.body as { error: { code: string } }).error.code).toBe('payload_too_large')
+  })
+
+  it.todo('streaming run cancel emits run.cancelled within 1s (needs live LLM — covered by agent24-agent unit test with a hanging provider)')
 })
 
 describe('v1 M-C approvals (activate in C4)', () => {
@@ -234,7 +331,28 @@ describe('v1 M-C schedules (activate in C5)', () => {
   it.todo('schedule firing emits schedule.fired {schedule_id, run_id}')
 })
 
-describe('v1 M-C sessions & tools (activate in C1/C3)', () => {
-  it.todo('POST /api/v1/sessions → 201 Session; GET list contains it; GET /api/v1/sessions/{id} returns it')
-  it.todo('GET /api/v1/tools → 200 {tools:[{name, source, description, requires_approval}]}')
+describe('v1 M-C sessions (live since C2, agent24d only)', () => {
+  it('POST /api/v1/sessions → 201; list contains it; get by id returns it', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const created = await post('/api/v1/sessions', { title: 'contract', channel: 'cli' })
+    expect(created.status).toBe(201)
+    const session = created.body as { id: string; title: string; channel: string }
+    expect(session.id).toMatch(/^sess_[0-9A-HJKMNP-TV-Z]{26}$/)
+    expect(session.title).toBe('contract')
+
+    const list = await get('/api/v1/sessions')
+    expect(list.status).toBe(200)
+    const sessions = (list.body as { sessions: Array<{ id: string }> }).sessions
+    expect(sessions.some((s) => s.id === session.id)).toBe(true)
+
+    const fetched = await get(`/api/v1/sessions/${session.id}`)
+    expect(fetched.status).toBe(200)
+    expect((fetched.body as { id: string }).id).toBe(session.id)
+
+    // run bound to an unknown session → 404
+    const bad = await post('/api/v1/runs', { prompt: 'x', session_id: 'sess_nope' })
+    expect(bad.status).toBe(404)
+  })
+
+  it.todo('GET /api/v1/tools → 200 {tools:[...]} (activate in C3)')
 })

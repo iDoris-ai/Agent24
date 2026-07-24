@@ -237,6 +237,20 @@ impl Store {
         Ok(run)
     }
 
+    /// Fail-closed startup sweep: any run left non-terminal by a previous
+    /// daemon process (queued/running/awaiting_approval with no executor
+    /// alive) is cancelled. Must run BEFORE accepting requests.
+    pub async fn sweep_orphan_runs(&self, ended_at: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE runs SET status = 'cancelled', ended_at = ?
+             WHERE status IN ('queued', 'running', 'awaiting_approval')",
+        )
+        .bind(ended_at)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     // ── tool calls ───────────────────────────────────────────────────────────
 
     pub async fn insert_tool_call(&self, call: &ToolCall) -> Result<()> {

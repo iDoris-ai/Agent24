@@ -5,6 +5,7 @@
 
 mod events;
 mod routes;
+mod runs;
 mod server;
 
 use clap::{Parser, Subcommand};

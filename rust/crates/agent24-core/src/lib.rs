@@ -6,5 +6,6 @@
 //! legal state machines live in exactly one place.
 
 pub mod transitions;
+pub mod util;
 
 pub use transitions::*;
