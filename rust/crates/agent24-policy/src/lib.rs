@@ -170,12 +170,16 @@ impl ApprovalBroker {
             };
             match guardian.evaluate(&assess, cancel).await {
                 GuardianDecision::AutoApprove(assessment) => {
+                    // No human saw this call, so the audit must prove WHAT was
+                    // auto-approved — full payload, not just the summary (the
+                    // human path's approval.required does the same).
                     self.audit(
                         "approval.auto_approved",
                         serde_json::json!({
                             "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
                             "kind": kind, "risk_level": "low",
                             "rationale": assessment.rationale, "summary": summary,
+                            "payload": payload,
                         }),
                     )
                     .await;
@@ -981,6 +985,8 @@ mod tests {
         )
         .await;
         seed_run(&store, "run_1").await;
+        let mut payload = Map::new();
+        payload.insert("path".to_owned(), serde_json::json!("/tmp/x"));
         let verdict = broker
             .request(
                 "run_1",
@@ -989,7 +995,7 @@ mod tests {
                 "fs_write",
                 "fs_write",
                 "fs_write: /tmp/x".to_owned(),
-                Map::new(),
+                payload,
                 &CancellationToken::new(),
             )
             .await;
@@ -997,9 +1003,15 @@ mod tests {
         // No human was asked: no approval row, no ApprovalRequired event.
         assert!(store.list_approvals(None).await.unwrap().is_empty());
         assert!(events.0.lock().unwrap().is_empty());
-        // The auto-approval is audited (with rationale) and the chain holds.
+        // The auto-approval is audited with rationale AND the full payload (no
+        // human saw it), and the hash chain holds.
         let audits = store.list_audit().await.unwrap();
-        assert!(audits.iter().any(|a| a.action == "approval.auto_approved"));
+        let rec = audits
+            .iter()
+            .find(|a| a.action == "approval.auto_approved")
+            .expect("auto_approved audit");
+        assert_eq!(rec.detail["risk_level"], "low");
+        assert_eq!(rec.detail["payload"]["path"], "/tmp/x");
         store.verify_audit_chain().await.unwrap();
     }
 
