@@ -809,11 +809,76 @@ mod tests {
         assert_eq!(verdict, Verdict::Approved);
         assert_eq!(store.list_approvals(None).await.unwrap().len(), 1);
 
-        // Different session still asks (row appears; let it time out — not
-        // awaited here, the tiny scope ends the test)
         let audits = store.list_audit().await.unwrap();
         assert!(audits.iter().any(|a| a.action == "approval.auto_granted"));
         store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn grants_are_scoped_to_session_and_tool() {
+        // An approve_for_session grant must NOT leak across sessions or tools:
+        // a different session, or a different tool in the same session, still
+        // creates a fresh pending approval (review C4 grant-scoping).
+        let (broker, _events, store) = broker_with_timeout(Duration::from_millis(80)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let waiter = tokio::spawn(async move {
+            b.request(
+                "run_1",
+                Some("sess_1"),
+                "tc_1",
+                "shell_exec",
+                "exec",
+                "s".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        broker
+            .resolve(&id, decision("approve_for_session", None))
+            .await
+            .unwrap();
+        assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+
+        // Different SESSION, same tool → not granted → asks (times out closed)
+        seed_run(&store, "run_2").await;
+        let other_session = broker
+            .request(
+                "run_2",
+                Some("sess_2"),
+                "tc_2",
+                "shell_exec",
+                "exec",
+                "s".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(other_session, Verdict::Denied(_)),
+            "a different session must still be asked: {other_session:?}"
+        );
+
+        // Same session, different TOOL → not granted → asks (times out closed)
+        seed_run(&store, "run_3").await;
+        let other_tool = broker
+            .request(
+                "run_3",
+                Some("sess_1"),
+                "tc_3",
+                "fs_write",
+                "fs_write",
+                "s".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(other_tool, Verdict::Denied(_)),
+            "a different tool must still be asked: {other_tool:?}"
+        );
     }
 
     #[tokio::test]
