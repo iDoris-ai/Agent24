@@ -28,9 +28,19 @@ use agent24_tools::Tool;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-/// Per-server connect budget. A server that hangs during handshake must not
-/// hold up daemon startup.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-server connect budget.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Budget for mounting ALL servers, enforced across the whole loop.
+///
+/// This MUST stay comfortably below the CLI's 15s ready-line deadline
+/// (`agent24-cli` `spawn_daemon`): mounting happens BEFORE the ready line, and
+/// servers are mounted sequentially, so a per-server timeout alone could exceed
+/// that deadline in aggregate. When it did, the CLI declared the daemon dead —
+/// and in ephemeral mode (`kill_on_drop`) actually killed an otherwise-healthy
+/// daemon (reviewer-found). Bounding the total, not just each server, is what
+/// makes that impossible regardless of how many servers are configured.
+const MOUNT_TOTAL_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize, Default)]
 pub struct McpConfig {
@@ -92,24 +102,52 @@ pub async fn mount(
 ) -> (Vec<Arc<McpServer>>, Vec<Arc<dyn Tool>>) {
     let mut servers = Vec::new();
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + MOUNT_TOTAL_BUDGET;
     for spec in specs {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::error!(
+                "MCP server {} not mounted: total mount budget {MOUNT_TOTAL_BUDGET:?} exhausted",
+                spec.name
+            );
+            continue;
+        }
+        let budget = CONNECT_TIMEOUT.min(remaining);
         let connect = agent24_mcp::connect_and_build_tools(spec, cancel.clone());
-        match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-            Ok(Ok((server, mut built))) => {
+        match tokio::time::timeout(budget, connect).await {
+            Ok(Ok((server, built))) => {
+                // Belt-and-braces after the separator fix: distinct raw names can
+                // still sanitize to the same string (e.g. `a.b` and `a-b`), and
+                // ToolRegistry::with() is a plain insert that would silently
+                // shadow. Refuse the duplicate loudly instead.
+                let mut kept: Vec<Arc<dyn Tool>> = Vec::new();
+                for tool in built {
+                    let name = tool.info().name;
+                    if !seen.insert(name.clone()) {
+                        tracing::error!(
+                            "MCP tool {name} from server {} collides with an already \
+                             registered tool and was NOT registered — rename the server",
+                            spec.name
+                        );
+                        continue;
+                    }
+                    kept.push(tool);
+                }
                 tracing::info!(
                     "mounted MCP server {} with {} tool(s)",
                     spec.name,
-                    built.len()
+                    kept.len()
                 );
                 servers.push(server);
-                tools.append(&mut built);
+                tools.extend(kept);
             }
             Ok(Err(err)) => {
                 tracing::error!("MCP server {} not mounted: {err}", spec.name);
             }
             Err(_) => {
                 tracing::error!(
-                    "MCP server {} not mounted: handshake exceeded {CONNECT_TIMEOUT:?}",
+                    "MCP server {} not mounted: handshake exceeded its {budget:?} budget",
                     spec.name
                 );
             }
@@ -174,6 +212,37 @@ mod tests {
     fn malformed_config_is_an_error_not_a_panic() {
         assert!(parse_config("{ not json").is_err());
         assert!(parse_config(r#"{"mcpServers":{"a":{}}}"#).is_err()); // command required
+    }
+
+    #[test]
+    fn mount_budget_stays_under_the_cli_ready_deadline() {
+        // The CLI (agent24-cli spawn_daemon) waits 15s for the ready line, and
+        // mounting runs BEFORE that line. If this budget ever creeps past it,
+        // a slow server makes the CLI declare a healthy daemon dead — and kill
+        // it in ephemeral mode. Pin the relationship so it can't drift silently.
+        const CLI_READY_DEADLINE: Duration = Duration::from_secs(15);
+        assert!(
+            MOUNT_TOTAL_BUDGET < CLI_READY_DEADLINE,
+            "mount budget {MOUNT_TOTAL_BUDGET:?} must stay under the CLI's {CLI_READY_DEADLINE:?}"
+        );
+        // And a single server can never consume the whole budget on its own.
+        assert!(CONNECT_TIMEOUT <= MOUNT_TOTAL_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn total_budget_is_enforced_across_servers_not_just_each_one() {
+        // Several broken servers must not add up past the total budget.
+        let specs: Vec<McpServerSpec> = (0..5)
+            .map(|i| McpServerSpec::new(format!("broken{i}"), "/definitely/not/real", vec![]))
+            .collect();
+        let started = std::time::Instant::now();
+        let (servers, tools) = mount(&specs, &CancellationToken::new()).await;
+        assert!(servers.is_empty() && tools.is_empty());
+        assert!(
+            started.elapsed() < MOUNT_TOTAL_BUDGET + Duration::from_secs(2),
+            "mount overran its total budget: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
