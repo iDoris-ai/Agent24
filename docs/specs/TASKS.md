@@ -146,8 +146,8 @@
 | ID | 任务 | 依赖 | 状态 |
 |---|---|---|---|
 | D1 | agent24-memory：L0 KV + canonical session（超阈值 LLM 摘要压缩） | C8 + 用户确认 | done |
-| D2 | ModelRouter 一等公民：TaskProfile → tier(local/remote/lora) 选择，health+cooldown 反馈闭环，隐私标签强制本地 | C8 + 用户确认 | in-pr #44 |
-| D3 | Guardian 自动审批员：L1 本地小模型评估 `{risk_level, rationale}`，低风险自动放行+结构化审计，高风险升级人审 | C4, D2 | pending |
+| D2 | ModelRouter 一等公民：TaskProfile → tier(local/remote/lora) 选择，health+cooldown 反馈闭环，隐私标签强制本地 | C8 + 用户确认 | done |
+| D3 | Guardian 自动审批员：L1 本地小模型评估 `{risk_level, rationale}`，低风险自动放行+结构化审计，高风险升级人审 | C4, D2 | in-pr |
 | D4 | Python ML worker 接入（embedding/whisper 先行；LoRA 训练后置） | D2 | pending |
 
 ## M-E 模块生态桥接（v0.3.0）

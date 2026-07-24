@@ -10,9 +10,13 @@
 //! Audit is double-written: full detail into the hash-chained audit table,
 //! ids-only into logs (payloads never hit stderr).
 
+pub mod guardian;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+
+use guardian::{AssessInput, Guardian, GuardianDecision};
 
 use agent24_core::util::{now_iso8601, ulid};
 use agent24_protocol::{Approval, ApprovalResolvedPayload, ApprovalStatus, Decision, EventBody};
@@ -63,6 +67,9 @@ pub struct ApprovalBroker {
     /// falling back to the run id for session-less runs. Bounded: on
     /// overflow the set is CLEARED (fail-closed — users get re-asked).
     grants: Mutex<HashSet<(String, String)>>,
+    /// D3 auto-approver. When present, a low-risk verdict skips the human ask;
+    /// absent (the default) means every gated call goes to a human.
+    guardian: Option<Arc<Guardian>>,
     timeout: Duration,
 }
 
@@ -89,11 +96,25 @@ impl ApprovalBroker {
         emit: Arc<dyn Fn(EventBody) + Send + Sync>,
         timeout: Duration,
     ) -> Arc<Self> {
+        Self::with_guardian(store, emit, timeout, None)
+    }
+
+    /// Build a broker fronted by a [`Guardian`]. A low-risk verdict from the
+    /// guardian auto-approves (audited, no human ask); every other outcome —
+    /// high-risk, an unavailable/garbled model, or a hard-listed kind — falls
+    /// through to the normal human approval flow.
+    pub fn with_guardian(
+        store: Store,
+        emit: Arc<dyn Fn(EventBody) + Send + Sync>,
+        timeout: Duration,
+        guardian: Option<Arc<Guardian>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             emit,
             pending: Mutex::new(HashMap::new()),
             grants: Mutex::new(HashSet::new()),
+            guardian,
             timeout,
         })
     }
@@ -135,6 +156,50 @@ impl ApprovalBroker {
             )
             .await;
             return Verdict::Approved;
+        }
+
+        // D3 Guardian: a low-risk verdict auto-approves (audited, no human ask);
+        // every other outcome falls through to the human flow below. Fail-closed
+        // — the guardian never DENIES here, only "approve now" or "ask a human".
+        if let Some(guardian) = &self.guardian {
+            let assess = AssessInput {
+                tool,
+                kind,
+                summary: &summary,
+                payload: &payload,
+            };
+            match guardian.evaluate(&assess, cancel).await {
+                GuardianDecision::AutoApprove(assessment) => {
+                    self.audit(
+                        "approval.auto_approved",
+                        serde_json::json!({
+                            "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
+                            "kind": kind, "risk_level": "low",
+                            "rationale": assessment.rationale, "summary": summary,
+                        }),
+                    )
+                    .await;
+                    tracing::info!("guardian auto-approved {tool} for run {run_id}");
+                    return Verdict::Approved;
+                }
+                GuardianDecision::Escalate(reason) => {
+                    // Record WHY the guardian handed this to a human, then fall
+                    // through to the normal pending-approval flow.
+                    self.audit(
+                        "approval.guardian_escalated",
+                        serde_json::json!({
+                            "run_id": run_id, "tool": tool, "tool_call_id": tool_call_id,
+                            "kind": kind, "reason": reason.reason_code(),
+                            "detail": reason.detail(),
+                        }),
+                    )
+                    .await;
+                    tracing::info!(
+                        "guardian escalated {tool} for run {run_id}: {}",
+                        reason.reason_code()
+                    );
+                }
+            }
         }
 
         let now = now_iso8601();
@@ -479,6 +544,13 @@ mod tests {
     struct Recorded(Arc<StdMutex<Vec<String>>>);
 
     async fn broker_with_timeout(timeout: Duration) -> (Arc<ApprovalBroker>, Recorded, Store) {
+        broker_with(timeout, None).await
+    }
+
+    async fn broker_with(
+        timeout: Duration,
+        guardian: Option<Arc<Guardian>>,
+    ) -> (Arc<ApprovalBroker>, Recorded, Store) {
         let store = Store::open_memory().await.unwrap();
         let events = Arc::new(StdMutex::new(Vec::new()));
         let ev = Arc::clone(&events);
@@ -488,10 +560,30 @@ mod tests {
             }
         });
         (
-            ApprovalBroker::new(store.clone(), emit, timeout),
+            ApprovalBroker::with_guardian(store.clone(), emit, timeout, guardian),
             Recorded(events),
             store,
         )
+    }
+
+    struct FixedAssessor(guardian::RiskLevel);
+
+    #[async_trait]
+    impl guardian::RiskAssessor for FixedAssessor {
+        async fn assess(
+            &self,
+            _input: &guardian::AssessInput<'_>,
+            _cancel: &CancellationToken,
+        ) -> std::result::Result<guardian::RiskAssessment, guardian::AssessError> {
+            Ok(guardian::RiskAssessment {
+                level: self.0,
+                rationale: "fixed".to_owned(),
+            })
+        }
+    }
+
+    fn guardian_rating(level: guardian::RiskLevel) -> Arc<Guardian> {
+        Arc::new(Guardian::new(Arc::new(FixedAssessor(level))))
     }
 
     async fn seed_run(store: &Store, id: &str) {
@@ -879,6 +971,133 @@ mod tests {
             matches!(other_tool, Verdict::Denied(_)),
             "a different tool must still be asked: {other_tool:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn guardian_low_risk_auto_approves_without_a_human() {
+        let (broker, events, store) = broker_with(
+            Duration::from_secs(30),
+            Some(guardian_rating(guardian::RiskLevel::Low)),
+        )
+        .await;
+        seed_run(&store, "run_1").await;
+        let verdict = broker
+            .request(
+                "run_1",
+                Some("sess_1"),
+                "tc_1",
+                "fs_write",
+                "fs_write",
+                "fs_write: /tmp/x".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(verdict, Verdict::Approved);
+        // No human was asked: no approval row, no ApprovalRequired event.
+        assert!(store.list_approvals(None).await.unwrap().is_empty());
+        assert!(events.0.lock().unwrap().is_empty());
+        // The auto-approval is audited (with rationale) and the chain holds.
+        let audits = store.list_audit().await.unwrap();
+        assert!(audits.iter().any(|a| a.action == "approval.auto_approved"));
+        store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn guardian_high_risk_escalates_to_a_human() {
+        // High risk → fall through to the human flow. With no resolver it times
+        // out (fail-closed), which proves a real pending approval was created.
+        let (broker, events, store) = broker_with(
+            Duration::from_millis(100),
+            Some(guardian_rating(guardian::RiskLevel::High)),
+        )
+        .await;
+        seed_run(&store, "run_1").await;
+        let verdict = broker
+            .request(
+                "run_1",
+                Some("sess_1"),
+                "tc_1",
+                "shell_exec",
+                "exec",
+                "shell_exec: rm -rf /".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(verdict, Verdict::Denied(ref r) if r.contains("timed out")),
+            "{verdict:?}"
+        );
+        // A human approval row was created and then failed closed.
+        let all = store.list_approvals(None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].status, ApprovalStatus::TimedOut);
+        // The escalation reason is audited, and the human ask was emitted.
+        let audits = store.list_audit().await.unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|a| a.action == "approval.guardian_escalated")
+        );
+        assert!(
+            events
+                .0
+                .lock()
+                .unwrap()
+                .contains(&"approval.required".to_owned())
+        );
+        store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn guardian_respects_session_grant_before_assessing() {
+        // An approve_for_session grant short-circuits BEFORE the guardian, so a
+        // granted tool never re-consults the model.
+        let (broker, _events, store) = broker_with(
+            Duration::from_secs(30),
+            Some(guardian_rating(guardian::RiskLevel::High)),
+        )
+        .await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let waiter = tokio::spawn(async move {
+            b.request(
+                "run_1",
+                Some("sess_1"),
+                "tc_1",
+                "shell_exec",
+                "exec",
+                "s".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        broker
+            .resolve(&id, decision("approve_for_session", None))
+            .await
+            .unwrap();
+        assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+
+        // Second call, same session+tool: granted → Approved with NO new row,
+        // even though the guardian would have rated it high.
+        seed_run(&store, "run_2").await;
+        let verdict = broker
+            .request(
+                "run_2",
+                Some("sess_1"),
+                "tc_2",
+                "shell_exec",
+                "exec",
+                "s".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(verdict, Verdict::Approved);
+        assert_eq!(store.list_approvals(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

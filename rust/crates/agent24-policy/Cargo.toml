@@ -8,6 +8,7 @@ description = "Agent24 approval system (C4): fail-closed approval broker + broke
 
 [dependencies]
 agent24-core = { path = "../agent24-core" }
+agent24-models = { path = "../agent24-models" }
 agent24-protocol = { path = "../agent24-protocol" }
 agent24-store = { path = "../agent24-store" }
 agent24-tools = { path = "../agent24-tools" }
