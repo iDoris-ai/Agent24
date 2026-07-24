@@ -86,6 +86,7 @@ dependencies = [
  "agent24-store",
  "agent24-tools",
  "async-trait",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use agent24_models::router::{Complexity, ModelRouter, Privacy, TaskProfile};
 use agent24_models::{CompletionRequest, Msg};
 use async_trait::async_trait;
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -290,7 +291,78 @@ fn parse_assessment(content: &str) -> Result<RiskAssessment, AssessError> {
 /// embellished one escalates.
 fn extract_json_value(content: &str) -> Option<Value> {
     let body = strip_code_fence(content.trim()).trim();
-    serde_json::from_str(body).ok()
+    serde_json::from_str::<StrictValue>(body).ok().map(|s| s.0)
+}
+
+/// A `serde_json::Value` that REJECTS duplicate object keys at any depth.
+///
+/// `serde_json` silently keeps the LAST value for a duplicate key, so
+/// `{"risk_level":"high","risk_level":"low",…}` would collapse to `low` and drop
+/// the `high` before the guardian ever sees it — smuggling a high-risk call past
+/// [`find_high`]. Parsing through this type turns any duplicate key into a parse
+/// error (→ escalate).
+struct StrictValue(Value);
+
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictVisitor).map(StrictValue)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> Visitor<'de> for StrictVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value with no duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        StrictValue::deserialize(d).map(|s| s.0)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(StrictValue(v)) = seq.next_element()? {
+            items.push(v);
+        }
+        Ok(Value::Array(items))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut obj = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let StrictValue(value) = map.next_value()?;
+            if obj.contains_key(&key) {
+                return Err(de::Error::custom(format!("duplicate object key: {key}")));
+            }
+            obj.insert(key, value);
+        }
+        Ok(Value::Object(obj))
+    }
 }
 
 /// Strip a single surrounding ```/```json fence, if present. Anything malformed
@@ -556,6 +628,30 @@ mod tests {
             "```json\n{\"risk_level\":\"low\",\"rationale\":\"safe\"}\n```\n then {\"wrapper\":";
         assert!(matches!(
             parse_assessment(content).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
+    }
+
+    #[test]
+    fn parse_duplicate_risk_level_key_escalates() {
+        // Codex: serde_json keeps the last of duplicate keys, dropping a leading
+        // high. A duplicate key at any depth must escalate, not silently collapse.
+        let content = r#"{"risk_level":"high","risk_level":"low","rationale":"safe"}"#;
+        assert!(matches!(
+            parse_assessment(content).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
+        // Same trick inside a clean fence.
+        let fenced =
+            "```json\n{\"risk_level\":\"high\",\"risk_level\":\"low\",\"rationale\":\"safe\"}\n```";
+        assert!(matches!(
+            parse_assessment(fenced).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
+        // And a duplicate key nested inside a wrapper (would drop a nested high).
+        let nested = r#"{"wrap":{"risk_level":"high","risk_level":"low","rationale":"x"}}"#;
+        assert!(matches!(
+            parse_assessment(nested).unwrap_err(),
             AssessError::Unparseable(_)
         ));
     }
