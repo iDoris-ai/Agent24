@@ -592,6 +592,14 @@ impl RunManager {
                 }
                 // Re-check: a cancel that landed just as the write finished must
                 // still win rather than be overwritten by Completed.
+                //
+                // A cancel arriving between THIS check and the transition below
+                // still loses — an inherent check-then-act window that predates
+                // this change (it has always existed between the loop's last
+                // check and finalization). The memory write above is what could
+                // have widened it to 30s, which is why that is cancellable;
+                // closing the remaining microsecond window would need the store
+                // to make cancel-vs-complete a single atomic transition.
                 if cancel.is_cancelled() {
                     self.finish_cancelled(&run_id).await;
                     return;
@@ -1260,9 +1268,11 @@ pub(crate) mod tests {
         assert_eq!(session.recent.len(), WRITERS * 2, "{texts:?}");
     }
 
-    /// A summarizer that blocks long enough to sit inside the memory-write
-    /// window, so a cancel can land there.
-    struct SlowSummarizer;
+    /// A summarizer that signals when it is entered and then blocks, so a test
+    /// can cancel at a deterministic point INSIDE the memory write.
+    struct SlowSummarizer {
+        entered: Arc<tokio::sync::Notify>,
+    }
 
     #[async_trait]
     impl Summarizer for SlowSummarizer {
@@ -1271,10 +1281,15 @@ pub(crate) mod tests {
             _prior: Option<&str>,
             _messages: &[Msg],
         ) -> std::result::Result<String, String> {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            self.entered.notify_one();
+            tokio::time::sleep(SLOW_SUMMARIZER_BLOCK).await;
             Ok("summary".to_owned())
         }
     }
+
+    /// Long enough that completing normally is clearly distinguishable from
+    /// being interrupted by the cancel.
+    const SLOW_SUMMARIZER_BLOCK: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[tokio::test]
     async fn cancel_during_the_memory_write_still_cancels_the_run() {
@@ -1292,6 +1307,7 @@ pub(crate) mod tests {
             keep_recent: 0,
             max_summary_chars: 500,
         };
+        let entered = Arc::new(tokio::sync::Notify::new());
         let manager = RunManager::with_memory(
             store.clone(),
             Arc::new(ModelRouter::with_defaults(vec![(
@@ -1301,7 +1317,15 @@ pub(crate) mod tests {
             Arc::new(ToolRegistry::new()),
             sink,
             CancellationToken::new(),
-            Some(SessionMemory::new(kv, Arc::new(SlowSummarizer)).with_policy(policy)),
+            Some(
+                SessionMemory::new(
+                    kv,
+                    Arc::new(SlowSummarizer {
+                        entered: Arc::clone(&entered),
+                    }),
+                )
+                .with_policy(policy),
+            ),
         );
         seed_session(&store, "sess_cancel").await;
         let run = manager
@@ -1312,14 +1336,27 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-        // Let the model turn finish so we're inside the memory write, then cancel.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Deterministic: wait until the summarizer is actually entered, so the
+        // cancel provably lands INSIDE the memory write (not before the run
+        // started, and not after it finished).
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("summarizer should have been entered");
+        let started = std::time::Instant::now();
         let _ = manager.cancel_run(&run.id).await;
         let final_run = wait_terminal(&store, &run.id).await;
         assert_eq!(
             final_run.status,
             RunStatus::Cancelled,
             "cancel was ignored during the memory write"
+        );
+        // Latency is the real assertion: without the select! on the cancel token
+        // the run would sit until the summarizer returned, so finishing far
+        // sooner proves the write was actually interrupted.
+        assert!(
+            started.elapsed() < SLOW_SUMMARIZER_BLOCK / 2,
+            "cancel did not interrupt the memory write (took {:?})",
+            started.elapsed()
         );
     }
 
