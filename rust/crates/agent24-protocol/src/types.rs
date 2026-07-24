@@ -318,6 +318,18 @@ pub struct ScheduleUpdate {
     pub delivery: Option<Vec<DeliveryTarget>>,
 }
 
+impl ScheduleUpdate {
+    /// True when no field is set (openapi: ScheduleUpdate is `minProperties: 1`,
+    /// so an empty update is a 400, not a silent no-op).
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.enabled.is_none()
+            && self.spec.is_none()
+            && self.action.is_none()
+            && self.delivery.is_none()
+    }
+}
+
 // ── Tools ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -85,6 +85,13 @@ pub async fn update_schedule(State(state): State<AppState>, req: Request<Body>) 
             );
         }
     };
+    if update.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "update must set at least one field",
+        );
+    }
     match state.scheduler.update(&id, update, Utc::now()).await {
         Ok(schedule) => Json(schedule).into_response(),
         Err(err) => map_error(err),

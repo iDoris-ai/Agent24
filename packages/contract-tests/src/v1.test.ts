@@ -443,6 +443,19 @@ describe('v1 M-C schedules (live since C5, agent24d only)', () => {
     expect(res.status).toBe(404)
     expect((res.body as { error: { code: string } }).error.code).toBe('not_found')
   })
+
+  it('empty PATCH body → 400 (minProperties: 1)', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const created = await post('/api/v1/schedules', {
+      name: 'emptypatch',
+      spec: cronSpec,
+      action: agentAction,
+    })
+    const id = (created.body as { id: string }).id
+    const res = await patch(`/api/v1/schedules/${id}`, {})
+    expect(res.status).toBe(400)
+    expect((res.body as { error: { code: string } }).error.code).toBe('invalid_request')
+  })
 })
 
 describe('v1 M-C sessions (live since C2, agent24d only)', () => {

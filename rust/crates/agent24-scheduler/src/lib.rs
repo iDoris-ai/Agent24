@@ -200,7 +200,8 @@ impl Scheduler {
     /// Process every schedule due at `now`. Returns how many fired. Free of
     /// real time — the caller supplies `now`, so tests drive it directly.
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<usize, ScheduleError> {
-        let schedules = self.store.list_schedules().await?;
+        // Lenient list: a single corrupt row must not wedge every future tick
+        let schedules = self.store.list_schedules_lenient().await?;
         let mut fired = 0;
         for schedule in schedules {
             if !schedule.enabled {
@@ -227,6 +228,17 @@ impl Scheduler {
 
     /// Pre-advance THEN trigger. The advanced `next_run_at` is persisted first
     /// so a crash between here and the trigger cannot re-fire the same slot.
+    ///
+    /// Every persist in this path is an UPDATE-if-exists (never an upsert): a
+    /// schedule DELETEd concurrently mid-fire must not be resurrected by a
+    /// post-trigger write (review C5). If the pre-advance write finds the row
+    /// already gone, the fire is abandoned before the trigger runs.
+    ///
+    /// Event ordering note: `schedule.fired` is emitted the moment the run is
+    /// created (queued); the run's own `run.started` is emitted later from its
+    /// execution task and may interleave. Clients that need the causal link
+    /// read `schedule_id` off `RunStartedPayload` rather than relying on the
+    /// relative order of the two events on the broadcast bus.
     async fn fire(&self, mut schedule: Schedule, now: DateTime<Utc>) -> Result<(), ScheduleError> {
         // Skip-missed: next slot is computed from `now`, not the stale due time
         let advanced = match next_fire(&schedule.spec, now) {
@@ -240,21 +252,26 @@ impl Scheduler {
                 );
                 schedule.enabled = false;
                 schedule.next_run_at = None;
-                self.store.upsert_schedule(&schedule).await?;
+                self.store.update_schedule_if_exists(&schedule).await?;
                 self.emit_disabled(&schedule.id, "next_fire_error");
                 return Ok(());
             }
         };
         schedule.last_run_at = Some(fmt_iso(now));
         schedule.next_run_at = advanced;
-        self.store.upsert_schedule(&schedule).await?;
+        // Pre-advance: if the row is already gone (concurrent delete), stop —
+        // don't trigger a run for a schedule the user just removed.
+        if !self.store.update_schedule_if_exists(&schedule).await? {
+            tracing::debug!("schedule {} deleted before fire; skipping", schedule.id);
+            return Ok(());
+        }
 
         // Trigger the run (synchronous creation; the run executes in the bg)
         match self.trigger.trigger(&schedule.action, &schedule.id).await {
             Ok(run_id) => {
                 if schedule.consecutive_failures != 0 {
                     schedule.consecutive_failures = 0;
-                    self.store.upsert_schedule(&schedule).await?;
+                    self.store.update_schedule_if_exists(&schedule).await?;
                 }
                 self.emit.as_ref()(EventBody::ScheduleFired(ScheduleFiredPayload {
                     schedule_id: schedule.id.clone(),
@@ -267,10 +284,10 @@ impl Scheduler {
                 if health == agent24_core::ScheduleHealth::MustDisable {
                     schedule.enabled = false;
                     schedule.next_run_at = None;
-                    self.store.upsert_schedule(&schedule).await?;
+                    self.store.update_schedule_if_exists(&schedule).await?;
                     self.emit_disabled(&schedule.id, "consecutive_failures");
                 } else {
-                    self.store.upsert_schedule(&schedule).await?;
+                    self.store.update_schedule_if_exists(&schedule).await?;
                 }
             }
         }
@@ -608,6 +625,71 @@ mod tests {
         let after = store.get_schedule(&created.id).await.unwrap().unwrap();
         assert_eq!(after.next_run_at, created.next_run_at);
         assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_delete_during_fire_is_not_resurrected() {
+        // A trigger that deletes its own schedule then fails: the post-trigger
+        // failure write must be an UPDATE-if-exists, never a resurrecting
+        // upsert (review C5).
+        struct DeletingTrigger {
+            store: Store,
+        }
+        #[async_trait]
+        impl RunTrigger for DeletingTrigger {
+            async fn trigger(
+                &self,
+                _action: &ScheduleAction,
+                schedule_id: &str,
+            ) -> Result<String, String> {
+                self.store.delete_schedule(schedule_id).await.unwrap();
+                Err("boom after delete".to_owned())
+            }
+        }
+        let store = Store::open_memory().await.unwrap();
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(|_| {});
+        let sched = Scheduler::new(
+            store.clone(),
+            Arc::new(DeletingTrigger {
+                store: store.clone(),
+            }),
+            emit,
+        );
+        let created = sched
+            .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        // due → fire → trigger deletes the row → failure write must not re-add
+        sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap();
+        assert!(
+            store.get_schedule(&created.id).await.unwrap().is_none(),
+            "deleted schedule was resurrected"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_survives_a_corrupt_schedule_row() {
+        // A row with unreadable JSON must be skipped, not abort the tick so
+        // that healthy schedules still fire (review C5).
+        let trig = RecordingTrigger::new();
+        let (sched, _ev, store) = scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+        let good = sched
+            .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        // Inject a corrupt row directly (invalid spec JSON)
+        agent24_store::test_hooks::insert_raw_schedule(
+            &store,
+            "sch_corrupt",
+            "not-json",
+            "2026-07-24T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        // Healthy schedule still fires despite the corrupt neighbour
+        assert_eq!(sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap(), 1);
+        assert_eq!(trig.count(), 1);
+        assert!(store.get_schedule(&good.id).await.unwrap().is_some());
     }
 
     #[tokio::test]

@@ -485,6 +485,50 @@ impl Store {
         Ok(())
     }
 
+    /// Persist an EXISTING schedule (never inserts). Returns false when the
+    /// row is gone — used by the scheduler's fire path so a schedule deleted
+    /// mid-tick cannot be resurrected by a post-trigger write (review C5).
+    pub async fn update_schedule_if_exists(&self, schedule: &Schedule) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE schedules SET
+                 name = ?, enabled = ?, spec = ?, action = ?, delivery = ?,
+                 last_run_at = ?, next_run_at = ?, consecutive_failures = ?
+             WHERE id = ?",
+        )
+        .bind(&schedule.name)
+        .bind(schedule.enabled)
+        .bind(serde_json::to_string(&schedule.spec)?)
+        .bind(serde_json::to_string(&schedule.action)?)
+        .bind(serde_json::to_string(&schedule.delivery)?)
+        .bind(&schedule.last_run_at)
+        .bind(&schedule.next_run_at)
+        .bind(schedule.consecutive_failures)
+        .bind(&schedule.id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// List schedules, skipping (and logging) any row whose JSON columns no
+    /// longer deserialize — one corrupt row must never wedge the whole tick
+    /// (review C5). Use [`list_schedules`] where a hard error is preferable.
+    pub async fn list_schedules_lenient(&self) -> Result<Vec<Schedule>> {
+        let rows = sqlx::query("SELECT * FROM schedules ORDER BY name ASC")
+            .fetch_all(self.pool())
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match Self::row_to_schedule(row) {
+                Ok(schedule) => out.push(schedule),
+                Err(err) => {
+                    let id: String = row.get("id");
+                    tracing::error!("skipping unreadable schedule {id}: {err}");
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn row_to_schedule(r: &SqliteRow) -> Result<Schedule> {
         Ok(Schedule {
             id: r.get("id"),

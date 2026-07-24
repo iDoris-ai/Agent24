@@ -31,15 +31,18 @@ pub fn fmt_iso(dt: DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// The `cron` crate wants a seconds field first (6-7 fields). Accept the POSIX
-/// 5-field form by prepending `0` seconds; pass 6/7-field through unchanged.
+/// Normalize to the `cron` crate's seconds-first form. Accept only the two
+/// documented shapes (SPEC-002 §1.5): 5-field POSIX (min hour dom month dow —
+/// seconds default to 0) and 6-field with an explicit leading seconds field.
+/// 7-field (with a trailing year) is rejected so the wire contract stays
+/// unambiguous.
 fn normalize_cron(expr: &str) -> Result<String, SpecError> {
     let fields = expr.split_whitespace().count();
     match fields {
         5 => Ok(format!("0 {expr}")),
-        6 | 7 => Ok(expr.to_owned()),
+        6 => Ok(expr.to_owned()),
         n => Err(SpecError::Invalid(format!(
-            "cron expression must have 5-7 fields, got {n}"
+            "cron expression must have 5 or 6 fields (6th is a leading seconds field), got {n}"
         ))),
     }
 }
@@ -225,6 +228,18 @@ mod tests {
         // at/after: never again
         assert_eq!(next_fire(&spec, utc("2026-07-24T12:00:00Z")).unwrap(), None);
         assert_eq!(next_fire(&spec, utc("2026-07-24T13:00:00Z")).unwrap(), None);
+    }
+
+    #[test]
+    fn seven_field_cron_is_rejected() {
+        // 7-field (trailing year) is outside the documented 5/6-field contract
+        assert!(
+            validate(&ScheduleSpec::Cron {
+                expr: "0 0 8 * * * 2026".to_owned(),
+                tz: None
+            })
+            .is_err()
+        );
     }
 
     #[test]
