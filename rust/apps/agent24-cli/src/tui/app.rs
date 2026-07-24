@@ -718,6 +718,19 @@ mod tests {
     }
 
     #[test]
+    fn tab_toggles_focus_between_runs_and_approvals() {
+        let mut app = App::new();
+        assert_eq!(app.focus(), Focus::Runs);
+        assert_eq!(app.on_key(Key::Tab), Action::None);
+        assert_eq!(app.focus(), Focus::Approvals);
+        // Enter on the (empty) approvals panel is a no-op, not a crash
+        assert_eq!(app.on_key(Key::Enter), Action::None);
+        assert!(app.modal().is_none());
+        assert_eq!(app.on_key(Key::Tab), Action::None);
+        assert_eq!(app.focus(), Focus::Runs);
+    }
+
+    #[test]
     fn quit_key_sets_should_quit() {
         let mut app = App::new();
         assert_eq!(app.on_key(Key::Quit), Action::Quit);
