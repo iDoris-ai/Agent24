@@ -108,14 +108,31 @@ pub struct ModelRouter {
     max_cooldown: Duration,
 }
 
+/// Absolute ceiling on any cooldown, independent of the caller's `max_cooldown`
+/// — keeps `now + backoff` far from `Instant`'s representable boundary so it
+/// can never overflow (review D2).
+const COOLDOWN_HARD_CAP: Duration = Duration::from_secs(24 * 3600);
+
 impl ModelRouter {
     /// Build from `(provider, tier)` pairs. Cooldown grows exponentially from
     /// `base_cooldown`, capped at `max_cooldown`.
+    ///
+    /// PRIVACY CONTRACT: the [`Tier`] label states WHERE a provider runs and is
+    /// the sole basis of the LocalOnly guarantee. `Tier::Local` / `Tier::Lora`
+    /// MUST be on-device endpoints — the router cannot introspect a provider's
+    /// URL, so mislabeling a remote endpoint as local would route sensitive
+    /// (LocalOnly) traffic to it. [`from_env`](Self::from_env) labels correctly;
+    /// any hand-built router must uphold this.
     pub fn new(
         providers: Vec<(Arc<dyn ModelProvider>, Tier)>,
         base_cooldown: Duration,
         max_cooldown: Duration,
     ) -> Self {
+        // Clamp so exponential backoff can never approach the Instant boundary.
+        let max_cooldown = max_cooldown.min(COOLDOWN_HARD_CAP);
+        let base_cooldown = base_cooldown
+            .min(max_cooldown)
+            .max(Duration::from_millis(1));
         Self {
             providers: providers
                 .into_iter()
@@ -193,7 +210,9 @@ impl ModelRouter {
             .base_cooldown
             .saturating_mul(1u32 << shift)
             .min(self.max_cooldown);
-        entry.cooldown_until = Some(now + backoff);
+        // checked_add is belt-and-suspenders — max_cooldown is clamped to
+        // COOLDOWN_HARD_CAP so this cannot realistically overflow.
+        entry.cooldown_until = now.checked_add(backoff);
     }
 
     fn record_success(&self, name: &str) {
@@ -223,7 +242,9 @@ impl ModelRouter {
                 Privacy::Any => "no provider available".to_owned(),
             }));
         }
-        let mut last = ModelError::Unavailable("all routed providers unavailable".to_owned());
+        // Accumulate per-provider reasons so an all-unavailable error names
+        // which providers were tried and why (review D2 minor).
+        let mut tried: Vec<String> = Vec::new();
         for idx in route {
             let r = &self.providers[idx];
             match r.provider.complete(req, cancel).await {
@@ -234,14 +255,17 @@ impl ModelRouter {
                 Err(ModelError::Unavailable(msg)) => {
                     tracing::debug!("provider {} unavailable: {msg}", r.provider.name());
                     self.record_failure(r.provider.name(), Instant::now());
-                    last = ModelError::Unavailable(msg);
+                    tried.push(format!("{}: {msg}", r.provider.name()));
                 }
                 // A reachable-but-failed call or a cancellation is terminal —
                 // never retried on another provider (mirrors ProviderRegistry).
                 Err(other) => return Err(other),
             }
         }
-        Err(last)
+        Err(ModelError::Unavailable(format!(
+            "all routed providers unavailable [{}]",
+            tried.join(", ")
+        )))
     }
 
     /// Union of models from reachable providers (unreachable ones skipped).
@@ -546,6 +570,65 @@ mod tests {
         // still cooling at 59s, available again by 61s (capped at 60s, not huge)
         assert_eq!(r.route(profile, t0 + Duration::from_secs(59)).len(), 0);
         assert_eq!(r.route(profile, t0 + Duration::from_secs(61)).len(), 1);
+    }
+
+    #[test]
+    fn tier_parse_defaults_unknown_to_remote() {
+        assert_eq!(Tier::parse("local"), Tier::Local);
+        assert_eq!(Tier::parse("lora"), Tier::Lora);
+        assert_eq!(Tier::parse("remote"), Tier::Remote);
+        assert_eq!(Tier::parse("anything-else"), Tier::Remote); // conservative
+        assert!(Tier::Local.is_local() && Tier::Lora.is_local());
+        assert!(!Tier::Remote.is_local());
+    }
+
+    #[tokio::test]
+    async fn cancelled_is_terminal_and_does_not_fall_through() {
+        struct CancelledProvider;
+        #[async_trait]
+        impl ModelProvider for CancelledProvider {
+            fn name(&self) -> &str {
+                "cancelled"
+            }
+            async fn complete(
+                &self,
+                _req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                Err(ModelError::Cancelled)
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<crate::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let fallback = StubProvider::ok("remote");
+        let r = router(vec![
+            (Arc::new(CancelledProvider), Tier::Local),
+            (fallback.clone(), Tier::Remote),
+        ]);
+        let err = r
+            .complete(TaskProfile::default(), &req(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ModelError::Cancelled), "{err}");
+        assert_eq!(fallback.calls(), 0, "cancellation must not fall through");
+    }
+
+    #[tokio::test]
+    async fn all_unavailable_error_names_the_tried_providers() {
+        let a = StubProvider::down("local");
+        let b = StubProvider::down("remote");
+        let r = router(vec![(a, Tier::Local), (b, Tier::Remote)]);
+        let err = r
+            .complete(TaskProfile::default(), &req(), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("local: local down"), "{msg}");
+        assert!(msg.contains("remote: remote down"), "{msg}");
     }
 
     #[tokio::test]
