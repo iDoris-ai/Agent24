@@ -13,6 +13,7 @@ use agent24_protocol::{ChatMessage, ChatRequest, ChatResponse, Health};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod service;
 mod tui;
 
 #[derive(Parser)]
@@ -38,6 +39,11 @@ enum Command {
     },
     /// List models known to the daemon
     Models,
+    /// Install/remove 24/7 unattended operation (macOS LaunchAgent)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Manage the daemon process
     Daemon {
         #[command(subcommand)]
@@ -55,6 +61,16 @@ enum DaemonAction {
     Status,
     /// Stop the running daemon
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the LaunchAgent so the daemon starts at login and self-heals
+    Install,
+    /// Stop and remove the LaunchAgent
+    Uninstall,
+    /// Show whether 24/7 operation is installed and loaded
+    Status,
 }
 
 struct Endpoint {
@@ -366,6 +382,50 @@ async fn cmd_tui() -> Result<(), String> {
     result
 }
 
+fn cmd_service(action: ServiceAction) -> Result<(), String> {
+    match action {
+        ServiceAction::Install => {
+            let exec = std::path::PathBuf::from(agent24d_binary());
+            // Resolve to an absolute path: launchd has no working directory of
+            // ours, so a relative or PATH-only name would never start.
+            let exec = exec.canonicalize().map_err(|e| {
+                format!(
+                    "resolving {}: {e} — set AGENT24D_BIN to the built binary",
+                    exec.display()
+                )
+            })?;
+            let plist = service::install(&exec)?;
+            println!("24/7 enabled.");
+            println!("  agent:  {}", plist.display());
+            println!("  daemon: {}", exec.display());
+            if let Some(logs) = service::log_dir() {
+                println!("  logs:   {}", logs.display());
+            }
+            println!("It now starts at login and restarts if it crashes.");
+            println!("A clean `agent24 daemon stop` is respected (not resurrected).");
+            Ok(())
+        }
+        ServiceAction::Uninstall => {
+            service::uninstall()?;
+            println!("24/7 disabled; the LaunchAgent is stopped and removed.");
+            Ok(())
+        }
+        ServiceAction::Status => {
+            let (installed, plist, loaded) = service::status();
+            println!("installed: {}", if installed { "yes" } else { "no" });
+            println!("loaded:    {}", if loaded { "yes" } else { "no" });
+            if let Some(p) = plist {
+                println!("plist:     {}", p.display());
+            }
+            match state_file::read_live() {
+                Some(st) => println!("daemon:    running (pid {}, port {})", st.pid, st.port),
+                None => println!("daemon:    not running"),
+            }
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
@@ -373,6 +433,7 @@ async fn main() -> std::process::ExitCode {
         Command::Chat { message, model } => cmd_chat(message, model).await,
         Command::Models => cmd_models().await,
         Command::Daemon { action } => cmd_daemon(action).await,
+        Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
     };
     match result {

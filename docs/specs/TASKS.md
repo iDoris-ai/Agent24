@@ -154,6 +154,20 @@
 | D5b | 会话记忆（D1 生效）：CanonicalSession 接入 run 生命周期——按 session 载入既往上下文、完成后回写并按阈值压缩 | D5a, D1 | done |
 | D5c | HttpMlWorker 挂载 + 消费端（D4a 生效） | D5a, D4a | **deferred（等需要时再做）** |
 
+## M-F 24/7 化 + 渠道
+
+| ID | 任务 | 依赖 | 状态 |
+|---|---|---|---|
+| F1 | 24/7 无人值守：`agent24 service install/uninstall/status` —— macOS LaunchAgent（开机自启 + 崩溃自愈 + 退避节流 + 日志），干净停止不被复活 | M-D | in-pr |
+| F2 | 托盘常驻（菜单栏状态/启停）| F1 | pending |
+| F3 | 渠道接入：微信（iDoris-SDK）/ Nostr（agent-speaker）| F1 | pending（语音相关，用户暂缓）|
+
+### F1 设计取舍
+**不自造进程守护** —— launchd 已提供全部所需且更可靠：`RunAtLoad`（开机自启）、
+`KeepAlive{SuccessfulExit:false}`（**只在崩溃时重启，尊重干净停止**——朴素的"总是重启"守护会做错这点）、
+`ThrottleInterval`（崩溃循环退避）、`StandardOut/ErrorPath`（崩溃输出留证）。
+自造的守护自己也会挂；launchd 由系统拉起，不会。
+
 ### M-D 收尾说明（2026-07-24）
 
 **M-D 的目标已达成**：ADR-026 对 M-D 的定义是「Memory **L0-L1**、上下文压缩；三层路由落地」——
