@@ -36,6 +36,10 @@ pub const MAX_ITERATIONS: usize = 10;
 /// the model; full input is audit-only in the store row).
 const SUMMARY_MAX_BYTES: usize = 500;
 
+/// Tool calls executed per assistant turn; the rest are answered with a
+/// "skipped" tool result so the wire protocol stays balanced.
+pub const MAX_TOOL_CALLS_PER_TURN: usize = 16;
+
 /// Where lifecycle events go (the daemon adapts this onto its WS hub).
 pub trait EventSink: Send + Sync + 'static {
     fn emit(&self, body: EventBody);
@@ -306,13 +310,25 @@ impl RunManager {
                 return;
             }
 
-            // Tool round trip: echo the assistant turn, then answer every call
+            // Tool round trip: echo the assistant turn, then answer every call.
+            // Every call gets a tool message (protocol requirement) but only
+            // the first MAX_TOOL_CALLS_PER_TURN execute — a runaway fanout is
+            // answered, not obeyed.
             let calls = res.message.tool_calls.clone();
             messages.push(res.message);
-            for call in &calls {
+            for (idx, call) in calls.iter().enumerate() {
                 if cancel.is_cancelled() {
                     self.finish_cancelled(&run_id).await;
                     return;
+                }
+                if idx >= MAX_TOOL_CALLS_PER_TURN {
+                    messages.push(Msg::tool_result(
+                        call.id.clone(),
+                        format!(
+                            "skipped: per-turn tool call limit ({MAX_TOOL_CALLS_PER_TURN}) exceeded"
+                        ),
+                    ));
+                    continue;
                 }
                 match self.run_tool_call(&run_id, call, &cancel).await {
                     Ok(content) => messages.push(Msg::tool_result(call.id.clone(), content)),
@@ -429,24 +445,28 @@ impl RunManager {
             }
         };
 
-        if let Err(err) = self
+        // The store is authoritative: no terminal event unless the terminal
+        // state actually persisted — a completed event over a row still
+        // `running` would break WS/REST reconciliation (review C3)
+        match self
             .store
             .finish_tool_call(&tc.id, status, Some(summary.clone()), now_iso8601())
             .await
         {
-            tracing::error!("tool call finish persist failed: {err}");
+            Ok(()) => self
+                .sink
+                .emit(EventBody::ToolCompleted(ToolCompletedPayload {
+                    run_id: run_id.to_owned(),
+                    tool_call_id: tc.id.clone(),
+                    status: match status {
+                        ToolCallStatus::Completed => ToolCompletedStatus::Completed,
+                        ToolCallStatus::Denied => ToolCompletedStatus::Denied,
+                        _ => ToolCompletedStatus::Failed,
+                    },
+                    output_summary: Some(summary),
+                })),
+            Err(err) => tracing::error!("tool call finish persist failed: {err}"),
         }
-        self.sink
-            .emit(EventBody::ToolCompleted(ToolCompletedPayload {
-                run_id: run_id.to_owned(),
-                tool_call_id: tc.id.clone(),
-                status: match status {
-                    ToolCallStatus::Completed => ToolCompletedStatus::Completed,
-                    ToolCallStatus::Denied => ToolCompletedStatus::Denied,
-                    _ => ToolCompletedStatus::Failed,
-                },
-                output_summary: Some(summary),
-            }));
 
         if cancelled { Err(()) } else { Ok(content) }
     }

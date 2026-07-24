@@ -37,23 +37,52 @@ impl HttpFetchTool {
 }
 
 fn ipv4_is_public(ip: Ipv4Addr) -> bool {
-    let shared_cgnat = {
-        let o = ip.octets();
-        o[0] == 100 && (o[1] & 0b1100_0000) == 64 // 100.64.0.0/10
-    };
-    !(ip.is_loopback()
+    let o = ip.octets();
+    !(o[0] == 0 // 0.0.0.0/8 "this network"
+        || ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local() // includes 169.254.169.254 metadata
-        || ip.is_unspecified()
+        || (o[0] == 100 && (o[1] & 0b1100_0000) == 64) // 100.64.0.0/10 CGNAT
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF special
+        || (o[0] == 198 && (o[1] & 0b1111_1110) == 18) // 198.18.0.0/15 benchmarking
+        || ip.is_documentation()
         || ip.is_broadcast()
         || ip.is_multicast()
-        || ip.is_documentation()
-        || shared_cgnat)
+        || o[0] >= 240) // 240.0.0.0/4 reserved (broadcast already above)
 }
 
+/// IPv6 must decode every embedded-IPv4 transition scheme and re-check the
+/// inner address — otherwise e.g. NAT64 `64:ff9b::a9fe:a9fe` reaches the
+/// 169.254.169.254 metadata service while looking like a "public" v6 address.
 fn ipv6_is_public(ip: Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    // v4-mapped ::ffff:a.b.c.d
     if let Some(v4) = ip.to_ipv4_mapped() {
         return ipv4_is_public(v4);
+    }
+    // v4-compatible ::a.b.c.d (deprecated) — everything else in ::/96 is
+    // covered by the unspecified/loopback checks below
+    if seg[..5] == [0, 0, 0, 0, 0] && seg[5] == 0 && (seg[6] != 0 || seg[7] > 1) {
+        return ipv4_is_public(Ipv4Addr::from(((seg[6] as u32) << 16) | seg[7] as u32));
+    }
+    // NAT64 well-known 64:ff9b::/96 + local-use 64:ff9b:1::/48
+    if seg[0] == 0x64 && seg[1] == 0xff9b && (seg[2..6] == [0, 0, 0, 0] || seg[2] == 1) {
+        return ipv4_is_public(Ipv4Addr::from(((seg[6] as u32) << 16) | seg[7] as u32));
+    }
+    // 6to4 2002:AABB:CCDD::/48 embeds v4 in segments 1-2
+    if seg[0] == 0x2002 {
+        return ipv4_is_public(Ipv4Addr::from(((seg[1] as u32) << 16) | seg[2] as u32));
+    }
+    // Teredo 2001:0::/32 embeds the server v4 in segs 2-3 and the client v4
+    // XOR ffff in segs 6-7 — both must be public
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        let server = Ipv4Addr::from(((seg[2] as u32) << 16) | seg[3] as u32);
+        let client = Ipv4Addr::from((((seg[6] ^ 0xffff) as u32) << 16) | (seg[7] ^ 0xffff) as u32);
+        return ipv4_is_public(server) && ipv4_is_public(client);
+    }
+    // 2001:db8::/32 documentation
+    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+        return false;
     }
     !(ip.is_loopback()
         || ip.is_unspecified()
@@ -208,8 +237,13 @@ impl Tool for HttpFetchTool {
                 () = cancel.cancelled() => return Err(ToolError::Cancelled),
             };
             let Some(chunk) = chunk else { break };
-            let room = MAX_BODY_BYTES - body.len();
-            if chunk.len() >= room {
+            if chunk.is_empty() {
+                continue;
+            }
+            // truncated only when bytes were actually dropped — an exact-fit
+            // final chunk is not a truncation
+            if body.len() + chunk.len() > MAX_BODY_BYTES {
+                let room = MAX_BODY_BYTES - body.len();
                 body.extend_from_slice(&chunk[..room]);
                 truncated = true;
                 break;
@@ -260,7 +294,16 @@ mod tests {
             "::1",
             "fe80::1",
             "fc00::1",
-            "::ffff:127.0.0.1", // v4-mapped loopback
+            "::ffff:127.0.0.1",           // v4-mapped loopback
+            "64:ff9b::a9fe:a9fe",         // NAT64 → 169.254.169.254 metadata
+            "64:ff9b:1::a00:1",           // NAT64 local-use → 10.0.0.1
+            "2002:7f00:1::1",             // 6to4 → 127.0.0.1
+            "2001:0:100:0:0:0:5601:5601", // Teredo client XOR ffff → 169.254.169.254
+            "2001:db8::1",                // documentation
+            "0.1.2.3",                    // 0.0.0.0/8
+            "198.18.0.1",                 // benchmarking
+            "240.0.0.1",                  // reserved
+            "192.0.0.8",                  // IETF special
         ] {
             let ip: IpAddr = bad.parse().unwrap();
             assert!(!ip_is_public(ip), "{bad} must be non-public");

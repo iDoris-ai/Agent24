@@ -284,6 +284,35 @@ struct OaModelsResponse {
     data: Vec<OaModelEntry>,
 }
 
+/// Response-body budgets — a misbehaving provider must not be able to
+/// allocate unbounded memory in the daemon.
+const MAX_CHAT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MODELS_RESPONSE_BYTES: usize = 1024 * 1024;
+
+async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    cap: usize,
+    cancel: &CancellationToken,
+    name: &str,
+) -> Result<T, ModelError> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            c = response.chunk() => c.map_err(|e| classify(&e))?,
+            () = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
+        let Some(chunk) = chunk else { break };
+        if body.len() + chunk.len() > cap {
+            return Err(ModelError::Provider(format!(
+                "{name} response exceeds {cap} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|e| ModelError::Provider(format!("{name} returned invalid JSON: {e}")))
+}
+
 fn classify(err: &reqwest::Error) -> ModelError {
     if err.is_connect() || err.is_timeout() {
         ModelError::Unavailable(err.to_string())
@@ -345,10 +374,8 @@ impl ModelProvider for OpenAiCompatProvider {
                 response.status()
             )));
         }
-        let parsed: OaChatResponse = tokio::select! {
-            r = response.json() => r.map_err(|e| classify(&e))?,
-            () = cancel.cancelled() => return Err(ModelError::Cancelled),
-        };
+        let parsed: OaChatResponse =
+            read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, &self.name).await?;
         let choice =
             parsed.choices.into_iter().next().ok_or_else(|| {
                 ModelError::Provider(format!("{} returned no choices", self.name))
@@ -389,10 +416,8 @@ impl ModelProvider for OpenAiCompatProvider {
                 response.status()
             )));
         }
-        let parsed: OaModelsResponse = tokio::select! {
-            r = response.json() => r.map_err(|e| classify(&e))?,
-            () = cancel.cancelled() => return Err(ModelError::Cancelled),
-        };
+        let parsed: OaModelsResponse =
+            read_json_capped(response, MAX_MODELS_RESPONSE_BYTES, cancel, &self.name).await?;
         Ok(parsed
             .data
             .into_iter()

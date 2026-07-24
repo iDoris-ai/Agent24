@@ -56,6 +56,12 @@ fn checked_read_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, ToolError>
 /// Resolve `path` for writing: canonicalize the parent (must exist), then
 /// re-attach the final component. An existing symlink target is rejected —
 /// writing through it could escape the whitelist.
+///
+/// KNOWN LIMIT (C4 gate): the canonicalized parent directory can itself be
+/// swapped for a symlink between this check and the open. The final component
+/// is protected by O_NOFOLLOW at open time, the parent is not. `fs_write` is
+/// auto-denied by the C3 approval stub; this race MUST be closed (dirfd +
+/// openat-style traversal) before C4 lets approvals enable it.
 fn checked_write_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, ToolError> {
     let path = Path::new(raw);
     let name = path
@@ -126,13 +132,37 @@ impl Tool for FsReadTool {
         let raw =
             str_arg(input, "path").ok_or_else(|| ToolError::Invalid("path is required".into()))?;
         let path = checked_read_path(raw, &self.roots)?;
-        if !path.is_file() {
-            return Err(ToolError::Invalid(format!("{raw} is not a regular file")));
-        }
-        let bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|e| ToolError::Failed(format!("read {raw}: {e}")))?;
-        Ok(truncate(&String::from_utf8_lossy(&bytes), MAX_READ_BYTES))
+        // Post-check open is O_NOFOLLOW and everything (type check, bounded
+        // read) happens on the fd — swapping the checked path for a symlink
+        // afterwards makes the open fail instead of following it. (A parent-
+        // directory swap race remains; see the C4 note on checked_write_path.)
+        let raw_owned = raw.to_owned();
+        let out = tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
+            use std::io::Read as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|e| ToolError::Failed(format!("open {raw_owned}: {e}")))?;
+            let meta = file
+                .metadata()
+                .map_err(|e| ToolError::Failed(format!("stat {raw_owned}: {e}")))?;
+            if !meta.is_file() {
+                return Err(ToolError::Invalid(format!(
+                    "{raw_owned} is not a regular file"
+                )));
+            }
+            // Never more than the cap + 1 sentinel byte in memory
+            let mut bytes = Vec::new();
+            file.take(MAX_READ_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| ToolError::Failed(format!("read {raw_owned}: {e}")))?;
+            Ok(truncate(&String::from_utf8_lossy(&bytes), MAX_READ_BYTES))
+        })
+        .await
+        .map_err(|e| ToolError::Failed(format!("read task: {e}")))??;
+        Ok(out)
     }
 }
 
@@ -291,19 +321,77 @@ impl Tool for ShellExecTool {
         cmd.args(args)
             .current_dir(&self.workdir)
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             // kill_on_drop: a timeout or cancellation drops the child future —
             // the process must die with it, never linger
             .kill_on_drop(true);
-        let fut = cmd.output();
-        let output = tokio::select! {
-            r = fut => r.map_err(|e| ToolError::Failed(format!("spawn {program}: {e}")))?,
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolError::Failed(format!("spawn {program}: {e}")))?;
+
+        // Stream both pipes with a hard cap: keep the first 16 KiB, then keep
+        // DRAINING (discarding) so the child never blocks on a full pipe —
+        // but never buffer more than the cap in memory.
+        async fn capped_drain(
+            mut src: impl tokio::io::AsyncRead + Unpin,
+        ) -> std::io::Result<(Vec<u8>, bool)> {
+            use tokio::io::AsyncReadExt as _;
+            let mut kept = Vec::new();
+            let mut dropped = false;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = src.read(&mut buf).await?;
+                if n == 0 {
+                    return Ok((kept, dropped));
+                }
+                let room = MAX_STREAM_BYTES.saturating_sub(kept.len());
+                let take = n.min(room);
+                kept.extend_from_slice(&buf[..take]);
+                if take < n {
+                    dropped = true;
+                }
+            }
+        }
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let io = async {
+            // Both pipes drained CONCURRENTLY — sequential draining deadlocks
+            // when the child fills the un-drained pipe while the other stays open
+            let out_fut = async {
+                match stdout {
+                    Some(s) => capped_drain(s).await.unwrap_or((Vec::new(), false)),
+                    None => (Vec::new(), false),
+                }
+            };
+            let err_fut = async {
+                match stderr {
+                    Some(s) => capped_drain(s).await.unwrap_or((Vec::new(), false)),
+                    None => (Vec::new(), false),
+                }
+            };
+            let (out, err) = tokio::join!(out_fut, err_fut);
+            let status = child.wait().await;
+            (out, err, status)
+        };
+        let ((stdout, out_dropped), (stderr, err_dropped), status) = tokio::select! {
+            r = io => r,
             () = cancel.cancelled() => return Err(ToolError::Cancelled),
         };
+        let status = status.map_err(|e| ToolError::Failed(format!("wait {program}: {e}")))?;
 
+        let render = |bytes: &[u8], dropped: bool| {
+            let s = String::from_utf8_lossy(bytes).into_owned();
+            if dropped {
+                format!("{s}… [output capped at {MAX_STREAM_BYTES} bytes]")
+            } else {
+                s
+            }
+        };
         let out = serde_json::json!({
-            "exit_code": output.status.code(),
-            "stdout": truncate(&String::from_utf8_lossy(&output.stdout), MAX_STREAM_BYTES),
-            "stderr": truncate(&String::from_utf8_lossy(&output.stderr), MAX_STREAM_BYTES),
+            "exit_code": status.code(),
+            "stdout": render(&stdout, out_dropped),
+            "stderr": render(&stderr, err_dropped),
         });
         Ok(out.to_string())
     }
