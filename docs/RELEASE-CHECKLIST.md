@@ -19,6 +19,12 @@ this top-to-bottom; every box must be checked before publishing.
 
 ## 2. Build the installer (macOS dmg)
 
+> Prerequisite: electron-builder downloads the Electron runtime
+> (`electron-v<ver>-darwin-arm64.zip`) on first package. Run this on a machine
+> with network access (or a warm `~/Library/Caches/electron`); do NOT set
+> `ELECTRON_SKIP_BINARY_DOWNLOAD=1` for the packaging step. Unsigned local
+> build: `export CSC_IDENTITY_AUTO_DISCOVERY=false`.
+
 - [ ] `pnpm --filter @agent24/desktop build:mac`
       (builds the release `agent24d` + `agent24` binaries, the node daemon,
       the renderer, then packages the dmg into `apps/desktop/release/`).
