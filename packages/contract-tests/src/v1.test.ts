@@ -309,16 +309,43 @@ describe('v1 M-C runs (live since C2, agent24d only)', () => {
   it.todo('streaming run cancel emits run.cancelled within 1s (needs live LLM — covered by agent24-agent unit test with a hanging provider)')
 })
 
-describe('v1 M-C approvals (activate in C4)', () => {
-  it.todo('approval-required tool emits approval.required (request class) with available_decisions')
-  it.todo('GET /api/v1/approvals?status=pending lists the pending approval')
-  it.todo('POST /api/v1/approvals/{id} {type:approve} → 200, run resumes')
-  it.todo('POST /api/v1/approvals/{id} {type:deny, reason} → 200, model receives reason, run continues')
-  it.todo('POST /api/v1/approvals/{id} {type:abort} → run cancelled')
-  it.todo('decision type not in available_decisions → 400 invalid_request')
-  it.todo('second decision on same approval → 409 approval_already_resolved')
-  it.todo('expired approval resolves to timed_out (fail-closed) and emits approval.resolved')
-  it.todo('daemon restart marks lingering pending approvals aborted (fail-closed)')
+describe('v1 M-C approvals (endpoints live since C4, agent24d only)', () => {
+  // The full interactive flows (approve→resumes / deny→reason / abort→run
+  // cancelled / timeout→timed_out / restart→aborted sweep) need a tool-calling
+  // LLM run and are covered by agent24-agent + agent24-policy integration
+  // tests in Rust; the contract layer verifies the REST surface.
+
+  it('GET /api/v1/approvals → 200 {approvals:[...]}; ?status filter validated', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await get('/api/v1/approvals')
+    expect(res.status).toBe(200)
+    expect(Array.isArray((res.body as { approvals: unknown[] }).approvals)).toBe(true)
+
+    const filtered = await get('/api/v1/approvals?status=pending')
+    expect(filtered.status).toBe(200)
+
+    const bad = await get('/api/v1/approvals?status=nonsense')
+    expect(bad.status).toBe(400)
+    expect((bad.body as { error: { code: string } }).error.code).toBe('invalid_request')
+  })
+
+  it('POST /api/v1/approvals/{unknown} → 404 envelope; malformed body → 400', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const missing = await post('/api/v1/approvals/apr_nope', { type: 'approve' })
+    expect(missing.status).toBe(404)
+    expect((missing.body as { error: { code: string } }).error.code).toBe('not_found')
+
+    const malformed = await post('/api/v1/approvals/apr_nope', 'not-a-decision')
+    expect(malformed.status).toBe(400)
+  })
+
+  it('GET /api/v1/approvals/{unknown} → 404 envelope', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await get('/api/v1/approvals/apr_nope')
+    expect(res.status).toBe(404)
+  })
+
+  it.todo('live approve/deny/abort/timeout flows via a tool-calling run (needs LLM; Rust-tested)')
 })
 
 describe('v1 M-C schedules (activate in C5)', () => {

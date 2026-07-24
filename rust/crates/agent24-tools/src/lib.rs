@@ -24,10 +24,14 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-/// Per-call execution context (grows in C4+: session, approval channel).
+/// Per-call execution context.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub run_id: String,
+    /// The session the run belongs to (scopes approve_for_session grants)
+    pub session_id: Option<String>,
+    /// The persisted tool-call row this execution belongs to
+    pub tool_call_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +49,49 @@ pub enum ToolError {
     Timeout(Duration),
     #[error("cancelled")]
     Cancelled,
+    /// The approval gate decided the whole run must stop (user chose abort)
+    #[error("run aborted: {0}")]
+    AbortRun(String),
+}
+
+/// What the approval gate says about one requires-approval dispatch.
+pub enum GateDecision {
+    Allow,
+    Deny(String),
+    /// Deny this call AND cancel the whole run
+    AbortRun(String),
+}
+
+/// The policy hook consulted for every `requires_approval` tool. C3 ships the
+/// fail-closed [`DenyAllGate`]; C4 installs an interactive broker-backed gate.
+#[async_trait]
+pub trait ApprovalGate: Send + Sync {
+    async fn check(
+        &self,
+        info: &ToolInfo,
+        ctx: &ToolContext,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> GateDecision;
+}
+
+/// Fail-closed default: everything needing approval is denied.
+pub struct DenyAllGate;
+
+#[async_trait]
+impl ApprovalGate for DenyAllGate {
+    async fn check(
+        &self,
+        info: &ToolInfo,
+        _ctx: &ToolContext,
+        _input: &Map<String, Value>,
+        _cancel: &CancellationToken,
+    ) -> GateDecision {
+        GateDecision::Deny(format!(
+            "tool {} requires approval and no approval channel is installed (fail-closed)",
+            info.name
+        ))
+    }
 }
 
 /// One callable tool. `parameters` is the JSON Schema advertised to the model;
@@ -83,6 +130,10 @@ pub struct ToolRegistry {
     /// Capability whitelist (C3: name-based). A registered-but-not-whitelisted
     /// tool is listable yet not dispatchable — deny wins over registration.
     allowed: BTreeSet<String>,
+    gate: Arc<dyn ApprovalGate>,
+    /// True once an interactive gate is installed — only then are
+    /// requires-approval tools advertised to the model
+    interactive_gate: bool,
 }
 
 impl ToolRegistry {
@@ -90,7 +141,19 @@ impl ToolRegistry {
         Self {
             tools: BTreeMap::new(),
             allowed: BTreeSet::new(),
+            gate: Arc::new(DenyAllGate),
+            interactive_gate: false,
         }
+    }
+
+    /// Install an interactive approval gate (C4 broker). Requires-approval
+    /// tools become advertisable; every dispatch of one still passes through
+    /// the gate.
+    #[must_use]
+    pub fn with_gate(mut self, gate: Arc<dyn ApprovalGate>) -> Self {
+        self.gate = gate;
+        self.interactive_gate = true;
+        self
     }
 
     /// Register a tool and whitelist it (the default for builtins).
@@ -124,15 +187,17 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.info()).collect()
     }
 
-    /// Tools advertised to the model: whitelisted AND auto-executable. Tools
-    /// stuck behind the C4 approval stub are NOT advertised — offering a tool
-    /// that dispatch always denies just burns model iterations.
+    /// Tools advertised to the model: whitelisted AND executable. Without an
+    /// interactive gate, requires-approval tools are NOT advertised —
+    /// offering a tool that dispatch always denies just burns model
+    /// iterations. With one (C4), they are advertised and gated per call.
     pub fn adverts(&self) -> Vec<ToolAdvert> {
         self.tools
             .values()
             .filter(|t| {
                 let info = t.info();
-                self.allowed.contains(&info.name) && !info.requires_approval
+                self.allowed.contains(&info.name)
+                    && (self.interactive_gate || !info.requires_approval)
             })
             .map(|t| {
                 let info = t.info();
@@ -168,11 +233,15 @@ impl ToolRegistry {
             )));
         }
 
-        // 3. approval gate — C4 stub: fail-closed auto-deny
-        if tool.info().requires_approval {
-            return Err(ToolError::Denied(format!(
-                "tool {name} requires approval; approvals land in C4 — auto-denied (fail-closed)"
-            )));
+        // 3. approval gate — every requires-approval dispatch consults the
+        // installed gate (fail-closed DenyAllGate unless C4's broker is wired)
+        let info = tool.info();
+        if info.requires_approval {
+            match self.gate.check(&info, ctx, input, cancel).await {
+                GateDecision::Allow => {}
+                GateDecision::Deny(reason) => return Err(ToolError::Denied(reason)),
+                GateDecision::AbortRun(reason) => return Err(ToolError::AbortRun(reason)),
+            }
         }
 
         // 4. execute under the tool's budget, cancellable at any point
@@ -252,6 +321,8 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             run_id: "run_test".to_owned(),
+            session_id: None,
+            tool_call_id: "tc_test".to_owned(),
         }
     }
 

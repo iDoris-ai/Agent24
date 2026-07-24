@@ -330,10 +330,14 @@ impl RunManager {
                     ));
                     continue;
                 }
-                match self.run_tool_call(&run_id, call, &cancel).await {
+                match self
+                    .run_tool_call(&run_id, run.session_id.as_deref(), call, &cancel)
+                    .await
+                {
                     Ok(content) => messages.push(Msg::tool_result(call.id.clone(), content)),
                     Err(()) => {
-                        // Cancelled mid-tool
+                        // Cancelled mid-tool, or the user chose abort on an
+                        // approval — either way the run lands cancelled
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
@@ -356,6 +360,7 @@ impl RunManager {
     async fn run_tool_call(
         &self,
         run_id: &str,
+        session_id: Option<&str>,
         call: &agent24_models::ToolCallRequest,
         cancel: &CancellationToken,
     ) -> Result<String, ()> {
@@ -407,6 +412,8 @@ impl RunManager {
             None => {
                 let ctx = ToolContext {
                     run_id: run_id.to_owned(),
+                    session_id: session_id.map(str::to_owned),
+                    tool_call_id: tc.id.clone(),
                 };
                 self.tools.dispatch(&call.name, &ctx, &input, cancel).await
             }
@@ -438,6 +445,12 @@ impl RunManager {
             Err(ToolError::Cancelled) => {
                 let content = "cancelled".to_owned();
                 (ToolCallStatus::Failed, content.clone(), content, true)
+            }
+            Err(ToolError::AbortRun(msg)) => {
+                // User chose abort: this call lands denied and the whole run
+                // is cancelled by the caller (SPEC-002 §1.4)
+                let content = format!("denied by policy: {msg}");
+                (ToolCallStatus::Denied, content.clone(), content, true)
             }
             Err(err) => {
                 let content = format!("tool error: {err}");
@@ -524,7 +537,7 @@ impl RunManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -579,12 +592,12 @@ mod tests {
 
     /// Plays a fixed sequence of assistant turns, then echoes the last tool
     /// result as the final answer.
-    struct ScriptedProvider {
+    pub(crate) struct ScriptedProvider {
         turns: StdMutex<Vec<Msg>>,
     }
 
     impl ScriptedProvider {
-        fn new(turns: Vec<Msg>) -> Self {
+        pub(crate) fn new(turns: Vec<Msg>) -> Self {
             Self {
                 turns: StdMutex::new(turns),
             }
@@ -674,7 +687,7 @@ mod tests {
         manager_with_tools(provider, ToolRegistry::new()).await
     }
 
-    fn create() -> RunCreate {
+    pub(crate) fn create() -> RunCreate {
         RunCreate {
             session_id: None,
             prompt: "hi".to_owned(),
@@ -682,7 +695,7 @@ mod tests {
         }
     }
 
-    async fn wait_terminal(store: &Store, id: &str) -> Run {
+    pub(crate) async fn wait_terminal(store: &Store, id: &str) -> Run {
         for _ in 0..100 {
             let run = store.get_run(id).await.unwrap().unwrap();
             if agent24_core::run_is_terminal(run.status) {
@@ -985,5 +998,177 @@ mod tests {
         let calls = store.list_tool_calls(&run.id).await.unwrap();
         assert_eq!(calls.len(), MAX_ITERATIONS);
         assert!(calls.iter().all(|c| c.status == ToolCallStatus::Failed));
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::tests::*;
+    use super::*;
+    use agent24_policy::{ApprovalBroker, BrokerGate};
+    use agent24_protocol::{ApprovalStatus, Decision};
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    struct Harness {
+        manager: Arc<RunManager>,
+        broker: Arc<ApprovalBroker>,
+        store: Store,
+        events: Arc<StdMutex<Vec<String>>>,
+    }
+
+    /// Real broker + gate + registry with a live shell_exec, driven by a
+    /// scripted provider asking for one shell_exec call.
+    async fn harness(workdir: std::path::PathBuf) -> Harness {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let tools = ToolRegistry::builtin(workdir)
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let provider = ScriptedProvider::new(vec![Msg::assistant(
+            None,
+            vec![agent24_models::ToolCallRequest {
+                id: "call_1".to_owned(),
+                name: "shell_exec".to_owned(),
+                arguments: serde_json::json!({ "argv": ["/bin/echo", "approved-output"] })
+                    .to_string(),
+            }],
+        )]);
+        let manager = RunManager::new(
+            store.clone(),
+            Arc::new(ProviderRegistry::new(vec![Arc::new(provider)])),
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        Harness {
+            manager,
+            broker,
+            store,
+            events,
+        }
+    }
+
+    async fn wait_pending(store: &Store) -> String {
+        for _ in 0..200 {
+            let pending = store
+                .list_approvals(Some(ApprovalStatus::Pending))
+                .await
+                .unwrap();
+            if let Some(a) = pending.first() {
+                return a.id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no pending approval appeared");
+    }
+
+    fn decision(kind: &str, reason: Option<&str>) -> Decision {
+        Decision {
+            kind: kind.to_owned(),
+            reason: reason.map(str::to_owned),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_shell_exec_actually_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = harness(dir.path().to_path_buf()).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let id = wait_pending(&h.store).await;
+        h.broker
+            .resolve(&id, decision("approve", None))
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(done.output.unwrap().text.contains("approved-output"));
+        let calls = h.store.list_tool_calls(&run.id).await.unwrap();
+        assert_eq!(calls[0].status, ToolCallStatus::Completed);
+        let seen = h.events.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                "run.started",
+                "tool.started",
+                "approval.required",
+                "approval.resolved",
+                "tool.completed",
+                "model.delta",
+                "run.completed"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_approval_feeds_the_reason_back_to_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = harness(dir.path().to_path_buf()).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let id = wait_pending(&h.store).await;
+        h.broker
+            .resolve(&id, decision("deny", Some("not on my machine")))
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, &run.id).await;
+        // Run continues: the scripted provider echoes the tool result
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(done.output.unwrap().text.contains("not on my machine"));
+        let calls = h.store.list_tool_calls(&run.id).await.unwrap();
+        assert_eq!(calls[0].status, ToolCallStatus::Denied);
+    }
+
+    #[tokio::test]
+    async fn abort_decision_cancels_the_whole_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = harness(dir.path().to_path_buf()).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let id = wait_pending(&h.store).await;
+        h.broker
+            .resolve(&id, decision("abort", None))
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Cancelled);
+        let calls = h.store.list_tool_calls(&run.id).await.unwrap();
+        assert_eq!(calls[0].status, ToolCallStatus::Denied);
+        let seen = h.events.lock().unwrap().clone();
+        assert!(seen.contains(&"run.cancelled".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_run_aborts_its_pending_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = harness(dir.path().to_path_buf()).await;
+        let run = h.manager.start_run(create()).await.unwrap();
+        let id = wait_pending(&h.store).await;
+        h.manager.cancel_run(&run.id).await.unwrap();
+        let done = wait_terminal(&h.store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Cancelled);
+        for _ in 0..100 {
+            let a = h.store.get_approval(&id).await.unwrap().unwrap();
+            if a.status != ApprovalStatus::Pending {
+                assert_eq!(a.status, ApprovalStatus::Aborted);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("approval never left pending after run cancel");
     }
 }

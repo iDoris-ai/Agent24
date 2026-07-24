@@ -27,6 +27,7 @@ pub struct AppState {
     pub token: Arc<String>,
     pub registry: Arc<ProviderRegistry>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
+    pub broker: Arc<agent24_policy::ApprovalBroker>,
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
     pub store: Store,
@@ -45,8 +46,22 @@ impl AppState {
         shutdown: CancellationToken,
     ) -> Self {
         let registry = Arc::new(registry);
-        let tools = Arc::new(tools);
         let events = crate::events::EventsHub::default();
+        // Approval broker: emits onto the same WS hub; timeout from env
+        // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
+        let timeout = std::env::var("A24_APPROVAL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(Duration::from_secs(300), Duration::from_secs);
+        let hub = events.clone();
+        let broker = agent24_policy::ApprovalBroker::new(
+            store.clone(),
+            StdArc::new(move |body| hub.broadcast(body)),
+            timeout,
+        );
+        let tools = Arc::new(tools.with_gate(StdArc::new(agent24_policy::BrokerGate::new(
+            StdArc::clone(&broker),
+        ))));
         let runs = agent24_agent::RunManager::new(
             store.clone(),
             Arc::clone(&registry),
@@ -58,6 +73,7 @@ impl AppState {
             token: Arc::new(token),
             registry,
             tools,
+            broker,
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
             store,
@@ -143,6 +159,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/models", get(crate::routes::get_models))
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/tools", get(crate::routes::get_tools))
+        .route("/api/v1/approvals", get(crate::approvals::list_approvals))
+        .route(
+            "/api/v1/approvals/{id}",
+            get(crate::approvals::get_approval).post(crate::approvals::decide_approval),
+        )
         .route("/api/v1/events", get(crate::events::ws_events))
         .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
         .route(
