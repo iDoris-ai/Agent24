@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use agent24_models::ProviderRegistry;
 use agent24_protocol::{ErrorBody, ErrorEnvelope, Health};
+use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
@@ -13,6 +14,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use rand::RngCore;
+use std::sync::Arc as StdArc;
 use tokio_util::sync::CancellationToken;
 
 /// Grace period for in-flight requests after a shutdown signal; the process
@@ -26,18 +28,35 @@ pub struct AppState {
     pub registry: Arc<ProviderRegistry>,
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
+    pub store: Store,
+    pub runs: Arc<agent24_agent::RunManager>,
     /// Daemon-wide shutdown token; handlers derive request tokens from it so
     /// shutdown cancels in-flight provider calls (run-level cancel joins in C2)
     pub shutdown: CancellationToken,
 }
 
 impl AppState {
-    pub fn new(token: String, registry: ProviderRegistry, shutdown: CancellationToken) -> Self {
+    pub fn new(
+        token: String,
+        registry: ProviderRegistry,
+        store: Store,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let registry = Arc::new(registry);
+        let events = crate::events::EventsHub::default();
+        let runs = agent24_agent::RunManager::new(
+            store.clone(),
+            Arc::clone(&registry),
+            StdArc::new(events.clone()),
+            shutdown.clone(),
+        );
         Self {
             token: Arc::new(token),
-            registry: Arc::new(registry),
+            registry,
             usage: Arc::new(crate::routes::UsageCounters::default()),
-            events: crate::events::EventsHub::default(),
+            events,
+            store,
+            runs,
             shutdown,
         }
     }
@@ -120,6 +139,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/events", get(crate::events::ws_events))
         .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
+        .route(
+            "/api/v1/sessions",
+            post(crate::runs::create_session).get(crate::runs::list_sessions),
+        )
+        .route("/api/v1/sessions/{id}", get(crate::runs::get_session))
+        .route(
+            "/api/v1/runs",
+            post(crate::runs::create_run).get(crate::runs::list_runs),
+        )
+        .route("/api/v1/runs/{id}", get(crate::runs::get_run))
+        .route("/api/v1/runs/{id}/cancel", post(crate::runs::cancel_run))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
@@ -154,7 +184,38 @@ pub async fn serve(
     };
 
     let token = generate_token();
-    let state = AppState::new(token.clone(), ProviderRegistry::from_env(), cancel.clone());
+    // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
+    let store = if ephemeral {
+        Store::open_memory().await.map_err(std::io::Error::other)?
+    } else {
+        let dir = agent24_protocol::state_file::state_dir()
+            .ok_or_else(|| std::io::Error::other("HOME not set"))?;
+        Store::open(&dir.join("agent24.db"))
+            .await
+            .map_err(std::io::Error::other)?
+    };
+    // Fail-closed sweep BEFORE accepting any request: approvals left pending
+    // by a previous process abort now (C1 primitive; ordering per its review)
+    let swept = store
+        .abort_lingering_approvals(&agent24_core::util::now_iso8601())
+        .await
+        .map_err(std::io::Error::other)?;
+    if swept > 0 {
+        tracing::warn!("aborted {swept} lingering pending approvals from a previous process");
+    }
+    let orphans = store
+        .sweep_orphan_runs(&agent24_core::util::now_iso8601())
+        .await
+        .map_err(std::io::Error::other)?;
+    if orphans > 0 {
+        tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
+    }
+    let state = AppState::new(
+        token.clone(),
+        ProviderRegistry::from_env(),
+        store,
+        cancel.clone(),
+    );
     let router = build_router(state);
 
     // 127.0.0.1 only — never a public bind (SPEC-001 §9)
@@ -259,10 +320,11 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn state() -> AppState {
+    async fn state() -> AppState {
         AppState::new(
             "testtoken".to_owned(),
             ProviderRegistry::new(vec![]),
+            Store::open_memory().await.unwrap(),
             CancellationToken::new(),
         )
     }
@@ -274,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_needs_no_token() {
-        let res = build_router(state())
+        let res = build_router(state().await)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/health")
@@ -293,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn post_to_health_path_requires_token() {
         // The auth exemption is GET-only — same path, other method: 401
-        let res = build_router(state())
+        let res = build_router(state().await)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -310,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_routes_401_without_token_with_v1_envelope() {
-        let res = build_router(state())
+        let res = build_router(state().await)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/models")
@@ -326,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_token_401_correct_token_reaches_404_envelope() {
-        let router = build_router(state());
+        let router = build_router(state().await);
         let res = router
             .clone()
             .oneshot(

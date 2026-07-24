@@ -7,7 +7,7 @@ use agent24_protocol::{
     ChatRequest, ChatResponse, ErrorBody, EventBody, Model, ModelDeltaPayload, RunCompletedPayload,
     RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
 };
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
@@ -15,7 +15,39 @@ use axum::response::{IntoResponse, Json, Response};
 use crate::server::{AppState, error_response};
 
 /// 1 MiB body cap — mirrors the node daemon (loopback is not a DoS boundary)
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Read a capped body, mapping every failure to a v1 envelope
+/// (axum's default extractor rejections are plain-text and would violate it).
+pub async fn read_body_or_response(req: Request<Body>) -> Result<Bytes, Response> {
+    match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
+        Ok(b) => Ok(b),
+        Err(err) => {
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+            let mut is_limit = false;
+            while let Some(e) = source {
+                if e.is::<http_body_util::LengthLimitError>() {
+                    is_limit = true;
+                    break;
+                }
+                source = e.source();
+            }
+            Err(if is_limit {
+                error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "payload_too_large",
+                    &format!("Request body exceeds {MAX_BODY_BYTES} bytes"),
+                )
+            } else {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "failed to read request body",
+                )
+            })
+        }
+    }
+}
 
 /// Single guarded value (not three independent atomics): record+snapshot are
 /// each atomic as a whole, so a snapshot can never observe a torn update where
@@ -95,7 +127,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         model: chat.model,
     };
     // Transient run: session_id null, full run lifecycle events (SPEC-002 §2)
-    let run_id = format!("run_{}", crate::events::ulid());
+    let run_id = format!("run_{}", agent24_core::util::ulid());
     state
         .events
         .broadcast(EventBody::RunStarted(RunStartedPayload {
