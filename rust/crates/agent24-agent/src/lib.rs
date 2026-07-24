@@ -498,35 +498,6 @@ impl RunManager {
             Err(err) => tracing::error!("run failure persist failed: {err}"),
         }
     }
-
-    /// Land the failed terminal state + event.
-    async fn finish_failed(&self, run_id: &str, code: &str, message: &str) {
-        let body = ErrorBody {
-            code: code.to_owned(),
-            message: message.to_owned(),
-            details: None,
-        };
-        match self
-            .store
-            .transition_run(
-                run_id,
-                RunStatus::Failed,
-                RunPatch {
-                    error: Some(body.clone()),
-                    ended_at: Some(now_iso8601()),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(_) => self.sink.emit(EventBody::RunFailed(RunFailedPayload {
-                run_id: run_id.to_owned(),
-                error: body,
-            })),
-            Err(err) => tracing::error!("run failure persist failed: {err}"),
-        }
-    }
-
     /// The single helper that lands the cancelled terminal state + event.
     /// Both paths use it (executor on token cancel; cancel_run for token-less
     /// runs) — a raced double-write loses in the store's IMMEDIATE tx and is
