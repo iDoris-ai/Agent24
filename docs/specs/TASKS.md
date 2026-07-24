@@ -148,11 +148,32 @@
 | D1 | agent24-memory：L0 KV + canonical session（超阈值 LLM 摘要压缩） | C8 + 用户确认 | done |
 | D2 | ModelRouter 一等公民：TaskProfile → tier(local/remote/lora) 选择，health+cooldown 反馈闭环，隐私标签强制本地 | C8 + 用户确认 | done |
 | D3 | Guardian 自动审批员：L1 本地小模型评估 `{risk_level, rationale}`，低风险自动放行+结构化审计，高风险升级人审 | C4, D2 | done |
-| D4a | ML worker Rust 侧契约 + 客户端：`agent24-worker`（MlWorker trait + HTTP/JSON 客户端 + mock，embed/transcribe/health 线协议） | D2 | in-pr #47 |
-| D4b | Python ML worker serving 实现（embedding/whisper；LoRA 训练后置），对齐 D4a 契约 | D4a | pending |
+| D4a | ML worker Rust 侧契约 + 客户端：`agent24-worker`（MlWorker trait + HTTP/JSON 客户端 + mock，embed/transcribe/health 线协议） | D2 | done |
+| D4b | Python ML worker serving 实现（embedding/whisper；LoRA 训练后置），对齐 D4a 契约 | D4a | **deferred（等消费者）** |
 | D5a | daemon 集成布线（一）：ModelRouter 接管 daemon 全部模型调用（chat/runs），Guardian 按 `A24_GUARDIAN` opt-in 接入 ApprovalBroker（默认关） | D2, D3 | done |
-| D5b | 会话记忆（D1 生效）：CanonicalSession 接入 run 生命周期——按 session 载入既往上下文、完成后回写并按阈值压缩 | D5a, D1 | in-pr |
-| D5c | HttpMlWorker 挂载 + 消费端（D4a 生效） | D5a, D4a | pending |
+| D5b | 会话记忆（D1 生效）：CanonicalSession 接入 run 生命周期——按 session 载入既往上下文、完成后回写并按阈值压缩 | D5a, D1 | done |
+| D5c | HttpMlWorker 挂载 + 消费端（D4a 生效） | D5a, D4a | **deferred（等需要时再做）** |
+
+### M-D 收尾说明（2026-07-24）
+
+**M-D 的目标已达成**：ADR-026 对 M-D 的定义是「Memory **L0-L1**、上下文压缩；三层路由落地」——
+L0 KV（D1）、L1 会话压缩（D1+D5b）、三层路由（D2）全部 merged，daemon 也已真正布线（D5a/D5b）。
+
+**D4b / D5c 是按决策延后，不是漏掉的活**，重启 loop 时不要盲目捡起来：
+
+- ADR-026 §5 已论证：**跑 LLM 不需要 Python**（oMLX 走 OpenAI-compat HTTP 即可）。
+  Python ML Worker 的价值只在 oMLX chat 接口给不了的三件事：Embedding、Whisper、LoRA 训练。
+- 这三件当下**都没有上层消费者**：
+  - Embedding → 给 L2 语义检索用，而 **L2 不在 M-D 范围内**（L0-L1 走摘要压缩，不用向量）
+  - Whisper → 等 **M-F 渠道**（微信/Nostr）接进来，语音输入才有意义
+  - LoRA → L3，最靠后
+- 因此 **`/api/v1/embed` 端点也不加**：没有消费者，加了是空端点，还要动 `protocol/openapi.yaml` 触发零漂移门。
+
+**原则：先有消费者，再有提供者。** D4a 已把 wire 契约 + 客户端 + mock 锁死，
+将来任一能力真的需要时，Python 侧照契约实现即可接上，无需重新设计。
+
+**下一步应由「想要哪个能力」驱动，而不是按任务编号顺序推**（语音 → M-F；长期语义记忆 → L2；24/7 无人值守 → M-F）。
+
 
 ## M-E 模块生态桥接（v0.3.0）
 
