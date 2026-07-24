@@ -127,15 +127,22 @@ pub fn qualified_name(server: &str, tool: &str) -> String {
     format!("mcp_{}_{}", sanitize(server), sanitize(tool))
 }
 
-/// Tool names reach the model as function names; keep them to a conservative
-/// charset so a server cannot inject separators or break the wire shape.
+/// Sanitize one half of a qualified name.
+///
+/// `_` is the SEPARATOR in `mcp_{server}_{tool}`, so it must not survive inside
+/// either half — otherwise the split is ambiguous and two ordinary configs
+/// collide: server `web` + tool `search_x` and server `web_search` + tool `x`
+/// both yielded `mcp_web_search_x`, and `ToolRegistry::with()` is a plain insert,
+/// so one silently shadowed the other. Mapping `_` (and anything else outside
+/// `[A-Za-z0-9-]`) to `-` leaves only `-` inside the halves, which makes the `_`
+/// positions unambiguous.
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            if c.is_ascii_alphanumeric() || c == '-' {
                 c
             } else {
-                '_'
+                '-'
             }
         })
         .collect()
@@ -269,14 +276,30 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_configs_do_not_collide() {
+        // Reviewer-found, reproduced before fixing: two entirely conventional
+        // server names silently produced the SAME qualified name, and the
+        // registry's insert meant one permanently shadowed the other.
+        assert_ne!(
+            qualified_name("web", "search_x"),
+            qualified_name("web_search", "x"),
+        );
+        // The separator is unambiguous: exactly two `_` after the `mcp` prefix.
+        let q = qualified_name("web_search", "x");
+        assert_eq!(q.matches('_').count(), 2, "{q}");
+    }
+
+    #[test]
     fn hostile_names_are_sanitized() {
         // A server must not be able to inject separators, whitespace or
         // path-ish characters into the function name the model sees.
-        assert_eq!(qualified_name("a b", "x/y"), "mcp_a_b_x_y");
+        assert_eq!(qualified_name("a b", "x/y"), "mcp_a-b_x-y");
         let q = qualified_name("a.b", "c:d");
         assert!(!q.contains('.'), "{q}");
         assert!(!q.contains(':'), "{q}");
         assert!(!qualified_name("../etc", "p").contains('/'));
+        // Underscores never survive inside a half.
+        assert!(!sanitize("a_b").contains('_'));
     }
 
     #[test]
