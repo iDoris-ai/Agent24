@@ -1,12 +1,14 @@
 //! Local builtins: `fs_read` / `fs_write` (path-whitelisted) and `shell_exec`
 //! (argv-array execution, never a shell string).
 //!
-//! Path whitelist semantics: a target is allowed only if its CANONICAL path
-//! (symlinks resolved) sits under one of the canonicalized roots. For writes
-//! the parent directory is canonicalized (the file itself may not exist yet)
-//! and an existing target must not be a symlink pointing outside.
+//! Path whitelist semantics: every root is opened ONCE as a `cap_std::fs::Dir`
+//! (a pinned directory fd). All path resolution then happens INSIDE that fd
+//! with openat-style beneath-only traversal — a symlink (or a parent-directory
+//! swap) pointing outside the workspace fails at resolution time, not at some
+//! earlier check that could race. In-workspace symlinks still work.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_protocol::ToolInfo;
@@ -19,83 +21,117 @@ use crate::{Tool, ToolContext, ToolError, truncate};
 const MAX_READ_BYTES: usize = 256 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024;
 
-fn canonical_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+/// One whitelisted root: the paths it answers for (as given + canonicalized,
+/// so `/tmp/...` matches even when the dir really lives under `/private/tmp`)
+/// plus the pinned directory handle all I/O goes through.
+struct Root {
+    prefixes: Vec<PathBuf>,
+    dir: Arc<cap_std::fs::Dir>,
+}
+
+fn open_roots(roots: Vec<PathBuf>) -> Vec<Root> {
     roots
         .into_iter()
-        .filter_map(|r| match r.canonicalize() {
-            Ok(c) => Some(c),
-            Err(err) => {
-                tracing::warn!("fs whitelist root {} dropped: {err}", r.display());
-                None
+        .filter_map(|r| {
+            let canonical = match r.canonicalize() {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::warn!("fs whitelist root {} dropped: {err}", r.display());
+                    return None;
+                }
+            };
+            match cap_std::fs::Dir::open_ambient_dir(&canonical, cap_std::ambient_authority()) {
+                Ok(dir) => {
+                    let mut prefixes = vec![canonical];
+                    if !prefixes.contains(&r) {
+                        prefixes.push(r);
+                    }
+                    Some(Root {
+                        prefixes,
+                        dir: Arc::new(dir),
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!("fs whitelist root {} unopenable: {err}", r.display());
+                    None
+                }
             }
         })
         .collect()
-}
-
-fn under_roots(candidate: &Path, roots: &[PathBuf]) -> bool {
-    roots.iter().any(|r| candidate.starts_with(r))
 }
 
 fn str_arg<'a>(input: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
 }
 
-/// Canonicalize `path` for reading and enforce the whitelist.
-fn checked_read_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, ToolError> {
-    let canonical = Path::new(raw)
-        .canonicalize()
-        .map_err(|e| ToolError::Invalid(format!("path {raw}: {e}")))?;
-    if !under_roots(&canonical, roots) {
-        return Err(ToolError::Denied(format!(
-            "path {raw} is outside the allowed workspace"
-        )));
+/// Lexically fold `.` / `..` (no filesystem access). `None` when `..` would
+/// climb above the root — those can never be workspace paths.
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other),
+        }
     }
-    Ok(canonical)
+    Some(out)
 }
 
-/// Resolve `path` for writing: canonicalize the parent (must exist), then
-/// re-attach the final component. An existing symlink target is rejected —
-/// writing through it could escape the whitelist.
-///
-/// KNOWN LIMIT (C4 gate): the canonicalized parent directory can itself be
-/// swapped for a symlink between this check and the open. The final component
-/// is protected by O_NOFOLLOW at open time, the parent is not. `fs_write` is
-/// auto-denied by the C3 approval stub; this race MUST be closed (dirfd +
-/// openat-style traversal) before C4 lets approvals enable it.
-fn checked_write_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, ToolError> {
+/// Map an absolute input path onto (pinned root dir, path relative to it).
+fn resolve_in_roots<'a>(raw: &str, roots: &'a [Root]) -> Result<(&'a Root, PathBuf), ToolError> {
     let path = Path::new(raw);
-    let name = path
-        .file_name()
-        .ok_or_else(|| ToolError::Invalid(format!("path {raw} has no file name")))?;
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let parent = parent.ok_or_else(|| ToolError::Invalid(format!("path {raw} has no parent")))?;
-    let parent = parent
-        .canonicalize()
-        .map_err(|e| ToolError::Invalid(format!("parent of {raw}: {e}")))?;
-    if !under_roots(&parent, roots) {
-        return Err(ToolError::Denied(format!(
-            "path {raw} is outside the allowed workspace"
+    if !path.is_absolute() {
+        return Err(ToolError::Invalid(format!(
+            "path {raw} must be absolute (inside the workspace)"
         )));
     }
-    let target = parent.join(name);
-    if target.is_symlink() {
-        return Err(ToolError::Denied(format!(
-            "path {raw} is a symlink — refusing to write through it"
-        )));
+    let norm = lexical_normalize(path)
+        .ok_or_else(|| ToolError::Denied(format!("path {raw} escapes the filesystem root")))?;
+    for root in roots {
+        for prefix in &root.prefixes {
+            if let Ok(rel) = norm.strip_prefix(prefix) {
+                if rel.as_os_str().is_empty() {
+                    return Err(ToolError::Invalid(format!(
+                        "path {raw} is the workspace root, not a file"
+                    )));
+                }
+                return Ok((root, rel.to_path_buf()));
+            }
+        }
     }
-    Ok(target)
+    Err(ToolError::Denied(format!(
+        "path {raw} is outside the allowed workspace"
+    )))
+}
+
+/// cap-std reports beneath-escapes as distinct I/O errors; surface them as
+/// policy denials, everything else as plain failures.
+fn map_fs_err(raw: &str, err: &std::io::Error) -> ToolError {
+    let msg = err.to_string();
+    if err.kind() == std::io::ErrorKind::PermissionDenied
+        || msg.contains("outside of the filesystem")
+    {
+        ToolError::Denied(format!("path {raw} resolves outside the workspace: {msg}"))
+    } else {
+        ToolError::Failed(format!("{raw}: {msg}"))
+    }
 }
 
 // ── fs_read ──────────────────────────────────────────────────────────────────
 
 pub struct FsReadTool {
-    roots: Vec<PathBuf>,
+    roots: Vec<Root>,
 }
 
 impl FsReadTool {
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Self {
-            roots: canonical_roots(roots),
+            roots: open_roots(roots),
         }
     }
 }
@@ -131,20 +167,15 @@ impl Tool for FsReadTool {
     ) -> Result<String, ToolError> {
         let raw =
             str_arg(input, "path").ok_or_else(|| ToolError::Invalid("path is required".into()))?;
-        let path = checked_read_path(raw, &self.roots)?;
-        // Post-check open is O_NOFOLLOW and everything (type check, bounded
-        // read) happens on the fd — swapping the checked path for a symlink
-        // afterwards makes the open fail instead of following it. (A parent-
-        // directory swap race remains; see the C4 note on checked_write_path.)
+        let (root, rel) = resolve_in_roots(raw, &self.roots)?;
+        // Everything below happens through the pinned dirfd: beneath-only
+        // traversal (parent swaps and escaping symlinks fail at open), type
+        // check from the fd, bounded read — never more than cap+1 in memory.
+        let dir = Arc::clone(&root.dir);
         let raw_owned = raw.to_owned();
         let out = tokio::task::spawn_blocking(move || -> Result<String, ToolError> {
             use std::io::Read as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)
-                .map_err(|e| ToolError::Failed(format!("open {raw_owned}: {e}")))?;
+            let file = dir.open(&rel).map_err(|e| map_fs_err(&raw_owned, &e))?;
             let meta = file
                 .metadata()
                 .map_err(|e| ToolError::Failed(format!("stat {raw_owned}: {e}")))?;
@@ -153,7 +184,6 @@ impl Tool for FsReadTool {
                     "{raw_owned} is not a regular file"
                 )));
             }
-            // Never more than the cap + 1 sentinel byte in memory
             let mut bytes = Vec::new();
             file.take(MAX_READ_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)
@@ -169,13 +199,13 @@ impl Tool for FsReadTool {
 // ── fs_write ─────────────────────────────────────────────────────────────────
 
 pub struct FsWriteTool {
-    roots: Vec<PathBuf>,
+    roots: Vec<Root>,
 }
 
 impl FsWriteTool {
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Self {
-            roots: canonical_roots(roots),
+            roots: open_roots(roots),
         }
     }
 }
@@ -214,27 +244,25 @@ impl Tool for FsWriteTool {
             str_arg(input, "path").ok_or_else(|| ToolError::Invalid("path is required".into()))?;
         let content = str_arg(input, "content")
             .ok_or_else(|| ToolError::Invalid("content is required".into()))?;
-        let path = checked_write_path(raw, &self.roots)?;
-        // O_NOFOLLOW closes the check-then-write race: even if the target is
-        // swapped for a symlink after checked_write_path, the open fails
-        // instead of following it out of the workspace.
+        let (root, rel) = resolve_in_roots(raw, &self.roots)?;
+        // Beneath-only traversal from the pinned dirfd — parent swaps and
+        // symlinks escaping the workspace fail at open, atomically with it.
+        let dir = Arc::clone(&root.dir);
         let bytes = content.as_bytes().to_vec();
         let raw_owned = raw.to_owned();
-        let written = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+        let written = tokio::task::spawn_blocking(move || -> Result<usize, ToolError> {
             use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)?;
-            file.write_all(&bytes)?;
+            let mut opts = cap_std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            let mut file = dir
+                .open_with(&rel, &opts)
+                .map_err(|e| map_fs_err(&raw_owned, &e))?;
+            file.write_all(&bytes)
+                .map_err(|e| ToolError::Failed(format!("write {raw_owned}: {e}")))?;
             Ok(bytes.len())
         })
         .await
-        .map_err(|e| ToolError::Failed(format!("write task: {e}")))?
-        .map_err(|e| ToolError::Failed(format!("write {raw_owned}: {e}")))?;
+        .map_err(|e| ToolError::Failed(format!("write task: {e}")))??;
         Ok(format!("wrote {written} bytes to {raw}"))
     }
 }
@@ -510,6 +538,45 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
+    }
+
+    #[tokio::test]
+    async fn symlinked_parent_directory_cannot_escape() {
+        // The dirfd-anchored traversal must also stop escapes via an
+        // intermediate PATH COMPONENT that is a symlink out of the workspace
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("dirlink")).unwrap();
+        let cancel = CancellationToken::new();
+
+        let read = FsReadTool::new(vec![root.clone()]);
+        let target = root.join("dirlink/secret.txt");
+        let err = read
+            .call(
+                &ctx(),
+                &sinput(&[("path", target.to_str().unwrap())]),
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+
+        let write = FsWriteTool::new(vec![root]);
+        let err = write
+            .call(
+                &ctx(),
+                &sinput(&[("path", target.to_str().unwrap()), ("content", "pwn")]),
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret"
+        );
     }
 
     #[tokio::test]

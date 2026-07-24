@@ -65,9 +65,16 @@ fn ipv6_is_public(ip: Ipv6Addr) -> bool {
     if seg[..5] == [0, 0, 0, 0, 0] && seg[5] == 0 && (seg[6] != 0 || seg[7] > 1) {
         return ipv4_is_public(Ipv4Addr::from(((seg[6] as u32) << 16) | seg[7] as u32));
     }
-    // NAT64 well-known 64:ff9b::/96 + local-use 64:ff9b:1::/48
-    if seg[0] == 0x64 && seg[1] == 0xff9b && (seg[2..6] == [0, 0, 0, 0] || seg[2] == 1) {
-        return ipv4_is_public(Ipv4Addr::from(((seg[6] as u32) << 16) | seg[7] as u32));
+    // NAT64: the well-known 64:ff9b::/96 embeds v4 in the last 32 bits;
+    // local-use 64:ff9b:1::/48 allows variable embedding (RFC 6052), so it is
+    // denied outright rather than decoded
+    if seg[0] == 0x64 && seg[1] == 0xff9b {
+        if seg[2] == 1 {
+            return false;
+        }
+        if seg[2..6] == [0, 0, 0, 0] {
+            return ipv4_is_public(Ipv4Addr::from(((seg[6] as u32) << 16) | seg[7] as u32));
+        }
     }
     // 6to4 2002:AABB:CCDD::/48 embeds v4 in segments 1-2
     if seg[0] == 0x2002 {

@@ -9,7 +9,7 @@ description = "Agent24 tool trait + registry + builtin tools (C3 scope: http_fet
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
 async-trait = "0.1"
-libc = "0.2"
+cap-std = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json = { workspace = true }
 thiserror = "2"
