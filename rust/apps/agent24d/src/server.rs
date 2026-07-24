@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_models::ProviderRegistry;
+use agent24_models::router::ModelRouter;
 use agent24_protocol::{ErrorBody, ErrorEnvelope, Health};
 use agent24_store::Store;
 use axum::Router;
@@ -25,7 +25,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct AppState {
     pub token: Arc<String>,
-    pub registry: Arc<ProviderRegistry>,
+    /// D2 router: every model call goes through tier routing + health/cooldown,
+    /// so a downed local provider backs off and a LocalOnly task never leaks.
+    pub router: Arc<ModelRouter>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     pub broker: Arc<agent24_policy::ApprovalBroker>,
     pub usage: Arc<crate::routes::UsageCounters>,
@@ -69,15 +71,64 @@ impl agent24_scheduler::RunTrigger for RunManagerTrigger {
     }
 }
 
+/// Build the D3 Guardian when the operator opts in with `A24_GUARDIAN=1`.
+///
+/// **Default OFF.** Letting a model auto-approve tool calls is a deliberate
+/// operator choice, never a silent default — with no guardian every gated call
+/// goes to a human exactly as before.
+///
+/// When on, risk is assessed by a LOCAL-ONLY model through the same [`ModelRouter`]
+/// (the payload never leaves the device). `A24_GUARDIAN_ALWAYS_REVIEW` is a
+/// comma-separated list of tool kinds that always require a human regardless of
+/// the model's verdict; it defaults to `exec`, because `shell_exec` is arbitrary
+/// code execution and deserves a human by default even with the guardian on.
+fn build_guardian(router: &Arc<ModelRouter>) -> Option<StdArc<agent24_policy::guardian::Guardian>> {
+    if !guardian_enabled(std::env::var("A24_GUARDIAN").ok().as_deref()) {
+        return None;
+    }
+    let always_review =
+        parse_always_review(std::env::var("A24_GUARDIAN_ALWAYS_REVIEW").ok().as_deref());
+    let assessor = StdArc::new(agent24_policy::guardian::ModelRiskAssessor::new(
+        Arc::clone(router),
+    ));
+    tracing::info!(
+        "guardian enabled (always-review kinds: {})",
+        always_review.join(",")
+    );
+    Some(StdArc::new(
+        agent24_policy::guardian::Guardian::new(assessor).always_review(always_review),
+    ))
+}
+
+/// Opt-in only: absent, empty, or anything other than `1`/`true` leaves the
+/// guardian OFF (fail-safe — a typo must never silently enable auto-approval).
+fn guardian_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true")
+    })
+}
+
+/// Parse the always-review kind list, defaulting to `exec`. An explicitly empty
+/// value yields an empty list (the operator deliberately allows every kind to be
+/// considered for auto-approval).
+fn parse_always_review(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("exec")
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 impl AppState {
     pub fn new(
         token: String,
-        registry: ProviderRegistry,
+        router: ModelRouter,
         tools: agent24_tools::ToolRegistry,
         store: Store,
         shutdown: CancellationToken,
     ) -> Self {
-        let registry = Arc::new(registry);
+        let router = Arc::new(router);
         let events = crate::events::EventsHub::default();
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
@@ -86,17 +137,18 @@ impl AppState {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(Duration::from_secs(300), Duration::from_secs);
         let hub = events.clone();
-        let broker = agent24_policy::ApprovalBroker::new(
+        let broker = agent24_policy::ApprovalBroker::with_guardian(
             store.clone(),
             StdArc::new(move |body| hub.broadcast(body)),
             timeout,
+            build_guardian(&router),
         );
         let tools = Arc::new(tools.with_gate(StdArc::new(agent24_policy::BrokerGate::new(
             StdArc::clone(&broker),
         ))));
         let runs = agent24_agent::RunManager::new(
             store.clone(),
-            Arc::clone(&registry),
+            Arc::clone(&router),
             Arc::clone(&tools),
             StdArc::new(events.clone()),
             shutdown.clone(),
@@ -111,7 +163,7 @@ impl AppState {
         );
         Self {
             token: Arc::new(token),
-            registry,
+            router,
             tools,
             broker,
             usage: Arc::new(crate::routes::UsageCounters::default()),
@@ -300,7 +352,7 @@ pub async fn serve(
     std::fs::create_dir_all(&workspace)?;
     let state = AppState::new(
         token.clone(),
-        ProviderRegistry::from_env(),
+        ModelRouter::from_env(),
         agent24_tools::ToolRegistry::builtin(workspace),
         store,
         cancel.clone(),
@@ -428,7 +480,7 @@ mod tests {
     async fn state() -> AppState {
         AppState::new(
             "testtoken".to_owned(),
-            ProviderRegistry::new(vec![]),
+            ModelRouter::with_defaults(vec![]),
             agent24_tools::ToolRegistry::new(),
             Store::open_memory().await.unwrap(),
             CancellationToken::new(),
@@ -531,6 +583,38 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn guardian_is_off_unless_explicitly_enabled() {
+        // Fail-safe: absent / empty / typo / "0" / "no" all leave it OFF.
+        assert!(!guardian_enabled(None));
+        assert!(!guardian_enabled(Some("")));
+        assert!(!guardian_enabled(Some("0")));
+        assert!(!guardian_enabled(Some("no")));
+        assert!(!guardian_enabled(Some("ture"))); // typo must not enable
+        // Only an explicit opt-in turns it on.
+        assert!(guardian_enabled(Some("1")));
+        assert!(guardian_enabled(Some("true")));
+        assert!(guardian_enabled(Some("TRUE")));
+        assert!(guardian_enabled(Some(" 1 ")));
+    }
+
+    #[test]
+    fn always_review_defaults_to_exec_and_parses_lists() {
+        // Default keeps shell_exec human-gated even with the guardian on.
+        assert_eq!(parse_always_review(None), vec!["exec".to_owned()]);
+        assert_eq!(
+            parse_always_review(Some("exec, fs_write ,network")),
+            vec![
+                "exec".to_owned(),
+                "fs_write".to_owned(),
+                "network".to_owned()
+            ]
+        );
+        // Explicitly empty = operator allows every kind to be auto-approvable.
+        assert!(parse_always_review(Some("")).is_empty());
+        assert!(parse_always_review(Some(" , ")).is_empty());
     }
 
     #[test]
