@@ -113,6 +113,54 @@ pub struct ModelRouter {
 /// can never overflow (review D2).
 const COOLDOWN_HARD_CAP: Duration = Duration::from_secs(24 * 3600);
 
+/// Extract the host from an `http(s)://host[:port][/path]` URL (no url-crate
+/// dependency). IPv6 literals in `[...]` are unwrapped.
+fn url_host(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // strip userinfo
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if let Some(rest) = hostport.strip_prefix('[') {
+        // IPv6: [::1]:port → ::1
+        return rest.split(']').next().filter(|h| !h.is_empty());
+    }
+    hostport.split(':').next().filter(|h| !h.is_empty())
+}
+
+/// True only for genuinely ON-DEVICE hosts — loopback or `localhost`. A LAN or
+/// any other address is NOT local for privacy purposes: sending data there
+/// leaves the device (review D2). Used by [`ModelRouter::from_env`] to decide
+/// whether an env-configured provider may carry the `Tier::Local` label.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// The tier an env-configured "local" provider actually deserves: `Local` only
+/// if its URL is genuinely loopback, else `Remote` (fail-safe — a LocalOnly
+/// task then refuses it rather than leaking to it).
+fn env_local_tier(url: &str) -> Tier {
+    match url_host(url) {
+        Some(host) if is_loopback_host(host) => Tier::Local,
+        _ => {
+            tracing::warn!(
+                "provider URL {url} is not loopback — labeling Remote so \
+                 LocalOnly tasks won't route to it"
+            );
+            Tier::Remote
+        }
+    }
+}
+
 impl ModelRouter {
     /// Build from `(provider, tier)` pairs. Cooldown grows exponentially from
     /// `base_cooldown`, capped at `max_cooldown`.
@@ -160,6 +208,12 @@ impl ModelRouter {
         let omlx_key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
         let default_model =
             std::env::var("DEFAULT_MODEL").unwrap_or_else(|_| "Qwen3-8B-4bit".to_owned());
+        // Validate locality before trusting the `Local` label: an OMLX_URL
+        // pointed at a non-loopback address is treated as Remote so a
+        // LocalOnly task never silently leaks to it (review D2).
+        let omlx_tier = env_local_tier(&omlx_url);
+        let ollama_url = "http://127.0.0.1:11434";
+        let ollama_tier = env_local_tier(ollama_url);
         let omlx: Arc<dyn ModelProvider> = Arc::new(crate::OpenAiCompatProvider::new(
             "omlx",
             omlx_url,
@@ -169,12 +223,12 @@ impl ModelRouter {
         ));
         let ollama: Arc<dyn ModelProvider> = Arc::new(crate::OpenAiCompatProvider::new(
             "ollama",
-            "http://127.0.0.1:11434",
+            ollama_url,
             None,
             "local",
             default_model,
         ));
-        Self::with_defaults(vec![(omlx, Tier::Local), (ollama, Tier::Local)])
+        Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)])
     }
 
     /// Provider indices to try, in order, for `profile` at `now`: tier
@@ -570,6 +624,36 @@ mod tests {
         // still cooling at 59s, available again by 61s (capped at 60s, not huge)
         assert_eq!(r.route(profile, t0 + Duration::from_secs(59)).len(), 0);
         assert_eq!(r.route(profile, t0 + Duration::from_secs(61)).len(), 1);
+    }
+
+    #[test]
+    fn url_host_and_loopback_classification() {
+        assert_eq!(url_host("http://127.0.0.1:8088"), Some("127.0.0.1"));
+        assert_eq!(url_host("http://localhost:11434/v1"), Some("localhost"));
+        assert_eq!(url_host("https://[::1]:8443/x"), Some("::1"));
+        assert_eq!(url_host("http://api.openai.com/v1"), Some("api.openai.com"));
+        assert_eq!(url_host("http://192.168.1.50:8088"), Some("192.168.1.50"));
+
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        // a LAN box is NOT on-device — data would leave the machine
+        assert!(!is_loopback_host("192.168.1.50"));
+        assert!(!is_loopback_host("10.0.0.5"));
+        assert!(!is_loopback_host("api.openai.com"));
+    }
+
+    #[test]
+    fn env_local_tier_demotes_non_loopback_to_remote() {
+        assert_eq!(env_local_tier("http://127.0.0.1:8088"), Tier::Local);
+        assert_eq!(env_local_tier("http://localhost:8088"), Tier::Local);
+        // a misconfigured "local" URL pointing off-device must NOT be Local —
+        // else a LocalOnly task would leak to it (review D2)
+        assert_eq!(env_local_tier("http://192.168.1.50:8088"), Tier::Remote);
+        assert_eq!(
+            env_local_tier("https://inference.example.com"),
+            Tier::Remote
+        );
     }
 
     #[test]
