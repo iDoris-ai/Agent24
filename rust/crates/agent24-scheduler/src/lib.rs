@@ -220,8 +220,17 @@ impl Scheduler {
             if due > now {
                 continue;
             }
-            self.fire(schedule, now).await?;
-            fired += 1;
+            // Isolate per-schedule failures: a genuine StoreError while firing
+            // ONE schedule (e.g. a transient SQLITE_BUSY under concurrent
+            // approval/tool/audit writes to the same file) must not abort the
+            // whole batch and starve every other healthy due schedule (review
+            // #39). The failed schedule keeps its persisted next_run_at and is
+            // retried next tick.
+            let id = schedule.id.clone();
+            match self.fire(schedule, now).await {
+                Ok(()) => fired += 1,
+                Err(err) => tracing::error!("schedule {id} fire failed: {err}; skipping this tick"),
+            }
         }
         Ok(fired)
     }
@@ -451,6 +460,23 @@ mod tests {
         assert_eq!(after.next_run_at.as_deref(), Some("2026-07-24T10:02:05Z"));
         assert_eq!(after.last_run_at.as_deref(), Some("2026-07-24T10:01:05Z"));
         assert_eq!(events.lock().unwrap().clone(), vec!["schedule.fired"]);
+    }
+
+    #[tokio::test]
+    async fn tick_fires_every_due_schedule_in_the_batch() {
+        // The per-schedule loop must not stop early — every due schedule fires
+        // in one tick (review #39: one schedule's failure can't starve others).
+        let trig = RecordingTrigger::new();
+        let (sched, _ev, _store) = scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+        for _ in 0..3 {
+            sched
+                .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+                .await
+                .unwrap();
+        }
+        // all three are due at 10:01:05
+        assert_eq!(sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap(), 3);
+        assert_eq!(trig.count(), 3);
     }
 
     #[tokio::test]
