@@ -10,6 +10,7 @@ members = [
     "crates/agent24-policy",
     "crates/agent24-store",
     "crates/agent24-tools",
+    "crates/agent24-worker",
     "apps/agent24d",
     "apps/agent24-cli",
 ]

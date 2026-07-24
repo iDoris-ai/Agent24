@@ -1,0 +1,24 @@
+[package]
+name = "agent24-worker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent24 ML worker client (M-D/D4a): Rust-side wire contract + HTTP client for the Python ML worker (embedding/whisper; LoRA training later)"
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+
+[lints]
+workspace = true
