@@ -182,6 +182,18 @@ impl ToolRegistry {
             .with(Arc::new(ShellExecTool::new(workspace)))
     }
 
+    /// True when an interactive approval gate (C4 broker) is installed.
+    pub fn gate_is_interactive(&self) -> bool {
+        self.interactive_gate
+    }
+
+    /// Whether dispatching `name` would consult the approval gate.
+    pub fn tool_requires_approval(&self, name: &str) -> bool {
+        self.tools
+            .get(name.trim())
+            .is_some_and(|t| t.info().requires_approval)
+    }
+
     /// Sorted list for `GET /api/v1/tools`.
     pub fn list(&self) -> Vec<ToolInfo> {
         self.tools.values().map(|t| t.info()).collect()

@@ -407,6 +407,20 @@ impl RunManager {
             input_summary: summarize_input(&input),
         }));
 
+        // SPEC-002 §1.2: a run blocked on an interactive approval is
+        // `awaiting_approval`, not `running` — REST pollers must see it.
+        let awaiting = parse_error.is_none()
+            && self.tools.gate_is_interactive()
+            && self.tools.tool_requires_approval(&call.name);
+        if awaiting
+            && let Err(err) = self
+                .store
+                .transition_run(run_id, RunStatus::AwaitingApproval, RunPatch::default())
+                .await
+        {
+            tracing::error!("run {run_id}: awaiting_approval transition failed: {err}");
+        }
+
         let outcome = match parse_error {
             Some(msg) => Err(ToolError::Invalid(msg)),
             None => {
@@ -418,6 +432,21 @@ impl RunManager {
                 self.tools.dispatch(&call.name, &ctx, &input, cancel).await
             }
         };
+
+        // Back to running unless the run is about to land cancelled (the
+        // awaiting_approval → cancelled edge is taken by finish_cancelled)
+        if awaiting
+            && !matches!(
+                outcome,
+                Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled)
+            )
+            && let Err(err) = self
+                .store
+                .transition_run(run_id, RunStatus::Running, RunPatch::default())
+                .await
+        {
+            tracing::error!("run {run_id}: back-to-running transition failed: {err}");
+        }
 
         let (status, summary, content, cancelled) = match outcome {
             Ok(output) => {

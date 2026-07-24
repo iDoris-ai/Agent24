@@ -18,7 +18,9 @@ use agent24_core::util::{now_iso8601, ulid};
 use agent24_protocol::{Approval, ApprovalResolvedPayload, ApprovalStatus, Decision, EventBody};
 use agent24_store::{Store, StoreError};
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, oneshot};
+use std::sync::Mutex;
+
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use agent24_tools::{ApprovalGate, GateDecision, ToolContext, summarize_input};
@@ -53,13 +55,32 @@ pub enum ResolveError {
 pub struct ApprovalBroker {
     store: Store,
     emit: Arc<dyn Fn(EventBody) + Send + Sync>,
-    /// approval_id → the waiting dispatch. Entry removed on every resolution
-    /// path; a dropped sender (process teardown) reads as abort on the waiter.
+    /// approval_id → the waiting dispatch. std Mutex (never held across an
+    /// await) so a Drop guard can clean it even when the waiting future is
+    /// dropped mid-wait. The store row stays the single arbiter.
     pending: Mutex<HashMap<String, oneshot::Sender<Decision>>>,
     /// approve_for_session grants: (scope, tool) — scope is the session id,
-    /// falling back to the run id for session-less runs
+    /// falling back to the run id for session-less runs. Bounded: on
+    /// overflow the set is CLEARED (fail-closed — users get re-asked).
     grants: Mutex<HashSet<(String, String)>>,
     timeout: Duration,
+}
+
+const MAX_GRANTS: usize = 1024;
+
+/// Removes the pending-map entry when the waiting future is dropped for any
+/// reason — nothing may leak a sender (the watchdog then times the row out).
+struct PendingGuard<'a> {
+    broker: &'a ApprovalBroker,
+    id: String,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.broker.pending.lock() {
+            map.remove(&self.id);
+        }
+    }
 }
 
 impl ApprovalBroker {
@@ -102,12 +123,12 @@ impl ApprovalBroker {
         cancel: &CancellationToken,
     ) -> Verdict {
         let scope = session_id.unwrap_or(run_id).to_owned();
-        if self
+        let granted = self
             .grants
             .lock()
-            .await
-            .contains(&(scope.clone(), tool.to_owned()))
-        {
+            .map(|g| g.contains(&(scope.clone(), tool.to_owned())))
+            .unwrap_or(false);
+        if granted {
             self.audit(
                 "approval.auto_granted",
                 serde_json::json!({ "run_id": run_id, "tool": tool, "scope": scope }),
@@ -134,19 +155,59 @@ impl ApprovalBroker {
             created_at: now,
             decided_at: None,
         };
+        // Sender registered BEFORE the row becomes visible: a polling client
+        // that resolves the instant the row appears always finds the sender.
+        let (tx, mut rx) = oneshot::channel::<Decision>();
+        if let Ok(mut map) = self.pending.lock() {
+            map.insert(approval.id.clone(), tx);
+        }
+        let guard = PendingGuard {
+            broker: self,
+            id: approval.id.clone(),
+        };
         if let Err(err) = self.store.insert_approval(&approval).await {
             tracing::error!("approval persist failed: {err}");
+            drop(guard);
             // Fail closed: an approval that cannot be recorded is denied
             return Verdict::Denied("approval could not be recorded (fail-closed)".to_owned());
         }
-        let (tx, mut rx) = oneshot::channel::<Decision>();
-        self.pending.lock().await.insert(approval.id.clone(), tx);
+        // Watchdog backstop: if this waiting future is dropped (task killed,
+        // panic elsewhere) the row must still fail closed. The pending-only
+        // UPDATE makes the normal paths win harmlessly (Conflict → no-op).
+        {
+            let store = self.store.clone();
+            let emit = Arc::clone(&self.emit);
+            let id = approval.id.clone();
+            let run_id = run_id.to_owned();
+            let after = self.timeout + Duration::from_secs(1);
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                if store
+                    .resolve_approval(&id, ApprovalStatus::TimedOut, None, now_iso8601())
+                    .await
+                    .is_ok()
+                {
+                    tracing::warn!("approval {id} force-timed-out by watchdog");
+                    (emit)(EventBody::ApprovalResolved(ApprovalResolvedPayload {
+                        approval_id: id,
+                        run_id,
+                        decision_type: "timed_out".to_owned(),
+                    }));
+                }
+            });
+        }
         (self.emit)(EventBody::ApprovalRequired(Box::new(approval.clone())));
         self.audit(
             "approval.required",
             serde_json::json!({
                 "approval_id": approval.id, "run_id": run_id,
                 "tool": tool, "tool_call_id": tool_call_id,
+                // Chain the full content: the audit log must prove WHAT was
+                // asked, not merely that an id existed (review C4)
+                "summary": approval.summary,
+                "payload": approval.payload,
+                "available_decisions": approval.available_decisions,
+                "expires_at": approval.expires_at,
             }),
         )
         .await;
@@ -169,11 +230,10 @@ impl ApprovalBroker {
                         self.broadcast_resolution(&id, run_id, "timed_out").await;
                         Verdict::Denied("approval timed out (fail-closed)".to_owned())
                     }
-                    // A decision won the race against the timeout — take it
-                    Err(StoreError::Conflict(_)) => match rx.await {
-                        Ok(decision) => self.apply_decision(&id, &scope, tool, decision).await,
-                        Err(_) => Verdict::Aborted("approval channel dropped".to_owned()),
-                    },
+                    // A decision won the race against the timeout — the row
+                    // (single arbiter) tells us which; never block on the
+                    // channel here (fail-closed, review C4)
+                    Err(StoreError::Conflict(_)) => self.verdict_from_row(&id, &scope, tool).await,
                     Err(err) => {
                         tracing::error!("approval timeout persist failed: {err}");
                         Verdict::Denied("approval store error (fail-closed)".to_owned())
@@ -192,8 +252,53 @@ impl ApprovalBroker {
                 Verdict::Aborted("run cancelled while approval pending".to_owned())
             }
         };
-        self.pending.lock().await.remove(&id);
+        drop(guard);
         verdict
+    }
+
+    /// Derive the verdict from the authoritative store row (used when a
+    /// concurrent resolution won a race). Fail-closed on anything unexpected.
+    async fn verdict_from_row(&self, id: &str, scope: &str, tool: &str) -> Verdict {
+        match self.store.get_approval(id).await {
+            Ok(Some(row)) => match row.status {
+                ApprovalStatus::Approved => {
+                    let kind = row.decision.as_ref().map(|d| d.kind.as_str());
+                    if kind == Some("approve_for_session") {
+                        self.grant(scope, tool);
+                    }
+                    Verdict::Approved
+                }
+                ApprovalStatus::Denied => Verdict::Denied(format!(
+                    "denied by user: {}",
+                    row.decision
+                        .as_ref()
+                        .and_then(|d| d.reason.as_deref())
+                        .unwrap_or("no reason given")
+                )),
+                ApprovalStatus::Aborted => Verdict::Aborted("aborted by user".to_owned()),
+                ApprovalStatus::TimedOut => {
+                    Verdict::Denied("approval timed out (fail-closed)".to_owned())
+                }
+                ApprovalStatus::Pending => {
+                    Verdict::Denied("approval in inconsistent state (fail-closed)".to_owned())
+                }
+            },
+            other => {
+                tracing::error!("approval {id} row unreadable after conflict: {other:?}");
+                Verdict::Denied("approval store error (fail-closed)".to_owned())
+            }
+        }
+    }
+
+    fn grant(&self, scope: &str, tool: &str) {
+        if let Ok(mut grants) = self.grants.lock() {
+            if grants.len() >= MAX_GRANTS {
+                // Fail-closed bound: clearing only means users get re-asked
+                tracing::warn!("session-grant set full ({MAX_GRANTS}); clearing");
+                grants.clear();
+            }
+            grants.insert((scope.to_owned(), tool.to_owned()));
+        }
     }
 
     /// Interpret a decision that already won the store transition.
@@ -207,10 +312,7 @@ impl ApprovalBroker {
         match decision.kind.as_str() {
             "approve" => Verdict::Approved,
             "approve_for_session" => {
-                self.grants
-                    .lock()
-                    .await
-                    .insert((scope.to_owned(), tool.to_owned()));
+                self.grant(scope, tool);
                 self.audit(
                     "approval.session_grant",
                     serde_json::json!({ "approval_id": approval_id, "scope": scope, "tool": tool }),
@@ -255,6 +357,11 @@ impl ApprovalBroker {
             .get_approval(id)
             .await?
             .ok_or_else(|| ResolveError::NotFound(id.to_owned()))?;
+        // 409 comes BEFORE decision validation: a bad decision against an
+        // already-resolved approval is still "already resolved" per openapi
+        if approval.status != ApprovalStatus::Pending {
+            return Err(ResolveError::AlreadyResolved(id.to_owned()));
+        }
         if !approval
             .available_decisions
             .iter()
@@ -287,7 +394,8 @@ impl ApprovalBroker {
                 other => ResolveError::Store(other),
             })?;
         // Wake the waiting dispatch (absent waiter is fine — the row rules)
-        if let Some(tx) = self.pending.lock().await.remove(id) {
+        let tx = self.pending.lock().ok().and_then(|mut map| map.remove(id));
+        if let Some(tx) = tx {
             let _ = tx.send(decision.clone());
         }
         self.broadcast_resolution(id, &resolved.run_id, &decision.kind)
@@ -553,6 +661,38 @@ mod tests {
             .unwrap();
         let err = broker
             .resolve(&id, decision("deny", Some("late")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ResolveError::AlreadyResolved(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolved_approval_beats_decision_validation_with_409() {
+        // openapi: an already-resolved approval is 409 even for a decision
+        // type that would otherwise be invalid
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let _waiter = tokio::spawn(async move {
+            b.request(
+                "run_1",
+                None,
+                "tc_1",
+                "shell_exec",
+                "exec",
+                "s".to_owned(),
+                Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+        broker
+            .resolve(&id, decision("approve", None))
+            .await
+            .unwrap();
+        let err = broker
+            .resolve(&id, decision("definitely_not_offered", None))
             .await
             .unwrap_err();
         assert!(matches!(err, ResolveError::AlreadyResolved(_)), "{err}");
