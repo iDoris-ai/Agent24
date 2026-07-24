@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+pub mod router;
+
 /// A tool advertised to the model (OpenAI function-calling wire shape is
 /// produced by the adapter; this stays provider-neutral).
 #[derive(Debug, Clone, PartialEq)]
