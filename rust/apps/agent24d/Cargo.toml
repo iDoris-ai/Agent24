@@ -9,6 +9,7 @@ description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — heal
 [dependencies]
 agent24-agent = { path = "../../crates/agent24-agent" }
 agent24-core = { path = "../../crates/agent24-core" }
+agent24-memory = { path = "../../crates/agent24-memory" }
 agent24-models = { path = "../../crates/agent24-models" }
 agent24-policy = { path = "../../crates/agent24-policy" }
 agent24-scheduler = { path = "../../crates/agent24-scheduler" }

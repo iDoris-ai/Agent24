@@ -8,6 +8,8 @@ description = "Agent24 run manager — the agent loop (C2 scope: run lifecycle w
 
 [dependencies]
 agent24-core = { path = "../agent24-core" }
+agent24-memory = { path = "../agent24-memory" }
+async-trait = "0.1"
 agent24-models = { path = "../agent24-models" }
 agent24-protocol = { path = "../agent24-protocol" }
 agent24-store = { path = "../agent24-store" }
@@ -20,7 +22,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 agent24-policy = { path = "../agent24-policy" }
-async-trait = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
