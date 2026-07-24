@@ -333,57 +333,121 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 > 研读笔记：**`docs/reference-notes/openworker.md`**——开工前必读，本节只列任务不重复论证。
 > 产品同构（本地优先 + 审批门 + MCP + 定时 + 渠道 + 桌面壳），实现异构（Python 单体 vs Rust 内核）。
 > **借鉴的不是它的架构，而是它把「人机边界」想得比我们细的那几处。**
+>
+> **本节经 codex 对抗式评审后重写（2026-07-25）**。三处实质修正，已在下方各任务里落实：
+> ① 原 H6「补两条调度策略」**删除**——两条我们都已有（`agent24-scheduler/src/lib.rs:8` 的 skip-missed
+> doc contract + `agent24-agent/src/lib.rs:442` 的双层 spawn 监督执行）；
+> ② 原 H3 严重低估成本——**我们没有持久化消息线程**（store 只有
+> sessions/runs/tool_calls/approvals/schedules/audit_log，见 `migrations/0001_initial.sql`），
+> 而 OpenWorker 的 durable resume 恰恰是靠消息线程重建的，且 H3 **必须**与 G1 的 payload 哈希捆绑；
+> ③ 原 H1 写成「取代 `requires_approval: bool`」过于轻率——那是**公开协议字段**
+> （`protocol/openapi.yaml:971`），改动触发 `pnpm gen:api` + CI 零漂移门，必须做成**加法迁移**。
 
 | ID | 任务 | 依赖 | 状态 |
 |---|---|---|---|
-| H1 | **RiskClass 四级 + 分类函数**：`read/write_local/exec/external` 取代 `requires_approval: bool`；分级决定豁免路径 | C4 | pending |
-| H2 | **用户本地风险 override**：glob 规则放宽/收紧单个工具的风险级，最具体者赢；**模块/persona 不得写入** | H1, E1 | pending |
-| H3 | **审批 durable resume**：重启后按 `(session_id, tool_call_id)` 幂等复原挂起审批并接着问，取代「全部 aborted」 | G1, F1a | pending |
-| H4 | **常驻定向授权**：「总是允许」绑到 `tool → 确切目标`，仅 external 风险，规则挂在 schedule 记录上 | H1, C5 | pending |
-| H5 | **self-wake 工具**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick | C5 | pending |
-| H6 | 调度器补两条策略：**run-once-catch-up**（宕机期间错过的到期任务补跑一次）+ **spawn 不 await** | C5, G1 | pending |
-| H7 | 工具并发三分法：**授权串行 → 只读并发 → 写/exec 串行**（顺序不可反） | H1 | pending |
+| H1 | **`risk_class` 加法迁移**：`read/write_local/exec/external` 作为新协议字段落地，`requires_approval` 改为由它派生；零行为变更 | C4 | pending |
+| H2 | **用户本地风险 override**：glob 规则调整单个工具的 risk_class；**模块/persona 不得写入**；与 Guardian 的优先级明确 | H1, E1 | pending |
+| H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | pending |
+| H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | pending |
+| H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending |
+| H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending |
+| H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | pending |
+| H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | pending |
+| H11 | **协议级 Fake 渠道 harness**：FakeWeChat / FakeNostr，让渠道审批与 inbox 可自动测 | F3 | pending |
+| H12 | **provider 错误人话翻译**：额度/权限/模型不存在类错误落成可读文案 | — | pending |
+| H7 | 工具并发三分法（授权串行 → 只读并发 → 写/exec 串行） | H1 | **deferred**（收益不确定，代价高，见下） |
+| ~~H6~~ | ~~调度器补 catch-up + spawn 不 await~~ | — | **删除（已存在）** |
 
-### H1 为什么先做（其余四条都挂在它上面）
+### 执行顺序（codex 评审后确定）
 
-现状 `ToolInfo.requires_approval: bool` 是二值的，只能表达「问 / 不问」。
-H2 的 override 需要一个可覆盖的**级**、H4 的定向授权需要「只有 external 有资格」这个判据、
-H7 的并发需要「read 是安全的」这个判据——**三者都要求风险先成为一等的分类，而不是一个布尔**。
-分类函数三级解析：用户 override → 内置名表 → `ToolInfo` 元数据 → 默认 read。
+`H1 → H2 → H4 → [G1+H3] → H5 → H10/H11 →（H8/H9/H12 择机）`，H7 最后且可能永不做。
 
-### H2 不做会怎样（E1 的实际可用性）
+前三条是一条线：**H1 提供判据 → H2 用判据放宽 → H4 用判据收窄**。
+`G1+H3` 是 M-F 前必须做完的那一块（否则 24/7 语义是错的），但它最贵，放在判据成型之后。
 
-E1 让 MCP 工具默认 `requires_approval=true`（第三方代码不自动派发，判断正确）。
-但保守默认**不配 override 就等于把功能关掉**：接一个 filesystem MCP server，每次 `read_file` 都弹审批，
-用户三天内自己关掉 MCP。H2 是让 E1 真正可用的那块拼图。
+### H1 加法迁移（本轮执行）
 
-**硬约束（写进 E3/E5 之前必须先立）**：override store 是 **user-local，永远不由模块清单/persona 写入**。
-模块可以*声明*它想要什么工具，但只有用户决定信任到什么程度。否则模块市场等于让第三方自带豁免。
+**不是**把 `requires_approval: bool` 换成枚举——那是破坏性契约改动。做法：
 
-### H3 与 C4 验收条目的冲突（需显式改写）
+1. `agent24-protocol`：新增 `RiskClass{read, write_local, exec, external}`（serde snake_case + schemars），
+   `ToolInfo` 加 `risk_class` 字段。
+2. `protocol/openapi.yaml`：`ToolInfo` 加 `risk_class`（**不进 `required`**——老客户端不得因此失败），
+   跑 `pnpm gen:api` 让 api-client 同步，CI 零漂移门必须绿。
+3. `agent24-tools`：每个内置工具**声明** risk_class；`requires_approval` 改为 `risk_class != Read` **派生**，
+   消除「两处手工同步」的漂移可能（这是 OpenWorker `risk.py:1` 重构掉 `WRITE_TOOLS` 名集合的同一个理由）。
+4. 映射（**刻意保持零行为变更**）：`fs_read → read`、`http_fetch → read`、`fs_write → write_local`、
+   `shell_exec → exec`、MCP 工具 → `external`。派生出的 `requires_approval` 与当前逐字相同。
+5. `http_fetch = read` 的取舍要写进代码注释：GET 无副作用，**它的危险是外泄而不是改动**——
+   外泄属于污点（taint）问题，不属于风险级（见 `openworker.md` §1 与 `openfang.md` §8 的 taint 原语）。
+   把网络读塞进 `external` 会让 H4 的定向授权对它生效，那是错的语义。
 
-C4 现有验收写着「daemon 被 kill 后重启，遗留 pending 审批全部标记 aborted」。
-**F1a（launchd 自愈）之后这条语义就错了**：daemon 两秒被拉起来，而凌晨那条等人批的任务已经死了；
-人早上看到的是「任务失败」而不是「任务在等你」。
-H3 落地时**同步修订 C4 的这条验收**，并保留一条兜底：无法复原的（会话已删、工具已卸载）仍标 aborted。
+**验收**：`cargo test` 全绿；`GET /api/v1/tools` 每个工具带 risk_class；
+新增单测断言「每个工具的 `requires_approval` == (risk_class != read)」（派生不可被绕过）；
+`pnpm gen:api` 无漂移；contract-tests 双后端绿。
 
-复原信息应尽量来自已持久化的消息线程（找出最后一条 assistant 消息里尚无 tool result 的 tool_calls），
-不要新发明一套 checkpoint 格式。
+### H2 重写（原文「没有它 E1 等于不可用」过满）
 
-### H4 与现有 `approve_for_session` 的关系
+**事实修正**：D3 Guardian 已能对 gated call 做本地小模型评估并自动放行低风险
+（`agent24-policy/src/lib.rs:166`、`guardian.rs:142`），所以 MCP 并非「必须靠 H2 才可用」。
 
-现在的 `approve_for_session` 是 `(scope, tool)`——**批准一次后该工具对任何参数都放行**。
-无人值守下这是危险的：凌晨的定时任务批了一次发消息，之后它发到哪个群都不再问。
-H4 不是替换它，而是**在同一个 UX 位置提供更窄的选项**：绑定到确切目标（频道地址、收件人）。
-资格三重收窄：① 仅 external 风险（exec/write 永远问）② 工具必须声明 target 参数 ③ 调用必须真的填了 target。
-授权时 fail-closed——只有写操作成为授权，读权限只在同意卡片上**披露**、不存储。
+**但 Guardian 不是 H2 的替代品**，三点差异决定了两者都要：
 
-### H6 第二条的因果
+| | D3 Guardian | H2 override |
+|---|---|---|
+| 默认 | **关**（`A24_GUARDIAN=1` 才开，`agent24d/src/server.rs:79`——刻意不默认信任模型） | 用户显式写下才生效 |
+| 性质 | 模型判断，**非确定性**，每次调用都要跑一次 | 声明式规则，确定性，可审计 |
+| 可解释 | `{risk_level, rationale}` 一次性 | 「是我允许的」，可回看可撤销 |
 
-「spawn 不 await」不是性能优化，是**异步审批的配套前提**：
-一个 run 可能挂在待批审批上等好几个小时，调度器若 await 它，
-其他到期任务和 self-wake 恢复全部僵死。只搬 G1/H3 不搬这条，会得到一个会卡住的调度器。
-关停契约同时补上：停止调度器时把 spawn 出去的 run 一并取消——**挂起的 run 不得比调度器活得久**。
+**优先级必须写死**：用户 override 先于 Guardian（用户的显式声明高于模型的推断）；
+override 只能把风险**调整**到用户选定的级，不能凭空放行一次具体调用——
+放行仍走同一条 `risk_class → 门禁` 路径。
+
+**硬约束（写进 E3/E5/H10 之前必须先立）**：override store 是 **user-local，永远不由模块清单/persona 写入**
+（上游把这条标为 inviolable，`overrides.py:1`）。模块可以*声明*它想要什么工具，
+但只有用户决定信任到什么程度。否则模块市场等于让第三方自带豁免。
+
+### H4 收窄（比原文更进一步）
+
+现状比原笔记写得更值得改：`approve_for_session` 命中后**直接 `Verdict::Approved`**
+（`agent24-policy/src/lib.rs:151`），**Guardian 也不再被咨询**（`:170`）。
+`MAX_GRANTS` 溢出清空（`:420`）只防集合无界增长，**完全不限制一条已有 grant 的参数范围**。
+
+H4 = 对 external 风险的工具提供**更窄的选项**并**停用宽泛选项**：
+- 常驻规则形态 `tool → 确切目标`，资格三重收窄：① 仅 `external` ② 工具必须声明 target 参数
+  ③ 调用必须真的填了 target；`exec`/`write_local` 永远问。
+- 规则挂在 schedule 记录上（撤销 per-automation，删任务带走规则）。
+- 授权 fail-closed：只有写操作成为授权；读权限只在同意卡片上**披露**、不存储。
+- **`approve_for_session` 对 external 工具不再作为可选项呈现**——否则窄选项旁边永远摆着个宽选项，
+  用户会点宽的那个。
+
+### G1+H3 合并（M-F 前必须完成，最贵的一块）
+
+原 H3 只写了「重启后接着问」，漏了三件事，codex 指出后补上。**四件事捆绑交付，缺一不可**：
+
+1. **消息线程持久化**——我们目前只把成功的 exchange 追加进 session memory
+   （`agent24-agent/src/lib.rs:319`），没有 assistant/tool 消息表。
+   不先有它，就没有 OpenWorker 那种「从未回答的 trailing tool_calls 重建挂起点」的便宜做法。
+2. **payload 完整性哈希**（G1 已论证）——异步模型下不做就会「批的是 A、执行的是 B」。
+3. **复原取代 abort**——改 `agent24d/src/server.rs:388` 的启动清扫，
+   并**同步修订 C4 的验收条目**（现在写的是「遗留 pending 审批全部标记 aborted」）。
+4. **陈旧性重校验**——哈希只保证 payload 未变，**不保证世界未变**：工具可能已卸载、
+   MCP server 已下线、目标资源已删除、schedule 已改。复原时必须重校验工具仍存在、
+   并给审批项 TTL 与「这是 N 小时前排队的」提示。无法复原的仍标 aborted（兜底不能丢）。
+
+### H5 self-wake（成本比原文写的高）
+
+不只是四个工具：`ScheduleAction` 目前只有 `agent_run`（`agent24-protocol/src/types.rs:254`），
+H5 要新增 wake 表 + **「向既有 session 投递后台消息」这个语义本身**。
+scheduler 的 tick 已存在（`agent24-scheduler/src/lib.rs:202`），按上游的 `extra_tick` 位挂进去即可，
+并继承关停契约：**停调度器时把 spawn 出去的 run 一并取消，挂起的 run 不得比调度器活得久**。
+
+### H7 为何降级
+
+原文说它「几乎零风险」是错的。审批、状态转换与执行在 `ToolRegistry::dispatch()` 里是耦合的
+（`agent24-tools/src/lib.rs:248`），`run_tool_call` 还会把 run 切到 `awaiting_approval`
+（`agent24-agent/src/lib.rs:759`）。要并发就得先拆 `authorize()` / `execute()` 两阶段，
+还要保证 tool result 按原调用顺序回填。收益（几个独立只读调用并行）在本地模型延迟面前不显著。
+**H1 之后再评估，没有明确的慢场景就不做。**
 
 ### 明确不借鉴
 
@@ -391,5 +455,5 @@ H4 不是替换它，而是**在同一个 UX 位置提供更窄的选项**：绑
   注意它是**在已支持 MCP 的前提下**还手写了这些——说明 MCP 给不了那种产品级体验。
   这印证 E2 降级的判断，同时警告 M-F：**渠道成本大头在账号与寻址，不在协议**。我们只要一个微信 + 一个 Nostr。
 - **前缀式 ProviderRouter**（`provider:model` 分发，不看成本/健康/隐私）——D2 的 ModelRouter 比它成熟，不要回退。
-- **JSON 整文件重写当存储**——我们 sqlx/SQLite 已更对，H1–H6 一律建表。
+- **JSON 整文件重写当存储**——我们 sqlx/SQLite 已更对，H1–H12 一律建表。
 - **3505 行的 manager.py God object**——与 openfang 的 kernel 同病。
