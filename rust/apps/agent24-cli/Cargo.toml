@@ -16,7 +16,13 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "sync"] }
+# TUI (C6)
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+# localhost only (ws://, never wss) — `connect` gives connect_async
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", default-features = false }
 
 [lints]
 workspace = true

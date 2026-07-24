@@ -13,6 +13,8 @@ use agent24_protocol::{ChatMessage, ChatRequest, ChatResponse, Health};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod tui;
+
 #[derive(Parser)]
 #[command(
     name = "agent24",
@@ -41,6 +43,8 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Launch the terminal UI (runs · events · approval queue)
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -349,6 +353,19 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
     }
 }
 
+async fn cmd_tui() -> Result<(), String> {
+    // Attach to a running daemon when present; otherwise spawn an ephemeral
+    // one that lives for this TUI session (killed on exit via finish()).
+    let ep = connect().await?;
+    let conn = tui::Conn {
+        base: ep.base.clone(),
+        token: ep.token.clone(),
+    };
+    let result = tui::run(conn).await;
+    finish(ep).await;
+    result
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
@@ -356,6 +373,7 @@ async fn main() -> std::process::ExitCode {
         Command::Chat { message, model } => cmd_chat(message, model).await,
         Command::Models => cmd_models().await,
         Command::Daemon { action } => cmd_daemon(action).await,
+        Command::Tui => cmd_tui().await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
