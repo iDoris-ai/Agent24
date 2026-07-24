@@ -6,7 +6,10 @@ use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() {
     let mut a = std::env::args().skip(1);
-    let cmd = a.next().expect("usage: probe <command> [args...]");
+    let Some(cmd) = a.next() else {
+        eprintln!("usage: probe <command> [args...]");
+        return;
+    };
     let args: Vec<String> = a.collect();
     let spec = McpServerSpec::new("probe", cmd, args);
     let cancel = CancellationToken::new();
