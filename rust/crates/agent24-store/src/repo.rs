@@ -485,21 +485,19 @@ impl Store {
         Ok(())
     }
 
-    /// Persist an EXISTING schedule (never inserts). Returns false when the
-    /// row is gone — used by the scheduler's fire path so a schedule deleted
-    /// mid-tick cannot be resurrected by a post-trigger write (review C5).
-    pub async fn update_schedule_if_exists(&self, schedule: &Schedule) -> Result<bool> {
+    /// Persist ONLY the scheduler-owned runtime columns of an existing row
+    /// (enabled / last_run_at / next_run_at / consecutive_failures). Returns
+    /// false when the row is gone. Two guarantees for the fire path (review
+    /// C5): a schedule deleted mid-tick is not resurrected (never inserts),
+    /// and a concurrent PATCH to the user-facing fields (name / spec / action
+    /// / delivery) is not clobbered — those columns are left untouched.
+    pub async fn update_schedule_runtime(&self, schedule: &Schedule) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE schedules SET
-                 name = ?, enabled = ?, spec = ?, action = ?, delivery = ?,
-                 last_run_at = ?, next_run_at = ?, consecutive_failures = ?
+                 enabled = ?, last_run_at = ?, next_run_at = ?, consecutive_failures = ?
              WHERE id = ?",
         )
-        .bind(&schedule.name)
         .bind(schedule.enabled)
-        .bind(serde_json::to_string(&schedule.spec)?)
-        .bind(serde_json::to_string(&schedule.action)?)
-        .bind(serde_json::to_string(&schedule.delivery)?)
         .bind(&schedule.last_run_at)
         .bind(&schedule.next_run_at)
         .bind(schedule.consecutive_failures)

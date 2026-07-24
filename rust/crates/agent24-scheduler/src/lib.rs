@@ -252,7 +252,7 @@ impl Scheduler {
                 );
                 schedule.enabled = false;
                 schedule.next_run_at = None;
-                self.store.update_schedule_if_exists(&schedule).await?;
+                self.store.update_schedule_runtime(&schedule).await?;
                 self.emit_disabled(&schedule.id, "next_fire_error");
                 return Ok(());
             }
@@ -261,7 +261,7 @@ impl Scheduler {
         schedule.next_run_at = advanced;
         // Pre-advance: if the row is already gone (concurrent delete), stop —
         // don't trigger a run for a schedule the user just removed.
-        if !self.store.update_schedule_if_exists(&schedule).await? {
+        if !self.store.update_schedule_runtime(&schedule).await? {
             tracing::debug!("schedule {} deleted before fire; skipping", schedule.id);
             return Ok(());
         }
@@ -271,7 +271,7 @@ impl Scheduler {
             Ok(run_id) => {
                 if schedule.consecutive_failures != 0 {
                     schedule.consecutive_failures = 0;
-                    self.store.update_schedule_if_exists(&schedule).await?;
+                    self.store.update_schedule_runtime(&schedule).await?;
                 }
                 self.emit.as_ref()(EventBody::ScheduleFired(ScheduleFiredPayload {
                     schedule_id: schedule.id.clone(),
@@ -284,10 +284,10 @@ impl Scheduler {
                 if health == agent24_core::ScheduleHealth::MustDisable {
                     schedule.enabled = false;
                     schedule.next_run_at = None;
-                    self.store.update_schedule_if_exists(&schedule).await?;
+                    self.store.update_schedule_runtime(&schedule).await?;
                     self.emit_disabled(&schedule.id, "consecutive_failures");
                 } else {
-                    self.store.update_schedule_if_exists(&schedule).await?;
+                    self.store.update_schedule_runtime(&schedule).await?;
                 }
             }
         }
