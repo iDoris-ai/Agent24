@@ -100,8 +100,8 @@
 |---|---|---|---|---|
 | C1 | agent24-core 领域模型 + agent24-store | B5 | merged | #35 |
 | C2 | Agent Loop v1（runs 端到端） | C1 | merged | #36 |
-| C3 | Tool trait + registry + 基础工具 | C2 | in-pr | #37 |
-| C4 | 审批系统 | C3 | pending | |
+| C3 | Tool trait + registry + 基础工具 | C2 | merged | #37 |
+| C4 | 审批系统 | C3 | in-pr | #38 |
 | C5 | Schedule 调度器 | C2 | pending | |
 | C6 | `agent24 tui` 最小版 | C4, C5 | pending | |
 | C7 | 桌面端 Runs/Schedules/Approvals UI | C4, C5 | pending | |

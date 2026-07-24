@@ -26,10 +26,22 @@ pub fn ulid() -> String {
 
 /// ISO 8601 UTC, second precision (civil-from-days — no chrono dependency).
 pub fn now_iso8601() -> String {
-    let secs = std::time::SystemTime::now()
+    iso8601_at(epoch_secs())
+}
+
+/// ISO 8601 UTC timestamp `after` from now (e.g. approval expires_at).
+pub fn iso8601_after(after: std::time::Duration) -> String {
+    iso8601_at(epoch_secs().saturating_add(after.as_secs()))
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+fn iso8601_at(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);

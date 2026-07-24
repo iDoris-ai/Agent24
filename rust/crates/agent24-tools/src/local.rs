@@ -436,6 +436,8 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             run_id: "run_test".to_owned(),
+            session_id: None,
+            tool_call_id: "tc_test".to_owned(),
         }
     }
 
