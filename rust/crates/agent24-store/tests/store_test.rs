@@ -47,6 +47,7 @@ fn approval(id: &str, run_id: &str) -> Approval {
         summary: "run a command".to_owned(),
         payload: serde_json::Map::new(),
         available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
+        standing_target: None,
         status: ApprovalStatus::Pending,
         decision: None,
         expires_at: "2026-07-24T00:05:00Z".to_owned(),

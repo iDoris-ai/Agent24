@@ -30,6 +30,11 @@ pub struct ToolContext {
     pub run_id: String,
     /// The session the run belongs to (scopes approve_for_session grants)
     pub session_id: Option<String>,
+    /// The schedule that fired this run, when one did. A standing grant minted
+    /// here belongs to the SCHEDULE rather than the session (H4): an unattended
+    /// automation is the thing the user was consenting to, so revoking or
+    /// deleting that automation must take its grants with it.
+    pub schedule_id: Option<String>,
     /// The persisted tool-call row this execution belongs to
     pub tool_call_id: String,
 }
@@ -66,11 +71,16 @@ pub enum GateDecision {
 /// fail-closed [`DenyAllGate`]; C4 installs an interactive broker-backed gate.
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
+    /// `standing_target` is this call's value for the tool's declared target
+    /// argument, when it has one and the call filled it — the only thing a
+    /// target-scoped standing grant (H4) may ever be bound to. `None` means no
+    /// such grant can be offered for this call.
     async fn check(
         &self,
         info: &ToolInfo,
         ctx: &ToolContext,
         input: &Map<String, Value>,
+        standing_target: Option<&str>,
         cancel: &CancellationToken,
     ) -> GateDecision;
 }
@@ -99,6 +109,7 @@ impl ApprovalGate for DenyAllGate {
         info: &ToolInfo,
         _ctx: &ToolContext,
         _input: &Map<String, Value>,
+        _standing_target: Option<&str>,
         _cancel: &CancellationToken,
     ) -> GateDecision {
         GateDecision::Deny(format!(
@@ -116,6 +127,17 @@ pub trait Tool: Send + Sync {
 
     /// JSON Schema for the input object
     fn parameters(&self) -> Value;
+
+    /// The input field naming *where this call sends things* — the channel
+    /// address, the recipient, the repository. `None` (the default) means the
+    /// tool is not eligible for a target-scoped standing grant (H4) at all.
+    ///
+    /// Declared rather than guessed. A heuristic over parameter names would
+    /// eventually bind a grant to the wrong field, and the failure mode of that
+    /// mistake is a standing authorisation the user never meant to give.
+    fn target_arg(&self) -> Option<String> {
+        None
+    }
 
     /// Per-tool execution budget, enforced by the registry
     fn timeout(&self) -> Duration {
@@ -344,8 +366,22 @@ impl ToolRegistry {
             declared.description,
             effective,
         );
+        // Resolve the standing-grant target BEFORE the gate: eligibility is a
+        // property of this call (tool declares a target arg AND the call filled
+        // it), and the gate must not have to reach back into the registry to
+        // work it out.
+        let standing_target = tool
+            .target_arg()
+            .and_then(|arg| input.get(&arg).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
         if effective.requires_approval() {
-            match self.gate.check(&info, ctx, input, cancel).await {
+            match self
+                .gate
+                .check(&info, ctx, input, standing_target.as_deref(), cancel)
+                .await
+            {
                 GateDecision::Allow => {}
                 GateDecision::Deny(reason) => return Err(ToolError::Denied(reason)),
                 GateDecision::AbortRun(reason) => return Err(ToolError::AbortRun(reason)),
@@ -425,6 +461,7 @@ mod tests {
         ToolContext {
             run_id: "run_test".to_owned(),
             session_id: None,
+            schedule_id: None,
             tool_call_id: "tc_test".to_owned(),
         }
     }
@@ -513,6 +550,7 @@ mod tests {
             info: &ToolInfo,
             _ctx: &ToolContext,
             _input: &Map<String, Value>,
+            _standing_target: Option<&str>,
             _cancel: &CancellationToken,
         ) -> GateDecision {
             panic!("gate consulted for {} — it should not have been", info.name);
