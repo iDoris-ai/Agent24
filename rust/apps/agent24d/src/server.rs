@@ -121,14 +121,16 @@ fn parse_always_review(raw: Option<&str>) -> Vec<String> {
 }
 
 impl AppState {
+    /// The guardian is INJECTED rather than read from env in here, so tests can
+    /// wire a stub one; `serve` supplies [`build_guardian`]'s env-driven result.
     pub fn new(
         token: String,
-        router: ModelRouter,
+        router: Arc<ModelRouter>,
         tools: agent24_tools::ToolRegistry,
         store: Store,
         shutdown: CancellationToken,
+        guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     ) -> Self {
-        let router = Arc::new(router);
         let events = crate::events::EventsHub::default();
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
@@ -141,7 +143,7 @@ impl AppState {
             store.clone(),
             StdArc::new(move |body| hub.broadcast(body)),
             timeout,
-            build_guardian(&router),
+            guardian,
         );
         let tools = Arc::new(tools.with_gate(StdArc::new(agent24_policy::BrokerGate::new(
             StdArc::clone(&broker),
@@ -350,12 +352,15 @@ pub async fn serve(
         .ok_or_else(|| std::io::Error::other("HOME not set"))?
         .join("workspace");
     std::fs::create_dir_all(&workspace)?;
+    let router = Arc::new(ModelRouter::from_env());
+    let guardian = build_guardian(&router);
     let state = AppState::new(
         token.clone(),
-        ModelRouter::from_env(),
+        router,
         agent24_tools::ToolRegistry::builtin(workspace),
         store,
         cancel.clone(),
+        guardian,
     );
     // Scheduler tick loop: polls due schedules and fires runs. Cadence from
     // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
@@ -478,12 +483,48 @@ mod tests {
     use tower::ServiceExt;
 
     async fn state() -> AppState {
+        state_with_guardian(None).await
+    }
+
+    async fn state_with_guardian(
+        guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
+    ) -> AppState {
         AppState::new(
             "testtoken".to_owned(),
-            ModelRouter::with_defaults(vec![]),
+            Arc::new(ModelRouter::with_defaults(vec![])),
             agent24_tools::ToolRegistry::new(),
             Store::open_memory().await.unwrap(),
             CancellationToken::new(),
+            guardian,
+        )
+    }
+
+    /// A guardian whose assessor always returns the given verdict — lets us test
+    /// the daemon's wiring without a live model.
+    struct StubAssessor(agent24_policy::guardian::RiskLevel);
+
+    #[async_trait::async_trait]
+    impl agent24_policy::guardian::RiskAssessor for StubAssessor {
+        async fn assess(
+            &self,
+            _input: &agent24_policy::guardian::AssessInput<'_>,
+            _cancel: &CancellationToken,
+        ) -> Result<agent24_policy::guardian::RiskAssessment, agent24_policy::guardian::AssessError>
+        {
+            Ok(agent24_policy::guardian::RiskAssessment {
+                level: self.0,
+                rationale: "stub".to_owned(),
+            })
+        }
+    }
+
+    fn stub_guardian(
+        level: agent24_policy::guardian::RiskLevel,
+        always_review: Vec<String>,
+    ) -> StdArc<agent24_policy::guardian::Guardian> {
+        StdArc::new(
+            agent24_policy::guardian::Guardian::new(StdArc::new(StubAssessor(level)))
+                .always_review(always_review),
         )
     }
 
@@ -615,6 +656,169 @@ mod tests {
         // Explicitly empty = operator allows every kind to be auto-approvable.
         assert!(parse_always_review(Some("")).is_empty());
         assert!(parse_always_review(Some(" , ")).is_empty());
+    }
+
+    /// An approval row has a FK to its run, so escalation tests must seed one.
+    async fn seed_run(store: &Store, id: &str) {
+        let now = agent24_core::util::now_iso8601();
+        store
+            .insert_run(&agent24_protocol::Run {
+                id: id.to_owned(),
+                session_id: None,
+                status: agent24_protocol::RunStatus::Running,
+                input: agent24_protocol::RunInput {
+                    prompt: "p".to_owned(),
+                    model_override: None,
+                },
+                output: None,
+                error: None,
+                usage: agent24_protocol::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cost_usd: 0.0,
+                },
+                schedule_id: None,
+                created_at: now.clone(),
+                started_at: Some(now),
+                ended_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Drive one gated call through the daemon's real broker.
+    async fn gated_call(state: &AppState, tool: &str, kind: &str) -> agent24_policy::Verdict {
+        state
+            .broker
+            .request(
+                "run_1",
+                Some("sess_1"),
+                "tc_1",
+                tool,
+                kind,
+                format!("{tool}: x"),
+                serde_json::Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn wired_guardian_auto_approves_low_risk_without_a_human() {
+        // Codex follow-up: prove the daemon's broker really consults the injected
+        // guardian. A low verdict on a non-always-review kind auto-approves with
+        // NO approval row (nobody was asked) — and it returns immediately, so no
+        // 300s human-approval path is involved.
+        let state = state_with_guardian(Some(stub_guardian(
+            agent24_policy::guardian::RiskLevel::Low,
+            vec![],
+        )))
+        .await;
+        let verdict = gated_call(&state, "fs_write", "fs_write").await;
+        assert_eq!(verdict, agent24_policy::Verdict::Approved);
+        assert!(state.store.list_approvals(None).await.unwrap().is_empty());
+        let audits = state.store.list_audit().await.unwrap();
+        assert!(audits.iter().any(|a| a.action == "approval.auto_approved"));
+    }
+
+    #[tokio::test]
+    async fn wired_guardian_never_auto_approves_an_always_review_kind() {
+        // The default always-review list keeps shell_exec ("exec") human-gated
+        // even when the model says low. Escalation is audited; we cancel rather
+        // than wait out the approval timeout.
+        let state = state_with_guardian(Some(stub_guardian(
+            agent24_policy::guardian::RiskLevel::Low,
+            vec!["exec".to_owned()],
+        )))
+        .await;
+        seed_run(&state.store, "run_1").await;
+        let cancel = CancellationToken::new();
+        let broker = Arc::clone(&state.broker);
+        let c = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            broker
+                .request(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "shell_exec: rm -rf /".to_owned(),
+                    serde_json::Map::new(),
+                    &c,
+                )
+                .await
+        });
+        // A pending row must appear → it went to the human flow, not auto-approved.
+        let mut pending = false;
+        for _ in 0..200 {
+            if !state
+                .store
+                .list_approvals(Some(agent24_protocol::ApprovalStatus::Pending))
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                pending = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pending, "always-review kind was not escalated to a human");
+        cancel.cancel();
+        let verdict = waiter.await.unwrap();
+        assert!(
+            matches!(verdict, agent24_policy::Verdict::Aborted(_)),
+            "{verdict:?}"
+        );
+        let audits = state.store.list_audit().await.unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|a| a.action == "approval.guardian_escalated")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_guardian_every_gated_call_still_asks_a_human() {
+        // Default daemon (no guardian): unchanged behaviour — a pending row.
+        let state = state().await;
+        seed_run(&state.store, "run_1").await;
+        let cancel = CancellationToken::new();
+        let broker = Arc::clone(&state.broker);
+        let c = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            broker
+                .request(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "fs_write",
+                    "fs_write",
+                    "fs_write: x".to_owned(),
+                    serde_json::Map::new(),
+                    &c,
+                )
+                .await
+        });
+        let mut pending = false;
+        for _ in 0..200 {
+            if !state
+                .store
+                .list_approvals(Some(agent24_protocol::ApprovalStatus::Pending))
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                pending = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pending, "no guardian, yet no human was asked");
+        cancel.cancel();
+        let _ = waiter.await;
     }
 
     #[test]
