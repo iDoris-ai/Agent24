@@ -14,7 +14,11 @@ export interface ScheduleSpecInput {
 
 export interface PreviewResult {
   next: Date | null
-  error: string | null
+  /** Human-readable text for display (error or info); null when a time shows */
+  message: string | null
+  /** true = the spec is INVALID (blocks create, shown red). A valid spec
+   *  whose next fire is simply beyond the preview window is NOT an error. */
+  isError: boolean
   /** true when the preview may drift from the server's tz-accurate result */
   approximate: boolean
 }
@@ -22,15 +26,22 @@ export interface PreviewResult {
 const MIN_EVERY_SECS = 60
 const MAX_EVERY_SECS = 86_400
 // Cap the minute-by-minute cron search (~366 days) so a never-matching
-// expression can't spin forever.
+// expression can't spin forever. This bounds the PREVIEW only — it never
+// gates schedule creation (a valid cron firing >1y out, e.g. Feb 29, is still
+// creatable; the server computes its real next_run_at).
 const MAX_SEARCH_MINUTES = 366 * 24 * 60
 
-/** Compile one cron field into a set of allowed integers in [min, max]. */
+/** Compile one cron field into a set of allowed integers in [min, max], or
+ *  null when the field is malformed (strict: no empty parts, one `/`, one
+ *  `-`). */
 function parseField(field: string, min: number, max: number): Set<number> | null {
+  if (field === '') return null
   const allowed = new Set<number>()
   for (const part of field.split(',')) {
-    // step: base/step
-    const [base, stepStr] = part.split('/')
+    if (part === '') return null // e.g. "1,,2"
+    const slash = part.split('/')
+    if (slash.length > 2) return null // e.g. "*/2/3"
+    const [base, stepStr] = slash
     const step = stepStr === undefined ? 1 : Number(stepStr)
     if (!Number.isInteger(step) || step < 1) return null
 
@@ -40,7 +51,9 @@ function parseField(field: string, min: number, max: number): Set<number> | null
       lo = min
       hi = max
     } else if (base.includes('-')) {
-      const [a, b] = base.split('-').map(Number)
+      const range = base.split('-')
+      if (range.length !== 2) return null // e.g. "1-2-3"
+      const [a, b] = range.map(Number)
       if (!Number.isInteger(a) || !Number.isInteger(b)) return null
       lo = a
       hi = b
@@ -77,15 +90,19 @@ function parseCron(expr: string): {
   const hour = parseField(f[1], 0, 23)
   const dom = parseField(f[2], 1, 31)
   const month = parseField(f[3], 1, 12)
-  // cron dow: 0-6 (Sun=0); also accept 7 as Sunday
-  const dowRaw = parseField(f[4].replace(/7/g, '0'), 0, 6)
+  // cron dow: 0-6 (Sun=0). Accept 7 as an alias for Sunday by parsing the
+  // field over 0..7 (so "1-7" / "*/7" stay valid) then folding 7 into 0 —
+  // NOT a naive string replace, which would corrupt "*/7", "17", etc.
+  const dowRaw = parseField(f[4], 0, 7)
   if (!min || !hour || !dom || !month || !dowRaw) return null
+  const dow = new Set<number>()
+  for (const v of dowRaw) dow.add(v === 7 ? 0 : v)
   return {
     min,
     hour,
     dom,
     month,
-    dow: dowRaw,
+    dow,
     domRestricted: f[2] !== '*',
     dowRestricted: f[4] !== '*',
   }
@@ -129,36 +146,53 @@ export function previewNextFire(spec: ScheduleSpecInput, now: Date): PreviewResu
       if (!Number.isInteger(secs) || secs < MIN_EVERY_SECS || secs > MAX_EVERY_SECS) {
         return {
           next: null,
-          error: `每隔秒数须为 ${MIN_EVERY_SECS}–${MAX_EVERY_SECS}`,
+          message: `每隔秒数须为 ${MIN_EVERY_SECS}–${MAX_EVERY_SECS}`,
+          isError: true,
           approximate: false,
         }
       }
-      return { next: new Date(now.getTime() + secs * 1000), error: null, approximate: false }
+      return {
+        next: new Date(now.getTime() + secs * 1000),
+        message: null,
+        isError: false,
+        approximate: false,
+      }
     }
     case 'at': {
       const ts = spec.ts ?? ''
       const at = new Date(ts)
       if (Number.isNaN(at.getTime())) {
-        return { next: null, error: '时间格式无效（需 ISO 8601）', approximate: false }
+        return { next: null, message: '时间格式无效（需 ISO 8601）', isError: true, approximate: false }
       }
       if (at.getTime() <= now.getTime()) {
-        return { next: null, error: '该时间已过', approximate: false }
+        return { next: null, message: '该时间已过', isError: true, approximate: false }
       }
-      return { next: at, error: null, approximate: false }
+      return { next: at, message: null, isError: false, approximate: false }
     }
     case 'cron': {
       const expr = (spec.expr ?? '').trim()
-      if (!expr) return { next: null, error: '请输入 cron 表达式', approximate: false }
-      const next = nextCronFire(expr, now)
-      if (!next) {
-        return { next: null, error: 'cron 表达式无效或一年内不触发', approximate: false }
+      if (!expr) return { next: null, message: '请输入 cron 表达式', isError: true, approximate: false }
+      // Syntax validity gates creation; the search window only gates display.
+      if (!parseCron(expr)) {
+        return { next: null, message: 'cron 表达式无效', isError: true, approximate: false }
       }
       const tz = spec.tz?.trim()
       const approximate = !!tz && tz !== 'UTC' && tz !== 'Etc/UTC'
-      return { next, error: null, approximate }
+      const next = nextCronFire(expr, now)
+      if (!next) {
+        // Valid syntax, just no fire within the preview window (e.g. Feb 29).
+        // NOT an error — the server computes the real next_run_at on save.
+        return {
+          next: null,
+          message: '一年内不触发（服务端将计算下次时间）',
+          isError: false,
+          approximate,
+        }
+      }
+      return { next, message: null, isError: false, approximate }
     }
     default:
-      return { next: null, error: '未知调度类型', approximate: false }
+      return { next: null, message: '未知调度类型', isError: true, approximate: false }
   }
 }
 

@@ -8,15 +8,15 @@ describe('previewNextFire', () => {
     expect(formatPreview(previewNextFire({ type: 'every', secs: 3600 }, NOW).next!)).toBe(
       '2026-07-24 11:00:00 UTC',
     )
-    expect(previewNextFire({ type: 'every', secs: 30 }, NOW).error).toBeTruthy()
-    expect(previewNextFire({ type: 'every', secs: 100_000 }, NOW).error).toBeTruthy()
+    expect(previewNextFire({ type: 'every', secs: 30 }, NOW).message).toBeTruthy()
+    expect(previewNextFire({ type: 'every', secs: 100_000 }, NOW).message).toBeTruthy()
   })
 
   it('at: future timestamp accepted, past rejected', () => {
     const r = previewNextFire({ type: 'at', ts: '2026-07-24T12:00:00Z' }, NOW)
     expect(formatPreview(r.next!)).toBe('2026-07-24 12:00:00 UTC')
-    expect(previewNextFire({ type: 'at', ts: '2026-07-24T09:00:00Z' }, NOW).error).toBe('该时间已过')
-    expect(previewNextFire({ type: 'at', ts: 'not-a-date' }, NOW).error).toBeTruthy()
+    expect(previewNextFire({ type: 'at', ts: '2026-07-24T09:00:00Z' }, NOW).message).toBe('该时间已过')
+    expect(previewNextFire({ type: 'at', ts: 'not-a-date' }, NOW).message).toBeTruthy()
   })
 
   it('cron: 5-field daily at 08:00 UTC', () => {
@@ -62,16 +62,36 @@ describe('previewNextFire', () => {
     expect(r.approximate).toBe(true)
   })
 
-  it('cron: invalid expressions error', () => {
-    expect(previewNextFire({ type: 'cron', expr: 'nonsense' }, NOW).error).toBeTruthy()
-    expect(previewNextFire({ type: 'cron', expr: '' }, NOW).error).toBeTruthy()
-    expect(previewNextFire({ type: 'cron', expr: '99 * * * *' }, NOW).error).toBeTruthy()
-    // wrong field count
-    expect(previewNextFire({ type: 'cron', expr: '0 8 * *' }, NOW).error).toBeTruthy()
+  it('cron: invalid expressions are flagged isError', () => {
+    for (const expr of ['nonsense', '', '99 * * * *', '0 8 * *', '1,,2 * * * *', '*/2/3 * * * *', '1-2-3 * * * *']) {
+      const r = previewNextFire({ type: 'cron', expr }, NOW)
+      expect(r.message, expr).toBeTruthy()
+      expect(r.isError, expr).toBe(true)
+    }
+  })
+
+  it('cron: dow 7 is Sunday without corrupting */7 or ranges', () => {
+    // "*/7" in the minute field must NOT be mangled to "*/0"
+    const everySeven = previewNextFire({ type: 'cron', expr: '*/7 * * * *' }, new Date('2026-07-24T10:00:00Z'))
+    expect(everySeven.isError).toBe(false)
+    expect(formatPreview(everySeven.next!)).toBe('2026-07-24 10:07:00 UTC')
+    // dow 7 == 0 == Sunday: next Sunday 00:00 after Fri 2026-07-24 is 07-26
+    const sunday = previewNextFire({ type: 'cron', expr: '0 0 * * 7' }, new Date('2026-07-24T10:00:00Z'))
+    expect(formatPreview(sunday.next!)).toBe('2026-07-26 00:00:00 UTC')
+    // "1-7" dow range stays valid
+    expect(previewNextFire({ type: 'cron', expr: '0 0 * * 1-7' }, NOW).isError).toBe(false)
+  })
+
+  it('cron: valid syntax with no fire in a year is not an error (creatable)', () => {
+    // Feb 29 only exists on leap years — no fire within 366 days of 2026-07
+    const r = previewNextFire({ type: 'cron', expr: '0 0 29 2 *' }, NOW)
+    expect(r.next).toBeNull()
+    expect(r.isError).toBe(false) // must NOT block create
+    expect(r.message).toContain('服务端')
   })
 
   it('unknown type errors', () => {
     // @ts-expect-error deliberately wrong
-    expect(previewNextFire({ type: 'bogus' }, NOW).error).toBeTruthy()
+    expect(previewNextFire({ type: 'bogus' }, NOW).message).toBeTruthy()
   })
 })

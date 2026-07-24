@@ -66,10 +66,15 @@ export interface Decision {
   reason?: string
 }
 
-/** Envelope-aware error message extractor for a failed proxy response. */
+/** Envelope-aware error message extractor for a failed proxy response.
+ *  Handles the v1 `{error:{message}}` shape and the desktop IPC fallback's
+ *  `{error: "string"}` (connection/proxy failures) before defaulting to the
+ *  HTTP status. */
 export function errorMessage(res: { status: number; data: unknown }): string {
-  const err = (res.data as { error?: { message?: string } } | null)?.error
-  return err?.message ?? `HTTP ${res.status}`
+  const err = (res.data as { error?: unknown } | null)?.error
+  if (typeof err === 'string' && err) return err
+  const msg = (err as { message?: string } | undefined)?.message
+  return msg ?? `HTTP ${res.status}`
 }
 
 async function get<T>(path: string, pick: string): Promise<T> {
@@ -142,6 +147,12 @@ export const listPendingApprovals = (): Promise<Approval[]> =>
   get<Approval[]>('/api/v1/approvals?status=pending', 'approvals')
 
 export const decideApproval = async (id: string, decision: Decision): Promise<void> => {
+  // Fail-closed at the API boundary: SPEC-002 requires a non-empty reason for
+  // deny, and the daemon 400s an empty one. Enforce here so no caller (not
+  // just the current UI) can send an invalid deny.
+  if (decision.type === 'deny' && (decision.reason ?? '').trim() === '') {
+    throw new Error('拒绝需要填写原因')
+  }
   const res = await window.agent24.backendProxy({
     method: 'POST',
     path: `/api/v1/approvals/${id}`,

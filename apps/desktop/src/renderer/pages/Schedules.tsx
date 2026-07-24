@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   listSchedules,
   createSchedule,
@@ -32,13 +32,21 @@ export default function SchedulesPage() {
   const [secs, setSecs] = useState('3600')
   const [ts, setTs] = useState('')
 
+  // Monotonic request token: only the latest refresh's result may land, so a
+  // slow poll can't overwrite fresher post-mutation state (review C7).
+  const reqSeq = useRef(0)
   const refresh = useCallback(() => {
+    const seq = ++reqSeq.current
     listSchedules()
       .then((s) => {
+        if (seq !== reqSeq.current) return // a newer refresh superseded this one
         setSchedules(s)
         setError(null)
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => {
+        if (seq !== reqSeq.current) return
+        setError(e instanceof Error ? e.message : String(e))
+      })
   }, [])
 
   useEffect(() => {
@@ -47,7 +55,15 @@ export default function SchedulesPage() {
     return () => clearInterval(timer)
   }, [refresh])
 
-  // Live next-fire preview (recomputed as the form changes)
+  // A 1-Hz clock so the preview (especially `at`) stays live as time passes,
+  // not only when the form changes.
+  const [nowTick, setNowTick] = useState(() => Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [])
+
+  // Live next-fire preview (recomputed on form change AND each clock tick)
   const preview = useMemo(() => {
     const specInput: ScheduleSpecInput = {
       type: specType,
@@ -56,16 +72,16 @@ export default function SchedulesPage() {
       secs: Number(secs),
       ts,
     }
-    return previewNextFire(specInput, new Date())
-  }, [specType, expr, tz, secs, ts])
+    return previewNextFire(specInput, new Date(nowTick))
+  }, [specType, expr, tz, secs, ts, nowTick])
 
   const onCreate = async () => {
     if (name.trim() === '' || prompt.trim() === '') {
       setError('名称和 prompt 必填')
       return
     }
-    if (preview.error) {
-      setError(`调度规格无效：${preview.error}`)
+    if (preview.isError) {
+      setError(`调度规格无效：${preview.message}`)
       return
     }
     try {
@@ -191,13 +207,15 @@ export default function SchedulesPage() {
 
           {/* Live preview */}
           <div style={{ fontSize: 12 }} data-testid="preview">
-            {preview.error ? (
-              <span style={{ color: '#e05050' }}>下次触发：{preview.error}</span>
-            ) : (
+            {preview.isError ? (
+              <span style={{ color: '#e05050' }}>下次触发：{preview.message}</span>
+            ) : preview.next ? (
               <span style={{ color: 'var(--muted)' }}>
-                下次触发：{formatPreview(preview.next!)}
+                下次触发：{formatPreview(preview.next)}
                 {preview.approximate && '（近似 · 服务端按所选时区精确计算）'}
               </span>
+            ) : (
+              <span style={{ color: 'var(--muted)' }}>下次触发：{preview.message}</span>
             )}
           </div>
 

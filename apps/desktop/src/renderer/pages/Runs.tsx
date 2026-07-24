@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { listRuns, cancelRun, type Run, type RunStatus } from './agent/api'
 
 const STATUS_LABELS: Record<RunStatus, { label: string; color: string }> = {
@@ -19,13 +19,20 @@ export default function RunsPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Only the latest refresh's result may land (review C7 poll-race guard).
+  const reqSeq = useRef(0)
   const refresh = useCallback(() => {
+    const seq = ++reqSeq.current
     listRuns()
       .then((r) => {
+        if (seq !== reqSeq.current) return
         setRuns(r)
         setError(null)
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => {
+        if (seq !== reqSeq.current) return
+        setError(e instanceof Error ? e.message : String(e))
+      })
   }, [])
 
   useEffect(() => {

@@ -80,8 +80,20 @@ describe('agent api', () => {
     setProxy(() => ({ ok: false, status: 409, data: {} }))
     await expect(decideApproval('apr_1', { type: 'approve' })).resolves.toBeUndefined()
     setProxy(() => ({ ok: false, status: 400, data: { error: { message: 'nope' } } }))
-    await expect(decideApproval('apr_1', { type: 'deny', reason: '' })).rejects.toThrow('nope')
+    await expect(decideApproval('apr_1', { type: 'abort' })).rejects.toThrow('nope')
     setProxy(() => ({ ok: true, status: 200, data: { approvals: [{ id: 'apr_1' }] } }))
     expect(await listPendingApprovals()).toEqual([{ id: 'apr_1' }])
+  })
+
+  it('decideApproval rejects an empty deny reason before any proxy call', async () => {
+    const proxy = vi.fn()
+    window.agent24 = { backendProxy: proxy } as never
+    await expect(decideApproval('apr_1', { type: 'deny', reason: '  ' })).rejects.toThrow('原因')
+    await expect(decideApproval('apr_1', { type: 'deny' })).rejects.toThrow('原因')
+    expect(proxy).not.toHaveBeenCalled()
+  })
+
+  it('errorMessage handles a string-shaped error (IPC fallback)', () => {
+    expect(errorMessage({ status: 502, data: { error: 'proxy refused' } })).toBe('proxy refused')
   })
 })

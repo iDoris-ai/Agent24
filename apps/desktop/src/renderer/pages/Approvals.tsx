@@ -8,20 +8,30 @@ const DECISION_LABELS: Record<string, string> = {
   abort: '中止运行',
 }
 
-/** Fire a desktop notification for a newly-seen approval (best-effort). */
+/** Fire a desktop notification for a newly-seen approval (best-effort — never
+ *  throws or leaves an unhandled rejection). */
 function notify(approval: Approval): void {
   if (typeof Notification === 'undefined') return
-  const show = () =>
-    new Notification('需要审批', {
-      body: approval.summary,
-      tag: approval.id, // dedup repeat notifications for the same approval
-    })
+  const show = () => {
+    try {
+      new Notification('需要审批', {
+        body: approval.summary,
+        tag: approval.id, // dedup repeat notifications for the same approval
+      })
+    } catch {
+      /* notifications are best-effort */
+    }
+  }
   if (Notification.permission === 'granted') {
     show()
   } else if (Notification.permission !== 'denied') {
-    void Notification.requestPermission().then((p) => {
-      if (p === 'granted') show()
-    })
+    void Notification.requestPermission()
+      .then((p) => {
+        if (p === 'granted') show()
+      })
+      .catch(() => {
+        /* permission request unavailable — ignore */
+      })
   }
 }
 
@@ -33,9 +43,14 @@ export default function ApprovalsPage() {
   const [reason, setReason] = useState('')
   const seenIds = useRef<Set<string>>(new Set())
 
+  // Only the latest refresh's result may land, so a slow poll can't resurrect
+  // an approval the user just decided (review C7 poll-race guard).
+  const reqSeq = useRef(0)
   const refresh = useCallback(() => {
+    const seq = ++reqSeq.current
     listPendingApprovals()
       .then((list) => {
+        if (seq !== reqSeq.current) return
         setApprovals(list)
         setError(null)
         // Notify for any approval id not seen before this session
@@ -46,7 +61,10 @@ export default function ApprovalsPage() {
           }
         }
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => {
+        if (seq !== reqSeq.current) return
+        setError(e instanceof Error ? e.message : String(e))
+      })
   }, [])
 
   useEffect(() => {
