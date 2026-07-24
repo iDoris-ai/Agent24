@@ -272,9 +272,12 @@ fn parse_assessment(content: &str) -> Result<RiskAssessment, AssessError> {
     if let Some(high) = find_high(&value) {
         return Ok(high);
     }
-    // Low accepted ONLY as the model's direct top-level verdict — never nested
-    // (a nested low is the echoed-payload shape).
-    if let Some(low) = top_level_assessment(&value).filter(|a| a.level == RiskLevel::Low) {
+    // Low accepted ONLY from a FLAT top-level object — risk_level "low", a
+    // non-empty rationale, and no nested objects/arrays. Flatness is what makes
+    // the low path safe: a genuine low verdict is a flat `{risk_level,rationale}`,
+    // so ANY nested structure (where a high, an echoed payload, or other content
+    // could ride along) disqualifies the auto-approval and escalates.
+    if let Some(low) = top_level_flat_low(&value) {
         return Ok(low);
     }
     Err(AssessError::Unparseable(truncate(content)))
@@ -419,18 +422,42 @@ fn object_assessment(value: &Value) -> Option<RiskAssessment> {
     })
 }
 
-/// The top-level object's own assessment, if any (no recursion).
-fn top_level_assessment(value: &Value) -> Option<RiskAssessment> {
-    object_assessment(value)
+/// A low verdict accepted from a FLAT top-level object only: risk_level "low",
+/// non-empty rationale, and every value a scalar (no nested object/array). Any
+/// nesting disqualifies it — a compliant low is a flat object, and nesting is
+/// where hidden content (a high, an echoed payload) would ride along.
+fn top_level_flat_low(value: &Value) -> Option<RiskAssessment> {
+    let map = value.as_object()?;
+    let assessment = object_assessment(value).filter(|a| a.level == RiskLevel::Low)?;
+    if map.values().any(|v| v.is_object() || v.is_array()) {
+        return None;
+    }
+    Some(assessment)
 }
 
-/// Recursively search every depth for a `high` verdict. Returns the first found.
-/// High at any depth escalates (fail-safe), so a nested high can never hide.
+/// Recursively search every depth for a `high` risk word. Returns the first
+/// found. High at any depth escalates (the fail-safe direction), so — UNLIKE the
+/// low-accept path — a rationale is NOT required here: a nested
+/// `{"risk_level":"high"}` with a missing or empty rationale must still be seen
+/// as a high, or it could hide behind a top-level low.
 fn find_high(value: &Value) -> Option<RiskAssessment> {
-    if let Some(a) = object_assessment(value)
-        && a.level == RiskLevel::High
+    if let Some(map) = value.as_object()
+        && map
+            .get("risk_level")
+            .and_then(Value::as_str)
+            .and_then(parse_risk_level)
+            == Some(RiskLevel::High)
     {
-        return Some(a);
+        let rationale = map
+            .get("rationale")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        return Some(RiskAssessment {
+            level: RiskLevel::High,
+            rationale,
+        });
     }
     match value {
         Value::Object(map) => map.values().find_map(find_high),
@@ -799,6 +826,39 @@ mod tests {
         // A top-level low but a high hiding in a sibling/echoed field: high wins.
         let content = r#"{"risk_level":"low","rationale":"looks fine","echoed":{"risk_level":"high","rationale":"rm -rf"}}"#;
         assert_eq!(parse_assessment(content).unwrap().level, RiskLevel::High);
+    }
+
+    #[test]
+    fn parse_low_with_any_nesting_escalates() {
+        // Flatness rule: a low verdict must be a flat object. A benign nested
+        // object/array (where hidden content could ride along) escalates.
+        let nested_obj = r#"{"risk_level":"low","rationale":"safe","meta":{"x":1}}"#;
+        assert!(matches!(
+            parse_assessment(nested_obj).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
+        let nested_arr = r#"{"risk_level":"low","rationale":"safe","tags":["a","b"]}"#;
+        assert!(matches!(
+            parse_assessment(nested_arr).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
+    }
+
+    #[test]
+    fn parse_flat_low_with_extra_scalar_keys_is_accepted() {
+        // Extra SCALAR keys don't break flatness.
+        let content = r#"{"risk_level":"low","rationale":"safe","confidence":0.9}"#;
+        assert_eq!(parse_assessment(content).unwrap().level, RiskLevel::Low);
+    }
+
+    #[test]
+    fn parse_nested_high_without_rationale_still_wins() {
+        // Codex: a nested high with NO/blank rationale must still be detected —
+        // high-detection does not require a rationale (fail-safe direction).
+        let missing = r#"{"risk_level":"low","rationale":"safe","echo":{"risk_level":"high"}}"#;
+        assert_eq!(parse_assessment(missing).unwrap().level, RiskLevel::High);
+        let blank = r#"{"risk_level":"low","rationale":"safe","echo":{"risk_level":"high","rationale":"   "}}"#;
+        assert_eq!(parse_assessment(blank).unwrap().level, RiskLevel::High);
     }
 
     #[test]
