@@ -32,9 +32,41 @@ pub struct AppState {
     pub events: crate::events::EventsHub,
     pub store: Store,
     pub runs: Arc<agent24_agent::RunManager>,
+    pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Daemon-wide shutdown token; handlers derive request tokens from it so
     /// shutdown cancels in-flight provider calls (run-level cancel joins in C2)
     pub shutdown: CancellationToken,
+}
+
+/// Adapts the run manager to the scheduler's `RunTrigger` — a fired schedule
+/// becomes a background run tagged with the schedule id.
+struct RunManagerTrigger {
+    runs: Arc<agent24_agent::RunManager>,
+}
+
+#[async_trait::async_trait]
+impl agent24_scheduler::RunTrigger for RunManagerTrigger {
+    async fn trigger(
+        &self,
+        action: &agent24_protocol::ScheduleAction,
+        schedule_id: &str,
+    ) -> Result<String, String> {
+        let agent24_protocol::ScheduleAction::AgentRun {
+            prompt,
+            session_id,
+            model_override,
+        } = action;
+        let create = agent24_protocol::RunCreate {
+            session_id: session_id.clone(),
+            prompt: prompt.clone(),
+            model_override: model_override.clone(),
+        };
+        self.runs
+            .start_run_with_schedule(create, Some(schedule_id.to_owned()))
+            .await
+            .map(|run| run.id)
+            .map_err(|err| err.to_string())
+    }
 }
 
 impl AppState {
@@ -69,6 +101,14 @@ impl AppState {
             StdArc::new(events.clone()),
             shutdown.clone(),
         );
+        let sched_hub = events.clone();
+        let scheduler = agent24_scheduler::Scheduler::new(
+            store.clone(),
+            StdArc::new(RunManagerTrigger {
+                runs: Arc::clone(&runs),
+            }),
+            StdArc::new(move |body| sched_hub.broadcast(body)),
+        );
         Self {
             token: Arc::new(token),
             registry,
@@ -78,6 +118,7 @@ impl AppState {
             events,
             store,
             runs,
+            scheduler,
             shutdown,
         }
     }
@@ -163,6 +204,20 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/approvals/{id}",
             get(crate::approvals::get_approval).post(crate::approvals::decide_approval),
+        )
+        .route(
+            "/api/v1/schedules",
+            get(crate::schedules::list_schedules).post(crate::schedules::create_schedule),
+        )
+        .route(
+            "/api/v1/schedules/{id}",
+            get(crate::schedules::get_schedule)
+                .patch(crate::schedules::update_schedule)
+                .delete(crate::schedules::delete_schedule),
+        )
+        .route(
+            "/api/v1/schedules/{id}/run_now",
+            axum::routing::post(crate::schedules::run_now),
         )
         .route("/api/v1/events", get(crate::events::ws_events))
         .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
@@ -250,6 +305,22 @@ pub async fn serve(
         store,
         cancel.clone(),
     );
+    // Scheduler tick loop: polls due schedules and fires runs. Cadence from
+    // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
+    // minute, so a few seconds' latency is invisible).
+    let tick_secs = std::env::var("A24_SCHEDULER_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(10);
+    let scheduler = Arc::clone(&state.scheduler);
+    let sched_cancel = cancel.clone();
+    tokio::spawn(scheduler.run(
+        StdArc::new(agent24_scheduler::SystemClock),
+        Duration::from_secs(tick_secs),
+        sched_cancel,
+    ));
+
     let router = build_router(state);
 
     // 127.0.0.1 only — never a public bind (SPEC-001 §9)
