@@ -7,6 +7,7 @@ name = "agent24-agent"
 version = "0.1.0"
 dependencies = [
  "agent24-core",
+ "agent24-memory",
  "agent24-models",
  "agent24-policy",
  "agent24-protocol",
@@ -175,6 +176,7 @@ version = "0.1.0"
 dependencies = [
  "agent24-agent",
  "agent24-core",
+ "agent24-memory",
  "agent24-models",
  "agent24-policy",
  "agent24-protocol",

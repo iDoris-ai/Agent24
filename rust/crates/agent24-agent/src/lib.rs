@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use agent24_core::util::{now_iso8601, ulid};
+use agent24_memory::KvStore;
+use agent24_memory::session::{CanonicalSession, CompactionPolicy, Summarizer};
 use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolSpec};
 use agent24_protocol::{
@@ -44,6 +46,96 @@ pub const MAX_TOOL_CALLS_PER_TURN: usize = 16;
 /// Where lifecycle events go (the daemon adapts this onto its WS hub).
 pub trait EventSink: Send + Sync + 'static {
     fn emit(&self, body: EventBody);
+}
+
+/// Per-session conversation memory (D1 made live): a KV-backed
+/// [`CanonicalSession`] plus the summarizer that compacts it.
+///
+/// Without this a run starts from the bare prompt, so a "session" carries no
+/// conversation memory at all. With it, each run in a session is preceded by the
+/// session's context, and the exchange is appended back — with threshold
+/// compaction keeping an unbounded conversation a bounded prompt.
+pub struct SessionMemory {
+    kv: KvStore,
+    summarizer: Arc<dyn Summarizer>,
+    policy: CompactionPolicy,
+}
+
+impl SessionMemory {
+    pub fn new(kv: KvStore, summarizer: Arc<dyn Summarizer>) -> Self {
+        Self {
+            kv,
+            summarizer,
+            policy: CompactionPolicy::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_policy(mut self, policy: CompactionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+}
+
+/// A [`Summarizer`] backed by the model router.
+///
+/// Uses the SAME [`TaskProfile::default()`] as chat/runs deliberately: the
+/// conversation being summarized already went to whichever provider the router
+/// picked for those calls, so summarizing it there is no new exposure — whereas
+/// forcing LocalOnly would silently stop compacting on remote-only setups.
+pub struct RouterSummarizer {
+    router: Arc<ModelRouter>,
+}
+
+impl RouterSummarizer {
+    pub fn new(router: Arc<ModelRouter>) -> Self {
+        Self { router }
+    }
+}
+
+#[async_trait::async_trait]
+impl Summarizer for RouterSummarizer {
+    async fn summarize(
+        &self,
+        prior: Option<&str>,
+        messages: &[Msg],
+    ) -> std::result::Result<String, String> {
+        let mut transcript = String::new();
+        for m in messages {
+            let content = m.content.as_deref().unwrap_or("");
+            if content.is_empty() {
+                continue;
+            }
+            transcript.push_str(&format!("{}: {}\n", m.role, truncate(content, 2000)));
+        }
+        let prompt = match prior {
+            Some(prior) => format!(
+                "Update this running summary of a conversation so it still captures \
+                 everything needed to continue. Reply with the updated summary only.\n\n\
+                 EXISTING SUMMARY:\n{prior}\n\nNEW MESSAGES:\n{transcript}"
+            ),
+            None => format!(
+                "Summarize this conversation so it can be continued later, keeping \
+                 decisions, facts and open threads. Reply with the summary only.\n\n\
+                 {transcript}"
+            ),
+        };
+        let req = CompletionRequest {
+            messages: vec![Msg::user(prompt)],
+            model: None,
+            tools: vec![],
+        };
+        let (_provider, res) = self
+            .router
+            .complete(TaskProfile::default(), &req, &CancellationToken::new())
+            .await
+            .map_err(|e| e.to_string())?;
+        let summary = res.message.content.unwrap_or_default().trim().to_owned();
+        if summary.is_empty() {
+            return Err("summarizer returned an empty summary".to_owned());
+        }
+        Ok(summary)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +170,9 @@ pub struct RunManager {
     router: Arc<ModelRouter>,
     tools: Arc<ToolRegistry>,
     sink: Arc<dyn EventSink>,
+    /// Optional per-session conversation memory (D1). `None` = runs start from
+    /// the bare prompt, exactly as before.
+    memory: Option<SessionMemory>,
     /// Daemon-wide shutdown token; every run token is a child of it
     shutdown: CancellationToken,
     /// Live run cancellation tokens; entries removed when a run reaches a
@@ -94,17 +189,83 @@ impl RunManager {
         sink: Arc<dyn EventSink>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
+        Self::with_memory(store, router, tools, sink, shutdown, None)
+    }
+
+    /// Build with optional per-session conversation memory (D1).
+    pub fn with_memory(
+        store: Store,
+        router: Arc<ModelRouter>,
+        tools: Arc<ToolRegistry>,
+        sink: Arc<dyn EventSink>,
+        shutdown: CancellationToken,
+        memory: Option<SessionMemory>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             router,
             tools,
             sink,
+            memory,
             shutdown,
             cancels: Mutex::new(HashMap::new()),
         })
     }
 
     /// Create a run (202 semantics: persisted queued, executed in background).
+    /// The session's prior context, or empty when memory is off / this run has
+    /// no session. Best-effort: a memory failure degrades to a fresh context
+    /// rather than failing the run.
+    async fn session_context(&self, session_id: Option<&str>) -> Vec<Msg> {
+        let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
+            return Vec::new();
+        };
+        match CanonicalSession::load(&memory.kv, sid).await {
+            Ok(Some(session)) => session.context(),
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                tracing::warn!("session {sid} memory load failed: {err}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Append this exchange to the session and persist it. Best-effort — an
+    /// already-successful run must never fail because memory did.
+    ///
+    /// Note the save happens even when compaction errors: `append` deliberately
+    /// leaves the message in `recent` on summarizer failure (D1's no-loss
+    /// guarantee), so persisting keeps the turn and lets the next append retry
+    /// the fold. Skipping the save is what would lose it.
+    async fn remember_exchange(&self, session_id: Option<&str>, prompt: &str, answer: &str) {
+        let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
+            return;
+        };
+        let mut session = match CanonicalSession::load(&memory.kv, sid).await {
+            Ok(Some(session)) => session,
+            Ok(None) => CanonicalSession::new(sid),
+            Err(err) => {
+                tracing::warn!("session {sid} memory load failed, not persisting turn: {err}");
+                return;
+            }
+        };
+        for msg in [
+            Msg::user(prompt.to_owned()),
+            Msg::assistant(Some(answer.to_owned()), vec![]),
+        ] {
+            if let Err(err) = session
+                .append(msg, memory.policy, memory.summarizer.as_ref())
+                .await
+            {
+                // Compaction failed; the message is still in `recent`.
+                tracing::warn!("session {sid} compaction failed (turn kept verbatim): {err}");
+            }
+        }
+        if let Err(err) = session.save(&memory.kv).await {
+            tracing::warn!("session {sid} memory save failed: {err}");
+        }
+    }
+
     pub async fn start_run(self: &Arc<Self>, create: RunCreate) -> Result<Run, AgentError> {
         self.start_run_with_schedule(create, None).await
     }
@@ -253,7 +414,10 @@ impl RunManager {
                 parameters: a.parameters,
             })
             .collect();
-        let mut messages = vec![Msg::user(run.input.prompt.clone())];
+        // D1: a session's prior (compacted) context precedes this turn, so a
+        // session actually remembers. Empty when memory is off or session-less.
+        let mut messages = self.session_context(run.session_id.as_deref()).await;
+        messages.push(Msg::user(run.input.prompt.clone()));
         let mut usage_total = zero_usage();
 
         for _ in 0..MAX_ITERATIONS {
@@ -311,11 +475,15 @@ impl RunManager {
                     )
                     .await
                 {
-                    Ok(_) => self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
-                        run_id,
-                        output: RunOutputPayload { text },
-                        usage: usage_total,
-                    })),
+                    Ok(_) => {
+                        self.remember_exchange(run.session_id.as_deref(), &run.input.prompt, &text)
+                            .await;
+                        self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
+                            run_id,
+                            output: RunOutputPayload { text },
+                            usage: usage_total,
+                        }));
+                    }
                     Err(err) => tracing::error!("run completion persist failed: {err}"),
                 }
                 return;
@@ -631,6 +799,51 @@ pub(crate) mod tests {
         }
     }
 
+    /// Answers "pong" and records the messages it was handed, so a test can
+    /// assert what context the loop actually built.
+    struct RecordingProvider {
+        seen: StdMutex<Vec<Vec<Msg>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn complete(
+            &self,
+            req: &CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            self.seen.lock().unwrap().push(req.messages.clone());
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                usage: usage_one(),
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    /// A summarizer that must never be reached in tests that stay under the
+    /// compaction threshold — calling it is the failure.
+    struct UnusedSummarizer;
+
+    #[async_trait]
+    impl Summarizer for UnusedSummarizer {
+        async fn summarize(
+            &self,
+            _prior: Option<&str>,
+            _messages: &[Msg],
+        ) -> std::result::Result<String, String> {
+            Err("summarizer should not be needed in this test".to_owned())
+        }
+    }
+
     /// Plays a fixed sequence of assistant turns, then echoes the last tool
     /// result as the final answer.
     pub(crate) struct ScriptedProvider {
@@ -726,6 +939,116 @@ pub(crate) mod tests {
         provider: Arc<dyn ModelProvider>,
     ) -> (Arc<RunManager>, Arc<RecordingSink>, Store) {
         manager_with_tools(provider, ToolRegistry::new()).await
+    }
+
+    /// A manager with D1 session memory attached (in-memory KV).
+    async fn manager_with_memory(
+        provider: Arc<dyn ModelProvider>,
+        summarizer: Arc<dyn Summarizer>,
+    ) -> (Arc<RunManager>, Store) {
+        let store = Store::open_memory().await.unwrap();
+        let sink = Arc::new(RecordingSink(StdMutex::new(vec![])));
+        let kv = KvStore::open_memory().await.unwrap();
+        let manager = RunManager::with_memory(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)])),
+            Arc::new(ToolRegistry::new()),
+            sink,
+            CancellationToken::new(),
+            Some(SessionMemory::new(kv, summarizer)),
+        );
+        (manager, store)
+    }
+
+    /// Insert a session row so `start_run` accepts it.
+    async fn seed_session(store: &Store, id: &str) {
+        let now = now_iso8601();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: id.to_owned(),
+                title: "t".to_owned(),
+                channel: "cli".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Run one prompt in a session and wait for it to reach a terminal state.
+    async fn run_in_session(
+        manager: &Arc<RunManager>,
+        store: &Store,
+        session_id: &str,
+        prompt: &str,
+    ) {
+        let run = manager
+            .start_run(RunCreate {
+                session_id: Some(session_id.to_owned()),
+                prompt: prompt.to_owned(),
+                model_override: None,
+            })
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            let current = store.get_run(&run.id).await.unwrap().unwrap();
+            if current.status != RunStatus::Running && current.status != RunStatus::Queued {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("run did not finish");
+    }
+
+    #[tokio::test]
+    async fn a_session_remembers_across_runs() {
+        // D1 made live: without memory every run starts from the bare prompt.
+        // With it, the second run in a session must SEE the first exchange.
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_mem").await;
+
+        run_in_session(&manager, &store, "sess_mem", "first question").await;
+        run_in_session(&manager, &store, "sess_mem", "second question").await;
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "expected one completion per run");
+        // Run 1 saw only its own prompt.
+        assert_eq!(seen[0].len(), 1);
+        assert_eq!(seen[0][0].content.as_deref(), Some("first question"));
+        // Run 2 saw the remembered exchange BEFORE its own prompt.
+        let second = &seen[1];
+        assert!(
+            second.len() > 1,
+            "second run had no prior context: {second:?}"
+        );
+        let texts: Vec<&str> = second.iter().filter_map(|m| m.content.as_deref()).collect();
+        assert!(texts.contains(&"first question"), "{texts:?}");
+        assert!(texts.contains(&"pong"), "{texts:?}");
+        assert_eq!(texts.last(), Some(&"second question"));
+    }
+
+    #[tokio::test]
+    async fn without_memory_runs_do_not_accumulate_context() {
+        // The default (no SessionMemory) keeps prior behaviour exactly.
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, _sink, store) = manager_with(provider.clone()).await;
+        seed_session(&store, "sess_plain").await;
+        run_in_session(&manager, &store, "sess_plain", "first question").await;
+        run_in_session(&manager, &store, "sess_plain", "second question").await;
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[1].len(),
+            1,
+            "context leaked without memory: {:?}",
+            seen[1]
+        );
     }
 
     pub(crate) fn create() -> RunCreate {

@@ -120,6 +120,31 @@ fn parse_always_review(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Open the D1 session-memory KV store and pair it with a router-backed
+/// summarizer. Returns `None` (memory off) if the store can't be opened — a
+/// degraded daemon is better than one that won't start.
+async fn open_session_memory(
+    ephemeral: bool,
+    router: &Arc<ModelRouter>,
+) -> Option<agent24_agent::SessionMemory> {
+    let kv = if ephemeral {
+        agent24_memory::KvStore::open_memory().await
+    } else {
+        let dir = agent24_protocol::state_file::state_dir()?;
+        agent24_memory::KvStore::open(&dir.join("memory.db")).await
+    };
+    match kv {
+        Ok(kv) => Some(agent24_agent::SessionMemory::new(
+            kv,
+            StdArc::new(agent24_agent::RouterSummarizer::new(Arc::clone(router))),
+        )),
+        Err(err) => {
+            tracing::warn!("session memory unavailable ({err}); sessions will not remember");
+            None
+        }
+    }
+}
+
 impl AppState {
     /// The guardian is INJECTED rather than read from env in here, so tests can
     /// wire a stub one; `serve` supplies [`build_guardian`]'s env-driven result.
@@ -130,6 +155,7 @@ impl AppState {
         store: Store,
         shutdown: CancellationToken,
         guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
+        memory: Option<agent24_agent::SessionMemory>,
     ) -> Self {
         let events = crate::events::EventsHub::default();
         // Approval broker: emits onto the same WS hub; timeout from env
@@ -148,12 +174,13 @@ impl AppState {
         let tools = Arc::new(tools.with_gate(StdArc::new(agent24_policy::BrokerGate::new(
             StdArc::clone(&broker),
         ))));
-        let runs = agent24_agent::RunManager::new(
+        let runs = agent24_agent::RunManager::with_memory(
             store.clone(),
             Arc::clone(&router),
             Arc::clone(&tools),
             StdArc::new(events.clone()),
             shutdown.clone(),
+            memory,
         );
         let sched_hub = events.clone();
         let scheduler = agent24_scheduler::Scheduler::new(
@@ -354,6 +381,10 @@ pub async fn serve(
     std::fs::create_dir_all(&workspace)?;
     let router = Arc::new(ModelRouter::from_env());
     let guardian = build_guardian(&router);
+    // D1 session memory: a KV file next to the main store (ephemeral daemons get
+    // an in-memory one). A failure here degrades to no memory rather than
+    // refusing to start — sessions simply don't remember, as before.
+    let memory = open_session_memory(ephemeral, &router).await;
     let state = AppState::new(
         token.clone(),
         router,
@@ -361,6 +392,7 @@ pub async fn serve(
         store,
         cancel.clone(),
         guardian,
+        memory,
     );
     // Scheduler tick loop: polls due schedules and fires runs. Cadence from
     // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
@@ -496,6 +528,7 @@ mod tests {
             Store::open_memory().await.unwrap(),
             CancellationToken::new(),
             guardian,
+            None,
         )
     }
 
