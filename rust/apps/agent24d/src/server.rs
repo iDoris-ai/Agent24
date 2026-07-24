@@ -35,6 +35,11 @@ pub struct AppState {
     pub store: Store,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
+    /// Live MCP server handles. This is an RAII guard, not data: dropping an
+    /// McpServer kills its child process, which would silently break every tool
+    /// it contributed. Never read on purpose — its job is to exist (M-E/E1b).
+    #[allow(dead_code, reason = "RAII: keeps MCP child processes alive")]
+    pub mcp_servers: Arc<Vec<Arc<agent24_mcp::McpServer>>>,
     /// Daemon-wide shutdown token; handlers derive request tokens from it so
     /// shutdown cancels in-flight provider calls (run-level cancel joins in C2)
     pub shutdown: CancellationToken,
@@ -149,18 +154,36 @@ async fn open_session_memory(
     }
 }
 
+/// Everything [`AppState::new`] needs. The guardian and session memory are
+/// INJECTED rather than read from env inside the constructor, so tests can wire
+/// stubs; `serve` supplies the env-driven values.
+pub struct AppDeps {
+    pub token: String,
+    pub router: Arc<ModelRouter>,
+    pub tools: agent24_tools::ToolRegistry,
+    pub store: Store,
+    pub shutdown: CancellationToken,
+    pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
+    pub memory: Option<agent24_agent::SessionMemory>,
+    pub mcp_servers: Vec<Arc<agent24_mcp::McpServer>>,
+}
+
 impl AppState {
-    /// The guardian is INJECTED rather than read from env in here, so tests can
-    /// wire a stub one; `serve` supplies [`build_guardian`]'s env-driven result.
-    pub fn new(
-        token: String,
-        router: Arc<ModelRouter>,
-        tools: agent24_tools::ToolRegistry,
-        store: Store,
-        shutdown: CancellationToken,
-        guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
-        memory: Option<agent24_agent::SessionMemory>,
-    ) -> Self {
+    /// Build from [`AppDeps`]. Grouped into a struct rather than a long
+    /// parameter list: the collaborators grew with each milestone (guardian,
+    /// session memory, MCP servers) and positional args of the same shape are
+    /// easy to transpose silently.
+    pub fn new(deps: AppDeps) -> Self {
+        let AppDeps {
+            token,
+            router,
+            tools,
+            store,
+            shutdown,
+            guardian,
+            memory,
+            mcp_servers,
+        } = deps;
         let events = crate::events::EventsHub::default();
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
@@ -196,6 +219,7 @@ impl AppState {
         );
         Self {
             token: Arc::new(token),
+            mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
             broker,
@@ -389,15 +413,45 @@ pub async fn serve(
     // an in-memory one). A failure here degrades to no memory rather than
     // refusing to start — sessions simply don't remember, as before.
     let memory = open_session_memory(ephemeral, &router, &cancel).await;
-    let state = AppState::new(
-        token.clone(),
+
+    // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
+    // their tools. Registered with `with()` so they are dispatchable, while
+    // McpTool sets requires_approval = true so EVERY call still goes through the
+    // C4 gate — the whitelist decides "may be dispatched", the gate decides
+    // "may run this time". A broken server is logged and skipped, never fatal.
+    let mut tools = agent24_tools::ToolRegistry::builtin(workspace);
+    let mcp_servers = match crate::mcp::config_path() {
+        Some(path) => match crate::mcp::load_config(&path) {
+            Ok(cfg) => {
+                let specs = cfg.specs();
+                if specs.is_empty() {
+                    Vec::new()
+                } else {
+                    let (servers, mcp_tools) = crate::mcp::mount(&specs, &cancel).await;
+                    for tool in mcp_tools {
+                        tools = tools.with(tool);
+                    }
+                    servers
+                }
+            }
+            Err(err) => {
+                tracing::error!("ignoring {}: {err}", path.display());
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+
+    let state = AppState::new(AppDeps {
+        token: token.clone(),
         router,
-        agent24_tools::ToolRegistry::builtin(workspace),
+        tools,
         store,
-        cancel.clone(),
+        shutdown: cancel.clone(),
         guardian,
         memory,
-    );
+        mcp_servers,
+    });
     // Scheduler tick loop: polls due schedules and fires runs. Cadence from
     // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
     // minute, so a few seconds' latency is invisible).
@@ -525,15 +579,16 @@ mod tests {
     async fn state_with_guardian(
         guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     ) -> AppState {
-        AppState::new(
-            "testtoken".to_owned(),
-            Arc::new(ModelRouter::with_defaults(vec![])),
-            agent24_tools::ToolRegistry::new(),
-            Store::open_memory().await.unwrap(),
-            CancellationToken::new(),
+        AppState::new(AppDeps {
+            token: "testtoken".to_owned(),
+            router: Arc::new(ModelRouter::with_defaults(vec![])),
+            tools: agent24_tools::ToolRegistry::new(),
+            store: Store::open_memory().await.unwrap(),
+            shutdown: CancellationToken::new(),
             guardian,
-            None,
-        )
+            memory: None,
+            mcp_servers: Vec::new(),
+        })
     }
 
     /// A guardian whose assessor always returns the given verdict — lets us test
