@@ -11,6 +11,7 @@
 //! ids-only into logs (payloads never hit stderr).
 
 pub mod guardian;
+pub mod overrides;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,7 +20,9 @@ use std::time::Duration;
 use guardian::{AssessInput, Guardian, GuardianDecision};
 
 use agent24_core::util::{now_iso8601, ulid};
-use agent24_protocol::{Approval, ApprovalResolvedPayload, ApprovalStatus, Decision, EventBody};
+use agent24_protocol::{
+    Approval, ApprovalResolvedPayload, ApprovalStatus, Decision, EventBody, RiskClass,
+};
 use agent24_store::{Store, StoreError};
 use serde_json::{Map, Value};
 use std::sync::Mutex;
@@ -30,9 +33,37 @@ use tokio_util::sync::CancellationToken;
 use agent24_tools::{ApprovalGate, GateDecision, ToolContext, summarize_input};
 use async_trait::async_trait;
 
-/// Decision types the server offers on every C4 approval (open set,
-/// server-driven — UIs render exactly this list).
+/// Decision types the server offers on a C4 approval (open set, server-driven —
+/// UIs render exactly this list).
 pub const AVAILABLE_DECISIONS: [&str; 4] = ["approve", "approve_for_session", "deny", "abort"];
+
+/// The decisions offered for ONE approval (H4).
+///
+/// Two rules, and the second is the one that matters:
+///
+/// 1. `approve_for_target` appears only when this call is eligible — the tool
+///    is `external` AND declares a target argument AND the call filled it.
+/// 2. `approve_for_session` DISAPPEARS for `external` tools. Adding a narrow
+///    option beside the broad one would not have helped: a user faced with
+///    "allow this address" and "allow this tool" picks the one that stops the
+///    prompting, and the broad grant then covers every address that tool can
+///    reach. Making the safe option the only option is the whole mechanism.
+///
+/// Non-external tools are untouched — `fs_write`/`shell_exec` keep the session
+/// grant they always had, and never gain a target-scoped one.
+pub fn decisions_for(risk: RiskClass, standing_target: Option<&str>) -> Vec<String> {
+    let mut out = vec!["approve".to_owned()];
+    if risk.standing_grant_eligible() {
+        if standing_target.is_some() {
+            out.push("approve_for_target".to_owned());
+        }
+    } else {
+        out.push("approve_for_session".to_owned());
+    }
+    out.push("deny".to_owned());
+    out.push("abort".to_owned());
+    out
+}
 
 /// How a gated dispatch should proceed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +85,55 @@ pub enum ResolveError {
     Invalid(String),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// One gated dispatch, as handed to [`ApprovalBroker::request`].
+///
+/// A struct rather than a parameter list because the list had already reached
+/// nine same-shaped arguments and H4 adds three more — `&str` positional args
+/// of the same type are exactly what silently transposes.
+pub struct ApprovalRequest<'a> {
+    pub run_id: &'a str,
+    pub session_id: Option<&'a str>,
+    /// Set when the run was fired by a schedule — the owner of any standing
+    /// grant minted here (H4).
+    pub schedule_id: Option<&'a str>,
+    pub tool_call_id: &'a str,
+    pub tool: &'a str,
+    /// Open enum used by the always-review policy: exec | fs_write | network | module
+    pub kind: &'a str,
+    /// EFFECTIVE class (declared + user overrides), not the declared one.
+    pub risk: RiskClass,
+    /// This call's value for the tool's declared target argument, if any.
+    pub standing_target: Option<&'a str>,
+    pub summary: String,
+    pub payload: Map<String, Value>,
+}
+
+/// What an approved decision needs in order to mint the right kind of grant.
+struct GrantCtx {
+    /// Broad in-memory session grant scope (session id, or run id when there is
+    /// no session).
+    scope: String,
+    tool: String,
+    /// Durable owner for a target-scoped grant, when one exists.
+    scope_kind: Option<&'static str>,
+    scope_id: Option<String>,
+    /// The exact target this call named, when it is eligible for a grant.
+    target: Option<String>,
+}
+
+/// Where a standing grant would live: the schedule if one fired this run, else
+/// the session. Schedule wins because that is what the user was consenting to —
+/// "this automation may post there", not "this conversation may".
+fn grant_scope<'a>(
+    session_id: Option<&'a str>,
+    schedule_id: Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    if let Some(id) = schedule_id {
+        return Some(("schedule", id));
+    }
+    session_id.map(|id| ("session", id))
 }
 
 pub struct ApprovalBroker {
@@ -136,24 +216,72 @@ impl ApprovalBroker {
 
     /// Block until the approval is decided (or fails closed). Called from the
     /// tool dispatch path via [`BrokerGate`].
-    #[allow(clippy::too_many_arguments)]
-    pub async fn request(
-        &self,
-        run_id: &str,
-        session_id: Option<&str>,
-        tool_call_id: &str,
-        tool: &str,
-        kind: &str,
-        summary: String,
-        payload: Map<String, Value>,
-        cancel: &CancellationToken,
-    ) -> Verdict {
+    pub async fn request(&self, req: ApprovalRequest<'_>, cancel: &CancellationToken) -> Verdict {
+        let ApprovalRequest {
+            run_id,
+            session_id,
+            schedule_id,
+            tool_call_id,
+            tool,
+            kind,
+            risk,
+            standing_target,
+            summary,
+            payload,
+        } = req;
         let scope = session_id.unwrap_or(run_id).to_owned();
-        let granted = self
-            .grants
-            .lock()
-            .map(|g| g.contains(&(scope.clone(), tool.to_owned())))
-            .unwrap_or(false);
+        // A target-scoped grant is only offerable when there is something
+        // durable to hang it on. A transient run's id never recurs, so a grant
+        // scoped to it could never match again — offering it would be a button
+        // that silently does nothing.
+        let grant_scope = grant_scope(session_id, schedule_id);
+        let offer_target = risk
+            .standing_grant_eligible()
+            .then_some(standing_target)
+            .flatten()
+            .filter(|_| grant_scope.is_some());
+        let grant_ctx = GrantCtx {
+            scope: scope.clone(),
+            tool: tool.to_owned(),
+            scope_kind: grant_scope.map(|(k, _)| k),
+            scope_id: grant_scope.map(|(_, id)| id.to_owned()),
+            target: offer_target.map(str::to_owned),
+        };
+
+        // Standing grant (H4): persistent, and matched on the EXACT target.
+        if let (Some((kind_s, id)), Some(target)) = (grant_scope, offer_target) {
+            match self
+                .store
+                .standing_grant_exists(kind_s, id, tool, target)
+                .await
+            {
+                Ok(true) => {
+                    self.audit(
+                        "approval.standing_grant_used",
+                        serde_json::json!({
+                            "run_id": run_id, "tool": tool, "target": target,
+                            "scope_kind": kind_s, "scope_id": id,
+                        }),
+                    )
+                    .await;
+                    return Verdict::Approved;
+                }
+                Ok(false) => {}
+                // Fail closed: an unreadable grant table means we ask a human,
+                // never that we assume a grant exists.
+                Err(err) => tracing::error!("standing grant lookup failed ({err}); asking a human"),
+            }
+        }
+
+        // Broad session grant. Deliberately NOT consulted for external tools:
+        // they can no longer mint one (see `decisions_for`), and a grant minted
+        // before H4 must not keep authorising every address afterwards.
+        let granted = !risk.standing_grant_eligible()
+            && self
+                .grants
+                .lock()
+                .map(|g| g.contains(&(scope.clone(), tool.to_owned())))
+                .unwrap_or(false);
         if granted {
             self.audit(
                 "approval.auto_granted",
@@ -256,10 +384,8 @@ impl ApprovalBroker {
             kind: kind.to_owned(),
             summary,
             payload,
-            available_decisions: AVAILABLE_DECISIONS
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
+            available_decisions: decisions_for(risk, offer_target),
+            standing_target: offer_target.map(str::to_owned),
             status: ApprovalStatus::Pending,
             decision: None,
             expires_at: agent24_core::util::iso8601_after(self.timeout),
@@ -343,7 +469,7 @@ impl ApprovalBroker {
         let id = approval.id.clone();
         let verdict = tokio::select! {
             decision = &mut rx => match decision {
-                Ok(decision) => self.apply_decision(&id, &scope, tool, decision).await,
+                Ok(decision) => self.apply_decision(&id, &grant_ctx, decision).await,
                 // Sender dropped without a decision — treat as abort
                 Err(_) => Verdict::Aborted("approval channel dropped".to_owned()),
             },
@@ -360,7 +486,7 @@ impl ApprovalBroker {
                     // A decision won the race against the timeout — the row
                     // (single arbiter) tells us which; never block on the
                     // channel here (fail-closed, review C4)
-                    Err(StoreError::Conflict(_)) => self.verdict_from_row(&id, &scope, tool).await,
+                    Err(StoreError::Conflict(_)) => self.verdict_from_row(&id, &grant_ctx).await,
                     Err(err) => {
                         tracing::error!("approval timeout persist failed: {err}");
                         Verdict::Denied("approval store error (fail-closed)".to_owned())
@@ -385,13 +511,15 @@ impl ApprovalBroker {
 
     /// Derive the verdict from the authoritative store row (used when a
     /// concurrent resolution won a race). Fail-closed on anything unexpected.
-    async fn verdict_from_row(&self, id: &str, scope: &str, tool: &str) -> Verdict {
+    async fn verdict_from_row(&self, id: &str, ctx: &GrantCtx) -> Verdict {
         match self.store.get_approval(id).await {
             Ok(Some(row)) => match row.status {
                 ApprovalStatus::Approved => {
-                    let kind = row.decision.as_ref().map(|d| d.kind.as_str());
-                    if kind == Some("approve_for_session") {
-                        self.grant(scope, tool);
+                    // The winning decision may have carried a grant with it;
+                    // replay that side effect here so a lost race still leaves
+                    // the same state a won one would have.
+                    if let Some(decision) = row.decision.clone() {
+                        return self.apply_decision(id, ctx, decision).await;
                     }
                     Verdict::Approved
                 }
@@ -428,24 +556,90 @@ impl ApprovalBroker {
         }
     }
 
+    /// Persist a target-scoped standing grant (H4).
+    ///
+    /// The write is a HARD precondition for treating the call as pre-authorised
+    /// beyond this one time: if it fails, the call still proceeds (a human just
+    /// approved it) but no grant is recorded, so the next call asks again.
+    /// Failing the other way — proceeding as if granted — would leave a
+    /// permission the user believes exists and the daemon cannot show them.
+    async fn record_standing_grant(
+        &self,
+        approval_id: &str,
+        scope_kind: &str,
+        scope_id: &str,
+        tool: &str,
+        target: &str,
+    ) {
+        let grant = agent24_store::StandingGrant {
+            id: format!("sg_{}", ulid()),
+            scope_kind: scope_kind.to_owned(),
+            scope_id: scope_id.to_owned(),
+            tool: tool.to_owned(),
+            target: target.to_owned(),
+            created_at: now_iso8601(),
+        };
+        match self.store.insert_standing_grant(&grant).await {
+            Ok(()) => {
+                self.audit(
+                    "approval.standing_grant_created",
+                    serde_json::json!({
+                        "approval_id": approval_id, "grant_id": grant.id,
+                        "scope_kind": scope_kind, "scope_id": scope_id,
+                        "tool": tool, "target": target,
+                    }),
+                )
+                .await;
+            }
+            Err(err) => tracing::error!(
+                "standing grant for {tool} → {target} not recorded ({err}); the next call will ask again"
+            ),
+        }
+    }
+
     /// Interpret a decision that already won the store transition.
     async fn apply_decision(
         &self,
         approval_id: &str,
-        scope: &str,
-        tool: &str,
+        ctx: &GrantCtx,
         decision: Decision,
     ) -> Verdict {
         match decision.kind.as_str() {
             "approve" => Verdict::Approved,
             "approve_for_session" => {
-                self.grant(scope, tool);
+                self.grant(&ctx.scope, &ctx.tool);
                 self.audit(
                     "approval.session_grant",
-                    serde_json::json!({ "approval_id": approval_id, "scope": scope, "tool": tool }),
+                    serde_json::json!({
+                        "approval_id": approval_id, "scope": ctx.scope, "tool": ctx.tool,
+                    }),
                 )
                 .await;
                 Verdict::Approved
+            }
+            "approve_for_target" => {
+                // Re-check eligibility at apply time rather than trusting that
+                // the offer list was respected: `resolve` validates the decision
+                // against available_decisions, but this is the write that grants
+                // lasting authority, so it verifies its own preconditions.
+                match (
+                    ctx.scope_kind,
+                    ctx.scope_id.as_deref(),
+                    ctx.target.as_deref(),
+                ) {
+                    (Some(kind), Some(id), Some(target)) => {
+                        self.record_standing_grant(approval_id, kind, id, &ctx.tool, target)
+                            .await;
+                        Verdict::Approved
+                    }
+                    _ => {
+                        tracing::error!(
+                            "approval {approval_id}: approve_for_target without an eligible \
+                             target; approving this call only"
+                        );
+                        Verdict::Approved
+                    }
+                }
             }
             "deny" => Verdict::Denied(format!(
                 "denied by user: {}",
@@ -550,6 +744,7 @@ impl ApprovalGate for BrokerGate {
         info: &agent24_protocol::ToolInfo,
         ctx: &ToolContext,
         input: &Map<String, Value>,
+        standing_target: Option<&str>,
         cancel: &CancellationToken,
     ) -> GateDecision {
         let kind = match info.name.as_str() {
@@ -562,13 +757,20 @@ impl ApprovalGate for BrokerGate {
         let verdict = self
             .broker
             .request(
-                &ctx.run_id,
-                ctx.session_id.as_deref(),
-                &ctx.tool_call_id,
-                &info.name,
-                kind,
-                summary,
-                input.clone(),
+                ApprovalRequest {
+                    run_id: &ctx.run_id,
+                    session_id: ctx.session_id.as_deref(),
+                    schedule_id: ctx.schedule_id.as_deref(),
+                    tool_call_id: &ctx.tool_call_id,
+                    tool: &info.name,
+                    kind,
+                    // `info` is the EFFECTIVE ToolInfo the registry built, so
+                    // this already accounts for the user's H2 overrides.
+                    risk: info.risk_class,
+                    standing_target,
+                    summary,
+                    payload: input.clone(),
+                },
                 cancel,
             )
             .await;
@@ -586,6 +788,38 @@ mod tests {
 
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    /// Build a request for the pre-H4 shape used by the existing coverage:
+    /// no schedule, no target, and a class derived from `kind` that keeps every
+    /// one of these tools NON-external — so their session-grant behaviour is
+    /// unchanged. H4's new paths build `ApprovalRequest` literals instead, which
+    /// keeps "what changed" visible in the tests that exercise it.
+    fn req<'a>(
+        run_id: &'a str,
+        session_id: Option<&'a str>,
+        tool_call_id: &'a str,
+        tool: &'a str,
+        kind: &'a str,
+        summary: String,
+        payload: Map<String, Value>,
+    ) -> ApprovalRequest<'a> {
+        let risk = match kind {
+            "exec" => RiskClass::Exec,
+            _ => RiskClass::WriteLocal,
+        };
+        ApprovalRequest {
+            run_id,
+            session_id,
+            schedule_id: None,
+            tool_call_id,
+            tool,
+            kind,
+            risk,
+            standing_target: None,
+            summary,
+            payload,
+        }
+    }
 
     struct Recorded(Arc<StdMutex<Vec<String>>>);
 
@@ -693,13 +927,15 @@ mod tests {
         let b = Arc::clone(&broker);
         let waiter = tokio::spawn(async move {
             b.request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "shell_exec: {}".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "shell_exec: {}".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -757,13 +993,15 @@ mod tests {
         let b = Arc::clone(&broker);
         let waiter = tokio::spawn(async move {
             b.request(
-                "run_1",
-                None,
-                "tc_1",
-                "fs_write",
-                "fs_write",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    None,
+                    "tc_1",
+                    "fs_write",
+                    "fs_write",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -789,13 +1027,15 @@ mod tests {
         let b = Arc::clone(&broker);
         let _waiter = tokio::spawn(async move {
             b.request(
-                "run_1",
-                None,
-                "tc_1",
-                "fs_write",
-                "fs_write",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    None,
+                    "tc_1",
+                    "fs_write",
+                    "fs_write",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -815,13 +1055,15 @@ mod tests {
         let b = Arc::clone(&broker);
         let _waiter = tokio::spawn(async move {
             b.request(
-                "run_1",
-                None,
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    None,
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -847,13 +1089,15 @@ mod tests {
         let b = Arc::clone(&broker);
         let _waiter = tokio::spawn(async move {
             b.request(
-                "run_1",
-                None,
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    None,
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -876,13 +1120,15 @@ mod tests {
         seed_run(&store, "run_1").await;
         let verdict = broker
             .request(
-                "run_1",
-                None,
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    None,
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await;
@@ -908,13 +1154,15 @@ mod tests {
         });
         let verdict = broker
             .request(
-                "run_1",
-                None,
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    None,
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &cancel,
             )
             .await;
@@ -930,13 +1178,15 @@ mod tests {
         let b = Arc::clone(&broker);
         let waiter = tokio::spawn(async move {
             b.request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -952,13 +1202,15 @@ mod tests {
         seed_run(&store, "run_2").await;
         let verdict = broker
             .request(
-                "run_2",
-                Some("sess_1"),
-                "tc_2",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_2",
+                    Some("sess_1"),
+                    "tc_2",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await;
@@ -980,13 +1232,15 @@ mod tests {
         let b = Arc::clone(&broker);
         let waiter = tokio::spawn(async move {
             b.request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -1002,13 +1256,15 @@ mod tests {
         seed_run(&store, "run_2").await;
         let other_session = broker
             .request(
-                "run_2",
-                Some("sess_2"),
-                "tc_2",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_2",
+                    Some("sess_2"),
+                    "tc_2",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await;
@@ -1021,13 +1277,15 @@ mod tests {
         seed_run(&store, "run_3").await;
         let other_tool = broker
             .request(
-                "run_3",
-                Some("sess_1"),
-                "tc_3",
-                "fs_write",
-                "fs_write",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_3",
+                    Some("sess_1"),
+                    "tc_3",
+                    "fs_write",
+                    "fs_write",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await;
@@ -1049,13 +1307,15 @@ mod tests {
         payload.insert("path".to_owned(), serde_json::json!("/tmp/x"));
         let verdict = broker
             .request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                "fs_write",
-                "fs_write",
-                "fs_write: /tmp/x".to_owned(),
-                payload,
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "fs_write",
+                    "fs_write",
+                    "fs_write: /tmp/x".to_owned(),
+                    payload,
+                ),
                 &CancellationToken::new(),
             )
             .await;
@@ -1087,13 +1347,15 @@ mod tests {
         seed_run(&store, "run_1").await;
         let verdict = broker
             .request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "shell_exec: rm -rf /".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "shell_exec: rm -rf /".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await;
@@ -1131,13 +1393,15 @@ mod tests {
         seed_run(&store, "run_1").await;
         let verdict = broker
             .request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await;
@@ -1168,13 +1432,15 @@ mod tests {
         let b = Arc::clone(&broker);
         let waiter = tokio::spawn(async move {
             b.request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -1191,13 +1457,15 @@ mod tests {
         seed_run(&store, "run_2").await;
         let verdict = broker
             .request(
-                "run_2",
-                Some("sess_1"),
-                "tc_2",
-                "shell_exec",
-                "exec",
-                "s".to_owned(),
-                Map::new(),
+                req(
+                    "run_2",
+                    Some("sess_1"),
+                    "tc_2",
+                    "shell_exec",
+                    "exec",
+                    "s".to_owned(),
+                    Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await;
@@ -1213,5 +1481,193 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ResolveError::NotFound(_)), "{err}");
+    }
+
+    // ── H4: target-scoped standing grants ────────────────────────────────────
+
+    fn external_req<'a>(
+        run_id: &'a str,
+        session_id: Option<&'a str>,
+        schedule_id: Option<&'a str>,
+        target: Option<&'a str>,
+    ) -> ApprovalRequest<'a> {
+        ApprovalRequest {
+            run_id,
+            session_id,
+            schedule_id,
+            tool_call_id: "tc_1",
+            tool: "mcp_slack_post",
+            kind: "module",
+            risk: RiskClass::External,
+            standing_target: target,
+            summary: "post a message".to_owned(),
+            payload: Map::new(),
+        }
+    }
+
+    /// The core substitution: an external call that names a target is offered
+    /// the NARROW option and is NOT offered the broad one. Putting both on the
+    /// card would defeat the purpose — a user who wants the prompting to stop
+    /// picks whichever button stops it, and the broad grant then covers every
+    /// address the tool can reach.
+    #[test]
+    fn external_calls_swap_the_broad_grant_for_a_targeted_one() {
+        let offered = decisions_for(RiskClass::External, Some("#ops"));
+        assert!(offered.contains(&"approve_for_target".to_owned()));
+        assert!(
+            !offered.contains(&"approve_for_session".to_owned()),
+            "an external tool must not be able to mint a whole-tool grant: {offered:?}"
+        );
+    }
+
+    /// No declared target (or a call that left it empty) means no standing
+    /// grant at all — not a broad one as a consolation prize.
+    #[test]
+    fn an_external_call_without_a_target_gets_no_standing_option() {
+        let offered = decisions_for(RiskClass::External, None);
+        assert_eq!(offered, vec!["approve", "deny", "abort"]);
+    }
+
+    /// Non-external tools are untouched by H4: shell/fs keep the session grant
+    /// they always had, and never gain a target-scoped one.
+    #[test]
+    fn non_external_tools_keep_the_session_grant_and_gain_nothing() {
+        for risk in [RiskClass::Exec, RiskClass::WriteLocal, RiskClass::Read] {
+            let offered = decisions_for(risk, Some("#ops"));
+            assert!(
+                offered.contains(&"approve_for_session".to_owned()),
+                "{risk:?}"
+            );
+            assert!(
+                !offered.contains(&"approve_for_target".to_owned()),
+                "{risk:?} must never be eligible for a target grant"
+            );
+        }
+    }
+
+    /// A grant fires only for the EXACT target it was minted for. This is the
+    /// property the whole design rests on: if "#ops" also authorised "#ops-2",
+    /// a target-scoped grant would just be a slower broad grant.
+    #[tokio::test]
+    async fn a_grant_authorises_only_its_exact_target() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_millis(300)).await;
+        store
+            .insert_standing_grant(&agent24_store::StandingGrant {
+                id: "sg_1".to_owned(),
+                scope_kind: "schedule".to_owned(),
+                scope_id: "sch_1".to_owned(),
+                tool: "mcp_slack_post".to_owned(),
+                target: "#ops".to_owned(),
+                created_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        seed_run(&store, "run_1").await;
+
+        let hit = broker
+            .request(
+                external_req("run_1", None, Some("sch_1"), Some("#ops")),
+                &cancel,
+            )
+            .await;
+        assert_eq!(
+            hit,
+            Verdict::Approved,
+            "the granted target must not ask again"
+        );
+
+        // A neighbouring channel is a different authorisation: this one must
+        // reach a human, so it times out fail-closed rather than proceeding.
+        let miss = broker
+            .request(
+                external_req("run_1", None, Some("sch_1"), Some("#ops-2")),
+                &cancel,
+            )
+            .await;
+        assert!(matches!(miss, Verdict::Denied(_)), "{miss:?}");
+    }
+
+    /// A grant belongs to ONE scope. The same tool and target under a different
+    /// schedule is a separate decision the user has not made.
+    #[tokio::test]
+    async fn a_grant_does_not_leak_across_scopes() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_millis(300)).await;
+        store
+            .insert_standing_grant(&agent24_store::StandingGrant {
+                id: "sg_1".to_owned(),
+                scope_kind: "schedule".to_owned(),
+                scope_id: "sch_1".to_owned(),
+                tool: "mcp_slack_post".to_owned(),
+                target: "#ops".to_owned(),
+                created_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+        seed_run(&store, "run_1").await;
+        let verdict = broker
+            .request(
+                external_req("run_1", None, Some("sch_2"), Some("#ops")),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(verdict, Verdict::Denied(_)), "{verdict:?}");
+    }
+
+    /// A transient run has no durable owner for a grant — its id never recurs,
+    /// so a grant scoped to it could never match again. Offering the button
+    /// anyway would be offering one that silently does nothing.
+    #[test]
+    fn a_transient_run_is_offered_no_standing_grant() {
+        assert_eq!(grant_scope(None, None), None);
+        assert_eq!(
+            grant_scope(Some("sess_1"), None),
+            Some(("session", "sess_1"))
+        );
+        assert_eq!(
+            grant_scope(Some("sess_1"), Some("sch_1")),
+            Some(("schedule", "sch_1")),
+            "a scheduled run's grant belongs to the automation, not the session"
+        );
+    }
+
+    /// Deleting an automation takes its grants with it. Otherwise a later
+    /// schedule reusing the id would inherit an authorisation nobody gave it.
+    #[tokio::test]
+    async fn deleting_a_schedule_revokes_its_grants() {
+        let store = Store::open_memory().await.unwrap();
+        let schedule = agent24_protocol::Schedule {
+            id: "sch_1".to_owned(),
+            name: "nightly".to_owned(),
+            enabled: true,
+            spec: agent24_protocol::ScheduleSpec::Every { secs: 60 },
+            action: agent24_protocol::ScheduleAction::AgentRun {
+                prompt: "go".to_owned(),
+                session_id: None,
+                model_override: None,
+            },
+            delivery: vec![],
+            last_run_at: None,
+            next_run_at: None,
+            consecutive_failures: 0,
+        };
+        store.upsert_schedule(&schedule).await.unwrap();
+        store
+            .insert_standing_grant(&agent24_store::StandingGrant {
+                id: "sg_1".to_owned(),
+                scope_kind: "schedule".to_owned(),
+                scope_id: "sch_1".to_owned(),
+                tool: "mcp_slack_post".to_owned(),
+                target: "#ops".to_owned(),
+                created_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+
+        assert!(store.delete_schedule("sch_1").await.unwrap());
+        assert!(
+            store.list_standing_grants().await.unwrap().is_empty(),
+            "the grant outlived the automation it belonged to"
+        );
     }
 }

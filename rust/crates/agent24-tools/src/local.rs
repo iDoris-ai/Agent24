@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_protocol::ToolInfo;
+use agent24_protocol::{RiskClass, ToolInfo};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -139,13 +139,12 @@ impl FsReadTool {
 #[async_trait]
 impl Tool for FsReadTool {
     fn info(&self) -> ToolInfo {
-        ToolInfo {
-            name: "fs_read".to_owned(),
-            source: "builtin".to_owned(),
-            description: "Read a UTF-8 text file inside the agent workspace (256 KiB cap)."
-                .to_owned(),
-            requires_approval: false,
-        }
+        ToolInfo::new(
+            "fs_read",
+            "builtin",
+            "Read a UTF-8 text file inside the agent workspace (256 KiB cap).",
+            RiskClass::Read,
+        )
     }
 
     fn parameters(&self) -> Value {
@@ -213,13 +212,12 @@ impl FsWriteTool {
 #[async_trait]
 impl Tool for FsWriteTool {
     fn info(&self) -> ToolInfo {
-        ToolInfo {
-            name: "fs_write".to_owned(),
-            source: "builtin".to_owned(),
-            description: "Write a UTF-8 text file inside the agent workspace (overwrites)."
-                .to_owned(),
-            requires_approval: true,
-        }
+        ToolInfo::new(
+            "fs_write",
+            "builtin",
+            "Write a UTF-8 text file inside the agent workspace (overwrites).",
+            RiskClass::WriteLocal,
+        )
     }
 
     fn parameters(&self) -> Value {
@@ -294,14 +292,13 @@ impl ShellExecTool {
 #[async_trait]
 impl Tool for ShellExecTool {
     fn info(&self) -> ToolInfo {
-        ToolInfo {
-            name: "shell_exec".to_owned(),
-            source: "builtin".to_owned(),
-            description: "Execute a command as an argv array (no shell interpretation), \
-                          cwd inside the agent workspace."
-                .to_owned(),
-            requires_approval: true,
-        }
+        ToolInfo::new(
+            "shell_exec",
+            "builtin",
+            "Execute a command as an argv array (no shell interpretation), \
+             cwd inside the agent workspace.",
+            RiskClass::Exec,
+        )
     }
 
     fn parameters(&self) -> Value {
@@ -437,6 +434,7 @@ mod tests {
         ToolContext {
             run_id: "run_test".to_owned(),
             session_id: None,
+            schedule_id: None,
             tool_call_id: "tc_test".to_owned(),
         }
     }
@@ -622,10 +620,10 @@ mod tests {
         #[async_trait]
         impl Tool for NoApproval {
             fn info(&self) -> ToolInfo {
-                ToolInfo {
-                    requires_approval: false,
-                    ..self.0.info()
-                }
+                // Re-declared as Read purely to skip the gate for this budget
+                // test; the real ShellExecTool is Exec and always gated.
+                let base = self.0.info();
+                ToolInfo::new(base.name, base.source, base.description, RiskClass::Read)
             }
             fn parameters(&self) -> Value {
                 self.0.parameters()

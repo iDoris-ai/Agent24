@@ -29,6 +29,11 @@ pub struct AppState {
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
+    /// H2: the user's risk overrides. Held here as well as inside the registry
+    /// because the two need the SAME object — the registry resolves against it
+    /// on every dispatch, and the CRUD handlers refresh it in place, so a rule
+    /// the user adds governs the very next tool call without a restart.
+    pub risk_overrides: StdArc<agent24_policy::overrides::RiskOverrideStore>,
     pub broker: Arc<agent24_policy::ApprovalBroker>,
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
@@ -166,6 +171,9 @@ pub struct AppDeps {
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
     pub mcp_servers: Vec<Arc<agent24_mcp::McpServer>>,
+    /// Pre-loaded user overrides (H2). Injected rather than loaded here so
+    /// tests can wire an empty or hand-built set.
+    pub risk_overrides: StdArc<agent24_policy::overrides::RiskOverrideStore>,
 }
 
 impl AppState {
@@ -183,6 +191,7 @@ impl AppState {
             guardian,
             memory,
             mcp_servers,
+            risk_overrides,
         } = deps;
         let events = crate::events::EventsHub::default();
         // Approval broker: emits onto the same WS hub; timeout from env
@@ -198,9 +207,15 @@ impl AppState {
             timeout,
             guardian,
         );
-        let tools = Arc::new(tools.with_gate(StdArc::new(agent24_policy::BrokerGate::new(
-            StdArc::clone(&broker),
-        ))));
+        let tools = Arc::new(
+            tools
+                .with_risk_overrides(
+                    StdArc::clone(&risk_overrides) as StdArc<dyn agent24_tools::RiskOverrides>
+                )
+                .with_gate(StdArc::new(agent24_policy::BrokerGate::new(StdArc::clone(
+                    &broker,
+                )))),
+        );
         let runs = agent24_agent::RunManager::with_memory(
             store.clone(),
             Arc::clone(&router),
@@ -218,6 +233,7 @@ impl AppState {
             StdArc::new(move |body| sched_hub.broadcast(body)),
         );
         Self {
+            risk_overrides,
             token: Arc::new(token),
             mcp_servers: Arc::new(mcp_servers),
             router,
@@ -229,6 +245,20 @@ impl AppState {
             runs,
             scheduler,
             shutdown,
+        }
+    }
+}
+
+impl AppState {
+    /// Re-read the override set after the user changed it.
+    ///
+    /// A failed reload leaves the previous snapshot in place rather than
+    /// clearing it: the old rules were user-authored too, and dropping them
+    /// would silently re-tighten every tool the user had relaxed — surprising,
+    /// though never unsafe.
+    pub async fn reload_overrides(&self) {
+        if let Err(err) = self.risk_overrides.reload(&self.store).await {
+            tracing::error!("reloading risk overrides: {err}; keeping the previous set");
         }
     }
 }
@@ -309,6 +339,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/models", get(crate::routes::get_models))
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/tools", get(crate::routes::get_tools))
+        .route(
+            "/api/v1/tool-overrides",
+            get(crate::overrides::list_overrides),
+        )
+        .route(
+            "/api/v1/standing-grants",
+            get(crate::overrides::list_standing_grants),
+        )
+        .route(
+            "/api/v1/standing-grants/{id}",
+            axum::routing::delete(crate::overrides::delete_standing_grant),
+        )
+        .route(
+            "/api/v1/tool-overrides/{pattern}",
+            axum::routing::put(crate::overrides::put_override)
+                .delete(crate::overrides::delete_override),
+        )
         .route("/api/v1/approvals", get(crate::approvals::list_approvals))
         .route(
             "/api/v1/approvals/{id}",
@@ -442,11 +489,25 @@ pub async fn serve(
         None => Vec::new(),
     };
 
+    // H2: load the user's risk overrides before the registry is frozen, so the
+    // first dispatch already resolves against them. A read failure is logged
+    // and treated as "no overrides" — which fails CLOSED (every tool keeps its
+    // declared, more restrictive class), never open.
+    let risk_overrides = StdArc::new(
+        match agent24_policy::overrides::RiskOverrideStore::load(&store).await {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                tracing::error!("could not load risk overrides ({err}); continuing with none");
+                agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new())
+            }
+        },
+    );
     let state = AppState::new(AppDeps {
         token: token.clone(),
         router,
         tools,
         store,
+        risk_overrides,
         shutdown: cancel.clone(),
         guardian,
         memory,
@@ -588,6 +649,9 @@ mod tests {
             guardian,
             memory: None,
             mcp_servers: Vec::new(),
+            risk_overrides: StdArc::new(agent24_policy::overrides::RiskOverrideStore::from_rows(
+                Vec::new(),
+            )),
         })
     }
 
@@ -784,13 +848,15 @@ mod tests {
         state
             .broker
             .request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                tool,
-                kind,
-                format!("{tool}: x"),
-                serde_json::Map::new(),
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    tool,
+                    kind,
+                    format!("{tool}: x"),
+                    serde_json::Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -831,13 +897,15 @@ mod tests {
         let waiter = tokio::spawn(async move {
             broker
                 .request(
-                    "run_1",
-                    Some("sess_1"),
-                    "tc_1",
-                    "shell_exec",
-                    "exec",
-                    "shell_exec: rm -rf /".to_owned(),
-                    serde_json::Map::new(),
+                    req(
+                        "run_1",
+                        Some("sess_1"),
+                        "tc_1",
+                        "shell_exec",
+                        "exec",
+                        "shell_exec: rm -rf /".to_owned(),
+                        serde_json::Map::new(),
+                    ),
                     &c,
                 )
                 .await
@@ -883,13 +951,15 @@ mod tests {
         let waiter = tokio::spawn(async move {
             broker
                 .request(
-                    "run_1",
-                    Some("sess_1"),
-                    "tc_1",
-                    "fs_write",
-                    "fs_write",
-                    "fs_write: x".to_owned(),
-                    serde_json::Map::new(),
+                    req(
+                        "run_1",
+                        Some("sess_1"),
+                        "tc_1",
+                        "fs_write",
+                        "fs_write",
+                        "fs_write: x".to_owned(),
+                        serde_json::Map::new(),
+                    ),
                     &c,
                 )
                 .await
@@ -918,5 +988,105 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    // ── H2: risk overrides end to end ────────────────────────────────────────
+
+    use agent24_tools::RiskOverrides as _;
+
+    /// Pre-H4 request shape for the existing guardian coverage (no schedule, no
+    /// target, never external — so the session-grant path stays as it was).
+    fn req<'a>(
+        run_id: &'a str,
+        session_id: Option<&'a str>,
+        tool_call_id: &'a str,
+        tool: &'a str,
+        kind: &'a str,
+        summary: String,
+        payload: serde_json::Map<String, serde_json::Value>,
+    ) -> agent24_policy::ApprovalRequest<'a> {
+        agent24_policy::ApprovalRequest {
+            run_id,
+            session_id,
+            schedule_id: None,
+            tool_call_id,
+            tool,
+            kind,
+            risk: if kind == "exec" {
+                agent24_protocol::RiskClass::Exec
+            } else {
+                agent24_protocol::RiskClass::WriteLocal
+            },
+            standing_target: None,
+            summary,
+            payload,
+        }
+    }
+
+    /// The whole point of H2 is that a rule the user writes governs the NEXT
+    /// dispatch, with no restart. Anything less and the feature is a settings
+    /// screen that lies. Asserted through the live registry the request path
+    /// uses, not through the store.
+    #[tokio::test]
+    async fn a_stored_override_governs_the_next_dispatch() {
+        let state = state().await;
+        let store = state.store.clone();
+        store
+            .set_risk_override(
+                "mcp_fs_*",
+                agent24_protocol::RiskClass::Read,
+                "cli",
+                &agent24_core::util::now_iso8601(),
+            )
+            .await
+            .unwrap();
+
+        // Before the reload the daemon has not seen it …
+        assert!(state.risk_overrides.is_empty());
+        state.reload_overrides().await;
+        // … and after, the same object the registry resolves against carries it.
+        assert_eq!(state.risk_overrides.len(), 1);
+        assert_eq!(
+            state.risk_overrides.resolve("mcp_fs_read"),
+            Some(agent24_protocol::RiskClass::Read)
+        );
+        assert_eq!(state.risk_overrides.resolve("shell_exec"), None);
+    }
+
+    /// A rule that names a builtin is STORED (the user said it) but must not
+    /// take effect. Storing and applying are deliberately separate: the rule
+    /// stays visible and revocable instead of being silently dropped at write
+    /// time, while the registry keeps refusing to relax code we wrote.
+    #[tokio::test]
+    async fn an_override_naming_a_builtin_is_stored_but_never_applied() {
+        let state = state().await;
+        state
+            .store
+            .set_risk_override(
+                "shell_exec",
+                agent24_protocol::RiskClass::Read,
+                "cli",
+                &agent24_core::util::now_iso8601(),
+            )
+            .await
+            .unwrap();
+        state.reload_overrides().await;
+
+        assert_eq!(
+            state.risk_overrides.resolve("shell_exec"),
+            Some(agent24_protocol::RiskClass::Read),
+            "the rule is stored and listable"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let reg = agent24_tools::ToolRegistry::builtin(dir.path().to_path_buf())
+            .with_risk_overrides(
+                StdArc::clone(&state.risk_overrides) as StdArc<dyn agent24_tools::RiskOverrides>
+            );
+        assert_eq!(
+            reg.tool_risk_class("shell_exec"),
+            Some(agent24_protocol::RiskClass::Exec),
+            "but shell_exec is still exec — a builtin may be tightened, never relaxed"
+        );
+        assert!(reg.tool_requires_approval("shell_exec"));
     }
 }

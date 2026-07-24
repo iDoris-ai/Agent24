@@ -493,6 +493,7 @@ mod tests {
             summary: "run rm -rf /tmp/x".to_owned(),
             payload: Default::default(),
             available_decisions: decisions.iter().map(|s| (*s).to_owned()).collect(),
+            standing_target: None,
             status: ApprovalStatus::Pending,
             decision: None,
             expires_at: "2026-07-24T10:05:00Z".to_owned(),

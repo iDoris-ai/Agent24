@@ -306,6 +306,92 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/standing-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List target-scoped standing grants
+         * @description Persistent pre-authorisations of the form "this tool, aimed at exactly this target, for this session or schedule". They outlive the process and fire while nobody is watching, so listing them is not a convenience — it is the other half of being allowed to mint them.
+         */
+        get: operations["listStandingGrants"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/standing-grants/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one standing grant
+         * @description Takes effect on the next call — the broker reads the table per dispatch rather than caching it, so a revocation is never queued behind a restart. Deleting a schedule revokes the grants it owned as well.
+         */
+        delete: operations["revokeStandingGrant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tool-overrides": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the user's local risk overrides
+         * @description User-local rules adjusting a tool's risk_class. NEVER written by a module, persona, or MCP server: a package may declare which tools it wants, but only the user decides how far to trust them.
+         */
+        get: operations["listToolOverrides"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tool-overrides/{pattern}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Glob over tool names (`*` any run, `?` one char). It is the rule's identity, so writing the same pattern twice replaces it. */
+                pattern: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Create or replace one risk override
+         * @description The rule is stored as written. Whether it takes EFFECT is decided at dispatch: a builtin's class may be tightened but never relaxed, since `external` on third-party code is a guess the user may correct while a builtin's class is not. A stored-but-inert rule stays listed and revocable rather than being silently dropped.
+         */
+        put: operations["setToolOverride"];
+        post?: never;
+        /** Remove one risk override */
+        delete: operations["deleteToolOverride"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -602,8 +688,53 @@ export interface components {
              */
             source: string;
             description: string;
-            /** @default false */
+            risk_class?: components["schemas"]["RiskClass"];
+            /**
+             * @description DERIVED from risk_class (true for anything but `read`). Present for pre-H1 clients; new consumers should read risk_class, which carries strictly more information. Absent (pre-H1 daemon) means the class is unknown, which is treated as `external`, not as `read`.
+             * @default false
+             */
             requires_approval: boolean;
+        };
+        /**
+         * @description A tool's intrinsic side-effect category (H1). Each class earns a different exemption path, which is the reason for the split: only `external` may ever be covered by a target-scoped standing grant; `exec` is asked every time. `read` covers network reads (an http GET changes nothing) — exfiltration is a taint concern, not a side effect. Omitted by a pre-H1 daemon, in which case treat it as `external`.
+         * @example read
+         * @example external
+         * @enum {string}
+         */
+        RiskClass: "read" | "write_local" | "exec" | "external";
+        StandingGrant: {
+            id: string;
+            /**
+             * @description Who owns the grant. `schedule` when a schedule fired the run — what the user consented to was that automation sending there, so deleting it takes the grant along.
+             * @enum {string}
+             */
+            scope_kind: "session" | "schedule";
+            scope_id: string;
+            tool: string;
+            /**
+             * @description Exact value of the tool's declared target argument. Matched exactly — never by prefix, glob, or case. "#ops" does not authorise "#ops-2".
+             * @example #ops-alerts
+             */
+            target: string;
+            /** Format: date-time */
+            created_at: string;
+        };
+        RiskOverride: {
+            /**
+             * @description Glob over tool names; also the rule's identity.
+             * @example mcp_fs_*
+             */
+            pattern: string;
+            risk_class: components["schemas"]["RiskClass"];
+            /**
+             * @description Surface the user acted from. Audit metadata, NOT authorization.
+             * @example desktop
+             * @example cli
+             * @example tui
+             */
+            source: string;
+            /** Format: date-time */
+            created_at: string;
         };
         ErrorBody: {
             /**
@@ -1175,6 +1306,154 @@ export interface operations {
                     "application/json": {
                         tools: components["schemas"]["ToolInfo"][];
                     };
+                };
+            };
+        };
+    };
+    listStandingGrants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Grant list, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        standing_grants: components["schemas"]["StandingGrant"][];
+                    };
+                };
+            };
+        };
+    };
+    revokeStandingGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No such grant */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listToolOverrides: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Override list, most specific rule first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        overrides: components["schemas"]["RiskOverride"][];
+                    };
+                };
+            };
+        };
+    };
+    setToolOverride: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Glob over tool names (`*` any run, `?` one char). It is the rule's identity, so writing the same pattern twice replaces it. */
+                pattern: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    risk_class: components["schemas"]["RiskClass"];
+                    /**
+                     * @description Surface the user acted from. Audit metadata, NOT authorization.
+                     * @example desktop
+                     * @example cli
+                     * @example tui
+                     */
+                    source?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The stored rule */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RiskOverride"];
+                };
+            };
+            /** @description Empty pattern */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    deleteToolOverride: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Glob over tool names (`*` any run, `?` one char). It is the rule's identity, so writing the same pattern twice replaces it. */
+                pattern: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No such rule */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
         };

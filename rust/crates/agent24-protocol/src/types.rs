@@ -223,6 +223,13 @@ pub struct Approval {
     pub payload: Map<String, Value>,
     /// Server-driven open set — UIs render exactly this list
     pub available_decisions: Vec<String>,
+    /// The exact target a `approve_for_target` decision would bind to (H4):
+    /// the channel address, recipient, or repository this call names. Present
+    /// only when `available_decisions` offers that decision, so a UI can label
+    /// the button with what it actually authorises ("always allow → #ops")
+    /// rather than an unqualified "always allow".
+    #[serde(default)]
+    pub standing_target: Option<String>,
     pub status: ApprovalStatus,
     /// Set once resolved
     pub decision: Option<Decision>,
@@ -332,12 +339,182 @@ impl ScheduleUpdate {
 
 // ── Tools ────────────────────────────────────────────────────────────────────
 
+/// The intrinsic side-effect category of a tool (H1) — the single declared
+/// property the approval path reads, replacing the hardcoded name sets the
+/// policy layer used to carry inline.
+///
+/// The point of the split is NOT finer labelling: it is that each class earns a
+/// different exemption path. Only [`RiskClass::External`] is eligible for a
+/// target-scoped standing grant (H4); `Exec` asks every single time, forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskClass {
+    /// No side effects — always allowed.
+    ///
+    /// Note this covers *network reads* (`http_fetch`): a GET changes nothing.
+    /// Its danger is exfiltration, which is a taint-propagation problem, not a
+    /// side-effect class — filing it under `External` would wrongly make it
+    /// eligible for standing grants.
+    Read,
+    /// Mutates the local workspace — path-scoped and gated.
+    WriteLocal,
+    /// Runs commands. Always gated, never eligible for a standing grant.
+    Exec,
+    /// Side effects that leave this machine — the unattended-inbox hook and the
+    /// only class a target-scoped standing grant may cover.
+    External,
+}
+
+impl RiskClass {
+    /// Anything but a pure read needs the approval path's attention.
+    ///
+    /// This is the ONLY definition of "needs approval" in the system:
+    /// [`ToolInfo::requires_approval`] is derived from it so the two can never
+    /// drift apart the way two hand-maintained lists do.
+    pub const fn requires_approval(self) -> bool {
+        !matches!(self, RiskClass::Read)
+    }
+
+    /// Whether a target-scoped standing grant (H4) may ever cover this class.
+    pub const fn standing_grant_eligible(self) -> bool {
+        matches!(self, RiskClass::External)
+    }
+
+    /// How far this class can escape human review — the axis a user-local
+    /// override (H2) is allowed to move a tool *down* but not *up*.
+    ///
+    /// This is deliberately NOT a "how scary is it" ranking: `write_local` and
+    /// `exec` are not comparable that way. It orders the classes by the only
+    /// thing an override can abuse, namely how much review the class lets a
+    /// call skip:
+    ///
+    /// - `Read` (3) — skips the gate entirely
+    /// - `External` (2) — gated, but a standing grant can pre-answer it (H4)
+    /// - `WriteLocal` (1) — gated, never grant-eligible
+    /// - `Exec` (0) — gated, never grant-eligible, asked every single time
+    pub const fn escape_rank(self) -> u8 {
+        match self {
+            RiskClass::Read => 3,
+            RiskClass::External => 2,
+            RiskClass::WriteLocal => 1,
+            RiskClass::Exec => 0,
+        }
+    }
+}
+
+/// Non-exhaustive on purpose: construction must go through [`ToolInfo::new`],
+/// which is what makes `requires_approval` a derived value rather than a second
+/// thing to remember to set.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
 pub struct ToolInfo {
     pub name: String,
     /// Open enum: builtin | mcp | module
     pub source: String,
     pub description: String,
+    /// Declared side-effect class (H1). Additive field: absent in payloads from
+    /// a pre-H1 daemon, where it defaults to the most conservative class rather
+    /// than the most permissive one — an unlabelled tool is treated as if it
+    /// reaches off the machine.
+    #[serde(default = "default_risk_class")]
+    pub risk_class: RiskClass,
+    /// DERIVED from `risk_class` — kept as a wire field for pre-H1 clients.
+    /// Never set it independently; [`ToolInfo::new`] is the only writer.
     #[serde(default)]
     pub requires_approval: bool,
+}
+
+const fn default_risk_class() -> RiskClass {
+    RiskClass::External
+}
+
+impl ToolInfo {
+    pub fn new(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        description: impl Into<String>,
+        risk_class: RiskClass,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+            description: description.into(),
+            risk_class,
+            requires_approval: risk_class.requires_approval(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod risk_class_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn requires_approval_is_read_vs_everything_else() {
+        assert!(!RiskClass::Read.requires_approval());
+        assert!(RiskClass::WriteLocal.requires_approval());
+        assert!(RiskClass::Exec.requires_approval());
+        assert!(RiskClass::External.requires_approval());
+    }
+
+    /// H4's eligibility rule, asserted at its definition so a later edit that
+    /// widens it has to delete a test that says why it is narrow.
+    #[test]
+    fn only_external_may_hold_a_standing_grant() {
+        assert!(RiskClass::External.standing_grant_eligible());
+        for class in [RiskClass::Read, RiskClass::WriteLocal, RiskClass::Exec] {
+            assert!(
+                !class.standing_grant_eligible(),
+                "{class:?} must never be eligible — exec/write ask every time"
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_derives_the_wire_field() {
+        for (class, expected) in [
+            (RiskClass::Read, false),
+            (RiskClass::WriteLocal, true),
+            (RiskClass::Exec, true),
+            (RiskClass::External, true),
+        ] {
+            let info = ToolInfo::new("t", "builtin", "d", class);
+            assert_eq!(info.requires_approval, expected, "{class:?}");
+            assert_eq!(info.risk_class, class);
+        }
+    }
+
+    #[test]
+    fn wire_names_are_snake_case() {
+        let json = serde_json::to_value(ToolInfo::new(
+            "fs_write",
+            "builtin",
+            "d",
+            RiskClass::WriteLocal,
+        ))
+        .unwrap();
+        assert_eq!(json["risk_class"], "write_local");
+        assert_eq!(json["requires_approval"], true);
+    }
+
+    /// A payload from a pre-H1 daemon carries no `risk_class`. It must land on
+    /// the most conservative class, NOT the most permissive one — an unlabelled
+    /// tool is treated as if it reaches off the machine.
+    #[test]
+    fn missing_risk_class_defaults_fail_closed() {
+        let info: ToolInfo = serde_json::from_value(serde_json::json!({
+            "name": "legacy",
+            "source": "mcp",
+            "description": "",
+            "requires_approval": false
+        }))
+        .unwrap();
+        assert_eq!(info.risk_class, RiskClass::External);
+        // The wire field deserializes as it was sent (false), which is exactly
+        // why every decision point must read `risk_class`, never this field.
+        assert!(!info.requires_approval);
+        assert!(info.risk_class.requires_approval());
+    }
 }

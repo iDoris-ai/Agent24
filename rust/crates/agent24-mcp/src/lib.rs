@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_protocol::ToolInfo;
+use agent24_protocol::{RiskClass, ToolInfo};
 use agent24_tools::{Tool, ToolContext, ToolError};
 use async_trait::async_trait;
 use rmcp::ServiceExt;
@@ -47,6 +47,9 @@ pub struct McpServerSpec {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    /// Per-tool target argument (H4), keyed by the server's own tool name.
+    /// Absent = that tool can never hold a target-scoped standing grant.
+    pub target_args: std::collections::BTreeMap<String, String>,
 }
 
 impl McpServerSpec {
@@ -55,7 +58,17 @@ impl McpServerSpec {
             name: name.into(),
             command: command.into(),
             args,
+            target_args: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_target_args(
+        mut self,
+        target_args: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.target_args = target_args;
+        self
     }
 }
 
@@ -63,6 +76,8 @@ impl McpServerSpec {
 pub struct McpServer {
     name: String,
     service: RunningService<RoleClient, ()>,
+    /// The user's per-tool target declarations from mcp.json (H4).
+    target_args: std::collections::BTreeMap<String, String>,
 }
 
 impl McpServer {
@@ -86,11 +101,18 @@ impl McpServer {
         Ok(Self {
             name: spec.name.clone(),
             service,
+            target_args: spec.target_args.clone(),
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The declared target argument for one of this server's tools, if the user
+    /// named one in `mcp.json`.
+    pub fn target_arg(&self, remote_tool: &str) -> Option<&str> {
+        self.target_args.get(remote_tool).map(String::as_str)
     }
 
     /// The server's advertised tools.
@@ -176,6 +198,8 @@ pub struct McpTool {
     name: String,
     description: String,
     parameters: Value,
+    /// Input field this tool aims at, when the user declared one (H4).
+    target_arg: Option<String>,
 }
 
 impl McpTool {
@@ -183,6 +207,7 @@ impl McpTool {
         let remote_name = tool.name.to_string();
         Self {
             name: qualified_name(server.name(), &remote_name),
+            target_arg: server.target_arg(&remote_name).map(str::to_owned),
             description: tool
                 .description
                 .as_ref()
@@ -198,20 +223,27 @@ impl McpTool {
 #[async_trait]
 impl Tool for McpTool {
     fn info(&self) -> ToolInfo {
-        ToolInfo {
-            name: self.name.clone(),
+        ToolInfo::new(
+            self.name.clone(),
             // ToolInfo.source is an open enum (builtin | mcp | module) — mark
             // these as mcp so a UI/audit can tell third-party tools apart.
-            source: "mcp".to_owned(),
-            description: self.description.clone(),
-            // Third-party code we did not write: it goes through the human
-            // approval path, never auto-dispatch.
-            requires_approval: true,
-        }
+            "mcp",
+            self.description.clone(),
+            // Third-party code we did not write, whose side effects we cannot
+            // bound: classified External so it goes through the human approval
+            // path and never auto-dispatches. H2 will let the USER relax an
+            // individual server's read-only tools to `Read`; nothing a server
+            // or a module ships may relax itself.
+            RiskClass::External,
+        )
     }
 
     fn parameters(&self) -> Value {
         self.parameters.clone()
+    }
+
+    fn target_arg(&self) -> Option<String> {
+        self.target_arg.clone()
     }
 
     fn timeout(&self) -> Duration {
