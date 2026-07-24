@@ -126,6 +126,7 @@ fn parse_always_review(raw: Option<&str>) -> Vec<String> {
 async fn open_session_memory(
     ephemeral: bool,
     router: &Arc<ModelRouter>,
+    shutdown: &CancellationToken,
 ) -> Option<agent24_agent::SessionMemory> {
     let kv = if ephemeral {
         agent24_memory::KvStore::open_memory().await
@@ -136,7 +137,10 @@ async fn open_session_memory(
     match kv {
         Ok(kv) => Some(agent24_agent::SessionMemory::new(
             kv,
-            StdArc::new(agent24_agent::RouterSummarizer::new(Arc::clone(router))),
+            StdArc::new(agent24_agent::RouterSummarizer::new(
+                Arc::clone(router),
+                shutdown.clone(),
+            )),
         )),
         Err(err) => {
             tracing::warn!("session memory unavailable ({err}); sessions will not remember");
@@ -384,7 +388,7 @@ pub async fn serve(
     // D1 session memory: a KV file next to the main store (ephemeral daemons get
     // an in-memory one). A failure here degrades to no memory rather than
     // refusing to start — sessions simply don't remember, as before.
-    let memory = open_session_memory(ephemeral, &router).await;
+    let memory = open_session_memory(ephemeral, &router, &cancel).await;
     let state = AppState::new(
         token.clone(),
         router,
