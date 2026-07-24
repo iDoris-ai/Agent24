@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/agent24-agent",
     "crates/agent24-core",
+    "crates/agent24-mcp",
     "crates/agent24-memory",
     "crates/agent24-models",
     "crates/agent24-protocol",
