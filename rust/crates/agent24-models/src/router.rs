@@ -524,6 +524,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_only_with_cooled_down_local_still_never_uses_remote() {
+        // Privacy × health: even when the ONLY local provider is in cooldown, a
+        // LocalOnly task must fail closed — never fall back to the remote one.
+        let local = StubProvider::down("local"); // Unavailable → enters cooldown
+        let remote = StubProvider::ok("remote");
+        let r = router(vec![
+            (local.clone(), Tier::Local),
+            (remote.clone(), Tier::Remote),
+        ]);
+        // First call routes to local, which is down and so cools down. Remote is
+        // off-limits for LocalOnly, so the call still errors.
+        let first = r
+            .complete(
+                TaskProfile {
+                    privacy: Privacy::LocalOnly,
+                    complexity: Complexity::Simple,
+                },
+                &req(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(first, ModelError::Unavailable(_)), "{first}");
+        // Second call: local is now cooling → route is empty → still Unavailable,
+        // and the remote provider is never touched.
+        let second = r
+            .complete(
+                TaskProfile {
+                    privacy: Privacy::LocalOnly,
+                    complexity: Complexity::Complex,
+                },
+                &req(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(second, ModelError::Unavailable(_)), "{second}");
+        assert_eq!(
+            remote.calls(),
+            0,
+            "remote must never be called for LocalOnly, even with local cooling"
+        );
+        assert_eq!(
+            local.calls(),
+            1,
+            "local tried once, then skipped while cooling"
+        );
+    }
+
+    #[tokio::test]
     async fn local_only_uses_lora_as_a_local_tier() {
         let lora = StubProvider::ok("lora");
         let remote = StubProvider::ok("remote");
