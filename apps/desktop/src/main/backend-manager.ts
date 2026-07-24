@@ -1,5 +1,7 @@
 // Backend process manager — supervises the daemon child process.
-// AGENT24_BACKEND=node|rust selects the implementation (default: node).
+// AGENT24_BACKEND=node|rust selects the implementation (default: rust since
+// v0.1.0 — the Rust agent24d is the shipping backend; `node` stays available
+// as an explicit opt-in for the legacy mock).
 // Both backends speak the same v1 protocol and announce themselves via the
 // SPEC-002 §4 ready line: the manager scans child stdout for the first
 // {"type":"ready","port":…,"token":…} JSON line and exposes it to the IPC
@@ -33,7 +35,8 @@ export function getBackendEndpoint(): BackendEndpoint | null {
 }
 
 export function selectedBackend(): BackendKind {
-  return process.env['AGENT24_BACKEND'] === 'rust' ? 'rust' : 'node'
+  // Default rust (v0.1.0); only an explicit `node` opts into the legacy mock.
+  return process.env['AGENT24_BACKEND'] === 'node' ? 'node' : 'rust'
 }
 
 function repoRootDev(): string {
@@ -55,7 +58,8 @@ function resolveRustBinary(): string {
   if (isDev) {
     return path.join(repoRootDev(), 'rust', 'target', 'debug', 'agent24d')
   }
-  // Packaging of agent24d into resources lands in C8
+  // Packaged: electron-builder copies the release binary into
+  // Resources/backend/agent24d (see the desktop package.json build config).
   return path.join(process.resourcesPath, 'backend', 'agent24d')
 }
 
