@@ -13,6 +13,9 @@ import ModulesManagerPage from './pages/ModulesManager'
 import HelloModule from './pages/modules/HelloModule'
 import CodeSandboxPage from './pages/CodeSandbox'
 import ServiceBoxDemoPage from './pages/ServiceBoxDemo'
+import RunsPage from './pages/Runs'
+import SchedulesPage from './pages/Schedules'
+import ApprovalsPage from './pages/Approvals'
 
 // Static module route map — M2 will replace this with dynamic import()
 const MODULE_PAGES: Record<string, React.ComponentType> = {
@@ -21,19 +24,31 @@ const MODULE_PAGES: Record<string, React.ComponentType> = {
   'service-box': ServiceBoxDemoPage,
 }
 
-type BuiltinPage = 'chat' | 'workbench' | 'models' | 'settings' | 'modules-manager'
+type BuiltinPage =
+  | 'chat'
+  | 'workbench'
+  | 'runs'
+  | 'schedules'
+  | 'approvals'
+  | 'models'
+  | 'settings'
+  | 'modules-manager'
 type Page = BuiltinPage | string  // string = module route
 
 const BUILTIN_NAV: { id: BuiltinPage; icon: string; label: string }[] = [
   { id: 'chat',            icon: '💬', label: '对话' },
   { id: 'workbench',       icon: '🔧', label: '工作台' },
+  { id: 'runs',            icon: '📋', label: '任务' },
+  { id: 'schedules',       icon: '⏰', label: '调度' },
+  { id: 'approvals',       icon: '🔐', label: '审批' },
   { id: 'models',          icon: '🤖', label: '模型' },
   { id: 'modules-manager', icon: '🧩', label: '模块管理' },
   { id: 'settings',        icon: '⚙️', label: '设置' },
 ]
 
 const BUILTIN_TITLES: Record<BuiltinPage, string> = {
-  chat: '对话', workbench: '工作台', models: '模型管理',
+  chat: '对话', workbench: '工作台', runs: '运行任务',
+  schedules: '定时调度', approvals: '待审批', models: '模型管理',
   'modules-manager': '模块管理', settings: '设置',
 }
 
@@ -191,6 +206,9 @@ export function App(): JSX.Element {
 
         {page === 'chat'             && <ChatPage />}
         {page === 'workbench'        && <WorkbenchPage />}
+        {page === 'runs'             && <RunsPage />}
+        {page === 'schedules'        && <SchedulesPage />}
+        {page === 'approvals'        && <ApprovalsPage />}
         {page === 'models'           && <ModelsPage />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
         {page === 'settings'         && <SettingsPage />}
