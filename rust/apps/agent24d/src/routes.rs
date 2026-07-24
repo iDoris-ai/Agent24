@@ -2,6 +2,7 @@
 
 use std::sync::Mutex;
 
+use agent24_models::router::TaskProfile;
 use agent24_models::{CompletionRequest, ModelError};
 use agent24_protocol::{
     ChatRequest, ChatResponse, ErrorBody, EventBody, Model, ModelDeltaPayload, RunCompletedPayload,
@@ -73,7 +74,7 @@ impl UsageCounters {
 
 pub async fn get_models(State(state): State<AppState>) -> Response {
     let cancel = state.shutdown.child_token();
-    let models: Vec<Model> = state.registry.models(&cancel).await;
+    let models: Vec<Model> = state.router.models(&cancel).await;
     Json(serde_json::json!({ "models": models })).into_response()
 }
 
@@ -151,7 +152,13 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // Child of the daemon shutdown token — shutdown cancels in-flight provider
     // calls; run-level cancellation joins this in C2
     let cancel = state.shutdown.child_token();
-    match state.registry.complete(&request, &cancel).await {
+    // Default profile: shareable + simple → local-first tier order, so everyday
+    // chat prefers the on-device model and only falls back outward (D2).
+    match state
+        .router
+        .complete(TaskProfile::default(), &request, &cancel)
+        .await
+    {
         Ok((provider, res)) => {
             tracing::debug!("chat served by {provider}");
             state.usage.record(&res.usage);

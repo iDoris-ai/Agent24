@@ -18,7 +18,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use agent24_core::util::{now_iso8601, ulid};
-use agent24_models::{CompletionRequest, ModelError, Msg, ProviderRegistry, ToolSpec};
+use agent24_models::router::{ModelRouter, TaskProfile};
+use agent24_models::{CompletionRequest, ModelError, Msg, ToolSpec};
 use agent24_protocol::{
     ErrorBody, EventBody, ModelDeltaPayload, Run, RunCancelledPayload, RunCompletedPayload,
     RunCreate, RunFailedPayload, RunInput, RunOutputPayload, RunStartedPayload, RunStatus,
@@ -74,7 +75,7 @@ fn add_usage(mut total: Usage, delta: &Usage) -> Usage {
 
 pub struct RunManager {
     store: Store,
-    registry: Arc<ProviderRegistry>,
+    router: Arc<ModelRouter>,
     tools: Arc<ToolRegistry>,
     sink: Arc<dyn EventSink>,
     /// Daemon-wide shutdown token; every run token is a child of it
@@ -88,14 +89,14 @@ pub struct RunManager {
 impl RunManager {
     pub fn new(
         store: Store,
-        registry: Arc<ProviderRegistry>,
+        router: Arc<ModelRouter>,
         tools: Arc<ToolRegistry>,
         sink: Arc<dyn EventSink>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            registry,
+            router,
             tools,
             sink,
             shutdown,
@@ -262,7 +263,7 @@ impl RunManager {
                 tools: tool_specs.clone(),
             };
             let outcome = tokio::select! {
-                r = self.registry.complete(&request, &cancel) => r,
+                r = self.router.complete(TaskProfile::default(), &request, &cancel) => r,
                 () = cancel.cancelled() => Err(ModelError::Cancelled),
             };
 
@@ -580,6 +581,7 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use agent24_models::router::Tier;
     use agent24_models::{CompletionResponse, ModelProvider, ToolCallRequest};
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
@@ -712,7 +714,7 @@ pub(crate) mod tests {
         let sink = Arc::new(RecordingSink(StdMutex::new(vec![])));
         let manager = RunManager::new(
             store.clone(),
-            Arc::new(ProviderRegistry::new(vec![provider])),
+            Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)])),
             Arc::new(tools),
             sink.clone(),
             CancellationToken::new(),
@@ -1046,6 +1048,7 @@ mod approval_tests {
 
     use super::tests::*;
     use super::*;
+    use agent24_models::router::Tier;
     use agent24_policy::{ApprovalBroker, BrokerGate};
     use agent24_protocol::{ApprovalStatus, Decision};
     use std::sync::Arc;
@@ -1090,7 +1093,10 @@ mod approval_tests {
         )]);
         let manager = RunManager::new(
             store.clone(),
-            Arc::new(ProviderRegistry::new(vec![Arc::new(provider)])),
+            Arc::new(ModelRouter::with_defaults(vec![(
+                Arc::new(provider),
+                Tier::Local,
+            )])),
             Arc::new(tools),
             Arc::new(FnSink(emit)),
             CancellationToken::new(),
