@@ -15,7 +15,7 @@ use agent24_protocol::Event;
 const FORCE_REQUIRED: &[(&str, &[&str])] = &[
     ("RunStartedPayload", &["session_id", "schedule_id"]),
     ("ToolCompletedPayload", &["output_summary"]),
-    ("Approval", &["decision", "decided_at"]),
+    ("Approval", &["decision", "decided_at", "standing_target"]),
 ];
 
 fn main() {

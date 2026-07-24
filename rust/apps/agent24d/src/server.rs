@@ -344,6 +344,14 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::overrides::list_overrides),
         )
         .route(
+            "/api/v1/standing-grants",
+            get(crate::overrides::list_standing_grants),
+        )
+        .route(
+            "/api/v1/standing-grants/{id}",
+            axum::routing::delete(crate::overrides::delete_standing_grant),
+        )
+        .route(
             "/api/v1/tool-overrides/{pattern}",
             axum::routing::put(crate::overrides::put_override)
                 .delete(crate::overrides::delete_override),
@@ -840,13 +848,15 @@ mod tests {
         state
             .broker
             .request(
-                "run_1",
-                Some("sess_1"),
-                "tc_1",
-                tool,
-                kind,
-                format!("{tool}: x"),
-                serde_json::Map::new(),
+                req(
+                    "run_1",
+                    Some("sess_1"),
+                    "tc_1",
+                    tool,
+                    kind,
+                    format!("{tool}: x"),
+                    serde_json::Map::new(),
+                ),
                 &CancellationToken::new(),
             )
             .await
@@ -887,13 +897,15 @@ mod tests {
         let waiter = tokio::spawn(async move {
             broker
                 .request(
-                    "run_1",
-                    Some("sess_1"),
-                    "tc_1",
-                    "shell_exec",
-                    "exec",
-                    "shell_exec: rm -rf /".to_owned(),
-                    serde_json::Map::new(),
+                    req(
+                        "run_1",
+                        Some("sess_1"),
+                        "tc_1",
+                        "shell_exec",
+                        "exec",
+                        "shell_exec: rm -rf /".to_owned(),
+                        serde_json::Map::new(),
+                    ),
                     &c,
                 )
                 .await
@@ -939,13 +951,15 @@ mod tests {
         let waiter = tokio::spawn(async move {
             broker
                 .request(
-                    "run_1",
-                    Some("sess_1"),
-                    "tc_1",
-                    "fs_write",
-                    "fs_write",
-                    "fs_write: x".to_owned(),
-                    serde_json::Map::new(),
+                    req(
+                        "run_1",
+                        Some("sess_1"),
+                        "tc_1",
+                        "fs_write",
+                        "fs_write",
+                        "fs_write: x".to_owned(),
+                        serde_json::Map::new(),
+                    ),
                     &c,
                 )
                 .await
@@ -979,6 +993,35 @@ mod tests {
     // ── H2: risk overrides end to end ────────────────────────────────────────
 
     use agent24_tools::RiskOverrides as _;
+
+    /// Pre-H4 request shape for the existing guardian coverage (no schedule, no
+    /// target, never external — so the session-grant path stays as it was).
+    fn req<'a>(
+        run_id: &'a str,
+        session_id: Option<&'a str>,
+        tool_call_id: &'a str,
+        tool: &'a str,
+        kind: &'a str,
+        summary: String,
+        payload: serde_json::Map<String, serde_json::Value>,
+    ) -> agent24_policy::ApprovalRequest<'a> {
+        agent24_policy::ApprovalRequest {
+            run_id,
+            session_id,
+            schedule_id: None,
+            tool_call_id,
+            tool,
+            kind,
+            risk: if kind == "exec" {
+                agent24_protocol::RiskClass::Exec
+            } else {
+                agent24_protocol::RiskClass::WriteLocal
+            },
+            standing_target: None,
+            summary,
+            payload,
+        }
+    }
 
     /// The whole point of H2 is that a rule the user writes governs the NEXT
     /// dispatch, with no restart. Anything less and the feature is a settings

@@ -306,6 +306,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/standing-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List target-scoped standing grants
+         * @description Persistent pre-authorisations of the form "this tool, aimed at exactly this target, for this session or schedule". They outlive the process and fire while nobody is watching, so listing them is not a convenience — it is the other half of being allowed to mint them.
+         */
+        get: operations["listStandingGrants"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/standing-grants/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one standing grant
+         * @description Takes effect on the next call — the broker reads the table per dispatch rather than caching it, so a revocation is never queued behind a restart. Deleting a schedule revokes the grants it owned as well.
+         */
+        delete: operations["revokeStandingGrant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/tool-overrides": {
         parameters: {
             query?: never;
@@ -660,6 +702,23 @@ export interface components {
          * @enum {string}
          */
         RiskClass: "read" | "write_local" | "exec" | "external";
+        StandingGrant: {
+            id: string;
+            /**
+             * @description Who owns the grant. `schedule` when a schedule fired the run — what the user consented to was that automation sending there, so deleting it takes the grant along.
+             * @enum {string}
+             */
+            scope_kind: "session" | "schedule";
+            scope_id: string;
+            tool: string;
+            /**
+             * @description Exact value of the tool's declared target argument. Matched exactly — never by prefix, glob, or case. "#ops" does not authorise "#ops-2".
+             * @example #ops-alerts
+             */
+            target: string;
+            /** Format: date-time */
+            created_at: string;
+        };
         RiskOverride: {
             /**
              * @description Glob over tool names; also the rule's identity.
@@ -1247,6 +1306,57 @@ export interface operations {
                     "application/json": {
                         tools: components["schemas"]["ToolInfo"][];
                     };
+                };
+            };
+        };
+    };
+    listStandingGrants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Grant list, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        standing_grants: components["schemas"]["StandingGrant"][];
+                    };
+                };
+            };
+        };
+    };
+    revokeStandingGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No such grant */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
         };

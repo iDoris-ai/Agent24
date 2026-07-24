@@ -186,6 +186,14 @@ export interface Approval {
     [k: string]: unknown;
   };
   run_id: string;
+  /**
+   * The exact target a `approve_for_target` decision would bind to (H4):
+   * the channel address, recipient, or repository this call names. Present
+   * only when `available_decisions` offers that decision, so a UI can label
+   * the button with what it actually authorises ("always allow → #ops")
+   * rather than an unqualified "always allow".
+   */
+  standing_target: string | null;
   status: ApprovalStatus;
   summary: string;
   tool_call_id: string;

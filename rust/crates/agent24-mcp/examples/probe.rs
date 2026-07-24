@@ -25,6 +25,7 @@ async fn main() {
                 let ctx = agent24_tools::ToolContext {
                     run_id: "probe".into(),
                     session_id: None,
+                    schedule_id: None,
                     tool_call_id: "tc".into(),
                 };
                 let mut input = serde_json::Map::new();

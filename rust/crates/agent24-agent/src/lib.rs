@@ -680,7 +680,13 @@ impl RunManager {
                     continue;
                 }
                 match self
-                    .run_tool_call(&run_id, run.session_id.as_deref(), call, &cancel)
+                    .run_tool_call(
+                        &run_id,
+                        run.session_id.as_deref(),
+                        run.schedule_id.as_deref(),
+                        call,
+                        &cancel,
+                    )
                     .await
                 {
                     Ok(content) => messages.push(Msg::tool_result(call.id.clone(), content)),
@@ -706,10 +712,14 @@ impl RunManager {
     /// persist running → dispatch → persist terminal + event (+ audit on
     /// policy denial). Returns the content handed back to the model, or
     /// `Err(())` when the run was cancelled mid-call.
+    #[allow(clippy::too_many_arguments)]
     async fn run_tool_call(
         &self,
         run_id: &str,
         session_id: Option<&str>,
+        // Set when a schedule fired this run — owns any standing grant the
+        // user mints from its approval (H4).
+        schedule_id: Option<&str>,
         call: &agent24_models::ToolCallRequest,
         cancel: &CancellationToken,
     ) -> Result<String, ()> {
@@ -776,6 +786,7 @@ impl RunManager {
                 let ctx = ToolContext {
                     run_id: run_id.to_owned(),
                     session_id: session_id.map(str::to_owned),
+                    schedule_id: schedule_id.map(str::to_owned),
                     tool_call_id: tc.id.clone(),
                 };
                 self.tools.dispatch(&call.name, &ctx, &input, cancel).await
