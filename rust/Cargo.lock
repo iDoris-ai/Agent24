@@ -81,10 +81,12 @@ name = "agent24-policy"
 version = "0.1.0"
 dependencies = [
  "agent24-core",
+ "agent24-models",
  "agent24-protocol",
  "agent24-store",
  "agent24-tools",
  "async-trait",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
