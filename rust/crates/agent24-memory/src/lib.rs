@@ -29,6 +29,8 @@ pub enum MemoryError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("serialization: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("io: {0}")]
+    Io(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("summarizer: {0}")]
@@ -49,8 +51,7 @@ impl KvStore {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| MemoryError::Summarizer(format!("mkdir: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| MemoryError::Io(format!("mkdir: {e}")))?;
         }
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true)

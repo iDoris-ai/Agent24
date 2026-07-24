@@ -31,6 +31,10 @@ pub trait Summarizer: Send + Sync {
 pub struct CompactionPolicy {
     pub max_recent: usize,
     pub keep_recent: usize,
+    /// Hard cap on the rolling summary length (chars). A misbehaving
+    /// summarizer that keeps appending can't grow the prompt/KV row without
+    /// bound — the summary is truncated to this after each fold (review D1).
+    pub max_summary_chars: usize,
 }
 
 impl Default for CompactionPolicy {
@@ -39,6 +43,7 @@ impl Default for CompactionPolicy {
         Self {
             max_recent: 40,
             keep_recent: 20,
+            max_summary_chars: 4000,
         }
     }
 }
@@ -52,8 +57,18 @@ impl CompactionPolicy {
         Self {
             max_recent,
             keep_recent,
+            max_summary_chars: self.max_summary_chars.max(1),
         }
     }
+}
+
+/// Truncate a summary to at most `max` chars on a char boundary, marking it.
+fn cap_summary(summary: String, max: usize) -> String {
+    if summary.chars().count() <= max {
+        return summary;
+    }
+    let kept: String = summary.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 /// A session's compacted conversation state.
@@ -98,6 +113,13 @@ impl CanonicalSession {
     /// Append a message, compacting if the tail grew past the policy's trigger.
     /// Compaction summarizes the oldest overflow messages into `summary`
     /// (folding in any prior summary) and drops them from `recent`.
+    ///
+    /// No-loss guarantee: the fold is computed WITHOUT mutating `recent`, the
+    /// summarizer is awaited, and only on success are the older messages
+    /// dropped and the summary committed. If the summarizer errors, `recent`
+    /// is left intact (the appended message included) and the next append
+    /// retries compaction — no message is ever lost to a failed summary
+    /// (review D1).
     pub async fn append(
         &mut self,
         msg: Msg,
@@ -109,19 +131,29 @@ impl CanonicalSession {
         if self.recent.len() <= policy.max_recent {
             return Ok(());
         }
-        // Fold everything except the last `keep_recent` into the summary.
+        // Everything except the last `keep_recent` folds into the summary.
+        // Borrow (not drain) so a summarizer error leaves state untouched.
         let overflow = self.recent.len() - policy.keep_recent;
-        let older: Vec<Msg> = self.recent.drain(0..overflow).collect();
+        let older = &self.recent[0..overflow];
         let new_summary = summarizer
-            .summarize(self.summary.as_deref(), &older)
+            .summarize(self.summary.as_deref(), older)
             .await
             .map_err(MemoryError::Summarizer)?;
-        self.summary = Some(new_summary);
-        self.compacted_count += older.len();
+        // Commit only after success.
+        let folded = overflow;
+        self.recent.drain(0..overflow);
+        self.summary = Some(cap_summary(new_summary, policy.max_summary_chars));
+        self.compacted_count += folded;
         Ok(())
     }
 
     /// Persist to the KV store under the `session` namespace.
+    ///
+    /// Last-writer-wins: callers MUST serialize mutations of a single session
+    /// (load → append → save under a per-session lock). The current agent
+    /// drives a session's runs sequentially, satisfying this; a future
+    /// concurrent-runs design would need optimistic concurrency here (review
+    /// D1, deferred to the wiring in D2+).
     pub async fn save(&self, kv: &KvStore) -> Result<()> {
         kv.put("session", &self.session_id, self).await
     }
@@ -180,6 +212,7 @@ mod tests {
         let policy = CompactionPolicy {
             max_recent: 5,
             keep_recent: 2,
+            max_summary_chars: 4000,
         };
         for i in 0..5 {
             s.append(user(i), policy, &sum).await.unwrap();
@@ -198,6 +231,7 @@ mod tests {
         let policy = CompactionPolicy {
             max_recent: 5,
             keep_recent: 2,
+            max_summary_chars: 4000,
         };
         // 6th message triggers compaction: overflow = 6 - 2 = 4 folded, 2 kept
         for i in 0..6 {
@@ -224,6 +258,7 @@ mod tests {
         let policy = CompactionPolicy {
             max_recent: 4,
             keep_recent: 2,
+            max_summary_chars: 4000,
         };
         // 10 messages → multiple compactions, each folding the prior summary
         for i in 0..10 {
@@ -247,6 +282,7 @@ mod tests {
         let policy = CompactionPolicy {
             max_recent: 3,
             keep_recent: 9,
+            max_summary_chars: 4000,
         };
         for i in 0..5 {
             s.append(user(i), policy, &sum).await.unwrap();
@@ -293,6 +329,7 @@ mod tests {
         let policy = CompactionPolicy {
             max_recent: 2,
             keep_recent: 1,
+            max_summary_chars: 4000,
         };
         s.append(user(0), policy, &FailingSummarizer).await.unwrap();
         s.append(user(1), policy, &FailingSummarizer).await.unwrap();
@@ -302,5 +339,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MemoryError::Summarizer(_)), "{err}");
+        // NO-LOSS: recent untouched — all 3 messages present, nothing dropped
+        // by the failed fold (review D1 blocker)
+        assert_eq!(s.recent.len(), 3);
+        assert_eq!(s.summary, None);
+        assert_eq!(s.compacted_count, 0);
+        assert_eq!(s.recent[0].content.as_deref(), Some("message 0"));
+        assert_eq!(s.recent[2].content.as_deref(), Some("message 2"));
+    }
+
+    #[tokio::test]
+    async fn summary_is_capped_to_the_policy_bound() {
+        // A summarizer that returns a huge string must not grow the prompt
+        // without bound — cap_summary truncates it (review D1 major).
+        struct HugeSummarizer;
+        #[async_trait]
+        impl Summarizer for HugeSummarizer {
+            async fn summarize(
+                &self,
+                _prior: Option<&str>,
+                _messages: &[Msg],
+            ) -> std::result::Result<String, String> {
+                Ok("x".repeat(10_000))
+            }
+        }
+        let mut s = CanonicalSession::new("sess_1");
+        let policy = CompactionPolicy {
+            max_recent: 2,
+            keep_recent: 1,
+            max_summary_chars: 100,
+        };
+        for i in 0..3 {
+            s.append(user(i), policy, &HugeSummarizer).await.unwrap();
+        }
+        let summary = s.summary.as_deref().unwrap();
+        assert!(summary.chars().count() <= 100, "summary not capped");
+        assert!(summary.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn msg_serde_roundtrips_tool_calls_and_results() {
+        // Persisting a session requires Msg to serialize losslessly, including
+        // an assistant tool-call turn and a tool-result turn (review D1 minor).
+        let assistant = Msg::assistant(
+            Some("calling a tool".to_owned()),
+            vec![agent24_models::ToolCallRequest {
+                id: "call_1".to_owned(),
+                name: "shell_exec".to_owned(),
+                arguments: "{\"argv\":[\"ls\"]}".to_owned(),
+            }],
+        );
+        let tool_result = Msg::tool_result("call_1", "file listing");
+        let json = serde_json::to_string(&vec![assistant.clone(), tool_result.clone()]).unwrap();
+        let back: Vec<Msg> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, vec![assistant, tool_result]);
+        assert_eq!(back[0].tool_calls[0].name, "shell_exec");
+        assert_eq!(back[1].tool_call_id.as_deref(), Some("call_1"));
     }
 }
