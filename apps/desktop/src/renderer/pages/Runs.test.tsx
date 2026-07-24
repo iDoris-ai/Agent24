@@ -45,6 +45,16 @@ describe('RunsPage', () => {
     )
   })
 
+  it('shows the empty state when there are no runs', async () => {
+    window.agent24 = {
+      backendProxy: proxyMock(() => ({ ok: true, status: 200, data: { runs: [] } })),
+    } as never
+    render(<RunsPage />)
+    await waitFor(() => expect(screen.getByText('暂无运行任务')).toBeInTheDocument())
+    // and the detail panel prompts for a selection
+    expect(screen.getByText('选择一个任务查看详情')).toBeInTheDocument()
+  })
+
   it('shows an error when the list fetch fails', async () => {
     window.agent24 = {
       backendProxy: proxyMock(() => ({
