@@ -130,7 +130,10 @@ fn spawn_ws(base: String, token: String, tx: mpsc::Sender<Msg>) {
         let request = match build_ws_request(&ws_url, &token) {
             Ok(req) => req,
             Err(_) => {
-                let _ = tx.try_send(Msg::WsClosed);
+                // WsClosed drives reconnect — deliver it reliably (await), never
+                // try_send, so a full channel can't strand the TUI on REST-only
+                // polling (review C6).
+                let _ = tx.send(Msg::WsClosed).await;
                 return;
             }
         };
@@ -151,7 +154,8 @@ fn spawn_ws(base: String, token: String, tx: mpsc::Sender<Msg>) {
                 }
             }
         }
-        let _ = tx.try_send(Msg::WsClosed);
+        // Guaranteed delivery: the reconnect signal must not be dropped
+        let _ = tx.send(Msg::WsClosed).await;
     });
 }
 
@@ -184,25 +188,33 @@ impl TerminalGuard {
     fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        // If entering the alternate screen fails, undo raw mode before erroring
+        // Any failure after raw mode is enabled fully unwinds ALL terminal
+        // state (leave alt screen + show cursor + disable raw mode) before
+        // erroring — a partial success must never leave a wrecked terminal.
         if let Err(err) = stdout
             .execute(EnterAlternateScreen)
             .and_then(|s| s.execute(cursor::Hide))
         {
-            let _ = disable_raw_mode();
+            hard_restore();
             return Err(err);
         }
         match Terminal::new(CrosstermBackend::new(stdout)) {
             Ok(terminal) => Ok(Self { terminal }),
             Err(err) => {
-                let mut out = io::stdout();
-                let _ = out.execute(LeaveAlternateScreen);
-                let _ = out.execute(cursor::Show);
-                let _ = disable_raw_mode();
+                hard_restore();
                 Err(err)
             }
         }
     }
+}
+
+/// Best-effort full terminal restore against a fresh stdout handle — used on
+/// the partial-setup-failure path where no `Terminal` exists yet.
+fn hard_restore() {
+    let mut out = io::stdout();
+    let _ = out.execute(LeaveAlternateScreen);
+    let _ = out.execute(cursor::Show);
+    let _ = disable_raw_mode();
 }
 
 impl Drop for TerminalGuard {
