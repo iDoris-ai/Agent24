@@ -228,14 +228,20 @@ impl HttpMlWorker {
 #[async_trait]
 impl MlWorker for HttpMlWorker {
     async fn embed(&self, req: &EmbedRequest, cancel: &CancellationToken) -> Result<EmbedResponse> {
-        self.post_json(
-            "/v1/embed",
-            req,
-            MAX_EMBED_RESPONSE_BYTES,
-            self.call_timeout,
-            cancel,
-        )
-        .await
+        let res: EmbedResponse = self
+            .post_json(
+                "/v1/embed",
+                req,
+                MAX_EMBED_RESPONSE_BYTES,
+                self.call_timeout,
+                cancel,
+            )
+            .await?;
+        // Validate the worker's response against the contract BEFORE handing it
+        // back — a misbehaving worker must surface here as a Worker error, not as
+        // malformed vectors that blow up later in memory/vector-search code.
+        validate_embed(req, &res)?;
+        Ok(res)
     }
 
     async fn transcribe(
@@ -304,6 +310,35 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
     }
     serde_json::from_slice(&body)
         .map_err(|e| WorkerError::Worker(format!("{path} returned invalid JSON: {e}")))
+}
+
+/// Enforce the [`EmbedResponse`] contract: one vector per input (order-preserving)
+/// and every vector exactly `dims` long, with `dims` non-zero when any input was
+/// sent. A violation is a reachable-but-broken worker → [`WorkerError::Worker`].
+fn validate_embed(req: &EmbedRequest, res: &EmbedResponse) -> Result<()> {
+    if res.embeddings.len() != req.input.len() {
+        return Err(WorkerError::Worker(format!(
+            "embed returned {} vectors for {} inputs",
+            res.embeddings.len(),
+            req.input.len()
+        )));
+    }
+    if !req.input.is_empty() && res.dims == 0 {
+        return Err(WorkerError::Worker("embed returned dims=0".to_owned()));
+    }
+    if let Some((i, v)) = res
+        .embeddings
+        .iter()
+        .enumerate()
+        .find(|(_, v)| v.len() != res.dims)
+    {
+        return Err(WorkerError::Worker(format!(
+            "embed vector {i} has length {} but dims={}",
+            v.len(),
+            res.dims
+        )));
+    }
+    Ok(())
 }
 
 /// A connect/timeout failure means "try later" (`Unavailable`); anything else is
@@ -524,6 +559,87 @@ mod tests {
         assert_eq!(res.model, "e5");
         assert_eq!(res.dims, 2);
         assert_eq!(res.embeddings, vec![vec![0.1, 0.2]]);
+    }
+
+    #[tokio::test]
+    async fn http_embed_rejects_dims_mismatch() {
+        // dims says 3 but the vector is length 2 → contract violation → Worker.
+        let base = serve_once(
+            "HTTP/1.1 200 OK",
+            r#"{"model":"e5","embeddings":[[0.1,0.2]],"dims":3}"#,
+        )
+        .await;
+        let worker = HttpMlWorker::new(base);
+        let err = worker
+            .embed(
+                &EmbedRequest {
+                    model: None,
+                    input: vec!["x".to_owned()],
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::Worker(ref m) if m.contains("dims")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_embed_rejects_vector_count_mismatch() {
+        // Two inputs but only one vector returned → Worker error.
+        let base = serve_once(
+            "HTTP/1.1 200 OK",
+            r#"{"model":"e5","embeddings":[[0.1,0.2]],"dims":2}"#,
+        )
+        .await;
+        let worker = HttpMlWorker::new(base);
+        let err = worker
+            .embed(
+                &EmbedRequest {
+                    model: None,
+                    input: vec!["a".to_owned(), "b".to_owned()],
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::Worker(ref m) if m.contains("vectors")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_embed_accepts_a_consistent_response() {
+        let req = EmbedRequest {
+            model: None,
+            input: vec!["a".to_owned(), "b".to_owned()],
+        };
+        let res = EmbedResponse {
+            model: "e5".to_owned(),
+            embeddings: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            dims: 2,
+        };
+        assert!(validate_embed(&req, &res).is_ok());
+    }
+
+    #[test]
+    fn validate_embed_rejects_zero_dims_with_inputs() {
+        let req = EmbedRequest {
+            model: None,
+            input: vec!["a".to_owned()],
+        };
+        let res = EmbedResponse {
+            model: "e5".to_owned(),
+            embeddings: vec![vec![]],
+            dims: 0,
+        };
+        assert!(matches!(
+            validate_embed(&req, &res).unwrap_err(),
+            WorkerError::Worker(_)
+        ));
     }
 
     #[tokio::test]
