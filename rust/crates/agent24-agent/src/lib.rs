@@ -341,7 +341,14 @@ impl RunManager {
             .max_recent
             .saturating_mul(RECENT_HARD_CEILING_FACTOR);
         if session.recent.len() > ceiling {
-            let keep = memory.policy.keep_recent.max(1);
+            // Clamp against the ceiling: a degenerate custom policy (e.g.
+            // keep_recent > ceiling) would otherwise compute drop_n == 0 and
+            // silently fail to enforce the bound at all.
+            let keep = memory
+                .policy
+                .keep_recent
+                .min(ceiling.saturating_sub(1))
+                .max(1);
             let drop_n = session.recent.len().saturating_sub(keep);
             tracing::error!(
                 "session {sid} verbatim tail ({}) exceeded the hard ceiling ({ceiling}); dropping \
@@ -551,6 +558,24 @@ impl RunManager {
                     run_id: run_id.clone(),
                     text: text.clone(),
                 }));
+                // Persist memory BEFORE the run becomes observable as completed
+                // — through the STORE ROW as well as the event. A client polling
+                // get_run/list_runs could otherwise see `completed`, start the
+                // next run in this session, win the session lock and read stale
+                // memory (review D5b). Bounded by MEMORY_WRITE_BUDGET (and the
+                // daemon shutdown token inside the summarizer) so a stuck
+                // provider can never hang a finished run.
+                if tokio::time::timeout(
+                    MEMORY_WRITE_BUDGET,
+                    self.remember_exchange(run.session_id.as_deref(), &run.input.prompt, &text),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!(
+                        "run {run_id} session memory write exceeded {MEMORY_WRITE_BUDGET:?}; completing without recording the turn"
+                    );
+                }
                 match self
                     .store
                     .transition_run(
@@ -566,27 +591,6 @@ impl RunManager {
                     .await
                 {
                     Ok(_) => {
-                        // Persist memory BEFORE emitting: a client that sees
-                        // run.completed may immediately start another run in
-                        // this session, and it must observe this turn. Bounded
-                        // by MEMORY_WRITE_BUDGET (and the daemon shutdown token
-                        // inside the summarizer) so a stuck provider can still
-                        // never hang completion (review D5b).
-                        if tokio::time::timeout(
-                            MEMORY_WRITE_BUDGET,
-                            self.remember_exchange(
-                                run.session_id.as_deref(),
-                                &run.input.prompt,
-                                &text,
-                            ),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            tracing::warn!(
-                                "run {run_id} session memory write exceeded {MEMORY_WRITE_BUDGET:?};                                  completing without recording the turn"
-                            );
-                        }
                         self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
                             run_id,
                             output: RunOutputPayload { text },
