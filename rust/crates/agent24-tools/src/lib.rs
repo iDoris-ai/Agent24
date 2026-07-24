@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_protocol::ToolInfo;
+use agent24_protocol::{RiskClass, ToolInfo};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -191,7 +191,12 @@ impl ToolRegistry {
     pub fn tool_requires_approval(&self, name: &str) -> bool {
         self.tools
             .get(name.trim())
-            .is_some_and(|t| t.info().requires_approval)
+            .is_some_and(|t| t.info().risk_class.requires_approval())
+    }
+
+    /// The declared side-effect class of `name` (H1), if it is registered.
+    pub fn tool_risk_class(&self, name: &str) -> Option<RiskClass> {
+        self.tools.get(name.trim()).map(|t| t.info().risk_class)
     }
 
     /// Sorted list for `GET /api/v1/tools`.
@@ -209,7 +214,7 @@ impl ToolRegistry {
             .filter(|t| {
                 let info = t.info();
                 self.allowed.contains(&info.name)
-                    && (self.interactive_gate || !info.requires_approval)
+                    && (self.interactive_gate || !info.risk_class.requires_approval())
             })
             .map(|t| {
                 let info = t.info();
@@ -246,9 +251,15 @@ impl ToolRegistry {
         }
 
         // 3. approval gate — every requires-approval dispatch consults the
-        // installed gate (fail-closed DenyAllGate unless C4's broker is wired)
+        // installed gate (fail-closed DenyAllGate unless C4's broker is wired).
+        //
+        // The predicate reads `risk_class`, NOT the `requires_approval` wire
+        // field: the field is derived output kept for pre-H1 clients, and a
+        // deserialized ToolInfo could in principle carry a stale `false`
+        // alongside a gated class. Deriving at the decision point makes that
+        // combination unrepresentable in the gate's view.
         let info = tool.info();
-        if info.requires_approval {
+        if info.risk_class.requires_approval() {
             match self.gate.check(&info, ctx, input, cancel).await {
                 GateDecision::Allow => {}
                 GateDecision::Deny(reason) => return Err(ToolError::Denied(reason)),
@@ -304,12 +315,7 @@ mod tests {
     #[async_trait]
     impl Tool for SlowTool {
         fn info(&self) -> ToolInfo {
-            ToolInfo {
-                name: "slow".to_owned(),
-                source: "builtin".to_owned(),
-                description: "sleeps".to_owned(),
-                requires_approval: false,
-            }
+            ToolInfo::new("slow", "builtin", "sleeps", RiskClass::Read)
         }
         fn parameters(&self) -> Value {
             serde_json::json!({"type": "object"})
@@ -382,6 +388,45 @@ mod tests {
         );
     }
 
+    /// H1's whole point: `requires_approval` is DERIVED, so it cannot drift
+    /// from the declared class the way two hand-maintained lists do. Asserted
+    /// over the real registry rather than over constructed samples — a future
+    /// tool that finds some way to set the field independently fails here.
+    #[test]
+    fn requires_approval_is_derived_for_every_registered_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        for info in ToolRegistry::builtin(dir.path().to_path_buf()).list() {
+            assert_eq!(
+                info.requires_approval,
+                info.risk_class.requires_approval(),
+                "{} declares {:?} but carries requires_approval={}",
+                info.name,
+                info.risk_class,
+                info.requires_approval
+            );
+        }
+    }
+
+    /// H1 is an additive migration: the gating outcome must be byte-for-byte
+    /// what it was before the risk classes existed. If a future edit changes a
+    /// builtin's class, this test is where the behaviour change surfaces —
+    /// which is the point. Update it deliberately, never to make CI green.
+    #[test]
+    fn builtin_classes_preserve_pre_h1_gating_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::builtin(dir.path().to_path_buf());
+        let expected = [
+            ("fs_read", RiskClass::Read, false),
+            ("http_fetch", RiskClass::Read, false),
+            ("fs_write", RiskClass::WriteLocal, true),
+            ("shell_exec", RiskClass::Exec, true),
+        ];
+        for (name, class, gated) in expected {
+            assert_eq!(reg.tool_risk_class(name), Some(class), "{name}");
+            assert_eq!(reg.tool_requires_approval(name), gated, "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn slow_tool_hits_its_timeout_budget() {
         let reg = ToolRegistry::new().with(Arc::new(SlowTool));
@@ -400,12 +445,7 @@ mod tests {
         #[async_trait]
         impl Tool for Hanging {
             fn info(&self) -> ToolInfo {
-                ToolInfo {
-                    name: "hang".to_owned(),
-                    source: "builtin".to_owned(),
-                    description: String::new(),
-                    requires_approval: false,
-                }
+                ToolInfo::new("hang", "builtin", "", RiskClass::Read)
             }
             fn parameters(&self) -> Value {
                 serde_json::json!({"type": "object"})

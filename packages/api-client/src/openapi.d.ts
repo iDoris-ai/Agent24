@@ -602,9 +602,20 @@ export interface components {
              */
             source: string;
             description: string;
-            /** @default false */
+            risk_class?: components["schemas"]["RiskClass"];
+            /**
+             * @description DERIVED from risk_class (true for anything but `read`). Present for pre-H1 clients; new consumers should read risk_class, which carries strictly more information. Absent (pre-H1 daemon) means the class is unknown, which is treated as `external`, not as `read`.
+             * @default false
+             */
             requires_approval: boolean;
         };
+        /**
+         * @description A tool's intrinsic side-effect category (H1). Each class earns a different exemption path, which is the reason for the split: only `external` may ever be covered by a target-scoped standing grant; `exec` is asked every time. `read` covers network reads (an http GET changes nothing) — exfiltration is a taint concern, not a side effect. Omitted by a pre-H1 daemon, in which case treat it as `external`.
+         * @example read
+         * @example external
+         * @enum {string}
+         */
+        RiskClass: "read" | "write_local" | "exec" | "external";
         ErrorBody: {
             /**
              * @description Open enum: invalid_request, unauthorized, not_found, conflict,
