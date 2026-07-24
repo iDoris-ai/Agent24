@@ -101,11 +101,11 @@
 | C1 | agent24-core 领域模型 + agent24-store | B5 | merged | #35 |
 | C2 | Agent Loop v1（runs 端到端） | C1 | merged | #36 |
 | C3 | Tool trait + registry + 基础工具 | C2 | merged | #37 |
-| C4 | 审批系统 | C3 | in-pr | #38 |
-| C5 | Schedule 调度器 | C2 | in-pr | #39 |
-| C6 | `agent24 tui` 最小版 | C4, C5 | in-pr | #40 |
-| C7 | 桌面端 Runs/Schedules/Approvals UI | C4, C5 | in-pr | #41 |
-| C8 | v0.1.0 发布工程 | C6, C7 | pending | |
+| C4 | 审批系统 | C3 | merged | #38 |
+| C5 | Schedule 调度器 | C2 | merged | #39 |
+| C6 | `agent24 tui` 最小版 | C4, C5 | merged | #40 |
+| C7 | 桌面端 Runs/Schedules/Approvals UI | C4, C5 | merged | #41 |
+| C8 | v0.1.0 发布工程 | C6, C7 | in-pr #42  | |
 
 ### C1 agent24-core + agent24-store
 - core：Run/Session/ToolCall/Approval/Schedule 状态机（纯逻辑，穷举非法转移返回错误）；store：sqlx SQLite migrations（全部实体表 + audit 表含 prev_hash 链）、repo 层。
