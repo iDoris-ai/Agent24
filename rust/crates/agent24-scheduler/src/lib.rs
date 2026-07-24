@@ -719,6 +719,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_now_fires_even_a_disabled_schedule() {
+        // run_now is a manual override — it triggers regardless of `enabled`
+        // and never touches next_run_at, so a user can run a paused schedule
+        // on demand without re-enabling it.
+        let trig = RecordingTrigger::new();
+        let (sched, _events, store) =
+            scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+        let created = sched
+            .create(every_create(3600), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        let disabled = sched
+            .update(
+                &created.id,
+                ScheduleUpdate {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                utc("2026-07-24T10:05:00Z"),
+            )
+            .await
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.next_run_at, None);
+
+        let run_id = sched.run_now(&created.id).await.unwrap();
+        assert!(run_id.starts_with("run_"));
+        assert_eq!(trig.count(), 1);
+        // still disabled, next_run_at still None — run_now changed neither
+        let after = store.get_schedule(&created.id).await.unwrap().unwrap();
+        assert!(!after.enabled);
+        assert_eq!(after.next_run_at, None);
+    }
+
+    #[tokio::test]
     async fn update_and_delete_unknown_id_is_not_found() {
         let trig = RecordingTrigger::new();
         let (sched, _ev, _store) = scheduler_with(trig).await;
