@@ -271,20 +271,40 @@ impl RunManager {
     /// The session's prior context, or empty when memory is off / this run has
     /// no session. Best-effort: a memory failure degrades to a fresh context
     /// rather than failing the run.
-    async fn session_context(&self, session_id: Option<&str>) -> Vec<Msg> {
+    /// Returns `None` if the run was cancelled while waiting — the caller must
+    /// then finish it cancelled rather than proceed with an empty context.
+    ///
+    /// CANCEL-AWARE by necessity: this takes the per-session lock, and another
+    /// run in the same session can hold that lock for up to MEMORY_WRITE_BUDGET
+    /// while it compacts. A run parked here hasn't even reached its model call
+    /// yet, so blocking it uncancellably would break the C2 contract that cancel
+    /// works in ANY non-terminal state — the same reason the model call and the
+    /// memory write are raced against the token (review D5b).
+    async fn session_context(
+        &self,
+        session_id: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Option<Vec<Msg>> {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         // Take the same per-session lock as the writer so a read can never
         // observe a half-written session (a concurrent run's load→append→save).
-        let lock = memory.session_lock(sid).await;
-        let _guard = lock.lock().await;
-        match CanonicalSession::load(&memory.kv, sid).await {
-            Ok(Some(session)) => session.context(),
-            Ok(None) => Vec::new(),
+        let load = async {
+            let lock = memory.session_lock(sid).await;
+            let _guard = lock.lock().await;
+            CanonicalSession::load(&memory.kv, sid).await
+        };
+        let loaded = tokio::select! {
+            result = load => result,
+            () = cancel.cancelled() => return None,
+        };
+        match loaded {
+            Ok(Some(session)) => Some(session.context()),
+            Ok(None) => Some(Vec::new()),
             Err(err) => {
                 tracing::warn!("session {sid} memory load failed: {err}");
-                Vec::new()
+                Some(Vec::new())
             }
         }
     }
@@ -517,7 +537,16 @@ impl RunManager {
             .collect();
         // D1: a session's prior (compacted) context precedes this turn, so a
         // session actually remembers. Empty when memory is off or session-less.
-        let mut messages = self.session_context(run.session_id.as_deref()).await;
+        // A cancel while waiting on a concurrent run's session lock ends the run
+        // here rather than proceeding without its own context.
+        let Some(prior_context) = self
+            .session_context(run.session_id.as_deref(), &cancel)
+            .await
+        else {
+            self.finish_cancelled(&run_id).await;
+            return;
+        };
+        let mut messages = prior_context;
         messages.push(Msg::user(run.input.prompt.clone()));
         let mut usage_total = zero_usage();
 
@@ -1358,6 +1387,85 @@ pub(crate) mod tests {
             "cancel did not interrupt the memory write (took {:?})",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_while_waiting_on_another_runs_session_lock_is_prompt() {
+        // Reviewer-found (clestons): session_context() takes the per-session
+        // lock BEFORE the model is ever contacted. Run A can hold that lock for
+        // up to MEMORY_WRITE_BUDGET while compacting, so Run B parked here must
+        // still be cancellable — C2: cancel works in any non-terminal state.
+        let store = Store::open_memory().await.unwrap();
+        let sink = Arc::new(RecordingSink(StdMutex::new(vec![])));
+        let kv = KvStore::open_memory().await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        // max_recent 1 → run A's very first turn compacts, so its slow
+        // summarizer runs while holding the session lock.
+        let policy = CompactionPolicy {
+            max_recent: 1,
+            keep_recent: 0,
+            max_summary_chars: 500,
+        };
+        let manager = RunManager::with_memory(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(
+                Arc::new(FixedProvider),
+                Tier::Local,
+            )])),
+            Arc::new(ToolRegistry::new()),
+            sink,
+            CancellationToken::new(),
+            Some(
+                SessionMemory::new(
+                    kv,
+                    Arc::new(SlowSummarizer {
+                        entered: Arc::clone(&entered),
+                    }),
+                )
+                .with_policy(policy),
+            ),
+        );
+        seed_session(&store, "sess_lockwait").await;
+
+        // Run A: proceed until it is inside compaction, holding the lock.
+        let run_a = manager
+            .start_run(RunCreate {
+                session_id: Some("sess_lockwait".to_owned()),
+                prompt: "a".to_owned(),
+                model_override: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("run A should have entered the summarizer holding the lock");
+
+        // Run B: blocks in session_context() waiting for A's lock.
+        let run_b = manager
+            .start_run(RunCreate {
+                session_id: Some("sess_lockwait".to_owned()),
+                prompt: "b".to_owned(),
+                model_override: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let started = std::time::Instant::now();
+        let _ = manager.cancel_run(&run_b.id).await;
+        let final_b = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_terminal(&store, &run_b.id),
+        )
+        .await
+        .expect("run B stayed stuck in an uncancellable lock wait");
+        assert_eq!(final_b.status, RunStatus::Cancelled, "{final_b:?}");
+        assert!(
+            started.elapsed() < SLOW_SUMMARIZER_BLOCK / 2,
+            "cancel waited out the lock holder ({:?})",
+            started.elapsed()
+        );
+        let _ = run_a;
     }
 
     #[tokio::test]
