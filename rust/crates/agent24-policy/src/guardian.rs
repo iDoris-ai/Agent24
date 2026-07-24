@@ -315,37 +315,50 @@ impl<'a> Iterator for JsonObjects<'a> {
 
     fn next(&mut self) -> Option<&'a str> {
         let bytes = self.s.as_bytes();
-        let start = self.s[self.pos..].find('{')? + self.pos;
-        let mut depth = 0usize;
-        let mut in_string = false;
-        let mut escaped = false;
-        for (i, &b) in bytes.iter().enumerate().skip(start) {
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'"' {
-                    in_string = false;
-                }
-                continue;
-            }
-            match b {
-                b'"' => in_string = true,
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        self.pos = i + 1;
-                        return Some(&self.s[start..=i]);
+        // Try each `{` as a candidate object start. An UNTERMINATED `{` must not
+        // abort the whole scan — otherwise a stray/malformed brace placed before
+        // the model's real verdict would hide it (e.g. an echoed low, then `{`,
+        // then the genuine high), letting the low win. So on an unterminated
+        // candidate we advance past just that brace and retry from the next one.
+        loop {
+            let start = self.s[self.pos..].find('{')? + self.pos;
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut closed_at = None;
+            for (i, &b) in bytes.iter().enumerate().skip(start) {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if b == b'\\' {
+                        escaped = true;
+                    } else if b == b'"' {
+                        in_string = false;
                     }
+                    continue;
                 }
-                _ => {}
+                match b {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            closed_at = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match closed_at {
+                Some(i) => {
+                    self.pos = i + 1;
+                    return Some(&self.s[start..=i]);
+                }
+                // Unterminated: skip this `{` and keep looking for the next one.
+                None => self.pos = start + 1,
             }
         }
-        // Unterminated object: nothing more to yield.
-        self.pos = self.s.len();
-        None
     }
 }
 
@@ -566,6 +579,32 @@ mod tests {
         let a = parse_assessment(content).unwrap();
         assert_eq!(a.level, RiskLevel::High);
         assert_eq!(a.rationale, "rm -rf is destructive");
+    }
+
+    #[test]
+    fn parse_stray_brace_between_echo_and_verdict_does_not_hide_high() {
+        // Codex regression: an unterminated `{` after an echoed low must not
+        // abort the scan and let the earlier low win — the real high still wins.
+        let content = "echo: {\"risk_level\":\"low\",\"rationale\":\"echoed payload\"}\nscratch: {\nverdict: {\"risk_level\":\"high\",\"rationale\":\"destructive shell command\"}";
+        let a = parse_assessment(content).unwrap();
+        assert_eq!(a.level, RiskLevel::High);
+        assert_eq!(a.rationale, "destructive shell command");
+    }
+
+    #[test]
+    fn parse_trailing_unterminated_brace_is_ignored() {
+        // A valid low followed by a dangling `{` still parses as low (the stray
+        // brace yields no object rather than derailing the iterator).
+        let content = r#"{"risk_level":"low","rationale":"safe"} then {"#;
+        assert_eq!(parse_assessment(content).unwrap().level, RiskLevel::Low);
+    }
+
+    #[test]
+    fn parse_only_unterminated_braces_is_unparseable() {
+        assert!(matches!(
+            parse_assessment("{ { { no closes here").unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
     }
 
     #[test]
