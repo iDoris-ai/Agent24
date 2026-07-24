@@ -30,7 +30,7 @@ pub struct ToolSpec {
 /// A tool invocation the model asked for. `arguments` is the raw JSON string
 /// exactly as the model produced it — parsing (and rejecting) it is the
 /// caller's job, not the transport's.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
     pub id: String,
     pub name: String,
@@ -40,7 +40,7 @@ pub struct ToolCallRequest {
 /// Conversation message for the agent loop. Richer than the /chat wire
 /// `ChatMessage` (which stays a plain role+content pair): assistant turns may
 /// carry tool calls, and `role: "tool"` turns answer them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Msg {
     pub role: String,
     pub content: Option<String>,
