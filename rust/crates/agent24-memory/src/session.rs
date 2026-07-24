@@ -132,8 +132,18 @@ impl CanonicalSession {
             return Ok(());
         }
         // Everything except the last `keep_recent` folds into the summary.
+        let mut overflow = self.recent.len() - policy.keep_recent;
+        // A `role: "tool"` result must never be split from the assistant
+        // `tool_calls` turn it answers — a kept tail starting with an orphaned
+        // tool message is an invalid conversation every OpenAI-compatible
+        // provider rejects (review D1). Advance the boundary to fold any
+        // leading tool-result messages of the kept tail together with their
+        // (already-folded) assistant turn, until the tail starts on a
+        // non-tool message.
+        while overflow < self.recent.len() && self.recent[overflow].role == "tool" {
+            overflow += 1;
+        }
         // Borrow (not drain) so a summarizer error leaves state untouched.
-        let overflow = self.recent.len() - policy.keep_recent;
         let older = &self.recent[0..overflow];
         let new_summary = summarizer
             .summarize(self.summary.as_deref(), older)
@@ -375,6 +385,87 @@ mod tests {
         let summary = s.summary.as_deref().unwrap();
         assert!(summary.chars().count() <= 100, "summary not capped");
         assert!(summary.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn compaction_never_orphans_a_tool_result() {
+        // The exact repro (review D1 High): user → assistant(tool_calls) →
+        // tool_result, with a boundary that would split the pair. The kept
+        // tail must never start with a `role: "tool"` message (which would be
+        // an orphaned tool result an OpenAI-compatible provider rejects).
+        let mut s = CanonicalSession::new("sess_1");
+        let sum = MockSummarizer::new();
+        let policy = CompactionPolicy {
+            max_recent: 2,
+            keep_recent: 1,
+            max_summary_chars: 4000,
+        };
+        s.append(user(0), policy, &sum).await.unwrap();
+        s.append(
+            Msg::assistant(
+                None,
+                vec![agent24_models::ToolCallRequest {
+                    id: "call_1".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: "{}".to_owned(),
+                }],
+            ),
+            policy,
+            &sum,
+        )
+        .await
+        .unwrap();
+        // this triggers compaction; the naive boundary would keep the tool
+        // result alone
+        s.append(Msg::tool_result("call_1", "output"), policy, &sum)
+            .await
+            .unwrap();
+        // the tool result was folded with its assistant, not stranded
+        assert!(
+            s.recent.first().map(|m| m.role.as_str()) != Some("tool"),
+            "kept tail must not start with an orphaned tool result: {:?}",
+            s.recent
+        );
+        // context() likewise never begins its verbatim part with a bare tool msg
+        let ctx = s.context();
+        let first_verbatim = ctx.iter().find(|m| m.role != "system");
+        assert!(first_verbatim.map(|m| m.role.as_str()) != Some("tool"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_group_kept_together_when_it_fits() {
+        // When keep_recent is large enough, the whole tool-call group stays in
+        // the verbatim tail — no spurious over-folding.
+        let mut s = CanonicalSession::new("sess_1");
+        let sum = MockSummarizer::new();
+        let policy = CompactionPolicy {
+            max_recent: 4,
+            keep_recent: 3,
+            max_summary_chars: 4000,
+        };
+        s.append(user(0), policy, &sum).await.unwrap();
+        s.append(user(1), policy, &sum).await.unwrap();
+        s.append(
+            Msg::assistant(
+                None,
+                vec![agent24_models::ToolCallRequest {
+                    id: "c".to_owned(),
+                    name: "t".to_owned(),
+                    arguments: "{}".to_owned(),
+                }],
+            ),
+            policy,
+            &sum,
+        )
+        .await
+        .unwrap();
+        s.append(Msg::tool_result("c", "out"), policy, &sum)
+            .await
+            .unwrap();
+        // 5th append triggers compaction with keep_recent=3: the assistant +
+        // tool_result pair is within the kept tail, never split
+        s.append(user(4), policy, &sum).await.unwrap();
+        assert_ne!(s.recent.first().map(|m| m.role.as_str()), Some("tool"));
     }
 
     #[tokio::test]
