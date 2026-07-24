@@ -11,7 +11,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use agent24_protocol::{Approval, Decision, Event, Run};
-use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind};
+use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -226,7 +226,18 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn map_key(code: KeyCode) -> Option<Key> {
+fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<Key> {
+    // Ctrl+C / Ctrl+D are the universal "get me out" gesture — they must QUIT,
+    // never be seen as a plain 'c'/'d'. In raw mode crossterm delivers Ctrl+C
+    // as Char('c') + CONTROL, so the modifier MUST be inspected before the
+    // Char arms below (review #40): otherwise Ctrl+C would silently cancel the
+    // selected run.
+    if mods.contains(KeyModifiers::CONTROL) {
+        return match code {
+            KeyCode::Char('c') | KeyCode::Char('d') => Some(Key::Quit),
+            _ => None, // ignore other Ctrl combos
+        };
+    }
     match code {
         KeyCode::Up => Some(Key::Up),
         KeyCode::Down => Some(Key::Down),
@@ -303,7 +314,7 @@ async fn run_loop(terminal: &mut Tui, conn: Conn) -> Result<(), String> {
             key = keys.next() => {
                 match key {
                     Some(Ok(CtEvent::Key(k))) if k.kind == KeyEventKind::Press => {
-                        if let Some(mapped) = map_key(k.code) {
+                        if let Some(mapped) = map_key(k.code, k.modifiers) {
                             let action = app.on_key(mapped);
                             redraw = true;
                             perform(&conn, &mut app, action).await;
@@ -360,4 +371,34 @@ async fn reconcile(conn: &Conn, app: &mut App) {
     // set_runs/set_approvals each clear the flag; only a fully-successful pass
     // leaves it cleared.
     app.needs_reconcile = !ok;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_c_and_ctrl_d_quit_not_cancel() {
+        // Raw mode delivers Ctrl+C as Char('c') + CONTROL; it must map to Quit,
+        // never Cancel (which would silently cancel the selected run) — review #40.
+        assert_eq!(
+            map_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(Key::Quit)
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Some(Key::Quit)
+        );
+        // a plain 'c' still cancels; plain 'q' quits
+        assert_eq!(
+            map_key(KeyCode::Char('c'), KeyModifiers::NONE),
+            Some(Key::Cancel)
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('q'), KeyModifiers::NONE),
+            Some(Key::Quit)
+        );
+        // other Ctrl combos are ignored, not passed through as Char
+        assert_eq!(map_key(KeyCode::Char('a'), KeyModifiers::CONTROL), None);
+    }
 }
