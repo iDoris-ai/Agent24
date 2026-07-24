@@ -150,7 +150,7 @@
 | D3 | Guardian 自动审批员：L1 本地小模型评估 `{risk_level, rationale}`，低风险自动放行+结构化审计，高风险升级人审 | C4, D2 | done |
 | D4a | ML worker Rust 侧契约 + 客户端：`agent24-worker`（MlWorker trait + HTTP/JSON 客户端 + mock，embed/transcribe/health 线协议） | D2 | in-pr #47 |
 | D4b | Python ML worker serving 实现（embedding/whisper；LoRA 训练后置），对齐 D4a 契约 | D4a | pending |
-| D5a | daemon 集成布线（一）：ModelRouter 接管 daemon 全部模型调用（chat/runs），Guardian 按 `A24_GUARDIAN` opt-in 接入 ApprovalBroker（默认关） | D2, D3 | in-pr |
+| D5a | daemon 集成布线（一）：ModelRouter 接管 daemon 全部模型调用（chat/runs），Guardian 按 `A24_GUARDIAN` opt-in 接入 ApprovalBroker（默认关） | D2, D3 | done |
 | D5b | 会话记忆（D1 生效）：CanonicalSession 接入 run 生命周期——按 session 载入既往上下文、完成后回写并按阈值压缩 | D5a, D1 | in-pr |
 | D5c | HttpMlWorker 挂载 + 消费端（D4a 生效） | D5a, D4a | pending |
 
