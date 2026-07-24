@@ -68,9 +68,15 @@ pub struct SessionMemory {
 
 /// Absolute ceiling on the verbatim tail, as a multiple of `max_recent`. If
 /// compaction keeps failing (e.g. the summarizer's provider is down) the tail
-/// would otherwise grow forever and blow the context window; past this we stop
-/// recording new turns instead — a frozen session beats an unusable one.
+/// would otherwise grow forever and blow the context window; past this the
+/// OLDEST messages are dropped. Trimming rather than refusing to record keeps
+/// the session live, so a recovered summarizer can compact it again.
 const RECENT_HARD_CEILING_FACTOR: usize = 4;
+
+/// Ceiling on the post-completion memory write. Ordering demands it happen
+/// before `run.completed`, so it must be bounded — a stuck summarizer must never
+/// hang a finished run.
+const MEMORY_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl SessionMemory {
     pub fn new(kv: KvStore, summarizer: Arc<dyn Summarizer>) -> Self {
@@ -269,6 +275,10 @@ impl RunManager {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
             return Vec::new();
         };
+        // Take the same per-session lock as the writer so a read can never
+        // observe a half-written session (a concurrent run's load→append→save).
+        let lock = memory.session_lock(sid).await;
+        let _guard = lock.lock().await;
         match CanonicalSession::load(&memory.kv, sid).await {
             Ok(Some(session)) => session.context(),
             Ok(None) => Vec::new(),
@@ -304,22 +314,9 @@ impl RunManager {
                 return;
             }
         };
-        // Boundedness guard: if compaction has been failing, `recent` keeps
-        // growing and every later run feeds it all back to the model. Past a
-        // hard ceiling stop recording rather than build an unusable prompt.
-        let ceiling = memory
-            .policy
-            .max_recent
-            .saturating_mul(RECENT_HARD_CEILING_FACTOR);
-        if session.recent.len() >= ceiling {
-            tracing::error!(
-                "session {sid} verbatim tail is at the hard ceiling ({}); not recording this turn \
-                 — compaction is failing, check the summarizer's provider",
-                session.recent.len()
-            );
-            return;
-        }
-        let mut compaction_failed = false;
+        // ALWAYS append — `append` is also where compaction is retried, so
+        // returning early here would freeze a session forever once it grew
+        // (it could never compact again, even after the summarizer recovered).
         for msg in [
             Msg::user(prompt.to_owned()),
             Msg::assistant(Some(answer.to_owned()), vec![]),
@@ -331,15 +328,28 @@ impl RunManager {
                 // Compaction failed; the message is still in `recent` (D1's
                 // no-loss guarantee), so saving keeps the turn and the next
                 // append retries the fold.
-                compaction_failed = true;
                 tracing::warn!("session {sid} compaction failed (turn kept verbatim): {err}");
             }
         }
-        if compaction_failed {
-            tracing::warn!(
-                "session {sid} tail is now {} messages; it will stop recording at {ceiling}",
+        // Boundedness backstop: with compaction persistently failing the tail
+        // would grow every run and be fed back in full. Trim the OLDEST verbatim
+        // messages back to the policy's keep window — losing the oldest history
+        // beats an unusable prompt, and unlike refusing to record it leaves the
+        // session live so a recovered summarizer heals it.
+        let ceiling = memory
+            .policy
+            .max_recent
+            .saturating_mul(RECENT_HARD_CEILING_FACTOR);
+        if session.recent.len() > ceiling {
+            let keep = memory.policy.keep_recent.max(1);
+            let drop_n = session.recent.len().saturating_sub(keep);
+            tracing::error!(
+                "session {sid} verbatim tail ({}) exceeded the hard ceiling ({ceiling}); dropping \
+                 the {drop_n} oldest messages — compaction is failing, check the summarizer's \
+                 provider",
                 session.recent.len()
             );
+            session.recent.drain(0..drop_n);
         }
         if let Err(err) = session.save(&memory.kv).await {
             tracing::warn!("session {sid} memory save failed: {err}");
@@ -556,17 +566,32 @@ impl RunManager {
                     .await
                 {
                     Ok(_) => {
-                        // Emit BEFORE persisting memory: the run is already
-                        // Completed in the store and memory is best-effort, so
-                        // a slow summarizer must never delay run.completed or
-                        // hold the run's cancellation entry (review D5b).
+                        // Persist memory BEFORE emitting: a client that sees
+                        // run.completed may immediately start another run in
+                        // this session, and it must observe this turn. Bounded
+                        // by MEMORY_WRITE_BUDGET (and the daemon shutdown token
+                        // inside the summarizer) so a stuck provider can still
+                        // never hang completion (review D5b).
+                        if tokio::time::timeout(
+                            MEMORY_WRITE_BUDGET,
+                            self.remember_exchange(
+                                run.session_id.as_deref(),
+                                &run.input.prompt,
+                                &text,
+                            ),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                "run {run_id} session memory write exceeded {MEMORY_WRITE_BUDGET:?};                                  completing without recording the turn"
+                            );
+                        }
                         self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
                             run_id,
-                            output: RunOutputPayload { text: text.clone() },
+                            output: RunOutputPayload { text },
                             usage: usage_total,
                         }));
-                        self.remember_exchange(run.session_id.as_deref(), &run.input.prompt, &text)
-                            .await;
                     }
                     Err(err) => tracing::error!("run completion persist failed: {err}"),
                 }
@@ -1162,6 +1187,53 @@ pub(crate) mod tests {
         assert!(texts.contains(&"alpha"), "lost a turn: {texts:?}");
         assert!(texts.contains(&"beta"), "lost a turn: {texts:?}");
         assert_eq!(session.recent.len(), 4, "{texts:?}");
+    }
+
+    #[tokio::test]
+    async fn many_concurrent_writers_on_one_session_lose_nothing() {
+        // Codex (low): the two-run test can pass even unlocked if tokio happens
+        // to serialize. Drive remember_exchange directly from many tasks at once
+        // — an unlocked load→append→save loses turns here with high probability.
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) = manager_with_memory(provider, Arc::new(UnusedSummarizer)).await;
+        seed_session(&store, "sess_many").await;
+
+        const WRITERS: usize = 12;
+        let mut tasks = Vec::new();
+        for i in 0..WRITERS {
+            let m = Arc::clone(&manager);
+            tasks.push(tokio::spawn(async move {
+                m.remember_exchange(Some("sess_many"), &format!("q{i}"), &format!("a{i}"))
+                    .await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let session = CanonicalSession::load(&kv, "sess_many")
+            .await
+            .unwrap()
+            .expect("session should exist");
+        let texts: Vec<&str> = session
+            .recent
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        // Every writer's prompt AND answer must have survived.
+        for i in 0..WRITERS {
+            assert!(
+                texts.contains(&format!("q{i}").as_str()),
+                "lost q{i}: {texts:?}"
+            );
+            assert!(
+                texts.contains(&format!("a{i}").as_str()),
+                "lost a{i}: {texts:?}"
+            );
+        }
+        assert_eq!(session.recent.len(), WRITERS * 2, "{texts:?}");
     }
 
     #[tokio::test]
