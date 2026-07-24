@@ -246,9 +246,9 @@ impl RiskAssessor for ModelRiskAssessor {
 /// echo it back — a payload field holding `{"risk_level":"low",…}` must never be
 /// mistaken for the verdict and auto-approve a genuinely high-risk call.
 ///
-/// We extract the SINGLE span from the first `{` to the last `}` and parse it as
-/// one JSON value; a span that is not itself well-formed JSON (two prose-separated
-/// objects, an unterminated wrapper, …) fails and we escalate. Then two DELIBERATELY
+/// We require the WHOLE response (after whitespace + optional code fence) to be
+/// exactly one JSON value — surrounding prose, a second object, or truncated
+/// trailing content all fail to parse and escalate. Then two DELIBERATELY
 /// ASYMMETRIC rules apply — the asymmetry IS the fail-closed hardening:
 ///   - **high wins at any depth**: if any object anywhere in the value states
 ///     `risk_level: high` with a rationale, the result is High. Finding a high
@@ -279,16 +279,36 @@ fn parse_assessment(content: &str) -> Result<RiskAssessment, AssessError> {
     Err(AssessError::Unparseable(truncate(content)))
 }
 
-/// Extract the first-`{`…last-`}` span and parse it as a single JSON value.
-/// Returns `None` if there is no brace pair or the span is not well-formed JSON
-/// — both of which the caller treats as fail-closed escalation.
+/// Parse the model's response as a single JSON value, fail-closed.
+///
+/// The WHOLE response (after trimming whitespace and an optional single
+/// ``` / ```json code fence) must be exactly one JSON value — `serde_json`
+/// natively rejects any leading or trailing junk. So surrounding prose, a second
+/// object, or a truncated trailing wrapper (`{…} then {"x":`) all fail here and
+/// escalate, rather than being silently discarded (fail-open). The model is told
+/// to reply with one object and nothing else; a compliant answer parses, an
+/// embellished one escalates.
 fn extract_json_value(content: &str) -> Option<Value> {
-    let start = content.find('{')?;
-    let end = content.rfind('}')?;
-    if end < start {
-        return None;
+    let body = strip_code_fence(content.trim()).trim();
+    serde_json::from_str(body).ok()
+}
+
+/// Strip a single surrounding ```/```json fence, if present. Anything malformed
+/// is returned as-is so the strict `from_str` below rejects it.
+fn strip_code_fence(s: &str) -> &str {
+    let Some(rest) = s.strip_prefix("```") else {
+        return s;
+    };
+    // Drop the remainder of the opening fence line (an optional language tag).
+    let Some(newline) = rest.find('\n') else {
+        return s;
+    };
+    let after_open = &rest[newline + 1..];
+    // Drop the closing fence, if there is one.
+    match after_open.rfind("```") {
+        Some(close) => &after_open[..close],
+        None => after_open,
     }
-    serde_json::from_str(&content[start..=end]).ok()
 }
 
 /// The assessment stated by an object's OWN `risk_level` + non-empty `rationale`
@@ -507,18 +527,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_wrapped_in_prose_and_fences() {
-        let content = "Sure! Here is my assessment:\n```json\n{\n  \"risk_level\": \"high\",\n  \"rationale\": \"rm -rf is irreversible\"\n}\n```\nHope that helps.";
+    fn parse_fenced_json_is_accepted() {
+        // A ```json fenced object (whitespace/fence tolerated) parses.
+        let content = "```json\n{\n  \"risk_level\": \"high\",\n  \"rationale\": \"rm -rf is irreversible\"\n}\n```";
         let a = parse_assessment(content).unwrap();
         assert_eq!(a.level, RiskLevel::High);
         assert_eq!(a.rationale, "rm -rf is irreversible");
     }
 
     #[test]
+    fn parse_prose_around_the_object_escalates() {
+        // Strict: surrounding prose means the whole response is not one JSON value
+        // → escalate (a compliant model replies with the object and nothing else).
+        assert_not_auto_approvable(
+            r#"Sure! Here is my assessment: {"risk_level":"low","rationale":"safe"}. Hope that helps."#,
+        );
+    }
+
+    #[test]
     fn parse_tolerates_brace_inside_rationale_string() {
-        let a =
-            parse_assessment(r#"prefix {"risk_level":"low","rationale":"safe } really"} suffix"#)
-                .unwrap();
+        // A `}` inside the rationale string is handled by serde natively.
+        let a = parse_assessment(r#"{"risk_level":"low","rationale":"safe } really"}"#).unwrap();
         assert_eq!(a.level, RiskLevel::Low);
         assert_eq!(a.rationale, "safe } really");
     }
@@ -638,11 +667,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_trailing_dangling_brace_is_ignored() {
-        // A valid low object followed by a dangling `{` still parses as low: the
-        // last `}` is the object's own close.
-        let content = r#"{"risk_level":"low","rationale":"safe"} then {"#;
-        assert_eq!(parse_assessment(content).unwrap().level, RiskLevel::Low);
+    fn parse_trailing_content_after_object_escalates() {
+        // Codex: a complete low followed by truncated trailing content must NOT
+        // be silently accepted — strict whole-response parse rejects the junk.
+        let content = r#"{"risk_level":"low","rationale":"safe"} then {"wrapper":"#;
+        assert!(matches!(
+            parse_assessment(content).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
+        // A second complete object after the first also escalates.
+        let two =
+            r#"{"risk_level":"low","rationale":"safe"} {"risk_level":"low","rationale":"again"}"#;
+        assert!(matches!(
+            parse_assessment(two).unwrap_err(),
+            AssessError::Unparseable(_)
+        ));
     }
 
     #[test]
