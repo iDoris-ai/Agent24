@@ -11,6 +11,7 @@
 //! ids-only into logs (payloads never hit stderr).
 
 pub mod guardian;
+pub mod overrides;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

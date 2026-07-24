@@ -372,6 +372,27 @@ impl RiskClass {
     pub const fn standing_grant_eligible(self) -> bool {
         matches!(self, RiskClass::External)
     }
+
+    /// How far this class can escape human review — the axis a user-local
+    /// override (H2) is allowed to move a tool *down* but not *up*.
+    ///
+    /// This is deliberately NOT a "how scary is it" ranking: `write_local` and
+    /// `exec` are not comparable that way. It orders the classes by the only
+    /// thing an override can abuse, namely how much review the class lets a
+    /// call skip:
+    ///
+    /// - `Read` (3) — skips the gate entirely
+    /// - `External` (2) — gated, but a standing grant can pre-answer it (H4)
+    /// - `WriteLocal` (1) — gated, never grant-eligible
+    /// - `Exec` (0) — gated, never grant-eligible, asked every single time
+    pub const fn escape_rank(self) -> u8 {
+        match self {
+            RiskClass::Read => 3,
+            RiskClass::External => 2,
+            RiskClass::WriteLocal => 1,
+            RiskClass::Exec => 0,
+        }
+    }
 }
 
 /// Non-exhaustive on purpose: construction must go through [`ToolInfo::new`],
