@@ -56,10 +56,29 @@ fn xml_escape(s: &str) -> String {
 ///
 /// `ThrottleInterval` is 10s: launchd's own minimum, and enough that a daemon
 /// crash-looping on a bad config burns ~0.1 CPU instead of a core.
-pub fn render_plist(exec: &Path, out_log: &Path, err_log: &Path) -> String {
+pub fn render_plist(
+    exec: &Path,
+    out_log: &Path,
+    err_log: &Path,
+    env: &[(String, String)],
+) -> String {
     let exec = xml_escape(&exec.to_string_lossy());
     let out_log = xml_escape(&out_log.to_string_lossy());
     let err_log = xml_escape(&err_log.to_string_lossy());
+    let env_block = if env.is_empty() {
+        String::new()
+    } else {
+        let mut b = String::from("    <key>EnvironmentVariables</key>\n    <dict>\n");
+        for (k, v) in env {
+            b.push_str(&format!(
+                "        <key>{}</key>\n        <string>{}</string>\n",
+                xml_escape(k),
+                xml_escape(v)
+            ));
+        }
+        b.push_str("    </dict>\n");
+        b
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -85,7 +104,7 @@ pub fn render_plist(exec: &Path, out_log: &Path, err_log: &Path) -> String {
     <integer>10</integer>
     <key>ProcessType</key>
     <string>Background</string>
-    <key>StandardOutPath</key>
+{env_block}    <key>StandardOutPath</key>
     <string>{out_log}</string>
     <key>StandardErrorPath</key>
     <string>{err_log}</string>
@@ -93,6 +112,38 @@ pub fn render_plist(exec: &Path, out_log: &Path, err_log: &Path) -> String {
 </plist>
 "#
     )
+}
+
+/// Config the daemon reads from the environment. launchd gives a LaunchAgent
+/// NONE of the login shell's environment, so without capturing these the 24/7
+/// daemon silently behaves differently from a manually started one.
+pub const PASSTHROUGH_VARS: [&str; 7] = [
+    "OMLX_URL",
+    "OMLX_API_KEY",
+    "DEFAULT_MODEL",
+    "A24_GUARDIAN",
+    "A24_GUARDIAN_ALWAYS_REVIEW",
+    "A24_APPROVAL_TIMEOUT_SECS",
+    "A24_SCHEDULER_TICK_SECS",
+];
+
+/// Snapshot the environment the daemon should run with.
+///
+/// PATH matters most: launchd's default is only `/usr/bin:/bin:/usr/sbin:/sbin`,
+/// so a `shell_exec` tool call for `node`/`git`/`python3` would fail under 24/7
+/// while working when started by hand — the worst kind of bug to diagnose.
+/// This is a SNAPSHOT taken at install time; re-run install to refresh it.
+pub fn capture_env() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        out.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
+    }
+    for key in PASSTHROUGH_VARS {
+        if let Some(val) = std::env::var_os(key) {
+            out.push((key.to_owned(), val.to_string_lossy().into_owned()));
+        }
+    }
+    out
 }
 
 fn launchctl(args: &[&str]) -> Result<std::process::Output, String> {
@@ -120,7 +171,7 @@ fn bootout_if_loaded() {
 }
 
 /// Install (or reinstall) the LaunchAgent and start it.
-pub fn install(exec: &Path) -> Result<PathBuf, String> {
+pub fn install(exec: &Path) -> Result<(PathBuf, Vec<String>), String> {
     if !exec.exists() {
         return Err(format!(
             "agent24d not found at {} — build it (cargo build --release -p agent24d) \
@@ -139,12 +190,21 @@ pub fn install(exec: &Path) -> Result<PathBuf, String> {
     // previous ProgramArguments and the new plist looks like it did nothing.
     bootout_if_loaded();
 
+    let env = capture_env();
     let body = render_plist(
         exec,
         &logs.join("agent24d.out.log"),
         &logs.join("agent24d.err.log"),
+        &env,
     );
     std::fs::write(&plist, body).map_err(|e| format!("writing {}: {e}", plist.display()))?;
+    // The captured env can include OMLX_API_KEY, so keep the plist owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("securing {}: {e}", plist.display()))?;
+    }
 
     let target = format!("gui/{}", uid());
     let out = launchctl(&["bootstrap", &target, &plist.to_string_lossy()])?;
@@ -159,7 +219,7 @@ pub fn install(exec: &Path) -> Result<PathBuf, String> {
             }
         ));
     }
-    Ok(plist)
+    Ok((plist, env.into_iter().map(|(k, _)| k).collect()))
 }
 
 /// Stop and remove the LaunchAgent. Idempotent.
@@ -195,6 +255,7 @@ mod tests {
             Path::new("/opt/agent24d"),
             Path::new("/logs/out.log"),
             Path::new("/logs/err.log"),
+            &[],
         );
         assert!(p.contains("<string>ai.auraai.agent24</string>"));
         assert!(p.contains("<string>/opt/agent24d</string>"));
@@ -215,7 +276,7 @@ mod tests {
     fn daemon_is_launched_with_a_dynamic_port() {
         // The port must stay dynamic: the daemon publishes it via the state
         // file, and a hard-coded port would collide with a manually started one.
-        let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"));
+        let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &[]);
         assert!(p.contains("<string>serve</string>"));
         assert!(p.contains("<string>--port</string>"));
         assert!(p.contains("<string>0</string>"));
@@ -229,9 +290,61 @@ mod tests {
             Path::new("/Users/x/R&D <beta>/agent24d"),
             Path::new("/o"),
             Path::new("/e"),
+            &[],
         );
         assert!(p.contains("/Users/x/R&amp;D &lt;beta&gt;/agent24d"));
         assert!(!p.contains("R&D <beta>"));
+    }
+
+    #[test]
+    fn captured_env_lands_in_the_plist_so_shell_exec_still_finds_tools() {
+        // launchd's default PATH is only /usr/bin:/bin:/usr/sbin:/sbin, so
+        // without this a shell_exec for `node` works by hand and fails at 3am.
+        let env = vec![
+            ("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned()),
+            ("OMLX_URL".to_owned(), "http://127.0.0.1:8088".to_owned()),
+        ];
+        let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &env);
+        assert!(p.contains("<key>EnvironmentVariables</key>"));
+        assert!(p.contains("<key>PATH</key>"));
+        assert!(p.contains("<string>/opt/homebrew/bin:/usr/bin</string>"));
+        assert!(p.contains("<key>OMLX_URL</key>"));
+    }
+
+    #[test]
+    fn no_env_block_when_nothing_captured() {
+        let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &[]);
+        assert!(!p.contains("EnvironmentVariables"));
+    }
+
+    #[test]
+    fn env_values_are_xml_escaped_too() {
+        let env = vec![(
+            "A24_GUARDIAN_ALWAYS_REVIEW".to_owned(),
+            "exec&<fs".to_owned(),
+        )];
+        let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &env);
+        assert!(p.contains("exec&amp;&lt;fs"));
+        assert!(!p.contains("exec&<fs"));
+    }
+
+    #[test]
+    fn passthrough_list_matches_what_the_daemon_actually_reads() {
+        // Guard against drift: these are the vars grepped out of the daemon.
+        for v in [
+            "OMLX_URL",
+            "OMLX_API_KEY",
+            "DEFAULT_MODEL",
+            "A24_GUARDIAN",
+            "A24_GUARDIAN_ALWAYS_REVIEW",
+            "A24_APPROVAL_TIMEOUT_SECS",
+            "A24_SCHEDULER_TICK_SECS",
+        ] {
+            assert!(
+                PASSTHROUGH_VARS.contains(&v),
+                "{v} missing from passthrough"
+            );
+        }
     }
 
     #[test]

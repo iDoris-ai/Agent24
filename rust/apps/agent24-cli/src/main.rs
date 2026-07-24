@@ -394,12 +394,18 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
                     exec.display()
                 )
             })?;
-            let plist = service::install(&exec)?;
+            let (plist, captured) = service::install(&exec)?;
             println!("24/7 enabled.");
             println!("  agent:  {}", plist.display());
             println!("  daemon: {}", exec.display());
             if let Some(logs) = service::log_dir() {
                 println!("  logs:   {}", logs.display());
+            }
+            if !captured.is_empty() {
+                println!(
+                    "  env:    captured {} (snapshot — re-run install to refresh)",
+                    captured.join(", ")
+                );
             }
             println!("It now starts at login and restarts if it crashes.");
             println!("A clean `agent24 daemon stop` is respected (not resurrected).");
