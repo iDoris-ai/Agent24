@@ -301,6 +301,35 @@ fn default_true() -> bool {
     true
 }
 
+/// Partial update (openapi ScheduleUpdate: any non-empty subset). A field
+/// present-and-null is meaningful only where the wire allows null; for these
+/// fields "absent" = leave unchanged. Changing `spec` recomputes next_run_at.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<ScheduleSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ScheduleAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Vec<DeliveryTarget>>,
+}
+
+impl ScheduleUpdate {
+    /// True when no field is set (openapi: ScheduleUpdate is `minProperties: 1`,
+    /// so an empty update is a 400, not a silent no-op).
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.enabled.is_none()
+            && self.spec.is_none()
+            && self.action.is_none()
+            && self.delivery.is_none()
+    }
+}
+
 // ── Tools ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -5,6 +5,7 @@ members = [
     "crates/agent24-core",
     "crates/agent24-models",
     "crates/agent24-protocol",
+    "crates/agent24-scheduler",
     "crates/agent24-policy",
     "crates/agent24-store",
     "crates/agent24-tools",

@@ -485,6 +485,48 @@ impl Store {
         Ok(())
     }
 
+    /// Persist ONLY the scheduler-owned runtime columns of an existing row
+    /// (enabled / last_run_at / next_run_at / consecutive_failures). Returns
+    /// false when the row is gone. Two guarantees for the fire path (review
+    /// C5): a schedule deleted mid-tick is not resurrected (never inserts),
+    /// and a concurrent PATCH to the user-facing fields (name / spec / action
+    /// / delivery) is not clobbered — those columns are left untouched.
+    pub async fn update_schedule_runtime(&self, schedule: &Schedule) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE schedules SET
+                 enabled = ?, last_run_at = ?, next_run_at = ?, consecutive_failures = ?
+             WHERE id = ?",
+        )
+        .bind(schedule.enabled)
+        .bind(&schedule.last_run_at)
+        .bind(&schedule.next_run_at)
+        .bind(schedule.consecutive_failures)
+        .bind(&schedule.id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// List schedules, skipping (and logging) any row whose JSON columns no
+    /// longer deserialize — one corrupt row must never wedge the whole tick
+    /// (review C5). Use [`list_schedules`] where a hard error is preferable.
+    pub async fn list_schedules_lenient(&self) -> Result<Vec<Schedule>> {
+        let rows = sqlx::query("SELECT * FROM schedules ORDER BY name ASC")
+            .fetch_all(self.pool())
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match Self::row_to_schedule(row) {
+                Ok(schedule) => out.push(schedule),
+                Err(err) => {
+                    let id: String = row.get("id");
+                    tracing::error!("skipping unreadable schedule {id}: {err}");
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn row_to_schedule(r: &SqliteRow) -> Result<Schedule> {
         Ok(Schedule {
             id: r.get("id"),

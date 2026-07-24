@@ -339,6 +339,56 @@ async fn schedule_upsert_roundtrip_and_delete() {
 }
 
 #[tokio::test]
+async fn update_schedule_runtime_preserves_user_fields_and_needs_the_row() {
+    // The scheduler's fire path must touch only runtime columns: a concurrent
+    // PATCH to name/spec/action/delivery must survive, and a deleted row must
+    // not be resurrected (review C5).
+    let store = Store::open_memory().await.unwrap();
+    let schedule = Schedule {
+        id: "sch_rt".to_owned(),
+        name: "original".to_owned(),
+        enabled: true,
+        spec: ScheduleSpec::Every { secs: 3600 },
+        action: ScheduleAction::AgentRun {
+            prompt: "original prompt".to_owned(),
+            session_id: None,
+            model_override: None,
+        },
+        delivery: vec![],
+        last_run_at: None,
+        next_run_at: Some(TS.to_owned()),
+        consecutive_failures: 0,
+    };
+    store.upsert_schedule(&schedule).await.unwrap();
+
+    // Simulate a concurrent PATCH renaming + re-specing the row
+    let mut patched = schedule.clone();
+    patched.name = "renamed by patch".to_owned();
+    patched.spec = ScheduleSpec::Every { secs: 120 };
+    store.upsert_schedule(&patched).await.unwrap();
+
+    // The scheduler fires with its STALE copy, writing runtime fields only
+    let mut stale = schedule.clone();
+    stale.last_run_at = Some(TS.to_owned());
+    stale.next_run_at = Some(TS.to_owned());
+    stale.consecutive_failures = 3;
+    assert!(store.update_schedule_runtime(&stale).await.unwrap());
+
+    let loaded = store.get_schedule("sch_rt").await.unwrap().unwrap();
+    // user fields survive the runtime write
+    assert_eq!(loaded.name, "renamed by patch");
+    assert_eq!(loaded.spec, ScheduleSpec::Every { secs: 120 });
+    // runtime fields applied
+    assert_eq!(loaded.consecutive_failures, 3);
+    assert_eq!(loaded.last_run_at.as_deref(), Some(TS));
+
+    // deleted row: runtime update reports it's gone, never resurrects
+    assert!(store.delete_schedule("sch_rt").await.unwrap());
+    assert!(!store.update_schedule_runtime(&stale).await.unwrap());
+    assert!(store.get_schedule("sch_rt").await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn audit_chain_appends_and_detects_tampering() {
     let store = Store::open_memory().await.unwrap();
     for i in 0..3 {

@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path'
 import Ajv2020 from 'ajv/dist/2020.js'
 import addFormats from 'ajv-formats'
 import WsClient from 'ws'
-import { BASE_URL, TOKEN, get, post, resolveLlmExpectation } from './helpers.js'
+import { BASE_URL, TOKEN, get, post, patch, del, resolveLlmExpectation } from './helpers.js'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const WS_URL = BASE_URL.replace(/^http/, 'ws') + '/api/v1/events'
@@ -348,14 +348,114 @@ describe('v1 M-C approvals (endpoints live since C4, agent24d only)', () => {
   it.todo('live approve/deny/abort/timeout flows via a tool-calling run (needs LLM; Rust-tested)')
 })
 
-describe('v1 M-C schedules (activate in C5)', () => {
-  it.todo('POST /api/v1/schedules (cron spec) → 201 with computed next_run_at')
-  it.todo('GET /api/v1/schedules lists it; GET /api/v1/schedules/{id} returns it')
-  it.todo('POST /api/v1/schedules with every.secs < 60 → 400')
-  it.todo('PATCH /api/v1/schedules/{id} spec change recomputes next_run_at')
-  it.todo('DELETE /api/v1/schedules/{id} → 204; then GET → 404')
-  it.todo('POST /api/v1/schedules/{id}/run_now → 202 {run_id}, next_run_at unchanged')
-  it.todo('schedule firing emits schedule.fired {schedule_id, run_id}')
+describe('v1 M-C schedules (live since C5, agent24d only)', () => {
+  const cronSpec = { type: 'cron', expr: '0 8 * * *', tz: 'UTC' }
+  const agentAction = { type: 'agent_run', prompt: 'daily digest' }
+
+  it('POST /api/v1/schedules (cron) → 201 with computed next_run_at; list & get', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const created = await post('/api/v1/schedules', {
+      name: 'digest',
+      spec: cronSpec,
+      action: agentAction,
+    })
+    expect(created.status).toBe(201)
+    const schedule = created.body as { id: string; next_run_at: string | null; enabled: boolean }
+    expect(schedule.id).toMatch(/^sch_[0-9A-HJKMNP-TV-Z]{26}$/)
+    expect(schedule.enabled).toBe(true)
+    expect(schedule.next_run_at).toMatch(/T08:00:00Z$/)
+
+    const list = await get('/api/v1/schedules')
+    expect(list.status).toBe(200)
+    const schedules = (list.body as { schedules: Array<{ id: string }> }).schedules
+    expect(schedules.some((s) => s.id === schedule.id)).toBe(true)
+
+    const fetched = await get(`/api/v1/schedules/${schedule.id}`)
+    expect(fetched.status).toBe(200)
+    expect((fetched.body as { id: string }).id).toBe(schedule.id)
+  })
+
+  it('POST /api/v1/schedules with every.secs < 60 → 400', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await post('/api/v1/schedules', {
+      name: 'too-fast',
+      spec: { type: 'every', secs: 30 },
+      action: agentAction,
+    })
+    expect(res.status).toBe(400)
+    expect((res.body as { error: { code: string } }).error.code).toBe('invalid_request')
+  })
+
+  it('PATCH spec change recomputes next_run_at', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const created = await post('/api/v1/schedules', {
+      name: 'patchme',
+      spec: cronSpec,
+      action: agentAction,
+    })
+    const id = (created.body as { id: string }).id
+    const before = (created.body as { next_run_at: string }).next_run_at
+
+    const patched = await patch(`/api/v1/schedules/${id}`, {
+      spec: { type: 'cron', expr: '0 9 * * *', tz: 'UTC' },
+    })
+    expect(patched.status).toBe(200)
+    const after = (patched.body as { next_run_at: string }).next_run_at
+    expect(after).toMatch(/T09:00:00Z$/)
+    expect(after).not.toBe(before)
+  })
+
+  it('DELETE → 204; then GET → 404', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const created = await post('/api/v1/schedules', {
+      name: 'deleteme',
+      spec: cronSpec,
+      action: agentAction,
+    })
+    const id = (created.body as { id: string }).id
+    const deleted = await del(`/api/v1/schedules/${id}`)
+    expect(deleted.status).toBe(204)
+    const gone = await get(`/api/v1/schedules/${id}`)
+    expect(gone.status).toBe(404)
+  })
+
+  it('POST /api/v1/schedules/{id}/run_now → 202 {run_id}, next_run_at unchanged', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const created = await post('/api/v1/schedules', {
+      name: 'runnow',
+      spec: cronSpec,
+      action: agentAction,
+    })
+    const id = (created.body as { id: string }).id
+    const before = (created.body as { next_run_at: string }).next_run_at
+
+    const fired = await post(`/api/v1/schedules/${id}/run_now`, undefined)
+    expect(fired.status).toBe(202)
+    expect((fired.body as { run_id: string }).run_id).toMatch(/^run_/)
+
+    const after = await get(`/api/v1/schedules/${id}`)
+    expect((after.body as { next_run_at: string }).next_run_at).toBe(before)
+  })
+
+  it('run_now on unknown id → 404 envelope', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const res = await post('/api/v1/schedules/sch_nope/run_now', undefined)
+    expect(res.status).toBe(404)
+    expect((res.body as { error: { code: string } }).error.code).toBe('not_found')
+  })
+
+  it('empty PATCH body → 400 (minProperties: 1)', async (ctx) => {
+    if (!IS_RUST_TARGET) return ctx.skip()
+    const created = await post('/api/v1/schedules', {
+      name: 'emptypatch',
+      spec: cronSpec,
+      action: agentAction,
+    })
+    const id = (created.body as { id: string }).id
+    const res = await patch(`/api/v1/schedules/${id}`, {})
+    expect(res.status).toBe(400)
+    expect((res.body as { error: { code: string } }).error.code).toBe('invalid_request')
+  })
 })
 
 describe('v1 M-C sessions (live since C2, agent24d only)', () => {

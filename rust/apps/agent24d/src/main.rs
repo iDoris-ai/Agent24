@@ -7,6 +7,7 @@ mod approvals;
 mod events;
 mod routes;
 mod runs;
+mod schedules;
 mod server;
 
 use clap::{Parser, Subcommand};

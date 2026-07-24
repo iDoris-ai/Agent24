@@ -105,6 +105,16 @@ impl RunManager {
 
     /// Create a run (202 semantics: persisted queued, executed in background).
     pub async fn start_run(self: &Arc<Self>, create: RunCreate) -> Result<Run, AgentError> {
+        self.start_run_with_schedule(create, None).await
+    }
+
+    /// As [`start_run`], but tags the run with the schedule that fired it
+    /// (the scheduler uses this so every run traces back to its trigger).
+    pub async fn start_run_with_schedule(
+        self: &Arc<Self>,
+        create: RunCreate,
+        schedule_id: Option<String>,
+    ) -> Result<Run, AgentError> {
         if let Some(session_id) = &create.session_id
             && self.store.get_session(session_id).await?.is_none()
         {
@@ -122,7 +132,7 @@ impl RunManager {
             output: None,
             error: None,
             usage: zero_usage(),
-            schedule_id: None,
+            schedule_id,
             created_at: now_iso8601(),
             started_at: None,
             ended_at: None,

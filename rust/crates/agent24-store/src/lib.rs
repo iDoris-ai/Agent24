@@ -88,4 +88,25 @@ pub mod test_hooks {
     pub fn pool(store: &super::Store) -> &sqlx::SqlitePool {
         store.pool()
     }
+
+    /// Insert a schedule row with arbitrary (possibly invalid) JSON columns —
+    /// lets tests simulate a corrupt row that would fail deserialization.
+    pub async fn insert_raw_schedule(
+        store: &super::Store,
+        id: &str,
+        spec_json: &str,
+        next_run_at: &str,
+    ) -> super::Result<()> {
+        sqlx::query(
+            "INSERT INTO schedules (id, name, enabled, spec, action, delivery,
+                                    last_run_at, next_run_at, consecutive_failures)
+             VALUES (?, 'corrupt', 1, ?, '{}', '[]', NULL, ?, 0)",
+        )
+        .bind(id)
+        .bind(spec_json)
+        .bind(next_run_at)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
 }
