@@ -214,8 +214,12 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     }
 }
 
-/// `GET /api/v1/tools` — the registered tool list (builtin/mcp/module), with
-/// `requires_approval` visible so clients can explain the C3 fail-closed stub.
+/// `GET /api/v1/tools` — the registered tool list (builtin/mcp/module).
+///
+/// Reports each tool's EFFECTIVE risk class (declared, as adjusted by the
+/// user's H2 overrides) rather than the declared one: the endpoint answers
+/// "what happens if this is called", and showing a declared `external` for a
+/// tool the user relaxed to `read` would misdescribe the next dispatch.
 pub async fn get_tools(State(state): State<AppState>) -> Response {
     Json(serde_json::json!({ "tools": state.tools.list() })).into_response()
 }

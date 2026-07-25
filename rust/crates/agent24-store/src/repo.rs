@@ -7,9 +7,10 @@
 
 use agent24_core::check_run_transition;
 use agent24_protocol::{
-    Approval, ApprovalStatus, Decision, ErrorBody, Run, RunOutput, RunStatus, Schedule, Session,
-    ToolCall, ToolCallStatus, Usage,
+    Approval, ApprovalStatus, Decision, ErrorBody, RiskClass, Run, RunOutput, RunStatus, Schedule,
+    Session, ToolCall, ToolCallStatus, Usage,
 };
+use serde_json::Value;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
@@ -563,6 +564,93 @@ impl Store {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    // ── Risk overrides (H2) ──────────────────────────────────────────────────
+    //
+    // Only an explicit user action reaches these three methods. Nothing on a
+    // module/persona/MCP install path may call `set_risk_override` — see the
+    // migration's note and `agent24_tools::RiskOverrides`.
+
+    /// Upsert one user rule. Returns the row as stored.
+    pub async fn set_risk_override(
+        &self,
+        pattern: &str,
+        risk_class: RiskClass,
+        source: &str,
+        now: &str,
+    ) -> Result<RiskOverrideRow> {
+        let class = serde_json::to_value(risk_class)?
+            .as_str()
+            .unwrap_or("external")
+            .to_owned();
+        sqlx::query(
+            "INSERT INTO risk_overrides (pattern, risk_class, source, created_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(pattern) DO UPDATE SET \
+               risk_class = excluded.risk_class, \
+               source = excluded.source, \
+               created_at = excluded.created_at",
+        )
+        .bind(pattern)
+        .bind(&class)
+        .bind(source)
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(RiskOverrideRow {
+            pattern: pattern.to_owned(),
+            risk_class,
+            source: source.to_owned(),
+            created_at: now.to_owned(),
+        })
+    }
+
+    pub async fn delete_risk_override(&self, pattern: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM risk_overrides WHERE pattern = ?")
+            .bind(pattern)
+            .execute(self.pool())
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// All rules, most specific first (see `agent24_policy::overrides`).
+    ///
+    /// A row with an unreadable class is SKIPPED rather than failing the load:
+    /// one corrupt rule must not take the whole override set down, because
+    /// losing the set silently re-tightens every tool the user had relaxed —
+    /// noisy, but never unsafe.
+    pub async fn list_risk_overrides(&self) -> Result<Vec<RiskOverrideRow>> {
+        let rows = sqlx::query("SELECT * FROM risk_overrides ORDER BY pattern ASC")
+            .fetch_all(self.pool())
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let pattern: String = row.get("pattern");
+            let raw: String = row.get("risk_class");
+            match serde_json::from_value::<RiskClass>(Value::String(raw.clone())) {
+                Ok(risk_class) => out.push(RiskOverrideRow {
+                    pattern,
+                    risk_class,
+                    source: row.get("source"),
+                    created_at: row.get("created_at"),
+                }),
+                Err(_) => {
+                    tracing::error!("skipping risk override {pattern}: unknown class {raw:?}");
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One stored user rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RiskOverrideRow {
+    pub pattern: String,
+    pub risk_class: RiskClass,
+    /// Which surface the user acted from. Audit metadata, NOT authorization.
+    pub source: String,
+    pub created_at: String,
 }
 
 #[cfg(test)]
