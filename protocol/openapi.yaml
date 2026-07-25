@@ -980,9 +980,28 @@ components:
           examples: [builtin, mcp, module]
         description:
           type: string
+        risk_class:
+          $ref: '#/components/schemas/RiskClass'
         requires_approval:
           type: boolean
           default: false
+          description: >-
+            DERIVED from risk_class (true for anything but `read`). Present for
+            pre-H1 clients; new consumers should read risk_class, which carries
+            strictly more information. Absent (pre-H1 daemon) means the class is
+            unknown, which is treated as `external`, not as `read`.
+
+    RiskClass:
+      type: string
+      description: >-
+        A tool's intrinsic side-effect category (H1). Each class earns a
+        different exemption path, which is the reason for the split: only
+        `external` may ever be covered by a target-scoped standing grant;
+        `exec` is asked every time. `read` covers network reads (an http GET
+        changes nothing) — exfiltration is a taint concern, not a side effect.
+        Omitted by a pre-H1 daemon, in which case treat it as `external`.
+      enum: [read, write_local, exec, external]
+      examples: [read, external]
 
     ErrorBody:
       type: object

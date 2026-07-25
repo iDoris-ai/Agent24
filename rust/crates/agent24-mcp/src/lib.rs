@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_protocol::ToolInfo;
+use agent24_protocol::{RiskClass, ToolInfo};
 use agent24_tools::{Tool, ToolContext, ToolError};
 use async_trait::async_trait;
 use rmcp::ServiceExt;
@@ -198,16 +198,19 @@ impl McpTool {
 #[async_trait]
 impl Tool for McpTool {
     fn info(&self) -> ToolInfo {
-        ToolInfo {
-            name: self.name.clone(),
+        ToolInfo::new(
+            self.name.clone(),
             // ToolInfo.source is an open enum (builtin | mcp | module) — mark
             // these as mcp so a UI/audit can tell third-party tools apart.
-            source: "mcp".to_owned(),
-            description: self.description.clone(),
-            // Third-party code we did not write: it goes through the human
-            // approval path, never auto-dispatch.
-            requires_approval: true,
-        }
+            "mcp",
+            self.description.clone(),
+            // Third-party code we did not write, whose side effects we cannot
+            // bound: classified External so it goes through the human approval
+            // path and never auto-dispatches. H2 will let the USER relax an
+            // individual server's read-only tools to `Read`; nothing a server
+            // or a module ships may relax itself.
+            RiskClass::External,
+        )
     }
 
     fn parameters(&self) -> Value {
