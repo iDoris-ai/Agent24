@@ -1,6 +1,6 @@
 {
   "name": "@agent24/contract-tests",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Protocol contract tests — run against any Agent24 daemon (node mock or agent24d) via A24_BASE_URL",
   "type": "module",
