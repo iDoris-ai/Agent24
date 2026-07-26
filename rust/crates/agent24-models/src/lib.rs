@@ -290,6 +290,116 @@ struct OaModelsResponse {
 /// allocate unbounded memory in the daemon.
 const MAX_CHAT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODELS_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Error bodies are tiny (a JSON error object). Cap hard — the error path must
+/// not become a second unbounded-allocation route.
+const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+
+/// OpenAI-compatible error envelope: `{ "error": { "message", "code", "type" } }`.
+#[derive(Deserialize)]
+struct OaErrorBody {
+    error: OaError,
+}
+
+#[derive(Deserialize)]
+struct OaError {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+/// Pull the provider's own human-readable message out of an error body, if it
+/// sent one in the OpenAI shape. Best-effort: a body we can't parse yields a
+/// trimmed snippet rather than nothing, because even a raw HTML 502 page tells
+/// a user more than a bare status code.
+fn extract_provider_message(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = serde_json::from_str::<OaErrorBody>(trimmed) {
+        let msg = parsed.error.message.trim();
+        if !msg.is_empty() {
+            return Some(match parsed.error.code {
+                Some(code) if !code.is_empty() => format!("{msg} [{code}]"),
+                _ => msg.to_owned(),
+            });
+        }
+    }
+    // Not the expected shape — surface a bounded snippet so the cause isn't lost.
+    let snippet: String = trimmed.chars().take(200).collect();
+    Some(snippet)
+}
+
+/// Turn a non-success HTTP status into something a user can act on (H12).
+///
+/// `provider returned HTTP 429` names a symptom nobody can fix; this names the
+/// likely cause and the fix. The provider's own message (when present) is
+/// appended, because it often carries the specific detail — which key, which
+/// model, how long the rate-limit window is.
+///
+/// The [`ModelError`] variant is chosen so the router's fallthrough stays
+/// sensible: a rate limit or a server-side 5xx is transient and provider-local,
+/// so it is `Unavailable` and the next provider is tried; an auth/model/request
+/// error is a configuration problem the next provider cannot paper over, so it
+/// is `Provider` and stops here. (Before H12 every HTTP error was `Provider`;
+/// letting 429/5xx fall through is the one behaviour change, and it is the
+/// correct one — a rate-limited primary should yield to a healthy backup.)
+fn friendly_http_error(provider: &str, status: reqwest::StatusCode, body: &str) -> ModelError {
+    let code = status.as_u16();
+    let cause = match code {
+        401 => "authentication failed — the API key is missing, wrong, or expired",
+        403 => "permission denied — this key may not be allowed to use this model",
+        404 => "not found — the model id is likely wrong for this provider",
+        408 | 409 => "the provider rejected the request",
+        413 => "the request was too large for this provider",
+        422 => "the provider rejected the request as invalid",
+        429 => "rate limited or out of quota",
+        400 => "the provider rejected the request as malformed",
+        500..=599 => "the provider had a server-side error",
+        _ => "unexpected provider response",
+    };
+    let detail = extract_provider_message(body);
+    let msg = match detail {
+        Some(d) => format!("{provider}: {cause} (HTTP {code}: {d})"),
+        None => format!("{provider}: {cause} (HTTP {code})"),
+    };
+    if code == 429 || status.is_server_error() {
+        ModelError::Unavailable(msg)
+    } else {
+        ModelError::Provider(msg)
+    }
+}
+
+/// Read a bounded error body (cancellable) so [`friendly_http_error`] can quote
+/// the provider's own message. A read failure degrades to an empty body — the
+/// status-based cause line still stands on its own.
+async fn read_error_body(response: reqwest::Response, cancel: &CancellationToken) -> String {
+    let mut body = Vec::new();
+    let mut response = response;
+    loop {
+        let chunk = tokio::select! {
+            c = response.chunk() => c,
+            () = cancel.cancelled() => break,
+        };
+        match chunk {
+            Ok(Some(chunk)) => {
+                let room = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+                if room == 0 {
+                    break;
+                }
+                let take = room.min(chunk.len());
+                body.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
 
 async fn read_json_capped<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response,
@@ -370,11 +480,9 @@ impl ModelProvider for OpenAiCompatProvider {
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
         };
         if !response.status().is_success() {
-            return Err(ModelError::Provider(format!(
-                "{} returned HTTP {}",
-                self.name,
-                response.status()
-            )));
+            let status = response.status();
+            let body = read_error_body(response, cancel).await;
+            return Err(friendly_http_error(&self.name, status, &body));
         }
         let parsed: OaChatResponse =
             read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, &self.name).await?;
@@ -412,11 +520,9 @@ impl ModelProvider for OpenAiCompatProvider {
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
         };
         if !response.status().is_success() {
-            return Err(ModelError::Provider(format!(
-                "{} returned HTTP {}",
-                self.name,
-                response.status()
-            )));
+            let status = response.status();
+            let body = read_error_body(response, cancel).await;
+            return Err(friendly_http_error(&self.name, status, &body));
         }
         let parsed: OaModelsResponse =
             read_json_capped(response, MAX_MODELS_RESPONSE_BYTES, cancel, &self.name).await?;
@@ -509,6 +615,67 @@ mod tests {
 
     use super::*;
     use std::time::Duration;
+
+    // ── H12: friendly provider errors ────────────────────────────────────────
+
+    #[test]
+    fn extracts_the_openai_error_message_and_code() {
+        let body = r#"{"error":{"message":"Incorrect API key provided","code":"invalid_api_key","type":"auth"}}"#;
+        assert_eq!(
+            extract_provider_message(body).as_deref(),
+            Some("Incorrect API key provided [invalid_api_key]")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_a_bounded_snippet_for_a_non_json_body() {
+        let msg = extract_provider_message("<html>502 Bad Gateway</html>").unwrap();
+        assert!(msg.contains("502"));
+        assert!(msg.len() <= 200);
+        assert_eq!(extract_provider_message("   "), None);
+    }
+
+    #[test]
+    fn status_becomes_a_cause_a_user_can_act_on() {
+        use reqwest::StatusCode;
+        let auth = friendly_http_error("openai", StatusCode::UNAUTHORIZED, "");
+        assert!(matches!(auth, ModelError::Provider(_)));
+        assert!(auth.to_string().contains("authentication failed"));
+
+        let missing = friendly_http_error("ollama", StatusCode::NOT_FOUND, "");
+        assert!(matches!(missing, ModelError::Provider(_)));
+        assert!(missing.to_string().contains("model id"));
+    }
+
+    /// The one behaviour change H12 makes: a rate limit or a 5xx is transient
+    /// and provider-local, so it becomes `Unavailable` and the router tries the
+    /// next provider — an auth/model error stays `Provider` and stops.
+    #[test]
+    fn transient_errors_allow_fallthrough_config_errors_do_not() {
+        use reqwest::StatusCode;
+        assert!(matches!(
+            friendly_http_error("p", StatusCode::TOO_MANY_REQUESTS, ""),
+            ModelError::Unavailable(_)
+        ));
+        assert!(matches!(
+            friendly_http_error("p", StatusCode::BAD_GATEWAY, ""),
+            ModelError::Unavailable(_)
+        ));
+        assert!(matches!(
+            friendly_http_error("p", StatusCode::FORBIDDEN, ""),
+            ModelError::Provider(_)
+        ));
+    }
+
+    #[test]
+    fn the_providers_own_message_is_quoted_when_present() {
+        use reqwest::StatusCode;
+        let body = r#"{"error":{"message":"You exceeded your current quota"}}"#;
+        let err = friendly_http_error("openai", StatusCode::TOO_MANY_REQUESTS, body);
+        let s = err.to_string();
+        assert!(s.contains("rate limited"), "{s}");
+        assert!(s.contains("exceeded your current quota"), "{s}");
+    }
 
     struct HangingProvider;
 
