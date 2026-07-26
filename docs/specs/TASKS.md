@@ -6,6 +6,7 @@
 > 每完成一步（提 PR / 收到 merge）由 loop 更新本文件并 commit。
 > 最后更新：2026-07-24（M-A ✅ M-B ✅；C1 merged #35；C2 in-pr #36；alpha tag 待用户确认）；#32/#33/#34 stacked 在审）
 > 2026-07-24 追加 **M-H（从 OpenWorker 借鉴：人机边界）**，并据此修订 G1/G2 的落地形态。
+> 2026-07-26 **发布 v0.2.0**：H1/H2/H4/H12/H9 已合并（人机边界线）。剩 H5/H8 未阻塞待专注做，H3/H10/H11 阻塞于未建的 G1/E3/F3。
 
 ## 执行顺序总览（最佳路径）
 
@@ -349,12 +350,12 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H2 | **用户本地风险 override**：glob 规则调整单个工具的 risk_class；**模块/persona 不得写入**；与 Guardian 的优先级明确 | H1, E1 | merged #61 |
 | H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | merged #62 |
 | H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | pending |
-| H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending |
-| H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending |
-| H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | pending |
+| H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending（未阻塞；需专门的 wake 表 + tick 集成，H4 量级） |
+| H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（未阻塞；需引入 run/session mode 状态 + 只读强制层） |
+| H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
 | H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | pending |
 | H11 | **协议级 Fake 渠道 harness**：FakeWeChat / FakeNostr，让渠道审批与 inbox 可自动测 | F3 | pending |
-| H12 | **provider 错误人话翻译**：额度/权限/模型不存在类错误落成可读文案 | — | pending |
+| H12 | **provider 错误人话翻译**：额度/权限/模型不存在类错误落成可读文案 | — | merged #65 |
 | H7 | 工具并发三分法（授权串行 → 只读并发 → 写/exec 串行） | H1 | **deferred**（收益不确定，代价高，见下） |
 | ~~H6~~ | ~~调度器补 catch-up + spawn 不 await~~ | — | **删除（已存在）** |
 
