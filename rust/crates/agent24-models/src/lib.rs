@@ -61,6 +61,15 @@ impl Msg {
         }
     }
 
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_owned(),
+            content: Some(content.into()),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }
+    }
+
     pub fn assistant(content: Option<String>, tool_calls: Vec<ToolCallRequest>) -> Self {
         Self {
             role: "assistant".to_owned(),

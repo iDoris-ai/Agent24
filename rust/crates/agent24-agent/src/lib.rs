@@ -12,6 +12,8 @@
 //! fail-closed approval stub + timeout) up to `MAX_ITERATIONS` per run. Every
 //! tool call is persisted, evented, and — when denied by policy — audited.
 
+pub mod subagent;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

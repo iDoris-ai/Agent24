@@ -228,6 +228,24 @@ impl ToolRegistry {
             .with(Arc::new(ShellExecTool::new(workspace)))
     }
 
+    /// The read-only subset — only `Read`-class builtins (H9).
+    ///
+    /// This is what the explorer subagent runs against, and the guarantee is
+    /// STRUCTURAL: the registry simply does not contain `fs_write`, `shell_exec`,
+    /// or the explorer itself, so a sub-run cannot write, execute, or recurse no
+    /// matter what the model asks for. There is nothing to bypass because the
+    /// dangerous tools were never registered.
+    pub fn read_only(workspace: std::path::PathBuf) -> Self {
+        let reg = Self::new()
+            .with(Arc::new(HttpFetchTool::new(false)))
+            .with(Arc::new(FsReadTool::new(vec![workspace])));
+        debug_assert!(
+            reg.list().iter().all(|t| t.risk_class == RiskClass::Read),
+            "read_only registry must contain only Read-class tools"
+        );
+        reg
+    }
+
     /// True when an interactive approval gate (C4 broker) is installed.
     pub fn gate_is_interactive(&self) -> bool {
         self.interactive_gate
