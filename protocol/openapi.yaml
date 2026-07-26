@@ -498,6 +498,57 @@ paths:
                     items:
                       $ref: "#/components/schemas/ToolInfo"
 
+  /standing-grants:
+    get:
+      operationId: listStandingGrants
+      x-milestone: M-H
+      tags: [tools]
+      summary: List target-scoped standing grants
+      description: >-
+        Persistent pre-authorisations of the form "this tool, aimed at exactly
+        this target, for this session or schedule". They outlive the process and
+        fire while nobody is watching, so listing them is not a convenience —
+        it is the other half of being allowed to mint them.
+      responses:
+        "200":
+          description: Grant list, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [standing_grants]
+                properties:
+                  standing_grants:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/StandingGrant"
+
+  /standing-grants/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: revokeStandingGrant
+      x-milestone: M-H
+      tags: [tools]
+      summary: Revoke one standing grant
+      description: >-
+        Takes effect on the next call — the broker reads the table per dispatch
+        rather than caching it, so a revocation is never queued behind a
+        restart. Deleting a schedule revokes the grants it owned as well.
+      responses:
+        "204":
+          description: Revoked
+        "404":
+          description: No such grant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /tool-overrides:
     get:
       operationId: listToolOverrides
@@ -1092,6 +1143,34 @@ components:
         Omitted by a pre-H1 daemon, in which case treat it as `external`.
       enum: [read, write_local, exec, external]
       examples: [read, external]
+
+    StandingGrant:
+      type: object
+      required: [id, scope_kind, scope_id, tool, target, created_at]
+      properties:
+        id:
+          type: string
+        scope_kind:
+          type: string
+          description: >-
+            Who owns the grant. `schedule` when a schedule fired the run —
+            what the user consented to was that automation sending there, so
+            deleting it takes the grant along.
+          enum: [session, schedule]
+        scope_id:
+          type: string
+        tool:
+          type: string
+        target:
+          type: string
+          description: >-
+            Exact value of the tool's declared target argument. Matched
+            exactly — never by prefix, glob, or case. "#ops" does not authorise
+            "#ops-2".
+          examples: ["#ops-alerts"]
+        created_at:
+          type: string
+          format: date-time
 
     RiskOverride:
       type: object

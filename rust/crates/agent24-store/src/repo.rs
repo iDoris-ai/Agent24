@@ -338,9 +338,9 @@ impl Store {
     pub async fn insert_approval(&self, approval: &Approval) -> Result<()> {
         sqlx::query(
             "INSERT INTO approvals (id, run_id, tool_call_id, kind, summary, payload,
-                                    available_decisions, status, decision, expires_at,
+                                    available_decisions, standing_target, status, decision, expires_at,
                                     created_at, decided_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&approval.id)
         .bind(&approval.run_id)
@@ -349,6 +349,7 @@ impl Store {
         .bind(&approval.summary)
         .bind(serde_json::to_string(&approval.payload)?)
         .bind(serde_json::to_string(&approval.available_decisions)?)
+        .bind(&approval.standing_target)
         .bind(approval_status_str(approval.status))
         .bind(
             approval
@@ -374,6 +375,7 @@ impl Store {
             summary: r.get("summary"),
             payload: serde_json::from_str(&r.get::<String, _>("payload"))?,
             available_decisions: serde_json::from_str(&r.get::<String, _>("available_decisions"))?,
+            standing_target: r.get("standing_target"),
             status: serde_json::from_value(serde_json::Value::String(
                 r.get::<String, _>("status"),
             ))?,
@@ -557,12 +559,99 @@ impl Store {
         rows.iter().map(Self::row_to_schedule).collect()
     }
 
+    /// Delete a schedule AND every standing grant it owns, in one transaction.
+    ///
+    /// The cascade is the point, not housekeeping: a grant means "this
+    /// automation may send to this address without asking". If the automation
+    /// is gone and the grant outlives it, a later schedule that happens to be
+    /// issued the same id would inherit an authorisation nobody granted it.
     pub async fn delete_schedule(&self, id: &str) -> Result<bool> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query("DELETE FROM schedules WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = result.rows_affected() > 0;
+        if deleted {
+            sqlx::query(
+                "DELETE FROM standing_grants WHERE scope_kind = 'schedule' AND scope_id = ?",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    // ── Standing grants (H4) ─────────────────────────────────────────────────
+
+    /// Record a target-scoped pre-authorisation. Idempotent on the natural key.
+    pub async fn insert_standing_grant(&self, grant: &StandingGrant) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO standing_grants (id, scope_kind, scope_id, tool, target, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(scope_kind, scope_id, tool, target) DO NOTHING",
+        )
+        .bind(&grant.id)
+        .bind(&grant.scope_kind)
+        .bind(&grant.scope_id)
+        .bind(&grant.tool)
+        .bind(&grant.target)
+        .bind(&grant.created_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Whether this exact (scope, tool, target) is already pre-authorised.
+    ///
+    /// Exact match on all four columns — a standing grant never widens by
+    /// prefix, glob, or case. "#ops-alerts" does not authorise "#ops-alerts-2".
+    pub async fn standing_grant_exists(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        tool: &str,
+        target: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 AS hit FROM standing_grants \
+             WHERE scope_kind = ? AND scope_id = ? AND tool = ? AND target = ?",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(tool)
+        .bind(target)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.is_some())
+    }
+
+    pub async fn list_standing_grants(&self) -> Result<Vec<StandingGrant>> {
+        let rows = sqlx::query("SELECT * FROM standing_grants ORDER BY created_at DESC")
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows.iter().map(Self::row_to_grant).collect())
+    }
+
+    pub async fn delete_standing_grant(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM standing_grants WHERE id = ?")
             .bind(id)
             .execute(self.pool())
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    fn row_to_grant(r: &SqliteRow) -> StandingGrant {
+        StandingGrant {
+            id: r.get("id"),
+            scope_kind: r.get("scope_kind"),
+            scope_id: r.get("scope_id"),
+            tool: r.get("tool"),
+            target: r.get("target"),
+            created_at: r.get("created_at"),
+        }
     }
 
     // ── Risk overrides (H2) ──────────────────────────────────────────────────
@@ -641,6 +730,19 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// A persisted target-scoped pre-authorisation (H4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StandingGrant {
+    pub id: String,
+    /// `session` | `schedule`
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub tool: String,
+    /// The exact value of the tool's declared target argument.
+    pub target: String,
+    pub created_at: String,
 }
 
 /// One stored user rule.

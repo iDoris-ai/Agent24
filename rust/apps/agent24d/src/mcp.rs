@@ -56,6 +56,16 @@ pub struct ServerEntry {
     /// Set false to keep an entry in the file without mounting it.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Which input field names *where a call sends things* (H4), per tool —
+    /// `{"post_message": "channel"}`. A tool listed here becomes eligible for a
+    /// target-scoped standing grant; one that is not stays "ask every time".
+    ///
+    /// Declared by the user rather than guessed from the schema. Guessing binds
+    /// a lasting authorisation to whichever field a heuristic liked, and the
+    /// cost of getting that wrong is a permission nobody meant to give. Tool
+    /// names here are the server's own (unqualified) names.
+    #[serde(default, rename = "targetArgs")]
+    pub target_args: BTreeMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -87,7 +97,10 @@ impl McpConfig {
         self.servers
             .iter()
             .filter(|(_, e)| e.enabled)
-            .map(|(name, e)| McpServerSpec::new(name.clone(), e.command.clone(), e.args.clone()))
+            .map(|(name, e)| {
+                McpServerSpec::new(name.clone(), e.command.clone(), e.args.clone())
+                    .with_target_args(e.target_args.clone())
+            })
             .collect()
     }
 }
@@ -256,5 +269,29 @@ mod tests {
         let (servers, tools) = mount(&specs, &CancellationToken::new()).await;
         assert!(servers.is_empty());
         assert!(tools.is_empty());
+    }
+
+    /// H4: a tool is eligible for a target-scoped standing grant only if the
+    /// USER named its target argument. Absent means "ask every time", which is
+    /// the right default for a schema we cannot interpret.
+    #[test]
+    fn target_args_are_read_per_tool_and_default_to_none() {
+        let cfg = parse_config(
+            r#"{"mcpServers":{"slack":{"command":"x","targetArgs":{"post_message":"channel"}}}}"#,
+        )
+        .unwrap();
+        let spec = &cfg.specs()[0];
+        assert_eq!(
+            spec.target_args.get("post_message").map(String::as_str),
+            Some("channel")
+        );
+        assert_eq!(spec.target_args.get("list_channels"), None);
+    }
+
+    /// An entry with no targetArgs at all parses fine and grants nothing.
+    #[test]
+    fn a_server_without_target_args_is_never_grant_eligible() {
+        let cfg = parse_config(r#"{"mcpServers":{"fs":{"command":"x"}}}"#).unwrap();
+        assert!(cfg.specs()[0].target_args.is_empty());
     }
 }

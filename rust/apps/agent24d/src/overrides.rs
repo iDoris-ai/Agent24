@@ -164,3 +164,78 @@ impl AuditOverride for agent24_store::Store {
         }
     }
 }
+
+// ── H4: target-scoped standing grants ────────────────────────────────────────
+
+/// `GET /api/v1/standing-grants` — every persistent pre-authorisation.
+///
+/// A grant is a permission that outlives the process and fires while nobody is
+/// watching, so it must be trivially reviewable. Listing them is not a
+/// convenience endpoint; it is the other half of being allowed to mint them.
+pub async fn list_standing_grants(State(state): State<AppState>) -> Response {
+    match state.store.list_standing_grants().await {
+        Ok(grants) => Json(json!({
+            "standing_grants": grants
+                .iter()
+                .map(|g| json!({
+                    "id": g.id,
+                    "scope_kind": g.scope_kind,
+                    "scope_id": g.scope_id,
+                    "tool": g.tool,
+                    "target": g.target,
+                    "created_at": g.created_at,
+                }))
+                .collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(err) => {
+            tracing::error!("listing standing grants: {err}");
+            error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "could not read standing grants",
+            )
+        }
+    }
+}
+
+/// `DELETE /api/v1/standing-grants/{id}` — revoke one.
+///
+/// Takes effect on the next call: the broker reads the table per dispatch
+/// rather than caching, precisely so a revocation is immediate. A permission
+/// you cannot withdraw until restart is not really revocable.
+pub async fn delete_standing_grant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.delete_standing_grant(id.trim()).await {
+        Ok(true) => {
+            if let Err(err) = state
+                .store
+                .append_audit(
+                    &now_iso8601(),
+                    "user",
+                    "standing_grant.revoked",
+                    &json!({ "grant_id": id }),
+                )
+                .await
+            {
+                tracing::error!("auditing standing grant revocation {id}: {err}");
+            }
+            axum::http::StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => error_response(
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+            "no such standing grant",
+        ),
+        Err(err) => {
+            tracing::error!("deleting standing grant {id}: {err}");
+            error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "could not delete the standing grant",
+            )
+        }
+    }
+}

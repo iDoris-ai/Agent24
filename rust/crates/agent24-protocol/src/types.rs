@@ -223,6 +223,13 @@ pub struct Approval {
     pub payload: Map<String, Value>,
     /// Server-driven open set — UIs render exactly this list
     pub available_decisions: Vec<String>,
+    /// The exact target a `approve_for_target` decision would bind to (H4):
+    /// the channel address, recipient, or repository this call names. Present
+    /// only when `available_decisions` offers that decision, so a UI can label
+    /// the button with what it actually authorises ("always allow → #ops")
+    /// rather than an unqualified "always allow".
+    #[serde(default)]
+    pub standing_target: Option<String>,
     pub status: ApprovalStatus,
     /// Set once resolved
     pub decision: Option<Decision>,
