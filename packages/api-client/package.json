@@ -1,6 +1,6 @@
 {
   "name": "@agent24/api-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "GENERATED types for the Agent24 v1 protocol — do not edit src/ by hand; run `pnpm gen:api` at repo root",
   "type": "module",
