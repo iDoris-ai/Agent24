@@ -571,12 +571,17 @@ impl RunManager {
                     return;
                 }
                 Err(err) => {
+                    // H12: the model layer now returns messages a user can act
+                    // on. Pass them through as-is rather than re-wrapping them
+                    // in "internal", which discarded the very detail (bad key,
+                    // wrong model, rate limit) that tells them what to fix.
                     let (code, message) = match &err {
                         ModelError::Unavailable(msg) => (
                             "provider_unavailable",
-                            format!("All LLM providers unavailable. Last error: {msg}"),
+                            format!("No provider could serve this request. {msg}"),
                         ),
-                        other => ("internal", other.to_string()),
+                        ModelError::Provider(msg) => ("provider_error", msg.clone()),
+                        ModelError::Cancelled => ("internal", err.to_string()),
                     };
                     self.finish_failed(&run_id, code, &message).await;
                     return;
