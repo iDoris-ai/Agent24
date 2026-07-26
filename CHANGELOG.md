@@ -3,14 +3,42 @@
 All notable changes to Agent24 are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-07-26
+
+Hardening of the H9 explorer subagent (found in an adversarial re-review of
+v0.2.0) plus protocol/changelog corrections.
+
+### Fixed
+
+- **Explorer is now truly network-free** (H9 security): the read-only registry
+  the `explore` subagent runs against no longer includes `http_fetch`. `Read`
+  class means "no side effect on the machine", not "no egress" — a GET could
+  still send bytes an `fs_read` just returned to an arbitrary URL, which in an
+  ungated, model-spawned helper is an exfiltration channel. The explorer now
+  has `fs_read` only; a network-capable researcher, if ever wanted, must be a
+  separate gated tool.
+- **Explorer fanout is bounded** (H9): a single model turn is capped at 16 tool
+  calls (mirroring the main loop) and each `explore` call has a 120s wall-clock
+  ceiling, so no input shape can make one exploration run for hours.
+- **Explorer panics are contained** (H9): the sub-loop runs in its own
+  supervised task; a panic becomes a `ToolError` instead of unwinding past the
+  caller and leaving a dangling `running` tool-call row.
+- **Empty exploration answers are distinct** (H9): an explorer that produces no
+  text returns an explicit sentinel, so the caller can tell "found nothing"
+  from "produced nothing".
+- **Protocol doc**: `approve_for_target` (H4) is now documented in the
+  `Decision` type in `openapi.yaml`, and the note that `approve_for_session` is
+  not offered for `external` tools is recorded there.
+
 ## [0.2.0] — 2026-07-26
 
 **M-H — the human boundary.** Everything a person needs to stay in control of an
 agent that runs while they're away: what needs asking, how far a "yes" reaches,
 and what an error actually tells them. Studied from Andrew Ng's OpenWorker and
 put through an adversarial review before landing (see
-`docs/reference-notes/openworker.md`). All protocol changes are additive — a
-pre-0.2 client keeps validating.
+`docs/reference-notes/openworker.md`). Protocol changes are additive (a pre-0.2
+client keeps validating), with one deliberate behaviour change: `external`-risk
+tools no longer offer the broad `approve_for_session` grant — see H4.
 
 ### Added
 

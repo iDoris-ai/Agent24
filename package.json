@@ -1,6 +1,6 @@
 {
   "name": "agent24-monorepo",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Agent24 — 24/7 personal & community agent platform (Electron shell + daemon + protocol)",
   "license": "Apache-2.0",

@@ -563,7 +563,12 @@ export interface components {
          *     (400 invalid_request). Known types and their semantics:
          *     - `approve` — approve this request only
          *     - `approve_for_session` — approve and skip future approvals of the
-         *       same kind in this session
+         *       same tool in this session. NOT offered for `external`-risk tools
+         *       (H4): a whole-tool grant there is replaced by `approve_for_target`.
+         *     - `approve_for_target` — approve and pre-authorise future calls of this
+         *       tool aimed at the SAME `standing_target` (H4), owned by the session or
+         *       the firing schedule. Offered only when the approval carries a
+         *       `standing_target`.
          *     - `deny` — deny but let the run continue (`reason` REQUIRED and fed
          *       back to the model)
          *     - `abort` — deny and cancel the whole run
@@ -577,6 +582,7 @@ export interface components {
              * @description Open enum
              * @example approve
              * @example approve_for_session
+             * @example approve_for_target
              * @example deny
              * @example abort
              */
