@@ -466,7 +466,15 @@ pub async fn serve(
     // McpTool sets requires_approval = true so EVERY call still goes through the
     // C4 gate — the whitelist decides "may be dispatched", the gate decides
     // "may run this time". A broken server is logged and skipped, never fatal.
-    let mut tools = agent24_tools::ToolRegistry::builtin(workspace);
+    let mut tools = agent24_tools::ToolRegistry::builtin(workspace.clone());
+    // H9: register the read-only explorer subagent. It runs against a registry
+    // that holds ONLY read builtins and NOT itself, so the sub-run cannot write,
+    // execute, or recurse — the guarantees are structural, not policy-checked.
+    let explorer_tools = StdArc::new(agent24_tools::ToolRegistry::read_only(workspace));
+    tools = tools.with(StdArc::new(agent24_agent::subagent::ExplorerSubagent::new(
+        Arc::clone(&router),
+        explorer_tools,
+    )));
     let mcp_servers = match crate::mcp::config_path() {
         Some(path) => match crate::mcp::load_config(&path) {
             Ok(cfg) => {
