@@ -56,3 +56,26 @@ export function validateManifest(manifest: unknown): string[] {
   }
   return errors
 }
+
+/** The user-facing summary shown before a freshly installed module is enabled
+ * (H10). It is the module's own declaration of what it wants — the user decides
+ * whether to trust it. Assumes `manifest` already passed {@link validateManifest}. */
+export interface ConsentSummary {
+  id: string
+  name: string
+  type: string
+  /** What the module declares it needs access to (llm, network, filesystem, …). */
+  permissions: string[]
+}
+
+export function consentSummary(manifest: Record<string, unknown>): ConsentSummary {
+  const permissions = Array.isArray(manifest.permissions)
+    ? manifest.permissions.filter((p): p is string => typeof p === 'string')
+    : []
+  return {
+    id: String(manifest.id ?? ''),
+    name: String(manifest.name ?? manifest.id ?? ''),
+    type: String(manifest.type ?? ''),
+    permissions,
+  }
+}

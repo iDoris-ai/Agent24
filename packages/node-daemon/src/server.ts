@@ -14,6 +14,7 @@ import {
 } from './capability-registry'
 import { loadState, isEnabled, setEnabled } from './module-state'
 import { installModule, uninstallModule, loadInstalledModule } from './module-installer'
+import { consentSummary } from './module-manifest'
 import { proxyToService, getHostPort, stopAll } from './boxlite-service'
 import { EventsHub } from './v1/events-hub'
 import { createV1Handler } from './v1/routes'
@@ -158,7 +159,25 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return
     }
     registerCommunityModule(mod, buildRouter, { llm: gateway })
-    send(res, 200, { ok: true, id: mod.manifest.id, manifest: mod.manifest })
+    // H10: a freshly installed community module is DISABLED pending the user's
+    // explicit consent — it must not start acting the moment it lands. Its routes
+    // are registered but return 503 (see isEnabled gate above) until the user
+    // reviews the permission summary and enables it. Built-ins are unaffected:
+    // they never go through this install path.
+    //
+    // Note the module install path deliberately touches NO risk-override / trust
+    // state (the H2 inviolable rule): a package may DECLARE the permissions it
+    // wants, but only the user decides to enable it. node-daemon has no path to
+    // the daemon's override store, so this holds by construction here.
+    setEnabled(mod.manifest.id, false)
+    send(res, 200, {
+      ok: true,
+      id: mod.manifest.id,
+      manifest: mod.manifest,
+      enabled: false,
+      pendingConsent: true,
+      consent: consentSummary(mod.manifest as unknown as Record<string, unknown>),
+    })
     return
   }
 

@@ -213,7 +213,7 @@ L0 KV（D1）、L1 会话压缩（D1+D5b）、三层路由（D2）全部 merged�
 |---|---|---|---|
 | E1 | agent24-mcp：rmcp client（stdio），MCP 工具以 `mcp_{server}_{tool}` 注入 registry | C8 + 用户确认 | **done** #54 + 接线 |
 | E2 | ~~node-host：现有 5 个 CapabilityModule 经 JSON-RPC 接入内核~~ | E1 | **descoped**（见下方说明） |
-| E3 | module.schema.json 落地 UI Module 规范 + 模块市场页对接 | ~~E2~~ E1 | **in-pr**（校验落地：见下）｜市场浏览 UI 依赖发现服务，归 M4 |
+| E3 | module.schema.json 落地 UI Module 规范 + 模块市场页对接 | ~~E2~~ E1 | **merged #74**（安装门禁校验；市场浏览 UI 归 M4） |
 | E4 | agent24d 作为 MCP server 暴露自身工具 | E1 | **merged #73**（server 模块 + `agent24 mcp` + e2e client↔server 测试） |
 | E5 | PGL manifest（pgl.yml）解析钩子 + AgentStore 元数据展示 | E3 | pending |
 
@@ -417,7 +417,7 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending（未阻塞；需专门的 wake 表 + tick 集成，H4 量级） |
 | H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（未阻塞；需引入 run/session mode 状态 + 只读强制层） |
 | H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
-| H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | pending |
+| H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | **in-pr**（见下） |
 | H11 | **协议级 Fake 渠道 harness**：FakeWeChat / FakeNostr，让渠道审批与 inbox 可自动测 | F3 | pending |
 | H12 | **provider 错误人话翻译**：额度/权限/模型不存在类错误落成可读文案 | — | merged #65 |
 | H7 | 工具并发三分法（授权串行 → 只读并发 → 写/exec 串行） | H1 | **deferred**（收益不确定，代价高，见下） |
@@ -534,6 +534,18 @@ H4 = 对 external 风险的工具提供**更窄的选项**并**停用宽泛选�
 H5 要新增 wake 表 + **「向既有 session 投递后台消息」这个语义本身**。
 scheduler 的 tick 已存在（`agent24-scheduler/src/lib.rs:202`），按上游的 `extra_tick` 位挂进去即可，
 并继承关停契约：**停调度器时把 spawn 出去的 run 一并取消，挂起的 run 不得比调度器活得久**。
+
+### H10 落地（2026-07-27，紧接 E3）
+
+建立在 E3 校验之上，三条 inviolable 全部到位：
+
+1. **清单严格校验** —— E3 的 `validateManifest` 已在 `loadInstalledModule` 做安装门禁（畸形清单不注册）。
+2. **安装后默认 disabled pending consent** —— 此前 `module-state` 默认 **enabled**（`isEnabled` 返回 `!== false`）。install handler 现在装完即 `setEnabled(id, false)`：模块注册但路由 503，直到用户显式启用。内置模块不走此路径，不受影响。
+3. **安装绝不写 override** —— node-daemon 模块安装**没有任何路径**能触到 daemon 的 risk-override 存储（H2 的 inviolable 规则），架构上天然成立；已在 install handler 注释写明。模块只能*声明*想要什么权限，是否信任由用户决定。
+
+**知情同意**：install 响应新增 `pendingConsent: true` + `consent`（`consentSummary`：id/name/type/permissions）；桌面 `ModulesManager` 卡片现在展示每个模块**声明的权限 chips**，用户在启用（=同意）前能看到它要什么。
+
+**测试**：`consentSummary`（含缺 name 回退 id、过滤非字符串权限）+ E3 校验共 36 个 node-daemon 测试；桌面 85 测试 + 双 tsconfig typecheck 全绿。
 
 ### H7 为何降级
 
