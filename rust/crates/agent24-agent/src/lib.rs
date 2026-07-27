@@ -389,6 +389,33 @@ impl RunManager {
         }
     }
 
+    /// Append one message to the run's durable thread (H3/G1 foundation).
+    ///
+    /// Best-effort, exactly like session memory: a thread-append failure must
+    /// never fail an otherwise-good run. It only degrades durable resume for
+    /// THIS run — and that degrades safely, because a run whose thread cannot be
+    /// reconstructed is aborted rather than replayed (H3, fail-closed). The
+    /// alternative — failing the run on a bookkeeping write — would be strictly
+    /// worse for the same safety outcome.
+    async fn persist_message(&self, run_id: &str, msg: &Msg) {
+        let tool_calls =
+            serde_json::to_value(&msg.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
+        if let Err(err) = self
+            .store
+            .append_run_message(
+                run_id,
+                &msg.role,
+                msg.content.as_deref(),
+                &tool_calls,
+                msg.tool_call_id.as_deref(),
+                &now_iso8601(),
+            )
+            .await
+        {
+            tracing::warn!("run {run_id}: message thread append failed: {err}");
+        }
+    }
+
     pub async fn start_run(self: &Arc<Self>, create: RunCreate) -> Result<Run, AgentError> {
         self.start_run_with_schedule(create, None).await
     }
@@ -549,7 +576,12 @@ impl RunManager {
             return;
         };
         let mut messages = prior_context;
-        messages.push(Msg::user(run.input.prompt.clone()));
+        // Persist this run's opening user turn to the durable thread (H3). Prior
+        // (compacted) context stays in session memory and is reloaded from there
+        // on resume, so only the per-run tail is recorded here.
+        let user_msg = Msg::user(run.input.prompt.clone());
+        self.persist_message(&run_id, &user_msg).await;
+        messages.push(user_msg);
         let mut usage_total = zero_usage();
 
         for _ in 0..MAX_ITERATIONS {
@@ -594,6 +626,9 @@ impl RunManager {
             if res.message.tool_calls.is_empty() {
                 // Final answer
                 let text = res.message.content.clone().unwrap_or_default();
+                // Record the closing assistant turn so the durable thread is a
+                // complete, self-contained transcript (H3).
+                self.persist_message(&run_id, &res.message).await;
                 self.sink.emit(EventBody::ModelDelta(ModelDeltaPayload {
                     run_id: run_id.clone(),
                     text: text.clone(),
@@ -671,6 +706,11 @@ impl RunManager {
             // the first MAX_TOOL_CALLS_PER_TURN execute — a runaway fanout is
             // answered, not obeyed.
             let calls = res.message.tool_calls.clone();
+            // Persist the assistant turn (with its tool_calls) BEFORE running any
+            // call. This is the row H3 keys resume off: an assistant turn on disk
+            // whose trailing tool_call has no answering `tool` row is exactly a
+            // run that died awaiting approval.
+            self.persist_message(&run_id, &res.message).await;
             messages.push(res.message);
             for (idx, call) in calls.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -678,12 +718,14 @@ impl RunManager {
                     return;
                 }
                 if idx >= MAX_TOOL_CALLS_PER_TURN {
-                    messages.push(Msg::tool_result(
+                    let skipped = Msg::tool_result(
                         call.id.clone(),
                         format!(
                             "skipped: per-turn tool call limit ({MAX_TOOL_CALLS_PER_TURN}) exceeded"
                         ),
-                    ));
+                    );
+                    self.persist_message(&run_id, &skipped).await;
+                    messages.push(skipped);
                     continue;
                 }
                 match self
@@ -696,7 +738,11 @@ impl RunManager {
                     )
                     .await
                 {
-                    Ok(content) => messages.push(Msg::tool_result(call.id.clone(), content)),
+                    Ok(content) => {
+                        let result = Msg::tool_result(call.id.clone(), content);
+                        self.persist_message(&run_id, &result).await;
+                        messages.push(result);
+                    }
                     Err(()) => {
                         // Cancelled mid-tool, or the user chose abort on an
                         // approval — either way the run lands cancelled
@@ -1720,6 +1766,46 @@ pub(crate) mod tests {
         assert_eq!(calls[0].tool, "http_fetch");
         assert_eq!(calls[0].status, ToolCallStatus::Completed);
         assert!(calls[0].ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_tool_round_trip_persists_the_full_message_thread() {
+        // H3 foundation: the durable thread must be a faithful, ordered image of
+        // the loop's in-memory `messages` — user prompt → assistant turn bearing
+        // the tool_call → the tool result answering it → closing assistant answer.
+        // This is what a restarted daemon reconstructs a suspended run from.
+        let url = http_fixture("fixture payload 42").await;
+        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let provider = ScriptedProvider::new(vec![tool_call_turn(
+            "http_fetch",
+            serde_json::json!({ "url": url }).to_string(),
+        )]);
+        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        let run = manager.start_run(create()).await.unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+
+        let thread = store.list_run_messages(&run.id).await.unwrap();
+        assert_eq!(
+            thread.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user", "assistant", "tool", "assistant"],
+            "{thread:?}"
+        );
+        // The persisted assistant turn carries the very tool_call the loop keys
+        // resume off, and the tool row names the call it answers.
+        assert_eq!(thread[1].content, None);
+        assert_eq!(thread[1].tool_calls[0]["name"], "http_fetch");
+        assert_eq!(thread[2].tool_call_id.as_deref(), Some("call_1"));
+        // The closing answer is recorded so the thread is self-contained.
+        assert!(
+            thread[3]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("fixture payload 42"),
+            "{:?}",
+            thread[3].content
+        );
     }
 
     #[tokio::test]
