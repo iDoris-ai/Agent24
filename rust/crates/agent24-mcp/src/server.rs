@@ -329,4 +329,55 @@ mod tests {
         let err = server.get("/api/v1/runs").await.unwrap_err();
         assert!(err.contains("daemon unreachable"), "{err}");
     }
+
+    /// End-to-end through the ACTUAL MCP protocol: a real rmcp client, connected
+    /// to our server over an in-process duplex transport, does initialize →
+    /// tools/list → tools/call. This exercises the ServerHandler wiring itself
+    /// (not just the proxy helpers), and proves a read-only call round-trips to
+    /// the daemon and back as MCP content.
+    #[tokio::test]
+    async fn a_real_mcp_client_lists_and_calls_over_the_protocol() {
+        let (base, _seen) = mock_daemon(r#"{"tools":["fs_read"]}"#).await;
+
+        // In-process client ↔ server transport.
+        let (server_io, client_io) = tokio::io::duplex(8192);
+        let (sr, sw) = tokio::io::split(server_io);
+        let (cr, cw) = tokio::io::split(client_io);
+
+        let server = Agent24Server::new(base, "tok".to_owned());
+        let server_task = tokio::spawn(async move {
+            if let Ok(running) = server.serve((sr, sw)).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ().serve((cr, cw)).await.unwrap();
+
+        // tools/list surfaces the curated surface over the wire.
+        let tools = client.list_all_tools().await.unwrap();
+        let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+        assert!(names.contains(&"agent24_run".to_owned()), "{names:?}");
+        assert!(
+            names.contains(&"agent24_list_tools".to_owned()),
+            "{names:?}"
+        );
+
+        // tools/call for a read-only tool proxies to the mock daemon and returns
+        // its body as MCP text content.
+        let mut params = CallToolRequestParams::default();
+        params.name = Cow::Borrowed("agent24_list_tools");
+        let result = client.call_tool(params).await.unwrap();
+        let text = result
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(text.contains("fs_read"), "{text}");
+        assert_ne!(result.is_error, Some(true));
+
+        client.cancel().await.unwrap();
+        server_task.abort();
+    }
 }
