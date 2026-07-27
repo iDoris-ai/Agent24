@@ -415,10 +415,13 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 - [x] `ApprovalBroker::settle_resumed` + `GrantCtx::for_resume`：无 waiter 时读已决行、重放 session/target 授权副作用；2 单测
 - [x] `execute` → `run_loop` 抽取（run/cancel 按值，loop 主体逐字不变；45 旧测全过证行为保持）
 - [x] agent manager：`resume_run(run_id, approval_id)` + `drive_resume` —— 从线程重建 `messages`、`assess_restore` 复校、结算挂起 call（approved→`execute_preapproved` 跑**批准的 payload**、denied→喂 reason、abort→cancel）、半应答轮的剩余 call 走 `run_tool_call`、继续 `run_loop`；supervised spawn + cancel token + 幂等（非 awaiting/已有 task 即 no-op）。2 端到端集成测试（approve 跑工具并完成 / deny 不执行仍完成）。**注**：结算走 store-only 读决策，restored 审批的 `approve_for_session/target` 不重铸授权（fail-closed 下次再问；已在代码注释标 KNOWN LIMITATION）
-- [ ] `server.rs`：启动清扫 `abort_lingering_approvals` → 逐条 `assess_restore`，Restore 则重广播 `approval.required` 并保留 pending、Abort 则落 aborted（兜底）；orphan-sweep 排除「awaiting_approval 且有 pending 审批」；resolve 端在决策落定后对「无 live task 的 run」spawn `resume_run`；同步修订 C4「全 aborted」验收
-- [ ] append 路径幂等：resume 重入不得重复 append（clestons #70 note 2；跳过已存 seq / 截断 tail）
-- [ ] best-effort 契约测试：注入 `append_run_message` 失败断言 run 仍 completed
-- [ ] 端到端：起 daemon → 触发需审批 run → kill → 重启 → 审批重现 → 批准 → run 续跑完成
+- [x] `RunManager::restore_pending_approvals`：启动逐条 `assess_restore`，Restore 则重广播 `approval.required` 保留 pending、Abort 则落 aborted（兜底）；返回 (restored, aborted)。agent 测：restorable 保留+重广播、run 已 Completed 的 aborted
+- [x] `sweep_orphan_runs` 排除「awaiting_approval 且有 pending 审批」（SQL `NOT IN (SELECT run_id ... status='pending')`）；store 测：parked 幸免、stranded/running 取消
+- [x] `server.rs`：早期 abort-all 移除，state 建好后 `restore_pending_approvals` → 再 `sweep_orphan_runs`（顺序保证）；`decide_approval` resolve 成功后无条件调 `resume_run`（幂等，sync 情形因 run 在 cancels 而 no-op）
+- **C4 验收修订**：旧「遗留 pending 全 aborted」不再是服务器行为（改为 restore-or-abort）。`abort_lingering_approvals` store 原语保留（仍有单测），仅不再被 daemon 调用。
+- [ ] （PR-3 遗留，非阻塞）append 路径幂等：resume 重入不得重复 append（clestons #70 note 2）——当前 resume 只 append 新 tool result，不重放已存消息，故本 PR 无重复；正式幂等契约留 PR-3
+- [ ] （PR-3 遗留，非阻塞）best-effort 契约测试：注入 `append_run_message` 失败断言 run 仍 completed
+- [x] 端到端（crate 级）：seed 崩溃态 → 应答 → 复原 → 工具执行 → 完成（approve/deny 两例）。真·跨进程 kill 的 daemon 级 e2e 留手册化验证（F5 泡测顺带）
 
 `inline`（TUI/桌面有人在看）保留现有同步阻塞路径；两种模式共用一条 parked 记录。
 

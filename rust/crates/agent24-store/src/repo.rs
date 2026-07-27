@@ -241,10 +241,18 @@ impl Store {
     /// Fail-closed startup sweep: any run left non-terminal by a previous
     /// daemon process (queued/running/awaiting_approval with no executor
     /// alive) is cancelled. Must run BEFORE accepting requests.
+    /// Cancel runs left non-terminal by a previous process. An `awaiting_approval`
+    /// run that STILL has a pending approval is deliberately spared (H3): the
+    /// restore sweep kept that approval pending on purpose, so the run is a
+    /// durable parked run to be resumed when answered — not an orphan. Runs whose
+    /// approval the restore sweep aborted have no pending row left and are swept
+    /// here. Ordering therefore matters: run the restore sweep FIRST.
     pub async fn sweep_orphan_runs(&self, ended_at: &str) -> Result<u64> {
         let result = sqlx::query(
             "UPDATE runs SET status = 'cancelled', ended_at = ?
-             WHERE status IN ('queued', 'running', 'awaiting_approval')",
+             WHERE status IN ('queued', 'running')
+                OR (status = 'awaiting_approval'
+                    AND id NOT IN (SELECT run_id FROM approvals WHERE status = 'pending'))",
         )
         .bind(ended_at)
         .execute(self.pool())

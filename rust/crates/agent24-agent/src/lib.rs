@@ -26,9 +26,9 @@ use agent24_memory::session::{CanonicalSession, CompactionPolicy, Summarizer};
 use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
 use agent24_protocol::{
-    Approval, Decision, ErrorBody, EventBody, ModelDeltaPayload, Run, RunCancelledPayload,
-    RunCompletedPayload, RunCreate, RunFailedPayload, RunInput, RunOutputPayload,
-    RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
+    Approval, ApprovalStatus, Decision, ErrorBody, EventBody, ModelDeltaPayload, Run,
+    RunCancelledPayload, RunCompletedPayload, RunCreate, RunFailedPayload, RunInput,
+    RunOutputPayload, RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
     ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{RunMessage, RunPatch, Store, StoreError};
@@ -86,7 +86,7 @@ const MEMORY_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// than this is too stale to safely continue — the world it was queued against
 /// has likely moved on — so `assess_restore` aborts it. Generous: an overnight
 /// scheduled run must still be answerable the next morning.
-const RESUME_TTL: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
+pub const RESUME_TTL: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
 
 impl SessionMemory {
     pub fn new(kv: KvStore, summarizer: Arc<dyn Summarizer>) -> Self {
@@ -567,6 +567,85 @@ impl RunManager {
             .get_run(id)
             .await?
             .ok_or_else(|| AgentError::Store(StoreError::NotFound(format!("run {id}"))))
+    }
+
+    /// Startup durable-resume sweep (H3): decide every approval left `pending` by
+    /// a previous process, in place of the old abort-everything sweep.
+    ///
+    /// A restorable approval is RE-BROADCAST (so a freshly-connected inbox shows
+    /// the queued item again) and kept pending; its run stays parked until a
+    /// human answers, when `resume_run` continues it. A non-restorable one (tool
+    /// gone, payload drift, past the resume TTL, or a vanished run) is aborted
+    /// fail-closed — its now-approval-less run is then cancelled by the orphan
+    /// sweep, which is why THIS must run first. Returns `(restored, aborted)`.
+    pub async fn restore_pending_approvals(&self) -> (u64, u64) {
+        let pending = match self
+            .store
+            .list_approvals(Some(ApprovalStatus::Pending))
+            .await
+        {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::error!("restore sweep: listing pending approvals failed: {err}");
+                return (0, 0);
+            }
+        };
+        let cutoff = agent24_core::util::iso8601_before(RESUME_TTL);
+        let (mut restored, mut aborted) = (0u64, 0u64);
+        for approval in pending {
+            let thread = self
+                .store
+                .list_run_messages(&approval.run_id)
+                .await
+                .unwrap_or_default();
+            let run_status = match self.store.get_run(&approval.run_id).await {
+                Ok(Some(run)) => run.status,
+                // The run row is gone or unreadable — there is nothing to resume.
+                _ => {
+                    self.abort_one_approval(&approval).await;
+                    aborted += 1;
+                    continue;
+                }
+            };
+            match crate::resume::assess_restore(
+                &approval.tool_call_id,
+                &approval.payload,
+                &approval.created_at,
+                run_status,
+                &thread,
+                |name| self.tools.tool_risk_class(name).is_some(),
+                &cutoff,
+            ) {
+                crate::resume::RestoreDecision::Restore { .. } => {
+                    // Re-announce the queued item; the row stays pending.
+                    self.sink
+                        .emit(EventBody::ApprovalRequired(Box::new(approval.clone())));
+                    restored += 1;
+                }
+                crate::resume::RestoreDecision::Abort { reason } => {
+                    tracing::warn!(
+                        "restore sweep: aborting approval {} — {reason}",
+                        approval.id
+                    );
+                    self.abort_one_approval(&approval).await;
+                    aborted += 1;
+                }
+            }
+        }
+        (restored, aborted)
+    }
+
+    async fn abort_one_approval(&self, approval: &Approval) {
+        if let Err(err) = self
+            .store
+            .resolve_approval(&approval.id, ApprovalStatus::Aborted, None, now_iso8601())
+            .await
+        {
+            tracing::error!(
+                "restore sweep: aborting approval {} failed: {err}",
+                approval.id
+            );
+        }
     }
 
     /// Resume a run parked awaiting approval whose in-memory task is gone — the
@@ -2529,6 +2608,136 @@ mod approval_tests {
         assert!(
             !text.contains("should-not-run"),
             "denied tool ran anyway: {text}"
+        );
+    }
+
+    /// A run row in a given status, for seeding crash/parked state directly.
+    fn run_in(id: &str, status: RunStatus) -> Run {
+        Run {
+            id: id.to_owned(),
+            session_id: None,
+            status,
+            input: RunInput {
+                prompt: "go".to_owned(),
+                model_override: None,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now_iso8601(),
+            started_at: Some(now_iso8601()),
+            ended_at: None,
+        }
+    }
+
+    /// A pending approval row.
+    fn seed_approval(
+        id: &str,
+        run_id: &str,
+        tool_call_id: &str,
+        payload: serde_json::Map<String, serde_json::Value>,
+    ) -> Approval {
+        Approval {
+            id: id.to_owned(),
+            run_id: run_id.to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
+            kind: "exec".to_owned(),
+            summary: "shell_exec".to_owned(),
+            payload,
+            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
+            standing_target: None,
+            status: ApprovalStatus::Pending,
+            decision: None,
+            expires_at: now_iso8601(),
+            created_at: now_iso8601(),
+            decided_at: None,
+        }
+    }
+
+    /// Startup restore sweep (H3): a restorable pending approval is re-broadcast
+    /// and kept pending; a non-restorable one (here: its run already completed)
+    /// is aborted fail-closed. Replaces the old abort-everything sweep.
+    #[tokio::test]
+    async fn restore_sweep_keeps_the_restorable_and_aborts_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+
+        // Restorable: an awaiting_approval run with a consistent parked thread.
+        let args = serde_json::json!({ "argv": ["/bin/echo", "hi"] });
+        h.store
+            .insert_run(&run_in("run_ok", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        h.store
+            .append_run_message(
+                "run_ok",
+                "user",
+                Some("go"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let call = serde_json::json!([{ "id": "call_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_ok", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        h.store
+            .insert_approval(&seed_approval(
+                "apr_ok",
+                "run_ok",
+                "call_1",
+                args.as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap();
+
+        // Non-restorable: a pending approval whose run already COMPLETED — the
+        // status gate in plan_resume refuses it, so the sweep aborts it.
+        h.store
+            .insert_run(&run_in("run_done", RunStatus::Completed))
+            .await
+            .unwrap();
+        h.store
+            .insert_approval(&seed_approval(
+                "apr_done",
+                "run_done",
+                "call_x",
+                serde_json::Map::new(),
+            ))
+            .await
+            .unwrap();
+
+        let (restored, aborted) = h.manager.restore_pending_approvals().await;
+        assert_eq!((restored, aborted), (1, 1));
+        // The restorable one is still pending and was re-announced.
+        assert_eq!(
+            h.store
+                .get_approval("apr_ok")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::Pending
+        );
+        assert!(
+            h.events
+                .lock()
+                .unwrap()
+                .contains(&"approval.required".to_owned())
+        );
+        // The non-restorable one is aborted.
+        assert_eq!(
+            h.store
+                .get_approval("apr_done")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::Aborted
         );
     }
 
