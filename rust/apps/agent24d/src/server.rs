@@ -432,22 +432,8 @@ pub async fn serve(
             .await
             .map_err(std::io::Error::other)?
     };
-    // Fail-closed sweep BEFORE accepting any request: approvals left pending
-    // by a previous process abort now (C1 primitive; ordering per its review)
-    let swept = store
-        .abort_lingering_approvals(&agent24_core::util::now_iso8601())
-        .await
-        .map_err(std::io::Error::other)?;
-    if swept > 0 {
-        tracing::warn!("aborted {swept} lingering pending approvals from a previous process");
-    }
-    let orphans = store
-        .sweep_orphan_runs(&agent24_core::util::now_iso8601())
-        .await
-        .map_err(std::io::Error::other)?;
-    if orphans > 0 {
-        tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
-    }
+    // NOTE: the startup sweeps (durable-resume restore + orphan cancel) run
+    // AFTER the state is built, below — the restore sweep needs the run manager.
     // Tool workspace: the fs whitelist root + shell cwd. Created up front so
     // the canonicalized whitelist is non-empty from the first request.
     let workspace = agent24_protocol::state_file::state_dir()
@@ -521,6 +507,27 @@ pub async fn serve(
         memory,
         mcp_servers,
     });
+
+    // H3 durable-resume startup, BEFORE accepting any request and BEFORE the
+    // orphan sweep: restore restorable parked approvals (re-broadcast + keep
+    // pending) so their runs survive to be resumed when answered, and abort the
+    // rest fail-closed. The orphan sweep then cancels every still-non-terminal
+    // run whose approval did NOT survive — so the restore MUST come first.
+    let (restored, aborted) = state.runs.restore_pending_approvals().await;
+    if restored > 0 || aborted > 0 {
+        tracing::info!(
+            "durable resume: {restored} approval(s) restored, {aborted} aborted from a previous process"
+        );
+    }
+    let orphans = state
+        .store
+        .sweep_orphan_runs(&agent24_core::util::now_iso8601())
+        .await
+        .map_err(std::io::Error::other)?;
+    if orphans > 0 {
+        tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
+    }
+
     // Scheduler tick loop: polls due schedules and fires runs. Cadence from
     // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
     // minute, so a few seconds' latency is invisible).

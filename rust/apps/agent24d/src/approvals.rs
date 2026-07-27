@@ -92,7 +92,22 @@ pub async fn decide_approval(State(state): State<AppState>, req: Request<Body>) 
         }
     };
     match state.broker.resolve(&id, decision).await {
-        Ok(approval) => Json(approval).into_response(),
+        Ok(approval) => {
+            // H3: if this run was PARKED (its task gone — a restored approval
+            // answered after a restart), continue it now off the persisted
+            // thread. resume_run is idempotent and a no-op when a live dispatch
+            // is already handling this approval (the normal interactive case: the
+            // run is in `cancels`), so calling it unconditionally is safe and it
+            // returns promptly (it spawns its own supervised task).
+            if let Err(err) = state
+                .runs
+                .resume_run(approval.run_id.clone(), id.clone())
+                .await
+            {
+                tracing::error!("resume after approval {id} failed: {err}");
+            }
+            Json(approval).into_response()
+        }
         Err(ResolveError::NotFound(_)) => error_response(
             StatusCode::NOT_FOUND,
             "not_found",

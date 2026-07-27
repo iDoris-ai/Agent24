@@ -412,6 +412,49 @@ impl ToolRegistry {
         }
 
         // 4. execute under the tool's budget, cancellable at any point
+        Self::run_budgeted(tool, ctx, input, cancel).await
+    }
+
+    /// Execute a tool whose approval was ALREADY granted out of band — the
+    /// durable-resume path (H3). When a run is resumed after a restart (or after
+    /// a parked approval is answered with no dispatch waiting), the human's
+    /// decision already exists on the approval row; the broker's `settle_resumed`
+    /// has replayed its grant side-effects and returned `Approved`. Running the
+    /// call back through `dispatch` would ask a SECOND time.
+    ///
+    /// So this runs the same normalize + whitelist + budgeted-execute path but
+    /// deliberately SKIPS the gate. It is the one execution path that does not
+    /// ask, and must only be reached with an approval already in hand.
+    pub async fn execute_preapproved(
+        &self,
+        name: &str,
+        ctx: &ToolContext,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        let name = name.trim();
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| ToolError::Invalid(format!("unknown tool: {name}")))?;
+        // The whitelist is still enforced: "already approved" authorises the
+        // side effect, not dispatch of a tool that was never dispatchable.
+        if !self.allowed.contains(name) {
+            return Err(ToolError::Denied(format!(
+                "tool {name} is not in the capability whitelist"
+            )));
+        }
+        Self::run_budgeted(tool, ctx, input, cancel).await
+    }
+
+    /// Step 4 of both dispatch paths: run the tool under its timeout budget,
+    /// cancellable at any point.
+    async fn run_budgeted(
+        tool: &Arc<dyn Tool>,
+        ctx: &ToolContext,
+        input: &Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
         let budget = tool.timeout();
         tokio::select! {
             r = tokio::time::timeout(budget, tool.call(ctx, input, cancel)) => {
@@ -626,6 +669,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "ran");
+    }
+
+    /// Durable resume (H3): a call whose approval was granted out of band runs
+    /// via `execute_preapproved`, which must NOT consult the gate — the human
+    /// already decided. `ExplodingGate` proves the gate is never touched even
+    /// for an `external`, requires-approval tool.
+    #[tokio::test]
+    async fn execute_preapproved_runs_a_gated_tool_without_asking() {
+        let reg = ToolRegistry::new()
+            .with(mcp_style_tool()) // external → requires approval
+            .with_gate(Arc::new(ExplodingGate));
+        assert!(reg.tool_requires_approval("mcp_fs_read"));
+        let out = reg
+            .execute_preapproved(
+                "mcp_fs_read",
+                &ctx(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "ran",
+            "the tool must run without the gate being consulted"
+        );
+    }
+
+    /// "Already approved" authorises the side effect, not dispatch of a tool that
+    /// was never dispatchable: the whitelist is still enforced.
+    #[tokio::test]
+    async fn execute_preapproved_still_enforces_the_whitelist() {
+        let reg = ToolRegistry::new().with_unlisted(mcp_style_tool());
+        let err = reg
+            .execute_preapproved(
+                "mcp_fs_read",
+                &ctx(),
+                &Map::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err:?}");
     }
 
     /// The line the override rule draws: `external` on third-party code is a

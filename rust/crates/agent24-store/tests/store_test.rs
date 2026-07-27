@@ -571,3 +571,46 @@ async fn listing_an_unknown_run_thread_is_empty() {
             .is_empty()
     );
 }
+
+// ── H3: orphan sweep spares durable parked runs ──────────────────────────────
+
+#[tokio::test]
+async fn orphan_sweep_spares_a_parked_run_but_cancels_the_rest() {
+    let store = Store::open_memory().await.unwrap();
+
+    // Parked: awaiting_approval WITH a pending approval → the restore sweep kept
+    // it on purpose, so the orphan sweep must spare it.
+    let mut parked = run("run_parked");
+    parked.status = RunStatus::AwaitingApproval;
+    store.insert_run(&parked).await.unwrap();
+    store
+        .insert_approval(&approval("apr_1", "run_parked"))
+        .await
+        .unwrap(); // pending
+
+    // awaiting_approval WITHOUT a pending approval (its approval was aborted by
+    // the restore sweep) → cancelled.
+    let mut stranded = run("run_stranded");
+    stranded.status = RunStatus::AwaitingApproval;
+    store.insert_run(&stranded).await.unwrap();
+
+    // A plain running orphan → cancelled.
+    let mut running = run("run_running");
+    running.status = RunStatus::Running;
+    store.insert_run(&running).await.unwrap();
+
+    let swept = store.sweep_orphan_runs(TS).await.unwrap();
+    assert_eq!(swept, 2, "stranded + running cancelled, parked spared");
+    assert_eq!(
+        store.get_run("run_parked").await.unwrap().unwrap().status,
+        RunStatus::AwaitingApproval
+    );
+    assert_eq!(
+        store.get_run("run_stranded").await.unwrap().unwrap().status,
+        RunStatus::Cancelled
+    );
+    assert_eq!(
+        store.get_run("run_running").await.unwrap().unwrap().status,
+        RunStatus::Cancelled
+    );
+}

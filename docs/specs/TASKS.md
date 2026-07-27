@@ -379,7 +379,7 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H1 | **`risk_class` 加法迁移**：`read/write_local/exec/external` 作为新协议字段落地，`requires_approval` 改为由它派生；零行为变更 | C4 | merged #63 |
 | H2 | **用户本地风险 override**：glob 规则调整单个工具的 risk_class；**模块/persona 不得写入**；与 Guardian 的优先级明确 | H1, E1 | merged #61 |
 | H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | merged #62 |
-| H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | in-progress（3-PR stack，见下）｜PR-1 消息线程 merged #70 |
+| H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | in-progress（2-PR，见下）｜PR-1 merged #70；PR-2 durable resume **in-pr #72** |
 | H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending（未阻塞；需专门的 wake 表 + tick 集成，H4 量级） |
 | H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（未阻塞；需引入 run/session mode 状态 + 只读强制层） |
 | H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
@@ -396,22 +396,34 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 前三条是一条线：**H1 提供判据 → H2 用判据放宽 → H4 用判据收窄**。
 `G1+H3` 是 M-F 前必须做完的那一块（否则 24/7 语义是错的），但它最贵，放在判据成型之后。
 
-### G1+H3 拆成 3 个 stacked PR（2026-07-27，用户确认交付形态）
+### G1+H3 交付形态：收敛为 2 个 PR（2026-07-27 修订）
 
-四件事捆绑，但依赖链天然分三层，按 stacked PR 交付：
+原计划拆 3 个 stacked PR。实现中确认：**PR-1（消息线程）能干净独立，但剩下三件（visibility/park、payload 完整性、durable resume）本质是同一个行为**——TASKS.md 自己写「四件事捆绑，缺一不可」。硬拆 PR-2/PR-3 会各自变成没有消费者的空布线（payload 哈希的消费者就是 resume）。故收敛为 2 个 PR。
 
 | PR | 切片 | 内容 | 状态 |
 |---|---|---|---|
-| PR-1 | 消息线程持久化 | 新 `run_messages` 表 + repo（`append_run_message`/`list_run_messages`）；agent loop 把 user/assistant/tool 消息落库。**复原挂起点的地基**。不动协议。 | **merged #70**（clestons v4 APPROVE） |
-| PR-2 | G1 异步 parked + payload 哈希 | 审批加 `visibility`（inline/inbox）+ payload 完整性 SHA256；inbox 模式不阻塞到 timeout 而持久挂起。一条 parked 记录 + visibility 字段（OpenWorker §4），不写两条代码路径。触发 `pnpm gen:api` 零漂移门。 | pending |
-| PR-3 | H3 durable resume + 陈旧性重校验 | 改 `server.rs` 启动清扫：pending 审批复原而非全 abort；同步修订 C4「全 aborted」验收；重校验（工具仍存在、payload 哈希未变、TTL + 「N 小时前排队」）；无法复原的才 abort（兜底）。 | pending |
+| PR-1 | 消息线程持久化 | 新 `run_messages` 表 + repo；agent loop 落库 user/assistant/tool。**复原挂起点的地基**。不动协议。 | **merged #70**（clestons v4 APPROVE） |
+| PR-2 | 完整 durable resume 行为 | `feat/h3b-durable-resume`：resume 分析器 → 陈旧性重校验 → 启动复原而非全 abort → resolve 触发 run 从持久化线程续跑。 | **in-pr #72**（21 新测，28 套全绿） |
 
-**PR-1 review（#70，clestons v4 APPROVE）留给 PR-3 的三条**：
-1. 「取消的 run」与「死在审批上的 run」落盘线程形态**完全相同**（都是 trailing 未应答 tool_call）——复原时必须靠 `RunStatus` 区分，不能只看线程形态；且要处理**半应答轮**（一个 assistant 轮里 call[0] 已应答、call[1] 出错），不是只判「最后一个 call 未应答」。
-2. PR-1 的 append 路径**不防重复行**：一旦 resume 逻辑重入 run loop，会重复 append。幂等/去重（或截断 tail）契约由 PR-3 设计。
-3. 测试补：注入 `append_run_message` 失败断言 run 仍 completed（best-effort 契约）；以及 mid-tool cancel/abort 后 assistant 轮带 trailing 未应答 tool_call 的复原信号——这些放到有 resume 消费方的 PR-3 一起断言实际重建，而非只断言落盘形态。
+**resume 架构决定**：采用 **OpenWorker 式完整复原**——parked 审批重现 inbox，人应答后从持久化线程重建 run 继续跑（而非只让审批 durable、run 不续跑的过渡版）。
+**触发模型改为 lazy（实现中确认更简单且正确）**：不在重启时为每个 pending 审批 spawn 一个跨关停存活的 waiter（那会在优雅关停时误 abort、丢 durability）。改为：重启只**重新广播** pending 审批（`assess_restore` 通过的）+ 排除 orphan-sweep；真正的续跑由**人应答时**（resolve）触发 `resume_run`——那时决策已在行上，无需 await。故不需要 `reattach`，用 `settle_resumed`（读已决行、重放授权副作用）即可。
 
-`inline`（TUI/桌面有人在看）保留现有同步阻塞路径；两种模式共用一条 parked 记录，靠 `visibility` 区分。
+**PR-2 内部进度（breadcrumbs）**：
+- [x] `resume::plan_resume(status, thread) -> ResumePlan`（RunStatus 区分「取消 vs 死在审批」；半应答轮；8 单测）
+- [x] `resume::assess_restore(...)`：工具仍在 + payload 未变（拒「批 A 跑 B」）+ TTL（`iso8601_before` cutoff）；7 单测
+- [x] `ToolRegistry::execute_preapproved`：跳过门的执行路径（续跑时决策已在手，不得二次问）；2 单测（含仍强制 whitelist）
+- [x] `ApprovalBroker::settle_resumed` + `GrantCtx::for_resume`：无 waiter 时读已决行、重放 session/target 授权副作用；2 单测
+- [x] `execute` → `run_loop` 抽取（run/cancel 按值，loop 主体逐字不变；45 旧测全过证行为保持）
+- [x] agent manager：`resume_run(run_id, approval_id)` + `drive_resume` —— 从线程重建 `messages`、`assess_restore` 复校、结算挂起 call（approved→`execute_preapproved` 跑**批准的 payload**、denied→喂 reason、abort→cancel）、半应答轮的剩余 call 走 `run_tool_call`、继续 `run_loop`；supervised spawn + cancel token + 幂等（非 awaiting/已有 task 即 no-op）。2 端到端集成测试（approve 跑工具并完成 / deny 不执行仍完成）。**注**：结算走 store-only 读决策，restored 审批的 `approve_for_session/target` 不重铸授权（fail-closed 下次再问；已在代码注释标 KNOWN LIMITATION）
+- [x] `RunManager::restore_pending_approvals`：启动逐条 `assess_restore`，Restore 则重广播 `approval.required` 保留 pending、Abort 则落 aborted（兜底）；返回 (restored, aborted)。agent 测：restorable 保留+重广播、run 已 Completed 的 aborted
+- [x] `sweep_orphan_runs` 排除「awaiting_approval 且有 pending 审批」（SQL `NOT IN (SELECT run_id ... status='pending')`）；store 测：parked 幸免、stranded/running 取消
+- [x] `server.rs`：早期 abort-all 移除，state 建好后 `restore_pending_approvals` → 再 `sweep_orphan_runs`（顺序保证）；`decide_approval` resolve 成功后无条件调 `resume_run`（幂等，sync 情形因 run 在 cancels 而 no-op）
+- **C4 验收修订**：旧「遗留 pending 全 aborted」不再是服务器行为（改为 restore-or-abort）。`abort_lingering_approvals` store 原语保留（仍有单测），仅不再被 daemon 调用。
+- [ ] （PR-3 遗留，非阻塞）append 路径幂等：resume 重入不得重复 append（clestons #70 note 2）——当前 resume 只 append 新 tool result，不重放已存消息，故本 PR 无重复；正式幂等契约留 PR-3
+- [ ] （PR-3 遗留，非阻塞）best-effort 契约测试：注入 `append_run_message` 失败断言 run 仍 completed
+- [x] 端到端（crate 级）：seed 崩溃态 → 应答 → 复原 → 工具执行 → 完成（approve/deny 两例）。真·跨进程 kill 的 daemon 级 e2e 留手册化验证（F5 泡测顺带）
+
+`inline`（TUI/桌面有人在看）保留现有同步阻塞路径；两种模式共用一条 parked 记录。
 
 ### H1 加法迁移（本轮执行）
 
