@@ -4,17 +4,21 @@ version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Agent24 MCP adapter (M-E/E1): rmcp-backed client, isolated so SDK churn never reaches the kernel"
+description = "Agent24 MCP adapter (M-E/E1 client + E4 server): rmcp-backed, isolated so SDK churn never reaches the kernel"
 
 [dependencies]
 agent24-tools = { path = "../agent24-tools" }
 agent24-protocol = { path = "../agent24-protocol" }
 async-trait = "0.1"
-rmcp = { version = "2.2", features = ["client", "transport-child-process"] }
+# E1 = client, E4 = server (stdio via transport-io). rmcp stays confined to this
+# adapter crate (ADR-026) — the kernel depends on nothing here.
+rmcp = { version = "2.2", features = ["client", "server", "transport-child-process", "transport-io"] }
+# E4: the MCP server proxies to the running daemon over its v1 HTTP API.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "process", "time", "rt"] }
+tokio = { version = "1", features = ["macros", "process", "time", "rt", "io-std"] }
 tokio-util = "0.7"
 tracing = "0.1"
 

@@ -51,6 +51,10 @@ enum Command {
     },
     /// Launch the terminal UI (runs · events · approval queue)
     Tui,
+    /// Serve agent24d as an MCP server over stdio, so an external MCP client
+    /// (Claude Desktop, another agent) can run tasks on it and introspect it.
+    /// Risky actions are still approved on THIS host, never by the caller (E4).
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -186,6 +190,19 @@ async fn finish(mut ep: Endpoint) {
     if let Some(child) = ep.child.as_mut() {
         let _ = child.kill().await;
     }
+}
+
+/// Serve agent24d as an MCP server over stdio (E4). Attaches to the running
+/// daemon (or a private ephemeral one) and proxies a curated, host-gated surface
+/// to it. Runs until the MCP client closes stdin.
+async fn cmd_mcp() -> Result<(), String> {
+    let ep = connect().await?;
+    let result = agent24_mcp::server::Agent24Server::new(ep.base.clone(), ep.token.clone())
+        .serve_stdio()
+        .await
+        .map_err(|e| e.to_string());
+    finish(ep).await;
+    result
 }
 
 fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -441,6 +458,7 @@ async fn main() -> std::process::ExitCode {
         Command::Daemon { action } => cmd_daemon(action).await,
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
+        Command::Mcp => cmd_mcp().await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
