@@ -170,22 +170,35 @@ fn find_requested_call<'a>(
 }
 
 /// Re-validate a parked approval on restart before re-issuing it (H3 staleness
-/// re-validation). The persisted hash/shape proves the payload did not change,
-/// but NOT that the world did not — so this layers three live checks on top of
-/// [`plan_resume`], and ANY failure aborts (fail-closed):
+/// re-validation). The persisted thread proves the payload did not change, but
+/// NOT that the world did not — so this layers three live checks on top of
+/// [`plan_resume`], and ANY failure aborts (fail-closed).
 ///
-/// 1. the analyzer independently agrees the run is parked on THIS exact call;
+/// ## The suspension point comes from the THREAD, not the approval's id
+///
+/// `Approval.tool_call_id` is an INTERNAL persistence id (`tc_{ulid}`, minted for
+/// the ToolCall audit row), while the thread's `tool_calls[].id` is the MODEL
+/// PROVIDER's id (`call_...`). These are two different namespaces and never
+/// equal, so they must NOT be compared. The suspension point is derived purely
+/// from the thread ([`plan_resume`]), and the approval's correspondence to that
+/// call is established by PAYLOAD equality (below) — the integrity property for
+/// data the daemon's single-writer store owns end to end. The returned
+/// `tool_call_id` is the thread/provider id, the one the tool-result message
+/// will be keyed on.
+///
+/// Checks (all must hold):
+/// 1. the thread has a genuine suspension point (`plan_resume`);
 /// 2. the tool that call names still exists in the live registry (`tool_exists`)
 ///    — a tool uninstalled or an MCP server gone offline while down can't run;
 /// 3. the input rebuilt from the thread still equals what was approved — the
-///    payload-integrity property ("refuse to run B for an approval of A");
+///    payload-integrity property ("refuse to run B for an approval of A"), and
+///    ALSO what ties this approval to this parked call across the id namespaces;
 /// 4. the approval is not older than the resume TTL (`created_at >= ttl_cutoff`;
 ///    both fixed-width UTC, so the lexical compare is chronological).
 ///
 /// Pure over its inputs: the caller derives `tool_exists` from the registry and
 /// `ttl_cutoff` from the clock ([`agent24_core::util::iso8601_before`]).
 pub fn assess_restore(
-    tool_call_id: &str,
     approved_payload: &Map<String, Value>,
     created_at: &str,
     run_status: RunStatus,
@@ -193,25 +206,14 @@ pub fn assess_restore(
     tool_exists: impl Fn(&str) -> bool,
     ttl_cutoff: &str,
 ) -> RestoreDecision {
-    match plan_resume(run_status, thread) {
-        ResumePlan::AwaitingToolApproval {
-            tool_call_id: point,
-            ..
-        } if point == tool_call_id => {}
-        ResumePlan::AwaitingToolApproval {
-            tool_call_id: point,
-            ..
-        } => {
-            return RestoreDecision::Abort {
-                reason: format!(
-                    "approval parked on {tool_call_id} but the thread's suspension point is {point}"
-                ),
-            };
-        }
+    // The suspension point is whatever the thread says is unanswered — a provider
+    // id, self-consistent with the tool-result messages that answer calls.
+    let tool_call_id = match plan_resume(run_status, thread) {
+        ResumePlan::AwaitingToolApproval { tool_call_id, .. } => tool_call_id,
         ResumePlan::NotResumable { reason } => return RestoreDecision::Abort { reason },
-    }
+    };
 
-    let Some((name, args)) = find_requested_call(thread, tool_call_id) else {
+    let Some((name, args)) = find_requested_call(thread, &tool_call_id) else {
         return RestoreDecision::Abort {
             reason: format!("tool_call {tool_call_id} not found in the persisted thread"),
         };
@@ -256,9 +258,7 @@ pub fn assess_restore(
         };
     }
 
-    RestoreDecision::Restore {
-        tool_call_id: tool_call_id.to_owned(),
-    }
+    RestoreDecision::Restore { tool_call_id }
 }
 
 #[cfg(test)]
@@ -465,7 +465,6 @@ mod tests {
         ];
         assert_eq!(
             assess_restore(
-                "call_a",
                 &Map::new(),
                 FRESH,
                 RunStatus::AwaitingApproval,
@@ -479,6 +478,34 @@ mod tests {
         );
     }
 
+    /// REGRESSION (id-namespace bug): the suspension point is the thread's
+    /// PROVIDER id, and correspondence to the approval is by PAYLOAD — the
+    /// approval's own `tc_...` id is never compared. Here the provider id is an
+    /// opaque `call_provider_xyz` (nothing like a `tc_...`) and the approved
+    /// payload matches, so restore succeeds and RETURNS THE PROVIDER ID (the one
+    /// the tool-result message is keyed on). Before the fix, passing the
+    /// approval's `tc_` id here made this comparison always fail in production.
+    #[test]
+    fn restore_uses_the_thread_provider_id_not_any_approval_id() {
+        let thread = [
+            user(0, "go"),
+            assistant_call_full(1, "call_provider_xyz", "shell_exec", r#"{"argv":["x"]}"#),
+        ];
+        assert_eq!(
+            assess_restore(
+                &obj(json!({ "argv": ["x"] })),
+                FRESH,
+                RunStatus::AwaitingApproval,
+                &thread,
+                |_| true,
+                CUTOFF,
+            ),
+            RestoreDecision::Restore {
+                tool_call_id: "call_provider_xyz".to_owned()
+            }
+        );
+    }
+
     #[test]
     fn empty_arguments_match_an_empty_approved_payload() {
         let thread = [
@@ -487,7 +514,6 @@ mod tests {
         ];
         assert_eq!(
             assess_restore(
-                "call_a",
                 &Map::new(),
                 FRESH,
                 RunStatus::AwaitingApproval,
@@ -509,7 +535,6 @@ mod tests {
         ];
         // Registry no longer has this tool (e.g. its MCP server went offline).
         let decision = assess_restore(
-            "call_a",
             &Map::new(),
             FRESH,
             RunStatus::AwaitingApproval,
@@ -526,12 +551,13 @@ mod tests {
     #[test]
     fn a_payload_changed_since_approval_aborts() {
         // Approved {"a":2}; the thread's call now rebuilds to {"a":1}. Refuse.
+        // This is also what ties an approval to its parked call across the id
+        // namespaces, so a mismatch here is the fail-closed guard.
         let thread = [
             user(0, "go"),
             assistant_call_full(1, "call_a", "shell_exec", r#"{"a":1}"#),
         ];
         let decision = assess_restore(
-            "call_a",
             &obj(json!({ "a": 2 })),
             FRESH,
             RunStatus::AwaitingApproval,
@@ -552,7 +578,6 @@ mod tests {
             assistant_call_full(1, "call_a", "shell_exec", "{}"),
         ];
         let decision = assess_restore(
-            "call_a",
             &Map::new(),
             STALE,
             RunStatus::AwaitingApproval,
@@ -574,7 +599,6 @@ mod tests {
         ];
         assert!(matches!(
             assess_restore(
-                "call_a",
                 &Map::new(),
                 FRESH,
                 RunStatus::Cancelled,
@@ -584,28 +608,5 @@ mod tests {
             ),
             RestoreDecision::Abort { .. }
         ));
-    }
-
-    #[test]
-    fn an_approval_pointing_at_a_different_call_than_the_suspension_point_aborts() {
-        // The approval claims call_x, but the thread's actual unanswered call is
-        // call_a. The two must agree, or we could resume the wrong call.
-        let thread = [
-            user(0, "go"),
-            assistant_call_full(1, "call_a", "shell_exec", "{}"),
-        ];
-        let decision = assess_restore(
-            "call_x",
-            &Map::new(),
-            FRESH,
-            RunStatus::AwaitingApproval,
-            &thread,
-            |_| true,
-            CUTOFF,
-        );
-        assert!(
-            matches!(decision, RestoreDecision::Abort { ref reason } if reason.contains("suspension point")),
-            "{decision:?}"
-        );
     }
 }

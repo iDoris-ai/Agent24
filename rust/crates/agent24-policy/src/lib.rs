@@ -111,7 +111,7 @@ pub struct ApprovalRequest<'a> {
 }
 
 /// What an approved decision needs in order to mint the right kind of grant.
-pub struct GrantCtx {
+struct GrantCtx {
     /// Broad in-memory session grant scope (session id, or run id when there is
     /// no session).
     scope: String,
@@ -121,38 +121,6 @@ pub struct GrantCtx {
     scope_id: Option<String>,
     /// The exact target this call named, when it is eligible for a grant.
     target: Option<String>,
-}
-
-impl GrantCtx {
-    /// Rebuild the grant context for a RESUMED approval (H3) from the run and its
-    /// parked tool call, mirroring exactly what [`ApprovalBroker::request`]
-    /// computed when the approval was first created. Replaying an
-    /// `approve_for_session` / `approve_for_target` decision through
-    /// [`ApprovalBroker::settle_resumed`] then records the same grant a live
-    /// dispatch would have — resume must not silently drop a grant the user made.
-    pub fn for_resume(
-        run_id: &str,
-        session_id: Option<&str>,
-        schedule_id: Option<&str>,
-        tool: &str,
-        risk: RiskClass,
-        standing_target: Option<&str>,
-    ) -> Self {
-        let scope = session_id.unwrap_or(run_id).to_owned();
-        let grant_scope = grant_scope(session_id, schedule_id);
-        let offer_target = risk
-            .standing_grant_eligible()
-            .then_some(standing_target)
-            .flatten()
-            .filter(|_| grant_scope.is_some());
-        GrantCtx {
-            scope,
-            tool: tool.to_owned(),
-            scope_kind: grant_scope.map(|(k, _)| k),
-            scope_id: grant_scope.map(|(_, id)| id.to_owned()),
-            target: offer_target.map(str::to_owned),
-        }
-    }
 }
 
 /// Where a standing grant would live: the schedule if one fired this run, else
@@ -539,20 +507,6 @@ impl ApprovalBroker {
         };
         drop(guard);
         verdict
-    }
-
-    /// Apply a decision recorded on an approval row while NO dispatch was
-    /// waiting — the durable-resume counterpart of the live `request` path (H3).
-    /// A restored or parked approval is answered after its original in-memory
-    /// waiter is gone (daemon restarted, or the run task ended when it parked);
-    /// this reads the now-resolved row and replays the decision's grant
-    /// side-effects, returning the verdict for the resumed run to act on. Reuses
-    /// the same authoritative-row logic as the raced-resolution path, so it is
-    /// fail-closed on anything unexpected.
-    ///
-    /// Build `grant_ctx` with [`GrantCtx::for_resume`].
-    pub async fn settle_resumed(&self, approval_id: &str, grant_ctx: &GrantCtx) -> Verdict {
-        self.verdict_from_row(approval_id, grant_ctx).await
     }
 
     /// Derive the verdict from the authoritative store row (used when a
@@ -1527,80 +1481,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ResolveError::NotFound(_)), "{err}");
-    }
-
-    // ── H3: settle_resumed (durable resume with no live waiter) ───────────────
-
-    /// Resume path: an approval is resolved while NO dispatch is waiting (the
-    /// original waiter died with the process). settle_resumed reads the resolved
-    /// row and returns the verdict a live dispatch would have — here Approved.
-    #[tokio::test]
-    async fn settle_resumed_reads_an_already_resolved_row() {
-        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
-        seed_run(&store, "run_1").await;
-        // Persist a pending approval directly (as a restart would have left it),
-        // with no waiter registered in the pending map.
-        let approval = Approval {
-            id: "apr_resume".to_owned(),
-            run_id: "run_1".to_owned(),
-            tool_call_id: "tc_1".to_owned(),
-            kind: "exec".to_owned(),
-            summary: "shell_exec".to_owned(),
-            payload: Map::new(),
-            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
-            standing_target: None,
-            status: ApprovalStatus::Pending,
-            decision: None,
-            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(3600)),
-            created_at: now_iso8601(),
-            decided_at: None,
-        };
-        store.insert_approval(&approval).await.unwrap();
-        // A human answers it (no waiter is woken — the map is empty).
-        broker
-            .resolve("apr_resume", decision("approve", None))
-            .await
-            .unwrap();
-
-        // The resumed run settles the decision off the row.
-        let ctx = GrantCtx::for_resume("run_1", None, None, "shell_exec", RiskClass::Exec, None);
-        assert_eq!(
-            broker.settle_resumed("apr_resume", &ctx).await,
-            Verdict::Approved
-        );
-    }
-
-    /// A denied resume yields the reason to feed back to the model, not an
-    /// execution.
-    #[tokio::test]
-    async fn settle_resumed_surfaces_a_denial() {
-        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
-        seed_run(&store, "run_1").await;
-        let approval = Approval {
-            id: "apr_resume".to_owned(),
-            run_id: "run_1".to_owned(),
-            tool_call_id: "tc_1".to_owned(),
-            kind: "exec".to_owned(),
-            summary: "shell_exec".to_owned(),
-            payload: Map::new(),
-            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
-            standing_target: None,
-            status: ApprovalStatus::Pending,
-            decision: None,
-            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(3600)),
-            created_at: now_iso8601(),
-            decided_at: None,
-        };
-        store.insert_approval(&approval).await.unwrap();
-        broker
-            .resolve("apr_resume", decision("deny", Some("not now")))
-            .await
-            .unwrap();
-
-        let ctx = GrantCtx::for_resume("run_1", None, None, "shell_exec", RiskClass::Exec, None);
-        assert!(
-            matches!(broker.settle_resumed("apr_resume", &ctx).await, Verdict::Denied(r) if r.contains("not now")),
-        );
     }
 
     // ── H4: target-scoped standing grants ────────────────────────────────────

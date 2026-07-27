@@ -607,8 +607,10 @@ impl RunManager {
                     continue;
                 }
             };
+            // NB: the approval's `tool_call_id` (an internal `tc_` id) is
+            // deliberately NOT passed — the suspension point is derived from the
+            // thread's provider ids, and the approval is matched by payload.
             match crate::resume::assess_restore(
-                &approval.tool_call_id,
                 &approval.payload,
                 &approval.created_at,
                 run_status,
@@ -731,19 +733,14 @@ impl RunManager {
     ) {
         let run_id = run.id.clone();
 
-        // 1. Locate the suspension point the analyzer agrees on.
-        let crate::resume::ResumePlan::AwaitingToolApproval { tool_call_id, .. } =
-            crate::resume::plan_resume(run.status, &thread)
-        else {
-            tracing::warn!("run {run_id}: not resumable; aborting");
-            self.finish_cancelled(&run_id).await;
-            return;
-        };
-
-        // 2. Staleness re-validation (tool still exists, payload unchanged, TTL).
+        // 1+2. Re-validate off the persisted thread and locate the suspension
+        // point. The point is a PROVIDER id derived from the thread (NOT the
+        // approval's internal `tc_` id — a different namespace that never
+        // matches); the approval is tied to that call by payload equality inside
+        // assess_restore. Done BEFORE any state change, so an unrestorable run
+        // never emits a spurious RunStarted→Cancelled pair.
         let cutoff = agent24_core::util::iso8601_before(RESUME_TTL);
-        if let crate::resume::RestoreDecision::Abort { reason } = crate::resume::assess_restore(
-            &tool_call_id,
+        let tool_call_id = match crate::resume::assess_restore(
             &approval.payload,
             &approval.created_at,
             run.status,
@@ -751,10 +748,13 @@ impl RunManager {
             |name| self.tools.tool_risk_class(name).is_some(),
             &cutoff,
         ) {
-            tracing::warn!("run {run_id}: resume aborted — {reason}");
-            self.finish_cancelled(&run_id).await;
-            return;
-        }
+            crate::resume::RestoreDecision::Restore { tool_call_id } => tool_call_id,
+            crate::resume::RestoreDecision::Abort { reason } => {
+                tracing::warn!("run {run_id}: resume aborted — {reason}");
+                self.finish_cancelled(&run_id).await;
+                return;
+            }
+        };
 
         // 3. Reconstruct the conversation and return the run to Running.
         let mut messages = thread_to_messages(&thread);
@@ -2479,7 +2479,7 @@ mod approval_tests {
             )
             .await
             .unwrap();
-        let call = serde_json::json!([{ "id": "call_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
         h.store
             .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
             .await
@@ -2487,7 +2487,7 @@ mod approval_tests {
         let approval = Approval {
             id: "apr_1".to_owned(),
             run_id: "run_1".to_owned(),
-            tool_call_id: "call_1".to_owned(),
+            tool_call_id: "tc_internal_1".to_owned(),
             kind: "exec".to_owned(),
             summary: "shell_exec".to_owned(),
             payload: args.as_object().unwrap().clone(),
@@ -2520,12 +2520,14 @@ mod approval_tests {
             done.output.unwrap().text.contains("resumed-output"),
             "the parked tool did not run on resume"
         );
-        // The reconstructed thread gained the tool result for the parked call.
+        // The reconstructed thread gained the tool result for the parked call,
+        // keyed on the THREAD's provider id (call_provider_1) — NOT the
+        // approval's tc_internal_1. Resume works across the two id namespaces.
         let thread = h.store.list_run_messages("run_1").await.unwrap();
         assert!(
             thread
                 .iter()
-                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_1")),
+                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
             "no tool result was recorded for the resumed call"
         );
     }
@@ -2565,7 +2567,7 @@ mod approval_tests {
             )
             .await
             .unwrap();
-        let call = serde_json::json!([{ "id": "call_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
         h.store
             .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
             .await
@@ -2573,7 +2575,7 @@ mod approval_tests {
         let approval = Approval {
             id: "apr_1".to_owned(),
             run_id: "run_1".to_owned(),
-            tool_call_id: "call_1".to_owned(),
+            tool_call_id: "tc_internal_1".to_owned(),
             kind: "exec".to_owned(),
             summary: "shell_exec".to_owned(),
             payload: args.as_object().unwrap().clone(),
@@ -2680,7 +2682,7 @@ mod approval_tests {
             )
             .await
             .unwrap();
-        let call = serde_json::json!([{ "id": "call_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
         h.store
             .append_run_message("run_ok", "assistant", None, &call, None, &now_iso8601())
             .await
@@ -2689,7 +2691,9 @@ mod approval_tests {
             .insert_approval(&seed_approval(
                 "apr_ok",
                 "run_ok",
-                "call_1",
+                // tc_ namespace — deliberately DIFFERENT from the thread's
+                // provider id (call_provider_1); correspondence is by payload.
+                "tc_internal_1",
                 args.as_object().unwrap().clone(),
             ))
             .await
