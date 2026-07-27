@@ -7,6 +7,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { promisify } from 'node:util'
 import type { CapabilityModule } from './capabilities/base'
+import { validateManifest } from './module-manifest'
 
 const execFileAsync = promisify(execFile)
 
@@ -88,13 +89,23 @@ export function loadInstalledModule(modulePath: string): CapabilityModule | null
     // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const mod = require(modulePath) as { manifest?: unknown; register?: unknown }
     if (
-      mod &&
-      typeof mod.manifest === 'object' && mod.manifest !== null &&
-      typeof mod.register === 'function'
+      !mod ||
+      typeof mod.manifest !== 'object' || mod.manifest === null ||
+      typeof mod.register !== 'function'
     ) {
-      return mod as CapabilityModule
+      return null
     }
-    return null
+    // E3: the manifest must conform to protocol/module.schema.json before the
+    // module is allowed to register anything. A malformed manifest is rejected
+    // here rather than surfacing later as an opaque runtime failure.
+    const errors = validateManifest(mod.manifest)
+    if (errors.length > 0) {
+      console.error(
+        `[module-installer] rejecting ${modulePath}: manifest failed schema validation: ${errors.join('; ')}`,
+      )
+      return null
+    }
+    return mod as CapabilityModule
   } catch (err) {
     console.error('[module-installer] failed to load module:', modulePath, err)
     return null
