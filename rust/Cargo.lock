@@ -26,6 +26,7 @@ dependencies = [
 name = "agent24-cli"
 version = "0.2.1"
 dependencies = [
+ "agent24-mcp",
  "agent24-protocol",
  "clap",
  "crossterm",
@@ -54,6 +55,7 @@ dependencies = [
  "agent24-protocol",
  "agent24-tools",
  "async-trait",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",

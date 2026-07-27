@@ -14,6 +14,8 @@
 //! third-party SDK churn: adapter layer only, kernel depends on nothing here).
 //! Pinned to the stable 2.x line rather than the 3.0 beta.
 
+pub mod server;
+
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;

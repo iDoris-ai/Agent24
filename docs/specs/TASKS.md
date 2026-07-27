@@ -214,8 +214,21 @@ L0 KV（D1）、L1 会话压缩（D1+D5b）、三层路由（D2）全部 merged�
 | E1 | agent24-mcp：rmcp client（stdio），MCP 工具以 `mcp_{server}_{tool}` 注入 registry | C8 + 用户确认 | **done** #54 + 接线 |
 | E2 | ~~node-host：现有 5 个 CapabilityModule 经 JSON-RPC 接入内核~~ | E1 | **descoped**（见下方说明） |
 | E3 | module.schema.json 落地 UI Module 规范 + 模块市场页对接 | ~~E2~~ E1 | pending |
-| E4 | agent24d 作为 MCP server 暴露自身工具 | E1 | pending |
+| E4 | agent24d 作为 MCP server 暴露自身工具 | E1 | **in-pr**（`feat/e4-mcp-server`，设计见下；server 模块 + `agent24 mcp` 子命令 + 代理测试） |
 | E5 | PGL manifest（pgl.yml）解析钩子 + AgentStore 元数据展示 | E3 | pending |
+
+### E4 设计（2026-07-27，用户选 P2 后开工）
+
+**关键判断：不裸暴露危险工具，而是暴露"能力"，且经守门。** 让外部 MCP client（Claude Desktop 等）把 agent24d 当一个 MCP 工具用，但绝不给外部一条绕过审批直接跑 `shell_exec` 的路。
+
+- **形态**：`agent24 mcp`（stdio）子命令 = 一个 rmcp **server**，代理到运行中 agent24d 的 v1 HTTP API（守门权威留在 daemon 一处，审批照常经 daemon 的 TUI/桌面/未来微信弹出）。
+- **暴露面（curated）**：
+  - `agent24_run(prompt, session_id?)` → `POST /api/v1/runs` 轮询到终态返回输出。**走完整 gated loop**——外部要跑危险动作，宿主人在 daemon 侧审批，天然继承 C4/D3/H1-H4。
+  - 只读自省：`agent24_list_tools`(GET /tools)、`agent24_list_runs`(GET /runs)。安全，无副作用。
+- **不做**：把 registry 里的 `shell_exec`/`fs_write` 逐个当 MCP 工具直接暴露给外部——那等于给第三方一条免审批执行路。要真按「逐个工具」暴露，也必须每次经审批门（宿主阻塞批准），MVP 先不做，只出 `agent24_run` + 只读自省。
+- **安全性是白拿的**：一切副作用都发生在 `agent24_run` 触发的 run 内部，经既有 gated dispatch；MCP server 层只是转发 + 只读。
+- **rmcp**：现 `agent24-mcp` 只开了 `client` feature；E4 加 `server`（+ stdio transport）feature；SDK 仍限在 adapter crate（ADR-026）。
+- **验收**：`agent24 mcp` 可被一个标准 MCP client（或单测 harness）发现 `agent24_run`/`agent24_list_*`；`agent24_run` 端到端跑通一个 run 并返回输出；危险动作确实在 daemon 侧触发审批而非被外部静默执行。
 
 ### E2 降级说明（2026-07-24，用户确认）
 
@@ -269,6 +282,17 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 | F3 | 微信渠道（iDoris-SDK / @agent-wechat）：入站消息 → run，审批可经微信完成 | C8 + 用户确认 | pending |
 | F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | pending |
 | F5 | 7×24 稳定性验证：Mac mini 连续 7 天，日程照跑，无人工干预 | F2 | pending（F1a/F2 已就绪，可开始跑） |
+
+### F3 技术栈参考（2026-07-27，用户指路 `~/Dev/mycelium/blog`）
+
+调研 blog 项目后确认微信有**两条不同的路**，F3 要的是第二条：
+
+| 路 | 来源 | 用途 | 与 F3 关系 |
+|---|---|---|---|
+| 公众号**发布**（草稿/群发） | blog `pipeline/m2/index.js`（Node）；官方 MP API，auth = `WECHAT_APP_ID`(wx…)+`WECHAT_APP_SECRET`+`WECHAT_MP_ID`(gh_…)，access_token 流 | **出站**发文章 | 提供**账号 + 官方 API auth 模式**；但不是 F3 的对话流 |
+| 公众号**消息**（收/回） | 组织自有 **@agent-wechat/core**（已发布 npm）+ Agent-WeChat-SDK（WeChat→Nostr 转发，github.com/MushroomDAO/Agent-WeChat-SDK） | **双向对话**：入站消息→run，回复经微信 | **这才是 F3 的正解** |
+
+**F3 落地要点**（开工时展开）：入站需公众号服务器配置（webhook 收消息）或走 @agent-wechat 的桥；服务号可用**客服消息**在 48h 窗口内主动回复（审批卡片/结果）。账号可复用 blog 的 MP（`gh_ba9082b3a7aa`）。**审批经微信**：把 `approval.required` 渲染成微信消息，用户回「批准/拒绝」→ 映射成 `POST /approvals/{id}` decision。这与刚做完的 durable resume 天然契合（离线审批→resume_run 续跑）。
 
 ### F1a/F2 设计变更（2026-07-24，#51）
 
@@ -379,7 +403,7 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H1 | **`risk_class` 加法迁移**：`read/write_local/exec/external` 作为新协议字段落地，`requires_approval` 改为由它派生；零行为变更 | C4 | merged #63 |
 | H2 | **用户本地风险 override**：glob 规则调整单个工具的 risk_class；**模块/persona 不得写入**；与 Guardian 的优先级明确 | H1, E1 | merged #61 |
 | H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | merged #62 |
-| H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | in-progress（2-PR，见下）｜PR-1 merged #70；PR-2 durable resume **in-pr #72** |
+| H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | **merged**（PR-1 #70 + PR-2 #72；P0 完成） |
 | H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending（未阻塞；需专门的 wake 表 + tick 集成，H4 量级） |
 | H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（未阻塞；需引入 run/session mode 状态 + 只读强制层） |
 | H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
