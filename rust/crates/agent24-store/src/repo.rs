@@ -654,6 +654,67 @@ impl Store {
         }
     }
 
+    // ── Run message thread (H3/G1 foundation) ────────────────────────────────
+
+    /// Append one message to a run's durable thread.
+    ///
+    /// `seq` is assigned by the store as `MAX(seq)+1` for this run inside the
+    /// insert, so callers never track ordering and a resumed run appends after
+    /// the persisted tail without recomputation. Single-writer by construction:
+    /// a run executes in exactly one task, so no two appends for the same run
+    /// race for the next seq.
+    pub async fn append_run_message(
+        &self,
+        run_id: &str,
+        role: &str,
+        content: Option<&str>,
+        tool_calls: &Value,
+        tool_call_id: Option<&str>,
+        now: &str,
+    ) -> Result<()> {
+        let tool_calls_json = serde_json::to_string(tool_calls)?;
+        sqlx::query(
+            "INSERT INTO run_messages (run_id, seq, role, content, tool_calls, tool_call_id, created_at) \
+             VALUES (?, (SELECT COALESCE(MAX(seq), -1) + 1 FROM run_messages WHERE run_id = ?), ?, ?, ?, ?, ?)",
+        )
+        .bind(run_id)
+        .bind(run_id)
+        .bind(role)
+        .bind(content)
+        .bind(&tool_calls_json)
+        .bind(tool_call_id)
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// The full per-run thread in append order. Empty for a run that never
+    /// reached its first persisted message (or one from before this table).
+    pub async fn list_run_messages(&self, run_id: &str) -> Result<Vec<RunMessage>> {
+        let rows = sqlx::query(
+            "SELECT run_id, seq, role, content, tool_calls, tool_call_id, created_at \
+             FROM run_messages WHERE run_id = ? ORDER BY seq ASC",
+        )
+        .bind(run_id)
+        .fetch_all(self.pool())
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let raw: String = r.get("tool_calls");
+            out.push(RunMessage {
+                run_id: r.get("run_id"),
+                seq: r.get("seq"),
+                role: r.get("role"),
+                content: r.get("content"),
+                tool_calls: serde_json::from_str(&raw)?,
+                tool_call_id: r.get("tool_call_id"),
+                created_at: r.get("created_at"),
+            });
+        }
+        Ok(out)
+    }
+
     // ── Risk overrides (H2) ──────────────────────────────────────────────────
     //
     // Only an explicit user action reaches these three methods. Nothing on a
@@ -742,6 +803,25 @@ pub struct StandingGrant {
     pub tool: String,
     /// The exact value of the tool's declared target argument.
     pub target: String,
+    pub created_at: String,
+}
+
+/// One message of a run's durable conversation thread (H3/G1 foundation).
+///
+/// A faithful persisted image of the agent loop's in-memory `Msg`: `content`
+/// is null for an assistant tool-only turn, `tool_calls` is the JSON array of
+/// requests (`[]` on every non-assistant row), and `tool_call_id` is set only
+/// on `role = "tool"` rows to say which call they answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunMessage {
+    pub run_id: String,
+    /// Per-run monotonic order, 0-based.
+    pub seq: i64,
+    pub role: String,
+    pub content: Option<String>,
+    /// JSON array of `ToolCallRequest` on the wire; `[]` when the turn made none.
+    pub tool_calls: Value,
+    pub tool_call_id: Option<String>,
     pub created_at: String,
 }
 

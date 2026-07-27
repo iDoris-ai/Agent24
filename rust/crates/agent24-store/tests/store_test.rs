@@ -453,3 +453,121 @@ async fn concurrent_audit_appends_never_fork_the_chain() {
     store.verify_audit_chain().await.unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Run message thread (H3/G1 foundation) ────────────────────────────────────
+
+#[tokio::test]
+async fn run_message_thread_roundtrips_in_append_order() {
+    let store = Store::open_memory().await.unwrap();
+    store.insert_run(&run("run_1")).await.unwrap();
+
+    // A representative thread: user prompt → assistant turn with a tool_call →
+    // the tool result answering it → closing assistant answer.
+    let tool_calls = serde_json::json!([
+        { "id": "call_a", "name": "http_fetch", "arguments": "{\"url\":\"https://x\"}" }
+    ]);
+    store
+        .append_run_message(
+            "run_1",
+            "user",
+            Some("go"),
+            &serde_json::json!([]),
+            None,
+            TS,
+        )
+        .await
+        .unwrap();
+    store
+        .append_run_message("run_1", "assistant", None, &tool_calls, None, TS)
+        .await
+        .unwrap();
+    store
+        .append_run_message(
+            "run_1",
+            "tool",
+            Some("200 OK"),
+            &serde_json::json!([]),
+            Some("call_a"),
+            TS,
+        )
+        .await
+        .unwrap();
+    store
+        .append_run_message(
+            "run_1",
+            "assistant",
+            Some("done"),
+            &serde_json::json!([]),
+            None,
+            TS,
+        )
+        .await
+        .unwrap();
+
+    let thread = store.list_run_messages("run_1").await.unwrap();
+    assert_eq!(thread.len(), 4);
+    // seq is store-assigned, 0-based and dense.
+    assert_eq!(
+        thread.iter().map(|m| m.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    assert_eq!(
+        thread.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+        vec!["user", "assistant", "tool", "assistant"]
+    );
+    // The assistant tool-only turn preserves null content and its tool_calls.
+    assert_eq!(thread[1].content, None);
+    assert_eq!(thread[1].tool_calls, tool_calls);
+    // The tool result records which call it answers.
+    assert_eq!(thread[2].tool_call_id.as_deref(), Some("call_a"));
+    assert_eq!(thread[2].tool_calls, serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn run_message_seq_is_independent_across_runs() {
+    let store = Store::open_memory().await.unwrap();
+    store.insert_run(&run("run_1")).await.unwrap();
+    store.insert_run(&run("run_2")).await.unwrap();
+
+    // Interleave appends: each run's seq must start at 0 and advance on its own.
+    for (r, text) in [
+        ("run_1", "a"),
+        ("run_2", "x"),
+        ("run_1", "b"),
+        ("run_2", "y"),
+    ] {
+        store
+            .append_run_message(r, "user", Some(text), &serde_json::json!([]), None, TS)
+            .await
+            .unwrap();
+    }
+
+    let one = store.list_run_messages("run_1").await.unwrap();
+    let two = store.list_run_messages("run_2").await.unwrap();
+    assert_eq!(one.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1]);
+    assert_eq!(two.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1]);
+    assert_eq!(
+        one.iter()
+            .map(|m| m.content.clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+    assert_eq!(
+        two.iter()
+            .map(|m| m.content.clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["x", "y"]
+    );
+}
+
+#[tokio::test]
+async fn listing_an_unknown_run_thread_is_empty() {
+    let store = Store::open_memory().await.unwrap();
+    assert!(
+        store
+            .list_run_messages("run_nope")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
