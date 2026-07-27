@@ -15,6 +15,36 @@
 
 ---
 
+## 🎯 个人助理优先级（v0.2.1 之后的主排序，2026-07-27 用户确认）
+
+> **目标**：做成「你在微信上聊、7×24 跑你的定时工作流、碰风险动作问你、按 session 记忆」的个人助理，
+> 同时把基础框架做扎实到「任何人都能基于它做自己的 agent」。
+> **这是 loop 的任务选择依据**：在「pending 且依赖满足」的任务里，优先级高的先做。
+
+**P0 — 无人值守正确性（进行中，最高优先）**
+- `[G1+H3]` 3-PR stack：PR-1 消息线程 ✅merged #70 → **PR-2** 异步 parked+payload 哈希 → PR-3 durable resume+重校验。
+  没有它，24/7 下需审批的任务在凌晨阻塞到超时**死掉**——个人助理不成立。
+
+**P1 — 能对话的渠道（"个人助理"的定义性一步）**
+- H11 Fake 渠道 harness（先行，让 F3 可自动测）→ F3 微信渠道（入站消息→run，审批经微信完成）
+  → F5 7×24 泡测（Mac mini 连跑 7 天）→ F4 Nostr 渠道 → F1b 托盘常驻（小项，可穿插）。
+
+**P2 — 让"任何人可基于它做 agent"（框架完成度）**
+- E4 agent24d 作为 MCP server 暴露自身工具 → E3 module.schema + 模块市场页
+  → H10 模块/persona 安装同意摘要（依赖 E3）→ E5 PGL manifest。
+
+**P3 — 助理更自主/更聪明**
+- H5 self-wake → H8 plan mode + propose_plan → G2/G3 审批判据补充/CLI 授权成文
+  → L2 语义记忆（M-D 扩展；BGE-M3 embedding+reranker 这套用在这，需先有消费者）。
+
+**P4 — 生态 / 分发（M4 / M5，最后）**
+- 跨用户 skill 共享、Nostr 分发 skill、iDoris 主 AI 接入、模块 marketplace、
+  模块签名 + AirAccount 信任根、跨设备记忆同步、Tauri mobile。
+
+**里程碑门（需用户确认才越过，不擅自跨）**：进入 P4（M4/M5 产品级生态）前停下确认；发布 tag/Release 由用户执行。
+
+---
+
 ## M-A 契约冻结 + 仓库重构
 
 | ID | 任务 | 依赖 | 状态 | PR |
@@ -349,7 +379,7 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H1 | **`risk_class` 加法迁移**：`read/write_local/exec/external` 作为新协议字段落地，`requires_approval` 改为由它派生；零行为变更 | C4 | merged #63 |
 | H2 | **用户本地风险 override**：glob 规则调整单个工具的 risk_class；**模块/persona 不得写入**；与 Guardian 的优先级明确 | H1, E1 | merged #61 |
 | H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | merged #62 |
-| H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | in-progress（3-PR stack，见下）｜PR-1 消息线程 in-pr |
+| H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | in-progress（3-PR stack，见下）｜PR-1 消息线程 merged #70 |
 | H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending（未阻塞；需专门的 wake 表 + tick 集成，H4 量级） |
 | H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（未阻塞；需引入 run/session mode 状态 + 只读强制层） |
 | H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
@@ -372,7 +402,7 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 
 | PR | 切片 | 内容 | 状态 |
 |---|---|---|---|
-| PR-1 | 消息线程持久化 | 新 `run_messages` 表 + repo（`append_run_message`/`list_run_messages`）；agent loop 把 user/assistant/tool 消息落库。**复原挂起点的地基**。不动协议。 | in-pr |
+| PR-1 | 消息线程持久化 | 新 `run_messages` 表 + repo（`append_run_message`/`list_run_messages`）；agent loop 把 user/assistant/tool 消息落库。**复原挂起点的地基**。不动协议。 | **merged #70**（clestons v4 APPROVE） |
 | PR-2 | G1 异步 parked + payload 哈希 | 审批加 `visibility`（inline/inbox）+ payload 完整性 SHA256；inbox 模式不阻塞到 timeout 而持久挂起。一条 parked 记录 + visibility 字段（OpenWorker §4），不写两条代码路径。触发 `pnpm gen:api` 零漂移门。 | pending |
 | PR-3 | H3 durable resume + 陈旧性重校验 | 改 `server.rs` 启动清扫：pending 审批复原而非全 abort；同步修订 C4「全 aborted」验收；重校验（工具仍存在、payload 哈希未变、TTL + 「N 小时前排队」）；无法复原的才 abort（兜底）。 | pending |
 
