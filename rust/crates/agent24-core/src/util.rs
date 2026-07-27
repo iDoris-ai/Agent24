@@ -34,6 +34,14 @@ pub fn iso8601_after(after: std::time::Duration) -> String {
     iso8601_at(epoch_secs().saturating_add(after.as_secs()))
 }
 
+/// ISO 8601 UTC timestamp `before` now (e.g. a resume TTL cutoff: approvals
+/// created earlier than this are too stale to restore). Saturates at the epoch.
+/// Timestamps are fixed-width UTC, so a lexical `created_at < cutoff` compare is
+/// a chronological one.
+pub fn iso8601_before(before: std::time::Duration) -> String {
+    iso8601_at(epoch_secs().saturating_sub(before.as_secs()))
+}
+
 fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -82,5 +90,17 @@ mod tests {
         assert_eq!(ts.len(), 20);
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[10..11], "T");
+    }
+
+    #[test]
+    fn iso8601_before_and_after_straddle_now() {
+        use std::time::Duration;
+        let before = iso8601_before(Duration::from_secs(3600));
+        let now = now_iso8601();
+        let after = iso8601_after(Duration::from_secs(3600));
+        // Fixed-width UTC → lexical order is chronological order.
+        assert!(before < now, "{before} !< {now}");
+        assert!(now <= after, "{now} !<= {after}");
+        assert_eq!(before.len(), 20);
     }
 }
