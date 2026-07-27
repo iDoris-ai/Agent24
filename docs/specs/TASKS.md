@@ -376,6 +376,11 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | PR-2 | G1 异步 parked + payload 哈希 | 审批加 `visibility`（inline/inbox）+ payload 完整性 SHA256；inbox 模式不阻塞到 timeout 而持久挂起。一条 parked 记录 + visibility 字段（OpenWorker §4），不写两条代码路径。触发 `pnpm gen:api` 零漂移门。 | pending |
 | PR-3 | H3 durable resume + 陈旧性重校验 | 改 `server.rs` 启动清扫：pending 审批复原而非全 abort；同步修订 C4「全 aborted」验收；重校验（工具仍存在、payload 哈希未变、TTL + 「N 小时前排队」）；无法复原的才 abort（兜底）。 | pending |
 
+**PR-1 review（#70，clestons v4 APPROVE）留给 PR-3 的三条**：
+1. 「取消的 run」与「死在审批上的 run」落盘线程形态**完全相同**（都是 trailing 未应答 tool_call）——复原时必须靠 `RunStatus` 区分，不能只看线程形态；且要处理**半应答轮**（一个 assistant 轮里 call[0] 已应答、call[1] 出错），不是只判「最后一个 call 未应答」。
+2. PR-1 的 append 路径**不防重复行**：一旦 resume 逻辑重入 run loop，会重复 append。幂等/去重（或截断 tail）契约由 PR-3 设计。
+3. 测试补：注入 `append_run_message` 失败断言 run 仍 completed（best-effort 契约）；以及 mid-tool cancel/abort 后 assistant 轮带 trailing 未应答 tool_call 的复原信号——这些放到有 resume 消费方的 PR-3 一起断言实际重建，而非只断言落盘形态。
+
 `inline`（TUI/桌面有人在看）保留现有同步阻塞路径；两种模式共用一条 parked 记录，靠 `visibility` 区分。
 
 ### H1 加法迁移（本轮执行）
