@@ -406,14 +406,16 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | PR-2 | 完整 durable resume 行为 | `feat/h3b-durable-resume`：resume 分析器 → 陈旧性重校验 → 启动复原而非全 abort → broker 重挂载既有 pending 审批 → run 从持久化线程续跑。 | **in-progress** |
 
 **resume 架构决定**：采用 **OpenWorker 式完整复原**——parked 审批重现 inbox，人应答后从持久化线程重建 run 继续跑（而非只让审批 durable、run 不续跑的过渡版）。
+**触发模型改为 lazy（实现中确认更简单且正确）**：不在重启时为每个 pending 审批 spawn 一个跨关停存活的 waiter（那会在优雅关停时误 abort、丢 durability）。改为：重启只**重新广播** pending 审批（`assess_restore` 通过的）+ 排除 orphan-sweep；真正的续跑由**人应答时**（resolve）触发 `resume_run`——那时决策已在行上，无需 await。故不需要 `reattach`，用 `settle_resumed`（读已决行、重放授权副作用）即可。
 
 **PR-2 内部进度（breadcrumbs）**：
 - [x] `resume::plan_resume(status, thread) -> ResumePlan`（RunStatus 区分「取消 vs 死在审批」；半应答轮；8 单测）
 - [x] `resume::assess_restore(...)`：工具仍在 + payload 未变（拒「批 A 跑 B」）+ TTL（`iso8601_before` cutoff）；7 单测
-- [ ] `ApprovalBroker::reattach(existing_approval_id)`：不新建行，挂载既有 pending 行 + 注册 waiter + 重发 `approval.required`
-- [ ] agent manager：`resume_run(run_id)` —— 从线程重建 `messages`、快进到挂起的 tool_call、经 reattach 等审批、继续 loop
-- [ ] `server.rs` 启动清扫：`abort_lingering_approvals` → 逐条 `assess_restore`，Restore 则 `resume_run`、Abort 则落 aborted（兜底）；同步修订 C4「全 aborted」验收
-- [ ] append 路径幂等：resume 重入不得重复 append（clestons #70 note 2；截断 tail 或跳过已存 seq）
+- [x] `ToolRegistry::execute_preapproved`：跳过门的执行路径（续跑时决策已在手，不得二次问）；2 单测（含仍强制 whitelist）
+- [x] `ApprovalBroker::settle_resumed` + `GrantCtx::for_resume`：无 waiter 时读已决行、重放 session/target 授权副作用；2 单测
+- [ ] agent manager：`resume_run(run_id)` —— 从线程重建 `messages`、`assess_restore` 复校、`settle_resumed` 结算挂起 call（approved→`execute_preapproved`、denied→喂 reason、abort→cancel）、继续 loop（与 `execute` 共用 loop 主体，需轻量重构）
+- [ ] `server.rs`：启动清扫 `abort_lingering_approvals` → 逐条 `assess_restore`，Restore 则重广播 `approval.required` 并保留 pending、Abort 则落 aborted（兜底）；orphan-sweep 排除「awaiting_approval 且有 pending 审批」；resolve 端在决策落定后对「无 live task 的 run」spawn `resume_run`；同步修订 C4「全 aborted」验收
+- [ ] append 路径幂等：resume 重入不得重复 append（clestons #70 note 2；跳过已存 seq / 截断 tail）
 - [ ] best-effort 契约测试：注入 `append_run_message` 失败断言 run 仍 completed
 - [ ] 端到端：起 daemon → 触发需审批 run → kill → 重启 → 审批重现 → 批准 → run 续跑完成
 
