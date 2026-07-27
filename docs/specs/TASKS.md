@@ -213,9 +213,19 @@ L0 KV（D1）、L1 会话压缩（D1+D5b）、三层路由（D2）全部 merged�
 |---|---|---|---|
 | E1 | agent24-mcp：rmcp client（stdio），MCP 工具以 `mcp_{server}_{tool}` 注入 registry | C8 + 用户确认 | **done** #54 + 接线 |
 | E2 | ~~node-host：现有 5 个 CapabilityModule 经 JSON-RPC 接入内核~~ | E1 | **descoped**（见下方说明） |
-| E3 | module.schema.json 落地 UI Module 规范 + 模块市场页对接 | ~~E2~~ E1 | pending |
-| E4 | agent24d 作为 MCP server 暴露自身工具 | E1 | **in-pr**（`feat/e4-mcp-server`，设计见下；server 模块 + `agent24 mcp` 子命令 + 代理测试） |
+| E3 | module.schema.json 落地 UI Module 规范 + 模块市场页对接 | ~~E2~~ E1 | **in-pr**（校验落地：见下）｜市场浏览 UI 依赖发现服务，归 M4 |
+| E4 | agent24d 作为 MCP server 暴露自身工具 | E1 | **merged #73**（server 模块 + `agent24 mcp` + e2e client↔server 测试） |
 | E5 | PGL manifest（pgl.yml）解析钩子 + AgentStore 元数据展示 | E3 | pending |
+
+### E3 落地范围（2026-07-27）
+
+`module.schema.json`（A2 建）此前**没有任何强制点**——`loadInstalledModule` 只查 manifest 是不是对象。E3 把规范**落地为安装门禁**：
+
+- `packages/node-daemon/src/module-manifest.ts`：`validateManifest(manifest) → string[]`，依 module.schema.json 校验**结构契约**（required 字段齐、类型对、id 匹配 npm pattern、permissions 为字符串数组）；**不**拒绝未知 enum 值/未知字段（schema 自述其 string enum 为开放集、消费者须忽略未知字段——前向兼容）。
+- 接入 `loadInstalledModule`：manifest 不合规 → 记录原因 + 拒绝注册（不再让畸形清单跑到运行期才炸）。**这就是 H10「清单严格校验」的基座**。
+- **drift-guard 测试**：加载 `protocol/module.schema.json`，断言 validator 的 REQUIRED/id-pattern 与 schema 同步——校验规则不会悄悄偏离权威。33 个 node-daemon 测试全绿 + typecheck 净。
+
+**未纳入 E3（归 M4）**：模块市场**浏览/发现** UI——需要发现服务（Nostr 索引 / npm scope 扫描），那是 M4「模块 Marketplace」的活；且 E4 落地后 MCP 已是主力扩展路径，node-daemon 模块系统权重下降，市场 UI 不宜在此刻重投入。E3 交付「规范落地」这一确定有价值、且 H10 依赖的核心。
 
 ### E4 设计（2026-07-27，用户选 P2 后开工）
 
