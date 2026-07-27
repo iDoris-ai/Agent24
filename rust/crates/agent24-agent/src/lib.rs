@@ -24,13 +24,14 @@ use agent24_core::util::{now_iso8601, ulid};
 use agent24_memory::KvStore;
 use agent24_memory::session::{CanonicalSession, CompactionPolicy, Summarizer};
 use agent24_models::router::{ModelRouter, TaskProfile};
-use agent24_models::{CompletionRequest, ModelError, Msg, ToolSpec};
+use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
 use agent24_protocol::{
-    ErrorBody, EventBody, ModelDeltaPayload, Run, RunCancelledPayload, RunCompletedPayload,
-    RunCreate, RunFailedPayload, RunInput, RunOutputPayload, RunStartedPayload, RunStatus,
-    ToolCall, ToolCallStatus, ToolCompletedPayload, ToolCompletedStatus, ToolStartedPayload, Usage,
+    Approval, Decision, ErrorBody, EventBody, ModelDeltaPayload, Run, RunCancelledPayload,
+    RunCompletedPayload, RunCreate, RunFailedPayload, RunInput, RunOutputPayload,
+    RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
+    ToolCompletedStatus, ToolStartedPayload, Usage,
 };
-use agent24_store::{RunPatch, Store, StoreError};
+use agent24_store::{RunMessage, RunPatch, Store, StoreError};
 use agent24_tools::{ToolContext, ToolError, ToolRegistry, summarize_input, truncate};
 use tokio_util::sync::CancellationToken;
 
@@ -80,6 +81,12 @@ const RECENT_HARD_CEILING_FACTOR: usize = 4;
 /// before `run.completed`, so it must be bounded — a stuck summarizer must never
 /// hang a finished run.
 const MEMORY_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a parked approval remains resumable (H3). A restored approval older
+/// than this is too stale to safely continue — the world it was queued against
+/// has likely moved on — so `assess_restore` aborts it. Generous: an overnight
+/// scheduled run must still be answerable the next morning.
+const RESUME_TTL: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
 
 impl SessionMemory {
     pub fn new(kv: KvStore, summarizer: Arc<dyn Summarizer>) -> Self {
@@ -221,6 +228,47 @@ fn add_usage(mut total: Usage, delta: &Usage) -> Usage {
     total.total_tokens = total.total_tokens.saturating_add(delta.total_tokens);
     total.cost_usd += delta.cost_usd;
     total
+}
+
+/// Rebuild the in-memory conversation from a persisted run thread (H3 resume).
+/// The inverse of the agent loop's per-message persistence: a malformed
+/// `tool_calls` value degrades to "no calls" rather than erroring — a row we
+/// cannot parse must never resurrect as a phantom tool request.
+fn thread_to_messages(thread: &[RunMessage]) -> Vec<Msg> {
+    thread
+        .iter()
+        .map(|m| Msg {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            tool_calls: serde_json::from_value(m.tool_calls.clone()).unwrap_or_default(),
+            tool_call_id: m.tool_call_id.clone(),
+        })
+        .collect()
+}
+
+/// The still-unanswered tool calls of the reconstructed thread's LAST
+/// tool-calling assistant turn, in request order. `None` when there is no such
+/// turn (an inconsistent resume — the caller aborts). Returns the full ordered
+/// remainder, so a partially answered fan-out resumes EVERY leftover call, not
+/// just the first — otherwise the model would be handed an assistant turn with
+/// dangling unanswered tool_calls.
+fn unanswered_calls_of_last_turn(messages: &[Msg]) -> Option<Vec<ToolCallRequest>> {
+    let idx = messages
+        .iter()
+        .rposition(|m| m.role == "assistant" && !m.tool_calls.is_empty())?;
+    let answered: std::collections::HashSet<&str> = messages[idx + 1..]
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    Some(
+        messages[idx]
+            .tool_calls
+            .iter()
+            .filter(|c| !answered.contains(c.id.as_str()))
+            .cloned()
+            .collect(),
+    )
 }
 
 pub struct RunManager {
@@ -521,6 +569,237 @@ impl RunManager {
             .ok_or_else(|| AgentError::Store(StoreError::NotFound(format!("run {id}"))))
     }
 
+    /// Resume a run parked awaiting approval whose in-memory task is gone — the
+    /// durable crash-recovery entry point (H3). Called when a human answers an
+    /// approval that a restart re-broadcast: the decision is already on the row,
+    /// so this reconstructs the conversation from the persisted thread, settles
+    /// the parked tool call from that decision, and continues the loop.
+    ///
+    /// Idempotent and supervised, like [`start_run_with_schedule`]: a run not in
+    /// `awaiting_approval`, or one that already has a live task, is a no-op (a
+    /// stale or duplicate trigger must never re-drive); the continuation runs in
+    /// its own task that lands the run terminal on panic and registers a cancel
+    /// token so `cancel_run` works.
+    pub async fn resume_run(
+        self: &Arc<Self>,
+        run_id: String,
+        approval_id: String,
+    ) -> Result<(), AgentError> {
+        let run = self
+            .store
+            .get_run(&run_id)
+            .await?
+            .ok_or_else(|| AgentError::Store(StoreError::NotFound(format!("run {run_id}"))))?;
+        // Only a parked run resumes; anything else is a stale/duplicate trigger.
+        if run.status != RunStatus::AwaitingApproval {
+            return Ok(());
+        }
+        let approval = self
+            .store
+            .get_approval(&approval_id)
+            .await?
+            .ok_or_else(|| {
+                AgentError::Store(StoreError::NotFound(format!("approval {approval_id}")))
+            })?;
+        let thread = self.store.list_run_messages(&run_id).await?;
+
+        // Register the cancel token BEFORE spawning, and refuse if one already
+        // exists: a parked run has no live task, so a present token means another
+        // resume is already in flight — a duplicate trigger must not spawn a second.
+        {
+            let mut cancels = self.cancels.lock().await;
+            if cancels.contains_key(&run_id) {
+                return Ok(());
+            }
+            cancels.insert(run_id.clone(), self.shutdown.child_token());
+        }
+        let token = self
+            .cancels
+            .lock()
+            .await
+            .get(&run_id)
+            .cloned()
+            .unwrap_or_else(|| self.shutdown.child_token());
+
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let rid = run.id.clone();
+            let task = tokio::spawn({
+                let manager = Arc::clone(&manager);
+                async move { manager.drive_resume(run, thread, approval, token).await }
+            });
+            if let Err(err) = task.await
+                && err.is_panic()
+            {
+                tracing::error!("run {rid}: resume task panicked");
+                manager
+                    .finish_failed(&rid, "internal", "run resume panicked")
+                    .await;
+            }
+            manager.cancels.lock().await.remove(&rid);
+        });
+        Ok(())
+    }
+
+    /// Body of a resume: re-validate, reconstruct, settle the parked turn's
+    /// unanswered calls, then hand off to the shared loop.
+    async fn drive_resume(
+        &self,
+        run: Run,
+        thread: Vec<RunMessage>,
+        approval: Approval,
+        cancel: CancellationToken,
+    ) {
+        let run_id = run.id.clone();
+
+        // 1. Locate the suspension point the analyzer agrees on.
+        let crate::resume::ResumePlan::AwaitingToolApproval { tool_call_id, .. } =
+            crate::resume::plan_resume(run.status, &thread)
+        else {
+            tracing::warn!("run {run_id}: not resumable; aborting");
+            self.finish_cancelled(&run_id).await;
+            return;
+        };
+
+        // 2. Staleness re-validation (tool still exists, payload unchanged, TTL).
+        let cutoff = agent24_core::util::iso8601_before(RESUME_TTL);
+        if let crate::resume::RestoreDecision::Abort { reason } = crate::resume::assess_restore(
+            &tool_call_id,
+            &approval.payload,
+            &approval.created_at,
+            run.status,
+            &thread,
+            |name| self.tools.tool_risk_class(name).is_some(),
+            &cutoff,
+        ) {
+            tracing::warn!("run {run_id}: resume aborted — {reason}");
+            self.finish_cancelled(&run_id).await;
+            return;
+        }
+
+        // 3. Reconstruct the conversation and return the run to Running.
+        let mut messages = thread_to_messages(&thread);
+        if let Err(err) = self
+            .store
+            .transition_run(&run_id, RunStatus::Running, RunPatch::default())
+            .await
+        {
+            tracing::error!("run {run_id}: resume transition failed: {err}");
+            return;
+        }
+        self.sink.emit(EventBody::RunStarted(RunStartedPayload {
+            run_id: run_id.clone(),
+            session_id: run.session_id.clone(),
+            schedule_id: run.schedule_id.clone(),
+        }));
+
+        // 4. Answer the parked turn's still-unanswered calls, in order. The first
+        // is the one this approval decided (settle from the row, no second ask);
+        // any calls after it in the same fan-out were never approved, so they go
+        // through the normal gate via run_tool_call (which may itself re-park).
+        let Some(unanswered) = unanswered_calls_of_last_turn(&messages) else {
+            tracing::warn!("run {run_id}: no unanswered parked turn on resume; aborting");
+            self.finish_cancelled(&run_id).await;
+            return;
+        };
+        for call in unanswered {
+            if cancel.is_cancelled() {
+                self.finish_cancelled(&run_id).await;
+                return;
+            }
+            let content = if call.id == tool_call_id {
+                match self
+                    .settle_parked_call(&run, &approval, &call, &cancel)
+                    .await
+                {
+                    Ok(content) => content,
+                    Err(()) => {
+                        self.finish_cancelled(&run_id).await;
+                        return;
+                    }
+                }
+            } else {
+                match self
+                    .run_tool_call(
+                        &run_id,
+                        run.session_id.as_deref(),
+                        run.schedule_id.as_deref(),
+                        &call,
+                        &cancel,
+                    )
+                    .await
+                {
+                    Ok(content) => content,
+                    Err(()) => {
+                        self.finish_cancelled(&run_id).await;
+                        return;
+                    }
+                }
+            };
+            let result = Msg::tool_result(call.id.clone(), content);
+            self.persist_message(&run_id, &result).await;
+            messages.push(result);
+        }
+
+        // 5. Continue the shared loop for subsequent model iterations.
+        self.run_loop(run, messages, cancel).await;
+    }
+
+    /// Settle the ONE parked call whose approval is already decided (H3): apply
+    /// the recorded decision rather than asking again. Returns the tool-result
+    /// content to feed the model, or `Err(())` when the decision was to abort the
+    /// whole run.
+    ///
+    /// KNOWN LIMITATION (fail-closed): an `approve_for_session` /
+    /// `approve_for_target` on a RESTORED approval executes this call but does
+    /// NOT re-mint the standing grant (that lives in the broker, gone with the
+    /// crashed process). The next matching call is simply asked again — safe,
+    /// just not maximally convenient. Recording it needs the broker handle wired
+    /// into the resume path, deferred.
+    async fn settle_parked_call(
+        &self,
+        run: &Run,
+        approval: &Approval,
+        call: &ToolCallRequest,
+        cancel: &CancellationToken,
+    ) -> Result<String, ()> {
+        let decision = approval.decision.clone().unwrap_or_else(|| Decision {
+            kind: "deny".to_owned(),
+            reason: Some("no decision was recorded".to_owned()),
+            extra: serde_json::Map::new(),
+        });
+        match decision.kind.as_str() {
+            "approve" | "approve_for_session" | "approve_for_target" => {
+                let ctx = ToolContext {
+                    run_id: run.id.clone(),
+                    session_id: run.session_id.clone(),
+                    schedule_id: run.schedule_id.clone(),
+                    tool_call_id: call.id.clone(),
+                };
+                // Run EXACTLY what was approved — the payload the human signed
+                // off (assess_restore already proved it equals the thread's
+                // rebuilt input), so using it directly makes "run A, not B"
+                // structural rather than a re-parse we must trust.
+                match self
+                    .tools
+                    .execute_preapproved(&call.name, &ctx, &approval.payload, cancel)
+                    .await
+                {
+                    Ok(out) => Ok(out),
+                    // The whole-run abort choice is honoured even on resume.
+                    Err(ToolError::AbortRun(_)) | Err(ToolError::Cancelled) => Err(()),
+                    Err(err) => Ok(format!("tool error: {err}")),
+                }
+            }
+            "deny" => Ok(format!(
+                "denied by user: {}",
+                decision.reason.as_deref().unwrap_or("no reason given")
+            )),
+            // "abort" or anything unexpected → cancel the run (fail-closed).
+            _ => Err(()),
+        }
+    }
+
     async fn execute(&self, run_id: String, cancel: CancellationToken) {
         // Cancelled before starting? queued → cancelled directly.
         if cancel.is_cancelled() {
@@ -553,18 +832,6 @@ impl RunManager {
             schedule_id: run.schedule_id.clone(),
         }));
 
-        // C3 loop body: completion → tool execution round trips, bounded by
-        // MAX_ITERATIONS. Usage accumulates across iterations.
-        let tool_specs: Vec<ToolSpec> = self
-            .tools
-            .adverts()
-            .into_iter()
-            .map(|a| ToolSpec {
-                name: a.name,
-                description: a.description,
-                parameters: a.parameters,
-            })
-            .collect();
         // D1: a session's prior (compacted) context precedes this turn, so a
         // session actually remembers. Empty when memory is off or session-less.
         // A cancel while waiting on a concurrent run's session lock ends the run
@@ -583,6 +850,26 @@ impl RunManager {
         let user_msg = Msg::user(run.input.prompt.clone());
         self.persist_message(&run_id, &user_msg).await;
         messages.push(user_msg);
+        self.run_loop(run, messages, cancel).await;
+    }
+
+    /// The completion↔tool-execution loop shared by a fresh run ([`execute`]) and
+    /// a resumed one ([`resume_run`]): each builds the `messages` prefix its own
+    /// way (fresh: prior context + prompt; resumed: reconstructed thread + the
+    /// settled parked call), then hands it here. Bounded by MAX_ITERATIONS;
+    /// usage accumulates across iterations.
+    async fn run_loop(&self, run: Run, mut messages: Vec<Msg>, cancel: CancellationToken) {
+        let run_id = run.id.clone();
+        let tool_specs: Vec<ToolSpec> = self
+            .tools
+            .adverts()
+            .into_iter()
+            .map(|a| ToolSpec {
+                name: a.name,
+                description: a.description,
+                parameters: a.parameters,
+            })
+            .collect();
         let mut usage_total = zero_usage();
 
         for _ in 0..MAX_ITERATIONS {
@@ -2028,6 +2315,220 @@ mod approval_tests {
                 "model.delta",
                 "run.completed"
             ]
+        );
+    }
+
+    /// Like [`harness`] but with an EMPTY script: the first model call after a
+    /// resume answers from the last tool result, so the run finishes as soon as
+    /// the parked call has been settled and executed.
+    async fn resume_harness(workdir: std::path::PathBuf) -> Harness {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let tools = ToolRegistry::builtin(workdir)
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let manager = RunManager::new(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(
+                Arc::new(ScriptedProvider::new(vec![])),
+                Tier::Local,
+            )])),
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        Harness {
+            manager,
+            broker,
+            store,
+            events,
+        }
+    }
+
+    /// End-to-end crash recovery (H3): a run parked awaiting approval, its task
+    /// gone, is resumed once a human answers the restored approval — the parked
+    /// tool runs and the run completes, all reconstructed from the persisted
+    /// thread.
+    #[tokio::test]
+    async fn a_parked_run_resumes_after_its_approval_is_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+
+        // Seed the crash state directly: an awaiting_approval run with NO live
+        // task, its thread persisted (user + assistant turn whose trailing
+        // tool_call is unanswered), and a matching pending approval. The
+        // assistant call's arguments MUST equal the approval payload, or
+        // staleness re-validation would (correctly) refuse to run B for A.
+        let args = serde_json::json!({ "argv": ["/bin/echo", "resumed-output"] });
+        let run = Run {
+            id: "run_1".to_owned(),
+            session_id: None,
+            status: RunStatus::AwaitingApproval,
+            input: RunInput {
+                prompt: "run echo".to_owned(),
+                model_override: None,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now_iso8601(),
+            started_at: Some(now_iso8601()),
+            ended_at: None,
+        };
+        h.store.insert_run(&run).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let call = serde_json::json!([{ "id": "call_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = Approval {
+            id: "apr_1".to_owned(),
+            run_id: "run_1".to_owned(),
+            tool_call_id: "call_1".to_owned(),
+            kind: "exec".to_owned(),
+            summary: "shell_exec".to_owned(),
+            payload: args.as_object().unwrap().clone(),
+            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
+            standing_target: None,
+            status: ApprovalStatus::Pending,
+            decision: None,
+            expires_at: now_iso8601(),
+            created_at: now_iso8601(),
+            decided_at: None,
+        };
+        h.store.insert_approval(&approval).await.unwrap();
+
+        // The human answers — no in-memory waiter is woken (the task is gone).
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+        // The daemon resumes the run off the persisted thread.
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+
+        let done = wait_terminal(&h.store, "run_1").await;
+        assert_eq!(done.status, RunStatus::Completed);
+        // The parked shell_exec actually ran on resume; its output flowed into
+        // the final answer.
+        assert!(
+            done.output.unwrap().text.contains("resumed-output"),
+            "the parked tool did not run on resume"
+        );
+        // The reconstructed thread gained the tool result for the parked call.
+        let thread = h.store.list_run_messages("run_1").await.unwrap();
+        assert!(
+            thread
+                .iter()
+                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_1")),
+            "no tool result was recorded for the resumed call"
+        );
+    }
+
+    /// A denied restored approval does not execute the tool: the reason goes
+    /// back to the model and the run still completes (denial is not failure).
+    #[tokio::test]
+    async fn a_denied_parked_run_resumes_without_executing() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let args = serde_json::json!({ "argv": ["/bin/echo", "should-not-run"] });
+        let run = Run {
+            id: "run_1".to_owned(),
+            session_id: None,
+            status: RunStatus::AwaitingApproval,
+            input: RunInput {
+                prompt: "run echo".to_owned(),
+                model_override: None,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now_iso8601(),
+            started_at: Some(now_iso8601()),
+            ended_at: None,
+        };
+        h.store.insert_run(&run).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let call = serde_json::json!([{ "id": "call_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = Approval {
+            id: "apr_1".to_owned(),
+            run_id: "run_1".to_owned(),
+            tool_call_id: "call_1".to_owned(),
+            kind: "exec".to_owned(),
+            summary: "shell_exec".to_owned(),
+            payload: args.as_object().unwrap().clone(),
+            available_decisions: vec!["approve".to_owned(), "deny".to_owned(), "abort".to_owned()],
+            standing_target: None,
+            status: ApprovalStatus::Pending,
+            decision: None,
+            expires_at: now_iso8601(),
+            created_at: now_iso8601(),
+            decided_at: None,
+        };
+        h.store.insert_approval(&approval).await.unwrap();
+
+        h.broker
+            .resolve("apr_1", decision("deny", Some("not this time")))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+
+        let done = wait_terminal(&h.store, "run_1").await;
+        assert_eq!(done.status, RunStatus::Completed);
+        // The denial reason reached the model (echoed by the exhausted script),
+        // and the tool never produced its output.
+        let text = done.output.unwrap().text;
+        assert!(
+            text.contains("not this time"),
+            "denial reason not fed back: {text}"
+        );
+        assert!(
+            !text.contains("should-not-run"),
+            "denied tool ran anyway: {text}"
         );
     }
 

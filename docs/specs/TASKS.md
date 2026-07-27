@@ -413,7 +413,8 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 - [x] `resume::assess_restore(...)`：工具仍在 + payload 未变（拒「批 A 跑 B」）+ TTL（`iso8601_before` cutoff）；7 单测
 - [x] `ToolRegistry::execute_preapproved`：跳过门的执行路径（续跑时决策已在手，不得二次问）；2 单测（含仍强制 whitelist）
 - [x] `ApprovalBroker::settle_resumed` + `GrantCtx::for_resume`：无 waiter 时读已决行、重放 session/target 授权副作用；2 单测
-- [ ] agent manager：`resume_run(run_id)` —— 从线程重建 `messages`、`assess_restore` 复校、`settle_resumed` 结算挂起 call（approved→`execute_preapproved`、denied→喂 reason、abort→cancel）、继续 loop（与 `execute` 共用 loop 主体，需轻量重构）
+- [x] `execute` → `run_loop` 抽取（run/cancel 按值，loop 主体逐字不变；45 旧测全过证行为保持）
+- [x] agent manager：`resume_run(run_id, approval_id)` + `drive_resume` —— 从线程重建 `messages`、`assess_restore` 复校、结算挂起 call（approved→`execute_preapproved` 跑**批准的 payload**、denied→喂 reason、abort→cancel）、半应答轮的剩余 call 走 `run_tool_call`、继续 `run_loop`；supervised spawn + cancel token + 幂等（非 awaiting/已有 task 即 no-op）。2 端到端集成测试（approve 跑工具并完成 / deny 不执行仍完成）。**注**：结算走 store-only 读决策，restored 审批的 `approve_for_session/target` 不重铸授权（fail-closed 下次再问；已在代码注释标 KNOWN LIMITATION）
 - [ ] `server.rs`：启动清扫 `abort_lingering_approvals` → 逐条 `assess_restore`，Restore 则重广播 `approval.required` 并保留 pending、Abort 则落 aborted（兜底）；orphan-sweep 排除「awaiting_approval 且有 pending 审批」；resolve 端在决策落定后对「无 live task 的 run」spawn `resume_run`；同步修订 C4「全 aborted」验收
 - [ ] append 路径幂等：resume 重入不得重复 append（clestons #70 note 2；跳过已存 seq / 截断 tail）
 - [ ] best-effort 契约测试：注入 `append_run_message` 失败断言 run 仍 completed
