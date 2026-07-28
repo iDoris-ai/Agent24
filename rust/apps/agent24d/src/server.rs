@@ -461,6 +461,12 @@ pub async fn serve(
         Arc::clone(&router),
         explorer_tools,
     )));
+    // H5: register self-wake. It creates one-shot schedules in the same store the
+    // scheduler reads, so an agent can schedule its own follow-ups; the woken run
+    // is gated like any other (see self_wake module docs).
+    tools = tools.with(StdArc::new(agent24_agent::self_wake::SelfWakeTool::new(
+        store.clone(),
+    )));
     let mcp_servers = match crate::mcp::config_path() {
         Some(path) => match crate::mcp::load_config(&path) {
             Ok(cfg) => {

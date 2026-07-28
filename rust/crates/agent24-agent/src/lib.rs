@@ -13,6 +13,7 @@
 //! tool call is persisted, evented, and — when denied by policy — audited.
 
 pub mod resume;
+pub mod self_wake;
 pub mod subagent;
 
 use std::collections::HashMap;
