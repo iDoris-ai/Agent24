@@ -219,4 +219,29 @@ describe('Bridge authorization + serialization', () => {
     expect(calls.sends.some((s) => s.includes('已批准'))).toBe(true)
     expect(calls.sends.some((s) => s.includes('已删除'))).toBe(true)
   })
+
+  it('emits a single, FIFO-correct prompt when a resumed run immediately re-parks', async () => {
+    let approvalCall = 0
+    const { bridge, calls } = makeBridge(['alice'], {
+      runToCompletion: async () => ({ status: 'awaiting_approval', runId: 'rA' }),
+      awaitRun: async () => ({ status: 'awaiting_approval', runId: 'rA' }), // resume → re-parks
+      pendingApprovals: async () => {
+        approvalCall++
+        const a =
+          approvalCall === 1
+            ? { id: 'apA', run_id: 'rA', summary: 'A步' }
+            : { id: 'apB', run_id: 'rA', summary: 'B步' }
+        return [{ ...a, available_decisions: ['approve', 'deny'] }]
+      },
+    })
+
+    await bridge.handle(textMsg('alice', '开始')) // parks on A
+    await bridge.handle(textMsg('alice', 'y')) // resolves A, resumed run re-parks on B
+
+    expect(calls.decide).toEqual([{ id: 'apA', decision: 'approve' }])
+    // Exactly one prompt about B — no duplicate deliver()-CTA + surface-next pair.
+    const bPrompts = calls.sends.filter((s) => s.includes('B步'))
+    expect(bPrompts).toHaveLength(1)
+    expect(bPrompts[0]).toContain('还有 1 条待批准') // the FIFO prompt, not deliver()'s own CTA
+  })
 })
