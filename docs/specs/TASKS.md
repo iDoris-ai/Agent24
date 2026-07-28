@@ -215,7 +215,7 @@ L0 KV（D1）、L1 会话压缩（D1+D5b）、三层路由（D2）全部 merged�
 | E2 | ~~node-host：现有 5 个 CapabilityModule 经 JSON-RPC 接入内核~~ | E1 | **descoped**（见下方说明） |
 | E3 | module.schema.json 落地 UI Module 规范 + 模块市场页对接 | ~~E2~~ E1 | **merged #74**（安装门禁校验；市场浏览 UI 归 M4） |
 | E4 | agent24d 作为 MCP server 暴露自身工具 | E1 | **merged #73**（server 模块 + `agent24 mcp` + e2e client↔server 测试） |
-| E5 | PGL manifest（pgl.yml）解析钩子 + AgentStore 元数据展示 | E3 | pending |
+| E5 | PGL manifest（pgl.yml）解析钩子 + AgentStore 元数据展示 | E3 | **deferred（无消费者）**：`pgl` 在 schema/manifest 里只是 RESERVED 占位，AgentStore 尚不存在——同 D4b/D5c「先有消费者再有提供者」，等 AgentStore 真要展示 PGL 元数据时再做。P2 框架完成度以 E4+E3+H10 达成。 |
 
 ### E3 落地范围（2026-07-27）
 
@@ -414,7 +414,7 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H2 | **用户本地风险 override**：glob 规则调整单个工具的 risk_class；**模块/persona 不得写入**；与 Guardian 的优先级明确 | H1, E1 | merged #61 |
 | H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | merged #62 |
 | H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | **merged**（PR-1 #70 + PR-2 #72；P0 完成） |
-| H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending（未阻塞；需专门的 wake 表 + tick 集成，H4 量级） |
+| H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | **in-pr**（时间型 self-wake，见下；事件型 wake_on_event 后置） |
 | H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（下一个 P3 大件；设计见下） |
 | H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
 | H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | **in-pr**（见下） |
@@ -544,6 +544,16 @@ scheduler 的 tick 已存在（`agent24-scheduler/src/lib.rs:202`），按上游
 - **`propose_plan{plan}` 工具**：提交计划 → 经 broker 建「批准此计划」审批；**批准 → loop 内存 `plan_mode=false` → 后续 advertise 全量工具（退出只读）**；拒绝 → run 结束。mode flip 是 loop 内存态。
 - **与 H3 durable resume 的耦合点**：plan-mode run 若 park 在计划审批上再崩溃重启，resume 必须知道它**曾在 plan mode**（否则复原后错误地拿到全量工具）——`RunInput.mode` 持久化 + resume 据此恢复 `plan_mode`。实现时务必接上，别让 resume 绕过只读门。
 - **验收**：plan-mode run 只看得到 read+propose_plan（断言 adverts）；propose_plan 触发审批；批准后同一 run 能用写工具、拒绝则结束；gen:api 无漂移；与 durable resume 的只读恢复有测试。
+- **gen:api 已预验证**（2026-07-28）：`RunMode` enum 加进 openapi 的 RunInput/RunCreate、`pnpm gen:api` 干净生成——工具链无阻塞，实现时直接用。
+
+### H5 落地（2026-07-28，比原估计更省）
+
+原估「需专门的 wake 表 + tick 集成，H4 量级」——**实测不需要新表**。关键发现：`Scheduler::tick()` 每次 tick **重读 store**（`list_schedules_lenient`），所以工具写入的 schedule 下一 tick 就被 fire，无需改 scheduler。
+
+- **`SelfWakeTool`（agent24-agent，持 Store 句柄，仿 H9 ExplorerSubagent 模式）**：agent 调 `self_wake{prompt, after_secs|at}` → 建**一次性** `ScheduleSpec::At` schedule，action=`AgentRun{prompt, session_id=当前 session}`。scheduler fire 后清 `next_run_at`（one-shot 契约），woken run 载入 session 上下文=「向既有 session 投递后台消息」。**关停取消契约白拿**：run 生命周期归 scheduler 管，随其取消。
+- **不门控 + Read 类**：建 schedule 是控制面操作（同 `POST /schedules`，本就不过 tool gate）；危险永远在 woken run 的工具上，那些照常经 C4/D3/H1-H4；且 H3 durable resume 让凌晨审批 park 等人。`MAX_PENDING_WAKES=32` 封顶防刷。理由已在模块 doc 详述。
+- 6 单测（after_secs/at 建一次性 schedule、畸形 at 拒、缺 time/prompt 拒、封顶）。已接入 daemon（`tools.with(SelfWakeTool)`）。
+- **后置**：`wake_on_event`（事件型唤醒）——它不是时间触发，落不进 `At`，需事件订阅机制，单独一片。
 
 ### H10 落地（2026-07-27，紧接 E3）
 
