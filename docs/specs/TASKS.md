@@ -7,6 +7,7 @@
 > 最后更新：2026-07-24（M-A ✅ M-B ✅；C1 merged #35；C2 in-pr #36；alpha tag 待用户确认）；#32/#33/#34 stacked 在审）
 > 2026-07-24 追加 **M-H（从 OpenWorker 借鉴：人机边界）**，并据此修订 G1/G2 的落地形态。
 > 2026-07-26 **发布 v0.2.0**：H1/H2/H4/H12/H9 已合并（人机边界线）。剩 H5/H8 未阻塞待专注做，H3/H10/H11 阻塞于未建的 G1/E3/F3。
+> 2026-07-28 **同步真实状态**：P0（G1+H3 #70/#72）✅、P2（E3 #74/E4 #73/H10 #75）✅、P1 渠道 **F3 微信 #78+#79** ✅、H5 #76 ✅、G3 #77 ✅、C8 #42 ✅。所有 PR 已 merged，无 open PR。**P4 门前剩余可做：H11 → F4 → F1b → H8 → G2**（P1 渠道补齐 + P3 自主性），做完撞 P4 门须用户确认。
 
 ## 执行顺序总览（最佳路径）
 
@@ -137,7 +138,7 @@
 | C5 | Schedule 调度器 | C2 | merged | #39 |
 | C6 | `agent24 tui` 最小版 | C4, C5 | merged | #40 |
 | C7 | 桌面端 Runs/Schedules/Approvals UI | C4, C5 | merged | #41 |
-| C8 | v0.1.0 发布工程 | C6, C7 | in-pr #42  | |
+| C8 | v0.1.0 发布工程 | C6, C7 | merged | #42 |
 
 ### C1 agent24-core + agent24-store
 - core：Run/Session/ToolCall/Approval/Schedule 状态机（纯逻辑，穷举非法转移返回错误）；store：sqlx SQLite migrations（全部实体表 + audit 表含 prev_hash 链）、repo 层。
@@ -289,7 +290,7 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 | F1a | headless 开机自启：`agent24 service install/uninstall/status`（macOS LaunchAgent） | M-D | **done** #51 |
 | F1b | 托盘常驻（菜单栏状态/启停） | F1a | pending |
 | F2 | 崩溃自愈 | F1a | **done** #51（见下方设计变更） |
-| F3 | 微信渠道（**WeChat iLink 官方 Bot API**）：入站消息 → run，审批经微信完成 | C8 + 用户确认 | **in-pr**（`packages/wechat-bridge`，见下） |
+| F3 | 微信渠道（**WeChat iLink 官方 Bot API**）：入站消息 → run，审批经微信完成 | C8 + 用户确认 | **merged #78 + #79**（`packages/wechat-bridge`；#79 加鉴权白名单+per-user 串行+FIFO 审批队列。**实机需用户扫码验证**） |
 | F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | pending |
 | F5 | 7×24 稳定性验证：Mac mini 连续 7 天，日程照跑，无人工干预 | F2 | pending（F1a/F2 已就绪，可开始跑） |
 
@@ -344,7 +345,7 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 |---|---|---|---|
 | G1 | **异步审批队列**：审批可离线批复，批准后再执行；含 payload 完整性校验 | F1a, C4 | pending |
 | G2 | 审批判据补充「对外/不可撤回」维度（现按工具种类分级） | C4 | pending |
-| G3 | CLI wrapper 集成策略（包二进制而非 vendor 源码）写入 SPEC-001 | — | **in-pr**（SPEC-001 §10：进程边界=授权边界，包二进制不 vendor 源码，与 §9/cargo-deny 互补） |
+| G3 | CLI wrapper 集成策略（包二进制而非 vendor 源码）写入 SPEC-001 | — | **merged #77**（SPEC-001 §10：进程边界=授权边界，包二进制不 vendor 源码，与 §9/cargo-deny 互补） |
 
 ### G1 为什么重要（M-F 之后必然撞上）
 
@@ -417,10 +418,10 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H2 | **用户本地风险 override**：glob 规则调整单个工具的 risk_class；**模块/persona 不得写入**；与 Guardian 的优先级明确 | H1, E1 | merged #61 |
 | H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | merged #62 |
 | H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | **merged**（PR-1 #70 + PR-2 #72；P0 完成） |
-| H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | **in-pr**（时间型 self-wake，见下；事件型 wake_on_event 后置） |
+| H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | **merged #76**（时间型 self-wake；事件型 wake_on_event 后置） |
 | H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（下一个 P3 大件；设计见下） |
 | H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
-| H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | **in-pr**（见下） |
+| H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | **merged #75** |
 | H11 | **协议级 Fake 渠道 harness**：FakeWeChat / FakeNostr，让渠道审批与 inbox 可自动测 | F3 | pending |
 | H12 | **provider 错误人话翻译**：额度/权限/模型不存在类错误落成可读文案 | — | merged #65 |
 | H7 | 工具并发三分法（授权串行 → 只读并发 → 写/exec 串行） | H1 | **deferred**（收益不确定，代价高，见下） |
@@ -440,7 +441,7 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | PR | 切片 | 内容 | 状态 |
 |---|---|---|---|
 | PR-1 | 消息线程持久化 | 新 `run_messages` 表 + repo；agent loop 落库 user/assistant/tool。**复原挂起点的地基**。不动协议。 | **merged #70**（clestons v4 APPROVE） |
-| PR-2 | 完整 durable resume 行为 | `feat/h3b-durable-resume`：resume 分析器 → 陈旧性重校验 → 启动复原而非全 abort → resolve 触发 run 从持久化线程续跑。 | **in-pr #72**（21 新测，28 套全绿） |
+| PR-2 | 完整 durable resume 行为 | `feat/h3b-durable-resume`：resume 分析器 → 陈旧性重校验 → 启动复原而非全 abort → resolve 触发 run 从持久化线程续跑。 | **merged #72**（21 新测，28 套全绿） |
 
 **resume 架构决定**：采用 **OpenWorker 式完整复原**——parked 审批重现 inbox，人应答后从持久化线程重建 run 继续跑（而非只让审批 durable、run 不续跑的过渡版）。
 **触发模型改为 lazy（实现中确认更简单且正确）**：不在重启时为每个 pending 审批 spawn 一个跨关停存活的 waiter（那会在优雅关停时误 abort、丢 durability）。改为：重启只**重新广播** pending 审批（`assess_restore` 通过的）+ 排除 orphan-sweep；真正的续跑由**人应答时**（resolve）触发 `resume_run`——那时决策已在行上，无需 await。故不需要 `reattach`，用 `settle_resumed`（读已决行、重放授权副作用）即可。
