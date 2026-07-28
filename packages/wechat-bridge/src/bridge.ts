@@ -30,17 +30,49 @@ export function parseDecision(text: string): 'approve' | 'deny' | null {
 export class Bridge {
   private readonly sessions: Map<string, string>
   private readonly pending = new Map<string, Pending>() // from_user_id -> parked approval
+  // Per-user serialization tail. Handling for one user runs strictly in order so
+  // concurrent messages (double-taps, WeChat retries) can't race on the session
+  // or parked-approval maps. Bounded by the allowlist, so it needs no eviction.
+  private readonly queues = new Map<string, Promise<unknown>>()
 
   constructor(
     private readonly agent: Agent24Client,
     private readonly sender: Sender,
     private readonly store: SessionStore,
+    private readonly allowedUids: ReadonlySet<string>,
   ) {
     this.sessions = store.load()
   }
 
-  /** Entry point for an inbound WeChat message. */
+  /** Entry point for an inbound WeChat message. Enforces authorization, then
+   * serializes handling per user. */
   async handle(msg: WeixinMessage): Promise<void> {
+    const user = msg.from_user_id
+    // Authorization gate — fail-closed. An unlisted sender is dropped and never
+    // answered (so the bot isn't disclosed to strangers); the full id is logged
+    // so the operator can authorize themselves via A24_WECHAT_ALLOWED_UIDS.
+    if (!this.allowedUids.has(user)) {
+      console.warn(
+        `[wechat] 忽略未授权用户 ${user} 的消息；如需授权，将其加入 A24_WECHAT_ALLOWED_UIDS`,
+      )
+      return
+    }
+    await this.enqueue(user, () => this.process(msg))
+  }
+
+  /** Chain `fn` onto this user's serialization tail and return its result. */
+  private enqueue<T>(user: string, fn: () => Promise<T>): Promise<T> {
+    // `.then(fn, fn)` runs regardless of the prior task's outcome; the stored
+    // tail is made non-throwing so one failure can't break the chain.
+    const run = (this.queues.get(user) ?? Promise.resolve()).then(fn, fn)
+    this.queues.set(
+      user,
+      run.catch(() => {}),
+    )
+    return run
+  }
+
+  private async process(msg: WeixinMessage): Promise<void> {
     const user = msg.from_user_id
     const ctx = msg.context_token
     const text = messageText(msg)
@@ -90,6 +122,10 @@ export class Bridge {
         return
       case 'running':
         await this.reply(user, ctx, '还在处理中，完成后我再告诉你。')
+        // Keep polling in the background (detached from this user's queue so new
+        // messages aren't blocked); the final terminal result is re-enqueued so
+        // its pending/session writes stay serialized with everything else.
+        void this.followUp(user, ctx, result.runId)
         return
       case 'awaiting_approval': {
         const approval = (await this.agent.pendingApprovals()).find((a) => a.run_id === result.runId)
@@ -104,6 +140,21 @@ export class Bridge {
       default:
         return
     }
+  }
+
+  /** For a run that hadn't finished within the bounded wait, keep polling in the
+   * background and deliver the terminal result when it lands. Bounded so a run
+   * that never finishes doesn't poll forever. */
+  private async followUp(user: string, ctx: string, runId: string): Promise<void> {
+    const MAX_ROUNDS = 6 // each awaitRun waits RUN_WAIT_TIMEOUT_MS — caps total wall-clock
+    for (let i = 0; i < MAX_ROUNDS; i++) {
+      const result = await this.agent.awaitRun(runId)
+      if (result.status !== 'running') {
+        await this.enqueue(user, () => this.deliver(user, ctx, result))
+        return
+      }
+    }
+    await this.reply(user, ctx, '这个任务还在后台运行，完成后请到桌面端查看结果。')
   }
 
   private async sessionFor(user: string): Promise<string> {

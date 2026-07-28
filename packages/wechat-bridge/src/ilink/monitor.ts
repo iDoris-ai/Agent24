@@ -2,7 +2,7 @@
 // USER message to the handler; skips the bot's own echoes. Ported from heinu1.
 
 import type { ILinkClient } from './client.js'
-import { MessageType, type GetUpdatesResp, type WeixinMessage } from './types.js'
+import { MessageState, MessageType, type GetUpdatesResp, type WeixinMessage } from './types.js'
 import { BASE_INFO, CONFIG } from '../config.js'
 
 type MessageHandler = (msg: WeixinMessage) => void
@@ -37,6 +37,9 @@ export class Monitor {
         if (res.get_updates_buf) this.cursor = res.get_updates_buf
         for (const msg of res.msgs ?? []) {
           if (msg.message_type === MessageType.BOT) continue // skip our own echoes
+          // Only act on finished messages — ignore NEW/GENERATING updates so a
+          // still-composing/streaming message can't trigger a run prematurely.
+          if (msg.message_state !== MessageState.FINISH) continue
           this.onMessage(msg)
         }
       } catch (err) {

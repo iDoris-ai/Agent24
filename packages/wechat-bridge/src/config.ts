@@ -21,6 +21,14 @@ export const CONFIG = {
   RECONNECT_DELAY_MS: 3_000,
   MAX_MSG_LEN: 1800,
 
+  // ── Authorization (SECURITY, fail-closed) ────────────────────────────────
+  // Every inbound message becomes an owner-level agent24d run with tool /
+  // filesystem access, so only explicitly listed WeChat `from_user_id`s may
+  // drive the bridge. With none configured, nobody is authorized (the bridge
+  // drops every message). Set A24_WECHAT_ALLOWED_UIDS to a comma/space-separated
+  // list of ids (an unauthorized sender's full id is logged so you can add it).
+  ALLOWED_UIDS: parseAllowedUids(process.env.A24_WECHAT_ALLOWED_UIDS),
+
   // ── agent24d (the local daemon this bridge drives) ───────────────────────
   // The daemon writes its dynamic port + token to this discovery file (Rust
   // side). Env overrides win for tests / non-standard setups.
@@ -29,6 +37,16 @@ export const CONFIG = {
   // going (the run keeps running on the daemon).
   RUN_WAIT_TIMEOUT_MS: 600_000,
   RUN_POLL_INTERVAL_MS: 1_500,
+}
+
+/** Parse a comma/space-separated allowlist of WeChat user ids into a Set. */
+export function parseAllowedUids(raw: string | undefined): Set<string> {
+  return new Set(
+    (raw ?? '')
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean),
+  )
 }
 
 // iLink `base_info.channel_version`, from the reference implementation.

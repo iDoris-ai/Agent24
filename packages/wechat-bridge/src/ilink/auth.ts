@@ -76,8 +76,9 @@ export async function doQRLogin(): Promise<LoginResult> {
 
 function saveToken(bot_token: string, baseurl: string): void {
   const data: TokenData = { bot_token, baseurl, saved_at: Date.now() }
-  fs.mkdirSync(path.dirname(CONFIG.TOKEN_FILE), { recursive: true })
-  // 0600: the token authorises acting as your WeChat bot — keep it private.
+  // 0700 on the dir + 0600 on the file: the token authorises acting as your
+  // WeChat bot — keep both the file and its parent directory private.
+  fs.mkdirSync(path.dirname(CONFIG.TOKEN_FILE), { recursive: true, mode: 0o700 })
   fs.writeFileSync(CONFIG.TOKEN_FILE, JSON.stringify(data, null, 2), { mode: 0o600 })
 }
 

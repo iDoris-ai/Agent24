@@ -31,7 +31,7 @@ class FileSessionStore implements SessionStore {
 
   save(map: Map<string, string>): void {
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true })
+      fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 })
       fs.writeFileSync(this.file, JSON.stringify(Object.fromEntries(map), null, 2))
     } catch (err) {
       console.error('[wechat] 保存会话映射失败:', err instanceof Error ? err.message : err)
@@ -50,10 +50,19 @@ async function main(): Promise<void> {
   }
   console.log(`[wechat] 已连接 agent24d: ${daemon.base}`)
 
+  if (CONFIG.ALLOWED_UIDS.size === 0) {
+    console.warn(
+      '[wechat] ⚠️  未配置 A24_WECHAT_ALLOWED_UIDS：将拒绝所有消息（fail-closed）。' +
+        '给 bot 发一条消息，日志会打印你的 from_user_id，再把它设进环境变量以授权。',
+    )
+  } else {
+    console.log(`[wechat] 已授权 ${CONFIG.ALLOWED_UIDS.size} 个用户`)
+  }
+
   const { bot_token, baseurl } = await login()
   const client = new ILinkClient(bot_token, baseurl)
   const sender = new Sender(client)
-  const bridge = new Bridge(new Agent24Client(daemon), sender, new FileSessionStore())
+  const bridge = new Bridge(new Agent24Client(daemon), sender, new FileSessionStore(), CONFIG.ALLOWED_UIDS)
 
   const monitor = new Monitor(client, (msg) => {
     void bridge.handle(msg).catch((err) =>
