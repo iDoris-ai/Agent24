@@ -114,6 +114,23 @@ export default function ModulesManagerPage() {
             <div>
               <div style={{ fontWeight: 600, fontSize: 14 }}>{mod.name}</div>
               <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{mod.id} · v{mod.version}</div>
+              {/* H10: show what the module declares it needs, so enabling a
+                  pending-consent module is an informed decision. */}
+              {mod.permissions?.length > 0 && (
+                <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
+                  {mod.permissions.map((p) => (
+                    <span
+                      key={p}
+                      title="此模块声明需要的权限"
+                      style={{
+                        fontSize: 9, padding: '1px 6px', borderRadius: 8,
+                        background: 'rgba(224,160,32,0.12)', color: '#e0a020',
+                        border: '1px solid rgba(224,160,32,0.25)',
+                      }}
+                    >{p}</span>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

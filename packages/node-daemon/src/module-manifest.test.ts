@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
-import { validateManifest, REQUIRED_FIELDS, ID_PATTERN } from './module-manifest'
+import { validateManifest, consentSummary, REQUIRED_FIELDS, ID_PATTERN } from './module-manifest'
 
 function valid(): Record<string, unknown> {
   return {
@@ -71,5 +71,28 @@ describe('validateManifest', () => {
     // RegExp.source escapes the forward slash (`\/`); the schema JSON does not.
     // Normalize before comparing — they are otherwise the same pattern.
     expect(ID_PATTERN.source.replaceAll('\\/', '/')).toBe(schema.properties.id.pattern)
+  })
+})
+
+describe('consentSummary (H10)', () => {
+  it('extracts what the module declares it wants', () => {
+    expect(consentSummary(valid())).toEqual({
+      id: '@acme/weather',
+      name: 'Weather',
+      type: 'headless',
+      permissions: ['network'],
+    })
+  })
+
+  it('falls back to the id when there is no display name', () => {
+    const m = valid()
+    delete m.name
+    expect(consentSummary(m).name).toBe('@acme/weather')
+  })
+
+  it('drops non-string permission entries defensively', () => {
+    const m = valid()
+    m.permissions = ['network', 42, 'filesystem']
+    expect(consentSummary(m).permissions).toEqual(['network', 'filesystem'])
   })
 })

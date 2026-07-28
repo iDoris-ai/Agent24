@@ -7,6 +7,7 @@ import codeboxModule from './capabilities/example-codebox'
 import serviceBoxModule from './capabilities/example-service-box'
 import { discoverInstalledModules, loadInstalledModule } from './module-installer'
 import { startService, stopService } from './boxlite-service'
+import { isEnabled } from './module-state'
 
 // Built-in bundled modules (always present)
 export const MODULES: CapabilityModule[] = [
@@ -51,20 +52,37 @@ export function registerCommunityModule(
   _communityModules.push(mod)
   const router = routerFactory(mod.manifest.id)
   mod.register(router, { ...llmCtx, moduleId: mod.manifest.id })
-  // M3: ensure declared models are loaded — fire and forget, don't block registration
+  // H10: registration only wires INERT routes. A module's declared side effects
+  // — loading models, and (the dangerous one) starting its container, which runs
+  // an arbitrary `startCmd` — must NOT fire until the user has consented. So they
+  // are gated on isEnabled here; a freshly installed community module is disabled
+  // first (see the install handler), so this skips them, and the enable-toggle
+  // starts them once the user opts in.
+  if (isEnabled(mod.manifest.id)) {
+    startModuleServices(mod, llmCtx)
+  }
+  return true
+}
+
+// A module's declared side effects: model loads + service container (whose
+// startCmd is arbitrary code). Extracted so BOTH the register path and the
+// enable-toggle run it only when the module is enabled (H10 consent gate). Fire
+// and forget — never blocks registration/enable.
+export function startModuleServices(
+  mod: CapabilityModule,
+  llmCtx: Omit<CapabilityContext, 'moduleId'>,
+): void {
   if (mod.manifest.models?.length) {
     void llmCtx.llm.ensureModels(mod.manifest.models).catch((err) => {
       console.warn(`[registry] ensureModels failed for ${mod.manifest.id}:`, err)
     })
   }
-  // M4: start service container if declared — non-blocking
   if (mod.manifest.container) {
     void startService(mod.manifest.id, mod.manifest.container).then((r) => {
       if (r.ok) console.log(`[registry] service ${mod.manifest.id} started on :${r.hostPort}`)
       else console.warn(`[registry] service ${mod.manifest.id} failed to start:`, r.error)
     })
   }
-  return true
 }
 
 // Remove a community module from the registry (routes stay until restart).
@@ -85,12 +103,11 @@ export function registerAll(
     const router = routerFactory(mod.manifest.id)
     const ctx: CapabilityContext = { ...llmCtx, moduleId: mod.manifest.id }
     mod.register(router, ctx)
-    // M4: auto-start service containers declared in bundled modules
-    if (mod.manifest.container) {
-      void startService(mod.manifest.id, mod.manifest.container).then((r) => {
-        if (r.ok) console.log(`[registry] service ${mod.manifest.id} started on :${r.hostPort}`)
-        else console.warn(`[registry] service ${mod.manifest.id} failed to start:`, r.error)
-      })
+    // M4/H10: auto-start declared containers for ENABLED modules only. Bundled
+    // modules default to enabled, so they start as before; a disabled one (e.g.
+    // a community module awaiting consent, re-registered on restart) does not.
+    if (isEnabled(mod.manifest.id)) {
+      startModuleServices(mod, llmCtx)
     }
   }
 }
