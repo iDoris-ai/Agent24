@@ -341,7 +341,7 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 |---|---|---|---|
 | G1 | **异步审批队列**：审批可离线批复，批准后再执行；含 payload 完整性校验 | F1a, C4 | pending |
 | G2 | 审批判据补充「对外/不可撤回」维度（现按工具种类分级） | C4 | pending |
-| G3 | CLI wrapper 集成策略（包二进制而非 vendor 源码）写入 SPEC-001 | — | pending |
+| G3 | CLI wrapper 集成策略（包二进制而非 vendor 源码）写入 SPEC-001 | — | **in-pr**（SPEC-001 §10：进程边界=授权边界，包二进制不 vendor 源码，与 §9/cargo-deny 互补） |
 
 ### G1 为什么重要（M-F 之后必然撞上）
 
@@ -415,7 +415,7 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | merged #62 |
 | H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | **merged**（PR-1 #70 + PR-2 #72；P0 完成） |
 | H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | pending（未阻塞；需专门的 wake 表 + tick 集成，H4 量级） |
-| H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（未阻塞；需引入 run/session mode 状态 + 只读强制层） |
+| H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | pending（下一个 P3 大件；设计见下） |
 | H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
 | H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | **in-pr**（见下） |
 | H11 | **协议级 Fake 渠道 harness**：FakeWeChat / FakeNostr，让渠道审批与 inbox 可自动测 | F3 | pending |
@@ -534,6 +534,16 @@ H4 = 对 external 风险的工具提供**更窄的选项**并**停用宽泛选�
 H5 要新增 wake 表 + **「向既有 session 投递后台消息」这个语义本身**。
 scheduler 的 tick 已存在（`agent24-scheduler/src/lib.rs:202`），按上游的 `extra_tick` 位挂进去即可，
 并继承关停契约：**停调度器时把 spawn 出去的 run 一并取消，挂起的 run 不得比调度器活得久**。
+
+### H8 设计（2026-07-28，开工前锁定，值得专注一轮）
+
+单 PR 可做但涉及协议 + loop + 新工具 + 审批四处，是 P3 里的大件。锁定方案：
+
+- **触发**：`RunCreate.mode`（`"plan" | "normal"`，默认 normal；**加法协议** → 触发 `pnpm gen:api` 零漂移门）。client 请求进入 plan mode，记进 `RunInput.mode` 持久化。
+- **只读强制（关键）**：agent loop 读 `run.input.mode`；plan 期**只 advertise `Read` 类工具 + `propose_plan`**——模型看不见 write/exec/external，就调不了（同 H9 explorer 的「结构性只读」，靠不 advertise 而非 dispatch 期拒）。
+- **`propose_plan{plan}` 工具**：提交计划 → 经 broker 建「批准此计划」审批；**批准 → loop 内存 `plan_mode=false` → 后续 advertise 全量工具（退出只读）**；拒绝 → run 结束。mode flip 是 loop 内存态。
+- **与 H3 durable resume 的耦合点**：plan-mode run 若 park 在计划审批上再崩溃重启，resume 必须知道它**曾在 plan mode**（否则复原后错误地拿到全量工具）——`RunInput.mode` 持久化 + resume 据此恢复 `plan_mode`。实现时务必接上，别让 resume 绕过只读门。
+- **验收**：plan-mode run 只看得到 read+propose_plan（断言 adverts）；propose_plan 触发审批；批准后同一 run 能用写工具、拒绝则结束；gen:api 无漂移；与 durable resume 的只读恢复有测试。
 
 ### H10 落地（2026-07-27，紧接 E3）
 
