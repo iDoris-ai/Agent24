@@ -134,3 +134,22 @@ M-A 重构任务需把 CI 扩为三个 job：
 - 不引入 GPL/AGPL 依赖（`cargo deny` 在 M-B 接入 license 检查）；参考 `vendor/reference/` 中 GPL 仓库只读思路、禁止复制代码
 - 凭据不落 git；容器/子进程启动参数不裸拼 shell
 - 遥测/日志不含用户内容原文（审计详情落本地库，日志只记 id/hash/时长）
+
+## 10. 第三方工具集成与授权策略（G3）
+
+§9 禁止把 GPL/AGPL 上游的**源码**复制进本仓库，但没有正面说明「那到底怎么合法用上这些工具」。本节补上这条，供集成 CLI 工具（尤其是我们无法复制其源码的强 copyleft 上游）时遵循。
+
+**核心原则**：调用一个程序不构成对它的演绎作品（derivative work）。
+
+> *invoking a program does not create a derivative work, so this route stays licence-clean even for upstreams whose source we could not copy*（来源：MediaBot `src/core/cli-adapter.ts` 的论证）
+
+即：把上游当成**独立的二进制**去 spawn / 通过 stdin·stdout·argv 通信，与它保持进程边界，**不把它的源码链接/内嵌进我们的作品**——这样即使上游是 GPL，我们的调用方仍保持授权洁净。这与「复制其源码」是两回事：前者合法，后者会让我们的代码被 copyleft 传染。
+
+**规则**：
+
+1. **包二进制，不 vendor 源码**。要集成一个 CLI 工具（git、ripgrep、某个 GPL 命令行程序……）时，作为二进制打包/调用它，不把它的源码拷进 `rust/` 或 `packages/`。二进制随 Release 附带或运行时发现（同 G3 上游做法），而非源码依赖。
+2. **进程边界即授权边界**。通过 `spawn` + **argv 数组**（不裸拼 shell 字符串，见 §9）+ stdin/stdout/exit code 通信。工具是一个被调用的独立作品，不是我们二进制的一部分。
+3. **`vendor/reference/` 只读思路的对照**。`vendor/reference/` 里的 GPL 仓库（如 zerostack）只供**读设计思路**、禁止复制代码；本节说的是另一件事——当我们想**用**某个 GPL *工具*（而非抄它的代码）时，包二进制 + 进程调用是合法路径。
+4. **边界警示**：这条**只**授权「调用独立程序」。它**不**授权把 GPL 源码抄进本树、也不授权把 GPL 库静态/动态链接进我们的二进制——那些仍会产生演绎/传染，属 §9 红线。判断标准：我们分发的是「调用它的代码」还是「它的代码」。
+
+**cargo deny / 依赖检查**（§9）仍然拦截把 GPL/AGPL 作为 **依赖**（源码/库）引入；本节的二进制调用路径不经过依赖树，故不与之冲突——两者共同覆盖了「不抄源码」与「可合法调用」两面。
