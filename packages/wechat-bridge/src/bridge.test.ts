@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { Bridge, parseDecision, type SessionStore } from './bridge.js'
-import type { Agent24Client, RunResult } from './agent24.js'
+import type { Agent24Client, PendingApproval, RunResult } from './agent24.js'
 import type { Sender } from './ilink/sender.js'
 import { parseAllowedUids } from './config.js'
 import { splitText } from './ilink/sender.js'
@@ -86,13 +86,29 @@ describe('Bridge authorization + serialization', () => {
     }
   }
 
+  interface Behavior {
+    runToCompletion?: () => Promise<RunResult>
+    awaitRun?: () => Promise<RunResult>
+    pendingApprovals?: () => Promise<PendingApproval[]>
+    decide?: (id: string, decision: string) => Promise<boolean>
+  }
   interface Fakes {
     bridge: Bridge
-    calls: { createSession: number; runToCompletion: number; sends: string[] }
+    calls: {
+      createSession: number
+      runToCompletion: number
+      decide: { id: string; decision: string }[]
+      sends: string[]
+    }
   }
 
-  function makeBridge(allowed: string[], onRun?: () => Promise<RunResult>): Fakes {
-    const calls = { createSession: 0, runToCompletion: 0, sends: [] as string[] }
+  function makeBridge(allowed: string[], behavior: Behavior = {}): Fakes {
+    const calls = {
+      createSession: 0,
+      runToCompletion: 0,
+      decide: [] as { id: string; decision: string }[],
+      sends: [] as string[],
+    }
     const agent = {
       async createSession(): Promise<string> {
         calls.createSession++
@@ -100,7 +116,19 @@ describe('Bridge authorization + serialization', () => {
       },
       async runToCompletion(): Promise<RunResult> {
         calls.runToCompletion++
-        return onRun ? onRun() : { status: 'completed', text: 'ok', runId: 'r1' }
+        return behavior.runToCompletion
+          ? behavior.runToCompletion()
+          : { status: 'completed', text: 'ok', runId: 'r1' }
+      },
+      async awaitRun(): Promise<RunResult> {
+        return behavior.awaitRun ? behavior.awaitRun() : { status: 'completed', text: 'done', runId: 'r1' }
+      },
+      async pendingApprovals(): Promise<PendingApproval[]> {
+        return behavior.pendingApprovals ? behavior.pendingApprovals() : []
+      },
+      async decide(id: string, decision: string): Promise<boolean> {
+        calls.decide.push({ id, decision })
+        return behavior.decide ? behavior.decide(id, decision) : true
       },
     } as unknown as Agent24Client
     const sender = {
@@ -133,14 +161,16 @@ describe('Bridge authorization + serialization', () => {
     let release!: () => void
     const gate = new Promise<void>((r) => (release = r))
     let firstRunStarted = false
-    const { bridge, calls } = makeBridge(['alice'], async () => {
-      // Hold the first run open so the second message would race sessionFor if
-      // handling weren't serialized.
-      if (!firstRunStarted) {
-        firstRunStarted = true
-        await gate
-      }
-      return { status: 'completed', text: 'ok', runId: 'r' }
+    const { bridge, calls } = makeBridge(['alice'], {
+      runToCompletion: async () => {
+        // Hold the first run open so the second message would race sessionFor if
+        // handling weren't serialized.
+        if (!firstRunStarted) {
+          firstRunStarted = true
+          await gate
+        }
+        return { status: 'completed', text: 'ok', runId: 'r' }
+      },
     })
     const p1 = bridge.handle(textMsg('alice', 'one'))
     const p2 = bridge.handle(textMsg('alice', 'two'))
@@ -148,5 +178,70 @@ describe('Bridge authorization + serialization', () => {
     await Promise.all([p1, p2])
     expect(calls.runToCompletion).toBe(2)
     expect(calls.createSession).toBe(1) // reused, created exactly once
+  })
+
+  it('replies with an error instead of going silent when a daemon call throws', async () => {
+    const { bridge, calls } = makeBridge(['alice'], {
+      runToCompletion: async () => {
+        throw new Error('daemon down')
+      },
+    })
+    await bridge.handle(textMsg('alice', '做点事'))
+    // The user is never left without a reply; the error surfaces.
+    expect(calls.sends.some((s) => s.includes('处理出错') && s.includes('daemon down'))).toBe(true)
+  })
+
+  it('queues parked approvals and resolves them FIFO', async () => {
+    const approval: PendingApproval = {
+      id: 'ap1',
+      run_id: 'r1',
+      summary: '删除 ~/notes.txt',
+      available_decisions: ['approve', 'deny'],
+    }
+    const { bridge, calls } = makeBridge(['alice'], {
+      runToCompletion: async () => ({ status: 'awaiting_approval', runId: 'r1' }),
+      pendingApprovals: async () => [approval],
+      awaitRun: async () => ({ status: 'completed', text: '已删除', runId: 'r1' }),
+    })
+
+    // First message parks on approval — the summary is surfaced to the user.
+    await bridge.handle(textMsg('alice', '删掉笔记'))
+    expect(calls.sends.some((s) => s.includes('需要你批准') && s.includes('删除 ~/notes.txt'))).toBe(true)
+
+    // A non-decision reply nudges (with count + summary), without deciding.
+    await bridge.handle(textMsg('alice', '在吗'))
+    expect(calls.sends.some((s) => s.includes('1 条待批准') && s.includes('删除 ~/notes.txt'))).toBe(true)
+    expect(calls.decide).toHaveLength(0)
+
+    // "y" resolves the oldest approval and delivers the resumed run's outcome.
+    await bridge.handle(textMsg('alice', 'y'))
+    expect(calls.decide).toEqual([{ id: 'ap1', decision: 'approve' }])
+    expect(calls.sends.some((s) => s.includes('已批准'))).toBe(true)
+    expect(calls.sends.some((s) => s.includes('已删除'))).toBe(true)
+  })
+
+  it('emits a single, FIFO-correct prompt when a resumed run immediately re-parks', async () => {
+    let approvalCall = 0
+    const { bridge, calls } = makeBridge(['alice'], {
+      runToCompletion: async () => ({ status: 'awaiting_approval', runId: 'rA' }),
+      awaitRun: async () => ({ status: 'awaiting_approval', runId: 'rA' }), // resume → re-parks
+      pendingApprovals: async () => {
+        approvalCall++
+        const a =
+          approvalCall === 1
+            ? { id: 'apA', run_id: 'rA', summary: 'A步' }
+            : { id: 'apB', run_id: 'rA', summary: 'B步' }
+        return [{ ...a, available_decisions: ['approve', 'deny'] }]
+      },
+    })
+
+    await bridge.handle(textMsg('alice', '开始')) // parks on A
+    await bridge.handle(textMsg('alice', 'y')) // resolves A, resumed run re-parks on B
+
+    expect(calls.decide).toEqual([{ id: 'apA', decision: 'approve' }])
+    // Exactly one prompt about B — no duplicate deliver()-CTA + surface-next pair.
+    const bPrompts = calls.sends.filter((s) => s.includes('B步'))
+    expect(bPrompts).toHaveLength(1)
+    expect(bPrompts[0]).toContain('还有 1 条待批准') // the FIFO prompt, not deliver()'s own CTA
   })
 })
