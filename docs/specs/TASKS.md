@@ -289,20 +289,23 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 | F1a | headless 开机自启：`agent24 service install/uninstall/status`（macOS LaunchAgent） | M-D | **done** #51 |
 | F1b | 托盘常驻（菜单栏状态/启停） | F1a | pending |
 | F2 | 崩溃自愈 | F1a | **done** #51（见下方设计变更） |
-| F3 | 微信渠道（iDoris-SDK / @agent-wechat）：入站消息 → run，审批可经微信完成 | C8 + 用户确认 | pending |
+| F3 | 微信渠道（**WeChat iLink 官方 Bot API**）：入站消息 → run，审批经微信完成 | C8 + 用户确认 | **in-pr**（`packages/wechat-bridge`，见下） |
 | F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | pending |
 | F5 | 7×24 稳定性验证：Mac mini 连续 7 天，日程照跑，无人工干预 | F2 | pending（F1a/F2 已就绪，可开始跑） |
 
-### F3 技术栈参考（2026-07-27，用户指路 `~/Dev/mycelium/blog`）
+### F3 落地：WeChat iLink 官方 Bot API（2026-07-28，用户指路 `~/Dev/tools/heinu1`）
 
-调研 blog 项目后确认微信有**两条不同的路**，F3 要的是第二条：
+**技术栈修正**：早前以为走公众号 MP API，实际用户已用 **WeChat iLink 官方 Bot API**（`https://ilinkai.weixin.qq.com`，`weixin.qq.com` 域，非第三方）跑通——参考实现 heinu1（`bot/src/ilink/`）。核心是**扫码登录**拿 `bot_token`，再走长轮询收发消息。**没有 npm SDK**——协议是一层薄 HTTP（headers `AuthorizationType: ilink_bot_token` + `Bearer <token>` + `X-WECHAT-UIN`）。
 
-| 路 | 来源 | 用途 | 与 F3 关系 |
-|---|---|---|---|
-| 公众号**发布**（草稿/群发） | blog `pipeline/m2/index.js`（Node）；官方 MP API，auth = `WECHAT_APP_ID`(wx…)+`WECHAT_APP_SECRET`+`WECHAT_MP_ID`(gh_…)，access_token 流 | **出站**发文章 | 提供**账号 + 官方 API auth 模式**；但不是 F3 的对话流 |
-| 公众号**消息**（收/回） | 组织自有 **@agent-wechat/core**（已发布 npm）+ Agent-WeChat-SDK（WeChat→Nostr 转发，github.com/MushroomDAO/Agent-WeChat-SDK） | **双向对话**：入站消息→run，回复经微信 | **这才是 F3 的正解** |
+- **QR 登录**：`GET /ilink/bot/get_bot_qrcode?bot_type=3` → 展示二维码 → 轮询 `get_qrcode_status` → `confirmed` 拿 `bot_token`+`baseurl`，持久化（用户**扫一次**）。
+- **收**：长轮询 `POST /ilink/bot/getupdates`（cursor `get_updates_buf`）→ `msgs[]`。
+- **发**：`POST /ilink/bot/sendmessage`（`item_list[{type TEXT, text_item}]`，超长切 1800）。
 
-**F3 落地要点**（开工时展开）：入站需公众号服务器配置（webhook 收消息）或走 @agent-wechat 的桥；服务号可用**客服消息**在 48h 窗口内主动回复（审批卡片/结果）。账号可复用 blog 的 MP（`gh_ba9082b3a7aa`）。**审批经微信**：把 `approval.required` 渲染成微信消息，用户回「批准/拒绝」→ 映射成 `POST /approvals/{id}` decision。这与刚做完的 durable resume 天然契合（离线审批→resume_run 续跑）。
+**落地形态（用户确认：Node 包移植）**：新建 `packages/wechat-bridge`（TS），把 heinu1 的 `ilink/`（auth/client/monitor/sender/types）搬过来，接线到 **agent24d v1 HTTP API**（而非 spawn claude）：
+- 每个微信用户 ↔ 一个 agent24 session（`daemon.json` 自动发现 daemon）；入站消息 → `POST /runs` → 轮询 → `sendmessage` 回结果。
+- **审批经微信 + durable resume 组合**：run park 在审批上 → 发「需要批准：<summary> 回复 y/n」→ 用户回 y → `POST /approvals/{id}` → **daemon `resume_run` 续跑**（H3）→ 再 await → 回最终输出。F3 与 H3 天然契合。
+- 测试：`parseDecision`/`splitText`/`messageText` 纯逻辑（7 测）+ typecheck 绿。**实机**需用户扫码验证（凭据链）。
+- **后置**：图片/语音/文件（当前只文字）、会话映射持久化已做（`wechat-sessions.json`）、launchd 常驻（同 heinu1）。
 
 ### F1a/F2 设计变更（2026-07-24，#51）
 
