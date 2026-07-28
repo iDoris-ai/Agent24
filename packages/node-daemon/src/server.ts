@@ -10,12 +10,13 @@ import {
   getAllModules,
   loadCommunityModules,
   registerCommunityModule,
+  startModuleServices,
   unregisterCommunityModule,
 } from './capability-registry'
 import { loadState, isEnabled, setEnabled } from './module-state'
 import { installModule, uninstallModule, loadInstalledModule } from './module-installer'
 import { consentSummary } from './module-manifest'
-import { proxyToService, getHostPort, stopAll } from './boxlite-service'
+import { proxyToService, getHostPort, stopAll, stopService } from './boxlite-service'
 import { EventsHub } from './v1/events-hub'
 import { createV1Handler } from './v1/routes'
 import type { SimpleRouter, RouteContext, RouteHandler } from './capabilities/base'
@@ -132,9 +133,22 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       send(res, 404, { error: 'Unknown module', id })
       return
     }
-    const action = enableMatch[2] as 'enable' | 'disable'
-    setEnabled(id, action === 'enable')
-    send(res, 200, { ok: true, id, enabled: action === 'enable' })
+    const enabling = enableMatch[2] === 'enable'
+    if (!setEnabled(id, enabling)) {
+      send(res, 500, { error: 'Could not persist module state', id })
+      return
+    }
+    // H10: the module's side effects (container/models) follow consent, not
+    // registration — start them on enable, stop them on disable. This makes the
+    // gate and its teardown symmetric: enabling is where the container's startCmd
+    // actually runs, and disabling stops the container it started.
+    const mod = getAllModules().find((m) => m.manifest.id === id)
+    if (enabling) {
+      if (mod) startModuleServices(mod, { llm: gateway })
+    } else {
+      void stopService(id)
+    }
+    send(res, 200, { ok: true, id, enabled: enabling })
     return
   }
 
@@ -158,18 +172,24 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       send(res, 500, { ok: false, error: 'Package installed but does not export a valid CapabilityModule — rolled back' })
       return
     }
-    registerCommunityModule(mod, buildRouter, { llm: gateway })
-    // H10: a freshly installed community module is DISABLED pending the user's
-    // explicit consent — it must not start acting the moment it lands. Its routes
-    // are registered but return 503 (see isEnabled gate above) until the user
-    // reviews the permission summary and enables it. Built-ins are unaffected:
-    // they never go through this install path.
+    // H10: record the module as DISABLED *before* registering it, so registration
+    // skips its declared side effects — loading models and, critically, starting
+    // its container (which runs an arbitrary `startCmd`). A freshly installed
+    // community module must not act until the user reviews the permission summary
+    // and enables it; the enable-toggle is what starts those side effects. If we
+    // cannot durably persist the disabled state, roll the install back rather
+    // than leave a module we can't record as un-consented (fail-closed).
     //
-    // Note the module install path deliberately touches NO risk-override / trust
-    // state (the H2 inviolable rule): a package may DECLARE the permissions it
-    // wants, but only the user decides to enable it. node-daemon has no path to
-    // the daemon's override store, so this holds by construction here.
-    setEnabled(mod.manifest.id, false)
+    // The install path also touches NO risk-override / trust state (H2's
+    // inviolable rule): a package may DECLARE permissions, but only the user
+    // decides to enable it. node-daemon has no path to the daemon's override
+    // store, so this holds by construction.
+    if (!setEnabled(mod.manifest.id, false)) {
+      await uninstallModule(packageName)
+      send(res, 500, { ok: false, error: 'Could not persist the module as disabled (pending consent) — rolled back' })
+      return
+    }
+    registerCommunityModule(mod, buildRouter, { llm: gateway })
     send(res, 200, {
       ok: true,
       id: mod.manifest.id,

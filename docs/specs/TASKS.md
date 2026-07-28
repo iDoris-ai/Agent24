@@ -540,7 +540,7 @@ scheduler 的 tick 已存在（`agent24-scheduler/src/lib.rs:202`），按上游
 建立在 E3 校验之上，三条 inviolable 全部到位：
 
 1. **清单严格校验** —— E3 的 `validateManifest` 已在 `loadInstalledModule` 做安装门禁（畸形清单不注册）。
-2. **安装后默认 disabled pending consent** —— 此前 `module-state` 默认 **enabled**（`isEnabled` 返回 `!== false`）。install handler 现在装完即 `setEnabled(id, false)`：模块注册但路由 503，直到用户显式启用。内置模块不走此路径，不受影响。
+2. **安装后默认 disabled pending consent** —— 此前 `module-state` 默认 **enabled**。**关键修正（clestons #75 抓到）**：`registerCommunityModule` 会无条件 `startService`（执行容器 `startCmd` = 任意代码）+ `ensureModels`，路由级 `isEnabled` 门只挡 HTTP 访问、挡不住注册期的容器启动——所以带 `container` 的模块一装就跑了 startCmd。**修法**：先 `setEnabled(id,false)` **再** register；`startModuleServices`（models+container）抽出来，register/registerAll 都 **gate 在 `isEnabled`**；enable-toggle 才真正启动服务、disable 停容器（对称生命周期）；`setEnabled` 改返回布尔，install 持久化失败即回滚（fail-closed，堵住「持久化失败+重启→默认 enabled」的 fail-open）。e2e 测试断言 disabled 模块**不**启容器、enable 才启。内置模块默认 enabled 不受影响。
 3. **安装绝不写 override** —— node-daemon 模块安装**没有任何路径**能触到 daemon 的 risk-override 存储（H2 的 inviolable 规则），架构上天然成立；已在 install handler 注释写明。模块只能*声明*想要什么权限，是否信任由用户决定。
 
 **知情同意**：install 响应新增 `pendingConsent: true` + `consent`（`consentSummary`：id/name/type/permissions）；桌面 `ModulesManager` 卡片现在展示每个模块**声明的权限 chips**，用户在启用（=同意）前能看到它要什么。

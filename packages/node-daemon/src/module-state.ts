@@ -30,13 +30,20 @@ export function isEnabled(moduleId: string): boolean {
   return _state[moduleId] !== false  // default: enabled
 }
 
-export function setEnabled(moduleId: string, enabled: boolean): void {
+// Returns whether the new state was DURABLY persisted. Callers that rely on the
+// state surviving a restart (H10: "disabled pending consent" must not silently
+// revert to enabled after a crash) treat `false` as a hard failure — e.g. the
+// installer rolls the install back rather than leave a module it cannot record
+// as disabled.
+export function setEnabled(moduleId: string, enabled: boolean): boolean {
   _state[moduleId] = enabled
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true })
     fs.writeFileSync(STATE_FILE, JSON.stringify(_state, null, 2))
+    return true
   } catch (err) {
     console.error('[module-state] failed to persist state:', err)
+    return false
   }
 }
 
