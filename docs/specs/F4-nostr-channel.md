@@ -55,19 +55,63 @@ agent24d  ◀─HTTP─▶  packages/nostr-bridge  ◀─驱动─▶  agent-spe
 
 ---
 
-## 4. 最简通信协议（agent24 侧 5 个动词）
+## 4. 通信协议:信封 + 意图（v2,已经 Codex 对抗式定稿）
 
-对齐 agent-speaker L3，映射到**已实现命令**。agent24 对上层只暴露这几条：
+> 定稿源:2026-07-29 与用户讨论 + Codex 挑战。取代早前的「5 动词」草案(register/post/search/answer/subscribe)——那把「传输语义」和「协作意图」混在了一起。
 
-| # | 动词 | 语义 | 落到 agent-speaker |
-|---|---|---|---|
-| 1 | **register** | 宣告身份 + 业务能力到网络花名册（**首次默认注册**，见 §5） | `profile publish` |
-| 2 | **post** | 向某 agent 或网络发消息/请求 | `agent msg --to <npub>` / broadcast |
-| 3 | **search** | 按能力/标签定位 agent | `profile discover --capability X` |
-| 4 | **answer** | 对入站消息的定向回复 | `agent msg --to <发件 npub>` |
-| 5 | **subscribe** | 接收入站 → 触发 gated run | `daemon` + `history inbox` |
+**核心分层（三层各司其职）**:
 
-未来第 6 条 **tip**（跨 relay 付费，AAstar Point）——先不做，遵循「先有消费者再有提供者」。
+| 层 | 谁 | 管什么 |
+|---|---|---|
+| 传输原子 | **agent-speaker(喇叭)** | 签名+加密 emit event、按 filter subscribe、身份密钥、relay 路由 |
+| **信封 + 关联** | **F4(本渠道)** | 3 个信封动词 + 会话关联字段——收方靠它路由/过滤 |
+| **意图 + 动作分解** | **agent24 的 LLM（run loop / H8 plan mode）** | 从用户自然语言现场抽意图、拆成动作序列。**不写死** |
+
+### 4.1 信封（动词,3 个,固定,与 speaker 约定）
+
+| 信封 | 协作语义 | Nostr 传输形态 |
+|---|---|---|
+| **say** | 定向 1:1（加密给某 npub） | 一次性 event（NIP-44 加密）→ `agent msg --to` |
+| **announce** | **广播发布**（1:多:公告、feed、CFP、公开任务、profile/能力）——**明确是"广播发布",不等同于 Nostr replaceable"最新状态"**（可替换只是其中一种） | event / replaceable event（视是否"最新状态"）→ `profile publish` / `nostr publish` |
+| **listen** | 订阅关注（某 npub / 某 topic） | subscription filter(REQ)→ `daemon` + `history inbox` / `profile discover` |
+
+- **register / discover 不单列**——它们是 `announce` / `listen` 到「目录/profile 主题」的特例。
+- 首次默认注册 = 一次 `announce`(profile 能力,见 §5)。
+
+### 4.2 意图（content 字段,开放枚举,AI 现生成）
+
+**意图不做成动词**（参照 FIPA-ACL performative-as-field、A2A message/parts+role、MCP method/params）——做成动词会让协议膨胀、并锁死 LLM 现场抽意图的开放性。意图是 `content` JSON 里的一个开放枚举字段,协议**只给推荐词表、不封死语义空间**:
+
+`ask` · `answer` · `offer` · `accept` · `decline` · `inform` · `report` · `cfp`(招标) · `ack` · `tip`(交易) · …
+
+Searle 五类言语行为都由它承载:directive→`ask`/`cfp`,commissive→`offer`/`accept`/`decline`,assertive→`inform`/`report`。**不做协议级状态机**——多轮谈判/竞标靠稳定**关联字段**(见 4.3),而非把工作流写死进协议(否则 F4 从通信基线蜕变成工作流引擎)。
+
+### 4.3 content JSON schema（信封的载荷,必需字段）
+
+```jsonc
+{
+  "version": "f4/1",          // schema 版本
+  "intent": "ask",            // 开放枚举意图(4.2)
+  "thread_id": "<ulid>",      // 会话关联:多轮/竞标靠它串起来
+  "reply_to": "<event_id>",   // 回哪条(answer/accept 必填)
+  "topic": "textile-outreach",// 主题(路由/漂流瓶向量匹配)
+  "tags": ["textile", "b2b"], // 过滤标签
+  "payload": { },             // 意图相关的自由载荷(AI 生成)
+  "expires_at": 1730000000,   // 生命周期:目录/报价/任务过期,防长期污染
+  "status": "ok",             // 可选:异步任务回执 ok|working|failed
+  "error": null               // 失败时的结构化错误(status=failed 时)
+}
+```
+
+- **不带 `sender/from`**——Nostr 事件已带签名 pubkey,即身份,无需重复。
+- `thread_id` + `reply_to` 是 Codex 定稿里唯一"协议级必须"的关联位:没有它,多轮协作没法串联。
+- `expires_at` / `status` / `error` 是 Codex 补的两处:防目录/报价长期污染、让异步失败可读而非猜自由文本。
+
+### 4.4 意图与动作分解由谁做
+
+**不是我们写死,也不一定是单独的小模型——是 agent24 自己的 agent loop(H8 plan mode)。** 用户说「找女朋友」→ agent 现推出动作序列(`announce` 档案 → `announce` 诉求 CFP → `listen` 匹配 → `say` 私聊),plan mode 让这串动作**人可先批**再执行。廉价意图打标/匹配可用本地小模型(D2/D3),但目标→动作分解是**整个 agent 的推理**。
+
+未来 `tip`(跨 relay 付费,AAstar Point)作为一个意图接入,不是新信封——先不做,遵循「先有消费者再有提供者」。
 
 ---
 
