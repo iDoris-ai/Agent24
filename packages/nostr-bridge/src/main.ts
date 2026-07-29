@@ -27,7 +27,10 @@ async function main(): Promise<void> {
   }
   console.log(`[nostr] 已连接 agent24d: ${daemon.base}`)
 
-  const speaker = new SpeakerClient(cliRunner(CONFIG.SPEAKER_BIN), CONFIG.RELAY || undefined)
+  const speaker = new SpeakerClient(cliRunner(CONFIG.SPEAKER_BIN), {
+    identity: CONFIG.IDENTITY,
+    relay: CONFIG.RELAY || undefined,
+  })
   const agent = new Agent24Client(daemon)
 
   // ── register (default): publish business capabilities so peers can find us ──

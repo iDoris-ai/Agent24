@@ -83,7 +83,8 @@ describe('NostrBridge outbound (real bridge + SpeakerClient vs fake agent-speake
 
     const call = fake.calls.find((c) => c.args[0] === 'profile' && c.args[1] === 'publish')
     expect(call).toBeDefined()
-    expect(call!.args).toEqual(expect.arrayContaining(['--from', '--json-file', '--json']))
+    expect(call!.args).toEqual(expect.arrayContaining(['--as', '--json-file', '--json']))
+    expect(call!.publishedProfile?.mode).toBe('structured') // capabilities ⇒ structured (联调)
     // the file the CLI actually received parsed back to the business profile
     expect(call!.publishedProfile?.name).toBe('alice-agent')
     expect(call!.publishedProfile?.capabilities?.[0]?.name).toBe('触达纺织业客户群')
