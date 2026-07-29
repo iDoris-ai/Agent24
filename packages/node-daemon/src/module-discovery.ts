@@ -93,3 +93,52 @@ export async function discoverModules(
   }
   return [...byName.values()].sort((a, b) => a.packageName.localeCompare(b.packageName))
 }
+
+/** Marketplace browse filters (ROADMAP: 浏览面板 搜索 + 过滤). All optional and
+ * ANDed together; an absent field doesn't constrain. */
+export interface ModuleFilter {
+  /** Case-insensitive substring, matched across packageName + name + description. */
+  query?: string
+  /** Keep only this trust tier. */
+  trustTier?: TrustTier
+  /** `true` → only already-installed; `false` → only not-installed; absent → both. */
+  installed?: boolean
+}
+
+const TRUST_TIERS: readonly TrustTier[] = ['official', 'community', 'third-party']
+
+/** Narrow a filter value from an untrusted query string. Returns undefined for
+ * an unknown tier so a bad `?tier=` degrades to "no tier filter" rather than
+ * silently matching nothing. */
+export function parseTrustTier(value: string | undefined): TrustTier | undefined {
+  return value && (TRUST_TIERS as readonly string[]).includes(value)
+    ? (value as TrustTier)
+    : undefined
+}
+
+/** Parse the `installed` query param: only the explicit strings 'true'/'false'
+ * constrain; anything else (including absent) means "don't filter by installed". */
+export function parseInstalledFilter(value: string | undefined): boolean | undefined {
+  if (value === 'true') return true
+  if (value === 'false') return false
+  return undefined
+}
+
+/** Apply browse filters to a discovered-module list. Pure over its input — the
+ * network fetch already happened in {@link discoverModules}; this is what the
+ * marketplace search box + tier/installed toggles drive. */
+export function filterModules(
+  modules: readonly DiscoveredModule[],
+  filter: ModuleFilter = {},
+): DiscoveredModule[] {
+  const q = filter.query?.trim().toLowerCase()
+  return modules.filter((m) => {
+    if (filter.trustTier && m.trustTier !== filter.trustTier) return false
+    if (filter.installed !== undefined && m.installed !== filter.installed) return false
+    if (q) {
+      const hay = `${m.packageName} ${m.name} ${m.description}`.toLowerCase()
+      if (!hay.includes(q)) return false
+    }
+    return true
+  })
+}

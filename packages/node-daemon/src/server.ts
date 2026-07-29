@@ -20,7 +20,12 @@ import {
   loadInstalledModule,
   discoverInstalledModules,
 } from './module-installer'
-import { discoverModules } from './module-discovery'
+import {
+  discoverModules,
+  filterModules,
+  parseTrustTier,
+  parseInstalledFilter,
+} from './module-discovery'
 import { consentSummary } from './module-manifest'
 import { proxyToService, getHostPort, stopAll, stopService } from './boxlite-service'
 import { EventsHub } from './v1/events-hub'
@@ -265,10 +270,18 @@ function registerCoreRoutes(): void {
   // M4 marketplace: discover installable modules from the npm registry, tagged
   // with trust tier and whether each is already installed locally. The browse
   // UI + one-click install build on this; consent is still shown at install (H10).
+  // Browse filters (all optional, ANDed): ?q=<text>&tier=official|community|
+  // third-party&installed=true|false — this is what the marketplace search box
+  // and tier/installed toggles drive.
   routes.set('GET /api/modules/discover', {
-    handler: async () => {
+    handler: async (ctx) => {
       const installed = new Set(discoverInstalledModules().map((m) => m.packageName))
-      return discoverModules({ installed })
+      const all = await discoverModules({ installed })
+      return filterModules(all, {
+        query: ctx.query.q,
+        trustTier: parseTrustTier(ctx.query.tier),
+        installed: parseInstalledFilter(ctx.query.installed),
+      })
     },
     moduleId: 'system',
   })
