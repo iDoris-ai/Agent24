@@ -79,16 +79,24 @@ describe('NostrBridge outbound (real bridge + SpeakerClient vs fake agent-speake
   it('register: transforms YAML → agent-speaker JSON and publishes it via --json-file', async () => {
     const fake = new FakeSpeaker()
     const p = loadAgent24Profile(PROFILE_YAML)
-    await bridge(fake).register('alice-agent', p, 2_000_000_000_000)
+    const { result } = await bridge(fake).register('alice-agent', p, 2_000_000_000_000)
 
     const call = fake.calls.find((c) => c.args[0] === 'profile' && c.args[1] === 'publish')
     expect(call).toBeDefined()
-    expect(call!.args).toContain('--from')
-    expect(call!.args).toContain('--json-file')
+    expect(call!.args).toEqual(expect.arrayContaining(['--from', '--json-file', '--json']))
     // the file the CLI actually received parsed back to the business profile
     expect(call!.publishedProfile?.name).toBe('alice-agent')
     expect(call!.publishedProfile?.capabilities?.[0]?.name).toBe('触达纺织业客户群')
     expect(JSON.stringify(call!.publishedProfile)).not.toContain('post_xiaohongshu')
+    // consumes PR #29's structured publish result
+    expect(result.published_to).toBe(1)
+  })
+
+  it('register: fails when the profile reached no relays', async () => {
+    const fake = new FakeSpeaker()
+    fake.publishResult = { name: 'x', published_to: 0, relay_count: 0, relays: [] }
+    const p = loadAgent24Profile(PROFILE_YAML)
+    await expect(bridge(fake).register('x', p)).rejects.toThrow(/no relays/)
   })
 
   it('say: sends a directed, encrypted message carrying the intent envelope', async () => {

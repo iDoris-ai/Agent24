@@ -30,6 +30,13 @@ export class FakeSpeaker {
   }
   /** Canned `profile discover --json` reply. */
   discoverResult: unknown = []
+  /** Canned `profile publish --json` reply (PR #29 structured result). */
+  publishResult: unknown = {
+    name: 'agent24',
+    published_to: 1,
+    relay_count: 1,
+    relays: [{ url: 'wss://relay.aastar.io', ok: true }],
+  }
   /** Canned `agent inbox --json` reply (inbound messages). */
   inboxMessages: InboundMessage[] = []
 
@@ -44,7 +51,7 @@ export class FakeSpeaker {
       const file = i >= 0 ? args[i + 1] : undefined
       if (file) inv.publishedProfile = JSON.parse(fs.readFileSync(file, 'utf8')) as AgentSpeakerProfile
       this.calls.push(inv)
-      return '' // this command has no --json output (CC-82 gap); exit 0 = success
+      return JSON.stringify(this.publishResult) // PR #29: profile publish --json
     }
     if (group === 'agent' && cmd === 'msg') {
       this.calls.push(inv)

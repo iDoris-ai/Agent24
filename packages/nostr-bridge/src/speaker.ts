@@ -29,6 +29,14 @@ export interface SendResult {
   queued_for_retry?: boolean
 }
 
+/** `profile publish --json` result (agent-speaker PR #29). */
+export interface PublishResult {
+  name?: string
+  published_to?: number
+  relay_count?: number
+  relays?: { url: string; ok: boolean; error?: string }[]
+}
+
 /** One `profile discover --json` entry. */
 export interface DiscoverEntry {
   npub: string
@@ -57,9 +65,10 @@ export class SpeakerClient {
     return this.relay ? ['--relay', this.relay] : []
   }
 
-  /** register → `profile publish --json-file`. This command has no `--json`
-   * yet (CC-82 gap), so success is the non-zero-exit contract of the runner. */
-  async publishProfile(identity: string, jsonFile: string): Promise<void> {
+  /** register → `profile publish --json-file` reads the profile, `--json`
+   * (agent-speaker PR #29) returns structured per-relay results so we know how
+   * many relays it actually reached. */
+  async publishProfile(identity: string, jsonFile: string): Promise<PublishResult> {
     const out = await this.run([
       'profile',
       'publish',
@@ -67,14 +76,10 @@ export class SpeakerClient {
       identity,
       '--json-file',
       jsonFile,
+      '--json',
       ...this.relayArgs(),
     ])
-    // `profile publish` has no `--json` yet (CC-82 gap), so success is inferred
-    // from exit 0. Best-effort until it does: an error line printed on a 0 exit
-    // must not be silently reported as a successful register.
-    if (/❌|\berror\b|\bfailed\b/i.test(out)) {
-      throw new Error(`profile publish reported failure: ${out.trim().slice(0, 200)}`)
-    }
+    return parseJson<PublishResult>(out, 'profile publish')
   }
 
   /** say / answer → `agent msg` (directed, NIP-44 encrypted by default). */
@@ -110,21 +115,26 @@ export class SpeakerClient {
   }
 
   /** listen/subscribe (inbound) → `agent inbox --json`. The daemon pulls inbound
-   * to the local store; this reads it. Normalizes a few likely field names so
-   * the bridge doesn't hard-depend on one exact key (`from`/`from_npub`/`sender`,
-   * `content`/`text`). */
+   * to the local store; this reads it. Maps agent-speaker's `StoredMessage`
+   * (PR #29: `sender_npub` / `plaintext` / `id` / `is_incoming`), tolerating a
+   * couple of older field names so a version skew during 联调 doesn't break it.
+   * Only INCOMING messages surface (our own outbound is in the same store). */
   async inbox(): Promise<InboundMessage[]> {
     const out = await this.run(['agent', 'inbox', '--json', ...this.relayArgs()])
     const parsed = parseJson<unknown>(out, 'agent inbox')
     const rows = Array.isArray(parsed)
       ? parsed
       : ((parsed as { messages?: unknown[] })?.messages ?? [])
-    return (rows as Record<string, unknown>[]).map((r) => ({
-      from: String(r.from ?? r.from_npub ?? r.sender ?? r.from_user_id ?? ''),
-      content: String(r.content ?? r.text ?? r.body ?? ''),
-      event_id: r.event_id != null ? String(r.event_id) : undefined,
-      created_at: typeof r.created_at === 'number' ? r.created_at : undefined,
-    }))
+    return (rows as Record<string, unknown>[])
+      .filter((r) => r.is_incoming !== false) // absent (older build) → treat as inbound
+      .map((r) => ({
+        from: String(r.sender_npub ?? r.from ?? r.from_npub ?? r.sender ?? ''),
+        // prefer decrypted plaintext; fall back to raw content
+        content: String(r.plaintext ?? r.content ?? r.text ?? ''),
+        event_id:
+          r.id != null ? String(r.id) : r.event_id != null ? String(r.event_id) : undefined,
+        created_at: typeof r.created_at === 'number' ? r.created_at : undefined,
+      }))
   }
 }
 
