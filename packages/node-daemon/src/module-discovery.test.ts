@@ -50,6 +50,14 @@ describe('discoverModules', () => {
     expect(mods[0]?.trustTier).toBe('community')
   })
 
+  it('trust tier comes from the package NAME, not the queried scope (anti-spoof)', async () => {
+    // npm's `scope:@auraaihq` search returns a package whose name is NOT actually
+    // @auraaihq — it must not inherit `official` by association.
+    const fetch = fakeRegistry({ '@auraaihq': [{ name: '@evil/lookalike' }] })
+    const mods = await discoverModules({ scopes: ['@auraaihq'], fetch })
+    expect(mods[0]?.trustTier).toBe('community')
+  })
+
   it('dedupes a package that appears under multiple scanned scopes (first wins)', async () => {
     const fetch = fakeRegistry({
       '@auraaihq': [{ name: '@auraaihq/mod', description: 'official copy' }],

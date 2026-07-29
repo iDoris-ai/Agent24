@@ -35,8 +35,14 @@ interface SearchObject {
   package?: { name?: string; version?: string; description?: string }
 }
 
-function tierFor(scope: string, officialScopes: readonly string[]): TrustTier {
-  return officialScopes.includes(scope) ? 'official' : 'community'
+/** Trust tier from the package's OWN scope (parsed from its name), NOT from the
+ * scope we happened to query. npm's `scope:` search qualifier is a hint, not a
+ * guarantee — deriving `official` from the queried scope would let an
+ * out-of-scope package (or a future user-added scan scope) be stamped official
+ * by association. The package name is the authority. */
+function tierForName(name: string, officialScopes: readonly string[]): TrustTier {
+  const pkgScope = name.startsWith('@') ? (name.split('/')[0] ?? '') : ''
+  return pkgScope && officialScopes.includes(pkgScope) ? 'official' : 'community'
 }
 
 /** Discover installable modules by scanning npm scopes. One scope failing (e.g.
@@ -80,7 +86,7 @@ export async function discoverModules(
         version: o.package?.version ?? '',
         name,
         description: o.package?.description ?? '',
-        trustTier: tierFor(scope, officialScopes),
+        trustTier: tierForName(name, officialScopes),
         installed: installed.has(name),
       })
     }
