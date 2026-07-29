@@ -33,7 +33,9 @@ use agent24_protocol::{
     ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{RunMessage, RunPatch, Store, StoreError};
-use agent24_tools::{ToolContext, ToolError, ToolRegistry, summarize_input, truncate};
+use agent24_tools::{
+    GateDecision, ToolContext, ToolError, ToolRegistry, summarize_input, truncate,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Completion→tools round trips per run before the run is failed. A model
@@ -47,6 +49,23 @@ const SUMMARY_MAX_BYTES: usize = 500;
 /// Tool calls executed per assistant turn; the rest are answered with a
 /// "skipped" tool result so the wire protocol stays balanced.
 pub const MAX_TOOL_CALLS_PER_TURN: usize = 16;
+
+/// H8: the reserved tool name the model calls to submit a plan for approval.
+/// Handled by the loop itself (not the registry), so it is never dispatchable
+/// as an ordinary tool.
+const PROPOSE_PLAN: &str = "propose_plan";
+
+/// Outcome of a `propose_plan` submission (H8).
+enum PlanOutcome {
+    /// Human approved — content is the tool result fed back to the model, and
+    /// the loop leaves read-only.
+    Approved(String),
+    /// Human declined (or it timed out, fail-closed) — the run ends; content is
+    /// both the tool result and the run's closing output.
+    Rejected(String),
+    /// The run was cancelled / aborted while the plan approval was pending.
+    Cancelled,
+}
 
 /// Where lifecycle events go (the daemon adapts this onto its WS hub).
 pub trait EventSink: Send + Sync + 'static {
@@ -789,14 +808,33 @@ impl RunManager {
                 return;
             }
             let content = if call.id == tool_call_id {
-                match self
-                    .settle_parked_call(&run, &approval, &call, &cancel)
-                    .await
-                {
-                    Ok(content) => content,
-                    Err(()) => {
-                        self.finish_cancelled(&run_id).await;
+                if call.name.trim() == PROPOSE_PLAN {
+                    // H8: the parked call is a plan approval (the only thing a
+                    // plan-mode run can park on — read tools never gate, and no
+                    // other tool is advertised until a plan is approved). resume
+                    // runs post-decision (H3), so the row is resolved: approve →
+                    // continue with the full set; anything else → the run ends
+                    // having done nothing but read.
+                    if !matches!(approval.status, ApprovalStatus::Approved) {
+                        let content = "Plan rejected.".to_owned();
+                        let result = Msg::tool_result(call.id.clone(), content.clone());
+                        self.persist_message(&run_id, &result).await;
+                        self.finish_completed(&run_id, &content, run.usage.clone())
+                            .await;
                         return;
+                    }
+                    "Plan approved. The full tool set is now available — carry out the plan."
+                        .to_owned()
+                } else {
+                    match self
+                        .settle_parked_call(&run, &approval, &call, &cancel)
+                        .await
+                    {
+                        Ok(content) => content,
+                        Err(()) => {
+                            self.finish_cancelled(&run_id).await;
+                            return;
+                        }
                     }
                 }
             } else {
@@ -822,8 +860,11 @@ impl RunManager {
             messages.push(result);
         }
 
-        // 5. Continue the shared loop for subsequent model iterations.
-        self.run_loop(run, messages, cancel).await;
+        // 5. Continue the shared loop for subsequent model iterations. Always
+        // out of plan mode: the only thing a plan-mode run can park on is its
+        // plan approval, and reaching here means that was approved (a rejection
+        // returned above), so the full tool set is unlocked (H8).
+        self.run_loop(run, messages, false, cancel).await;
     }
 
     /// Settle the ONE parked call whose approval is already decided (H3): apply
@@ -931,7 +972,9 @@ impl RunManager {
         let user_msg = Msg::user(run.input.prompt.clone());
         self.persist_message(&run_id, &user_msg).await;
         messages.push(user_msg);
-        self.run_loop(run, messages, cancel).await;
+        // H8: a fresh plan-mode run starts read-only; a Normal run never is.
+        let plan_mode = matches!(run.input.mode, RunMode::Plan);
+        self.run_loop(run, messages, plan_mode, cancel).await;
     }
 
     /// The completion↔tool-execution loop shared by a fresh run ([`execute`]) and
@@ -939,25 +982,24 @@ impl RunManager {
     /// way (fresh: prior context + prompt; resumed: reconstructed thread + the
     /// settled parked call), then hands it here. Bounded by MAX_ITERATIONS;
     /// usage accumulates across iterations.
-    async fn run_loop(&self, run: Run, mut messages: Vec<Msg>, cancel: CancellationToken) {
+    async fn run_loop(
+        &self,
+        run: Run,
+        mut messages: Vec<Msg>,
+        mut plan_mode: bool,
+        cancel: CancellationToken,
+    ) {
         let run_id = run.id.clone();
-        let tool_specs: Vec<ToolSpec> = self
-            .tools
-            .adverts()
-            .into_iter()
-            .map(|a| ToolSpec {
-                name: a.name,
-                description: a.description,
-                parameters: a.parameters,
-            })
-            .collect();
         let mut usage_total = zero_usage();
 
         for _ in 0..MAX_ITERATIONS {
+            // Recomputed each turn: in plan mode only the read-only subset plus
+            // `propose_plan` is offered; the instant a plan is approved
+            // `plan_mode` flips false and the full set is advertised (H8).
             let request = CompletionRequest {
                 messages: messages.clone(),
                 model: run.input.model_override.clone(),
-                tools: tool_specs.clone(),
+                tools: self.tool_specs_for(plan_mode),
             };
             let outcome = tokio::select! {
                 r = self.router.complete(TaskProfile::default(), &request, &cancel) => r,
@@ -1095,6 +1137,36 @@ impl RunManager {
                     );
                     self.persist_message(&run_id, &skipped).await;
                     messages.push(skipped);
+                    continue;
+                }
+                // H8: propose_plan is a loop construct, not a registry tool. It
+                // gates the read-only → full-tools transition behind a
+                // human-only approval instead of executing a side effect.
+                if call.name.trim() == PROPOSE_PLAN {
+                    match self
+                        .run_plan_proposal(&run_id, run.session_id.as_deref(), call, &cancel)
+                        .await
+                    {
+                        PlanOutcome::Approved(content) => {
+                            plan_mode = false; // full tool set from the next turn
+                            let result = Msg::tool_result(call.id.clone(), content);
+                            self.persist_message(&run_id, &result).await;
+                            messages.push(result);
+                        }
+                        PlanOutcome::Rejected(content) => {
+                            // The user declined the plan — the run ends here,
+                            // having done nothing but read.
+                            let result = Msg::tool_result(call.id.clone(), content.clone());
+                            self.persist_message(&run_id, &result).await;
+                            self.finish_completed(&run_id, &content, usage_total.clone())
+                                .await;
+                            return;
+                        }
+                        PlanOutcome::Cancelled => {
+                            self.finish_cancelled(&run_id).await;
+                            return;
+                        }
+                    }
                     continue;
                 }
                 match self
@@ -1293,6 +1365,177 @@ impl RunManager {
         }
 
         if cancelled { Err(()) } else { Ok(content) }
+    }
+
+    /// The tool specs advertised this turn: the full advert set normally, or the
+    /// read-only subset plus `propose_plan` in plan mode (H8).
+    fn tool_specs_for(&self, plan_mode: bool) -> Vec<ToolSpec> {
+        let adverts = if plan_mode {
+            self.tools.plan_adverts()
+        } else {
+            self.tools.adverts()
+        };
+        let mut specs: Vec<ToolSpec> = adverts
+            .into_iter()
+            .map(|a| ToolSpec {
+                name: a.name,
+                description: a.description,
+                parameters: a.parameters,
+            })
+            .collect();
+        if plan_mode {
+            specs.push(ToolSpec {
+                name: PROPOSE_PLAN.to_owned(),
+                description: "You are in plan mode and may only READ — write/exec/network \
+                     tools are withheld. When you have a concrete plan, call propose_plan with \
+                     it. A human approves or rejects the plan; on approval the full tool set \
+                     unlocks and you carry it out, on rejection the run ends."
+                    .to_owned(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "plan": {
+                            "type": "string",
+                            "description": "The plan you intend to carry out, detailed enough for a human to approve."
+                        }
+                    },
+                    "required": ["plan"]
+                }),
+            });
+        }
+        specs
+    }
+
+    /// Handle a `propose_plan` call (H8): record it as a tool call, park the run
+    /// on a human-only plan approval, and translate the decision into a
+    /// [`PlanOutcome`]. Never routes through the registry — a plan is a mode
+    /// gate, not a side effect.
+    async fn run_plan_proposal(
+        &self,
+        run_id: &str,
+        session_id: Option<&str>,
+        call: &ToolCallRequest,
+        cancel: &CancellationToken,
+    ) -> PlanOutcome {
+        let plan = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|v| v.get("plan").and_then(|p| p.as_str()).map(str::to_owned))
+            .unwrap_or_default();
+        let mut input = serde_json::Map::new();
+        input.insert("plan".to_owned(), serde_json::Value::String(plan.clone()));
+
+        let tc = ToolCall {
+            id: format!("tc_{}", ulid()),
+            run_id: run_id.to_owned(),
+            tool: PROPOSE_PLAN.to_owned(),
+            input: input.clone(),
+            status: ToolCallStatus::Running,
+            output_summary: None,
+            started_at: now_iso8601(),
+            ended_at: None,
+        };
+        if let Err(err) = self.store.insert_tool_call(&tc).await {
+            tracing::error!("plan tool call persist failed: {err}");
+            return PlanOutcome::Rejected("plan could not be recorded (fail-closed)".to_owned());
+        }
+        self.sink.emit(EventBody::ToolStarted(ToolStartedPayload {
+            run_id: run_id.to_owned(),
+            tool_call_id: tc.id.clone(),
+            tool: PROPOSE_PLAN.to_owned(),
+            input_summary: truncate(&plan, SUMMARY_MAX_BYTES),
+        }));
+
+        // The run parks on a human decision — REST pollers must see it.
+        if let Err(err) = self
+            .store
+            .transition_run(run_id, RunStatus::AwaitingApproval, RunPatch::default())
+            .await
+        {
+            tracing::error!("run {run_id}: plan awaiting_approval transition failed: {err}");
+        }
+
+        let ask = format!("Approve this plan?\n{}", truncate(&plan, SUMMARY_MAX_BYTES));
+        let decision = self
+            .tools
+            .request_plan(run_id, session_id, &tc.id, ask, input, cancel)
+            .await;
+
+        // Back to running unless the approval aborted the whole run.
+        if !matches!(decision, GateDecision::AbortRun(_))
+            && let Err(err) = self
+                .store
+                .transition_run(run_id, RunStatus::Running, RunPatch::default())
+                .await
+        {
+            tracing::error!("run {run_id}: plan back-to-running transition failed: {err}");
+        }
+
+        let (status, outcome) = match decision {
+            GateDecision::Allow => (
+                ToolCallStatus::Completed,
+                PlanOutcome::Approved(
+                    "Plan approved. The full tool set is now available — carry out the plan."
+                        .to_owned(),
+                ),
+            ),
+            GateDecision::Deny(reason) => (
+                ToolCallStatus::Denied,
+                PlanOutcome::Rejected(format!("Plan rejected: {reason}")),
+            ),
+            GateDecision::AbortRun(_) => (ToolCallStatus::Denied, PlanOutcome::Cancelled),
+        };
+        let summary = match &outcome {
+            PlanOutcome::Approved(c) | PlanOutcome::Rejected(c) => c.clone(),
+            PlanOutcome::Cancelled => "aborted".to_owned(),
+        };
+        match self
+            .store
+            .finish_tool_call(&tc.id, status, Some(summary.clone()), now_iso8601())
+            .await
+        {
+            Ok(()) => self
+                .sink
+                .emit(EventBody::ToolCompleted(ToolCompletedPayload {
+                    run_id: run_id.to_owned(),
+                    tool_call_id: tc.id.clone(),
+                    status: match status {
+                        ToolCallStatus::Completed => ToolCompletedStatus::Completed,
+                        _ => ToolCompletedStatus::Denied,
+                    },
+                    output_summary: Some(summary),
+                })),
+            Err(err) => tracing::error!("plan tool call finish persist failed: {err}"),
+        }
+        outcome
+    }
+
+    /// Land the completed terminal state + event with the given output text.
+    async fn finish_completed(&self, run_id: &str, text: &str, usage: Usage) {
+        match self
+            .store
+            .transition_run(
+                run_id,
+                RunStatus::Completed,
+                RunPatch {
+                    output: Some(agent24_protocol::RunOutput {
+                        text: text.to_owned(),
+                    }),
+                    usage: Some(usage.clone()),
+                    ended_at: Some(now_iso8601()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
+                run_id: run_id.to_owned(),
+                output: RunOutputPayload {
+                    text: text.to_owned(),
+                },
+                usage,
+            })),
+            Err(err) => tracing::error!("run completion persist failed: {err}"),
+        }
     }
 
     /// Land the failed terminal state + event.
@@ -2404,6 +2647,172 @@ mod approval_tests {
                 "run.completed"
             ]
         );
+    }
+
+    // ── H8 plan mode ─────────────────────────────────────────────────────────
+
+    fn create_plan() -> RunCreate {
+        RunCreate {
+            session_id: None,
+            prompt: "do the thing".to_owned(),
+            model_override: None,
+            mode: RunMode::Plan,
+        }
+    }
+
+    fn propose_plan_call() -> Msg {
+        Msg::assistant(
+            None,
+            vec![agent24_models::ToolCallRequest {
+                id: "plan_1".to_owned(),
+                name: "propose_plan".to_owned(),
+                arguments: serde_json::json!({ "plan": "delete the notes file" }).to_string(),
+            }],
+        )
+    }
+
+    /// A real broker + gate + builtin registry driven by a caller-supplied
+    /// script (unlike [`harness`], whose script is fixed).
+    async fn scripted_plan_harness(workdir: std::path::PathBuf, turns: Vec<Msg>) -> Harness {
+        let store = Store::open_memory().await.unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let ev = Arc::clone(&events);
+        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
+            if let Ok(mut v) = ev.lock() {
+                v.push(body.wire_type().to_owned());
+            }
+        });
+        let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
+        let tools = ToolRegistry::builtin(workdir)
+            .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        struct FnSink(Arc<dyn Fn(EventBody) + Send + Sync>);
+        impl EventSink for FnSink {
+            fn emit(&self, body: EventBody) {
+                (self.0)(body);
+            }
+        }
+        let provider = ScriptedProvider::new(turns);
+        let manager = RunManager::new(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(
+                Arc::new(provider),
+                Tier::Local,
+            )])),
+            Arc::new(tools),
+            Arc::new(FnSink(emit)),
+            CancellationToken::new(),
+        );
+        Harness {
+            manager,
+            broker,
+            store,
+            events,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_advertises_only_read_tools_and_propose_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = scripted_plan_harness(dir.path().to_path_buf(), vec![]).await;
+        let plan: Vec<String> = h
+            .manager
+            .tool_specs_for(true)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(plan.contains(&"propose_plan".to_owned()));
+        assert!(plan.contains(&"fs_read".to_owned()));
+        assert!(
+            !plan.contains(&"shell_exec".to_owned()),
+            "plan mode must not offer exec"
+        );
+        assert!(
+            !plan.contains(&"fs_write".to_owned()),
+            "plan mode must not offer write"
+        );
+        let full: Vec<String> = h
+            .manager
+            .tool_specs_for(false)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(full.contains(&"shell_exec".to_owned()));
+        assert!(
+            !full.contains(&"propose_plan".to_owned()),
+            "propose_plan is plan-mode only"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_approved_unlocks_the_run_to_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        // ScriptedProvider pops from the end, so turns are listed last-first.
+        let h = scripted_plan_harness(
+            dir.path().to_path_buf(),
+            vec![
+                Msg::assistant(Some("done".to_owned()), vec![]),
+                propose_plan_call(),
+            ],
+        )
+        .await;
+        let run = h.manager.start_run(create_plan()).await.unwrap();
+        let id = wait_pending(&h.store).await;
+        let ap = h.store.get_approval(&id).await.unwrap().unwrap();
+        assert_eq!(ap.kind, "plan");
+        assert_eq!(
+            ap.available_decisions,
+            vec!["approve".to_owned(), "deny".to_owned()],
+            "a plan is human-only: no approve_for_session / target grant is offered"
+        );
+        assert_eq!(
+            h.store.get_run(&run.id).await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        h.broker
+            .resolve(&id, decision("approve", None))
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.output.unwrap().text, "done");
+    }
+
+    #[tokio::test]
+    async fn plan_denied_ends_the_run_without_executing() {
+        let dir = tempfile::tempdir().unwrap();
+        // The shell_exec turn would run only if the plan were approved — a
+        // rejected plan must never reach it. (Turns are listed last-first: the
+        // ScriptedProvider pops from the end, so propose_plan runs first.)
+        let h = scripted_plan_harness(
+            dir.path().to_path_buf(),
+            vec![
+                Msg::assistant(
+                    None,
+                    vec![agent24_models::ToolCallRequest {
+                        id: "x".to_owned(),
+                        name: "shell_exec".to_owned(),
+                        arguments: serde_json::json!({ "argv": ["/bin/echo", "SHOULD_NOT_RUN"] })
+                            .to_string(),
+                    }],
+                ),
+                propose_plan_call(),
+            ],
+        )
+        .await;
+        let run = h.manager.start_run(create_plan()).await.unwrap();
+        let id = wait_pending(&h.store).await;
+        h.broker
+            .resolve(&id, decision("deny", Some("no")))
+            .await
+            .unwrap();
+        let done = wait_terminal(&h.store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(done.output.unwrap().text.contains("rejected"));
+        // Only the propose_plan call exists — shell_exec never ran.
+        let calls = h.store.list_tool_calls(&run.id).await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "propose_plan");
+        assert_eq!(calls[0].status, ToolCallStatus::Denied);
     }
 
     /// Like [`harness`] but with an EMPTY script: the first model call after a

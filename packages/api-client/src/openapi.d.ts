@@ -458,9 +458,16 @@ export interface components {
          * @enum {string}
          */
         RunStatus: "queued" | "running" | "awaiting_approval" | "completed" | "failed" | "cancelled";
+        /**
+         * @description H8 plan mode. `plan` starts the run under a read-only tool gate — only Read-class tools and `propose_plan` are offered — until the model submits a plan a human approves, which unlocks the full tool set for that run. Additive: absent/unknown reads as `normal`.
+         * @default normal
+         * @enum {string}
+         */
+        RunMode: "normal" | "plan";
         RunInput: {
             prompt: string;
             model_override?: string | null;
+            mode?: components["schemas"]["RunMode"];
         };
         RunOutput: {
             text: string;
@@ -490,6 +497,7 @@ export interface components {
             session_id?: string | null;
             prompt: string;
             model_override?: string | null;
+            mode?: components["schemas"]["RunMode"];
         };
         /** @enum {string} */
         ToolCallStatus: "running" | "completed" | "failed" | "denied";
