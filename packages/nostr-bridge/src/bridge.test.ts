@@ -40,6 +40,22 @@ describe('protocol.makeContent', () => {
     expect(c.reply_to).toBe('e1')
     expect(c.expires_at).toBe(Math.floor(1_000_000 / 1000) + 60)
   })
+  it('scrubs internal atomic-tool wiring markers out of the outbound payload', () => {
+    const c = makeContent({
+      intent: 'inform',
+      payload: {
+        impl: 'handled by module:xiaohongshu',
+        via: 'tool:http_fetch',
+        ok: 'a normal string',
+        nested: { deep: ['module:wechat-bridge'] },
+      },
+    })
+    const json = JSON.stringify(c.payload)
+    expect(json).not.toContain('module:')
+    expect(json).not.toContain('tool:')
+    expect(json).toContain('[redacted]')
+    expect((c.payload as { ok: string }).ok).toBe('a normal string') // untouched
+  })
 })
 
 describe('profile transform (business capabilities only)', () => {
@@ -89,6 +105,19 @@ describe('NostrBridge outbound (real bridge + SpeakerClient vs fake agent-speake
     expect(env.topic).toBe('textile-outreach')
     expect((env.payload as { q: string }).q).toBe('能接单吗')
     expect(res.event_id).toBe('evt_fake')
+  })
+
+  it('say: fails loudly when the message reached no relays and was not queued', async () => {
+    const fake = new FakeSpeaker()
+    fake.sendResult = { published_to: 0, relay_count: 0, relays: [], queued_for_retry: false }
+    await expect(bridge(fake).say('npub1bob', { intent: 'ask' })).rejects.toThrow(/no relays/)
+  })
+
+  it('say: accepts a queued-for-retry message (agent-speaker outbox will retry)', async () => {
+    const fake = new FakeSpeaker()
+    fake.sendResult = { published_to: 0, relay_count: 0, relays: [], queued_for_retry: true }
+    const res = await bridge(fake).say('npub1bob', { intent: 'ask' })
+    expect(res.queued_for_retry).toBe(true)
   })
 
   it('search: discovers agents by business capability', async () => {

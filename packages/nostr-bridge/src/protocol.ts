@@ -66,6 +66,29 @@ export interface ContentInput {
   error?: Content['error']
 }
 
+/** Internal atomic-tool wiring markers (`module:*` / `tool:*`, §5) must never
+ * leave the machine in outbound content. This is defense-in-depth mirroring the
+ * register() invariant (which publishes only business capabilities): the say()
+ * payload is filled by the agent's own LLM, so it is scrubbed on the way out —
+ * important before `announce`/`listen` ever reuse this path unencrypted. */
+const INTERNAL_MARKER = /\b(?:module|tool):[\w./-]+/gi
+
+function scrubValue(v: unknown): unknown {
+  if (typeof v === 'string') return v.replace(INTERNAL_MARKER, '[redacted]')
+  if (Array.isArray(v)) return v.map(scrubValue)
+  if (v && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, scrubValue(val)]),
+    )
+  }
+  return v
+}
+
+/** Redact internal atomic-tool wiring markers from an outbound payload. */
+export function scrubPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  return scrubValue(payload) as Record<string, unknown>
+}
+
 /** Build a well-formed content envelope, minting a thread id when none is given.
  * `now` is injectable for deterministic tests. */
 export function makeContent(input: ContentInput, now: number = Date.now()): Content {
@@ -77,7 +100,7 @@ export function makeContent(input: ContentInput, now: number = Date.now()): Cont
   if (input.replyTo) content.reply_to = input.replyTo
   if (input.topic) content.topic = input.topic
   if (input.tags?.length) content.tags = input.tags
-  if (input.payload) content.payload = input.payload
+  if (input.payload) content.payload = scrubPayload(input.payload)
   if (input.ttlSeconds != null) content.expires_at = Math.floor(now / 1000) + input.ttlSeconds
   if (input.status) content.status = input.status
   if (input.error !== undefined) content.error = input.error

@@ -45,7 +45,15 @@ export class NostrBridge {
    * `replyTo`/`threadId` inside `content` to continue a thread. */
   async say(toNpub: string, content: ContentInput, now?: number): Promise<SendResult> {
     const envelope = makeContent(content, now)
-    return this.speaker.sendMessage(this.identity, toNpub, JSON.stringify(envelope))
+    const res = await this.speaker.sendMessage(this.identity, toNpub, JSON.stringify(envelope))
+    // A message that reached zero relays and wasn't even queued for retry never
+    // went out — surface that as a failure instead of resolving as success.
+    // (queued_for_retry is a legitimate degraded state: agent-speaker's outbox
+    // will keep trying, so it is NOT an error.)
+    if ((res.published_to ?? 0) === 0 && !res.queued_for_retry) {
+      throw new Error(`say to ${toNpub} reached no relays (published_to=0, not queued)`)
+    }
+    return res
   }
 
   /** search: locate agents by business capability. */

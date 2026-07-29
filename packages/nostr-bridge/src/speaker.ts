@@ -49,7 +49,7 @@ export class SpeakerClient {
   /** register → `profile publish --json-file`. This command has no `--json`
    * yet (CC-82 gap), so success is the non-zero-exit contract of the runner. */
   async publishProfile(identity: string, jsonFile: string): Promise<void> {
-    await this.run([
+    const out = await this.run([
       'profile',
       'publish',
       '--from',
@@ -58,6 +58,12 @@ export class SpeakerClient {
       jsonFile,
       ...this.relayArgs(),
     ])
+    // `profile publish` has no `--json` yet (CC-82 gap), so success is inferred
+    // from exit 0. Best-effort until it does: an error line printed on a 0 exit
+    // must not be silently reported as a successful register.
+    if (/❌|\berror\b|\bfailed\b/i.test(out)) {
+      throw new Error(`profile publish reported failure: ${out.trim().slice(0, 200)}`)
+    }
   }
 
   /** say / answer → `agent msg` (directed, NIP-44 encrypted by default). */
