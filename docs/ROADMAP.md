@@ -123,9 +123,9 @@
 - [ ] iDoris 主 AI 接入（替换 placeholder）
 - [ ] **模块 Marketplace（PLAN 七.6 阶段 4）**
   - [x] 模块发现服务（npm scope 扫描 + 信任分层）— `module-discovery.ts` + `GET /api/modules/discover`（Nostr 索引作未来源）
-  - [~] Desktop UI: marketplace 浏览面板（搜索 + 过滤）— 后端就绪：`filterModules` + `GET /api/modules/discover?q=&tier=&installed=`（UI 待 desktop 包）
-  - [ ] 一键 install 流程
-  - [ ] 信任分层显示：官方 / 社区 / 第三方 + 权限申请确认
+  - [x] Desktop UI: marketplace 浏览面板（搜索 + 过滤）— `ModulesManager.tsx` 模块市场：搜索框 + 信任级 chip 过滤 + 已装/未装切换（debounced，走 `modules:discover` IPC → `GET /api/modules/discover?q=&tier=&installed=`）
+  - [x] 一键 install 流程 — 市场卡片「安装」直连 `modulesInstall`，安装后刷新已装列表 + 市场 installed 标记（默认停用，待 H10 权限确认再启用）
+  - [x] 信任分层显示：官方 / 社区 / 第三方（彩色 chip，信任级由 daemon 从包名推导 anti-spoof）+ 权限申请确认（沿用 H10 安装门 `consentSummary`）
 
 ---
 

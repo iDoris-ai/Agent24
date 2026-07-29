@@ -12,6 +12,7 @@ export const IpcChannels = {
   OmlxStop: 'omlx:stop',
   OmlxWarmup: 'omlx:warmup',
   ModulesList: 'modules:list',
+  ModulesDiscover: 'modules:discover',
   ModulesEnable: 'modules:enable',
   ModulesDisable: 'modules:disable',
   ModulesInstall: 'modules:install',
@@ -121,4 +122,27 @@ export interface ModuleInstallResult {
 export interface ModuleUninstallResult {
   ok: boolean
   error?: string
+}
+
+// ── M4 marketplace: discovery / browse ────────────────────────────────────────
+// MIRROR NOTICE: packages/node-daemon/src/module-discovery.ts is the source of
+// truth (the daemon computes trust tier from the package name, anti-spoof).
+
+export type TrustTier = 'official' | 'community' | 'third-party'
+
+export interface DiscoveredModule {
+  packageName: string
+  version: string
+  name: string
+  description: string
+  trustTier: TrustTier
+  installed: boolean
+}
+
+/** Browse filters driving GET /api/modules/discover?q=&tier=&installed= — all
+ * optional; an absent field doesn't constrain. */
+export interface DiscoverFilter {
+  query?: string
+  trustTier?: TrustTier
+  installed?: boolean
 }

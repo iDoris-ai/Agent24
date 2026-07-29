@@ -9,6 +9,8 @@ import { IpcChannels } from '../../shared/ipc-types'
 import type {
   BackendProxyRequest,
   BackendProxyResponse,
+  DiscoverFilter,
+  DiscoveredModule,
   LlmStatusResult,
   ModuleInfo,
   ModuleInstallResult,
@@ -187,6 +189,23 @@ export function registerIpcHandlers(): void {
     try {
       const res = await proxyToBackend({ method: 'GET', path: '/api/modules' })
       if (res.ok) return res.data as ModuleInfo[]
+    } catch { /* daemon may not be ready yet */ }
+    return []
+  })
+
+  // modules:discover — M4 marketplace browse: query installable modules from the
+  // npm registry, tagged with trust tier + installed flag. Filters are optional
+  // and forwarded as query params; the daemon (module-discovery.ts) applies them.
+  ipcMain.handle(IpcChannels.ModulesDiscover, async (_event, filter: unknown): Promise<DiscoveredModule[]> => {
+    const f = (filter ?? {}) as DiscoverFilter
+    const params = new URLSearchParams()
+    if (typeof f.query === 'string' && f.query.trim()) params.set('q', f.query.trim())
+    if (typeof f.trustTier === 'string') params.set('tier', f.trustTier)
+    if (typeof f.installed === 'boolean') params.set('installed', String(f.installed))
+    const qs = params.toString()
+    try {
+      const res = await proxyToBackend({ method: 'GET', path: `/api/modules/discover${qs ? `?${qs}` : ''}` })
+      if (res.ok) return res.data as DiscoveredModule[]
     } catch { /* daemon may not be ready yet */ }
     return []
   })
