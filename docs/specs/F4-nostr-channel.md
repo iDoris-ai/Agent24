@@ -122,6 +122,21 @@ Searle 五类言语行为都由它承载:directive→`ask`/`cfp`,commissive→`o
 - **2 个 `--json` 缺口(非阻塞):** `profile publish`、`history inbox` 未接 `--json`(纯 emoji 文本)。agent-speaker 排期修。F4a 期间:入站走 **messages.db 直读 / `agent inbox --json`**(注意不是 `history inbox`);出站 `profile publish` 先靠退出码,`--json` 到位再切结构化结果。
 - **R2 已实现**:`profile publish --json-file` 吃 **JSON 不吃 YAML**。F4 保留 `agent-profile.yml` 作人类可编辑源(§5),发布前 bridge 转 YAML→JSON(字段对齐:`rate_sheet` 下划线)再喂 `--json-file`。
 
+### 4.6 联调验证的命令契约(2026-07-29,对真二进制跑出来的)
+
+实机跑 agent-speaker 二进制(commit 7cef326 / #29)对齐命令契约,**逮到并修掉 5 处 FakeNostr 之前建模错的地方**(harness 建模错=测不出来,正是联调的意义):
+
+| # | 真实契约 | 之前 bridge 错在 |
+|---|---|---|
+| 1 | **所有 `--json` 输出是信封** `{ok:true,data:<result>}` / `{ok:false,error,message}`(+ 语义退出码) | 把信封当 payload 解析 → 每条命令都错(inbox 会永远空)。已加 `unwrap()`,`cliRunner` 在语义非零退出时也返回 JSON 让真错误浮出 |
+| 2 | `profile publish` / `agent inbox` 用 **`--as`**;`agent msg` 用 `--from` | publish/inbox 误用 `--from` |
+| 3 | `agent inbox` 需 **`--as <identity>`**;`SpeakerClient` 现持有 identity | inbox 没传身份 |
+| 4 | 有 `capabilities` 必须 **`mode:structured`**(tagged/simple 会拒;且 `discover --capability` 只匹配 structured) | 默认 tagged → 被拒 |
+| 5 | `availability` 是**枚举** `{available,busy,away,offline}` | 用了 `7x24` → 被拒;非法值现在丢弃默认 available |
+
+- **headless 需无密码 identity**:加密 keystore 目前**无法非交互解锁**(inbox/msg 无 `--password`,无 unlock 命令,`AGENT_SPEAKER_PASSWORD` env 无效)。自动化 agent 用 `identity create`(不带 `--password`)的无密码 keystore;若要加密 headless,需 agent-speaker 加非交互解锁(**R3**)。
+- **端到端验证**:`profile publish --as … --json-file … --json` 全字段校验通过、返回结构化 `PublishResult`;唯 `relay.aastar.io` 从测试环境返回 **HTTP 530**(relay 不可达),故 `published_to:0`,`register()` 正确报"no relays"。真投递需可达 relay(用户环境)。
+
 ---
 
 ## 5. 能力抽象:原子能力 → 业务能力（可编辑）
