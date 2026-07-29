@@ -26,9 +26,12 @@ export function envelopeToPrompt(content: string): { prompt: string; envelope?: 
   return { prompt: content }
 }
 
+/** Cap on the dedup set so a 7×24 soak can't grow it without bound. */
+const MAX_SEEN = 10_000
+
 export class InboundBridge {
   private readonly sessions = new Map<string, string>() // npub -> session id
-  private readonly seen = new Set<string>() // event_id dedup
+  private readonly seen = new Set<string>() // event_id dedup (bounded, insertion-ordered)
   // Per-sender serialization so concurrent messages from one npub can't race on
   // the session map. Bounded by the allowlist, so it needs no eviction.
   private readonly queues = new Map<string, Promise<unknown>>()
@@ -49,11 +52,33 @@ export class InboundBridge {
       console.warn(`[nostr] 忽略未授权 agent ${msg.from} 的消息;如需授权加入 A24_NOSTR_ALLOWED_NPUBS`)
       return
     }
-    if (msg.event_id) {
-      if (this.seen.has(msg.event_id)) return // at-most-once per event
-      this.seen.add(msg.event_id)
+    const eventId = msg.event_id
+    if (eventId) {
+      if (this.seen.has(eventId)) return // dedup (also guards concurrent polls)
+      this.rememberSeen(eventId) // mark BEFORE running so a concurrent poll dedups
     }
-    await this.enqueue(msg.from, () => this.process(msg))
+    await this.enqueue(msg.from, () => this.process(msg)).catch((err) => {
+      // A run that reached a terminal state (even a failed one) replies and does
+      // NOT throw — it stays deduped. A THROW here is a transient failure
+      // (daemon down / network), so un-commit the event and let a later inbox
+      // poll retry it, rather than silently losing the message.
+      if (eventId) this.seen.delete(eventId)
+      console.error('[nostr] 处理入站消息出错(将在下次轮询重试):', err instanceof Error ? err.message : err)
+    })
+  }
+
+  /** Record an event id, evicting the oldest once over the cap (Set preserves
+   * insertion order). */
+  private rememberSeen(id: string): void {
+    this.seen.add(id)
+    if (this.seen.size > MAX_SEEN) {
+      const excess = this.seen.size - MAX_SEEN
+      let i = 0
+      for (const oldest of this.seen) {
+        if (i++ >= excess) break
+        this.seen.delete(oldest)
+      }
+    }
   }
 
   private enqueue<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -66,14 +91,13 @@ export class InboundBridge {
   }
 
   private async process(msg: InboundMessage): Promise<void> {
-    try {
-      const { prompt, envelope } = envelopeToPrompt(msg.content)
-      const session = await this.sessionFor(msg.from)
-      const result = await this.agent.runToCompletion(prompt, session)
-      await this.reply(msg.from, result, envelope, msg.event_id)
-    } catch (err) {
-      console.error('[nostr] 处理入站消息出错:', err instanceof Error ? err.message : err)
-    }
+    // Throws (daemon down / network) propagate to handle()'s catch, which
+    // un-commits the event for retry. A terminal run replies here and never
+    // throws, so it stays deduped.
+    const { prompt, envelope } = envelopeToPrompt(msg.content)
+    const session = await this.sessionFor(msg.from)
+    const result = await this.agent.runToCompletion(prompt, session)
+    await this.reply(msg.from, result, envelope, msg.event_id)
   }
 
   private async sessionFor(npub: string): Promise<string> {
@@ -98,7 +122,9 @@ export class InboundBridge {
           ? '这一步需要我的主人批准,稍候由 ta 在桌面端处理后我再回复。'
           : result.status === 'failed'
             ? `执行失败:${result.error ?? '未知错误'}`
-            : '还在处理中,完成后我再告诉你。'
+            : result.status === 'cancelled'
+              ? '这次请求已被取消。'
+              : '还在处理中,完成后我再告诉你。'
     // Reply as an `answer`, threaded off the inbound envelope so multi-round
     // collaboration correlates.
     const envelope = makeContent({
