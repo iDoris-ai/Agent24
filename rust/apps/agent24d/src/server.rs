@@ -72,6 +72,9 @@ impl agent24_scheduler::RunTrigger for RunManagerTrigger {
             session_id: session_id.clone(),
             prompt: prompt.clone(),
             model_override: model_override.clone(),
+            // Scheduled runs are unattended — plan mode needs a human to approve
+            // the plan, so a fired schedule always runs Normal.
+            mode: agent24_protocol::RunMode::Normal,
         };
         self.runs
             .start_run_with_schedule(create, Some(schedule_id.to_owned()))
@@ -846,6 +849,7 @@ mod tests {
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
                     model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
                 },
                 output: None,
                 error: None,

@@ -392,6 +392,25 @@ impl ApprovalBroker {
             created_at: now,
             decided_at: None,
         };
+        self.run_pending_approval(approval, grant_ctx, run_id, tool, tool_call_id, cancel)
+            .await
+    }
+
+    /// The shared human-approval tail: register the resolver, persist the row
+    /// (fail-closed if it can't), arm the timeout watchdog, emit + audit, then
+    /// await a decision / timeout / cancel. Both the normal gated path
+    /// ([`request`], after its grant + Guardian fast-paths) and the plan-mode
+    /// path ([`request_plan`], which deliberately has neither) funnel through
+    /// here so the fail-closed resolution logic lives in exactly one place.
+    async fn run_pending_approval(
+        &self,
+        approval: Approval,
+        grant_ctx: GrantCtx,
+        run_id: &str,
+        tool: &str,
+        tool_call_id: &str,
+        cancel: &CancellationToken,
+    ) -> Verdict {
         // Sender registered BEFORE the row becomes visible: a polling client
         // that resolves the instant the row appears always finds the sender.
         let (tx, mut rx) = oneshot::channel::<Decision>();
@@ -507,6 +526,55 @@ impl ApprovalBroker {
         };
         drop(guard);
         verdict
+    }
+
+    /// H8 plan-mode approval — the human ALWAYS decides. Unlike [`request`],
+    /// this deliberately skips the standing-grant and Guardian fast-paths: a
+    /// plan unlocks the full tool set for the rest of the run, so a model may
+    /// never auto-approve its own exit from read-only, and no session grant can
+    /// pre-authorise it. Decisions are exactly approve / deny.
+    pub async fn request_plan(
+        &self,
+        run_id: &str,
+        session_id: Option<&str>,
+        tool_call_id: &str,
+        summary: String,
+        payload: Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> Verdict {
+        let approval = Approval {
+            id: format!("apr_{}", ulid()),
+            run_id: run_id.to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
+            kind: "plan".to_owned(),
+            summary,
+            payload,
+            available_decisions: vec!["approve".to_owned(), "deny".to_owned()],
+            standing_target: None,
+            status: ApprovalStatus::Pending,
+            decision: None,
+            expires_at: agent24_core::util::iso8601_after(self.timeout),
+            created_at: now_iso8601(),
+            decided_at: None,
+        };
+        // No target, no session/schedule grant scope — a plan approval mints
+        // nothing durable, so apply_decision only resolves the row.
+        let grant_ctx = GrantCtx {
+            scope: session_id.unwrap_or(run_id).to_owned(),
+            tool: "propose_plan".to_owned(),
+            scope_kind: None,
+            scope_id: None,
+            target: None,
+        };
+        self.run_pending_approval(
+            approval,
+            grant_ctx,
+            run_id,
+            "propose_plan",
+            tool_call_id,
+            cancel,
+        )
+        .await
     }
 
     /// Derive the verdict from the authoritative store row (used when a
@@ -739,6 +807,26 @@ impl BrokerGate {
 
 #[async_trait]
 impl ApprovalGate for BrokerGate {
+    async fn check_plan(
+        &self,
+        run_id: &str,
+        session_id: Option<&str>,
+        tool_call_id: &str,
+        summary: String,
+        payload: Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> GateDecision {
+        match self
+            .broker
+            .request_plan(run_id, session_id, tool_call_id, summary, payload, cancel)
+            .await
+        {
+            Verdict::Approved => GateDecision::Allow,
+            Verdict::Denied(reason) => GateDecision::Deny(reason),
+            Verdict::Aborted(reason) => GateDecision::AbortRun(reason),
+        }
+    }
+
     async fn check(
         &self,
         info: &agent24_protocol::ToolInfo,
@@ -893,6 +981,7 @@ mod tests {
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
                     model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
                 },
                 output: None,
                 error: None,

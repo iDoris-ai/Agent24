@@ -83,6 +83,25 @@ pub trait ApprovalGate: Send + Sync {
         standing_target: Option<&str>,
         cancel: &CancellationToken,
     ) -> GateDecision;
+
+    /// H8 plan-mode approval. A submitted plan unlocks the full tool set for the
+    /// rest of the run, so this ALWAYS asks a human — there is deliberately no
+    /// auto-approval path (unlike [`check`], which a Guardian may fast-path).
+    /// Default is fail-closed: with no interactive channel installed a plan can
+    /// never proceed, exactly as `DenyAllGate` denies every gated tool.
+    async fn check_plan(
+        &self,
+        _run_id: &str,
+        _session_id: Option<&str>,
+        _tool_call_id: &str,
+        _summary: String,
+        _payload: Map<String, Value>,
+        _cancel: &CancellationToken,
+    ) -> GateDecision {
+        GateDecision::Deny(
+            "plan mode requires an interactive approval channel (fail-closed)".to_owned(),
+        )
+    }
 }
 
 /// A user's local adjustment of a tool's declared [`RiskClass`] (H2).
@@ -343,6 +362,36 @@ impl ToolRegistry {
                 }
             })
             .collect()
+    }
+
+    /// Tools advertised to the model while a run is in plan mode (H8): the
+    /// read-only subset only. Write/exec/external tools are structurally absent
+    /// from the model's options — there is nothing to bypass because they were
+    /// never offered — until it submits a plan and the human approves it. The
+    /// agent loop pairs this list with a synthetic `propose_plan` advert.
+    pub fn plan_adverts(&self) -> Vec<ToolAdvert> {
+        self.adverts()
+            .into_iter()
+            .filter(|a| self.tool_risk_class(&a.name) == Some(RiskClass::Read))
+            .collect()
+    }
+
+    /// H8: ask the installed gate for a human decision on a submitted plan.
+    /// Fail-closed when no interactive channel exists (see
+    /// [`ApprovalGate::check_plan`]). `Allow` means the human approved it and
+    /// the run may leave read-only.
+    pub async fn request_plan(
+        &self,
+        run_id: &str,
+        session_id: Option<&str>,
+        tool_call_id: &str,
+        summary: String,
+        payload: Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> GateDecision {
+        self.gate
+            .check_plan(run_id, session_id, tool_call_id, summary, payload, cancel)
+            .await
     }
 
     /// The dispatch pipeline. Every policy refusal is `ToolError::Denied` so

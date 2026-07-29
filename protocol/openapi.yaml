@@ -764,6 +764,16 @@ components:
         queued|running|awaiting_approval → cancelled.
       enum: [queued, running, awaiting_approval, completed, failed, cancelled]
 
+    RunMode:
+      type: string
+      enum: [normal, plan]
+      default: normal
+      description: >
+        H8 plan mode. `plan` starts the run under a read-only tool gate — only
+        Read-class tools and `propose_plan` are offered — until the model
+        submits a plan a human approves, which unlocks the full tool set for that
+        run. Additive: absent/unknown reads as `normal`.
+
     RunInput:
       type: object
       required: [prompt]
@@ -772,6 +782,8 @@ components:
           type: string
         model_override:
           type: [string, "null"]
+        mode:
+          $ref: "#/components/schemas/RunMode"
 
     RunOutput:
       type: object
@@ -831,6 +843,8 @@ components:
           type: string
         model_override:
           type: [string, "null"]
+        mode:
+          $ref: "#/components/schemas/RunMode"
 
     ToolCallStatus:
       type: string
