@@ -113,6 +113,15 @@ Searle 五类言语行为都由它承载:directive→`ask`/`cfp`,commissive→`o
 
 未来 `tip`(跨 relay 付费,AAstar Point)作为一个意图接入,不是新信封——先不做,遵循「先有消费者再有提供者」。
 
+### 4.5 上游依赖与已知缺口(经 CC-82 与 agent-speaker 核对,2026-07-29)
+
+- **content 透传:已确认无损** —— agent msg 把 content 当不透明字节流(zstd→可选 NIP-44,收端逆向),不解析/改写 JSON。信封载荷放心塞。
+- **⚠️ 已知缺口(agent-speaker 现存,非 F4 引入):`agent msg` 在标准 relay 上会被覆盖。** agent msg 与 profile publish 同用 kind **30078**,但 agent msg **没有 `d` 标签**;NIP-01 规定 30000–39999 整段是 addressable,无 `d` 即 `d=""` → 同发送者多条 agent msg 落同一坐标,严格 relay 只留最新、前面静默丢。**CFP/连续 say 会被折叠。** 本地 messages.db 逐条落盘掩盖了它。
+  - **决策:方案 A**——agent-speaker 给每条 agent msg 加唯一 `d` 标签(内容 hash),等价普通 event,保留"全收敛到 30078"设计。agent-speaker 排期中(连同下方 2 个 --json 缺口)。**在 d 标签落地前,F4a 入站以本地 messages.db / `agent inbox --json` 为准(逐条落盘,不受 relay 覆盖影响)。**
+- **`expires_at` 是应用层字段** —— F4 自判过期,**不依赖 relay 物理清理**(不要 NIP-40)。agent-speaker 无需为此做事。
+- **2 个 `--json` 缺口(非阻塞):** `profile publish`、`history inbox` 未接 `--json`(纯 emoji 文本)。agent-speaker 排期修。F4a 期间:入站走 **messages.db 直读 / `agent inbox --json`**(注意不是 `history inbox`);出站 `profile publish` 先靠退出码,`--json` 到位再切结构化结果。
+- **R2 已实现**:`profile publish --json-file` 吃 **JSON 不吃 YAML**。F4 保留 `agent-profile.yml` 作人类可编辑源(§5),发布前 bridge 转 YAML→JSON(字段对齐:`rate_sheet` 下划线)再喂 `--json-file`。
+
 ---
 
 ## 5. 能力抽象:原子能力 → 业务能力（可编辑）
