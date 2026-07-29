@@ -7,6 +7,8 @@ import {
   IpcChannels,
   type BackendProxyRequest,
   type BackendProxyResponse,
+  type DiscoverFilter,
+  type DiscoveredModule,
   type LlmStatusResult,
   type ModuleInfo,
   type ModuleInstallResult,
@@ -36,6 +38,8 @@ const api = {
     ipcRenderer.invoke(IpcChannels.OmlxWarmup, url, apiKey, modelId),
   modulesList: (): Promise<ModuleInfo[]> =>
     ipcRenderer.invoke(IpcChannels.ModulesList),
+  modulesDiscover: (filter?: DiscoverFilter): Promise<DiscoveredModule[]> =>
+    ipcRenderer.invoke(IpcChannels.ModulesDiscover, filter ?? {}),
   modulesEnable: (id: string): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke(IpcChannels.ModulesEnable, id),
   modulesDisable: (id: string): Promise<{ ok: boolean }> =>

@@ -289,7 +289,7 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 | ID | 任务 | 依赖 | 状态 |
 |---|---|---|---|
 | F1a | headless 开机自启：`agent24 service install/uninstall/status`（macOS LaunchAgent） | M-D | **done** #51 |
-| F1b | 托盘常驻（菜单栏状态/启停） | F1a | pending |
+| F1b | 托盘常驻（菜单栏状态/启停） | F1a | **done**：托盘显示 daemon 实时状态（⚡运行/…启动中/⚠️已停）+ 启动/停止/重启菜单项，4s 轮询刷新。`BackendManager` 加 `status()/startDaemon()/stopDaemon()/restart()` + `userStopped` 标志（手动停不被健康循环自动重拉）+ 纯 `deriveStatus` 状态机（单测覆盖） |
 | F2 | 崩溃自愈 | F1a | **done** #51（见下方设计变更） |
 | F3 | 微信渠道（**WeChat iLink 官方 Bot API**）：入站消息 → run，审批经微信完成 | C8 + 用户确认 | **merged #78 + #79**（`packages/wechat-bridge`；#79 加鉴权白名单+per-user 串行+FIFO 审批队列。**实机需用户扫码验证**） |
 | F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | **设计定稿**（`F4-nostr-channel.md`，经 Codex 对抗式挑战）：subprocess 驱动 agent-speaker CLI（G3）+ **信封+意图协议**（3 信封 say/announce/listen + content 里开放意图字段 + thread_id/expires_at 关联位；意图与动作分解交给 agent LLM/H8 plan mode，不写死）+ 原子→业务能力抽象（可编辑 `agent-profile.yml`）+ npub 白名单+gated 入站。**✅ 契约收官（2026-07-29，CC-82 双向真联调）**：F4a 出站 merged #85（register/say/search + 默认注册 + YAML→JSON profile + FakeNostr harness）；F4b 入站 merged #86 + 硬化 #87；联调对接 agent-speaker#29 结构化 JSON merged #89；inbox dedup 修 merged #92；**strfry 真 NIP-33 relay 覆盖定论 merged #93**（profile×3→折叠成1 反向对照 + agent msg×5→全存活，证 d-tag 修复在真 relay 生效）；**入站收尾 merged #95**（切 `history inbox --as <identity>` + 真 hex event_id dedup，消费 agent-speaker#30 的 hex id + --as，拆掉 `identity use` workaround）。上游 agent-speaker 待办全落地（d 标签#29 + 2×--json#29 + history id/daemon dedup + --as#30）。**剩:F5 泡测(物理)+ R3(headless 加密解锁,上游挂账,非阻塞)。** 契约见 §7 / `F4-nostr-channel.md` §4.5–4.7 |

@@ -39,6 +39,25 @@ export function selectedBackend(): BackendKind {
   return process.env['AGENT24_BACKEND'] === 'node' ? 'node' : 'rust'
 }
 
+/** Daemon lifecycle status surfaced to the tray (F1b). */
+export type BackendStatus = 'running' | 'starting' | 'stopped'
+
+/** Pure derivation of the tray status from the manager's observable state.
+ * Exported so the state machine is unit-testable without spawning a process:
+ * - a user-initiated stop pins `stopped` (the health loop won't auto-respawn);
+ * - a healthy endpoint is `running`;
+ * - anything else (spawned but not yet ready, or briefly between respawns) is
+ *   `starting`. */
+export function deriveStatus(s: {
+  userStopped: boolean
+  hasEndpoint: boolean
+  healthy: boolean
+}): BackendStatus {
+  if (s.userStopped) return 'stopped'
+  if (s.hasEndpoint && s.healthy) return 'running'
+  return 'starting'
+}
+
 function repoRootDev(): string {
   // __dirname = apps/desktop/dist/main → repo root is four levels up
   return path.join(__dirname, '..', '..', '..', '..')
@@ -92,10 +111,52 @@ export class BackendManager {
   private healthTimer: NodeJS.Timeout | null = null
   private failureCount = 0
   private readonly kind: BackendKind = selectedBackend()
+  // F1b: last observed health (drives the tray status), and whether the user
+  // deliberately stopped the daemon — while true, the health loop must NOT
+  // auto-respawn it (that would defeat a manual stop).
+  private lastHealthy = false
+  private userStopped = false
 
   start(): void {
     this.spawnChild()
     this.healthTimer = setInterval(() => { void this.tick() }, HEALTH_INTERVAL_MS)
+  }
+
+  /** Current lifecycle status for the tray (F1b). */
+  status(): BackendStatus {
+    return deriveStatus({
+      userStopped: this.userStopped,
+      hasEndpoint: currentEndpoint !== null,
+      healthy: this.lastHealthy,
+    })
+  }
+
+  /** Which backend implementation is running (shown in the tray tooltip). */
+  backendKind(): BackendKind {
+    return this.kind
+  }
+
+  /** Tray "启动 daemon": clear a prior manual stop and (re)spawn if needed. */
+  startDaemon(): void {
+    this.userStopped = false
+    this.failureCount = 0
+    if (!this.child) this.spawnChild()
+  }
+
+  /** Tray "停止 daemon": kill the child and keep it down (no auto-respawn). */
+  stopDaemon(): void {
+    this.userStopped = true
+    this.lastHealthy = false
+    this.killChild()
+  }
+
+  /** Tray "重启 daemon": kill + respawn regardless of prior state. */
+  restart(): void {
+    this.userStopped = false
+    this.failureCount = 0
+    this.lastHealthy = false
+    this.killChild()
+    this.spawnChild()
   }
 
   private spawnChild(): void {
@@ -171,7 +232,15 @@ export class BackendManager {
   }
 
   private async tick(): Promise<void> {
+    // A deliberate stop suspends supervision entirely — don't probe, don't
+    // count failures, and above all don't auto-respawn (F1b).
+    if (this.userStopped) {
+      this.lastHealthy = false
+      return
+    }
+
     const alive = await checkHealth(currentEndpoint)
+    this.lastHealthy = alive
     if (alive) {
       this.failureCount = 0
       return
