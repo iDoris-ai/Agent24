@@ -291,7 +291,7 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 | F1b | 托盘常驻（菜单栏状态/启停） | F1a | pending |
 | F2 | 崩溃自愈 | F1a | **done** #51（见下方设计变更） |
 | F3 | 微信渠道（**WeChat iLink 官方 Bot API**）：入站消息 → run，审批经微信完成 | C8 + 用户确认 | **merged #78 + #79**（`packages/wechat-bridge`；#79 加鉴权白名单+per-user 串行+FIFO 审批队列。**实机需用户扫码验证**） |
-| F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | pending |
+| F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | **设计完成**（`F4-nostr-channel.md`）：subprocess 驱动 agent-speaker CLI（G3 策略）+ 5 动词协议（register/post/search/answer/subscribe）+ 原子→业务能力抽象（可编辑 `agent-profile.yml`）+ npub 白名单+gated 入站。拆 F4a（出站+默认注册）/ F4b（入站+泡测）。与 agent-speaker 的契约见文档 §7，已经 goutou 同步 |
 | F5 | 7×24 稳定性验证：Mac mini 连续 7 天，日程照跑，无人工干预 | F2 | pending（F1a/F2 已就绪，可开始跑） |
 
 ### F3 落地：WeChat iLink 官方 Bot API（2026-07-28，用户指路 `~/Dev/tools/heinu1`）
