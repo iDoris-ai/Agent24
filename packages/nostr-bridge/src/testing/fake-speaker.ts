@@ -74,7 +74,7 @@ export class FakeSpeaker {
       this.calls.push(inv)
       return this.envelope(this.discoverResult)
     }
-    if (group === 'agent' && cmd === 'inbox') {
+    if (group === 'history' && cmd === 'inbox') {
       this.calls.push(inv)
       return this.envelope(this.inboxRows)
     }

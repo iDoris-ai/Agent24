@@ -133,11 +133,15 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
     expect(calls.prompts).toEqual(['one'])
   })
 
-  it('agent inbox rows (no id) get a stable synthesized key, so re-polling dedups', async () => {
+  it('history inbox: full sender_npub matches the allowlist; garbage id synthesizes a stable dedup key', async () => {
     const fake = new FakeSpeaker()
-    // the REAL `agent inbox --json` shape (verified in 联调): {time,from,content},
-    // NO id — the bridge must synthesize a stable dedup key.
-    fake.inboxRows = [{ time: '17:06', from: 'npub1alice', content: 'hi', encrypted: true, decrypted: true }]
+    // real `history inbox --json` StoredMessage: full sender_npub (so the
+    // fail-closed allowlist can actually match) + a non-hex garbage id
+    // (agent-speaker bug) → the bridge synthesizes a stable key from
+    // sender+created_at+content, and re-polling the same window dedups.
+    fake.inboxRows = [
+      { sender_npub: 'npub1alice', plaintext: 'hi', id: 'garbage', created_at: 1785318666, is_incoming: true },
+    ]
     const { b, calls } = bridge(fake, ['npub1alice'])
     const speaker = new SpeakerClient(fake.runner)
     await pollOnce(speaker, b)
