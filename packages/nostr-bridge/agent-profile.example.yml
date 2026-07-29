@@ -1,0 +1,31 @@
+# agent24 capability profile (F4 §5). Copy to ~/.agent24/agent-profile.yml.
+#
+# Only the `capabilities` (business) layer is published to the network. The
+# `atomic` layer is auto-generated from your enabled modules/tools and stays
+# local — it exists so a business capability can say what it's backed by.
+#
+# Edit the business layer freely: publish what a collaborator understands
+# ("reach the textile client segment"), not raw tools ("post_xiaohongshu").
+
+# ── auto: machine-generated from enabled modules/tools; do not hand-edit ──
+atomic:
+  - id: post_xiaohongshu
+    from: module:xiaohongshu
+  - id: send_wechat
+    from: module:wechat-bridge
+  - id: web_fetch
+    from: tool:http_fetch
+
+# ── business: user-editable; THIS is what gets published ──
+capabilities:
+  - name: "触达纺织业客户群"
+    description: "在小红书/微信触达纺织行业目标客户并回收反馈"
+    tags: [textile, marketing, outreach]
+    backed_by: [post_xiaohongshu, send_wechat]
+  - name: "内容分发"
+    tags: [content, distribution]
+    backed_by: [post_xiaohongshu]
+
+publish:
+  mode: tagged            # simple | tagged | structured
+  availability: "7x24"
