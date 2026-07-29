@@ -87,6 +87,29 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
     expect(calls.prompts).toHaveLength(1)
   })
 
+  it('a transient failure does NOT consume the event — a later poll retries it', async () => {
+    const fake = new FakeSpeaker()
+    let attempts = 0
+    const { b, calls } = bridge(fake, ['npub1alice'], () => {
+      attempts++
+      if (attempts === 1) throw new Error('daemon down') // transient
+      return { status: 'completed', text: 'ok', runId: 'r' }
+    })
+    const m = inbound('npub1alice', 'hi', 'ev-transient')
+    await b.handle(m) // attempt 1 throws → event un-committed
+    await b.handle(m) // retried → succeeds
+    expect(attempts).toBe(2)
+    expect(calls.prompts).toHaveLength(2)
+  })
+
+  it('cancelled: tells the peer the request was cancelled (not "still processing")', async () => {
+    const fake = new FakeSpeaker()
+    const { b } = bridge(fake, ['npub1alice'], () => ({ status: 'cancelled', runId: 'r' }))
+    await b.handle(inbound('npub1alice', 'hi'))
+    const reply = fake.lastContent()!
+    expect((reply.payload as { text: string }).text).toContain('取消')
+  })
+
   it('awaiting_approval: tells the peer it needs the owner to approve', async () => {
     const fake = new FakeSpeaker()
     const { b } = bridge(fake, ['npub1alice'], () => ({ status: 'awaiting_approval', runId: 'r' }))
