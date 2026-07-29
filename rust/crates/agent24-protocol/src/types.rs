@@ -116,11 +116,26 @@ pub enum RunStatus {
     Cancelled,
 }
 
+/// H8 plan mode. `plan` starts the run under a read-only tool gate — only
+/// Read-class tools and `propose_plan` are advertised — until the model submits
+/// a plan the human approves, which unlocks the full tool set for that run.
+/// Additive: absent/unknown deserializes to `normal`, so pre-H8 clients are
+/// unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    #[default]
+    Normal,
+    Plan,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunInput {
     pub prompt: String,
     #[serde(default)]
     pub model_override: Option<String>,
+    #[serde(default)]
+    pub mode: RunMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -155,6 +170,9 @@ pub struct RunCreate {
     pub prompt: String,
     #[serde(default)]
     pub model_override: Option<String>,
+    /// H8: `plan` starts the run read-only until a submitted plan is approved.
+    #[serde(default)]
+    pub mode: RunMode,
 }
 
 // ── ToolCall ─────────────────────────────────────────────────────────────────
