@@ -344,7 +344,7 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 | ID | 任务 | 依赖 | 状态 |
 |---|---|---|---|
 | G1 | **异步审批队列**：审批可离线批复，批准后再执行；含 payload 完整性校验 | F1a, C4 | pending |
-| G2 | 审批判据补充「对外/不可撤回」维度（现按工具种类分级） | C4 | pending |
+| G2 | 审批判据补充「对外/不可撤回」维度（现按工具种类分级） | C4 | **done（被 H1 #63 + H4 #62 覆盖）** |
 | G3 | CLI wrapper 集成策略（包二进制而非 vendor 源码）写入 SPEC-001 | — | **merged #77**（SPEC-001 §10：进程边界=授权边界，包二进制不 vendor 源码，与 §9/cargo-deny 互补） |
 
 ### G1 为什么重要（M-F 之后必然撞上）
@@ -382,6 +382,8 @@ MediaBot 按「**对外的、挂用户名字的、发出去撤不回来**」分�
 > **落地形态见 OpenWorker `RiskClass`**（`read/write_local/exec/external`，见 openworker.md §1）：
 > 分级的价值不在于分得细，而在于**不同级享有不同的豁免路径**——只有 `external` 能拿常驻定向授权，
 > `exec` 永远问。H1 按这个形态实现，G2 即随之满足。
+
+**验证 done（2026-07-29）**：预言成立，G2 无需独立实现——「对外/不可撤回」维度即 `RiskClass::External`，已随 H1 #63 落地并赋给真实工具（MCP 工具 `agent24-mcp/src/lib.rs:239` 归 `External`「so it goes through the human approval」），差异化豁免路径由 H4 #62 提供：`standing_grant_eligible()` 仅 `External` 为真（`types.rs:398`）、`target_arg` 承载定向授权、`exec` 永远问。工具种类维度（`kind`：exec/fs_write/network/module）并存供 Guardian `always_review`，与风险级**叠加而非替换**，正是本任务要求。故标 done，不另开实现 PR。
 
 ### G3 授权策略
 
