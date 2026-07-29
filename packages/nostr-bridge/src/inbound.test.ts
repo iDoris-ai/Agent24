@@ -133,6 +133,18 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
     expect(calls.prompts).toEqual(['one'])
   })
 
+  it('agent inbox rows (no id) get a stable synthesized key, so re-polling dedups', async () => {
+    const fake = new FakeSpeaker()
+    // the REAL `agent inbox --json` shape (verified in 联调): {time,from,content},
+    // NO id — the bridge must synthesize a stable dedup key.
+    fake.inboxRows = [{ time: '17:06', from: 'npub1alice', content: 'hi', encrypted: true, decrypted: true }]
+    const { b, calls } = bridge(fake, ['npub1alice'])
+    const speaker = new SpeakerClient(fake.runner)
+    await pollOnce(speaker, b)
+    await pollOnce(speaker, b) // same last-N window again — must NOT re-run
+    expect(calls.prompts).toEqual(['hi'])
+  })
+
   it('agent-speaker error envelope surfaces as a thrown error', async () => {
     const fake = new FakeSpeaker()
     fake.nextError = 'keystore is locked'
