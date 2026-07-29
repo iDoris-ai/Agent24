@@ -1,0 +1,21 @@
+{
+  "name": "@agent24/nostr-bridge",
+  "version": "0.2.1",
+  "private": true,
+  "description": "F4: Nostr channel for agent24 over the decentralized agent-collaboration network, driven by the agent-speaker CLI (G3 'package the binary'). F4a: outbound — default-register the agent's business capabilities, say (directed), search (discover by capability). Envelope+intent protocol (docs/specs/F4-nostr-channel.md §4).",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.5"
+  }
+}
