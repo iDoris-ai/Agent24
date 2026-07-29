@@ -291,8 +291,8 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 | F1b | 托盘常驻（菜单栏状态/启停） | F1a | pending |
 | F2 | 崩溃自愈 | F1a | **done** #51（见下方设计变更） |
 | F3 | 微信渠道（**WeChat iLink 官方 Bot API**）：入站消息 → run，审批经微信完成 | C8 + 用户确认 | **merged #78 + #79**（`packages/wechat-bridge`；#79 加鉴权白名单+per-user 串行+FIFO 审批队列。**实机需用户扫码验证**） |
-| F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | **设计定稿**（`F4-nostr-channel.md`，经 Codex 对抗式挑战）：subprocess 驱动 agent-speaker CLI（G3）+ **信封+意图协议**（3 信封 say/announce/listen + content 里开放意图字段 + thread_id/expires_at 关联位；意图与动作分解交给 agent LLM/H8 plan mode，不写死）+ 原子→业务能力抽象（可编辑 `agent-profile.yml`）+ npub 白名单+gated 入站。**F4a 出站 merged #85**（register/say/search + 默认注册 + YAML→JSON profile + FakeNostr harness）；**F4b 入站 in-pr**（`inbound.ts`:npub 白名单 fail-closed + per-npub session + dedup + gated run + reply-as-answer + inbox 轮询,17 测试）。**F5 7×24 泡测**（Mac mini 连跑,物理时间）单列待做。与 agent-speaker 的契约见 §7，已经 goutou 同步（CC-82;agent-speaker 待办=d 标签方案A + 2 个 --json） |
-| F5 | 7×24 稳定性验证：Mac mini 连续 7 天，日程照跑，无人工干预 | F2 | pending（F1a/F2 已就绪，可开始跑） |
+| F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | **设计定稿**（`F4-nostr-channel.md`，经 Codex 对抗式挑战）：subprocess 驱动 agent-speaker CLI（G3）+ **信封+意图协议**（3 信封 say/announce/listen + content 里开放意图字段 + thread_id/expires_at 关联位；意图与动作分解交给 agent LLM/H8 plan mode，不写死）+ 原子→业务能力抽象（可编辑 `agent-profile.yml`）+ npub 白名单+gated 入站。**代码 done**：F4a 出站 merged #85（register/say/search + 默认注册 + YAML→JSON profile + FakeNostr harness）；F4b 入站 merged #86 + 硬化 #87（`inbound.ts`:npub 白名单 fail-closed + per-npub session + 有界 dedup + 临时失败重试 + gated run + reply-as-answer + inbox 轮询）。**剩:F5 泡测(物理)+ agent-speaker 待办(d 标签方案A + 2 个 --json,经 CC-82 协同并行)。** 契约见 §7 |
+| F5 | 7×24 稳定性验证：Mac mini 连续 7 天，日程照跑，无人工干预 | F2 | pending（**物理任务**，F1a/F2 已就绪、F3 微信 + F4 Nostr 渠道代码已就位，可开始跑；需用户在 Mac mini 上实机执行 + F3/F4 各扫码/建 identity） |
 
 ### F3 落地：WeChat iLink 官方 Bot API（2026-07-28，用户指路 `~/Dev/tools/heinu1`）
 
