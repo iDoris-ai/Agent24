@@ -12,6 +12,7 @@
 //     non-interactively today; see the F4 doc / CC-82 R3).
 
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import type { AgentSpeakerProfile } from './profile.js'
 
 /** Runs one agent-speaker invocation and resolves its stdout. */
@@ -90,6 +91,13 @@ export class SpeakerClient {
     return this.relay ? ['--relay', this.relay] : []
   }
 
+  /** Make this bridge's identity the keystore default, so `inbox()` (which uses
+   * `history inbox`, and it has no `--as`) reads THIS agent's inbox. Called once
+   * at startup. */
+  async useIdentity(): Promise<void> {
+    if (this.identity) await this.run(['identity', 'use', this.identity])
+  }
+
   /** register → `profile publish --as <id> --json-file <file> --json`. */
   async publishProfile(identity: string, jsonFile: string): Promise<PublishResult> {
     const out = await this.run([
@@ -138,24 +146,43 @@ export class SpeakerClient {
   }
 
   /** listen/subscribe (inbound) → `agent inbox --as <id> --json`. The daemon
-   * pulls inbound to the local store; this reads it. Maps agent-speaker's
-   * StoredMessage (`sender_npub` / `plaintext` / `id` / `is_incoming`), keeping
-   * fallbacks for a version skew. Only INCOMING messages surface. */
+   * pulls inbound to the local store; this reads it.
+   *
+   * Verified in 联调: `agent inbox --json` returns `{time, from, content,
+   * encrypted, decrypted}` — `from` is the sender npub, `content` is the
+   * plaintext (`decrypted` is a boolean flag, NOT text), and there is NO id.
+   * So we SYNTHESIZE a stable dedup key from sender+time+content — without it
+   * every poll re-processes the same (last-N) window of messages. Fallbacks are
+   * kept for a version skew (older StoredMessage-shaped output). */
   async inbox(): Promise<InboundMessage[]> {
-    const args = ['agent', 'inbox']
-    if (this.identity) args.push('--as', this.identity)
-    args.push('--json', ...this.relayArgs())
-    const data = unwrap<unknown>(await this.run(args), 'agent inbox')
+    // history inbox (daemon-populated local store), NOT agent inbox: agent
+    // inbox's `from` is a truncated/nickname DISPLAY string that never matches
+    // the full-npub allowlist; history inbox's StoredMessage has the full
+    // sender_npub. It has no --as, so the bridge reads its DEFAULT identity.
+    const data = unwrap<unknown>(await this.run(['history', 'inbox', '--json']), 'history inbox')
     const rows = Array.isArray(data) ? data : ((data as { messages?: unknown[] })?.messages ?? [])
     return (rows as Record<string, unknown>[])
-      .filter((r) => r.is_incoming !== false) // absent (older build) → treat as inbound
-      .map((r) => ({
-        from: String(r.sender_npub ?? r.from ?? r.from_npub ?? r.sender ?? ''),
-        content: String(r.plaintext ?? r.content ?? r.text ?? ''),
-        event_id:
-          r.id != null ? String(r.id) : r.event_id != null ? String(r.event_id) : undefined,
-        created_at: typeof r.created_at === 'number' ? r.created_at : undefined,
-      }))
+      .filter((r) => r.is_incoming !== false) // absent → it's the inbox, all incoming
+      .map((r) => {
+        const from = String(r.sender_npub ?? r.from ?? r.from_npub ?? r.sender ?? '')
+        const content = String(r.plaintext ?? r.content ?? r.text ?? '')
+        // history inbox `id` is currently non-hex garbage (agent-speaker known
+        // bug); use it only when it looks like a real event id, else synthesize
+        // a stable key from sender + created_at + content (created_at is a real
+        // timestamp, finer than agent inbox minute-only `time`).
+        const realId =
+          typeof r.id === 'string' && /^[0-9a-f]{16,}$/i.test(r.id) ? r.id : undefined
+        const stamp = String(r.created_at ?? r.received_at ?? r.time ?? '')
+        const event_id =
+          realId ??
+          createHash('sha1').update(`${from} ${stamp} ${content}`).digest('hex').slice(0, 24)
+        return {
+          from,
+          content,
+          event_id,
+          created_at: typeof r.created_at === 'number' ? r.created_at : undefined,
+        }
+      })
   }
 }
 

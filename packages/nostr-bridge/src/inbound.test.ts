@@ -133,6 +133,22 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
     expect(calls.prompts).toEqual(['one'])
   })
 
+  it('history inbox: full sender_npub matches the allowlist; garbage id synthesizes a stable dedup key', async () => {
+    const fake = new FakeSpeaker()
+    // real `history inbox --json` StoredMessage: full sender_npub (so the
+    // fail-closed allowlist can actually match) + a non-hex garbage id
+    // (agent-speaker bug) → the bridge synthesizes a stable key from
+    // sender+created_at+content, and re-polling the same window dedups.
+    fake.inboxRows = [
+      { sender_npub: 'npub1alice', plaintext: 'hi', id: 'garbage', created_at: 1785318666, is_incoming: true },
+    ]
+    const { b, calls } = bridge(fake, ['npub1alice'])
+    const speaker = new SpeakerClient(fake.runner)
+    await pollOnce(speaker, b)
+    await pollOnce(speaker, b) // same last-N window again — must NOT re-run
+    expect(calls.prompts).toEqual(['hi'])
+  })
+
   it('agent-speaker error envelope surfaces as a thrown error', async () => {
     const fake = new FakeSpeaker()
     fake.nextError = 'keystore is locked'
