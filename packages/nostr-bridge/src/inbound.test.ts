@@ -154,4 +154,30 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
     fake.nextError = 'keystore is locked'
     await expect(new SpeakerClient(fake.runner).inbox()).rejects.toThrow(/keystore is locked/)
   })
+
+  it('inbox() targets its own identity via `history inbox --as` (no identity-use hijack)', async () => {
+    // agent-speaker#30 gave history inbox --as; the bridge reads ITS identity's
+    // inbox directly instead of hijacking the keystore default. With no identity
+    // set, --as is omitted (reads the default).
+    const fake = new FakeSpeaker()
+    await new SpeakerClient(fake.runner, { identity: 'f4-me' }).inbox()
+    const call = fake.calls.find((c) => c.args[0] === 'history' && c.args[1] === 'inbox')!
+    expect(call.args).toEqual(expect.arrayContaining(['--as', 'f4-me']))
+    // the bridge must NOT mutate the global default identity
+    expect(fake.calls.some((c) => c.args[0] === 'identity' && c.args[1] === 'use')).toBe(false)
+
+    const anon = new FakeSpeaker()
+    await new SpeakerClient(anon.runner).inbox()
+    expect(anon.calls[0]?.args).not.toContain('--as')
+  })
+
+  it('uses the real hex event_id as the dedup key (agent-speaker#30), not a synthesized one', async () => {
+    const fake = new FakeSpeaker()
+    const hexId = 'c2abfcb7a9fb305dc17cc213d10e2f8bd81d411658ffa027b303d1d62d8f6a7e'
+    fake.inboxRows = [
+      { sender_npub: 'npub1alice', plaintext: 'hi', id: hexId, created_at: 1785318666, is_incoming: true },
+    ]
+    const [msg] = await new SpeakerClient(fake.runner).inbox()
+    expect(msg?.event_id).toBe(hexId) // real id, not the sha1 synth fallback
+  })
 })

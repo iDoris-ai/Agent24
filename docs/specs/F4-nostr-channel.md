@@ -119,7 +119,7 @@ Searle 五类言语行为都由它承载:directive→`ask`/`cfp`,commissive→`o
 - **✅ 已修复并经真 relay 验证(原缺口:`agent msg` 在标准 relay 上会被覆盖):** agent msg 与 profile publish 同用 kind **30078**,原先 agent msg **没有 `d` 标签**;NIP-01 规定 30000–39999 整段是 addressable,无 `d` 即 `d=""` → 同发送者多条 agent msg 落同一坐标,严格 relay 只留最新、前面静默丢(CFP/连续 say 被折叠;本地 messages.db 逐条落盘掩盖了它)。
   - **决策:方案 A**——agent-speaker 给每条 agent msg 加唯一 `d` 标签(内容 hash),等价普通 event,保留"全收敛到 30078"设计。**已落地当前二进制,并在真 NIP-33 relay 上验证通过(见 §4.7)。**
 - **`expires_at` 是应用层字段** —— F4 自判过期,**不依赖 relay 物理清理**(不要 NIP-40)。agent-speaker 无需为此做事。
-- **2 个 `--json` 缺口(非阻塞):** `profile publish`、`history inbox` 未接 `--json`(纯 emoji 文本)。agent-speaker 排期修。F4a 期间:入站走 **messages.db 直读 / `agent inbox --json`**(注意不是 `history inbox`);出站 `profile publish` 先靠退出码,`--json` 到位再切结构化结果。
+- **✅ 2 个 `--json` 缺口已修(agent-speaker#29)+ 入站身份/id 已修(agent-speaker#30):** `profile publish` / `history inbox` 都接了 `--json`;`history inbox` 的 `id` 从 raw-byte 乱码改成正确 hex(与 `agent msg` 返回的 `event_id` 逐字节一致),并新增 `--as <identity>`。**最终入站走 `history inbox --as <identity> --json`**——完整 `sender_npub`(fail-closed 白名单可匹配)、真 hex `event_id` 直接做 dedup(不再合成 key)、`--as` 精确读本 agent 收件箱(不再 `identity use` 抢全局默认,多 bridge 共享 keystore 不打架)。**不用 `agent inbox`**:它的 `from` 是截断显示串,白名单匹配不上(§4.6 表补记)。
 - **R2 已实现**:`profile publish --json-file` 吃 **JSON 不吃 YAML**。F4 保留 `agent-profile.yml` 作人类可编辑源(§5),发布前 bridge 转 YAML→JSON(字段对齐:`rate_sheet` 下划线)再喂 `--json-file`。
 
 ### 4.6 联调验证的命令契约(2026-07-29,对真二进制跑出来的)
@@ -136,6 +136,7 @@ Searle 五类言语行为都由它承载:directive→`ask`/`cfp`,commissive→`o
 
 - **headless 需无密码 identity**:加密 keystore 目前**无法非交互解锁**(inbox/msg 无 `--password`,无 unlock 命令,`AGENT_SPEAKER_PASSWORD` env 无效)。自动化 agent 用 `identity create`(不带 `--password`)的无密码 keystore;若要加密 headless,需 agent-speaker 加非交互解锁(**R3**)。
 - **端到端验证**:`profile publish --as … --json-file … --json` 全字段校验通过、返回结构化 `PublishResult`;唯 `relay.aastar.io` 从测试环境返回 **HTTP 530**(relay 不可达),故 `published_to:0`,`register()` 正确报"no relays"。真投递需可达 relay(用户环境)。
+- **入站数据源:从 `agent inbox` 切到 `history inbox --as`(真联调 + code review 连锁逮到 2 个我方 bug):** 第一版入站读 `agent inbox --json`,后发现 ① 它无 `id` → 每轮重复处理(#92 先合成 dedup key 顶);② 更严重:它的 `from` 是**截断显示串**(`npub1m8vyv6m3g48...` 或昵称,源码 `senderName := senderNpub[:16]+"..."`),完整 npub 被丢,fail-closed 白名单永远匹配不上 → 真 CLI 上入站**全拒**。改读 `history inbox`(StoredMessage 带完整 `sender_npub`)。agent-speaker#30 落地后再切 `history inbox --as <identity>` + 真 hex `event_id` dedup,去掉合成 key 与 `identity use` workaround(见 §4.5 末条)。**教训:mock 建模成理想 shape 会掩盖真 CLI 的字段截断/编码问题——只有真联调 + review 才逮得到。**
 
 ### 4.7 真 NIP-33 relay 覆盖验证(2026-07-29,strfry)
 
