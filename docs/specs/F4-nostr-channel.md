@@ -116,8 +116,8 @@ Searle 五类言语行为都由它承载:directive→`ask`/`cfp`,commissive→`o
 ### 4.5 上游依赖与已知缺口(经 CC-82 与 agent-speaker 核对,2026-07-29)
 
 - **content 透传:已确认无损** —— agent msg 把 content 当不透明字节流(zstd→可选 NIP-44,收端逆向),不解析/改写 JSON。信封载荷放心塞。
-- **⚠️ 已知缺口(agent-speaker 现存,非 F4 引入):`agent msg` 在标准 relay 上会被覆盖。** agent msg 与 profile publish 同用 kind **30078**,但 agent msg **没有 `d` 标签**;NIP-01 规定 30000–39999 整段是 addressable,无 `d` 即 `d=""` → 同发送者多条 agent msg 落同一坐标,严格 relay 只留最新、前面静默丢。**CFP/连续 say 会被折叠。** 本地 messages.db 逐条落盘掩盖了它。
-  - **决策:方案 A**——agent-speaker 给每条 agent msg 加唯一 `d` 标签(内容 hash),等价普通 event,保留"全收敛到 30078"设计。agent-speaker 排期中(连同下方 2 个 --json 缺口)。**在 d 标签落地前,F4a 入站以本地 messages.db / `agent inbox --json` 为准(逐条落盘,不受 relay 覆盖影响)。**
+- **✅ 已修复并经真 relay 验证(原缺口:`agent msg` 在标准 relay 上会被覆盖):** agent msg 与 profile publish 同用 kind **30078**,原先 agent msg **没有 `d` 标签**;NIP-01 规定 30000–39999 整段是 addressable,无 `d` 即 `d=""` → 同发送者多条 agent msg 落同一坐标,严格 relay 只留最新、前面静默丢(CFP/连续 say 被折叠;本地 messages.db 逐条落盘掩盖了它)。
+  - **决策:方案 A**——agent-speaker 给每条 agent msg 加唯一 `d` 标签(内容 hash),等价普通 event,保留"全收敛到 30078"设计。**已落地当前二进制,并在真 NIP-33 relay 上验证通过(见 §4.7)。**
 - **`expires_at` 是应用层字段** —— F4 自判过期,**不依赖 relay 物理清理**(不要 NIP-40)。agent-speaker 无需为此做事。
 - **2 个 `--json` 缺口(非阻塞):** `profile publish`、`history inbox` 未接 `--json`(纯 emoji 文本)。agent-speaker 排期修。F4a 期间:入站走 **messages.db 直读 / `agent inbox --json`**(注意不是 `history inbox`);出站 `profile publish` 先靠退出码,`--json` 到位再切结构化结果。
 - **R2 已实现**:`profile publish --json-file` 吃 **JSON 不吃 YAML**。F4 保留 `agent-profile.yml` 作人类可编辑源(§5),发布前 bridge 转 YAML→JSON(字段对齐:`rate_sheet` 下划线)再喂 `--json-file`。
@@ -136,6 +136,19 @@ Searle 五类言语行为都由它承载:directive→`ask`/`cfp`,commissive→`o
 
 - **headless 需无密码 identity**:加密 keystore 目前**无法非交互解锁**(inbox/msg 无 `--password`,无 unlock 命令,`AGENT_SPEAKER_PASSWORD` env 无效)。自动化 agent 用 `identity create`(不带 `--password`)的无密码 keystore;若要加密 headless,需 agent-speaker 加非交互解锁(**R3**)。
 - **端到端验证**:`profile publish --as … --json-file … --json` 全字段校验通过、返回结构化 `PublishResult`;唯 `relay.aastar.io` 从测试环境返回 **HTTP 530**(relay 不可达),故 `published_to:0`,`register()` 正确报"no relays"。真投递需可达 relay(用户环境)。
+
+### 4.7 真 NIP-33 relay 覆盖验证(2026-07-29,strfry)
+
+§4.5 的 d-tag 折叠缺口,minirelay(agent-speaker 自带测试 relay)**不实现可替换事件淘汰**,所以永远测不出来。用一个**合规 strfry**(`dockurr/strfry`,实现 NIP-01 addressable 折叠)对着真二进制跑,得到铁证:
+
+| 实验 | 命令 | strfry 上存活 | 结论 |
+|---|---|---|---|
+| **反向对照** | `profile publish` ×3(固定 d 坐标) | **1**(后覆盖前) | strfry **确实**折叠同 `(kind,pubkey,d)` 坐标——验证机制真实存在 |
+| **连发不丢** | `agent msg` ×5(alice→bob) | **5**(各自唯一 d) | d-tag 修复**生效**:每条落独立坐标,真 relay 上一条不丢 |
+
+直接对 strfry 发 `REQ {authors:[alice], kinds:[30078]}` 取 ground truth(不经 agent-speaker 本地 db,排除"messages.db 逐条落盘掩盖"):6 个事件、6 个不同 `d` 坐标、每坐标恰 1 条。5 条 agent msg 的 `d` 各不相同(内容 hash),profile 的 3 次发布折叠为 1。**§4.5 的缺口正式关闭。**
+
+> 复现:`docker run -d -p 7778:7777 dockurr/strfry`(需在 strfry.conf 清空 `writePolicy.plugin` 关掉默认白名单),`agent msg --relay ws://localhost:7778`,再对 relay 发原始 REQ 数存活事件。
 
 ---
 
