@@ -27,7 +27,7 @@ use agent24_memory::session::{CanonicalSession, CompactionPolicy, Summarizer};
 use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
 use agent24_protocol::{
-    Approval, ApprovalStatus, Decision, ErrorBody, EventBody, ModelDeltaPayload, Run,
+    Approval, ApprovalStatus, Decision, ErrorBody, EventBody, ModelDeltaPayload, RiskClass, Run,
     RunCancelledPayload, RunCompletedPayload, RunCreate, RunFailedPayload, RunInput, RunMode,
     RunOutputPayload, RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
     ToolCompletedStatus, ToolStartedPayload, Usage,
@@ -1167,6 +1167,26 @@ impl RunManager {
                             return;
                         }
                     }
+                    continue;
+                }
+                // H8: enforce read-only at the DISPATCH boundary, not only at the
+                // advertising layer. A rogue / hallucinating model (or one fed
+                // adversarial content through a read tool) could emit a write /
+                // exec / external call that was never offered; routed through the
+                // normal gate it might be auto-satisfied by a pre-existing H4
+                // standing grant or a Guardian fast-path — executing with no plan
+                // ever approved. Fail-closed here, before any of that runs, so
+                // `propose_plan` stays the only way out of read-only. (`None` =
+                // unknown tool → also denied.)
+                if plan_mode && self.tools.tool_risk_class(&call.name) != Some(RiskClass::Read) {
+                    let denied = Msg::tool_result(
+                        call.id.clone(),
+                        "denied: plan mode is read-only — call propose_plan and have it \
+                         approved before using this tool"
+                            .to_owned(),
+                    );
+                    self.persist_message(&run_id, &denied).await;
+                    messages.push(denied);
                     continue;
                 }
                 match self
@@ -2813,6 +2833,43 @@ mod approval_tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool, "propose_plan");
         assert_eq!(calls[0].status, ToolCallStatus::Denied);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_a_direct_write_call_at_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        // A rogue provider emits shell_exec DIRECTLY in plan mode, without ever
+        // proposing a plan. It must be denied at the dispatch boundary — never
+        // reaching the gate (where a standing grant / Guardian could otherwise
+        // auto-approve it). Turns are last-first: final answer, then the rogue
+        // call.
+        let h = scripted_plan_harness(
+            dir.path().to_path_buf(),
+            vec![
+                Msg::assistant(Some("stopped".to_owned()), vec![]),
+                Msg::assistant(
+                    None,
+                    vec![agent24_models::ToolCallRequest {
+                        id: "rogue".to_owned(),
+                        name: "shell_exec".to_owned(),
+                        arguments: serde_json::json!({ "argv": ["/bin/echo", "PWNED"] })
+                            .to_string(),
+                    }],
+                ),
+            ],
+        )
+        .await;
+        let run = h.manager.start_run(create_plan()).await.unwrap();
+        let done = wait_terminal(&h.store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        // The rogue call was refused before it could become a gated tool call,
+        // so no shell_exec ever ran and the run finished on the next model turn.
+        assert_eq!(done.output.unwrap().text, "stopped");
+        let calls = h.store.list_tool_calls(&run.id).await.unwrap();
+        assert!(
+            calls.iter().all(|c| c.tool != "shell_exec"),
+            "a write/exec call in plan mode must be denied at dispatch, never executed"
+        );
     }
 
     /// Like [`harness`] but with an EMPTY script: the first model call after a
