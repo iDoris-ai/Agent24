@@ -8,6 +8,7 @@
 > 2026-07-24 追加 **M-H（从 OpenWorker 借鉴：人机边界）**，并据此修订 G1/G2 的落地形态。
 > 2026-07-26 **发布 v0.2.0**：H1/H2/H4/H12/H9 已合并（人机边界线）。剩 H5/H8 未阻塞待专注做，H3/H10/H11 阻塞于未建的 G1/E3/F3。
 > 2026-07-28 **同步真实状态**：P0（G1+H3 #70/#72）✅、P2（E3 #74/E4 #73/H10 #75）✅、P1 渠道 **F3 微信 #78+#79** ✅、H5 #76 ✅、G3 #77 ✅、C8 #42 ✅。所有 PR 已 merged，无 open PR。**P4 门前剩余可做：H11 → F4 → F1b → H8 → G2**（P1 渠道补齐 + P3 自主性），做完撞 P4 门须用户确认。
+> 2026-07-29 **P4 门前全部收口**：H11 ✅#81、**H8 ✅#82**、G2 ✅（H1/H4 覆盖，见 §H8 区）已 merged。**F4 Nostr 契约收官**：与 agent-speaker 经 CC-82 双向真联调，落地 F4a#85/F4b#86#87 + 联调#89 + inbox dedup#92 + **strfry 真 NIP-33 relay 覆盖定论#93** + **入站收尾#95**（`history inbox --as` + 真 hex event_id，消费 agent-speaker#30）；唯 R3（headless 加密解锁，上游）挂账。**P4 起步**：模块 marketplace 后端已落 — 发现服务#90/#91 + 浏览过滤#94（`?q=&tier=&installed=`）。**P4 门前 P0/P2/P3 全清零，P1 仅剩 F1b（缺 desktop 包）+ F5（物理泡测）。撞 P4 门，越过需用户确认。**
 
 ## 执行顺序总览（最佳路径）
 
@@ -291,7 +292,7 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 | F1b | 托盘常驻（菜单栏状态/启停） | F1a | pending |
 | F2 | 崩溃自愈 | F1a | **done** #51（见下方设计变更） |
 | F3 | 微信渠道（**WeChat iLink 官方 Bot API**）：入站消息 → run，审批经微信完成 | C8 + 用户确认 | **merged #78 + #79**（`packages/wechat-bridge`；#79 加鉴权白名单+per-user 串行+FIFO 审批队列。**实机需用户扫码验证**） |
-| F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | **设计定稿**（`F4-nostr-channel.md`，经 Codex 对抗式挑战）：subprocess 驱动 agent-speaker CLI（G3）+ **信封+意图协议**（3 信封 say/announce/listen + content 里开放意图字段 + thread_id/expires_at 关联位；意图与动作分解交给 agent LLM/H8 plan mode，不写死）+ 原子→业务能力抽象（可编辑 `agent-profile.yml`）+ npub 白名单+gated 入站。**代码 done**：F4a 出站 merged #85（register/say/search + 默认注册 + YAML→JSON profile + FakeNostr harness）；F4b 入站 merged #86 + 硬化 #87（`inbound.ts`:npub 白名单 fail-closed + per-npub session + 有界 dedup + 临时失败重试 + gated run + reply-as-answer + inbox 轮询）。**剩:F5 泡测(物理)+ agent-speaker 待办(d 标签方案A + 2 个 --json,经 CC-82 协同并行)。** 契约见 §7 |
+| F4 | Nostr 渠道（agent-speaker，NIP-44） | F3 | **设计定稿**（`F4-nostr-channel.md`，经 Codex 对抗式挑战）：subprocess 驱动 agent-speaker CLI（G3）+ **信封+意图协议**（3 信封 say/announce/listen + content 里开放意图字段 + thread_id/expires_at 关联位；意图与动作分解交给 agent LLM/H8 plan mode，不写死）+ 原子→业务能力抽象（可编辑 `agent-profile.yml`）+ npub 白名单+gated 入站。**✅ 契约收官（2026-07-29，CC-82 双向真联调）**：F4a 出站 merged #85（register/say/search + 默认注册 + YAML→JSON profile + FakeNostr harness）；F4b 入站 merged #86 + 硬化 #87；联调对接 agent-speaker#29 结构化 JSON merged #89；inbox dedup 修 merged #92；**strfry 真 NIP-33 relay 覆盖定论 merged #93**（profile×3→折叠成1 反向对照 + agent msg×5→全存活，证 d-tag 修复在真 relay 生效）；**入站收尾 merged #95**（切 `history inbox --as <identity>` + 真 hex event_id dedup，消费 agent-speaker#30 的 hex id + --as，拆掉 `identity use` workaround）。上游 agent-speaker 待办全落地（d 标签#29 + 2×--json#29 + history id/daemon dedup + --as#30）。**剩:F5 泡测(物理)+ R3(headless 加密解锁,上游挂账,非阻塞)。** 契约见 §7 / `F4-nostr-channel.md` §4.5–4.7 |
 | F5 | 7×24 稳定性验证：Mac mini 连续 7 天，日程照跑，无人工干预 | F2 | pending（**物理任务**，F1a/F2 已就绪、F3 微信 + F4 Nostr 渠道代码已就位，可开始跑；需用户在 Mac mini 上实机执行 + F3/F4 各扫码/建 identity） |
 
 ### F3 落地：WeChat iLink 官方 Bot API（2026-07-28，用户指路 `~/Dev/tools/heinu1`）
@@ -421,10 +422,10 @@ Agent24 现有 `vendor/reference/` 已注明「zerostack 是 GPL 只读思路禁
 | H4 | **external 定向常驻授权**：`tool → 确切目标`，挂在 schedule 记录上；**并对 external 工具停用宽泛的 `approve_for_session`** | H1, C5 | merged #62 |
 | H3 | **异步审批 + durable resume**（与 G1 合并执行）：消息线程持久化 → payload 完整性哈希 → 重启后复原而非全 abort → 陈旧性重校验 | G1, F1a, H1 | **merged**（PR-1 #70 + PR-2 #72；P0 完成） |
 | H5 | **self-wake**：`sleep_for` / `sleep_until` / `wake_on(job)` / `wake_on_event`，复用 scheduler tick 的 extra_tick 位；含关停取消契约 | C5 | **merged #76**（时间型 self-wake；事件型 wake_on_event 后置） |
-| H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | **in-pr #82**（RunMode 加法协议 + broker human-only request_plan + loop 拦截 + resume 恒离只读；plan 审批跳过 Guardian/常驻授权） |
+| H8 | **plan mode + `propose_plan`**：只读门禁下 explore → 提交计划 → 人批准 → 才退出只读 | C4 | **merged #82**（RunMode 加法协议 + broker human-only request_plan + loop 拦截 + resume 恒离只读；plan 审批跳过 Guardian/常驻授权；只读门在 advertising + dispatch 两层都强制，fail-closed） |
 | H9 | **只读 explorer subagent**：独立上下文、只读工具集、禁递归 | C3 | merged #66 |
 | H10 | **模块/persona 安装同意摘要**：清单严格校验 + 安装后默认 disabled pending consent + 安装绝不写 override | H2, E3 | **merged #75** |
-| H11 | **协议级 Fake 渠道 harness**：FakeWeChat / FakeNostr，让渠道审批与 inbox 可自动测 | F3 | **in-pr #81**（FakeWeChat hermetic 假服务 + e2e：真 adapter 打假 iLink+假 daemon；FakeNostr 随 F4） |
+| H11 | **协议级 Fake 渠道 harness**：FakeWeChat / FakeNostr，让渠道审批与 inbox 可自动测 | F3 | **merged #81**（FakeWeChat hermetic 假服务 + e2e：真 adapter 打假 iLink+假 daemon；FakeNostr 随 F4 落 `packages/nostr-bridge/src/testing/fake-speaker.ts`） |
 | H12 | **provider 错误人话翻译**：额度/权限/模型不存在类错误落成可读文案 | — | merged #65 |
 | H7 | 工具并发三分法（授权串行 → 只读并发 → 写/exec 串行） | H1 | **deferred**（收益不确定，代价高，见下） |
 | ~~H6~~ | ~~调度器补 catch-up + spawn 不 await~~ | — | **删除（已存在）** |
