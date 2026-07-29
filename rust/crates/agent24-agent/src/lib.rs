@@ -28,7 +28,7 @@ use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
 use agent24_protocol::{
     Approval, ApprovalStatus, Decision, ErrorBody, EventBody, ModelDeltaPayload, Run,
-    RunCancelledPayload, RunCompletedPayload, RunCreate, RunFailedPayload, RunInput,
+    RunCancelledPayload, RunCompletedPayload, RunCreate, RunFailedPayload, RunInput, RunMode,
     RunOutputPayload, RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
     ToolCompletedStatus, ToolStartedPayload, Usage,
 };
@@ -490,6 +490,7 @@ impl RunManager {
             input: RunInput {
                 prompt: create.prompt,
                 model_override: create.model_override,
+                mode: create.mode,
             },
             output: None,
             error: None,
@@ -1589,6 +1590,7 @@ pub(crate) mod tests {
                 session_id: Some(session_id.to_owned()),
                 prompt: prompt.to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             })
             .await
             .unwrap();
@@ -1652,6 +1654,7 @@ pub(crate) mod tests {
                     session_id: Some("sess_race".to_owned()),
                     prompt: prompt.to_owned(),
                     model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
                 })
                 .await
                 .unwrap();
@@ -1794,6 +1797,7 @@ pub(crate) mod tests {
                 session_id: Some("sess_cancel".to_owned()),
                 prompt: "hi".to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             })
             .await
             .unwrap();
@@ -1865,6 +1869,7 @@ pub(crate) mod tests {
                 session_id: Some("sess_lockwait".to_owned()),
                 prompt: "a".to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             })
             .await
             .unwrap();
@@ -1878,6 +1883,7 @@ pub(crate) mod tests {
                 session_id: Some("sess_lockwait".to_owned()),
                 prompt: "b".to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             })
             .await
             .unwrap();
@@ -1925,6 +1931,7 @@ pub(crate) mod tests {
             session_id: None,
             prompt: "hi".to_owned(),
             model_override: None,
+            mode: agent24_protocol::RunMode::Normal,
         }
     }
 
@@ -1990,6 +1997,7 @@ pub(crate) mod tests {
                 session_id: Some("sess_nope".to_owned()),
                 prompt: "hi".to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             })
             .await
             .unwrap_err();
@@ -2459,6 +2467,7 @@ mod approval_tests {
             input: RunInput {
                 prompt: "run echo".to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             },
             output: None,
             error: None,
@@ -2547,6 +2556,7 @@ mod approval_tests {
             input: RunInput {
                 prompt: "run echo".to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             },
             output: None,
             error: None,
@@ -2623,6 +2633,7 @@ mod approval_tests {
             input: RunInput {
                 prompt: "go".to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             },
             output: None,
             error: None,

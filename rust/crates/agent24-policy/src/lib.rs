@@ -893,6 +893,7 @@ mod tests {
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
                     model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
                 },
                 output: None,
                 error: None,

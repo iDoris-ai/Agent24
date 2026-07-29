@@ -510,6 +510,7 @@ mod tests {
             input: RunInput {
                 prompt: "hi".to_owned(),
                 model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
             },
             output: None,
             error: None,
