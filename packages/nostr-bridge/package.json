@@ -5,6 +5,7 @@
   "description": "F4: Nostr channel for agent24 over the decentralized agent-collaboration network, driven by the agent-speaker CLI (G3 'package the binary'). F4a: outbound — default-register the agent's business capabilities, say (directed), search (discover by capability). Envelope+intent protocol (docs/specs/F4-nostr-channel.md §4).",
   "type": "module",
   "scripts": {
+    "bridge": "tsx src/main.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run"
   },

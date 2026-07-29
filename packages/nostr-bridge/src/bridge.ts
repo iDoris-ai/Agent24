@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { makeContent, type ContentInput } from './protocol.js'
-import { SpeakerClient, type DiscoverEntry, type SendResult } from './speaker.js'
+import { SpeakerClient, type DiscoverEntry, type PublishResult, type SendResult } from './speaker.js'
 import {
   toAgentSpeakerProfile,
   type Agent24Profile,
@@ -29,16 +29,21 @@ export class NostrBridge {
     name: string,
     profile: Agent24Profile,
     now: number = Date.now(),
-  ): Promise<AgentSpeakerProfile> {
+  ): Promise<{ profile: AgentSpeakerProfile; result: PublishResult }> {
     const asp = toAgentSpeakerProfile(name, profile, Math.floor(now / 1000))
     const file = path.join(os.tmpdir(), `agent24-profile-${randomUUID()}.json`)
     fs.writeFileSync(file, JSON.stringify(asp), { mode: 0o600 })
+    let result: PublishResult
     try {
-      await this.speaker.publishProfile(this.identity, file)
+      result = await this.speaker.publishProfile(this.identity, file)
     } finally {
       fs.rmSync(file, { force: true })
     }
-    return asp
+    // A profile that reached no relays isn't discoverable — surface it.
+    if ((result.published_to ?? 0) === 0) {
+      throw new Error('register reached no relays (profile not published)')
+    }
+    return { profile: asp, result }
   }
 
   /** say / answer: a directed 1:1 message carrying an intent envelope. Pass

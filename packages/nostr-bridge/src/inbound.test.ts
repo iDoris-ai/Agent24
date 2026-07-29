@@ -119,14 +119,23 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
     expect((reply.payload as { text: string }).text).toContain('批准')
   })
 
-  it('pollOnce feeds every inbox message through the bridge', async () => {
+  it('pollOnce maps StoredMessage rows and feeds authorized ones through', async () => {
     const fake = new FakeSpeaker()
-    fake.inboxMessages = [
-      { from: 'npub1alice', content: 'one', event_id: 'a' },
-      { from: 'npub1mallory', content: 'two', event_id: 'b' }, // dropped
+    // real agent-speaker StoredMessage shape (sender_npub / plaintext / id /
+    // is_incoming), verified in 联调
+    fake.inboxRows = [
+      { sender_npub: 'npub1alice', plaintext: 'one', id: 'a', is_incoming: true },
+      { sender_npub: 'npub1mallory', plaintext: 'two', id: 'b', is_incoming: true }, // dropped
+      { sender_npub: 'npub1alice', plaintext: 'mine', id: 'c', is_incoming: false }, // outbound, skipped
     ]
     const { b, calls } = bridge(fake, ['npub1alice'])
     await pollOnce(new SpeakerClient(fake.runner), b)
     expect(calls.prompts).toEqual(['one'])
+  })
+
+  it('agent-speaker error envelope surfaces as a thrown error', async () => {
+    const fake = new FakeSpeaker()
+    fake.nextError = 'keystore is locked'
+    await expect(new SpeakerClient(fake.runner).inbox()).rejects.toThrow(/keystore is locked/)
   })
 })

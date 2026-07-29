@@ -8,7 +8,7 @@
 // adapter to test until now — "先有消费者再有提供者".
 
 import fs from 'node:fs'
-import type { SpeakerRunner, InboundMessage } from '../speaker.js'
+import type { SpeakerRunner } from '../speaker.js'
 import type { AgentSpeakerProfile } from '../profile.js'
 
 export interface Invocation {
@@ -30,11 +30,31 @@ export class FakeSpeaker {
   }
   /** Canned `profile discover --json` reply. */
   discoverResult: unknown = []
-  /** Canned `agent inbox --json` reply (inbound messages). */
-  inboxMessages: InboundMessage[] = []
+  /** Canned `profile publish --json` reply (PR #29 structured result). */
+  publishResult: unknown = {
+    name: 'agent24',
+    published_to: 1,
+    relay_count: 1,
+    relays: [{ url: 'wss://relay.aastar.io', ok: true }],
+  }
+  /** Canned `agent inbox --json` rows (raw StoredMessage-shaped records). */
+  inboxRows: Record<string, unknown>[] = []
+  /** Set to make the next command return an error envelope `{ok:false,...}`. */
+  nextError?: string
 
   /** The runner to hand SpeakerClient. */
   runner: SpeakerRunner = (args) => this.handle(args)
+
+  /** Real agent-speaker `--json` output is a `{ok,data}` envelope (verified in
+   * 联调) — the fake mirrors that so the REAL unwrap path is exercised. */
+  private envelope(data: unknown): string {
+    if (this.nextError) {
+      const msg = this.nextError
+      this.nextError = undefined
+      return JSON.stringify({ ok: false, error: 'other_error', message: msg })
+    }
+    return JSON.stringify({ ok: true, data })
+  }
 
   private async handle(args: string[]): Promise<string> {
     const inv: Invocation = { args }
@@ -44,22 +64,22 @@ export class FakeSpeaker {
       const file = i >= 0 ? args[i + 1] : undefined
       if (file) inv.publishedProfile = JSON.parse(fs.readFileSync(file, 'utf8')) as AgentSpeakerProfile
       this.calls.push(inv)
-      return '' // this command has no --json output (CC-82 gap); exit 0 = success
+      return this.envelope(this.publishResult)
     }
     if (group === 'agent' && cmd === 'msg') {
       this.calls.push(inv)
-      return JSON.stringify(this.sendResult)
+      return this.envelope(this.sendResult)
     }
     if (group === 'profile' && cmd === 'discover') {
       this.calls.push(inv)
-      return JSON.stringify(this.discoverResult)
+      return this.envelope(this.discoverResult)
     }
     if (group === 'agent' && cmd === 'inbox') {
       this.calls.push(inv)
-      return JSON.stringify(this.inboxMessages)
+      return this.envelope(this.inboxRows)
     }
     this.calls.push(inv)
-    return '{}'
+    return this.envelope({})
   }
 
   /** The value passed to `agent msg --content` in the last say(), parsed. */

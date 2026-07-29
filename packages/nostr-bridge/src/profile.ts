@@ -57,16 +57,37 @@ export function toAgentSpeakerProfile(
   updatedAt: number,
 ): AgentSpeakerProfile {
   const tags = [...new Set(p.capabilities.flatMap((c) => c.tags ?? []))]
+  // agent-speaker (verified in 联调): `capabilities` is a STRUCTURED-mode field —
+  // `tagged`/`simple` only carry name+tags and are REJECTED if capabilities are
+  // set. And `profile discover --capability` only matches structured profiles.
+  // So whenever we publish business capabilities the mode must be `structured`,
+  // regardless of what the user wrote in `publish.mode`.
+  const hasCapabilities = p.capabilities.length > 0
+  const mode = hasCapabilities ? 'structured' : (p.publish?.mode ?? 'simple')
+  // agent-speaker (verified in 联调): availability is an ENUM, not free text —
+  // anything else (e.g. "7x24") is rejected. Only pass a valid value; otherwise
+  // omit and let agent-speaker default to `available`.
+  const availability =
+    p.publish?.availability && (VALID_AVAILABILITY as readonly string[]).includes(p.publish.availability)
+      ? p.publish.availability
+      : undefined
   return {
     name,
-    mode: p.publish?.mode ?? 'tagged',
+    mode,
     ...(tags.length ? { tags } : {}),
-    capabilities: p.capabilities.map((c) => ({
-      name: c.name,
-      ...(c.description ? { description: c.description } : {}),
-      ...(c.tags?.length ? { tags: c.tags } : {}),
-    })),
-    ...(p.publish?.availability ? { availability: p.publish.availability } : {}),
+    ...(hasCapabilities
+      ? {
+          capabilities: p.capabilities.map((c) => ({
+            name: c.name,
+            ...(c.description ? { description: c.description } : {}),
+            ...(c.tags?.length ? { tags: c.tags } : {}),
+          })),
+        }
+      : {}),
+    ...(availability ? { availability } : {}),
     updated_at: updatedAt,
   }
 }
+
+/** agent-speaker's availability enum (`profile publish --availability`). */
+export const VALID_AVAILABILITY = ['available', 'busy', 'away', 'offline'] as const

@@ -27,5 +27,9 @@ capabilities:
     backed_by: [post_xiaohongshu]
 
 publish:
-  mode: tagged            # simple | tagged | structured
-  availability: "7x24"
+  # simple(name only) | tagged(name+tags) | structured(full capabilities).
+  # NOTE: publishing `capabilities` REQUIRES structured — the bridge forces it
+  # when capabilities are present (tagged/simple only carry name+tags, and
+  # `discover --capability` only matches structured profiles).
+  mode: structured
+  availability: available   # available | busy | away | offline (agent-speaker enum)
