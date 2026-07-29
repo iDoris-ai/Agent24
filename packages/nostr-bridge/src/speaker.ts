@@ -35,6 +35,17 @@ export interface DiscoverEntry {
   profile: AgentSpeakerProfile
 }
 
+/** A decrypted inbound message from `agent inbox --json`. `content` is the raw
+ * decompressed/decrypted string the sender put on the wire (an F4 envelope JSON
+ * when it came from another agent24). */
+export interface InboundMessage {
+  /** Sender npub — the allowlist / session key. */
+  from: string
+  content: string
+  event_id?: string
+  created_at?: number
+}
+
 export class SpeakerClient {
   constructor(
     private readonly run: SpeakerRunner,
@@ -96,6 +107,24 @@ export class SpeakerClient {
     ])
     const parsed = parseJson<DiscoverEntry[]>(out, 'profile discover')
     return Array.isArray(parsed) ? parsed : []
+  }
+
+  /** listen/subscribe (inbound) → `agent inbox --json`. The daemon pulls inbound
+   * to the local store; this reads it. Normalizes a few likely field names so
+   * the bridge doesn't hard-depend on one exact key (`from`/`from_npub`/`sender`,
+   * `content`/`text`). */
+  async inbox(): Promise<InboundMessage[]> {
+    const out = await this.run(['agent', 'inbox', '--json', ...this.relayArgs()])
+    const parsed = parseJson<unknown>(out, 'agent inbox')
+    const rows = Array.isArray(parsed)
+      ? parsed
+      : ((parsed as { messages?: unknown[] })?.messages ?? [])
+    return (rows as Record<string, unknown>[]).map((r) => ({
+      from: String(r.from ?? r.from_npub ?? r.sender ?? r.from_user_id ?? ''),
+      content: String(r.content ?? r.text ?? r.body ?? ''),
+      event_id: r.event_id != null ? String(r.event_id) : undefined,
+      created_at: typeof r.created_at === 'number' ? r.created_at : undefined,
+    }))
   }
 }
 

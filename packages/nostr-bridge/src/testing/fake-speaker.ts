@@ -8,7 +8,7 @@
 // adapter to test until now — "先有消费者再有提供者".
 
 import fs from 'node:fs'
-import type { SpeakerRunner } from '../speaker.js'
+import type { SpeakerRunner, InboundMessage } from '../speaker.js'
 import type { AgentSpeakerProfile } from '../profile.js'
 
 export interface Invocation {
@@ -30,6 +30,8 @@ export class FakeSpeaker {
   }
   /** Canned `profile discover --json` reply. */
   discoverResult: unknown = []
+  /** Canned `agent inbox --json` reply (inbound messages). */
+  inboxMessages: InboundMessage[] = []
 
   /** The runner to hand SpeakerClient. */
   runner: SpeakerRunner = (args) => this.handle(args)
@@ -51,6 +53,10 @@ export class FakeSpeaker {
     if (group === 'profile' && cmd === 'discover') {
       this.calls.push(inv)
       return JSON.stringify(this.discoverResult)
+    }
+    if (group === 'agent' && cmd === 'inbox') {
+      this.calls.push(inv)
+      return JSON.stringify(this.inboxMessages)
     }
     this.calls.push(inv)
     return '{}'
