@@ -91,13 +91,6 @@ export class SpeakerClient {
     return this.relay ? ['--relay', this.relay] : []
   }
 
-  /** Make this bridge's identity the keystore default, so `inbox()` (which uses
-   * `history inbox`, and it has no `--as`) reads THIS agent's inbox. Called once
-   * at startup. */
-  async useIdentity(): Promise<void> {
-    if (this.identity) await this.run(['identity', 'use', this.identity])
-  }
-
   /** register → `profile publish --as <id> --json-file <file> --json`. */
   async publishProfile(identity: string, jsonFile: string): Promise<PublishResult> {
     const out = await this.run([
@@ -158,18 +151,22 @@ export class SpeakerClient {
     // history inbox (daemon-populated local store), NOT agent inbox: agent
     // inbox's `from` is a truncated/nickname DISPLAY string that never matches
     // the full-npub allowlist; history inbox's StoredMessage has the full
-    // sender_npub. It has no --as, so the bridge reads its DEFAULT identity.
-    const data = unwrap<unknown>(await this.run(['history', 'inbox', '--json']), 'history inbox')
+    // sender_npub. `--as <identity>` targets THIS agent's inbox directly
+    // (agent-speaker#30) — no need to hijack the keystore default identity, so
+    // multiple bridges can share a keystore without racing on `identity use`.
+    const args = ['history', 'inbox', ...(this.identity ? ['--as', this.identity] : []), '--json']
+    const data = unwrap<unknown>(await this.run(args), 'history inbox')
     const rows = Array.isArray(data) ? data : ((data as { messages?: unknown[] })?.messages ?? [])
     return (rows as Record<string, unknown>[])
       .filter((r) => r.is_incoming !== false) // absent → it's the inbox, all incoming
       .map((r) => {
         const from = String(r.sender_npub ?? r.from ?? r.from_npub ?? r.sender ?? '')
         const content = String(r.plaintext ?? r.content ?? r.text ?? '')
-        // history inbox `id` is currently non-hex garbage (agent-speaker known
-        // bug); use it only when it looks like a real event id, else synthesize
-        // a stable key from sender + created_at + content (created_at is a real
-        // timestamp, finer than agent inbox minute-only `time`).
+        // history inbox `id` is the real hex event id (agent-speaker#30 fixed the
+        // raw-byte encoding), matching `agent msg`'s returned event_id byte for
+        // byte — use it as the dedup key. The synthesized sender+created_at+content
+        // key is retained only as a defensive fallback for any legacy pre-#30 row
+        // whose id is still non-hex garbage (those age out of the store).
         const realId =
           typeof r.id === 'string' && /^[0-9a-f]{16,}$/i.test(r.id) ? r.id : undefined
         const stamp = String(r.created_at ?? r.received_at ?? r.time ?? '')

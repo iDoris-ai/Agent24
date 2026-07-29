@@ -33,14 +33,6 @@ async function main(): Promise<void> {
   })
   const agent = new Agent24Client(daemon)
 
-  // `history inbox` (the inbound source) has no --as, so it reads the keystore
-  // DEFAULT identity — make this bridge's identity the default.
-  try {
-    await speaker.useIdentity()
-  } catch (err) {
-    console.warn('[nostr] 设置默认身份失败(入站可能读错身份):', err instanceof Error ? err.message : err)
-  }
-
   // ── register (default): publish business capabilities so peers can find us ──
   if (fs.existsSync(CONFIG.PROFILE_FILE)) {
     try {
