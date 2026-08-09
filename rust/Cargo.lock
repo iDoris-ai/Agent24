@@ -142,6 +142,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-sin90"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "agent24-store"
 version = "0.2.1"
 dependencies = [
