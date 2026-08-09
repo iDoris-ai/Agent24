@@ -35,11 +35,16 @@ pub enum StoreError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
-    /// A relational invariant the pure validator cannot see (ValidationCtx is
-    /// per-entity): mutating a task whose week is already closed. Enforced here,
-    /// under the write lock (SIN90-domain.md §2.3).
-    #[error("task {0}'s week is closed; cannot mutate")]
-    WeekClosed(String),
+    /// Relational invariants the pure validator cannot see (ValidationCtx is
+    /// per-entity), enforced here under the write lock (SIN90-domain.md §2.3):
+    /// mutating a task whose week is not open (planning|active) ...
+    #[error("task {0}'s week is not open; cannot mutate")]
+    WeekNotOpen(String),
+    /// ... or carrying a task over into the very week it already lives in
+    /// (which would strand the closed task and spawn an endlessly re-carryable
+    /// duplicate in the same week).
+    #[error("cannot carry task {0} into its own week")]
+    SameWeekCarry(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -90,7 +95,10 @@ impl Sin90Store {
 }
 
 /// Test-only escape hatches (raw SQL peeks + a mutation to prove event replay
-/// is unaffected). `#[doc(hidden)]`, not supported API.
+/// is unaffected). Feature-gated so they are NOT part of the released API —
+/// `#[doc(hidden)]` alone would still export them. Integration tests get them
+/// via the self dev-dependency in Cargo.toml (`features = ["test-hooks"]`).
+#[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod test_hooks {
     use crate::{Result, Sin90Store};

@@ -10,7 +10,7 @@ use agent24_core::util::{now_iso8601, ulid};
 use agent24_sin90::{
     Direction, DirectionStatus, RhythmStatus, ScheduleBlock, ScheduleBlockStatus, Sin90Op,
     Sin90Proposal, TaskStatus, ValidationCtx, Week, WeekStatus, check_rhythm_transition,
-    check_schedule_block_transition, check_task_transition, validate, week_is_terminal,
+    check_schedule_block_transition, check_task_transition, validate, week_is_open,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -270,21 +270,40 @@ impl Sin90Store {
 
     // ----- proposal gate ------------------------------------------------------
 
-    /// Persist a proposal as `pending`. Idempotent on `id` (re-submit is a no-op).
+    /// Persist a proposal as `pending`. Idempotent on `id` ONLY when the ops are
+    /// identical: re-submitting the same id with a DIFFERENT batch is a
+    /// `Conflict`, not a silent no-op that would later apply the stale ops the
+    /// caller thinks they replaced.
     pub async fn submit_proposal(&self, p: &Sin90Proposal) -> Result<()> {
         let now = now_iso8601();
-        sqlx::query(
+        let ops_json = serde_json::to_string(&p.ops)?;
+        let affected = sqlx::query(
             "INSERT INTO sin90_proposals (id, status, source, ops, rationale, created_at)
              VALUES (?, 'pending', ?, ?, ?, ?)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&p.id)
         .bind(to_wire(&p.source)?)
-        .bind(serde_json::to_string(&p.ops)?)
+        .bind(&ops_json)
         .bind(&p.rationale)
         .bind(&now)
         .execute(self.pool())
-        .await?;
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            // Row already exists — accept only if the ops match byte-for-byte.
+            let existing: String = sqlx::query("SELECT ops FROM sin90_proposals WHERE id = ?")
+                .bind(&p.id)
+                .fetch_one(self.pool())
+                .await?
+                .get("ops");
+            if existing != ops_json {
+                return Err(StoreError::Conflict(format!(
+                    "proposal {} already exists with different ops",
+                    p.id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -479,7 +498,7 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
         }
 
         Sin90Op::TransitionTask { task_id, to } => {
-            reject_if_week_closed(tx, task_id).await?; // relational invariant (§2.3)
+            require_task_week_open(tx, task_id).await?; // relational invariant (§2.3)
             let from = read_task_status(tx, task_id).await?;
             check_task_transition(from, *to)?;
             let to_str = to_wire(to)?;
@@ -537,14 +556,26 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
         }
 
         Sin90Op::ReorderTasks { week_id, order } => {
+            // Every id must actually belong to this week, else the appended
+            // `reordered` event would assert an order the table never adopted
+            // (the log is the source of truth — no silent drift in an
+            // all-or-nothing apply).
             for (i, tid) in order.iter().enumerate() {
-                sqlx::query("UPDATE sin90_tasks SET sort_key = ?, updated_at = ? WHERE id = ? AND week_id = ?")
-                    .bind(i as i64)
-                    .bind(&now)
-                    .bind(tid)
-                    .bind(week_id)
-                    .execute(&mut **tx)
-                    .await?;
+                let affected = sqlx::query(
+                    "UPDATE sin90_tasks SET sort_key = ?, updated_at = ? WHERE id = ? AND week_id = ?",
+                )
+                .bind(i as i64)
+                .bind(&now)
+                .bind(tid)
+                .bind(week_id)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected != 1 {
+                    return Err(StoreError::NotFound(format!(
+                        "task {tid} not in week {week_id} (reorder)"
+                    )));
+                }
             }
             let ev = append_event(
                 tx,
@@ -591,7 +622,22 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
         }
 
         Sin90Op::CarryOverTask { task_id, to_week } => {
-            reject_if_week_closed(tx, task_id).await?; // relational invariant (§2.3)
+            require_task_week_open(tx, task_id).await?; // relational invariant (§2.3)
+            // Read the source up front — we need its week to reject a self-carry
+            // (else the task is closed and an infinitely re-carryable duplicate is
+            // created in the very same week).
+            let src =
+                sqlx::query("SELECT title, direction_id, week_id FROM sin90_tasks WHERE id = ?")
+                    .bind(task_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+            let title: String = src.get("title");
+            let direction_id: Option<String> = src.get("direction_id");
+            let src_week: Option<String> = src.get("week_id");
+            if src_week.as_deref() == Some(to_week.as_str()) {
+                return Err(StoreError::SameWeekCarry(task_id.to_string()));
+            }
             let from = read_task_status(tx, task_id).await?;
             check_task_transition(from, TaskStatus::CarriedOver)?;
             // Close the source task.
@@ -615,12 +661,6 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
             .await?;
             event_ids.push(close_ev);
             // Create the fresh next-week task, linked via carried_from.
-            let src = sqlx::query("SELECT title, direction_id FROM sin90_tasks WHERE id = ?")
-                .bind(task_id)
-                .fetch_one(&mut **tx)
-                .await?;
-            let title: String = src.get("title");
-            let direction_id: Option<String> = src.get("direction_id");
             let new_id = ulid();
             sqlx::query(
                 "INSERT INTO sin90_tasks
@@ -664,9 +704,11 @@ async fn read_task_status(tx: &mut Tx<'_>, id: &str) -> Result<TaskStatus> {
 }
 
 /// Relational invariant the pure validator can't express (ValidationCtx is
-/// per-entity): a task in a CLOSED week is immutable. A task with no week, or
-/// whose week is not closed, passes. Enforced under the write lock.
-async fn reject_if_week_closed(tx: &mut Tx<'_>, task_id: &str) -> Result<()> {
+/// per-entity): a task may only be mutated while its week is OPEN
+/// (planning | active) — the same predicate `require_open_week` uses for
+/// week-level ops, so the two apply paths stay symmetric (no reviewing/closed
+/// gap). A task with no week passes. Enforced under the write lock.
+async fn require_task_week_open(tx: &mut Tx<'_>, task_id: &str) -> Result<()> {
     let row = sqlx::query(
         "SELECT w.status AS wstatus
          FROM sin90_tasks t JOIN sin90_weeks w ON w.id = t.week_id
@@ -677,8 +719,8 @@ async fn reject_if_week_closed(tx: &mut Tx<'_>, task_id: &str) -> Result<()> {
     .await?;
     if let Some(row) = row {
         let wstatus: WeekStatus = from_wire(&row.get::<String, _>("wstatus"))?;
-        if week_is_terminal(wstatus) {
-            return Err(StoreError::WeekClosed(task_id.to_string()));
+        if !week_is_open(wstatus) {
+            return Err(StoreError::WeekNotOpen(task_id.to_string()));
         }
     }
     Ok(())

@@ -14,8 +14,15 @@ serde_json = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 thiserror = "2"
 
+[features]
+# test-only helpers (raw-SQL peeks/mutations); never on for released builds.
+test-hooks = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Self-dependency with the feature on, so integration tests (a separate crate)
+# can reach `test_hooks` while downstream consumers never get it.
+agent24-sin90-store = { path = ".", features = ["test-hooks"] }
 
 [lints]
 workspace = true

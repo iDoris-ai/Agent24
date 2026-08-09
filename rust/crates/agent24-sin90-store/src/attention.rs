@@ -15,9 +15,11 @@ use sqlx::Row;
 use crate::{Result, Sin90Store};
 
 /// One direction's realized minutes over a window (from event replay).
+/// `direction_id` is `""` for a block with no direction — the same
+/// representation `sin90_attention_daily` uses, so the two paths line up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionRow {
-    pub direction_id: Option<String>,
+    pub direction_id: String,
     /// Title as snapshotted in the event payload at completion time.
     pub direction_title: Option<String>,
     pub actual_min: i64,
@@ -35,16 +37,20 @@ impl Sin90Store {
     /// Pure replay: realized minutes per direction for `[start, end)` (ISO-8601
     /// bounds, lexical compare == chronological on fixed-width UTC).
     pub async fn attention(&self, start: &str, end: &str) -> Result<Vec<AttentionRow>> {
+        // Window filter uses the indexed `at` column (== payload.occurred_at by
+        // construction). `MAX(title)` makes the label deterministic if a
+        // direction was renamed mid-window (payloads still hold each snapshot);
+        // `COALESCE(dir,'')` matches the materialized view's no-direction key;
+        // the `, dir` tiebreaker makes ordering stable.
         let rows = sqlx::query(
-            "SELECT json_extract(payload,'$.direction_id')    AS dir,
-                    json_extract(payload,'$.direction_title')  AS title,
+            "SELECT COALESCE(json_extract(payload,'$.direction_id'),'') AS dir,
+                    MAX(json_extract(payload,'$.direction_title'))       AS title,
                     CAST(COALESCE(SUM(json_extract(payload,'$.minutes')),0) AS INTEGER) AS actual
              FROM sin90_events
              WHERE entity = 'block' AND kind = 'transitioned' AND to_state = 'completed'
-               AND json_extract(payload,'$.occurred_at') >= ?
-               AND json_extract(payload,'$.occurred_at') <  ?
+               AND at >= ? AND at < ?
              GROUP BY dir
-             ORDER BY actual DESC",
+             ORDER BY actual DESC, dir",
         )
         .bind(start)
         .bind(end)
@@ -95,11 +101,13 @@ impl Sin90Store {
         .await?;
 
         for r in rows {
-            let occurred_at: String = r.get("occurred_at");
-            // NULL direction folds under "" so the NOT NULL PK is satisfied.
-            let dir: Option<String> = r.get("dir");
+            // try_get so a malformed/NULL payload surfaces as an error, not a panic.
+            let occurred_at: String = r.try_get("occurred_at")?;
+            // NULL direction folds under "" so the NOT NULL PK is satisfied —
+            // the same key `attention()` reports for no-direction blocks.
+            let dir: Option<String> = r.try_get("dir")?;
             let dir = dir.unwrap_or_default();
-            let minutes: i64 = r.get("minutes");
+            let minutes: i64 = r.try_get("minutes")?;
             let day = occurred_at.get(0..10).unwrap_or("").to_string();
             sqlx::query(
                 "INSERT INTO sin90_attention_daily (day, direction_id, actual_min)

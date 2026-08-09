@@ -156,6 +156,7 @@ version = "0.1.0"
 dependencies = [
  "agent24-core",
  "agent24-sin90",
+ "agent24-sin90-store",
  "serde",
  "serde_json",
  "sqlx",

@@ -85,6 +85,9 @@ CREATE TABLE sin90_events (
     at         TEXT NOT NULL           -- occurred_at
 );
 CREATE INDEX idx_sin90_events_entity ON sin90_events(entity, entity_id);
+-- The attention replay filters completed-block events by time window on `at`
+-- (== payload.occurred_at by construction); index it so replay is not a scan.
+CREATE INDEX idx_sin90_events_at ON sin90_events(entity, to_state, at);
 
 -- Proposal gate (persistent): pending -> applying -> applied | rejected.
 -- applying is the CAS-claimed state that makes a re-tried accept idempotent.

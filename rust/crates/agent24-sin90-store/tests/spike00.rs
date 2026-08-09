@@ -225,6 +225,152 @@ async fn transition_in_closed_week_is_rejected() {
     );
 }
 
+#[tokio::test]
+async fn carry_over_into_same_week_is_rejected() {
+    // Carrying a task into its OWN week would strand it (carried_over) and spawn
+    // an endlessly re-carryable duplicate in that same week.
+    let store = Sin90Store::open_memory().await.unwrap();
+    let wk = store.create_week("2026-W33").await.unwrap();
+    let seed = proposal(
+        "p-seed",
+        vec![Sin90Op::CreateTasks {
+            week_id: wk.id.clone(),
+            tasks: vec![agent24_sin90::NewTask {
+                title: "t".into(),
+                direction_id: None,
+            }],
+        }],
+    );
+    store.submit_proposal(&seed).await.unwrap();
+    store.apply_proposal("p-seed").await.unwrap();
+    let task_id = test_hooks::first_task_id(&store).await.unwrap();
+
+    let same = proposal(
+        "p-same",
+        vec![Sin90Op::CarryOverTask {
+            task_id,
+            to_week: wk.id.clone(), // same week!
+        }],
+    );
+    store.submit_proposal(&same).await.unwrap();
+    assert!(store.apply_proposal("p-same").await.is_err());
+    // Rolled back — the source task is untouched, no duplicate created.
+    assert_eq!(test_hooks::direction_count(&store).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn reorder_with_foreign_task_id_rejected() {
+    // An id not in the week must fail the whole apply — the reordered event may
+    // not assert an order the table never adopted.
+    let store = Sin90Store::open_memory().await.unwrap();
+    let wk = store.create_week("2026-W33").await.unwrap();
+    let seed = proposal(
+        "p-seed",
+        vec![Sin90Op::CreateTasks {
+            week_id: wk.id.clone(),
+            tasks: vec![agent24_sin90::NewTask {
+                title: "t".into(),
+                direction_id: None,
+            }],
+        }],
+    );
+    store.submit_proposal(&seed).await.unwrap();
+    store.apply_proposal("p-seed").await.unwrap();
+    let real = test_hooks::first_task_id(&store).await.unwrap();
+
+    let bad = proposal(
+        "p-reorder",
+        vec![Sin90Op::ReorderTasks {
+            week_id: wk.id.clone(),
+            order: vec![real, "ghost".into()],
+        }],
+    );
+    store.submit_proposal(&bad).await.unwrap();
+    assert!(store.apply_proposal("p-reorder").await.is_err());
+}
+
+#[tokio::test]
+async fn resubmit_same_id_different_ops_conflicts() {
+    let store = Sin90Store::open_memory().await.unwrap();
+    let a = proposal(
+        "p",
+        vec![Sin90Op::CreateDirection {
+            title: "A".into(),
+            target_window: "2026-08".into(),
+        }],
+    );
+    store.submit_proposal(&a).await.unwrap();
+    // Same id, different ops → must not be silently ignored.
+    let b = proposal(
+        "p",
+        vec![Sin90Op::CreateDirection {
+            title: "B".into(),
+            target_window: "2026-08".into(),
+        }],
+    );
+    assert!(store.submit_proposal(&b).await.is_err());
+    // Re-submitting the identical batch stays idempotent (ok).
+    assert!(store.submit_proposal(&a).await.is_ok());
+}
+
+#[tokio::test]
+async fn attention_replay_matches_materialized_view() {
+    // The two paths documented as "MUST agree" are actually cross-checked here,
+    // not folded-vs-itself.
+    use std::collections::HashMap;
+    let store = Sin90Store::open_memory().await.unwrap();
+    let d1 = store.create_direction("Coding", "2026-08").await.unwrap();
+    let none_dir = store.create_block(None, None, 25).await.unwrap(); // no-direction block
+    store
+        .transition_block(&none_dir.id, ScheduleBlockStatus::Started)
+        .await
+        .unwrap();
+    let last = {
+        for (dir, mins) in [(Some(&d1.id), 90u32), (Some(&d1.id), 30)] {
+            let b = store
+                .create_block(dir.map(String::as_str), None, mins)
+                .await
+                .unwrap();
+            store
+                .transition_block(&b.id, ScheduleBlockStatus::Started)
+                .await
+                .unwrap();
+            store
+                .transition_block(&b.id, ScheduleBlockStatus::Completed)
+                .await
+                .unwrap();
+        }
+        store
+            .transition_block(&none_dir.id, ScheduleBlockStatus::Completed)
+            .await
+            .unwrap()
+    };
+    store.attention_apply_new_events().await.unwrap();
+
+    let (start, end) = window_around(&last.updated_at);
+    let replay: HashMap<String, i64> = store
+        .attention(&start, &end)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.direction_id, r.actual_min))
+        .collect();
+    let view: HashMap<String, i64> = store
+        .attention_daily()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.direction_id, r.actual_min))
+        .collect();
+    assert_eq!(replay, view, "replay and materialized view must agree");
+    assert_eq!(replay.get(&d1.id).copied(), Some(120));
+    assert_eq!(
+        replay.get("").copied(),
+        Some(25),
+        "no-direction folds under \"\""
+    );
+}
+
 // ---- helpers ----
 
 /// A ±1h window around an ISO-8601 timestamp is overkill precision-wise; we just
