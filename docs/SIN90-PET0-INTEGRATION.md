@@ -130,7 +130,7 @@ Agent24 提供三级路由 policy 层 + `sin90_ai_calls` 记账(每次决策记�
 
 ### 4.3 共同边界(不可协商)
 
-- 壳↔核 = agent24d 本地 HTTP + WS;壳只发 Event、只订阅 State。
+- 壳↔核 = agent24d 本地 HTTP + WS;壳**发命令(经校验、可被拒),只订阅事件**——从不直接写既成事实(事实只由核在校验后产生并以 `sin90.*` 事件回推)。
 - **离线优先是硬指标**:除 Executive 脑外,桌宠/FSM/本地脑/录入/检索/对账全部断网可用。
 - AI 不写库,一切经 Proposal。
 - 每次状态变更产事件;每次路由决策记账。
@@ -178,7 +178,7 @@ Reflex(壳内 FSM)不走这些接口;它只在需要落库时(如「用户完成
 
 原 Pet0 计划里以下**改为复用 Agent24,不再写第二遍**:
 
-- M1 W1 内核:SQLite 建库/迁移框架/事件回放/事务化 Proposal → 用 `agent24-store` + `agent24-sin90`。
+- M1 W1 内核:SQLite 建库/迁移框架/事件回放/事务化 Proposal → 用 `agent24-sin90` 模块(自带 store,独立 `sin90.db`;**不是** `agent24-store`)。
 - M2:`IntelligenceProvider` 抽象 / Intelligence Router 基础设施 / MCP 接入 → 用 `agent24-models` + `agent24-mcp`。
 - 调度/Nudge 触发底座 → 用 `agent24-scheduler`。
 
@@ -219,5 +219,5 @@ Agent24 的「魂」含 Nostr/联邦/多渠道(`nostr-bridge`/`wechat-bridge`/�
 
 1. Pet0 壳最终选 Tauri 还是复用 Electron?(不阻塞本约定,但影响分发与复用估算)
 2. ~~Local 脑走 oMLX 能否吃 Qwen3-0.6B?~~ **已定(2026-08-09 调研)**:能,且**无需新增 GGUF provider**。oMLX(mlx-lm 底座,OpenAI/Anthropic 兼容)原生支持 `response_format: json_schema` 结构化输出,满足 Local 脑"受约束 JSON"硬约束;Qwen3-0.6B 由 mlx-lm 支持、mlx-community 有量化权重。链路 = `agent24-models` 现成 OpenAI provider → oMLX:8088 → Qwen3-0.6B。动作:`omlx` 拉一次 0.6B 权重 + 量 p95。注意 `enable_thinking=false`(Qwen3 thinking token 会破坏 JSON,与 Pet0 架构一致)。额外:HF cache 已有 `Qwen3-ASR-0.6B` 可喂语音链路 STT。
-3. ~~Sin90 同库不同表 vs 独立 DB?~~ **已定**:**独立 DB `sin90.db` + 可加载模块**,比同库更彻底。Sin90 是内核之上的模块,自带 store,依赖单向(Sin90→内核,内核绝不反向依赖)。两种交互不一刀切:**壳↔Sin90 走 HTTP/WS API**;**Sin90↔内核走进程内 ctx 句柄**(模块 `register(router,ctx)`,热路径不加 HTTP 跳)。不做独立进程纯 API——桌宠本地单机拿不到独立进程的好处却要付运维税。Proposal 原子性不受影响:一个 proposal 只改 Sin90 表,单库单事务即可,内核审批仅上游放行信号。详见 [SIN90-domain.md §0](specs/SIN90-domain.md)。
+3. ~~Sin90 同库不同表 vs 独立 DB?~~ **已定**:**独立 DB `sin90.db` + 可加载模块**,比同库更彻底。Sin90 是内核之上的模块,自带 store,依赖单向(Sin90→内核,内核绝不反向依赖)。两种交互不一刀切:**壳↔Sin90 走 HTTP/WS API**;**Sin90↔内核走进程内 ctx 句柄**(模块 `register(router,ctx)`,热路径不加 HTTP 跳)。不做独立进程纯 API——桌宠本地单机拿不到独立进程的好处却要付运维税(但边界用 `Sin90KernelCtx` trait 定义,进程内只是第一个 adapter,将来可加 RPC adapter 拆进程)。**跨库一致性(Codex 自审收口)**:proposal 的状态/审批/apply **全落 sin90.db 单事务**,内核 policy 仅被**只读**查询是否放行;需要写内核的副作用(如注册 cron)经 apply 后的**幂等 outbox 对账**,不跨库两阶段提交。详见 [SIN90-domain.md §0.1/§0.2](specs/SIN90-domain.md)。
 4. `.petpack` 的 behaviors.json 沙箱与 Agent24 的模块/审批模型如何对齐?

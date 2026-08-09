@@ -1,14 +1,15 @@
 # SIN90 — 内置 Personal-OS 领域模型(接口草案)
 
-> 设计草案 v0.2(2026-08-09)。配套:[集成约定](../SIN90-PET0-INTEGRATION.md)。
-> **架构定调(v0.2 修正)**:Sin90 是内核之上的**可加载模块**,**自带独立
-> DB `sin90.db`**,依赖单向(Sin90 → 内核,内核绝不反向依赖 Sin90)。持久化
-> **不再塞进 `agent24-store`**——Sin90 自带 store。**本文件是接口契约草案,
-> 非最终实现;签名可在 SPIKE-00 中调整。**
+> 设计草案 v0.3(2026-08-09)。配套:[集成约定](../SIN90-PET0-INTEGRATION.md)。
+> **架构定调**:Sin90 是内核之上的**可加载模块**,**自带独立 DB `sin90.db`**,
+> 依赖单向(Sin90 → 内核,内核绝不反向依赖 Sin90)。持久化**不塞进
+> `agent24-store`**——Sin90 自带 store。**本文件是接口契约草案,非最终实现;
+> 签名可在 SPIKE-00 中调整。** v0.3 依据 Codex 架构自审收口了跨库原子性、
+> 回放正确性、协议事件三条硬伤(改动记录见 §9)。
 
 ---
 
-## 0. 边界与依赖方向(v0.2 定调)
+## 0. 边界与依赖方向
 
 ```
 内核(通用,agent24.db)  core/store/models/policy/scheduler/memory/mcp/agent/protocol
@@ -23,12 +24,28 @@
 | 交互 | 走什么 | 理由 |
 |---|---|---|
 | 壳 ↔ Sin90 | HTTP/WS(`/api/v1/sin90/*`) | 跨进程,本就该 API |
-| Sin90 ↔ 内核(调模型/注册调度/发事件/审批) | **进程内 ctx 句柄**(模块 `register(router, ctx)`) | 热路径(意图分类 p95<500ms)不该白加 HTTP 跳 |
-| 内核 ↔ Sin90 | **无**(单向) | 内核发通用事件,Sin90 按需订阅;内核绝不 call 进 Sin90 |
+| Sin90 ↔ 内核(调模型/注册调度/发事件/查授权) | **`Sin90KernelCtx` trait**(进程内为第一个 adapter) | 热路径(意图分类 p95<500ms)不该白加 HTTP 跳 |
+| 内核 ↔ Sin90 | **无**(单向) | 内核发通用/模块事件,Sin90 按需订阅;内核绝不 call 进 Sin90 |
 
-**为什么模块+独立 DB,而非独立进程纯 API**:桌宠是本地单机,拿不到独立进程的好处(异地/异语言/热插拔都用不上),却要付多养一个 daemon + 内核模型调用跨 HTTP 的税。模块机制拿到"互不影响"(独立 DB、独立迁移、独立演进),不付这税。
+**ctx 是 trait,不是内联句柄(Codex #2 修正)**:边界定义为 `Sin90KernelCtx` trait(`model()` / `scheduler()` / `events()` / `authz()`),进程内实现只是**第一个 adapter**;将来 headless server 版要把 Sin90 拆独立进程时,加一个 RPC adapter 即可,业务代码不动。选"进程内"是**部署决定**,不是语义边界——语义边界永远是这个 trait。
 
-**Proposal 原子性不受独立 DB 影响**:一个 `Sin90Proposal` 只改 Sin90 自己的表,"校验+落库+追加事件"是 `sin90.db` 内一个事务;内核审批只是上游放行信号,无需跨库两阶段提交。
+**为什么先做进程内 adapter,而非独立进程纯 API**:桌宠本地单机,拿不到独立进程的好处却要付多养 daemon + 内核模型调用跨 HTTP 的税。模块 + trait 边界拿到"互不影响",又保留将来拆进程的口子。
+
+### 0.1 跨库一致性:Sin90 自持 proposal/审批,内核只读放行(Codex #1/#Critical 修正)
+
+**原"内核审批只是上游放行信号"的说法有洞:若 accept 时内核 approval 行与 sin90 apply 分属两库,一边成功一边失败会审计/实际不一致。收口如下:**
+
+- **proposal 的权威状态、审批决定、apply 结果全部落在 `sin90.db`**(见 §2.3 的 `sin90_proposals`)。内核 `agent24-policy` 只被**只读**查询:"这类 op 是否命中 standing-grant 可自动放行?"——读,不写,不需与 apply 原子。
+- 因此 accept 一个 proposal = **单库单事务**:`sin90.db` 内 `pending→applied` + 写领域表 + 追加事件,一起提交。**不存在跨库两阶段提交。**
+- 内核侧真正需要写的副作用(如 Rhythm proposal 要在内核 `scheduler` 注册 cron)**不进 proposal 事务**,而是 **apply 提交后触发的幂等对账 job**(outbox 模式,§0.2)。
+
+### 0.2 内核副作用 = apply 后的幂等对账(Codex #High 修正)
+
+凡是"落库 Sin90 状态 → 顺带在内核注册/更新点什么"(Rhythm→cron schedule、nudge→定时器)的场景:
+
+- proposal 事务**只写 Sin90 表**并记一条 `sin90_outbox`(desired kernel state,带确定性 key)。
+- 一个 reconciler 读 outbox,对内核做**幂等 upsert**(按 key,重复执行等价一次),成功后标记 outbox 行 done。
+- 崩溃重启后 reconciler 重放未完成 outbox → 最终一致;内核 schedule 永远由 Sin90 状态**派生**,不会与之分叉。
 
 ---
 
@@ -143,7 +160,10 @@ pub fn check_task_transition(from: TaskStatus, to: TaskStatus)
 
 // week / schedule_block / rhythm / review 同款。
 pub fn direction_is_terminal(s: DirectionStatus) -> bool; // achieved|abandoned
-pub fn task_is_terminal(s: TaskStatus) -> bool;           // done|dropped
+pub fn task_is_terminal(s: TaskStatus) -> bool;           // done|dropped|carried_over
+// 注:carried_over 是终态——原 task 就此关闭,carry-over 原子地新建一个下周 task
+// 并回填其 carried_from(见 §3.1 UNIQUE 约束 + §3.2 原子操作)。Codex #Medium 修正:
+// 终态集合与迁移表一致,都含 carried_over。
 ```
 
 合法迁移表(草案):
@@ -158,9 +178,9 @@ Rhythm    : active→adjusted→retired ; active→retired
 Review    : draft→finalized
 ```
 
-### 2.3 `proposal.rs` — AI 不写库的门
+### 2.3 `proposal.rs` — AI 不写库的门(持久 + 幂等)
 
-**AI(Local/Executive)产出的一切都是 `Sin90Proposal`;落库前必过 `validate`——复用 store 事务 + 本校验,不新造审批机制(与 `agent24-policy` 同哲学:fail-closed)。**
+**AI(Local/Executive)产出的一切都是 `Sin90Proposal`;它先持久化进 pending,accept 时经 `validate` 校验后在 `sin90.db` 单事务落库。审批门在 Sin90 自持,内核 policy 仅被只读查询(§0.1)。**
 
 ```rust
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -170,14 +190,19 @@ pub enum Sin90Op {
     CreateTasks     { week_id: WeekId, tasks: Vec<NewTask> },
     ReorderTasks    { week_id: WeekId, order: Vec<TaskId> },
     AdjustRhythm    { rhythm_id: RhythmId, new_alloc: Vec<Alloc> },
+    CarryOverTask   { task_id: TaskId, to_week: WeekId }, // 原子:关闭原 task + 建新 task 回填 carried_from
     // …
 }
 
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus { Pending, Applying, Applied, Rejected } // 持久,见 sin90_proposals
+
 pub struct Sin90Proposal {
-    pub id: String,
+    pub id: String,                  // 客户端可复用同 id 重试 → 幂等
+    pub status: ProposalStatus,
     pub source: ProposalSource,      // local_brain | executive(codex) | rule
     pub ops: Vec<Sin90Op>,           // 一个 proposal 可含多个原子 op
-    pub rationale: Option<String>,   // 给用户看的解释
+    pub rationale: Option<String>,
 }
 
 /// 纯校验:schema 合法性 + 每个 op 目标状态迁移是否合法。
@@ -185,13 +210,22 @@ pub struct Sin90Proposal {
 pub fn validate(p: &Sin90Proposal, ctx: &ValidationCtx) -> Result<(), ProposalError>;
 ```
 
-落库流程(在 store 侧,`BEGIN IMMEDIATE` 内):
+**apply 流程(单库单事务 + CAS 幂等,Codex #1/#High/#并发 修正)**:
 
 ```
-读当前状态(写锁) → sin90::proposal::validate() → 逐 op 事务写入 → 追加 sin90_events → COMMIT
-                                     │Err
-                                     └→ 整个 proposal 回滚,返回精确错误(绝不半写)
+BEGIN IMMEDIATE (sin90.db):
+  CAS: UPDATE sin90_proposals SET status='applying' WHERE id=? AND status='pending'
+       └ 影响 0 行 → 该 proposal 非 pending(已 apply/正在 apply)→ 直接返回既有结果,不重复 apply
+  读每个 op 目标实体当前状态(同事务写锁) → sin90::proposal::validate()
+  逐 op 写领域表 + 每次变更追加一条 sin90_events(payload 自包含,见 §3.1)
+  需要内核副作用的 op → 只写 sin90_outbox(desired kernel state),不在此调内核(§0.2)
+  UPDATE sin90_proposals SET status='applied'
+COMMIT
+   │任一步 Err → 整体回滚(proposal 退回 pending),返回精确错误,绝不半写
+apply 提交后:reconciler 消费 sin90_outbox → 对内核幂等 upsert(崩溃可重放)
 ```
+
+**审批(accept)**:handler 先只读问 `ctx.authz()`(内核 standing-grants)判断该 proposal 是否可自动放行;人工 proposal 则等用户 accept。放行判定与 apply **不需要原子**——它只决定"要不要调 apply",apply 本身是上面那个幂等事务。
 
 ---
 
@@ -228,27 +262,58 @@ CREATE TABLE sin90_tasks (
 );
 CREATE INDEX idx_sin90_task_status ON sin90_tasks(status);
 CREATE INDEX idx_sin90_task_week   ON sin90_tasks(week_id);
+-- Codex #High 修正:一个原 task 最多被 carry-over 一次,防并发/重试重复生成子任务。
+CREATE UNIQUE INDEX idx_sin90_task_carried ON sin90_tasks(carried_from) WHERE carried_from IS NOT NULL;
 
 -- sin90_weeks / sin90_rhythms / sin90_schedule_blocks / sin90_reviews 同构,略。
 
 -- 唯一事实来源:append-only 事件流。所有状态变更必写一条。
+-- Codex #High 修正:seq 单调自增 = 全序;payload 必须自包含(回放不 join 可变表)。
 CREATE TABLE sin90_events (
-    id         TEXT PRIMARY KEY,
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调全序,回放/水位线的锚
+    id         TEXT NOT NULL UNIQUE,               -- ulid,对外稳定标识
     entity     TEXT NOT NULL,          -- direction|task|week|block|rhythm|review
     entity_id  TEXT NOT NULL,
     kind       TEXT NOT NULL,          -- created|transitioned|reordered|…
-    from_state TEXT,                   -- 迁移事件才有
+    from_state TEXT,
     to_state   TEXT,
-    payload    TEXT NOT NULL,          -- JSON 明细(用于回放)
-    at         TEXT NOT NULL
+    -- 自包含快照:回放所需的一切都在这(direction_id/title 快照、minutes、
+    -- block_id、occurred_at、schema_ver)。事后改 direction 标题/删 block 不影响历史回放。
+    payload    TEXT NOT NULL,
+    schema_ver INTEGER NOT NULL DEFAULT 1,
+    at         TEXT NOT NULL           -- 事件发生时刻(occurred_at),回放按 seq 而非 at 排序
 );
 CREATE INDEX idx_sin90_events_entity ON sin90_events(entity, entity_id);
-CREATE INDEX idx_sin90_events_at     ON sin90_events(at);
+
+-- Proposal 门(持久):pending→applying→applied|rejected,支撑重启恢复 + CAS 幂等。
+CREATE TABLE sin90_proposals (
+    id         TEXT PRIMARY KEY,       -- 客户端可复用同 id 重试
+    status     TEXT NOT NULL,          -- pending|applying|applied|rejected
+    source     TEXT NOT NULL,          -- local_brain|executive|rule
+    ops        TEXT NOT NULL,          -- JSON: Vec<Sin90Op>
+    rationale  TEXT,
+    result     TEXT,                   -- applied 后的 AppliedProposal JSON(重试幂等返回)
+    created_at TEXT NOT NULL,
+    decided_at TEXT
+);
+CREATE INDEX idx_sin90_proposals_status ON sin90_proposals(status);
+
+-- 内核副作用 outbox(§0.2):apply 事务内只写这里,reconciler 幂等落到内核。
+CREATE TABLE sin90_outbox (
+    id           TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,        -- register_schedule|update_schedule|…
+    dedup_key    TEXT NOT NULL,        -- 确定性 key,内核侧据此 upsert(幂等)
+    desired      TEXT NOT NULL,        -- JSON: 期望的内核状态
+    status       TEXT NOT NULL,        -- pending|done
+    created_at   TEXT NOT NULL,
+    done_at      TEXT
+);
+CREATE INDEX idx_sin90_outbox_status ON sin90_outbox(status);
 
 -- 路由记账(三级脑):每次 AI 决策一行。
 CREATE TABLE sin90_ai_calls (
     id            TEXT PRIMARY KEY,
-    task_kind     TEXT NOT NULL,        -- intent_classify|weekly_plan|…
+    task_kind     TEXT NOT NULL,
     engine        TEXT NOT NULL,        -- reflex|local|executive
     fallback_from TEXT,                 -- 非空 = 本该降级却打到了更贵的脑
     latency_ms    INTEGER,
@@ -256,44 +321,54 @@ CREATE TABLE sin90_ai_calls (
     at            TEXT NOT NULL
 );
 
--- 对账物化视图:按天×方向的计划vs实际分钟数,由 sin90_events 回放增量更新。
+-- 对账物化视图:纯派生自 sin90_events,带水位线保证"增量 == 全量回放"。
+-- Codex #High 修正:applied_event_seq 记已消费到的 seq;重建 = 清空 + 从 seq 0 回放。
 CREATE TABLE sin90_attention_daily (
-    day          TEXT NOT NULL,
-    direction_id TEXT NOT NULL,
-    planned_min  INTEGER NOT NULL DEFAULT 0,
-    actual_min   INTEGER NOT NULL DEFAULT 0,
+    day               TEXT NOT NULL,
+    direction_id      TEXT NOT NULL,
+    planned_min       INTEGER NOT NULL DEFAULT 0,
+    actual_min        INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, direction_id)
 );
+CREATE TABLE sin90_attention_watermark ( applied_event_seq INTEGER NOT NULL ); -- 单行
 ```
 
 ### 3.2 repo trait(草案)
 
 ```rust
-// agent24-store 内新增,风格同现有 repo(sqlx::query, BEGIN IMMEDIATE)。
+// agent24-sin90-store 内,风格同现有 repo(sqlx::query, BEGIN IMMEDIATE)。
 pub trait Sin90Repo {
     async fn create_direction(&self, d: NewDirection) -> Result<Direction, StoreError>;
     /// 读当前状态(写锁)→ check_task_transition → UPDATE → 追加 sin90_events,全在一个事务。
     async fn transition_task(&self, id: &TaskId, to: TaskStatus) -> Result<Task, StoreError>;
-    /// 一个 proposal 的所有 op 落在同一事务;任一 op 校验失败 → 整体回滚。
+    /// §2.3 apply:CAS 幂等 + 单事务落库 + outbox;重复 id 返回既有结果。
     async fn apply_proposal(&self, p: &Sin90Proposal) -> Result<AppliedProposal, StoreError>;
-    /// SPIKE-00 判定面:纯从 sin90_events 回放算注意力分配。
+    /// SPIKE-00:纯从 sin90_events 回放(不 join 可变表)。
     async fn attention(&self, window: Window) -> Result<AttentionReport, StoreError>;
+    /// 物化视图增量推进 + 确定性重建(见下)。
+    async fn attention_apply_new_events(&self) -> Result<(), StoreError>;
+    async fn attention_rebuild(&self) -> Result<(), StoreError>; // 清空 + 从 seq 0 全量回放
     // list_* / get_* …
 }
 ```
 
-**SPIKE-00 对账 SQL 的形状**(核心):
+**SPIKE-00 对账 SQL(核心,只读事件、不 join 可变表 —— Codex #High 修正)**:
 
 ```sql
--- 「本周 Coding 18h」= 回放本周所有 block.completed 事件,按 direction 归并 actual_min。
-SELECT d.title, SUM(json_extract(e.payload,'$.minutes')) AS actual_min
+-- 「本周 Coding 18h」= 回放本周所有 block.completed 事件。
+-- direction_id / minutes 全取自事件 payload 快照,绝不 join 当前的 blocks/directions,
+-- 这样事后改标题、删 block、迁移都不会篡改历史回放结果。
+SELECT json_extract(e.payload,'$.direction_id')       AS direction_id,
+       json_extract(e.payload,'$.direction_title')     AS direction_title, -- 快照标题
+       SUM(json_extract(e.payload,'$.minutes'))         AS actual_min
 FROM sin90_events e
-JOIN sin90_schedule_blocks b ON b.id = e.entity_id
-JOIN sin90_directions d      ON d.id = b.direction_id
 WHERE e.entity='block' AND e.kind='transitioned' AND e.to_state='completed'
-  AND e.at >= :week_start AND e.at < :week_end
-GROUP BY d.id;
+  AND json_extract(e.payload,'$.occurred_at') >= :week_start
+  AND json_extract(e.payload,'$.occurred_at') <  :week_end
+GROUP BY direction_id;
 ```
+
+**物化视图正确性协议**:`attention_apply_new_events()` 从 `sin90_attention_watermark.applied_event_seq+1` 起按 `seq` 升序消费新事件、累加到 `sin90_attention_daily`、推进水位线,全在一个事务;`attention_rebuild()` 清空后从 seq 0 全量回放。**测试硬断言:任意事件序列下,增量结果 == 全量重建结果**(乱序写入不影响,因回放按 `seq` 全序而非按 `at`)。
 
 ---
 
@@ -324,20 +399,26 @@ GROUP BY d.id;
 .route("/api/v1/sin90/attention",         get(sin90::attention))
 ```
 
+- **这些是命令(command),不是事件**(Codex #Medium 修正):壳发的 `POST`/`PATCH` 都要经状态机校验、可被拒(409)。壳**从不直接写"既成事实"**;事实只由核在校验后产生,并以 `sin90.*` 事件(§4.2)回推给壳。"壳只发命令、只订阅事件"才是准确表述。
 - `PATCH /{entity}/{id}` body = `{ "to": "<status>", ...fields }`,handler 调 `Sin90Repo::transition_*`,状态机非法 → `409 Conflict`(与现有 approvals 的 409 语义一致)。
-- `POST /proposals` 提交后进 pending;`accept` 才触发 `apply_proposal` 落库。可配置为「low-risk op 自动 accept」——复用 `agent24-policy` 的 standing-grants。
+- `POST /proposals` 持久化进 `pending`(重启可恢复);`accept` 触发 §2.3 的幂等 apply。**同 `proposal_id` 重试安全**:CAS 命中非 pending → 返回既有 `result`,不重复 apply。可配置「low-risk op 自动 accept」——**只读**查 `agent24-policy` standing-grants(§0.1,不与 apply 原子)。
 
-### 4.2 WS 事件(复用 `/api/v1/events`)
+### 4.2 WS 事件:通用模块事件信封(Codex #High/#3危 修正)
 
-新增 `sin90.*` 事件类型(与现有 `run.*`/`schedule.*` 同一条流):
+**冲突**:现有 `agent24-protocol::EventBody` 是**强类型枚举**;若直接加 `sin90.direction.created`,要么让 protocol 认识 Sin90(破坏"内核不认识 Sin90"),要么无处安放。
 
+**收口**:给内核协议加**一个通用模块事件信封**——内核只知"模块能发不透明事件",不知其语义,单向依赖不破:
+
+```rust
+// agent24-protocol::EventBody 新增一个变体(内核一次性通用能力,非 Sin90 专属):
+Module { module: String, kind: String, payload: serde_json::Value }
+// 例:{ module:"sin90", kind:"task.transitioned", payload:{...} }
 ```
-sin90.direction.created     sin90.task.transitioned
-sin90.week.closed           sin90.proposal.pending
-sin90.attention.updated     sin90.nudge.due
-```
 
-壳订阅这些做无刷新更新(桌宠反应、气泡、对账面板)。
+- Sin90 经 `ctx.events()` 发 `Module{module:"sin90", ...}`,与 `run.*`/`schedule.*` 同一条 `/api/v1/events` WS 流。
+- 壳按 `module=="sin90"` 过滤、按 `kind` 分发(`task.transitioned`/`proposal.pending`/`attention.updated`/`nudge.due`…)做无刷新更新。
+- WS 鉴权/Origin 拒绝规则**沿用现有 events 通道**(SPEC-002),Sin90 不另立(Codex #Low)。
+- 这个信封变体也随 ADR-026 的 JSON Schema 单一事实源发布(见 §8 遗留项)。
 
 ### 4.3 typed client
 
@@ -375,7 +456,8 @@ Sin90 需要一次 AI 决策(如 task 分类 / weekly-plan)
 | **provider 应用** | 现成 OpenAI-兼容 ↔ 更好的第三方 provider crate | `agent24-models` 有序注册表 | 否 |
 
 约束落法:
-- Sin90 调模型只经 `ctx.model.route(task_kind, prompt, schema) -> Sin90Proposal 素材`;**输入是任务类别 + 受约束 schema,输出是结构化结果**,概不出现 endpoint / api-key / model-id / vendor SDK 类型。
+- Sin90 调模型经 `ctx.model()`,底层是现有 `ModelRouter::complete(TaskProfile, CompletionRequest, CancellationToken)`(Codex #High 修正:原稿写的 `route(task_kind,prompt,schema)` **不存在**,已对齐真实签名)。Sin90 侧永不出现 endpoint / api-key / model-id / vendor SDK 类型。
+- **受约束 JSON 输出是 agent24-models 的一个待办依赖**(§8):现有 `CompletionRequest` **没有** `response_format`/schema 字段。收口二选一——(a) 给 `CompletionRequest` 加可选 `response_format: JsonSchema`,OpenAI-兼容 provider(oMLX 已原生支持)透传;(b) 短期内 Sin90 侧对文本输出做 schema 校验 + 失败重试。倾向 (a),因 oMLX 已支持 `response_format: json_schema`。
 - 路由/重试/降级/健康反馈在 `ModelRouter`(trait 之上),provider 内只做"一次调用"(ADR-026 §6.5)。
 - 有更好的模型 → 改配置换权重;有更好的 provider → 注册表里替换一项;换本地运行时 → 换 provider 实现。三者都不触碰 Sin90 与其 API。
 
@@ -411,9 +493,41 @@ agent24-sin90-store = { path = "../../crates/agent24-sin90-store" }
 
 ## 7. SPIKE-00 落地清单(据此起跑)
 
-- [ ] `agent24-sin90`:`Direction/Task/ScheduleBlock` 类型 + `check_*_transition` + `validate`(纯,带单测)
-- [ ] `agent24-sin90-store`:`0001_sin90.sql` 最小子集(独立 `sin90.db`)+ `Sin90Repo`(`create_direction`/`apply_proposal`/`transition_block`/`attention`)
-- [ ] `agent24d`:sin90 模块挂 `POST /directions`、`POST /proposals`、`GET /attention`
-- [ ] Local 脑冒烟:`omlx` 拉 `mlx-community/Qwen3-0.6B` → 经 agent24-models OpenAI provider(`response_format: json_schema`)做一次意图分类,量 p95(SPIKE-03)
+- [ ] `agent24-sin90`:`Direction/Task/ScheduleBlock` 类型 + `check_*_transition`(终态含 carried_over)+ `validate`(纯,带单测)
+- [ ] `agent24-sin90-store`:`0001_sin90.sql`(含 `sin90_proposals`/`sin90_outbox`/事件 `seq`/attention 水位线/`UNIQUE(carried_from)`)+ `Sin90Repo`(`apply_proposal` 走 CAS 幂等单事务、`attention` 纯回放、`attention_rebuild`)
+- [ ] **一致性测试(判定门槛)**:`apply_proposal` 同 id 重试幂等;增量 attention == 全量 rebuild;事件 payload 自包含(改标题/删 block 不改历史回放)
+- [ ] `agent24d`:sin90 模块挂 `POST /directions`、`POST /proposals`、`POST /proposals/{id}/accept`、`GET /attention`
+- [ ] Local 脑冒烟:`omlx` 拉 `mlx-community/Qwen3-0.6B` → 经 agent24-models provider 做一次意图分类,量 p95(SPIKE-03)
 - [ ] 判定:塞入一串 block.completed 事件,`GET /api/v1/sin90/attention?window=week` 返回「Coding 18h / Business 2h」,全部来自事件回放
 - [ ] Pet0 侧:一次性壳建 1 个 Direction + 渲染对账 → 绿灯即坐实
+
+---
+
+## 8. 内核侧遗留工作(SPIKE-00 前须与内核对齐)
+
+这几项**动的是内核,不是 Sin90**,需在内核仓库另行排期;SPIKE-00 可先用桩绕过,但契约要先定:
+
+1. **`agent24-protocol`**:新增通用 `EventBody::Module{module,kind,payload}` 变体 + 其 JSON Schema(§4.2)。这是内核一次性通用能力,非 Sin90 专属。
+2. **`agent24-models`**:`CompletionRequest` 加可选 `response_format: JsonSchema`,OpenAI-兼容 provider 透传(§5.1)。
+3. **模块宿主**:`agent24d` 定义 `Sin90KernelCtx` 的进程内 adapter(`model()`/`scheduler()`/`events()`/`authz()`),并规范模块 `register(router, ctx)` 挂载点(§0)。
+4. **ADR-026 单一事实源**:Sin90 的 API/事件随内核一样发布 OpenAPI/JSON Schema(而非只写在本文档)。
+
+## 9. v0.3 改动记录(Codex 架构自审收口)
+
+| # | 级别 | 问题 | 收口 |
+|---|---|---|---|
+| 1 | Critical | 审批与 apply 跨库不原子 | proposal/审批/apply 全落 sin90.db 单事务;内核 policy 只读放行(§0.1) |
+| 2 | High | 内核副作用(scheduler)也跨库写 | apply 只写 `sin90_outbox`,reconciler 幂等落内核(§0.2) |
+| 3 | High | pending proposal 无持久表 | 新增 `sin90_proposals`(§3.1),重启可恢复 |
+| 4 | High | ctx 内联硬编码部署拓扑 | 边界改为 `Sin90KernelCtx` trait,进程内为第一 adapter(§0) |
+| 5 | High | attention "纯回放"实为 join 可变表 | 事件 payload 自包含快照,回放不 join(§3.1/§3.2) |
+| 6 | High | 物化视图无正确性协议 | 事件 `seq` 全序 + `applied_event_seq` 水位线 + 确定性 rebuild + 断言测试(§3) |
+| 7 | High | 无 proposal 幂等,双 accept 重复 apply | `pending→applying` CAS(§2.3) |
+| 8 | High | carried_over 链无约束 | `UNIQUE(carried_from)` + 原子 `CarryOverTask` op(§2.3/§3.1) |
+| 9 | High | `ctx.model.route(...)` API 不存在 | 对齐真实 `ModelRouter::complete`;response_format 列内核待办(§5.1/§8) |
+| 10 | High | `sin90.*` 强类型事件 vs 单向依赖冲突 | 通用 `EventBody::Module` 信封(§4.2/§8) |
+| 11 | Medium | task 终态自相矛盾 | 终态集合含 carried_over(§2.2) |
+| 12 | Medium | 命令 vs 事件语义混用 | 明确壳发命令(可拒)、只订阅事件(§4.1) |
+| 13 | Medium | 镜像文档说用 agent24-store,与本稿矛盾 | 同步镜像:改为 agent24-sin90 模块自带 store |
+
+未采纳(记录理由):sin90_events 全量 hash-chain(Codex #Medium)——单用户本地场景暂以 `seq` 全序 + append-only 达到可回放/可对账,防篡改留作 M3 隐私加固项,不进 SPIKE-00。
