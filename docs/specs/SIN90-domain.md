@@ -364,6 +364,21 @@ Sin90 需要一次 AI 决策(如 task 分类 / weekly-plan)
 
 输出统一回到 §2.3 的 `Sin90Proposal`,再过 Proposal 门。
 
+### 5.1 模型层三个替换轴(隔离原则,硬约束)
+
+**Sin90 永不直连任何具体模型/运行时/端点;它只依赖 `ctx.model` 抽象(内核 `ModelRouter`)。** 下面三个轴各自独立可换,换任一轴不动 Sin90 一行、不动业务接口:
+
+| 轴 | 换什么 | 换的位置 | Sin90 感知? |
+|---|---|---|---|
+| **运行时** | oMLX ↔ Ollama ↔ llama.cpp ↔ 云 API | `agent24-models` provider 实现 | 否 |
+| **模型权重** | Qwen3-0.6B ↔ 1.7B ↔ 换厂商模型 | provider 配置(model id) | 否 |
+| **provider 应用** | 现成 OpenAI-兼容 ↔ 更好的第三方 provider crate | `agent24-models` 有序注册表 | 否 |
+
+约束落法:
+- Sin90 调模型只经 `ctx.model.route(task_kind, prompt, schema) -> Sin90Proposal 素材`;**输入是任务类别 + 受约束 schema,输出是结构化结果**,概不出现 endpoint / api-key / model-id / vendor SDK 类型。
+- 路由/重试/降级/健康反馈在 `ModelRouter`(trait 之上),provider 内只做"一次调用"(ADR-026 §6.5)。
+- 有更好的模型 → 改配置换权重;有更好的 provider → 注册表里替换一项;换本地运行时 → 换 provider 实现。三者都不触碰 Sin90 与其 API。
+
 ---
 
 ## 6. Cargo 接线(依赖单向:Sin90 → 内核)
