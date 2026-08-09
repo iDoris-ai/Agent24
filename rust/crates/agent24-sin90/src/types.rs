@@ -71,6 +71,18 @@ pub enum ReviewStatus {
     Finalized,
 }
 
+/// Persistent proposal lifecycle (backs `sin90_proposals.status`); its state
+/// machine lives in `transitions.rs` like every other status. `applying` is the
+/// CAS-claimed state that makes a re-tried accept idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    Pending,
+    Applying,
+    Applied,
+    Rejected,
+}
+
 // ---------------------------------------------------------------------------
 // Descriptive value enums (classification outputs, not state machines)
 // ---------------------------------------------------------------------------
@@ -102,7 +114,10 @@ pub enum ReviewKind {
 }
 
 /// One direction's share of a Rhythm's attention budget, in whole percent.
+/// `deny_unknown_fields`: this is model-produced input, so a stray/mistyped key
+/// must fail loudly, not be silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Alloc {
     pub direction_id: DirectionId,
     pub pct: u32,

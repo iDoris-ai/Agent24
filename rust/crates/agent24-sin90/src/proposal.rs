@@ -9,12 +9,18 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
+
 use crate::transitions::{TransitionError, check_task_transition, week_is_open};
-use crate::types::{Alloc, DirectionId, RhythmId, TaskId, TaskStatus, WeekId, WeekStatus};
+use crate::types::{
+    Alloc, DirectionId, ProposalStatus, RhythmId, TaskId, TaskStatus, WeekId, WeekStatus,
+};
 
 /// A new task to create inside a week (fields the AI proposes; ids/timestamps
-/// are minted by the store on apply).
+/// are minted by the store on apply). `deny_unknown_fields`: model output with a
+/// stray/mistyped key must fail loudly, not silently drop it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewTask {
     pub title: String,
     pub direction_id: Option<DirectionId>,
@@ -60,17 +66,6 @@ pub enum ProposalSource {
     Rule,
 }
 
-/// Persistent proposal lifecycle (backs `sin90_proposals.status`). `applying`
-/// is the CAS-claimed state that makes a re-tried accept idempotent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProposalStatus {
-    Pending,
-    Applying,
-    Applied,
-    Rejected,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sin90Proposal {
     /// Client-stable id: re-submitting the same id is idempotent.
@@ -81,12 +76,22 @@ pub struct Sin90Proposal {
     pub rationale: Option<String>,
 }
 
-/// Read-only current-state lookup the store provides (under its write lock)
-/// so validation stays pure. `None` means "no such entity".
+/// Read-only current-state lookup the store provides (under its write lock) so
+/// validation stays pure. `None` means "no such entity".
+///
+/// SCOPE (the boundary, decided deliberately — SIN90-domain.md §2.3): this trait
+/// exposes only per-entity *existence + status*. Validation here therefore
+/// covers structural well-formedness and transition legality. It does NOT check
+/// **relational** invariants that an FK cannot express — e.g. that a
+/// `TransitionTask`'s task belongs to an *open* week, or that `CarryOverTask`'s
+/// `to_week` differs from the task's current week. Those are enforced by the
+/// store inside the apply transaction, under the same write lock. The trait is
+/// kept narrow on purpose: every widening becomes a breaking change across every
+/// implementor once the store lands.
 pub trait ValidationCtx {
-    fn task_status(&self, id: &TaskId) -> Option<TaskStatus>;
-    fn week_status(&self, id: &WeekId) -> Option<WeekStatus>;
-    fn rhythm_is_retired(&self, id: &RhythmId) -> Option<bool>;
+    fn task_status(&self, id: &str) -> Option<TaskStatus>;
+    fn week_status(&self, id: &str) -> Option<WeekStatus>;
+    fn rhythm_is_retired(&self, id: &str) -> Option<bool>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -101,50 +106,97 @@ pub enum ProposalError {
     WeekNotOpen { week_id: WeekId, status: WeekStatus },
     #[error("rhythm {rhythm_id} is retired; cannot adjust")]
     RhythmRetired { rhythm_id: RhythmId },
-    #[error("reorder for week {week_id} has an empty order list")]
-    EmptyReorder { week_id: WeekId },
+    #[error("{op} for week {week_id} has an empty list")]
+    EmptyList { op: &'static str, week_id: WeekId },
+    #[error("{op} references {id} more than once")]
+    DuplicateRef { op: &'static str, id: String },
     #[error("allocation percentages sum to {sum_pct} (must be <= 100)")]
     InvalidAlloc { sum_pct: u32 },
+    #[error("{field} must not be blank")]
+    BlankField { field: &'static str },
 }
 
-/// Pure validation: structural checks + every state-changing op must be a legal
-/// transition from the entity's *current* status (looked up via `ctx`). Returns
-/// on the FIRST offending op, leaving the store to reject the whole proposal —
-/// apply is all-or-nothing (SIN90-domain.md §2.3).
+/// A working view that overlays the pending effects of earlier ops in the SAME
+/// batch on top of the store snapshot. This makes a proposal validate as the
+/// ordered sequence it is, not as N independent reads of the pre-batch state —
+/// so `[t→InProgress, t→Done]` passes and `[t→InProgress, t→InProgress]` fails,
+/// exactly as apply would behave under the write lock.
+struct Working<'c> {
+    ctx: &'c dyn ValidationCtx,
+    task: std::collections::HashMap<String, TaskStatus>,
+}
+
+impl<'c> Working<'c> {
+    fn new(ctx: &'c dyn ValidationCtx) -> Self {
+        Self {
+            ctx,
+            task: std::collections::HashMap::new(),
+        }
+    }
+    fn task_status(&self, id: &str) -> Option<TaskStatus> {
+        self.task
+            .get(id)
+            .copied()
+            .or_else(|| self.ctx.task_status(id))
+    }
+    fn set_task(&mut self, id: &str, s: TaskStatus) {
+        self.task.insert(id.to_string(), s);
+    }
+}
+
+/// Pure validation: structural well-formedness + every state-changing op must be
+/// a legal transition from the entity's status *as of this point in the batch*
+/// (store snapshot overlaid with earlier ops). Returns on the FIRST offending
+/// op; the store rejects the whole proposal — apply is all-or-nothing.
+/// Relational invariants are the store's job (see [`ValidationCtx`]).
 pub fn validate(p: &Sin90Proposal, ctx: &dyn ValidationCtx) -> Result<(), ProposalError> {
     if p.ops.is_empty() {
         return Err(ProposalError::Empty);
     }
+    let mut w = Working::new(ctx);
     for op in &p.ops {
-        validate_op(op, ctx)?;
+        validate_op(op, &mut w)?;
     }
     Ok(())
 }
 
-fn validate_op(op: &Sin90Op, ctx: &dyn ValidationCtx) -> Result<(), ProposalError> {
+fn validate_op(op: &Sin90Op, w: &mut Working<'_>) -> Result<(), ProposalError> {
     match op {
-        // Structurally always valid — a brand-new entity has no prior state.
-        Sin90Op::CreateDirection { .. } => Ok(()),
+        Sin90Op::CreateDirection {
+            title,
+            target_window,
+        } => {
+            non_blank("title", title)?;
+            non_blank("target_window", target_window)?;
+            Ok(())
+        }
 
         Sin90Op::TransitionTask { task_id, to } => {
-            let from = task_status(ctx, task_id)?;
+            let from = task_status(w, task_id)?;
             check_task_transition(from, *to)?;
+            w.set_task(task_id, *to);
             Ok(())
         }
 
-        Sin90Op::CreateTasks { week_id, .. } => {
-            require_open_week(ctx, week_id)?;
-            Ok(())
-        }
-
-        Sin90Op::ReorderTasks { week_id, order } => {
-            require_open_week(ctx, week_id)?;
-            if order.is_empty() {
-                return Err(ProposalError::EmptyReorder {
+        Sin90Op::CreateTasks { week_id, tasks } => {
+            if tasks.is_empty() {
+                return Err(ProposalError::EmptyList {
+                    op: "create_tasks",
                     week_id: week_id.clone(),
                 });
             }
-            Ok(())
+            require_open_week(w, week_id)
+        }
+
+        Sin90Op::ReorderTasks { week_id, order } => {
+            require_open_week(w, week_id)?;
+            if order.is_empty() {
+                return Err(ProposalError::EmptyList {
+                    op: "reorder_tasks",
+                    week_id: week_id.clone(),
+                });
+            }
+            reject_dupes("reorder_tasks", order.iter())
         }
 
         Sin90Op::AdjustRhythm {
@@ -152,7 +204,8 @@ fn validate_op(op: &Sin90Op, ctx: &dyn ValidationCtx) -> Result<(), ProposalErro
             new_alloc,
         } => {
             let retired =
-                ctx.rhythm_is_retired(rhythm_id)
+                w.ctx
+                    .rhythm_is_retired(rhythm_id)
                     .ok_or_else(|| ProposalError::UnknownEntity {
                         entity: "rhythm",
                         id: rhythm_id.clone(),
@@ -162,47 +215,79 @@ fn validate_op(op: &Sin90Op, ctx: &dyn ValidationCtx) -> Result<(), ProposalErro
                     rhythm_id: rhythm_id.clone(),
                 });
             }
-            check_alloc(new_alloc)?;
-            Ok(())
+            check_alloc(new_alloc)
         }
 
         Sin90Op::CarryOverTask { task_id, to_week } => {
-            let from = task_status(ctx, task_id)?;
+            let from = task_status(w, task_id)?;
             // Closing side of the carry-over must itself be a legal task transition.
             check_task_transition(from, TaskStatus::CarriedOver)?;
-            require_open_week(ctx, to_week)?;
+            require_open_week(w, to_week)?;
+            w.set_task(task_id, TaskStatus::CarriedOver);
             Ok(())
         }
     }
 }
 
-fn task_status(ctx: &dyn ValidationCtx, id: &TaskId) -> Result<TaskStatus, ProposalError> {
-    ctx.task_status(id)
+fn non_blank(field: &'static str, value: &str) -> Result<(), ProposalError> {
+    if value.trim().is_empty() {
+        Err(ProposalError::BlankField { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn task_status(w: &Working<'_>, id: &str) -> Result<TaskStatus, ProposalError> {
+    w.task_status(id)
         .ok_or_else(|| ProposalError::UnknownEntity {
             entity: "task",
-            id: id.clone(),
+            id: id.to_string(),
         })
 }
 
-fn require_open_week(ctx: &dyn ValidationCtx, id: &WeekId) -> Result<(), ProposalError> {
-    let status = ctx
+fn require_open_week(w: &Working<'_>, id: &str) -> Result<(), ProposalError> {
+    let status = w
+        .ctx
         .week_status(id)
         .ok_or_else(|| ProposalError::UnknownEntity {
             entity: "week",
-            id: id.clone(),
+            id: id.to_string(),
         })?;
     if week_is_open(status) {
         Ok(())
     } else {
         Err(ProposalError::WeekNotOpen {
-            week_id: id.clone(),
+            week_id: id.to_string(),
             status,
         })
     }
 }
 
+fn reject_dupes<'a>(
+    op: &'static str,
+    ids: impl Iterator<Item = &'a String>,
+) -> Result<(), ProposalError> {
+    let mut seen = HashSet::new();
+    for id in ids {
+        if !seen.insert(id.as_str()) {
+            return Err(ProposalError::DuplicateRef { op, id: id.clone() });
+        }
+    }
+    Ok(())
+}
+
 fn check_alloc(alloc: &[Alloc]) -> Result<(), ProposalError> {
-    // Saturating so a maliciously huge value can't wrap; > 100 is rejected anyway.
+    // No ctx needed: structural checks a batch can fail on its own contents.
+    let mut seen = HashSet::new();
+    for a in alloc {
+        if !seen.insert(a.direction_id.as_str()) {
+            return Err(ProposalError::DuplicateRef {
+                op: "adjust_rhythm",
+                id: a.direction_id.clone(),
+            });
+        }
+    }
+    // Saturating so a huge value can't wrap; > 100 is rejected anyway.
     let sum = alloc.iter().fold(0u32, |acc, a| acc.saturating_add(a.pct));
     if sum > 100 {
         Err(ProposalError::InvalidAlloc { sum_pct: sum })
@@ -227,13 +312,13 @@ mod tests {
     }
 
     impl ValidationCtx for MockCtx {
-        fn task_status(&self, id: &TaskId) -> Option<TaskStatus> {
+        fn task_status(&self, id: &str) -> Option<TaskStatus> {
             self.tasks.get(id).copied()
         }
-        fn week_status(&self, id: &WeekId) -> Option<WeekStatus> {
+        fn week_status(&self, id: &str) -> Option<WeekStatus> {
             self.weeks.get(id).copied()
         }
-        fn rhythm_is_retired(&self, id: &RhythmId) -> Option<bool> {
+        fn rhythm_is_retired(&self, id: &str) -> Option<bool> {
             self.rhythms_retired.get(id).copied()
         }
     }
@@ -320,7 +405,10 @@ mod tests {
 
         let bad = proposal(vec![Sin90Op::CreateTasks {
             week_id: "w_closed".into(),
-            tasks: vec![],
+            tasks: vec![NewTask {
+                title: "x".into(),
+                direction_id: None,
+            }],
         }]);
         assert!(matches!(
             validate(&bad, &ctx),
@@ -338,8 +426,163 @@ mod tests {
         }]);
         assert!(matches!(
             validate(&p, &ctx),
-            Err(ProposalError::EmptyReorder { .. })
+            Err(ProposalError::EmptyList {
+                op: "reorder_tasks",
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn reorder_duplicate_ids_rejected() {
+        let mut ctx = MockCtx::default();
+        ctx.weeks.insert("w".into(), WeekStatus::Active);
+        let p = proposal(vec![Sin90Op::ReorderTasks {
+            week_id: "w".into(),
+            order: vec!["t1".into(), "t2".into(), "t1".into()],
+        }]);
+        assert!(matches!(
+            validate(&p, &ctx),
+            Err(ProposalError::DuplicateRef {
+                op: "reorder_tasks",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn create_tasks_empty_list_rejected() {
+        let mut ctx = MockCtx::default();
+        ctx.weeks.insert("w".into(), WeekStatus::Planning);
+        let p = proposal(vec![Sin90Op::CreateTasks {
+            week_id: "w".into(),
+            tasks: vec![],
+        }]);
+        assert!(matches!(
+            validate(&p, &ctx),
+            Err(ProposalError::EmptyList {
+                op: "create_tasks",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn create_direction_blank_title_rejected() {
+        let ctx = MockCtx::default();
+        let p = proposal(vec![Sin90Op::CreateDirection {
+            title: "   ".into(),
+            target_window: "2026-08".into(),
+        }]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::BlankField { field: "title" })
+        );
+    }
+
+    #[test]
+    fn adjust_rhythm_duplicate_direction_rejected() {
+        let mut ctx = MockCtx::default();
+        ctx.rhythms_retired.insert("r".into(), false);
+        // Sums to 100 but names d1 twice — must be caught before it hits the
+        // UNIQUE(rhythm_id, direction_id) constraint at apply time.
+        let p = proposal(vec![Sin90Op::AdjustRhythm {
+            rhythm_id: "r".into(),
+            new_alloc: vec![
+                Alloc {
+                    direction_id: "d1".into(),
+                    pct: 50,
+                },
+                Alloc {
+                    direction_id: "d1".into(),
+                    pct: 50,
+                },
+            ],
+        }]);
+        assert!(matches!(
+            validate(&p, &ctx),
+            Err(ProposalError::DuplicateRef {
+                op: "adjust_rhythm",
+                ..
+            })
+        ));
+    }
+
+    // ---- intra-batch state threading (the overlay) ----
+
+    #[test]
+    fn intra_batch_sequential_transitions_pass() {
+        // [planned→in_progress, in_progress→done] is a legal SEQUENCE; the old
+        // snapshot-only validator wrongly rejected the second op as planned→done.
+        let mut ctx = MockCtx::default();
+        ctx.tasks.insert("t1".into(), TaskStatus::Planned);
+        let p = proposal(vec![
+            Sin90Op::TransitionTask {
+                task_id: "t1".into(),
+                to: TaskStatus::InProgress,
+            },
+            Sin90Op::TransitionTask {
+                task_id: "t1".into(),
+                to: TaskStatus::Done,
+            },
+        ]);
+        assert!(validate(&p, &ctx).is_ok());
+    }
+
+    #[test]
+    fn intra_batch_repeated_transition_fails() {
+        // [planned→in_progress, planned→in_progress] must fail: after the first,
+        // t1 is in_progress, so the second is in_progress→in_progress (illegal).
+        let mut ctx = MockCtx::default();
+        ctx.tasks.insert("t1".into(), TaskStatus::Planned);
+        let p = proposal(vec![
+            Sin90Op::TransitionTask {
+                task_id: "t1".into(),
+                to: TaskStatus::InProgress,
+            },
+            Sin90Op::TransitionTask {
+                task_id: "t1".into(),
+                to: TaskStatus::InProgress,
+            },
+        ]);
+        assert!(matches!(
+            validate(&p, &ctx),
+            Err(ProposalError::IllegalTransition(
+                TransitionError::Task { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn intra_batch_carry_over_then_transition_fails() {
+        // [carry_over t1, t1→done]: after carry-over t1 is carried_over (terminal),
+        // so the follow-up transition is illegal — caught at validate, not apply.
+        let mut ctx = MockCtx::default();
+        ctx.tasks.insert("t1".into(), TaskStatus::InProgress);
+        ctx.weeks.insert("next".into(), WeekStatus::Planning);
+        let p = proposal(vec![
+            Sin90Op::CarryOverTask {
+                task_id: "t1".into(),
+                to_week: "next".into(),
+            },
+            Sin90Op::TransitionTask {
+                task_id: "t1".into(),
+                to: TaskStatus::Done,
+            },
+        ]);
+        assert!(matches!(
+            validate(&p, &ctx),
+            Err(ProposalError::IllegalTransition(
+                TransitionError::Task { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn deny_unknown_fields_on_new_task() {
+        // A stray key in model output must fail loudly, not be silently dropped.
+        let err = serde_json::from_str::<NewTask>(r#"{"title":"x","typo":1}"#);
+        assert!(err.is_err(), "unknown field must be rejected");
     }
 
     #[test]

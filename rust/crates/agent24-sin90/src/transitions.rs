@@ -7,7 +7,8 @@
 //! lock before every UPDATE (SIN90-domain.md §2.2).
 
 use crate::types::{
-    DirectionStatus, ReviewStatus, RhythmStatus, ScheduleBlockStatus, TaskStatus, WeekStatus,
+    DirectionStatus, ProposalStatus, ReviewStatus, RhythmStatus, ScheduleBlockStatus, TaskStatus,
+    WeekStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -16,6 +17,11 @@ pub enum TransitionError {
     Direction {
         from: DirectionStatus,
         to: DirectionStatus,
+    },
+    #[error("illegal proposal transition: {from:?} -> {to:?}")]
+    Proposal {
+        from: ProposalStatus,
+        to: ProposalStatus,
     },
     #[error("illegal task transition: {from:?} -> {to:?}")]
     Task { from: TaskStatus, to: TaskStatus },
@@ -40,6 +46,8 @@ pub enum TransitionError {
 
 // ---------------------------------------------------------------------------
 // Direction: draft → active → {achieved, abandoned, paused}; paused → active
+// A direction can also be abandoned straight from draft or paused, so it need
+// not pass through a state it was never in (parallels task's backlog → dropped).
 // ---------------------------------------------------------------------------
 
 pub fn direction_transition_allowed(from: DirectionStatus, to: DirectionStatus) -> bool {
@@ -47,10 +55,12 @@ pub fn direction_transition_allowed(from: DirectionStatus, to: DirectionStatus) 
     matches!(
         (from, to),
         (Draft, Active)
+            | (Draft, Abandoned)
             | (Active, Achieved)
             | (Active, Abandoned)
             | (Active, Paused)
             | (Paused, Active)
+            | (Paused, Abandoned)
     )
 }
 
@@ -171,14 +181,17 @@ pub fn schedule_block_is_terminal(s: ScheduleBlockStatus) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Rhythm: active → adjusted → retired; active → retired
+// Rhythm: active → adjusted → retired; active → retired; adjusted → adjusted
+// (re-adjust). An adjusted rhythm can be tuned repeatedly — matches the intent
+// baked into ValidationCtx, which exposes rhythm as "retired?" (a rhythm may be
+// adjusted whenever it is not retired), not as a one-shot.
 // ---------------------------------------------------------------------------
 
 pub fn rhythm_transition_allowed(from: RhythmStatus, to: RhythmStatus) -> bool {
     use RhythmStatus::*;
     matches!(
         (from, to),
-        (Active, Adjusted) | (Active, Retired) | (Adjusted, Retired)
+        (Active, Adjusted) | (Active, Retired) | (Adjusted, Adjusted) | (Adjusted, Retired)
     )
 }
 
@@ -219,6 +232,37 @@ pub fn check_review_transition(
 
 pub fn review_is_terminal(s: ReviewStatus) -> bool {
     matches!(s, ReviewStatus::Finalized)
+}
+
+// ---------------------------------------------------------------------------
+// Proposal lifecycle: pending → applying → applied ; {pending, applying} →
+// rejected. The store CLAIMS pending → applying with a CAS; a failed apply
+// rolls the whole tx back (an implicit return to pending), which is a database
+// rollback, not a modeled forward edge.
+// ---------------------------------------------------------------------------
+
+pub fn proposal_transition_allowed(from: ProposalStatus, to: ProposalStatus) -> bool {
+    use ProposalStatus::*;
+    matches!(
+        (from, to),
+        (Pending, Applying) | (Pending, Rejected) | (Applying, Applied) | (Applying, Rejected)
+    )
+}
+
+pub fn check_proposal_transition(
+    from: ProposalStatus,
+    to: ProposalStatus,
+) -> Result<(), TransitionError> {
+    if proposal_transition_allowed(from, to) {
+        Ok(())
+    } else {
+        Err(TransitionError::Proposal { from, to })
+    }
+}
+
+pub fn proposal_is_terminal(s: ProposalStatus) -> bool {
+    use ProposalStatus::*;
+    matches!(s, Applied | Rejected)
 }
 
 #[cfg(test)]
@@ -266,10 +310,12 @@ mod tests {
         use DirectionStatus::*;
         let legal = [
             (Draft, Active),
+            (Draft, Abandoned),
             (Active, Achieved),
             (Active, Abandoned),
             (Active, Paused),
             (Paused, Active),
+            (Paused, Abandoned),
         ];
         let mut count = 0;
         for from in DIRECTION_ALL {
@@ -325,11 +371,13 @@ mod tests {
         let legal = [(Planning, Active), (Active, Reviewing), (Reviewing, Closed)];
         for from in WEEK_ALL {
             for to in WEEK_ALL {
+                let expected = legal.contains(&(from, to));
                 assert_eq!(
                     week_transition_allowed(from, to),
-                    legal.contains(&(from, to)),
+                    expected,
                     "({from:?} -> {to:?})"
                 );
+                assert_eq!(check_week_transition(from, to).is_ok(), expected);
             }
         }
     }
@@ -345,11 +393,13 @@ mod tests {
         ];
         for from in BLOCK_ALL {
             for to in BLOCK_ALL {
+                let expected = legal.contains(&(from, to));
                 assert_eq!(
                     schedule_block_transition_allowed(from, to),
-                    legal.contains(&(from, to)),
+                    expected,
                     "({from:?} -> {to:?})"
                 );
+                assert_eq!(check_schedule_block_transition(from, to).is_ok(), expected);
             }
         }
     }
@@ -357,14 +407,21 @@ mod tests {
     #[test]
     fn rhythm_matrix() {
         use RhythmStatus::*;
-        let legal = [(Active, Adjusted), (Active, Retired), (Adjusted, Retired)];
+        let legal = [
+            (Active, Adjusted),
+            (Active, Retired),
+            (Adjusted, Adjusted),
+            (Adjusted, Retired),
+        ];
         for from in RHYTHM_ALL {
             for to in RHYTHM_ALL {
+                let expected = legal.contains(&(from, to));
                 assert_eq!(
                     rhythm_transition_allowed(from, to),
-                    legal.contains(&(from, to)),
+                    expected,
                     "({from:?} -> {to:?})"
                 );
+                assert_eq!(check_rhythm_transition(from, to).is_ok(), expected);
             }
         }
     }
@@ -376,6 +433,35 @@ mod tests {
             for to in REVIEW_ALL {
                 let expected = from == Draft && to == Finalized;
                 assert_eq!(review_transition_allowed(from, to), expected);
+                assert_eq!(check_review_transition(from, to).is_ok(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn proposal_matrix() {
+        use ProposalStatus::*;
+        const ALL: [ProposalStatus; 4] = [Pending, Applying, Applied, Rejected];
+        let legal = [
+            (Pending, Applying),
+            (Pending, Rejected),
+            (Applying, Applied),
+            (Applying, Rejected),
+        ];
+        for from in ALL {
+            for to in ALL {
+                let expected = legal.contains(&(from, to));
+                assert_eq!(
+                    proposal_transition_allowed(from, to),
+                    expected,
+                    "({from:?} -> {to:?})"
+                );
+                assert_eq!(check_proposal_transition(from, to).is_ok(), expected);
+            }
+        }
+        for s in ALL {
+            if proposal_is_terminal(s) {
+                assert!(ALL.iter().all(|&t| !proposal_transition_allowed(s, t)));
             }
         }
     }
