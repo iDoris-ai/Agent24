@@ -181,6 +181,50 @@ async fn carry_over_twice_is_rejected() {
     assert!(store.apply_proposal("p-carry2").await.is_err());
 }
 
+#[tokio::test]
+async fn transition_in_closed_week_is_rejected() {
+    // Relational invariant enforced store-side: a task in a closed week is
+    // immutable, even though the pure validator (per-entity) can't see it.
+    let store = Sin90Store::open_memory().await.unwrap();
+    let wk = store.create_week("2026-W33").await.unwrap();
+    let seed = proposal(
+        "p-seed",
+        vec![Sin90Op::CreateTasks {
+            week_id: wk.id.clone(),
+            tasks: vec![agent24_sin90::NewTask {
+                title: "t".into(),
+                direction_id: None,
+            }],
+        }],
+    );
+    store.submit_proposal(&seed).await.unwrap();
+    store.apply_proposal("p-seed").await.unwrap();
+    let task_id = test_hooks::first_task_id(&store).await.unwrap();
+
+    test_hooks::close_week(&store, &wk.id).await.unwrap();
+
+    let mv = proposal(
+        "p-move",
+        vec![Sin90Op::TransitionTask {
+            task_id,
+            to: TaskStatus::InProgress,
+        }],
+    );
+    store.submit_proposal(&mv).await.unwrap();
+    assert!(
+        store.apply_proposal("p-move").await.is_err(),
+        "mutating a task in a closed week must be rejected"
+    );
+    // Rolled back → still retryable.
+    assert_eq!(
+        test_hooks::proposal_status(&store, "p-move")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("pending")
+    );
+}
+
 // ---- helpers ----
 
 /// A ±1h window around an ISO-8601 timestamp is overkill precision-wise; we just

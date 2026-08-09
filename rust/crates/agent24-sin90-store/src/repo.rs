@@ -10,7 +10,7 @@ use agent24_core::util::{now_iso8601, ulid};
 use agent24_sin90::{
     Direction, DirectionStatus, RhythmStatus, ScheduleBlock, ScheduleBlockStatus, Sin90Op,
     Sin90Proposal, TaskStatus, ValidationCtx, Week, WeekStatus, check_rhythm_transition,
-    check_schedule_block_transition, check_task_transition, validate,
+    check_schedule_block_transition, check_task_transition, validate, week_is_terminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -479,6 +479,7 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
         }
 
         Sin90Op::TransitionTask { task_id, to } => {
+            reject_if_week_closed(tx, task_id).await?; // relational invariant (§2.3)
             let from = read_task_status(tx, task_id).await?;
             check_task_transition(from, *to)?;
             let to_str = to_wire(to)?;
@@ -564,11 +565,9 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
             new_alloc,
         } => {
             let from = read_rhythm_status(tx, rhythm_id).await?;
-            // Active → Adjusted is a real transition; re-adjusting an Adjusted
-            // rhythm just updates allocations (stays Adjusted).
-            if from == RhythmStatus::Active {
-                check_rhythm_transition(from, RhythmStatus::Adjusted)?;
-            }
+            // Both Active→Adjusted and Adjusted→Adjusted (re-adjust) are legal in
+            // the matrix now, so one unconditional check covers it.
+            check_rhythm_transition(from, RhythmStatus::Adjusted)?;
             sqlx::query(
                 "UPDATE sin90_rhythms SET status = 'adjusted', allocations = ?, updated_at = ? WHERE id = ?",
             )
@@ -592,6 +591,7 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
         }
 
         Sin90Op::CarryOverTask { task_id, to_week } => {
+            reject_if_week_closed(tx, task_id).await?; // relational invariant (§2.3)
             let from = read_task_status(tx, task_id).await?;
             check_task_transition(from, TaskStatus::CarriedOver)?;
             // Close the source task.
@@ -661,6 +661,27 @@ async fn read_task_status(tx: &mut Tx<'_>, id: &str) -> Result<TaskStatus> {
         .await?
         .ok_or_else(|| StoreError::NotFound(format!("task {id}")))?;
     from_wire(&row.get::<String, _>("status"))
+}
+
+/// Relational invariant the pure validator can't express (ValidationCtx is
+/// per-entity): a task in a CLOSED week is immutable. A task with no week, or
+/// whose week is not closed, passes. Enforced under the write lock.
+async fn reject_if_week_closed(tx: &mut Tx<'_>, task_id: &str) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT w.status AS wstatus
+         FROM sin90_tasks t JOIN sin90_weeks w ON w.id = t.week_id
+         WHERE t.id = ?",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = row {
+        let wstatus: WeekStatus = from_wire(&row.get::<String, _>("wstatus"))?;
+        if week_is_terminal(wstatus) {
+            return Err(StoreError::WeekClosed(task_id.to_string()));
+        }
+    }
+    Ok(())
 }
 
 async fn read_rhythm_status(tx: &mut Tx<'_>, id: &str) -> Result<RhythmStatus> {

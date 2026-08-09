@@ -35,8 +35,11 @@ pub enum StoreError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
-    #[error("unsupported op (post-SPIKE-00): {0}")]
-    Unsupported(&'static str),
+    /// A relational invariant the pure validator cannot see (ValidationCtx is
+    /// per-entity): mutating a task whose week is already closed. Enforced here,
+    /// under the write lock (SIN90-domain.md §2.3).
+    #[error("task {0}'s week is closed; cannot mutate")]
+    WeekClosed(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -118,6 +121,16 @@ pub mod test_hooks {
                 .await?
                 .get::<String, _>("id"),
         )
+    }
+
+    /// Force a week to `closed` via raw SQL, to test the store-side relational
+    /// invariant (a pure proposal can't legally close a week itself here).
+    pub async fn close_week(store: &Sin90Store, id: &str) -> Result<()> {
+        sqlx::query("UPDATE sin90_weeks SET status = 'closed' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
     }
 
     pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {
