@@ -9,6 +9,7 @@ members = [
     "crates/agent24-protocol",
     "crates/agent24-scheduler",
     "crates/agent24-sin90",
+    "crates/agent24-sin90-store",
     "crates/agent24-policy",
     "crates/agent24-store",
     "crates/agent24-tools",
