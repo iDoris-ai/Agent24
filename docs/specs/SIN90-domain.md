@@ -1,9 +1,34 @@
 # SIN90 — 内置 Personal-OS 领域模型(接口草案)
 
-> 设计草案 v0.1(2026-08-09)。配套:[集成约定](../SIN90-PET0-INTEGRATION.md)。
-> 分层遵循 ADR-026:领域 crate 保持纯净(只依赖 protocol + thiserror),
-> 持久化扩展 `agent24-store`,API 扩展 `agent24d`。**本文件是接口契约草案,
+> 设计草案 v0.2(2026-08-09)。配套:[集成约定](../SIN90-PET0-INTEGRATION.md)。
+> **架构定调(v0.2 修正)**:Sin90 是内核之上的**可加载模块**,**自带独立
+> DB `sin90.db`**,依赖单向(Sin90 → 内核,内核绝不反向依赖 Sin90)。持久化
+> **不再塞进 `agent24-store`**——Sin90 自带 store。**本文件是接口契约草案,
 > 非最终实现;签名可在 SPIKE-00 中调整。**
+
+---
+
+## 0. 边界与依赖方向(v0.2 定调)
+
+```
+内核(通用,agent24.db)  core/store/models/policy/scheduler/memory/mcp/agent/protocol
+      ▲ 单向依赖:Sin90 用内核,内核不认识 Sin90
+模块(Sin90,sin90.db)   agent24-sin90(纯域)+ 自带 store + 挂进 agent24d 的 sin90 路由
+      ▲ HTTP/WS
+壳(Pet0)
+```
+
+两种交互,**不一刀切走 API**:
+
+| 交互 | 走什么 | 理由 |
+|---|---|---|
+| 壳 ↔ Sin90 | HTTP/WS(`/api/v1/sin90/*`) | 跨进程,本就该 API |
+| Sin90 ↔ 内核(调模型/注册调度/发事件/审批) | **进程内 ctx 句柄**(模块 `register(router, ctx)`) | 热路径(意图分类 p95<500ms)不该白加 HTTP 跳 |
+| 内核 ↔ Sin90 | **无**(单向) | 内核发通用事件,Sin90 按需订阅;内核绝不 call 进 Sin90 |
+
+**为什么模块+独立 DB,而非独立进程纯 API**:桌宠是本地单机,拿不到独立进程的好处(异地/异语言/热插拔都用不上),却要付多养一个 daemon + 内核模型调用跨 HTTP 的税。模块机制拿到"互不影响"(独立 DB、独立迁移、独立演进),不付这税。
+
+**Proposal 原子性不受独立 DB 影响**:一个 `Sin90Proposal` 只改 Sin90 自己的表,"校验+落库+追加事件"是 `sin90.db` 内一个事务;内核审批只是上游放行信号,无需跨库两阶段提交。
 
 ---
 
@@ -12,25 +37,33 @@
 | 交付 | 落点 | 纯度 |
 |---|---|---|
 | **领域**:实体类型 + 状态机 + Proposal 校验 | 新 crate `agent24-sin90` | 纯(只依赖 protocol + thiserror,**不碰 sqlx/tokio/vendor**) |
-| **持久化**:迁移 + repo + 对账 SQL | 扩展 `agent24-store`(同库不同表) | sqlx |
-| **API**:`/api/v1/sin90/*` + WS 事件 | 扩展 `agent24d`(新 `sin90.rs` 路由模块) | axum |
+| **持久化**:迁移 + repo + 对账 SQL | `agent24-sin90` 自带 store,**独立 `sin90.db`**(非 agent24-store) | sqlx |
+| **API**:`/api/v1/sin90/*` + WS 事件 | `agent24d` 挂 sin90 模块路由(`register(router, ctx)`) | axum |
 
-分层理由:与现有 `agent24-core`(纯状态机)/`agent24-store`(sqlx)/`agent24d`(axum)完全同构。换持久化或 API 不动领域一行。
+分层理由:内核 `agent24-store` 保持只认内核表;Sin90 自带 store 对着独立 DB,与内核物理隔离,单向依赖。换壳/换 API 不动领域一行,内核加载别的垂直时**根本不带 Sin90 的表**。
 
 ---
 
-## 2. crate `agent24-sin90` 布局
+## 2. crate 布局(两个 crate:纯域 + 自带 store)
 
 ```
-rust/crates/agent24-sin90/
-├── Cargo.toml          # deps: agent24-protocol, thiserror  —— 仅此
+rust/crates/agent24-sin90/            # 纯域 —— 不碰 sqlx/tokio/vendor
+├── Cargo.toml        # deps: agent24-protocol, thiserror  —— 仅此
 └── src/
     ├── lib.rs
-    ├── types.rs        # 实体 + 状态枚举(snake_case wire shape)
-    ├── transitions.rs  # 纯状态机函数(镜像 agent24-core::transitions)
-    ├── proposal.rs     # Sin90Proposal + 确定性校验
-    └── attention.rs    # 对账输入/输出形状(SQL 在 store 侧)
+    ├── types.rs      # 实体 + 状态枚举(snake_case wire shape)
+    ├── transitions.rs# 纯状态机函数(镜像 agent24-core::transitions)
+    ├── proposal.rs   # Sin90Proposal + 确定性校验
+    └── attention.rs  # 对账输入/输出形状(SQL 在 store 侧)
+
+rust/crates/agent24-sin90-store/      # 自带持久化 —— 对着独立 sin90.db
+├── Cargo.toml        # deps: agent24-sin90, sqlx  (不进 agent24-store)
+├── migrations/
+│   └── 0001_sin90.sql
+└── src/lib.rs        # Sin90Repo:BEGIN IMMEDIATE + 事件回放
 ```
+
+内核 `agent24-store` 保持不变、不认识 Sin90;Sin90 的 store 是独立 crate 对着独立 DB。
 
 ### 2.1 `types.rs` — 实体与状态
 
@@ -162,11 +195,11 @@ pub fn validate(p: &Sin90Proposal, ctx: &ValidationCtx) -> Result<(), ProposalEr
 
 ---
 
-## 3. 持久化(扩展 `agent24-store`)
+## 3. 持久化(`agent24-sin90-store`,独立 `sin90.db`)
 
-### 3.1 迁移 `migrations/0005_sin90.sql`(草案)
+### 3.1 迁移 `agent24-sin90-store/migrations/0001_sin90.sql`(草案)
 
-同一个 SQLite 文件、同一迁移框架,新增表:
+独立 SQLite 文件 `sin90.db`、独立迁移线;复用 sqlx migrate 框架但**与内核 agent24.db 物理隔离**:
 
 ```sql
 -- Sin90 domain (Personal-OS). Statuses are TEXT matching snake_case wire enums.
@@ -264,14 +297,14 @@ GROUP BY d.id;
 
 ---
 
-## 4. API 面(扩展 `agent24d`,新 `sin90.rs`)
+## 4. API 面(sin90 模块挂进 `agent24d`)
 
-沿用现有约定:`/api/v1/*`、bearer 门(除 health)、路径直接抠 `{id}`、WS 复用 `/api/v1/events`。
+沿用现有约定:`/api/v1/*`、bearer 门(除 health)、路径直接抠 `{id}`、WS 复用 `/api/v1/events`。路由由 sin90 模块的 `register(router, ctx)` 挂载,`ctx` 携带内核服务句柄(ModelRouter / Scheduler / policy / EventSink / 自身 Sin90Repo)。
 
 ### 4.1 路由表
 
 ```rust
-// server.rs 里挂进现有 Router::new()……
+// sin90 模块 register(router, ctx) 里挂进 agent24d 的 Router……
 .route("/api/v1/sin90/directions",        get(sin90::list_directions).post(sin90::create_direction))
 .route("/api/v1/sin90/directions/{id}",   get(sin90::get_direction).patch(sin90::transition_direction))
 .route("/api/v1/sin90/tasks",             get(sin90::list_tasks).post(sin90::create_task))
@@ -333,30 +366,39 @@ Sin90 需要一次 AI 决策(如 task 分类 / weekly-plan)
 
 ---
 
-## 6. Cargo 接线
+## 6. Cargo 接线(依赖单向:Sin90 → 内核)
 
 ```toml
 # rust/Cargo.toml [workspace].members 增:
 "crates/agent24-sin90",
+"crates/agent24-sin90-store",
 
-# agent24-store/Cargo.toml deps 增:
-agent24-sin90 = { path = "../agent24-sin90" }
-
-# agent24-sin90/Cargo.toml —— 保持纯净
+# agent24-sin90/Cargo.toml —— 纯域,保持纯净
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
 thiserror = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# agent24-sin90-store/Cargo.toml —— 自带 store,对着独立 sin90.db
+[dependencies]
+agent24-sin90 = { path = "../agent24-sin90" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio","sqlite","migrate","macros"] }
+
+# agent24d/Cargo.toml deps 增(内核宿主挂模块):
+agent24-sin90       = { path = "../../crates/agent24-sin90" }
+agent24-sin90-store = { path = "../../crates/agent24-sin90-store" }
 ```
+
+**关键**:`agent24-store`(内核持久化)**不新增对 sin90 的依赖**——依赖箭头只从 sin90 指向内核,内核不反向认识 sin90。
 
 ---
 
 ## 7. SPIKE-00 落地清单(据此起跑)
 
 - [ ] `agent24-sin90`:`Direction/Task/ScheduleBlock` 类型 + `check_*_transition` + `validate`(纯,带单测)
-- [ ] `agent24-store`:`0005_sin90.sql` 最小子集 + `Sin90Repo`(`create_direction`/`apply_proposal`/`transition_block`/`attention`)
-- [ ] `agent24d`:`sin90.rs` 挂 `POST /directions`、`POST /proposals`、`GET /attention`
+- [ ] `agent24-sin90-store`:`0001_sin90.sql` 最小子集(独立 `sin90.db`)+ `Sin90Repo`(`create_direction`/`apply_proposal`/`transition_block`/`attention`)
+- [ ] `agent24d`:sin90 模块挂 `POST /directions`、`POST /proposals`、`GET /attention`
+- [ ] Local 脑冒烟:`omlx` 拉 `mlx-community/Qwen3-0.6B` → 经 agent24-models OpenAI provider(`response_format: json_schema`)做一次意图分类,量 p95(SPIKE-03)
 - [ ] 判定:塞入一串 block.completed 事件,`GET /api/v1/sin90/attention?window=week` 返回「Coding 18h / Business 2h」,全部来自事件回放
 - [ ] Pet0 侧:一次性壳建 1 个 Direction + 渲染对账 → 绿灯即坐实
-```

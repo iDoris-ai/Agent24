@@ -62,7 +62,7 @@ Pet0 写进文档的 6 条硬约束,Agent24 的 Rust core 已用代码实现每�
 
 ## 3. Sin90 —— Agent24 内置基础领域模型
 
-Sin90 是 Agent24 提供的 **Personal-OS 领域模型**,复用 store/core/policy 的既有模式,新增为 crate `agent24-sin90`。它给 Pet0 的是**领域实体 + 状态机 + 事件 + Proposal 门**;`agent24-core` 现有的状态机是 agent-run 语义,Sin90 补齐 Personal-OS 语义。
+Sin90 是 Agent24 提供的 **Personal-OS 领域模型**,以**内核之上的可加载模块**形态落地(纯域 crate `agent24-sin90` + 自带 store `agent24-sin90-store`,**独立 DB `sin90.db`**),依赖单向(Sin90→内核,内核绝不反向依赖)。它给 Pet0 的是**领域实体 + 状态机 + 事件 + Proposal 门**;`agent24-core` 现有的状态机是 agent-run 语义,Sin90 补齐 Personal-OS 语义。边界与依赖方向详见 [SIN90-domain.md §0](specs/SIN90-domain.md)。
 
 ### 3.1 实体与状态机
 
@@ -218,6 +218,6 @@ Agent24 的「魂」含 Nostr/联邦/多渠道(`nostr-bridge`/`wechat-bridge`/�
 ## 10. 待确认(Open Questions)
 
 1. Pet0 壳最终选 Tauri 还是复用 Electron?(不阻塞本约定,但影响分发与复用估算)
-2. Local 脑走 oMLX 现有运行时能否直接吃 Qwen3-0.6B 做意图分类,还是需新增 GGUF provider?
-3. Sin90 是否需要独立于 agent-run 的第二个 SQLite 文件,还是同库不同表?(倾向同库不同表,复用迁移框架)
+2. ~~Local 脑走 oMLX 能否吃 Qwen3-0.6B?~~ **已定(2026-08-09 调研)**:能,且**无需新增 GGUF provider**。oMLX(mlx-lm 底座,OpenAI/Anthropic 兼容)原生支持 `response_format: json_schema` 结构化输出,满足 Local 脑"受约束 JSON"硬约束;Qwen3-0.6B 由 mlx-lm 支持、mlx-community 有量化权重。链路 = `agent24-models` 现成 OpenAI provider → oMLX:8088 → Qwen3-0.6B。动作:`omlx` 拉一次 0.6B 权重 + 量 p95。注意 `enable_thinking=false`(Qwen3 thinking token 会破坏 JSON,与 Pet0 架构一致)。额外:HF cache 已有 `Qwen3-ASR-0.6B` 可喂语音链路 STT。
+3. ~~Sin90 同库不同表 vs 独立 DB?~~ **已定**:**独立 DB `sin90.db` + 可加载模块**,比同库更彻底。Sin90 是内核之上的模块,自带 store,依赖单向(Sin90→内核,内核绝不反向依赖)。两种交互不一刀切:**壳↔Sin90 走 HTTP/WS API**;**Sin90↔内核走进程内 ctx 句柄**(模块 `register(router,ctx)`,热路径不加 HTTP 跳)。不做独立进程纯 API——桌宠本地单机拿不到独立进程的好处却要付运维税。Proposal 原子性不受影响:一个 proposal 只改 Sin90 表,单库单事务即可,内核审批仅上游放行信号。详见 [SIN90-domain.md §0](specs/SIN90-domain.md)。
 4. `.petpack` 的 behaviors.json 沙箱与 Agent24 的模块/审批模型如何对齐?
