@@ -38,6 +38,10 @@ pub struct AppState {
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
     pub store: Store,
+    /// Sin90 Personal-OS module store — its OWN `sin90.db`, isolated from the
+    /// kernel `store` above (SIN90-domain.md §0). Mounted here so `/api/v1/sin90/*`
+    /// handlers reach it; the kernel never depends on it.
+    pub sin90: agent24_sin90_store::Sin90Store,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -170,6 +174,7 @@ pub struct AppDeps {
     pub router: Arc<ModelRouter>,
     pub tools: agent24_tools::ToolRegistry,
     pub store: Store,
+    pub sin90: agent24_sin90_store::Sin90Store,
     pub shutdown: CancellationToken,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
@@ -190,6 +195,7 @@ impl AppState {
             router,
             tools,
             store,
+            sin90,
             shutdown,
             guardian,
             memory,
@@ -245,6 +251,7 @@ impl AppState {
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
             store,
+            sin90,
             runs,
             scheduler,
             shutdown,
@@ -379,6 +386,28 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(crate::schedules::run_now),
         )
         .route("/api/v1/events", get(crate::events::ws_events))
+        // Sin90 module (SIN90-domain.md §4) — its own sin90.db, sin90.* WS events.
+        .route(
+            "/api/v1/sin90/directions",
+            post(crate::sin90::create_direction),
+        )
+        .route(
+            "/api/v1/sin90/schedule-blocks",
+            post(crate::sin90::create_block),
+        )
+        .route(
+            "/api/v1/sin90/schedule-blocks/{id}",
+            axum::routing::patch(crate::sin90::transition_block),
+        )
+        .route(
+            "/api/v1/sin90/proposals",
+            post(crate::sin90::submit_proposal),
+        )
+        .route(
+            "/api/v1/sin90/proposals/{id}/accept",
+            post(crate::sin90::accept_proposal),
+        )
+        .route("/api/v1/sin90/attention", get(crate::sin90::attention))
         .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
         .route(
             "/api/v1/sessions",
@@ -432,6 +461,18 @@ pub async fn serve(
         let dir = agent24_protocol::state_file::state_dir()
             .ok_or_else(|| std::io::Error::other("HOME not set"))?;
         Store::open(&dir.join("agent24.db"))
+            .await
+            .map_err(std::io::Error::other)?
+    };
+    // Sin90 module store: its OWN sin90.db, physically isolated from agent24.db.
+    let sin90 = if ephemeral {
+        agent24_sin90_store::Sin90Store::open_memory()
+            .await
+            .map_err(std::io::Error::other)?
+    } else {
+        let dir = agent24_protocol::state_file::state_dir()
+            .ok_or_else(|| std::io::Error::other("HOME not set"))?;
+        agent24_sin90_store::Sin90Store::open(&dir.join("sin90.db"))
             .await
             .map_err(std::io::Error::other)?
     };
@@ -510,6 +551,7 @@ pub async fn serve(
         router,
         tools,
         store,
+        sin90,
         risk_overrides,
         shutdown: cancel.clone(),
         guardian,
@@ -669,6 +711,9 @@ mod tests {
             router: Arc::new(ModelRouter::with_defaults(vec![])),
             tools: agent24_tools::ToolRegistry::new(),
             store: Store::open_memory().await.unwrap(),
+            sin90: agent24_sin90_store::Sin90Store::open_memory()
+                .await
+                .unwrap(),
             shutdown: CancellationToken::new(),
             guardian,
             memory: None,
@@ -1113,5 +1158,87 @@ mod tests {
             "but shell_exec is still exec — a builtin may be tightened, never relaxed"
         );
         assert!(reg.tool_requires_approval("shell_exec"));
+    }
+
+    // SPIKE-00 end-to-end through the router: create a direction + a 120-min
+    // block, complete it, and read the attention reconciliation back — proving
+    // "Coding = 2h" is computed purely from event replay, over HTTP.
+    #[tokio::test]
+    async fn sin90_spike00_loop_over_router() {
+        let router = build_router(state().await);
+
+        async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        let dir = body_json(
+            post(
+                &router,
+                "/api/v1/sin90/directions",
+                serde_json::json!({ "title": "Coding", "target_window": "2026-08" }),
+            )
+            .await,
+        )
+        .await;
+        let dir_id = dir["id"].as_str().unwrap().to_owned();
+
+        let blk = body_json(
+            post(
+                &router,
+                "/api/v1/sin90/schedule-blocks",
+                serde_json::json!({ "direction_id": dir_id, "planned_minutes": 120 }),
+            )
+            .await,
+        )
+        .await;
+        let blk_id = blk["id"].as_str().unwrap().to_owned();
+
+        for to in ["started", "completed"] {
+            let res = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/v1/sin90/schedule-blocks/{blk_id}"))
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!("{{\"to\":\"{to}\"}}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "transition to {to}");
+        }
+
+        // Wide, date-agnostic window (events stamp `at` = now).
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sin90/attention?start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let att = body_json(res).await;
+        let rows = att["attention"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["actual_min"], 120);
+        assert_eq!(rows[0]["direction_id"], dir_id);
+        assert_eq!(rows[0]["direction_title"], "Coding");
     }
 }
