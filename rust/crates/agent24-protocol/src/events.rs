@@ -50,6 +50,12 @@ pub enum EventBody {
     ScheduleFired(ScheduleFiredPayload),
     #[serde(rename = "schedule.disabled")]
     ScheduleDisabled(ScheduleDisabledPayload),
+    /// Opaque event from a loadable module (e.g. Sin90). The kernel carries it
+    /// on the same WS stream without understanding its semantics — a generic
+    /// capability, NOT knowledge of any specific module (SIN90-domain.md §4.2).
+    /// Clients dispatch on `payload.module` + `payload.kind`.
+    #[serde(rename = "module")]
+    Module(ModuleEventPayload),
 }
 
 impl EventBody {
@@ -67,8 +73,23 @@ impl EventBody {
             EventBody::ApprovalResolved(_) => "approval.resolved",
             EventBody::ScheduleFired(_) => "schedule.fired",
             EventBody::ScheduleDisabled(_) => "schedule.disabled",
+            EventBody::Module(_) => "module",
         }
     }
+}
+
+/// A module-namespaced event the kernel relays verbatim (adjacently-tagged
+/// `type = "module"`). `module`/`kind` are module-defined strings; `payload` is
+/// module-defined JSON the kernel never inspects — this is the ONLY seam by
+/// which a module reaches the WS stream, preserving the one-way dependency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ModuleEventPayload {
+    /// Owning module, e.g. `"sin90"`.
+    pub module: String,
+    /// Module-defined event kind, e.g. `"task.transitioned"`.
+    pub kind: String,
+    /// Module-defined body; opaque to the kernel and clients that don't know it.
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
