@@ -269,6 +269,9 @@ impl App {
                 self.log(&p.run_id, format!("⏰ fired by schedule {}", p.schedule_id))
             }
             EventBody::ScheduleDisabled(_) => {}
+            // Module events are namespaced to a loadable module (e.g. sin90);
+            // the generic CLI TUI has nothing to render for them.
+            EventBody::Module(_) => {}
         }
     }
 

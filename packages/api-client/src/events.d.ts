@@ -72,6 +72,11 @@ export type Agent24V1WebSocketEventProtocol = {
       type: "schedule.disabled";
       [k: string]: unknown;
     }
+  | {
+      payload: ModuleEventPayload;
+      type: "module";
+      [k: string]: unknown;
+    }
 );
 /**
  * Closed set per protocol/events.schema.json (a running tool never emits
@@ -237,5 +242,31 @@ export interface ScheduleDisabledPayload {
    */
   reason: string;
   schedule_id: string;
+  [k: string]: unknown;
+}
+/**
+ * A module-namespaced event (adjacently-tagged `type = "module"`). The
+ * envelope shape is deliberately CLOSED — extension space is inside `payload`,
+ * which the kernel relays verbatim and never inspects. This is the ONLY seam
+ * by which a module reaches the WS stream, preserving the one-way dependency.
+ */
+export interface ModuleEventPayload {
+  /**
+   * Module-defined event kind, dotted like a first-party name, e.g.
+   * `"task.transitioned"` — this is where the real event name lives.
+   */
+  kind: string;
+  /**
+   * Owning module. MUST equal the module's manifest `id`
+   * (`protocol/module.schema.json`), hence the same pattern.
+   */
+  module: string;
+  /**
+   * Module-defined body; an OBJECT, opaque to the kernel and to clients that
+   * don't know this module (matches the generated TS `{ [k]: unknown }`).
+   */
+  payload: {
+    [k: string]: unknown;
+  };
   [k: string]: unknown;
 }

@@ -62,32 +62,41 @@ fn every_event_fixture_roundtrips_exactly() {
         );
         count += 1;
     }
-    assert!(count >= 12, "expected >=12 event fixtures, saw {count}");
+    assert!(
+        count >= REQUIRED_EVENT_FIXTURES.len(),
+        "expected >={} event fixtures, saw {count}",
+        REQUIRED_EVENT_FIXTURES.len()
+    );
 }
+
+/// One fixture per event type must exist. Adding an `EventBody` variant without
+/// its fixture would otherwise satisfy every count floor silently (the bug
+/// #101 review caught) — so this list is the single source the floor derives
+/// from, and it must grow with the enum.
+const REQUIRED_EVENT_FIXTURES: &[&str] = &[
+    "run.started.json",
+    "run.started.transient.json",
+    "run.completed.json",
+    "run.failed.json",
+    "run.cancelled.json",
+    "model.delta.json",
+    "tool.started.json",
+    "tool.completed.json",
+    "approval.required.json",
+    "approval.resolved.json",
+    "schedule.fired.json",
+    "schedule.disabled.json",
+    "module.json",
+];
 
 #[test]
 fn required_fixture_set_is_present() {
-    // One fixture per event type must exist (deleting one may not fail the
-    // count floor above) — extras are welcome.
     let dir = fixtures_dir("events");
     let names: Vec<String> = fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    for required in [
-        "run.started.json",
-        "run.started.transient.json",
-        "run.completed.json",
-        "run.failed.json",
-        "run.cancelled.json",
-        "model.delta.json",
-        "tool.started.json",
-        "tool.completed.json",
-        "approval.required.json",
-        "approval.resolved.json",
-        "schedule.fired.json",
-        "schedule.disabled.json",
-    ] {
+    for required in REQUIRED_EVENT_FIXTURES {
         assert!(
             names.iter().any(|n| n == required),
             "missing fixture {required}"
@@ -106,9 +115,11 @@ fn event_wire_types_are_dotted_not_snake_case() {
         let raw = fs::read_to_string(&path).unwrap();
         let event: Event = serde_json::from_str(&raw).unwrap();
         let wire = event.body.wire_type();
+        // `module` is the ONE declared exemption (SPEC-002 §3): a namespace tag,
+        // not an event name — the dotted name lives in payload.kind.
         assert!(
-            wire.contains('.') && !wire.contains('_'),
-            "event type must be dotted, got {wire}"
+            wire == "module" || (wire.contains('.') && !wire.contains('_')),
+            "event type must be dotted (or the `module` exemption), got {wire}"
         );
         // serialize side: the JSON "type" field equals wire_type()
         let json = serde_json::to_value(&event).unwrap();

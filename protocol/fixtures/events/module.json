@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "seq": 7,
+  "ts": "2026-08-10T12:00:00Z",
+  "type": "module",
+  "payload": {
+    "module": "sin90",
+    "kind": "task.transitioned",
+    "payload": { "task_id": "01J000000000000000000TASK", "from": "planned", "to": "in_progress" }
+  }
+}

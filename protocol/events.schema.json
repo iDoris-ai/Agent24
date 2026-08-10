@@ -196,6 +196,23 @@
         "type",
         "payload"
       ]
+    },
+    {
+      "description": "Opaque event from a loadable module (e.g. Sin90). The kernel carries it\non the same WS stream without understanding its semantics — a generic\ncapability, NOT knowledge of any specific module. The `type` is the bare\nnamespace tag `module` (declared exemption to hard constraint #8's dotted\nrule, SPEC-002 §3); the real dotted event name is `payload.kind`. Clients\ndispatch on `payload.module` + `payload.kind`.",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/ModuleEventPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "module"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
     }
   ],
   "required": [
@@ -379,6 +396,31 @@
       "required": [
         "run_id",
         "text"
+      ]
+    },
+    "ModuleEventPayload": {
+      "description": "A module-namespaced event (adjacently-tagged `type = \"module\"`). The\nenvelope shape is deliberately CLOSED — extension space is inside `payload`,\nwhich the kernel relays verbatim and never inspects. This is the ONLY seam\nby which a module reaches the WS stream, preserving the one-way dependency.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Module-defined event kind, dotted like a first-party name, e.g.\n`\"task.transitioned\"` — this is where the real event name lives.",
+          "type": "string"
+        },
+        "module": {
+          "description": "Owning module. MUST equal the module's manifest `id`\n(`protocol/module.schema.json`), hence the same pattern.",
+          "type": "string",
+          "pattern": "^(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*$"
+        },
+        "payload": {
+          "description": "Module-defined body; an OBJECT, opaque to the kernel and to clients that\ndon't know this module (matches the generated TS `{ [k]: unknown }`).",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "module",
+        "kind",
+        "payload"
       ]
     },
     "RunCancelledPayload": {

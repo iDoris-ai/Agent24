@@ -28,7 +28,7 @@ const ENVELOPE = { v: 1, seq: 0, ts: '2026-07-23T12:00:00Z' }
 describe('events schema — fixtures', () => {
   it('accepts every fixture', () => {
     const files = readdirSync(eventsDir).filter((f) => f.endsWith('.json'))
-    expect(files.length).toBeGreaterThanOrEqual(12)
+    expect(files.length).toBeGreaterThanOrEqual(13)
     for (const f of files) {
       const doc = JSON.parse(readFileSync(join(eventsDir, f), 'utf8')) as unknown
       expect(validate(doc), `${f}: ${JSON.stringify(validate.errors)}`).toBe(true)
