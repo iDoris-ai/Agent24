@@ -49,7 +49,7 @@ impl EventsHub {
         let _ = self.tx.send((ts, body));
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<(String, EventBody)> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(String, EventBody)> {
         self.tx.subscribe()
     }
 }

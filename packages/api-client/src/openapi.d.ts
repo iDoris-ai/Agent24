@@ -392,6 +392,108 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sin90/directions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create a Sin90 direction */
+        post: operations["sin90CreateDirection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sin90/schedule-blocks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create a Sin90 schedule block */
+        post: operations["sin90CreateBlock"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sin90/schedule-blocks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Transition a schedule block (started/completed/skipped) */
+        patch: operations["sin90TransitionBlock"];
+        trace?: never;
+    };
+    "/sin90/proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Submit a Sin90 proposal (persisted pending; idempotent on id) */
+        post: operations["sin90SubmitProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sin90/proposals/{id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Accept + apply a pending proposal (CAS-idempotent) */
+        post: operations["sin90AcceptProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sin90/attention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Attention reconciliation for a window (pure event replay) */
+        get: operations["sin90Attention"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -765,10 +867,105 @@ export interface components {
         Error: {
             error: components["schemas"]["ErrorBody"];
         };
+        /** @enum {string} */
+        Sin90DirectionStatus: "draft" | "active" | "paused" | "achieved" | "abandoned";
+        /** @enum {string} */
+        Sin90TaskStatus: "backlog" | "planned" | "in_progress" | "done" | "dropped" | "carried_over";
+        /** @enum {string} */
+        Sin90ScheduleBlockStatus: "planned" | "started" | "completed" | "skipped";
+        Sin90Direction: {
+            id: string;
+            title: string;
+            status: components["schemas"]["Sin90DirectionStatus"];
+            target_window: string;
+            created_at: string;
+            updated_at: string;
+        };
+        Sin90ScheduleBlock: {
+            id: string;
+            direction_id?: string | null;
+            task_id?: string | null;
+            status: components["schemas"]["Sin90ScheduleBlockStatus"];
+            planned_minutes: number;
+            created_at: string;
+            updated_at: string;
+        };
+        Sin90AttentionRow: {
+            /** @description "" == no direction */
+            direction_id: string;
+            direction_title?: string | null;
+            actual_min: number;
+        };
+        Sin90AppliedProposal: {
+            proposal_id: string;
+            event_ids: string[];
+        };
+        Sin90Alloc: {
+            direction_id: string;
+            pct: number;
+        };
+        Sin90NewTask: {
+            title: string;
+            direction_id?: string | null;
+        };
+        /** @description One atomic change, internally tagged by `op`. */
+        Sin90Op: {
+            /** @constant */
+            op: "create_direction";
+            title: string;
+            target_window: string;
+        } | {
+            /** @constant */
+            op: "transition_task";
+            task_id: string;
+            to: components["schemas"]["Sin90TaskStatus"];
+        } | {
+            /** @constant */
+            op: "create_tasks";
+            week_id: string;
+            tasks: components["schemas"]["Sin90NewTask"][];
+        } | {
+            /** @constant */
+            op: "reorder_tasks";
+            week_id: string;
+            order: string[];
+        } | {
+            /** @constant */
+            op: "adjust_rhythm";
+            rhythm_id: string;
+            new_alloc: components["schemas"]["Sin90Alloc"][];
+        } | {
+            /** @constant */
+            op: "carry_over_task";
+            task_id: string;
+            to_week: string;
+        };
+        /**
+         * @description A batch of atomic ops. `status` MUST be `pending` on submit — the server
+         *     stores it as pending regardless (only pending is meaningful here).
+         */
+        Sin90Proposal: {
+            id: string;
+            /** @constant */
+            status: "pending";
+            /** @enum {string} */
+            source: "local_brain" | "executive" | "rule";
+            ops: components["schemas"]["Sin90Op"][];
+            rationale?: string | null;
+        };
     };
     responses: {
         /** @description Malformed or invalid request */
         BadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description The Sin90 module store failed to open; the kernel is unaffected */
+        Sin90Unavailable: {
             headers: {
                 [name: string]: unknown;
             };
@@ -1470,6 +1667,215 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+        };
+    };
+    sin90CreateDirection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    title: string;
+                    /** @description e.g. 2026-08 or 2026-Q3 */
+                    target_window: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Created direction */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sin90Direction"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
+    sin90CreateBlock: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    direction_id?: string | null;
+                    task_id?: string | null;
+                    planned_minutes: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Created block */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sin90ScheduleBlock"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
+    sin90TransitionBlock: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    to: components["schemas"]["Sin90ScheduleBlockStatus"];
+                };
+            };
+        };
+        responses: {
+            /** @description Updated block */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sin90ScheduleBlock"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Illegal transition */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
+    sin90SubmitProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Sin90Proposal"];
+            };
+        };
+        responses: {
+            /** @description Accepted (pending) */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        id: string;
+                        /** @constant */
+                        status: "pending";
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Same id already exists with different ops */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
+    sin90AcceptProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Applied (or idempotent replay); returns the receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sin90AppliedProposal"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Proposal not pending */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Stored ops are stale against current state */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
+    sin90Attention: {
+        parameters: {
+            query: {
+                start: string;
+                end: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Per-direction realized minutes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        attention: components["schemas"]["Sin90AttentionRow"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            503: components["responses"]["Sin90Unavailable"];
         };
     };
 }

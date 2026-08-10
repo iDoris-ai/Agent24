@@ -34,7 +34,12 @@ async fn apply_proposal_is_cas_idempotent() {
     let first = store.apply_proposal("p-idem").await.unwrap();
     // Re-applying the same proposal returns the SAME receipt and creates nothing new.
     let second = store.apply_proposal("p-idem").await.unwrap();
-    assert_eq!(first, second, "re-apply must be idempotent");
+    assert_eq!(first.receipt, second.receipt, "re-apply must be idempotent");
+    assert!(first.applied_now, "first apply actually applies");
+    assert!(
+        !second.applied_now,
+        "second is a replay — caller must NOT re-broadcast"
+    );
     assert_eq!(
         test_hooks::direction_count(&store).await.unwrap(),
         1,

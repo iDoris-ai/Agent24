@@ -223,6 +223,8 @@ dependencies = [
  "agent24-policy",
  "agent24-protocol",
  "agent24-scheduler",
+ "agent24-sin90",
+ "agent24-sin90-store",
  "agent24-store",
  "agent24-tools",
  "async-trait",

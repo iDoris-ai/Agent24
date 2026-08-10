@@ -27,6 +27,17 @@ pub struct AppliedProposal {
     pub event_ids: Vec<String>,
 }
 
+/// Outcome of [`Sin90Store::apply_proposal`]. `applied_now` distinguishes a real
+/// apply (CAS claimed pending → applied) from an idempotent REPLAY of an already
+/// applied proposal — so callers only broadcast a `proposal.applied` event on a
+/// real apply, never on a retried accept (the receipt is idempotent; the
+/// notification must be too).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyOutcome {
+    pub receipt: AppliedProposal,
+    pub applied_now: bool,
+}
+
 // A unit-variant enum serializes to a JSON string; unwrap that to the wire text.
 fn to_wire<T: Serialize>(v: &T) -> Result<String> {
     match serde_json::to_value(v)? {
@@ -311,7 +322,7 @@ impl Sin90Store {
     /// `pending → applying` is a compare-and-set; a re-tried accept whose row is
     /// already `applied` returns the stored receipt without re-applying. A
     /// validation or apply error rolls the whole tx back (proposal → pending).
-    pub async fn apply_proposal(&self, proposal_id: &str) -> Result<AppliedProposal> {
+    pub async fn apply_proposal(&self, proposal_id: &str) -> Result<ApplyOutcome> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
 
         // CAS claim.
@@ -334,10 +345,18 @@ impl Sin90Store {
                 None => Err(StoreError::NotFound(format!("proposal {proposal_id}"))),
                 Some(r) => match r.get::<String, _>("status").as_str() {
                     "applied" => {
-                        let result: String = r
-                            .get::<Option<String>, _>("result")
-                            .ok_or_else(|| StoreError::Conflict("applied without result".into()))?;
-                        Ok(serde_json::from_str(&result)?)
+                        // Idempotent replay: return the stored receipt, but flag
+                        // applied_now=false so the caller does NOT re-broadcast.
+                        let result: String =
+                            r.get::<Option<String>, _>("result").ok_or_else(|| {
+                                // An `applied` row with NULL result is a broken
+                                // internal invariant, not a client conflict → 500.
+                                StoreError::Internal("applied proposal has no result".into())
+                            })?;
+                        Ok(ApplyOutcome {
+                            receipt: serde_json::from_str(&result)?,
+                            applied_now: false,
+                        })
                     }
                     "applying" => Err(StoreError::Conflict(format!(
                         "proposal {proposal_id} is already being applied"
@@ -381,7 +400,10 @@ impl Sin90Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(receipt)
+        Ok(ApplyOutcome {
+            receipt,
+            applied_now: true,
+        })
     }
 }
 

@@ -38,6 +38,11 @@ pub struct AppState {
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
     pub store: Store,
+    /// Sin90 Personal-OS module store — its OWN `sin90.db`, isolated from the
+    /// kernel `store` above (SIN90-domain.md §0). `Option` so a store that fails
+    /// to open degrades THIS module (handlers 503) instead of killing the daemon:
+    /// the kernel genuinely never depends on it.
+    pub sin90: Option<agent24_sin90_store::Sin90Store>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -170,6 +175,7 @@ pub struct AppDeps {
     pub router: Arc<ModelRouter>,
     pub tools: agent24_tools::ToolRegistry,
     pub store: Store,
+    pub sin90: Option<agent24_sin90_store::Sin90Store>,
     pub shutdown: CancellationToken,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
@@ -190,6 +196,7 @@ impl AppState {
             router,
             tools,
             store,
+            sin90,
             shutdown,
             guardian,
             memory,
@@ -245,6 +252,7 @@ impl AppState {
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
             store,
+            sin90,
             runs,
             scheduler,
             shutdown,
@@ -379,6 +387,28 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(crate::schedules::run_now),
         )
         .route("/api/v1/events", get(crate::events::ws_events))
+        // Sin90 module (SIN90-domain.md §4) — its own sin90.db, sin90.* WS events.
+        .route(
+            "/api/v1/sin90/directions",
+            post(crate::sin90::create_direction),
+        )
+        .route(
+            "/api/v1/sin90/schedule-blocks",
+            post(crate::sin90::create_block),
+        )
+        .route(
+            "/api/v1/sin90/schedule-blocks/{id}",
+            axum::routing::patch(crate::sin90::transition_block),
+        )
+        .route(
+            "/api/v1/sin90/proposals",
+            post(crate::sin90::submit_proposal),
+        )
+        .route(
+            "/api/v1/sin90/proposals/{id}/accept",
+            post(crate::sin90::accept_proposal),
+        )
+        .route("/api/v1/sin90/attention", get(crate::sin90::attention))
         .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
         .route(
             "/api/v1/sessions",
@@ -434,6 +464,27 @@ pub async fn serve(
         Store::open(&dir.join("agent24.db"))
             .await
             .map_err(std::io::Error::other)?
+    };
+    // Sin90 module store: its OWN sin90.db, physically isolated from agent24.db.
+    // A failure to open degrades the module (handlers 503), NEVER the daemon —
+    // the kernel (runs/approvals/scheduler) must not die because an add-on's
+    // file is corrupt (cf. open_session_memory).
+    let sin90_open = if ephemeral {
+        agent24_sin90_store::Sin90Store::open_memory().await
+    } else {
+        match agent24_protocol::state_file::state_dir() {
+            Some(dir) => agent24_sin90_store::Sin90Store::open(&dir.join("sin90.db")).await,
+            None => Err(agent24_sin90_store::StoreError::Internal(
+                "HOME not set".into(),
+            )),
+        }
+    };
+    let sin90 = match sin90_open {
+        Ok(s) => Some(s),
+        Err(err) => {
+            tracing::error!("sin90 module store unavailable ({err}); /api/v1/sin90/* will 503");
+            None
+        }
     };
     // NOTE: the startup sweeps (durable-resume restore + orphan cancel) run
     // AFTER the state is built, below — the restore sweep needs the run manager.
@@ -510,6 +561,7 @@ pub async fn serve(
         router,
         tools,
         store,
+        sin90,
         risk_overrides,
         shutdown: cancel.clone(),
         guardian,
@@ -669,6 +721,11 @@ mod tests {
             router: Arc::new(ModelRouter::with_defaults(vec![])),
             tools: agent24_tools::ToolRegistry::new(),
             store: Store::open_memory().await.unwrap(),
+            sin90: Some(
+                agent24_sin90_store::Sin90Store::open_memory()
+                    .await
+                    .unwrap(),
+            ),
             shutdown: CancellationToken::new(),
             guardian,
             memory: None,
@@ -1113,5 +1170,238 @@ mod tests {
             "but shell_exec is still exec — a builtin may be tightened, never relaxed"
         );
         assert!(reg.tool_requires_approval("shell_exec"));
+    }
+
+    // SPIKE-00 end-to-end through the router: create a direction + a 120-min
+    // block, complete it, and read the attention reconciliation back — the HTTP
+    // link computes 120. (The *purity* of the replay — unaffected by later edits
+    // — is proven in agent24-sin90-store's `attention_replay_is_pure_snapshot`.)
+    #[tokio::test]
+    async fn sin90_spike00_loop_over_router() {
+        let router = build_router(state().await);
+
+        async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        let dir = body_json(
+            post(
+                &router,
+                "/api/v1/sin90/directions",
+                serde_json::json!({ "title": "Coding", "target_window": "2026-08" }),
+            )
+            .await,
+        )
+        .await;
+        let dir_id = dir["id"].as_str().unwrap().to_owned();
+
+        let blk = body_json(
+            post(
+                &router,
+                "/api/v1/sin90/schedule-blocks",
+                serde_json::json!({ "direction_id": dir_id, "planned_minutes": 120 }),
+            )
+            .await,
+        )
+        .await;
+        let blk_id = blk["id"].as_str().unwrap().to_owned();
+
+        for to in ["started", "completed"] {
+            let res = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/v1/sin90/schedule-blocks/{blk_id}"))
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!("{{\"to\":\"{to}\"}}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "transition to {to}");
+        }
+
+        // Wide, date-agnostic window (events stamp `at` = now).
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sin90/attention?start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let att = body_json(res).await;
+        let rows = att["attention"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["actual_min"], 120);
+        assert_eq!(rows[0]["direction_id"], dir_id);
+        assert_eq!(rows[0]["direction_title"], "Coding");
+    }
+
+    // A block referencing a nonexistent direction is a client mistake (FK
+    // violation) → 404, not the 500 a raw sqlx error would become.
+    #[tokio::test]
+    async fn sin90_bad_direction_is_404_not_500() {
+        let router = build_router(state().await);
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sin90/schedule-blocks")
+                    .header("Authorization", "Bearer testtoken")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"direction_id":"NOPE","planned_minutes":30}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let json = body_json(res).await;
+        assert_eq!(json["error"]["code"], "not_found");
+    }
+
+    // A retried `accept` returns the same receipt but must NOT re-broadcast
+    // `proposal.applied` — the receipt is idempotent, the notification too.
+    #[tokio::test]
+    async fn sin90_retry_accept_does_not_double_emit() {
+        let st = state().await;
+        let mut rx = st.events.subscribe();
+        let router = build_router(st);
+
+        let submit = |router: Router| async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/sin90/proposals")
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(
+                            r#"{"id":"p1","status":"pending","source":"local_brain","ops":[{"op":"create_direction","title":"X","target_window":"2026-08"}],"rationale":null}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(submit(router.clone()).await.status(), StatusCode::ACCEPTED);
+
+        let accept = |router: Router| async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/sin90/proposals/p1/accept")
+                        .header("Authorization", "Bearer testtoken")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(accept(router.clone()).await.status(), StatusCode::OK);
+        assert_eq!(accept(router).await.status(), StatusCode::OK); // retry
+
+        // Drain events; count only proposal.applied.
+        let mut applied = 0;
+        while let Ok((_, body)) = rx.try_recv() {
+            if let agent24_protocol::EventBody::Module(m) = &body
+                && m.module == "sin90"
+                && m.kind == "proposal.applied"
+            {
+                applied += 1;
+            }
+        }
+        assert_eq!(
+            applied, 1,
+            "exactly one proposal.applied despite two accepts"
+        );
+    }
+
+    // The head-fix: a daemon whose sin90 store failed to open (None) must serve
+    // health but 503 every sin90 route — the kernel does not depend on the module.
+    #[tokio::test]
+    async fn sin90_unavailable_503s_but_kernel_lives() {
+        let mut st = state().await;
+        st.sin90 = None;
+        let router = build_router(st);
+
+        for (method, uri) in [
+            ("POST", "/api/v1/sin90/directions"),
+            ("POST", "/api/v1/sin90/schedule-blocks"),
+            ("PATCH", "/api/v1/sin90/schedule-blocks/x"),
+            ("POST", "/api/v1/sin90/proposals"),
+            ("POST", "/api/v1/sin90/proposals/x/accept"),
+            ("GET", "/api/v1/sin90/attention?start=a&end=b"),
+        ] {
+            let res = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {uri} must 503 when the module is down"
+            );
+            let json = body_json(res).await;
+            assert_eq!(json["error"]["code"], "module_unavailable");
+        }
+
+        // The kernel is unaffected.
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // A bare date (not the fixed-width timestamp) would drop a whole day under a
+    // lexical window compare — reject it rather than silently under-count.
+    #[tokio::test]
+    async fn sin90_attention_rejects_non_fixed_width_bounds() {
+        let res = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sin90/attention?start=2026-08-01&end=2026-08-11")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

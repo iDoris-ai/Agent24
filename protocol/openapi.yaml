@@ -44,6 +44,7 @@ tags:
   - name: approvals
   - name: schedules
   - name: tools
+  - name: sin90
 
 paths:
   /health:
@@ -639,6 +640,180 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /sin90/directions:
+    post:
+      operationId: sin90CreateDirection
+      tags: [sin90]
+      summary: Create a Sin90 direction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, target_window]
+              additionalProperties: false
+              properties:
+                title: { type: string }
+                target_window: { type: string, description: "e.g. 2026-08 or 2026-Q3" }
+      responses:
+        "201":
+          description: Created direction
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sin90Direction" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
+
+  /sin90/schedule-blocks:
+    post:
+      operationId: sin90CreateBlock
+      tags: [sin90]
+      summary: Create a Sin90 schedule block
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planned_minutes]
+              additionalProperties: false
+              properties:
+                direction_id: { type: [string, "null"] }
+                task_id: { type: [string, "null"] }
+                planned_minutes: { type: integer, minimum: 0 }
+      responses:
+        "201":
+          description: Created block
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sin90ScheduleBlock" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
+
+  /sin90/schedule-blocks/{id}:
+    patch:
+      operationId: sin90TransitionBlock
+      tags: [sin90]
+      summary: Transition a schedule block (started/completed/skipped)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              additionalProperties: false
+              properties:
+                to: { $ref: "#/components/schemas/Sin90ScheduleBlockStatus" }
+      responses:
+        "200":
+          description: Updated block
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sin90ScheduleBlock" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Illegal transition
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
+
+  /sin90/proposals:
+    post:
+      operationId: sin90SubmitProposal
+      tags: [sin90]
+      summary: Submit a Sin90 proposal (persisted pending; idempotent on id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Sin90Proposal" }
+      responses:
+        "202":
+          description: Accepted (pending)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id: { type: string }
+                  status: { type: string, const: pending }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: Same id already exists with different ops
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
+
+  /sin90/proposals/{id}/accept:
+    post:
+      operationId: sin90AcceptProposal
+      tags: [sin90]
+      summary: Accept + apply a pending proposal (CAS-idempotent)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Applied (or idempotent replay); returns the receipt
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sin90AppliedProposal" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Proposal not pending
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Stored ops are stale against current state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
+
+  /sin90/attention:
+    get:
+      operationId: sin90Attention
+      tags: [sin90]
+      summary: Attention reconciliation for a window (pure event replay)
+      parameters:
+        - name: start
+          in: query
+          required: true
+          schema: { type: string, description: "ISO-8601 lower bound, inclusive (fixed-width, e.g. 2026-08-01T00:00:00Z)" }
+        - name: end
+          in: query
+          required: true
+          schema: { type: string, description: "ISO-8601 upper bound, exclusive; must be a fixed-width timestamp > start" }
+      responses:
+        "200":
+          description: Per-direction realized minutes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [attention]
+                properties:
+                  attention:
+                    type: array
+                    items: { $ref: "#/components/schemas/Sin90AttentionRow" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -661,6 +836,12 @@ components:
   responses:
     BadRequest:
       description: Malformed or invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Sin90Unavailable:
+      description: The Sin90 module store failed to open; the kernel is unaffected
       content:
         application/json:
           schema:
@@ -1231,3 +1412,128 @@ components:
       properties:
         error:
           $ref: "#/components/schemas/ErrorBody"
+
+    # ---- Sin90 module (SIN90-domain.md) ----
+    Sin90DirectionStatus:
+      type: string
+      enum: [draft, active, paused, achieved, abandoned]
+    Sin90TaskStatus:
+      type: string
+      enum: [backlog, planned, in_progress, done, dropped, carried_over]
+    Sin90ScheduleBlockStatus:
+      type: string
+      enum: [planned, started, completed, skipped]
+
+    Sin90Direction:
+      type: object
+      required: [id, title, status, target_window, created_at, updated_at]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        status: { $ref: "#/components/schemas/Sin90DirectionStatus" }
+        target_window: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+
+    Sin90ScheduleBlock:
+      type: object
+      required: [id, status, planned_minutes, created_at, updated_at]
+      properties:
+        id: { type: string }
+        direction_id: { type: [string, "null"] }
+        task_id: { type: [string, "null"] }
+        status: { $ref: "#/components/schemas/Sin90ScheduleBlockStatus" }
+        planned_minutes: { type: integer }
+        created_at: { type: string }
+        updated_at: { type: string }
+
+    Sin90AttentionRow:
+      type: object
+      required: [direction_id, actual_min]
+      properties:
+        direction_id: { type: string, description: "\"\" == no direction" }
+        direction_title: { type: [string, "null"] }
+        actual_min: { type: integer }
+
+    Sin90AppliedProposal:
+      type: object
+      required: [proposal_id, event_ids]
+      properties:
+        proposal_id: { type: string }
+        event_ids: { type: array, items: { type: string } }
+
+    Sin90Alloc:
+      type: object
+      required: [direction_id, pct]
+      additionalProperties: false
+      properties:
+        direction_id: { type: string }
+        pct: { type: integer }
+
+    Sin90NewTask:
+      type: object
+      required: [title]
+      additionalProperties: false
+      properties:
+        title: { type: string }
+        direction_id: { type: [string, "null"] }
+
+    Sin90Op:
+      description: One atomic change, internally tagged by `op`.
+      oneOf:
+        - type: object
+          required: [op, title, target_window]
+          additionalProperties: false
+          properties:
+            op: { type: string, const: create_direction }
+            title: { type: string }
+            target_window: { type: string }
+        - type: object
+          required: [op, task_id, to]
+          additionalProperties: false
+          properties:
+            op: { type: string, const: transition_task }
+            task_id: { type: string }
+            to: { $ref: "#/components/schemas/Sin90TaskStatus" }
+        - type: object
+          required: [op, week_id, tasks]
+          additionalProperties: false
+          properties:
+            op: { type: string, const: create_tasks }
+            week_id: { type: string }
+            tasks: { type: array, items: { $ref: "#/components/schemas/Sin90NewTask" } }
+        - type: object
+          required: [op, week_id, order]
+          additionalProperties: false
+          properties:
+            op: { type: string, const: reorder_tasks }
+            week_id: { type: string }
+            order: { type: array, items: { type: string } }
+        - type: object
+          required: [op, rhythm_id, new_alloc]
+          additionalProperties: false
+          properties:
+            op: { type: string, const: adjust_rhythm }
+            rhythm_id: { type: string }
+            new_alloc: { type: array, items: { $ref: "#/components/schemas/Sin90Alloc" } }
+        - type: object
+          required: [op, task_id, to_week]
+          additionalProperties: false
+          properties:
+            op: { type: string, const: carry_over_task }
+            task_id: { type: string }
+            to_week: { type: string }
+
+    Sin90Proposal:
+      type: object
+      required: [id, status, source, ops]
+      additionalProperties: false
+      description: |
+        A batch of atomic ops. `status` MUST be `pending` on submit — the server
+        stores it as pending regardless (only pending is meaningful here).
+      properties:
+        id: { type: string }
+        status: { type: string, const: pending }
+        source: { type: string, enum: [local_brain, executive, rule] }
+        ops: { type: array, items: { $ref: "#/components/schemas/Sin90Op" } }
+        rationale: { type: [string, "null"] }
