@@ -39,9 +39,10 @@ pub struct AppState {
     pub events: crate::events::EventsHub,
     pub store: Store,
     /// Sin90 Personal-OS module store — its OWN `sin90.db`, isolated from the
-    /// kernel `store` above (SIN90-domain.md §0). Mounted here so `/api/v1/sin90/*`
-    /// handlers reach it; the kernel never depends on it.
-    pub sin90: agent24_sin90_store::Sin90Store,
+    /// kernel `store` above (SIN90-domain.md §0). `Option` so a store that fails
+    /// to open degrades THIS module (handlers 503) instead of killing the daemon:
+    /// the kernel genuinely never depends on it.
+    pub sin90: Option<agent24_sin90_store::Sin90Store>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -174,7 +175,7 @@ pub struct AppDeps {
     pub router: Arc<ModelRouter>,
     pub tools: agent24_tools::ToolRegistry,
     pub store: Store,
-    pub sin90: agent24_sin90_store::Sin90Store,
+    pub sin90: Option<agent24_sin90_store::Sin90Store>,
     pub shutdown: CancellationToken,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
@@ -465,16 +466,25 @@ pub async fn serve(
             .map_err(std::io::Error::other)?
     };
     // Sin90 module store: its OWN sin90.db, physically isolated from agent24.db.
-    let sin90 = if ephemeral {
-        agent24_sin90_store::Sin90Store::open_memory()
-            .await
-            .map_err(std::io::Error::other)?
+    // A failure to open degrades the module (handlers 503), NEVER the daemon —
+    // the kernel (runs/approvals/scheduler) must not die because an add-on's
+    // file is corrupt (cf. open_session_memory).
+    let sin90_open = if ephemeral {
+        agent24_sin90_store::Sin90Store::open_memory().await
     } else {
-        let dir = agent24_protocol::state_file::state_dir()
-            .ok_or_else(|| std::io::Error::other("HOME not set"))?;
-        agent24_sin90_store::Sin90Store::open(&dir.join("sin90.db"))
-            .await
-            .map_err(std::io::Error::other)?
+        match agent24_protocol::state_file::state_dir() {
+            Some(dir) => agent24_sin90_store::Sin90Store::open(&dir.join("sin90.db")).await,
+            None => Err(agent24_sin90_store::StoreError::Conflict(
+                "HOME not set".into(),
+            )),
+        }
+    };
+    let sin90 = match sin90_open {
+        Ok(s) => Some(s),
+        Err(err) => {
+            tracing::error!("sin90 module store unavailable ({err}); /api/v1/sin90/* will 503");
+            None
+        }
     };
     // NOTE: the startup sweeps (durable-resume restore + orphan cancel) run
     // AFTER the state is built, below — the restore sweep needs the run manager.
@@ -711,9 +721,11 @@ mod tests {
             router: Arc::new(ModelRouter::with_defaults(vec![])),
             tools: agent24_tools::ToolRegistry::new(),
             store: Store::open_memory().await.unwrap(),
-            sin90: agent24_sin90_store::Sin90Store::open_memory()
-                .await
-                .unwrap(),
+            sin90: Some(
+                agent24_sin90_store::Sin90Store::open_memory()
+                    .await
+                    .unwrap(),
+            ),
             shutdown: CancellationToken::new(),
             guardian,
             memory: None,
@@ -1161,8 +1173,9 @@ mod tests {
     }
 
     // SPIKE-00 end-to-end through the router: create a direction + a 120-min
-    // block, complete it, and read the attention reconciliation back — proving
-    // "Coding = 2h" is computed purely from event replay, over HTTP.
+    // block, complete it, and read the attention reconciliation back — the HTTP
+    // link computes 120. (The *purity* of the replay — unaffected by later edits
+    // — is proven in agent24-sin90-store's `attention_replay_is_pure_snapshot`.)
     #[tokio::test]
     async fn sin90_spike00_loop_over_router() {
         let router = build_router(state().await);
@@ -1240,5 +1253,87 @@ mod tests {
         assert_eq!(rows[0]["actual_min"], 120);
         assert_eq!(rows[0]["direction_id"], dir_id);
         assert_eq!(rows[0]["direction_title"], "Coding");
+    }
+
+    // A block referencing a nonexistent direction is a client mistake (FK
+    // violation) → 404, not the 500 a raw sqlx error would become.
+    #[tokio::test]
+    async fn sin90_bad_direction_is_404_not_500() {
+        let router = build_router(state().await);
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sin90/schedule-blocks")
+                    .header("Authorization", "Bearer testtoken")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"direction_id":"NOPE","planned_minutes":30}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let json = body_json(res).await;
+        assert_eq!(json["error"]["code"], "not_found");
+    }
+
+    // A retried `accept` returns the same receipt but must NOT re-broadcast
+    // `proposal.applied` — the receipt is idempotent, the notification too.
+    #[tokio::test]
+    async fn sin90_retry_accept_does_not_double_emit() {
+        let st = state().await;
+        let mut rx = st.events.subscribe();
+        let router = build_router(st);
+
+        let submit = |router: Router| async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/sin90/proposals")
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(
+                            r#"{"id":"p1","status":"pending","source":"local_brain","ops":[{"op":"create_direction","title":"X","target_window":"2026-08"}],"rationale":null}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(submit(router.clone()).await.status(), StatusCode::ACCEPTED);
+
+        let accept = |router: Router| async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/sin90/proposals/p1/accept")
+                        .header("Authorization", "Bearer testtoken")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(accept(router.clone()).await.status(), StatusCode::OK);
+        assert_eq!(accept(router).await.status(), StatusCode::OK); // retry
+
+        // Drain events; count only proposal.applied.
+        let mut applied = 0;
+        while let Ok((_, body)) = rx.try_recv() {
+            if let agent24_protocol::EventBody::Module(m) = &body
+                && m.module == "sin90"
+                && m.kind == "proposal.applied"
+            {
+                applied += 1;
+            }
+        }
+        assert_eq!(
+            applied, 1,
+            "exactly one proposal.applied despite two accepts"
+        );
     }
 }

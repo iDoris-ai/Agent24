@@ -12,7 +12,7 @@ mod attention;
 mod repo;
 
 pub use attention::AttentionRow;
-pub use repo::AppliedProposal;
+pub use repo::{AppliedProposal, ApplyOutcome};
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -45,6 +45,21 @@ pub enum StoreError {
     /// duplicate in the same week).
     #[error("cannot carry task {0} into its own week")]
     SameWeekCarry(String),
+    /// A broken internal invariant (not the client's fault) — maps to 500.
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+impl StoreError {
+    /// True if this is a FOREIGN KEY violation (SQLite extended code 787) —
+    /// i.e. the client referenced an entity that doesn't exist, a 4xx not a 5xx.
+    /// Encapsulated here so callers need not depend on sqlx to classify it.
+    pub fn is_fk_violation(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Sqlx(sqlx::Error::Database(db)) if db.code().as_deref() == Some("787")
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

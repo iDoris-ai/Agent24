@@ -50,17 +50,6 @@ pub async fn read_body_or_response(req: Request<Body>) -> Result<Bytes, Response
     }
 }
 
-/// Last path segment — the `{id}` in `/…/{id}` — for handlers that consume the
-/// whole `Request<Body>` (so the `Path` extractor isn't available).
-pub fn path_last(req: &Request<Body>) -> String {
-    req.uri()
-        .path()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_owned()
-}
-
 /// Single guarded value (not three independent atomics): record+snapshot are
 /// each atomic as a whole, so a snapshot can never observe a torn update where
 /// total != prompt + completion (review finding on B3).

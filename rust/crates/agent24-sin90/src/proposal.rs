@@ -66,7 +66,10 @@ pub enum ProposalSource {
     Rule,
 }
 
+/// `deny_unknown_fields`: a proposal is the most model-produced input in the
+/// system — a stray/mistyped key must fail loudly, not be silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sin90Proposal {
     /// Client-stable id: re-submitting the same id is idempotent.
     pub id: String,

@@ -639,6 +639,138 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /sin90/directions:
+    post:
+      operationId: sin90CreateDirection
+      tags: [sin90]
+      summary: Create a Sin90 direction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, target_window]
+              additionalProperties: false
+              properties:
+                title: { type: string }
+                target_window: { type: string, description: "e.g. 2026-08 or 2026-Q3" }
+      responses:
+        "201": { description: Created direction }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { description: Sin90 module unavailable }
+
+  /sin90/schedule-blocks:
+    post:
+      operationId: sin90CreateBlock
+      tags: [sin90]
+      summary: Create a Sin90 schedule block
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planned_minutes]
+              additionalProperties: false
+              properties:
+                direction_id: { type: string, nullable: true }
+                task_id: { type: string, nullable: true }
+                planned_minutes: { type: integer, minimum: 0 }
+      responses:
+        "201": { description: Created block }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { description: Sin90 module unavailable }
+
+  /sin90/schedule-blocks/{id}:
+    patch:
+      operationId: sin90TransitionBlock
+      tags: [sin90]
+      summary: Transition a schedule block (started/completed/skipped)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              additionalProperties: false
+              properties:
+                to: { type: string, enum: [started, completed, skipped] }
+      responses:
+        "200": { description: Updated block }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Illegal transition }
+        "503": { description: Sin90 module unavailable }
+
+  /sin90/proposals:
+    post:
+      operationId: sin90SubmitProposal
+      tags: [sin90]
+      summary: Submit a Sin90 proposal (persisted pending; idempotent on id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, status, source, ops]
+              additionalProperties: false
+              properties:
+                id: { type: string }
+                status: { type: string, enum: [pending, applying, applied, rejected] }
+                source: { type: string, enum: [local_brain, executive, rule] }
+                ops: { type: array, items: { type: object } }
+                rationale: { type: string, nullable: true }
+      responses:
+        "202": { description: Accepted (pending) }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { description: Same id, different ops }
+        "503": { description: Sin90 module unavailable }
+
+  /sin90/proposals/{id}/accept:
+    post:
+      operationId: sin90AcceptProposal
+      tags: [sin90]
+      summary: Accept + apply a pending proposal (CAS-idempotent)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Applied (or idempotent replay); returns the receipt }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Proposal not pending }
+        "422": { description: Stored ops are stale against current state }
+        "503": { description: Sin90 module unavailable }
+
+  /sin90/attention:
+    get:
+      operationId: sin90Attention
+      tags: [sin90]
+      summary: Attention reconciliation for a window (pure event replay)
+      parameters:
+        - name: start
+          in: query
+          required: true
+          schema: { type: string, description: "ISO-8601 lower bound (inclusive)" }
+        - name: end
+          in: query
+          required: true
+          schema: { type: string, description: "ISO-8601 upper bound (exclusive); must be > start" }
+      responses:
+        "200": { description: Per-direction realized minutes }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { description: Sin90 module unavailable }
+
 components:
   securitySchemes:
     bearerAuth:
