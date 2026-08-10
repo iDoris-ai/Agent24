@@ -224,6 +224,7 @@ impl RiskAssessor for ModelRiskAssessor {
             messages: vec![Msg::user(Self::prompt(input))],
             model: self.model.clone(),
             tools: vec![],
+            response_format: None,
         };
         // LocalOnly: the tool payload must never leave the device to be judged.
         let profile = TaskProfile {
