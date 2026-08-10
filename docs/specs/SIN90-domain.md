@@ -166,17 +166,23 @@ pub fn task_is_terminal(s: TaskStatus) -> bool;           // done|dropped|carrie
 // 终态集合与迁移表一致,都含 carried_over。
 ```
 
-合法迁移表(草案):
+合法迁移表(与已合并的 #99 实现同步):
 
 ```
 Direction : draft→active→{achieved,abandoned,paused} ; paused→active
+            draft→abandoned ; paused→abandoned      (直接放弃,不必穿过没待过的态)
 Task      : backlog→planned→in_progress→{done,dropped,carried_over}
-            planned→dropped ; backlog→dropped
+            planned→dropped ; backlog→dropped ; planned→carried_over
+            (carried_over 是终态;可从 planned 或 in_progress 结转)
 Week      : planning→active→reviewing→closed
 Block     : planned→started→{completed,skipped} ; planned→skipped
-Rhythm    : active→adjusted→retired ; active→retired
+Rhythm    : active→adjusted→retired ; active→retired ; adjusted→adjusted (可反复调)
 Review    : draft→finalized
+Proposal  : pending→applying→applied ; {pending,applying}→rejected
+            (applying→pending 是 apply 失败时的 DB 回滚,非显式边)
 ```
+
+关系型不变量**不进状态机也不进纯校验器**(ValidationCtx 是逐实体的),由 store 在 apply 写锁下强制:任务只在其**周 open(planning|active)**时可变、carry-over 的 `to_week` 不得等于源任务当前周(否则原任务作废且同周产生可无限自我复制的重复行)。alloc 的 direction 查重是**代码校验**(allocations 是 `sin90_rhythms.allocations` 的 JSON,非 DB UNIQUE 约束)。
 
 ### 2.3 `proposal.rs` — AI 不写库的门(持久 + 幂等)
 
@@ -505,12 +511,12 @@ agent24-sin90-store = { path = "../../crates/agent24-sin90-store" }
 
 ## 8. 内核侧遗留工作(SPIKE-00 前须与内核对齐)
 
-这几项**动的是内核,不是 Sin90**,需在内核仓库另行排期;SPIKE-00 可先用桩绕过,但契约要先定:
+这几项**动的是内核,不是 Sin90**:
 
-1. **`agent24-protocol`**:新增通用 `EventBody::Module{module,kind,payload}` 变体 + 其 JSON Schema(§4.2)。这是内核一次性通用能力,非 Sin90 专属。
-2. **`agent24-models`**:`CompletionRequest` 加可选 `response_format: JsonSchema`,OpenAI-兼容 provider 透传(§5.1)。
-3. **模块宿主**:`agent24d` 定义 `Sin90KernelCtx` 的进程内 adapter(`model()`/`scheduler()`/`events()`/`authz()`),并规范模块 `register(router, ctx)` 挂载点(§0)。
-4. **ADR-026 单一事实源**:Sin90 的 API/事件随内核一样发布 OpenAPI/JSON Schema(而非只写在本文档)。
+1. ✅ **`agent24-protocol`**:通用 `EventBody::Module{module,kind,payload}` 变体 + JSON Schema(§4.2)。**已做 → PR #101**(schema/api-client 已重生成)。
+2. ✅ **`agent24-models`**:`CompletionRequest` 加可选 `response_format`(`ResponseFormat::JsonSchema{name,schema,strict}`),OpenAI-兼容 adapter 透传(§5.1)。**已做 → PR #102**。**1e 冒烟验证**:oMLX 服务 `Qwen3-0.6B-4bit`,`response_format: json_schema` 强制合法 JSON,p95 **0.271s**(<500ms 目标)——无需新增 GGUF provider。
+3. ⏳ **模块宿主**:`agent24d` 定义 `Sin90KernelCtx` 的进程内 adapter(`model()`/`scheduler()`/`events()`/`authz()`)+ 挂载 `/api/v1/sin90/*` 路由(§0)。**1d,进行中**。
+4. ⏳ **ADR-026 单一事实源**:Sin90 的 API/事件随内核一样发布 OpenAPI/JSON Schema。
 
 ## 9. v0.3 改动记录(Codex 架构自审收口)
 
