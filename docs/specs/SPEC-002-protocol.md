@@ -160,6 +160,7 @@ M-B agent24d 起动态端口 + `Authorization: Bearer <token>`（启动时 stdou
 | `approval.resolved` | `{ approval_id, run_id, decision_type }`（多客户端同步收敛） |
 | `schedule.fired` | `{ schedule_id, run_id }` |
 | `schedule.disabled` | `{ schedule_id, reason }`（reason 为开放枚举，当前唯一取值 `consecutive_failures`） |
+| `module` | `{ module, kind, payload }` — 可加载模块的命名空间事件信封。`type` 是裸标签 `module`（**唯一豁免**下述点分命名），真实事件名在 `payload.kind`（点分，如 `task.transitioned`）；`module` 须等于模块 manifest 的 `id`（`module.schema.json` 的 pattern）；`payload` 为对象，内核不解释、原样转发。见 SIN90-domain.md §4.2 的用例 |
 
 **Request（必须回包，经 REST）**：
 
@@ -169,6 +170,8 @@ M-B agent24d 起动态端口 + `Authorization: Bearer <token>`（启动时 stdou
 
 实现约束（硬约束 #8）：Rust 侧事件为 `#[serde(tag = "type")]` 强类型 enum，**每个变体显式 `#[serde(rename = "run.started")]` 式点分命名**（注意：`rename_all = "snake_case"` 会错误产出 `run_started`，禁止依赖它命名事件）；
 TS 侧类型由 `protocol/events.schema.json` 生成。**禁止任何一侧手解析无类型 JSON。**
+
+> **唯一豁免（命名空间信封）**：`module` 事件的 `type` 是命名空间标签而非事件名，真实事件名在点分的 `payload.kind`；其 `payload` 是被批准的不透明对象通道——客户端按 `payload.module`/`payload.kind` 分发，这对**模块事件**是设计许可，而非违反上面「禁止手解析无类型 JSON」（该禁令针对第一方强类型事件）。豁免仅此一个变体,其信封三字段仍是封闭强类型。
 
 ## 4. 认证与进程握手（M-B 起）
 

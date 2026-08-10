@@ -245,22 +245,25 @@ export interface ScheduleDisabledPayload {
   [k: string]: unknown;
 }
 /**
- * A module-namespaced event the kernel relays verbatim (adjacently-tagged
- * `type = "module"`). `module`/`kind` are module-defined strings; `payload` is
- * module-defined JSON the kernel never inspects — this is the ONLY seam by
- * which a module reaches the WS stream, preserving the one-way dependency.
+ * A module-namespaced event (adjacently-tagged `type = "module"`). The
+ * envelope shape is deliberately CLOSED — extension space is inside `payload`,
+ * which the kernel relays verbatim and never inspects. This is the ONLY seam
+ * by which a module reaches the WS stream, preserving the one-way dependency.
  */
 export interface ModuleEventPayload {
   /**
-   * Module-defined event kind, e.g. `"task.transitioned"`.
+   * Module-defined event kind, dotted like a first-party name, e.g.
+   * `"task.transitioned"` — this is where the real event name lives.
    */
   kind: string;
   /**
-   * Owning module, e.g. `"sin90"`.
+   * Owning module. MUST equal the module's manifest `id`
+   * (`protocol/module.schema.json`), hence the same pattern.
    */
   module: string;
   /**
-   * Module-defined body; opaque to the kernel and clients that don't know it.
+   * Module-defined body; an OBJECT, opaque to the kernel and to clients that
+   * don't know this module (matches the generated TS `{ [k]: unknown }`).
    */
   payload: {
     [k: string]: unknown;

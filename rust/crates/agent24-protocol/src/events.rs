@@ -1,9 +1,16 @@
 //! WS event protocol (SPEC-002 §3, protocol/events.schema.json).
 //!
 //! Envelope `{ v, seq, ts, type, payload }` — `type`/`payload` are adjacently
-//! tagged onto [`EventBody`]. Every variant carries an explicit dotted
-//! `#[serde(rename = "…")]` name (ADR-026 hard constraint #8): `rename_all`
-//! would wrongly produce `run_started`.
+//! tagged onto [`EventBody`]. Every FIRST-PARTY variant carries an explicit
+//! dotted `#[serde(rename = "run.started")]` name (ADR-026 hard constraint #8):
+//! `rename_all` would wrongly produce `run_started`.
+//!
+//! ONE declared exemption (SPEC-002 §3): the [`EventBody::Module`] envelope's
+//! `type` is the bare namespace tag `"module"`, not an event name — the real,
+//! dotted event name lives in `payload.kind`. This is the sanctioned channel
+//! for the second clause of hard constraint #8 too: a module's `payload` IS
+//! opaque and clients dispatch on `payload.module`/`payload.kind`, which is
+//! exactly what "no untyped-JSON parsing" forbids for FIRST-PARTY events.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -52,8 +59,10 @@ pub enum EventBody {
     ScheduleDisabled(ScheduleDisabledPayload),
     /// Opaque event from a loadable module (e.g. Sin90). The kernel carries it
     /// on the same WS stream without understanding its semantics — a generic
-    /// capability, NOT knowledge of any specific module (SIN90-domain.md §4.2).
-    /// Clients dispatch on `payload.module` + `payload.kind`.
+    /// capability, NOT knowledge of any specific module. The `type` is the bare
+    /// namespace tag `module` (declared exemption to hard constraint #8's dotted
+    /// rule, SPEC-002 §3); the real dotted event name is `payload.kind`. Clients
+    /// dispatch on `payload.module` + `payload.kind`.
     #[serde(rename = "module")]
     Module(ModuleEventPayload),
 }
@@ -78,18 +87,22 @@ impl EventBody {
     }
 }
 
-/// A module-namespaced event the kernel relays verbatim (adjacently-tagged
-/// `type = "module"`). `module`/`kind` are module-defined strings; `payload` is
-/// module-defined JSON the kernel never inspects — this is the ONLY seam by
-/// which a module reaches the WS stream, preserving the one-way dependency.
+/// A module-namespaced event (adjacently-tagged `type = "module"`). The
+/// envelope shape is deliberately CLOSED — extension space is inside `payload`,
+/// which the kernel relays verbatim and never inspects. This is the ONLY seam
+/// by which a module reaches the WS stream, preserving the one-way dependency.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModuleEventPayload {
-    /// Owning module, e.g. `"sin90"`.
+    /// Owning module. MUST equal the module's manifest `id`
+    /// (`protocol/module.schema.json`), hence the same pattern.
+    #[schemars(regex(pattern = r"^(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*$"))]
     pub module: String,
-    /// Module-defined event kind, e.g. `"task.transitioned"`.
+    /// Module-defined event kind, dotted like a first-party name, e.g.
+    /// `"task.transitioned"` — this is where the real event name lives.
     pub kind: String,
-    /// Module-defined body; opaque to the kernel and clients that don't know it.
-    pub payload: serde_json::Value,
+    /// Module-defined body; an OBJECT, opaque to the kernel and to clients that
+    /// don't know this module (matches the generated TS `{ [k]: unknown }`).
+    pub payload: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
