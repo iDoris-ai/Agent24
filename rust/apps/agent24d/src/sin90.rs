@@ -112,6 +112,24 @@ fn parse<T: for<'de> Deserialize<'de>>(bytes: &Bytes, what: &str) -> Result<T, R
     })
 }
 
+/// A fixed-width `YYYY-MM-DDThh:mm:ssZ` (20 chars) — the exact shape
+/// `agent24_core::util::now_iso8601` stamps events with, so a lexical window
+/// compare is chronological. Deliberately not a full RFC3339 parser: we only
+/// need to reject shapes (like a bare date) that would compare wrong.
+fn is_fixed_iso8601(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 20
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || c.is_ascii_digit())
+}
+
 // ---- request/query bodies (deny_unknown_fields: reject model typos loudly) --
 
 #[derive(Deserialize)]
@@ -313,6 +331,17 @@ pub async fn attention(
             );
         }
     };
+    // Both bounds must be the fixed-width ISO-8601 that events stamp `at` with
+    // (`YYYY-MM-DDThh:mm:ssZ`). A date-only `2026-08-11` compares lexically
+    // BELOW `2026-08-11T00:00:00Z`, so it would silently drop that whole day —
+    // worse than a 400. Reject anything that isn't the exact 20-char shape.
+    if !is_fixed_iso8601(&q.start) || !is_fixed_iso8601(&q.end) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "start and end must be fixed-width ISO-8601 (YYYY-MM-DDThh:mm:ssZ)",
+        );
+    }
     // start >= end would silently return an empty report indistinguishable from
     // "did nothing" — reject it rather than lie.
     if q.start >= q.end {

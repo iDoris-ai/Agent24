@@ -474,7 +474,7 @@ pub async fn serve(
     } else {
         match agent24_protocol::state_file::state_dir() {
             Some(dir) => agent24_sin90_store::Sin90Store::open(&dir.join("sin90.db")).await,
-            None => Err(agent24_sin90_store::StoreError::Conflict(
+            None => Err(agent24_sin90_store::StoreError::Internal(
                 "HOME not set".into(),
             )),
         }
@@ -1335,5 +1335,73 @@ mod tests {
             applied, 1,
             "exactly one proposal.applied despite two accepts"
         );
+    }
+
+    // The head-fix: a daemon whose sin90 store failed to open (None) must serve
+    // health but 503 every sin90 route — the kernel does not depend on the module.
+    #[tokio::test]
+    async fn sin90_unavailable_503s_but_kernel_lives() {
+        let mut st = state().await;
+        st.sin90 = None;
+        let router = build_router(st);
+
+        for (method, uri) in [
+            ("POST", "/api/v1/sin90/directions"),
+            ("POST", "/api/v1/sin90/schedule-blocks"),
+            ("PATCH", "/api/v1/sin90/schedule-blocks/x"),
+            ("POST", "/api/v1/sin90/proposals"),
+            ("POST", "/api/v1/sin90/proposals/x/accept"),
+            ("GET", "/api/v1/sin90/attention?start=a&end=b"),
+        ] {
+            let res = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {uri} must 503 when the module is down"
+            );
+            let json = body_json(res).await;
+            assert_eq!(json["error"]["code"], "module_unavailable");
+        }
+
+        // The kernel is unaffected.
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // A bare date (not the fixed-width timestamp) would drop a whole day under a
+    // lexical window compare — reject it rather than silently under-count.
+    #[tokio::test]
+    async fn sin90_attention_rejects_non_fixed_width_bounds() {
+        let res = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sin90/attention?start=2026-08-01&end=2026-08-11")
+                    .header("Authorization", "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }
