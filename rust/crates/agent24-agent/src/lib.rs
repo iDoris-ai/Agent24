@@ -209,6 +209,7 @@ impl Summarizer for RouterSummarizer {
             messages: vec![Msg::user(prompt)],
             model: None,
             tools: vec![],
+            response_format: None,
         };
         let (_provider, res) = self
             .router
@@ -1000,6 +1001,7 @@ impl RunManager {
                 messages: messages.clone(),
                 model: run.input.model_override.clone(),
                 tools: self.tool_specs_for(plan_mode),
+                response_format: None,
             };
             let outcome = tokio::select! {
                 r = self.router.complete(TaskProfile::default(), &request, &cancel) => r,

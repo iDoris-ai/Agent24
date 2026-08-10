@@ -417,6 +417,7 @@ mod tests {
             }],
             model: None,
             tools: vec![],
+            response_format: None,
         }
     }
 

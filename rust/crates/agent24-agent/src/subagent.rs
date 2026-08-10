@@ -188,6 +188,7 @@ impl ExplorerSubagent {
                 messages: messages.clone(),
                 model: None,
                 tools: tool_specs.clone(),
+                response_format: None,
             };
             // Privacy note: the explorer uses the SAME (default) profile as a
             // normal run. It is not more privileged than the main agent w.r.t.

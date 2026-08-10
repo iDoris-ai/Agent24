@@ -95,6 +95,42 @@ pub struct CompletionRequest {
     pub model: Option<String>,
     /// Empty = the model cannot call tools this turn
     pub tools: Vec<ToolSpec>,
+    /// Constrained output. `None` = free text. The OpenAI-compatible adapter
+    /// forwards it as `response_format`; providers that ignore it degrade to
+    /// free text, so callers must still validate (Sin90's Local brain does).
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Structured-output request, mirroring the OpenAI `response_format` wire shape
+/// so an OpenAI-compatible backend (oMLX, …) forwards it verbatim. Kept
+/// provider-neutral: the adapter, not the router or Sin90, knows the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResponseFormat {
+    /// Force the model to emit JSON matching `schema` (OpenAI `json_schema`).
+    JsonSchema {
+        /// Schema name (OpenAI requires one).
+        name: String,
+        /// The JSON Schema the output must satisfy.
+        schema: serde_json::Value,
+        /// OpenAI `strict` mode — reject any output that doesn't match.
+        strict: bool,
+    },
+}
+
+impl ResponseFormat {
+    /// The OpenAI `response_format` JSON body.
+    fn to_wire(&self) -> Value {
+        match self {
+            ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => serde_json::json!({
+                "type": "json_schema",
+                "json_schema": { "name": name, "schema": schema, "strict": strict },
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -476,6 +512,9 @@ impl ModelProvider for OpenAiCompatProvider {
                     .collect(),
             );
         }
+        if let Some(rf) = &req.response_format {
+            body["response_format"] = rf.to_wire();
+        }
         let fut = self
             .authed(
                 self.client
@@ -625,6 +664,20 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn response_format_json_schema_wire_shape() {
+        let rf = ResponseFormat::JsonSchema {
+            name: "sin90_intent".to_owned(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        };
+        let wire = rf.to_wire();
+        assert_eq!(wire["type"], "json_schema");
+        assert_eq!(wire["json_schema"]["name"], "sin90_intent");
+        assert_eq!(wire["json_schema"]["strict"], true);
+        assert_eq!(wire["json_schema"]["schema"]["type"], "object");
+    }
+
     // ── H12: friendly provider errors ────────────────────────────────────────
 
     #[test]
@@ -757,6 +810,7 @@ mod tests {
             messages: vec![Msg::user("hi")],
             model: None,
             tools: vec![],
+            response_format: None,
         }
     }
 
