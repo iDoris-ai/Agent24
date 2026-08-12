@@ -137,7 +137,7 @@
   - [ ] 用户可设置"只信任 AirAccount X 签发的模块"
 - [ ] 跨设备记忆同步
 - [ ] 个人 ↔ 组织 ↔ 公共 三级 agent 网络
-- [ ] Tauri 2.0 mobile 端（ADR-018）
+- [ ] 移动瘦壳示例：Tauri 2.0 + Expo/React Native（ADR-027）
 - [ ] 拆分时机评估（哪些子目录适合拆出 monorepo）
 
 ---

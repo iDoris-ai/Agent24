@@ -6,13 +6,13 @@
 
 **Agent24 是框架，不是应用。** 我们提供：
 
-- **外壳无关（shell-agnostic）**：Rust 内核 + daemon 与前端解耦，兼容任何外壳——自带 Electron 参考外壳，Tauri 外壳（如 Pet0 桌宠）等同样可挂载
-- 跨平台分发（macOS / Windows，Electron 参考壳）
+- **外壳无关（shell-agnostic）**：Rust 内核 + daemon 与前端解耦，壳只经 HTTP/WS 协议连接——自带 Electron 参考外壳，Tauri 外壳（如 Pet0 桌宠）等同样可挂载
+- **多端**：桌面已落地（Electron 参考壳，macOS / Windows / Linux 分发）；移动（iOS / Android）与 Web 规划中，同属 shell-agnostic——移动端计划各提供 Tauri 与 Expo / React Native 瘦壳示例（见 [ADR-027](docs/decision.md)）。daemon 与模型可不在端上（如跑在你的 Mac），移动 / Web 端做瘦壳、只经 HTTP/WS 协议远程消费
 - 后台 daemon + 用户交互一致性
 - 标准化能力模块接口（`@auraaihq/sdk` `defineModule`）
 - AI 适配层（本地 & API 多模型：iDoris 主、Claude / OpenAI / 本地 LLaVA 备）
 - 分层记忆（L0 KV → L3 ATIF 轨迹 + SkillBank）+ 自进化框架
-- 通过 agent-speaker / Nostr 与其他 agent 通信
+- 通过 **Hyphae 菌丝网络**（Nostr）与其他 agent 通信
 
 **应用方**（如小黑书、博客、社区工具等）从本框架 fork，搭载具体场景的能力模块。
 

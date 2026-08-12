@@ -598,7 +598,7 @@ privacy-first 必须是"安全默认值"，不能默认 share-on（用户不知�
 ## ADR-018：移动端技术路径选 Tauri 2.0（M5+）
 
 **日期**：2026-04-27
-**状态**：✅ 采纳（影响 M0-M4 的依赖选择）
+**状态**：⛔ Superseded by ADR-027（2026-08-12）——移动端从"单选 Tauri"改为 shell-agnostic 双壳示例；Tauri 作为其中一条路径保留，下方 M0-M4 的 Tauri-friendly 约束仍有效
 
 ### 备选
 
@@ -984,6 +984,34 @@ GET  /api/v1/files/{id}        — 结果文件下载
 2. **能力模块并发**：非 LLM 步骤（Playwright 抓取、文件处理）可并发
 3. **模型卸载策略**：Ollama 模式下换模型时自动卸载旧模型；MLX 模式下显式 `del model; gc.collect()` 释放
 4. **内存警告**：后台监控系统内存，低于阈值（默认 6GB）时暂停新任务入队并推送告警到前端
+
+---
+
+## ADR-027：移动端 shell-agnostic 双壳（Tauri + Expo/React Native）
+
+**日期**：2026-08-12
+**状态**：✅ 采纳（supersedes ADR-018）
+
+### 背景
+
+ADR-026 把内核收敛为 shell-agnostic 的 Rust daemon + HTTP/WS 协议边界。移动端因此不再是"用哪个框架把 app 重写一遍"的单选题——任何前端都能作瘦壳、经协议远程消费 daemon，而 daemon 与模型可不在端上（如跑在用户的 Mac）。
+
+### 重新审视 ADR-018 的三条理由
+
+ADR-018 当年选 Tauri，核心理由是 Rust-on-device 一致性、包体积、避免 node 原生依赖。**在瘦壳模型下这三条大半失效**：端上不再跑 Rust 内核或本地模型，只是一个协议客户端；包体积与 node 依赖对一个"只发 HTTP/WS 的薄客户端"不再是决定性约束。
+
+### 决策
+
+移动端（iOS / Android）采用 **shell-agnostic 策略**：官方各提供一个瘦壳示例——**Tauri 2.0**（承接 ADR-018）与 **Expo / React Native**——二者都只经 HTTP/WS 协议接入 daemon，供社区 follow。**不再钦定单一框架**；桌面仍以 Electron 为参考壳（不变）。
+
+### 影响
+
+- ADR-018 标 Superseded（其 M0-M4 的"Tauri-friendly、避免 Electron-only API / node 原生依赖"约束仍有效，且对两种瘦壳都友好）。
+- ROADMAP 的"Tauri 2.0 mobile 端"改为"移动瘦壳示例（Tauri + Expo/RN）"。
+
+### 遗留（代码侧 follow-up）
+
+"daemon 跑在端外、移动端远程消费"要成为真支持能力，`agent24d` 需要一条 bind-address 配置路径（现 `server.rs` 硬编码 `127.0.0.1`）+ 远程认证/配对（现为本机 stdout token）。浏览器内的 Web 壳还需处理 daemon 有意的 Origin/CSRF 拒绝（原生壳无此问题）。
 
 ---
 
