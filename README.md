@@ -1,15 +1,16 @@
 # Agent24
 
-> 跨平台 Electron 桌面框架——为 Agent24 生态提供统一的"个人 AI 助手"承载壳，支持可插拔能力模块、多 AI 适配、分层记忆、跨 agent 通信。
+> 面向 24/7 AI agent 的 **shell-agnostic 框架**——Rust 内核 + daemon 提供统一的"个人 AI 助手"承载能力，外壳与核心解耦：自带 Electron 参考外壳，任何外壳都能挂上来（如 Tauri 的 Pet0）；支持可插拔能力模块、本地 & API 多模型适配、分层记忆、跨 agent 通信。
 
 ## 定位
 
 **Agent24 是框架，不是应用。** 我们提供：
 
-- 跨平台分发（macOS / Windows）
+- **外壳无关（shell-agnostic）**：Rust 内核 + daemon 与前端解耦，兼容任何外壳——自带 Electron 参考外壳，Tauri 外壳（如 Pet0 桌宠）等同样可挂载
+- 跨平台分发（macOS / Windows，Electron 参考壳）
 - 后台 daemon + 用户交互一致性
 - 标准化能力模块接口（`@auraaihq/sdk` `defineModule`）
-- AI 适配层（iDoris 主、Claude / OpenAI / 本地 LLaVA 备）
+- AI 适配层（本地 & API 多模型：iDoris 主、Claude / OpenAI / 本地 LLaVA 备）
 - 分层记忆（L0 KV → L3 ATIF 轨迹 + SkillBank）+ 自进化框架
 - 通过 agent-speaker / Nostr 与其他 agent 通信
 
