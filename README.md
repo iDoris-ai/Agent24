@@ -10,7 +10,7 @@
 - **多端**：桌面已落地（Electron 参考壳，macOS / Windows / Linux 分发）；移动（iOS / Android）与 Web 规划中，同属 shell-agnostic——移动端计划各提供 Tauri 与 Expo / React Native 瘦壳示例（见 [ADR-027](docs/decision.md)）。daemon 与模型可不在端上（如跑在你的 Mac），移动 / Web 端做瘦壳、只经 HTTP/WS 协议远程消费
 - 后台 daemon + 用户交互一致性
 - 标准化能力模块接口（`@auraaihq/sdk` `defineModule`）
-- AI 适配层（本地 & API 多模型：iDoris 主、Claude / OpenAI / 本地 LLaVA 备）
+- AI 适配层（本地 & API 多模型：本地小模型 + Claude / OpenAI / iDoris 等 API，可切换）
 - 分层记忆（L0 KV → L3 ATIF 轨迹 + SkillBank）+ 自进化框架
 - 通过 **Hyphae 菌丝网络**（Nostr）与其他 agent 通信
 
@@ -20,54 +20,56 @@
 
 ---
 
-## 架构（M2 — Backend Daemon）
+## 架构（Rust Core + Polyglot，见 [ADR-026](docs/ADR-026-rust-core-polyglot.md)）
+
+内核是 Rust daemon `agent24d`——唯一核心运行时，也是桌面端默认后端（`AGENT24_BACKEND=rust`，v0.1.0 起）。所有外壳只经 **v1 REST + WebSocket** 协议接入，互不感知实现。
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Electron Shell（跨平台分发 + UI 一致性）               │
-│                                                                 │
-│  Main Process (Node.js)              Renderer (React)          │
-│  ┌─────────────────────────────┐    ┌────────────────────────┐  │
-│  │  BackendManager             │IPC │  Chat  / Workbench     │  │
-│  │   └─ fork() backend daemon  │────┤  Models / Settings     │  │
-│  │  registerIpcHandlers()      │    │  backendProxy()        │  │
-│  │   └─ BackendProxy IPC       │    └────────────────────────┘  │
-│  └─────────────────────────────┘                                 │
-│                    │ child_process.fork                          │
-│                    ▼                                             │
-│  ┌─────────────────────────────┐                                 │
-│  │  Backend Daemon :8765       │                                 │
-│  │  ├─ /health                 │                                 │
-│  │  ├─ /api/llm/chat           │                                 │
-│  │  ├─ /api/llm/usage          │                                 │
-│  │  └─ CapabilityModule routes │                                 │
-│  │                             │                                 │
-│  │  LLM Gateway                │                                 │
-│  │   ├─ oMLX  :8000 (default)  │                                 │
-│  │   ├─ Ollama :11434          │                                 │
-│  │   ├─ LM Studio              │                                 │
-│  │   └─ Remote OpenAI-compat.  │                                 │
-│  └─────────────────────────────┘                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│  外壳（shell-agnostic，只经 v1 REST/WS 接入）                          │
+│  Electron+React 桌面（默认/参考壳）· Tauri（如 Pet0）·                 │
+│  移动 iOS/Android + Web（规划，瘦壳）· TUI（ratatui）· CLI             │
+└───────────────────────────────┬────────────────────────────────────┘
+                  HTTP REST + WebSocket（bearer token，动态端口）
+┌───────────────────────────────▼────────────────────────────────────┐
+│  Agent24 Core = Rust daemon  agent24d                                │
+│  /api/v1: sessions · runs · events(WS) · approvals · schedules ·     │
+│           models · chat · usage · tools · tool-overrides · sin90 …   │
+│  crates: core · agent(Loop) · models(网关+三级路由) · scheduler ·    │
+│          store · memory · policy · tools · mcp · protocol · sin90    │
+└──────────┬───────────────────────────────────────┬─────────────────┘
+     契约：protocol/openapi.yaml + events.schema     │ REST
+     （单一来源 → packages/api-client TS SDK 自动生成，CI 校验漂移）
+┌──────────▼──────────────────┐        ┌───────────▼──────────────────┐
+│ TS 能力模块 / 协议参考实现    │        │ Python ML Worker（规划）       │
+│ packages/node-daemon         │        │ Embedding · Whisper ·          │
+│ （v1 协议 mock/参考实现，     │        │ 图像 · LoRA 训练                │
+│  CapabilityModule 承载）     │        │ （agent24-ml-worker）          │
+└──────────────────────────────┘        └────────────────────────────────┘
 ```
 
-> **M1 → M3 演进**：M1 用 `@auraaihq/core` 内核（见 PR #3）；M2 用独立 Node.js daemon + LLM Gateway；M3 将迁移到 Python FastAPI（原生 MLX 绑定）。
+> **为什么不是 Node/Python 主后端**（[ADR-026](docs/ADR-026-rust-core-polyglot.md)，取代 ADR-023 的「M3 切 Python FastAPI」）：新内核能力（Agent Loop / 调度器 / 记忆 / 工作流 / 权限）从第一行起写在 Rust，不在 Node 或 Python 主后端里先写一遍。`packages/node-daemon` 保留为 v1 协议的 **mock/参考实现**（`AGENT24_BACKEND=node` 可切），保障协议演进期日常开发不阻塞；Python **仅**用于 ML Worker（不承担会话/权限/持久化/审计）。
 
 ### 核心组件
 
+> 状态图例：✅ 已落地（有测试）· 🟡 部分 · 🔲 未建成。职责列只写已落地能力，目标态见 ADR/ROADMAP。
+
 | 组件 | 路径 | 状态 | 职责 |
 |------|------|------|------|
-| **BackendManager** | `src/main/backend-manager.ts` | ✅ M2 | fork/health-check/auto-restart backend daemon |
-| **Backend Daemon** | `src/backend/server.ts` | ✅ M2 | Node.js http 服务，聚合路由，不依赖 Electron |
-| **LLM Gateway** | `src/backend/llm-gateway.ts` | ✅ M2 | 统一 LLM 调用、token 统计、运行时切换 |
-| **CapabilityModule** | `src/backend/capabilities/` | ✅ M2 | 可插拔能力模块接口 `register(router, ctx)` |
-| **IPC 桥** | `src/main/ipc/index.ts` | ✅ M2 | `BackendProxy` IPC 转发 + 参数校验 |
-| **Preload** | `src/main/preload.ts` | ✅ M2 | `backendProxy()` 暴露给 Renderer |
-| **Onboarding Wizard** | `src/main/onboarding/` | 🔲 M2 planned | 硬件检测 → 模型推荐 → 下载引导 |
-| **Python FastAPI backend** | `src/backend_py/` | 🔲 M3 planned | 原生 MLX 绑定，替换 Node.js daemon |
-| **MemPalace 记忆模块** | `src/backend/memory/` | 🔲 M3 planned | 分层记忆 L0-L3 + SkillBank |
+| **agent24d**（Rust daemon） | `rust/apps/agent24d` | ✅ | v1 REST+WS 核心运行时；桌面默认后端 |
+| **agent24-cli / TUI** | `rust/apps/agent24-cli` | ✅ CLI · ✅ TUI 最小版 · 🔲 chat | Attached/Standalone；TUI（ratatui）runs/事件流/审批队列，headless 运维 |
+| **agent24-core** | `rust/crates/agent24-core` | ✅ | 稳定领域模型（Session/Run/Task/ToolCall/Approval/Event/Usage…），零框架依赖 |
+| **agent24-agent** | `rust/crates/agent24-agent` | ✅ | Agent Loop：上下文 → 调模型 → 解析 ToolCall → 权限 → 执行 → 续 |
+| **agent24-models** | `rust/crates/agent24-models` | ✅ | Model Gateway + 三级路由（本地小模型 / 远程 API / 自训领域 LoRA；敏感任务强制本地或 LoRA，数据不出设备） |
+| **agent24-scheduler** | `rust/crates/agent24-scheduler` | ✅ | cron 式日常工作流调度器 |
+| **agent24-store / memory / policy** | `rust/crates/agent24-{store,memory,policy}` | ✅ | 持久化 / 分层记忆 / 权限审批 |
+| **agent24-sin90 (+store)** | `rust/crates/agent24-sin90*` | ✅ | 内置 Personal-OS 领域模块（独立 `sin90.db`） |
+| **api-client**（生成物） | `packages/api-client` | ✅ | openapi + events schema → TS SDK（CI 校验零漂移） |
+| **node-daemon**（参考实现） | `packages/node-daemon` | ✅ | v1 协议 mock/参考；TS CapabilityModule 承载 |
+| **desktop**（Electron 壳） | `apps/desktop` | ✅ | spawn agent24d + 端口/token/托盘/preload；React UI |
+| **agent24-worker → Python ML Worker** | `rust/crates/agent24-worker` | ✅ 契约/客户端 · 🔲 Python 侧 | Rust 侧 wire 契约 + HTTP 客户端（embed/transcribe/health）；Python 服务 `agent24-ml-worker`（Embedding/Whisper/图像/LoRA）规划 |
 
-### 能力模块开发
+### 能力模块开发（TS CapabilityModule，由 `node-daemon` 承载）
 
 ```ts
 // 实现 CapabilityModule 接口
@@ -115,7 +117,7 @@ cd rust && cargo build -p agent24d -p agent24-cli
 ## 文档
 
 - [工作站规划](docs/WORKSTATION_PLAN.md) — oMLX API 调研、64GB Mac 模型清单、能力 TODO
-- [决策日志](docs/decision.md) — ADR-001 ~ ADR-025
+- [决策日志](docs/decision.md) — ADR-001 ~ ADR-027
 
 ## 参考实现
 
