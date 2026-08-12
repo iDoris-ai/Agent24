@@ -472,6 +472,79 @@ async fn list_and_detail_reads_reflect_the_live_tables() {
     assert!(store.get_proposal("nope").await.is_err());
 }
 
+#[tokio::test]
+async fn list_reads_are_newest_first_even_within_one_tick() {
+    let store = Sin90Store::open_memory().await.unwrap();
+
+    // Four directions created back-to-back land in the SAME second (`created_at`
+    // is second-precision → ties) with RANDOM ulid tails — only the `rowid DESC`
+    // tiebreak makes "newest first" deterministic here.
+    let mut dir_ids = Vec::new();
+    for t in ["a", "b", "c", "d"] {
+        dir_ids.push(store.create_direction(t, "2026-08").await.unwrap().id);
+    }
+    let listed: Vec<String> = store
+        .list_directions()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    let mut expected = dir_ids.clone();
+    expected.reverse();
+    assert_eq!(
+        listed, expected,
+        "directions must be newest-first by insert order"
+    );
+
+    // Blocks likewise.
+    let mut blk_ids = Vec::new();
+    for _ in 0..3 {
+        blk_ids.push(store.create_block(None, None, 30).await.unwrap().id);
+    }
+    let listed: Vec<String> = store
+        .list_blocks()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    let mut expected = blk_ids.clone();
+    expected.reverse();
+    assert_eq!(
+        listed, expected,
+        "blocks must be newest-first by insert order"
+    );
+
+    // Proposals carry CLIENT-supplied ids, so lexical order is unrelated to time.
+    // Submit m, a, z → newest-first must be z, a, m (insert order) — NOT z,m,a
+    // (old lexical `id DESC`) and NOT a,m,z (lexical ascending).
+    for id in ["m", "a", "z"] {
+        store
+            .submit_proposal(&proposal(
+                id,
+                vec![Sin90Op::CreateDirection {
+                    title: id.into(),
+                    target_window: "2026-08".into(),
+                }],
+            ))
+            .await
+            .unwrap();
+    }
+    let listed: Vec<String> = store
+        .list_proposals()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["z", "a", "m"],
+        "proposals newest-first must track submit order, not client-id lexical order"
+    );
+}
+
 // ---- helpers ----
 
 /// A ±1h window around an ISO-8601 timestamp is overkill precision-wise; we just

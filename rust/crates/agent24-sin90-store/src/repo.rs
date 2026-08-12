@@ -312,15 +312,25 @@ impl Sin90Store {
 
     // ----- reads (list + detail) ---------------------------------------------
     // Plain projections off the live tables (NOT the event log): the answer to
-    // "what exists now", newest first (`created_at DESC`, `id` as a stable
-    // tiebreak). The `block.transitioned` stream carries ids no GET announced
-    // until these landed; now a reader can reconcile against the current rows.
+    // "what exists now", newest first. The `block.transitioned` stream carries
+    // ids no GET announced until these landed; now a reader can reconcile.
+    //
+    // Ordering `created_at DESC, rowid DESC`: `created_at` is only SECOND
+    // precision and the `id` (ULID) tail is RANDOM, so within one tick — and,
+    // crucially, within a single `apply_proposal` tx that stamps every new row
+    // the same `now` — neither key breaks ties deterministically. `rowid` is the
+    // true insert order, so it is the tiebreak that actually makes "newest first"
+    // hold. This relies on all three tables being ordinary rowid tables (they are
+    // — none is `WITHOUT ROWID`, and the crate never DELETEs from them, so rowids
+    // are neither reused nor reordered). Do NOT convert them to `WITHOUT ROWID`
+    // or migrate them via SQLite's build-new-table-and-copy dance without giving
+    // these reads an explicit monotonic column instead.
 
     pub async fn list_directions(&self) -> Result<Vec<Direction>> {
         let rows = sqlx::query(
             "SELECT id, title, status, target_window, created_at, updated_at
              FROM sin90_directions
-             ORDER BY created_at DESC, id DESC",
+             ORDER BY created_at DESC, rowid DESC",
         )
         .fetch_all(self.pool())
         .await?;
@@ -342,7 +352,7 @@ impl Sin90Store {
         let rows = sqlx::query(
             "SELECT id, direction_id, task_id, status, planned_minutes, created_at, updated_at
              FROM sin90_schedule_blocks
-             ORDER BY created_at DESC, id DESC",
+             ORDER BY created_at DESC, rowid DESC",
         )
         .fetch_all(self.pool())
         .await?;
@@ -365,7 +375,7 @@ impl Sin90Store {
         let rows = sqlx::query(
             "SELECT id, status, source, ops, rationale, result, created_at, decided_at
              FROM sin90_proposals
-             ORDER BY created_at DESC, id DESC",
+             ORDER BY created_at DESC, rowid DESC",
         )
         .fetch_all(self.pool())
         .await?;
@@ -396,9 +406,12 @@ impl Sin90Store {
         let now = now_iso8601();
         let ops_json = serde_json::to_string(&p.ops)?;
         // Transactional like every other mutation (BEGIN IMMEDIATE): the row and
-        // its `sin90_events` receipt commit together, so the event log is a
-        // COMPLETE record of what the store did — a pure replay sees the submit,
-        // not just the later apply.
+        // its `sin90_events` receipt commit together. Previously submit wrote the
+        // row via a bare pool and appended NO event, so a pure replay never saw
+        // the submit at all — only apply's later per-entity events. Now the submit
+        // is on the log too. (Note apply still records per-ENTITY events, not a
+        // `proposal/applied` one — the proposal entity's own stream ends at
+        // `submitted`; see the follow-up noted on the PR.)
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let affected = sqlx::query(
             "INSERT INTO sin90_proposals (id, status, source, ops, rationale, created_at)
