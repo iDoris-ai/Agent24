@@ -1,0 +1,11 @@
+# Redocly lint config for the API contract (`protocol/openapi.yaml`).
+#
+# This is the CI gate that would have caught the unquoted-flow-map YAML bug the
+# #103 review found by hand: `redocly lint` fails the build on any structural or
+# spec error. It extends the recommended ruleset; the one advisory rule below is
+# relaxed because several read-only/health endpoints legitimately return only
+# 2xx/5xx (a GET list has no 4xx to declare).
+extends:
+  - recommended
+rules:
+  operation-4xx-response: off

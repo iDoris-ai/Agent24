@@ -390,11 +390,11 @@ pub fn build_router(state: AppState) -> Router {
         // Sin90 module (SIN90-domain.md §4) — its own sin90.db, sin90.* WS events.
         .route(
             "/api/v1/sin90/directions",
-            post(crate::sin90::create_direction),
+            post(crate::sin90::create_direction).get(crate::sin90::list_directions),
         )
         .route(
             "/api/v1/sin90/schedule-blocks",
-            post(crate::sin90::create_block),
+            post(crate::sin90::create_block).get(crate::sin90::list_blocks),
         )
         .route(
             "/api/v1/sin90/schedule-blocks/{id}",
@@ -402,7 +402,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/sin90/proposals",
-            post(crate::sin90::submit_proposal),
+            post(crate::sin90::submit_proposal).get(crate::sin90::list_proposals),
+        )
+        .route(
+            "/api/v1/sin90/proposals/{id}",
+            get(crate::sin90::get_proposal),
         )
         .route(
             "/api/v1/sin90/proposals/{id}/accept",
@@ -1255,6 +1259,95 @@ mod tests {
         assert_eq!(rows[0]["direction_title"], "Coding");
     }
 
+    // The GET list/detail reads: create through the router, then read the same
+    // rows back — and a missing proposal id is a 404, not an empty success.
+    #[tokio::test]
+    async fn sin90_list_reads_round_trip_over_router() {
+        let router = build_router(state().await);
+
+        async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Authorization", "Bearer testtoken")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+        async fn get(router: &Router, uri: &str) -> Response {
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("Authorization", "Bearer testtoken")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        let dir = body_json(
+            post(
+                &router,
+                "/api/v1/sin90/directions",
+                serde_json::json!({ "title": "Coding", "target_window": "2026-08" }),
+            )
+            .await,
+        )
+        .await;
+        let dir_id = dir["id"].as_str().unwrap().to_owned();
+        post(
+            &router,
+            "/api/v1/sin90/schedule-blocks",
+            serde_json::json!({ "direction_id": dir_id, "planned_minutes": 45 }),
+        )
+        .await;
+        assert_eq!(
+            post(
+                &router,
+                "/api/v1/sin90/proposals",
+                serde_json::json!({
+                    "id": "p-read", "status": "pending", "source": "local_brain",
+                    "ops": [{"op":"create_direction","title":"Z","target_window":"2026-08"}],
+                    "rationale": null
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+
+        let dirs = body_json(get(&router, "/api/v1/sin90/directions").await).await;
+        assert_eq!(dirs["directions"].as_array().unwrap().len(), 1);
+        assert_eq!(dirs["directions"][0]["id"], dir_id);
+
+        let blocks = body_json(get(&router, "/api/v1/sin90/schedule-blocks").await).await;
+        assert_eq!(blocks["blocks"].as_array().unwrap().len(), 1);
+        assert_eq!(blocks["blocks"][0]["planned_minutes"], 45);
+
+        let props = body_json(get(&router, "/api/v1/sin90/proposals").await).await;
+        assert_eq!(props["proposals"].as_array().unwrap().len(), 1);
+        assert_eq!(props["proposals"][0]["id"], "p-read");
+
+        let one = get(&router, "/api/v1/sin90/proposals/p-read").await;
+        assert_eq!(one.status(), StatusCode::OK);
+        let one = body_json(one).await;
+        assert_eq!(one["status"], "pending");
+        assert_eq!(one["ops"].as_array().unwrap().len(), 1);
+
+        let missing = get(&router, "/api/v1/sin90/proposals/nope").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(missing).await["error"]["code"], "not_found");
+    }
+
     // A block referencing a nonexistent direction is a client mistake (FK
     // violation) → 404, not the 500 a raw sqlx error would become.
     #[tokio::test]
@@ -1347,9 +1440,13 @@ mod tests {
 
         for (method, uri) in [
             ("POST", "/api/v1/sin90/directions"),
+            ("GET", "/api/v1/sin90/directions"),
             ("POST", "/api/v1/sin90/schedule-blocks"),
+            ("GET", "/api/v1/sin90/schedule-blocks"),
             ("PATCH", "/api/v1/sin90/schedule-blocks/x"),
             ("POST", "/api/v1/sin90/proposals"),
+            ("GET", "/api/v1/sin90/proposals"),
+            ("GET", "/api/v1/sin90/proposals/x"),
             ("POST", "/api/v1/sin90/proposals/x/accept"),
             ("GET", "/api/v1/sin90/attention?start=a&end=b"),
         ] {

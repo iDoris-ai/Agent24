@@ -120,6 +120,9 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
         run: pnpm install --frozen-lockfile
 
+      - name: OpenAPI lint (redocly — structural/spec gate on protocol/openapi.yaml)
+        run: pnpm lint:openapi
+
       - name: Codegen drift check (api-client must match protocol/)
         run: |
           pnpm gen:api

@@ -311,6 +311,54 @@ pub async fn accept_proposal(State(state): State<AppState>, Path(id): Path<Strin
     }
 }
 
+// ---- reads (list + detail) ------------------------------------------------
+// Plain "what exists now" projections, newest first. The mutation stream emits
+// created/transitioned events carrying ids; these GETs are the reconcile side.
+
+pub async fn list_directions(State(state): State<AppState>) -> Response {
+    let sin90 = match store(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match sin90.list_directions().await {
+        Ok(v) => Json(serde_json::json!({ "directions": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+pub async fn list_blocks(State(state): State<AppState>) -> Response {
+    let sin90 = match store(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match sin90.list_blocks().await {
+        Ok(v) => Json(serde_json::json!({ "blocks": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+pub async fn list_proposals(State(state): State<AppState>) -> Response {
+    let sin90 = match store(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match sin90.list_proposals().await {
+        Ok(v) => Json(serde_json::json!({ "proposals": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+pub async fn get_proposal(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let sin90 = match store(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match sin90.get_proposal(&id).await {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
 pub async fn attention(
     State(state): State<AppState>,
     q: Result<Query<AttentionQuery>, QueryRejection>,

@@ -8,9 +8,10 @@ use std::collections::HashMap;
 
 use agent24_core::util::{now_iso8601, ulid};
 use agent24_sin90::{
-    Direction, DirectionStatus, RhythmStatus, ScheduleBlock, ScheduleBlockStatus, Sin90Op,
-    Sin90Proposal, TaskStatus, ValidationCtx, Week, WeekStatus, check_rhythm_transition,
-    check_schedule_block_transition, check_task_transition, validate, week_is_open,
+    Direction, DirectionStatus, ProposalSource, ProposalStatus, RhythmStatus, ScheduleBlock,
+    ScheduleBlockStatus, Sin90Op, Sin90Proposal, TaskStatus, ValidationCtx, Week, WeekStatus,
+    check_rhythm_transition, check_schedule_block_transition, check_task_transition, validate,
+    week_is_open,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -36,6 +37,36 @@ pub struct AppliedProposal {
 pub struct ApplyOutcome {
     pub receipt: AppliedProposal,
     pub applied_now: bool,
+}
+
+/// A persisted proposal as returned by the read endpoints — the stored row plus
+/// its apply receipt (present only once `applied`). `ops` is re-inflated to typed
+/// form so a reader reconciles exactly what was proposed, not opaque JSON text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StoredProposal {
+    pub id: String,
+    pub status: ProposalStatus,
+    pub source: ProposalSource,
+    pub ops: Vec<Sin90Op>,
+    pub rationale: Option<String>,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+    pub result: Option<AppliedProposal>,
+}
+
+/// Row → [`StoredProposal`], shared by the list and the by-id read.
+fn row_to_proposal(r: &sqlx::sqlite::SqliteRow) -> Result<StoredProposal> {
+    let result: Option<String> = r.get("result");
+    Ok(StoredProposal {
+        id: r.get("id"),
+        status: from_wire(&r.get::<String, _>("status"))?,
+        source: from_wire(&r.get::<String, _>("source"))?,
+        ops: serde_json::from_str(&r.get::<String, _>("ops"))?,
+        rationale: r.get("rationale"),
+        created_at: r.get("created_at"),
+        decided_at: r.get("decided_at"),
+        result: result.map(|s| serde_json::from_str(&s)).transpose()?,
+    })
 }
 
 // A unit-variant enum serializes to a JSON string; unwrap that to the wire text.
@@ -279,6 +310,82 @@ impl Sin90Store {
         })
     }
 
+    // ----- reads (list + detail) ---------------------------------------------
+    // Plain projections off the live tables (NOT the event log): the answer to
+    // "what exists now", newest first (`created_at DESC`, `id` as a stable
+    // tiebreak). The `block.transitioned` stream carries ids no GET announced
+    // until these landed; now a reader can reconcile against the current rows.
+
+    pub async fn list_directions(&self) -> Result<Vec<Direction>> {
+        let rows = sqlx::query(
+            "SELECT id, title, status, target_window, created_at, updated_at
+             FROM sin90_directions
+             ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(Direction {
+                    id: r.get("id"),
+                    title: r.get("title"),
+                    status: from_wire(&r.get::<String, _>("status"))?,
+                    target_window: r.get("target_window"),
+                    created_at: r.get("created_at"),
+                    updated_at: r.get("updated_at"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_blocks(&self) -> Result<Vec<ScheduleBlock>> {
+        let rows = sqlx::query(
+            "SELECT id, direction_id, task_id, status, planned_minutes, created_at, updated_at
+             FROM sin90_schedule_blocks
+             ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(ScheduleBlock {
+                    id: r.get("id"),
+                    direction_id: r.get("direction_id"),
+                    task_id: r.get("task_id"),
+                    status: from_wire(&r.get::<String, _>("status"))?,
+                    planned_minutes: r.get::<i64, _>("planned_minutes") as u32,
+                    created_at: r.get("created_at"),
+                    updated_at: r.get("updated_at"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_proposals(&self) -> Result<Vec<StoredProposal>> {
+        let rows = sqlx::query(
+            "SELECT id, status, source, ops, rationale, result, created_at, decided_at
+             FROM sin90_proposals
+             ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_proposal).collect()
+    }
+
+    /// One proposal by id (with its ops and — once applied — the receipt). A
+    /// missing id is `NotFound` (→ 404), the same shape the accept path uses.
+    pub async fn get_proposal(&self, id: &str) -> Result<StoredProposal> {
+        let row = sqlx::query(
+            "SELECT id, status, source, ops, rationale, result, created_at, decided_at
+             FROM sin90_proposals WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("proposal {id}")))?;
+        row_to_proposal(&row)
+    }
+
     // ----- proposal gate ------------------------------------------------------
 
     /// Persist a proposal as `pending`. Idempotent on `id` ONLY when the ops are
@@ -288,6 +395,11 @@ impl Sin90Store {
     pub async fn submit_proposal(&self, p: &Sin90Proposal) -> Result<()> {
         let now = now_iso8601();
         let ops_json = serde_json::to_string(&p.ops)?;
+        // Transactional like every other mutation (BEGIN IMMEDIATE): the row and
+        // its `sin90_events` receipt commit together, so the event log is a
+        // COMPLETE record of what the store did — a pure replay sees the submit,
+        // not just the later apply.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let affected = sqlx::query(
             "INSERT INTO sin90_proposals (id, status, source, ops, rationale, created_at)
              VALUES (?, 'pending', ?, ?, ?, ?)
@@ -298,23 +410,40 @@ impl Sin90Store {
         .bind(&ops_json)
         .bind(&p.rationale)
         .bind(&now)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if affected == 0 {
             // Row already exists — accept only if the ops match byte-for-byte.
+            // An idempotent re-submit appends NO second event and writes nothing;
+            // the tx drops with the same effect as a commit of no changes.
             let existing: String = sqlx::query("SELECT ops FROM sin90_proposals WHERE id = ?")
                 .bind(&p.id)
-                .fetch_one(self.pool())
+                .fetch_one(&mut *tx)
                 .await?
                 .get("ops");
             if existing != ops_json {
+                // tx drops here → rollback (nothing was written anyway).
                 return Err(StoreError::Conflict(format!(
                     "proposal {} already exists with different ops",
                     p.id
                 )));
             }
+            return Ok(());
         }
+        // A genuinely new proposal — append its `submitted` event in the same tx.
+        append_event(
+            &mut tx,
+            "proposal",
+            &p.id,
+            "submitted",
+            None,
+            Some("pending"),
+            &json!({"id": p.id, "source": to_wire(&p.source)?, "ops_count": p.ops.len()}),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 

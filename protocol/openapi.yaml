@@ -38,13 +38,21 @@ security:
 
 tags:
   - name: system
+    description: Health, version, and process-level daemon endpoints.
   - name: chat
+    description: One-shot LLM chat completion.
   - name: sessions
+    description: Conversation sessions — the container runs belong to.
   - name: runs
+    description: Agent runs, their lifecycle, output, and cancellation.
   - name: approvals
+    description: Human-in-the-loop tool-call decisions for a run.
   - name: schedules
+    description: Cron-driven scheduled runs (CRUD + run-now).
   - name: tools
+    description: Tool inventory, risk classes, and trust overrides.
   - name: sin90
+    description: The Sin90 Personal-OS module (own store; degrades independently).
 
 paths:
   /health:
@@ -641,6 +649,23 @@ paths:
                 $ref: "#/components/schemas/Error"
 
   /sin90/directions:
+    get:
+      operationId: sin90ListDirections
+      tags: [sin90]
+      summary: List Sin90 directions (newest first)
+      responses:
+        "200":
+          description: All directions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [directions]
+                properties:
+                  directions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Sin90Direction" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       operationId: sin90CreateDirection
       tags: [sin90]
@@ -666,6 +691,23 @@ paths:
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/schedule-blocks:
+    get:
+      operationId: sin90ListBlocks
+      tags: [sin90]
+      summary: List Sin90 schedule blocks (newest first)
+      responses:
+        "200":
+          description: All schedule blocks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [blocks]
+                properties:
+                  blocks:
+                    type: array
+                    items: { $ref: "#/components/schemas/Sin90ScheduleBlock" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       operationId: sin90CreateBlock
       tags: [sin90]
@@ -728,6 +770,23 @@ paths:
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/proposals:
+    get:
+      operationId: sin90ListProposals
+      tags: [sin90]
+      summary: List Sin90 proposals (newest first)
+      responses:
+        "200":
+          description: All proposals, with their ops and (once applied) receipts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [proposals]
+                properties:
+                  proposals:
+                    type: array
+                    items: { $ref: "#/components/schemas/Sin90StoredProposal" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       operationId: sin90SubmitProposal
       tags: [sin90]
@@ -754,6 +813,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Sin90Unavailable" }
+
+  /sin90/proposals/{id}:
+    get:
+      operationId: sin90GetProposal
+      tags: [sin90]
+      summary: Read one proposal by id (ops + receipt once applied)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The stored proposal
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sin90StoredProposal" }
+        "404": { $ref: "#/components/responses/NotFound" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/proposals/{id}/accept:
@@ -1423,6 +1501,9 @@ components:
     Sin90ScheduleBlockStatus:
       type: string
       enum: [planned, started, completed, skipped]
+    Sin90ProposalStatus:
+      type: string
+      enum: [pending, applying, applied, rejected]
 
     Sin90Direction:
       type: object
@@ -1537,3 +1618,22 @@ components:
         source: { type: string, enum: [local_brain, executive, rule] }
         ops: { type: array, items: { $ref: "#/components/schemas/Sin90Op" } }
         rationale: { type: [string, "null"] }
+
+    Sin90StoredProposal:
+      type: object
+      description: >
+        A persisted proposal as returned by the read endpoints: the stored row
+        plus its apply receipt (`result`, present only once `applied`).
+      required: [id, status, source, ops, created_at]
+      properties:
+        id: { type: string }
+        status: { $ref: "#/components/schemas/Sin90ProposalStatus" }
+        source: { type: string, enum: [local_brain, executive, rule] }
+        ops: { type: array, items: { $ref: "#/components/schemas/Sin90Op" } }
+        rationale: { type: [string, "null"] }
+        created_at: { type: string }
+        decided_at: { type: [string, "null"] }
+        result:
+          oneOf:
+            - $ref: "#/components/schemas/Sin90AppliedProposal"
+            - type: "null"
