@@ -399,7 +399,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** List Sin90 directions (newest first) */
+        get: operations["sin90ListDirections"];
         put?: never;
         /** Create a Sin90 direction */
         post: operations["sin90CreateDirection"];
@@ -416,7 +417,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** List Sin90 schedule blocks (newest first) */
+        get: operations["sin90ListBlocks"];
         put?: never;
         /** Create a Sin90 schedule block */
         post: operations["sin90CreateBlock"];
@@ -450,10 +452,28 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** List Sin90 proposals (newest first) */
+        get: operations["sin90ListProposals"];
         put?: never;
         /** Submit a Sin90 proposal (persisted pending; idempotent on id) */
         post: operations["sin90SubmitProposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sin90/proposals/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read one proposal by id (ops + receipt once applied) */
+        get: operations["sin90GetProposal"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -873,6 +893,8 @@ export interface components {
         Sin90TaskStatus: "backlog" | "planned" | "in_progress" | "done" | "dropped" | "carried_over";
         /** @enum {string} */
         Sin90ScheduleBlockStatus: "planned" | "started" | "completed" | "skipped";
+        /** @enum {string} */
+        Sin90ProposalStatus: "pending" | "applying" | "applied" | "rejected";
         Sin90Direction: {
             id: string;
             title: string;
@@ -952,6 +974,18 @@ export interface components {
             source: "local_brain" | "executive" | "rule";
             ops: components["schemas"]["Sin90Op"][];
             rationale?: string | null;
+        };
+        /** @description A persisted proposal as returned by the read endpoints: the stored row plus its apply receipt (`result`, present only once `applied`). */
+        Sin90StoredProposal: {
+            id: string;
+            status: components["schemas"]["Sin90ProposalStatus"];
+            /** @enum {string} */
+            source: "local_brain" | "executive" | "rule";
+            ops: components["schemas"]["Sin90Op"][];
+            rationale?: string | null;
+            created_at: string;
+            decided_at?: string | null;
+            result?: components["schemas"]["Sin90AppliedProposal"] | null;
         };
     };
     responses: {
@@ -1669,6 +1703,29 @@ export interface operations {
             };
         };
     };
+    sin90ListDirections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All directions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        directions: components["schemas"]["Sin90Direction"][];
+                    };
+                };
+            };
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
     sin90CreateDirection: {
         parameters: {
             query?: never;
@@ -1696,6 +1753,29 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
+    sin90ListBlocks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All schedule blocks */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        blocks: components["schemas"]["Sin90ScheduleBlock"][];
+                    };
+                };
+            };
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -1770,6 +1850,29 @@ export interface operations {
             503: components["responses"]["Sin90Unavailable"];
         };
     };
+    sin90ListProposals: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All proposals, with their ops and (once applied) receipts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        proposals: components["schemas"]["Sin90StoredProposal"][];
+                    };
+                };
+            };
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
     sin90SubmitProposal: {
         parameters: {
             query?: never;
@@ -1806,6 +1909,30 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            503: components["responses"]["Sin90Unavailable"];
+        };
+    };
+    sin90GetProposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stored proposal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sin90StoredProposal"];
+                };
+            };
+            404: components["responses"]["NotFound"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };

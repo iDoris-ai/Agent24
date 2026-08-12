@@ -12,7 +12,7 @@ mod attention;
 mod repo;
 
 pub use attention::AttentionRow;
-pub use repo::{AppliedProposal, ApplyOutcome};
+pub use repo::{AppliedProposal, ApplyOutcome, StoredProposal};
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -154,6 +154,21 @@ pub mod test_hooks {
             .execute(store.pool())
             .await?;
         Ok(())
+    }
+
+    /// Count events appended for one entity — proves a submit/apply left the
+    /// expected receipt in `sin90_events` (and that an idempotent replay did not).
+    pub async fn event_count(store: &Sin90Store, entity: &str, entity_id: &str) -> Result<i64> {
+        Ok(
+            sqlx::query(
+                "SELECT COUNT(*) AS n FROM sin90_events WHERE entity = ? AND entity_id = ?",
+            )
+            .bind(entity)
+            .bind(entity_id)
+            .fetch_one(store.pool())
+            .await?
+            .get::<i64, _>("n"),
+        )
     }
 
     pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {

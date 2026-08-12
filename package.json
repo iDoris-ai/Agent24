@@ -15,6 +15,7 @@
     "test": "pnpm --filter @agent24/desktop test && pnpm --filter @agent24/node-daemon test && pnpm --filter @agent24/wechat-bridge test && pnpm --filter @agent24/nostr-bridge test",
     "test:contract": "pnpm --filter @agent24/contract-tests test",
     "lint": "eslint apps/desktop/src packages/node-daemon/src --ext .ts,.tsx",
+    "lint:openapi": "pnpm --package=@redocly/cli@2.46.1 dlx redocly lint protocol/openapi.yaml",
     "format": "prettier --write \"apps/desktop/src/**/*.{ts,tsx,css}\" \"packages/node-daemon/src/**/*.ts\"",
     "build:mac": "pnpm --filter @agent24/desktop build:mac",
     "build:win": "pnpm --filter @agent24/desktop build:win",

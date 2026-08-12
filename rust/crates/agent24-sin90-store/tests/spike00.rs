@@ -376,6 +376,175 @@ async fn attention_replay_matches_materialized_view() {
     );
 }
 
+#[tokio::test]
+async fn submit_proposal_appends_one_event_and_is_idempotent() {
+    let store = Sin90Store::open_memory().await.unwrap();
+    let p = proposal(
+        "p-sub",
+        vec![Sin90Op::CreateDirection {
+            title: "x".into(),
+            target_window: "2026-08".into(),
+        }],
+    );
+    store.submit_proposal(&p).await.unwrap();
+    assert_eq!(
+        test_hooks::event_count(&store, "proposal", "p-sub")
+            .await
+            .unwrap(),
+        1,
+        "submit appends exactly one `submitted` event (a pure replay sees it)"
+    );
+
+    // Idempotent re-submit (identical ops) must NOT append a second event.
+    store.submit_proposal(&p).await.unwrap();
+    assert_eq!(
+        test_hooks::event_count(&store, "proposal", "p-sub")
+            .await
+            .unwrap(),
+        1,
+        "an idempotent re-submit writes no duplicate event"
+    );
+
+    // Same id + different ops is a conflict; it must write nothing.
+    let conflict = proposal(
+        "p-sub",
+        vec![Sin90Op::CreateDirection {
+            title: "y".into(),
+            target_window: "2026-09".into(),
+        }],
+    );
+    assert!(
+        store.submit_proposal(&conflict).await.is_err(),
+        "same id + different ops is a conflict"
+    );
+    assert_eq!(
+        test_hooks::event_count(&store, "proposal", "p-sub")
+            .await
+            .unwrap(),
+        1,
+        "a rejected conflicting re-submit rolls back — still exactly one event"
+    );
+}
+
+#[tokio::test]
+async fn list_and_detail_reads_reflect_the_live_tables() {
+    let store = Sin90Store::open_memory().await.unwrap();
+    let d = store.create_direction("Coding", "2026-08").await.unwrap();
+    let b = store.create_block(Some(&d.id), None, 90).await.unwrap();
+    let p = proposal(
+        "p-list",
+        vec![Sin90Op::CreateDirection {
+            title: "z".into(),
+            target_window: "2026-08".into(),
+        }],
+    );
+    store.submit_proposal(&p).await.unwrap();
+
+    let dirs = store.list_directions().await.unwrap();
+    assert_eq!(dirs.len(), 1);
+    assert_eq!(dirs[0].id, d.id);
+
+    let blocks = store.list_blocks().await.unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].id, b.id);
+    assert_eq!(blocks[0].planned_minutes, 90);
+
+    let props = store.list_proposals().await.unwrap();
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].id, "p-list");
+    assert_eq!(props[0].status, ProposalStatus::Pending);
+    assert_eq!(props[0].ops.len(), 1);
+    assert!(
+        props[0].result.is_none(),
+        "a pending proposal has no receipt yet"
+    );
+
+    // Detail read by id; the receipt appears only after apply.
+    store.apply_proposal("p-list").await.unwrap();
+    let applied = store.get_proposal("p-list").await.unwrap();
+    assert_eq!(applied.status, ProposalStatus::Applied);
+    assert!(
+        applied.result.is_some(),
+        "an applied proposal carries its receipt"
+    );
+
+    // A missing id is NotFound (→ 404 at the daemon), not an empty success.
+    assert!(store.get_proposal("nope").await.is_err());
+}
+
+#[tokio::test]
+async fn list_reads_are_newest_first_even_within_one_tick() {
+    let store = Sin90Store::open_memory().await.unwrap();
+
+    // Four directions created back-to-back land in the SAME second (`created_at`
+    // is second-precision → ties) with RANDOM ulid tails — only the `rowid DESC`
+    // tiebreak makes "newest first" deterministic here.
+    let mut dir_ids = Vec::new();
+    for t in ["a", "b", "c", "d"] {
+        dir_ids.push(store.create_direction(t, "2026-08").await.unwrap().id);
+    }
+    let listed: Vec<String> = store
+        .list_directions()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    let mut expected = dir_ids.clone();
+    expected.reverse();
+    assert_eq!(
+        listed, expected,
+        "directions must be newest-first by insert order"
+    );
+
+    // Blocks likewise.
+    let mut blk_ids = Vec::new();
+    for _ in 0..3 {
+        blk_ids.push(store.create_block(None, None, 30).await.unwrap().id);
+    }
+    let listed: Vec<String> = store
+        .list_blocks()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    let mut expected = blk_ids.clone();
+    expected.reverse();
+    assert_eq!(
+        listed, expected,
+        "blocks must be newest-first by insert order"
+    );
+
+    // Proposals carry CLIENT-supplied ids, so lexical order is unrelated to time.
+    // Submit m, a, z → newest-first must be z, a, m (insert order) — NOT z,m,a
+    // (old lexical `id DESC`) and NOT a,m,z (lexical ascending).
+    for id in ["m", "a", "z"] {
+        store
+            .submit_proposal(&proposal(
+                id,
+                vec![Sin90Op::CreateDirection {
+                    title: id.into(),
+                    target_window: "2026-08".into(),
+                }],
+            ))
+            .await
+            .unwrap();
+    }
+    let listed: Vec<String> = store
+        .list_proposals()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["z", "a", "m"],
+        "proposals newest-first must track submit order, not client-id lexical order"
+    );
+}
+
 // ---- helpers ----
 
 /// A ±1h window around an ISO-8601 timestamp is overkill precision-wise; we just
