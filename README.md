@@ -42,9 +42,9 @@
      （单一来源 → packages/api-client TS SDK 自动生成，CI 校验漂移）
 ┌──────────▼──────────────────┐        ┌───────────▼──────────────────┐
 │ TS 能力模块 / 协议参考实现    │        │ Python ML Worker（规划）       │
-│ packages/node-daemon         │        │ MLX serving · Embedding ·      │
-│ （v1 协议 mock/参考实现，     │        │ Whisper · 图像 · LoRA 训练      │
-│  CapabilityModule 承载）     │        │ （agent24-worker）             │
+│ packages/node-daemon         │        │ Embedding · Whisper ·          │
+│ （v1 协议 mock/参考实现，     │        │ 图像 · LoRA 训练                │
+│  CapabilityModule 承载）     │        │ （agent24-ml-worker）          │
 └──────────────────────────────┘        └────────────────────────────────┘
 ```
 
@@ -52,20 +52,22 @@
 
 ### 核心组件
 
+> 状态图例：✅ 已落地（有测试）· 🟡 部分 · 🔲 未建成。职责列只写已落地能力，目标态见 ADR/ROADMAP。
+
 | 组件 | 路径 | 状态 | 职责 |
 |------|------|------|------|
 | **agent24d**（Rust daemon） | `rust/apps/agent24d` | ✅ | v1 REST+WS 核心运行时；桌面默认后端 |
-| **agent24-cli / TUI** | `rust/apps/agent24-cli` | ✅ CLI · 🔲 TUI | Attached/Standalone 两模式；TUI（ratatui）headless 运维 |
+| **agent24-cli / TUI** | `rust/apps/agent24-cli` | ✅ CLI · ✅ TUI 最小版 · 🔲 chat | Attached/Standalone；TUI（ratatui）runs/事件流/审批队列，headless 运维 |
 | **agent24-core** | `rust/crates/agent24-core` | ✅ | 稳定领域模型（Session/Run/Task/ToolCall/Approval/Event/Usage…），零框架依赖 |
 | **agent24-agent** | `rust/crates/agent24-agent` | ✅ | Agent Loop：上下文 → 调模型 → 解析 ToolCall → 权限 → 执行 → 续 |
-| **agent24-models** | `rust/crates/agent24-models` | ✅ | Model Gateway + 三级路由（本地小模型 / API / 结构化输出） |
+| **agent24-models** | `rust/crates/agent24-models` | ✅ | Model Gateway + 三级路由（本地小模型 / 远程 API / 自训领域 LoRA；敏感任务强制本地或 LoRA，数据不出设备） |
 | **agent24-scheduler** | `rust/crates/agent24-scheduler` | ✅ | cron 式日常工作流调度器 |
 | **agent24-store / memory / policy** | `rust/crates/agent24-{store,memory,policy}` | ✅ | 持久化 / 分层记忆 / 权限审批 |
 | **agent24-sin90 (+store)** | `rust/crates/agent24-sin90*` | ✅ | 内置 Personal-OS 领域模块（独立 `sin90.db`） |
 | **api-client**（生成物） | `packages/api-client` | ✅ | openapi + events schema → TS SDK（CI 校验零漂移） |
 | **node-daemon**（参考实现） | `packages/node-daemon` | ✅ | v1 协议 mock/参考；TS CapabilityModule 承载 |
-| **desktop**（Electron 壳） | `apps/desktop` | ✅ | spawn agent24d + 端口/token/托盘/更新/preload；React UI |
-| **agent24-worker → Python ML Worker** | `rust/crates/agent24-worker` | ✅ 契约/客户端 · 🔲 Python 侧 | Rust 侧 wire 契约 + HTTP 客户端（embed/transcribe/health）；Python 服务（MLX/Whisper/LoRA）规划 |
+| **desktop**（Electron 壳） | `apps/desktop` | ✅ | spawn agent24d + 端口/token/托盘/preload；React UI |
+| **agent24-worker → Python ML Worker** | `rust/crates/agent24-worker` | ✅ 契约/客户端 · 🔲 Python 侧 | Rust 侧 wire 契约 + HTTP 客户端（embed/transcribe/health）；Python 服务 `agent24-ml-worker`（Embedding/Whisper/图像/LoRA）规划 |
 
 ### 能力模块开发（TS CapabilityModule，由 `node-daemon` 承载）
 
@@ -115,7 +117,7 @@ cd rust && cargo build -p agent24d -p agent24-cli
 ## 文档
 
 - [工作站规划](docs/WORKSTATION_PLAN.md) — oMLX API 调研、64GB Mac 模型清单、能力 TODO
-- [决策日志](docs/decision.md) — ADR-001 ~ ADR-025
+- [决策日志](docs/decision.md) — ADR-001 ~ ADR-027
 
 ## 参考实现
 
