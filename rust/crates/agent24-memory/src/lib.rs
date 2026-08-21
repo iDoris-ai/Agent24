@@ -8,6 +8,7 @@
 //!   threshold-triggered LLM-summary compaction, so an unbounded chat stays a
 //!   bounded prompt.
 
+pub mod event;
 pub mod session;
 
 use std::path::Path;
@@ -76,6 +77,12 @@ impl KvStore {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
+    }
+
+    /// An [`event::EventLog`] over the SAME database — MD-2's append-only
+    /// episodic authority shares the KV store's pool (one file, one tx domain).
+    pub fn events(&self) -> event::EventLog {
+        event::EventLog::new(self.pool.clone())
     }
 
     /// Upsert a raw JSON value.
