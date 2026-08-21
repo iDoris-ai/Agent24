@@ -7,7 +7,9 @@
 CREATE TABLE mem_events (
     seq           INTEGER PRIMARY KEY AUTOINCREMENT,
     id            TEXT NOT NULL UNIQUE,
-    scope_owner   TEXT NOT NULL,
+    -- CHECK, not just NOT NULL: an empty-string owner is still "unowned memory"
+    -- and must be rejected too (governance — review #114 Low).
+    scope_owner   TEXT NOT NULL CHECK(scope_owner <> ''),
     scope_session TEXT,
     scope         TEXT NOT NULL,            -- JSON: full Scope
     kind          TEXT NOT NULL,

@@ -4,7 +4,10 @@
 //! [`EventLog`] is the source of truth that the condensers (MD-1) and future
 //! projections (FTS/vector/KG) are VIEWS over: it is never rewritten, `id` is
 //! the client idempotency key, and `seq` is the monotonic total order used for
-//! scans and projection checkpoints. Every event carries a mandatory
+//! scans and projection checkpoints. `seq` is monotonic but may be SPARSE: an
+//! idempotent re-append burns an AUTOINCREMENT value before the `ON CONFLICT`
+//! resolves, so gaps are normal and `MAX(seq)` is NOT a row count — only its
+//! ordering is relied on. Every event carries a mandatory
 //! [`Scope::owner`] (governance: no unowned memory) and an [`Origin`] (trust
 //! provenance the write-gate keys on in MD-4).
 
@@ -17,6 +20,10 @@ use sqlx::{Row, SqlitePool};
 use crate::Result;
 
 pub type EventId = String;
+
+/// Hard cap on a single scan when the caller gives no `limit` — a scan must
+/// never fetch an unbounded set (review #114 B3).
+const DEFAULT_SCAN_LIMIT: i64 = 50_000;
 
 /// Where a memory belongs. `owner` is MANDATORY; the rest narrow it. Used for
 /// isolation and (MD-4+) capability-scoped access.
@@ -57,6 +64,11 @@ pub enum Trust {
     WebFetch,
     Model,
     System,
+    /// An UNRECOGNIZED on-disk trust value — the STRICTEST tier: the write-gate
+    /// (MD-4) must never auto-persist it. We land here rather than silently
+    /// downgrading an unknown to `Model`, which on a read→write roundtrip would
+    /// launder e.g. `"untrusted_web_scrape"` into `"model"` (review #114 Low).
+    Unknown,
 }
 
 impl Trust {
@@ -67,6 +79,7 @@ impl Trust {
             Trust::WebFetch => "web_fetch",
             Trust::Model => "model",
             Trust::System => "system",
+            Trust::Unknown => "unknown",
         }
     }
     fn parse(s: &str) -> Trust {
@@ -74,8 +87,9 @@ impl Trust {
             "user_said" => Trust::UserSaid,
             "tool_output" => Trust::ToolOutput,
             "web_fetch" => Trust::WebFetch,
+            "model" => Trust::Model,
             "system" => Trust::System,
-            _ => Trust::Model,
+            _ => Trust::Unknown,
         }
     }
 }
@@ -128,11 +142,15 @@ pub struct StoredEvent {
     pub event: MemEvent,
 }
 
-/// Scan filter. `after_seq` drives incremental projection (fold only what a
-/// checkpoint hasn't seen).
-#[derive(Debug, Clone, Default)]
+/// Scan filter. `owner` is REQUIRED — a scan is ALWAYS owner-scoped, matching
+/// the mandatory-owner write side. There is deliberately no `Default`: the
+/// natural incremental-scan shape `{ after_seq: Some(cp), ..Default::default() }`
+/// would otherwise silently cross every tenant (review #114 B3). An admin path
+/// that genuinely needs all owners can be added explicitly when a consumer needs
+/// it. `after_seq` drives incremental projection.
+#[derive(Debug, Clone)]
 pub struct EventQuery {
-    pub owner: Option<String>,
+    pub owner: String,
     pub session: Option<String>,
     pub after_seq: Option<i64>,
     pub limit: Option<i64>,
@@ -141,8 +159,10 @@ pub struct EventQuery {
 impl EventQuery {
     pub fn owner(owner: impl Into<String>) -> Self {
         Self {
-            owner: Some(owner.into()),
-            ..Default::default()
+            owner: owner.into(),
+            session: None,
+            after_seq: None,
+            limit: None,
         }
     }
     pub fn after(mut self, seq: i64) -> Self {
@@ -151,6 +171,10 @@ impl EventQuery {
     }
     pub fn session(mut self, s: impl Into<String>) -> Self {
         self.session = Some(s.into());
+        self
+    }
+    pub fn limit(mut self, n: i64) -> Self {
+        self.limit = Some(n);
         self
     }
 }
@@ -163,15 +187,23 @@ pub trait EventStore: Send + Sync {
     async fn append(&self, e: &MemEvent) -> Result<i64>;
     /// Events in seq order under a filter.
     async fn scan(&self, q: &EventQuery) -> Result<Vec<StoredEvent>>;
-    /// Record a named projection checkpoint at the current max seq; returns it.
+    /// Record that a named projection has folded events **up to `up_to_seq`**.
+    /// Forward-only (a lower seq is a no-op), so an out-of-order or retried
+    /// consumer can never REGRESS a checkpoint. This is the seq a consumer
+    /// actually processed — NOT the global max — so a paginated or slow consumer
+    /// never skips the events it hasn't folded yet (review #114 B1).
+    async fn checkpoint_at(&self, name: &str, up_to_seq: i64) -> Result<()>;
+    /// Convenience: mark a named checkpoint as "everything so far is folded"
+    /// (records the current global max seq). Returns that seq. Use `checkpoint_at`
+    /// when a consumer folds only a bounded page.
     async fn checkpoint(&self, name: &str) -> Result<i64>;
     /// The seq a named checkpoint last reached, if any.
     async fn checkpoint_seq(&self, name: &str) -> Result<Option<i64>>;
 }
 
 /// SQLite-backed event log. Shares the memory DB pool (see
-/// [`crate::KvStore::events`]) so the log and KV live in one file/transaction
-/// domain.
+/// [`crate::KvStore::events`]) so the log and KV live in the same DB file — but
+/// NOT (yet) the same transaction (that cross-store seam is MD-2b).
 #[derive(Clone)]
 pub struct EventLog {
     pool: SqlitePool,
@@ -235,48 +267,68 @@ impl EventStore for EventLog {
         if let Some(row) = inserted {
             return Ok(row.get("seq"));
         }
-        // Already present — return its seq (idempotent replay).
-        let seq: i64 = sqlx::query("SELECT seq FROM mem_events WHERE id = ?")
+        // The id already exists. This is an idempotent replay ONLY if the stored
+        // event MATCHES (same owner AND same payload). A cross-tenant id collision
+        // (two sessions each minting "msg-1") or a same-owner payload change must
+        // NOT be silently swallowed and handed the other event's seq — that would
+        // fold one tenant's write into another's row on a layer whose whole point
+        // is scope isolation (review #114 B2). `id` is a client-stable key that is
+        // GLOBAL-unique in this table, so a collision needs no malice.
+        let existing = sqlx::query("SELECT seq, scope_owner, payload FROM mem_events WHERE id = ?")
             .bind(&e.id)
             .fetch_one(&self.pool)
-            .await?
-            .get("seq");
-        Ok(seq)
+            .await?;
+        let stored_owner: String = existing.get("scope_owner");
+        let stored_payload: String = existing.get("payload");
+        if stored_owner != e.scope.owner || stored_payload != payload {
+            return Err(crate::MemoryError::Conflict(format!(
+                "event id {} already exists with a different owner/payload — refusing to alias it",
+                e.id
+            )));
+        }
+        Ok(existing.get("seq"))
     }
 
     async fn scan(&self, q: &EventQuery) -> Result<Vec<StoredEvent>> {
+        // owner is ALWAYS bound (a scan is always owner-scoped); an explicit or
+        // default LIMIT is ALWAYS applied so a scan cannot fetch an unbounded set.
         let mut sql = String::from(
             "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at
-             FROM mem_events WHERE 1=1",
+             FROM mem_events WHERE scope_owner = ?",
         );
-        if q.owner.is_some() {
-            sql.push_str(" AND scope_owner = ?");
-        }
         if q.session.is_some() {
             sql.push_str(" AND scope_session = ?");
         }
         if q.after_seq.is_some() {
             sql.push_str(" AND seq > ?");
         }
-        sql.push_str(" ORDER BY seq ASC");
-        if q.limit.is_some() {
-            sql.push_str(" LIMIT ?");
-        }
-        let mut query = sqlx::query(&sql);
-        if let Some(o) = &q.owner {
-            query = query.bind(o);
-        }
+        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        let mut query = sqlx::query(&sql).bind(&q.owner);
         if let Some(s) = &q.session {
             query = query.bind(s);
         }
         if let Some(a) = q.after_seq {
             query = query.bind(a);
         }
-        if let Some(l) = q.limit {
-            query = query.bind(l);
-        }
+        query = query.bind(q.limit.unwrap_or(DEFAULT_SCAN_LIMIT));
         let rows = query.fetch_all(&self.pool).await?;
         rows.iter().map(Self::row_to_stored).collect()
+    }
+
+    async fn checkpoint_at(&self, name: &str, up_to_seq: i64) -> Result<()> {
+        // Forward-only: the guarded UPDATE only advances the checkpoint, so a
+        // retried or out-of-order consumer can never regress it.
+        sqlx::query(
+            "INSERT INTO mem_checkpoints (name, up_to_seq, at) VALUES (?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET up_to_seq = excluded.up_to_seq, at = excluded.at
+                 WHERE excluded.up_to_seq > mem_checkpoints.up_to_seq",
+        )
+        .bind(name)
+        .bind(up_to_seq)
+        .bind(now_iso8601())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn checkpoint(&self, name: &str) -> Result<i64> {
@@ -284,15 +336,7 @@ impl EventStore for EventLog {
             .fetch_one(&self.pool)
             .await?
             .get("m");
-        sqlx::query(
-            "INSERT INTO mem_checkpoints (name, up_to_seq, at) VALUES (?, ?, ?)
-             ON CONFLICT(name) DO UPDATE SET up_to_seq = excluded.up_to_seq, at = excluded.at",
-        )
-        .bind(name)
-        .bind(max)
-        .bind(now_iso8601())
-        .execute(&self.pool)
-        .await?;
+        self.checkpoint_at(name, max).await?;
         Ok(max)
     }
 
@@ -409,5 +453,104 @@ mod tests {
         assert_eq!(got.causal, e.causal);
         assert_eq!(got.origin.trust, Trust::WebFetch);
         assert_eq!(got.scope.session.as_deref(), Some("s"));
+    }
+
+    // ---- review #114 fixes ----
+
+    #[tokio::test]
+    async fn checkpoint_at_records_what_was_folded_not_global_max() {
+        // B1: a consumer folds a bounded PAGE (seq 1..2) while more events exist.
+        // A global-MAX checkpoint would skip the unfolded ones forever.
+        let log = log().await;
+        for id in ["a", "b", "c", "d", "e"] {
+            log.append(&ev(id, "u1", None, "msg")).await.unwrap();
+        }
+        // Fold only up to seq 2.
+        log.checkpoint_at("proj", 2).await.unwrap();
+        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), Some(2));
+        // The next incremental scan still sees c/d/e — nothing was skipped.
+        let rest = log.scan(&EventQuery::owner("u1").after(2)).await.unwrap();
+        assert_eq!(rest.len(), 3);
+        assert_eq!(rest[0].event.id, "c");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_at_is_forward_only() {
+        let log = log().await;
+        log.checkpoint_at("proj", 10).await.unwrap();
+        log.checkpoint_at("proj", 3).await.unwrap(); // lower → no-op
+        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), Some(10));
+        log.checkpoint_at("proj", 20).await.unwrap(); // higher → advances
+        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), Some(20));
+    }
+
+    #[tokio::test]
+    async fn append_id_collision_across_owners_is_a_conflict_not_a_swallow() {
+        // B2: alice writes "evt-1"; bob writing the SAME id must NOT be swallowed
+        // into alice's row and handed her seq.
+        let log = log().await;
+        log.append(&ev("evt-1", "alice", None, "note"))
+            .await
+            .unwrap();
+        let err = log
+            .append(&ev("evt-1", "bob", None, "payment"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::MemoryError::Conflict(_)), "{err}");
+        // bob's write did not land; alice's row is untouched.
+        assert_eq!(log.scan(&EventQuery::owner("bob")).await.unwrap().len(), 0);
+        assert_eq!(
+            log.scan(&EventQuery::owner("alice")).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn append_same_id_same_owner_different_payload_is_a_conflict() {
+        let log = log().await;
+        let mut a = ev("evt-1", "u1", None, "note");
+        a.body = serde_json::json!({"v": 1});
+        log.append(&a).await.unwrap();
+        let mut b = ev("evt-1", "u1", None, "note");
+        b.body = serde_json::json!({"v": 2}); // same id+owner, different payload
+        assert!(matches!(
+            log.append(&b).await.unwrap_err(),
+            crate::MemoryError::Conflict(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn append_true_replay_same_event_returns_same_seq() {
+        let log = log().await;
+        let e = ev("evt-1", "u1", None, "note");
+        let s1 = log.append(&e).await.unwrap();
+        let s2 = log.append(&e).await.unwrap(); // identical → idempotent
+        assert_eq!(s1, s2);
+        assert_eq!(log.scan(&EventQuery::owner("u1")).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_owner_is_rejected() {
+        // CHECK(scope_owner <> '') — "" is unowned memory, not a valid owner.
+        let log = log().await;
+        let err = log.append(&ev("x", "", None, "note")).await.unwrap_err();
+        assert!(matches!(err, crate::MemoryError::Sqlx(_)), "{err}");
+    }
+
+    #[test]
+    fn unknown_trust_maps_to_strictest_not_model() {
+        // An unrecognized on-disk trust must not launder into "model".
+        assert_eq!(Trust::parse("untrusted_web_scrape"), Trust::Unknown);
+        assert_eq!(Trust::Unknown.as_str(), "unknown");
+        for t in [
+            Trust::UserSaid,
+            Trust::ToolOutput,
+            Trust::WebFetch,
+            Trust::Model,
+            Trust::System,
+            Trust::Unknown,
+        ] {
+            assert_eq!(Trust::parse(t.as_str()), t, "roundtrip {t:?}");
+        }
     }
 }

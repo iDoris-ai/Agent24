@@ -34,6 +34,8 @@ pub enum MemoryError {
     Io(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("summarizer: {0}")]
     Summarizer(String),
 }
@@ -79,8 +81,11 @@ impl KvStore {
         Ok(Self { pool })
     }
 
-    /// An [`event::EventLog`] over the SAME database — MD-2's append-only
-    /// episodic authority shares the KV store's pool (one file, one tx domain).
+    /// An [`event::EventLog`] over the SAME database file — MD-2's append-only
+    /// episodic authority shares the KV store's pool. (Same file, NOT the same
+    /// transaction: `EventLog` runs its own statements on the pool, so a caller
+    /// cannot yet atomically commit a KV write and an append together — that
+    /// cross-store transaction seam is MD-2b work.)
     pub fn events(&self) -> event::EventLog {
         event::EventLog::new(self.pool.clone())
     }
