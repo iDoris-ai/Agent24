@@ -35,7 +35,20 @@ pub struct ContextFragment {
     pub reason: &'static str,
 }
 
-/// A bounded view of a history.
+/// A best-effort-bounded view of a history.
+///
+/// The view TARGETS `budget_tokens` but is deliberately NOT hard-capped — two
+/// documented overruns are allowed (review #113 B4):
+/// 1. **Tool-safety.** An assistant `tool_calls` turn and the `tool_result`
+///    answering it are indivisible, so the newest such pair is kept whole even
+///    when it alone exceeds the budget (see [`tail_start`]).
+/// 2. **Summary overhead.** A summary fragment ([`LlmSummaryCondenser`]) sits ON
+///    TOP of the verbatim tail. The condenser RESERVES budget for it, but an
+///    oversized summarizer can still push the total past `budget_tokens`.
+///
+/// So a caller wiring this into a real context window must treat `budget_tokens`
+/// as a target, read the honest [`ContextProjection::tokens_estimated`], and not
+/// assume a hard cap.
 ///
 /// **No-loss invariant** (checked by [`ContextProjection::covers`] and the
 /// tests): every source index `0..history.len()` appears EXACTLY once across
@@ -81,6 +94,11 @@ pub trait TokenEstimator: Send + Sync {
 /// A deterministic ~4-chars-per-token heuristic over role + content + tool-call
 /// name/args. No dependency, reproducible — good enough for budgeting and for
 /// the spike's regression corpus; a real tokenizer is a drop-in later.
+///
+/// TODO(MD-2b Low#3): this is a one-sided UNDER-estimate — it ignores
+/// `tool_call_id` and per-message framing overhead, so it never over-counts.
+/// Combined with the best-effort summary overhead that skews budgets small; a
+/// real tokenizer with per-message framing closes it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CharTokenEstimator;
 
@@ -101,9 +119,10 @@ impl TokenEstimator for CharTokenEstimator {
     }
 }
 
-/// Turns an unbounded history into a bounded [`ContextProjection`] under a token
-/// budget. MUST NOT mutate or drop the input — it returns a VIEW; the source
-/// stays authoritative.
+/// Turns an unbounded history into a [`ContextProjection`] that TARGETS a token
+/// budget — best-effort, not a hard cap (see [`ContextProjection`] for the two
+/// documented overruns). MUST NOT mutate or drop the input — it returns a VIEW;
+/// the source stays authoritative.
 #[async_trait]
 pub trait Condenser: Send + Sync {
     async fn condense(
@@ -210,6 +229,11 @@ impl<E: TokenEstimator> Condenser for RecentWindowCondenser<E> {
 /// `source` carries every folded head index, so the no-loss invariant holds and
 /// `folded` stays empty — the head is REPRESENTED, not lost. With nothing to
 /// summarize it degrades to a pure recent window.
+///
+/// TODO(MD-2b Low#1): there is no `pinned` seam for a system prompt that must
+/// always survive condensing. Before MD-2b wires this to a real context window,
+/// either add one or make explicit that pinned instructions are the caller's
+/// responsibility (reviewer's Low #1).
 pub struct LlmSummaryCondenser<'a, E = CharTokenEstimator> {
     pub summarizer: &'a dyn Summarizer,
     pub est: E,
@@ -228,9 +252,21 @@ impl<E: TokenEstimator> Condenser for LlmSummaryCondenser<'_, E> {
         history: &[Msg],
         budget_tokens: usize,
     ) -> std::result::Result<ContextProjection, String> {
-        let start = tail_start(history, &self.est, budget_tokens);
+        // Reserve part of the budget for the summary fragment so the verbatim
+        // tail does not eat the whole window and leave the summary as pure
+        // overrun (review #113 B4). A summary COMPRESSES the head, so a quarter
+        // of the budget is a generous target. This is a RESERVE, not a cap: an
+        // oversized summarizer can still overrun, which is exactly why the
+        // contract is best-effort (see `ContextProjection` docs) and is pinned by
+        // `llm_summary_reserve_is_best_effort_not_hard_bounded`.
+        let reserve = budget_tokens / 4;
+        let tail_budget = budget_tokens.saturating_sub(reserve);
+        let start = tail_start(history, &self.est, tail_budget);
         let mut fragments = Vec::with_capacity(history.len() - start + 1);
         if start > 0 {
+            // TODO(MD-2b Low#2): thread the prior running summary in here instead
+            // of `None` so re-condensing composes incrementally rather than
+            // re-summarizing the whole head each time (reviewer's Low #2).
             let summary = self.summarizer.summarize(None, &history[0..start]).await?;
             fragments.push(ContextFragment {
                 msg: Msg {
@@ -287,6 +323,22 @@ mod tests {
         ) -> std::result::Result<String, String> {
             *self.calls.lock().unwrap() += 1;
             Ok(format!("folded {} msgs", messages.len()))
+        }
+    }
+
+    /// A realistic-magnitude summarizer. `MockSummarizer` returns a handful of
+    /// chars ("folded N msgs"), far too small to ever trip the budget — so it
+    /// cannot pin the best-effort contract. This one returns a summary the size
+    /// of a real LLM compaction.
+    struct BigSummarizer;
+    #[async_trait]
+    impl Summarizer for BigSummarizer {
+        async fn summarize(
+            &self,
+            _prior: Option<&str>,
+            _messages: &[Msg],
+        ) -> std::result::Result<String, String> {
+            Ok("summary sentence. ".repeat(60)) // ~1080 chars ≈ 270 tokens
         }
     }
 
@@ -452,6 +504,51 @@ mod tests {
                 assert!(b.covers(n), "summary n={n} budget={budget}: {b:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn llm_summary_reserve_is_best_effort_not_hard_bounded() {
+        // B4: the summary is overhead ON TOP of the verbatim tail. Reservation
+        // shrinks the tail so it does not eat the whole window, but a big
+        // summarizer still overruns — the contract is best-effort. This test
+        // pins that so a reader of the "budget" docs is never misled into
+        // assuming a hard cap (the whole B4 finding).
+        let h = history(40);
+        let sum = BigSummarizer;
+        let c = LlmSummaryCondenser::new(&sum, CharTokenEstimator);
+        let budget = 40usize;
+        let p = c.condense(&h, budget).await.unwrap();
+
+        // No loss, whatever the budget math does.
+        assert!(p.covers(h.len()), "no-loss: {p:?}");
+        assert_eq!(p.fragments[0].reason, "summary");
+
+        // Reservation worked: the VERBATIM TAIL alone respects the reduced
+        // (reserved) budget and did NOT consume the whole window. (The
+        // single-newest-message floor is the only allowed exception.)
+        let recent: Vec<Msg> = p
+            .fragments
+            .iter()
+            .filter(|f| f.reason == "recent")
+            .map(|f| f.msg.clone())
+            .collect();
+        let tail_tokens = CharTokenEstimator.estimate(&recent);
+        let reserve = budget / 4;
+        assert!(
+            tail_tokens <= budget - reserve || recent.len() == 1,
+            "tail ({tail_tokens}) should respect the reserved budget {}",
+            budget - reserve
+        );
+
+        // But the TOTAL exceeds the budget because the summary is bigger than
+        // its reserve — the documented best-effort overrun. If this ever becomes
+        // <= budget, the "not a hard cap" caveat in the docs is stale and should
+        // be revisited.
+        assert!(
+            p.tokens_estimated > budget,
+            "a big summarizer must overrun to prove best-effort, got {}",
+            p.tokens_estimated
+        );
     }
 
     #[tokio::test]
