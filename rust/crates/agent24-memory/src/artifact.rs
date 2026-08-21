@@ -123,6 +123,28 @@ impl ArtifactCas {
         Self { pool }
     }
 
+    /// Every current artifact's `(path, db_checksum)` under `owner`, sorted by
+    /// path. This is the DB-side lineage MD-2c reconciliation compares against the
+    /// on-disk lineage — an ADDITIVE inherent method, not a change to the frozen
+    /// [`ArtifactStore`] trait (SPEC §2.1).
+    pub async fn tracked_paths(&self, owner: &str) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT path, db_checksum FROM mem_artifacts WHERE scope_owner = ? ORDER BY path ASC",
+        )
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("path"),
+                    r.get::<String, _>("db_checksum"),
+                )
+            })
+            .collect())
+    }
+
     fn row_to_artifact(row: &sqlx::sqlite::SqliteRow) -> Result<Artifact> {
         let scope: Scope = serde_json::from_str(&row.get::<String, _>("scope"))?;
         Ok(Artifact {
