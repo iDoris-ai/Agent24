@@ -11,6 +11,7 @@
 pub mod artifact;
 pub mod condenser;
 pub mod event;
+pub mod replay;
 pub mod session;
 
 use std::path::Path;
