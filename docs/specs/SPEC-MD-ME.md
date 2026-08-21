@@ -6,7 +6,7 @@
 >
 > **状态**:🟢 MD-1 spike 已交付并冻结签名(见 §2.1);MD-2a/2b 权威层已合并。MD-1c 后向量实现/SQLite DDL 仍按各自 MD-x 落。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
 >
-> **进度**:✅ MD-1a 条件器 · ✅ MD-1b 崩溃重放 · ✅ MD-1c LongMemEval 装载 · ✅ MD-2a EventStore · ✅ MD-2b ArtifactStore · ✅ MD-2c 双谱系对账 ·（下一步:MD-3 AssertionStore 双时相+Retriever)。
+> **进度**:✅ MD-1(a/b/c 全交付,签名冻结)· ✅ MD-2(a EventStore / b ArtifactStore / c 对账)· ✅ MD-3a AssertionStore 双时相 ·（下一步:MD-3b Retriever(FTS)→ MD-4 写门)。
 
 ---
 
@@ -147,7 +147,7 @@ trait ProjectionJob{ async fn run_from(&self, ckpt: CheckpointId)->R<ProjectionO
 |---|---|---|---|---|
 | **MD-1** ✅ | **评测/恢复 spike**:两个 `Condenser`(确定性 recent-window + 保留尾部 summary,发 `Condensation` view-delta,**不删原始**);建可回放语料 + benchmark 装载 | D1 | 崩溃/重启/幂等重放;语料测 token 预算/关键事实保留/因果/投毒排除/跨 scope 泄漏;LongMemEval 装载跑通 | ✅ 已交付(MD-1a #113 + MD-1b #116 + MD-1c):session 测试全绿 + 上述全过 + **签名已冻结(§2.1)** |
 | **MD-2** ✅ | **EventStore + ArtifactStore**(权威层):事件表 + markdown-CAS + 双谱系对账(checksum 移动检测) | MD-1 | 事件 append/scan/checkpoint 幂等;CAS 拒陈旧写;外部改文件→对账不静默删;rebuild 从事件重建投影 | ✅ 2a EventStore(#114)· ✅ 2b ArtifactStore(#115)· ✅ 2c 对账(`reconcile` 四类状态 + checksum 移动检测 + **无静默删** + 确定性 + path-safe `observe_dir`);rebuild-from-events 见 `replay`(MD-1b) |
-| **MD-3** | **AssertionStore 双时相 + Retriever(FTS)**:断言表两区间 + 证据链 + `qualified` 门;FTS 检索 + scope 隔离 | MD-2 | 写-查-失效-`as_of(valid,recorded)` 回看;矛盾=新版本非删;候选不进默认召回;scope 泄漏 0 | 双时相四象限查询正确 + 跨 scope 零泄漏 |
+| **MD-3** 🟡 | **AssertionStore 双时相 + Retriever(FTS)**:断言表两区间 + 证据链 + `qualified` 门;FTS 检索 + scope 隔离 | MD-2 | 写-查-失效-`as_of(valid,recorded)` 回看;矛盾=新版本非删;候选不进默认召回;scope 泄漏 0 | ✅ **3a AssertionStore**(`assert`/`retract`/`beliefs_as_of` + 双时相四象限 + 矛盾 supersede 非删 + qualified 门 + 跨 scope 零泄漏,migration 0004);🔜 **3b Retriever(FTS)** 未做 |
 | **MD-4** | **MemoryWriter 写门(治理)**:candidate→闭 schema 校验→确定性策略→approve/commit;强制 owner;origin/trust;审计 | MD-3 | 恶意 ToolOutput/WebFetch 默认不落持久;UserSaid+显式 remember 才自动 commit;dry-run/review;bulk rollback | 投毒语料:未确认候选不进召回;审计可回放 |
 | **MD-5** | **Consolidator 巩固循环**:后台读未巩固事件→写 insight→更新 persona;importance/consolidated 标记 | MD-3 | 巩固幂等;importance 排序;增量==全量重跑 | LongMemEval/LoCoMo 相对纯检索有提升(对照) |
 | **MD-6** | **Retriever 本地向量(可选)**:`OmlxEmbedder` + SQLite 向量 + 双索引迁移 + FTS 兜底;`Embedding{model_id,revision,dims}` | MD-3, D4b | 换模型触发 reindex 状态机;可续重嵌;混版本行为 | 语义召回优于纯 FTS 对照 + reindex 不丢 |
