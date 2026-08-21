@@ -41,6 +41,11 @@ pub enum MemoryError {
     Conflict(String),
     #[error("summarizer: {0}")]
     Summarizer(String),
+    /// A stored event could not be decoded during replay. Carries the offending
+    /// event's id + seq so one bad row is diagnosable, not an anonymous failure
+    /// of a whole owner's history (review #116 B2).
+    #[error("replay: {0}")]
+    Replay(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
