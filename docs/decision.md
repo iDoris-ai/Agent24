@@ -1074,13 +1074,31 @@ Sin90 是 Agent24 **默认搭载**的 Personal-OS，但它应可**关闭 / 清�
 
 ### 决策
 
-边界线**明确画在 `agent24d`**：内核（所有 `agent24-*` 内核 crate + agent24d 的通用部分）**领域无关**；领域 OS（Sin90/Cos72）活在**自己的 crate + 自己的 DB + 自己的路由命名空间 + 自己的 event `module` 名**。把 agent24d 里的硬编码胶水换成通用缝：
+边界线**明确画在 `agent24d`**：内核（所有 `agent24-*` 内核 crate + agent24d 的通用部分）**领域无关**；领域 OS（Sin90/Cos72）活在自己的实现 + 自己的 DB + 自己的路由命名空间 + 自己的 event `module` 名。换 OS 必须是**配置 + 安装脚本驱动的一次性动作，不改内核源码、不重编 agent24d**。
 
-- 引入 **`DomainModule` trait**：每个领域 OS 实现——`name()`、`open_store()/migrations`、`routes()`（自己的命名空间）、`event_module()`，并**经 `KernelCtx` trait 访问内核能力**（model 路由 / scheduler / policy 审批），而非反向依赖内核。
-- agent24d 从**配置**加载一个 **模块注册表**，取代 `AppState.sin90` 具体字段与硬编码路由。
-- **Sin90 = 默认注册**的一个 `DomainModule`；配置里可**禁用**它、或**替换**为 Cos72。
+#### 1. 领域 OS 是一个「可安装包」，不只是 crate + 配置
 
-于是三种玩法都成立：**用默认 Sin90** / **基于 Sin90 定制** / **清掉 Sin90 载入 Cos72**。
+一个领域 OS = **清单 + 实现 + 安装生命周期 + 独立目录**，四件套：
+
+- **清单 `domain-os.yml`**：`name` / `version` / 路由命名空间(`/api/v1/<name>/*`) / event `module` 名 / **资源要求**(需要哪些本地模型、哪些 API/密钥、哪些依赖) / **请求的内核能力**(model 路由 / scheduler / policy——经 `KernelCtx`) / UI 入口(给外壳)。
+- **实现**（二选一，同一清单统一描述）：
+  - **进程内 Rust crate**（第一方，如 Sin90/Cos72）：实现 **`DomainModule` trait**——`name() / open_store()+migrations / routes() / event_module()`，经 **`KernelCtx` trait** 单向用内核能力。
+  - **进程外 Capability Provider**（第三方/多语言，ADR-026 §3）：经协议/MCP 暴露同一套契约，`agent24d` 只代理，**装新 OS 不需重编内核**。
+- **安装脚本 / 生命周期钩子**：`install`(校验+按需下载模型、检查 API/密钥/依赖、建独立目录、跑迁移) · `activate` · `deactivate` · `uninstall`(保留或清除独立目录)。
+- **独立数据目录 `~/.agent24/os/<name>/`**：装该 OS 的 DB + 资产，于是 `uninstall` = 干净地删这个目录。
+
+#### 2. 配置驱动的激活 + 干净的一次性换装
+
+- 配置里 `active_domain_os: sin90`（默认）。`agent24d` 启动：从注册表解析激活的 OS → 跑其 `install` 校验(模型/依赖到位否) → 经 `DomainModule` 缝挂载路由/store/事件。缺资源就**明确报缺什么**，不半死不活。
+- 换装是一条清晰的一次性流水（CLI）：`agent24 os install cos72`（校验+建目录+下模型）→ `agent24 os activate cos72`（翻配置 + 重启）→ 可选 `agent24 os uninstall sin90`（清 `~/.agent24/os/sin90/`）。Sin90 的数据目录不清就**可回退**。
+
+#### 3. 诚实的进程模型取舍（Rust 编译期现实）
+
+- **第一方进程内 OS**（我们自己写的 Sin90/Cos72）：都编进 `agent24d`，配置在启动时**选激活哪一个**——目标 OS 已编入就能**免重编换装**。
+- **全新第三方 OS**（未编入）：走**进程外 Provider**路线（ADR-026 的 Node Host/MCP/容器/远程），**完全不动 agent24d**。
+- 两条路由同一清单 + 同一 `DomainModule`/Provider 契约描述，对上层一致。
+
+于是三种玩法都成立且都是**干净、一次性、可回退**的动作：**用默认 Sin90** / **基于 Sin90 定制** / **`os install cos72 && os activate cos72` 清掉 Sin90 换 Cos72**。取代今天 `AppState.sin90` 具体字段 + 硬编码 `/sin90/*` 路由。
 
 ### 与记忆（ADR-028）的关系
 
