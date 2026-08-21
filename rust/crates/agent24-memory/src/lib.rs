@@ -9,6 +9,7 @@
 //!   bounded prompt.
 
 pub mod artifact;
+pub mod assertion;
 pub mod condenser;
 pub mod eval;
 pub mod event;
@@ -109,6 +110,12 @@ impl KvStore {
     /// CAS-versioned editable-content authority shares the KV store's pool.
     pub fn artifacts(&self) -> artifact::ArtifactCas {
         artifact::ArtifactCas::new(self.pool.clone())
+    }
+
+    /// An [`assertion::AssertionLedger`] over the SAME database file — MD-3a's
+    /// bi-temporal semantic authority shares the KV store's pool.
+    pub fn assertions(&self) -> assertion::AssertionLedger {
+        assertion::AssertionLedger::new(self.pool.clone())
     }
 
     /// Upsert a raw JSON value.
