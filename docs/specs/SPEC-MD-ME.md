@@ -135,7 +135,7 @@ trait ProjectionJob{ async fn run_from(&self, ckpt: CheckpointId)->R<ProjectionO
 
 **`replay`**(MD-1b):`replay_history(&EventLog, &EventQuery) -> Result<Replayed>`(分页到底,不砍最新)+ `replay_history_lenient(...) -> (Replayed, Vec<SkippedEvent>)`(坏行跳过并上报,带 id+seq)。`Replayed { messages, provenance: Vec<Provenance{event_id, trust}>, last_seq }`——`messages` 与 `provenance` 位置对齐、一趟产出,**trust 溯源随重放保留**(MD-4 写门可用)。owner-only 重放合并所有 session,要隔离传 `.session(s)`。
 
-**`eval`**(MD-1c):`parse_cases`/`load_cases_from_file`/`ingest_case`/`run_case` + `EvalOutcome`。LongMemEval 装载跑通;`answer_in_view` **按源下标精确判定**(答案 turn 的 flat 下标 ∈ `fragments[*].source`),**不用子串**——否则深答案是近期 turn 的子串会**高报**基线。近期窗口对深答案 `answer_in_view=false` 是**基线**(MD-3 retriever 要超越的数,宁低报不高报),`lossless` 恒真。**边界(诚实标注)**:投毒排除属 MD-4 写门,深召回属 MD-3;二者在 MD-1 只钉边界不实现。
+**`eval`**(MD-1c):`parse_cases`/`load_cases_from_file`/`ingest_case`/`run_case` + `EvalOutcome`。LongMemEval 装载跑通;`answer_in_view` **按答案 turn 的持久 event id 在重放 `provenance` 中定位下标、再判 ∈ `fragments[*].source`**——**不用子串**(否则子串重合会**高报**),也**不用 case 内 flat 下标**(`run_case` 重放整个 owner 历史,同 owner 多 case 会错位,故按 event id 定位,无「一 owner 一 case」前提)。近期窗口对深答案 `answer_in_view=false` 是**基线**(MD-3 retriever 要超越的数,宁低报不高报),`lossless` 恒真。**边界(诚实标注)**:投毒排除属 MD-4 写门,深召回属 MD-3;二者在 MD-1 只钉边界不实现。
 
 ---
 

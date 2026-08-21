@@ -79,21 +79,28 @@ impl LongMemEvalCase {
             .collect()
     }
 
-    /// The FLAT indices (across all sessions, in ingest order) of the
-    /// answer-bearing turns. [`ingest_case`] appends turns in exactly this
-    /// flattened `(session, turn)` order, and replay returns them in seq order,
-    /// so a turn's flat index equals its index in the condenser's history — which
-    /// is what [`crate::condenser::ContextFragment::source`] refers to. Judging
-    /// recall by these indices (not substring matching) is exact.
-    pub fn answer_turn_indices(&self) -> Vec<usize> {
-        self.haystack_sessions
-            .iter()
-            .flatten()
-            .enumerate()
-            .filter(|(_, t)| t.has_answer)
-            .map(|(i, _)| i)
-            .collect()
+    /// The `(session, turn)` positions of the answer-bearing turns. These map to
+    /// stable event ids ([`event_id_for`]) so [`run_case`] can find the answer's
+    /// index in the REPLAYED history by event id — which works even when the owner
+    /// holds other cases too, unlike a within-case flat index (review #117 round
+    /// 2: `run_case` replays the whole owner, not one case).
+    pub fn answer_turn_positions(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (si, session) in self.haystack_sessions.iter().enumerate() {
+            for (ti, turn) in session.iter().enumerate() {
+                if turn.has_answer {
+                    out.push((si, ti));
+                }
+            }
+        }
+        out
     }
+}
+
+/// The durable event id [`ingest_case`] mints for a turn — position-stable, so
+/// [`run_case`] can reconstruct an answer turn's id and locate it in replay.
+fn event_id_for(question_id: &str, si: usize, ti: usize) -> String {
+    format!("lme-{question_id}-{si}-{ti}")
 }
 
 /// Parse a LongMemEval JSON array of cases.
@@ -153,7 +160,7 @@ pub async fn ingest_case(log: &EventLog, owner: &str, case: &LongMemEvalCase) ->
                 source: "longmemeval".to_owned(),
                 trust: trust_for(&turn.role),
             };
-            let id = format!("lme-{}-{si}-{ti}", case.question_id);
+            let id = event_id_for(&case.question_id, si, ti);
             log.append(&message_event(id, scope, &msg, origin)?).await?;
             count += 1;
         }
@@ -194,18 +201,29 @@ pub async fn run_case(
 
     // Judge recall by SOURCE INDEX, not substring: a deep answer that happens to
     // be a substring of a recent turn must NOT count as recalled, or the baseline
-    // this PR freezes would OVER-report and hide a future regression (review #117
-    // B1). `fragments[*].source` are the history indices the model actually sees;
-    // `answer_turn_indices()` are the answer turns' indices in that same history.
+    // this PR freezes would OVER-report (review #117 B1). `fragments[*].source`
+    // are the history indices the model actually sees.
     let in_view: std::collections::HashSet<usize> = projection
         .fragments
         .iter()
         .flat_map(|f| f.source.iter().copied())
         .collect();
-    let answer_in_view = case
-        .answer_turn_indices()
+    // Locate the answer turns in the REPLAYED history by their durable event id,
+    // NOT by a within-case flat index — `replayed` is the WHOLE owner's history,
+    // which may hold other cases, so a per-case index would be wrong (review #117
+    // round 2). `provenance` is positionally aligned with `messages`, so its
+    // index IS the condenser's `source` index.
+    let answer_ids: std::collections::HashSet<String> = case
+        .answer_turn_positions()
         .iter()
-        .any(|i| in_view.contains(i));
+        .map(|(si, ti)| event_id_for(&case.question_id, *si, *ti))
+        .collect();
+    let answer_in_view = replayed
+        .provenance
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| answer_ids.contains(&p.event_id))
+        .any(|(i, _)| in_view.contains(&i));
 
     Ok(EvalOutcome {
         question_id: case.question_id.clone(),
@@ -362,6 +380,51 @@ mod tests {
             "substring overlap must not report the folded deep answer: {out:?}"
         );
         assert!(out.lossless);
+    }
+
+    #[tokio::test]
+    async fn multi_case_same_owner_locates_answer_by_event_id_not_flat_index() {
+        // Review #117 round 2: run_case replays the WHOLE owner's history. If two
+        // cases share an owner, a within-case flat index is wrong once the merged
+        // history is longer than one case. Locating the answer by its durable
+        // event id is correct regardless.
+        let a = r#"[{
+          "question_id": "A",
+          "question": "?",
+          "answer": "x",
+          "haystack_sessions": [[
+            {"role": "user", "content": "a0"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "a2"}
+          ]]
+        }]"#;
+        let b = r#"[{
+          "question_id": "B",
+          "question": "?",
+          "answer": "y",
+          "haystack_sessions": [[
+            {"role": "user", "content": "b0"},
+            {"role": "user", "content": "b-answer", "has_answer": true}
+          ]]
+        }]"#;
+        let store = KvStore::open_memory().await.unwrap();
+        let log = store.events();
+        let ca = case(&parse_cases(a).unwrap(), "A");
+        let cb = case(&parse_cases(b).unwrap(), "B");
+        // Both cases under the SAME owner: 3 + 2 = 5 events, B's answer is newest.
+        ingest_case(&log, "u1", &ca).await.unwrap();
+        ingest_case(&log, "u1", &cb).await.unwrap();
+        let condenser = RecentWindowCondenser::default();
+
+        // B's answer ("b-answer") is the newest turn overall → in view at budget=1,
+        // even though its within-case flat index (1) differs from its real merged
+        // index (4). A flat-index judge would have missed it and reported false.
+        let out = run_case(&log, "u1", &cb, &condenser, 1).await.unwrap();
+        assert_eq!(out.total_turns, 5, "whole owner history replayed");
+        assert!(
+            out.answer_in_view,
+            "answer located by event id across cases: {out:?}"
+        );
     }
 
     #[test]
