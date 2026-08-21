@@ -20,6 +20,10 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Read a capped body, mapping every failure to a v1 envelope
 /// (axum's default extractor rejections are plain-text and would violate it).
+// Err is the shared v1-envelope Response — large only because this is sync, same
+// as the sin90.rs helpers that already carry this allow. Rust 1.98's tighter
+// `result_large_err` threshold now flags it here too.
+#[allow(clippy::result_large_err)]
 pub async fn read_body_or_response(req: Request<Body>) -> Result<Bytes, Response> {
     match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => Ok(b),
