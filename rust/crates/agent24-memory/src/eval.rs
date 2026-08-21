@@ -78,6 +78,22 @@ impl LongMemEvalCase {
             .map(|t| t.content.as_str())
             .collect()
     }
+
+    /// The FLAT indices (across all sessions, in ingest order) of the
+    /// answer-bearing turns. [`ingest_case`] appends turns in exactly this
+    /// flattened `(session, turn)` order, and replay returns them in seq order,
+    /// so a turn's flat index equals its index in the condenser's history — which
+    /// is what [`crate::condenser::ContextFragment::source`] refers to. Judging
+    /// recall by these indices (not substring matching) is exact.
+    pub fn answer_turn_indices(&self) -> Vec<usize> {
+        self.haystack_sessions
+            .iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, t)| t.has_answer)
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 /// Parse a LongMemEval JSON array of cases.
@@ -106,10 +122,13 @@ fn trust_for(role: &str) -> Trust {
 /// turn, each scoped to its session so an owner-only replay reconstructs the full
 /// haystack while a session-scoped replay isolates one conversation.
 ///
-/// Event ids are CONTENT-STABLE (`lme-{question_id}-{session}-{turn}`) and the
-/// loader is the single writer, so re-ingesting the same corpus is idempotent
-/// (per [`crate::replay::message_event`]'s id guidance). Returns the number of
-/// events appended (new + idempotent replays alike).
+/// Event ids are POSITION-stable (`lme-{question_id}-{session}-{turn}` — no
+/// content component) and the loader is the single writer, so re-ingesting the
+/// SAME corpus is idempotent. Re-ingesting a CORRECTED variant at the same
+/// position does NOT overwrite: it hits the append idempotency guard and errors
+/// as a `Conflict` (same id, different payload — #114 B2's loud-not-silent
+/// behavior). To load a corrected corpus, use a fresh `owner` or clear the DB.
+/// Returns the number of events appended (new + idempotent replays alike).
 pub async fn ingest_case(log: &EventLog, owner: &str, case: &LongMemEvalCase) -> Result<usize> {
     let mut count = 0usize;
     for (si, session) in case.haystack_sessions.iter().enumerate() {
@@ -173,15 +192,20 @@ pub async fn run_case(
         .await
         .map_err(MemoryError::Condenser)?;
 
-    let view: Vec<&str> = projection
+    // Judge recall by SOURCE INDEX, not substring: a deep answer that happens to
+    // be a substring of a recent turn must NOT count as recalled, or the baseline
+    // this PR freezes would OVER-report and hide a future regression (review #117
+    // B1). `fragments[*].source` are the history indices the model actually sees;
+    // `answer_turn_indices()` are the answer turns' indices in that same history.
+    let in_view: std::collections::HashSet<usize> = projection
         .fragments
         .iter()
-        .filter_map(|f| f.msg.content.as_deref())
+        .flat_map(|f| f.source.iter().copied())
         .collect();
     let answer_in_view = case
-        .answer_turns()
+        .answer_turn_indices()
         .iter()
-        .any(|ans| view.iter().any(|v| v.contains(*ans)));
+        .any(|i| in_view.contains(i));
 
     Ok(EvalOutcome {
         question_id: case.question_id.clone(),
@@ -308,6 +332,36 @@ mod tests {
             "no loss even when the answer is folded: {out:?}"
         );
         assert_eq!(out.total_turns, 6);
+    }
+
+    #[tokio::test]
+    async fn deep_answer_that_is_a_substring_of_a_recent_turn_is_not_falsely_recalled() {
+        // B1: the answer "Paris" is the OLDEST (deep) turn; a RECENT turn happens
+        // to contain "Paris" as a substring. Substring matching would wrongly
+        // report the deep answer as recalled (over-reporting the baseline). Index
+        // matching must report FALSE — the deep turn really is folded away.
+        let json = r#"[{
+          "question_id": "sub",
+          "question": "where?",
+          "answer": "Paris",
+          "haystack_sessions": [[
+            {"role": "user", "content": "Paris", "has_answer": true},
+            {"role": "assistant", "content": "noted"},
+            {"role": "user", "content": "I love Paris in the spring"}
+          ]]
+        }]"#;
+        let store = KvStore::open_memory().await.unwrap();
+        let log = store.events();
+        let c = case(&parse_cases(json).unwrap(), "sub");
+        ingest_case(&log, "u1", &c).await.unwrap();
+        let condenser = RecentWindowCondenser::default();
+        let out = run_case(&log, "u1", &c, &condenser, 1).await.unwrap();
+        // Only the newest turn survives at budget=1; the deep "Paris" is folded.
+        assert!(
+            !out.answer_in_view,
+            "substring overlap must not report the folded deep answer: {out:?}"
+        );
+        assert!(out.lossless);
     }
 
     #[test]
