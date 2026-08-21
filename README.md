@@ -16,7 +16,7 @@
 
 **应用方**（如小黑书、博客、社区工具等）从本框架 fork，搭载具体场景的能力模块。
 
-> **重命名计划**：M3 末 `AuraAIHQ/Agent24` → `AuraAIHQ/Agent24`（旧 Agent24 仓库届时归档，名字空出来，详见 [ADR-015](docs/decision.md)）。
+> **仓库位置**：本框架仓库现位于 `iDoris-ai/Agent24`（组织由早期文档中的 `AuraAIHQ` 迁至 `iDoris-ai`；历史 rename 背景见 [ADR-015](docs/decision.md)）。
 
 ---
 
@@ -88,7 +88,7 @@ export const myModule: CapabilityModule = {
 
 | 运行时 | 端点 | 说明 |
 |--------|------|------|
-| **oMLX**（默认） | `localhost:8000/v1` | Apple Silicon 原生，最低延迟 |
+| **oMLX**（默认） | `localhost:8088/v1` | Apple Silicon 原生，最低延迟 |
 | Ollama | `localhost:11434` | 跨平台，模型丰富 |
 | LM Studio | `localhost:1234/v1` | 图形界面管理 |
 | Remote API | 自定义 | OpenAI 兼容接口 |
