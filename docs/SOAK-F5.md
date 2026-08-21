@@ -20,7 +20,7 @@
 ```bash
 # 1) release 构建（泡测用 release，别用 debug）
 cd rust && cargo build --release -p agent24d -p agent24-cli
-sudo cp target/release/agent24 /usr/local/bin/   # 或加进 PATH
+sudo cp target/release/agent24 target/release/agent24d /usr/local/bin/   # 两个都要:`agent24 service install` 会找同目录的 agent24d(否则 ENOENT)
 
 # 2) 开机自启 + 自愈（F1a/F2）
 agent24 service install          # 装 LaunchAgent，登录即起、崩溃自拉
