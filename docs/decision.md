@@ -1018,7 +1018,7 @@ ADR-018 当年选 Tauri，核心理由是 Rust-on-device 一致性、包体积�
 ## ADR-028：记忆架构 — 可进化 / 可替换 / 可组合的分层模型（M-D 重做）
 
 **日期**：2026-08-21
-**状态**：✅ 采纳（方向）；实现分期见 `docs/specs/SPEC-MEMORY.md`
+**状态**：🟡 暂定 / 需 spike（2026-08-21 经 Codex 对抗式复审后从"采纳 85%"下调——见文末「Codex 复审收口」；保留本地优先+无强制外部服务的约束，但**不冻结**当前层边界、两列"双时相"、全局文件权威、crate 拆分）。实现分期见 `docs/specs/SPEC-MEMORY.md`
 
 ### 背景
 
@@ -1049,6 +1049,28 @@ ADR-018 当年选 Tauri，核心理由是 Rust-on-device 一致性、包体积�
 ### 置信度（诚实标注）
 
 方向置信 ~85%：4 角色分类与"可插拔层"由多仓收敛证据强支撑，且贴合我们 Rust/本地优先/事件溯源约束；**精确的层边界与分期 ~80%，会在实现中随 trait 缝微调**——这正是选 trait 缝的原因。要再抬高需一个 spike：本地嵌入/向量那半（oMLX embedding + SQLite 向量）、以及 `Condenser` trait 对真实 agent loop 的验证。
+
+### Codex 复审收口（2026-08-21，中立裁定）
+
+Codex 对抗式复审（读了全部 9 仓库 checked-out 源码，`CODEX-REVIEW.md`，118 处引用）。我作为中立裁判逐条判定，**大部分成立、已采纳**，据此把状态下调为「暂定/需 spike」，修订方向如下：
+
+- **[采纳·关键] 重构为"权威 + 投影"而非"层门面"**：三个**持久权威**——`EventLog`（不可变事件，因果 ID/来源/保留级）、`ArtifactStore`（用户/agent 可编辑 markdown + 知识，CAS 版本/来源/ACL/git 审计）、`AssertionLedger`（不可变语义断言，链证据，**双时相**）——加**可重建投影**（prompt 视图/摘要/FTS/嵌入/图索引，各带 generation/checkpoint）。"工作/情景/语义/程序"降为**产品词汇/视图**，不是硬 crate 边界。
+- **[采纳·关键] "双时相"我原来写错了**：`valid_at/invalid_at` 只是 valid-time 单轴。真双时相要 **valid-time + recorded-time 两个区间**（"周三我以为的" vs "周三实际为真的"是两根轴）。Graphiti 的 `created_at`+`expired_at`+`valid_at`+`invalid_at`+`reference_time` 为证。改为双区间断言版本 + as-of 语义。
+- **[采纳·关键] 权威按数据产品分，不全局**：原"文件即真源、SQLite 即索引"与 L1(KV)/L3(Fact 表) 自相矛盾。改为：EventLog 权威于情景；AssertionLedger 权威于语义；markdown 只权威于用户创作的 core/知识；FTS/向量表是可弃投影。明确 `memory rebuild` 能/不能恢复什么。
+- **[采纳·关键] 补安全/授权/同意模型**：`Scope` 现在只是过滤元数据、可空=无主记忆——不行。强制非空 owner/tenant、不可变 origin/trust 标签、读/写/删/admin 分权、project/personal/public 可见性、显式 vs 自动写的同意、PII/secret 分类、注入隔离、审计。**并修 ADR-029 的洞**：领域模块经 `KernelCtx` 拿的是**能力受限的 filtered handle，不是 ambient `MemoryStore`**（否则 Sin90 DB 物理隔离被架空）。
+- **[采纳·高] Condenser 拆开**：现在把 durable retention / 预算选择 / 变换 / 渲染 / **删除策略** 混在一起,且 `forget` 不能和 context-view 策略互换、condenser **绝不删原始事件**。拆 `EventStore/ContextSelector/ContextTransformer/ContextRenderer/RetentionPolicy`；投影返回**带 source event IDs + 理由/分数 + 安全标签 + 预算**的 typed fragments（对齐 codex compaction checkpoint、OpenHands condensation = view delta 非删除）。
+- **[采纳·高] Fact 补来源/信念质量**：加断言/证据模型、置信、抽取器/模型版本、观察时刻、说话人、模态("A 说" vs "为真")、矛盾集、派生血缘。**断言与证据分开存**；巩固产出"首选信念"而不抹掉竞争断言。
+- **[采纳·高] 自动写策略要 candidate→validate→approve→commit**：**追加断言而非 mutate**；持久化 writer 版本+决策 trace；默认只对**可信用户话语 + 显式 remember 指令**自动写，其余等评测达标（防"恶意网页变成永久偏好/指令"）。
+- **[采纳·高] 先别拆 crate**：先在**一个 crate** 里定 capability trait（EventStore/ArtifactStore/AssertionStore/ContextProjector/ProjectionJob），出现真实依赖/发布边界再拆——"一层一 trait"不等于可进化。（仍满足"可拆解"：先模块、后 crate。）
+- **[采纳·高] 崩溃一致性/并发契约**：事件 ID 做幂等键、投影 checkpoint、事务化 outbox、人/agent 编辑用 CAS 版本、确定性 replay/rebuild 测试。
+- **[采纳·中高] L4 是安全边界**：可执行 procedure（权限/签名/发布者/版本）与只读知识分开；触发文本是注入面。接 ADR-016 的签名 + AirAccount 信任根。
+- **[采纳·中高] 本地嵌入=可复现索引**：`Embedding{model_id,revision,dims,normalized,vector}` + 投影 generation + 双索引迁移 + 可续重嵌 + FTS 兜底；oMLX 是一个 adapter,不是架构默认（等 spike 过）。
+- **[采纳·中] 补生命周期/用户权利 + 评测契约**：保留/过期/配额/安全擦除/"忘掉我"/备份导出；"invalid≠deleted"。M-D.3b 前先建可回放语料（显式召回/纠正/矛盾/迟到事实/多用户隔离/投毒源/删除/重启重建）。
+- **[修正] 研究报告的事实错误**（`RESEARCH-REPORT.md` 已知需订正，Codex C 节 12 条）：OpenHands 这个 checkout 是 **Agent Canvas UI**、不含后端 condenser（我的策略清单来自先验知识、非此 checkout 可证）；letta-code 用 **git-backed MemFS + apply-patch commit**，非经典 MemGPT core/recall/archival；mem0 现为 **V3 单抽取批处理**、非两阶段 enum；codex 有真实 **`codex-rs/ext/memories` Rust 记忆子系统**（我漏了，Rust→Rust 直接可借）；"四层"应为"L0 substrate + 四角色/五层"。
+
+**未全盘照收（裁判保留）**：完整 ACL/PII 分类/投毒隔离的重型治理**分期**做（接 ADR-016 P4），M-D 先落"强制 owner + 能力受限 handle + delete≠invalidate"这三条硬的；"权威+投影"重构**采纳为修订方向**，但产品仍用"工作/情景/语义/程序"词汇（用户心智），二者不冲突。
+
+**下一步**：M-D.1 改为**评测/恢复 spike**（两个投影器 over 现有事件流 + 崩溃/重放测试 + 语料），而非只重命名 trait；spike 过再冻结公开 trait 与是否拆 crate。SPEC-MEMORY 按本收口重写。
 
 ---
 

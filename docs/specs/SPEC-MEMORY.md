@@ -2,6 +2,8 @@
 
 > 权威决策见 [ADR-028](../decision.md)（分层模型）与 [ADR-029](../decision.md)（内核↔领域 OS 边界）。
 > 本文是 **M-D 里程碑的实现蓝图**：层→trait→crate→分期→验收。设计首要属性：**可进化 / 可替换 / 可组合**（每层一个 trait 缝，可换实现、可加层，不动其余）。
+>
+> ⚠️ **2026-08-21 Codex 复审后修订**（见 ADR-028「Codex 复审收口」）：本蓝图正朝**"权威 + 投影"**重构——三个持久权威（`EventLog` / `ArtifactStore` / `AssertionLedger`）+ 可重建投影，"工作/情景/语义/程序"降为产品词汇。下方分层表是过渡视图；`Fact` 的双时相、`KernelCtx` handle、MD-1 定义已按收口修正，其余段落待 spike 后整体重写。
 
 ## 0. 设计不变量
 
@@ -27,8 +29,14 @@
 
 ```rust
 struct Scope { user: Option<String>, agent: Option<String>, session: Option<String>, run: Option<String> }
-struct Fact { id, scope, kind, body: Value, valid_at: String, invalid_at: Option<String>, source }  // 双时相
-enum Change { Add(Fact), Update{id, ..}, Delete(id), Noop }                                          // mem0 式写策略
+// 真·双时相(Codex 收口修正):valid-time + recorded-time 两个区间,断言不可变、更新=新版本
+struct Assertion { id, scope, kind, body: Value,
+                   valid_from: String, valid_to: Option<String>,        // 领域有效时间
+                   recorded_from: String, recorded_to: Option<String>, // 记录/事务时间
+                   evidence: Vec<EventId>, confidence: f32, speaker: Option<String>,
+                   writer_version: String, supersedes: Option<String> }
+// 语义写=候选管线,不 mutate:CandidateExtracted→Validated→Approved→AssertionCommitted→Indexed
+enum WriteDecision { Commit(Assertion), Reject{reason}, NeedsApproval }
 struct Context { messages: Vec<Msg>, tokens: usize }                                                 // Condenser 产物
 ```
 
@@ -37,7 +45,7 @@ struct Context { messages: Vec<Msg>, tokens: usize }                            
 
 ## 2. 分期（跟消费者走，逐层独立可发）
 
-- **M-D.1 — Condenser trait**（最便宜、runs 立即受益）：把 `agent24-memory::session::Summarizer/CompactionPolicy` 泛化为 `Condenser` trait + `RecentWindow`/`LlmSummary` 两策略；`CanonicalSession` 改为持一个 `Box<dyn Condenser>`。验收：现有 session 测试全绿 + 新策略单测 + 切换策略不改调用方。
+- **M-D.1 — 评测/恢复 spike**（Codex 收口修正：不是只重命名 trait）：在现有事件流上实现**两个投影器**——确定性 `RecentWindow` + 保留尾部的 `LlmSummary`——**绝不删原始事件**，各记录 source event IDs + 模型/prompt 版本 + 安装的 checkpoint（对齐 codex compaction）。验收：现有 session 测试全绿 + **崩溃/重启/幂等重放测试** + 小语料测（token 预算 / 关键事实保留 / 工具-动作因果 / 投毒排除 / 跨 scope 泄漏 / 时间纠正）。**过了才冻结公开 trait、才决定是否拆 crate。**
 - **M-D.2 — L1 CoreMemory**：block 存取 + `apply_patch`；agent loop 把 persona/偏好注入 prompt。验收：block 往返 + patch 幂等 + 人工编辑 KV 后 agent 读到。
 - **M-D.3 — L3 Semantic（FTS 版）**：`Fact` 表 + 双时相 + `MemoryWriter`(显式) + `Retriever`(FTS + scope + 预算)；落一个"跨会话记住"消费者。验收：写-查-失效-as_of 回看四条 + scope 隔离。
 - **M-D.3b — 本地向量（可选）**：`OmlxEmbedder` + SQLite 向量检索；两阶段 LLM writer。验收：语义召回优于纯 FTS 的对照。
@@ -46,7 +54,7 @@ struct Context { messages: Vec<Msg>, tokens: usize }                            
 ## 3. 与内核/领域 OS 的边界
 
 - 记忆 crate **不依赖** sin90（保持内核领域无关，ADR-029）。
-- 领域 OS 若需长期记忆，经 `KernelCtx` 拿 `MemoryStore` 句柄用之；领域事件仍走各自 DB + `EventBody::Module`。
+- 领域 OS 若需长期记忆，经 `KernelCtx` 拿一个**能力受限的 filtered handle**（限定其 scope/权限，**非 ambient `MemoryStore`**——否则 Sin90 DB 物理隔离被架空，Codex 收口）；领域事件仍走各自 DB + `EventBody::Module`。
 - L2 Episodic 复用内核 runs/events 脊柱，不另造事件系统。
 
 ## 4. 不做（本里程碑）

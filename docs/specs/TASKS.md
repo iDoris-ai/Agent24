@@ -214,7 +214,7 @@ L0 KV（D1）、L1 会话压缩（D1+D5b）、三层路由（D2）全部 merged�
 
 | ID | 任务 | 依赖 | 状态 |
 |---|---|---|---|
-| MD-1 | `Summarizer`→**`Condenser` trait** + RecentWindow/LlmSummary 策略；CanonicalSession 持 `Box<dyn Condenser>` | D1 | pending（最先做，最便宜） |
+| MD-1 | **评测/恢复 spike**（Codex 收口:非只重命名 trait）：两投影器 over 事件流(recent-window + tail-preserving summary,**不删原始**,记 source IDs+版本+checkpoint) + 崩溃/重放测试 + 小语料(预算/关键事实/因果/投毒/跨 scope 泄漏)。过了再冻结 trait/拆 crate | D1 | pending（最先做） |
 | MD-2 | **L1 CoreMemory**：block get/append/replace/apply_patch，agent+人可编辑 | MD-1 | pending |
 | MD-3 | **L3 Semantic（FTS）**：`Fact` 双时相表 + `MemoryWriter`+`Retriever`，scope 隔离 | MD-2 | pending（落"跨会话记住"消费者时） |
 | MD-3b | 本地向量（可选）：`OmlxEmbedder` + SQLite 向量 + 两阶段 LLM writer | MD-3, D4b | pending |
