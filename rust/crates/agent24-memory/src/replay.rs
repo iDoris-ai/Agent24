@@ -165,15 +165,23 @@ pub fn messages_from_events(events: &[StoredEvent]) -> Result<Vec<Msg>> {
 /// `query`'s `owner` (and optional `session`) select the scope; its `after_seq`
 /// is honored as a starting point and its `limit` is ignored (paging owns it).
 pub async fn replay_history(log: &EventLog, query: &EventQuery) -> Result<Replayed> {
+    replay_history_paged(log, query, REPLAY_PAGE).await
+}
+
+/// [`replay_history`] with the page size injected, so a test can force a small
+/// history to cross multiple pages and actually exercise the paging loop (a test
+/// at the production `REPLAY_PAGE` never iterates twice, so it cannot catch a
+/// regression to single-page/truncating behavior — review #116).
+async fn replay_history_paged(log: &EventLog, query: &EventQuery, page: i64) -> Result<Replayed> {
     let mut acc = Replayed::default();
     let mut cursor = query.after_seq.unwrap_or(0);
     loop {
-        let page = scan_page(log, query, cursor).await?;
-        if page.is_empty() {
+        let events = scan_page(log, query, cursor, page).await?;
+        if events.is_empty() {
             break;
         }
-        let short = (page.len() as i64) < REPLAY_PAGE;
-        let chunk = replayed_from_events(&page)?;
+        let short = (events.len() as i64) < page;
+        let chunk = replayed_from_events(&events)?;
         merge(&mut acc, chunk);
         cursor = acc.last_seq;
         if short {
@@ -192,16 +200,24 @@ pub async fn replay_history_lenient(
     log: &EventLog,
     query: &EventQuery,
 ) -> Result<(Replayed, Vec<SkippedEvent>)> {
+    replay_history_lenient_paged(log, query, REPLAY_PAGE).await
+}
+
+async fn replay_history_lenient_paged(
+    log: &EventLog,
+    query: &EventQuery,
+    page: i64,
+) -> Result<(Replayed, Vec<SkippedEvent>)> {
     let mut acc = Replayed::default();
     let mut skipped = Vec::new();
     let mut cursor = query.after_seq.unwrap_or(0);
     loop {
-        let page = scan_page(log, query, cursor).await?;
-        if page.is_empty() {
+        let events = scan_page(log, query, cursor, page).await?;
+        if events.is_empty() {
             break;
         }
-        let short = (page.len() as i64) < REPLAY_PAGE;
-        for stored in &page {
+        let short = (events.len() as i64) < page;
+        for stored in &events {
             acc.last_seq = acc.last_seq.max(stored.seq);
             cursor = cursor.max(stored.seq);
             if stored.event.kind != MESSAGE_KIND {
@@ -229,10 +245,15 @@ pub async fn replay_history_lenient(
     Ok((acc, skipped))
 }
 
-async fn scan_page(log: &EventLog, query: &EventQuery, after: i64) -> Result<Vec<StoredEvent>> {
+async fn scan_page(
+    log: &EventLog,
+    query: &EventQuery,
+    after: i64,
+    page: i64,
+) -> Result<Vec<StoredEvent>> {
     let mut q = query.clone();
     q.after_seq = Some(after);
-    q.limit = Some(REPLAY_PAGE);
+    q.limit = Some(page);
     log.scan(&q).await
 }
 
@@ -337,29 +358,83 @@ mod tests {
 
     #[tokio::test]
     async fn replay_pages_past_the_scan_limit_keeping_the_newest() {
-        // B1: the whole finding. A history longer than a single page must recover
-        // ENTIRELY — including its newest events, which a `scan ... LIMIT` drops
-        // off the tail. We cannot append 50k rows in a unit test, so drive the
-        // pager over multiple pages with a query whose scope spans them and assert
-        // the last message (newest) is present.
+        // B1: the whole finding. A history longer than ONE page must recover
+        // ENTIRELY — including its newest events, which a single `scan ... LIMIT`
+        // drops off the tail. Rather than append 50k rows, drive the pager with a
+        // SMALL page (10) so 25 events genuinely cross 3 pages and the loop runs.
+        //
+        // Falsifiable: if the pager stopped after the first page (the B1 bug — the
+        // review's `let short = true` mutation), only the OLDEST 10 would return
+        // and `m24` (the newest) would be missing, failing the assert below. With
+        // the production REPLAY_PAGE this same test would NOT iterate twice and so
+        // could not catch that — which is exactly why the page size is injected.
         let store = KvStore::open_memory().await.unwrap();
-        // REPLAY_PAGE is large; instead prove the pager's loop terminates and
-        // keeps the newest by checking a modest history recovers whole and the
-        // final message is the newest one appended.
         let n = 25usize;
         let msgs: Vec<Msg> = (0..n).map(|i| Msg::user(format!("m{i}"))).collect();
         append_conversation(&store, "u1", &msgs).await;
-        let r = replay_history(&store.events(), &EventQuery::owner("u1"))
+
+        let page = 10i64; // < n, so the 25 events span 3 pages
+        let r = replay_history_paged(&store.events(), &EventQuery::owner("u1"), page)
             .await
             .unwrap();
-        assert_eq!(r.len(), n);
+        assert_eq!(r.len(), n, "all pages recovered, not just the first");
         assert_eq!(
             r.messages.last().unwrap().content.as_deref(),
             Some("m24"),
-            "newest message must survive replay"
+            "newest message must survive multi-page replay"
         );
-        // last_seq tracks the newest event for checkpointing.
+        // Every page's messages are present and ordered, none dropped at a seam.
+        let contents: Vec<String> = r
+            .messages
+            .iter()
+            .filter_map(|m| m.content.clone())
+            .collect();
+        let expected: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+        assert_eq!(contents, expected);
         assert!(r.last_seq >= n as i64);
+    }
+
+    #[tokio::test]
+    async fn lenient_replay_also_pages_across_seams() {
+        // The lenient path shares the pager; prove it too crosses pages so a bad
+        // row on a later page is still reached and reported.
+        let store = KvStore::open_memory().await.unwrap();
+        let log = store.events();
+        for i in 0..25usize {
+            if i == 20 {
+                // A corrupt message-kind event on the 3rd page.
+                log.append(&MemEvent::new(
+                    "bad-20",
+                    Scope::owner("u1"),
+                    MESSAGE_KIND,
+                    serde_json::json!({"role": "user"}),
+                    origin(),
+                ))
+                .await
+                .unwrap();
+            } else {
+                log.append(
+                    &message_event(
+                        format!("g{i}"),
+                        Scope::owner("u1"),
+                        &Msg::user(format!("m{i}")),
+                        origin(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let (r, skipped) = replay_history_lenient_paged(&log, &EventQuery::owner("u1"), 10)
+            .await
+            .unwrap();
+        assert_eq!(r.len(), 24, "24 good rows across 3 pages");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0].event_id, "bad-20",
+            "bad row on page 3 still reported"
+        );
     }
 
     #[tokio::test]
