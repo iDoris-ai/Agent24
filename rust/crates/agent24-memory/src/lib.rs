@@ -10,6 +10,7 @@
 
 pub mod artifact;
 pub mod condenser;
+pub mod eval;
 pub mod event;
 pub mod replay;
 pub mod session;
@@ -46,6 +47,11 @@ pub enum MemoryError {
     /// of a whole owner's history (review #116 B2).
     #[error("replay: {0}")]
     Replay(String),
+    /// A [`condenser::Condenser`] returned an error (its error type is a bare
+    /// `String`); the eval harness wraps it so a condense failure is a typed
+    /// `MemoryError` like the rest.
+    #[error("condenser: {0}")]
+    Condenser(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
