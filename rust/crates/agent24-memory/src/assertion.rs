@@ -169,8 +169,10 @@ pub trait AssertionStore: Send + Sync {
     /// old row is kept (a correction, not a delete). Returns the id.
     async fn assert(&self, a: &Assertion) -> Result<AssertionId>;
     /// Stop believing an assertion as of `at`: closes its `recorded_to` (a no-op
-    /// if already closed). The row is retained.
-    async fn retract(&self, id: &AssertionId, at: &str) -> Result<()>;
+    /// if already closed). The row is retained. Scoped by `owner` — a caller
+    /// cannot retract another owner's belief even holding its id (which is
+    /// caller-minted and often derivable, so not a secret — review #119).
+    async fn retract(&self, id: &AssertionId, owner: &str, at: &str) -> Result<()>;
     /// The beliefs matching `q`'s bi-temporal point (and optional subject),
     /// qualified-only unless asked otherwise.
     async fn beliefs_as_of(&self, q: &BeliefQuery) -> Result<Vec<Assertion>>;
@@ -265,12 +267,16 @@ impl AssertionStore for AssertionLedger {
         Ok(a.id.clone())
     }
 
-    async fn retract(&self, id: &AssertionId, at: &str) -> Result<()> {
+    async fn retract(&self, id: &AssertionId, owner: &str, at: &str) -> Result<()> {
+        // Owner-scoped like the assert/supersede path: a foreign id cannot close
+        // this owner's belief, and this owner's id cannot reach across tenants.
         sqlx::query(
-            "UPDATE mem_assertions SET recorded_to = ? WHERE id = ? AND recorded_to IS NULL",
+            "UPDATE mem_assertions SET recorded_to = ?
+             WHERE id = ? AND scope_owner = ? AND recorded_to IS NULL",
         )
         .bind(at)
         .bind(id)
+        .bind(owner)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -455,7 +461,7 @@ mod tests {
         a.recorded_from = "2020-01-01T00:00:00Z".into();
         a.valid_from = "2020-01-01T00:00:00Z".into();
         l.assert(&a).await.unwrap();
-        l.retract(&"a1".to_owned(), "2020-06-01T00:00:00Z")
+        l.retract(&"a1".to_owned(), "u1", "2020-06-01T00:00:00Z")
             .await
             .unwrap();
         // Currently not believed.
@@ -490,6 +496,45 @@ mod tests {
         assert_eq!(alice.len(), 1);
         assert_eq!(alice[0].object, serde_json::json!("A"));
         assert!(!alice.iter().any(|x| x.object == serde_json::json!("B")));
+    }
+
+    #[tokio::test]
+    async fn retract_cannot_cross_owners_even_with_the_id() {
+        // Review #119: a caller-minted id is not a secret, so retract must be
+        // owner-scoped. bob holding alice's id must not close alice's belief.
+        let l = ledger().await;
+        let mut a = assertion("alice-1", "alice", "sky", serde_json::json!("blue"));
+        a.recorded_from = "2020-01-01T00:00:00Z".into();
+        a.valid_from = "2020-01-01T00:00:00Z".into();
+        l.assert(&a).await.unwrap();
+
+        // bob tries to retract alice's assertion by id — no effect.
+        l.retract(&"alice-1".to_owned(), "bob", "2020-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        let alice = l
+            .beliefs_as_of(
+                &BeliefQuery::owner("alice")
+                    .valid_at("2020-09-01T00:00:00Z")
+                    .recorded_at("2020-09-01T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(alice.len(), 1, "alice's belief survives bob's retract");
+
+        // alice's own retract does close it.
+        l.retract(&"alice-1".to_owned(), "alice", "2020-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        let after = l
+            .beliefs_as_of(
+                &BeliefQuery::owner("alice")
+                    .valid_at("2020-09-01T00:00:00Z")
+                    .recorded_at("2020-09-01T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "owner's own retract works");
     }
 
     #[tokio::test]
