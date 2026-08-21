@@ -1015,6 +1015,79 @@ ADR-018 当年选 Tauri，核心理由是 Rust-on-device 一致性、包体积�
 
 ---
 
+## ADR-028：记忆架构 — 可进化 / 可替换 / 可组合的分层模型（M-D 重做）
+
+**日期**：2026-08-21
+**状态**：✅ 采纳（方向）；实现分期见 `docs/specs/SPEC-MEMORY.md`
+
+### 背景
+
+现状 `agent24-memory`（M-D/D1）只有两层：L0 `KvStore`（命名空间 JSON KV）+ `CanonicalSession`（单一 `Summarizer`/`CompactionPolicy` 压缩）。README 画的 "L0→L3 + SkillBank + 自进化" 尚是愿景。为把 Agent24 做成**通用 agent 底座**，需要一套记忆方案，其**首要属性是可进化 / 可替换 / 可组合**：即便未来出现新记忆范式，也能**加一层或换某一层的实现，而不动其余层**。
+
+调研了业界最先进方案（对源码逐条核实，报告见研究目录）：mem0（两阶段 LLM 写 + 可插拔后端）、letta/MemGPT（core/recall/archival 自编辑 block）、cognee（ECL 任务管线）、graphiti（双时相知识图）、basic-memory（markdown 真源 + SQLite 索引）、codex（Rust rollout-trace + AGENTS.md）、cline（Memory Bank 约定）、aider（排序压缩 repo-map）、OpenHands（事件流 + 可插拔 Condenser）、Claude Code（一文件一事实 + 索引）。**收敛结论**：记忆 = 4 类角色（工作/情景/语义/程序）；分水岭是"写策略"（显式编辑 / LLM 抽取对照 / 自动压缩，最好三者组合）；本地优先系统靠 文件+SQL，"聪明召回"才要向量/图。
+
+### 决策
+
+**四层记忆模型，每层一个 trait 缝、独立可换、独立可发**（"可组合"=facade 组合各层；"可替换"=每层 trait 后换实现；"可进化"=可新增层或策略而不动其余）：
+
+- **L0 KvStore**（已有）：命名空间 JSON substrate。
+- **L1 Working/Core**：小、常驻上下文、结构化、agent+人可编辑的 block（persona/偏好/当前焦点）。trait `CoreMemory`（append/replace/apply_patch）。借鉴 letta / cline / Claude Code。
+- **L2 Episodic**：append-only 事件/轮次流 + **可插拔 `Condenser`** 建上下文（策略 recent/summarize/mask/forget）。**泛化现有 `Summarizer`**。复用内核 runs/events 脊柱。借鉴 OpenHands / codex。
+- **L3 Semantic**：可检索事实/实体，带**双时相**有效性（`valid_at/invalid_at`，更新=失效非删除）。trait `MemoryWriter`（抽取→对照 ADD/UPDATE/DELETE）+ `Retriever`（SQLite FTS + 可选本地向量 + 排序预算）。借鉴 mem0 / graphiti / aider。
+- **L4 Procedural/知识**：触发式指令/技能（SkillBank）。**markdown 权威** + file-watched 索引。trait `KnowledgeSource`。借鉴 codex AGENTS.md / Claude Code CLAUDE.md / OpenHands microagent。
+
+**跨层原则**：① **文件即真源、SQLite 即可重建索引**（basic-memory）——记忆人可审 + 可重建；② 作用域键（user/agent/session/run）一等公民（mem0）；③ 嵌入走**可插拔 `Embedder`，默认本地 oMLX，零云依赖**；④ 双时相只用 SQLite 两列，**不引入 Neo4j/向量服务硬依赖**。
+
+**crate 拆分**：`agent24-memory` 拆为 `memory-core / memory-episodic / memory-semantic / memory-knowledge`，一个 `MemoryStore` facade 组合；每层 trait 后可换、可测。
+
+### 显式否决
+
+- ❌ 强制图数据库（Neo4j）或外部向量服务——违反本地优先；双时相/关系用 SQLite 表达。
+- ❌ 一次性把 L1–L4 全建——按消费者分期（M-D.1 先做 Condenser）。
+- ❌ 把三级模型路由塞进记忆层——路由归模型侧（agent24-models），与记忆解耦。
+
+### 置信度（诚实标注）
+
+方向置信 ~85%：4 角色分类与"可插拔层"由多仓收敛证据强支撑，且贴合我们 Rust/本地优先/事件溯源约束；**精确的层边界与分期 ~80%，会在实现中随 trait 缝微调**——这正是选 trait 缝的原因。要再抬高需一个 spike：本地嵌入/向量那半（oMLX embedding + SQLite 向量）、以及 `Condenser` trait 对真实 agent loop 的验证。
+
+---
+
+## ADR-029：Agent24 内核 ↔ 领域 OS（Sin90 / Cos72…）边界 + DomainModule 挂载缝
+
+**日期**：2026-08-21
+**状态**：✅ 采纳（边界原则）；`DomainModule` 挂载缝为实现工作项（收口 #103/#104 推迟的"真正的模块挂载 seam" + Sin90KernelCtx）
+
+### 背景
+
+Sin90 是 Agent24 **默认搭载**的 Personal-OS，但它应可**关闭 / 清除 / 替换**成别的领域 OS（如 Cos72 社区成员 OS、BusinessOS）。需要明确 **Agent24 硬基础** 与 **领域 OS** 之间的边界线画在哪。
+
+### 现状：边界已清的四维（今天就成立，代码为证）
+
+1. **crate 依赖单向**：内核 crate（core/agent/store/scheduler/models）**零依赖 sin90**（Cargo 图强制核实）；`agent24-sin90-store` 只反向用内核 util（ulid/now_iso8601）。
+2. **数据隔离**：Sin90 有**独立 `sin90.db`**，物理隔离于内核 `agent24.db`。
+3. **事件**：Sin90 经**通用 `EventBody::Module{module,kind,payload}`** 信封发事件，内核不认识其语义、只转发。
+4. **API**：只经 `/api/v1/sin90/*` REST/WS 触达；外壳（Pet0…）走协议消费，不进程内耦合。
+
+### 现状：唯一未清的一维 = 挂载/替换缝
+
+**边界线在 `agent24d`（组合根）**：它是全仓唯一"按名字认识 Sin90"的地方——`AppState.sin90: Option<Sin90Store>`（具体字段）+ `build_router` 硬编码 `/api/v1/sin90/*` → `crate::sin90::*`（编译进二进制）。没有 `DomainModule` trait / 注册表，所以"清掉 Sin90 换 Cos72"今天需要改 `agent24d` 源码重编。
+
+### 决策
+
+边界线**明确画在 `agent24d`**：内核（所有 `agent24-*` 内核 crate + agent24d 的通用部分）**领域无关**；领域 OS（Sin90/Cos72）活在**自己的 crate + 自己的 DB + 自己的路由命名空间 + 自己的 event `module` 名**。把 agent24d 里的硬编码胶水换成通用缝：
+
+- 引入 **`DomainModule` trait**：每个领域 OS 实现——`name()`、`open_store()/migrations`、`routes()`（自己的命名空间）、`event_module()`，并**经 `KernelCtx` trait 访问内核能力**（model 路由 / scheduler / policy 审批），而非反向依赖内核。
+- agent24d 从**配置**加载一个 **模块注册表**，取代 `AppState.sin90` 具体字段与硬编码路由。
+- **Sin90 = 默认注册**的一个 `DomainModule`；配置里可**禁用**它、或**替换**为 Cos72。
+
+于是三种玩法都成立：**用默认 Sin90** / **基于 Sin90 定制** / **清掉 Sin90 载入 Cos72**。
+
+### 与记忆（ADR-028）的关系
+
+记忆层保持**领域 OS 无关**：内核提供通用记忆（L0–L4），领域 OS **用但不拥有**它；领域态（Sin90 的 direction/proposal…）留在领域 OS 自己的 DB。换 OS 不动内核记忆。
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
