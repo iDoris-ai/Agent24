@@ -48,6 +48,17 @@ pub enum Reconciliation {
     /// A tracked file's content now lives at a NEW path (its `db_checksum` matches
     /// a new file's bytes). Detected by checksum so the artifact's id/history are
     /// preserved across the move instead of read as delete-then-create.
+    ///
+    /// This is an INFERENCE, only made when the content is GLOBALLY UNIQUE — the
+    /// checksum appears exactly once in `tracked` and once in `observed` (review
+    /// #118). Identical content is common (empty files, templates), and guessing
+    /// a move there would (a) hide a real delete behind a fake move and (b) risk
+    /// attaching one file's history to an unrelated file. So when a checksum has
+    /// more than one candidate on either side, no move is inferred: the gone side
+    /// is reported `DeletedOnDisk` and the new side `NewOnDisk`, truthfully. Even
+    /// in the unique 1-to-1 case a genuine delete + an unrelated same-content
+    /// create is INDISTINGUISHABLE from a move by content alone, so a consumer
+    /// must treat `Moved` as a best guess, not a certainty.
     Moved {
         from_path: String,
         to_path: String,
@@ -77,11 +88,13 @@ impl Reconciliation {
 /// result is sorted, so the same inputs always yield the same actions (the
 /// `memory rebuild` determinism the acceptance asks for).
 ///
-/// Move detection: a tracked path that vanished, whose `db_checksum` equals the
-/// bytes of a NEW file at another path, is a [`Reconciliation::Moved`] — matched
-/// one-to-one and greedily by checksum, so a rename is not misread as a delete
-/// plus an unrelated create. Duplicate checksums are matched in sorted order for
-/// determinism.
+/// Move detection: a tracked path that vanished, whose `db_checksum` equals a NEW
+/// file's bytes, is a [`Reconciliation::Moved`] ONLY when that content is
+/// GLOBALLY UNIQUE — its checksum occurs exactly once in `tracked` AND once in
+/// `observed`. When content is duplicated, no move is guessed: the gone side is
+/// `DeletedOnDisk` and the new side `NewOnDisk`, so a real delete is never hidden
+/// behind a fabricated move and no file's history is attached to the wrong file
+/// (review #118).
 pub fn reconcile(tracked: &[(String, String)], observed: &[ObservedFile]) -> Vec<Reconciliation> {
     let tracked_by_path: BTreeMap<&str, &str> = tracked
         .iter()
@@ -92,19 +105,25 @@ pub fn reconcile(tracked: &[(String, String)], observed: &[ObservedFile]) -> Vec
         .map(|o| (o.path.as_str(), o.checksum.as_str()))
         .collect();
 
+    // How many times each checksum occurs on each side, over ALL entries — the
+    // uniqueness test that gates a move inference.
+    let mut tracked_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in tracked_by_path.values() {
+        *tracked_count.entry(*c).or_default() += 1;
+    }
+    let mut observed_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in observed_by_path.values() {
+        *observed_count.entry(*c).or_default() += 1;
+    }
+
     let mut out = Vec::new();
-    // Gone-from-disk tracked entries and new-on-disk observed entries, collected
-    // first so move-detection can pair them by checksum.
     let mut gone: Vec<(&str, &str)> = Vec::new(); // (path, db_checksum)
-    let mut fresh: Vec<(&str, &str)> = Vec::new(); // (path, file_checksum)
 
     for (path, db_sum) in &tracked_by_path {
         match observed_by_path.get(path) {
-            Some(file_sum) if file_sum == db_sum => {
-                out.push(Reconciliation::Unchanged {
-                    path: (*path).to_owned(),
-                });
-            }
+            Some(file_sum) if file_sum == db_sum => out.push(Reconciliation::Unchanged {
+                path: (*path).to_owned(),
+            }),
             Some(file_sum) => out.push(Reconciliation::ModifiedOnDisk {
                 path: (*path).to_owned(),
                 db_checksum: (*db_sum).to_owned(),
@@ -113,21 +132,30 @@ pub fn reconcile(tracked: &[(String, String)], observed: &[ObservedFile]) -> Vec
             None => gone.push((path, db_sum)),
         }
     }
-    for (path, file_sum) in &observed_by_path {
-        if !tracked_by_path.contains_key(path) {
-            fresh.push((path, file_sum));
-        }
-    }
-
-    // Pair a gone entry with a fresh entry of the SAME checksum → a move. Both
-    // vecs are already in sorted (BTreeMap) order, so pairing is deterministic.
+    // Fresh = observed paths the DB doesn't track. Track which are consumed by a
+    // move so they aren't also reported NewOnDisk.
+    let fresh: Vec<(&str, &str)> = observed_by_path
+        .iter()
+        .filter(|(path, _)| !tracked_by_path.contains_key(*path))
+        .map(|(p, c)| (*p, *c))
+        .collect();
     let mut fresh_used = vec![false; fresh.len()];
+
     for (from_path, db_sum) in &gone {
-        let matched = fresh
-            .iter()
-            .enumerate()
-            .find(|(i, (_, fsum))| !fresh_used[*i] && fsum == db_sum);
-        if let Some((i, (to_path, _))) = matched {
+        // A move is inferred only for globally-unique content. tracked_count==1 is
+        // guaranteed (this gone path holds it) but assert it for clarity; the
+        // real gate is observed_count==1 AND a fresh landing spot exists.
+        let unique = tracked_count.get(db_sum).copied().unwrap_or(0) == 1
+            && observed_count.get(db_sum).copied().unwrap_or(0) == 1;
+        let landing = if unique {
+            fresh
+                .iter()
+                .enumerate()
+                .find(|(i, (_, fsum))| !fresh_used[*i] && fsum == db_sum)
+        } else {
+            None
+        };
+        if let Some((i, (to_path, _))) = landing {
             fresh_used[i] = true;
             out.push(Reconciliation::Moved {
                 from_path: (*from_path).to_owned(),
@@ -175,11 +203,9 @@ pub fn observe_dir(root: &Path) -> Result<Vec<ObservedFile>> {
         .map_err(|e| MemoryError::Io(format!("read_dir {}: {e}", root.display())))?;
     for entry in entries {
         let entry = entry.map_err(|e| MemoryError::Io(format!("dir entry: {e}")))?;
-        // symlink_metadata does NOT follow the link, so a symlink is seen as a
-        // symlink and refused rather than dereferenced.
-        let meta = entry
-            .metadata()
-            .map_err(|e| MemoryError::Io(format!("metadata: {e}")))?;
+        // `DirEntry::file_type()` reports the entry's OWN type without following
+        // the link (unlike `fs::metadata`), so a symlink is seen as a symlink and
+        // refused BEFORE any dereference — even a dangling one.
         let ft = entry
             .file_type()
             .map_err(|e| MemoryError::Io(format!("file_type: {e}")))?;
@@ -189,7 +215,7 @@ pub fn observe_dir(root: &Path) -> Result<Vec<ObservedFile>> {
                 entry.file_name()
             )));
         }
-        if !meta.is_file() {
+        if !ft.is_file() {
             continue;
         }
         let name = entry
@@ -319,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn genuine_delete_and_unrelated_new_are_not_paired() {
+    fn different_checksums_are_a_real_delete_plus_a_real_new() {
         // Different checksums → NOT a move: a real delete + a real new.
         let r = reconcile(
             &tracked(&[("gone.md", "h1")]),
@@ -333,6 +359,67 @@ mod tests {
             path: "fresh.md".into(),
             file_checksum: "h2".into(),
         }));
+    }
+
+    #[test]
+    fn duplicated_content_across_tracked_is_not_confidently_paired() {
+        // Review #118 case 2: a.md and b.md have the SAME content; a.md vanishes,
+        // b.md stays, c.md (same content) appears. b→c is as plausible as a→c, so
+        // no move is guessed: a is DeletedOnDisk, c is NewOnDisk, b is Unchanged.
+        let r = reconcile(
+            &tracked(&[("a.md", "S"), ("b.md", "S")]),
+            &observed(&[("b.md", "S"), ("c.md", "S")]),
+        );
+        assert!(r.contains(&Reconciliation::Unchanged {
+            path: "b.md".into()
+        }));
+        assert!(r.contains(&Reconciliation::DeletedOnDisk {
+            path: "a.md".into(),
+            db_checksum: "S".into(),
+        }));
+        assert!(r.contains(&Reconciliation::NewOnDisk {
+            path: "c.md".into(),
+            file_checksum: "S".into(),
+        }));
+        assert!(!r.iter().any(|x| matches!(x, Reconciliation::Moved { .. })));
+    }
+
+    #[test]
+    fn one_gone_two_same_content_new_is_not_paired() {
+        // Review #118 case 3: which of x/y did a move to? Ambiguous → no guess.
+        let r = reconcile(
+            &tracked(&[("a.md", "S")]),
+            &observed(&[("x.md", "S"), ("y.md", "S")]),
+        );
+        assert!(r.contains(&Reconciliation::DeletedOnDisk {
+            path: "a.md".into(),
+            db_checksum: "S".into(),
+        }));
+        assert_eq!(
+            r.iter()
+                .filter(|x| matches!(x, Reconciliation::NewOnDisk { .. }))
+                .count(),
+            2
+        );
+        assert!(!r.iter().any(|x| matches!(x, Reconciliation::Moved { .. })));
+    }
+
+    #[test]
+    fn unique_content_1to1_still_infers_a_move_as_a_documented_best_guess() {
+        // Review #118 case 1: unique content, 1-to-1. A genuine delete + an
+        // unrelated create with identical bytes is INDISTINGUISHABLE from a move
+        // by content, so we take the move as a best guess (documented on the
+        // `Moved` variant). This is the accepted default; the ambiguous cases
+        // above are the ones that must NOT be guessed.
+        let r = reconcile(&tracked(&[("gone.md", "U")]), &observed(&[("new.md", "U")]));
+        assert_eq!(
+            r,
+            vec![Reconciliation::Moved {
+                from_path: "gone.md".into(),
+                to_path: "new.md".into(),
+                checksum: "U".into(),
+            }]
+        );
     }
 
     #[test]
