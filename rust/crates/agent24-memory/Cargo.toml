@@ -12,6 +12,7 @@ agent24-models = { path = "../agent24-models" }
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 thiserror = "2"
 tracing = "0.1"
