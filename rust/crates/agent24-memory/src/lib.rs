@@ -8,6 +8,7 @@
 //!   threshold-triggered LLM-summary compaction, so an unbounded chat stays a
 //!   bounded prompt.
 
+pub mod condenser;
 pub mod event;
 pub mod session;
 
