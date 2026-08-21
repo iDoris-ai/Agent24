@@ -136,9 +136,27 @@ fn tail_start(history: &[Msg], est: &dyn TokenEstimator, budget: usize) -> usize
         }
         start = cand;
     }
-    // Advance past any leading tool results so the kept tail starts clean.
-    while start < n && history[start].role == "tool" {
-        start += 1;
+    // Don't begin the tail on an orphaned tool result. Advancing past leading
+    // tool messages is fine UNLESS it would eat the ENTIRE tail (reach `n` → an
+    // empty view). That empty case is exactly the agent-loop moment when the
+    // newest message is a `tool_result`, so instead of emptying the model input
+    // we RETREAT to pull in the assistant turn those results answer — the same
+    // "never below the newest message" escape hatch the loop above encodes
+    // (review #113 B1: the advance previously contradicted that guarantee).
+    let mut adv = start;
+    while adv < n && history[adv].role == "tool" {
+        adv += 1;
+    }
+    if adv < n {
+        start = adv;
+    } else {
+        // Retreat past the leading tool run to include its assistant turn. A
+        // history that is ALL tool results has no assistant to attach to, so
+        // `start` lands at 0 (a leading orphan): that degenerate input is out of
+        // contract (a real conversation never starts with a tool result).
+        while start > 0 && history[start].role == "tool" {
+            start -= 1;
+        }
     }
     start
 }
@@ -301,9 +319,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tail_never_starts_on_an_orphaned_tool_result() {
-        // user, assistant(tool_calls), tool_result — a budget that would keep
-        // only the tool_result must fold it up with its assistant turn.
+    async fn tail_never_orphans_a_tool_result_and_never_empties_the_view() {
+        // user, assistant(tool_calls), tool_result — the newest message is a
+        // tool_result, exactly the agent-loop moment before the next model call.
         let h = vec![
             user(0),
             Msg::assistant(
@@ -317,10 +335,61 @@ mod tests {
             Msg::tool_result("c1", "output"),
         ];
         let c = RecentWindowCondenser::default();
-        // Tiny budget → naive tail would be just the tool_result.
+        // Across EVERY budget the view must be non-empty (B1: it used to empty
+        // out) AND start with the assistant, not the orphaned tool result. At a
+        // tiny budget the tool-safe pair is kept even though it exceeds the
+        // budget — tool-safety wins over the budget (B2: assert this POSITIVELY,
+        // not the old vacuous `assert_ne!(None, tool)` at budget=1).
+        for budget in [0usize, 1, 5, 8, 12, 40] {
+            let p = c.condense(&h, budget).await.unwrap();
+            assert!(
+                !p.fragments.is_empty(),
+                "empty view at budget={budget}: {p:?}"
+            );
+            let roles: Vec<&str> = p.fragments.iter().map(|f| f.msg.role.as_str()).collect();
+            assert_ne!(
+                roles.first(),
+                Some(&"tool"),
+                "orphan at budget={budget}: {roles:?}"
+            );
+            // The tool_result and its assistant are always kept together.
+            assert!(
+                roles.ends_with(&["assistant", "tool"]),
+                "pair split at budget={budget}: {roles:?}"
+            );
+            assert!(p.covers(h.len()));
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_window_always_keeps_the_newest_message() {
+        // The SEMANTIC guarantee `covers()` cannot see (B3: covers() only checks
+        // bookkeeping — folded ∪ sources == 0..n holds even for an empty view).
+        // For any non-empty history the newest source index must be in the
+        // verbatim view, never folded away.
+        let c = RecentWindowCondenser::default();
+        for n in [1usize, 2, 7, 30] {
+            let h = history(n);
+            for budget in [0usize, 1, 5, 50] {
+                let p = c.condense(&h, budget).await.unwrap();
+                let kept: Vec<usize> = p.fragments.iter().flat_map(|f| f.source.clone()).collect();
+                assert!(
+                    kept.contains(&(n - 1)),
+                    "newest message (idx {}) dropped at n={n} budget={budget}: {p:?}",
+                    n - 1
+                );
+                assert!(!p.folded.contains(&(n - 1)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn all_tool_history_is_out_of_contract_but_does_not_panic() {
+        // Degenerate input (a conversation never starts with a tool result):
+        // documented behavior is a leading orphan at index 0, no loss, no panic.
+        let h = vec![Msg::tool_result("c", "a"), Msg::tool_result("c", "b")];
+        let c = RecentWindowCondenser::default();
         let p = c.condense(&h, 1).await.unwrap();
-        let first_verbatim = p.fragments.first().map(|f| f.msg.role.as_str());
-        assert_ne!(first_verbatim, Some("tool"), "orphaned tool result: {p:?}");
         assert!(p.covers(h.len()));
     }
 
