@@ -1015,6 +1015,119 @@ ADR-018 当年选 Tauri，核心理由是 Rust-on-device 一致性、包体积�
 
 ---
 
+## ADR-028：记忆架构 — 可进化 / 可替换 / 可组合的分层模型（M-D 重做）
+
+**日期**：2026-08-21
+**状态**：🟡 暂定 / 需 spike（2026-08-21 经 Codex 对抗式复审后从"采纳 85%"下调——见文末「Codex 复审收口」；保留本地优先+无强制外部服务的约束，但**不冻结**当前层边界、两列"双时相"、全局文件权威、crate 拆分）。实现分期见 `docs/specs/SPEC-MEMORY.md`
+
+### 背景
+
+现状 `agent24-memory`（M-D/D1）只有两层：L0 `KvStore`（命名空间 JSON KV）+ `CanonicalSession`（单一 `Summarizer`/`CompactionPolicy` 压缩）。README 画的 "L0→L3 + SkillBank + 自进化" 尚是愿景。为把 Agent24 做成**通用 agent 底座**，需要一套记忆方案，其**首要属性是可进化 / 可替换 / 可组合**：即便未来出现新记忆范式，也能**加一层或换某一层的实现，而不动其余层**。
+
+调研了业界最先进方案（对源码逐条核实，报告见研究目录）：mem0（两阶段 LLM 写 + 可插拔后端）、letta/MemGPT（core/recall/archival 自编辑 block）、cognee（ECL 任务管线）、graphiti（双时相知识图）、basic-memory（markdown 真源 + SQLite 索引）、codex（Rust rollout-trace + AGENTS.md）、cline（Memory Bank 约定）、aider（排序压缩 repo-map）、OpenHands（事件流 + 可插拔 Condenser）、Claude Code（一文件一事实 + 索引）。**收敛结论**：记忆 = 4 类角色（工作/情景/语义/程序）；分水岭是"写策略"（显式编辑 / LLM 抽取对照 / 自动压缩，最好三者组合）；本地优先系统靠 文件+SQL，"聪明召回"才要向量/图。
+
+### 决策
+
+**四层记忆模型，每层一个 trait 缝、独立可换、独立可发**（"可组合"=facade 组合各层；"可替换"=每层 trait 后换实现；"可进化"=可新增层或策略而不动其余）：
+
+- **L0 KvStore**（已有）：命名空间 JSON substrate。
+- **L1 Working/Core**：小、常驻上下文、结构化、agent+人可编辑的 block（persona/偏好/当前焦点）。trait `CoreMemory`（append/replace/apply_patch）。借鉴 letta / cline / Claude Code。
+- **L2 Episodic**：append-only 事件/轮次流 + **可插拔 `Condenser`** 建上下文（策略 recent/summarize/mask/forget）。**泛化现有 `Summarizer`**。复用内核 runs/events 脊柱。借鉴 OpenHands / codex。
+- **L3 Semantic**：可检索事实/实体，带**双时相**有效性（`valid_at/invalid_at`，更新=失效非删除）。trait `MemoryWriter`（抽取→对照 ADD/UPDATE/DELETE）+ `Retriever`（SQLite FTS + 可选本地向量 + 排序预算）。借鉴 mem0 / graphiti / aider。
+- **L4 Procedural/知识**：触发式指令/技能（SkillBank）。**markdown 权威** + file-watched 索引。trait `KnowledgeSource`。借鉴 codex AGENTS.md / Claude Code CLAUDE.md / OpenHands microagent。
+
+**跨层原则**：① **文件即真源、SQLite 即可重建索引**（basic-memory）——记忆人可审 + 可重建；② 作用域键（user/agent/session/run）一等公民（mem0）；③ 嵌入走**可插拔 `Embedder`，默认本地 oMLX，零云依赖**；④ 双时相只用 SQLite 两列，**不引入 Neo4j/向量服务硬依赖**。
+
+**crate 拆分**：`agent24-memory` 拆为 `memory-core / memory-episodic / memory-semantic / memory-knowledge`，一个 `MemoryStore` facade 组合；每层 trait 后可换、可测。
+
+### 显式否决
+
+- ❌ 强制图数据库（Neo4j）或外部向量服务——违反本地优先；双时相/关系用 SQLite 表达。
+- ❌ 一次性把 L1–L4 全建——按消费者分期（M-D.1 先做 Condenser）。
+- ❌ 把三级模型路由塞进记忆层——路由归模型侧（agent24-models），与记忆解耦。
+
+### 置信度（诚实标注）
+
+方向置信 ~85%：4 角色分类与"可插拔层"由多仓收敛证据强支撑，且贴合我们 Rust/本地优先/事件溯源约束；**精确的层边界与分期 ~80%，会在实现中随 trait 缝微调**——这正是选 trait 缝的原因。要再抬高需一个 spike：本地嵌入/向量那半（oMLX embedding + SQLite 向量）、以及 `Condenser` trait 对真实 agent loop 的验证。
+
+### Codex 复审收口（2026-08-21，中立裁定）
+
+Codex 对抗式复审（读了全部 9 仓库 checked-out 源码，`CODEX-REVIEW.md`，118 处引用）。我作为中立裁判逐条判定，**大部分成立、已采纳**，据此把状态下调为「暂定/需 spike」，修订方向如下：
+
+- **[采纳·关键] 重构为"权威 + 投影"而非"层门面"**：三个**持久权威**——`EventLog`（不可变事件，因果 ID/来源/保留级）、`ArtifactStore`（用户/agent 可编辑 markdown + 知识，CAS 版本/来源/ACL/git 审计）、`AssertionLedger`（不可变语义断言，链证据，**双时相**）——加**可重建投影**（prompt 视图/摘要/FTS/嵌入/图索引，各带 generation/checkpoint）。"工作/情景/语义/程序"降为**产品词汇/视图**，不是硬 crate 边界。
+- **[采纳·关键] "双时相"我原来写错了**：`valid_at/invalid_at` 只是 valid-time 单轴。真双时相要 **valid-time + recorded-time 两个区间**（"周三我以为的" vs "周三实际为真的"是两根轴）。Graphiti 的 `created_at`+`expired_at`+`valid_at`+`invalid_at`+`reference_time` 为证。改为双区间断言版本 + as-of 语义。
+- **[采纳·关键] 权威按数据产品分，不全局**：原"文件即真源、SQLite 即索引"与 L1(KV)/L3(Fact 表) 自相矛盾。改为：EventLog 权威于情景；AssertionLedger 权威于语义；markdown 只权威于用户创作的 core/知识；FTS/向量表是可弃投影。明确 `memory rebuild` 能/不能恢复什么。
+- **[采纳·关键] 补安全/授权/同意模型**：`Scope` 现在只是过滤元数据、可空=无主记忆——不行。强制非空 owner/tenant、不可变 origin/trust 标签、读/写/删/admin 分权、project/personal/public 可见性、显式 vs 自动写的同意、PII/secret 分类、注入隔离、审计。**并修 ADR-029 的洞**：领域模块经 `KernelCtx` 拿的是**能力受限的 filtered handle，不是 ambient `MemoryStore`**（否则 Sin90 DB 物理隔离被架空）。
+- **[采纳·高] Condenser 拆开**：现在把 durable retention / 预算选择 / 变换 / 渲染 / **删除策略** 混在一起,且 `forget` 不能和 context-view 策略互换、condenser **绝不删原始事件**。拆 `EventStore/ContextSelector/ContextTransformer/ContextRenderer/RetentionPolicy`；投影返回**带 source event IDs + 理由/分数 + 安全标签 + 预算**的 typed fragments（对齐 codex compaction checkpoint、OpenHands condensation = view delta 非删除）。
+- **[采纳·高] Fact 补来源/信念质量**：加断言/证据模型、置信、抽取器/模型版本、观察时刻、说话人、模态("A 说" vs "为真")、矛盾集、派生血缘。**断言与证据分开存**；巩固产出"首选信念"而不抹掉竞争断言。
+- **[采纳·高] 自动写策略要 candidate→validate→approve→commit**：**追加断言而非 mutate**；持久化 writer 版本+决策 trace；默认只对**可信用户话语 + 显式 remember 指令**自动写，其余等评测达标（防"恶意网页变成永久偏好/指令"）。
+- **[采纳·高] 先别拆 crate**：先在**一个 crate** 里定 capability trait（EventStore/ArtifactStore/AssertionStore/ContextProjector/ProjectionJob），出现真实依赖/发布边界再拆——"一层一 trait"不等于可进化。（仍满足"可拆解"：先模块、后 crate。）
+- **[采纳·高] 崩溃一致性/并发契约**：事件 ID 做幂等键、投影 checkpoint、事务化 outbox、人/agent 编辑用 CAS 版本、确定性 replay/rebuild 测试。
+- **[采纳·中高] L4 是安全边界**：可执行 procedure（权限/签名/发布者/版本）与只读知识分开；触发文本是注入面。接 ADR-016 的签名 + AirAccount 信任根。
+- **[采纳·中高] 本地嵌入=可复现索引**：`Embedding{model_id,revision,dims,normalized,vector}` + 投影 generation + 双索引迁移 + 可续重嵌 + FTS 兜底；oMLX 是一个 adapter,不是架构默认（等 spike 过）。
+- **[采纳·中] 补生命周期/用户权利 + 评测契约**：保留/过期/配额/安全擦除/"忘掉我"/备份导出；"invalid≠deleted"。M-D.3b 前先建可回放语料（显式召回/纠正/矛盾/迟到事实/多用户隔离/投毒源/删除/重启重建）。
+- **[修正] 研究报告的事实错误**（`RESEARCH-REPORT.md` 已知需订正，Codex C 节 12 条）：OpenHands 这个 checkout 是 **Agent Canvas UI**、不含后端 condenser（我的策略清单来自先验知识、非此 checkout 可证）；letta-code 用 **git-backed MemFS + apply-patch commit**，非经典 MemGPT core/recall/archival；mem0 现为 **V3 单抽取批处理**、非两阶段 enum；codex 有真实 **`codex-rs/ext/memories` Rust 记忆子系统**（我漏了，Rust→Rust 直接可借）；"四层"应为"L0 substrate + 四角色/五层"。
+
+**未全盘照收（裁判保留）**：完整 ACL/PII 分类/投毒隔离的重型治理**分期**做（接 ADR-016 P4），M-D 先落"强制 owner + 能力受限 handle + delete≠invalidate"这三条硬的；"权威+投影"重构**采纳为修订方向**，但产品仍用"工作/情景/语义/程序"词汇（用户心智），二者不冲突。
+
+**下一步**：M-D.1 改为**评测/恢复 spike**（两个投影器 over 现有事件流 + 崩溃/重放测试 + 语料），而非只重命名 trait；spike 过再冻结公开 trait 与是否拆 crate。SPEC-MEMORY 按本收口重写。
+
+---
+
+## ADR-029：Agent24 内核 ↔ 领域 OS（Sin90 / Cos72…）边界 + DomainModule 挂载缝
+
+**日期**：2026-08-21
+**状态**：✅ 采纳（边界原则）；`DomainModule` 挂载缝为实现工作项（收口 #103/#104 推迟的"真正的模块挂载 seam" + Sin90KernelCtx）
+
+### 背景
+
+Sin90 是 Agent24 **默认搭载**的 Personal-OS，但它应可**关闭 / 清除 / 替换**成别的领域 OS（如 Cos72 社区成员 OS、BusinessOS）。需要明确 **Agent24 硬基础** 与 **领域 OS** 之间的边界线画在哪。
+
+### 现状：边界已清的四维（今天就成立，代码为证）
+
+1. **crate 依赖单向**：内核 crate（core/agent/store/scheduler/models）**零依赖 sin90**（Cargo 图强制核实）；`agent24-sin90-store` 只反向用内核 util（ulid/now_iso8601）。
+2. **数据隔离**：Sin90 有**独立 `sin90.db`**，物理隔离于内核 `agent24.db`。
+3. **事件**：Sin90 经**通用 `EventBody::Module{module,kind,payload}`** 信封发事件，内核不认识其语义、只转发。
+4. **API**：只经 `/api/v1/sin90/*` REST/WS 触达；外壳（Pet0…）走协议消费，不进程内耦合。
+
+### 现状：唯一未清的一维 = 挂载/替换缝
+
+**边界线在 `agent24d`（组合根）**：它是全仓唯一"按名字认识 Sin90"的地方——`AppState.sin90: Option<Sin90Store>`（具体字段）+ `build_router` 硬编码 `/api/v1/sin90/*` → `crate::sin90::*`（编译进二进制）。没有 `DomainModule` trait / 注册表，所以"清掉 Sin90 换 Cos72"今天需要改 `agent24d` 源码重编。
+
+### 决策
+
+边界线**明确画在 `agent24d`**：内核（所有 `agent24-*` 内核 crate + agent24d 的通用部分）**领域无关**；领域 OS（Sin90/Cos72）活在自己的实现 + 自己的 DB + 自己的路由命名空间 + 自己的 event `module` 名。换 OS 必须是**配置 + 安装脚本驱动的一次性动作，不改内核源码、不重编 agent24d**。
+
+#### 1. 领域 OS 是一个「可安装包」，不只是 crate + 配置
+
+一个领域 OS = **清单 + 实现 + 安装生命周期 + 独立目录**，四件套：
+
+- **清单 `domain-os.yml`**：`name` / `version` / 路由命名空间(`/api/v1/<name>/*`) / event `module` 名 / **资源要求**(需要哪些本地模型、哪些 API/密钥、哪些依赖) / **请求的内核能力**(model 路由 / scheduler / policy——经 `KernelCtx`) / UI 入口(给外壳)。
+- **实现**（二选一，同一清单统一描述）：
+  - **进程内 Rust crate**（第一方，如 Sin90/Cos72）：实现 **`DomainModule` trait**——`name() / open_store()+migrations / routes() / event_module()`，经 **`KernelCtx` trait** 单向用内核能力。
+  - **进程外 Capability Provider**（第三方/多语言，ADR-026 §3）：经协议/MCP 暴露同一套契约，`agent24d` 只代理，**装新 OS 不需重编内核**。
+- **安装脚本 / 生命周期钩子**：`install`(校验+按需下载模型、检查 API/密钥/依赖、建独立目录、跑迁移) · `activate` · `deactivate` · `uninstall`(保留或清除独立目录)。
+- **独立数据目录 `~/.agent24/os/<name>/`**：装该 OS 的 DB + 资产，于是 `uninstall` = 干净地删这个目录。
+
+#### 2. 配置驱动的激活 + 干净的一次性换装
+
+- 配置里 `active_domain_os: sin90`（默认）。`agent24d` 启动：从注册表解析激活的 OS → 跑其 `install` 校验(模型/依赖到位否) → 经 `DomainModule` 缝挂载路由/store/事件。缺资源就**明确报缺什么**，不半死不活。
+- 换装是一条清晰的一次性流水（CLI）：`agent24 os install cos72`（校验+建目录+下模型）→ `agent24 os activate cos72`（翻配置 + 重启）→ 可选 `agent24 os uninstall sin90`（清 `~/.agent24/os/sin90/`）。Sin90 的数据目录不清就**可回退**。
+
+#### 3. 诚实的进程模型取舍（Rust 编译期现实）
+
+- **第一方进程内 OS**（我们自己写的 Sin90/Cos72）：都编进 `agent24d`，配置在启动时**选激活哪一个**——目标 OS 已编入就能**免重编换装**。
+- **全新第三方 OS**（未编入）：走**进程外 Provider**路线（ADR-026 的 Node Host/MCP/容器/远程），**完全不动 agent24d**。
+- 两条路由同一清单 + 同一 `DomainModule`/Provider 契约描述，对上层一致。
+
+于是三种玩法都成立且都是**干净、一次性、可回退**的动作：**用默认 Sin90** / **基于 Sin90 定制** / **`os install cos72 && os activate cos72` 清掉 Sin90 换 Cos72**。取代今天 `AppState.sin90` 具体字段 + 硬编码 `/sin90/*` 路由。
+
+### 与记忆（ADR-028）的关系
+
+记忆层保持**领域 OS 无关**：内核提供通用记忆（L0–L4），领域 OS **用但不拥有**它；领域态（Sin90 的 direction/proposal…）留在领域 OS 自己的 DB。换 OS 不动内核记忆。
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
