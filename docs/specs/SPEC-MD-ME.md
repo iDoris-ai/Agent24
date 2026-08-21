@@ -4,7 +4,9 @@
 >
 > **定位澄清(关键)**:M-D 建的是**通用 agent 的记忆底座**,**不是把某个个人知识库(如 MemPalace)搬进内核**。方法是**借各家最佳实现之长**,能直接复用的 Rust 模块(如 codex 的 trait 形状)就复用。
 >
-> **状态**:🟡 蓝图(骨架已钉,精确 trait 签名/向量实现/SQLite DDL 待 **MD-1 spike** 后冻结——遵循 Codex 收口"别过早冻结")。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
+> **状态**:🟢 MD-1 spike 已交付并冻结签名(见 §2.1);MD-2a/2b 权威层已合并。MD-1c 后向量实现/SQLite DDL 仍按各自 MD-x 落。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
+>
+> **进度**:✅ MD-1a 条件器 · ✅ MD-1b 崩溃重放 · ✅ MD-1c LongMemEval 装载 · ✅ MD-2a EventStore · ✅ MD-2b ArtifactStore ·（下一步:MD-2c 双谱系对账 → MD-3 AssertionStore+Retriever)。
 
 ---
 
@@ -121,14 +123,30 @@ trait ProjectionJob{ async fn run_from(&self, ckpt: CheckpointId)->R<ProjectionO
 
 ---
 
+## 2.1 已冻结签名(MD-1 spike 出口 · 实现见 `rust/crates/agent24-memory`)
+
+> MD-1 spike(MD-1a 条件器 + MD-1b 崩溃重放 + MD-1c LongMemEval 装载)已合并并经外部对抗式复审多轮变异实测。以下签名**已冻结**——后续 MD-x 在其上加层,不重塑这些形状;改动需新 ADR/复审。冻结的是**形状与不变式**,SQLite DDL 与向量实现仍按原计划在各自 MD-x 落。
+
+**`condenser`**(MD-1a):`Condenser::condense(&self, history: &[Msg], budget_tokens: usize) -> Result<ContextProjection, String>`。`ContextProjection { fragments: Vec<ContextFragment>, folded: Vec<usize>, tokens_estimated }`;`ContextFragment { msg, source: Vec<usize>, reason }`。**不变式**:每个源下标恰好一次落在 `fragments[*].source ∪ folded`(`covers(n)` 记账,非语义);预算是 **best-effort**,两处允许超支(tool-safe 不可拆分对、summary 固定开销);最新消息永不被折走。`TokenEstimator` 缝可换真 tokenizer。
+
+**`event`**(MD-2a):`EventStore::{append(&MemEvent)->i64, scan(&EventQuery)->Vec<StoredEvent>, checkpoint_at(name,seq), checkpoint(name)->i64, checkpoint_seq(name)}`。`append` 幂等于 `id`;跨租户/异 payload 撞 id → `Conflict`。`Scope.owner` 强制非空;`Trust` 含 `Unknown`(最严,未识别值不降级)。`scan` 恒绑 owner + 恒加 LIMIT。
+
+**`artifact`**(MD-2b):`ArtifactStore::{read(path, owner:&str)->Option<Artifact>, cas_write(Artifact, expect_version)->Artifact, history(path, owner:&str)->Vec<Artifact>}`。身份是 `(owner, path)`,narrowing 非隔离;CAS 陈旧写 → `Conflict`(`BEGIN IMMEDIATE` 串行化,输家拿干净 `Conflict` 非裸锁错);每版本留存,双谱系 `db_checksum`/`file_checksum` 待 MD-2c 对账发散。
+
+**`replay`**(MD-1b):`replay_history(&EventLog, &EventQuery) -> Result<Replayed>`(分页到底,不砍最新)+ `replay_history_lenient(...) -> (Replayed, Vec<SkippedEvent>)`(坏行跳过并上报,带 id+seq)。`Replayed { messages, provenance: Vec<Provenance{event_id, trust}>, last_seq }`——`messages` 与 `provenance` 位置对齐、一趟产出,**trust 溯源随重放保留**(MD-4 写门可用)。owner-only 重放合并所有 session,要隔离传 `.session(s)`。
+
+**`eval`**(MD-1c):`parse_cases`/`load_cases_from_file`/`ingest_case`/`run_case` + `EvalOutcome`。LongMemEval 装载跑通;`answer_in_view` **按答案 turn 的持久 event id 在重放 `provenance` 中定位下标、再判 ∈ `fragments[*].source`**——**不用子串**(否则子串重合会**高报**),也**不用 case 内 flat 下标**(`run_case` 重放整个 owner 历史,同 owner 多 case 会错位,故按 event id 定位,无「一 owner 一 case」前提)。近期窗口对深答案 `answer_in_view=false` 是**基线**(MD-3 retriever 要超越的数,宁低报不高报),`lossless` 恒真。**边界(诚实标注)**:投毒排除属 MD-4 写门,深召回属 MD-3;二者在 MD-1 只钉边界不实现。
+
+---
+
 ## 3. M-D to-do / 测试 / 验收
 
 > 分期跟消费者走;每条独立可发。"验收"= 该条合并的硬门槛。
 
 | ID | 交付 | 依赖 | 测试 | 验收 |
 |---|---|---|---|---|
-| **MD-1** | **评测/恢复 spike**:两个 `Condenser`(确定性 recent-window + 保留尾部 summary,发 `Condensation` view-delta,**不删原始**);建可回放语料 + benchmark 装载 | D1 | 崩溃/重启/幂等重放;语料测 token 预算/关键事实保留/因果/投毒排除/跨 scope 泄漏;LongMemEval 装载跑通 | 现 session 测试全绿 + 上述测试全过 + **产出冻结后的 `Condenser`/`ContextProjection` 签名** |
-| **MD-2** | **EventStore + ArtifactStore**(权威层):事件表 + markdown-CAS + 双谱系对账(checksum 移动检测) | MD-1 | 事件 append/scan/checkpoint 幂等;CAS 拒陈旧写;外部改文件→对账不静默删;rebuild 从事件重建投影 | 四类对账状态测试(借 basic-memory)+ `memory rebuild` 确定性 |
+| **MD-1** ✅ | **评测/恢复 spike**:两个 `Condenser`(确定性 recent-window + 保留尾部 summary,发 `Condensation` view-delta,**不删原始**);建可回放语料 + benchmark 装载 | D1 | 崩溃/重启/幂等重放;语料测 token 预算/关键事实保留/因果/投毒排除/跨 scope 泄漏;LongMemEval 装载跑通 | ✅ 已交付(MD-1a #113 + MD-1b #116 + MD-1c):session 测试全绿 + 上述全过 + **签名已冻结(§2.1)** |
+| **MD-2** 🟡 | **EventStore + ArtifactStore**(权威层):事件表 + markdown-CAS + 双谱系对账(checksum 移动检测) | MD-1 | 事件 append/scan/checkpoint 幂等;CAS 拒陈旧写;外部改文件→对账不静默删;rebuild 从事件重建投影 | ✅ 2a EventStore(#114)+ ✅ 2b ArtifactStore(#115);🔜 **2c 双谱系对账**(四类状态测试 + `memory rebuild` 确定性)未做 |
 | **MD-3** | **AssertionStore 双时相 + Retriever(FTS)**:断言表两区间 + 证据链 + `qualified` 门;FTS 检索 + scope 隔离 | MD-2 | 写-查-失效-`as_of(valid,recorded)` 回看;矛盾=新版本非删;候选不进默认召回;scope 泄漏 0 | 双时相四象限查询正确 + 跨 scope 零泄漏 |
 | **MD-4** | **MemoryWriter 写门(治理)**:candidate→闭 schema 校验→确定性策略→approve/commit;强制 owner;origin/trust;审计 | MD-3 | 恶意 ToolOutput/WebFetch 默认不落持久;UserSaid+显式 remember 才自动 commit;dry-run/review;bulk rollback | 投毒语料:未确认候选不进召回;审计可回放 |
 | **MD-5** | **Consolidator 巩固循环**:后台读未巩固事件→写 insight→更新 persona;importance/consolidated 标记 | MD-3 | 巩固幂等;importance 排序;增量==全量重跑 | LongMemEval/LoCoMo 相对纯检索有提升(对照) |
