@@ -12,6 +12,7 @@ pub mod artifact;
 pub mod condenser;
 pub mod eval;
 pub mod event;
+pub mod reconcile;
 pub mod replay;
 pub mod session;
 
