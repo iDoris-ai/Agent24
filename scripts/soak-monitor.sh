@@ -46,7 +46,7 @@ command -v curl >/dev/null || { echo "need curl" >&2; exit 2; }
 
 # Counters (whole-run accounting).
 samples=0; health_ok=0; restarts=0; overdue_max=0; last_pid=""
-schedule_min=""; anomalies=0
+schedule_min=""; anomalies=0; disabled_seen=0; sched_err_seen=0
 
 read_daemon() { # -> echoes "port token pid" or nothing
   [ -f "$DAEMON_JSON" ] || return 1
@@ -68,14 +68,20 @@ summarize() {
   echo "health uptime:  ${up}%  ($health_ok/$samples ok)"
   echo "daemon restarts: $restarts   (F2 should keep the user unaffected)"
   echo "schedules seen:  min=${schedule_min:-n/a}  max_overdue=${overdue_max}"
+  echo "scheduler faults: auto_disabled=${disabled_seen}  fetch_errors=${sched_err_seen}"
   echo "anomalies:       $anomalies"
   echo
-  # F5 pass gate: 100% health, scheduler never wedged. Restarts are allowed
-  # (F2's job) as long as health recovered — that is exactly what we're proving.
-  if [ "$samples" -gt 0 ] && [ "$health_ok" -eq "$samples" ] && [ "$overdue_max" -eq 0 ]; then
-    echo "RESULT: PASS (health 100%, no stuck schedules)"
+  # F5 pass gate: health 100% AND the scheduler stayed ALIVE the whole run.
+  # "Alive" is NOT "a /schedules row still exists": after 5 consecutive failures
+  # the daemon auto-disables a schedule (enabled=false, next_run_at=null) yet the
+  # row lingers — so a dead scheduler would otherwise read as healthy. We FAIL on
+  # any overdue fire, any auto-disabled schedule, or any failed /schedules read
+  # (a 401/500 envelope must never be miscounted as schedules). — soak review #109
+  if [ "$samples" -gt 0 ] && [ "$health_ok" -eq "$samples" ] && [ "$overdue_max" -eq 0 ] \
+     && [ "$disabled_seen" -eq 0 ] && [ "$sched_err_seen" -eq 0 ]; then
+    echo "RESULT: PASS (health 100%, scheduler alive: no overdue / auto-disabled / fetch-error)"
   else
-    echo "RESULT: NEEDS REVIEW (see anomalies in the log)"
+    echo "RESULT: NEEDS REVIEW (see anomalies + scheduler faults in the log)"
   fi
   exit 0
 }
@@ -112,22 +118,52 @@ while :; do
     rss_mb=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%.1f", $1/1024}')
     cpu_pct=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ')
 
-    # Schedules (token-gated). Count total + how many are overdue.
-    sched=$(curl -s --max-time 10 -H "Authorization: Bearer $token" "$base/api/v1/schedules" 2>/dev/null || echo '')
-    n_sched=$(echo "$sched" | jq -r '(.schedules // .) | length' 2>/dev/null || echo "null")
-    overdue=$(echo "$sched" | jq -r --arg now "$ts" '[(.schedules // .)[]? | select((.next_run_at // "") != "" and .next_run_at < $now)] | length' 2>/dev/null || echo 0)
-    [ "$overdue" = "null" ] && overdue=0
+    # Schedules (token-gated). A live scheduler keeps every enabled schedule with
+    # a FUTURE next_run_at. Two soak-review (#109) failure modes to catch:
+    #   (1) 401/500 returns an ERROR ENVELOPE, not a list — the old
+    #       `(.schedules // .)|length` fell back to the envelope and counted its
+    #       KEYS (=1), fabricating a healthy-looking count. So capture the HTTP
+    #       code and only count a real array; any other shape is `sched_err`.
+    #   (2) after 5 consecutive failures the daemon sets enabled=false +
+    #       next_run_at=null but leaves the row in the list — a DEAD scheduler
+    #       reading healthy. So count auto-disabled schedules explicitly.
+    sresp=$(curl -s -w '\n%{http_code}' --max-time 10 -H "Authorization: Bearer $token" "$base/api/v1/schedules" 2>/dev/null || printf '\n000')
+    scode=$(printf '%s' "$sresp" | tail -n1)
+    sbody=$(printf '%s' "$sresp" | sed '$d')
+    n_sched="null"; disabled=0; nullnext=0; overdue=0; sched_err=0
+    if [ "$scode" = "200" ]; then
+      # Normalize to the schedule array ONLY when the shape is as expected;
+      # `"ERR"` (anything else, incl. an error object) means NOT zero schedules.
+      arr=$(printf '%s' "$sbody" | jq -c 'if type=="object" and has("schedules") then .schedules elif type=="array" then . else "ERR" end' 2>/dev/null || echo '"ERR"')
+      if [ "$arr" = '"ERR"' ] || [ -z "$arr" ]; then
+        sched_err=1
+      else
+        n_sched=$(printf '%s' "$arr" | jq 'length' 2>/dev/null || echo null)
+        disabled=$(printf '%s' "$arr" | jq '[.[]|select(.enabled==false)]|length' 2>/dev/null || echo 0)
+        # next_run_at strictly in the past on a still-enabled schedule = a wedged
+        # fire (a legitimately-fired one-shot clears next_run_at but is not < now).
+        overdue=$(printf '%s' "$arr" | jq --arg now "$ts" '[.[]|select(.enabled!=false and .next_run_at!=null and .next_run_at<$now)]|length' 2>/dev/null || echo 0)
+        nullnext=$(printf '%s' "$arr" | jq '[.[]|select(.enabled!=false and .next_run_at==null)]|length' 2>/dev/null || echo 0)
+      fi
+    else
+      sched_err=1   # non-200 = scheduler surface unhealthy; do NOT fabricate a count
+    fi
 
     samples=$((samples+1))
     $ok && health_ok=$((health_ok+1)) || anomalies=$((anomalies+1))
     [ "$overdue" -gt "$overdue_max" ] 2>/dev/null && overdue_max="$overdue"
+    # Hard scheduler faults → the run cannot PASS.
+    if [ "$sched_err" -eq 1 ]; then sched_err_seen=1; anomalies=$((anomalies+1)); fi
+    if [ "$disabled" -gt 0 ] 2>/dev/null; then disabled_seen=1; anomalies=$((anomalies+1)); fi
     if [ "$overdue" -gt 0 ] 2>/dev/null; then anomalies=$((anomalies+1)); fi
+    # nullnext on an enabled schedule is logged (could be a fired one-shot) but
+    # does not itself fail the gate — the auto-disable case is caught by `disabled`.
     if [ "$n_sched" != "null" ] && { [ -z "$schedule_min" ] || [ "$n_sched" -lt "$schedule_min" ] 2>/dev/null; }; then
       schedule_min="$n_sched"
     fi
 
-    printf '{"at":"%s","health":%s,"code":"%s","pid":%s,"restarts":%s,"rss_mb":%s,"cpu_pct":%s,"schedules":%s,"overdue":%s}\n' \
-      "$ts" "$ok" "$code" "${pid:-0}" "$restarts" "${rss_mb:-0}" "${cpu_pct:-0}" "${n_sched:-0}" "${overdue:-0}" >> "$LOG"
+    printf '{"at":"%s","health":%s,"code":"%s","sched_code":"%s","pid":%s,"restarts":%s,"rss_mb":%s,"cpu_pct":%s,"schedules":%s,"disabled":%s,"nullnext":%s,"overdue":%s,"sched_err":%s}\n' \
+      "$ts" "$ok" "$code" "$scode" "${pid:-0}" "$restarts" "${rss_mb:-0}" "${cpu_pct:-0}" "${n_sched:-0}" "$disabled" "$nullnext" "$overdue" "$sched_err" >> "$LOG"
   fi
 
   # Stop after the configured duration.

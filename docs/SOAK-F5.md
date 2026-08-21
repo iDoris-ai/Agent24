@@ -8,7 +8,7 @@
 一次通过的泡测应满足：
 
 1. **可用性**：`soak-monitor` 记录的 health 命中率 **100%**（偶发 daemon 重启允许——那正是 F2 要证明的——只要 health 每次都恢复）。
-2. **调度不卡**：任何采样点都没有 `next_run_at` 落在过去仍未触发的 schedule（`overdue == 0`）。
+2. **调度器全程存活**（不是"`/schedules` 里还有行"）：任何采样点都 **没有 `overdue`**（`next_run_at` 落在过去仍未触发）、**没有 `auto_disabled`**（连续失败 5 次后 daemon 把 schedule 置 `enabled=false, next_run_at=null`，行还在但调度器已死）、**没有 `fetch_errors`**（`/schedules` 返回 401/500 错误信封被误当成计数）。这三条任一出现即判 **NEEDS REVIEW**——一个"死掉但行还在"的调度器**不算通过**。
 3. **无人工干预**：7 天里你没有手动重启 daemon / 重连渠道 / 清状态。
 4. **无内存泄漏**：`rss_mb` 曲线平稳，不单调爬升。
 5. **渠道存活**：微信 / Nostr 入站在第 1 天和第 7 天都能触发 run + 审批回。
