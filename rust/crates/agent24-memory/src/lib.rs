@@ -8,6 +8,7 @@
 //!   threshold-triggered LLM-summary compaction, so an unbounded chat stays a
 //!   bounded prompt.
 
+pub mod artifact;
 pub mod condenser;
 pub mod event;
 pub mod session;
@@ -89,6 +90,12 @@ impl KvStore {
     /// cross-store transaction seam is MD-2b work.)
     pub fn events(&self) -> event::EventLog {
         event::EventLog::new(self.pool.clone())
+    }
+
+    /// An [`artifact::ArtifactCas`] over the SAME database file — MD-2b's
+    /// CAS-versioned editable-content authority shares the KV store's pool.
+    pub fn artifacts(&self) -> artifact::ArtifactCas {
+        artifact::ArtifactCas::new(self.pool.clone())
     }
 
     /// Upsert a raw JSON value.
