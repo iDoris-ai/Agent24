@@ -87,19 +87,28 @@ impl Artifact {
 }
 
 /// The CAS-versioned editable-content authority.
+///
+/// **Identity is `(owner, path)` — narrowing is NOT isolation.** An artifact
+/// (persona core, note) belongs to an OWNER and is meant to span sessions, so
+/// `read`/`history` take a bare `owner: &str`, not a `&Scope`. This is a
+/// deliberate contrast with the episodic [`crate::event::EventStore`], which DOES
+/// filter by `scope.session` (an event belongs to the run that emitted it).
+/// Taking a `&Scope` here would falsely imply that passing a session narrows the
+/// read — it would not (review #115 B2). `cas_write` still records the writer's
+/// full [`Artifact::scope`] as PROVENANCE, but only `scope.owner` is identity.
 #[async_trait]
 pub trait ArtifactStore: Send + Sync {
     /// The current version of an artifact, or `None` if `path` is untracked
-    /// under this owner.
-    async fn read(&self, path: &str, scope: &Scope) -> Result<Option<Artifact>>;
+    /// under `owner`.
+    async fn read(&self, path: &str, owner: &str) -> Result<Option<Artifact>>;
     /// Commit `a.body` as the next version, but only if `expect_version` matches
     /// the version currently stored (0 for a first create). A mismatch — a stale
     /// or wrong assumption about the current state — is a
     /// [`MemoryError::Conflict`], never a clobber. Returns the committed artifact
     /// with its assigned version and checksums.
     async fn cas_write(&self, a: Artifact, expect_version: u64) -> Result<Artifact>;
-    /// Every committed version of `path` under this owner, oldest first.
-    async fn history(&self, path: &str, scope: &Scope) -> Result<Vec<Artifact>>;
+    /// Every committed version of `path` under `owner`, oldest first.
+    async fn history(&self, path: &str, owner: &str) -> Result<Vec<Artifact>>;
 }
 
 /// SQLite-backed [`ArtifactStore`]. Shares the memory DB pool (see
@@ -134,12 +143,12 @@ impl ArtifactCas {
 
 #[async_trait]
 impl ArtifactStore for ArtifactCas {
-    async fn read(&self, path: &str, scope: &Scope) -> Result<Option<Artifact>> {
+    async fn read(&self, path: &str, owner: &str) -> Result<Option<Artifact>> {
         let row = sqlx::query(
             "SELECT path, body, version, db_checksum, file_checksum, scope, updated_by, reason, at
              FROM mem_artifacts WHERE scope_owner = ? AND path = ?",
         )
-        .bind(&scope.owner)
+        .bind(owner)
         .bind(path)
         .fetch_optional(&self.pool)
         .await?;
@@ -147,12 +156,17 @@ impl ArtifactStore for ArtifactCas {
     }
 
     async fn cas_write(&self, a: Artifact, expect_version: u64) -> Result<Artifact> {
-        // The whole read-check-write runs in one transaction so the current
-        // version we validate against cannot shift under us mid-write. The
-        // UNIQUE(scope_owner, path, version) on the history table is the ultimate
-        // guard: a racing writer that slips past the version check still collides
-        // there and is rejected, so no two commits can share a version.
-        let mut tx = self.pool.begin().await?;
+        // BEGIN IMMEDIATE takes the write lock UP FRONT, so the whole
+        // read-check-write is serialized against other writers and `busy_timeout`
+        // actually applies. A plain DEFERRED begin (`pool.begin()`) instead lets
+        // two writers both take read locks and then collide on the lock UPGRADE,
+        // which SQLite fails IMMEDIATELY with SQLITE_BUSY (busy_timeout
+        // deliberately does not wait on upgrades) — surfacing a raw "database is
+        // locked" to the loser instead of the `Conflict` this API's retry
+        // contract promises. Under a real multi-connection WAL pool that was 96%
+        // of losers (review #115 B1); with BEGIN IMMEDIATE they serialize and
+        // every loser gets a clean version `Conflict`.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let current: Option<i64> =
             sqlx::query("SELECT version FROM mem_artifacts WHERE scope_owner = ? AND path = ?")
@@ -184,7 +198,12 @@ impl ArtifactStore for ArtifactCas {
         let scope_json = serde_json::to_string(&committed.scope)?;
         let version_i64 = new_version as i64;
 
-        // History insert first: its PK rejects a concurrent duplicate version.
+        // Insert the history row, then move the pointer. With BEGIN IMMEDIATE the
+        // writers are already serialized, so this order is just for a clean
+        // single-statement failure surface. The UNIQUE(owner, path, version) it
+        // can violate is DEFENSE IN DEPTH the normal path never reaches (0 hits
+        // under ~1400 racing writes, review #115 B3), NOT the load-bearing
+        // concurrency guard — that is the write lock above.
         sqlx::query(
             "INSERT INTO mem_artifact_versions
                  (scope_owner, path, version, body, db_checksum, file_checksum,
@@ -234,13 +253,13 @@ impl ArtifactStore for ArtifactCas {
         Ok(committed)
     }
 
-    async fn history(&self, path: &str, scope: &Scope) -> Result<Vec<Artifact>> {
+    async fn history(&self, path: &str, owner: &str) -> Result<Vec<Artifact>> {
         let rows = sqlx::query(
             "SELECT path, body, version, db_checksum, file_checksum, scope, updated_by, reason, at
              FROM mem_artifact_versions WHERE scope_owner = ? AND path = ?
              ORDER BY version ASC",
         )
-        .bind(&scope.owner)
+        .bind(owner)
         .bind(path)
         .fetch_all(&self.pool)
         .await?;
@@ -248,8 +267,10 @@ impl ArtifactStore for ArtifactCas {
     }
 }
 
-/// Map the history-table PK collision (a concurrent writer already committed
-/// this version) to a `Conflict`, leaving any other DB error untouched.
+/// Map a history-table PK collision to a `Conflict`, leaving any other DB error
+/// untouched. This is the DEFENSE-IN-DEPTH path (see `cas_write`): with the
+/// writer transaction serialized by BEGIN IMMEDIATE the normal path loses at the
+/// version check, not here — but a future direct-to-history writer would.
 fn cas_race_to_conflict(path: &str, version: u64) -> impl FnOnce(sqlx::Error) -> MemoryError {
     let path = path.to_owned();
     move |e| match &e {
@@ -271,6 +292,15 @@ mod tests {
         KvStore::open_memory().await.unwrap().artifacts()
     }
 
+    /// A unique temp DB path per test (tokio runs tests concurrently in one
+    /// binary, so a shared filename would collide).
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("a24mem-artifact-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("mem.db")
+    }
+
     fn draft(owner: &str, path: &str, body: &str) -> Artifact {
         Artifact::draft(path, body, Scope::owner(owner), "agent", "test write")
     }
@@ -278,8 +308,7 @@ mod tests {
     #[tokio::test]
     async fn create_then_read_current_version() {
         let s = store().await;
-        let scope = Scope::owner("u1");
-        assert!(s.read("core.md", &scope).await.unwrap().is_none());
+        assert!(s.read("core.md", "u1").await.unwrap().is_none());
 
         let a = s
             .cas_write(draft("u1", "core.md", "hello"), 0)
@@ -289,7 +318,7 @@ mod tests {
         assert_eq!(a.db_checksum, checksum("hello"));
         assert_eq!(a.file_checksum, a.db_checksum);
 
-        let got = s.read("core.md", &scope).await.unwrap().unwrap();
+        let got = s.read("core.md", "u1").await.unwrap().unwrap();
         assert_eq!(got.body, "hello");
         assert_eq!(got.version, 1);
     }
@@ -301,14 +330,7 @@ mod tests {
         let v2 = s.cas_write(draft("u1", "n.md", "v2"), 1).await.unwrap();
         assert_eq!(v2.version, 2);
         assert_eq!(v2.body, "v2");
-        assert_eq!(
-            s.read("n.md", &Scope::owner("u1"))
-                .await
-                .unwrap()
-                .unwrap()
-                .version,
-            2
-        );
+        assert_eq!(s.read("n.md", "u1").await.unwrap().unwrap().version, 2);
     }
 
     #[tokio::test]
@@ -324,7 +346,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MemoryError::Conflict(_)), "{err}");
         // v2 is intact.
-        let cur = s.read("n.md", &Scope::owner("u1")).await.unwrap().unwrap();
+        let cur = s.read("n.md", "u1").await.unwrap().unwrap();
         assert_eq!(cur.body, "v2");
         assert_eq!(cur.version, 2);
     }
@@ -338,12 +360,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MemoryError::Conflict(_)), "{err}");
-        assert!(
-            s.read("new.md", &Scope::owner("u1"))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(s.read("new.md", "u1").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -352,11 +369,35 @@ mod tests {
         s.cas_write(draft("u1", "n.md", "v1"), 0).await.unwrap();
         s.cas_write(draft("u1", "n.md", "v2"), 1).await.unwrap();
         s.cas_write(draft("u1", "n.md", "v3"), 2).await.unwrap();
-        let hist = s.history("n.md", &Scope::owner("u1")).await.unwrap();
+        let hist = s.history("n.md", "u1").await.unwrap();
         let versions: Vec<u64> = hist.iter().map(|a| a.version).collect();
         let bodies: Vec<&str> = hist.iter().map(|a| a.body.as_str()).collect();
         assert_eq!(versions, vec![1, 2, 3]);
         assert_eq!(bodies, vec!["v1", "v2", "v3"], "no version is destroyed");
+    }
+
+    #[tokio::test]
+    async fn history_orders_by_version_not_physical_row_order() {
+        // Low#4: the public API always writes in order, so insertion order equals
+        // version order and never exercises `ORDER BY version`. Insert version
+        // rows OUT OF ORDER via raw SQL and prove history() still sorts them.
+        let s = store().await;
+        for v in [3i64, 1, 2] {
+            sqlx::query(
+                "INSERT INTO mem_artifact_versions
+                     (scope_owner, path, version, body, db_checksum, file_checksum,
+                      scope, updated_by, reason, at)
+                 VALUES ('u1', 'n.md', ?, ?, 'x', 'x', '{\"owner\":\"u1\"}', 'a', 'r', 't')",
+            )
+            .bind(v)
+            .bind(format!("body-{v}"))
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        let hist = s.history("n.md", "u1").await.unwrap();
+        let versions: Vec<u64> = hist.iter().map(|a| a.version).collect();
+        assert_eq!(versions, vec![1, 2, 3], "ORDER BY version, not row order");
     }
 
     #[tokio::test]
@@ -374,37 +415,122 @@ mod tests {
         assert_eq!(a.version, 1);
         assert_eq!(b.version, 1);
         assert_eq!(
-            s.read("core.md", &Scope::owner("alice"))
-                .await
-                .unwrap()
-                .unwrap()
-                .body,
+            s.read("core.md", "alice").await.unwrap().unwrap().body,
             "alice-core"
         );
         assert_eq!(
-            s.read("core.md", &Scope::owner("bob"))
-                .await
-                .unwrap()
-                .unwrap()
-                .body,
+            s.read("core.md", "bob").await.unwrap().unwrap().body,
             "bob-core"
         );
         // bob cannot see alice's history and vice versa.
-        assert_eq!(
-            s.history("core.md", &Scope::owner("bob"))
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(s.history("core.md", "bob").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_is_owner_scoped_narrowing_is_not_isolation() {
+        // B2: an artifact belongs to an OWNER and spans sessions. Two DIFFERENT
+        // sessions of the SAME owner see and edit the SAME core — the write from
+        // sess-A is visible to sess-B, and identity ignores the session. (The
+        // signature takes `owner: &str`, so a caller cannot even be misled into
+        // thinking a session narrows the read.)
+        let s = store().await;
+        let a_scope = Scope::owner("u1").with_session("sess-A");
+        s.cas_write(
+            Artifact::draft("core.md", "from-A", a_scope, "agent", "w"),
+            0,
+        )
+        .await
+        .unwrap();
+        // Read by owner sees it regardless of any session.
+        let got = s.read("core.md", "u1").await.unwrap().unwrap();
+        assert_eq!(got.body, "from-A");
+        // A different session of the same owner edits the same identity.
+        let b_scope = Scope::owner("u1").with_session("sess-B");
+        let v2 = s
+            .cas_write(
+                Artifact::draft("core.md", "from-B", b_scope, "agent", "w"),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v2.version, 2, "same (owner, path) identity across sessions");
     }
 
     #[tokio::test]
     async fn empty_owner_is_rejected() {
-        // CHECK(scope_owner <> '') — an unowned artifact is not valid.
+        // CHECK(trim(scope_owner) <> '') — an unowned artifact is not valid.
         let s = store().await;
         let err = s.cas_write(draft("", "n.md", "x"), 0).await.unwrap_err();
         assert!(matches!(err, MemoryError::Sqlx(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn whitespace_owner_is_rejected() {
+        // Low: "   " is unowned memory too (trim()).
+        let s = store().await;
+        let err = s.cas_write(draft("   ", "n.md", "x"), 0).await.unwrap_err();
+        assert!(matches!(err, MemoryError::Sqlx(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn empty_path_is_rejected() {
+        // Low: CHECK(trim(path) <> '') was previously unexercised.
+        let s = store().await;
+        let err = s.cas_write(draft("u1", "", "x"), 0).await.unwrap_err();
+        assert!(matches!(err, MemoryError::Sqlx(_)), "{err}");
+        let err = s.cas_write(draft("u1", "  ", "x"), 0).await.unwrap_err();
+        assert!(matches!(err, MemoryError::Sqlx(_)), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cas_write_on_real_pool_yields_one_winner_rest_conflict() {
+        // B1: the regression that single-connection `open_memory()` cannot catch.
+        // On a real multi-connection WAL pool, N writers race the SAME
+        // expect_version; exactly one wins and EVERY loser must get a clean
+        // `Conflict`, never a raw "database is locked" (which BEGIN IMMEDIATE
+        // prevents by serializing on the write lock).
+        let path = temp_db("cas-race");
+        let store = KvStore::open(&path).await.unwrap();
+        let s = store.artifacts();
+        s.cas_write(draft("u1", "n.md", "seed"), 0).await.unwrap(); // version 1
+
+        let n = 6;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                s2.cas_write(draft("u1", "n.md", &format!("w{i}")), 1).await
+            }));
+        }
+        let (mut ok, mut conflict, mut other) = (0, 0, 0);
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(MemoryError::Conflict(_)) => conflict += 1,
+                Err(e) => {
+                    other += 1;
+                    eprintln!("unexpected non-Conflict error: {e}");
+                }
+            }
+        }
+        assert_eq!(ok, 1, "exactly one writer wins");
+        assert_eq!(
+            other, 0,
+            "every loser gets Conflict, never a raw lock error"
+        );
+        assert_eq!(conflict, n - 1);
+        // Final state is a single clean version-2 pointer over a contiguous
+        // 2-version history — no lost update, no version hole.
+        assert_eq!(s.read("n.md", "u1").await.unwrap().unwrap().version, 2);
+        let versions: Vec<u64> = s
+            .history("n.md", "u1")
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.version)
+            .collect();
+        assert_eq!(versions, vec![1, 2]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
