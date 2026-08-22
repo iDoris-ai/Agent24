@@ -50,6 +50,18 @@ pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response
 /// reports both through the same error type — conflating them would answer 400
 /// for an oversized upload, which reads as "your JSON is malformed" and sends
 /// the caller looking in the wrong place.
+// `Response` is genuinely large (>128 bytes), which is what the lint measures. Boxing
+// it would satisfy the lint but is the wrong trade here: this `Err` never travels —
+// every one of the dozen callers immediately `return`s it as the handler's response —
+// so the box buys an allocation on every error path and a deref at every call site, to
+// avoid a move that only ever happens once. Scoped to this function on purpose: a
+// future oversized `Err` elsewhere still fires.
+//
+// The alternative worth considering is a small error enum here plus `into_response()`
+// at the call sites — that would separate WHAT went wrong from HOW it is rendered and
+// drop the allow entirely, but it touches every caller, so it is left as a deliberate
+// choice for the owner rather than smuggled into a CI fix.
+#[allow(clippy::result_large_err)]
 pub async fn read_body_or_response(req: Request<Body>) -> Result<Bytes, Response> {
     match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => Ok(b),
