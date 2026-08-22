@@ -6,7 +6,7 @@
 >
 > **状态**:🟢 MD-1 spike 已交付并冻结签名(见 §2.1);MD-2a/2b 权威层已合并。MD-1c 后向量实现/SQLite DDL 仍按各自 MD-x 落。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
 >
-> **进度**:✅ MD-1(a/b/c 全交付,签名冻结)· ✅ MD-2(a/b/c)· ✅ MD-3(a/b)· ✅ MD-4 写门(核心,bulk rollback 挂 MD-4b)·（下一步:MD-5 巩固循环)。
+> **进度**:✅ MD-1(a/b/c)· ✅ MD-2(a/b/c)· ✅ MD-3(a/b)· ✅ MD-4 写门(核心)· ✅ MD-5 巩固循环 ·（下一步:MD-6 本地向量 retriever(可选))。
 
 ---
 
@@ -149,7 +149,7 @@ trait ProjectionJob{ async fn run_from(&self, ckpt: CheckpointId)->R<ProjectionO
 | **MD-2** ✅ | **EventStore + ArtifactStore**(权威层):事件表 + markdown-CAS + 双谱系对账(checksum 移动检测) | MD-1 | 事件 append/scan/checkpoint 幂等;CAS 拒陈旧写;外部改文件→对账不静默删;rebuild 从事件重建投影 | ✅ 2a EventStore(#114)· ✅ 2b ArtifactStore(#115)· ✅ 2c 对账(`reconcile` 四类状态 + checksum 移动检测 + **无静默删** + 确定性 + path-safe `observe_dir`);rebuild-from-events 见 `replay`(MD-1b) |
 | **MD-3** ✅ | **AssertionStore 双时相 + Retriever(FTS)**:断言表两区间 + 证据链 + `qualified` 门;FTS 检索 + scope 隔离 | MD-2 | 写-查-失效-`as_of(valid,recorded)` 回看;矛盾=新版本非删;候选不进默认召回;scope 泄漏 0 | ✅ **3a AssertionStore**(双时相四象限 + supersede 非删 + qualified 门 + 跨 scope 零泄漏,migration 0004)· ✅ **3b Retriever**(FTS5 投影 migration 0005:MATCH 检索 + owner 隔离 + 仅当前/qualified + bm25 排序 + 确定性 rebuild + 查询消毒) |
 | **MD-4** 🟢 | **MemoryWriter 写门(治理)**:candidate→闭 schema 校验→确定性策略→approve/commit;强制 owner;origin/trust;审计 | MD-3 | 恶意 ToolOutput/WebFetch 默认不落持久;UserSaid+显式 remember 才自动 commit;dry-run/review;bulk rollback | ✅ 核心:确定性策略(WebFetch/Unknown→Reject 不落持久;UserSaid+remember/System→Commit qualified;UserSaid/Model/ToolOutput→Hold 候选不进召回)+ 强制 owner + `mem.write_decision` 审计可回放 + dry-run 无副作用 + 投毒语料测试。🔜 **bulk rollback + turn→candidate 抽取**挂 MD-4b(文档标注为边界) |
-| **MD-5** | **Consolidator 巩固循环**:后台读未巩固事件→写 insight→更新 persona;importance/consolidated 标记 | MD-3 | 巩固幂等;importance 排序;增量==全量重跑 | LongMemEval/LoCoMo 相对纯检索有提升(对照) |
+| **MD-5** 🟢 | **Consolidator 巩固循环**:后台读未巩固事件→写 insight→更新 persona;importance/consolidated 标记 | MD-3 | 巩固幂等;importance 排序;增量==全量重跑 | ✅ `Consolidator::run_once`/`insights` + `InsightSynth`(默认确定性 `CountSynth`)+ migration 0006:巩固幂等 + importance 排序 + **增量==全量重跑** + 跨 scope 零泄漏(每个巩固=其 key 所有事件的纯函数)。🔜 LLM 版 synth + LongMemEval 对照增益、checkpoint 增量优化留后续 |
 | **MD-6** | **Retriever 本地向量(可选)**:`OmlxEmbedder` + SQLite 向量 + 双索引迁移 + FTS 兜底;`Embedding{model_id,revision,dims}` | MD-3, D4b | 换模型触发 reindex 状态机;可续重嵌;混版本行为 | 语义召回优于纯 FTS 对照 + reindex 不丢 |
 | **MD-7** | **知识/指令层(L4)**:层级 markdown(CLAUDE.md 式)合并 + 触发注入 + **审核门控 auto-memory inbox**(gemini-cli) | MD-2 | 层级合并优先级;触发命中;auto-memory 从不自动应用 | 层级覆盖正确 + inbox 需人批 |
 | **MD-8** | **长任务符号轨迹(H1/H2)**:全量工具日志落 `refs/*.md`,留符号图 + `node_id` 下钻(TencentDB) | MD-2 | 符号图可下钻回原文;压缩可恢复(非截断) | 轨迹压缩率 + 100% 可恢复 |

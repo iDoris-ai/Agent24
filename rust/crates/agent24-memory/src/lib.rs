@@ -11,6 +11,7 @@
 pub mod artifact;
 pub mod assertion;
 pub mod condenser;
+pub mod consolidator;
 pub mod eval;
 pub mod event;
 pub mod reconcile;
@@ -130,6 +131,12 @@ impl KvStore {
     /// write-gate, committing an assertion and its audit event atomically.
     pub fn write_gate(&self) -> writer::WriteGate {
         writer::WriteGate::new(self.pool.clone())
+    }
+
+    /// An [`consolidator::EventConsolidator`] over the SAME database file — MD-5's
+    /// consolidation loop, with the default deterministic [`consolidator::CountSynth`].
+    pub fn consolidator(&self) -> consolidator::EventConsolidator<consolidator::CountSynth> {
+        consolidator::EventConsolidator::new(self.pool.clone(), consolidator::CountSynth)
     }
 
     /// Upsert a raw JSON value.
