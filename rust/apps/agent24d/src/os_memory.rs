@@ -124,9 +124,11 @@ pub struct OsMemoryPartition {
     pub key: String,
     /// The logical user the partition belongs to.
     pub user: String,
-    /// The module's manifest name AT THE TIME OF MOUNT. A rename changes this;
-    /// the key it produced does not change, which is exactly the debt the
-    /// catalog exists to make payable.
+    /// The module's manifest name AT THE TIME OF MOUNT.
+    ///
+    /// A rename produces a DIFFERENT key and therefore a different partition —
+    /// the old one keeps its data under its old name and is never visited again.
+    /// That orphan is exactly the debt the catalog exists to make payable.
     pub module: String,
 }
 
@@ -245,6 +247,13 @@ impl OsScopedMemory {
     /// appending while another task reads keeps every page full, so the loop
     /// chases a tail that keeps moving. A descending cursor only ever decreases,
     /// so concurrent appends land above it and the walk ends.
+    ///
+    /// Honest about the size of that second argument: keeping a page full needs
+    /// [`RECALL_PAGE`] appends per page-read, which a real writer does not sustain
+    /// — an attempt to pin it with a test failed to distinguish the two shapes at
+    /// all (see the note in this file's tests). The bound is worth having because
+    /// it is structural rather than a matter of relative speed, but the reason to
+    /// read backwards is the first one: `recent` becomes one query.
     async fn page(&self, before: Option<i64>, size: i64) -> agent24_domain::Result<Page> {
         let mut q = EventQuery::owner(&self.key).newest().limit(size);
         if let Some(b) = before {
@@ -370,8 +379,11 @@ impl ScopedMemory for OsScopedMemory {
         // `recent(usize::MAX)` became `LIMIT i64::MAX` and defeated the memory
         // crate's own scan cap; forward paging to a short page could not terminate
         // against a concurrent writer. Backwards, the cursor only decreases, and a
-        // query whose matches are recent costs a page rather than a partition —
-        // while an old match is still found, because the walk does not stop early.
+        // query whose matches are recent costs a page rather than a partition. It
+        // stops when `want` matches are in hand or history runs out — so matches
+        // OLDER than the newest `want` are deliberately not returned, which is what
+        // a limit means; what it does not do is stop at a page boundary and call
+        // that the end.
         let want = limit.min(MAX_RESULTS);
         if want == 0 {
             return Ok(Vec::new());
@@ -728,48 +740,29 @@ mod tests {
         assert!(m.recall("note", 0).await.unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn a_read_terminates_while_another_task_keeps_appending() {
-        // The non-termination review found: paging FORWARD to a short page chases a
-        // tail that keeps moving, because a writer keeps every page full. Reading
-        // backwards, the cursor only decreases, so appends land above it.
-        //
-        // The writer keeps going for the whole read; if the read walked forwards it
-        // would not finish, and this test would hang rather than fail — which is
-        // why it is wrapped in a timeout.
-        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
-        let m = std::sync::Arc::new(handle(&kv, "alice", "sin90").await);
-        for _ in 0..(RECALL_PAGE * 2) {
-            m.remember(Remember::new("note", serde_json::Map::new()))
-                .await
-                .unwrap();
-        }
-        let writer = {
-            let m = m.clone();
-            tokio::spawn(async move {
-                for _ in 0..2000 {
-                    if m.remember(Remember::new("note", serde_json::Map::new()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-        };
-        // A query that matches NOTHING, so the search cannot stop early on hits and
-        // must walk the partition to the end.
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            m.recall("no-such-content-anywhere", 10),
-        )
-        .await
-        .expect("a read must terminate against a concurrent writer")
-        .unwrap();
-        assert!(read.is_empty());
-        writer.abort();
-    }
+    // There is deliberately NO test here for "a read terminates against a
+    // concurrent writer", and the reason is worth more than the test was.
+    //
+    // Review's argument was that forward paging to a short page has no upper bound
+    // on iterations: a writer keeps every page full, so the walk chases a moving
+    // tail. The SHAPE of that argument is right, and it is why the reads page
+    // backwards now — a decreasing cursor bounds the walk structurally.
+    //
+    // But the situation is not reachable at these page sizes, and the test written
+    // to prove it did not: an unbounded writer, a matchless query forcing a full
+    // walk, an asserted before/after overlap — and reverting to forward paging
+    // still passed, in 0.18s. It has to: the writer must sustain RECALL_PAGE (500)
+    // appends per page-read to keep a page full, while it actually manages one or
+    // two per round trip. So the test asserted a property it could not observe,
+    // which is the exact thing the last five review rounds on this repo kept
+    // deleting.
+    //
+    // What backwards paging demonstrably buys is `recent`: one descending query
+    // instead of a walk of the whole partition. That is pinned by
+    // `recent_returns_the_newest_not_the_oldest` and
+    // `max_results_is_the_stated_cap_and_it_is_the_newest_that_survive`. The
+    // termination property is an argument about the loop, and it belongs in the
+    // comment on `page` where it is, not in a test that cannot fail.
 
     #[test]
     fn the_partition_key_is_versioned_and_unambiguous() {

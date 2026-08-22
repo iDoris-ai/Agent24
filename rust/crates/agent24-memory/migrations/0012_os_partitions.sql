@@ -28,8 +28,14 @@ CREATE TABLE mem_os_partitions (
     key_version   TEXT NOT NULL CHECK (trim(key_version, char(32)||char(9)||char(10)||char(13)) <> ''),
     -- The logical user, recorded rather than parsed back out of the key.
     logical_user  TEXT NOT NULL CHECK (trim(logical_user, char(32)||char(9)||char(10)||char(13)) <> ''),
-    -- The module's manifest name AT FIRST SIGHT. A rename does not change the
-    -- key, so this is the only record of what the key originally meant.
+    -- The module's manifest name AT FIRST SIGHT, and write-once.
+    --
+    -- A rename does NOT rewrite this row: the key is derived from the name, so a
+    -- renamed module produces a NEW partition and leaves the old one behind, data
+    -- and all, under the old name. That is exactly the debt design C accepted, and
+    -- this column is the only thing that can later say what the abandoned key
+    -- meant — the key itself cannot be asked, and the running kernel no longer
+    -- knows the old name.
     module_name   TEXT NOT NULL CHECK (trim(module_name, char(32)||char(9)||char(10)||char(13)) <> ''),
     first_seen_at TEXT NOT NULL,
     last_seen_at  TEXT NOT NULL
