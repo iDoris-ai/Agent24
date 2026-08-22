@@ -214,6 +214,42 @@ impl EventLog {
         Self { pool }
     }
 
+    /// Append an event on a caller-owned connection with a PLAIN insert — an `id`
+    /// collision is an error that rolls the caller's transaction back, NOT a
+    /// silent no-op. `pub(crate)` so MD-4's write-gate can write an audit event in
+    /// the SAME transaction as the assertion it audits (review #121 B1): if the
+    /// audit cannot be written, the belief must not be either. The write-gate
+    /// mints a CONTENT-ADDRESSED audit id, so a collision means either an exact
+    /// replay (the assertion collides first) or a pre-occupied id — both correctly
+    /// abort rather than commit a belief the audit does not describe.
+    pub(crate) async fn append_tx(
+        conn: &mut sqlx::sqlite::SqliteConnection,
+        e: &MemEvent,
+    ) -> Result<()> {
+        let scope_json = serde_json::to_string(&e.scope)?;
+        let payload = serde_json::to_string(&e.body)?;
+        let causal = serde_json::to_string(&e.causal)?;
+        sqlx::query(
+            "INSERT INTO mem_events
+                 (id, scope_owner, scope_session, scope, kind, payload,
+                  origin_source, origin_trust, causal, at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&e.id)
+        .bind(&e.scope.owner)
+        .bind(&e.scope.session)
+        .bind(&scope_json)
+        .bind(&e.kind)
+        .bind(&payload)
+        .bind(&e.origin.source)
+        .bind(e.origin.trust.as_str())
+        .bind(&causal)
+        .bind(&e.at)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     fn row_to_stored(row: &sqlx::sqlite::SqliteRow) -> Result<StoredEvent> {
         let scope: Scope = serde_json::from_str(&row.get::<String, _>("scope"))?;
         let body: Value = serde_json::from_str(&row.get::<String, _>("payload"))?;
