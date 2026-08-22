@@ -18,6 +18,7 @@ pub mod reconcile;
 pub mod replay;
 pub mod retriever;
 pub mod session;
+pub mod vector;
 pub mod writer;
 
 use std::path::Path;
@@ -137,6 +138,16 @@ impl KvStore {
     /// consolidation loop, with the default deterministic [`consolidator::CountSynth`].
     pub fn consolidator(&self) -> consolidator::EventConsolidator<consolidator::CountSynth> {
         consolidator::EventConsolidator::new(self.pool.clone(), consolidator::CountSynth)
+    }
+
+    /// A [`vector::VectorRetriever`] over the SAME database file with a chosen
+    /// [`vector::Embedder`] (MD-6). The embedder is caller-supplied (`OmlxEmbedder`
+    /// in production, pending D4b) so the store never hard-depends on a model runtime.
+    pub fn vector_retriever<E: vector::Embedder + Clone>(
+        &self,
+        embedder: E,
+    ) -> vector::VectorRetriever<E> {
+        vector::VectorRetriever::new(self.pool.clone(), embedder)
     }
 
     /// Upsert a raw JSON value.
