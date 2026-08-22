@@ -34,6 +34,9 @@ improvement/
 - [ ] 收紧 `mem_events` 的 `scope_owner` CHECK 到 `trim(...)`(需新迁移;0002 已发布不可改)。
 - [ ] **领域 OS 之间的记忆隔离/共享模型**:Sin90 与 Cos72 各自挂载时,底层 memory 是**同库不同 scope**、**不同库**、还是**可选共享的显式通道**?给出方案对比 + 推荐 + 污染面分析。
 - [ ] 落地 ADR-029 里那个**尚未实现**的洞:`KernelCtx::memory(scope, grants) -> ScopedMemory`(能力受限句柄,不是 ambient `MemoryStore`)。这是隔离能否成立的关键,属 M-E(ME-1)范围。
+- [ ] **模块目录的 symlink 安全**:ME-1b-a 的挂载器只做了「目标已是 symlink 就**不用它、把该模块降级为 503**」的**检查**(catch 掉真实会发生的那种:`~/.agent24/os/cos72` 软链到 sin90 目录 = 两个 OS 共用一个库),但**不是保证** —— `root` 的任一祖先仍可以是软链,且 `symlink_metadata` 到 `create_dir_all` 之间存在 TOCTOU。真正的隔离需要 `openat` 式目录句柄(`cap-std` / `openat2`)。契约文字已同步收窄,不再声称做到了。
+- [ ] **领域 OS 命名空间应否改为 `/api/v1/os/<name>`**:现在是 `/api/v1/<name>`(ADR-029 / SPEC-MD-ME §2 钉死),后果是**模块名可能撞上内核路由段**——axum 对精确路由重叠会 **panic**,即一个第三方 OS 取名 `health` 就能让 daemon 起不来。ME-1b-a 用「保留段名单 + 从 `build_router` 源码反推的防过期测试」挡住了,但那是**检查**;`/api/v1/os/<name>` 会让这类冲突**不可表达**。属于要改 ADR 的架构决定,列此待判。
+- [ ] **ME-1b-b 必须带 Sin90 数据迁移**(对抗复查发现,否则是静默数据丢失):今天 Sin90 开的是 `~/.agent24/sin90.db`,挂载器给的新位置是 `~/.agent24/os/sin90/sin90.db` —— **不迁移的话老用户升级后看到的是一个空 Sin90**。最小安全形状(迁移逻辑放在 Sin90 模块里,不放通用挂载器):① 先拿到 daemon 单例锁;② 新库已存在 → 视为迁移完成,**绝不**用旧库覆盖;③ 旧库不存在 → 正常新建;④ 旧在新不在 → 用 SQLite 的 backup API / `VACUUM INTO` 导出一致快照到目标目录下的**临时**库(**不要**把 `.db`/`.db-wal`/`.db-shm` 当三个文件搬——搬不成原子,且崩溃后已提交数据可能只在 WAL 里),`quick_check` 后**原子 rename**;⑤ rename 成功后才打开并跑迁移;⑥ 任何一步失败 → 返回 `Err` 让模块降级,**不要**掉进 `create_if_missing` 静默产出空库;⑦ 旧库原地保留作回滚快照。**不要**在新旧路径间做软链/硬链(WAL 锁和 sidecar 文件名与路径绑定,两个别名会损坏库)。降级不可写同步,只能明确写进文档。
 - [ ] 给出**跨 OS 共享**的显式机制设计(若确实需要):共享什么(assertions? artifacts?)、谁授权、怎么审计、怎么撤销。
 
 **今日事实基线(不是结论,是现状快照;经 #126 复审逐表核对后订正)**:

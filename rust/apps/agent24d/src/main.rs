@@ -4,6 +4,7 @@
 //! stdout ready line, dynamic port, CancellationToken-driven graceful shutdown.
 
 mod approvals;
+mod domain;
 mod events;
 mod mcp;
 mod overrides;

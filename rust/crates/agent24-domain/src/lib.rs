@@ -26,6 +26,11 @@
 //!   `if ctx.grants().has(..) { ctx.events().unwrap() }`, which panics the moment
 //!   the two disagree.
 //!
+//! [`http`] carries the fourth piece: the v1 error envelope and body limit, so
+//! kernel and module CAN answer identically. It does not make them: nothing forces
+//! a module's handlers through these helpers — it removes the excuse for a second
+//! error shape, and the mounter uses them for the responses IT owns.
+//!
 //! **In-process modules are pinned to axum 0.8.** [`DomainModule::routes`] returns
 //! an `axum::Router`, so this crate is a contract in types but not
 //! framework-neutral. That is a deliberate ME-1b trade: a boxed tower service via
@@ -67,6 +72,8 @@
 //! ADR-029's open hole, which must consult kernel-owned policy and must NOT take a
 //! caller-supplied [`Grants`]); the model / scheduler / policy handles; and the
 //! out-of-process Provider path (ME-3).
+
+pub mod http;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -337,11 +344,14 @@ impl DomainOsManifest {
     /// **This is a lexical guarantee only.** It does not stop two module
     /// directories from being symlinks to one place, and it cannot stop an
     /// implementation of [`DomainModule::open_store`] from ignoring the path it is
-    /// handed. Physically isolating stores is ME-1b's mounter: create the directory
-    /// itself, refuse to follow unsafe symlinks, and pass a path it has already
-    /// validated. (Do not "harden" this with `canonicalize`: it resolves only when
-    /// root and target already exist — false on first start — and it is
-    /// TOCTOU-prone.)
+    /// handed. The mounter (ME-1b) creates the directory and DECLINES one that is
+    /// already a symlink — degrading that module to 503 rather than letting two
+    /// domain OSes resolve to one store. That catches the case that occurs in
+    /// practice, but it is a check, not symlink-safe traversal: an ancestor may
+    /// still be a link and the check is TOCTOU-prone. Real isolation needs `openat`-style directory
+    /// handles; it is tracked, not claimed. (Do not "harden" this with
+    /// `canonicalize` either: it resolves only when root and target already exist —
+    /// false on first start — and is TOCTOU-prone in the same way.)
     pub fn data_dir_under(&self, root: &Path) -> PathBuf {
         root.join(&self.name)
     }
@@ -532,9 +542,13 @@ pub trait DomainModule: Send + Sync {
     /// This module's validated manifest — its identity, capabilities and kind.
     fn manifest(&self) -> &DomainOsManifest;
 
-    /// Open this module's own store under `dir` (which the kernel derived via
-    /// [`DomainOsManifest::data_dir_under`] and created), running its own
-    /// migrations.
+    /// Open this module's own store, running its own migrations.
+    ///
+    /// `dir` is the PERSISTENT location the kernel assigned it (derived via
+    /// [`DomainOsManifest::data_dir_under`] and created before this call). A module
+    /// configured for ephemeral operation may legitimately ignore it and open an
+    /// in-memory store instead — that choice belongs to the module's constructor,
+    /// not to this trait, which is why there is no mode parameter here.
     ///
     /// The trait cannot ENFORCE what happens on failure — an implementation is
     /// free to return `Err` and still hand back a router that answers 200 — so the
@@ -546,8 +560,8 @@ pub trait DomainModule: Send + Sync {
 
     /// The module's routes, RELATIVE to its namespace (`/directions`, not
     /// `/api/v1/sin90/directions`). The kernel nests them under
-    /// [`DomainOsManifest::route_namespace`], so a module never spells its own
-    /// prefix and cannot mount outside it.
+    /// [`DomainOsManifest::route_namespace`], so a module need not spell its own
+    /// prefix — and, whatever it spells, cannot mount outside that namespace.
     ///
     /// `Router<()>` means the module has already bound all of its OWN state; `ctx`
     /// is an `Arc` because handlers outlive this call and must keep it.

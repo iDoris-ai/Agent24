@@ -8,52 +8,18 @@ use agent24_protocol::{
     ChatRequest, ChatResponse, ErrorBody, EventBody, Model, ModelDeltaPayload, RunCompletedPayload,
     RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
 };
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 
 use crate::server::{AppState, error_response};
 
-/// 1 MiB body cap — mirrors the node daemon (loopback is not a DoS boundary)
-pub const MAX_BODY_BYTES: usize = 1024 * 1024;
-
-/// Read a capped body, mapping every failure to a v1 envelope
-/// (axum's default extractor rejections are plain-text and would violate it).
-// Err is the shared v1-envelope Response (same allow the sin90.rs helpers carry).
-// clippy 1.98 EXTENDED `result_large_err` to cover `async fn` return types — the
-// ~128-byte threshold is unchanged; this is an async fn, so it now trips the lint
-// where earlier clippy only checked sync fns.
-#[allow(clippy::result_large_err)]
-pub async fn read_body_or_response(req: Request<Body>) -> Result<Bytes, Response> {
-    match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
-        Ok(b) => Ok(b),
-        Err(err) => {
-            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
-            let mut is_limit = false;
-            while let Some(e) = source {
-                if e.is::<http_body_util::LengthLimitError>() {
-                    is_limit = true;
-                    break;
-                }
-                source = e.source();
-            }
-            Err(if is_limit {
-                error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "payload_too_large",
-                    &format!("Request body exceeds {MAX_BODY_BYTES} bytes"),
-                )
-            } else {
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "failed to read request body",
-                )
-            })
-        }
-    }
-}
+// The v1 body cap and reader live in the CONTRACT crate since ME-1b: a domain OS
+// in its own crate must produce the same envelope and enforce the same limit, and
+// two copies would drift. Re-exported (not redefined) so every existing call site
+// keeps working and there is exactly ONE definition.
+pub use agent24_domain::http::read_body_or_response;
 
 /// Single guarded value (not three independent atomics): record+snapshot are
 /// each atomic as a whole, so a snapshot can never observe a torn update where
@@ -88,33 +54,12 @@ pub async fn get_usage(State(state): State<AppState>) -> Response {
 }
 
 pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Response {
-    let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
+    // The third copy of this logic used to live inline here; it is byte-for-byte
+    // the shared reader's behavior (413 only on a real length-limit hit, 400 for a
+    // disconnect or malformed transfer encoding).
+    let bytes = match read_body_or_response(req).await {
         Ok(b) => b,
-        Err(err) => {
-            // Only an actual length-limit hit is 413; disconnects / malformed
-            // transfer encodings are the client's bad request, not "too large"
-            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
-            let mut is_limit = false;
-            while let Some(e) = source {
-                if e.is::<http_body_util::LengthLimitError>() {
-                    is_limit = true;
-                    break;
-                }
-                source = e.source();
-            }
-            if is_limit {
-                return error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "payload_too_large",
-                    &format!("Request body exceeds {MAX_BODY_BYTES} bytes"),
-                );
-            }
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                "failed to read request body",
-            );
-        }
+        Err(r) => return r,
     };
     let parsed: Result<ChatRequest, _> = serde_json::from_slice(&bytes);
     let chat = match parsed {

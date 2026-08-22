@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_models::router::ModelRouter;
-use agent24_protocol::{ErrorBody, ErrorEnvelope, Health};
+use agent24_protocol::Health;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
@@ -274,16 +274,7 @@ impl AppState {
     }
 }
 
-pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = ErrorEnvelope {
-        error: ErrorBody {
-            code: code.to_owned(),
-            message: message.to_owned(),
-            details: None,
-        },
-    };
-    (status, Json(body)).into_response()
-}
+pub use agent24_domain::http::error_response;
 
 async fn health() -> Json<Health> {
     Json(Health {
@@ -343,8 +334,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The kernel router with NO domain OS mounted. Test-only since ME-1b: the real
+/// startup path always goes through [`build_router_with_modules`], and a
+/// production caller that skipped the mounter would silently serve a daemon with
+/// no modules.
+#[cfg(test)]
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    build_router_with_modules(state, Router::new())
+}
+
+/// The kernel router with `modules` (from [`crate::domain::mount_all`]) folded in.
+///
+/// **The fold happens BEFORE `.layer(auth)` on purpose.** An axum layer applies
+/// only to the routes already on the router, so nesting modules after the auth
+/// layer would leave every module route unauthenticated — the modules would be a
+/// hole in the daemon's only access control. `module_routes_are_behind_kernel_auth`
+/// is the regression test; do not reorder these two lines.
+pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
+    let kernel = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
@@ -426,8 +433,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/runs/{id}", get(crate::runs::get_run))
         .route("/api/v1/runs/{id}/cancel", post(crate::runs::cancel_run))
         .fallback(fallback)
-        .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Modules first, auth last — see the doc comment above.
+    kernel
+        .merge(modules)
+        .layer(middleware::from_fn_with_state(state, auth))
 }
 
 pub fn generate_token() -> String {
@@ -609,7 +620,29 @@ pub async fn serve(
         sched_cancel,
     ));
 
-    let router = build_router(state);
+    // Domain OSes (ME-1b). The registry is EMPTY, so this runs the ZERO-module
+    // path and produces no reports — it is wiring, not coverage; the mounter's
+    // real behavior is covered by `domain::tests`. It is here rather than behind a
+    // TODO so the registry slot is already wired when ME-1b-b moves Sin90 behind
+    // `DomainModule` — that change still has to delete the hardcoded sin90 routes
+    // and `AppState.sin90`, drop `sin90` from RESERVED_KERNEL_SEGMENTS, and migrate
+    // `~/.agent24/sin90.db` to the new per-module directory.
+    let os_root = agent24_protocol::state_file::state_dir()
+        .ok_or_else(|| std::io::Error::other("HOME not set"))?
+        .join("os");
+    let installed: Vec<StdArc<dyn agent24_domain::DomainModule>> = Vec::new();
+    let (module_routes, reports) =
+        crate::domain::mount_all(&installed, &os_root, &state.events).await;
+    for r in &reports {
+        tracing::info!(
+            "domain OS {} at {}: {:?} (grants: {:?})",
+            r.name,
+            r.namespace,
+            r.outcome,
+            r.granted
+        );
+    }
+    let router = build_router_with_modules(state, module_routes);
 
     // 127.0.0.1 only — never a public bind (SPEC-001 §9)
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -706,14 +739,17 @@ pub async fn serve(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    async fn state() -> AppState {
+    /// A daemon state wired for tests. `pub(crate)` so the mounter's tests in
+    /// `domain.rs` can merge a module into the REAL kernel router — testing the
+    /// degraded 503 against a stub router would not show which fallback wins.
+    pub(crate) async fn state() -> AppState {
         state_with_guardian(None).await
     }
 
@@ -808,6 +844,87 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let json = body_json(res).await;
         assert_eq!(json["error"]["code"], "unauthorized");
+    }
+
+    /// A MOUNTED domain OS is behind the kernel's auth, exactly like a kernel
+    /// route.
+    ///
+    /// This is the regression for the mount-order hazard in
+    /// [`build_router_with_modules`]: an axum layer applies only to the routes
+    /// already on the router, so the version of this that "obviously compiles" —
+    /// `kernel.with_state(state).layer(auth).merge(modules)` — mounts every module
+    /// route with NO authentication at all. That failure is silent: the module
+    /// works, its tests pass, and the daemon simply serves a module's whole
+    /// surface to anyone who can reach the port. Reorder those two lines and this
+    /// test goes from 401 to 200.
+    #[tokio::test]
+    async fn module_routes_are_behind_kernel_auth() {
+        use agent24_domain::{DomainModule, DomainOsManifest, KernelCtx};
+
+        struct OpenModule(DomainOsManifest);
+        #[async_trait::async_trait]
+        impl DomainModule for OpenModule {
+            fn manifest(&self) -> &DomainOsManifest {
+                &self.0
+            }
+            async fn open_store(&self, _dir: &std::path::Path) -> agent24_domain::Result<()> {
+                Ok(())
+            }
+            fn routes(&self, _ctx: StdArc<dyn KernelCtx>) -> Router {
+                // Deliberately unauthenticated on its own: modules must not have
+                // to implement auth, the kernel owns it.
+                Router::new().route("/secret", get(|| async { "leaked" }))
+            }
+        }
+
+        let st = state().await;
+        let token = st.token.to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let m = StdArc::new(OpenModule(
+            DomainOsManifest::from_yaml(
+                "name: probe\nversion: \"0.1.0\"\nroute_namespace: /api/v1/probe\n\
+                 event_module: probe\ndata_dir: ~/.agent24/os/probe/\n\
+                 kernel_capabilities: [events]\nimpl_kind: in_process_crate\n",
+            )
+            .unwrap(),
+        ));
+        let (modules, reports) =
+            crate::domain::mount_all(&[m as StdArc<dyn DomainModule>], tmp.path(), &st.events)
+                .await;
+        assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);
+        let router = build_router_with_modules(st, modules);
+
+        // No token: 401, in the kernel's v1 envelope — not the module's 200.
+        let res = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/probe/secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "a module route without a token must 401 — if this is 200, modules \
+             were nested AFTER the auth layer and are an authentication hole"
+        );
+        assert_eq!(body_json(res).await["error"]["code"], "unauthorized");
+
+        // With the token: the module answers.
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/probe/secret")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
