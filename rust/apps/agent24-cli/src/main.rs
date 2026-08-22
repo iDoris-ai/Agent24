@@ -316,16 +316,10 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
             let path = agent24_protocol::state_file::state_dir()
                 .map(|d| d.join("os.json").display().to_string())
                 .unwrap_or_else(|| "~/.agent24/os.json".to_owned());
-            let hint = match &action {
-                OsAction::List => format!("read {path} to see what is configured"),
-                OsAction::Enable { name } | OsAction::Disable { name } => format!(
-                    "edit {path} directly: {{\"domainOs\": {{\"{name}\": {{\"enabled\": {}}}}}}}",
-                    matches!(action, OsAction::Enable { .. })
-                ),
-            };
             return Err(format!(
                 "{e}\n  this command goes through the daemon, which owns os.json. \
-                 If a domain OS is what stops the daemon starting, {hint}"
+                 If a domain OS is what stops the daemon starting, {}",
+                offline_hint(&path, &action)
             ));
         }
     };
@@ -358,6 +352,36 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     };
     finish(ep).await;
     out
+}
+
+/// What to tell a user who cannot reach the daemon.
+///
+/// **It prints ONE ENTRY TO ADD, never a whole document.** The first version
+/// printed a complete, valid `os.json` after the words "edit this file
+/// directly" — and a user with `{"default": "disabled", ...}` who followed that
+/// literally would have wiped their allow-list and silently switched ON every
+/// module in the build. That is precisely the failure this whole feature treats
+/// as fatal ("a config mistake that silently keeps something on"), arrived at by
+/// obeying the tool instead of by mistyping. It is also printed at the WORST
+/// possible moment — only when the daemon will not start, when a user is most
+/// likely to copy something verbatim.
+///
+/// The name is serialised as JSON rather than interpolated, because it reaches
+/// here without ever passing the daemon's name check: `agent24 os disable 'a"b'`
+/// would otherwise print a broken document.
+fn offline_hint(path: &str, action: &OsAction) -> String {
+    match action {
+        OsAction::List => format!("read {path} to see what is configured"),
+        OsAction::Enable { name } | OsAction::Disable { name } => {
+            let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());
+            let enabled = matches!(action, OsAction::Enable { .. });
+            format!(
+                "add this ONE entry inside the \"domainOs\" object in {path} \
+                 (keep everything else that is already there): \
+                 {key}: {{\"enabled\": {enabled}}}"
+            )
+        }
+    }
 }
 
 fn print_os(list: &agent24_protocol::DomainOsList) {
@@ -598,5 +622,71 @@ async fn main() -> std::process::ExitCode {
             eprintln!("error: {err}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn the_offline_hint_never_tells_you_to_replace_the_whole_file() {
+        // The regression that matters: a user with an allow-list who follows this
+        // literally must not end up with every module enabled. The old text was a
+        // complete `os.json` after the words "edit this file directly".
+        let h = offline_hint(
+            "/home/u/.agent24/os.json",
+            &OsAction::Disable {
+                name: "sin90".to_owned(),
+            },
+        );
+        assert!(h.contains("\"sin90\": {\"enabled\": false}"), "{h}");
+        assert!(
+            h.contains("add this ONE entry") && h.contains("keep everything else"),
+            "it must say ADD, and say the rest is to be kept: {h}"
+        );
+        assert!(
+            !h.contains("\"domainOs\": {\"sin90\""),
+            "it must not print a whole document a user could paste over theirs: {h}"
+        );
+        assert!(h.contains("/home/u/.agent24/os.json"), "{h}");
+
+        let h = offline_hint("/p/os.json", &OsAction::Enable { name: "c".into() });
+        assert!(h.contains("\"c\": {\"enabled\": true}"), "{h}");
+    }
+
+    #[test]
+    fn the_offline_hint_escapes_a_name_the_daemon_never_got_to_reject() {
+        // This path runs precisely because the daemon is unreachable, so the name
+        // has NOT been through its validation. Interpolating it raw produced
+        // invalid JSON for the user to paste.
+        let h = offline_hint(
+            "/p/os.json",
+            &OsAction::Disable {
+                name: r#"a"b\c"#.to_owned(),
+            },
+        );
+        // The suggested ENTRY is everything after the last ": " separator; wrapping
+        // it in braces must give a parseable object with that exact key. Parsing
+        // is the assertion — eyeballing the escapes is how the bug got in.
+        let entry = h
+            .rsplit_once("there): ")
+            .expect("the hint must end with the entry to add")
+            .1;
+        let v: serde_json::Value = serde_json::from_str(&format!("{{{entry}}}"))
+            .unwrap_or_else(|e| panic!("the suggested entry is not valid JSON: {e}\n{entry}"));
+        assert_eq!(v[r#"a"b\c"#]["enabled"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn the_list_hint_only_suggests_reading() {
+        let h = offline_hint("/p/os.json", &OsAction::List);
+        assert!(h.contains("read /p/os.json"), "{h}");
+        assert!(
+            !h.contains("enabled"),
+            "listing must not suggest an edit: {h}"
+        );
     }
 }

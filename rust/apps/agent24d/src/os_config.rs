@@ -194,6 +194,30 @@ impl OsConfig {
         // predictable name — is an error rather than something we write THROUGH,
         // truncating whatever it points at.
         let tmp = parent.join(format!("os.json.writing.{}", std::process::id()));
+        // Two guards, doing DIFFERENT jobs — worth saying, because a test that
+        // conflates them proves neither:
+        //
+        // - the clearing below handles a leftover from an interrupted write. A
+        //   pid-keyed name makes that hazard worse exactly where it matters: a
+        //   long-lived daemon keeps one pid, so without this every later PATCH
+        //   would fail on `create_new` with no path to recovery. It is safe because
+        //   the config lock is held, so nothing else can be mid-write to this name;
+        //   and it removes a symlink rather than following it, so a planted link's
+        //   target is untouched.
+        // - `create_new` below is what closes the gap BETWEEN that removal and the
+        //   open. It is not decoration, but it is also not what a test can easily
+        //   reach now that the clearing runs first.
+        // `symlink_metadata`, not `exists`: the latter FOLLOWS the link, so a
+        // DANGLING symlink at this path would look absent, survive the clearing,
+        // and then fail `create_new` forever.
+        if std::fs::symlink_metadata(&tmp).is_ok() {
+            tracing::warn!(
+                "removing a stale {} left by an earlier interrupted write",
+                tmp.display()
+            );
+            std::fs::remove_file(&tmp)
+                .map_err(|e| format!("cannot clear stale {}: {e}", tmp.display()))?;
+        }
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -419,6 +443,85 @@ mod tests {
             leftover_temps(tmp.path()).is_empty(),
             "and no temp file was left behind"
         );
+    }
+
+    #[test]
+    fn a_stale_temp_from_an_interrupted_write_does_not_wedge_the_registry() {
+        // `create_new` is what stops a write following a planted symlink, and the
+        // price is that a leftover temp makes the NEXT write fail. With a pid-keyed
+        // name a long-lived daemon keeps failing forever, which is the state the
+        // guard's own comment says it exists to avoid — so the leftover is cleared.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        let stale = tmp
+            .path()
+            .join(format!("os.json.writing.{}", std::process::id()));
+        std::fs::write(&stale, b"garbage from a crashed write").unwrap();
+
+        let cfg = OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        assert!(!cfg.is_enabled("sin90"));
+        assert!(leftover_temps(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_temp_path_is_removed_not_followed() {
+        // Named for what it PROVES. An earlier version of this test claimed to pin
+        // `create_new` as load-bearing, and it did not: the staleness clearing runs
+        // first and removes the link, so mutating `create_new` away left the test
+        // green. Mutating the CLEARING away is what breaks it.
+        //
+        // `remove_file` unlinks the symlink itself, never its target — which is why
+        // the victim below survives.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(
+            &victim,
+            tmp.path()
+                .join(format!("os.json.writing.{}", std::process::id())),
+        )
+        .unwrap();
+
+        OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not touch",
+            "the symlink target must not have been written through"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&p)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "and os.json must be a real file, not a link"
+        );
+        assert!(!OsConfig::load(&p).unwrap().is_enabled("sin90"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_the_temp_path_does_not_wedge_the_registry() {
+        // The case `exists()` cannot see: it follows the link, so a link to nothing
+        // reads as absent, survives the clearing, and then fails `create_new` on
+        // every subsequent write — permanently, for a daemon that keeps its pid.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        std::os::unix::fs::symlink(
+            tmp.path().join("nothing-here"),
+            tmp.path()
+                .join(format!("os.json.writing.{}", std::process::id())),
+        )
+        .unwrap();
+
+        OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        assert!(!OsConfig::load(&p).unwrap().is_enabled("sin90"));
+        assert!(
+            !tmp.path().join("nothing-here").exists(),
+            "and nothing was created through the link"
+        );
+        assert!(leftover_temps(tmp.path()).is_empty());
     }
 
     #[test]
