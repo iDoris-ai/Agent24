@@ -322,18 +322,54 @@ impl ModelRouter {
         )))
     }
 
-    /// Union of models from reachable providers (unreachable ones skipped).
+    /// Union of models from every provider that yielded a usable list; the rest
+    /// are silently skipped. Use [`Self::models_detailed`] if an ABSENCE has to
+    /// mean something.
     pub async fn models(&self, cancel: &CancellationToken) -> Vec<crate::Model> {
-        let mut all = Vec::new();
+        self.models_detailed(cancel).await.models
+    }
+
+    /// Like [`Self::models`], but says which providers did NOT answer.
+    ///
+    /// The plain list cannot distinguish "this model does not exist" from "the
+    /// provider that has it did not yield a list", because a partial failure still
+    /// returns a non-empty union. Any caller that draws a CONCLUSION from a model's absence
+    /// needs that difference: telling a user to install a model they already have,
+    /// because their provider was briefly unreachable, is a confident wrong answer
+    /// (ME-2's mount-time resource check).
+    pub async fn models_detailed(&self, cancel: &CancellationToken) -> ModelInventory {
+        let mut inv = ModelInventory::default();
         for r in &self.providers {
             match r.provider.models(cancel).await {
-                Ok(mut models) => all.append(&mut models),
+                Ok(mut models) => inv.models.append(&mut models),
                 Err(err) => {
-                    tracing::debug!("models from {} failed: {err}", r.provider.name())
+                    tracing::debug!("models from {} failed: {err}", r.provider.name());
+                    inv.failures.push(format!("{}: {err}", r.provider.name()));
                 }
             }
         }
-        all
+        inv
+    }
+}
+
+/// What a model enumeration actually found, including what it could not reach.
+#[derive(Debug, Default, Clone)]
+pub struct ModelInventory {
+    /// Models from every provider that answered.
+    pub models: Vec<crate::Model>,
+    /// `provider: error` for each provider that did not yield a usable list, so a
+    /// caller can tell an absent model from an unseen provider. Named for the
+    /// OUTCOME, not a cause: unreachable, cancelled, auth-rejected and
+    /// parse-failed all land here, alike in the only way that matters — this sweep
+    /// did not see what that provider has.
+    pub failures: Vec<String>,
+}
+
+impl ModelInventory {
+    /// Whether every configured provider yielded a list. `false` means an absence
+    /// proves nothing.
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
     }
 }
 
@@ -799,5 +835,92 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ModelError::Provider(_)), "{err}");
         assert_eq!(fallback.calls(), 0, "Provider error must not fall through");
+    }
+
+    /// Enumeration-only stubs: `StubProvider::models` always returns an empty
+    /// list, so it cannot express the case these tests are about — a sweep where
+    /// one provider CONTRIBUTES models and another fails.
+    struct Lister(&'static str, Vec<&'static str>);
+    struct Dead(&'static str);
+
+    #[async_trait]
+    impl ModelProvider for Lister {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn complete(
+            &self,
+            _r: &CompletionRequest,
+            _c: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            Err(ModelError::Unavailable("not used".into()))
+        }
+        async fn models(&self, _c: &CancellationToken) -> Result<Vec<crate::Model>, ModelError> {
+            Ok(self
+                .1
+                .iter()
+                .map(|id| crate::Model {
+                    id: (*id).to_owned(),
+                    provider: self.0.to_owned(),
+                    tier: "local".to_owned(),
+                    loaded: true,
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for Dead {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn complete(
+            &self,
+            _r: &CompletionRequest,
+            _c: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            Err(ModelError::Unavailable("down".into()))
+        }
+        async fn models(&self, _c: &CancellationToken) -> Result<Vec<crate::Model>, ModelError> {
+            Err(ModelError::Unavailable("down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn no_providers_is_a_complete_and_empty_inventory() {
+        // Vacuously complete: nobody failed to answer, so an absent model really is
+        // absent. Calling this "cannot tell" would leave a daemon with no provider
+        // configured permanently unable to report anything.
+        let router = ModelRouter::with_defaults(vec![]);
+        let inv = router.models_detailed(&CancellationToken::new()).await;
+        assert!(inv.is_complete());
+        assert!(inv.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_partial_sweep_is_incomplete_even_though_it_returned_models() {
+        // The bug this type exists to prevent: the union is NON-EMPTY, so a caller
+        // looking only at the list would conclude anything absent is missing —
+        // including the models held by the provider that never answered.
+        let router = ModelRouter::with_defaults(vec![
+            (
+                Arc::new(Lister("up", vec!["m1"])) as Arc<dyn ModelProvider>,
+                Tier::Local,
+            ),
+            (
+                Arc::new(Dead("down")) as Arc<dyn ModelProvider>,
+                Tier::Remote,
+            ),
+        ]);
+        let inv = router.models_detailed(&CancellationToken::new()).await;
+        assert_eq!(inv.models.len(), 1, "the union is non-empty");
+        assert!(
+            !inv.is_complete(),
+            "yet it proves nothing about what is missing"
+        );
+        assert!(inv.failures[0].contains("down"), "{:?}", inv.failures);
+        // And the plain `models()` view still hides all of that, which is exactly
+        // why a caller drawing conclusions must not use it.
+        assert_eq!(router.models(&CancellationToken::new()).await.len(), 1);
     }
 }

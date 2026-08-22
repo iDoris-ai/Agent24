@@ -50,6 +50,77 @@ pub struct AppState {
     pub shutdown: CancellationToken,
 }
 
+/// The model ids on offer at startup, for the mount-time resource check.
+///
+/// Three properties, each of which cost a real bug to learn:
+///
+/// - **Enumerated once**, not per module: `ModelRouter::models` queries every
+///   configured provider over the network, so per-module would multiply startup
+///   latency by the module count and make one slow provider look like a module
+///   fault.
+/// - **Enumerated only when needed.** Zero times is better than once. Sin90
+///   declares no models at all today, so an unconditional probe is pure startup
+///   cost — and it lands after MCP's own 10s budget, inside the CLI's 15s ready
+///   deadline. [`Self::skipped`] is what a daemon with nothing to check uses.
+/// - **Completeness is tracked**, not inferred from emptiness. A partial failure
+///   (one provider answers, another is down) still returns a non-empty union, so
+///   a model served by the DOWN provider would be reported missing. "Install this
+///   model" and "start your provider" are not the same instruction, and only one
+///   of them would be right.
+struct ModelCatalog(std::result::Result<Vec<String>, String>);
+
+impl ModelCatalog {
+    /// No admissible module declares any model, so nothing was asked.
+    fn skipped() -> Self {
+        Self(Err(
+            "no module declares a model, so no provider was queried".to_owned(),
+        ))
+    }
+
+    /// Ask every provider, bounded. A provider that hangs must not push the
+    /// daemon past the CLI's ready deadline — a timed-out probe is `Unknown`,
+    /// which is exactly the honest answer.
+    async fn probe(router: &Arc<ModelRouter>, cancel: &CancellationToken) -> Self {
+        const BUDGET: Duration = Duration::from_secs(3);
+        let inv = match tokio::time::timeout(BUDGET, router.models_detailed(&cancel.child_token()))
+            .await
+        {
+            Ok(inv) => inv,
+            Err(_) => {
+                return Self(Err(format!(
+                    "model enumeration exceeded {}s",
+                    BUDGET.as_secs()
+                )));
+            }
+        };
+        // INCOMPLETE, not empty, is the disqualifier. An empty list from providers
+        // that all answered honestly means the models really are absent; a
+        // non-empty list from a partial sweep proves nothing about what is missing.
+        // (With NO providers configured at all, the sweep is vacuously complete and
+        // the answer is an honest "nothing is available". Note it does not say WHY:
+        // zero providers and providers that all answered with nothing are
+        // indistinguishable once the count is dropped. A `NoProviders` variant is
+        // worth adding when `agent24 os` has to explain this to a user.)
+        if !inv.is_complete() {
+            return Self(Err(format!(
+                "{} provider(s) did not answer: {}",
+                inv.failures.len(),
+                inv.failures.join("; ")
+            )));
+        }
+        Self(Ok(inv.models.into_iter().map(|m| m.id).collect()))
+    }
+}
+
+impl crate::domain::ModelInventory for ModelCatalog {
+    fn available(&self) -> std::result::Result<&[String], String> {
+        match &self.0 {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.clone()),
+        }
+    }
+}
+
 /// Adapts the run manager to the scheduler's `RunTrigger` — a fired schedule
 /// becomes a background run tagged with the schedule id.
 struct RunManagerTrigger {
@@ -612,8 +683,51 @@ pub async fn serve(
     } else {
         state_dir.join("os")
     };
-    let (module_routes, reports) =
-        crate::domain::mount_all(&installed, &os_root, &state.events).await;
+    // The registry (ME-2). A MALFORMED os.json is fatal to the registry, not to
+    // the daemon: falling back to defaults would mount modules the user had
+    // explicitly disabled, so instead nothing is mounted and the reason is loud.
+    // The registry (ME-2). An unreadable `os.json` is NOT fatal to the daemon and
+    // NOT quietly ignored: the mounter degrades every ADMISSIBLE module to a 503
+    // carrying `registry_invalid` (an inadmissible manifest is still refused first,
+    // because that verdict does not depend on the config), so a client sees that the CONFIG is broken rather than
+    // being sent to look at a module that is fine. Falling back to defaults would
+    // mount something the user had switched off; mounting nothing would answer 404,
+    // which reads as "this feature is gone".
+    let os_config = crate::os_config::config_path()
+        .ok_or_else(|| "HOME not set".to_owned())
+        .and_then(|p| crate::os_config::OsConfig::load(&p));
+    if let Err(why) = &os_config {
+        tracing::error!("os.json could not be read ({why}); every admissible domain OS will 503");
+    }
+    // Probe only if some module that could actually mount declares a model.
+    // Checking `enabled` too means disabling the one module that needs a model
+    // also removes the startup cost of looking for it.
+    //
+    // This DUPLICATES admission logic that `mount_all` applies again, on purpose,
+    // and the duplication is safe in both directions because it is an
+    // OPTIMISATION, not a decision: if this predicate is too permissive we probe
+    // when nobody needed it (wasted time), and if it is too strict a module that
+    // does need the check gets `Unknown` instead of a definite answer (less
+    // information, never wrong information). Neither can change what mounts.
+    let needs_models = installed.iter().any(|m| {
+        let man = m.manifest();
+        !man.requires_models().is_empty()
+            && man.is_mountable_in_process()
+            && os_config.as_ref().is_ok_and(|c| c.is_enabled(man.name()))
+    });
+    let inventory = if needs_models {
+        ModelCatalog::probe(&state.router, &cancel).await
+    } else {
+        ModelCatalog::skipped()
+    };
+    let (module_routes, reports) = crate::domain::mount_all(
+        &installed,
+        &os_root,
+        &state.events,
+        os_config.as_ref().map_err(String::as_str),
+        &inventory,
+    )
+    .await;
     for r in &reports {
         tracing::info!(
             "domain OS {} at {}: {:?} (grants: {:?})",
@@ -622,6 +736,21 @@ pub async fn serve(
             r.outcome,
             r.granted
         );
+        match &r.resources {
+            crate::domain::ResourceStatus::NotChecked
+            | crate::domain::ResourceStatus::Satisfied => {}
+            crate::domain::ResourceStatus::MissingModels(missing) => tracing::warn!(
+                "domain OS {} declares models that are not available: {:?} — it is \
+                 mounted, but features needing them will fail",
+                r.name,
+                missing
+            ),
+            crate::domain::ResourceStatus::Unknown(why) => tracing::warn!(
+                "could not check {}'s declared models ({why}); NOT reporting them \
+                 as missing, because an unreachable provider is not a missing model",
+                r.name
+            ),
+        }
     }
     let router = build_router_with_modules(state, module_routes);
 
@@ -727,6 +856,16 @@ pub(crate) mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    /// No provider answered — the honest default for a test daemon with no
+    /// providers configured. Modules under test declare no models, so the check
+    /// is Satisfied regardless; ME-2's resource cases have their own tests.
+    struct NoModels;
+    impl crate::domain::ModelInventory for NoModels {
+        fn available(&self) -> std::result::Result<&[String], String> {
+            Err("no providers in tests".to_owned())
+        }
+    }
+
     /// A daemon state wired for tests. `pub(crate)` so the mounter's tests in
     /// `domain.rs` can merge a module into the REAL kernel router — testing the
     /// degraded 503 against a stub router would not show which fallback wins.
@@ -761,7 +900,14 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let m: StdArc<dyn agent24_domain::DomainModule> =
             StdArc::new(agent24_sin90_os::Sin90Module::new(mode).unwrap());
-        let (modules, _) = crate::domain::mount_all(&[m], tmp.path(), &st.events).await;
+        let (modules, _) = crate::domain::mount_all(
+            &[m],
+            tmp.path(),
+            &st.events,
+            Ok(&crate::os_config::OsConfig::default()),
+            &NoModels,
+        )
+        .await;
         (build_router_with_modules(st, modules), tmp)
     }
 
@@ -895,9 +1041,14 @@ pub(crate) mod tests {
             )
             .unwrap(),
         ));
-        let (modules, reports) =
-            crate::domain::mount_all(&[m as StdArc<dyn DomainModule>], tmp.path(), &st.events)
-                .await;
+        let (modules, reports) = crate::domain::mount_all(
+            &[m as StdArc<dyn DomainModule>],
+            tmp.path(),
+            &st.events,
+            Ok(&crate::os_config::OsConfig::default()),
+            &NoModels,
+        )
+        .await;
         assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);
         let router = build_router_with_modules(st, modules);
 
@@ -1509,7 +1660,14 @@ pub(crate) mod tests {
         let m: StdArc<dyn agent24_domain::DomainModule> = StdArc::new(
             agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Memory).unwrap(),
         );
-        let (modules, _) = crate::domain::mount_all(&[m], tmp.path(), &st.events).await;
+        let (modules, _) = crate::domain::mount_all(
+            &[m],
+            tmp.path(),
+            &st.events,
+            Ok(&crate::os_config::OsConfig::default()),
+            &NoModels,
+        )
+        .await;
         let router = build_router_with_modules(st, modules);
 
         let submit = |router: Router| async move {
