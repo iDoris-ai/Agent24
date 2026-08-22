@@ -44,8 +44,14 @@
 //! - **Identifiers stay database-global.** `mem_events.id` is globally UNIQUE, so
 //!   two modules that minted the same id would collide even though neither can
 //!   read the other. That is why [`ScopedMemory`] does not accept caller-minted
-//!   ids at all: the kernel mints them here, prefixed with the partition key, so
-//!   a collision between modules is not representable.
+//!   ids at all — the kernel mints `osmem:<ULID>`.
+//!
+//!   Between modules that makes a collision IMPROBABLE, not impossible: an
+//!   earlier version prefixed the partition key to make it unrepresentable, and
+//!   that leaked the user id (round 4). What makes the weaker property safe is
+//!   `EventLog::append` REFUSING an existing id under a different owner instead
+//!   of aliasing into it — so do not weaken that conflict check on the grounds
+//!   that ids cannot collide here. They can; the store just says no.
 
 use std::sync::Arc;
 
@@ -559,8 +565,9 @@ mod tests {
         // The non-read leak the review found: `mem_events.id` is globally UNIQUE,
         // so if modules minted their own ids, one taking "note-1" would make the
         // other's write FAIL. They could not read each other — but one could stop
-        // the other working. Ids are kernel-minted and partition-prefixed, so the
-        // collision is not representable.
+        // the other working. Ids are kernel-minted, so a module cannot aim at
+        // another's; see `a_shared_id_is_refused_rather_than_aliased` for what
+        // happens in the improbable case that two minted ids agree anyway.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let a = handle(&kv, "alice", "sin90").await;
         let b = handle(&kv, "alice", "cos72").await;
@@ -941,7 +948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_the_same_partition_twice_keeps_the_first_sighting() {
+    async fn recording_the_same_partition_twice_advances_only_last_seen_at() {
         // Restarts re-record every mounted partition, so `record` must be
         // idempotent. `first_seen_at` and `module_name` are write-once: a rename
         // must NOT rewrite the row that says what the key originally meant.
@@ -955,6 +962,38 @@ mod tests {
         assert_eq!(again[0].owner_key, p.key);
         assert_eq!(again[0].first_seen_at, first[0].first_seen_at);
         assert_eq!(again[0].module_name, "sin90");
+    }
+
+    #[tokio::test]
+    async fn a_repeat_recording_advances_last_seen_at() {
+        // Split from the test above, which asserted row count and the immutable
+        // columns and would therefore have passed with the upsert changed to
+        // `DO NOTHING` — leaving every repeatedly-mounted partition with a
+        // `last_seen_at` frozen at its first sighting, which is the one column an
+        // operator would use to tell a live partition from an abandoned one.
+        //
+        // `now_iso8601` has second resolution, so the wait is what makes the two
+        // stamps distinguishable at all. It is the price of asserting the thing
+        // rather than asserting around it.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let mut cat = OsMemoryCatalog::default();
+        cat.record("alice", &manifest("sin90"), &kv).await.unwrap();
+        let first = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        cat.record("alice", &manifest("sin90"), &kv).await.unwrap();
+        let again = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+
+        assert!(
+            again[0].last_seen_at > first[0].last_seen_at,
+            "last_seen_at must advance: {} -> {}",
+            first[0].last_seen_at,
+            again[0].last_seen_at
+        );
+        assert_eq!(
+            again[0].first_seen_at, first[0].first_seen_at,
+            "and first_seen_at must not move with it"
+        );
     }
 
     #[tokio::test]

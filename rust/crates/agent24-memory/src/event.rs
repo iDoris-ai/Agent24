@@ -163,9 +163,12 @@ pub struct EventQuery {
     /// Added in F1 for a reason worth recording, because the forward-only shape
     /// looked sufficient and was not. A reader that wants "the most recent N"
     /// under ASC ordering has to walk the partition from the beginning — which is
-    /// O(partition) for a bounded answer, and, when paged, never terminates
-    /// against a writer that keeps appending: each page is full because the tail
-    /// keeps moving. Paging DESC walks AWAY from new appends (the cursor only
+    /// O(partition) for a bounded answer, and, when paged, MAY not terminate
+    /// against a writer that keeps appending: a writer fast enough to keep every
+    /// page full leaves the walk chasing a tail that keeps moving. (A slower one
+    /// lets a short page through and the walk ends — the bound is worth having
+    /// because it does not depend on relative speed, not because the failure is
+    /// certain.) Paging DESC walks AWAY from new appends (the cursor only
     /// decreases), so it terminates by construction and reads O(N).
     pub newest_first: bool,
 }
