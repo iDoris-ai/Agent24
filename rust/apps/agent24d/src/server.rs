@@ -38,6 +38,13 @@ pub struct AppState {
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
     pub store: Store,
+    /// What the mounter decided about each domain OS at startup (ME-2b).
+    /// Held so `/api/v1/os` can report it — a mount verdict that only reached the
+    /// log is invisible to the person who needs it. Includes modules that were
+    /// never CONSTRUCTED (switched off, or whose constructor failed), because
+    /// `agent24 os enable` needs a name to act on and a module that only appeared
+    /// once it was already on could never be turned on.
+    pub os_reports: Arc<Vec<crate::domain::MountReport>>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -316,6 +323,13 @@ impl AppState {
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
             store,
+            // Empty until `serve` replaces it after the mount pass, which happens
+            // before the router (and therefore any request handler) can clone this
+            // state. Note that a clone taken EARLIER keeps the empty Arc forever —
+            // replacing the original does not reach clones — which is why the
+            // assignment is ordered ahead of router construction rather than left
+            // to chance.
+            os_reports: Arc::new(Vec::new()),
             runs,
             scheduler,
             shutdown,
@@ -457,6 +471,12 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             axum::routing::post(crate::schedules::run_now),
         )
         .route("/api/v1/events", get(crate::events::ws_events))
+        // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
+        .route("/api/v1/os", get(crate::os_routes::list_os))
+        .route(
+            "/api/v1/os/{name}",
+            axum::routing::patch(crate::os_routes::patch_os),
+        )
         .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
         .route(
             "/api/v1/sessions",
@@ -587,7 +607,7 @@ pub async fn serve(
             }
         },
     );
-    let state = AppState::new(AppDeps {
+    let mut state = AppState::new(AppDeps {
         token: token.clone(),
         router,
         tools,
@@ -641,8 +661,9 @@ pub async fn serve(
     // downstream — routing, the data directory, the event module, the capability
     // grant — is derived from the manifest, so `crate::domain` and
     // `build_router_with_modules` still contain no Sin90-shaped branch. A second
-    // OS is another entry in `installed` — each built independently so one that
-    // fails to construct cannot stop the others from mounting.
+    // OS is another entry in the CATALOGUE below — each with its own builder, which
+    // the mounter calls only if that module is admissible and enabled, so one that
+    // fails to construct cannot stop the others.
     let state_dir = agent24_protocol::state_file::state_dir()
         .ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let mode = if ephemeral {
@@ -659,17 +680,33 @@ pub async fn serve(
             legacy: Some(state_dir.join("sin90.db")),
         }
     };
-    let mut installed: Vec<StdArc<dyn agent24_domain::DomainModule>> = Vec::new();
-    match agent24_sin90_os::Sin90Module::new(mode) {
-        Ok(m) => installed.push(StdArc::new(m)),
-        Err(err) => {
-            // Only reachable if this build's compiled-in manifest is invalid. The
-            // daemon still starts, and any OTHER installed module still mounts: a
-            // broken domain OS is not a broken kernel, which is the whole point of
-            // the boundary.
-            tracing::error!("sin90 module could not be constructed ({err}); not mounting it");
-        }
+    // The CATALOGUE — what this build provides — comes first, and deliberately
+    // does NOT construct anything. Constructing before consulting the registry
+    // creates a trap: a module that panics or fails in its constructor takes the
+    // daemon down (or vanishes from the reports), and `agent24 os disable` cannot
+    // rescue it because the name it needs was never registered. Naming what we
+    // have, then deciding what to build, means a switched-off module is never
+    // constructed at all — which is exactly what a user reaching for `disable`
+    // needs.
+    let catalogue = vec![crate::domain::Installed {
+        name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
+        version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
+        // A CLOSURE, not a constructed module: the mounter decides whether this
+        // ever runs. That is what lets a user switch off a domain OS whose
+        // constructor is the thing breaking the daemon.
+        build: Box::new(move || {
+            agent24_sin90_os::Sin90Module::new(mode.clone())
+                .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
+                .map_err(|e| e.to_string())
+        }),
+    }];
+    let os_config_path =
+        crate::os_config::config_path().ok_or_else(|| std::io::Error::other("HOME not set"))?;
+    let os_config = crate::os_config::OsConfig::load(&os_config_path);
+    if let Err(why) = &os_config {
+        tracing::error!("os.json could not be read ({why}); every admissible domain OS will 503");
     }
+
     // An ephemeral daemon gets a throwaway root, NOT `~/.agent24/os`. The mounter
     // creates a directory for every module it mounts, and an in-memory module will
     // never writes into it — but an ephemeral instance's STORES were all in memory
@@ -683,22 +720,6 @@ pub async fn serve(
     } else {
         state_dir.join("os")
     };
-    // The registry (ME-2). A MALFORMED os.json is fatal to the registry, not to
-    // the daemon: falling back to defaults would mount modules the user had
-    // explicitly disabled, so instead nothing is mounted and the reason is loud.
-    // The registry (ME-2). An unreadable `os.json` is NOT fatal to the daemon and
-    // NOT quietly ignored: the mounter degrades every ADMISSIBLE module to a 503
-    // carrying `registry_invalid` (an inadmissible manifest is still refused first,
-    // because that verdict does not depend on the config), so a client sees that the CONFIG is broken rather than
-    // being sent to look at a module that is fine. Falling back to defaults would
-    // mount something the user had switched off; mounting nothing would answer 404,
-    // which reads as "this feature is gone".
-    let os_config = crate::os_config::config_path()
-        .ok_or_else(|| "HOME not set".to_owned())
-        .and_then(|p| crate::os_config::OsConfig::load(&p));
-    if let Err(why) = &os_config {
-        tracing::error!("os.json could not be read ({why}); every admissible domain OS will 503");
-    }
     // Probe only if some module that could actually mount declares a model.
     // Checking `enabled` too means disabling the one module that needs a model
     // also removes the startup cost of looking for it.
@@ -709,19 +730,25 @@ pub async fn serve(
     // when nobody needed it (wasted time), and if it is too strict a module that
     // does need the check gets `Unknown` instead of a definite answer (less
     // information, never wrong information). Neither can change what mounts.
-    let needs_models = installed.iter().any(|m| {
-        let man = m.manifest();
-        !man.requires_models().is_empty()
-            && man.is_mountable_in_process()
-            && os_config.as_ref().is_ok_and(|c| c.is_enabled(man.name()))
-    });
+    // A model declaration lives in a manifest, and reading a manifest means
+    // constructing the module — which is exactly what the catalogue exists to
+    // avoid. So the probe is skipped: no module in this build declares one (Sin90
+    // declares none), and paying a multi-provider network sweep at every startup to
+    // discover that would be worse than the `Unknown` it would avoid.
+    //
+    // This is a CONSTANT, not a predicate, and deliberately so — writing a
+    // predicate over data the catalogue does not carry would look like a check
+    // while always answering the same thing. When a module that needs models
+    // arrives, `Installed` gains a `requires_models` field and this becomes a real
+    // predicate over it.
+    let needs_models = false;
     let inventory = if needs_models {
         ModelCatalog::probe(&state.router, &cancel).await
     } else {
         ModelCatalog::skipped()
     };
     let (module_routes, reports) = crate::domain::mount_all(
-        &installed,
+        &catalogue,
         &os_root,
         &state.events,
         os_config.as_ref().map_err(String::as_str),
@@ -752,6 +779,9 @@ pub async fn serve(
             ),
         }
     }
+    // Hand the verdicts to the state BEFORE the router clones it, so `/api/v1/os`
+    // can report what the mounter actually decided rather than re-deriving it.
+    state.os_reports = Arc::new(reports);
     let router = build_router_with_modules(state, module_routes);
 
     // 127.0.0.1 only — never a public bind (SPEC-001 §9)
@@ -898,10 +928,17 @@ pub(crate) mod tests {
     ) -> (Router, tempfile::TempDir) {
         let st = state().await;
         let tmp = tempfile::tempdir().unwrap();
-        let m: StdArc<dyn agent24_domain::DomainModule> =
-            StdArc::new(agent24_sin90_os::Sin90Module::new(mode).unwrap());
+        let entry = crate::domain::Installed {
+            name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
+            version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
+            build: Box::new(move || {
+                agent24_sin90_os::Sin90Module::new(mode.clone())
+                    .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
+                    .map_err(|e| e.to_string())
+            }),
+        };
         let (modules, _) = crate::domain::mount_all(
-            &[m],
+            &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),
@@ -1041,8 +1078,13 @@ pub(crate) mod tests {
             )
             .unwrap(),
         ));
+        let entry = crate::domain::Installed {
+            name: "probe".to_owned(),
+            version: "0.1.0".to_owned(),
+            build: Box::new(move || Ok(m.clone() as StdArc<dyn DomainModule>)),
+        };
         let (modules, reports) = crate::domain::mount_all(
-            &[m as StdArc<dyn DomainModule>],
+            &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),
@@ -1657,11 +1699,17 @@ pub(crate) mod tests {
         let st = state().await;
         let mut rx = st.events.subscribe();
         let tmp = tempfile::tempdir().unwrap();
-        let m: StdArc<dyn agent24_domain::DomainModule> = StdArc::new(
-            agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Memory).unwrap(),
-        );
+        let entry = crate::domain::Installed {
+            name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
+            version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
+            build: Box::new(|| {
+                agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Memory)
+                    .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
+                    .map_err(|e| e.to_string())
+            }),
+        };
         let (modules, _) = crate::domain::mount_all(
-            &[m],
+            &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),

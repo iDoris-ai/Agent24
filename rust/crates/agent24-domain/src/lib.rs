@@ -211,6 +211,18 @@ const MAX_NAME_BYTES: usize = 64;
 /// pattern because the name is also a URL segment and a DIRECTORY. Restricting to
 /// ASCII also removes Unicode-normalization aliasing (`é` vs `e` + U+0301), which
 /// would otherwise let two distinct names land on one directory.
+/// Whether `name` is usable as a domain-OS identity, WITHOUT parsing a manifest.
+///
+/// The kernel's catalogue names modules before it constructs them (so a module
+/// whose constructor fails still has a name to switch off), and that name becomes
+/// a URL segment and a directory the same way a manifest's does. Exposing the rule
+/// is what stops the two from drifting: an unvalidated catalogue entry could
+/// otherwise mount `bad/name` as a namespace that no manifest would ever be
+/// allowed to claim.
+pub fn is_valid_module_name(name: &str) -> bool {
+    valid_name(name)
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_BYTES

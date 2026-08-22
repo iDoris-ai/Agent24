@@ -51,10 +51,28 @@ enum Command {
     },
     /// Launch the terminal UI (runs · events · approval queue)
     Tui,
+    /// Inspect and toggle the domain OSes this daemon provides
+    Os {
+        #[command(subcommand)]
+        action: OsAction,
+    },
     /// Serve agent24d as an MCP server over stdio, so an external MCP client
     /// (Claude Desktop, another agent) can run tasks on it and introspect it.
     /// Risky actions are still approved on THIS host, never by the caller (E4).
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum OsAction {
+    /// Show every domain OS the daemon knows about, and what it did with each
+    List,
+    /// Turn one on (applies at the next daemon start)
+    Enable {
+        /// Module name, e.g. sin90
+        name: String,
+    },
+    /// Turn one off (applies at the next daemon start)
+    Disable { name: String },
 }
 
 #[derive(Subcommand)]
@@ -280,6 +298,119 @@ async fn cmd_models() -> Result<(), String> {
     out
 }
 
+/// `agent24 os` — read and toggle the domain-OS registry.
+///
+/// Everything goes through the daemon; this never touches `os.json`. That is
+/// what makes `agent24 os disable sin09` fail HERE, naming the modules that do
+/// exist, instead of writing a file that breaks the registry at the next start.
+async fn cmd_os(action: OsAction) -> Result<(), String> {
+    let ep = match connect().await {
+        Ok(ep) => ep,
+        // The bootstrapping case, and it is the one that matters most: if a domain
+        // OS is what keeps the daemon from starting, "ask the daemon to disable it"
+        // is exactly the advice that cannot work. `os.json` is plain JSON and
+        // nothing stops the user editing it — so say that, with the edit spelled
+        // out, rather than leaving them stuck behind a tool that requires the very
+        // thing that is broken.
+        Err(e) => {
+            let path = agent24_protocol::state_file::state_dir()
+                .map(|d| d.join("os.json").display().to_string())
+                .unwrap_or_else(|| "~/.agent24/os.json".to_owned());
+            let hint = match &action {
+                OsAction::List => format!("read {path} to see what is configured"),
+                OsAction::Enable { name } | OsAction::Disable { name } => format!(
+                    "edit {path} directly: {{\"domainOs\": {{\"{name}\": {{\"enabled\": {}}}}}}}",
+                    matches!(action, OsAction::Enable { .. })
+                ),
+            };
+            return Err(format!(
+                "{e}\n  this command goes through the daemon, which owns os.json. \
+                 If a domain OS is what stops the daemon starting, {hint}"
+            ));
+        }
+    };
+    let req = match &action {
+        OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
+        OsAction::Enable { name } | OsAction::Disable { name } => {
+            let enabled = matches!(action, OsAction::Enable { .. });
+            bearer(&ep, client().patch(format!("{}/api/v1/os/{name}", ep.base)))
+                .json(&agent24_protocol::DomainOsUpdate { enabled })
+        }
+    };
+    let out = match req.timeout(Duration::from_secs(10)).send().await {
+        Ok(res) if res.status().is_success() => {
+            let body: agent24_protocol::DomainOsList =
+                res.json().await.map_err(|e| e.to_string())?;
+            print_os(&body);
+            Ok(())
+        }
+        // Surface the daemon's own message: for a bad name it names the modules
+        // that DO exist, which is the whole point of asking the daemon.
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            Err(match body["error"]["message"].as_str() {
+                Some(m) => m.to_owned(),
+                None => format!("daemon returned {status}"),
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    finish(ep).await;
+    out
+}
+
+fn print_os(list: &agent24_protocol::DomainOsList) {
+    // The registry problem FIRST, because until it is fixed nothing else the user
+    // does here takes effect — including the toggle they probably just tried.
+    if let Some(err) = &list.registry_error {
+        eprintln!("registry: {err}\n");
+    }
+    if list.modules.is_empty() {
+        println!("(no domain OS installed)");
+        return;
+    }
+    for m in &list.modules {
+        // The RUNNING state leads, because that is what a request will hit. The
+        // config only gets its own line when the two disagree.
+        // Both states, always: the running one leads because that is what a
+        // request will hit, and the config follows in parentheses when it differs
+        // from what is running. An earlier version printed the config only when
+        // `restart_required` was set, which hid it entirely for a REFUSED module.
+        let mut line = format!("{}  {}  [{}]", m.name, m.version, m.state);
+        if m.state != if m.enabled { "mounted" } else { "disabled" } {
+            line.push_str(if m.enabled {
+                "  (config: enabled)"
+            } else {
+                "  (config: disabled)"
+            });
+        }
+        if !m.granted.is_empty() {
+            line.push_str(&format!("  grants: {}", m.granted.join(",")));
+        }
+        println!("{line}");
+        println!("    {}", m.namespace);
+        if let Some(detail) = &m.detail {
+            println!("    {detail}");
+        }
+        if m.resources == "missing" {
+            println!(
+                "    missing models: {}  (mounted anyway; features needing them \
+                 will fail)",
+                m.missing_models.join(", ")
+            );
+        } else if m.resources == "unknown" {
+            println!("    declared models could not be checked");
+        }
+        if m.restart_required {
+            println!(
+                "    config says {} — restart the daemon to apply (agent24 daemon stop && agent24 daemon start)",
+                if m.enabled { "enabled" } else { "disabled" }
+            );
+        }
+    }
+}
+
 async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
     match action {
         DaemonAction::Start => {
@@ -458,6 +589,7 @@ async fn main() -> std::process::ExitCode {
         Command::Daemon { action } => cmd_daemon(action).await,
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
+        Command::Os { action } => cmd_os(action).await,
         Command::Mcp => cmd_mcp().await,
     };
     match result {

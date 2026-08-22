@@ -1,9 +1,10 @@
 //! The kernel's domain-OS mounter (ME-1b; ADR-029).
 //!
 //! This is the half of the kernel↔domain-OS boundary that lives in the kernel:
-//! it takes a list of [`DomainModule`]s, gives each one a directory and a
-//! [`KernelCtx`], and nests its routes under a namespace DERIVED from its
-//! manifest. The mounting LOGIC has no module-specific branch — that is the ME-1
+//! it takes a CATALOGUE of [`Installed`] descriptors — names and builders, not
+//! constructed modules — decides which of them should run, builds those, gives
+//! each a directory and a [`KernelCtx`], and nests its routes under a namespace
+//! derived from its identity. The mounting LOGIC has no module-specific branch — that is the ME-1
 //! acceptance — and the tests below mount fake modules rather than Sin90, so the
 //! property cannot quietly become "the mounter happens to work for Sin90". As of
 //! ME-1b-b this file names no module at all: Sin90 mounts through exactly this
@@ -18,8 +19,10 @@
 //!    `sin90` would collide on the directory, the route namespace AND the event
 //!    module at once, so the name is reserved BEFORE the store is opened or any
 //!    route is mounted — a later failure must not leave a half-mounted twin.
-//! 2. **Out-of-process manifests are refused.** ME-3's transport does not exist;
-//!    half-mounting a config we cannot honor is worse than refusing it.
+//! 2. **Out-of-process manifests are refused** — once constructed. The transport
+//!    does not exist (ME-3), and half-mounting a config we cannot honor is worse
+//!    than refusing it. A DISABLED entry is never constructed, so its transport is
+//!    simply not known yet; see the ordering note below.
 //! 3. **A failed `open_store` degrades that module ONLY.** The kernel nests its
 //!    OWN 503 router under the namespace rather than the module's — a module
 //!    whose store is gone is exactly the one least able to answer correctly, and
@@ -35,6 +38,14 @@
 //! 5. **A name that is already a kernel route segment is refused.** axum PANICS on
 //!    an exact route overlap, so a module called `health` would kill the daemon at
 //!    startup rather than lose a routing contest — see [`RESERVED_KERNEL_SEGMENTS`].
+//!
+//! The pass runs `identity → admission → registry policy → construction → mount`,
+//! and the position of CONSTRUCTION is load-bearing: a module the user switched off
+//! is never built, which is what lets them switch off one whose constructor is
+//! breaking the daemon. The cost is that manifest-derived admission (the
+//! out-of-process transport) cannot run for a module that was never constructed —
+//! such an entry reports `Disabled`, which is true, and is refused the moment it is
+//! enabled.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -85,6 +96,11 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "events",
     "health",
     "models",
+    // ME-2b's own registry endpoint. A domain OS named `os` would collide with it
+    // — and the set-equality test below is what forced this entry the moment the
+    // route was added, rather than leaving it to be discovered by whoever shipped
+    // that module.
+    "os",
     "runs",
     "schedules",
     "sessions",
@@ -125,9 +141,38 @@ impl KernelCtx for DaemonCtx {
 pub struct MountReport {
     pub name: String,
     pub namespace: String,
+    /// The module's version, always the CATALOGUE's copy — which exists before any
+    /// module does. A constructed module whose manifest states a different version
+    /// is refused rather than mounted, so for anything that IS mounted the two
+    /// agree and this is not a second answer.
+    ///
+    /// Held here rather than in a name-keyed side table: two modules claiming one
+    /// name would otherwise have the loser reported with the winner's version, and
+    /// ME-3 makes that collision real.
+    pub version: String,
+    /// What the registry said about this module WHEN THE DAEMON STARTED.
+    ///
+    /// `agent24 os` needs "has the config changed since we mounted?", and that is
+    /// not the same question as "is it running?". Comparing config-now against
+    /// RUNNING conflates a pending toggle with a module that is enabled and simply
+    /// unhealthy — the first is fixed by a restart, the second is not.
+    ///
+    /// `None` means the registry gave no usable answer at startup: unparseable, OR
+    /// parseable but semantically rejected (an unknown-disabled entry). There is
+    /// nothing to compare against, so the view reports a pending change only once
+    /// the registry is USABLE again — a file that is still broken cannot be applied
+    /// by restarting, and saying otherwise sent the user to restart into the same
+    /// degradation.
+    pub enabled_at_start: Option<bool>,
     pub outcome: MountOutcome,
-    /// What the kernel actually granted (the intersection of what the module
-    /// asked for and [`KERNEL_GRANTS`]), as capability names.
+    /// Capabilities a LIVE module holds: the intersection of what its manifest
+    /// asked for and [`KERNEL_GRANTS`].
+    ///
+    /// Empty for every outcome other than [`MountOutcome::Mounted`], because no
+    /// `KernelCtx` was handed over — for a disabled entry the manifest was never
+    /// even read, and for one that failed to open its store the grants were
+    /// computed but never given. Empty therefore means "holds nothing", which is
+    /// true in every one of those cases.
     pub granted: Vec<String>,
     /// Whether the module's declared `requires_models` are actually there
     /// (ME-2's "缺资源明确报错").
@@ -336,16 +381,54 @@ fn disabled_namespace(app: Router, namespace: &str, module: &str) -> Router {
     })
 }
 
-/// Mount every module under `root`, returning the combined router and one report
-/// per module.
+/// One entry in what this build PROVIDES — named WITHOUT being constructed.
+///
+/// The identity has to exist before construction, or the kernel cannot answer
+/// "what is installed?" for a module it decided not to build. That matters in
+/// exactly the case where it matters most: a module whose constructor RETURNS AN
+/// ERROR must still have a name for `agent24 os disable` to act on, and a module
+/// that is switched off must appear in the list — one that only showed up once it
+/// was already on could never be turned on.
+///
+/// A constructor that PANICS is not contained: it takes the daemon down before any
+/// of this runs. Containing that needs a process boundary (ME-3), and claiming
+/// otherwise here would be the kind of promise this contract keeps getting wrong.
+pub struct Installed {
+    pub name: String,
+    pub version: String,
+    /// Build the module. Called ONLY after IDENTITY admission (name validity,
+    /// duplicates, kernel-reserved names) and registry policy have said it should
+    /// run — so a switched-off or badly-named entry is never constructed.
+    /// Manifest-derived admission necessarily happens after this, because the
+    /// manifest does not exist until the module does.
+    #[allow(clippy::type_complexity)]
+    pub build: Box<dyn Fn() -> std::result::Result<Arc<dyn DomainModule>, String> + Send + Sync>,
+}
+
+/// Mount everything in `catalogue` under `root`, returning the combined router
+/// and one report per entry.
+///
+/// **One pass, over the CATALOGUE rather than over constructed modules.** An
+/// earlier version split the two — the caller constructed the enabled ones, called
+/// this, and appended reports for the rest — and that quietly broke every global
+/// invariant this loop maintains: a skipped entry did not claim its name (so two
+/// disabled twins both "succeeded" and their namespaces could collide), it did not
+/// pass admission (so a disabled module named `health` was reported Disabled rather
+/// than Refused), and it was absent from `provided`, so a legitimate
+/// `sin90: false` looked like a typo for a module the build does not have. The
+/// order below is the whole design:
+///
+/// ```text
+/// identity → admission → registry policy → construction → mount
+/// ```
 ///
 /// The returned router is NOT authenticated — the caller must fold it into the
 /// kernel router before applying the auth layer (rule 4 above). It is a
-/// `Router<()>`: each module has already bound its own state.
-/// `config` decides which modules are active (ME-2); `inventory` answers the
-/// declared-resource check once for the whole pass.
+/// `Router<()>`: each module has already bound its own state. `registry` decides
+/// which entries are active (ME-2); `inventory` answers the declared-resource
+/// check once for the whole pass.
 pub async fn mount_all(
-    modules: &[Arc<dyn DomainModule>],
+    catalogue: &[Installed],
     root: &Path,
     events: &crate::events::EventsHub,
     registry: std::result::Result<&crate::os_config::OsConfig, &str>,
@@ -365,7 +448,11 @@ pub async fn mount_all(
     // than a warning in a log the user is not reading. An unknown ENABLED entry is
     // harmless by comparison (it asks for something absent, and nothing happens),
     // so that stays a warning.
-    let provided: BTreeSet<&str> = modules.iter().map(|m| m.manifest().name()).collect();
+    //
+    // `provided` is the CATALOGUE, not the constructed subset — otherwise
+    // disabling a module would make its own entry look like a typo for something
+    // this build does not have.
+    let provided: BTreeSet<&str> = catalogue.iter().map(|e| e.name.as_str()).collect();
     let mut registry = registry;
     let unknown_disabled: Vec<String> = registry
         .into_iter()
@@ -391,38 +478,58 @@ pub async fn mount_all(
         }
     }
 
-    for module in modules {
-        let manifest = module.manifest();
-        let name = manifest.name().to_owned();
-        let namespace = manifest.route_namespace();
-        let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_GRANTS);
-        let granted_names: Vec<String> = granted.iter().map(|c| c.as_str().to_owned()).collect();
-        // Resources are checked LATE, only for a module that actually mounts. A
-        // disabled or refused module's declared models are not a fact about the
-        // system — reporting "missing model X" for something that never ran sends
-        // the user to install a model nothing is going to use.
-        let mut resources = ResourceStatus::NotChecked;
+    for entry in catalogue {
+        let name = entry.name.clone();
+        let version = entry.version.clone();
+        let namespace = agent24_domain::DomainOsManifest::declared_namespace(&name);
+        let enabled_at_start = registry.ok().map(|c| c.is_enabled(&name));
 
         let refuse = |why: String, reports: &mut Vec<MountReport>| {
             tracing::error!("domain OS {name:?} not mounted: {why}");
             reports.push(MountReport {
                 name: name.clone(),
                 namespace: namespace.clone(),
+                version: version.clone(),
+                enabled_at_start,
                 outcome: MountOutcome::Refused(why),
-                granted: granted_names.clone(),
+                // Nothing was handed a `KernelCtx`, so it holds nothing. (For a
+                // pre-construction refusal no manifest was read either; for a
+                // post-construction one the grants were computable but never given.
+                // Both hold nothing, which is what this field means.)
+                granted: Vec::new(),
                 resources: ResourceStatus::NotChecked,
             });
         };
 
-        // Claim the name before `open_store`, route construction, or any
-        // filesystem work, so a duplicate cannot open a store or leave routes
-        // behind. (`manifest()` above already ran — it is the module's identity
-        // and there is nothing to claim without it.) (This
-        // loop is sequential — there is no race to lose; the point is ORDER, so
-        // that a later rejection never has to undo work.) The claim is held for
-        // the whole pass even by a REFUSED module: a name that was rejected once
-        // stays rejected, rather than being silently handed to the next module
-        // that asks for it.
+        // IDENTITY. The catalogue names a module before any manifest exists, so the
+        // name has to satisfy the SAME rule a manifest's would — it becomes a URL
+        // segment and a directory either way, and an unvalidated one could mount a
+        // namespace no manifest would ever be allowed to claim.
+        if version.trim().is_empty() {
+            refuse(
+                "the catalogue entry has an empty version; a manifest could not \
+                 declare one, and this identity is reported as if it had"
+                    .to_owned(),
+                &mut reports,
+            );
+            continue;
+        }
+        if !agent24_domain::is_valid_module_name(&name) {
+            refuse(
+                format!(
+                    "the catalogue entry {name:?} is not a usable module name; it \
+                     cannot be routed or given a directory"
+                ),
+                &mut reports,
+            );
+            continue;
+        }
+        // Claim the name before anything observable, so a duplicate can
+        // never open a store, build routes or leave a namespace behind. The claim
+        // is held for the whole pass even by a REFUSED entry: a name rejected once
+        // stays rejected rather than being handed to the next asker. (The loop is
+        // sequential — there is no race to lose; the point is ORDER, so that a
+        // later rejection never has to undo work.)
         if !claimed.insert(name.clone()) {
             refuse(
                 format!("another module already claims the name {name:?}"),
@@ -430,19 +537,106 @@ pub async fn mount_all(
             );
             continue;
         }
-        // ADMISSION comes before policy. A manifest that could never be mounted —
-        // a kernel-reserved name, a transport that does not exist — is refused
+
+        // ADMISSION, before policy. A name that could never be mounted is refused
         // whether or not the user switched it on, because "disabled" would
-        // otherwise CONCEAL an inadmissible manifest: turning it back on would
-        // then fail in a way the earlier report gave no hint of. It also keeps the
-        // states consistent: a module named `health` reported as Disabled while
-        // `/api/v1/health` cheerfully answered 200 was two different truths at
-        // once.
+        // otherwise CONCEAL it: turning it back on would fail in a way the earlier
+        // report gave no hint of. It also stops two truths at once — an entry named
+        // `health` reported Disabled while `/api/v1/health` answered 200.
         if RESERVED_KERNEL_SEGMENTS.contains(&name.as_str()) {
             refuse(
                 format!(
                     "the name {name:?} is a kernel route segment; mounting it would \
                      panic the daemon on an overlapping route"
+                ),
+                &mut reports,
+            );
+            continue;
+        }
+
+        // POLICY: an unreadable registry, then the user's switch. Neither
+        // CONSTRUCTS anything — which is what lets a user switch off a module whose
+        // constructor is what breaks the daemon.
+        //
+        // An unreadable `os.json` degrades every admissible entry rather than
+        // mounting it. Falling back to defaults would mount something the user had
+        // switched off; mounting nothing would answer 404, which reads as "this
+        // feature is gone". A 503 naming the config is the only answer that is both
+        // safe and legible.
+        if let Err(why) = registry {
+            let reason = format!("os.json could not be read ({why}); refusing to guess");
+            tracing::error!("domain OS {name:?}: {reason}");
+            app = registry_invalid_namespace(app, &namespace, why);
+            reports.push(MountReport {
+                name,
+                namespace,
+                version,
+                enabled_at_start,
+                outcome: MountOutcome::Degraded(reason),
+                granted: Vec::new(),
+                resources: ResourceStatus::NotChecked,
+            });
+            continue;
+        }
+        if !registry.is_ok_and(|c| c.is_enabled(&name)) {
+            tracing::info!("domain OS {name:?} is disabled in os.json; {namespace}/* will 503");
+            app = disabled_namespace(app, &namespace, &name);
+            reports.push(MountReport {
+                name,
+                namespace,
+                version,
+                enabled_at_start,
+                outcome: MountOutcome::Disabled,
+                granted: Vec::new(),
+                resources: ResourceStatus::NotChecked,
+            });
+            continue;
+        }
+
+        // CONSTRUCTION. A failure here degrades this entry and nothing else — and
+        // it still has a name and a namespace, so `agent24 os disable` can reach it.
+        let module = match (entry.build)() {
+            Ok(m) => m,
+            Err(why) => {
+                let reason = format!("could not be constructed: {why}");
+                tracing::error!("domain OS {name:?} {reason}");
+                app = degraded_namespace(app, &namespace, &name);
+                reports.push(MountReport {
+                    name,
+                    namespace,
+                    version,
+                    enabled_at_start,
+                    outcome: MountOutcome::Degraded(reason),
+                    granted: Vec::new(),
+                    resources: ResourceStatus::NotChecked,
+                });
+                continue;
+            }
+        };
+
+        let manifest = module.manifest();
+        // The catalogue named it before it existed, so the two can disagree — and a
+        // module whose manifest claims a DIFFERENT name would be routed under one
+        // identity while emitting events under another.
+        if manifest.name() != name {
+            refuse(
+                format!(
+                    "the catalogue lists it as {name:?} but its manifest says {:?}",
+                    manifest.name()
+                ),
+                &mut reports,
+            );
+            continue;
+        }
+        // The VERSION too: the catalogue's copy is what `agent24 os` reports for an
+        // entry that was never constructed, so a mismatch would have the API state
+        // one version while the running module is another.
+        if manifest.version() != version {
+            refuse(
+                format!(
+                    "the catalogue lists {name:?} at version {version:?} but its \
+                     manifest says {:?}",
+                    manifest.version()
                 ),
                 &mut reports,
             );
@@ -458,41 +652,8 @@ pub async fn mount_all(
             continue;
         }
 
-        // POLICY, after admission: an unreadable registry, then the user's switch.
-        //
-        // An unreadable `os.json` degrades EVERY admissible module rather than
-        // mounting them. Falling back to defaults would mount something the user
-        // had switched off; mounting nothing at all would answer 404, which reads
-        // as "this feature is gone" and sends them looking in the wrong place. A
-        // 503 naming the config is the only answer that is both safe and legible.
-        if let Err(why) = registry {
-            let reason = format!("os.json could not be read ({why}); refusing to guess");
-            tracing::error!("domain OS {name:?}: {reason}");
-            app = registry_invalid_namespace(app, &namespace, why);
-            reports.push(MountReport {
-                name,
-                namespace,
-                outcome: MountOutcome::Degraded(reason),
-                granted: granted_names,
-                resources,
-            });
-            continue;
-        }
-        // The name was claimed above, so a DISABLED module still holds it —
-        // otherwise switching Sin90 off would let a second module quietly take the
-        // `sin90` namespace and its directory.
-        if !registry.is_ok_and(|c| c.is_enabled(&name)) {
-            tracing::info!("domain OS {name:?} is disabled in os.json; {namespace}/* will 503");
-            app = disabled_namespace(app, &namespace, &name);
-            reports.push(MountReport {
-                name,
-                namespace,
-                outcome: MountOutcome::Disabled,
-                granted: granted_names,
-                resources,
-            });
-            continue;
-        }
+        let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_GRANTS);
+        let granted_names: Vec<String> = granted.iter().map(|c| c.as_str().to_owned()).collect();
 
         // The module's directory is DERIVED from its validated name, never from
         // the string its manifest declared.
@@ -515,9 +676,14 @@ pub async fn mount_all(
             reports.push(MountReport {
                 name,
                 namespace,
+                version,
+                enabled_at_start,
                 outcome: MountOutcome::Degraded(why),
-                granted: granted_names,
-                resources,
+                // Empty because no `KernelCtx` was ever handed over: these would
+                // have been its grants, but it never got them. `granted` means what
+                // a LIVE module holds, and nothing else.
+                granted: Vec::new(),
+                resources: ResourceStatus::NotChecked,
             });
             continue;
         }
@@ -526,7 +692,7 @@ pub async fn mount_all(
         // its declared-resource status a fact worth reporting. Checking earlier
         // meant a module that then failed to open still carried `MissingModels`,
         // and the startup log said "it is mounted" about something that was not.
-        resources = check_resources(inventory, manifest.requires_models());
+        let resources = check_resources(inventory, manifest.requires_models());
 
         // The sink's EXISTENCE is the capability: build one only when events were
         // actually granted, and name it from the MANIFEST, never a local string.
@@ -543,6 +709,8 @@ pub async fn mount_all(
         reports.push(MountReport {
             name,
             namespace,
+            version,
+            enabled_at_start,
             outcome: MountOutcome::Mounted,
             granted: granted_names,
             resources,
@@ -582,13 +750,37 @@ mod tests {
         TestModels(Ok(Vec::new()))
     }
 
+    /// A catalogue entry that hands back an already-built fake. Construction is
+    /// what the mounter now controls, so tests that are about MOUNTING supply a
+    /// builder that always succeeds; the construction-failure cases build their own.
+    fn entry<M: DomainModule + 'static>(m: Arc<M>) -> Installed {
+        let name = m.manifest().name().to_owned();
+        let version = m.manifest().version().to_owned();
+        Installed {
+            name,
+            version,
+            build: Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>)),
+        }
+    }
+
+    /// A catalogue entry whose builder FAILS — the case that used to vanish from
+    /// the reports entirely.
+    fn broken_entry(name: &str, why: &str) -> Installed {
+        let why = why.to_owned();
+        Installed {
+            name: name.to_owned(),
+            version: "0.0.0".to_owned(),
+            build: Box::new(move || Err(why.clone())),
+        }
+    }
+
     /// `mount_all` with the ME-2 knobs defaulted.
     async fn mount(
-        modules: &[Arc<dyn DomainModule>],
+        catalogue: &[Installed],
         root: &Path,
         hub: &crate::events::EventsHub,
     ) -> (Router, Vec<MountReport>) {
-        mount_all(modules, root, hub, Ok(&all_enabled()), &no_models()).await
+        mount_all(catalogue, root, hub, Ok(&all_enabled()), &no_models()).await
     }
 
     fn manifest_yaml(name: &str, kind: &str) -> String {
@@ -691,7 +883,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("zzquux");
-        let (app, reports) = mount(&[m.clone() as Arc<dyn DomainModule>], tmp.path(), &hub).await;
+        let (app, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
 
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -712,15 +904,7 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let a = FakeModule::new("aaa");
         let b = FakeModule::new("bbb");
-        let (app, reports) = mount(
-            &[
-                a.clone() as Arc<dyn DomainModule>,
-                b.clone() as Arc<dyn DomainModule>,
-            ],
-            tmp.path(),
-            &hub,
-        )
-        .await;
+        let (app, reports) = mount(&[entry(a.clone()), entry(b.clone())], tmp.path(), &hub).await;
         assert!(reports.iter().all(|r| r.outcome == MountOutcome::Mounted));
 
         assert_eq!(
@@ -753,10 +937,7 @@ mod tests {
         let first = FakeModule::new("dup");
         let second = FakeModule::new("dup");
         let (app, reports) = mount(
-            &[
-                first.clone() as Arc<dyn DomainModule>,
-                second.clone() as Arc<dyn DomainModule>,
-            ],
+            &[entry(first.clone()), entry(second.clone())],
             tmp.path(),
             &hub,
         )
@@ -786,7 +967,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::with("remote", "out_of_process_provider", false);
-        let (app, reports) = mount(&[m.clone() as Arc<dyn DomainModule>], tmp.path(), &hub).await;
+        let (app, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
 
         assert!(matches!(reports[0].outcome, MountOutcome::Refused(_)));
         assert!(m.opened().is_none());
@@ -808,12 +989,7 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let bad = FakeModule::with("broken", "in_process_crate", true);
         let good = FakeModule::new("healthy");
-        let (app, reports) = mount(
-            &[bad as Arc<dyn DomainModule>, good as Arc<dyn DomainModule>],
-            tmp.path(),
-            &hub,
-        )
-        .await;
+        let (app, reports) = mount(&[entry(bad), entry(good)], tmp.path(), &hub).await;
 
         assert!(matches!(reports[0].outcome, MountOutcome::Degraded(_)));
         assert_eq!(reports[1].outcome, MountOutcome::Mounted);
@@ -841,7 +1017,7 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let mut rx = hub.subscribe();
         let m = FakeModule::new("emitter");
-        let (app, _) = mount(&[m as Arc<dyn DomainModule>], tmp.path(), &hub).await;
+        let (app, _) = mount(&[entry(m)], tmp.path(), &hub).await;
 
         assert_eq!(
             get(&app, "/api/v1/emitter/ping").await.status(),
@@ -882,7 +1058,7 @@ mod tests {
         let m = Arc::new(RootRouteModule(
             DomainOsManifest::from_yaml(&manifest_yaml("health", "in_process_crate")).unwrap(),
         ));
-        let (modules, reports) = mount(&[m as Arc<dyn DomainModule>], tmp.path(), &hub).await;
+        let (modules, reports) = mount(&[entry(m)], tmp.path(), &hub).await;
         assert!(
             matches!(reports[0].outcome, MountOutcome::Refused(_)),
             "got {:?}",
@@ -977,7 +1153,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let bad = FakeModule::with("broken", "in_process_crate", true);
-        let (modules, _) = mount(&[bad.clone() as Arc<dyn DomainModule>], tmp.path(), &hub).await;
+        let (modules, _) = mount(&[entry(bad.clone())], tmp.path(), &hub).await;
 
         // Merged into the FULL kernel router, so the kernel's own fallback and the
         // nested one are both in play and we learn which wins where.
@@ -1054,7 +1230,7 @@ mod tests {
 
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("linked");
-        let (app, reports) = mount(&[m.clone() as Arc<dyn DomainModule>], tmp.path(), &hub).await;
+        let (app, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
 
         match &reports[0].outcome {
             MountOutcome::Degraded(why) => assert!(why.contains("symlink"), "{why}"),
@@ -1080,7 +1256,7 @@ mod tests {
         let yaml = manifest_yaml("quiet", "in_process_crate")
             .replace("kernel_capabilities: [events]\n", "");
         let m = FakeModule::from_yaml(&yaml, false);
-        let (app, reports) = mount(&[m as Arc<dyn DomainModule>], tmp.path(), &hub).await;
+        let (app, reports) = mount(&[entry(m)], tmp.path(), &hub).await;
 
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
         assert!(reports[0].granted.is_empty());
@@ -1108,7 +1284,7 @@ mod tests {
         let m = FakeModule::new("offswitch");
         let cfg = config_from(r#"{"domainOs": {"offswitch": {"enabled": false}}}"#);
         let (app, reports) = mount_all(
-            &[m.clone() as Arc<dyn DomainModule>],
+            &[entry(m.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
@@ -1166,7 +1342,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = config_from(r#"{"domainOs": {"offswitch": {"enabled": false}}}"#);
         let (modules, _) = mount_all(
-            &[FakeModule::new("offswitch") as Arc<dyn DomainModule>],
+            &[entry(FakeModule::new("offswitch"))],
             tmp.path(),
             &st.events,
             Ok(&cfg),
@@ -1206,10 +1382,7 @@ mod tests {
         let squatter = FakeModule::new("shared");
         let cfg = config_from(r#"{"domainOs": {"shared": {"enabled": false}}}"#);
         let (app, reports) = mount_all(
-            &[
-                off as Arc<dyn DomainModule>,
-                squatter.clone() as Arc<dyn DomainModule>,
-            ],
+            &[entry(off), entry(squatter.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
@@ -1239,10 +1412,7 @@ mod tests {
         let a = FakeModule::new("alpha");
         let b = FakeModule::new("beta");
         let (app, reports) = mount_all(
-            &[
-                a.clone() as Arc<dyn DomainModule>,
-                b.clone() as Arc<dyn DomainModule>,
-            ],
+            &[entry(a.clone()), entry(b.clone())],
             tmp.path(),
             &hub,
             Err("os.json is not valid: expected value at line 1"),
@@ -1298,7 +1468,7 @@ mod tests {
         );
         let m = FakeModule::from_yaml(&yaml, true);
         let (_, reports) = mount_all(
-            &[m as Arc<dyn DomainModule>],
+            &[entry(m)],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
@@ -1326,7 +1496,7 @@ mod tests {
                 "domainOs": {"sin09": {"enabled": false}, "sin90": {"enabled": true}}}"#,
         );
         let (app, reports) = mount_all(
-            &[FakeModule::new("sin90") as Arc<dyn DomainModule>],
+            &[entry(FakeModule::new("sin90"))],
             tmp.path(),
             &hub,
             Ok(&cfg),
@@ -1355,8 +1525,8 @@ mod tests {
         let cfg = config_from(r#"{"domainOs": {"someone-else": {"enabled": false}}}"#);
         let (app, reports) = mount_all(
             &[
-                FakeModule::new("newcomer") as Arc<dyn DomainModule>,
-                FakeModule::new("someone-else") as Arc<dyn DomainModule>,
+                entry(FakeModule::new("newcomer")),
+                entry(FakeModule::new("someone-else")),
             ],
             tmp.path(),
             &hub,
@@ -1389,7 +1559,7 @@ mod tests {
         let real = FakeModule::new("sin90");
         let cfg = config_from(r#"{"domainOs": {"sin09": {"enabled": false}}}"#);
         let (app, reports) = mount_all(
-            &[real.clone() as Arc<dyn DomainModule>],
+            &[entry(real.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
@@ -1411,7 +1581,7 @@ mod tests {
         // The harmless half: an unknown ENABLED entry changes nothing.
         let ok_cfg = config_from(r#"{"domainOs": {"sin09": {"enabled": true}}}"#);
         let (app, reports) = mount_all(
-            &[FakeModule::new("sin90") as Arc<dyn DomainModule>],
+            &[entry(FakeModule::new("sin90"))],
             tmp.path(),
             &hub,
             Ok(&ok_cfg),
@@ -1436,8 +1606,8 @@ mod tests {
             config_from(r#"{"default": "disabled", "domainOs": {"wanted": {"enabled": true}}}"#);
         let (app, reports) = mount_all(
             &[
-                FakeModule::new("wanted") as Arc<dyn DomainModule>,
-                FakeModule::new("unlisted") as Arc<dyn DomainModule>,
+                entry(FakeModule::new("wanted")),
+                entry(FakeModule::new("unlisted")),
             ],
             tmp.path(),
             &hub,
@@ -1462,11 +1632,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_inadmissible_manifest_is_refused_even_when_disabled() {
-        // Disabling must not CONCEAL a manifest that could never mount: turning it
-        // back on would then fail in a way the earlier report gave no hint of. It
-        // also kept two truths at once — a module named `health` reported Disabled
-        // while `/api/v1/health` answered 200.
+    async fn identity_admission_beats_disabled_but_manifest_admission_cannot() {
+        // There are TWO kinds of admission, and only one can run before the user's
+        // switch:
+        //
+        // - IDENTITY admission (duplicate name, kernel-reserved name) needs only
+        //   the catalogue, so it runs first and beats `disabled`. Otherwise a module
+        //   named `health` would report Disabled while `/api/v1/health` answered
+        //   200 — two truths at once — and re-enabling it would fail in a way the
+        //   earlier report gave no hint of.
+        // - MANIFEST admission (the out-of-process transport) needs the manifest,
+        //   which needs CONSTRUCTION. A disabled module is deliberately never
+        //   constructed — that is what lets a user switch off a module whose
+        //   constructor is breaking the daemon — so its transport is simply not
+        //   known yet, and `Disabled` is the truthful report: the reason it is not
+        //   running is the user's own setting. It is refused the moment it is
+        //   enabled, which `an_out_of_process_manifest_is_refused_not_half_mounted`
+        //   covers.
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(
@@ -1474,9 +1656,8 @@ mod tests {
         );
         let (_, reports) = mount_all(
             &[
-                FakeModule::new("health") as Arc<dyn DomainModule>,
-                FakeModule::with("remote", "out_of_process_provider", false)
-                    as Arc<dyn DomainModule>,
+                entry(FakeModule::new("health")),
+                entry(FakeModule::with("remote", "out_of_process_provider", false)),
             ],
             tmp.path(),
             &hub,
@@ -1484,19 +1665,262 @@ mod tests {
             &no_models(),
         )
         .await;
+        assert!(
+            matches!(reports[0].outcome, MountOutcome::Refused(_)),
+            "a kernel-reserved NAME is knowable without constructing, so it is \
+             refused even when disabled; got {:?}",
+            reports[0].outcome
+        );
+        assert_eq!(
+            reports[1].outcome,
+            MountOutcome::Disabled,
+            "an out-of-process TRANSPORT is only knowable from the manifest, which \
+             a disabled module is never constructed to provide"
+        );
         for r in &reports {
-            assert!(
-                matches!(r.outcome, MountOutcome::Refused(_)),
-                "{}: inadmissible beats disabled, got {:?}",
-                r.name,
-                r.outcome
-            );
             assert_eq!(
                 r.resources,
                 ResourceStatus::NotChecked,
                 "a module that never ran has no resource facts"
             );
+            assert!(
+                r.granted.is_empty(),
+                "nor any capability facts — its manifest was never read"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_module_is_never_constructed() {
+        // The bootstrapping fix, tested where it actually lives. If construction
+        // ran first, a module whose constructor crashes the daemon could never be
+        // switched off — the tool for switching it off needs the daemon.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let built = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = built.clone();
+        let cat = vec![Installed {
+            name: "crashy".to_owned(),
+            version: "0.1.0".to_owned(),
+            build: Box::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("would have taken the daemon down".to_owned())
+            }),
+        }];
+        let cfg = config_from(r#"{"domainOs": {"crashy": {"enabled": false}}}"#);
+        let (app, reports) = mount_all(&cat, tmp.path(), &hub, Ok(&cfg), &no_models()).await;
+
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        assert_eq!(
+            built.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a switched-off module must not be constructed at all"
+        );
+        assert_eq!(
+            body_json(get(&app, "/api/v1/crashy/ping").await).await["error"]["code"],
+            "module_disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_registry_constructs_nothing() {
+        // We do not know what the user wanted, so we build nothing — same reason.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let built = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = built.clone();
+        let cat = vec![Installed {
+            name: "any".to_owned(),
+            version: "0.1.0".to_owned(),
+            build: Box::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("never reached".to_owned())
+            }),
+        }];
+        let (app, reports) = mount_all(
+            &cat,
+            tmp.path(),
+            &hub,
+            Err("os.json is not valid"),
+            &no_models(),
+        )
+        .await;
+
+        assert!(matches!(reports[0].outcome, MountOutcome::Degraded(_)));
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            body_json(get(&app, "/api/v1/any/ping").await).await["error"]["code"],
+            "registry_invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_that_fails_to_construct_still_has_a_name_and_a_namespace() {
+        // It used to vanish from the reports entirely, so `agent24 os disable` was
+        // refused for a name that "did not exist" — in exactly the situation where
+        // a user most needs to switch it off.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let (app, reports) = mount(
+            &[broken_entry("brokenbuild", "manifest invalid")],
+            tmp.path(),
+            &hub,
+        )
+        .await;
+
+        assert_eq!(reports[0].name, "brokenbuild");
+        assert_eq!(reports[0].namespace, "/api/v1/brokenbuild");
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => {
+                assert!(why.contains("could not be constructed"), "{why}");
+                assert!(why.contains("manifest invalid"), "{why}");
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+        assert_eq!(
+            get(&app, "/api/v1/brokenbuild/ping").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "and its namespace answers 503, not 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_disabled_twins_still_collide_on_their_name() {
+        // Skipped entries used to be appended AFTER `mount_all`, so they never
+        // claimed a name: two disabled twins both "succeeded" and their namespaces
+        // could register overlapping routes.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(r#"{"domainOs": {"twin": {"enabled": false}}}"#);
+        let (app, reports) = mount_all(
+            &[
+                entry(FakeModule::new("twin")),
+                entry(FakeModule::new("twin")),
+            ],
+            tmp.path(),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+        )
+        .await;
+
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        assert!(
+            matches!(reports[1].outcome, MountOutcome::Refused(_)),
+            "the second twin must lose on NAME, not be reported Disabled too: {:?}",
+            reports[1].outcome
+        );
+        // And exactly one namespace was registered — a second would have panicked
+        // on an overlapping route, which is why this test builds the router at all.
+        assert_eq!(
+            get(&app, "/api/v1/twin/ping").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_one_module_does_not_make_its_own_entry_look_like_a_typo() {
+        // `provided` used to be the CONSTRUCTED subset, so switching Sin90 off
+        // removed it from that set and its own `sin90: false` entry was then read
+        // as a typo for a module the build does not have — degrading every OTHER
+        // module. With one module the damage was invisible; with two it is not.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(r#"{"domainOs": {"alpha": {"enabled": false}}}"#);
+        let (app, reports) = mount_all(
+            &[
+                entry(FakeModule::new("alpha")),
+                entry(FakeModule::new("beta")),
+            ],
+            tmp.path(),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+        )
+        .await;
+
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        assert_eq!(
+            reports[1].outcome,
+            MountOutcome::Mounted,
+            "the OTHER module must be unaffected: {:?}",
+            reports[1].outcome
+        );
+        assert_eq!(
+            get(&app, "/api/v1/beta/ping").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_catalogue_name_is_refused_without_construction() {
+        // The catalogue names a module before any manifest exists, so nothing else
+        // would have checked it — and the name becomes a URL segment and a
+        // directory either way. An entry called `bad/name` would otherwise reach
+        // `disabled_namespace` and try to mount a route no manifest could claim.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        for bad in ["bad/name", "", "Health", "../escape"] {
+            let cat = vec![Installed {
+                name: bad.to_owned(),
+                version: "0.1.0".to_owned(),
+                build: Box::new(|| panic!("must never be constructed")),
+            }];
+            let (_, reports) = mount(&cat, tmp.path(), &hub).await;
+            match &reports[0].outcome {
+                MountOutcome::Refused(why) => {
+                    assert!(why.contains("not a usable module name"), "{bad:?}: {why}")
+                }
+                other => panic!("{bad:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manifest_that_disagrees_with_its_catalogue_entry_is_refused() {
+        // The catalogue and the manifest are two sources for one identity, so they
+        // can diverge. A name mismatch would route the module under one identity
+        // while it emitted events under another; a version mismatch would have
+        // `agent24 os` state one version while another was running.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+
+        let m = FakeModule::new("truthful");
+        let wrong_name = Installed {
+            name: "claimed".to_owned(),
+            version: m.manifest().version().to_owned(),
+            build: Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>)),
+        };
+        let (_, reports) = mount(&[wrong_name], tmp.path(), &hub).await;
+        match &reports[0].outcome {
+            MountOutcome::Refused(why) => assert!(why.contains("manifest says"), "{why}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+
+        let m = FakeModule::new("truthful");
+        let wrong_version = Installed {
+            name: "truthful".to_owned(),
+            version: "9.9.9".to_owned(),
+            build: Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>)),
+        };
+        let (_, reports) = mount(&[wrong_version], tmp.path(), &hub).await;
+        match &reports[0].outcome {
+            MountOutcome::Refused(why) => assert!(why.contains("version"), "{why}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_module_that_failed_to_open_its_store_holds_no_grants() {
+        // `granted` means what a LIVE module holds. This one got as far as having
+        // its grants computed and then never received a KernelCtx, so reporting
+        // them would say it holds capabilities it does not.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let bad = FakeModule::with("brokenstore", "in_process_crate", true);
+        let (_, reports) = mount(&[entry(bad)], tmp.path(), &hub).await;
+        assert!(matches!(reports[0].outcome, MountOutcome::Degraded(_)));
+        assert!(reports[0].granted.is_empty());
     }
 
     // ---------- ME-2: declared resources ----------
@@ -1517,14 +1941,8 @@ mod tests {
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let inv = TestModels(Ok(vec!["ornith-9b".to_owned()]));
-        let (app, reports) = mount_all(
-            &[m as Arc<dyn DomainModule>],
-            tmp.path(),
-            &hub,
-            Ok(&all_enabled()),
-            &inv,
-        )
-        .await;
+        let (app, reports) =
+            mount_all(&[entry(m)], tmp.path(), &hub, Ok(&all_enabled()), &inv).await;
 
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
         assert_eq!(
@@ -1551,14 +1969,7 @@ mod tests {
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let inv = TestModels(Err("provider timed out".to_owned()));
-        let (_, reports) = mount_all(
-            &[m as Arc<dyn DomainModule>],
-            tmp.path(),
-            &hub,
-            Ok(&all_enabled()),
-            &inv,
-        )
-        .await;
+        let (_, reports) = mount_all(&[entry(m)], tmp.path(), &hub, Ok(&all_enabled()), &inv).await;
         match &reports[0].resources {
             ResourceStatus::Unknown(why) => assert!(why.contains("timed out"), "{why}"),
             other => panic!("an unreachable provider must be Unknown, got {other:?}"),
@@ -1573,7 +1984,7 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("frugal");
         let (_, reports) = mount_all(
-            &[m as Arc<dyn DomainModule>],
+            &[entry(m)],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
@@ -1594,7 +2005,7 @@ mod tests {
             "kernel_capabilities: [events, memory]",
         );
         let m = FakeModule::from_yaml(&yaml, false);
-        let (_, reports) = mount(&[m as Arc<dyn DomainModule>], tmp.path(), &hub).await;
+        let (_, reports) = mount(&[entry(m)], tmp.path(), &hub).await;
         assert_eq!(reports[0].granted, vec!["events".to_owned()]);
     }
 }

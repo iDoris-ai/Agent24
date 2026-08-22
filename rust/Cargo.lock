@@ -265,6 +265,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "fs2",
  "http-body-util",
  "rand 0.9.5",
  "serde",

@@ -46,6 +46,19 @@ use serde::Deserialize;
 /// the only `domain-os.yml` that can describe this code is the one built with it.
 const MANIFEST: &str = include_str!("../domain-os.yml");
 
+/// This module's identity, available WITHOUT constructing it.
+///
+/// The kernel builds its catalogue of installed OSes before it decides what to
+/// construct, because a module whose constructor fails must still have a name for
+/// `agent24 os disable` to act on — that is the case where a user most needs it.
+/// (A constructor that PANICS is a different matter: nothing in-process contains
+/// that.) Constants rather than a parse: the catalogue must not be able to fail
+/// either.
+///
+/// `identity_matches_the_manifest` keeps them honest.
+pub const MANIFEST_NAME: &str = "sin90";
+pub const MANIFEST_VERSION: &str = "0.2.1";
+
 /// Where this module's data lives — a CONSTRUCTOR choice, not a trait parameter.
 ///
 /// [`DomainModule::open_store`] takes only a `&Path`, and widening it with a mode
@@ -479,5 +492,39 @@ async fn attention(
     match state.store.attention(&q.start, &q.end).await {
         Ok(rows) => Json(serde_json::json!({ "attention": rows })).into_response(),
         Err(e) => map_err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn identity_matches_the_manifest() {
+        // The kernel's catalogue uses the CONSTANTS (so it cannot fail), while
+        // everything downstream uses the parsed MANIFEST. If they ever disagreed,
+        // `agent24 os enable sin90` would write an entry for a name the mounter
+        // never sees — and nothing else would notice.
+        let m = DomainOsManifest::from_yaml(MANIFEST).expect("the compiled-in manifest is valid");
+        assert_eq!(m.name(), MANIFEST_NAME);
+        assert_eq!(m.version(), MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn a_module_that_never_opened_its_store_serves_unavailable_rather_than_panicking() {
+        // The mounter never asks a module for routes after a failed open, but the
+        // trait cannot promise that, and a panic here would take the daemon down
+        // over one module.
+        struct NoCtx;
+        impl KernelCtx for NoCtx {
+            fn events(&self) -> Option<&agent24_domain::EventSink> {
+                None
+            }
+        }
+        let m = Sin90Module::new(StorageMode::Memory).unwrap();
+        // `routes` is called WITHOUT `open_store` having run.
+        let _router = m.routes(Arc::new(NoCtx));
     }
 }
