@@ -55,6 +55,7 @@ dependencies = [
  "agent24-protocol",
  "async-trait",
  "axum",
+ "http-body-util",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -232,6 +233,7 @@ version = "0.2.1"
 dependencies = [
  "agent24-agent",
  "agent24-core",
+ "agent24-domain",
  "agent24-mcp",
  "agent24-memory",
  "agent24-models",
