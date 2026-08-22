@@ -1419,7 +1419,7 @@ mod tests {
         };
         // `manifest_yaml` asks for events only.
         let m = FakeModule::new("quiet");
-        let (_, _, partitions) = mount_all(
+        let (_, reports, partitions) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
@@ -1432,6 +1432,10 @@ mod tests {
         assert!(
             partitions.partitions().is_empty(),
             "and no partition was recorded for a module that never got one"
+        );
+        assert!(
+            !reports[0].granted.contains(&"memory".to_owned()),
+            "and the report must not claim a capability the module does not hold"
         );
     }
 
@@ -1458,6 +1462,58 @@ mod tests {
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted, "it still mounts");
         assert!(m.ctx().unwrap().memory().is_none());
+        assert!(partitions.partitions().is_empty());
+        assert!(
+            !reports[0].granted.contains(&"memory".to_owned()),
+            "a module that asked for memory and got none must not be REPORTED as \
+             holding it — `granted` names what a live module holds (#134)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partition_that_cannot_be_recorded_is_not_lent() {
+        // The precondition, end to end. Lending a partition the catalog could not
+        // record creates rows under a NUL-containing owner key that no later
+        // export, erase or key-version migration can attribute to anyone.
+        //
+        // The failure is provoked the way it could really happen: the durable row
+        // for this module's key already exists, recorded against a DIFFERENT
+        // identity, so `record_os_partition` refuses to re-attribute it.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let yaml = manifest_yaml("hungry", "in_process_crate").replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [memory]",
+        );
+        let m = FakeModule::from_yaml(&yaml, false);
+        let key = crate::os_memory::partition_key("alice", "hungry");
+        kv.record_os_partition(&key, "v0-from-an-older-kernel", "alice", "hungry")
+            .await
+            .unwrap();
+
+        let lease = MemoryLease {
+            user: "alice".to_owned(),
+            kv,
+        };
+        let (_, reports, partitions) = mount_all(
+            &[entry(m.clone())],
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            Some(&lease),
+        )
+        .await;
+
+        // It still mounts — a bookkeeping failure must not take down a module's
+        // HTTP surface — but without the capability, and saying so.
+        assert_eq!(reports[0].outcome, MountOutcome::Mounted);
+        assert!(
+            m.ctx().unwrap().memory().is_none(),
+            "no handle, rather than one writing rows nothing can attribute"
+        );
+        assert!(!reports[0].granted.contains(&"memory".to_owned()));
         assert!(partitions.partitions().is_empty());
     }
 

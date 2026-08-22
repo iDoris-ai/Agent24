@@ -100,7 +100,7 @@ const KEY_VERSION: &str = "v1";
 ///
 /// (Found by this file's own test, which asserted the collision was impossible
 /// and discovered it was not.)
-fn partition_key(user: &str, module: &str) -> String {
+pub(crate) fn partition_key(user: &str, module: &str) -> String {
     format!(
         "{KEY_VERSION}\u{0}{}\u{0}{user}\u{0}os:{}\u{0}{module}",
         user.len(),
@@ -236,37 +236,43 @@ impl OsScopedMemory {
         format!("{}\u{0}{}", self.key, agent24_core::util::ulid())
     }
 
-    /// One page of this partition's events, seq ASC, starting after `after`.
-    async fn page(&self, after: i64, size: i64) -> agent24_domain::Result<Page> {
-        let q = EventQuery::owner(&self.key).after(after).limit(size);
+    /// One page of this partition's events, NEWEST first, older than `before`
+    /// (or from the newest end when `before` is `None`).
+    ///
+    /// Backwards on purpose. The first version paged forwards from seq 0 and
+    /// stopped at a short page, which is both O(partition) for a bounded answer
+    /// and — as review pointed out — not guaranteed to terminate: a module
+    /// appending while another task reads keeps every page full, so the loop
+    /// chases a tail that keeps moving. A descending cursor only ever decreases,
+    /// so concurrent appends land above it and the walk ends.
+    async fn page(&self, before: Option<i64>, size: i64) -> agent24_domain::Result<Page> {
+        let mut q = EventQuery::owner(&self.key).newest().limit(size);
+        if let Some(b) = before {
+            q = q.before(b);
+        }
         let rows = self
             .events
             .scan(&q)
             .await
             .map_err(|e| DomainError::Store(e.to_string()))?;
         let short = (rows.len() as i64) < size;
-        let last_seq = rows.last().map(|r| r.seq).unwrap_or(after);
+        let oldest_seq = rows.last().map(|r| r.seq);
         Ok(Page {
             items: rows.into_iter().map(to_recollection).collect(),
-            last_seq,
+            oldest_seq,
             short,
         })
     }
 }
 
-/// One page of a partition's events.
+/// One page of a partition's events, newest first.
 struct Page {
     items: Vec<Recollection>,
-    /// The highest seq in this page, or the cursor it started from when empty.
-    last_seq: i64,
-    /// Fewer rows than asked for, so there is nothing after this page.
+    /// The lowest seq in this page — the cursor for the next (older) page.
+    /// `None` when the page is empty, which is also when the walk is over.
+    oldest_seq: Option<i64>,
+    /// Fewer rows than asked for, so there is nothing older than this page.
     short: bool,
-}
-
-impl Page {
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
 }
 
 fn to_recollection(s: agent24_memory::event::StoredEvent) -> Recollection {
@@ -359,24 +365,23 @@ impl ScopedMemory for OsScopedMemory {
         // not write to, and reaching for it would also drag in `rebuild()` — a
         // global operation no module should hold.
         //
-        // PAGED, with a bounded working set. The first version asked for
-        // `recent(usize::MAX)`, which became `LIMIT i64::MAX` and pulled an entire
-        // partition into memory — bypassing the very cap (`DEFAULT_SCAN_LIMIT`)
-        // that `agent24-memory` applies precisely so a scan cannot do that. Paging
-        // keeps at most one page plus `limit` matches alive at a time, and unlike a
-        // "search only the most recent N" shortcut it does not silently drop older
-        // matches.
-        let needle = query.trim().to_lowercase();
+        // Paged BACKWARDS from the newest, stopping as soon as `want` matches are
+        // in hand. Two earlier shapes were wrong and both are worth remembering:
+        // `recent(usize::MAX)` became `LIMIT i64::MAX` and defeated the memory
+        // crate's own scan cap; forward paging to a short page could not terminate
+        // against a concurrent writer. Backwards, the cursor only decreases, and a
+        // query whose matches are recent costs a page rather than a partition —
+        // while an old match is still found, because the walk does not stop early.
         let want = limit.min(MAX_RESULTS);
-        let mut newest: std::collections::VecDeque<Recollection> =
-            std::collections::VecDeque::new();
-        let mut cursor = 0i64;
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let needle = query.trim().to_lowercase();
+        let mut hits: Vec<Recollection> = Vec::new();
+        let mut cursor: Option<i64> = None;
         loop {
             let page = self.page(cursor, RECALL_PAGE).await?;
-            if page.is_empty() {
-                break;
-            }
-            cursor = page.last_seq;
+            cursor = page.oldest_seq;
             for r in page.items {
                 let hit = needle.is_empty()
                     || r.kind.to_lowercase().contains(&needle)
@@ -385,54 +390,34 @@ impl ScopedMemory for OsScopedMemory {
                         .to_lowercase()
                         .contains(&needle);
                 if hit {
-                    // A bounded ring of the NEWEST matches: `scan` is seq ASC, and
-                    // the memory crate offers no backward paging, so the newest are
-                    // found last. Keeping only `limit` of them is what stops a big
-                    // partition from being held in memory just to return ten rows.
-                    newest.push_back(r);
-                    if newest.len() > want {
-                        newest.pop_front();
+                    hits.push(r);
+                    if hits.len() == want {
+                        return Ok(hits);
                     }
                 }
             }
-            if page.short {
-                break;
+            if page.short || cursor.is_none() {
+                return Ok(hits);
             }
         }
-        let mut out: Vec<Recollection> = newest.into();
-        out.reverse();
-        Ok(out)
     }
 
     async fn recent(&self, limit: usize) -> agent24_domain::Result<Vec<Recollection>> {
-        // PAGED to the caller's limit, not clamped to one page. Clamping would
-        // silently return 500 to someone who asked for 1000 — the kind of quiet
-        // truncation this codebase keeps finding and removing. The only cap is
-        // `MAX_RESULTS`, which the contract states.
+        // ONE descending query. Not a walk: "the newest N" is exactly what
+        // `seq DESC LIMIT N` returns, so the work is proportional to the answer
+        // rather than to the partition, and there is no loop for a concurrent
+        // writer to keep alive.
+        //
+        // It got here the long way. First `LIMIT n` over an ASCENDING scan then
+        // reversed — which returns the OLDEST n backwards, and every test used a
+        // limit larger than the row count, where the two agree. Then a forward
+        // walk keeping a ring of the last n, which was correct but O(partition)
+        // and unbounded in time against an active writer.
         let want = limit.min(MAX_RESULTS);
-        let mut newest: std::collections::VecDeque<Recollection> =
-            std::collections::VecDeque::new();
-        let mut cursor = 0i64;
-        loop {
-            let page = self.page(cursor, RECALL_PAGE).await?;
-            if page.is_empty() {
-                break;
-            }
-            cursor = page.last_seq;
-            for r in page.items {
-                newest.push_back(r);
-                if newest.len() > want {
-                    newest.pop_front();
-                }
-            }
-            if page.short {
-                break;
-            }
+        if want == 0 {
+            return Ok(Vec::new());
         }
-        let mut out: Vec<Recollection> = newest.into();
-        // `scan` returns seq ASC; "recent" means newest first.
-        out.reverse();
-        Ok(out)
+        Ok(self.page(None, want as i64).await?.items)
     }
 }
 
@@ -685,8 +670,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_page_boundary_is_not_a_silent_truncation() {
-        // `usize::MAX` used to become `LIMIT i64::MAX`, bypassing the memory
-        // crate's own scan cap and pulling a whole partition into memory.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let m = handle(&kv, "alice", "sin90").await;
         for _ in 0..(RECALL_PAGE + 20) {
@@ -701,9 +684,91 @@ mod tests {
             "everything that exists comes back — the page size is a working-set \
              bound, NOT a silent truncation of the result"
         );
-        // And an unbounded ask is capped by the contract's stated ceiling, not by
-        // whatever the page size happens to be.
-        assert!(all.len() <= MAX_RESULTS);
+        // The same for the search path, whose page size is what RECALL_PAGE names.
+        assert_eq!(m.recall("note", usize::MAX).await.unwrap().len(), all.len());
+    }
+
+    #[tokio::test]
+    async fn max_results_is_the_stated_cap_and_it_is_the_newest_that_survive() {
+        // The previous version of this test asserted `len() <= MAX_RESULTS` over a
+        // 520-row partition, which is vacuously true — review was right that it
+        // pinned nothing. The cap only means anything above it.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        for i in 0..(MAX_RESULTS + 5) {
+            let mut b = serde_json::Map::new();
+            b.insert("n".into(), i.into());
+            m.remember(Remember::new("note", b)).await.unwrap();
+        }
+        let got = m.recent(usize::MAX).await.unwrap();
+        assert_eq!(got.len(), MAX_RESULTS, "capped at the contract's ceiling");
+        // And it is a NEWEST-first cap, not "the first 1000 we happened to read".
+        assert_eq!(
+            got[0].body.get("n").and_then(|v| v.as_i64()),
+            Some(MAX_RESULTS as i64 + 4)
+        );
+        assert_eq!(
+            m.recall("note", usize::MAX).await.unwrap().len(),
+            MAX_RESULTS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_limit_of_zero_reads_nothing_at_all() {
+        // Not merely "returns nothing": a zero limit used to still walk the whole
+        // partition to fill a ring it then threw away.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        for _ in 0..10 {
+            m.remember(Remember::new("note", serde_json::Map::new()))
+                .await
+                .unwrap();
+        }
+        assert!(m.recent(0).await.unwrap().is_empty());
+        assert!(m.recall("note", 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_terminates_while_another_task_keeps_appending() {
+        // The non-termination review found: paging FORWARD to a short page chases a
+        // tail that keeps moving, because a writer keeps every page full. Reading
+        // backwards, the cursor only decreases, so appends land above it.
+        //
+        // The writer keeps going for the whole read; if the read walked forwards it
+        // would not finish, and this test would hang rather than fail — which is
+        // why it is wrapped in a timeout.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = std::sync::Arc::new(handle(&kv, "alice", "sin90").await);
+        for _ in 0..(RECALL_PAGE * 2) {
+            m.remember(Remember::new("note", serde_json::Map::new()))
+                .await
+                .unwrap();
+        }
+        let writer = {
+            let m = m.clone();
+            tokio::spawn(async move {
+                for _ in 0..2000 {
+                    if m.remember(Remember::new("note", serde_json::Map::new()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        // A query that matches NOTHING, so the search cannot stop early on hits and
+        // must walk the partition to the end.
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            m.recall("no-such-content-anywhere", 10),
+        )
+        .await
+        .expect("a read must terminate against a concurrent writer")
+        .unwrap();
+        assert!(read.is_empty());
+        writer.abort();
     }
 
     #[test]
@@ -838,5 +903,39 @@ mod tests {
         assert_eq!(again[0].owner_key, p.key);
         assert_eq!(again[0].first_seen_at, first[0].first_seen_at);
         assert_eq!(again[0].module_name, "sin90");
+    }
+
+    #[tokio::test]
+    async fn a_partition_recorded_with_a_different_identity_is_a_conflict() {
+        // The test the previous one could not be: re-recording the SAME metadata
+        // proves nothing about what happens when the stored identity disagrees.
+        // The first upsert took every conflict as success and updated only
+        // `last_seen_at`, so a drifted row returned `Ok`, the handle was lent, and
+        // the catalog went on attributing new data to the old identity.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let key = partition_key("alice", "sin90");
+        kv.record_os_partition(&key, KEY_VERSION, "alice", "sin90")
+            .await
+            .unwrap();
+
+        for (ver, user, module) in [
+            ("v2", "alice", "sin90"),
+            (KEY_VERSION, "bob", "sin90"),
+            (KEY_VERSION, "alice", "cos72"),
+        ] {
+            let err = kv
+                .record_os_partition(&key, ver, user, module)
+                .await
+                .expect_err("a disagreeing identity must not be accepted");
+            assert!(
+                matches!(err, agent24_memory::MemoryError::Conflict(_)),
+                "{err}"
+            );
+        }
+        // The original row is untouched by any of the three attempts.
+        let rows = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].module_name, "sin90");
+        assert_eq!(rows[0].key_version, KEY_VERSION);
     }
 }

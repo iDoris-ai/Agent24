@@ -190,13 +190,21 @@ impl KvStore {
     /// Record that `owner_key` is the memory partition of `(user, module)`, and
     /// that it was seen now.
     ///
-    /// Idempotent and INSERT-OR-UPDATE-LAST-SEEN: `first_seen_at` and
-    /// `module_name` are written once and never overwritten, because their whole
-    /// value is saying what a partition originally was. A module rename must
-    /// leave the old row intact — that row is the only thing that can tell a
-    /// later migration what `…os:calendar` used to mean.
+    /// Idempotent, and **write-once on the immutable columns**: a repeat call with
+    /// the same identity advances `last_seen_at` and nothing else, because
+    /// `first_seen_at` and `module_name` exist to say what a partition ORIGINALLY
+    /// was. A module rename must leave the old row intact — that row is the only
+    /// thing that can tell a later migration what `…os:calendar` used to mean.
     ///
-    /// Kernel-only in practice: nothing a domain OS holds can reach it.
+    /// A repeat call that DISAGREES about `key_version`, `logical_user` or
+    /// `module_name` is a [`MemoryError::Conflict`], not an update and not a
+    /// silent success. The first version treated every conflict as success and
+    /// updated only `last_seen_at`, so a key whose stored identity had drifted —
+    /// through a future key-encoder change, another kernel caller, or corruption —
+    /// would still return `Ok`, the kernel would hand out the handle, and the
+    /// catalog would go on attributing new rows to the old identity. A catalog
+    /// that reports success while disagreeing with itself is worse than no
+    /// catalog, because the caller is entitled to believe it.
     pub async fn record_os_partition(
         &self,
         owner_key: &str,
@@ -205,12 +213,18 @@ impl KvStore {
         module: &str,
     ) -> Result<()> {
         let now = now_iso8601();
-        sqlx::query(
+        // The guarded arm updates ZERO rows when the immutable columns disagree,
+        // which is how the disagreement is detected: SQLite reports the conflict
+        // as "handled" either way, so `rows_affected()` is the only signal.
+        let res = sqlx::query(
             "INSERT INTO mem_os_partitions
                  (owner_key, key_version, logical_user, module_name,
                   first_seen_at, last_seen_at)
              VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(owner_key) DO UPDATE SET last_seen_at = excluded.last_seen_at",
+             ON CONFLICT(owner_key) DO UPDATE SET last_seen_at = excluded.last_seen_at
+               WHERE key_version = excluded.key_version
+                 AND logical_user = excluded.logical_user
+                 AND module_name = excluded.module_name",
         )
         .bind(owner_key)
         .bind(key_version)
@@ -220,6 +234,13 @@ impl KvStore {
         .bind(&now)
         .execute(&self.pool)
         .await?;
+        if res.rows_affected() == 0 {
+            return Err(crate::MemoryError::Conflict(format!(
+                "memory partition {owner_key:?} is already recorded with a different \
+                 identity than ({key_version}, {user}, {module}) — refusing to \
+                 re-attribute it"
+            )));
+        }
         Ok(())
     }
 

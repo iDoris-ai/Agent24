@@ -153,7 +153,21 @@ pub struct EventQuery {
     pub owner: String,
     pub session: Option<String>,
     pub after_seq: Option<i64>,
+    /// Exclusive upper bound on `seq`. With [`Self::newest`] this is the
+    /// backward-paging cursor; on its own it pins a scan to a snapshot taken
+    /// before a concurrent writer's appends.
+    pub before_seq: Option<i64>,
     pub limit: Option<i64>,
+    /// Return the NEWEST rows first (`seq DESC`) instead of the oldest.
+    ///
+    /// Added in F1 for a reason worth recording, because the forward-only shape
+    /// looked sufficient and was not. A reader that wants "the most recent N"
+    /// under ASC ordering has to walk the partition from the beginning — which is
+    /// O(partition) for a bounded answer, and, when paged, never terminates
+    /// against a writer that keeps appending: each page is full because the tail
+    /// keeps moving. Paging DESC walks AWAY from new appends (the cursor only
+    /// decreases), so it terminates by construction and reads O(N).
+    pub newest_first: bool,
 }
 
 impl EventQuery {
@@ -162,11 +176,23 @@ impl EventQuery {
             owner: owner.into(),
             session: None,
             after_seq: None,
+            before_seq: None,
             limit: None,
+            newest_first: false,
         }
     }
     pub fn after(mut self, seq: i64) -> Self {
         self.after_seq = Some(seq);
+        self
+    }
+    /// Only rows with `seq < seq`.
+    pub fn before(mut self, seq: i64) -> Self {
+        self.before_seq = Some(seq);
+        self
+    }
+    /// Order by `seq DESC`. See [`EventQuery::newest_first`].
+    pub fn newest(mut self) -> Self {
+        self.newest_first = true;
         self
     }
     pub fn session(mut self, s: impl Into<String>) -> Self {
@@ -343,13 +369,23 @@ impl EventStore for EventLog {
         if q.after_seq.is_some() {
             sql.push_str(" AND seq > ?");
         }
-        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        if q.before_seq.is_some() {
+            sql.push_str(" AND seq < ?");
+        }
+        sql.push_str(if q.newest_first {
+            " ORDER BY seq DESC LIMIT ?"
+        } else {
+            " ORDER BY seq ASC LIMIT ?"
+        });
         let mut query = sqlx::query(&sql).bind(&q.owner);
         if let Some(s) = &q.session {
             query = query.bind(s);
         }
         if let Some(a) = q.after_seq {
             query = query.bind(a);
+        }
+        if let Some(b) = q.before_seq {
+            query = query.bind(b);
         }
         query = query.bind(q.limit.unwrap_or(DEFAULT_SCAN_LIMIT));
         let rows = query.fetch_all(&self.pool).await?;

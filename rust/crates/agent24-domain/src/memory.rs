@@ -139,6 +139,17 @@ pub struct Recollection {
 
 /// A domain OS's view of the shared memory base.
 ///
+/// # No method here may accept a [`MemoryId`]
+///
+/// A rule for whoever extends this trait, stated here because it cannot be
+/// enforced by a test — one was written (`a_memory_id_is_opaque`, then
+/// `no_scoped_memory_method_accepts_a_memory_id`) and review was right that
+/// neither could fail. `MemoryId` is constructible by any module (see its docs),
+/// so it is not authority; it is harmless today only because there is nowhere to
+/// spend one. A `fn forget(&self, id: MemoryId)` or `fn get(&self, id: MemoryId)`
+/// would turn a forgeable value into a lookup key across partitions. If you need
+/// one, resolve it against the caller's OWN partition — never on its own.
+///
 /// Every method is scoped to the module that was handed this object. There is no
 /// parameter through which that scope can be widened, and no accessor through
 /// which the underlying store can be reached — see the module docs for why both
@@ -194,26 +205,5 @@ mod tests {
             "Remember must carry ONLY kind and body — no id, and no scope through \
              which an owner could be smuggled"
         );
-    }
-
-    #[test]
-    fn no_scoped_memory_method_accepts_a_memory_id() {
-        // The property that actually matters, replacing a test named
-        // `a_memory_id_is_opaque` that could not establish what its name claimed:
-        // `from_kernel` is public and `Deserialize` is a second construction path,
-        // so a module CAN build a `MemoryId` — it just has nowhere to spend one.
-        // Every read is scoped by the kernel's key and none takes an id, so a
-        // forged or guessed id cannot select another module's row.
-        //
-        // Compile-time, asserted here because the risk is someone later adding a
-        // `fn forget(&self, id: MemoryId)` or `fn get(&self, id: MemoryId)` and
-        // reopening the hole. If you are here because you added one: the id must
-        // be resolved against the caller's OWN partition, never used as a lookup
-        // key on its own.
-        let id = MemoryId::from_kernel("forged");
-        let _: &str = id.as_str();
-        // `Remembered` and `Recollection` are where ids come OUT. Nothing takes one
-        // back in — see the trait above, whose three methods take `Remember`,
-        // `&str`+`usize`, and `usize`.
     }
 }

@@ -804,14 +804,18 @@ pub async fn serve(
     if let Some(l) = lease.as_ref() {
         match crate::os_memory::OsMemoryCatalog::durable_for(&l.kv, LOCAL_USER).await {
             Ok(rows) if !rows.is_empty() => {
+                // By physical KEY, not by module name. After a key-version change a
+                // mounted module gets a NEW partition while its historical rows keep
+                // the same module name — matching on the name would report those as
+                // live and hide exactly the leftovers this log exists to surface.
                 let live: std::collections::HashSet<&str> = partitions
                     .partitions()
                     .iter()
-                    .map(|p| p.module.as_str())
+                    .map(|p| p.key.as_str())
                     .collect();
                 let dormant = rows
                     .iter()
-                    .filter(|r| !live.contains(r.module_name.as_str()))
+                    .filter(|r| !live.contains(r.owner_key.as_str()))
                     .count();
                 tracing::info!(
                     "user {LOCAL_USER} has {} domain-OS memory partition(s) besides their \

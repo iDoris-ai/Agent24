@@ -25,14 +25,18 @@ CREATE TABLE mem_os_partitions (
     owner_key     TEXT PRIMARY KEY,
     -- The derived-key format, so a later migration knows what it is reading
     -- rather than inferring it from the string's shape.
-    key_version   TEXT NOT NULL CHECK (trim(key_version) <> ''),
+    key_version   TEXT NOT NULL CHECK (trim(key_version, char(32)||char(9)||char(10)||char(13)) <> ''),
     -- The logical user, recorded rather than parsed back out of the key.
-    logical_user  TEXT NOT NULL CHECK (trim(logical_user) <> ''),
+    logical_user  TEXT NOT NULL CHECK (trim(logical_user, char(32)||char(9)||char(10)||char(13)) <> ''),
     -- The module's manifest name AT FIRST SIGHT. A rename does not change the
     -- key, so this is the only record of what the key originally meant.
-    module_name   TEXT NOT NULL CHECK (trim(module_name) <> ''),
+    module_name   TEXT NOT NULL CHECK (trim(module_name, char(32)||char(9)||char(10)||char(13)) <> ''),
     first_seen_at TEXT NOT NULL,
     last_seen_at  TEXT NOT NULL
 );
 
+-- The two-argument trim, matching migration 0011's event-owner rule. The
+-- one-argument form strips ASCII SPACE only, so a tab-only module name would
+-- pass a CHECK that reads as "not blank" — the exact gap 0011 was written to
+-- close, and one this table would have reintroduced.
 CREATE INDEX mem_os_partitions_user ON mem_os_partitions (logical_user);
