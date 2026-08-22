@@ -50,6 +50,17 @@ pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response
 /// reports both through the same error type — conflating them would answer 400
 /// for an oversized upload, which reads as "your JSON is malformed" and sends
 /// the caller looking in the wrong place.
+// `Err` is the shared v1-envelope `Response`, which is the whole point of this
+// helper — boxing it to shrink the `Result` would just move the allocation and
+// make every call site unwrap it again.
+//
+// The allow travelled with the function from `agent24d::routes` in ME-1b-a and
+// was DROPPED in the move. It fires only on clippy 1.98+ (which extended
+// `result_large_err` to `async fn` return types), so a local 1.95 reported a
+// clean workspace while CI failed — and it then blocked three consecutive PRs,
+// each of which I had checked locally and believed green. Note it here rather
+// than re-learning it a fourth time.
+#[allow(clippy::result_large_err)]
 pub async fn read_body_or_response(req: Request<Body>) -> Result<Bytes, Response> {
     match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => Ok(b),
