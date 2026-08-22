@@ -60,9 +60,16 @@ fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 fn blob_to_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    // Manual 4-byte stride rather than `chunks_exact(4)` (CI clippy flags a
+    // constant chunk size); trailing <4 bytes are impossible given the migration's
+    // `CHECK(length(vec) = dims * 4)` but are simply ignored here.
+    let mut out = Vec::with_capacity(b.len() / 4);
+    let mut i = 0;
+    while i + 4 <= b.len() {
+        out.push(f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]));
+        i += 4;
+    }
+    out
 }
 
 /// Cosine similarity of two equal-length vectors; 0.0 if either is zero-norm or
