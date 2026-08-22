@@ -5,15 +5,26 @@
 //!
 //! - [`KnowledgeBase::merged`] concatenates the ACTIVE instructions in precedence
 //!   order (priority ascending, so the highest-priority / most-specific layer
-//!   comes LAST and wins for a top-down reader — CLAUDE.md semantics).
+//!   comes LAST and wins for a top-down reader — CLAUDE.md semantics). Ties break
+//!   by WRITE TIME then id, so a caller-chosen id no longer silently encodes
+//!   precedence (review #124 M2).
 //! - [`KnowledgeBase::triggered`] returns the active instructions whose triggers
 //!   appear in a context string (conditional injection).
 //! - [`KnowledgeBase::propose`] files an auto-memory PROPOSAL as `pending`; it is
 //!   NEVER part of `merged`/`triggered` until [`KnowledgeBase::approve`] promotes
 //!   it. Auto-memory is never auto-applied — a human gates it.
 //!
-//! All writes are owner-scoped (a foreign id cannot approve/reject another
-//! owner's inbox — the #119 lesson).
+//! **All writes are owner-scoped** — the row identity is the PAIR
+//! `(scope_owner, id)`, so a foreign id can neither rewrite another owner's
+//! instruction nor approve/reject their inbox (#119's lesson, applied to the
+//! WRITE path too — review #124 B1).
+//!
+//! **What the review gate protects.** Not merely "a proposal cannot promote
+//! itself", but "auto-memory cannot change the IN-FORCE instruction set without a
+//! human". So `propose` also refuses to overwrite an ACTIVE row: silently
+//! replacing an approved rule with a pending one would REMOVE it from `merged`
+//! — un-approving by the back door (review #124 B2). Retracting a rule needs the
+//! same human as adding one.
 
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
@@ -92,9 +103,12 @@ pub trait KnowledgeBase: Send + Sync {
     async fn triggered(&self, owner: &str, context: &str) -> Result<Vec<Instruction>>;
     /// The pending auto-memory proposals awaiting review.
     async fn inbox(&self, owner: &str) -> Result<Vec<Instruction>>;
-    /// Promote a pending proposal to active. Owner-scoped; returns whether one
-    /// moved.
-    async fn approve(&self, id: &str, owner: &str) -> Result<bool>;
+    /// Promote a pending proposal to active, with the REVIEWER's layer/priority —
+    /// not the proposal's self-chosen ones. A proposal that picked
+    /// `priority = i64::MAX` would otherwise outrank a human policy the moment it
+    /// was approved, bundling "approve this text" with "approve this precedence"
+    /// (review #124 M1). Owner-scoped; returns whether one moved.
+    async fn approve(&self, id: &str, owner: &str, layer: &str, priority: i64) -> Result<bool>;
     /// Drop a pending proposal. Owner-scoped; returns whether one was removed.
     async fn reject(&self, id: &str, owner: &str) -> Result<bool>;
 }
@@ -110,28 +124,57 @@ impl InstructionStore {
         Self { pool }
     }
 
-    async fn insert(&self, i: &Instruction, status: InstructionStatus) -> Result<()> {
-        let triggers = serde_json::to_string(&i.triggers)?;
-        sqlx::query(
+    /// Triggers, trimmed with blanks dropped: a whitespace-only trigger is a
+    /// substring of nearly any context and would become a permanent injection
+    /// surface once approved (review #124).
+    fn clean_triggers(triggers: &[String]) -> Vec<String> {
+        triggers
+            .iter()
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    /// Upsert on the (owner, id) PAIR. `only_when_pending` gates the update so a
+    /// proposal cannot clobber an ACTIVE row (review #124 B2); the caller turns a
+    /// no-op into a `Conflict` rather than reporting silent success.
+    async fn upsert(
+        &self,
+        i: &Instruction,
+        status: InstructionStatus,
+        only_when_pending: bool,
+    ) -> Result<u64> {
+        let triggers = serde_json::to_string(&Self::clean_triggers(&i.triggers))?;
+        let sql = if only_when_pending {
             "INSERT INTO mem_instructions
-                 (id, scope_owner, layer, priority, body, triggers, status, at)
+                 (scope_owner, id, layer, priority, body, triggers, status, at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
+             ON CONFLICT(scope_owner, id) DO UPDATE SET
                  layer = excluded.layer, priority = excluded.priority,
                  body = excluded.body, triggers = excluded.triggers,
-                 status = excluded.status, at = excluded.at",
-        )
-        .bind(&i.id)
-        .bind(&i.owner)
-        .bind(&i.layer)
-        .bind(i.priority)
-        .bind(&i.body)
-        .bind(&triggers)
-        .bind(status.as_str())
-        .bind(agent24_core::util::now_iso8601())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+                 status = excluded.status, at = excluded.at
+                 WHERE mem_instructions.status = 'pending'"
+        } else {
+            "INSERT INTO mem_instructions
+                 (scope_owner, id, layer, priority, body, triggers, status, at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(scope_owner, id) DO UPDATE SET
+                 layer = excluded.layer, priority = excluded.priority,
+                 body = excluded.body, triggers = excluded.triggers,
+                 status = excluded.status, at = excluded.at"
+        };
+        let res = sqlx::query(sql)
+            .bind(&i.owner)
+            .bind(&i.id)
+            .bind(&i.layer)
+            .bind(i.priority)
+            .bind(&i.body)
+            .bind(&triggers)
+            .bind(status.as_str())
+            .bind(agent24_core::util::now_iso8601())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 
     fn row_to_instruction(row: &sqlx::sqlite::SqliteRow) -> Result<Instruction> {
@@ -151,7 +194,7 @@ impl InstructionStore {
             "SELECT id, scope_owner, layer, priority, body, triggers, status
              FROM mem_instructions
              WHERE scope_owner = ? AND status = 'active'
-             ORDER BY priority ASC, id ASC",
+             ORDER BY priority ASC, at ASC, id ASC",
         )
         .bind(owner)
         .fetch_all(&self.pool)
@@ -163,13 +206,23 @@ impl InstructionStore {
 #[async_trait]
 impl KnowledgeBase for InstructionStore {
     async fn add_active(&self, i: &Instruction) -> Result<()> {
-        self.insert(i, InstructionStatus::Active).await
+        // The trusted human write path: may overwrite this owner's own row.
+        self.upsert(i, InstructionStatus::Active, false).await?;
+        Ok(())
     }
 
     async fn propose(&self, i: &Instruction) -> Result<()> {
-        // Forced pending regardless of the passed status — a proposal can never
-        // sneak in as active.
-        self.insert(i, InstructionStatus::Pending).await
+        // Forced pending (a proposal can never sneak in as active) AND refused
+        // against an active row (it must not un-approve one either).
+        let affected = self.upsert(i, InstructionStatus::Pending, true).await?;
+        if affected == 0 {
+            return Err(crate::MemoryError::Conflict(format!(
+                "instruction {} is ACTIVE for owner {}; a proposal cannot overwrite \
+                 an approved instruction — retracting one needs the same human review",
+                i.id, i.owner
+            )));
+        }
+        Ok(())
     }
 
     async fn merged(&self, owner: &str) -> Result<String> {
@@ -201,7 +254,7 @@ impl KnowledgeBase for InstructionStore {
             "SELECT id, scope_owner, layer, priority, body, triggers, status
              FROM mem_instructions
              WHERE scope_owner = ? AND status = 'pending'
-             ORDER BY priority ASC, id ASC",
+             ORDER BY priority ASC, at ASC, id ASC",
         )
         .bind(owner)
         .fetch_all(&self.pool)
@@ -209,11 +262,13 @@ impl KnowledgeBase for InstructionStore {
         rows.iter().map(Self::row_to_instruction).collect()
     }
 
-    async fn approve(&self, id: &str, owner: &str) -> Result<bool> {
+    async fn approve(&self, id: &str, owner: &str, layer: &str, priority: i64) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE mem_instructions SET status = 'active'
+            "UPDATE mem_instructions SET status = 'active', layer = ?, priority = ?
              WHERE id = ? AND scope_owner = ? AND status = 'pending'",
         )
+        .bind(layer)
+        .bind(priority)
         .bind(id)
         .bind(owner)
         .execute(&self.pool)
@@ -315,7 +370,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(k.approve("a", "u1").await.unwrap());
+        assert!(k.approve("a", "u1", "learned", 0).await.unwrap());
         assert!(k.reject("r", "u1").await.unwrap());
         // Approved is now merged; rejected is gone; inbox empty.
         assert_eq!(k.merged("u1").await.unwrap(), "APPROVED FACT");
@@ -329,12 +384,109 @@ mod tests {
             .await
             .unwrap();
         // bob cannot approve or reject alice's inbox item by id.
-        assert!(!k.approve("p", "bob").await.unwrap());
+        assert!(!k.approve("p", "bob", "learned", 0).await.unwrap());
         assert!(!k.reject("p", "bob").await.unwrap());
         assert_eq!(
             k.inbox("alice").await.unwrap().len(),
             1,
             "still pending for alice"
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_are_owner_scoped_same_id_across_owners_do_not_collide() {
+        // B1: the case the old isolation test could never hit — the SAME id under
+        // two owners. bob's write must not rewrite alice's row (nor forge its
+        // attribution).
+        let k = kb().await;
+        k.add_active(&instr("shared", "alice", "global", 0, "ALICE-RULE"))
+            .await
+            .unwrap();
+        k.add_active(&instr("shared", "bob", "global", 0, "BOB-RULE"))
+            .await
+            .unwrap();
+        assert_eq!(
+            k.merged("alice").await.unwrap(),
+            "ALICE-RULE",
+            "alice intact"
+        );
+        assert_eq!(k.merged("bob").await.unwrap(), "BOB-RULE");
+    }
+
+    #[tokio::test]
+    async fn proposal_cannot_overwrite_an_approved_instruction() {
+        // B2: the review gate protects the IN-FORCE set, not just self-promotion.
+        // A proposal reusing an active id must ERROR, not silently un-approve it.
+        let k = kb().await;
+        k.add_active(&instr("rule", "u1", "global", 0, "HUMAN-APPROVED-RULE"))
+            .await
+            .unwrap();
+        let err = k
+            .propose(&instr("rule", "u1", "learned", 0, "AUTO-MEMORY-CONTENT"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::MemoryError::Conflict(_)), "{err}");
+        // The approved rule is still in force and the inbox stayed empty.
+        assert_eq!(k.merged("u1").await.unwrap(), "HUMAN-APPROVED-RULE");
+        assert!(k.inbox("u1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_owner_proposal_cannot_touch_another_owners_active_rule() {
+        let k = kb().await;
+        k.add_active(&instr("rule", "alice", "global", 0, "ALICE-RULE"))
+            .await
+            .unwrap();
+        // bob proposing under his own scope with the same id is fine and isolated.
+        k.propose(&instr("rule", "bob", "learned", 0, "BOB-PROPOSAL"))
+            .await
+            .unwrap();
+        assert_eq!(k.merged("alice").await.unwrap(), "ALICE-RULE", "untouched");
+        assert!(
+            k.inbox("alice").await.unwrap().is_empty(),
+            "not in alice's inbox"
+        );
+        assert_eq!(k.inbox("bob").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approve_uses_the_reviewers_priority_not_the_proposals() {
+        // M1: a proposal picking i64::MAX must not outrank a human policy just by
+        // being approved — the reviewer sets layer/priority.
+        let k = kb().await;
+        k.add_active(&instr("policy", "u1", "global", 100, "HUMAN-POLICY"))
+            .await
+            .unwrap();
+        k.propose(&instr("greedy", "u1", "learned", i64::MAX, "AUTO-WINS"))
+            .await
+            .unwrap();
+        assert!(k.approve("greedy", "u1", "learned", 10).await.unwrap());
+        // Reviewer's priority 10 < 100 → the human policy still comes last (wins).
+        assert_eq!(
+            k.merged("u1").await.unwrap(),
+            "AUTO-WINS\n\n---\n\nHUMAN-POLICY"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_triggers_are_dropped_not_stored() {
+        // A whitespace-only trigger matches nearly any context — a permanent
+        // injection surface once approved. It is trimmed away at write time.
+        let k = kb().await;
+        let mut i = instr("t", "u1", "global", 0, "body");
+        i.triggers = vec!["  ".into(), "".into(), " deploy ".into()];
+        k.add_active(&i).await.unwrap();
+        assert!(
+            k.triggered("u1", "unrelated chatter")
+                .await
+                .unwrap()
+                .is_empty(),
+            "blank trigger must not match everything"
+        );
+        assert_eq!(
+            k.triggered("u1", "time to DEPLOY").await.unwrap().len(),
+            1,
+            "the real trigger still works, trimmed"
         );
     }
 
