@@ -14,9 +14,11 @@ CREATE TABLE mem_embeddings (
     scope_owner  TEXT    NOT NULL CHECK (trim(scope_owner) <> ''),
     model_id     TEXT    NOT NULL,
     revision     TEXT    NOT NULL,
-    dims         INTEGER NOT NULL,
-    normalized   INTEGER NOT NULL,
-    vec          BLOB    NOT NULL,          -- dims × f32, little-endian
+    dims         INTEGER NOT NULL CHECK (dims > 0),
+    normalized   INTEGER NOT NULL CHECK (normalized IN (0, 1)),
+    -- the blob must hold exactly dims × 4 bytes (dims f32s): a length mismatch is
+    -- a corrupt/misbehaving embedder, not a silently-zero-scoring row (review #123 M2).
+    vec          BLOB    NOT NULL CHECK (length(vec) = dims * 4),
     at           TEXT    NOT NULL,
     PRIMARY KEY (assertion_id, model_id, revision)
 );

@@ -27,9 +27,9 @@
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 
-use crate::Result;
 use crate::assertion::AssertionLedger;
-use crate::retriever::{FtsRetriever, Retriever, SearchHit};
+use crate::retriever::{FtsRetriever, Retriever, SearchHit, is_searchable_query};
+use crate::{MemoryError, Result};
 
 /// A reproducible embedding: the vector plus the model identity that produced it.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +103,35 @@ impl<E: Embedder + Clone> VectorRetriever<E> {
         }
     }
 
+    /// Reject a misbehaving embedder before its output can corrupt the index or a
+    /// search: the returned identity must match the declared one (else reindex
+    /// would embed forever and search never find it, review #123 M1), the vector
+    /// length must equal `dims` (M2), and every component must be finite (M3).
+    fn check_embedding(&self, emb: &Embedding) -> Result<()> {
+        if emb.model_id != self.embedder.model_id() || emb.revision != self.embedder.revision() {
+            return Err(MemoryError::Embedder(format!(
+                "declared {}/{} but returned {}/{}",
+                self.embedder.model_id(),
+                self.embedder.revision(),
+                emb.model_id,
+                emb.revision
+            )));
+        }
+        if emb.dims as usize != emb.vector.len() {
+            return Err(MemoryError::Embedder(format!(
+                "dims {} != vector length {}",
+                emb.dims,
+                emb.vector.len()
+            )));
+        }
+        if !emb.vector.iter().all(|x| x.is_finite()) {
+            return Err(MemoryError::Embedder(
+                "non-finite vector component".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Embed the owner's current, qualified assertions that LACK a vector under
     /// the current `(model_id, revision)`, and store them. Resumable: only the
     /// missing ones are embedded, so an interrupted run resumes and a finished run
@@ -133,7 +162,8 @@ impl<E: Embedder + Clone> VectorRetriever<E> {
             let object: String = r.get("object");
             let text = format!("{subject} {predicate} {object}");
             let emb = self.embedder.embed(&text).await?;
-            sqlx::query(
+            self.check_embedding(&emb)?;
+            let res = sqlx::query(
                 "INSERT INTO mem_embeddings
                      (assertion_id, scope_owner, model_id, revision, dims, normalized, vec, at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -149,7 +179,8 @@ impl<E: Embedder + Clone> VectorRetriever<E> {
             .bind(agent24_core::util::now_iso8601())
             .execute(&self.pool)
             .await?;
-            n += 1;
+            // Count only rows actually inserted, not conflicts (review #123 minor).
+            n += res.rows_affected() as usize;
         }
         Ok(n)
     }
@@ -158,7 +189,43 @@ impl<E: Embedder + Clone> VectorRetriever<E> {
 #[async_trait]
 impl<E: Embedder + Clone> Retriever for VectorRetriever<E> {
     async fn search(&self, query: &str, owner: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        // Load current-model vectors joined to current, qualified assertions.
+        // A degenerate query returns nothing (never errors) — the SAME trait
+        // contract FtsRetriever honors, checked BEFORE the embedder (review #123 B2).
+        if !is_searchable_query(query) {
+            return Ok(Vec::new());
+        }
+
+        // Probe completeness and fetch vectors in ONE read transaction, so a
+        // concurrent insert cannot slip between the two and make the "complete"
+        // verdict stale.
+        let mut tx = self.pool.begin().await?;
+        // Fall back to FTS unless the index is COMPLETE for this owner: a PARTIAL
+        // index (the normal window between reindex runs) must not silently miss
+        // un-embedded assertions by returning only the embedded fraction (B1).
+        let incomplete: i64 = sqlx::query(
+            "SELECT EXISTS(
+                 SELECT 1 FROM mem_assertions a
+                 WHERE a.scope_owner = ? AND a.recorded_to IS NULL AND a.qualified = 1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM mem_embeddings e
+                     WHERE e.assertion_id = a.id AND e.model_id = ? AND e.revision = ?
+                   )
+             ) AS inc",
+        )
+        .bind(owner)
+        .bind(self.embedder.model_id())
+        .bind(self.embedder.revision())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("inc");
+        if incomplete != 0 {
+            drop(tx); // read-only; nothing to commit
+            return self.fts.search(query, owner, limit).await;
+        }
+
+        // Complete index: rank by cosine over the current model's vectors. Isolate
+        // by the AUTHORITY owner (a.scope_owner), not the projection's redundant
+        // copy (review #123 M4).
         let rows = sqlx::query(
             "SELECT a.id, a.scope, a.subject, a.predicate, a.object,
                     a.valid_from, a.valid_to, a.recorded_from, a.recorded_to,
@@ -166,37 +233,39 @@ impl<E: Embedder + Clone> Retriever for VectorRetriever<E> {
                     a.supersedes, a.qualified, e.vec
              FROM mem_embeddings e
              JOIN mem_assertions a ON a.id = e.assertion_id
-             WHERE e.scope_owner = ? AND e.model_id = ? AND e.revision = ?
+             WHERE a.scope_owner = ? AND e.model_id = ? AND e.revision = ?
                AND a.recorded_to IS NULL AND a.qualified = 1",
         )
         .bind(owner)
         .bind(self.embedder.model_id())
         .bind(self.embedder.revision())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-
-        // No current-model vectors → fall back to lexical FTS (local-first, never
-        // a hard dependency on the vector index being built).
+        drop(tx);
         if rows.is_empty() {
-            return self.fts.search(query, owner, limit).await;
+            return Ok(Vec::new()); // complete + empty = the owner has no beliefs
         }
 
         let q = self.embedder.embed(query).await?;
-        let mut scored: Vec<SearchHit> = rows
-            .iter()
-            .map(|r| {
-                let vec = blob_to_vec(&r.get::<Vec<u8>, _>("vec"));
-                Ok(SearchHit {
-                    score: cosine(&q.vector, &vec),
-                    assertion: AssertionLedger::row_to_assertion(r)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Deterministic order: score desc, then id asc to break ties.
+        self.check_embedding(&q)?;
+        let mut scored: Vec<SearchHit> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let vec = blob_to_vec(&r.get::<Vec<u8>, _>("vec"));
+            let score = cosine(&q.vector, &vec);
+            // Drop a non-finite score rather than let a NaN break the total order
+            // (review #123 M3); cosine already handles zero-norm/len-mismatch.
+            if !score.is_finite() {
+                continue;
+            }
+            scored.push(SearchHit {
+                score,
+                assertion: AssertionLedger::row_to_assertion(r)?,
+            });
+        }
+        // Total order: score desc (total_cmp), then id asc to break ties.
         scored.sort_by(|a, b| {
             b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&a.score)
                 .then_with(|| a.assertion.id.cmp(&b.assertion.id))
         });
         scored.truncate(limit);
@@ -220,7 +289,9 @@ impl HashEmbedder {
         Self {
             model_id: model_id.into(),
             revision: revision.into(),
-            dims,
+            // Clamp to at least 1: dims == 0 would panic on the `% self.dims` in
+            // embed (review #123 minor).
+            dims: dims.max(1),
         }
     }
 }
@@ -391,6 +462,125 @@ mod tests {
         let v = kv.vector_retriever(HashEmbedder::new("m", "v1", 32));
         let hits = v.search("rust", "u1", 5).await.unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_index_falls_back_to_fts_not_confident_wrong_answer() {
+        // B1: a1 embedded, a2 added after → the index is INCOMPLETE. Searching for
+        // a2's term must fall back to FTS (and find a2), not return only the
+        // embedded fraction with a confident wrong hit.
+        let kv = store().await;
+        assert(&kv, "a1", "u1", "color", "blue").await;
+        let v = kv.vector_retriever(HashEmbedder::new("m", "v1", 32));
+        v.reindex("u1").await.unwrap();
+        assert(&kv, "a2", "u1", "city", "zanzibar").await; // NOT reindexed
+        let hits = v.search("zanzibar", "u1", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].assertion.id, "a2",
+            "FTS fallback finds the un-embedded one"
+        );
+    }
+
+    #[tokio::test]
+    async fn degenerate_query_returns_nothing_like_fts() {
+        // B2: same trait contract as FtsRetriever, on a fully-built index.
+        let kv = store().await;
+        assert(&kv, "a1", "u1", "topic", "rust").await;
+        let v = kv.vector_retriever(HashEmbedder::new("m", "v1", 32));
+        v.reindex("u1").await.unwrap();
+        assert!(v.search("", "u1", 5).await.unwrap().is_empty());
+        assert!(v.search("   ", "u1", 5).await.unwrap().is_empty());
+        assert!(v.search("!@#$%", "u1", 5).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn misbehaving_embedder_is_rejected_not_re_embedded_forever() {
+        // M1: an embedder whose returned identity disagrees with its declared one
+        // would otherwise be re-embedded every run and never found → hard error.
+        #[derive(Clone)]
+        struct LiarEmbedder;
+        #[async_trait]
+        impl Embedder for LiarEmbedder {
+            fn model_id(&self) -> &str {
+                "declared"
+            }
+            fn revision(&self) -> &str {
+                "v1"
+            }
+            async fn embed(&self, _t: &str) -> Result<Embedding> {
+                Ok(Embedding {
+                    model_id: "actual".into(),
+                    revision: "v9".into(),
+                    dims: 2,
+                    normalized: false,
+                    vector: vec![1.0, 0.0],
+                })
+            }
+        }
+        let kv = store().await;
+        assert(&kv, "a1", "u1", "x", "y").await;
+        let v = kv.vector_retriever(LiarEmbedder);
+        assert!(matches!(
+            v.reindex("u1").await.unwrap_err(),
+            MemoryError::Embedder(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dims_mismatch_is_rejected() {
+        // M2: dims=384 but a 2-float vector must not land as a silently-0-scoring row.
+        #[derive(Clone)]
+        struct WrongDims;
+        #[async_trait]
+        impl Embedder for WrongDims {
+            fn model_id(&self) -> &str {
+                "m"
+            }
+            fn revision(&self) -> &str {
+                "v1"
+            }
+            async fn embed(&self, _t: &str) -> Result<Embedding> {
+                Ok(Embedding {
+                    model_id: "m".into(),
+                    revision: "v1".into(),
+                    dims: 384,
+                    normalized: true,
+                    vector: vec![1.0, 0.0],
+                })
+            }
+        }
+        let kv = store().await;
+        assert(&kv, "a1", "u1", "x", "y").await;
+        let v = kv.vector_retriever(WrongDims);
+        assert!(matches!(
+            v.reindex("u1").await.unwrap_err(),
+            MemoryError::Embedder(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn isolation_uses_authority_owner_not_the_projection_copy() {
+        // M4: even if a projection row's redundant scope_owner is tampered, the
+        // authority (mem_assertions.scope_owner) gates the result — no leak.
+        let kv = store().await;
+        assert(&kv, "victim", "alice", "secret", "alpha").await;
+        let v = kv.vector_retriever(HashEmbedder::new("m", "v1", 32));
+        v.reindex("alice").await.unwrap();
+        // Tamper the projection's owner copy to "bob".
+        sqlx::query("UPDATE mem_embeddings SET scope_owner = 'bob' WHERE assertion_id = 'victim'")
+            .execute(&v.pool)
+            .await
+            .unwrap();
+        // bob must NOT see alice's assertion (the join filters on a.scope_owner).
+        assert!(v.search("secret", "bob", 5).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hash_embedder_zero_dims_does_not_panic() {
+        let e = HashEmbedder::new("m", "v1", 0);
+        let emb = e.embed("hello world").await.unwrap();
+        assert_eq!(emb.dims, 1, "clamped to 1, no modulo-by-zero panic");
     }
 
     #[test]

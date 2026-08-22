@@ -58,6 +58,11 @@ pub enum MemoryError {
     /// `MemoryError` like the rest.
     #[error("condenser: {0}")]
     Condenser(String),
+    /// An [`vector::Embedder`] misbehaved — returned an identity that disagrees
+    /// with its declared one, a vector whose length differs from `dims`, or a
+    /// non-finite component (review #123 M1/M2/M3).
+    #[error("embedder: {0}")]
+    Embedder(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
