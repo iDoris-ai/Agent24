@@ -29,14 +29,20 @@ improvement/
 
 **要交付的结论(尚未做)**:
 - [ ] 逐层核对 M-D 记忆底座的**可插拔缝**是否真的可换实现(不是名义上的 trait):`Condenser` / `EventStore` / `ArtifactStore` / `AssertionStore` / `Retriever` / `Embedder` / `InsightSynth` / `MemoryWriter` / `KnowledgeBase` / `TaskTrace`。
+- [ ] 🔴 **修 `mem_checkpoints` 的 owner 维**(已知缺陷,见下方基线):加 owner 列 + API 加 owner 参数 + 跨 owner 测试。**优先级高于其余自检** —— 这是已在 main 上的真实跨租户缺口,不是设计问题。
+- [ ] 判定 **`kv` 的 namespace-vs-owner 隔离模型**:是否需要把 namespace 绑定到 owner,或改用 owner 维。
+- [ ] 收紧 `mem_events` 的 `scope_owner` CHECK 到 `trim(...)`(需新迁移;0002 已发布不可改)。
 - [ ] **领域 OS 之间的记忆隔离/共享模型**:Sin90 与 Cos72 各自挂载时,底层 memory 是**同库不同 scope**、**不同库**、还是**可选共享的显式通道**?给出方案对比 + 推荐 + 污染面分析。
 - [ ] 落地 ADR-029 里那个**尚未实现**的洞:`KernelCtx::memory(scope, grants) -> ScopedMemory`(能力受限句柄,不是 ambient `MemoryStore`)。这是隔离能否成立的关键,属 M-E(ME-1)范围。
 - [ ] 给出**跨 OS 共享**的显式机制设计(若确实需要):共享什么(assertions? artifacts?)、谁授权、怎么审计、怎么撤销。
 
-**今日事实基线(不是结论,是现状快照)**:
-- 记忆层每一张表都有 `scope_owner`,且 owner 强制非空;所有读写路径 owner-scoped(#115/#119/#122/#123/#124/#125 六轮复审逐条打过跨 owner 探针)。
-- `Scope` 有 `owner / agent / session / run` 四维,但**只有 owner 维在存储层强制**;`agent` 维目前**未被任何查询使用** —— 这正是「不同 OS 挂在同一 owner 下会不会互污」的关键缺口。
-- `ScopedMemory` / `KernelCtx` **尚未实现**(SPEC §2 只有契约草案)。
+**今日事实基线(不是结论,是现状快照;经 #126 复审逐表核对后订正)**:
+- 记忆层 **11 张表里 9 张**有 `scope_owner` 且强制非空,读写路径 owner-scoped(#115/#119/#122/#123/#124/#125 六轮复审逐条打过跨 owner 探针)。**两个例外**:
+  - 🔴 **`mem_checkpoints` 完全没有 owner 列**,且 API 也没有 owner 参数(`checkpoint_at(name, seq)` / `checkpoint_seq(name)`)—— **两个 owner 用同名 checkpoint 会共享同一行**,一方推进会让另一方的增量扫描跳过事件。**形状与 #119 的 `retract` 一模一样**(没有 owner 参数,所以没有任何 `WHERE` 能救),那六轮复审各自只打了它们触碰的表,**这张一次都没被碰到**。→ 已列为 TODO-A 的**已知缺陷**,单独修。
+  - ⚠️ **`kv`(L0)用 `PRIMARY KEY (namespace, key)` 隔离,即 namespace 而非 owner** —— 是**另一套隔离模型**,不一定是缺陷,但正该由 TODO-A 判断:namespace 是否由 owner 派生?两个 OS 挂同一 owner 时会不会撞 namespace?
+- `Scope` 有 `owner / agent / session / run` 四维,但**只有 owner 维在存储层强制**;`agent` 维目前**未被任何查询使用**(全仓 0 处 `scope_agent` 列)—— 这正是「不同 OS 挂在同一 owner 下会不会互污」的关键缺口。
+- `ScopedMemory` / `KernelCtx` **尚未实现**(SPEC §2 只有契约草案;ME-1a 已落契约 crate,ME-1b+ 才接内核)。
+- ⚠️ **非空 CHECK 强度不齐**:`mem_events` 是 `CHECK(scope_owner <> '')`,其余八张是 `CHECK(trim(scope_owner) <> '')` —— **纯空格 owner 在 `mem_events` 过得去,在别处过不去**。(0002 是已发布迁移不可改,需新迁移收紧。)
 
 ---
 
@@ -72,7 +78,8 @@ improvement/
 
 M-D 阶段已落地的借鉴(源:`agent24-memory-research/RESEARCH-REPORT-v2.md`,18 仓库读源码):
 codex(trait 形状/路径安全)· goose(TokenEstimator/hide-not-delete)· OpenHands(Condenser view-delta)· basic-memory(双谱系对账)· graphiti(双时相)· Dense-Mem(写门)· memobase(巩固)· gemini-cli(审核门控 inbox)· aider(预算渲染)· TencentDB(符号轨迹)· cognee(确定性 id)。
-详见 `docs/specs/SPEC-MD-ME.md` §0.4 借鉴映射表。
+详见 `docs/specs/SPEC-MD-ME.md` §0.4 借鉴映射表(**在本仓库内,可跟随**)。
+> ⚠️ 原始调研报告 `agent24-memory-research/RESEARCH-REPORT-v2.md`(18 仓库读源码)按本章程约定放在 **repo 外、不提交**,因此**不可跟随**。11 条已落地借鉴的**结论摘要**待沉进 `decisions/`,避免那个目录一旦丢失、第 4 节只剩一串名字。→ 列入 TODO-A。
 
 **已评估但明确不采纳(带理由)**:
 - **ColBERT / late-interaction 多向量检索**(sentence-transformers v6):不作主索引 —— ~40× 存储 + MaxSim 需 Qdrant/Weaviate/Vespa/Milvus 原生支持 = ADR-028 §0.1 禁止的强制外部向量服务;且在语义聚合任务上会输。**采纳其两段式** recall→rerank,留作 MD-6x `Reranker` 缝(与 `OmlxEmbedder` 同挂 D4b)。已记入 SPEC 借鉴映射表。
