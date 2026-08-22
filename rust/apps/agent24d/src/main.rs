@@ -12,7 +12,6 @@ mod routes;
 mod runs;
 mod schedules;
 mod server;
-mod sin90;
 
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;

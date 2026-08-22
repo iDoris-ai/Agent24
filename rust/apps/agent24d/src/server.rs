@@ -38,11 +38,6 @@ pub struct AppState {
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
     pub store: Store,
-    /// Sin90 Personal-OS module store — its OWN `sin90.db`, isolated from the
-    /// kernel `store` above (SIN90-domain.md §0). `Option` so a store that fails
-    /// to open degrades THIS module (handlers 503) instead of killing the daemon:
-    /// the kernel genuinely never depends on it.
-    pub sin90: Option<agent24_sin90_store::Sin90Store>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -175,7 +170,6 @@ pub struct AppDeps {
     pub router: Arc<ModelRouter>,
     pub tools: agent24_tools::ToolRegistry,
     pub store: Store,
-    pub sin90: Option<agent24_sin90_store::Sin90Store>,
     pub shutdown: CancellationToken,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
@@ -196,7 +190,6 @@ impl AppState {
             router,
             tools,
             store,
-            sin90,
             shutdown,
             guardian,
             memory,
@@ -252,7 +245,6 @@ impl AppState {
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
             store,
-            sin90,
             runs,
             scheduler,
             shutdown,
@@ -394,32 +386,6 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             axum::routing::post(crate::schedules::run_now),
         )
         .route("/api/v1/events", get(crate::events::ws_events))
-        // Sin90 module (SIN90-domain.md §4) — its own sin90.db, sin90.* WS events.
-        .route(
-            "/api/v1/sin90/directions",
-            post(crate::sin90::create_direction).get(crate::sin90::list_directions),
-        )
-        .route(
-            "/api/v1/sin90/schedule-blocks",
-            post(crate::sin90::create_block).get(crate::sin90::list_blocks),
-        )
-        .route(
-            "/api/v1/sin90/schedule-blocks/{id}",
-            axum::routing::patch(crate::sin90::transition_block),
-        )
-        .route(
-            "/api/v1/sin90/proposals",
-            post(crate::sin90::submit_proposal).get(crate::sin90::list_proposals),
-        )
-        .route(
-            "/api/v1/sin90/proposals/{id}",
-            get(crate::sin90::get_proposal),
-        )
-        .route(
-            "/api/v1/sin90/proposals/{id}/accept",
-            post(crate::sin90::accept_proposal),
-        )
-        .route("/api/v1/sin90/attention", get(crate::sin90::attention))
         .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
         .route(
             "/api/v1/sessions",
@@ -479,27 +445,6 @@ pub async fn serve(
         Store::open(&dir.join("agent24.db"))
             .await
             .map_err(std::io::Error::other)?
-    };
-    // Sin90 module store: its OWN sin90.db, physically isolated from agent24.db.
-    // A failure to open degrades the module (handlers 503), NEVER the daemon —
-    // the kernel (runs/approvals/scheduler) must not die because an add-on's
-    // file is corrupt (cf. open_session_memory).
-    let sin90_open = if ephemeral {
-        agent24_sin90_store::Sin90Store::open_memory().await
-    } else {
-        match agent24_protocol::state_file::state_dir() {
-            Some(dir) => agent24_sin90_store::Sin90Store::open(&dir.join("sin90.db")).await,
-            None => Err(agent24_sin90_store::StoreError::Internal(
-                "HOME not set".into(),
-            )),
-        }
-    };
-    let sin90 = match sin90_open {
-        Ok(s) => Some(s),
-        Err(err) => {
-            tracing::error!("sin90 module store unavailable ({err}); /api/v1/sin90/* will 503");
-            None
-        }
     };
     // NOTE: the startup sweeps (durable-resume restore + orphan cancel) run
     // AFTER the state is built, below — the restore sweep needs the run manager.
@@ -576,7 +521,6 @@ pub async fn serve(
         router,
         tools,
         store,
-        sin90,
         risk_overrides,
         shutdown: cancel.clone(),
         guardian,
@@ -620,17 +564,54 @@ pub async fn serve(
         sched_cancel,
     ));
 
-    // Domain OSes (ME-1b). The registry is EMPTY, so this runs the ZERO-module
-    // path and produces no reports — it is wiring, not coverage; the mounter's
-    // real behavior is covered by `domain::tests`. It is here rather than behind a
-    // TODO so the registry slot is already wired when ME-1b-b moves Sin90 behind
-    // `DomainModule` — that change still has to delete the hardcoded sin90 routes
-    // and `AppState.sin90`, drop `sin90` from RESERVED_KERNEL_SEGMENTS, and migrate
-    // `~/.agent24/sin90.db` to the new per-module directory.
-    let os_root = agent24_protocol::state_file::state_dir()
-        .ok_or_else(|| std::io::Error::other("HOME not set"))?
-        .join("os");
-    let installed: Vec<StdArc<dyn agent24_domain::DomainModule>> = Vec::new();
+    // Domain OSes (ME-1b-b). THIS is the one place in the kernel that may name a
+    // module: someone has to say which OS is installed, and a composition root
+    // naming its components is not the coupling ADR-029 objects to. Everything
+    // downstream — routing, the data directory, the event module, the capability
+    // grant — is derived from the manifest, so `crate::domain` and
+    // `build_router_with_modules` still contain no Sin90-shaped branch. A second
+    // OS is another entry in `installed` — each built independently so one that
+    // fails to construct cannot stop the others from mounting.
+    let state_dir = agent24_protocol::state_file::state_dir()
+        .ok_or_else(|| std::io::Error::other("HOME not set"))?;
+    let mode = if ephemeral {
+        // Ephemeral daemons get an in-memory store and NO migration: they are
+        // private to one CLI invocation and must not touch the user's database.
+        agent24_sin90_os::StorageMode::Memory
+    } else {
+        // Pre-ME-1b daemons kept Sin90 at `~/.agent24/sin90.db`. Handing that path
+        // over as `legacy` is what stops an upgrading user from opening a
+        // brand-new empty Sin90 while their real data sits one directory up; the
+        // copy itself is a SQLite snapshot, not a file move (see
+        // `Sin90Store::open_migrating_from`).
+        agent24_sin90_os::StorageMode::Persistent {
+            legacy: Some(state_dir.join("sin90.db")),
+        }
+    };
+    let mut installed: Vec<StdArc<dyn agent24_domain::DomainModule>> = Vec::new();
+    match agent24_sin90_os::Sin90Module::new(mode) {
+        Ok(m) => installed.push(StdArc::new(m)),
+        Err(err) => {
+            // Only reachable if this build's compiled-in manifest is invalid. The
+            // daemon still starts, and any OTHER installed module still mounts: a
+            // broken domain OS is not a broken kernel, which is the whole point of
+            // the boundary.
+            tracing::error!("sin90 module could not be constructed ({err}); not mounting it");
+        }
+    }
+    // An ephemeral daemon gets a throwaway root, NOT `~/.agent24/os`. The mounter
+    // creates a directory for every module it mounts, and an in-memory module will
+    // never writes into it — but an ephemeral instance's STORES were all in memory
+    // before ME-1b-b, and quietly starting to create per-module directories under
+    // the user's state dir would erode that. (It does still create
+    // `~/.agent24/workspace` for tools; this is about not ADDING to what an
+    // ephemeral run touches.) Keyed by pid so two concurrent ephemeral daemons
+    // cannot collide.
+    let os_root = if ephemeral {
+        std::env::temp_dir().join(format!("agent24-ephemeral-{}", std::process::id()))
+    } else {
+        state_dir.join("os")
+    };
     let (module_routes, reports) =
         crate::domain::mount_all(&installed, &os_root, &state.events).await;
     for r in &reports {
@@ -753,6 +734,37 @@ pub(crate) mod tests {
         state_with_guardian(None).await
     }
 
+    /// A router with Sin90 mounted AS A DOMAIN OS — through `mount_all`, exactly
+    /// like `serve` does it.
+    ///
+    /// The SPIKE-00 tests below deliberately still go over HTTP rather than
+    /// calling the store: their job is to show that moving Sin90 behind
+    /// `DomainModule` left the HEALTHY surface unchanged — same paths, same
+    /// statuses, same bodies, and `proposal.applied` still reaching the kernel's
+    /// bus with the right module and kind. What DID change is the unavailable
+    /// surface: a degraded module now answers 503 for every path and method under
+    /// its namespace, where the old inline guard produced 503 only on its own
+    /// routes and left 404/405 for the rest.
+    ///
+    /// The `TempDir` is returned so the caller can hold it. With the in-memory
+    /// store it is only the (empty) directory the mounter creates, so dropping it
+    /// would not break anything today — but a test that switches to `Persistent`
+    /// would silently lose its database the moment the handle went out of scope.
+    async fn router_with_sin90() -> (Router, tempfile::TempDir) {
+        router_with_sin90_mode(agent24_sin90_os::StorageMode::Memory).await
+    }
+
+    async fn router_with_sin90_mode(
+        mode: agent24_sin90_os::StorageMode,
+    ) -> (Router, tempfile::TempDir) {
+        let st = state().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let m: StdArc<dyn agent24_domain::DomainModule> =
+            StdArc::new(agent24_sin90_os::Sin90Module::new(mode).unwrap());
+        let (modules, _) = crate::domain::mount_all(&[m], tmp.path(), &st.events).await;
+        (build_router_with_modules(st, modules), tmp)
+    }
+
     async fn state_with_guardian(
         guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     ) -> AppState {
@@ -761,11 +773,6 @@ pub(crate) mod tests {
             router: Arc::new(ModelRouter::with_defaults(vec![])),
             tools: agent24_tools::ToolRegistry::new(),
             store: Store::open_memory().await.unwrap(),
-            sin90: Some(
-                agent24_sin90_store::Sin90Store::open_memory()
-                    .await
-                    .unwrap(),
-            ),
             shutdown: CancellationToken::new(),
             guardian,
             memory: None,
@@ -1299,7 +1306,7 @@ pub(crate) mod tests {
     // — is proven in agent24-sin90-store's `attention_replay_is_pure_snapshot`.)
     #[tokio::test]
     async fn sin90_spike00_loop_over_router() {
-        let router = build_router(state().await);
+        let (router, _os_dir) = router_with_sin90().await;
 
         async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
             router
@@ -1380,7 +1387,7 @@ pub(crate) mod tests {
     // rows back — and a missing proposal id is a 404, not an empty success.
     #[tokio::test]
     async fn sin90_list_reads_round_trip_over_router() {
-        let router = build_router(state().await);
+        let (router, _os_dir) = router_with_sin90().await;
 
         async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
             router
@@ -1469,7 +1476,7 @@ pub(crate) mod tests {
     // violation) → 404, not the 500 a raw sqlx error would become.
     #[tokio::test]
     async fn sin90_bad_direction_is_404_not_500() {
-        let router = build_router(state().await);
+        let (router, _os_dir) = router_with_sin90().await;
         let res = router
             .oneshot(
                 Request::builder()
@@ -1493,9 +1500,17 @@ pub(crate) mod tests {
     // `proposal.applied` — the receipt is idempotent, the notification too.
     #[tokio::test]
     async fn sin90_retry_accept_does_not_double_emit() {
+        // Subscribe to the hub BEFORE mounting, and use the same state the module
+        // was mounted against — the whole point is that the module's events still
+        // reach the kernel's bus now that it emits through `KernelCtx`.
         let st = state().await;
         let mut rx = st.events.subscribe();
-        let router = build_router(st);
+        let tmp = tempfile::tempdir().unwrap();
+        let m: StdArc<dyn agent24_domain::DomainModule> = StdArc::new(
+            agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Memory).unwrap(),
+        );
+        let (modules, _) = crate::domain::mount_all(&[m], tmp.path(), &st.events).await;
+        let router = build_router_with_modules(st, modules);
 
         let submit = |router: Router| async move {
             router
@@ -1547,13 +1562,23 @@ pub(crate) mod tests {
         );
     }
 
-    // The head-fix: a daemon whose sin90 store failed to open (None) must serve
-    // health but 503 every sin90 route — the kernel does not depend on the module.
+    // The head-fix, now going through the real mount path: a daemon whose sin90
+    // store fails to open must serve health but 503 every sin90 route — the kernel
+    // does not depend on the module.
+    //
+    // The failure is REAL rather than injected: the module is pointed at a legacy
+    // "database" that is not one, so its migration fails and `open_store` returns
+    // Err. That exercises the whole chain — module error → `MountOutcome::Degraded`
+    // → the kernel's own 503 under the namespace — instead of a hand-set `None`.
     #[tokio::test]
     async fn sin90_unavailable_503s_but_kernel_lives() {
-        let mut st = state().await;
-        st.sin90 = None;
-        let router = build_router(st);
+        let broken = tempfile::tempdir().unwrap();
+        let legacy = broken.path().join("not-a-database.db");
+        std::fs::write(&legacy, b"definitely not sqlite").unwrap();
+        let (router, _os_dir) = router_with_sin90_mode(agent24_sin90_os::StorageMode::Persistent {
+            legacy: Some(legacy),
+        })
+        .await;
 
         for (method, uri) in [
             ("POST", "/api/v1/sin90/directions"),
@@ -1606,7 +1631,8 @@ pub(crate) mod tests {
     // lexical window compare — reject it rather than silently under-count.
     #[tokio::test]
     async fn sin90_attention_rejects_non_fixed_width_bounds() {
-        let res = build_router(state().await)
+        let (router, _os_dir) = router_with_sin90().await;
+        let res = router
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/sin90/attention?start=2026-08-01&end=2026-08-11")

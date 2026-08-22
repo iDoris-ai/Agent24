@@ -5,10 +5,11 @@
 //! [`KernelCtx`], and nests its routes under a namespace DERIVED from its
 //! manifest. The mounting LOGIC has no module-specific branch — that is the ME-1
 //! acceptance — and the tests below mount fake modules rather than Sin90, so the
-//! property cannot quietly become "the mounter happens to work for Sin90". (The
-//! file does name `sin90` once, in [`RESERVED_KERNEL_SEGMENTS`], because the
-//! kernel still hardcodes those routes; that entry disappears in ME-1b-b. Fake
-//! modules give regression evidence, not proof that no special case exists.)
+//! property cannot quietly become "the mounter happens to work for Sin90". As of
+//! ME-1b-b this file names no module at all: Sin90 mounts through exactly this
+//! path, and the only place in the kernel that says "sin90" is `serve`, which has
+//! to name the OS it installs. (Fake modules give regression evidence, not proof
+//! that no special case exists.)
 //!
 //! Five rules the CONTRACT cannot enforce on its own, which therefore live here:
 //!
@@ -88,14 +89,6 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "schedules",
     "sessions",
     "shutdown",
-    // TEMPORARY, and the set-equality test is what enforces it. Sin90's seven
-    // routes are still HARDCODED in the kernel, which makes `sin90` a kernel
-    // segment like any other — a module claiming it today would panic startup.
-    // ME-1b-b deletes those routes; at that moment this entry becomes STALE and
-    // `reserved_segments_match_the_kernel_routes_exactly` FAILS until it is
-    // removed. Without that direction of the check, the kernel would quietly
-    // refuse to mount its own first domain OS.
-    "sin90",
     "standing-grants",
     "tool-overrides",
     "tools",
@@ -659,11 +652,11 @@ mod tests {
     /// BOTH directions.
     ///
     /// A missing entry reappears as a startup panic. A STALE entry is just as bad
-    /// and much quieter: when ME-1b-b deletes Sin90's seven hardcoded routes,
-    /// `"sin90"` left in this list would make the kernel refuse to mount its own
-    /// first domain OS — and a one-directional "every kernel segment is reserved"
-    /// check would stay green through it. So this asserts SET EQUALITY, which
-    /// makes that deletion fail here until the entry is removed too.
+    /// and much quieter — and this is not hypothetical: when ME-1b-b deleted
+    /// Sin90's seven hardcoded routes, `"sin90"` left in this list would have made
+    /// the kernel refuse to mount its own first domain OS, and a one-directional
+    /// "every kernel segment is reserved" check would have stayed green through
+    /// it. The equality assertion is what forced that entry out.
     ///
     /// **It is a heuristic, and its limits are the point of saying so.** It scans
     /// literal `"/api/v1/<seg>` strings inside one function's source, so a route

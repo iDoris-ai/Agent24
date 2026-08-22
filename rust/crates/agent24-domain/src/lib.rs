@@ -3,8 +3,10 @@
 //! Agent24 is a BASE: one kernel, plus a swappable **domain OS** (Sin90 today,
 //! Cos72 or a third-party one tomorrow). This crate holds the contract between
 //! them — types and traits only, no kernel and no module — so the dependency
-//! arrow stays one-way and the kernel can mount a module **without knowing its
-//! name**, which is the ME-1 acceptance.
+//! arrow stays one-way and the kernel's MOUNTER can mount a module **without
+//! knowing its name**, which is the ME-1 acceptance. (The daemon's composition
+//! root still names the OS it installs — someone has to say which one is
+//! there — but nothing downstream of that does.)
 //!
 //! ```text
 //!   agent24d (kernel)  ──depends on──▶  agent24-domain  ◀──depends on──  a domain OS
@@ -66,12 +68,13 @@
 //! READER also needs a bounded read; [`DomainOsManifest::MAX_YAML_BYTES`] bounds an
 //! already-loaded string and cannot stop a huge file from being read in first.
 //!
-//! **What is deliberately NOT here yet** (ME-1b and later, documented rather than
-//! faked): the kernel-side registry that mounts modules and drops
-//! `AppState.sin90`; `ScopedMemory` over the M-D stores (`KernelCtx::memory` —
-//! ADR-029's open hole, which must consult kernel-owned policy and must NOT take a
-//! caller-supplied [`Grants`]); the model / scheduler / policy handles; and the
-//! out-of-process Provider path (ME-3).
+//! **What is deliberately NOT here yet** (documented rather than faked):
+//! `ScopedMemory` over the M-D stores (`KernelCtx::memory` — ADR-029's open hole,
+//! which must consult kernel-owned policy and must NOT take a caller-supplied
+//! [`Grants`]); the model / scheduler / policy handles; and the out-of-process
+//! Provider path (ME-3). The kernel-side registry landed in ME-1b-a
+//! (`agent24d::domain`) and Sin90 moved behind this contract in ME-1b-b, so
+//! `AppState.sin90` and the hardcoded `/api/v1/sin90/*` routes are gone.
 
 pub mod http;
 

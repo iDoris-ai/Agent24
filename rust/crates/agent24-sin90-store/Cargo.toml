@@ -12,6 +12,7 @@ agent24-core = { path = "../agent24-core" }        # util only: ulid() + now_iso
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+tracing = "0.1"
 thiserror = "2"
 
 [features]
@@ -19,6 +20,10 @@ thiserror = "2"
 test-hooks = []
 
 [dev-dependencies]
+# Same version as the main dep; integration tests need it to build a valid but
+# FOREIGN SQLite database, to prove identity is checked and not just integrity.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Self-dependency with the feature on, so integration tests (a separate crate)
 # can reach `test_hooks` while downstream consumers never get it.
