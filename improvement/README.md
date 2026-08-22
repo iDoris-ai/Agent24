@@ -91,6 +91,15 @@ codex(trait 形状/路径安全)· goose(TokenEstimator/hide-not-delete)· OpenH
 
 ---
 
-## 5. 开工条件
+## 5. 与 `SPEC-ME-FOLLOWUPS.md` 的分工
+
+2026-08-22 起,本台账里**已经排期的**修复项(领域 OS 记忆隔离、`kv` 隔离模型判定、`mem_events` CHECK 收紧、symlink `openat`、`agent24-store` 排序 tie-breaker)统一收进
+[`docs/specs/SPEC-ME-FOLLOWUPS.md`](../docs/specs/SPEC-ME-FOLLOWUPS.md) —— 那份是**要做的工单**,带验收。
+
+本台账继续负责**长期跟踪**的那一半:架构自检的持续结论、心智模型叙事、以及 TODO-C 的先进 agent 深度调研。两边指向同一批事实,但**工单只写一处**,免得改完一处忘了另一处。
+
+---
+
+## 6. 开工条件
 
 用户 2026-08-22 指令:**「等 milestone 都搞一阶段之后再开始」**。当前 M-D 主线 MD-1..8 已交付;M-E 尚未开始。开工前请用户确认批次与优先级。
