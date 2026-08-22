@@ -47,7 +47,31 @@ M-E 到 ME-2 为止交付的是**可换**：内核不再按名字认识 Sin90，
 2. 复用一条 #115/#119/#122–#125 六轮复审已经逐表打过跨 owner 探针的强制路径;
 3. 零迁移 = 对既有用户数据零风险。
 
-> 这个决定正在做对抗式挑战（重点:C 在哪里会漏、把 owner 重载成「(用户, 模块)」将来会不会后悔、以及「C 不锁死 B」这句话是不是真的）。**结论落定后回填这里。**
+### 对抗式挑战的结论（2026-08-22）
+
+**三条我自查时漏掉的:**
+
+1. 🔴 **KV 是 C 的直接漏洞。** `kv` 表根本没有 owner,只有调用方给的 `(namespace, key)`(`0001_kv.sql:1`)。**而且拿到 `KvStore` 就等于拿到全部** —— events / artifacts / assertions / retriever / consolidation / knowledge / trace / vector 的访问器都挂在它上面(`lib.rs:115/124/130`)。
+   → **`ScopedMemory` 绝不能暴露 `KvStore`、pool、或任何由它派生的原始 store。** 模块若需要 KV,namespace 必须由内核派生/加前缀。
+2. 🔴 **全局唯一 ID 是一条非读取型泄漏。** `mem_events.id` 是**全局 UNIQUE** 而不是 `(scope_owner, id)`(`0002_events.sql:7`),`mem_assertions.id` 是裸主键(`0004_assertions.sql:19`)。两个隔离的模块都铸 `msg-1` 时,**一方能阻止另一方写入**(`event.rs:311` 那条跨租户冲突检查正是拒绝点)。读不到对方,但能拒绝服务。
+   → 要么内核**给模块铸的全局 ID 打戳并一致重写引用**(causal / evidence / supersedes),要么**契约明说 ID 是数据库全局的**、模块不得指望自己的键空间。
+3. 🟡 **「C 不锁死 B」只在弱意义上成立。** 反例:模块 `calendar` 改名/被 `schedule` 取代后,**光看数据库无法判断** `user\0calendar` 该归给谁、要不要合并、还是属于一个已卸载的历史模块。加上 C 之前的老数据(`alice`,没有模块分量)同样无从归属。
+   → 诚实的说法是:**C 不让 B 变成不可能,但会产生语义迁移债。** 因此:派生键**必须带版本**,并维护一份内核自己的目录 `physical_owner_key -> (logical_user, stable_module_id, current_manifest_name)` —— 将来的 GDPR/迁移代码**不该靠对含 NUL 的字符串做 SQL 前缀匹配**来发现分区。
+
+**它对 A 的判断**:不要为了复用 `Scope.agent` 而选 A —— 那个字段今天只存在于序列化的 `Scope` 里,**没有任何强制路径**。
+
+**它给的裁决框架**(逐字):
+- 若这只是「模块私有记忆」的能力边界 → **用 C**,但必须先修 KV 和全局 ID,并保留内核侧的逻辑身份元数据;
+- 若「这个用户的全部数据」「GDPR 删除」「模块迁移」「有意的跨 OS 记忆」是**近期产品需求** → **现在就做 B**,11 次重建比生产数据堆起来之后再normalize 便宜。
+
+### 不得声称的话（复审逐条列出，这个仓库前四轮抓的几乎全是这类）
+
+- ❌「schema 层面强制的模块隔离」—— C 之下 schema 强制的是**不透明 owner** 的隔离,模块含义是内核包装层给的;
+- ❌「每张记忆表都是 owner-scoped」—— **KV 不是**;
+- ❌「模块有独立键空间」—— 除非先处理全局 event/assertion ID;
+- ❌「agent/session/run 是隔离边界」—— 它们只是序列化元数据,**没有强制**;
+- ❌「GDPR 就绪的按用户删除」—— 除非有一条被测过的内核枚举/目录操作;
+- ❌「将来迁到 B 是无损/轻松的」。
 
 **要交付**
 1. `KernelCtx::memory() -> Option<&dyn ScopedMemory>`：**能力受限句柄，不是 ambient `MemoryStore`**；能力=句柄存在，与 `events()` 同构；**不接受调用方传进来的 `Grants`**（ME-1a 已把 `Grants` 定性为信息而非权威）。
