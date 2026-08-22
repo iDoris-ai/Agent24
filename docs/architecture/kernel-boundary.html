@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<!--
+  Agent24 内核边界 — 架构快照(2026-08-22)
+
+  自包含的静态 HTML:直接用浏览器打开即可,不需要构建、不需要服务器。
+  唯一的外部请求是 Google Fonts;离线打开会回退到系统字体,布局不受影响。
+
+  出处:最初作为 artifact 生成,用来回答"内核到底是什么、领域 OS 站在
+  哪一层、新能力该放哪里"。存进仓库是为了让那次讨论可追溯 —— 哪些部分
+  已经过时,见页面顶部的状态块。
+-->
+<title>Agent24 内核边界</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+
+<style>
+  :root{
+    --ground:#EAEEF1; --panel:#F6F8F9; --panel-2:#E1E7EB;
+    --ink:#171E22; --ink-2:#48565E; --ink-3:#6F8189;
+    --line:#C3CED4; --line-soft:#D7E0E5;
+    --oxide:#A8481F;      /* 铁锈 — 只给"有意义的那一处" */
+    --patina:#1F6F66;     /* 铜绿 — 已接通/正确 */
+    --amber:#8A6108;      /* 缺口 */
+    --oxide-wash:#F3E2DA; --patina-wash:#DCEBE8; --amber-wash:#F2E9D3;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#0F1518; --panel:#161E22; --panel-2:#1D272C;
+      --ink:#E4EBEE; --ink-2:#A5B5BC; --ink-3:#7C8F97;
+      --line:#2C3A41; --line-soft:#232F35;
+      --oxide:#E8895E; --patina:#5FBFB1; --amber:#D9AB4A;
+      --oxide-wash:#2A1810; --patina-wash:#0E2523; --amber-wash:#251C08;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0F1518; --panel:#161E22; --panel-2:#1D272C;
+    --ink:#E4EBEE; --ink-2:#A5B5BC; --ink-3:#7C8F97;
+    --line:#2C3A41; --line-soft:#232F35;
+    --oxide:#E8895E; --patina:#5FBFB1; --amber:#D9AB4A;
+    --oxide-wash:#2A1810; --patina-wash:#0E2523; --amber-wash:#251C08;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--ground); color:var(--ink);
+    font-family:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    font-size:15px; line-height:1.65; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1060px; margin:0 auto; padding:48px 24px 96px; display:flex; flex-direction:column; gap:44px}
+
+  code,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+  code{font-size:.86em; background:var(--panel-2); padding:.12em .38em; border-radius:3px; color:var(--ink)}
+
+  header{display:flex; flex-direction:column; gap:14px; border-bottom:1px solid var(--line); padding-bottom:26px}
+  .eyebrow{font-family:"IBM Plex Mono",monospace; font-size:11.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-3)}
+  h1{font-size:clamp(30px,4.4vw,44px); line-height:1.1; margin:0; font-weight:600; letter-spacing:-.02em; text-wrap:balance}
+  .lede{font-size:17px; color:var(--ink-2); max-width:64ch; margin:0}
+
+  .method{
+    display:flex; flex-wrap:wrap; gap:8px 20px; padding:14px 18px; background:var(--panel);
+    border:1px solid var(--line-soft); border-left:3px solid var(--patina); border-radius:2px;
+    font-family:"IBM Plex Mono",monospace; font-size:12px; color:var(--ink-2);
+  }
+
+  h2{font-size:24px; font-weight:600; letter-spacing:-.01em; margin:0 0 4px; text-wrap:balance}
+  h3{font-size:15.5px; font-weight:600; margin:0 0 6px}
+  section{display:flex; flex-direction:column; gap:18px}
+  p{margin:0; max-width:70ch}
+
+  figure{margin:0; display:flex; flex-direction:column; gap:12px}
+  .canvas{background:var(--panel); border:1px solid var(--line-soft); border-radius:3px; padding:20px 16px; overflow-x:auto}
+  svg{display:block; max-width:100%; height:auto; min-width:720px; margin:0 auto}
+  figcaption{font-size:13.5px; color:var(--ink-2); max-width:76ch}
+
+  /* ---- SVG 语义类 ---- */
+  .band{fill:var(--panel-2); stroke:var(--line-soft); stroke-width:1}
+  .chip{fill:var(--panel); stroke:var(--line); stroke-width:1.2}
+  .chip-ok{fill:var(--patina-wash); stroke:var(--patina); stroke-width:1.4}
+  .chip-gap{fill:var(--amber-wash); stroke:var(--amber); stroke-width:1.4; stroke-dasharray:5 3}
+  .chip-bad{fill:var(--oxide-wash); stroke:var(--oxide); stroke-width:1.4}
+  .kbox{fill:none; stroke:var(--patina); stroke-width:2}
+  .t{fill:var(--ink); font-family:"IBM Plex Mono",monospace; font-size:12.5px}
+  .t-sm{fill:var(--ink-2); font-family:"IBM Plex Mono",monospace; font-size:10.5px}
+  .t-band{fill:var(--ink-3); font-family:"IBM Plex Mono",monospace; font-size:11px; letter-spacing:.06em}
+  .t-oxide{fill:var(--oxide); font-family:"IBM Plex Mono",monospace; font-size:11px; font-weight:500}
+  .t-patina{fill:var(--patina); font-family:"IBM Plex Mono",monospace; font-size:10.5px}
+  .t-amber{fill:var(--amber); font-family:"IBM Plex Mono",monospace; font-size:10px}
+  .ln{stroke:var(--ink-3); stroke-width:1.4; fill:none}
+  .ln-bad{stroke:var(--oxide); stroke-width:2; fill:none; stroke-dasharray:6 4}
+  .ln-ok{stroke:var(--patina); stroke-width:1.6; fill:none}
+
+  table{border-collapse:collapse; width:100%; font-size:13.5px}
+  th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--line-soft); vertical-align:top}
+  th{font-family:"IBM Plex Mono",monospace; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-3); font-weight:500; border-bottom:1px solid var(--line)}
+  td.ev{font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--ink-2); white-space:nowrap}
+  .tbl-scroll{overflow-x:auto; border:1px solid var(--line-soft); border-radius:3px; background:var(--panel)}
+  tbody tr:last-child td{border-bottom:none}
+
+  .pill{display:inline-block; font-family:"IBM Plex Mono",monospace; font-size:10.5px; padding:2px 7px; border-radius:2px; white-space:nowrap; font-weight:500}
+  .ok{background:var(--patina-wash); color:var(--patina); border:1px solid var(--patina)}
+  .gap{background:var(--amber-wash); color:var(--amber); border:1px solid var(--amber)}
+  .bad{background:var(--oxide-wash); color:var(--oxide); border:1px solid var(--oxide)}
+
+  .qa{display:flex; flex-direction:column; gap:22px}
+  .q{border-left:3px solid var(--oxide); padding-left:18px; display:flex; flex-direction:column; gap:7px}
+  .q h3{color:var(--oxide)}
+
+  .verdict{background:var(--panel); border:1px solid var(--line-soft); border-radius:3px; padding:18px 20px; display:flex; flex-direction:column; gap:10px}
+  .verdict strong{font-weight:600}
+  ul{margin:0; padding-left:20px; display:flex; flex-direction:column; gap:6px; max-width:70ch}
+  li::marker{color:var(--ink-3)}
+</style>
+
+</head>
+<body>
+<div class="wrap" style="padding-bottom:0">
+<div style="background:var(--amber-wash);border:1px solid var(--amber);border-left:3px solid var(--amber);border-radius:2px;padding:16px 18px;font-size:14px;line-height:1.6">
+<strong style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--amber)">状态 · 2026-08-22</strong>
+<p style="margin:8px 0 0;max-width:none">
+本页绘于 <strong>M-E 开工之前</strong>,记录的是当时的现状与当时设想的理想态。它被存下来是因为<strong>那两张图促成了后面几期的工作</strong>,不是因为它现在还准确。
+</p>
+<p style="margin:8px 0 0;max-width:none">
+下方「当前架构」一图中标注的两处缺陷 <strong>已经修掉</strong>:内核不再按名字认识 Sin90(<code>AppState.sin90</code>、七条硬编码路由、<code>apps/agent24d/src/sin90.rs</code> 全部删除,PR&nbsp;#132),领域 OS 经 <code>DomainModule</code> + 清单挂载(#127/#131),装哪些 OS 由 <code>~/.agent24/os.json</code> 决定(#133)。
+「理想架构」一图中的多数格子<strong>仍未实现</strong>,它们是待办而不是现状 —— 逐项拆解见
+<a href="../specs/SPEC-ME-FOLLOWUPS.md"><code>docs/specs/SPEC-ME-FOLLOWUPS.md</code></a>。
+</p>
+<p style="margin:8px 0 0;max-width:none">
+读这一页时,请把它当作<strong>一份带日期的快照</strong>。真正随代码走的事实在 <code>docs/decision.md</code>(ADR-029)与各 crate 的模块文档里。
+</p>
+</div>
+</div>
+
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">架构核验 · 2026-08-22 · main @ 1bb6226</div>
+  <h1>内核在哪里结束，操作系统从哪里开始</h1>
+  <p class="lede">两张图：一张是代码里<em>真实</em>的样子，一张是它应该长成的样子。所有结论都逐条落到 <code>file:line</code>，不是凭印象画的。</p>
+  <div class="method">
+    <span>核验方式：13 个 crate 的 Cargo 依赖图</span><span>run_loop 逐行读</span><span>全仓 grep 外部引用计数</span><span>HTTP 路由清单枚举</span>
+  </div>
+</header>
+
+<!-- ══════════════ 现状 ══════════════ -->
+<section>
+  <h2>一、现状：分层是对的，两个地方漏了</h2>
+  <p>依赖箭头整体是单向向下的 —— <code>agent24-protocol</code> 零内部依赖，是真正的底座。但有两处，代码没有兑现设计。</p>
+
+  <figure>
+    <div class="canvas">
+      <svg viewBox="0 0 980 560" role="img" aria-label="Agent24 当前分层：契约层、纯域层、内核能力层、编排层、宿主进程层；两处缺口是内核反向依赖 Sin90，以及 M-D 记忆模块零外部引用">
+        <defs>
+          <marker id="a-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--oxide)"/>
+          </marker>
+          <marker id="a-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--patina)"/>
+          </marker>
+        </defs>
+
+        <!-- L5 宿主 -->
+        <rect class="band" x="124" y="24" width="832" height="64" rx="2"/>
+        <text class="t-band" x="112" y="60" text-anchor="end">宿主进程</text>
+        <rect class="chip" x="140" y="38" width="560" height="36" rx="2"/>
+        <text class="t" x="156" y="61">agent24d — HTTP + WS · AppState</text>
+        <rect class="chip" x="716" y="38" width="224" height="36" rx="2"/>
+        <text class="t" x="732" y="61">agent24-cli</text>
+
+        <!-- L4 编排 -->
+        <rect class="band" x="124" y="108" width="832" height="72" rx="2"/>
+        <text class="t-band" x="112" y="148" text-anchor="end">编排</text>
+        <text class="t-sm" x="140" y="125">agent24-agent</text>
+        <rect class="chip-ok" x="140" y="130" width="188" height="36" rx="2"/>
+        <text class="t" x="234" y="153" text-anchor="middle">run_loop</text>
+        <rect class="chip-ok" x="344" y="130" width="188" height="36" rx="2"/>
+        <text class="t" x="438" y="153" text-anchor="middle">resume 恢复</text>
+        <rect class="chip-ok" x="548" y="130" width="188" height="36" rx="2"/>
+        <text class="t" x="642" y="153" text-anchor="middle">self_wake</text>
+        <rect class="chip-ok" x="752" y="130" width="188" height="36" rx="2"/>
+        <text class="t" x="846" y="153" text-anchor="middle">subagent</text>
+
+        <!-- L3 内核能力 -->
+        <rect class="band" x="124" y="200" width="832" height="132" rx="2"/>
+        <text class="t-band" x="112" y="272" text-anchor="end">内核能力</text>
+        <rect class="chip-gap" x="140" y="212" width="196" height="44" rx="2"/>
+        <text class="t" x="238" y="230" text-anchor="middle">agent24-memory</text>
+        <text class="t-amber" x="238" y="246" text-anchor="middle">M-D 12 模块 · 0 外部引用</text>
+        <rect class="chip" x="352" y="212" width="196" height="44" rx="2"/>
+        <text class="t" x="450" y="239" text-anchor="middle">store</text>
+        <rect class="chip" x="564" y="212" width="196" height="44" rx="2"/>
+        <text class="t" x="662" y="239" text-anchor="middle">models 路由</text>
+        <rect class="chip" x="776" y="212" width="164" height="44" rx="2"/>
+        <text class="t" x="858" y="239" text-anchor="middle">tools</text>
+        <rect class="chip-ok" x="140" y="268" width="196" height="44" rx="2"/>
+        <text class="t" x="238" y="288" text-anchor="middle">policy 审批</text>
+        <text class="t-patina" x="238" y="303" text-anchor="middle">四档风险 · 不可绕过</text>
+        <rect class="chip" x="352" y="268" width="196" height="44" rx="2"/>
+        <text class="t" x="450" y="295" text-anchor="middle">scheduler</text>
+        <rect class="chip" x="564" y="268" width="196" height="44" rx="2"/>
+        <text class="t" x="662" y="295" text-anchor="middle">mcp</text>
+        <rect class="chip" x="776" y="268" width="164" height="44" rx="2"/>
+        <text class="t" x="858" y="295" text-anchor="middle">worker</text>
+
+        <!-- 已接通的那一根 -->
+        <path class="ln-ok" d="M200 168 L200 208" marker-end="url(#a-ok)"/>
+        <text class="t-patina" x="210" y="192">只用 session / KvStore</text>
+
+        <!-- L2 纯域 -->
+        <rect class="band" x="124" y="352" width="832" height="64" rx="2"/>
+        <text class="t-band" x="112" y="388" text-anchor="end">纯域</text>
+        <rect class="chip" x="140" y="366" width="380" height="36" rx="2"/>
+        <text class="t" x="156" y="389">agent24-core — 仅依赖 protocol</text>
+        <rect class="chip-bad" x="540" y="366" width="284" height="36" rx="2"/>
+        <text class="t" x="556" y="389">agent24-sin90 — 领域 OS 纯核</text>
+
+        <!-- L1 契约 -->
+        <rect class="band" x="124" y="436" width="832" height="72" rx="2"/>
+        <text class="t-band" x="112" y="476" text-anchor="end">契约</text>
+        <rect class="chip-ok" x="140" y="450" width="380" height="44" rx="2"/>
+        <text class="t" x="156" y="470">agent24-protocol</text>
+        <text class="t-patina" x="156" y="486">零内部依赖 — 真底座</text>
+        <rect class="chip" x="540" y="450" width="400" height="44" rx="2"/>
+        <text class="t" x="556" y="470">protocol/ 单一来源</text>
+        <text class="t-sm" x="556" y="486">openapi.yaml · events · module.schema</text>
+
+        <!-- 违规：内核 → OS 反向依赖 -->
+        <path class="ln-bad" d="M700 56 L900 56 L900 384 L832 384" marker-end="url(#a-bad)"/>
+        <text class="t-oxide" transform="rotate(90 916 210)" x="916" y="210" text-anchor="middle">内核反向依赖 OS</text>
+        <text class="t-oxide" x="540" y="342">🔴 agent24d 直接依赖 sin90 两个 crate + 7 条硬编码路由 + AppState.sin90</text>
+      </svg>
+    </div>
+    <figcaption><strong>两处缺口。</strong>红：内核 <code>agent24d</code> 直接依赖 <code>agent24-sin90</code>，Sin90 的 7 个 HTTP handler 长在内核进程里（<code>apps/agent24d/src/sin90.rs</code>，406 行）—— 箭头指反了。琥珀：M-D 记忆底座 12 个模块建好了，但 <em>agent loop 一个都没用</em>；它仍走 M-D 之前的老 <code>session::CanonicalSession</code>。</figcaption>
+  </figure>
+
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>断言</th><th>代码证据</th><th>结论</th></tr></thead>
+      <tbody>
+        <tr><td>protocol 是真底座</td><td class="ev">agent24-protocol/Cargo.toml → 零内部依赖</td><td><span class="pill ok">成立</span></td></tr>
+        <tr><td>agent loop 的位置</td><td class="ev">agent24-agent/src/lib.rs:986 <code>run_loop</code></td><td><span class="pill ok">成立</span></td></tr>
+        <tr><td>工具调用前先落盘</td><td class="ev">lib.rs — 先持久化 assistant turn 再执行工具</td><td><span class="pill ok">成立</span></td></tr>
+        <tr><td>权限不可绕过</td><td class="ev">protocol/types.rs:369 <code>RiskClass{Read,WriteLocal,Exec,External}</code></td><td><span class="pill ok">成立</span></td></tr>
+        <tr><td>崩溃恢复已有</td><td class="ev">agent24-agent/src/resume.rs — 612 行</td><td><span class="pill ok">成立</span></td></tr>
+        <tr><td>loop 用的是哪层记忆</td><td class="ev">lib.rs:26 <code>use agent24_memory::session::{CanonicalSession,…}</code></td><td><span class="pill gap">只用老 L0</span></td></tr>
+        <tr><td>M-D 12 模块的消费者</td><td class="ev">全仓 grep：condenser/event/assertion/… 外部引用 <strong>各 0 处</strong></td><td><span class="pill gap">已建未接</span></td></tr>
+        <tr><td>内核不认识 OS 的名字</td><td class="ev">agent24d/Cargo.toml:17-18 依赖 sin90 + sin90-store</td><td><span class="pill bad">不成立</span></td></tr>
+        <tr><td>OS 路由不硬编码</td><td class="ev">server.rs:390-415 七条 <code>/api/v1/sin90/*</code></td><td><span class="pill bad">不成立</span></td></tr>
+        <tr><td>OS 不占内核状态</td><td class="ev">server.rs:45 <code>AppState.sin90</code></td><td><span class="pill bad">不成立</span></td></tr>
+        <tr><td>ScopedMemory / KernelCtx</td><td class="ev">代码中 0 处；契约在 PR #127，未合入</td><td><span class="pill bad">未实现</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══════════════ 理想 ══════════════ -->
+<section>
+  <h2>二、理想：内核画死，外面随便换</h2>
+  <p>同一个栈形，差别只在两件事：内核有了<em>明确边界</em>，边界上有<em>四个受控接口</em>；领域 OS 从内核里搬出去，站到边界之上，只能通过接口向下调用。</p>
+
+  <figure>
+    <div class="canvas">
+      <svg viewBox="0 0 980 600" role="img" aria-label="理想架构：可插拔层在上，四个受控接口在内核边界上，内核内部为编排、能力、纯域、契约四层，记忆层展开为三权威加四投影">
+        <defs>
+          <marker id="b-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--patina)"/>
+          </marker>
+          <marker id="b-ox" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--oxide)"/>
+          </marker>
+        </defs>
+
+        <!-- 可插拔层 -->
+        <text class="t-band" x="112" y="58" text-anchor="end">可插拔</text>
+        <rect class="chip-bad" x="140" y="24" width="376" height="64" rx="2"/>
+        <text class="t" x="328" y="46" text-anchor="middle">领域 OS · DomainModule</text>
+        <text class="t-sm" x="328" y="64" text-anchor="middle">Sin90 · Cos72 · 第三方(进程外)</text>
+        <text class="t-oxide" x="328" y="80" text-anchor="middle">换 OS = 换 agent</text>
+        <rect class="chip" x="532" y="24" width="196" height="64" rx="2"/>
+        <text class="t" x="630" y="52" text-anchor="middle">MCP 服务器</text>
+        <text class="t-sm" x="630" y="70" text-anchor="middle">外部工具</text>
+        <rect class="chip" x="744" y="24" width="196" height="64" rx="2"/>
+        <text class="t" x="842" y="52" text-anchor="middle">Skills / 工具包</text>
+        <text class="t-sm" x="842" y="70" text-anchor="middle">流程与技能</text>
+
+        <!-- 四个受控接口 -->
+        <rect x="124" y="120" width="832" height="52" rx="2" fill="var(--patina-wash)" stroke="var(--patina)" stroke-width="2"/>
+        <text class="t-band" x="112" y="150" text-anchor="end">内核接口</text>
+        <text class="t" x="228" y="143" text-anchor="middle">HTTP / WS API</text>
+        <text class="t-sm" x="228" y="159" text-anchor="middle">对外唯一入口</text>
+        <text class="t" x="440" y="143" text-anchor="middle">KernelCtx</text>
+        <text class="t-sm" x="440" y="159" text-anchor="middle">能力受限句柄</text>
+        <text class="t" x="652" y="143" text-anchor="middle">ToolRegistry</text>
+        <text class="t-sm" x="652" y="159" text-anchor="middle">工具注册点</text>
+        <text class="t" x="862" y="143" text-anchor="middle">EventBus</text>
+        <text class="t-sm" x="862" y="159" text-anchor="middle">只发自己 module</text>
+        <line class="ln" x1="334" y1="126" x2="334" y2="166" stroke="var(--patina)"/>
+        <line class="ln" x1="546" y1="126" x2="546" y2="166" stroke="var(--patina)"/>
+        <line class="ln" x1="758" y1="126" x2="758" y2="166" stroke="var(--patina)"/>
+
+        <path class="ln-ok" d="M328 92 L328 116" marker-end="url(#b-ok)"/>
+        <path class="ln-ok" d="M630 92 L648 116" marker-end="url(#b-ok)"/>
+        <path class="ln-ok" d="M842 92 L858 116" marker-end="url(#b-ok)"/>
+
+        <!-- 内核盒 -->
+        <rect class="kbox" x="124" y="192" width="832" height="376" rx="3"/>
+        <text class="t-patina" x="140" y="211">内核 · 稳定不动 · 永不知道 OS 的名字</text>
+
+        <text class="t-band" x="112" y="248" text-anchor="end">编排</text>
+        <rect class="chip" x="140" y="224" width="800" height="44" rx="2"/>
+        <text class="t" x="540" y="243" text-anchor="middle">agent loop — prompt 组装 · 工具调用 · 审批门 · 步进</text>
+        <text class="t-sm" x="540" y="259" text-anchor="middle">resume 恢复 · self_wake 自唤醒 · subagent 子代理</text>
+
+        <text class="t-band" x="112" y="300" text-anchor="end">能力</text>
+        <rect class="chip" x="140" y="282" width="152" height="40" rx="2"/>
+        <text class="t" x="216" y="306" text-anchor="middle">models</text>
+        <rect class="chip" x="302" y="282" width="152" height="40" rx="2"/>
+        <text class="t" x="378" y="306" text-anchor="middle">tools</text>
+        <rect class="chip" x="464" y="282" width="152" height="40" rx="2"/>
+        <text class="t" x="540" y="306" text-anchor="middle">policy 审批</text>
+        <rect class="chip" x="626" y="282" width="152" height="40" rx="2"/>
+        <text class="t" x="702" y="306" text-anchor="middle">scheduler</text>
+        <rect class="chip" x="788" y="282" width="152" height="40" rx="2"/>
+        <text class="t" x="864" y="306" text-anchor="middle">store</text>
+
+        <!-- memory 展开 -->
+        <rect x="140" y="336" width="800" height="96" rx="2" fill="var(--panel-2)" stroke="var(--patina)" stroke-width="1.6"/>
+        <text class="t" x="156" y="356">agent24-memory — 权威 + 投影</text>
+        <text class="t-sm" x="640" y="356">上下文 · 压缩 · 召回 · 巩固 · 轨迹 · 重放</text>
+        <rect class="chip-ok" x="156" y="366" width="176" height="26" rx="2"/>
+        <text class="t-sm" x="244" y="383" text-anchor="middle">事件权威 EventLog</text>
+        <rect class="chip-ok" x="344" y="366" width="176" height="26" rx="2"/>
+        <text class="t-sm" x="432" y="383" text-anchor="middle">内容权威 Artifact</text>
+        <rect class="chip-ok" x="532" y="366" width="176" height="26" rx="2"/>
+        <text class="t-sm" x="620" y="383" text-anchor="middle">语义权威 Assertion</text>
+        <rect class="chip-ok" x="720" y="366" width="204" height="26" rx="2"/>
+        <text class="t-sm" x="822" y="383" text-anchor="middle">写门 · 治理</text>
+        <rect class="chip" x="156" y="398" width="176" height="24" rx="2"/>
+        <text class="t-sm" x="244" y="414" text-anchor="middle">条件器/压缩</text>
+        <rect class="chip" x="344" y="398" width="176" height="24" rx="2"/>
+        <text class="t-sm" x="432" y="414" text-anchor="middle">检索 FTS/向量</text>
+        <rect class="chip" x="532" y="398" width="176" height="24" rx="2"/>
+        <text class="t-sm" x="620" y="414" text-anchor="middle">巩固 insight</text>
+        <rect class="chip" x="720" y="398" width="204" height="24" rx="2"/>
+        <text class="t-sm" x="822" y="414" text-anchor="middle">轨迹 trace · 重放 replay</text>
+
+        <text class="t-band" x="112" y="466" text-anchor="end">纯域</text>
+        <rect class="chip" x="140" y="446" width="800" height="36" rx="2"/>
+        <text class="t" x="540" y="469" text-anchor="middle">agent24-core — 实体 · 状态机 · 无 I/O</text>
+
+        <text class="t-band" x="112" y="522" text-anchor="end">契约</text>
+        <rect class="chip-ok" x="140" y="500" width="800" height="44" rx="2"/>
+        <text class="t" x="540" y="520" text-anchor="middle">agent24-protocol + protocol/ 单一来源</text>
+        <text class="t-patina" x="540" y="536" text-anchor="middle">openapi · events.schema · module.schema · domain-os.schema</text>
+
+        <!-- KernelCtx → ScopedMemory 的授权链 -->
+        <path class="ln-ox" d="M440 176 L440 200 L960 200 L960 384 L944 384" marker-end="url(#b-ox)" stroke="var(--oxide)" stroke-width="2" fill="none" stroke-dasharray="5 3"/>
+        <text class="t-oxide" transform="rotate(90 974 292)" x="974" y="292" text-anchor="middle">ScopedMemory(scope, grants)</text>
+      </svg>
+    </div>
+    <figcaption><strong>一条线决定隔离成立与否。</strong>红虚线：领域 OS 拿不到 ambient 的记忆句柄，只能通过 <code>KernelCtx::memory(scope, grants)</code> 领一个<em>作用域被钉死</em>的 <code>ScopedMemory</code>。这条线今天不存在 —— 它就是 ADR-029 的洞，也是"两个 OS 会不会互污"的唯一答案所在。</figcaption>
+  </figure>
+</section>
+
+<!-- ══════════════ 你的四个问题 ══════════════ -->
+<section>
+  <h2>三、你问的四件事</h2>
+  <div class="qa">
+    <div class="q">
+      <h3>memory 应该在内核里，对不对？</h3>
+      <p><strong>对，而且它已经在了。</strong><code>agent24-memory</code> 是内核 crate，被 <code>agent24-agent</code> 依赖。理由不是"重要所以放内核"，而是：上下文预算、压缩、崩溃恢复这三件事<em>每个 OS 都需要</em>，且与 agent loop 的热路径耦合 —— 放外面等于每个 OS 各写一遍，还各错一遍。</p>
+      <p>但要认账：<strong>M-D 那 12 个模块目前一个都没接进 loop</strong>。内核里躺着一套完整的记忆底座，loop 却还在用它之前的老 <code>session</code> 层。这是"建好了没通电"。</p>
+    </div>
+    <div class="q">
+      <h3>Sin90 / Cos72 在哪一层？和 memory 是上下层还是调用关系？</h3>
+      <p><strong>两者都是，而且必须同时是。</strong>领域 OS 在内核<em>之上</em>（层级），只能<em>向下调用</em>内核（方向）—— 单向，永不反过来。</p>
+      <p>判据在代码里，不在图里：<code>agent24d/Cargo.toml</code> 中<strong>不允许出现任何 OS crate</strong>。今天它出现了两个（<code>sin90</code> + <code>sin90-store</code>），所以今天这条不成立 —— ME-1 修的就是这个。</p>
+    </div>
+    <div class="q">
+      <h3>Agent 最核心的是什么？</h3>
+      <p>你说的是对的：<strong>prompt 组装 + 工具调用 + loop</strong>。代码印证 —— <code>run_loop</code>（lib.rs:986）每一轮做四件事：按模式重算可用工具集 → 调模型 → <em>先把 assistant turn 落盘再执行工具</em> → 过审批门后 dispatch。第三步的顺序是崩溃恢复的全部基础：磁盘上"尾部 tool_call 没有应答"这个形状，就是"死在等审批"的判据。</p>
+    </div>
+    <div class="q">
+      <h3>新能力（压缩 / 恢复 / 轨迹 / 评测 / 回滚 / 自进化）放哪一层？</h3>
+      <p>一条判据："<strong>换一个 OS 之后还需不需要它</strong>"—— 需要就进内核，不需要就出去。</p>
+    </div>
+  </div>
+
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>能力</th><th>归属</th><th>为什么</th><th>现状</th></tr></thead>
+      <tbody>
+        <tr><td>上下文管理 / 压缩</td><td>内核 · memory</td><td>与 token 预算和 loop 热路径耦合，每个 OS 都要</td><td><span class="pill gap">已建未接</span></td></tr>
+        <tr><td>权限 / 审批</td><td>内核 · policy</td><td>必须不可绕过；OS 能自己实现就等于没有</td><td><span class="pill ok">已通</span></td></tr>
+        <tr><td>崩溃恢复</td><td>内核 · agent + memory</td><td>恢复靠 thread 形状 + 事件重放，都是内核物</td><td><span class="pill ok">resume 已通</span></td></tr>
+        <tr><td>跨机 / 跨会话迁移</td><td>内核 · memory 重放</td><td>事件日志是权威，迁移＝在别处重放</td><td><span class="pill gap">已建未接</span></td></tr>
+        <tr><td>trajectory 轨迹</td><td>内核 · memory · trace</td><td>自进化的输入，必须全量可回溯不截断</td><td><span class="pill gap">已建未接</span></td></tr>
+        <tr><td>evaluation 评测</td><td>内核<em>旁挂</em>，不进热路径</td><td>评测是门禁不是运行时；进 loop 会拖慢每一轮</td><td><span class="pill gap">harness 已建 · CI 门未建</span></td></tr>
+        <tr><td>评测不过自动回滚</td><td>内核 · policy ← eval</td><td>回滚是<em>权限决策</em>，归审批引擎而非评测器</td><td><span class="pill bad">未建</span></td></tr>
+        <tr><td>自进化</td><td><strong>OS 层或其上</strong></td><td>与领域强绑（Sin90 进化的是"节律"，Cos72 不是）</td><td><span class="pill bad">未建</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══════════════ OS 标准化 ══════════════ -->
+<section>
+  <h2>四、"个人操作系统"到底是什么</h2>
+  <p>你问 Sin90 究竟包含哪些东西、怎么标准化。答案：<strong>一份 manifest 声明七件事，内核只认 manifest 不认名字。</strong></p>
+
+  <figure>
+    <div class="canvas">
+      <svg viewBox="0 0 980 330" role="img" aria-label="domain-os.yml 清单声明七项：路由命名空间、独立数据库、领域工具、Skills流程、职能定义、UI入口、能力申请">
+        <defs>
+          <marker id="c-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--patina)"/>
+          </marker>
+        </defs>
+        <rect class="chip-bad" x="30" y="46" width="256" height="240" rx="3"/>
+        <text class="t" x="46" y="72">domain-os.yml</text>
+        <text class="t-sm" x="46" y="94">name: sin90</text>
+        <text class="t-sm" x="46" y="112">version: 0.2.1</text>
+        <text class="t-sm" x="46" y="130">route_namespace: …</text>
+        <text class="t-sm" x="46" y="148">event_module: sin90</text>
+        <text class="t-sm" x="46" y="166">data_dir: …/os/sin90/</text>
+        <text class="t-sm" x="46" y="184">requires_models: []</text>
+        <text class="t-sm" x="46" y="202">kernel_capabilities:</text>
+        <text class="t-sm" x="58" y="220">- events</text>
+        <text class="t-sm" x="58" y="238">- memory(scoped)</text>
+        <text class="t-oxide" x="46" y="266">name 是唯一身份来源</text>
+
+        <rect class="chip" x="380" y="46" width="272" height="60" rx="2"/>
+        <text class="t" x="396" y="70">① 路由命名空间</text>
+        <text class="t-sm" x="396" y="90">/api/v1/&lt;name&gt;/*</text>
+        <rect class="chip-ok" x="676" y="46" width="272" height="60" rx="2"/>
+        <text class="t" x="692" y="70">② 自己的数据库</text>
+        <text class="t-sm" x="692" y="90">~/.agent24/os/&lt;name&gt;/ — 物理隔离</text>
+
+        <rect class="chip" x="380" y="136" width="272" height="60" rx="2"/>
+        <text class="t" x="396" y="160">③ 领域工具</text>
+        <text class="t-sm" x="396" y="180">注册进内核 ToolRegistry</text>
+        <rect class="chip" x="676" y="136" width="272" height="60" rx="2"/>
+        <text class="t" x="692" y="160">④ Skills / 流程</text>
+        <text class="t-sm" x="692" y="180">可复用的多步动作</text>
+
+        <rect class="chip" x="380" y="226" width="272" height="60" rx="2"/>
+        <text class="t" x="396" y="250">⑤ 职能定义</text>
+        <text class="t-sm" x="396" y="270">persona · prompt · 领域状态机</text>
+        <rect class="chip" x="676" y="226" width="272" height="60" rx="2"/>
+        <text class="t" x="692" y="250">⑥ UI 入口</text>
+        <text class="t-sm" x="692" y="270">外壳挂载点(可选)</text>
+
+        <path class="ln-ok" d="M290 100 L372 76" marker-end="url(#c-ok)"/>
+        <path class="ln-ok" d="M290 140 L372 166" marker-end="url(#c-ok)"/>
+        <path class="ln-ok" d="M290 200 L372 256" marker-end="url(#c-ok)"/>
+        <text class="t-patina" x="300" y="122">声明 + 校验</text>
+      </svg>
+    </div>
+    <figcaption><strong>标准化＝把身份收敛到一处。</strong><code>name</code> 同时决定路由前缀、事件名、数据目录，三者<em>必须由它派生</em>，否则清单校验直接拒 —— 一个 OS 就没法声称自己叫 A 却以 B 的名义发事件、或指向别人的数据目录。第七项 <code>kernel_capabilities</code> 是申请，不是授权：内核给的是<em>请求 ∩ 内核愿给</em>的交集。</figcaption>
+  </figure>
+
+  <div class="verdict">
+    <strong>所以"底座 + 不同 OS = 不同 agent"这个模型准不准？</strong>
+    <p>方向准，但<strong>今天还差一层没兑现</strong>。缺的不是概念，是三样具体的东西：</p>
+    <ul>
+      <li>内核仍<em>按名字</em>认识 Sin90（依赖 + 硬编码路由 + AppState 字段）→ ME-1b 在修</li>
+      <li><code>KernelCtx::memory(scope, grants)</code> 不存在 → 两个 OS 之间的记忆隔离目前<strong>靠调用方自觉，不靠机制</strong></li>
+      <li><code>Scope</code> 有 <code>owner/agent/session/run</code> 四维，但存储层<strong>只强制 owner 一维</strong>，<code>agent</code> 维全仓零使用 —— 同一 owner 挂两个 OS，记忆是相通的</li>
+    </ul>
+    <p>换句话说：<strong>换 OS 今天能换，但"换了不互相污染"还没有机制保证。</strong>这三条已经进了 <code>improvement/</code> 台账的 TODO-A。</p>
+  </div>
+</section>
+
+</div>
+</body>
+</html>
