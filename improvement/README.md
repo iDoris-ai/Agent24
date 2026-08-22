@@ -29,7 +29,7 @@ improvement/
 
 **要交付的结论(尚未做)**:
 - [ ] 逐层核对 M-D 记忆底座的**可插拔缝**是否真的可换实现(不是名义上的 trait):`Condenser` / `EventStore` / `ArtifactStore` / `AssertionStore` / `Retriever` / `Embedder` / `InsightSynth` / `MemoryWriter` / `KnowledgeBase` / `TaskTrace`。
-- [ ] 🔴 **修 `mem_checkpoints` 的 owner 维**(已知缺陷,见下方基线):加 owner 列 + API 加 owner 参数 + 跨 owner 测试。**优先级高于其余自检** —— 这是已在 main 上的真实跨租户缺口,不是设计问题。
+- [x] ✅ **`mem_checkpoints` 的 owner 维已修**(PR #128,已合入 main):migration 0010 改 `PRIMARY KEY (scope_owner, name)`、三个 API 加 owner、`checkpoint()` 改用该 owner 自己的 max(旧实现用全表 `MAX(seq)`,是同一缺陷的第二半)。3 条回归测试。历史行故意丢弃(书签可重建,重扫优于静默丢失)。
 - [ ] 判定 **`kv` 的 namespace-vs-owner 隔离模型**:是否需要把 namespace 绑定到 owner,或改用 owner 维。
 - [ ] 收紧 `mem_events` 的 `scope_owner` CHECK 到 `trim(...)`(需新迁移;0002 已发布不可改)。
 - [ ] **领域 OS 之间的记忆隔离/共享模型**:Sin90 与 Cos72 各自挂载时,底层 memory 是**同库不同 scope**、**不同库**、还是**可选共享的显式通道**?给出方案对比 + 推荐 + 污染面分析。
@@ -37,8 +37,8 @@ improvement/
 - [ ] 给出**跨 OS 共享**的显式机制设计(若确实需要):共享什么(assertions? artifacts?)、谁授权、怎么审计、怎么撤销。
 
 **今日事实基线(不是结论,是现状快照;经 #126 复审逐表核对后订正)**:
-- 记忆层 **11 张表里 9 张**有 `scope_owner` 且强制非空,读写路径 owner-scoped(#115/#119/#122/#123/#124/#125 六轮复审逐条打过跨 owner 探针)。**两个例外**:
-  - 🔴 **`mem_checkpoints` 完全没有 owner 列**,且 API 也没有 owner 参数(`checkpoint_at(name, seq)` / `checkpoint_seq(name)`)—— **两个 owner 用同名 checkpoint 会共享同一行**,一方推进会让另一方的增量扫描跳过事件。**形状与 #119 的 `retract` 一模一样**(没有 owner 参数,所以没有任何 `WHERE` 能救),那六轮复审各自只打了它们触碰的表,**这张一次都没被碰到**。→ 已列为 TODO-A 的**已知缺陷**,单独修。
+- 记忆层 **11 张表里 10 张**有 `scope_owner` 且强制非空,读写路径 owner-scoped(#115/#119/#122/#123/#124/#125 六轮复审逐条打过跨 owner 探针)。**一个已修 + 一个待判**:
+  - ✅ **`mem_checkpoints`(已于 PR #128 修复,下述为修复前状态)完全没有 owner 列**,且 API 也没有 owner 参数(`checkpoint_at(name, seq)` / `checkpoint_seq(name)`)—— **两个 owner 用同名 checkpoint 会共享同一行**,一方推进会让另一方的增量扫描跳过事件。**形状与 #119 的 `retract` 一模一样**(没有 owner 参数,所以没有任何 `WHERE` 能救),那六轮复审各自只打了它们触碰的表,**这张一次都没被碰到**。→ 已修,见 TODO-A 第一条。**基线现为 10/11**(仅剩 `kv` 用 namespace 模型待判)。
   - ⚠️ **`kv`(L0)用 `PRIMARY KEY (namespace, key)` 隔离,即 namespace 而非 owner** —— 是**另一套隔离模型**,不一定是缺陷,但正该由 TODO-A 判断:namespace 是否由 owner 派生?两个 OS 挂同一 owner 时会不会撞 namespace?
 - `Scope` 有 `owner / agent / session / run` 四维,但**只有 owner 维在存储层强制**;`agent` 维目前**未被任何查询使用**(全仓 0 处 `scope_agent` 列)—— 这正是「不同 OS 挂在同一 owner 下会不会互污」的关键缺口。
 - `ScopedMemory` / `KernelCtx` **尚未实现**(SPEC §2 只有契约草案;ME-1a 契约 crate 在 **PR #127,尚未合入**;ME-1b+ 才接内核)。
