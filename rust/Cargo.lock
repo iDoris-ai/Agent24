@@ -54,6 +54,7 @@ version = "0.2.1"
 dependencies = [
  "agent24-protocol",
  "async-trait",
+ "axum",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -9,6 +9,7 @@ description = "Agent24 domain-OS contract (M-E/ME-1): DomainModule + KernelCtx t
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
 async-trait = "0.1"
+axum = { version = "0.8", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
