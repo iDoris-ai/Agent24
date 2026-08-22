@@ -153,7 +153,24 @@ pub struct EventQuery {
     pub owner: String,
     pub session: Option<String>,
     pub after_seq: Option<i64>,
+    /// Exclusive upper bound on `seq`. With [`Self::newest`] this is the
+    /// backward-paging cursor; on its own it pins a scan to a snapshot taken
+    /// before a concurrent writer's appends.
+    pub before_seq: Option<i64>,
     pub limit: Option<i64>,
+    /// Return the NEWEST rows first (`seq DESC`) instead of the oldest.
+    ///
+    /// Added in F1 for a reason worth recording, because the forward-only shape
+    /// looked sufficient and was not. A reader that wants "the most recent N"
+    /// under ASC ordering has to walk the partition from the beginning — which is
+    /// O(partition) for a bounded answer, and, when paged, MAY not terminate
+    /// against a writer that keeps appending: a writer fast enough to keep every
+    /// page full leaves the walk chasing a tail that keeps moving. (A slower one
+    /// lets a short page through and the walk ends — the bound is worth having
+    /// because it does not depend on relative speed, not because the failure is
+    /// certain.) Paging DESC walks AWAY from new appends (the cursor only
+    /// decreases), so it terminates by construction and reads O(N).
+    pub newest_first: bool,
 }
 
 impl EventQuery {
@@ -162,19 +179,38 @@ impl EventQuery {
             owner: owner.into(),
             session: None,
             after_seq: None,
+            before_seq: None,
             limit: None,
+            newest_first: false,
         }
     }
     pub fn after(mut self, seq: i64) -> Self {
         self.after_seq = Some(seq);
         self
     }
+    /// Only rows with `seq < seq`.
+    pub fn before(mut self, seq: i64) -> Self {
+        self.before_seq = Some(seq);
+        self
+    }
+    /// Order by `seq DESC`. See [`EventQuery::newest_first`].
+    pub fn newest(mut self) -> Self {
+        self.newest_first = true;
+        self
+    }
     pub fn session(mut self, s: impl Into<String>) -> Self {
         self.session = Some(s.into());
         self
     }
+    /// Cap the rows returned.
+    ///
+    /// Clamped to at least 1: SQLite reads a NEGATIVE `LIMIT` as "no limit", so
+    /// `.limit(-1)` would have turned the one thing `scan` promises
+    /// unconditionally — that every scan is bounded — into an unbounded read
+    /// through a perfectly ordinary-looking call. A caller asking for a
+    /// nonsensical count gets one row, not the table.
     pub fn limit(mut self, n: i64) -> Self {
-        self.limit = Some(n);
+        self.limit = Some(n.max(1));
         self
     }
 }
@@ -343,7 +379,14 @@ impl EventStore for EventLog {
         if q.after_seq.is_some() {
             sql.push_str(" AND seq > ?");
         }
-        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        if q.before_seq.is_some() {
+            sql.push_str(" AND seq < ?");
+        }
+        sql.push_str(if q.newest_first {
+            " ORDER BY seq DESC LIMIT ?"
+        } else {
+            " ORDER BY seq ASC LIMIT ?"
+        });
         let mut query = sqlx::query(&sql).bind(&q.owner);
         if let Some(s) = &q.session {
             query = query.bind(s);
@@ -351,7 +394,15 @@ impl EventStore for EventLog {
         if let Some(a) = q.after_seq {
             query = query.bind(a);
         }
-        query = query.bind(q.limit.unwrap_or(DEFAULT_SCAN_LIMIT));
+        if let Some(b) = q.before_seq {
+            query = query.bind(b);
+        }
+        // `.max(1)` again at the point of binding, not only in the builder: the
+        // field is public, so a struct update or a direct assignment reaches this
+        // without passing through `limit()`. A negative LIMIT is unbounded in
+        // SQLite, and "a scan is ALWAYS bounded" has to be true of the SQL, not of
+        // the API's good manners.
+        query = query.bind(q.limit.unwrap_or(DEFAULT_SCAN_LIMIT).max(1));
         let rows = query.fetch_all(&self.pool).await?;
         rows.iter().map(Self::row_to_stored).collect()
     }
@@ -753,6 +804,96 @@ mod tests {
                 "mem_events_session_seq".to_owned()
             ],
             "0002's indexes must survive the rebuild under their own names"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_negative_limit_is_not_an_unbounded_scan() {
+        // SQLite reads a NEGATIVE `LIMIT` as "no limit", so `.limit(-1)` would turn
+        // `scan`'s one unconditional promise — every scan is bounded — into a full
+        // table read through an ordinary-looking call. Clamped in the builder AND
+        // at the bind, because the field is public.
+        let kv = crate::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        for i in 0..5 {
+            log.append(&MemEvent::new(
+                format!("e{i}"),
+                Scope::owner("alice"),
+                "chat",
+                serde_json::json!({"i": i}),
+                Origin {
+                    source: "test".into(),
+                    trust: Trust::UserSaid,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            log.scan(&EventQuery::owner("alice").limit(-1))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a nonsensical count gets one row, not the table"
+        );
+        let mut q = EventQuery::owner("alice");
+        q.limit = Some(-1); // straight past the builder
+        assert_eq!(log.scan(&q).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_descending_query_reads_the_newest_and_leaves_ascending_callers_alone() {
+        let kv = crate::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        for i in 0..10 {
+            log.append(&MemEvent::new(
+                format!("e{i}"),
+                Scope::owner("alice"),
+                "chat",
+                serde_json::json!({"i": i}),
+                Origin {
+                    source: "test".into(),
+                    trust: Trust::UserSaid,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+        let desc = log
+            .scan(&EventQuery::owner("alice").newest().limit(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            desc.iter().map(|r| r.event.id.as_str()).collect::<Vec<_>>(),
+            vec!["e9", "e8", "e7"]
+        );
+        // `newest_first` defaults to false, so every existing incremental consumer
+        // keeps its ascending, `after_seq`-driven behaviour.
+        let asc = log
+            .scan(&EventQuery::owner("alice").limit(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            asc.iter().map(|r| r.event.id.as_str()).collect::<Vec<_>>(),
+            vec!["e0", "e1", "e2"]
+        );
+        // `before` is exclusive and composes with the descending order.
+        let before = log
+            .scan(
+                &EventQuery::owner("alice")
+                    .newest()
+                    .before(desc[2].seq)
+                    .limit(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .map(|r| r.event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e6", "e5"]
         );
     }
 }

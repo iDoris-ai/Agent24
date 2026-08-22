@@ -163,7 +163,10 @@ pub fn messages_from_events(events: &[StoredEvent]) -> Result<Vec<Msg>> {
 /// skip-and-report instead.
 ///
 /// `query`'s `owner` (and optional `session`) select the scope; its `after_seq`
-/// is honored as a starting point and its `limit` is ignored (paging owns it).
+/// is honored as a starting point. Its `limit`, `before_seq` and `newest_first`
+/// are IGNORED — replay owns the window and the ordering, and honouring a
+/// descending or bounded query here would end the replay after one page or
+/// truncate a history this function documents as full.
 pub async fn replay_history(log: &EventLog, query: &EventQuery) -> Result<Replayed> {
     replay_history_paged(log, query, REPLAY_PAGE).await
 }
@@ -254,6 +257,17 @@ async fn scan_page(
     let mut q = query.clone();
     q.after_seq = Some(after);
     q.limit = Some(page);
+    // Replay OWNS the ordering and the window, so both are normalised away rather
+    // than inherited from the caller's query. F1 added `newest_first` and
+    // `before_seq` to `EventQuery` for a backwards-paging reader, and this clone
+    // would otherwise carry them in: a `.newest()` query makes the first page
+    // descending, after which `replayed_from_events` takes the MAXIMUM seq and the
+    // next page asks for `seq > max` — so replay ends after one page and hands
+    // back a reversed conversation, silently. `.before(n)` would truncate a
+    // history documented as FULL. Neither is a caller error worth an `Err`; they
+    // are fields this function has no business honouring.
+    q.newest_first = false;
+    q.before_seq = None;
     log.scan(&q).await
 }
 
@@ -696,6 +710,50 @@ mod tests {
             assert!(
                 out_of_order.is_err(),
                 "out-of-order slice must trip debug_assert"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_ignores_a_callers_ordering_and_window() {
+        // F1 added `newest_first` and `before_seq` to `EventQuery`, and `scan_page`
+        // clones the caller's query. Left alone, a `.newest()` query makes the first
+        // page descending; `replayed_from_events` then takes the MAXIMUM seq and the
+        // next page asks for `seq > max`, so the replay ends after one page and
+        // returns a reversed conversation — silently. `.before(n)` would truncate a
+        // history this API documents as FULL.
+        let kv = crate::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        let msgs: Vec<Msg> = (0..8).map(|i| Msg::user(format!("msg {i}"))).collect();
+        append_conversation(&kv, "alice", &msgs).await;
+
+        let plain = replay_history_paged(&log, &EventQuery::owner("alice"), 3)
+            .await
+            .unwrap();
+        assert_eq!(plain.messages.len(), 8);
+
+        for hostile in [
+            EventQuery::owner("alice").newest(),
+            EventQuery::owner("alice").before(4),
+            EventQuery::owner("alice").newest().before(4),
+        ] {
+            let got = replay_history_paged(&log, &hostile, 3).await.unwrap();
+            assert_eq!(
+                got.messages.len(),
+                plain.messages.len(),
+                "replay owns the window and the ordering"
+            );
+            assert_eq!(
+                got.messages
+                    .iter()
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>(),
+                plain
+                    .messages
+                    .iter()
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>(),
+                "and the order must be the same as an unadorned query's"
             );
         }
     }

@@ -28,6 +28,10 @@
 //!   `if ctx.grants().has(..) { ctx.events().unwrap() }`, which panics the moment
 //!   the two disagree.
 //!
+//! [`memory`] carries the fifth: [`ScopedMemory`](memory::ScopedMemory), the
+//! capability-limited view of the shared memory base that closes ADR-029's open
+//! hole — until it existed, two domain OSes under one owner shared that base.
+//!
 //! [`http`] carries the fourth piece: the v1 error envelope and body limit, so
 //! kernel and module CAN answer identically. It does not make them: nothing forces
 //! a module's handlers through these helpers — it removes the excuse for a second
@@ -68,15 +72,14 @@
 //! READER also needs a bounded read; [`DomainOsManifest::MAX_YAML_BYTES`] bounds an
 //! already-loaded string and cannot stop a huge file from being read in first.
 //!
-//! **What is deliberately NOT here yet** (documented rather than faked):
-//! `ScopedMemory` over the M-D stores (`KernelCtx::memory` — ADR-029's open hole,
-//! which must consult kernel-owned policy and must NOT take a caller-supplied
-//! [`Grants`]); the model / scheduler / policy handles; and the out-of-process
-//! Provider path (ME-3). The kernel-side registry landed in ME-1b-a
+//! **What is deliberately NOT here yet** (documented rather than faked): the
+//! model / scheduler / policy handles, and the out-of-process Provider path
+//! (ME-3). The kernel-side registry landed in ME-1b-a
 //! (`agent24d::domain`) and Sin90 moved behind this contract in ME-1b-b, so
 //! `AppState.sin90` and the hardcoded `/api/v1/sin90/*` routes are gone.
 
 pub mod http;
+pub mod memory;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -95,6 +98,11 @@ pub enum DomainError {
     InvalidEvent(String),
     #[error("module store: {0}")]
     Store(String),
+    /// A [`memory`] request the kernel refused — an empty `kind`, or a `kind`/body
+    /// over the per-memory size cap. Distinct from [`Self::Store`], which is the
+    /// base failing rather than the request being unacceptable.
+    #[error("memory: {0}")]
+    Memory(String),
 }
 
 pub type Result<T> = std::result::Result<T, DomainError>;
@@ -533,16 +541,38 @@ impl EventSink {
 /// `if ctx.grants().has(Events) { ctx.events().unwrap() }`, a panic. [`Grants`]
 /// belongs in the kernel's mount report, not beside the handles it describes.
 ///
-/// Only [`KernelCtx::events`] exists today; `models` / `scheduler` / `policy` /
-/// `memory(scope)` land as their consumers do (ME-1b+). When `memory` arrives it
-/// must consult kernel-owned policy — it must NOT take a caller-supplied
-/// [`Grants`], which is informational only.
+/// [`KernelCtx::events`] and [`KernelCtx::memory`] exist today; `models` /
+/// `scheduler` / `policy` land as their consumers do. Memory arrived in F1 and
+/// kept the rule that was written here while it was still future work: it
+/// consults kernel-owned policy and takes NO caller-supplied [`Grants`] and no
+/// caller-supplied scope, because both would be boundaries the caller could
+/// move.
 pub trait KernelCtx: Send + Sync {
     /// The module-scoped event sink, or `None` when [`Capability::Events`] was not
     /// granted. `None` is an expected outcome, not an error: a module that can run
     /// without events simply does. The REASON a capability was withheld belongs in
     /// the kernel's mount diagnostics, not in every handle lookup.
     fn events(&self) -> Option<&EventSink>;
+
+    /// The module-scoped memory handle, or `None` when [`Capability::Memory`] was
+    /// not granted.
+    ///
+    /// Deliberately takes NO scope argument. An earlier sketch of this was
+    /// `memory(scope, grants)`, and both parameters were mistakes: a scope the
+    /// caller supplies is a boundary the caller can move, and `Grants` is
+    /// informational rather than authority (see the crate trust model). The kernel
+    /// builds one of these per admitted module from that module's VALIDATED
+    /// manifest, exactly as it builds the event sink.
+    ///
+    /// See [`memory`] for what the handle does and does not guarantee — in
+    /// particular that the isolation is enforced by the kernel rather than by the
+    /// schema, and that identifiers are database-global.
+    fn memory(&self) -> Option<&dyn memory::ScopedMemory> {
+        // Defaulted so existing implementors (and tests) do not have to opt in to
+        // a capability they never had. "Not granted" is the honest default: a
+        // context that has not been taught to lend memory does not lend it.
+        None
+    }
 }
 
 /// A domain OS the kernel can mount without knowing its name.

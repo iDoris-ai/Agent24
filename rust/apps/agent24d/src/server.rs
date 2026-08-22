@@ -211,14 +211,26 @@ fn parse_always_review(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Open the D1 session-memory KV store and pair it with a router-backed
-/// summarizer. Returns `None` (memory off) if the store can't be opened — a
-/// degraded daemon is better than one that won't start.
-async fn open_session_memory(
-    ephemeral: bool,
-    router: &Arc<ModelRouter>,
-    shutdown: &CancellationToken,
-) -> Option<agent24_agent::SessionMemory> {
+/// The logical user a local daemon's memory belongs to.
+///
+/// Agent24 is one person's 24/7 agent, so there is exactly one — and inventing an
+/// identity system to have a nicer-looking constant would be worse than naming
+/// the assumption. It matters here only because it is one half of a module's
+/// memory partition key, and because that key is VERSIONED: when real user
+/// identity arrives it comes from the kernel, and the catalog in
+/// [`crate::os_memory`] is what lets the existing partitions be reattributed
+/// rather than guessed at.
+const LOCAL_USER: &str = "local";
+
+/// Open the memory base — the KV store the D1 session memory and the domain-OS
+/// memory partitions both live in. Returns `None` (memory off) if it cannot be
+/// opened: a degraded daemon is better than one that won't start.
+///
+/// ONE store, handed to both. `KvStore` is `Clone` over a shared pool, so this is
+/// one database and one connection pool rather than two competing for the same
+/// file — and the two uses are separated by their owner keys, not by their
+/// handles (see [`crate::os_memory`]).
+async fn open_memory_base(ephemeral: bool) -> Option<agent24_memory::KvStore> {
     let kv = if ephemeral {
         agent24_memory::KvStore::open_memory().await
     } else {
@@ -226,18 +238,30 @@ async fn open_session_memory(
         agent24_memory::KvStore::open(&dir.join("memory.db")).await
     };
     match kv {
-        Ok(kv) => Some(agent24_agent::SessionMemory::new(
-            kv,
-            StdArc::new(agent24_agent::RouterSummarizer::new(
-                Arc::clone(router),
-                shutdown.clone(),
-            )),
-        )),
+        Ok(kv) => Some(kv),
         Err(err) => {
-            tracing::warn!("session memory unavailable ({err}); sessions will not remember");
+            tracing::warn!(
+                "memory base unavailable ({err}); sessions will not remember and no \
+                 domain OS will be lent memory"
+            );
             None
         }
     }
+}
+
+/// Pair the memory base with a router-backed summarizer for D1 session memory.
+fn session_memory(
+    kv: agent24_memory::KvStore,
+    router: &Arc<ModelRouter>,
+    shutdown: &CancellationToken,
+) -> agent24_agent::SessionMemory {
+    agent24_agent::SessionMemory::new(
+        kv,
+        StdArc::new(agent24_agent::RouterSummarizer::new(
+            Arc::clone(router),
+            shutdown.clone(),
+        )),
+    )
 }
 
 /// Everything [`AppState::new`] needs. The guardian and session memory are
@@ -550,7 +574,10 @@ pub async fn serve(
     // D1 session memory: a KV file next to the main store (ephemeral daemons get
     // an in-memory one). A failure here degrades to no memory rather than
     // refusing to start — sessions simply don't remember, as before.
-    let memory = open_session_memory(ephemeral, &router, &cancel).await;
+    let memory_base = open_memory_base(ephemeral).await;
+    let memory = memory_base
+        .clone()
+        .map(|kv| session_memory(kv, &router, &cancel));
 
     // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
     // their tools. Registered with `with()` so they are dispatchable, while
@@ -747,14 +774,59 @@ pub async fn serve(
     } else {
         ModelCatalog::skipped()
     };
-    let (module_routes, reports) = crate::domain::mount_all(
+    // A module gets memory only if the base actually opened. No base, no lease,
+    // no handle — rather than a handle that fails on every call.
+    let lease = memory_base.map(|kv| crate::domain::MemoryLease {
+        user: LOCAL_USER.to_owned(),
+        kv,
+    });
+    let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
         &state.events,
         os_config.as_ref().map_err(String::as_str),
         &inventory,
+        lease.as_ref(),
     )
     .await;
+    for p in partitions.partitions() {
+        tracing::info!(
+            "domain OS {} was lent a memory partition for user {}",
+            p.module,
+            p.user
+        );
+    }
+    // From the DURABLE catalog, not from what mounted just now, and not by
+    // matching keys — which is the whole reason the catalog exists. This number
+    // deliberately includes partitions belonging to modules that are disabled or
+    // no longer installed: those are the ones an operator would otherwise never
+    // learn about, and the ones an export or erase path must not miss.
+    if let Some(l) = lease.as_ref() {
+        match crate::os_memory::OsMemoryCatalog::durable_for(&l.kv, LOCAL_USER).await {
+            Ok(rows) if !rows.is_empty() => {
+                // By physical KEY, not by module name. After a key-version change a
+                // mounted module gets a NEW partition while its historical rows keep
+                // the same module name — matching on the name would report those as
+                // live and hide exactly the leftovers this log exists to surface.
+                let live: std::collections::HashSet<&str> = partitions
+                    .partitions()
+                    .iter()
+                    .map(|p| p.key.as_str())
+                    .collect();
+                let dormant = rows
+                    .iter()
+                    .filter(|r| !live.contains(r.owner_key.as_str()))
+                    .count();
+                tracing::info!(
+                    "user {LOCAL_USER} has {} domain-OS memory partition(s) besides their \
+                     own memory, {dormant} of them belonging to modules not mounted now",
+                    rows.len()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("could not read the domain-OS memory catalog: {e}"),
+        }
+    }
     for r in &reports {
         tracing::info!(
             "domain OS {} at {}: {:?} (grants: {:?})",
@@ -937,12 +1009,13 @@ pub(crate) mod tests {
                     .map_err(|e| e.to_string())
             }),
         };
-        let (modules, _) = crate::domain::mount_all(
+        let (modules, _, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
+            None,
         )
         .await;
         (build_router_with_modules(st, modules), tmp)
@@ -1083,12 +1156,13 @@ pub(crate) mod tests {
             version: "0.1.0".to_owned(),
             build: Box::new(move || Ok(m.clone() as StdArc<dyn DomainModule>)),
         };
-        let (modules, reports) = crate::domain::mount_all(
+        let (modules, reports, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
+            None,
         )
         .await;
         assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);
@@ -1708,12 +1782,13 @@ pub(crate) mod tests {
                     .map_err(|e| e.to_string())
             }),
         };
-        let (modules, _) = crate::domain::mount_all(
+        let (modules, _, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
+            None,
         )
         .await;
         let router = build_router_with_modules(st, modules);
