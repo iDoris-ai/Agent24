@@ -77,6 +77,14 @@ impl FtsRetriever {
 /// `NEAR`, …), so arbitrary user input can never be a syntax error or an injected
 /// query. Returns `None` if there is no searchable term (empty / all-punctuation),
 /// so the caller returns no hits.
+/// Whether a query has any searchable term. The SHARED predicate both retrievers
+/// use so a degenerate (empty / all-punctuation) query returns nothing rather
+/// than erroring, in BOTH the FTS and vector implementations of the same trait
+/// contract (review #123 B2).
+pub(crate) fn is_searchable_query(query: &str) -> bool {
+    to_match_query(query).is_some()
+}
+
 fn to_match_query(query: &str) -> Option<String> {
     let terms: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric())
