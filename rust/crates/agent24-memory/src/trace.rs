@@ -9,8 +9,16 @@
 //! `symbolize(record(x)) → drill → x` for every x. Nothing is discarded, so a
 //! trace can be 100% reconstructed ([`TaskTrace::expand_run`]).
 //!
-//! Refs are content-addressed, so a tool that emits the same output twice stores
-//! one body (deduplication) while each occurrence still gets its own node.
+//! Refs are content-addressed WITHIN AN OWNER (`(scope_owner, ref_id)`): a tool
+//! that emits the same output twice for one owner stores one body (dedup) while
+//! each occurrence still gets its own node. Dedup deliberately does NOT cross
+//! owners — a globally-content-addressed ref would be owned by whoever recorded
+//! it first, and the second owner's `drill` would return `None` while
+//! `expand_run` silently returned a SHORTER trace (review #125 B1).
+//!
+//! A node's identity is its natural key `(scope_owner, run_id, seq)` — one step
+//! of one run — so re-recording a step is a clean idempotent upsert rather than a
+//! collision against a second, competing identity (review #125 M1/M2).
 //!
 //! Scope: everything is owner-scoped — a foreign `node_id`/`ref_id` cannot drill
 //! into another owner's trace (the #119 lesson).
@@ -116,41 +124,48 @@ impl TaskTrace for SymbolicTrace {
         symbol: &str,
         body: &str,
     ) -> Result<TraceNode> {
-        // Content-addressed ref: identical bodies dedupe to one row, but each
-        // occurrence still gets its own node.
+        // Content-addressed WITHIN the owner (the table's key is
+        // (scope_owner, ref_id)): identical bodies dedupe for one owner, but two
+        // owners recording the same bytes each keep their own row.
         let ref_id = format!("ref-{}", &checksum(body)[..32]);
+        // A derived handle for drill-down. Full 32-hex over (owner, run) so a
+        // collision is not a realistic silent-overwrite path; the row's identity
+        // is the natural key below, not this.
         let node_id = format!(
             "node-{}-{}",
-            &checksum(&format!("{owner}\u{0}{run_id}"))[..12],
+            &checksum(&format!("{owner}\u{0}{run_id}"))[..32],
             seq
         );
         let now = agent24_core::util::now_iso8601();
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
-            "INSERT INTO mem_trace_refs (ref_id, scope_owner, body, bytes, at)
+            "INSERT INTO mem_trace_refs (scope_owner, ref_id, body, bytes, at)
              VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(ref_id) DO NOTHING",
+             ON CONFLICT(scope_owner, ref_id) DO NOTHING",
         )
-        .bind(&ref_id)
         .bind(owner)
+        .bind(&ref_id)
         .bind(body)
         .bind(body.len() as i64)
         .bind(&now)
         .execute(&mut *tx)
         .await?;
+        // Conflict on the NATURAL key — re-recording a step is an idempotent
+        // update, never a collision against a second identity (review #125 M1).
         sqlx::query(
             "INSERT INTO mem_trace_nodes
-                 (node_id, scope_owner, run_id, seq, kind, symbol, ref_id, at)
+                 (scope_owner, run_id, seq, node_id, kind, symbol, ref_id, at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(node_id) DO UPDATE SET
-                 kind = excluded.kind, symbol = excluded.symbol,
-                 ref_id = excluded.ref_id, at = excluded.at",
+             ON CONFLICT(scope_owner, run_id, seq) DO UPDATE SET
+                 node_id = excluded.node_id, kind = excluded.kind,
+                 symbol = excluded.symbol, ref_id = excluded.ref_id,
+                 at = excluded.at",
         )
-        .bind(&node_id)
         .bind(owner)
         .bind(run_id)
         .bind(seq)
+        .bind(&node_id)
         .bind(kind)
         .bind(symbol)
         .bind(&ref_id)
@@ -333,6 +348,78 @@ mod tests {
         assert_eq!(refs, 1);
         // Both still expand to the same full body.
         assert_eq!(t.expand_run("u1", "run1").await.unwrap(), vec![same, same]);
+    }
+
+    #[tokio::test]
+    async fn identical_body_across_owners_is_fully_recoverable_by_both() {
+        // B1: a globally content-addressed ref would be owned by whoever recorded
+        // it first — the second owner's drill would be None and expand_run would
+        // silently return a SHORTER trace. Dedup is per-owner, so both recover.
+        let t = trace().await;
+        let shared = "identical tool output";
+        let a = t
+            .record("alice", "runA", 0, "tool", "a-sym", shared)
+            .await
+            .unwrap();
+        let b = t
+            .record("bob", "runB", 0, "tool", "b-sym", shared)
+            .await
+            .unwrap();
+        assert_eq!(
+            t.drill(&a.node_id, "alice").await.unwrap().as_deref(),
+            Some(shared)
+        );
+        assert_eq!(
+            t.drill(&b.node_id, "bob").await.unwrap().as_deref(),
+            Some(shared),
+            "the second owner recovers its own body"
+        );
+        // Neither run is silently short, and stats count the same step set.
+        assert_eq!(t.expand_run("bob", "runB").await.unwrap(), vec![shared]);
+        let s = t.stats("bob", "runB").await.unwrap();
+        assert_eq!(s.nodes, 1);
+        assert_eq!(s.full_bytes, shared.len(), "denominator covers every step");
+    }
+
+    #[tokio::test]
+    async fn expand_run_never_silently_drops_a_step() {
+        // The same shape with MULTIPLE steps, one of them a body alice recorded
+        // first: bob's run must expand to ALL of its steps.
+        let t = trace().await;
+        let shared = "same bytes";
+        t.record("alice", "runA", 0, "tool", "a", shared)
+            .await
+            .unwrap();
+        t.record("bob", "runB", 0, "tool", "b0", "unique-first")
+            .await
+            .unwrap();
+        t.record("bob", "runB", 1, "tool", "b1", shared)
+            .await
+            .unwrap();
+        assert_eq!(
+            t.expand_run("bob", "runB").await.unwrap(),
+            vec!["unique-first", shared],
+            "no step is dropped by the owner-scoped join"
+        );
+        assert_eq!(t.stats("bob", "runB").await.unwrap().nodes, 2);
+    }
+
+    #[tokio::test]
+    async fn re_recording_a_step_with_new_content_updates_it_cleanly() {
+        // M1: the natural key (owner, run, seq) is the conflict identity, so
+        // re-recording a step — even with different content, hence a different
+        // ref — is an idempotent UPDATE, not a collision error.
+        let t = trace().await;
+        t.record("u1", "run1", 0, "tool", "v1", "BODY-ONE")
+            .await
+            .unwrap();
+        t.record("u1", "run1", 0, "tool", "v2", "BODY-TWO")
+            .await
+            .unwrap();
+        let syms = t.symbols("u1", "run1").await.unwrap();
+        assert_eq!(syms.len(), 1, "still one step");
+        assert_eq!(syms[0].symbol, "v2");
+        assert_eq!(t.expand_run("u1", "run1").await.unwrap(), vec!["BODY-TWO"]);
     }
 
     #[tokio::test]

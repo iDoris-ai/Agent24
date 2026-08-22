@@ -86,6 +86,9 @@ impl KvStore {
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            // FKs are OFF by default in SQLite; the trace projection (MD-8) relies
+            // on a composite FK so a node's ref can never be unresolvable.
+            .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -99,6 +102,7 @@ impl KvStore {
     /// connection is a distinct database.
     pub async fn open_memory() -> Result<Self> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
