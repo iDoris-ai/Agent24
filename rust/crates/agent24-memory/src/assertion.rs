@@ -189,6 +189,47 @@ impl AssertionLedger {
         Self { pool }
     }
 
+    /// Insert one assertion row on a caller-owned connection — no transaction of
+    /// its own, no supersede handling (the caller owns both). `pub(crate)` so
+    /// MD-4's write-gate can commit an assertion AND its audit event in ONE
+    /// transaction (review #121 B1: otherwise a belief can land with no audit).
+    pub(crate) async fn insert_tx(
+        conn: &mut sqlx::sqlite::SqliteConnection,
+        a: &Assertion,
+    ) -> Result<()> {
+        let scope_json = serde_json::to_string(&a.scope)?;
+        let object = serde_json::to_string(&a.object)?;
+        let evidence = serde_json::to_string(&a.evidence)?;
+        sqlx::query(
+            "INSERT INTO mem_assertions
+                 (id, scope_owner, scope, subject, predicate, object,
+                  valid_from, valid_to, recorded_from, recorded_to,
+                  evidence, confidence, modality, speaker, writer_version,
+                  supersedes, qualified)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&a.id)
+        .bind(&a.scope.owner)
+        .bind(&scope_json)
+        .bind(&a.subject)
+        .bind(&a.predicate)
+        .bind(&object)
+        .bind(&a.valid_from)
+        .bind(&a.valid_to)
+        .bind(&a.recorded_from)
+        .bind(&a.recorded_to)
+        .bind(&evidence)
+        .bind(a.confidence as f64)
+        .bind(a.modality.as_str())
+        .bind(&a.speaker)
+        .bind(&a.writer_version)
+        .bind(&a.supersedes)
+        .bind(i64::from(a.qualified))
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// Build an [`Assertion`] from a row selecting all its columns. `pub(crate)`
     /// so the MD-3b retriever can reuse it when joining the FTS projection back to
     /// the ledger.
@@ -217,9 +258,6 @@ impl AssertionLedger {
 #[async_trait]
 impl AssertionStore for AssertionLedger {
     async fn assert(&self, a: &Assertion) -> Result<AssertionId> {
-        let scope_json = serde_json::to_string(&a.scope)?;
-        let object = serde_json::to_string(&a.object)?;
-        let evidence = serde_json::to_string(&a.evidence)?;
         // Serialize the whole correction so a superseded row cannot be left open
         // by a crash between the two writes.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -238,34 +276,7 @@ impl AssertionStore for AssertionLedger {
             .await?;
         }
 
-        sqlx::query(
-            "INSERT INTO mem_assertions
-                 (id, scope_owner, scope, subject, predicate, object,
-                  valid_from, valid_to, recorded_from, recorded_to,
-                  evidence, confidence, modality, speaker, writer_version,
-                  supersedes, qualified)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&a.id)
-        .bind(&a.scope.owner)
-        .bind(&scope_json)
-        .bind(&a.subject)
-        .bind(&a.predicate)
-        .bind(&object)
-        .bind(&a.valid_from)
-        .bind(&a.valid_to)
-        .bind(&a.recorded_from)
-        .bind(&a.recorded_to)
-        .bind(&evidence)
-        .bind(a.confidence as f64)
-        .bind(a.modality.as_str())
-        .bind(&a.speaker)
-        .bind(&a.writer_version)
-        .bind(&a.supersedes)
-        .bind(i64::from(a.qualified))
-        .execute(&mut *tx)
-        .await?;
-
+        Self::insert_tx(&mut tx, a).await?;
         tx.commit().await?;
         Ok(a.id.clone())
     }

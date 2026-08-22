@@ -6,50 +6,63 @@
 //! [`Candidate`], and a DETERMINISTIC policy ([`WriteGate::policy`]) decides per
 //! candidate:
 //! - **Commit** — persist as a qualified belief (enters recall). Only the trusted
-//!   paths: `UserSaid` WITH an explicit remember, or `System`.
+//!   paths — `UserSaid` WITH an explicit remember, or `System` — AND only with
+//!   non-empty `evidence`: no qualified belief without provenance (review #121 B2).
 //! - **Hold** — persist as an UNqualified candidate (stored, reviewable, but kept
-//!   out of default recall by the MD-3 `qualified` gate). Mid-trust: `UserSaid`
-//!   without remember, `Model`, `ToolOutput`.
+//!   out of default recall by the MD-3 `qualified` gate). Mid-trust (`UserSaid`
+//!   without remember, `Model`, `ToolOutput`), and also a would-be Commit that
+//!   lacks evidence (downgraded, not thrown away).
 //! - **Reject** — do NOT persist at all. The least-trusted, most poison-prone
 //!   sources: `WebFetch`, `Unknown`.
 //!
-//! Every decision is AUDITED as an episodic event (`mem.write_decision`), so the
-//! governance trail is replayable ([`crate::replay`]). [`WriteGate::dry_run`]
-//! reports the decisions with NO side effects (no persistence, no audit).
+//! **Trust is an INPUT INVARIANT, not something the gate verifies.** `origin`
+//! (hence `trust`) and `explicit_remember` are the caller's assertion of
+//! provenance; the [`Candidate`] fields are private so they can only be set
+//! through the constructor, and the CALLER — a trusted extractor, NOT the LLM
+//! whose output it is labeling — is responsible for setting them truthfully. The
+//! gate additionally requires evidence for a Commit so a trusted label alone
+//! cannot mint an unsubstantiated qualified belief. (Reverse-verifying trust
+//! against the evidence events needs an owner-scoped get-by-id on the event log,
+//! which does not exist yet; that is a later slice, noted here rather than faked.)
 //!
-//! Scope: a candidate with an empty/whitespace owner is rejected — no unowned
-//! memory (#114's governance rule).
+//! Every persisted decision is AUDITED **in the SAME transaction** as the write
+//! (review #121 B1: otherwise a belief can land with no governance record). The
+//! audit event id is CONTENT-ADDRESSED, so two different-content decisions on the
+//! same candidate id are recorded as distinct events, not aliased (review #121
+//! M1). The trail is replayable ([`crate::replay`]). [`WriteGate::dry_run`]
+//! reports the decisions with NO side effects.
 //!
 //! NOT here: turn→candidate EXTRACTION (an LLM step; the gate is deterministic and
-//! takes candidates already extracted) and BULK ROLLBACK (a follow-up). Both are
-//! documented boundaries, not silent omissions.
+//! sits after it) and BULK ROLLBACK (a follow-up). Documented boundaries, not
+//! silent omissions.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::Result;
-use crate::assertion::{Assertion, AssertionId, AssertionStore, Modality};
-use crate::event::{EventLog, EventStore, MemEvent, Origin, Scope, Trust};
+use crate::artifact::checksum;
+use crate::assertion::{Assertion, AssertionId, AssertionLedger, Modality};
+use crate::event::{EventLog, MemEvent, Origin, Scope, Trust};
 
-/// A proposed assertion, before the gate decides. Carries the [`Origin`] (trust
-/// provenance from the source event) the policy keys on, plus whether the user
-/// EXPLICITLY asked to remember it.
+/// A proposed assertion, before the gate decides. Its trust-bearing fields are
+/// PRIVATE: construct via [`Candidate::new`] (which requires an [`Origin`]) and
+/// the builders, so a caller cannot casually stamp a trust label onto a struct it
+/// half-filled. The provenance the constructor records is the caller's
+/// responsibility to have earned (see the module docs).
 #[derive(Debug, Clone)]
 pub struct Candidate {
-    pub id: AssertionId,
-    pub scope: Scope,
-    pub subject: String,
-    pub predicate: String,
-    pub object: Value,
-    pub evidence: Vec<String>,
-    pub origin: Origin,
-    /// The user explicitly asked to remember this (e.g. "remember that ..."). Only
-    /// meaningful for `UserSaid`; it is what turns a held candidate into a commit.
-    pub explicit_remember: bool,
+    id: AssertionId,
+    scope: Scope,
+    subject: String,
+    predicate: String,
+    object: Value,
+    evidence: Vec<String>,
+    origin: Origin,
+    explicit_remember: bool,
 }
 
 impl Candidate {
-    /// A candidate stamped with an origin/trust and no explicit-remember.
+    /// A candidate stamped with an origin/trust, no evidence, no explicit-remember.
     pub fn new(
         id: impl Into<String>,
         scope: Scope,
@@ -69,6 +82,14 @@ impl Candidate {
             explicit_remember: false,
         }
     }
+    /// Attach the source-event ids that substantiate this belief. A Commit
+    /// requires at least one.
+    pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
+        self.evidence = evidence;
+        self
+    }
+    /// The user explicitly asked to remember this. Only meaningful for `UserSaid`;
+    /// it is what turns a held candidate into a commit.
     pub fn remember(mut self) -> Self {
         self.explicit_remember = true;
         self
@@ -100,30 +121,27 @@ enum Outcome {
 /// The governance write-gate over the semantic authority.
 #[async_trait]
 pub trait MemoryWriter: Send + Sync {
-    /// Decide + persist + audit each candidate, in order. A `Commit` writes a
-    /// qualified assertion, a `Hold` an unqualified one, a `Reject` nothing (but
-    /// still audits). Returns one [`WriteDecision`] per candidate.
+    /// Decide + persist + audit each candidate, in order. Commit/Hold write the
+    /// assertion and its audit event ATOMICALLY; Reject audits only. Returns one
+    /// [`WriteDecision`] per candidate.
     async fn propose(&self, candidates: Vec<Candidate>) -> Result<Vec<WriteDecision>>;
-    /// Decide WITHOUT any side effects: no persistence, no audit. For previewing
-    /// what `propose` would do.
+    /// Decide WITHOUT any side effects: no persistence, no audit.
     async fn dry_run(&self, candidates: &[Candidate]) -> Result<Vec<WriteDecision>>;
 }
 
-/// The write-gate: an [`AssertionStore`] to commit into and an [`EventLog`] to
-/// audit into, over the shared memory DB.
+/// The write-gate over the shared memory DB. Concrete (holds the pool) so an
+/// assertion and its audit event commit in ONE transaction.
 #[derive(Clone)]
-pub struct WriteGate<S: AssertionStore + Clone> {
-    store: S,
-    events: EventLog,
+pub struct WriteGate {
+    pool: sqlx::SqlitePool,
 }
 
-impl<S: AssertionStore + Clone> WriteGate<S> {
-    pub fn new(store: S, events: EventLog) -> Self {
-        Self { store, events }
+impl WriteGate {
+    pub(crate) fn new(pool: sqlx::SqlitePool) -> Self {
+        Self { pool }
     }
 
-    /// The DETERMINISTIC policy: same candidate → same outcome, no I/O. This is
-    /// the heart of the gate; everything else persists or audits its verdict.
+    /// The DETERMINISTIC policy: same candidate → same outcome, no I/O.
     fn policy(c: &Candidate) -> Outcome {
         // Closed validation first — no unowned/empty memory regardless of trust.
         if c.scope.owner.trim().is_empty() {
@@ -132,16 +150,19 @@ impl<S: AssertionStore + Clone> WriteGate<S> {
         if c.subject.trim().is_empty() || c.predicate.trim().is_empty() {
             return Outcome::Reject("empty subject/predicate".to_owned());
         }
-        match c.origin.trust {
-            // Trusted paths auto-commit a qualified belief.
+        let trust_outcome = match c.origin.trust {
             Trust::System => Outcome::Commit,
             Trust::UserSaid if c.explicit_remember => Outcome::Commit,
-            // Mid-trust is held as a reviewable candidate (out of default recall).
             Trust::UserSaid | Trust::Model | Trust::ToolOutput => Outcome::Hold,
-            // Least-trusted, poison-prone sources never persist by default.
             Trust::WebFetch => Outcome::Reject("web_fetch not auto-persisted".to_owned()),
             Trust::Unknown => Outcome::Reject("unknown trust not auto-persisted".to_owned()),
+        };
+        // A qualified belief must have provenance: a would-be Commit with no
+        // evidence is DOWNGRADED to a held candidate, never a recallable belief.
+        if trust_outcome == Outcome::Commit && c.evidence.is_empty() {
+            return Outcome::Hold;
         }
+        trust_outcome
     }
 
     fn to_assertion(c: &Candidate, qualified: bool) -> Assertion {
@@ -155,8 +176,6 @@ impl<S: AssertionStore + Clone> WriteGate<S> {
         );
         a.qualified = qualified;
         a.writer_version = "md4".to_owned();
-        // How the belief was acquired follows the source's trust: a tool result is
-        // observed, a model claim is derived, the rest is stated.
         a.modality = match c.origin.trust {
             Trust::ToolOutput => Modality::Observed,
             Trust::Model => Modality::Derived,
@@ -165,17 +184,31 @@ impl<S: AssertionStore + Clone> WriteGate<S> {
         a
     }
 
-    /// Append a replayable governance audit event for one decision.
-    async fn audit(&self, c: &Candidate, verdict: &str, reason: Option<&str>) -> Result<()> {
+    /// A replayable governance audit event whose id is CONTENT-ADDRESSED: the same
+    /// (candidate, content, verdict) yields the same id (idempotent replay), but a
+    /// different content or verdict yields a different id, so decisions never alias
+    /// (review #121 M1). The body carries the content for the same reason.
+    fn audit_event(c: &Candidate, verdict: &str, reason: Option<&str>) -> MemEvent {
+        let object = c.object.to_string();
+        let evidence = format!("{:?}", c.evidence);
+        let canonical = format!(
+            "{verdict}|{}|{}|{}|{object}|{evidence}",
+            c.id, c.subject, c.predicate
+        );
+        let id = format!("audit-{}-{}", c.id, &checksum(&canonical)[..16]);
         let body = serde_json::json!({
             "candidate_id": c.id,
             "verdict": verdict,
             "reason": reason,
             "trust": format!("{:?}", c.origin.trust),
             "explicit_remember": c.explicit_remember,
+            "subject": c.subject,
+            "predicate": c.predicate,
+            "object": c.object,
+            "evidence": c.evidence,
         });
-        let ev = MemEvent::new(
-            format!("audit-{}", c.id),
+        MemEvent::new(
+            id,
             c.scope.clone(),
             "mem.write_decision",
             body,
@@ -183,30 +216,46 @@ impl<S: AssertionStore + Clone> WriteGate<S> {
                 source: "write_gate".to_owned(),
                 trust: Trust::System,
             },
-        );
-        self.events.append(&ev).await?;
+        )
+    }
+
+    /// Persist a Commit/Hold assertion AND its audit event in ONE transaction, so
+    /// a belief can never land without its governance record (and vice versa).
+    async fn commit_with_audit(&self, c: &Candidate, qualified: bool, verdict: &str) -> Result<()> {
+        let assertion = Self::to_assertion(c, qualified);
+        let audit = Self::audit_event(c, verdict, None);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        AssertionLedger::insert_tx(&mut tx, &assertion).await?;
+        EventLog::append_tx(&mut tx, &audit).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
 
 #[async_trait]
-impl<S: AssertionStore + Clone> MemoryWriter for WriteGate<S> {
+impl MemoryWriter for WriteGate {
     async fn propose(&self, candidates: Vec<Candidate>) -> Result<Vec<WriteDecision>> {
         let mut out = Vec::with_capacity(candidates.len());
         for c in &candidates {
             let decision = match Self::policy(c) {
                 Outcome::Commit => {
-                    self.store.assert(&Self::to_assertion(c, true)).await?;
-                    self.audit(c, "commit", None).await?;
+                    self.commit_with_audit(c, true, "commit").await?;
                     WriteDecision::Committed(c.id.clone())
                 }
                 Outcome::Hold => {
-                    self.store.assert(&Self::to_assertion(c, false)).await?;
-                    self.audit(c, "hold", None).await?;
+                    self.commit_with_audit(c, false, "hold").await?;
                     WriteDecision::Held(c.id.clone())
                 }
                 Outcome::Reject(reason) => {
-                    self.audit(c, "reject", Some(&reason)).await?;
+                    // Audit the reject too — but only under a VALID owner. A
+                    // malformed empty/whitespace-owner candidate has no scope to
+                    // file a governance record under, so it is rejected without one.
+                    if !c.scope.owner.trim().is_empty() {
+                        let audit = Self::audit_event(c, "reject", Some(&reason));
+                        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                        EventLog::append_tx(&mut tx, &audit).await?;
+                        tx.commit().await?;
+                    }
                     WriteDecision::Rejected {
                         candidate_id: c.id.clone(),
                         reason,
@@ -239,16 +288,17 @@ mod tests {
 
     use super::*;
     use crate::KvStore;
-    use crate::assertion::BeliefQuery;
-    use crate::event::EventQuery;
+    use crate::assertion::{AssertionStore, BeliefQuery};
+    use crate::event::{EventQuery, EventStore};
     use serde_json::json;
 
-    async fn gate() -> (KvStore, WriteGate<crate::assertion::AssertionLedger>) {
+    async fn gate() -> (KvStore, WriteGate) {
         let kv = KvStore::open_memory().await.unwrap();
         let g = kv.write_gate();
         (kv, g)
     }
 
+    /// A candidate WITH evidence (so a trusted one can actually commit).
     fn cand(id: &str, owner: &str, subject: &str, trust: Trust) -> Candidate {
         Candidate::new(
             id,
@@ -261,6 +311,7 @@ mod tests {
                 trust,
             },
         )
+        .with_evidence(vec!["ev-1".to_owned()])
     }
 
     async fn recall(kv: &KvStore, owner: &str) -> Vec<Assertion> {
@@ -270,15 +321,24 @@ mod tests {
             .unwrap()
     }
 
+    async fn audits(kv: &KvStore, owner: &str) -> Vec<crate::event::StoredEvent> {
+        kv.events()
+            .scan(&EventQuery::owner(owner))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event.kind == "mem.write_decision")
+            .collect()
+    }
+
     #[tokio::test]
-    async fn user_said_with_remember_commits_into_recall() {
+    async fn user_said_with_remember_and_evidence_commits_into_recall() {
         let (kv, g) = gate().await;
         let d = g
             .propose(vec![cand("c1", "u1", "sky", Trust::UserSaid).remember()])
             .await
             .unwrap();
         assert_eq!(d, vec![WriteDecision::Committed("c1".into())]);
-        // In default recall (qualified).
         assert_eq!(recall(&kv, "u1").await.len(), 1);
     }
 
@@ -290,14 +350,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d, vec![WriteDecision::Held("c1".into())]);
-        // Persisted but NOT in default recall (qualified = false).
         assert!(recall(&kv, "u1").await.is_empty());
         let with = kv
             .assertions()
             .beliefs_as_of(&BeliefQuery::owner("u1").with_unqualified())
             .await
             .unwrap();
-        assert_eq!(with.len(), 1, "held as a reviewable candidate");
+        assert_eq!(with.len(), 1);
     }
 
     #[tokio::test]
@@ -308,15 +367,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d, vec![WriteDecision::Held("c1".into())]);
+        assert!(recall(&kv, "u1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_requires_evidence_else_downgrades_to_hold() {
+        // B2: a trusted label alone must not mint a qualified belief with empty
+        // provenance. A System candidate with NO evidence is held, not committed.
+        let (kv, g) = gate().await;
+        let no_ev = Candidate::new(
+            "c1",
+            Scope::owner("u1"),
+            "boot",
+            "is",
+            json!("v"),
+            Origin {
+                source: "sys".to_owned(),
+                trust: Trust::System,
+            },
+        ); // no with_evidence
+        let d = g.propose(vec![no_ev]).await.unwrap();
+        assert_eq!(d, vec![WriteDecision::Held("c1".into())]);
         assert!(
             recall(&kv, "u1").await.is_empty(),
-            "tool output not in recall"
+            "no evidence → not in recall"
         );
+        // With evidence, the same System candidate commits.
+        g.propose(vec![cand("c2", "u1", "boot", Trust::System)])
+            .await
+            .unwrap();
+        assert_eq!(recall(&kv, "u1").await.len(), 1);
     }
 
     #[tokio::test]
     async fn poisoned_web_fetch_is_rejected_and_not_persisted() {
-        // The poison-corpus case: a malicious WebFetch claim never persists.
         let (kv, g) = gate().await;
         let d = g
             .propose(vec![cand(
@@ -328,7 +412,6 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(d[0], WriteDecision::Rejected { .. }));
-        // Nothing in the ledger at all — not even as an unqualified candidate.
         let all = kv
             .assertions()
             .beliefs_as_of(&BeliefQuery::owner("u1").with_unqualified())
@@ -338,37 +421,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_trust_is_rejected() {
+    async fn commit_and_audit_are_atomic_no_belief_without_record() {
+        // B1: pre-occupy the CONTENT-ADDRESSED audit id so the audit insert
+        // collides. The whole transaction must roll back — the belief must NOT
+        // land without its governance record.
         let (kv, g) = gate().await;
-        let d = g
-            .propose(vec![cand("c1", "u1", "x", Trust::Unknown)])
-            .await
-            .unwrap();
-        assert!(matches!(d[0], WriteDecision::Rejected { .. }));
-        assert!(recall(&kv, "u1").await.is_empty());
+        let c = cand("X", "u1", "trusted-subject", Trust::UserSaid).remember();
+        let audit = WriteGate::audit_event(&c, "commit", None);
+        let clash = MemEvent::new(
+            audit.id.clone(),
+            Scope::owner("u1"),
+            "mem.write_decision",
+            json!({"different": "payload"}),
+            Origin {
+                source: "attacker".to_owned(),
+                trust: Trust::System,
+            },
+        );
+        kv.events().append(&clash).await.unwrap();
+
+        // propose aborts (the audit insert collides), and CRUCIALLY the belief did
+        // not land: no "belief without audit".
+        let err = g.propose(vec![c.clone()]).await;
+        assert!(err.is_err(), "audit collision must abort the whole write");
+        assert!(
+            recall(&kv, "u1").await.is_empty(),
+            "no belief committed when its audit could not be written"
+        );
     }
 
     #[tokio::test]
-    async fn system_is_committed() {
+    async fn different_content_same_id_is_two_audits_not_aliased() {
+        // M1: two rejects, same candidate id, DIFFERENT content → two distinct
+        // audit events (content-addressed id), not one aliased.
         let (kv, g) = gate().await;
-        g.propose(vec![cand("c1", "u1", "boot", Trust::System)])
-            .await
-            .unwrap();
-        assert_eq!(recall(&kv, "u1").await.len(), 1);
+        let one = Candidate::new(
+            "dup",
+            Scope::owner("u1"),
+            "content-ONE",
+            "is",
+            json!("ONE"),
+            Origin {
+                source: "s".to_owned(),
+                trust: Trust::WebFetch,
+            },
+        );
+        let two = Candidate::new(
+            "dup",
+            Scope::owner("u1"),
+            "content-TWO",
+            "is",
+            json!("TWO"),
+            Origin {
+                source: "s".to_owned(),
+                trust: Trust::WebFetch,
+            },
+        );
+        g.propose(vec![one]).await.unwrap();
+        g.propose(vec![two]).await.unwrap();
+        assert_eq!(
+            audits(&kv, "u1").await.len(),
+            2,
+            "two decisions, two audits"
+        );
     }
 
     #[tokio::test]
-    async fn empty_owner_is_rejected_regardless_of_trust() {
-        let (_kv, g) = gate().await;
-        let d = g
-            .propose(vec![cand("c1", "  ", "x", Trust::UserSaid).remember()])
-            .await
-            .unwrap();
-        assert!(matches!(d[0], WriteDecision::Rejected { .. }));
-    }
-
-    #[tokio::test]
-    async fn every_decision_is_audited_and_replayable() {
+    async fn every_persisted_decision_is_audited_and_replayable() {
         let (kv, g) = gate().await;
         g.propose(vec![
             cand("c1", "u1", "a", Trust::UserSaid).remember(), // commit
@@ -377,17 +496,9 @@ mod tests {
         ])
         .await
         .unwrap();
-        // Three governance audit events, replayable from the episodic log.
-        let audits: Vec<_> = kv
-            .events()
-            .scan(&EventQuery::owner("u1"))
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.event.kind == "mem.write_decision")
-            .collect();
-        assert_eq!(audits.len(), 3, "one audit per decision");
-        let verdicts: Vec<String> = audits
+        let a = audits(&kv, "u1").await;
+        assert_eq!(a.len(), 3, "one audit per decision");
+        let verdicts: Vec<String> = a
             .iter()
             .map(|e| e.event.body["verdict"].as_str().unwrap().to_owned())
             .collect();
@@ -404,7 +515,6 @@ mod tests {
         let preview = g.dry_run(&cands).await.unwrap();
         assert_eq!(preview[0], WriteDecision::Committed("c1".into()));
         assert!(matches!(preview[1], WriteDecision::Rejected { .. }));
-        // Nothing persisted, nothing audited.
         assert!(
             kv.assertions()
                 .beliefs_as_of(&BeliefQuery::owner("u1").with_unqualified())
@@ -419,26 +529,46 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // And dry_run matches what propose would decide.
-        let real = g.propose(cands).await.unwrap();
-        assert_eq!(preview, real);
+        assert_eq!(preview, g.propose(cands).await.unwrap());
     }
 
-    #[test]
-    fn policy_is_deterministic_and_total_over_trust() {
-        for trust in [
-            Trust::UserSaid,
-            Trust::ToolOutput,
-            Trust::WebFetch,
-            Trust::Model,
-            Trust::System,
-            Trust::Unknown,
-        ] {
-            let c = cand("c", "u1", "s", trust);
-            // Same input → same outcome.
+    #[tokio::test]
+    async fn empty_owner_is_rejected_regardless_of_trust() {
+        let (_kv, g) = gate().await;
+        let d = g
+            .propose(vec![cand("c1", "  ", "x", Trust::UserSaid).remember()])
+            .await
+            .unwrap();
+        assert!(matches!(d[0], WriteDecision::Rejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn policy_maps_each_trust_to_its_expected_outcome() {
+        // L1: assert the ACTUAL outcome per trust, not just determinism. Each row
+        // has evidence + remember so the trusted paths reach Commit.
+        let cases = [
+            (Trust::System, WriteDecision::Committed("c".into())),
+            (Trust::UserSaid, WriteDecision::Committed("c".into())), // + remember below
+            (Trust::Model, WriteDecision::Held("c".into())),
+            (Trust::ToolOutput, WriteDecision::Held("c".into())),
+        ];
+        let (_kv, g) = gate().await;
+        for (trust, expected) in cases {
+            let c = cand("c", "u1", "s", trust).remember();
             assert_eq!(
-                WriteGate::<crate::assertion::AssertionLedger>::policy(&c),
-                WriteGate::<crate::assertion::AssertionLedger>::policy(&c)
+                g.dry_run(&[c]).await.unwrap()[0],
+                expected,
+                "trust {trust:?}"
+            );
+        }
+        for trust in [Trust::WebFetch, Trust::Unknown] {
+            let c = cand("c", "u1", "s", trust).remember();
+            assert!(
+                matches!(
+                    g.dry_run(&[c]).await.unwrap()[0],
+                    WriteDecision::Rejected { .. }
+                ),
+                "trust {trust:?} must reject"
             );
         }
     }

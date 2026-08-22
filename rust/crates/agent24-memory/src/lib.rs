@@ -127,10 +127,9 @@ impl KvStore {
     }
 
     /// A [`writer::WriteGate`] over the SAME database file — MD-4's governance
-    /// write-gate, committing into the assertion ledger and auditing into the
-    /// event log.
-    pub fn write_gate(&self) -> writer::WriteGate<assertion::AssertionLedger> {
-        writer::WriteGate::new(self.assertions(), self.events())
+    /// write-gate, committing an assertion and its audit event atomically.
+    pub fn write_gate(&self) -> writer::WriteGate {
+        writer::WriteGate::new(self.pool.clone())
     }
 
     /// Upsert a raw JSON value.
