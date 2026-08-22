@@ -6,7 +6,7 @@
 >
 > **状态**:🟢 MD-1 spike 已交付并冻结签名(见 §2.1);MD-2a/2b 权威层已合并。MD-1c 后向量实现/SQLite DDL 仍按各自 MD-x 落。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
 >
-> **进度**:✅ MD-1(a/b/c)· ✅ MD-2(a/b/c)· ✅ MD-3(a/b)· ✅ MD-4 写门 · ✅ MD-5 巩固 · ✅ MD-6 本地向量(机制;OmlxEmbedder 待 D4b)·（下一步:MD-7/MD-8 或 MD-4b/MD-1c 收尾)。
+> **进度**:✅ MD-1(a/b/c)· ✅ MD-2(a/b/c)· ✅ MD-3(a/b)· ✅ MD-4 写门 · ✅ MD-5 巩固 · ✅ MD-6 本地向量(机制;OmlxEmbedder 待 D4b)· ✅ MD-7 知识/指令层 ·（下一步:MD-8 符号轨迹)。
 
 ---
 
@@ -52,6 +52,7 @@
 | 用户画像/巩固 | **memobase / MemoryScope / Google** | buffer→flush→槽合并;定时 observation→insight;后台 consolidation + importance |
 | 分层指令记忆 | **gemini-cli** | 层级 `*.md` 合并 + **审核门控 auto-memory inbox**(从不自动应用) |
 | 排序压缩上下文 | **aider** | PageRank 个性化先验 + 预算二分 render + 优雅降级 |
+| 两段检索(recall→rerank) | **ColBERT / sentence-transformers v6**(late interaction) | **不采纳多向量作主索引**(~40× 存储 + MaxSim 需 Qdrant/Weaviate/Vespa/Milvus 原生 = ADR-028 §0.1 禁的强制外部向量服务);**采纳其推荐的两段式**:FTS(MD-3b)/dense(MD-6)召回 top-K → 可选 `Reranker`(ColBERT-MaxSim 或 CrossEncoder)重排 top-K,无新索引、无本地优先违背、拿到大部分 +NDCG。注意 ColBERT 在语义聚合任务(如财报 QA)会输 → 适合断言/事实召回,不适合 MD-5 巩固。留作 **MD-6x `Reranker` 缝**(与 `OmlxEmbedder` 同挂 D4b) |
 | 长任务符号轨迹 | **TencentDB** | Mermaid 符号图 + `node_id` 下钻,全量日志落 `refs/*.md` |
 | 幂等/provenance 管线 | **cognee** | 确定性命名 id、run-id、rollback、先 flush 后完成 |
 
@@ -151,7 +152,7 @@ trait ProjectionJob{ async fn run_from(&self, ckpt: CheckpointId)->R<ProjectionO
 | **MD-4** 🟢 | **MemoryWriter 写门(治理)**:candidate→闭 schema 校验→确定性策略→approve/commit;强制 owner;origin/trust;审计 | MD-3 | 恶意 ToolOutput/WebFetch 默认不落持久;UserSaid+显式 remember 才自动 commit;dry-run/review;bulk rollback | ✅ 核心:确定性策略(WebFetch/Unknown→Reject 不落持久;UserSaid+remember/System→Commit qualified;UserSaid/Model/ToolOutput→Hold 候选不进召回)+ 强制 owner + `mem.write_decision` 审计可回放 + dry-run 无副作用 + 投毒语料测试。🔜 **bulk rollback + turn→candidate 抽取**挂 MD-4b(文档标注为边界) |
 | **MD-5** 🟢 | **Consolidator 巩固循环**:后台读未巩固事件→写 insight→更新 persona;importance/consolidated 标记 | MD-3 | 巩固幂等;importance 排序;增量==全量重跑 | ✅ `Consolidator::run_once`/`insights` + `InsightSynth`(默认确定性 `CountSynth`)+ migration 0006:巩固幂等 + importance 排序 + **增量==全量重跑** + 跨 scope 零泄漏(每个巩固=其 key 所有事件的纯函数)。🔜 LLM 版 synth + LongMemEval 对照增益、checkpoint 增量优化留后续 |
 | **MD-6** 🟢 | **Retriever 本地向量(可选)**:`OmlxEmbedder` + SQLite 向量 + 双索引迁移 + FTS 兜底;`Embedding{model_id,revision,dims}` | MD-3, D4b | 换模型触发 reindex 状态机;可续重嵌;混版本行为 | ✅ 机制:`Embedder` 缝 + `VectorRetriever`(cosine 暴力,current-model-only,current+qualified+owner 门)+ migration 0007:换模型→FTS 兜底→reindex 状态机 + 可续重嵌(只嵌缺失)+ 混版本共存(reindex 不丢旧版本行)+ 跨 scope 隔离。🔜 **OmlxEmbedder 待 D4b**;「语义召回优于纯 FTS」对照需真模型,同挂 D4b(文档标注) |
-| **MD-7** | **知识/指令层(L4)**:层级 markdown(CLAUDE.md 式)合并 + 触发注入 + **审核门控 auto-memory inbox**(gemini-cli) | MD-2 | 层级合并优先级;触发命中;auto-memory 从不自动应用 | 层级覆盖正确 + inbox 需人批 |
+| **MD-7** ✅ | **知识/指令层(L4)**:层级 markdown(CLAUDE.md 式)合并 + 触发注入 + **审核门控 auto-memory inbox**(gemini-cli) | MD-2 | 层级合并优先级;触发命中;auto-memory 从不自动应用 | ✅ `KnowledgeBase`(`add_active`/`propose`/`merged`/`triggered`/`inbox`/`approve`/`reject`)+ migration 0008:priority 升序合并(高优先级后置=胜)+ 大小写不敏感触发注入 + **pending 提案永不进 merged/triggered(需人批)** + approve/reject owner-scoped + 跨 scope 零泄漏 |
 | **MD-8** | **长任务符号轨迹(H1/H2)**:全量工具日志落 `refs/*.md`,留符号图 + `node_id` 下钻(TencentDB) | MD-2 | 符号图可下钻回原文;压缩可恢复(非截断) | 轨迹压缩率 + 100% 可恢复 |
 | **MD-X** | **crate 拆分**:`agent24-memory` → `memory-{core,episodic,semantic,knowledge}` + facade——**仅当依赖/发布边界被证明**(Codex 收口:先模块后 crate) | MD-2..7 | 编译/依赖图无环 | 有真实边界才拆,否则不拆 |
 
