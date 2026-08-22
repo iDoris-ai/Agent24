@@ -1,0 +1,27 @@
+[package]
+name = "agent24-sin90-os"
+version = "0.2.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sin90 as a domain OS: the first DomainModule (ME-1b-b) — its own store, its own routes, mounted through the manifest rather than hardcoded in the kernel router"
+
+[dependencies]
+agent24-domain = { path = "../agent24-domain" }
+agent24-sin90 = { path = "../agent24-sin90" }
+agent24-sin90-store = { path = "../agent24-sin90-store" }
+async-trait = "0.1"
+# `query` because /attention takes a query string; `json` for the response bodies.
+# Declared explicitly rather than relying on the daemon's axum features leaking in
+# through cargo feature unification — this crate must build and test on its own.
+axum = { version = "0.8", default-features = false, features = ["json", "query"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

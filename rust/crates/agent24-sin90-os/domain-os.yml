@@ -1,0 +1,18 @@
+# Sin90's domain-OS manifest (ADR-029 / SPEC-MD-ME §2).
+#
+# The kernel reads THIS to learn the module's identity; `name` is the single
+# source of it, and the namespace, event module and data directory are all
+# derived from it. Declaring any of them differently is a validation error, so
+# this file cannot quietly point Sin90 at another OS's routes or data.
+name: sin90
+version: "0.2.1"
+route_namespace: /api/v1/sin90
+event_module: sin90
+data_dir: ~/.agent24/os/sin90/
+requires_models: []
+requires_apis: []
+requires_deps: []
+# Only what it actually uses. Asking for more gains nothing — the kernel
+# intersects — and would misdescribe the module in `agent24 os`.
+kernel_capabilities: [events]
+impl_kind: in_process_crate
