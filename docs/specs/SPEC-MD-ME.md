@@ -6,7 +6,7 @@
 >
 > **状态**:🟢 MD-1 spike 已交付并冻结签名(见 §2.1);MD-2a/2b 权威层已合并。MD-1c 后向量实现/SQLite DDL 仍按各自 MD-x 落。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
 >
-> **进度**:✅ MD-1(a/b/c)· ✅ MD-2(a/b/c)· ✅ MD-3(a/b)· ✅ MD-4 写门 · ✅ MD-5 巩固 · ✅ MD-6 本地向量(机制;OmlxEmbedder 待 D4b)· ✅ MD-7 知识/指令层 ·（下一步:MD-8 符号轨迹)。
+> **进度**:✅ MD-1 · ✅ MD-2 · ✅ MD-3 · ✅ MD-4 · ✅ MD-5 · ✅ MD-6(机制;OmlxEmbedder 待 D4b)· ✅ MD-7 · ✅ MD-8 —— **M-D 主线 MD-1..8 全交付**(MD-X 拆 crate 按 Codex 收口:无真实边界不拆)。
 
 ---
 
@@ -153,7 +153,7 @@ trait ProjectionJob{ async fn run_from(&self, ckpt: CheckpointId)->R<ProjectionO
 | **MD-5** 🟢 | **Consolidator 巩固循环**:后台读未巩固事件→写 insight→更新 persona;importance/consolidated 标记 | MD-3 | 巩固幂等;importance 排序;增量==全量重跑 | ✅ `Consolidator::run_once`/`insights` + `InsightSynth`(默认确定性 `CountSynth`)+ migration 0006:巩固幂等 + importance 排序 + **增量==全量重跑** + 跨 scope 零泄漏(每个巩固=其 key 所有事件的纯函数)。🔜 LLM 版 synth + LongMemEval 对照增益、checkpoint 增量优化留后续 |
 | **MD-6** 🟢 | **Retriever 本地向量(可选)**:`OmlxEmbedder` + SQLite 向量 + 双索引迁移 + FTS 兜底;`Embedding{model_id,revision,dims}` | MD-3, D4b | 换模型触发 reindex 状态机;可续重嵌;混版本行为 | ✅ 机制:`Embedder` 缝 + `VectorRetriever`(cosine 暴力,current-model-only,current+qualified+owner 门)+ migration 0007:换模型→FTS 兜底→reindex 状态机 + 可续重嵌(只嵌缺失)+ 混版本共存(reindex 不丢旧版本行)+ 跨 scope 隔离。🔜 **OmlxEmbedder 待 D4b**;「语义召回优于纯 FTS」对照需真模型,同挂 D4b(文档标注) |
 | **MD-7** ✅ | **知识/指令层(L4)**:层级 markdown(CLAUDE.md 式)合并 + 触发注入 + **审核门控 auto-memory inbox**(gemini-cli) | MD-2 | 层级合并优先级;触发命中;auto-memory 从不自动应用 | ✅ `KnowledgeBase`(`add_active`/`propose`/`merged`/`triggered`/`inbox`/`approve`/`reject`)+ migration 0008:priority 升序合并(高优先级后置=胜)+ 大小写不敏感触发注入 + **pending 提案永不进 merged/triggered(需人批)** + approve/reject owner-scoped + 跨 scope 零泄漏 |
-| **MD-8** | **长任务符号轨迹(H1/H2)**:全量工具日志落 `refs/*.md`,留符号图 + `node_id` 下钻(TencentDB) | MD-2 | 符号图可下钻回原文;压缩可恢复(非截断) | 轨迹压缩率 + 100% 可恢复 |
+| **MD-8** ✅ | **长任务符号轨迹(H1/H2)**:全量工具日志落 `refs/*.md`,留符号图 + `node_id` 下钻(TencentDB) | MD-2 | 符号图可下钻回原文;压缩可恢复(非截断) | ✅ `TaskTrace`(`record`/`symbols`/`drill`/`expand_run`/`stats`)+ migration 0009:全量 body 存内容寻址 ref、prompt 只留 symbol;**drill 逐字返回原文(非截断)**、`expand_run` 证明 **100% 可恢复**、压缩率 >99% 有测试;相同 body 去重但各占一个 node;drill owner-scoped;空 run stats 不除零 |
 | **MD-X** | **crate 拆分**:`agent24-memory` → `memory-{core,episodic,semantic,knowledge}` + facade——**仅当依赖/发布边界被证明**(Codex 收口:先模块后 crate) | MD-2..7 | 编译/依赖图无环 | 有真实边界才拆,否则不拆 |
 
 ---

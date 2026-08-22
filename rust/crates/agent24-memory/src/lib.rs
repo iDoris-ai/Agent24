@@ -19,6 +19,7 @@ pub mod reconcile;
 pub mod replay;
 pub mod retriever;
 pub mod session;
+pub mod trace;
 pub mod vector;
 pub mod writer;
 
@@ -150,6 +151,12 @@ impl KvStore {
     /// layered instruction/knowledge layer with a review-gated auto-memory inbox.
     pub fn knowledge(&self) -> knowledge::InstructionStore {
         knowledge::InstructionStore::new(self.pool.clone())
+    }
+
+    /// A [`trace::SymbolicTrace`] over the SAME database file — MD-8's symbolic
+    /// task trace (full bodies spilled to refs, prompt keeps symbols + drill-down).
+    pub fn trace(&self) -> trace::SymbolicTrace {
+        trace::SymbolicTrace::new(self.pool.clone())
     }
 
     /// A [`vector::VectorRetriever`] over the SAME database file with a chosen
