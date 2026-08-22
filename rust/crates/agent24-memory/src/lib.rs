@@ -14,6 +14,7 @@ pub mod condenser;
 pub mod consolidator;
 pub mod eval;
 pub mod event;
+pub mod knowledge;
 pub mod reconcile;
 pub mod replay;
 pub mod retriever;
@@ -143,6 +144,12 @@ impl KvStore {
     /// consolidation loop, with the default deterministic [`consolidator::CountSynth`].
     pub fn consolidator(&self) -> consolidator::EventConsolidator<consolidator::CountSynth> {
         consolidator::EventConsolidator::new(self.pool.clone(), consolidator::CountSynth)
+    }
+
+    /// An [`knowledge::InstructionStore`] over the SAME database file — MD-7's
+    /// layered instruction/knowledge layer with a review-gated auto-memory inbox.
+    pub fn knowledge(&self) -> knowledge::InstructionStore {
+        knowledge::InstructionStore::new(self.pool.clone())
     }
 
     /// A [`vector::VectorRetriever`] over the SAME database file with a chosen
