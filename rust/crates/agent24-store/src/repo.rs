@@ -114,8 +114,24 @@ impl Store {
         }))
     }
 
+    /// # Ordering
+    ///
+    /// Every list in this file breaks its timestamp tie with `id`, and that is not
+    /// cosmetic: `created_at` is SECOND-resolution
+    /// ([`agent24_core::util::now_iso8601`]), so rows created in the same second
+    /// had NO defined order — SQLite was free to return them differently between
+    /// runs, and a caller that indexed or paginated the result would have seen it.
+    ///
+    /// `id` is the right tie-break rather than an arbitrary one: these ids are
+    /// `<prefix>_<ULID>` with a constant per-table prefix, so their lexical order
+    /// IS the ULID's millisecond order. The tie-break therefore refines the
+    /// ordering to milliseconds instead of merely making it deterministic.
+    ///
+    /// `agent24-sin90-store` already did this (with `rowid`) and has a same-second
+    /// regression test; this file did not. Recorded in `improvement/` as the second
+    /// half of the same hazard that produced a flaky memory test (#130).
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
-        let rows = sqlx::query("SELECT * FROM sessions ORDER BY created_at DESC")
+        let rows = sqlx::query("SELECT * FROM sessions ORDER BY created_at DESC, id DESC")
             .fetch_all(self.pool())
             .await?;
         Ok(rows
@@ -165,13 +181,13 @@ impl Store {
     pub async fn list_runs(&self, status: Option<RunStatus>) -> Result<Vec<Run>> {
         let rows = match status {
             Some(s) => {
-                sqlx::query("SELECT * FROM runs WHERE status = ? ORDER BY created_at DESC")
+                sqlx::query("SELECT * FROM runs WHERE status = ? ORDER BY created_at DESC, id DESC")
                     .bind(status_str(s))
                     .fetch_all(self.pool())
                     .await?
             }
             None => {
-                sqlx::query("SELECT * FROM runs ORDER BY created_at DESC")
+                sqlx::query("SELECT * FROM runs ORDER BY created_at DESC, id DESC")
                     .fetch_all(self.pool())
                     .await?
             }
@@ -319,10 +335,12 @@ impl Store {
     }
 
     pub async fn list_tool_calls(&self, run_id: &str) -> Result<Vec<ToolCall>> {
-        let rows = sqlx::query("SELECT * FROM tool_calls WHERE run_id = ? ORDER BY started_at ASC")
-            .bind(run_id)
-            .fetch_all(self.pool())
-            .await?;
+        let rows = sqlx::query(
+            "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY started_at ASC, id ASC",
+        )
+        .bind(run_id)
+        .fetch_all(self.pool())
+        .await?;
         rows.iter()
             .map(|r| {
                 Ok(ToolCall {
@@ -408,13 +426,15 @@ impl Store {
     pub async fn list_approvals(&self, status: Option<ApprovalStatus>) -> Result<Vec<Approval>> {
         let rows = match status {
             Some(s) => {
-                sqlx::query("SELECT * FROM approvals WHERE status = ? ORDER BY created_at ASC")
-                    .bind(approval_status_str(s))
-                    .fetch_all(self.pool())
-                    .await?
+                sqlx::query(
+                    "SELECT * FROM approvals WHERE status = ? ORDER BY created_at ASC, id ASC",
+                )
+                .bind(approval_status_str(s))
+                .fetch_all(self.pool())
+                .await?
             }
             None => {
-                sqlx::query("SELECT * FROM approvals ORDER BY created_at ASC")
+                sqlx::query("SELECT * FROM approvals ORDER BY created_at ASC, id ASC")
                     .fetch_all(self.pool())
                     .await?
             }
@@ -637,7 +657,7 @@ impl Store {
     }
 
     pub async fn list_standing_grants(&self) -> Result<Vec<StandingGrant>> {
-        let rows = sqlx::query("SELECT * FROM standing_grants ORDER BY created_at DESC")
+        let rows = sqlx::query("SELECT * FROM standing_grants ORDER BY created_at DESC, id DESC")
             .fetch_all(self.pool())
             .await?;
         Ok(rows.iter().map(Self::row_to_grant).collect())

@@ -672,4 +672,87 @@ mod tests {
             assert_eq!(Trust::parse(t.as_str()), t, "roundtrip {t:?}");
         }
     }
+
+    #[tokio::test]
+    async fn a_whitespace_only_owner_is_rejected_like_everywhere_else() {
+        // `mem_events` shipped with `CHECK(scope_owner <> '')` while every table
+        // added after it uses `trim(...)`. A "   " owner therefore passed HERE and
+        // was refused everywhere else — an event nothing downstream could own.
+        let kv = crate::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        for bad in ["   ", "\t", "\n "] {
+            let ev = MemEvent::new(
+                format!("ws-{}", bad.len()),
+                Scope::owner(bad),
+                "note",
+                serde_json::json!({}),
+                Origin {
+                    source: "t".to_owned(),
+                    trust: Trust::UserSaid,
+                },
+            );
+            assert!(
+                log.append(&ev).await.is_err(),
+                "a whitespace-only owner must be refused: {bad:?}"
+            );
+        }
+        // And a real owner still works — the constraint must not have become
+        // "reject everything".
+        let ok = MemEvent::new(
+            "fine",
+            Scope::owner("alice"),
+            "note",
+            serde_json::json!({}),
+            Origin {
+                source: "t".to_owned(),
+                trust: Trust::UserSaid,
+            },
+        );
+        log.append(&ok).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_rebuild_keeps_seq_and_the_indexes() {
+        // The 0011 rebuild copies `seq` rather than regenerating it — renumbering
+        // would make every stored projection checkpoint point at a different
+        // event. And it recreates 0002's indexes under THEIR names, because a
+        // table rebuild drops them.
+        let kv = crate::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        for id in ["a", "b", "c"] {
+            let ev = MemEvent::new(
+                id,
+                Scope::owner("alice"),
+                "note",
+                serde_json::json!({}),
+                Origin {
+                    source: "t".to_owned(),
+                    trust: Trust::UserSaid,
+                },
+            );
+            log.append(&ev).await.unwrap();
+        }
+        let scanned = log.scan(&EventQuery::owner("alice")).await.unwrap();
+        assert_eq!(scanned.len(), 3);
+        assert!(
+            scanned.windows(2).all(|w| w[0].seq < w[1].seq),
+            "seq must still be a monotonic total order"
+        );
+
+        let idx: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'mem_events' \
+             AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .fetch_all(&kv.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            idx,
+            vec![
+                "mem_events_owner_seq".to_owned(),
+                "mem_events_session_seq".to_owned()
+            ],
+            "0002's indexes must survive the rebuild under their own names"
+        );
+    }
 }
