@@ -615,3 +615,64 @@ async fn orphan_sweep_spares_a_parked_run_but_cancels_the_rest() {
         RunStatus::Cancelled
     );
 }
+
+/// Rows created in the SAME SECOND must come back in a defined order.
+///
+/// `created_at` is second-resolution, so before the `id` tie-break these lists
+/// had no defined order at all — SQLite could return them differently between
+/// runs, and a caller that indexed or paginated would have seen it. The same
+/// hazard, in the memory crate, produced a test that failed roughly one run in
+/// fifteen (#130); this pins the store side of it.
+///
+/// The ids here are written explicitly rather than minted, so the test does not
+/// depend on how fast it runs.
+#[tokio::test]
+async fn same_second_rows_come_back_in_a_defined_order() {
+    let store = Store::open_memory().await.unwrap();
+    let at = "2026-01-01T00:00:00Z";
+
+    // Deliberately inserted OUT of id order, so a query that ignored `id` would
+    // have insertion order (or whatever SQLite chose) to fall back on.
+    for id in ["sess_B", "sess_A", "sess_C"] {
+        store
+            .insert_session(&Session {
+                id: id.to_owned(),
+                title: "t".to_owned(),
+                channel: "cli".to_owned(),
+                created_at: at.to_owned(),
+                updated_at: at.to_owned(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let ids: Vec<String> = store
+        .list_sessions()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "sess_C".to_owned(),
+            "sess_B".to_owned(),
+            "sess_A".to_owned()
+        ],
+        "newest first, and within one second by id DESC — not by luck"
+    );
+
+    // And it is STABLE: the same query twice must agree. A single call cannot
+    // distinguish "ordered" from "happened to come back that way".
+    for _ in 0..5 {
+        let again: Vec<String> = store
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(again, ids);
+    }
+}
