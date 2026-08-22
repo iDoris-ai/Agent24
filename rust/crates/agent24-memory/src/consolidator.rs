@@ -24,7 +24,13 @@ use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 
 use crate::Result;
+use crate::artifact::checksum;
 use crate::event::{EventLog, EventQuery, EventStore, StoredEvent};
+
+/// How many events one consolidation page scans. `run_once` pages to the end, so
+/// the total is unbounded — unlike a single capped `scan`, which would silently
+/// drop events past its limit (review #122 B2).
+const CONSOLIDATE_PAGE: i64 = 10_000;
 
 /// One consolidated insight over a group of events.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,15 +39,25 @@ pub struct Consolidation {
     pub owner: String,
     pub key: String,
     pub insight: String,
-    pub importance: f32,
+    /// f64, not f32: a count-based importance loses precision above 2^24 in f32
+    /// (adjacent counts would compare equal), breaking strict ranking (review
+    /// #122). Synths must return a FINITE value.
+    pub importance: f64,
     pub source_events: Vec<String>,
     pub at: String,
 }
 
 /// Turns a group of events (all sharing a key) into an insight + importance.
-/// The pluggable seam an LLM synth slots into; the default is deterministic.
+/// The pluggable seam an LLM synth slots into.
+///
+/// **Contract: `synth` MUST be a deterministic, finite pure function of its
+/// inputs** — the same `(key, events)` yields the same `(insight, importance)`,
+/// and importance is finite (no NaN). The consolidation loop's idempotence and
+/// "incremental == full" guarantees rest on this; an LLM-backed synth must pin
+/// its output (temperature 0 / cached) to honor it (review #122 M1, same shape as
+/// #121's "trust is an input invariant").
 pub trait InsightSynth: Send + Sync {
-    fn synth(&self, key: &str, events: &[&StoredEvent]) -> (String, f32);
+    fn synth(&self, key: &str, events: &[&StoredEvent]) -> (String, f64);
 }
 
 /// Deterministic default: the insight names the group size, importance is the
@@ -50,10 +66,10 @@ pub trait InsightSynth: Send + Sync {
 pub struct CountSynth;
 
 impl InsightSynth for CountSynth {
-    fn synth(&self, key: &str, events: &[&StoredEvent]) -> (String, f32) {
+    fn synth(&self, key: &str, events: &[&StoredEvent]) -> (String, f64) {
         (
             format!("{} events of kind '{key}'", events.len()),
-            events.len() as f32,
+            events.len() as f64,
         )
     }
 }
@@ -83,15 +99,41 @@ impl<S: InsightSynth + Clone> EventConsolidator<S> {
     fn events(&self) -> EventLog {
         EventLog::new(self.pool.clone())
     }
+
+    /// Scan ALL of an owner's events, paging past the per-scan cap so nothing is
+    /// silently dropped (review #122 B2). `page` is injectable for tests to force
+    /// multiple pages without a huge corpus.
+    async fn scan_all_paged(&self, owner: &str, page: i64) -> Result<Vec<StoredEvent>> {
+        let log = self.events();
+        let mut out = Vec::new();
+        let mut cursor = 0i64;
+        loop {
+            let batch = log
+                .scan(&EventQuery::owner(owner).after(cursor).limit(page))
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            let short = (batch.len() as i64) < page;
+            if let Some(last) = batch.last() {
+                cursor = last.seq;
+            }
+            out.extend(batch);
+            if short {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
 impl<S: InsightSynth + Clone> Consolidator for EventConsolidator<S> {
     async fn run_once(&self, owner: &str) -> Result<usize> {
-        // Recompute from ALL of the owner's events, so the result depends only on
-        // what exists — never on batching (incremental == full) or on how many
-        // times we have run (idempotent).
-        let all = self.events().scan(&EventQuery::owner(owner)).await?;
+        // Recompute from ALL of the owner's events (paged, never truncated), so
+        // the result depends only on what exists — never on batching (incremental
+        // == full) or on how many times we have run (idempotent).
+        let all = self.scan_all_paged(owner, CONSOLIDATE_PAGE).await?;
 
         // Group by kind, in a BTreeMap for a deterministic order.
         let mut groups: std::collections::BTreeMap<&str, Vec<&StoredEvent>> =
@@ -101,9 +143,31 @@ impl<S: InsightSynth + Clone> Consolidator for EventConsolidator<S> {
         }
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Drop consolidations whose key no longer has any events for this owner,
+        // so the projection stays a faithful rebuild of the current log (e.g.
+        // after a log repair/import removes a kind), not an append-only residue.
+        let live_keys: Vec<String> = groups.keys().map(|k| (*k).to_owned()).collect();
+        let placeholders = std::iter::repeat_n("?", live_keys.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let delete_sql = if live_keys.is_empty() {
+            "DELETE FROM mem_consolidations WHERE scope_owner = ?".to_owned()
+        } else {
+            format!(
+                "DELETE FROM mem_consolidations WHERE scope_owner = ? AND consol_key NOT IN ({placeholders})"
+            )
+        };
+        let mut del = sqlx::query(&delete_sql).bind(owner);
+        for k in &live_keys {
+            del = del.bind(k);
+        }
+        del.execute(&mut *tx).await?;
+
         for (key, events) in &groups {
             let (insight, importance) = self.synth.synth(key, events);
             // Deterministic provenance + timestamp: sorted source ids, latest at.
+            // (`at` uses lexicographic max, which is the time max because
+            // MemEvent.at is canonical fixed-width UTC from now_iso8601.)
             let mut source_ids: Vec<&str> = events.iter().map(|e| e.event.id.as_str()).collect();
             source_ids.sort_unstable();
             let source_json = serde_json::to_string(&source_ids)?;
@@ -113,20 +177,23 @@ impl<S: InsightSynth + Clone> Consolidator for EventConsolidator<S> {
                 .max()
                 .unwrap_or("")
                 .to_owned();
-            let id = format!("consol-{owner}-{key}");
+            // Collision-free display id: hash of owner+key (NUL-separated), so it
+            // is not the ambiguous concat — the real identity is (owner, key).
+            let id = format!("consol-{}", &checksum(&format!("{owner}\u{0}{key}"))[..16]);
             sqlx::query(
                 "INSERT INTO mem_consolidations
-                     (id, scope_owner, consol_key, insight, importance, source_events, at)
+                     (scope_owner, consol_key, id, insight, importance, source_events, at)
                  VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     insight = excluded.insight, importance = excluded.importance,
+                 ON CONFLICT(scope_owner, consol_key) DO UPDATE SET
+                     id = excluded.id, insight = excluded.insight,
+                     importance = excluded.importance,
                      source_events = excluded.source_events, at = excluded.at",
             )
-            .bind(&id)
             .bind(owner)
             .bind(*key)
+            .bind(&id)
             .bind(&insight)
-            .bind(importance as f64)
+            .bind(importance)
             .bind(&source_json)
             .bind(&at)
             .execute(&mut *tx)
@@ -152,7 +219,7 @@ impl<S: InsightSynth + Clone> Consolidator for EventConsolidator<S> {
                     owner: r.get("scope_owner"),
                     key: r.get("consol_key"),
                     insight: r.get("insight"),
-                    importance: r.get::<f64, _>("importance") as f32,
+                    importance: r.get::<f64, _>("importance"),
                     source_events: serde_json::from_str(&r.get::<String, _>("source_events"))?,
                     at: r.get("at"),
                 })
@@ -186,6 +253,21 @@ mod tests {
                 trust: Trust::UserSaid,
             },
         );
+        kv.events().append(&ev).await.unwrap();
+    }
+
+    async fn append_at(kv: &KvStore, id: &str, owner: &str, kind: &str, at: &str) {
+        let mut ev = MemEvent::new(
+            id,
+            Scope::owner(owner),
+            kind,
+            serde_json::json!({"k": id}),
+            Origin {
+                source: "t".to_owned(),
+                trust: Trust::UserSaid,
+            },
+        );
+        ev.at = at.to_owned();
         kv.events().append(&ev).await.unwrap();
     }
 
@@ -268,6 +350,81 @@ mod tests {
         let ins = c.insights("u1").await.unwrap();
         assert_eq!(ins[0].key, "frequent", "3 events outranks 1");
         assert!(ins[0].importance > ins[1].importance);
+    }
+
+    #[tokio::test]
+    async fn cross_owner_with_hyphens_do_not_collide() {
+        // B1: (owner="alice", kind="x-y") and (owner="alice-x", kind="y") must NOT
+        // share a consolidation. The identity is the (owner, key) pair, not a
+        // concatenated string.
+        let (kv, c) = consolidator().await;
+        append(&kv, "e1", "alice", "x-y").await;
+        append(&kv, "e2", "alice-x", "y").await;
+        c.run_once("alice").await.unwrap();
+        c.run_once("alice-x").await.unwrap();
+
+        let alice = c.insights("alice").await.unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(
+            alice[0].source_events,
+            vec!["e1"],
+            "alice keeps only her event"
+        );
+        let alice_x = c.insights("alice-x").await.unwrap();
+        assert_eq!(alice_x.len(), 1);
+        assert_eq!(
+            alice_x[0].source_events,
+            vec!["e2"],
+            "alice-x is not clobbered"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_all_pages_past_the_cap() {
+        // B2: a history longer than one page must be consolidated ENTIRELY. Drive
+        // the pager with a small page so 25 events cross 3 pages (a single capped
+        // scan would silently drop the tail).
+        let (kv, c) = consolidator().await;
+        for i in 0..25 {
+            append(&kv, &format!("e{i}"), "u1", "note").await;
+        }
+        let all = c.scan_all_paged("u1", 10).await.unwrap();
+        assert_eq!(all.len(), 25, "all pages recovered, not just the first");
+    }
+
+    #[tokio::test]
+    async fn at_is_the_latest_source_event_time_not_wall_clock() {
+        // Minor: the consolidation's `at` is the max source-event time — asserting
+        // the mechanism directly, so it cannot pass with a wall-clock `at`.
+        let (kv, c) = consolidator().await;
+        append_at(&kv, "old", "u1", "note", "2020-01-01T00:00:00Z").await;
+        append_at(&kv, "new", "u1", "note", "2023-06-01T00:00:00Z").await;
+        c.run_once("u1").await.unwrap();
+        assert_eq!(
+            c.insights("u1").await.unwrap()[0].at,
+            "2023-06-01T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_key_consolidation_is_removed_on_rebuild() {
+        // Minor ④: a projection is rebuildable — a consolidation whose key no
+        // longer has events (e.g. after a log repair) must not linger. Simulate by
+        // deleting the events then re-running.
+        let (kv, c) = consolidator().await;
+        append(&kv, "a", "u1", "note").await;
+        append(&kv, "b", "u1", "task").await;
+        c.run_once("u1").await.unwrap();
+        assert_eq!(c.insights("u1").await.unwrap().len(), 2);
+        // Remove all 'task' events, re-run: the 'task' consolidation is dropped.
+        sqlx::query("DELETE FROM mem_events WHERE scope_owner = 'u1' AND kind = 'task'")
+            .execute(&c.pool)
+            .await
+            .unwrap();
+        c.run_once("u1").await.unwrap();
+        let ins = c.insights("u1").await.unwrap();
+        assert_eq!(ins.len(), 1);
+        assert_eq!(ins[0].key, "note");
     }
 
     #[tokio::test]
