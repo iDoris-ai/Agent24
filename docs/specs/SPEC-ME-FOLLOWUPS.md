@@ -79,13 +79,33 @@ M-E 到 ME-2 为止交付的是**可换**：内核不再按名字认识 Sin90，
 
 ## F2 · M-D 记忆底座的零消费者问题
 
-架构图核对代码时发现：**M-D 建好的 12 个模块，agent loop 一个都没用** —— 仍走 M-D 之前的 `session::CanonicalSession`。
+**核对结果（2026-08-22，逐模块数过）**：`agent24-memory` 的 **12 个 M-D 模块全部 `pub mod` 导出，crate 外引用数全为 0**：
 
-底座建成了但没接上，等于**两套记忆并存**：M-D 的 EventLog/AssertionLedger/Condenser 在那里，而实际跑的对话用的是另一套。
+```
+condenser event artifact assertion retriever writer
+consolidator vector knowledge trace replay eval     ← 每一个 external-refs = 0
+```
 
-**要交付**：给出接入方案（一次性切换 vs 双写过渡），并至少让 **Condenser** 与 **EventLog** 进入真实 agent loop。
+依赖这个 crate 的只有 `agent24-agent` 和 `agent24d`，而它们**只用 `KvStore` 和 `session::{CanonicalSession, CompactionPolicy, Summarizer}`** —— 全是 M-D **之前**就有的东西。
 
-**验收**：一次真实对话在 M-D 的 EventLog 里留下可重放的事件；`CanonicalSession` 要么退役，要么明确降级为投影。
+### 而且重叠是直接的，不是"还没接上"那么松
+
+`CanonicalSession::append` **已经在做基于摘要的压缩**，还带 no-loss 保证（摘要失败就不丢消息，下次重试）。`Condenser`（MD-1a）做的是**同一件事**，只是：按 **token 预算**而不是消息条数触发、策略**可换**（`RecentWindowCondenser` / `LlmSummaryCondenser`）、并给出带 `covers(n)` 的 `ContextProjection`。
+
+所以 F2 不是"底座没人用",而是:**Condenser 就是为了取代 CanonicalSession 的压缩而建的,而那次替换从来没发生。**
+
+同理 `CanonicalSession::save(kv)` 把会话存成 **KV blob**,不是事件 —— 所以**情节权威(EventLog)里根本没有对话**,MD-1b 的崩溃重放对真实会话无从谈起。
+
+### 要交付
+
+| ID | 内容 |
+|---|---|
+| F2a | 用 `Condenser` 取代 `CanonicalSession` 的压缩(两者做同一件事,后者按 token 预算且策略可换)。给出**一次性切换 vs 双写过渡**的选择与理由。 |
+| F2b | 会话轮次**写进 EventLog**,让情节权威名副其实,MD-1b 的崩溃重放对真实会话生效。 |
+
+**验收**：一次真实对话在 M-D 的 EventLog 里留下可重放的事件；`CanonicalSession` 要么退役，要么明确降级为投影(而不是两套并存)。
+
+> ⚠️ 顺带更正一处说法:里程碑记的是「M-D 全交付」。**交付 ≠ 在用** —— 164 条测试证明的是底座本身正确,不是它接进了 agent loop。这个区别以后要写清楚。
 
 ---
 
