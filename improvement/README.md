@@ -41,7 +41,7 @@ improvement/
   - 🔴 **`mem_checkpoints` 完全没有 owner 列**,且 API 也没有 owner 参数(`checkpoint_at(name, seq)` / `checkpoint_seq(name)`)—— **两个 owner 用同名 checkpoint 会共享同一行**,一方推进会让另一方的增量扫描跳过事件。**形状与 #119 的 `retract` 一模一样**(没有 owner 参数,所以没有任何 `WHERE` 能救),那六轮复审各自只打了它们触碰的表,**这张一次都没被碰到**。→ 已列为 TODO-A 的**已知缺陷**,单独修。
   - ⚠️ **`kv`(L0)用 `PRIMARY KEY (namespace, key)` 隔离,即 namespace 而非 owner** —— 是**另一套隔离模型**,不一定是缺陷,但正该由 TODO-A 判断:namespace 是否由 owner 派生?两个 OS 挂同一 owner 时会不会撞 namespace?
 - `Scope` 有 `owner / agent / session / run` 四维,但**只有 owner 维在存储层强制**;`agent` 维目前**未被任何查询使用**(全仓 0 处 `scope_agent` 列)—— 这正是「不同 OS 挂在同一 owner 下会不会互污」的关键缺口。
-- `ScopedMemory` / `KernelCtx` **尚未实现**(SPEC §2 只有契约草案;ME-1a 已落契约 crate,ME-1b+ 才接内核)。
+- `ScopedMemory` / `KernelCtx` **尚未实现**(SPEC §2 只有契约草案;ME-1a 契约 crate 在 **PR #127,尚未合入**;ME-1b+ 才接内核)。
 - ⚠️ **非空 CHECK 强度不齐**:`mem_events` 是 `CHECK(scope_owner <> '')`,其余八张是 `CHECK(trim(scope_owner) <> '')` —— **纯空格 owner 在 `mem_events` 过得去,在别处过不去**。(0002 是已发布迁移不可改,需新迁移收紧。)
 
 ---
