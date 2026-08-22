@@ -187,18 +187,23 @@ pub trait EventStore: Send + Sync {
     async fn append(&self, e: &MemEvent) -> Result<i64>;
     /// Events in seq order under a filter.
     async fn scan(&self, q: &EventQuery) -> Result<Vec<StoredEvent>>;
-    /// Record that a named projection has folded events **up to `up_to_seq`**.
-    /// Forward-only (a lower seq is a no-op), so an out-of-order or retried
-    /// consumer can never REGRESS a checkpoint. This is the seq a consumer
+    /// Record that `owner`'s named projection has folded events **up to
+    /// `up_to_seq`**. Forward-only (a lower seq is a no-op), so an out-of-order or
+    /// retried consumer can never REGRESS a checkpoint. This is the seq a consumer
     /// actually processed — NOT the global max — so a paginated or slow consumer
     /// never skips the events it hasn't folded yet (review #114 B1).
-    async fn checkpoint_at(&self, name: &str, up_to_seq: i64) -> Result<()>;
-    /// Convenience: mark a named checkpoint as "everything so far is folded"
-    /// (records the current global max seq). Returns that seq. Use `checkpoint_at`
-    /// when a consumer folds only a bounded page.
-    async fn checkpoint(&self, name: &str) -> Result<i64>;
-    /// The seq a named checkpoint last reached, if any.
-    async fn checkpoint_seq(&self, name: &str) -> Result<Option<i64>>;
+    ///
+    /// OWNER-SCOPED: a checkpoint belongs to one owner's projection. Without the
+    /// owner, two owners using the same name shared one row and one side's
+    /// progress made the other skip events (review #126).
+    async fn checkpoint_at(&self, name: &str, owner: &str, up_to_seq: i64) -> Result<()>;
+    /// Convenience: mark `owner`'s named checkpoint as "everything of THIS
+    /// OWNER'S so far is folded" (records that owner's max seq, never the global
+    /// one). Returns that seq. Use `checkpoint_at` when a consumer folds only a
+    /// bounded page.
+    async fn checkpoint(&self, name: &str, owner: &str) -> Result<i64>;
+    /// The seq `owner`'s named checkpoint last reached, if any.
+    async fn checkpoint_seq(&self, name: &str, owner: &str) -> Result<Option<i64>>;
 }
 
 /// SQLite-backed event log. Shares the memory DB pool (see
@@ -351,14 +356,17 @@ impl EventStore for EventLog {
         rows.iter().map(Self::row_to_stored).collect()
     }
 
-    async fn checkpoint_at(&self, name: &str, up_to_seq: i64) -> Result<()> {
+    async fn checkpoint_at(&self, name: &str, owner: &str, up_to_seq: i64) -> Result<()> {
         // Forward-only: the guarded UPDATE only advances the checkpoint, so a
-        // retried or out-of-order consumer can never regress it.
+        // retried or out-of-order consumer can never regress it. Keyed by
+        // (scope_owner, name) so one owner's progress cannot move another's.
         sqlx::query(
-            "INSERT INTO mem_checkpoints (name, up_to_seq, at) VALUES (?, ?, ?)
-             ON CONFLICT(name) DO UPDATE SET up_to_seq = excluded.up_to_seq, at = excluded.at
+            "INSERT INTO mem_checkpoints (scope_owner, name, up_to_seq, at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(scope_owner, name) DO UPDATE SET
+                 up_to_seq = excluded.up_to_seq, at = excluded.at
                  WHERE excluded.up_to_seq > mem_checkpoints.up_to_seq",
         )
+        .bind(owner)
         .bind(name)
         .bind(up_to_seq)
         .bind(now_iso8601())
@@ -367,18 +375,23 @@ impl EventStore for EventLog {
         Ok(())
     }
 
-    async fn checkpoint(&self, name: &str) -> Result<i64> {
-        let max: i64 = sqlx::query("SELECT COALESCE(MAX(seq), 0) AS m FROM mem_events")
-            .fetch_one(&self.pool)
-            .await?
-            .get("m");
-        self.checkpoint_at(name, max).await?;
+    async fn checkpoint(&self, name: &str, owner: &str) -> Result<i64> {
+        // THIS OWNER's max seq, not the table's: a global MAX would bookmark one
+        // owner past another owner's events (review #126).
+        let max: i64 =
+            sqlx::query("SELECT COALESCE(MAX(seq), 0) AS m FROM mem_events WHERE scope_owner = ?")
+                .bind(owner)
+                .fetch_one(&self.pool)
+                .await?
+                .get("m");
+        self.checkpoint_at(name, owner, max).await?;
         Ok(max)
     }
 
-    async fn checkpoint_seq(&self, name: &str) -> Result<Option<i64>> {
+    async fn checkpoint_seq(&self, name: &str, owner: &str) -> Result<Option<i64>> {
         Ok(
-            sqlx::query("SELECT up_to_seq FROM mem_checkpoints WHERE name = ?")
+            sqlx::query("SELECT up_to_seq FROM mem_checkpoints WHERE scope_owner = ? AND name = ?")
+                .bind(owner)
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await?
@@ -466,14 +479,14 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_records_and_advances() {
         let log = log().await;
-        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), None);
+        assert_eq!(log.checkpoint_seq("proj", "u1").await.unwrap(), None);
         log.append(&ev("a", "u1", None, "msg")).await.unwrap();
-        let c1 = log.checkpoint("proj").await.unwrap();
-        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), Some(c1));
+        let c1 = log.checkpoint("proj", "u1").await.unwrap();
+        assert_eq!(log.checkpoint_seq("proj", "u1").await.unwrap(), Some(c1));
         log.append(&ev("b", "u1", None, "msg")).await.unwrap();
-        let c2 = log.checkpoint("proj").await.unwrap();
+        let c2 = log.checkpoint("proj", "u1").await.unwrap();
         assert!(c2 > c1);
-        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), Some(c2));
+        assert_eq!(log.checkpoint_seq("proj", "u1").await.unwrap(), Some(c2));
     }
 
     #[tokio::test]
@@ -502,8 +515,8 @@ mod tests {
             log.append(&ev(id, "u1", None, "msg")).await.unwrap();
         }
         // Fold only up to seq 2.
-        log.checkpoint_at("proj", 2).await.unwrap();
-        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), Some(2));
+        log.checkpoint_at("proj", "u1", 2).await.unwrap();
+        assert_eq!(log.checkpoint_seq("proj", "u1").await.unwrap(), Some(2));
         // The next incremental scan still sees c/d/e — nothing was skipped.
         let rest = log.scan(&EventQuery::owner("u1").after(2)).await.unwrap();
         assert_eq!(rest.len(), 3);
@@ -513,11 +526,81 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_at_is_forward_only() {
         let log = log().await;
-        log.checkpoint_at("proj", 10).await.unwrap();
-        log.checkpoint_at("proj", 3).await.unwrap(); // lower → no-op
-        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), Some(10));
-        log.checkpoint_at("proj", 20).await.unwrap(); // higher → advances
-        assert_eq!(log.checkpoint_seq("proj").await.unwrap(), Some(20));
+        log.checkpoint_at("proj", "u1", 10).await.unwrap();
+        log.checkpoint_at("proj", "u1", 3).await.unwrap(); // lower → no-op
+        assert_eq!(log.checkpoint_seq("proj", "u1").await.unwrap(), Some(10));
+        log.checkpoint_at("proj", "u1", 20).await.unwrap(); // higher → advances
+        assert_eq!(log.checkpoint_seq("proj", "u1").await.unwrap(), Some(20));
+    }
+
+    #[tokio::test]
+    async fn checkpoints_are_owner_scoped_same_name_does_not_collide() {
+        // Review #126: mem_checkpoints had NO owner column and the API took no
+        // owner, so two owners using the same checkpoint name shared ONE row —
+        // one side advancing made the other's incremental scan skip events.
+        let log = log().await;
+        for id in ["a1", "a2", "a3"] {
+            log.append(&ev(id, "alice", None, "msg")).await.unwrap();
+        }
+        log.append(&ev("b1", "bob", None, "msg")).await.unwrap();
+
+        // Both use the SAME projection name.
+        log.checkpoint_at("condenser", "alice", 3).await.unwrap();
+        assert_eq!(
+            log.checkpoint_seq("condenser", "bob").await.unwrap(),
+            None,
+            "alice's progress is invisible to bob"
+        );
+        log.checkpoint_at("condenser", "bob", 1).await.unwrap();
+        assert_eq!(
+            log.checkpoint_seq("condenser", "alice").await.unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            log.checkpoint_seq("condenser", "bob").await.unwrap(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_records_the_owners_max_not_the_global_max() {
+        // The second half of the same defect: checkpoint() used
+        // `MAX(seq) FROM mem_events` across ALL owners, so alice's bookmark could
+        // land past bob's events (or vice versa).
+        let log = log().await;
+        log.append(&ev("a1", "alice", None, "msg")).await.unwrap();
+        // bob appends many more events, pushing the GLOBAL max far ahead.
+        for id in ["b1", "b2", "b3", "b4"] {
+            log.append(&ev(id, "bob", None, "msg")).await.unwrap();
+        }
+        let alice_cp = log.checkpoint("condenser", "alice").await.unwrap();
+        let alice_max = log
+            .scan(&EventQuery::owner("alice"))
+            .await
+            .unwrap()
+            .last()
+            .map(|e| e.seq)
+            .unwrap();
+        assert_eq!(
+            alice_cp, alice_max,
+            "alice's checkpoint is her own max, not the table's"
+        );
+        // And it must NOT have jumped past bob's events.
+        let bob_max = log
+            .scan(&EventQuery::owner("bob"))
+            .await
+            .unwrap()
+            .last()
+            .map(|e| e.seq)
+            .unwrap();
+        assert!(alice_cp < bob_max, "global max would have been {bob_max}");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_empty_owner_is_rejected() {
+        let log = log().await;
+        let err = log.checkpoint_at("proj", "  ", 1).await.unwrap_err();
+        assert!(matches!(err, crate::MemoryError::Sqlx(_)), "{err}");
     }
 
     #[tokio::test]
