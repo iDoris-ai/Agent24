@@ -21,3 +21,11 @@ CREATE TRIGGER mem_assertions_fts_ai AFTER INSERT ON mem_assertions BEGIN
     INSERT INTO mem_assertions_fts (id, scope_owner, subject, predicate, object)
     VALUES (new.id, new.scope_owner, new.subject, new.predicate, new.object);
 END;
+
+-- BACKFILL existing assertions: the trigger only fires on FUTURE inserts, but
+-- this migration runs on live databases that already hold assertions (MD-3a
+-- shipped first). Without this, an upgraded instance would silently return zero
+-- hits for every historical belief — indistinguishable from "doesn't exist"
+-- (review #120 B1). Same statement as FtsRetriever::rebuild.
+INSERT INTO mem_assertions_fts (id, scope_owner, subject, predicate, object)
+SELECT id, scope_owner, subject, predicate, object FROM mem_assertions;

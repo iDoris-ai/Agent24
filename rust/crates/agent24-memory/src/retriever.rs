@@ -68,24 +68,20 @@ impl FtsRetriever {
     }
 }
 
-/// Turn free text into a safe FTS5 MATCH expression: each whitespace token is
-/// quoted as a literal phrase and the tokens are AND-ed. Quoting neutralizes FTS5
-/// operators (`"`, `*`, `:`, `(`, `AND`, `NEAR`, …) so arbitrary user input can
-/// never be a syntax error or an injected query. Returns `None` if there is no
-/// searchable token (empty / all-punctuation), so the caller returns no hits.
+/// Turn free text into a safe FTS5 MATCH expression: SPLIT the input on every
+/// non-alphanumeric character and quote each resulting term as a literal phrase,
+/// AND-ing them. Splitting (not stripping) MATCHES the `unicode61` tokenizer used
+/// by the index — the tokenizer breaks `e-mail` into `e`/`mail`, so the query
+/// must too, or the literal text from the ledger would never match (review #120
+/// B2). Quoting each term neutralizes FTS5 operators (`"`, `*`, `:`, `(`, `AND`,
+/// `NEAR`, …), so arbitrary user input can never be a syntax error or an injected
+/// query. Returns `None` if there is no searchable term (empty / all-punctuation),
+/// so the caller returns no hits.
 fn to_match_query(query: &str) -> Option<String> {
     let terms: Vec<String> = query
-        .split_whitespace()
-        .filter_map(|tok| {
-            // Keep only alphanumerics inside the phrase; a token that is pure
-            // punctuation contributes nothing.
-            let cleaned: String = tok.chars().filter(|c| c.is_alphanumeric()).collect();
-            if cleaned.is_empty() {
-                None
-            } else {
-                Some(format!("\"{cleaned}\""))
-            }
-        })
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{t}\""))
         .collect();
     if terms.is_empty() {
         None
@@ -266,27 +262,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_reproduces_the_index_deterministically() {
+    async fn rebuild_actually_repopulates_a_cleared_projection() {
+        // M1: prove rebuild DOES something. Clear the projection first — if it is
+        // not cleared, a no-op rebuild() would pass just as well (the review's
+        // `return Ok(())` mutation). Search must go 1 → 0 (cleared) → 1 (rebuilt).
         let (kv, r) = fixture().await;
         let l = kv.assertions();
         l.assert(&a("a1", "u1", "color", json!("blue")))
             .await
             .unwrap();
         let before = r.search("color", "u1", 10).await.unwrap();
-        // Drop everything from the projection and rebuild from the ledger.
+        assert_eq!(before.len(), 1);
+
+        sqlx::query("DELETE FROM mem_assertions_fts")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        assert!(
+            r.search("color", "u1", 10).await.unwrap().is_empty(),
+            "projection is empty after the clear"
+        );
+
         r.rebuild().await.unwrap();
         let after = r.search("color", "u1", 10).await.unwrap();
-        assert_eq!(before, after, "rebuild is deterministic");
-        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after, before,
+            "rebuild reproduces the index deterministically"
+        );
+        assert_eq!(after.len(), 1, "rebuild is not a no-op");
+    }
+
+    #[tokio::test]
+    async fn punctuated_text_is_found_by_its_literal_form() {
+        // B2: the ledger holds `e-mail`, `well-being`, an apostrophe. Searching
+        // the SAME literal text must find them (the sanitizer must split, not
+        // strip). Before the fix these were silent zero-hits.
+        let (kv, r) = fixture().await;
+        let l = kv.assertions();
+        l.assert(&a("a1", "u1", "e-mail", json!("user@example.com")))
+            .await
+            .unwrap();
+        l.assert(&a("a2", "u1", "well-being", json!("don't overspend")))
+            .await
+            .unwrap();
+        assert_eq!(r.search("e-mail", "u1", 10).await.unwrap().len(), 1);
+        assert_eq!(
+            r.search("user@example.com", "u1", 10).await.unwrap().len(),
+            1
+        );
+        assert_eq!(r.search("well-being", "u1", 10).await.unwrap().len(), 1);
+        assert_eq!(r.search("don't", "u1", 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_assertions_that_predate_the_index() {
+        // B1: assertions written before 0005 (here: to a DB, then the index
+        // emptied to simulate the pre-0005 state) must be searchable after a
+        // rebuild — the same recovery the migration's backfill performs on
+        // upgrade. (A pure migration-path test needs a fresh file; this exercises
+        // the identical INSERT...SELECT that 0005 runs.)
+        let (kv, r) = fixture().await;
+        kv.assertions()
+            .assert(&a("old", "u1", "legacy fact", json!("kept")))
+            .await
+            .unwrap();
+        // Simulate "index did not exist when this row was written".
+        sqlx::query("DELETE FROM mem_assertions_fts")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        assert!(r.search("legacy", "u1", 10).await.unwrap().is_empty());
+        r.rebuild().await.unwrap(); // == 0005's backfill statement
+        assert_eq!(r.search("legacy", "u1", 10).await.unwrap().len(), 1);
     }
 
     #[test]
-    fn to_match_query_quotes_terms_and_drops_empties() {
+    fn to_match_query_splits_like_the_tokenizer_and_drops_empties() {
         assert_eq!(
             to_match_query("hello world"),
             Some("\"hello\" \"world\"".to_owned())
         );
         assert_eq!(to_match_query("  spaced  "), Some("\"spaced\"".to_owned()));
+        // B2: split on punctuation like the unicode61 tokenizer does.
+        assert_eq!(to_match_query("e-mail"), Some("\"e\" \"mail\"".to_owned()));
+        assert_eq!(
+            to_match_query("user@example.com"),
+            Some("\"user\" \"example\" \"com\"".to_owned())
+        );
         assert_eq!(to_match_query(""), None);
         assert_eq!(to_match_query("*()\""), None);
     }
