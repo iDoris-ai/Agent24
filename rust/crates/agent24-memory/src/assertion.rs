@@ -189,7 +189,10 @@ impl AssertionLedger {
         Self { pool }
     }
 
-    fn row_to_assertion(row: &sqlx::sqlite::SqliteRow) -> Result<Assertion> {
+    /// Build an [`Assertion`] from a row selecting all its columns. `pub(crate)`
+    /// so the MD-3b retriever can reuse it when joining the FTS projection back to
+    /// the ledger.
+    pub(crate) fn row_to_assertion(row: &sqlx::sqlite::SqliteRow) -> Result<Assertion> {
         Ok(Assertion {
             id: row.get("id"),
             scope: serde_json::from_str(&row.get::<String, _>("scope"))?,

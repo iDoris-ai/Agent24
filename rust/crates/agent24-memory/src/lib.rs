@@ -15,6 +15,7 @@ pub mod eval;
 pub mod event;
 pub mod reconcile;
 pub mod replay;
+pub mod retriever;
 pub mod session;
 
 use std::path::Path;
@@ -116,6 +117,12 @@ impl KvStore {
     /// bi-temporal semantic authority shares the KV store's pool.
     pub fn assertions(&self) -> assertion::AssertionLedger {
         assertion::AssertionLedger::new(self.pool.clone())
+    }
+
+    /// An [`retriever::FtsRetriever`] over the SAME database file — MD-3b's
+    /// full-text projection over the assertion ledger.
+    pub fn retriever(&self) -> retriever::FtsRetriever {
+        retriever::FtsRetriever::new(self.pool.clone())
     }
 
     /// Upsert a raw JSON value.
