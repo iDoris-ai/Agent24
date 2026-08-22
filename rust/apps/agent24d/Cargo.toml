@@ -23,6 +23,7 @@ agent24-tools = { path = "../../crates/agent24-tools" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
 http-body-util = "0.1"
 rand = "0.9"
 serde = { workspace = true }

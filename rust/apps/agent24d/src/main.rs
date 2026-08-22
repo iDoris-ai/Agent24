@@ -8,6 +8,7 @@ mod domain;
 mod events;
 mod mcp;
 mod os_config;
+mod os_routes;
 mod overrides;
 mod routes;
 mod runs;

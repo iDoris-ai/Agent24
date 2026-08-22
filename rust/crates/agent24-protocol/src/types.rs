@@ -34,6 +34,76 @@ pub struct Model {
     pub loaded: bool,
 }
 
+// ── Domain OS registry (M-E / ME-2) ──────────────────────────────────────────
+
+/// One domain OS, as `agent24 os list` sees it.
+///
+/// It carries TWO states on purpose. `enabled` is what the config says now;
+/// `state` is what the running daemon actually did at startup. They diverge the
+/// moment someone toggles a module, because routes are built once at startup —
+/// and hiding that divergence would leave a user staring at a module that says
+/// "enabled" while every request 503s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DomainOsView {
+    pub name: String,
+    /// `/api/v1/<name>`, always derived from the kernel's CATALOGUE name — which
+    /// exists before any module does. A constructed module whose manifest states a
+    /// different name is refused rather than routed, so the two can never disagree
+    /// on a mounted module.
+    pub namespace: String,
+    pub version: String,
+    /// What `os.json` says right now.
+    pub enabled: bool,
+    /// What the RUNNING daemon did with it. Open enum:
+    /// `mounted` | `disabled` | `degraded` | `refused`.
+    pub state: String,
+    /// Why, when there is a reason worth acting on — a degradation or a refusal.
+    /// Absent for `mounted`, and for `disabled`, whose reason is simply that the
+    /// user said so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Kernel capabilities the module actually GOT: the intersection of what its
+    /// manifest asked for and what the kernel offers.
+    ///
+    /// EMPTY for anything that did not mount, in every case: a module that was
+    /// never constructed, one that was refused, and one that failed to open its
+    /// store all HOLD nothing — the last had grants computed and then never
+    /// received a `KernelCtx`. Empty means "holds nothing", not "not known".
+    #[serde(default)]
+    pub granted: Vec<String>,
+    /// Declared models the daemon could not find. Empty when satisfied, when
+    /// nothing was declared, or when the check could not run — `resources` says
+    /// which.
+    #[serde(default)]
+    pub missing_models: Vec<String>,
+    /// Open enum: `ok` | `missing` | `unknown` | `not_checked`.
+    pub resources: String,
+    /// The registry has CHANGED since the daemon mounted: this module will only
+    /// pick the change up on the next start. Deliberately not "it is enabled but
+    /// not running" — a module that is enabled and merely unhealthy has no pending
+    /// change, and `detail` is what the user should act on there.
+    pub restart_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DomainOsList {
+    pub modules: Vec<DomainOsView>,
+    /// A problem with the REGISTRY itself rather than with any one module — an
+    /// entry that disables something this build does not provide, say.
+    ///
+    /// Reported separately because it is not a module's fault and no module's
+    /// `restart_required` can express it: restarting changes nothing until the file
+    /// is fixed, so this is the one instruction that helps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_error: Option<String>,
+}
+
+/// Body of `PATCH /api/v1/os/{name}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DomainOsUpdate {
+    pub enabled: bool,
+}
+
 // ── Errors (SPEC-002 §5) ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -34,9 +34,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OsConfig {
     /// What to do with a module the file does not mention. Defaults to
@@ -52,7 +52,7 @@ pub struct OsConfig {
 }
 
 /// What an UNLISTED module gets.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultPolicy {
     /// Anything not named in the file runs. The compatible default: nobody has an
@@ -66,7 +66,7 @@ pub enum DefaultPolicy {
     Disabled,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModuleEntry {
     /// Set false to keep the entry in the file without mounting the module —
@@ -78,6 +78,41 @@ struct ModuleEntry {
 
 fn default_true() -> bool {
     true
+}
+
+/// An exclusive, cross-process lock over the registry file.
+///
+/// `fs2` on a dedicated lock file — the same primitive the daemon singleton uses
+/// (`state_file::try_acquire_singleton`), for the same reason: it is the only
+/// kind that still holds when the second writer is a different PROCESS. Released
+/// on drop, and by the OS if the holder dies, so a crashed writer cannot wedge
+/// the registry.
+///
+/// It BLOCKS rather than failing fast. The critical section is one small read and
+/// one small write; making a user re-run `agent24 os disable` because another
+/// toggle was mid-flight would be worse than waiting a few milliseconds.
+struct ConfigLock(std::fs::File);
+
+impl ConfigLock {
+    fn acquire(dir: &Path) -> Result<Self, String> {
+        use fs2::FileExt;
+        let path = dir.join("os.json.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        file.lock_exclusive()
+            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -115,6 +150,117 @@ impl OsConfig {
     /// Names the file mentions. Used to report entries no build provides.
     pub fn named(&self) -> impl Iterator<Item = &str> {
         self.modules.keys().map(String::as_str)
+    }
+
+    /// Record a decision for `name` and write the file.
+    ///
+    /// The whole load-modify-write runs under an EXCLUSIVE, CROSS-PROCESS lock,
+    /// and that is not belt-and-braces. An earlier version justified a lock-free
+    /// write with "the daemon is a singleton", which is false twice over: axum
+    /// handlers run concurrently, so two PATCHes in ONE daemon can both read the
+    /// old file and the second silently drops the first; and ephemeral daemons are
+    /// deliberately exempt from the singleton lock, so two CLI invocations with no
+    /// persistent daemon are two PROCESSES writing the same file. Only a file lock
+    /// covers both, which is why this is `fs2` rather than a `Mutex`.
+    ///
+    /// The write itself is temp-file-plus-rename, because this file's EMPTY state
+    /// means "enable everything": a crash partway through a naive
+    /// truncate-and-write would silently turn every disabled module back on.
+    ///
+    /// Returns the config as written.
+    pub fn set_enabled(path: &Path, name: &str, enabled: bool) -> Result<Self, String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        let _guard = ConfigLock::acquire(parent)?;
+
+        let mut cfg = Self::load(path)?;
+        cfg.modules.insert(name.to_owned(), ModuleEntry { enabled });
+        cfg.write_atomically(path, parent)?;
+        Ok(cfg)
+    }
+
+    /// Caller must hold [`ConfigLock`].
+    fn write_atomically(&self, path: &Path, parent: &Path) -> Result<(), String> {
+        use std::io::Write;
+
+        let body = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("cannot serialize os.json: {e}"))?;
+
+        // Beside the destination so the rename stays on one filesystem, and
+        // `create_new` so a file already at that path — or a symlink planted at a
+        // predictable name — is an error rather than something we write THROUGH,
+        // truncating whatever it points at.
+        let tmp = parent.join(format!("os.json.writing.{}", std::process::id()));
+        // Two guards, doing DIFFERENT jobs — worth saying, because a test that
+        // conflates them proves neither:
+        //
+        // - the clearing below handles a leftover from an interrupted write. A
+        //   pid-keyed name makes that hazard worse exactly where it matters: a
+        //   long-lived daemon keeps one pid, so without this every later PATCH
+        //   would fail on `create_new` with no path to recovery. It is safe because
+        //   the config lock is held, so nothing else can be mid-write to this name;
+        //   and it removes a symlink rather than following it, so a planted link's
+        //   target is untouched.
+        // - `create_new` below is what closes the gap BETWEEN that removal and the
+        //   open. It is not decoration, but it is also not what a test can easily
+        //   reach now that the clearing runs first.
+        // `symlink_metadata`, not `exists`: the latter FOLLOWS the link, so a
+        // DANGLING symlink at this path would look absent, survive the clearing,
+        // and then fail `create_new` forever.
+        if std::fs::symlink_metadata(&tmp).is_ok() {
+            tracing::warn!(
+                "removing a stale {} left by an earlier interrupted write",
+                tmp.display()
+            );
+            std::fs::remove_file(&tmp)
+                .map_err(|e| format!("cannot clear stale {}: {e}", tmp.display()))?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+
+        // Every failure past this point removes the temp file. Leaving a stale one
+        // behind would make the NEXT write fail on `create_new`, turning one
+        // transient error into a permanently stuck registry.
+        let written = (|| -> std::io::Result<()> {
+            f.write_all(body.as_bytes())?;
+            f.write_all(b"\n")?;
+            // The CONTENTS must be on disk before the rename publishes the name.
+            // Syncing only the directory would publish a name pointing at data that
+            // has not landed.
+            f.sync_all()
+        })();
+        drop(f);
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot write {}: {e}", tmp.display()));
+        }
+
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot replace {}: {e}", path.display()));
+        }
+        // And the directory entry, so a power loss cannot lose a change the user
+        // was told had been applied. PROPAGATED, not swallowed: reporting success
+        // for a write that may not survive a reboot is the same class of lie the
+        // atomic rename exists to avoid.
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(parent).map_err(|e| {
+                format!(
+                    "written, but cannot open {} to fsync it: {e}",
+                    parent.display()
+                )
+            })?;
+            dir.sync_all()
+                .map_err(|e| format!("written, but fsync of {} failed: {e}", parent.display()))?;
+        }
+        Ok(())
     }
 
     /// Entries that say `enabled: false` for a name nothing provides, AND that
@@ -156,6 +302,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Anything matching the production temp pattern, whatever pid it carries.
+    fn leftover_temps(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("os.json.writing"))
+            .collect()
+    }
 
     fn write(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join("os.json");
@@ -227,6 +383,175 @@ mod tests {
         assert!(cfg.is_enabled("cos72"), "an entry defaults to enabled");
         assert!(cfg.is_enabled("never-mentioned"));
         assert_eq!(cfg.named().collect::<Vec<_>>(), vec!["cos72", "sin90"]);
+    }
+
+    #[test]
+    fn set_enabled_round_trips_and_leaves_no_temp_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+
+        // From nothing at all — the first toggle a user ever makes.
+        let cfg = OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        assert!(!cfg.is_enabled("sin90"));
+        assert!(!OsConfig::load(&p).unwrap().is_enabled("sin90"));
+        // Match what production actually names its temp (`os.json.writing.<pid>`):
+        // an earlier version of this assertion looked for `os.json.writing`, which
+        // no code has ever created, so it could not have caught a leak.
+        assert!(
+            leftover_temps(tmp.path()).is_empty(),
+            "no temp file may survive a successful write: {:?}",
+            leftover_temps(tmp.path())
+        );
+
+        // And back, without disturbing other entries.
+        OsConfig::set_enabled(&p, "cos72", false).unwrap();
+        let cfg = OsConfig::set_enabled(&p, "sin90", true).unwrap();
+        assert!(cfg.is_enabled("sin90"));
+        assert!(!cfg.is_enabled("cos72"), "the other entry survived");
+        assert_eq!(
+            OsConfig::load(&p).unwrap().named().collect::<Vec<_>>(),
+            vec!["cos72", "sin90"]
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_lose_an_update() {
+        // The failure the lock exists to prevent, exercised for real: without it
+        // both threads read the same starting file and the second rename silently
+        // discards the first's entry. Threads rather than tasks, because the lock
+        // is a BLOCKING file lock — the thing under test is that two OS-level
+        // writers serialize.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        std::fs::write(&p, "{}").unwrap();
+
+        let names = ["alpha", "beta", "gamma", "delta"];
+        std::thread::scope(|scope| {
+            for n in names {
+                let p = p.clone();
+                scope.spawn(move || {
+                    OsConfig::set_enabled(&p, n, false).unwrap();
+                });
+            }
+        });
+
+        let cfg = OsConfig::load(&p).unwrap();
+        for n in names {
+            assert!(!cfg.is_enabled(n), "{n} lost its update");
+        }
+        assert!(
+            leftover_temps(tmp.path()).is_empty(),
+            "and no temp file was left behind"
+        );
+    }
+
+    #[test]
+    fn a_stale_temp_from_an_interrupted_write_does_not_wedge_the_registry() {
+        // `create_new` is what stops a write following a planted symlink, and the
+        // price is that a leftover temp makes the NEXT write fail. With a pid-keyed
+        // name a long-lived daemon keeps failing forever, which is the state the
+        // guard's own comment says it exists to avoid — so the leftover is cleared.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        let stale = tmp
+            .path()
+            .join(format!("os.json.writing.{}", std::process::id()));
+        std::fs::write(&stale, b"garbage from a crashed write").unwrap();
+
+        let cfg = OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        assert!(!cfg.is_enabled("sin90"));
+        assert!(leftover_temps(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_temp_path_is_removed_not_followed() {
+        // Named for what it PROVES. An earlier version of this test claimed to pin
+        // `create_new` as load-bearing, and it did not: the staleness clearing runs
+        // first and removes the link, so mutating `create_new` away left the test
+        // green. Mutating the CLEARING away is what breaks it.
+        //
+        // `remove_file` unlinks the symlink itself, never its target — which is why
+        // the victim below survives.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(
+            &victim,
+            tmp.path()
+                .join(format!("os.json.writing.{}", std::process::id())),
+        )
+        .unwrap();
+
+        OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not touch",
+            "the symlink target must not have been written through"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&p)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "and os.json must be a real file, not a link"
+        );
+        assert!(!OsConfig::load(&p).unwrap().is_enabled("sin90"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_the_temp_path_does_not_wedge_the_registry() {
+        // The case `exists()` cannot see: it follows the link, so a link to nothing
+        // reads as absent, survives the clearing, and then fails `create_new` on
+        // every subsequent write — permanently, for a daemon that keeps its pid.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("os.json");
+        std::os::unix::fs::symlink(
+            tmp.path().join("nothing-here"),
+            tmp.path()
+                .join(format!("os.json.writing.{}", std::process::id())),
+        )
+        .unwrap();
+
+        OsConfig::set_enabled(&p, "sin90", false).unwrap();
+        assert!(!OsConfig::load(&p).unwrap().is_enabled("sin90"));
+        assert!(
+            !tmp.path().join("nothing-here").exists(),
+            "and nothing was created through the link"
+        );
+        assert!(leftover_temps(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn set_enabled_preserves_the_default_policy() {
+        // Losing this on a write would silently flip an allow-list back to
+        // allow-everything — the exact failure the policy exists to prevent.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), r#"{"default": "disabled", "domainOs": {}}"#);
+        OsConfig::set_enabled(&p, "sin90", true).unwrap();
+        let cfg = OsConfig::load(&p).unwrap();
+        assert!(cfg.is_enabled("sin90"));
+        assert!(
+            !cfg.is_enabled("something-else"),
+            "the allow-list policy must survive the write"
+        );
+    }
+
+    #[test]
+    fn a_write_refuses_rather_than_truncating_an_unreadable_file() {
+        // The file's EMPTY state means "enable everything", so a partial write
+        // would silently turn every disabled module back on. `set_enabled` reads
+        // first and fails without touching anything.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), "{ not json");
+        assert!(OsConfig::set_enabled(&p, "sin90", false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "{ not json",
+            "the unreadable file is left exactly as found"
+        );
     }
 
     #[test]
