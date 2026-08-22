@@ -17,6 +17,7 @@ pub mod reconcile;
 pub mod replay;
 pub mod retriever;
 pub mod session;
+pub mod writer;
 
 use std::path::Path;
 use std::str::FromStr;
@@ -123,6 +124,13 @@ impl KvStore {
     /// full-text projection over the assertion ledger.
     pub fn retriever(&self) -> retriever::FtsRetriever {
         retriever::FtsRetriever::new(self.pool.clone())
+    }
+
+    /// A [`writer::WriteGate`] over the SAME database file — MD-4's governance
+    /// write-gate, committing into the assertion ledger and auditing into the
+    /// event log.
+    pub fn write_gate(&self) -> writer::WriteGate<assertion::AssertionLedger> {
+        writer::WriteGate::new(self.assertions(), self.events())
     }
 
     /// Upsert a raw JSON value.
