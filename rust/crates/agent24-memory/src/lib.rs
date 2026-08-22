@@ -69,6 +69,20 @@ pub enum MemoryError {
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
+/// One durably recorded domain-OS memory partition.
+///
+/// See `mem_os_partitions` (migration 0012) for why each field is kept, and in
+/// particular why `module_name` and `first_seen_at` are write-once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsPartitionRow {
+    pub owner_key: String,
+    pub key_version: String,
+    pub logical_user: String,
+    pub module_name: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+}
+
 /// L0: a namespaced JSON key-value store over SQLite (WAL, 5s busy timeout).
 #[derive(Clone)]
 pub struct KvStore {
@@ -171,6 +185,70 @@ impl KvStore {
         embedder: E,
     ) -> vector::VectorRetriever<E> {
         vector::VectorRetriever::new(self.pool.clone(), embedder)
+    }
+
+    /// Record that `owner_key` is the memory partition of `(user, module)`, and
+    /// that it was seen now.
+    ///
+    /// Idempotent and INSERT-OR-UPDATE-LAST-SEEN: `first_seen_at` and
+    /// `module_name` are written once and never overwritten, because their whole
+    /// value is saying what a partition originally was. A module rename must
+    /// leave the old row intact — that row is the only thing that can tell a
+    /// later migration what `…os:calendar` used to mean.
+    ///
+    /// Kernel-only in practice: nothing a domain OS holds can reach it.
+    pub async fn record_os_partition(
+        &self,
+        owner_key: &str,
+        key_version: &str,
+        user: &str,
+        module: &str,
+    ) -> Result<()> {
+        let now = now_iso8601();
+        sqlx::query(
+            "INSERT INTO mem_os_partitions
+                 (owner_key, key_version, logical_user, module_name,
+                  first_seen_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(owner_key) DO UPDATE SET last_seen_at = excluded.last_seen_at",
+        )
+        .bind(owner_key)
+        .bind(key_version)
+        .bind(user)
+        .bind(module)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every partition ever recorded for `user`, oldest first.
+    ///
+    /// The answer an export or erase path needs — INCLUDING partitions belonging
+    /// to modules that are disabled, uninstalled or renamed, which is why it
+    /// reads the table rather than whatever mounted this run.
+    pub async fn os_partitions_for(&self, user: &str) -> Result<Vec<OsPartitionRow>> {
+        let rows = sqlx::query(
+            "SELECT owner_key, key_version, logical_user, module_name,
+                    first_seen_at, last_seen_at
+             FROM mem_os_partitions WHERE logical_user = ?
+             ORDER BY first_seen_at ASC, owner_key ASC",
+        )
+        .bind(user)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| OsPartitionRow {
+                owner_key: r.get("owner_key"),
+                key_version: r.get("key_version"),
+                logical_user: r.get("logical_user"),
+                module_name: r.get("module_name"),
+                first_seen_at: r.get("first_seen_at"),
+                last_seen_at: r.get("last_seen_at"),
+            })
+            .collect())
     }
 
     /// Upsert a raw JSON value.

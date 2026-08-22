@@ -60,7 +60,12 @@ use axum::Router;
 /// nothing. The list grows as `KernelCtx` gains handles — `Models`, `Scheduler`,
 /// `Policy` and `Memory` are deliberately absent because there is nothing to hand
 /// out yet, and granting a capability with no handle would be a lie.
-const KERNEL_GRANTS: &[Capability] = &[Capability::Events];
+///
+/// `Memory` joined the list in F1, when `KernelCtx::memory` gained a handle to
+/// give: a module that asks for it gets a view of the shared memory base scoped
+/// to ITS OWN partition (see [`crate::os_memory`]). Before that handle existed,
+/// two domain OSes under one user shared that base.
+const KERNEL_GRANTS: &[Capability] = &[Capability::Events, Capability::Memory];
 
 /// Names a module may not take, because the kernel already serves
 /// `/api/v1/<segment>` and axum PANICS on an exact route overlap:
@@ -122,14 +127,45 @@ impl EventBroadcast for HubBroadcast {
     }
 }
 
-/// The kernel context handed to one module.
-struct DaemonCtx {
-    sink: Option<EventSink>,
+/// What the kernel needs in order to lend a module a memory partition: the
+/// authenticated user, and the base to lend from.
+///
+/// Bundled so `mount_all` cannot be handed one without the other, and so the
+/// whole capability is `Option` at the call site — a daemon whose memory base
+/// failed to open lends nothing rather than half a handle.
+pub struct MemoryLease {
+    pub user: String,
+    pub kv: agent24_memory::KvStore,
 }
 
-impl KernelCtx for DaemonCtx {
-    fn events(&self) -> Option<&EventSink> {
-        self.sink.as_ref()
+impl MemoryLease {
+    /// Lend `manifest`'s partition — or NOTHING, if it could not be recorded.
+    ///
+    /// The catalog write is a precondition, not bookkeeping done afterwards. A
+    /// partition the kernel lends but never records is orphaned data: rows under
+    /// a NUL-containing owner key that no later export, erase or key-version
+    /// migration can attribute to a user or a module. Refusing the capability
+    /// costs the module its memory for this run; lending it anyway costs the
+    /// user their ability to find the data again.
+    async fn lend(
+        &self,
+        manifest: &agent24_domain::DomainOsManifest,
+        catalogue: &mut crate::os_memory::OsMemoryCatalog,
+    ) -> Option<Arc<crate::os_memory::OsScopedMemory>> {
+        match catalogue.record(&self.user, manifest, &self.kv).await {
+            Ok(partition) => Some(Arc::new(crate::os_memory::OsScopedMemory::new(
+                &partition, &self.kv,
+            ))),
+            Err(e) => {
+                tracing::error!(
+                    module = manifest.name(),
+                    error = %e,
+                    "could not record the module's memory partition; withholding the \
+                     memory capability rather than creating rows nothing can attribute"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -433,9 +469,13 @@ pub async fn mount_all(
     events: &crate::events::EventsHub,
     registry: std::result::Result<&crate::os_config::OsConfig, &str>,
     inventory: &dyn ModelInventory,
-) -> (Router, Vec<MountReport>) {
+    memory: Option<&MemoryLease>,
+) -> (Router, Vec<MountReport>, crate::os_memory::OsMemoryCatalog) {
     let mut app = Router::new();
     let mut reports = Vec::new();
+    // Recorded for every module that is HANDED a partition, so a future export or
+    // erase path has an explicit list instead of prefix-matching storage keys.
+    let mut partitions = crate::os_memory::OsMemoryCatalog::default();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
 
     // A name in the file that no build provides is a typo, and the two halves of
@@ -702,7 +742,25 @@ pub async fn mount_all(
                 Arc::new(HubBroadcast(events.clone())) as Arc<dyn EventBroadcast>,
             )
         });
-        let ctx: Arc<dyn KernelCtx> = Arc::new(DaemonCtx { sink });
+        // Same shape for memory: the HANDLE is the capability. A module that did
+        // not ask for it, or that the kernel has no base to lend, gets `None` —
+        // not an unusable object it has to remember to check.
+        let scoped = match (granted.has(Capability::Memory), memory) {
+            (true, Some(lease)) => lease.lend(manifest, &mut partitions).await,
+            _ => None,
+        };
+        // `granted` must name what the module ACTUALLY holds, not what policy
+        // would have allowed — the invariant #134 established for every other
+        // capability. A lease refused because its partition could not be recorded
+        // is a withheld capability, so it must not still be reported as granted.
+        let granted_names: Vec<String> = granted_names
+            .into_iter()
+            .filter(|c| c != Capability::Memory.as_str() || scoped.is_some())
+            .collect();
+        let ctx: Arc<dyn KernelCtx> = Arc::new(crate::os_memory::MemoryCtx {
+            sink,
+            memory: scoped,
+        });
 
         tracing::info!("domain OS {name:?} mounted at {namespace} (grants: {granted_names:?})");
         app = app.nest(&namespace, module.routes(ctx));
@@ -717,7 +775,7 @@ pub async fn mount_all(
         });
     }
 
-    (app, reports)
+    (app, reports, partitions)
 }
 
 #[cfg(test)]
@@ -780,7 +838,9 @@ mod tests {
         root: &Path,
         hub: &crate::events::EventsHub,
     ) -> (Router, Vec<MountReport>) {
-        mount_all(catalogue, root, hub, Ok(&all_enabled()), &no_models()).await
+        let (app, reports, _) =
+            mount_all(catalogue, root, hub, Ok(&all_enabled()), &no_models(), None).await;
+        (app, reports)
     }
 
     fn manifest_yaml(name: &str, kind: &str) -> String {
@@ -799,6 +859,9 @@ mod tests {
         manifest: DomainOsManifest,
         fail_open: bool,
         opened_in: std::sync::Mutex<Option<std::path::PathBuf>>,
+        /// The context the mounter handed over, so a test can check WHAT was lent
+        /// rather than only that mounting succeeded.
+        ctx: std::sync::Mutex<Option<Arc<dyn KernelCtx>>>,
         /// Whether the mounter ever ASKED this module for routes. A module that
         /// failed to open must never be asked — otherwise "the kernel serves the
         /// 503" would be indistinguishable from "the module's routes happen not to
@@ -818,6 +881,7 @@ mod tests {
                 manifest: DomainOsManifest::from_yaml(yaml).unwrap(),
                 fail_open,
                 opened_in: std::sync::Mutex::new(None),
+                ctx: std::sync::Mutex::new(None),
                 routes_built: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -826,6 +890,9 @@ mod tests {
         }
         fn opened(&self) -> Option<std::path::PathBuf> {
             self.opened_in.lock().unwrap().clone()
+        }
+        fn ctx(&self) -> Option<Arc<dyn KernelCtx>> {
+            self.ctx.lock().unwrap().clone()
         }
     }
 
@@ -844,6 +911,7 @@ mod tests {
         fn routes(&self, ctx: Arc<dyn KernelCtx>) -> Router {
             self.routes_built
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.ctx.lock().unwrap() = Some(ctx.clone());
             let name = self.manifest.name().to_owned();
             Router::new().route(
                 "/ping",
@@ -1266,6 +1334,133 @@ mod tests {
         assert!(rx.try_recv().is_err(), "and nothing reached the hub");
     }
 
+    // ---------- F1: memory partitions handed out by the MOUNTER ----------
+
+    #[tokio::test]
+    async fn the_mounter_lends_each_module_its_own_memory_partition() {
+        // The unit tests in `os_memory` prove two handles are isolated. This proves
+        // the MOUNTER actually hands out such handles — that the capability is
+        // wired, keyed per module, and recorded in the catalog.
+        use agent24_domain::memory::Remember;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let lease = MemoryLease {
+            user: "alice".to_owned(),
+            kv: kv.clone(),
+        };
+
+        // Both modules ask for memory in their manifests.
+        let want_mem = |name: &str| {
+            let yaml = manifest_yaml(name, "in_process_crate").replace(
+                "kernel_capabilities: [events]",
+                "kernel_capabilities: [memory]",
+            );
+            FakeModule::from_yaml(&yaml, false)
+        };
+        let a = want_mem("alpha");
+        let b = want_mem("beta");
+        let (_, reports, partitions) = mount_all(
+            &[entry(a.clone()), entry(b.clone())],
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            Some(&lease),
+        )
+        .await;
+
+        assert!(reports.iter().all(|r| r.outcome == MountOutcome::Mounted));
+        assert!(
+            reports
+                .iter()
+                .all(|r| r.granted == vec!["memory".to_owned()])
+        );
+
+        // Two partitions, recorded — so a future export/erase path has a list
+        // rather than a prefix match over keys containing NUL.
+        assert_eq!(partitions.partitions().len(), 2);
+        // From the DURABLE table, which is what a later export/erase path reads —
+        // not from this run's inventory, which cannot see a disabled or renamed
+        // module's leftovers.
+        let rows = crate::os_memory::OsMemoryCatalog::durable_for(&lease.kv, "alice")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(
+            rows[0].owner_key, rows[1].owner_key,
+            "one partition per module, not per user"
+        );
+
+        // And the handles the mounter actually built are isolated from each other.
+        let ctx_a = a.ctx().unwrap();
+        let ctx_b = b.ctx().unwrap();
+        let ma = ctx_a.memory().unwrap();
+        let mb = ctx_b.memory().unwrap();
+        ma.remember(Remember::new("note", serde_json::Map::new()))
+            .await
+            .unwrap();
+        assert_eq!(ma.recent(10).await.unwrap().len(), 1);
+        assert!(
+            mb.recent(10).await.unwrap().is_empty(),
+            "the other module must see nothing the mounter gave the first one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_that_did_not_ask_for_memory_gets_no_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let lease = MemoryLease {
+            user: "alice".to_owned(),
+            kv,
+        };
+        // `manifest_yaml` asks for events only.
+        let m = FakeModule::new("quiet");
+        let (_, _, partitions) = mount_all(
+            &[entry(m.clone())],
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            Some(&lease),
+        )
+        .await;
+        assert!(m.ctx().unwrap().memory().is_none());
+        assert!(
+            partitions.partitions().is_empty(),
+            "and no partition was recorded for a module that never got one"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_memory_base_means_no_handle_rather_than_a_broken_one() {
+        // A daemon whose memory base failed to open lends nothing. The alternative
+        // — a handle that errors on every call — would make every module carry a
+        // failure path for a capability it was told it had.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let yaml = manifest_yaml("hungry", "in_process_crate").replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [memory]",
+        );
+        let m = FakeModule::from_yaml(&yaml, false);
+        let (_, reports, partitions) = mount_all(
+            &[entry(m.clone())],
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Mounted, "it still mounts");
+        assert!(m.ctx().unwrap().memory().is_none());
+        assert!(partitions.partitions().is_empty());
+    }
+
     // ---------- ME-2: the registry ----------
 
     fn config_from(json: &str) -> crate::os_config::OsConfig {
@@ -1283,12 +1478,13 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("offswitch");
         let cfg = config_from(r#"{"domainOs": {"offswitch": {"enabled": false}}}"#);
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
 
@@ -1341,12 +1537,13 @@ mod tests {
         let token = st.token.to_string();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = config_from(r#"{"domainOs": {"offswitch": {"enabled": false}}}"#);
-        let (modules, _) = mount_all(
+        let (modules, _, _) = mount_all(
             &[entry(FakeModule::new("offswitch"))],
             tmp.path(),
             &st.events,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
         let app = crate::server::build_router_with_modules(st, modules);
@@ -1381,12 +1578,13 @@ mod tests {
         let off = FakeModule::new("shared");
         let squatter = FakeModule::new("shared");
         let cfg = config_from(r#"{"domainOs": {"shared": {"enabled": false}}}"#);
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(off), entry(squatter.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
 
@@ -1411,12 +1609,13 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let a = FakeModule::new("alpha");
         let b = FakeModule::new("beta");
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(a.clone()), entry(b.clone())],
             tmp.path(),
             &hub,
             Err("os.json is not valid: expected value at line 1"),
             &no_models(),
+            None,
         )
         .await;
 
@@ -1467,12 +1666,13 @@ mod tests {
             manifest_yaml("broken", "in_process_crate")
         );
         let m = FakeModule::from_yaml(&yaml, true);
-        let (_, reports) = mount_all(
+        let (_, reports, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &TestModels(Ok(vec!["something-else".to_owned()])),
+            None,
         )
         .await;
         assert!(matches!(reports[0].outcome, MountOutcome::Degraded(_)));
@@ -1495,12 +1695,13 @@ mod tests {
             r#"{"default": "disabled",
                 "domainOs": {"sin09": {"enabled": false}, "sin90": {"enabled": true}}}"#,
         );
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(FakeModule::new("sin90"))],
             tmp.path(),
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
         assert_eq!(
@@ -1523,7 +1724,7 @@ mod tests {
         // `someone-else` is a REAL module here, so disabling it is a legitimate
         // config rather than the typo case guarded above.
         let cfg = config_from(r#"{"domainOs": {"someone-else": {"enabled": false}}}"#);
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("newcomer")),
                 entry(FakeModule::new("someone-else")),
@@ -1532,6 +1733,7 @@ mod tests {
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
         assert_eq!(
@@ -1558,12 +1760,13 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let real = FakeModule::new("sin90");
         let cfg = config_from(r#"{"domainOs": {"sin09": {"enabled": false}}}"#);
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(real.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
 
@@ -1580,12 +1783,13 @@ mod tests {
 
         // The harmless half: an unknown ENABLED entry changes nothing.
         let ok_cfg = config_from(r#"{"domainOs": {"sin09": {"enabled": true}}}"#);
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(FakeModule::new("sin90"))],
             tmp.path(),
             &hub,
             Ok(&ok_cfg),
             &no_models(),
+            None,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -1604,7 +1808,7 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let cfg =
             config_from(r#"{"default": "disabled", "domainOs": {"wanted": {"enabled": true}}}"#);
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("wanted")),
                 entry(FakeModule::new("unlisted")),
@@ -1613,6 +1817,7 @@ mod tests {
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -1654,7 +1859,7 @@ mod tests {
         let cfg = config_from(
             r#"{"domainOs": {"health": {"enabled": false}, "remote": {"enabled": false}}}"#,
         );
-        let (_, reports) = mount_all(
+        let (_, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("health")),
                 entry(FakeModule::with("remote", "out_of_process_provider", false)),
@@ -1663,6 +1868,7 @@ mod tests {
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
         assert!(
@@ -1708,7 +1914,8 @@ mod tests {
             }),
         }];
         let cfg = config_from(r#"{"domainOs": {"crashy": {"enabled": false}}}"#);
-        let (app, reports) = mount_all(&cat, tmp.path(), &hub, Ok(&cfg), &no_models()).await;
+        let (app, reports, _) =
+            mount_all(&cat, tmp.path(), &hub, Ok(&cfg), &no_models(), None).await;
 
         assert_eq!(reports[0].outcome, MountOutcome::Disabled);
         assert_eq!(
@@ -1737,12 +1944,13 @@ mod tests {
                 Err("never reached".to_owned())
             }),
         }];
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &cat,
             tmp.path(),
             &hub,
             Err("os.json is not valid"),
             &no_models(),
+            None,
         )
         .await;
 
@@ -1792,7 +2000,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"twin": {"enabled": false}}}"#);
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("twin")),
                 entry(FakeModule::new("twin")),
@@ -1801,6 +2009,7 @@ mod tests {
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
 
@@ -1827,7 +2036,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"alpha": {"enabled": false}}}"#);
-        let (app, reports) = mount_all(
+        let (app, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("alpha")),
                 entry(FakeModule::new("beta")),
@@ -1836,6 +2045,7 @@ mod tests {
             &hub,
             Ok(&cfg),
             &no_models(),
+            None,
         )
         .await;
 
@@ -1941,8 +2151,15 @@ mod tests {
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let inv = TestModels(Ok(vec!["ornith-9b".to_owned()]));
-        let (app, reports) =
-            mount_all(&[entry(m)], tmp.path(), &hub, Ok(&all_enabled()), &inv).await;
+        let (app, reports, _) = mount_all(
+            &[entry(m)],
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &inv,
+            None,
+        )
+        .await;
 
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
         assert_eq!(
@@ -1969,7 +2186,15 @@ mod tests {
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let inv = TestModels(Err("provider timed out".to_owned()));
-        let (_, reports) = mount_all(&[entry(m)], tmp.path(), &hub, Ok(&all_enabled()), &inv).await;
+        let (_, reports, _) = mount_all(
+            &[entry(m)],
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &inv,
+            None,
+        )
+        .await;
         match &reports[0].resources {
             ResourceStatus::Unknown(why) => assert!(why.contains("timed out"), "{why}"),
             other => panic!("an unreachable provider must be Unknown, got {other:?}"),
@@ -1983,12 +2208,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("frugal");
-        let (_, reports) = mount_all(
+        let (_, reports, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &TestModels(Err("nothing configured".to_owned())),
+            None,
         )
         .await;
         assert_eq!(reports[0].resources, ResourceStatus::Satisfied);
@@ -1996,13 +2222,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_capability_the_kernel_cannot_serve_is_not_granted() {
-        // The manifest asks for `memory`, which KERNEL_GRANTS does not include
+        // The manifest asks for `scheduler`, which KERNEL_GRANTS does not include
         // because there is no handle to hand out yet. Granting it would be a lie.
+        //
+        // This used to use `memory` — until F1 gave memory a real handle, at which
+        // point the kernel COULD serve it and the test was asserting the opposite
+        // of the truth. The example has to be a capability that is still
+        // unimplemented, or the test stops meaning anything.
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let yaml = manifest_yaml("greedy", "in_process_crate").replace(
             "kernel_capabilities: [events]",
-            "kernel_capabilities: [events, memory]",
+            "kernel_capabilities: [events, scheduler]",
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let (_, reports) = mount(&[entry(m)], tmp.path(), &hub).await;
