@@ -229,13 +229,28 @@ impl OsScopedMemory {
 
     /// Mint an id for a module's memory.
     ///
-    /// Prefixed with the partition key because `mem_events.id` is globally
-    /// UNIQUE: without it, two modules that both wanted `note-1` would collide
-    /// and one could DENY the other's write — isolation that stops reads but not
-    /// interference. The random suffix keeps two writes from the SAME module
-    /// distinct.
+    /// `osmem:<ULID>` — deliberately carrying NOTHING about the partition.
+    ///
+    /// The first version prefixed the partition key, reasoning that since
+    /// `mem_events.id` is globally UNIQUE, a shared id would let one module DENY
+    /// another's write, and a prefix makes that unrepresentable rather than
+    /// unlikely. Review pointed out what it cost: the partition key contains the
+    /// logical USER id verbatim and a NUL byte, and this string is handed straight
+    /// back to the module. A module with no other route to the user's identity
+    /// could read it out of an id, and a NUL-bearing identifier is a hazard
+    /// anywhere it is logged, rendered, or put on a wire.
+    ///
+    /// Dropping the prefix is NOT the same trade this file refused earlier for
+    /// `partition_key`. There the collision was deterministic and reachable from
+    /// constructible inputs, which is why length-prefixing it was worth a
+    /// property. Here nothing the module supplies reaches the id at all — the
+    /// kernel mints it — so a cross-module collision needs a ULID collision (80
+    /// random bits within one millisecond), and its outcome is a hard error rather
+    /// than an alias: `EventLog::append` refuses an existing id under a different
+    /// owner instead of merging into it. Negligible probability with a safe
+    /// failure is a different thing from an input an adversary can construct.
     fn mint_id(&self) -> String {
-        format!("{}\u{0}{}", self.key, agent24_core::util::ulid())
+        format!("osmem:{}", agent24_core::util::ulid())
     }
 
     /// One page of this partition's events, NEWEST first, older than `before`
@@ -560,20 +575,64 @@ mod tests {
         assert_eq!(a.recent(10).await.unwrap().len(), 5);
         assert_eq!(b.recent(10).await.unwrap().len(), 5);
 
-        // The assertions above are necessary and were NOT sufficient: review
-        // pointed out they pass with the partition prefix deleted, because the ULID
-        // suffix alone makes ids differ. So assert the mechanism directly — every
-        // id carries its own partition's key, which is what makes a cross-module
-        // collision unrepresentable rather than merely unlikely.
-        for r in a.recent(10).await.unwrap() {
+        // And what an id must NOT contain. It used to carry the partition key,
+        // which embeds the logical user and a NUL byte, and it is handed straight
+        // back to the module — so a module with no other route to the user's
+        // identity could simply read it out of an id it was given.
+        for r in a
+            .recent(10)
+            .await
+            .unwrap()
+            .iter()
+            .chain(b.recent(10).await.unwrap().iter())
+        {
+            let id = r.id.as_str();
+            assert!(id.starts_with("osmem:"), "{id:?}");
             assert!(
-                r.id.as_str().starts_with(&a.key),
-                "sin90's ids must be prefixed with sin90's partition key: {:?}",
-                r.id.as_str()
+                !id.contains('\u{0}'),
+                "no NUL in an id that reaches logs, \
+                JSON and one day a wire: {id:?}"
             );
-            assert!(!r.id.as_str().starts_with(&b.key));
+            assert!(
+                !id.contains("alice"),
+                "an id must not disclose the user: {id:?}"
+            );
+            assert!(!id.contains("sin90") && !id.contains("cos72"), "{id:?}");
         }
         assert_ne!(a.key, b.key);
+    }
+
+    #[tokio::test]
+    async fn a_shared_id_is_refused_rather_than_aliased() {
+        // What makes dropping the partition prefix from `mint_id` safe. Two modules
+        // colliding needs a ULID collision, and if it ever happened the store
+        // REFUSES the second write instead of quietly merging it into the first
+        // module's row — a hard error, not a cross-partition alias.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        let ev = |owner: &str| {
+            MemEvent::new(
+                "osmem:collision",
+                Scope::owner(owner),
+                "note",
+                serde_json::json!({}),
+                Origin {
+                    source: "test".into(),
+                    trust: Trust::ToolOutput,
+                },
+            )
+        };
+        log.append(&ev(&partition_key("alice", "sin90")))
+            .await
+            .unwrap();
+        let err = log
+            .append(&ev(&partition_key("alice", "cos72")))
+            .await
+            .expect_err("the same id under another owner must not be aliased");
+        assert!(
+            matches!(err, agent24_memory::MemoryError::Conflict(_)),
+            "{err}"
+        );
     }
 
     #[tokio::test]

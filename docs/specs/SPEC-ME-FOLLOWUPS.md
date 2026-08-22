@@ -158,6 +158,29 @@ M-E 到 ME-2 为止交付的是**可换**：内核不再按名字认识 Sin90，
 - 反向分页仍然保留，但理由改成真正站得住的那个：**`recent` 从遍历整个分区变成一条
   `seq DESC LIMIT n`**，代价与答案成正比——这个是有测试钉住的。
 
+### 第五轮：真 Codex 对抗挑战（2026-08-22）
+
+上一轮子代理里 codex 起不来，这次直接 `codex exec` 跑通（子代理用的 `--ephemeral`
+是元凶；后台执行还要 `< /dev/null`，否则它会卡在 "Reading additional input from stdin"）。
+三条结论全部成立：
+
+| 结论 | 判定 | 处置 |
+|---|---|---|
+| **Medium**：`mint_id` 把 `partition_key` 前缀进 id，而 key 里逐字包含**逻辑用户 id** 和 **NUL**，这个 id 又原样交回模块 | **成立**。一个本来拿不到用户身份的模块，只要 `remember` 一次再读 `as_str()` 就能把用户 id 解出来；带 NUL 的标识符在日志、CLI、JSON、未来的 wire 上都是隐患 | 改成 `osmem:<ULID>`，不携带任何分区信息 |
+| **Low**：`recall` 文档承诺 "most relevant first"，实现只是布尔子串匹配 | **成立，是我的过度声称** | 改成 "newest matching memories first"，并明写不要在这个顺序上建排序 |
+| **Low**：`KernelCtx` 文档仍写着"今天只有 events，memory 是将来的事" | **成立**，F1 之后就过时了 | 改正 |
+
+**为什么这次可以去掉前缀，而 `partition_key` 当初必须加长度前缀** —— 两者不是一回事，
+不能机械套用：`partition_key` 的碰撞是**确定性的、可由输入构造的**；而 id 完全由内核
+铸造，模块提供的任何东西都进不去，跨模块撞 id 需要一毫秒内撞上 ULID 的 80 位随机数，
+而且真撞上时 `EventLog::append` 是**拒绝**（同 id 不同 owner 报 Conflict），不是别名合并。
+可构造的输入 ≠ 可忽略概率 + 安全失败模式。这两条都有测试钉住，变异验证通过。
+
+Codex 同时确认了几处是干净的：内核没有把 `DomainError::Memory` 序列化到 HTTP 的路径；
+整合/FTS/向量/断言/写门禁都不会跨 owner 扫 `mem_events`，也没有靠前缀匹配发现 owner 的
+维护路径；模块可以自己实现 `KernelCtx`，但造不出真的 `EventSink` 或 `OsScopedMemory`，
+默认 `memory() -> None` 不授予任何权限。
+
 ### 未在 F1 修的一条（→ 新增 F7）
 
 复审指出：单条记忆的大小上限**不是配额**。模块可以用任意多次合法的小写入把共享

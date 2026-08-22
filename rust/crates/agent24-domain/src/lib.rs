@@ -541,10 +541,12 @@ impl EventSink {
 /// `if ctx.grants().has(Events) { ctx.events().unwrap() }`, a panic. [`Grants`]
 /// belongs in the kernel's mount report, not beside the handles it describes.
 ///
-/// Only [`KernelCtx::events`] exists today; `models` / `scheduler` / `policy` /
-/// `memory(scope)` land as their consumers do (ME-1b+). When `memory` arrives it
-/// must consult kernel-owned policy — it must NOT take a caller-supplied
-/// [`Grants`], which is informational only.
+/// [`KernelCtx::events`] and [`KernelCtx::memory`] exist today; `models` /
+/// `scheduler` / `policy` land as their consumers do. Memory arrived in F1 and
+/// kept the rule that was written here while it was still future work: it
+/// consults kernel-owned policy and takes NO caller-supplied [`Grants`] and no
+/// caller-supplied scope, because both would be boundaries the caller could
+/// move.
 pub trait KernelCtx: Send + Sync {
     /// The module-scoped event sink, or `None` when [`Capability::Events`] was not
     /// granted. `None` is an expected outcome, not an error: a module that can run

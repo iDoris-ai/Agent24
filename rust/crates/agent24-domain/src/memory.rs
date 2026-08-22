@@ -80,7 +80,9 @@ impl Remember {
 ///
 /// `id` is the KERNEL's identifier. It is returned so a module can correlate its
 /// own later reads, and it is deliberately opaque: a module must not parse it,
-/// derive another from it, or assume anything about its shape.
+/// derive another from it, or assume anything about its shape. It also carries
+/// nothing to parse — the kernel mints `osmem:<ULID>` precisely so that an id
+/// handed to a module discloses neither the user nor the partition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Remembered {
     pub id: MemoryId,
@@ -159,7 +161,14 @@ pub trait ScopedMemory: Send + Sync {
     /// Remember something. The kernel mints the id and supplies the scope.
     async fn remember(&self, what: Remember) -> crate::Result<Remembered>;
 
-    /// Recall by free text, newest and most relevant first.
+    /// Recall by free text: the NEWEST matching memories first.
+    ///
+    /// "Matching", not "most relevant" — an earlier version of this line promised
+    /// relevance and the kernel does not compute any. A match is a case-insensitive
+    /// substring hit on the kind or the serialized body, and hits come back newest
+    /// first regardless of how well they match, so a recent body mentioning the
+    /// query once precedes an older exact-kind match. Do not build a ranking on
+    /// this ordering.
     ///
     /// `limit` is honoured up to an implementation cap — a module asking for more
     /// than the kernel is willing to materialise gets the cap, not everything and
