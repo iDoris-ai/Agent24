@@ -43,6 +43,8 @@ improvement/
 - `Scope` 有 `owner / agent / session / run` 四维,但**只有 owner 维在存储层强制**;`agent` 维目前**未被任何查询使用**(全仓 0 处 `scope_agent` 列)—— 这正是「不同 OS 挂在同一 owner 下会不会互污」的关键缺口。
 - `ScopedMemory` / `KernelCtx` **尚未实现**(SPEC §2 只有契约草案;ME-1a 契约 crate 在 **PR #127,尚未合入**;ME-1b+ 才接内核)。
 - ⚠️ **非空 CHECK 强度不齐**:`mem_events` 是 `CHECK(scope_owner <> '')`,其余八张是 `CHECK(trim(scope_owner) <> '')` —— **纯空格 owner 在 `mem_events` 过得去,在别处过不去**。(0002 是已发布迁移不可改,需新迁移收紧。)
+- ✅ **一个负载相关的偶发失败已定位并修复**(2026-08-22):`cargo test --workspace` 满载时出现过 `163 passed; 1 failed`,重跑 14 次全绿。**没当它没发生过**——记忆层是所有 OS 共用的地基,1/164 的偶发等于生产的偶发。追下去是 `consolidator::tests::incremental_equals_full_rerun`:它**分别建两个库**,事件时间戳取墙钟秒,而 `Consolidation.at` 是源事件 `at` 的 max —— 两半只要跨秒,"两个语料相同"的前提就不成立。**是测试的缺陷,不是 MD-5 的**(实现本来就不用墙钟)。已改为固定时间戳,并额外钉一条 `at` 断言,使得将来若有人改成用墙钟会**直接失败而不是重新变飘**。教训:**任何"A 等于 B"的测试,先确认 A 和 B 真的由同一份输入构造**。
+- ⚠️ **`agent24-store` 有五处列表查询只按秒级时间戳排序,没有 tie-breaker**(2026-08-22,Codex 在复查上一条时顺带扫出;**当前没有测试会踩到,所以不是现存 flake,但是同一个隐患的另一半**):`repo.rs:117` sessions、`repo.rs:165` runs、`repo.rs:321` tool calls、`repo.rs:408` approvals、`repo.rs:639` standing grants —— 同一秒内创建的多行**返回顺序未定义**,对调用方(和将来任何断言顺序的测试)都是不确定性。对照:`agent24-sin90-store` 已经用 `rowid` 兜底(`spike00.rs:475` 有专门的同秒顺序测试)。待办:给这五处补 `id`/`rowid` 次序键。
 
 ---
 

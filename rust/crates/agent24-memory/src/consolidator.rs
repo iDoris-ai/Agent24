@@ -303,20 +303,37 @@ mod tests {
 
     #[tokio::test]
     async fn incremental_equals_full_rerun() {
+        // Event timestamps are PINNED, because "incremental == full" needs the two
+        // sides to be the SAME corpus and they were not. `MemEvent::new` stamps
+        // `at` from the wall clock at SECOND resolution, and `Consolidation.at` is
+        // the max `at` of its source events — so building two separate databases a
+        // moment apart gave them different timestamps whenever the incremental
+        // corpus's latest events and the full corpus's landed in different seconds.
+        // (~1 failure in 15 under a loaded `cargo test --workspace`.) The
+        // implementation was never at fault; the test's premise was.
+        const EVENTS: [(&str, &str, &str); 4] = [
+            ("a", "note", "2026-01-01T00:00:01Z"),
+            ("d", "task", "2026-01-01T00:00:02Z"),
+            ("b", "note", "2026-01-01T00:00:03Z"),
+            ("e", "task", "2026-01-01T00:00:04Z"),
+        ];
+
         // Incremental: append a batch, run, append another, run.
         let (kv_inc, c_inc) = consolidator().await;
-        append(&kv_inc, "a", "u1", "note").await;
-        append(&kv_inc, "d", "u1", "task").await;
+        for (id, kind, at) in &EVENTS[..2] {
+            append_at(&kv_inc, id, "u1", kind, at).await;
+        }
         c_inc.run_once("u1").await.unwrap();
-        append(&kv_inc, "b", "u1", "note").await;
-        append(&kv_inc, "e", "u1", "task").await;
+        for (id, kind, at) in &EVENTS[2..] {
+            append_at(&kv_inc, id, "u1", kind, at).await;
+        }
         c_inc.run_once("u1").await.unwrap();
         let incremental = c_inc.insights("u1").await.unwrap();
 
         // Full: all events present, one run.
         let (kv_full, c_full) = consolidator().await;
-        for (id, kind) in [("a", "note"), ("d", "task"), ("b", "note"), ("e", "task")] {
-            append(&kv_full, id, "u1", kind).await;
+        for (id, kind, at) in &EVENTS {
+            append_at(&kv_full, id, "u1", kind, at).await;
         }
         c_full.run_once("u1").await.unwrap();
         let full = c_full.insights("u1").await.unwrap();
@@ -324,6 +341,26 @@ mod tests {
         assert_eq!(
             incremental, full,
             "incremental consolidation equals a full rebuild"
+        );
+        // Pinning the inputs also lets us pin each group's `at` EXACTLY. Anything
+        // looser passes for the wrong reasons: an `.all(at == 3 || at == 4)` form
+        // is satisfied by an implementation that stamps every group with the
+        // corpus-wide max, which violates the per-group rule at `run_once`. Being
+        // exact here means the second incremental run really did advance each
+        // group's `at`, and a future change that stamps from the clock fails
+        // loudly instead of going flaky again.
+        let by_key: std::collections::BTreeMap<&str, &str> = full
+            .iter()
+            .map(|c| (c.key.as_str(), c.at.as_str()))
+            .collect();
+        assert_eq!(
+            by_key,
+            std::collections::BTreeMap::from([
+                ("note", "2026-01-01T00:00:03Z"),
+                ("task", "2026-01-01T00:00:04Z"),
+            ]),
+            "each group's `at` is ITS OWN latest source event, not the clock and \
+             not the corpus max: {full:?}"
         );
     }
 
