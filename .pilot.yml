@@ -1,0 +1,40 @@
+# pilot 仓库配置 — Agent24
+#
+# 单主干仓库：PR 直接开向 main，没有 preview 集成分支。
+# 因此 integration_branch == base_branch，合并时必须带 --allow-trunk。
+# 那不是绕过：git-guard 仍要求 main 的保护规则要求审批、且该 PR 已 APPROVED，
+# 读不到保护规则就 fail-closed 拒绝。
+#
+# ⚠️ 本仓库的 main 由 **ruleset**（新机制）保护，不是 classic branch protection。
+# 需要 pilot 的 git-guard 带 ruleset 回落（2026-08-23 加入）；**更老的 pilot 会在
+# 合并这一步拒绝**，且报错会把人指向一件已经做完的事 —— 见下。
+#
+# 三个端点交叉验证过（2026-08-23）：
+#
+#   GET /repos/iDoris-ai/Agent24/branches/main/protection  → "Branch not protected"
+#   GET /repos/iDoris-ai/Agent24/branches/main             → protected: true
+#   GET /repos/iDoris-ai/Agent24/rules/branches/main       → 3 条 pull_request 规则，各自
+#                                                            required_approving_review_count = 1
+#                                                            dismiss_stale_reviews_on_push  = true
+#
+# main **确实**要求审批、也确实在 push 时废除陈旧审批 —— 正是 --allow-trunk 要的两样。
+# 但 classic 端点对 ruleset 保护的分支返回 "Branch not protected"。
+#
+# git-guard 现在会在收到这句话时回落查 /rules/branches/{branch}，并且
+# **显式校验 enforcement**：只统计属于 `active` ruleset 的 pull_request 规则
+# —— `evaluate` 模式只报告不强制，若把它算成保护，就等于用一条不生效的规则
+# 放行一次自合。读不到 ruleset 列表同样拒绝（未经核实的保护等于没有保护）。
+#
+# **如果你的 pilot 没有这个回落**，合并会被拒绝，报错让你去「先保护分支、
+# 要求至少一个审批」—— 那件事早就做完了，**不要因此去改本仓库的分支保护设置**。
+base_branch: main
+integration_branch: main
+
+# 额外保护的分支前缀（除 main 外）
+protect_patterns: [release, hotfix]
+
+remote: origin
+
+# 规划层在 docs/agent/（本仓库的长期设计文档另在 docs/specs/ 与 docs/decision.md）
+docs_dir: docs/agent
+planning_source: docs
