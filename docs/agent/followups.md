@@ -10,4 +10,4 @@
 - [ ] FU-4 · B · src=PR#140 · 2026-08-23 · 首次插入时无人检查 owner_key 是否真的编码了所声明的 (org_id,space_id)。carol 可抢先用 alice 未创建的 key 在自己 org 下 record，alice 从此永久拿不到该分区且无修复路径（可达性为零）。要么写成 record_os_partition 文档里的显式非属性，要么把一致性断言上提到 OsMemoryCatalog::record
 - [ ] FU-5 · B · src=PR#140 · 2026-08-23 · Conflict 消息只打呈递的身份、不打已存的 → guard 触发时日志说不清是哪个 org 占着那一行
 - [ ] FU-6 · B · src=PR#141 · 2026-08-23 · spec.md:31 usr: 与 os: 前缀的不相交性依赖模块名为 ASCII；T1.2.1 已要求补交叉积测试，确保测试真的覆盖非 ASCII 输入
-- [ ] FU-7 · B · src=PR#141 · 2026-08-23 · git-guard.sh 的 --allow-trunk 只查 classic branch protection 端点，对 ruleset 保护的分支误判为无保护。修法：classic 报 Branch not protected 时回落查 /rules/branches/{branch}。属 pilot skill，不在本仓库
+- [x] FU-7 · B · src=PR#141 · 2026-08-23 · git-guard.sh 的 --allow-trunk 只查 classic branch protection 端点，对 ruleset 保护的分支误判为无保护。修法：classic 报 Branch not protected 时回落查 /rules/branches/{branch}。属 pilot skill，不在本仓库 · done=PR#141
