@@ -424,10 +424,15 @@ impl KvStore {
 
     /// Add `user` to `org`, if `user` has no org yet. Idempotent.
     ///
-    /// The only way membership grows. It exists because without it F8's central
-    /// claim — that an org gaining a second member is cheap — could not be
-    /// exercised by anything, and a model no code can reach is a model nobody has
-    /// checked.
+    /// The only way membership grows — and it has NO production caller. The
+    /// daemon creates one org for its one user and never calls this.
+    ///
+    /// It exists so that the storage model's support for several members is
+    /// exercised by something rather than merely asserted, and so that a future
+    /// membership workflow has a primitive to build on. Read every "second
+    /// member" sentence in this crate as a claim about what the model ADMITS,
+    /// not about behaviour a user can reach today; the kernel-side module docs
+    /// in `agent24d::os_memory` say so at length.
     ///
     /// # It REFUSES a user who already belongs to a different org, and that
     /// refusal is the honest half of the feature
@@ -460,29 +465,52 @@ impl KvStore {
                 "cannot add a blank user to an org".into(),
             ));
         }
-        // Not `INSERT … WHERE NOT EXISTS`: silently doing nothing would leave the
-        // caller believing the member was added.
-        if let Some(existing) = self.resolve_org_for_user(user).await?
-            && existing != org_id
-        {
-            return Err(MemoryError::Conflict(format!(
+        // ONE statement decides, for the reason `ensure_org_for_user` uses the
+        // same shape: a check followed by an insert is a race, and review caught
+        // that the first version of this refusal had exactly that gap. Two
+        // concurrent calls adding an unassigned user to different orgs would both
+        // read "no membership" and both insert — producing the two-org state this
+        // function exists to refuse, by way of the refusal itself. The race with
+        // `ensure_org_for_user` minting an org concurrently is the same shape.
+        //
+        // `ON CONFLICT(org_id, user_id) DO NOTHING` cannot cover it: the schema
+        // deliberately allows one user in several orgs, so that conflict target
+        // never fires for the case that matters.
+        let inserted = sqlx::query(
+            "INSERT INTO mem_org_members (org_id, user_id, joined_at)
+             SELECT ?, ?, ?
+             WHERE NOT EXISTS (SELECT 1 FROM mem_org_members WHERE user_id = ?)",
+        )
+        .bind(org_id)
+        .bind(user)
+        .bind(now_iso8601())
+        .bind(user)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted == 1 {
+            return Ok(());
+        }
+        // Zero rows means the user already had a membership. Which one decides
+        // whether this call was idempotent or is the refusal — and reading it
+        // back is the only way to know, since the statement above cannot say.
+        match self.resolve_org_for_user(user).await? {
+            Some(existing) if existing == org_id => Ok(()),
+            Some(existing) => Err(MemoryError::Conflict(format!(
                 "user {user:?} already belongs to org {existing:?}; moving them to \
                  {org_id:?} needs a decision about the partitions {existing:?} owns and \
                  about which org they then act in, and there is no policy layer to make \
                  it. Refusing rather than leaving them in two orgs, which would make \
                  their org unresolvable and withhold memory from every module"
-            )));
+            ))),
+            // Nothing inserted and no membership found: only reachable if another
+            // writer removed one between the two statements. Reported rather than
+            // retried, because a membership disappearing under this call is not a
+            // state this function can reason about.
+            None => Err(MemoryError::Conflict(format!(
+                "membership for {user:?} changed underneath this call"
+            ))),
         }
-        sqlx::query(
-            "INSERT INTO mem_org_members (org_id, user_id, joined_at) VALUES (?, ?, ?)
-             ON CONFLICT(org_id, user_id) DO NOTHING",
-        )
-        .bind(org_id)
-        .bind(user)
-        .bind(now_iso8601())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     /// The single org `user` belongs to, or `None` if they belong to none.
@@ -1014,6 +1042,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(members, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_adds_cannot_leave_a_user_in_two_orgs() {
+        // The refusal is only worth anything if it cannot be raced past, and the
+        // first version could be: it read the membership, then inserted, with
+        // nothing between. Two callers adding an unassigned user to different
+        // orgs would both see "no membership" and both succeed — the refusal
+        // producing the very state it refuses.
+        //
+        // A NET, like the other race test here: an unguarded implementation could
+        // serialise by luck. Mutation-checked against the check-then-insert shape.
+        let dir = tempfile::tempdir().unwrap();
+        let kv = KvStore::open(&dir.path().join("m.db")).await.unwrap();
+        let orgs: Vec<String> = {
+            let mut v = Vec::new();
+            for u in ["alice", "carol", "dave", "erin"] {
+                v.push(kv.ensure_org_for_user(u).await.unwrap());
+            }
+            v
+        };
+
+        let racers: Vec<_> = orgs
+            .iter()
+            .map(|org| {
+                let (kv, org) = (kv.clone(), org.clone());
+                tokio::spawn(async move { kv.add_org_member(&org, "bob").await })
+            })
+            .collect();
+        let mut ok = 0;
+        for r in racers {
+            if r.await.unwrap().is_ok() {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 1, "exactly one add may win");
+
+        // The property that matters: Bob is still resolvable, so his memory works.
+        kv.ensure_org_for_user("bob")
+            .await
+            .expect("a raced add must never leave a user unresolvable");
+        let memberships: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mem_org_members WHERE user_id = 'bob'")
+                .fetch_one(&kv.pool)
+                .await
+                .unwrap();
+        assert_eq!(memberships, 1);
     }
 
     #[tokio::test]

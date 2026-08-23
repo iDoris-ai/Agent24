@@ -64,6 +64,22 @@
 //!   nothing else. Whether an accessor MAY reach a space is not asked anywhere;
 //!   isolation is still "your key or nothing", which is a partition, not a
 //!   decision. Do not describe this file as access control.
+//! - **There is no membership WORKFLOW.** This is the limitation most easily
+//!   overstated, so it is stated flatly: what F8 delivers is the ownership
+//!   DIMENSION, not a feature for adding people to orgs. The daemon creates
+//!   exactly one org, for its one user, and never calls
+//!   `KvStore::add_org_member` — which itself refuses any user who already has
+//!   an org, i.e. anyone who has ever started the daemon. So no supported path
+//!   puts a second member into an org today, and every claim here about a second
+//!   member is a claim about what the STORAGE MODEL admits, not about behaviour a
+//!   user can reach.
+//!
+//!   That is the intended scope rather than an unfinished corner. F8's whole
+//!   argument is that the ownership dimension has to be right BEFORE there is
+//!   data to migrate, because that is the part a later change cannot do cheaply;
+//!   a membership workflow can be built any time, against whatever the real
+//!   requirements turn out to be, and building one now would be inventing them.
+//!   What had to happen while the catalog was one day old has happened.
 //!
 //! # What this does NOT do
 //!

@@ -817,9 +817,16 @@ pub async fn serve(
                     .iter()
                     .filter(|r| !live.contains(r.owner_key.as_str()))
                     .count();
+                // "not mounted now" describes the PARTITION, not the module. The
+                // comment above already said why and the message used to
+                // contradict it: after a re-key, the leftover row keeps the same
+                // module name while that module is mounted perfectly well under
+                // its new key, so calling those rows "modules not mounted" is
+                // false exactly where an operator most needs the truth.
                 tracing::info!(
                     "org {} owns {} domain-OS memory partition(s) besides {LOCAL_USER}'s \
-                     own memory, {dormant} of them belonging to modules not mounted now",
+                     own memory; {dormant} of them are not mounted under that key now \
+                     (a disabled or uninstalled module, a rename, or an older key version)",
                     l.org.as_str(),
                     rows.len()
                 );
