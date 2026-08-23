@@ -1,0 +1,17 @@
+# pilot 仓库配置 — Agent24
+#
+# 单主干仓库：PR 直接开向 main，没有 preview 集成分支。
+# 因此 integration_branch == base_branch，合并时必须带 --allow-trunk。
+# 那不是绕过：git-guard 仍要求 main 的保护规则要求审批、且该 PR 已 APPROVED，
+# 读不到保护规则就 fail-closed 拒绝。
+base_branch: main
+integration_branch: main
+
+# 额外保护的分支前缀（除 main 外）
+protect_patterns: [release, hotfix]
+
+remote: origin
+
+# 规划层在 docs/agent/（本仓库的长期设计文档另在 docs/specs/ 与 docs/decision.md）
+docs_dir: docs/agent
+planning_source: docs
