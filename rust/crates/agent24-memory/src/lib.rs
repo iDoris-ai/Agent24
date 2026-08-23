@@ -288,6 +288,26 @@ impl KvStore {
     /// The identity a key encodes is `(org_id, space_id)`. Who walked up to it
     /// is not part of it.
     pub async fn record_os_partition(&self, id: OsPartitionIdentity<'_>) -> Result<()> {
+        // Dropping `logical_user` from the guard let a non-member be recorded as
+        // a partition's creator, which review caught: the kernel's own path
+        // resolves the org by membership first, so it could not happen there —
+        // but this is a public API, and "the only caller today does it right" is
+        // not a property. A creator who is not in the org makes the provenance
+        // column a lie in the one place it is the whole point.
+        let member: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_org_members WHERE org_id = ? AND user_id = ?",
+        )
+        .bind(id.org_id)
+        .bind(id.user)
+        .fetch_one(&self.pool)
+        .await?;
+        if member == 0 {
+            return Err(MemoryError::Conflict(format!(
+                "user {:?} is not a member of org {:?}; a partition cannot record a \
+                 creator who does not belong to the org that owns it",
+                id.user, id.org_id
+            )));
+        }
         let now = now_iso8601();
         // The guarded arm updates ZERO rows when the immutable columns disagree,
         // which is how the disagreement is detected: SQLite reports the conflict
@@ -402,6 +422,39 @@ impl KvStore {
         Ok(org_id)
     }
 
+    /// Add `user` to `org`. Idempotent.
+    ///
+    /// The only way membership grows, and it exists because without it F8's
+    /// central claim — that an org gaining a second member is cheap — could not
+    /// be exercised by anything, in tests or in production. A model no code can
+    /// reach is a model no one has checked.
+    ///
+    /// **It performs no authorisation, because there is nothing to perform.**
+    /// There is no policy layer, no roles, and no notion of who may grow an org;
+    /// this is a storage operation, and the kernel does not call it yet. When a
+    /// decision point exists, this is one of the call sites that must go through
+    /// it — adding a member changes who can reach every space the org owns.
+    ///
+    /// Note the consequence for [`Self::ensure_org_for_user`]: a user added to a
+    /// SECOND org can no longer be resolved implicitly, by design.
+    pub async fn add_org_member(&self, org_id: &str, user: &str) -> Result<()> {
+        if user.trim().is_empty() {
+            return Err(MemoryError::Conflict(
+                "cannot add a blank user to an org".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO mem_org_members (org_id, user_id, joined_at) VALUES (?, ?, ?)
+             ON CONFLICT(org_id, user_id) DO NOTHING",
+        )
+        .bind(org_id)
+        .bind(user)
+        .bind(now_iso8601())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// The single org `user` belongs to, or `None` if they belong to none.
     ///
     /// `Err` on more than one — see [`Self::ensure_org_for_user`] for why an
@@ -464,15 +517,23 @@ impl KvStore {
     /// commit the catalog would point at `new_key` while artifacts, assertions
     /// and traces stayed behind, orphaned silently rather than loudly.
     ///
-    /// Refusing is the right shape rather than a smaller one. Nothing can put a
-    /// row in those tables under a partition key today — [`crate::KvStore`]
-    /// hands a domain OS only an `EventLog`, so `remember` can write nowhere
-    /// else — which makes a mover for them code with no caller, written against
-    /// a guess about what a future writer would need (the assertion FTS shadow
-    /// alone needs its own handling). A refusal is a fact this function can
-    /// check. If a later change lets a module write assertions, this fails on
-    /// the first partition instead of quietly leaving them behind, and whoever
-    /// makes that change gets told to come back here.
+    /// Refusing is the right shape rather than a smaller one. No MODULE can put
+    /// a row in those tables under a partition key: a domain OS is handed only
+    /// an `EventLog`, so `remember` can write nowhere else. A mover for them
+    /// would therefore be code with no caller, written against a guess about
+    /// what a future writer would need — and the assertion FTS shadow alone
+    /// needs its own handling. A refusal is a fact this function can check.
+    ///
+    /// **That is a claim about modules, not about this crate.** Review was right
+    /// to draw the line: [`KvStore`] publicly exposes `artifacts()`,
+    /// `assertions()`, `knowledge()`, `trace()` and the rest, all of which take
+    /// a caller-supplied owner, so a root-level caller CAN construct the state
+    /// this refuses on. If one ever has, the consequence is real and worth
+    /// stating: the sweep refuses that partition on every startup, and the module
+    /// mounts without memory until a human moves those rows. That is a worse
+    /// outcome than a migration and a better one than silent data loss, and it is
+    /// not a complete migration strategy — it is a stop, with a log line naming
+    /// the table, so that whoever hits it knows exactly what to move.
     ///
     /// # Why this is one transaction and not two statements
     ///
@@ -511,8 +572,18 @@ impl KvStore {
             )));
         }
         let mut tx = self.pool.begin().await?;
-        // Checked INSIDE the transaction, so a writer cannot slip a row into one
-        // of these between the check and the move.
+        // Checked inside the transaction so the check and the move see one
+        // consistent snapshot. That is ALL it buys, and the previous version of
+        // this comment claimed fencing it does not do: nothing stops a writer
+        // that was blocked on this transaction from inserting under `old_key`
+        // immediately after it commits, and nothing could — none of these tables
+        // has a foreign key to `mem_os_partitions.owner_key`, so the database has
+        // no way to know a key is retired.
+        //
+        // What makes that safe today is not this loop. It is WHEN the sweep runs:
+        // `MemoryLease::open` calls it during startup, before a single module has
+        // been mounted, so there is no module code running to race with. Preserve
+        // that ordering; this check cannot substitute for it.
         for table in OTHER_OWNER_SCOPED_TABLES {
             let n: i64 = sqlx::query_scalar(&format!(
                 "SELECT COUNT(*) FROM {table} WHERE scope_owner = ?"
@@ -582,19 +653,60 @@ impl KvStore {
         Ok(moved)
     }
 
-    /// Every partition ever recorded for `user`, oldest first.
+    /// Every partition `user` CREATED, oldest first.
     ///
-    /// The answer an export or erase path needs — INCLUDING partitions belonging
-    /// to modules that are disabled, uninstalled or renamed, which is why it
-    /// reads the table rather than whatever mounted this run.
+    /// # This is no longer "everything for this user", and cannot be
+    ///
+    /// It was, under F1, because a partition belonged to one user by
+    /// construction. F8 made a partition belong to an (org, space), and round 2
+    /// made `logical_user` the write-once CREATOR so that a second member could
+    /// mount it at all — which review then correctly pointed out leaves this
+    /// query answering a narrower question than its old doc claimed: if Alice
+    /// creates the org's `os:calendar` partition and Bob writes to it, this
+    /// returns nothing for Bob.
+    ///
+    /// That is not a lookup to widen. Once a space has several members, "export
+    /// everything belonging to Bob" has no answer at this layer: the memories in
+    /// a shared space belong to the ORG, and Bob's having written some of them
+    /// does not make the space his to export or erase. Answering with the whole
+    /// partition would over-collect (Alice's memories) and answering with
+    /// nothing would under-collect — the question is malformed, not unanswered.
+    ///
+    /// So there are two honest lookups instead of one dishonest one. This one
+    /// answers provenance ("what did this user bring into being"). An export or
+    /// erase path wants [`Self::os_partitions_for_org`], plus a decision — which
+    /// is a POLICY question, and there is no policy layer yet — about what
+    /// leaving an org does to memories written into its shared spaces.
+    ///
+    /// Both include partitions belonging to modules that are disabled,
+    /// uninstalled or renamed, which is why they read the table rather than
+    /// whatever mounted this run.
     pub async fn os_partitions_for(&self, user: &str) -> Result<Vec<OsPartitionRow>> {
-        let rows = sqlx::query(
+        self.os_partitions_where("logical_user", user).await
+    }
+
+    /// Every partition owned by `org`, oldest first.
+    ///
+    /// The lookup an export or erase path needs, because an (org, space) is what
+    /// owns a partition — see [`Self::os_partitions_for`] for why the per-user
+    /// question stopped having an answer here.
+    pub async fn os_partitions_for_org(&self, org_id: &str) -> Result<Vec<OsPartitionRow>> {
+        self.os_partitions_where("org_id", org_id).await
+    }
+
+    /// One catalog query with a caller-chosen column.
+    ///
+    /// `column` is NEVER caller-supplied — the two callers above pass literals.
+    /// It is interpolated because SQLite cannot bind an identifier, and it is
+    /// private so that stays true.
+    async fn os_partitions_where(&self, column: &str, value: &str) -> Result<Vec<OsPartitionRow>> {
+        let rows = sqlx::query(&format!(
             "SELECT owner_key, key_version, org_id, space_id, logical_user,
                     module_name, first_seen_at, last_seen_at
-             FROM mem_os_partitions WHERE logical_user = ?
-             ORDER BY first_seen_at ASC, owner_key ASC",
-        )
-        .bind(user)
+             FROM mem_os_partitions WHERE {column} = ?
+             ORDER BY first_seen_at ASC, owner_key ASC"
+        ))
+        .bind(value)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(os_partition_row).collect())
@@ -773,27 +885,44 @@ mod tests {
         let path = dir.path().join("m.db");
         let pool = pool_migrated_up_to(&path, 13).await;
 
-        // A catalog row exactly as F1 left it: the 0012 schema, six columns.
-        sqlx::query(
-            "INSERT INTO mem_os_partitions
-                 (owner_key, key_version, logical_user, module_name,
-                  first_seen_at, last_seen_at)
-             VALUES ('v1-key-for-sin90', 'v1', 'alice', 'sin90', '2026-08-22T00:00:00Z',
-                     '2026-08-22T00:00:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO mem_os_partitions
-                 (owner_key, key_version, logical_user, module_name,
-                  first_seen_at, last_seen_at)
-             VALUES ('v1-key-for-cos72', 'v1', 'alice', 'cos72', '2026-08-22T01:00:00Z',
-                     '2026-08-22T01:00:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Catalog rows exactly as F1 left them: the 0012 schema, six columns, and
+        // owner keys in F1's REAL encoding.
+        //
+        // The first version of this fixture used strings like `v1-key-for-sin90`,
+        // which review caught as untestable-by-construction: the kernel sweep
+        // recomputes the v1 key from the row's own (user, module) and skips any
+        // row that disagrees, so a made-up key would be skipped before the
+        // assertions here could mean anything, and a migration that corrupted
+        // `owner_key` would still have passed.
+        //
+        // Duplicated from `agent24d`'s `legacy_partition_key` because this crate
+        // cannot see it. That duplication is the point: if the two ever disagree,
+        // the end-to-end sweep test in `agent24d` fails.
+        let v1_key = |user: &str, module: &str| {
+            format!(
+                "v1\u{0}{}\u{0}{user}\u{0}os:{}\u{0}{module}",
+                user.len(),
+                module.len()
+            )
+        };
+        for (module, at) in [
+            ("sin90", "2026-08-22T00:00:00Z"),
+            ("cos72", "2026-08-22T01:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO mem_os_partitions
+                     (owner_key, key_version, logical_user, module_name,
+                      first_seen_at, last_seen_at)
+                 VALUES (?, 'v1', 'alice', ?, ?, ?)",
+            )
+            .bind(v1_key("alice", module))
+            .bind(module)
+            .bind(at)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         pool.close().await;
 
         // Now run the rest, which is 0013.
@@ -818,6 +947,10 @@ mod tests {
             rows[0].first_seen_at, "2026-08-22T00:00:00Z",
             "first_seen_at is what it always was"
         );
+        // The rebuild copied the key VERBATIM. A migration that mangled it would
+        // leave the kernel sweep unable to recognise the row and the partition's
+        // history stranded — the failure the made-up fixture keys hid.
+        assert_eq!(rows[0].owner_key, v1_key("alice", &rows[0].module_name));
 
         // The org exists as a row, with the user as a member — so the resolver
         // finds it rather than minting a second one for the same person.
@@ -864,14 +997,7 @@ mod tests {
         // second member possible while the storage layer said no.
         let kv = KvStore::open_memory().await.unwrap();
         let org = kv.ensure_org_for_user("alice").await.unwrap();
-        let now = now_iso8601();
-        sqlx::query("INSERT INTO mem_org_members (org_id, user_id, joined_at) VALUES (?, ?, ?)")
-            .bind(&org)
-            .bind("bob")
-            .bind(&now)
-            .execute(&kv.pool)
-            .await
-            .unwrap();
+        kv.add_org_member(&org, "bob").await.unwrap();
         assert_eq!(
             kv.ensure_org_for_user("bob").await.unwrap(),
             org,
@@ -1064,34 +1190,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_partition_cannot_belong_to_an_org_that_does_not_exist() {
-        // Found by two of this file's own tests failing on it, which is the
-        // better way to learn a constraint is real. `org_id` is a FOREIGN KEY, so
-        // a partition cannot be attributed to an org nothing ever created —
-        // exactly the orphan the catalog exists to prevent, one level up: a row
-        // whose org cannot be looked up is a row no export or erase path can act
-        // on.
+    async fn a_partition_cannot_be_created_by_a_non_member() {
+        // Round 2 took `logical_user` out of the upsert guard so a second member
+        // could mount. Review's follow-up: that also let the public API record a
+        // creator who is not in the org at all, making the provenance column a
+        // lie in the one place it is the whole point. Membership is now a
+        // precondition.
         //
-        // Worth pinning because it is easy to lose: SQLite has foreign keys OFF
-        // by default, and this database only has them on because `KvStore::open`
-        // asks for them (for MD-8's trace projection). Turning that off would
-        // silently downgrade this from a guarantee to a comment.
+        // TWO guards, and this reaches the first. `org_id` is also a FOREIGN KEY
+        // to `mem_orgs`, but a nonexistent org has no members, so the membership
+        // check now answers first and the FK has become a schema-level backstop
+        // this path can no longer reach. Said plainly because the previous
+        // version of this test asserted `MemoryError::Sqlx` and would otherwise
+        // look like it had simply changed its mind.
         let kv = KvStore::open_memory().await.unwrap();
-        let err = kv
-            .record_os_partition(OsPartitionIdentity {
-                owner_key: "k",
-                key_version: "v2",
-                org_id: "org_never_created",
-                space_id: "os:sin90",
-                user: "alice",
-                module: "sin90",
-            })
-            .await
-            .expect_err("an unknown org must not be recordable");
-        assert!(
-            matches!(err, MemoryError::Sqlx(_)),
-            "expected the FK to reject it, got {err}"
-        );
+        let org = kv.ensure_org_for_user("alice").await.unwrap();
+
+        for (org_id, user, why) in [
+            ("org_never_created", "alice", "an org that does not exist"),
+            (org.as_str(), "mallory", "a user who is not a member"),
+        ] {
+            let err = kv
+                .record_os_partition(OsPartitionIdentity {
+                    owner_key: "k",
+                    key_version: "v2",
+                    org_id,
+                    space_id: "os:sin90",
+                    user,
+                    module: "sin90",
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MemoryError::Conflict(_)), "{why}: {err}");
+        }
+
+        // Nothing was recorded by either attempt.
+        assert!(kv.os_partitions_for_org(&org).await.unwrap().is_empty());
     }
 
     #[tokio::test]

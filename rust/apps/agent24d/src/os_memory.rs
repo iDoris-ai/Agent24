@@ -1537,6 +1537,12 @@ mod tests {
         // `a_second_member_of_an_org_mounts_the_same_partition` in
         // `agent24-memory`. This test had `user: "bob"` in the loop until review
         // showed what that was really asserting.
+        //
+        // Bob has to be MADE a member first. The earlier version of this did not,
+        // and passed — which review caught as the second half of the same
+        // mistake: dropping the guard had also let the storage API record a
+        // creator from outside the org entirely.
+        kv.add_org_member(org.as_str(), "bob").await.unwrap();
         kv.record_os_partition(agent24_memory::OsPartitionIdentity {
             user: "bob",
             ..recorded
