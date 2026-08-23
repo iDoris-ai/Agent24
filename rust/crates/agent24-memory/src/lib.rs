@@ -114,6 +114,28 @@ pub struct OsPartitionIdentity<'a> {
     pub module: &'a str,
 }
 
+/// Every table keyed by `scope_owner` that [`KvStore::rekey_os_partition`] does
+/// NOT move — so it can refuse instead of orphaning them.
+///
+/// `mem_events` and `mem_checkpoints` are absent because they ARE moved. The
+/// assertion FTS shadow is absent because it is trigger-maintained from
+/// `mem_assertions`, which is here.
+///
+/// A new owner-scoped table must be added to this list or explicitly moved.
+/// Nothing enforces that mechanically — a schema-introspecting test was
+/// considered and would have to encode the same list to know what to expect, so
+/// it would restate this constant rather than check it.
+const OTHER_OWNER_SCOPED_TABLES: &[&str] = &[
+    "mem_artifacts",
+    "mem_artifact_versions",
+    "mem_assertions",
+    "mem_consolidations",
+    "mem_embeddings",
+    "mem_instructions",
+    "mem_trace_refs",
+    "mem_trace_nodes",
+];
+
 /// One catalog row, read in the one place so two readers cannot disagree about
 /// which column is which.
 fn os_partition_row(r: &sqlx::sqlite::SqliteRow) -> OsPartitionRow {
@@ -242,7 +264,7 @@ impl KvStore {
     /// was. A module rename must leave the old row intact — that row is the only
     /// thing that can tell a later migration what `…os:calendar` used to mean.
     ///
-    /// A repeat call that DISAGREES about `key_version`, `logical_user` or
+    /// A repeat call that DISAGREES about `key_version`, `org_id`, `space_id` or
     /// `module_name` is a [`MemoryError::Conflict`], not an update and not a
     /// silent success. The first version treated every conflict as success and
     /// updated only `last_seen_at`, so a key whose stored identity had drifted —
@@ -251,11 +273,20 @@ impl KvStore {
     /// catalog would go on attributing new rows to the old identity. A catalog
     /// that reports success while disagreeing with itself is worse than no
     /// catalog, because the caller is entitled to believe it.
-    /// A repeat call that DISAGREES about `org_id` or `space_id` is a conflict
-    /// for the same reason: those two ARE the identity the key encodes, so a key
-    /// that claims to belong to a different space than the one recorded means
-    /// the encoder and the catalog have diverged, and lending the handle would
-    /// let one space's writes land in another's partition.
+    ///
+    /// # `logical_user` is NOT part of that identity, and cannot be
+    ///
+    /// It records which user first caused the partition to exist, write-once
+    /// like `module_name` and `first_seen_at`. Guarding on it looked right and
+    /// broke the entire point of F8, which review caught: a partition is owned
+    /// by an (org, space), so every member of that org derives the SAME key. If
+    /// the upsert demanded that the mounting user match the creator, then the
+    /// day an org gained a second member, that member's mount would affect zero
+    /// rows, return a conflict, and be refused the memory capability for good —
+    /// while the code claimed to have made a second member cheap.
+    ///
+    /// The identity a key encodes is `(org_id, space_id)`. Who walked up to it
+    /// is not part of it.
     pub async fn record_os_partition(&self, id: OsPartitionIdentity<'_>) -> Result<()> {
         let now = now_iso8601();
         // The guarded arm updates ZERO rows when the immutable columns disagree,
@@ -270,7 +301,6 @@ impl KvStore {
                WHERE key_version = excluded.key_version
                  AND org_id = excluded.org_id
                  AND space_id = excluded.space_id
-                 AND logical_user = excluded.logical_user
                  AND module_name = excluded.module_name",
         )
         .bind(id.owner_key)
@@ -286,8 +316,8 @@ impl KvStore {
         if res.rows_affected() == 0 {
             return Err(crate::MemoryError::Conflict(format!(
                 "memory partition {:?} is already recorded with a different identity \
-                 than ({}, {}, {}, {}, {}) — refusing to re-attribute it",
-                id.owner_key, id.key_version, id.org_id, id.space_id, id.user, id.module
+                 than ({}, {}, {}, {}) — refusing to re-attribute it",
+                id.owner_key, id.key_version, id.org_id, id.space_id, id.module
             )));
         }
         Ok(())
@@ -416,9 +446,33 @@ impl KvStore {
         Ok(rows.iter().map(os_partition_row).collect())
     }
 
-    /// Move a partition from `old_key` to `new_key`, atomically with its rows.
+    /// Move a partition from `old_key` to `new_key`, atomically with its EVENT
+    /// rows and its projection bookmarks — and only those.
     ///
     /// Returns how many events moved.
+    ///
+    /// # It refuses rather than move the other eight owner-scoped tables
+    ///
+    /// `scope_owner` also keys `mem_artifacts`, `mem_artifact_versions`,
+    /// `mem_assertions` (plus its trigger-maintained FTS shadow),
+    /// `mem_consolidations`, `mem_embeddings`, `mem_instructions`,
+    /// `mem_trace_refs` and `mem_trace_nodes`. This moves NONE of them. It
+    /// instead refuses to run when any of them holds a row under `old_key`.
+    ///
+    /// The first version of this doc said "atomically with its rows" while
+    /// touching two tables of ten, which review called correctly: after such a
+    /// commit the catalog would point at `new_key` while artifacts, assertions
+    /// and traces stayed behind, orphaned silently rather than loudly.
+    ///
+    /// Refusing is the right shape rather than a smaller one. Nothing can put a
+    /// row in those tables under a partition key today — [`crate::KvStore`]
+    /// hands a domain OS only an `EventLog`, so `remember` can write nowhere
+    /// else — which makes a mover for them code with no caller, written against
+    /// a guess about what a future writer would need (the assertion FTS shadow
+    /// alone needs its own handling). A refusal is a fact this function can
+    /// check. If a later change lets a module write assertions, this fails on
+    /// the first partition instead of quietly leaving them behind, and whoever
+    /// makes that change gets told to come back here.
     ///
     /// # Why this is one transaction and not two statements
     ///
@@ -457,6 +511,24 @@ impl KvStore {
             )));
         }
         let mut tx = self.pool.begin().await?;
+        // Checked INSIDE the transaction, so a writer cannot slip a row into one
+        // of these between the check and the move.
+        for table in OTHER_OWNER_SCOPED_TABLES {
+            let n: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE scope_owner = ?"
+            ))
+            .bind(old_key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if n > 0 {
+                return Err(MemoryError::Conflict(format!(
+                    "cannot re-key {old_key:?}: {table} holds {n} row(s) under it, and \
+                     this function moves only events and checkpoints. Moving a partition \
+                     while leaving those behind would orphan them silently — teach this \
+                     function to move {table} before allowing it"
+                )));
+            }
+        }
         let taken: Option<String> =
             sqlx::query("SELECT owner_key FROM mem_os_partitions WHERE owner_key = ?")
                 .bind(new_key)
@@ -657,6 +729,218 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 2, "{first} plus the one this test inserted");
+    }
+
+    /// Open a database migrated only as far as `stop_before`, so a migration can
+    /// be tested against the schema it will actually meet.
+    ///
+    /// `KvStore::open*` runs every migration, which is why the first version of
+    /// the 0013 tests proved nothing about 0013: they inserted v1-shaped rows
+    /// into an already-upgraded schema and exercised only the Rust sweep. The
+    /// upgrade path — the backfill, the org rows, the rebuilt catalog — was the
+    /// one part of this change that touches data a user already has, and it was
+    /// the one part with no test.
+    async fn pool_migrated_up_to(path: &Path, stop_before: i64) -> SqlitePool {
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        // Through the real migrator, with the later migrations removed — NOT by
+        // executing the SQL by hand. Hand-executing leaves `_sqlx_migrations`
+        // empty, so the next `KvStore::open` starts again at 0001 and fails on
+        // "table kv already exists" (which is how the first attempt at this
+        // helper was caught).
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = migrator
+            .migrations
+            .iter()
+            .filter(|m| m.version < stop_before)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        migrator.run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn migration_0013_gives_an_existing_0012_partition_an_org_and_a_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let pool = pool_migrated_up_to(&path, 13).await;
+
+        // A catalog row exactly as F1 left it: the 0012 schema, six columns.
+        sqlx::query(
+            "INSERT INTO mem_os_partitions
+                 (owner_key, key_version, logical_user, module_name,
+                  first_seen_at, last_seen_at)
+             VALUES ('v1-key-for-sin90', 'v1', 'alice', 'sin90', '2026-08-22T00:00:00Z',
+                     '2026-08-22T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO mem_os_partitions
+                 (owner_key, key_version, logical_user, module_name,
+                  first_seen_at, last_seen_at)
+             VALUES ('v1-key-for-cos72', 'v1', 'alice', 'cos72', '2026-08-22T01:00:00Z',
+                     '2026-08-22T01:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        // Now run the rest, which is 0013.
+        let kv = KvStore::open(&path).await.unwrap();
+
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(rows.len(), 2, "the rebuild must not lose a row");
+        for r in &rows {
+            // The space the backfill wrote must be the one the KERNEL derives, or
+            // the sweep never recomputes this partition's key and its history
+            // disappears. This is the real version of the assertion that used to
+            // compare a Rust constant against itself.
+            assert_eq!(
+                r.space_id,
+                format!("os:{}", r.module_name),
+                "0013's backfill and SpaceId::module_private must agree"
+            );
+            assert_eq!(r.key_version, "v1", "the rebuild must not claim a re-key");
+            assert_eq!(r.org_id, rows[0].org_id, "one user, one org");
+        }
+        assert_eq!(
+            rows[0].first_seen_at, "2026-08-22T00:00:00Z",
+            "first_seen_at is what it always was"
+        );
+
+        // The org exists as a row, with the user as a member — so the resolver
+        // finds it rather than minting a second one for the same person.
+        assert_eq!(
+            kv.ensure_org_for_user("alice").await.unwrap(),
+            rows[0].org_id,
+            "a migrated user must resolve to their migrated org"
+        );
+        let orgs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_orgs")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(orgs, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_0013_is_fine_on_a_database_with_no_partitions() {
+        // The common case, and the one where a backfill with a GROUP BY can
+        // quietly do something odd (insert one all-NULL org row).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        pool_migrated_up_to(&path, 13).await.close().await;
+        let kv = KvStore::open(&path).await.unwrap();
+        let orgs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_orgs")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(orgs, 0, "no partitions means no orgs to invent");
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_org_members")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(members, 0);
+    }
+
+    #[tokio::test]
+    async fn a_second_member_of_an_org_mounts_the_same_partition() {
+        // F8's entire justification is that a second member becomes cheap. Review
+        // found the catalog forbidding exactly that: the upsert guarded on
+        // `logical_user`, so once Alice had created the org's `os:calendar`
+        // partition, Bob — same org, same space, therefore the SAME derived key —
+        // affected zero rows, got a conflict, and was refused the memory
+        // capability permanently. The commit would have claimed to have made a
+        // second member possible while the storage layer said no.
+        let kv = KvStore::open_memory().await.unwrap();
+        let org = kv.ensure_org_for_user("alice").await.unwrap();
+        let now = now_iso8601();
+        sqlx::query("INSERT INTO mem_org_members (org_id, user_id, joined_at) VALUES (?, ?, ?)")
+            .bind(&org)
+            .bind("bob")
+            .bind(&now)
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.ensure_org_for_user("bob").await.unwrap(),
+            org,
+            "a member resolves to the org they are IN, not a fresh one"
+        );
+
+        let id = |user| OsPartitionIdentity {
+            owner_key: "k",
+            key_version: "v2",
+            org_id: &org,
+            space_id: "os:calendar",
+            user,
+            module: "calendar",
+        };
+        kv.record_os_partition(id("alice")).await.unwrap();
+        kv.record_os_partition(id("bob"))
+            .await
+            .expect("the second member must reach the org's own partition");
+
+        // And the row still says who created it — write-once, like module_name.
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].logical_user, "alice",
+            "logical_user records the CREATOR; Bob mounting must not rewrite it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rekey_refuses_when_another_owner_scoped_table_holds_rows() {
+        // `scope_owner` keys ten tables; this moves two. The first version of the
+        // doc said "atomically with its rows" and review was right that after such
+        // a commit the catalog points at the new key while artifacts, assertions
+        // and traces stay behind — orphaned silently.
+        //
+        // Nothing can put a row there through a module handle today, so the fix
+        // is a refusal rather than a mover written against a guess.
+        let kv = KvStore::open_memory().await.unwrap();
+        let org = kv.ensure_org_for_user("alice").await.unwrap();
+        kv.record_os_partition(OsPartitionIdentity {
+            owner_key: "old",
+            key_version: "v1",
+            org_id: &org,
+            space_id: "os:sin90",
+            user: "alice",
+            module: "sin90",
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO mem_instructions
+                 (scope_owner, id, layer, priority, body, triggers, status, at)
+             VALUES (?, 'i1', 'global', 0, 'remember this', '[]', 'active', ?)",
+        )
+        .bind("old")
+        .bind(now_iso8601())
+        .execute(&kv.pool)
+        .await
+        .unwrap();
+
+        let err = kv
+            .rekey_os_partition("old", "new", "v2")
+            .await
+            .expect_err("a partition with rows this cannot move must not move");
+        assert!(matches!(err, MemoryError::Conflict(_)), "{err}");
+        // And it refused BEFORE touching anything.
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(rows[0].owner_key, "old");
+        assert_eq!(rows[0].key_version, "v1");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -43,9 +43,12 @@
 //!   see [`OsMemoryCatalog::migrate_legacy_partitions`], the first time that
 //!   mechanism was used rather than merely described.
 //! - **Disjoint from the user's own key.** The agent loop's memory is keyed by
-//!   the bare user id, which can never equal a `v2\0…` string, so a module cannot
-//!   reach the user's own memory and the user's memory is not polluted by
-//!   modules.
+//!   the bare user id, and every partition key begins with `v2\0`, so a module
+//!   cannot reach the user's own memory and the user's memory is not polluted by
+//!   modules. Precisely: this holds for any user id that does not itself begin
+//!   with `v2\0`, and nothing validates that it does not — the daemon's only user
+//!   id is the constant `LOCAL_USER`. A future multi-user id scheme has to keep
+//!   that true, and this is the line that says so.
 //!
 //! # What F8 deliberately did NOT do
 //!
@@ -134,10 +137,23 @@ const LEGACY_KEY_VERSION: &str = "v1";
 
 /// An organisation. Opaque, stable, and never parsed.
 ///
-/// It is a value read from `mem_orgs`, NOT something derived from whoever is
-/// logged in. That distinction is the point of F8: an org whose id is a function
-/// of a user is a user wearing an org's name, and it has to be re-issued — and
-/// therefore every partition re-keyed — the day it gains a second member.
+/// It is a value read from `mem_orgs`. Orgs the kernel creates get a generated
+/// id (`org_<ULID>`) rather than one derived from whoever is logged in, which is
+/// the point of F8: an org whose id is a function of a user is a user wearing an
+/// org's name, and it has to be re-issued — and therefore every partition
+/// re-keyed — the day it gains a second member.
+///
+/// **One exception, in upgraded databases**: migration 0013 has to invent an org
+/// for each user F1 had already recorded a partition for, and SQL cannot mint a
+/// ULID, so those rows carry `org_legacy_<user>`. Review flagged the earlier
+/// wording here ("NOT something derived from whoever is logged in") as claiming
+/// more than that. What actually holds for both shapes is what callers depend
+/// on: the id is opaque, no code parses it, it is resolved by MEMBERSHIP, and it
+/// never changes again — so a legacy org gains a second member exactly as
+/// cheaply as a generated one. What does not hold is that the string is free of
+/// a user's name.
+///
+/// No module can see either shape: a handle exposes only `osmem:<ULID>` ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgId(String);
 
@@ -1062,8 +1078,16 @@ mod tests {
             partition_key(&OrgId::from_store("ab"), &SpaceId::raw("c")),
             partition_key(&OrgId::from_store("a"), &SpaceId::raw("bc")),
         );
-        // And a partition key can never equal a bare user id — the agent loop's
-        // own memory stays unreachable from a module.
+        // Disjoint from the agent loop's own keys, stated as what is actually
+        // enforced rather than as a blanket claim (review's point: the old
+        // assertion tried one literal, `"alice"`, and read as if it covered every
+        // user id). Every partition key begins with `v2\0`; nothing validates
+        // that a user id does not, so the property is "disjoint from any user id
+        // that does not itself begin with `v2\0`". The daemon's only user id is
+        // the constant `LOCAL_USER`, so today nothing can collide — but the
+        // structural half is what a future multi-user id scheme must preserve,
+        // and it is the half worth asserting.
+        assert!(k.starts_with("v2\u{0}"));
         assert_ne!(k, "alice");
 
         // Two hand-picked counter-examples are not injectivity, which is what the
@@ -1085,12 +1109,20 @@ mod tests {
     }
 
     #[test]
-    fn the_space_prefix_matches_migration_0013s_backfill() {
-        // Two spellings of one convention: `SpaceId::module_private` writes
-        // `os:<module>` in Rust, and 0013's backfill writes `'os:' || module_name`
-        // in SQL. Nothing makes them agree except this assertion, and if they
-        // drift a migrated partition gets a space id the kernel never derives —
-        // so its key is never recomputed and its history silently disappears.
+    fn a_modules_space_id_is_the_os_prefixed_module_name() {
+        // HALF of a pin, and named as half. It fixes what the Rust constructor
+        // produces; the other half — that 0013's SQL backfill produces the same
+        // string — is asserted in `agent24-memory`'s
+        // `migration_0013_gives_an_existing_0012_partition_an_org_and_a_space`,
+        // which runs the real migration and compares its `space_id` against
+        // `os:<module_name>`.
+        //
+        // Review was right that this test alone proved nothing about the SQL: it
+        // was called `the_space_prefix_matches_migration_0013s_backfill` while
+        // never reading the migration, so editing the SQL left it green. Together
+        // the two assertions pin both ends, which matters because a drift gives a
+        // migrated partition a space id the kernel never derives — its key is
+        // then never recomputed and its history silently disappears.
         assert_eq!(SpaceId::module_private("sin90").as_str(), "os:sin90");
     }
 
@@ -1484,10 +1516,6 @@ mod tests {
                 ..recorded
             },
             agent24_memory::OsPartitionIdentity {
-                user: "bob",
-                ..recorded
-            },
-            agent24_memory::OsPartitionIdentity {
                 module: "cos72",
                 ..recorded
             },
@@ -1501,10 +1529,26 @@ mod tests {
                 "{err}"
             );
         }
-        // The original row is untouched by any of the three attempts.
+
+        // `user` is NOT in that list, and its absence is the point. A partition
+        // belongs to an (org, space), so every member of the org derives this
+        // same key; demanding that the mounting user match the creator would
+        // refuse the second member forever — see
+        // `a_second_member_of_an_org_mounts_the_same_partition` in
+        // `agent24-memory`. This test had `user: "bob"` in the loop until review
+        // showed what that was really asserting.
+        kv.record_os_partition(agent24_memory::OsPartitionIdentity {
+            user: "bob",
+            ..recorded
+        })
+        .await
+        .expect("a different member of the same org must be able to mount it");
+
+        // The original row is untouched by any of it — including the creator.
         let rows = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].module_name, "sin90");
         assert_eq!(rows[0].key_version, KEY_VERSION);
+        assert_eq!(rows[0].logical_user, "alice");
     }
 }
