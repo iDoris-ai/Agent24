@@ -1,34 +1,85 @@
 //! The kernel side of [`ScopedMemory`] — a module's view of the shared memory
-//! base, keyed so that two domain OSes under one user cannot reach each other.
+//! base, keyed so that two domain OSes cannot reach each other.
+//!
+//! # What owns a memory (F8)
+//!
+//! A **space** does, inside an **org**. Not a user.
+//!
+//! F1 shipped the dimension as `(user, module)`, which is the shape of a
+//! single-user product: it makes the owner of a memory the person who happened
+//! to be logged in. The moment there are two people, the real owner is a
+//! container they both relate to — Team Shared, Finance Private, Customer A —
+//! and a user is an ACCESSOR of one. F8 separates those before there is data to
+//! migrate; a personal deployment is then an org of one rather than a different
+//! architecture.
+//!
+//! Isolation is UNCHANGED by that renaming: each module still gets its own
+//! private space ([`SpaceId::module_private`]), so there is still exactly one
+//! partition per module and still no way for one to read another's.
 //!
 //! # The key
 //!
-//! A module's partition key is derived by the KERNEL:
-//!
 //! ```text
-//!   v1\0<len(user)>\0<user>\0os:<len(module)>\0<module>
+//!   v2\0<len(org)>\0<org>\0<len(space)>\0<space>
 //! ```
 //!
 //! Three properties, each of which is load-bearing:
 //!
-//! - **LENGTH-PREFIXED**, so two different `(user, module)` pairs cannot produce
-//!   one key. The first version of this was merely NUL-separated and its own test
-//!   found the collision: `("a", "b\0os:c")` and `("a\0os:b", "c")` both rendered
-//!   as `v1\0a\0os:b\0os:c`. Neither input is reachable today — the module name
-//!   is validated ASCII — but this repo has already paid once for a concat
-//!   identity two pairs could produce (MD-5's `consol-{owner}-{key}`, review #122
-//!   B1), and "unreachable" is an argument where a length prefix is a property.
-//! - **Version-prefixed.** The adversarial review of this design was blunt about
-//!   why: baking the manifest name into storage identity creates semantic
-//!   migration debt. After a module is renamed, the database alone cannot say
-//!   whether `…os:calendar` should become `calendar`, become `schedule`, merge,
-//!   or stay separate as an uninstalled historical module. The version does not
-//!   remove that debt — [`OsMemoryCatalog`] is what makes it payable — but it
-//!   stops a future migration from having to guess which encoding it is reading.
+//! - **LENGTH-PREFIXED**, so two different `(org, space)` pairs cannot produce
+//!   one key. F1's first attempt was merely NUL-separated and its own test found
+//!   the collision: `("a", "b\0os:c")` and `("a\0os:b", "c")` both rendered as
+//!   `v1\0a\0os:b\0os:c`. Neither input is reachable today, but this repo has
+//!   already paid once for a concat identity two pairs could produce (MD-5's
+//!   `consol-{owner}-{key}`, review #122 B1), and "unreachable" is an argument
+//!   where a length prefix is a property. Widening the dimension did not get to
+//!   drop it.
+//! - **Version-prefixed.** F1's review was blunt about why: baking a name into
+//!   storage identity creates semantic migration debt, and after a module is
+//!   renamed the database alone cannot say whether `…os:calendar` should become
+//!   `calendar`, become `schedule`, merge, or stay separate as an uninstalled
+//!   historical module. The version does not remove that debt —
+//!   [`OsMemoryCatalog`] is what makes it payable — but it stops a migration from
+//!   guessing which encoding it is reading. It is also what let F8 happen at all:
+//!   see [`OsMemoryCatalog::migrate_legacy_partitions`], the first time that
+//!   mechanism was used rather than merely described.
 //! - **Disjoint from the user's own key.** The agent loop's memory is keyed by
-//!   the bare user id, which can never equal a `v1\0…` string, so a module cannot
-//!   reach the user's own memory and the user's memory is not polluted by
-//!   modules.
+//!   the bare user id, and every partition key begins with `v2\0`, so a module
+//!   cannot reach the user's own memory and the user's memory is not polluted by
+//!   modules. Precisely: this holds for any user id that does not itself begin
+//!   with `v2\0`, and nothing validates that it does not — the daemon's only user
+//!   id is the constant `LOCAL_USER`. A future multi-user id scheme has to keep
+//!   that true, and this is the line that says so.
+//!
+//! # What F8 deliberately did NOT do
+//!
+//! - **The user's own memory is still keyed by the bare user id**, not by a
+//!   space. It is the one partition with real data in the wild, and moving it is
+//!   a migration with something to lose; F8 moved the partitions that were one
+//!   day old. So "everything is space-owned" is NOT true yet, and the agent
+//!   loop's memory is the exception.
+//! - **There is no `mem_spaces` registry**, because nothing could read one. No
+//!   path creates a space that is not a module's own, since nothing can grant
+//!   access to one — a space that cannot be granted does not exist yet.
+//! - **There are no roles, policies or permissions.** The org has members and
+//!   nothing else. Whether an accessor MAY reach a space is not asked anywhere;
+//!   isolation is still "your key or nothing", which is a partition, not a
+//!   decision. Do not describe this file as access control.
+//! - **There is no membership WORKFLOW.** This is the limitation most easily
+//!   overstated, so it is stated flatly: what F8 delivers is the ownership
+//!   DIMENSION, not a feature for adding people to orgs. The daemon creates
+//!   exactly one org, for its one user, and never calls
+//!   `KvStore::add_org_member` — which itself refuses any user who already has
+//!   an org, i.e. anyone who has ever started the daemon. So no supported path
+//!   puts a second member into an org today, and every claim here about a second
+//!   member is a claim about what the STORAGE MODEL admits, not about behaviour a
+//!   user can reach.
+//!
+//!   That is the intended scope rather than an unfinished corner. F8's whole
+//!   argument is that the ownership dimension has to be right BEFORE there is
+//!   data to migrate, because that is the part a later change cannot do cheaply;
+//!   a membership workflow can be built any time, against whatever the real
+//!   requirements turn out to be, and building one now would be inventing them.
+//!   What had to happen while the catalog was one day old has happened.
 //!
 //! # What this does NOT do
 //!
@@ -91,24 +142,110 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// The derived-key format version. Bump ONLY together with a migration that can
 /// read the previous one — the catalog is what makes that possible.
-const KEY_VERSION: &str = "v1";
+///
+/// `v1` was F1's `(user, module)`. `v2` is F8's `(org, space)`: same isolation,
+/// a dimension that can hold more than one person.
+const KEY_VERSION: &str = "v2";
 
-/// Derive a module's partition key. Kernel-only: nothing a module can call.
+/// F1's key format, kept ONLY so partitions written under it can be found and
+/// re-keyed. Nothing new is ever written with this.
+const LEGACY_KEY_VERSION: &str = "v1";
+
+/// An organisation. Opaque, stable, and never parsed.
 ///
-/// LENGTH-PREFIXED, not merely separated. A plain `v1\0{user}\0os:{module}` looks
-/// unambiguous and is not: `("a", "b\0os:c")` and `("a\0os:b", "c")` both render
-/// as `v1\0a\0os:b\0os:c`. The module name is validated ASCII so today neither
-/// input is reachable — but "unreachable" is an argument, and this repo has
-/// already paid once for a concat identity that two different pairs could produce
-/// (MD-5's `consol-{owner}-{key}`, review #122 B1). A length prefix makes the
-/// collision unrepresentable for ANY input, which is a property rather than an
-/// argument.
+/// It is a value read from `mem_orgs`. Orgs the kernel creates get a generated
+/// id (`org_<ULID>`) rather than one derived from whoever is logged in, which is
+/// the point of F8: an org whose id is a function of a user is a user wearing an
+/// org's name, and it has to be re-issued — and therefore every partition
+/// re-keyed — the day it gains a second member.
 ///
-/// (Found by this file's own test, which asserted the collision was impossible
-/// and discovered it was not.)
-pub(crate) fn partition_key(user: &str, module: &str) -> String {
+/// **One exception, in upgraded databases**: migration 0013 has to invent an org
+/// for each user F1 had already recorded a partition for, and SQL cannot mint a
+/// ULID, so those rows carry `org_legacy_<user>`. Review flagged the earlier
+/// wording here ("NOT something derived from whoever is logged in") as claiming
+/// more than that. What actually holds for both shapes is what callers depend
+/// on: the id is opaque, no code parses it, it is resolved by MEMBERSHIP, and it
+/// never changes again — so a legacy org gains a second member exactly as
+/// cheaply as a generated one. What does not hold is that the string is free of
+/// a user's name.
+///
+/// No module can see either shape: a handle exposes only `osmem:<ULID>` ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgId(String);
+
+impl OrgId {
+    /// Wrap an id the store issued. Named for its caller: only the kernel, and
+    /// only with a value that came from `mem_orgs`.
+    pub fn from_store(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A container of memories within an org — the thing that OWNS a partition.
+///
+/// The user's examples are the shape to hold in mind: Team Shared, Finance
+/// Private, Customer A. A person is an accessor of one, not the owner of it.
+///
+/// Today exactly one kind is constructible, [`Self::module_private`], which
+/// reproduces F1's isolation exactly: one partition per module. Shared spaces
+/// are deliberately not constructible, because nothing can grant access to one
+/// — a space that cannot be granted does not exist, and a constructor for it
+/// would be an API promising a capability the kernel does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceId(String);
+
+impl SpaceId {
+    /// A module's own private space.
+    ///
+    /// The `os:` prefix is also written by migration 0013's backfill; the two
+    /// are pinned to each other by a test, because one convention spelled in two
+    /// places is how they drift.
+    pub fn module_private(module: &str) -> Self {
+        Self(format!("os:{module}"))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// An arbitrary space id, for testing the KEY ENCODER against inputs no
+    /// production path can produce.
+    ///
+    /// `#[cfg(test)]` on purpose: a public one would be a constructor for shared
+    /// spaces, which is the capability this type deliberately does not have yet.
+    #[cfg(test)]
+    pub(crate) fn raw(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+/// Derive a partition key. Kernel-only: nothing a module can call.
+///
+/// LENGTH-PREFIXED, not merely separated. A plain `v2\0{org}\0{space}` looks
+/// unambiguous and is not — F1's own test found the equivalent collision in the
+/// v1 format: `("a", "b\0os:c")` and `("a\0os:b", "c")` both rendered as
+/// `v1\0a\0os:b\0os:c`. Both components are constrained today, but "unreachable"
+/// is an argument where a length prefix is a property, and this repo has already
+/// paid once for a concat identity that two different pairs could produce (MD-5's
+/// `consol-{owner}-{key}`, review #122 B1).
+///
+/// The lengths are BYTE counts, which is why the equivalent cannot be written in
+/// SQL: SQLite's `length()` counts characters, so a non-ASCII org id would give a
+/// migration a key that silently disagrees with this one.
+pub(crate) fn partition_key(org: &OrgId, space: &SpaceId) -> String {
+    let (o, s) = (org.as_str(), space.as_str());
     format!(
-        "{KEY_VERSION}\u{0}{}\u{0}{user}\u{0}os:{}\u{0}{module}",
+        "{KEY_VERSION}\u{0}{}\u{0}{o}\u{0}{}\u{0}{s}",
+        o.len(),
+        s.len()
+    )
+}
+
+/// F1's key, for finding what must be re-keyed. Never used to write.
+pub(crate) fn legacy_partition_key(user: &str, module: &str) -> String {
+    format!(
+        "{LEGACY_KEY_VERSION}\u{0}{}\u{0}{user}\u{0}os:{}\u{0}{module}",
         user.len(),
         module.len()
     )
@@ -122,13 +259,21 @@ pub(crate) fn partition_key(user: &str, module: &str) -> String {
 /// user and which module a physical key belongs to.
 ///
 /// It is deliberately built from what the kernel already knows at mount time —
-/// the authenticated user and the VALIDATED manifest — rather than parsed back
-/// out of the key.
+/// the resolved org, the authenticated user and the VALIDATED manifest — rather
+/// than parsed back out of the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OsMemoryPartition {
     /// The physical `scope_owner` value used in storage.
     pub key: String,
-    /// The logical user the partition belongs to.
+    /// The org that owns this partition.
+    pub org: OrgId,
+    /// The space within that org — the actual owner of the memories.
+    pub space: SpaceId,
+    /// The logical user the partition was created for.
+    ///
+    /// NOT the same fact as [`Self::org`], and kept separate for the day they
+    /// stop lining up: the org is who the data belongs to, this is who caused it
+    /// to exist. The export/erase path reads it.
     pub user: String,
     /// The module's manifest name AT THE TIME OF MOUNT.
     ///
@@ -160,7 +305,7 @@ pub struct OsMemoryPartition {
 /// Those four are the entire reason a catalog was required. So [`Self::record`]
 /// now WRITES, and the `Vec` is what it says it is: this run's mount inventory,
 /// used for the startup log and for tests. Anything asking "which partitions
-/// exist for this user" must ask the table — [`Self::durable_for`] — not this.
+/// exist for this org" must ask the table — [`Self::durable_for_org`] — not this.
 #[derive(Debug, Clone, Default)]
 pub struct OsMemoryCatalog {
     partitions: Vec<OsMemoryPartition>,
@@ -176,20 +321,109 @@ impl OsMemoryCatalog {
     /// attribute to a user or a module.
     pub async fn record(
         &mut self,
+        org: &OrgId,
         user: &str,
         manifest: &DomainOsManifest,
         kv: &agent24_memory::KvStore,
     ) -> Result<OsMemoryPartition, String> {
+        let space = SpaceId::module_private(manifest.name());
         let p = OsMemoryPartition {
-            key: partition_key(user, manifest.name()),
+            key: partition_key(org, &space),
+            org: org.clone(),
+            space,
             user: user.to_owned(),
             module: manifest.name().to_owned(),
         };
-        kv.record_os_partition(&p.key, KEY_VERSION, &p.user, &p.module)
-            .await
-            .map_err(|e| e.to_string())?;
+        kv.record_os_partition(agent24_memory::OsPartitionIdentity {
+            owner_key: &p.key,
+            key_version: KEY_VERSION,
+            org_id: p.org.as_str(),
+            space_id: p.space.as_str(),
+            user: &p.user,
+            module: &p.module,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         self.partitions.push(p.clone());
         Ok(p)
+    }
+
+    /// Re-key every partition still stored under F1's `v1` format.
+    ///
+    /// Returns how many partitions moved. Errors are per-partition and do NOT
+    /// abort the sweep: one partition whose target key is already taken must not
+    /// stop the others from migrating, because leaving them on v1 means the
+    /// kernel derives a v2 key at mount, finds an empty partition, and the
+    /// module silently loses its history. The failure is logged and the row
+    /// stays on v1 so a later run can retry it.
+    ///
+    /// # This is the catalog's first real job
+    ///
+    /// F1 built `mem_os_partitions` for exactly this — "a future export, erase or
+    /// key-version migration has an explicit list instead of prefix-matching
+    /// strings that contain NUL" — and then shipped without ever exercising it.
+    /// Doing the v1→v2 move through the catalog now, while the only rows that
+    /// exist are on developer machines that ran `main` since yesterday, is the
+    /// one chance to find out whether that mechanism works while being wrong
+    /// costs nothing.
+    pub async fn migrate_legacy_partitions(kv: &agent24_memory::KvStore) -> Result<usize, String> {
+        let stale = kv
+            .os_partitions_with_key_version(LEGACY_KEY_VERSION)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut moved = 0usize;
+        for row in stale {
+            // Recomputed, never trusted: if the stored key does not match what
+            // F1's encoder would have produced for this row's own identity, the
+            // row and the key disagree and this code does not know which is
+            // right. Rewriting on a guess is how one module's memories end up in
+            // another's partition.
+            let expected = legacy_partition_key(&row.logical_user, &row.module_name);
+            if expected != row.owner_key {
+                tracing::error!(
+                    owner_key = %row.owner_key.escape_debug(),
+                    "catalog row does not match the v1 key its own (user, module) \
+                     would produce; leaving it alone rather than re-keying on a guess"
+                );
+                continue;
+            }
+            let org = OrgId::from_store(&row.org_id);
+            let space = SpaceId::module_private(&row.module_name);
+            if space.as_str() != row.space_id {
+                tracing::error!(
+                    owner_key = %row.owner_key.escape_debug(),
+                    "catalog row's space_id disagrees with its module_name; leaving it"
+                );
+                continue;
+            }
+            let new_key = partition_key(&org, &space);
+            match kv
+                .rekey_os_partition(&row.owner_key, &new_key, KEY_VERSION)
+                .await
+            {
+                Ok(events) => {
+                    moved += 1;
+                    tracing::info!(
+                        module = %row.module_name,
+                        events,
+                        "re-keyed a v1 memory partition onto its (org, space) identity"
+                    );
+                }
+                // The module does NOT then mount with an empty partition: the
+                // stale v1 row still holds this (org, space), and that pair is
+                // UNIQUE in the catalog, so `record` fails and `lend` withholds
+                // the capability entirely. Losing memory for a run is the
+                // correct outcome; silently starting a fresh partition beside
+                // the old one is not.
+                Err(e) => tracing::error!(
+                    module = %row.module_name,
+                    error = %e,
+                    "could not re-key a v1 memory partition; it stays on v1, and this \
+                     module will be refused the memory capability until it is resolved"
+                ),
+            }
+        }
+        Ok(moved)
     }
 
     /// What mounted this run. NOT the answer to "what exists" — see the type docs.
@@ -197,17 +431,28 @@ impl OsMemoryCatalog {
         &self.partitions
     }
 
-    /// Every partition EVER recorded for `user`, from the durable table.
+    /// Every partition EVER recorded for `org`, from the durable table.
     ///
     /// The answer an export or erase path needs, and the reason it must not be a
     /// `LIKE` query over keys that contain NUL. Includes partitions belonging to
     /// modules that are disabled, uninstalled or renamed — which is the whole
     /// point, and the thing this run's [`Self::partitions`] cannot tell you.
-    pub async fn durable_for(
+    ///
+    /// # Keyed by ORG, because that is what owns a partition
+    ///
+    /// This took the user until round 3 to follow the storage layer. It was
+    /// `durable_for(kv, user)` over `os_partitions_for`, which after round 2
+    /// answers only "what did this user CREATE" — so the startup inventory
+    /// undercounted by exactly the partitions a second member had written to but
+    /// not created, which is the population F8 exists for. Review caught that the
+    /// storage layer had been split and its caller had not.
+    pub async fn durable_for_org(
         kv: &agent24_memory::KvStore,
-        user: &str,
+        org: &OrgId,
     ) -> Result<Vec<agent24_memory::OsPartitionRow>, String> {
-        kv.os_partitions_for(user).await.map_err(|e| e.to_string())
+        kv.os_partitions_for_org(org.as_str())
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -484,9 +729,16 @@ mod tests {
         .unwrap()
     }
 
+    /// The org a user acts in, through the same resolver the daemon uses — so a
+    /// test cannot accidentally pin an org id the kernel would never produce.
+    async fn org_of(kv: &agent24_memory::KvStore, user: &str) -> OrgId {
+        OrgId::from_store(kv.ensure_org_for_user(user).await.unwrap())
+    }
+
     async fn handle(kv: &agent24_memory::KvStore, user: &str, name: &str) -> OsScopedMemory {
         let mut cat = OsMemoryCatalog::default();
-        let p = cat.record(user, &manifest(name), kv).await.unwrap();
+        let org = org_of(kv, user).await;
+        let p = cat.record(&org, user, &manifest(name), kv).await.unwrap();
         OsScopedMemory::new(&p, kv)
     }
 
@@ -629,11 +881,12 @@ mod tests {
                 },
             )
         };
-        log.append(&ev(&partition_key("alice", "sin90")))
+        let org = org_of(&kv, "alice").await;
+        log.append(&ev(&partition_key(&org, &SpaceId::module_private("sin90"))))
             .await
             .unwrap();
         let err = log
-            .append(&ev(&partition_key("alice", "cos72")))
+            .append(&ev(&partition_key(&org, &SpaceId::module_private("cos72"))))
             .await
             .expect_err("the same id under another owner must not be aliased");
         assert!(
@@ -832,38 +1085,239 @@ mod tests {
 
     #[test]
     fn the_partition_key_is_versioned_and_unambiguous() {
-        let k = partition_key("alice", "sin90");
-        assert!(k.starts_with("v1\u{0}"), "{k:?}");
+        let k = partition_key(
+            &OrgId::from_store("org_1"),
+            &SpaceId::module_private("sin90"),
+        );
+        assert!(k.starts_with("v2\u{0}"), "{k:?}");
         // The concat-collision shape this repo already paid for once (#122 B1):
-        // two different (user, module) pairs must not produce one key. The FIRST
-        // version of this key failed exactly here — both of these rendered as
-        // `v1\0a\0os:b\0os:c` — which is why the parts are length-prefixed.
+        // two different (org, space) pairs must not produce one key. The v1 key
+        // failed exactly here — `("a", "b\0os:c")` and `("a\0os:b", "c")` both
+        // rendered as `v1\0a\0os:b\0os:c` — which is why the parts are
+        // length-prefixed, and why widening the dimension did not get to drop it.
         assert_ne!(
-            partition_key("a", "b\u{0}os:c"),
-            partition_key("a\u{0}os:b", "c"),
+            partition_key(&OrgId::from_store("a"), &SpaceId::raw("b\u{0}c")),
+            partition_key(&OrgId::from_store("a\u{0}b"), &SpaceId::raw("c")),
         );
         // Same shape without any NUL in the inputs, so it does not rely on an
-        // exotic user id to be meaningful.
-        assert_ne!(partition_key("ab", "c"), partition_key("a", "bc"));
-        // And a module's key can never equal a bare user id.
+        // exotic id to be meaningful.
+        assert_ne!(
+            partition_key(&OrgId::from_store("ab"), &SpaceId::raw("c")),
+            partition_key(&OrgId::from_store("a"), &SpaceId::raw("bc")),
+        );
+        // Disjoint from the agent loop's own keys, stated as what is actually
+        // enforced rather than as a blanket claim (review's point: the old
+        // assertion tried one literal, `"alice"`, and read as if it covered every
+        // user id). Every partition key begins with `v2\0`; nothing validates
+        // that a user id does not, so the property is "disjoint from any user id
+        // that does not itself begin with `v2\0`". The daemon's only user id is
+        // the constant `LOCAL_USER`, so today nothing can collide — but the
+        // structural half is what a future multi-user id scheme must preserve,
+        // and it is the half worth asserting.
+        assert!(k.starts_with("v2\u{0}"));
         assert_ne!(k, "alice");
 
         // Two hand-picked counter-examples are not injectivity, which is what the
         // key actually has to have. Sweep a small cross product — including the
         // adversarial inputs (embedded NUL, the `os:` marker, a shared prefix) —
         // and assert the mapping is one-to-one.
-        let users = ["", "a", "ab", "abc", "a\u{0}b", "os:a", "alice"];
-        let modules = ["", "a", "ab", "abc", "b\u{0}os:c", "os:b", "sin90"];
+        let orgs = ["", "a", "ab", "abc", "a\u{0}b", "os:a", "org_1"];
+        let spaces = ["", "a", "ab", "abc", "b\u{0}os:c", "os:b", "os:sin90"];
         let mut seen = std::collections::HashMap::new();
-        for u in users {
-            for m in modules {
-                let key = partition_key(u, m);
-                if let Some(prev) = seen.insert(key.clone(), (u, m)) {
-                    panic!("collision: {prev:?} and {:?} both produce {key:?}", (u, m));
+        for o in orgs {
+            for s in spaces {
+                let key = partition_key(&OrgId::from_store(o), &SpaceId::raw(s));
+                if let Some(prev) = seen.insert(key.clone(), (o, s)) {
+                    panic!("collision: {prev:?} and {:?} both produce {key:?}", (o, s));
                 }
             }
         }
-        assert_eq!(seen.len(), users.len() * modules.len());
+        assert_eq!(seen.len(), orgs.len() * spaces.len());
+    }
+
+    #[test]
+    fn a_modules_space_id_is_the_os_prefixed_module_name() {
+        // HALF of a pin, and named as half. It fixes what the Rust constructor
+        // produces; the other half — that 0013's SQL backfill produces the same
+        // string — is asserted in `agent24-memory`'s
+        // `migration_0013_gives_an_existing_0012_partition_an_org_and_a_space`,
+        // which runs the real migration and compares its `space_id` against
+        // `os:<module_name>`.
+        //
+        // Review was right that this test alone proved nothing about the SQL: it
+        // was called `the_space_prefix_matches_migration_0013s_backfill` while
+        // never reading the migration, so editing the SQL left it green. Together
+        // the two assertions pin both ends, which matters because a drift gives a
+        // migrated partition a space id the kernel never derives — its key is
+        // then never recomputed and its history silently disappears.
+        assert_eq!(SpaceId::module_private("sin90").as_str(), "os:sin90");
+    }
+
+    #[tokio::test]
+    async fn a_v1_partition_is_rekeyed_onto_its_org_and_space() {
+        // The catalog's FIRST real job. F1 built `mem_os_partitions` so that a
+        // future key-version migration would have an explicit list instead of
+        // prefix-matching NUL-bearing strings — and shipped without ever
+        // exercising it. This is that exercise, run while the only rows in
+        // existence are on machines that ran `main` since yesterday.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let org = org_of(&kv, "alice").await;
+        let old_key = legacy_partition_key("alice", "sin90");
+
+        // A partition exactly as F1 would have left it: v1 key, v1 rows.
+        kv.record_os_partition(agent24_memory::OsPartitionIdentity {
+            owner_key: &old_key,
+            key_version: "v1",
+            org_id: org.as_str(),
+            space_id: "os:sin90",
+            user: "alice",
+            module: "sin90",
+        })
+        .await
+        .unwrap();
+        let log = kv.events();
+        for i in 0..3 {
+            log.append(&MemEvent::new(
+                format!("osmem:legacy-{i}"),
+                Scope::owner(&old_key),
+                "note",
+                serde_json::json!({"n": i}),
+                Origin {
+                    source: "os:sin90".into(),
+                    trust: Trust::ToolOutput,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            OsMemoryCatalog::migrate_legacy_partitions(&kv)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // The module mounts, derives its v2 key with no knowledge of any of
+        // this, and finds its history where it left it. That is the whole claim.
+        let sin90 = handle(&kv, "alice", "sin90").await;
+        assert_eq!(
+            sin90.recent(10).await.unwrap().len(),
+            3,
+            "a re-keyed partition must still be the module's own memory"
+        );
+        assert!(
+            log.scan(&EventQuery::owner(&old_key))
+                .await
+                .unwrap()
+                .is_empty(),
+            "and nothing may be left behind under the old key"
+        );
+        // Idempotent: a second run finds no v1 rows and moves nothing.
+        assert_eq!(
+            OsMemoryCatalog::migrate_legacy_partitions(&kv)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_rekey_leaves_both_partitions_exactly_as_they_were() {
+        // The failure mode that would make this migration worse than not
+        // migrating: the events move onto the occupied key while the catalog
+        // does not follow, silently pouring one partition's memories into
+        // another's — a cross-partition leak produced by the code written to
+        // keep partitions apart.
+        //
+        // It is the TRANSACTION that prevents that, not the up-front occupied
+        // check. An earlier version of this test asserted only that an error
+        // came back, and a mutation check showed it passed with the check
+        // deleted — the catalog's primary key rejects the second row either way.
+        // So what this asserts is the part that would actually break: after the
+        // refusal, no event has moved.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let org = org_of(&kv, "alice").await;
+        let space = SpaceId::module_private("sin90");
+        let occupied = partition_key(&org, &space);
+        let old_key = legacy_partition_key("alice", "sin90");
+
+        // The v2 partition already exists (this daemon ran once), and a v1 row
+        // for the same identity is still there (an earlier sweep failed).
+        kv.record_os_partition(agent24_memory::OsPartitionIdentity {
+            owner_key: &occupied,
+            key_version: KEY_VERSION,
+            org_id: org.as_str(),
+            space_id: space.as_str(),
+            user: "alice",
+            module: "sin90",
+        })
+        .await
+        .unwrap();
+
+        // One memory on each side, so a merge would be visible as a count.
+        let log = kv.events();
+        for (id, owner) in [("osmem:stale", &old_key), ("osmem:live", &occupied)] {
+            log.append(&MemEvent::new(
+                id,
+                Scope::owner(owner),
+                "note",
+                serde_json::json!({}),
+                Origin {
+                    source: "test".into(),
+                    trust: Trust::ToolOutput,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+
+        let err = kv
+            .rekey_os_partition(&old_key, &occupied, KEY_VERSION)
+            .await
+            .expect_err("merging two partitions must never be automatic");
+        assert!(
+            matches!(err, agent24_memory::MemoryError::Conflict(_)),
+            "{err}"
+        );
+
+        // THE assertion: the occupied partition still holds exactly its own
+        // memory, and the stale one still holds exactly its own.
+        assert_eq!(
+            log.scan(&EventQuery::owner(&occupied)).await.unwrap().len(),
+            1,
+            "a refused re-key must not have poured the other partition in"
+        );
+        assert_eq!(
+            log.scan(&EventQuery::owner(&old_key)).await.unwrap().len(),
+            1,
+            "and must not have half-moved the stale one either"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_an_org_is_stable_and_the_id_is_opaque() {
+        // Named for what it checks. The ambiguity path — a user in TWO orgs
+        // erroring instead of picking one — needs a second membership row, which
+        // no API here can create, so it is tested in `agent24-memory` where the
+        // pool is reachable. A test that cannot construct the state it claims to
+        // cover is the kind this repo has already deleted once.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let first = kv.ensure_org_for_user("alice").await.unwrap();
+        assert_eq!(
+            kv.ensure_org_for_user("alice").await.unwrap(),
+            first,
+            "resolving twice must be the same org, not a second one"
+        );
+        assert_ne!(
+            kv.ensure_org_for_user("bob").await.unwrap(),
+            first,
+            "two users must not land in one org by accident"
+        );
+        // The org id is opaque: nothing may recover the user from it, which is
+        // the property that makes it survivable when the org gains a second
+        // member.
+        assert!(!first.contains("alice"), "{first}");
     }
 
     #[tokio::test]
@@ -872,23 +1326,41 @@ mod tests {
         // partitions by LIKE-matching strings that contain NUL.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let mut cat = OsMemoryCatalog::default();
-        cat.record("alice", &manifest("sin90"), &kv).await.unwrap();
-        cat.record("alice", &manifest("cos72"), &kv).await.unwrap();
-        cat.record("bob", &manifest("sin90"), &kv).await.unwrap();
+        cat.record(
+            &org_of(&kv, "alice").await,
+            "alice",
+            &manifest("sin90"),
+            &kv,
+        )
+        .await
+        .unwrap();
+        cat.record(
+            &org_of(&kv, "alice").await,
+            "alice",
+            &manifest("cos72"),
+            &kv,
+        )
+        .await
+        .unwrap();
+        cat.record(&org_of(&kv, "bob").await, "bob", &manifest("sin90"), &kv)
+            .await
+            .unwrap();
 
-        let alice = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let alice = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         assert_eq!(alice.len(), 2);
         assert!(alice.iter().all(|r| r.logical_user == "alice"));
         assert!(alice.iter().all(|r| r.key_version == KEY_VERSION));
         assert_eq!(
-            OsMemoryCatalog::durable_for(&kv, "bob")
+            OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "bob").await)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert!(
-            OsMemoryCatalog::durable_for(&kv, "nobody")
+            OsMemoryCatalog::durable_for_org(&kv, &OrgId::from_store("org_that_owns_nothing"))
                 .await
                 .unwrap()
                 .is_empty()
@@ -911,7 +1383,10 @@ mod tests {
         {
             let mut cat = OsMemoryCatalog::default();
             for name in ["sin90", "cos72"] {
-                let p = cat.record("alice", &manifest(name), &kv).await.unwrap();
+                let p = cat
+                    .record(&org_of(&kv, "alice").await, "alice", &manifest(name), &kv)
+                    .await
+                    .unwrap();
                 OsScopedMemory::new(&p, &kv)
                     .remember(Remember::new("note", serde_json::Map::new()))
                     .await
@@ -921,12 +1396,19 @@ mod tests {
         // Run 2: cos72 has been disabled, and sin90 renamed to schedule — so the
         // fresh run's inventory knows about ONE partition while three exist.
         let mut run2 = OsMemoryCatalog::default();
-        run2.record("alice", &manifest("schedule"), &kv)
-            .await
-            .unwrap();
+        run2.record(
+            &org_of(&kv, "alice").await,
+            "alice",
+            &manifest("schedule"),
+            &kv,
+        )
+        .await
+        .unwrap();
         assert_eq!(run2.partitions().len(), 1);
 
-        let rows = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let rows = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         let mut names: Vec<&str> = rows.iter().map(|r| r.module_name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -954,10 +1436,29 @@ mod tests {
         // must NOT rewrite the row that says what the key originally meant.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let mut cat = OsMemoryCatalog::default();
-        let p = cat.record("alice", &manifest("sin90"), &kv).await.unwrap();
-        let first = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
-        cat.record("alice", &manifest("sin90"), &kv).await.unwrap();
-        let again = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let p = cat
+            .record(
+                &org_of(&kv, "alice").await,
+                "alice",
+                &manifest("sin90"),
+                &kv,
+            )
+            .await
+            .unwrap();
+        let first = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
+        cat.record(
+            &org_of(&kv, "alice").await,
+            "alice",
+            &manifest("sin90"),
+            &kv,
+        )
+        .await
+        .unwrap();
+        let again = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         assert_eq!(again.len(), 1, "one row per partition, ever");
         assert_eq!(again[0].owner_key, p.key);
         assert_eq!(again[0].first_seen_at, first[0].first_seen_at);
@@ -977,12 +1478,30 @@ mod tests {
         // rather than asserting around it.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let mut cat = OsMemoryCatalog::default();
-        cat.record("alice", &manifest("sin90"), &kv).await.unwrap();
-        let first = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        cat.record(
+            &org_of(&kv, "alice").await,
+            "alice",
+            &manifest("sin90"),
+            &kv,
+        )
+        .await
+        .unwrap();
+        let first = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        cat.record("alice", &manifest("sin90"), &kv).await.unwrap();
-        let again = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        cat.record(
+            &org_of(&kv, "alice").await,
+            "alice",
+            &manifest("sin90"),
+            &kv,
+        )
+        .await
+        .unwrap();
+        let again = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
 
         assert!(
             again[0].last_seen_at > first[0].last_seen_at,
@@ -1004,18 +1523,62 @@ mod tests {
         // `last_seen_at`, so a drifted row returned `Ok`, the handle was lent, and
         // the catalog went on attributing new data to the old identity.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
-        let key = partition_key("alice", "sin90");
-        kv.record_os_partition(&key, KEY_VERSION, "alice", "sin90")
-            .await
-            .unwrap();
+        let org = org_of(&kv, "alice").await;
+        let space = SpaceId::module_private("sin90");
+        let key = partition_key(&org, &space);
+        let recorded = agent24_memory::OsPartitionIdentity {
+            owner_key: &key,
+            key_version: KEY_VERSION,
+            org_id: org.as_str(),
+            space_id: space.as_str(),
+            user: "alice",
+            module: "sin90",
+        };
+        kv.record_os_partition(recorded).await.unwrap();
 
-        for (ver, user, module) in [
-            ("v2", "alice", "sin90"),
-            (KEY_VERSION, "bob", "sin90"),
-            (KEY_VERSION, "alice", "cos72"),
+        // Every column that IS the identity, drifted one at a time. `org_id` and
+        // `space_id` are the two F8 adds, and they matter most: they are what the
+        // key encodes, so a row claiming a different one means the encoder and the
+        // catalog have diverged and the handle must not be lent.
+        // Carol's, not Bob's: Bob is about to be added to ALICE's org below, and
+        // `add_org_member` now refuses a user who already has one of their own —
+        // which is the whole point of that refusal, and which giving Bob an org
+        // here would walk straight into.
+        let other_org = org_of(&kv, "carol").await;
+        for drifted in [
+            agent24_memory::OsPartitionIdentity {
+                key_version: "v3-from-a-newer-kernel",
+                ..recorded
+            },
+            agent24_memory::OsPartitionIdentity {
+                org_id: other_org.as_str(),
+                // Carol, not Alice — and the `user` field is what makes this arm
+                // test the thing it names.
+                //
+                // Review caught that with `user` left as "alice", this case never
+                // reached the org_id guard at all: `record_os_partition` checks
+                // membership FIRST, Alice is not in Carol's org, and the conflict
+                // came back from there. The assertion below was satisfied by a
+                // different mechanism, which left `AND org_id = excluded.org_id`
+                // as the ONLY one of the five identity guards with zero coverage
+                // — delete that line and the whole workspace stayed green.
+                //
+                // Carol is a legitimate member of her own org, so membership
+                // passes and the guard is what refuses her.
+                user: "carol",
+                ..recorded
+            },
+            agent24_memory::OsPartitionIdentity {
+                space_id: "os:cos72",
+                ..recorded
+            },
+            agent24_memory::OsPartitionIdentity {
+                module: "cos72",
+                ..recorded
+            },
         ] {
             let err = kv
-                .record_os_partition(&key, ver, user, module)
+                .record_os_partition(drifted)
                 .await
                 .expect_err("a disagreeing identity must not be accepted");
             assert!(
@@ -1023,10 +1586,34 @@ mod tests {
                 "{err}"
             );
         }
-        // The original row is untouched by any of the three attempts.
-        let rows = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+
+        // `user` is NOT in that list, and its absence is the point. A partition
+        // belongs to an (org, space), so every member of the org derives this
+        // same key; demanding that the mounting user match the creator would
+        // refuse the second member forever — see
+        // `a_second_member_of_an_org_mounts_the_same_partition` in
+        // `agent24-memory`. This test had `user: "bob"` in the loop until review
+        // showed what that was really asserting.
+        //
+        // Bob has to be MADE a member first. The earlier version of this did not,
+        // and passed — which review caught as the second half of the same
+        // mistake: dropping the guard had also let the storage API record a
+        // creator from outside the org entirely.
+        kv.add_org_member(org.as_str(), "bob").await.unwrap();
+        kv.record_os_partition(agent24_memory::OsPartitionIdentity {
+            user: "bob",
+            ..recorded
+        })
+        .await
+        .expect("a different member of the same org must be able to mount it");
+
+        // The original row is untouched by any of it — including the creator.
+        let rows = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].module_name, "sin90");
         assert_eq!(rows[0].key_version, KEY_VERSION);
+        assert_eq!(rows[0].logical_user, "alice");
     }
 }

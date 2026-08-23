@@ -44,6 +44,13 @@
 //!   caller-minted ids at all (see [`Remembered`]); the kernel mints them.
 //! - **`agent` / `session` / `run` are NOT isolation boundaries.** They exist in
 //!   the serialized `Scope` and are enforced nowhere. Only `owner` is.
+//! - **This is not access control.** As of F8 the partition is owned by a SPACE
+//!   inside an org rather than by a user — which is what lets a second person
+//!   exist later without re-keying everything — but nothing yet asks whether an
+//!   accessor MAY reach a space. A module gets exactly one space and cannot name
+//!   another, so isolation is still a partition, not a decision. When a policy
+//!   decision point arrives, it will be the kernel's, and this trait still will
+//!   not take a space as a parameter: see rule 1.
 //! - **This is not a sandbox.** An in-process module is trusted code, as the
 //!   crate-level trust model says. What this bounds is what the kernel HANDS
 //!   OVER, not what a determined module could reach by other means.

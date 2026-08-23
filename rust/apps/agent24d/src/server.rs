@@ -776,10 +776,10 @@ pub async fn serve(
     };
     // A module gets memory only if the base actually opened. No base, no lease,
     // no handle — rather than a handle that fails on every call.
-    let lease = memory_base.map(|kv| crate::domain::MemoryLease {
-        user: LOCAL_USER.to_owned(),
-        kv,
-    });
+    let lease = match memory_base {
+        Some(kv) => crate::domain::MemoryLease::open(LOCAL_USER, kv).await,
+        None => None,
+    };
     let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
@@ -802,7 +802,7 @@ pub async fn serve(
     // no longer installed: those are the ones an operator would otherwise never
     // learn about, and the ones an export or erase path must not miss.
     if let Some(l) = lease.as_ref() {
-        match crate::os_memory::OsMemoryCatalog::durable_for(&l.kv, LOCAL_USER).await {
+        match crate::os_memory::OsMemoryCatalog::durable_for_org(&l.kv, &l.org).await {
             Ok(rows) if !rows.is_empty() => {
                 // By physical KEY, not by module name. After a key-version change a
                 // mounted module gets a NEW partition while its historical rows keep
@@ -817,9 +817,17 @@ pub async fn serve(
                     .iter()
                     .filter(|r| !live.contains(r.owner_key.as_str()))
                     .count();
+                // "not mounted now" describes the PARTITION, not the module. The
+                // comment above already said why and the message used to
+                // contradict it: after a re-key, the leftover row keeps the same
+                // module name while that module is mounted perfectly well under
+                // its new key, so calling those rows "modules not mounted" is
+                // false exactly where an operator most needs the truth.
                 tracing::info!(
-                    "user {LOCAL_USER} has {} domain-OS memory partition(s) besides their \
-                     own memory, {dormant} of them belonging to modules not mounted now",
+                    "org {} owns {} domain-OS memory partition(s) besides {LOCAL_USER}'s \
+                     own memory; {dormant} of them are not mounted under that key now \
+                     (a disabled or uninstalled module, a rename, or an older key version)",
+                    l.org.as_str(),
                     rows.len()
                 );
             }
