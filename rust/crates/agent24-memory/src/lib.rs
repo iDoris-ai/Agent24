@@ -422,26 +422,56 @@ impl KvStore {
         Ok(org_id)
     }
 
-    /// Add `user` to `org`. Idempotent.
+    /// Add `user` to `org`, if `user` has no org yet. Idempotent.
     ///
-    /// The only way membership grows, and it exists because without it F8's
-    /// central claim — that an org gaining a second member is cheap — could not
-    /// be exercised by anything, in tests or in production. A model no code can
-    /// reach is a model no one has checked.
+    /// The only way membership grows. It exists because without it F8's central
+    /// claim — that an org gaining a second member is cheap — could not be
+    /// exercised by anything, and a model no code can reach is a model nobody has
+    /// checked.
+    ///
+    /// # It REFUSES a user who already belongs to a different org, and that
+    /// refusal is the honest half of the feature
+    ///
+    /// The first version did not, which review caught as worse than useless: a
+    /// user who has ever started the daemon already has their own org, so adding
+    /// them to a second one gave them two memberships,
+    /// [`Self::ensure_org_for_user`] then failed on the ambiguity by design, and
+    /// `MemoryLease::open` withheld memory from EVERY module on their next
+    /// startup. An API added to demonstrate that a second member is cheap would
+    /// have broken every realistic second member — the population it was for.
+    /// Its test passed only because the Bob in it had never existed before.
+    ///
+    /// So what is actually delivered is narrower than "orgs can gain members":
+    /// **a user with no org of their own can be placed in one.** Moving an
+    /// established user into another org additionally requires deciding what
+    /// becomes of the partitions their own org already owns — merge, migrate,
+    /// abandon — and which org they then act in. Those are policy questions, and
+    /// there is no policy layer. This refusing is what keeps that decision from
+    /// being made accidentally, by silently disabling someone's memory.
     ///
     /// **It performs no authorisation, because there is nothing to perform.**
     /// There is no policy layer, no roles, and no notion of who may grow an org;
-    /// this is a storage operation, and the kernel does not call it yet. When a
+    /// this is a storage operation, and the kernel does not call it. When a
     /// decision point exists, this is one of the call sites that must go through
     /// it — adding a member changes who can reach every space the org owns.
-    ///
-    /// Note the consequence for [`Self::ensure_org_for_user`]: a user added to a
-    /// SECOND org can no longer be resolved implicitly, by design.
     pub async fn add_org_member(&self, org_id: &str, user: &str) -> Result<()> {
         if user.trim().is_empty() {
             return Err(MemoryError::Conflict(
                 "cannot add a blank user to an org".into(),
             ));
+        }
+        // Not `INSERT … WHERE NOT EXISTS`: silently doing nothing would leave the
+        // caller believing the member was added.
+        if let Some(existing) = self.resolve_org_for_user(user).await?
+            && existing != org_id
+        {
+            return Err(MemoryError::Conflict(format!(
+                "user {user:?} already belongs to org {existing:?}; moving them to \
+                 {org_id:?} needs a decision about the partitions {existing:?} owns and \
+                 about which org they then act in, and there is no policy layer to make \
+                 it. Refusing rather than leaving them in two orgs, which would make \
+                 their org unresolvable and withhold memory from every module"
+            )));
         }
         sqlx::query(
             "INSERT INTO mem_org_members (org_id, user_id, joined_at) VALUES (?, ?, ?)
@@ -987,6 +1017,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_user_who_already_has_an_org_is_refused_rather_than_left_in_two() {
+        // The realistic second member, and the case the first version of
+        // `add_org_member` broke: Bob has started the daemon before, so he
+        // already has his own org. Adding him to Alice's would have given him two
+        // memberships, made `ensure_org_for_user` fail on the ambiguity BY
+        // DESIGN, and withheld memory from every one of Bob's modules at his next
+        // startup — an API added to show a second member is cheap, breaking every
+        // second member who had ever run the thing.
+        //
+        // The previous test passed only because its Bob had never existed.
+        let kv = KvStore::open_memory().await.unwrap();
+        let alice_org = kv.ensure_org_for_user("alice").await.unwrap();
+        let bob_org = kv.ensure_org_for_user("bob").await.unwrap();
+
+        let err = kv
+            .add_org_member(&alice_org, "bob")
+            .await
+            .expect_err("an established user must not be silently put in two orgs");
+        assert!(matches!(err, MemoryError::Conflict(_)), "{err}");
+
+        // Bob is still resolvable, which is the property that matters: his memory
+        // still works.
+        assert_eq!(kv.ensure_org_for_user("bob").await.unwrap(), bob_org);
+    }
+
+    #[tokio::test]
     async fn a_second_member_of_an_org_mounts_the_same_partition() {
         // F8's entire justification is that a second member becomes cheap. Review
         // found the catalog forbidding exactly that: the upsert guarded on
@@ -997,6 +1053,8 @@ mod tests {
         // second member possible while the storage layer said no.
         let kv = KvStore::open_memory().await.unwrap();
         let org = kv.ensure_org_for_user("alice").await.unwrap();
+        kv.add_org_member(&org, "bob").await.unwrap();
+        // Idempotent, and adding him again does not create a second membership.
         kv.add_org_member(&org, "bob").await.unwrap();
         assert_eq!(
             kv.ensure_org_for_user("bob").await.unwrap(),

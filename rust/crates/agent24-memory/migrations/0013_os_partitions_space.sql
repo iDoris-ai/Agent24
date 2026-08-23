@@ -109,9 +109,13 @@ CREATE TABLE mem_os_partitions_v2 (
     -- own private space `os:<module>`, which reproduces F1's isolation exactly —
     -- one partition per module — while naming the dimension for what it is.
     space_id      TEXT NOT NULL CHECK (trim(space_id, char(32)||char(9)||char(10)||char(13)) <> ''),
-    -- The logical user, kept from 0012. NOT redundant with `org_id`: it records
-    -- which user this partition was created FOR, which stays answerable after an
-    -- org has more than one member. The export/erase path reads it.
+    -- The user who CREATED this partition. Write-once, like `module_name`.
+    --
+    -- NOT the export/erase lookup, which is what 0012 used it for and what an
+    -- earlier draft of this comment still said. A partition is owned by
+    -- (org_id, space_id), so every member of the org derives the same key and
+    -- writes into the same rows; this column answers provenance ("who brought
+    -- this into being"), not ownership. An export or erase path reads `org_id`.
     logical_user  TEXT NOT NULL CHECK (trim(logical_user, char(32)||char(9)||char(10)||char(13)) <> ''),
     -- The module's manifest name AT FIRST SIGHT, write-once, kept from 0012 for
     -- the reason recorded there: a rename produces a NEW partition and leaves the
@@ -152,8 +156,13 @@ FROM mem_os_partitions;
 DROP TABLE mem_os_partitions;
 ALTER TABLE mem_os_partitions_v2 RENAME TO mem_os_partitions;
 
--- The export/erase lookup, unchanged from 0012.
+-- The provenance lookup, unchanged from 0012 in shape but no longer in meaning
+-- — see `logical_user` above.
 CREATE INDEX mem_os_partitions_user ON mem_os_partitions (logical_user);
+-- No separate index for the export/erase lookup (`WHERE org_id = ?`): the
+-- UNIQUE index below is on (org_id, space_id), and org_id is its leftmost
+-- prefix, so SQLite already serves that query from it. A second index would be
+-- write cost for a read that is already covered.
 -- The lookup this table now exists for: "which physical key is (org, space)
 -- stored under". UNIQUE because one logical space has exactly one partition —
 -- without it, a re-key that failed halfway and left both rows behind would look

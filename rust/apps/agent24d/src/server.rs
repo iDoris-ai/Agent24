@@ -802,7 +802,7 @@ pub async fn serve(
     // no longer installed: those are the ones an operator would otherwise never
     // learn about, and the ones an export or erase path must not miss.
     if let Some(l) = lease.as_ref() {
-        match crate::os_memory::OsMemoryCatalog::durable_for(&l.kv, LOCAL_USER).await {
+        match crate::os_memory::OsMemoryCatalog::durable_for_org(&l.kv, &l.org).await {
             Ok(rows) if !rows.is_empty() => {
                 // By physical KEY, not by module name. After a key-version change a
                 // mounted module gets a NEW partition while its historical rows keep
@@ -818,8 +818,9 @@ pub async fn serve(
                     .filter(|r| !live.contains(r.owner_key.as_str()))
                     .count();
                 tracing::info!(
-                    "user {LOCAL_USER} has {} domain-OS memory partition(s) besides their \
+                    "org {} owns {} domain-OS memory partition(s) besides {LOCAL_USER}'s \
                      own memory, {dormant} of them belonging to modules not mounted now",
+                    l.org.as_str(),
                     rows.len()
                 );
             }

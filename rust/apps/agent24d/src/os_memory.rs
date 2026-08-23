@@ -289,7 +289,7 @@ pub struct OsMemoryPartition {
 /// Those four are the entire reason a catalog was required. So [`Self::record`]
 /// now WRITES, and the `Vec` is what it says it is: this run's mount inventory,
 /// used for the startup log and for tests. Anything asking "which partitions
-/// exist for this user" must ask the table — [`Self::durable_for`] — not this.
+/// exist for this org" must ask the table — [`Self::durable_for_org`] — not this.
 #[derive(Debug, Clone, Default)]
 pub struct OsMemoryCatalog {
     partitions: Vec<OsMemoryPartition>,
@@ -415,17 +415,28 @@ impl OsMemoryCatalog {
         &self.partitions
     }
 
-    /// Every partition EVER recorded for `user`, from the durable table.
+    /// Every partition EVER recorded for `org`, from the durable table.
     ///
     /// The answer an export or erase path needs, and the reason it must not be a
     /// `LIKE` query over keys that contain NUL. Includes partitions belonging to
     /// modules that are disabled, uninstalled or renamed — which is the whole
     /// point, and the thing this run's [`Self::partitions`] cannot tell you.
-    pub async fn durable_for(
+    ///
+    /// # Keyed by ORG, because that is what owns a partition
+    ///
+    /// This took the user until round 3 to follow the storage layer. It was
+    /// `durable_for(kv, user)` over `os_partitions_for`, which after round 2
+    /// answers only "what did this user CREATE" — so the startup inventory
+    /// undercounted by exactly the partitions a second member had written to but
+    /// not created, which is the population F8 exists for. Review caught that the
+    /// storage layer had been split and its caller had not.
+    pub async fn durable_for_org(
         kv: &agent24_memory::KvStore,
-        user: &str,
+        org: &OrgId,
     ) -> Result<Vec<agent24_memory::OsPartitionRow>, String> {
-        kv.os_partitions_for(user).await.map_err(|e| e.to_string())
+        kv.os_partitions_for_org(org.as_str())
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1319,19 +1330,21 @@ mod tests {
             .await
             .unwrap();
 
-        let alice = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let alice = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         assert_eq!(alice.len(), 2);
         assert!(alice.iter().all(|r| r.logical_user == "alice"));
         assert!(alice.iter().all(|r| r.key_version == KEY_VERSION));
         assert_eq!(
-            OsMemoryCatalog::durable_for(&kv, "bob")
+            OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "bob").await)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert!(
-            OsMemoryCatalog::durable_for(&kv, "nobody")
+            OsMemoryCatalog::durable_for_org(&kv, &OrgId::from_store("org_that_owns_nothing"))
                 .await
                 .unwrap()
                 .is_empty()
@@ -1377,7 +1390,9 @@ mod tests {
         .unwrap();
         assert_eq!(run2.partitions().len(), 1);
 
-        let rows = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let rows = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         let mut names: Vec<&str> = rows.iter().map(|r| r.module_name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -1414,7 +1429,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let first = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let first = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         cat.record(
             &org_of(&kv, "alice").await,
             "alice",
@@ -1423,7 +1440,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let again = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let again = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         assert_eq!(again.len(), 1, "one row per partition, ever");
         assert_eq!(again[0].owner_key, p.key);
         assert_eq!(again[0].first_seen_at, first[0].first_seen_at);
@@ -1451,7 +1470,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let first = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         cat.record(
@@ -1462,7 +1483,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let again = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let again = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
 
         assert!(
             again[0].last_seen_at > first[0].last_seen_at,
@@ -1501,7 +1524,11 @@ mod tests {
         // `space_id` are the two F8 adds, and they matter most: they are what the
         // key encodes, so a row claiming a different one means the encoder and the
         // catalog have diverged and the handle must not be lent.
-        let other_org = org_of(&kv, "bob").await;
+        // Carol's, not Bob's: Bob is about to be added to ALICE's org below, and
+        // `add_org_member` now refuses a user who already has one of their own —
+        // which is the whole point of that refusal, and which giving Bob an org
+        // here would walk straight into.
+        let other_org = org_of(&kv, "carol").await;
         for drifted in [
             agent24_memory::OsPartitionIdentity {
                 key_version: "v3-from-a-newer-kernel",
@@ -1551,7 +1578,9 @@ mod tests {
         .expect("a different member of the same org must be able to mount it");
 
         // The original row is untouched by any of it — including the creator.
-        let rows = OsMemoryCatalog::durable_for(&kv, "alice").await.unwrap();
+        let rows = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].module_name, "sin90");
         assert_eq!(rows[0].key_version, KEY_VERSION);

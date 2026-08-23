@@ -1423,7 +1423,7 @@ mod tests {
         // From the DURABLE table, which is what a later export/erase path reads —
         // not from this run's inventory, which cannot see a disabled or renamed
         // module's leftovers.
-        let rows = crate::os_memory::OsMemoryCatalog::durable_for(&lease.kv, "alice")
+        let rows = crate::os_memory::OsMemoryCatalog::durable_for_org(&lease.kv, &lease.org)
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
