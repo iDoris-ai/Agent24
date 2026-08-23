@@ -4,6 +4,27 @@
 # 因此 integration_branch == base_branch，合并时必须带 --allow-trunk。
 # 那不是绕过：git-guard 仍要求 main 的保护规则要求审批、且该 PR 已 APPROVED，
 # 读不到保护规则就 fail-closed 拒绝。
+#
+# ⚠️ 已知限制：`pilot run` 的自动合并这一步在本仓库目前用不了。
+#
+# 本仓库的 main 由 **ruleset**（新机制）保护，不是 classic branch protection。
+# 三个端点交叉验证过（2026-08-23）：
+#
+#   GET /repos/iDoris-ai/Agent24/branches/main/protection  → "Branch not protected"
+#   GET /repos/iDoris-ai/Agent24/branches/main             → protected: true
+#   GET /repos/iDoris-ai/Agent24/rules/branches/main       → 3 条 pull_request 规则，各自
+#                                                            required_approving_review_count = 1
+#                                                            dismiss_stale_reviews_on_push  = true
+#
+# main **确实**要求审批、也确实在 push 时废除陈旧审批 —— 正是 --allow-trunk 要的两样。
+# 但 git-guard.sh 查的是 **classic** 端点，对 ruleset 保护的分支它返回
+# "Branch not protected"，于是 fail-closed 拒绝合并，并让人去「先保护分支、
+# 要求至少一个审批」—— 而那件事早就做完了。
+#
+# 方向是对的（未经核实的保护等于没有保护），看不见的是新机制。
+# 真正的修法在 pilot 侧：classic 端点报 "Branch not protected" 时回落查
+# /rules/branches/{branch}，把 pull_request 规则的 required_approving_review_count
+# 当作等价证明。在那之前，**合并这一步由人来做**，不要因为脚本拒绝就去改分支保护设置。
 base_branch: main
 integration_branch: main
 
