@@ -1552,6 +1552,20 @@ mod tests {
             },
             agent24_memory::OsPartitionIdentity {
                 org_id: other_org.as_str(),
+                // Carol, not Alice — and the `user` field is what makes this arm
+                // test the thing it names.
+                //
+                // Review caught that with `user` left as "alice", this case never
+                // reached the org_id guard at all: `record_os_partition` checks
+                // membership FIRST, Alice is not in Carol's org, and the conflict
+                // came back from there. The assertion below was satisfied by a
+                // different mechanism, which left `AND org_id = excluded.org_id`
+                // as the ONLY one of the five identity guards with zero coverage
+                // — delete that line and the whole workspace stayed green.
+                //
+                // Carol is a legitimate member of her own org, so membership
+                // passes and the guard is what refuses her.
+                user: "carol",
                 ..recorded
             },
             agent24_memory::OsPartitionIdentity {
