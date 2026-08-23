@@ -135,10 +135,49 @@ impl EventBroadcast for HubBroadcast {
 /// failed to open lends nothing rather than half a handle.
 pub struct MemoryLease {
     pub user: String,
+    /// The org the user is acting in, resolved ONCE at startup.
+    ///
+    /// Resolved rather than derived, and held rather than re-read: it is an
+    /// input to every partition key, so a lease whose org could change between
+    /// two mounts would hand two modules keys from different orgs in one run.
+    pub org: crate::os_memory::OrgId,
     pub kv: agent24_memory::KvStore,
 }
 
 impl MemoryLease {
+    /// Resolve the org for `user`, then bring any partition still on F1's key
+    /// format onto its (org, space) identity.
+    ///
+    /// Returns `None` if the org cannot be resolved — a daemon that cannot say
+    /// which org it is acting in lends no memory at all, rather than lending
+    /// partitions under a guessed one. The re-key sweep is best-effort by
+    /// contrast: it reports per-partition failures and leaves those rows on v1,
+    /// which the catalog's UNIQUE `(org_id, space_id)` then turns into a refused
+    /// capability for that module rather than a silently fresh partition.
+    pub async fn open(user: &str, kv: agent24_memory::KvStore) -> Option<Self> {
+        let org = match kv.ensure_org_for_user(user).await {
+            Ok(id) => crate::os_memory::OrgId::from_store(id),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "could not resolve the org for the authenticated user; withholding \
+                     the memory capability from every module rather than keying \
+                     partitions under a guessed org"
+                );
+                return None;
+            }
+        };
+        match crate::os_memory::OsMemoryCatalog::migrate_legacy_partitions(&kv).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("re-keyed {n} memory partition(s) from v1 onto (org, space)"),
+            Err(e) => tracing::error!(error = %e, "the v1 partition sweep could not run"),
+        }
+        Some(Self {
+            user: user.to_owned(),
+            org,
+            kv,
+        })
+    }
     /// Lend `manifest`'s partition — or NOTHING, if it could not be recorded.
     ///
     /// The catalog write is a precondition, not bookkeeping done afterwards. A
@@ -152,7 +191,10 @@ impl MemoryLease {
         manifest: &agent24_domain::DomainOsManifest,
         catalogue: &mut crate::os_memory::OsMemoryCatalog,
     ) -> Option<Arc<crate::os_memory::OsScopedMemory>> {
-        match catalogue.record(&self.user, manifest, &self.kv).await {
+        match catalogue
+            .record(&self.org, &self.user, manifest, &self.kv)
+            .await
+        {
             Ok(partition) => Some(Arc::new(crate::os_memory::OsScopedMemory::new(
                 &partition, &self.kv,
             ))),
@@ -1346,10 +1388,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
-        let lease = MemoryLease {
-            user: "alice".to_owned(),
-            kv: kv.clone(),
-        };
+        let lease = MemoryLease::open("alice", kv.clone()).await.unwrap();
 
         // Both modules ask for memory in their manifests.
         let want_mem = |name: &str| {
@@ -1413,10 +1452,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
-        let lease = MemoryLease {
-            user: "alice".to_owned(),
-            kv,
-        };
+        let lease = MemoryLease::open("alice", kv).await.unwrap();
         // `manifest_yaml` asks for events only.
         let m = FakeModule::new("quiet");
         let (_, reports, partitions) = mount_all(
@@ -1487,15 +1523,27 @@ mod tests {
             "kernel_capabilities: [memory]",
         );
         let m = FakeModule::from_yaml(&yaml, false);
-        let key = crate::os_memory::partition_key("alice", "hungry");
-        kv.record_os_partition(&key, "v0-from-an-older-kernel", "alice", "hungry")
-            .await
-            .unwrap();
+        // Resolved here so the poisoned row is recorded against the SAME org the
+        // lease will resolve a moment later — otherwise the mount would derive a
+        // different key and sail past the conflict this test exists to provoke.
+        let org =
+            crate::os_memory::OrgId::from_store(kv.ensure_org_for_user("alice").await.unwrap());
+        let key = crate::os_memory::partition_key(
+            &org,
+            &crate::os_memory::SpaceId::module_private("hungry"),
+        );
+        kv.record_os_partition(agent24_memory::OsPartitionIdentity {
+            owner_key: &key,
+            key_version: "v0-from-an-older-kernel",
+            org_id: org.as_str(),
+            space_id: "os:hungry",
+            user: "alice",
+            module: "hungry",
+        })
+        .await
+        .unwrap();
 
-        let lease = MemoryLease {
-            user: "alice".to_owned(),
-            kv,
-        };
+        let lease = MemoryLease::open("alice", kv).await.unwrap();
         let (_, reports, partitions) = mount_all(
             &[entry(m.clone())],
             tmp.path(),

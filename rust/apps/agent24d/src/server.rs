@@ -776,10 +776,10 @@ pub async fn serve(
     };
     // A module gets memory only if the base actually opened. No base, no lease,
     // no handle — rather than a handle that fails on every call.
-    let lease = memory_base.map(|kv| crate::domain::MemoryLease {
-        user: LOCAL_USER.to_owned(),
-        kv,
-    });
+    let lease = match memory_base {
+        Some(kv) => crate::domain::MemoryLease::open(LOCAL_USER, kv).await,
+        None => None,
+    };
     let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
