@@ -2,7 +2,7 @@
 
 > 文档类型：设计考量 + 工作任务（供 Agent24 自己的 P4 规划采纳）
 > 日期：2026-07-30 ｜ 作者：iDoris 侧规划输入（@jhfnetboy）
-> 关联：iDoris 设计文档 `/Users/jason/Dev/auraai/iDoris/docs/`（01–09）；本项属 Agent24 **P4 门后"iDoris 主 AI 接入"**，排期需 Agent24 侧用户拍板。
+> 关联：iDoris 仓库的设计文档 `docs/`（01–09，尚未合并到该仓库 main，故此处不给链接）；本项属 Agent24 **P4 门后"iDoris 主 AI 接入"**，排期需 Agent24 侧用户拍板。
 >
 > **定位**：iDoris 是 Agent24 之外的独立"个人 AI 网关"服务（对外一个 OpenAI-compat 本地 URL）。Agent24 是前端用户交互入口（Electron + Rust 内核），经进程边界(REST)消费 iDoris。本文列 Agent24 侧要考虑的设计 + 工作任务。**均为加法迁移，零回归。**
 
@@ -63,7 +63,7 @@
 
 ## 四、动态硬件推荐模块（低优先，留 TODO）
 
-- **是什么**：按机器 RAM/芯片/OS + 模型目录，推荐常驻/临时/量化组合（算法与标准见 iDoris [07](/Users/jason/Dev/auraai/iDoris/docs/07-模型量化内存评估与动态推荐.md)）。
+- **是什么**：按机器 RAM/芯片/OS + 模型目录，推荐常驻/临时/量化组合（算法与标准见 iDoris 仓库 `docs/07-模型量化内存评估与动态推荐.md`；该文档尚未合并到 iDoris main，合并后再补链接）。
 - **定位**：**非核心、不着急**（用户 2026-07-30 明确）。macOS 上 oMLX 的 memory-guard 已能兜底；跨平台再补。
 - **动作**：**留 TODO**，不在本轮排期。真要做时作为 ModelRouter 的 `HardwareProfile+recommend()` 扩展或独立 util。
 

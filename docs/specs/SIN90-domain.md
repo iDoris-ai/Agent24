@@ -65,7 +65,7 @@
 
 ```
 rust/crates/agent24-sin90/            # 纯域 —— 不碰 sqlx/tokio/vendor
-├── Cargo.toml        # deps: agent24-protocol, thiserror  —— 仅此
+├── Cargo.toml        # deps: serde, serde_json, thiserror —— 无任何 agent24 依赖
 └── src/
     ├── lib.rs
     ├── types.rs      # 实体 + 状态枚举(snake_case wire shape)
@@ -74,7 +74,7 @@ rust/crates/agent24-sin90/            # 纯域 —— 不碰 sqlx/tokio/vendor
     └── attention.rs  # 对账输入/输出形状(SQL 在 store 侧)
 
 rust/crates/agent24-sin90-store/      # 自带持久化 —— 对着独立 sin90.db
-├── Cargo.toml        # deps: agent24-sin90, sqlx  (不进 agent24-store)
+├── Cargo.toml        # deps: agent24-sin90, agent24-core(仅 ulid/now), sqlx (不进 agent24-store)
 ├── migrations/
 │   └── 0001_sin90.sql
 └── src/lib.rs        # Sin90Repo:BEGIN IMMEDIATE + 事件回放
@@ -144,10 +144,12 @@ pub struct Task {
 **每个实体一对函数**,与 `agent24-core::transitions` 完全同款签名:
 
 ```rust
+// 已实现的形状:每实体一个变体,字段是强类型枚举(不是 String) —— 误用在编译期就挡住
 #[derive(thiserror::Error, Debug)]
 pub enum TransitionError {
-    #[error("illegal {entity} transition: {from:?} -> {to:?}")]
-    Illegal { entity: &'static str, from: String, to: String },
+    Direction { from: DirectionStatus, to: DirectionStatus },
+    Task { from: TaskStatus, to: TaskStatus },
+    // … Week / Block / Rhythm / Review / Proposal 同形
 }
 
 pub fn direction_transition_allowed(from: DirectionStatus, to: DirectionStatus) -> bool;
@@ -332,11 +334,15 @@ CREATE TABLE sin90_ai_calls (
 CREATE TABLE sin90_attention_daily (
     day               TEXT NOT NULL,
     direction_id      TEXT NOT NULL,
-    planned_min       INTEGER NOT NULL DEFAULT 0,
+    -- 只落 actual:planned 从 rhythm 的 allocations 现算,不物化
+    -- (否则 rhythm 一改,这张表里的 planned 就是过期副本)
     actual_min        INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, direction_id)
 );
-CREATE TABLE sin90_attention_watermark ( applied_event_seq INTEGER NOT NULL ); -- 单行
+CREATE TABLE sin90_attention_watermark (
+    only_row          INTEGER PRIMARY KEY CHECK (only_row = 1),  -- 单行由 DB 保证,不靠约定
+    applied_event_seq INTEGER NOT NULL
+);
 ```
 
 ### 3.2 repo trait(草案)
@@ -463,7 +469,7 @@ Sin90 需要一次 AI 决策(如 task 分类 / weekly-plan)
 
 约束落法:
 - Sin90 调模型经 `ctx.model()`,底层是现有 `ModelRouter::complete(TaskProfile, CompletionRequest, CancellationToken)`(Codex #High 修正:原稿写的 `route(task_kind,prompt,schema)` **不存在**,已对齐真实签名)。Sin90 侧永不出现 endpoint / api-key / model-id / vendor SDK 类型。
-- **受约束 JSON 输出是 agent24-models 的一个待办依赖**(§8):现有 `CompletionRequest` **没有** `response_format`/schema 字段。收口二选一——(a) 给 `CompletionRequest` 加可选 `response_format: JsonSchema`,OpenAI-兼容 provider(oMLX 已原生支持)透传;(b) 短期内 Sin90 侧对文本输出做 schema 校验 + 失败重试。倾向 (a),因 oMLX 已支持 `response_format: json_schema`。
+- **受约束 JSON 输出**(§8):当时 `CompletionRequest` 没有 `response_format`,两个收口方案里选了 (a)——给它加可选 `response_format: JsonSchema`,由 OpenAI-兼容 provider 透传。**已实现并合并(PR #102)**,不再是待办;(b)「Sin90 侧自己校验 + 重试」相应作废。
 - 路由/重试/降级/健康反馈在 `ModelRouter`(trait 之上),provider 内只做"一次调用"(ADR-026 §6.5)。
 - 有更好的模型 → 改配置换权重;有更好的 provider → 注册表里替换一项;换本地运行时 → 换 provider 实现。三者都不触碰 Sin90 与其 API。
 
@@ -486,6 +492,7 @@ serde_json = { workspace = true }
 # agent24-sin90-store/Cargo.toml —— 自带 store,对着独立 sin90.db
 [dependencies]
 agent24-sin90 = { path = "../agent24-sin90" }
+agent24-core  = { path = "../agent24-core" }   # 仅 util:ulid() / now_iso8601(),仍是单向
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio","sqlite","migrate","macros"] }
 
 # agent24d/Cargo.toml deps 增(内核宿主挂模块):
