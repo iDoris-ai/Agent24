@@ -411,7 +411,7 @@ GROUP BY direction_id;
 .route("/api/v1/sin90/attention",         get(sin90::attention))
 ```
 
-- **这些是命令(command),不是事件**(Codex #Medium 修正):壳发的 `POST`/`PATCH` 都要经状态机校验、可被拒(409)。壳**从不直接写"既成事实"**;事实只由核在校验后产生,并以 `sin90.*` 事件(§4.2)回推给壳。"壳只发命令、只订阅事件"才是准确表述。
+- **这些是命令(command),不是事件**(Codex #Medium 修正):壳发的 `POST`/`PATCH` 都要经状态机校验、可被拒(409)。壳**从不直接写"既成事实"**;事实只由核在校验后产生,并以 `module` 信封的 `kind`(§4.2)回推给壳。"壳只发命令、只订阅事件"才是准确表述。
 - `PATCH /{entity}/{id}` body = `{ "to": "<status>", ...fields }`,handler 调 `Sin90Repo::transition_*`,状态机非法 → `409 Conflict`(与现有 approvals 的 409 语义一致)。
 - `POST /proposals` 持久化进 `pending`(重启可恢复);`accept` 触发 §2.3 的幂等 apply。**同 `proposal_id` 重试安全**:CAS 命中非 pending → 返回既有 `result`,不重复 apply。可配置「low-risk op 自动 accept」——**只读**查 `agent24-policy` standing-grants(§0.1,不与 apply 原子)。
 

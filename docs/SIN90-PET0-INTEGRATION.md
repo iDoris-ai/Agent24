@@ -168,7 +168,7 @@ GET|PATCH        /api/v1/sin90/directions/{id}      # PATCH body = {to: <status>
 GET|POST         /api/v1/sin90/rhythms
                  # 注意:Rhythm **没有** PATCH /{id}。它的变更不是状态迁移,是重新
                  # 分配占比,必须经 Proposal 门的 `AdjustRhythm{rhythm_id,new_alloc}`
-                 # (见 specs/SIN90-domain.md §4)。这也是 adjusted → adjusted 那条边
+                 # (见 specs/SIN90-domain.md §2.3)。这也是 adjusted → adjusted 那条边
                  # 的用途:同一个 rhythm 可以反复调,每次都留一条 proposal 记录。
 GET|POST         /api/v1/sin90/weeks
 GET|PATCH        /api/v1/sin90/weeks/{id}
