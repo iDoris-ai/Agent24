@@ -37,8 +37,15 @@ M-E：领域 OS 成为一等公民，M-D 记忆底座重做，Nostr 渠道收官
 
 - **F4 Nostr 收官**（#85–#95）：出站 register/say/search + 入站 gated +
   npub 白名单；与 agent-speaker 双向真联调；strfry 真 NIP-33 relay 覆盖定论
-- **两条会让 7×24 静默失效的缺陷**（#142）：Nostr 桥的 `execFile` 无 deadline
-  导致轮询循环永久停摆；微信会话映射非原子写导致断电截断
+- **两条会让 7×24 静默失效的缺陷**（#142）：
+  - Nostr 桥的 `execFile` 无 deadline —— 子进程挂起会让入站轮询循环**永久停摆**
+    （`tick()` 是串行自调度，promise 不 settle 就没有下一轮）。加 60s deadline
+    + SIGKILL。**注意这只关上了「子进程挂起」那一支，不含 relay 静默，见下方
+    已知缺口 FU-32。**
+  - 微信会话映射改为原子写：temp → `fsync` → `rename` → `fsync` 父目录，
+    外加一代 `.bak` 回退与损坏时的回退读取。**限定（FU-31）**：macOS 的
+    `fsync` 不保证驱动器刷新自身写缓存（那需要 `F_FULLFSYNC`，Node 不暴露），
+    所以这关上的是 page cache 那个窗口，**不是「抗断电」**
 
 ### 生态
 
@@ -53,10 +60,22 @@ M-E：领域 OS 成为一等公民，M-D 记忆底座重做，Nostr 渠道收官
 
 - **FU-32（A 级）**：入站 relay 静默 —— 桥无法区分「收件箱为空」与「relay
   连接已死」。#142 只关上了子进程挂起那一支。**F5 泡测前必须处理。**
+- **FU-29**：Nostr 回复是 **at-most-once**，且子进程超时被杀时**投递状态不确定**
+  —— 一条回复可能被静默丢弃，且不会重试（盲重试可能重发）。这是本次发布的 F4
+  渠道的用户可见行为。修法需持久化 outbox + 发送侧幂等键。
+- **FU-31**：`fsync` 在 macOS 上不含 `F_FULLFSYNC`，见上方微信桥条目的限定。
 - F5 7×24 泡测**尚未跑过**（物理任务）
 - `agent24 os` 只有 `list`/`enable`/`disable`，**没有 `install`** —— 第三方
   领域 OS 仍需编进二进制（ME-3 未开工）
 - 没有 web UI
+
+### 一个会被当成 bug 的正常现象
+
+`agent24 os list` 在 v0.3.0 里仍显示 `sin90 v0.2.1`。**这不是漏改的版本号** ——
+领域 OS 模块有**独立的版本线**：真值来源是 `agent24-sin90-os/domain-os.yml` 的
+`version` 字段，`identity_matches_the_manifest` 断言 `MANIFEST_VERSION` 等于解析
+出的 manifest，`os list` 显示的是**模块版本，不是产品版本**。此前两者恰好都是
+`0.2.1` 只是巧合，本次发布把巧合打破了。
 
 ## [0.2.1] — 2026-07-26
 
