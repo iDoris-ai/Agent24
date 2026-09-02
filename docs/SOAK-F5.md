@@ -12,9 +12,13 @@
 3. **无人工干预**：7 天里你没有手动重启 daemon / 重连渠道 / 清状态。
 4. **无内存泄漏**：`rss_mb` 曲线平稳，不单调爬升。
 5. **渠道存活**：微信 / Nostr 入站在第 1 天和第 7 天都能触发 run + 审批回。
-6. **Nostr 入站通路全程活着**（FU-32）：`~/.agent24/nostr-bridge-health.json` 的 `state` **7 天里从未出现过 `degraded`**，**且** `canaries.confirmed` 全程在增长。
+6. **Nostr 入站通路全程活着**（FU-32）：健康快照的 `degraded_transitions` **结束时仍为 0**，`canaries.confirmed` 从头到尾**有增长**，且监控**每次采样都读得到**这个文件。`soak-monitor.sh` 现在会采集这三项并把它们纳入 PASS 门（没配置 Nostr 桥的 run 不受此条影响，摘要会写明「未评估」）。
 
-   > 「从未 degraded」单独**不够**：一个从来没确认过的桥停在 `starting` 也满足它。必须同时看 `confirmed` 在涨 —— 那才是「真的有东西收进来过」。
+   > 判据用的是**累计计数**而不是「我去看的时候 state 是 ok」——健康文件是原地覆盖写的，周二坏掉、周三自己好了的话，文件里**不留任何痕迹**，靠抽查根本证明不了「7 天里从未出现」。
+   >
+   > `confirmed` 必须增长也是必需的：一个从来没确认过、停在 `starting` 的桥同样满足「从未 degraded」。
+   >
+   > 快照读不出来（文件损坏/权限/消失）一律判失败，不当作「没装桥」。
 
    > 第 5 条单独**挡不住**这一类失效,这正是 FU-32 的教训:桥读的是 agent-speaker daemon 填的**本地库**,daemon 那侧 relay 断了的话 `history inbox` 照样 exit 0 返回 `[]` —— 不抛错、不超时、进程健康、日程照跑,**只是谁的消息都收不到**。只在第 1 天和第 7 天各发一条,中间六天全哑也照样 PASS。桥现在每 5 分钟给自己发一条 canary,只有 daemon 真把它从 relay 拉回来才算数;15 分钟没有确认就写 `degraded` 并在 stderr 报警。**睡眠→唤醒之后必须专门抽查一次**——那是这条最可能失效的时刻。
 
@@ -49,10 +53,12 @@ pnpm --filter @agent24/wechat-bridge start   # 扫码
   which agent-speaker || which hyphae      # 装的是哪个名字
   # 若是 hyphae，桥要显式指过去（否则第一分钟就 degraded）
   export A24_SPEAKER_BIN=hyphae
-  # 契约自检:这四条都要返回 {"ok":true,...} 信封(F4 联调是对着改名前的 7cef326 验的)
+  # 两条只读冒烟:都要返回 {"ok":true,...} 信封
   $A24_SPEAKER_BIN identity list --json
   $A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
   ```
+
+  这两条只覆盖桥的**读**路径。`agent msg` 与 `profile publish` 的改名后契约**仍未验收**（F4 联调是对着改名前的 7cef326 验的），它们会在桥起来后的第一次 register / 第一条 canary 上暴露 —— 起跑后立刻 `cat` 一次健康快照，`last_error` 为 null 才算这两条也过了。
 
 - **泡测的 daemon 要关掉桌面通知和自动回复**：`hyphae daemon --notify=false --auto-reply=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
 
@@ -89,12 +95,14 @@ jq 'select(.overdue > 0)' ~/agent24-soak.jsonl
 
 # Nostr 入站通路现在是活的吗（FU-32）——每次开机/唤醒后都看一眼
 cat ~/.agent24/nostr-bridge-health.json
-# state 应为 "ok"；canaries.confirmed 应随时间增长（计数跨重启累计，不会归零）
-# lost 偶尔 >0 是已知的上游竞态（FU-33）；只要 confirmed 在涨、state 是 ok 就不算问题
+# state 应为 "ok"；degraded_transitions 应为 0；confirmed 应随时间增长
+#（计数跨重启累计，launchd 重启不会归零）
+# lost 偶尔 >0 是已知的上游竞态（FU-33）；只要 confirmed 在涨、transitions 是 0 就不算问题
 # "degraded" = 对端消息现在收不进来，按报警里那三条顺序查（daemon 在跑吗 / relay 一致吗 / 网络回来了吗）
 
-# 整个泡测期间出现过 degraded 吗（桥的日志里）
-grep -c "入站通路疑似已死" ~/soak-monitor.out ~/nostr-bridge.log 2>/dev/null
+# 整个泡测期间出现过 degraded 吗 —— 看采样序列，不要只看当前文件
+jq 'select(.nostr_degraded != null and .nostr_degraded > 0)' ~/agent24-soak.jsonl
+jq -r '[.at, (.nostr_state|tostring), (.nostr_confirmed|tostring)] | @tsv' ~/agent24-soak.jsonl | tail -20
 ```
 
 ## 收尾

@@ -13,34 +13,38 @@
 // relay does `INSERT OR REPLACE` flip the row to `is_incoming=1`. `deliver()` is
 // the daemon doing its job; not calling it is the daemon's relay path being dead.
 //
-// MUTATION CHECKS (each one verified to turn the named test red):
-//   - `observe()`: drop the `outstanding.delete(...)` guard and confirm on any
-//     self-row → "一条 canary 只确认一次" (a stale row in the window would
-//     re-prove liveness on every poll: permanent fail-open).
-//   - `observe()`: confirm on the event id alone, without comparing content →
-//     "canary 原路返回但内容不对(解密链路坏了)". The daemon stores messages it
-//     could NOT decrypt, so an id-only match calls a broken crypto path healthy.
-//   - `pollOnce`: pass the raw rows instead of `liveness.observe(rows)` →
-//     "走真实 pollOnce".
-//   - `elapsed()`: drop `restoredGapMs` → "反复重启不能刷掉静默". A supervisor
-//     restarting the bridge inside the grace window would otherwise hide a dead
-//     path forever, and the soak's "never degraded" criterion would false-PASS.
-//   - `nextDelay()`: always return the base interval → "丢一条 canary,但一条
-//     不足以报死".
-//   - `nextDelay()`: count every outstanding canary instead of only published
-//     ones → "只剩没发出去的那条时不加速". Note the backoff branch normally
-//     answers first, so this needs the one state where it does not.
-//   - `armCanary()`: round the delay up to a multiple of `tickMs` → "canary 发送
-//     时刻不被 30s tick 量化". THIS IS THE BUG A FIRST ATTEMPT HAD: a jittered
-//     deadline checked on a fixed tick still fires at t0 + N×30s, so the phase
-//     never drifts and the jitter is decorative.
-//   - `restore()`: drop the field validation → "损坏的健康文件…". `Math.max(0,
-//     NaN)` is NaN and NaN > threshold is false for every threshold, so one bad
-//     field makes `degraded` unreachable forever.
-//   - `restore()`: do not carry the counters → "计数跨重启累计".
-//   - `start()`: drop the idempotence guard → "重复 start()…". Counting sends
-//     would NOT catch it (armCanary clears its own handle); the leak is a second
-//     judge-tick chain, so the test counts inbox reads.
+// MUTATION CHECKS — each verified by hand to turn the NAMED test red:
+//   observe()
+//     · drop the `outstanding.delete` guard, confirm on any self-row
+//         → 一条 canary 只确认一次   (a stale row would re-prove liveness forever)
+//     · confirm on the event id alone, without comparing content
+//         → 解密链路坏了            (the daemon stores what it cannot decrypt)
+//     · do not clear the send backoff on a confirmation
+//         → queued 的 canary 后来送达并确认
+//   nextDelay()
+//     · always return the base interval        → 上游竞态:发布早于写出站行
+//     · count every outstanding, not only published → 只剩没发出去的那条时不加速
+//   armCanary()
+//     · round the delay up to a multiple of tickMs → 发送时刻不被 30s tick 量化
+//         THIS IS THE BUG THE FIRST ATTEMPT HAD: a jittered deadline checked on
+//         a fixed tick still fires at t0 + N×30s, so the phase never drifts.
+//     · drop the final clamp                   → 递给 setTimeout 的延迟不能越界
+//   restore()
+//     · drop any field validation              → 损坏的健康文件…
+//     · do not carry the counters              → 计数跨重启累计
+//     · swallow every read error, not just ENOENT → 读不了快照…
+//   elapsed()
+//     · drop restoredGapMs                     → 反复重启不能刷掉静默
+//   start()
+//     · drop the idempotence guard             → 重复 start()…
+//         Counting sends would NOT catch it (armCanary clears its own handle);
+//         the leak is a second judge-tick chain, so the test counts inbox reads.
+//   pollOnce()
+//     · pass the raw rows instead of observe() → 走真实 pollOnce
+//
+// Three of these tests did NOT discriminate when first written (they asserted
+// through a path the mutation did not touch, or the fixture never built the
+// state under test). If a mutation here stops failing, suspect the test first.
 
 import { describe, it, expect, vi } from 'vitest'
 import fs from 'node:fs'
@@ -360,16 +364,100 @@ describe('InboundLiveness — 已知的上游竞态(FU-33)必须是可幸存的'
     // and the sending CLI then REPLACEs the row back to 0 — while the daemon's
     // `seen` set now holds the id and will never revisit it. The canary is lost
     // on a perfectly healthy system, so a single loss must not be able to walk
-    // us to the threshold: the probe re-sends sooner while anything is
-    // outstanding, instead of waiting out the full interval.
-    const h = harness({ loseCanaries: true })
-    await h.boot()
-    await h.cycle() // canary #1 — will be lost
+    // us to the threshold.
+    //
+    // Driven through the REAL timers: calling `probe()` by hand would pass even
+    // if `canaryTurn` ignored `nextDelay()` entirely, which is the wiring that
+    // actually decides whether the re-probe happens.
+    vi.useFakeTimers()
+    try {
+      const fake = new FakeSpeaker()
+      let seq = 0
+      const sends: number[] = []
+      const speaker = new SpeakerClient(async (args) => {
+        if (args[0] === 'agent' && args[1] === 'msg') {
+          sends.push(Date.now())
+          fake.sendResult = {
+            event_id: (++seq).toString(16).padStart(64, '0'),
+            published_to: 1, // published, but the daemon never gives it back
+          }
+        }
+        return fake.runner(args)
+      }, { identity: 'agent24' })
+      const liveness = new InboundLiveness({
+        speaker,
+        identity: 'agent24',
+        resolveSelfNpub: () => speaker.npubFor('agent24'),
+        canaryIntervalMs: 300_000,
+        staleAfterMs: 900_000,
+        tickMs: 30_000,
+        now: () => Date.now(),
+        rand: () => 0.5,
+        log: { log: () => {}, warn: () => {}, error: () => {} },
+      })
+      await liveness.start()
+      // One base interval. With the accelerated re-probe (base/3) this must fit
+      // more than one send; without it, exactly one.
+      await vi.advanceTimersByTimeAsync(300_000)
+      liveness.stop()
+      expect(sends.length).toBeGreaterThan(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 
-    h.advance(Math.round(CANARY_MS / 3) + 1)
-    await h.cycle() // re-probe fires early because #1 is still outstanding
-    expect(h.liveness.current).not.toBe('degraded')
-    expect(h.inFlight.length + h.liveness.snapshot().canaries.lost).toBeGreaterThan(1)
+  it('queued 的 canary 后来送达并确认 → 必须解除退避,不能周期性误报', async () => {
+    // The absorbing state: a canary that missed the relay sets the failure
+    // counter, agent-speaker's outbox publishes it later, it comes back and
+    // confirms — but if the confirmation does not clear the backoff, the next
+    // probe is 20-30 minutes out while the staleness window is 15, so a path
+    // that demonstrably works reports degraded on a cycle.
+    const fake = new FakeSpeaker()
+    let t = 0
+    let seq = 0
+    const queued: { id: string; content: string }[] = []
+    const speaker = new SpeakerClient(async (args) => {
+      if (args[0] === 'agent' && args[1] === 'msg') {
+        const id = (++seq).toString(16).padStart(64, '0')
+        const ci = args.indexOf('--content')
+        queued.push({ id, content: args[ci + 1]! })
+        fake.sendResult = { event_id: id, published_to: 0, queued_for_retry: true }
+      }
+      return fake.runner(args)
+    }, { identity: 'agent24' })
+    const liveness = new InboundLiveness({
+      speaker,
+      identity: 'agent24',
+      resolveSelfNpub: () => speaker.npubFor('agent24'),
+      canaryIntervalMs: CANARY_MS,
+      staleAfterMs: STALE_MS,
+      now: () => t,
+      rand: () => 0.5,
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+    })
+    await liveness.start()
+    liveness.stop()
+
+    await liveness.probe() // never reached a relay → backoff arms
+    expect(nextDelayOf(liveness)).toBeGreaterThan(CANARY_MS)
+
+    // The outbox publishes it; the daemon pulls it back.
+    for (const c of queued) {
+      fake.inboxRows.push({
+        id: c.id,
+        sender_npub: SELF,
+        plaintext: c.content,
+        created_at: 1,
+        is_incoming: true,
+      })
+    }
+    t += 1_000
+    await liveness.beat()
+
+    expect(liveness.current).toBe('ok')
+    // Back to the normal cadence — well inside the staleness window.
+    expect(nextDelayOf(liveness)).toBeLessThan(STALE_MS)
+    expect(nextDelayOf(liveness)).toBeLessThanOrEqual(Math.round(CANARY_MS * 1.2))
   })
 })
 
@@ -443,28 +531,22 @@ describe('InboundLiveness — 探针不能污染业务路径', () => {
   })
 
   it('发送与判定在不同的 timer 上:canary 卡死也不挡判定和健康文件', async () => {
-    // Stronger than "judge runs first inside one function": the two are on
-    // separate timers now, so a send hanging on its 60s deadline cannot delay
-    // the verdict OR the health file that publishes it — which is what an
-    // operator and the soak actually read.
+    // Driven through `start()` and the real timer chain: calling `probe()` and
+    // `beat()` by hand would stay green even if production went back to a single
+    // timer, which is the thing under test.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
     const file = path.join(dir, 'health.json')
+    vi.useFakeTimers()
     try {
       const fake = new FakeSpeaker()
-      let t = 0
       let release!: () => void
-      let entered!: () => void
       const blocked = new Promise<void>((r) => {
         release = r
-      })
-      const sendStarted = new Promise<void>((r) => {
-        entered = r
       })
       const speaker = new SpeakerClient(
         async (args) => {
           if (args[0] === 'agent' && args[1] === 'msg') {
-            entered()
-            await blocked
+            await blocked // the canary send hangs for the whole test
             return fake.runner(args)
           }
           return fake.runner(args)
@@ -475,24 +557,28 @@ describe('InboundLiveness — 探针不能污染业务路径', () => {
         speaker,
         identity: 'agent24',
         resolveSelfNpub: () => speaker.npubFor('agent24'),
-        canaryIntervalMs: CANARY_MS,
-        staleAfterMs: STALE_MS,
+        canaryIntervalMs: 300_000,
+        staleAfterMs: 900_000,
+        tickMs: 30_000,
         healthFile: file,
-        now: () => t,
-        wallNow: () => 1_700_000_000_000 + t,
+        now: () => Date.now(),
         rand: () => 0.5,
         log: { log: () => {}, warn: () => {}, error: () => {} },
       })
 
-      const probing = liveness.probe() // hangs
-      await sendStarted
-      t = STALE_MS + 1
-      await liveness.beat() // completes anyway, with the send still in flight
+      await liveness.start()
+      // Past the staleness window, with the first canary still hanging. Advanced
+      // by a whole extra tick: the judge only runs ON a tick, and the tick that
+      // lands exactly on 900_000 sees `elapsed > staleAfterMs` as false.
+      await vi.advanceTimersByTimeAsync(930_000)
+      liveness.stop()
+
       expect(liveness.current).toBe('degraded')
+      // And the verdict reached the file an operator reads, not just memory.
       expect((JSON.parse(fs.readFileSync(file, 'utf8')) as { state: string }).state).toBe('degraded')
       release()
-      await probing
     } finally {
+      vi.useRealTimers()
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
@@ -718,6 +804,63 @@ describe('InboundLiveness — 发送相位必须真的会漂移(H-1)', () => {
   })
 })
 
+describe('InboundLiveness — 定时器边界(M-4)', () => {
+  it('间隔顶到上限时,递给 setTimeout 的延迟不能越界', async () => {
+    // durationMs() clamps the CONFIG to 2^31-1, but jitter multiplies by up to
+    // 1.2 afterwards — and Node silently turns an out-of-range delay into 1ms:
+    // the tight loop the config validation existed to prevent, reached by
+    // arithmetic downstream of it. So the clamp has to live where the timer is
+    // actually armed.
+    //
+    // Asserted on the DELAY handed to setTimeout rather than on observed firing,
+    // because the fake timer library does not reproduce Node's overflow
+    // coercion — a behavioural test here would pass no matter what.
+    vi.useFakeTimers()
+    const delays: number[] = []
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      fn: () => void,
+      ms?: number,
+    ) => {
+      delays.push(ms ?? 0)
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout)
+    try {
+      const fake = new FakeSpeaker()
+      const speaker = new SpeakerClient(fake.runner, { identity: 'agent24' })
+      const liveness = new InboundLiveness({
+        speaker,
+        identity: 'agent24',
+        resolveSelfNpub: () => speaker.npubFor('agent24'),
+        canaryIntervalMs: 2 ** 31 - 1, // the ceiling durationMs allows
+        staleAfterMs: 2 ** 31 - 1,
+        tickMs: 30_000,
+        now: () => Date.now(),
+        rand: () => 0.99, // ×1.196 — over the signed-32-bit timer range
+        log: { log: () => {}, warn: () => {}, error: () => {} },
+      })
+      await liveness.start()
+      // Re-arm at the FULL jittered interval. No probe first: an outstanding
+      // published canary would put `nextDelay` in the accelerated branch, whose
+      // value is a third of the interval and never trips the ceiling — the test
+      // would then pass regardless of the clamp.
+      ;(liveness as unknown as { armCanary: (d: number) => void }).armCanary(
+        (liveness as unknown as { nextDelay: () => number }).nextDelay(),
+      )
+      liveness.stop()
+
+      expect(delays.length).toBeGreaterThan(0)
+      for (const d of delays) {
+        expect(Number.isFinite(d)).toBe(true)
+        expect(d).toBeGreaterThanOrEqual(0)
+        expect(d).toBeLessThanOrEqual(2 ** 31 - 1)
+      }
+    } finally {
+      spy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe('InboundLiveness — 断网时不能自己制造洪水(M-1)', () => {
   it('canary 一条都没发出去时不加速重探,而是退避', async () => {
     // Every unpublished canary lands in agent-speaker's outbox and is retried
@@ -829,6 +972,17 @@ describe('InboundLiveness — 健康文件是运维输入,必须当成不可信�
         '{"seconds_since_confirmed":120}',
         '{"seconds_since_confirmed":-5,"updated_at":"nonsense"}',
         'not json at all{',
+        // Finite but absurd: 1e308 ms survives a bare isFinite check and then
+        // overflows to Infinity on `* 1000`, which JSON.stringify writes back as
+        // `null` — corrupting the NEXT restore too.
+        '{"seconds_since_confirmed":1e308,"updated_at":"2026-09-02T00:00:00.000Z"}',
+        // Counters as an array / with a bad field: silently coercing these to 0
+        // breaks the very "counts accumulate across restarts" property the soak
+        // criterion leans on, so the whole snapshot must be rejected loudly.
+        '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","canaries":[]}',
+        '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","canaries":{"sent":1,"confirmed":"x","lost":0}}',
+        // Present-but-unparseable timestamp is corruption, not absence.
+        '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","last_confirmed_at":"soon"}',
       ]) {
         fs.writeFileSync(file, bad)
         const h = harness({ healthFile: file })
@@ -837,8 +991,25 @@ describe('InboundLiveness — 健康文件是运维输入,必须当成不可信�
         await h.judge()
         expect(h.liveness.current).toBe('degraded')
         expect(Number.isFinite(h.liveness.snapshot().seconds_since_confirmed)).toBe(true)
-        expect(h.logs.some((l) => l.level === 'warn' && l.text.includes('无法解析'))).toBe(true)
+        expect(h.logs.some((l) => l.level === 'warn' && l.text.includes('健康快照'))).toBe(true)
       }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('读不了快照(不是「不存在」)要报警,不能当成首次运行', async () => {
+    // Only ENOENT is a genuinely fresh start. EACCES / EISDIR / an I/O error
+    // means a snapshot may well exist and we simply cannot see it — treating
+    // that as "first run" hands a restart loop a clean slate every time, which
+    // is exactly the accounting `restore()` exists to protect.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    fs.mkdirSync(file) // a directory where the snapshot should be → EISDIR
+    try {
+      const h = harness({ healthFile: file })
+      await h.boot()
+      expect(h.logs.some((l) => l.level === 'warn' && l.text.includes('健康快照'))).toBe(true)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

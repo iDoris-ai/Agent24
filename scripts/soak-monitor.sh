@@ -12,6 +12,12 @@
 #   - rss_mb / cpu_pct: agent24d process footprint (watch for a slow leak)
 #   - schedules / overdue: GET /api/v1/schedules (bearer), and how many have a
 #     next_run_at already in the past (a stuck scheduler)
+#   - nostr_state / nostr_confirmed / nostr_degraded: the Nostr bridge's liveness
+#     snapshot (FU-32). WITHOUT this, F5 criterion 6 ("inbound was never dead")
+#     cannot be checked after the fact at all: that file is OVERWRITTEN in place,
+#     so an outage on Tuesday that recovered by Wednesday leaves no trace in it.
+#     Sampling it here, plus the cumulative degraded_transitions counter it
+#     carries, is what makes the criterion evidence instead of a promise.
 #
 # On exit (Ctrl-C, SIGTERM, or --duration elapsed) it prints a PASS/FAIL summary
 # against the F5 criteria.
@@ -27,6 +33,7 @@ set -u
 INTERVAL=300            # seconds between samples
 DURATION=$((7*24*3600)) # total run length (7 days)
 DAEMON_JSON="${A24_DAEMON_JSON:-$HOME/.agent24/daemon.json}"
+NOSTR_HEALTH="${A24_NOSTR_HEALTH_FILE:-$HOME/.agent24/nostr-bridge-health.json}"
 LOG=""
 
 while [ $# -gt 0 ]; do
@@ -34,6 +41,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="$2"; shift 2 ;;
     --duration) DURATION="$2"; shift 2 ;;
     --daemon-json) DAEMON_JSON="$2"; shift 2 ;;
+    --nostr-health) NOSTR_HEALTH="$2"; shift 2 ;;
     --log) LOG="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -54,6 +62,11 @@ case "$DURATION" in ''|*[!0-9]*) echo "--duration must be integer seconds" >&2; 
 # Counters (whole-run accounting).
 samples=0; health_ok=0; restarts=0; overdue_max=0; last_pid=""
 schedule_min=""; anomalies=0; disabled_seen=0; sched_err_seen=0; stuck_failing_seen=0
+# Nostr inbound liveness (FU-32). `nostr_seen` starts at 0 so a soak run without
+# the bridge configured is not failed by criterion 6; once a snapshot HAS been
+# read, a later disappearance is an anomaly rather than "no bridge here".
+nostr_seen=0; nostr_degraded_max=0; nostr_conf_first=""; nostr_conf_last=0; nostr_read_err=0
+n_state="null"; n_conf="null"; n_degr="null"
 
 read_daemon() { # -> echoes "port token pid" or nothing
   [ -f "$DAEMON_JSON" ] || return 1
@@ -62,6 +75,37 @@ read_daemon() { # -> echoes "port token pid" or nothing
 
 # ISO-8601 UTC without relying on GNU date flags.
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Read the Nostr bridge's liveness snapshot into n_state/n_conf/n_degr (JSON
+# literals, ready to interpolate) and fold it into the whole-run accounting.
+sample_nostr() {
+  n_state="null"; n_conf="null"; n_degr="null"
+  if [ ! -f "$NOSTR_HEALTH" ]; then
+    # Gone after having been seen = the bridge died or the file broke. A soak
+    # that can no longer read its own evidence must not report PASS on it.
+    if [ "$nostr_seen" -eq 1 ]; then nostr_read_err=1; anomalies=$((anomalies+1)); fi
+    return
+  fi
+  local st cf dg
+  st=$(jq -r '.state // empty' "$NOSTR_HEALTH" 2>/dev/null)
+  cf=$(jq -r '.canaries.confirmed // empty' "$NOSTR_HEALTH" 2>/dev/null)
+  dg=$(jq -r '.degraded_transitions // empty' "$NOSTR_HEALTH" 2>/dev/null)
+  if [ -z "$st" ] || [ -z "$cf" ] || [ -z "$dg" ]; then
+    # The file EXISTS and cannot be parsed. That is never "no bridge configured"
+    # — it is broken evidence, and it must fail the gate even if we have never
+    # managed to read this file, otherwise a snapshot that was corrupt from the
+    # very first sample makes criterion 6 silently un-evaluated and the run can
+    # PASS on it. (Same fail-open the bridge's own `restore()` had.)
+    nostr_seen=1; nostr_read_err=1; anomalies=$((anomalies+1))
+    return
+  fi
+  nostr_seen=1
+  [ -z "$nostr_conf_first" ] && nostr_conf_first="$cf"
+  nostr_conf_last="$cf"
+  [ "$dg" -gt "$nostr_degraded_max" ] 2>/dev/null && nostr_degraded_max="$dg"
+  [ "$st" = "degraded" ] && anomalies=$((anomalies+1))
+  n_state="\"$st\""; n_conf="$cf"; n_degr="$dg"
+}
 
 summarize() {
   local up="n/a"
@@ -76,6 +120,11 @@ summarize() {
   echo "daemon restarts: $restarts   (F2 should keep the user unaffected)"
   echo "schedules seen:  min=${schedule_min:-n/a}  max_overdue=${overdue_max}"
   echo "scheduler faults: auto_disabled=${disabled_seen}  fetch_errors=${sched_err_seen}  stuck_failing=${stuck_failing_seen}"
+  if [ "$nostr_seen" -eq 1 ]; then
+    echo "nostr inbound:   degraded_transitions=${nostr_degraded_max}  confirmed ${nostr_conf_first:-0}→${nostr_conf_last}  read_errors=${nostr_read_err}"
+  else
+    echo "nostr inbound:   (no health snapshot seen — bridge not configured; criterion 6 NOT evaluated)"
+  fi
   echo "anomalies:       $anomalies"
   echo
   # F5 pass gate. The scheduler must be positively ALIVE the whole run — not
@@ -92,14 +141,33 @@ summarize() {
   # NOT gate — a flapping schedule can legitimately carry it; the JSONL
   # last_run/max_consec_fail fields are the post-hoc "did it actually fire" check.
   # NEEDS REVIEW exits NON-ZERO so TASKS.md automation can gate on it (B3).
+  # F5 criterion 6 (FU-32). Gates only once a snapshot has been seen, so a run
+  # without the Nostr bridge is not failed by it — but from then on it is HARD,
+  # and it is judged from the CUMULATIVE counter, not from "state looked ok
+  # whenever someone happened to sample it": the health file is overwritten in
+  # place, so a degradation that recovered leaves no other trace. `confirmed`
+  # must also have advanced — a bridge stuck at `starting` never reported
+  # degraded either, and that must not read as healthy.
+  local nostr_ok=1
+  if [ "$nostr_seen" -eq 1 ]; then
+    if [ "$nostr_degraded_max" -ne 0 ] || [ "$nostr_read_err" -ne 0 ] \
+       || [ "$nostr_conf_last" -le "${nostr_conf_first:-0}" ]; then
+      nostr_ok=0
+    fi
+  fi
+
   local result=1
   if [ "$samples" -gt 0 ] && [ "$health_ok" -eq "$samples" ] \
      && [ "${schedule_min:-0}" -gt 0 ] && [ "$overdue_max" -eq 0 ] \
-     && [ "$disabled_seen" -eq 0 ] && [ "$sched_err_seen" -eq 0 ]; then
-    echo "RESULT: PASS (health 100%, ≥1 live schedule every sample, no overdue/auto-disabled/fetch-error)"
+     && [ "$disabled_seen" -eq 0 ] && [ "$sched_err_seen" -eq 0 ] \
+     && [ "$nostr_ok" -eq 1 ]; then
+    echo "RESULT: PASS (health 100%, ≥1 live schedule every sample, no overdue/auto-disabled/fetch-error$([ "$nostr_seen" -eq 1 ] && echo ", nostr inbound never degraded"))"
     result=0
   else
     echo "RESULT: NEEDS REVIEW (see anomalies + scheduler faults in the log)"
+    if [ "$nostr_ok" -eq 0 ]; then
+      echo "  · Nostr 入站(F5 判据 6):degraded_transitions=${nostr_degraded_max} read_errors=${nostr_read_err} confirmed ${nostr_conf_first:-0}→${nostr_conf_last}"
+    fi
   fi
   exit "$result"
 }
@@ -112,10 +180,11 @@ start=$(date +%s)
 while :; do
   ts=$(now_iso)
   info=$(read_daemon || true)
+  sample_nostr
   if [ -z "$info" ]; then
     # No discovery file → daemon not registered. Record and keep watching;
     # F1a autostart / F2 recovery may bring it back.
-    echo "{\"at\":\"$ts\",\"health\":false,\"reason\":\"no daemon.json\"}" >> "$LOG"
+    echo "{\"at\":\"$ts\",\"health\":false,\"reason\":\"no daemon.json\",\"nostr_state\":$n_state,\"nostr_confirmed\":$n_conf,\"nostr_degraded\":$n_degr}" >> "$LOG"
     samples=$((samples+1)); anomalies=$((anomalies+1))
   else
     port=$(echo "$info" | cut -d' ' -f1)
@@ -196,8 +265,8 @@ while :; do
 
     # An unwritable log must abort, not silently PASS on a phantom log the summary
     # then tells you to archive (soak review #109 Low).
-    printf '{"at":"%s","health":%s,"code":"%s","sched_code":"%s","pid":%s,"restarts":%s,"rss_mb":%s,"cpu_pct":%s,"schedules":%s,"disabled":%s,"nullnext":%s,"overdue":%s,"sched_err":%s,"max_consec_fail":%s,"last_run":%s}\n' \
-      "$ts" "$ok" "$code" "$scode" "${pid:-0}" "$restarts" "${rss_mb:-0}" "${cpu_pct:-0}" "${n_sched:-0}" "$disabled" "$nullnext" "$overdue" "$sched_err" "${max_cfail:-0}" "${last_run:-\"null\"}" >> "$LOG" \
+    printf '{"at":"%s","health":%s,"code":"%s","sched_code":"%s","pid":%s,"restarts":%s,"rss_mb":%s,"cpu_pct":%s,"schedules":%s,"disabled":%s,"nullnext":%s,"overdue":%s,"sched_err":%s,"max_consec_fail":%s,"last_run":%s,"nostr_state":%s,"nostr_confirmed":%s,"nostr_degraded":%s}\n' \
+      "$ts" "$ok" "$code" "$scode" "${pid:-0}" "$restarts" "${rss_mb:-0}" "${cpu_pct:-0}" "${n_sched:-0}" "$disabled" "$nullnext" "$overdue" "$sched_err" "${max_cfail:-0}" "${last_run:-\"null\"}" "$n_state" "$n_conf" "$n_degr" >> "$LOG" \
       || { echo "soak-monitor: cannot write $LOG — aborting" >&2; exit 2; }
   fi
 

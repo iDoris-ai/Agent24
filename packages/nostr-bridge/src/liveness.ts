@@ -84,8 +84,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { SpeakerTimeoutError, type InboundMessage, type SpeakerClient } from './speaker.js'
 
-/** Marks a canary in the message body. NOT used for matching — it exists so an
- * operator reading their own inbox knows what these are. */
+/** Marks a canary in the message body. NEVER used for matching — neither to
+ * confirm nor to drop. It exists so an operator reading their own inbox knows
+ * what these are. Matching on it would let any peer opt out of being processed
+ * by prefixing their message with a public string. */
 export const CANARY_PREFIX = 'a24-liveness-canary'
 
 export type LivenessState =
@@ -143,8 +145,18 @@ export interface LivenessSnapshot {
   /** null until a canary has ever come back. */
   last_confirmed_at: string | null
   seconds_since_confirmed: number
+  /** How many times the path has gone from healthy to dead, CUMULATIVE across
+   * restarts. The file only ever holds the CURRENT state, so a degradation that
+   * happened on Tuesday and recovered by Wednesday leaves no trace in it — and
+   * the F5 criterion is "never degraded across seven days". This counter is that
+   * evidence; without it the criterion cannot be checked from what the run
+   * leaves behind, only from having watched it live. */
+  degraded_transitions: number
   canaries: { sent: number; confirmed: number; lost: number; outstanding: number }
   last_error: string | null
+  /** Our own npub, so a restart whose keystore read fails can still recognise
+   * (and drop) the canaries the previous process left in the inbox window. */
+  self_npub?: string
   context?: Record<string, unknown>
 }
 
@@ -153,6 +165,15 @@ export interface LivenessSnapshot {
 const DEGRADED_RELOG_MS = 60 * 60 * 1000
 /** Rewrite an unchanged health file at most this often. */
 const HEALTH_WRITE_MS = 60 * 1000
+
+/** Final clamp before any `setTimeout`. Validating the CONFIG value is not
+ * enough: a canary interval sitting at the 2^31-1 ceiling still gets multiplied
+ * by up to 1.2 by the jitter, and Node silently turns an out-of-range delay into
+ * 1ms — the tight loop the config validation existed to prevent, reached by
+ * arithmetic downstream of it. Clamp where the timer is actually armed. */
+function safeDelay(ms: number): number {
+  return Number.isFinite(ms) ? Math.min(Math.max(0, ms), 2 ** 31 - 1) : 0
+}
 
 interface Outstanding {
   at: number
@@ -178,7 +199,7 @@ export class InboundLiveness {
     LivenessOptions
 
   private selfNpub?: string
-  private readonly startedAt: number
+  private startedAt: number
   private lastConfirmedAt: number | null = null
   private lastConfirmedWall: number | null = null
   /** Silence inherited from the previous process (see `restore`). Without it a
@@ -196,6 +217,7 @@ export class InboundLiveness {
   private confirmed = 0
   private lost = 0
   private lastError: string | null = null
+  private degradedTransitions = 0
   private lastDegradedLogAt = -Infinity
   private lastHealthWriteAt = -Infinity
   private lastHealthState?: LivenessState
@@ -235,6 +257,14 @@ export class InboundLiveness {
     this.startedAt = this.o.now()
   }
 
+  /** Re-anchored in `start()`: `restore()` measures the inherited silence up to
+   * ITS OWN wall-clock moment, and `elapsed()` then adds `now - startedAt` on
+   * top. If the two anchors differ — an instance constructed and started minutes
+   * apart — that interval is counted twice. */
+  private reanchor(): void {
+    this.startedAt = this.o.now()
+  }
+
   /** Current state — for tests and for whoever wants to gate on it. */
   get current(): LivenessState {
     return this.state
@@ -256,6 +286,7 @@ export class InboundLiveness {
     if (this.started) return
     this.started = true
     this.restore()
+    this.reanchor()
     try {
       this.selfNpub = await this.o.resolveSelfNpub()
     } catch (err) {
@@ -279,7 +310,7 @@ export class InboundLiveness {
 
   private scheduleTick(): void {
     if (this.stopped) return
-    this.tickTimer = setTimeout(() => void this.loop(), this.o.tickMs)
+    this.tickTimer = setTimeout(() => void this.loop(), safeDelay(this.o.tickMs))
   }
 
   private async loop(): Promise<void> {
@@ -311,7 +342,7 @@ export class InboundLiveness {
   private armCanary(delay: number): void {
     if (this.stopped) return
     if (this.canaryTimer) clearTimeout(this.canaryTimer)
-    this.canaryTimer = setTimeout(() => void this.canaryTurn(), Math.max(0, delay))
+    this.canaryTimer = setTimeout(() => void this.canaryTurn(), safeDelay(delay))
   }
 
   private async canaryTurn(): Promise<void> {
@@ -359,6 +390,17 @@ export class InboundLiveness {
         this.lastGapMs = this.elapsed(now)
         this.lastConfirmedAt = now
         this.lastConfirmedWall = this.o.wallNow()
+        // A completed round trip is the STRONGEST evidence there is, so it must
+        // clear the send-failure backoff — otherwise this is an absorbing state:
+        // a canary that missed the relay on the first try (failures=1) but got
+        // published later by agent-speaker's outbox comes back and confirms,
+        // while the schedule stays backed off to 20-30 minutes. Two of those and
+        // the next probe lands past the 15-minute staleness window, so a path
+        // that is demonstrably working reports `degraded` on a cycle.
+        if (this.consecutiveSendFailures > 0) {
+          this.consecutiveSendFailures = 0
+          this.armCanary(this.nextDelay()) // pull the deadline back in
+        }
         continue
       }
       // Dropped, never confirmed: a canary from an earlier run, or one that came
@@ -366,16 +408,13 @@ export class InboundLiveness {
       // as if a peer had sent it. Matched on SENDER, because a text match would
       // also swallow a legitimate peer message that happened to start with the
       // marker.
-      if (this.selfNpub) {
-        if (m.from === this.selfNpub) continue
-      } else if (m.content.startsWith(CANARY_PREFIX)) {
-        // Only while the npub is still unresolved (a keystore unreadable at
-        // boot). Without this, the previous process's canaries would reach the
-        // run path for an operator who allowlisted their own npub — the agent
-        // answering its own probe. Narrow window, and it closes for good the
-        // moment `resolveSelfNpub` succeeds.
-        continue
-      }
+      // Matched on SENDER only. Falling back to the marker TEXT when the npub is
+      // not yet known would swallow a legitimate peer message that happens to
+      // start with the marker — a public string anyone can type. The npub comes
+      // from the keystore, or, when that read fails at boot, from the last
+      // trusted health snapshot (see `restore`), which covers the window that
+      // fallback was there for without giving a peer a way to silence itself.
+      if (this.selfNpub && m.from === this.selfNpub) continue
       peers.push(m)
     }
     return peers
@@ -459,6 +498,7 @@ export class InboundLiveness {
     this.state = next
 
     if (next === 'degraded') {
+      if (was !== 'degraded') this.degradedTransitions += 1
       if (was !== 'degraded' || now - this.lastDegradedLogAt >= DEGRADED_RELOG_MS) {
         this.lastDegradedLogAt = now
         this.o.log.error(
@@ -538,6 +578,7 @@ export class InboundLiveness {
       last_confirmed_at:
         this.lastConfirmedWall === null ? null : new Date(this.lastConfirmedWall).toISOString(),
       seconds_since_confirmed: Math.round(this.elapsed(now) / 1000),
+      degraded_transitions: this.degradedTransitions,
       canaries: {
         sent: this.sent,
         confirmed: this.confirmed,
@@ -545,6 +586,7 @@ export class InboundLiveness {
         outstanding: this.outstanding.size,
       },
       last_error: this.lastError,
+      ...(this.selfNpub ? { self_npub: this.selfNpub } : {}),
       ...(this.o.context ? { context: this.o.context } : {}),
     }
   }
@@ -561,15 +603,25 @@ export class InboundLiveness {
     let raw: string
     try {
       raw = fs.readFileSync(file, 'utf8')
-    } catch {
-      return // no previous run — a genuinely fresh start
+    } catch (err) {
+      // ONLY a missing file is a genuinely fresh start. EACCES / EISDIR / an I/O
+      // error means a snapshot may well exist and we simply cannot see it —
+      // treating that as "first run" hands a restart loop a clean slate every
+      // time, which is precisely the accounting this function exists to protect.
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') this.unreadable(file, err)
+      return
     }
-    // Every number out of this file is validated. `Math.max(0, NaN)` is NaN, and
-    // a NaN elapsed compares false against EVERY threshold — so one corrupt or
+    // Every value out of this file is validated. `Math.max(0, NaN)` is NaN, and a
+    // NaN elapsed compares false against EVERY threshold — so one corrupt or
     // hand-edited field would leave the probe permanently in `starting`, unable
     // to ever report degraded. A fail-open hiding in an operations file.
-    const finite = (v: unknown): number | null =>
-      typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
+    //
+    // "Finite" is not sufficient either: 1e308 milliseconds is finite, survives
+    // the check, and then overflows to Infinity the moment it is multiplied —
+    // which JSON.stringify writes back out as `null`, corrupting the NEXT run's
+    // restore too. Everything is therefore bounded to a safe integer range.
+    const num = (v: unknown, max = Number.MAX_SAFE_INTEGER): number | null =>
+      typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max ? v : null
     const stamp = (v: unknown): number | null => {
       if (typeof v !== 'string') return null
       const t = Date.parse(v)
@@ -577,38 +629,71 @@ export class InboundLiveness {
     }
     try {
       const prev = JSON.parse(raw) as Partial<LivenessSnapshot>
-      const carriedSec = finite(prev.seconds_since_confirmed)
+      // A year of silence is already absurd; anything beyond it is corruption,
+      // and bounding here keeps `* 1000` inside the safe integer range.
+      const carriedSec = num(prev.seconds_since_confirmed, 365 * 24 * 3600)
       const writtenAt = stamp(prev.updated_at)
       if (carriedSec === null || writtenAt === null) {
-        throw new Error('缺少或非法的 seconds_since_confirmed / updated_at')
+        throw new Error('seconds_since_confirmed / updated_at 缺失或非法')
       }
+      // `last_confirmed_at` may legitimately be absent (nothing has ever come
+      // back), but a PRESENT-and-unparseable one is corruption, not absence.
+      if (prev.last_confirmed_at != null && stamp(prev.last_confirmed_at) === null) {
+        throw new Error('last_confirmed_at 存在但不是合法时间戳')
+      }
+      // Counters must be a plain object of non-negative safe integers. An array,
+      // a null, or one bad field silently became 0 before — which quietly
+      // violates the very "counts accumulate across restarts" property the soak
+      // criterion leans on.
+      const c = prev.canaries
+      const plainObject =
+        typeof c === 'object' && c !== null && !Array.isArray(c)
+      const counters = plainObject
+        ? {
+            sent: num((c as LivenessSnapshot['canaries']).sent),
+            confirmed: num((c as LivenessSnapshot['canaries']).confirmed),
+            lost: num((c as LivenessSnapshot['canaries']).lost),
+          }
+        : null
+      if (c !== undefined && (!counters || Object.values(counters).some((v) => v === null))) {
+        throw new Error('canaries 计数缺失或非法')
+      }
+      const transitions = prev.degraded_transitions === undefined
+        ? 0
+        : num(prev.degraded_transitions)
+      if (transitions === null) throw new Error('degraded_transitions 非法')
+
       // The written value is already the TOTAL silence (it includes whatever the
       // previous process itself inherited), so adding the downtime since the
       // write accumulates correctly across any number of restarts — it does not
       // double-count.
       this.restoredGapMs = carriedSec * 1000 + Math.max(0, this.o.wallNow() - writtenAt)
       this.lastConfirmedWall = stamp(prev.last_confirmed_at)
-      // Counters carry over too: the soak criterion is that confirmations keep
-      // accruing across the week, and a launchd restart must not reset that to
-      // zero and read as "nothing has ever come through".
-      const c = prev.canaries
-      this.sent = finite(c?.sent) ?? 0
-      this.confirmed = finite(c?.confirmed) ?? 0
-      this.lost = finite(c?.lost) ?? 0
+      this.sent = counters?.sent ?? 0
+      this.confirmed = counters?.confirmed ?? 0
+      this.lost = counters?.lost ?? 0
+      this.degradedTransitions = transitions
+      // Last known identity, so a keystore we cannot read right now does not
+      // leave us unable to recognise our own leftover canaries.
+      if (typeof prev.self_npub === 'string' && prev.self_npub) this.selfNpub = prev.self_npub
       if (this.restoredGapMs > this.o.staleAfterMs) {
         this.o.log.warn(
           `[nostr] ⚠️  上一轮进程留下的入站静默已有 ${Math.round(this.restoredGapMs / 1000)}s,本进程不重新计时(重启不清账)。`,
         )
       }
     } catch (err) {
-      // The file EXISTS but cannot be trusted. Starting fresh silently would
-      // hand a restart loop a clean slate every time — say it loudly instead,
-      // because it means the soak's own accounting is broken.
-      this.restoredGapMs = 0
-      this.o.log.warn(
-        `[nostr] ⚠️  健康快照 ${file} 存在但无法解析(${err instanceof Error ? err.message : String(err)});静默计时从本进程重新开始 —— 若这是反复出现的,活性判据不可信。`,
-      )
+      this.unreadable(file, err)
     }
+  }
+
+  /** The snapshot exists but cannot be trusted. Reset the inherited accounting
+   * and say so loudly — a silent fresh start here is indistinguishable from a
+   * healthy first run, which is how a broken soak reports PASS. */
+  private unreadable(file: string, err: unknown): void {
+    this.restoredGapMs = 0
+    this.o.log.warn(
+      `[nostr] ⚠️  健康快照 ${file} 存在但无法读取/解析(${err instanceof Error ? err.message : String(err)});静默计时从本进程重新开始 —— 若这是反复出现的,活性判据不可信。`,
+    )
   }
 
   /** Write the health snapshot. On state change immediately; otherwise at most
