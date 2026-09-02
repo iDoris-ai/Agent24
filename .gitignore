@@ -14,6 +14,10 @@ CLAUDE.md
 
 # Local-only reference clones for code study (NOT submodules, never committed)
 vendor/reference/
+vendor/macro/
+vendor/berd/
+vendor/LongHorizon-Harness/
+vendor/Proma/
 
 # Local copy of third-party listmonk (newsletter service, deployed separately)
 listmonk/
