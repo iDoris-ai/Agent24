@@ -22,7 +22,9 @@
 
 `soak-monitor.sh` 退出时按 **1、2、6** 自动给 PASS / NEEDS REVIEW；3–5 靠你日常抽查 + 日志。
 
-判据 6 由脚本采样健康快照来判，具体会因为这些原因判失败：任何一次采样抓到 `state=degraded`、`degraded_transitions` **在本次 run 内增长**、快照读不出来、快照**超过 15 分钟没更新**（进程死了但文件还在，冻结在 `ok` 上）、`confirmed` 全程没涨、或者整轮**从没读到过快照**（桥没起来）。确实不跑 Nostr 的 run 要显式加 `--no-nostr`——「没有证据」不会被当成「没配置」。
+判据 6 由脚本采样健康快照来判，这些情况判失败：任何一次采样抓到 `state=degraded`；`degraded_transitions` **在本次 run 内增长**；快照读不出来 / 格式非法 / 属于另一个身份；快照**超过 15 分钟没更新**（进程死了但文件还在，冻结在 `ok` 上）；`confirmed` 或 `degraded_transitions` **回退**，或 `generation` 变化（账本被重置——重置会把跨重启的静默一起抹掉）；`confirmed` 全程没涨；整轮**从没读到过快照**，或快照**迟到超过 15 分钟才出现**（在那之前那一段没有任何入站证据）。
+
+确实不跑 Nostr 的 run 要显式加 `--no-nostr`——「没有证据」不会被当成「没配置」。跑得比 15 分钟还短的 run 会报 `SMOKE PASS` 并**以非 0 退出**：那种长度根本评估不了判据 6，不能拿来当 F5 结论。
 
 ## 一次性准备
 
@@ -60,7 +62,7 @@ pnpm --filter @agent24/wechat-bridge start   # 扫码
 
   这两条只覆盖桥的**读**路径。`agent msg` 与 `profile publish` 的改名后契约**仍未验收**（F4 联调是对着改名前的 7cef326 验的）。桥起来后分别这样确认：
 
-  - `agent msg` → `cat ~/.agent24/nostr-bridge-health.json`，`last_error` 为 null 且 `canaries.sent` 在涨（canary 就是走这条命令发的）。
+  - `agent msg` → `cat ~/.agent24/nostr-bridge-health-<identity>.json`，`last_error` 为 null 且 `canaries.sent` 在涨（canary 就是走这条命令发的）。
   - `profile publish` → 看桥的启动日志里有没有 `[nostr] ✅ 已注册能力,发布到 N 个 relay`；失败会打 `[nostr] 注册失败`。**它不会写进健康快照的 `last_error`**（那个字段只来自活性探针），所以别用它证明注册成功。
 
 - **泡测的 daemon 要关掉桌面通知和自动回复**：`hyphae daemon --notify=false --auto-reply=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
@@ -97,7 +99,7 @@ jq 'select(.overdue > 0)' ~/agent24-soak.jsonl
 # 第 1 天 / 第 7 天各发一条真实微信、Nostr 消息，确认能驱动 run + 审批回
 
 # Nostr 入站通路现在是活的吗（FU-32）——每次开机/唤醒后都看一眼
-cat ~/.agent24/nostr-bridge-health.json
+cat ~/.agent24/nostr-bridge-health-agent24.json   # 文件名带身份后缀
 # state 应为 "ok"；degraded_transitions 应为 0；confirmed 应随时间增长
 #（计数跨重启累计，launchd 重启不会归零）
 # lost 偶尔 >0 是已知的上游竞态（FU-33）；只要 confirmed 在涨、transitions 是 0 就不算问题
