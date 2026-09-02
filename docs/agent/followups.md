@@ -11,6 +11,14 @@
 > 交付了 A 但原条目要的是 A+B 时：把原条目的范围**收窄到 A** 并标 done，
 > **另开一条 `- [ ]` 承载 B**。两个数（`count-open`、`[x]` 与 `done=PR#n` 相等）
 > 才会同时说真话。
+>
+> 判据用**宽**写法，不要加行尾锚：
+> ```bash
+> [ "$(grep -cE '^- \[x\] FU-' F)" = "$(grep -cE '^- \[x\] FU-.*done=PR#[0-9]+' F)" ]
+> ```
+> `[0-9]+` 已经排掉了正文里字面的「done=PR#n」；再加 ` *$` 只会**禁止任何尾部标注**
+> （如 `done=PR#142(仅子进程支)`）并误报。在最初那个真 bug 上两种写法同样给 1 ——
+> **锚从来没有承重。**（PR-Daemon 在 #144 用四棵树做控制实验推翻了它自己开的处方。）
 
 - [ ] FU-1 · B · src=PR#140 · 2026-08-23 · rekey 失败后 record_os_partition 撞的是 (org_id,space_id) UNIQUE，ON CONFLICT(owner_key) 接不住 → 冒出裸 Sqlx 错误而非 typed Conflict；运维日志因此说不出「有陈旧 v1 行占着这个 (org,space)」
 - [ ] FU-2 · B · src=PR#140 · 2026-08-23 · open_memory_base (server.rs:243) 在记忆库打不开时只 warn! → daemon 可能长期在「无模块记忆也无会话记忆」下运行。提到 error!

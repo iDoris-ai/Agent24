@@ -1,6 +1,6 @@
 {
   "name": "@agent24/wechat-bridge",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "F3: WeChat channel for agent24d over WeChat's official iLink Bot API. Inbound WeChat message -> agent24d run; run output + approvals delivered back to WeChat. Ported iLink protocol layer from heinu1 (bot/src/ilink), wired to the daemon's v1 HTTP API instead of spawning claude.",
   "type": "module",

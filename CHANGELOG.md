@@ -3,6 +3,61 @@
 All notable changes to Agent24 are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-09-02
+
+M-E：领域 OS 成为一等公民，M-D 记忆底座重做，Nostr 渠道收官。
+自 0.2.1 起 72 个合并。
+
+### 领域 OS（可插拔架构，ADR-029）
+
+- `DomainModule` + `KernelCtx` 契约 crate；内核不再按名字认识 Sin90（#127）
+- 内核侧挂载器 + Sin90 成为第一个 `DomainModule`：自己的 DB、自己的路由
+  命名空间、自己的 event module 名（#131 #132）
+- 配置驱动的领域 OS 注册表 + `agent24 os` CLI（daemon 拥有注册表）（#133 #134）
+- `domain-os.yml` 清单带 `deny_unknown_fields` —— 拼错字段名报错，而不是
+  静默的空能力集
+
+### 记忆（M-D 重做：可进化 / 可替换 / 可组合）
+
+- MD-1 Condenser 缝 + 崩溃重放，签名已冻结（#113 #116）
+- MD-2 EventStore（情节权威）+ ArtifactStore（markdown-CAS）+ 双谱系对账，
+  checksum 移动检测、**无静默删**（#114 #115）
+- MD-3 AssertionStore 双时相（矛盾=新版本非删）+ FTS5 Retriever，owner 隔离
+- MD-4 MemoryWriter 写门：WebFetch/Unknown 默认不落持久，投毒语料测试
+- MD-5 Consolidator：幂等 + **增量 == 全量重跑**
+- MD-6 向量检索机制 + 换模型 reindex 状态机 + FTS 兜底
+- MD-7 知识层：层级合并 + 触发注入 + **审核门控 auto-memory inbox**
+- MD-8 长任务符号轨迹：压缩率 >99% 且 **100% 可恢复**
+- **F1 `ScopedMemory`**：两个领域 OS 不再共享记忆底座（#139，六轮对抗复审）
+- **F8 所有权改为 (org, space)**，org 成为一等实体；分区目录 + v1→v2 re-key，
+  全程一个事务（#140，六轮对抗复审）
+- F5 两处排序 tie-breaker + 一条比字面更弱的 CHECK 约束（#138）
+
+### 渠道
+
+- **F4 Nostr 收官**（#85–#95）：出站 register/say/search + 入站 gated +
+  npub 白名单；与 agent-speaker 双向真联调；strfry 真 NIP-33 relay 覆盖定论
+- **两条会让 7×24 静默失效的缺陷**（#142）：Nostr 桥的 `execFile` 无 deadline
+  导致轮询循环永久停摆；微信会话映射非原子写导致断电截断
+
+### 生态
+
+- 模块发现服务 + 浏览过滤（#90 #91 #94）
+
+### 文档
+
+- ADR-030 + SPEC-ORG-SPACE + M1 规划层（#141）
+- 四份 vendor 研读笔记 + `docs/laws/` + Skill 分发规格 + 三档能力边界（#143）
+
+### 已知缺口（如实列出，不粉饰）
+
+- **FU-32（A 级）**：入站 relay 静默 —— 桥无法区分「收件箱为空」与「relay
+  连接已死」。#142 只关上了子进程挂起那一支。**F5 泡测前必须处理。**
+- F5 7×24 泡测**尚未跑过**（物理任务）
+- `agent24 os` 只有 `list`/`enable`/`disable`，**没有 `install`** —— 第三方
+  领域 OS 仍需编进二进制（ME-3 未开工）
+- 没有 web UI
+
 ## [0.2.1] — 2026-07-26
 
 Hardening of the H9 explorer subagent (found in an adversarial re-review of
