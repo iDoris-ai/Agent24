@@ -19,6 +19,19 @@ import type { AgentSpeakerProfile } from './profile.js'
 /** Runs one agent-speaker invocation and resolves its stdout. */
 export type SpeakerRunner = (args: string[]) => Promise<string>
 
+/** The child hit its deadline and was killed, so the outcome of whatever it was
+ * doing is UNKNOWN — not "failed". For a send that is a real distinction: the
+ * message may already be on a relay, or may never have left. Callers that must
+ * choose between retrying and dropping need to be able to tell this apart from
+ * an ordinary error, and to say so in the log. */
+export class SpeakerTimeoutError extends Error {
+  readonly indeterminate = true
+  constructor(message: string) {
+    super(message)
+    this.name = 'SpeakerTimeoutError'
+  }
+}
+
 /** The real runner: exec the `agent-speaker` binary. A `--json` error is itself
  * a JSON envelope (on stdout or stderr) plus a non-zero exit, so prefer the JSON
  * — `unwrap` surfaces the real message. Reject only when there's no JSON to
@@ -36,16 +49,22 @@ export function cliRunner(bin = 'agent-speaker', timeoutMs = CONFIG.SPEAKER_TIME
         args,
         { maxBuffer: 8 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
         (err, stdout, stderr) => {
-          const out = (stdout && stdout.trim()) || (stderr && stderr.trim()) || ''
-          if (out.startsWith('{') || out.startsWith('[')) return resolve(out)
-          // A killed child reports `err.killed`; say so explicitly, because
-          // "failed: null" tells an operator nothing at 3am.
+          // The kill check comes FIRST, before the JSON check. A child killed at
+          // the deadline may already have flushed something that starts with `{`
+          // — but we have no idea whether it is a complete envelope or the first
+          // half of one, nor whether the operation it describes actually
+          // finished. Treating that as success is exactly the fail-OPEN we spend
+          // review rounds hunting. (Codex review, Low.)
           const killed = (err as (Error & { killed?: boolean }) | null)?.killed
           if (killed) {
             return reject(
-              new Error(`agent-speaker ${args[0] ?? ''} timed out after ${timeoutMs}ms and was killed`),
+              new SpeakerTimeoutError(
+                `agent-speaker ${args[0] ?? ''} timed out after ${timeoutMs}ms and was killed`,
+              ),
             )
           }
+          const out = (stdout && stdout.trim()) || (stderr && stderr.trim()) || ''
+          if (out.startsWith('{') || out.startsWith('[')) return resolve(out)
           if (err) return reject(new Error(`agent-speaker ${args[0] ?? ''} failed: ${stderr.trim() || err.message}`))
           resolve(stdout)
         },

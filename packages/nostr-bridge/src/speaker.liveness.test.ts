@@ -14,7 +14,7 @@
 //     fails, which is the real bug reproducing.
 
 import { describe, it, expect } from 'vitest'
-import { cliRunner } from './speaker.js'
+import { cliRunner, SpeakerTimeoutError } from './speaker.js'
 
 describe('cliRunner liveness', () => {
   it('rejects instead of hanging when the child never exits', async () => {
@@ -36,6 +36,26 @@ describe('cliRunner liveness', () => {
   it('still resolves normally well inside the timeout', async () => {
     const run = cliRunner('echo', 10_000)
     await expect(run(['{"ok":true}'])).resolves.toContain('"ok"')
+  })
+
+  // CODEX REVIEW (Low): the kill check must come BEFORE the JSON check. A child
+  // killed at the deadline may already have flushed something starting with `{`,
+  // and we cannot tell a complete envelope from half of one — nor whether the
+  // operation it claims actually finished. Reporting that as success is fail-OPEN.
+  it('reports a kill as a timeout even when the child already flushed JSON', async () => {
+    // `sh -c` prints a complete-looking envelope, then hangs past the deadline.
+    // The budget must be comfortably longer than `sh` takes to start and flush,
+    // or the child gets killed before it prints and the test proves nothing —
+    // verified: at kill time `stdout` really does contain `{"ok":true}`.
+    const run = cliRunner('sh', 600)
+    await expect(run(['-c', 'printf \'{"ok":true}\'; sleep 30'])).rejects.toBeInstanceOf(
+      SpeakerTimeoutError,
+    )
+  })
+
+  it('marks a timeout as indeterminate — callers must not treat it as a plain failure', async () => {
+    const run = cliRunner('sleep', 100)
+    await expect(run(['30'])).rejects.toMatchObject({ indeterminate: true })
   })
 
   it('still rejects with the real message when the binary is missing', async () => {

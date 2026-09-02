@@ -3,16 +3,25 @@
 // `writeFileSync` does not have.
 //
 // MUTATION CHECK (how to confirm these tests are load-bearing):
-//   In `session-store.ts` `save()`, replace the temp+rename body with
-//   `fs.writeFileSync(this.file, JSON.stringify(...))`.
-//   → "a reader never sees a half-written file" fails (a truncated file is
-//     observable), and "recovers from a truncated main file" fails (no .bak).
+//   1. Replace the temp+rename body of `save()` with a plain
+//      `fs.writeFileSync(this.file, ...)`.
+//      → "never leaves a half-written main file" and "recovers ... via the
+//        backup" fail.
+//   2. Make `rotateBackupIfValid()` copy unconditionally (drop the parse check).
+//      → "never rotates a corrupt main file into the backup" fails.
+//   3. Drop the shape checks from `parseMap` (keep only JSON.parse).
+//      → "rejects on-disk shapes that are valid JSON but not a session map" fails.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { FileSessionStore } from './session-store.js'
+
+/** The backup's parsed contents — several tests assert on which generation it holds. */
+function parseBak(): unknown {
+  return JSON.parse(fs.readFileSync(`${file}.bak`, 'utf8'))
+}
 
 let dir: string
 let file: string
@@ -80,15 +89,44 @@ describe('FileSessionStore crash safety', () => {
     expect(new FileSessionStore(file).load()).toEqual(new Map([['uid-1', 'sess-a']]))
   })
 
-  it('prefers a leftover .tmp over an older .bak — .tmp is the newer content', () => {
+  it('does NOT trust a leftover .tmp — it is an unfinished write, not a generation', () => {
     const store = new FileSessionStore(file)
-    store.save(new Map([['uid-1', 'old']]))
-    store.save(new Map([['uid-1', 'older-still']])) // .bak = {uid-1: old}
+    store.save(new Map([['uid-1', 'good']]))
+    store.save(new Map([['uid-1', 'good']])) // .bak now holds a good generation
 
     fs.writeFileSync(file, 'not json at all')
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ 'uid-1': 'newest' }))
+    // Whatever a dead writer left behind must not become the answer.
+    fs.writeFileSync(`${file}.${process.pid}.tmp`, JSON.stringify({ 'uid-1': 'truncated?' }))
 
-    expect(new FileSessionStore(file).load()).toEqual(new Map([['uid-1', 'newest']]))
+    expect(new FileSessionStore(file).load()).toEqual(new Map([['uid-1', 'good']]))
+  })
+
+  // CODEX REVIEW (High): rotating an unvalidated main into .bak destroys the
+  // backup in exactly the scenario it exists for. This is the regression test.
+  it('never rotates a corrupt main file into the backup', () => {
+    const store = new FileSessionStore(file)
+    store.save(new Map([['uid-1', 'good']]))
+    store.save(new Map([['uid-1', 'good'], ['uid-2', 'also-good']]))
+
+    // Main is damaged from outside; .bak still holds the previous generation.
+    fs.writeFileSync(file, '{corrupt')
+    expect(new FileSessionStore(file).load()).toEqual(new Map([['uid-1', 'good']]))
+
+    // A save now must NOT copy the corrupt main over the good .bak...
+    store.save(new Map([['uid-3', 'new']]))
+    expect(parseBak()).toEqual({ 'uid-1': 'good' })
+
+    // ...so damaging main again still leaves something to recover.
+    fs.writeFileSync(file, '{corrupt again')
+    expect(new FileSessionStore(file).load()).toEqual(new Map([['uid-1', 'good']]))
+  })
+
+  it('rejects on-disk shapes that are valid JSON but not a session map', () => {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    for (const bad of ['null', '[1,2]', '"a string"', '42', '{"uid":123}']) {
+      fs.writeFileSync(file, bad)
+      expect(new FileSessionStore(file).load()).toEqual(new Map())
+    }
   })
 
   it('returns an empty map rather than throwing when every candidate is corrupt', () => {
