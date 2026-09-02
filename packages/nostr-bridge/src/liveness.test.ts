@@ -25,22 +25,39 @@
 //   - `elapsed()`: drop `restoredGapMs` → "反复重启不能刷掉静默". A supervisor
 //     restarting the bridge inside the grace window would otherwise hide a dead
 //     path forever, and the soak's "never degraded" criterion would false-PASS.
-//   - `dueIn()`: always return `nextCanaryDelay` → "丢一条 canary 不足以报死".
-//   - `jittered()`: return the base interval unchanged → no test goes red, and
-//     that is stated honestly: the phase-lock it defends against is a property
-//     of the real daemon's 30s cycle, which no unit test here simulates. The
-//     hazard is pinned by "上游竞态:发布早于写出站行" instead, which asserts the
-//     loss is survivable rather than that jitter prevents it.
+//   - `nextDelay()`: always return the base interval → "丢一条 canary,但一条
+//     不足以报死".
+//   - `nextDelay()`: count every outstanding canary instead of only published
+//     ones → "只剩没发出去的那条时不加速". Note the backoff branch normally
+//     answers first, so this needs the one state where it does not.
+//   - `armCanary()`: round the delay up to a multiple of `tickMs` → "canary 发送
+//     时刻不被 30s tick 量化". THIS IS THE BUG A FIRST ATTEMPT HAD: a jittered
+//     deadline checked on a fixed tick still fires at t0 + N×30s, so the phase
+//     never drifts and the jitter is decorative.
+//   - `restore()`: drop the field validation → "损坏的健康文件…". `Math.max(0,
+//     NaN)` is NaN and NaN > threshold is false for every threshold, so one bad
+//     field makes `degraded` unreachable forever.
+//   - `restore()`: do not carry the counters → "计数跨重启累计".
+//   - `start()`: drop the idempotence guard → "重复 start()…". Counting sends
+//     would NOT catch it (armCanary clears its own handle); the leak is a second
+//     judge-tick chain, so the test counts inbox reads.
 
 import { describe, it, expect, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { InboundLiveness, CANARY_PREFIX } from './liveness.js'
+import { durationMs } from './config.js'
 import { SpeakerClient, SpeakerTimeoutError, type SpeakerRunner } from './speaker.js'
 import { InboundBridge, pollOnce } from './inbound.js'
 import type { Agent24Client } from './agent24.js'
 import { FakeSpeaker } from './testing/fake-speaker.js'
+
+/** Reach the private scheduling decision — the thing that decides whether an
+ * outage becomes a flood. Asserting it directly beats asserting a timer's shape. */
+function nextDelayOf(l: InboundLiveness): number {
+  return (l as unknown as { nextDelay: () => number }).nextDelay()
+}
 
 const SELF = 'npub1self'
 const CANARY_MS = 60_000
@@ -134,8 +151,15 @@ function harness(
         })
       }
     },
-    /** One probe beat (reads the inbox itself — see InboundLiveness.start). */
+    /** Send one canary (the probe's own timer does this in production). */
+    probe: () => liveness.probe(),
+    /** Read the inbox, confirm, judge, persist — no sending. */
+    judge: () => liveness.beat(),
+    /** A canary going out and then a judgement, which is what one round of the
+     * probe amounts to. They run on SEPARATE timers in production (see
+     * `armCanary`), so tests that care about that drive them apart. */
     cycle: async () => {
+      await liveness.probe()
       await liveness.beat()
     },
   }
@@ -296,8 +320,10 @@ describe('InboundLiveness — 什么不算证据(fail-closed)', () => {
       log: { log: () => {}, warn: () => {}, error: () => {} },
     })
 
+    await liveness.probe()
     await liveness.beat()
     t += STALE_MS + 1
+    await liveness.probe()
     await liveness.beat()
 
     expect(liveness.current).toBe('degraded')
@@ -319,7 +345,7 @@ describe('InboundLiveness — 什么不算证据(fail-closed)', () => {
       log: { log: () => {}, warn: () => {}, error: () => {} },
     })
 
-    await liveness.beat()
+    await liveness.probe()
     expect(liveness.snapshot().last_error).toContain('npub')
     t += STALE_MS + 1
     await liveness.beat()
@@ -416,51 +442,59 @@ describe('InboundLiveness — 探针不能污染业务路径', () => {
     expect(peers.map((p) => p.from)).toEqual(['npub1peer'])
   })
 
-  it('判定先于发送:canary 发送卡住时,状态已经判过了', async () => {
-    // `beat()` judges before it sends. If it sent first, a canary send sitting
-    // on its 60s deadline would delay the verdict by a whole tick — during an
-    // outage, which is when the verdict is the entire point.
-    const fake = new FakeSpeaker()
-    let t = 0
-    let release!: () => void
-    let entered!: () => void
-    const blocked = new Promise<void>((r) => {
-      release = r
-    })
-    // Resolved the moment the canary send is entered, so the assertion below
-    // waits on the real thing instead of counting microtasks.
-    const sendStarted = new Promise<void>((r) => {
-      entered = r
-    })
-    const speaker = new SpeakerClient(
-      async (args) => {
-        if (args[0] === 'agent' && args[1] === 'msg') {
-          entered()
-          await blocked
+  it('发送与判定在不同的 timer 上:canary 卡死也不挡判定和健康文件', async () => {
+    // Stronger than "judge runs first inside one function": the two are on
+    // separate timers now, so a send hanging on its 60s deadline cannot delay
+    // the verdict OR the health file that publishes it — which is what an
+    // operator and the soak actually read.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      const fake = new FakeSpeaker()
+      let t = 0
+      let release!: () => void
+      let entered!: () => void
+      const blocked = new Promise<void>((r) => {
+        release = r
+      })
+      const sendStarted = new Promise<void>((r) => {
+        entered = r
+      })
+      const speaker = new SpeakerClient(
+        async (args) => {
+          if (args[0] === 'agent' && args[1] === 'msg') {
+            entered()
+            await blocked
+            return fake.runner(args)
+          }
           return fake.runner(args)
-        }
-        return fake.runner(args)
-      },
-      { identity: 'agent24' },
-    )
-    const liveness = new InboundLiveness({
-      speaker,
-      identity: 'agent24',
-      resolveSelfNpub: () => speaker.npubFor('agent24'),
-      canaryIntervalMs: CANARY_MS,
-      staleAfterMs: STALE_MS,
-      now: () => t,
-      rand: () => 0.5,
-      log: { log: () => {}, warn: () => {}, error: () => {} },
-    })
+        },
+        { identity: 'agent24' },
+      )
+      const liveness = new InboundLiveness({
+        speaker,
+        identity: 'agent24',
+        resolveSelfNpub: () => speaker.npubFor('agent24'),
+        canaryIntervalMs: CANARY_MS,
+        staleAfterMs: STALE_MS,
+        healthFile: file,
+        now: () => t,
+        wallNow: () => 1_700_000_000_000 + t,
+        rand: () => 0.5,
+        log: { log: () => {}, warn: () => {}, error: () => {} },
+      })
 
-    t = STALE_MS + 1
-    const beating = liveness.beat() // will block inside sendCanary
-    await sendStarted
-    // The verdict is already in, with the send still hanging.
-    expect(liveness.current).toBe('degraded')
-    release()
-    await beating
+      const probing = liveness.probe() // hangs
+      await sendStarted
+      t = STALE_MS + 1
+      await liveness.beat() // completes anyway, with the send still in flight
+      expect(liveness.current).toBe('degraded')
+      expect((JSON.parse(fs.readFileSync(file, 'utf8')) as { state: string }).state).toBe('degraded')
+      release()
+      await probing
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('对端消息原样放行', async () => {
@@ -606,6 +640,246 @@ describe('InboundLiveness — 运维面', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('InboundLiveness — 发送相位必须真的会漂移(H-1)', () => {
+  /** Build a probe on FAKE timers and record the wall time of every canary. */
+  function phaseHarness(rands: number[]) {
+    const fake = new FakeSpeaker()
+    const sentAt: number[] = []
+    let i = 0
+    const speaker = new SpeakerClient(
+      async (args) => {
+        if (args[0] === 'agent' && args[1] === 'msg') {
+          sentAt.push(Date.now())
+          fake.sendResult = { event_id: (sentAt.length + 1).toString(16).padStart(64, '0'), published_to: 1 }
+        }
+        return fake.runner(args)
+      },
+      { identity: 'agent24' },
+    )
+    const liveness = new InboundLiveness({
+      speaker,
+      identity: 'agent24',
+      resolveSelfNpub: () => speaker.npubFor('agent24'),
+      canaryIntervalMs: 300_000, // 5 min — an exact multiple of the daemon's 30s
+      staleAfterMs: 900_000,
+      tickMs: 30_000,
+      now: () => Date.now(),
+      rand: () => rands[i++ % rands.length]!,
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+    })
+    return { liveness, sentAt, inboxReads: () => fake.calls.filter((c) => c.args[0] === 'history').length }
+  }
+
+  it('canary 发送时刻不被 30s tick 量化 —— 否则抖动等于没做', async () => {
+    // The bug this pins: checking a jittered deadline on a fixed 30s tick still
+    // fires at t0 + N×30s, so `mod 30s` never moves and the probe stays locked
+    // to whatever phase it started in — including, possibly, one that sits
+    // inside the daemon's 3s subscribe window and loses EVERY canary.
+    vi.useFakeTimers()
+    try {
+      const { liveness, sentAt } = phaseHarness([0.13, 0.87, 0.41, 0.66, 0.29])
+      await liveness.start()
+      for (let n = 0; n < 6; n++) await vi.advanceTimersByTimeAsync(300_000)
+      liveness.stop()
+
+      expect(sentAt.length).toBeGreaterThanOrEqual(4)
+      const phases = new Set(sentAt.map((ms) => ms % 30_000))
+      // Quantized scheduling collapses every send onto the same residue.
+      expect(phases.size).toBeGreaterThan(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('重复 start() 不会留下两条自我调度链', async () => {
+    // Counting SENDS would not catch this: `armCanary` clears the previous
+    // handle, so the canary chain self-heals. The leak is the JUDGE tick — two
+    // chains, each spawning its own `history inbox` subprocess forever.
+    vi.useFakeTimers()
+    try {
+      const twice = phaseHarness([0.5])
+      await twice.liveness.start()
+      await twice.liveness.start() // must be a no-op
+      await vi.advanceTimersByTimeAsync(300_000)
+      twice.liveness.stop()
+
+      const once = phaseHarness([0.5])
+      await once.liveness.start()
+      await vi.advanceTimersByTimeAsync(300_000)
+      once.liveness.stop()
+
+      expect(twice.inboxReads()).toBe(once.inboxReads())
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('InboundLiveness — 断网时不能自己制造洪水(M-1)', () => {
+  it('canary 一条都没发出去时不加速重探,而是退避', async () => {
+    // Every unpublished canary lands in agent-speaker's outbox and is retried
+    // from there. Treating "unconfirmed" as "probe harder" during a week-long
+    // outage would queue thousands of messages to fix nothing.
+    const fake = new FakeSpeaker()
+    let t = 0
+    const speaker = new SpeakerClient(async (args) => {
+      if (args[0] === 'agent' && args[1] === 'msg') {
+        fake.sendResult = { event_id: 'ab'.repeat(32), published_to: 0, queued_for_retry: true }
+      }
+      return fake.runner(args)
+    }, { identity: 'agent24' })
+    const liveness = new InboundLiveness({
+      speaker,
+      identity: 'agent24',
+      resolveSelfNpub: () => speaker.npubFor('agent24'),
+      canaryIntervalMs: CANARY_MS,
+      staleAfterMs: STALE_MS,
+      now: () => t,
+      rand: () => 0.5,
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await liveness.probe()
+    expect(liveness.snapshot().last_error).toContain('outbox')
+    // The next probe must be pushed OUT (backoff), never pulled in to base/3.
+    expect(nextDelayOf(liveness)).toBeGreaterThan(CANARY_MS)
+  })
+
+  it('发布成功但没回来 → 才加速重探', async () => {
+    const h = harness({ loseCanaries: true })
+    await h.boot()
+    await h.probe()
+    expect(nextDelayOf(h.liveness)).toBeLessThan(CANARY_MS)
+  })
+
+  it('只剩没发出去的那条时不加速 —— 退避分支挡不住这一格', async () => {
+    // The discriminating case for tracking `published` at all. A send that never
+    // reached a relay sets the failure counter, so the backoff branch normally
+    // answers first and hides the distinction. Here the counter has been reset
+    // by a LATER successful send which then got confirmed and removed, leaving
+    // only the queued canary — accelerating for it would mean probing hard at
+    // something that has not yet had its chance to come back.
+    const fake = new FakeSpeaker()
+    let t = 0
+    let publish = false
+    let seq = 0
+    const inFlight: { id: string; content: string }[] = []
+    const speaker = new SpeakerClient(async (args) => {
+      if (args[0] === 'agent' && args[1] === 'msg') {
+        // A distinct id per SEND, not per delivered canary: deriving it from
+        // inFlight.length gave the unpublished A and the published B the same
+        // id, so B silently replaced A and the case under test never existed.
+        const id = (++seq).toString(16).padStart(64, '0')
+        const ci = args.indexOf('--content')
+        if (publish) inFlight.push({ id, content: args[ci + 1]! })
+        fake.sendResult = { event_id: id, published_to: publish ? 1 : 0, queued_for_retry: !publish }
+      }
+      return fake.runner(args)
+    }, { identity: 'agent24' })
+    const liveness = new InboundLiveness({
+      speaker,
+      identity: 'agent24',
+      resolveSelfNpub: () => speaker.npubFor('agent24'),
+      canaryIntervalMs: CANARY_MS,
+      staleAfterMs: STALE_MS,
+      now: () => t,
+      rand: () => 0.5,
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+    })
+    await liveness.start()
+    liveness.stop()
+
+    await liveness.probe() // A: queued, never published
+    publish = true
+    await liveness.probe() // B: published
+    for (const c of inFlight) {
+      fake.inboxRows.push({
+        id: c.id,
+        sender_npub: SELF,
+        plaintext: c.content,
+        created_at: 1,
+        is_incoming: true,
+      })
+    }
+    await liveness.beat() // B confirms and leaves; only A remains, unpublished
+    expect(liveness.snapshot().canaries.confirmed).toBe(1)
+    expect(nextDelayOf(liveness)).toBeGreaterThanOrEqual(CANARY_MS)
+  })
+
+  it('outstanding 有硬上限,不会无界增长', async () => {
+    const h = harness({ loseCanaries: true })
+    await h.boot()
+    for (let i = 0; i < 40; i++) await h.probe()
+    expect(h.liveness.snapshot().canaries.outstanding).toBeLessThanOrEqual(12)
+  })
+})
+
+describe('InboundLiveness — 健康文件是运维输入,必须当成不可信输入(M-2/M-3)', () => {
+  it('损坏的健康文件不能让探针永远停在 starting', async () => {
+    // `Math.max(0, NaN)` is NaN, and NaN > threshold is false for every
+    // threshold — one bad field would make degraded unreachable forever.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      for (const bad of [
+        '{"seconds_since_confirmed":"broken","updated_at":"2026-09-02T00:00:00.000Z"}',
+        '{"seconds_since_confirmed":120}',
+        '{"seconds_since_confirmed":-5,"updated_at":"nonsense"}',
+        'not json at all{',
+      ]) {
+        fs.writeFileSync(file, bad)
+        const h = harness({ healthFile: file })
+        await h.boot()
+        h.advance(STALE_MS + 1)
+        await h.judge()
+        expect(h.liveness.current).toBe('degraded')
+        expect(Number.isFinite(h.liveness.snapshot().seconds_since_confirmed)).toBe(true)
+        expect(h.logs.some((l) => l.level === 'warn' && l.text.includes('无法解析'))).toBe(true)
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('计数跨重启累计 —— 泡测判据要求 confirmed 全程增长', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      const first = harness({ healthFile: file })
+      await first.boot()
+      await first.cycle()
+      first.deliver()
+      first.advance(1_000)
+      await first.judge()
+      expect(first.liveness.snapshot().canaries.confirmed).toBe(1)
+
+      const second = harness({ healthFile: file, wallStart: 1_700_000_000_000 + 5_000 })
+      await second.boot()
+      await second.cycle()
+      second.deliver()
+      second.advance(1_000)
+      await second.judge()
+      // 2, not 1: a launchd restart must not read as "nothing ever came through".
+      expect(second.liveness.snapshot().canaries.confirmed).toBe(2)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('配置的时间值必须是有限正数(L-3)', () => {
+  it('负数/非数/Infinity 都回落到默认值,不会变成零延迟紧循环', () => {
+    expect(durationMs('-1', 30_000, 1_000)).toBe(30_000)
+    expect(durationMs('0', 30_000, 1_000)).toBe(30_000)
+    expect(durationMs('abc', 30_000, 1_000)).toBe(30_000)
+    expect(durationMs('Infinity', 30_000, 1_000)).toBe(30_000)
+    expect(durationMs(undefined, 30_000, 1_000)).toBe(30_000)
+    expect(durationMs('5', 30_000, 1_000)).toBe(1_000) // clamped to the floor
+    expect(durationMs('1e30', 30_000, 1_000)).toBe(2 ** 31 - 1) // not 1ms
+    expect(durationMs('45000', 30_000, 1_000)).toBe(45_000)
   })
 })
 

@@ -64,11 +64,20 @@
 // on a perfectly healthy system. The reason this is not merely an occasional
 // dropped probe: a fixed 5-minute canary against the daemon's 30s cycle is an
 // exact multiple, so the two PHASE-LOCK, and an unlucky phase loses EVERY
-// canary. Hence `jitter` below — it is not decoration, it is what keeps a
-// correlated failure from becoming a permanent false alarm — plus a faster
-// re-probe while anything is outstanding, so one lost canary cannot walk us to
-// the staleness threshold. The real fix is upstream (store before publish, or
-// make `is_incoming` monotonic on upsert).
+// canary — a permanent false alarm on a system that is fine.
+//
+// Two things defend against that, and BOTH are needed:
+//   - `jittered()` draws a continuous ±20% delay, and
+//   - the canary runs on ITS OWN timer (`armCanary`), not on the judge tick.
+// The second is not a refactor. A jittered deadline that is only CHECKED on a
+// fixed 30s tick still fires at `t0 + N×30s`, so `mod 30s` — the only thing that
+// decides whether the send lands inside the daemon's subscribe window — never
+// moves, and the random draw merely picks how many ticks to wait. The jitter has
+// to reach the actual timer to do anything at all.
+// Plus a faster re-probe while a PUBLISHED canary is outstanding, so a single
+// lost canary cannot walk us to the staleness threshold (see `nextDelay`).
+// The real fix is upstream (store before publish, or make `is_incoming`
+// monotonic on upsert).
 
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
@@ -149,7 +158,15 @@ interface Outstanding {
   at: number
   /** Exactly what we sent, so the round trip proves decryption too. */
   content: string
+  /** Whether it actually reached a relay. A canary sitting in agent-speaker's
+   * outbox has not been given a chance to come back yet, so it must not drive
+   * the faster re-probe — otherwise a real network outage turns into a
+   * self-inflicted flood of queued messages. */
+  published: boolean
 }
+
+/** Hard cap on tracked canaries, so no schedule bug can grow it without bound. */
+const MAX_OUTSTANDING = 12
 
 export class InboundLiveness {
   private readonly o: Required<
@@ -168,8 +185,7 @@ export class InboundLiveness {
    * supervisor that restarts the bridge every few minutes would hand each new
    * process a fresh grace period and `degraded` could never be reached. */
   private restoredGapMs = 0
-  private lastCanaryAt = -Infinity
-  private nextCanaryDelay: number
+  private consecutiveSendFailures = 0
   private readonly outstanding = new Map<string, Outstanding>()
   private state: LivenessState = 'starting'
   /** Silence between the previous confirmation and the one that just landed —
@@ -183,9 +199,14 @@ export class InboundLiveness {
   private lastDegradedLogAt = -Infinity
   private lastHealthWriteAt = -Infinity
   private lastHealthState?: LivenessState
-  private timer?: ReturnType<typeof setTimeout>
+  /** Judge/persist on a fixed cadence. */
+  private tickTimer?: ReturnType<typeof setTimeout>
+  /** Canary sends on their OWN continuously-jittered deadline — see `armCanary`. */
+  private canaryTimer?: ReturnType<typeof setTimeout>
+  private started = false
   private stopped = false
   private beating = false
+  private sending = false
 
   constructor(opts: LivenessOptions) {
     const log = opts.log ?? console
@@ -212,7 +233,6 @@ export class InboundLiveness {
       log,
     }
     this.startedAt = this.o.now()
-    this.nextCanaryDelay = this.jittered()
   }
 
   /** Current state — for tests and for whoever wants to gate on it. */
@@ -231,6 +251,10 @@ export class InboundLiveness {
    * healthy bridge working two slow messages would cross the staleness threshold
    * and cry wolf. */
   async start(): Promise<void> {
+    // Idempotent: a second call would otherwise leave two self-rescheduling
+    // chains running forever, since only the latest handle is kept.
+    if (this.started) return
+    this.started = true
     this.restore()
     try {
       this.selfNpub = await this.o.resolveSelfNpub()
@@ -240,22 +264,27 @@ export class InboundLiveness {
       this.lastError = `无法解析本机 npub(${err instanceof Error ? err.message : String(err)})`
       this.o.log.warn(`[nostr] ⚠️  活性探针:${this.lastError};将重试。`)
     }
-    this.schedule()
+    this.scheduleTick()
+    // The first canary goes out almost immediately (so a healthy bridge reaches
+    // `ok` in seconds rather than minutes) but at a RANDOM offset, because the
+    // phase of the very first send seeds every send after it.
+    this.armCanary(Math.round(this.o.rand() * 2_000))
   }
 
   stop(): void {
     this.stopped = true
-    if (this.timer) clearTimeout(this.timer)
+    if (this.tickTimer) clearTimeout(this.tickTimer)
+    if (this.canaryTimer) clearTimeout(this.canaryTimer)
   }
 
-  private schedule(): void {
+  private scheduleTick(): void {
     if (this.stopped) return
-    this.timer = setTimeout(() => void this.loop(), this.o.tickMs)
+    this.tickTimer = setTimeout(() => void this.loop(), this.o.tickMs)
   }
 
   private async loop(): Promise<void> {
     if (this.stopped) return
-    // Re-entrancy guard: a canary send can sit on its 60s deadline, which is
+    // Re-entrancy guard: an inbox read can sit on its 60s deadline, which is
     // longer than a tick.
     if (!this.beating) {
       this.beating = true
@@ -267,7 +296,37 @@ export class InboundLiveness {
         this.beating = false
       }
     }
-    this.schedule()
+    this.scheduleTick()
+  }
+
+  /** Arm the next canary on its own timer.
+   *
+   * This is separate from the judge tick, and that separation is the entire
+   * defence against the phase lock described in the header. Checking a jittered
+   * DEADLINE on a fixed 30s tick does not help: the send still lands on
+   * `t0 + N×30s`, so `mod 30s` — the thing that decides whether we sit inside
+   * the daemon's 3s subscribe window — never moves, and the random draw only
+   * picks how many ticks to wait. Only an independent timer with a continuous
+   * delay makes the send phase actually drift. */
+  private armCanary(delay: number): void {
+    if (this.stopped) return
+    if (this.canaryTimer) clearTimeout(this.canaryTimer)
+    this.canaryTimer = setTimeout(() => void this.canaryTurn(), Math.max(0, delay))
+  }
+
+  private async canaryTurn(): Promise<void> {
+    if (this.stopped) return
+    if (!this.sending) {
+      this.sending = true
+      try {
+        await this.probe()
+      } catch (err) {
+        this.o.log.error('[nostr] 活性探针发送出错:', err instanceof Error ? err.message : err)
+      } finally {
+        this.sending = false
+      }
+    }
+    this.armCanary(this.nextDelay())
   }
 
   /** Called with every inbox read — the probe's own, and `pollOnce`'s. Confirms
@@ -279,6 +338,12 @@ export class InboundLiveness {
       const pending = m.event_id ? this.outstanding.get(m.event_id) : undefined
       if (pending) {
         this.outstanding.delete(m.event_id!)
+        // The comparison is byte-exact on purpose, and that is safe: the full
+        // upstream pipeline the canary rides — encrypt → zstd+base64 compress →
+        // relay → decompress → decrypt — was verified to round-trip byte for
+        // byte (there is no size threshold that would skip compression on one
+        // leg only). If it were lossy, this check would false-alarm forever on a
+        // healthy system, so it is not something to assume.
         if (m.content !== pending.content) {
           // It came back, but not as what we sent. The daemon stores messages it
           // could not decrypt (daemon.go:358-368), so this is the shape of a
@@ -298,16 +363,27 @@ export class InboundLiveness {
       }
       // Dropped, never confirmed: a canary from an earlier run, or one that came
       // back after we gave up on it, must not be handed to the inbound handler
-      // as if a peer had sent it. Matched on SENDER, not on the marker text — a
-      // text match would also swallow a legitimate peer message that happened to
-      // start with the marker.
-      if (this.selfNpub && m.from === this.selfNpub) continue
+      // as if a peer had sent it. Matched on SENDER, because a text match would
+      // also swallow a legitimate peer message that happened to start with the
+      // marker.
+      if (this.selfNpub) {
+        if (m.from === this.selfNpub) continue
+      } else if (m.content.startsWith(CANARY_PREFIX)) {
+        // Only while the npub is still unresolved (a keystore unreadable at
+        // boot). Without this, the previous process's canaries would reach the
+        // run path for an operator who allowlisted their own npub — the agent
+        // answering its own probe. Narrow window, and it closes for good the
+        // moment `resolveSelfNpub` succeeds.
+        continue
+      }
       peers.push(m)
     }
     return peers
   }
 
-  /** One beat: read the inbox, confirm, judge, log, probe, persist. */
+  /** One beat: read the inbox, confirm, judge, log, persist. Sending is NOT done
+   * here — it has its own timer, so a canary send hanging on its 60s deadline
+   * cannot delay the verdict or the health file that publishes it. */
   async beat(): Promise<void> {
     try {
       this.observe(await this.o.speaker.inbox())
@@ -319,7 +395,6 @@ export class InboundLiveness {
     const now = this.o.now()
     this.expire(now)
     this.judge(now)
-    if (now - this.lastCanaryAt >= this.dueIn()) await this.sendCanary()
     this.persist(now)
   }
 
@@ -338,13 +413,30 @@ export class InboundLiveness {
     return Math.round(this.o.canaryIntervalMs * (0.8 + this.o.rand() * 0.4))
   }
 
-  /** While a canary is outstanding, probe again sooner: one canary lost to the
-   * upstream store race must not be able to walk us to the staleness threshold
-   * on its own. */
-  private dueIn(): number {
-    return this.outstanding.size > 0
-      ? Math.max(1_000, Math.round(this.o.canaryIntervalMs / 3))
-      : this.nextCanaryDelay
+  /** Delay until the next canary.
+   *
+   * Three regimes, in priority order:
+   *   1. sends are FAILING (threw, or reached no relay) — exponential backoff.
+   *      Without it a real network outage becomes self-inflicted damage: every
+   *      unpublished canary lands in agent-speaker's outbox and is retried from
+   *      there, so probing hard through a week-long outage would queue thousands
+   *      of messages to fix nothing. The cap stays under the staleness window's
+   *      order of magnitude so recovery is still noticed promptly.
+   *   2. a PUBLISHED canary is outstanding — probe sooner, so a single canary
+   *      lost to the upstream store race cannot walk us to the threshold on its
+   *      own. Only published ones count: one still sitting in the outbox has not
+   *      had its chance to come back yet, and treating it as "missing" is what
+   *      would turn regime 1 into a flood.
+   *   3. otherwise — the jittered base interval. */
+  private nextDelay(): number {
+    if (this.consecutiveSendFailures > 0) {
+      const factor = Math.min(2 ** this.consecutiveSendFailures, 8)
+      return Math.min(this.o.canaryIntervalMs * factor, 30 * 60_000)
+    }
+    let published = 0
+    for (const c of this.outstanding.values()) if (c.published) published++
+    if (published > 0) return Math.max(1_000, Math.round(this.o.canaryIntervalMs / 3))
+    return this.jittered()
   }
 
   /** A canary out longer than the staleness window is never coming back; stop
@@ -390,15 +482,19 @@ export class InboundLiveness {
     }
   }
 
-  private async sendCanary(): Promise<void> {
-    // Stamped BEFORE the await: a send that hangs to its 60s deadline must not
-    // let the next beat fire another one on top of it.
-    this.lastCanaryAt = this.o.now()
-    this.nextCanaryDelay = this.jittered()
+  /** Send one canary. Public so tests can drive a probe without waiting on real
+   * timers; production calls it from `canaryTurn`. */
+  async probe(): Promise<void> {
+    if (this.outstanding.size >= MAX_OUTSTANDING) {
+      // Nothing is coming back and we are already degraded; stop adding to the
+      // pile (and to agent-speaker's outbox) until expiry drains it.
+      return
+    }
     let npub: string
     try {
       npub = this.selfNpub ?? (this.selfNpub = await this.o.resolveSelfNpub())
     } catch (err) {
+      this.consecutiveSendFailures += 1
       this.lastError = `无法解析本机 npub(${err instanceof Error ? err.message : String(err)})`
       return
     }
@@ -409,17 +505,21 @@ export class InboundLiveness {
       if (!res.event_id) {
         // Untrackable: without the id we cannot recognise the round trip, and
         // matching on text would be the fail-open this module refuses.
+        this.consecutiveSendFailures += 1
         this.lastError = 'canary 已发出但 agent-speaker 未返回 event_id,无法追踪往返'
         return
       }
-      // Tracked even when `published_to` is 0: a queued canary that the daemon's
-      // outbox publishes later still round-trips, and that is still proof.
-      this.outstanding.set(res.event_id, { at: this.o.now(), content })
-      this.lastError =
-        (res.published_to ?? 0) === 0 ? 'canary 未直达任何 relay(已入 outbox 重试队列)' : null
+      const published = (res.published_to ?? 0) > 0
+      // Tracked even when unpublished: a queued canary that the daemon's outbox
+      // publishes later still round-trips, and that is still proof. It just does
+      // not earn the faster re-probe (see `nextDelay`).
+      this.outstanding.set(res.event_id, { at: this.o.now(), content, published })
+      this.consecutiveSendFailures = published ? 0 : this.consecutiveSendFailures + 1
+      this.lastError = published ? null : 'canary 未直达任何 relay(已入 outbox 重试队列)'
     } catch (err) {
       // A killed child is INDETERMINATE, not a failure — the canary may well be
       // on a relay. Either way we hold no id for it, so it can never confirm.
+      this.consecutiveSendFailures += 1
       this.lastError =
         err instanceof SpeakerTimeoutError
           ? `canary 发送超时被杀,投递状态未知:${err.message}`
@@ -458,21 +558,56 @@ export class InboundLiveness {
   private restore(): void {
     const file = this.o.healthFile
     if (!file) return
+    let raw: string
     try {
-      const prev = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<LivenessSnapshot>
-      const writtenAt = prev.updated_at ? Date.parse(prev.updated_at) : NaN
-      const sinceWrite = Number.isFinite(writtenAt) ? Math.max(0, this.o.wallNow() - writtenAt) : 0
-      const carried = Math.max(0, (prev.seconds_since_confirmed ?? 0) * 1000)
-      this.restoredGapMs = carried + sinceWrite
-      const confirmedAt = prev.last_confirmed_at ? Date.parse(prev.last_confirmed_at) : NaN
-      if (Number.isFinite(confirmedAt)) this.lastConfirmedWall = confirmedAt
+      raw = fs.readFileSync(file, 'utf8')
+    } catch {
+      return // no previous run — a genuinely fresh start
+    }
+    // Every number out of this file is validated. `Math.max(0, NaN)` is NaN, and
+    // a NaN elapsed compares false against EVERY threshold — so one corrupt or
+    // hand-edited field would leave the probe permanently in `starting`, unable
+    // to ever report degraded. A fail-open hiding in an operations file.
+    const finite = (v: unknown): number | null =>
+      typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
+    const stamp = (v: unknown): number | null => {
+      if (typeof v !== 'string') return null
+      const t = Date.parse(v)
+      return Number.isFinite(t) ? t : null
+    }
+    try {
+      const prev = JSON.parse(raw) as Partial<LivenessSnapshot>
+      const carriedSec = finite(prev.seconds_since_confirmed)
+      const writtenAt = stamp(prev.updated_at)
+      if (carriedSec === null || writtenAt === null) {
+        throw new Error('缺少或非法的 seconds_since_confirmed / updated_at')
+      }
+      // The written value is already the TOTAL silence (it includes whatever the
+      // previous process itself inherited), so adding the downtime since the
+      // write accumulates correctly across any number of restarts — it does not
+      // double-count.
+      this.restoredGapMs = carriedSec * 1000 + Math.max(0, this.o.wallNow() - writtenAt)
+      this.lastConfirmedWall = stamp(prev.last_confirmed_at)
+      // Counters carry over too: the soak criterion is that confirmations keep
+      // accruing across the week, and a launchd restart must not reset that to
+      // zero and read as "nothing has ever come through".
+      const c = prev.canaries
+      this.sent = finite(c?.sent) ?? 0
+      this.confirmed = finite(c?.confirmed) ?? 0
+      this.lost = finite(c?.lost) ?? 0
       if (this.restoredGapMs > this.o.staleAfterMs) {
         this.o.log.warn(
           `[nostr] ⚠️  上一轮进程留下的入站静默已有 ${Math.round(this.restoredGapMs / 1000)}s,本进程不重新计时(重启不清账)。`,
         )
       }
-    } catch {
-      /* no previous run, or an unreadable file — start fresh */
+    } catch (err) {
+      // The file EXISTS but cannot be trusted. Starting fresh silently would
+      // hand a restart loop a clean slate every time — say it loudly instead,
+      // because it means the soak's own accounting is broken.
+      this.restoredGapMs = 0
+      this.o.log.warn(
+        `[nostr] ⚠️  健康快照 ${file} 存在但无法解析(${err instanceof Error ? err.message : String(err)});静默计时从本进程重新开始 —— 若这是反复出现的,活性判据不可信。`,
+      )
     }
   }
 

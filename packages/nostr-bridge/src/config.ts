@@ -8,6 +8,22 @@ import fs from 'node:fs'
 
 const HOME = os.homedir()
 
+/** Parse a duration env var into a finite positive number of milliseconds.
+ *
+ * `Number(env) || fallback` is not enough for anything that feeds a timer:
+ * `A24_..._MS=-1` survives it, and `setTimeout(-1)` fires immediately — a
+ * negative tick would spin the probe into a tight loop spawning `history inbox`
+ * subprocesses as fast as the machine allows. `Infinity` and `1e30` are just as
+ * bad from the other side (Node clamps an out-of-range delay to 1ms). So: reject
+ * anything not finite, and clamp to a sane floor. */
+export function durationMs(raw: string | undefined, fallback: number, min: number): number {
+  const n = Number(raw)
+  if (!raw || !Number.isFinite(n) || n <= 0) return fallback
+  // 24 days is Node's signed-32-bit timer ceiling; past it a delay silently
+  // becomes 1ms, which is the tight loop again.
+  return Math.min(Math.max(n, min), 2 ** 31 - 1)
+}
+
 /** Parse a comma/space-separated allowlist of sender npubs into a Set. */
 export function parseNpubs(raw: string | undefined): Set<string> {
   return new Set(
@@ -33,7 +49,7 @@ export const CONFIG = {
   /** Inbound authorization — fail-closed (SECURITY, same as F3). */
   ALLOWED_NPUBS: parseNpubs(process.env.A24_NOSTR_ALLOWED_NPUBS),
   /** How often to poll the inbox for new peer messages. */
-  POLL_INTERVAL_MS: Number(process.env.A24_NOSTR_POLL_MS) || 5_000,
+  POLL_INTERVAL_MS: durationMs(process.env.A24_NOSTR_POLL_MS, 5_000, 250),
   /** Hard wall-clock cap on one `agent-speaker` invocation.
    *
    * WITHOUT this the whole bridge can stop for good: `tick()` in `main.ts` is a
@@ -46,25 +62,25 @@ export const CONFIG = {
    *
    * 60s is well above a normal relay round-trip and below any human's patience
    * for "why hasn't it answered". */
-  SPEAKER_TIMEOUT_MS: Number(process.env.A24_NOSTR_SPEAKER_TIMEOUT_MS) || 60_000,
+  SPEAKER_TIMEOUT_MS: durationMs(process.env.A24_NOSTR_SPEAKER_TIMEOUT_MS, 60_000, 1_000),
   /** Rows per inbox read. Wide enough that nothing falls out of the window
    * between two polls (agent-speaker's own default is 20). */
-  INBOX_LIMIT: Number(process.env.A24_NOSTR_INBOX_LIMIT) || 100,
+  INBOX_LIMIT: Math.round(durationMs(process.env.A24_NOSTR_INBOX_LIMIT, 100, 1)),
 
   // ── FU-32 inbound liveness (see liveness.ts for why a canary, not a timeout) ──
   /** Set to `0` to disable the probe entirely. Disabling means the bridge can no
    * longer tell an empty inbox from a dead relay path — the F5 soak must not. */
   LIVENESS_ENABLED: process.env.A24_NOSTR_LIVENESS !== '0',
   /** How often the bridge sends itself a canary. 5 min ≈ 288 events/day. */
-  CANARY_INTERVAL_MS: Number(process.env.A24_NOSTR_CANARY_MS) || 5 * 60_000,
+  CANARY_INTERVAL_MS: durationMs(process.env.A24_NOSTR_CANARY_MS, 5 * 60_000, 10_000),
   /** No canary back for this long ⇒ inbound is presumed dead. Three missed
    * canaries: long enough to ride out one relay hiccup, short enough that a
    * machine that woke up broken is caught within the quarter hour. */
-  LIVENESS_STALE_MS: Number(process.env.A24_NOSTR_STALE_MS) || 15 * 60_000,
+  LIVENESS_STALE_MS: durationMs(process.env.A24_NOSTR_STALE_MS, 15 * 60_000, 30_000),
   /** How often the probe wakes up. It runs on its OWN timer, not on the poll
    * loop — that loop awaits each inbound message's agent run, so a probe riding
    * it would be starved by a slow run for as long as the run takes. */
-  LIVENESS_TICK_MS: Number(process.env.A24_NOSTR_LIVENESS_TICK_MS) || 30_000,
+  LIVENESS_TICK_MS: durationMs(process.env.A24_NOSTR_LIVENESS_TICK_MS, 30_000, 1_000),
   /** NIP-44-encrypt canaries (set `0` for plaintext). */
   CANARY_ENCRYPT: process.env.A24_NOSTR_CANARY_ENCRYPT !== '0',
   /** Health snapshot an operator (or the F5 soak) can `cat`. Empty disables. */

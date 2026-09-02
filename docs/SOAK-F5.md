@@ -89,7 +89,7 @@ jq 'select(.overdue > 0)' ~/agent24-soak.jsonl
 
 # Nostr 入站通路现在是活的吗（FU-32）——每次开机/唤醒后都看一眼
 cat ~/.agent24/nostr-bridge-health.json
-# state 应为 "ok"；canaries.confirmed 应随时间增长
+# state 应为 "ok"；canaries.confirmed 应随时间增长（计数跨重启累计，不会归零）
 # lost 偶尔 >0 是已知的上游竞态（FU-33）；只要 confirmed 在涨、state 是 ok 就不算问题
 # "degraded" = 对端消息现在收不进来，按报警里那三条顺序查（daemon 在跑吗 / relay 一致吗 / 网络回来了吗）
 
