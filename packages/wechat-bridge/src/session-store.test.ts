@@ -8,7 +8,11 @@
 //      → "never leaves a half-written main file" and "recovers ... via the
 //        backup" fail.
 //   2. Make `readValidMain()` return the text without the `parseMap` check.
-//      → "never rotates a corrupt main file into the backup" fails.
+//      → "never rotates a corrupt main file into the backup" fails, because the
+//        corrupt bytes reach `.bak` and `parseBak()` then throws. NOTE: that
+//        test must NOT call `load()` between damaging main and saving — `load()`
+//        repairs main, which silently disarmed this very check once
+//        republish-on-recover landed.
 //   3. Drop the shape checks from `parseMap` (keep only JSON.parse).
 //      → "rejects on-disk shapes that are valid JSON but not a session map" fails.
 //   4. Make `load()` return the recovered map without calling `republish`.
@@ -123,15 +127,19 @@ describe('FileSessionStore crash safety', () => {
 
     // Main is damaged from outside; .bak still holds the previous generation.
     fs.writeFileSync(file, '{corrupt')
-    expect(new FileSessionStore(file).load()).toEqual(new Map([['uid-1', 'good']]))
 
-    // A save now must NOT copy the corrupt main over the good .bak...
+    // Save DIRECTLY, with no intervening `load()`. This is load-bearing: `load()`
+    // repairs main on recovery, so calling it here would hand `save()` a valid
+    // file and the guard under test would never be reached. That is exactly how
+    // this test lost its discriminating power once republish-on-recover landed —
+    // it passed with the guard removed. (Caught by PR-Daemon on #142.)
     store.save(new Map([['uid-3', 'new']]))
-    expect(parseBak()).toEqual({ 'uid-1': 'good' })
 
-    // ...so damaging main again still leaves something to recover.
-    fs.writeFileSync(file, '{corrupt again')
-    expect(new FileSessionStore(file).load()).toEqual(new Map([['uid-1', 'good']]))
+    // The new generation is published over the corrupt file...
+    expect(new FileSessionStore(file).load()).toEqual(new Map([['uid-3', 'new']]))
+    // ...and the corrupt bytes were NOT promoted into the rollback copy, which
+    // still holds the last generation anyone could actually read.
+    expect(parseBak()).toEqual({ 'uid-1': 'good' })
   })
 
   it('rejects on-disk shapes that are valid JSON but not a session map', () => {

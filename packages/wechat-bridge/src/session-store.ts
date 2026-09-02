@@ -154,6 +154,13 @@ export class FileSessionStore implements SessionStore {
     try {
       writeFileDurable(tmp, text)
       fs.renameSync(tmp, this.bak)
+      // The header lists "fsync temp, then fsync dir" as one of this file's four
+      // properties; the backup path used to do only the first half, so the file
+      // said something the code did not do. What that costs is small — the temp
+      // bytes are already fsynced, only the directory entry was unflushed, so a
+      // power cut could lose one generation of rollback depth, never the backup
+      // itself. Small is not the same as documented. (PR-Daemon on #142, Low.)
+      fsyncDir(path.dirname(this.bak))
     } catch (err) {
       try {
         fs.unlinkSync(tmp)
