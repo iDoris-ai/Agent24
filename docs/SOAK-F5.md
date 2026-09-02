@@ -100,8 +100,9 @@ jq 'select(.overdue > 0)' ~/agent24-soak.jsonl
 
 # Nostr 入站通路现在是活的吗（FU-32）——每次开机/唤醒后都看一眼
 cat ~/.agent24/nostr-bridge-health-agent24.json   # 文件名带身份后缀
-# state 应为 "ok"；degraded_transitions 应为 0；confirmed 应随时间增长
-#（计数跨重启累计，launchd 重启不会归零）
+# state 应为 "ok"；confirmed 应随时间增长；generation 应保持不变
+#（计数与 generation 都跨重启累计/继承，launchd 重启不会归零 —— 所以判据看的是
+#  degraded_transitions 在本次泡测期间有没有涨，而不是它是不是 0）
 # lost 偶尔 >0 是已知的上游竞态（FU-33）；只要 confirmed 在涨、transitions 是 0 就不算问题
 # "degraded" = 对端消息现在收不进来，按报警里那三条顺序查（daemon 在跑吗 / relay 一致吗 / 网络回来了吗）
 
