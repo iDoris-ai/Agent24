@@ -24,7 +24,13 @@
 
 判据 6 由脚本采样健康快照来判，这些情况判失败：任何一次采样抓到 `state=degraded`；`degraded_transitions` **在本次 run 内增长**；快照读不出来 / 格式非法 / 属于另一个身份；快照**超过 15 分钟没更新**（进程死了但文件还在，冻结在 `ok` 上）；`confirmed` 或 `degraded_transitions` **回退**，或 `generation` 变化（账本被重置——重置会把跨重启的静默一起抹掉）；`confirmed` 全程没涨；整轮**从没读到过快照**，或快照**迟到超过 15 分钟才出现**（在那之前那一段没有任何入站证据）。
 
-确实不跑 Nostr 的 run 要显式加 `--no-nostr`——「没有证据」不会被当成「没配置」。跑得比 15 分钟还短的 run 会报 `SMOKE PASS` 并**以非 0 退出**：那种长度根本评估不了判据 6，不能拿来当 F5 结论。
+确实不跑 Nostr 的 run 要显式加 `--no-nostr`——「没有证据」不会被当成「没配置」。
+
+脚本还有两个「这不是 F5 结论」的出口，都**以非 0 退出**：跑得比 15 分钟还短的 run 报 `SMOKE PASS`（那种长度根本评估不了判据 6）；没跑满 `--duration` 就被 Ctrl-C / `kill` 中断的 run 报 `INCOMPLETE`（7 天的 run 在第 20 分钟被掐掉，采样到的一切当然都是健康的——那正是陷阱）。
+
+快照必须自报身份（`context.identity`），监控只认与 `--nostr-identity`（默认 `agent24`）一致的那一份：否则把 `--nostr-health` 指到另一个桥的文件上，就成了拿别人的健康替这一个背书。
+
+> 监控这道门本身有回归测试：`scripts/test-soak-monitor.sh`（起一个假 daemon，覆盖 18 种情形，PASS 与各种失败两个方向都测）。改动 `soak-monitor.sh` 后跑一下。
 
 ## 一次性准备
 

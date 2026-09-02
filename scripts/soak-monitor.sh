@@ -37,7 +37,11 @@ DAEMON_JSON="${A24_DAEMON_JSON:-$HOME/.agent24/daemon.json}"
 # Identity-scoped, matching the bridge's own default (packages/nostr-bridge
 # config.ts): one file per bridge, so two instances cannot overwrite each other's
 # ledger and make one's outage invisible behind the other's health.
-NOSTR_HEALTH="${A24_NOSTR_HEALTH_FILE:-$HOME/.agent24/nostr-bridge-health-${A24_NOSTR_IDENTITY:-agent24}.json}"
+# Sanitised exactly like the bridge does it (packages/nostr-bridge config.ts),
+# or an identity with an exotic character makes the two sides compute DIFFERENT
+# default paths and a healthy run fails for no reason.
+NOSTR_IDENTITY="${A24_NOSTR_IDENTITY:-agent24}"
+NOSTR_HEALTH="${A24_NOSTR_HEALTH_FILE:-$HOME/.agent24/nostr-bridge-health-${NOSTR_IDENTITY//[^A-Za-z0-9_.-]/_}.json}"
 # F5 runs Nostr, so its absence is a FAILURE, not a "not configured" — a bridge
 # that never started, or crashed before writing, otherwise leaves exactly the
 # same evidence as "the user didn't ask for Nostr" and the gate is skipped.
@@ -57,6 +61,7 @@ while [ $# -gt 0 ]; do
     --daemon-json) DAEMON_JSON="$2"; shift 2 ;;
     --nostr-health) NOSTR_HEALTH="$2"; shift 2 ;;
     --nostr-stale) NOSTR_STALE="$2"; shift 2 ;;
+    --nostr-identity) NOSTR_IDENTITY="$2"; shift 2 ;;
     --no-nostr) REQUIRE_NOSTR=0; shift ;;
     --log) LOG="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
@@ -79,6 +84,11 @@ case "$NOSTR_STALE" in ''|*[!0-9]*) echo "--nostr-stale must be integer seconds"
 # Fail loudly NOW if the log is unwritable — never run a 7-day soak whose PASS
 # rests on a log that was never written (soak review #109 Low).
 ( : >> "$LOG" ) 2>/dev/null || { echo "log not writable: $LOG" >&2; exit 2; }
+
+# Set only when the loop reaches DURATION. A 7-day run killed at minute 20 has
+# not shown anything about 7 days, and `summarize()` runs from the signal trap
+# too — without this it would happily print PASS for it.
+completed=0
 
 # Counters (whole-run accounting).
 samples=0; health_ok=0; restarts=0; overdue_max=0; last_pid=""
@@ -128,7 +138,7 @@ sample_nostr() {
   # top-level JSON documents otherwise makes jq emit TWO rows and exit 0, and the
   # shell then compares strings like "degraded\nok" — every numeric test errors,
   # evaluates false, and the gate reads "fine" on evidence that is plainly broken.
-  row=$(jq -ers '
+  row=$(jq -ers --arg want "$NOSTR_IDENTITY" '
     def isnat: type == "number" and . >= 0 and . == floor and . < 9007199254740991;
     select(length == 1) | .[0]
     | select((.state | type) == "string")
@@ -147,6 +157,13 @@ sample_nostr() {
     # snapshot is an operator-editable file: a generation containing a quote
     # would emit invalid JSON.
     | select(((.generation // "") | tostring) | test("^[A-Za-z0-9_.:-]{0,64}$"))
+    # The snapshot has to say whose it is. Without this, pointing
+    # `--nostr-health` at a file belonging to another identity lets THAT bridge
+    # vouch for this one — and the runbook already claims a foreign snapshot
+    # fails, so the claim has to be true here, not only inside the bridge.
+    # (No apostrophes in these comments: the jq program lives inside a
+    # single-quoted shell string, and one would close it mid-program.)
+    | select(((.context.identity // "") | tostring) == $want)
     | [.state, ($c|tostring), ($d|tostring), (([$age, 0] | max) | tostring),
        (.generation // "" | tostring)]
     | @tsv' "$NOSTR_HEALTH" 2>/dev/null) || row=""
@@ -168,6 +185,14 @@ sample_nostr() {
   age=$(printf '%s' "$row" | cut -f4)
   gen=$(printf '%s' "$row" | cut -f5)
 
+  # Checked HERE, not only in the missing-file branch: if the last missing
+  # sample fell before the threshold and the file appeared after it but before
+  # the next sample, that branch never runs again and the lateness would be lost
+  # — one whole interval of no-evidence, silently forgiven.
+  if [ "$nostr_seen" -eq 0 ] && [ "$REQUIRE_NOSTR" -eq 1 ] \
+     && [ $(( $(date +%s) - start )) -gt "$NOSTR_STALE" ]; then
+    nostr_late=1; anomalies=$((anomalies+1))
+  fi
   nostr_seen=1
   local nowsec; nowsec=$(date +%s)
   [ -z "$nostr_first_epoch" ] && nostr_first_epoch="$nowsec"
@@ -286,6 +311,11 @@ summarize() {
     if [ "$nostr_short" -eq 0 ]; then
       [ "$nostr_conf_last" -le "${nostr_conf_first:-0}" ] && nostr_ok=0
     fi
+  fi
+
+  if [ "$completed" -eq 0 ]; then
+    echo "RESULT: INCOMPLETE (run 未跑满 ${DURATION}s 就被中断 —— 不是 F5 结论)"
+    exit 1
   fi
 
   local result=1
@@ -418,7 +448,7 @@ while :; do
   fi
 
   # Stop after the configured duration.
-  [ $(( $(date +%s) - start )) -ge "$DURATION" ] && summarize
+  if [ $(( $(date +%s) - start )) -ge "$DURATION" ]; then completed=1; summarize; fi
 
   # Sleep in the background and `wait` on it so an INT/TERM (Ctrl-C, or `kill`
   # on a nohup'd run) fires the summarize trap IMMEDIATELY instead of blocking
