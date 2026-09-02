@@ -1247,6 +1247,36 @@ describe('InboundLiveness — 健康文件是运维输入,必须当成不可信�
     }
   })
 
+  it('generation:干净重启继承,账本断了就换 —— 这是重置唯一留得下的痕迹', async () => {
+    // Counters alone cannot express "the accounting started over": a snapshot
+    // lost and rebuilt from zero between two monitor samples shows no rollback
+    // by the time anyone looks, while the reset has taken the accumulated
+    // silence with it. The generation is the chain.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      const first = harness({ healthFile: file })
+      await first.boot()
+      await first.judge()
+      const gen1 = first.liveness.snapshot().generation
+      expect(gen1).toBeTruthy()
+
+      // Clean restart: same chain.
+      const second = harness({ healthFile: file, wallStart: 1_700_000_000_000 + 1_000 })
+      await second.boot()
+      expect(second.liveness.snapshot().generation).toBe(gen1)
+
+      // The snapshot is destroyed and the accounting starts from nothing —
+      // which must be visible, not silent.
+      fs.writeFileSync(file, 'garbage{')
+      const third = harness({ healthFile: file, wallStart: 1_700_000_000_000 + 2_000 })
+      await third.boot()
+      expect(third.liveness.snapshot().generation).not.toBe(gen1)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('计数跨重启累计 —— 泡测判据要求 confirmed 全程增长', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
     const file = path.join(dir, 'health.json')
