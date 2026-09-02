@@ -55,16 +55,19 @@ pnpm --filter @agent24/wechat-bridge start   # 扫码
 
 ### ⚠️ 已知坑（TASKS.md 记录）
 
-- **先确认 agent-speaker 的二进制名（FU-34）**。上游已把它改名为 `hyphae`（`cmd/hyphae/`、module `github.com/iDoris-ai/hyphae`），而本仓默认还找 `agent-speaker`。起跑前跑一遍：
+- **先确认 agent-speaker 的二进制名（FU-34）**。上游已把它改名为 `hyphae`（`cmd/hyphae/`、module `github.com/iDoris-ai/hyphae`），而本仓默认还找 `agent-speaker`。本机的编译产物在 `~/Dev/auraai/agent-speaker/bin/hyphae`，**不在 PATH 上**，所以桥要显式指过去。
+
+  好消息：**`--json` 契约没有随改名漂移**（2026-09-02 实测四条：信封形状、`identity list` 的裸数组、`history inbox` 的 `--as/--limit`、`agent msg` 与 `profile publish` 的旗标全在）。起跑前只需确认安装位置与 identity：
 
   ```bash
-  which agent-speaker || which hyphae      # 装的是哪个名字
-  # 若是 hyphae，桥要显式指过去（否则第一分钟就 degraded）
-  export A24_SPEAKER_BIN=hyphae
+  which agent-speaker || which hyphae      # 都没有的话就用仓库里的编译产物
+  export A24_SPEAKER_BIN=~/Dev/auraai/agent-speaker/bin/hyphae   # 否则第一分钟就 degraded
   # 两条只读冒烟:都要返回 {"ok":true,...} 信封
   $A24_SPEAKER_BIN identity list --json
   $A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
   ```
+
+  第一条现在应该返回**非空**的身份列表——`{"ok":true,"data":[]}` 说明还没建 identity，那样 `history inbox --as agent24` 会返回 `identity 'agent24' not found`，桥起来就是 degraded。
 
   这两条只覆盖桥的**读**路径。`agent msg` 与 `profile publish` 的改名后契约**仍未验收**（F4 联调是对着改名前的 7cef326 验的）。桥起来后分别这样确认：
 
