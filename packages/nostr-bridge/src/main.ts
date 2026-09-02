@@ -60,12 +60,44 @@ async function main(): Promise<void> {
   const inbound = new InboundBridge(agent, speaker, CONFIG.IDENTITY, CONFIG.ALLOWED_NPUBS)
 
   let stopped = false
+  // A 7-day soak at a 5s interval is ~120k ticks. Logging every failure of a
+  // persistent outage buries the log; logging none hides the outage.
+  //
+  // Pure power-of-two backoff has a trap that a review caught: at 5s the gap
+  // between failure 65536 and 131072 is ~3.8 days, so a week-long soak can go
+  // SILENT for its last days while still broken — the exact shape of failure
+  // this bridge is being hardened against. So the decay is capped by ELAPSED
+  // TIME, not by count: dense at first, then never quieter than hourly.
+  //
+  // Elapsed time is measured MONOTONICALLY, not by wall clock:
+  // `performance.now()` is monotonic; `Date.now()` is not. An NTP correction or
+  // a manual clock change that moves wall time BACKWARD would make the elapsed
+  // check negative and silence the log until the clock caught up again — hours,
+  // in exactly the unattended run this cap exists to protect. (Codex round 2.)
+  const MAX_LOG_GAP_MS = 60 * 60 * 1000
+  let consecutiveFailures = 0
+  let lastLoggedAt = 0
   const tick = async (): Promise<void> => {
     if (stopped) return
     try {
       await pollOnce(speaker, inbound)
+      if (consecutiveFailures > 0) {
+        console.log(`[nostr] 入站轮询已恢复(此前连续失败 ${consecutiveFailures} 次)`)
+        consecutiveFailures = 0
+        lastLoggedAt = 0
+      }
     } catch (err) {
-      console.error('[nostr] 轮询入站出错:', err instanceof Error ? err.message : err)
+      consecutiveFailures += 1
+      const now = performance.now()
+      // 1, 2, 4, 8 … while the count is small; then at least once an hour.
+      const isPowerOfTwo = (consecutiveFailures & (consecutiveFailures - 1)) === 0
+      if (isPowerOfTwo || now - lastLoggedAt >= MAX_LOG_GAP_MS) {
+        lastLoggedAt = now
+        console.error(
+          `[nostr] 轮询入站出错(连续第 ${consecutiveFailures} 次):`,
+          err instanceof Error ? err.message : err,
+        )
+      }
     }
     if (!stopped) setTimeout(() => void tick(), CONFIG.POLL_INTERVAL_MS)
   }

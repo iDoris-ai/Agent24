@@ -4,7 +4,7 @@
 // otherwise run as an owner-level agent24d run — the F3 lesson).
 
 import { Agent24Client, type RunResult } from './agent24.js'
-import { SpeakerClient, type InboundMessage } from './speaker.js'
+import { SpeakerClient, SpeakerTimeoutError, type InboundMessage } from './speaker.js'
 import { makeContent, PROTOCOL_VERSION, type Content } from './protocol.js'
 
 /** Turn an inbound message into a run prompt. If it carries an F4 envelope, tag
@@ -137,7 +137,24 @@ export class InboundBridge {
     try {
       await this.speaker.sendMessage(this.identity, toNpub, JSON.stringify(envelope))
     } catch (err) {
-      console.error('[nostr] 回复失败:', err instanceof Error ? err.message : err)
+      // A reply failure does NOT rethrow: the run reached a terminal state, so
+      // re-running it on the next poll would repeat the work (and any side
+      // effects) to fix a delivery problem. The message is lost, and that is a
+      // deliberate at-most-once choice — see FU-29 for the outbox that would
+      // make it at-least-once.
+      //
+      // A timeout-kill is worse than a failure and must not read like one: we
+      // do not know whether the send reached a relay. Blind retry could
+      // double-send; blind drop could lose it. Say which case this is, loudly,
+      // because it is the one an operator has to reason about.
+      if (err instanceof SpeakerTimeoutError) {
+        console.error(
+          `[nostr] ⚠️  回复投递状态未知(子进程超时被杀,可能已发出也可能未发出) → ${toNpub}:`,
+          err.message,
+        )
+      } else {
+        console.error('[nostr] 回复失败(该条不会重试):', err instanceof Error ? err.message : err)
+      }
     }
   }
 }

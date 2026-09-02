@@ -7,37 +7,15 @@
 // you send the bot become agent24d runs, and replies (and approval requests)
 // come back in the chat.
 
-import fs from 'node:fs'
 import path from 'node:path'
 import { login } from './ilink/auth.js'
 import { ILinkClient } from './ilink/client.js'
 import { Monitor } from './ilink/monitor.js'
 import { Sender } from './ilink/sender.js'
 import { Agent24Client } from './agent24.js'
-import { Bridge, type SessionStore } from './bridge.js'
+import { Bridge } from './bridge.js'
+import { FileSessionStore } from './session-store.js'
 import { CONFIG, discoverDaemon } from './config.js'
-
-class FileSessionStore implements SessionStore {
-  private readonly file = path.join(path.dirname(CONFIG.TOKEN_FILE), 'wechat-sessions.json')
-
-  load(): Map<string, string> {
-    try {
-      const raw = JSON.parse(fs.readFileSync(this.file, 'utf8')) as Record<string, string>
-      return new Map(Object.entries(raw))
-    } catch {
-      return new Map()
-    }
-  }
-
-  save(map: Map<string, string>): void {
-    try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 })
-      fs.writeFileSync(this.file, JSON.stringify(Object.fromEntries(map), null, 2))
-    } catch (err) {
-      console.error('[wechat] 保存会话映射失败:', err instanceof Error ? err.message : err)
-    }
-  }
-}
 
 async function main(): Promise<void> {
   const daemon = discoverDaemon()
@@ -62,7 +40,7 @@ async function main(): Promise<void> {
   const { bot_token, baseurl } = await login()
   const client = new ILinkClient(bot_token, baseurl)
   const sender = new Sender(client)
-  const bridge = new Bridge(new Agent24Client(daemon), sender, new FileSessionStore(), CONFIG.ALLOWED_UIDS)
+  const bridge = new Bridge(new Agent24Client(daemon), sender, new FileSessionStore(path.join(path.dirname(CONFIG.TOKEN_FILE), 'wechat-sessions.json')), CONFIG.ALLOWED_UIDS)
 
   const monitor = new Monitor(client, (msg) => {
     void bridge.handle(msg).catch((err) =>
