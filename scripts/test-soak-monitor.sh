@@ -19,7 +19,10 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 MON="$HERE/soak-monitor.sh"
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"; [ -n "${FAKE_PID:-}" ] && kill "$FAKE_PID" 2>/dev/null' EXIT
+# Processes first, then the directory they are writing into — the other order
+# leaves a daemon writing to a path that no longer exists.
+cleanup() { stop_fake; rm -rf "$WORK"; }
+trap cleanup EXIT
 
 command -v jq >/dev/null || { echo "need jq" >&2; exit 2; }
 pass=0; fail=0
@@ -50,7 +53,33 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 time.sleep(float(sys.argv[2]))
 PY
 
-start_fake() { python3 "$WORK/faked.py" "$WORK/daemon.json" "${1:-30}" & FAKE_PID=$!; sleep 0.6; }
+# Deterministic start/stop. A fixed `sleep 0.6` plus a leftover daemon.json meant
+# a slow machine could leave the monitor talking to the PREVIOUS daemon, so a
+# case could pass for the wrong reason.
+start_fake() {
+  stop_fake
+  rm -f "$WORK/daemon.json"
+  python3 "$WORK/faked.py" "$WORK/daemon.json" "${1:-30}" & FAKE_PID=$!
+  local i=0
+  while [ ! -s "$WORK/daemon.json" ]; do
+    i=$((i+1)); [ "$i" -gt 200 ] && { echo "fake daemon failed to start" >&2; exit 2; }
+    sleep 0.05
+  done
+  # Announced is not the same as answering.
+  local port; port=$(jq -r .port "$WORK/daemon.json")
+  i=0
+  until curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$port/api/v1/health"; do
+    i=$((i+1)); [ "$i" -gt 200 ] && { echo "fake daemon not answering" >&2; exit 2; }
+    sleep 0.05
+  done
+}
+stop_fake() {
+  if [ -n "${FAKE_PID:-}" ]; then
+    kill "$FAKE_PID" 2>/dev/null
+    wait "$FAKE_PID" 2>/dev/null
+    FAKE_PID=""
+  fi
+}
 
 # snap <age_secs> <state> <transitions> <generation> <confirmed>
 # Written the way the bridge writes it: temp file + rename, so a sampler can
