@@ -157,6 +157,13 @@ export interface LivenessSnapshot {
   /** Our own npub, so a restart whose keystore read fails can still recognise
    * (and drop) the canaries the previous process left in the inbox window. */
   self_npub?: string
+  /** Identifies this unbroken chain of accounting. Inherited on every successful
+   * restore; REGENERATED whenever the chain breaks (first run, or a snapshot
+   * that could not be read). Counters alone cannot express that: a snapshot lost
+   * and rebuilt from zero between two monitor samples shows no rollback by the
+   * time anyone looks, and the reset takes the accumulated silence with it —
+   * which is exactly how a real FU-32 outage would disappear from the record. */
+  generation: string
   context?: Record<string, unknown>
 }
 
@@ -218,6 +225,8 @@ export class InboundLiveness {
   private lost = 0
   private lastError: string | null = null
   private degradedTransitions = 0
+  /** New by default: a process that inherits nothing IS a new chain. */
+  private generation: string = randomUUID()
   private lastDegradedLogAt = -Infinity
   private lastHealthWriteAt = -Infinity
   private lastHealthState?: LivenessState
@@ -514,6 +523,12 @@ export class InboundLiveness {
             `[nostr] ❌ 入站通路疑似已死:${Math.round(elapsed / 1000)}s 没有任何入站确认(阈值 ${Math.round(this.o.staleAfterMs / 1000)}s)。`,
             `        canary 已发 ${this.sent} / 确认 ${this.confirmed} / 丢失 ${this.lost}${this.lastError ? ` · 最近错误:${this.lastError}` : ''}`,
             '        进程还活着、日程照跑,但对端发来的消息现在收不到。按这个顺序查:',
+            ...(this.selfNpub
+              ? []
+              : [
+                  '        0) ⚠️  连本机 npub 都还没解析出来 —— 入站派发正处于 fail-closed(不处理任何对端消息),',
+                  '           先修这个:检查 A24_NOSTR_IDENTITY 与 keystore 是否可读',
+                ]),
             '        1) agent-speaker daemon 还在跑吗(它是入站的唯一来源,桥只读它写的本地库)',
             '        2) 桥的 --relay 和 daemon 的 --relay 是不是同一个(不一致就是发出去没人收)',
             '        3) 机器刚唤醒/换网的话,网络是否已恢复',
@@ -587,6 +602,7 @@ export class InboundLiveness {
         this.lastConfirmedWall === null ? null : new Date(this.lastConfirmedWall).toISOString(),
       seconds_since_confirmed: Math.round(this.elapsed(now) / 1000),
       degraded_transitions: this.degradedTransitions,
+      generation: this.generation,
       canaries: {
         sent: this.sent,
         confirmed: this.confirmed,
@@ -697,6 +713,12 @@ export class InboundLiveness {
       // leave us unable to recognise our own leftover canaries.
       if (typeof prev.self_npub === 'string' && prev.self_npub) this.selfNpub = prev.self_npub
       if (prevState !== undefined) this.state = prevState
+      // Carry the chain forward. Kept only when the whole snapshot validated —
+      // reaching `unreadable()` leaves the fresh id from construction, which is
+      // the signal that the accounting restarted from nothing.
+      if (typeof prev.generation === 'string' && prev.generation.length > 0) {
+        this.generation = prev.generation.slice(0, 64)
+      }
       if (this.restoredGapMs > this.o.staleAfterMs) {
         this.o.log.warn(
           `[nostr] ⚠️  上一轮进程留下的入站静默已有 ${Math.round(this.restoredGapMs / 1000)}s,本进程不重新计时(重启不清账)。`,

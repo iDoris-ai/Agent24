@@ -67,6 +67,11 @@ command -v curl >/dev/null || { echo "need curl" >&2; exit 2; }
 # would arithmetic-compare to 0 and the run would never stop.
 case "$INTERVAL" in ''|*[!0-9]*) echo "--interval must be integer seconds" >&2; exit 2 ;; esac
 case "$DURATION" in ''|*[!0-9]*) echo "--duration must be integer seconds" >&2; exit 2 ;; esac
+# A non-integer here would make every `-gt` print an error and evaluate FALSE,
+# i.e. silently DISABLE the frozen-snapshot check — the gate would still say
+# "fine" while checking nothing.
+case "$NOSTR_STALE" in ''|*[!0-9]*) echo "--nostr-stale must be integer seconds" >&2; exit 2 ;; esac
+[ "$NOSTR_STALE" -gt 0 ] || { echo "--nostr-stale must be > 0" >&2; exit 2 ; }
 [ -n "$LOG" ] || LOG="$HOME/agent24-soak-$(date +%Y%m%d-%H%M%S).jsonl"
 # Fail loudly NOW if the log is unwritable — never run a 7-day soak whose PASS
 # rests on a log that was never written (soak review #109 Low).
@@ -80,7 +85,9 @@ schedule_min=""; anomalies=0; disabled_seen=0; sched_err_seen=0; stuck_failing_s
 # read, a later disappearance is an anomaly rather than "no bridge here".
 nostr_seen=0; nostr_conf_first=""; nostr_conf_last=0; nostr_read_err=0
 nostr_degraded_seen=0; nostr_stale_seen=0; nostr_tr_base=""; nostr_tr_last=0; nostr_tr_back=0
-n_state="null"; n_conf="null"; n_degr="null"; n_age="null"
+nostr_first_epoch=""; nostr_last_epoch=0; nostr_short=0
+nostr_gen_first=""; nostr_gen_changed=0; nostr_conf_back=0
+n_state="null"; n_conf="null"; n_degr="null"; n_age="null"; n_gen="null"
 
 read_daemon() { # -> echoes "port token pid" or nothing
   [ -f "$DAEMON_JSON" ] || return 1
@@ -99,7 +106,7 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # integer-expression error and evaluate FALSE, which leaves the gate variables
 # saying "fine". Malformed evidence has to fail the gate, never slip through it.
 sample_nostr() {
-  n_state="null"; n_conf="null"; n_degr="null"; n_age="null"
+  n_state="null"; n_conf="null"; n_degr="null"; n_age="null"; n_gen="null"
   if [ ! -f "$NOSTR_HEALTH" ]; then
     # Missing before the bridge has ever written one is normal — the monitor is
     # usually started first. "Never written at all" is caught at the END by the
@@ -109,16 +116,28 @@ sample_nostr() {
     if [ "$nostr_seen" -eq 1 ]; then nostr_read_err=1; anomalies=$((anomalies+1)); fi
     return
   fi
-  local row st cf dg age
-  row=$(jq -er '
+  local row st cf dg age gen
+  # `-s` (slurp) + `length == 1` is load-bearing: a file holding two concatenated
+  # top-level JSON documents otherwise makes jq emit TWO rows and exit 0, and the
+  # shell then compares strings like "degraded\nok" — every numeric test errors,
+  # evaluates false, and the gate reads "fine" on evidence that is plainly broken.
+  row=$(jq -ers '
     def isnat: type == "number" and . >= 0 and . == floor and . < 9007199254740991;
-    select((.state | type) == "string")
+    select(length == 1) | .[0]
+    | select((.state | type) == "string")
     | select(.state == "ok" or .state == "starting" or .state == "degraded")
     | (.canaries.confirmed) as $c
     | (.degraded_transitions // 0) as $d
     | select(($c | isnat) and ($d | isnat))
     | (.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $u
-    | [.state, ($c|tostring), ($d|tostring), ((now - $u) | floor | tostring)]
+    | ((now - $u) | floor) as $age
+    # A snapshot stamped in the FUTURE is not fresh evidence, it is a clock that
+    # moved (or a file that was touched). Left unchecked it buys a dead bridge
+    # unlimited extra grace, because a negative age never exceeds the threshold.
+    # A few seconds of sub-second/NTP jitter is tolerated and floored to 0.
+    | select($age >= -5)
+    | [.state, ($c|tostring), ($d|tostring), (([$age, 0] | max) | tostring),
+       (.generation // "" | tostring)]
     | @tsv' "$NOSTR_HEALTH" 2>/dev/null) || row=""
   if [ -z "$row" ]; then
     # The file EXISTS and does not validate. Never "no bridge configured" — that
@@ -127,12 +146,24 @@ sample_nostr() {
     nostr_seen=1; nostr_read_err=1; anomalies=$((anomalies+1))
     return
   fi
+  # Belt and braces after the slurp guard: anything multi-line here is malformed.
+  # `$'\n'`, NOT `$(printf '\n')` — command substitution strips trailing
+  # newlines, so the latter is an EMPTY pattern that matches every row and would
+  # silently reject every snapshot.
+  case "$row" in *$'\n'*) nostr_seen=1; nostr_read_err=1; anomalies=$((anomalies+1)); return ;; esac
   st=$(printf '%s' "$row" | cut -f1)
   cf=$(printf '%s' "$row" | cut -f2)
   dg=$(printf '%s' "$row" | cut -f3)
   age=$(printf '%s' "$row" | cut -f4)
+  gen=$(printf '%s' "$row" | cut -f5)
 
   nostr_seen=1
+  local nowsec; nowsec=$(date +%s)
+  [ -z "$nostr_first_epoch" ] && nostr_first_epoch="$nowsec"
+  nostr_last_epoch="$nowsec"
+  # Compare against the PREVIOUS value before overwriting it — comparing after
+  # the assignment is `cf < cf`, i.e. a rollback check that can never fire.
+  [ "$cf" -lt "$nostr_conf_last" ] && nostr_conf_back=1
   [ -z "$nostr_conf_first" ] && nostr_conf_first="$cf"
   nostr_conf_last="$cf"
   # Transitions are LIFETIME cumulative (they survive bridge restarts), so the
@@ -143,14 +174,28 @@ sample_nostr() {
   [ -z "$nostr_tr_base" ] && nostr_tr_base="$dg"
   [ "$dg" -lt "$nostr_tr_last" ] && nostr_tr_back=1   # counter went backwards = reset/tampered
   nostr_tr_last="$dg"
+  # Rollback detection on the counters catches only a reset we happen to SAMPLE
+  # mid-way. A snapshot lost and rebuilt from zero between two samples shows no
+  # rollback by the time anyone looks — while the reset has taken the accumulated
+  # silence with it, which is precisely how a real outage would vanish from the
+  # record. The generation id is the chain: it survives a restart that restores
+  # cleanly and changes whenever the accounting starts over.
+  if [ -z "$nostr_gen_first" ]; then
+    nostr_gen_first="$gen"
+  elif [ "$gen" != "$nostr_gen_first" ]; then
+    nostr_gen_changed=1; anomalies=$((anomalies+1))
+  fi
   # Any sample that catches it degraded is a sticky failure on its own, not just
   # an anomaly count that nothing gates on.
   if [ "$st" = "degraded" ]; then nostr_degraded_seen=1; anomalies=$((anomalies+1)); fi
   if [ "$age" -gt "$NOSTR_STALE" ]; then nostr_stale_seen=1; anomalies=$((anomalies+1)); fi
-  n_state="\"$st\""; n_conf="$cf"; n_degr="$dg"; n_age="$age"
+  n_state="\"$st\""; n_conf="$cf"; n_degr="$dg"; n_age="$age"; n_gen="\"$gen\""
 }
 
 summarize() {
+  # Computed first: the report lines below read it.
+  local nostr_span=$(( nostr_last_epoch - ${nostr_first_epoch:-0} ))
+  if [ "$nostr_seen" -eq 1 ] && [ "$nostr_span" -lt "$NOSTR_STALE" ]; then nostr_short=1; fi
   local up="n/a"
   if [ "$samples" -gt 0 ]; then
     up=$(awk "BEGIN{printf \"%.2f\", 100*$health_ok/$samples}")
@@ -165,7 +210,9 @@ summarize() {
   echo "scheduler faults: auto_disabled=${disabled_seen}  fetch_errors=${sched_err_seen}  stuck_failing=${stuck_failing_seen}"
   if [ "$nostr_seen" -eq 1 ]; then
     echo "nostr inbound:   transitions ${nostr_tr_base:-0}→${nostr_tr_last}  confirmed ${nostr_conf_first:-0}→${nostr_conf_last}"
-    echo "                 degraded_sampled=${nostr_degraded_seen}  stale_snapshots=${nostr_stale_seen}  read_errors=${nostr_read_err}  counter_reset=${nostr_tr_back}"
+    echo "                 degraded_sampled=${nostr_degraded_seen}  stale_snapshots=${nostr_stale_seen}  read_errors=${nostr_read_err}"
+    echo "                 counter_reset=${nostr_tr_back}/${nostr_conf_back}  generation_changed=${nostr_gen_changed}"
+    [ "${nostr_short:-0}" -eq 1 ] && echo "                 ⚠️  本 run 采样跨度 < ${NOSTR_STALE}s,「confirmed 必须增长」这一条未评估" 
   elif [ "$REQUIRE_NOSTR" -eq 1 ]; then
     echo "nostr inbound:   NO HEALTH SNAPSHOT (bridge never wrote one — criterion 6 FAILS; pass --no-nostr if this run genuinely has no Nostr bridge)"
   else
@@ -208,9 +255,17 @@ summarize() {
     # `starting` never reported degraded either).
     if [ "$nostr_degraded_seen" -ne 0 ] || [ "$nostr_read_err" -ne 0 ] \
        || [ "$nostr_stale_seen" -ne 0 ] || [ "$nostr_tr_back" -ne 0 ] \
-       || [ "$nostr_tr_last" -gt "${nostr_tr_base:-0}" ] \
-       || [ "$nostr_conf_last" -le "${nostr_conf_first:-0}" ]; then
+       || [ "$nostr_conf_back" -ne 0 ] || [ "$nostr_gen_changed" -ne 0 ] \
+       || [ "$nostr_tr_last" -gt "${nostr_tr_base:-0}" ]; then
       nostr_ok=0
+    fi
+    # "confirmations advanced" can only be required of a run long enough for a
+    # canary to have gone out and come back. Demanding it of a two-minute smoke
+    # test would fail a perfectly healthy bridge — and a false FAIL costs a week,
+    # because the answer to it is "run the soak again". Below that span the check
+    # is reported as NOT EVALUATED rather than silently passed.
+    if [ "$nostr_short" -eq 0 ]; then
+      [ "$nostr_conf_last" -le "${nostr_conf_first:-0}" ] && nostr_ok=0
     fi
   fi
 
@@ -227,7 +282,7 @@ summarize() {
       if [ "$nostr_seen" -eq 0 ]; then
         echo "  · Nostr 入站(F5 判据 6):整个 run 没有读到任何健康快照 —— 桥没起来/没写过文件。确实不测 Nostr 请显式加 --no-nostr"
       else
-        echo "  · Nostr 入站(F5 判据 6):degraded_sampled=${nostr_degraded_seen} transitions ${nostr_tr_base:-0}→${nostr_tr_last} stale=${nostr_stale_seen} read_err=${nostr_read_err} counter_reset=${nostr_tr_back} confirmed ${nostr_conf_first:-0}→${nostr_conf_last}"
+        echo "  · Nostr 入站(F5 判据 6):degraded_sampled=${nostr_degraded_seen} transitions ${nostr_tr_base:-0}→${nostr_tr_last} stale=${nostr_stale_seen} read_err=${nostr_read_err} counter_reset=${nostr_tr_back}/${nostr_conf_back} generation_changed=${nostr_gen_changed} confirmed ${nostr_conf_first:-0}→${nostr_conf_last}"
       fi
     fi
   fi
@@ -246,7 +301,7 @@ while :; do
   if [ -z "$info" ]; then
     # No discovery file → daemon not registered. Record and keep watching;
     # F1a autostart / F2 recovery may bring it back.
-    echo "{\"at\":\"$ts\",\"health\":false,\"reason\":\"no daemon.json\",\"nostr_state\":$n_state,\"nostr_confirmed\":$n_conf,\"nostr_degraded\":$n_degr,\"nostr_age_s\":$n_age}" >> "$LOG"
+    echo "{\"at\":\"$ts\",\"health\":false,\"reason\":\"no daemon.json\",\"nostr_state\":$n_state,\"nostr_confirmed\":$n_conf,\"nostr_degraded\":$n_degr,\"nostr_age_s\":$n_age,\"nostr_gen\":$n_gen}" >> "$LOG"
     samples=$((samples+1)); anomalies=$((anomalies+1))
   else
     port=$(echo "$info" | cut -d' ' -f1)
@@ -327,8 +382,8 @@ while :; do
 
     # An unwritable log must abort, not silently PASS on a phantom log the summary
     # then tells you to archive (soak review #109 Low).
-    printf '{"at":"%s","health":%s,"code":"%s","sched_code":"%s","pid":%s,"restarts":%s,"rss_mb":%s,"cpu_pct":%s,"schedules":%s,"disabled":%s,"nullnext":%s,"overdue":%s,"sched_err":%s,"max_consec_fail":%s,"last_run":%s,"nostr_state":%s,"nostr_confirmed":%s,"nostr_degraded":%s,"nostr_age_s":%s}\n' \
-      "$ts" "$ok" "$code" "$scode" "${pid:-0}" "$restarts" "${rss_mb:-0}" "${cpu_pct:-0}" "${n_sched:-0}" "$disabled" "$nullnext" "$overdue" "$sched_err" "${max_cfail:-0}" "${last_run:-\"null\"}" "$n_state" "$n_conf" "$n_degr" "$n_age" >> "$LOG" \
+    printf '{"at":"%s","health":%s,"code":"%s","sched_code":"%s","pid":%s,"restarts":%s,"rss_mb":%s,"cpu_pct":%s,"schedules":%s,"disabled":%s,"nullnext":%s,"overdue":%s,"sched_err":%s,"max_consec_fail":%s,"last_run":%s,"nostr_state":%s,"nostr_confirmed":%s,"nostr_degraded":%s,"nostr_age_s":%s,"nostr_gen":%s}\n' \
+      "$ts" "$ok" "$code" "$scode" "${pid:-0}" "$restarts" "${rss_mb:-0}" "${cpu_pct:-0}" "${n_sched:-0}" "$disabled" "$nullnext" "$overdue" "$sched_err" "${max_cfail:-0}" "${last_run:-\"null\"}" "$n_state" "$n_conf" "$n_degr" "$n_age" "$n_gen" >> "$LOG" \
       || { echo "soak-monitor: cannot write $LOG — aborting" >&2; exit 2; }
   fi
 
