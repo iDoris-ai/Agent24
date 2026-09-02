@@ -39,6 +39,11 @@ export class FakeSpeaker {
   }
   /** Canned `agent inbox --json` rows (raw StoredMessage-shaped records). */
   inboxRows: Record<string, unknown>[] = []
+  /** Canned `identity list --json` rows (never carries the nsec — mirrors the
+   * real command's anonymous struct). */
+  identities: { nickname: string; npub: string; default?: boolean; encrypted?: boolean }[] = [
+    { nickname: 'agent24', npub: 'npub1self', default: true, encrypted: false },
+  ]
   /** Set to make the next command return an error envelope `{ok:false,...}`. */
   nextError?: string
 
@@ -73,6 +78,10 @@ export class FakeSpeaker {
     if (group === 'profile' && cmd === 'discover') {
       this.calls.push(inv)
       return this.envelope(this.discoverResult)
+    }
+    if (group === 'identity' && cmd === 'list') {
+      this.calls.push(inv)
+      return this.envelope(this.identities)
     }
     if (group === 'history' && cmd === 'inbox') {
       this.calls.push(inv)

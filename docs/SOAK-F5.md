@@ -12,8 +12,11 @@
 3. **无人工干预**：7 天里你没有手动重启 daemon / 重连渠道 / 清状态。
 4. **无内存泄漏**：`rss_mb` 曲线平稳，不单调爬升。
 5. **渠道存活**：微信 / Nostr 入站在第 1 天和第 7 天都能触发 run + 审批回。
+6. **Nostr 入站通路全程活着**（FU-32）：`~/.agent24/nostr-bridge-health.json` 的 `state` **7 天里从未出现过 `degraded`**。
 
-`soak-monitor.sh` 退出时按 1、2 自动给 PASS / NEEDS REVIEW；3–5 靠你日常抽查 + 日志。
+   > 第 5 条单独**挡不住**这一类失效,这正是 FU-32 的教训:桥读的是 agent-speaker daemon 填的**本地库**,daemon 那侧 relay 断了的话 `history inbox` 照样 exit 0 返回 `[]` —— 不抛错、不超时、进程健康、日程照跑,**只是谁的消息都收不到**。只在第 1 天和第 7 天各发一条,中间六天全哑也照样 PASS。桥现在每 5 分钟给自己发一条 canary,只有 daemon 真把它从 relay 拉回来才算数;15 分钟没有确认就写 `degraded` 并在 stderr 报警。**睡眠→唤醒之后必须专门抽查一次**——那是这条最可能失效的时刻。
+
+`soak-monitor.sh` 退出时按 1、2 自动给 PASS / NEEDS REVIEW；3–6 靠你日常抽查 + 日志。
 
 ## 一次性准备
 
@@ -37,6 +40,19 @@ pnpm --filter @agent24/wechat-bridge start   # 扫码
 ```
 
 ### ⚠️ 已知坑（TASKS.md 记录）
+
+- **先确认 agent-speaker 的二进制名（FU-34）**。上游已把它改名为 `hyphae`（`cmd/hyphae/`、module `github.com/iDoris-ai/hyphae`），而本仓默认还找 `agent-speaker`。起跑前跑一遍：
+
+  ```bash
+  which agent-speaker || which hyphae      # 装的是哪个名字
+  # 若是 hyphae，桥要显式指过去（否则第一分钟就 degraded）
+  export A24_SPEAKER_BIN=hyphae
+  # 契约自检:这四条都要返回 {"ok":true,...} 信封(F4 联调是对着改名前的 7cef326 验的)
+  $A24_SPEAKER_BIN identity list --json
+  $A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
+  ```
+
+- **桥和 daemon 必须watch 同一个 relay**。`hyphae daemon --relay X` 而桥 `A24_NOSTR_RELAY=Y` 的话，canary 发出去没人收 → 一直 `degraded`，而且症状和"通路真的死了"完全一样。
 
 - **launchd 不继承登录 shell 的环境变量**。凡是 daemon 需要的 env（`OMLX_URL`、`OMLX_API_KEY`、API keys、`A24_*`），必须写进 LaunchAgent plist 的 `EnvironmentVariables`，不能只 `export` 在 `~/.zshrc` 里——否则自启的 daemon 连不上模型。装完 `service install` 后核对 plist。
 
@@ -66,6 +82,14 @@ jq -r '[.at, (.rss_mb|tostring)] | @tsv' ~/agent24-soak.jsonl | tail -50
 # 有没有出现过 overdue schedule
 jq 'select(.overdue > 0)' ~/agent24-soak.jsonl
 # 第 1 天 / 第 7 天各发一条真实微信、Nostr 消息，确认能驱动 run + 审批回
+
+# Nostr 入站通路现在是活的吗（FU-32）——每次开机/唤醒后都看一眼
+cat ~/.agent24/nostr-bridge-health.json
+# state 应为 "ok"；canaries.confirmed 应随时间增长，lost 应为 0
+# "degraded" = 对端消息现在收不进来，按报警里那三条顺序查（daemon 在跑吗 / relay 一致吗 / 网络回来了吗）
+
+# 整个泡测期间出现过 degraded 吗（桥的日志里）
+grep -c "入站通路疑似已死" ~/soak-monitor.out ~/nostr-bridge.log 2>/dev/null
 ```
 
 ## 收尾

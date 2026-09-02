@@ -47,6 +47,25 @@ export const CONFIG = {
    * 60s is well above a normal relay round-trip and below any human's patience
    * for "why hasn't it answered". */
   SPEAKER_TIMEOUT_MS: Number(process.env.A24_NOSTR_SPEAKER_TIMEOUT_MS) || 60_000,
+  /** Rows per inbox read. Wide enough that nothing falls out of the window
+   * between two polls (agent-speaker's own default is 20). */
+  INBOX_LIMIT: Number(process.env.A24_NOSTR_INBOX_LIMIT) || 100,
+
+  // ── FU-32 inbound liveness (see liveness.ts for why a canary, not a timeout) ──
+  /** Set to `0` to disable the probe entirely. Disabling means the bridge can no
+   * longer tell an empty inbox from a dead relay path — the F5 soak must not. */
+  LIVENESS_ENABLED: process.env.A24_NOSTR_LIVENESS !== '0',
+  /** How often the bridge sends itself a canary. 5 min ≈ 288 events/day. */
+  CANARY_INTERVAL_MS: Number(process.env.A24_NOSTR_CANARY_MS) || 5 * 60_000,
+  /** No canary back for this long ⇒ inbound is presumed dead. Three missed
+   * canaries: long enough to ride out one relay hiccup, short enough that a
+   * machine that woke up broken is caught within the quarter hour. */
+  LIVENESS_STALE_MS: Number(process.env.A24_NOSTR_STALE_MS) || 15 * 60_000,
+  /** NIP-44-encrypt canaries (set `0` for plaintext). */
+  CANARY_ENCRYPT: process.env.A24_NOSTR_CANARY_ENCRYPT !== '0',
+  /** Health snapshot an operator (or the F5 soak) can `cat`. Empty disables. */
+  HEALTH_FILE:
+    process.env.A24_NOSTR_HEALTH_FILE ?? path.join(HOME, '.agent24', 'nostr-bridge-health.json'),
 
   // ── agent24d discovery (Rust writes port+token here; env overrides win) ──
   DAEMON_STATE_FILE: path.join(HOME, '.agent24', 'daemon.json'),
