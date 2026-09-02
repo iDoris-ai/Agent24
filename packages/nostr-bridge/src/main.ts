@@ -66,8 +66,14 @@ async function main(): Promise<void> {
   // Pure power-of-two backoff has a trap that a review caught: at 5s the gap
   // between failure 65536 and 131072 is ~3.8 days, so a week-long soak can go
   // SILENT for its last days while still broken — the exact shape of failure
-  // this bridge is being hardened against. So the decay is capped by WALL CLOCK,
-  // not by count: dense at first, then never quieter than hourly.
+  // this bridge is being hardened against. So the decay is capped by ELAPSED
+  // TIME, not by count: dense at first, then never quieter than hourly.
+  //
+  // Elapsed time is measured MONOTONICALLY, not by wall clock:
+  // `performance.now()` is monotonic; `Date.now()` is not. An NTP correction or
+  // a manual clock change that moves wall time BACKWARD would make the elapsed
+  // check negative and silence the log until the clock caught up again — hours,
+  // in exactly the unattended run this cap exists to protect. (Codex round 2.)
   const MAX_LOG_GAP_MS = 60 * 60 * 1000
   let consecutiveFailures = 0
   let lastLoggedAt = 0
@@ -82,7 +88,7 @@ async function main(): Promise<void> {
       }
     } catch (err) {
       consecutiveFailures += 1
-      const now = Date.now()
+      const now = performance.now()
       // 1, 2, 4, 8 … while the count is small; then at least once an hour.
       const isPowerOfTwo = (consecutiveFailures & (consecutiveFailures - 1)) === 0
       if (isPowerOfTwo || now - lastLoggedAt >= MAX_LOG_GAP_MS) {
