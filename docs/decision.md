@@ -1225,6 +1225,68 @@ ADR-029 画清了内核 ↔ 领域 OS 的边界，但没定义**记忆归谁**�
 
 ---
 
+## ADR-031：ME-3 进程外模块的协议 —— 按「缝」分别裁决，不按「大家都用什么」裁决
+
+**日期**：2026-09-02
+**状态**：✅ 采纳（裁决 FU-14，解除 ME-3 的开工前置）
+**详细设计**：[`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`](specs/SPEC-ME3-OUT-OF-PROCESS.md)
+
+### 背景
+
+FU-14 把「自定义协议 vs ACP」列为 ME-3 的开工前置。起因是两份互不相干的 vendor 研读同时撞上 ACP：Berd 用它连 `goose serve`（`berd.md` §9），Macro 的 `agent_runtime_protocol` 是「携带 ACP 消息、不解释其载荷」的外层信封（`macro.md` §5）。两个独立团队在同一年选了同一个边界协议，这是一个值得认真对待的收敛信号。
+
+`berd.md` 当时把话说得很准：**「这条是建议，不是结论」**，因为 ACP 的能力覆盖度、与我们审批门和 `ScopedMemory` 的契合度都没验证过。本 ADR 先补上那次验证，再裁决。
+
+### 先补验证：ACP 到底定义了什么
+
+查了 ACP 规范（agentclientprotocol.com，2026-09-02）：
+
+- **传输/编码**：JSON-RPC 2.0。
+- **客户端 → agent**：`initialize`（版本与能力协商）、`authenticate`、`session/new`、`session/prompt`、`session/load`、`session/cancel`。
+- **agent → 客户端**（反向调用真实存在）：`session/request_permission`（**为工具调用请求用户授权**）、`session/update`、`fs/read_text_file`、`fs/write_text_file`、`terminal/create|output|kill`、`elicitation/create`。
+- **扩展机制**：`_` 前缀保留给自定义方法（如 `_zed.dev/workspace/buffers`），所有类型都带 `_meta`，扩展能力应通过能力对象里的 `_meta` 广告出来。
+- **记忆/存储**：**没有**。除 `session/load` 的会话恢复外，规范不涉及持久化或记忆。
+
+### 关键判断：这里有两条缝，不是一条
+
+把「要不要用 ACP」当成一个问题，是这次差点犯的错误。Agent24 有两条不同的进程边界：
+
+| | **缝 A：壳 ↔ agent 运行时** | **缝 B：内核 ↔ 领域 OS（ME-3）** |
+|---|---|---|
+| 对象模型 | 会话、提示、工具调用 | 模块、路由、清单、作用域记忆 |
+| 谁主动 | 壳发起提示，运行时回调要权限/读文件 | 内核转发 HTTP，模块回调要记忆/事件/审批 |
+| ACP 覆盖 | **基本吻合** | **不覆盖** |
+
+ACP 的对象模型是**会话与提示**。ME-3 要过线的是 `DomainModule`/`KernelCtx` 那组东西：清单（`route_namespace`、`event_module`、`data_dir`、`kernel_capabilities`）、模块贡献的 HTTP 路由、`open_store`、以及 `Capability::{Events, Models, Scheduler, Policy, Memory}`。这些在 ACP 里**一个都没有**——记忆更是明确不在其范围内。
+
+### 决策
+
+**1. 缝 B（ME-3）不采用 ACP 作为模块协议。**
+
+采用它意味着 `initialize` 之后的**全部**语义都落在 `_agent24/*` 扩展里。那买到的是信封，不是互操作：一个通用 ACP 客户端**挂载不了它读不懂的 Agent24 领域 OS**。而互操作恰恰是 `berd.md` 推荐它的唯一理由——理由不成立时，收敛信号不构成采用理由。
+
+**2. 缝 B 用一条窄的、专用的 JSON-RPC 回调通道**，形状照抄已经付过学费的 `DomainModule`/`KernelCtx`，而不是照抄任何外部协议的对象模型。入站方向根本不需要协议：内核已有 axum，把 `/api/v1/<ns>/*` 反向代理给子进程的监听端口即可。**只有出站（模块 → 内核）方向需要定义**，因为记忆的所有权与分区是内核强制的（ADR-030）。
+
+**3. 但在不花钱的地方对齐 ACP 的约定**：JSON-RPC 2.0；`initialize` 式的能力协商；`_` 前缀 + `_meta` 的扩展惯例。这不是为了兼容，是为了**将来在缝 A 上采用 ACP 时不必再叠一套栈**。
+
+**4. 缝 A 不在本 ADR 内裁决。** ACP 在那里是强候选（`session/request_permission` 与我们的审批门是同一个东西），但 Agent24 今天的 `agent24d ↔ 桌面壳` 走自定义 HTTP+WS，替换它是独立的一次立项。本 ADR 只负责**不把缝 B 的选择做成缝 A 的障碍**。
+
+**5. MCP 同理不采用为模块协议。** 它的对象模型是 tools/resources/prompts——比 ACP 更接近「能力」，但同样不涉及路由贡献、作用域记忆和模块生命周期。SPEC-MD-ME §5 的 ME-3 行写的是「经 MCP/协议」，那是立项时的猜测，本 ADR 改正它：**MCP 是领域 OS 可以对外暴露的一个面，不是内核挂载它的那条缝。**
+
+### 代价与后果
+
+- 我们要自己维护一个协议。范围被刻意压到最小：**只有出站回调**，入站是纯反向代理。
+- 第三方要写 Agent24 领域 OS，得实现这条通道——但它只有几个方法，且与进程内 trait 一一对应，SDK 是薄的。
+- 若将来缝 A 采用 ACP，两条缝会是**同一种线格式、不同的词汇表**。这是有意的：词汇表本来就该不同。
+
+### 未验证 / 留给设计文档
+
+- ACP 的 `session/request_permission` 与我们审批门的**字段级**契合度（本 ADR 只核到语义层）。
+- 反向代理下审批门的 UX：模块发起的审批要如何归因到发起它的那次用户请求。
+- 这两条在 `SPEC-ME3-OUT-OF-PROCESS.md` 里作为公开问题记着，不在本 ADR 内假装已解决。
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |

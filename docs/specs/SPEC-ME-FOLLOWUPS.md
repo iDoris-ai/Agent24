@@ -207,6 +207,8 @@ Codex 同时确认：`mint_id` 去掉前缀后没有任何地方还依赖解析/
 
 ### 留给 ME-3 的（进程外模块）
 
+> **这五条已被 [SPEC-ME3-OUT-OF-PROCESS.md](SPEC-ME3-OUT-OF-PROCESS.md) 逐条接住**（身份→§2、双向上限与分页→§4、真配额→§4、目录持久→§3）。此处保留原文作为出处。
+
 `KernelCtx::memory()` 返回的是借用的 `&dyn ScopedMemory`，这个形状**过不了进程边界**。
 ME-3 要在 broker/RPC 层重建这些性质，逐条对应上面已经付过学费的地方：
 

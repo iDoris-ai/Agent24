@@ -204,7 +204,7 @@ struct DomainOsConfig { active_domain_os: String, installed: Vec<String> }
 |---|---|---|---|---|
 | **ME-1** | **`DomainModule` + `KernelCtx` trait**;把 **Sin90 改造成第一个 `DomainModule`**,去掉 `AppState.sin90` 具体字段 + 硬编码 `/sin90/*` 路由 | — | Sin90 经 trait 挂载后 SPIKE-00 全测试仍绿;内核零依赖 sin90 不变 | agent24d 不再按名字认识 Sin90;`cargo` 图仍单向 |
 | **ME-2** | **配置驱动模块注册表 + `agent24 os` CLI**(install/activate/uninstall);独立 `~/.agent24/os/<name>/`;缺资源明确报错 | ME-1 | 装/激活/卸载往返;缺模型→明确报缺;禁用后 `/…/*` 503 | 换装是纯配置+脚本,不改内核不重编 |
-| **ME-3** | **进程外 Provider 路径**(第三方 OS,经 MCP/协议;不重编内核) | ME-2 | 一个 mock Provider OS 挂载 + 路由代理 + 事件转发 | 装第三方 OS 零改内核 |
+| **ME-3** | **进程外 Provider 路径**(第三方 OS;不重编内核)。**协议已裁决:[ADR-031](../decision.md) —— 不用 ACP 也不用 MCP,入站是反向代理、只有出站回调需要协议;设计见 [SPEC-ME3-OUT-OF-PROCESS.md](SPEC-ME3-OUT-OF-PROCESS.md)** | ME-2 | 一个 mock Provider OS 挂载 + 路由代理 + 事件转发 | 装第三方 OS 零改内核 |
 | **ME-4** | **第二个领域 OS 样例(Cos72 骨架)** 证明可替换;`os install cos72 && os activate cos72` | ME-2 | 清 Sin90→装 Cos72→各自 DB 隔离、路由切换 | 三玩法(默认/定制/替换)都是干净一次性动作 |
 | **ME-5** | **E5 PGL manifest** 解析钩子 + AgentStore 元数据展示 | ME-2 + 消费者 | pgl.yml 解析 + 展示 | **等 AgentStore 真消费**(先有消费者) |
 | **ME-6** | **模块签名 + AirAccount 信任根**(ADR-016 阶段3):sigstore keyless 签名 + 验签 + "只信任 AirAccount X" | ME-2 | 签名验证 + 信任策略 | **P4 门后**(需用户确认) |
