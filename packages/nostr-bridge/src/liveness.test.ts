@@ -132,6 +132,7 @@ function harness(
     canaryIntervalMs: opts.canaryIntervalMs ?? CANARY_MS,
     staleAfterMs: opts.staleAfterMs ?? STALE_MS,
     healthFile: opts.healthFile,
+    context: { identity: 'agent24' },
     now: () => t,
     wallNow: () => wallStart + t,
     rand: () => 0.5, // no jitter, so the tests' timing arithmetic stays exact
@@ -1161,6 +1162,9 @@ describe('InboundLiveness — 健康文件是运维输入,必须当成不可信�
         '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","degraded_transitions":0.5}',
         // Not one of the three known verdicts.
         '{"state":"weird","seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z"}',
+        // A generation that would break the soak monitor's JSONL if echoed back
+        // (the snapshot is an operator-editable file, so its shape is input).
+        '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","generation":"a\\"b"}',
       ]) {
         fs.writeFileSync(file, bad)
         const h = harness({ healthFile: file })
@@ -1272,6 +1276,78 @@ describe('InboundLiveness — 健康文件是运维输入,必须当成不可信�
       const third = harness({ healthFile: file, wallStart: 1_700_000_000_000 + 2_000 })
       await third.boot()
       expect(third.liveness.snapshot().generation).not.toBe(gen1)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('另一个身份写的快照不能被继承 —— 两个桥共用默认路径会把账本搅在一起', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          state: 'ok',
+          updated_at: new Date(1_700_000_000_000).toISOString(),
+          last_confirmed_at: new Date(1_700_000_000_000).toISOString(),
+          seconds_since_confirmed: 0,
+          degraded_transitions: 0,
+          generation: 'gen-of-the-other-bridge',
+          canaries: { sent: 99, confirmed: 99, lost: 0, outstanding: 0 },
+          last_error: null,
+          self_npub: 'npub1someoneelse',
+          context: { identity: 'another-agent' },
+        }),
+      )
+      const h = harness({ healthFile: file })
+      await h.boot()
+      // Not inherited: not the counters, not the chain, and — most importantly —
+      // not `self_npub`, which would make `observe()` drop the wrong rows.
+      expect(h.liveness.snapshot().canaries.confirmed).toBe(0)
+      expect(h.liveness.snapshot().generation).not.toBe('gen-of-the-other-bridge')
+      expect(h.liveness.ready).toBe(true) // resolved from the keystore, not the file
+      expect(h.logs.some((l) => l.level === 'warn' && l.text.includes('另一个身份'))).toBe(true)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('被判损坏的快照不能留下「半继承」的残留', async () => {
+    // Validation used to be interleaved with assignment, so a field that failed
+    // LATE left the earlier ones already inherited — a snapshot we just declared
+    // untrustworthy would still have handed us its counters, its verdict and its
+    // self_npub, and `unreadable()` only resets the silence. The fixture below
+    // is valid right up to the last field on purpose.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          state: 'degraded',
+          updated_at: new Date(1_700_000_000_000).toISOString(),
+          last_confirmed_at: new Date(1_700_000_000_000).toISOString(),
+          seconds_since_confirmed: 42,
+          degraded_transitions: 7,
+          canaries: { sent: 99, confirmed: 88, lost: 5, outstanding: 0 },
+          self_npub: 'npub1definitelynotus',
+          last_error: null,
+          generation: 'not a legal generation!!',
+        }),
+      )
+      const h = harness({ healthFile: file })
+      await h.boot()
+      const snap = h.liveness.snapshot()
+      expect(snap.canaries.confirmed).toBe(0)
+      expect(snap.canaries.sent).toBe(0)
+      expect(snap.canaries.lost).toBe(0)
+      expect(snap.degraded_transitions).toBe(0)
+      expect(snap.state).not.toBe('degraded')
+      expect(snap.generation).not.toBe('not a legal generation!!')
+      // self_npub came from the keystore, not from the rejected file.
+      expect(snap.self_npub).toBe(SELF)
+      expect(h.logs.some((l) => l.level === 'warn' && l.text.includes('健康快照'))).toBe(true)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

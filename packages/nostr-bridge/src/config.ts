@@ -83,9 +83,20 @@ export const CONFIG = {
   LIVENESS_TICK_MS: durationMs(process.env.A24_NOSTR_LIVENESS_TICK_MS, 30_000, 1_000),
   /** NIP-44-encrypt canaries (set `0` for plaintext). */
   CANARY_ENCRYPT: process.env.A24_NOSTR_CANARY_ENCRYPT !== '0',
-  /** Health snapshot an operator (or the F5 soak) can `cat`. Empty disables. */
+  /** Health snapshot an operator (or the F5 soak) can `cat`. Empty disables.
+   *
+   * Scoped by identity: two bridges acting as different identities would
+   * otherwise take turns overwriting one file, interleaving their silence,
+   * counters and generation into a single meaningless ledger — and a monitor
+   * sampling it would see whichever instance wrote last, so one bridge's outage
+   * could be masked by the other's health. */
   HEALTH_FILE:
-    process.env.A24_NOSTR_HEALTH_FILE ?? path.join(HOME, '.agent24', 'nostr-bridge-health.json'),
+    process.env.A24_NOSTR_HEALTH_FILE ??
+    path.join(
+      HOME,
+      '.agent24',
+      `nostr-bridge-health-${(process.env.A24_NOSTR_IDENTITY || 'agent24').replace(/[^A-Za-z0-9_.-]/g, '_')}.json`,
+    ),
 
   // ── agent24d discovery (Rust writes port+token here; env overrides win) ──
   DAEMON_STATE_FILE: path.join(HOME, '.agent24', 'daemon.json'),

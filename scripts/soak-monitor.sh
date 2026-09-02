@@ -34,7 +34,10 @@ set -u
 INTERVAL=300            # seconds between samples
 DURATION=$((7*24*3600)) # total run length (7 days)
 DAEMON_JSON="${A24_DAEMON_JSON:-$HOME/.agent24/daemon.json}"
-NOSTR_HEALTH="${A24_NOSTR_HEALTH_FILE:-$HOME/.agent24/nostr-bridge-health.json}"
+# Identity-scoped, matching the bridge's own default (packages/nostr-bridge
+# config.ts): one file per bridge, so two instances cannot overwrite each other's
+# ledger and make one's outage invisible behind the other's health.
+NOSTR_HEALTH="${A24_NOSTR_HEALTH_FILE:-$HOME/.agent24/nostr-bridge-health-${A24_NOSTR_IDENTITY:-agent24}.json}"
 # F5 runs Nostr, so its absence is a FAILURE, not a "not configured" — a bridge
 # that never started, or crashed before writing, otherwise leaves exactly the
 # same evidence as "the user didn't ask for Nostr" and the gate is skipped.
@@ -86,7 +89,7 @@ schedule_min=""; anomalies=0; disabled_seen=0; sched_err_seen=0; stuck_failing_s
 nostr_seen=0; nostr_conf_first=""; nostr_conf_last=0; nostr_read_err=0
 nostr_degraded_seen=0; nostr_stale_seen=0; nostr_tr_base=""; nostr_tr_last=0; nostr_tr_back=0
 nostr_first_epoch=""; nostr_last_epoch=0; nostr_short=0
-nostr_gen_first=""; nostr_gen_changed=0; nostr_conf_back=0
+nostr_gen_first=""; nostr_gen_changed=0; nostr_conf_back=0; nostr_late=0
 n_state="null"; n_conf="null"; n_degr="null"; n_age="null"; n_gen="null"
 
 read_daemon() { # -> echoes "port token pid" or nothing
@@ -108,12 +111,16 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 sample_nostr() {
   n_state="null"; n_conf="null"; n_degr="null"; n_age="null"; n_gen="null"
   if [ ! -f "$NOSTR_HEALTH" ]; then
-    # Missing before the bridge has ever written one is normal — the monitor is
-    # usually started first. "Never written at all" is caught at the END by the
-    # `nostr_seen` gate, so failing per-sample here would fail a healthy 7-day
-    # run over its first few seconds. Missing AFTER we have seen it is different:
-    # the file was removed or the bridge tore it down.
-    if [ "$nostr_seen" -eq 1 ]; then nostr_read_err=1; anomalies=$((anomalies+1)); fi
+    # Missing before the bridge has ever written one is normal for a moment — the
+    # monitor is usually started first. But only for a moment: the grace period
+    # is bounded, because "the file showed up eventually" is not evidence about
+    # the days before it did. Missing AFTER we have seen it is a separate
+    # failure: the file was removed or the bridge tore it down.
+    if [ "$nostr_seen" -eq 1 ]; then
+      nostr_read_err=1; anomalies=$((anomalies+1))
+    elif [ "$REQUIRE_NOSTR" -eq 1 ] && [ $(( $(date +%s) - start )) -gt "$NOSTR_STALE" ]; then
+      nostr_late=1; anomalies=$((anomalies+1))
+    fi
     return
   fi
   local row st cf dg age gen
@@ -136,6 +143,10 @@ sample_nostr() {
     # unlimited extra grace, because a negative age never exceeds the threshold.
     # A few seconds of sub-second/NTP jitter is tolerated and floored to 0.
     | select($age >= -5)
+    # Shape-checked because it is echoed back into the JSONL below and the
+    # snapshot is an operator-editable file: a generation containing a quote
+    # would emit invalid JSON.
+    | select(((.generation // "") | tostring) | test("^[A-Za-z0-9_.:-]{0,64}$"))
     | [.state, ($c|tostring), ($d|tostring), (([$age, 0] | max) | tostring),
        (.generation // "" | tostring)]
     | @tsv' "$NOSTR_HEALTH" 2>/dev/null) || row=""
@@ -194,8 +205,13 @@ sample_nostr() {
 
 summarize() {
   # Computed first: the report lines below read it.
-  local nostr_span=$(( nostr_last_epoch - ${nostr_first_epoch:-0} ))
-  if [ "$nostr_seen" -eq 1 ] && [ "$nostr_span" -lt "$NOSTR_STALE" ]; then nostr_short=1; fi
+  #
+  # Measured against the RUN's own length, not the span between the first and
+  # last Nostr sample. Using the sample span let a bridge that appeared for the
+  # final ten minutes of a seven-day run claim the short-run exemption — six days
+  # with no evidence at all, and a PASS at the end of it.
+  local run_secs=$(( $(date +%s) - start ))
+  if [ "$run_secs" -lt "$NOSTR_STALE" ]; then nostr_short=1; fi
   local up="n/a"
   if [ "$samples" -gt 0 ]; then
     up=$(awk "BEGIN{printf \"%.2f\", 100*$health_ok/$samples}")
@@ -242,6 +258,9 @@ summarize() {
   # must also have advanced — a bridge stuck at `starting` never reported
   # degraded either, and that must not read as healthy.
   local nostr_ok=1
+  # A snapshot that only appeared long after the run began cannot vouch for the
+  # stretch before it. Sticky, so a late arrival cannot clear it.
+  [ "$nostr_late" -ne 0 ] && nostr_ok=0
   if [ "$REQUIRE_NOSTR" -eq 1 ] && [ "$nostr_seen" -eq 0 ]; then
     # "No evidence" is not "no bridge asked for". A bridge that never started
     # leaves exactly the same trace as one that was never configured, so the
@@ -274,13 +293,24 @@ summarize() {
      && [ "${schedule_min:-0}" -gt 0 ] && [ "$overdue_max" -eq 0 ] \
      && [ "$disabled_seen" -eq 0 ] && [ "$sched_err_seen" -eq 0 ] \
      && [ "$nostr_ok" -eq 1 ]; then
-    echo "RESULT: PASS (health 100%, ≥1 live schedule every sample, no overdue/auto-disabled/fetch-error$([ "$nostr_seen" -eq 1 ] && echo ", nostr inbound never degraded"))"
-    result=0
+    if [ "${nostr_short:-0}" -eq 1 ] && [ "$REQUIRE_NOSTR" -eq 1 ]; then
+      # Everything checked passed, but the run was too short to evaluate
+      # criterion 6 at all. That is not an F5 PASS — saying so would let a
+      # ten-minute smoke test read as a seven-day result. Non-zero on purpose,
+      # so automation cannot mistake it either.
+      echo "RESULT: SMOKE PASS (其余判据通过,但 run 长度 < ${NOSTR_STALE}s,F5 判据 6 未评估 —— 不能作为 F5 结论)"
+      result=1
+    else
+      echo "RESULT: PASS (health 100%, ≥1 live schedule every sample, no overdue/auto-disabled/fetch-error$([ "$nostr_seen" -eq 1 ] && echo ", nostr inbound never degraded"))"
+      result=0
+    fi
   else
     echo "RESULT: NEEDS REVIEW (see anomalies + scheduler faults in the log)"
     if [ "$nostr_ok" -eq 0 ]; then
       if [ "$nostr_seen" -eq 0 ]; then
         echo "  · Nostr 入站(F5 判据 6):整个 run 没有读到任何健康快照 —— 桥没起来/没写过文件。确实不测 Nostr 请显式加 --no-nostr"
+      elif [ "$nostr_late" -ne 0 ]; then
+        echo "  · Nostr 入站(F5 判据 6):健康快照迟到超过 ${NOSTR_STALE}s 才出现 —— 在那之前这一段没有任何入站证据"
       else
         echo "  · Nostr 入站(F5 判据 6):degraded_sampled=${nostr_degraded_seen} transitions ${nostr_tr_base:-0}→${nostr_tr_last} stale=${nostr_stale_seen} read_err=${nostr_read_err} counter_reset=${nostr_tr_back}/${nostr_conf_back} generation_changed=${nostr_gen_changed} confirmed ${nostr_conf_first:-0}→${nostr_conf_last}"
       fi

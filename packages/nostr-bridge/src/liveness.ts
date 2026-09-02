@@ -653,6 +653,12 @@ export class InboundLiveness {
     }
     try {
       const prev = JSON.parse(raw) as Partial<LivenessSnapshot>
+      // ── validate EVERYTHING first, commit to `this.*` only at the end ──
+      // Interleaving the two means a field that fails late leaves the earlier
+      // ones already inherited, and then `unreadable()` resets only what it
+      // knows about: a snapshot rejected as corrupt would still have handed us
+      // its counters, its verdict and its self_npub. Half-inherited state from a
+      // file we just declared untrustworthy is worse than none.
       // A year of silence is already absurd; anything beyond it is corruption,
       // and bounding here keeps `* 1000` inside the safe integer range.
       const carriedSec = num(prev.seconds_since_confirmed, 365 * 24 * 3600)
@@ -670,8 +676,7 @@ export class InboundLiveness {
       // violates the very "counts accumulate across restarts" property the soak
       // criterion leans on.
       const c = prev.canaries
-      const plainObject =
-        typeof c === 'object' && c !== null && !Array.isArray(c)
+      const plainObject = typeof c === 'object' && c !== null && !Array.isArray(c)
       const counters = plainObject
         ? {
             sent: num((c as LivenessSnapshot['canaries']).sent),
@@ -682,9 +687,8 @@ export class InboundLiveness {
       if (c !== undefined && (!counters || Object.values(counters).some((v) => v === null))) {
         throw new Error('canaries 计数缺失或非法')
       }
-      const transitions = prev.degraded_transitions === undefined
-        ? 0
-        : num(prev.degraded_transitions)
+      const transitions =
+        prev.degraded_transitions === undefined ? 0 : num(prev.degraded_transitions)
       if (transitions === null) throw new Error('degraded_transitions 非法')
       // The previous process's VERDICT, not just its silence. It decides whether
       // this process's first judgement is a new transition:
@@ -698,7 +702,32 @@ export class InboundLiveness {
       if (prevState !== undefined && !['starting', 'ok', 'degraded'].includes(prevState)) {
         throw new Error('state 非法')
       }
+      // A snapshot written by a DIFFERENT identity is not ours to inherit. The
+      // health path is identity-scoped by default precisely so this cannot
+      // happen, but an explicit `A24_NOSTR_HEALTH_FILE` can still collide, and
+      // interleaving two bridges' silence, counters and generation into one
+      // ledger makes all of it meaningless — while the wrong `self_npub` would
+      // make `observe()` drop the wrong rows.
+      const prevIdentity = (prev.context as { identity?: unknown } | undefined)?.identity
+      if (typeof prevIdentity === 'string' && prevIdentity !== this.o.identity) {
+        throw new Error(
+          `快照属于另一个身份 "${prevIdentity}"(本进程是 "${this.o.identity}");两个桥不要共用同一个健康文件`,
+        )
+      }
+      // Shape-checked because it is echoed into the soak monitor's JSONL and the
+      // file is operator-editable: a generation containing a quote would emit
+      // invalid JSON downstream. Never truncated — truncation would alias two
+      // distinct chains onto one id.
+      if (
+        prev.generation !== undefined &&
+        (typeof prev.generation !== 'string' || !/^[A-Za-z0-9_.:-]{1,64}$/.test(prev.generation))
+      ) {
+        throw new Error('generation 非法')
+      }
+      const npub =
+        typeof prev.self_npub === 'string' && prev.self_npub ? prev.self_npub : undefined
 
+      // ── everything validated; now commit ──
       // The written value is already the TOTAL silence (it includes whatever the
       // previous process itself inherited), so adding the downtime since the
       // write accumulates correctly across any number of restarts — it does not
@@ -709,16 +738,9 @@ export class InboundLiveness {
       this.confirmed = counters?.confirmed ?? 0
       this.lost = counters?.lost ?? 0
       this.degradedTransitions = transitions
-      // Last known identity, so a keystore we cannot read right now does not
-      // leave us unable to recognise our own leftover canaries.
-      if (typeof prev.self_npub === 'string' && prev.self_npub) this.selfNpub = prev.self_npub
+      if (npub) this.selfNpub = npub
       if (prevState !== undefined) this.state = prevState
-      // Carry the chain forward. Kept only when the whole snapshot validated —
-      // reaching `unreadable()` leaves the fresh id from construction, which is
-      // the signal that the accounting restarted from nothing.
-      if (typeof prev.generation === 'string' && prev.generation.length > 0) {
-        this.generation = prev.generation.slice(0, 64)
-      }
+      if (prev.generation !== undefined) this.generation = prev.generation as string
       if (this.restoredGapMs > this.o.staleAfterMs) {
         this.o.log.warn(
           `[nostr] ⚠️  上一轮进程留下的入站静默已有 ${Math.round(this.restoredGapMs / 1000)}s,本进程不重新计时(重启不清账)。`,
