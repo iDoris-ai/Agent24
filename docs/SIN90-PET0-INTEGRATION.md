@@ -166,6 +166,10 @@ Agent24 提供三级路由 policy 层 + `sin90_ai_calls` 记账(每次决策记�
 GET|POST         /api/v1/sin90/directions
 GET|PATCH        /api/v1/sin90/directions/{id}      # PATCH body = {to: <status>, ...},走状态机校验
 GET|POST         /api/v1/sin90/rhythms
+                 # 注意:Rhythm **没有** PATCH /{id}。它的变更不是状态迁移,是重新
+                 # 分配占比,必须经 Proposal 门的 `AdjustRhythm{rhythm_id,new_alloc}`
+                 # (见 specs/SIN90-domain.md §4)。这也是 adjusted → adjusted 那条边
+                 # 的用途:同一个 rhythm 可以反复调,每次都留一条 proposal 记录。
 GET|POST         /api/v1/sin90/weeks
 GET|PATCH        /api/v1/sin90/weeks/{id}
 GET|POST         /api/v1/sin90/tasks
