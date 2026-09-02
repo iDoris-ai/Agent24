@@ -7,16 +7,20 @@
 //      `fs.writeFileSync(this.file, ...)`.
 //      → "never leaves a half-written main file" and "recovers ... via the
 //        backup" fail.
-//   2. Make `rotateBackupIfValid()` copy unconditionally (drop the parse check).
+//   2. Make `readValidMain()` return the text without the `parseMap` check.
 //      → "never rotates a corrupt main file into the backup" fails.
 //   3. Drop the shape checks from `parseMap` (keep only JSON.parse).
 //      → "rejects on-disk shapes that are valid JSON but not a session map" fails.
 //   4. Make `load()` return the recovered map without calling `republish`.
 //      → "repairs the main file after recovering from the backup" fails.
-//   5. Make `rotateBackupIfValid` use `copyFileSync` instead of temp+rename.
-//      → "leaves the old backup intact when rotation fails" fails.
+//   5. Make `writeBackup` use `copyFileSync` instead of temp+rename.
+//      → "leaves the old backup intact when the rotation write fails" fails.
 //   6. Delete the `sweepTemps()` call from `load()`.
-//      → "sweeps temps orphaned by a crashed writer" fails.
+//      → "sweeps only temps old enough to be abandoned" fails.
+//   7. Make `sweepTemps` treat a foreign PID as an orphan (drop the age check).
+//      → the same test fails: it deletes another process's live temp.
+//   8. In `save()`, rotate the backup BEFORE calling `republish`.
+//      → "a failed publish does not consume the rollback copy" fails.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
@@ -71,16 +75,11 @@ describe('FileSessionStore crash safety', () => {
     // a truncating writer has already destroyed the file. `rename` is what
     // publishes, so the ORIGINAL content must still be fully readable after.
     //
-    // A `save()` performs two durable writes: the backup rotation first, then
-    // the main generation. Let the rotation through and fail the main write, or
-    // the test would be exercising rotation instead of publication.
+    // `save()` publishes the primary FIRST and only then rotates the generation
+    // it replaced, so the primary write is the first durable write of the call.
     const realWrite = fs.writeFileSync
-    let writes = 0
-    vi.spyOn(fs, 'writeFileSync').mockImplementation(((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
-      writes += 1
-      const call = (...a: unknown[]): void => (realWrite as unknown as (...a: unknown[]) => void)(...a)
-      if (writes < 2) return call(p, ...rest)
-      call(p, '{"uid-1": "sess-', ...rest.slice(1)) // truncated content
+    vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      ;(realWrite as unknown as (...a: unknown[]) => void)(p, '{"uid-1": "sess-', ...rest.slice(1))
       throw new Error('simulated power cut mid-write')
     }) as typeof fs.writeFileSync)
 
@@ -173,37 +172,71 @@ describe('FileSessionStore crash safety', () => {
   // CODEX REVIEW round 2 (Medium): copyFileSync truncates the destination, so a
   // failed rotation used to damage .bak AND let the save proceed — the same
   // defect class as round 1's High, one level down.
-  it('leaves the old backup intact when rotation fails', () => {
+  it('leaves the old backup intact when the rotation write fails', () => {
     const store = new FileSessionStore(file)
-    store.save(new Map([['uid-1', 'keep-me']]))
-    store.save(new Map([['uid-1', 'keep-me'], ['uid-2', 'x']])) // .bak = {uid-1:keep-me}
+    store.save(new Map([['uid-1', 'g1']]))
+    store.save(new Map([['uid-1', 'g2']])) // .bak = {uid-1:g1}, main = {uid-1:g2}
 
-    // Fail the rotation write (the first durable write of the next save).
+    // Let the primary publish through, fail the backup write that follows it.
+    const realWrite = fs.writeFileSync
+    let writes = 0
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(((...a: unknown[]) => {
+      writes += 1
+      if (writes >= 2) throw new Error('simulated ENOSPC during backup rotation')
+      return (realWrite as unknown as (...x: unknown[]) => void)(...a)
+    }) as typeof fs.writeFileSync)
+    store.save(new Map([['uid-1', 'g3']]))
+    vi.restoreAllMocks()
+
+    // The new generation is published; the fallback is simply one older.
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ 'uid-1': 'g3' })
+    expect(parseBak()).toEqual({ 'uid-1': 'g1' })
+  })
+
+  // CODEX REVIEW round 3 (blocking, case B): rotating BEFORE publishing meant a
+  // failed publish left .bak holding the same generation as main — rollback
+  // depth zero, silently, as the cost of a save that did not even happen.
+  it('a failed publish does not consume the rollback copy', () => {
+    const store = new FileSessionStore(file)
+    store.save(new Map([['uid-1', 'g1']]))
+    store.save(new Map([['uid-1', 'g2']])) // .bak = g1, main = g2
+
     vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => {
-      throw new Error('simulated ENOSPC during backup rotation')
+      throw new Error('simulated failure publishing the new generation')
     })
-    store.save(new Map([['uid-3', 'new']]))
+    store.save(new Map([['uid-1', 'g3']]))
+    vi.restoreAllMocks()
 
-    expect(parseBak()).toEqual({ 'uid-1': 'keep-me' })
+    // Both files untouched: main is still g2 and the fallback is still g1.
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ 'uid-1': 'g2' })
+    expect(parseBak()).toEqual({ 'uid-1': 'g1' })
   })
 
   // CODEX REVIEW round 2 (Low): SIGKILL bypasses the catch that removes a temp,
-  // so without a sweep one orphan accumulates per crashed PID, forever.
-  it('sweeps temps orphaned by a crashed writer, but not a live one', () => {
+  // so without a sweep one orphan accumulates per crash, forever.
+  //
+  // CODEX REVIEW round 3 (BLOCKING): the first version used "a different PID
+  // means an orphan", which let one process delete a live writer's in-flight
+  // temp — a failure mode this branch would have INTRODUCED. Age is the test.
+  it('sweeps only temps old enough to be abandoned, never a live write', () => {
     const store = new FileSessionStore(file)
     store.save(new Map([['uid-1', 'a']]))
 
-    const orphan = `${file}.999999.tmp`
-    const bakOrphan = `${file}.bak.999998.tmp`
-    const mine = `${file}.${process.pid}.tmp`
+    const stale = `${file}.999999.tmp`
+    const staleBak = `${file}.bak.999998.tmp`
+    const liveOther = `${file}.999997.tmp` // ANOTHER process, writing right now
     const unrelated = path.join(path.dirname(file), 'something-else.tmp')
-    for (const f of [orphan, bakOrphan, mine, unrelated]) fs.writeFileSync(f, '{}')
+    for (const f of [stale, staleBak, liveOther, unrelated]) fs.writeFileSync(f, '{}')
+
+    // Backdate only the two that a crash would have left behind.
+    const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000)
+    for (const f of [stale, staleBak]) fs.utimesSync(f, longAgo, longAgo)
 
     new FileSessionStore(file).load()
 
-    expect(fs.existsSync(orphan)).toBe(false)
-    expect(fs.existsSync(bakOrphan)).toBe(false)
-    expect(fs.existsSync(mine)).toBe(true) // a concurrent write of ours
+    expect(fs.existsSync(stale)).toBe(false)
+    expect(fs.existsSync(staleBak)).toBe(false)
+    expect(fs.existsSync(liveOther)).toBe(true) // ← the round-3 regression
     expect(fs.existsSync(unrelated)).toBe(true) // not ours to delete
   })
 })

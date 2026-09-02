@@ -36,6 +36,11 @@ import type { SessionStore } from './bridge.js'
  * it", as opposed to a storage error that the operator needs to hear about. */
 const DIR_FSYNC_UNSUPPORTED = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EINVAL', 'EISDIR', 'EACCES', 'EPERM'])
 
+/** How old a temp must be before it counts as abandoned. A write here takes
+ * milliseconds; an hour is far outside any live write and far inside "this has
+ * been lying around since a crash". */
+const TEMP_ORPHAN_AGE_MS = 60 * 60 * 1000
+
 export class FileSessionStore implements SessionStore {
   constructor(private readonly file: string) {}
 
@@ -79,21 +84,55 @@ export class FileSessionStore implements SessionStore {
     return new Map()
   }
 
-  /** Publish a new generation atomically and durably. */
+  /** Publish a new generation, then demote the one it replaced to `.bak`.
+   *
+   * ORDER MATTERS, and it is the opposite of the obvious one. Rotating first
+   * (back up main, then publish) has a hole: if the publish fails, `.bak` now
+   * holds the same generation main still holds, so the rollback depth is zero —
+   * a failed save silently costs the only fallback. Publishing first means a
+   * failed publish leaves BOTH files exactly as they were. (Codex round 3.)
+   *
+   * A failed BACKUP, by contrast, does not stop the save. Refusing to record a
+   * new user's session because the backup copy failed would lose that mapping
+   * outright, which is the very thing this file exists to prevent — a stale
+   * backup is strictly better than a lost update. It is warned about loudly. */
   save(map: Map<string, string>): void {
-    this.rotateBackupIfValid()
-    this.republish(map)
+    const replaced = this.readValidMain() // null on first save or corrupt main
+    if (!this.republish(map)) return // publish failed — leave .bak alone
+    if (replaced !== null) this.writeBackup(replaced)
   }
 
-  /** The write half of `save`, also used by `load` to repair a recovered
-   * generation. Never rotates the backup — the caller decides that. */
-  private republish(map: Map<string, string>): void {
+  /** The current main generation's bytes, or null if absent or unusable.
+   *
+   * Returning null for a corrupt main is what keeps a bad generation out of the
+   * backup — rotating an unvalidated main is how a backup gets destroyed in
+   * exactly the situation it exists for. (Codex round 1, High.) */
+  private readValidMain(): string | null {
+    let text: string
+    try {
+      text = fs.readFileSync(this.file, 'utf8')
+    } catch {
+      return null // no main yet
+    }
+    if (!parseMap(text)) {
+      console.warn('[wechat] 主会话映射不可读,保留现有备份不覆盖')
+      return null
+    }
+    return text
+  }
+
+  /** Publish a map as the new main generation. Returns whether it landed.
+   *
+   * Also used by `load` to repair a generation recovered from `.bak`. Never
+   * touches the backup — the caller decides that. */
+  private republish(map: Map<string, string>): boolean {
     const tmp = `${this.file}.${process.pid}.tmp`
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 })
       writeFileDurable(tmp, JSON.stringify(Object.fromEntries(map), null, 2))
       fs.renameSync(tmp, this.file)
       fsyncDir(path.dirname(this.file)) // make the rename itself durable
+      return true
     } catch (err) {
       try {
         fs.unlinkSync(tmp)
@@ -101,60 +140,54 @@ export class FileSessionStore implements SessionStore {
         /* already gone */
       }
       console.error('[wechat] 保存会话映射失败:', err instanceof Error ? err.message : err)
+      return false
     }
   }
 
-  /** Promote the current main file to `.bak` — but ONLY if it parses.
+  /** Record the generation that was just replaced as the rollback copy.
    *
-   * Rotating an unvalidated main is how a backup gets destroyed in exactly the
-   * situation it exists for (Codex round 1, High).
-   *
-   * The copy itself goes through a temp + rename for the same reason the main
-   * write does: `copyFileSync` truncates the destination first, so a failure
-   * partway leaves `.bak` damaged AND lets the save proceed — one interrupted
-   * copy and there is nothing left to recover from. (Codex round 2, Medium.) */
-  private rotateBackupIfValid(): void {
-    let text: string
-    try {
-      text = fs.readFileSync(this.file, 'utf8')
-    } catch {
-      return // no main yet (first save) — nothing to back up
-    }
-    if (!parseMap(text)) {
-      console.warn('[wechat] 主会话映射不可读,保留现有备份不覆盖')
-      return
-    }
+   * Goes through a temp + rename for the same reason the main write does:
+   * `copyFileSync` truncates the destination first, so a failure partway would
+   * leave `.bak` damaged. (Codex round 2, Medium.) */
+  private writeBackup(text: string): void {
     const tmp = `${this.bak}.${process.pid}.tmp`
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 })
       writeFileDurable(tmp, text)
       fs.renameSync(tmp, this.bak)
     } catch (err) {
-      // The old .bak is still intact — the temp never made it over. Say so:
-      // silently continuing would leave the operator believing there is a
-      // backup generation behind the one about to be written.
       try {
         fs.unlinkSync(tmp)
       } catch {
         /* already gone */
       }
+      // The previous `.bak` is untouched — the temp never made it over. It is
+      // now two generations behind instead of one. Say so: an operator who
+      // thinks there is a fallback and finds a stale one is worse off than one
+      // who was told.
       console.warn(
-        '[wechat] 备份轮转失败,保留上一代备份(本次写入不会有对应的回退代):',
+        '[wechat] 备份轮转失败,回退副本仍停留在更早的一代:',
         err instanceof Error ? err.message : err,
       )
     }
   }
 
-  /** Remove temps this store left behind that no longer belong to a live write.
+  /** Remove temps this store left behind that no longer belong to any write.
    *
    * A SIGKILL or power cut bypasses `republish`'s cleanup, so without this one
-   * orphan accumulates per crashed PID, forever. Only files matching this
-   * store's own basename pattern are touched, and never the current process's
-   * temp — a concurrent write of ours must not be deleted out from under it. */
+   * orphan accumulates per crashed PID, forever.
+   *
+   * AGE is the ownership test, not PID. The first version of this used "a
+   * different PID means an orphan", which is wrong and was a REGRESSION: a
+   * second bridge process starting up would delete the temp a running one was
+   * mid-write on, making its rename fail and dropping that update — a failure
+   * mode that did not exist before this branch. (Codex round 3, blocking.)
+   *
+   * A write here takes milliseconds. Anything still sitting after an hour
+   * belongs to a process that is not coming back, whatever its PID says — and
+   * PIDs are reused, so they cannot answer the question at all. */
   private sweepTemps(): void {
     const dir = path.dirname(this.file)
     const base = path.basename(this.file)
-    const mine = `${base}.${process.pid}.tmp`
     let entries: string[]
     try {
       entries = fs.readdirSync(dir)
@@ -162,12 +195,15 @@ export class FileSessionStore implements SessionStore {
       return // directory not there yet — nothing to sweep
     }
     const pattern = new RegExp(`^${escapeRegExp(base)}(\\.bak)?\\.\\d+\\.tmp$`)
+    const cutoff = Date.now() - TEMP_ORPHAN_AGE_MS
     for (const name of entries) {
-      if (name === mine || !pattern.test(name)) continue
+      if (!pattern.test(name)) continue
+      const full = path.join(dir, name)
       try {
-        fs.unlinkSync(path.join(dir, name))
+        if (fs.statSync(full).mtimeMs > cutoff) continue // possibly a live write
+        fs.unlinkSync(full)
       } catch {
-        /* another process may have just removed it */
+        /* vanished, or another process got there first */
       }
     }
   }
