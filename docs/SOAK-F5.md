@@ -74,7 +74,7 @@ pnpm --filter @agent24/wechat-bridge start   # 扫码
   - `agent msg` → `cat ~/.agent24/nostr-bridge-health-<identity>.json`，`last_error` 为 null 且 `canaries.sent` 在涨（canary 就是走这条命令发的）。
   - `profile publish` → 看桥的启动日志里有没有 `[nostr] ✅ 已注册能力,发布到 N 个 relay`；失败会打 `[nostr] 注册失败`。**它不会写进健康快照的 `last_error`**（那个字段只来自活性探针），所以别用它证明注册成功。
 
-- **泡测的 daemon 要关掉桌面通知和自动回复**：`hyphae daemon --notify=false --auto-reply=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
+- **泡测的 daemon 要关掉桌面通知和自动回复**：`hyphae daemon --notify=false --auto-reply=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音（按 5 分钟一发算；若把 `A24_NOSTR_CANARY_MS` 调小，次数按比例上升）；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
 
 - **桥和 daemon 必须watch 同一个 relay**。`hyphae daemon --relay X` 而桥 `A24_NOSTR_RELAY=Y` 的话，canary 发出去没人收 → 一直 `degraded`，而且症状和"通路真的死了"完全一样。
 

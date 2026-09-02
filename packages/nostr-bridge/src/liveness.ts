@@ -234,6 +234,9 @@ export class InboundLiveness {
   private tickTimer?: ReturnType<typeof setTimeout>
   /** Canary sends on their OWN continuously-jittered deadline — see `armCanary`. */
   private canaryTimer?: ReturnType<typeof setTimeout>
+  /** Monotonic deadline the canary timer is currently armed for, so `beat` can
+   * tell whether pulling it in would actually be earlier. */
+  private canaryDueAt: number | null = null
   private started = false
   private stopped = false
   private beating = false
@@ -359,7 +362,9 @@ export class InboundLiveness {
   private armCanary(delay: number): void {
     if (this.stopped) return
     if (this.canaryTimer) clearTimeout(this.canaryTimer)
-    this.canaryTimer = setTimeout(() => void this.canaryTurn(), safeDelay(delay))
+    const d = safeDelay(delay)
+    this.canaryDueAt = this.o.now() + d
+    this.canaryTimer = setTimeout(() => void this.canaryTurn(), d)
   }
 
   private async canaryTurn(): Promise<void> {
@@ -451,6 +456,17 @@ export class InboundLiveness {
     const now = this.o.now()
     this.expire(now)
     this.judge(now)
+    // Pull the canary deadline IN when one goes overdue. Without this the fast
+    // re-probe would never happen: the delay is computed once, right after a
+    // send, when nothing can be overdue yet. Only ever moves the deadline
+    // earlier — re-arming unconditionally would push it out on every tick and
+    // starve the probe.
+    if (!this.stopped && this.hasOverdueCanary(now)) {
+      const accelerated = this.jittered(Math.max(1_000, Math.round(this.o.canaryIntervalMs / 3)))
+      if (this.canaryDueAt === null || this.canaryDueAt - now > accelerated) {
+        this.armCanary(accelerated)
+      }
+    }
     this.persist(now)
   }
 
@@ -464,9 +480,32 @@ export class InboundLiveness {
 
   /** ±20% so the canary cadence cannot phase-lock with the daemon's fixed 30s
    * watch cycle (see the header — that lock is what turns an occasional lost
-   * probe into a permanent false alarm). */
-  private jittered(): number {
-    return Math.round(this.o.canaryIntervalMs * (0.8 + this.o.rand() * 0.4))
+   * probe into a permanent false alarm).
+   *
+   * Takes the base as a PARAMETER because every branch of `nextDelay` has to go
+   * through it. An un-jittered branch is not a smaller version of the same
+   * defence, it is a hole in it: a constant delay locks to the daemon's cycle
+   * whenever it is a multiple of 30s, which `interval/3` is for any interval
+   * divisible by 90s (15min, 4.5min, 3min are all natural choices). */
+  private jittered(baseMs: number): number {
+    return Math.round(baseMs * (0.8 + this.o.rand() * 0.4))
+  }
+
+  /** How long a published canary may be outstanding before we call it overdue.
+   * The daemon watches on a 30s cycle with a 3s subscribe window, so a healthy
+   * round trip can legitimately take ~35s; anything under that would call every
+   * canary overdue the instant it is sent. */
+  private overdueAfterMs(): number {
+    return Math.max(60_000, this.o.tickMs * 2)
+  }
+
+  /** Is a canary we published late coming back? */
+  private hasOverdueCanary(now: number): boolean {
+    const limit = this.overdueAfterMs()
+    for (const c of this.outstanding.values()) {
+      if (c.published && now - c.at > limit) return true
+    }
+    return false
   }
 
   /** Delay until the next canary.
@@ -489,10 +528,20 @@ export class InboundLiveness {
       const factor = Math.min(2 ** this.consecutiveSendFailures, 8)
       return Math.min(this.o.canaryIntervalMs * factor, 30 * 60_000)
     }
-    let published = 0
-    for (const c of this.outstanding.values()) if (c.published) published++
-    if (published > 0) return Math.max(1_000, Math.round(this.o.canaryIntervalMs / 3))
-    return this.jittered()
+    // OVERDUE, not merely outstanding. Keying on "outstanding" made this branch
+    // fire on every single turn — `canaryTurn` arms the next timer immediately
+    // after a successful send, and the canary it just sent is outstanding and
+    // published at that moment. The consequences were both real and both
+    // measured: the cadence was silently `interval/3` (3× the configured rate),
+    // and because that value is a CONSTANT the phase lock this whole mechanism
+    // exists to defend against came straight back for any interval divisible by
+    // 90s. The default 5min escaped it by arithmetic luck (100s mod 30s = 10s
+    // rotates), not by design — and 15min, a natural choice for a 7-day soak,
+    // was locked solid.
+    if (this.hasOverdueCanary(this.o.now())) {
+      return this.jittered(Math.max(1_000, Math.round(this.o.canaryIntervalMs / 3)))
+    }
+    return this.jittered(this.o.canaryIntervalMs)
   }
 
   /** A canary out longer than the staleness window is never coming back; stop

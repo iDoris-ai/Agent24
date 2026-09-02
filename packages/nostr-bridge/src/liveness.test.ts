@@ -817,6 +817,142 @@ describe('InboundLiveness — 发送相位必须真的会漂移(H-1)', () => {
   })
 })
 
+describe('InboundLiveness — 抖动必须真的落到定时器上', () => {
+  /** Collect every delay handed to setTimeout while driving the real chain. */
+  async function armedDelays(opts: {
+    intervalMs: number
+    turns: number
+    rand: () => number
+    /** Reserved: the fixture never returns canaries, so every turn after the
+     * first sees an overdue one. Named so the intent is explicit at call sites. */
+    deliver?: boolean
+  }) {
+    vi.useFakeTimers()
+    const delays: number[] = []
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      fn: () => void,
+      ms?: number,
+    ) => {
+      delays.push(ms ?? 0)
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout)
+    try {
+      const fake = new FakeSpeaker()
+      let seq = 0
+      const sentAt: number[] = []
+      let clock = 0
+      const speaker = new SpeakerClient(async (a) => {
+        if (a[0] === 'agent' && a[1] === 'msg') {
+          sentAt.push(clock)
+          fake.sendResult = {
+            event_id: (++seq).toString(16).padStart(64, '0'),
+            published_to: 1,
+          }
+        }
+        return fake.runner(a)
+      }, { identity: 'agent24' })
+      const liveness = new InboundLiveness({
+        speaker,
+        identity: 'agent24',
+        resolveSelfNpub: () => speaker.npubFor('agent24'),
+        canaryIntervalMs: opts.intervalMs,
+        staleAfterMs: opts.intervalMs * 3,
+        tickMs: 30_000,
+        now: () => clock,
+        rand: opts.rand,
+        log: { log: () => {}, warn: () => {}, error: () => {} },
+      })
+      await liveness.start()
+      const canaryOnly = () => delays.filter((d) => d !== 30_000)
+      for (let i = 0; i < opts.turns; i++) {
+        // Advance by whatever the probe was just armed for, then take that turn.
+        const armed = canaryOnly()[canaryOnly().length - 1] ?? 0
+        clock += armed
+        await (liveness as unknown as { canaryTurn: () => Promise<void> }).canaryTurn()
+      }
+      liveness.stop()
+      return { delays: canaryOnly(), sentAt }
+    } finally {
+      spy.mockRestore()
+      vi.useRealTimers()
+    }
+  }
+
+  it('① 健康路径下的布防延迟必须落在 [0.8×, 1.2×] 区间内', async () => {
+    // The bug this pins: `jittered()` was dead code. `canaryTurn` armed the next
+    // timer straight after a successful send, and the just-sent canary made the
+    // "accelerate" branch true every single time — so every delay was the
+    // constant interval/3 and the jitter band was never entered. Measured 18/18
+    // at 100000 with a band of [240000,360000].
+    let i = 0
+    const seq = [0.1, 0.9, 0.35, 0.62, 0.48, 0.77]
+    const { delays } = await armedDelays({
+      intervalMs: 300_000,
+      turns: 12,
+      rand: () => seq[i++ % seq.length]!,
+    })
+    const inBand = delays.filter((d) => d >= 240_000 && d <= 360_000)
+    expect(inBand.length).toBeGreaterThan(0)
+  })
+
+  it('② 延迟不能全部相等(抖动改成常数时这格必须红)', async () => {
+    let i = 0
+    const seq = [0.1, 0.9, 0.35, 0.62, 0.48, 0.77]
+    const { delays } = await armedDelays({
+      intervalMs: 300_000,
+      turns: 12,
+      rand: () => seq[i++ % seq.length]!,
+    })
+    expect(new Set(delays).size).toBeGreaterThan(1)
+  })
+
+  it('③ interval 能被 90s 整除时,发送时刻 mod 30s 仍必须不止一个值', async () => {
+    // THE decisive case, and the one the default value hides: with a 15-minute
+    // interval the old constant `interval/3` is exactly 300s — a multiple of the
+    // daemon's 30s watch cycle — so the phase never moved. 5 minutes escaped
+    // only by arithmetic luck (100s mod 30s = 10s rotates), not by design.
+    let i = 0
+    const seq = [0.13, 0.87, 0.41, 0.66, 0.29, 0.94]
+    const { sentAt } = await armedDelays({
+      intervalMs: 15 * 60_000,
+      turns: 12,
+      rand: () => seq[i++ % seq.length]!,
+    })
+    const phases = new Set(sentAt.map((t) => t % 30_000))
+    // ≥3, not >1: a single jittered first arm already produces two distinct
+    // phases even when every delay after it is constant. What has to hold is
+    // that the phase keeps MOVING.
+    expect(phases.size).toBeGreaterThanOrEqual(3)
+  })
+
+  it('④ 加速分支自己也必须抖 —— 它才是常见配置下锁死的那一支', async () => {
+    // The healthy path never enters the accelerate branch, so ①–③ cannot see
+    // whether IT is jittered. With canaries that never come back, every turn
+    // after the first takes that branch: if it returns a constant, those delays
+    // are all equal and — at 15 min — an exact multiple of the daemon cycle.
+    let i = 0
+    const seq = [0.13, 0.87, 0.41, 0.66, 0.29, 0.94]
+    const opts_interval = 15 * 60_000
+    const { delays } = await armedDelays({
+      intervalMs: opts_interval,
+      turns: 12,
+      rand: () => seq[i++ % seq.length]!,
+      deliver: false,
+    })
+    // Selected by VALUE, not by position: delays[0] is the startup arm and
+    // delays[1] is still the normal branch (nothing can be overdue right after
+    // the first send). Slicing by index left a normal-branch value in the set,
+    // so its size was 2 even when every accelerated delay was identical.
+    // Both by position and by value: `slice(1)` drops the startup arm (a random
+    // few-hundred-ms value that would otherwise land in the set and make its
+    // size 2 even when every accelerated delay is identical), and the value
+    // filter keeps only the accelerated branch.
+    const accelerated = delays.slice(1).filter((d) => d <= opts_interval / 2)
+    expect(accelerated.length).toBeGreaterThan(2)
+    expect(new Set(accelerated).size).toBeGreaterThan(1)
+  })
+})
+
 describe('InboundLiveness — 定时器边界(M-4)', () => {
   it('间隔顶到上限时,递给 setTimeout 的延迟不能越界', async () => {
     // durationMs() clamps the CONFIG to 2^31-1, but jitter multiplies by up to
@@ -1064,10 +1200,18 @@ describe('InboundLiveness — 断网时不能自己制造洪水(M-1)', () => {
     expect(nextDelayOf(liveness)).toBeGreaterThan(CANARY_MS)
   })
 
-  it('发布成功但没回来 → 才加速重探', async () => {
+  it('发布成功但**过期**没回来 → 才加速重探(刚发出去的不算)', async () => {
     const h = harness({ loseCanaries: true })
     await h.boot()
     await h.probe()
+    // Just sent: NOT a reason to speed up. Keying on "outstanding" instead of
+    // "overdue" made this branch fire on every turn, which silently tripled the
+    // cadence and — because interval/3 is a constant — brought the phase lock
+    // back. See the header note on `nextDelay`.
+    expect(nextDelayOf(h.liveness)).toBeGreaterThanOrEqual(Math.round(CANARY_MS * 0.8))
+
+    // Overdue (past a couple of daemon watch cycles): now it is evidence.
+    h.advance(120_000)
     expect(nextDelayOf(h.liveness)).toBeLessThan(CANARY_MS)
   })
 
