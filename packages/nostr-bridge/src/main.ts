@@ -73,6 +73,7 @@ async function main(): Promise<void> {
         resolveSelfNpub: () => speaker.npubFor(CONFIG.IDENTITY),
         canaryIntervalMs: CONFIG.CANARY_INTERVAL_MS,
         staleAfterMs: CONFIG.LIVENESS_STALE_MS,
+        tickMs: CONFIG.LIVENESS_TICK_MS,
         encrypt: CONFIG.CANARY_ENCRYPT,
         healthFile: CONFIG.HEALTH_FILE || undefined,
         context: {
@@ -130,26 +131,28 @@ async function main(): Promise<void> {
         )
       }
     }
-    // OUTSIDE the poll's try/catch, and reached on both paths: an outage that
-    // makes every poll throw is precisely when the liveness verdict matters. A
-    // beat must never be able to kill the loop either, hence its own catch.
-    if (liveness && !stopped) {
-      try {
-        await liveness.beat()
-      } catch (err) {
-        console.error('[nostr] 活性探针出错:', err instanceof Error ? err.message : err)
-      }
-    }
+    // NOTE: the liveness probe deliberately does NOT beat here. This loop awaits
+    // every inbound message's agent run to completion, and a run can take
+    // minutes — a probe riding it would be starved exactly when a backlog is
+    // being worked (health file stuck at a stale `ok` through a real outage) and
+    // would cry wolf on a healthy bridge that spent 15 minutes on two slow
+    // messages. It runs on its own timer with its own inbox read; see
+    // `InboundLiveness.start()`.
     if (!stopped) setTimeout(() => void tick(), CONFIG.POLL_INTERVAL_MS)
   }
 
   const shutdown = (): void => {
     console.log('\n[nostr] 停止中...')
     stopped = true
+    liveness?.stop()
     process.exit(0)
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
+
+  // Before the first poll: `observe()` recognises our own leftover canaries by
+  // sender, so the npub has to be resolved before any row reaches the handler.
+  if (liveness) await liveness.start()
 
   console.log(
     `[nostr] ✅ 桥已启动,每 ${CONFIG.POLL_INTERVAL_MS}ms 轮询入站` +

@@ -13,19 +13,24 @@
 // relay does `INSERT OR REPLACE` flip the row to `is_incoming=1`. `deliver()` is
 // the daemon doing its job; not calling it is the daemon's relay path being dead.
 //
-// MUTATION CHECKS (each one must turn the named test red):
+// MUTATION CHECKS (each one verified to turn the named test red):
 //   - `observe()`: drop the `outstanding.delete(...)` guard and confirm on any
-//     self-row → "一条 canary 只确认一次" goes green→red (a stale row in the
-//     window would re-prove liveness on every poll: permanent fail-open).
-//   - `judge()`: use `Date.now()` instead of the injected monotonic clock →
-//     nothing in this file can move time, so every staleness test fails.
-//   - `judge()`: seed `lastConfirmedAt` at construction instead of falling back
-//     to `startedAt` → "daemon 根本没起" still reports degraded, but
-//     "从未确认过 → 到点必须报死" stops distinguishing starting from ok.
-//   - `beat()`: send the canary before judging → "报死后仍然继续发 canary" is
-//     unaffected, but the degraded transition is delayed by one beat.
+//     self-row → "一条 canary 只确认一次" (a stale row in the window would
+//     re-prove liveness on every poll: permanent fail-open).
+//   - `observe()`: confirm on the event id alone, without comparing content →
+//     "canary 原路返回但内容不对(解密链路坏了)". The daemon stores messages it
+//     could NOT decrypt, so an id-only match calls a broken crypto path healthy.
 //   - `pollOnce`: pass the raw rows instead of `liveness.observe(rows)` →
-//     "canary 不会被当成对端消息处理" fails.
+//     "走真实 pollOnce".
+//   - `elapsed()`: drop `restoredGapMs` → "反复重启不能刷掉静默". A supervisor
+//     restarting the bridge inside the grace window would otherwise hide a dead
+//     path forever, and the soak's "never degraded" criterion would false-PASS.
+//   - `dueIn()`: always return `nextCanaryDelay` → "丢一条 canary 不足以报死".
+//   - `jittered()`: return the base interval unchanged → no test goes red, and
+//     that is stated honestly: the phase-lock it defends against is a property
+//     of the real daemon's 30s cycle, which no unit test here simulates. The
+//     hazard is pinned by "上游竞态:发布早于写出站行" instead, which asserts the
+//     loss is survivable rather than that jitter prevents it.
 
 import { describe, it, expect, vi } from 'vitest'
 import fs from 'node:fs'
@@ -42,7 +47,21 @@ const CANARY_MS = 60_000
 // Must clear the constructor's floor (2 × canary + 60s) or it gets clamped.
 const STALE_MS = 200_000
 
-function harness(opts: { staleAfterMs?: number; canaryIntervalMs?: number; healthFile?: string } = {}) {
+function harness(
+  opts: {
+    staleAfterMs?: number
+    canaryIntervalMs?: number
+    healthFile?: string
+    /** Model the upstream store race: the daemon writes is_incoming=1 first and
+     * the sending CLI then REPLACEs the row back to 0, losing the canary on a
+     * healthy system. See the module header / FU-33. */
+    loseCanaries?: boolean
+    /** Model a broken daemon decryption path: the row comes back under the right
+     * event id, but carrying ciphertext instead of what we sent. */
+    garbleContent?: boolean
+    wallStart?: number
+  } = {},
+) {
   const fake = new FakeSpeaker()
   let t = 0
   let seq = 0
@@ -72,6 +91,7 @@ function harness(opts: { staleAfterMs?: number; canaryIntervalMs?: number; healt
     error: (...a: unknown[]) => logs.push({ level: 'error', text: a.join(' ') }),
   }
 
+  const wallStart = opts.wallStart ?? 1_700_000_000_000
   const liveness = new InboundLiveness({
     speaker,
     identity: 'agent24',
@@ -80,7 +100,8 @@ function harness(opts: { staleAfterMs?: number; canaryIntervalMs?: number; healt
     staleAfterMs: opts.staleAfterMs ?? STALE_MS,
     healthFile: opts.healthFile,
     now: () => t,
-    wallNow: () => 1_700_000_000_000 + t,
+    wallNow: () => wallStart + t,
+    rand: () => 0.5, // no jitter, so the tests' timing arithmetic stays exact
     log,
   })
 
@@ -93,22 +114,28 @@ function harness(opts: { staleAfterMs?: number; canaryIntervalMs?: number; healt
     advance: (ms: number) => {
       t += ms
     },
+    /** Resolve the npub and read any previous health file, then cancel the
+     * probe's real timer — the tests drive `beat()` by hand. */
+    boot: async () => {
+      await liveness.start()
+      liveness.stop()
+    },
     /** The daemon pulls the in-flight canaries off the relay: the local row
      * flips to is_incoming=1 and becomes visible to `history inbox`. */
     deliver: () => {
       for (const c of inFlight.splice(0)) {
+        if (opts.loseCanaries) continue // the row exists, but stuck at is_incoming=0
         fake.inboxRows.push({
           id: c.id,
           sender_npub: SELF,
-          plaintext: c.content,
+          plaintext: opts.garbleContent ? 'AhkP2s+ciphertext-we-cannot-read' : c.content,
           created_at: Math.floor(t / 1000),
           is_incoming: true,
         })
       }
     },
-    /** One full poll+beat cycle, the way main.ts runs it. */
+    /** One probe beat (reads the inbox itself — see InboundLiveness.start). */
     cycle: async () => {
-      liveness.observe(await speaker.inbox())
       await liveness.beat()
     },
   }
@@ -129,6 +156,7 @@ describe('InboundLiveness — 区分「收件箱为空」和「入站通路已�
 
   it('通路健康:canary 往返 → ok', async () => {
     const h = harness()
+    await h.boot()
     await h.cycle() // sends canary #1
     expect(h.liveness.current).toBe('starting')
 
@@ -227,6 +255,25 @@ describe('InboundLiveness — 什么不算证据(fail-closed)', () => {
     expect(h.liveness.current).toBe('degraded')
   })
 
+  it('canary 原路返回但内容不对(解密链路坏了)= 不是确认', async () => {
+    // The daemon calls StoreIncomingMessage even when NIP-44 decryption fails
+    // (daemon.go:358-368), so the row comes back under the right event id
+    // carrying ciphertext. Matching on the id alone would call that healthy —
+    // while real peer messages are reaching the agent as unreadable ciphertext.
+    const h = harness({ garbleContent: true })
+    await h.boot()
+    await h.cycle()
+    h.deliver()
+    h.advance(1_000)
+    await h.cycle()
+
+    expect(h.liveness.current).not.toBe('ok')
+    expect(h.liveness.snapshot().last_error).toContain('解密')
+    h.advance(STALE_MS + 1)
+    await h.cycle()
+    expect(h.liveness.current).toBe('degraded')
+  })
+
   it('canary 发送超时被杀 = 状态未知,不是确认', async () => {
     const fake = new FakeSpeaker()
     let t = 0
@@ -277,6 +324,26 @@ describe('InboundLiveness — 什么不算证据(fail-closed)', () => {
     t += STALE_MS + 1
     await liveness.beat()
     expect(liveness.current).toBe('degraded')
+  })
+})
+
+describe('InboundLiveness — 已知的上游竞态(FU-33)必须是可幸存的', () => {
+  it('上游竞态:发布早于写出站行 → 丢一条 canary,但一条不足以报死', async () => {
+    // hyphae publishes BEFORE storing the outgoing row (agent.go:208-238). If
+    // the daemon is inside its 3s subscribe window it writes is_incoming=1 first
+    // and the sending CLI then REPLACEs the row back to 0 — while the daemon's
+    // `seen` set now holds the id and will never revisit it. The canary is lost
+    // on a perfectly healthy system, so a single loss must not be able to walk
+    // us to the threshold: the probe re-sends sooner while anything is
+    // outstanding, instead of waiting out the full interval.
+    const h = harness({ loseCanaries: true })
+    await h.boot()
+    await h.cycle() // canary #1 — will be lost
+
+    h.advance(Math.round(CANARY_MS / 3) + 1)
+    await h.cycle() // re-probe fires early because #1 is still outstanding
+    expect(h.liveness.current).not.toBe('degraded')
+    expect(h.inFlight.length + h.liveness.snapshot().canaries.lost).toBeGreaterThan(1)
   })
 })
 
@@ -331,6 +398,69 @@ describe('InboundLiveness — 探针不能污染业务路径', () => {
 
     expect(prompts).toEqual(['hello'])
     expect(prompts.some((p) => p.includes(CANARY_PREFIX))).toBe(false)
+  })
+
+  it('授权对端发以 marker 开头的消息不会被吞掉', async () => {
+    // Recognising our own traffic by its marker text (rather than by sender)
+    // would let any peer silence themselves by prefixing their message.
+    const h = harness()
+    await h.boot()
+    h.fake.inboxRows.push({
+      id: 'beef'.repeat(16),
+      sender_npub: 'npub1peer',
+      plaintext: `${CANARY_PREFIX} 我就是要用这个前缀说话`,
+      created_at: 3,
+      is_incoming: true,
+    })
+    const peers = h.liveness.observe(await h.speaker.inbox())
+    expect(peers.map((p) => p.from)).toEqual(['npub1peer'])
+  })
+
+  it('判定先于发送:canary 发送卡住时,状态已经判过了', async () => {
+    // `beat()` judges before it sends. If it sent first, a canary send sitting
+    // on its 60s deadline would delay the verdict by a whole tick — during an
+    // outage, which is when the verdict is the entire point.
+    const fake = new FakeSpeaker()
+    let t = 0
+    let release!: () => void
+    let entered!: () => void
+    const blocked = new Promise<void>((r) => {
+      release = r
+    })
+    // Resolved the moment the canary send is entered, so the assertion below
+    // waits on the real thing instead of counting microtasks.
+    const sendStarted = new Promise<void>((r) => {
+      entered = r
+    })
+    const speaker = new SpeakerClient(
+      async (args) => {
+        if (args[0] === 'agent' && args[1] === 'msg') {
+          entered()
+          await blocked
+          return fake.runner(args)
+        }
+        return fake.runner(args)
+      },
+      { identity: 'agent24' },
+    )
+    const liveness = new InboundLiveness({
+      speaker,
+      identity: 'agent24',
+      resolveSelfNpub: () => speaker.npubFor('agent24'),
+      canaryIntervalMs: CANARY_MS,
+      staleAfterMs: STALE_MS,
+      now: () => t,
+      rand: () => 0.5,
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    t = STALE_MS + 1
+    const beating = liveness.beat() // will block inside sendCanary
+    await sendStarted
+    // The verdict is already in, with the send still hanging.
+    expect(liveness.current).toBe('degraded')
+    release()
+    await beating
   })
 
   it('对端消息原样放行', async () => {
@@ -389,6 +519,60 @@ describe('InboundLiveness — 运维面', () => {
       expect(
         (JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>).state,
       ).toBe('degraded')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('反复重启不能刷掉静默:supervisor 每几分钟拉一次也必须报死', async () => {
+    // The soak criterion is "state never became degraded". If each new process
+    // started its own grace period, a bridge that a supervisor restarts inside
+    // that window could never reach degraded — and a week with the inbound path
+    // dead the whole time would report a clean PASS.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      let wall = 1_700_000_000_000
+      for (let restart = 0; restart < 4; restart++) {
+        const h = harness({ healthFile: file, wallStart: wall })
+        await h.boot()
+        await h.cycle() // sends a canary; the daemon never returns it
+        h.advance(60_000) // this process lives one minute, then is restarted
+        await h.cycle()
+        wall += 60_000
+        if (restart === 3) {
+          // 4 minutes of process time, but ~4 minutes of accumulated silence too.
+          expect(h.liveness.snapshot().seconds_since_confirmed).toBeGreaterThanOrEqual(180)
+        }
+      }
+      // One more restart, this time after enough total silence to cross it.
+      wall += STALE_MS
+      const last = harness({ healthFile: file, wallStart: wall })
+      await last.boot()
+      await last.cycle()
+      expect(last.liveness.current).toBe('degraded')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('重启继承的是静默,不是报警:上一轮健康的话新进程不误报', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      const first = harness({ healthFile: file })
+      await first.boot()
+      await first.cycle()
+      first.deliver()
+      first.advance(1_000)
+      await first.cycle()
+      expect(first.liveness.current).toBe('ok')
+
+      // Restarted 30s later — well inside the window.
+      const second = harness({ healthFile: file, wallStart: 1_700_000_000_000 + 31_000 })
+      await second.boot()
+      await second.cycle()
+      expect(second.liveness.current).not.toBe('degraded')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

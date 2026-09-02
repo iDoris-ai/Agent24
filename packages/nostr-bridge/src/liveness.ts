@@ -15,41 +15,68 @@
 // relay with nothing new. There is no last-seen to read. Adding one is an
 // upstream change in another repo (see FU-33).
 //
-// So we manufacture the signal instead, and it turns out the store already
-// discriminates for us for free:
+// So we manufacture the signal instead, and the store already discriminates for
+// us for free:
 //
 //   1. the bridge sends a canary message TO ITS OWN npub through the same
 //      `agent-speaker` binary every other outbound message uses (G3 — the bridge
 //      never opens a relay socket of its own);
 //   2. the send stores an OUTGOING row keyed by the event id, `is_incoming=0`
-//      (agent.go:237 → StoreOutgoingMessage);
+//      (agent.go:238 → StoreOutgoingMessage);
 //   3. `speaker.inbox()` already drops `is_incoming === false` rows, so that
 //      row is invisible to us;
 //   4. when — and only when — the DAEMON pulls that same event back off the
 //      relay, `StoreIncomingMessage` REPLACEs the row on its primary key
 //      (`INSERT OR REPLACE`, message.go:34) and `is_incoming` flips to 1;
-//   5. the row appears in `inbox()`, carrying the event id we are holding.
+//   5. the row appears in `inbox()`, carrying the event id we are holding AND
+//      the plaintext we sent.
 //
-// Seeing our own canary come back therefore proves the WHOLE inbound path is
-// alive end to end: relay reachable, daemon running, daemon subscribing, daemon
-// decrypting, daemon writing, bridge reading. That is a POSITIVE signal, which
-// is the thing FU-32 says a timeout can never be.
+// Steps 2/4/5 are not inferred from reading that code — they were VERIFIED by
+// running it: a probe against the real upstream schema showed the outgoing row
+// landing with `is_incoming=0`, then the same event id REPLACING it (one row,
+// not two) with `is_incoming=1`, id equal to the 64-hex `event_id` that `agent
+// msg --json` returns. NIP-44 to one's own key round-trips too (checked against
+// `pkg/crypto`), so an encrypted canary is fine. FU-33 proposes contributing
+// that probe upstream so a refactor there cannot silently invalidate this.
+//
+// Seeing our own canary come back therefore proves the inbound path end to end:
+// relay reachable, daemon running, daemon subscribing, daemon DECRYPTING (we
+// compare the plaintext, not just the id — the daemon stores undecryptable
+// messages too, so an id-only match would call a broken crypto path healthy),
+// daemon writing, bridge reading. That is a POSITIVE signal, which is the thing
+// FU-32 says a timeout can never be.
 //
 // ── WHAT DELIBERATELY DOES *NOT* COUNT AS PROOF ─────────────────────────────
-// Only a canary THIS PROCESS SENT and is still holding an outstanding id for can
-// confirm, and each id confirms exactly once. Not: a canary recognised by its
-// text (an old one sitting in the inbox window would then re-prove liveness on
-// every poll, forever — a permanent fail-OPEN); not: an inbound peer message
-// (rows repeat across polls, so "a message is in the window" says nothing about
-// NOW). Fail-closed both ways: if the signal is ambiguous, it is not proof.
+// Only a canary THIS PROCESS SENT, still outstanding, arriving from our own
+// npub with the exact plaintext we sent, can confirm — and each id confirms
+// exactly once. Not: a canary recognised by its marker text (an old one sitting
+// in the inbox window would then re-prove liveness on every poll, forever — a
+// permanent fail-OPEN); not: an inbound peer message (rows repeat across polls,
+// so "a message is in the window" says nothing about NOW). If the signal is
+// ambiguous, it is not proof.
+//
+// ── THE KNOWN HAZARD THIS CANNOT FIX FROM HERE (FU-33) ──────────────────────
+// Upstream publishes to the relay BEFORE it stores the outgoing row
+// (agent.go:208-238). If the daemon happens to be inside its 3s subscribe window
+// it can receive the event and write `is_incoming=1` first, and then the sending
+// CLI's `INSERT OR REPLACE` puts the row back to 0 — while the daemon's `seen`
+// set now holds that id and will never process it again. The canary is then lost
+// on a perfectly healthy system. The reason this is not merely an occasional
+// dropped probe: a fixed 5-minute canary against the daemon's 30s cycle is an
+// exact multiple, so the two PHASE-LOCK, and an unlucky phase loses EVERY
+// canary. Hence `jitter` below — it is not decoration, it is what keeps a
+// correlated failure from becoming a permanent false alarm — plus a faster
+// re-probe while anything is outstanding, so one lost canary cannot walk us to
+// the staleness threshold. The real fix is upstream (store before publish, or
+// make `is_incoming` monotonic on upsert).
 
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { SpeakerTimeoutError, type InboundMessage, type SpeakerClient } from './speaker.js'
 
-/** Marks a canary in the message body. NOT used for matching (see the header) —
- * it exists so an operator reading their own inbox knows what these are. */
+/** Marks a canary in the message body. NOT used for matching — it exists so an
+ * operator reading their own inbox knows what these are. */
 export const CANARY_PREFIX = 'a24-liveness-canary'
 
 export type LivenessState =
@@ -63,8 +90,8 @@ export type LivenessState =
   | 'degraded'
 
 export interface LivenessOptions {
-  /** Drives the canary send — the same binary, the same relay flag as every
-   * other outbound call. */
+  /** Drives both the canary send and the probe's OWN inbox read — the same
+   * binary, the same relay flag as every other outbound call. */
   speaker: SpeakerClient
   /** The agent-speaker identity nickname to send as. */
   identity: string
@@ -72,15 +99,17 @@ export interface LivenessOptions {
    * be briefly unreadable at boot; until it resolves we stay `starting` and
    * eventually go `degraded` with the reason, rather than silently not probing. */
   resolveSelfNpub: () => Promise<string>
-  /** How often to emit a canary. */
+  /** How often to emit a canary (jittered ±20%, see the header). */
   canaryIntervalMs: number
   /** No confirmation for this long ⇒ degraded. */
   staleAfterMs: number
+  /** How often the probe wakes up. Independent of the poll loop on purpose. */
+  tickMs?: number
   /** NIP-44-encrypt the canary (default true) so the probe exercises the exact
-   * path peer traffic takes. Correctness does not depend on it: matching is by
-   * event id, so even a canary the daemon failed to decrypt still confirms. */
+   * path peer traffic takes — and so that comparing the returned plaintext
+   * actually tests the daemon's decryption. */
   encrypt?: boolean
-  /** Health snapshot path; empty disables the file. */
+  /** Health snapshot path; empty disables the file (and cross-restart memory). */
   healthFile?: string
   /** Static context recorded in the health file, for the operator. */
   context?: Record<string, unknown>
@@ -89,16 +118,20 @@ export interface LivenessOptions {
    * for hours, in exactly the unattended run it exists for (the same reasoning
    * as the log-gap cap in `main.ts`). */
   now?: () => number
-  /** Wall clock, for human-readable timestamps in the health file only. */
+  /** Wall clock. Used ONLY for timestamps and for carrying the silence across a
+   * restart — never for the staleness decision itself. */
   wallNow?: () => number
+  /** [0,1) source for the jitter. Injectable so tests are deterministic. */
+  rand?: () => number
   log?: Pick<Console, 'log' | 'warn' | 'error'>
 }
 
-/** What the health file carries. Written for humans and `jq`, not for us. */
+/** What the health file carries. Written for humans and `jq` — and read back by
+ * the next process, so the silence survives a restart (see `restore`). */
 export interface LivenessSnapshot {
   state: LivenessState
   updated_at: string
-  /** null until the first canary returns. */
+  /** null until a canary has ever come back. */
   last_confirmed_at: string | null
   seconds_since_confirmed: number
   canaries: { sent: number; confirmed: number; lost: number; outstanding: number }
@@ -112,25 +145,36 @@ const DEGRADED_RELOG_MS = 60 * 60 * 1000
 /** Rewrite an unchanged health file at most this often. */
 const HEALTH_WRITE_MS = 60 * 1000
 
+interface Outstanding {
+  at: number
+  /** Exactly what we sent, so the round trip proves decryption too. */
+  content: string
+}
+
 export class InboundLiveness {
   private readonly o: Required<
-    Pick<LivenessOptions, 'canaryIntervalMs' | 'staleAfterMs' | 'encrypt' | 'now' | 'wallNow' | 'log'>
+    Pick<
+      LivenessOptions,
+      'canaryIntervalMs' | 'staleAfterMs' | 'tickMs' | 'encrypt' | 'now' | 'wallNow' | 'rand' | 'log'
+    >
   > &
     LivenessOptions
 
   private selfNpub?: string
   private readonly startedAt: number
   private lastConfirmedAt: number | null = null
+  private lastConfirmedWall: number | null = null
+  /** Silence inherited from the previous process (see `restore`). Without it a
+   * supervisor that restarts the bridge every few minutes would hand each new
+   * process a fresh grace period and `degraded` could never be reached. */
+  private restoredGapMs = 0
   private lastCanaryAt = -Infinity
-  /** event id → monotonic send time. Bounded by staleAfterMs/canaryIntervalMs. */
-  private readonly outstanding = new Map<string, number>()
+  private nextCanaryDelay: number
+  private readonly outstanding = new Map<string, Outstanding>()
   private state: LivenessState = 'starting'
   /** Silence between the previous confirmation and the one that just landed —
-   * captured in `observe()` BEFORE `lastConfirmedAt` moves. The recovery message
-   * needs it: computing the outage from `lastConfirmedAt` afterwards prints
-   * "中断约 0s" for every outage however long, and computing it from when we
-   * entered `degraded` under-reports it by the whole staleness window. What an
-   * operator wants is how long messages were actually not getting through. */
+   * captured BEFORE `lastConfirmedAt` moves, because the recovery message has to
+   * report how long messages were actually not getting through. */
   private lastGapMs = 0
   private sent = 0
   private confirmed = 0
@@ -139,6 +183,9 @@ export class InboundLiveness {
   private lastDegradedLogAt = -Infinity
   private lastHealthWriteAt = -Infinity
   private lastHealthState?: LivenessState
+  private timer?: ReturnType<typeof setTimeout>
+  private stopped = false
+  private beating = false
 
   constructor(opts: LivenessOptions) {
     const log = opts.log ?? console
@@ -157,12 +204,15 @@ export class InboundLiveness {
       ...opts,
       canaryIntervalMs: opts.canaryIntervalMs,
       staleAfterMs: stale,
+      tickMs: opts.tickMs ?? Math.min(30_000, opts.canaryIntervalMs),
       encrypt: opts.encrypt ?? true,
       now: opts.now ?? (() => performance.now()),
       wallNow: opts.wallNow ?? (() => Date.now()),
+      rand: opts.rand ?? Math.random,
       log,
     }
     this.startedAt = this.o.now()
+    this.nextCanaryDelay = this.jittered()
   }
 
   /** Current state — for tests and for whoever wants to gate on it. */
@@ -170,52 +220,139 @@ export class InboundLiveness {
     return this.state
   }
 
-  /** Called with every inbox read. Confirms liveness from any canary we are
-   * holding, and returns the messages that are real peer traffic.
+  /** Resolve our own npub and pick up where the previous process left off, then
+   * start the probe's own timer.
    *
-   * Every row sent by US is dropped, not just the ones still outstanding: a
-   * canary from an earlier run (or one that returned after we gave up on it)
-   * would otherwise be handed to the inbound handler as if a peer had sent it. */
+   * The probe runs on its OWN clock, NOT inside the poll loop, and does its own
+   * inbox read. That is load-bearing: `pollOnce` awaits every inbound message's
+   * agent run to completion, and a run can take many minutes, so a probe riding
+   * the poll loop would be starved exactly when a backlog is being worked — the
+   * health file would sit at a stale `ok` for hours during a real outage, and a
+   * healthy bridge working two slow messages would cross the staleness threshold
+   * and cry wolf. */
+  async start(): Promise<void> {
+    this.restore()
+    try {
+      this.selfNpub = await this.o.resolveSelfNpub()
+    } catch (err) {
+      // Not fatal and not silent: recorded, retried on every canary send, and it
+      // walks us to `degraded` on its own if it never succeeds.
+      this.lastError = `无法解析本机 npub(${err instanceof Error ? err.message : String(err)})`
+      this.o.log.warn(`[nostr] ⚠️  活性探针:${this.lastError};将重试。`)
+    }
+    this.schedule()
+  }
+
+  stop(): void {
+    this.stopped = true
+    if (this.timer) clearTimeout(this.timer)
+  }
+
+  private schedule(): void {
+    if (this.stopped) return
+    this.timer = setTimeout(() => void this.loop(), this.o.tickMs)
+  }
+
+  private async loop(): Promise<void> {
+    if (this.stopped) return
+    // Re-entrancy guard: a canary send can sit on its 60s deadline, which is
+    // longer than a tick.
+    if (!this.beating) {
+      this.beating = true
+      try {
+        await this.beat()
+      } catch (err) {
+        this.o.log.error('[nostr] 活性探针出错:', err instanceof Error ? err.message : err)
+      } finally {
+        this.beating = false
+      }
+    }
+    this.schedule()
+  }
+
+  /** Called with every inbox read — the probe's own, and `pollOnce`'s. Confirms
+   * liveness from a canary we are holding, and returns the messages that are
+   * real peer traffic. */
   observe(msgs: InboundMessage[]): InboundMessage[] {
     const peers: InboundMessage[] = []
     for (const m of msgs) {
-      if (m.event_id && this.outstanding.delete(m.event_id)) {
+      const pending = m.event_id ? this.outstanding.get(m.event_id) : undefined
+      if (pending) {
+        this.outstanding.delete(m.event_id!)
+        if (m.content !== pending.content) {
+          // It came back, but not as what we sent. The daemon stores messages it
+          // could not decrypt (daemon.go:358-368), so this is the shape of a
+          // broken crypto path — under which real peer messages reach the agent
+          // as ciphertext. Emphatically not a confirmation.
+          this.lost += 1
+          this.lastError =
+            'canary 原路返回但内容不是我们发出的明文 —— daemon 的解密链路可能已坏(对端消息会以密文进来)'
+          continue
+        }
         const now = this.o.now()
         this.confirmed += 1
-        this.lastGapMs = now - (this.lastConfirmedAt ?? this.startedAt)
+        this.lastGapMs = this.elapsed(now)
         this.lastConfirmedAt = now
+        this.lastConfirmedWall = this.o.wallNow()
         continue
       }
-      // Dropped, never confirmed. Two independent recognisers because
-      // `selfNpub` is only resolved on the first canary send, so on the very
-      // first poll of a process it is still unset — and that is exactly the poll
-      // that sees the canaries the PREVIOUS process left in the window. Matching
-      // the marker text is safe HERE and nowhere else: the worst a peer can do
-      // by putting the marker in their own message is get it ignored.
+      // Dropped, never confirmed: a canary from an earlier run, or one that came
+      // back after we gave up on it, must not be handed to the inbound handler
+      // as if a peer had sent it. Matched on SENDER, not on the marker text — a
+      // text match would also swallow a legitimate peer message that happened to
+      // start with the marker.
       if (this.selfNpub && m.from === this.selfNpub) continue
-      if (m.content.startsWith(CANARY_PREFIX)) continue
       peers.push(m)
     }
     return peers
   }
 
-  /** One beat of the probe: expire, judge, log, send, persist. Called once per
-   * poll tick — INCLUDING ticks where the poll itself threw, because an outage
-   * that makes every poll throw is exactly when the operator needs the verdict. */
+  /** One beat: read the inbox, confirm, judge, log, probe, persist. */
   async beat(): Promise<void> {
+    try {
+      this.observe(await this.o.speaker.inbox())
+    } catch (err) {
+      // A failed read is not evidence of anything either way — but it must not
+      // skip the judgement below, which is the whole point of this method.
+      this.lastError = `读收件箱失败:${err instanceof Error ? err.message : String(err)}`
+    }
     const now = this.o.now()
     this.expire(now)
     this.judge(now)
-    if (now - this.lastCanaryAt >= this.o.canaryIntervalMs) await this.sendCanary()
+    if (now - this.lastCanaryAt >= this.dueIn()) await this.sendCanary()
     this.persist(now)
   }
 
-  /** A canary that has been out longer than the staleness window is never coming
-   * back; stop holding it (and stop it from confirming liveness long after the
-   * fact, which would make a recovered path look continuously healthy). */
+  /** Silence so far: since this process's last confirmation, or — before any —
+   * carried over from the previous process plus this process's own uptime. */
+  private elapsed(now: number): number {
+    return this.lastConfirmedAt !== null
+      ? now - this.lastConfirmedAt
+      : this.restoredGapMs + (now - this.startedAt)
+  }
+
+  /** ±20% so the canary cadence cannot phase-lock with the daemon's fixed 30s
+   * watch cycle (see the header — that lock is what turns an occasional lost
+   * probe into a permanent false alarm). */
+  private jittered(): number {
+    return Math.round(this.o.canaryIntervalMs * (0.8 + this.o.rand() * 0.4))
+  }
+
+  /** While a canary is outstanding, probe again sooner: one canary lost to the
+   * upstream store race must not be able to walk us to the staleness threshold
+   * on its own. */
+  private dueIn(): number {
+    return this.outstanding.size > 0
+      ? Math.max(1_000, Math.round(this.o.canaryIntervalMs / 3))
+      : this.nextCanaryDelay
+  }
+
+  /** A canary out longer than the staleness window is never coming back; stop
+   * holding it, so it cannot confirm long after the fact and make a recovered
+   * path look continuously healthy. */
   private expire(now: number): void {
-    for (const [id, at] of this.outstanding) {
-      if (now - at > this.o.staleAfterMs) {
+    for (const [id, c] of this.outstanding) {
+      if (now - c.at > this.o.staleAfterMs) {
         this.outstanding.delete(id)
         this.lost += 1
       }
@@ -223,11 +360,7 @@ export class InboundLiveness {
   }
 
   private judge(now: number): void {
-    // Before the first confirmation the clock runs from process start: a bridge
-    // whose canary NEVER returns (daemon not started, wrong relay) must go
-    // degraded on its own, not sit in `starting` forever.
-    const since = this.lastConfirmedAt ?? this.startedAt
-    const elapsed = now - since
+    const elapsed = this.elapsed(now)
     const next: LivenessState =
       elapsed > this.o.staleAfterMs ? 'degraded' : this.lastConfirmedAt === null ? 'starting' : 'ok'
     const was = this.state
@@ -261,6 +394,7 @@ export class InboundLiveness {
     // Stamped BEFORE the await: a send that hangs to its 60s deadline must not
     // let the next beat fire another one on top of it.
     this.lastCanaryAt = this.o.now()
+    this.nextCanaryDelay = this.jittered()
     let npub: string
     try {
       npub = this.selfNpub ?? (this.selfNpub = await this.o.resolveSelfNpub())
@@ -280,7 +414,7 @@ export class InboundLiveness {
       }
       // Tracked even when `published_to` is 0: a queued canary that the daemon's
       // outbox publishes later still round-trips, and that is still proof.
-      this.outstanding.set(res.event_id, this.o.now())
+      this.outstanding.set(res.event_id, { at: this.o.now(), content })
       this.lastError =
         (res.published_to ?? 0) === 0 ? 'canary 未直达任何 relay(已入 outbox 重试队列)' : null
     } catch (err) {
@@ -294,16 +428,16 @@ export class InboundLiveness {
   }
 
   snapshot(now = this.o.now()): LivenessSnapshot {
-    const since = this.lastConfirmedAt ?? this.startedAt
-    const wall = this.o.wallNow()
     return {
       state: this.state,
-      updated_at: new Date(wall).toISOString(),
+      updated_at: new Date(this.o.wallNow()).toISOString(),
+      // The stored wall timestamp, NOT one back-computed from the monotonic
+      // clock: on macOS the monotonic clock does not advance across sleep, so
+      // subtracting it from wall time would report a confirmation from before an
+      // 8-hour sleep as "a few minutes ago".
       last_confirmed_at:
-        this.lastConfirmedAt === null
-          ? null
-          : new Date(wall - (now - this.lastConfirmedAt)).toISOString(),
-      seconds_since_confirmed: Math.round((now - since) / 1000),
+        this.lastConfirmedWall === null ? null : new Date(this.lastConfirmedWall).toISOString(),
+      seconds_since_confirmed: Math.round(this.elapsed(now) / 1000),
       canaries: {
         sent: this.sent,
         confirmed: this.confirmed,
@@ -315,8 +449,35 @@ export class InboundLiveness {
     }
   }
 
+  /** Carry the previous process's silence forward. Without this, a bridge that a
+   * supervisor restarts every few minutes gets a fresh grace period every time
+   * and can NEVER reach `degraded` — the soak would report a clean run while the
+   * inbound path had been dead the whole week. Wall clock, because a monotonic
+   * one means nothing across processes; `max(0, …)` so a backwards clock step
+   * shortens the inherited gap rather than making it negative. */
+  private restore(): void {
+    const file = this.o.healthFile
+    if (!file) return
+    try {
+      const prev = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<LivenessSnapshot>
+      const writtenAt = prev.updated_at ? Date.parse(prev.updated_at) : NaN
+      const sinceWrite = Number.isFinite(writtenAt) ? Math.max(0, this.o.wallNow() - writtenAt) : 0
+      const carried = Math.max(0, (prev.seconds_since_confirmed ?? 0) * 1000)
+      this.restoredGapMs = carried + sinceWrite
+      const confirmedAt = prev.last_confirmed_at ? Date.parse(prev.last_confirmed_at) : NaN
+      if (Number.isFinite(confirmedAt)) this.lastConfirmedWall = confirmedAt
+      if (this.restoredGapMs > this.o.staleAfterMs) {
+        this.o.log.warn(
+          `[nostr] ⚠️  上一轮进程留下的入站静默已有 ${Math.round(this.restoredGapMs / 1000)}s,本进程不重新计时(重启不清账)。`,
+        )
+      }
+    } catch {
+      /* no previous run, or an unreadable file — start fresh */
+    }
+  }
+
   /** Write the health snapshot. On state change immediately; otherwise at most
-   * once a minute — a 7-day soak at a 5s poll would be ~120k writes otherwise. */
+   * once a minute — a 7-day soak would be a lot of writes otherwise. */
   private persist(now: number): void {
     const file = this.o.healthFile
     if (!file) return

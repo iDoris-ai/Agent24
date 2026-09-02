@@ -61,6 +61,10 @@ export const CONFIG = {
    * canaries: long enough to ride out one relay hiccup, short enough that a
    * machine that woke up broken is caught within the quarter hour. */
   LIVENESS_STALE_MS: Number(process.env.A24_NOSTR_STALE_MS) || 15 * 60_000,
+  /** How often the probe wakes up. It runs on its OWN timer, not on the poll
+   * loop — that loop awaits each inbound message's agent run, so a probe riding
+   * it would be starved by a slow run for as long as the run takes. */
+  LIVENESS_TICK_MS: Number(process.env.A24_NOSTR_LIVENESS_TICK_MS) || 30_000,
   /** NIP-44-encrypt canaries (set `0` for plaintext). */
   CANARY_ENCRYPT: process.env.A24_NOSTR_CANARY_ENCRYPT !== '0',
   /** Health snapshot an operator (or the F5 soak) can `cat`. Empty disables. */
