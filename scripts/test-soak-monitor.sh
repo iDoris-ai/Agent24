@@ -206,12 +206,15 @@ check "快照恰好在门槛后、下次采样前才出现" REVIEW \
   --interval 1 --duration 8 --nostr-stale 3 --daemon-json "$WORK/daemon.json"
 wait $! 2>/dev/null
 
-start_fake 20
-snap 1 ok 0 gen-A 100
-rm -f "$WORK/soak.jsonl"
-( sleep 2; rm -f "$WORK/health.json" ) &
+# `--nostr-stale 30` so the frozen-snapshot gate cannot fire, and the snapshot
+# keeps confirming until it vanishes so the growth gate cannot either. Only the
+# disappearance is left to catch it.
+start_fake 25
+snap 0 ok 0 gen-A 100
+( sleep 1; snap 0 ok 0 gen-A 101; sleep 1; snap 0 ok 0 gen-A 102
+  sleep 1; rm -f "$WORK/health.json" ) &
 check "快照出现过又消失" REVIEW \
-  --interval 1 --duration 4 --nostr-stale 2 --daemon-json "$WORK/daemon.json"
+  --interval 1 --duration 6 --nostr-stale 30 --daemon-json "$WORK/daemon.json"
 wait $! 2>/dev/null
 
 echo
@@ -237,7 +240,50 @@ check "跑到一半被 SIGTERM" INCOMPLETE \
 wait $! 2>/dev/null
 
 echo
+echo "== 新旗标必须对它们自己的用途有效 =="
+# The default health path has to follow --nostr-identity. It used to be computed
+# before argument parsing, so `--nostr-identity alice` still read agent24's file
+# and the flag was broken for its only purpose. HOME is redirected so the default
+# path resolves inside the sandbox.
+start_fake 20
+mkdir -p "$WORK/home/.agent24"
+python3 - "$WORK/home/.agent24/nostr-bridge-health-alice.json" <<'SNAP'
+import datetime, json, sys
+t = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+json.dump({"state": "ok", "updated_at": t, "degraded_transitions": 0, "generation": "gen-A",
+           "last_error": None,
+           "canaries": {"sent": 5, "confirmed": 5, "lost": 0, "outstanding": 0},
+           "context": {"identity": "alice"}}, open(sys.argv[1], "w"))
+SNAP
+out=$(HOME="$WORK/home" "$MON" --interval 1 --duration 3 --nostr-stale 30 \
+  --nostr-identity alice --log "$WORK/soak.jsonl" --daemon-json "$WORK/daemon.json" 2>&1)
+rm -f "$WORK/soak.jsonl"
+case "$out" in
+  *"NO HEALTH SNAPSHOT"*)
+    printf '  FAIL %-52s (默认路径没跟着 identity 走)\n' "--nostr-identity 决定默认路径"; fail=$((fail+1)) ;;
+  *)
+    printf '  ok   %-52s\n' "--nostr-identity 决定默认路径"; pass=$((pass+1)) ;;
+esac
+
+# --no-nostr has to actually skip. A stale/degraded snapshot left over from an
+# earlier run used to be read anyway, dragging the whole gate in and failing the
+# very runs the flag exists to let through.
+start_fake 20
+snap 5000 degraded 3 gen-A 100
+check "--no-nostr 时遗留的坏快照不该拖累判定" PASS \
+  --interval 1 --duration 3 --nostr-stale 2 --no-nostr --daemon-json "$WORK/daemon.json"
+
+echo
 echo "== 参数校验 =="
+for bad in "--duration 0" "--interval 0" "--nostr-stale 0"; do
+  # shellcheck disable=SC2086
+  if "$MON" $bad --daemon-json "$WORK/daemon.json" 2>&1 | grep -q "must be > 0"; then
+    printf '  ok   %-52s\n' "$bad 被拒"; pass=$((pass+1))
+  else
+    printf '  FAIL %-52s\n' "$bad 被拒"; fail=$((fail+1))
+  fi
+done
+
 snap 1 ok 0 gen-A 100
 if "$MON" --nostr-stale abc --daemon-json "$WORK/daemon.json" 2>&1 | grep -q "must be integer"; then
   printf '  ok   %-52s\n' "--nostr-stale 非整数被拒"; pass=$((pass+1))

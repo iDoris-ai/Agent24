@@ -119,6 +119,6 @@ jq -r '[.at, (.nostr_state|tostring), (.nostr_confirmed|tostring)] | @tsv' ~/age
 
 ## 收尾
 
-`Ctrl-C`（或 7 天到点自停）→ 监控打印 PASS / NEEDS REVIEW 摘要。把摘要 + `~/agent24-soak.jsonl` 归档，据此在 `docs/specs/TASKS.md` 把 **F5** 标 done、**P1 收尾**。
+**让它自己跑到点**（7 天到期自停）→ 监控打印 PASS / NEEDS REVIEW 摘要。中途 `Ctrl-C` / `kill` 得到的是 `RESULT: INCOMPLETE`（非 0 退出）——没跑满的 run 不是 F5 结论，采样到的一切当然都是健康的，那正是陷阱。所以只在确实要放弃这一轮时才中断。把摘要 + `~/agent24-soak.jsonl` 归档，据此在 `docs/specs/TASKS.md` 把 **F5** 标 done、**P1 收尾**。
 
 > 远程支持：把 `~/soak-monitor.out` 的摘要行 / 异常行贴回来，我能帮你判读趋势、定位重启或泄漏根因。

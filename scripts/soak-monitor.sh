@@ -37,11 +37,12 @@ DAEMON_JSON="${A24_DAEMON_JSON:-$HOME/.agent24/daemon.json}"
 # Identity-scoped, matching the bridge's own default (packages/nostr-bridge
 # config.ts): one file per bridge, so two instances cannot overwrite each other's
 # ledger and make one's outage invisible behind the other's health.
-# Sanitised exactly like the bridge does it (packages/nostr-bridge config.ts),
-# or an identity with an exotic character makes the two sides compute DIFFERENT
-# default paths and a healthy run fails for no reason.
 NOSTR_IDENTITY="${A24_NOSTR_IDENTITY:-agent24}"
-NOSTR_HEALTH="${A24_NOSTR_HEALTH_FILE:-$HOME/.agent24/nostr-bridge-health-${NOSTR_IDENTITY//[^A-Za-z0-9_.-]/_}.json}"
+# Deliberately NOT resolved here: the default path depends on the identity, and
+# the identity can still change during argument parsing. Computing it now made
+# `--nostr-identity alice` read agent24's file — the new flag was broken for its
+# only intended use.
+NOSTR_HEALTH="${A24_NOSTR_HEALTH_FILE:-}"
 # F5 runs Nostr, so its absence is a FAILURE, not a "not configured" — a bridge
 # that never started, or crashed before writing, otherwise leaves exactly the
 # same evidence as "the user didn't ask for Nostr" and the gate is skipped.
@@ -75,11 +76,28 @@ command -v curl >/dev/null || { echo "need curl" >&2; exit 2; }
 # would arithmetic-compare to 0 and the run would never stop.
 case "$INTERVAL" in ''|*[!0-9]*) echo "--interval must be integer seconds" >&2; exit 2 ;; esac
 case "$DURATION" in ''|*[!0-9]*) echo "--duration must be integer seconds" >&2; exit 2 ;; esac
+# Zero would satisfy the "reached DURATION" test on the very first sample, so a
+# `--duration 0` run could hand back a verdict having observed nothing.
+[ "$INTERVAL" -gt 0 ] || { echo "--interval must be > 0" >&2; exit 2 ; }
+[ "$DURATION" -gt 0 ] || { echo "--duration must be > 0" >&2; exit 2 ; }
 # A non-integer here would make every `-gt` print an error and evaluate FALSE,
 # i.e. silently DISABLE the frozen-snapshot check — the gate would still say
 # "fine" while checking nothing.
 case "$NOSTR_STALE" in ''|*[!0-9]*) echo "--nostr-stale must be integer seconds" >&2; exit 2 ;; esac
 [ "$NOSTR_STALE" -gt 0 ] || { echo "--nostr-stale must be > 0" >&2; exit 2 ; }
+# Resolved AFTER parsing, and only when the operator did not name a file.
+# Sanitised exactly like the bridge does it (packages/nostr-bridge config.ts) —
+# otherwise the two sides compute different default paths and a healthy run fails
+# for no reason. Identities outside that character set are refused rather than
+# silently mangled, because the two sanitisers only agree on ASCII.
+case "$NOSTR_IDENTITY" in
+  *[!A-Za-z0-9_.-]*)
+    if [ -z "$NOSTR_HEALTH" ]; then
+      echo "identity '$NOSTR_IDENTITY' 含特殊字符,默认路径可能与桥算出的不一致;请显式传 --nostr-health" >&2
+      exit 2
+    fi ;;
+esac
+[ -n "$NOSTR_HEALTH" ] || NOSTR_HEALTH="$HOME/.agent24/nostr-bridge-health-${NOSTR_IDENTITY}.json"
 [ -n "$LOG" ] || LOG="$HOME/agent24-soak-$(date +%Y%m%d-%H%M%S).jsonl"
 # Fail loudly NOW if the log is unwritable — never run a 7-day soak whose PASS
 # rests on a log that was never written (soak review #109 Low).
@@ -120,6 +138,11 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # saying "fine". Malformed evidence has to fail the gate, never slip through it.
 sample_nostr() {
   n_state="null"; n_conf="null"; n_degr="null"; n_age="null"; n_gen="null"
+  # `--no-nostr` means SKIP, not "read it anyway and hope nothing fails". A stale
+  # or foreign snapshot left over from an earlier run would otherwise set
+  # nostr_seen and drag the whole gate in — the flag would fail the very runs it
+  # exists to let through.
+  [ "$REQUIRE_NOSTR" -eq 0 ] && return
   if [ ! -f "$NOSTR_HEALTH" ]; then
     # Missing before the bridge has ever written one is normal for a moment — the
     # monitor is usually started first. But only for a moment: the grace period
@@ -229,6 +252,9 @@ sample_nostr() {
 }
 
 summarize() {
+  # A second Ctrl-C while this is printing would re-enter and interleave two
+  # summaries (and could exit before writing the verdict).
+  trap '' INT TERM
   # Computed first: the report lines below read it.
   #
   # Measured against the RUN's own length, not the span between the first and
@@ -313,8 +339,11 @@ summarize() {
     fi
   fi
 
+  # Placed AFTER the diagnostics above, not before: someone who interrupts a run
+  # still wants to see what it had collected. It just must not be called a
+  # verdict.
   if [ "$completed" -eq 0 ]; then
-    echo "RESULT: INCOMPLETE (run 未跑满 ${DURATION}s 就被中断 —— 不是 F5 结论)"
+    echo "RESULT: INCOMPLETE (run 未跑满 ${DURATION}s 就被中断 —— 不是 F5 结论,上面的数字只是中断时的快照)"
     exit 1
   fi
 
@@ -337,7 +366,7 @@ summarize() {
   else
     echo "RESULT: NEEDS REVIEW (see anomalies + scheduler faults in the log)"
     if [ "$nostr_ok" -eq 0 ]; then
-      if [ "$nostr_seen" -eq 0 ]; then
+      if [ "$nostr_seen" -eq 0 ] && [ "$nostr_late" -eq 0 ]; then
         echo "  · Nostr 入站(F5 判据 6):整个 run 没有读到任何健康快照 —— 桥没起来/没写过文件。确实不测 Nostr 请显式加 --no-nostr"
       elif [ "$nostr_late" -ne 0 ]; then
         echo "  · Nostr 入站(F5 判据 6):健康快照迟到超过 ${NOSTR_STALE}s 才出现 —— 在那之前这一段没有任何入站证据"
