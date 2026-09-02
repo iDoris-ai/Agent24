@@ -26,6 +26,7 @@
 #   scripts/soak-monitor.sh                 # 7 days, sample every 5 min
 #   scripts/soak-monitor.sh --interval 60 --duration 3600   # 1h smoke, 1 min
 #   scripts/soak-monitor.sh --log ~/agent24-soak.jsonl
+#   scripts/soak-monitor.sh --no-nostr        # this run genuinely has no bridge
 #
 # Env: A24_DAEMON_JSON (default ~/.agent24/daemon.json). Requires curl + jq.
 set -u
@@ -34,6 +35,16 @@ INTERVAL=300            # seconds between samples
 DURATION=$((7*24*3600)) # total run length (7 days)
 DAEMON_JSON="${A24_DAEMON_JSON:-$HOME/.agent24/daemon.json}"
 NOSTR_HEALTH="${A24_NOSTR_HEALTH_FILE:-$HOME/.agent24/nostr-bridge-health.json}"
+# F5 runs Nostr, so its absence is a FAILURE, not a "not configured" — a bridge
+# that never started, or crashed before writing, otherwise leaves exactly the
+# same evidence as "the user didn't ask for Nostr" and the gate is skipped.
+# Opting out has to be explicit.
+REQUIRE_NOSTR=1
+# A snapshot that stopped being updated is worthless even if its last recorded
+# state was `ok`: a bridge that died on day 1 freezes the file at ok/confirmed=N
+# forever, and a start-vs-end comparison happily passes. Same shape of bug as
+# FU-32 itself — stale evidence that cannot be told from healthy evidence.
+NOSTR_STALE=900
 LOG=""
 
 while [ $# -gt 0 ]; do
@@ -42,6 +53,8 @@ while [ $# -gt 0 ]; do
     --duration) DURATION="$2"; shift 2 ;;
     --daemon-json) DAEMON_JSON="$2"; shift 2 ;;
     --nostr-health) NOSTR_HEALTH="$2"; shift 2 ;;
+    --nostr-stale) NOSTR_STALE="$2"; shift 2 ;;
+    --no-nostr) REQUIRE_NOSTR=0; shift ;;
     --log) LOG="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -65,8 +78,9 @@ schedule_min=""; anomalies=0; disabled_seen=0; sched_err_seen=0; stuck_failing_s
 # Nostr inbound liveness (FU-32). `nostr_seen` starts at 0 so a soak run without
 # the bridge configured is not failed by criterion 6; once a snapshot HAS been
 # read, a later disappearance is an anomaly rather than "no bridge here".
-nostr_seen=0; nostr_degraded_max=0; nostr_conf_first=""; nostr_conf_last=0; nostr_read_err=0
-n_state="null"; n_conf="null"; n_degr="null"
+nostr_seen=0; nostr_conf_first=""; nostr_conf_last=0; nostr_read_err=0
+nostr_degraded_seen=0; nostr_stale_seen=0; nostr_tr_base=""; nostr_tr_last=0; nostr_tr_back=0
+n_state="null"; n_conf="null"; n_degr="null"; n_age="null"
 
 read_daemon() { # -> echoes "port token pid" or nothing
   [ -f "$DAEMON_JSON" ] || return 1
@@ -76,35 +90,64 @@ read_daemon() { # -> echoes "port token pid" or nothing
 # ISO-8601 UTC without relying on GNU date flags.
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-# Read the Nostr bridge's liveness snapshot into n_state/n_conf/n_degr (JSON
-# literals, ready to interpolate) and fold it into the whole-run accounting.
+# Read the Nostr bridge's liveness snapshot into n_state/n_conf/n_degr/n_age and
+# fold it into the whole-run accounting.
+#
+# The read is a single strict `jq` program on purpose. Reading the fields one by
+# one and comparing them with `[ -gt ]` looks equivalent and is not: a
+# `degraded_transitions` of 0.5 or a `confirmed` of "x" makes the test print an
+# integer-expression error and evaluate FALSE, which leaves the gate variables
+# saying "fine". Malformed evidence has to fail the gate, never slip through it.
 sample_nostr() {
-  n_state="null"; n_conf="null"; n_degr="null"
+  n_state="null"; n_conf="null"; n_degr="null"; n_age="null"
   if [ ! -f "$NOSTR_HEALTH" ]; then
-    # Gone after having been seen = the bridge died or the file broke. A soak
-    # that can no longer read its own evidence must not report PASS on it.
+    # Missing before the bridge has ever written one is normal — the monitor is
+    # usually started first. "Never written at all" is caught at the END by the
+    # `nostr_seen` gate, so failing per-sample here would fail a healthy 7-day
+    # run over its first few seconds. Missing AFTER we have seen it is different:
+    # the file was removed or the bridge tore it down.
     if [ "$nostr_seen" -eq 1 ]; then nostr_read_err=1; anomalies=$((anomalies+1)); fi
     return
   fi
-  local st cf dg
-  st=$(jq -r '.state // empty' "$NOSTR_HEALTH" 2>/dev/null)
-  cf=$(jq -r '.canaries.confirmed // empty' "$NOSTR_HEALTH" 2>/dev/null)
-  dg=$(jq -r '.degraded_transitions // empty' "$NOSTR_HEALTH" 2>/dev/null)
-  if [ -z "$st" ] || [ -z "$cf" ] || [ -z "$dg" ]; then
-    # The file EXISTS and cannot be parsed. That is never "no bridge configured"
-    # — it is broken evidence, and it must fail the gate even if we have never
-    # managed to read this file, otherwise a snapshot that was corrupt from the
-    # very first sample makes criterion 6 silently un-evaluated and the run can
-    # PASS on it. (Same fail-open the bridge's own `restore()` had.)
+  local row st cf dg age
+  row=$(jq -er '
+    def isnat: type == "number" and . >= 0 and . == floor and . < 9007199254740991;
+    select((.state | type) == "string")
+    | select(.state == "ok" or .state == "starting" or .state == "degraded")
+    | (.canaries.confirmed) as $c
+    | (.degraded_transitions // 0) as $d
+    | select(($c | isnat) and ($d | isnat))
+    | (.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $u
+    | [.state, ($c|tostring), ($d|tostring), ((now - $u) | floor | tostring)]
+    | @tsv' "$NOSTR_HEALTH" 2>/dev/null) || row=""
+  if [ -z "$row" ]; then
+    # The file EXISTS and does not validate. Never "no bridge configured" — that
+    # would let a snapshot corrupt from the very first sample leave criterion 6
+    # silently un-evaluated.
     nostr_seen=1; nostr_read_err=1; anomalies=$((anomalies+1))
     return
   fi
+  st=$(printf '%s' "$row" | cut -f1)
+  cf=$(printf '%s' "$row" | cut -f2)
+  dg=$(printf '%s' "$row" | cut -f3)
+  age=$(printf '%s' "$row" | cut -f4)
+
   nostr_seen=1
   [ -z "$nostr_conf_first" ] && nostr_conf_first="$cf"
   nostr_conf_last="$cf"
-  [ "$dg" -gt "$nostr_degraded_max" ] 2>/dev/null && nostr_degraded_max="$dg"
-  [ "$st" = "degraded" ] && anomalies=$((anomalies+1))
-  n_state="\"$st\""; n_conf="$cf"; n_degr="$dg"
+  # Transitions are LIFETIME cumulative (they survive bridge restarts), so the
+  # gate is "did it grow during THIS run", not "is it zero". Otherwise one
+  # degradation months ago would fail every future soak, and the runbook would
+  # have to tell people to delete the file — throwing away the cross-restart
+  # evidence and the stored self_npub with it.
+  [ -z "$nostr_tr_base" ] && nostr_tr_base="$dg"
+  [ "$dg" -lt "$nostr_tr_last" ] && nostr_tr_back=1   # counter went backwards = reset/tampered
+  nostr_tr_last="$dg"
+  # Any sample that catches it degraded is a sticky failure on its own, not just
+  # an anomaly count that nothing gates on.
+  if [ "$st" = "degraded" ]; then nostr_degraded_seen=1; anomalies=$((anomalies+1)); fi
+  if [ "$age" -gt "$NOSTR_STALE" ]; then nostr_stale_seen=1; anomalies=$((anomalies+1)); fi
+  n_state="\"$st\""; n_conf="$cf"; n_degr="$dg"; n_age="$age"
 }
 
 summarize() {
@@ -121,9 +164,12 @@ summarize() {
   echo "schedules seen:  min=${schedule_min:-n/a}  max_overdue=${overdue_max}"
   echo "scheduler faults: auto_disabled=${disabled_seen}  fetch_errors=${sched_err_seen}  stuck_failing=${stuck_failing_seen}"
   if [ "$nostr_seen" -eq 1 ]; then
-    echo "nostr inbound:   degraded_transitions=${nostr_degraded_max}  confirmed ${nostr_conf_first:-0}→${nostr_conf_last}  read_errors=${nostr_read_err}"
+    echo "nostr inbound:   transitions ${nostr_tr_base:-0}→${nostr_tr_last}  confirmed ${nostr_conf_first:-0}→${nostr_conf_last}"
+    echo "                 degraded_sampled=${nostr_degraded_seen}  stale_snapshots=${nostr_stale_seen}  read_errors=${nostr_read_err}  counter_reset=${nostr_tr_back}"
+  elif [ "$REQUIRE_NOSTR" -eq 1 ]; then
+    echo "nostr inbound:   NO HEALTH SNAPSHOT (bridge never wrote one — criterion 6 FAILS; pass --no-nostr if this run genuinely has no Nostr bridge)"
   else
-    echo "nostr inbound:   (no health snapshot seen — bridge not configured; criterion 6 NOT evaluated)"
+    echo "nostr inbound:   (skipped, --no-nostr)"
   fi
   echo "anomalies:       $anomalies"
   echo
@@ -149,8 +195,20 @@ summarize() {
   # must also have advanced — a bridge stuck at `starting` never reported
   # degraded either, and that must not read as healthy.
   local nostr_ok=1
-  if [ "$nostr_seen" -eq 1 ]; then
-    if [ "$nostr_degraded_max" -ne 0 ] || [ "$nostr_read_err" -ne 0 ] \
+  if [ "$REQUIRE_NOSTR" -eq 1 ] && [ "$nostr_seen" -eq 0 ]; then
+    # "No evidence" is not "no bridge asked for". A bridge that never started
+    # leaves exactly the same trace as one that was never configured, so the
+    # intent has to be stated, not inferred.
+    nostr_ok=0
+  elif [ "$nostr_seen" -eq 1 ]; then
+    # Fails if: it was ever caught degraded · the cumulative transition counter
+    # grew during THIS run · the counter went backwards (file reset/tampered) ·
+    # any snapshot was unreadable · any snapshot was STALE (a frozen file is not
+    # evidence of health) · confirmations never advanced (a bridge stuck in
+    # `starting` never reported degraded either).
+    if [ "$nostr_degraded_seen" -ne 0 ] || [ "$nostr_read_err" -ne 0 ] \
+       || [ "$nostr_stale_seen" -ne 0 ] || [ "$nostr_tr_back" -ne 0 ] \
+       || [ "$nostr_tr_last" -gt "${nostr_tr_base:-0}" ] \
        || [ "$nostr_conf_last" -le "${nostr_conf_first:-0}" ]; then
       nostr_ok=0
     fi
@@ -166,7 +224,11 @@ summarize() {
   else
     echo "RESULT: NEEDS REVIEW (see anomalies + scheduler faults in the log)"
     if [ "$nostr_ok" -eq 0 ]; then
-      echo "  · Nostr 入站(F5 判据 6):degraded_transitions=${nostr_degraded_max} read_errors=${nostr_read_err} confirmed ${nostr_conf_first:-0}→${nostr_conf_last}"
+      if [ "$nostr_seen" -eq 0 ]; then
+        echo "  · Nostr 入站(F5 判据 6):整个 run 没有读到任何健康快照 —— 桥没起来/没写过文件。确实不测 Nostr 请显式加 --no-nostr"
+      else
+        echo "  · Nostr 入站(F5 判据 6):degraded_sampled=${nostr_degraded_seen} transitions ${nostr_tr_base:-0}→${nostr_tr_last} stale=${nostr_stale_seen} read_err=${nostr_read_err} counter_reset=${nostr_tr_back} confirmed ${nostr_conf_first:-0}→${nostr_conf_last}"
+      fi
     fi
   fi
   exit "$result"
@@ -184,7 +246,7 @@ while :; do
   if [ -z "$info" ]; then
     # No discovery file → daemon not registered. Record and keep watching;
     # F1a autostart / F2 recovery may bring it back.
-    echo "{\"at\":\"$ts\",\"health\":false,\"reason\":\"no daemon.json\",\"nostr_state\":$n_state,\"nostr_confirmed\":$n_conf,\"nostr_degraded\":$n_degr}" >> "$LOG"
+    echo "{\"at\":\"$ts\",\"health\":false,\"reason\":\"no daemon.json\",\"nostr_state\":$n_state,\"nostr_confirmed\":$n_conf,\"nostr_degraded\":$n_degr,\"nostr_age_s\":$n_age}" >> "$LOG"
     samples=$((samples+1)); anomalies=$((anomalies+1))
   else
     port=$(echo "$info" | cut -d' ' -f1)
@@ -265,8 +327,8 @@ while :; do
 
     # An unwritable log must abort, not silently PASS on a phantom log the summary
     # then tells you to archive (soak review #109 Low).
-    printf '{"at":"%s","health":%s,"code":"%s","sched_code":"%s","pid":%s,"restarts":%s,"rss_mb":%s,"cpu_pct":%s,"schedules":%s,"disabled":%s,"nullnext":%s,"overdue":%s,"sched_err":%s,"max_consec_fail":%s,"last_run":%s,"nostr_state":%s,"nostr_confirmed":%s,"nostr_degraded":%s}\n' \
-      "$ts" "$ok" "$code" "$scode" "${pid:-0}" "$restarts" "${rss_mb:-0}" "${cpu_pct:-0}" "${n_sched:-0}" "$disabled" "$nullnext" "$overdue" "$sched_err" "${max_cfail:-0}" "${last_run:-\"null\"}" "$n_state" "$n_conf" "$n_degr" >> "$LOG" \
+    printf '{"at":"%s","health":%s,"code":"%s","sched_code":"%s","pid":%s,"restarts":%s,"rss_mb":%s,"cpu_pct":%s,"schedules":%s,"disabled":%s,"nullnext":%s,"overdue":%s,"sched_err":%s,"max_consec_fail":%s,"last_run":%s,"nostr_state":%s,"nostr_confirmed":%s,"nostr_degraded":%s,"nostr_age_s":%s}\n' \
+      "$ts" "$ok" "$code" "$scode" "${pid:-0}" "$restarts" "${rss_mb:-0}" "${cpu_pct:-0}" "${n_sched:-0}" "$disabled" "$nullnext" "$overdue" "$sched_err" "${max_cfail:-0}" "${last_run:-\"null\"}" "$n_state" "$n_conf" "$n_degr" "$n_age" >> "$LOG" \
       || { echo "soak-monitor: cannot write $LOG — aborting" >&2; exit 2; }
   fi
 

@@ -22,7 +22,9 @@
 
    > 第 5 条单独**挡不住**这一类失效,这正是 FU-32 的教训:桥读的是 agent-speaker daemon 填的**本地库**,daemon 那侧 relay 断了的话 `history inbox` 照样 exit 0 返回 `[]` —— 不抛错、不超时、进程健康、日程照跑,**只是谁的消息都收不到**。只在第 1 天和第 7 天各发一条,中间六天全哑也照样 PASS。桥现在每 5 分钟给自己发一条 canary,只有 daemon 真把它从 relay 拉回来才算数;15 分钟没有确认就写 `degraded` 并在 stderr 报警。**睡眠→唤醒之后必须专门抽查一次**——那是这条最可能失效的时刻。
 
-`soak-monitor.sh` 退出时按 1、2 自动给 PASS / NEEDS REVIEW；3–6 靠你日常抽查 + 日志。
+`soak-monitor.sh` 退出时按 **1、2、6** 自动给 PASS / NEEDS REVIEW；3–5 靠你日常抽查 + 日志。
+
+判据 6 由脚本采样健康快照来判，具体会因为这些原因判失败：任何一次采样抓到 `state=degraded`、`degraded_transitions` **在本次 run 内增长**、快照读不出来、快照**超过 15 分钟没更新**（进程死了但文件还在，冻结在 `ok` 上）、`confirmed` 全程没涨、或者整轮**从没读到过快照**（桥没起来）。确实不跑 Nostr 的 run 要显式加 `--no-nostr`——「没有证据」不会被当成「没配置」。
 
 ## 一次性准备
 
@@ -58,7 +60,10 @@ pnpm --filter @agent24/wechat-bridge start   # 扫码
   $A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
   ```
 
-  这两条只覆盖桥的**读**路径。`agent msg` 与 `profile publish` 的改名后契约**仍未验收**（F4 联调是对着改名前的 7cef326 验的），它们会在桥起来后的第一次 register / 第一条 canary 上暴露 —— 起跑后立刻 `cat` 一次健康快照，`last_error` 为 null 才算这两条也过了。
+  这两条只覆盖桥的**读**路径。`agent msg` 与 `profile publish` 的改名后契约**仍未验收**（F4 联调是对着改名前的 7cef326 验的）。桥起来后分别这样确认：
+
+  - `agent msg` → `cat ~/.agent24/nostr-bridge-health.json`，`last_error` 为 null 且 `canaries.sent` 在涨（canary 就是走这条命令发的）。
+  - `profile publish` → 看桥的启动日志里有没有 `[nostr] ✅ 已注册能力,发布到 N 个 relay`；失败会打 `[nostr] 注册失败`。**它不会写进健康快照的 `last_error`**（那个字段只来自活性探针），所以别用它证明注册成功。
 
 - **泡测的 daemon 要关掉桌面通知和自动回复**：`hyphae daemon --notify=false --auto-reply=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
 

@@ -41,6 +41,18 @@
 //         the leak is a second judge-tick chain, so the test counts inbox reads.
 //   pollOnce()
 //     · pass the raw rows instead of observe() → 走真实 pollOnce
+//     · drop the `ready` gate                  → 解析不出自己的 npub 时不派发
+//   restore() / observe(), round 4
+//     · num() with isFinite instead of isSafeInteger → 损坏的健康文件… (1.5 canaries)
+//     · drop the state enum check              → 损坏的健康文件… ("weird")
+//     · do not restore the previous verdict    → degraded_transitions:重启不重复计
+//     · do not count the transition in judge() → same test
+//     · do not restore self_npub               → 自身 npub 可以从上一轮快照恢复
+//     · clear the failure counter but do NOT re-arm the timer
+//         → queued canary 确认后,下一次发送在正常周期内发生
+//         (the round-3 version of this test called stop() first, so armCanary
+//          returned early and the mutation survived — the schedule has to be
+//          driven through the real timer chain to be asserted at all)
 //
 // Three of these tests did NOT discriminate when first written (they asserted
 // through a path the mutation did not touch, or the fixture never built the
@@ -861,6 +873,166 @@ describe('InboundLiveness — 定时器边界(M-4)', () => {
   })
 })
 
+describe('InboundLiveness — 确认要真的把退避 timer 拉回来', () => {
+  it('queued canary 确认后,下一次发送在正常周期内发生(不是 20 分钟后)', async () => {
+    // The earlier version of this test called stop() before confirming, so
+    // `armCanary` returned early and only the counter reset was exercised —
+    // deleting the re-arm left it green. Driven through the real timer chain
+    // now, so the SCHEDULE is what is asserted, not just the state.
+    vi.useFakeTimers()
+    try {
+      const fake = new FakeSpeaker()
+      let seq = 0
+      let publish = false
+      const sends: number[] = []
+      const queued: { id: string; content: string }[] = []
+      const speaker = new SpeakerClient(async (args) => {
+        if (args[0] === 'agent' && args[1] === 'msg') {
+          const id = (++seq).toString(16).padStart(64, '0')
+          const ci = args.indexOf('--content')
+          queued.push({ id, content: args[ci + 1]! })
+          sends.push(Date.now())
+          fake.sendResult = {
+            event_id: id,
+            published_to: publish ? 1 : 0,
+            queued_for_retry: !publish,
+          }
+        }
+        return fake.runner(args)
+      }, { identity: 'agent24' })
+      const liveness = new InboundLiveness({
+        speaker,
+        identity: 'agent24',
+        resolveSelfNpub: () => speaker.npubFor('agent24'),
+        canaryIntervalMs: 300_000,
+        staleAfterMs: 900_000,
+        tickMs: 30_000,
+        now: () => Date.now(),
+        rand: () => 0.5,
+        log: { log: () => {}, warn: () => {}, error: () => {} },
+      })
+
+      await liveness.start()
+      await vi.advanceTimersByTimeAsync(1_000) // first canary: unpublished → backoff
+      expect(sends.length).toBe(1)
+      publish = true
+
+      // agent-speaker's outbox publishes it; the daemon pulls it back.
+      for (const c of queued) {
+        fake.inboxRows.push({
+          id: c.id,
+          sender_npub: SELF,
+          plaintext: c.content,
+          created_at: 1,
+          is_incoming: true,
+        })
+      }
+      await vi.advanceTimersByTimeAsync(30_000) // one judge tick → confirms
+      expect(liveness.current).toBe('ok')
+
+      // Without the re-arm the next send sits at the backoff deadline (≥10 min);
+      // one base interval must be enough to see it.
+      await vi.advanceTimersByTimeAsync(400_000)
+      liveness.stop()
+      expect(sends.length).toBeGreaterThan(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('入站在自身 npub 未知时必须 fail-closed(M-3)', () => {
+  it('解析不出自己的 npub 时不派发业务消息', async () => {
+    const fake = new FakeSpeaker()
+    fake.identities = [] // keystore unreadable / identity missing
+    const speaker = new SpeakerClient(fake.runner, { identity: 'agent24' })
+    const liveness = new InboundLiveness({
+      speaker,
+      identity: 'agent24',
+      resolveSelfNpub: () => speaker.npubFor('agent24'),
+      canaryIntervalMs: CANARY_MS,
+      staleAfterMs: STALE_MS,
+      now: () => 0,
+      rand: () => 0.5,
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+    })
+    await liveness.start()
+    liveness.stop()
+    expect(liveness.ready).toBe(false)
+
+    fake.inboxRows.push({
+      id: 'dead'.repeat(16),
+      sender_npub: 'npub1peer',
+      plaintext: 'hello',
+      created_at: 1,
+      is_incoming: true,
+    })
+    const prompts: string[] = []
+    const agent = {
+      async createSession(): Promise<string> {
+        return 's1'
+      },
+      async runToCompletion(p: string) {
+        prompts.push(p)
+        return { status: 'completed', text: 'ok', runId: 'r1' }
+      },
+    } as unknown as Agent24Client
+    const bridge = new InboundBridge(agent, speaker, 'agent24', new Set(['npub1peer']))
+
+    await pollOnce(speaker, bridge, liveness)
+    // Held, not lost: the inbox window is re-read every poll.
+    expect(prompts).toEqual([])
+  })
+
+  it('自身 npub 可以从上一轮的可信快照恢复,恢复后即可派发', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          state: 'ok',
+          updated_at: new Date(1_700_000_000_000).toISOString(),
+          last_confirmed_at: new Date(1_700_000_000_000).toISOString(),
+          seconds_since_confirmed: 0,
+          degraded_transitions: 0,
+          canaries: { sent: 1, confirmed: 1, lost: 0, outstanding: 0 },
+          last_error: null,
+          self_npub: SELF,
+        }),
+      )
+      const fake = new FakeSpeaker()
+      fake.identities = [] // keystore still unreadable
+      const speaker = new SpeakerClient(fake.runner, { identity: 'agent24' })
+      const liveness = new InboundLiveness({
+        speaker,
+        identity: 'agent24',
+        resolveSelfNpub: () => speaker.npubFor('agent24'),
+        canaryIntervalMs: CANARY_MS,
+        staleAfterMs: STALE_MS,
+        healthFile: file,
+        now: () => 0,
+        wallNow: () => 1_700_000_000_000,
+        rand: () => 0.5,
+        log: { log: () => {}, warn: () => {}, error: () => {} },
+      })
+      await liveness.start()
+      liveness.stop()
+      expect(liveness.ready).toBe(true)
+
+      // And it is used: an old canary from the previous process is recognised by
+      // that npub and dropped rather than dispatched.
+      const peers = liveness.observe([
+        { from: SELF, content: `${CANARY_PREFIX} old`, event_id: 'aaaa'.repeat(16) },
+        { from: 'npub1peer', content: 'hi', event_id: 'bbbb'.repeat(16) },
+      ])
+      expect(peers.map((p) => p.from)).toEqual(['npub1peer'])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('InboundLiveness — 断网时不能自己制造洪水(M-1)', () => {
   it('canary 一条都没发出去时不加速重探,而是退避', async () => {
     // Every unpublished canary lands in agent-speaker's outbox and is retried
@@ -983,6 +1155,12 @@ describe('InboundLiveness — 健康文件是运维输入,必须当成不可信�
         '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","canaries":{"sent":1,"confirmed":"x","lost":0}}',
         // Present-but-unparseable timestamp is corruption, not absence.
         '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","last_confirmed_at":"soon"}',
+        // Finite, in range, non-negative — but not an INTEGER. A count of 1.5
+        // canaries is corruption, and `isFinite` alone would wave it through.
+        '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","canaries":{"sent":1.5,"confirmed":2,"lost":0}}',
+        '{"seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z","degraded_transitions":0.5}',
+        // Not one of the three known verdicts.
+        '{"state":"weird","seconds_since_confirmed":1,"updated_at":"2026-09-02T00:00:00.000Z"}',
       ]) {
         fs.writeFileSync(file, bad)
         const h = harness({ healthFile: file })
@@ -1015,6 +1193,60 @@ describe('InboundLiveness — 健康文件是运维输入,必须当成不可信�
     }
   })
 
+  it('degraded_transitions:重启不重复计,但进程被杀前没来得及判的那次不能丢', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
+    const file = path.join(dir, 'health.json')
+    try {
+      // 1) A process that judges itself degraded and writes it down.
+      const first = harness({ healthFile: file })
+      await first.boot()
+      first.advance(STALE_MS + 1)
+      await first.judge()
+      expect(first.liveness.snapshot().degraded_transitions).toBe(1)
+
+      // 2) Restarted while still broken. The transition already happened and is
+      //    in the count — re-counting it on every restart would inflate the only
+      //    evidence the soak keeps. The restart is AFTER the first process's
+      //    last write (a wall clock that ran backwards would be a different
+      //    test, and `restore` floors that gap at 0).
+      const second = harness({
+        healthFile: file,
+        wallStart: 1_700_000_000_000 + STALE_MS + 1 + 1_000,
+      })
+      await second.boot()
+      await second.judge()
+      expect(second.liveness.current).toBe('degraded')
+      expect(second.liveness.snapshot().degraded_transitions).toBe(1)
+
+      // 3) A snapshot that says `ok` but whose silence has since crossed the
+      //    threshold: the process was killed before it could judge. That
+      //    transition is real and must be counted, or a genuine outage
+      //    disappears from the record entirely.
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          state: 'ok',
+          updated_at: new Date(1_700_000_000_000).toISOString(),
+          last_confirmed_at: new Date(1_700_000_000_000).toISOString(),
+          seconds_since_confirmed: 0,
+          degraded_transitions: 0,
+          canaries: { sent: 3, confirmed: 3, lost: 0, outstanding: 0 },
+          last_error: null,
+        }),
+      )
+      const third = harness({
+        healthFile: file,
+        wallStart: 1_700_000_000_000 + STALE_MS + 1,
+      })
+      await third.boot()
+      await third.judge()
+      expect(third.liveness.current).toBe('degraded')
+      expect(third.liveness.snapshot().degraded_transitions).toBe(1)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('计数跨重启累计 —— 泡测判据要求 confirmed 全程增长', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-liveness-'))
     const file = path.join(dir, 'health.json')
@@ -1035,6 +1267,10 @@ describe('InboundLiveness — 健康文件是运维输入,必须当成不可信�
       await second.judge()
       // 2, not 1: a launchd restart must not read as "nothing ever came through".
       expect(second.liveness.snapshot().canaries.confirmed).toBe(2)
+      // The transition counter is carried the same way — it is the ONLY evidence
+      // the soak keeps of a degradation that later recovered.
+      expect(second.liveness.snapshot().degraded_transitions).toBe(0)
+      expect(second.liveness.snapshot().canaries.sent).toBe(2)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

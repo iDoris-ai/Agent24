@@ -169,10 +169,20 @@ export class InboundBridge {
 export async function pollOnce(
   speaker: SpeakerClient,
   bridge: InboundBridge,
-  liveness?: Pick<InboundLiveness, 'observe'>,
+  liveness?: Pick<InboundLiveness, 'observe' | 'ready'>,
 ): Promise<void> {
   const rows = await speaker.inbox()
   const msgs = liveness ? liveness.observe(rows) : rows
+  // FAIL CLOSED while the probe does not know our own npub: `observe()`
+  // recognises our canaries by SENDER, so until that is resolved a canary this
+  // bridge sent is indistinguishable from peer traffic. For an operator who
+  // allowlisted their own npub that means the agent running its own probe — and
+  // replying to itself. Holding costs nothing: the inbox window is re-read every
+  // poll, so genuine peer messages are delayed, not lost. The condition is
+  // already loud elsewhere (a warning at `start()`, and the probe walks itself
+  // to `degraded` with the reason in `last_error`), so it is not logged here on
+  // every tick.
+  if (liveness && !liveness.ready) return
   for (const msg of msgs) {
     if (msg.from) await bridge.handle(msg)
   }

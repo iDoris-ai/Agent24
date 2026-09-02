@@ -270,6 +270,14 @@ export class InboundLiveness {
     return this.state
   }
 
+  /** Whether our own npub is known. Until it is, `observe()` cannot recognise
+   * our own leftover canaries, so inbound dispatch has to hold (see `pollOnce`).
+   * Resolved from the keystore at `start()`, or from the last trusted health
+   * snapshot when that read fails. */
+  get ready(): boolean {
+    return this.selfNpub !== undefined
+  }
+
   /** Resolve our own npub and pick up where the previous process left off, then
    * start the probe's own timer.
    *
@@ -621,7 +629,7 @@ export class InboundLiveness {
     // which JSON.stringify writes back out as `null`, corrupting the NEXT run's
     // restore too. Everything is therefore bounded to a safe integer range.
     const num = (v: unknown, max = Number.MAX_SAFE_INTEGER): number | null =>
-      typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max ? v : null
+      typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= max ? v : null
     const stamp = (v: unknown): number | null => {
       if (typeof v !== 'string') return null
       const t = Date.parse(v)
@@ -662,6 +670,18 @@ export class InboundLiveness {
         ? 0
         : num(prev.degraded_transitions)
       if (transitions === null) throw new Error('degraded_transitions 非法')
+      // The previous process's VERDICT, not just its silence. It decides whether
+      // this process's first judgement is a new transition:
+      //   · it was already `degraded` → the transition is in the inherited count
+      //     already, so counting again would inflate it on every restart;
+      //   · it was `ok`/`starting` and we come up past the threshold → the
+      //     transition genuinely happened between the two processes (it may have
+      //     been killed before it could judge), and NOT counting it would let a
+      //     real degradation vanish from the only evidence the soak keeps.
+      const prevState = prev.state
+      if (prevState !== undefined && !['starting', 'ok', 'degraded'].includes(prevState)) {
+        throw new Error('state 非法')
+      }
 
       // The written value is already the TOTAL silence (it includes whatever the
       // previous process itself inherited), so adding the downtime since the
@@ -676,6 +696,7 @@ export class InboundLiveness {
       // Last known identity, so a keystore we cannot read right now does not
       // leave us unable to recognise our own leftover canaries.
       if (typeof prev.self_npub === 'string' && prev.self_npub) this.selfNpub = prev.self_npub
+      if (prevState !== undefined) this.state = prevState
       if (this.restoredGapMs > this.o.staleAfterMs) {
         this.o.log.warn(
           `[nostr] ⚠️  上一轮进程留下的入站静默已有 ${Math.round(this.restoredGapMs / 1000)}s,本进程不重新计时(重启不清账)。`,
