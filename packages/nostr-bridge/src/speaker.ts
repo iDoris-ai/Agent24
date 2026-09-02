@@ -111,11 +111,22 @@ export interface SpeakerOptions {
   identity?: string
   /** Relay override; falls back to agent-speaker's default when unset. */
   relay?: string
+  /** How many inbox rows to read per poll. */
+  inboxLimit?: number
+}
+
+/** One `identity list --json` row (agent-speaker never serializes the nsec). */
+export interface IdentityEntry {
+  nickname: string
+  npub: string
+  default?: boolean
+  encrypted?: boolean
 }
 
 export class SpeakerClient {
   private readonly identity?: string
   private readonly relay?: string
+  private readonly inboxLimit: number
 
   constructor(
     private readonly run: SpeakerRunner,
@@ -123,6 +134,7 @@ export class SpeakerClient {
   ) {
     this.identity = opts.identity
     this.relay = opts.relay
+    this.inboxLimit = opts.inboxLimit ?? 100
   }
 
   private relayArgs(): string[] {
@@ -162,6 +174,25 @@ export class SpeakerClient {
     return unwrap<SendResult>(out, 'agent msg')
   }
 
+  /** `identity list --json` → the npub of `nickname`. Reads the keystore
+   * WITHOUT unlocking it (agent-speaker only needs the public half here), so
+   * this is safe to call on a headless bridge. Used by the FU-32 liveness probe,
+   * which has to address a message to this bridge's own npub. */
+  async npubFor(nickname: string): Promise<string> {
+    const data = unwrap<unknown>(await this.run(['identity', 'list', '--json']), 'identity list')
+    const rows = Array.isArray(data) ? data : ((data as { identities?: unknown[] })?.identities ?? [])
+    const hit = (rows as Record<string, unknown>[]).find(
+      (r) => String(r.nickname ?? '') === nickname,
+    )
+    const npub = hit && typeof hit.npub === 'string' ? hit.npub : ''
+    if (!npub) {
+      throw new Error(
+        `agent-speaker 里找不到身份 "${nickname}"(identity list 未返回它);检查 A24_NOSTR_IDENTITY`,
+      )
+    }
+    return npub
+  }
+
   /** search → `profile discover --capability <cap> --json` (returns data[]). */
   async discover(capability: string): Promise<DiscoverEntry[]> {
     const out = await this.run([
@@ -192,7 +223,18 @@ export class SpeakerClient {
     // sender_npub. `--as <identity>` targets THIS agent's inbox directly
     // (agent-speaker#30) — no need to hijack the keystore default identity, so
     // multiple bridges can share a keystore without racing on `identity use`.
-    const args = ['history', 'inbox', ...(this.identity ? ['--as', this.identity] : []), '--json']
+    //
+    // `--limit` is explicit rather than left at agent-speaker's default of 20:
+    // the window has to be wide enough that nothing falls out of it between two
+    // polls, and it is now also where the FU-32 liveness canary is looked for.
+    const args = [
+      'history',
+      'inbox',
+      ...(this.identity ? ['--as', this.identity] : []),
+      '--limit',
+      String(this.inboxLimit),
+      '--json',
+    ]
     const data = unwrap<unknown>(await this.run(args), 'history inbox')
     const rows = Array.isArray(data) ? data : ((data as { messages?: unknown[] })?.messages ?? [])
     return (rows as Record<string, unknown>[])
