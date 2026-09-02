@@ -60,12 +60,27 @@ async function main(): Promise<void> {
   const inbound = new InboundBridge(agent, speaker, CONFIG.IDENTITY, CONFIG.ALLOWED_NPUBS)
 
   let stopped = false
+  // A 7-day soak at a 5s interval is ~120k ticks. Logging every failure of a
+  // persistent outage buries the log; logging none hides the outage. So: log the
+  // first failure, then only at powers of two, and log the recovery.
+  let consecutiveFailures = 0
   const tick = async (): Promise<void> => {
     if (stopped) return
     try {
       await pollOnce(speaker, inbound)
+      if (consecutiveFailures > 0) {
+        console.log(`[nostr] 入站轮询已恢复(此前连续失败 ${consecutiveFailures} 次)`)
+        consecutiveFailures = 0
+      }
     } catch (err) {
-      console.error('[nostr] 轮询入站出错:', err instanceof Error ? err.message : err)
+      consecutiveFailures += 1
+      // 1, 2, 4, 8, … — first failure always speaks, then the rate decays.
+      if ((consecutiveFailures & (consecutiveFailures - 1)) === 0) {
+        console.error(
+          `[nostr] 轮询入站出错(连续第 ${consecutiveFailures} 次):`,
+          err instanceof Error ? err.message : err,
+        )
+      }
     }
     if (!stopped) setTimeout(() => void tick(), CONFIG.POLL_INTERVAL_MS)
   }

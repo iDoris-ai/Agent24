@@ -13,6 +13,7 @@
 
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { CONFIG } from './config.js'
 import type { AgentSpeakerProfile } from './profile.js'
 
 /** Runs one agent-speaker invocation and resolves its stdout. */
@@ -21,16 +22,34 @@ export type SpeakerRunner = (args: string[]) => Promise<string>
 /** The real runner: exec the `agent-speaker` binary. A `--json` error is itself
  * a JSON envelope (on stdout or stderr) plus a non-zero exit, so prefer the JSON
  * — `unwrap` surfaces the real message. Reject only when there's no JSON to
- * interpret (e.g. the binary is missing). */
-export function cliRunner(bin = 'agent-speaker'): SpeakerRunner {
+ * interpret (e.g. the binary is missing).
+ *
+ * The `timeout` is LOAD-BEARING, not defensive garnish: the caller (`tick()` in
+ * `main.ts`) only schedules the next poll after this promise settles, so a child
+ * that never calls back stops inbound permanently and silently. `killSignal`
+ * escalates past a child ignoring SIGTERM. See `CONFIG.SPEAKER_TIMEOUT_MS`. */
+export function cliRunner(bin = 'agent-speaker', timeoutMs = CONFIG.SPEAKER_TIMEOUT_MS): SpeakerRunner {
   return (args) =>
     new Promise<string>((resolve, reject) => {
-      execFile(bin, args, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
-        const out = (stdout && stdout.trim()) || (stderr && stderr.trim()) || ''
-        if (out.startsWith('{') || out.startsWith('[')) return resolve(out)
-        if (err) return reject(new Error(`agent-speaker ${args[0] ?? ''} failed: ${stderr.trim() || err.message}`))
-        resolve(stdout)
-      })
+      execFile(
+        bin,
+        args,
+        { maxBuffer: 8 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
+        (err, stdout, stderr) => {
+          const out = (stdout && stdout.trim()) || (stderr && stderr.trim()) || ''
+          if (out.startsWith('{') || out.startsWith('[')) return resolve(out)
+          // A killed child reports `err.killed`; say so explicitly, because
+          // "failed: null" tells an operator nothing at 3am.
+          const killed = (err as (Error & { killed?: boolean }) | null)?.killed
+          if (killed) {
+            return reject(
+              new Error(`agent-speaker ${args[0] ?? ''} timed out after ${timeoutMs}ms and was killed`),
+            )
+          }
+          if (err) return reject(new Error(`agent-speaker ${args[0] ?? ''} failed: ${stderr.trim() || err.message}`))
+          resolve(stdout)
+        },
+      )
     })
 }
 

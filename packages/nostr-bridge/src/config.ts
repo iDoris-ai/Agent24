@@ -34,6 +34,19 @@ export const CONFIG = {
   ALLOWED_NPUBS: parseNpubs(process.env.A24_NOSTR_ALLOWED_NPUBS),
   /** How often to poll the inbox for new peer messages. */
   POLL_INTERVAL_MS: Number(process.env.A24_NOSTR_POLL_MS) || 5_000,
+  /** Hard wall-clock cap on one `agent-speaker` invocation.
+   *
+   * WITHOUT this the whole bridge can stop for good: `tick()` in `main.ts` is a
+   * SEQUENTIAL self-rescheduling loop — it only schedules the next poll after the
+   * current one settles. An `execFile` with no timeout that never calls back
+   * (hung relay socket after the machine wakes, DNS stall, a wedged child) leaves
+   * that promise pending forever, so no further tick is ever scheduled. The
+   * process stays alive and healthy-looking, so launchd's KeepAlive never fires
+   * and nothing is logged. Inbound simply stops.
+   *
+   * 60s is well above a normal relay round-trip and below any human's patience
+   * for "why hasn't it answered". */
+  SPEAKER_TIMEOUT_MS: Number(process.env.A24_NOSTR_SPEAKER_TIMEOUT_MS) || 60_000,
 
   // ── agent24d discovery (Rust writes port+token here; env overrides win) ──
   DAEMON_STATE_FILE: path.join(HOME, '.agent24', 'daemon.json'),
