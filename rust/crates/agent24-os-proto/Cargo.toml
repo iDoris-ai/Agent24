@@ -4,17 +4,26 @@ version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Agent24 kernel↔domain-OS protocol (ME-3b): version negotiation, framing, handshake"
+description = "Agent24 kernel↔domain-OS protocol (ME-3b): version negotiation, framing, handshake, launch, supervision, constrained proxy"
 
 [dependencies]
 agent24-domain = { path = "../agent24-domain" }
+axum = { version = "0.8" }
+# 1.9 for `Bytes::from_owner` — see `PermitBytes`.
+bytes = "1.9"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # For signalling a process GROUP — a safe wrapper over `killpg`.
 rustix = { version = "0.38", features = ["process"] }
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 
 [lints]
 workspace = true

@@ -35,6 +35,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# ME-3b-4: the constrained proxy is mounted only by a test so far — the address
+# it needs comes from ME-3b-3's supervisor, which does not hand one over yet.
+# This moves to [dependencies] with that consumer.
+agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 tempfile = "3"
 sha2 = "0.10"
 tower = { version = "0.5", features = ["util"] }
