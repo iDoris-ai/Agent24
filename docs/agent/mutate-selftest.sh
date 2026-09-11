@@ -130,6 +130,16 @@ mut "$F" 'pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);' \
 expect ALIVE "$_MUT_LAST" "⑧ → 必须 🟢(否则一个永远报不出 🟢 的脚手架也能过)"
 mut "$F" '        // 500ms, 1s, 2s, 4s' '        // 1s, 2s, 4s, 8s' "⑨ 锚点在注释里"
 expect VOID "$_MUT_LAST" "⑨ → 作废"
+# ⑨b 块注释里的改动同样作废(复审 @ #172 F2)。用临时加进去的一段块注释当靶子。
+python3 - "$F" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+open(p,"w").write(s.replace("pub const REAP_TIMEOUT", "/* block note: retries 3 */\npub const REAP_TIMEOUT", 1))
+PY
+mut_baseline agent24-os-proto supervise >/dev/null || echo "    (带块注释的基线立不起来)"
+mut "$F" 'retries 3' 'retries 4' "⑨b 锚点在块注释里"
+expect VOID "$_MUT_LAST" "⑨b → 作废"
+cp "$ORIG" "$F"
+mut_baseline agent24-os-proto supervise >/dev/null || { echo "  基线立不起来"; exit 1; }
 
 mut "$CRATE_DIR/src/supervize_TYPO.rs" 'a' 'b' "⑩" >/dev/null
 expect 1 $? "⑩ 路径打错 → 拒绝"
@@ -229,6 +239,21 @@ wait_for "$GITDIR/mutate-paused-before-verdict"
 kill -TERM "$pypid"; { wait "$pypid"; } 2>/dev/null
 expect 143 $? "㉒b 读数定下之前收到的 TERM,python 自己也以 143 退出,不报读数"
 expect same "$(same_as_orig)" "㉒b 源码已恢复"
+
+# ㉒c 非交互脚本收到 INT:整批停下,第二格从未开始,脚本以 130 退出。(复审 @ #172 F1:bash 的
+# wait-and-cooperative-exit —— 用子进程把 INT 交还给 shell 时,那个子进程是正常退出的,bash 就
+# 不退出,继续跑下一格。)脚本用 perl 恢复 INT 的默认处置再启动:否则后台作业继承 SIG_IGN,
+# 这个实验本身就无效。
+: >"$FAKE/pids"; rm -f "$FAKE/running" "$FAKE/cell2"
+perl -e '$SIG{INT}="DEFAULT"; exec @ARGV' bash -c "cd $(printf %q "$ROOT") && source docs/agent/mutate.sh \
+  && MUT_CARGO=$(printf %q "$FAKE/slow") mut $(printf %q "$F") $(printf %q "$BREAKER") '        if false {' c1; \
+  : >$(printf %q "$FAKE/cell2"); MUT_CARGO=$(printf %q "$FAKE/ok") mut $(printf %q "$F") $(printf %q "$BREAKER") '        if false {' c2" >/dev/null 2>&1 &
+spid=$!
+wait_for "$FAKE/running"
+kill -INT "$spid"; { wait "$spid"; } 2>/dev/null
+expect 130 $? "㉒c 非交互脚本收到 INT → 以 130 退出"
+expect no "$([ -e "$FAKE/cell2" ] && echo yes || echo no)" "㉒c 且第二格从未开始"
+expect same "$(same_as_orig)" "㉒c 源码已恢复"
 
 echo "── 交互式 shell 里 Ctrl-C ──"
 : >"$FAKE/pids"
@@ -413,6 +438,18 @@ mut_recover >/dev/null
 expect 1 $? "㊳ 备份与记录的 sha 不符 → 不据它写"
 expect yes "$(grep -q 'USER WORK AFTER THE CRASH' "$F" && echo yes || echo no)" "㊳ 源码没被动"
 rm -rf "$GITDIR/mutate-inflight"; cp "$ORIG" "$F"
+# ㊳a SIGKILL 落在我们写到一半时(日志里有 writing 标记),之后又有人改过这个文件:recover 写回
+# 原文,但**先把此刻的内容存档**,并说出存在哪(复审 @ #172 F3)。
+kill9_mid_run
+: >"$GITDIR/mutate-inflight/writing"
+printf '\n// USER EDIT AFTER A HALF WRITE\n' >>"$F"
+rm -f "$GITDIR"/mutate-overwritten-*
+out=$(mut_recover)
+expect 0 $? "㊳a writing 标记在 → recover 写回原文"
+expect same "$(same_as_orig)" "㊳a 源码是原文"
+expect yes "$(grep -l 'USER EDIT AFTER A HALF WRITE' "$GITDIR"/mutate-overwritten-* >/dev/null 2>&1 && echo yes || echo no)" "㊳a 覆盖前的内容已存档"
+expect yes "$([[ $out == *mutate-overwritten-* ]] && echo yes || echo no)" "㊳a 且提示里说出了存档位置"
+rm -f "$GITDIR"/mutate-overwritten-*
 kill9_mid_run
 rm -f "$F"
 out=$(mut_recover)

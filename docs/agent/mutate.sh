@@ -51,12 +51,19 @@ _mut_done() { # 收到过信号:把它原样交还给本 shell —— 调用方�
   if [ -n "${_MUT_SIG:-}" ] && [[ $- != *i* ]]; then
     local sig=$_MUT_SIG
     _MUT_SIG=""
-    # 发给「本 shell」:bash 3.2 没有 $BASHPID,$$ 在子 shell 里是父 shell;而
-    # `$(sh -c 'echo $PPID')` 自己就跑在命令替换的子 shell 里,拿到的是那个子 shell。
-    # 让 sh 直接 kill 它的父进程 —— 它是本 shell 的直接子进程。
-    sh -c 'kill -s "$1" "$PPID"' _ "$sig"
-    # 调用方的 trap 运行了且没有退出 —— 那是它的决定;把 python 的返回值交给它。
-    return "$rc"
+    if [ -n "$(trap -p "$sig")" ]; then
+      # 调用方对这个信号有自己的 trap:交还信号,让它照常运行。发给「本 shell」:bash 3.2
+      # 没有 $BASHPID,$$ 在子 shell 里是父 shell;让 sh 直接 kill 它的父进程 —— sh 是本
+      # shell 的直接子进程。trap 运行了且没退出,那是调用方的决定。
+      sh -c 'kill -s "$1" "$PPID"' _ "$sig"
+      return "$rc"
+    fi
+    # 调用方没有 trap:按默认处置,整个脚本就此退出。**不能**同样用 sh 重发 —— 对 INT,
+    # bash 的 wait-and-cooperative-exit 规则只在前台子进程「也死于 SIGINT」时才让 shell
+    # 退出,而 sh 是正常退出的,于是 bash 接着跑下一格(复审 @ #172 F1 实测)。
+    # 源码没恢复(2)时保留 2:那条信息比「被信号打断」更要紧。
+    [ "$rc" -eq 2 ] && exit 2
+    exit $((128 + $(kill -l "$sig")))
   fi
   if [ "$rc" -ge 128 ] && [[ $- != *i* ]]; then exit "$rc"; fi
   return "$rc"

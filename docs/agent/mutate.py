@@ -53,8 +53,7 @@
   5. 测试进程崩溃(abort/段错误)算 🔴,但只在输出能确定崩的就是那个 lib 测试二进制时;
      别的子进程(build script、包装器)失败 → 作废。
 
-**仍然拦不住的**,如实写:唯一锚点落在 `#[cfg(...)]` 编译掉的代码、字符串字面量、或块注释
-里 → 假 🟢;测试进程另起会话的后代,只有在它父进程还活着时才能按 ppid 找到并杀掉 —— 父进程
+**仍然拦不住的**,如实写:唯一锚点落在 `#[cfg(...)]` 编译掉的代码或字符串字面量里 → 假 🟢;测试进程另起会话的后代,只有在它父进程还活着时才能按 ppid 找到并杀掉 —— 父进程
 先退出、后代被 launchd 收养的那种,找不到。选锚点时自己确认它是被编译、被执行的代码。
 
 ── 一个试过并否定的做法 ────────────────────────────────────────────────
@@ -246,6 +245,14 @@ def restore(paths, src, original, mutated_sha, meta=None):
             if sha(current) != mutated_sha and not ours_half_written:
                 conflict_message(paths, src, current, meta)
                 return False
+            if ours_half_written and sha(current) != mutated_sha:
+                # 那半截是我们写的 —— 但 SIGKILL 与 recover 之间,也可能有人改过它。覆盖前
+                # 先把此刻的字节存一份:这是「有人改过就不覆盖」这条规则唯一的例外路径,
+                # 例外也不能丢东西(复审 @ #172 F3)。
+                keep = os.path.join(paths.gitdir, f"mutate-overwritten-{int(time.time())}")
+                with open(keep, "wb") as k:
+                    k.write(current)
+                say(f"  ⚠️ {src} 处于我们写到一半的状态,已写回原文;覆盖前的内容存在 {keep}")
             write_source(paths, src, original)
             with open(src, "rb") as f:
                 if f.read() != original:
@@ -564,6 +571,10 @@ def inject(original, anchor, repl):
     line_start = s.rfind("\n", 0, p) + 1
     if "//" in s[line_start:p]:
         return None, "改动落在 // 注释里 —— 改注释不改行为(含行尾注释;字符串里的 // 也会被这样拒,方向是保守的)"
+    # 块注释:改动点之前最后一个 `/*` 在最后一个 `*/` 之后 → 在一个没闭合的块注释里。
+    # (不处理嵌套块注释;字符串里的 `/*` 也会被这样拒 —— 方向同样是保守的。)
+    if s.rfind("/*", 0, p) > s.rfind("*/", 0, p):
+        return None, "改动落在 /* */ 块注释里 —— 改注释不改行为"
     return out.encode("utf-8"), None
 
 
