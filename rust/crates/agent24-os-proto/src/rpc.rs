@@ -281,6 +281,13 @@ pub trait Handler: Send + Sync {
     /// spawned and detached, nor a `spawn_blocking` already running. A handler
     /// that does either has work that outlives cancellation and the connection,
     /// and the guarantee above does not extend to it.
+    ///
+    /// **And the future must yield.** Cancellation, the call timeout and the
+    /// shutdown when the connection ends all take effect at an `.await`; a
+    /// `poll` that loops or blocks synchronously cannot be interrupted by
+    /// anything in this process — `serve` then does not return until it does.
+    /// Guarding against a handler that never yields needs a thread or process
+    /// boundary, not a task.
     fn call(&self, params: Value) -> CallFuture;
 }
 
@@ -504,10 +511,14 @@ fn params_only(params: &Value, allowed: &[&str]) -> bool {
         .is_some_and(|m| m.keys().all(|k| allowed.contains(&k.as_str())))
 }
 
-/// The first repeated key, as a path of object keys from the top (array
-/// positions are not recorded). Call only on bytes already known to be JSON.
+/// A repeated key, as a path of object keys from the top (array positions are
+/// not recorded). **Every** repeat is found, and one in the envelope (a
+/// one-segment path) is returned in preference to one inside `params` — so
+/// `{"params":{"x":1,"x":2},"id":"a","id":"b"}` is an envelope problem, not a
+/// params problem answered with whichever id parsed last. Call only on bytes
+/// already known to be JSON.
 fn find_duplicate_key(bytes: &[u8]) -> Option<Vec<String>> {
-    let mut found: Option<Vec<String>> = None;
+    let mut found: Vec<Vec<String>> = Vec::new();
     let mut path = Vec::new();
     let mut de = serde_json::Deserializer::from_slice(bytes);
     let _ = NoDup {
@@ -515,12 +526,16 @@ fn find_duplicate_key(bytes: &[u8]) -> Option<Vec<String>> {
         found: &mut found,
     }
     .deserialize(&mut de);
-    found
+    let envelope = found.iter().position(|p| p.len() == 1);
+    match envelope {
+        Some(i) => Some(found.swap_remove(i)),
+        None => found.into_iter().next(),
+    }
 }
 
 struct NoDup<'a> {
     path: &'a mut Vec<String>,
-    found: &'a mut Option<Vec<String>>,
+    found: &'a mut Vec<Vec<String>>,
 }
 
 impl<'de> DeserializeSeed<'de> for NoDup<'_> {
@@ -569,10 +584,11 @@ impl<'de> Visitor<'de> for NoDup<'_> {
         let mut seen = HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
             if !seen.insert(key.clone()) {
+                // Record and keep scanning: a later, more serious repeat (in the
+                // envelope) must not be hidden by an earlier one (in params).
                 let mut at = path.clone();
-                at.push(key);
-                *found = Some(at);
-                return Err(de::Error::custom("duplicate key"));
+                at.push(key.clone());
+                found.push(at);
             }
             path.push(key);
             map.next_value_seed(NoDup {
@@ -770,6 +786,12 @@ where
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the response queue closed")
     }));
 
+    let mut writer_done = false;
+    // Frames are taken first (`biased`) so that an end-of-stream beats a finished
+    // call; unbounded, that lets a peer that never stops sending starve every
+    // finished call of its response (and its slot). So after this many frames in
+    // a row, one finished call — if any — is reaped before the next frame.
+    let mut frames_in_a_row = 0usize;
     let mut handlers: tokio::task::JoinSet<
         Result<Result<Value, RpcError>, tokio::time::error::Elapsed>,
     > = tokio::task::JoinSet::new();
@@ -777,10 +799,23 @@ where
     let mut in_flight: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
 
     let ended = loop {
+        if frames_in_a_row >= FRAMES_BEFORE_REAPING {
+            frames_in_a_row = 0;
+            if let Some(joined) = handlers.try_join_next_with_id() {
+                if let Some(response) = finished(joined, &mut by_task, &mut in_flight, limits)
+                    && let Err(e) = enqueue(&lines_tx, response, limits).await
+                {
+                    break e;
+                }
+                continue;
+            }
+        }
         let response = tokio::select! {
             biased;
             frame = frames_rx.recv() => match frame {
-                Some(Ok(bytes)) => match dispatch(&bytes, &methods, &|id| in_flight.contains_key(id)) {
+                Some(Ok(bytes)) => {
+                    frames_in_a_row += 1;
+                    match dispatch(&bytes, &methods, &|id| in_flight.contains_key(id)) {
                     Dispatch::Respond(r) => Some(r),
                     Dispatch::Ignore => None,
                     Dispatch::Cancel { id } => {
@@ -809,53 +844,110 @@ where
                             None
                         }
                     }
-                },
+                }
+                }
                 Some(Err(FrameError::TooLong { .. })) => break Ended::TooLong,
                 Some(Err(FrameError::Eof)) | None => break Ended::PeerClosed,
                 Some(Err(FrameError::Io(e))) => break Ended::ReadFailed(e),
             },
-            e = &mut writer_task.0 => break Ended::WriteFailed(
+            e = &mut writer_task.0 => {
+                writer_done = true;
+                break Ended::WriteFailed(
                 e.unwrap_or_else(|_| std::io::Error::other("the writer task failed")),
-            ),
+                );
+            }
             Some(joined) = handlers.join_next_with_id(), if !handlers.is_empty() => {
-                let (task, outcome) = match joined {
-                    Ok((task, Ok(outcome))) => (task, outcome),
-                    Ok((task, Err(_elapsed))) => (task, Err(RpcError::application(
-                        ErrorKind::Timeout,
-                        format!("the kernel gave up after {}ms; the call is not retried", limits.call_timeout.as_millis()),
-                    ))),
-                    Err(e) if e.is_cancelled() => (e.id(), Err(RpcError::application(
-                        ErrorKind::Cancelled,
-                        "cancelled by $/cancelRequest; any side effect already committed stays",
-                    ))),
-                    Err(e) => (e.id(), Err(RpcError::internal("the handler failed without answering"))),
-                };
-                by_task.remove(&task).map(|id| {
-                    in_flight.remove(&id);
-                    Response { id: Some(id), outcome }
-                })
+                frames_in_a_row = 0;
+                finished(joined, &mut by_task, &mut in_flight, limits)
             }
         };
-        if let Some(response) = response {
-            match lines_tx.try_send(response_line(response)) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    break Ended::PeerNotReading;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    break Ended::WriteFailed(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "the writer stopped",
-                    ));
-                }
-            }
+        if let Some(response) = response
+            && let Err(e) = enqueue(&lines_tx, response, limits).await
+        {
+            break e;
         }
     };
-    // Abort every handler and wait until each has actually finished — so on
-    // return no handler future is still alive — and discard unwritten responses.
+    // Abort every handler and the writer, and wait until each has actually
+    // finished — so on return no handler future is alive and nothing more is
+    // written. Unwritten responses are discarded.
     handlers.shutdown().await;
     drop(lines_tx);
+    if !writer_done {
+        writer_task.0.abort();
+        let _ = (&mut writer_task.0).await;
+    }
     ended
+}
+
+/// After this many frames in a row, [`serve`] reaps one finished call before
+/// reading the next frame (see the comment where it is used).
+const FRAMES_BEFORE_REAPING: usize = 16;
+
+type Joined = Result<
+    (
+        tokio::task::Id,
+        Result<Result<Value, RpcError>, tokio::time::error::Elapsed>,
+    ),
+    tokio::task::JoinError,
+>;
+
+/// Turn a finished handler task into its response, and forget its id.
+fn finished(
+    joined: Joined,
+    by_task: &mut HashMap<tokio::task::Id, String>,
+    in_flight: &mut HashMap<String, tokio::task::AbortHandle>,
+    limits: Limits,
+) -> Option<Response> {
+    let (task, outcome) = match joined {
+        Ok((task, Ok(outcome))) => (task, outcome),
+        Ok((task, Err(_elapsed))) => (
+            task,
+            Err(RpcError::application(
+                ErrorKind::Timeout,
+                format!(
+                    "the kernel gave up after {}ms; the call is not retried",
+                    limits.call_timeout.as_millis()
+                ),
+            )),
+        ),
+        Err(e) if e.is_cancelled() => (
+            e.id(),
+            Err(RpcError::application(
+                ErrorKind::Cancelled,
+                "cancelled by $/cancelRequest; any side effect already committed stays",
+            )),
+        ),
+        Err(e) => (
+            e.id(),
+            Err(RpcError::internal("the handler failed without answering")),
+        ),
+    };
+    by_task.remove(&task).map(|id| {
+        in_flight.remove(&id);
+        Response {
+            id: Some(id),
+            outcome,
+        }
+    })
+}
+
+/// Queue a response for the writer. A full queue is **not** by itself proof the
+/// peer stopped reading — a burst can fill it while the writer is making
+/// progress — so wait for room, for at most `write_timeout`; only a queue that
+/// stays full that long ends the connection.
+async fn enqueue(
+    lines: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    response: Response,
+    limits: Limits,
+) -> Result<(), Ended> {
+    match tokio::time::timeout(limits.write_timeout, lines.send(response_line(response))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_closed)) => Err(Ended::WriteFailed(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the writer stopped",
+        ))),
+        Err(_) => Err(Ended::PeerNotReading),
+    }
 }
 
 #[cfg(test)]
@@ -1920,5 +2012,132 @@ mod tests {
             "serve returned while a handler future was still alive"
         );
         module.await.unwrap();
+    }
+
+    // ── review round 2 ─────────────────────────────────────────────────
+
+    /// A burst that fills the response queue while the peer IS reading (just
+    /// slower than the kernel writes) is not "the peer stopped reading": every
+    /// response arrives and the connection stays up.
+    #[tokio::test]
+    async fn a_burst_that_fills_the_queue_is_not_mistaken_for_a_peer_that_stopped_reading() {
+        let limits = Limits {
+            max_in_flight: 2, // queue = 2 + 16
+            write_timeout: Duration::from_secs(3),
+            ..TEST_LIMITS
+        };
+        let (client, server) = tokio::io::duplex(256); // the writer blocks almost at once
+        let (sr, sw) = tokio::io::split(server);
+        let task = tokio::spawn(serve(BufReader::new(sr), sw, fixture().methods, limits));
+        let (cr, mut cw) = tokio::io::split(client);
+        let burst: Vec<u8> = (0..40)
+            .flat_map(|_| b"{not json\n".iter().copied())
+            .collect();
+        cw.write_all(&burst).await.unwrap();
+        let mut rx = BufReader::new(cr);
+        for i in 0..40 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), rx.read_line(&mut line))
+                .await
+                .unwrap_or_else(|_| panic!("response {i} never came"))
+                .unwrap();
+            assert!(line.contains("-32700"), "{line}");
+            tokio::time::sleep(Duration::from_millis(5)).await; // a slow reader
+        }
+        assert!(
+            !task.is_finished(),
+            "the connection was ended while the peer was reading"
+        );
+        cw.shutdown().await.unwrap(); // dropping one half does not close a duplex
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ended, Ended::PeerClosed), "{ended:?}");
+    }
+
+    /// A writer that enters a write and never returns, and records being dropped.
+    struct StuckWriter {
+        entered: Arc<AtomicBool>,
+        _dropped: SetOnDrop,
+    }
+    impl tokio::io::AsyncWrite for StuckWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.entered.store(true, Ordering::SeqCst);
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// When `serve` returns, the writer has stopped too — not merely been asked
+    /// to. `serve` is awaited in the test's own task, so nothing runs between its
+    /// return and the assertion.
+    #[tokio::test]
+    async fn when_serve_returns_the_writer_has_stopped() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let writer = StuckWriter {
+            entered: entered.clone(),
+            _dropped: SetOnDrop(dropped.clone()),
+        };
+        let (client, server) = tokio::io::duplex(1024);
+        let module = tokio::spawn({
+            let entered = entered.clone();
+            async move {
+                let (_rx, mut tx) = tokio::io::split(client);
+                tx.write_all(b"{not json\n").await.unwrap();
+                while !entered.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                tx.shutdown().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let (sr, _sw) = tokio::io::split(server);
+        let ended = serve(BufReader::new(sr), writer, fixture().methods, TEST_LIMITS).await;
+        let dropped_at_return = dropped.load(Ordering::SeqCst);
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "precondition: the writer was mid-write"
+        );
+        assert!(matches!(ended, Ended::PeerClosed), "{ended:?}");
+        assert!(
+            dropped_at_return,
+            "serve returned while the writer was still alive"
+        );
+        module.await.unwrap();
+    }
+
+    /// Every repeated key is found; an envelope repeat outranks an earlier one
+    /// inside params (which would otherwise be answered with whichever id parsed
+    /// last).
+    #[tokio::test]
+    async fn an_envelope_repeat_outranks_an_earlier_repeat_in_params() {
+        let mut c = connect(fixture().methods, TEST_LIMITS);
+        c.send_raw(
+            br#"{"jsonrpc":"2.0","id":"a","params":{"x":1,"x":2},"id":"b","method":"t/echo"}
+"#,
+        )
+        .await;
+        let r = c.recv().await;
+        assert_eq!(
+            (r["id"].clone(), code_of(&r)),
+            (Value::Null, i64::from(code::INVALID_REQUEST))
+        );
     }
 }

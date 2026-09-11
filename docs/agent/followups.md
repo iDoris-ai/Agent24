@@ -69,3 +69,4 @@
 - [ ] FU-48 · B · src=PR#175 review · 2026-09-11 · S1(#175 评审):SPEC 与 revoke() 的 rustdoc 说「撤销之后一律不再发送」比代码强 —— dispatch() 在 client.request 被 poll 之前返回,撤销若落在建连/取连接之间,hyper 仍可能把字节写给旧进程。结果上对(这类请求已 dispatched、归为 abandoned),措辞改为「撤销之后不再 dispatch;已 dispatch 的请求其字节仍可能到达旧进程,这正是它被归为结果未知的原因」
 - [ ] FU-49 · B · src=PR#175 review · 2026-09-11 · S2(#175 评审):回调通道必须绑定到它完成 initialize 的那一代,不能经 Current::get() 解析 —— 否则旧进程(Draining/Revoked)发来的回调会拿去对照新的 Running 一代而被放行。在 admit_callback / Current 上写明,接线(ME3-SUP)时落实。与 FU-46 同类
 - [ ] FU-50 · B · src=PR#175 review · 2026-09-11 · S3(#175 评审):代理的 legacy Client 按 authority 复用连接,重启后新一代若复用同一地址而旧进程仍在 SIGTERM 宽限期,新一代的请求可能被分到通向旧进程的 keep-alive 连接。接线时三选一:每代一个 client / 撤销时丢弃池里的连接 / 旧进程被杀之后新一代才开始接请求
+- [ ] FU-51 · B · src=PR#172 review · 2026-09-12 · 变异脚手架的自证在真实 cargo 下偶发失败(评审实测:⑦/⑦b 的崩溃偶尔读成作废、㉑ 偶尔 no-pids-recorded;失败方向是作废,不是假 🟢)。脚手架自己的规则是「自证失败 → 这一轮所有读数作废」,偶发失败会让人习惯性重跑到绿,那条规则就失效了。要找出偶发的原因并消除,而不是给自证加重试
