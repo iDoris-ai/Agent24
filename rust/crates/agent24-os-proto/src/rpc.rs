@@ -49,17 +49,34 @@ use crate::initialize::INITIALIZE_METHOD;
 /// answered `busy` at once rather than queued — a queue is memory the peer
 /// controls, which is the thing being bounded.
 ///
-/// **SPEC gives no number** (§3: "并发上限见 §5"; §5 has none). 64 matches the
-/// proxy's per-module ceiling (`proxy::MAX_INFLIGHT_PER_MODULE`) so that a module
-/// cannot hold more callbacks open than requests it is serving at full load. It
-/// is a choice, recorded as one in SPEC's ME-3c table, not a measurement.
+/// **SPEC gives no number** (§3: "并发上限见 §5"; §5 has none), so this is a
+/// choice, recorded as one (⚖️) in SPEC's ME-3c table. What it bounds is memory:
+/// each in-flight call holds its parsed params (from a frame of at most
+/// [`MAX_FRAME_BYTES`]) and, when done, a queued response of at most the same —
+/// so on the order of 64 × 2 MiB per connection. 64 is the proxy's per-module
+/// ceiling too; that is symmetry, **not** a guarantee that callbacks cannot
+/// outnumber requests — nothing ties the two, and background work (§5) has no
+/// request at all.
 pub const MAX_IN_FLIGHT_PER_CONNECTION: usize = 64;
 
 /// How long the kernel works on one callback before answering `timeout`. Not
-/// retried: a callback may have side effects (SPEC §3). Same caveat as above —
-/// SPEC gives no number; 30s matches the proxy's total deadline, so a callback
-/// made on behalf of a proxied request cannot outlive that request by design.
+/// retried: a callback may have side effects (SPEC §3). SPEC gives no number;
+/// 30s is the proxy's total deadline, chosen for symmetry (⚖️). It does **not**
+/// make a callback end with the request it was made for — a callback started at
+/// second 29 of a request can outlive it by nearly 30s. Bounding a callback by
+/// its request's remaining time needs the `request_id` link (ME-3b-5's
+/// `admit_callback`, wired in by the first business method).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long one response may take to be written before the connection is given
+/// up on. A module that stops reading must not be able to stall the kernel's
+/// side of the connection.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest request id accepted (SPEC §3: ids are strings; it does not bound
+/// them). Unbounded ids make every per-id structure — the in-flight table, the
+/// `duplicate_id` echo — sized by the peer.
+pub const MAX_ID_BYTES: usize = 256;
 
 /// Cancellation, LSP-style (SPEC §3): a **notification**, `params: {id}`.
 pub const CANCEL_METHOD: &str = "$/cancelRequest";
@@ -258,6 +275,12 @@ pub trait Handler: Send + Sync {
 
     /// Run the call. Dropped — not awaited to completion — on cancellation,
     /// timeout, or the connection ending.
+    ///
+    /// **All of the call's work must live in the returned future.** `serve`
+    /// guarantees that the future is dropped; it cannot reach a task the handler
+    /// spawned and detached, nor a `spawn_blocking` already running. A handler
+    /// that does either has work that outlives cancellation and the connection,
+    /// and the guarantee above does not extend to it.
     fn call(&self, params: Value) -> CallFuture;
 }
 
@@ -305,50 +328,38 @@ pub enum Dispatch {
 
 /// Classify one post-handshake frame. Pure: no I/O, no clock.
 ///
-/// `in_flight` is the set of ids currently running on this connection.
+/// `in_flight` answers "is this id running on this connection right now" — a
+/// lookup, not a set, so classifying a frame does not cost a copy of every
+/// in-flight id (with 64 long ids in flight, a copy per frame was measured at
+/// ~22ms per 33-byte notification).
 ///
-/// **A reused in-flight id is answered with `id: null`**, carrying the id in
-/// `error.data.duplicate_id`. SPEC §3 says the second request fails; it does not
-/// say how to answer it, and the obvious answer (echo the id) makes the error
-/// indistinguishable from a response to the FIRST request — the caller would
-/// pair it with the call that is still running. `null` is JSON-RPC's own answer
-/// for "the id of this request cannot be used", and the original request still
-/// gets its own response later.
+/// The order is part of the contract:
+///
+/// 1. **Not JSON** → `-32700`, `id: null`. Syntax first: a frame that is both
+///    truncated and has a repeated key is malformed JSON, not "a duplicate".
+/// 2. **Not an object** → `-32600`, `id: null` (a batch, or a scalar).
+/// 3. **A repeated key in the envelope** (including `params` itself appearing
+///    twice) → `-32600`, `id: null` — which of two ids is meant is itself the
+///    problem. Without any `id` member at all it is a notification, and is not
+///    answered.
+/// 4. **The id**: a string of at most [`MAX_ID_BYTES`], else `-32600`, `id: null`.
+/// 5. **An id already in flight** → `-32600`, `id: null`, with the id in
+///    `error.data.duplicate_id` — checked **before** any other validation.
+///    Echoing the id would pair the error with the call that is still running
+///    (SPEC §3 says the second request fails; it does not say how, and every
+///    later check that echoes the id would make that pairing again). `null` is
+///    JSON-RPC's own answer for "this request's id cannot be used"; the original
+///    request still gets its own response.
+/// 6. Everything else — envelope members, `jsonrpc`, `method`, `params`,
+///    `initialize` again, unknown methods, a repeated key inside `params`,
+///    `check_params` — fails that one request with its id echoed.
 #[must_use]
-pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &HashSet<String>) -> Dispatch {
-    // Duplicate keys first, over the RAW bytes: parsing into a map keeps the last
-    // value and forgets that there were two — "last one wins" lets a sender show
-    // one value to a logger and another to a checker (SPEC §8 ME-3c).
-    match find_duplicate_key(frame) {
-        Err(e) => return Dispatch::Respond(Response::error(None, RpcError::parse_error(e))),
-        Ok(Some(path)) => {
-            let in_params = path.first().is_some_and(|p| p == "params");
-            let where_ = path.join(".");
-            if in_params {
-                // The envelope itself is sound, so the id can be trusted.
-                let id = serde_json::from_slice::<Value>(frame)
-                    .ok()
-                    .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_owned));
-                if id.is_none() {
-                    return Dispatch::Ignore; // a notification: never answered
-                }
-                return Dispatch::Respond(Response::error(
-                    id,
-                    RpcError::invalid_params(format!("duplicate key `{where_}` in params")),
-                ));
-            }
-            return Dispatch::Respond(Response::error(
-                None,
-                RpcError::invalid_request(format!("duplicate key `{where_}` in the request")),
-            ));
-        }
-        Ok(None) => {}
-    }
+pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &dyn Fn(&str) -> bool) -> Dispatch {
+    let respond_null = |e: RpcError| Dispatch::Respond(Response::error(None, e));
+
     let value: Value = match serde_json::from_slice(frame) {
         Ok(v) => v,
-        Err(e) => {
-            return Dispatch::Respond(Response::error(None, RpcError::parse_error(e.to_string())));
-        }
+        Err(e) => return respond_null(RpcError::parse_error(e.to_string())),
     };
     let Value::Object(obj) = value else {
         let what = if value.is_array() {
@@ -356,20 +367,47 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &HashSet<String>) ->
         } else {
             "a request must be a JSON object"
         };
-        return Dispatch::Respond(Response::error(None, RpcError::invalid_request(what)));
+        return respond_null(RpcError::invalid_request(what));
     };
 
-    // The id, if it can be determined. SPEC §3: ids are strings.
+    // Repeated keys, over the RAW bytes: parsing into a map keeps the last value
+    // and forgets there were two — "last one wins" lets a sender show one value
+    // to a logger and another to a checker (SPEC §8 ME-3c). The frame is known
+    // to be valid JSON here, so the scan fails only on a duplicate.
+    let duplicate = find_duplicate_key(frame);
+    let has_id = obj.contains_key("id");
+    if let Some(path) = duplicate.as_ref().filter(|p| p.len() == 1) {
+        if !has_id {
+            return Dispatch::Ignore; // a notification: never answered
+        }
+        return respond_null(RpcError::invalid_request(format!(
+            "duplicate key `{}` in the request",
+            path[0]
+        )));
+    }
+    let duplicate_in_params = duplicate
+        .as_ref()
+        .filter(|p| p.len() > 1 && p[0] == "params")
+        .map(|p| p.join("."));
+
     let id = match obj.get("id") {
         None => None,
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(_) => {
-            return Dispatch::Respond(Response::error(
-                None,
-                RpcError::invalid_request("the id must be a string"),
-            ));
+        Some(Value::String(s)) if s.len() <= MAX_ID_BYTES => Some(s.clone()),
+        Some(Value::String(_)) => {
+            return respond_null(RpcError::invalid_request(format!(
+                "the id is longer than {MAX_ID_BYTES} bytes"
+            )));
         }
+        Some(_) => return respond_null(RpcError::invalid_request("the id must be a string")),
     };
+    if let Some(id) = &id
+        && in_flight(id)
+    {
+        return respond_null(
+            RpcError::invalid_request("this id is already in flight on this connection")
+                .with_data("duplicate_id", Value::String(id.clone())),
+        );
+    }
     let fail = |e: RpcError| match &id {
         Some(id) => Dispatch::Respond(Response::error(Some(id.clone()), e)),
         None => Dispatch::Ignore,
@@ -380,7 +418,8 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &HashSet<String>) ->
         .find(|k| !matches!(k.as_str(), "jsonrpc" | "id" | "method" | "params"))
     {
         return fail(RpcError::invalid_request(format!(
-            "unknown member `{extra}`"
+            "unknown member `{}`",
+            clip(extra)
         )));
     }
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
@@ -397,7 +436,7 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &HashSet<String>) ->
 
     let Some(id) = id.clone() else {
         // A notification.
-        if method == CANCEL_METHOD {
+        if method == CANCEL_METHOD && duplicate_in_params.is_none() {
             return match params.get("id").and_then(Value::as_str) {
                 Some(target) if params_only(&params, &["id", "_meta"]) => Dispatch::Cancel {
                     id: target.to_owned(),
@@ -418,18 +457,23 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &HashSet<String>) ->
             "`$/cancelRequest` is a notification; send it without an id",
         ));
     }
-    if in_flight.contains(&id) {
-        return Dispatch::Respond(Response::error(
-            None,
-            RpcError::invalid_request("this id is already in flight on this connection")
-                .with_data("duplicate_id", Value::String(id)),
-        ));
-    }
     let Some(handler) = methods.get(method) else {
         return fail(RpcError::method_not_found(method));
     };
-    if let Err(why) = handler.check_params(&params) {
-        return fail(RpcError::invalid_params(why));
+    if let Some(at) = duplicate_in_params {
+        return fail(RpcError::invalid_params(format!(
+            "duplicate key `{}` in params",
+            clip(&at)
+        )));
+    }
+    // A validator that panics is a kernel bug; it must fail that one request,
+    // not unwind through the connection and take every other call with it.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handler.check_params(&params)
+    })) {
+        Ok(Ok(())) => {}
+        Ok(Err(why)) => return fail(RpcError::invalid_params(why)),
+        Err(_) => return fail(RpcError::internal("the method's params check failed")),
     }
     Dispatch::Call {
         id,
@@ -438,29 +482,40 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &HashSet<String>) ->
     }
 }
 
+/// Longest string echoed back from a request into an error message. A message
+/// that repeats an attacker-chosen string in full could itself exceed the frame
+/// limit (a 1 MiB method name, echoed, is a response over 1 MiB).
+const ECHO_LIMIT: usize = 128;
+
+fn clip(s: &str) -> String {
+    if s.len() <= ECHO_LIMIT {
+        return s.to_owned();
+    }
+    let mut end = ECHO_LIMIT;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 fn params_only(params: &Value, allowed: &[&str]) -> bool {
     params
         .as_object()
         .is_some_and(|m| m.keys().all(|k| allowed.contains(&k.as_str())))
 }
 
-/// `Err` = not JSON at all. `Ok(Some(path))` = the first repeated key, as a path
-/// of object keys from the top (array positions are not recorded).
-fn find_duplicate_key(bytes: &[u8]) -> Result<Option<Vec<String>>, String> {
+/// The first repeated key, as a path of object keys from the top (array
+/// positions are not recorded). Call only on bytes already known to be JSON.
+fn find_duplicate_key(bytes: &[u8]) -> Option<Vec<String>> {
     let mut found: Option<Vec<String>> = None;
     let mut path = Vec::new();
     let mut de = serde_json::Deserializer::from_slice(bytes);
-    let r = NoDup {
+    let _ = NoDup {
         path: &mut path,
         found: &mut found,
     }
-    .deserialize(&mut de)
-    .and_then(|()| de.end());
-    match (r, found) {
-        (_, Some(p)) => Ok(Some(p)),
-        (Ok(()), None) => Ok(None),
-        (Err(e), None) => Err(e.to_string()),
-    }
+    .deserialize(&mut de);
+    found
 }
 
 struct NoDup<'a> {
@@ -533,11 +588,15 @@ impl<'de> Visitor<'de> for NoDup<'_> {
 // ── the connection ──────────────────────────────────────────────────────
 
 /// Per-connection limits. Production uses [`Limits::default`]; tests shrink them
-/// so the `busy` and `timeout` branches are reachable in milliseconds.
-#[derive(Debug, Clone, Copy)]
+/// so the `busy`, `timeout` and stuck-writer branches are reachable in
+/// milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub max_in_flight: usize,
     pub call_timeout: Duration,
+    /// How long one response may take to be written before the connection is
+    /// given up on.
+    pub write_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -545,12 +604,14 @@ impl Default for Limits {
         Self {
             max_in_flight: MAX_IN_FLIGHT_PER_CONNECTION,
             call_timeout: CALL_TIMEOUT,
+            write_timeout: WRITE_TIMEOUT,
         }
     }
 }
 
-/// Why [`serve`] returned. Every in-flight call has been dropped by then, and
-/// none of them was answered — the connection they would be answered on is gone.
+/// Why [`serve`] returned. By then every in-flight handler future **has been
+/// dropped** (not merely asked to stop), and none of them was answered — the
+/// connection they would be answered on is gone.
 #[derive(Debug)]
 pub enum Ended {
     /// The module closed the connection.
@@ -560,8 +621,10 @@ pub enum Ended {
     TooLong,
     /// Reading failed.
     ReadFailed(std::io::Error),
-    /// Writing a response failed.
+    /// Writing a response failed, or took longer than `write_timeout`.
     WriteFailed(std::io::Error),
+    /// The module stopped reading: responses piled up past the queue.
+    PeerNotReading,
 }
 
 /// Read one frame from an async reader — [`crate::frame::read_frame`]'s rules,
@@ -613,8 +676,7 @@ pub async fn read_frame_async<R: AsyncBufRead + Unpin>(src: &mut R) -> Result<Ve
     }
 }
 
-/// Aborts a task when dropped — so a call whose connection ended, or whose
-/// outer task was aborted, does not keep running detached.
+/// Aborts a task when dropped.
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
@@ -623,47 +685,51 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-async fn run_call(
-    handler: Arc<dyn Handler>,
-    params: Value,
-    cancel: tokio::sync::oneshot::Receiver<()>,
-    timeout: Duration,
-) -> Result<Value, RpcError> {
-    // On its own task so a panicking handler becomes an error response instead
-    // of a call that never answers (and an id that stays "in flight" forever).
-    let mut inner = AbortOnDrop(tokio::spawn(async move {
-        tokio::time::timeout(timeout, handler.call(params)).await
-    }));
-    tokio::select! {
-        r = &mut inner.0 => match r {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(_elapsed)) => Err(RpcError::application(
-                ErrorKind::Timeout,
-                format!("the kernel gave up after {}ms; the call is not retried", timeout.as_millis()),
-            )),
-            Err(_) => Err(RpcError::internal("the handler failed without answering")),
-        },
-        Ok(()) = cancel => Err(RpcError::application(
-            ErrorKind::Cancelled,
-            "cancelled by $/cancelRequest; any side effect already committed stays",
-        )),
+/// The line to write for `response`. A response that would exceed the frame
+/// limit is replaced by an error for the same id — the peer applies the same
+/// framing rule and would disconnect on it (SPEC §5: limits in both
+/// directions).
+fn response_line(response: Response) -> Vec<u8> {
+    let line = response.to_line();
+    if line.len() <= MAX_FRAME_BYTES + 1 {
+        return line;
     }
+    Response::error(
+        response.id,
+        RpcError::internal(format!(
+            "the response would exceed the {MAX_FRAME_BYTES}-byte frame limit"
+        )),
+    )
+    .to_line()
 }
 
 /// Run a connection after its handshake: read frames, run calls concurrently,
 /// write each response when its call finishes (so responses may be out of
-/// order), until the peer closes, a line is too long, or I/O fails.
+/// order), until the peer closes, a line is too long, the peer stops reading,
+/// or I/O fails.
 ///
-/// When it returns, every in-flight call has been dropped **without a response**
-/// (SPEC §3: the connection they would be answered on is gone).
-pub async fn serve<R, W>(reader: R, mut writer: W, methods: Methods, limits: Limits) -> Ended
+/// Structure, and why each part is where it is:
+///
+/// - **Frames come from a dedicated reader task.** `read_frame_async` is not
+///   cancel-safe; racing it in the `select!` below would drop a half-read frame
+///   and desynchronise the stream.
+/// - **Responses go to a dedicated writer task through a bounded queue**, and
+///   each write has a deadline. A module that stops reading must not freeze this
+///   loop — with the writer inline, a full socket buffer blocks the loop, which
+///   then stops reading frames, so a cancel or a close is never seen. A full
+///   queue or a write past its deadline ends the connection instead.
+/// - **Handlers run directly in a `JoinSet` owned here** — one task each, no
+///   nesting. Cancelling aborts the task and the `cancelled` response is sent
+///   when the set reports the task finished, i.e. after the handler future has
+///   been dropped. On return, `shutdown().await` waits for every task to finish,
+///   so no handler future outlives the connection.
+/// - **`biased`, frames first**: when an end-of-stream and a finished call are
+///   ready together, the end wins, and nothing more is written.
+pub async fn serve<R, W>(reader: R, writer: W, methods: Methods, limits: Limits) -> Ended
 where
     R: AsyncBufRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    // Frames arrive from a dedicated reader task: `read_frame_async` is not
-    // cancel-safe, and racing it against "a call finished" would drop a
-    // half-read frame and desynchronise the stream.
     let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, FrameError>>(1);
     let _reader = AbortOnDrop(tokio::spawn(async move {
         let mut reader = reader;
@@ -676,70 +742,119 @@ where
         }
     }));
 
-    let (done_tx, mut done_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, Result<Value, RpcError>)>();
-    // id → the cancel trigger (taken when fired). Removed when the call answers.
-    let mut in_flight: HashMap<String, Option<tokio::sync::oneshot::Sender<()>>> = HashMap::new();
-    let mut calls = tokio::task::JoinSet::new();
+    // Room for one response per in-flight call plus a few immediate errors; a
+    // peer that lets it fill is not reading.
+    let (lines_tx, mut lines_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(limits.max_in_flight + 16);
+    let write_timeout = limits.write_timeout;
+    let mut writer_task = AbortOnDrop(tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(line) = lines_rx.recv().await {
+            let write = async {
+                writer.write_all(&line).await?;
+                writer.flush().await
+            };
+            match tokio::time::timeout(write_timeout, write).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return e,
+                Err(_) => {
+                    return std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "a response took longer than {}ms to write",
+                            write_timeout.as_millis()
+                        ),
+                    );
+                }
+            }
+        }
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the response queue closed")
+    }));
+
+    let mut handlers: tokio::task::JoinSet<
+        Result<Result<Value, RpcError>, tokio::time::error::Elapsed>,
+    > = tokio::task::JoinSet::new();
+    let mut by_task: HashMap<tokio::task::Id, String> = HashMap::new();
+    let mut in_flight: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
 
     let ended = loop {
-        let line = tokio::select! {
+        let response = tokio::select! {
+            biased;
             frame = frames_rx.recv() => match frame {
-                Some(Ok(bytes)) => {
-                    let ids: HashSet<String> = in_flight.keys().cloned().collect();
-                    match dispatch(&bytes, &methods, &ids) {
-                        Dispatch::Respond(r) => Some(r.to_line()),
-                        Dispatch::Ignore => None,
-                        Dispatch::Cancel { id } => {
-                            if let Some(trigger) = in_flight.get_mut(&id).and_then(Option::take) {
-                                let _ = trigger.send(());
-                            }
+                Some(Ok(bytes)) => match dispatch(&bytes, &methods, &|id| in_flight.contains_key(id)) {
+                    Dispatch::Respond(r) => Some(r),
+                    Dispatch::Ignore => None,
+                    Dispatch::Cancel { id } => {
+                        // The `cancelled` response is sent when the set reports the
+                        // task finished — after the handler future is dropped.
+                        if let Some(handle) = in_flight.get(&id) {
+                            handle.abort();
+                        }
+                        None
+                    }
+                    Dispatch::Call { id, params, handler } => {
+                        if in_flight.len() >= limits.max_in_flight {
+                            Some(Response::error(Some(id), RpcError::application(
+                                ErrorKind::Busy,
+                                format!("{} calls are already in flight on this connection", limits.max_in_flight),
+                            )))
+                        } else {
+                            let timeout = limits.call_timeout;
+                            // `call` runs inside the task, so a handler that panics
+                            // while building its future is caught too.
+                            let handle = handlers.spawn(async move {
+                                tokio::time::timeout(timeout, handler.call(params)).await
+                            });
+                            by_task.insert(handle.id(), id.clone());
+                            in_flight.insert(id, handle);
                             None
                         }
-                        Dispatch::Call { id, params, handler } => {
-                            if in_flight.len() >= limits.max_in_flight {
-                                Some(Response::error(Some(id), RpcError::application(
-                                    ErrorKind::Busy,
-                                    format!("{} calls are already in flight on this connection", limits.max_in_flight),
-                                )).to_line())
-                            } else {
-                                let (trigger, cancel) = tokio::sync::oneshot::channel();
-                                in_flight.insert(id.clone(), Some(trigger));
-                                let done = done_tx.clone();
-                                let timeout = limits.call_timeout;
-                                calls.spawn(async move {
-                                    let outcome = run_call(handler, params, cancel, timeout).await;
-                                    let _ = done.send((id, outcome));
-                                });
-                                None
-                            }
-                        }
                     }
-                }
+                },
                 Some(Err(FrameError::TooLong { .. })) => break Ended::TooLong,
                 Some(Err(FrameError::Eof)) | None => break Ended::PeerClosed,
                 Some(Err(FrameError::Io(e))) => break Ended::ReadFailed(e),
             },
-            Some((id, outcome)) = done_rx.recv() => {
-                in_flight.remove(&id);
-                Some(Response { id: Some(id), outcome }.to_line())
+            e = &mut writer_task.0 => break Ended::WriteFailed(
+                e.unwrap_or_else(|_| std::io::Error::other("the writer task failed")),
+            ),
+            Some(joined) = handlers.join_next_with_id(), if !handlers.is_empty() => {
+                let (task, outcome) = match joined {
+                    Ok((task, Ok(outcome))) => (task, outcome),
+                    Ok((task, Err(_elapsed))) => (task, Err(RpcError::application(
+                        ErrorKind::Timeout,
+                        format!("the kernel gave up after {}ms; the call is not retried", limits.call_timeout.as_millis()),
+                    ))),
+                    Err(e) if e.is_cancelled() => (e.id(), Err(RpcError::application(
+                        ErrorKind::Cancelled,
+                        "cancelled by $/cancelRequest; any side effect already committed stays",
+                    ))),
+                    Err(e) => (e.id(), Err(RpcError::internal("the handler failed without answering"))),
+                };
+                by_task.remove(&task).map(|id| {
+                    in_flight.remove(&id);
+                    Response { id: Some(id), outcome }
+                })
             }
-            // Reap finished call tasks so the set does not grow without bound.
-            Some(_) = calls.join_next(), if !calls.is_empty() => None,
         };
-        if let Some(line) = line
-            && let Err(e) = async {
-                writer.write_all(&line).await?;
-                writer.flush().await
+        if let Some(response) = response {
+            match lines_tx.try_send(response_line(response)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    break Ended::PeerNotReading;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    break Ended::WriteFailed(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "the writer stopped",
+                    ));
+                }
             }
-            .await
-        {
-            break Ended::WriteFailed(e);
         }
     };
-    // Dropping the set aborts every call task, and each aborts its handler task
-    // (AbortOnDrop) — no call outlives its connection, and none is answered.
-    calls.abort_all();
+    // Abort every handler and wait until each has actually finished — so on
+    // return no handler future is still alive — and discard unwritten responses.
+    handlers.shutdown().await;
+    drop(lines_tx);
     ended
 }
 
@@ -879,7 +994,10 @@ mod tests {
                 .await
                 .expect("no response within 5s")
                 .unwrap();
-            serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line:?}"))
+            let v: Value =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line:?}"));
+            assert_eq!(v["jsonrpc"], "2.0", "not a JSON-RPC 2.0 response: {line}");
+            v
         }
         /// Nothing arrives within `ms` (the connection may still be open).
         async fn silent_for(&mut self, ms: u64) {
@@ -907,6 +1025,7 @@ mod tests {
     const TEST_LIMITS: Limits = Limits {
         max_in_flight: 8,
         call_timeout: Duration::from_secs(10),
+        write_timeout: Duration::from_secs(10),
     };
 
     // ── SPEC §8 ME-3c, one test per clause ──────────────────────────────
@@ -964,7 +1083,9 @@ mod tests {
         assert_eq!(r["id"], "h");
         assert_eq!(code_of(&r), i64::from(code::APPLICATION));
         assert_eq!(kind(&r), Some("cancelled"));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(code_of(&r), i64::from(code::APPLICATION));
+        // Asserted at the moment `cancelled` is read — not 50ms later: the
+        // response is sent only after the handler future has been dropped.
         assert!(
             hang.dropped.load(Ordering::SeqCst),
             "the handler kept running"
@@ -996,7 +1117,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(ended, Ended::PeerClosed), "{ended:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Asserted at the moment `serve` returns — not 50ms later.
         assert!(
             hang.dropped.load(Ordering::SeqCst),
             "the call outlived its connection"
@@ -1018,14 +1139,21 @@ mod tests {
         let mut c = connect(
             f.methods,
             Limits {
-                max_in_flight: 8,
                 call_timeout: Duration::from_millis(100),
+                ..TEST_LIMITS
             },
         );
+        let started = std::time::Instant::now();
         c.send(req("h", "t/hang", json!({}))).await;
         let r = c.recv().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "took {:?} for a 100ms timeout",
+            started.elapsed()
+        );
         assert_eq!(r["id"], "h");
         assert_eq!(kind(&r), Some("timeout"));
+        assert_eq!(code_of(&r), i64::from(code::APPLICATION));
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(hang.calls.load(Ordering::SeqCst), 1, "retried");
         assert!(hang.dropped.load(Ordering::SeqCst));
@@ -1152,7 +1280,7 @@ mod tests {
             f.methods,
             Limits {
                 max_in_flight: 1,
-                call_timeout: Duration::from_secs(10),
+                ..TEST_LIMITS
             },
         );
         c.send(req("h", "t/hang", json!({}))).await;
@@ -1160,6 +1288,7 @@ mod tests {
         let r = c.recv().await;
         assert_eq!(r["id"], "b");
         assert_eq!(kind(&r), Some("busy"));
+        assert_eq!(code_of(&r), i64::from(code::APPLICATION));
         c.send(json!({"jsonrpc": "2.0", "method": CANCEL_METHOD, "params": {"id": "h"}}))
             .await;
         assert_eq!(kind(&c.recv().await), Some("cancelled"));
@@ -1269,6 +1398,13 @@ mod tests {
             .unwrap();
         assert!(matches!(ended, Ended::TooLong), "{ended:?}");
         writer.abort();
+        // SPEC's ME-3c table: disconnect without answering first.
+        let mut rest = String::new();
+        assert_eq!(
+            c.rx.read_line(&mut rest).await.unwrap(),
+            0,
+            "answered before disconnecting: {rest}"
+        );
     }
 
     // ── the pieces ──────────────────────────────────────────────────────
@@ -1348,5 +1484,441 @@ mod tests {
                 "handshake kind {k} is not in the closed set"
             );
         }
+    }
+
+    // ── review round 1 (Codex + an independent reviewer) ────────────────
+
+    /// Answers with a string larger than the frame limit.
+    struct Big;
+    impl Handler for Big {
+        fn check_params(&self, _: &Value) -> Result<(), String> {
+            Ok(())
+        }
+        fn call(&self, _: Value) -> CallFuture {
+            Box::pin(async move { Ok(Value::String("x".repeat(MAX_FRAME_BYTES + 10))) })
+        }
+    }
+
+    /// Its params check panics.
+    struct PanicCheck;
+    impl Handler for PanicCheck {
+        fn check_params(&self, _: &Value) -> Result<(), String> {
+            panic!("validator bug")
+        }
+        fn call(&self, _: Value) -> CallFuture {
+            Box::pin(async move { Ok(Value::Null) })
+        }
+    }
+
+    /// The in-flight check comes BEFORE every other validation: a malformed
+    /// request that reuses a running id is answered `id: null` too — otherwise
+    /// its error is paired with the call still running.
+    #[tokio::test]
+    async fn a_reused_id_is_answered_null_even_when_the_request_is_also_malformed() {
+        let f = fixture();
+        let mut c = connect(f.methods, TEST_LIMITS);
+        c.send(req("a", "t/hang", json!({}))).await;
+        let shapes = [
+            json!({"jsonrpc": "2.0", "id": "a", "method": "t/echo", "params": [1]}),
+            json!({"jsonrpc": "2.0", "id": "a", "method": INITIALIZE_METHOD}),
+            json!({"jsonrpc": "2.0", "id": "a", "method": CANCEL_METHOD, "params": {"id": "a"}}),
+            json!({"jsonrpc": "2.0", "id": "a", "method": "t/echo", "extra": 1}),
+            json!({"jsonrpc": "1.0", "id": "a", "method": "t/echo"}),
+            json!({"jsonrpc": "2.0", "id": "a", "method": 7}),
+        ];
+        for shape in shapes {
+            c.send(shape.clone()).await;
+            let r = c.recv().await;
+            assert_eq!(r["id"], Value::Null, "{shape}");
+            assert_eq!(r["error"]["data"]["duplicate_id"], "a", "{shape}");
+        }
+        c.send_raw(
+            br#"{"jsonrpc":"2.0","id":"a","method":"t/strict","params":{"n":1,"n":2}}
+"#,
+        )
+        .await;
+        let r = c.recv().await;
+        assert_eq!(r["id"], Value::Null, "params duplicate on a running id");
+        assert_eq!(r["error"]["data"]["duplicate_id"], "a");
+    }
+
+    /// A cancel stops its target and nothing else.
+    #[tokio::test]
+    async fn a_cancel_stops_only_its_target() {
+        let f = fixture();
+        let mut c = connect(f.methods, TEST_LIMITS);
+        c.send(req("x", "t/echo", json!({"delay_ms": 300, "tag": "x"})))
+            .await;
+        c.send(req("y", "t/echo", json!({"delay_ms": 300, "tag": "y"})))
+            .await;
+        c.send(json!({"jsonrpc": "2.0", "method": CANCEL_METHOD, "params": {"id": "x"}}))
+            .await;
+        let first = c.recv().await;
+        assert_eq!(
+            (first["id"].clone(), kind(&first)),
+            (json!("x"), Some("cancelled"))
+        );
+        let second = c.recv().await;
+        assert_eq!(second["id"], "y");
+        assert_eq!(second["result"]["tag"], "y");
+    }
+
+    /// Where a repeated key sits decides the answer: the envelope (including
+    /// `params` itself twice) → -32600 null; inside params, at any depth
+    /// including inside arrays → -32602 with the id; no id member → a
+    /// notification, unanswered; truncated JSON → -32700, whatever else.
+    #[tokio::test]
+    async fn repeated_keys_are_classified_by_where_they_are() {
+        let f = fixture();
+        let strict = f.strict.clone();
+        let mut c = connect(f.methods, TEST_LIMITS);
+        for (raw, code, id) in [
+            (&br#"{"jsonrpc":"2.0","id":"p","method":"t/strict","params":{"n":1},"params":{"n":2}}"#[..], code::INVALID_REQUEST, Value::Null),
+            (&br#"{"jsonrpc":"2.0","id":"m","method":"t/strict","method":"t/echo","params":{"n":1}}"#[..], code::INVALID_REQUEST, Value::Null),
+            (&br#"{"jsonrpc":"2.0","id":"q","method":"t/strict","params":{"n":1,"l":[{"k":1,"k":2}]}}"#[..], code::INVALID_PARAMS, json!("q")),
+            (&br#"{"jsonrpc":"2.0","id":7,"method":"t/strict","params":{"n":1,"n":2}}"#[..], code::INVALID_REQUEST, Value::Null),
+            (&br#"{"jsonrpc":"2.0","id":"t","method":"t/strict","params":{"n":1,"n":2"#[..], code::PARSE_ERROR, Value::Null),
+        ] {
+            c.send_raw(&[raw, b"\n"].concat()).await;
+            let r = c.recv().await;
+            assert_eq!(code_of(&r), i64::from(code), "{}", String::from_utf8_lossy(raw));
+            assert_eq!(r["id"], id, "{}", String::from_utf8_lossy(raw));
+        }
+        // A notification with a repeated key: never answered.
+        c.send_raw(
+            br#"{"jsonrpc":"2.0","method":"t/echo","method":"t/strict"}
+"#,
+        )
+        .await;
+        c.silent_for(150).await;
+        assert_eq!(strict.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_id_longer_than_the_limit_is_refused() {
+        let f = fixture();
+        let mut c = connect(f.methods, TEST_LIMITS);
+        c.send(req(&"i".repeat(MAX_ID_BYTES + 1), "t/echo", json!({})))
+            .await;
+        let r = c.recv().await;
+        assert_eq!(
+            (r["id"].clone(), code_of(&r)),
+            (Value::Null, i64::from(code::INVALID_REQUEST))
+        );
+        // Control: exactly the limit is fine.
+        let id = "i".repeat(MAX_ID_BYTES);
+        c.send(req(&id, "t/echo", json!({}))).await;
+        assert_eq!(c.recv().await["id"], json!(id));
+    }
+
+    /// A blank line is not JSON: -32700, and the connection carries on.
+    #[tokio::test]
+    async fn a_blank_line_is_a_parse_error() {
+        let f = fixture();
+        let mut c = connect(f.methods, TEST_LIMITS);
+        c.send_raw(b"\n").await;
+        assert_eq!(code_of(&c.recv().await), i64::from(code::PARSE_ERROR));
+        c.send(req("n", "t/echo", json!({}))).await;
+        assert_eq!(c.recv().await["id"], "n");
+    }
+
+    /// The envelope is closed: `method` must be a string, `jsonrpc` must be
+    /// present, `_meta` belongs in params not beside it. Absent params are `{}`.
+    #[tokio::test]
+    async fn the_envelope_is_strict_and_absent_params_are_an_empty_object() {
+        let f = fixture();
+        let mut c = connect(f.methods, TEST_LIMITS);
+        for shape in [
+            json!({"jsonrpc": "2.0", "id": "a", "method": 7}),
+            json!({"id": "a", "method": "t/echo"}),
+            json!({"jsonrpc": "2.0", "id": "a", "method": "t/echo", "_meta": {}}),
+        ] {
+            c.send(shape.clone()).await;
+            let r = c.recv().await;
+            assert_eq!(
+                (r["id"].clone(), code_of(&r)),
+                (json!("a"), i64::from(code::INVALID_REQUEST)),
+                "{shape}"
+            );
+        }
+        c.send(json!({"jsonrpc": "2.0", "id": "b", "method": "t/echo"}))
+            .await;
+        assert_eq!(c.recv().await["result"], json!({}));
+    }
+
+    /// `$/cancelRequest` params are `{id, _meta?}` — an extra member makes it a
+    /// malformed notification, which is dropped (the target keeps running).
+    #[tokio::test]
+    async fn a_cancel_with_unknown_params_is_ignored_and_meta_is_allowed() {
+        let f = fixture();
+        let mut c = connect(f.methods, TEST_LIMITS);
+        c.send(req("h", "t/hang", json!({}))).await;
+        c.send(
+            json!({"jsonrpc": "2.0", "method": CANCEL_METHOD, "params": {"id": "h", "why": "x"}}),
+        )
+        .await;
+        c.silent_for(150).await;
+        c.send(json!({"jsonrpc": "2.0", "method": CANCEL_METHOD, "params": {"id": "h", "_meta": {"k": 1}}})).await;
+        let r = c.recv().await;
+        assert_eq!((r["id"].clone(), kind(&r)), (json!("h"), Some("cancelled")));
+    }
+
+    /// A params check that panics fails that one request (-32603) and the
+    /// connection — with its other calls — carries on.
+    #[tokio::test]
+    async fn a_panicking_params_check_fails_only_that_request() {
+        let mut c = connect(
+            fixture()
+                .methods
+                .with("t/panic-check", Arc::new(PanicCheck)),
+            TEST_LIMITS,
+        );
+        c.send(req("slow", "t/echo", json!({"delay_ms": 200})))
+            .await;
+        c.send(req("p", "t/panic-check", json!({}))).await;
+        let r = c.recv().await;
+        assert_eq!(
+            (r["id"].clone(), code_of(&r)),
+            (json!("p"), i64::from(code::INTERNAL_ERROR))
+        );
+        assert_eq!(c.recv().await["id"], "slow", "the other call was lost");
+    }
+
+    /// A response larger than the frame limit is replaced by an error for the
+    /// same id — the peer would disconnect on it.
+    #[tokio::test]
+    async fn a_response_over_the_frame_limit_becomes_an_error() {
+        let mut c = connect(fixture().methods.with("t/big", Arc::new(Big)), TEST_LIMITS);
+        c.send(req("b", "t/big", json!({}))).await;
+        let r = c.recv().await;
+        assert_eq!(
+            (r["id"].clone(), code_of(&r)),
+            (json!("b"), i64::from(code::INTERNAL_ERROR))
+        );
+        c.send(req("n", "t/echo", json!({}))).await;
+        assert_eq!(c.recv().await["id"], "n");
+    }
+
+    /// A module that stops reading must not freeze the kernel's side: the
+    /// connection ends within the write deadline, and its handlers are dropped.
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_ends_the_connection_instead_of_freezing_it() {
+        let f = fixture();
+        let hang = f.hang.clone();
+        let (client, server) = tokio::io::duplex(256);
+        let (sr, sw) = tokio::io::split(server);
+        let task = tokio::spawn(serve(
+            BufReader::new(sr),
+            sw,
+            f.methods,
+            Limits {
+                write_timeout: Duration::from_millis(200),
+                ..TEST_LIMITS
+            },
+        ));
+        let (_client_rx, mut client_tx) = tokio::io::split(client); // never read
+        let line = |id: &str, m: &str, p: Value| {
+            let mut l = serde_json::to_vec(&req(id, m, p)).unwrap();
+            l.push(b'\n');
+            l
+        };
+        client_tx
+            .write_all(&line("h", "t/hang", json!({})))
+            .await
+            .unwrap();
+        for i in 0..4 {
+            let pad = "p".repeat(4096);
+            client_tx
+                .write_all(&line(&format!("e{i}"), "t/echo", json!({"pad": pad})))
+                .await
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the connection froze instead of ending")
+            .unwrap();
+        assert!(
+            matches!(&ended, Ended::WriteFailed(e) if e.kind() == std::io::ErrorKind::TimedOut)
+                || matches!(ended, Ended::PeerNotReading),
+            "{ended:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            hang.dropped.load(Ordering::SeqCst),
+            "a handler outlived the connection"
+        );
+    }
+
+    struct FailingWriter;
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("write boom")))
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct FailingReader;
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("read boom")))
+        }
+    }
+
+    /// Each way a connection ends is reported as itself — a write failure is not
+    /// a close, a read failure is not a close.
+    #[tokio::test]
+    async fn write_and_read_failures_are_reported_as_themselves() {
+        let (client, server) = tokio::io::duplex(1024);
+        let (sr, _sw) = tokio::io::split(server);
+        let task = tokio::spawn(serve(
+            BufReader::new(sr),
+            FailingWriter,
+            fixture().methods,
+            TEST_LIMITS,
+        ));
+        let (_rx, mut tx) = tokio::io::split(client);
+        tx.write_all(
+            &[
+                serde_json::to_vec(&req("a", "t/echo", json!({}))).unwrap(),
+                b"\n".to_vec(),
+            ]
+            .concat(),
+        )
+        .await
+        .unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&ended, Ended::WriteFailed(e) if e.to_string() == "write boom"),
+            "{ended:?}"
+        );
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve(
+                BufReader::new(FailingReader),
+                tokio::io::sink(),
+                fixture().methods,
+                TEST_LIMITS,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&ended, Ended::ReadFailed(e) if e.to_string() == "read boom"),
+            "{ended:?}"
+        );
+    }
+
+    /// The production limits are the documented constants.
+    #[test]
+    fn the_default_limits_are_the_documented_constants() {
+        assert_eq!(
+            Limits::default(),
+            Limits {
+                max_in_flight: MAX_IN_FLIGHT_PER_CONNECTION,
+                call_timeout: CALL_TIMEOUT,
+                write_timeout: WRITE_TIMEOUT,
+            }
+        );
+        assert_eq!(MAX_IN_FLIGHT_PER_CONNECTION, 64);
+        assert_eq!(CALL_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// The handshake's kinds come from `initialize` itself, not from a list
+    /// retyped here — so renaming one there turns this red.
+    #[test]
+    fn the_handshakes_error_kinds_are_members_of_the_closed_set() {
+        use crate::initialize::HandshakeError;
+        let ours: HashSet<&str> = ErrorKind::ALL.iter().map(|k| k.as_str()).collect();
+        let theirs = [
+            HandshakeError::AuthFailed.kind(),
+            HandshakeError::ManifestMismatch {
+                expected: String::new(),
+                got: String::new(),
+            }
+            .kind(),
+            Some(crate::version::VersionMismatch::KIND),
+        ];
+        for k in theirs {
+            let k = k.expect("a handshake kind is missing");
+            assert!(
+                ours.contains(k),
+                "handshake kind `{k}` is not in the closed set"
+            );
+        }
+    }
+
+    /// The empty offer set, on both sides: the handshake offers none of SPEC
+    /// §3's business methods, and the connection serves none of them.
+    #[test]
+    fn the_offer_and_the_served_methods_are_both_empty() {
+        let offer = crate::initialize::Offer::none();
+        for m in [
+            "_a24/memory/private/remember",
+            "_a24/memory/scoped/remember",
+            "_a24/events/emit",
+            "_a24/approval/request",
+        ] {
+            assert!(!offer.provides(m), "{m} is offered");
+        }
+        assert!(Methods::none().map.is_empty());
+    }
+
+    /// The boundary exactly: `serve` is awaited HERE, in the test's own task, so
+    /// nothing else runs between its return and the assertion. (Awaiting a
+    /// spawned `serve` yields to the runtime first, which gets to finish an
+    /// abort that `serve` itself never waited for — measured: with
+    /// `abort_all()` in place of `shutdown().await`, the spawned-task version of
+    /// this test stays green.)
+    #[tokio::test]
+    async fn when_serve_returns_every_handler_future_is_already_dropped() {
+        let f = fixture();
+        let hang = f.hang.clone();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server);
+        let calls = hang.calls.clone();
+        let module = tokio::spawn(async move {
+            let (_rx, mut tx) = tokio::io::split(client);
+            let mut l = serde_json::to_vec(&req("h", "t/hang", json!({}))).unwrap();
+            l.push(b'\n');
+            tx.write_all(&l).await.unwrap();
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            tx.shutdown().await.unwrap();
+            // keep `_rx` alive until the end so the close is a clean EOF
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let ended = serve(BufReader::new(sr), sw, f.methods, TEST_LIMITS).await;
+        let dropped_at_return = hang.dropped.load(Ordering::SeqCst);
+        assert!(matches!(ended, Ended::PeerClosed), "{ended:?}");
+        assert!(
+            dropped_at_return,
+            "serve returned while a handler future was still alive"
+        );
+        module.await.unwrap();
     }
 }

@@ -40,7 +40,7 @@ PR 的实时状态以 `gh pr view <n>` 为准，本表只记「为什么在等�
 
 - 清掉 28 个 PR-Daemon 在本机评审时留下的临时 worktree、7 个 PR 已合并的同级 worktree（约 21 GB，多为 `rust/target` 与 `node_modules`）、54 个本地分支（PR 头快照与已合并分支）。
   每一项删前都核过：PR 已 MERGED、工作区干净；分支 tip 是该 PR 最终 head 或其祖先 —— 例外是 9 个「被后续评审轮次改过的旧草稿」（`me3b-cuts*`、`pr98-*`、`pr100-r`），它们不是最终版的祖先，也一并删了。
-  删之前全部打包进 开发机 **`Jason-M1-Max-MacBook-Pro`**(不是 Mac mini)上的 `~/Dev/auraai/.archive/agent24-cleanup-2026-09-11.bundle`（`git bundle verify` 通过），只在那一台上可恢复。
+  删之前全部打包进 开发机（MacBook，不是 Mac mini）上的 `~/Dev/auraai/.archive/agent24-cleanup-2026-09-11.bundle`（`git bundle verify` 通过），只在那一台上可恢复。
 - 保留：`feat/me4-cos72-skeleton`（Cos72 骨架，PLAN T10 要重做成进程外样例，远端也在）。
 
 ## 下一个 READY
