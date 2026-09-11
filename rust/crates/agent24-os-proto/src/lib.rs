@@ -18,6 +18,7 @@
 //! implementation, which makes it the one part of ME-3b whose expected answers
 //! are not decided by whoever writes the code.
 
+pub mod drain;
 pub mod frame;
 pub mod initialize;
 pub mod launch;

@@ -67,14 +67,33 @@ enum Command {
 enum OsAction {
     /// Show every domain OS the daemon knows about, and what it did with each
     List,
-    // EXPIRES WITH ME-3b. Both "applies at the next daemon start" lines below are
-    // true TODAY for one reason only: a toggle is written to the config and
-    // nothing acts on a running module, so a restart is the only path by which it
-    // takes effect. ME-3's two-phase hot disable (SPEC §4, delivered in ME-3b's
-    // last slice) makes disable act immediately — at which point these two lines
-    // become false with no test to notice, because no test can assert what a help
-    // string promises. The note lives here rather than in the follow-ups ledger so
-    // that it is read by whoever changes the thing that makes it false.
+    // EXPIRES WHEN `os disable` ACTS ON A RUNNING MODULE — which is NOT the day
+    // ME-3b-5 landed. Both "applies at the next daemon start" lines below are true
+    // for one reason only: a toggle is written to the config and nothing acts on a
+    // running module, so a restart is the only path by which it takes effect.
+    //
+    // This note used to say it expired with ME-3b's last slice. ME-3b-5 delivered
+    // the two-phase stop as a library (`agent24_os_proto::drain::Generation`), but
+    // the daemon still refuses to mount an out-of-process package at all
+    // (`domain.rs`, `is_mountable_in_process`), so there is no running module for
+    // a disable to act on and these lines are still true. Rewording them then
+    // would have made a true sentence false.
+    //
+    // What DOES make them false, one line each, because they are different
+    // events: `Disable` — the daemon's disable path calling
+    // `Generation::begin_drain` on a running module; `Enable` — the daemon
+    // spawning a module at runtime rather than at start. Neither can happen
+    // while out-of-process packages are refused at mount, so the test
+    // `an_out_of_process_manifest_is_refused_not_half_mounted` has to change
+    // first — that is the tripwire, since no test can assert what a help string
+    // promises. It and the refusal it covers (`domain.rs`) point back here.
+    //
+    // The same promise is made twice more, and expires with these lines:
+    // `os_routes.rs`'s module docs ("A toggle does not take effect until the
+    // daemon restarts") and the `restart_required` field it reports.
+    //
+    // The note lives here rather than in the follow-ups ledger so that it is
+    // read by whoever changes the thing that makes it false.
     /// Turn one on (applies at the next daemon start)
     Enable {
         /// Module name, e.g. sin90
