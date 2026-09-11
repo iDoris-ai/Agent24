@@ -352,6 +352,59 @@ impl Generation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Abandoned;
 
+impl Abandoned {
+    /// The `error.code` of the 503 an abandoned request gets.
+    pub const CODE: &'static str = "request_abandoned";
+}
+
+/// The generation a namespace is served by right now.
+///
+/// The proxy is mounted once, when the router is built, but a module that
+/// crashes and restarts is a NEW generation. So the proxy holds this slot rather
+/// than a generation, and reads it once per request. A request keeps the
+/// generation it was admitted into (its [`InFlight`] holds it), so replacing the
+/// slot never moves a request in flight to the next run — revoking the old run
+/// still abandons it.
+#[derive(Debug)]
+pub struct Current {
+    slot: Mutex<Arc<Generation>>,
+}
+
+impl Current {
+    #[must_use]
+    pub fn new(generation: Arc<Generation>) -> Arc<Self> {
+        Arc::new(Self {
+            slot: Mutex::new(generation),
+        })
+    }
+
+    #[must_use]
+    pub fn get(&self) -> Arc<Generation> {
+        Arc::clone(
+            &self
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Install the next run's generation and hand back the one it replaced.
+    ///
+    /// Does NOT revoke the old one: whoever stops a run revokes it, through the
+    /// one path that yields a [`KillPermit`]. Revoking here as well would be a
+    /// second place that decides when a module may be killed.
+    #[must_use]
+    pub fn replace(&self, next: Arc<Generation>) -> Arc<Generation> {
+        std::mem::replace(
+            &mut *self
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            next,
+        )
+    }
+}
+
 impl InFlight {
     /// The kernel-minted request id.
     #[must_use]
@@ -546,6 +599,26 @@ mod tests {
         // A revoked generation cannot be revived by a late handshake.
         assert!(!g.ready());
         assert_eq!(g.state(), DrainState::Revoked);
+    }
+
+    /// A restart swaps the slot. The request admitted by the old run stays with
+    /// the old run: revoking it abandons that request, while the new run serves
+    /// new ones. The control is the new run admitting at all — a slot that
+    /// never moved would pass the first half.
+    #[test]
+    fn a_restart_does_not_carry_a_request_in_flight_into_the_next_run() {
+        let current = Current::new(running());
+        let old = current.get();
+        let a = old.admit_request("a".into()).unwrap();
+
+        let next = running();
+        let replaced = current.replace(Arc::clone(&next));
+        assert!(Arc::ptr_eq(&replaced, &old));
+        let _ = replaced.revoke();
+
+        assert_eq!(a.finish(), Err(Abandoned));
+        assert!(current.get().admit_request("b".into()).is_ok());
+        assert!(Arc::ptr_eq(&current.get(), &next));
     }
 
     #[test]

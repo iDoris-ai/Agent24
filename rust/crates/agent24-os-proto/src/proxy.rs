@@ -41,9 +41,17 @@
 //! The concurrency ceiling and both deadlines (§5) ARE here, and deliberately —
 //! an earlier draft of this comment deferred them to the supervisor. They do not
 //! need one: nothing about "how many requests may this module be handling"
-//! needs to know when the process started. What DOES need the supervisor is
-//! DRAINING (§4, ME-3b-5), which is why 503 carries a `code` rather than a
-//! single meaning.
+//! needs to know when the process started.
+//!
+//! # Admission (ME-3b-5)
+//!
+//! Every request is admitted into the module's current
+//! [`crate::drain::Generation`] before anything else happens. A module that is
+//! starting, draining or stopped answers 503 with its own `code`
+//! (`module_not_ready` / `module_draining` / `module_stopping`) — which is why
+//! 503 carries a `code` rather than a single meaning. A request whose generation
+//! is revoked while it is in flight answers 503 `request_abandoned`, whatever
+//! the module did: its outcome is unknown.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -58,6 +66,8 @@ use axum::response::{IntoResponse, Response};
 use http_body_util::{BodyExt, Full, Limited};
 
 use agent24_domain::http::{MAX_BODY_BYTES, error_response, read_body_or_response};
+
+use crate::drain::{Abandoned, Current, RequestRefused};
 
 /// The non-secret correlation id the kernel injects on every proxied request.
 pub const REQUEST_ID_HEADER: &str = "x-a24-request-id";
@@ -389,6 +399,9 @@ fn normalise_dot_segments(path: &str) -> Option<String> {
 struct ProxyState {
     namespace: Arc<String>,
     upstream: SocketAddr,
+    /// Which run of the module serves this namespace, and whether it is taking
+    /// requests (ME-3b-5). Read once per request.
+    module: Arc<Current>,
     client: Client,
     ids: Arc<RequestIds>,
     limits: Limits,
@@ -486,10 +499,10 @@ fn short_prefix() -> String {
 /// rather than nesting it directly: `nest` does not cover the bare trailing
 /// slash (matchit's `{*rest}` will not match an empty segment), and that rule
 /// belongs in one place.
-pub fn proxy_router(namespace: &str, upstream: SocketAddr) -> Router {
+pub fn proxy_router(namespace: &str, upstream: SocketAddr, module: Arc<Current>) -> Router {
     Router::new()
         .fallback(proxy)
-        .with_state(state_for(namespace, upstream))
+        .with_state(state_for(namespace, upstream, module))
 }
 
 /// Nest [`proxy_router`] under `namespace`, trailing slash included.
@@ -497,8 +510,8 @@ pub fn proxy_router(namespace: &str, upstream: SocketAddr) -> Router {
 /// One [`ProxyState`], shared by both routes, so the two cannot drift — in
 /// particular so `/api/v1/ns/` and `/api/v1/ns/x` mint request ids from the
 /// same sequence rather than from two that look unrelated in a log.
-pub fn mount(app: Router, namespace: &str, upstream: SocketAddr) -> Router {
-    let state = state_for(namespace, upstream);
+pub fn mount(app: Router, namespace: &str, upstream: SocketAddr, module: Arc<Current>) -> Router {
+    let state = state_for(namespace, upstream, module);
     app.nest(
         namespace,
         Router::new().fallback(proxy).with_state(state.clone()),
@@ -509,10 +522,11 @@ pub fn mount(app: Router, namespace: &str, upstream: SocketAddr) -> Router {
     )
 }
 
-fn state_for(namespace: &str, upstream: SocketAddr) -> ProxyState {
+fn state_for(namespace: &str, upstream: SocketAddr, module: Arc<Current>) -> ProxyState {
     state_with(
         namespace,
         upstream,
+        module,
         Limits::default(),
         MAX_INFLIGHT_PER_MODULE,
     )
@@ -521,12 +535,14 @@ fn state_for(namespace: &str, upstream: SocketAddr) -> ProxyState {
 fn state_with(
     namespace: &str,
     upstream: SocketAddr,
+    module: Arc<Current>,
     limits: Limits,
     inflight: usize,
 ) -> ProxyState {
     ProxyState {
         namespace: Arc::new(namespace.to_owned()),
         upstream,
+        module,
         client: hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http(),
         ids: Arc::new(RequestIds::new()),
@@ -540,6 +556,61 @@ async fn proxy(
     State(state): State<ProxyState>,
     OriginalUri(original): OriginalUri,
     request: Request<Body>,
+) -> Response {
+    // Admission comes first (ME-3b-5, SPEC §4): a module that is starting,
+    // draining or stopped takes no new request, and says which — the three are
+    // different things to an operator, so they are different `code`s on one 503.
+    let request_id = state.ids.mint();
+    let generation = state.module.get();
+    let in_flight = match generation.admit_request(request_id.clone()) {
+        Ok(f) => f,
+        Err(refused) => return refused_response(refused),
+    };
+
+    let response = forward(&state, &original, request, &request_id).await;
+
+    // Whatever `forward` produced — a 200, or a 502 because the process was
+    // killed under it — a request whose generation was revoked while it was in
+    // flight has an UNKNOWN outcome: the module may or may not have acted on it.
+    // Passing a 200 on would report success for a run the kernel already
+    // decided to stop; passing the 502 on would blame the module for a kill.
+    match in_flight.finish() {
+        Ok(()) => response,
+        Err(Abandoned) => {
+            tracing::warn!(
+                namespace = %state.namespace,
+                request_id = %request_id,
+                "request abandoned: the module was stopped while it was in flight; \
+                 whether it acted on the request is unknown"
+            );
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Abandoned::CODE,
+                "the module was stopped while this request was in flight; \
+                 whether it acted on the request is unknown",
+            )
+        }
+    }
+}
+
+fn refused_response(refused: RequestRefused) -> Response {
+    let message = match refused {
+        RequestRefused::NotReady => "the module is starting and has not completed its handshake",
+        RequestRefused::Draining => {
+            "the module is being stopped: it is finishing the requests it already has \
+             and takes no new ones"
+        }
+        RequestRefused::Stopping => "the module has been stopped",
+        RequestRefused::DuplicateId => "the kernel minted a request id that is already in flight",
+    };
+    error_response(StatusCode::SERVICE_UNAVAILABLE, refused.code(), message)
+}
+
+async fn forward(
+    state: &ProxyState,
+    original: &Uri,
+    request: Request<Body>,
+    request_id: &str,
 ) -> Response {
     // The deadline starts HERE, not at the upstream call. Reading the client's
     // body is time this handler spends holding memory, and a client that dribbles
@@ -567,14 +638,13 @@ async fn proxy(
     // Read the body under the kernel's own cap: a module must not be the thing
     // that decides how much of the daemon's memory an upload gets.
     let body = match tokio::time::timeout_at(deadline, read_body_or_response(request)).await {
-        Err(_) => return timed_out(&state, TimedOut::ClientBody),
+        Err(_) => return timed_out(state, TimedOut::ClientBody),
         Ok(Err(response)) => return response,
         Ok(Ok(b)) => b,
     };
 
     let mut headers = sanitize_request_headers(&from_client);
-    let request_id = state.ids.mint();
-    if let Ok(value) = HeaderValue::from_str(&request_id) {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
         headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
     }
 
@@ -632,7 +702,7 @@ async fn proxy(
     )
     .await
     {
-        Err(_) => return timed_out(&state, TimedOut::UpstreamHead(head_budget)),
+        Err(_) => return timed_out(state, TimedOut::UpstreamHead(head_budget)),
         Ok(Err(e)) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -660,7 +730,7 @@ async fn proxy(
     )
     .await
     {
-        Err(_) => return timed_out(&state, TimedOut::UpstreamBody),
+        Err(_) => return timed_out(state, TimedOut::UpstreamBody),
         Ok(Ok(c)) => c.to_bytes(),
         Ok(Err(e)) => {
             return if is_length_limit(&*e) {
@@ -1143,6 +1213,14 @@ mod tests {
         .into_response()
     }
 
+    /// A module that has completed its handshake — what every test before
+    /// ME-3b-5 implicitly assumed.
+    fn running_module() -> Arc<Current> {
+        let g = crate::drain::Generation::starting();
+        assert!(g.ready());
+        Current::new(g)
+    }
+
     async fn serve(app: Router) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1161,7 +1239,7 @@ mod tests {
                 .with_state(hits.clone()),
         )
         .await;
-        let proxy = serve(mount(Router::new(), NS, upstream)).await;
+        let proxy = serve(mount(Router::new(), NS, upstream, running_module())).await;
         (proxy, hits)
     }
 
@@ -1347,7 +1425,7 @@ mod tests {
             }
         });
 
-        let proxy = serve(mount(Router::new(), NS, upstream)).await;
+        let proxy = serve(mount(Router::new(), NS, upstream, running_module())).await;
         let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert!(!got.body.contains("partial"), "{}", got.body);
@@ -1361,7 +1439,7 @@ mod tests {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             l.local_addr().unwrap()
         };
-        let proxy = serve(mount(Router::new(), NS, dead)).await;
+        let proxy = serve(mount(Router::new(), NS, dead, running_module())).await;
         let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert!(got.body.contains("upstream_unavailable"), "{}", got.body);
@@ -1451,7 +1529,7 @@ mod tests {
         limits: Limits,
         inflight: usize,
     ) -> (Router, Arc<tokio::sync::Semaphore>) {
-        let state = state_with(NS, upstream, limits, inflight);
+        let state = state_with(NS, upstream, running_module(), limits, inflight);
         let sem = state.inflight.clone();
         (Router::new().fallback(proxy).with_state(state), sem)
     }
@@ -1705,7 +1783,7 @@ mod tests {
 
         let hits = Hits::default();
         let upstream = serve(Router::new().fallback(upstream_handler).with_state(hits)).await;
-        let state = state_with(NS, upstream, Limits::default(), 1);
+        let state = state_with(NS, upstream, running_module(), Limits::default(), 1);
         let sem = state.inflight.clone();
         let app = Router::new().fallback(proxy).with_state(state);
 
@@ -2158,5 +2236,263 @@ mod tests {
             refused.body
         );
         let _ = first.await;
+    }
+
+    // ── ME-3b-5: the proxy side of the two-phase stop ────────────────────
+
+    /// What a gated module does once the test lets it go.
+    #[derive(Clone, Copy)]
+    enum Then {
+        /// Answer `200 done`.
+        Answer,
+        /// Close the connection without answering — what the kernel sees when
+        /// it kills the process under a request.
+        Vanish,
+    }
+
+    /// A module that holds every request until the test releases it.
+    ///
+    /// `arrived` fires once per request that actually reached the module, so a
+    /// test can wait for "it is in flight" as a fact, and can count dials.
+    struct Gated {
+        addr: SocketAddr,
+        arrived: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Notify>,
+        dials: Arc<AtomicUsize>,
+    }
+
+    async fn gated(then: Then) -> Gated {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dials = Arc::new(AtomicUsize::new(0));
+        let (a, r, d) = (arrived.clone(), release.clone(), dials.clone());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                d.fetch_add(1, Ordering::SeqCst);
+                let (a, r) = (a.clone(), r.clone());
+                tokio::spawn(async move {
+                    // Read the request head before announcing arrival, so
+                    // "arrived" means the proxy really sent it.
+                    let mut buf = vec![0u8; 4096];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                    }
+                    // Register for the release BEFORE announcing arrival.
+                    // `notify_waiters` only wakes futures already registered, so
+                    // in the other order a test that releases right after
+                    // `wait_arrived` can land in the gap and the request hangs.
+                    let released = r.notified();
+                    tokio::pin!(released);
+                    released.as_mut().enable();
+                    a.add_permits(1);
+                    released.await;
+                    if let Then::Answer = then {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone")
+                            .await;
+                    }
+                    // `Vanish`: dropped here without a byte.
+                });
+            }
+        });
+        Gated {
+            addr,
+            arrived,
+            release,
+            dials,
+        }
+    }
+
+    impl Gated {
+        async fn wait_arrived(&self) {
+            tokio::time::timeout(Duration::from_secs(10), self.arrived.acquire())
+                .await
+                .expect("the request never reached the module")
+                .unwrap()
+                .forget();
+        }
+    }
+
+    fn running_generation() -> Arc<crate::drain::Generation> {
+        let g = crate::drain::Generation::starting();
+        assert!(g.ready());
+        g
+    }
+
+    /// SPEC §8 ME-3b: *"DRAINING 期间新的被代理请求 503、在途请求的回调仍可用"* —
+    /// the proxy half: the new request is refused with its own code and never
+    /// dialled, and the one already in flight completes with the module's answer.
+    #[tokio::test]
+    async fn draining_refuses_a_new_request_while_the_one_in_flight_completes() {
+        let module = gated(Then::Answer).await;
+        let generation = running_generation();
+        let proxy = serve(mount(
+            Router::new(),
+            NS,
+            module.addr,
+            Current::new(generation.clone()),
+        ))
+        .await;
+
+        let first =
+            tokio::spawn(
+                async move { call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await },
+            );
+        module.wait_arrived().await;
+
+        assert!(generation.begin_drain(std::time::Instant::now(), Duration::from_secs(30)));
+        let refused = call(proxy, Method::GET, &format!("{NS}/b"), &[], "").await;
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.json()["error"]["code"], "module_draining");
+        assert_eq!(
+            module.dials.load(Ordering::SeqCst),
+            1,
+            "a request refused for draining still reached the module"
+        );
+
+        // The control: the request that was already in flight is not a casualty.
+        module.release.notify_waiters();
+        let first = first.await.unwrap();
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.body, "done");
+    }
+
+    /// SPEC §8: *"drain 超时的在途请求返回 503(不假装成功)"*. The module DOES answer
+    /// 200 — after its generation was revoked — and the client must not see it.
+    #[tokio::test]
+    async fn a_request_whose_generation_is_revoked_gets_a_503_not_the_modules_200() {
+        let module = gated(Then::Answer).await;
+        let generation = running_generation();
+        let proxy = serve(mount(
+            Router::new(),
+            NS,
+            module.addr,
+            Current::new(generation.clone()),
+        ))
+        .await;
+
+        let first =
+            tokio::spawn(
+                async move { call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await },
+            );
+        module.wait_arrived().await;
+
+        let revocation = generation.revoke();
+        assert_eq!(revocation.abandoned.len(), 1);
+        module.release.notify_waiters();
+
+        let got = first.await.unwrap();
+        assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(got.json()["error"]["code"], "request_abandoned");
+        assert!(got.body.contains("unknown"), "{}", got.body);
+    }
+
+    /// The same, when the kill lands before the module answers: the connection
+    /// just dies. That is a 502 `upstream_unavailable` from `forward` — which
+    /// would tell an operator the MODULE failed, when the kernel stopped it.
+    #[tokio::test]
+    async fn a_request_killed_under_a_revocation_is_abandoned_not_blamed_on_the_module() {
+        let module = gated(Then::Vanish).await;
+        let generation = running_generation();
+        let proxy = serve(mount(
+            Router::new(),
+            NS,
+            module.addr,
+            Current::new(generation.clone()),
+        ))
+        .await;
+
+        let first =
+            tokio::spawn(
+                async move { call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await },
+            );
+        module.wait_arrived().await;
+        let _ = generation.revoke();
+        module.release.notify_waiters();
+
+        let got = first.await.unwrap();
+        assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(got.json()["error"]["code"], "request_abandoned");
+    }
+
+    /// The control for the two above: the same vanishing module, NOT revoked,
+    /// is still the module's failure (502). Without this, a proxy that turned
+    /// every upstream error into `request_abandoned` would pass them.
+    #[tokio::test]
+    async fn a_module_that_vanishes_on_its_own_is_still_a_502() {
+        let module = gated(Then::Vanish).await;
+        let proxy = serve(mount(Router::new(), NS, module.addr, running_module())).await;
+
+        let first =
+            tokio::spawn(
+                async move { call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await },
+            );
+        module.wait_arrived().await;
+        module.release.notify_waiters();
+
+        let got = first.await.unwrap();
+        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(got.json()["error"]["code"], "upstream_unavailable");
+    }
+
+    /// Before `initialize` the namespace answers 503 `module_not_ready` and the
+    /// module is never dialled. Control: the same generation, once ready, serves.
+    #[tokio::test]
+    async fn a_module_that_is_not_ready_is_never_dialled() {
+        let module = gated(Then::Answer).await;
+        let generation = crate::drain::Generation::starting();
+        let proxy = serve(mount(
+            Router::new(),
+            NS,
+            module.addr,
+            Current::new(generation.clone()),
+        ))
+        .await;
+
+        let got = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
+        assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(got.json()["error"]["code"], "module_not_ready");
+        assert_eq!(module.dials.load(Ordering::SeqCst), 0);
+
+        assert!(generation.ready());
+        let second =
+            tokio::spawn(
+                async move { call(proxy, Method::GET, &format!("{NS}/b"), &[], "").await },
+            );
+        module.wait_arrived().await;
+        module.release.notify_waiters();
+        assert_eq!(second.await.unwrap().status, StatusCode::OK);
+    }
+
+    /// A restart swaps the slot the proxy reads, without remounting anything.
+    #[tokio::test]
+    async fn after_a_restart_the_proxy_admits_into_the_new_generation() {
+        let module = gated(Then::Answer).await;
+        let old = running_generation();
+        let current = Current::new(old.clone());
+        let proxy = serve(mount(Router::new(), NS, module.addr, current.clone())).await;
+
+        let _ = old.revoke();
+        let refused = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
+        assert_eq!(refused.json()["error"]["code"], "module_stopping");
+
+        let _ = current.replace(running_generation());
+        let next =
+            tokio::spawn(
+                async move { call(proxy, Method::GET, &format!("{NS}/b"), &[], "").await },
+            );
+        module.wait_arrived().await;
+        module.release.notify_waiters();
+        assert_eq!(next.await.unwrap().status, StatusCode::OK);
     }
 }

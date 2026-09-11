@@ -19,6 +19,8 @@ serde_json = { workspace = true }
 # For signalling a process GROUP — a safe wrapper over `killpg`.
 rustix = { version = "0.38", features = ["process"] }
 tokio = { version = "1", features = ["time"] }
+# SPEC §4: a request abandoned by a revocation is logged as "outcome unknown".
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
