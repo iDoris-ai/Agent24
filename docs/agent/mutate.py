@@ -171,13 +171,25 @@ def fsync_dir(path):
         os.close(fd)
 
 
-def write_source(path, data):
-    """原地写:保留 inode、属主、xattr、硬链接。中途崩溃留下的半截文件由日志兜底。"""
+def write_source(paths, path, data):
+    """原地写:保留 inode、属主、xattr、硬链接。
+
+    写之前在日志里落一个 `writing` 标记,写完才删:原地写可能写到一半(被 SIGKILL、ENOSPC、
+    RLIMIT_FSIZE —— APFS 是写时复制,原地覆盖也要新块),那时文件既不是原文也不是变异。
+    有这个标记,恢复就知道那半截是**我们自己**写的,可以无条件写回原文;没有它,恢复只能
+    当成「有人改过」而拒绝 —— 而且会一直拒绝下去。"""
+    marker = os.path.join(paths.journal, "writing")
+    with open(marker, "w") as m:
+        m.flush()
+        os.fsync(m.fileno())
+    fsync_dir(paths.journal)
     with open(path, "r+b") as f:
         f.write(data)
         f.truncate()
         f.flush()
         os.fsync(f.fileno())
+    os.unlink(marker)
+    fsync_dir(paths.journal)
 
 
 def read_journal(paths):
@@ -194,14 +206,15 @@ def read_journal(paths):
     return meta["path"], original, meta
 
 
-def write_journal(paths, src, original, mutated):
+def write_journal(paths, src, original, mutated, anchor="", repl=""):
     tmp = tempfile.mkdtemp(dir=paths.gitdir, prefix="mutate-inflight.tmp-")
     with open(os.path.join(tmp, "bak"), "wb") as f:
         f.write(original)
         f.flush()
         os.fsync(f.fileno())
     with open(os.path.join(tmp, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump({"path": src, "original_sha": sha(original), "mutated_sha": sha(mutated)}, f)
+        json.dump({"path": src, "original_sha": sha(original), "mutated_sha": sha(mutated),
+                   "anchor": anchor, "repl": repl}, f)
         f.flush()
         os.fsync(f.fileno())
     fsync_dir(tmp)
@@ -210,21 +223,30 @@ def write_journal(paths, src, original, mutated):
 
 
 def drop_journal(paths):
-    shutil.rmtree(paths.journal, ignore_errors=True)
+    # 先 rename 成临时名字再删:rmtree 删到一半被打断,留下的是 check_no_journal 会清掉的
+    # 临时目录,而不是一个缺了 meta.json、recover 又读不了的正式日志。
+    doomed = paths.journal + ".tmp-drop"
+    os.rename(paths.journal, doomed)
     fsync_dir(paths.gitdir)
+    shutil.rmtree(doomed, ignore_errors=True)
 
 
-def restore(paths, src, original, mutated_sha):
+def restore(paths, src, original, mutated_sha, meta=None):
     """把 src 恢复成 original 并逐字节核对;成功才删日志。返回 True/False。"""
     try:
-        with open(src, "rb") as f:
-            current = f.read()
+        try:
+            with open(src, "rb") as f:
+                current = f.read()
+        except FileNotFoundError:
+            say(f"  ⛔ {src} 不存在了 —— 不替你重建它。原文备份在 {paths.journal}/bak;"
+                f"核对后自行处理,再删掉 {paths.journal}")
+            return False
+        ours_half_written = os.path.exists(os.path.join(paths.journal, "writing"))
         if current != original:
-            if sha(current) != mutated_sha:
-                say(f"  ⛔ {src} 既不是原文、也不是我们写进去的变异 —— 有人在这期间改过它。不覆盖。"
-                    f"原文备份在 {paths.journal}/bak;核对后自行处理,再删掉 {paths.journal}")
+            if sha(current) != mutated_sha and not ours_half_written:
+                conflict_message(paths, src, current, meta)
                 return False
-            write_source(src, original)
+            write_source(paths, src, original)
             with open(src, "rb") as f:
                 if f.read() != original:
                     raise OSError("写回后逐字节比对不上")
@@ -234,6 +256,19 @@ def restore(paths, src, original, mutated_sha):
         return False
     drop_journal(paths)
     return True
+
+
+def conflict_message(paths, src, current, meta):
+    """有人在这期间改过它:不覆盖 —— 但要说清楚**变异还在不在文件里**,否则人会把它一起提交。"""
+    say(f"  ⛔ {src} 既不是原文、也不是我们写进去的变异 —— 有人在这期间改过它。不覆盖。")
+    repl = (meta or {}).get("repl")
+    text = current.decode("utf-8", errors="replace")
+    if repl and repl in text:
+        line = text[: text.index(repl)].count("\n") + 1
+        say(f"  ⚠️ 变异**仍在文件里**(第 {line} 行附近):把 {repl!r} 改回 {meta.get('anchor')!r},"
+            f"再保留你自己的修改")
+    say(f"  原文备份在 {paths.journal}/bak(对比:diff {paths.journal}/bak {src});"
+        f"处理完再删掉 {paths.journal}")
 
 
 def pause(paths, phase):
@@ -460,10 +495,14 @@ def fingerprint(paths, files):
 
 
 def watched_files(paths, sources):
-    extra = [os.path.join(paths.rust, "Cargo.lock")]
-    crate_tomls = {os.path.join(os.path.dirname(os.path.dirname(s)), "Cargo.toml") for s in sources
-                   if os.path.basename(os.path.dirname(s)) == "src"}
-    return sorted(set(sources) | set(extra) | {t for t in crate_tomls if os.path.exists(t)})
+    """rust/ 下 git 知道的全部文件(已跟踪 + 未跟踪未忽略)。只看被变异 crate 自己的源码不够:
+    path 依赖(agent24-domain 之类)、workspace 的 Cargo.toml 变了,测试行为照样会变 —— 复审
+    实测:基线之后改 agent24-domain,mut 照给 🟢。"""
+    out = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z", "--", "rust"],
+                         cwd=paths.root, capture_output=True).stdout
+    listed = {os.path.realpath(os.path.join(paths.root, p.decode("utf-8", "replace")))
+              for p in out.split(b"\0") if p}
+    return sorted(listed | set(sources))
 
 
 def cmd_baseline(paths, crate, filters):
@@ -486,6 +525,9 @@ def cmd_baseline(paths, crate, filters):
     if r[1] == 0:
         say(f"  ⛔ 基线跑了 0 个测试({r[2]}) —— 过滤词不对?停止")
         return REFUSED
+    pause(paths, "baseline-after-run")
+    if interrupted():
+        return 128 + interrupted()
     if fingerprint(paths, prints.keys()) != prints:
         say("  ⛔ 立基线期间源码被改动了 —— 这个绿说的不是现在这棵树,重来")
         return REFUSED
@@ -525,7 +567,7 @@ def inject(original, anchor, repl):
     return out.encode("utf-8"), None
 
 
-FAILED_TEST = re.compile(r"^test (\S+) \.\.\. FAILED$")
+FAILED_TEST = re.compile(r"^test (\S+) \.\.\. FAILED\b")
 
 
 def failed_tests(r_text):
@@ -571,22 +613,27 @@ def cmd_mut(paths, file, anchor, repl, label):
     timeout = float(os.environ.get("MUT_TIMEOUT", "150"))
     if interrupted():
         return 128 + interrupted()
-    write_journal(paths, src, original, mutated)
+    write_journal(paths, src, original, mutated, anchor, repl)
     pause(paths, "after-journal")
     r = r2 = names = names2 = None
+    failure = None
     try:
         if not interrupted():
-            write_source(src, mutated)
+            write_source(paths, src, mutated)
             pause(paths, "after-inject")
         if not interrupted():
             r, names = run_red(paths, base, timeout)
             if r[0] in ("FAIL", "CRASH") and not interrupted():
                 r2, names2 = run_red(paths, base, timeout)
             pause(paths, "after-run")
-    finally:
-        restored = restore(paths, src, original, sha(mutated))
+    except Exception as e:  # noqa: BLE001 — 先恢复,再决定退出码
+        failure = e
+    restored = restore(paths, src, original, sha(mutated),
+                       {"anchor": anchor, "repl": repl})
     if not restored:
-        return RESTORE_FAILED
+        return RESTORE_FAILED  # 源码没恢复:这条压过一切,包括内部错误和信号
+    if failure is not None:
+        raise failure
     if interrupted():
         say(f"\n  ⛔ 被信号 {interrupted()} 打断 —— 源码已恢复")
         return 128 + interrupted()
@@ -646,7 +693,7 @@ def cmd_recover(paths):
     real_root = os.path.realpath(paths.root) + os.sep
     if not os.path.realpath(src).startswith(real_root):
         raise Refused(f"日志指向 {src},不在这棵树({paths.root})里 —— 不写")
-    if restore(paths, src, original, meta.get("mutated_sha")):
+    if restore(paths, src, original, meta.get("mutated_sha"), meta):
         say(f"  ✓ 已恢复 {src}")
         return 0
     return RESTORE_FAILED
@@ -678,8 +725,9 @@ def main(argv):
 
 
 def exit_code(rc):
-    """最后一次检查之后才到的信号,也不能被一个普通读数盖过去。"""
-    if interrupted() and rc < 128:
+    """最后一次检查之后才到的信号,也不能被一个普通读数盖过去 —— 但「源码没恢复」(2)
+    不许被任何东西盖过去:128+n 的含义是「源码已恢复」。"""
+    if interrupted() and rc < 128 and rc != RESTORE_FAILED:
         return 128 + interrupted()
     return rc
 
