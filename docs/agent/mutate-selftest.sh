@@ -138,6 +138,17 @@ PY
 mut_baseline agent24-os-proto supervise >/dev/null || echo "    (带块注释的基线立不起来)"
 mut "$F" 'retries 3' 'retries 4' "⑨b 锚点在块注释里"
 expect VOID "$_MUT_LAST" "⑨b → 作废"
+# ⑨c 反方向:行注释里写着 `scoped/*`、字符串里写着 `/*` —— 它们不是块注释的开头,之后对代码的
+# 改动必须照常读数。(上一版用子串找 `/*`,在 rpc.rs 这种注释里有路径的文件上,之后的每一处
+# 改动都被判成「在块注释里」—— 实测。)
+python3 - "$F" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+open(p,"w").write(s.replace("pub const REAP_TIMEOUT", '// see _a24/memory/scoped/* for details\nconst _SLASH_STAR: &str = "/*";\npub const REAP_TIMEOUT', 1))
+PY
+mut_baseline agent24-os-proto supervise >/dev/null || echo "    (⑨c 的基线立不起来)"
+mut "$F" 'pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);' \
+  'pub const REAP_TIMEOUT: Duration = Duration::from_secs(6);' "⑨c 注释/字符串里的 /* 之后的代码"
+expect ALIVE "$_MUT_LAST" "⑨c → 照常读数(🟢),不被当成块注释"
 cp "$ORIG" "$F"
 mut_baseline agent24-os-proto supervise >/dev/null || { echo "  基线立不起来"; exit 1; }
 

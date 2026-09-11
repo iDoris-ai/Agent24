@@ -568,14 +568,70 @@ def inject(original, anchor, repl):
     p = 0
     while p < min(len(s), len(out)) and s[p] == out[p]:
         p += 1
-    line_start = s.rfind("\n", 0, p) + 1
-    if "//" in s[line_start:p]:
-        return None, "改动落在 // 注释里 —— 改注释不改行为(含行尾注释;字符串里的 // 也会被这样拒,方向是保守的)"
-    # 块注释:改动点之前最后一个 `/*` 在最后一个 `*/` 之后 → 在一个没闭合的块注释里。
-    # (不处理嵌套块注释;字符串里的 `/*` 也会被这样拒 —— 方向同样是保守的。)
-    if s.rfind("/*", 0, p) > s.rfind("*/", 0, p):
+    where = comment_at(s, p)
+    if where == "line":
+        return None, "改动落在 // 注释里(含行尾注释)—— 改注释不改行为"
+    if where == "block":
         return None, "改动落在 /* */ 块注释里 —— 改注释不改行为"
     return out.encode("utf-8"), None
+
+
+def comment_at(s, p):
+    """位置 p 在不在注释里:"line" / "block" / None。一个最小的 Rust 词法扫描 —— 字符串、
+    原始字符串、字符字面量、生命周期、可嵌套的块注释都认得。
+
+    上一版用子串查找(「p 之前最后一个 `/*` 在最后一个 `*/` 之后」),在注释里写着
+    `_a24/memory/scoped/*` 这种路径的文件上,之后的每一处改动都被判成「在块注释里」——
+    脚手架对这个文件整个不能用(在 rpc.rs 上实测)。行注释那条同理会被字符串里的
+    `http://` 骗到。"""
+    i, n = 0, len(s)
+    while i < p:
+        c = s[i]
+        two = s[i:i + 2]
+        if two == "//":
+            end = s.find("\n", i)
+            end = n if end == -1 else end
+            if p < end:
+                return "line"
+            i = end
+        elif two == "/*":
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if s.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif s.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+                if depth and i > p:
+                    return "block"
+        elif c == "r" and (s.startswith('r"', i) or s.startswith("r#", i)) and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_")):
+            j = i + 1
+            while j < n and s[j] == "#":
+                j += 1
+            if j < n and s[j] == '"':
+                close = '"' + "#" * (j - i - 1)
+                end = s.find(close, j + 1)
+                i = n if end == -1 else end + len(close)
+            else:
+                i += 1
+        elif c == '"':
+            i += 1
+            while i < n and s[i] != '"':
+                i += 2 if s[i] == "\\" else 1
+            i += 1
+        elif c == "'":
+            # 字符字面量 'x' / '\n' / '\u{..}';否则是生命周期 'a,跳过这个引号即可
+            if s.startswith("\\", i + 1):
+                end = s.find("'", i + 2)
+                i = n if end == -1 else end + 1
+            elif i + 2 < n and s[i + 2] == "'":
+                i += 3
+            else:
+                i += 1
+        else:
+            i += 1
+    return None
 
 
 FAILED_TEST = re.compile(r"^test (\S+) \.\.\. FAILED\b")
