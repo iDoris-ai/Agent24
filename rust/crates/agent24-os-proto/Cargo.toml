@@ -18,9 +18,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # For signalling a process GROUP — a safe wrapper over `killpg`.
 rustix = { version = "0.38", features = ["process"] }
-# `sync` for the revocation signal (`watch`), `macros` for racing it against
-# the upstream call (`select!`).
-tokio = { version = "1", features = ["time", "sync", "macros"] }
+# `sync` for the revocation signal (`watch`) and the callback channels; `macros`
+# for `select!` (the proxy's race against revocation, and `rpc::serve`); `rt` +
+# `io-util` for the callback connection loop (ME-3c).
+tokio = { version = "1", features = ["time", "sync", "macros", "rt", "io-util"] }
 # SPEC §4: a request abandoned by a revocation is logged as "outcome unknown".
 tracing = "0.1"
 

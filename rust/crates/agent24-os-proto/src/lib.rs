@@ -23,5 +23,6 @@ pub mod frame;
 pub mod initialize;
 pub mod launch;
 pub mod proxy;
+pub mod rpc;
 pub mod supervise;
 pub mod version;

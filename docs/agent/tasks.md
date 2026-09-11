@@ -24,7 +24,8 @@
 - 已 APPROVE（head `00f5e27`）；#165 合入后与之冲突（只在 SPEC 状态表）→ 合 main 解冲突、取探针（`0163803`）→ 复扫对新 head 重新 APPROVE → 合并。
 - **验收**：探针 `3b-4 受约束代理` 一行变 `●`。
 
-### ME3-MUT 变异脚手架收掉三条阻塞  `CHANGES_REQUESTED`(修复已在分支上,等推送后复审)— [#172](https://github.com/iDoris-ai/Agent24/pull/172)
+### ME3-MUT 变异脚手架收掉三条阻塞  `DONE` — [#172](https://github.com/iDoris-ai/Agent24/pull/172)（`32ab103`，2026-09-12）
+- 外部评审对 head `dceba02` APPROVE；批准里的六条不阻塞项记为 FU-52，自证偶发失败记为 FU-51。
 - 两轮 PR 前复审发现 bash 版的问题同根(用 shell 手搓进程监督器),核心改写为 `mutate.py`;自证 45 组、元测试 26 种回退全红。
 - B1 红基线不拦后续 `mut` · B2 0 个测试的基线 / 测试数变化读成「判据不承重」· B3 中途被杀留下被变异的源码；同轮收掉非阻塞项（崩溃被读成编译失败、超时只杀直接子进程、`set -u` 泄漏、路径打错建出空文件、不认识的输出落到 🔴、自证不断言）。
 - **验收**：`bash docs/agent/mutate-selftest.sh` exit 0；把每条修复改回去自证都 exit 1（PR body 列回退清单）。
@@ -32,7 +33,7 @@
 ### ME3-DOC 状态文档对齐  `DONE` — [#174](https://github.com/iDoris-ai/Agent24/pull/174)(`09669bc`)
 - `progress.md` 停在 2026-08-23，与仓库脱节十九天；本条把它和本文件对齐，并记下本轮四条待办。
 
-### ME3-T5 3b-5 两阶段热 disable（SPEC §4）  `PR_OPEN` — 本 PR(分支 `feat/me3b-5-drain`)
+### ME3-T5 3b-5 两阶段热 disable（SPEC §4）  `DONE` — [#175](https://github.com/iDoris-ai/Agent24/pull/175)（`4918201`，2026-09-11）
 - **优先级**：high（ME-3b 的最后一刀）
 - **依赖**：3b-3（库层已在 main）· ME3-T4 ✅（要接进 `proxy.rs`；不叠在 #173 上开 stacked PR —— 合并自动删分支会把叠在上面的 PR 一起关掉）
 - **目标**：停一个模块时，「宽限期内收不收新请求、在途 handler 还能不能回调、generation 什么时候撤」三件事由一个状态机定死，而且**撤 generation 早于杀进程**由类型保证，不靠调用顺序。
@@ -51,6 +52,24 @@
   - Revoking 之后一切回调拒绝，包括持有活跃 `request_id` 的。
 - **涉及文件**：`rust/crates/agent24-os-proto/src/{drain.rs,proxy.rs,lib.rs}`（探针预言的符号是 `drain.rs` 的 `pub enum DrainState`，照它命名）、`rust/apps/agent24-cli/src/main.rs`（仅注释）、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`（记本刀的边界）
 - **证据**：
+
+### ME3-T6 3c 回调通道其余部分（SPEC §3 + §8 ME-3c 格）  `PR_OPEN` — 分支 `feat/me3c-rpc`（用户 2026-09-11 定为下一步）
+- **优先级**：high（T1–T6 齐了即可发 v0.4.0 握手层）
+- **依赖**：3b-1 framing、3b-2b `initialize`（均已在 main）。**不依赖** #175（3b-5）：本刀 offer set 为空，没有任何业务方法，「draining 期间回调准入」要等第一个业务方法（3d/3e）才有落点
+- **目标**：握手之后那条回调连接上的一切协议行为定死，实现者不需要猜并发、取消与错误分类
+- **开发范围**（`agent24-os-proto/src/rpc.rs`，探针预言符号 `pub fn dispatch`）：
+  1. `dispatch`：把握手之后的**一帧**分类成「立即回错」「派发给 handler」「取消某个在途请求」「忽略（未知 notification）」—— 纯函数，不碰连接
+  2. 一个连接循环：并发在途、响应可乱序、按 id 配对；超时回 `timeout` 且不重试；连接断开则在途请求就地中止、**不产生响应**
+  3. 错误闭集 `error.data.kind`（SPEC §3 原文十个），常量带「整词出现在 SPEC 引文里」的测试（§8 的规则）
+- **明确不做**：任何业务方法（offer set 为空，调任何方法都是 `-32601`，**不得为了凑 forbidden 测试提前注册方法**）；把连接循环接进 daemon（那是 Supervisor 的事，见 ME3-SUP）
+- **SPEC 的空档，本刀要补并请评审拍板**：§3 说「并发上限见 §5，超限回 busy」，但 §5 没有给数字；超时也没有数字。取与代理侧一致的 **每连接 64 个在途 / 单次 30s**，写进 SPEC
+- **验收**（取自 SPEC §8 ME-3c 格，每条带正对照）：握手后的超长行被拒并断连；并发在途按 id 配对、响应可乱序；仍在途的 id 被复用 → 该请求失败；`$/cancelRequest` 使目标请求回 cancelled；连接断开则在途请求中止且不产生响应；超时不重试；握手后 params 解析失败 `-32602` 且不派发；坏 params 只失败该行、连接继续；重复 JSON key 被拒；握手后畸形 JSON `-32700` 只失败该行；握手后重复 `initialize` → `-32600` 只失败该行；业务方法一律 `-32601`
+- **证据**：
+
+### ME3-SUP 3b-3 的 Supervisor —— 让 daemon 真的持有并监督模块进程  `BACKLOG`（排在 T6 之后、T9 之前）
+- **为什么单列**：3b-3 目前只交付了库层零件（`RestartPolicy`、`terminate_group`、`launch::spawn`），daemon 里没有任何代码真正持有一个模块进程。没有它：3b-5 的热 disable 接不进 `os disable`；`KillPermit` 绑定不到具体进程（FU-46）；**T9（3f 仓外包端到端验收）跑不起来**
+- **范围（待开工时细化）**：一个类型同时持有 child 与它那一代的 `Generation`，只暴露先撤后杀的 `stop(self)`，`Launched::child` 改私有（FU-46）；启动 → 握手 → ready → 挂代理 → 崩溃退避/熔断 → 停机的完整生命周期；解除 `domain.rs` 对 out_of_process 的挂载拒绝（**那一天 CLI 两行 help 与 `os_routes.rs` 的承诺到期**，绊线测试已就位）；顺带评估 FU-47
+- **依赖**：T6（回调连接循环）
 
 ---
 
