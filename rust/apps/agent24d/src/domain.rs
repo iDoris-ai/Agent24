@@ -724,6 +724,10 @@ pub async fn mount_all(
             );
             continue;
         }
+        // Lifting this refusal is what makes "a toggle takes effect at the next
+        // daemon start" false — in the CLI help (`agent24-cli` `OsAction`), in
+        // `os_routes.rs`'s module docs and in its `restart_required` field. Read
+        // the EXPIRES note beside those help lines before removing this.
         if !manifest.is_mountable_in_process() {
             refuse(
                 "manifest declares an out-of-process provider; that transport does \
@@ -1080,6 +1084,10 @@ mod tests {
         assert_eq!(get(&app, "/api/v1/dup/ping").await.status(), StatusCode::OK);
     }
 
+    /// Also the tripwire for three promises that "a toggle takes effect at the
+    /// next daemon start" (CLI help, `os_routes.rs`, `restart_required`): if this
+    /// has to change because out-of-process modules now mount, those become
+    /// false — see the EXPIRES note in `agent24-cli`'s `OsAction`.
     #[tokio::test]
     async fn an_out_of_process_manifest_is_refused_not_half_mounted() {
         let tmp = tempfile::tempdir().unwrap();

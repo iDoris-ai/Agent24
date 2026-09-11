@@ -1432,7 +1432,14 @@ pub(crate) mod tests {
 
         let st = state().await;
         let token = st.token.to_string();
-        let modules = agent24_os_proto::proxy::mount(Router::new(), "/api/v1/zzproxy", upstream);
+        let module = agent24_os_proto::drain::Generation::starting();
+        assert!(module.ready());
+        let modules = agent24_os_proto::proxy::mount(
+            Router::new(),
+            "/api/v1/zzproxy",
+            upstream,
+            agent24_os_proto::drain::Current::new(module),
+        );
         let router = build_router_with_modules(st, modules);
 
         let res = router

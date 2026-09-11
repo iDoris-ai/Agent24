@@ -24,19 +24,20 @@
 - 已 APPROVE（head `00f5e27`）；#165 合入后与之冲突（只在 SPEC 状态表）→ 合 main 解冲突、取探针（`0163803`）→ 复扫对新 head 重新 APPROVE → 合并。
 - **验收**：探针 `3b-4 受约束代理` 一行变 `●`。
 
-### ME3-MUT 变异脚手架收掉三条阻塞  `CHANGES_REQUESTED → 修复待复审` — [#172](https://github.com/iDoris-ai/Agent24/pull/172)
+### ME3-MUT 变异脚手架收掉三条阻塞  `CHANGES_REQUESTED`(修复已在分支上,等推送后复审)— [#172](https://github.com/iDoris-ai/Agent24/pull/172)
+- 两轮 PR 前复审发现 bash 版的问题同根(用 shell 手搓进程监督器),核心改写为 `mutate.py`;自证 45 组、元测试 26 种回退全红。
 - B1 红基线不拦后续 `mut` · B2 0 个测试的基线 / 测试数变化读成「判据不承重」· B3 中途被杀留下被变异的源码；同轮收掉非阻塞项（崩溃被读成编译失败、超时只杀直接子进程、`set -u` 泄漏、路径打错建出空文件、不认识的输出落到 🔴、自证不断言）。
 - **验收**：`bash docs/agent/mutate-selftest.sh` exit 0；把每条修复改回去自证都 exit 1（PR body 列回退清单）。
 
-### ME3-DOC 状态文档对齐  `PR_OPEN` — 本 PR
+### ME3-DOC 状态文档对齐  `DONE` — [#174](https://github.com/iDoris-ai/Agent24/pull/174)(`09669bc`)
 - `progress.md` 停在 2026-08-23，与仓库脱节十九天；本条把它和本文件对齐，并记下本轮四条待办。
 
-### ME3-T5 3b-5 两阶段热 disable（SPEC §4）  `IN_PROGRESS` — 分支 `feat/me3b-5-drain`
+### ME3-T5 3b-5 两阶段热 disable（SPEC §4）  `PR_OPEN` — 本 PR(分支 `feat/me3b-5-drain`)
 - **优先级**：high（ME-3b 的最后一刀）
 - **依赖**：3b-3（库层已在 main）· ME3-T4 ✅（要接进 `proxy.rs`；不叠在 #173 上开 stacked PR —— 合并自动删分支会把叠在上面的 PR 一起关掉）
 - **目标**：停一个模块时，「宽限期内收不收新请求、在途 handler 还能不能回调、generation 什么时候撤」三件事由一个状态机定死，而且**撤 generation 早于杀进程**由类型保证，不靠调用顺序。
 - **开发范围**：
-  1. `agent24-os-proto` 里一个纯状态机：`Running → Draining → Revoking → Stopped`；在途请求登记（带 `request_id`）；drain 在「在途清零」与「宽限到期」先到者结束。
+  1. `agent24-os-proto` 里一个纯状态机：`Starting → Running → Draining → Revoked`（没有单独的 `Stopped`，理由见 SPEC「3b-5 落地时定死的几条」）；在途请求登记（带 `request_id`）；drain 在「在途清零」与「宽限到期」先到者结束。
   2. **回调准入**是它的一个纯判定：Running 全收；Draining 只收**携带并命中活跃 `request_id`** 的；Revoking 之后一律拒。回调通道本身是 ME-3c，本刀只交判定，3c 调它。
   3. **杀进程组的入口要求一个只能由「撤销 generation」产出的值**，于是「先杀后撤」写不出来（编译不过），而不是「测试里没这么写」。
   4. 接进代理：Draining 期间新的被代理请求 503（`error.code` 区分 draining / not-ready / overloaded，§2.1 已预留）；在途请求继续；drain 超时的在途请求 503、结果记为「未知」写日志，不假装成功。
