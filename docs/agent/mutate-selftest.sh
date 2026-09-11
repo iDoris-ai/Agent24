@@ -266,6 +266,44 @@ expect 130 $? "㉒c 非交互脚本收到 INT → 以 130 退出"
 expect no "$([ -e "$FAKE/cell2" ] && echo yes || echo no)" "㉒c 且第二格从未开始"
 expect same "$(same_as_orig)" "㉒c 源码已恢复"
 
+# ㉒d 按 Ctrl-C 的真实形状:信号发给**整个进程组**,外层是一个批量循环(复审 @ c78db3d F-A)。
+# `exit 130` 只是报告了 INT,没有死于 INT;外层 bash 按 wait-and-cooperative-exit 看到「正常退出」
+# 就接着跑下一轮。要求:内层真的死于 INT(顶层与 `( … )` 子 shell 都是),调用方的 EXIT trap
+# 照常运行;调用方自己有 INT trap 时,那个 trap 照常运行。
+# 外层用 perl 放进自己的进程组、恢复 INT 默认处置,然后 kill -INT -<pgid>。
+INNER=$FAKE/inner.sh
+cat >"$INNER" <<SH
+cd $(printf %q "$ROOT") && source docs/agent/mutate.sh
+export MUT_TIMEOUT=5  # 回退时第二轮会真的跑起来;别让它把自证拖住
+[ -n "\${WITH_EXIT_TRAP:-}" ] && trap ': >$(printf %q "$FAKE/exit-trap-ran")' EXIT
+[ -n "\${WITH_INT_TRAP:-}" ] && trap 'echo CALLER_INT >$(printf %q "$FAKE/caller-int"); exit 9' INT
+if [ -n "\${IN_SUBSHELL:-}" ]; then
+  ( MUT_CARGO=$(printf %q "$FAKE/slow") mut $(printf %q "$F") $(printf %q "$BREAKER") '        if false {' x )
+else
+  MUT_CARGO=$(printf %q "$FAKE/slow") mut $(printf %q "$F") $(printf %q "$BREAKER") '        if false {' x
+fi
+SH
+outer_int() { # outer_int <额外环境> : 两轮循环,第一轮进行中对整个进程组发 INT;echo 外层退出码
+  rm -f "$FAKE/running" "$FAKE/iter2" "$FAKE/exit-trap-ran" "$FAKE/caller-int"; : >"$FAKE/pids"
+  env "$@" perl -e 'setpgrp(0,0); $SIG{INT}="DEFAULT"; exec @ARGV' bash -c "for i in 1 2; do [ \$i = 2 ] && : >$(printf %q "$FAKE/iter2"); bash $(printf %q "$INNER"); done" >/dev/null 2>&1 &
+  local pg=$!
+  wait_for "$FAKE/running" || echo "    (第一轮没跑起来)" >&2
+  kill -INT -- "-$pg"
+  { wait "$pg"; } 2>/dev/null
+  echo $?
+}
+rc=$(outer_int)
+expect yes "$([ "$rc" -ne 0 ] && echo yes || echo no)" "㉒d 批量循环里按 Ctrl-C → 外层也停(退出码 $rc,非 0)"
+expect no "$([ -e "$FAKE/iter2" ] && echo yes || echo no)" "㉒d 第二轮从未开始"
+expect same "$(same_as_orig)" "㉒d 源码已恢复"
+rc=$(outer_int IN_SUBSHELL=1)
+expect no "$([ -e "$FAKE/iter2" ] && echo yes || echo no)" "㉒d 内层写成 ( mut … ) 时,第二轮同样从未开始"
+expect same "$(same_as_orig)" "㉒d (子 shell)源码已恢复"
+rc=$(outer_int WITH_EXIT_TRAP=1)
+expect yes "$([ -e "$FAKE/exit-trap-ran" ] && echo yes || echo no)" "㉒d 调用方的 EXIT trap 照常运行"
+rc=$(outer_int WITH_INT_TRAP=1)
+expect CALLER_INT "$(cat "$FAKE/caller-int" 2>/dev/null)" "㉒d 调用方自己的 INT trap 照常运行"
+
 echo "── 交互式 shell 里 Ctrl-C ──"
 : >"$FAKE/pids"
 rm -f "$FAKE/running"
@@ -375,6 +413,8 @@ MUT_CARGO=$FAKE/flaky mut "$F" "$BREAKER" '        if false {' "㉜" >/dev/null
 expect VOID "$_MUT_LAST" "㉜ 变异版第一次红、第二次绿(偶发)→ 作废,不是 🔴"
 MUT_CARGO=$FAKE/cond mut "$FRAME" '// no newline, then EOF' '// no newline, then eof' "㉝" >/dev/null
 expect VOID "$_MUT_LAST" "㉝ 改动落在行尾注释里 → 作废"
+MUT_CARGO=$FAKE/cond mut "$FRAME" ' // no newline, then EOF' '' "㉝b 删掉整条行尾注释" >/dev/null
+expect VOID "$_MUT_LAST" "㉝b 删掉整条行尾注释(改动点落在注释前的空格上)→ 同样作废"
 printf '\n// drift\n' >>"$FRAME"
 MUT_CARGO=$FAKE/cond mut "$F" "$BREAKER" '        if false {' "㉞" >/dev/null
 expect 1 $? "㉞ 基线之后别的源码变了 → 拒绝开始"

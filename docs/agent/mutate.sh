@@ -9,8 +9,9 @@
 #   mut_recover                             # 上一次被 SIGKILL 打断时,把被变异的文件恢复
 #
 # 返回值：一格读完(不论读成什么)返回 0；拒绝开始返回 1；源码恢复失败返回 2；被信号 n 打断
-# 返回 128+n。非交互 shell(脚本)里,收到的信号会原样交还给本 shell:调用方有自己的 trap 就
-# 照常运行它,没有就按默认处置退出(和被那个信号杀掉一样);交互式 shell 里只返回,提示符留着。
+# 返回 128+n。非交互 shell(脚本)里,收到的信号会交还给本 shell:调用方有自己的 trap 就照常
+# 运行它;没有,本 shell(含 `( … )` 子 shell)就**死于这个信号**,调用方的 EXIT trap 照常运行 ——
+# 外层的批量循环因此也会停下。交互式 shell 里只返回,提示符留着。
 # 对 `set -e` 安全:一格读成 ALIVE/VOID 不会让调用方脚本退出。
 # `MUT_TIMEOUT`（秒,默认 150）与 `MUT_CARGO`（默认 cargo；自证用它换成假 cargo）可覆盖。
 
@@ -58,11 +59,20 @@ _mut_done() { # 收到过信号:把它原样交还给本 shell —— 调用方�
       sh -c 'kill -s "$1" "$PPID"' _ "$sig"
       return "$rc"
     fi
-    # 调用方没有 trap:按默认处置,整个脚本就此退出。**不能**同样用 sh 重发 —— 对 INT,
-    # bash 的 wait-and-cooperative-exit 规则只在前台子进程「也死于 SIGINT」时才让 shell
-    # 退出,而 sh 是正常退出的,于是 bash 接着跑下一格(复审 @ #172 F1 实测)。
-    # 源码没恢复(2)时保留 2:那条信息比「被信号打断」更要紧。
-    [ "$rc" -eq 2 ] && exit 2
+    # 调用方没有 trap:**死于这个信号本身**,而不是 `exit 128+n`。区别是给上一层看的:
+    # 等着本 shell 的父 bash 也收到了同一个 Ctrl-C,它按 wait-and-cooperative-exit 规则,
+    # 只在子进程「死于 SIGINT」时才跟着退出 —— `exit 130` 是正常退出,父 bash 会接着跑
+    # 下一轮(复审 @ c78db3d F-A:外层批量循环里按 Ctrl-C 停不下)。
+    # 「本 shell」要取对:bash 3.2 没有 $BASHPID,$$ 在 `( … )` 里是顶层脚本;
+    # `$(exec sh -c 'echo $PPID')` 里命令替换的子 shell 被 sh 取代,sh 的父进程就是本 shell。
+    # 调用方的 EXIT trap 照常运行(bash 死于它捕获的致命信号前会跑 EXIT trap;实测)。
+    # 源码没恢复时,提示已经打印过;这里仍然死于信号 —— 让这一批停下比保留退出码 2 更要紧。
+    local self
+    self=$(exec sh -c 'echo "$PPID"')
+    trap - "$sig"
+    kill -s "$sig" "$self"
+    # 信号是异步投递的;万一它在本 shell 启动时就被忽略(无法改回),退回到报告退出码。
+    sleep 1
     exit $((128 + $(kill -l "$sig")))
   fi
   if [ "$rc" -ge 128 ] && [[ $- != *i* ]]; then exit "$rc"; fi

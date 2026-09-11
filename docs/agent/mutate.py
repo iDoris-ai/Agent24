@@ -53,7 +53,9 @@
   5. 测试进程崩溃(abort/段错误)算 🔴,但只在输出能确定崩的就是那个 lib 测试二进制时;
      别的子进程(build script、包装器)失败 → 作废。
 
-**仍然拦不住的**,如实写:唯一锚点落在 `#[cfg(...)]` 编译掉的代码或字符串字面量里 → 假 🟢;测试进程另起会话的后代,只有在它父进程还活着时才能按 ppid 找到并杀掉 —— 父进程
+**仍然拦不住的**,如实写:唯一锚点落在 `#[cfg(...)]` 编译掉的代码或字符串字面量里 → 假 🟢;
+注释判定是一个最小的 Rust 词法扫描(不是编译器),认不出的写法按「是代码」处理,由测试结果说话;
+比较时忽略空白,所以只改字符串里空白的变异会被判作废(方向是保守的);测试进程另起会话的后代,只有在它父进程还活着时才能按 ppid 找到并杀掉 —— 父进程
 先退出、后代被 launchd 收养的那种,找不到。选锚点时自己确认它是被编译、被执行的代码。
 
 ── 一个试过并否定的做法 ────────────────────────────────────────────────
@@ -249,9 +251,13 @@ def restore(paths, src, original, mutated_sha, meta=None):
                 # 那半截是我们写的 —— 但 SIGKILL 与 recover 之间,也可能有人改过它。覆盖前
                 # 先把此刻的字节存一份:这是「有人改过就不覆盖」这条规则唯一的例外路径,
                 # 例外也不能丢东西(复审 @ #172 F3)。
-                keep = os.path.join(paths.gitdir, f"mutate-overwritten-{int(time.time())}")
-                with open(keep, "wb") as k:
+                keep = os.path.join(paths.gitdir,
+                                    f"mutate-overwritten-{time.time_ns()}-{os.getpid()}")
+                with open(keep, "xb") as k:  # x:绝不覆盖另一份存档
                     k.write(current)
+                    k.flush()
+                    os.fsync(k.fileno())
+                fsync_dir(paths.gitdir)
                 say(f"  ⚠️ {src} 处于我们写到一半的状态,已写回原文;覆盖前的内容存在 {keep}")
             write_source(paths, src, original)
             with open(src, "rb") as f:
@@ -568,34 +574,43 @@ def inject(original, anchor, repl):
     p = 0
     while p < min(len(s), len(out)) and s[p] == out[p]:
         p += 1
-    where = comment_at(s, p)
-    if where == "line":
-        return None, "改动落在 // 注释里(含行尾注释)—— 改注释不改行为"
-    if where == "block":
-        return None, "改动落在 /* */ 块注释里 —— 改注释不改行为"
+    # 去掉注释之后,改动前后是否相同 —— 比「第一个不同字节落在哪」强:删掉一整条行尾注释
+    # (改动点落在注释前的空格上)、删掉一段恰好从改动点开始的块注释,都只动了注释(复审 @
+    # c78db3d F-C)。
+    # 比较时忽略空白:删掉行尾注释通常连前面的空格一起删。代价如实写 —— 只改字符串字面量里
+    # 空白的变异也会被判作废(方向是保守的:作废,不给假读数)。
+    if re.sub(r"\s+", "", code_only(s)) == re.sub(r"\s+", "", code_only(out)):
+        where = comment_at(s, p)
+        kind = "/* */ 块注释" if where == "block" else "// 注释"
+        return None, f"改动只落在{kind}里(含行尾注释)—— 改注释不改行为"
     return out.encode("utf-8"), None
 
 
-def comment_at(s, p):
-    """位置 p 在不在注释里:"line" / "block" / None。一个最小的 Rust 词法扫描 —— 字符串、
-    原始字符串、字符字面量、生命周期、可嵌套的块注释都认得。
-
-    上一版用子串查找(「p 之前最后一个 `/*` 在最后一个 `*/` 之后」),在注释里写着
-    `_a24/memory/scoped/*` 这种路径的文件上,之后的每一处改动都被判成「在块注释里」——
-    脚手架对这个文件整个不能用(在 rpc.rs 上实测)。行注释那条同理会被字符串里的
-    `http://` 骗到。"""
+def _scan(s, stop=None):
+    """逐段切分 Rust 源码:产出 (kind, start, end),kind ∈ {"code", "line", "block"}。
+    字符串、原始字符串(含 br"…" / cr#"…"# 这类前缀)、字符字面量、生命周期、可嵌套块注释都认得。
+    stop 给定时,扫到 stop 为止。"""
     i, n = 0, len(s)
-    while i < p:
+    stop = n if stop is None else stop
+    code_start = 0
+
+    def ident(k):
+        return 0 <= k < n and (s[k].isalnum() or s[k] == "_")
+
+    while i < stop:
         c = s[i]
         two = s[i:i + 2]
         if two == "//":
+            if code_start < i:
+                yield ("code", code_start, i)
             end = s.find("\n", i)
             end = n if end == -1 else end
-            if p < end:
-                return "line"
-            i = end
+            yield ("line", i, end)
+            i = code_start = end
         elif two == "/*":
-            depth, i = 1, i + 2
+            if code_start < i:
+                yield ("code", code_start, i)
+            start, depth, i = i, 1, i + 2
             while i < n and depth:
                 if s.startswith("/*", i):
                     depth, i = depth + 1, i + 2
@@ -603,15 +618,16 @@ def comment_at(s, p):
                     depth, i = depth - 1, i + 2
                 else:
                     i += 1
-                if depth and i > p:
-                    return "block"
-        elif c == "r" and (s.startswith('r"', i) or s.startswith("r#", i)) and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_")):
-            j = i + 1
-            while j < n and s[j] == "#":
-                j += 1
-            if j < n and s[j] == '"':
-                close = '"' + "#" * (j - i - 1)
-                end = s.find(close, j + 1)
+            yield ("block", start, i)
+            code_start = i
+        elif (c == "r" or (c in "bc" and i + 1 < n and s[i + 1] == "r")) and not ident(i - 1):
+            j = i + (2 if c != "r" else 1)
+            k = j
+            while k < n and s[k] == "#":
+                k += 1
+            if k < n and s[k] == '"':
+                close = '"' + "#" * (k - j)
+                end = s.find(close, k + 1)
                 i = n if end == -1 else end + len(close)
             else:
                 i += 1
@@ -623,7 +639,7 @@ def comment_at(s, p):
         elif c == "'":
             # 字符字面量 'x' / '\n' / '\u{..}';否则是生命周期 'a,跳过这个引号即可
             if s.startswith("\\", i + 1):
-                end = s.find("'", i + 2)
+                end = s.find("'", i + 3)
                 i = n if end == -1 else end + 1
             elif i + 2 < n and s[i + 2] == "'":
                 i += 3
@@ -631,6 +647,24 @@ def comment_at(s, p):
                 i += 1
         else:
             i += 1
+    if code_start < min(i, n):
+        yield ("code", code_start, min(i, n))
+
+
+def code_only(s):
+    """s 去掉全部注释之后剩下的代码。"""
+    return "".join(s[a:b] for kind, a, b in _scan(s) if kind == "code")
+
+
+def comment_at(s, p):
+    """位置 p 在不在注释里:"line" / "block" / None(用于提示文字;判定本身用 code_only)。
+
+    上一版用子串查找(「p 之前最后一个 `/*` 在最后一个 `*/` 之后」),在注释里写着
+    `_a24/memory/scoped/*` 这种路径的文件上,之后的每一处改动都被判成「在块注释里」——
+    脚手架对这个文件整个不能用(在 rpc.rs 上实测)。"""
+    for kind, a, b in _scan(s):
+        if a <= p < b:
+            return None if kind == "code" else kind
     return None
 
 
