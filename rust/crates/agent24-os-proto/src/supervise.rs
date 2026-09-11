@@ -224,7 +224,11 @@ impl std::fmt::Display for TerminateFailed {
     }
 }
 
-impl std::error::Error for TerminateFailed {}
+impl std::error::Error for TerminateFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 fn terminate_group_inner(child: &mut std::process::Child, grace: Duration) -> std::io::Result<()> {
     use rustix::process::{Pid, Signal, kill_process_group};

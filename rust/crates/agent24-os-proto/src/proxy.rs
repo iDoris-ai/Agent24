@@ -652,12 +652,16 @@ async fn forward(
             ),
         );
     };
-    // Shared by the request body handed to hyper and by the response bytes: when
-    // a revocation drops this future, hyper may still hold the request it was
-    // given, and the permit has to outlive that too — otherwise a restart can
-    // start a fresh set of requests while the old generation's bodies are still
-    // in memory, and the ceiling bounds nothing.
-    let permit = Arc::new(permit);
+    // The permit rides with the RESPONSE bytes only (see below), not with the
+    // request body handed to hyper. That leaves one thing uncounted, stated
+    // rather than half-fixed (FU-47): once `forward` is dropped — by a
+    // revocation, say — hyper may still hold the request body it was given
+    // until the upstream connection closes. After a revocation the process is
+    // killed within its grace, so that overshoot is transient. Attaching the
+    // permit to the request body was tried and is worse: a module that answers
+    // early without reading its body, and keeps the connection open, makes hyper
+    // hold that body indefinitely — and with the permit inside it, 64 such
+    // exchanges starve the namespace for good.
 
     let method = request.method().clone();
     let from_client = request.headers().clone();
@@ -695,25 +699,22 @@ async fn forward(
         }
     };
 
-    let mut upstream_request =
-        match Request::builder()
-            .method(method)
-            .uri(upstream_uri)
-            .body(Full::new(Bytes::from_owner(PermitBytes {
-                data: body,
-                _permit: Arc::clone(&permit),
-            }))) {
-            Ok(r) => r,
-            // Not `unwrap_or_default()`: the default is a GET of `/` with an empty
-            // body, which would proxy a DIFFERENT request rather than fail one.
-            Err(e) => {
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_unavailable",
-                    &format!("the proxied request could not be rebuilt: {e}"),
-                );
-            }
-        };
+    let mut upstream_request = match Request::builder()
+        .method(method)
+        .uri(upstream_uri)
+        .body(Full::new(body))
+    {
+        Ok(r) => r,
+        // Not `unwrap_or_default()`: the default is a GET of `/` with an empty
+        // body, which would proxy a DIFFERENT request rather than fail one.
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_unavailable",
+                &format!("the proxied request could not be rebuilt: {e}"),
+            );
+        }
+    };
     *upstream_request.headers_mut() = headers;
 
     // Two deadlines, because they answer different questions (§5): a module that
@@ -823,7 +824,7 @@ async fn forward(
 /// for the two earlier versions that bounded neither.
 struct PermitBytes {
     data: Bytes,
-    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl AsRef<[u8]> for PermitBytes {
