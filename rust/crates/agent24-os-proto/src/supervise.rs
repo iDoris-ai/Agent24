@@ -198,14 +198,35 @@ impl RestartPolicy {
 ///
 /// # Errors
 ///
-/// Propagates the failure to signal or to reap. `ESRCH` (nothing there) is
-/// **not** an error: the goal state is "that group is gone".
+/// A failure to signal or to reap, **with the permit handed back** in
+/// [`TerminateFailed`]: revocation is one-shot, so a permit spent on an attempt
+/// that failed would leave a revoked generation whose process nobody may legally
+/// retry killing. `ESRCH` (nothing there) is **not** an error: the goal state is
+/// "that group is gone".
 pub fn terminate_group(
     permit: KillPermit,
     child: &mut std::process::Child,
     grace: Duration,
-) -> std::io::Result<()> {
-    let _ = permit;
+) -> Result<(), TerminateFailed> {
+    terminate_group_inner(child, grace).map_err(|error| TerminateFailed { error, permit })
+}
+
+/// [`terminate_group`] failed. The permit comes back so the caller can retry.
+#[derive(Debug)]
+pub struct TerminateFailed {
+    pub error: std::io::Error,
+    pub permit: KillPermit,
+}
+
+impl std::fmt::Display for TerminateFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for TerminateFailed {}
+
+fn terminate_group_inner(child: &mut std::process::Child, grace: Duration) -> std::io::Result<()> {
     use rustix::process::{Pid, Signal, kill_process_group};
 
     let raw = i32::try_from(child.id()).unwrap_or(0);
@@ -222,7 +243,12 @@ pub fn terminate_group(
 
     // Poll rather than block: `wait` would hang exactly when the module is
     // ignoring SIGTERM, which is the case this function exists for.
-    let deadline = Instant::now() + grace;
+    // `checked_add`: an unrepresentable grace must not panic half-way through a
+    // kill (the permit is already spent by then). It is treated as "wait no
+    // longer than the reap bound", not as forever.
+    let deadline = Instant::now()
+        .checked_add(grace)
+        .unwrap_or_else(|| Instant::now() + REAP_TIMEOUT);
     while Instant::now() < deadline {
         if child.try_wait()?.is_some() {
             // The leader is gone. Signal the group once more anyway — helpers

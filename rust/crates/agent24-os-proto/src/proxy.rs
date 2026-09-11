@@ -652,6 +652,12 @@ async fn forward(
             ),
         );
     };
+    // Shared by the request body handed to hyper and by the response bytes: when
+    // a revocation drops this future, hyper may still hold the request it was
+    // given, and the permit has to outlive that too — otherwise a restart can
+    // start a fresh set of requests while the old generation's bodies are still
+    // in memory, and the ceiling bounds nothing.
+    let permit = Arc::new(permit);
 
     let method = request.method().clone();
     let from_client = request.headers().clone();
@@ -689,22 +695,25 @@ async fn forward(
         }
     };
 
-    let mut upstream_request = match Request::builder()
-        .method(method)
-        .uri(upstream_uri)
-        .body(Full::new(body))
-    {
-        Ok(r) => r,
-        // Not `unwrap_or_default()`: the default is a GET of `/` with an empty
-        // body, which would proxy a DIFFERENT request rather than fail one.
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_unavailable",
-                &format!("the proxied request could not be rebuilt: {e}"),
-            );
-        }
-    };
+    let mut upstream_request =
+        match Request::builder()
+            .method(method)
+            .uri(upstream_uri)
+            .body(Full::new(Bytes::from_owner(PermitBytes {
+                data: body,
+                _permit: Arc::clone(&permit),
+            }))) {
+            Ok(r) => r,
+            // Not `unwrap_or_default()`: the default is a GET of `/` with an empty
+            // body, which would proxy a DIFFERENT request rather than fail one.
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_unavailable",
+                    &format!("the proxied request could not be rebuilt: {e}"),
+                );
+            }
+        };
     *upstream_request.headers_mut() = headers;
 
     // Two deadlines, because they answer different questions (§5): a module that
@@ -814,7 +823,7 @@ async fn forward(
 /// for the two earlier versions that bounded neither.
 struct PermitBytes {
     data: Bytes,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl AsRef<[u8]> for PermitBytes {
@@ -2428,8 +2437,12 @@ mod tests {
         assert_eq!(first.body, "done");
     }
 
-    /// SPEC §8: *"drain 超时的在途请求返回 503(不假装成功)"*. The module DOES answer
-    /// 200 — after its generation was revoked — and the client must not see it.
+    /// SPEC §8: *"drain 超时的在途请求返回 503(不假装成功)"* — through the whole
+    /// handler: the request is with the module when its generation is revoked,
+    /// and the client gets 503 `request_abandoned` plus the log line. (Whether
+    /// the module's 200 is ever read here depends on which side of the race wins;
+    /// that a 200 arriving AFTER the revocation is not committed is pinned
+    /// separately, by `a_200_that_arrives_after_the_revocation_is_not_committed`.)
     #[tokio::test]
     async fn a_request_whose_generation_is_revoked_gets_a_503_not_the_modules_200() {
         let (logs, _guard) = capture_logs();
@@ -2764,6 +2777,137 @@ mod tests {
             module.dials.load(Ordering::SeqCst),
             0,
             "sent after the revoke"
+        );
+    }
+
+    /// A request body that yields nothing until the test opens `gate`, and says
+    /// when it was first polled — so a test can establish "forward is inside the
+    /// body read" as a fact rather than after a sleep.
+    struct GatedBody {
+        polled: Option<tokio::sync::oneshot::Sender<()>>,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        sent: bool,
+    }
+
+    impl hyper::body::Body for GatedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            use std::future::Future;
+            use std::task::Poll;
+            if let Some(tx) = self.polled.take() {
+                let _ = tx.send(());
+            }
+            if self.sent {
+                return Poll::Ready(None);
+            }
+            if let Some(gate) = self.gate.as_mut() {
+                if std::pin::Pin::new(gate).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.gate = None;
+            }
+            self.sent = true;
+            Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                b"late",
+            )))))
+        }
+    }
+
+    /// The window the `select!` in `proxy` cannot close alone: the client's last
+    /// body byte and the revocation land together, and `forward` is polled first.
+    /// Here `forward` runs on its own, inside the body read when the revocation
+    /// lands; the body then completes. It must not dial the module.
+    #[tokio::test]
+    async fn a_revocation_during_the_body_read_stops_forward_from_sending() {
+        let module = gated(Then::Answer).await;
+        let generation = running_generation();
+        let state = state_with(
+            NS,
+            module.addr,
+            Current::new(generation.clone()),
+            Limits::default(),
+            MAX_INFLIGHT_PER_MODULE,
+        );
+        let in_flight = generation.admit_request("r-3".into()).unwrap();
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let uri: Uri = format!("{NS}/a").parse().unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(uri.clone())
+            .body(Body::new(GatedBody {
+                polled: Some(polled_tx),
+                gate: Some(gate_rx),
+                sent: false,
+            }))
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let got = forward(&state, &uri, request, "r-3", &in_flight).await;
+            (got, in_flight)
+        });
+
+        polled_rx
+            .await
+            .expect("forward never started reading the body");
+        let _ = generation.revoke();
+        gate_tx.send(()).unwrap();
+
+        let (got, in_flight) = task.await.unwrap();
+        assert_eq!(got.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = got.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("module_stopping"));
+        assert_eq!(
+            module.dials.load(Ordering::SeqCst),
+            0,
+            "sent after the revoke"
+        );
+        assert_eq!(in_flight.finish(), Err(Abandoned { dispatched: false }));
+    }
+
+    /// `finish` is the commit point. A 200 the module really wrote — after its
+    /// generation was revoked — is not committed. Driven through `forward`
+    /// directly so the race in `proxy` cannot cancel the read first: the
+    /// precondition asserts the 200 actually arrived.
+    #[tokio::test]
+    async fn a_200_that_arrives_after_the_revocation_is_not_committed() {
+        let module = gated(Then::Answer).await;
+        let generation = running_generation();
+        let state = state_with(
+            NS,
+            module.addr,
+            Current::new(generation.clone()),
+            Limits::default(),
+            MAX_INFLIGHT_PER_MODULE,
+        );
+        let in_flight = generation.admit_request("r-4".into()).unwrap();
+        let uri: Uri = format!("{NS}/a").parse().unwrap();
+        let request = Request::builder()
+            .uri(uri.clone())
+            .body(Body::empty())
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let got = forward(&state, &uri, request, "r-4", &in_flight).await;
+            (got, in_flight)
+        });
+        module.wait_arrived().await;
+        let _ = generation.revoke();
+        module.release.notify_waiters();
+
+        let (got, in_flight) = task.await.unwrap();
+        assert_eq!(
+            got.status(),
+            StatusCode::OK,
+            "precondition: the module really answered 200"
+        );
+        assert_eq!(
+            in_flight.finish(),
+            Err(Abandoned { dispatched: true }),
+            "a 200 that arrived after the revocation was committed"
         );
     }
 }

@@ -95,10 +95,13 @@
 //! `Clone`, adding `impl Default`, and dropping the permit parameter each turn
 //! exactly its block red.
 //!
-//! Every kill path goes through here — a disable, a crash (helpers outlive a
-//! dead leader and may still hold the callback connection), a startup timeout
-//! (nothing was ever admitted, so revoking costs nothing). None is exempt,
-//! because an exemption is a constructor.
+//! Every kill path **must** go through here — a disable, a crash (helpers
+//! outlive a dead leader and may still hold the callback connection), a startup
+//! timeout (nothing was ever admitted, so revoking costs nothing). None may be
+//! exempt, because an exemption is a constructor. That is a rule for the
+//! supervisor that does not exist yet (FU-46), not a description of today:
+//! today nothing in the daemon kills a module process at all, and
+//! `Launched::child` can still be killed without a permit.
 //!
 //! # No clock, no waiting
 //!
