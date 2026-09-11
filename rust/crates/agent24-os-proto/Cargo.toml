@@ -18,7 +18,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # For signalling a process GROUP — a safe wrapper over `killpg`.
 rustix = { version = "0.38", features = ["process"] }
-tokio = { version = "1", features = ["time"] }
+# `rt` + `io-util` for the callback connection loop (ME-3c, `rpc::serve`);
+# `sync` / `macros` for its channels and `select!`.
+tokio = { version = "1", features = ["time", "sync", "macros", "rt", "io-util"] }
 
 [dev-dependencies]
 tempfile = "3"
