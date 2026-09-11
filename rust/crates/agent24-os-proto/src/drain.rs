@@ -47,11 +47,34 @@
 //! ```
 //!
 //! ```compile_fail
+//! // ... or to copy one ...
+//! fn f(p: agent24_os_proto::drain::KillPermit) -> (agent24_os_proto::drain::KillPermit, agent24_os_proto::drain::KillPermit) {
+//!     (p.clone(), p)
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! // ... or to default one into existence ...
+//! let permit = agent24_os_proto::drain::KillPermit::default();
+//! ```
+//!
+//! ```compile_fail
 //! # fn f(child: &mut std::process::Child) {
-//! // ... and no way to kill without one.
+//! // ... and `terminate_group` cannot be called without one.
 //! agent24_os_proto::supervise::terminate_group(child, std::time::Duration::from_secs(1));
 //! # }
 //! ```
+//!
+//! **What this does NOT guarantee, stated because it would be easy to read it
+//! in.** A permit is not bound to a process or to the generation that process
+//! belongs to: any revoked generation's permit can kill any group, and the
+//! tests here do exactly that. Nor is `terminate_group` the only way to kill a
+//! process — `Launched::child` is a `std::process::Child`, and `.kill()` needs
+//! no permit. What the type enforces is narrower: **a call to
+//! `terminate_group` is preceded by some call to `revoke`.** Binding the two to
+//! one process is the job of the supervisor that will own both the child and
+//! its generation (ME-3b-3's `Supervisor`, not yet written; FU-46) — and that
+//! type should be the only holder of the child.
 //!
 //! The control for both — the one legal order, which must compile:
 //!
@@ -59,17 +82,18 @@
 //! # fn f(child: &mut std::process::Child) {
 //! use agent24_os_proto::drain::Generation;
 //! let generation = Generation::starting();
-//! let revocation = generation.revoke();
+//! let revocation = generation.revoke().expect("the first revoke yields the permit");
 //! agent24_os_proto::supervise::terminate_group(revocation.permit, child, std::time::Duration::from_secs(1));
 //! # }
 //! ```
 //!
 //! **Why the control is there.** Stable rustdoc does not check the error code of
 //! a `compile_fail` block — measured: `compile_fail,E0999` passes. So each of
-//! the two blocks above passes for ANY compile error, a typo included, and only
+//! the blocks above passes for ANY compile error, a typo included, and only
 //! the control shows that the same shape compiles when the permit is
-//! legitimate. The mutation that proves the first one bears weight is making
-//! `_private` public: it must turn that block red.
+//! legitimate. Each was mutation-checked: making `_private` public, deriving
+//! `Clone`, adding `impl Default`, and dropping the permit parameter each turn
+//! exactly its block red.
 //!
 //! Every kill path goes through here — a disable, a crash (helpers outlive a
 //! dead leader and may still hold the callback connection), a startup timeout
@@ -142,10 +166,11 @@ pub enum CallbackRefused {
     Revoked,
 }
 
-/// The one value that allows killing a module's process group.
+/// The one value that allows [`crate::supervise::terminate_group`].
 ///
-/// Not `Clone`, no public constructor: [`Generation::revoke`] is the only source,
-/// so holding one proves the generation it came from was revoked first.
+/// Not `Clone`, not `Default`, no public constructor: [`Generation::revoke`] is
+/// the only source, so holding one proves that SOME generation was revoked
+/// first — not which one; see the module docs for what that leaves open.
 #[derive(Debug)]
 pub struct KillPermit {
     _private: (),
@@ -156,10 +181,14 @@ pub struct KillPermit {
 pub struct Revocation {
     /// Allows [`crate::supervise::terminate_group`].
     pub permit: KillPermit,
-    /// Requests still in flight at the moment of revocation. Their outcome is
-    /// **unknown** — the module may or may not have acted on them — and the
-    /// caller must say so (a 503, and a log line), never report success.
+    /// Requests in flight AND already sent to the module at the moment of
+    /// revocation. Their outcome is **unknown** — the module may or may not have
+    /// acted on them — and the caller must say so (a 503, and a log line),
+    /// never report success.
     pub abandoned: Vec<String>,
+    /// Requests in flight but never sent (still reading the client's body, say).
+    /// Their outcome is known: nothing ran, and after this point nothing will.
+    pub never_sent: Vec<String>,
 }
 
 /// Where a drain stands at a given `now`.
@@ -183,6 +212,11 @@ pub enum DrainProgress {
 struct Inner {
     state: DrainState,
     in_flight: HashSet<String>,
+    /// The subset of `in_flight` that has been sent to the module. Marked under
+    /// the same lock `revoke` takes, so "sent" and "revoked" are ordered: a
+    /// request is either sent before the revocation (its outcome is then
+    /// unknown) or never sent at all (known: nothing ran).
+    dispatched: HashSet<String>,
     drain_deadline: Option<Instant>,
 }
 
@@ -191,6 +225,10 @@ struct Inner {
 #[derive(Debug)]
 pub struct Generation {
     inner: Mutex<Inner>,
+    /// Flips to `true` once, on revocation, so a request in flight can stop
+    /// waiting for its module the moment its generation is revoked rather than
+    /// when the process finally dies (see [`InFlight::revoked`]).
+    revoked: tokio::sync::watch::Sender<bool>,
 }
 
 /// A request admitted into a generation. Leaves the in-flight set when dropped,
@@ -211,8 +249,10 @@ impl Generation {
             inner: Mutex::new(Inner {
                 state: DrainState::Starting,
                 in_flight: HashSet::new(),
+                dispatched: HashSet::new(),
                 drain_deadline: None,
             }),
+            revoked: tokio::sync::watch::Sender::new(false),
         })
     }
 
@@ -230,6 +270,13 @@ impl Generation {
     #[must_use]
     pub fn state(&self) -> DrainState {
         self.lock().state
+    }
+
+    /// How many admitted requests have not finished. For logs, and for a test to
+    /// establish "it is in flight" as a fact rather than after a sleep.
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.lock().in_flight.len()
     }
 
     /// `initialize` succeeded. Only from `Starting`; returns `false` otherwise
@@ -296,10 +343,17 @@ impl Generation {
     /// the grace).
     #[must_use]
     pub fn begin_drain(&self, now: Instant, grace: Duration) -> bool {
+        // Computed BEFORE touching the state: `now + grace` can overflow and
+        // panic, and a panic after `state = Draining` would leave a draining
+        // generation with no deadline behind a poisoned (and here, recovered)
+        // lock. An unrepresentable grace is refused instead.
+        let Some(deadline) = now.checked_add(grace) else {
+            return false;
+        };
         let mut inner = self.lock();
         if inner.state == DrainState::Running {
             inner.state = DrainState::Draining;
-            inner.drain_deadline = Some(now + grace);
+            inner.drain_deadline = Some(deadline);
             true
         } else {
             false
@@ -327,22 +381,42 @@ impl Generation {
     }
 
     /// Revoke this generation: from here on nothing is admitted — no request, no
-    /// callback, in flight or not. Legal from every state, because every kill
-    /// path needs it (see the module docs); calling it twice yields a second
-    /// permit for a process that is already being killed, which is harmless.
+    /// callback, in flight or not, and no in-flight request may still be sent
+    /// to the module. Legal from every state, because every kill path needs it
+    /// (see the module docs).
+    ///
+    /// **One-shot**: the first call returns the [`Revocation`] (and with it the
+    /// only [`KillPermit`] this generation will ever yield); every later call
+    /// returns `None`. Two paths that race to stop the same run — a crash and a
+    /// disable — therefore cannot both kill.
     ///
     /// The in-flight set is **kept**: an [`InFlight`] finishing after this
     /// point learns that it was abandoned from [`InFlight::finish`].
     #[must_use]
-    pub fn revoke(&self) -> Revocation {
-        let mut inner = self.lock();
-        inner.state = DrainState::Revoked;
-        let mut abandoned: Vec<String> = inner.in_flight.iter().cloned().collect();
+    pub fn revoke(&self) -> Option<Revocation> {
+        let (mut abandoned, mut never_sent) = {
+            let mut inner = self.lock();
+            if inner.state == DrainState::Revoked {
+                return None;
+            }
+            inner.state = DrainState::Revoked;
+            let (sent, unsent): (Vec<String>, Vec<String>) = inner
+                .in_flight
+                .iter()
+                .cloned()
+                .partition(|id| inner.dispatched.contains(id));
+            (sent, unsent)
+        };
         abandoned.sort();
-        Revocation {
+        never_sent.sort();
+        // After the state is Revoked, so a woken request that re-checks the
+        // state sees the revocation.
+        self.revoked.send_replace(true);
+        Some(Revocation {
             permit: KillPermit { _private: () },
             abandoned,
-        }
+            never_sent,
+        })
     }
 }
 
@@ -350,7 +424,11 @@ impl Generation {
 /// request was in flight: whatever the module answered, the kernel does not
 /// pass it on as a success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Abandoned;
+pub struct Abandoned {
+    /// Whether it had been sent to the module. `true`: its outcome is unknown.
+    /// `false`: nothing ran.
+    pub dispatched: bool,
+}
 
 impl Abandoned {
     /// The `error.code` of the 503 an abandoned request gets.
@@ -412,8 +490,40 @@ impl InFlight {
         &self.id
     }
 
-    /// The request is done. `Err(Abandoned)` if its generation was revoked in
-    /// the meantime — the caller answers 503 and logs the outcome as unknown.
+    /// Mark the request as about to be sent to the module. `false` if the
+    /// generation is already revoked — the caller must then NOT send it.
+    ///
+    /// Taken under the lock `revoke` takes, so the two are ordered: without it,
+    /// a request whose client was still sending its body when the drain expired
+    /// would finish reading and dial the module afterwards — the old process in
+    /// its SIGTERM grace, or a restarted one on the same address.
+    #[must_use]
+    pub fn dispatch(&self) -> bool {
+        let mut inner = self.generation.lock();
+        if inner.state == DrainState::Revoked {
+            return false;
+        }
+        inner.dispatched.insert(self.id.clone());
+        true
+    }
+
+    /// Resolves once this request's generation is revoked — immediately if it
+    /// already has been. `watch` rather than `Notify`: a subscriber sees the
+    /// current value, so a revocation that lands before anyone waits is not a
+    /// lost wakeup.
+    pub async fn revoked(&self) {
+        let mut rx = self.generation.revoked.subscribe();
+        // Err means the sender is gone, which cannot happen while `self` holds
+        // the generation; treat it as "never revoked" rather than as revoked.
+        let _ = rx.wait_for(|revoked| *revoked).await;
+    }
+
+    /// The request is done — **this is the commit point.** `Ok` means the
+    /// kernel passes the module's answer on; a revocation after this point does
+    /// not reach back into a response already on its way to the client (its
+    /// bytes may still be queued for a slow reader, and are still counted by the
+    /// concurrency ceiling, but they are no longer this generation's business).
+    /// `Err(Abandoned)` if the generation was revoked first.
     ///
     /// # Errors
     ///
@@ -423,20 +533,27 @@ impl InFlight {
         // landing between them lists this request in `Revocation::abandoned`
         // while this returns `Ok` — the kernel would log "outcome unknown" and
         // report success for the same request.
-        let revoked = {
+        let (revoked, dispatched) = {
             let mut inner = self.generation.lock();
             inner.in_flight.remove(&self.id);
-            inner.state == DrainState::Revoked
+            let dispatched = inner.dispatched.remove(&self.id);
+            (inner.state == DrainState::Revoked, dispatched)
         };
         self.finished = true;
-        if revoked { Err(Abandoned) } else { Ok(()) }
+        if revoked {
+            Err(Abandoned { dispatched })
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
         if !self.finished {
-            self.generation.lock().in_flight.remove(&self.id);
+            let mut inner = self.generation.lock();
+            inner.in_flight.remove(&self.id);
+            inner.dispatched.remove(&self.id);
         }
     }
 }
@@ -517,8 +634,10 @@ mod tests {
             "control: before revoke"
         );
 
-        let r = g.revoke();
-        assert_eq!(r.abandoned, vec!["a".to_owned()]);
+        let r = g.revoke().unwrap();
+        // Admitted but never sent: its outcome is known.
+        assert!(r.abandoned.is_empty());
+        assert_eq!(r.never_sent, vec!["a".to_owned()]);
         assert_eq!(g.admit_callback(Some("a")), Err(CallbackRefused::Revoked));
         assert_eq!(g.admit_callback(None), Err(CallbackRefused::Revoked));
         assert_eq!(
@@ -526,7 +645,7 @@ mod tests {
             RequestRefused::Stopping
         );
         // SPEC §8: *"drain 超时的在途请求返回 503(不假装成功)"*.
-        assert_eq!(a.finish(), Err(Abandoned));
+        assert_eq!(a.finish(), Err(Abandoned { dispatched: false }));
     }
 
     /// The drain ends at whichever comes first: in-flight reaching zero, or the
@@ -570,6 +689,35 @@ mod tests {
         assert_eq!(g.progress(Instant::now()), DrainProgress::Idle);
     }
 
+    /// `progress` only answers while draining; before and after, it says so
+    /// rather than reporting an idle drain that is not happening.
+    #[test]
+    fn progress_outside_a_drain_is_not_draining() {
+        let g = running();
+        let _a = g.admit_request("a".into()).unwrap();
+        assert_eq!(g.progress(Instant::now()), DrainProgress::NotDraining);
+        // Revoked AFTER a drain began, so a deadline exists: `NotDraining` here
+        // must come from the state, not from the deadline being absent.
+        assert!(g.begin_drain(Instant::now(), GRACE));
+        let _ = g.revoke();
+        assert_eq!(g.progress(Instant::now()), DrainProgress::NotDraining);
+    }
+
+    /// `ready` only moves Starting → Running. A late or repeated `initialize`
+    /// must not reopen a module that is draining.
+    #[test]
+    fn a_late_handshake_cannot_reopen_a_draining_module() {
+        let g = running();
+        assert!(!g.ready(), "a second initialize on a running module");
+        assert!(g.begin_drain(Instant::now(), GRACE));
+        assert!(!g.ready());
+        assert_eq!(g.state(), DrainState::Draining);
+        assert_eq!(
+            g.admit_request("b".into()).unwrap_err(),
+            RequestRefused::Draining
+        );
+    }
+
     #[test]
     fn a_second_drain_does_not_extend_the_grace() {
         let t = Instant::now();
@@ -594,8 +742,8 @@ mod tests {
         );
         assert_eq!(g.admit_callback(None), Err(CallbackRefused::NotReady));
         assert!(!g.begin_drain(Instant::now(), GRACE));
-        let r = g.revoke();
-        assert!(r.abandoned.is_empty());
+        let r = g.revoke().unwrap();
+        assert!(r.abandoned.is_empty() && r.never_sent.is_empty());
         // A revoked generation cannot be revived by a late handshake.
         assert!(!g.ready());
         assert_eq!(g.state(), DrainState::Revoked);
@@ -614,11 +762,59 @@ mod tests {
         let next = running();
         let replaced = current.replace(Arc::clone(&next));
         assert!(Arc::ptr_eq(&replaced, &old));
+        // `replace` does not revoke: whoever stops a run does, through the one
+        // path that yields a permit.
+        assert_eq!(replaced.state(), DrainState::Running);
         let _ = replaced.revoke();
 
-        assert_eq!(a.finish(), Err(Abandoned));
+        assert_eq!(a.finish(), Err(Abandoned { dispatched: false }));
         assert!(current.get().admit_request("b".into()).is_ok());
         assert!(Arc::ptr_eq(&current.get(), &next));
+    }
+
+    /// Revocation and "about to send" are ordered: after the revoke, a request
+    /// that has not been sent never will be; one that was sent is reported as
+    /// such. The control is the dispatch that happens BEFORE the revoke.
+    #[test]
+    fn after_revocation_nothing_more_is_sent_and_what_was_sent_is_reported() {
+        let g = running();
+        let sent = g.admit_request("sent".into()).unwrap();
+        let unsent = g.admit_request("unsent".into()).unwrap();
+        assert!(sent.dispatch(), "control: a running generation may send");
+
+        let r = g.revoke().unwrap();
+        assert_eq!(r.abandoned, vec!["sent".to_owned()]);
+        assert_eq!(r.never_sent, vec!["unsent".to_owned()]);
+        assert!(
+            !unsent.dispatch(),
+            "a revoked generation's request was sent"
+        );
+
+        assert_eq!(sent.finish(), Err(Abandoned { dispatched: true }));
+        assert_eq!(unsent.finish(), Err(Abandoned { dispatched: false }));
+    }
+
+    /// One revocation, one permit: a crash and a disable racing to stop the same
+    /// run cannot both kill it.
+    #[test]
+    fn revoking_twice_yields_one_permit() {
+        let g = running();
+        assert!(g.revoke().is_some());
+        assert!(g.revoke().is_none());
+        assert_eq!(g.state(), DrainState::Revoked);
+    }
+
+    /// A grace that cannot be added to `now` is refused, and leaves the
+    /// generation running — not draining with no deadline.
+    #[test]
+    fn an_unrepresentable_grace_is_refused_without_half_starting_a_drain() {
+        let g = running();
+        assert!(!g.begin_drain(Instant::now(), Duration::MAX));
+        assert_eq!(g.state(), DrainState::Running);
+        assert!(
+            g.begin_drain(Instant::now(), GRACE),
+            "control: a normal grace works"
+        );
     }
 
     #[test]

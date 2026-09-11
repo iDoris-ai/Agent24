@@ -190,9 +190,11 @@ impl RestartPolicy {
 /// # Only with a [`KillPermit`]
 ///
 /// The permit comes from [`crate::drain::Generation::revoke`] and nowhere else,
-/// so this cannot be called before the module's generation is revoked (SPEC §4:
-/// revocation must precede the kill, or the module can still write during the
-/// grace period). It is consumed: one revocation, one kill.
+/// so a call here is always preceded by a revocation (SPEC §4: revocation must
+/// precede the kill, or the module can still write during the grace period).
+/// It is consumed, so each call spends one. **It is not bound to `child`**: the
+/// type proves that a revocation happened, not that it was this process's
+/// generation — see [`crate::drain`] for what that leaves to the supervisor.
 ///
 /// # Errors
 ///
@@ -460,7 +462,10 @@ mod tests {
         );
 
         terminate_group(
-            crate::drain::Generation::starting().revoke().permit,
+            crate::drain::Generation::starting()
+                .revoke()
+                .expect("first revoke")
+                .permit,
             &mut launched.child,
             Duration::from_secs(2),
         )
@@ -518,7 +523,10 @@ mod tests {
 
         let start = Instant::now();
         terminate_group(
-            crate::drain::Generation::starting().revoke().permit,
+            crate::drain::Generation::starting()
+                .revoke()
+                .expect("first revoke")
+                .permit,
             &mut launched.child,
             Duration::from_millis(300),
         )

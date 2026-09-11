@@ -18,13 +18,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # For signalling a process GROUP — a safe wrapper over `killpg`.
 rustix = { version = "0.38", features = ["process"] }
-tokio = { version = "1", features = ["time"] }
+# `sync` for the revocation signal (`watch`), `macros` for racing it against
+# the upstream call (`select!`).
+tokio = { version = "1", features = ["time", "sync", "macros"] }
 # SPEC §4: a request abandoned by a revocation is logged as "outcome unknown".
 tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+# To assert the "outcome unknown" log line is actually written.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 
 [lints]

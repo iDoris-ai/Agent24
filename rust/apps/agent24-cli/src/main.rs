@@ -79,12 +79,21 @@ enum OsAction {
     // a disable to act on and these lines are still true. Rewording them then
     // would have made a true sentence false.
     //
-    // The event that DOES make them false: the daemon's disable path calling
-    // `Generation::begin_drain`. The test
-    // `an_out_of_process_manifest_is_refused_not_half_mounted` has to change the
-    // same day — that is the tripwire, since no test can assert what a help
-    // string promises. The note lives here rather than in the follow-ups ledger
-    // so that it is read by whoever changes the thing that makes it false.
+    // What DOES make them false, one line each, because they are different
+    // events: `Disable` — the daemon's disable path calling
+    // `Generation::begin_drain` on a running module; `Enable` — the daemon
+    // spawning a module at runtime rather than at start. Neither can happen
+    // while out-of-process packages are refused at mount, so the test
+    // `an_out_of_process_manifest_is_refused_not_half_mounted` has to change
+    // first — that is the tripwire, since no test can assert what a help string
+    // promises. It and the refusal it covers (`domain.rs`) point back here.
+    //
+    // The same promise is made twice more, and expires with these lines:
+    // `os_routes.rs`'s module docs ("A toggle does not take effect until the
+    // daemon restarts") and the `restart_required` field it reports.
+    //
+    // The note lives here rather than in the follow-ups ledger so that it is
+    // read by whoever changes the thing that makes it false.
     /// Turn one on (applies at the next daemon start)
     Enable {
         /// Module name, e.g. sin90
