@@ -129,10 +129,17 @@ name = "agent24-os-proto"
 version = "0.3.0"
 dependencies = [
  "agent24-domain",
+ "axum",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rustix 0.38.44",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -280,6 +287,7 @@ dependencies = [
  "agent24-memory",
  "agent24-models",
  "agent24-os-packages",
+ "agent24-os-proto",
  "agent24-policy",
  "agent24-protocol",
  "agent24-scheduler",

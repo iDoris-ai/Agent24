@@ -405,6 +405,19 @@ async fn fallback() -> Response {
 /// Bearer-token gate for everything except `GET /api/v1/health`
 /// (SPEC-002 §4: health is the only unauthenticated endpoint — method
 /// included, so a future POST on the same path never silently bypasses auth).
+///
+/// # If you are adding a kernel-private header, name it `X-A24-*`
+///
+/// An out-of-process module is reached through
+/// [`agent24_os_proto::proxy`](../../../crates/agent24-os-proto/src/proxy.rs),
+/// which strips every `X-A24-*` header in both directions by PREFIX, and strips
+/// `Authorization` / `Cookie` from a hand-written list. The prefix rule keeps up
+/// on its own; the list does not. A kernel-private header introduced here under
+/// any other name reaches modules verbatim, and nothing will report it.
+///
+/// This note lives beside the auth middleware rather than beside the proxy
+/// because the person adding such a header is reading this file
+/// (SPEC-ME3-OUT-OF-PROCESS §2.1).
 async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
@@ -1378,6 +1391,83 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// An OUT-OF-PROCESS module is behind the kernel's auth too — and an
+    /// unauthenticated caller does not even cause a connection to it.
+    ///
+    /// The 401 itself is already covered for in-process modules by
+    /// [`module_routes_are_behind_kernel_auth`]; what is new here is that the
+    /// thing being protected is a socket to another program. "401" and "the
+    /// module never heard about it" are different claims: a proxy mounted as a
+    /// FALLBACK, or one that dialled upstream before the layer ran, could answer
+    /// 401 to the client while the module had already seen the request — and a
+    /// module that logs or acts on what it receives is then reachable by anyone
+    /// who can reach the port. So the assertion is on the upstream's connection
+    /// count, not only on the status.
+    ///
+    /// The daemon does not mount a proxy in production yet — the address comes
+    /// from ME-3b-3's supervisor, which does not hand one over yet. This pins the
+    /// composition (`proxy::mount` + `build_router_with_modules`) before that
+    /// consumer exists, which is the point at which the mount order is still
+    /// cheap to get right.
+    #[tokio::test]
+    async fn a_proxied_module_is_behind_kernel_auth_and_is_not_even_dialled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let connections = StdArc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nmodule")
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let st = state().await;
+        let token = st.token.to_string();
+        let modules = agent24_os_proto::proxy::mount(Router::new(), "/api/v1/zzproxy", upstream);
+        let router = build_router_with_modules(st, modules);
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/zzproxy/anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(res).await["error"]["code"], "unauthorized");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "the module was dialled for a request that had no token"
+        );
+
+        // The control. Without it, zero connections is also what a proxy
+        // pointed at nothing produces, and the 401 proves nothing about the
+        // mount order.
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/zzproxy/anything")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
