@@ -15,6 +15,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::drain::KillPermit;
+
 /// After this long without a successful handshake, a freshly spawned module is
 /// treated as having crashed.
 ///
@@ -185,11 +187,23 @@ impl RestartPolicy {
 /// SIGTERM first, then SIGKILL after `grace`: a module that has state to flush
 /// deserves the chance, and one that ignores SIGTERM must not get a veto.
 ///
+/// # Only with a [`KillPermit`]
+///
+/// The permit comes from [`crate::drain::Generation::revoke`] and nowhere else,
+/// so this cannot be called before the module's generation is revoked (SPEC §4:
+/// revocation must precede the kill, or the module can still write during the
+/// grace period). It is consumed: one revocation, one kill.
+///
 /// # Errors
 ///
 /// Propagates the failure to signal or to reap. `ESRCH` (nothing there) is
 /// **not** an error: the goal state is "that group is gone".
-pub fn terminate_group(child: &mut std::process::Child, grace: Duration) -> std::io::Result<()> {
+pub fn terminate_group(
+    permit: KillPermit,
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> std::io::Result<()> {
+    let _ = permit;
     use rustix::process::{Pid, Signal, kill_process_group};
 
     let raw = i32::try_from(child.id()).unwrap_or(0);
@@ -445,7 +459,12 @@ mod tests {
             "the helper never started; nothing was proven"
         );
 
-        terminate_group(&mut launched.child, Duration::from_secs(2)).expect("terminate");
+        terminate_group(
+            crate::drain::Generation::starting().revoke().permit,
+            &mut launched.child,
+            Duration::from_secs(2),
+        )
+        .expect("terminate");
 
         // The helper stops touching the file. Measured as "the mtime stops
         // advancing", because the file itself remains.
@@ -498,7 +517,12 @@ mod tests {
         assert!(ready.exists(), "the module never installed its trap");
 
         let start = Instant::now();
-        terminate_group(&mut launched.child, Duration::from_millis(300)).expect("terminate");
+        terminate_group(
+            crate::drain::Generation::starting().revoke().permit,
+            &mut launched.child,
+            Duration::from_millis(300),
+        )
+        .expect("terminate");
         let took = start.elapsed();
 
         assert!(
