@@ -17,10 +17,10 @@
 
 | # | 做什么 | PR | 完成条件 |
 |---|---|---|---|
-| 1 | ME-3b-4 受约束代理合入（PLAN T4） | [#173](https://github.com/iDoris-ai/Agent24/pull/173) | 已获 APPROVE 后与 #165 冲突 → 已合 main 解冲突（只动 SPEC 状态表，取探针）→ 等复扫 → 合并 |
+| 1 | ✅ ME-3b-4 受约束代理合入（PLAN T4） | [#173](https://github.com/iDoris-ai/Agent24/pull/173) | APPROVE 后与 #165 冲突 → 合 main 解冲突（只动 SPEC 状态表，取探针）→ 复扫重新 APPROVE → 已合并 `b1b4b82` |
 | 2 | 变异脚手架收掉复审的三条阻塞（B1 红基线 / B2 测试数 / B3 中途被杀） | [#172](https://github.com/iDoris-ai/Agent24/pull/172) | 自证逐格断言通过 + 逐条回退验证自证会红 → 复审 APPROVE → 合并 |
 | 3 | 本文件与 `tasks.md` 对齐仓库真实状态，并记下这四条 | 本 PR | 合并 |
-| 4 | ME-3b-5 两阶段热 disable（PLAN T5） | 未开 | 见 `tasks.md` ME3-T5 的验收 |
+| 4 | ME-3b-5 两阶段热 disable（PLAN T5） | 开发中（`feat/me3b-5-drain`） | 见 `tasks.md` ME3-T5 的验收 |
 
 PR 的实时状态以 `gh pr view <n>` 为准，本表只记「为什么在等」。
 
@@ -45,7 +45,7 @@ PR 的实时状态以 `gh pr view <n>` 为准，本表只记「为什么在等�
 
 ## 下一个 READY
 
-- 待办 1–3 等复审；**ME3-T5（3b-5）** 可开工。
+- 待办 2、3 等复审；**ME3-T5（3b-5）** 开发中：库层状态机 + `KillPermit` 已写完并变异验证，接下来接进代理。
 
 ## 本轮的三条纪律（从 F1/F8 二十余轮复审里带出来的，ME-3 仍适用）
 

@@ -20,8 +20,8 @@
 > 这里只放**正在做的**那几条，且 ID 带 `ME3-` 前缀，免得和下面 M1 的 `T1.x.y` 撞名。
 > **哪一刀已在 main 上，跑 `bash docs/agent/me3-status.sh`，不看本表。**
 
-### ME3-T4 3b-4 受约束代理合入  `PR_OPEN` — [#173](https://github.com/iDoris-ai/Agent24/pull/173)
-- 已 APPROVE（head `00f5e27`）；#165 合入后与之冲突（只在 SPEC 状态表）→ 合 main 解冲突、取探针（`0163803`）→ approve 不再覆盖新 head，**等复扫**。
+### ME3-T4 3b-4 受约束代理合入  `DONE` — [#173](https://github.com/iDoris-ai/Agent24/pull/173)（`b1b4b82`，2026-09-11）
+- 已 APPROVE（head `00f5e27`）；#165 合入后与之冲突（只在 SPEC 状态表）→ 合 main 解冲突、取探针（`0163803`）→ 复扫对新 head 重新 APPROVE → 合并。
 - **验收**：探针 `3b-4 受约束代理` 一行变 `●`。
 
 ### ME3-MUT 变异脚手架收掉三条阻塞  `CHANGES_REQUESTED → 修复待复审` — [#172](https://github.com/iDoris-ai/Agent24/pull/172)
@@ -31,9 +31,9 @@
 ### ME3-DOC 状态文档对齐  `PR_OPEN` — 本 PR
 - `progress.md` 停在 2026-08-23，与仓库脱节十九天；本条把它和本文件对齐，并记下本轮四条待办。
 
-### ME3-T5 3b-5 两阶段热 disable（SPEC §4）  `READY`
+### ME3-T5 3b-5 两阶段热 disable（SPEC §4）  `IN_PROGRESS` — 分支 `feat/me3b-5-drain`
 - **优先级**：high（ME-3b 的最后一刀）
-- **依赖**：3b-3（库层已在 main）· **ME3-T4 合入**（要接进 `proxy.rs`；不叠在 #173 上开 stacked PR —— 合并自动删分支会把叠在上面的 PR 一起关掉）
+- **依赖**：3b-3（库层已在 main）· ME3-T4 ✅（要接进 `proxy.rs`；不叠在 #173 上开 stacked PR —— 合并自动删分支会把叠在上面的 PR 一起关掉）
 - **目标**：停一个模块时，「宽限期内收不收新请求、在途 handler 还能不能回调、generation 什么时候撤」三件事由一个状态机定死，而且**撤 generation 早于杀进程**由类型保证，不靠调用顺序。
 - **开发范围**：
   1. `agent24-os-proto` 里一个纯状态机：`Running → Draining → Revoking → Stopped`；在途请求登记（带 `request_id`）；drain 在「在途清零」与「宽限到期」先到者结束。
