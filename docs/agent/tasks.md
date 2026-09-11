@@ -14,6 +14,47 @@
 
 ---
 
+## ME-3 / v0.5.0 —— 当前主线（用户 2026-09-10 裁决）
+
+> 完整任务分解（PLAN 的 T1–T14）在 [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) §五，这里**不抄第二份**。
+> 这里只放**正在做的**那几条，且 ID 带 `ME3-` 前缀，免得和下面 M1 的 `T1.x.y` 撞名。
+> **哪一刀已在 main 上，跑 `bash docs/agent/me3-status.sh`，不看本表。**
+
+### ME3-T4 3b-4 受约束代理合入  `PR_OPEN` — [#173](https://github.com/iDoris-ai/Agent24/pull/173)
+- 已 APPROVE（head `00f5e27`）；#165 合入后与之冲突（只在 SPEC 状态表）→ 合 main 解冲突、取探针（`0163803`）→ approve 不再覆盖新 head，**等复扫**。
+- **验收**：探针 `3b-4 受约束代理` 一行变 `●`。
+
+### ME3-MUT 变异脚手架收掉三条阻塞  `CHANGES_REQUESTED → 修复待复审` — [#172](https://github.com/iDoris-ai/Agent24/pull/172)
+- B1 红基线不拦后续 `mut` · B2 0 个测试的基线 / 测试数变化读成「判据不承重」· B3 中途被杀留下被变异的源码；同轮收掉非阻塞项（崩溃被读成编译失败、超时只杀直接子进程、`set -u` 泄漏、路径打错建出空文件、不认识的输出落到 🔴、自证不断言）。
+- **验收**：`bash docs/agent/mutate-selftest.sh` exit 0；把每条修复改回去自证都 exit 1（PR body 列回退清单）。
+
+### ME3-DOC 状态文档对齐  `PR_OPEN` — 本 PR
+- `progress.md` 停在 2026-08-23，与仓库脱节十九天；本条把它和本文件对齐，并记下本轮四条待办。
+
+### ME3-T5 3b-5 两阶段热 disable（SPEC §4）  `READY`
+- **优先级**：high（ME-3b 的最后一刀）
+- **依赖**：3b-3（库层已在 main）· **ME3-T4 合入**（要接进 `proxy.rs`；不叠在 #173 上开 stacked PR —— 合并自动删分支会把叠在上面的 PR 一起关掉）
+- **目标**：停一个模块时，「宽限期内收不收新请求、在途 handler 还能不能回调、generation 什么时候撤」三件事由一个状态机定死，而且**撤 generation 早于杀进程**由类型保证，不靠调用顺序。
+- **开发范围**：
+  1. `agent24-os-proto` 里一个纯状态机：`Running → Draining → Revoking → Stopped`；在途请求登记（带 `request_id`）；drain 在「在途清零」与「宽限到期」先到者结束。
+  2. **回调准入**是它的一个纯判定：Running 全收；Draining 只收**携带并命中活跃 `request_id`** 的；Revoking 之后一律拒。回调通道本身是 ME-3c，本刀只交判定，3c 调它。
+  3. **杀进程组的入口要求一个只能由「撤销 generation」产出的值**，于是「先杀后撤」写不出来（编译不过），而不是「测试里没这么写」。
+  4. 接进代理：Draining 期间新的被代理请求 503（`error.code` 区分 draining / not-ready / overloaded，§2.1 已预留）；在途请求继续；drain 超时的在途请求 503、结果记为「未知」写日志，不假装成功。
+- **明确不做**：回调通道（3c）；把状态机接到 daemon 的 `os disable` 路径 —— 今天 daemon 对 `out_of_process` 包在挂载时就拒绝，**没有一个运行中的进程外模块可以被热停**。
+- **CLI help 的到期标记**：`agent24-cli/src/main.rs` 那两行「applies at the next daemon start」**本刀之后仍然为真**（理由同上），所以本刀**不改它们**，只把到期标记的触发条件从「3b-5 落地」改成「daemon 的 `os disable` 真的作用于运行中的模块」。PLAN T5 原文写的「同时改 help」是按「3b-5 = 接线完成」写的，与 3b-3 只交付库层的实情不符 —— 在 PR 里讲清，不静默改掉一句会变假的 help。
+- **验收**（取自 SPEC §8 ME-3b 格与 PLAN T5，每条带正对照）：
+  - Draining 期间新的被代理请求 503 且 `code = module_draining`；**对照**：同一时刻已在途的请求正常完成（200）。
+  - Draining 期间：携带活跃 `request_id` 的回调被放行；不带 `request_id` 的被拒；携带**已结束**请求 id 的被拒。**对照**：Running 期间三者都放行。
+  - drain 超时：仍在途的请求得到 503（不是 200、不是挂住），日志里有「结果未知」。
+  - generation 撤销先于 `terminate_group`：由类型保证 + 一条 `compile_fail` doctest 证明「未撤销就杀」写不出来；**对照**：撤销后能杀的那条 doctest 编译通过。
+  - Revoking 之后一切回调拒绝，包括持有活跃 `request_id` 的。
+- **涉及文件**：`rust/crates/agent24-os-proto/src/{drain.rs,proxy.rs,lib.rs}`（探针预言的符号是 `drain.rs` 的 `pub enum DrainState`，照它命名）、`rust/apps/agent24-cli/src/main.rs`（仅注释）、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`（记本刀的边界）
+- **证据**：
+
+---
+
+## M1 —— 记忆成为产品（2026-08-23 规划；状态未改动，未重排）
+
 ## F1.1 — 判定接缝（原 F8b）
 
 > 依赖 PR #140（F8）已合并。**若 #140 尚未合并，本 Feature 全部 task 保持 BACKLOG。**
