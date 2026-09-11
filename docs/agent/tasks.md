@@ -51,6 +51,24 @@
 - **涉及文件**：`rust/crates/agent24-os-proto/src/{drain.rs,proxy.rs,lib.rs}`（探针预言的符号是 `drain.rs` 的 `pub enum DrainState`，照它命名）、`rust/apps/agent24-cli/src/main.rs`（仅注释）、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`（记本刀的边界）
 - **证据**：
 
+### ME3-T6 3c 回调通道其余部分（SPEC §3 + §8 ME-3c 格）  `IN_PROGRESS` — 分支 `feat/me3c-rpc`（用户 2026-09-11 定为下一步）
+- **优先级**：high（T1–T6 齐了即可发 v0.4.0 握手层）
+- **依赖**：3b-1 framing、3b-2b `initialize`（均已在 main）。**不依赖** #175（3b-5）：本刀 offer set 为空，没有任何业务方法，「draining 期间回调准入」要等第一个业务方法（3d/3e）才有落点
+- **目标**：握手之后那条回调连接上的一切协议行为定死，实现者不需要猜并发、取消与错误分类
+- **开发范围**（`agent24-os-proto/src/rpc.rs`，探针预言符号 `pub fn dispatch`）：
+  1. `dispatch`：把握手之后的**一帧**分类成「立即回错」「派发给 handler」「取消某个在途请求」「忽略（未知 notification）」—— 纯函数，不碰连接
+  2. 一个连接循环：并发在途、响应可乱序、按 id 配对；超时回 `timeout` 且不重试；连接断开则在途请求就地中止、**不产生响应**
+  3. 错误闭集 `error.data.kind`（SPEC §3 原文十个），常量带「整词出现在 SPEC 引文里」的测试（§8 的规则）
+- **明确不做**：任何业务方法（offer set 为空，调任何方法都是 `-32601`，**不得为了凑 forbidden 测试提前注册方法**）；把连接循环接进 daemon（那是 Supervisor 的事，见 ME3-SUP）
+- **SPEC 的空档，本刀要补并请评审拍板**：§3 说「并发上限见 §5，超限回 busy」，但 §5 没有给数字；超时也没有数字。取与代理侧一致的 **每连接 64 个在途 / 单次 30s**，写进 SPEC
+- **验收**（取自 SPEC §8 ME-3c 格，每条带正对照）：握手后的超长行被拒并断连；并发在途按 id 配对、响应可乱序；仍在途的 id 被复用 → 该请求失败；`$/cancelRequest` 使目标请求回 cancelled；连接断开则在途请求中止且不产生响应；超时不重试；握手后 params 解析失败 `-32602` 且不派发；坏 params 只失败该行、连接继续；重复 JSON key 被拒；握手后畸形 JSON `-32700` 只失败该行；握手后重复 `initialize` → `-32600` 只失败该行；业务方法一律 `-32601`
+- **证据**：
+
+### ME3-SUP 3b-3 的 Supervisor —— 让 daemon 真的持有并监督模块进程  `BACKLOG`（排在 T6 之后、T9 之前）
+- **为什么单列**：3b-3 目前只交付了库层零件（`RestartPolicy`、`terminate_group`、`launch::spawn`），daemon 里没有任何代码真正持有一个模块进程。没有它：3b-5 的热 disable 接不进 `os disable`；`KillPermit` 绑定不到具体进程（FU-46）；**T9（3f 仓外包端到端验收）跑不起来**
+- **范围（待开工时细化）**：一个类型同时持有 child 与它那一代的 `Generation`，只暴露先撤后杀的 `stop(self)`，`Launched::child` 改私有（FU-46）；启动 → 握手 → ready → 挂代理 → 崩溃退避/熔断 → 停机的完整生命周期；解除 `domain.rs` 对 out_of_process 的挂载拒绝（**那一天 CLI 两行 help 与 `os_routes.rs` 的承诺到期**，绊线测试已就位）；顺带评估 FU-47
+- **依赖**：T6（回调连接循环）
+
 ---
 
 ## M1 —— 记忆成为产品（2026-08-23 规划；状态未改动，未重排）
