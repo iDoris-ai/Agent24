@@ -25,8 +25,13 @@ ORPHAN=$CRATE_DIR/src/zz_mutate_selftest_orphan.rs
 ORIG=$(mktemp)
 cp "$F" "$ORIG"
 FAKE=$(mktemp -d)
+FRAME=$CRATE_DIR/src/frame.rs
+FRAME_ORIG=$(mktemp)
+cp "$FRAME" "$FRAME_ORIG"
 cleanup() {
-  chmod u+w "$CRATE_DIR/src" 2>/dev/null
+  chmod u+w "$F" "$CRATE_DIR/src" 2>/dev/null
+  cp "$FRAME_ORIG" "$FRAME"
+  rm -f "$FRAME_ORIG"
   [ -d "$GITDIR/mutate-inflight" ] && python3 docs/agent/mutate.py recover >/dev/null
   cp "$ORIG" "$F"
   rm -f "$ORPHAN" "$GITDIR"/mutate-paused-* "$GITDIR"/mutate-continue-*
@@ -70,6 +75,24 @@ fake twosum "$SUM_OK; $SUM_OK"
 fake buildrs 'echo "error: failed to run custom build command for \`x v0.1.0\`"; echo "  process didn'"'"'t exit successfully: \`/t/build-script-build\` (exit status: 101)"; exit 101'
 fake hang "sleep 3001 & echo \$! >>$(printf %q "$FAKE/pids"); sleep 3002 & echo \$! >>$(printf %q "$FAKE/pids"); wait"
 fake slow "sleep 3003 & echo \$! >>$(printf %q "$FAKE/pids"); : >$(printf %q "$FAKE/running"); wait"
+PIDS=$(printf %q "$FAKE/pids")
+fake okrc1 "$SUM_OK; exit 1"
+fake failrc0 "$SUM_RED; exit 0"
+MUTATED="grep -q 'if false {' $(printf %q "$FA")"
+fake foreign_ 'echo "     Running unittests src/lib.rs (target/debug/deps/x-1)"; echo "error: test failed"; echo "  process didn'"'"'t exit successfully: \`/r/target/debug/deps/other-2\` (signal: 6, SIGABRT)"; exit 101'
+fake prefix_ 'echo "     Running unittests src/lib.rs (target/debug/deps/x-1)"; echo "error: test failed"; echo "  process didn'"'"'t exit successfully: \`/r/target/debug/deps/x-12345\` (signal: 6, SIGABRT)"; exit 101'
+# ㉘ 的两个只在变异时崩:否则「未变异复跑」那道确认会从下游把它们兜成作废,分类规则本身
+# 就没被测到(元测试实测:去掉「只认那个二进制」,自证照过)。
+fake foreign "if $MUTATED; then $FAKE/foreign_; exit 101; else $SUM_OK; fi"
+fake prefix "if $MUTATED; then $FAKE/prefix_; exit 101; else $SUM_OK; fi"
+fake indent "echo '    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; $SUM_OK"
+fake leak "sleep 3005 & echo \$! >>$PIDS; $SUM_OK"
+fake detach "perl -e 'setpgrp(0,0); sleep 3006' & echo \$! >>$PIDS; sleep 3007 & echo \$! >>$PIDS; wait"
+# cond7:被变异时红;未变异时,$FAKE/drift 存在就只报 7 个通过(基线是 8)。
+fake cond7 "if grep -q 'if false {' $(printf %q "$FA"); then $SUM_RED; exit 101; elif [ -e $(printf %q "$FAKE/drift") ]; then echo 'test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; else $SUM_OK; fi"
+# flaky:被变异时第一次红、第二次绿 —— 偶发失败
+fake flaky "n=\$(cat $(printf %q "$FAKE/cnt") 2>/dev/null || echo 0); echo \$((n+1)) >$(printf %q "$FAKE/cnt"); if grep -q 'if false {' $(printf %q "$FA") && [ \"\$n\" = 0 ]; then $SUM_RED; exit 101; else $SUM_OK; fi"
+fake slowmeta "sleep 3008 & echo \$! >>$PIDS; : >$(printf %q "$FAKE/running"); wait"
 
 echo "── 真 cargo ──"
 mut_baseline agent24-os-proto supervise || { echo "  基线立不起来,自证无法进行"; exit 1; }
@@ -85,8 +108,14 @@ mut "$F" '#[test]
     fn only_a_long_enough_run_counts_as_healthy' '#[allow(dead_code)]
     fn only_a_long_enough_run_counts_as_healthy' "⑥ 藏掉一条测试"
 expect VOID "$_MUT_LAST" "⑥ 测试数少了一条 → 作废,不是 🟢"
-mut "$F" "$BREAKER" '        if { std::process::abort() } {' "⑦ 测试进程崩溃"
-expect RED "$_MUT_LAST" "⑦ 崩溃 → 红,不是「编译失败」"
+# 在 CARGO_TERM_COLOR=always 下跑:颜色转义会让行首锚定的判据全部失配。
+CARGO_TERM_COLOR=always mut "$F" "$BREAKER" '        if { std::process::abort() } {' "⑦ 测试进程崩溃(彩色输出下)"
+expect RED "$_MUT_LAST" "⑦ 崩溃 → 红,不是「编译失败」或「不认识」"
+# cargo -q 不打印 `Running unittests` 行;崩溃要靠基线记下的二进制路径来认。
+mut_baseline agent24-os-proto supervise -q >/dev/null || echo "    (-q 基线立不起来)"
+mut "$F" "$BREAKER" '        if { std::process::abort() } {' "⑦b 崩溃(cargo -q)" >/dev/null
+expect RED "$_MUT_LAST" "⑦b -q 下的崩溃仍然是红"
+mut_baseline agent24-os-proto supervise >/dev/null || { echo "  基线立不起来"; exit 1; }
 mut "$F" 'pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);' \
   'pub const REAP_TIMEOUT: Duration = Duration::from_secs(6);' "⑧ 对照:没有测试管的常量"
 expect ALIVE "$_MUT_LAST" "⑧ → 必须 🟢(否则一个永远报不出 🟢 的脚手架也能过)"
@@ -147,7 +176,7 @@ run_bg() { # run_bg <MUT_CARGO> <MUT_PAUSE_AT 或空>:在独立 bash 里跑一�
 }
 # INT/QUIT 不在这里测:非交互 shell 起的后台命令对它们是 SIG_IGN 继承来的,trap 不了 ——
 # Ctrl-C 的场景由下面的交互式格子测。
-for cell in "after-journal TERM 143" "after-inject HUP 129" "child TERM 143" "after-run HUP 129"; do
+for cell in "after-journal TERM 143" "after-inject HUP 129" "child TERM 143" "after-run HUP 129" "before-verdict TERM 143"; do
   # shellcheck disable=SC2086
   set -- $cell
   phase=$1 sig=$2 want=$3
@@ -162,6 +191,11 @@ for cell in "after-journal TERM 143" "after-inject HUP 129" "child TERM 143" "af
     run_bg "$FAKE/cond" "$phase"
     pid=$BG
     wait_for "$GITDIR/mutate-paused-$phase" || echo "    (没停在 $phase)"
+    if [ "$phase" = after-journal ]; then
+      # 顺序:备份先落盘、再动源码。停在这里时源码必须仍是原文,且日志已完整在位。
+      expect same "$(same_as_orig)" "㉒ after-journal 前提:源码还没被动"
+      expect same "$(cmp -s "$GITDIR/mutate-inflight/bak" "$ORIG" && echo same || echo changed)" "㉒ after-journal 前提:备份已完整落盘"
+    fi
   fi
   kill -s "$sig" "$pid"
   { wait "$pid"; } 2>/dev/null
@@ -171,6 +205,16 @@ for cell in "after-journal TERM 143" "after-inject HUP 129" "child TERM 143" "af
   expect none "$(journal)" "㉒ $phase 日志已清"
   [ "$phase" = child ] && expect dead "$(all_dead)" "㉒ $phase 测试进程组已被杀"
 done
+
+# ㉒b 同一件事,绕过 bash 包装直接对 python 发信号:包装会在 shell 这一层把信号重新交还
+# 一遍,所以上面几格即使 python 返回了一个普通读数,脚本照样以 143 退出 —— python 自己的
+# 退出码没被测到(元测试实测:两道防线同时拿掉,上面全过)。
+MUT_CARGO=$FAKE/cond MUT_PAUSE_AT=before-verdict python3 docs/agent/mutate.py mut "$F" "$BREAKER" '        if false {' x >/dev/null 2>&1 &
+pypid=$!
+wait_for "$GITDIR/mutate-paused-before-verdict"
+kill -TERM "$pypid"; { wait "$pypid"; } 2>/dev/null
+expect 143 $? "㉒b 读数定下之前收到的 TERM,python 自己也以 143 退出,不报读数"
+expect same "$(same_as_orig)" "㉒b 源码已恢复"
 
 echo "── 交互式 shell 里 Ctrl-C ──"
 : >"$FAKE/pids"
@@ -228,15 +272,19 @@ expect same "$(same_as_orig)" "㉔ 第一个跑完后源码是原样"
 run_bg "$FAKE/cond" after-run
 pidA=$BG
 wait_for "$GITDIR/mutate-paused-after-run"
-chmod a-w "$CRATE_DIR/src"
+chmod a-w "$F"
 : >"$GITDIR/mutate-continue-after-run"
 { wait "$pidA"; } 2>/dev/null
 rc=$?
-chmod u+w "$CRATE_DIR/src"
+chmod u+w "$F"
 expect 2 "$rc" "㉕ 恢复不了 → 返回 2,不报读数"
 expect present "$(journal)" "㉕ 且保留备份(不删唯一的一份)"
 MUT_CARGO=$FAKE/cond mut "$F" "$BREAKER" '        if false {' "㉕" >/dev/null
 expect 1 $? "㉕ 有未收尾的变异时拒绝开始"
+# 用永远全绿的 ok:用 cond 的话,源码此刻是变异状态,基线本来就会因「不是全绿」被拒 ——
+# 这格就不再测「有日志时拒绝」了(元测试实测:去掉那道检查,这格照过)。
+MUT_CARGO=$FAKE/ok mut_baseline agent24-os-proto >/dev/null
+expect 1 $? "㉕ 有未收尾的变异时也不许立基线(否则基线立在被变异的源码上)"
 mut_recover >/dev/null
 expect 0 $? "㉕ recover 成功"
 expect same "$(same_as_orig)" "㉕ recover 之后源码是原样"
@@ -245,6 +293,123 @@ expect none "$(journal)" "㉕ 且日志已清"
 got=$(bash -c "cd $(printf %q "$ROOT") && trap 'echo MINE' TERM && source docs/agent/mutate.sh \
   && MUT_CARGO=$(printf %q "$FAKE/ok") mut $(printf %q "$F") $(printf %q "$BREAKER") '        if false {' x >/dev/null; trap -p TERM")
 expect yes "$([[ $got == *MINE* ]] && echo yes || echo no)" "㉖ 调用方原有的 trap 在 mut 之后还在"
+
+echo "── 复审 @ 46f67d3 补的格子 ──"
+MUT_CARGO=$FAKE/cond mut_baseline agent24-os-proto >/dev/null || { echo "  假基线立不起来"; exit 1; }
+MUT_CARGO=$FAKE/okrc1 mut "$F" "$BREAKER" '        if false {' "㉗ ok 行但退出码非 0" >/dev/null
+expect VOID "$_MUT_LAST" "㉗ result ok 而 rc≠0 → 作废"
+MUT_CARGO=$FAKE/failrc0 mut "$F" "$BREAKER" '        if false {' "㉗b" >/dev/null
+expect VOID "$_MUT_LAST" "㉗ result FAILED 而 rc=0 → 作废"
+MUT_CARGO=$FAKE/foreign mut "$F" "$BREAKER" '        if false {' "㉘" >/dev/null
+expect VOID "$_MUT_LAST" "㉘ 崩的是另一个进程 → 作废,不是 🔴"
+MUT_CARGO=$FAKE/prefix mut "$F" "$BREAKER" '        if false {' "㉘b" >/dev/null
+expect VOID "$_MUT_LAST" "㉘ x-1 不认下 x-12345"
+MUT_CARGO=$FAKE/indent mut "$F" "$BREAKER" '        if false {' "㉙" >/dev/null
+expect ALIVE "$_MUT_LAST" "㉙ 测试自己打印的缩进 result 行不算数(行首锚定)"
+: >"$FAKE/pids"
+MUT_CARGO=$FAKE/leak mut "$F" "$BREAKER" '        if false {' "㉚" >/dev/null
+expect dead "$(all_dead)" "㉚ 正常退出时 cargo 留下的后台进程也被杀"
+: >"$FAKE/pids"
+MUT_TIMEOUT=2 MUT_CARGO=$FAKE/detach mut "$F" "$BREAKER" '        if false {' "㉚b" >/dev/null
+expect TIMEOUT "$_MUT_LAST" "㉚ 挂住"
+expect dead "$(all_dead)" "㉚ 另起进程组的后代也被杀"
+rm -f "$FAKE/drift"
+MUT_CARGO=$FAKE/cond7 mut_baseline agent24-os-proto >/dev/null
+: >"$FAKE/drift"
+MUT_CARGO=$FAKE/cond7 mut "$F" "$BREAKER" '        if false {' "㉛" >/dev/null
+expect VOID "$_MUT_LAST" "㉛ 未变异复跑是绿但测试数不同 → 作废"
+rm -f "$FAKE/drift"
+MUT_CARGO=$FAKE/cond mut_baseline agent24-os-proto >/dev/null
+echo 0 >"$FAKE/cnt"
+MUT_CARGO=$FAKE/flaky mut "$F" "$BREAKER" '        if false {' "㉜" >/dev/null
+expect VOID "$_MUT_LAST" "㉜ 变异版第一次红、第二次绿(偶发)→ 作废,不是 🔴"
+MUT_CARGO=$FAKE/cond mut "$FRAME" '// no newline, then EOF' '// no newline, then eof' "㉝" >/dev/null
+expect VOID "$_MUT_LAST" "㉝ 改动落在行尾注释里 → 作废"
+printf '\n// drift\n' >>"$FRAME"
+MUT_CARGO=$FAKE/cond mut "$F" "$BREAKER" '        if false {' "㉞" >/dev/null
+expect 1 $? "㉞ 基线之后别的源码变了 → 拒绝开始"
+cp "$FRAME_ORIG" "$FRAME"
+mkdir -p "$GITDIR/mutate-inflight.tmp-stale" && echo junk >"$GITDIR/mutate-inflight.tmp-stale/bak"
+MUT_CARGO=$FAKE/cond mut "$F" "$BREAKER" '        if false {' "㉟" >/dev/null
+expect RED "$_MUT_LAST" "㉟ 写到一半的日志(临时目录)不挡路 —— 那时源码没被动过"
+expect no "$([ -e "$GITDIR/mutate-inflight.tmp-stale" ] && echo yes || echo no)" "㉟ 且被清掉"
+
+echo "── SIGKILL 之后的 recover ──"
+kill9_mid_run() { # 跑一格,在测试进行中 SIGKILL 掉 python,留下日志
+  : >"$FAKE/pids"; rm -f "$FAKE/running"
+  run_bg "$FAKE/slow" ""
+  wait_for "$FAKE/running"
+  # 只杀这棵树的 mutate.py —— 全局的 `pkill -f "mutate.py mut"` 会连同一台机器上别的
+  # worktree 里正在跑的变异一起杀掉(实际发生过:另一棵树的变异被打断在半路)。
+  pkill -9 -f "$ROOT/docs/agent/mutate.py mut" ; { wait "$BG"; } 2>/dev/null
+  xargs kill -9 <"$FAKE/pids" 2>/dev/null
+}
+kill9_mid_run
+expect present "$(journal)" "㊱ SIGKILL 之后日志还在"
+expect changed "$(same_as_orig)" "㊱ 且源码仍是变异状态(前提)"
+mut_recover >/dev/null
+expect 0 $? "㊱ 没人动过 → recover 成功"
+expect same "$(same_as_orig)" "㊱ 且恢复成原文"
+kill9_mid_run
+printf '\n// USER WORK AFTER THE CRASH\n' >>"$F"
+mut_recover >/dev/null
+expect 2 $? "㊲ 崩溃后有人改过 → recover 拒绝(返回 2)"
+expect yes "$(grep -q 'USER WORK AFTER THE CRASH' "$F" && echo yes || echo no)" "㊲ 且用户的修改还在"
+expect present "$(journal)" "㊲ 且备份保留"
+echo corrupted >"$GITDIR/mutate-inflight/bak"
+mut_recover >/dev/null
+expect 1 $? "㊳ 备份与记录的 sha 不符 → 不据它写"
+expect yes "$(grep -q 'USER WORK AFTER THE CRASH' "$F" && echo yes || echo no)" "㊳ 源码没被动"
+rm -rf "$GITDIR/mutate-inflight"; cp "$ORIG" "$F"
+run_bg "$FAKE/cond" after-run
+wait_for "$GITDIR/mutate-paused-after-run"
+printf '\n// EDITOR SAVE DURING THE RUN\n' >>"$F"
+: >"$GITDIR/mutate-continue-after-run"
+{ wait "$BG"; } 2>/dev/null
+expect 2 $? "㊴ 跑测试期间有人改了源码 → 不覆盖,返回 2"
+expect yes "$(grep -q 'EDITOR SAVE DURING THE RUN' "$F" && echo yes || echo no)" "㊴ 且那次修改还在"
+rm -rf "$GITDIR/mutate-inflight"; cp "$ORIG" "$F"
+
+# ㊸ 日志指向树外的文件:不写
+mkdir -p "$GITDIR/mutate-inflight"
+OUTSIDE=$(mktemp); echo outside >"$OUTSIDE"; cp "$OUTSIDE" "$GITDIR/mutate-inflight/bak"
+python3 - "$GITDIR/mutate-inflight" "$OUTSIDE" <<'PY'
+import hashlib, json, sys
+d, path = sys.argv[1], sys.argv[2]
+bak = open(d + "/bak", "rb").read()
+json.dump({"path": path, "original_sha": hashlib.sha256(bak).hexdigest(), "mutated_sha": "x"}, open(d + "/meta.json", "w"))
+PY
+echo "changed-by-someone" >"$OUTSIDE"
+mut_recover >/dev/null
+expect 1 $? "㊸ 日志指向这棵树之外 → recover 拒绝"
+expect changed-by-someone "$(cat "$OUTSIDE")" "㊸ 且那个文件没被写"
+rm -rf "$GITDIR/mutate-inflight" "$OUTSIDE"
+# ㊹ 脚手架内部错误:退出码 3,不和「拒绝开始」(1)混在一起;源码照样恢复
+MUT_CARGO=/nonexistent/cargo mut "$F" "$BREAKER" '        if false {' "㊹" >/dev/null
+expect 3 $? "㊹ 内部错误 → 3"
+expect same "$(same_as_orig)" "㊹ 且源码已恢复"
+expect none "$(journal)" "㊹ 且日志已清"
+
+echo "── 调用方的 shell ──"
+got=$(bash -c "set -e; cd $(printf %q "$ROOT") && source docs/agent/mutate.sh \
+  && MUT_CARGO=$(printf %q "$FAKE/ok") mut $(printf %q "$F") $(printf %q "$BREAKER") '        if false {' x >/dev/null; echo AFTER:\$_MUT_LAST")
+expect "AFTER:ALIVE" "$got" "㊵ set -e 的调用方:一格读成 ALIVE 不会让脚本退出"
+: >"$FAKE/pids"; rm -f "$FAKE/running"
+bash -c "trap 'echo CALLER_TERM >$(printf %q "$FAKE/caller"); exit 7' TERM; cd $(printf %q "$ROOT") && source docs/agent/mutate.sh \
+  && MUT_CARGO=$(printf %q "$FAKE/slow") mut $(printf %q "$F") $(printf %q "$BREAKER") '        if false {' x" >/dev/null 2>&1 &
+cpid=$!
+wait_for "$FAKE/running"
+kill -TERM "$cpid"; { wait "$cpid"; } 2>/dev/null
+expect 7 $? "㊶ 调用方自己的 TERM trap 照常运行(它 exit 7)"
+expect CALLER_TERM "$(cat "$FAKE/caller" 2>/dev/null)" "㊶ 且 trap 的内容执行了"
+expect same "$(same_as_orig)" "㊶ 源码已恢复"
+: >"$FAKE/pids"; rm -f "$FAKE/running"
+bash -c "cd $(printf %q "$ROOT") && source docs/agent/mutate.sh && MUT_CARGO_META=$(printf %q "$FAKE/slowmeta") mut_baseline agent24-os-proto" >/dev/null 2>&1 &
+cpid=$!
+wait_for "$FAKE/running"
+kill -TERM "$cpid"; { wait "$cpid"; } 2>/dev/null
+expect 143 $? "㊷ 立基线时(查编译范围那一步)收到 TERM → 以 143 退出"
+expect dead "$(all_dead)" "㊷ 且那一步起的进程已被杀"
 
 echo
 expect same "$(same_as_orig)" "收尾:被变异的文件与开始时逐字节相同"

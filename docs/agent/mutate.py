@@ -9,6 +9,7 @@
     0 RED   变异被抓到          10 ALIVE  存活(判据不承重)
     20 VOID 读数作废            30 TIMEOUT 挂住
     1  拒绝开始(前置条件不满足)  2  源码恢复失败 —— 备份保留在 git-dir 里,见提示
+    3  内部错误(脚手架自己出错;源码照样先恢复)
     128+n  被信号 n 打断(源码已恢复)
 
 ── 为什么从 bash 改成这个 ────────────────────────────────────────────────
@@ -24,20 +25,26 @@
     写到一半的地方」这种窗口;恢复这一步即使连按 Ctrl-C 也会做完。
   - 子进程 `start_new_session=True`:setsid 发生在 exec **之前**、Popen 返回之前,进程组
     在我们拿到 pid 时已经存在。超时由我们自己的时钟判,不看退出码。
-  - 源码的备份先落进 git-dir 下的**日志**,再动源码;写源码与恢复都是同目录临时文件 +
-    `os.replace`(原子),恢复后逐字节比对,比对不上就保留日志、报错,绝不删唯一的备份。
-    被 SIGKILL 打断后日志还在,下一次 baseline/mut 会拒绝开始并指向 `recover`。
+  - 源码的备份先落进 git-dir 下的**日志**(临时目录里写全 + sha256 + fsync,再原子 rename
+    成正式名字,所以不存在「写到一半的日志」),然后才动源码。源码**原地**写(保留 inode、
+    属主、xattr、硬链接)。恢复前先认当前文件:是原文 → 已恢复;是我们写的变异 → 写回原文并
+    逐字节比对;**两者都不是 → 有人在这期间改过它,不覆盖**,保留日志报冲突。绝不删唯一的
+    备份。被 SIGKILL 打断后日志还在,下一次 baseline/mut 会拒绝开始并指向 `recover`。
   - 一把 `flock` 锁:同一棵树上两个变异不能同时跑(第二个会把第一个的变异当成原文备份,
     最后写回去)。
   - **能改的文件只限于 `--lib` 测试真正编译进去的那些** —— 从 cargo 的 dep-info 读出来,
     按规范化路径比。`src/bin/`、`tests/`、`build.rs`、没有 `mod` 声明的文件、`../` 与
     软链,都不在这份清单里。(前缀比较能被 `crate/../别处` 绕过,复审实测过。)
-  - 🔴 不是一次读数说了算:恢复源码后**再跑一次未变异的版本**,必须仍是全绿且测试数等于
-    基线,这次红才归到变异头上。否则是基线漂移或测试不稳定 —— 作废。
+  - 🔴 不是一次读数说了算,两道确认:**变异版再跑一次**,要红得一样(同一类、同一批失败的
+    测试)—— 否则是偶发;**恢复后的原样再跑一次**,要是那个全绿基线 —— 否则是基线漂移。
+  - 基线记下所有被编译源码(+ Cargo.toml / Cargo.lock)的 sha256;`mut` 前后各核一次,树
+    变了就拒绝或作废 —— 否则一个恰好把某条红测试「修好」的变异会读成 🟢,一个删掉了 `mod`
+    声明的文件会被改了却没人编译。
 
 ── 它拦的假结论(每一条都在实际复审里发生过) ─────────────────────────
 
-  1. 锚点不存在 / 不唯一 / 替换里仍完整包含锚点(纯插入)/ 锚点所在行是 `//` 注释 → 作废。
+  1. 锚点不存在 / 不唯一 / 替换里仍完整包含锚点(纯插入)/ 改动落在 `//` 注释里(含行尾
+     注释)→ 作废。
      纯插入那条也会拒绝 `x → !(x)` 这种包裹式变异,方向是保守的;换一个锚点即可。
   2. 编译失败(含 build script 失败)→ 作废。编译错误不是测试结果。
   3. 测试数与基线不一致(过滤词打错 → 0 个测试;`#[test]` 被变异藏掉)→ 作废。
@@ -47,8 +54,8 @@
      别的子进程(build script、包装器)失败 → 作废。
 
 **仍然拦不住的**,如实写:唯一锚点落在 `#[cfg(...)]` 编译掉的代码、字符串字面量、或块注释
-里 → 假 🟢;测试自己用 setsid 另起的进程组(os-proto 的模块进程就是)不在我们杀的那一组
-里。选锚点时自己确认它是被编译、被执行的代码。
+里 → 假 🟢;测试进程另起会话的后代,只有在它父进程还活着时才能按 ppid 找到并杀掉 —— 父进程
+先退出、后代被 launchd 收养的那种,找不到。选锚点时自己确认它是被编译、被执行的代码。
 
 ── 一个试过并否定的做法 ────────────────────────────────────────────────
 
@@ -58,6 +65,7 @@
 
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -69,7 +77,7 @@ import tempfile
 import time
 
 RED, ALIVE, VOID, TIMEOUT = 0, 10, 20, 30
-REFUSED, RESTORE_FAILED = 1, 2
+REFUSED, RESTORE_FAILED, INTERNAL = 1, 2, 3
 
 SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
 _pending = []
@@ -124,12 +132,17 @@ def take_lock(paths):
 
 
 def check_no_journal(paths):
+    # 临时目录 = 写日志时被打断:那时源码还没被动过(源码只在日志 rename 成正式名字之后才改),
+    # 所以它里面没有任何需要恢复的东西。持锁时清掉。
+    for name in os.listdir(paths.gitdir):
+        if name.startswith("mutate-inflight.tmp-"):
+            shutil.rmtree(os.path.join(paths.gitdir, name), ignore_errors=True)
     if os.path.isdir(paths.journal):
         target = ""
         try:
-            with open(os.path.join(paths.journal, "path"), encoding="utf-8") as f:
-                target = f.read()
-        except OSError:
+            with open(os.path.join(paths.journal, "meta.json"), encoding="utf-8") as f:
+                target = json.load(f).get("path", "")
+        except (OSError, ValueError):
             pass
         raise Refused(
             f"上一次变异没有收尾(被 SIGKILL 或恢复失败):{target or '<未知文件>'} 可能仍处于被变异状态。"
@@ -137,54 +150,90 @@ def check_no_journal(paths):
         )
 
 
-# ── 原子写与恢复 ─────────────────────────────────────────────────────
+# ── 日志、写源码与恢复 ─────────────────────────────────────────────────
+#
+# 日志 = git-dir 下的 mutate-inflight/{bak, meta.json}。它先在同级的临时目录里写全、fsync,
+# 再**原子 rename** 成正式名字 —— 所以一个「写到一半」的日志永远不会以正式名字存在(被
+# SIGKILL 在写日志时打断,留下的只是一个临时目录,而那时源码还没被动过)。meta 里记着原文与
+# 变异后内容的 sha256:恢复前先看当前文件是哪一个 —— 是原文就当已恢复,是我们写的变异就
+# 恢复,**两者都不是就是有人在这期间改过它,不覆盖**,保留一切并报冲突。
 
 
-def atomic_write(path, data):
-    d = os.path.dirname(path)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".mutate-")
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        shutil.copymode(path, tmp)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
-def write_journal(paths, src, original):
-    os.mkdir(paths.journal)  # 已存在就抛 —— check_no_journal 已先拦过
-    with open(os.path.join(paths.journal, "bak"), "wb") as f:
+def write_source(path, data):
+    """原地写:保留 inode、属主、xattr、硬链接。中途崩溃留下的半截文件由日志兜底。"""
+    with open(path, "r+b") as f:
+        f.write(data)
+        f.truncate()
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def read_journal(paths):
+    """→ (src, original, meta) 或抛 Refused(日志损坏)。"""
+    try:
+        with open(os.path.join(paths.journal, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        with open(os.path.join(paths.journal, "bak"), "rb") as f:
+            original = f.read()
+    except (OSError, ValueError) as e:
+        raise Refused(f"日志 {paths.journal} 读不全({e}) —— 不据它写任何东西;请人工检查后删掉它")
+    if sha(original) != meta.get("original_sha"):
+        raise Refused(f"日志 {paths.journal} 的备份与记录的 sha256 不符 —— 不据它写任何东西")
+    return meta["path"], original, meta
+
+
+def write_journal(paths, src, original, mutated):
+    tmp = tempfile.mkdtemp(dir=paths.gitdir, prefix="mutate-inflight.tmp-")
+    with open(os.path.join(tmp, "bak"), "wb") as f:
         f.write(original)
         f.flush()
         os.fsync(f.fileno())
-    with open(os.path.join(paths.journal, "path"), "w", encoding="utf-8") as f:
-        f.write(src)
+    with open(os.path.join(tmp, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"path": src, "original_sha": sha(original), "mutated_sha": sha(mutated)}, f)
         f.flush()
         os.fsync(f.fileno())
+    fsync_dir(tmp)
+    os.rename(tmp, paths.journal)  # 已存在就抛 —— check_no_journal 已先拦过
+    fsync_dir(paths.gitdir)
 
 
-def restore(paths, src, original):
-    """恢复并逐字节核对;成功才删日志。返回 True/False。"""
+def drop_journal(paths):
+    shutil.rmtree(paths.journal, ignore_errors=True)
+    fsync_dir(paths.gitdir)
+
+
+def restore(paths, src, original, mutated_sha):
+    """把 src 恢复成 original 并逐字节核对;成功才删日志。返回 True/False。"""
     try:
-        atomic_write(src, original)
         with open(src, "rb") as f:
-            ok = f.read() == original
+            current = f.read()
+        if current != original:
+            if sha(current) != mutated_sha:
+                say(f"  ⛔ {src} 既不是原文、也不是我们写进去的变异 —— 有人在这期间改过它。不覆盖。"
+                    f"原文备份在 {paths.journal}/bak;核对后自行处理,再删掉 {paths.journal}")
+                return False
+            write_source(src, original)
+            with open(src, "rb") as f:
+                if f.read() != original:
+                    raise OSError("写回后逐字节比对不上")
     except OSError as e:
-        say(f"  ⛔ 恢复 {src} 失败:{e}")
-        ok = False
-    if ok:
-        shutil.rmtree(paths.journal, ignore_errors=True)
-    else:
-        say(f"  ⛔ 源码没有恢复成原样。备份保留在 {paths.journal}/bak —— "
+        say(f"  ⛔ 恢复 {src} 失败:{e}。原文备份保留在 {paths.journal}/bak —— "
             f"运行 `python3 docs/agent/mutate.py recover`")
-    return ok
+        return False
+    drop_journal(paths)
+    return True
 
 
 def pause(paths, phase):
@@ -204,25 +253,38 @@ def pause(paths, phase):
             pass
 
 
-# ── 跑测试与读结果 ────────────────────────────────────────────────────
-
-SUMMARY = re.compile(
-    r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; \d+ ignored; \d+ measured; \d+ filtered out"
-)
-RUNNING = re.compile(r"^\s+Running unittests .* \((.+)\)\s*$")
+# ── 跑子进程 ─────────────────────────────────────────────────────────
 
 
-def run_tests(paths, crate, filters, timeout):
-    """→ ("PASS", n, line) / ("FAIL", line) / ("CRASH", why) / ("COMPILE",) / ("TIMEOUT",) /
-         ("UNKNOWN", why) / ("INTERRUPTED", signum)"""
-    cargo = os.environ.get("MUT_CARGO", "cargo")
+def descendants(root):
+    """root 的全部后代 pid(按 ppid 快照)。setsid 另起会话的后代不在 root 的进程组里,
+    只有趁父进程还活着时按 ppid 才找得到。"""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+    except OSError:
+        return []
+    kids = {}
+    for line in out.splitlines():
+        try:
+            pid, ppid = map(int, line.split())
+        except ValueError:
+            continue
+        kids.setdefault(ppid, []).append(pid)
+    found, todo = [], [root]
+    while todo:
+        for k in kids.get(todo.pop(), []):
+            found.append(k)
+            todo.append(k)
+    return found
+
+
+def supervise(cmd, cwd, timeout):
+    """→ ("DONE", rc, text) / ("TIMEOUT",) / ("INTERRUPTED", signum)。不论怎么结束,整棵树都杀掉。"""
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as out:
+        # 颜色转义会让行首锚定的判据全部失配(一个真崩溃被读成「不认识」)。
+        env = dict(os.environ, CARGO_TERM_COLOR="never")
         proc = subprocess.Popen(
-            [cargo, "test", "-p", crate, "--lib", *filters],
-            cwd=paths.rust,
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
+            cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             start_new_session=True,  # setsid 在 exec 之前:拿到 pid 时进程组已存在
         )
         deadline = time.monotonic() + timeout
@@ -235,11 +297,17 @@ def run_tests(paths, crate, filters, timeout):
                 verdict = ("TIMEOUT",)
                 break
             time.sleep(0.02)
-        # 不论怎么结束,整组杀一遍:测试进程可能比 cargo 活得久。
+        # 先按 ppid 快照后代(另起会话的也在内),再杀组、再逐个杀:测试进程可能比 cargo 活得久。
+        stray = descendants(proc.pid)
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        for pid in stray:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         # 等它也要有上限:杀组失败(组不存在)时 cargo 可能还活着,无上限的 wait 会把
         # 「挂住」变成脚手架自己挂住 —— 元测试里真发生过,自证因此一声不吭。
         try:
@@ -250,11 +318,30 @@ def run_tests(paths, crate, filters, timeout):
         if verdict:
             return verdict
         out.seek(0)
-        text = out.read()
-    return classify(text, proc.returncode)
+        return ("DONE", proc.returncode, out.read())
 
 
-def classify(text, rc):
+SUMMARY = re.compile(
+    r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; \d+ ignored; \d+ measured; \d+ filtered out"
+)
+RUNNING = re.compile(r"^\s+Running unittests .* \((.+)\)\s*$")
+# cargo 自己的顶层诊断,行首锚定 —— 测试输出里夹带的同样字样不算。
+COMPILE_LINE = re.compile(
+    r"^(error\[E\d+\]|error: could not compile |error: failed to run custom build command )"
+)
+
+
+def run_tests(paths, crate, filters, timeout, exe=None):
+    """→ ("PASS", n, line) / ("FAIL", line) / ("CRASH", why) / ("COMPILE",) / ("TIMEOUT",) /
+         ("UNKNOWN", why) / ("INTERRUPTED", signum)"""
+    r = supervise([os.environ.get("MUT_CARGO", "cargo"), "test", "-p", crate, "--lib", *filters],
+                  paths.rust, timeout)
+    if r[0] != "DONE":
+        return r
+    return classify(r[2], r[1], exe)
+
+
+def classify(text, rc, exe=None):
     lines = text.splitlines()
     summaries = [SUMMARY.match(l) for l in lines]
     summaries = [m for m in summaries if m]
@@ -268,36 +355,81 @@ def classify(text, rc):
         if status == "FAILED" and failed > 0 and rc != 0:
             return ("FAIL", m.group(0))
         return ("UNKNOWN", f"result 行与退出码矛盾(rc={rc}):{m.group(0)}")
-    if any("failed to run custom build command" in l for l in lines):
-        return ("COMPILE",)
-    if any(re.match(r"^error\[E\d+\]", l) or "could not compile" in l for l in lines):
-        return ("COMPILE",)
-    # 崩溃:只认「cargo 起的那一个 lib 测试二进制」没正常退出。
+    # 崩溃先判:只认「cargo 起的那一个 lib 测试二进制」没正常退出 —— 精确匹配到它,就不
+    # 让测试输出里夹带的「could not compile」把一个被抓到的变异读成作废。
+    # 那个二进制的路径:基线里从 compiler-artifact 记下的最可靠(`cargo -q` 不打印
+    # `Running unittests` 行);没有才退回去读那一行。
     running = [RUNNING.match(l) for l in lines]
     running = [m.group(1) for m in running if m]
-    crashed = [l for l in lines if "process didn't exit successfully" in l]
-    if len(running) == 1 and len(crashed) == 1 and rc != 0:
+    if exe is None and len(running) == 1:
         exe = running[0]
+    crashed = [l for l in lines if "process didn't exit successfully" in l]
+    if exe and len(running) <= 1 and len(crashed) == 1 and rc != 0:
         c = crashed[0]
-        if f"`{exe}" in c or f"`{os.path.join('.', exe)}" in c or exe in c:
+        # 路径要整段匹配:前面是反引号或 /,后面是反引号或空格(cargo 把测试参数接在路径后面,
+        # `…/x-hash supervise`)。子串匹配会让 `…/x-1` 也认下 `…/x-12345`。
+        if re.search(r"[`/]" + re.escape(exe.lstrip("./")) + r"[` ]", c):
             why = re.search(r"\(([^()]*)\)\s*$", c)
             return ("CRASH", why.group(1) if why else "非正常退出")
+    if any(COMPILE_LINE.match(l) for l in lines):
+        return ("COMPILE",)
     return ("UNKNOWN", "既没有 result 行,也认不出是编译失败或测试进程崩溃")
 
 
 # ── 基线 ────────────────────────────────────────────────────────────
 
 
-def lib_sources(paths, crate):
-    """`--lib` 测试真正编译进去的源文件(规范化绝对路径)。"""
-    proc = subprocess.run(
-        ["cargo", "test", "-p", crate, "--lib", "--no-run", "--message-format=json"],
-        cwd=paths.rust, capture_output=True, text=True,
+def parse_depinfo(text):
+    """Make 格式 dep-info 的第一条规则里的依赖文件。处理续行与 `\\ ` / `\\#` / `\\\\` 转义。"""
+    rule = text.split("\n\n", 1)[0].replace("\\\n", " ")
+    # 找第一个未转义的 ": "
+    i, target_end = 0, None
+    while i < len(rule) - 1:
+        if rule[i] == "\\":
+            i += 2
+            continue
+        if rule[i] == ":" and rule[i + 1] in " \n":
+            target_end = i
+            break
+        i += 1
+    if target_end is None:
+        return []
+    deps, cur, i, body = [], [], 0, rule[target_end + 1:]
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body) and body[i + 1] in " #\\":
+            cur.append(body[i + 1])
+            i += 2
+            continue
+        if c.isspace():
+            if cur:
+                deps.append("".join(cur))
+                cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if cur:
+        deps.append("".join(cur))
+    return deps
+
+
+def lib_sources(paths, crate, filters):
+    """`--lib` 测试真正编译进去的源文件(规范化绝对路径),以及那个测试二进制的路径。
+    带上与跑测试**同样的参数**:`--no-default-features` 之类会改变编译范围,不带就会把一个
+    实际没被编译的文件算进可变异清单(假 🟢)。"""
+    r = supervise(
+        [os.environ.get("MUT_CARGO_META", "cargo"), "test", "-p", crate, "--lib", "--no-run",
+         "--message-format=json", *filters],
+        paths.rust, float(os.environ.get("MUT_TIMEOUT", "150")),
     )
-    if proc.returncode != 0:
+    if r[0] == "INTERRUPTED":
+        return r
+    if r[0] == "TIMEOUT":
+        raise Refused(f"`cargo test -p {crate} --lib --no-run` 挂住 —— 无法确定哪些文件会被编译")
+    if r[1] != 0:
         raise Refused(f"`cargo test -p {crate} --lib --no-run` 失败 —— crate 名不对或编译不过")
     exe = None
-    for line in proc.stdout.splitlines():
+    for line in r[2].splitlines():
         try:
             m = json.loads(line)
         except ValueError:
@@ -310,16 +442,28 @@ def lib_sources(paths, crate):
     if not exe or not os.path.exists(exe + ".d"):
         raise Refused(f"读不到 {crate} lib 测试的 dep-info —— 无法确定哪些文件会被编译")
     with open(exe + ".d", encoding="utf-8") as f:
-        first = f.readline()
-    _, _, deps = first.partition(": ")
-    files = re.split(r"(?<!\\) ", deps.strip())
-    out = set()
+        deps = parse_depinfo(f.read())
+    return sorted({os.path.realpath(os.path.join(paths.rust, p)) for p in deps}), exe
+
+
+def fingerprint(paths, files):
+    """每个文件的 sha256。基线之后树变了,读数说的就不是基线那棵树 —— 包括一个恰好把
+    某条红测试「修好」的变异被读成 🟢。"""
+    out = {}
     for p in files:
-        p = p.replace("\\ ", " ")
-        if not p:
-            continue
-        out.add(os.path.realpath(os.path.join(paths.rust, p)))
-    return sorted(out)
+        try:
+            with open(p, "rb") as f:
+                out[p] = sha(f.read())
+        except OSError:
+            out[p] = None
+    return out
+
+
+def watched_files(paths, sources):
+    extra = [os.path.join(paths.rust, "Cargo.lock")]
+    crate_tomls = {os.path.join(os.path.dirname(os.path.dirname(s)), "Cargo.toml") for s in sources
+                   if os.path.basename(os.path.dirname(s)) == "src"}
+    return sorted(set(sources) | set(extra) | {t for t in crate_tomls if os.path.exists(t)})
 
 
 def cmd_baseline(paths, crate, filters):
@@ -328,7 +472,11 @@ def cmd_baseline(paths, crate, filters):
         os.unlink(paths.baseline)  # 先清掉:一次失败的重立,不能让上一次的好基线继续生效
     except FileNotFoundError:
         pass
-    sources = lib_sources(paths, crate)
+    found = lib_sources(paths, crate, filters)
+    if found[0] == "INTERRUPTED":
+        return 128 + found[1]
+    sources, exe = found
+    prints = fingerprint(paths, watched_files(paths, sources))
     r = run_tests(paths, crate, filters, float(os.environ.get("MUT_TIMEOUT", "150")))
     if r[0] == "INTERRUPTED":
         return 128 + r[1]
@@ -338,9 +486,12 @@ def cmd_baseline(paths, crate, filters):
     if r[1] == 0:
         say(f"  ⛔ 基线跑了 0 个测试({r[2]}) —— 过滤词不对?停止")
         return REFUSED
+    if fingerprint(paths, prints.keys()) != prints:
+        say("  ⛔ 立基线期间源码被改动了 —— 这个绿说的不是现在这棵树,重来")
+        return REFUSED
     with open(paths.baseline, "w", encoding="utf-8") as f:
-        json.dump({"root": paths.root, "crate": crate, "filters": filters,
-                   "passed": r[1], "sources": sources}, f)
+        json.dump({"root": paths.root, "crate": crate, "filters": filters, "exe": exe,
+                   "passed": r[1], "sources": sources, "fingerprint": prints}, f)
     say(f"  {'基线(必须全绿,否则后面读数无意义)':<44} {r[2]}")
     return 0
 
@@ -362,13 +513,32 @@ def inject(original, anchor, repl):
         return None, "替换与锚点相同"
     if anchor in repl:
         return None, "纯插入:替换里仍完整包含锚点,原代码还在 → 行为未必变"
-    i = s.index(anchor)
-    line_start = s.rfind("\n", 0, i) + 1
-    line_end = s.find("\n", i)
-    line = s[line_start: line_end if line_end != -1 else len(s)]
-    if line.lstrip().startswith("//"):
-        return None, "锚点所在行是 // 注释 —— 改注释不改行为"
-    return s.replace(anchor, repl, 1).encode("utf-8"), None
+    out = s.replace(anchor, repl, 1)
+    # 真正被改动的区间(去掉公共前后缀),而不是锚点所在行的行首:行尾注释
+    # `x = 1; // retry 3 times` 里改 3 → 4,锚点所在行不以 // 开头,改的却只是注释。
+    p = 0
+    while p < min(len(s), len(out)) and s[p] == out[p]:
+        p += 1
+    line_start = s.rfind("\n", 0, p) + 1
+    if "//" in s[line_start:p]:
+        return None, "改动落在 // 注释里 —— 改注释不改行为(含行尾注释;字符串里的 // 也会被这样拒,方向是保守的)"
+    return out.encode("utf-8"), None
+
+
+FAILED_TEST = re.compile(r"^test (\S+) \.\.\. FAILED$")
+
+
+def failed_tests(r_text):
+    return sorted(m.group(1) for m in (FAILED_TEST.match(l) for l in r_text.splitlines()) if m)
+
+
+def run_red(paths, base, timeout):
+    """跑一次,红的话连同失败的测试名一起返回:两次变异运行要红得一样,才不是偶发。"""
+    r = supervise([os.environ.get("MUT_CARGO", "cargo"), "test", "-p", base["crate"], "--lib",
+                   *base["filters"]], paths.rust, timeout)
+    if r[0] != "DONE":
+        return r, None
+    return classify(r[2], r[1], base.get("exe")), failed_tests(r[2])
 
 
 def cmd_mut(paths, file, anchor, repl, label):
@@ -385,6 +555,11 @@ def cmd_mut(paths, file, anchor, repl, label):
         raise Refused(f"文件不存在: {file}")
     if src not in base["sources"]:
         raise Refused(f"{file} 不在 `{base['crate']}` 的 --lib 测试编译范围里 —— 改它读不到任何东西,读数会是假 🟢")
+    prints = base.get("fingerprint", {})
+    now = fingerprint(paths, prints.keys())
+    if not prints or now != prints:
+        changed = sorted(os.path.relpath(k, paths.root) for k in prints if now.get(k) != prints[k])
+        raise Refused(f"基线之后源码变了({', '.join(changed[:3]) or '无指纹'}) —— 读数会说的是另一棵树,先重立基线")
 
     with open(src, "rb") as f:
         original = f.read()
@@ -396,19 +571,20 @@ def cmd_mut(paths, file, anchor, repl, label):
     timeout = float(os.environ.get("MUT_TIMEOUT", "150"))
     if interrupted():
         return 128 + interrupted()
-    write_journal(paths, src, original)
+    write_journal(paths, src, original, mutated)
     pause(paths, "after-journal")
-    status = None
-    r = None
+    r = r2 = names = names2 = None
     try:
         if not interrupted():
-            atomic_write(src, mutated)
+            write_source(src, mutated)
             pause(paths, "after-inject")
         if not interrupted():
-            r = run_tests(paths, base["crate"], base["filters"], timeout)
+            r, names = run_red(paths, base, timeout)
+            if r[0] in ("FAIL", "CRASH") and not interrupted():
+                r2, names2 = run_red(paths, base, timeout)
             pause(paths, "after-run")
     finally:
-        restored = restore(paths, src, original)
+        restored = restore(paths, src, original, sha(mutated))
     if not restored:
         return RESTORE_FAILED
     if interrupted():
@@ -417,11 +593,25 @@ def cmd_mut(paths, file, anchor, repl, label):
     if r is None:
         say(f"  {label:<44} ⛔ 变异没能写进源码,本格作废")
         return VOID
+    for x in (r, r2):
+        if x is not None and x[0] == "INTERRUPTED":
+            return 128 + x[1]
+    pause(paths, "before-verdict")
+    if interrupted():
+        return 128 + interrupted()
+    if fingerprint(paths, prints.keys()) != prints:
+        say(f"  {label:<44} ⛔ 跑测试期间别的源码被改了 —— 读数说的不是基线那棵树,本格作废")
+        return VOID
 
     kind = r[0]
     if kind in ("FAIL", "CRASH"):
-        # 这次红是不是变异造成的:在恢复后的原样上再跑一次,必须还是那个全绿基线。
-        again = run_tests(paths, base["crate"], base["filters"], timeout)
+        # 两道确认:变异版再跑一次要红得一样(同一类、同一批失败的测试)—— 否则是偶发;
+        # 恢复后的原样再跑一次要是基线 —— 否则是基线漂移。
+        if r2 is None or r2[0] != kind or names2 != names:
+            say(f"  {label:<44} ⛔ 变异版两次跑得不一样({r[0]} {names} / "
+                f"{r2[0] if r2 else '-'} {names2}) —— 测试不稳定,本格作废")
+            return VOID
+        again = run_tests(paths, base["crate"], base["filters"], timeout, base.get("exe"))
         if again[0] == "INTERRUPTED":
             return 128 + again[1]
         if again[0] != "PASS" or again[1] != base["passed"]:
@@ -452,11 +642,11 @@ def cmd_recover(paths):
     if not os.path.isdir(paths.journal):
         say("  没有未收尾的变异")
         return 0
-    with open(os.path.join(paths.journal, "path"), encoding="utf-8") as f:
-        src = f.read()
-    with open(os.path.join(paths.journal, "bak"), "rb") as f:
-        original = f.read()
-    if restore(paths, src, original):
+    src, original, meta = read_journal(paths)
+    real_root = os.path.realpath(paths.root) + os.sep
+    if not os.path.realpath(src).startswith(real_root):
+        raise Refused(f"日志指向 {src},不在这棵树({paths.root})里 —— 不写")
+    if restore(paths, src, original, meta.get("mutated_sha")):
         say(f"  ✓ 已恢复 {src}")
         return 0
     return RESTORE_FAILED
@@ -482,7 +672,17 @@ def main(argv):
     except Refused as e:
         say(f"  ⛔ {e}")
         return REFUSED
+    except Exception as e:  # noqa: BLE001 — 源码已由 cmd_mut 的 finally 恢复;这里只区分退出码
+        say(f"  ⛔ 脚手架内部错误:{type(e).__name__}: {e}")
+        return INTERNAL
+
+
+def exit_code(rc):
+    """最后一次检查之后才到的信号,也不能被一个普通读数盖过去。"""
+    if interrupted() and rc < 128:
+        return 128 + interrupted()
+    return rc
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(exit_code(main(sys.argv)))
