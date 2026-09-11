@@ -52,7 +52,7 @@
 - **涉及文件**：`rust/crates/agent24-os-proto/src/{drain.rs,proxy.rs,lib.rs}`（探针预言的符号是 `drain.rs` 的 `pub enum DrainState`，照它命名）、`rust/apps/agent24-cli/src/main.rs`（仅注释）、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`（记本刀的边界）
 - **证据**：
 
-### ME3-T6 3c 回调通道其余部分（SPEC §3 + §8 ME-3c 格）  `IN_PROGRESS` — 分支 `feat/me3c-rpc`（用户 2026-09-11 定为下一步）
+### ME3-T6 3c 回调通道其余部分（SPEC §3 + §8 ME-3c 格）  `PR_OPEN` — 分支 `feat/me3c-rpc`（用户 2026-09-11 定为下一步）
 - **优先级**：high（T1–T6 齐了即可发 v0.4.0 握手层）
 - **依赖**：3b-1 framing、3b-2b `initialize`（均已在 main）。**不依赖** #175（3b-5）：本刀 offer set 为空，没有任何业务方法，「draining 期间回调准入」要等第一个业务方法（3d/3e）才有落点
 - **目标**：握手之后那条回调连接上的一切协议行为定死，实现者不需要猜并发、取消与错误分类

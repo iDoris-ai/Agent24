@@ -633,6 +633,8 @@ pub struct Limits {
     /// How long one response may take to be written before the connection is
     /// given up on.
     pub write_timeout: Duration,
+    /// Bytes waiting to be written above which no new frame is read.
+    pub queue_high_water: usize,
 }
 
 impl Default for Limits {
@@ -641,6 +643,7 @@ impl Default for Limits {
             max_in_flight: MAX_IN_FLIGHT_PER_CONNECTION,
             call_timeout: CALL_TIMEOUT,
             write_timeout: WRITE_TIMEOUT,
+            queue_high_water: QUEUE_HIGH_WATER,
         }
     }
 }
@@ -866,7 +869,8 @@ where
             }
             continue;
         }
-        let backpressured = queued.load(std::sync::atomic::Ordering::SeqCst) >= QUEUE_HIGH_WATER;
+        let backpressured =
+            queued.load(std::sync::atomic::Ordering::SeqCst) >= limits.queue_high_water;
         let response = tokio::select! {
             biased;
             frame = frames_rx.recv(), if !backpressured => match frame {
@@ -911,11 +915,12 @@ where
 /// reading the next frame (see the comment where it is used).
 const FRAMES_BEFORE_REAPING: usize = 16;
 
-/// Bytes waiting to be written above which [`serve`] stops reading frames. Two
+/// Bytes waiting to be written above which [`serve`] stops reading frames
+/// (production value of [`Limits::queue_high_water`]). Two
 /// frames' worth: enough that one maximal response never pauses reading on its
 /// own. The queue can still exceed it by the responses of calls already in
 /// flight — at most `max_in_flight` of them, each within the frame limit.
-const QUEUE_HIGH_WATER: usize = 2 * MAX_FRAME_BYTES;
+pub const QUEUE_HIGH_WATER: usize = 2 * MAX_FRAME_BYTES;
 
 fn conn_end(end: FrameError) -> Ended {
     match end {
@@ -1188,6 +1193,7 @@ mod tests {
         max_in_flight: 8,
         call_timeout: Duration::from_secs(10),
         write_timeout: Duration::from_secs(10),
+        queue_high_water: QUEUE_HIGH_WATER,
     };
 
     // ── SPEC §8 ME-3c, one test per clause ──────────────────────────────
@@ -2002,6 +2008,7 @@ mod tests {
                 max_in_flight: MAX_IN_FLIGHT_PER_CONNECTION,
                 call_timeout: CALL_TIMEOUT,
                 write_timeout: WRITE_TIMEOUT,
+                queue_high_water: QUEUE_HIGH_WATER,
             }
         );
         assert_eq!(MAX_IN_FLIGHT_PER_CONNECTION, 64);
@@ -2212,9 +2219,9 @@ mod tests {
 
     // ── review round 3 ─────────────────────────────────────────────────
 
-    /// The loop never waits on the peer. With the writer stuck and a pile of
-    /// responses queued behind it, a cancel that arrives is still acted on at
-    /// once. (The version before waited for queue space inside the loop, and
+    /// Below the high-water mark the loop never waits on the peer: with the
+    /// writer stuck and small responses queued behind it, a cancel that arrives
+    /// is still acted on at once. (The version before waited for queue space inside the loop, and
     /// saw nothing — cancel, EOF, finished calls — for up to the write deadline.)
     #[tokio::test]
     async fn a_stuck_writer_does_not_stop_the_loop_from_acting_on_a_cancel() {
@@ -2300,5 +2307,65 @@ mod tests {
             panic!("a repeated key must be refused")
         };
         assert_eq!(r.outcome.unwrap_err().code, code::INVALID_PARAMS);
+    }
+
+    /// Above the high-water mark reading stops — even a cancel waits — and it
+    /// resumes when the peer drains the queue. Both halves: a watermark that
+    /// never paused, or a pause that never woke up, each fail one assertion.
+    #[tokio::test]
+    async fn over_the_high_water_mark_reading_pauses_and_resumes_when_drained() {
+        let f = fixture();
+        let hang = f.hang.clone();
+        let (client, server) = tokio::io::duplex(16); // a write of any response blocks
+        let (sr, sw) = tokio::io::split(server);
+        let task = tokio::spawn(serve(
+            BufReader::new(sr),
+            sw,
+            f.methods,
+            Limits {
+                queue_high_water: 1,
+                write_timeout: Duration::from_secs(10),
+                ..TEST_LIMITS
+            },
+        ));
+        let (cr, mut cw) = tokio::io::split(client);
+        let line = |v: Value| format!("{v}\n");
+        cw.write_all(line(req("h", "t/hang", json!({}))).as_bytes())
+            .await
+            .unwrap();
+        while hang.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // One response queued and stuck behind the 16-byte pipe → over the mark.
+        cw.write_all(b"{not json\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cw.write_all(
+            line(json!({"jsonrpc": "2.0", "method": CANCEL_METHOD, "params": {"id": "h"}}))
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !hang.dropped.load(Ordering::SeqCst),
+            "a frame was read while over the high-water mark"
+        );
+        // Drain: read the parse-error response; reading must resume and the
+        // cancel take effect.
+        let mut rx = BufReader::new(cr);
+        let mut first = String::new();
+        tokio::time::timeout(Duration::from_secs(5), rx.read_line(&mut first))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.contains("-32700"), "{first}");
+        let mut second = String::new();
+        tokio::time::timeout(Duration::from_secs(5), rx.read_line(&mut second))
+            .await
+            .expect("reading never resumed after the queue drained")
+            .unwrap();
+        assert!(second.contains("cancelled"), "{second}");
+        assert!(hang.dropped.load(Ordering::SeqCst));
+        task.abort();
     }
 }
