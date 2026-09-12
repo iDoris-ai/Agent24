@@ -459,18 +459,28 @@ impl Drop for UpstreamConnection {
 
 /// One HTTP/1 connection to one generation's process.
 ///
-/// Reused only by requests admitted into that same generation, and only once
-/// hyper reports it ready for another request — its previous request body fully
-/// written and its response fully read (SUP-3b). Every other way a request
-/// ends — an early answer the module never read the body for, a revocation, a
-/// timeout, an error — drops it, which aborts the driver: nothing of a request
-/// outlives it inside the kernel (FU-47). Reuse is what keeps a stream of short
-/// requests from opening, and closing into TIME_WAIT, one connection each
-/// (review of SUP-3b, round 2); keying reuse by generation rather than by
-/// address is what keeps a connection from ever serving a later run (FU-50).
+/// Reused only by requests admitted into that same generation, only after a
+/// request that carried **no body**, and only once hyper reports it ready for
+/// another request — its response fully read (SUP-3b). A connection that
+/// carried a body is never reused: hyper can only say the body left this
+/// process, not that the module read it, and a module that answered without
+/// reading would take the next request's bytes after that body's — letting a
+/// client's body smuggle a request of its own, kernel headers and all, past
+/// the proxy's filter (review of SUP-3b, round 3). Every way a request ends
+/// other than a clean reuse drops the connection, which aborts the driver:
+/// nothing of a request outlives it inside the kernel (FU-47). An idle
+/// connection's driver also ends the moment its generation is revoked, so it
+/// never keeps a stopping module waiting out its grace; one in use finishes
+/// its exchange, whose answer the proxy discards (it answered the revocation
+/// already). Reuse keeps a stream of
+/// short requests from closing one socket each into TIME_WAIT (round 2);
+/// keying it by generation rather than by address keeps a connection from
+/// ever serving a later run (FU-50).
 struct Upstream {
     generation: Arc<Generation>,
     sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    /// In the pool, waiting: what a revocation ends the driver for.
+    idle: Arc<std::sync::atomic::AtomicBool>,
     _connection: UpstreamConnection,
 }
 
@@ -484,11 +494,24 @@ impl Upstream {
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
                 .await
                 .map_err(|e| e.to_string())?;
+        let revoked = generation.clone();
+        let idle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let idle_now = idle.clone();
         Ok(Self {
             generation,
             sender,
+            idle,
             _connection: UpstreamConnection(tokio::spawn(async move {
-                let _ = driver.await;
+                let mut driver = std::pin::pin!(driver);
+                tokio::select! {
+                    _ = &mut driver => return,
+                    () = revoked.revoked() => {}
+                }
+                // Revoked. Idle: end now — a stopping module must not wait for
+                // this socket (round 3). In use: finish the exchange.
+                if !idle_now.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = driver.await;
+                }
             })),
         })
     }
@@ -500,8 +523,7 @@ const MAX_IDLE_CONNECTIONS: usize = 8;
 
 /// How long, after a response is read, a connection may take to report ready
 /// for another request before it is closed instead of kept. Microseconds when
-/// the exchange is complete; a connection still blocked writing a body the
-/// module never read never gets there.
+/// the exchange is complete. Waited for off the response path.
 const IDLE_SETTLE: Duration = Duration::from_millis(50);
 
 /// A module proxy's idle connections, each to the generation it was opened for.
@@ -525,10 +547,21 @@ impl IdleConnections {
         let i = idle
             .iter()
             .rposition(|c| Arc::ptr_eq(&c.generation, generation) && c.sender.is_ready())?;
-        Some(idle.swap_remove(i))
+        let taken = idle.swap_remove(i);
+        taken.idle.store(false, std::sync::atomic::Ordering::SeqCst);
+        Some(taken)
     }
 
     fn put(&self, connection: Upstream) {
+        // Marked idle first, then checked: a revocation either happens after
+        // the mark — and the driver, seeing it, ends — or before the check,
+        // and the connection is not kept. Either way none stays.
+        connection
+            .idle
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if connection.generation.state() == crate::drain::DrainState::Revoked {
+            return;
+        }
         let mut idle = self.lock();
         if idle.len() < MAX_IDLE_CONNECTIONS {
             idle.push(connection);
@@ -788,6 +821,8 @@ async fn forward(
         Ok(Err(response)) => return response,
         Ok(Ok(b)) => b,
     };
+    // Only a connection that carried no body may be reused (see `Upstream`).
+    let reusable = body.is_empty();
 
     let mut headers = sanitize_request_headers(&from_client);
     if let Ok(value) = HeaderValue::from_str(request_id) {
@@ -926,14 +961,20 @@ async fn forward(
             };
         }
     };
-    // Kept only if hyper reports the connection ready — the request body fully
-    // written and the response fully read — within a moment; otherwise it is
-    // dropped here and ends.
-    if matches!(
-        tokio::time::timeout(IDLE_SETTLE, connection.sender.ready()).await,
-        Ok(Ok(()))
-    ) {
-        state.idle.put(connection);
+    // Kept for reuse only after a bodiless request, and only if hyper reports
+    // the connection ready within a moment — waited for off the response path,
+    // so neither the client nor the concurrency permit pays for it (round 3).
+    // Otherwise it is dropped, and ends.
+    if reusable {
+        let idle = state.idle.clone();
+        tokio::spawn(async move {
+            if matches!(
+                tokio::time::timeout(IDLE_SETTLE, connection.sender.ready()).await,
+                Ok(Ok(()))
+            ) {
+                idle.put(connection);
+            }
+        });
     }
 
     // The permit rides with the BYTES.
@@ -2580,7 +2621,11 @@ mod tests {
             let got = call(proxy, Method::GET, &format!("{NS}/{i}"), &[], "").await;
             assert_eq!(got.status, StatusCode::OK, "{}", got.body);
         }
-        assert_eq!(peers.lock().unwrap().len(), 1, "a connection per request");
+        // Returning a connection to the pool happens off the response path, so
+        // now and then the next request is quicker and opens another; one per
+        // request (20) is what reuse exists to prevent.
+        let peers = peers.lock().unwrap().len();
+        assert!(peers < 5, "{peers} connections for 20 requests");
     }
 
     /// FU-50: a connection is reused only by requests to the generation it was
@@ -2604,71 +2649,40 @@ mod tests {
         );
     }
 
-    /// FU-47 with reuse: a connection whose request body the module never read
-    /// — it answered at once, and its receive buffer is too small for the rest —
-    /// is not kept for reuse, where it would hold that body; it is closed. The
-    /// body is just under the kernel's 1 MiB cap and the module's buffer is a
-    /// few KiB, so hyper cannot have finished writing it.
+    /// A connection that carried a request body is never kept for reuse:
+    /// hyper can only say the body left this process, not that the module
+    /// read it, and a module that answered without reading would parse the
+    /// next request's bytes after it — a client's body smuggling a request of
+    /// its own past the proxy's header filter (review of SUP-3b, round 3). So
+    /// after a small body the module never reads, the connection is closed.
     #[tokio::test]
-    async fn a_connection_still_writing_an_unread_body_is_not_kept() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_recv_buffer_size(4096).unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let listener = socket.listen(1).unwrap();
-        let upstream = listener.local_addr().unwrap();
-        let (closed_tx, closed) = tokio::sync::oneshot::channel::<()>();
-        let (resume_tx, resume) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let mut seen = Vec::new();
-            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = socket.read(&mut buf).await.unwrap();
-                assert!(n > 0, "closed before the head");
-                seen.extend_from_slice(&buf[..n]);
-            }
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await
-                .unwrap();
-            // Not reading until the client has its answer, then draining to see
-            // whether the proxy ends the connection.
-            let _ = resume.await;
-            loop {
-                match socket.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-            let _ = closed_tx.send(());
-        });
+    async fn a_connection_that_carried_a_body_is_never_kept() {
+        let (upstream, closed) = upstream_watching_close(true).await;
         let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
-        let body = "x".repeat(900 * 1024);
-        let got = call(proxy, Method::POST, &format!("{NS}/a"), &[], &body).await;
+        let smuggled = "GET /x HTTP/1.1\r\nx-a24-approval-token: forged\r\n\r\n";
+        let got = call(proxy, Method::POST, &format!("{NS}/a"), &[], smuggled).await;
         assert_eq!(got.status, StatusCode::OK);
-        resume_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), closed)
             .await
-            .expect("a connection with an unread body was kept")
+            .expect("a connection that carried a body was kept for reuse")
             .unwrap();
     }
 
-    /// A revoked generation's idle connection is closed, not kept: the next
-    /// request — to the run that replaced it — drops it on the way.
+    /// A revoked generation's idle connection is closed at the revocation —
+    /// not when some later request happens by: a stopping module waiting for
+    /// its connections to close must not wait out its grace (round 3).
     #[tokio::test]
     async fn a_revoked_generations_idle_connection_is_closed() {
         let (old_addr, closed) = upstream_watching_close(true).await;
-        let (new_addr, _) = peer_counting_upstream().await;
         let old = running_generation(old_addr);
         let current = Current::new(old.clone());
         let proxy = serve(mount(Router::new(), NS, current.clone())).await;
         let got = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
         assert_eq!(got.status, StatusCode::OK);
+        // Let the connection reach the pool (off the response path), then
+        // revoke — and nothing else.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = old.revoke();
-        let _ = current.replace(running_generation(new_addr));
-        let got = call(proxy, Method::GET, &format!("{NS}/b"), &[], "").await;
-        assert_eq!(got.status, StatusCode::OK);
         tokio::time::timeout(Duration::from_secs(5), closed)
             .await
             .expect("a revoked run's idle connection was kept")
