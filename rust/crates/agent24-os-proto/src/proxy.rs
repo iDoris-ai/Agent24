@@ -691,15 +691,14 @@ async fn forward(
         );
     };
     // The permit rides with the RESPONSE bytes only (see below), not with the
-    // request body handed to hyper. That leaves one thing uncounted, stated
-    // rather than half-fixed (FU-47): once `forward` is dropped — by a
-    // revocation, say — hyper may still hold the request body it was given
-    // until the upstream connection closes. After a revocation the process is
-    // killed within its grace, so that overshoot is transient. Attaching the
-    // permit to the request body was tried and is worse: a module that answers
-    // early without reading its body, and keeps the connection open, makes hyper
-    // hold that body indefinitely — and with the permit inside it, 64 such
-    // exchanges starve the namespace for good.
+    // request body handed to hyper. The request body is held only while this
+    // request is: it lives on the request's own connection, whose driver is
+    // aborted when `forward` finishes or is dropped (`UpstreamConnection`,
+    // SUP-3b) — so neither a revocation nor a module that answers without
+    // reading its body and keeps the connection open can make hyper keep it
+    // (FU-47). Attaching the permit to the request body was tried before that
+    // and was worse: such a module made hyper hold the body — permit inside —
+    // indefinitely, and 64 of them starved the namespace for good.
 
     let method = request.method().clone();
     let from_client = request.headers().clone();
@@ -2399,26 +2398,63 @@ mod tests {
 
     /// The connection guard ends a connection hyper is still blocked on: a
     /// request body far larger than any socket buffer, to a module that
-    /// answered without reading it. Dropping the guard closes the connection;
-    /// without the abort, hyper would keep writing — and keep the body — for
-    /// as long as the module keeps the connection open.
+    /// answered at once and then stopped reading. Dropping the guard ends the
+    /// connection with most of the body unsent — the module, reading again
+    /// afterwards, finds EOF well before the declared length. Without the
+    /// abort, hyper keeps writing, and the module would receive all of it
+    /// (review of SUP-3b, round 1: a module that kept reading drained the body
+    /// and hid the difference).
     #[tokio::test]
     async fn dropping_the_connection_guard_ends_a_connection_blocked_on_its_body() {
-        let (upstream, closed) = upstream_watching_close(true).await;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const BODY: usize = 64 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let module = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut seen = Vec::new();
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0, "closed before the head");
+                seen.extend_from_slice(&buf[..n]);
+            }
+            let mut received = seen.len();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            // Stop reading: hyper blocks on the body. Read again only once the
+            // test has dropped the guard, and count what still arrives.
+            resume_rx.await.unwrap();
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+            }
+            received
+        });
         let request = Request::builder()
             .method(Method::POST)
             .uri("/a")
             .header(axum::http::header::HOST, upstream.to_string())
-            .body(Full::new(Bytes::from(vec![b'x'; 64 * 1024 * 1024])))
+            .body(Full::new(Bytes::from(vec![b'x'; BODY])))
             .unwrap();
         let (response, connection) = exchange(upstream, request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let _ = response.into_body().collect().await;
         drop(connection);
-        tokio::time::timeout(Duration::from_secs(5), closed)
+        resume_tx.send(()).unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(10), module)
             .await
             .expect("the connection outlived its guard")
             .unwrap();
+        assert!(
+            received < BODY,
+            "the whole body was still written after the guard was dropped ({received} bytes)"
+        );
     }
 
     /// FU-47, the other way a request ends: revoked while the module sits on
