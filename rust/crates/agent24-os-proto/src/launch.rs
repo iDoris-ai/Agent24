@@ -762,24 +762,35 @@ mod tests {
     /// module is gone, its port refuses at once — a copy kept here would queue
     /// connections in a backlog nobody accepts from, and a request would hang
     /// instead of failing.
+    ///
+    /// Up to three attempts, each with a fresh port: other tests in this
+    /// process bind `127.0.0.1:0` concurrently, and one of them can be handed
+    /// the port the moment the module frees it — measured once in 120 full
+    /// runs, as a connection "accepted by a dead module's port". A real leak
+    /// (the daemon keeping its copy) accepts on every attempt, so it stays red;
+    /// a coincidence three times running is about one in a million.
     #[tokio::test]
     async fn once_the_module_is_gone_its_port_refuses() {
-        let t = pkg();
-        let l = listener();
-        let addr = l.local_addr().unwrap();
-        let mut p = start_with(t.path(), &cmd("sh", &["-c", "exit 0"]), l);
-        exited(&mut p).await;
-        let _ = p.stop(std::time::Duration::from_millis(100)).await;
-        let refused = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        .expect("the connect hung: something still holds the listener");
-        assert!(
-            refused.is_err(),
-            "a connection was accepted by a dead module's port"
-        );
+        let mut accepted = Vec::new();
+        for _ in 0..3 {
+            let t = pkg();
+            let l = listener();
+            let addr = l.local_addr().unwrap();
+            let mut p = start_with(t.path(), &cmd("sh", &["-c", "exit 0"]), l);
+            exited(&mut p).await;
+            let _ = p.stop(std::time::Duration::from_millis(100)).await;
+            let connect = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            .expect("the connect hung: something still holds the listener");
+            if connect.is_err() {
+                return; // refused, as it should be
+            }
+            accepted.push(addr);
+        }
+        panic!("a dead module's port accepted a connection on every attempt: {accepted:?}");
     }
 
     /// Only fds 0–3 reach the module: stdio and the listener. Anything else

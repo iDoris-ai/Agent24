@@ -401,6 +401,47 @@ fn signal_group(group: Pid, sig: Signal) -> std::io::Result<()> {
     }
 }
 
+/// How long [`kill_what_remains`] keeps retrying an `EPERM`. ⚖️
+const ZOMBIE_REAP_WAIT: Duration = Duration::from_secs(1);
+
+/// `SIGKILL` a group whose leader has already exited.
+///
+/// **`EPERM` here usually means "only zombies are left", on macOS.** Once the
+/// leader is gone, its helpers are reparented to launchd; one that has already
+/// died is a zombie until launchd reaps it, and macOS answers `killpg` on a
+/// group of nothing but zombies with `EPERM` rather than `ESRCH`. Measured: 2 of
+/// about 60 full test runs under load failed `stop` with exactly that, the
+/// leader having exited on the TERM (status 15). Linux signals zombies without
+/// complaint. So an `EPERM` is retried until the group is empty (`ESRCH`) —
+/// zombies are reaped promptly — and reported only if it outlasts
+/// [`ZOMBIE_REAP_WAIT`]; then it may also be a member running as another user,
+/// which this process genuinely cannot kill, and the message says both.
+async fn kill_what_remains(group: Pid) -> std::io::Result<()> {
+    let deadline = Instant::now() + ZOMBIE_REAP_WAIT;
+    loop {
+        match rustix::process::kill_process_group(group, Signal::Kill) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => return Ok(()),
+            Err(rustix::io::Errno::PERM) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(rustix::io::Errno::PERM) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "process group {} could not be signalled for {}ms after its \
+                         leader exited: either its remaining members are zombies not \
+                         yet reaped, or one runs as another user and cannot be killed \
+                         from here",
+                        group.as_raw_nonzero(),
+                        ZOMBIE_REAP_WAIT.as_millis()
+                    ),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// SIGTERM the group, wait up to `grace` for the leader, SIGKILL the group, and
 /// wait — bounded — for the leader to be reaped.
 ///
@@ -418,7 +459,7 @@ async fn terminate_group(
         // The leader is gone. Signal the group once more anyway — helpers
         // outlive their parent, and "the process we started exited" is not the
         // same claim as "the tree is gone".
-        return signal_group(group, Signal::Kill);
+        return kill_what_remains(group).await;
     }
     signal_group(group, Signal::Kill)?;
     // Bounded, not an open-ended wait. Two reasons: with an unbounded wait, a
@@ -643,11 +684,11 @@ mod tests {
     /// The helper stops touching the file — measured as "the mtime stops
     /// advancing", because the file itself remains.
     ///
-    /// The baseline is taken a moment AFTER the kill: a signal is delivered
-    /// asynchronously, so a `touch` already running when `stop` returned can
-    /// still land. Taking the baseline at once made this read "alive" under
-    /// load (the mutation harness saw it fail on runs where nothing about the
-    /// kill had changed).
+    /// The baseline is taken a moment after the kill, because a signal is
+    /// delivered asynchronously and a `touch` already running when `stop`
+    /// returned could still land. (That was a guess at a flake that turned out
+    /// to be something else — `stop` itself failing with `EPERM`, see
+    /// `kill_what_remains` — but the margin is right on its own terms.)
     async fn helper_stopped(marker: &std::path::Path) -> bool {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let settle = std::time::SystemTime::now();
