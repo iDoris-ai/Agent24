@@ -153,7 +153,9 @@ impl SupervisorHandle {
     ///
     /// [`SupervisorError::StopFailed`] when a run's process could not be
     /// confirmed gone — the slot stays held, so nothing else starts the module
-    /// over it; [`SupervisorError::Panicked`] when the loop itself panicked.
+    /// over it; [`SupervisorError::Panicked`] when the loop itself panicked;
+    /// [`SupervisorError::Killed`] when the loop had been cancelled without a
+    /// stop (its runtime shut down).
     pub async fn stop(mut self) -> Result<(), SupervisorError> {
         let _ = self.stop.send(true);
         if let Some(task) = self.task.take()
@@ -163,10 +165,14 @@ impl SupervisorHandle {
             tracing::error!("the supervisor loop had panicked: {e}");
             return Err(SupervisorError::Panicked);
         }
+        // Only `Stopped` is a clean stop. Anything else at this point — the
+        // task cancelled by its runtime's shutdown (`Killed`), say — is not,
+        // whatever the `JoinError` said (round 9).
         match self.status.borrow().clone() {
+            Status::Stopped => Ok(()),
             Status::StopFailed { error } => Err(SupervisorError::StopFailed { error }),
             Status::Panicked => Err(SupervisorError::Panicked),
-            _ => Ok(()),
+            _ => Err(SupervisorError::Killed),
         }
     }
 }
@@ -176,8 +182,12 @@ impl SupervisorHandle {
 pub enum SupervisorError {
     /// A run's process could not be confirmed gone.
     StopFailed { error: String },
-    /// The supervisor loop panicked (a bug); its module was SIGKILLed.
+    /// The supervisor loop panicked (a bug); its module had a SIGKILL
+    /// attempted.
     Panicked,
+    /// The loop was cancelled without a stop — its runtime shut down, say —
+    /// and its module had a SIGKILL attempted, not waited for.
+    Killed,
 }
 
 impl std::fmt::Display for SupervisorError {
@@ -185,6 +195,9 @@ impl std::fmt::Display for SupervisorError {
         match self {
             Self::StopFailed { error } => write!(f, "{error}"),
             Self::Panicked => f.write_str("the supervisor loop panicked"),
+            Self::Killed => f.write_str(
+                "the supervisor loop was cancelled; its module was SIGKILLed, not confirmed gone",
+            ),
         }
     }
 }
@@ -640,6 +653,13 @@ async fn finish(
     status.send_replace(Status::Stopping);
     match process.stop(timings.stop_grace).await {
         Ok(report) => {
+            // Confirmed gone — recorded first, before anything that could
+            // panic (a log line included): a panic past this point must not
+            // leave a stopped supervisor holding its slot (round 9). Until
+            // `stop` returned — its bounded wait for the output drains
+            // included — the flag stayed set: the fail-closed side.
+            slot.unconfirmed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             if !report.abandoned.is_empty() {
                 tracing::warn!(
                     module = name,
@@ -647,11 +667,6 @@ async fn finish(
                     "requests in flight when the module stopped: outcome unknown"
                 );
             }
-            // Confirmed gone. (Until `stop` returned — its bounded wait for
-            // the output drains included — the flag stayed set: the fail-closed
-            // side.)
-            slot.unconfirmed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         Err(failed) => {
@@ -1075,6 +1090,43 @@ sys.exit(0)
         );
     }
 
+    /// A loop cancelled by its runtime's shutdown is not a clean stop:
+    /// `stop` called afterwards, on another runtime, says so, and the slot —
+    /// its module SIGKILLed, not confirmed gone — stays held (round 9).
+    #[test]
+    fn a_supervisor_cancelled_by_its_runtime_does_not_report_a_clean_stop() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let first = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = first.block_on(async {
+            let h = sup(
+                f.spec.clone(),
+                f.dir.clone(),
+                current.clone(),
+                no_methods(),
+                fast(),
+            );
+            until(&mut h.subscribe(), "Running", |s| *s == Status::Running).await;
+            h
+        });
+        first.shutdown_timeout(Duration::from_secs(10));
+        let second = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(second.block_on(handle.stop()), Err(SupervisorError::Killed));
+        let g = fixture("normal");
+        assert_eq!(
+            supervise(g.spec.clone(), g.dir.clone(), current, no_methods(), fast()).err(),
+            Some(SlotHeld),
+            "the slot was released over a module not confirmed gone"
+        );
+    }
+
     /// A handle dropped while its module runs keeps the slot: the SIGKILL
     /// its drop sends is not waited for, so the module is not confirmed gone
     /// and no successor may start over it. Dropped after giving up — no
@@ -1181,8 +1233,9 @@ sys.exit(0)
             matches!(s, Status::StopFailed { .. })
         })
         .await;
-        // Past a backoff the fast timings would have restarted within.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Well past a backoff the fast timings (10 ms) would have restarted
+        // within.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(
             starts(f.data.path()).len(),
             1,
