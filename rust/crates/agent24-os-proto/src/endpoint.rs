@@ -917,7 +917,10 @@ mod tests {
         let err = answer_within(&mut late, b"x\n", deadline, Duration::from_millis(50))
             .await
             .expect_err("past the write bound");
-        assert!(matches!(err, HandshakeFailed::Write(_)), "{err}");
+        assert!(
+            matches!(&err, HandshakeFailed::Write(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "{err}"
+        );
     }
 
     /// "Exactly 0700" includes the special bits: an otherwise-0700 directory
