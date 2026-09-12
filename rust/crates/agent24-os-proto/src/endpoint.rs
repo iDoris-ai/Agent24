@@ -59,6 +59,9 @@ pub enum EndpointError {
     Timeout,
     /// The process that connected runs as another user.
     ForeignPeer { uid: u32 },
+    /// This process already took over this socket directory: a second
+    /// `create` would empty it under the listeners the first one made.
+    AlreadyCreated(PathBuf),
     /// The OS refused.
     Io(std::io::Error),
 }
@@ -81,6 +84,11 @@ impl std::fmt::Display for EndpointError {
                     "the callback connection came from uid {uid}, not this user"
                 )
             }
+            Self::AlreadyCreated(p) => write!(
+                f,
+                "{} was already taken over by this process; create it once",
+                p.display()
+            ),
             Self::Io(e) => write!(f, "callback endpoint: {e}"),
         }
     }
@@ -103,7 +111,16 @@ impl From<std::io::Error> for EndpointError {
 #[derive(Debug)]
 pub struct CallbackDir {
     path: PathBuf,
+    /// The last generation number handed out. Numbers come from here and
+    /// nowhere else, so a number — and with it a socket path — is never used
+    /// twice by this directory.
+    last: std::sync::atomic::AtomicU64,
 }
+
+/// The socket directories this process has taken over. A second `create` for
+/// one of them would `remove_dir_all` it under listeners the first already
+/// made (PR-Daemon review of #179, L2).
+static TAKEN_OVER: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 impl CallbackDir {
     /// Create (or take over) `<state>/run/<this pid>/`.
@@ -113,24 +130,57 @@ impl CallbackDir {
     /// user cannot rename or replace. Within that, `run/` and the pid directory
     /// are checked here (review of ME3-SUP slice 2, round 1, F8).
     ///
+    /// Once per state directory per process: the pid directory is emptied
+    /// here, so a second call would take the sockets of generations already
+    /// listening away.
+    ///
     /// # Errors
     ///
     /// [`EndpointError::UnsafeDirectory`] if `run/` or the pid directory is not
-    /// this user's alone; [`EndpointError::Io`] if it cannot be made.
+    /// this user's alone; [`EndpointError::AlreadyCreated`] on a second call
+    /// for the same directory; [`EndpointError::Io`] if it cannot be made.
     pub fn create(state: &Path) -> Result<Self, EndpointError> {
         let run = state.join("run");
         private_dir(&run)?;
-        let path = run.join(std::process::id().to_string());
-        if std::fs::symlink_metadata(&path).is_ok() {
+        let path = run.canonicalize()?.join(std::process::id().to_string());
+        {
+            let mut taken = TAKEN_OVER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if taken.contains(&path) {
+                return Err(EndpointError::AlreadyCreated(path));
+            }
+            taken.push(path.clone());
+        }
+        // Held only by a take-over that succeeds: one that fails made no
+        // listener, so nothing it could empty is in use, and a retry once the
+        // cause is fixed must not be refused (review of ME3-SUP slice 3a).
+        match Self::take_over(&path) {
+            Ok(()) => Ok(Self {
+                path,
+                last: std::sync::atomic::AtomicU64::new(0),
+            }),
+            Err(e) => {
+                TAKEN_OVER
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|p| p != &path);
+                Err(e)
+            }
+        }
+    }
+
+    /// Empty a stale pid directory of ours, then (re)make it exactly `0700`.
+    fn take_over(path: &Path) -> Result<(), EndpointError> {
+        if std::fs::symlink_metadata(path).is_ok() {
             // Normalised and checked before it is emptied — the same rule as
             // `run/` (the first version refused an ours-but-0755 pid directory
             // that `run/` would have normalised; review of ME3-SUP slice 2,
             // round 2): only a directory that is this user's is ours to clear.
-            private_dir(&path)?;
-            std::fs::remove_dir_all(&path)?;
+            private_dir(path)?;
+            std::fs::remove_dir_all(path)?;
         }
-        private_dir(&path)?;
-        Ok(Self { path })
+        private_dir(path)
     }
 
     /// The directory.
@@ -139,19 +189,34 @@ impl CallbackDir {
         &self.path
     }
 
-    /// Listen for generation `n`'s callback connection at `<dir>/<n>.sock`.
+    /// Listen for the next generation's callback connection, at
+    /// `<dir>/<n>.sock` with a number this directory has never handed out.
     /// Must be called within a Tokio runtime.
+    ///
+    /// The number is chosen here, not by the caller: taking one as a parameter
+    /// let the same number be listened on again after its first connection had
+    /// been served, and the second connection was served too — "one
+    /// connection per generation" then held only while callers remembered not
+    /// to reuse numbers (PR-Daemon review of #179, L1). Now it holds per
+    /// directory by construction.
     ///
     /// # Errors
     ///
     /// [`EndpointError::PathTooLong`], or the OS refusing to bind.
-    pub fn listen(&self, n: u64) -> Result<CallbackListener, EndpointError> {
+    pub fn listen_next(&self) -> Result<CallbackListener, EndpointError> {
+        let n = self.last.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.listen_at(n)
+    }
+
+    /// Listen at `<dir>/<n>.sock`. Private: a caller-chosen number is what
+    /// [`CallbackDir::listen_next`] exists to rule out.
+    fn listen_at(&self, n: u64) -> Result<CallbackListener, EndpointError> {
         let path = self.path.join(format!("{n}.sock"));
         if path.as_os_str().len() > MAX_SOCKET_PATH {
             return Err(EndpointError::PathTooLong(path));
         }
-        // Nothing is removed first. The directory was emptied when this daemon
-        // started and generation numbers are not reused, so a node at this
+        // Nothing is removed first. The directory was emptied when this
+        // process took it over and numbers are never handed out twice, so a node at this
         // path is not a stale file but someone's live socket — removing it (as
         // the first version did) took a working listener's address away
         // (review of ME3-SUP slice 2, round 1, F5). An address in use fails.
@@ -238,8 +303,9 @@ fn check_private(path: &Path) -> Result<(), EndpointError> {
     Ok(())
 }
 
-/// One generation's listening socket. Its path is removed when it is dropped —
-/// after [`CallbackListener::accept_one`], or unused.
+/// One generation's listening socket. When it is dropped — after
+/// [`CallbackListener::accept_one`], or unused — its path is removed if it
+/// still names this listener's node (see `node`).
 #[derive(Debug)]
 pub struct CallbackListener {
     listener: tokio::net::UnixListener,
@@ -263,7 +329,14 @@ impl CallbackListener {
 
     /// Take the first connection that arrives before `deadline`, then stop
     /// listening: the listener is closed and its path removed before this
-    /// returns, whatever it returns, so a second connection is refused.
+    /// returns, whatever it returns. Exactly one connection is served: a later
+    /// `connect` finds nothing, and one that raced into the backlog is ended
+    /// unserved when the listener closes.
+    ///
+    /// **Pass [`handshake`] the same `deadline`.** A connection can be
+    /// accepted just after it (`timeout_at` polls the accept first); that is
+    /// harmless only because the handshake that follows is bounded by the same
+    /// instant and fails at once.
     ///
     /// # Errors
     ///
@@ -391,6 +464,11 @@ async fn answer_within<W: tokio::io::AsyncWrite + Unpin>(
 /// success, or the refusal and then a disconnect (SPEC §3: *"握手期（首帧）任何
 /// 协议或语义失败一律断连"*).
 ///
+/// A module can receive a complete success line and still be counted as having
+/// missed its startup deadline — when the answer finished past it — and see
+/// the connection close. That is the kernel failing closed at the boundary,
+/// not a protocol error (D1: the connection ending ends the generation).
+///
 /// Ready (`Generation::ready`) is the CALLER's step, taken after this returns
 /// `Ok`: that is after the success line was written, so a module that never
 /// received the agreed version is not counted ready.
@@ -513,7 +591,7 @@ mod tests {
     async fn a_correct_handshake_is_answered_and_the_connection_stays_open() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let listener = dir.listen(1).unwrap();
+        let listener = dir.listen_next().unwrap();
         let path = listener.path().to_owned();
         let module = tokio::spawn(async move {
             let mut conn = UnixStream::connect(&path).await.unwrap();
@@ -558,7 +636,7 @@ mod tests {
     async fn a_wrong_token_is_refused_by_kind_and_disconnected() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let listener = dir.listen(1).unwrap();
+        let listener = dir.listen_next().unwrap();
         let module = tokio::spawn(module_says(
             listener.path().to_owned(),
             initialize_frame("x", "wrong"),
@@ -589,7 +667,7 @@ mod tests {
     async fn a_first_frame_that_is_not_initialize_is_refused_and_disconnected() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let listener = dir.listen(1).unwrap();
+        let listener = dir.listen_next().unwrap();
         let module = tokio::spawn(module_says(
             listener.path().to_owned(),
             r#"{"jsonrpc":"2.0","method":"ping","id":"p","params":{}}"#.to_owned() + "\n",
@@ -616,7 +694,7 @@ mod tests {
     async fn no_first_frame_before_the_deadline_is_a_timeout() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let listener = dir.listen(1).unwrap();
+        let listener = dir.listen_next().unwrap();
         let path = listener.path().to_owned();
         let _module = tokio::spawn(async move {
             let _conn = UnixStream::connect(&path).await.unwrap();
@@ -637,7 +715,7 @@ mod tests {
     async fn after_the_first_connection_a_second_is_refused() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let listener = dir.listen(1).unwrap();
+        let listener = dir.listen_next().unwrap();
         let path = listener.path().to_owned();
         let first = tokio::spawn({
             let path = path.clone();
@@ -664,7 +742,7 @@ mod tests {
     async fn no_connection_before_the_deadline_is_a_timeout_and_leaves_nothing() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let listener = dir.listen(7).unwrap();
+        let listener = dir.listen_next().unwrap();
         let path = listener.path().to_owned();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         let err = listener.accept_one(deadline).await.expect_err("nobody");
@@ -700,12 +778,12 @@ mod tests {
         let s = state();
         let deep = s.path().join("x".repeat(100));
         let dir = CallbackDir::create(&deep).unwrap();
-        let err = dir.listen(1).expect_err("too long");
+        let err = dir.listen_next().expect_err("too long");
         assert!(matches!(err, EndpointError::PathTooLong(_)), "{err}");
         // Control: a short state directory works.
         CallbackDir::create(s.path())
             .unwrap()
-            .listen(1)
+            .listen_next()
             .expect("short enough");
     }
 
@@ -738,7 +816,7 @@ mod tests {
     async fn of_two_early_connections_exactly_one_is_served() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let listener = dir.listen(1).unwrap();
+        let listener = dir.listen_next().unwrap();
         let path = listener.path().to_owned();
         let a = UnixStream::connect(&path).await.expect("first connect");
         let b = UnixStream::connect(&path)
@@ -772,7 +850,7 @@ mod tests {
         std::fs::set_permissions(s.path().join("run"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         let dir = CallbackDir::create(s.path()).expect("ours, so tightened");
-        let listener = dir.listen(1).unwrap();
+        let listener = dir.listen_next().unwrap();
         for p in [
             s.path().join("run"),
             dir.path().to_owned(),
@@ -790,12 +868,15 @@ mod tests {
     async fn a_dropped_listener_does_not_remove_someone_elses_socket() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let first = dir.listen(1).unwrap();
+        let first = dir.listen_at(1).unwrap();
         let path = first.path().to_owned();
         // The same name, bound again: refused while the first holds it.
-        assert!(dir.listen(1).is_err(), "an address in use was taken over");
+        assert!(
+            dir.listen_at(1).is_err(),
+            "an address in use was taken over"
+        );
         std::fs::remove_file(&path).unwrap();
-        let second = dir.listen(1).expect("the name is free again");
+        let second = dir.listen_at(1).expect("the name is free again");
         drop(first);
         assert!(
             path.exists(),
@@ -813,7 +894,7 @@ mod tests {
     async fn a_passed_deadline_wins_over_a_frame_already_waiting() {
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let listener = dir.listen(1).unwrap();
+        let listener = dir.listen_next().unwrap();
         let mut module = UnixStream::connect(listener.path()).await.unwrap();
         module
             .write_all(initialize_frame("late", "s3cret").as_bytes())
@@ -942,5 +1023,83 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(mode, 0o700, "{mode:o}");
+    }
+
+    /// Every listener gets a number the directory has not handed out before:
+    /// the sequence "listen, serve one, listen on that number again, serve a
+    /// second" cannot be written any more (PR-Daemon review of #179, L1).
+    #[tokio::test]
+    async fn every_listener_gets_a_path_never_used_before() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let paths: Vec<PathBuf> = (0..5)
+            .map(|_| dir.listen_next().unwrap().path().to_owned())
+            .collect();
+        let unique: std::collections::BTreeSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "{paths:?}");
+    }
+
+    /// A second take-over of the same directory is refused — it would empty
+    /// the directory under a listener the first one made — and that listener's
+    /// socket is still there afterwards (PR-Daemon review of #179, L2).
+    #[tokio::test]
+    async fn a_socket_directory_is_taken_over_once() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let listener = dir.listen_next().unwrap();
+        let err = CallbackDir::create(s.path()).expect_err("a second take-over");
+        assert!(matches!(err, EndpointError::AlreadyCreated(_)), "{err}");
+        assert!(
+            listener.path().exists(),
+            "the first listener's socket was removed"
+        );
+    }
+
+    /// Whatever the module sends right behind its `initialize` — pipelined in
+    /// the same write — is still there to read after the handshake: the reader
+    /// handed back keeps what it buffered past the first line. SUP-3 serves
+    /// the connection from that reader.
+    #[tokio::test]
+    async fn bytes_sent_right_after_initialize_survive_the_handshake() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let listener = dir.listen_next().unwrap();
+        let mut module = UnixStream::connect(listener.path()).await.unwrap();
+        let next = r#"{"jsonrpc":"2.0","id":"2","method":"t/next","params":{}}"#;
+        module
+            .write_all(format!("{}{next}\n", initialize_frame("1", "s3cret")).as_bytes())
+            .await
+            .unwrap();
+        let stream = listener.accept_one(soon()).await.unwrap();
+        let mut done = handshake(stream, &expectation(), soon())
+            .await
+            .expect("handshake");
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), done.reader.read_line(&mut line))
+            .await
+            .expect("the pipelined line was lost")
+            .unwrap();
+        assert_eq!(line.trim_end(), next);
+    }
+
+    /// A take-over that fails does not hold the directory: once the cause is
+    /// fixed, the next `create` succeeds (review of ME3-SUP slice 3a).
+    #[tokio::test]
+    async fn a_failed_take_over_can_be_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = state();
+        let run = s.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A file where the pid directory goes: `private_dir` refuses it.
+        let pid_path = run
+            .canonicalize()
+            .unwrap()
+            .join(std::process::id().to_string());
+        std::fs::write(&pid_path, b"").unwrap();
+        CallbackDir::create(s.path()).expect_err("a file is not a directory");
+        std::fs::remove_file(&pid_path).unwrap();
+        let dir = CallbackDir::create(s.path()).expect("the retry was refused");
+        assert!(dir.listen_next().is_ok());
     }
 }

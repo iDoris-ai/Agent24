@@ -26,4 +26,5 @@ pub mod launch;
 pub mod proxy;
 pub mod rpc;
 pub mod supervise;
+pub mod supervisor;
 pub mod version;

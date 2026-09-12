@@ -50,6 +50,11 @@ pub const BASE_BACKOFF: Duration = Duration::from_millis(500);
 /// as "wait a bit more".
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long an `EPERM` from signalling the group may take to turn into "the
+/// leader has exited" (see `ModuleProcess::signal_settling`). ⚖️ Exiting takes
+/// microseconds to milliseconds; a real permission problem does not go away.
+const EXIT_SETTLE: Duration = Duration::from_millis(200);
+
 /// How many consecutive failures trip the breaker.
 pub const BREAKER_THRESHOLD: u32 = 5;
 
@@ -108,6 +113,8 @@ pub enum Stopped {
 pub struct RestartPolicy {
     consecutive: u32,
     first_failure_at: Option<Instant>,
+    /// The first delay; doubles per consecutive failure.
+    base: Duration,
 }
 
 impl Default for RestartPolicy {
@@ -120,9 +127,17 @@ impl RestartPolicy {
     /// A policy that has seen nothing yet.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_base(BASE_BACKOFF)
+    }
+
+    /// A policy whose first delay is `base` instead of [`BASE_BACKOFF`] — for
+    /// tests, which cannot wait out half a second times fifteen.
+    #[must_use]
+    pub fn with_base(base: Duration) -> Self {
         Self {
             consecutive: 0,
             first_failure_at: None,
+            base,
         }
     }
 
@@ -177,7 +192,7 @@ impl RestartPolicy {
         // cannot happen today for the same reason the cap cannot; it is written
         // this way so it stays true if the threshold moves.
         let factor = 1u32.saturating_mul(1 << (self.consecutive - 1).min(16));
-        Decision::RestartAfter(BASE_BACKOFF.saturating_mul(factor))
+        Decision::RestartAfter(self.base.saturating_mul(factor))
     }
 
     /// Consecutive failures so far. For logging; the decision is
@@ -411,15 +426,38 @@ impl ModuleProcess {
         if self.exit.is_some() {
             return Ok(self.exit);
         }
-        let status = waitid(
-            WaitId::Pid(self.group),
-            WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
-        )?;
+        // `NOHANG` does not block, so an interrupt is rare — but one must not
+        // be what stands between `Drop` and the SIGKILL it owes (review of
+        // ME3-SUP slice 3a). Any other error leaves the question open, and an
+        // open question means the group id is not known to be ours.
+        // Bounded: a destructor must not spin forever under a signal storm.
+        let mut tries = 0;
+        let status = loop {
+            match waitid(
+                WaitId::Pid(self.group),
+                WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
+            ) {
+                Err(rustix::io::Errno::INTR) if tries < 64 => tries += 1,
+                other => break other?,
+            }
+        };
         self.exit = status.map(|st| Exit {
             code: st.exit_status().and_then(|c| i32::try_from(c).ok()),
             signal: st.terminating_signal().and_then(|c| i32::try_from(c).ok()),
         });
         Ok(self.exit)
+    }
+
+    /// The synchronous first step of [`ModuleProcess::stop`]: revoke this
+    /// process's generation now, keeping the permit for the kill. For a caller
+    /// that must report "stopping" only once new work is already refused;
+    /// `stop` then goes on from here. `false` if the generation was revoked by
+    /// someone else (then `stop` reports it).
+    pub(crate) fn begin_stop(&mut self) -> bool {
+        if self.revocation.is_none() {
+            self.revocation = self.generation.revoke();
+        }
+        self.revocation.is_some()
     }
 
     /// Has the leader exited?
@@ -464,7 +502,21 @@ impl ModuleProcess {
     /// failed attempt would leave a revoked generation nobody could legally
     /// retry killing. A retry after the leader was reaped only probes the group
     /// again; it sends no signal (see the type's docs).
-    pub async fn stop(mut self, grace: Duration) -> Result<StopReport, StopFailed> {
+    pub async fn stop(self, grace: Duration) -> Result<StopReport, StopFailed> {
+        self.stop_then(grace, || {}).await
+    }
+
+    /// [`ModuleProcess::stop`], calling `gone` the moment the group is
+    /// confirmed empty — synchronously, before the bounded wait for the output
+    /// drains that follows. For a caller that must record "no process left" at
+    /// the point it becomes true: a cancellation during the drain wait would
+    /// otherwise find it unrecorded (review of ME3-SUP slice 3a, round 10).
+    pub(crate) async fn stop_then(
+        mut self,
+        grace: Duration,
+        gone: impl FnOnce(),
+    ) -> Result<StopReport, StopFailed> {
+        self.begin_stop();
         if self.revocation.is_none() {
             match self.generation.revoke() {
                 Some(r) => self.revocation = Some(r),
@@ -491,6 +543,7 @@ impl ModuleProcess {
                 process: Box::new(self),
             });
         }
+        gone();
         self.finish_drains().await;
         let Some(Revocation {
             permit,
@@ -516,12 +569,12 @@ impl ModuleProcess {
         if !self.reaped {
             // The leader is unreaped: the group id is ours.
             let exited_already = self.leader_exited()?;
-            self.signal(Signal::Term, exited_already)?;
+            self.signal_settling(Signal::Term, exited_already).await?;
             let exited = exited_already || self.leader_exits_within(grace).await?;
             // Once more even if the leader went on TERM: helpers outlive their
             // parent, and "the process we started exited" is not the claim "the
             // tree is gone".
-            self.signal(Signal::Kill, exited)?;
+            self.signal_settling(Signal::Kill, exited).await?;
             if !exited && !self.leader_exits_within(REAP_TIMEOUT).await? {
                 // Bounded, not an open-ended wait: SIGKILL does not guarantee
                 // reaping — a process blocked in an uninterruptible state stays
@@ -565,6 +618,31 @@ impl ModuleProcess {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
             Err(rustix::io::Errno::PERM) if leader_exited || self.leader_exited()? => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// [`ModuleProcess::signal`], giving an `EPERM` a moment to settle.
+    ///
+    /// **On macOS a leader in the middle of exiting answers `killpg` with
+    /// `EPERM` too** — before it is a zombie, so `leader_exited` still says
+    /// no. A module that closes its callback and exits is stopped in exactly
+    /// that window: the supervisor sees the connection end first. Measured: 3
+    /// of 6 runs of one SUP-3a crash-loop test, found once `Supervisor` stopped
+    /// swallowing a failed stop. The leader is looked at again every few
+    /// milliseconds for [`EXIT_SETTLE`]; a member really running as another
+    /// user keeps answering `EPERM` with the leader alive, and still fails.
+    async fn signal_settling(&mut self, sig: Signal, leader_exited: bool) -> std::io::Result<()> {
+        let deadline = Instant::now() + EXIT_SETTLE;
+        loop {
+            match self.signal(sig, leader_exited) {
+                Err(e)
+                    if e.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error())
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                other => return other,
+            }
         }
     }
 
@@ -641,6 +719,16 @@ impl Drop for ModuleProcess {
                     Ok(()) => "SIGKILL sent".to_owned(),
                     Err(e) => format!("SIGKILL failed: {e}"),
                 },
+                // Only interrupts kept the answer from us. The leader is still
+                // unreaped — only this owner reaps it — so the group id is
+                // still ours, and the kill is owed (review of ME3-SUP slice 3a,
+                // round 3). Any other error leaves ownership unknown.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    match self.signal(Signal::Kill, false) {
+                        Ok(()) => "SIGKILL sent (leader state unknown: interrupted)".to_owned(),
+                        Err(e) => format!("SIGKILL failed: {e}"),
+                    }
+                }
                 Err(e) => format!("could not tell whether the leader exited: {e}"),
             }
         };

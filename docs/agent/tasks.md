@@ -78,8 +78,10 @@
   - **D4 每一代新 bind 一个端口**：代理按代取上游地址（FU-50 随之闭上；旧一代 backlog 里的请求不会被新进程执行）
 - **切成五刀**（SUP-1、SUP-2 可并行；解除挂载拒绝在 SUP-4；ME-3g 与签名都不是它的前提 —— F4e 是正确性问题，不是 §0 意义上的安全问题）：
   - **SUP-1 进程所有权 + 启动加固** `DONE` — [#178](https://github.com/iDoris-ai/Agent24/pull/178)（`f86b9d4`，2026-09-12；PR 前 Codex 3 轮 + 5 次窄范围复核，外部评审一次 REQUEST_CHANGES（B1：generation 可被共享）后 APPROVE）：`ModuleProcess` 是子进程与它那一代的唯一持有者，只有 `stop(self)` 能杀，而它先撤销**自己那一代**；`revoke` 收成 crate 内可见（FU-46）；drop 也是先撤后杀；spawn 清环境变量到白名单、监听 socket 作为 fd 3、经跳板启动（其余 fd 在子进程一侧标 close-on-exec）、stdin 为 null、stdout/stderr 限行长限速率读走；整棵包目录树属主校验（安装器配套去掉组/其他写权限）；组没清完不收尸、stop 取消安全且以「组已空」为成功；`RestartPolicy::ready` 改为 `ran`（在进程结束时调用，否则计数永不清零）
-  - **SUP-2 回调端点 + 握手驱动** `PR_OPEN` — [#179](https://github.com/iDoris-ai/Agent24/pull/179)：UDS 目录 `0700` 且校验属主、每代一个短路径、只 accept 一次；握手失败先写错误行再断连；`initialize` 的 id 改字符串；`rpc::serve` 加停止输入
-  - **SUP-3 `Supervisor` 循环**：起 → 握手 → ready → 服务 → 崩溃退避/熔断 → 停，放在库里用 mock 模块测；每代新端口（D4）；FU-44/47/49/50；新建 `publish = false` 的 mock 模块 crate
+  - **SUP-2 回调端点 + 握手驱动** `DONE` — [#179](https://github.com/iDoris-ai/Agent24/pull/179)（`a108de3`，2026-09-13；批准时的 Low/Info 在 SUP-3a 分支第一个提交收掉）：UDS 目录 `0700` 且校验属主、每代一个短路径、只 accept 一次；握手失败先写错误行再断连；`initialize` 的 id 改字符串；`rpc::serve` 加停止输入
+  - **SUP-3 `Supervisor` 循环**（2026-09-13 再拆两刀：两者合在一起远超可审规模 —— 代理的上游地址今天在挂载时写死，改动面近百处）：
+    - **SUP-3a Supervisor 循环** `PR_OPEN`（分支 `feat/me3-sup-3-supervisor`；PR 前 Codex 11 轮，第 5 轮起把「接管」协议换成「一个槽位一个 Supervisor」）：一个模块的一生 —— 换上新的一代 → 绑新端口（D4）→ 监听回调 → 经跳板启动 → 限时握手 → ready → 以绑定到这一代的 `Methods` 服务回调连接（FU-49）→ 等「进程退出 / 回调断开（D1）/ 收到停止」之一 → 先撤后杀 → 退避重启或熔断；`SupervisorHandle { stop, status }`；FU-44 端到端；用 Python 写的模拟模块测
+    - **SUP-3b 代理按代取上游地址**：`Generation` 带上它那一代的端口，代理每个请求从准入的那一代取地址（D4）；每请求一条上游连接、响应提交或放弃时中止（FU-47、FU-50）
   - **SUP-4 接进 daemon，解除挂载拒绝**：`Installed` 分进程内/进程外两种；绊线测试挪到真实路径；daemon 退出时有界地等所有 Supervisor 停完（否则子进程成孤儿）
   - **SUP-5 热 disable**：`os disable` 对运行中的进程外模块走两阶段停止；CLI help、`os_routes.rs` 文档、`restart_required` 的承诺同时到期
 - **SUP-1 验收**（每条带正对照，变异验证）：外部拿不到许可证、调不了 `revoke`、碰不到子进程（5 条 `compile_fail`，各被对应变异单独弄红，对照 `stop` 能编译）；子进程环境里没有父进程的 `CARGO_MANIFEST_DIR`，只有白名单与 `A24_*`；fd 3 上能 accept；子进程只开着 fd 0–3；模块死后端口立刻拒绝；往 stderr 灌 2 MiB 不阻塞；他人可写的包目录 / `bin/` / 程序被拒；`stop` 撤销的是自己那一代并报告 abandoned / never_sent；drop 先撤后杀；首领按时退出、忽略 SIGTERM 的助手仍被杀

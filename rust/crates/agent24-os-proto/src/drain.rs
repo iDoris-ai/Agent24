@@ -467,6 +467,8 @@ impl Abandoned {
 #[derive(Debug)]
 pub struct Current {
     slot: Mutex<Arc<Generation>>,
+    /// Whether a supervisor holds this slot (see `claim`).
+    held: std::sync::atomic::AtomicBool,
 }
 
 impl Current {
@@ -474,7 +476,39 @@ impl Current {
     pub fn new(generation: Arc<Generation>) -> Arc<Self> {
         Arc::new(Self {
             slot: Mutex::new(generation),
+            held: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Become the one supervisor of this slot and install `placeholder`, or
+    /// `false` if a supervisor holds it already. One at a time, by
+    /// construction: a second supervisor started while the first winds down
+    /// would run a second process on the same data directory — for as long as
+    /// the first failed to die (review of ME3-SUP slice 3a, rounds 2–5, which
+    /// tried a takeover protocol instead and kept finding its gaps).
+    pub(crate) fn claim(&self, placeholder: Arc<Generation>) -> bool {
+        if self
+            .held
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        // Out goes the caller's initial generation, or the last one of the
+        // previous supervisor, which stopped (and revoked it) before releasing.
+        let _previous = self.replace(placeholder);
+        true
+    }
+
+    /// Give the slot up: the supervisor holds no process that is not
+    /// confirmed gone (see `supervisor::Exit`).
+    pub(crate) fn release(&self) {
+        self.held.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[must_use]
@@ -492,8 +526,12 @@ impl Current {
     /// Does NOT revoke the old one: whoever stops a run revokes it, through the
     /// one path that yields a [`KillPermit`]. Revoking here as well would be a
     /// second place that decides when a module may be killed.
+    ///
+    /// Crate-private: the slot's supervisor (see `claim`) is the only writer,
+    /// and a public `replace` let anyone put a generation there behind its
+    /// back (review of ME3-SUP slice 3a, round 6).
     #[must_use]
-    pub fn replace(&self, next: Arc<Generation>) -> Arc<Generation> {
+    pub(crate) fn replace(&self, next: Arc<Generation>) -> Arc<Generation> {
         std::mem::replace(
             &mut *self
                 .slot
