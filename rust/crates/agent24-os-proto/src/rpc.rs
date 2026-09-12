@@ -52,8 +52,12 @@ use crate::initialize::INITIALIZE_METHOD;
 /// **SPEC gives no number** (§3: "并发上限见 §5"; §5 has none), so this is a
 /// choice, recorded as one (⚖️) in SPEC's ME-3c table. What it bounds is memory:
 /// each in-flight call holds its parsed params (from a frame of at most
-/// [`MAX_FRAME_BYTES`]) and, when done, a queued response of at most the same —
-/// so on the order of 64 × 2 MiB per connection. 64 is the proxy's per-module
+/// [`MAX_FRAME_BYTES`]) and, when done, a queued response within the frame
+/// limit. **Parsed params are not frame-sized**: a 1 MiB `{"a":[0,0,…]}` parses
+/// to 524 278 `Value`s of 32 bytes, over 15 MiB (review F4 @ #176), so once a
+/// method accepts array params this ceiling is near 1 GiB per connection. No
+/// method does yet (the offer set is empty); before the first one does (ME-3d),
+/// bound in-flight params by bytes or cap one call's params (FU-53). 64 is the proxy's per-module
 /// ceiling too; that is symmetry, **not** a guarantee that callbacks cannot
 /// outnumber requests — nothing ties the two, and background work (§5) has no
 /// request at all.
@@ -175,7 +179,10 @@ impl RpcError {
     pub fn method_not_found(method: &str) -> Self {
         Self::protocol(
             code::METHOD_NOT_FOUND,
-            format!("method not found: this daemon does not provide `{method}`"),
+            format!(
+                "method not found: this daemon does not provide `{}`",
+                clip(method)
+            ),
         )
     }
 
@@ -389,7 +396,7 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &dyn Fn(&str) -> boo
         }
         return respond_null(RpcError::invalid_request(format!(
             "duplicate key `{}` in the request",
-            path[0]
+            clip(&path[0])
         )));
     }
     let duplicate_in_params = duplicate
@@ -489,16 +496,24 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &dyn Fn(&str) -> boo
     }
 }
 
+/// Longest error message [`serve`] writes, whoever wrote the message — the
+/// `…` that marks a cut included.
+const MAX_MESSAGE_BYTES: usize = 1024;
+
 /// Longest string echoed back from a request into an error message. A message
 /// that repeats an attacker-chosen string in full could itself exceed the frame
 /// limit (a 1 MiB method name, echoed, is a response over 1 MiB).
 const ECHO_LIMIT: usize = 128;
 
 fn clip(s: &str) -> String {
-    if s.len() <= ECHO_LIMIT {
+    clip_to(s, ECHO_LIMIT)
+}
+
+fn clip_to(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
         return s.to_owned();
     }
-    let mut end = ECHO_LIMIT;
+    let mut end = limit;
     while !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -628,6 +643,15 @@ impl<'de> Visitor<'de> for NoDup<'_> {
 /// milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
+    /// Calls accepted whose handler has not yet been reaped. An id leaves the
+    /// table when its handler is reaped, before its response is queued, so the
+    /// count never exceeds what the peer sees as unanswered: a peer with at
+    /// most `max_in_flight - 1` unanswered calls always has the next one
+    /// accepted. The converse does not hold — responses queued but not yet
+    /// delivered are not counted (their memory is bounded by the queue's
+    /// high-water mark instead). For a peer that sends more than the limit
+    /// without waiting, how many are `busy` depends on how fast handlers finish
+    /// and on scheduling.
     pub max_in_flight: usize,
     pub call_timeout: Duration,
     /// How long one response may take to be written before the connection is
@@ -727,7 +751,18 @@ impl<T> Drop for AbortOnDrop<T> {
 /// limit is replaced by an error for the same id — the peer applies the same
 /// framing rule and would disconnect on it (SPEC §5: limits in both
 /// directions).
-fn response_line(response: Response) -> Vec<u8> {
+///
+/// Before that, an error message longer than [`MAX_MESSAGE_BYTES`] is cut. The
+/// echoes this module writes are clipped where they are made, but a message can
+/// also come from a handler — a params check that quotes the bad value, a
+/// call's own error — and without this cut a long quote would turn the peer's
+/// `-32602` into the frame-limit `-32603` (review of f2b4e2e, M1).
+fn response_line(mut response: Response) -> Vec<u8> {
+    if let Err(e) = &mut response.outcome
+        && e.message.len() > MAX_MESSAGE_BYTES
+    {
+        e.message = clip_to(&e.message, MAX_MESSAGE_BYTES - '…'.len_utf8());
+    }
     let line = response.to_line();
     if line.len() <= MAX_FRAME_BYTES + 1 {
         return line;
@@ -751,24 +786,30 @@ fn response_line(response: Response) -> Vec<u8> {
 /// - **Frames come from a dedicated reader task.** `read_frame_async` is not
 ///   cancel-safe; racing it in the `select!` below would drop a half-read frame
 ///   and desynchronise the stream.
-/// - **Responses go to a dedicated writer task through a bounded queue**, and
-///   each write has a deadline. A module that stops reading must not freeze this
-///   loop — with the writer inline, a full socket buffer blocks the loop, which
-///   then stops reading frames, so a cancel or a close is never seen. A full
-///   queue or a write past its deadline ends the connection instead.
+/// - **Responses go to a dedicated writer task** through an unbounded channel
+///   whose bytes are counted, and each write has a deadline. A module that
+///   stops reading must not freeze this loop — with the writer inline, a full
+///   socket buffer blocks the loop, which then stops reading frames, so a
+///   cancel or a close is never seen. Over the high-water mark the loop stops
+///   taking reader events (below); a write past its deadline ends the
+///   connection.
 /// - **Handlers run directly in a `JoinSet` owned here** — one task each, no
 ///   nesting. Cancelling aborts the task and the `cancelled` response is sent
 ///   when the set reports the task finished, i.e. after the handler future has
 ///   been dropped. On return, `shutdown().await` waits for every task to finish,
 ///   so no handler future outlives the connection.
 /// - **`biased`, frames first**: when an end-of-stream and a finished call are
-///   ready together, the end wins, and nothing more is written.
+///   ready together, the end wins, and nothing more is written. **Not over the
+///   high-water mark**: there no reader event is taken at all — a frame, an
+///   end-of-stream, a read error and an over-long line all wait for the queue
+///   to drain, and if the writer's deadline expires first the connection ends
+///   as `WriteFailed`, not as what the reader saw.
 pub async fn serve<R, W>(reader: R, writer: W, methods: Methods, limits: Limits) -> Ended
 where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, FrameError>>(1);
+    let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<Frame>(1);
     let _reader = AbortOnDrop(tokio::spawn(async move {
         let mut reader = reader;
         loop {
@@ -779,7 +820,27 @@ where
             }
         }
     }));
+    run(&mut frames_rx, writer, methods, limits).await
+}
 
+/// One reader event: a frame, or how the stream ended.
+type Frame = Result<Vec<u8>, FrameError>;
+
+/// The loop of [`serve`], fed by a channel of reader events rather than by the
+/// reader itself. Tests hand it a channel with frames already waiting, which
+/// makes paths that in production depend on the reader task running on
+/// another thread (a frame ready at the reaping step; frames ready every time
+/// the loop looks) happen on every run instead of on some — and, the channel
+/// being borrowed, can count afterwards how many frames were never read.
+async fn run<W>(
+    frames_rx: &mut tokio::sync::mpsc::Receiver<Frame>,
+    writer: W,
+    methods: Methods,
+    limits: Limits,
+) -> Ended
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     // The response queue is bounded by BYTES, and the bound is enforced by not
     // READING, never by waiting: while more than `QUEUE_HIGH_WATER` bytes are
     // waiting to be written, no new frame is read — but finished calls are still
@@ -843,15 +904,33 @@ where
     // call. Unbounded, that lets a peer that never stops sending starve every
     // finished call of its response (and its slot) — so after this many frames
     // in a row, one finished call is reaped before the next frame. The next
-    // reader event is looked at FIRST: an end-of-stream still wins.
+    // reader event is looked at FIRST: an end-of-stream still wins (under the
+    // high-water mark; over it reader events wait — see `serve`).
     let mut frames_in_a_row = 0usize;
 
     let ended = 'conn: loop {
         if frames_in_a_row >= FRAMES_BEFORE_REAPING {
             frames_in_a_row = 0;
-            let stashed = frames_rx.try_recv().ok();
+            // Under the high-water mark only, as in the select below: taking a
+            // frame here regardless let every 16th frame's response push the
+            // queue further past the mark (review F2 @ #176).
+            let stashed =
+                if queued.load(std::sync::atomic::Ordering::SeqCst) < limits.queue_high_water {
+                    frames_rx.try_recv().ok()
+                } else {
+                    None
+                };
             if let Some(Err(end)) = stashed {
                 break conn_end(end);
+            }
+            // The select below is biased to frames, so it sees a dead writer only
+            // when no frame is ready. A peer that sends nothing but
+            // notifications never enqueues a response whose send would fail —
+            // without this look, it kept the connection reading after the writer
+            // had died (review F3 @ #176).
+            if writer_task.0.is_finished() {
+                writer_done = true;
+                break writer_failed((&mut writer_task.0).await);
             }
             if let Some(joined) = conn.handlers.try_join_next_with_id()
                 && let Some(response) = conn.finished(joined)
@@ -883,9 +962,7 @@ where
             },
             e = &mut writer_task.0 => {
                 writer_done = true;
-                break 'conn Ended::WriteFailed(
-                    e.unwrap_or_else(|_| std::io::Error::other("the writer task failed")),
-                );
+                break 'conn writer_failed(e);
             }
             Some(joined) = conn.handlers.join_next_with_id(), if !conn.handlers.is_empty() => {
                 frames_in_a_row = 0;
@@ -918,9 +995,15 @@ const FRAMES_BEFORE_REAPING: usize = 16;
 /// Bytes waiting to be written above which [`serve`] stops reading frames
 /// (production value of [`Limits::queue_high_water`]). Two
 /// frames' worth: enough that one maximal response never pauses reading on its
-/// own. The queue can still exceed it by the responses of calls already in
-/// flight — at most `max_in_flight` of them, each within the frame limit.
+/// own. It is checked before each frame is read, so the queue can exceed it by
+/// the immediate response to the one frame read just under it, plus the
+/// responses of calls already in flight — at most `max_in_flight` of them —
+/// each within the frame limit.
 pub const QUEUE_HIGH_WATER: usize = 2 * MAX_FRAME_BYTES;
+
+fn writer_failed(joined: Result<std::io::Error, tokio::task::JoinError>) -> Ended {
+    Ended::WriteFailed(joined.unwrap_or_else(|_| std::io::Error::other("the writer task failed")))
+}
 
 fn conn_end(end: FrameError) -> Ended {
     match end {
@@ -2367,5 +2450,185 @@ mod tests {
         assert!(second.contains("cancelled"), "{second}");
         assert!(hang.dropped.load(Ordering::SeqCst));
         task.abort();
+    }
+
+    // ── review of #176 (approved; non-blocking F2, F3, F5) ────────────────
+
+    /// F5: a method name or an envelope key is the peer's string, and the error
+    /// that names it is capped like every other echo — a 200 KiB method name is
+    /// still `-32601`, not a 200 KiB message (or, near the frame limit, a
+    /// `-32603` for a response that grew too big).
+    #[test]
+    fn a_huge_method_name_or_repeated_key_is_echoed_clipped() {
+        let long = "m".repeat(200 * 1024);
+        let frame = serde_json::to_vec(&req("a", &long, json!({}))).unwrap();
+        let Dispatch::Respond(r) = dispatch(&frame, &fixture().methods, &|_| false) else {
+            panic!("an unknown method must be answered")
+        };
+        let e = r.outcome.unwrap_err();
+        assert_eq!(e.code, code::METHOD_NOT_FOUND);
+        assert!(e.message.len() < 256, "{} bytes", e.message.len());
+
+        let key = "k".repeat(300 * 1024);
+        let frame =
+            format!(r#"{{"jsonrpc":"2.0","id":"a","method":"t/echo","{key}":1,"{key}":2}}"#);
+        let Dispatch::Respond(r) = dispatch(frame.as_bytes(), &fixture().methods, &|_| false)
+        else {
+            panic!("a repeated key must be answered")
+        };
+        let e = r.outcome.unwrap_err();
+        assert_eq!(e.code, code::INVALID_REQUEST);
+        assert!(e.message.contains("duplicate key"), "{}", e.message);
+        assert!(e.message.len() < 256, "{} bytes", e.message.len());
+    }
+
+    /// Records that its params check ran — which happens inside `dispatch`, in
+    /// the loop itself, the moment its frame is read.
+    struct Probe {
+        seen: Arc<AtomicBool>,
+    }
+    impl Handler for Probe {
+        fn check_params(&self, _: &Value) -> Result<(), String> {
+            self.seen.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn call(&self, _: Value) -> CallFuture {
+            Box::pin(async move { Ok(Value::Null) })
+        }
+    }
+
+    fn frame_of(v: &Value) -> Frame {
+        Ok(serde_json::to_vec(v).unwrap())
+    }
+
+    /// F2: over the high-water mark no frame is read — including by the reaping
+    /// step every 16 frames. Sixteen requests, answered at once, fill the queue
+    /// to the mark behind a writer that never finishes a write; the seventeenth
+    /// frame is already waiting when the reaping step runs. It must stay unread.
+    ///
+    /// Fed through `run` with every frame queued up front: through `serve`, the
+    /// seventeenth frame is ready at that moment only if the reader task ran on
+    /// another thread in time — the first version of this test depended on that
+    /// and was not reliably red on its mutant (review of f2b4e2e, L2).
+    #[tokio::test]
+    async fn the_reaping_step_does_not_read_past_the_high_water_mark() {
+        let seen = Arc::new(AtomicBool::new(false));
+        let methods = fixture()
+            .methods
+            .with("t/probe", Arc::new(Probe { seen: seen.clone() }));
+        let one = response_line(Response::error(
+            Some("00".to_owned()),
+            RpcError::method_not_found("t/none"),
+        ))
+        .len();
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        for i in 0..16 {
+            tx.send(frame_of(&req(&format!("{i:02}"), "t/none", json!({}))))
+                .await
+                .unwrap();
+        }
+        tx.send(frame_of(&req("16", "t/probe", json!({}))))
+            .await
+            .unwrap();
+        let writer = StuckWriter {
+            entered: Arc::new(AtomicBool::new(false)),
+            _dropped: SetOnDrop(Arc::new(AtomicBool::new(false))),
+        };
+        let task = tokio::spawn(async move {
+            let mut rx = rx;
+            let limits = Limits {
+                queue_high_water: 16 * one,
+                ..TEST_LIMITS
+            };
+            run(&mut rx, writer, methods, limits).await
+        });
+        // The loop takes the sixteen frames and reaches the reaping step in one
+        // poll, so once they are gone the reaping step has run.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while tx.capacity() < 31 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop never took the first sixteen frames"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !seen.load(Ordering::SeqCst),
+            "a frame was read with the queue at the high-water mark"
+        );
+        assert_eq!(
+            tx.capacity(),
+            31,
+            "precondition: exactly the seventeenth frame is still waiting"
+        );
+        task.abort();
+    }
+
+    /// F3: a writer that has died is noticed even while frames keep coming —
+    /// here notifications, which never enqueue a response whose send would
+    /// fail. While a frame is waiting, the biased select takes it and never
+    /// polls the writer branch; only the reaping step's look catches the dead
+    /// writer. With 100 000 notifications queued up front, the loop must stop
+    /// long before it has read them all — without the look it reads every one
+    /// and notices only when the channel runs dry. (Through `serve`, frames are
+    /// waiting only while the reader stays ahead on another thread; the first
+    /// version of this test, and a second with a refilling producer, both let
+    /// the channel run dry and survived their mutant — review of f2b4e2e, L3.)
+    #[tokio::test]
+    async fn a_dead_writer_is_noticed_while_frames_keep_coming() {
+        // The writer runs, and dies, the first time the loop yields — on a
+        // current-thread runtime, when tokio's coop budget (128 in 1.53) runs
+        // out. Before that the loop takes up to budget × 16/15 frames (the
+        // reaping step's `try_recv` spends no budget), then at most 16 more to
+        // its next reaping step; "more than half unread" therefore holds for any
+        // budget below about 46 000.
+        const NOTES: usize = 100_000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(NOTES + 1);
+        // One request, so the writer has a line to fail on.
+        tx.send(frame_of(&req("x", "t/none", json!({}))))
+            .await
+            .unwrap();
+        let note = serde_json::to_vec(&json!({"jsonrpc": "2.0", "method": "t/none"})).unwrap();
+        for _ in 0..NOTES {
+            tx.send(Ok(note.clone())).await.unwrap();
+        }
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            run(&mut rx, FailingWriter, fixture().methods, TEST_LIMITS),
+        )
+        .await
+        .expect("the connection never ended");
+        assert!(
+            matches!(&ended, Ended::WriteFailed(e) if e.to_string() == "write boom"),
+            "{ended:?}"
+        );
+        let unread = rx.len();
+        assert!(
+            unread > NOTES / 2,
+            "the loop read {} notifications after its writer died",
+            NOTES - unread
+        );
+    }
+
+    /// M1 (review of f2b4e2e): a message this module did not clip — a params
+    /// check that quotes the bad value — is cut where responses are written, so
+    /// a long quote still reaches the peer as `-32602`, not as the frame-limit
+    /// `-32603`.
+    #[test]
+    fn a_long_message_from_a_handler_is_cut_not_turned_into_an_internal_error() {
+        let quote = "v".repeat(2 * MAX_FRAME_BYTES);
+        let line = response_line(Response::error(
+            Some("a".to_owned()),
+            RpcError::invalid_params(format!("bad value: {quote}")),
+        ));
+        let v: Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(code_of(&v), i64::from(code::INVALID_PARAMS), "{v}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("bad value: v"), "{message}");
+        assert!(
+            message.len() <= MAX_MESSAGE_BYTES,
+            "{} bytes",
+            message.len()
+        );
     }
 }
