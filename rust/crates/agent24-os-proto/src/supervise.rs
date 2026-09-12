@@ -108,6 +108,8 @@ pub enum Stopped {
 pub struct RestartPolicy {
     consecutive: u32,
     first_failure_at: Option<Instant>,
+    /// The first delay; doubles per consecutive failure.
+    base: Duration,
 }
 
 impl Default for RestartPolicy {
@@ -120,9 +122,17 @@ impl RestartPolicy {
     /// A policy that has seen nothing yet.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_base(BASE_BACKOFF)
+    }
+
+    /// A policy whose first delay is `base` instead of [`BASE_BACKOFF`] — for
+    /// tests, which cannot wait out half a second times fifteen.
+    #[must_use]
+    pub fn with_base(base: Duration) -> Self {
         Self {
             consecutive: 0,
             first_failure_at: None,
+            base,
         }
     }
 
@@ -177,7 +187,7 @@ impl RestartPolicy {
         // cannot happen today for the same reason the cap cannot; it is written
         // this way so it stays true if the threshold moves.
         let factor = 1u32.saturating_mul(1 << (self.consecutive - 1).min(16));
-        Decision::RestartAfter(BASE_BACKOFF.saturating_mul(factor))
+        Decision::RestartAfter(self.base.saturating_mul(factor))
     }
 
     /// Consecutive failures so far. For logging; the decision is
