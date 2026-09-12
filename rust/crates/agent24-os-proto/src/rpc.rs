@@ -2578,8 +2578,10 @@ mod tests {
     async fn a_dead_writer_is_noticed_while_frames_keep_coming() {
         // The writer runs, and dies, the first time the loop yields — on a
         // current-thread runtime, when tokio's coop budget (128 in 1.53) runs
-        // out. 100 000 keeps "stopped long before the end" true for any budget
-        // below 50 000.
+        // out. Before that the loop takes up to budget × 16/15 frames (the
+        // reaping step's `try_recv` spends no budget), then at most 16 more to
+        // its next reaping step; "more than half unread" therefore holds for any
+        // budget below about 46 000.
         const NOTES: usize = 100_000;
         let (tx, mut rx) = tokio::sync::mpsc::channel(NOTES + 1);
         // One request, so the writer has a line to fail on.
