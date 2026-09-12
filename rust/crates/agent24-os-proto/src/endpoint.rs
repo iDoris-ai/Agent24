@@ -346,7 +346,18 @@ async fn answer<W: tokio::io::AsyncWrite + Unpin>(
     line: &[u8],
     deadline: tokio::time::Instant,
 ) -> Result<(), HandshakeFailed> {
-    let until = deadline.min(tokio::time::Instant::now() + crate::rpc::WRITE_TIMEOUT);
+    answer_within(writer, line, deadline, crate::rpc::WRITE_TIMEOUT).await
+}
+
+/// [`answer`] with the write's own bound as a parameter, so a test can make it
+/// shorter than the deadline.
+async fn answer_within<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    line: &[u8],
+    deadline: tokio::time::Instant,
+    write_timeout: Duration,
+) -> Result<(), HandshakeFailed> {
+    let until = deadline.min(tokio::time::Instant::now() + write_timeout);
     let timed_out = || {
         if until >= deadline {
             HandshakeFailed::Timeout
@@ -366,8 +377,11 @@ async fn answer<W: tokio::io::AsyncWrite + Unpin>(
         } => written,
     };
     written.map_err(HandshakeFailed::Write)?;
-    if tokio::time::Instant::now() >= deadline {
-        return Err(HandshakeFailed::Timeout);
+    // Against `until`, the earlier of the two bounds — not the deadline alone:
+    // the write's own bound has the same preemption hole (review of ME3-SUP
+    // slice 2, round 3′).
+    if tokio::time::Instant::now() >= until {
+        return Err(timed_out());
     }
     Ok(())
 }
@@ -889,6 +903,21 @@ mod tests {
         answer(&mut prompt, b"x\n", deadline)
             .await
             .expect("control: in time");
+    }
+
+    /// The same for the write's own bound when it is the earlier one: a write
+    /// that finishes past it — though well inside the deadline — is a write
+    /// that took too long, not a success.
+    #[tokio::test]
+    async fn an_answer_finished_past_its_write_bound_is_not_a_success() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut late = LateWriter {
+            until: std::time::Instant::now() + Duration::from_millis(100),
+        };
+        let err = answer_within(&mut late, b"x\n", deadline, Duration::from_millis(50))
+            .await
+            .expect_err("past the write bound");
+        assert!(matches!(err, HandshakeFailed::Write(_)), "{err}");
     }
 
     /// "Exactly 0700" includes the special bits: an otherwise-0700 directory
