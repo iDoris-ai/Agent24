@@ -502,7 +502,20 @@ impl ModuleProcess {
     /// failed attempt would leave a revoked generation nobody could legally
     /// retry killing. A retry after the leader was reaped only probes the group
     /// again; it sends no signal (see the type's docs).
-    pub async fn stop(mut self, grace: Duration) -> Result<StopReport, StopFailed> {
+    pub async fn stop(self, grace: Duration) -> Result<StopReport, StopFailed> {
+        self.stop_then(grace, || {}).await
+    }
+
+    /// [`ModuleProcess::stop`], calling `gone` the moment the group is
+    /// confirmed empty — synchronously, before the bounded wait for the output
+    /// drains that follows. For a caller that must record "no process left" at
+    /// the point it becomes true: a cancellation during the drain wait would
+    /// otherwise find it unrecorded (review of ME3-SUP slice 3a, round 10).
+    pub(crate) async fn stop_then(
+        mut self,
+        grace: Duration,
+        gone: impl FnOnce(),
+    ) -> Result<StopReport, StopFailed> {
         self.begin_stop();
         if self.revocation.is_none() {
             match self.generation.revoke() {
@@ -530,6 +543,7 @@ impl ModuleProcess {
                 process: Box::new(self),
             });
         }
+        gone();
         self.finish_drains().await;
         let Some(Revocation {
             permit,

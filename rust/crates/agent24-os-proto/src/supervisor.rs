@@ -103,8 +103,9 @@ pub enum Status {
     /// run is started, and the slot stays held: no other supervisor can start
     /// the module while the old group may still hold its data directory.
     StopFailed { error: String },
-    /// The supervisor itself panicked — a bug. The module had a SIGKILL
-    /// attempted, the slot says `module_stopping`, and the slot stays held.
+    /// The supervisor itself panicked — a bug. A process it held, if any, had
+    /// a SIGKILL attempted; the slot says `module_stopping`, and stays held if
+    /// a process was not confirmed gone.
     Panicked,
     /// The handle was dropped without a stop: the task was aborted, and a
     /// process it held (if any) had a SIGKILL attempted on its group — not
@@ -185,8 +186,9 @@ pub enum SupervisorError {
     /// The supervisor loop panicked (a bug); its module had a SIGKILL
     /// attempted.
     Panicked,
-    /// The loop was cancelled without a stop — its runtime shut down, say —
-    /// and its module had a SIGKILL attempted, not waited for.
+    /// The loop was cancelled without a stop — its runtime shut down, say. A
+    /// process it held, if any, had a SIGKILL attempted, not waited for (and
+    /// then the slot stays held). Not a clean stop either way.
     Killed,
 }
 
@@ -196,7 +198,8 @@ impl std::fmt::Display for SupervisorError {
             Self::StopFailed { error } => write!(f, "{error}"),
             Self::Panicked => f.write_str("the supervisor loop panicked"),
             Self::Killed => f.write_str(
-                "the supervisor loop was cancelled; its module was SIGKILLed, not confirmed gone",
+                "the supervisor loop was cancelled without a stop; a module process it held, \
+                 if any, was SIGKILLed and not confirmed gone",
             ),
         }
     }
@@ -651,15 +654,16 @@ async fn finish(
     // A `false` here — revoked by someone else — is reported by `stop`.
     let _ = process.begin_stop();
     status.send_replace(Status::Stopping);
-    match process.stop(timings.stop_grace).await {
+    // Recorded the moment the group is confirmed empty — before the wait for
+    // the output drains and before anything that could panic (a log line
+    // included), so neither a cancellation nor a panic past that point leaves
+    // a stopped supervisor holding its slot (rounds 9 and 10).
+    let gone = || {
+        slot.unconfirmed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    };
+    match process.stop_then(timings.stop_grace, gone).await {
         Ok(report) => {
-            // Confirmed gone — recorded first, before anything that could
-            // panic (a log line included): a panic past this point must not
-            // leave a stopped supervisor holding its slot (round 9). Until
-            // `stop` returned — its bounded wait for the output drains
-            // included — the flag stayed set: the fail-closed side.
-            slot.unconfirmed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
             if !report.abandoned.is_empty() {
                 tracing::warn!(
                     module = name,
@@ -687,6 +691,10 @@ mod tests {
     /// A module in Python. `mode`: `normal` (serve until the callback ends —
     /// D1's module side), `crash` (exit right after the handshake), `silent`
     /// (never connect), `hangup` (close the callback, keep running). Every
+    /// `escape`: like `normal`, after starting a `sleep` in a session of its
+    /// own (out of the module's group) that holds its stdout, and writing that
+    /// pid to `<data>/escaped` — so a stop empties the group quickly but waits
+    /// out the output drains. Every
     /// start appends `<pid> <token> <CLOCK_MONOTONIC>` to `<data>/starts` —
     /// system-wide, unlike Python's `time.monotonic()` on macOS. `early`:
     /// exit without ever connecting. `stubborn`: like `hangup`, but ignoring
@@ -702,6 +710,11 @@ if mode == "silent":
     sys.exit(0)
 if mode == "early":
     sys.exit(4)
+if mode == "escape":
+    import subprocess
+    p = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    with open(os.path.join(data, "escaped"), "w") as e:
+        e.write(str(p.pid))
 s = socket.socket(socket.AF_UNIX)
 s.connect(os.environ["A24_CALLBACK_SOCK"])
 req = {"jsonrpc": "2.0", "id": "1", "method": "initialize", "params": {
@@ -1124,6 +1137,71 @@ sys.exit(0)
             supervise(g.spec.clone(), g.dir.clone(), current, no_methods(), fast()).err(),
             Some(SlotHeld),
             "the slot was released over a module not confirmed gone"
+        );
+    }
+
+    /// A stop cancelled after the group was confirmed empty — while it waits
+    /// for the output drains, which a process that left the group keeps open
+    /// (≈1 s) — releases the slot: nothing of the module's group is left
+    /// (round 10). Cancelled by shutting its runtime down: cancelling a
+    /// `stop()` future only detaches the loop, which then finishes the stop.
+    #[test]
+    fn a_stop_cancelled_while_draining_output_still_releases_the_slot() {
+        let f = fixture("escape");
+        let current = Current::new(Generation::starting());
+        let first = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = first.block_on(async {
+            let h = sup(
+                f.spec.clone(),
+                f.dir.clone(),
+                current.clone(),
+                no_methods(),
+                fast(),
+            );
+            until(&mut h.subscribe(), "Running", |s| *s == Status::Running).await;
+            h
+        });
+        let (pid, _) = starts(f.data.path())[0].clone();
+        let escaped: i32 = std::fs::read_to_string(f.data.path().join("escaped"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let _stopping = first.spawn(handle.stop());
+        let leader = rustix::process::Pid::from_raw(pid).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while rustix::process::test_kill_process(leader) != Err(rustix::io::Errno::SRCH) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the module outlived its stop"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The group is empty; the stop now waits for the drains. Cancel it there.
+        std::thread::sleep(Duration::from_millis(300));
+        first.shutdown_timeout(Duration::from_secs(10));
+        let g = fixture("normal");
+        let second = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        second.block_on(async {
+            let next = supervise(
+                g.spec.clone(),
+                g.dir.clone(),
+                current.clone(),
+                no_methods(),
+                fast(),
+            )
+            .expect("a stop cancelled after the group was confirmed empty kept the slot");
+            stop(next).await;
+        });
+        let _ = rustix::process::kill_process(
+            rustix::process::Pid::from_raw(escaped).unwrap(),
+            rustix::process::Signal::Kill,
         );
     }
 
