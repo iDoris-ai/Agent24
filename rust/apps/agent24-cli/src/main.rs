@@ -112,6 +112,9 @@ enum OsAction {
         path: PathBuf,
     },
     /// Remove an installed domain-OS package (takes effect at the next daemon start)
+    ///
+    /// A module of that package that is running now keeps running, but cannot
+    /// be restarted: if it exits before the next daemon start, it stays down.
     Uninstall { name: String },
 }
 

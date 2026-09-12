@@ -279,6 +279,13 @@ fn private_dir(path: &Path) -> Result<(), EndpointError> {
 /// is followed through a symlink, and `run/` itself must pass the same check as
 /// when it is created, or nothing is touched. Returns what was removed. Called
 /// once at daemon start, before [`CallbackDir::create`].
+///
+/// **Assumes one daemon per state directory at a time** (agent24d holds a
+/// singleton lock for its state directory, and an ephemeral daemon has a root
+/// of its own). Between "that pid is gone" and the removal, a reused pid's new
+/// daemon could take the directory over in the same state directory only if
+/// two daemons shared it — which that lock rules out. Without it, this would
+/// need a per-directory lock (review of SUP-4, round 1).
 pub fn remove_stale(state: &Path) -> Vec<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let run = state.join("run");

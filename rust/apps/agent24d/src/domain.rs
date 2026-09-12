@@ -521,6 +521,9 @@ pub struct ProcessHost {
 pub struct Supervised {
     pub name: String,
     pub handle: agent24_os_proto::supervisor::SupervisorHandle,
+    /// The module's slot, for a shutdown to drain its current run before
+    /// stopping it (SPEC §4: DRAINING, then REVOKING).
+    pub current: Arc<agent24_os_proto::drain::Current>,
 }
 
 /// Mount everything in `catalogue` under `root`, returning the combined router
@@ -1019,11 +1022,15 @@ async fn mount_package(
         "domain OS {name:?} started from {} and proxied at {namespace}",
         package.dir.display()
     );
-    let app = agent24_os_proto::proxy::mount(app, &namespace, current);
+    let app = agent24_os_proto::proxy::mount(app, &namespace, current.clone());
     (
         app,
         report(MountOutcome::Mounted, resources),
-        Some(Supervised { name, handle }),
+        Some(Supervised {
+            name,
+            handle,
+            current,
+        }),
     )
 }
 

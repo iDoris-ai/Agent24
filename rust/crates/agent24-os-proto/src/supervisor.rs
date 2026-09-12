@@ -160,8 +160,17 @@ impl SupervisorHandle {
     /// stop (its runtime shut down).
     pub async fn stop(mut self) -> Result<(), SupervisorError> {
         let _ = self.stop.send(true);
-        if let Some(task) = self.task.take()
-            && let Err(e) = task.await
+        // Awaited in place, not taken out: a `stop` future dropped half-way —
+        // a caller's deadline — drops `self` with the task still in it, and
+        // `Drop` aborts it, which SIGKILLs the module now. Taking it out left
+        // `Drop` nothing to abort, and the loop finished its graceful stop,
+        // detached, past the caller's deadline (review of SUP-4, round 1).
+        let joined = match self.task.as_mut() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        self.task = None;
+        if let Some(Err(e)) = joined
             && e.is_panic()
         {
             tracing::error!("the supervisor loop had panicked: {e}");
@@ -703,6 +712,10 @@ mod tests {
     /// SIGTERM, so its stop lasts the whole grace.
     const MOCK: &str = r#"import json, os, socket, sys, time
 mode, name, digest = sys.argv[1], sys.argv[2], sys.argv[3]
+if mode == "stubborn_serving":
+    # Before the handshake: the kernel can stop it the moment it is ready.
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 data = os.environ["A24_DATA_DIR"]
 token = os.environ["A24_HANDSHAKE_TOKEN"]
 with open(os.path.join(data, "starts"), "a") as f:
@@ -727,6 +740,11 @@ f = s.makefile("rb")
 f.readline()
 if mode == "crash":
     sys.exit(3)
+if mode == "stubborn_serving":
+    while f.readline():
+        pass
+    time.sleep(60)
+    sys.exit(0)
 if mode == "stubborn":
     import signal
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -1205,6 +1223,47 @@ sys.exit(0)
             rustix::process::Pid::from_raw(escaped).unwrap(),
             rustix::process::Signal::Kill,
         );
+    }
+
+    /// A `stop` whose caller gives up — its future dropped at a deadline —
+    /// kills the module now: the handle, and the loop in it, go with the
+    /// future, rather than the loop finishing its graceful stop detached, past
+    /// the deadline (review of SUP-4, round 1). The module ignores SIGTERM and
+    /// the grace is long, so only a kill ends it within the bound.
+    #[tokio::test]
+    async fn a_stop_given_up_on_kills_the_module_at_once() {
+        let f = fixture("stubborn_serving");
+        let current = Current::new(Generation::starting());
+        let timings = Timings {
+            stop_grace: Duration::from_secs(10),
+            ..fast()
+        };
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            timings,
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let (pid, _) = starts(f.data.path())[0].clone();
+        let gave_up = tokio::time::timeout(Duration::from_millis(300), handle.stop()).await;
+        assert!(
+            gave_up.is_err(),
+            "the stop finished inside a SIGTERM-ignoring grace: {gave_up:?}"
+        );
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the module outlived a stop its caller gave up on"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// A handle dropped while its module runs keeps the slot: the SIGKILL

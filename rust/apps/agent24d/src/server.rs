@@ -24,9 +24,16 @@ use tokio_util::sync::CancellationToken;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// SIGTERM to SIGKILL for an out-of-process module this daemon stops. ⚖️
-/// Shorter than the library's default so that stopping every module fits in
-/// [`SHUTDOWN_GRACE`] with time left to reap: a module gets 1.5s to flush.
-const MODULE_STOP_GRACE: Duration = Duration::from_millis(1500);
+/// Much shorter than the library's default so that draining, stopping and
+/// reaping every module fit in [`SHUTDOWN_GRACE`].
+const MODULE_STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// How long a shutdown lets out-of-process modules finish the requests they
+/// already have (DRAINING, SPEC §4) before stopping them. ⚖️ This and
+/// [`MODULE_STOP_GRACE`] share [`SHUTDOWN_GRACE`]: drain first, so a request a
+/// module is working on is answered rather than abandoned; then a short grace,
+/// since a drained module has nothing in flight.
+const MODULE_DRAIN: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -51,6 +58,15 @@ pub struct AppState {
     /// `agent24 os enable` needs a name to act on and a module that only appeared
     /// once it was already on could never be turned on.
     pub os_reports: Arc<Vec<crate::domain::MountReport>>,
+    /// The live status of each out-of-process module, by name: what `agent24
+    /// os list` reports beyond the startup verdict (a package can be mounted
+    /// and since have given up).
+    pub module_status: Arc<
+        std::collections::HashMap<
+            String,
+            tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
+        >,
+    >,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -360,6 +376,7 @@ impl AppState {
             // assignment is ordered ahead of router construction rather than left
             // to chance.
             os_reports: Arc::new(Vec::new()),
+            module_status: Arc::new(std::collections::HashMap::new()),
             runs,
             scheduler,
             shutdown,
@@ -794,7 +811,13 @@ pub async fn serve(
     // while always answering the same thing. When a module that needs models
     // arrives, `Installed` gains a `requires_models` field and this becomes a real
     // predicate over it.
-    let needs_models = false;
+    // Packages carry their manifest already (it was read at discovery), so a
+    // package that declares a model can be known without constructing
+    // anything: probe if any does. Compiled-in modules still cannot say without
+    // being built, and none in this build declares one.
+    let needs_models = catalogue.iter().any(|e| {
+        matches!(&e.build, crate::domain::Build::Package(p) if !p.manifest.requires_models().is_empty())
+    });
     let inventory = if needs_models {
         ModelCatalog::probe(&state.router, &cancel).await
     } else {
@@ -811,6 +834,38 @@ pub async fn serve(
     // under its throwaway root. Directories left by daemons that are gone are
     // cleared first (FU-56). A daemon that cannot set this up still runs; its
     // packages degrade, with the reason.
+    // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
+    // Registered HERE — before any module process can be started — and
+    // synchronously: a SIGTERM arriving while packages start must run this
+    // shutdown, which stops them, not the default action, which ends the daemon
+    // and leaves them running (review of SUP-4, round 1).
+    #[cfg(unix)]
+    let signals = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        )
+    };
+    let signal_cancel = cancel.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let (term, int) = signals;
+            tokio::select! {
+                () = until_signal(term, "SIGTERM") => {},
+                () = until_signal(int, "SIGINT") => {},
+            }
+        }
+        #[cfg(not(unix))]
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!("SIGINT handler failed: {err}");
+            std::future::pending::<()>().await;
+        }
+        tracing::info!("shutdown signal received");
+        signal_cancel.cancel();
+    });
+
     let host = process_host(if ephemeral { &os_root } else { &state_dir });
     if let Err(why) = &host {
         tracing::error!("out-of-process domain OS modules cannot be started: {why}");
@@ -898,6 +953,12 @@ pub async fn serve(
     // Hand the verdicts to the state BEFORE the router clones it, so `/api/v1/os`
     // can report what the mounter actually decided rather than re-deriving it.
     state.os_reports = Arc::new(reports);
+    state.module_status = Arc::new(
+        supervisors
+            .iter()
+            .map(|s| (s.name.clone(), s.handle.subscribe()))
+            .collect(),
+    );
     let router = build_router_with_modules(state, module_routes);
 
     // 127.0.0.1 only — never a public bind (SPEC-001 §9)
@@ -931,52 +992,12 @@ pub async fn serve(
         })
     );
 
-    // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev)
-    let signal_cancel = cancel.clone();
-    tokio::spawn(async move {
-        let sigterm = async {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{SignalKind, signal};
-                match signal(SignalKind::terminate()) {
-                    Ok(mut s) => {
-                        s.recv().await;
-                    }
-                    Err(err) => {
-                        // Never resolve on registration failure — resolving would
-                        // be indistinguishable from a real signal and trigger an
-                        // immediate graceful shutdown at startup.
-                        tracing::error!("SIGTERM handler failed: {err}");
-                        std::future::pending::<()>().await;
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            std::future::pending::<()>().await;
-        };
-        let sigint = async {
-            if let Err(err) = tokio::signal::ctrl_c().await {
-                // Mirror the SIGTERM arm: a registration failure must never be
-                // indistinguishable from a real signal — park forever instead
-                // of resolving the select and triggering a spurious shutdown.
-                tracing::error!("SIGINT handler failed: {err}");
-                std::future::pending::<()>().await;
-            }
-        };
-        tokio::select! {
-            () = sigterm => {},
-            () = sigint => {},
-        }
-        tracing::info!("shutdown signal received");
-        signal_cancel.cancel();
-    });
-
-    // Modules are stopped from the moment shutdown begins, alongside the HTTP
-    // drain, and inside the same SHUTDOWN_GRACE (TASKS B2).
-    // Bounded from the moment shutdown begins: a module still stopping at the
-    // deadline is dropped with its supervisor, which SIGKILLs its group — and a
-    // module reads EOF on its callback connection as the end of its run (D1),
-    // so one that outlives this process exits on its own.
+    // Modules are drained and then stopped from the moment shutdown begins,
+    // alongside the HTTP drain, inside the same SHUTDOWN_GRACE (TASKS B2).
+    // Bounded from that moment: a module still stopping at the deadline is
+    // dropped with its supervisor, which SIGKILLs its group — and a module
+    // reads EOF on its callback connection as the end of its run (D1), so one
+    // that outlives this process exits on its own.
     let stop_cancel = cancel.clone();
     let stopping = tokio::spawn(async move {
         stop_cancel.cancelled().await;
@@ -1027,8 +1048,21 @@ fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, St
     }
     let callback_dir = agent24_os_proto::endpoint::CallbackDir::create(root)
         .map_err(|e| format!("callback directory: {e}"))?;
+    // Checked now, for the longest name a socket there can get, rather than
+    // failing every module's start — and then its restarts — one by one: a long
+    // `TMPDIR` (an ephemeral daemon's root) can put every socket over the limit.
+    let longest = callback_dir.path().join(format!("{}.sock", u64::MAX));
+    if longest.as_os_str().len() > agent24_os_proto::endpoint::MAX_SOCKET_PATH {
+        return Err(format!(
+            "callback sockets under {} would be longer than {} bytes",
+            callback_dir.path().display(),
+            agent24_os_proto::endpoint::MAX_SOCKET_PATH
+        ));
+    }
     // This binary, which hands a module over at the top of `main`
-    // (`run_as_trampoline_if_asked`), so it needs no arguments of its own.
+    // (`run_as_trampoline_if_asked`), so it needs no arguments of its own. By
+    // path: a module restarted after the binary was replaced or moved runs the
+    // new one, or fails to start — upgrading the daemon means restarting it.
     let program = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;
     Ok(crate::domain::ProcessHost {
         callback_dir: StdArc::new(callback_dir),
@@ -1043,9 +1077,43 @@ fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, St
     })
 }
 
-/// Stop every supervised module, concurrently, and log any stop that was not
-/// clean. Unbounded here; the caller bounds it.
+/// Wait for a registered signal. A registration that failed never resolves:
+/// resolving would be indistinguishable from a real signal and shut the daemon
+/// down at startup.
+#[cfg(unix)]
+async fn until_signal(registered: std::io::Result<tokio::signal::unix::Signal>, what: &str) {
+    match registered {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(err) => {
+            tracing::error!("{what} handler failed: {err}");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Stop every supervised module, the way SPEC §4 stops one: DRAINING first —
+/// new proxied requests refused, the ones in flight left to finish, for up to
+/// [`MODULE_DRAIN`] — then REVOKING and the process stop, concurrently for all.
+/// Logs any stop that was not clean. The caller bounds the whole of it.
+///
+/// Draining first is what keeps a shutdown from answering a request a module
+/// is in the middle of `request_abandoned` — and a client that then retries a
+/// write the module did complete (review of SUP-4, round 1).
 async fn stop_supervisors(supervisors: Vec<crate::domain::Supervised>) {
+    let now = std::time::Instant::now();
+    for s in &supervisors {
+        // `false` for a run not serving (starting, or already stopped): there
+        // is nothing to drain, and the stop below handles it.
+        let _ = s.current.get().begin_drain(now, MODULE_DRAIN);
+    }
+    let drained_by = tokio::time::Instant::now() + MODULE_DRAIN;
+    while supervisors.iter().any(|s| s.current.get().in_flight() > 0)
+        && tokio::time::Instant::now() < drained_by
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let mut stops = tokio::task::JoinSet::new();
     for s in supervisors {
         stops.spawn(async move { (s.name, s.handle.stop().await) });
