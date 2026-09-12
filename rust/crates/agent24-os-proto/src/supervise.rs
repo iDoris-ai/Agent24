@@ -425,12 +425,14 @@ impl ModuleProcess {
         // be what stands between `Drop` and the SIGKILL it owes (review of
         // ME3-SUP slice 3a). Any other error leaves the question open, and an
         // open question means the group id is not known to be ours.
+        // Bounded: a destructor must not spin forever under a signal storm.
+        let mut tries = 0;
         let status = loop {
             match waitid(
                 WaitId::Pid(self.group),
                 WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
             ) {
-                Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::INTR) if tries < 64 => tries += 1,
                 other => break other?,
             }
         };
@@ -439,6 +441,18 @@ impl ModuleProcess {
             signal: st.terminating_signal().and_then(|c| i32::try_from(c).ok()),
         });
         Ok(self.exit)
+    }
+
+    /// The synchronous first step of [`ModuleProcess::stop`]: revoke this
+    /// process's generation now, keeping the permit for the kill. For a caller
+    /// that must report "stopping" only once new work is already refused;
+    /// `stop` then goes on from here. `false` if the generation was revoked by
+    /// someone else (then `stop` reports it).
+    pub(crate) fn begin_stop(&mut self) -> bool {
+        if self.revocation.is_none() {
+            self.revocation = self.generation.revoke();
+        }
+        self.revocation.is_some()
     }
 
     /// Has the leader exited?
@@ -484,6 +498,7 @@ impl ModuleProcess {
     /// retry killing. A retry after the leader was reaped only probes the group
     /// again; it sends no signal (see the type's docs).
     pub async fn stop(mut self, grace: Duration) -> Result<StopReport, StopFailed> {
+        self.begin_stop();
         if self.revocation.is_none() {
             match self.generation.revoke() {
                 Some(r) => self.revocation = Some(r),

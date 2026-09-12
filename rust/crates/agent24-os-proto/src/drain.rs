@@ -502,6 +502,29 @@ impl Current {
             next,
         )
     }
+
+    /// Install `next` only if the slot still holds `expected` (the same
+    /// `Arc`), atomically; otherwise hand `next` back. For a supervisor that
+    /// must not overwrite a generation another supervisor has put in since.
+    ///
+    /// # Errors
+    ///
+    /// `Err(next)` when the slot holds something other than `expected`.
+    pub fn replace_if(
+        &self,
+        expected: &Arc<Generation>,
+        next: Arc<Generation>,
+    ) -> Result<Arc<Generation>, Arc<Generation>> {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if Arc::ptr_eq(&slot, expected) {
+            Ok(std::mem::replace(&mut *slot, next))
+        } else {
+            Err(next)
+        }
+    }
 }
 
 impl InFlight {
