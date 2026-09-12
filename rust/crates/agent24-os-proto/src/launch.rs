@@ -16,7 +16,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 
 use agent24_domain::SpawnCommand;
 
@@ -333,7 +332,27 @@ const FD_DIR: &str = "/dev/fd";
 
 /// Where `close_fds`'s last-resort scan stops (exclusive): an fd at or above
 /// it is flagged only if the library took a complete path.
-const FALLBACK_SCAN_END: i32 = 65_536;
+///
+/// Computed as close_fds 0.3.2 computes it (`iterfds/fditer.rs`):
+/// `sysconf(_SC_OPEN_MAX)` — the `RLIMIT_NOFILE` soft limit — clamped to
+/// 1024..=65536. The first version used a flat 65 536, which let a flagless fd
+/// between a low soft limit and 65 535 escape both the fallback and the check
+/// (PR-Daemon review of #178, F2). A limit that cannot be read counts as 1024,
+/// the smallest bound the library could use — so the check refuses more,
+/// never less. This mirrors the library's internals, which is why its version
+/// is pinned (`=0.3.2`): an upgrade must re-read this. Checking each fd's
+/// close-on-exec flag directly would not depend on them, but reading the flag
+/// of an arbitrary fd number needs `unsafe` here.
+fn fallback_scan_end() -> i32 {
+    scan_end_for(rustix::process::getrlimit(rustix::process::Resource::Nofile).current)
+}
+
+/// [`fallback_scan_end`] for a given soft limit (`None`: unlimited or unknown).
+fn scan_end_for(soft: Option<u64>) -> i32 {
+    soft.and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(1024)
+        .clamp(1024, 65_536)
+}
 
 /// The first open fd at or above `bound`, from a complete listing of
 /// [`FD_DIR`] — any error while listing, including part-way, is an error.
@@ -377,12 +396,13 @@ pub fn run_as_trampoline_if_asked() {
     close_fds::set_fds_cloexec_threadsafe(LISTEN_FD + 1, &[]);
     // `close_fds` covers the whole range when `close_range` works (Linux) or
     // when it can walk FD_DIR; otherwise — and silently, even part-way through
-    // a walk that failed — it falls back to a scan that stops at fd 65 535
-    // (review of SUP-1, rounds 3 and 3′). So which path it took is not
-    // trusted: this process lists its own fds, completely, and refuses if the
-    // listing fails or shows an fd the fallback could have missed. With no fd
-    // at or above that bound, every path flagged everything.
-    match open_fd_at_or_above(FALLBACK_SCAN_END) {
+    // a walk that failed — it falls back to a scan bounded by the fd limit
+    // (see `fallback_scan_end`; review of SUP-1, rounds 3 and 3′, and of #178).
+    // So which path it took is not trusted: this process lists its own fds,
+    // completely, and refuses if the listing fails or shows an fd the fallback
+    // could have missed. With no fd at or above that bound, every path flagged
+    // everything.
+    match open_fd_at_or_above(fallback_scan_end()) {
         Ok(None) => {}
         Ok(Some(fd)) => {
             eprintln!(
@@ -403,10 +423,11 @@ pub fn run_as_trampoline_if_asked() {
         .args(argv)
         .env_remove(ENV_TRAMPOLINE)
         // macOS CoreFoundation writes this into the environment of a process
-        // that initializes it — the trampoline sometimes does — and it would
-        // pass to the module as the one variable the contract does not name.
-        // Seen as a test failure only in some runs, which is the reason to take
-        // it out here rather than list it as allowed.
+        // that initializes it. Where it came from in the one run that showed it
+        // is not settled — the test binary links no CoreFoundation (`otool -L`:
+        // libSystem, libiconv), so more likely a process between the daemon
+        // and the probe — but taking it out here keeps the contract's "the four
+        // A24_* and the allowlist" exact whatever sets it.
         .env_remove("__CF_USER_TEXT_ENCODING")
         .exec();
     eprintln!(
@@ -416,7 +437,7 @@ pub fn run_as_trampoline_if_asked() {
     std::process::exit(127);
 }
 
-/// Everything [`spawn`] needs besides the generation.
+/// Everything [`spawn`] needs.
 #[derive(Debug)]
 pub struct LaunchSpec<'a> {
     /// The module's name, for its log lines.
@@ -457,13 +478,36 @@ pub struct LaunchSpec<'a> {
 /// The package-tree check runs on a blocking thread: it is a walk of the whole
 /// tree, and must not stall the runtime it is called from.
 ///
+/// # The generation is the process's own
+///
+/// `spawn` creates the [`Generation`] itself; a caller that needs it — the
+/// proxy's `Current`, say — takes a clone from [`ModuleProcess::generation`].
+/// Taking one as a parameter let two processes share a generation (the second
+/// one's `stop` then found it revoked with the permit gone, and could never
+/// succeed, however often retried) or be started for a generation already
+/// revoked (PR-Daemon review of #178, B1).
+///
+/// ```compile_fail
+/// # async fn f(spec: agent24_os_proto::launch::LaunchSpec<'_>) {
+/// // A generation cannot be handed in ...
+/// let p = agent24_os_proto::launch::spawn(spec, agent24_os_proto::drain::Generation::starting()).await;
+/// # }
+/// ```
+///
+/// The control — the one legal shape, which must compile (a `compile_fail`
+/// block passes on ANY compile error):
+///
+/// ```no_run
+/// # async fn f(spec: agent24_os_proto::launch::LaunchSpec<'_>) {
+/// // ... the process brings its own.
+/// let p = agent24_os_proto::launch::spawn(spec).await;
+/// # }
+/// ```
+///
 /// # Errors
 ///
 /// [`LaunchError`] — resolution, ownership, entropy, or the OS refusing.
-pub async fn spawn(
-    spec: LaunchSpec<'_>,
-    generation: Arc<Generation>,
-) -> Result<ModuleProcess, LaunchError> {
+pub async fn spawn(spec: LaunchSpec<'_>) -> Result<ModuleProcess, LaunchError> {
     use command_fds::{CommandFdExt, FdMapping};
 
     let program = {
@@ -517,7 +561,7 @@ pub async fn spawn(
             "stderr",
         )));
     }
-    ModuleProcess::new(child, generation, token, drains).map_err(LaunchError::Spawn)
+    ModuleProcess::new(child, Generation::starting(), token, drains).map_err(LaunchError::Spawn)
 }
 
 /// The test binary is its own trampoline: started with `--exact` on
@@ -708,6 +752,7 @@ mod tests {
 
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
 
     fn pkg() -> tempfile::TempDir {
         let t = tempfile::tempdir().unwrap();
@@ -838,28 +883,28 @@ mod tests {
             command.args
         );
         let trampoline = crate::launch::test_trampoline();
-        spawn(
-            LaunchSpec {
-                name: "t",
-                command,
-                package_dir: t,
-                data_dir: &t.join("data"),
-                callback_sock: &t.join("cb.sock"),
-                trampoline: &trampoline,
-                listener,
-            },
-            Generation::starting(),
-        )
+        spawn(LaunchSpec {
+            name: "t",
+            command,
+            package_dir: t,
+            data_dir: &t.join("data"),
+            callback_sock: &t.join("cb.sock"),
+            trampoline: &trampoline,
+            listener,
+        })
         .await
         .expect("spawn")
     }
 
     /// Wait for the leader to exit, within a bound — a test that waits without
-    /// one reports a hang as silence.
+    /// one reports a hang as silence. 30s, not less: on a loaded machine the OS
+    /// takes seconds to start freshly written scripts (PR-Daemon measured a
+    /// median of 9.6s for 24 at once), and the wait returns the moment the
+    /// module exits, so a generous bound costs a passing run nothing.
     async fn exited(p: &mut ModuleProcess) -> crate::supervise::Exit {
-        tokio::time::timeout(std::time::Duration::from_secs(10), p.exited())
+        tokio::time::timeout(std::time::Duration::from_secs(30), p.exited())
             .await
-            .expect("the module did not exit within 10s")
+            .expect("the module did not exit within 30s")
             .unwrap()
     }
 
@@ -1316,6 +1361,22 @@ mod tests {
             "{found:?} for {number}"
         );
         assert_eq!(open_fd_at_or_above(i32::MAX).unwrap(), None);
+    }
+
+    /// The bound mirrors close_fds 0.3.2's fallback scan: the soft fd limit,
+    /// clamped to 1024..=65536 — and an unknown limit counts as the smallest
+    /// bound, so the check refuses more rather than less.
+    #[test]
+    fn the_fallback_bound_follows_the_fd_limit() {
+        for (soft, bound) in [
+            (Some(256), 1024),
+            (Some(4096), 4096),
+            (Some(65_536), 65_536),
+            (Some(10_000_000), 65_536),
+            (None, 1024),
+        ] {
+            assert_eq!(scan_end_for(soft), bound, "soft limit {soft:?}");
+        }
     }
 
     /// What the module's exit looked like comes back: `exited` reports it, and

@@ -31,7 +31,9 @@ command-fds = { version = "0.3.3", features = ["tokio"] }
 # the module, so only 0–3 reach it. `set_fds_cloexec_threadsafe` is a safe
 # function; doing the same between fork and exec would need `unsafe` here
 # (review of SUP-1, rounds 1–2; user decision: a trampoline).
-close_fds = "0.3.2"
+# Pinned exactly: the trampoline mirrors this version's fallback-scan bound
+# (`launch::fallback_scan_end`), so an upgrade must re-read it.
+close_fds = "=0.3.2"
 # SPEC §4: a request abandoned by a revocation is logged as "outcome unknown".
 tracing = "0.1"
 

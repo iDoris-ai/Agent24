@@ -468,9 +468,12 @@ impl ModuleProcess {
         if self.revocation.is_none() {
             match self.generation.revoke() {
                 Some(r) => self.revocation = Some(r),
-                // Only this type revokes a live process's generation, and it
-                // does so once; reaching this means another in-crate caller
-                // revoked it and took the permit.
+                // Not reachable through the public API: `spawn` creates the
+                // generation, so no other process shares it, and `revoke` is
+                // crate-private. An in-crate caller revoking it would take the
+                // permit, and then no retry of this `stop` could succeed — the
+                // process could only be dropped (SIGKILL, no grace). Reported
+                // rather than hidden; nothing in this crate does it.
                 None => {
                     return Err(StopFailed {
                         error: std::io::Error::other(
@@ -547,14 +550,20 @@ impl ModuleProcess {
     /// full test runs under load failed `stop` with exactly that. Linux signals
     /// zombies without complaint. With the leader still alive, `EPERM` is real:
     /// a member runs as another user.
-    fn signal(&self, sig: Signal, leader_exited: bool) -> std::io::Result<()> {
+    ///
+    /// `leader_exited` can be stale — the leader may die between that check and
+    /// this signal, leaving a group of zombies — so an `EPERM` looks at the
+    /// leader again before it counts (PR-Daemon review of #178, F1). A live
+    /// member running as another user still fails later, in the
+    /// empty-group probe, rather than passing as success.
+    fn signal(&mut self, sig: Signal, leader_exited: bool) -> std::io::Result<()> {
         debug_assert!(
             !self.reaped,
             "a signal after the reap could hit a reused id"
         );
         match rustix::process::kill_process_group(self.group, sig) {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-            Err(rustix::io::Errno::PERM) if leader_exited => Ok(()),
+            Err(rustix::io::Errno::PERM) if leader_exited || self.leader_exited()? => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -615,7 +624,9 @@ impl Drop for ModuleProcess {
         // The same order as `stop`: revoke first. A permit taken here is spent
         // on the kill below; one already held (a failed or cancelled stop) is
         // spent too.
-        let revoked = self
+        // `true` when a permit was spent here — one taken now, or one a failed
+        // or cancelled `stop` was holding. Not "the generation was unrevoked".
+        let permit_taken = self
             .revocation
             .take()
             .or_else(|| self.generation.revoke())
@@ -635,7 +646,7 @@ impl Drop for ModuleProcess {
         };
         tracing::warn!(
             pid = self.group.as_raw_nonzero().get(),
-            revoked,
+            permit_taken,
             killed,
             "a module process was dropped without being stopped; its group was killed \
              without grace"
@@ -800,24 +811,21 @@ mod tests {
         assert!(text.contains("503"), "{text}");
     }
 
-    async fn start(dir: &std::path::Path, generation: Arc<Generation>) -> ModuleProcess {
+    async fn start(dir: &std::path::Path) -> ModuleProcess {
         let spawn_cmd = agent24_domain::SpawnCommand {
             command: "bin/mod".to_owned(),
             args: vec![],
         };
         let trampoline = crate::launch::test_trampoline();
-        crate::launch::spawn(
-            crate::launch::LaunchSpec {
-                name: "t",
-                command: &spawn_cmd,
-                package_dir: dir,
-                data_dir: dir,
-                callback_sock: &dir.join("cb.sock"),
-                trampoline: &trampoline,
-                listener: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
-            },
-            generation,
-        )
+        crate::launch::spawn(crate::launch::LaunchSpec {
+            name: "t",
+            command: &spawn_cmd,
+            package_dir: dir,
+            data_dir: dir,
+            callback_sock: &dir.join("cb.sock"),
+            trampoline: &trampoline,
+            listener: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+        })
         .await
         .expect("spawn")
     }
@@ -838,8 +846,14 @@ mod tests {
 
     /// Wait for the helper to prove it is running. Without this a test could
     /// "pass" by killing something that had not started yet.
+    ///
+    /// 30s: on a loaded machine the OS takes seconds to start freshly written
+    /// scripts — PR-Daemon saw this precondition fail in 3 of 6 whole-crate
+    /// runs at 5s and measured a median of 9.6s for 24 scripts at once. The
+    /// loop returns the moment the marker appears, so a passing run pays
+    /// nothing for the margin.
     async fn helper_running(marker: &std::path::Path) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !marker.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -879,7 +893,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
-        let p = start(dir.path(), Generation::starting()).await;
+        let p = start(dir.path()).await;
         helper_running(&marker).await;
 
         p.stop(Duration::from_secs(2)).await.expect("stop");
@@ -908,7 +922,7 @@ mod tests {
                 m = marker.display()
             ),
         );
-        let p = start(dir.path(), Generation::starting()).await;
+        let p = start(dir.path()).await;
         helper_running(&marker).await;
 
         let start = Instant::now();
@@ -945,14 +959,14 @@ mod tests {
                 ready.display()
             ),
         );
-        let p = start(dir.path(), Generation::starting()).await;
+        let p = start(dir.path()).await;
         let pid = Pid::from_raw(p.pid()).unwrap();
 
         // Wait until the trap is INSTALLED. Without this the test signals a
         // shell that has not run `trap` yet, the default disposition applies, and
         // the child dies immediately — measured: it returned in 30ms and the
         // assertion below failed. The test was racing the thing it was testing.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !ready.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -982,7 +996,7 @@ mod tests {
 
         let mut tokens = std::collections::BTreeSet::new();
         for _ in 0..5 {
-            let p = start(dir.path(), Generation::starting()).await;
+            let p = start(dir.path()).await;
             tokens.insert(p.token().to_owned());
             p.stop(Duration::from_millis(100)).await.expect("stop");
         }
@@ -1003,7 +1017,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
-        let generation = Generation::starting();
+        let p = start(dir.path()).await;
+        let generation = p.generation().clone();
         assert!(generation.ready());
         let sent = generation.admit_request("sent".to_owned()).unwrap();
         assert!(sent.dispatch());
@@ -1011,7 +1026,6 @@ mod tests {
         // Another generation, to show which one is revoked.
         let other = Generation::starting();
 
-        let p = start(dir.path(), generation.clone()).await;
         let report = p.stop(Duration::from_secs(2)).await.expect("stop");
 
         assert_eq!(generation.state(), crate::drain::DrainState::Revoked);
@@ -1035,8 +1049,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
-        let generation = Generation::starting();
-        let p = start(dir.path(), generation.clone()).await;
+        let p = start(dir.path()).await;
+        let generation = p.generation().clone();
         helper_running(&marker).await;
 
         drop(p);
@@ -1058,9 +1072,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("bin")).unwrap();
         exe(&dir.path().join("bin/mod"), "#!/bin/sh\nexit 3\n");
-        let mut p = start(dir.path(), Generation::starting()).await;
+        let mut p = start(dir.path()).await;
         let pid = Pid::from_raw(p.pid()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), p.exited())
+        tokio::time::timeout(Duration::from_secs(30), p.exited())
             .await
             .expect("no exit")
             .unwrap();
@@ -1094,7 +1108,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
-        let p = start(dir.path(), Generation::starting()).await;
+        let p = start(dir.path()).await;
         let group = Pid::from_raw(p.pid()).unwrap();
         helper_running(&marker).await;
         // Precondition: the group has members to begin with.
@@ -1120,7 +1134,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
-        let p = start(dir.path(), Generation::starting()).await;
+        let p = start(dir.path()).await;
         helper_running(&marker).await;
         let mut joiner = std::process::Command::new("sleep")
             .arg("30")
@@ -1168,8 +1182,8 @@ mod tests {
                 m = marker.display()
             ),
         );
-        let generation = Generation::starting();
-        let p = start(dir.path(), generation.clone()).await;
+        let p = start(dir.path()).await;
+        let generation = p.generation().clone();
         helper_running(&marker).await;
 
         let cancelled =
@@ -1205,8 +1219,8 @@ mod tests {
              while not os.path.exists('escaped'):\n\
              \x20   time.sleep(0.01)\n",
         );
-        let mut p = start(dir.path(), Generation::starting()).await;
-        tokio::time::timeout(Duration::from_secs(10), p.exited())
+        let mut p = start(dir.path()).await;
+        tokio::time::timeout(Duration::from_secs(30), p.exited())
             .await
             .expect("no exit")
             .unwrap();
@@ -1217,5 +1231,27 @@ mod tests {
             "stop waited {:?} for an escaped helper's pipes",
             begun.elapsed()
         );
+    }
+
+    /// Every process brings its own generation, so no two can share one: the
+    /// shape that let the second of two processes on one generation fail
+    /// every `stop` (PR-Daemon review of #178, B1) cannot be built any more.
+    #[tokio::test]
+    async fn two_processes_never_share_a_generation_and_both_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("helper-alive");
+        module_with_helper(dir.path(), &marker);
+        let a = start(dir.path()).await;
+        let b = start(dir.path()).await;
+        assert!(
+            !Arc::ptr_eq(a.generation(), b.generation()),
+            "two processes share one generation"
+        );
+        a.stop(Duration::from_secs(2))
+            .await
+            .expect("the first stop");
+        b.stop(Duration::from_secs(2))
+            .await
+            .expect("the second stop");
     }
 }
