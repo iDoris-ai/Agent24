@@ -325,16 +325,34 @@ pub const ENV_TRAMPOLINE: &str = "A24_TRAMPOLINE";
 /// when passed as separate arguments (review of SUP-1, round 3).
 pub const TRAMPOLINE_ARG: &str = "--a24-exec-module";
 
-/// Where this process's open fds can be listed. The fd flagging below walks
-/// it; without it `close_fds` falls back to a scan that stops at fd 65 535.
+/// Where this process's open fds can be listed.
 #[cfg(target_os = "linux")]
 const FD_DIR: &str = "/proc/self/fd";
 #[cfg(not(target_os = "linux"))]
 const FD_DIR: &str = "/dev/fd";
 
+/// Where `close_fds`'s last-resort scan stops (exclusive): an fd at or above
+/// it is flagged only if the library took a complete path.
+const FALLBACK_SCAN_END: i32 = 65_536;
+
+/// The first open fd at or above `bound`, from a complete listing of
+/// [`FD_DIR`] — any error while listing, including part-way, is an error.
+fn open_fd_at_or_above(bound: i32) -> std::io::Result<Option<i32>> {
+    for entry in std::fs::read_dir(FD_DIR)? {
+        let name = entry?.file_name();
+        if let Some(fd) = name.to_str().and_then(|n| n.parse::<i32>().ok())
+            && fd >= bound
+        {
+            return Ok(Some(fd));
+        }
+    }
+    Ok(None)
+}
+
 /// If this process was started as a module's trampoline, become the module:
-/// mark every fd from 4 up close-on-exec, drop the trampoline marker, and exec
-/// the module's program with its arguments. Otherwise return at once.
+/// mark every fd from 4 up close-on-exec, check that from a complete listing of
+/// its own fds, drop the trampoline marker, and exec the module's program with
+/// its arguments. Otherwise return at once.
 ///
 /// **Call it first thing in the host's `main`**, before any thread exists —
 /// that is what makes flagging the fds race-free. If it cannot guarantee the
@@ -356,19 +374,31 @@ pub fn run_as_trampoline_if_asked() {
         eprintln!("agent24: the module trampoline was started without a program");
         std::process::exit(127);
     };
-    // `close_fds` walks FD_DIR; when that cannot be read it falls back to a
-    // scan capped at fd 65 535, and an inherited fd above that would reach the
-    // module. Fail closed instead (review of SUP-1, round 3). On Linux it
-    // tries `close_range` first, which covers the whole range; the check is
-    // made there too, because that call can be refused (old kernels, seccomp).
-    if std::fs::read_dir(FD_DIR).is_err() {
-        eprintln!(
-            "agent24: cannot list this process's fds ({FD_DIR}); refusing to start a \
-             module without being able to keep the daemon's fds from it"
-        );
-        std::process::exit(127);
-    }
     close_fds::set_fds_cloexec_threadsafe(LISTEN_FD + 1, &[]);
+    // `close_fds` covers the whole range when `close_range` works (Linux) or
+    // when it can walk FD_DIR; otherwise — and silently, even part-way through
+    // a walk that failed — it falls back to a scan that stops at fd 65 535
+    // (review of SUP-1, rounds 3 and 3′). So which path it took is not
+    // trusted: this process lists its own fds, completely, and refuses if the
+    // listing fails or shows an fd the fallback could have missed. With no fd
+    // at or above that bound, every path flagged everything.
+    match open_fd_at_or_above(FALLBACK_SCAN_END) {
+        Ok(None) => {}
+        Ok(Some(fd)) => {
+            eprintln!(
+                "agent24: fd {fd} is open, above what can be verified as close-on-exec; \
+                 refusing to start a module that might inherit it"
+            );
+            std::process::exit(127);
+        }
+        Err(e) => {
+            eprintln!(
+                "agent24: cannot list this process's fds ({FD_DIR}: {e}); refusing to \
+                 start a module without being able to keep the daemon's fds from it"
+            );
+            std::process::exit(127);
+        }
+    }
     let error = std::process::Command::new(&program)
         .args(argv)
         .env_remove(ENV_TRAMPOLINE)
@@ -495,6 +525,10 @@ pub async fn spawn(
 /// module (and is a no-op in an ordinary test run). The `--` makes libtest
 /// take the marker, the program and its arguments as test-name filters, which
 /// match nothing else under `--exact`.
+///
+/// A module argument equal to another test's full name would select that test
+/// too; `start_with` in the tests refuses arguments containing `::tests::`, so
+/// no test here can pass one by accident.
 ///
 /// **Not single-threaded**, unlike the daemon's `main`: libtest runs the test
 /// on a worker thread while its main thread waits. The waiting thread opens no
@@ -796,6 +830,13 @@ mod tests {
         command: &SpawnCommand,
         listener: std::net::TcpListener,
     ) -> ModuleProcess {
+        // Through the test trampoline, module arguments are libtest filters: one
+        // equal to a test's full name would run that test in the child too.
+        assert!(
+            !command.args.iter().any(|a| a.contains("::tests::")),
+            "a module argument that names a test: {:?}",
+            command.args
+        );
         let trampoline = crate::launch::test_trampoline();
         spawn(
             LaunchSpec {
@@ -1259,6 +1300,22 @@ mod tests {
         assert_eq!(exit.code, Some(0), "{exit}");
         assert_eq!(read(t.path(), "out").trim(), "2000");
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// The trampoline's own check: a complete listing of this process's fds
+    /// finds an fd that is open at or above a bound, and nothing above one
+    /// that no fd reaches.
+    #[test]
+    fn the_fd_listing_finds_a_high_fd_and_nothing_above_it() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let high = rustix::io::fcntl_dupfd_cloexec(&file, 900).unwrap();
+        let number = std::os::fd::AsRawFd::as_raw_fd(&high);
+        let found = open_fd_at_or_above(number).unwrap();
+        assert!(
+            found.is_some_and(|fd| fd >= number),
+            "{found:?} for {number}"
+        );
+        assert_eq!(open_fd_at_or_above(i32::MAX).unwrap(), None);
     }
 
     /// What the module's exit looked like comes back: `exited` reports it, and

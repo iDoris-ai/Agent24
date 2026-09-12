@@ -104,7 +104,16 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // the promise is that a refused install leaves no trace, and an empty
     // `packages/` directory that only exists because someone tried once is a
     // trace.
-    let root_existed = entry_exists(packages_root).unwrap_or(true);
+    //
+    // Every directory this call is about to create — the root and any missing
+    // parents, deepest first — because `ensure_packages_root` creates parents
+    // too, and undoing only the root left them behind (review of ME3-SUP slice
+    // 1, round 3′).
+    let created: Vec<PathBuf> = packages_root
+        .ancestors()
+        .take_while(|p| !p.as_os_str().is_empty() && !entry_exists(p).unwrap_or(true))
+        .map(Path::to_path_buf)
+        .collect();
     // The daemon's own check, not `create_dir_all`: under `umask 002` that made
     // the root `0775`, the install succeeded, and the next daemon start refused
     // the whole root (review of ME3-SUP slice 1, round 3). This creates it
@@ -113,11 +122,12 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     crate::ensure_packages_root(packages_root)
         .map_err(|e| InstallError::Filesystem(e.to_string()))?;
     let undo_root = || {
-        if !root_existed {
+        for dir in &created {
             // `remove_dir` (not `_all`): it only succeeds while the directory is
             // still empty, so a concurrent install that already put something
-            // there is never destroyed by our cleanup.
-            let _ = std::fs::remove_dir(packages_root);
+            // there is never destroyed by our cleanup. Deepest first, so each
+            // parent is empty by the time it is tried.
+            let _ = std::fs::remove_dir(dir);
         }
     };
 
@@ -369,6 +379,26 @@ mod tests {
     /// package, so an install that kept a `0664` file (or made `0775`
     /// directories under `umask 002`) would succeed and leave a package that
     /// can never run.
+    /// A refused install leaves no trace — including parents of the packages
+    /// root that the install itself created (`ensure_packages_root` creates them;
+    /// undoing only the root left them behind).
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_install_removes_the_parents_it_created() {
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+        // Refused mid-copy: a symlink in the source (copy_tree refuses those),
+        // which is after the root and its parents have been created.
+        std::os::unix::fs::symlink("/etc/hosts", src.join("link")).unwrap();
+        let root = t.path().join("a/b/packages");
+        install(&src, &root).expect_err("a symlink in the source");
+        assert!(
+            !t.path().join("a").exists(),
+            "the refused install left {} behind",
+            t.path().join("a").display()
+        );
+    }
+
     /// The packages root is created `0700`, and an existing one anyone else can
     /// write is refused at install time — not accepted by the install and then
     /// refused by the next daemon start.
