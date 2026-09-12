@@ -99,30 +99,25 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
         return Err(InstallError::AlreadyInstalled(manifest.name().to_owned()));
     }
 
-    // Whether the root existed BEFORE this call decides what a failure has to
-    // clean up. If this call created it, a later failure must take it away again:
-    // the promise is that a refused install leaves no trace, and an empty
-    // `packages/` directory that only exists because someone tried once is a
-    // trace.
+    // What this call creates decides what a failure has to clean up. If it
+    // created the root — or any parent of it — a later failure must take that
+    // away again: the promise is that a refused install leaves no trace, and an
+    // empty `packages/` directory that only exists because someone tried once is
+    // a trace.
     //
-    // Every directory this call is about to create — the root and any missing
-    // parents, deepest first — because `ensure_packages_root` creates parents
-    // too, and undoing only the root left them behind (review of ME3-SUP slice
-    // 1, round 3′).
-    let created: Vec<PathBuf> = packages_root
-        .ancestors()
-        .take_while(|p| !p.as_os_str().is_empty() && !entry_exists(p).unwrap_or(true))
-        .map(Path::to_path_buf)
-        .collect();
-    // The daemon's own check, not `create_dir_all`: under `umask 002` that made
-    // the root `0775`, the install succeeded, and the next daemon start refused
-    // the whole root (review of ME3-SUP slice 1, round 3). This creates it
-    // `0700` (parents included) and refuses an existing root anyone else can
-    // write NOW, rather than after the install claimed success.
-    crate::ensure_packages_root(packages_root)
-        .map_err(|e| InstallError::Filesystem(e.to_string()))?;
+    // So the directories are created HERE, one level at a time from the top,
+    // and each one that this call created is recorded as it is made: then any
+    // failure — including one part-way down the path — can take back exactly
+    // what was made. (Handing the whole path to a recursive create, as the
+    // round-3 fix did, made parents that a failure deeper down left behind:
+    // review of ME3-SUP slice 1, round 3″.) `ensure_packages_root` then checks
+    // the root as it would for a daemon start: owned by us, nobody else can
+    // write it — refused NOW rather than after the install claimed success
+    // (under `umask 002` a plain `create_dir_all` made it `0775`, the install
+    // succeeded, and the next daemon start refused the whole root).
+    let created = create_missing_dirs(packages_root)?;
     let undo_root = || {
-        for dir in &created {
+        for dir in created.iter().rev() {
             // `remove_dir` (not `_all`): it only succeeds while the directory is
             // still empty, so a concurrent install that already put something
             // there is never destroyed by our cleanup. Deepest first, so each
@@ -130,6 +125,10 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
             let _ = std::fs::remove_dir(dir);
         }
     };
+    if let Err(e) = crate::ensure_packages_root(packages_root) {
+        undo_root();
+        return Err(InstallError::Filesystem(e.to_string()));
+    }
 
     // Staging lives INSIDE the packages root, not in the system temp directory.
     // That is the whole point: `/tmp` is frequently a different volume (it is on
@@ -290,6 +289,51 @@ fn remove_quietly(p: &Path) {
     let _ = std::fs::remove_dir_all(p);
 }
 
+/// Create `path` and every missing directory above it, top-down, each `0700`.
+/// Returns the directories this call created, top-down. On failure, removes
+/// what it created before returning the error.
+///
+/// "Missing" is "not confirmed to exist": an ancestor whose `symlink_metadata`
+/// fails for any reason (not found, a component too long, a file where a
+/// directory should be) is attempted, so that the create reports the real
+/// error — and an ancestor that does exist (even as a dangling symlink) ends
+/// the walk up, so nothing that was there before is ever recorded as ours.
+#[cfg(unix)]
+fn create_missing_dirs(path: &Path) -> Result<Vec<PathBuf>, InstallError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|p| !p.as_os_str().is_empty() && std::fs::symlink_metadata(p).is_err())
+        .collect();
+    missing.reverse();
+    let mut created = Vec::new();
+    for dir in missing {
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => created.push(dir.to_path_buf()),
+            // Made by a concurrent install between the look and the create:
+            // not ours to remove.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                for made in created.iter().rev() {
+                    let _ = std::fs::remove_dir(made);
+                }
+                return Err(InstallError::Filesystem(format!(
+                    "could not create {}: {e}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok(created)
+}
+
+#[cfg(not(unix))]
+fn create_missing_dirs(path: &Path) -> Result<Vec<PathBuf>, InstallError> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| InstallError::Filesystem(format!("could not create packages root: {e}")))?;
+    Ok(Vec::new())
+}
+
 /// Copy a package tree. Symlinks are refused rather than followed, for the reason
 /// `os_discovery` refuses a symlinked manifest: a package's identity is decided by
 /// a file inside it, and a link lets that file live outside the tree being
@@ -392,6 +436,23 @@ mod tests {
         std::os::unix::fs::symlink("/etc/hosts", src.join("link")).unwrap();
         let root = t.path().join("a/b/packages");
         install(&src, &root).expect_err("a symlink in the source");
+        assert!(
+            !t.path().join("a").exists(),
+            "the refused install left {} behind",
+            t.path().join("a").display()
+        );
+    }
+
+    /// The same when the failure is part-way down the path to the root itself:
+    /// `a` can be created, the next component cannot (it is longer than any
+    /// filesystem allows a name to be) — `a` must not be left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_created_leaves_no_parents_behind() {
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+        let root = t.path().join("a").join("x".repeat(300)).join("packages");
+        install(&src, &root).expect_err("an uncreatable root");
         assert!(
             !t.path().join("a").exists(),
             "the refused install left {} behind",
