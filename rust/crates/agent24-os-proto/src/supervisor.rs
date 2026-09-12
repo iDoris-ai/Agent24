@@ -98,6 +98,10 @@ pub enum Status {
     /// The supervisor itself panicked — a bug. The module was killed and the
     /// slot says `module_stopping`.
     Panicked,
+    /// The handle was dropped without a stop: the task was aborted and the
+    /// module's group sent SIGKILL — without waiting to see it gone, unlike
+    /// `Stopped`.
+    Killed,
 }
 
 /// Builds the callback methods for one generation. Called once per run, with
@@ -158,8 +162,10 @@ impl Drop for SupervisorHandle {
 /// answered `503 module_not_ready` rather than reaching a dead generation).
 /// Starting a supervisor takes the slot over at once; from then on it changes
 /// only what it put there itself, so a supervisor still winding down never
-/// touches the generation of one started after it — and when it finds the
-/// slot taken over, it stops its run and ends.
+/// touches the generation of one started after it. A supervisor whose slot is
+/// taken over treats that like a stop: it stops its run (grace included) and
+/// ends — two runs of one module never share its data directory for longer
+/// than that stop.
 #[must_use]
 pub fn supervise(
     spec: ModuleSpec,
@@ -206,12 +212,18 @@ enum Run {
 struct Slot {
     current: Arc<Current>,
     mine: std::sync::Mutex<Arc<Generation>>,
+    /// This supervisor's claim, and where a later one shows up.
+    claim: u64,
+    owner: watch::Receiver<u64>,
 }
 
 impl Slot {
     /// Put a fresh placeholder in, unconditionally: the newest supervisor for
     /// a slot owns it.
     fn take_over(current: Arc<Current>) -> Self {
+        // Claimed before the slot is replaced; either order would do — a
+        // supervisor ending on the new claim stops writing to the slot too.
+        let (claim, owner) = current.claim();
         let mine = Generation::starting();
         // Out goes whatever was there — the caller's initial placeholder, or
         // the generation of a supervisor this one replaces, which that one
@@ -220,7 +232,17 @@ impl Slot {
         Self {
             current,
             mine: std::sync::Mutex::new(mine),
+            claim,
+            owner,
         }
+    }
+
+    /// Resolves once a newer supervisor has claimed the slot.
+    async fn superseded(&self) {
+        let mut owner = self.owner.clone();
+        // The sender lives in `current`, which this holds: `Err` cannot
+        // happen, and would end this supervisor — the safe direction.
+        let _ = owner.wait_for(|n| *n != self.claim).await;
     }
 
     fn mine(&self) -> std::sync::MutexGuard<'_, Arc<Generation>> {
@@ -272,8 +294,9 @@ impl Drop for OnExit<'_> {
             *self.status.borrow(),
             Status::Stopped | Status::GaveUp { .. }
         ) {
-            // Aborted (the handle was dropped): the process went with the task.
-            self.status.send_replace(Status::Stopped);
+            // Aborted (the handle was dropped): the process went with the task,
+            // SIGKILLed, not waited for — so not `Stopped`.
+            self.status.send_replace(Status::Killed);
         }
     }
 }
@@ -332,7 +355,7 @@ async fn run_loop(
                 });
                 tokio::select! {
                     biased;
-                    () = stop_requested(&mut stop) => {
+                    () = told_to_end(&mut stop, &slot) => {
                         // The placeholder put in above must not outlive the
                         // module: `module_not_ready` would promise a return.
                         slot.retire();
@@ -351,7 +374,7 @@ async fn run_loop(
                     failures: after,
                     within,
                 });
-                stop_requested(&mut stop).await;
+                told_to_end(&mut stop, &slot).await;
                 status.send_replace(Status::Stopped);
                 return;
             }
@@ -398,7 +421,7 @@ async fn run_once(
     // end on its own thread, bounded by the entry cap.)
     let spawned = tokio::select! {
         biased;
-        () = stop_requested(stop) => return Run::StopRequested,
+        () = told_to_end(stop, slot) => return Run::StopRequested,
         spawned = launch::spawn(LaunchSpec {
             name: &spec.name,
             command: &spec.command,
@@ -434,7 +457,7 @@ async fn run_once(
     let deadline = tokio::time::Instant::now() + timings.startup;
     let handshaken = tokio::select! {
         biased;
-        () = stop_requested(stop) => {
+        () = told_to_end(stop, slot) => {
             finish(process, timings, &spec.name, status).await;
             return Run::StopRequested;
         }
@@ -484,7 +507,7 @@ async fn run_once(
     );
     let outcome = tokio::select! {
         biased;
-        () = stop_requested(stop) => None,
+        () = told_to_end(stop, slot) => None,
         ended = serve => Some(format!("the callback connection ended: {ended:?}")),
         exited = process.exited() => Some(format!("the module exited: {exited:?}")),
     };
@@ -499,6 +522,19 @@ async fn run_once(
                 ready_at: Some(ready_at),
                 ended_at,
             }
+        }
+    }
+}
+
+/// Resolves once this supervisor must end: a stop was requested, or a newer
+/// supervisor took the slot over. Both end the same way — the run stopped with
+/// its grace, and the loop over.
+async fn told_to_end(stop: &mut watch::Receiver<bool>, slot: &Slot) {
+    tokio::select! {
+        biased;
+        () = stop_requested(stop) => {}
+        () = slot.superseded() => {
+            tracing::warn!("another supervisor took this module's slot over; ending");
         }
     }
 }
@@ -553,7 +589,8 @@ mod tests {
     /// A module in Python. `mode`: `normal` (serve until the callback ends —
     /// D1's module side), `crash` (exit right after the handshake), `silent`
     /// (never connect), `hangup` (close the callback, keep running). Every
-    /// start appends `<pid> <token> <wall time>` to `<data>/starts`. `early`:
+    /// start appends `<pid> <token> <CLOCK_MONOTONIC>` to `<data>/starts` —
+    /// system-wide, unlike Python's `time.monotonic()` on macOS. `early`:
     /// exit without ever connecting. `stubborn`: like `hangup`, but ignoring
     /// SIGTERM, so its stop lasts the whole grace.
     const MOCK: &str = r#"import json, os, socket, sys, time
@@ -561,7 +598,7 @@ mode, name, digest = sys.argv[1], sys.argv[2], sys.argv[3]
 data = os.environ["A24_DATA_DIR"]
 token = os.environ["A24_HANDSHAKE_TOKEN"]
 with open(os.path.join(data, "starts"), "a") as f:
-    f.write("%d %s %f\n" % (os.getpid(), token, time.time()))
+    f.write("%d %s %f\n" % (os.getpid(), token, time.clock_gettime(time.CLOCK_MONOTONIC)))
 if mode == "silent":
     time.sleep(60)
     sys.exit(0)
@@ -786,7 +823,7 @@ sys.exit(0)
     async fn restarts_wait_out_a_doubling_backoff() {
         let f = fixture("crash");
         let current = Current::new(Generation::starting());
-        let base = Duration::from_millis(150);
+        let base = Duration::from_millis(300);
         let timings = Timings {
             backoff_base: base,
             ..fast()
@@ -860,11 +897,13 @@ sys.exit(0)
         stop(handle).await;
     }
 
-    /// A supervisor winding down never touches the slot once a newer one has
-    /// taken it over: stopping the old one leaves the new one's generation in
-    /// the slot, Running (review of ME3-SUP slice 3a, round 2).
+    /// A healthy supervisor whose slot is taken over ends by itself — nobody
+    /// stops it: its module is stopped and its generation revoked, so two runs
+    /// of one module do not go on side by side (review of ME3-SUP slice 3a,
+    /// round 3). And winding down, it never touches the slot: the new one's
+    /// generation stays there, Running (round 2).
     #[tokio::test]
-    async fn an_old_supervisor_leaves_its_successor_s_generation_alone() {
+    async fn a_superseded_healthy_supervisor_ends_by_itself_and_leaves_the_slot_alone() {
         let current = Current::new(Generation::starting());
         let a = fixture("normal");
         let old = supervise(
@@ -891,20 +930,29 @@ sys.exit(0)
         })
         .await;
         let theirs = current.get();
-        stop(old).await;
+        until(&mut old.subscribe(), "the old one ending by itself", |s| {
+            *s == Status::Stopped
+        })
+        .await;
+        let (old_pid, _) = starts(a.data.path())[0].clone();
+        assert!(
+            gone(old_pid).await,
+            "the superseded module was left running"
+        );
         assert!(
             Arc::ptr_eq(&current.get(), &theirs),
             "the old supervisor replaced the slot"
         );
         assert_eq!(theirs.state(), crate::drain::DrainState::Running);
+        stop(old).await;
         stop(new).await;
     }
 
-    /// A supervisor whose slot was taken over does not put its next run there:
-    /// at its next restart it finds the slot is not its own, and ends by
-    /// itself — the newer supervisor's generation stays.
+    /// A crash-looping supervisor whose slot was taken over ends too, between
+    /// runs, and never puts a run of its own into the slot again — the newer
+    /// supervisor's generation stays.
     #[tokio::test]
-    async fn a_superseded_supervisor_ends_at_its_next_restart() {
+    async fn a_superseded_crash_looping_supervisor_ends_too() {
         let current = Current::new(Generation::starting());
         let a = fixture("crash");
         let timings = Timings {
@@ -1141,5 +1189,14 @@ sys.exit(0)
         let (pid, _) = starts(f.data.path())[0].clone();
         drop(handle);
         assert!(gone(pid).await, "the module outlived a dropped supervisor");
+        // `Killed`, not `Stopped`: the kill was sent, its end not waited for.
+        let killed = tokio::time::timeout(
+            Duration::from_secs(10),
+            rx.wait_for(|s| *s == Status::Killed),
+        )
+        .await
+        .expect("the status never said Killed")
+        .is_ok();
+        assert!(killed, "the status ended as {:?}, not Killed", *rx.borrow());
     }
 }

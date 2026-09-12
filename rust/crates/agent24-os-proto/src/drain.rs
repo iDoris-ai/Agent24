@@ -467,6 +467,9 @@ impl Abandoned {
 #[derive(Debug)]
 pub struct Current {
     slot: Mutex<Arc<Generation>>,
+    /// Bumped by every [`Current::claim`]: whoever claimed earlier learns it
+    /// no longer owns the slot by seeing a number that is not its own.
+    owner: tokio::sync::watch::Sender<u64>,
 }
 
 impl Current {
@@ -474,7 +477,21 @@ impl Current {
     pub fn new(generation: Arc<Generation>) -> Arc<Self> {
         Arc::new(Self {
             slot: Mutex::new(generation),
+            owner: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    /// Become the slot's owner: a claim number, and a receiver on which every
+    /// later claim shows up as a different number. For a supervisor, which
+    /// must end when a newer one takes its slot over — not just stop writing
+    /// to the slot (review of ME3-SUP slice 3a, round 3).
+    pub(crate) fn claim(&self) -> (u64, tokio::sync::watch::Receiver<u64>) {
+        let mut claimed = 0;
+        self.owner.send_modify(|n| {
+            *n += 1;
+            claimed = *n;
+        });
+        (claimed, self.owner.subscribe())
     }
 
     #[must_use]

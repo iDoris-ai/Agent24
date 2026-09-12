@@ -675,6 +675,16 @@ impl Drop for ModuleProcess {
                     Ok(()) => "SIGKILL sent".to_owned(),
                     Err(e) => format!("SIGKILL failed: {e}"),
                 },
+                // Only interrupts kept the answer from us. The leader is still
+                // unreaped — only this owner reaps it — so the group id is
+                // still ours, and the kill is owed (review of ME3-SUP slice 3a,
+                // round 3). Any other error leaves ownership unknown.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    match self.signal(Signal::Kill, false) {
+                        Ok(()) => "SIGKILL sent (leader state unknown: interrupted)".to_owned(),
+                        Err(e) => format!("SIGKILL failed: {e}"),
+                    }
+                }
                 Err(e) => format!("could not tell whether the leader exited: {e}"),
             }
         };
