@@ -16,8 +16,10 @@
 //! Two of the three rules below are structural; one rests on a convention, and
 //! saying which is which is the point of this paragraph.
 //!
-//! - **The upstream is a [`SocketAddr`], not a URL.** A module therefore has no
-//!   way to name a host — the local-SSRF pivot §1 refuses to allow is not
+//! - **The upstream is a [`SocketAddr`], not a URL** — and it is the address
+//!   of the generation a request was admitted into (SUP-3b), set by the kernel
+//!   when it spawned that run on a port of its own (D4). A module therefore has
+//!   no way to name a host — the local-SSRF pivot §1 refuses to allow is not
 //!   defended against here, it is unrepresentable. Structural.
 //! - **Every `X-A24-*` header is dropped in BOTH directions**, then the kernel
 //!   writes its own. A client cannot forge a lease and a module cannot echo one
@@ -403,11 +405,10 @@ fn normalise_dot_segments(path: &str) -> Option<String> {
 #[derive(Clone)]
 struct ProxyState {
     namespace: Arc<String>,
-    upstream: SocketAddr,
-    /// Which run of the module serves this namespace, and whether it is taking
-    /// requests (ME-3b-5). Read once per request.
+    /// Which run of the module serves this namespace, whether it is taking
+    /// requests (ME-3b-5), and where it listens (SUP-3b: each run its own
+    /// port, D4). Read once per request.
     module: Arc<Current>,
-    client: Client,
     ids: Arc<RequestIds>,
     limits: Limits,
     /// The ceiling on concurrent proxied requests for THIS module. One per
@@ -444,10 +445,49 @@ impl Default for Limits {
     }
 }
 
-type Client = hyper_util::client::legacy::Client<
-    hyper_util::client::legacy::connect::HttpConnector,
-    Full<Bytes>,
->;
+/// The connection one proxied request travels on, and nothing else.
+///
+/// One connection per request, not a pool (SUP-3b, FU-47/FU-50). A pooled
+/// client kept a request's body inside hyper until the upstream connection
+/// closed — after a revocation, or behind a module that answered without
+/// reading its body and kept the connection open — and pooled connections are
+/// keyed by address, the wrong key once addresses belong to generations. Here
+/// the connection's driver is aborted when this is dropped: once the response
+/// has been collected, or when the request is given up. Loopback connects are
+/// cheap; a module holding requests' memory is not.
+struct UpstreamConnection(tokio::task::JoinHandle<()>);
+
+impl Drop for UpstreamConnection {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Connect to `upstream`, send `request` on a connection of its own, and
+/// return the response head with the connection that carries its body.
+async fn exchange(
+    upstream: SocketAddr,
+    request: Request<Full<Bytes>>,
+) -> Result<(hyper::Response<hyper::body::Incoming>, UpstreamConnection), String> {
+    let stream = tokio::net::TcpStream::connect(upstream)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = stream.set_nodelay(true);
+    let (mut sender, driver) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .map_err(|e| e.to_string())?;
+    // Owned before the request is sent: a caller that gives up mid-send drops
+    // this future, and with it the guard, which ends the connection.
+    let connection = UpstreamConnection(tokio::spawn(async move {
+        let _ = driver.await;
+    }));
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((response, connection))
+}
 
 /// Correlation ids: a per-daemon random prefix and a counter.
 ///
@@ -504,10 +544,10 @@ fn short_prefix() -> String {
 /// rather than nesting it directly: `nest` does not cover the bare trailing
 /// slash (matchit's `{*rest}` will not match an empty segment), and that rule
 /// belongs in one place.
-pub fn proxy_router(namespace: &str, upstream: SocketAddr, module: Arc<Current>) -> Router {
+pub fn proxy_router(namespace: &str, module: Arc<Current>) -> Router {
     Router::new()
         .fallback(proxy)
-        .with_state(state_for(namespace, upstream, module))
+        .with_state(state_for(namespace, module))
 }
 
 /// Nest [`proxy_router`] under `namespace`, trailing slash included.
@@ -515,8 +555,11 @@ pub fn proxy_router(namespace: &str, upstream: SocketAddr, module: Arc<Current>)
 /// One [`ProxyState`], shared by both routes, so the two cannot drift — in
 /// particular so `/api/v1/ns/` and `/api/v1/ns/x` mint request ids from the
 /// same sequence rather than from two that look unrelated in a log.
-pub fn mount(app: Router, namespace: &str, upstream: SocketAddr, module: Arc<Current>) -> Router {
-    let state = state_for(namespace, upstream, module);
+///
+/// There is no address here: each request goes to the address of the
+/// generation it was admitted into (SUP-3b, D4).
+pub fn mount(app: Router, namespace: &str, module: Arc<Current>) -> Router {
+    let state = state_for(namespace, module);
     app.nest(
         namespace,
         Router::new().fallback(proxy).with_state(state.clone()),
@@ -527,10 +570,9 @@ pub fn mount(app: Router, namespace: &str, upstream: SocketAddr, module: Arc<Cur
     )
 }
 
-fn state_for(namespace: &str, upstream: SocketAddr, module: Arc<Current>) -> ProxyState {
+fn state_for(namespace: &str, module: Arc<Current>) -> ProxyState {
     state_with(
         namespace,
-        upstream,
         module,
         Limits::default(),
         MAX_INFLIGHT_PER_MODULE,
@@ -539,17 +581,13 @@ fn state_for(namespace: &str, upstream: SocketAddr, module: Arc<Current>) -> Pro
 
 fn state_with(
     namespace: &str,
-    upstream: SocketAddr,
     module: Arc<Current>,
     limits: Limits,
     inflight: usize,
 ) -> ProxyState {
     ProxyState {
         namespace: Arc::new(namespace.to_owned()),
-        upstream,
         module,
-        client: hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http(),
         ids: Arc::new(RequestIds::new()),
         limits,
         inflight: Arc::new(tokio::sync::Semaphore::new(inflight)),
@@ -679,16 +717,25 @@ async fn forward(
         headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
     }
 
+    // The address of the generation this request was admitted into (D4) —
+    // never the slot's by now, which a restart may have replaced.
+    let Some(upstream) = in_flight.upstream() else {
+        // Unreachable: only a `Running` generation admits, and `ready` gives
+        // that state only to a generation with an address. Refused rather than
+        // trusted to be impossible.
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unavailable",
+            "the module's run has no address to send the request to",
+        );
+    };
     let path_and_query = original
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let upstream_uri = match Uri::builder()
-        .scheme("http")
-        .authority(state.upstream.to_string())
-        .path_and_query(path_and_query)
-        .build()
-    {
+    // Origin-form, with the authority in `Host`: this is a connection to the
+    // module, not a request to be routed by a proxy.
+    let upstream_uri = match Uri::builder().path_and_query(path_and_query).build() {
         Ok(u) => u,
         Err(e) => {
             return error_response(
@@ -716,6 +763,11 @@ async fn forward(
         }
     };
     *upstream_request.headers_mut() = headers;
+    if let Ok(host) = HeaderValue::from_str(&upstream.to_string()) {
+        upstream_request
+            .headers_mut()
+            .insert(axum::http::header::HOST, host);
+    }
 
     // Two deadlines, because they answer different questions (§5): a module that
     // has not produced a response HEAD is wedged, while one still sending a body
@@ -733,22 +785,21 @@ async fn forward(
     if !in_flight.dispatch() {
         return refused_response(RequestRefused::Stopping);
     }
-    let response = match tokio::time::timeout_at(
-        head_deadline,
-        state.client.request(upstream_request),
-    )
-    .await
-    {
-        Err(_) => return timed_out(state, TimedOut::UpstreamHead(head_budget)),
-        Ok(Err(e)) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_unavailable",
-                &format!("the module could not be reached: {e}"),
-            );
-        }
-        Ok(Ok(r)) => r,
-    };
+    // `_connection` lives to the end of this function: the body is collected
+    // below, then it is dropped and the connection ends — whatever the module
+    // does with the rest of it (FU-47).
+    let (response, _connection) =
+        match tokio::time::timeout_at(head_deadline, exchange(upstream, upstream_request)).await {
+            Err(_) => return timed_out(state, TimedOut::UpstreamHead(head_budget)),
+            Ok(Err(e)) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_unavailable",
+                    &format!("the module could not be reached: {e}"),
+                );
+            }
+            Ok(Ok(r)) => r,
+        };
 
     let (parts, upstream_body) = response.into_parts();
 
@@ -1252,10 +1303,8 @@ mod tests {
 
     /// A module that has completed its handshake — what every test before
     /// ME-3b-5 implicitly assumed.
-    fn running_module() -> Arc<Current> {
-        let g = crate::drain::Generation::starting();
-        assert!(g.ready());
-        Current::new(g)
+    fn running_module(upstream: SocketAddr) -> Arc<Current> {
+        Current::new(running_generation(upstream))
     }
 
     async fn serve(app: Router) -> SocketAddr {
@@ -1276,7 +1325,7 @@ mod tests {
                 .with_state(hits.clone()),
         )
         .await;
-        let proxy = serve(mount(Router::new(), NS, upstream, running_module())).await;
+        let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
         (proxy, hits)
     }
 
@@ -1291,6 +1340,12 @@ mod tests {
             serde_json::from_str(&self.body).unwrap()
         }
     }
+
+    /// The test's own HTTP client — a pooled one is fine on this side.
+    type Client = hyper_util::client::legacy::Client<
+        hyper_util::client::legacy::connect::HttpConnector,
+        Full<Bytes>,
+    >;
 
     async fn call(
         addr: SocketAddr,
@@ -1462,7 +1517,7 @@ mod tests {
             }
         });
 
-        let proxy = serve(mount(Router::new(), NS, upstream, running_module())).await;
+        let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
         let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert!(!got.body.contains("partial"), "{}", got.body);
@@ -1476,7 +1531,7 @@ mod tests {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             l.local_addr().unwrap()
         };
-        let proxy = serve(mount(Router::new(), NS, dead, running_module())).await;
+        let proxy = serve(mount(Router::new(), NS, running_module(dead))).await;
         let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert!(got.body.contains("upstream_unavailable"), "{}", got.body);
@@ -1566,16 +1621,15 @@ mod tests {
         limits: Limits,
         inflight: usize,
     ) -> (Router, Arc<tokio::sync::Semaphore>) {
-        proxy_and_permits_for(running_module(), upstream, limits, inflight)
+        proxy_and_permits_for(running_module(upstream), limits, inflight)
     }
 
     fn proxy_and_permits_for(
         module: Arc<Current>,
-        upstream: SocketAddr,
         limits: Limits,
         inflight: usize,
     ) -> (Router, Arc<tokio::sync::Semaphore>) {
-        let state = state_with(NS, upstream, module, limits, inflight);
+        let state = state_with(NS, module, limits, inflight);
         let sem = state.inflight.clone();
         (Router::new().fallback(proxy).with_state(state), sem)
     }
@@ -1829,7 +1883,7 @@ mod tests {
 
         let hits = Hits::default();
         let upstream = serve(Router::new().fallback(upstream_handler).with_state(hits)).await;
-        let state = state_with(NS, upstream, running_module(), Limits::default(), 1);
+        let state = state_with(NS, running_module(upstream), Limits::default(), 1);
         let sem = state.inflight.clone();
         let app = Router::new().fallback(proxy).with_state(state);
 
@@ -2284,6 +2338,159 @@ mod tests {
         let _ = first.await;
     }
 
+    // ── SUP-3b: the address is the admitted generation's; one connection
+    //    per request ─────────────────────────────────────────────────────
+
+    /// A module that reads a request's head and then either answers at once —
+    /// without reading the body, keeping the connection open — or never
+    /// answers. Resolves `closed` when the proxy ends the connection.
+    async fn upstream_watching_close(
+        answer: bool,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+            if answer {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+            }
+            // Never close from this side: only the proxy can end it now.
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+        (addr, closed_rx)
+    }
+
+    /// FU-47: a module that answers without reading its body and keeps the
+    /// connection open does not keep that body — or the connection — inside
+    /// the kernel: once the answer is collected, the proxy ends the connection
+    /// — no pool keeps it alive. (For a body hyper is still blocked writing,
+    /// see the next test.)
+    #[tokio::test]
+    async fn the_upstream_connection_ends_with_its_request() {
+        let (upstream, closed) = upstream_watching_close(true).await;
+        let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
+        let got = call(proxy, Method::POST, &format!("{NS}/a"), &[], "never read").await;
+        assert_eq!(got.status, StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the upstream connection outlived its request")
+            .unwrap();
+    }
+
+    /// The connection guard ends a connection hyper is still blocked on: a
+    /// request body far larger than any socket buffer, to a module that
+    /// answered without reading it. Dropping the guard closes the connection;
+    /// without the abort, hyper would keep writing — and keep the body — for
+    /// as long as the module keeps the connection open.
+    #[tokio::test]
+    async fn dropping_the_connection_guard_ends_a_connection_blocked_on_its_body() {
+        let (upstream, closed) = upstream_watching_close(true).await;
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/a")
+            .header(axum::http::header::HOST, upstream.to_string())
+            .body(Full::new(Bytes::from(vec![b'x'; 64 * 1024 * 1024])))
+            .unwrap();
+        let (response, connection) = exchange(upstream, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await;
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the connection outlived its guard")
+            .unwrap();
+    }
+
+    /// FU-47, the other way a request ends: revoked while the module sits on
+    /// it. The client is answered at once, and the connection — with the body
+    /// hyper was given — ends with it.
+    #[tokio::test]
+    async fn a_revoked_request_takes_its_upstream_connection_with_it() {
+        let (upstream, closed) = upstream_watching_close(false).await;
+        let generation = running_generation(upstream);
+        let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
+        let first = tokio::spawn(async move {
+            call(proxy, Method::POST, &format!("{NS}/a"), &[], "body").await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while generation.in_flight() == 0 {
+            assert!(std::time::Instant::now() < deadline, "never admitted");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Let it reach the module before revoking.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = generation.revoke();
+        assert_eq!(first.await.unwrap().status, StatusCode::SERVICE_UNAVAILABLE);
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the upstream connection outlived its revoked request")
+            .unwrap();
+    }
+
+    /// D4: a request goes to the address of the generation it was ADMITTED
+    /// into, even when a restart has put another generation in the slot before
+    /// the request is sent — here while the client is still sending its body.
+    /// Reading the slot at send time would deliver it to the new process.
+    #[tokio::test]
+    async fn a_request_goes_to_the_generation_it_was_admitted_into() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let a = gated(Then::Answer).await;
+        let b = gated(Then::Answer).await;
+        let old = running_generation(a.addr);
+        let current = Current::new(old.clone());
+        let proxy = serve(mount(Router::new(), NS, current.clone())).await;
+
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!("POST {NS}/a HTTP/1.1\r\nhost: x\r\nconnection: close\r\ncontent-length: 4\r\n\r\nab")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while old.in_flight() == 0 {
+            assert!(std::time::Instant::now() < deadline, "never admitted");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // A restart, while the body is still coming.
+        let _ = current.replace(running_generation(b.addr));
+        client.write_all(b"cd").await.unwrap();
+        a.wait_arrived().await;
+        a.release.notify_waiters();
+        let mut response = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response)).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(a.dials.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            b.dials.load(Ordering::SeqCst),
+            0,
+            "sent to the generation that replaced it"
+        );
+    }
+
     // ── ME-3b-5: the proxy side of the two-phase stop ────────────────────
 
     /// What a gated module does once the test lets it go.
@@ -2380,8 +2587,8 @@ mod tests {
         }
     }
 
-    fn running_generation() -> Arc<crate::drain::Generation> {
-        let g = crate::drain::Generation::starting();
+    fn running_generation(upstream: SocketAddr) -> Arc<crate::drain::Generation> {
+        let g = crate::drain::Generation::serving_at(upstream);
         assert!(g.ready());
         g
     }
@@ -2392,14 +2599,8 @@ mod tests {
     #[tokio::test]
     async fn draining_refuses_a_new_request_while_the_one_in_flight_completes() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation();
-        let proxy = serve(mount(
-            Router::new(),
-            NS,
-            module.addr,
-            Current::new(generation.clone()),
-        ))
-        .await;
+        let generation = running_generation(module.addr);
+        let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let first =
             tokio::spawn(
@@ -2448,14 +2649,8 @@ mod tests {
     async fn a_request_whose_generation_is_revoked_gets_a_503_not_the_modules_200() {
         let (logs, _guard) = capture_logs();
         let module = gated(Then::Answer).await;
-        let generation = running_generation();
-        let proxy = serve(mount(
-            Router::new(),
-            NS,
-            module.addr,
-            Current::new(generation.clone()),
-        ))
-        .await;
+        let generation = running_generation(module.addr);
+        let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let first =
             tokio::spawn(
@@ -2489,14 +2684,8 @@ mod tests {
     #[tokio::test]
     async fn a_request_killed_under_a_revocation_is_abandoned_not_blamed_on_the_module() {
         let module = gated(Then::Vanish).await;
-        let generation = running_generation();
-        let proxy = serve(mount(
-            Router::new(),
-            NS,
-            module.addr,
-            Current::new(generation.clone()),
-        ))
-        .await;
+        let generation = running_generation(module.addr);
+        let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let first =
             tokio::spawn(
@@ -2517,7 +2706,7 @@ mod tests {
     #[tokio::test]
     async fn a_module_that_vanishes_on_its_own_is_still_a_502() {
         let module = gated(Then::Vanish).await;
-        let proxy = serve(mount(Router::new(), NS, module.addr, running_module())).await;
+        let proxy = serve(mount(Router::new(), NS, running_module(module.addr))).await;
 
         let first =
             tokio::spawn(
@@ -2536,14 +2725,8 @@ mod tests {
     #[tokio::test]
     async fn a_module_that_is_not_ready_is_never_dialled() {
         let module = gated(Then::Answer).await;
-        let generation = crate::drain::Generation::starting();
-        let proxy = serve(mount(
-            Router::new(),
-            NS,
-            module.addr,
-            Current::new(generation.clone()),
-        ))
-        .await;
+        let generation = crate::drain::Generation::serving_at(module.addr);
+        let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let got = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
         assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -2565,9 +2748,9 @@ mod tests {
     #[tokio::test]
     async fn after_a_restart_the_proxy_admits_into_the_new_generation() {
         let module = gated(Then::Answer).await;
-        let old = running_generation();
+        let old = running_generation(module.addr);
         let current = Current::new(old.clone());
-        let proxy = serve(mount(Router::new(), NS, module.addr, current.clone())).await;
+        let proxy = serve(mount(Router::new(), NS, current.clone())).await;
 
         let _ = old.revoke();
         let refused = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
@@ -2578,7 +2761,7 @@ mod tests {
             refused.body
         );
 
-        let _ = current.replace(running_generation());
+        let _ = current.replace(running_generation(module.addr));
         let next =
             tokio::spawn(
                 async move { call(proxy, Method::GET, &format!("{NS}/b"), &[], "").await },
@@ -2631,14 +2814,8 @@ mod tests {
     #[tokio::test]
     async fn a_revoked_request_is_answered_at_once_not_when_the_process_dies() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation();
-        let proxy = serve(mount(
-            Router::new(),
-            NS,
-            module.addr,
-            Current::new(generation.clone()),
-        ))
-        .await;
+        let generation = running_generation(module.addr);
+        let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let first =
             tokio::spawn(
@@ -2662,14 +2839,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (logs, _guard) = capture_logs();
         let module = gated(Then::Answer).await;
-        let generation = running_generation();
-        let proxy = serve(mount(
-            Router::new(),
-            NS,
-            module.addr,
-            Current::new(generation.clone()),
-        ))
-        .await;
+        let generation = running_generation(module.addr);
+        let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         // A client that promises ten bytes of body and sends one: the request is
         // admitted and stays in the body read, short of the module.
@@ -2720,13 +2891,9 @@ mod tests {
     #[tokio::test]
     async fn a_draining_module_that_is_also_full_says_draining_not_overloaded() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation();
-        let (app, sem) = proxy_and_permits_for(
-            Current::new(generation.clone()),
-            module.addr,
-            Limits::default(),
-            1,
-        );
+        let generation = running_generation(module.addr);
+        let (app, sem) =
+            proxy_and_permits_for(Current::new(generation.clone()), Limits::default(), 1);
         let proxy = serve(app).await;
 
         let first =
@@ -2753,10 +2920,9 @@ mod tests {
     #[tokio::test]
     async fn forward_does_not_send_a_request_whose_generation_was_revoked() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation();
+        let generation = running_generation(module.addr);
         let state = state_with(
             NS,
-            module.addr,
             Current::new(generation.clone()),
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,
@@ -2826,10 +2992,9 @@ mod tests {
     #[tokio::test]
     async fn a_revocation_during_the_body_read_stops_forward_from_sending() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation();
+        let generation = running_generation(module.addr);
         let state = state_with(
             NS,
-            module.addr,
             Current::new(generation.clone()),
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,
@@ -2877,10 +3042,9 @@ mod tests {
     #[tokio::test]
     async fn a_200_that_arrives_after_the_revocation_is_not_committed() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation();
+        let generation = running_generation(module.addr);
         let state = state_with(
             NS,
-            module.addr,
             Current::new(generation.clone()),
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,

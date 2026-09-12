@@ -520,6 +520,9 @@ pub async fn spawn(spec: LaunchSpec<'_>) -> Result<ModuleProcess, LaunchError> {
             .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))??
     };
     let token = mint_token()?;
+    // The generation's address is the listener it hands over (D4): read now,
+    // before the listener moves into the command.
+    let upstream = spec.listener.local_addr().map_err(LaunchError::Spawn)?;
 
     let mut cmd = tokio::process::Command::new(&spec.trampoline.program);
     cmd.args(&spec.trampoline.args)
@@ -564,7 +567,8 @@ pub async fn spawn(spec: LaunchSpec<'_>) -> Result<ModuleProcess, LaunchError> {
             "stderr",
         )));
     }
-    ModuleProcess::new(child, Generation::starting(), token, drains).map_err(LaunchError::Spawn)
+    ModuleProcess::new(child, Generation::serving_at(upstream), token, drains)
+        .map_err(LaunchError::Spawn)
 }
 
 /// The test binary is its own trampoline: started with `--exact` on

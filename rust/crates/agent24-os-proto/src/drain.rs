@@ -232,6 +232,10 @@ pub struct Generation {
     /// waiting for its module the moment its generation is revoked rather than
     /// when the process finally dies (see [`InFlight::revoked`]).
     revoked: tokio::sync::watch::Sender<bool>,
+    /// Where this run's process listens for proxied requests: its own port
+    /// (D4), so a request admitted into this generation reaches this process
+    /// and no other. `None` for a placeholder, which never becomes `Running`.
+    upstream: Option<std::net::SocketAddr>,
 }
 
 /// A request admitted into a generation. Leaves the in-flight set when dropped,
@@ -245,9 +249,23 @@ pub struct InFlight {
 }
 
 impl Generation {
-    /// A freshly spawned module, before `initialize`.
+    /// A placeholder: a slot's generation while no process is serving it —
+    /// before the first run, between runs. It refuses everything
+    /// (`503 module_not_ready`) and can never become `Running`: it has no
+    /// process to send a request to.
     #[must_use]
     pub fn starting() -> Arc<Self> {
+        Self::new(None)
+    }
+
+    /// A freshly spawned module listening at `upstream`, before `initialize`.
+    /// Requests admitted into it are sent there and nowhere else (SUP-3b).
+    #[must_use]
+    pub fn serving_at(upstream: std::net::SocketAddr) -> Arc<Self> {
+        Self::new(Some(upstream))
+    }
+
+    fn new(upstream: Option<std::net::SocketAddr>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 state: DrainState::Starting,
@@ -256,7 +274,15 @@ impl Generation {
                 drain_deadline: None,
             }),
             revoked: tokio::sync::watch::Sender::new(false),
+            upstream,
         })
+    }
+
+    /// Where this run's process listens; `None` for a placeholder. Every
+    /// `Running` generation has one (see [`Generation::ready`]).
+    #[must_use]
+    pub fn upstream(&self) -> Option<std::net::SocketAddr> {
+        self.upstream
     }
 
     // A poisoned lock means another thread panicked while holding it. The state
@@ -282,10 +308,16 @@ impl Generation {
         self.lock().in_flight.len()
     }
 
-    /// `initialize` succeeded. Only from `Starting`; returns `false` otherwise
-    /// (a generation that was revoked while starting stays revoked).
+    /// `initialize` succeeded. Only from `Starting`, and only for a generation
+    /// with a process behind it; returns `false` otherwise (a generation that
+    /// was revoked while starting stays revoked, and a placeholder stays a
+    /// placeholder). So a `Running` generation always has an
+    /// [`upstream`](Generation::upstream).
     #[must_use]
     pub fn ready(&self) -> bool {
+        if self.upstream.is_none() {
+            return false;
+        }
         let mut inner = self.lock();
         if inner.state == DrainState::Starting {
             inner.state = DrainState::Running;
@@ -543,6 +575,15 @@ impl Current {
 }
 
 impl InFlight {
+    /// Where this request goes: the address of the generation it was admitted
+    /// into — not of whatever the slot holds by the time it is sent (D4).
+    /// Always `Some` for an admitted request: only a `Running` generation
+    /// admits, and every `Running` one has an address.
+    #[must_use]
+    pub fn upstream(&self) -> Option<std::net::SocketAddr> {
+        self.generation.upstream()
+    }
+
     /// The kernel-minted request id.
     #[must_use]
     pub fn id(&self) -> &str {
@@ -623,8 +664,14 @@ mod tests {
 
     use super::*;
 
+    /// A generation with a process behind it — the address is never dialled
+    /// by these tests.
+    fn spawned() -> Arc<Generation> {
+        Generation::serving_at("127.0.0.1:9".parse().unwrap())
+    }
+
     fn running() -> Arc<Generation> {
-        let g = Generation::starting();
+        let g = spawned();
         assert!(g.ready());
         g
     }
@@ -788,6 +835,20 @@ mod tests {
             g.progress(t + GRACE),
             DrainProgress::Expired { in_flight: 1 }
         );
+    }
+
+    /// A placeholder has no process behind it, so it can never become
+    /// `Running` — and so a `Running` generation always has an address to send
+    /// a request to (SUP-3b). Control: one with an address can.
+    #[test]
+    fn a_placeholder_can_never_become_running() {
+        let g = Generation::starting();
+        assert!(!g.ready(), "a placeholder became Running");
+        assert_eq!(g.state(), DrainState::Starting);
+        assert_eq!(g.upstream(), None);
+        let s = spawned();
+        assert!(s.ready());
+        assert!(s.upstream().is_some());
     }
 
     /// Before `initialize` nothing is authorised, and there is nothing to drain:
