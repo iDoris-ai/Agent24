@@ -861,10 +861,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let settle = std::time::SystemTime::now();
         tokio::time::sleep(Duration::from_millis(400)).await;
+        // An mtime that cannot be read counts as "touched": the test must fail,
+        // not pass, when it cannot tell.
         !std::fs::metadata(marker)
             .and_then(|m| m.modified())
             .map(|t| t > settle)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// **The reason the child is put in its own process group.**
