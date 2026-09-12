@@ -67,10 +67,22 @@
 - **验收**（取自 SPEC §8 ME-3c 格，每条带正对照）：握手后的超长行被拒并断连；并发在途按 id 配对、响应可乱序；仍在途的 id 被复用 → 该请求失败；`$/cancelRequest` 使目标请求回 cancelled；连接断开则在途请求中止且不产生响应；超时不重试；握手后 params 解析失败 `-32602` 且不派发；坏 params 只失败该行、连接继续；重复 JSON key 被拒；握手后畸形 JSON `-32700` 只失败该行；握手后重复 `initialize` → `-32600` 只失败该行；业务方法一律 `-32601`
 - **证据**：外部评审对 `d983af9` APPROVE（DeepSeek → Opus → Codex → Opus 四轮）；评审方 11 格变异全红；`rpc` 38 条测试、CI 5/5 绿。
 
-### ME3-SUP 3b-3 的 Supervisor —— 让 daemon 真的持有并监督模块进程  `BACKLOG`（排在 T6 之后、T9 之前）
-- **为什么单列**：3b-3 目前只交付了库层零件（`RestartPolicy`、`terminate_group`、`launch::spawn`），daemon 里没有任何代码真正持有一个模块进程。没有它：3b-5 的热 disable 接不进 `os disable`；`KillPermit` 绑定不到具体进程（FU-46）；**T9（3f 仓外包端到端验收）跑不起来**
-- **范围（待开工时细化）**：一个类型同时持有 child 与它那一代的 `Generation`，只暴露先撤后杀的 `stop(self)`，`Launched::child` 改私有（FU-46）；启动 → 握手 → ready → 挂代理 → 崩溃退避/熔断 → 停机的完整生命周期；解除 `domain.rs` 对 out_of_process 的挂载拒绝（**那一天 CLI 两行 help 与 `os_routes.rs` 的承诺到期**，绊线测试已就位）；顺带评估 FU-47
-- **依赖**：T6（回调连接循环）
+### ME3-SUP 3b-3 的 Supervisor —— 让 daemon 真的持有并监督模块进程  `IN_PROGRESS`（排在 T6 之后、T7/T9 之前）
+- **为什么单列**：3b-3 目前只交付了库层零件（`RestartPolicy`、`terminate_group`、`launch::spawn`），daemon 里没有任何代码真正持有一个模块进程。没有它：3b-5 的热 disable 接不进 `os disable`；`KillPermit` 绑定不到具体进程（FU-46）；**T9（3f 仓外包端到端验收）跑不起来**；T7（3e）的 handler 也需要一条已经绑定到某一代的真实回调连接
+- **规划时的三个发现**（2026-09-12，各自核实过）：① `domain.rs` 那道拒绝，真实磁盘包根本走不到 —— `server.rs` 给发现到的包配的 `build` 闭包直接 `Err`，所以绊线测试 `an_out_of_process_manifest_is_refused_not_half_mounted` 测的是另一条路；② SPEC 的「fd 3 传监听 socket」需要 `pre_exec`，与全仓 `forbid(unsafe_code)` 冲突；③ `initialize` 的 `id: u64` 违反 SPEC §3「请求 ID 类型：字符串」
+- **用户裁决（2026-09-12）**：
+  - **D1 回调断线 = 这一代结束**：同一代不许重连；「回调 EOF ⇒ 模块必须退出」写进 wire 契约（于是 daemon 被 SIGKILL 后，孤儿模块会自己退出）
+  - **D2 只做热 disable**：enable 仍下次启动生效；熔断后要恢复就重启 daemon
+  - **D3 fd 3 用 `command-fds` 依赖传**：unsafe 在依赖里，本仓仍零 unsafe，SPEC 不改
+  - **D4 每一代新 bind 一个端口**：代理按代取上游地址（FU-50 随之闭上；旧一代 backlog 里的请求不会被新进程执行）
+- **切成五刀**（SUP-1、SUP-2 可并行；解除挂载拒绝在 SUP-4；ME-3g 与签名都不是它的前提 —— F4e 是正确性问题，不是 §0 意义上的安全问题）：
+  - **SUP-1 进程所有权 + 启动加固** `PR_OPEN`（分支 `feat/me3-sup-1-process`）：`ModuleProcess` 是子进程与它那一代的唯一持有者，只有 `stop(self)` 能杀，而它先撤销**自己那一代**；`revoke` 收成 crate 内可见（FU-46）；drop 也是先撤后杀；spawn 清环境变量到白名单、监听 socket 作为 fd 3、stdin 为 null、stdout/stderr 限行长限速率读走；包目录属主校验；`RestartPolicy::ready` 改为 `ran`（在进程结束时调用，否则计数永不清零）
+  - **SUP-2 回调端点 + 握手驱动**：UDS 目录 `0700` 且校验属主、每代一个短路径、只 accept 一次；握手失败先写错误行再断连；`initialize` 的 id 改字符串；`rpc::serve` 加停止输入
+  - **SUP-3 `Supervisor` 循环**：起 → 握手 → ready → 服务 → 崩溃退避/熔断 → 停，放在库里用 mock 模块测；每代新端口（D4）；FU-44/47/49/50；新建 `publish = false` 的 mock 模块 crate
+  - **SUP-4 接进 daemon，解除挂载拒绝**：`Installed` 分进程内/进程外两种；绊线测试挪到真实路径；daemon 退出时有界地等所有 Supervisor 停完（否则子进程成孤儿）
+  - **SUP-5 热 disable**：`os disable` 对运行中的进程外模块走两阶段停止；CLI help、`os_routes.rs` 文档、`restart_required` 的承诺同时到期
+- **SUP-1 验收**（每条带正对照，变异验证）：外部拿不到许可证、调不了 `revoke`、碰不到子进程（5 条 `compile_fail`，各被对应变异单独弄红，对照 `stop` 能编译）；子进程环境里没有父进程的 `CARGO_MANIFEST_DIR`，只有白名单与 `A24_*`；fd 3 上能 accept；子进程只开着 fd 0–3；模块死后端口立刻拒绝；往 stderr 灌 2 MiB 不阻塞；他人可写的包目录 / `bin/` / 程序被拒；`stop` 撤销的是自己那一代并报告 abandoned / never_sent；drop 先撤后杀；首领按时退出、忽略 SIGTERM 的助手仍被杀
+- **依赖**：T6（回调连接循环）✅
 
 ---
 

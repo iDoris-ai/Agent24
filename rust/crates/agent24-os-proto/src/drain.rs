@@ -37,9 +37,12 @@
 //!
 //! SPEC §4: *"撤 generation 必须早于杀进程（否则宽限期里它还能写）"*. That is a
 //! safety property, and a property that holds because every caller remembered
-//! the order holds until the first caller who did not. So
-//! [`crate::supervise::terminate_group`] takes a [`KillPermit`], and the only
-//! way to obtain one is [`Generation::revoke`]:
+//! the order holds until the first caller who did not. So killing needs a
+//! [`KillPermit`]; the only way to obtain one is [`Generation::revoke`]; and
+//! **both `revoke` and the kill live inside this crate**, behind the one type
+//! that holds a module process — [`crate::supervise::ModuleProcess`]. From
+//! outside, the only way to kill a module is `ModuleProcess::stop`, which
+//! revokes that process's own generation first (FU-46).
 //!
 //! ```compile_fail
 //! // There is no way to build a permit by hand ...
@@ -59,49 +62,46 @@
 //! ```
 //!
 //! ```compile_fail
-//! # fn f(child: &mut std::process::Child) {
-//! // ... and `terminate_group` cannot be called without one.
-//! agent24_os_proto::supervise::terminate_group(child, std::time::Duration::from_secs(1));
+//! // ... or to revoke a generation from outside the crate and take its permit ...
+//! let revocation = agent24_os_proto::drain::Generation::starting().revoke();
+//! ```
+//!
+//! ```compile_fail
+//! // ... or to reach the child around `stop`.
+//! # async fn f(p: agent24_os_proto::supervise::ModuleProcess) {
+//! // (A borrow, not a move: moving out of a type with `Drop` is refused even
+//! // for a public field, which would keep this block red for the wrong reason.)
+//! let child = &p.child;
 //! # }
 //! ```
 //!
-//! **What this does NOT guarantee, stated because it would be easy to read it
-//! in.** A permit is not bound to a process or to the generation that process
-//! belongs to: any revoked generation's permit can kill any group, and the
-//! tests here do exactly that. Nor is `terminate_group` the only way to kill a
-//! process — `Launched::child` is a `std::process::Child`, and `.kill()` needs
-//! no permit. What the type enforces is narrower: **a call to
-//! `terminate_group` is preceded by some call to `revoke`.** Binding the two to
-//! one process is the job of the supervisor that will own both the child and
-//! its generation (ME-3b-3's `Supervisor`, not yet written; FU-46) — and that
-//! type should be the only holder of the child.
-//!
-//! The control for both — the one legal order, which must compile:
+//! The control — the one legal way, which must compile:
 //!
 //! ```no_run
-//! # fn f(child: &mut std::process::Child) {
-//! use agent24_os_proto::drain::Generation;
-//! let generation = Generation::starting();
-//! let revocation = generation.revoke().expect("the first revoke yields the permit");
-//! agent24_os_proto::supervise::terminate_group(revocation.permit, child, std::time::Duration::from_secs(1));
+//! # async fn f(p: agent24_os_proto::supervise::ModuleProcess) {
+//! let report = p.stop(std::time::Duration::from_secs(1)).await;
 //! # }
 //! ```
 //!
 //! **Why the control is there.** Stable rustdoc does not check the error code of
 //! a `compile_fail` block — measured: `compile_fail,E0999` passes. So each of
 //! the blocks above passes for ANY compile error, a typo included, and only
-//! the control shows that the same shape compiles when the permit is
-//! legitimate. Each was mutation-checked: making `_private` public, deriving
-//! `Clone`, adding `impl Default`, and dropping the permit parameter each turn
-//! exactly its block red.
+//! the control shows that the same shape compiles when the path is the legal
+//! one. Each is mutation-checked: making `_private` public, deriving `Clone`,
+//! adding `impl Default`, making `revoke` public, and making the process's
+//! field public each turn exactly its block red.
 //!
-//! Every kill path **must** go through here — a disable, a crash (helpers
+//! **What this still does not guarantee.** Inside this crate, `revoke` and the
+//! kill are ordinary functions; the ordering there rests on review of one small
+//! type, not on the compiler. And the guarantee is about the process
+//! `ModuleProcess` started — a module that hands work to a process outside its
+//! own group (a daemon of its own, say) is outside every kill path by design.
+//!
+//! Every kill path goes through `ModuleProcess` — a disable, a crash (helpers
 //! outlive a dead leader and may still hold the callback connection), a startup
-//! timeout (nothing was ever admitted, so revoking costs nothing). None may be
-//! exempt, because an exemption is a constructor. That is a rule for the
-//! supervisor that does not exist yet (FU-46), not a description of today:
-//! today nothing in the daemon kills a module process at all, and
-//! `Launched::child` can still be killed without a permit.
+//! timeout (nothing was ever admitted, so revoking costs nothing), and dropping
+//! it without stopping it (which revokes, then kills the group without grace).
+//! None may be exempt, because an exemption is a constructor.
 //!
 //! # No clock, no waiting
 //!
@@ -169,11 +169,11 @@ pub enum CallbackRefused {
     Revoked,
 }
 
-/// The one value that allows [`crate::supervise::terminate_group`].
+/// The one value that allows killing a module's process group.
 ///
 /// Not `Clone`, not `Default`, no public constructor: [`Generation::revoke`] is
-/// the only source, so holding one proves that SOME generation was revoked
-/// first — not which one; see the module docs for what that leaves open.
+/// the only source, and only [`crate::supervise::ModuleProcess`] calls it for a
+/// live process — on its own generation. See the module docs.
 #[derive(Debug)]
 pub struct KillPermit {
     _private: (),
@@ -182,7 +182,7 @@ pub struct KillPermit {
 /// What [`Generation::revoke`] hands back.
 #[derive(Debug)]
 pub struct Revocation {
-    /// Allows [`crate::supervise::terminate_group`].
+    /// Allows the kill in [`crate::supervise::ModuleProcess::stop`].
     pub permit: KillPermit,
     /// Requests in flight AND already sent to the module at the moment of
     /// revocation. Their outcome is **unknown** — the module may or may not have
@@ -395,8 +395,12 @@ impl Generation {
     ///
     /// The in-flight set is **kept**: an [`InFlight`] finishing after this
     /// point learns that it was abandoned from [`InFlight::finish`].
+    ///
+    /// Crate-private: outside this crate a generation is revoked only by
+    /// stopping the [`crate::supervise::ModuleProcess`] it belongs to, which is
+    /// what binds the permit to that process (FU-46).
     #[must_use]
-    pub fn revoke(&self) -> Option<Revocation> {
+    pub(crate) fn revoke(&self) -> Option<Revocation> {
         let (mut abandoned, mut never_sent) = {
             let mut inner = self.lock();
             if inner.state == DrainState::Revoked {

@@ -6,16 +6,54 @@
 //!    package. This is where the load-bearing check lives; the manifest's own
 //!    `SpawnCommand::validate` is purely lexical and says so.
 //! 2. [`mint_token`] — a fresh secret for this one handshake.
-//! 3. [`spawn`] — start it, in its own process group, with pipes.
+//! 3. [`spawn`] — start it, in its own process group, with a cleared
+//!    environment, the proxy's listening socket as fd 3, and its output drained
+//!    into the log. What comes back is a [`ModuleProcess`], the only holder of
+//!    the child.
 //!
-//! Supervision (backoff, circuit breaker, startup timeout) is the next slice and
-//! deliberately not here: what "ready" means depends on the handshake, and a
-//! restart policy written before there is anything to restart is a guess.
+//! Supervision (backoff, circuit breaker, startup timeout) is not here: what
+//! "ready" means depends on the handshake (ME3-SUP's second and third slices).
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
+use std::sync::Arc;
 
 use agent24_domain::SpawnCommand;
+
+use crate::drain::Generation;
+use crate::supervise::ModuleProcess;
+
+/// The environment a module is started with — the launch half of the wire
+/// contract (SPEC-ME3 §1).
+///
+/// `A24_LISTEN_FD`: the fd of the listening socket the module serves its HTTP
+/// on — always [`LISTEN_FD`]. The module does not choose an address.
+pub const ENV_LISTEN_FD: &str = "A24_LISTEN_FD";
+/// `A24_CALLBACK_SOCK`: the path of the kernel's callback socket, where the
+/// module connects and sends `initialize` first.
+pub const ENV_CALLBACK_SOCK: &str = "A24_CALLBACK_SOCK";
+/// `A24_HANDSHAKE_TOKEN`: this process's one-shot handshake secret.
+pub const ENV_HANDSHAKE_TOKEN: &str = "A24_HANDSHAKE_TOKEN";
+/// `A24_DATA_DIR`: the module's own data directory.
+pub const ENV_DATA_DIR: &str = "A24_DATA_DIR";
+
+/// The fd the listening socket arrives on — 3, the first after stdio, as
+/// systemd's socket activation does, so a module written for that convention
+/// needs no change.
+pub const LISTEN_FD: i32 = 3;
+
+/// The variables a module inherits from the daemon. Everything else is cleared
+/// (SPEC-ME3 §5: spawn clears inherited fds and environment) — the daemon's
+/// environment can carry credentials (a provider's API key, a cloud token) that
+/// are the kernel's, not a module's. `LC_*` is inherited as a prefix. ⚖️ The
+/// list is a choice: enough for an interpreter to find itself and a locale, and
+/// nothing that names a credential.
+pub const INHERITED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TZ", "TMPDIR", "USER"];
+
+fn inherited(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|n| INHERITED_ENV.contains(&n) || n.starts_with("LC_"))
+}
 
 /// Why a module could not be started.
 #[derive(Debug)]
@@ -29,6 +67,10 @@ pub enum LaunchError {
     /// A fresh token could not be produced. **Not** recoverable by reusing an
     /// old one — see [`mint_token`].
     NoEntropy(std::io::Error),
+    /// The package directory, or something on the way to the program inside
+    /// it, is not owned by this user or is writable by others — someone else
+    /// could replace what is about to run.
+    UnsafeOwnership(PathBuf),
 }
 
 impl std::fmt::Display for LaunchError {
@@ -43,6 +85,12 @@ impl std::fmt::Display for LaunchError {
             ),
             Self::Spawn(e) => write!(f, "could not start the module process: {e}"),
             Self::NoEntropy(e) => write!(f, "could not mint a handshake token: {e}"),
+            Self::UnsafeOwnership(p) => write!(
+                f,
+                "{} is not owned by this user, or is writable by group or others; \
+                 refusing to run a module from it",
+                p.display()
+            ),
         }
     }
 }
@@ -71,7 +119,19 @@ impl std::error::Error for LaunchError {}
 ///
 /// # Errors
 ///
-/// [`LaunchError::Unresolved`] or [`LaunchError::EscapesPackage`].
+/// # Who may have written it
+///
+/// A program inside the package is also refused unless the package directory,
+/// every directory between it and the program, and the program itself are
+/// owned by this user and not writable by group or others. Otherwise another
+/// user could swap what runs between install and spawn. This narrows the window
+/// the check is made in; it cannot close it — the check and the `exec` are two
+/// steps (FU-41).
+///
+/// # Errors
+///
+/// [`LaunchError::Unresolved`], [`LaunchError::EscapesPackage`] or
+/// [`LaunchError::UnsafeOwnership`].
 pub fn resolve(spawn: &SpawnCommand, package_dir: &Path) -> Result<PathBuf, LaunchError> {
     let command = Path::new(&spawn.command);
     // A bare name has no separator. `Path::components` would normalise away a
@@ -100,7 +160,19 @@ pub fn resolve(spawn: &SpawnCommand, package_dir: &Path) -> Result<PathBuf, Laun
     if !resolved.starts_with(&package) {
         return Err(LaunchError::EscapesPackage { resolved, package });
     }
+    for path in resolved.ancestors().take_while(|p| p.starts_with(&package)) {
+        if !safely_owned(path) {
+            return Err(LaunchError::UnsafeOwnership(path.to_owned()));
+        }
+    }
     Ok(resolved)
+}
+
+/// Owned by this user, and not writable by group or others.
+fn safely_owned(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .is_ok_and(|m| m.uid() == rustix::process::geteuid().as_raw() && m.mode() & 0o022 == 0)
 }
 
 /// Find `name` on `PATH`, the way `execvp` would.
@@ -152,55 +224,236 @@ pub fn mint_token() -> Result<String, LaunchError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// A started module process, plus the pipes to talk to it.
+/// Everything [`spawn`] needs besides the generation.
 #[derive(Debug)]
-pub struct Launched {
-    /// The child. Its process GROUP is its own, so the supervisor can signal the
-    /// whole tree rather than only the process it started.
-    pub child: Child,
-    /// The token given to this child, for the handshake to compare against.
-    pub token: String,
+pub struct LaunchSpec<'a> {
+    /// The module's name, for its log lines.
+    pub name: &'a str,
+    pub command: &'a SpawnCommand,
+    pub package_dir: &'a Path,
+    pub data_dir: &'a Path,
+    /// Where the kernel listens for this process's callback connection.
+    pub callback_sock: &'a Path,
+    /// The socket the module serves its HTTP on. Passed as fd [`LISTEN_FD`]
+    /// and closed in this process once the child has it — so when the module
+    /// dies, a connection to its port is refused at once instead of queueing in
+    /// a backlog nobody will ever accept from.
+    pub listener: std::net::TcpListener,
 }
 
-/// Start a module.
+/// Start a module for `generation`.
 ///
-/// # Its own process group, and why that is not a detail
+/// # What the child gets
 ///
-/// A module written in a scripting language routinely starts helpers. Killing
-/// only the pid we hold leaves those running — holding ports, holding the
-/// package directory, and invisible to a `disable` that reported success. The
-/// child is therefore put in a new process group at spawn, so the supervisor can
-/// signal the group.
+/// - **Its own process group**, so a stop can signal the whole tree: a module
+///   written in a scripting language routinely starts helpers, and killing only
+///   the pid we hold leaves them running.
+/// - **A cleared environment**: [`INHERITED_ENV`] plus the four `A24_*`
+///   variables. The token travels in the environment, not on the command line,
+///   because arguments are world-readable through `ps`.
+/// - **fds 0–3 only**: stdin is `/dev/null`, stdout and stderr are pipes the
+///   kernel drains, and fd 3 is the listening socket. Every other fd this
+///   process has is close-on-exec (the standard library's default).
 ///
-/// The token is passed in the ENVIRONMENT rather than on the command line:
-/// arguments are world-readable through `ps` on most systems.
+/// Output is drained whether or not anyone reads the log: a pipe nobody reads
+/// fills at about 64 KiB, and a module blocked writing a log line looks exactly
+/// like one that hung — it would be killed for a startup timeout it did not
+/// cause.
+///
+/// Must be called within a Tokio runtime.
 ///
 /// # Errors
 ///
-/// [`LaunchError`] — resolution, entropy, or the OS refusing.
+/// [`LaunchError`] — resolution, ownership, entropy, or the OS refusing.
 pub fn spawn(
-    spawn_command: &SpawnCommand,
-    package_dir: &Path,
-    data_dir: &Path,
-) -> Result<Launched, LaunchError> {
-    use std::os::unix::process::CommandExt;
+    spec: LaunchSpec<'_>,
+    generation: Arc<Generation>,
+) -> Result<ModuleProcess, LaunchError> {
+    use command_fds::{CommandFdExt, FdMapping};
 
-    let program = resolve(spawn_command, package_dir)?;
+    let program = resolve(spec.command, spec.package_dir)?;
     let token = mint_token()?;
+    tokio::runtime::Handle::try_current()
+        .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))?;
 
-    let mut cmd = Command::new(&program);
-    cmd.args(&spawn_command.args)
-        .current_dir(package_dir)
-        .env("A24_HANDSHAKE_TOKEN", &token)
-        .env("A24_DATA_DIR", data_dir)
-        .stdin(Stdio::piped())
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&spec.command.args)
+        .current_dir(spec.package_dir)
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(k, _)| inherited(k)))
+        .env(ENV_LISTEN_FD, LISTEN_FD.to_string())
+        .env(ENV_CALLBACK_SOCK, spec.callback_sock)
+        .env(ENV_HANDSHAKE_TOKEN, &token)
+        .env(ENV_DATA_DIR, spec.data_dir)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 0 means "a new group whose id is this child's pid".
         .process_group(0);
+    cmd.fd_mappings(vec![FdMapping {
+        parent_fd: spec.listener.into(),
+        child_fd: LISTEN_FD,
+    }])
+    .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))?;
 
-    let child = cmd.spawn().map_err(LaunchError::Spawn)?;
-    Ok(Launched { child, token })
+    let mut child = cmd.spawn().map_err(LaunchError::Spawn)?;
+    // The command owns our copy of the listener; dropping it closes that copy.
+    drop(cmd);
+    if let Some(out) = child.stdout.take() {
+        tokio::spawn(drain_output(out, spec.name.to_owned(), "stdout"));
+    }
+    if let Some(err) = child.stderr.take() {
+        tokio::spawn(drain_output(err, spec.name.to_owned(), "stderr"));
+    }
+    ModuleProcess::new(child, generation, token).map_err(LaunchError::Spawn)
+}
+
+/// Longest line of module output logged; the rest of the line is dropped and
+/// the line marked as cut. ⚖️
+pub const MAX_LOG_LINE: usize = 4096;
+
+/// Most lines of one stream logged per second; beyond it lines are counted and
+/// dropped, and the count is logged when the second ends. ⚖️ A module must not
+/// be able to fill the daemon's log, or its disk.
+pub const LOG_LINES_PER_SECOND: u32 = 200;
+
+/// Read a module's output to its end, logging it line by line within
+/// [`MAX_LOG_LINE`] and [`LOG_LINES_PER_SECOND`].
+async fn drain_output<R>(stream: R, module: String, which: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut lines = Lines::default();
+    let mut limit = RateLimit::new(std::time::Instant::now());
+    loop {
+        let chunk = match reader.fill_buf().await {
+            Ok([]) | Err(_) => break,
+            Ok(chunk) => chunk,
+        };
+        let taken = chunk.len();
+        for line in lines.push(chunk) {
+            log_line(&module, which, &line, &mut limit);
+        }
+        reader.consume(taken);
+    }
+    if let Some(line) = lines.finish() {
+        log_line(&module, which, &line, &mut limit);
+    }
+    if let Some(dropped) = limit.flush() {
+        tracing::warn!(target: "agent24::module", module, stream = which, dropped, "module output dropped (rate limit)");
+    }
+}
+
+fn log_line(module: &str, which: &'static str, line: &Line, limit: &mut RateLimit) {
+    let now = std::time::Instant::now();
+    if let Some(dropped) = limit.roll(now) {
+        tracing::warn!(target: "agent24::module", module, stream = which, dropped, "module output dropped (rate limit)");
+    }
+    if limit.admit() {
+        tracing::info!(
+            target: "agent24::module",
+            module,
+            stream = which,
+            cut = line.cut,
+            "{}",
+            String::from_utf8_lossy(&line.text)
+        );
+    }
+}
+
+/// One line of output, at most [`MAX_LOG_LINE`] bytes of it.
+#[derive(Debug, PartialEq, Eq)]
+struct Line {
+    text: Vec<u8>,
+    /// Bytes past [`MAX_LOG_LINE`] were dropped.
+    cut: bool,
+}
+
+/// Splits a byte stream into [`Line`]s, holding at most [`MAX_LOG_LINE`] bytes
+/// of an unfinished line however long it runs. Pure, so it is tested without a
+/// process.
+#[derive(Debug, Default)]
+struct Lines {
+    current: Vec<u8>,
+    cut: bool,
+}
+
+impl Lines {
+    fn push(&mut self, mut bytes: &[u8]) -> Vec<Line> {
+        let mut done = Vec::new();
+        while let Some(i) = bytes.iter().position(|&b| b == b'\n') {
+            self.take(&bytes[..i]);
+            done.push(Line {
+                text: std::mem::take(&mut self.current),
+                cut: std::mem::take(&mut self.cut),
+            });
+            bytes = &bytes[i + 1..];
+        }
+        self.take(bytes);
+        done
+    }
+
+    fn take(&mut self, bytes: &[u8]) {
+        let room = MAX_LOG_LINE - self.current.len();
+        if bytes.len() > room {
+            self.cut = true;
+        }
+        self.current
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    /// The last line, if the stream ended without a newline.
+    fn finish(self) -> Option<Line> {
+        (!self.current.is_empty() || self.cut).then_some(Line {
+            text: self.current,
+            cut: self.cut,
+        })
+    }
+}
+
+/// At most [`LOG_LINES_PER_SECOND`] per one-second window. Holds no clock.
+#[derive(Debug)]
+struct RateLimit {
+    window: std::time::Instant,
+    admitted: u32,
+    dropped: u64,
+}
+
+impl RateLimit {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            window: now,
+            admitted: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Start a new window if the current one is over; returns the lines the
+    /// old one dropped, if any.
+    fn roll(&mut self, now: std::time::Instant) -> Option<u64> {
+        if now.duration_since(self.window) < std::time::Duration::from_secs(1) {
+            return None;
+        }
+        self.window = now;
+        self.admitted = 0;
+        self.flush()
+    }
+
+    fn admit(&mut self) -> bool {
+        if self.admitted < LOG_LINES_PER_SECOND {
+            self.admitted += 1;
+            true
+        } else {
+            self.dropped += 1;
+            false
+        }
+    }
+
+    fn flush(&mut self) -> Option<u64> {
+        (self.dropped > 0).then(|| std::mem::take(&mut self.dropped))
+    }
 }
 
 #[cfg(test)]
@@ -308,37 +561,79 @@ mod tests {
         }
     }
 
-    /// The child must be in its OWN process group, so a supervisor can signal
-    /// the whole tree. A module that starts helpers and is killed by pid alone
+    fn listener() -> std::net::TcpListener {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+    }
+
+    /// Start `command` from package `t` for a fresh generation, with a fresh
+    /// listener.
+    fn start(t: &Path, command: &SpawnCommand) -> ModuleProcess {
+        start_with(t, command, listener())
+    }
+
+    fn start_with(
+        t: &Path,
+        command: &SpawnCommand,
+        listener: std::net::TcpListener,
+    ) -> ModuleProcess {
+        spawn(
+            LaunchSpec {
+                name: "t",
+                command,
+                package_dir: t,
+                data_dir: &t.join("data"),
+                callback_sock: &t.join("cb.sock"),
+                listener,
+            },
+            Generation::starting(),
+        )
+        .expect("spawn")
+    }
+
+    /// Wait for the leader to exit, within a bound — a test that waits without
+    /// one reports a hang as silence.
+    async fn exited(p: &mut ModuleProcess) -> std::process::ExitStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(10), p.wait_exit())
+            .await
+            .expect("the module did not exit within 10s")
+            .unwrap()
+    }
+
+    fn read(t: &Path, name: &str) -> String {
+        std::fs::read_to_string(t.join(name)).unwrap_or_default()
+    }
+
+    /// The child must be in its OWN process group, so a stop can signal the
+    /// whole tree. A module that starts helpers and is killed by pid alone
     /// leaves them running — holding ports, holding the package directory, and
     /// invisible to a `disable` that reported success.
-    #[test]
-    fn the_child_gets_its_own_process_group() {
+    #[tokio::test]
+    async fn the_child_gets_its_own_process_group() {
         let t = pkg();
-        // Print our own process-group id and exit.
+        // Output goes to a file: the child's stdout is drained into the log.
         exe(
             &t.path().join("bin/mod"),
-            "#!/bin/sh\nps -o pgid= -p $$ | tr -d ' '\n",
+            "#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' > out\n",
         );
-        let launched = spawn(&cmd("bin/mod", &[]), t.path(), t.path()).expect("spawn");
-        let pid = launched.child.id();
-        let out = launched.child.wait_with_output().unwrap();
-        let child_pgid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let mut p = start(t.path(), &cmd("bin/mod", &[]));
+        exited(&mut p).await;
+        let child_pgid: i32 = read(t.path(), "out").trim().parse().unwrap();
 
         assert_eq!(
-            child_pgid, pid,
+            child_pgid,
+            p.pid(),
             "the child's process group should be its own pid"
         );
         // Control: it is NOT this process's group — otherwise "its own group"
         // would be satisfied by inheriting ours whenever we happen to lead one.
-        let ours = std::process::id();
-        assert_ne!(child_pgid, ours);
+        assert_ne!(child_pgid, i32::try_from(std::process::id()).unwrap());
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 
     /// The token reaches the child, and through the environment rather than the
     /// command line — arguments are world-readable through `ps`.
-    #[test]
-    fn the_token_reaches_the_child_out_of_sight_of_ps() {
+    #[tokio::test]
+    async fn the_token_reaches_the_child_out_of_sight_of_ps() {
         let t = pkg();
         // The child reports BOTH: the env var on the first line, its own argv on
         // the second. Asking the child is the whole point — an assertion on the
@@ -347,13 +642,13 @@ mod tests {
         // mutation that ALSO put the token in argv left that version green.)
         exe(
             &t.path().join("bin/mod"),
-            "#!/bin/sh\necho \"$A24_HANDSHAKE_TOKEN\"\necho \"$@\"\n",
+            "#!/bin/sh\n{ echo \"$A24_HANDSHAKE_TOKEN\"; echo \"$@\"; } > out\n",
         );
-        let launched = spawn(&cmd("bin/mod", &["--flag"]), t.path(), t.path()).expect("spawn");
-        let token = launched.token.clone();
-        let out = launched.child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let mut lines = stdout.lines();
+        let mut p = start(t.path(), &cmd("bin/mod", &["--flag"]));
+        let token = p.token().to_owned();
+        exited(&mut p).await;
+        let out = read(t.path(), "out");
+        let mut lines = out.lines();
 
         assert_eq!(lines.next().unwrap_or_default().trim(), token, "env var");
         let argv = lines.next().unwrap_or_default();
@@ -367,5 +662,234 @@ mod tests {
             argv.contains("--flag"),
             "the child saw no arguments: {argv:?}"
         );
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// Run `code` in Python (no site, isolated: it adds nothing of its own to
+    /// the environment and opens no files) as the module.
+    fn python(code: &str) -> SpawnCommand {
+        cmd("python3", &["-I", "-S", "-c", code])
+    }
+
+    /// SPEC-ME3 §5: spawn clears the inherited environment. The daemon's can
+    /// carry the kernel's credentials; a module gets [`INHERITED_ENV`], `LC_*`
+    /// and the four `A24_*` variables, and nothing else.
+    ///
+    /// The probe is `sh -c env`, not Python: macOS's `/usr/bin/python3` is an
+    /// Xcode shim that ADDS `SDKROOT`, `CPATH` and others to its own
+    /// environment even when started with none (measured with `env -i`), which
+    /// would read as a leak that is not one. A shell adds only `_`, `PWD` and
+    /// `SHLVL`, listed below.
+    #[tokio::test]
+    async fn the_environment_is_cleared_down_to_the_allowlist() {
+        // The positive sample: cargo sets this for every test process. If it is
+        // missing the test proves nothing, so that is a failure, not a skip.
+        //
+        // Looked up by iterating rather than with `env::var_os("…")`: the CLI's
+        // `passthrough_list_matches_what_the_daemon_actually_reads` scans daemon
+        // sources for that spelling to find what the daemon reads at RUN time,
+        // and a test's precondition is not that.
+        assert!(
+            std::env::vars_os().any(|(k, _)| k == "CARGO_MANIFEST_DIR"),
+            "precondition: the parent has a variable the child must not inherit"
+        );
+        let t = pkg();
+        let mut p = start(t.path(), &cmd("sh", &["-c", "env > out"]));
+        exited(&mut p).await;
+        let out = read(t.path(), "out");
+        let env: std::collections::BTreeMap<&str, &str> =
+            out.lines().filter_map(|l| l.split_once('=')).collect();
+
+        assert!(
+            !env.contains_key("CARGO_MANIFEST_DIR"),
+            "the child inherited the parent's environment: {env:?}"
+        );
+        let stray: Vec<&&str> = env
+            .keys()
+            .filter(|k| {
+                !(INHERITED_ENV.contains(k) || k.starts_with("LC_") || k.starts_with("A24_"))
+                    // Set by the shell itself, not inherited.
+                    && !["_", "PWD", "SHLVL", "OLDPWD"].contains(k)
+            })
+            .collect();
+        assert!(stray.is_empty(), "not on the allowlist: {stray:?}");
+        // Control: what must be there is there, with the values given.
+        assert!(env.contains_key("PATH"), "{env:?}");
+        assert_eq!(env.get(ENV_LISTEN_FD), Some(&"3"));
+        assert_eq!(env.get(ENV_HANDSHAKE_TOKEN).copied(), Some(p.token()));
+        let data = t.path().join("data");
+        let sock = t.path().join("cb.sock");
+        assert_eq!(env.get(ENV_DATA_DIR).copied(), data.to_str());
+        assert_eq!(env.get(ENV_CALLBACK_SOCK).copied(), sock.to_str());
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// SPEC-ME3 §1: the kernel opens the listening socket and hands it over as
+    /// fd 3; the module does not choose an address. The module here accepts one
+    /// connection on fd 3 and answers on it.
+    #[tokio::test]
+    async fn the_listening_socket_arrives_as_fd_3() {
+        use tokio::io::AsyncReadExt;
+        let t = pkg();
+        let l = listener();
+        let addr = l.local_addr().unwrap();
+        let mut p = start_with(
+            t.path(),
+            &python(
+                "import os, socket\n\
+                 s = socket.socket(fileno=int(os.environ['A24_LISTEN_FD']))\n\
+                 c, _ = s.accept()\n\
+                 c.sendall(b'hello from fd 3')\n\
+                 c.close()",
+            ),
+            l,
+        );
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            conn.read_to_end(&mut got),
+        )
+        .await
+        .expect("no answer within 10s")
+        .unwrap();
+        assert_eq!(got, b"hello from fd 3");
+        exited(&mut p).await;
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// The listener is closed in the daemon once the child has it: when the
+    /// module is gone, its port refuses at once — a copy kept here would queue
+    /// connections in a backlog nobody accepts from, and a request would hang
+    /// instead of failing.
+    #[tokio::test]
+    async fn once_the_module_is_gone_its_port_refuses() {
+        let t = pkg();
+        let l = listener();
+        let addr = l.local_addr().unwrap();
+        let mut p = start_with(t.path(), &cmd("sh", &["-c", "exit 0"]), l);
+        exited(&mut p).await;
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .expect("the connect hung: something still holds the listener");
+        assert!(
+            refused.is_err(),
+            "a connection was accepted by a dead module's port"
+        );
+    }
+
+    /// Only fds 0–3 reach the module: stdio and the listener. Anything else
+    /// would be a daemon resource — a database, a socket to a provider — in a
+    /// third party's hands.
+    #[tokio::test]
+    async fn only_stdio_and_the_listener_are_open_in_the_child() {
+        let t = pkg();
+        // A file this process holds open while spawning: the daemon's own fds
+        // must not follow.
+        let _held = std::fs::File::open(t.path()).unwrap();
+        let mut p = start(
+            t.path(),
+            &python(
+                "import os\n\
+                 def is_open(fd):\n\
+                 \x20   try:\n\
+                 \x20       os.fstat(fd)\n\
+                 \x20       return True\n\
+                 \x20   except OSError:\n\
+                 \x20       return False\n\
+                 fds = [fd for fd in range(0, 256) if is_open(fd)]\n\
+                 open('out','w').write(' '.join(map(str, fds)))",
+            ),
+        );
+        exited(&mut p).await;
+        // 0–3 open is also the control: the probe sees open fds.
+        assert_eq!(read(t.path(), "out"), "0 1 2 3");
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// A module that writes more than a pipe holds is not blocked by it: its
+    /// output is drained whether or not anyone reads the log. Undrained, it
+    /// blocks at about 64 KiB and looks exactly like a module that hung.
+    #[tokio::test]
+    async fn a_module_that_floods_stderr_is_not_blocked_by_it() {
+        let t = pkg();
+        let mut p = start(
+            t.path(),
+            &cmd(
+                "sh",
+                &["-c", "head -c 2097152 /dev/zero >&2; echo done > out"],
+            ),
+        );
+        exited(&mut p).await;
+        assert_eq!(read(t.path(), "out").trim(), "done");
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// Someone else able to write the package — its directory, a directory on
+    /// the way to the program, or the program — could swap what runs. Each is
+    /// refused; the same tree with owner-only write access is the control.
+    #[test]
+    fn a_package_others_can_write_is_refused() {
+        let t = pkg();
+        exe(&t.path().join("bin/mod"), "#!/bin/sh\nexit 0\n");
+        let spawn = cmd("bin/mod", &[]);
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        resolve(&spawn, t.path()).expect("control: owner-only write access is fine");
+
+        for (what, path, bad, good) in [
+            ("package dir", t.path().to_owned(), 0o777, 0o700),
+            ("bin/", t.path().join("bin"), 0o775, 0o755),
+            ("program", t.path().join("bin/mod"), 0o757, 0o755),
+        ] {
+            mode(&path, bad);
+            let err = resolve(&spawn, t.path()).expect_err(what);
+            assert!(
+                matches!(&err, LaunchError::UnsafeOwnership(p) if p == &path.canonicalize().unwrap()),
+                "{what}: {err:?}"
+            );
+            mode(&path, good);
+        }
+        resolve(&spawn, t.path()).expect("restored");
+    }
+
+    #[test]
+    fn a_long_line_is_cut_and_the_next_one_is_whole() {
+        let mut lines = Lines::default();
+        let long = vec![b'x'; MAX_LOG_LINE * 3];
+        let mut out = lines.push(&long);
+        out.extend(lines.push(b"\nshort\npart"));
+        out.extend(lines.push(b"ial\n"));
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[0].text.len(), MAX_LOG_LINE);
+        assert!(out[0].cut);
+        assert_eq!((out[1].text.as_slice(), out[1].cut), (&b"short"[..], false));
+        // A line split across reads is joined.
+        assert_eq!(out[2].text, b"partial");
+        // The last line without a newline is not lost.
+        let mut tail = Lines::default();
+        assert!(tail.push(b"no newline").is_empty());
+        assert_eq!(tail.finish().map(|l| l.text), Some(b"no newline".to_vec()));
+    }
+
+    #[test]
+    fn output_beyond_the_rate_is_counted_and_dropped() {
+        let t0 = std::time::Instant::now();
+        let mut limit = RateLimit::new(t0);
+        let admitted = (0..LOG_LINES_PER_SECOND + 50)
+            .filter(|_| limit.admit())
+            .count();
+        assert_eq!(admitted, LOG_LINES_PER_SECOND as usize);
+        // Within the same second: nothing to report yet.
+        assert_eq!(limit.roll(t0 + std::time::Duration::from_millis(500)), None);
+        // The next window reports the drop once, and admits again.
+        assert_eq!(limit.roll(t0 + std::time::Duration::from_secs(1)), Some(50));
+        assert!(limit.admit());
+        assert_eq!(limit.flush(), None);
     }
 }
