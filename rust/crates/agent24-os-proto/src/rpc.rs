@@ -496,7 +496,8 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &dyn Fn(&str) -> boo
     }
 }
 
-/// Longest error message [`serve`] writes, whoever wrote the message.
+/// Longest error message [`serve`] writes, whoever wrote the message — the
+/// `…` that marks a cut included.
 const MAX_MESSAGE_BYTES: usize = 1024;
 
 /// Longest string echoed back from a request into an error message. A message
@@ -760,7 +761,7 @@ fn response_line(mut response: Response) -> Vec<u8> {
     if let Err(e) = &mut response.outcome
         && e.message.len() > MAX_MESSAGE_BYTES
     {
-        e.message = clip_to(&e.message, MAX_MESSAGE_BYTES);
+        e.message = clip_to(&e.message, MAX_MESSAGE_BYTES - '…'.len_utf8());
     }
     let line = response.to_line();
     if line.len() <= MAX_FRAME_BYTES + 1 {
@@ -785,11 +786,13 @@ fn response_line(mut response: Response) -> Vec<u8> {
 /// - **Frames come from a dedicated reader task.** `read_frame_async` is not
 ///   cancel-safe; racing it in the `select!` below would drop a half-read frame
 ///   and desynchronise the stream.
-/// - **Responses go to a dedicated writer task through a bounded queue**, and
-///   each write has a deadline. A module that stops reading must not freeze this
-///   loop — with the writer inline, a full socket buffer blocks the loop, which
-///   then stops reading frames, so a cancel or a close is never seen. A full
-///   queue or a write past its deadline ends the connection instead.
+/// - **Responses go to a dedicated writer task** through an unbounded channel
+///   whose bytes are counted, and each write has a deadline. A module that
+///   stops reading must not freeze this loop — with the writer inline, a full
+///   socket buffer blocks the loop, which then stops reading frames, so a
+///   cancel or a close is never seen. Over the high-water mark the loop stops
+///   taking reader events (below); a write past its deadline ends the
+///   connection.
 /// - **Handlers run directly in a `JoinSet` owned here** — one task each, no
 ///   nesting. Cancelling aborts the task and the `cancelled` response is sent
 ///   when the set reports the task finished, i.e. after the handler future has
@@ -2539,7 +2542,16 @@ mod tests {
             };
             run(&mut rx, writer, methods, limits).await
         });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The loop takes the sixteen frames and reaches the reaping step in one
+        // poll, so once they are gone the reaping step has run.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while tx.capacity() < 31 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop never took the first sixteen frames"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(
             !seen.load(Ordering::SeqCst),
             "a frame was read with the queue at the high-water mark"
@@ -2556,7 +2568,7 @@ mod tests {
     /// here notifications, which never enqueue a response whose send would
     /// fail. While a frame is waiting, the biased select takes it and never
     /// polls the writer branch; only the reaping step's look catches the dead
-    /// writer. With 10 000 notifications queued up front, the loop must stop
+    /// writer. With 100 000 notifications queued up front, the loop must stop
     /// long before it has read them all — without the look it reads every one
     /// and notices only when the channel runs dry. (Through `serve`, frames are
     /// waiting only while the reader stays ahead on another thread; the first
@@ -2564,7 +2576,11 @@ mod tests {
     /// the channel run dry and survived their mutant — review of f2b4e2e, L3.)
     #[tokio::test]
     async fn a_dead_writer_is_noticed_while_frames_keep_coming() {
-        const NOTES: usize = 10_000;
+        // The writer runs, and dies, the first time the loop yields — on a
+        // current-thread runtime, when tokio's coop budget (128 in 1.53) runs
+        // out. 100 000 keeps "stopped long before the end" true for any budget
+        // below 50 000.
+        const NOTES: usize = 100_000;
         let (tx, mut rx) = tokio::sync::mpsc::channel(NOTES + 1);
         // One request, so the writer has a line to fail on.
         tx.send(frame_of(&req("x", "t/none", json!({}))))
@@ -2608,7 +2624,7 @@ mod tests {
         let message = v["error"]["message"].as_str().unwrap();
         assert!(message.starts_with("bad value: v"), "{message}");
         assert!(
-            message.len() <= MAX_MESSAGE_BYTES + 3,
+            message.len() <= MAX_MESSAGE_BYTES,
             "{} bytes",
             message.len()
         );
