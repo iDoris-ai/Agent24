@@ -275,15 +275,18 @@ fn envelope(frame: &[u8]) -> Result<(String, serde_json::Value), HandshakeError>
     let serde_json::Value::Object(mut obj) = value else {
         return Err(bad("a frame that is not a request object".to_owned()));
     };
-    // Repeated keys, over the raw bytes. At the top level they are an invalid
-    // request; inside `params` (a repeated `auth_token`, say) bad params.
-    if let Some(path) = crate::rpc::find_duplicate_key(frame) {
-        let at = crate::rpc::clip_to(&path.join("."), 128);
-        return Err(if path.len() == 1 {
-            bad(format!("a repeated `{at}`"))
-        } else {
-            HandshakeError::BadParams(format!("a repeated key `{at}`"))
-        });
+    // Repeated keys, over the raw bytes. A repeat AT the top level is an
+    // invalid request, whatever else the frame has. A repeat deeper down is
+    // decided only once the envelope has passed below: then every other member
+    // is a string or refused, so the repeat can only be inside `params` (bad
+    // params). Deciding it here, by path length alone, put `"method": {"x": 1,
+    // "x": 2}` under -32602 (review of ME3-SUP slice 2, round 2).
+    let repeated = crate::rpc::find_duplicate_key(frame);
+    if let Some(path) = repeated.as_ref().filter(|p| p.len() == 1) {
+        return Err(bad(format!(
+            "a repeated `{}`",
+            crate::rpc::clip_to(&path[0], 128)
+        )));
     }
     if let Some(extra) = obj
         .keys()
@@ -318,6 +321,12 @@ fn envelope(frame: &[u8]) -> Result<(String, serde_json::Value), HandshakeError>
     let params = obj
         .remove("params")
         .ok_or_else(|| HandshakeError::BadParams("no `params`".to_owned()))?;
+    if let Some(path) = repeated {
+        return Err(HandshakeError::BadParams(format!(
+            "a repeated key `{}`",
+            crate::rpc::clip_to(&path.join("."), 128)
+        )));
+    }
     Ok((id, params))
 }
 
@@ -378,6 +387,10 @@ pub fn success_line(accepted: &Accepted) -> Vec<u8> {
 /// could not read).
 #[must_use]
 pub fn error_line(id: Option<&str>, err: &HandshakeError) -> Vec<u8> {
+    // An id longer than the channel allows is not echoed, from any caller —
+    // `id_of` never yields one, but this function is public and must keep its
+    // own bound (review of ME3-SUP slice 2, round 2).
+    let id = id.filter(|id| id.len() <= crate::rpc::MAX_ID_BYTES);
     let message = crate::rpc::clip_to(
         &err.to_string(),
         crate::rpc::MAX_MESSAGE_BYTES - '…'.len_utf8(),
@@ -751,5 +764,45 @@ mod tests {
         assert!(line.len() < 2048, "{} bytes", line.len());
         let v: serde_json::Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(v["error"]["data"]["kind"], "manifest_mismatch");
+    }
+
+    /// A repeat nested inside a member that is not `params` is an envelope
+    /// fault (-32600), because that member is itself wrong: a `method`, `id`
+    /// or unknown member that is an object. The first envelope check decided
+    /// by path length alone and said -32602 (review of ME3-SUP slice 2,
+    /// round 2).
+    #[test]
+    fn a_repeat_inside_a_non_params_member_is_an_envelope_fault() {
+        let g = good_frame();
+        let cases = [
+            (
+                "method",
+                g.replace(r#""method":"initialize""#, r#""method":{"x":1,"x":2}"#),
+            ),
+            ("id", g.replace(r#""id":"1""#, r#""id":{"x":1,"x":2}"#)),
+            (
+                "unknown member",
+                g.replace(r#""id":"1","#, r#""id":"1","extra":{"x":1,"x":2},"#),
+            ),
+        ];
+        for (what, frame) in cases {
+            let err = accept(frame.as_bytes(), &expectation()).expect_err(what);
+            assert_eq!(err.code(), -32600, "{what}: {err}");
+        }
+    }
+
+    /// `error_line` keeps its bound for any caller: an id past the limit is
+    /// answered as `null`, not echoed.
+    #[test]
+    fn an_overlong_id_is_not_echoed_by_error_line() {
+        let huge = "i".repeat(MAX_FRAME_BYTES);
+        let line = error_line(Some(&huge), &HandshakeError::AuthFailed);
+        assert!(line.len() < 1024, "{} bytes", line.len());
+        let v: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(v["id"], serde_json::Value::Null);
+        // Control: an id within the limit is echoed.
+        let v: serde_json::Value =
+            serde_json::from_slice(&error_line(Some("ok"), &HandshakeError::AuthFailed)).unwrap();
+        assert_eq!(v["id"], "ok");
     }
 }

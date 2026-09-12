@@ -122,9 +122,11 @@ impl CallbackDir {
         private_dir(&run)?;
         let path = run.join(std::process::id().to_string());
         if std::fs::symlink_metadata(&path).is_ok() {
-            // Checked before it is emptied: only a directory that is already
-            // this user's alone is ours to clear.
-            check_private(&path)?;
+            // Normalised and checked before it is emptied — the same rule as
+            // `run/` (the first version refused an ours-but-0755 pid directory
+            // that `run/` would have normalised; review of ME3-SUP slice 2,
+            // round 2): only a directory that is this user's is ours to clear.
+            private_dir(&path)?;
             std::fs::remove_dir_all(&path)?;
         }
         private_dir(&path)?;
@@ -153,21 +155,42 @@ impl CallbackDir {
         // path is not a stale file but someone's live socket — removing it (as
         // the first version did) took a working listener's address away
         // (review of ME3-SUP slice 2, round 1, F5). An address in use fails.
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         let listener = tokio::net::UnixListener::bind(&path)?;
-        // The socket node itself `0700` too, not the umask's `0755`.
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
-        let meta = std::fs::symlink_metadata(&path)?;
-        Ok(CallbackListener {
+        // Record the node at once and hand it to a `CallbackListener`, so any
+        // failure below drops it and removes the path — a socket left behind
+        // would make the next bind of this name fail for good (review of
+        // ME3-SUP slice 2, round 2).
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(e.into());
+            }
+        };
+        let bound = CallbackListener {
             listener,
             node: (meta.dev(), meta.ino()),
             path,
-        })
+        };
+        if !meta.file_type().is_socket() {
+            return Err(EndpointError::UnsafeDirectory {
+                path: bound.path.clone(),
+                why: "the bound path is not a socket".to_owned(),
+            });
+        }
+        // The socket node itself `0700` too, not the umask's `0755`. By path:
+        // this rests, like everything here, on nobody else of this user
+        // swapping entries in a `0700` directory under us (SPEC §0 does not
+        // defend against a hostile process of the same user).
+        std::fs::set_permissions(&bound.path, std::fs::Permissions::from_mode(0o700))?;
+        Ok(bound)
     }
 }
 
-/// Create `path` (and parents) `0700` if it is missing; tighten it to exactly
-/// `0700` if it is ours and looser; then check it.
+/// Create `path` (and parents) `0700` if it is missing; set it to exactly
+/// `0700` if it is a real directory of ours with any other mode (looser, or
+/// stricter — a `0600` directory gains the owner's search bit); then check it.
 fn private_dir(path: &Path) -> Result<(), EndpointError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     std::fs::DirBuilder::new()
@@ -220,7 +243,12 @@ pub struct CallbackListener {
     listener: tokio::net::UnixListener,
     path: PathBuf,
     /// The socket node this listener bound (device, inode): `Drop` removes the
-    /// path only while it still names THIS node.
+    /// path only if it still names this node when looked at. Best effort, not
+    /// atomic — the look and the removal are two calls, and an inode number
+    /// can be reused — so it guards against the ordinary case (a later
+    /// listener bound at the same name), not against someone of this user
+    /// replacing entries in the directory concurrently (review of ME3-SUP
+    /// slice 2, round 2).
     node: (u64, u64),
 }
 
@@ -328,13 +356,23 @@ pub async fn handshake(
 ) -> Result<Handshaken, HandshakeFailed> {
     let (read, mut writer) = stream.into_split();
     let mut reader = BufReader::new(read);
-    let frame =
-        match tokio::time::timeout_at(deadline, crate::rpc::read_frame_async(&mut reader)).await {
-            Err(_) => return Err(HandshakeFailed::Timeout),
-            Ok(Err(e)) => return Err(HandshakeFailed::Frame(e)),
-            Ok(Ok(frame)) => frame,
-        };
-    match initialize::accept(&frame, expect) {
+    // `timeout_at` polls the wrapped future before its timer, so a frame that
+    // was already buffered would win over a deadline that had already passed
+    // (a starved task resuming late). The deadline goes FIRST in a biased
+    // select instead, here and for the answer (review of ME3-SUP slice 2,
+    // round 2).
+    let frame = tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => return Err(HandshakeFailed::Timeout),
+        read = crate::rpc::read_frame_async(&mut reader) => read.map_err(HandshakeFailed::Frame)?,
+    };
+    let verdict = initialize::accept(&frame, expect);
+    // Checking up to a megabyte is synchronous work; it must not carry a
+    // handshake past its deadline into success.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(HandshakeFailed::Timeout);
+    }
+    match verdict {
         Ok(accepted) => {
             let line = initialize::success_line(&accepted);
             let write = async {
@@ -342,27 +380,39 @@ pub async fn handshake(
                 writer.flush().await
             };
             let until = deadline.min(tokio::time::Instant::now() + crate::rpc::WRITE_TIMEOUT);
-            match tokio::time::timeout_at(until, write).await {
-                Ok(Ok(())) => Ok(Handshaken {
-                    reader,
-                    writer,
-                    accepted,
-                }),
-                Ok(Err(e)) => Err(HandshakeFailed::Write(e)),
-                Err(_) => Err(HandshakeFailed::Write(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "the handshake answer was not taken",
-                ))),
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(until) => {
+                    if until >= deadline {
+                        Err(HandshakeFailed::Timeout)
+                    } else {
+                        Err(HandshakeFailed::Write(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the handshake answer was not taken",
+                        )))
+                    }
+                }
+                written = write => match written {
+                    Ok(()) => Ok(Handshaken {
+                        reader,
+                        writer,
+                        accepted,
+                    }),
+                    Err(e) => Err(HandshakeFailed::Write(e)),
+                },
             }
         }
         Err(refusal) => {
             let line = initialize::error_line(initialize::id_of(&frame).as_deref(), &refusal);
             let until = deadline.min(tokio::time::Instant::now() + REFUSAL_WRITE_TIMEOUT);
-            let _ = tokio::time::timeout_at(until, async {
-                writer.write_all(&line).await?;
-                writer.flush().await
-            })
-            .await;
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(until) => {}
+                _ = async {
+                    writer.write_all(&line).await?;
+                    writer.flush().await
+                } => {}
+            }
             Err(HandshakeFailed::Refused(refusal))
         }
     }
@@ -718,5 +768,49 @@ mod tests {
         );
         drop(second);
         assert!(!path.exists(), "control: the second removes its own");
+    }
+
+    /// A deadline that has already passed wins even when the first frame is
+    /// sitting in the buffer and the answer would be written at once: no
+    /// success after the deadline. (`timeout_at` polls its future first, and
+    /// returned success here; review of ME3-SUP slice 2, round 2.)
+    #[tokio::test]
+    async fn a_passed_deadline_wins_over_a_frame_already_waiting() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let listener = dir.listen(1).unwrap();
+        let mut module = UnixStream::connect(listener.path()).await.unwrap();
+        module
+            .write_all(initialize_frame("late", "s3cret").as_bytes())
+            .await
+            .unwrap();
+        let stream = listener.accept_one(soon()).await.unwrap();
+        // Give the frame time to land in the kernel's buffer.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let passed = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let err = handshake(stream, &expectation(), passed)
+            .await
+            .expect_err("a handshake past its deadline succeeded");
+        assert!(matches!(err, HandshakeFailed::Timeout), "{err}");
+    }
+
+    /// A stale pid directory of ours — left, say, by a crashed daemon that had
+    /// this pid — is normalised and emptied like `run/`, not refused.
+    #[tokio::test]
+    async fn a_stale_pid_directory_of_ours_is_taken_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = state();
+        let stale = s.path().join("run").join(std::process::id().to_string());
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("leftover.sock"), b"").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = CallbackDir::create(s.path()).expect("ours, so taken over");
+        assert!(
+            !stale.join("leftover.sock").exists(),
+            "the stale directory was not emptied"
+        );
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }
