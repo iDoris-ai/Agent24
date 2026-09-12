@@ -36,6 +36,24 @@ pub struct Discovered {
     /// The directory the manifest was read from. Kept for diagnostics and for
     /// ME-3b, which needs it to resolve a spawn command relative to the package.
     pub dir: PathBuf,
+    /// `sha256:<hex>` of the manifest file's exact bytes — what the module must
+    /// report in its `initialize`, so a module started against one manifest
+    /// cannot be served under another (SPEC §3). Computed from the bytes that
+    /// were parsed, not re-read, so the digest and the manifest are one read.
+    pub digest: String,
+}
+
+/// `sha256:` and the lowercase hex of `bytes`: the manifest digest format.
+#[must_use]
+pub fn manifest_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(bytes);
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for b in hash {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Why one directory under the packages root did not become a [`Discovered`].
@@ -198,6 +216,7 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
             bytes[0], bytes[1]
         ));
     }
+    let digest = manifest_digest(&bytes);
     let text =
         String::from_utf8(bytes).map_err(|e| format!("{MANIFEST_FILE} is not valid UTF-8: {e}"))?;
 
@@ -205,6 +224,7 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
     Ok(Discovered {
         manifest,
         dir: dir.to_owned(),
+        digest,
     })
 }
 
@@ -258,6 +278,29 @@ mod tests {
         assert!(scan.refused.is_empty(), "{:?}", scan.refused);
         assert_eq!(scan.found.len(), 1);
         assert_eq!(scan.found[0].manifest.name(), "cos72");
+    }
+
+    /// The digest a module must report is `sha256:` + lowercase hex of the
+    /// manifest file's exact bytes (the known vector pins the format), and a
+    /// discovered package carries the digest of the file it was parsed from.
+    #[test]
+    fn a_discovered_package_carries_the_digest_of_its_manifest_bytes() {
+        assert_eq!(
+            manifest_digest(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let body = manifest_yaml("cos72", "out_of_process_provider");
+        let dir = install(root.path(), "cos72", &body);
+        let scan = scan(root.path());
+        assert_eq!(scan.found[0].digest, manifest_digest(body.as_bytes()));
+        // One byte more is another manifest, and another digest.
+        std::fs::write(dir.join(MANIFEST_FILE), format!("{body}\n")).unwrap();
+        assert_ne!(scan_digest(root.path()), manifest_digest(body.as_bytes()));
+    }
+
+    fn scan_digest(root: &Path) -> String {
+        scan(root).found[0].digest.clone()
     }
 
     #[test]

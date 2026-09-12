@@ -19,8 +19,14 @@ use tokio_util::sync::CancellationToken;
 
 /// Grace period for in-flight requests after a shutdown signal; the process
 /// force-exits after this so `kill -TERM` always terminates within ~2s
-/// (TASKS B2 acceptance).
+/// (TASKS B2 acceptance). Out-of-process modules are stopped in the same
+/// window, alongside the HTTP drain — not after it (SUP-4).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// SIGTERM to SIGKILL for an out-of-process module this daemon stops. ⚖️
+/// Shorter than the library's default so that stopping every module fits in
+/// [`SHUTDOWN_GRACE`] with time left to reap: a module gets 1.5s to flush.
+const MODULE_STOP_GRACE: Duration = Duration::from_millis(1500);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -734,11 +740,11 @@ pub async fn serve(
         // A CLOSURE, not a constructed module: the mounter decides whether this
         // ever runs. That is what lets a user switch off a domain OS whose
         // constructor is the thing breaking the daemon.
-        build: Box::new(move || {
+        build: crate::domain::Build::InProcess(Box::new(move || {
             agent24_sin90_os::Sin90Module::new(mode.clone())
                 .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
                 .map_err(|e| e.to_string())
-        }),
+        })),
     }];
 
     // ME-3a: the catalogue is no longer only what was compiled in. The merge is a
@@ -800,13 +806,23 @@ pub async fn serve(
         Some(kv) => crate::domain::MemoryLease::open(LOCAL_USER, kv).await,
         None => None,
     };
-    let (module_routes, reports, partitions) = crate::domain::mount_all(
+    // SUP-4: what out-of-process modules are started with. Its callback
+    // sockets live under the state directory — or, for an ephemeral daemon,
+    // under its throwaway root. Directories left by daemons that are gone are
+    // cleared first (FU-56). A daemon that cannot set this up still runs; its
+    // packages degrade, with the reason.
+    let host = process_host(if ephemeral { &os_root } else { &state_dir });
+    if let Err(why) = &host {
+        tracing::error!("out-of-process domain OS modules cannot be started: {why}");
+    }
+    let (module_routes, reports, partitions, supervisors) = crate::domain::mount_all(
         &catalogue,
         &os_root,
         &state.events,
         os_config.as_ref().map_err(String::as_str),
         &inventory,
         lease.as_ref(),
+        host.as_ref().map_err(String::as_str),
     )
     .await;
     for p in partitions.partitions() {
@@ -955,6 +971,23 @@ pub async fn serve(
         signal_cancel.cancel();
     });
 
+    // Modules are stopped from the moment shutdown begins, alongside the HTTP
+    // drain, and inside the same SHUTDOWN_GRACE (TASKS B2).
+    // Bounded from the moment shutdown begins: a module still stopping at the
+    // deadline is dropped with its supervisor, which SIGKILLs its group — and a
+    // module reads EOF on its callback connection as the end of its run (D1),
+    // so one that outlives this process exits on its own.
+    let stop_cancel = cancel.clone();
+    let stopping = tokio::spawn(async move {
+        stop_cancel.cancelled().await;
+        if tokio::time::timeout(SHUTDOWN_GRACE, stop_supervisors(supervisors))
+            .await
+            .is_err()
+        {
+            tracing::warn!("out-of-process modules were still stopping at the deadline; killed");
+        }
+    });
+
     let graceful_cancel = cancel.clone();
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { graceful_cancel.cancelled().await });
@@ -971,11 +1004,59 @@ pub async fn serve(
             Ok(())
         }
     };
+    // The server can end without a cancel (an accept error); the modules stop
+    // either way. The wait is bounded by the task itself.
+    cancel.cancel();
+    let _ = stopping.await;
     // Only remove our own state file — a newer daemon may have replaced it
     if !ephemeral {
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
     }
     result
+}
+
+/// What out-of-process modules are started with: the callback directory under
+/// `root` (stale ones cleared first, FU-56), this binary as the trampoline, and
+/// the daemon's stop grace.
+fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, String> {
+    for gone in agent24_os_proto::endpoint::remove_stale(root) {
+        tracing::info!(
+            "removed the callback directory of a daemon that is gone: {}",
+            gone.display()
+        );
+    }
+    let callback_dir = agent24_os_proto::endpoint::CallbackDir::create(root)
+        .map_err(|e| format!("callback directory: {e}"))?;
+    // This binary, which hands a module over at the top of `main`
+    // (`run_as_trampoline_if_asked`), so it needs no arguments of its own.
+    let program = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;
+    Ok(crate::domain::ProcessHost {
+        callback_dir: StdArc::new(callback_dir),
+        trampoline: agent24_os_proto::launch::Trampoline {
+            program,
+            args: Vec::new(),
+        },
+        timings: agent24_os_proto::supervisor::Timings {
+            stop_grace: MODULE_STOP_GRACE,
+            ..agent24_os_proto::supervisor::Timings::default()
+        },
+    })
+}
+
+/// Stop every supervised module, concurrently, and log any stop that was not
+/// clean. Unbounded here; the caller bounds it.
+async fn stop_supervisors(supervisors: Vec<crate::domain::Supervised>) {
+    let mut stops = tokio::task::JoinSet::new();
+    for s in supervisors {
+        stops.spawn(async move { (s.name, s.handle.stop().await) });
+    }
+    while let Some(done) = stops.join_next().await {
+        match done {
+            Ok((_, Ok(()))) => {}
+            Ok((name, Err(e))) => tracing::error!("domain OS {name:?} did not stop cleanly: {e}"),
+            Err(e) => tracing::error!("stopping a domain OS failed: {e}"),
+        }
+    }
 }
 
 /// Append packages found on disk to a build-time catalogue.
@@ -987,10 +1068,9 @@ pub async fn serve(
 /// that `vec!` means editing and rebuilding the daemon.
 ///
 /// A discovered package is NOT constructed here, and cannot be: an out-of-process
-/// module has no Rust type, and the transport that would give it one is ME-3b. Its
-/// `build` closure returns an error naming that. The entry still reaches the
-/// mounter, is refused there by the check that already exists, and — the point —
-/// appears in `agent24 os list` with a reason.
+/// module has no Rust type. It becomes a [`crate::domain::Build::Package`], which
+/// the mounter starts under a supervisor — only if it is admissible and enabled —
+/// and which appears in `agent24 os list` either way.
 ///
 /// **Order is load-bearing.** Discovered entries go AFTER the built-in ones, and
 /// `mount_all` claims names first-come-first-served, so a disk package cannot
@@ -1023,21 +1103,18 @@ fn with_discovered(
     for d in scan.found {
         let name = d.manifest.name().to_owned();
         let version = d.manifest.version().to_owned();
-        let dir = d.dir.clone();
         tracing::info!(
             "discovered domain OS {name:?} v{version} at {}",
-            dir.display()
+            d.dir.display()
         );
         catalogue.push(crate::domain::Installed {
             name,
             version,
-            build: Box::new(move || {
-                Err(format!(
-                    "{} declares an out-of-process provider; that transport is not \
-                     implemented yet (ME-3b)",
-                    dir.display()
-                ))
-            }),
+            build: crate::domain::Build::Package(Box::new(crate::domain::Package {
+                manifest: d.manifest,
+                dir: d.dir,
+                digest: d.digest,
+            })),
         });
     }
     catalogue
@@ -1068,7 +1145,9 @@ pub(crate) mod tests {
         crate::domain::Installed {
             name: name.to_owned(),
             version: "9.9.9".to_owned(),
-            build: Box::new(|| Err("built-in, not constructed in this test".to_owned())),
+            build: crate::domain::Build::InProcess(Box::new(|| {
+                Err("built-in, not constructed in this test".to_owned())
+            })),
         }
     }
 
@@ -1195,19 +1274,20 @@ pub(crate) mod tests {
         let entry = crate::domain::Installed {
             name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
             version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-            build: Box::new(move || {
+            build: crate::domain::Build::InProcess(Box::new(move || {
                 agent24_sin90_os::Sin90Module::new(mode.clone())
                     .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
                     .map_err(|e| e.to_string())
-            }),
+            })),
         };
-        let (modules, _, _) = crate::domain::mount_all(
+        let (modules, _, _, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
             None,
+            Err("no process host in this test"),
         )
         .await;
         (build_router_with_modules(st, modules), tmp)
@@ -1346,15 +1426,18 @@ pub(crate) mod tests {
         let entry = crate::domain::Installed {
             name: "probe".to_owned(),
             version: "0.1.0".to_owned(),
-            build: Box::new(move || Ok(m.clone() as StdArc<dyn DomainModule>)),
+            build: crate::domain::Build::InProcess(Box::new(move || {
+                Ok(m.clone() as StdArc<dyn DomainModule>)
+            })),
         };
-        let (modules, reports, _) = crate::domain::mount_all(
+        let (modules, reports, _, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);
@@ -2053,19 +2136,20 @@ pub(crate) mod tests {
         let entry = crate::domain::Installed {
             name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
             version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-            build: Box::new(|| {
+            build: crate::domain::Build::InProcess(Box::new(|| {
                 agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Memory)
                     .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
                     .map_err(|e| e.to_string())
-            }),
+            })),
         };
-        let (modules, _, _) = crate::domain::mount_all(
+        let (modules, _, _, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
             None,
+            Err("no process host in this test"),
         )
         .await;
         let router = build_router_with_modules(st, modules);

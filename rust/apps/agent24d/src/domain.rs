@@ -19,10 +19,12 @@
 //!    `sin90` would collide on the directory, the route namespace AND the event
 //!    module at once, so the name is reserved BEFORE the store is opened or any
 //!    route is mounted — a later failure must not leave a half-mounted twin.
-//! 2. **Out-of-process manifests are refused** — once constructed. The transport
-//!    does not exist (ME-3), and half-mounting a config we cannot honor is worse
-//!    than refusing it. A DISABLED entry is never constructed, so its transport is
-//!    simply not known yet; see the ordering note below.
+//! 2. **A module runs the way its entry says, and only that way.** A compiled-in
+//!    entry ([`Build::InProcess`]) whose manifest declares an out-of-process
+//!    provider is refused — once constructed; a package on disk
+//!    ([`Build::Package`]) must declare one, and is started as its own process
+//!    under a supervisor with the kernel's proxy in front (SUP-4). A DISABLED
+//!    entry is never constructed or started; see the ordering note below.
 //! 3. **A failed `open_store` degrades that module ONLY.** The kernel nests its
 //!    OWN 503 router under the namespace rather than the module's — a module
 //!    whose store is gone is exactly the one least able to answer correctly, and
@@ -272,7 +274,9 @@ pub enum MountOutcome {
     /// (`module_unavailable`), because they send an operator to different files.
     Degraded(String),
     /// Not mounted at all — NO routes, not even 503 ones: a duplicate name, a
-    /// kernel-reserved name, or an out-of-process manifest.
+    /// kernel-reserved name, or a manifest that disagrees with how its entry is
+    /// provided (a compiled-in module declaring an out-of-process provider, a
+    /// package on disk declaring an in-process crate).
     Refused(String),
 }
 
@@ -474,13 +478,49 @@ fn disabled_namespace(app: Router, namespace: &str, module: &str) -> Router {
 pub struct Installed {
     pub name: String,
     pub version: String,
-    /// Build the module. Called ONLY after IDENTITY admission (name validity,
-    /// duplicates, kernel-reserved names) and registry policy have said it should
-    /// run — so a switched-off or badly-named entry is never constructed.
-    /// Manifest-derived admission necessarily happens after this, because the
-    /// manifest does not exist until the module does.
+    /// How the module comes to exist. Acted on ONLY after IDENTITY admission
+    /// (name validity, duplicates, kernel-reserved names) and registry policy
+    /// have said it should run — so a switched-off or badly-named entry is never
+    /// constructed, and never started.
+    pub build: Build,
+}
+
+/// Where a module comes from.
+pub enum Build {
+    /// Compiled in: build it by calling this. Manifest-derived admission
+    /// necessarily happens after, because the manifest does not exist until the
+    /// module does.
     #[allow(clippy::type_complexity)]
-    pub build: Box<dyn Fn() -> std::result::Result<Arc<dyn DomainModule>, String> + Send + Sync>,
+    InProcess(Box<dyn Fn() -> std::result::Result<Arc<dyn DomainModule>, String> + Send + Sync>),
+    /// A package found on disk, run as its own process (ME-3, SUP-4). Its
+    /// manifest was read and validated at discovery.
+    Package(Box<Package>),
+}
+
+/// A discovered package: what a supervisor needs to start it.
+pub struct Package {
+    pub manifest: agent24_domain::DomainOsManifest,
+    /// Where the manifest was read from; the spawn command resolves under it.
+    pub dir: std::path::PathBuf,
+    /// `sha256:<hex>` of the manifest's bytes — what the module must report in
+    /// its handshake.
+    pub digest: String,
+}
+
+/// What the daemon lends every out-of-process module: where their callback
+/// sockets live, how to start them, and how long to wait for them.
+pub struct ProcessHost {
+    pub callback_dir: Arc<agent24_os_proto::endpoint::CallbackDir>,
+    pub trampoline: agent24_os_proto::launch::Trampoline,
+    pub timings: agent24_os_proto::supervisor::Timings,
+}
+
+/// A module started under a supervisor. The daemon stops each before it exits
+/// (see `server::stop_supervisors`); dropping one kills its module without
+/// grace.
+pub struct Supervised {
+    pub name: String,
+    pub handle: agent24_os_proto::supervisor::SupervisorHandle,
 }
 
 /// Mount everything in `catalogue` under `root`, returning the combined router
@@ -505,6 +545,7 @@ pub struct Installed {
 /// `Router<()>`: each module has already bound its own state. `registry` decides
 /// which entries are active (ME-2); `inventory` answers the declared-resource
 /// check once for the whole pass.
+#[allow(clippy::too_many_arguments)]
 pub async fn mount_all(
     catalogue: &[Installed],
     root: &Path,
@@ -512,9 +553,16 @@ pub async fn mount_all(
     registry: std::result::Result<&crate::os_config::OsConfig, &str>,
     inventory: &dyn ModelInventory,
     memory: Option<&MemoryLease>,
-) -> (Router, Vec<MountReport>, crate::os_memory::OsMemoryCatalog) {
+    host: std::result::Result<&ProcessHost, &str>,
+) -> (
+    Router,
+    Vec<MountReport>,
+    crate::os_memory::OsMemoryCatalog,
+    Vec<Supervised>,
+) {
     let mut app = Router::new();
     let mut reports = Vec::new();
+    let mut supervisors = Vec::new();
     // Recorded for every module that is HANDED a partition, so a future export or
     // erase path has an explicit list instead of prefix-matching storage keys.
     let mut partitions = crate::os_memory::OsMemoryCatalog::default();
@@ -675,9 +723,34 @@ pub async fn mount_all(
             continue;
         }
 
+        // A PACKAGE is started, not constructed: its own path from here.
+        let build = match &entry.build {
+            Build::Package(package) => {
+                let (next, report, supervised) = mount_package(
+                    app,
+                    package,
+                    MountTarget {
+                        name,
+                        namespace,
+                        version,
+                        enabled_at_start,
+                    },
+                    root,
+                    inventory,
+                    host,
+                )
+                .await;
+                app = next;
+                reports.push(report);
+                supervisors.extend(supervised);
+                continue;
+            }
+            Build::InProcess(build) => build,
+        };
+
         // CONSTRUCTION. A failure here degrades this entry and nothing else — and
         // it still has a name and a namespace, so `agent24 os disable` can reach it.
-        let module = match (entry.build)() {
+        let module = match build() {
             Ok(m) => m,
             Err(why) => {
                 let reason = format!("could not be constructed: {why}");
@@ -724,14 +797,12 @@ pub async fn mount_all(
             );
             continue;
         }
-        // Lifting this refusal is what makes "a toggle takes effect at the next
-        // daemon start" false — in the CLI help (`agent24-cli` `OsAction`), in
-        // `os_routes.rs`'s module docs and in its `restart_required` field. Read
-        // the EXPIRES note beside those help lines before removing this.
+        // A compiled-in entry is mounted in process, so its manifest must say
+        // so. Out-of-process modules come from packages (`Build::Package`).
         if !manifest.is_mountable_in_process() {
             refuse(
-                "manifest declares an out-of-process provider; that transport does \
-                 not exist yet (ME-3)"
+                "a compiled-in module's manifest declares an out-of-process \
+                 provider; out-of-process modules are installed as packages"
                     .to_owned(),
                 &mut reports,
             );
@@ -821,7 +892,139 @@ pub async fn mount_all(
         });
     }
 
-    (app, reports, partitions)
+    (app, reports, partitions, supervisors)
+}
+
+/// The identity `mount_all` already admitted, for the entry being mounted.
+struct MountTarget {
+    name: String,
+    namespace: String,
+    version: String,
+    enabled_at_start: Option<bool>,
+}
+
+/// Mount one admitted, enabled package: start it under a supervisor and put the
+/// kernel's proxy in front of it. Returns the router, the report, and the
+/// supervisor if one was started.
+///
+/// The same outcomes as a compiled-in module, for the same reasons: a manifest
+/// that disagrees with its entry is Refused (no routes); a directory that cannot
+/// be prepared, or a daemon that cannot start processes at all, is Degraded
+/// (the kernel's 503). A package that is started is Mounted from the kernel's
+/// side — its namespace answers `503 module_not_ready` until the module's
+/// handshake, and after a crash while it restarts; the supervisor's status says
+/// which.
+async fn mount_package(
+    app: Router,
+    package: &Package,
+    target: MountTarget,
+    root: &Path,
+    inventory: &dyn ModelInventory,
+    host: std::result::Result<&ProcessHost, &str>,
+) -> (Router, MountReport, Option<Supervised>) {
+    let MountTarget {
+        name,
+        namespace,
+        version,
+        enabled_at_start,
+    } = target;
+    let report = |outcome: MountOutcome, resources: ResourceStatus| MountReport {
+        name: name.clone(),
+        namespace: namespace.clone(),
+        version: version.clone(),
+        enabled_at_start,
+        outcome,
+        // No capability is granted to an out-of-process module yet: the
+        // handshake offers none (`Offer::none`), so it holds none.
+        granted: Vec::new(),
+        resources,
+    };
+    let manifest = &package.manifest;
+    let refused = |why: String| {
+        tracing::error!("domain OS {name:?} not mounted: {why}");
+        report(MountOutcome::Refused(why), ResourceStatus::NotChecked)
+    };
+    // The catalogue entry was made from this manifest, so these agree unless
+    // the entry was built by hand — checked anyway, as for a compiled-in module.
+    if manifest.name() != name || manifest.version() != version {
+        return (
+            app,
+            refused(format!(
+                "the catalogue lists {name:?} v{version} but its manifest says {:?} v{}",
+                manifest.name(),
+                manifest.version()
+            )),
+            None,
+        );
+    }
+    let Some(command) = manifest
+        .spawn()
+        .filter(|_| !manifest.is_mountable_in_process())
+    else {
+        return (
+            app,
+            refused(
+                "a package on disk must declare an out-of-process provider with a \
+                 spawn command; in-process modules are compiled in"
+                    .to_owned(),
+            ),
+            None,
+        );
+    };
+    let degraded = |app: Router, why: String| {
+        tracing::error!("domain OS {name:?} unavailable ({why}); {namespace}/* will 503");
+        (
+            degraded_namespace(app, &namespace, &name),
+            report(MountOutcome::Degraded(why), ResourceStatus::NotChecked),
+            None,
+        )
+    };
+    let host = match host {
+        Ok(h) => h,
+        Err(why) => {
+            return degraded(
+                app,
+                format!("this daemon cannot start out-of-process modules: {why}"),
+            );
+        }
+    };
+    let data_dir = manifest.data_dir_under(root);
+    if let Err(why) = prepare_dir(&data_dir).await {
+        return degraded(app, why);
+    }
+    let resources = check_resources(inventory, manifest.requires_models());
+    let current =
+        agent24_os_proto::drain::Current::new(agent24_os_proto::drain::Generation::starting());
+    let spec = agent24_os_proto::supervisor::ModuleSpec {
+        name: name.clone(),
+        command: command.clone(),
+        package_dir: package.dir.clone(),
+        data_dir,
+        manifest_digest: package.digest.clone(),
+        trampoline: host.trampoline.clone(),
+    };
+    let handle = match agent24_os_proto::supervisor::supervise(
+        spec,
+        host.callback_dir.clone(),
+        current.clone(),
+        // No callback method is offered to modules yet (ME-3c onward).
+        Arc::new(|_| agent24_os_proto::rpc::Methods::none()),
+        host.timings,
+    ) {
+        Ok(h) => h,
+        // A fresh slot, held by nobody: not expected. Still not a mounted module.
+        Err(held) => return degraded(app, held.to_string()),
+    };
+    tracing::info!(
+        "domain OS {name:?} started from {} and proxied at {namespace}",
+        package.dir.display()
+    );
+    let app = agent24_os_proto::proxy::mount(app, &namespace, current);
+    (
+        app,
+        report(MountOutcome::Mounted, resources),
+        Some(Supervised { name, handle }),
+    )
 }
 
 #[cfg(test)]
@@ -863,7 +1066,7 @@ mod tests {
         Installed {
             name,
             version,
-            build: Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>)),
+            build: Build::InProcess(Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>))),
         }
     }
 
@@ -874,7 +1077,7 @@ mod tests {
         Installed {
             name: name.to_owned(),
             version: "0.0.0".to_owned(),
-            build: Box::new(move || Err(why.clone())),
+            build: Build::InProcess(Box::new(move || Err(why.clone()))),
         }
     }
 
@@ -884,8 +1087,16 @@ mod tests {
         root: &Path,
         hub: &crate::events::EventsHub,
     ) -> (Router, Vec<MountReport>) {
-        let (app, reports, _) =
-            mount_all(catalogue, root, hub, Ok(&all_enabled()), &no_models(), None).await;
+        let (app, reports, _, _) = mount_all(
+            catalogue,
+            root,
+            hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+        )
+        .await;
         (app, reports)
     }
 
@@ -1084,12 +1295,237 @@ mod tests {
         assert_eq!(get(&app, "/api/v1/dup/ping").await.status(), StatusCode::OK);
     }
 
-    /// Also the tripwire for three promises that "a toggle takes effect at the
-    /// next daemon start" (CLI help, `os_routes.rs`, `restart_required`): if this
-    /// has to change because out-of-process modules now mount, those become
-    /// false — see the EXPIRES note in `agent24-cli`'s `OsAction`.
+    // ── SUP-4: packages on disk, started under a supervisor ──────────────
+
+    /// A package module in Python: it serves HTTP on the listener the kernel
+    /// hands it (fd `A24_LISTEN_FD`), computes its manifest digest the way
+    /// SPEC §3 says — `sha256:` + hex of the manifest file's bytes — reports it
+    /// in `initialize`, and exits when its callback connection ends (D1).
+    const PACKAGE_MODULE: &str = r#"import hashlib, json, os, socket, threading
+name = os.environ["A24_MODULE_NAME"]
+with open("domain-os.yml", "rb") as f:
+    digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+def serve():
+    while True:
+        conn, _ = listener.accept()
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            head += chunk
+        body = ("hello from " + name).encode()
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+cb = socket.socket(socket.AF_UNIX)
+cb.connect(os.environ["A24_CALLBACK_SOCK"])
+req = {"jsonrpc": "2.0", "id": "1", "method": "initialize", "params": {
+    "protocol_versions": {"min": 1, "max": 1000}, "module": name,
+    "manifest_digest": digest, "auth_token": os.environ["A24_HANDSHAKE_TOKEN"],
+    "capabilities": []}}
+cb.sendall((json.dumps(req) + "\n").encode())
+f = cb.makefile("rb")
+f.readline()
+while f.readline():
+    pass
+"#;
+
+    /// Write a package for `name` under `packages`: a manifest whose spawn
+    /// command runs [`PACKAGE_MODULE`]. The module learns its name from an
+    /// argument-free environment, so it is written into the script.
+    fn write_package(packages: &Path, name: &str) {
+        let dir = packages.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("mod.py"),
+            PACKAGE_MODULE.replace("os.environ[\"A24_MODULE_NAME\"]", &format!("{name:?}")),
+        )
+        .unwrap();
+    }
+
+    /// The catalogue entries `serve` would make of `packages`.
+    fn discovered(packages: &Path) -> Vec<Installed> {
+        agent24_os_packages::discovery::scan(packages)
+            .found
+            .into_iter()
+            .map(|d| Installed {
+                name: d.manifest.name().to_owned(),
+                version: d.manifest.version().to_owned(),
+                build: Build::Package(Box::new(Package {
+                    manifest: d.manifest,
+                    dir: d.dir,
+                    digest: d.digest,
+                })),
+            })
+            .collect()
+    }
+
+    /// A process host for tests: a callback directory under a short path, and
+    /// a shell trampoline that execs the module (the daemon binary is the
+    /// real one, and is not available to a unit test).
+    fn test_host(tmp: &Path) -> ProcessHost {
+        use std::os::unix::fs::PermissionsExt;
+        let trampoline = tmp.join("trampoline.sh");
+        std::fs::write(
+            &trampoline,
+            "#!/bin/sh\nwhile [ \"$1\" != \"--a24-exec-module\" ]; do shift; done\nshift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&trampoline, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ProcessHost {
+            callback_dir: Arc::new(agent24_os_proto::endpoint::CallbackDir::create(tmp).unwrap()),
+            trampoline: agent24_os_proto::launch::Trampoline {
+                program: trampoline,
+                args: Vec::new(),
+            },
+            timings: agent24_os_proto::supervisor::Timings {
+                stop_grace: std::time::Duration::from_secs(1),
+                ..agent24_os_proto::supervisor::Timings::default()
+            },
+        }
+    }
+
+    /// SUP-4, the real path: a package found on disk is started under a
+    /// supervisor, completes its handshake — with the digest of its own
+    /// manifest — and answers through the kernel's proxy at its namespace; its
+    /// data directory is prepared; and it stops cleanly. (The successor of the
+    /// old tripwire: out-of-process modules now mount. The CLI's "applies at
+    /// the next daemon start" still holds — a toggle still acts only at start.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_package_is_started_and_proxied() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _, supervisors) = mount_all(
+            &discovered(&packages),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+        )
+        .await;
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "{:?}",
+            reports[0]
+        );
+        assert!(
+            root.join("remote").is_dir(),
+            "its data directory was not prepared"
+        );
+        assert_eq!(supervisors.len(), 1);
+
+        // `module_not_ready` until the handshake, then the module's own answer.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let body = loop {
+            let res = get(&app, "/api/v1/remote/hi").await;
+            if res.status() == StatusCode::OK {
+                let bytes = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+                break String::from_utf8_lossy(&bytes).into_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the module never became ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(body, "hello from remote");
+
+        for s in supervisors {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// A disabled package is never started — the same rule as a compiled-in
+    /// module that is never constructed — and its namespace says so.
     #[tokio::test]
-    async fn an_out_of_process_manifest_is_refused_not_half_mounted() {
+    async fn a_disabled_package_is_never_started() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
+        let (app, reports, _, supervisors) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Ok(&host),
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        assert!(supervisors.is_empty(), "a disabled package was started");
+        assert_eq!(
+            body_json(get(&app, "/api/v1/remote/hi").await).await["error"]["code"],
+            "module_disabled"
+        );
+    }
+
+    /// A daemon that cannot start processes still mounts everything else; each
+    /// package degrades to the kernel's 503, with the reason in its report.
+    #[tokio::test]
+    async fn without_a_process_host_a_package_degrades_with_the_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let hub = crate::events::EventsHub::default();
+        let (app, reports, _, supervisors) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Err("the callback directory is not ours"),
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("not ours"), "{why}"),
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+        assert!(supervisors.is_empty());
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// A COMPILED-IN entry whose manifest declares an out-of-process provider
+    /// is refused, not half-mounted: out-of-process modules are packages
+    /// (`Build::Package`, and the real path above), and an in-process type
+    /// claiming otherwise is a build mistake. (This used to be the tripwire for
+    /// the "takes effect at the next daemon start" promises; since SUP-4 that
+    /// is `a_package_is_started_and_proxied`, and the promises still hold — see
+    /// the note in `agent24-cli`'s `OsAction`.)
+    #[tokio::test]
+    async fn a_compiled_in_module_declaring_out_of_process_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::with("remote", "out_of_process_provider", false);
@@ -1416,13 +1852,14 @@ mod tests {
         };
         let a = want_mem("alpha");
         let b = want_mem("beta");
-        let (_, reports, partitions) = mount_all(
+        let (_, reports, partitions, _) = mount_all(
             &[entry(a.clone()), entry(b.clone())],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &no_models(),
             Some(&lease),
+            Err("no process host in this test"),
         )
         .await;
 
@@ -1471,13 +1908,14 @@ mod tests {
         let lease = MemoryLease::open("alice", kv).await.unwrap();
         // `manifest_yaml` asks for events only.
         let m = FakeModule::new("quiet");
-        let (_, reports, partitions) = mount_all(
+        let (_, reports, partitions, _) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &no_models(),
             Some(&lease),
+            Err("no process host in this test"),
         )
         .await;
         assert!(m.ctx().unwrap().memory().is_none());
@@ -1503,13 +1941,14 @@ mod tests {
             "kernel_capabilities: [memory]",
         );
         let m = FakeModule::from_yaml(&yaml, false);
-        let (_, reports, partitions) = mount_all(
+        let (_, reports, partitions, _) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted, "it still mounts");
@@ -1560,13 +1999,14 @@ mod tests {
         .unwrap();
 
         let lease = MemoryLease::open("alice", kv).await.unwrap();
-        let (_, reports, partitions) = mount_all(
+        let (_, reports, partitions, _) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &no_models(),
             Some(&lease),
+            Err("no process host in this test"),
         )
         .await;
 
@@ -1598,13 +2038,14 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("offswitch");
         let cfg = config_from(r#"{"domainOs": {"offswitch": {"enabled": false}}}"#);
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
 
@@ -1657,13 +2098,14 @@ mod tests {
         let token = st.token.to_string();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = config_from(r#"{"domainOs": {"offswitch": {"enabled": false}}}"#);
-        let (modules, _, _) = mount_all(
+        let (modules, _, _, _) = mount_all(
             &[entry(FakeModule::new("offswitch"))],
             tmp.path(),
             &st.events,
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
         let app = crate::server::build_router_with_modules(st, modules);
@@ -1698,13 +2140,14 @@ mod tests {
         let off = FakeModule::new("shared");
         let squatter = FakeModule::new("shared");
         let cfg = config_from(r#"{"domainOs": {"shared": {"enabled": false}}}"#);
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[entry(off), entry(squatter.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
 
@@ -1729,13 +2172,14 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let a = FakeModule::new("alpha");
         let b = FakeModule::new("beta");
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[entry(a.clone()), entry(b.clone())],
             tmp.path(),
             &hub,
             Err("os.json is not valid: expected value at line 1"),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
 
@@ -1786,13 +2230,14 @@ mod tests {
             manifest_yaml("broken", "in_process_crate")
         );
         let m = FakeModule::from_yaml(&yaml, true);
-        let (_, reports, _) = mount_all(
+        let (_, reports, _, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &TestModels(Ok(vec!["something-else".to_owned()])),
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert!(matches!(reports[0].outcome, MountOutcome::Degraded(_)));
@@ -1815,13 +2260,14 @@ mod tests {
             r#"{"default": "disabled",
                 "domainOs": {"sin09": {"enabled": false}, "sin90": {"enabled": true}}}"#,
         );
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[entry(FakeModule::new("sin90"))],
             tmp.path(),
             &hub,
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert_eq!(
@@ -1844,7 +2290,7 @@ mod tests {
         // `someone-else` is a REAL module here, so disabling it is a legitimate
         // config rather than the typo case guarded above.
         let cfg = config_from(r#"{"domainOs": {"someone-else": {"enabled": false}}}"#);
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[
                 entry(FakeModule::new("newcomer")),
                 entry(FakeModule::new("someone-else")),
@@ -1854,6 +2300,7 @@ mod tests {
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert_eq!(
@@ -1880,13 +2327,14 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let real = FakeModule::new("sin90");
         let cfg = config_from(r#"{"domainOs": {"sin09": {"enabled": false}}}"#);
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[entry(real.clone())],
             tmp.path(),
             &hub,
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
 
@@ -1903,13 +2351,14 @@ mod tests {
 
         // The harmless half: an unknown ENABLED entry changes nothing.
         let ok_cfg = config_from(r#"{"domainOs": {"sin09": {"enabled": true}}}"#);
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[entry(FakeModule::new("sin90"))],
             tmp.path(),
             &hub,
             Ok(&ok_cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -1928,7 +2377,7 @@ mod tests {
         let hub = crate::events::EventsHub::default();
         let cfg =
             config_from(r#"{"default": "disabled", "domainOs": {"wanted": {"enabled": true}}}"#);
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[
                 entry(FakeModule::new("wanted")),
                 entry(FakeModule::new("unlisted")),
@@ -1938,6 +2387,7 @@ mod tests {
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -1979,7 +2429,7 @@ mod tests {
         let cfg = config_from(
             r#"{"domainOs": {"health": {"enabled": false}, "remote": {"enabled": false}}}"#,
         );
-        let (_, reports, _) = mount_all(
+        let (_, reports, _, _) = mount_all(
             &[
                 entry(FakeModule::new("health")),
                 entry(FakeModule::with("remote", "out_of_process_provider", false)),
@@ -1989,6 +2439,7 @@ mod tests {
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert!(
@@ -2028,14 +2479,22 @@ mod tests {
         let cat = vec![Installed {
             name: "crashy".to_owned(),
             version: "0.1.0".to_owned(),
-            build: Box::new(move || {
+            build: Build::InProcess(Box::new(move || {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err("would have taken the daemon down".to_owned())
-            }),
+            })),
         }];
         let cfg = config_from(r#"{"domainOs": {"crashy": {"enabled": false}}}"#);
-        let (app, reports, _) =
-            mount_all(&cat, tmp.path(), &hub, Ok(&cfg), &no_models(), None).await;
+        let (app, reports, _, _) = mount_all(
+            &cat,
+            tmp.path(),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+        )
+        .await;
 
         assert_eq!(reports[0].outcome, MountOutcome::Disabled);
         assert_eq!(
@@ -2059,18 +2518,19 @@ mod tests {
         let cat = vec![Installed {
             name: "any".to_owned(),
             version: "0.1.0".to_owned(),
-            build: Box::new(move || {
+            build: Build::InProcess(Box::new(move || {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err("never reached".to_owned())
-            }),
+            })),
         }];
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &cat,
             tmp.path(),
             &hub,
             Err("os.json is not valid"),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
 
@@ -2120,7 +2580,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"twin": {"enabled": false}}}"#);
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[
                 entry(FakeModule::new("twin")),
                 entry(FakeModule::new("twin")),
@@ -2130,6 +2590,7 @@ mod tests {
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
 
@@ -2156,7 +2617,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"alpha": {"enabled": false}}}"#);
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[
                 entry(FakeModule::new("alpha")),
                 entry(FakeModule::new("beta")),
@@ -2166,6 +2627,7 @@ mod tests {
             Ok(&cfg),
             &no_models(),
             None,
+            Err("no process host in this test"),
         )
         .await;
 
@@ -2194,7 +2656,7 @@ mod tests {
             let cat = vec![Installed {
                 name: bad.to_owned(),
                 version: "0.1.0".to_owned(),
-                build: Box::new(|| panic!("must never be constructed")),
+                build: Build::InProcess(Box::new(|| panic!("must never be constructed"))),
             }];
             let (_, reports) = mount(&cat, tmp.path(), &hub).await;
             match &reports[0].outcome {
@@ -2219,7 +2681,7 @@ mod tests {
         let wrong_name = Installed {
             name: "claimed".to_owned(),
             version: m.manifest().version().to_owned(),
-            build: Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>)),
+            build: Build::InProcess(Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>))),
         };
         let (_, reports) = mount(&[wrong_name], tmp.path(), &hub).await;
         match &reports[0].outcome {
@@ -2231,7 +2693,7 @@ mod tests {
         let wrong_version = Installed {
             name: "truthful".to_owned(),
             version: "9.9.9".to_owned(),
-            build: Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>)),
+            build: Build::InProcess(Box::new(move || Ok(m.clone() as Arc<dyn DomainModule>))),
         };
         let (_, reports) = mount(&[wrong_version], tmp.path(), &hub).await;
         match &reports[0].outcome {
@@ -2271,13 +2733,14 @@ mod tests {
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let inv = TestModels(Ok(vec!["ornith-9b".to_owned()]));
-        let (app, reports, _) = mount_all(
+        let (app, reports, _, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &inv,
             None,
+            Err("no process host in this test"),
         )
         .await;
 
@@ -2306,13 +2769,14 @@ mod tests {
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let inv = TestModels(Err("provider timed out".to_owned()));
-        let (_, reports, _) = mount_all(
+        let (_, reports, _, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &inv,
             None,
+            Err("no process host in this test"),
         )
         .await;
         match &reports[0].resources {
@@ -2328,13 +2792,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("frugal");
-        let (_, reports, _) = mount_all(
+        let (_, reports, _, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
             Ok(&all_enabled()),
             &TestModels(Err("nothing configured".to_owned())),
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert_eq!(reports[0].resources, ResourceStatus::Satisfied);

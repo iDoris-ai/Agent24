@@ -72,21 +72,20 @@ enum OsAction {
     // for one reason only: a toggle is written to the config and nothing acts on a
     // running module, so a restart is the only path by which it takes effect.
     //
-    // This note used to say it expired with ME-3b's last slice. ME-3b-5 delivered
-    // the two-phase stop as a library (`agent24_os_proto::drain::Generation`), but
-    // the daemon still refuses to mount an out-of-process package at all
-    // (`domain.rs`, `is_mountable_in_process`), so there is no running module for
-    // a disable to act on and these lines are still true. Rewording them then
-    // would have made a true sentence false.
+    // This note used to say it expired with ME-3b's last slice, and later that
+    // it waited on the daemon refusing out-of-process packages. Since SUP-4 the
+    // daemon does start them — but only at start: a toggle is still written to
+    // the config and nothing acts on a running module, so these lines are still
+    // true. Rewording them now would make a true sentence false.
     //
     // What DOES make them false, one line each, because they are different
     // events: `Disable` — the daemon's disable path calling
-    // `Generation::begin_drain` on a running module; `Enable` — the daemon
-    // spawning a module at runtime rather than at start. Neither can happen
-    // while out-of-process packages are refused at mount, so the test
-    // `an_out_of_process_manifest_is_refused_not_half_mounted` has to change
-    // first — that is the tripwire, since no test can assert what a help string
-    // promises. It and the refusal it covers (`domain.rs`) point back here.
+    // `Generation::begin_drain` on a running module (SUP-5); `Enable` — the
+    // daemon spawning a module at runtime rather than at start. The test that
+    // pins today's behaviour is `a_disabled_package_is_never_started` in
+    // `domain.rs` (a disabled package is not started, and the switch is read
+    // only when the daemon starts); whoever makes a toggle act at runtime
+    // changes it, and these lines with it.
     //
     // The same promise is made twice more, and expires with these lines:
     // `os_routes.rs`'s module docs ("A toggle does not take effect until the
