@@ -103,12 +103,12 @@ pub enum Status {
     /// run is started, and the slot stays held: no other supervisor can start
     /// the module while the old group may still hold its data directory.
     StopFailed { error: String },
-    /// The supervisor itself panicked — a bug. The module was killed and the
-    /// slot says `module_stopping`.
+    /// The supervisor itself panicked — a bug. The module had a SIGKILL
+    /// attempted, the slot says `module_stopping`, and the slot stays held.
     Panicked,
     /// The handle was dropped without a stop: the task was aborted, and a
     /// process it held (if any) had a SIGKILL attempted on its group — not
-    /// waited for, unlike `Stopped`.
+    /// waited for, unlike `Stopped`. If it held one, the slot stays held.
     Killed,
 }
 
@@ -120,7 +120,9 @@ pub type MethodsFor = Arc<dyn Fn(&Arc<Generation>) -> Methods + Send + Sync>;
 
 /// A running supervisor. Dropping it without [`SupervisorHandle::stop`] aborts
 /// the loop; the module process it held is dropped with it, which revokes its
-/// generation and SIGKILLs its group without grace — and releases the slot.
+/// generation and SIGKILLs its group without grace. A kill not waited for is
+/// not a confirmed end, so the slot is then kept held; only a loop caught
+/// holding no process (between runs, or given up) releases it.
 #[derive(Debug)]
 pub struct SupervisorHandle {
     stop: watch::Sender<bool>,
@@ -298,6 +300,15 @@ impl Slot {
         *mine = next;
     }
 
+    /// The loop's end after a confirmed stop: retire, release the slot, and
+    /// only then say `Stopped` — so whoever sees `Stopped` finds the slot free
+    /// (review of ME3-SUP slice 3a, round 6).
+    fn stopped(&self, status: &watch::Sender<Status>) {
+        self.retire();
+        self.current.release();
+        status.send_replace(Status::Stopped);
+    }
+
     /// Leave this supervisor's generation saying `module_stopping`: the module
     /// is not coming back. A run's (revoked already by its stop: a no-op) or a
     /// never-started placeholder (revoking abandons nothing).
@@ -309,7 +320,12 @@ impl Slot {
 /// The loop's slot and status, owned. Every way out — return, panic, the task
 /// aborted, even before its first poll — drops this, which retires this
 /// supervisor's generation, so no path leaves the slot promising a module that
-/// will not come back, and releases the slot — except after `StopFailed`.
+/// will not come back. It releases the slot only when no process can be left:
+/// after `Stopped` (released already, before `Stopped` was published), or
+/// when the loop was aborted between runs (`Backoff`) or after giving up.
+/// Aborted or panicking with a process — or after `StopFailed` — it keeps the
+/// slot: the process had at most a SIGKILL attempted, never confirmed
+/// (review of ME3-SUP slice 3a, round 6).
 struct Exit {
     slot: Slot,
     status: watch::Sender<Status>,
@@ -318,22 +334,22 @@ struct Exit {
 impl Drop for Exit {
     fn drop(&mut self) {
         self.slot.retire();
+        let holds_no_process = matches!(
+            *self.status.borrow(),
+            Status::Stopped | Status::Backoff { .. } | Status::GaveUp { .. }
+        );
         if std::thread::panicking() {
             tracing::error!("the supervisor loop panicked");
             self.status.send_replace(Status::Panicked);
         } else if !matches!(
             *self.status.borrow(),
-            Status::Stopped | Status::GaveUp { .. } | Status::StopFailed { .. }
+            Status::Stopped | Status::StopFailed { .. }
         ) {
             // Aborted (the handle was dropped): the process went with the task,
             // SIGKILLed, not waited for — so not `Stopped`.
             self.status.send_replace(Status::Killed);
         }
-        // Released after an abort or a panic too: the process was dropped
-        // before this guard, and its `Drop` sent the SIGKILL it could — no
-        // better confirmation is coming from a task that no longer runs. Kept
-        // after `StopFailed`: that group may still be there.
-        if !matches!(*self.status.borrow(), Status::StopFailed { .. }) {
+        if holds_no_process {
             self.slot.current.release();
         }
     }
@@ -364,8 +380,7 @@ async fn run_loop(
                     return;
                 }
                 Ok(Run::StopRequested) => {
-                    slot.retire();
-                    status.send_replace(Status::Stopped);
+                    slot.stopped(status);
                     return;
                 }
                 Ok(Run::Ended {
@@ -396,8 +411,7 @@ async fn run_loop(
                     () = stop_requested(&mut stop) => {
                         // The placeholder put in above must not outlive the
                         // module: `module_not_ready` would promise a return.
-                        slot.retire();
-                        status.send_replace(Status::Stopped);
+                        slot.stopped(status);
                         return;
                     }
                     () = tokio::time::sleep(delay) => {}
@@ -413,7 +427,7 @@ async fn run_loop(
                     within,
                 });
                 stop_requested(&mut stop).await;
-                status.send_replace(Status::Stopped);
+                slot.stopped(status);
                 return;
             }
         }
@@ -999,6 +1013,77 @@ sys.exit(0)
         })
         .await;
         stop(second).await;
+    }
+
+    /// A handle dropped while its module runs keeps the slot: the SIGKILL
+    /// its drop sends is not waited for, so the module is not confirmed gone
+    /// and no successor may start over it. Dropped after giving up — no
+    /// process left — it releases the slot, and says `Killed` (round 6).
+    #[tokio::test]
+    async fn a_dropped_handle_releases_the_slot_only_when_it_held_no_process() {
+        let current = Current::new(Generation::starting());
+        let a = fixture("normal");
+        let running = sup(
+            a.spec.clone(),
+            a.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        until(&mut running.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let (pid, _) = starts(a.data.path())[0].clone();
+        drop(running);
+        assert!(gone(pid).await, "the module outlived a dropped supervisor");
+        let b = fixture("normal");
+        assert_eq!(
+            supervise(
+                b.spec.clone(),
+                b.dir.clone(),
+                current.clone(),
+                no_methods(),
+                fast()
+            )
+            .err(),
+            Some(SlotHeld),
+            "a kill not waited for released the slot"
+        );
+
+        let current = Current::new(Generation::starting());
+        let c = fixture("crash");
+        let gave_up = sup(
+            c.spec.clone(),
+            c.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        let mut rx = gave_up.subscribe();
+        until(&mut rx, "GaveUp", |s| matches!(s, Status::GaveUp { .. })).await;
+        drop(gave_up);
+        let killed = tokio::time::timeout(
+            Duration::from_secs(10),
+            rx.wait_for(|s| *s == Status::Killed),
+        )
+        .await
+        .expect("the status never said Killed")
+        .is_ok();
+        assert!(
+            killed,
+            "a supervisor dropped after giving up ended as {:?}",
+            *rx.borrow()
+        );
+        let d = fixture("normal");
+        let next = sup(
+            d.spec.clone(),
+            d.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        stop(next).await;
     }
 
     /// A run whose process cannot be confirmed gone — here a process of this

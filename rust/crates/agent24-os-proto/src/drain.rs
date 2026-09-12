@@ -505,8 +505,8 @@ impl Current {
         true
     }
 
-    /// Give the slot up: the supervisor's processes are confirmed gone (or it
-    /// sent the SIGKILL it could; see `supervisor::Exit`).
+    /// Give the slot up: the supervisor holds no process that is not
+    /// confirmed gone (see `supervisor::Exit`).
     pub(crate) fn release(&self) {
         self.held.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -526,8 +526,12 @@ impl Current {
     /// Does NOT revoke the old one: whoever stops a run revokes it, through the
     /// one path that yields a [`KillPermit`]. Revoking here as well would be a
     /// second place that decides when a module may be killed.
+    ///
+    /// Crate-private: the slot's supervisor (see `claim`) is the only writer,
+    /// and a public `replace` let anyone put a generation there behind its
+    /// back (review of ME3-SUP slice 3a, round 6).
     #[must_use]
-    pub fn replace(&self, next: Arc<Generation>) -> Arc<Generation> {
+    pub(crate) fn replace(&self, next: Arc<Generation>) -> Arc<Generation> {
         std::mem::replace(
             &mut *self
                 .slot
