@@ -273,6 +273,11 @@ enum Run {
 struct Slot {
     current: Arc<Current>,
     mine: std::sync::Mutex<Arc<Generation>>,
+    /// This lease was given back. `Current::release` does not know who holds
+    /// the slot, so a second release by the same supervisor — after a
+    /// successor claimed it — would release the successor's claim (review of
+    /// ME3-SUP slice 3a, round 7). A lease releases once.
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl Slot {
@@ -283,6 +288,7 @@ impl Slot {
         current.claim(mine.clone()).then(|| Self {
             current,
             mine: std::sync::Mutex::new(mine),
+            released: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -305,8 +311,19 @@ impl Slot {
     /// (review of ME3-SUP slice 3a, round 6).
     fn stopped(&self, status: &watch::Sender<Status>) {
         self.retire();
-        self.current.release();
+        self.release();
         status.send_replace(Status::Stopped);
+    }
+
+    /// Give the slot back — once: later calls do nothing, whoever holds the
+    /// slot by then.
+    fn release(&self) {
+        if !self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.current.release();
+        }
     }
 
     /// Leave this supervisor's generation saying `module_stopping`: the module
@@ -350,7 +367,7 @@ impl Drop for Exit {
             self.status.send_replace(Status::Killed);
         }
         if holds_no_process {
-            self.slot.current.release();
+            self.slot.release();
         }
     }
 }
@@ -1013,6 +1030,23 @@ sys.exit(0)
         })
         .await;
         stop(second).await;
+    }
+
+    /// A lease releases once: a supervisor that released its slot and
+    /// releases again (its exit guard after `stopped`) must not release a
+    /// successor's claim — or a third supervisor could start beside the
+    /// second (review of ME3-SUP slice 3a, round 7).
+    #[test]
+    fn a_lease_released_twice_does_not_release_a_successors_claim() {
+        let current = Current::new(Generation::starting());
+        let first = Slot::claim(current.clone()).expect("free");
+        first.release();
+        let _second = Slot::claim(current.clone()).expect("released");
+        first.release();
+        assert!(
+            Slot::claim(current).is_none(),
+            "a third claim beside the second"
+        );
     }
 
     /// A handle dropped while its module runs keeps the slot: the SIGKILL
