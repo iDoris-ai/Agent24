@@ -127,60 +127,72 @@ pub fn resolve_packages_root(
 ///
 /// A message an operator can act on: which path, and which of the conditions.
 pub fn ensure_packages_root(root: &std::path::Path) -> Result<(), UnsafePackagesRoot> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     match std::fs::symlink_metadata(root) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(root)
-                .map_err(|e| UnsafePackagesRoot {
-                    path: root.to_path_buf(),
-                    why: format!("could not create it: {e}"),
-                });
-        }
-        Err(e) => {
-            return Err(UnsafePackagesRoot {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root)
+            .map_err(|e| UnsafePackagesRoot {
                 path: root.to_path_buf(),
-                why: format!("could not inspect it: {e}"),
-            });
-        }
-        Ok(meta) => {
-            // `symlink_metadata`, so a symlink is seen AS a symlink. Following it
-            // would mean checking the permissions of the target while the daemon
-            // later writes through the link — the two would not be the same
-            // object's rights.
-            if meta.file_type().is_symlink() {
-                return Err(UnsafePackagesRoot {
-                    path: root.to_path_buf(),
-                    why: "it is a symlink; the packages root must be a real directory".to_owned(),
-                });
-            }
-            if !meta.is_dir() {
-                return Err(UnsafePackagesRoot {
-                    path: root.to_path_buf(),
-                    why: "it is not a directory".to_owned(),
-                });
-            }
-            let uid = effective_uid();
-            if meta.uid() != uid {
-                return Err(UnsafePackagesRoot {
-                    path: root.to_path_buf(),
-                    why: format!("owned by uid {} rather than {uid}", meta.uid()),
-                });
-            }
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o022 != 0 {
-                return Err(UnsafePackagesRoot {
-                    path: root.to_path_buf(),
-                    why: format!(
-                        "mode {mode:04o} is writable by group or others; a package there \
-                         decides what the daemon executes"
-                    ),
-                });
-            }
-        }
+                why: format!("could not create it: {e}"),
+            }),
+        _ => check_packages_root(root),
+    }
+}
+
+/// The checks of [`ensure_packages_root`] on a root that must already exist —
+/// **never creating anything**. A missing root is an error here.
+///
+/// `os install` creates the root and its parents itself, one level at a time,
+/// recording each so a failure can take them back; then it checks with this.
+/// Checking with `ensure_packages_root` instead let a root that a concurrent
+/// install's cleanup had just removed be re-created, recursively, by the
+/// check — directories nobody recorded, so nobody could take them back (review
+/// of ME3-SUP slice 1, round 3⁗).
+///
+/// # Errors
+///
+/// A message an operator can act on: which path, and which of the conditions.
+pub fn check_packages_root(root: &std::path::Path) -> Result<(), UnsafePackagesRoot> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = std::fs::symlink_metadata(root).map_err(|e| UnsafePackagesRoot {
+        path: root.to_path_buf(),
+        why: format!("could not inspect it: {e}"),
+    })?;
+    // `symlink_metadata`, so a symlink is seen AS a symlink. Following it would
+    // mean checking the permissions of the target while the daemon later writes
+    // through the link — the two would not be the same object's rights.
+    if meta.file_type().is_symlink() {
+        return Err(UnsafePackagesRoot {
+            path: root.to_path_buf(),
+            why: "it is a symlink; the packages root must be a real directory".to_owned(),
+        });
+    }
+    if !meta.is_dir() {
+        return Err(UnsafePackagesRoot {
+            path: root.to_path_buf(),
+            why: "it is not a directory".to_owned(),
+        });
+    }
+    let uid = effective_uid();
+    if meta.uid() != uid {
+        return Err(UnsafePackagesRoot {
+            path: root.to_path_buf(),
+            why: format!("owned by uid {} rather than {uid}", meta.uid()),
+        });
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(UnsafePackagesRoot {
+            path: root.to_path_buf(),
+            why: format!(
+                "mode {mode:04o} is writable by group or others; a package there \
+                 decides what the daemon executes"
+            ),
+        });
     }
     Ok(())
 }
@@ -422,6 +434,11 @@ mod root_safety_tests {
         let t = tempfile::tempdir().unwrap();
         let root = t.path().join("packages");
         ensure_packages_root(&root).expect("creating it");
+        // The check alone never creates: a missing root is an error, and stays
+        // missing.
+        let missing = root.with_file_name("never-made");
+        check_packages_root(&missing).expect_err("a missing root");
+        assert!(!missing.exists(), "the check created the root");
         let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "created with mode {mode:04o}");
     }

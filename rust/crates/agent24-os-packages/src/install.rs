@@ -110,11 +110,13 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // failure — including one part-way down the path — can take back exactly
     // what was made. (Handing the whole path to a recursive create, as the
     // round-3 fix did, made parents that a failure deeper down left behind:
-    // review of ME3-SUP slice 1, round 3″.) `ensure_packages_root` then checks
-    // the root as it would for a daemon start: owned by us, nobody else can
-    // write it — refused NOW rather than after the install claimed success
-    // (under `umask 002` a plain `create_dir_all` made it `0775`, the install
-    // succeeded, and the next daemon start refused the whole root).
+    // review of ME3-SUP slice 1, round 3″.) `check_packages_root` then checks
+    // the root as a daemon start would — owned by us, nobody else can write it —
+    // NOW rather than after the install claimed success (under `umask 002` a
+    // plain `create_dir_all` made it `0775`, the install succeeded, and the next
+    // daemon start refused the whole root). The check CREATES nothing: with a
+    // root a concurrent install's cleanup has just removed, it fails, rather
+    // than re-creating directories nobody recorded (round 3⁗).
     let created = create_missing_dirs(packages_root)?;
     let undo_root = || {
         for dir in created.iter().rev() {
@@ -125,7 +127,7 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
             let _ = std::fs::remove_dir(dir);
         }
     };
-    if let Err(e) = crate::ensure_packages_root(packages_root) {
+    if let Err(e) = crate::check_packages_root(packages_root) {
         undo_root();
         return Err(InstallError::Filesystem(e.to_string()));
     }
@@ -347,7 +349,7 @@ fn create_missing_dirs(path: &Path) -> Result<Vec<PathBuf>, InstallError> {
 /// every start of the module fail (review of ME3-SUP slice 1, round 2).
 ///
 /// `dst` is created NON-recursively: its parent must already be there. For the
-/// top call that parent is the packages root, checked by `ensure_packages_root`
+/// top call that parent is the packages root, checked by `check_packages_root`
 /// a moment earlier — and if a concurrent install's cleanup has since removed
 /// it (it was empty and that install created it), this install must fail
 /// rather than quietly re-create a root nobody recorded or checked (review of
@@ -431,8 +433,8 @@ mod tests {
     /// directories under `umask 002`) would succeed and leave a package that
     /// can never run.
     /// A refused install leaves no trace — including parents of the packages
-    /// root that the install itself created (`ensure_packages_root` creates them;
-    /// undoing only the root left them behind).
+    /// root that the install itself created (undoing only the root left them
+    /// behind).
     #[cfg(unix)]
     #[test]
     fn a_refused_install_removes_the_parents_it_created() {
