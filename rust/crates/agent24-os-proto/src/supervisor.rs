@@ -107,9 +107,10 @@ pub enum Status {
     /// a SIGKILL attempted; the slot says `module_stopping`, and stays held if
     /// a process was not confirmed gone.
     Panicked,
-    /// The handle was dropped without a stop: the task was aborted, and a
-    /// process it held (if any) had a SIGKILL attempted on its group — not
-    /// waited for, unlike `Stopped`. If it held one, the slot stays held.
+    /// The loop was cancelled before reaching `Stopped` — its handle dropped,
+    /// or its runtime shut down. A process not yet confirmed gone had a
+    /// SIGKILL attempted on its group, not waited for, and then the slot stays
+    /// held; otherwise the slot is released.
     Killed,
 }
 
@@ -186,9 +187,10 @@ pub enum SupervisorError {
     /// The supervisor loop panicked (a bug); its module had a SIGKILL
     /// attempted.
     Panicked,
-    /// The loop was cancelled without a stop — its runtime shut down, say. A
-    /// process it held, if any, had a SIGKILL attempted, not waited for (and
-    /// then the slot stays held). Not a clean stop either way.
+    /// The loop was cancelled before a clean stop — its runtime shut down,
+    /// say. A process not yet confirmed gone, if any, had a SIGKILL attempted,
+    /// not waited for (and then the slot stays held). Not a clean stop either
+    /// way.
     Killed,
 }
 
@@ -198,8 +200,8 @@ impl std::fmt::Display for SupervisorError {
             Self::StopFailed { error } => write!(f, "{error}"),
             Self::Panicked => f.write_str("the supervisor loop panicked"),
             Self::Killed => f.write_str(
-                "the supervisor loop was cancelled without a stop; a module process it held, \
-                 if any, was SIGKILLed and not confirmed gone",
+                "the supervisor loop was cancelled before a clean stop; a module process not \
+                 yet confirmed gone, if any, was SIGKILLed and the slot kept held",
             ),
         }
     }
