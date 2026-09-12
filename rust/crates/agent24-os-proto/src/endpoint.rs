@@ -152,19 +152,35 @@ impl CallbackDir {
             }
             taken.push(path.clone());
         }
-        if std::fs::symlink_metadata(&path).is_ok() {
+        // Held only by a take-over that succeeds: one that fails made no
+        // listener, so nothing it could empty is in use, and a retry once the
+        // cause is fixed must not be refused (review of ME3-SUP slice 3a).
+        match Self::take_over(&path) {
+            Ok(()) => Ok(Self {
+                path,
+                last: std::sync::atomic::AtomicU64::new(0),
+            }),
+            Err(e) => {
+                TAKEN_OVER
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|p| p != &path);
+                Err(e)
+            }
+        }
+    }
+
+    /// Empty a stale pid directory of ours, then (re)make it exactly `0700`.
+    fn take_over(path: &Path) -> Result<(), EndpointError> {
+        if std::fs::symlink_metadata(path).is_ok() {
             // Normalised and checked before it is emptied — the same rule as
             // `run/` (the first version refused an ours-but-0755 pid directory
             // that `run/` would have normalised; review of ME3-SUP slice 2,
             // round 2): only a directory that is this user's is ours to clear.
-            private_dir(&path)?;
-            std::fs::remove_dir_all(&path)?;
+            private_dir(path)?;
+            std::fs::remove_dir_all(path)?;
         }
-        private_dir(&path)?;
-        Ok(Self {
-            path,
-            last: std::sync::atomic::AtomicU64::new(0),
-        })
+        private_dir(path)
     }
 
     /// The directory.
@@ -1064,5 +1080,26 @@ mod tests {
             .expect("the pipelined line was lost")
             .unwrap();
         assert_eq!(line.trim_end(), next);
+    }
+
+    /// A take-over that fails does not hold the directory: once the cause is
+    /// fixed, the next `create` succeeds (review of ME3-SUP slice 3a).
+    #[tokio::test]
+    async fn a_failed_take_over_can_be_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = state();
+        let run = s.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A file where the pid directory goes: `private_dir` refuses it.
+        let pid_path = run
+            .canonicalize()
+            .unwrap()
+            .join(std::process::id().to_string());
+        std::fs::write(&pid_path, b"").unwrap();
+        CallbackDir::create(s.path()).expect_err("a file is not a directory");
+        std::fs::remove_file(&pid_path).unwrap();
+        let dir = CallbackDir::create(s.path()).expect("the retry was refused");
+        assert!(dir.listen_next().is_ok());
     }
 }

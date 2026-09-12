@@ -86,12 +86,18 @@ pub enum Status {
     Starting { attempt: u32 },
     /// Handshaken and serving.
     Running,
+    /// A run is being stopped (revoked already; the process is being
+    /// terminated). Next: `Backoff`, `GaveUp` or `Stopped`.
+    Stopping,
     /// The last run failed; the next starts after `delay`.
     Backoff { failures: u32, delay: Duration },
     /// The breaker tripped: no more runs until the supervisor is replaced.
     GaveUp { failures: u32, within: Duration },
     /// Stopped on request.
     Stopped,
+    /// The supervisor itself panicked — a bug. The module was killed and the
+    /// slot says `module_stopping`.
+    Panicked,
 }
 
 /// Builds the callback methods for one generation. Called once per run, with
@@ -127,8 +133,11 @@ impl SupervisorHandle {
     /// wait for both.
     pub async fn stop(mut self) {
         let _ = self.stop.send(true);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        if let Some(task) = self.task.take()
+            && let Err(e) = task.await
+            && e.is_panic()
+        {
+            tracing::error!("the supervisor loop had panicked: {e}");
         }
     }
 }
@@ -171,11 +180,48 @@ enum Run {
     /// A stop was requested; the process has been stopped.
     StopRequested,
     /// The run is over: `why` for the policy, and when it became ready (if it
-    /// did) for [`RestartPolicy::ran`].
+    /// did) and when it ended for [`RestartPolicy::ran`]. `ended_at` is taken
+    /// when the run's outcome is known, before the process is stopped: the
+    /// stop's grace is not running time, or a module that ignores SIGTERM
+    /// would earn a healthy run by being slow to die (review of ME3-SUP
+    /// slice 3a).
     Ended {
         why: Stopped,
         ready_at: Option<std::time::Instant>,
+        ended_at: std::time::Instant,
     },
+}
+
+/// Leave the slot saying `module_stopping`: the module is not coming back.
+/// What the slot holds is this supervisor's — a run's generation, revoked
+/// already by its stop (a no-op), or a placeholder that was never started, so
+/// revoking it abandons nothing.
+fn retire(current: &Current) {
+    drop(current.get().revoke());
+}
+
+/// Every way out of the loop — return, panic, or the task being aborted —
+/// retires the slot, so no path leaves it promising a module that will not
+/// come back.
+struct OnExit<'a> {
+    current: &'a Current,
+    status: &'a watch::Sender<Status>,
+}
+
+impl Drop for OnExit<'_> {
+    fn drop(&mut self) {
+        retire(self.current);
+        if std::thread::panicking() {
+            tracing::error!("the supervisor loop panicked");
+            self.status.send_replace(Status::Panicked);
+        } else if !matches!(
+            *self.status.borrow(),
+            Status::Stopped | Status::GaveUp { .. }
+        ) {
+            // Aborted (the handle was dropped): the process went with the task.
+            self.status.send_replace(Status::Stopped);
+        }
+    }
 }
 
 async fn run_loop(
@@ -187,27 +233,35 @@ async fn run_loop(
     mut stop: watch::Receiver<bool>,
     status: watch::Sender<Status>,
 ) {
+    let _on_exit = OnExit {
+        current: &current,
+        status: &status,
+    };
     let mut policy = RestartPolicy::with_base(timings.backoff_base);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         status.send_replace(Status::Starting { attempt });
-        let (why, ready_at) = match run_once(
+        let (why, ready_at, ended_at) = match run_once(
             &spec, &dir, &current, &methods, &timings, &mut stop, &status,
         )
         .await
         {
             Run::StopRequested => {
+                retire(&current);
                 status.send_replace(Status::Stopped);
                 return;
             }
-            Run::Ended { why, ready_at } => (why, ready_at),
+            Run::Ended {
+                why,
+                ready_at,
+                ended_at,
+            } => (why, ready_at, ended_at),
         };
-        let now = std::time::Instant::now();
         if let Some(ready_at) = ready_at {
-            policy.ran(ready_at, now);
+            policy.ran(ready_at, ended_at);
         }
-        match policy.failed(why, now) {
+        match policy.failed(why, ended_at) {
             Decision::RestartAfter(delay) => {
                 // Until the next run is handshaken the slot holds a generation
                 // that was never started: requests get `503 module_not_ready`
@@ -224,6 +278,9 @@ async fn run_loop(
                 tokio::select! {
                     biased;
                     () = stop_requested(&mut stop) => {
+                        // The placeholder put in above must not outlive the
+                        // module: `module_not_ready` would promise a return.
+                        retire(&current);
                         status.send_replace(Status::Stopped);
                         return;
                     }
@@ -232,6 +289,9 @@ async fn run_loop(
             }
             Decision::GiveUp { after, within } => {
                 tracing::error!(module = %spec.name, "{}", Decision::GiveUp { after, within });
+                // Also when no run got as far as a process (every spawn
+                // failed): the slot may hold a placeholder, never revoked.
+                retire(&current);
                 status.send_replace(Status::GaveUp {
                     failures: after,
                     within,
@@ -259,6 +319,7 @@ async fn run_once(
     let failed = |why: Stopped| Run::Ended {
         why,
         ready_at: None,
+        ended_at: std::time::Instant::now(),
     };
     // D4: a fresh port for every generation, so a connection pooled or queued
     // for the previous one can never reach this one.
@@ -276,17 +337,24 @@ async fn run_once(
             return failed(Stopped::Exited);
         }
     };
-    let mut process = match launch::spawn(LaunchSpec {
-        name: &spec.name,
-        command: &spec.command,
-        package_dir: &spec.package_dir,
-        data_dir: &spec.data_dir,
-        callback_sock: callback.path(),
-        trampoline: &spec.trampoline,
-        listener,
-    })
-    .await
-    {
+    // Raced against a stop: the package check before the spawn walks a whole
+    // tree and can be slow. Dropping `spawn` there is safe — its only await
+    // comes before the child exists. (The blocking walk itself runs on to its
+    // end on its own thread, bounded by the entry cap.)
+    let spawned = tokio::select! {
+        biased;
+        () = stop_requested(stop) => return Run::StopRequested,
+        spawned = launch::spawn(LaunchSpec {
+            name: &spec.name,
+            command: &spec.command,
+            package_dir: &spec.package_dir,
+            data_dir: &spec.data_dir,
+            callback_sock: callback.path(),
+            trampoline: &spec.trampoline,
+            listener,
+        }) => spawned,
+    };
+    let mut process = match spawned {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(module = %spec.name, "could not start the module: {e}");
@@ -309,13 +377,14 @@ async fn run_once(
     let handshaken = tokio::select! {
         biased;
         () = stop_requested(stop) => {
-            finish(process, timings, &spec.name).await;
+            finish(process, timings, &spec.name, status).await;
             return Run::StopRequested;
         }
         exited = process.exited() => {
             tracing::warn!(module = %spec.name, ?exited, "the module exited before its handshake");
-            finish(process, timings, &spec.name).await;
-            return failed(Stopped::Exited);
+            let run = failed(Stopped::Exited);
+            finish(process, timings, &spec.name, status).await;
+            return run;
         }
         result = async {
             let stream = callback.accept_one(deadline).await.map_err(|e| e.to_string())?;
@@ -326,8 +395,9 @@ async fn run_once(
         Ok(h) => h,
         Err(why) => {
             tracing::warn!(module = %spec.name, "the module did not complete its handshake: {why}");
-            finish(process, timings, &spec.name).await;
-            return failed(Stopped::StartupTimeout);
+            let run = failed(Stopped::StartupTimeout);
+            finish(process, timings, &spec.name, status).await;
+            return run;
         }
     };
     if !generation.ready() {
@@ -335,15 +405,19 @@ async fn run_once(
         // run stops its process — so this is not expected. It is still not a
         // ready module.
         tracing::error!(module = %spec.name, "the generation was revoked during its handshake");
-        finish(process, timings, &spec.name).await;
-        return failed(Stopped::StartupTimeout);
+        let run = failed(Stopped::StartupTimeout);
+        finish(process, timings, &spec.name, status).await;
+        return run;
     }
+    // Built before `Running` is published: a caller's `MethodsFor` that
+    // panics must not leave the status saying a module is being served.
+    let methods = methods(&generation);
     let ready_at = std::time::Instant::now();
     status.send_replace(Status::Running);
     let serve = rpc::serve_until(
         handshaken.reader,
         handshaken.writer,
-        methods(&generation),
+        methods,
         rpc::Limits::default(),
         {
             let generation = generation.clone();
@@ -356,7 +430,8 @@ async fn run_once(
         ended = serve => Some(format!("the callback connection ended: {ended:?}")),
         exited = process.exited() => Some(format!("the module exited: {exited:?}")),
     };
-    finish(process, timings, &spec.name).await;
+    let ended_at = std::time::Instant::now();
+    finish(process, timings, &spec.name, status).await;
     match outcome {
         None => Run::StopRequested,
         Some(why) => {
@@ -364,6 +439,7 @@ async fn run_once(
             Run::Ended {
                 why: Stopped::Exited,
                 ready_at: Some(ready_at),
+                ended_at,
             }
         }
     }
@@ -376,9 +452,16 @@ async fn stop_requested(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|s| *s).await;
 }
 
-/// Stop a run's process. A stop that fails is logged and the process dropped,
-/// which revokes (already done) and SIGKILLs its group without grace.
-async fn finish(process: ModuleProcess, timings: &Timings, name: &str) {
+/// Stop a run's process, with the status saying so while it happens. A stop
+/// that fails is logged and the process dropped, which revokes (already done)
+/// and SIGKILLs its group without grace.
+async fn finish(
+    process: ModuleProcess,
+    timings: &Timings,
+    name: &str,
+    status: &watch::Sender<Status>,
+) {
+    status.send_replace(Status::Stopping);
     match process.stop(timings.stop_grace).await {
         Ok(report) => {
             if !report.abandoned.is_empty() {
@@ -408,14 +491,15 @@ mod tests {
     /// A module in Python. `mode`: `normal` (serve until the callback ends —
     /// D1's module side), `crash` (exit right after the handshake), `silent`
     /// (never connect), `hangup` (close the callback, keep running). Every
-    /// start appends `<pid> <token>` to `<data>/starts`. `early`: exit without
-    /// ever connecting.
+    /// start appends `<pid> <token> <wall time>` to `<data>/starts`. `early`:
+    /// exit without ever connecting. `stubborn`: like `hangup`, but ignoring
+    /// SIGTERM, so its stop lasts the whole grace.
     const MOCK: &str = r#"import json, os, socket, sys, time
 mode, name, digest = sys.argv[1], sys.argv[2], sys.argv[3]
 data = os.environ["A24_DATA_DIR"]
 token = os.environ["A24_HANDSHAKE_TOKEN"]
 with open(os.path.join(data, "starts"), "a") as f:
-    f.write("%d %s\n" % (os.getpid(), token))
+    f.write("%d %s %f\n" % (os.getpid(), token, time.time()))
 if mode == "silent":
     time.sleep(60)
     sys.exit(0)
@@ -431,6 +515,13 @@ f = s.makefile("rb")
 f.readline()
 if mode == "crash":
     sys.exit(3)
+if mode == "stubborn":
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    f.close()
+    s.close()
+    time.sleep(60)
+    sys.exit(0)
 if mode == "hangup":
     f.close()
     s.close()
@@ -506,13 +597,29 @@ sys.exit(0)
             .clone()
     }
 
-    /// The `<pid> <token>` lines the module wrote, one per start.
+    /// The `<pid> <token>` of every start, in order. A missing file is no
+    /// start yet.
     fn starts(data: &std::path::Path) -> Vec<(i32, String)> {
-        std::fs::read_to_string(data.join("starts"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| l.split_once(' '))
-            .map(|(p, t)| (p.parse().unwrap(), t.to_owned()))
+        start_lines(data)
+            .into_iter()
+            .map(|(p, t, _)| (p, t))
+            .collect()
+    }
+
+    fn start_lines(data: &std::path::Path) -> Vec<(i32, String, f64)> {
+        let text = match std::fs::read_to_string(data.join("starts")) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => panic!("reading the starts: {e}"),
+        };
+        text.lines()
+            .map(|l| {
+                let mut w = l.split(' ');
+                let pid = w.next().unwrap().parse().unwrap();
+                let token = w.next().unwrap().to_owned();
+                let at = w.next().unwrap().parse().unwrap();
+                (pid, token, at)
+            })
             .collect()
     }
 
@@ -609,6 +716,86 @@ sys.exit(0)
         stop(handle).await;
     }
 
+    /// Restarts wait out the backoff: the gap before restart `i` is at least
+    /// `base · 2^(i-1)`. (Launching Python alone takes longer than a small
+    /// base, so the base here is large enough that only a real sleep covers
+    /// the later gaps.)
+    #[tokio::test]
+    async fn restarts_wait_out_a_doubling_backoff() {
+        let f = fixture("crash");
+        let current = Current::new(Generation::starting());
+        let base = Duration::from_millis(150);
+        let timings = Timings {
+            backoff_base: base,
+            ..fast()
+        };
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            timings,
+        );
+        let mut rx = handle.subscribe();
+        until(&mut rx, "GaveUp", |s| matches!(s, Status::GaveUp { .. })).await;
+        let at: Vec<f64> = start_lines(f.data.path()).iter().map(|l| l.2).collect();
+        for (i, pair) in at.windows(2).enumerate() {
+            let want = base.as_secs_f64() * f64::from(1u32 << i);
+            assert!(
+                pair[1] - pair[0] >= want,
+                "gap {i}: {:.3}s < {want:.3}s ({at:?})",
+                pair[1] - pair[0]
+            );
+        }
+        stop(handle).await;
+    }
+
+    /// While a run is being stopped the status says `Stopping`, not `Running`,
+    /// and the slot already refuses (revoked before anything is killed).
+    #[tokio::test]
+    async fn a_run_being_stopped_is_reported_as_stopping() {
+        let f = fixture("stubborn");
+        let current = Current::new(Generation::starting());
+        let timings = Timings {
+            stop_grace: Duration::from_secs(3),
+            ..fast()
+        };
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            timings,
+        );
+        let mut rx = handle.subscribe();
+        until(&mut rx, "Stopping", |s| *s == Status::Stopping).await;
+        assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
+        stop(handle).await;
+    }
+
+    /// A `MethodsFor` that panics ends supervision visibly: the status says
+    /// `Panicked` (not `Running`), the module is killed, and the slot says
+    /// `module_stopping`.
+    #[tokio::test]
+    async fn a_panic_in_the_loop_is_reported_and_kills_the_module() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let methods: MethodsFor = Arc::new(|_| panic!("a broken MethodsFor"));
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            methods,
+            fast(),
+        );
+        let mut rx = handle.subscribe();
+        until(&mut rx, "Panicked", |s| *s == Status::Panicked).await;
+        let (pid, _) = starts(f.data.path())[0].clone();
+        assert!(gone(pid).await, "the module outlived a panicked supervisor");
+        assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
+        stop(handle).await;
+    }
+
     /// While a restart is pending the slot holds a never-started placeholder
     /// (`503 module_not_ready`: coming back), not the ended run's revoked
     /// generation (`module_stopping`); once the breaker trips, the revoked one
@@ -634,8 +821,9 @@ sys.exit(0)
         })
         .await;
         assert_eq!(current.get().state(), crate::drain::DrainState::Starting);
+        // Stopped during the backoff: the placeholder must not outlive it.
         stop(handle).await;
-
+        assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
         let f = fixture("crash");
         let current = Current::new(Generation::starting());
         let handle = supervise(
@@ -647,6 +835,34 @@ sys.exit(0)
         );
         let mut rx = handle.subscribe();
         until(&mut rx, "GaveUp", |s| matches!(s, Status::GaveUp { .. })).await;
+        assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
+        stop(handle).await;
+    }
+
+    /// When no run gets as far as a process — every spawn is refused, here
+    /// for a package directory others can write — the breaker still trips, and
+    /// the slot's never-started placeholder is revoked with it: it says
+    /// `module_stopping`, not a `module_not_ready` that promises a return.
+    #[tokio::test]
+    async fn giving_up_without_ever_spawning_retires_the_placeholder() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture("normal");
+        std::fs::set_permissions(&f.spec.package_dir, std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        let current = Current::new(Generation::starting());
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        let mut rx = handle.subscribe();
+        until(&mut rx, "GaveUp", |s| matches!(s, Status::GaveUp { .. })).await;
+        assert!(
+            starts(f.data.path()).is_empty(),
+            "a refused package was run"
+        );
         assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
         stop(handle).await;
     }

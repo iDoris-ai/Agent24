@@ -421,10 +421,19 @@ impl ModuleProcess {
         if self.exit.is_some() {
             return Ok(self.exit);
         }
-        let status = waitid(
-            WaitId::Pid(self.group),
-            WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
-        )?;
+        // `NOHANG` does not block, so an interrupt is rare — but one must not
+        // be what stands between `Drop` and the SIGKILL it owes (review of
+        // ME3-SUP slice 3a). Any other error leaves the question open, and an
+        // open question means the group id is not known to be ours.
+        let status = loop {
+            match waitid(
+                WaitId::Pid(self.group),
+                WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
+            ) {
+                Err(rustix::io::Errno::INTR) => {}
+                other => break other?,
+            }
+        };
         self.exit = status.map(|st| Exit {
             code: st.exit_status().and_then(|c| i32::try_from(c).ok()),
             signal: st.terminating_signal().and_then(|c| i32::try_from(c).ok()),
