@@ -200,7 +200,7 @@ fn private_dir(path: &Path) -> Result<(), EndpointError> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir()
         && meta.uid() == rustix::process::geteuid().as_raw()
-        && meta.mode() & 0o777 != 0o700
+        && meta.mode() & 0o7777 != 0o700
     {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
@@ -227,10 +227,12 @@ fn check_private(path: &Path) -> Result<(), EndpointError> {
     if meta.uid() != me {
         return Err(unsafe_dir(format!("owned by uid {}, not {me}", meta.uid())));
     }
-    if meta.mode() & 0o777 != 0o700 {
+    // All twelve mode bits: "exactly 0700" admits no sticky, setuid or setgid
+    // bit either (review of ME3-SUP slice 2, round 3).
+    if meta.mode() & 0o7777 != 0o700 {
         return Err(unsafe_dir(format!(
             "mode {:04o}, not 0700",
-            meta.mode() & 0o777
+            meta.mode() & 0o7777
         )));
     }
     Ok(())
@@ -331,6 +333,45 @@ impl std::fmt::Display for HandshakeFailed {
 
 impl std::error::Error for HandshakeFailed {}
 
+/// Write the success line within `min(deadline, now + WRITE_TIMEOUT)`, and
+/// call it written only if the clock still says the deadline has not passed.
+///
+/// The biased select puts the timer first, but it can only prefer a timer that
+/// is ready WHEN it is polled: a thread preempted between polling the timer
+/// (not yet due) and polling the write (now done) would come back past the
+/// deadline with a finished write, and report success. So the clock is read
+/// again once the write is done (review of ME3-SUP slice 2, round 3).
+async fn answer<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    line: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<(), HandshakeFailed> {
+    let until = deadline.min(tokio::time::Instant::now() + crate::rpc::WRITE_TIMEOUT);
+    let timed_out = || {
+        if until >= deadline {
+            HandshakeFailed::Timeout
+        } else {
+            HandshakeFailed::Write(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the handshake answer was not taken",
+            ))
+        }
+    };
+    let written = tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(until) => return Err(timed_out()),
+        written = async {
+            writer.write_all(line).await?;
+            writer.flush().await
+        } => written,
+    };
+    written.map_err(HandshakeFailed::Write)?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(HandshakeFailed::Timeout);
+    }
+    Ok(())
+}
+
 /// Run the handshake on a fresh callback connection: read the first frame
 /// before `deadline`, check it against `expect`, and answer — the result on
 /// success, or the refusal and then a disconnect (SPEC §3: *"握手期（首帧）任何
@@ -375,32 +416,12 @@ pub async fn handshake(
     match verdict {
         Ok(accepted) => {
             let line = initialize::success_line(&accepted);
-            let write = async {
-                writer.write_all(&line).await?;
-                writer.flush().await
-            };
-            let until = deadline.min(tokio::time::Instant::now() + crate::rpc::WRITE_TIMEOUT);
-            tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(until) => {
-                    if until >= deadline {
-                        Err(HandshakeFailed::Timeout)
-                    } else {
-                        Err(HandshakeFailed::Write(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "the handshake answer was not taken",
-                        )))
-                    }
-                }
-                written = write => match written {
-                    Ok(()) => Ok(Handshaken {
-                        reader,
-                        writer,
-                        accepted,
-                    }),
-                    Err(e) => Err(HandshakeFailed::Write(e)),
-                },
-            }
+            answer(&mut writer, &line, deadline).await?;
+            Ok(Handshaken {
+                reader,
+                writer,
+                accepted,
+            })
         }
         Err(refusal) => {
             let line = initialize::error_line(initialize::id_of(&frame).as_deref(), &refusal);
@@ -812,5 +833,82 @@ mod tests {
         );
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    /// A writer whose write completes only after the deadline has passed —
+    /// by blocking the thread in `poll_write`, which is what a preempted
+    /// thread looks like to the select: the timer was polled (not yet due),
+    /// then the write, which is ready by the time it returns.
+    struct LateWriter {
+        until: std::time::Instant,
+    }
+    impl tokio::io::AsyncWrite for LateWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if let Some(left) = self.until.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(left);
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An answer whose write finishes after the deadline is a timeout, not a
+    /// success: the select saw the timer not yet due, and the write done only
+    /// once the deadline had gone (review of ME3-SUP slice 2, round 3). The
+    /// same writer finishing in time is the control.
+    #[tokio::test]
+    async fn an_answer_finished_past_the_deadline_is_not_a_success() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let mut late = LateWriter {
+            until: std::time::Instant::now() + Duration::from_millis(100),
+        };
+        let err = answer(&mut late, b"x\n", deadline)
+            .await
+            .expect_err("past the deadline");
+        assert!(matches!(err, HandshakeFailed::Timeout), "{err}");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut prompt = LateWriter {
+            until: std::time::Instant::now(),
+        };
+        answer(&mut prompt, b"x\n", deadline)
+            .await
+            .expect("control: in time");
+    }
+
+    /// "Exactly 0700" includes the special bits: an otherwise-0700 directory
+    /// of ours with the sticky bit is normalised, not accepted as it is.
+    #[tokio::test]
+    async fn a_directory_with_a_special_bit_is_normalised_to_exactly_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = state();
+        std::fs::create_dir(s.path().join("run")).unwrap();
+        std::fs::set_permissions(
+            s.path().join("run"),
+            std::fs::Permissions::from_mode(0o1700),
+        )
+        .unwrap();
+        CallbackDir::create(s.path()).expect("ours, so normalised");
+        let mode = std::fs::metadata(s.path().join("run"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "{mode:o}");
     }
 }
