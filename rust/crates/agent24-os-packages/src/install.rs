@@ -105,8 +105,13 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // `packages/` directory that only exists because someone tried once is a
     // trace.
     let root_existed = entry_exists(packages_root).unwrap_or(true);
-    std::fs::create_dir_all(packages_root)
-        .map_err(|e| InstallError::Filesystem(format!("could not create packages root: {e}")))?;
+    // The daemon's own check, not `create_dir_all`: under `umask 002` that made
+    // the root `0775`, the install succeeded, and the next daemon start refused
+    // the whole root (review of ME3-SUP slice 1, round 3). This creates it
+    // `0700` (parents included) and refuses an existing root anyone else can
+    // write NOW, rather than after the install claimed success.
+    crate::ensure_packages_root(packages_root)
+        .map_err(|e| InstallError::Filesystem(e.to_string()))?;
     let undo_root = || {
         if !root_existed {
             // `remove_dir` (not `_all`): it only succeeds while the directory is
@@ -364,6 +369,35 @@ mod tests {
     /// package, so an install that kept a `0664` file (or made `0775`
     /// directories under `umask 002`) would succeed and leave a package that
     /// can never run.
+    /// The packages root is created `0700`, and an existing one anyone else can
+    /// write is refused at install time — not accepted by the install and then
+    /// refused by the next daemon start.
+    #[cfg(unix)]
+    #[test]
+    fn the_packages_root_is_created_private_and_a_shared_one_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+
+        let fresh = t.path().join("fresh/packages");
+        install(&src, &fresh).expect("install into a new root");
+        for dir in [&fresh, &t.path().join("fresh")] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is {mode:o}", dir.display());
+        }
+
+        let shared = t.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = install(&src, &shared).expect_err("a group-writable root");
+        assert!(matches!(err, InstallError::Filesystem(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&shared).unwrap().count(),
+            0,
+            "the refused install left something in the root"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_installed_package_is_writable_by_its_owner_only() {

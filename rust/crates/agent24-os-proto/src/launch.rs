@@ -202,15 +202,13 @@ fn check_tree(root: &Path) -> Result<(), LaunchError> {
         let path = path.to_owned();
         move |error| LaunchError::Inspect { path, error }
     };
+    // Counted when an entry is FOUND, not when it is visited: counting on the
+    // way out let one flat directory of millions of entries be read into
+    // `pending` whole before the limit was ever consulted (review of SUP-1,
+    // round 3). So `pending` never holds more than the limit either.
     let mut pending = vec![root.to_owned()];
-    let mut seen = 0usize;
+    let mut found = 1usize;
     while let Some(path) = pending.pop() {
-        seen += 1;
-        if seen > MAX_PACKAGE_ENTRIES {
-            return Err(LaunchError::TooLarge {
-                package: root.to_owned(),
-            });
-        }
         let meta = std::fs::symlink_metadata(&path).map_err(inspect(&path))?;
         let writable_by_others = !meta.file_type().is_symlink() && meta.mode() & 0o022 != 0;
         if meta.uid() != me || writable_by_others {
@@ -218,6 +216,12 @@ fn check_tree(root: &Path) -> Result<(), LaunchError> {
         }
         if meta.is_dir() {
             for entry in std::fs::read_dir(&path).map_err(inspect(&path))? {
+                found += 1;
+                if found > MAX_PACKAGE_ENTRIES {
+                    return Err(LaunchError::TooLarge {
+                        package: root.to_owned(),
+                    });
+                }
                 pending.push(entry.map_err(inspect(&path))?.path());
             }
         }
@@ -284,7 +288,9 @@ pub fn mint_token() -> Result<String, LaunchError> {
 /// The program a module is started THROUGH: it marks every fd from 4 up
 /// close-on-exec and then execs the module (see
 /// [`run_as_trampoline_if_asked`]). The host binary — the daemon — must call
-/// that function first thing in `main`.
+/// that function first thing in `main`. It is run as `program args…
+/// --a24-exec-module <module program> <module args…>` with
+/// `A24_TRAMPOLINE=1`.
 ///
 /// # Why a trampoline
 ///
@@ -304,48 +310,68 @@ pub struct Trampoline {
     pub args: Vec<std::ffi::OsString>,
 }
 
-/// Set on the trampoline to the absolute path of the module's program.
-pub const ENV_TRAMPOLINE_PROGRAM: &str = "A24_TRAMPOLINE_PROGRAM";
-/// Set on the trampoline to the module's arguments, as a JSON array of
-/// strings.
-pub const ENV_TRAMPOLINE_ARGS: &str = "A24_TRAMPOLINE_ARGS";
+/// Set (to `1`) on a process started as a module's trampoline. Half of what
+/// activates it; the other half is [`TRAMPOLINE_ARG`] in its argv. Either alone
+/// is an ordinary start — a stray variable in a service's environment must not
+/// turn the daemon into something that execs whatever follows (review of
+/// SUP-1, round 3).
+pub const ENV_TRAMPOLINE: &str = "A24_TRAMPOLINE";
+
+/// Marks, in the trampoline's argv, where the module's program and its
+/// arguments begin: `<trampoline args…> --a24-exec-module <program> <args…>`.
+/// The module's arguments travel as argv elements of their own, as they would
+/// to the module directly — not packed into one variable, where Linux's limit
+/// on a single string (128 KiB) would refuse a command line that is legal
+/// when passed as separate arguments (review of SUP-1, round 3).
+pub const TRAMPOLINE_ARG: &str = "--a24-exec-module";
+
+/// Where this process's open fds can be listed. The fd flagging below walks
+/// it; without it `close_fds` falls back to a scan that stops at fd 65 535.
+#[cfg(target_os = "linux")]
+const FD_DIR: &str = "/proc/self/fd";
+#[cfg(not(target_os = "linux"))]
+const FD_DIR: &str = "/dev/fd";
 
 /// If this process was started as a module's trampoline, become the module:
-/// mark every fd from 4 up close-on-exec, drop the two trampoline variables,
-/// and exec the module's program. Otherwise return at once.
+/// mark every fd from 4 up close-on-exec, drop the trampoline marker, and exec
+/// the module's program with its arguments. Otherwise return at once.
 ///
 /// **Call it first thing in the host's `main`**, before any thread exists —
-/// that is what makes flagging the fds race-free. If the exec fails the
-/// process exits with 127 and says why on stderr, which the kernel logs as the
-/// module's.
+/// that is what makes flagging the fds race-free. If it cannot guarantee the
+/// flagging, or the exec fails, the process exits with 127 and says why on
+/// stderr, which the kernel logs as the module's.
 pub fn run_as_trampoline_if_asked() {
     use std::os::unix::process::CommandExt;
-    // Read by iterating: the CLI's scan of daemon sources looks for
+    // Looked up by iterating: the CLI's scan of daemon sources looks for
     // `env::var("…")` to learn what a service manager must pass through, and
-    // these two are set by the daemon for its own child, never by a user.
-    let (mut program, mut args) = (None, None);
-    for (k, v) in std::env::vars_os() {
-        if k == ENV_TRAMPOLINE_PROGRAM {
-            program = Some(v);
-        } else if k == ENV_TRAMPOLINE_ARGS {
-            args = Some(v);
-        }
-    }
-    let Some(program) = program else {
+    // this one is set by the daemon for its own child, never by a user.
+    if !std::env::vars_os().any(|(k, v)| k == ENV_TRAMPOLINE && v == "1") {
         return;
-    };
-    let Some(args) = args
-        .and_then(|a| a.into_string().ok())
-        .and_then(|a| serde_json::from_str::<Vec<String>>(&a).ok())
-    else {
-        eprintln!("agent24: the module trampoline was started without readable arguments");
+    }
+    let mut argv = std::env::args_os().skip_while(|a| a != TRAMPOLINE_ARG);
+    if argv.next().is_none() {
+        return; // the variable alone: an ordinary start
+    }
+    let Some(program) = argv.next() else {
+        eprintln!("agent24: the module trampoline was started without a program");
         std::process::exit(127);
     };
+    // `close_fds` walks FD_DIR; when that cannot be read it falls back to a
+    // scan capped at fd 65 535, and an inherited fd above that would reach the
+    // module. Fail closed instead (review of SUP-1, round 3). On Linux it
+    // tries `close_range` first, which covers the whole range; the check is
+    // made there too, because that call can be refused (old kernels, seccomp).
+    if std::fs::read_dir(FD_DIR).is_err() {
+        eprintln!(
+            "agent24: cannot list this process's fds ({FD_DIR}); refusing to start a \
+             module without being able to keep the daemon's fds from it"
+        );
+        std::process::exit(127);
+    }
     close_fds::set_fds_cloexec_threadsafe(LISTEN_FD + 1, &[]);
     let error = std::process::Command::new(&program)
-        .args(&args)
-        .env_remove(ENV_TRAMPOLINE_PROGRAM)
-        .env_remove(ENV_TRAMPOLINE_ARGS)
+        .args(argv)
+        .env_remove(ENV_TRAMPOLINE)
         // macOS CoreFoundation writes this into the environment of a process
         // that initializes it — the trampoline sometimes does — and it would
         // pass to the module as the one variable the contract does not name.
@@ -417,11 +443,12 @@ pub async fn spawn(
             .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))??
     };
     let token = mint_token()?;
-    let args = serde_json::to_string(&spec.command.args)
-        .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))?;
 
     let mut cmd = tokio::process::Command::new(&spec.trampoline.program);
     cmd.args(&spec.trampoline.args)
+        .arg(TRAMPOLINE_ARG)
+        .arg(&program)
+        .args(&spec.command.args)
         .current_dir(spec.package_dir)
         .env_clear()
         .envs(std::env::vars_os().filter(|(k, _)| inherited(k)))
@@ -429,8 +456,7 @@ pub async fn spawn(
         .env(ENV_CALLBACK_SOCK, spec.callback_sock)
         .env(ENV_HANDSHAKE_TOKEN, &token)
         .env(ENV_DATA_DIR, spec.data_dir)
-        .env(ENV_TRAMPOLINE_PROGRAM, &program)
-        .env(ENV_TRAMPOLINE_ARGS, args)
+        .env(ENV_TRAMPOLINE, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -466,7 +492,15 @@ pub async fn spawn(
 
 /// The test binary is its own trampoline: started with `--exact` on
 /// `launch::tests::trampoline_host`, it runs only that test, which becomes the
-/// module (and is a no-op in an ordinary test run).
+/// module (and is a no-op in an ordinary test run). The `--` makes libtest
+/// take the marker, the program and its arguments as test-name filters, which
+/// match nothing else under `--exact`.
+///
+/// **Not single-threaded**, unlike the daemon's `main`: libtest runs the test
+/// on a worker thread while its main thread waits. The waiting thread opens no
+/// fds, so the flagging is not raced in practice; the production path is
+/// pinned separately by `agent24d`'s `tests/trampoline.rs`, which runs the
+/// real binary with a flagless inherited fd.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) fn test_trampoline() -> Trampoline {
@@ -478,6 +512,7 @@ pub(crate) fn test_trampoline() -> Trampoline {
             "--test-threads=1",
             "--nocapture",
             "-q",
+            "--",
         ]
         .into_iter()
         .map(Into::into)
@@ -1206,6 +1241,24 @@ mod tests {
         for p in procs {
             let _ = p.stop(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// A long argument list reaches the module whole: the module's arguments
+    /// travel as argv elements of their own through the trampoline. Packed into
+    /// one environment variable they hit Linux's limit on a single string
+    /// (128 KiB) — 2000 arguments of 100 bytes are legal as argv and were not
+    /// as one variable (review of SUP-1, round 3).
+    #[tokio::test]
+    async fn a_long_argument_list_reaches_the_module_whole() {
+        let t = pkg();
+        let arg = "a".repeat(100);
+        let mut args = vec!["-c", "echo $# > out", "sh"];
+        args.extend(std::iter::repeat_n(arg.as_str(), 2000));
+        let mut p = start(t.path(), &cmd("sh", &args)).await;
+        let exit = exited(&mut p).await;
+        assert_eq!(exit.code, Some(0), "{exit}");
+        assert_eq!(read(t.path(), "out").trim(), "2000");
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 
     /// What the module's exit looked like comes back: `exited` reports it, and

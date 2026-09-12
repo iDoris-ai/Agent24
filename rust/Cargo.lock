@@ -305,6 +305,7 @@ dependencies = [
  "fs2",
  "http-body-util",
  "rand 0.9.5",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "sha2",
