@@ -459,7 +459,9 @@ pub struct LaunchSpec<'a> {
     pub listener: std::net::TcpListener,
 }
 
-/// Start a module for `generation`.
+/// Start a module as a new generation — created here, with the address of
+/// `spec.listener` (SUP-3b), so the process and the generation are born
+/// together.
 ///
 /// # What the child gets
 ///

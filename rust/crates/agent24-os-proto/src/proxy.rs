@@ -454,7 +454,9 @@ impl Default for Limits {
 /// keyed by address, the wrong key once addresses belong to generations. Here
 /// the connection's driver is aborted when this is dropped: once the response
 /// has been collected, or when the request is given up. Loopback connects are
-/// cheap; a module holding requests' memory is not.
+/// cheap; a module holding requests' memory is not. And closing leaves nothing
+/// behind: the socket is reset rather than shut down (see `exchange`), so no
+/// request costs a TIME_WAIT slot.
 struct UpstreamConnection(tokio::task::JoinHandle<()>);
 
 impl Drop for UpstreamConnection {
@@ -473,6 +475,14 @@ async fn exchange(
         .await
         .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
+    // Closed with a reset, not a FIN: the proxy is the side that closes, and a
+    // FIN would leave every request's socket in TIME_WAIT — a minute on Linux
+    // — so a module answering thousands of tiny requests a second would use up
+    // loopback's ephemeral ports, and the next `connect` would fail (review of
+    // SUP-3b, round 2). A connection is only ever closed once its response is
+    // collected or its request given up, so nothing the reset discards is
+    // still wanted.
+    stream.set_zero_linger().map_err(|e| e.to_string())?;
     let (mut sender, driver) =
         hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
             .await
@@ -2377,6 +2387,46 @@ mod tests {
             let _ = closed_tx.send(());
         });
         (addr, closed_rx)
+    }
+
+    /// A proxied request's connection is closed with a reset, not a FIN, so it
+    /// leaves no TIME_WAIT behind to use up loopback's ports under a stream of
+    /// short requests (review of SUP-3b, round 2). The module, reading on after
+    /// its answer, sees the reset — a FIN would read as a clean EOF.
+    #[tokio::test]
+    async fn an_upstream_connection_is_reset_not_left_in_time_wait() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let module = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0, "closed before the head");
+                seen.extend_from_slice(&buf[..n]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) => return "eof (a FIN)".to_owned(),
+                    Ok(_) => {}
+                    Err(e) => return format!("{:?}", e.kind()),
+                }
+            }
+        });
+        let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
+        let got = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
+        assert_eq!(got.status, StatusCode::OK);
+        let seen = tokio::time::timeout(Duration::from_secs(5), module)
+            .await
+            .expect("the connection was never closed")
+            .unwrap();
+        assert_eq!(seen, "ConnectionReset", "the proxy closed with {seen}");
     }
 
     /// FU-47: a module that answers without reading its body and keeps the
