@@ -87,20 +87,25 @@ pub enum Status {
     /// Handshaken and serving.
     Running,
     /// A run is being stopped (revoked already; the process is being
-    /// terminated). Next: `Backoff`, `GaveUp` or `Stopped`.
+    /// terminated). Next: `Backoff`, `GaveUp`, `Stopped` or `StopFailed`.
     Stopping,
     /// The last run failed; the next starts after `delay`.
     Backoff { failures: u32, delay: Duration },
     /// The breaker tripped: no more runs until the supervisor is replaced.
     GaveUp { failures: u32, within: Duration },
-    /// Stopped on request.
+    /// Ended: on request, or because a newer supervisor took the slot over.
+    /// Any process it ran is confirmed gone.
     Stopped,
+    /// A run's process could not be confirmed gone (the stop failed; the
+    /// process was dropped, which sends SIGKILL once more). No new run is
+    /// started: the old group may still hold the module's data directory.
+    StopFailed { error: String },
     /// The supervisor itself panicked — a bug. The module was killed and the
     /// slot says `module_stopping`.
     Panicked,
-    /// The handle was dropped without a stop: the task was aborted and the
-    /// module's group sent SIGKILL — without waiting to see it gone, unlike
-    /// `Stopped`.
+    /// The handle was dropped without a stop: the task was aborted, and a
+    /// process it held (if any) had a SIGKILL attempted on its group — not
+    /// waited for, unlike `Stopped`.
     Killed,
 }
 
@@ -174,12 +179,16 @@ pub fn supervise(
     methods: MethodsFor,
     timings: Timings,
 ) -> SupervisorHandle {
-    let slot = Slot::take_over(current);
     let (stop_tx, stop_rx) = watch::channel(false);
     let (status_tx, status_rx) = watch::channel(Status::Starting { attempt: 1 });
-    let task = tokio::spawn(run_loop(
-        spec, dir, slot, methods, timings, stop_rx, status_tx,
-    ));
+    // Built here and moved into the task, not built inside it: a task aborted
+    // before its first poll drops its future's captures — this guard — but
+    // never runs a line of its body (review of ME3-SUP slice 3a, round 4).
+    let exit = Exit {
+        slot: Slot::take_over(current),
+        status: status_tx,
+    };
+    let task = tokio::spawn(run_loop(spec, dir, exit, methods, timings, stop_rx));
     SupervisorHandle {
         stop: stop_tx,
         status: status_rx,
@@ -221,14 +230,8 @@ impl Slot {
     /// Put a fresh placeholder in, unconditionally: the newest supervisor for
     /// a slot owns it.
     fn take_over(current: Arc<Current>) -> Self {
-        // Claimed before the slot is replaced; either order would do — a
-        // supervisor ending on the new claim stops writing to the slot too.
-        let (claim, owner) = current.claim();
         let mine = Generation::starting();
-        // Out goes whatever was there — the caller's initial placeholder, or
-        // the generation of a supervisor this one replaces, which that one
-        // stops and revokes itself.
-        let _replaced = current.replace(mine.clone());
+        let (claim, owner) = current.take_over(mine.clone());
         Self {
             current,
             mine: std::sync::Mutex::new(mine),
@@ -276,15 +279,16 @@ impl Slot {
     }
 }
 
-/// Every way out of the loop — return, panic, or the task being aborted —
-/// retires this supervisor's generation, so no path leaves the slot promising
-/// a module that will not come back.
-struct OnExit<'a> {
-    slot: &'a Slot,
-    status: &'a watch::Sender<Status>,
+/// The loop's slot and status, owned. Every way out — return, panic, the task
+/// aborted, even before its first poll — drops this, which retires this
+/// supervisor's generation, so no path leaves the slot promising a module that
+/// will not come back.
+struct Exit {
+    slot: Slot,
+    status: watch::Sender<Status>,
 }
 
-impl Drop for OnExit<'_> {
+impl Drop for Exit {
     fn drop(&mut self) {
         self.slot.retire();
         if std::thread::panicking() {
@@ -292,7 +296,7 @@ impl Drop for OnExit<'_> {
             self.status.send_replace(Status::Panicked);
         } else if !matches!(
             *self.status.borrow(),
-            Status::Stopped | Status::GaveUp { .. }
+            Status::Stopped | Status::GaveUp { .. } | Status::StopFailed { .. }
         ) {
             // Aborted (the handle was dropped): the process went with the task,
             // SIGKILLed, not waited for — so not `Stopped`.
@@ -304,33 +308,37 @@ impl Drop for OnExit<'_> {
 async fn run_loop(
     spec: ModuleSpec,
     dir: Arc<CallbackDir>,
-    slot: Slot,
+    exit: Exit,
     methods: MethodsFor,
     timings: Timings,
     mut stop: watch::Receiver<bool>,
-    status: watch::Sender<Status>,
 ) {
-    let _on_exit = OnExit {
-        slot: &slot,
-        status: &status,
-    };
+    let (slot, status) = (&exit.slot, &exit.status);
     let mut policy = RestartPolicy::with_base(timings.backoff_base);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         status.send_replace(Status::Starting { attempt });
         let (why, ready_at, ended_at) =
-            match run_once(&spec, &dir, &slot, &methods, &timings, &mut stop, &status).await {
-                Run::StopRequested => {
+            match run_once(&spec, &dir, slot, &methods, &timings, &mut stop, status).await {
+                Err(Unconfirmed(error)) => {
+                    // No restart over a group that may still be there.
+                    tracing::error!(module = %spec.name, "not restarting: {error}");
+                    slot.retire();
+                    status.send_replace(Status::StopFailed { error });
+                    told_to_end(&mut stop, slot).await;
+                    return;
+                }
+                Ok(Run::StopRequested) => {
                     slot.retire();
                     status.send_replace(Status::Stopped);
                     return;
                 }
-                Run::Ended {
+                Ok(Run::Ended {
                     why,
                     ready_at,
                     ended_at,
-                } => (why, ready_at, ended_at),
+                }) => (why, ready_at, ended_at),
             };
         if let Some(ready_at) = ready_at {
             policy.ran(ready_at, ended_at);
@@ -355,7 +363,7 @@ async fn run_loop(
                 });
                 tokio::select! {
                     biased;
-                    () = told_to_end(&mut stop, &slot) => {
+                    () = told_to_end(&mut stop, slot) => {
                         // The placeholder put in above must not outlive the
                         // module: `module_not_ready` would promise a return.
                         slot.retire();
@@ -374,7 +382,7 @@ async fn run_loop(
                     failures: after,
                     within,
                 });
-                told_to_end(&mut stop, &slot).await;
+                told_to_end(&mut stop, slot).await;
                 status.send_replace(Status::Stopped);
                 return;
             }
@@ -382,9 +390,14 @@ async fn run_loop(
     }
 }
 
+/// A run's process could not be confirmed gone: its stop failed.
+struct Unconfirmed(String);
+
 /// One run: spawn, handshake, serve, and stop. Returns how it ended; the
-/// process is always stopped (or, if stopping failed, dropped — which kills
-/// its group without grace) by the time it returns.
+/// process is always stopped by the time it returns — or, if that could not
+/// be confirmed, dropped (one more SIGKILL) and reported as [`Unconfirmed`],
+/// after which the loop starts nothing new (review of ME3-SUP slice 3a,
+/// round 4).
 async fn run_once(
     spec: &ModuleSpec,
     dir: &CallbackDir,
@@ -393,7 +406,7 @@ async fn run_once(
     timings: &Timings,
     stop: &mut watch::Receiver<bool>,
     status: &watch::Sender<Status>,
-) -> Run {
+) -> Result<Run, Unconfirmed> {
     let failed = |why: Stopped| Run::Ended {
         why,
         ready_at: None,
@@ -405,14 +418,14 @@ async fn run_once(
         Ok(l) => l,
         Err(e) => {
             tracing::error!(module = %spec.name, "could not bind the module's port: {e}");
-            return failed(Stopped::Exited);
+            return Ok(failed(Stopped::Exited));
         }
     };
     let callback = match dir.listen_next() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(module = %spec.name, "could not listen for the callback: {e}");
-            return failed(Stopped::Exited);
+            return Ok(failed(Stopped::Exited));
         }
     };
     // Raced against a stop: the package check before the spawn walks a whole
@@ -421,7 +434,7 @@ async fn run_once(
     // end on its own thread, bounded by the entry cap.)
     let spawned = tokio::select! {
         biased;
-        () = told_to_end(stop, slot) => return Run::StopRequested,
+        () = told_to_end(stop, slot) => return Ok(Run::StopRequested),
         spawned = launch::spawn(LaunchSpec {
             name: &spec.name,
             command: &spec.command,
@@ -436,15 +449,15 @@ async fn run_once(
         Ok(p) => p,
         Err(e) => {
             tracing::error!(module = %spec.name, "could not start the module: {e}");
-            return failed(Stopped::Exited);
+            return Ok(failed(Stopped::Exited));
         }
     };
     let generation = process.generation().clone();
     // Out goes this supervisor's placeholder, which was never started.
     if !slot.install(generation.clone()) {
         tracing::warn!(module = %spec.name, "another supervisor took the slot over; ending");
-        finish(process, timings, &spec.name, status).await;
-        return Run::StopRequested;
+        finish(process, timings, &spec.name, status).await?;
+        return Ok(Run::StopRequested);
     }
     let expect = Expectation {
         module: spec.name.clone(),
@@ -458,14 +471,14 @@ async fn run_once(
     let handshaken = tokio::select! {
         biased;
         () = told_to_end(stop, slot) => {
-            finish(process, timings, &spec.name, status).await;
-            return Run::StopRequested;
+            finish(process, timings, &spec.name, status).await?;
+            return Ok(Run::StopRequested);
         }
         exited = process.exited() => {
             tracing::warn!(module = %spec.name, ?exited, "the module exited before its handshake");
             let run = failed(Stopped::Exited);
-            finish(process, timings, &spec.name, status).await;
-            return run;
+            finish(process, timings, &spec.name, status).await?;
+            return Ok(run);
         }
         result = async {
             let stream = callback.accept_one(deadline).await.map_err(|e| e.to_string())?;
@@ -477,8 +490,8 @@ async fn run_once(
         Err(why) => {
             tracing::warn!(module = %spec.name, "the module did not complete its handshake: {why}");
             let run = failed(Stopped::StartupTimeout);
-            finish(process, timings, &spec.name, status).await;
-            return run;
+            finish(process, timings, &spec.name, status).await?;
+            return Ok(run);
         }
     };
     if !generation.ready() {
@@ -487,8 +500,8 @@ async fn run_once(
         // ready module.
         tracing::error!(module = %spec.name, "the generation was revoked during its handshake");
         let run = failed(Stopped::StartupTimeout);
-        finish(process, timings, &spec.name, status).await;
-        return run;
+        finish(process, timings, &spec.name, status).await?;
+        return Ok(run);
     }
     // Built before `Running` is published: a caller's `MethodsFor` that
     // panics must not leave the status saying a module is being served.
@@ -512,8 +525,8 @@ async fn run_once(
         exited = process.exited() => Some(format!("the module exited: {exited:?}")),
     };
     let ended_at = std::time::Instant::now();
-    finish(process, timings, &spec.name, status).await;
-    match outcome {
+    finish(process, timings, &spec.name, status).await?;
+    Ok(match outcome {
         None => Run::StopRequested,
         Some(why) => {
             tracing::warn!(module = %spec.name, "{why}");
@@ -523,7 +536,7 @@ async fn run_once(
                 ended_at,
             }
         }
-    }
+    })
 }
 
 /// Resolves once this supervisor must end: a stop was requested, or a newer
@@ -547,14 +560,14 @@ async fn stop_requested(stop: &mut watch::Receiver<bool>) {
 }
 
 /// Stop a run's process, with the status saying so while it happens. A stop
-/// that fails is logged and the process dropped, which revokes (already done)
-/// and SIGKILLs its group without grace.
+/// that fails is reported: the process is dropped, which SIGKILLs its group
+/// once more, but its end is not confirmed.
 async fn finish(
     mut process: ModuleProcess,
     timings: &Timings,
     name: &str,
     status: &watch::Sender<Status>,
-) {
+) -> Result<(), Unconfirmed> {
     // Revoked before `Stopping` is published: whoever sees `Stopping` must
     // find new work already refused (review of ME3-SUP slice 3a, round 2).
     // A `false` here — revoked by someone else — is reported by `stop`.
@@ -569,12 +582,12 @@ async fn finish(
                     "requests in flight when the module stopped: outcome unknown"
                 );
             }
+            Ok(())
         }
         Err(failed) => {
-            tracing::error!(
-                module = name,
-                "the module could not be stopped cleanly: {failed}"
-            );
+            let error = format!("the module could not be confirmed stopped: {failed}");
+            tracing::error!(module = name, "{error}");
+            Err(Unconfirmed(error))
         }
     }
 }
@@ -689,11 +702,17 @@ sys.exit(0)
         what: &str,
         pred: impl Fn(&Status) -> bool,
     ) -> Status {
-        tokio::time::timeout(Duration::from_secs(60), rx.wait_for(|s| pred(s)))
+        let got = tokio::time::timeout(Duration::from_secs(60), rx.wait_for(|s| pred(s)))
             .await
-            .unwrap_or_else(|_| panic!("never reached: {what}"))
-            .unwrap()
-            .clone()
+            .map(|r| r.map(|s| s.clone()));
+        match got {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => panic!(
+                "never reached: {what}; the loop ended at {:?}",
+                *rx.borrow()
+            ),
+            Err(_) => panic!("never reached: {what}; last seen {:?}", *rx.borrow()),
+        }
     }
 
     /// The `<pid> <token>` of every start, in order. A missing file is no
@@ -838,6 +857,11 @@ sys.exit(0)
         let mut rx = handle.subscribe();
         until(&mut rx, "GaveUp", |s| matches!(s, Status::GaveUp { .. })).await;
         let at: Vec<f64> = start_lines(f.data.path()).iter().map(|l| l.2).collect();
+        assert_eq!(
+            at.len(),
+            crate::supervise::BREAKER_THRESHOLD as usize,
+            "{at:?}"
+        );
         for (i, pair) in at.windows(2).enumerate() {
             let want = base.as_secs_f64() * f64::from(1u32 << i);
             assert!(
@@ -1175,6 +1199,36 @@ sys.exit(0)
         );
         assert_eq!(seen[0].state(), crate::drain::DrainState::Revoked);
         stop(handle).await;
+    }
+
+    /// A handle dropped before its task was ever polled still retires the
+    /// slot: the exit guard is built before the spawn and moved into the task,
+    /// so it runs even when not one line of the loop did (review of ME3-SUP
+    /// slice 3a, round 4). On this single-threaded runtime nothing is polled
+    /// until the test awaits.
+    #[tokio::test]
+    async fn a_handle_dropped_before_the_first_poll_still_retires_the_slot() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        drop(supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while current.get().state() != crate::drain::DrainState::Revoked {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the placeholder was left promising a module"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            starts(f.data.path()).is_empty(),
+            "an aborted supervisor started a module"
+        );
     }
 
     /// Dropping the handle without stopping is still a kill path: the loop is

@@ -50,6 +50,11 @@ pub const BASE_BACKOFF: Duration = Duration::from_millis(500);
 /// as "wait a bit more".
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long an `EPERM` from signalling the group may take to turn into "the
+/// leader has exited" (see `ModuleProcess::signal_settling`). ⚖️ Exiting takes
+/// microseconds to milliseconds; a real permission problem does not go away.
+const EXIT_SETTLE: Duration = Duration::from_millis(200);
+
 /// How many consecutive failures trip the breaker.
 pub const BREAKER_THRESHOLD: u32 = 5;
 
@@ -550,12 +555,12 @@ impl ModuleProcess {
         if !self.reaped {
             // The leader is unreaped: the group id is ours.
             let exited_already = self.leader_exited()?;
-            self.signal(Signal::Term, exited_already)?;
+            self.signal_settling(Signal::Term, exited_already).await?;
             let exited = exited_already || self.leader_exits_within(grace).await?;
             // Once more even if the leader went on TERM: helpers outlive their
             // parent, and "the process we started exited" is not the claim "the
             // tree is gone".
-            self.signal(Signal::Kill, exited)?;
+            self.signal_settling(Signal::Kill, exited).await?;
             if !exited && !self.leader_exits_within(REAP_TIMEOUT).await? {
                 // Bounded, not an open-ended wait: SIGKILL does not guarantee
                 // reaping — a process blocked in an uninterruptible state stays
@@ -599,6 +604,31 @@ impl ModuleProcess {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
             Err(rustix::io::Errno::PERM) if leader_exited || self.leader_exited()? => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// [`ModuleProcess::signal`], giving an `EPERM` a moment to settle.
+    ///
+    /// **On macOS a leader in the middle of exiting answers `killpg` with
+    /// `EPERM` too** — before it is a zombie, so `leader_exited` still says
+    /// no. A module that closes its callback and exits is stopped in exactly
+    /// that window: the supervisor sees the connection end first. Measured: 3
+    /// of 6 runs of one SUP-3a crash-loop test, found once `Supervisor` stopped
+    /// swallowing a failed stop. The leader is looked at again every few
+    /// milliseconds for [`EXIT_SETTLE`]; a member really running as another
+    /// user keeps answering `EPERM` with the leader alive, and still fails.
+    async fn signal_settling(&mut self, sig: Signal, leader_exited: bool) -> std::io::Result<()> {
+        let deadline = Instant::now() + EXIT_SETTLE;
+        loop {
+            match self.signal(sig, leader_exited) {
+                Err(e)
+                    if e.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error())
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                other => return other,
+            }
         }
     }
 

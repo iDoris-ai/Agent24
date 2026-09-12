@@ -481,16 +481,28 @@ impl Current {
         })
     }
 
-    /// Become the slot's owner: a claim number, and a receiver on which every
-    /// later claim shows up as a different number. For a supervisor, which
-    /// must end when a newer one takes its slot over — not just stop writing
-    /// to the slot (review of ME3-SUP slice 3a, round 3).
-    pub(crate) fn claim(&self) -> (u64, tokio::sync::watch::Receiver<u64>) {
+    /// Take the slot over: install `next` and become its owner, in one step
+    /// under the slot's lock — so the newest claim and what the slot holds
+    /// always agree (round 4: two separate steps let an older take-over land
+    /// after a newer one). Returns the claim number and a receiver on which
+    /// every later claim shows up as a different number: a supervisor must
+    /// end when a newer one takes its slot over, not just stop writing to it
+    /// (round 3). What was in the slot is dropped: its owner, if any, stops
+    /// and revokes it itself.
+    pub(crate) fn take_over(
+        &self,
+        next: Arc<Generation>,
+    ) -> (u64, tokio::sync::watch::Receiver<u64>) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut claimed = 0;
         self.owner.send_modify(|n| {
             *n += 1;
             claimed = *n;
         });
+        *slot = next;
         (claimed, self.owner.subscribe())
     }
 
