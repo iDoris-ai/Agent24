@@ -121,12 +121,16 @@ impl std::error::Error for LaunchError {}
 ///
 /// # Who may have written it
 ///
-/// A program inside the package is also refused unless the package directory,
-/// every directory between it and the program, and the program itself are
-/// owned by this user and not writable by group or others. Otherwise another
-/// user could swap what runs between install and spawn. This narrows the window
-/// the check is made in; it cannot close it — the check and the `exec` are two
-/// steps (FU-41).
+/// The whole package tree — every file and directory under the package
+/// directory, the directory itself included — must be owned by this user and
+/// not writable by group or others, **whatever the command is**. A bare
+/// interpreter (`node server.js`) runs code from the package just as surely as
+/// `bin/mod` does, and which argument is the code cannot be told from argv; the
+/// first version checked only the path to a relative program and let `node
+/// server.js` through with a world-writable package (review of SUP-1, round 1).
+/// Symlinks are checked for owner only (their mode means nothing). The check
+/// narrows the window, it cannot close it — the check and the `exec` are two
+/// steps (FU-41) — and it costs a walk of the tree at every spawn.
 ///
 /// # Errors
 ///
@@ -134,6 +138,13 @@ impl std::error::Error for LaunchError {}
 /// [`LaunchError::UnsafeOwnership`].
 pub fn resolve(spawn: &SpawnCommand, package_dir: &Path) -> Result<PathBuf, LaunchError> {
     let command = Path::new(&spawn.command);
+    let package = package_dir.canonicalize().map_err(|e| {
+        LaunchError::Unresolved(format!(
+            "the package directory {} could not be resolved: {e}",
+            package_dir.display()
+        ))
+    })?;
+    check_tree(&package)?;
     // A bare name has no separator. `Path::components` would normalise away a
     // leading `./`, so the test is on the raw string.
     if !spawn.command.contains(std::path::MAIN_SEPARATOR) {
@@ -145,12 +156,6 @@ pub fn resolve(spawn: &SpawnCommand, package_dir: &Path) -> Result<PathBuf, Laun
         });
     }
 
-    let package = package_dir.canonicalize().map_err(|e| {
-        LaunchError::Unresolved(format!(
-            "the package directory {} could not be resolved: {e}",
-            package_dir.display()
-        ))
-    })?;
     let resolved = package.join(command).canonicalize().map_err(|e| {
         LaunchError::Unresolved(format!(
             "spawn.command {:?} could not be resolved inside the package: {e}",
@@ -160,25 +165,46 @@ pub fn resolve(spawn: &SpawnCommand, package_dir: &Path) -> Result<PathBuf, Laun
     if !resolved.starts_with(&package) {
         return Err(LaunchError::EscapesPackage { resolved, package });
     }
-    for path in resolved.ancestors().take_while(|p| p.starts_with(&package)) {
-        if !safely_owned(path) {
-            return Err(LaunchError::UnsafeOwnership(path.to_owned()));
-        }
-    }
     Ok(resolved)
 }
 
-/// Owned by this user, and not writable by group or others.
-fn safely_owned(path: &Path) -> bool {
+/// Every entry under `root`, `root` included, is owned by this user and not
+/// writable by group or others (symlinks: owner only). Does not follow
+/// symlinks, so a link pointing out of the tree is not walked into.
+fn check_tree(root: &Path) -> Result<(), LaunchError> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path)
-        .is_ok_and(|m| m.uid() == rustix::process::geteuid().as_raw() && m.mode() & 0o022 == 0)
+    let me = rustix::process::geteuid().as_raw();
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|_| LaunchError::UnsafeOwnership(path.clone()))?;
+        let writable_by_others = !meta.file_type().is_symlink() && meta.mode() & 0o022 != 0;
+        if meta.uid() != me || writable_by_others {
+            return Err(LaunchError::UnsafeOwnership(path));
+        }
+        if meta.is_dir() {
+            let entries =
+                std::fs::read_dir(&path).map_err(|_| LaunchError::UnsafeOwnership(path.clone()))?;
+            for entry in entries {
+                let entry = entry.map_err(|_| LaunchError::UnsafeOwnership(path.clone()))?;
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
-/// Find `name` on `PATH`, the way `execvp` would.
+/// Find `name` on `PATH`, the way `execvp` would — except that relative
+/// entries are skipped. A relative entry would be checked here against the
+/// daemon's working directory and then executed from the package directory
+/// (the child's), two different files (review of SUP-1, round 1).
 fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    which_in(name, &std::env::var_os("PATH")?)
+}
+
+fn which_in(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable_file(candidate))
 }
@@ -252,8 +278,8 @@ pub struct LaunchSpec<'a> {
 ///   variables. The token travels in the environment, not on the command line,
 ///   because arguments are world-readable through `ps`.
 /// - **fds 0–3 only**: stdin is `/dev/null`, stdout and stderr are pipes the
-///   kernel drains, and fd 3 is the listening socket. Every other fd this
-///   process has is close-on-exec (the standard library's default).
+///   kernel drains, and fd 3 is the listening socket. Every other fd of this
+///   process is marked close-on-exec just before the fork.
 ///
 /// Output is drained whether or not anyone reads the log: a pipe nobody reads
 /// fills at about 64 KiB, and a module blocked writing a log line looks exactly
@@ -296,17 +322,50 @@ pub fn spawn(
     }])
     .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))?;
 
-    let mut child = cmd.spawn().map_err(LaunchError::Spawn)?;
+    // Every fd of ours from 3 up is marked close-on-exec before the fork, so
+    // the child keeps only 0–2 and the fd 3 mapped above. The standard library
+    // opens everything close-on-exec already; what this catches is an fd the
+    // daemon INHERITED without the flag (from a shell or a service manager),
+    // which would otherwise pass straight to a third party (review of SUP-1,
+    // round 1: the first version relied on the flag being there).
+    //
+    // Under a lock, because the flag is not always set atomically: on macOS
+    // (no `pipe2`) the standard library creates a spawn's stdio pipes and THEN
+    // marks them close-on-exec, and a fork in between inherits them. Measured:
+    // 1 in 60 runs of this crate's tests, a module saw an extra fd — another
+    // test's spawn's pipe. Between two modules that is one module holding the
+    // other's output. The lock makes this crate's spawns exclusive of each
+    // other; a spawn elsewhere in the daemon that does not take it can still
+    // race one of these.
+    let mut child = {
+        let _exclusive = SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        close_fds::set_fds_cloexec_threadsafe(3, &[]);
+        cmd.spawn().map_err(LaunchError::Spawn)?
+    };
     // The command owns our copy of the listener; dropping it closes that copy.
     drop(cmd);
+    let mut drains = Vec::new();
     if let Some(out) = child.stdout.take() {
-        tokio::spawn(drain_output(out, spec.name.to_owned(), "stdout"));
+        drains.push(tokio::spawn(drain_output(
+            out,
+            spec.name.to_owned(),
+            "stdout",
+        )));
     }
     if let Some(err) = child.stderr.take() {
-        tokio::spawn(drain_output(err, spec.name.to_owned(), "stderr"));
+        drains.push(tokio::spawn(drain_output(
+            err,
+            spec.name.to_owned(),
+            "stderr",
+        )));
     }
-    ModuleProcess::new(child, generation, token).map_err(LaunchError::Spawn)
+    ModuleProcess::new(child, generation, token, drains).map_err(LaunchError::Spawn)
 }
+
+/// Held across marking fds close-on-exec and forking (see [`spawn`]).
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Longest line of module output logged; the rest of the line is dropped and
 /// the line marked as cut. ⚖️
@@ -592,11 +651,11 @@ mod tests {
 
     /// Wait for the leader to exit, within a bound — a test that waits without
     /// one reports a hang as silence.
-    async fn exited(p: &mut ModuleProcess) -> std::process::ExitStatus {
-        tokio::time::timeout(std::time::Duration::from_secs(10), p.wait_exit())
+    async fn exited(p: &mut ModuleProcess) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), p.exited())
             .await
             .expect("the module did not exit within 10s")
-            .unwrap()
+            .unwrap();
     }
 
     fn read(t: &Path, name: &str) -> String {
@@ -713,8 +772,20 @@ mod tests {
             })
             .collect();
         assert!(stray.is_empty(), "not on the allowlist: {stray:?}");
-        // Control: what must be there is there, with the values given.
+        // Control: what must be there is there, with the values given — and
+        // no `A24_*` beyond the four.
         assert!(env.contains_key("PATH"), "{env:?}");
+        let a24: Vec<&&str> = env.keys().filter(|k| k.starts_with("A24_")).collect();
+        assert_eq!(
+            a24,
+            [
+                &ENV_CALLBACK_SOCK,
+                &ENV_DATA_DIR,
+                &ENV_HANDSHAKE_TOKEN,
+                &ENV_LISTEN_FD
+            ],
+            "exactly the four A24_* variables"
+        );
         assert_eq!(env.get(ENV_LISTEN_FD), Some(&"3"));
         assert_eq!(env.get(ENV_HANDSHAKE_TOKEN).copied(), Some(p.token()));
         let data = t.path().join("data");
@@ -796,12 +867,20 @@ mod tests {
     /// Only fds 0–3 reach the module: stdio and the listener. Anything else
     /// would be a daemon resource — a database, a socket to a provider — in a
     /// third party's hands.
+    ///
+    /// The probe is an fd the daemon holds **without** close-on-exec, at a high
+    /// number — the shape of an fd a daemon inherits from a shell or a service
+    /// manager. The first version probed with a plain `File`, which Rust opens
+    /// close-on-exec, so it passed with no protection at all (review of SUP-1,
+    /// round 1).
     #[tokio::test]
-    async fn only_stdio_and_the_listener_are_open_in_the_child() {
+    async fn an_inherited_fd_without_close_on_exec_does_not_reach_the_child() {
         let t = pkg();
-        // A file this process holds open while spawning: the daemon's own fds
-        // must not follow.
-        let _held = std::fs::File::open(t.path()).unwrap();
+        let file = std::fs::File::open(t.path()).unwrap();
+        let high = rustix::io::fcntl_dupfd_cloexec(&file, 700).unwrap();
+        rustix::io::fcntl_setfd(&high, rustix::io::FdFlags::empty()).unwrap();
+        let number = std::os::fd::AsRawFd::as_raw_fd(&high);
+        assert!(number >= 700, "precondition: a high fd, got {number}");
         let mut p = start(
             t.path(),
             &python(
@@ -812,7 +891,7 @@ mod tests {
                  \x20       return True\n\
                  \x20   except OSError:\n\
                  \x20       return False\n\
-                 fds = [fd for fd in range(0, 256) if is_open(fd)]\n\
+                 fds = [fd for fd in range(0, 1024) if is_open(fd)]\n\
                  open('out','w').write(' '.join(map(str, fds)))",
             ),
         );
@@ -820,6 +899,7 @@ mod tests {
         // 0–3 open is also the control: the probe sees open fds.
         assert_eq!(read(t.path(), "out"), "0 1 2 3");
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
+        drop(high);
     }
 
     /// A module that writes more than a pipe holds is not blocked by it: its
@@ -840,33 +920,70 @@ mod tests {
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 
-    /// Someone else able to write the package — its directory, a directory on
-    /// the way to the program, or the program — could swap what runs. Each is
-    /// refused; the same tree with owner-only write access is the control.
+    /// Someone else able to write the package could swap what runs — its
+    /// directory, any directory or file in it. Each is refused, **for a bare
+    /// interpreter too**: `sh main.sh` runs package code as surely as `bin/mod`
+    /// does (the first version let it through; review of SUP-1, round 1). The
+    /// same tree with owner-only write access is the control.
     #[test]
-    fn a_package_others_can_write_is_refused() {
+    fn a_package_others_can_write_is_refused_whatever_the_command() {
         let t = pkg();
         exe(&t.path().join("bin/mod"), "#!/bin/sh\nexit 0\n");
-        let spawn = cmd("bin/mod", &[]);
+        std::fs::create_dir(t.path().join("lib")).unwrap();
+        std::fs::write(t.path().join("lib/code.sh"), "exit 0\n").unwrap();
         let mode = |p: &Path, m: u32| {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
         };
-        resolve(&spawn, t.path()).expect("control: owner-only write access is fine");
-
-        for (what, path, bad, good) in [
-            ("package dir", t.path().to_owned(), 0o777, 0o700),
-            ("bin/", t.path().join("bin"), 0o775, 0o755),
-            ("program", t.path().join("bin/mod"), 0o757, 0o755),
-        ] {
-            mode(&path, bad);
-            let err = resolve(&spawn, t.path()).expect_err(what);
-            assert!(
-                matches!(&err, LaunchError::UnsafeOwnership(p) if p == &path.canonicalize().unwrap()),
-                "{what}: {err:?}"
-            );
-            mode(&path, good);
+        for spawn in [cmd("bin/mod", &[]), cmd("sh", &["lib/code.sh"])] {
+            resolve(&spawn, t.path()).expect("control: owner-only write access is fine");
+            for (what, path, bad, good) in [
+                ("package dir", t.path().to_owned(), 0o777, 0o700),
+                ("bin/", t.path().join("bin"), 0o775, 0o755),
+                ("program", t.path().join("bin/mod"), 0o757, 0o755),
+                (
+                    "a file the interpreter runs",
+                    t.path().join("lib/code.sh"),
+                    0o666,
+                    0o644,
+                ),
+            ] {
+                mode(&path, bad);
+                let err = resolve(&spawn, t.path()).expect_err(what);
+                assert!(
+                    matches!(&err, LaunchError::UnsafeOwnership(p) if p == &path.canonicalize().unwrap()),
+                    "{} / {what}: {err:?}",
+                    spawn.command
+                );
+                mode(&path, good);
+            }
         }
-        resolve(&spawn, t.path()).expect("restored");
+    }
+
+    /// A relative `PATH` entry is skipped: it would be checked against the
+    /// daemon's directory and executed from the package's — two different
+    /// files. The absolute entry after it is the control.
+    #[test]
+    fn a_relative_path_entry_is_not_searched() {
+        let t = pkg();
+        let found = which_in("sh", std::ffi::OsStr::new("bin:/bin:/usr/bin")).expect("sh");
+        assert!(found.is_absolute(), "{}", found.display());
+        // A relative entry that DOES reach an executable `sh` from here —
+        // `../..` up to `/`, then down into the package — is still not
+        // searched. (Without the climb it would resolve to nothing and the
+        // assertion would hold with no filter at all.)
+        exe(&t.path().join("bin/sh"), "#!/bin/sh\nexit 0\n");
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.push(t.path().join("bin").strip_prefix("/").unwrap());
+        assert!(
+            rel.is_relative() && rel.join("sh").exists(),
+            "precondition: {}",
+            rel.display()
+        );
+        assert_eq!(which_in("sh", rel.as_os_str()), None);
     }
 
     #[test]
