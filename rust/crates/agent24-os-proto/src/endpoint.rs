@@ -12,8 +12,12 @@
 //!
 //! A [`CallbackListener`] belongs to one generation and is consumed by
 //! [`CallbackListener::accept_one`]: the first connection is taken, and the
-//! listener is closed and its path removed at once. A second `connect` finds
-//! nothing to connect to. That is how "the callback connection IS the
+//! listener is closed and its path removed at once. A later `connect` finds
+//! nothing to connect to; one that raced the first into the listen backlog
+//! DID connect, but is never served — closing the listener ends it (EOF or a
+//! reset). What holds is "exactly one connection is served", not "a second
+//! `connect()` fails" — the latter no pathname socket can promise (review of
+//! ME3-SUP slice 2, round 1). That is how "the callback connection IS the
 //! generation's lifeline" (user decision D1: it breaking ends the generation,
 //! and the same generation may not reconnect) is kept without a rule anyone
 //! has to remember to check.
@@ -104,6 +108,11 @@ pub struct CallbackDir {
 impl CallbackDir {
     /// Create (or take over) `<state>/run/<this pid>/`.
     ///
+    /// The steps go by path, not by a held directory handle, so they rest on
+    /// `state` itself being stable — the daemon's own directory, which another
+    /// user cannot rename or replace. Within that, `run/` and the pid directory
+    /// are checked here (review of ME3-SUP slice 2, round 1, F8).
+    ///
     /// # Errors
     ///
     /// [`EndpointError::UnsafeDirectory`] if `run/` or the pid directory is not
@@ -139,32 +148,46 @@ impl CallbackDir {
         if path.as_os_str().len() > MAX_SOCKET_PATH {
             return Err(EndpointError::PathTooLong(path));
         }
-        // A socket file left by an earlier generation with the same number
-        // (after a failed bind, say) would make the bind fail. The directory is
-        // ours alone, so what is there is ours to remove.
-        match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
+        // Nothing is removed first. The directory was emptied when this daemon
+        // started and generation numbers are not reused, so a node at this
+        // path is not a stale file but someone's live socket — removing it (as
+        // the first version did) took a working listener's address away
+        // (review of ME3-SUP slice 2, round 1, F5). An address in use fails.
         let listener = tokio::net::UnixListener::bind(&path)?;
-        Ok(CallbackListener { listener, path })
+        // The socket node itself `0700` too, not the umask's `0755`.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        let meta = std::fs::symlink_metadata(&path)?;
+        Ok(CallbackListener {
+            listener,
+            node: (meta.dev(), meta.ino()),
+            path,
+        })
     }
 }
 
-/// Create `path` (and parents) `0700` if it is missing; then check it.
+/// Create `path` (and parents) `0700` if it is missing; tighten it to exactly
+/// `0700` if it is ours and looser; then check it.
 fn private_dir(path: &Path) -> Result<(), EndpointError> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new()
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(path)
+        .create(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir()
+        && meta.uid() == rustix::process::geteuid().as_raw()
+        && meta.mode() & 0o777 != 0o700
     {
-        Ok(()) => check_private(path),
-        Err(e) => Err(e.into()),
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+    check_private(path)
 }
 
-/// A real directory, this user's, not writable by group or others.
+/// A real directory, this user's, mode exactly `0700` (SPEC §1: the kernel
+/// listens on a path it chose, `0700`). The first version refused only group-
+/// or other-WRITABLE, which let `0755` through (review of ME3-SUP slice 2,
+/// round 1, F6).
 fn check_private(path: &Path) -> Result<(), EndpointError> {
     use std::os::unix::fs::MetadataExt;
     let unsafe_dir = |why: String| EndpointError::UnsafeDirectory {
@@ -181,9 +204,9 @@ fn check_private(path: &Path) -> Result<(), EndpointError> {
     if meta.uid() != me {
         return Err(unsafe_dir(format!("owned by uid {}, not {me}", meta.uid())));
     }
-    if meta.mode() & 0o022 != 0 {
+    if meta.mode() & 0o777 != 0o700 {
         return Err(unsafe_dir(format!(
-            "mode {:04o} lets others create or remove sockets in it",
+            "mode {:04o}, not 0700",
             meta.mode() & 0o777
         )));
     }
@@ -196,6 +219,9 @@ fn check_private(path: &Path) -> Result<(), EndpointError> {
 pub struct CallbackListener {
     listener: tokio::net::UnixListener,
     path: PathBuf,
+    /// The socket node this listener bound (device, inode): `Drop` removes the
+    /// path only while it still names THIS node.
+    node: (u64, u64),
 }
 
 impl CallbackListener {
@@ -231,7 +257,12 @@ impl CallbackListener {
 
 impl Drop for CallbackListener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        use std::os::unix::fs::MetadataExt;
+        // Only our own node: if the path now names something else, it is not
+        // ours to remove.
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.node) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -281,6 +312,12 @@ impl std::error::Error for HandshakeFailed {}
 /// `Ok`: that is after the success line was written, so a module that never
 /// received the agreed version is not counted ready.
 ///
+/// `deadline` bounds the WHOLE handshake — reading the first frame and
+/// writing the answer — so "no successful `initialize` within the startup
+/// timeout counts as a crash" holds by this function's own bound (the first
+/// version let the answer take another ten seconds after it; review of
+/// ME3-SUP slice 2, round 1, F2).
+///
 /// # Errors
 ///
 /// [`HandshakeFailed`]; the connection is closed by the time it is returned.
@@ -304,7 +341,8 @@ pub async fn handshake(
                 writer.write_all(&line).await?;
                 writer.flush().await
             };
-            match tokio::time::timeout(crate::rpc::WRITE_TIMEOUT, write).await {
+            let until = deadline.min(tokio::time::Instant::now() + crate::rpc::WRITE_TIMEOUT);
+            match tokio::time::timeout_at(until, write).await {
                 Ok(Ok(())) => Ok(Handshaken {
                     reader,
                     writer,
@@ -319,7 +357,8 @@ pub async fn handshake(
         }
         Err(refusal) => {
             let line = initialize::error_line(initialize::id_of(&frame).as_deref(), &refusal);
-            let _ = tokio::time::timeout(REFUSAL_WRITE_TIMEOUT, async {
+            let until = deadline.min(tokio::time::Instant::now() + REFUSAL_WRITE_TIMEOUT);
+            let _ = tokio::time::timeout_at(until, async {
                 writer.write_all(&line).await?;
                 writer.flush().await
             })
@@ -506,7 +545,7 @@ mod tests {
         assert!(matches!(err, HandshakeFailed::Timeout), "{err}");
     }
 
-    /// One connection per generation: once the first is taken, a second
+    /// One connection per generation: once the first is taken, a later
     /// `connect` is refused — the listener is closed and its path gone. The
     /// first connecting is the control.
     #[tokio::test]
@@ -548,24 +587,21 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// The socket directory is this user's alone: a `run/` others can write is
-    /// refused, not used; a fresh one is created `0700` (the control).
+    /// The socket directory must be a real directory: a `run/` that is a
+    /// symlink — to anywhere — is refused, not followed (a looser directory
+    /// that IS ours is tightened instead: see
+    /// `the_socket_and_its_directories_are_exactly_0700`). A fresh one is the
+    /// control.
     #[test]
-    fn a_socket_directory_others_can_write_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_socket_directory_that_is_a_symlink_is_refused() {
         let s = state();
-        let dir = CallbackDir::create(s.path()).expect("control: a fresh directory");
-        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        CallbackDir::create(s.path()).expect("control: a fresh directory");
 
         let s2 = state();
-        std::fs::create_dir(s2.path().join("run")).unwrap();
-        std::fs::set_permissions(
-            s2.path().join("run"),
-            std::fs::Permissions::from_mode(0o777),
-        )
-        .unwrap();
-        let err = CallbackDir::create(s2.path()).expect_err("a shared run/");
+        let elsewhere = s2.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, s2.path().join("run")).unwrap();
+        let err = CallbackDir::create(s2.path()).expect_err("a symlinked run/");
         assert!(
             matches!(err, EndpointError::UnsafeDirectory { .. }),
             "{err}"
@@ -606,5 +642,81 @@ mod tests {
             v["error"]["data"]["kernel"],
             serde_json::json!({"min": 1, "max": 1})
         );
+    }
+
+    /// Two clients that both connect before the kernel accepts: exactly one is
+    /// served; the other did connect (it sat in the backlog) but is never
+    /// served — closing the listener ends it. The literal claim is "one is
+    /// served", not "the second connect fails" (review of ME3-SUP slice 2,
+    /// round 1, F7).
+    #[tokio::test]
+    async fn of_two_early_connections_exactly_one_is_served() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let listener = dir.listen(1).unwrap();
+        let path = listener.path().to_owned();
+        let a = UnixStream::connect(&path).await.expect("first connect");
+        let b = UnixStream::connect(&path)
+            .await
+            .expect("second connect, into the backlog");
+        let served = listener.accept_one(soon()).await.expect("one accepted");
+        // Whichever was not accepted sees its connection end, without a byte.
+        let mut ends = 0;
+        for mut c in [a, b] {
+            let mut buf = [0u8; 1];
+            match tokio::time::timeout(Duration::from_millis(500), c.read(&mut buf)).await {
+                Ok(Ok(0) | Err(_)) => ends += 1, // EOF or reset: never served
+                Ok(Ok(_)) => panic!("a byte from a connection nobody wrote to"),
+                Err(_) => {} // still open: the one being served
+            }
+        }
+        assert_eq!(
+            ends, 1,
+            "exactly one connection should have been ended unserved"
+        );
+        drop(served);
+    }
+
+    /// The socket node and both directories are exactly `0700`; an existing
+    /// `run/` that is ours but looser is tightened, not refused or left.
+    #[tokio::test]
+    async fn the_socket_and_its_directories_are_exactly_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = state();
+        std::fs::create_dir(s.path().join("run")).unwrap();
+        std::fs::set_permissions(s.path().join("run"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let dir = CallbackDir::create(s.path()).expect("ours, so tightened");
+        let listener = dir.listen(1).unwrap();
+        for p in [
+            s.path().join("run"),
+            dir.path().to_owned(),
+            listener.path().to_owned(),
+        ] {
+            let mode = std::fs::symlink_metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is {mode:o}", p.display());
+        }
+    }
+
+    /// A listener removes its path only while the path is still its own
+    /// socket: a second listener bound at the same name after the first's
+    /// path was taken away keeps its address when the first is dropped.
+    #[tokio::test]
+    async fn a_dropped_listener_does_not_remove_someone_elses_socket() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let first = dir.listen(1).unwrap();
+        let path = first.path().to_owned();
+        // The same name, bound again: refused while the first holds it.
+        assert!(dir.listen(1).is_err(), "an address in use was taken over");
+        std::fs::remove_file(&path).unwrap();
+        let second = dir.listen(1).expect("the name is free again");
+        drop(first);
+        assert!(
+            path.exists(),
+            "dropping the first listener removed the second's socket"
+        );
+        drop(second);
+        assert!(!path.exists(), "control: the second removes its own");
     }
 }

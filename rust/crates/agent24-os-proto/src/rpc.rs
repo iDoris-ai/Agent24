@@ -498,7 +498,7 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &dyn Fn(&str) -> boo
 
 /// Longest error message [`serve`] writes, whoever wrote the message — the
 /// `…` that marks a cut included.
-const MAX_MESSAGE_BYTES: usize = 1024;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 1024;
 
 /// Longest string echoed back from a request into an error message. A message
 /// that repeats an attacker-chosen string in full could itself exceed the frame
@@ -509,7 +509,7 @@ fn clip(s: &str) -> String {
     clip_to(s, ECHO_LIMIT)
 }
 
-fn clip_to(s: &str, limit: usize) -> String {
+pub(crate) fn clip_to(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_owned();
     }
@@ -532,7 +532,7 @@ fn params_only(params: &Value, allowed: &[&str]) -> bool {
 /// `{"params":{"x":1,"x":2},"id":"a","id":"b"}` is an envelope problem, not a
 /// params problem answered with whichever id parsed last. Call only on bytes
 /// already known to be JSON.
-fn find_duplicate_key(bytes: &[u8]) -> Option<Vec<String>> {
+pub(crate) fn find_duplicate_key(bytes: &[u8]) -> Option<Vec<String>> {
     scan_duplicates(bytes).0
 }
 
@@ -950,6 +950,19 @@ where
     let mut frames_in_a_row = 0usize;
 
     let ended = 'conn: loop {
+        // The stop, looked at first and without waiting, on EVERY turn. The
+        // reaping step below does not go through the select, and it dispatches
+        // the frame it takes before it `continue`s back there — so a stop that
+        // became ready while frame 16 was handled would otherwise let frame 17
+        // be dispatched, and its handler run up to its first await, after the
+        // generation was revoked. (This check was removed once as redundant with
+        // the select's stop branch; review of ME3-SUP slice 2, round 1, showed
+        // why it is not.)
+        if std::future::poll_fn(|cx| std::task::Poll::Ready(stop.as_mut().poll(cx).is_ready()))
+            .await
+        {
+            break Ended::Stopped;
+        }
         if frames_in_a_row >= FRAMES_BEFORE_REAPING {
             frames_in_a_row = 0;
             // Under the high-water mark only, as in the select below: taking a
@@ -993,9 +1006,8 @@ where
             queued.load(std::sync::atomic::Ordering::SeqCst) >= limits.queue_high_water;
         let response = tokio::select! {
             biased;
-            // First: biased to frames, a stop placed after them would never be
-            // seen while the peer keeps sending. (The reaping step every 16
-            // frames skips this select, but `continue`s straight back to it.)
+            // First here too: biased to frames, a stop placed after them would
+            // never wake this select while the peer keeps sending.
             () = &mut stop => break 'conn Ended::Stopped,
             frame = frames_rx.recv(), if !backpressured => match frame {
                 Some(Ok(bytes)) => {
@@ -2745,5 +2757,66 @@ mod tests {
             "read {} frames after the stop",
             NOTES - rx.len()
         );
+    }
+
+    /// Fires a stop from inside its params check — i.e. while the loop is
+    /// handling this frame, synchronously.
+    struct TriggerStop {
+        stop: Arc<tokio::sync::Notify>,
+    }
+    impl Handler for TriggerStop {
+        fn check_params(&self, _: &Value) -> Result<(), String> {
+            self.stop.notify_one();
+            Ok(())
+        }
+        fn call(&self, _: Value) -> CallFuture {
+            Box::pin(async move { Ok(Value::Null) })
+        }
+    }
+
+    /// A stop that becomes ready while frame 16 is handled is honoured before
+    /// frame 17 is dispatched — even though frame 17 is taken by the reaping
+    /// step, which does not go through the select. The probe records whether
+    /// frame 17's params check ever ran (review of ME3-SUP slice 2, round 1).
+    #[tokio::test]
+    async fn a_stop_during_the_sixteenth_frame_is_seen_before_the_seventeenth() {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(AtomicBool::new(false));
+        let methods = fixture()
+            .methods
+            .with("t/trigger", Arc::new(TriggerStop { stop: stop.clone() }))
+            .with("t/probe", Arc::new(Probe { seen: seen.clone() }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        for i in 0..15 {
+            tx.send(frame_of(&req(&format!("{i:02}"), "t/none", json!({}))))
+                .await
+                .unwrap();
+        }
+        tx.send(frame_of(&req("15", "t/trigger", json!({}))))
+            .await
+            .unwrap();
+        tx.send(frame_of(&req("16", "t/probe", json!({}))))
+            .await
+            .unwrap();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                &mut rx,
+                tokio::io::sink(),
+                methods,
+                TEST_LIMITS,
+                async move {
+                    stop.notified().await;
+                },
+            ),
+        )
+        .await
+        .expect("never stopped");
+        assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+        assert!(
+            !seen.load(Ordering::SeqCst),
+            "frame 17 was dispatched after the stop"
+        );
+        assert_eq!(rx.len(), 1, "precondition: frame 17 was there to be taken");
     }
 }
