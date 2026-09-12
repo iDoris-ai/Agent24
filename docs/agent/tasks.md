@@ -77,7 +77,7 @@
   - **D3′ 其余 fd 由跳板进程在子进程一侧标 close-on-exec**（SUP-1 第二轮复审发现父侧标记挡不住并发窗口后补定；另两个选项是「开一处审计过的 unsafe」与「接受残留窗口」）：本仓仍零 unsafe
   - **D4 每一代新 bind 一个端口**：代理按代取上游地址（FU-50 随之闭上；旧一代 backlog 里的请求不会被新进程执行）
 - **切成五刀**（SUP-1、SUP-2 可并行；解除挂载拒绝在 SUP-4；ME-3g 与签名都不是它的前提 —— F4e 是正确性问题，不是 §0 意义上的安全问题）：
-  - **SUP-1 进程所有权 + 启动加固** `PR_OPEN`（分支 `feat/me3-sup-1-process`）：`ModuleProcess` 是子进程与它那一代的唯一持有者，只有 `stop(self)` 能杀，而它先撤销**自己那一代**；`revoke` 收成 crate 内可见（FU-46）；drop 也是先撤后杀；spawn 清环境变量到白名单、监听 socket 作为 fd 3、经跳板启动（其余 fd 在子进程一侧标 close-on-exec）、stdin 为 null、stdout/stderr 限行长限速率读走；整棵包目录树属主校验（安装器配套去掉组/其他写权限）；组没清完不收尸、stop 取消安全且以「组已空」为成功；`RestartPolicy::ready` 改为 `ran`（在进程结束时调用，否则计数永不清零）
+  - **SUP-1 进程所有权 + 启动加固** `PR_OPEN` — [#178](https://github.com/iDoris-ai/Agent24/pull/178)：`ModuleProcess` 是子进程与它那一代的唯一持有者，只有 `stop(self)` 能杀，而它先撤销**自己那一代**；`revoke` 收成 crate 内可见（FU-46）；drop 也是先撤后杀；spawn 清环境变量到白名单、监听 socket 作为 fd 3、经跳板启动（其余 fd 在子进程一侧标 close-on-exec）、stdin 为 null、stdout/stderr 限行长限速率读走；整棵包目录树属主校验（安装器配套去掉组/其他写权限）；组没清完不收尸、stop 取消安全且以「组已空」为成功；`RestartPolicy::ready` 改为 `ran`（在进程结束时调用，否则计数永不清零）
   - **SUP-2 回调端点 + 握手驱动**：UDS 目录 `0700` 且校验属主、每代一个短路径、只 accept 一次；握手失败先写错误行再断连；`initialize` 的 id 改字符串；`rpc::serve` 加停止输入
   - **SUP-3 `Supervisor` 循环**：起 → 握手 → ready → 服务 → 崩溃退避/熔断 → 停，放在库里用 mock 模块测；每代新端口（D4）；FU-44/47/49/50；新建 `publish = false` 的 mock 模块 crate
   - **SUP-4 接进 daemon，解除挂载拒绝**：`Installed` 分进程内/进程外两种；绊线测试挪到真实路径；daemon 退出时有界地等所有 Supervisor 停完（否则子进程成孤儿）
