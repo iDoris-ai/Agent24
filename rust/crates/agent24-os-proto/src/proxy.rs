@@ -470,9 +470,17 @@ impl Drop for UpstreamConnection {
 /// other than a clean reuse drops the connection, which aborts the driver:
 /// nothing of a request outlives it inside the kernel (FU-47). An idle
 /// connection's driver also ends the moment its generation is revoked, so it
-/// never keeps a stopping module waiting out its grace; one in use finishes
-/// its exchange, whose answer the proxy discards (it answered the revocation
-/// already). Reuse keeps a stream of
+/// never keeps a stopping module waiting out its grace. One in use ends too,
+/// through the proxy: the revocation wins its race against `forward`, which is
+/// dropped with its connection, and the client gets `request_abandoned`.
+///
+/// Reuse does not make one caller's request the module's to answer with
+/// another's: the module writes every response on a connection, and a module
+/// that sends one unasked-for, to be read as the next request's, could have
+/// sent those bytes as that request's answer anyway. What the kernel
+/// guarantees of a response — its headers filtered, no kernel secret in it —
+/// holds for whatever response a connection carries (review of SUP-3b,
+/// round 4, assessed). Reuse keeps a stream of
 /// short requests from closing one socket each into TIME_WAIT (round 2);
 /// keying it by generation rather than by address keeps a connection from
 /// ever serving a later run (FU-50).
@@ -523,7 +531,7 @@ const MAX_IDLE_CONNECTIONS: usize = 8;
 
 /// How long, after a response is read, a connection may take to report ready
 /// for another request before it is closed instead of kept. Microseconds when
-/// the exchange is complete. Waited for off the response path.
+/// the exchange is complete.
 const IDLE_SETTLE: Duration = Duration::from_millis(50);
 
 /// A module proxy's idle connections, each to the generation it was opened for.
@@ -962,19 +970,19 @@ async fn forward(
         }
     };
     // Kept for reuse only after a bodiless request, and only if hyper reports
-    // the connection ready within a moment — waited for off the response path,
-    // so neither the client nor the concurrency permit pays for it (round 3).
-    // Otherwise it is dropped, and ends.
-    if reusable {
-        let idle = state.idle.clone();
-        tokio::spawn(async move {
-            if matches!(
-                tokio::time::timeout(IDLE_SETTLE, connection.sender.ready()).await,
-                Ok(Ok(()))
-            ) {
-                idle.put(connection);
-            }
-        });
+    // the connection ready within a moment; otherwise it is dropped, and ends.
+    // Waited for here, under this request's concurrency permit, so connections
+    // waiting to settle are bounded by the permits (a detached task per
+    // response was not bounded at all — review of SUP-3b, round 4). The wait
+    // costs microseconds when the exchange is complete; the full
+    // `IDLE_SETTLE` only for a connection that is neither ready nor closed.
+    if reusable
+        && matches!(
+            tokio::time::timeout(IDLE_SETTLE, connection.sender.ready()).await,
+            Ok(Ok(()))
+        )
+    {
+        state.idle.put(connection);
     }
 
     // The permit rides with the BYTES.
@@ -2621,11 +2629,7 @@ mod tests {
             let got = call(proxy, Method::GET, &format!("{NS}/{i}"), &[], "").await;
             assert_eq!(got.status, StatusCode::OK, "{}", got.body);
         }
-        // Returning a connection to the pool happens off the response path, so
-        // now and then the next request is quicker and opens another; one per
-        // request (20) is what reuse exists to prevent.
-        let peers = peers.lock().unwrap().len();
-        assert!(peers < 5, "{peers} connections for 20 requests");
+        assert_eq!(peers.lock().unwrap().len(), 1, "a connection per request");
     }
 
     /// FU-50: a connection is reused only by requests to the generation it was
@@ -2679,9 +2683,8 @@ mod tests {
         let proxy = serve(mount(Router::new(), NS, current.clone())).await;
         let got = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
         assert_eq!(got.status, StatusCode::OK);
-        // Let the connection reach the pool (off the response path), then
-        // revoke — and nothing else.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The connection is in the pool before the response is sent. Revoke —
+        // and nothing else.
         let _ = old.revoke();
         tokio::time::timeout(Duration::from_secs(5), closed)
             .await
