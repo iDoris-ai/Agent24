@@ -345,8 +345,15 @@ fn create_missing_dirs(path: &Path) -> Result<Vec<PathBuf>, InstallError> {
 /// with the common `umask 002` would create `0775` directories — and a source
 /// file that is `0664` is copied as `0664` — so the install would succeed and
 /// every start of the module fail (review of ME3-SUP slice 1, round 2).
+///
+/// `dst` is created NON-recursively: its parent must already be there. For the
+/// top call that parent is the packages root, checked by `ensure_packages_root`
+/// a moment earlier — and if a concurrent install's cleanup has since removed
+/// it (it was empty and that install created it), this install must fail
+/// rather than quietly re-create a root nobody recorded or checked (review of
+/// ME3-SUP slice 1, round 3‴).
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), InstallError> {
-    std::fs::create_dir_all(dst).map_err(|e| {
+    std::fs::create_dir(dst).map_err(|e| {
         InstallError::Filesystem(format!("could not create {}: {e}", dst.display()))
     })?;
     owner_write_only(dst)?;
@@ -458,6 +465,19 @@ mod tests {
             "the refused install left {} behind",
             t.path().join("a").display()
         );
+    }
+
+    /// The copy never creates the directory it is copying INTO: if the packages
+    /// root is gone — a concurrent install's cleanup removed it after this one
+    /// checked it — the copy fails instead of re-creating a root that nothing
+    /// recorded or checked.
+    #[test]
+    fn copying_into_a_root_that_is_gone_fails_and_does_not_recreate_it() {
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+        let gone = t.path().join("gone");
+        copy_tree(&src, &gone.join(".staging-x")).expect_err("the root is gone");
+        assert!(!gone.exists(), "the copy re-created the packages root");
     }
 
     /// The packages root is created `0700`, and an existing one anyone else can
