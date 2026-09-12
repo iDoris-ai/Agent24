@@ -333,13 +333,16 @@ const FD_DIR: &str = "/dev/fd";
 /// Where `close_fds`'s last-resort scan stops (exclusive): an fd at or above
 /// it is flagged only if the library took a complete path.
 ///
-/// Computed as close_fds 0.3.2 computes it (`iterfds/fditer.rs`):
-/// `sysconf(_SC_OPEN_MAX)` — the `RLIMIT_NOFILE` soft limit — clamped to
+/// Computed as close_fds 0.3.2 computes it on Linux and macOS
+/// (`iterfds/fditer.rs`; the BSDs take other branches, from the number of open
+/// fds): `sysconf(_SC_OPEN_MAX)` — the `RLIMIT_NOFILE` soft limit — clamped to
 /// 1024..=65536. The first version used a flat 65 536, which let a flagless fd
 /// between a low soft limit and 65 535 escape both the fallback and the check
-/// (PR-Daemon review of #178, F2). A limit that cannot be read counts as 1024,
-/// the smallest bound the library could use — so the check refuses more,
-/// never less. This mirrors the library's internals, which is why its version
+/// (PR-Daemon review of #178, F2). `getrlimit` cannot fail, so `None` means an
+/// unlimited soft limit, where `sysconf` returns -1 and the library also lands
+/// on 1024: the two bounds are EQUAL there. A soft limit above `i32::MAX` also
+/// counts as 1024 here while the library would take 65 536 — the one case
+/// where this refuses more than it must. This mirrors the library's internals, which is why its version
 /// is pinned (`=0.3.2`): an upgrade must re-read this. Checking each fd's
 /// close-on-exec flag directly would not depend on them, but reading the flag
 /// of an arbitrary fd number needs `unsafe` here.
@@ -1068,12 +1071,14 @@ mod tests {
         .await;
         let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut got = Vec::new();
+        // 30s, like every wait that includes an interpreter starting up (see
+        // `exited`): it returns the moment the module answers.
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
             conn.read_to_end(&mut got),
         )
         .await
-        .expect("no answer within 10s")
+        .expect("no answer within 30s")
         .unwrap();
         assert_eq!(got, b"hello from fd 3");
         exited(&mut p).await;
@@ -1373,7 +1378,10 @@ mod tests {
             (Some(4096), 4096),
             (Some(65_536), 65_536),
             (Some(10_000_000), 65_536),
+            // Unlimited: the library also uses 1024.
             (None, 1024),
+            // Above i32::MAX: conservative, below the library's 65536.
+            (Some(u64::from(u32::MAX)), 1024),
         ] {
             assert_eq!(scan_end_for(soft), bound, "soft limit {soft:?}");
         }
