@@ -40,6 +40,11 @@ enum Command {
 }
 
 fn main() -> std::process::ExitCode {
+    // Before anything else — logging, the runtime — can start a thread: when
+    // this process is a module's trampoline it becomes the module here, and
+    // flagging its fds close-on-exec is race-free only while it has one thread.
+    // An ordinary daemon start returns at once.
+    agent24_os_proto::launch::run_as_trampoline_if_asked();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

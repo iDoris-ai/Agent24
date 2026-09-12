@@ -212,6 +212,16 @@ impl RestartPolicy {
 /// SUP-1, round 1: the first version reaped in `wait_exit` and signalled the
 /// bare id afterwards, possibly much later.)
 ///
+/// # The daemon must not be PID 1, nor a subreaper
+///
+/// `stop` succeeds only once the group is empty, and a dead member stays in the
+/// group until its parent reaps it. A helper whose leader has died is
+/// reparented to init — which reaps it. If the daemon were init (PID 1 in a
+/// container) or a subreaper, those helpers would become ITS children, nothing
+/// here would reap them, and every `stop` would fail after [`REAP_TIMEOUT`]
+/// (review of SUP-1, round 2). Run it under a real init (`docker run --init`,
+/// `tini`) instead; reaping adopted children is not implemented.
+///
 /// # Dropping it
 ///
 /// Dropping one without a successful `stop` — including a `stop` future that
@@ -238,11 +248,42 @@ pub struct ModuleProcess {
     reaped: bool,
     /// `stop` succeeded; `Drop` has nothing to do.
     stopped: bool,
+    /// How the leader ended, once known.
+    exit: Option<Exit>,
     /// The tasks draining the child's stdout and stderr.
     drains: Vec<tokio::task::JoinHandle<()>>,
 }
 
-/// What stopping a module revoked.
+/// How a module's leader process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exit {
+    /// Its exit code, if it exited.
+    pub code: Option<i32>,
+    /// The signal that ended it, if one did.
+    pub signal: Option<i32>,
+}
+
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.code, self.signal) {
+            (Some(c), _) => write!(f, "exited with code {c}"),
+            (None, Some(s)) => write!(f, "killed by signal {s}"),
+            (None, None) => f.write_str("ended"),
+        }
+    }
+}
+
+impl From<std::process::ExitStatus> for Exit {
+    fn from(status: std::process::ExitStatus) -> Self {
+        use std::os::unix::process::ExitStatusExt;
+        Self {
+            code: status.code(),
+            signal: status.signal(),
+        }
+    }
+}
+
+/// What stopping a module revoked, and how it ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopReport {
     /// Requests in flight and already sent when the generation was revoked:
@@ -250,6 +291,8 @@ pub struct StopReport {
     pub abandoned: Vec<String>,
     /// Requests in flight but never sent: nothing ran.
     pub never_sent: Vec<String>,
+    /// How the leader ended.
+    pub exit: Exit,
 }
 
 /// [`ModuleProcess::stop`] could not make the group go away. The process comes
@@ -272,8 +315,12 @@ impl std::error::Error for StopFailed {
     }
 }
 
-/// How often the leader is polled for an exit it has not been reaped for.
+/// How often the leader is polled for an exit while `stop` waits on it.
 const EXIT_POLL: Duration = Duration::from_millis(20);
+
+/// While [`ModuleProcess::exited`] waits, the leader is checked on every
+/// `SIGCHLD` and, as a fallback, this often.
+const EXIT_FALLBACK_POLL: Duration = Duration::from_secs(1);
 
 /// After the group has been emptied, how long the output drains may take to
 /// reach end-of-file before they are aborted. A helper that left the group
@@ -301,6 +348,7 @@ impl ModuleProcess {
             revocation: None,
             reaped: false,
             stopped: false,
+            exit: None,
             drains,
         })
     }
@@ -331,34 +379,56 @@ impl ModuleProcess {
     /// revokes the generation, kills what is left of the group, and reaps).
     /// Cancel-safe.
     ///
+    /// Woken by `SIGCHLD` (with a slow fallback tick), not by polling: the
+    /// first version polled every 20ms, a wakeup and a syscall 50 times a
+    /// second per module for as long as the module lived (review of SUP-1,
+    /// round 2). The signal stream is registered BEFORE the first check, so an
+    /// exit between the check and the wait still wakes it.
+    ///
     /// # Errors
     ///
     /// The OS failed to report the child's state.
-    pub async fn exited(&mut self) -> std::io::Result<()> {
-        if self.reaped {
-            return Ok(());
+    pub async fn exited(&mut self) -> std::io::Result<Exit> {
+        let mut sigchld =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok();
+        loop {
+            if let Some(exit) = self.peek_exit()? {
+                return Ok(exit);
+            }
+            match sigchld.as_mut() {
+                Some(stream) => {
+                    let _ = tokio::time::timeout(EXIT_FALLBACK_POLL, stream.recv()).await;
+                }
+                None => tokio::time::sleep(EXIT_POLL).await,
+            }
         }
-        while !self.leader_exited()? {
-            tokio::time::sleep(EXIT_POLL).await;
-        }
-        Ok(())
     }
 
-    /// Has the leader exited? Asked with `WNOWAIT`, so it stays unreaped.
-    fn leader_exited(&self) -> std::io::Result<bool> {
+    /// How the leader ended, if it has — asked with `WNOWAIT`, so it stays
+    /// unreaped.
+    fn peek_exit(&mut self) -> std::io::Result<Option<Exit>> {
         use rustix::process::{WaitId, WaitidOptions, waitid};
-        if self.reaped {
-            return Ok(true);
+        if self.exit.is_some() {
+            return Ok(self.exit);
         }
         let status = waitid(
             WaitId::Pid(self.group),
             WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
         )?;
-        Ok(status.is_some())
+        self.exit = status.map(|st| Exit {
+            code: st.exit_status().and_then(|c| i32::try_from(c).ok()),
+            signal: st.terminating_signal().and_then(|c| i32::try_from(c).ok()),
+        });
+        Ok(self.exit)
+    }
+
+    /// Has the leader exited?
+    fn leader_exited(&mut self) -> std::io::Result<bool> {
+        Ok(self.reaped || self.peek_exit()?.is_some())
     }
 
     /// Wait up to `limit` for the leader to exit, unreaped. `true` if it did.
-    async fn leader_exits_within(&self, limit: Duration) -> std::io::Result<bool> {
+    async fn leader_exits_within(&mut self, limit: Duration) -> std::io::Result<bool> {
         let deadline = Instant::now().checked_add(limit);
         loop {
             if self.leader_exited()? {
@@ -432,6 +502,10 @@ impl ModuleProcess {
         Ok(StopReport {
             abandoned,
             never_sent,
+            exit: self.exit.unwrap_or(Exit {
+                code: None,
+                signal: None,
+            }),
         })
     }
 
@@ -457,7 +531,8 @@ impl ModuleProcess {
                     REAP_TIMEOUT.as_secs()
                 )));
             }
-            self.child.wait().await?;
+            let status = self.child.wait().await?;
+            self.exit = Some(Exit::from(status));
             self.reaped = true;
         }
         self.group_empties_within(REAP_TIMEOUT).await
@@ -725,11 +800,12 @@ mod tests {
         assert!(text.contains("503"), "{text}");
     }
 
-    fn start(dir: &std::path::Path, generation: Arc<Generation>) -> ModuleProcess {
+    async fn start(dir: &std::path::Path, generation: Arc<Generation>) -> ModuleProcess {
         let spawn_cmd = agent24_domain::SpawnCommand {
             command: "bin/mod".to_owned(),
             args: vec![],
         };
+        let trampoline = crate::launch::test_trampoline();
         crate::launch::spawn(
             crate::launch::LaunchSpec {
                 name: "t",
@@ -737,10 +813,12 @@ mod tests {
                 package_dir: dir,
                 data_dir: dir,
                 callback_sock: &dir.join("cb.sock"),
+                trampoline: &trampoline,
                 listener: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
             },
             generation,
         )
+        .await
         .expect("spawn")
     }
 
@@ -799,7 +877,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
-        let p = start(dir.path(), Generation::starting());
+        let p = start(dir.path(), Generation::starting()).await;
         helper_running(&marker).await;
 
         p.stop(Duration::from_secs(2)).await.expect("stop");
@@ -828,7 +906,7 @@ mod tests {
                 m = marker.display()
             ),
         );
-        let p = start(dir.path(), Generation::starting());
+        let p = start(dir.path(), Generation::starting()).await;
         helper_running(&marker).await;
 
         let start = Instant::now();
@@ -865,7 +943,7 @@ mod tests {
                 ready.display()
             ),
         );
-        let p = start(dir.path(), Generation::starting());
+        let p = start(dir.path(), Generation::starting()).await;
         let pid = Pid::from_raw(p.pid()).unwrap();
 
         // Wait until the trap is INSTALLED. Without this the test signals a
@@ -902,7 +980,7 @@ mod tests {
 
         let mut tokens = std::collections::BTreeSet::new();
         for _ in 0..5 {
-            let p = start(dir.path(), Generation::starting());
+            let p = start(dir.path(), Generation::starting()).await;
             tokens.insert(p.token().to_owned());
             p.stop(Duration::from_millis(100)).await.expect("stop");
         }
@@ -931,7 +1009,7 @@ mod tests {
         // Another generation, to show which one is revoked.
         let other = Generation::starting();
 
-        let p = start(dir.path(), generation.clone());
+        let p = start(dir.path(), generation.clone()).await;
         let report = p.stop(Duration::from_secs(2)).await.expect("stop");
 
         assert_eq!(generation.state(), crate::drain::DrainState::Revoked);
@@ -956,7 +1034,7 @@ mod tests {
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
         let generation = Generation::starting();
-        let p = start(dir.path(), generation.clone());
+        let p = start(dir.path(), generation.clone()).await;
         helper_running(&marker).await;
 
         drop(p);
@@ -978,7 +1056,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("bin")).unwrap();
         exe(&dir.path().join("bin/mod"), "#!/bin/sh\nexit 3\n");
-        let mut p = start(dir.path(), Generation::starting());
+        let mut p = start(dir.path(), Generation::starting()).await;
         let pid = Pid::from_raw(p.pid()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), p.exited())
             .await
@@ -1014,7 +1092,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
-        let p = start(dir.path(), Generation::starting());
+        let p = start(dir.path(), Generation::starting()).await;
         let group = Pid::from_raw(p.pid()).unwrap();
         helper_running(&marker).await;
         // Precondition: the group has members to begin with.
@@ -1040,7 +1118,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("helper-alive");
         module_with_helper(dir.path(), &marker);
-        let p = start(dir.path(), Generation::starting());
+        let p = start(dir.path(), Generation::starting()).await;
         helper_running(&marker).await;
         let mut joiner = std::process::Command::new("sleep")
             .arg("30")
@@ -1089,7 +1167,7 @@ mod tests {
             ),
         );
         let generation = Generation::starting();
-        let p = start(dir.path(), generation.clone());
+        let p = start(dir.path(), generation.clone()).await;
         helper_running(&marker).await;
 
         let cancelled =
@@ -1119,11 +1197,13 @@ mod tests {
              import os, time\n\
              if os.fork() == 0:\n\
              \x20   os.setsid()\n\
+             \x20   open('escaped', 'w').close()\n\
              \x20   time.sleep(4)\n\
              \x20   os._exit(0)\n\
-             time.sleep(0.2)\n",
+             while not os.path.exists('escaped'):\n\
+             \x20   time.sleep(0.01)\n",
         );
-        let mut p = start(dir.path(), Generation::starting());
+        let mut p = start(dir.path(), Generation::starting()).await;
         tokio::time::timeout(Duration::from_secs(10), p.exited())
             .await
             .expect("no exit")

@@ -279,10 +279,18 @@ fn remove_quietly(p: &Path) {
 /// `os_discovery` refuses a symlinked manifest: a package's identity is decided by
 /// a file inside it, and a link lets that file live outside the tree being
 /// validated.
+///
+/// Every directory and file in the copy loses its group and other WRITE bits.
+/// Starting a module refuses a package anyone but its owner can write
+/// (`agent24_os_proto::launch::resolve`), and without this a daemon running
+/// with the common `umask 002` would create `0775` directories — and a source
+/// file that is `0664` is copied as `0664` — so the install would succeed and
+/// every start of the module fail (review of ME3-SUP slice 1, round 2).
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), InstallError> {
     std::fs::create_dir_all(dst).map_err(|e| {
         InstallError::Filesystem(format!("could not create {}: {e}", dst.display()))
     })?;
+    owner_write_only(dst)?;
     let entries = std::fs::read_dir(src)
         .map_err(|e| InstallError::Source(format!("could not read {}: {e}", src.display())))?;
     for e in entries {
@@ -302,8 +310,30 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), InstallError> {
             std::fs::copy(e.path(), &to).map_err(|err| {
                 InstallError::Filesystem(format!("could not copy {}: {err}", e.path().display()))
             })?;
+            owner_write_only(&to)?;
         }
     }
+    Ok(())
+}
+
+/// Clear the group and other write bits of `path` (not a symlink: `copy_tree`
+/// refuses those).
+#[cfg(unix)]
+fn owner_write_only(path: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| InstallError::Filesystem(format!("could not stat {}: {e}", path.display())))?;
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o022)).map_err(
+            |e| InstallError::Filesystem(format!("could not restrict {}: {e}", path.display())),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn owner_write_only(_path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
@@ -328,6 +358,42 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeSet;
+
+    /// An installed package is writable by its owner only, whatever the source
+    /// allowed: a module is refused at start if anyone else can write its
+    /// package, so an install that kept a `0664` file (or made `0775`
+    /// directories under `umask 002`) would succeed and leave a package that
+    /// can never run.
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_package_is_writable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::write(src.join("lib/code.js"), "// code\n").unwrap();
+        std::fs::set_permissions(
+            src.join("lib/code.js"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        std::fs::set_permissions(src.join("lib"), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let dest = install(&src, &t.path().join("pkgs")).expect("install");
+
+        let mut seen = 0;
+        let mut pending = vec![dest];
+        while let Some(p) = pending.pop() {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+            assert_eq!(mode & 0o022, 0, "{} is {:o}", p.display(), mode);
+            seen += 1;
+            if p.is_dir() {
+                pending.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+            }
+        }
+        // The walk saw the tree: the package dir, lib/, the manifest and the code.
+        assert_eq!(seen, 4);
+    }
 
     // ---- the instrument, and its own negative controls -----------------------
     //

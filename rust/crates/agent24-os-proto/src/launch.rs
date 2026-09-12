@@ -67,10 +67,19 @@ pub enum LaunchError {
     /// A fresh token could not be produced. **Not** recoverable by reusing an
     /// old one — see [`mint_token`].
     NoEntropy(std::io::Error),
-    /// The package directory, or something on the way to the program inside
-    /// it, is not owned by this user or is writable by others — someone else
-    /// could replace what is about to run.
+    /// Something in the package tree is not owned by this user or is writable
+    /// by others — someone else could replace what is about to run.
     UnsafeOwnership(PathBuf),
+    /// Something in the package tree could not be inspected (unreadable, or it
+    /// vanished during the walk). Not an ownership verdict: the tree could not
+    /// be checked at all.
+    Inspect {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    /// The package tree has more than [`MAX_PACKAGE_ENTRIES`] entries — too
+    /// many to check at every start.
+    TooLarge { package: PathBuf },
 }
 
 impl std::fmt::Display for LaunchError {
@@ -85,6 +94,15 @@ impl std::fmt::Display for LaunchError {
             ),
             Self::Spawn(e) => write!(f, "could not start the module process: {e}"),
             Self::NoEntropy(e) => write!(f, "could not mint a handshake token: {e}"),
+            Self::Inspect { path, error } => {
+                write!(f, "could not inspect {}: {error}", path.display())
+            }
+            Self::TooLarge { package } => write!(
+                f,
+                "the package at {} has more than {MAX_PACKAGE_ENTRIES} entries; too many \
+                 to check at every start",
+                package.display()
+            ),
             Self::UnsafeOwnership(p) => write!(
                 f,
                 "{} is not owned by this user, or is writable by group or others; \
@@ -168,26 +186,39 @@ pub fn resolve(spawn: &SpawnCommand, package_dir: &Path) -> Result<PathBuf, Laun
     Ok(resolved)
 }
 
+/// Most entries a package tree may have and still be started: the tree is
+/// walked at every start, and an unbounded walk is a start that can take as
+/// long as the package's author likes. ⚖️
+pub const MAX_PACKAGE_ENTRIES: usize = 200_000;
+
 /// Every entry under `root`, `root` included, is owned by this user and not
 /// writable by group or others (symlinks: owner only). Does not follow
-/// symlinks, so a link pointing out of the tree is not walked into.
+/// symlinks, so a link pointing out of the tree is not walked into and a link
+/// loop is not a loop here.
 fn check_tree(root: &Path) -> Result<(), LaunchError> {
     use std::os::unix::fs::MetadataExt;
     let me = rustix::process::geteuid().as_raw();
+    let inspect = |path: &Path| {
+        let path = path.to_owned();
+        move |error| LaunchError::Inspect { path, error }
+    };
     let mut pending = vec![root.to_owned()];
+    let mut seen = 0usize;
     while let Some(path) = pending.pop() {
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|_| LaunchError::UnsafeOwnership(path.clone()))?;
+        seen += 1;
+        if seen > MAX_PACKAGE_ENTRIES {
+            return Err(LaunchError::TooLarge {
+                package: root.to_owned(),
+            });
+        }
+        let meta = std::fs::symlink_metadata(&path).map_err(inspect(&path))?;
         let writable_by_others = !meta.file_type().is_symlink() && meta.mode() & 0o022 != 0;
         if meta.uid() != me || writable_by_others {
             return Err(LaunchError::UnsafeOwnership(path));
         }
         if meta.is_dir() {
-            let entries =
-                std::fs::read_dir(&path).map_err(|_| LaunchError::UnsafeOwnership(path.clone()))?;
-            for entry in entries {
-                let entry = entry.map_err(|_| LaunchError::UnsafeOwnership(path.clone()))?;
-                pending.push(entry.path());
+            for entry in std::fs::read_dir(&path).map_err(inspect(&path))? {
+                pending.push(entry.map_err(inspect(&path))?.path());
             }
         }
     }
@@ -250,6 +281,85 @@ pub fn mint_token() -> Result<String, LaunchError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The program a module is started THROUGH: it marks every fd from 4 up
+/// close-on-exec and then execs the module (see
+/// [`run_as_trampoline_if_asked`]). The host binary — the daemon — must call
+/// that function first thing in `main`.
+///
+/// # Why a trampoline
+///
+/// A module must receive fds 0–3 and nothing else. Marking the daemon's own fds
+/// close-on-exec before the fork is not enough: another thread can open an fd
+/// without the flag between that and the fork (on macOS the standard library
+/// itself creates a spawn's pipes and only then flags them — measured, 1 in 60
+/// runs of this crate's tests, a module saw another spawn's pipe). Closing the
+/// window needs the child's side, between fork and exec, which is `unsafe` code
+/// in the daemon; a trampoline gets the child's side without it. It starts as a
+/// fresh process with one thread, so nothing can open an fd behind its back
+/// while it flags them, and `exec` does the closing (user decision, 2026-09-12,
+/// over an audited `unsafe` block and over accepting the window).
+#[derive(Debug, Clone)]
+pub struct Trampoline {
+    pub program: PathBuf,
+    pub args: Vec<std::ffi::OsString>,
+}
+
+/// Set on the trampoline to the absolute path of the module's program.
+pub const ENV_TRAMPOLINE_PROGRAM: &str = "A24_TRAMPOLINE_PROGRAM";
+/// Set on the trampoline to the module's arguments, as a JSON array of
+/// strings.
+pub const ENV_TRAMPOLINE_ARGS: &str = "A24_TRAMPOLINE_ARGS";
+
+/// If this process was started as a module's trampoline, become the module:
+/// mark every fd from 4 up close-on-exec, drop the two trampoline variables,
+/// and exec the module's program. Otherwise return at once.
+///
+/// **Call it first thing in the host's `main`**, before any thread exists —
+/// that is what makes flagging the fds race-free. If the exec fails the
+/// process exits with 127 and says why on stderr, which the kernel logs as the
+/// module's.
+pub fn run_as_trampoline_if_asked() {
+    use std::os::unix::process::CommandExt;
+    // Read by iterating: the CLI's scan of daemon sources looks for
+    // `env::var("…")` to learn what a service manager must pass through, and
+    // these two are set by the daemon for its own child, never by a user.
+    let (mut program, mut args) = (None, None);
+    for (k, v) in std::env::vars_os() {
+        if k == ENV_TRAMPOLINE_PROGRAM {
+            program = Some(v);
+        } else if k == ENV_TRAMPOLINE_ARGS {
+            args = Some(v);
+        }
+    }
+    let Some(program) = program else {
+        return;
+    };
+    let Some(args) = args
+        .and_then(|a| a.into_string().ok())
+        .and_then(|a| serde_json::from_str::<Vec<String>>(&a).ok())
+    else {
+        eprintln!("agent24: the module trampoline was started without readable arguments");
+        std::process::exit(127);
+    };
+    close_fds::set_fds_cloexec_threadsafe(LISTEN_FD + 1, &[]);
+    let error = std::process::Command::new(&program)
+        .args(&args)
+        .env_remove(ENV_TRAMPOLINE_PROGRAM)
+        .env_remove(ENV_TRAMPOLINE_ARGS)
+        // macOS CoreFoundation writes this into the environment of a process
+        // that initializes it — the trampoline sometimes does — and it would
+        // pass to the module as the one variable the contract does not name.
+        // Seen as a test failure only in some runs, which is the reason to take
+        // it out here rather than list it as allowed.
+        .env_remove("__CF_USER_TEXT_ENCODING")
+        .exec();
+    eprintln!(
+        "agent24: could not start the module program {}: {error}",
+        std::path::Path::new(&program).display()
+    );
+    std::process::exit(127);
+}
+
 /// Everything [`spawn`] needs besides the generation.
 #[derive(Debug)]
 pub struct LaunchSpec<'a> {
@@ -260,6 +370,8 @@ pub struct LaunchSpec<'a> {
     pub data_dir: &'a Path,
     /// Where the kernel listens for this process's callback connection.
     pub callback_sock: &'a Path,
+    /// What the module is started through (see [`Trampoline`]).
+    pub trampoline: &'a Trampoline,
     /// The socket the module serves its HTTP on. Passed as fd [`LISTEN_FD`]
     /// and closed in this process once the child has it — so when the module
     /// dies, a connection to its port is refused at once instead of queueing in
@@ -278,32 +390,38 @@ pub struct LaunchSpec<'a> {
 ///   variables. The token travels in the environment, not on the command line,
 ///   because arguments are world-readable through `ps`.
 /// - **fds 0–3 only**: stdin is `/dev/null`, stdout and stderr are pipes the
-///   kernel drains, and fd 3 is the listening socket. Every other fd of this
-///   process is marked close-on-exec just before the fork.
+///   kernel drains, fd 3 is the listening socket, and the [`Trampoline`] flags
+///   everything else close-on-exec before the module's program starts.
 ///
 /// Output is drained whether or not anyone reads the log: a pipe nobody reads
 /// fills at about 64 KiB, and a module blocked writing a log line looks exactly
 /// like one that hung — it would be killed for a startup timeout it did not
 /// cause.
 ///
-/// Must be called within a Tokio runtime.
+/// The package-tree check runs on a blocking thread: it is a walk of the whole
+/// tree, and must not stall the runtime it is called from.
 ///
 /// # Errors
 ///
 /// [`LaunchError`] — resolution, ownership, entropy, or the OS refusing.
-pub fn spawn(
+pub async fn spawn(
     spec: LaunchSpec<'_>,
     generation: Arc<Generation>,
 ) -> Result<ModuleProcess, LaunchError> {
     use command_fds::{CommandFdExt, FdMapping};
 
-    let program = resolve(spec.command, spec.package_dir)?;
+    let program = {
+        let (command, package) = (spec.command.clone(), spec.package_dir.to_owned());
+        tokio::task::spawn_blocking(move || resolve(&command, &package))
+            .await
+            .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))??
+    };
     let token = mint_token()?;
-    tokio::runtime::Handle::try_current()
+    let args = serde_json::to_string(&spec.command.args)
         .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))?;
 
-    let mut cmd = tokio::process::Command::new(&program);
-    cmd.args(&spec.command.args)
+    let mut cmd = tokio::process::Command::new(&spec.trampoline.program);
+    cmd.args(&spec.trampoline.args)
         .current_dir(spec.package_dir)
         .env_clear()
         .envs(std::env::vars_os().filter(|(k, _)| inherited(k)))
@@ -311,10 +429,13 @@ pub fn spawn(
         .env(ENV_CALLBACK_SOCK, spec.callback_sock)
         .env(ENV_HANDSHAKE_TOKEN, &token)
         .env(ENV_DATA_DIR, spec.data_dir)
+        .env(ENV_TRAMPOLINE_PROGRAM, &program)
+        .env(ENV_TRAMPOLINE_ARGS, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // 0 means "a new group whose id is this child's pid".
+        // 0 means "a new group whose id is this child's pid". The trampoline
+        // execs in place, so the module keeps that pid and that group.
         .process_group(0);
     cmd.fd_mappings(vec![FdMapping {
         parent_fd: spec.listener.into(),
@@ -322,28 +443,7 @@ pub fn spawn(
     }])
     .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))?;
 
-    // Every fd of ours from 3 up is marked close-on-exec before the fork, so
-    // the child keeps only 0–2 and the fd 3 mapped above. The standard library
-    // opens everything close-on-exec already; what this catches is an fd the
-    // daemon INHERITED without the flag (from a shell or a service manager),
-    // which would otherwise pass straight to a third party (review of SUP-1,
-    // round 1: the first version relied on the flag being there).
-    //
-    // Under a lock, because the flag is not always set atomically: on macOS
-    // (no `pipe2`) the standard library creates a spawn's stdio pipes and THEN
-    // marks them close-on-exec, and a fork in between inherits them. Measured:
-    // 1 in 60 runs of this crate's tests, a module saw an extra fd — another
-    // test's spawn's pipe. Between two modules that is one module holding the
-    // other's output. The lock makes this crate's spawns exclusive of each
-    // other; a spawn elsewhere in the daemon that does not take it can still
-    // race one of these.
-    let mut child = {
-        let _exclusive = SPAWN_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        close_fds::set_fds_cloexec_threadsafe(3, &[]);
-        cmd.spawn().map_err(LaunchError::Spawn)?
-    };
+    let mut child = cmd.spawn().map_err(LaunchError::Spawn)?;
     // The command owns our copy of the listener; dropping it closes that copy.
     drop(cmd);
     let mut drains = Vec::new();
@@ -364,8 +464,26 @@ pub fn spawn(
     ModuleProcess::new(child, generation, token, drains).map_err(LaunchError::Spawn)
 }
 
-/// Held across marking fds close-on-exec and forking (see [`spawn`]).
-static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// The test binary is its own trampoline: started with `--exact` on
+/// `launch::tests::trampoline_host`, it runs only that test, which becomes the
+/// module (and is a no-op in an ordinary test run).
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn test_trampoline() -> Trampoline {
+    Trampoline {
+        program: std::env::current_exe().expect("the test binary's path"),
+        args: [
+            "--exact",
+            "launch::tests::trampoline_host",
+            "--test-threads=1",
+            "--nocapture",
+            "-q",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    }
+}
 
 /// Longest line of module output logged; the rest of the line is dropped and
 /// the line marked as cut. ⚖️
@@ -624,17 +742,26 @@ mod tests {
         std::net::TcpListener::bind("127.0.0.1:0").unwrap()
     }
 
-    /// Start `command` from package `t` for a fresh generation, with a fresh
-    /// listener.
-    fn start(t: &Path, command: &SpawnCommand) -> ModuleProcess {
-        start_with(t, command, listener())
+    /// When this test binary is started as a module's trampoline (see
+    /// `test_trampoline`), this is the test it runs, and it becomes the module.
+    /// In an ordinary run it returns at once.
+    #[test]
+    fn trampoline_host() {
+        run_as_trampoline_if_asked();
     }
 
-    fn start_with(
+    /// Start `command` from package `t` for a fresh generation, with a fresh
+    /// listener.
+    async fn start(t: &Path, command: &SpawnCommand) -> ModuleProcess {
+        start_with(t, command, listener()).await
+    }
+
+    async fn start_with(
         t: &Path,
         command: &SpawnCommand,
         listener: std::net::TcpListener,
     ) -> ModuleProcess {
+        let trampoline = crate::launch::test_trampoline();
         spawn(
             LaunchSpec {
                 name: "t",
@@ -642,20 +769,22 @@ mod tests {
                 package_dir: t,
                 data_dir: &t.join("data"),
                 callback_sock: &t.join("cb.sock"),
+                trampoline: &trampoline,
                 listener,
             },
             Generation::starting(),
         )
+        .await
         .expect("spawn")
     }
 
     /// Wait for the leader to exit, within a bound — a test that waits without
     /// one reports a hang as silence.
-    async fn exited(p: &mut ModuleProcess) {
+    async fn exited(p: &mut ModuleProcess) -> crate::supervise::Exit {
         tokio::time::timeout(std::time::Duration::from_secs(10), p.exited())
             .await
             .expect("the module did not exit within 10s")
-            .unwrap();
+            .unwrap()
     }
 
     fn read(t: &Path, name: &str) -> String {
@@ -674,7 +803,7 @@ mod tests {
             &t.path().join("bin/mod"),
             "#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' > out\n",
         );
-        let mut p = start(t.path(), &cmd("bin/mod", &[]));
+        let mut p = start(t.path(), &cmd("bin/mod", &[])).await;
         exited(&mut p).await;
         let child_pgid: i32 = read(t.path(), "out").trim().parse().unwrap();
 
@@ -703,7 +832,7 @@ mod tests {
             &t.path().join("bin/mod"),
             "#!/bin/sh\n{ echo \"$A24_HANDSHAKE_TOKEN\"; echo \"$@\"; } > out\n",
         );
-        let mut p = start(t.path(), &cmd("bin/mod", &["--flag"]));
+        let mut p = start(t.path(), &cmd("bin/mod", &["--flag"])).await;
         let token = p.token().to_owned();
         exited(&mut p).await;
         let out = read(t.path(), "out");
@@ -753,7 +882,7 @@ mod tests {
             "precondition: the parent has a variable the child must not inherit"
         );
         let t = pkg();
-        let mut p = start(t.path(), &cmd("sh", &["-c", "env > out"]));
+        let mut p = start(t.path(), &cmd("sh", &["-c", "env > out"])).await;
         exited(&mut p).await;
         let out = read(t.path(), "out");
         let env: std::collections::BTreeMap<&str, &str> =
@@ -814,7 +943,8 @@ mod tests {
                  c.close()",
             ),
             l,
-        );
+        )
+        .await;
         let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut got = Vec::new();
         tokio::time::timeout(
@@ -847,7 +977,7 @@ mod tests {
             let t = pkg();
             let l = listener();
             let addr = l.local_addr().unwrap();
-            let mut p = start_with(t.path(), &cmd("sh", &["-c", "exit 0"]), l);
+            let mut p = start_with(t.path(), &cmd("sh", &["-c", "exit 0"]), l).await;
             exited(&mut p).await;
             let _ = p.stop(std::time::Duration::from_millis(100)).await;
             let connect = tokio::time::timeout(
@@ -880,7 +1010,10 @@ mod tests {
         let high = rustix::io::fcntl_dupfd_cloexec(&file, 700).unwrap();
         rustix::io::fcntl_setfd(&high, rustix::io::FdFlags::empty()).unwrap();
         let number = std::os::fd::AsRawFd::as_raw_fd(&high);
-        assert!(number >= 700, "precondition: a high fd, got {number}");
+        assert!(
+            (700..1024).contains(&number),
+            "precondition: a high fd the probe below scans, got {number}"
+        );
         let mut p = start(
             t.path(),
             &python(
@@ -894,7 +1027,8 @@ mod tests {
                  fds = [fd for fd in range(0, 1024) if is_open(fd)]\n\
                  open('out','w').write(' '.join(map(str, fds)))",
             ),
-        );
+        )
+        .await;
         exited(&mut p).await;
         // 0–3 open is also the control: the probe sees open fds.
         assert_eq!(read(t.path(), "out"), "0 1 2 3");
@@ -914,7 +1048,8 @@ mod tests {
                 "sh",
                 &["-c", "head -c 2097152 /dev/zero >&2; echo done > out"],
             ),
-        );
+        )
+        .await;
         exited(&mut p).await;
         assert_eq!(read(t.path(), "out").trim(), "done");
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
@@ -1019,5 +1154,89 @@ mod tests {
         assert_eq!(limit.roll(t0 + std::time::Duration::from_secs(1)), Some(50));
         assert!(limit.admit());
         assert_eq!(limit.flush(), None);
+    }
+
+    /// The trampoline flags fds close-on-exec in the CHILD, so a module gets
+    /// 0–3 even while other threads here keep opening fds without the flag —
+    /// the window that marking the daemon's own fds before the fork left open
+    /// (review of SUP-1, round 2). Twelve modules start at once while a thread
+    /// churns flagless fds; every one reports exactly 0–3.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn modules_started_while_fds_churn_still_get_only_stdio_and_the_listener() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(f) = std::fs::File::open("/dev/null") {
+                        let _ = rustix::io::fcntl_setfd(&f, rustix::io::FdFlags::empty());
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        });
+        let report = "import os\n\
+             def is_open(fd):\n\
+             \x20   try:\n\
+             \x20       os.fstat(fd)\n\
+             \x20       return True\n\
+             \x20   except OSError:\n\
+             \x20       return False\n\
+             fds = [fd for fd in range(0, 1024) if is_open(fd)]\n\
+             open('out','w').write(' '.join(map(str, fds)))";
+        let dirs: Vec<tempfile::TempDir> = (0..12).map(|_| pkg()).collect();
+        let command = python(report);
+        let mut starting = tokio::task::JoinSet::new();
+        for d in &dirs {
+            let (path, command) = (d.path().to_owned(), command.clone());
+            starting.spawn(async move { start(&path, &command).await });
+        }
+        let mut procs = Vec::new();
+        while let Some(p) = starting.join_next().await {
+            procs.push(p.unwrap());
+        }
+        for p in &mut procs {
+            exited(p).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+        for d in &dirs {
+            assert_eq!(read(d.path(), "out"), "0 1 2 3", "{}", d.path().display());
+        }
+        for p in procs {
+            let _ = p.stop(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// What the module's exit looked like comes back: `exited` reports it, and
+    /// so does `stop`.
+    #[tokio::test]
+    async fn the_exit_code_is_reported() {
+        let t = pkg();
+        let mut p = start(t.path(), &cmd("sh", &["-c", "exit 3"])).await;
+        let exit = exited(&mut p).await;
+        assert_eq!((exit.code, exit.signal), (Some(3), None));
+        let report = p.stop(std::time::Duration::from_millis(100)).await.unwrap();
+        assert_eq!(report.exit.code, Some(3));
+    }
+
+    /// A tree that cannot be read is reported as exactly that — not as an
+    /// ownership verdict, which would send the operator after the wrong cause
+    /// (review of SUP-1, round 2).
+    #[test]
+    fn an_unreadable_directory_is_an_inspection_error_not_an_ownership_one() {
+        let t = pkg();
+        exe(&t.path().join("bin/mod"), "#!/bin/sh\nexit 0\n");
+        let locked = t.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = resolve(&cmd("bin/mod", &[]), t.path()).expect_err("unreadable");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(&err, LaunchError::Inspect { path, .. } if path.ends_with("locked")),
+            "{err:?}"
+        );
+        // Control: readable again, and it passes.
+        resolve(&cmd("bin/mod", &[]), t.path()).expect("readable");
     }
 }

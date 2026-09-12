@@ -33,12 +33,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The module trampoline (`run_as_trampoline_if_asked`, first thing in `main`):
+# a module is started through this binary so its fds are flagged
+# close-on-exec in the child (ME3-SUP slice 1). The rest of the crate — the
+# proxy, the supervisor — is wired in by later slices.
+agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 
 [dev-dependencies]
-# ME-3b-4: the constrained proxy is mounted only by a test so far — the address
-# it needs comes from ME-3b-3's supervisor, which does not hand one over yet.
-# This moves to [dependencies] with that consumer.
-agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 tempfile = "3"
 sha2 = "0.10"
 tower = { version = "0.5", features = ["util"] }
