@@ -498,7 +498,7 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &dyn Fn(&str) -> boo
 
 /// Longest error message [`serve`] writes, whoever wrote the message — the
 /// `…` that marks a cut included.
-const MAX_MESSAGE_BYTES: usize = 1024;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 1024;
 
 /// Longest string echoed back from a request into an error message. A message
 /// that repeats an attacker-chosen string in full could itself exceed the frame
@@ -509,7 +509,7 @@ fn clip(s: &str) -> String {
     clip_to(s, ECHO_LIMIT)
 }
 
-fn clip_to(s: &str, limit: usize) -> String {
+pub(crate) fn clip_to(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_owned();
     }
@@ -532,7 +532,7 @@ fn params_only(params: &Value, allowed: &[&str]) -> bool {
 /// `{"params":{"x":1,"x":2},"id":"a","id":"b"}` is an envelope problem, not a
 /// params problem answered with whichever id parsed last. Call only on bytes
 /// already known to be JSON.
-fn find_duplicate_key(bytes: &[u8]) -> Option<Vec<String>> {
+pub(crate) fn find_duplicate_key(bytes: &[u8]) -> Option<Vec<String>> {
     scan_duplicates(bytes).0
 }
 
@@ -687,6 +687,10 @@ pub enum Ended {
     /// Writing a response failed, or took longer than `write_timeout` — which
     /// is also how a module that stopped reading shows up.
     WriteFailed(std::io::Error),
+    /// The `stop` given to [`serve_until`] fired — the generation this
+    /// connection belongs to was revoked, say. Handlers are aborted and waited
+    /// for exactly as on any other end.
+    Stopped,
 }
 
 /// Read one frame from an async reader — [`crate::frame::read_frame`]'s rules,
@@ -809,6 +813,26 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    serve_until(reader, writer, methods, limits, std::future::pending()).await
+}
+
+/// [`serve`], and also end — with [`Ended::Stopped`] — when `stop` resolves.
+/// `stop` wins over everything else that is ready at the same moment, frames
+/// included: a loop biased to frames would otherwise never see it while the
+/// peer keeps sending. On return, as with [`serve`], every handler future has
+/// been dropped and the writer has stopped.
+pub async fn serve_until<R, W, S>(
+    reader: R,
+    writer: W,
+    methods: Methods,
+    limits: Limits,
+    stop: S,
+) -> Ended
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    S: std::future::Future<Output = ()>,
+{
     let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<Frame>(1);
     let _reader = AbortOnDrop(tokio::spawn(async move {
         let mut reader = reader;
@@ -820,7 +844,7 @@ where
             }
         }
     }));
-    run(&mut frames_rx, writer, methods, limits).await
+    run_until(&mut frames_rx, writer, methods, limits, stop).await
 }
 
 /// One reader event: a frame, or how the stream ended.
@@ -832,6 +856,7 @@ type Frame = Result<Vec<u8>, FrameError>;
 /// another thread (a frame ready at the reaping step; frames ready every time
 /// the loop looks) happen on every run instead of on some — and, the channel
 /// being borrowed, can count afterwards how many frames were never read.
+#[cfg(test)]
 async fn run<W>(
     frames_rx: &mut tokio::sync::mpsc::Receiver<Frame>,
     writer: W,
@@ -841,6 +866,22 @@ async fn run<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    run_until(frames_rx, writer, methods, limits, std::future::pending()).await
+}
+
+/// [`run`] with a stop signal (see [`serve_until`]).
+async fn run_until<W, S>(
+    frames_rx: &mut tokio::sync::mpsc::Receiver<Frame>,
+    writer: W,
+    methods: Methods,
+    limits: Limits,
+    stop: S,
+) -> Ended
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    S: std::future::Future<Output = ()>,
+{
+    let mut stop = std::pin::pin!(stop);
     // The response queue is bounded by BYTES, and the bound is enforced by not
     // READING, never by waiting: while more than `QUEUE_HIGH_WATER` bytes are
     // waiting to be written, no new frame is read — but finished calls are still
@@ -909,6 +950,19 @@ where
     let mut frames_in_a_row = 0usize;
 
     let ended = 'conn: loop {
+        // The stop, looked at first and without waiting, on EVERY turn. The
+        // reaping step below does not go through the select, and it dispatches
+        // the frame it takes before it `continue`s back there — so a stop that
+        // became ready while frame 16 was handled would otherwise let frame 17
+        // be dispatched, and its handler run up to its first await, after the
+        // generation was revoked. (This check was removed once as redundant with
+        // the select's stop branch; review of ME3-SUP slice 2, round 1, showed
+        // why it is not.)
+        if std::future::poll_fn(|cx| std::task::Poll::Ready(stop.as_mut().poll(cx).is_ready()))
+            .await
+        {
+            break Ended::Stopped;
+        }
         if frames_in_a_row >= FRAMES_BEFORE_REAPING {
             frames_in_a_row = 0;
             // Under the high-water mark only, as in the select below: taking a
@@ -952,6 +1006,9 @@ where
             queued.load(std::sync::atomic::Ordering::SeqCst) >= limits.queue_high_water;
         let response = tokio::select! {
             biased;
+            // First here too: biased to frames, a stop placed after them would
+            // never wake this select while the peer keeps sending.
+            () = &mut stop => break 'conn Ended::Stopped,
             frame = frames_rx.recv(), if !backpressured => match frame {
                 Some(Ok(bytes)) => {
                     frames_in_a_row += 1;
@@ -2630,5 +2687,136 @@ mod tests {
             "{} bytes",
             message.len()
         );
+    }
+
+    /// `serve_until` ends with `Stopped` when its stop fires — and, as on every
+    /// other end, the handler in flight has been dropped by then.
+    #[tokio::test]
+    async fn serve_until_stops_when_told_and_drops_what_was_running() {
+        let f = fixture();
+        let hang = f.hang.clone();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server);
+        let (_cr, mut cw) = tokio::io::split(client);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve_until(
+            BufReader::new(sr),
+            sw,
+            f.methods,
+            TEST_LIMITS,
+            async {
+                let _ = rx.await;
+            },
+        ));
+        cw.write_all(format!("{}\n", req("h", "t/hang", json!({}))).as_bytes())
+            .await
+            .unwrap();
+        while hang.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Control: not stopped yet, still serving.
+        assert!(!task.is_finished());
+        tx.send(()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("did not stop")
+            .unwrap();
+        assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+        assert!(
+            hang.dropped.load(Ordering::SeqCst),
+            "the handler outlived the stop"
+        );
+    }
+
+    /// A stop wins over frames that are ready at the same time: with thousands
+    /// queued and the stop already fired, the loop reads almost none of them.
+    /// (Biased to frames, it would otherwise never look.)
+    #[tokio::test]
+    async fn a_stop_is_seen_even_while_frames_keep_coming() {
+        const NOTES: usize = 10_000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(NOTES);
+        let note = serde_json::to_vec(&json!({"jsonrpc": "2.0", "method": "t/none"})).unwrap();
+        for _ in 0..NOTES {
+            tx.send(Ok(note.clone())).await.unwrap();
+        }
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                &mut rx,
+                tokio::io::sink(),
+                fixture().methods,
+                TEST_LIMITS,
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("never stopped");
+        assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+        assert!(
+            rx.len() > NOTES - 16,
+            "read {} frames after the stop",
+            NOTES - rx.len()
+        );
+    }
+
+    /// Fires a stop from inside its params check — i.e. while the loop is
+    /// handling this frame, synchronously.
+    struct TriggerStop {
+        stop: Arc<tokio::sync::Notify>,
+    }
+    impl Handler for TriggerStop {
+        fn check_params(&self, _: &Value) -> Result<(), String> {
+            self.stop.notify_one();
+            Ok(())
+        }
+        fn call(&self, _: Value) -> CallFuture {
+            Box::pin(async move { Ok(Value::Null) })
+        }
+    }
+
+    /// A stop that becomes ready while frame 16 is handled is honoured before
+    /// frame 17 is dispatched — even though frame 17 is taken by the reaping
+    /// step, which does not go through the select. The probe records whether
+    /// frame 17's params check ever ran (review of ME3-SUP slice 2, round 1).
+    #[tokio::test]
+    async fn a_stop_during_the_sixteenth_frame_is_seen_before_the_seventeenth() {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(AtomicBool::new(false));
+        let methods = fixture()
+            .methods
+            .with("t/trigger", Arc::new(TriggerStop { stop: stop.clone() }))
+            .with("t/probe", Arc::new(Probe { seen: seen.clone() }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        for i in 0..15 {
+            tx.send(frame_of(&req(&format!("{i:02}"), "t/none", json!({}))))
+                .await
+                .unwrap();
+        }
+        tx.send(frame_of(&req("15", "t/trigger", json!({}))))
+            .await
+            .unwrap();
+        tx.send(frame_of(&req("16", "t/probe", json!({}))))
+            .await
+            .unwrap();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                &mut rx,
+                tokio::io::sink(),
+                methods,
+                TEST_LIMITS,
+                async move {
+                    stop.notified().await;
+                },
+            ),
+        )
+        .await
+        .expect("never stopped");
+        assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+        assert!(
+            !seen.load(Ordering::SeqCst),
+            "frame 17 was dispatched after the stop"
+        );
+        assert_eq!(rx.len(), 1, "precondition: frame 17 was there to be taken");
     }
 }
