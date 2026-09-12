@@ -19,6 +19,7 @@
 //! are not decided by whoever writes the code.
 
 pub mod drain;
+pub mod endpoint;
 pub mod frame;
 pub mod initialize;
 pub mod launch;

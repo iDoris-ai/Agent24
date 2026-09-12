@@ -427,6 +427,20 @@ impl Generation {
     }
 }
 
+impl Generation {
+    /// Resolves once this generation is revoked — immediately if it already
+    /// has been. For whoever serves this generation's callback connection: it
+    /// stops when the generation does (FU-49 — the connection is bound to the
+    /// generation that completed its handshake). `watch`, so a revocation that
+    /// lands before anyone waits is not a lost wakeup.
+    pub async fn revoked(&self) {
+        let mut rx = self.revoked.subscribe();
+        // The sender lives in `self`; an error here cannot happen while `self`
+        // is borrowed, and is read as "never revoked" rather than as revoked.
+        let _ = rx.wait_for(|revoked| *revoked).await;
+    }
+}
+
 /// Returned by [`InFlight::finish`] when the generation was revoked while the
 /// request was in flight: whatever the module answered, the kernel does not
 /// pass it on as a success.
@@ -848,5 +862,23 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(codes.len(), 4);
+    }
+
+    /// `Generation::revoked` waits until the generation is revoked — not
+    /// before (the control: still pending) — and returns at once after, even
+    /// for a waiter that arrives late.
+    #[tokio::test]
+    async fn waiting_for_a_revocation_ends_when_it_happens() {
+        let g = Generation::starting();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), g.revoked())
+                .await
+                .is_err(),
+            "resolved before any revocation"
+        );
+        let _ = g.revoke();
+        tokio::time::timeout(std::time::Duration::from_secs(1), g.revoked())
+            .await
+            .expect("a late waiter was not told");
     }
 }

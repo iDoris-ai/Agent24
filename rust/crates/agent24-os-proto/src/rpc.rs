@@ -687,6 +687,10 @@ pub enum Ended {
     /// Writing a response failed, or took longer than `write_timeout` — which
     /// is also how a module that stopped reading shows up.
     WriteFailed(std::io::Error),
+    /// The `stop` given to [`serve_until`] fired — the generation this
+    /// connection belongs to was revoked, say. Handlers are aborted and waited
+    /// for exactly as on any other end.
+    Stopped,
 }
 
 /// Read one frame from an async reader — [`crate::frame::read_frame`]'s rules,
@@ -809,6 +813,26 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    serve_until(reader, writer, methods, limits, std::future::pending()).await
+}
+
+/// [`serve`], and also end — with [`Ended::Stopped`] — when `stop` resolves.
+/// `stop` wins over everything else that is ready at the same moment, frames
+/// included: a loop biased to frames would otherwise never see it while the
+/// peer keeps sending. On return, as with [`serve`], every handler future has
+/// been dropped and the writer has stopped.
+pub async fn serve_until<R, W, S>(
+    reader: R,
+    writer: W,
+    methods: Methods,
+    limits: Limits,
+    stop: S,
+) -> Ended
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    S: std::future::Future<Output = ()>,
+{
     let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<Frame>(1);
     let _reader = AbortOnDrop(tokio::spawn(async move {
         let mut reader = reader;
@@ -820,7 +844,7 @@ where
             }
         }
     }));
-    run(&mut frames_rx, writer, methods, limits).await
+    run_until(&mut frames_rx, writer, methods, limits, stop).await
 }
 
 /// One reader event: a frame, or how the stream ended.
@@ -832,6 +856,7 @@ type Frame = Result<Vec<u8>, FrameError>;
 /// another thread (a frame ready at the reaping step; frames ready every time
 /// the loop looks) happen on every run instead of on some — and, the channel
 /// being borrowed, can count afterwards how many frames were never read.
+#[cfg(test)]
 async fn run<W>(
     frames_rx: &mut tokio::sync::mpsc::Receiver<Frame>,
     writer: W,
@@ -841,6 +866,22 @@ async fn run<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    run_until(frames_rx, writer, methods, limits, std::future::pending()).await
+}
+
+/// [`run`] with a stop signal (see [`serve_until`]).
+async fn run_until<W, S>(
+    frames_rx: &mut tokio::sync::mpsc::Receiver<Frame>,
+    writer: W,
+    methods: Methods,
+    limits: Limits,
+    stop: S,
+) -> Ended
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    S: std::future::Future<Output = ()>,
+{
+    let mut stop = std::pin::pin!(stop);
     // The response queue is bounded by BYTES, and the bound is enforced by not
     // READING, never by waiting: while more than `QUEUE_HIGH_WATER` bytes are
     // waiting to be written, no new frame is read — but finished calls are still
@@ -952,6 +993,10 @@ where
             queued.load(std::sync::atomic::Ordering::SeqCst) >= limits.queue_high_water;
         let response = tokio::select! {
             biased;
+            // First: biased to frames, a stop placed after them would never be
+            // seen while the peer keeps sending. (The reaping step every 16
+            // frames skips this select, but `continue`s straight back to it.)
+            () = &mut stop => break 'conn Ended::Stopped,
             frame = frames_rx.recv(), if !backpressured => match frame {
                 Some(Ok(bytes)) => {
                     frames_in_a_row += 1;
@@ -2629,6 +2674,76 @@ mod tests {
             message.len() <= MAX_MESSAGE_BYTES,
             "{} bytes",
             message.len()
+        );
+    }
+
+    /// `serve_until` ends with `Stopped` when its stop fires — and, as on every
+    /// other end, the handler in flight has been dropped by then.
+    #[tokio::test]
+    async fn serve_until_stops_when_told_and_drops_what_was_running() {
+        let f = fixture();
+        let hang = f.hang.clone();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server);
+        let (_cr, mut cw) = tokio::io::split(client);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve_until(
+            BufReader::new(sr),
+            sw,
+            f.methods,
+            TEST_LIMITS,
+            async {
+                let _ = rx.await;
+            },
+        ));
+        cw.write_all(format!("{}\n", req("h", "t/hang", json!({}))).as_bytes())
+            .await
+            .unwrap();
+        while hang.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Control: not stopped yet, still serving.
+        assert!(!task.is_finished());
+        tx.send(()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("did not stop")
+            .unwrap();
+        assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+        assert!(
+            hang.dropped.load(Ordering::SeqCst),
+            "the handler outlived the stop"
+        );
+    }
+
+    /// A stop wins over frames that are ready at the same time: with thousands
+    /// queued and the stop already fired, the loop reads almost none of them.
+    /// (Biased to frames, it would otherwise never look.)
+    #[tokio::test]
+    async fn a_stop_is_seen_even_while_frames_keep_coming() {
+        const NOTES: usize = 10_000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(NOTES);
+        let note = serde_json::to_vec(&json!({"jsonrpc": "2.0", "method": "t/none"})).unwrap();
+        for _ in 0..NOTES {
+            tx.send(Ok(note.clone())).await.unwrap();
+        }
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_until(
+                &mut rx,
+                tokio::io::sink(),
+                fixture().methods,
+                TEST_LIMITS,
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("never stopped");
+        assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+        assert!(
+            rx.len() > NOTES - 16,
+            "read {} frames after the stop",
+            NOTES - rx.len()
         );
     }
 }

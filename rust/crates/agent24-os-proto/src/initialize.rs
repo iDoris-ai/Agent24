@@ -82,8 +82,9 @@ pub struct InitializeRequest {
     pub jsonrpc: String,
     /// Must be [`INITIALIZE_METHOD`].
     pub method: String,
-    /// Correlation id, echoed in the response.
-    pub id: u64,
+    /// Correlation id, echoed in the response. A string — SPEC §3: *"请求 ID
+    /// 类型：字符串"* — as on the rest of the callback channel.
+    pub id: String,
     /// See [`InitializeParams`].
     pub params: InitializeParams,
 }
@@ -229,7 +230,7 @@ pub struct Expectation {
 ///
 /// See [`HandshakeError`]. Every one of them means the connection must be closed
 /// by the caller; this function has no way to do that itself.
-pub fn accept(frame: &[u8], expect: &Expectation) -> Result<InitializeResult, HandshakeError> {
+pub fn accept(frame: &[u8], expect: &Expectation) -> Result<Accepted, HandshakeError> {
     let req: InitializeRequest = match serde_json::from_slice(frame) {
         Ok(r) => r,
         Err(e) => return Err(classify(frame, &e)),
@@ -246,6 +247,12 @@ pub fn accept(frame: &[u8], expect: &Expectation) -> Result<InitializeResult, Ha
             req.method
         )));
     }
+    if req.id.len() > crate::rpc::MAX_ID_BYTES {
+        return Err(HandshakeError::NotInitialize(format!(
+            "an id longer than {} bytes",
+            crate::rpc::MAX_ID_BYTES
+        )));
+    }
     // Identity before secret: a module that read a different manifest is not a
     // module whose token is worth comparing.
     if req.params.module != expect.module || req.params.manifest_digest != expect.manifest_digest {
@@ -259,10 +266,81 @@ pub fn accept(frame: &[u8], expect: &Expectation) -> Result<InitializeResult, Ha
     }
     let chosen = version::negotiate(req.params.protocol_versions, expect.kernel_versions)
         .map_err(HandshakeError::VersionMismatch)?;
-    Ok(InitializeResult {
-        protocol_version: chosen,
-        offer: expect.offer.clone(),
+    Ok(Accepted {
+        id: req.id,
+        result: InitializeResult {
+            protocol_version: chosen,
+            offer: expect.offer.clone(),
+        },
     })
+}
+
+/// A handshake that passed: the request's id, to answer under, and the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Accepted {
+    pub id: String,
+    pub result: InitializeResult,
+}
+
+/// The id of a first frame, if it has a usable one — for answering a REFUSED
+/// handshake under the id the module sent. `None` (answered with `id: null`)
+/// for a frame that is not JSON, has no id, or whose id is not a string within
+/// [`crate::rpc::MAX_ID_BYTES`].
+#[must_use]
+pub fn id_of(frame: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(frame).ok()?;
+    let id = v.get("id")?.as_str()?;
+    (id.len() <= crate::rpc::MAX_ID_BYTES).then(|| id.to_owned())
+}
+
+/// The line answering a handshake that passed.
+#[must_use]
+pub fn success_line(accepted: &Accepted) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": accepted.id,
+        "result": accepted.result,
+    }))
+    .unwrap_or_default();
+    line.push(b'\n');
+    line
+}
+
+/// The line answering a refused handshake, sent before the kernel disconnects
+/// (SPEC §3: any failure during the handshake disconnects — after saying why).
+/// `data.kind` for the application-level refusals; for a version mismatch,
+/// both ranges too (SPEC §8: *"把两边区间都放进错误"*).
+#[must_use]
+pub fn error_line(id: Option<&str>, err: &HandshakeError) -> Vec<u8> {
+    let mut error = serde_json::json!({
+        "code": err.code(),
+        "message": err.to_string(),
+    });
+    if let Some(kind) = err.kind() {
+        let range = |r: VersionRange| serde_json::json!({"min": r.min(), "max": r.max()});
+        let mut data = serde_json::json!({ "kind": kind });
+        if let HandshakeError::VersionMismatch(m) = err {
+            match m {
+                VersionMismatch::NotDeclared { kernel } => {
+                    data["module"] = serde_json::Value::Null;
+                    data["kernel"] = range(*kernel);
+                }
+                VersionMismatch::NoOverlap { module, kernel } => {
+                    data["module"] = range(*module);
+                    data["kernel"] = range(*kernel);
+                }
+            }
+        }
+        error["data"] = data;
+    }
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": error,
+    }))
+    .unwrap_or_default();
+    line.push(b'\n');
+    line
 }
 
 /// Decide whether a `serde_json` failure was "not JSON" or "not the right
@@ -279,6 +357,11 @@ fn classify(frame: &[u8], e: &serde_json::Error) -> HandshakeError {
     // -32600; anything else that failed the strict shape is -32602.
     match serde_json::from_slice::<serde_json::Value>(frame) {
         Ok(v) => {
+            // A non-string id is an invalid REQUEST (-32600), as on the rest of
+            // the channel — not bad params.
+            if v.get("id").is_some_and(|id| !id.is_string()) {
+                return HandshakeError::NotInitialize("an id that is not a string".to_owned());
+            }
             let method = v.get("method").and_then(serde_json::Value::as_str);
             match method {
                 Some(INITIALIZE_METHOD) => HandshakeError::BadParams(e.to_string()),
@@ -310,18 +393,36 @@ mod tests {
     }
 
     fn good_frame() -> String {
-        r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{
+        r#"{"jsonrpc":"2.0","method":"initialize","id":"1","params":{
             "protocol_versions":{"min":1,"max":1},
             "module":"cos72","manifest_digest":"sha256:abc",
             "auth_token":"s3cret","capabilities":["events"]}}"#
             .to_owned()
     }
 
+    /// SPEC §3: *"请求 ID 类型：字符串"*. A numeric id is an invalid request
+    /// (-32600), as it is on the rest of the channel; a string is accepted (the
+    /// control); an id past the length limit is refused too.
+    #[test]
+    fn the_handshake_id_is_a_string() {
+        let numeric = good_frame().replace(r#""id":"1""#, r#""id":1"#);
+        let err = accept(numeric.as_bytes(), &expectation()).expect_err("a numeric id");
+        assert_eq!(err.code(), -32600, "{err}");
+        let long = good_frame().replace(
+            r#""id":"1""#,
+            &format!(r#""id":"{}""#, "x".repeat(crate::rpc::MAX_ID_BYTES + 1)),
+        );
+        let err = accept(long.as_bytes(), &expectation()).expect_err("a long id");
+        assert_eq!(err.code(), -32600, "{err}");
+        accept(good_frame().as_bytes(), &expectation()).expect("control: a string id");
+    }
+
     #[test]
     fn a_correct_handshake_is_accepted_and_answers_with_one_version() {
         let out = accept(good_frame().as_bytes(), &expectation()).expect("valid handshake");
-        assert_eq!(out.protocol_version, 1);
-        assert_eq!(out.offer, Offer::none());
+        assert_eq!(out.result.protocol_version, 1);
+        assert_eq!(out.result.offer, Offer::none());
+        assert_eq!(out.id, "1", "the id comes back, to answer under");
     }
 
     /// SPEC-ME3 §3's code assignment, as a table quoted from the document.
@@ -347,7 +448,7 @@ mod tests {
         // reaches the `method` check inside `accept`. Measured (review): with
         // only this row, deleting that check left the whole suite green.
         let wrong_method =
-            case(r#"{"jsonrpc":"2.0","method":"ping","id":1,"params":{"module":"cos72"}}"#);
+            case(r#"{"jsonrpc":"2.0","method":"ping","id":"1","params":{"module":"cos72"}}"#);
         assert_eq!(wrong_method.code(), -32600, "{wrong_method}");
         // …and the frame that DOES reach it: valid everything, wrong method.
         let wrong_method_complete = case(&good_frame().replace("\"initialize\"", "\"ping\""));
@@ -360,7 +461,7 @@ mod tests {
         // SPEC: 「首帧 params 解析失败（含重复 `auth_token` 等重复 JSON key）→
         //        `-32602` 并断连」
         let missing_field =
-            case(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"module":"cos72"}}"#);
+            case(r#"{"jsonrpc":"2.0","method":"initialize","id":"1","params":{"module":"cos72"}}"#);
         assert_eq!(missing_field.code(), -32602, "{missing_field}");
 
         // SPEC: 「认证失败 → `-32000` + `kind: auth_failed` 并断连」
@@ -435,7 +536,7 @@ mod tests {
     /// two failures cannot be told apart by which check ran.
     #[test]
     fn the_shape_is_checked_before_the_token() {
-        let both_wrong = r#"{"jsonrpc":"2.0","method":"ping","id":1,"params":{"module":"x"}}"#;
+        let both_wrong = r#"{"jsonrpc":"2.0","method":"ping","id":"1","params":{"module":"x"}}"#;
         let err = accept(both_wrong.as_bytes(), &expectation()).unwrap_err();
         assert_eq!(err.code(), -32600, "the token was consulted first: {err}");
     }
@@ -513,7 +614,8 @@ mod tests {
         let req = InitializeRequest {
             jsonrpc: "2.0".to_owned(),
             method: INITIALIZE_METHOD.to_owned(),
-            id: u64::MAX,
+            // The longest id accepted (ids are strings, SPEC §3).
+            id: "x".repeat(crate::rpc::MAX_ID_BYTES),
             params,
         };
         let encoded = serde_json::to_vec(&req).unwrap();
