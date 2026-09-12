@@ -584,6 +584,11 @@ impl InFlight {
         self.generation.upstream()
     }
 
+    /// The generation this request was admitted into.
+    pub(crate) fn generation(&self) -> &Arc<Generation> {
+        &self.generation
+    }
+
     /// The kernel-minted request id.
     #[must_use]
     pub fn id(&self) -> &str {
