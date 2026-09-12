@@ -122,7 +122,8 @@ pub type MethodsFor = Arc<dyn Fn(&Arc<Generation>) -> Methods + Send + Sync>;
 /// the loop; the module process it held is dropped with it, which revokes its
 /// generation and SIGKILLs its group without grace. A kill not waited for is
 /// not a confirmed end, so the slot is then kept held; only a loop caught
-/// holding no process (between runs, or given up) releases it.
+/// holding no process (none spawned yet, or all confirmed stopped) releases
+/// it.
 #[derive(Debug)]
 pub struct SupervisorHandle {
     stop: watch::Sender<bool>,
@@ -278,6 +279,12 @@ struct Slot {
     /// successor claimed it — would release the successor's claim (review of
     /// ME3-SUP slice 3a, round 7). A lease releases once.
     released: std::sync::atomic::AtomicBool,
+    /// A process of this supervisor's exists and is not confirmed gone: set
+    /// the moment `spawn` hands one over (no await in between), cleared once
+    /// its stop succeeds. What `Exit` releases the slot by — not `Status`,
+    /// which says `Starting` for a loop that never got to spawn anything
+    /// (review of ME3-SUP slice 3a, round 8).
+    unconfirmed: std::sync::atomic::AtomicBool,
 }
 
 impl Slot {
@@ -289,6 +296,7 @@ impl Slot {
             current,
             mine: std::sync::Mutex::new(mine),
             released: std::sync::atomic::AtomicBool::new(false),
+            unconfirmed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -337,12 +345,13 @@ impl Slot {
 /// The loop's slot and status, owned. Every way out — return, panic, the task
 /// aborted, even before its first poll — drops this, which retires this
 /// supervisor's generation, so no path leaves the slot promising a module that
-/// will not come back. It releases the slot only when no process can be left:
-/// after `Stopped` (released already, before `Stopped` was published), or
-/// when the loop was aborted between runs (`Backoff`) or after giving up.
-/// Aborted or panicking with a process — or after `StopFailed` — it keeps the
-/// slot: the process had at most a SIGKILL attempted, never confirmed
-/// (review of ME3-SUP slice 3a, round 6).
+/// will not come back. It releases the slot only when no process of this
+/// supervisor's can be left (`Slot::unconfirmed` clear): after `Stopped`
+/// (released already, before `Stopped` was published), or when the loop was
+/// aborted with nothing spawned or everything confirmed stopped. Aborted or
+/// panicking with a process — or after `StopFailed` — it keeps the slot: the
+/// process had at most a SIGKILL attempted, never confirmed (review of
+/// ME3-SUP slice 3a, rounds 6 and 8).
 struct Exit {
     slot: Slot,
     status: watch::Sender<Status>,
@@ -351,10 +360,10 @@ struct Exit {
 impl Drop for Exit {
     fn drop(&mut self) {
         self.slot.retire();
-        let holds_no_process = matches!(
-            *self.status.borrow(),
-            Status::Stopped | Status::Backoff { .. } | Status::GaveUp { .. }
-        );
+        let holds_no_process = !self
+            .slot
+            .unconfirmed
+            .load(std::sync::atomic::Ordering::SeqCst);
         if std::thread::panicking() {
             tracing::error!("the supervisor loop panicked");
             self.status.send_replace(Status::Panicked);
@@ -507,7 +516,11 @@ async fn run_once(
         }) => spawned,
     };
     let mut process = match spawned {
-        Ok(p) => p,
+        Ok(p) => {
+            slot.unconfirmed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            p
+        }
         Err(e) => {
             tracing::error!(module = %spec.name, "could not start the module: {e}");
             return Ok(failed(Stopped::Exited));
@@ -528,13 +541,13 @@ async fn run_once(
     let handshaken = tokio::select! {
         biased;
         () = stop_requested(stop) => {
-            finish(process, timings, &spec.name, status).await?;
+            finish(process, timings, &spec.name, status, slot).await?;
             return Ok(Run::StopRequested);
         }
         exited = process.exited() => {
             tracing::warn!(module = %spec.name, ?exited, "the module exited before its handshake");
             let run = failed(Stopped::Exited);
-            finish(process, timings, &spec.name, status).await?;
+            finish(process, timings, &spec.name, status, slot).await?;
             return Ok(run);
         }
         result = async {
@@ -547,7 +560,7 @@ async fn run_once(
         Err(why) => {
             tracing::warn!(module = %spec.name, "the module did not complete its handshake: {why}");
             let run = failed(Stopped::StartupTimeout);
-            finish(process, timings, &spec.name, status).await?;
+            finish(process, timings, &spec.name, status, slot).await?;
             return Ok(run);
         }
     };
@@ -557,7 +570,7 @@ async fn run_once(
         // ready module.
         tracing::error!(module = %spec.name, "the generation was revoked during its handshake");
         let run = failed(Stopped::StartupTimeout);
-        finish(process, timings, &spec.name, status).await?;
+        finish(process, timings, &spec.name, status, slot).await?;
         return Ok(run);
     }
     // Built before `Running` is published: a caller's `MethodsFor` that
@@ -582,7 +595,7 @@ async fn run_once(
         exited = process.exited() => Some(format!("the module exited: {exited:?}")),
     };
     let ended_at = std::time::Instant::now();
-    finish(process, timings, &spec.name, status).await?;
+    finish(process, timings, &spec.name, status, slot).await?;
     Ok(match outcome {
         None => Run::StopRequested,
         Some(why) => {
@@ -599,8 +612,15 @@ async fn run_once(
 /// Resolves once a stop has been requested. The `watch::Ref` that `wait_for`
 /// yields holds a read guard, which must not live across an await in a task
 /// that is spawned: it is dropped here, and only `()` comes out.
+///
+/// A closed channel is not a stop: the handle closes it only by being
+/// dropped, and that aborts this task — which must end as `Killed`, not run
+/// a stop path to `Stopped` in the meantime (review of ME3-SUP slice 3a,
+/// round 8).
 async fn stop_requested(stop: &mut watch::Receiver<bool>) {
-    let _ = stop.wait_for(|s| *s).await;
+    if stop.wait_for(|s| *s).await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Stop a run's process, with the status saying so while it happens. A stop
@@ -611,6 +631,7 @@ async fn finish(
     timings: &Timings,
     name: &str,
     status: &watch::Sender<Status>,
+    slot: &Slot,
 ) -> Result<(), Unconfirmed> {
     // Revoked before `Stopping` is published: whoever sees `Stopping` must
     // find new work already refused (review of ME3-SUP slice 3a, round 2).
@@ -626,6 +647,11 @@ async fn finish(
                     "requests in flight when the module stopped: outcome unknown"
                 );
             }
+            // Confirmed gone. (Until `stop` returned — its bounded wait for
+            // the output drains included — the flag stayed set: the fail-closed
+            // side.)
+            slot.unconfirmed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         Err(failed) => {
@@ -1397,6 +1423,15 @@ sys.exit(0)
             starts(f.data.path()).is_empty(),
             "an aborted supervisor started a module"
         );
+        // It never had a process, so the slot is free again (round 8).
+        let next = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        stop(next).await;
     }
 
     /// Dropping the handle without stopping is still a kill path: the loop is
