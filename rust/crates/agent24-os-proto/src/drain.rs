@@ -467,9 +467,8 @@ impl Abandoned {
 #[derive(Debug)]
 pub struct Current {
     slot: Mutex<Arc<Generation>>,
-    /// Bumped by every [`Current::claim`]: whoever claimed earlier learns it
-    /// no longer owns the slot by seeing a number that is not its own.
-    owner: tokio::sync::watch::Sender<u64>,
+    /// Whether a supervisor holds this slot (see `claim`).
+    held: std::sync::atomic::AtomicBool,
 }
 
 impl Current {
@@ -477,33 +476,39 @@ impl Current {
     pub fn new(generation: Arc<Generation>) -> Arc<Self> {
         Arc::new(Self {
             slot: Mutex::new(generation),
-            owner: tokio::sync::watch::channel(0).0,
+            held: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// Take the slot over: install `next` and become its owner, in one step
-    /// under the slot's lock — so the newest claim and what the slot holds
-    /// always agree (round 4: two separate steps let an older take-over land
-    /// after a newer one). Returns the claim number and a receiver on which
-    /// every later claim shows up as a different number: a supervisor must
-    /// end when a newer one takes its slot over, not just stop writing to it
-    /// (round 3). What was in the slot is dropped: its owner, if any, stops
-    /// and revokes it itself.
-    pub(crate) fn take_over(
-        &self,
-        next: Arc<Generation>,
-    ) -> (u64, tokio::sync::watch::Receiver<u64>) {
-        let mut slot = self
-            .slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut claimed = 0;
-        self.owner.send_modify(|n| {
-            *n += 1;
-            claimed = *n;
-        });
-        *slot = next;
-        (claimed, self.owner.subscribe())
+    /// Become the one supervisor of this slot and install `placeholder`, or
+    /// `false` if a supervisor holds it already. One at a time, by
+    /// construction: a second supervisor started while the first winds down
+    /// would run a second process on the same data directory — for as long as
+    /// the first failed to die (review of ME3-SUP slice 3a, rounds 2–5, which
+    /// tried a takeover protocol instead and kept finding its gaps).
+    pub(crate) fn claim(&self, placeholder: Arc<Generation>) -> bool {
+        if self
+            .held
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        // Out goes the caller's initial generation, or the last one of the
+        // previous supervisor, which stopped (and revoked it) before releasing.
+        let _previous = self.replace(placeholder);
+        true
+    }
+
+    /// Give the slot up: the supervisor's processes are confirmed gone (or it
+    /// sent the SIGKILL it could; see `supervisor::Exit`).
+    pub(crate) fn release(&self) {
+        self.held.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[must_use]
@@ -530,29 +535,6 @@ impl Current {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             next,
         )
-    }
-
-    /// Install `next` only if the slot still holds `expected` (the same
-    /// `Arc`), atomically; otherwise hand `next` back. For a supervisor that
-    /// must not overwrite a generation another supervisor has put in since.
-    ///
-    /// # Errors
-    ///
-    /// `Err(next)` when the slot holds something other than `expected`.
-    pub fn replace_if(
-        &self,
-        expected: &Arc<Generation>,
-        next: Arc<Generation>,
-    ) -> Result<Arc<Generation>, Arc<Generation>> {
-        let mut slot = self
-            .slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if Arc::ptr_eq(&slot, expected) {
-            Ok(std::mem::replace(&mut *slot, next))
-        } else {
-            Err(next)
-        }
     }
 }
 

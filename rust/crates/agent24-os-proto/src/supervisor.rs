@@ -14,8 +14,9 @@
 //!                    or give up (the breaker)
 //! ```
 //!
-//! Every way out of a run goes through [`ModuleProcess::stop`], so every way out
-//! revokes the generation before anything is killed. A run whose callback
+//! Every orderly end of a run goes through [`ModuleProcess::stop`], which
+//! revokes the generation before anything is killed; an aborted or panicking
+//! loop drops the process instead, and its `Drop` revokes and SIGKILLs. A run whose callback
 //! connection ends is over even if the process is still alive (user decision
 //! D1): the connection is the generation's lifeline, and a generation does not
 //! reconnect.
@@ -91,14 +92,16 @@ pub enum Status {
     Stopping,
     /// The last run failed; the next starts after `delay`.
     Backoff { failures: u32, delay: Duration },
-    /// The breaker tripped: no more runs until the supervisor is replaced.
+    /// The breaker tripped: no more runs. The loop waits for its stop and
+    /// then says `Stopped`.
     GaveUp { failures: u32, within: Duration },
-    /// Ended: on request, or because a newer supervisor took the slot over.
-    /// Any process it ran is confirmed gone.
+    /// Ended on request. Any process it ran is confirmed gone.
     Stopped,
-    /// A run's process could not be confirmed gone (the stop failed; the
-    /// process was dropped, which sends SIGKILL once more). No new run is
-    /// started: the old group may still hold the module's data directory.
+    /// A run's process could not be confirmed gone: its stop failed, and the
+    /// process was dropped — which sends SIGKILL once more while its leader is
+    /// unreaped, and nothing once it was reaped (the id may be reused). No new
+    /// run is started, and the slot stays held: no other supervisor can start
+    /// the module while the old group may still hold its data directory.
     StopFailed { error: String },
     /// The supervisor itself panicked — a bug. The module was killed and the
     /// slot says `module_stopping`.
@@ -117,7 +120,7 @@ pub type MethodsFor = Arc<dyn Fn(&Arc<Generation>) -> Methods + Send + Sync>;
 
 /// A running supervisor. Dropping it without [`SupervisorHandle::stop`] aborts
 /// the loop; the module process it held is dropped with it, which revokes its
-/// generation and kills its group without grace.
+/// generation and SIGKILLs its group without grace — and releases the slot.
 #[derive(Debug)]
 pub struct SupervisorHandle {
     stop: watch::Sender<bool>,
@@ -140,17 +143,63 @@ impl SupervisorHandle {
     }
 
     /// Stop the module (revoke, SIGTERM, grace, SIGKILL) and the loop, and
-    /// wait for both.
-    pub async fn stop(mut self) {
+    /// wait for both. `Ok` only when the module is confirmed gone and the slot
+    /// is free for the next supervisor.
+    ///
+    /// # Errors
+    ///
+    /// [`SupervisorError::StopFailed`] when a run's process could not be
+    /// confirmed gone — the slot stays held, so nothing else starts the module
+    /// over it; [`SupervisorError::Panicked`] when the loop itself panicked.
+    pub async fn stop(mut self) -> Result<(), SupervisorError> {
         let _ = self.stop.send(true);
         if let Some(task) = self.task.take()
             && let Err(e) = task.await
             && e.is_panic()
         {
             tracing::error!("the supervisor loop had panicked: {e}");
+            return Err(SupervisorError::Panicked);
+        }
+        match self.status.borrow().clone() {
+            Status::StopFailed { error } => Err(SupervisorError::StopFailed { error }),
+            Status::Panicked => Err(SupervisorError::Panicked),
+            _ => Ok(()),
         }
     }
 }
+
+/// Why [`SupervisorHandle::stop`] could not report a clean stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupervisorError {
+    /// A run's process could not be confirmed gone.
+    StopFailed { error: String },
+    /// The supervisor loop panicked (a bug); its module was SIGKILLed.
+    Panicked,
+}
+
+impl std::fmt::Display for SupervisorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StopFailed { error } => write!(f, "{error}"),
+            Self::Panicked => f.write_str("the supervisor loop panicked"),
+        }
+    }
+}
+
+impl std::error::Error for SupervisorError {}
+
+/// [`supervise`] was refused: another supervisor holds the module's slot.
+/// Stop that one first — [`SupervisorHandle::stop`] returning `Ok` frees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotHeld;
+
+impl std::fmt::Display for SlotHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another supervisor holds this module's slot; stop it first")
+    }
+}
+
+impl std::error::Error for SlotHeld {}
 
 impl Drop for SupervisorHandle {
     fn drop(&mut self) {
@@ -165,35 +214,38 @@ impl Drop for SupervisorHandle {
 /// `current` is the proxy's slot for this module: the supervisor puts each
 /// run's generation there (and a placeholder between runs, so requests are
 /// answered `503 module_not_ready` rather than reaching a dead generation).
-/// Starting a supervisor takes the slot over at once; from then on it changes
-/// only what it put there itself, so a supervisor still winding down never
-/// touches the generation of one started after it. A supervisor whose slot is
-/// taken over treats that like a stop: it stops its run (grace included) and
-/// ends — two runs of one module never share its data directory for longer
-/// than that stop.
-#[must_use]
+///
+/// A slot has at most one supervisor: until the one holding it has stopped —
+/// its processes confirmed gone — another is refused, so two runs of a module
+/// never share its data directory. A supervisor whose stop failed keeps the
+/// slot for good.
+///
+/// # Errors
+///
+/// [`SlotHeld`] when another supervisor holds `current`.
 pub fn supervise(
     spec: ModuleSpec,
     dir: Arc<CallbackDir>,
     current: Arc<Current>,
     methods: MethodsFor,
     timings: Timings,
-) -> SupervisorHandle {
+) -> Result<SupervisorHandle, SlotHeld> {
+    let slot = Slot::claim(current).ok_or(SlotHeld)?;
     let (stop_tx, stop_rx) = watch::channel(false);
     let (status_tx, status_rx) = watch::channel(Status::Starting { attempt: 1 });
     // Built here and moved into the task, not built inside it: a task aborted
     // before its first poll drops its future's captures — this guard — but
     // never runs a line of its body (review of ME3-SUP slice 3a, round 4).
     let exit = Exit {
-        slot: Slot::take_over(current),
+        slot,
         status: status_tx,
     };
     let task = tokio::spawn(run_loop(spec, dir, exit, methods, timings, stop_rx));
-    SupervisorHandle {
+    Ok(SupervisorHandle {
         stop: stop_tx,
         status: status_rx,
         task: Some(task),
-    }
+    })
 }
 
 /// How one run ended.
@@ -213,39 +265,23 @@ enum Run {
     },
 }
 
-/// This supervisor's hold on the proxy's slot. It remembers the generation it
-/// last put there and changes the slot only while that is still what it holds
-/// (review of ME3-SUP slice 3a, round 2: an unconditional revoke-what-is-there
-/// let a supervisor winding down revoke the live generation of the one that
-/// replaced it — and take that one's kill permit).
+/// This supervisor's hold on the proxy's slot: it is the slot's only
+/// supervisor (see [`supervise`]), and it remembers the generation it last put
+/// there, which is the one it retires.
 struct Slot {
     current: Arc<Current>,
     mine: std::sync::Mutex<Arc<Generation>>,
-    /// This supervisor's claim, and where a later one shows up.
-    claim: u64,
-    owner: watch::Receiver<u64>,
 }
 
 impl Slot {
-    /// Put a fresh placeholder in, unconditionally: the newest supervisor for
-    /// a slot owns it.
-    fn take_over(current: Arc<Current>) -> Self {
+    /// Hold `current` with a fresh placeholder in it; `None` if another
+    /// supervisor holds it.
+    fn claim(current: Arc<Current>) -> Option<Self> {
         let mine = Generation::starting();
-        let (claim, owner) = current.take_over(mine.clone());
-        Self {
+        current.claim(mine.clone()).then(|| Self {
             current,
             mine: std::sync::Mutex::new(mine),
-            claim,
-            owner,
-        }
-    }
-
-    /// Resolves once a newer supervisor has claimed the slot.
-    async fn superseded(&self) {
-        let mut owner = self.owner.clone();
-        // The sender lives in `current`, which this holds: `Err` cannot
-        // happen, and would end this supervisor — the safe direction.
-        let _ = owner.wait_for(|n| *n != self.claim).await;
+        })
     }
 
     fn mine(&self) -> std::sync::MutexGuard<'_, Arc<Generation>> {
@@ -254,26 +290,17 @@ impl Slot {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Install `next` if the slot still holds what this supervisor last put
-    /// there. `false`: another supervisor has taken the slot over.
-    fn install(&self, next: Arc<Generation>) -> bool {
+    /// Put `next` in. Out goes this supervisor's previous generation: a
+    /// placeholder, or a run's, revoked by its stop — nothing to do.
+    fn install(&self, next: Arc<Generation>) {
         let mut mine = self.mine();
-        match self.current.replace_if(&mine, next.clone()) {
-            // Out goes this supervisor's previous generation: a placeholder,
-            // or a run's, revoked by its stop. Nothing to do.
-            Ok(_previous) => {
-                *mine = next;
-                true
-            }
-            Err(_next) => false,
-        }
+        let _previous = self.current.replace(next.clone());
+        *mine = next;
     }
 
     /// Leave this supervisor's generation saying `module_stopping`: the module
-    /// is not coming back. Only its own — a run's (revoked already by its
-    /// stop: a no-op) or a never-started placeholder (revoking abandons
-    /// nothing). If another supervisor has taken the slot over, the slot is
-    /// not touched.
+    /// is not coming back. A run's (revoked already by its stop: a no-op) or a
+    /// never-started placeholder (revoking abandons nothing).
     fn retire(&self) {
         drop(self.mine().revoke());
     }
@@ -282,7 +309,7 @@ impl Slot {
 /// The loop's slot and status, owned. Every way out — return, panic, the task
 /// aborted, even before its first poll — drops this, which retires this
 /// supervisor's generation, so no path leaves the slot promising a module that
-/// will not come back.
+/// will not come back, and releases the slot — except after `StopFailed`.
 struct Exit {
     slot: Slot,
     status: watch::Sender<Status>,
@@ -301,6 +328,13 @@ impl Drop for Exit {
             // Aborted (the handle was dropped): the process went with the task,
             // SIGKILLed, not waited for — so not `Stopped`.
             self.status.send_replace(Status::Killed);
+        }
+        // Released after an abort or a panic too: the process was dropped
+        // before this guard, and its `Drop` sent the SIGKILL it could — no
+        // better confirmation is coming from a task that no longer runs. Kept
+        // after `StopFailed`: that group may still be there.
+        if !matches!(*self.status.borrow(), Status::StopFailed { .. }) {
+            self.slot.current.release();
         }
     }
 }
@@ -326,7 +360,7 @@ async fn run_loop(
                     tracing::error!(module = %spec.name, "not restarting: {error}");
                     slot.retire();
                     status.send_replace(Status::StopFailed { error });
-                    told_to_end(&mut stop, slot).await;
+                    stop_requested(&mut stop).await;
                     return;
                 }
                 Ok(Run::StopRequested) => {
@@ -351,11 +385,7 @@ async fn run_loop(
                 // taken out was revoked by its run's stop: nothing to do.
                 // After a stop or a give-up the revoked generation stays — the
                 // module is not coming back, and `module_stopping` says so.
-                if !slot.install(Generation::starting()) {
-                    tracing::warn!(module = %spec.name, "another supervisor took the slot over; ending");
-                    status.send_replace(Status::Stopped);
-                    return;
-                }
+                slot.install(Generation::starting());
                 tracing::warn!(module = %spec.name, ?why, delay_ms = delay.as_millis(), "module run ended; restarting");
                 status.send_replace(Status::Backoff {
                     failures: policy.consecutive_failures(),
@@ -363,7 +393,7 @@ async fn run_loop(
                 });
                 tokio::select! {
                     biased;
-                    () = told_to_end(&mut stop, slot) => {
+                    () = stop_requested(&mut stop) => {
                         // The placeholder put in above must not outlive the
                         // module: `module_not_ready` would promise a return.
                         slot.retire();
@@ -382,7 +412,7 @@ async fn run_loop(
                     failures: after,
                     within,
                 });
-                told_to_end(&mut stop, slot).await;
+                stop_requested(&mut stop).await;
                 status.send_replace(Status::Stopped);
                 return;
             }
@@ -434,7 +464,7 @@ async fn run_once(
     // end on its own thread, bounded by the entry cap.)
     let spawned = tokio::select! {
         biased;
-        () = told_to_end(stop, slot) => return Ok(Run::StopRequested),
+        () = stop_requested(stop) => return Ok(Run::StopRequested),
         spawned = launch::spawn(LaunchSpec {
             name: &spec.name,
             command: &spec.command,
@@ -454,11 +484,7 @@ async fn run_once(
     };
     let generation = process.generation().clone();
     // Out goes this supervisor's placeholder, which was never started.
-    if !slot.install(generation.clone()) {
-        tracing::warn!(module = %spec.name, "another supervisor took the slot over; ending");
-        finish(process, timings, &spec.name, status).await?;
-        return Ok(Run::StopRequested);
-    }
+    slot.install(generation.clone());
     let expect = Expectation {
         module: spec.name.clone(),
         manifest_digest: spec.manifest_digest.clone(),
@@ -470,7 +496,7 @@ async fn run_once(
     let deadline = tokio::time::Instant::now() + timings.startup;
     let handshaken = tokio::select! {
         biased;
-        () = told_to_end(stop, slot) => {
+        () = stop_requested(stop) => {
             finish(process, timings, &spec.name, status).await?;
             return Ok(Run::StopRequested);
         }
@@ -520,7 +546,7 @@ async fn run_once(
     );
     let outcome = tokio::select! {
         biased;
-        () = told_to_end(stop, slot) => None,
+        () = stop_requested(stop) => None,
         ended = serve => Some(format!("the callback connection ended: {ended:?}")),
         exited = process.exited() => Some(format!("the module exited: {exited:?}")),
     };
@@ -537,19 +563,6 @@ async fn run_once(
             }
         }
     })
-}
-
-/// Resolves once this supervisor must end: a stop was requested, or a newer
-/// supervisor took the slot over. Both end the same way — the run stopped with
-/// its grace, and the loop over.
-async fn told_to_end(stop: &mut watch::Receiver<bool>, slot: &Slot) {
-    tokio::select! {
-        biased;
-        () = stop_requested(stop) => {}
-        () = slot.superseded() => {
-            tracing::warn!("another supervisor took this module's slot over; ending");
-        }
-    }
 }
 
 /// Resolves once a stop has been requested. The `watch::Ref` that `wait_for`
@@ -758,11 +771,24 @@ sys.exit(0)
         }
     }
 
+    /// Start a supervisor on a slot the test knows is free.
+    fn sup(
+        spec: ModuleSpec,
+        dir: Arc<CallbackDir>,
+        current: Arc<Current>,
+        methods: MethodsFor,
+        timings: Timings,
+    ) -> SupervisorHandle {
+        supervise(spec, dir, current, methods, timings).expect("the slot is free")
+    }
+
     /// Stop, bounded: a stop that hangs fails the test instead of the run.
+    /// A clean stop is expected; a test of a failing one calls `stop` itself.
     async fn stop(handle: SupervisorHandle) {
         tokio::time::timeout(Duration::from_secs(30), handle.stop())
             .await
-            .expect("the supervisor did not stop");
+            .expect("the supervisor did not stop")
+            .expect("the stop was not clean");
     }
 
     /// Wait (bounded) until `pid` is gone.
@@ -784,7 +810,7 @@ sys.exit(0)
     async fn a_module_is_run_to_ready_and_stopped_cleanly() {
         let f = fixture("normal");
         let current = Current::new(Generation::starting());
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current.clone(),
@@ -809,7 +835,7 @@ sys.exit(0)
     async fn a_crash_loop_restarts_with_fresh_tokens_until_the_breaker_trips() {
         let f = fixture("crash");
         let current = Current::new(Generation::starting());
-        let handle = supervise(f.spec.clone(), f.dir.clone(), current, no_methods(), fast());
+        let handle = sup(f.spec.clone(), f.dir.clone(), current, no_methods(), fast());
         let mut rx = handle.subscribe();
         let gave_up = until(&mut rx, "GaveUp", |s| matches!(s, Status::GaveUp { .. })).await;
         assert!(
@@ -847,7 +873,7 @@ sys.exit(0)
             backoff_base: base,
             ..fast()
         };
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current,
@@ -885,7 +911,7 @@ sys.exit(0)
             stop_grace: Duration::from_secs(3),
             ..fast()
         };
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current.clone(),
@@ -906,7 +932,7 @@ sys.exit(0)
         let f = fixture("normal");
         let current = Current::new(Generation::starting());
         let methods: MethodsFor = Arc::new(|_| panic!("a broken MethodsFor"));
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current.clone(),
@@ -918,102 +944,125 @@ sys.exit(0)
         let (pid, _) = starts(f.data.path())[0].clone();
         assert!(gone(pid).await, "the module outlived a panicked supervisor");
         assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
-        stop(handle).await;
+        // And `stop` says so rather than reporting a clean stop.
+        assert_eq!(handle.stop().await, Err(SupervisorError::Panicked));
     }
 
-    /// A healthy supervisor whose slot is taken over ends by itself — nobody
-    /// stops it: its module is stopped and its generation revoked, so two runs
-    /// of one module do not go on side by side (review of ME3-SUP slice 3a,
-    /// round 3). And winding down, it never touches the slot: the new one's
-    /// generation stays there, Running (round 2).
+    /// A slot has one supervisor at a time: a second is refused while the
+    /// first runs, and the slot it holds is untouched; once the first stops
+    /// cleanly the second starts (review of ME3-SUP slice 3a, round 5).
     #[tokio::test]
-    async fn a_superseded_healthy_supervisor_ends_by_itself_and_leaves_the_slot_alone() {
+    async fn a_slot_is_supervised_by_one_supervisor_at_a_time() {
         let current = Current::new(Generation::starting());
         let a = fixture("normal");
-        let old = supervise(
+        let first = sup(
             a.spec.clone(),
             a.dir.clone(),
             current.clone(),
             no_methods(),
             fast(),
         );
-        until(&mut old.subscribe(), "the old one Running", |s| {
+        until(&mut first.subscribe(), "the first Running", |s| {
             *s == Status::Running
         })
         .await;
+        let theirs = current.get();
         let b = fixture("normal");
-        let new = supervise(
+        let refused = supervise(
             b.spec.clone(),
             b.dir.clone(),
             current.clone(),
             no_methods(),
             fast(),
         );
-        until(&mut new.subscribe(), "the new one Running", |s| {
+        assert_eq!(refused.err(), Some(SlotHeld));
+        assert!(
+            Arc::ptr_eq(&current.get(), &theirs),
+            "a refused supervisor touched the slot"
+        );
+        assert_eq!(theirs.state(), crate::drain::DrainState::Running);
+        assert!(
+            starts(b.data.path()).is_empty(),
+            "a refused supervisor started a module"
+        );
+
+        stop(first).await;
+        let second = sup(
+            b.spec.clone(),
+            b.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        until(&mut second.subscribe(), "the second Running", |s| {
             *s == Status::Running
         })
         .await;
-        let theirs = current.get();
-        until(&mut old.subscribe(), "the old one ending by itself", |s| {
-            *s == Status::Stopped
-        })
-        .await;
-        let (old_pid, _) = starts(a.data.path())[0].clone();
-        assert!(
-            gone(old_pid).await,
-            "the superseded module was left running"
-        );
-        assert!(
-            Arc::ptr_eq(&current.get(), &theirs),
-            "the old supervisor replaced the slot"
-        );
-        assert_eq!(theirs.state(), crate::drain::DrainState::Running);
-        stop(old).await;
-        stop(new).await;
+        stop(second).await;
     }
 
-    /// A crash-looping supervisor whose slot was taken over ends too, between
-    /// runs, and never puts a run of its own into the slot again — the newer
-    /// supervisor's generation stays.
+    /// A run whose process cannot be confirmed gone — here a process of this
+    /// test's joined the module's group, so after the SIGKILL it is a zombie
+    /// only the test can reap — ends in `StopFailed`: no restart, `stop`
+    /// reports it, and the slot stays held so no other supervisor starts the
+    /// module over the old group (review of ME3-SUP slice 3a, round 5).
     #[tokio::test]
-    async fn a_superseded_crash_looping_supervisor_ends_too() {
+    async fn a_stop_that_cannot_be_confirmed_ends_supervision_and_keeps_the_slot() {
+        use std::os::unix::process::CommandExt;
+        let f = fixture("normal");
         let current = Current::new(Generation::starting());
-        let a = fixture("crash");
-        let timings = Timings {
-            backoff_base: Duration::from_millis(300),
-            ..fast()
-        };
-        let old = supervise(
-            a.spec.clone(),
-            a.dir.clone(),
-            current.clone(),
-            no_methods(),
-            timings,
-        );
-        let b = fixture("normal");
-        let new = supervise(
-            b.spec.clone(),
-            b.dir.clone(),
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
             current.clone(),
             no_methods(),
             fast(),
         );
-        until(&mut new.subscribe(), "the new one Running", |s| {
-            *s == Status::Running
+        let mut rx = handle.subscribe();
+        until(&mut rx, "Running", |s| *s == Status::Running).await;
+        let (pid, _) = starts(f.data.path())[0].clone();
+        let mut joiner = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(pid)
+            .spawn()
+            .expect("a process joining the module's group");
+        // The module dies by itself; stopping that run cannot empty the group.
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid).unwrap(),
+            rustix::process::Signal::Kill,
+        )
+        .unwrap();
+        until(&mut rx, "StopFailed", |s| {
+            matches!(s, Status::StopFailed { .. })
         })
         .await;
-        let theirs = current.get();
-        until(&mut old.subscribe(), "the old one ending by itself", |s| {
-            *s == Status::Stopped
-        })
-        .await;
-        assert!(
-            Arc::ptr_eq(&current.get(), &theirs),
-            "the old supervisor replaced the slot"
+        // Past a backoff the fast timings would have restarted within.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            starts(f.data.path()).len(),
+            1,
+            "restarted over an unconfirmed group"
         );
-        assert_eq!(theirs.state(), crate::drain::DrainState::Running);
-        stop(old).await;
-        stop(new).await;
+
+        let err = tokio::time::timeout(Duration::from_secs(30), handle.stop())
+            .await
+            .expect("the supervisor did not stop")
+            .expect_err("a failed stop was reported as clean");
+        assert!(matches!(err, SupervisorError::StopFailed { .. }), "{err}");
+        let g = fixture("normal");
+        assert_eq!(
+            supervise(
+                g.spec.clone(),
+                g.dir.clone(),
+                current.clone(),
+                no_methods(),
+                fast()
+            )
+            .err(),
+            Some(SlotHeld),
+            "the slot was released over a group that may still be there"
+        );
+        joiner.wait().unwrap(); // reap the zombie
     }
 
     /// While a restart is pending the slot holds a never-started placeholder
@@ -1028,7 +1077,7 @@ sys.exit(0)
             backoff_base: Duration::from_secs(2),
             ..fast()
         };
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current.clone(),
@@ -1046,7 +1095,7 @@ sys.exit(0)
         assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
         let f = fixture("crash");
         let current = Current::new(Generation::starting());
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current.clone(),
@@ -1070,7 +1119,7 @@ sys.exit(0)
         std::fs::set_permissions(&f.spec.package_dir, std::fs::Permissions::from_mode(0o777))
             .unwrap();
         let current = Current::new(Generation::starting());
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current.clone(),
@@ -1098,7 +1147,7 @@ sys.exit(0)
             startup: Duration::from_secs(600),
             ..fast()
         };
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current,
@@ -1126,7 +1175,7 @@ sys.exit(0)
             startup: Duration::from_millis(500),
             ..fast()
         };
-        let handle = supervise(
+        let handle = sup(
             f.spec.clone(),
             f.dir.clone(),
             current,
@@ -1153,7 +1202,7 @@ sys.exit(0)
     async fn when_the_callback_connection_ends_the_run_ends() {
         let f = fixture("hangup");
         let current = Current::new(Generation::starting());
-        let handle = supervise(f.spec.clone(), f.dir.clone(), current, no_methods(), fast());
+        let handle = sup(f.spec.clone(), f.dir.clone(), current, no_methods(), fast());
         let starts = started(f.data.path(), 2).await;
         assert!(
             gone(starts[0].0).await,
@@ -1182,7 +1231,7 @@ sys.exit(0)
                 Methods::none()
             })
         };
-        let handle = supervise(f.spec.clone(), f.dir.clone(), current, methods, fast());
+        let handle = sup(f.spec.clone(), f.dir.clone(), current, methods, fast());
         started(f.data.path(), 2).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while seen.lock().unwrap().len() < 2 {
@@ -1210,7 +1259,7 @@ sys.exit(0)
     async fn a_handle_dropped_before_the_first_poll_still_retires_the_slot() {
         let f = fixture("normal");
         let current = Current::new(Generation::starting());
-        drop(supervise(
+        drop(sup(
             f.spec.clone(),
             f.dir.clone(),
             current.clone(),
@@ -1237,7 +1286,7 @@ sys.exit(0)
     async fn dropping_the_handle_kills_the_module() {
         let f = fixture("normal");
         let current = Current::new(Generation::starting());
-        let handle = supervise(f.spec.clone(), f.dir.clone(), current, no_methods(), fast());
+        let handle = sup(f.spec.clone(), f.dir.clone(), current, no_methods(), fast());
         let mut rx = handle.subscribe();
         until(&mut rx, "Running", |s| *s == Status::Running).await;
         let (pid, _) = starts(f.data.path())[0].clone();
