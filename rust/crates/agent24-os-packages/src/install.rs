@@ -99,22 +99,38 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
         return Err(InstallError::AlreadyInstalled(manifest.name().to_owned()));
     }
 
-    // Whether the root existed BEFORE this call decides what a failure has to
-    // clean up. If this call created it, a later failure must take it away again:
-    // the promise is that a refused install leaves no trace, and an empty
-    // `packages/` directory that only exists because someone tried once is a
-    // trace.
-    let root_existed = entry_exists(packages_root).unwrap_or(true);
-    std::fs::create_dir_all(packages_root)
-        .map_err(|e| InstallError::Filesystem(format!("could not create packages root: {e}")))?;
+    // What this call creates decides what a failure has to clean up. If it
+    // created the root — or any parent of it — a later failure must take that
+    // away again: the promise is that a refused install leaves no trace, and an
+    // empty `packages/` directory that only exists because someone tried once is
+    // a trace.
+    //
+    // So the directories are created HERE, one level at a time from the top,
+    // and each one that this call created is recorded as it is made: then any
+    // failure — including one part-way down the path — can take back exactly
+    // what was made. (Handing the whole path to a recursive create, as the
+    // round-3 fix did, made parents that a failure deeper down left behind:
+    // review of ME3-SUP slice 1, round 3″.) `check_packages_root` then checks
+    // the root as a daemon start would — owned by us, nobody else can write it —
+    // NOW rather than after the install claimed success (under `umask 002` a
+    // plain `create_dir_all` made it `0775`, the install succeeded, and the next
+    // daemon start refused the whole root). The check CREATES nothing: with a
+    // root a concurrent install's cleanup has just removed, it fails, rather
+    // than re-creating directories nobody recorded (round 3⁗).
+    let created = create_missing_dirs(packages_root)?;
     let undo_root = || {
-        if !root_existed {
+        for dir in created.iter().rev() {
             // `remove_dir` (not `_all`): it only succeeds while the directory is
             // still empty, so a concurrent install that already put something
-            // there is never destroyed by our cleanup.
-            let _ = std::fs::remove_dir(packages_root);
+            // there is never destroyed by our cleanup. Deepest first, so each
+            // parent is empty by the time it is tried.
+            let _ = std::fs::remove_dir(dir);
         }
     };
+    if let Err(e) = crate::check_packages_root(packages_root) {
+        undo_root();
+        return Err(InstallError::Filesystem(e.to_string()));
+    }
 
     // Staging lives INSIDE the packages root, not in the system temp directory.
     // That is the whole point: `/tmp` is frequently a different volume (it is on
@@ -275,14 +291,74 @@ fn remove_quietly(p: &Path) {
     let _ = std::fs::remove_dir_all(p);
 }
 
+/// Create `path` and every missing directory above it, top-down, each `0700`.
+/// Returns the directories this call created, top-down. On failure, removes
+/// what it created before returning the error.
+///
+/// "Missing" is "not confirmed to exist": an ancestor whose `symlink_metadata`
+/// fails for any reason (not found, a component too long, a file where a
+/// directory should be) is attempted, so that the create reports the real
+/// error — and an ancestor that does exist (even as a dangling symlink) ends
+/// the walk up, so nothing that was there before is ever recorded as ours.
+#[cfg(unix)]
+fn create_missing_dirs(path: &Path) -> Result<Vec<PathBuf>, InstallError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|p| !p.as_os_str().is_empty() && std::fs::symlink_metadata(p).is_err())
+        .collect();
+    missing.reverse();
+    let mut created = Vec::new();
+    for dir in missing {
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => created.push(dir.to_path_buf()),
+            // Made by a concurrent install between the look and the create:
+            // not ours to remove.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                for made in created.iter().rev() {
+                    let _ = std::fs::remove_dir(made);
+                }
+                return Err(InstallError::Filesystem(format!(
+                    "could not create {}: {e}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok(created)
+}
+
+#[cfg(not(unix))]
+fn create_missing_dirs(path: &Path) -> Result<Vec<PathBuf>, InstallError> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| InstallError::Filesystem(format!("could not create packages root: {e}")))?;
+    Ok(Vec::new())
+}
+
 /// Copy a package tree. Symlinks are refused rather than followed, for the reason
 /// `os_discovery` refuses a symlinked manifest: a package's identity is decided by
 /// a file inside it, and a link lets that file live outside the tree being
 /// validated.
+///
+/// Every directory and file in the copy loses its group and other WRITE bits.
+/// Starting a module refuses a package anyone but its owner can write
+/// (`agent24_os_proto::launch::resolve`), and without this a daemon running
+/// with the common `umask 002` would create `0775` directories — and a source
+/// file that is `0664` is copied as `0664` — so the install would succeed and
+/// every start of the module fail (review of ME3-SUP slice 1, round 2).
+///
+/// `dst` is created NON-recursively: its parent must already be there. For the
+/// top call that parent is the packages root, checked by `check_packages_root`
+/// a moment earlier — and if a concurrent install's cleanup has since removed
+/// it (it was empty and that install created it), this install must fail
+/// rather than quietly re-create a root nobody recorded or checked (review of
+/// ME3-SUP slice 1, round 3‴).
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), InstallError> {
-    std::fs::create_dir_all(dst).map_err(|e| {
+    std::fs::create_dir(dst).map_err(|e| {
         InstallError::Filesystem(format!("could not create {}: {e}", dst.display()))
     })?;
+    owner_write_only(dst)?;
     let entries = std::fs::read_dir(src)
         .map_err(|e| InstallError::Source(format!("could not read {}: {e}", src.display())))?;
     for e in entries {
@@ -302,8 +378,30 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), InstallError> {
             std::fs::copy(e.path(), &to).map_err(|err| {
                 InstallError::Filesystem(format!("could not copy {}: {err}", e.path().display()))
             })?;
+            owner_write_only(&to)?;
         }
     }
+    Ok(())
+}
+
+/// Clear the group and other write bits of `path` (not a symlink: `copy_tree`
+/// refuses those).
+#[cfg(unix)]
+fn owner_write_only(path: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| InstallError::Filesystem(format!("could not stat {}: {e}", path.display())))?;
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o022)).map_err(
+            |e| InstallError::Filesystem(format!("could not restrict {}: {e}", path.display())),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn owner_write_only(_path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
@@ -328,6 +426,121 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeSet;
+
+    /// An installed package is writable by its owner only, whatever the source
+    /// allowed: a module is refused at start if anyone else can write its
+    /// package, so an install that kept a `0664` file (or made `0775`
+    /// directories under `umask 002`) would succeed and leave a package that
+    /// can never run.
+    /// A refused install leaves no trace — including parents of the packages
+    /// root that the install itself created (undoing only the root left them
+    /// behind).
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_install_removes_the_parents_it_created() {
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+        // Refused mid-copy: a symlink in the source (copy_tree refuses those),
+        // which is after the root and its parents have been created.
+        std::os::unix::fs::symlink("/etc/hosts", src.join("link")).unwrap();
+        let root = t.path().join("a/b/packages");
+        install(&src, &root).expect_err("a symlink in the source");
+        assert!(
+            !t.path().join("a").exists(),
+            "the refused install left {} behind",
+            t.path().join("a").display()
+        );
+    }
+
+    /// The same when the failure is part-way down the path to the root itself:
+    /// `a` can be created, the next component cannot (it is longer than any
+    /// filesystem allows a name to be) — `a` must not be left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_created_leaves_no_parents_behind() {
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+        let root = t.path().join("a").join("x".repeat(300)).join("packages");
+        install(&src, &root).expect_err("an uncreatable root");
+        assert!(
+            !t.path().join("a").exists(),
+            "the refused install left {} behind",
+            t.path().join("a").display()
+        );
+    }
+
+    /// The copy never creates the directory it is copying INTO: if the packages
+    /// root is gone — a concurrent install's cleanup removed it after this one
+    /// checked it — the copy fails instead of re-creating a root that nothing
+    /// recorded or checked.
+    #[test]
+    fn copying_into_a_root_that_is_gone_fails_and_does_not_recreate_it() {
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+        let gone = t.path().join("gone");
+        copy_tree(&src, &gone.join(".staging-x")).expect_err("the root is gone");
+        assert!(!gone.exists(), "the copy re-created the packages root");
+    }
+
+    /// The packages root is created `0700`, and an existing one anyone else can
+    /// write is refused at install time — not accepted by the install and then
+    /// refused by the next daemon start.
+    #[cfg(unix)]
+    #[test]
+    fn the_packages_root_is_created_private_and_a_shared_one_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+
+        let fresh = t.path().join("fresh/packages");
+        install(&src, &fresh).expect("install into a new root");
+        for dir in [&fresh, &t.path().join("fresh")] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is {mode:o}", dir.display());
+        }
+
+        let shared = t.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = install(&src, &shared).expect_err("a group-writable root");
+        assert!(matches!(err, InstallError::Filesystem(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&shared).unwrap().count(),
+            0,
+            "the refused install left something in the root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_package_is_writable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = src_pkg(t.path(), "src", "shared");
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::write(src.join("lib/code.js"), "// code\n").unwrap();
+        std::fs::set_permissions(
+            src.join("lib/code.js"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        std::fs::set_permissions(src.join("lib"), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let dest = install(&src, &t.path().join("pkgs")).expect("install");
+
+        let mut seen = 0;
+        let mut pending = vec![dest];
+        while let Some(p) = pending.pop() {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+            assert_eq!(mode & 0o022, 0, "{} is {:o}", p.display(), mode);
+            seen += 1;
+            if p.is_dir() {
+                pending.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+            }
+        }
+        // The walk saw the tree: the package dir, lib/, the manifest and the code.
+        assert_eq!(seen, 4);
+    }
 
     // ---- the instrument, and its own negative controls -----------------------
     //

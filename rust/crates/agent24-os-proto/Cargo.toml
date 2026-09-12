@@ -21,7 +21,19 @@ rustix = { version = "0.38", features = ["process"] }
 # `sync` for the revocation signal (`watch`) and the callback channels; `macros`
 # for `select!` (the proxy's race against revocation, and `rpc::serve`); `rt` +
 # `io-util` for the callback connection loop (ME-3c).
-tokio = { version = "1", features = ["time", "sync", "macros", "rt", "io-util"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "rt", "io-util", "process", "signal"] }
+# Passing the proxy's listening socket to a module as fd 3 (SPEC-ME3 §1). The
+# fd mapping has to run between fork and exec (`pre_exec`), which is `unsafe`;
+# this crate keeps `forbid(unsafe_code)` and takes that one step from a small,
+# Google-maintained crate instead (ME3-SUP decision D3, 2026-09-12).
+command-fds = { version = "0.3.3", features = ["tokio"] }
+# The module trampoline marks every fd from 4 up close-on-exec before it execs
+# the module, so only 0–3 reach it. `set_fds_cloexec_threadsafe` is a safe
+# function; doing the same between fork and exec would need `unsafe` here
+# (review of SUP-1, rounds 1–2; user decision: a trampoline).
+# Pinned exactly: the trampoline mirrors this version's fallback-scan bound
+# (`launch::fallback_scan_end`), so an upgrade must re-read it.
+close_fds = "=0.3.2"
 # SPEC §4: a request abandoned by a revocation is logged as "outcome unknown".
 tracing = "0.1"
 
