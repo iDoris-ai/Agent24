@@ -86,7 +86,8 @@ impl std::fmt::Display for EndpointError {
             }
             Self::AlreadyCreated(p) => write!(
                 f,
-                "{} was already taken over by this process; create it once",
+                "{} is still taken over by this process; drop that directory and its \
+                 listeners first",
                 p.display()
             ),
             Self::Io(e) => write!(f, "callback endpoint: {e}"),
@@ -150,15 +151,18 @@ impl CallbackDir {
     /// user cannot rename or replace. Within that, `run/` and the pid directory
     /// are checked here (review of ME3-SUP slice 2, round 1, F8).
     ///
-    /// Once per state directory per process: the pid directory is emptied
-    /// here, so a second call would take the sockets of generations already
-    /// listening away.
+    /// Once at a time per state directory per process: the pid directory is
+    /// emptied here, so a second call while the first directory — or any
+    /// listener made from it — still lives would take the sockets of
+    /// generations already listening away. Once all of them are dropped, it
+    /// can be created again (FU-59).
     ///
     /// # Errors
     ///
     /// [`EndpointError::UnsafeDirectory`] if `run/` or the pid directory is not
-    /// this user's alone; [`EndpointError::AlreadyCreated`] on a second call
-    /// for the same directory; [`EndpointError::Io`] if it cannot be made.
+    /// this user's alone; [`EndpointError::AlreadyCreated`] while a
+    /// directory for the same path, or a listener made from one, still
+    /// lives; [`EndpointError::Io`] if it cannot be made.
     pub fn create(state: &Path) -> Result<Self, EndpointError> {
         let run = state.join("run");
         private_dir(&run)?;

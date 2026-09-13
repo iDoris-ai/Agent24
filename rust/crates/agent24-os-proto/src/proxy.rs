@@ -472,10 +472,11 @@ impl Drop for UpstreamConnection {
 /// then parses what is left of it as a pipelined request can still find a
 /// forged request in it on the same connection, with no second request from
 /// the proxy at all. No HTTP/1.1 proxy can prevent a module's own parser
-/// doing that (a compliant hyper/axum module closes a connection whose body
-/// it did not consume, and does not pipeline); a forged `x-a24-*` token in it
-/// is still one the kernel never minted, and moving to Unix sockets (FU-60)
-/// would not change it (FU-62). Every way a request ends
+/// doing that (a compliant server — hyper, under axum — drains a body it
+/// did not consume or closes the connection when it cannot, and never
+/// reads framed body bytes as a request head); a forged `x-a24-*` token in
+/// it is still one the kernel never minted, and moving to Unix sockets
+/// (FU-60) would not change it (FU-62). Every way a request ends
 /// other than a clean reuse drops the connection, which aborts the driver:
 /// nothing of a request outlives it inside the kernel (FU-47). An idle
 /// connection's driver also ends the moment its generation is revoked, so it
@@ -2627,14 +2628,15 @@ mod tests {
     }
 
     /// FU-63: a module whose keep-alive ends after every response — it closes
-    /// without saying `Connection: close` — costs the client nothing. Two
-    /// things see to it: `IdleConnections::take` passes over a connection
-    /// already seen closed, and a request that finds its reused connection
-    /// closed before it was sent is taken back and sent on a new one. Either
-    /// suffices here: with both gone, requests are answered 502; with only
-    /// the take-back left, none is. The take-back alone matters in the race
-    /// the filter cannot see — a close landing between `take` and the send —
-    /// which this does not pin by itself (FU-64).
+    /// without saying `Connection: close` — costs the client no 502 once the
+    /// proxy has seen the close: `IdleConnections::take` passes over a
+    /// connection seen closed, and one handed over closed before its request
+    /// was sent is taken back and sent again on a new connection. Either
+    /// suffices here; with both gone, requests are answered 502. The pause
+    /// between requests lets the close be seen first: a request that reaches
+    /// the connection in the same instant the module closes it can still be
+    /// answered 502 — once hyper has taken the request, it cannot be sent
+    /// again safely unless it is known to be idempotent (FU-64).
     #[tokio::test]
     async fn a_module_closing_after_every_response_costs_no_502() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2659,9 +2661,10 @@ mod tests {
             }
         });
         let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
-        for i in 0..200 {
+        for i in 0..20 {
             let got = call(proxy, Method::GET, &format!("{NS}/{i}"), &[], "").await;
             assert_eq!(got.status, StatusCode::OK, "request {i}: {}", got.body);
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
