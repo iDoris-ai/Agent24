@@ -1406,11 +1406,13 @@ pub(crate) mod tests {
     /// who can reach the port. So the assertion is on the upstream's connection
     /// count, not only on the status.
     ///
-    /// The daemon does not mount a proxy in production yet — the address comes
-    /// from ME-3b-3's supervisor, which does not hand one over yet. This pins the
-    /// composition (`proxy::mount` + `build_router_with_modules`) before that
-    /// consumer exists, which is the point at which the mount order is still
-    /// cheap to get right.
+    /// The daemon does not mount a proxy in production yet: that is SUP-4,
+    /// which starts a supervisor per module and hands its `Current` to
+    /// `proxy::mount` — the address travels inside each run's `Generation`
+    /// (SUP-3b), not through the mount. This pins the composition
+    /// (`proxy::mount` + `build_router_with_modules`) before that consumer
+    /// exists, which is the point at which the mount order is still cheap to
+    /// get right.
     #[tokio::test]
     async fn a_proxied_module_is_behind_kernel_auth_and_is_not_even_dialled() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1432,12 +1434,11 @@ pub(crate) mod tests {
 
         let st = state().await;
         let token = st.token.to_string();
-        let module = agent24_os_proto::drain::Generation::starting();
+        let module = agent24_os_proto::drain::Generation::serving_at(upstream);
         assert!(module.ready());
         let modules = agent24_os_proto::proxy::mount(
             Router::new(),
             "/api/v1/zzproxy",
-            upstream,
             agent24_os_proto::drain::Current::new(module),
         );
         let router = build_router_with_modules(st, modules);
