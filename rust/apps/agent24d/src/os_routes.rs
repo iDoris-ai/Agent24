@@ -48,12 +48,44 @@ use crate::server::AppState;
 
 /// Render one module for the wire, combining what the config says NOW with what
 /// the daemon did at startup.
-fn view(report: &MountReport, enabled_now: bool, registry_usable: bool) -> DomainOsView {
-    let (state, detail) = match &report.outcome {
-        MountOutcome::Mounted => ("mounted", None),
-        MountOutcome::Disabled => ("disabled", None),
-        MountOutcome::Degraded(why) => ("degraded", Some(why.clone())),
-        MountOutcome::Refused(why) => ("refused", Some(why.clone())),
+fn view(
+    report: &MountReport,
+    enabled_now: bool,
+    registry_usable: bool,
+    live: Option<&agent24_os_proto::supervisor::Status>,
+) -> DomainOsView {
+    use agent24_os_proto::supervisor::Status;
+    let (state, detail) = match (&report.outcome, live) {
+        // A package started at mount: its supervisor says where it is NOW. A
+        // mount verdict alone called a module that had since given up
+        // "mounted" (review of SUP-4, round 1).
+        (MountOutcome::Mounted, Some(status)) => match status {
+            Status::Running => ("mounted", None),
+            Status::Starting { attempt } => ("mounted", Some(format!("starting (run {attempt})"))),
+            Status::Stopping => ("mounted", Some("stopping".to_owned())),
+            Status::Backoff { failures, delay } => (
+                "degraded",
+                Some(format!(
+                    "restarting in {}ms after {failures} failed run(s)",
+                    delay.as_millis()
+                )),
+            ),
+            Status::GaveUp { failures, within } => (
+                "degraded",
+                Some(format!(
+                    "gave up after {failures} failed runs within {}s",
+                    within.as_secs()
+                )),
+            ),
+            Status::StopFailed { error } => ("degraded", Some(error.clone())),
+            Status::Stopped => ("degraded", Some("stopped".to_owned())),
+            Status::Panicked => ("degraded", Some("its supervisor panicked".to_owned())),
+            Status::Killed => ("degraded", Some("killed".to_owned())),
+        },
+        (MountOutcome::Mounted, None) => ("mounted", None),
+        (MountOutcome::Disabled, _) => ("disabled", None),
+        (MountOutcome::Degraded(why), _) => ("degraded", Some(why.clone())),
+        (MountOutcome::Refused(why), _) => ("refused", Some(why.clone())),
     };
     let (resources, missing_models) = match &report.resources {
         ResourceStatus::NotChecked => ("not_checked", Vec::new()),
@@ -144,7 +176,18 @@ fn render(state: &AppState) -> Response {
     let modules = state
         .os_reports
         .iter()
-        .map(|r| view(r, cfg.is_enabled(&r.name), registry_error.is_none()))
+        .map(|r| {
+            let live = state
+                .module_status
+                .get(&r.name)
+                .map(|rx| rx.borrow().clone());
+            view(
+                r,
+                cfg.is_enabled(&r.name),
+                registry_error.is_none(),
+                live.as_ref(),
+            )
+        })
         .collect();
     Json(DomainOsList {
         modules,
@@ -216,6 +259,29 @@ mod tests {
     use super::*;
     use crate::domain::{MountOutcome, MountReport, ResourceStatus};
 
+    /// A package mounted at start is reported by its supervisor's status NOW:
+    /// one that has given up is degraded, with the reason — not "mounted"
+    /// (review of SUP-4, round 1). Control: a running one is mounted.
+    #[test]
+    fn a_mounted_package_is_reported_by_its_live_status() {
+        use agent24_os_proto::supervisor::Status;
+        let r = report("pkg", MountOutcome::Mounted);
+        let gave_up = Status::GaveUp {
+            failures: 5,
+            within: std::time::Duration::from_secs(4),
+        };
+        let v = view(&r, true, true, Some(&gave_up));
+        assert_eq!(v.state, "degraded");
+        assert!(
+            v.detail.as_deref().is_some_and(|d| d.contains("gave up")),
+            "{:?}",
+            v.detail
+        );
+        let v = view(&r, true, true, Some(&Status::Running));
+        assert_eq!(v.state, "mounted");
+        assert_eq!(v.detail, None);
+    }
+
     /// A report shaped the way the mounter actually produces one.
     ///
     /// Two invariants the earlier fixture broke, and a broken fixture hides
@@ -261,14 +327,14 @@ mod tests {
         // user staring at a contradiction; `restart_required` is what turns that
         // into a fact they can act on.
         let running = report("sin90", MountOutcome::Mounted);
-        let v = view(&running, false, true);
+        let v = view(&running, false, true, None);
         assert_eq!(v.state, "mounted", "it is still serving right now");
         assert!(!v.enabled, "but the config now says off");
         assert!(v.restart_required);
 
         // And the other direction.
         let off = report("sin90", MountOutcome::Disabled);
-        let v = view(&off, true, true);
+        let v = view(&off, true, true, None);
         assert_eq!(v.state, "disabled");
         assert!(v.enabled);
         assert!(v.restart_required);
@@ -307,17 +373,17 @@ mod tests {
         let mut r = report("sin90", MountOutcome::Degraded("os.json ...".into()));
         r.enabled_at_start = None;
         assert!(
-            !view(&r, true, false).restart_required,
+            !view(&r, true, false, None).restart_required,
             "the registry is still unusable; the fix is the file, not a restart"
         );
         // Once it IS usable, the config has genuinely never been applied.
-        assert!(view(&r, true, true).restart_required);
+        assert!(view(&r, true, true, None).restart_required);
     }
 
     #[test]
     fn a_settled_module_does_not_ask_for_a_restart() {
-        assert!(!view(&report("a", MountOutcome::Mounted), true, true).restart_required);
-        assert!(!view(&report("a", MountOutcome::Disabled), false, true).restart_required);
+        assert!(!view(&report("a", MountOutcome::Mounted), true, true, None).restart_required);
+        assert!(!view(&report("a", MountOutcome::Disabled), false, true, None).restart_required);
     }
 
     #[test]
@@ -329,7 +395,7 @@ mod tests {
             "health",
             MountOutcome::Refused("kernel route segment".into()),
         );
-        let v = view(&r, true, true);
+        let v = view(&r, true, true, None);
         assert_eq!(v.state, "refused");
         assert!(v.enabled, "the config wants it");
         assert!(
@@ -351,7 +417,7 @@ mod tests {
             "sin90",
             MountOutcome::Degraded("store failed to open".into()),
         );
-        let v = view(&r, true, true);
+        let v = view(&r, true, true, None);
         assert!(!v.restart_required);
         assert_eq!(
             v.detail.as_deref(),
@@ -361,7 +427,7 @@ mod tests {
 
         // And the case the availability comparison MISSED entirely: disabling an
         // already-degraded module IS a real pending change.
-        assert!(view(&r, false, true).restart_required);
+        assert!(view(&r, false, true, None).restart_required);
     }
 
     #[tokio::test]
@@ -417,7 +483,7 @@ mod tests {
             granted: Vec::new(),
             resources: ResourceStatus::NotChecked,
         };
-        let v = view(&r, true, true);
+        let v = view(&r, true, true, None);
         assert_eq!(v.name, "sin90");
         assert_eq!(v.version, "0.2.1");
         assert_eq!(v.state, "degraded");
@@ -441,13 +507,13 @@ mod tests {
             granted: Vec::new(),
             resources: ResourceStatus::NotChecked,
         };
-        let v = view(&r, false, true);
+        let v = view(&r, false, true, None);
         assert_eq!(v.state, "disabled");
         assert!(!v.enabled);
         assert!(!v.restart_required, "config and runtime agree");
 
         // And once the user enables it, the list says a restart is what applies it.
-        assert!(view(&r, true, true).restart_required);
+        assert!(view(&r, true, true, None).restart_required);
     }
 
     #[tokio::test]
@@ -482,12 +548,12 @@ mod tests {
     fn resource_status_is_flattened_without_losing_which_case_it_was() {
         let mut r = report("m", MountOutcome::Mounted);
         r.resources = ResourceStatus::MissingModels(vec!["ornith-9b".into()]);
-        let v = view(&r, true, true);
+        let v = view(&r, true, true, None);
         assert_eq!(v.resources, "missing");
         assert_eq!(v.missing_models, vec!["ornith-9b".to_owned()]);
 
         r.resources = ResourceStatus::Unknown("provider down".into());
-        let v = view(&r, true, true);
+        let v = view(&r, true, true, None);
         assert_eq!(v.resources, "unknown");
         assert!(
             v.missing_models.is_empty(),
@@ -495,6 +561,6 @@ mod tests {
         );
 
         r.resources = ResourceStatus::NotChecked;
-        assert_eq!(view(&r, true, true).resources, "not_checked");
+        assert_eq!(view(&r, true, true, None).resources, "not_checked");
     }
 }

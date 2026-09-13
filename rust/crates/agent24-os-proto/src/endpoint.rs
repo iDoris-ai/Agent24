@@ -272,6 +272,59 @@ fn private_dir(path: &Path) -> Result<(), EndpointError> {
     check_private(path)
 }
 
+/// Remove the socket directories of daemons that are gone (FU-56): `run/<pid>/`
+/// for every pid that no longer exists, when it is this user's real directory.
+/// A live pid's directory is kept — it may be another daemon's — and so is one
+/// whose pid cannot be asked about (`EPERM`: not this user's process). Nothing
+/// is followed through a symlink, and `run/` itself must pass the same check as
+/// when it is created, or nothing is touched. Returns what was removed. Called
+/// once at daemon start, before [`CallbackDir::create`].
+///
+/// **Assumes one daemon per state directory at a time** (agent24d holds a
+/// singleton lock for its state directory, and an ephemeral daemon has a root
+/// of its own). Between "that pid is gone" and the removal, a reused pid's new
+/// daemon could take the directory over in the same state directory only if
+/// two daemons shared it — which that lock rules out. Without it, this would
+/// need a per-directory lock (review of SUP-4, round 1).
+pub fn remove_stale(state: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let run = state.join("run");
+    if check_private(&run).is_err() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&run) else {
+        return Vec::new();
+    };
+    let me = rustix::process::geteuid().as_raw();
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if u32::try_from(pid).is_ok_and(|p| p == std::process::id()) {
+            continue;
+        }
+        let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+            continue;
+        };
+        if rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() && meta.uid() == me && std::fs::remove_dir_all(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
 /// A real directory, this user's, mode exactly `0700` (SPEC §1: the kernel
 /// listens on a path it chose, `0700`). The first version refused only group-
 /// or other-WRITABLE, which let `0755` through (review of ME3-SUP slice 2,
@@ -1101,5 +1154,37 @@ mod tests {
         std::fs::remove_file(&pid_path).unwrap();
         let dir = CallbackDir::create(s.path()).expect("the retry was refused");
         assert!(dir.listen_next().is_ok());
+    }
+
+    /// FU-56: at daemon start, the socket directories of daemons that are gone
+    /// are removed — and one whose pid is alive is kept (it may be another
+    /// daemon's; here a live child of this test stands in for it), as is this
+    /// process's own.
+    #[test]
+    fn stale_socket_directories_are_removed_and_live_ones_kept() {
+        let s = state();
+        let run = s.path().join("run");
+        private_dir(&run).unwrap();
+        // A pid that is gone: a child that has already been waited for.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap();
+        let mut alive = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        for pid in [gone_pid, alive.id(), std::process::id()] {
+            std::fs::create_dir(run.join(pid.to_string())).unwrap();
+        }
+        let removed = remove_stale(s.path());
+        assert_eq!(removed, vec![run.join(gone_pid.to_string())]);
+        assert!(!run.join(gone_pid.to_string()).exists());
+        assert!(
+            run.join(alive.id().to_string()).exists(),
+            "a live pid's directory was removed"
+        );
+        assert!(run.join(std::process::id().to_string()).exists());
+        alive.kill().unwrap();
+        alive.wait().unwrap();
     }
 }

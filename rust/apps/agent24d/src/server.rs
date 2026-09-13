@@ -17,10 +17,30 @@ use rand::RngCore;
 use std::sync::Arc as StdArc;
 use tokio_util::sync::CancellationToken;
 
-/// Grace period for in-flight requests after a shutdown signal; the process
-/// force-exits after this so `kill -TERM` always terminates within ~2s
-/// (TASKS B2 acceptance).
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How long a shutdown's work gets — the HTTP drain, and out-of-process
+/// modules drained and stopped alongside it (SUP-4) — before the server is
+/// abandoned. With [`WATCHDOG_MARGIN`] for the runtime's teardown, `kill -TERM`
+/// ends the process within 2s (TASKS B2 acceptance): the watchdog guarantees
+/// it.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
+
+/// SIGTERM to SIGKILL for an out-of-process module this daemon stops. ⚖️
+/// Much shorter than the library's default so that draining, stopping and
+/// reaping every module fit in [`SHUTDOWN_GRACE`].
+const MODULE_STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// How far past the shutdown deadline the process may run before the watchdog
+/// ends it: time for the runtime's own bounded teardown (`main`'s
+/// `shutdown_timeout`, shorter than this). [`SHUTDOWN_GRACE`] plus this is the
+/// 2s of TASKS B2.
+const WATCHDOG_MARGIN: Duration = Duration::from_millis(500);
+
+/// How long a shutdown lets out-of-process modules finish the requests they
+/// already have (DRAINING, SPEC §4) before stopping them. ⚖️ This and
+/// [`MODULE_STOP_GRACE`] share [`SHUTDOWN_GRACE`]: drain first, so a request a
+/// module is working on is answered rather than abandoned; then a short grace,
+/// since a drained module has nothing in flight.
+const MODULE_DRAIN: Duration = Duration::from_millis(800);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,6 +65,15 @@ pub struct AppState {
     /// `agent24 os enable` needs a name to act on and a module that only appeared
     /// once it was already on could never be turned on.
     pub os_reports: Arc<Vec<crate::domain::MountReport>>,
+    /// The live status of each out-of-process module, by name: what `agent24
+    /// os list` reports beyond the startup verdict (a package can be mounted
+    /// and since have given up).
+    pub module_status: Arc<
+        std::collections::HashMap<
+            String,
+            tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
+        >,
+    >,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -52,9 +81,90 @@ pub struct AppState {
     /// it contributed. Never read on purpose — its job is to exist (M-E/E1b).
     #[allow(dead_code, reason = "RAII: keeps MCP child processes alive")]
     pub mcp_servers: Arc<Vec<Arc<agent24_mcp::McpServer>>>,
-    /// Daemon-wide shutdown token; handlers derive request tokens from it so
-    /// shutdown cancels in-flight provider calls (run-level cancel joins in C2)
-    pub shutdown: CancellationToken,
+    /// Daemon-wide shutdown: handlers derive request tokens from it so
+    /// shutdown cancels in-flight provider calls (run-level cancel joins in C2),
+    /// and `POST /api/v1/shutdown` requests it.
+    pub shutdown: Shutdown,
+}
+
+/// A shutdown request, from anything that can make one — a signal, `POST
+/// /api/v1/shutdown`, the server ending. [`Shutdown::request`] is synchronous
+/// and does no I/O: it fixes the deadline, arms the watchdog, and cancels, in
+/// that order — so nothing stuck, a stalled stderr say, keeps a shutdown from
+/// starting or from being bounded (review of SUP-4, rounds 4 and 5). Clones
+/// share one deadline and one watchdog.
+#[derive(Clone)]
+pub struct Shutdown {
+    token: CancellationToken,
+    at: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    /// `STARTING`, `READY` or `STOPPING`: readiness and a shutdown request
+    /// decide, once and atomically, which came first (see
+    /// [`Shutdown::commit_ready`]).
+    phase: Arc<std::sync::atomic::AtomicU8>,
+}
+
+const STARTING: u8 = 0;
+const READY: u8 = 1;
+const STOPPING: u8 = 2;
+
+impl Shutdown {
+    #[must_use]
+    pub fn new(token: CancellationToken) -> Self {
+        Self {
+            token,
+            at: Arc::new(std::sync::OnceLock::new()),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            phase: Arc::new(std::sync::atomic::AtomicU8::new(STARTING)),
+        }
+    }
+
+    /// Begin the shutdown (idempotent).
+    pub fn request(&self) {
+        self.phase
+            .store(STOPPING, std::sync::atomic::Ordering::SeqCst);
+        arm_watchdog(self.deadline(), &self.armed);
+        self.token.cancel();
+    }
+
+    /// Declare the daemon ready — unless a shutdown was requested first.
+    /// `false`: it was, and nothing may say this daemon is ready. One atomic
+    /// step against [`Shutdown::request`], so the two cannot both win: a
+    /// check followed by the ready line let a shutdown land in between and the
+    /// CLI report a daemon started that was already exiting (review of SUP-4,
+    /// rounds 5 and 7).
+    #[must_use]
+    pub fn commit_ready(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                STARTING,
+                READY,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// When the shutdown's work must be done: fixed by the first
+    /// [`Shutdown::request`], or — for a token cancelled some other way — by
+    /// the first look after it.
+    #[must_use]
+    pub fn deadline(&self) -> tokio::time::Instant {
+        *self
+            .at
+            .get_or_init(|| tokio::time::Instant::now() + SHUTDOWN_GRACE)
+    }
+
+    #[must_use]
+    pub fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    /// A token cancelled with the shutdown.
+    #[must_use]
+    pub fn child_token(&self) -> CancellationToken {
+        self.token.child_token()
+    }
 }
 
 /// The model ids on offer at startup, for the mount-time resource check.
@@ -272,7 +382,7 @@ pub struct AppDeps {
     pub router: Arc<ModelRouter>,
     pub tools: agent24_tools::ToolRegistry,
     pub store: Store,
-    pub shutdown: CancellationToken,
+    pub shutdown: Shutdown,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
     pub mcp_servers: Vec<Arc<agent24_mcp::McpServer>>,
@@ -326,7 +436,7 @@ impl AppState {
             Arc::clone(&router),
             Arc::clone(&tools),
             StdArc::new(events.clone()),
-            shutdown.clone(),
+            shutdown.token().clone(),
             memory,
         );
         let sched_hub = events.clone();
@@ -354,6 +464,7 @@ impl AppState {
             // assignment is ordered ahead of router construction rather than left
             // to chance.
             os_reports: Arc::new(Vec::new()),
+            module_status: Arc::new(std::collections::HashMap::new()),
             runs,
             scheduler,
             shutdown,
@@ -389,8 +500,8 @@ async fn health() -> Json<Health> {
 /// unlike a pid from a possibly-stale state file, this can never kill an
 /// unrelated reused-pid process). Used by `agent24 daemon stop`.
 async fn shutdown_handler(State(state): State<AppState>) -> Response {
+    state.shutdown.request();
     tracing::info!("shutdown requested via /api/v1/shutdown");
-    state.shutdown.cancel();
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "ok": true })),
@@ -546,6 +657,60 @@ pub async fn serve(
     ephemeral: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    // The shutdown controller, and the signals that request it, before
+    // anything else: a SIGTERM during startup — which can take seconds (the
+    // store, MCP servers, model probing) — runs this bounded shutdown rather
+    // than the default action, which ends the daemon as signal-killed, a crash
+    // to a supervisor such as launchd (review of SUP-4, round 6).
+    let shutdown = Shutdown::new(cancel.clone());
+    // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
+    // Registered HERE — before any module process can be started — and
+    // synchronously: a SIGTERM arriving while packages start must run this
+    // shutdown, which stops them, not the default action, which ends the daemon
+    // and leaves them running (review of SUP-4, round 1).
+    // A registration that fails is fatal HERE, before any module runs: a
+    // daemon that cannot hear SIGTERM cannot stop its modules when asked to
+    // (review of SUP-4, round 2).
+    #[cfg(unix)]
+    let (mut sigterm, mut sigint) = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
+    // The one shutdown deadline. A signal fixes it BEFORE it cancels, so it is
+    // the moment of the signal; any other way shutdown starts (an HTTP
+    // shutdown, the server ending) fixes it at the first look after the cancel
+    // — a scheduling delay later, which the watchdog below bounds (review of
+    // SUP-4, round 3).
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = sigterm.recv() => {},
+            _ = sigint.recv() => {},
+        }
+        #[cfg(not(unix))]
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!("SIGINT handler failed: {err}");
+            std::future::pending::<()>().await;
+        }
+        // The request first; the log line last — a stalled stderr must not be
+        // what keeps the shutdown from starting.
+        signal_shutdown.request();
+        tracing::info!("shutdown signal received");
+    });
+    // For a token cancelled other than through `Shutdown::request` (a child
+    // token's owner, say): the watchdog is armed at the first look after it.
+    {
+        let observed = shutdown.clone();
+        tokio::spawn(async move {
+            observed.token().cancelled().await;
+            observed.request();
+        });
+    }
+
     // Non-ephemeral daemons are singletons: hold an exclusive lifetime lock so
     // a concurrently-started second daemon fails fast instead of leaking as an
     // untracked process (review B6). Ephemeral instances skip both the lock
@@ -653,7 +818,7 @@ pub async fn serve(
         tools,
         store,
         risk_overrides,
-        shutdown: cancel.clone(),
+        shutdown: shutdown.clone(),
         guardian,
         memory,
         mcp_servers,
@@ -734,11 +899,11 @@ pub async fn serve(
         // A CLOSURE, not a constructed module: the mounter decides whether this
         // ever runs. That is what lets a user switch off a domain OS whose
         // constructor is the thing breaking the daemon.
-        build: Box::new(move || {
+        build: crate::domain::Build::InProcess(Box::new(move || {
             agent24_sin90_os::Sin90Module::new(mode.clone())
                 .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
                 .map_err(|e| e.to_string())
-        }),
+        })),
     }];
 
     // ME-3a: the catalogue is no longer only what was compiled in. The merge is a
@@ -788,7 +953,14 @@ pub async fn serve(
     // while always answering the same thing. When a module that needs models
     // arrives, `Installed` gains a `requires_models` field and this becomes a real
     // predicate over it.
-    let needs_models = false;
+    // Packages carry their manifest already (it was read at discovery), so a
+    // package that declares a model can be known without constructing
+    // anything: probe if any does. Compiled-in modules still cannot say without
+    // being built, and none in this build declares one.
+    let needs_models = catalogue.iter().any(|e| {
+        matches!(&e.build, crate::domain::Build::Package(p) if !p.manifest.requires_models().is_empty())
+            && os_config.as_ref().is_ok_and(|c| c.is_enabled(&e.name))
+    });
     let inventory = if needs_models {
         ModelCatalog::probe(&state.router, &cancel).await
     } else {
@@ -800,6 +972,58 @@ pub async fn serve(
         Some(kv) => crate::domain::MemoryLease::open(LOCAL_USER, kv).await,
         None => None,
     };
+    // SUP-4: what out-of-process modules are started with. Its callback
+    // sockets live under the state directory — or, for an ephemeral daemon,
+    // under its throwaway root. Directories left by daemons that are gone are
+    // cleared first (FU-56). A daemon that cannot set this up still runs; its
+    // packages degrade, with the reason.
+    // 127.0.0.1 only — never a public bind (SPEC-001 §9). Bound BEFORE any
+    // module is started: a port that is taken fails startup here, rather than
+    // after packages are running, on a path that would leave them to the
+    // runtime's teardown instead of the ordered stop (review of SUP-4, round 4).
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let local = listener.local_addr()?;
+
+    let host = process_host(if ephemeral { &os_root } else { &state_dir });
+    if let Err(why) = &host {
+        tracing::error!("out-of-process domain OS modules cannot be started: {why}");
+    }
+    // Modules are owned by the shutdown from the moment each starts — this
+    // task exists before the first one does — so a shutdown that begins while
+    // later packages are still being mounted stops the earlier ones, within
+    // the same bound (review of SUP-4, round 3). It drains and then stops
+    // them, alongside the HTTP drain, inside SHUTDOWN_GRACE (TASKS B2): a
+    // module still stopping at the deadline is dropped with its supervisor,
+    // which SIGKILLs its group — and a module reads EOF on its callback
+    // connection as the end of its run (D1), so one that outlives this
+    // process exits on its own.
+    let registry = host.as_ref().ok().map(|h| h.supervisors.clone());
+    let stop_shutdown = shutdown.clone();
+    let stopping = tokio::spawn(async move {
+        stop_shutdown.token().cancelled().await;
+        let deadline = stop_shutdown.deadline();
+        // The discovery state goes first, off this task: a watchdog exit later
+        // must not leave a state file pointing at a daemon that is gone. (The
+        // singleton lock is held until the process exits, so no second daemon
+        // can start in the meantime.)
+        if !ephemeral {
+            let pid = std::process::id();
+            // A thread of its own rather than the blocking pool, which a
+            // package-tree scan can have busy. Best effort all the same: on a
+            // stalled filesystem nothing can promise it before the watchdog,
+            // and a reader of a stale file still checks that its pid is alive.
+            let _ = std::thread::Builder::new()
+                .name("state-file-cleanup".to_owned())
+                .spawn(move || agent24_protocol::state_file::remove_if_owner(pid));
+        }
+        let supervisors = registry.map(|r| r.close()).unwrap_or_default();
+        if tokio::time::timeout_at(deadline, stop_supervisors(supervisors))
+            .await
+            .is_err()
+        {
+            tracing::warn!("out-of-process modules were still stopping at the deadline; killed");
+        }
+    });
     let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
@@ -807,6 +1031,7 @@ pub async fn serve(
         os_config.as_ref().map_err(String::as_str),
         &inventory,
         lease.as_ref(),
+        host.as_ref().map_err(String::as_str),
     )
     .await;
     for p in partitions.partitions() {
@@ -882,11 +1107,21 @@ pub async fn serve(
     // Hand the verdicts to the state BEFORE the router clones it, so `/api/v1/os`
     // can report what the mounter actually decided rather than re-deriving it.
     state.os_reports = Arc::new(reports);
+    state.module_status = Arc::new(
+        host.as_ref()
+            .map(|h| h.supervisors.statuses())
+            .unwrap_or_default(),
+    );
     let router = build_router_with_modules(state, module_routes);
 
-    // 127.0.0.1 only — never a public bind (SPEC-001 §9)
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    let local = listener.local_addr()?;
+    // A shutdown that began during startup ends it here, before anything says
+    // this daemon is ready: its modules are stopped, and no state file or
+    // ready line advertises a daemon that is about to exit (review of SUP-4,
+    // round 4). Checked again, atomically, before the ready line below.
+    if cancel.is_cancelled() {
+        let _ = stopping.await;
+        return Ok(());
+    }
 
     // SPEC-002 §4 ready line: parsers scan stdout for the first type=="ready"
     // JSON line. stdout carries nothing else (logs go to stderr).
@@ -905,6 +1140,17 @@ pub async fn serve(
         tracing::warn!("could not write daemon state file: {err}");
     }
 
+    // The state file is written; now readiness and a shutdown request race
+    // for one atomic flag. Lost to a shutdown: take the file back — the
+    // cleanup at the shutdown's start may have run before it existed — and
+    // print no ready line.
+    if !shutdown.commit_ready() {
+        if !ephemeral {
+            agent24_protocol::state_file::remove_if_owner(daemon_pid);
+        }
+        let _ = stopping.await;
+        return Ok(());
+    }
     println!(
         "{}",
         serde_json::json!({
@@ -914,46 +1160,6 @@ pub async fn serve(
             "version": env!("CARGO_PKG_VERSION"),
         })
     );
-
-    // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev)
-    let signal_cancel = cancel.clone();
-    tokio::spawn(async move {
-        let sigterm = async {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{SignalKind, signal};
-                match signal(SignalKind::terminate()) {
-                    Ok(mut s) => {
-                        s.recv().await;
-                    }
-                    Err(err) => {
-                        // Never resolve on registration failure — resolving would
-                        // be indistinguishable from a real signal and trigger an
-                        // immediate graceful shutdown at startup.
-                        tracing::error!("SIGTERM handler failed: {err}");
-                        std::future::pending::<()>().await;
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            std::future::pending::<()>().await;
-        };
-        let sigint = async {
-            if let Err(err) = tokio::signal::ctrl_c().await {
-                // Mirror the SIGTERM arm: a registration failure must never be
-                // indistinguishable from a real signal — park forever instead
-                // of resolving the select and triggering a spurious shutdown.
-                tracing::error!("SIGINT handler failed: {err}");
-                std::future::pending::<()>().await;
-            }
-        };
-        tokio::select! {
-            () = sigterm => {},
-            () = sigint => {},
-        }
-        tracing::info!("shutdown signal received");
-        signal_cancel.cancel();
-    });
 
     let graceful_cancel = cancel.clone();
     let server = axum::serve(listener, router)
@@ -965,17 +1171,125 @@ pub async fn serve(
         result = server => result,
         () = async {
             cancel.cancelled().await;
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            tokio::time::sleep_until(shutdown.deadline()).await;
         } => {
             tracing::warn!("graceful shutdown exceeded {SHUTDOWN_GRACE:?}; forcing exit");
             Ok(())
         }
     };
+    // The server can end without a cancel (an accept error); the modules stop
+    // either way. The wait is bounded by the task itself.
+    shutdown.request();
+    let _ = stopping.await;
     // Only remove our own state file — a newer daemon may have replaced it
     if !ephemeral {
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
     }
     result
+}
+
+/// What out-of-process modules are started with: the callback directory under
+/// `root` (stale ones cleared first, FU-56), this binary as the trampoline, and
+/// the daemon's stop grace.
+fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, String> {
+    for gone in agent24_os_proto::endpoint::remove_stale(root) {
+        tracing::info!(
+            "removed the callback directory of a daemon that is gone: {}",
+            gone.display()
+        );
+    }
+    let callback_dir = agent24_os_proto::endpoint::CallbackDir::create(root)
+        .map_err(|e| format!("callback directory: {e}"))?;
+    // Checked now, for the longest name a socket there can get, rather than
+    // failing every module's start — and then its restarts — one by one: a long
+    // `TMPDIR` (an ephemeral daemon's root) can put every socket over the limit.
+    let longest = callback_dir.path().join(format!("{}.sock", u64::MAX));
+    if longest.as_os_str().len() > agent24_os_proto::endpoint::MAX_SOCKET_PATH {
+        return Err(format!(
+            "callback sockets under {} would be longer than {} bytes",
+            callback_dir.path().display(),
+            agent24_os_proto::endpoint::MAX_SOCKET_PATH
+        ));
+    }
+    // This binary, which hands a module over at the top of `main`
+    // (`run_as_trampoline_if_asked`), so it needs no arguments of its own. By
+    // path: a module restarted after the binary was replaced or moved runs the
+    // new one, or fails to start — upgrading the daemon means restarting it.
+    let program = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;
+    Ok(crate::domain::ProcessHost {
+        callback_dir: StdArc::new(callback_dir),
+        trampoline: agent24_os_proto::launch::Trampoline {
+            program,
+            args: Vec::new(),
+        },
+        timings: agent24_os_proto::supervisor::Timings {
+            stop_grace: MODULE_STOP_GRACE,
+            ..agent24_os_proto::supervisor::Timings::default()
+        },
+        supervisors: StdArc::new(crate::domain::Supervisors::default()),
+    })
+}
+
+/// Arm the hard bound, once: at `deadline` + [`WATCHDOG_MARGIN`] the process
+/// ends, whatever is stuck — a module's directory on a stalled filesystem
+/// during startup, a blocking task. A native thread, so no scheduling of the
+/// runtime can delay it; an absolute instant, so arming it late does not move
+/// it; no I/O when it fires, so a stalled stderr cannot hold it; and exit
+/// status 0, because a shutdown was asked for — a supervisor such as launchd
+/// must not read it as a crash and start the daemon again (review of SUP-4,
+/// round 4). A thread the OS refuses to create ends the process at once,
+/// rather than losing the shutdown (round 5). Modules it did not get to stop
+/// read EOF on their callback connections, which ends their runs (D1).
+fn arm_watchdog(deadline: tokio::time::Instant, armed: &std::sync::atomic::AtomicBool) {
+    if armed
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let at = deadline.into_std() + WATCHDOG_MARGIN;
+    let spawned = std::thread::Builder::new()
+        .name("shutdown-watchdog".to_owned())
+        .spawn(move || {
+            let now = std::time::Instant::now();
+            if at > now {
+                std::thread::sleep(at - now);
+            }
+            std::process::exit(0);
+        });
+    if spawned.is_err() {
+        std::process::exit(0);
+    }
+}
+
+/// Stop every supervised module, the way SPEC §4 stops one, concurrently for
+/// all: DRAINING first — new proxied requests refused, the ones in flight left
+/// to finish, for up to [`MODULE_DRAIN`] — then REVOKING and the process stop.
+/// Each supervisor does both itself (`drain_and_stop`), so a module that was
+/// starting is stopped without ever serving and none is restarted into a
+/// generation nobody drained (review of SUP-4, round 2). Logs any stop that
+/// was not clean. The caller bounds the whole of it.
+///
+/// Draining first is what keeps a shutdown from answering a request a module
+/// is in the middle of `request_abandoned` — and a client that then retries a
+/// write the module did complete (review of SUP-4, round 1).
+async fn stop_supervisors(supervisors: Vec<crate::domain::Supervised>) {
+    let mut stops = tokio::task::JoinSet::new();
+    for s in supervisors {
+        stops.spawn(async move { (s.name, s.handle.drain_and_stop(MODULE_DRAIN).await) });
+    }
+    while let Some(done) = stops.join_next().await {
+        match done {
+            Ok((_, Ok(()))) => {}
+            Ok((name, Err(e))) => tracing::error!("domain OS {name:?} did not stop cleanly: {e}"),
+            Err(e) => tracing::error!("stopping a domain OS failed: {e}"),
+        }
+    }
 }
 
 /// Append packages found on disk to a build-time catalogue.
@@ -987,10 +1301,9 @@ pub async fn serve(
 /// that `vec!` means editing and rebuilding the daemon.
 ///
 /// A discovered package is NOT constructed here, and cannot be: an out-of-process
-/// module has no Rust type, and the transport that would give it one is ME-3b. Its
-/// `build` closure returns an error naming that. The entry still reaches the
-/// mounter, is refused there by the check that already exists, and — the point —
-/// appears in `agent24 os list` with a reason.
+/// module has no Rust type. It becomes a [`crate::domain::Build::Package`], which
+/// the mounter starts under a supervisor — only if it is admissible and enabled —
+/// and which appears in `agent24 os list` either way.
 ///
 /// **Order is load-bearing.** Discovered entries go AFTER the built-in ones, and
 /// `mount_all` claims names first-come-first-served, so a disk package cannot
@@ -1023,21 +1336,18 @@ fn with_discovered(
     for d in scan.found {
         let name = d.manifest.name().to_owned();
         let version = d.manifest.version().to_owned();
-        let dir = d.dir.clone();
         tracing::info!(
             "discovered domain OS {name:?} v{version} at {}",
-            dir.display()
+            d.dir.display()
         );
         catalogue.push(crate::domain::Installed {
             name,
             version,
-            build: Box::new(move || {
-                Err(format!(
-                    "{} declares an out-of-process provider; that transport is not \
-                     implemented yet (ME-3b)",
-                    dir.display()
-                ))
-            }),
+            build: crate::domain::Build::Package(Box::new(crate::domain::Package {
+                manifest: d.manifest,
+                dir: d.dir,
+                digest: d.digest,
+            })),
         });
     }
     catalogue
@@ -1064,11 +1374,34 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    /// Readiness and a shutdown request cannot both win: requested first, the
+    /// daemon never says it is ready; ready first, the shutdown still happens
+    /// (review of SUP-4, round 7).
+    #[test]
+    fn readiness_and_a_shutdown_request_decide_once() {
+        let stopping_first = Shutdown::new(CancellationToken::new());
+        stopping_first.token().cancel(); // no watchdog in a test process
+        stopping_first
+            .phase
+            .store(STOPPING, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !stopping_first.commit_ready(),
+            "ready after a shutdown request"
+        );
+
+        let ready_first = Shutdown::new(CancellationToken::new());
+        assert!(ready_first.commit_ready());
+        assert!(!ready_first.commit_ready(), "ready twice");
+        assert!(!ready_first.token().is_cancelled());
+    }
+
     fn built_in(name: &str) -> crate::domain::Installed {
         crate::domain::Installed {
             name: name.to_owned(),
             version: "9.9.9".to_owned(),
-            build: Box::new(|| Err("built-in, not constructed in this test".to_owned())),
+            build: crate::domain::Build::InProcess(Box::new(|| {
+                Err("built-in, not constructed in this test".to_owned())
+            })),
         }
     }
 
@@ -1195,11 +1528,11 @@ pub(crate) mod tests {
         let entry = crate::domain::Installed {
             name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
             version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-            build: Box::new(move || {
+            build: crate::domain::Build::InProcess(Box::new(move || {
                 agent24_sin90_os::Sin90Module::new(mode.clone())
                     .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
                     .map_err(|e| e.to_string())
-            }),
+            })),
         };
         let (modules, _, _) = crate::domain::mount_all(
             &[entry],
@@ -1208,6 +1541,7 @@ pub(crate) mod tests {
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
             None,
+            Err("no process host in this test"),
         )
         .await;
         (build_router_with_modules(st, modules), tmp)
@@ -1221,7 +1555,7 @@ pub(crate) mod tests {
             router: Arc::new(ModelRouter::with_defaults(vec![])),
             tools: agent24_tools::ToolRegistry::new(),
             store: Store::open_memory().await.unwrap(),
-            shutdown: CancellationToken::new(),
+            shutdown: Shutdown::new(CancellationToken::new()),
             guardian,
             memory: None,
             mcp_servers: Vec::new(),
@@ -1346,7 +1680,9 @@ pub(crate) mod tests {
         let entry = crate::domain::Installed {
             name: "probe".to_owned(),
             version: "0.1.0".to_owned(),
-            build: Box::new(move || Ok(m.clone() as StdArc<dyn DomainModule>)),
+            build: crate::domain::Build::InProcess(Box::new(move || {
+                Ok(m.clone() as StdArc<dyn DomainModule>)
+            })),
         };
         let (modules, reports, _) = crate::domain::mount_all(
             &[entry],
@@ -1355,6 +1691,7 @@ pub(crate) mod tests {
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
             None,
+            Err("no process host in this test"),
         )
         .await;
         assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);
@@ -2053,11 +2390,11 @@ pub(crate) mod tests {
         let entry = crate::domain::Installed {
             name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
             version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-            build: Box::new(|| {
+            build: crate::domain::Build::InProcess(Box::new(|| {
                 agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Memory)
                     .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
                     .map_err(|e| e.to_string())
-            }),
+            })),
         };
         let (modules, _, _) = crate::domain::mount_all(
             &[entry],
@@ -2066,6 +2403,7 @@ pub(crate) mod tests {
             Ok(&crate::os_config::OsConfig::default()),
             &NoModels,
             None,
+            Err("no process host in this test"),
         )
         .await;
         let router = build_router_with_modules(st, modules);

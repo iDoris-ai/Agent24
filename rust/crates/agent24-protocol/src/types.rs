@@ -57,9 +57,11 @@ pub struct DomainOsView {
     /// What the RUNNING daemon did with it. Open enum:
     /// `mounted` | `disabled` | `degraded` | `refused`.
     pub state: String,
-    /// Why, when there is a reason worth acting on — a degradation or a refusal.
-    /// Absent for `mounted`, and for `disabled`, whose reason is simply that the
-    /// user said so.
+    /// Why, when there is a reason worth acting on — a degradation or a refusal
+    /// — or, for a `mounted` out-of-process module, a passing state worth
+    /// knowing (`starting`, `stopping`). Absent for a `mounted` module that is
+    /// simply serving, and for `disabled`, whose reason is that the user said
+    /// so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Kernel capabilities the module actually GOT: the intersection of what its

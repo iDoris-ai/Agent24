@@ -128,7 +128,9 @@ pub type MethodsFor = Arc<dyn Fn(&Arc<Generation>) -> Methods + Send + Sync>;
 /// it.
 #[derive(Debug)]
 pub struct SupervisorHandle {
-    stop: watch::Sender<bool>,
+    /// `None` while running; `Some(drain)` once a stop was asked for, with how
+    /// long a run that is serving may take to finish the requests it has.
+    stop: watch::Sender<Option<Duration>>,
     status: watch::Receiver<Status>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -158,10 +160,35 @@ impl SupervisorHandle {
     /// over it; [`SupervisorError::Panicked`] when the loop itself panicked;
     /// [`SupervisorError::Killed`] when the loop had been cancelled without a
     /// stop (its runtime shut down).
-    pub async fn stop(mut self) -> Result<(), SupervisorError> {
-        let _ = self.stop.send(true);
-        if let Some(task) = self.task.take()
-            && let Err(e) = task.await
+    pub async fn stop(self) -> Result<(), SupervisorError> {
+        self.drain_and_stop(Duration::ZERO).await
+    }
+
+    /// [`SupervisorHandle::stop`], after DRAINING (SPEC §4): a run that is
+    /// serving refuses new proxied requests and gets up to `drain` to finish
+    /// the ones it has — its callback connection still served, since they may
+    /// call back — then it is revoked and stopped. A run that is still
+    /// starting, or between runs, is stopped without ever serving, and no run
+    /// is started after the request: a module that crashes while draining is
+    /// not restarted into a generation nobody drained (review of SUP-4,
+    /// round 2).
+    ///
+    /// # Errors
+    ///
+    /// As [`SupervisorHandle::stop`].
+    pub async fn drain_and_stop(mut self, drain: Duration) -> Result<(), SupervisorError> {
+        let _ = self.stop.send(Some(drain));
+        // Awaited in place, not taken out: a `stop` future dropped half-way —
+        // a caller's deadline — drops `self` with the task still in it, and
+        // `Drop` aborts it, which SIGKILLs the module now. Taking it out left
+        // `Drop` nothing to abort, and the loop finished its graceful stop,
+        // detached, past the caller's deadline (review of SUP-4, round 1).
+        let joined = match self.task.as_mut() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        self.task = None;
+        if let Some(Err(e)) = joined
             && e.is_panic()
         {
             tracing::error!("the supervisor loop had panicked: {e}");
@@ -252,7 +279,7 @@ pub fn supervise(
     timings: Timings,
 ) -> Result<SupervisorHandle, SlotHeld> {
     let slot = Slot::claim(current).ok_or(SlotHeld)?;
-    let (stop_tx, stop_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(None);
     let (status_tx, status_rx) = watch::channel(Status::Starting { attempt: 1 });
     // Built here and moved into the task, not built inside it: a task aborted
     // before its first poll drops its future's captures — this guard — but
@@ -405,7 +432,7 @@ async fn run_loop(
     exit: Exit,
     methods: MethodsFor,
     timings: Timings,
-    mut stop: watch::Receiver<bool>,
+    mut stop: watch::Receiver<Option<Duration>>,
 ) {
     let (slot, status) = (&exit.slot, &exit.status);
     let mut policy = RestartPolicy::with_base(timings.backoff_base);
@@ -481,6 +508,13 @@ async fn run_loop(
 /// A run's process could not be confirmed gone: its stop failed.
 struct Unconfirmed(String);
 
+/// What the handshake's end decided (see `run_once`).
+enum Admitted {
+    Ready,
+    Stopping,
+    Revoked,
+}
+
 /// One run: spawn, handshake, serve, and stop. Returns how it ended; the
 /// process is always stopped by the time it returns — or, if that could not
 /// be confirmed, dropped (one more SIGKILL) and reported as [`Unconfirmed`],
@@ -492,7 +526,7 @@ async fn run_once(
     slot: &Slot,
     methods: &MethodsFor,
     timings: &Timings,
-    stop: &mut watch::Receiver<bool>,
+    stop: &mut watch::Receiver<Option<Duration>>,
     status: &watch::Sender<Status>,
 ) -> Result<Run, Unconfirmed> {
     let failed = |why: Stopped| Run::Ended {
@@ -544,6 +578,13 @@ async fn run_once(
             return Ok(failed(Stopped::Exited));
         }
     };
+    // Checked again: a stop sent while the (biased) select above was already
+    // past its stop branch lets the spawn finish in the same poll. Stop that
+    // process now rather than hand it a generation (review of SUP-4, round 3).
+    if stop.borrow().is_some() {
+        finish(process, timings, &spec.name, status, slot).await?;
+        return Ok(Run::StopRequested);
+    }
     let generation = process.generation().clone();
     // Out goes this supervisor's placeholder, which was never started.
     slot.install(generation.clone());
@@ -582,18 +623,41 @@ async fn run_once(
             return Ok(run);
         }
     };
-    if !generation.ready() {
-        // Only a revocation moves a generation out of Starting, and only this
-        // run stops its process — so this is not expected. It is still not a
-        // ready module.
-        tracing::error!(module = %spec.name, "the generation was revoked during its handshake");
-        let run = failed(Stopped::StartupTimeout);
-        finish(process, timings, &spec.name, status, slot).await?;
-        return Ok(run);
-    }
     // Built before `Running` is published: a caller's `MethodsFor` that
     // panics must not leave the status saying a module is being served.
     let methods = methods(&generation);
+    // The last stop check and `ready` are ONE step: the stop channel's read
+    // guard is held across both, so a `drain_and_stop` sending its request
+    // lands either before the check — and the generation never runs — or
+    // after `ready`, and the serve loop below drains it. A check followed by a
+    // separate `ready` let a stop land in between and a stopping module admit
+    // work (review of SUP-4, rounds 3 and 4).
+    let admitted = {
+        let stopping = stop.borrow();
+        if stopping.is_some() {
+            Admitted::Stopping
+        } else if generation.ready() {
+            Admitted::Ready
+        } else {
+            Admitted::Revoked
+        }
+    };
+    match admitted {
+        Admitted::Ready => {}
+        Admitted::Stopping => {
+            finish(process, timings, &spec.name, status, slot).await?;
+            return Ok(Run::StopRequested);
+        }
+        Admitted::Revoked => {
+            // Only a revocation moves a generation out of Starting, and only
+            // this run stops its process — so this is not expected. It is
+            // still not a ready module.
+            tracing::error!(module = %spec.name, "the generation was revoked during its handshake");
+            let run = failed(Stopped::StartupTimeout);
+            finish(process, timings, &spec.name, status, slot).await?;
+            return Ok(run);
+        }
+    }
     let ready_at = std::time::Instant::now();
     status.send_replace(Status::Running);
     let serve = rpc::serve_until(
@@ -606,12 +670,17 @@ async fn run_once(
             async move { generation.revoked().await }
         },
     );
+    let mut serve = std::pin::pin!(serve);
     let outcome = tokio::select! {
         biased;
         () = stop_requested(stop) => None,
-        ended = serve => Some(format!("the callback connection ended: {ended:?}")),
+        ended = serve.as_mut() => Some(format!("the callback connection ended: {ended:?}")),
         exited = process.exited() => Some(format!("the module exited: {exited:?}")),
     };
+    if outcome.is_none() {
+        let drain = (*stop.borrow()).unwrap_or_default();
+        drain_run(&spec.name, &generation, drain, &mut serve, &mut process).await;
+    }
     let ended_at = std::time::Instant::now();
     finish(process, timings, &spec.name, status, slot).await?;
     Ok(match outcome {
@@ -635,9 +704,43 @@ async fn run_once(
 /// dropped, and that aborts this task — which must end as `Killed`, not run
 /// a stop path to `Stopped` in the meantime (review of ME3-SUP slice 3a,
 /// round 8).
-async fn stop_requested(stop: &mut watch::Receiver<bool>) {
-    if stop.wait_for(|s| *s).await.is_err() {
+async fn stop_requested(stop: &mut watch::Receiver<Option<Duration>>) {
+    if stop.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+/// Let a serving run finish what it has, for up to `drain`: DRAINING refuses
+/// new proxied requests; this waits until nothing is in flight, the deadline,
+/// the callback connection ending, or the process exiting — whichever is
+/// first. The callback connection is served throughout (`serve` is polled
+/// here), because a request finishing may call back.
+async fn drain_run(
+    name: &str,
+    generation: &Generation,
+    drain: Duration,
+    serve: &mut std::pin::Pin<&mut impl std::future::Future<Output = rpc::Ended>>,
+    process: &mut ModuleProcess,
+) {
+    if drain.is_zero() || !generation.begin_drain(std::time::Instant::now(), drain) {
+        return;
+    }
+    tracing::info!(
+        module = name,
+        in_flight = generation.in_flight(),
+        "draining before the stop"
+    );
+    let deadline = tokio::time::Instant::now() + drain;
+    let idle = async {
+        while generation.in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        () = idle => {}
+        () = tokio::time::sleep_until(deadline) => {}
+        _ = serve.as_mut() => {}
+        _ = process.exited() => {}
     }
 }
 
@@ -703,6 +806,10 @@ mod tests {
     /// SIGTERM, so its stop lasts the whole grace.
     const MOCK: &str = r#"import json, os, socket, sys, time
 mode, name, digest = sys.argv[1], sys.argv[2], sys.argv[3]
+if mode == "stubborn_serving":
+    # Before the handshake: the kernel can stop it the moment it is ready.
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 data = os.environ["A24_DATA_DIR"]
 token = os.environ["A24_HANDSHAKE_TOKEN"]
 with open(os.path.join(data, "starts"), "a") as f:
@@ -727,6 +834,11 @@ f = s.makefile("rb")
 f.readline()
 if mode == "crash":
     sys.exit(3)
+if mode == "stubborn_serving":
+    while f.readline():
+        pass
+    time.sleep(60)
+    sys.exit(0)
 if mode == "stubborn":
     import signal
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -1205,6 +1317,99 @@ sys.exit(0)
             rustix::process::Pid::from_raw(escaped).unwrap(),
             rustix::process::Signal::Kill,
         );
+    }
+
+    /// `drain_and_stop` drains a serving run before stopping it (SPEC §4):
+    /// the request in flight holds the stop, new ones are refused as
+    /// `Draining` meanwhile, the module keeps running — and once the request
+    /// finishes, the stop goes on at once rather than waiting out the drain
+    /// budget (review of SUP-4, round 2).
+    #[tokio::test]
+    async fn a_drain_lets_the_request_in_flight_finish_then_stops() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let (pid, _) = starts(f.data.path())[0].clone();
+        let generation = current.get();
+        let in_flight = generation.admit_request("r-1".into()).unwrap();
+        let stopping = tokio::spawn(handle.drain_and_stop(Duration::from_secs(10)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while generation.state() != crate::drain::DrainState::Draining {
+            assert!(std::time::Instant::now() < deadline, "never drained");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            generation.admit_request("r-2".into()).unwrap_err(),
+            crate::drain::RequestRefused::Draining
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !stopping.is_finished(),
+            "stopped with a request still in flight"
+        );
+        assert!(
+            rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap())
+                .is_ok(),
+            "the module was stopped while draining"
+        );
+        drop(in_flight);
+        let stopped = tokio::time::timeout(Duration::from_secs(3), stopping)
+            .await
+            .expect("the stop waited out the drain budget after the request finished")
+            .unwrap();
+        assert_eq!(stopped, Ok(()));
+        assert!(gone(pid).await);
+    }
+
+    /// A `stop` whose caller gives up — its future dropped at a deadline —
+    /// kills the module now: the handle, and the loop in it, go with the
+    /// future, rather than the loop finishing its graceful stop detached, past
+    /// the deadline (review of SUP-4, round 1). The module ignores SIGTERM and
+    /// the grace is long, so only a kill ends it within the bound.
+    #[tokio::test]
+    async fn a_stop_given_up_on_kills_the_module_at_once() {
+        let f = fixture("stubborn_serving");
+        let current = Current::new(Generation::starting());
+        let timings = Timings {
+            stop_grace: Duration::from_secs(10),
+            ..fast()
+        };
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            timings,
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let (pid, _) = starts(f.data.path())[0].clone();
+        let gave_up = tokio::time::timeout(Duration::from_millis(300), handle.stop()).await;
+        assert!(
+            gave_up.is_err(),
+            "the stop finished inside a SIGTERM-ignoring grace: {gave_up:?}"
+        );
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the module outlived a stop its caller gave up on"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// A handle dropped while its module runs keeps the slot: the SIGKILL

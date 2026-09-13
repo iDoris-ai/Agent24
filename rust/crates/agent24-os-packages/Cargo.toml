@@ -13,10 +13,11 @@ serde_yaml = "0.9"
 # dependency-free alternative (create a file, ask who owns it) was attacker-
 # influenceable, which is a worse trade than one small crate.
 rustix = { version = "0.38", features = ["process"] }
+# The manifest digest a module reports in its handshake (SUP-4).
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
-sha2 = "0.10"
 
 [lints]
 workspace = true
