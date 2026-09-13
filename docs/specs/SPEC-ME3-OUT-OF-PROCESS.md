@@ -388,8 +388,8 @@ disable / 停机       →  两阶段（见下）
 
 - **交接**：写配置与交出停止是一步，在 daemon 自己的任务里、持控制面锁完成（客户端中途断开也会做完，不会留下「配置已关、模块照跑」）。写配置在阻塞线程池里做，文件锁的等待不占 async worker；rename 已落地但之后的目录 fsync 报错时，重读配置，确认已生效就照样交出停止，再把错误报给调用方。交出停止是在登记表的锁下取出 Supervisor、发出停止请求、把这次停止留给停机（与停机的 `close` 同一把锁：一个模块要么由停机停，要么由 disable 停，不会两者都停也不会都不停）。停止请求在调用时就发出，不等后台任务被调度，所以从这一刻起这个模块不会再进入 Running。
 - **两阶段**：Supervisor 按上面的两阶段停掉它：DRAINING 最多 30 秒（等于代理自己的请求总时限，所以 disable 前准入的请求要么跑完、要么先按自己的时限超时），再 REVOKING。
-- **何时算成功**：释放控制面锁后，PATCH 等这一代不再准入新请求（进入 DRAINING，或本来就不在 Running），上限 2 秒，只为兜住调度不过来的运行时。等到了才回成功，所以 **disable 成功返回之后发出的请求不再被准入**：排空期间回 `503 module_draining`，停下后回 `503 module_stopping`。超时不算成功，回 `503 disable_pending`（配置已写、停止已请求，只是还没确认它不再准入）；再 disable 一次会重新检查同一个准入，仍在准入就仍回 `disable_pending`。
-- **列表**：`agent24 os list` 在排空期间报 `disabled`（附 `stopping`），停完后报 `disabled`，`restart_required` 为 false；停止失败（StopFailed / Panicked / Killed）不算 disable 已生效，照实报 `degraded` 并要求重启。
+- **何时算成功**：释放控制面锁后，PATCH 等这一代不再准入新请求（进入 DRAINING，或本来就不在 Running），上限 2 秒，只为兜住调度不过来的运行时。等到了才回成功，所以 **disable 成功返回之后发出的请求不再被准入**：排空期间回 `503 module_draining`，停下后回 `503 module_stopping`。超时不算成功，回 `503 disable_pending`（配置已写、停止已请求，只是还没确认它不再准入）；再 disable 一次会重新检查同一个准入，仍在准入就仍回 `disable_pending`。停止失败（Supervisor 报 StopFailed / Panicked / Killed）也不算成功，回 `500 stop_failed`——失败的停止同样会关掉准入，所以先看失败再看准入。错误文本说的是「本请求写入了什么」，不是「配置现在是什么」：控制面锁已释放，之后别的 toggle 可能又改了它。
+- **列表**：`agent24 os list` 只在这一代不再准入之后才把它报成 `disabled`：已请求停止但还在准入时照实报它仍是什么（`mounted`，还在服务）；排空期间报 `disabled`（附 `stopping`），停完后报 `disabled`，`restart_required` 为 false；停止失败（StopFailed / Panicked / Killed）不算 disable 已生效，照实报 `degraded` 并要求重启。
 - **与停机**：停机若在排空期间开始，停机等这次停止，但只给它与其他模块相同的预算：截断时刻是停机截止时刻（`request` 开始停机时就固定）之前的一个固定余量，即停机开始后 MODULE_DRAIN + MODULE_STOP_GRACE（不从后台任务第一次被调度算起）。到时仍未停下就中止它的 Supervisor 并**等到中止完成**（已尝试 SIGKILL，不等确认）再继续，停机仍守住它的上限。
 - **不变的部分**：编译进 daemon 的模块、以及**任何** enable，仍在下次 daemon 启动时生效：运行时不启动模块。
 

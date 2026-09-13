@@ -535,10 +535,9 @@ struct Registry {
     running: Option<Vec<Supervised>>,
     /// The stops `os disable` began and the shutdown has not taken yet.
     disabling: Vec<tokio::task::JoinHandle<()>>,
-    /// Every module `os disable` has asked to stop since this daemon started,
-    /// with its proxy slot — so a later disable can see whether it refuses
-    /// requests yet.
-    disabled: std::collections::HashMap<String, Arc<agent24_os_proto::drain::Current>>,
+    /// Every module `os disable` has asked to stop since this daemon started
+    /// — so the list and a later disable can see how far that has got.
+    disabled: std::collections::HashMap<String, Disabled>,
 }
 
 impl Default for Registry {
@@ -549,6 +548,15 @@ impl Default for Registry {
             disabled: std::collections::HashMap::new(),
         }
     }
+}
+
+/// A module `os disable` asked to stop: its proxy slot, to see whether it
+/// still admits requests, and its supervisor's status, to see whether the
+/// stop failed.
+#[derive(Clone)]
+pub struct Disabled {
+    pub current: Arc<agent24_os_proto::drain::Current>,
+    pub status: tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
 }
 
 /// What [`Supervisors::close`] hands the shutdown: every module still running,
@@ -628,7 +636,7 @@ impl Supervisors {
         name: &str,
         drain: std::time::Duration,
         cut_off: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Option<Arc<agent24_os_proto::drain::Current>> {
+    ) -> Option<Disabled> {
         let mut registry = self.lock();
         let list = registry.running.as_mut()?;
         let i = list.iter().position(|s| s.name == name)?;
@@ -637,7 +645,11 @@ impl Supervisors {
             handle,
             current,
         } = list.swap_remove(i);
-        registry.disabled.insert(name.clone(), current.clone());
+        let disabled = Disabled {
+            current,
+            status: handle.subscribe(),
+        };
+        registry.disabled.insert(name.clone(), disabled.clone());
         let stop = handle.drain_and_stop_unless(drain, cut_off);
         let task = tokio::spawn(async move {
             match stop.await {
@@ -651,19 +663,19 @@ impl Supervisors {
         });
         registry.disabling.retain(|t| !t.is_finished());
         registry.disabling.push(task);
-        Some(current)
+        Some(disabled)
     }
 
     /// Whether `os disable` has asked to stop `name` since this daemon
     /// started — stopped, or still stopping.
-    #[must_use]
+    #[cfg(test)]
     pub fn is_disabled(&self, name: &str) -> bool {
         self.lock().disabled.contains_key(name)
     }
 
-    /// The proxy slot of a module an earlier `os disable` asked to stop.
+    /// A module an earlier `os disable` asked to stop.
     #[must_use]
-    pub fn disabled_slot(&self, name: &str) -> Option<Arc<agent24_os_proto::drain::Current>> {
+    pub fn disabled_slot(&self, name: &str) -> Option<Disabled> {
         self.lock().disabled.get(name).cloned()
     }
 
@@ -1770,7 +1782,8 @@ while f.readline():
         let current = host
             .supervisors
             .disable("remote", drain, never())
-            .expect("the running module");
+            .expect("the running module")
+            .current;
         assert!(host.supervisors.is_disabled("remote"));
         assert!(
             host.supervisors.disable("remote", drain, never()).is_none(),

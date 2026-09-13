@@ -78,9 +78,10 @@ pub struct AppState {
     /// the daemon runs (SUP-5). `None` when out-of-process modules cannot be
     /// started at all.
     pub supervisors: Option<Arc<crate::domain::Supervisors>>,
-    /// Held across one `PATCH /api/v1/os/{name}` — the config write, a hot
-    /// disable, and the list it answers with — so concurrent toggles answer
-    /// in one order they were applied in (SUP-5).
+    /// Held across the config write and the hand-off of a hot disable's stop
+    /// in `PATCH /api/v1/os/{name}` — not across the wait that follows — so
+    /// concurrent toggles are applied in one order (SUP-5). The list a PATCH
+    /// answers with is rendered after, and shows the state then.
     pub os_control: Arc<tokio::sync::Mutex<()>>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
@@ -1050,7 +1051,10 @@ pub async fn serve(
             .await
             .is_err()
         {
-            tracing::warn!("out-of-process modules were still stopping at the deadline; killed");
+            tracing::warn!(
+                "out-of-process modules were still stopping at the deadline; their supervisors \
+                 were dropped (SIGKILL attempted, exit unconfirmed)"
+            );
         }
     });
     let (module_routes, reports, partitions) = crate::domain::mount_all(

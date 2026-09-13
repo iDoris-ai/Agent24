@@ -97,7 +97,12 @@ fn view(
             Status::StopFailed { error } => ("degraded", Some(error.clone())),
             Status::Stopped => ("degraded", Some("stopped".to_owned())),
             Status::Panicked => ("degraded", Some("its supervisor panicked".to_owned())),
-            Status::Killed => ("degraded", Some("killed".to_owned())),
+            Status::Killed => (
+                "degraded",
+                Some(
+                    "its supervisor was cancelled; SIGKILL attempted, exit unconfirmed".to_owned(),
+                ),
+            ),
         },
         (MountOutcome::Mounted, None) => ("mounted", None),
         (MountOutcome::Disabled, _) => ("disabled", None),
@@ -222,10 +227,21 @@ fn render(state: &AppState) -> Response {
 }
 
 fn hot_disabled(state: &AppState, name: &str) -> bool {
-    state
-        .supervisors
-        .as_ref()
-        .is_some_and(|s| s.is_disabled(name))
+    applied(
+        state
+            .supervisors
+            .as_ref()
+            .and_then(|s| s.disabled_slot(name))
+            .as_ref(),
+    )
+}
+
+/// Whether a disable has taken effect: its module no longer admits requests.
+/// Asked for but not yet so, it is still what it was — `mounted`, and
+/// serving (review of SUP-5, round 4).
+fn applied(disabled: Option<&crate::domain::Disabled>) -> bool {
+    disabled
+        .is_some_and(|d| d.current.get().state() != agent24_os_proto::drain::DrainState::Running)
 }
 
 /// How long a disabled module gets to finish the requests it has (DRAINING)
@@ -250,6 +266,9 @@ enum HotStop {
     Pending,
     /// An earlier disable asked for the stop, and it refuses requests.
     Already,
+    /// Its supervisor could not stop it cleanly (`StopFailed`, `Panicked`,
+    /// `Killed`): not a disable applied (review of SUP-5, round 4).
+    Failed,
     /// Nothing running to stop: a compiled-in module, a package not started
     /// at mount, or a daemon already shutting down.
     NotRunning,
@@ -265,7 +284,7 @@ fn hand_off(
     supervisors: Option<&crate::domain::Supervisors>,
     cut_off: impl std::future::Future<Output = ()> + Send + 'static,
     name: &str,
-) -> Option<(bool, std::sync::Arc<agent24_os_proto::drain::Current>)> {
+) -> Option<(bool, crate::domain::Disabled)> {
     let supervisors = supervisors?;
     match supervisors.disable(name, DISABLE_DRAIN, cut_off) {
         Some(current) => Some((true, current)),
@@ -278,16 +297,34 @@ fn hand_off(
 /// repeated disable, whose predecessor may have timed out (review of SUP-5,
 /// round 3).
 async fn settle(
-    handed: Option<(bool, std::sync::Arc<agent24_os_proto::drain::Current>)>,
+    handed: Option<(bool, crate::domain::Disabled)>,
     within: std::time::Duration,
 ) -> HotStop {
     match handed {
         None => HotStop::NotRunning,
-        Some((asked, current)) => match (admission_closed(&current, within).await, asked) {
-            (false, _) => HotStop::Pending,
-            (true, true) => HotStop::Stopping,
-            (true, false) => HotStop::Already,
-        },
+        Some((asked, d)) => {
+            let closed = admission_closed(&d.current, within).await;
+            let status = d.status.borrow().clone();
+            classify(closed, asked, &status)
+        }
+    }
+}
+
+/// A handed-off stop, by whether its module refuses requests, whether THIS
+/// disable asked for it, and its supervisor's status. A failed stop revokes
+/// admission too, so the failure is looked at first.
+fn classify(closed: bool, asked: bool, status: &agent24_os_proto::supervisor::Status) -> HotStop {
+    use agent24_os_proto::supervisor::Status;
+    if matches!(
+        status,
+        Status::StopFailed { .. } | Status::Panicked | Status::Killed
+    ) {
+        return HotStop::Failed;
+    }
+    match (closed, asked) {
+        (false, _) => HotStop::Pending,
+        (true, true) => HotStop::Stopping,
+        (true, false) => HotStop::Already,
     }
 }
 
@@ -312,13 +349,7 @@ async fn apply(
     path: std::path::PathBuf,
     name: &str,
     enabled: bool,
-) -> Result<
-    (
-        Option<(bool, std::sync::Arc<agent24_os_proto::drain::Current>)>,
-        Option<String>,
-    ),
-    String,
-> {
+) -> Result<(Option<(bool, crate::domain::Disabled)>, Option<String>), String> {
     // Off the async workers: the file lock waits for any other writer, for
     // as long as that takes (review of SUP-5, round 2).
     let written = tokio::task::spawn_blocking({
@@ -451,6 +482,7 @@ pub async fn patch_os(
         HotStop::Stopping => "stopping it now",
         HotStop::Pending => "its supervisor was asked to stop it; not yet refusing requests",
         HotStop::Already => "an earlier disable already stopped it or is stopping it",
+        HotStop::Failed => "its supervisor could not stop it cleanly",
         HotStop::NotRunning => "takes effect on restart",
     };
     tracing::info!(
@@ -462,9 +494,19 @@ pub async fn patch_os(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             &format!(
-                "os.json now says enabled={} for {name:?} ({effect}), but writing it reported: \
-                 {why}",
+                "this request set enabled={} for {name:?} in os.json ({effect}), but writing it \
+                 reported: {why}",
                 update.enabled
+            ),
+        );
+    }
+    if hot == HotStop::Failed {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stop_failed",
+            &format!(
+                "this request disabled {name:?} in os.json, but its supervisor could not stop it \
+                 cleanly; `agent24 os list` shows why, and a restart is needed"
             ),
         );
     }
@@ -475,8 +517,8 @@ pub async fn patch_os(
             StatusCode::SERVICE_UNAVAILABLE,
             "disable_pending",
             &format!(
-                "os.json now disables {name:?} and its supervisor was asked to stop it, but it \
-                 still admitted requests after {ADMISSION_CLOSED_WITHIN:?}; `agent24 os list` \
+                "this request disabled {name:?} in os.json and asked its supervisor to stop it, \
+                 but it still admitted requests after {ADMISSION_CLOSED_WITHIN:?}; `agent24 os list` \
                  shows when it has stopped"
             ),
         );
@@ -525,6 +567,10 @@ mod tests {
             HotStop::Pending,
             "a retry answered while the module still admits requests"
         );
+        assert!(
+            !applied(host.supervisors.disabled_slot("remote").as_ref()),
+            "listed as disabled while it still admits requests"
+        );
         assert_eq!(
             stop_now(
                 Some(&host.supervisors),
@@ -535,6 +581,7 @@ mod tests {
             .await,
             HotStop::Already
         );
+        assert!(applied(host.supervisors.disabled_slot("remote").as_ref()));
         for stop in host.supervisors.close().disabling {
             stop.await.unwrap();
         }
@@ -557,6 +604,22 @@ mod tests {
         for stop in host.supervisors.close().disabling {
             stop.await.unwrap();
         }
+    }
+
+    /// A failed stop is not a disable applied, whatever admission says — it
+    /// revokes admission too (review of SUP-5, round 4).
+    #[test]
+    fn a_failed_stop_is_classified_before_admission() {
+        use agent24_os_proto::supervisor::Status;
+        let failed = Status::StopFailed { error: "x".into() };
+        for asked in [true, false] {
+            assert_eq!(classify(true, asked, &failed), HotStop::Failed);
+            assert_eq!(classify(true, asked, &Status::Panicked), HotStop::Failed);
+            assert_eq!(classify(true, asked, &Status::Killed), HotStop::Failed);
+            assert_eq!(classify(false, asked, &Status::Running), HotStop::Pending);
+        }
+        assert_eq!(classify(true, true, &Status::Stopping), HotStop::Stopping);
+        assert_eq!(classify(true, false, &Status::Stopped), HotStop::Already);
     }
 
     /// A disable answers only once the module's generation refuses new work:
