@@ -575,6 +575,18 @@ impl Supervisors {
             .collect()
     }
 
+    /// Take one module's supervisor out of the list — to stop it while the
+    /// daemon runs (SUP-5, hot disable). `None` if there is none by that name,
+    /// or the shutdown has closed the list (and so already owns it): under the
+    /// same lock as [`Supervisors::close`], so a module is stopped by the
+    /// shutdown or by the disable, never by both and never by neither.
+    pub fn take(&self, name: &str) -> Option<Supervised> {
+        let mut list = self.lock();
+        let list = list.as_mut()?;
+        let i = list.iter().position(|s| s.name == name)?;
+        Some(list.swap_remove(i))
+    }
+
     /// Close the list and take everything in it. Later starts are refused.
     pub fn close(&self) -> Vec<Supervised> {
         self.lock().take().unwrap_or_default()
@@ -1556,6 +1568,39 @@ while f.readline():
             host.supervisors.close().is_empty(),
             "a package was started during the shutdown"
         );
+    }
+
+    /// `take` hands one module's supervisor out of the list — and none once
+    /// the shutdown has closed it, since the shutdown owns them all then
+    /// (SUP-5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_is_taken_by_the_disable_or_the_shutdown_never_both() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let _ = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+        )
+        .await;
+        assert!(host.supervisors.take("nope").is_none());
+        let taken = host.supervisors.take("remote").expect("the running module");
+        assert!(host.supervisors.take("remote").is_none(), "taken twice");
+        assert!(
+            host.supervisors.close().is_empty(),
+            "the shutdown got it too"
+        );
+        taken.handle.stop().await.expect("a clean stop");
     }
 
     /// A disabled package is never started — the same rule as a compiled-in

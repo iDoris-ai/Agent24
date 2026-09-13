@@ -26,13 +26,16 @@
 //! one: it would mean two writers, and the failure it prevents is rarer than the
 //! races it would introduce.
 //!
-//! **A toggle does not take effect until the daemon restarts.** Routes are built
-//! once at startup, and pretending otherwise would be worse than saying so: the
-//! list reports the config state AND the running state separately, and sets
-//! `restart_required` when the config has CHANGED since the mount pass — not
-//! merely when a module is enabled and not running, which would conflate a pending
-//! toggle with a module that is simply unhealthy. A user who toggles a module and
-//! then sees it still serving is looking at a fact, not a bug.
+//! **Disabling a running out-of-process module stops it now; every other toggle
+//! takes effect when the daemon restarts** (SUP-5). A disable stops the module
+//! the SPEC §4 way — DRAINING, then REVOKING — in the background: the request
+//! returns once the config is written, and the list reports it `disabled`
+//! (with `stopping` while it drains). A compiled-in module, and ANY enable, still
+//! waits for a restart: routes are built once at startup, and nothing starts a
+//! module at runtime. The list reports the config state AND the running state
+//! separately, and sets `restart_required` when the config differs from what is
+//! running — not merely when a module is enabled and not running, which would
+//! conflate a pending toggle with a module that is simply unhealthy.
 
 use agent24_domain::http::error_response;
 use agent24_protocol::{DomainOsList, DomainOsUpdate, DomainOsView};
@@ -53,9 +56,14 @@ fn view(
     enabled_now: bool,
     registry_usable: bool,
     live: Option<&agent24_os_proto::supervisor::Status>,
+    hot_disabled: bool,
 ) -> DomainOsView {
     use agent24_os_proto::supervisor::Status;
     let (state, detail) = match (&report.outcome, live) {
+        // Stopped by `os disable` while the daemon runs: disabled, whatever the
+        // mount said — still `stopping` while it drains (SUP-5).
+        (MountOutcome::Mounted, Some(Status::Stopped)) if hot_disabled => ("disabled", None),
+        (MountOutcome::Mounted, _) if hot_disabled => ("disabled", Some("stopping".to_owned())),
         // A package started at mount: its supervisor says where it is NOW. A
         // mount verdict alone called a module that had since given up
         // "mounted" (review of SUP-4, round 1).
@@ -101,7 +109,14 @@ fn view(
     // A REFUSED module is excluded whatever the config says: its manifest is
     // inadmissible for this binary, so a restart cannot deliver it, and asking for
     // one would send the user to do something that changes nothing.
-    let restart_required = match report.enabled_at_start {
+    // A hot disable has already applied "off": for the comparison below, what
+    // is running is what a start with it disabled would have given.
+    let running_enabled = if hot_disabled {
+        Some(false)
+    } else {
+        report.enabled_at_start
+    };
+    let restart_required = match running_enabled {
         _ if matches!(report.outcome, MountOutcome::Refused(_)) => false,
         // A registry that is STILL unusable cannot be applied by restarting — the
         // fix is the file. Saying otherwise sent the user to restart into exactly
@@ -186,6 +201,7 @@ fn render(state: &AppState) -> Response {
                 cfg.is_enabled(&r.name),
                 registry_error.is_none(),
                 live.as_ref(),
+                hot_disabled(state, &r.name),
             )
         })
         .collect();
@@ -194,6 +210,51 @@ fn render(state: &AppState) -> Response {
         registry_error,
     })
     .into_response()
+}
+
+fn hot_disabled(state: &AppState, name: &str) -> bool {
+    state
+        .hot_disabled
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(name)
+}
+
+/// How long a disabled module gets to finish the requests it has (DRAINING)
+/// before it is stopped. ⚖️ The proxy's own total deadline for a request, so
+/// every request admitted before the disable either finishes or times out by
+/// itself first — a disable abandons nothing a request's own deadline would not.
+const DISABLE_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Stop a running out-of-process module now (SUP-5): take its supervisor out
+/// of the daemon's list — so the shutdown will not also stop it — and drain
+/// and stop it in the background. A shutdown that begins meanwhile wins: the
+/// stop is abandoned, which SIGKILLs the module, so the shutdown stays within
+/// its bound. `false` if there was nothing running to stop (a compiled-in
+/// module, one that never started, or a daemon already shutting down).
+fn stop_now(state: &AppState, name: &str) -> bool {
+    let Some(supervised) = state.supervisors.as_ref().and_then(|s| s.take(name)) else {
+        return false;
+    };
+    state
+        .hot_disabled
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_owned());
+    let shutdown = state.shutdown.token().clone();
+    let name = name.to_owned();
+    tokio::spawn(async move {
+        tokio::select! {
+            stopped = supervised.handle.drain_and_stop(DISABLE_DRAIN) => match stopped {
+                Ok(()) => tracing::info!("domain OS {name:?} disabled and stopped"),
+                Err(e) => tracing::error!("domain OS {name:?} was disabled but did not stop cleanly: {e}"),
+            },
+            () = shutdown.cancelled() => {
+                tracing::warn!("domain OS {name:?}: the daemon is shutting down; its stop was cut short");
+            }
+        }
+    });
+    true
 }
 
 pub async fn list_os(State(state): State<AppState>) -> Response {
@@ -243,9 +304,17 @@ pub async fn patch_os(
     if let Err(why) = crate::os_config::OsConfig::set_enabled(&path, &name, update.enabled) {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &why);
     }
+    // A disable of a running out-of-process module applies now; anything else
+    // at the next start.
+    let now = !update.enabled && stop_now(&state, &name);
     tracing::info!(
-        "domain OS {name:?} set enabled={} in os.json (takes effect on restart)",
-        update.enabled
+        "domain OS {name:?} set enabled={} in os.json ({})",
+        update.enabled,
+        if now {
+            "stopping it now"
+        } else {
+            "takes effect on restart"
+        }
     );
     // Return the whole list so a client sees the new `restart_required` state
     // without a second round trip.
@@ -259,6 +328,27 @@ mod tests {
     use super::*;
     use crate::domain::{MountOutcome, MountReport, ResourceStatus};
 
+    /// A module stopped by `os disable` is reported `disabled` — `stopping`
+    /// while it drains — and needs no restart: the running state already
+    /// matches the config (SUP-5). Control: without the hot disable, the same
+    /// config change needs a restart.
+    #[test]
+    fn a_hot_disabled_module_is_disabled_and_needs_no_restart() {
+        use agent24_os_proto::supervisor::Status;
+        let r = report("pkg", MountOutcome::Mounted);
+        let v = view(&r, false, true, Some(&Status::Stopping), true);
+        assert_eq!(
+            (v.state.as_str(), v.detail.as_deref()),
+            ("disabled", Some("stopping"))
+        );
+        assert!(!v.restart_required);
+        let v = view(&r, false, true, Some(&Status::Stopped), true);
+        assert_eq!((v.state.as_str(), v.detail.as_deref()), ("disabled", None));
+        assert!(!v.restart_required);
+        let v = view(&r, false, true, Some(&Status::Running), false);
+        assert!(v.restart_required, "a pending disable not applied yet");
+    }
+
     /// A package mounted at start is reported by its supervisor's status NOW:
     /// one that has given up is degraded, with the reason — not "mounted"
     /// (review of SUP-4, round 1). Control: a running one is mounted.
@@ -270,14 +360,14 @@ mod tests {
             failures: 5,
             within: std::time::Duration::from_secs(4),
         };
-        let v = view(&r, true, true, Some(&gave_up));
+        let v = view(&r, true, true, Some(&gave_up), false);
         assert_eq!(v.state, "degraded");
         assert!(
             v.detail.as_deref().is_some_and(|d| d.contains("gave up")),
             "{:?}",
             v.detail
         );
-        let v = view(&r, true, true, Some(&Status::Running));
+        let v = view(&r, true, true, Some(&Status::Running), false);
         assert_eq!(v.state, "mounted");
         assert_eq!(v.detail, None);
     }
@@ -327,14 +417,14 @@ mod tests {
         // user staring at a contradiction; `restart_required` is what turns that
         // into a fact they can act on.
         let running = report("sin90", MountOutcome::Mounted);
-        let v = view(&running, false, true, None);
+        let v = view(&running, false, true, None, false);
         assert_eq!(v.state, "mounted", "it is still serving right now");
         assert!(!v.enabled, "but the config now says off");
         assert!(v.restart_required);
 
         // And the other direction.
         let off = report("sin90", MountOutcome::Disabled);
-        let v = view(&off, true, true, None);
+        let v = view(&off, true, true, None, false);
         assert_eq!(v.state, "disabled");
         assert!(v.enabled);
         assert!(v.restart_required);
@@ -373,17 +463,28 @@ mod tests {
         let mut r = report("sin90", MountOutcome::Degraded("os.json ...".into()));
         r.enabled_at_start = None;
         assert!(
-            !view(&r, true, false, None).restart_required,
+            !view(&r, true, false, None, false).restart_required,
             "the registry is still unusable; the fix is the file, not a restart"
         );
         // Once it IS usable, the config has genuinely never been applied.
-        assert!(view(&r, true, true, None).restart_required);
+        assert!(view(&r, true, true, None, false).restart_required);
     }
 
     #[test]
     fn a_settled_module_does_not_ask_for_a_restart() {
-        assert!(!view(&report("a", MountOutcome::Mounted), true, true, None).restart_required);
-        assert!(!view(&report("a", MountOutcome::Disabled), false, true, None).restart_required);
+        assert!(
+            !view(&report("a", MountOutcome::Mounted), true, true, None, false).restart_required
+        );
+        assert!(
+            !view(
+                &report("a", MountOutcome::Disabled),
+                false,
+                true,
+                None,
+                false
+            )
+            .restart_required
+        );
     }
 
     #[test]
@@ -395,7 +496,7 @@ mod tests {
             "health",
             MountOutcome::Refused("kernel route segment".into()),
         );
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, false);
         assert_eq!(v.state, "refused");
         assert!(v.enabled, "the config wants it");
         assert!(
@@ -417,7 +518,7 @@ mod tests {
             "sin90",
             MountOutcome::Degraded("store failed to open".into()),
         );
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, false);
         assert!(!v.restart_required);
         assert_eq!(
             v.detail.as_deref(),
@@ -427,7 +528,7 @@ mod tests {
 
         // And the case the availability comparison MISSED entirely: disabling an
         // already-degraded module IS a real pending change.
-        assert!(view(&r, false, true, None).restart_required);
+        assert!(view(&r, false, true, None, false).restart_required);
     }
 
     #[tokio::test]
@@ -483,7 +584,7 @@ mod tests {
             granted: Vec::new(),
             resources: ResourceStatus::NotChecked,
         };
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, false);
         assert_eq!(v.name, "sin90");
         assert_eq!(v.version, "0.2.1");
         assert_eq!(v.state, "degraded");
@@ -507,13 +608,13 @@ mod tests {
             granted: Vec::new(),
             resources: ResourceStatus::NotChecked,
         };
-        let v = view(&r, false, true, None);
+        let v = view(&r, false, true, None, false);
         assert_eq!(v.state, "disabled");
         assert!(!v.enabled);
         assert!(!v.restart_required, "config and runtime agree");
 
         // And once the user enables it, the list says a restart is what applies it.
-        assert!(view(&r, true, true, None).restart_required);
+        assert!(view(&r, true, true, None, false).restart_required);
     }
 
     #[tokio::test]
@@ -548,12 +649,12 @@ mod tests {
     fn resource_status_is_flattened_without_losing_which_case_it_was() {
         let mut r = report("m", MountOutcome::Mounted);
         r.resources = ResourceStatus::MissingModels(vec!["ornith-9b".into()]);
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, false);
         assert_eq!(v.resources, "missing");
         assert_eq!(v.missing_models, vec!["ornith-9b".to_owned()]);
 
         r.resources = ResourceStatus::Unknown("provider down".into());
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, false);
         assert_eq!(v.resources, "unknown");
         assert!(
             v.missing_models.is_empty(),
@@ -561,6 +662,6 @@ mod tests {
         );
 
         r.resources = ResourceStatus::NotChecked;
-        assert_eq!(view(&r, true, true, None).resources, "not_checked");
+        assert_eq!(view(&r, true, true, None, false).resources, "not_checked");
     }
 }

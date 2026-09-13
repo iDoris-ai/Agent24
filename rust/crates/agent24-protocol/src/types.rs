@@ -59,9 +59,10 @@ pub struct DomainOsView {
     pub state: String,
     /// Why, when there is a reason worth acting on — a degradation or a refusal
     /// — or, for a `mounted` out-of-process module, a passing state worth
-    /// knowing (`starting`, `stopping`). Absent for a `mounted` module that is
-    /// simply serving, and for `disabled`, whose reason is that the user said
-    /// so.
+    /// knowing (`starting`, `stopping`), and for a module `disabled` while it
+    /// ran, `stopping` until it has drained and stopped (SUP-5). Absent for a
+    /// `mounted` module that is simply serving, and for a settled `disabled`,
+    /// whose reason is that the user said so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Kernel capabilities the module actually GOT: the intersection of what its

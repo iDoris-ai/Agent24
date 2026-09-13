@@ -74,6 +74,13 @@ pub struct AppState {
             tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
         >,
     >,
+    /// The daemon's supervised modules, for `os disable` to stop one while
+    /// the daemon runs (SUP-5). `None` when out-of-process modules cannot be
+    /// started at all.
+    pub supervisors: Option<Arc<crate::domain::Supervisors>>,
+    /// The modules stopped by `os disable` since this daemon started: what
+    /// `agent24 os list` reports as `disabled` although they mounted.
+    pub hot_disabled: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -465,6 +472,8 @@ impl AppState {
             // to chance.
             os_reports: Arc::new(Vec::new()),
             module_status: Arc::new(std::collections::HashMap::new()),
+            supervisors: None,
+            hot_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             runs,
             scheduler,
             shutdown,
@@ -1112,6 +1121,7 @@ pub async fn serve(
             .map(|h| h.supervisors.statuses())
             .unwrap_or_default(),
     );
+    state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
     let router = build_router_with_modules(state, module_routes);
 
     // A shutdown that began during startup ends it here, before anything says
