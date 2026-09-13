@@ -67,7 +67,7 @@
 - **验收**（取自 SPEC §8 ME-3c 格，每条带正对照）：握手后的超长行被拒并断连；并发在途按 id 配对、响应可乱序；仍在途的 id 被复用 → 该请求失败；`$/cancelRequest` 使目标请求回 cancelled；连接断开则在途请求中止且不产生响应；超时不重试；握手后 params 解析失败 `-32602` 且不派发；坏 params 只失败该行、连接继续；重复 JSON key 被拒；握手后畸形 JSON `-32700` 只失败该行；握手后重复 `initialize` → `-32600` 只失败该行；业务方法一律 `-32601`
 - **证据**：外部评审对 `d983af9` APPROVE（DeepSeek → Opus → Codex → Opus 四轮）；评审方 11 格变异全红；`rpc` 38 条测试、CI 5/5 绿。
 
-### ME3-SUP 3b-3 的 Supervisor —— 让 daemon 真的持有并监督模块进程  `IN_PROGRESS`（排在 T6 之后、T7/T9 之前）
+### ME3-SUP 3b-3 的 Supervisor —— 让 daemon 真的持有并监督模块进程  `DONE` — #178–#184（2026-09-13）
 - **为什么单列**：3b-3 目前只交付了库层零件（`RestartPolicy`、`terminate_group`、`launch::spawn`），daemon 里没有任何代码真正持有一个模块进程。没有它：3b-5 的热 disable 接不进 `os disable`；`KillPermit` 绑定不到具体进程（FU-46）；**T9（3f 仓外包端到端验收）跑不起来**；T7（3e）的 handler 也需要一条已经绑定到某一代的真实回调连接
 - **规划时的三个发现**（2026-09-12，各自核实过）：① `domain.rs` 那道拒绝，真实磁盘包根本走不到 —— `server.rs` 给发现到的包配的 `build` 闭包直接 `Err`，所以绊线测试 `an_out_of_process_manifest_is_refused_not_half_mounted` 测的是另一条路；② SPEC 的「fd 3 传监听 socket」需要 `pre_exec`，与全仓 `forbid(unsafe_code)` 冲突；③ `initialize` 的 `id: u64` 违反 SPEC §3「请求 ID 类型：字符串」
 - **用户裁决（2026-09-12）**：
@@ -87,6 +87,39 @@
 - **ME3-SUP 全部完成**（SUP-1 … SUP-5，#178–#183）。余下跟进项见 `followups.md`（FU-57、FU-60、FU-61、FU-64 仍开）
 - **SUP-1 验收**（每条带正对照，变异验证）：外部拿不到许可证、调不了 `revoke`、碰不到子进程（5 条 `compile_fail`，各被对应变异单独弄红，对照 `stop` 能编译）；子进程环境里没有父进程的 `CARGO_MANIFEST_DIR`，只有白名单与 `A24_*`；fd 3 上能 accept；子进程只开着 fd 0–3；模块死后端口立刻拒绝；往 stderr 灌 2 MiB 不阻塞；他人可写的包目录 / `bin/` / 程序被拒；`stop` 撤销的是自己那一代并报告 abandoned / never_sent；drop 先撤后杀；首领按时退出、忽略 SIGTERM 的助手仍被杀
 - **依赖**：T6（回调连接循环）✅
+
+### ME3-NEXT 执行队列（2026-09-13 用户裁决；按顺序做，直到 T12 发布 v0.5.0）
+
+> 来源：ME3-SUP 收尾汇报。用户裁决：停机时长按建议保留默认值（排空 0.8s + 停止宽限 0.5s，总 2s），**但必须有日志、有跟踪、可调**；FU-60 改走 Unix socket；FU-61、FU-64 按下面的建议做。
+> 每一项仍走完整流程：worktree → 实现 → 变异验证 → Codex 对抗轮 → pre-pr-check → PR → PR-Daemon → 合并。**带状态机的项先写一页语义说明并让 Codex 审设计，再写代码**（SUP-5 的教训：7 轮 Codex 里 4 轮在补语义；规则提案已提给 PR-Daemon：jhfnetboy/PR-daemon#8）。
+
+**一、先止血：测试不许再漏进程**（2026-09-13 发现 31 个遗留的「忽略 SIGTERM」测试夹具进程，空转 1–2 天，已全部 SIGKILL）
+- **HYG-1 顽固模块测试夹具的进程组守卫** `READY`：`supervise.rs` / `supervisor.rs` 里起「trap '' TERM」模块的测试，改由守卫在 Drop 里按进程组 SIGKILL —— 断言失败、panic、超时中断都不留进程。判据：跑一个会让测试中途 panic 的变异后，`ps` 里该临时目录下的 `bin/mod` 进程数为 0。
+- **HYG-2 变异脚本收尾** `READY`：`docs/agent/mutate.sh` 每跑完一个变异体，清理本次测试临时目录下残留的模块进程并打印清理数；清理数 ≠ 0 即说明有测试漏收进程，打印为警告。判据：对「去掉 SIGKILL」的变异跑一次，结束后进程数为 0，且警告里点名了漏收的测试。
+
+**二、停机可观测、可调**（用户裁决：参数有问题要能被发现、能被调整）
+- **SHUT-1 停机可观测性** `READY`：① 模块超过停止宽限被 SIGKILL 时 warn（模块名、等了多久）；② 排空到时限仍有在途请求时 warn（切断几个）；③ 每次停机一行汇总（总耗时；每个模块排空耗时、停止耗时、是否被强杀）；④ 写 `~/.agent24/run/last-shutdown.json`（不阻塞看门狗：独立线程、尽力而为）；⑤ 下次启动读它 —— 文件缺失（上次被看门狗强退或崩溃）或有模块被强杀，启动日志告警并在 `agent24 os list` / `doctor` 可见。热 disable 的停止同样记录。
+- **SHUT-2 参数可调** `READY`：排空时长、停止宽限做成配置项（带上下限校验；总和不超过停机预算，超出即拒绝并说明），写进文档；默认值不变。
+- **SHUT-3 测试** `READY`：0.3s 才退出的模块不被强杀；1s 才退出的模块被强杀，且 ①③④ 都有记录；看门狗强退后下次启动告警（正对照：干净停机后不告警）。
+
+**三、收尾 ME3-SUP 的跟进项**
+- **FU-57 Supervisor 失败细分** `READY`：setup / refused / io / timeout / exited，在 `os list` 显示；判据带正对照（spawn 被拒显示 setup，真正退出显示 exited）。
+- **PROBE 修 `me3-status.sh`** `READY`：「3b-3 解析+起进程」「3b-3 进程监督」两格还在找旧符号（`pub fn spawn`、`pub fn terminate_group`），SUP 全部合并后仍显示「未开工」—— 正是它自己注释里警告过的失效方式。改成找今天的符号，并加一条「已知存在的 SUP 符号被探到」的自证。
+- **FU-60 模块 HTTP 改走 Unix socket**（用户已拍板）`READY`：D4 从「每代一个新端口」改为「每代一个新 socket 路径」（放在 `CallbackDir` 同一个 `0700` 目录下）；没有 TIME_WAIT，也省掉端口。**带状态机/协议变更：先写语义说明。**判据：带请求体的模块持续压测（2000 req/s × 60s）零 `connect` 失败。
+- **FU-61 包在运行中被卸载或替换**（按建议：检测变更、报「需要重启」，不做快照）`READY`：Supervisor 重启一代之前核对包摘要；包不在或摘要变了 → 不重启，状态 `package_changed`，带原因与解决办法（重启 daemon，或 `agent24 os disable` / `enable`），不再一路崩溃到熔断；`agent24 os uninstall` 对运行中的模块先热 disable 再删文件。**带状态机：先写语义说明。**判据：运行中卸载 → 状态报包已移除而非熔断；原地替换 → 不进入握手失败循环。快照方案记为后续选项，不做。
+- **FU-64 连接复用撞上模块关闭**（按建议：三件一起做）`READY`：① 幂等请求（无请求体的 GET/HEAD/OPTIONS）遇到「发出时连接已被关」自动换新连接重发一次；② 复用连接的空闲上限短于常见的模块 keep-alive，到期不再复用；③ 剩下的 502 返回结构化提示：`code: upstream_connection_closed`、说明「模块在请求发出的同时关闭了连接；这个请求可能已被处理，也可能没有」、解决办法「确认无副作用后重试；频繁出现请调大模块的 keep-alive」。判据：每次应答后立即关连接的模块，连续无间隔 2000 个 GET 零 502；POST 在同一情形下的 502 带上述字段。
+- **ERR-1 所有「连不上模块」的应答都带原因与解决办法** `READY`（与 FU-64 一起做）：`module_not_ready` / `module_draining` / `module_stopping` / 熔断 / `package_changed` / `disable_pending` / `stop_failed` 统一带 `hint`（为什么、该做什么），CLI 原样打印。判据：每个错误码一条测试，断言 `hint` 非空且写明可执行的下一步。
+
+**四、主线到发布**（任务定义与验收见 [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) §五「主链」）
+- **T8.5 ME-3d 记忆回调**（`private/*`）`READY`
+- **T7 ME-3e 事件 + 审批** `READY`
+- **T8 ME-3g 启用路径准入** `READY`
+- **T9 ME-3f 仓外包端到端 —— 验收**（黑盒：不改源码、不重新构建，装一个仓库之外的包，重启后挂载 → 路由代理 → 事件转发全绿）`BLOCKED on T7/T8/T8.5`
+- **T13 `agent24-os-sdk`** 与 **T14 wire 文档 + 非 Rust 参考实现**（可与 T9 之后并行）
+- **T10 Cos72 进程外样例**（重做暂停中的 `feat/me4-cos72-skeleton`）→ **T11 Sin90 迁出内核** → **T12 发布 v0.5.0**
+
+**五、仓外事项**
+- **PR-Daemon 规则 S1**：状态机改动先交一页语义说明，否则 block。已提 [jhfnetboy/PR-daemon#8](https://github.com/jhfnetboy/PR-daemon/issues/8)，等 PR-Daemon 落地；落地前本仓库按上面的约定人工执行。
 
 ---
 
