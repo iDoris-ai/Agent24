@@ -98,7 +98,15 @@ pub struct Shutdown {
     token: CancellationToken,
     at: Arc<std::sync::OnceLock<tokio::time::Instant>>,
     armed: Arc<std::sync::atomic::AtomicBool>,
+    /// `STARTING`, `READY` or `STOPPING`: readiness and a shutdown request
+    /// decide, once and atomically, which came first (see
+    /// [`Shutdown::commit_ready`]).
+    phase: Arc<std::sync::atomic::AtomicU8>,
 }
+
+const STARTING: u8 = 0;
+const READY: u8 = 1;
+const STOPPING: u8 = 2;
 
 impl Shutdown {
     #[must_use]
@@ -107,13 +115,34 @@ impl Shutdown {
             token,
             at: Arc::new(std::sync::OnceLock::new()),
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            phase: Arc::new(std::sync::atomic::AtomicU8::new(STARTING)),
         }
     }
 
     /// Begin the shutdown (idempotent).
     pub fn request(&self) {
+        self.phase
+            .store(STOPPING, std::sync::atomic::Ordering::SeqCst);
         arm_watchdog(self.deadline(), &self.armed);
         self.token.cancel();
+    }
+
+    /// Declare the daemon ready — unless a shutdown was requested first.
+    /// `false`: it was, and nothing may say this daemon is ready. One atomic
+    /// step against [`Shutdown::request`], so the two cannot both win: a
+    /// check followed by the ready line let a shutdown land in between and the
+    /// CLI report a daemon started that was already exiting (review of SUP-4,
+    /// rounds 5 and 7).
+    #[must_use]
+    pub fn commit_ready(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                STARTING,
+                READY,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
     /// When the shutdown's work must be done: fixed by the first
@@ -1088,7 +1117,7 @@ pub async fn serve(
     // A shutdown that began during startup ends it here, before anything says
     // this daemon is ready: its modules are stopped, and no state file or
     // ready line advertises a daemon that is about to exit (review of SUP-4,
-    // round 4).
+    // round 4). Checked again, atomically, before the ready line below.
     if cancel.is_cancelled() {
         let _ = stopping.await;
         return Ok(());
@@ -1111,6 +1140,17 @@ pub async fn serve(
         tracing::warn!("could not write daemon state file: {err}");
     }
 
+    // The state file is written; now readiness and a shutdown request race
+    // for one atomic flag. Lost to a shutdown: take the file back — the
+    // cleanup at the shutdown's start may have run before it existed — and
+    // print no ready line.
+    if !shutdown.commit_ready() {
+        if !ephemeral {
+            agent24_protocol::state_file::remove_if_owner(daemon_pid);
+        }
+        let _ = stopping.await;
+        return Ok(());
+    }
     println!(
         "{}",
         serde_json::json!({
@@ -1332,6 +1372,27 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// Readiness and a shutdown request cannot both win: requested first, the
+    /// daemon never says it is ready; ready first, the shutdown still happens
+    /// (review of SUP-4, round 7).
+    #[test]
+    fn readiness_and_a_shutdown_request_decide_once() {
+        let stopping_first = Shutdown::new(CancellationToken::new());
+        stopping_first.token().cancel(); // no watchdog in a test process
+        stopping_first
+            .phase
+            .store(STOPPING, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !stopping_first.commit_ready(),
+            "ready after a shutdown request"
+        );
+
+        let ready_first = Shutdown::new(CancellationToken::new());
+        assert!(ready_first.commit_ready());
+        assert!(!ready_first.commit_ready(), "ready twice");
+        assert!(!ready_first.token().is_cancelled());
     }
 
     fn built_in(name: &str) -> crate::domain::Installed {
