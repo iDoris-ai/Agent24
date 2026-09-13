@@ -571,6 +571,13 @@ async fn run_once(
             return Ok(failed(Stopped::Exited));
         }
     };
+    // Checked again: a stop sent while the (biased) select above was already
+    // past its stop branch lets the spawn finish in the same poll. Stop that
+    // process now rather than hand it a generation (review of SUP-4, round 3).
+    if stop.borrow().is_some() {
+        finish(process, timings, &spec.name, status, slot).await?;
+        return Ok(Run::StopRequested);
+    }
     let generation = process.generation().clone();
     // Out goes this supervisor's placeholder, which was never started.
     slot.install(generation.clone());
@@ -609,6 +616,12 @@ async fn run_once(
             return Ok(run);
         }
     };
+    // The same for the handshake: a stop that landed while it completed must
+    // not see the generation become Running and admit work.
+    if stop.borrow().is_some() {
+        finish(process, timings, &spec.name, status, slot).await?;
+        return Ok(Run::StopRequested);
+    }
     if !generation.ready() {
         // Only a revocation moves a generation out of Starting, and only this
         // run stops its process — so this is not expected. It is still not a

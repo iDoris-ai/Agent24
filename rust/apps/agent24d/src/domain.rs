@@ -513,10 +513,72 @@ pub struct ProcessHost {
     pub callback_dir: Arc<agent24_os_proto::endpoint::CallbackDir>,
     pub trampoline: agent24_os_proto::launch::Trampoline,
     pub timings: agent24_os_proto::supervisor::Timings,
-    /// The daemon's shutdown: once it has begun, no further package is
-    /// started — a SIGTERM during startup must not keep starting modules the
-    /// shutdown then has to stop (review of SUP-4, round 2).
-    pub shutdown: tokio_util::sync::CancellationToken,
+    /// Every module started, owned from the moment it starts — so a shutdown
+    /// that begins while later packages are still being mounted stops the
+    /// earlier ones too — and closed by the shutdown, after which nothing
+    /// starts (review of SUP-4, rounds 2 and 3).
+    pub supervisors: Arc<Supervisors>,
+}
+
+/// The daemon's supervised modules: a list the shutdown closes and takes.
+/// Starting a module happens under its lock, so "has the shutdown begun?" and
+/// "start and register it" are one step — no module starts after
+/// [`Supervisors::close`], and none started before it escapes the list it
+/// returns (review of SUP-4, round 3).
+pub struct Supervisors(std::sync::Mutex<Option<Vec<Supervised>>>);
+
+impl Default for Supervisors {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(Some(Vec::new())))
+    }
+}
+
+impl Supervisors {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<Supervised>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the shutdown has closed the list.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.lock().is_none()
+    }
+
+    /// Run `start` and keep what it starts — unless the list is closed, in
+    /// which case `start` does not run and this returns `false`. `start` runs
+    /// under the lock and must not block (starting a supervisor only spawns
+    /// its task).
+    pub fn start_with<E>(
+        &self,
+        start: impl FnOnce() -> std::result::Result<Supervised, E>,
+    ) -> Option<std::result::Result<(), E>> {
+        let mut list = self.lock();
+        let list = list.as_mut()?;
+        Some(start().map(|s| list.push(s)))
+    }
+
+    /// The live status of each module in the list, by name — for `agent24 os
+    /// list` (see `AppState::module_status`).
+    #[must_use]
+    pub fn statuses(
+        &self,
+    ) -> std::collections::HashMap<
+        String,
+        tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
+    > {
+        self.lock()
+            .iter()
+            .flatten()
+            .map(|s| (s.name.clone(), s.handle.subscribe()))
+            .collect()
+    }
+
+    /// Close the list and take everything in it. Later starts are refused.
+    pub fn close(&self) -> Vec<Supervised> {
+        self.lock().take().unwrap_or_default()
+    }
 }
 
 /// A module started under a supervisor. The daemon stops each before it exits
@@ -558,15 +620,9 @@ pub async fn mount_all(
     inventory: &dyn ModelInventory,
     memory: Option<&MemoryLease>,
     host: std::result::Result<&ProcessHost, &str>,
-) -> (
-    Router,
-    Vec<MountReport>,
-    crate::os_memory::OsMemoryCatalog,
-    Vec<Supervised>,
-) {
+) -> (Router, Vec<MountReport>, crate::os_memory::OsMemoryCatalog) {
     let mut app = Router::new();
     let mut reports = Vec::new();
-    let mut supervisors = Vec::new();
     // Recorded for every module that is HANDED a partition, so a future export or
     // erase path has an explicit list instead of prefix-matching storage keys.
     let mut partitions = crate::os_memory::OsMemoryCatalog::default();
@@ -730,7 +786,7 @@ pub async fn mount_all(
         // A PACKAGE is started, not constructed: its own path from here.
         let build = match &entry.build {
             Build::Package(package) => {
-                let (next, report, supervised) = mount_package(
+                let (next, report) = mount_package(
                     app,
                     package,
                     MountTarget {
@@ -746,7 +802,6 @@ pub async fn mount_all(
                 .await;
                 app = next;
                 reports.push(report);
-                supervisors.extend(supervised);
                 continue;
             }
             Build::InProcess(build) => build,
@@ -896,7 +951,7 @@ pub async fn mount_all(
         });
     }
 
-    (app, reports, partitions, supervisors)
+    (app, reports, partitions)
 }
 
 /// The identity `mount_all` already admitted, for the entry being mounted.
@@ -907,9 +962,9 @@ struct MountTarget {
     enabled_at_start: Option<bool>,
 }
 
-/// Mount one admitted, enabled package: start it under a supervisor and put the
-/// kernel's proxy in front of it. Returns the router, the report, and the
-/// supervisor if one was started.
+/// Mount one admitted, enabled package: start it under a supervisor — kept in
+/// `host.supervisors` — and put the kernel's proxy in front of it. Returns the
+/// router and the report.
 ///
 /// The same outcomes as a compiled-in module, for the same reasons: a manifest
 /// that disagrees with its entry is Refused (no routes); a directory that cannot
@@ -925,7 +980,7 @@ async fn mount_package(
     root: &Path,
     inventory: &dyn ModelInventory,
     host: std::result::Result<&ProcessHost, &str>,
-) -> (Router, MountReport, Option<Supervised>) {
+) -> (Router, MountReport) {
     let MountTarget {
         name,
         namespace,
@@ -958,7 +1013,6 @@ async fn mount_package(
                 manifest.name(),
                 manifest.version()
             )),
-            None,
         );
     }
     let Some(command) = manifest
@@ -972,7 +1026,6 @@ async fn mount_package(
                  spawn command; in-process modules are compiled in"
                     .to_owned(),
             ),
-            None,
         );
     };
     let degraded = |app: Router, why: String| {
@@ -980,7 +1033,6 @@ async fn mount_package(
         (
             degraded_namespace(app, &namespace, &name),
             report(MountOutcome::Degraded(why), ResourceStatus::NotChecked),
-            None,
         )
     };
     let host = match host {
@@ -992,17 +1044,13 @@ async fn mount_package(
             );
         }
     };
-    if host.shutdown.is_cancelled() {
-        return degraded(app, "the daemon is shutting down".to_owned());
+    const SHUTTING_DOWN: &str = "the daemon is shutting down";
+    if host.supervisors.is_closed() {
+        return degraded(app, SHUTTING_DOWN.to_owned());
     }
     let data_dir = manifest.data_dir_under(root);
     if let Err(why) = prepare_dir(&data_dir).await {
         return degraded(app, why);
-    }
-    // Checked again after the one await: a shutdown that began while the
-    // directory was prepared starts nothing either.
-    if host.shutdown.is_cancelled() {
-        return degraded(app, "the daemon is shutting down".to_owned());
     }
     let resources = check_resources(inventory, manifest.requires_models());
     let current =
@@ -1015,28 +1063,34 @@ async fn mount_package(
         manifest_digest: package.digest.clone(),
         trampoline: host.trampoline.clone(),
     };
-    let handle = match agent24_os_proto::supervisor::supervise(
-        spec,
-        host.callback_dir.clone(),
-        current.clone(),
-        // No callback method is offered to modules yet (ME-3c onward).
-        Arc::new(|_| agent24_os_proto::rpc::Methods::none()),
-        host.timings,
-    ) {
-        Ok(h) => h,
+    // Started and registered in one step, unless the shutdown has closed the
+    // list — which it may have while the directory was being prepared.
+    let started = host.supervisors.start_with(|| {
+        agent24_os_proto::supervisor::supervise(
+            spec,
+            host.callback_dir.clone(),
+            current.clone(),
+            // No callback method is offered to modules yet (ME-3c onward).
+            Arc::new(|_| agent24_os_proto::rpc::Methods::none()),
+            host.timings,
+        )
+        .map(|handle| Supervised {
+            name: name.clone(),
+            handle,
+        })
+    });
+    match started {
+        None => return degraded(app, SHUTTING_DOWN.to_owned()),
         // A fresh slot, held by nobody: not expected. Still not a mounted module.
-        Err(held) => return degraded(app, held.to_string()),
-    };
+        Some(Err(held)) => return degraded(app, held.to_string()),
+        Some(Ok(())) => {}
+    }
     tracing::info!(
         "domain OS {name:?} started from {} and proxied at {namespace}",
         package.dir.display()
     );
     let app = agent24_os_proto::proxy::mount(app, &namespace, current);
-    (
-        app,
-        report(MountOutcome::Mounted, resources),
-        Some(Supervised { name, handle }),
-    )
+    (app, report(MountOutcome::Mounted, resources))
 }
 
 #[cfg(test)]
@@ -1099,7 +1153,7 @@ mod tests {
         root: &Path,
         hub: &crate::events::EventsHub,
     ) -> (Router, Vec<MountReport>) {
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             catalogue,
             root,
             hub,
@@ -1406,7 +1460,7 @@ while f.readline():
                 stop_grace: std::time::Duration::from_secs(1),
                 ..agent24_os_proto::supervisor::Timings::default()
             },
-            shutdown: tokio_util::sync::CancellationToken::new(),
+            supervisors: Arc::new(Supervisors::default()),
         }
     }
 
@@ -1427,7 +1481,7 @@ while f.readline():
         let host = test_host(tmp.path());
         let hub = crate::events::EventsHub::default();
         let root = tmp.path().join("os");
-        let (app, reports, _, supervisors) = mount_all(
+        let (app, reports, _) = mount_all(
             &discovered(&packages),
             &root,
             &hub,
@@ -1447,7 +1501,7 @@ while f.readline():
             root.join("remote").is_dir(),
             "its data directory was not prepared"
         );
-        assert_eq!(supervisors.len(), 1);
+        assert_eq!(host.supervisors.lock().as_ref().map(Vec::len), Some(1));
 
         // `module_not_ready` until the handshake, then the module's own answer.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1465,7 +1519,7 @@ while f.readline():
         };
         assert_eq!(body, "hello from remote");
 
-        for s in supervisors {
+        for s in host.supervisors.close() {
             s.handle.stop().await.expect("a clean stop");
         }
     }
@@ -1482,9 +1536,9 @@ while f.readline():
         let packages = tmp.path().join("packages");
         write_package(&packages, "remote");
         let host = test_host(tmp.path());
-        host.shutdown.cancel();
+        assert!(host.supervisors.close().is_empty());
         let hub = crate::events::EventsHub::default();
-        let (_, reports, _, supervisors) = mount_all(
+        let (_, reports, _) = mount_all(
             &discovered(&packages),
             &tmp.path().join("os"),
             &hub,
@@ -1499,7 +1553,7 @@ while f.readline():
             other => panic!("expected Degraded, got {other:?}"),
         }
         assert!(
-            supervisors.is_empty(),
+            host.supervisors.close().is_empty(),
             "a package was started during the shutdown"
         );
     }
@@ -1517,7 +1571,7 @@ while f.readline():
         let host = test_host(tmp.path());
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
-        let (app, reports, _, supervisors) = mount_all(
+        let (app, reports, _) = mount_all(
             &discovered(&packages),
             &tmp.path().join("os"),
             &hub,
@@ -1528,7 +1582,10 @@ while f.readline():
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Disabled);
-        assert!(supervisors.is_empty(), "a disabled package was started");
+        assert!(
+            host.supervisors.close().is_empty(),
+            "a disabled package was started"
+        );
         assert_eq!(
             body_json(get(&app, "/api/v1/remote/hi").await).await["error"]["code"],
             "module_disabled"
@@ -1543,7 +1600,7 @@ while f.readline():
         let packages = tmp.path().join("packages");
         write_package(&packages, "remote");
         let hub = crate::events::EventsHub::default();
-        let (app, reports, _, supervisors) = mount_all(
+        let (app, reports, _) = mount_all(
             &discovered(&packages),
             &tmp.path().join("os"),
             &hub,
@@ -1557,7 +1614,6 @@ while f.readline():
             MountOutcome::Degraded(why) => assert!(why.contains("not ours"), "{why}"),
             other => panic!("expected Degraded, got {other:?}"),
         }
-        assert!(supervisors.is_empty());
         assert_eq!(
             get(&app, "/api/v1/remote/hi").await.status(),
             StatusCode::SERVICE_UNAVAILABLE
@@ -1899,7 +1955,7 @@ while f.readline():
         };
         let a = want_mem("alpha");
         let b = want_mem("beta");
-        let (_, reports, partitions, _) = mount_all(
+        let (_, reports, partitions) = mount_all(
             &[entry(a.clone()), entry(b.clone())],
             tmp.path(),
             &hub,
@@ -1955,7 +2011,7 @@ while f.readline():
         let lease = MemoryLease::open("alice", kv).await.unwrap();
         // `manifest_yaml` asks for events only.
         let m = FakeModule::new("quiet");
-        let (_, reports, partitions, _) = mount_all(
+        let (_, reports, partitions) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
@@ -1988,7 +2044,7 @@ while f.readline():
             "kernel_capabilities: [memory]",
         );
         let m = FakeModule::from_yaml(&yaml, false);
-        let (_, reports, partitions, _) = mount_all(
+        let (_, reports, partitions) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
@@ -2046,7 +2102,7 @@ while f.readline():
         .unwrap();
 
         let lease = MemoryLease::open("alice", kv).await.unwrap();
-        let (_, reports, partitions, _) = mount_all(
+        let (_, reports, partitions) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
@@ -2085,7 +2141,7 @@ while f.readline():
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("offswitch");
         let cfg = config_from(r#"{"domainOs": {"offswitch": {"enabled": false}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(m.clone())],
             tmp.path(),
             &hub,
@@ -2145,7 +2201,7 @@ while f.readline():
         let token = st.token.to_string();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = config_from(r#"{"domainOs": {"offswitch": {"enabled": false}}}"#);
-        let (modules, _, _, _) = mount_all(
+        let (modules, _, _) = mount_all(
             &[entry(FakeModule::new("offswitch"))],
             tmp.path(),
             &st.events,
@@ -2187,7 +2243,7 @@ while f.readline():
         let off = FakeModule::new("shared");
         let squatter = FakeModule::new("shared");
         let cfg = config_from(r#"{"domainOs": {"shared": {"enabled": false}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(off), entry(squatter.clone())],
             tmp.path(),
             &hub,
@@ -2219,7 +2275,7 @@ while f.readline():
         let hub = crate::events::EventsHub::default();
         let a = FakeModule::new("alpha");
         let b = FakeModule::new("beta");
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(a.clone()), entry(b.clone())],
             tmp.path(),
             &hub,
@@ -2277,7 +2333,7 @@ while f.readline():
             manifest_yaml("broken", "in_process_crate")
         );
         let m = FakeModule::from_yaml(&yaml, true);
-        let (_, reports, _, _) = mount_all(
+        let (_, reports, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
@@ -2307,7 +2363,7 @@ while f.readline():
             r#"{"default": "disabled",
                 "domainOs": {"sin09": {"enabled": false}, "sin90": {"enabled": true}}}"#,
         );
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(FakeModule::new("sin90"))],
             tmp.path(),
             &hub,
@@ -2337,7 +2393,7 @@ while f.readline():
         // `someone-else` is a REAL module here, so disabling it is a legitimate
         // config rather than the typo case guarded above.
         let cfg = config_from(r#"{"domainOs": {"someone-else": {"enabled": false}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("newcomer")),
                 entry(FakeModule::new("someone-else")),
@@ -2374,7 +2430,7 @@ while f.readline():
         let hub = crate::events::EventsHub::default();
         let real = FakeModule::new("sin90");
         let cfg = config_from(r#"{"domainOs": {"sin09": {"enabled": false}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(real.clone())],
             tmp.path(),
             &hub,
@@ -2398,7 +2454,7 @@ while f.readline():
 
         // The harmless half: an unknown ENABLED entry changes nothing.
         let ok_cfg = config_from(r#"{"domainOs": {"sin09": {"enabled": true}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(FakeModule::new("sin90"))],
             tmp.path(),
             &hub,
@@ -2424,7 +2480,7 @@ while f.readline():
         let hub = crate::events::EventsHub::default();
         let cfg =
             config_from(r#"{"default": "disabled", "domainOs": {"wanted": {"enabled": true}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("wanted")),
                 entry(FakeModule::new("unlisted")),
@@ -2476,7 +2532,7 @@ while f.readline():
         let cfg = config_from(
             r#"{"domainOs": {"health": {"enabled": false}, "remote": {"enabled": false}}}"#,
         );
-        let (_, reports, _, _) = mount_all(
+        let (_, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("health")),
                 entry(FakeModule::with("remote", "out_of_process_provider", false)),
@@ -2532,7 +2588,7 @@ while f.readline():
             })),
         }];
         let cfg = config_from(r#"{"domainOs": {"crashy": {"enabled": false}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &cat,
             tmp.path(),
             &hub,
@@ -2570,7 +2626,7 @@ while f.readline():
                 Err("never reached".to_owned())
             })),
         }];
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &cat,
             tmp.path(),
             &hub,
@@ -2627,7 +2683,7 @@ while f.readline():
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"twin": {"enabled": false}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("twin")),
                 entry(FakeModule::new("twin")),
@@ -2664,7 +2720,7 @@ while f.readline():
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"alpha": {"enabled": false}}}"#);
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[
                 entry(FakeModule::new("alpha")),
                 entry(FakeModule::new("beta")),
@@ -2780,7 +2836,7 @@ while f.readline():
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let inv = TestModels(Ok(vec!["ornith-9b".to_owned()]));
-        let (app, reports, _, _) = mount_all(
+        let (app, reports, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
@@ -2816,7 +2872,7 @@ while f.readline():
         );
         let m = FakeModule::from_yaml(&yaml, false);
         let inv = TestModels(Err("provider timed out".to_owned()));
-        let (_, reports, _, _) = mount_all(
+        let (_, reports, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,
@@ -2839,7 +2895,7 @@ while f.readline():
         let tmp = tempfile::tempdir().unwrap();
         let hub = crate::events::EventsHub::default();
         let m = FakeModule::new("frugal");
-        let (_, reports, _, _) = mount_all(
+        let (_, reports, _) = mount_all(
             &[entry(m)],
             tmp.path(),
             &hub,

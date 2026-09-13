@@ -12,10 +12,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// A package module: HTTP on the listener the kernel hands it — `/slow`
-/// marks that it has started (`slow-entered`) and answers after 600ms,
-/// anything else at once — its pid in its data directory, the handshake with
-/// its own manifest's digest, and an exit when the callback connection ends
-/// (D1).
+/// marks that it has started (`slow-entered`) and answers only once the test
+/// creates `release`; anything else at once — its pid in its data directory,
+/// the handshake with its own manifest's digest, and an exit when the callback
+/// connection ends (D1).
 const MODULE: &str = r#"import hashlib, json, os, socket, threading, time
 with open("domain-os.yml", "rb") as f:
     digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
@@ -31,8 +31,12 @@ def answer(conn):
         head += chunk
     path = head.split(b" ")[1]
     if path.endswith(b"/slow"):
-        open(os.path.join(os.environ["A24_DATA_DIR"], "slow-entered"), "w").close()
-        time.sleep(0.6)
+        data = os.environ["A24_DATA_DIR"]
+        open(os.path.join(data, "slow-entered"), "w").close()
+        release = os.path.join(data, "release")
+        deadline = time.time() + 5
+        while not os.path.exists(release) and time.time() < deadline:
+            time.sleep(0.01)
         body = b"slow done"
     else:
         body = b"hello"
@@ -133,17 +137,36 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut run = Running {
         daemon,
         module: None,
     };
-    let mut ready = String::new();
-    BufReader::new(run.daemon.stdout.take().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
+    // Bounded: a daemon that stalls before its ready line fails the test
+    // rather than hanging it.
+    let stdout = run.daemon.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let ready = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("no ready line within 30s");
+    // The daemon's log, line by line, so the test can wait for it to have
+    // HEARD the signal — not only for the signal to have been sent.
+    let stderr = run.daemon.stderr.take().unwrap();
+    let (log_tx, log_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if log_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let ready: serde_json::Value = serde_json::from_str(&ready).expect("the ready line");
     let port = u16::try_from(ready["port"].as_u64().unwrap()).unwrap();
     let token = ready["token"].as_str().unwrap().to_owned();
@@ -186,6 +209,19 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
             .unwrap()
             .success()
     );
+    // The shutdown has begun with the request still held by the module; only
+    // now is it let go — inside the drain budget. Finishing it before the
+    // daemon heard the signal would prove nothing.
+    let heard_by = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = heard_by.saturating_duration_since(Instant::now());
+        match log_rx.recv_timeout(left) {
+            Ok(line) if line.contains("shutdown signal received") => break,
+            Ok(_) => {}
+            Err(_) => panic!("the daemon never logged that it heard the signal"),
+        }
+    }
+    std::fs::write(home.path().join(".agent24/os/remote/release"), b"").unwrap();
 
     assert_eq!(
         slow.join().unwrap(),

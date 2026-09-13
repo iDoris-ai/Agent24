@@ -851,7 +851,15 @@ pub async fn serve(
             signal(SignalKind::interrupt())?,
         )
     };
+    // The one shutdown deadline. A signal fixes it BEFORE it cancels, so it is
+    // the moment of the signal; any other way shutdown starts (an HTTP
+    // shutdown, the server ending) fixes it at the first look after the cancel
+    // — a scheduling delay later, which the watchdog below bounds (review of
+    // SUP-4, round 3).
+    let shutdown_at: Arc<std::sync::OnceLock<tokio::time::Instant>> =
+        Arc::new(std::sync::OnceLock::new());
     let signal_cancel = cancel.clone();
+    let signal_at = shutdown_at.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
         tokio::select! {
@@ -864,26 +872,54 @@ pub async fn serve(
             std::future::pending::<()>().await;
         }
         tracing::info!("shutdown signal received");
+        let _ = deadline_of(&signal_at);
         signal_cancel.cancel();
     });
-    // The one shutdown deadline, fixed when shutdown begins — also when that is
-    // during startup, before the server exists: everything that waits on the
-    // shutdown waits until this instant, not SHUTDOWN_GRACE after it notices.
-    let shutdown_at: Arc<std::sync::OnceLock<tokio::time::Instant>> =
-        Arc::new(std::sync::OnceLock::new());
+    // The hard bound. Whatever is stuck — a module's directory on a stalled
+    // filesystem during startup, a blocking task — the process ends one second
+    // past the deadline. Modules it did not get to stop read EOF on their
+    // callback connections, which ends their runs (D1).
     {
-        let (cancel, shutdown_at) = (cancel.clone(), shutdown_at.clone());
+        let (cancel, at) = (cancel.clone(), shutdown_at.clone());
         tokio::spawn(async move {
             cancel.cancelled().await;
-            let _ = shutdown_at.set(tokio::time::Instant::now() + SHUTDOWN_GRACE);
+            let left = deadline_of(&at).saturating_duration_since(tokio::time::Instant::now());
+            std::thread::spawn(move || {
+                std::thread::sleep(left + Duration::from_secs(1));
+                tracing::error!("shutdown did not finish within its bound; exiting now");
+                std::process::exit(1);
+            });
         });
     }
 
-    let host = process_host(if ephemeral { &os_root } else { &state_dir }, &cancel);
+    let host = process_host(if ephemeral { &os_root } else { &state_dir });
     if let Err(why) = &host {
         tracing::error!("out-of-process domain OS modules cannot be started: {why}");
     }
-    let (module_routes, reports, partitions, supervisors) = crate::domain::mount_all(
+    // Modules are owned by the shutdown from the moment each starts — this
+    // task exists before the first one does — so a shutdown that begins while
+    // later packages are still being mounted stops the earlier ones, within
+    // the same bound (review of SUP-4, round 3). It drains and then stops
+    // them, alongside the HTTP drain, inside SHUTDOWN_GRACE (TASKS B2): a
+    // module still stopping at the deadline is dropped with its supervisor,
+    // which SIGKILLs its group — and a module reads EOF on its callback
+    // connection as the end of its run (D1), so one that outlives this
+    // process exits on its own.
+    let registry = host.as_ref().ok().map(|h| h.supervisors.clone());
+    let stop_cancel = cancel.clone();
+    let stop_deadline = shutdown_at.clone();
+    let stopping = tokio::spawn(async move {
+        stop_cancel.cancelled().await;
+        let deadline = deadline_of(&stop_deadline);
+        let supervisors = registry.map(|r| r.close()).unwrap_or_default();
+        if tokio::time::timeout_at(deadline, stop_supervisors(supervisors))
+            .await
+            .is_err()
+        {
+            tracing::warn!("out-of-process modules were still stopping at the deadline; killed");
+        }
+    });
+    let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
         &state.events,
@@ -967,10 +1003,9 @@ pub async fn serve(
     // can report what the mounter actually decided rather than re-deriving it.
     state.os_reports = Arc::new(reports);
     state.module_status = Arc::new(
-        supervisors
-            .iter()
-            .map(|s| (s.name.clone(), s.handle.subscribe()))
-            .collect(),
+        host.as_ref()
+            .map(|h| h.supervisors.statuses())
+            .unwrap_or_default(),
     );
     let router = build_router_with_modules(state, module_routes);
 
@@ -1005,25 +1040,6 @@ pub async fn serve(
         })
     );
 
-    // Modules are drained and then stopped from the moment shutdown begins,
-    // alongside the HTTP drain, inside the same SHUTDOWN_GRACE (TASKS B2).
-    // Bounded from that moment: a module still stopping at the deadline is
-    // dropped with its supervisor, which SIGKILLs its group — and a module
-    // reads EOF on its callback connection as the end of its run (D1), so one
-    // that outlives this process exits on its own.
-    let stop_cancel = cancel.clone();
-    let stop_deadline = shutdown_at.clone();
-    let stopping = tokio::spawn(async move {
-        stop_cancel.cancelled().await;
-        let deadline = deadline_of(&stop_deadline);
-        if tokio::time::timeout_at(deadline, stop_supervisors(supervisors))
-            .await
-            .is_err()
-        {
-            tracing::warn!("out-of-process modules were still stopping at the deadline; killed");
-        }
-    });
-
     let graceful_cancel = cancel.clone();
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { graceful_cancel.cancelled().await });
@@ -1054,10 +1070,7 @@ pub async fn serve(
 /// What out-of-process modules are started with: the callback directory under
 /// `root` (stale ones cleared first, FU-56), this binary as the trampoline, and
 /// the daemon's stop grace.
-fn process_host(
-    root: &std::path::Path,
-    shutdown: &CancellationToken,
-) -> Result<crate::domain::ProcessHost, String> {
+fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, String> {
     for gone in agent24_os_proto::endpoint::remove_stale(root) {
         tracing::info!(
             "removed the callback directory of a daemon that is gone: {}",
@@ -1092,13 +1105,13 @@ fn process_host(
             stop_grace: MODULE_STOP_GRACE,
             ..agent24_os_proto::supervisor::Timings::default()
         },
-        shutdown: shutdown.clone(),
+        supervisors: StdArc::new(crate::domain::Supervisors::default()),
     })
 }
 
-/// The shutdown deadline, once shutdown has begun (see `shutdown_at` in
-/// `serve`); a caller that finds it unset — it cannot be, after the cancel it
-/// waited for, but the order of two tasks is not proved here — counts from now.
+/// The shutdown deadline: fixed by the first caller — the signal task, before
+/// it cancels; otherwise the first to look after a cancel (see `shutdown_at` in
+/// `serve`).
 fn deadline_of(at: &std::sync::OnceLock<tokio::time::Instant>) -> tokio::time::Instant {
     *at.get_or_init(|| tokio::time::Instant::now() + SHUTDOWN_GRACE)
 }
@@ -1349,7 +1362,7 @@ pub(crate) mod tests {
                     .map_err(|e| e.to_string())
             })),
         };
-        let (modules, _, _, _) = crate::domain::mount_all(
+        let (modules, _, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
@@ -1499,7 +1512,7 @@ pub(crate) mod tests {
                 Ok(m.clone() as StdArc<dyn DomainModule>)
             })),
         };
-        let (modules, reports, _, _) = crate::domain::mount_all(
+        let (modules, reports, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
@@ -2211,7 +2224,7 @@ pub(crate) mod tests {
                     .map_err(|e| e.to_string())
             })),
         };
-        let (modules, _, _, _) = crate::domain::mount_all(
+        let (modules, _, _) = crate::domain::mount_all(
             &[entry],
             tmp.path(),
             &st.events,
