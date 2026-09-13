@@ -88,6 +88,9 @@ fake prefix "if $MUTATED; then $FAKE/prefix_; exit 101; else $SUM_OK; fi"
 fake indent "echo '    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; $SUM_OK"
 fake leak "sleep 3005 & echo \$! | tee -a $PIDS $(printf %q "$FAKE/allpids") >/dev/null; $SUM_OK"
 fake detach "perl -e 'setpgrp(0,0); sleep 3006' & echo \$! | tee -a $PIDS $(printf %q "$FAKE/allpids") >/dev/null; sleep 3007 & echo \$! | tee -a $PIDS $(printf %q "$FAKE/allpids") >/dev/null; wait"
+# orphan:像测试二进制先退出、它没停掉的模块被 init 收养 —— 在 $TMPDIR 下建一个忙等脚本,
+# 双 fork 让它的父进程先走(ppid=1),并另起进程组;杀组、按 ppid 找后代都够不着(HYG-2)。
+fake orphan "mkdir -p \"\$TMPDIR/bin\"; printf '#!/bin/sh\\nwhile : ; do sleep 1 ; done\\n' >\"\$TMPDIR/bin/mod\"; chmod +x \"\$TMPDIR/bin/mod\"; ( perl -e 'setpgrp(0,0); exec @ARGV' \"\$TMPDIR/bin/mod\" & echo \$! | tee -a $PIDS $(printf %q "$FAKE/allpids") >/dev/null ); sleep 0.3; $SUM_OK"
 # cond7:被变异时红;未变异时,$FAKE/drift 存在就只报 7 个通过(基线是 8)。
 fake cond7 "if grep -q 'if false {' $(printf %q "$FA"); then $SUM_RED; exit 101; elif [ -e $(printf %q "$FAKE/drift") ]; then echo 'test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; else $SUM_OK; fi"
 # flaky:被变异时第一次红、第二次绿 —— 偶发失败
@@ -401,6 +404,10 @@ expect dead "$(all_dead)" "㉚ 正常退出时 cargo 留下的后台进程也被
 MUT_TIMEOUT=2 MUT_CARGO=$FAKE/detach mut "$F" "$BREAKER" '        if false {' "㉚b" >/dev/null
 expect TIMEOUT "$_MUT_LAST" "㉚ 挂住"
 expect dead "$(all_dead)" "㉚ 另起进程组的后代也被杀"
+: >"$FAKE/pids"
+out=$(MUT_CARGO=$FAKE/orphan mut "$F" "$BREAKER" '        if false {' "㉚c" 2>&1)
+expect dead "$(all_dead)" "㉚c 被 init 收养、另起进程组的孤儿也被杀(按这次运行的 TMPDIR 找)"
+expect yes "$([[ $out == *漏收进程* ]] && echo yes || echo no)" "㉚c 且点名警告有测试漏收进程"
 rm -f "$FAKE/drift"
 MUT_CARGO=$FAKE/cond7 mut_baseline agent24-os-proto >/dev/null
 : >"$FAKE/drift"

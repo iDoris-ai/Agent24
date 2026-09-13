@@ -326,11 +326,58 @@ def descendants(root):
     return found
 
 
+def sweep(run_tmp):
+    """杀掉命令行里带着 run_tmp 的进程,返回它们的 (pid, 命令行)。
+
+    按 ppid 找后代(上面)看不见一种进程:测试二进制先退出了,它没停掉的模块被 init
+    收养(ppid=1),又在自己的进程组里 —— 杀组、杀后代都够不着。2026-09-13 就这样
+    攒下 31 个忽略 SIGTERM 的忙循环,空转一两天(HYG-2)。每次运行一个专属的 TMPDIR,
+    测试夹具都建在它下面,命令行里带着它 —— 按它找,不会误伤别的运行。"""
+    marks = {run_tmp, os.path.realpath(run_tmp)}
+    killed = []
+    for _ in range(5):  # 杀的同时可能又 fork 出新的:扫到没有为止,有上限
+        try:
+            out = subprocess.run(["ps", "-A", "-o", "pid=,command="], capture_output=True, text=True).stdout
+        except OSError:
+            return killed
+        found = []
+        for line in out.splitlines():
+            pid, _, command = line.strip().partition(" ")
+            if pid.isdigit() and int(pid) != os.getpid() and any(m in command for m in marks):
+                found.append((int(pid), command.strip()))
+        if not found:
+            break
+        for pid, command in found:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append((pid, command))
+            except ProcessLookupError:
+                pass
+        time.sleep(0.05)
+    return killed
+
+
 def supervise(cmd, cwd, timeout):
-    """→ ("DONE", rc, text) / ("TIMEOUT",) / ("INTERRUPTED", signum)。不论怎么结束,整棵树都杀掉。"""
+    """→ ("DONE", rc, text) / ("TIMEOUT",) / ("INTERRUPTED", signum)。不论怎么结束,整棵树都杀掉,
+    连同被 init 收养、命令行里带着这次运行的 TMPDIR 的进程(见 sweep)。"""
+    run_tmp = tempfile.mkdtemp(prefix="mut-run-")
+    try:
+        return _supervise(cmd, cwd, timeout, run_tmp)
+    finally:
+        leaked = sweep(run_tmp)
+        if leaked:
+            say(f"⚠️  漏收进程:这次运行结束后还有 {len(leaked)} 个进程在它的临时目录下运行,已 SIGKILL —— "
+                f"有测试没收掉它起的进程(测试夹具该有寿命上限或守卫):")
+            for pid, command in leaked[:10]:
+                say(f"      {pid} {command[:160]}")
+        shutil.rmtree(run_tmp, ignore_errors=True)
+
+
+def _supervise(cmd, cwd, timeout, run_tmp):
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as out:
         # 颜色转义会让行首锚定的判据全部失配(一个真崩溃被读成「不认识」)。
-        env = dict(os.environ, CARGO_TERM_COLOR="never")
+        # TMPDIR:测试的临时目录都落在这次运行专属的目录下,见 sweep。
+        env = dict(os.environ, CARGO_TERM_COLOR="never", TMPDIR=run_tmp)
         proc = subprocess.Popen(
             cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             start_new_session=True,  # setsid 在 exec 之前:拿到 pid 时进程组已存在
