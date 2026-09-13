@@ -589,8 +589,12 @@ impl IdleConnections {
 
 /// Send `request` to `generation`'s process: on an idle connection to it if
 /// there is one, else on a new one. A reused connection the module closed in
-/// the meantime hands the request back unsent, and it goes once more on a new
-/// connection — so a module's keep-alive timeout is never a client's 502.
+/// the meantime, if hyper sees the close before it writes the request, hands
+/// the request back unsent, and it goes once more on a new connection — so a
+/// module's keep-alive timeout seen in time is not a client's 502. One that
+/// lands after the request was written cannot be told from a module that
+/// failed while handling it, and is answered 502: the request may have been
+/// acted on, so it is not sent again (FU-64).
 /// Returns the response head and the connection that carries its body.
 async fn exchange(
     idle: &IdleConnections,
@@ -2627,44 +2631,60 @@ mod tests {
         (addr, peers)
     }
 
-    /// FU-63: a module whose keep-alive ends after every response — it closes
-    /// without saying `Connection: close` — costs the client no 502 once the
-    /// proxy has seen the close: `IdleConnections::take` passes over a
-    /// connection seen closed, and one handed over closed before its request
-    /// was sent is taken back and sent again on a new connection. Either
-    /// suffices here; with both gone, requests are answered 502. The pause
-    /// between requests lets the close be seen first: a request that reaches
-    /// the connection in the same instant the module closes it can still be
-    /// answered 502 — once hyper has taken the request, it cannot be sent
-    /// again safely unless it is known to be idempotent (FU-64).
+    /// FU-63: a module whose keep-alive ends between requests — it closes
+    /// an idle connection without having said `Connection: close` — costs
+    /// the client no 502 once the close is visible: `IdleConnections::take`
+    /// passes over a connection seen closed, and one handed over closed
+    /// before its request was written is taken back and sent again on a new
+    /// connection. Either suffices; with both gone, the requests after the
+    /// first are answered 502. The module answers, keeps the connection open
+    /// while the proxy puts it back in its pool, then closes it and says so;
+    /// only then does the next request go — on loopback the FIN is readable
+    /// by then. A close landing in the same instant a request is written can
+    /// still be answered 502: once written, a request may have been acted
+    /// on, so it is not sent again (FU-64).
     #[tokio::test]
-    async fn a_module_closing_after_every_response_costs_no_502() {
+    async fn a_module_closing_an_idle_connection_costs_no_502() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            while let Ok((mut socket, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut head = Vec::new();
-                    let mut buf = [0u8; 4096];
-                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match socket.read(&mut buf).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => head.extend_from_slice(&buf[..n]),
+        let close = Arc::new(tokio::sync::Notify::new());
+        let (closed_tx, mut closed) = tokio::sync::mpsc::unbounded_channel::<()>();
+        {
+            let close = close.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let (close, closed_tx) = (close.clone(), closed_tx.clone());
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&buf[..n]),
+                            }
                         }
-                    }
-                    let _ = socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                        .await;
-                    // Closed with no `Connection: close`: the proxy keeps it.
-                });
-            }
-        });
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await;
+                        close.notified().await;
+                        drop(socket);
+                        let _ = closed_tx.send(());
+                    });
+                }
+            });
+        }
         let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
         for i in 0..20 {
             let got = call(proxy, Method::GET, &format!("{NS}/{i}"), &[], "").await;
             assert_eq!(got.status, StatusCode::OK, "request {i}: {}", got.body);
+            // Long enough for the proxy to have put the connection back.
             tokio::time::sleep(Duration::from_millis(50)).await;
+            close.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), closed.recv())
+                .await
+                .expect("the module never closed the connection")
+                .unwrap();
         }
     }
 
