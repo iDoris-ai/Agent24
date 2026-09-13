@@ -326,35 +326,61 @@ def descendants(root):
     return found
 
 
+def _ps(*args):
+    """ps 的输出(按行),读不到就是空 —— 清扫是尽力而为,它的失败不许盖掉测试读数。"""
+    try:
+        r = subprocess.run(["ps", *args], capture_output=True, text=True, errors="replace")
+    except OSError:
+        return []
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+def _marked(command, marks):
+    """命令行里有一段路径以这次运行的目录开头(整段:目录名后面是 / 或结尾),不是任意子串。"""
+    return any((m + "/") in command or command.endswith(m) for m in marks)
+
+
 def sweep(run_tmp):
-    """杀掉命令行里带着 run_tmp 的进程,返回它们的 (pid, 命令行)。
+    """杀掉命令行里带着 run_tmp 的、本用户的进程,返回 (已杀, 没杀掉)。
 
     按 ppid 找后代(上面)看不见一种进程:测试二进制先退出了,它没停掉的模块被 init
     收养(ppid=1),又在自己的进程组里 —— 杀组、杀后代都够不着。2026-09-13 就这样
     攒下 31 个忽略 SIGTERM 的忙循环,空转一两天(HYG-2)。每次运行一个专属的 TMPDIR,
-    测试夹具都建在它下面,命令行里带着它 —— 按它找,不会误伤别的运行。"""
+    测试夹具都建在它下面,命令行里带着它 —— 按它找,不会误伤别的运行。
+
+    **它是纵深防御,不是主防线。**一个孤儿若 exec 成命令行里不带这个目录的程序,这里就认不
+    出它(FU-65:按进程容器/进程组持续记录才能根治)。主防线是夹具自带寿命上限(HYG-1)。
+    杀之前逐个按 pid 重新核对属主与命令行,把「ps 之后 pid 被复用」的窗口缩到两个系统调用之间。"""
     marks = {run_tmp, os.path.realpath(run_tmp)}
-    killed = []
+    uid = str(os.getuid())
+    killed, stuck = {}, {}
     for _ in range(5):  # 杀的同时可能又 fork 出新的:扫到没有为止,有上限
-        try:
-            out = subprocess.run(["ps", "-A", "-o", "pid=,command="], capture_output=True, text=True).stdout
-        except OSError:
-            return killed
         found = []
-        for line in out.splitlines():
-            pid, _, command = line.strip().partition(" ")
-            if pid.isdigit() and int(pid) != os.getpid() and any(m in command for m in marks):
-                found.append((int(pid), command.strip()))
+        for line in _ps("-A", "-o", "pid=,uid=,command="):
+            parts = line.split(None, 2)
+            if len(parts) < 3 or not parts[0].isdigit() or parts[1] != uid:
+                continue
+            pid = int(parts[0])
+            if pid != os.getpid() and pid not in killed and _marked(parts[2], marks):
+                found.append(pid)
         if not found:
             break
-        for pid, command in found:
+        for pid in found:
+            now = _ps("-o", "uid=,command=", "-p", str(pid))
+            if not now:
+                continue  # 已经没了
+            again = now[0].split(None, 1)
+            if len(again) < 2 or again[0] != uid or not _marked(again[1], marks):
+                continue  # 这个 pid 已经不是它了
             try:
                 os.kill(pid, signal.SIGKILL)
-                killed.append((pid, command))
+                killed[pid] = again[1].strip()
             except ProcessLookupError:
                 pass
+            except OSError as e:
+                stuck[pid] = f"{again[1].strip()} ({e})"
         time.sleep(0.05)
-    return killed
+    return list(killed.items()), list(stuck.items())
 
 
 def supervise(cmd, cwd, timeout):
@@ -364,13 +390,21 @@ def supervise(cmd, cwd, timeout):
     try:
         return _supervise(cmd, cwd, timeout, run_tmp)
     finally:
-        leaked = sweep(run_tmp)
-        if leaked:
-            say(f"⚠️  漏收进程:这次运行结束后还有 {len(leaked)} 个进程在它的临时目录下运行,已 SIGKILL —— "
-                f"有测试没收掉它起的进程(测试夹具该有寿命上限或守卫):")
-            for pid, command in leaked[:10]:
-                say(f"      {pid} {command[:160]}")
-        shutil.rmtree(run_tmp, ignore_errors=True)
+        try:
+            leaked, stuck = sweep(run_tmp)
+            if leaked:
+                say(f"⚠️  漏收进程:这次运行结束后还有 {len(leaked)} 个进程在它的临时目录下运行,已 SIGKILL —— "
+                    f"有测试没收掉它起的进程(测试夹具该有寿命上限或守卫):")
+                for pid, command in leaked[:10]:
+                    say(f"      {pid} {command[:160]}")
+            if stuck:
+                say(f"⚠️  另有 {len(stuck)} 个进程杀不掉,请手动处理:")
+                for pid, what in stuck[:10]:
+                    say(f"      {pid} {what[:200]}")
+        except Exception as e:  # 清扫出错只报告,不许盖掉这次运行的读数
+            say(f"⚠️  清扫残留进程时出错({e!r});这次运行的读数不受影响")
+        finally:
+            shutil.rmtree(run_tmp, ignore_errors=True)
 
 
 def _supervise(cmd, cwd, timeout, run_tmp):
