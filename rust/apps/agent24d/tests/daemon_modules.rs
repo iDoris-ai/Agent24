@@ -246,6 +246,10 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
         took < Duration::from_millis(2500),
         "the daemon took {took:?} to exit"
     );
+    assert!(
+        !home.path().join(".agent24/daemon.json").exists(),
+        "the discovery state file outlived the daemon"
+    );
     let gone_by = Instant::now() + Duration::from_secs(2);
     while alive(pid) {
         assert!(Instant::now() < gone_by, "the module outlived the daemon");

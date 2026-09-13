@@ -353,7 +353,7 @@ pub struct AppDeps {
     pub router: Arc<ModelRouter>,
     pub tools: agent24_tools::ToolRegistry,
     pub store: Store,
-    pub shutdown: CancellationToken,
+    pub shutdown: Shutdown,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
     pub mcp_servers: Vec<Arc<agent24_mcp::McpServer>>,
@@ -373,7 +373,7 @@ impl AppState {
             router,
             tools,
             store,
-            shutdown: shutdown_token,
+            shutdown,
             guardian,
             memory,
             mcp_servers,
@@ -407,7 +407,7 @@ impl AppState {
             Arc::clone(&router),
             Arc::clone(&tools),
             StdArc::new(events.clone()),
-            shutdown_token.clone(),
+            shutdown.token().clone(),
             memory,
         );
         let sched_hub = events.clone();
@@ -438,7 +438,7 @@ impl AppState {
             module_status: Arc::new(std::collections::HashMap::new()),
             runs,
             scheduler,
-            shutdown: Shutdown::new(shutdown_token),
+            shutdown,
         }
     }
 }
@@ -628,6 +628,60 @@ pub async fn serve(
     ephemeral: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    // The shutdown controller, and the signals that request it, before
+    // anything else: a SIGTERM during startup — which can take seconds (the
+    // store, MCP servers, model probing) — runs this bounded shutdown rather
+    // than the default action, which ends the daemon as signal-killed, a crash
+    // to a supervisor such as launchd (review of SUP-4, round 6).
+    let shutdown = Shutdown::new(cancel.clone());
+    // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
+    // Registered HERE — before any module process can be started — and
+    // synchronously: a SIGTERM arriving while packages start must run this
+    // shutdown, which stops them, not the default action, which ends the daemon
+    // and leaves them running (review of SUP-4, round 1).
+    // A registration that fails is fatal HERE, before any module runs: a
+    // daemon that cannot hear SIGTERM cannot stop its modules when asked to
+    // (review of SUP-4, round 2).
+    #[cfg(unix)]
+    let (mut sigterm, mut sigint) = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
+    // The one shutdown deadline. A signal fixes it BEFORE it cancels, so it is
+    // the moment of the signal; any other way shutdown starts (an HTTP
+    // shutdown, the server ending) fixes it at the first look after the cancel
+    // — a scheduling delay later, which the watchdog below bounds (review of
+    // SUP-4, round 3).
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = sigterm.recv() => {},
+            _ = sigint.recv() => {},
+        }
+        #[cfg(not(unix))]
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!("SIGINT handler failed: {err}");
+            std::future::pending::<()>().await;
+        }
+        // The request first; the log line last — a stalled stderr must not be
+        // what keeps the shutdown from starting.
+        signal_shutdown.request();
+        tracing::info!("shutdown signal received");
+    });
+    // For a token cancelled other than through `Shutdown::request` (a child
+    // token's owner, say): the watchdog is armed at the first look after it.
+    {
+        let observed = shutdown.clone();
+        tokio::spawn(async move {
+            observed.token().cancelled().await;
+            observed.request();
+        });
+    }
+
     // Non-ephemeral daemons are singletons: hold an exclusive lifetime lock so
     // a concurrently-started second daemon fails fast instead of leaking as an
     // untracked process (review B6). Ephemeral instances skip both the lock
@@ -735,7 +789,7 @@ pub async fn serve(
         tools,
         store,
         risk_overrides,
-        shutdown: cancel.clone(),
+        shutdown: shutdown.clone(),
         guardian,
         memory,
         mcp_servers,
@@ -894,55 +948,6 @@ pub async fn serve(
     // under its throwaway root. Directories left by daemons that are gone are
     // cleared first (FU-56). A daemon that cannot set this up still runs; its
     // packages degrade, with the reason.
-    // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
-    // Registered HERE — before any module process can be started — and
-    // synchronously: a SIGTERM arriving while packages start must run this
-    // shutdown, which stops them, not the default action, which ends the daemon
-    // and leaves them running (review of SUP-4, round 1).
-    // A registration that fails is fatal HERE, before any module runs: a
-    // daemon that cannot hear SIGTERM cannot stop its modules when asked to
-    // (review of SUP-4, round 2).
-    #[cfg(unix)]
-    let (mut sigterm, mut sigint) = {
-        use tokio::signal::unix::{SignalKind, signal};
-        (
-            signal(SignalKind::terminate())?,
-            signal(SignalKind::interrupt())?,
-        )
-    };
-    // The one shutdown deadline. A signal fixes it BEFORE it cancels, so it is
-    // the moment of the signal; any other way shutdown starts (an HTTP
-    // shutdown, the server ending) fixes it at the first look after the cancel
-    // — a scheduling delay later, which the watchdog below bounds (review of
-    // SUP-4, round 3).
-    let shutdown = state.shutdown.clone();
-    let signal_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        tokio::select! {
-            _ = sigterm.recv() => {},
-            _ = sigint.recv() => {},
-        }
-        #[cfg(not(unix))]
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!("SIGINT handler failed: {err}");
-            std::future::pending::<()>().await;
-        }
-        // The request first; the log line last — a stalled stderr must not be
-        // what keeps the shutdown from starting.
-        signal_shutdown.request();
-        tracing::info!("shutdown signal received");
-    });
-    // For a token cancelled other than through `Shutdown::request` (a child
-    // token's owner, say): the watchdog is armed at the first look after it.
-    {
-        let observed = shutdown.clone();
-        tokio::spawn(async move {
-            observed.token().cancelled().await;
-            observed.request();
-        });
-    }
-
     // 127.0.0.1 only — never a public bind (SPEC-001 §9). Bound BEFORE any
     // module is started: a port that is taken fails startup here, rather than
     // after packages are running, on a path that would leave them to the
@@ -974,9 +979,13 @@ pub async fn serve(
         // can start in the meantime.)
         if !ephemeral {
             let pid = std::process::id();
-            tokio::task::spawn_blocking(move || {
-                agent24_protocol::state_file::remove_if_owner(pid);
-            });
+            // A thread of its own rather than the blocking pool, which a
+            // package-tree scan can have busy. Best effort all the same: on a
+            // stalled filesystem nothing can promise it before the watchdog,
+            // and a reader of a stale file still checks that its pid is alive.
+            let _ = std::thread::Builder::new()
+                .name("state-file-cleanup".to_owned())
+                .spawn(move || agent24_protocol::state_file::remove_if_owner(pid));
         }
         let supervisors = registry.map(|r| r.close()).unwrap_or_default();
         if tokio::time::timeout_at(deadline, stop_supervisors(supervisors))
@@ -1485,7 +1494,7 @@ pub(crate) mod tests {
             router: Arc::new(ModelRouter::with_defaults(vec![])),
             tools: agent24_tools::ToolRegistry::new(),
             store: Store::open_memory().await.unwrap(),
-            shutdown: CancellationToken::new(),
+            shutdown: Shutdown::new(CancellationToken::new()),
             guardian,
             memory: None,
             mcp_servers: Vec::new(),
