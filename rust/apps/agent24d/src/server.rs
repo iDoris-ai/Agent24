@@ -78,9 +78,10 @@ pub struct AppState {
     /// the daemon runs (SUP-5). `None` when out-of-process modules cannot be
     /// started at all.
     pub supervisors: Option<Arc<crate::domain::Supervisors>>,
-    /// The modules stopped by `os disable` since this daemon started: what
-    /// `agent24 os list` reports as `disabled` although they mounted.
-    pub hot_disabled: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Held across one `PATCH /api/v1/os/{name}` — the config write, a hot
+    /// disable, and the list it answers with — so concurrent toggles answer
+    /// in one order they were applied in (SUP-5).
+    pub os_control: Arc<tokio::sync::Mutex<()>>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -171,6 +172,19 @@ impl Shutdown {
     #[must_use]
     pub fn child_token(&self) -> CancellationToken {
         self.token.child_token()
+    }
+
+    /// Resolves when a module still being stopped by `os disable` must be
+    /// killed: the budget any module gets once the shutdown begins — its
+    /// drain and its stop grace — so a disable's longer drain neither holds
+    /// the shutdown past its bound nor gets less than a module the shutdown
+    /// stops itself (SUP-5).
+    pub fn modules_cut_off(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let token = self.token.clone();
+        async move {
+            token.cancelled().await;
+            tokio::time::sleep(MODULE_DRAIN + MODULE_STOP_GRACE).await;
+        }
     }
 }
 
@@ -473,7 +487,7 @@ impl AppState {
             os_reports: Arc::new(Vec::new()),
             module_status: Arc::new(std::collections::HashMap::new()),
             supervisors: None,
-            hot_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            os_control: Arc::new(tokio::sync::Mutex::new(())),
             runs,
             scheduler,
             shutdown,
@@ -1288,9 +1302,9 @@ fn arm_watchdog(deadline: tokio::time::Instant, armed: &std::sync::atomic::Atomi
 /// Draining first is what keeps a shutdown from answering a request a module
 /// is in the middle of `request_abandoned` — and a client that then retries a
 /// write the module did complete (review of SUP-4, round 1).
-async fn stop_supervisors(supervisors: Vec<crate::domain::Supervised>) {
+async fn stop_supervisors(closed: crate::domain::Closed) {
     let mut stops = tokio::task::JoinSet::new();
-    for s in supervisors {
+    for s in closed.running {
         stops.spawn(async move { (s.name, s.handle.drain_and_stop(MODULE_DRAIN).await) });
     }
     while let Some(done) = stops.join_next().await {
@@ -1299,6 +1313,11 @@ async fn stop_supervisors(supervisors: Vec<crate::domain::Supervised>) {
             Ok((name, Err(e))) => tracing::error!("domain OS {name:?} did not stop cleanly: {e}"),
             Err(e) => tracing::error!("stopping a domain OS failed: {e}"),
         }
+    }
+    // Stops `os disable` began: each ends by `Shutdown::modules_cut_off` at
+    // the latest, its module killed by the time it does (SUP-5).
+    for stop in closed.disabling {
+        let _ = stop.await;
     }
 }
 
@@ -1492,6 +1511,28 @@ pub(crate) mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// The shutdown waits for the stops `os disable` began, not only for the
+    /// modules it stops itself (SUP-5): those end when the shutdown's module
+    /// budget cuts them short, and a daemon that exited first would leave the
+    /// kill unsent.
+    #[tokio::test]
+    async fn the_shutdown_waits_for_the_stops_disables_began() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = {
+            let done = done.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        stop_supervisors(crate::domain::Closed {
+            running: Vec::new(),
+            disabling: vec![stop],
+        })
+        .await;
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     /// No provider answered — the honest default for a test daemon with no
     /// providers configured. Modules under test declare no models, so the check

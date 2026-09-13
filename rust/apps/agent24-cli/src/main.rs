@@ -88,7 +88,7 @@ enum OsAction {
         /// Module name, e.g. sin90
         name: String,
     },
-    /// Turn one off (an out-of-process module is stopped now; a compiled-in one at the next daemon start)
+    /// Turn one off (a running out-of-process module stops taking requests now and is stopped once they finish; a compiled-in one at the next daemon start)
     Disable { name: String },
     /// Install a domain-OS package directory (takes effect at the next daemon start)
     ///

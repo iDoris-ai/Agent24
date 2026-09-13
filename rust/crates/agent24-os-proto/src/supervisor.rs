@@ -160,8 +160,8 @@ impl SupervisorHandle {
     /// over it; [`SupervisorError::Panicked`] when the loop itself panicked;
     /// [`SupervisorError::Killed`] when the loop had been cancelled without a
     /// stop (its runtime shut down).
-    pub async fn stop(self) -> Result<(), SupervisorError> {
-        self.drain_and_stop(Duration::ZERO).await
+    pub fn stop(self) -> impl std::future::Future<Output = Result<(), SupervisorError>> {
+        self.drain_and_stop(Duration::ZERO)
     }
 
     /// [`SupervisorHandle::stop`], after DRAINING (SPEC §4): a run that is
@@ -173,35 +173,83 @@ impl SupervisorHandle {
     /// not restarted into a generation nobody drained (review of SUP-4,
     /// round 2).
     ///
+    /// The stop is asked for when this is CALLED, not when the future is first
+    /// polled: from then on no run becomes Running, and one that is serving
+    /// begins DRAINING as soon as its loop is scheduled — whether or not the
+    /// caller has spawned the wait yet (SUP-5).
+    ///
     /// # Errors
     ///
     /// As [`SupervisorHandle::stop`].
-    pub async fn drain_and_stop(mut self, drain: Duration) -> Result<(), SupervisorError> {
+    pub fn drain_and_stop(
+        self,
+        drain: Duration,
+    ) -> impl std::future::Future<Output = Result<(), SupervisorError>> {
+        self.drain_and_stop_unless(drain, std::future::pending())
+    }
+
+    /// [`SupervisorHandle::drain_and_stop`], unless `abandon` resolves first:
+    /// then the loop is aborted AND waited for until it is gone — its module
+    /// process dropped, which revokes the generation and SIGKILLs the group —
+    /// before this returns [`SupervisorError::Killed`]. For an owner whose own
+    /// deadline must find the kill sent, not merely scheduled: dropping a stop
+    /// future only aborts the loop, which is then dropped whenever the
+    /// runtime next gets to it (SUP-5, the shutdown cutting short a hot
+    /// disable's drain).
+    ///
+    /// # Errors
+    ///
+    /// As [`SupervisorHandle::stop`]; [`SupervisorError::Killed`] when
+    /// abandoned.
+    pub fn drain_and_stop_unless(
+        mut self,
+        drain: Duration,
+        abandon: impl std::future::Future<Output = ()>,
+    ) -> impl std::future::Future<Output = Result<(), SupervisorError>> {
         let _ = self.stop.send(Some(drain));
-        // Awaited in place, not taken out: a `stop` future dropped half-way —
-        // a caller's deadline — drops `self` with the task still in it, and
-        // `Drop` aborts it, which SIGKILLs the module now. Taking it out left
-        // `Drop` nothing to abort, and the loop finished its graceful stop,
-        // detached, past the caller's deadline (review of SUP-4, round 1).
-        let joined = match self.task.as_mut() {
-            Some(task) => Some(task.await),
-            None => None,
-        };
-        self.task = None;
-        if let Some(Err(e)) = joined
-            && e.is_panic()
-        {
-            tracing::error!("the supervisor loop had panicked: {e}");
-            return Err(SupervisorError::Panicked);
-        }
-        // Only `Stopped` is a clean stop. Anything else at this point — the
-        // task cancelled by its runtime's shutdown (`Killed`), say — is not,
-        // whatever the `JoinError` said (round 9).
-        match self.status.borrow().clone() {
-            Status::Stopped => Ok(()),
-            Status::StopFailed { error } => Err(SupervisorError::StopFailed { error }),
-            Status::Panicked => Err(SupervisorError::Panicked),
-            _ => Err(SupervisorError::Killed),
+        async move {
+            // Awaited in place, not taken out: a `stop` future dropped half-way
+            // — a caller's deadline — drops `self` with the task still in it,
+            // and `Drop` aborts it, which SIGKILLs the module now. Taking it
+            // out left `Drop` nothing to abort, and the loop finished its
+            // graceful stop, detached, past the caller's deadline (review of
+            // SUP-4, round 1).
+            let joined = match self.task.as_mut() {
+                Some(task) => Some(tokio::select! {
+                    biased;
+                    joined = &mut *task => Some(joined),
+                    () = abandon => None,
+                }),
+                None => None,
+            };
+            let joined = match joined {
+                Some(Some(joined)) => Some(joined),
+                Some(None) => {
+                    if let Some(task) = self.task.take() {
+                        task.abort();
+                        // Resolves only once the task's future is dropped.
+                        let _ = task.await;
+                    }
+                    return Err(SupervisorError::Killed);
+                }
+                None => None,
+            };
+            self.task = None;
+            if let Some(Err(e)) = joined
+                && e.is_panic()
+            {
+                tracing::error!("the supervisor loop had panicked: {e}");
+                return Err(SupervisorError::Panicked);
+            }
+            // Only `Stopped` is a clean stop. Anything else at this point — the
+            // task cancelled by its runtime's shutdown (`Killed`), say — is
+            // not, whatever the `JoinError` said (round 9).
+            match self.status.borrow().clone() {
+                Status::Stopped => Ok(()),
+                Status::StopFailed { error } => Err(SupervisorError::StopFailed { error }),
+                Status::Panicked => Err(SupervisorError::Panicked),
+                _ => Err(SupervisorError::Killed),
+            }
         }
     }
 }
@@ -1369,6 +1417,92 @@ sys.exit(0)
             .unwrap();
         assert_eq!(stopped, Ok(()));
         assert!(gone(pid).await);
+    }
+
+    /// The stop is asked for at the call: a run serving drains although
+    /// nothing has polled the stop yet (SUP-5, which relies on it to refuse
+    /// new requests before the disable returns).
+    #[tokio::test]
+    async fn a_drain_is_asked_for_before_anything_awaits_it() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let generation = current.get();
+        let in_flight = generation.admit_request("r-1".into()).unwrap();
+        let stopping = handle.drain_and_stop(Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while generation.state() != crate::drain::DrainState::Draining {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not drained until the stop was awaited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(in_flight);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), stopping)
+                .await
+                .expect("the stop"),
+            Ok(())
+        );
+    }
+
+    /// A drain abandoned half-way returns only once the loop is gone — its
+    /// process dropped, the generation revoked, the kill sent — not with the
+    /// abort merely scheduled. On this single-threaded runtime nothing else
+    /// runs between the return and the check below, so an unjoined abort
+    /// would still find the generation draining (SUP-5).
+    #[tokio::test]
+    async fn an_abandoned_drain_has_killed_the_module_when_it_returns() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let (pid, _) = starts(f.data.path())[0].clone();
+        let generation = current.get();
+        let _in_flight = generation.admit_request("r-1".into()).unwrap();
+        let (abandon, abandoned) = tokio::sync::oneshot::channel::<()>();
+        let mut stopping = std::pin::pin!(handle.drain_and_stop_unless(
+            Duration::from_secs(60),
+            async {
+                let _ = abandoned.await;
+            }
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while generation.state() != crate::drain::DrainState::Draining {
+            assert!(std::time::Instant::now() < deadline, "never drained");
+            tokio::select! {
+                r = &mut stopping => panic!("stopped with a request in flight: {r:?}"),
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        abandon.send(()).unwrap();
+        assert_eq!(stopping.await, Err(SupervisorError::Killed));
+        assert_eq!(
+            generation.state(),
+            crate::drain::DrainState::Revoked,
+            "returned before the loop was dropped"
+        );
+        assert!(gone(pid).await, "the module outlived the abandoned stop");
     }
 
     /// A `stop` whose caller gives up — its future dropped at a deadline —

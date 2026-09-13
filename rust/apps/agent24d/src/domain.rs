@@ -524,17 +524,48 @@ pub struct ProcessHost {
 /// Starting a module happens under its lock, so "has the shutdown begun?" and
 /// "start and register it" are one step — no module starts after
 /// [`Supervisors::close`], and none started before it escapes the list it
-/// returns (review of SUP-4, round 3).
-pub struct Supervisors(std::sync::Mutex<Option<Vec<Supervised>>>);
+/// returns (review of SUP-4, round 3). A module stopped by `os disable` leaves
+/// the list under the same lock, its stop kept for the shutdown to wait for
+/// (SUP-5).
+#[derive(Default)]
+pub struct Supervisors(std::sync::Mutex<Registry>);
 
-impl Default for Supervisors {
+struct Registry {
+    /// `None` once the shutdown has closed the list.
+    running: Option<Vec<Supervised>>,
+    /// The stops `os disable` began and the shutdown has not taken yet.
+    disabling: Vec<tokio::task::JoinHandle<()>>,
+    /// Every module `os disable` has stopped since this daemon started.
+    disabled: std::collections::HashSet<String>,
+}
+
+impl Default for Registry {
     fn default() -> Self {
-        Self(std::sync::Mutex::new(Some(Vec::new())))
+        Self {
+            running: Some(Vec::new()),
+            disabling: Vec::new(),
+            disabled: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// What [`Supervisors::close`] hands the shutdown: every module still running,
+/// and every stop a disable began, for it to wait for.
+#[derive(Default)]
+pub struct Closed {
+    pub running: Vec<Supervised>,
+    pub disabling: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Closed {
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.running.is_empty() && self.disabling.is_empty()
     }
 }
 
 impl Supervisors {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<Supervised>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -543,7 +574,7 @@ impl Supervisors {
     /// Whether the shutdown has closed the list.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.lock().is_none()
+        self.lock().running.is_none()
     }
 
     /// Run `start` and keep what it starts — unless the list is closed, in
@@ -554,8 +585,8 @@ impl Supervisors {
         &self,
         start: impl FnOnce() -> std::result::Result<Supervised, E>,
     ) -> Option<std::result::Result<(), E>> {
-        let mut list = self.lock();
-        let list = list.as_mut()?;
+        let mut registry = self.lock();
+        let list = registry.running.as_mut()?;
         Some(start().map(|s| list.push(s)))
     }
 
@@ -569,27 +600,72 @@ impl Supervisors {
         tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
     > {
         self.lock()
+            .running
             .iter()
             .flatten()
             .map(|s| (s.name.clone(), s.handle.subscribe()))
             .collect()
     }
 
-    /// Take one module's supervisor out of the list — to stop it while the
-    /// daemon runs (SUP-5, hot disable). `None` if there is none by that name,
-    /// or the shutdown has closed the list (and so already owns it): under the
-    /// same lock as [`Supervisors::close`], so a module is stopped by the
-    /// shutdown or by the disable, never by both and never by neither.
-    pub fn take(&self, name: &str) -> Option<Supervised> {
-        let mut list = self.lock();
-        let list = list.as_mut()?;
+    /// Stop one module while the daemon runs (SUP-5, hot disable): take it
+    /// out of the list, ask its supervisor to drain for up to `drain` and
+    /// stop, and keep that stop for the shutdown — which kills it once
+    /// `cut_off` resolves, and waits for it. The stop is asked for before this
+    /// returns (see [`SupervisorHandle::drain_and_stop`]), all under the lock
+    /// [`Supervisors::close`] takes: a module is stopped by the shutdown or by
+    /// the disable, never by both, and never by neither.
+    ///
+    /// The module's proxy slot, to see its generation refuse new work; `None`
+    /// if nothing by that name is running (a compiled-in module, a package
+    /// not started at mount, one already disabled) or the shutdown has closed
+    /// the list, and so already owns it.
+    ///
+    /// [`SupervisorHandle::drain_and_stop`]: agent24_os_proto::supervisor::SupervisorHandle::drain_and_stop
+    pub fn disable(
+        &self,
+        name: &str,
+        drain: std::time::Duration,
+        cut_off: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Option<Arc<agent24_os_proto::drain::Current>> {
+        let mut registry = self.lock();
+        let list = registry.running.as_mut()?;
         let i = list.iter().position(|s| s.name == name)?;
-        Some(list.swap_remove(i))
+        let Supervised {
+            name,
+            handle,
+            current,
+        } = list.swap_remove(i);
+        registry.disabled.insert(name.clone());
+        let stop = handle.drain_and_stop_unless(drain, cut_off);
+        let task = tokio::spawn(async move {
+            match stop.await {
+                Ok(()) => tracing::info!("domain OS {name:?} disabled and stopped"),
+                Err(e) => {
+                    tracing::error!(
+                        "domain OS {name:?} was disabled but did not stop cleanly: {e}"
+                    );
+                }
+            }
+        });
+        registry.disabling.retain(|t| !t.is_finished());
+        registry.disabling.push(task);
+        Some(current)
     }
 
-    /// Close the list and take everything in it. Later starts are refused.
-    pub fn close(&self) -> Vec<Supervised> {
-        self.lock().take().unwrap_or_default()
+    /// Whether `os disable` has stopped `name` since this daemon started.
+    #[must_use]
+    pub fn is_disabled(&self, name: &str) -> bool {
+        self.lock().disabled.contains(name)
+    }
+
+    /// Close the list and take everything in it — and the stops disables
+    /// began. Later starts and disables are refused.
+    pub fn close(&self) -> Closed {
+        let mut registry = self.lock();
+        Closed {
+            running: registry.running.take().unwrap_or_default(),
+            disabling: std::mem::take(&mut registry.disabling),
+        }
     }
 }
 
@@ -599,6 +675,8 @@ impl Supervisors {
 pub struct Supervised {
     pub name: String,
     pub handle: agent24_os_proto::supervisor::SupervisorHandle,
+    /// Its proxy slot: which generation the proxy sends requests to.
+    pub current: Arc<agent24_os_proto::drain::Current>,
 }
 
 /// Mount everything in `catalogue` under `root`, returning the combined router
@@ -1089,6 +1167,7 @@ async fn mount_package(
         .map(|handle| Supervised {
             name: name.clone(),
             handle,
+            current: current.clone(),
         })
     });
     match started {
@@ -1513,7 +1592,10 @@ while f.readline():
             root.join("remote").is_dir(),
             "its data directory was not prepared"
         );
-        assert_eq!(host.supervisors.lock().as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            host.supervisors.lock().running.as_ref().map(Vec::len),
+            Some(1)
+        );
 
         // `module_not_ready` until the handshake, then the module's own answer.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1531,7 +1613,7 @@ while f.readline():
         };
         assert_eq!(body, "hello from remote");
 
-        for s in host.supervisors.close() {
+        for s in host.supervisors.close().running {
             s.handle.stop().await.expect("a clean stop");
         }
     }
@@ -1570,11 +1652,11 @@ while f.readline():
         );
     }
 
-    /// `take` hands one module's supervisor out of the list — and none once
-    /// the shutdown has closed it, since the shutdown owns them all then
-    /// (SUP-5).
+    /// `disable` takes one module out of the list and stops it — once — and
+    /// hands that stop to the shutdown rather than the module itself, so
+    /// the shutdown waits for it and does not stop it twice (SUP-5).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_supervisor_is_taken_by_the_disable_or_the_shutdown_never_both() {
+    async fn a_module_is_stopped_by_the_disable_or_the_shutdown_never_both() {
         let tmp = tempfile::Builder::new()
             .prefix("a24")
             .tempdir_in("/tmp")
@@ -1593,14 +1675,37 @@ while f.readline():
             Ok(&host),
         )
         .await;
-        assert!(host.supervisors.take("nope").is_none());
-        let taken = host.supervisors.take("remote").expect("the running module");
-        assert!(host.supervisors.take("remote").is_none(), "taken twice");
+        let drain = std::time::Duration::from_secs(10);
+        let never = std::future::pending::<()>;
+        assert!(host.supervisors.disable("nope", drain, never()).is_none());
+        assert!(!host.supervisors.is_disabled("remote"));
+        let current = host
+            .supervisors
+            .disable("remote", drain, never())
+            .expect("the running module");
+        assert!(host.supervisors.is_disabled("remote"));
         assert!(
-            host.supervisors.close().is_empty(),
-            "the shutdown got it too"
+            host.supervisors.disable("remote", drain, never()).is_none(),
+            "disabled twice"
         );
-        taken.handle.stop().await.expect("a clean stop");
+        let closed = host.supervisors.close();
+        assert!(closed.running.is_empty(), "the shutdown got it too");
+        assert_eq!(
+            closed.disabling.len(),
+            1,
+            "the disable's stop, not waited for"
+        );
+        for stop in closed.disabling {
+            stop.await.unwrap();
+        }
+        assert_eq!(
+            current.get().state(),
+            agent24_os_proto::drain::DrainState::Revoked
+        );
+        assert!(
+            host.supervisors.disable("remote", drain, never()).is_none(),
+            "a disable after the shutdown began"
+        );
     }
 
     /// A disabled package is never started — the same rule as a compiled-in

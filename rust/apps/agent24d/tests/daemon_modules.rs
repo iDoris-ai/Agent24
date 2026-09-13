@@ -355,16 +355,21 @@ fn a_disable_drains_and_stops_the_running_package() {
     );
     assert_eq!(m["restart_required"], false, "{m}");
 
+    // Once the disable has answered, a new request is refused — straight
+    // away, not once some later log line says so (review of SUP-5, round 1).
+    let refused = get(d.port, &d.token, "/api/v1/remote/hi").expect("the daemon answered");
+    assert_eq!(
+        refused.0, 503,
+        "a new request after the disable: {refused:?}"
+    );
+    assert!(refused.1.contains("module_draining"), "{refused:?}");
     // The request it holds is not abandoned: released only once the run is
-    // DRAINING, with a new request refused meanwhile.
+    // DRAINING.
     logged(
         &d,
         "draining before the stop",
         "the disable never began draining the module",
     );
-    let refused = get(d.port, &d.token, "/api/v1/remote/hi").expect("the daemon answered");
-    assert_eq!(refused.0, 503, "a new request while draining: {refused:?}");
-    assert!(refused.1.contains("module_draining"), "{refused:?}");
     std::fs::write(home.path().join(".agent24/os/remote/release"), b"").unwrap();
     assert_eq!(
         slow.join().unwrap(),
@@ -390,5 +395,66 @@ fn a_disable_drains_and_stops_the_running_package() {
     assert!(
         d.run.daemon.try_wait().unwrap().is_none(),
         "the daemon exited with the module"
+    );
+}
+
+/// A shutdown that begins while a disable is still draining its module cuts
+/// that stop short at the budget any module gets: the daemon still exits
+/// within its bound and the module is gone, although the disable's own drain
+/// would have held it far longer — and the stop is reported as cut short
+/// (SUP-5; that the shutdown also WAITS for it is pinned by
+/// `the_shutdown_waits_for_the_stops_disables_began`).
+#[test]
+fn a_sigterm_during_a_disables_drain_stops_the_module_in_bound() {
+    let home = tmp_home();
+    install(home.path());
+    let mut d = start(home.path());
+    let pid = serving(&mut d, home.path());
+    // Never released: the module holds it until its own 5s deadline.
+    let _slow = slow_in_flight(&d, home.path());
+    let (status, list) = call(
+        d.port,
+        &d.token,
+        "PATCH",
+        "/api/v1/os/remote",
+        r#"{"enabled":false}"#,
+    )
+    .expect("the daemon answered the disable");
+    assert_eq!(status, 200, "{list}");
+    logged(
+        &d,
+        "draining before the stop",
+        "the disable never began draining the module",
+    );
+
+    let t0 = Instant::now();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &d.run.daemon.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let exited = loop {
+        if let Some(status) = d.run.daemon.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the daemon did not exit within 10s of SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let took = t0.elapsed();
+    assert!(exited.success(), "{exited:?}");
+    assert!(
+        took < Duration::from_millis(2500),
+        "the daemon took {took:?} to exit"
+    );
+    gone_within(pid, 2, "the disabled module outlived the daemon");
+    logged(
+        &d,
+        "was disabled but did not stop cleanly",
+        "the shutdown did not wait for the disable's stop",
     );
 }

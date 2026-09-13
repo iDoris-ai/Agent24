@@ -29,8 +29,9 @@
 //! **Disabling a running out-of-process module stops it now; every other toggle
 //! takes effect when the daemon restarts** (SUP-5). A disable stops the module
 //! the SPEC §4 way — DRAINING, then REVOKING — in the background: the request
-//! returns once the config is written, and the list reports it `disabled`
-//! (with `stopping` while it drains). A compiled-in module, and ANY enable, still
+//! returns once the config is written AND the module refuses new requests,
+//! and the list reports it `disabled` (with `stopping` while it drains; a
+//! stop that fails is reported `degraded`, as what it is). A compiled-in module, and ANY enable, still
 //! waits for a restart: routes are built once at startup, and nothing starts a
 //! module at runtime. The list reports the config state AND the running state
 //! separately, and sets `restart_required` when the config differs from what is
@@ -59,6 +60,14 @@ fn view(
     hot_disabled: bool,
 ) -> DomainOsView {
     use agent24_os_proto::supervisor::Status;
+    // A disable whose stop failed is not applied: the module is reported as
+    // what it is — degraded, with the failure — and a restart is still what
+    // settles it (review of SUP-5, round 1).
+    let hot_disabled = hot_disabled
+        && !matches!(
+            live,
+            Some(Status::StopFailed { .. } | Status::Panicked | Status::Killed)
+        );
     let (state, detail) = match (&report.outcome, live) {
         // Stopped by `os disable` while the daemon runs: disabled, whatever the
         // mount said — still `stopping` while it drains (SUP-5).
@@ -214,10 +223,9 @@ fn render(state: &AppState) -> Response {
 
 fn hot_disabled(state: &AppState, name: &str) -> bool {
     state
-        .hot_disabled
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(name)
+        .supervisors
+        .as_ref()
+        .is_some_and(|s| s.is_disabled(name))
 }
 
 /// How long a disabled module gets to finish the requests it has (DRAINING)
@@ -226,34 +234,48 @@ fn hot_disabled(state: &AppState, name: &str) -> bool {
 /// itself first — a disable abandons nothing a request's own deadline would not.
 const DISABLE_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Stop a running out-of-process module now (SUP-5): take its supervisor out
-/// of the daemon's list — so the shutdown will not also stop it — and drain
-/// and stop it in the background. A shutdown that begins meanwhile wins: the
-/// stop is abandoned, which SIGKILLs the module, so the shutdown stays within
-/// its bound. `false` if there was nothing running to stop (a compiled-in
-/// module, one that never started, or a daemon already shutting down).
-fn stop_now(state: &AppState, name: &str) -> bool {
-    let Some(supervised) = state.supervisors.as_ref().and_then(|s| s.take(name)) else {
+/// How long a disable waits for the module's generation to stop admitting
+/// requests. Its supervisor does that as soon as it is scheduled; this only
+/// bounds a runtime too busy to schedule it.
+const ADMISSION_CLOSED_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Stop a running out-of-process module now (SUP-5): its supervisor drains
+/// and stops it in the background, and the shutdown — if it begins
+/// meanwhile — waits for that stop, cutting it short at its own module budget.
+/// Returns once the module's generation refuses new requests, so a request
+/// sent after the disable answers is not admitted. `false` if there was
+/// nothing running to stop (a compiled-in module, a package not started at
+/// mount, one already disabled, or a daemon already shutting down).
+async fn stop_now(state: &AppState, name: &str) -> bool {
+    let Some(current) = state
+        .supervisors
+        .as_ref()
+        .and_then(|s| s.disable(name, DISABLE_DRAIN, state.shutdown.modules_cut_off()))
+    else {
         return false;
     };
-    state
-        .hot_disabled
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(name.to_owned());
-    let shutdown = state.shutdown.token().clone();
-    let name = name.to_owned();
-    tokio::spawn(async move {
-        tokio::select! {
-            stopped = supervised.handle.drain_and_stop(DISABLE_DRAIN) => match stopped {
-                Ok(()) => tracing::info!("domain OS {name:?} disabled and stopped"),
-                Err(e) => tracing::error!("domain OS {name:?} was disabled but did not stop cleanly: {e}"),
-            },
-            () = shutdown.cancelled() => {
-                tracing::warn!("domain OS {name:?}: the daemon is shutting down; its stop was cut short");
-            }
+    if !admission_closed(&current, ADMISSION_CLOSED_WITHIN).await {
+        tracing::warn!(
+            "domain OS {name:?} was disabled, but its supervisor has not begun draining it \
+             within {ADMISSION_CLOSED_WITHIN:?}"
+        );
+    }
+    true
+}
+
+/// Wait, for up to `within`, until the generation `current` routes to no
+/// longer admits requests. `false` if it still did then.
+async fn admission_closed(
+    current: &agent24_os_proto::drain::Current,
+    within: std::time::Duration,
+) -> bool {
+    let by = tokio::time::Instant::now() + within;
+    while current.get().state() == agent24_os_proto::drain::DrainState::Running {
+        if tokio::time::Instant::now() >= by {
+            return false;
         }
-    });
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
     true
 }
 
@@ -291,6 +313,9 @@ pub async fn patch_os(
             );
         }
     };
+    // Held to the end: the write, the hot disable and the answer are one step
+    // against another toggle.
+    let _control = state.os_control.lock().await;
     let path = match crate::os_config::config_path() {
         Some(p) => p,
         None => {
@@ -306,7 +331,7 @@ pub async fn patch_os(
     }
     // A disable of a running out-of-process module applies now; anything else
     // at the next start.
-    let now = !update.enabled && stop_now(&state, &name);
+    let now = !update.enabled && stop_now(&state, &name).await;
     tracing::info!(
         "domain OS {name:?} set enabled={} in os.json ({})",
         update.enabled,
@@ -328,6 +353,37 @@ mod tests {
     use super::*;
     use crate::domain::{MountOutcome, MountReport, ResourceStatus};
 
+    /// A disable answers only once the module's generation refuses new work:
+    /// here its supervisor gets to it late, and the wait outlasts that. And
+    /// the wait is bounded, for a supervisor that never does (SUP-5).
+    #[tokio::test]
+    async fn a_disable_waits_until_the_generation_refuses_work() {
+        use agent24_os_proto::drain::{Current, DrainState, Generation};
+        let serving = || {
+            let g = Generation::serving_at("127.0.0.1:1".parse().unwrap());
+            assert!(g.ready());
+            g
+        };
+        let g = serving();
+        let current = Current::new(g.clone());
+        let late = {
+            let g = g.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(g.begin_drain(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(10)
+                ));
+            })
+        };
+        assert!(admission_closed(&current, std::time::Duration::from_secs(5)).await);
+        assert_eq!(g.state(), DrainState::Draining);
+        late.await.unwrap();
+
+        let stuck = Current::new(serving());
+        assert!(!admission_closed(&stuck, std::time::Duration::from_millis(50)).await);
+    }
+
     /// A module stopped by `os disable` is reported `disabled` — `stopping`
     /// while it drains — and needs no restart: the running state already
     /// matches the config (SUP-5). Control: without the hot disable, the same
@@ -347,6 +403,16 @@ mod tests {
         assert!(!v.restart_required);
         let v = view(&r, false, true, Some(&Status::Running), false);
         assert!(v.restart_required, "a pending disable not applied yet");
+        // A stop that failed is not a disable applied.
+        let failed = Status::StopFailed {
+            error: "still there".into(),
+        };
+        let v = view(&r, false, true, Some(&failed), true);
+        assert_eq!(
+            (v.state.as_str(), v.detail.as_deref()),
+            ("degraded", Some("still there"))
+        );
+        assert!(v.restart_required);
     }
 
     /// A package mounted at start is reported by its supervisor's status NOW:
