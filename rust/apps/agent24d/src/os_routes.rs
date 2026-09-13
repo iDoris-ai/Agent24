@@ -76,6 +76,10 @@ fn view(
         // mount said — still `stopping` while it drains (SUP-5).
         (MountOutcome::Mounted, Some(Status::Stopped)) if hot_disabled => ("disabled", None),
         (MountOutcome::Mounted, _) if hot_disabled => ("disabled", Some("stopping".to_owned())),
+        // Asked to stop and still admitting: what it is, and what is coming.
+        (MountOutcome::Mounted, Some(Status::Running)) if hot == Some(false) && !stop_failed => {
+            ("mounted", Some("stop requested".to_owned()))
+        }
         // A package started at mount: its supervisor says where it is NOW. A
         // mount verdict alone called a module that had since given up
         // "mounted" (review of SUP-4, round 1).
@@ -126,24 +130,28 @@ fn view(
     // A REFUSED module is excluded whatever the config says: its manifest is
     // inadmissible for this binary, so a restart cannot deliver it, and asking for
     // one would send the user to do something that changes nothing.
-    // A hot disable has already applied "off": for the comparison below, what
-    // is running is what a start with it disabled would have given.
-    let running_enabled = if hot_disabled {
+    // A hot disable has already applied "off" — or has asked for it, which
+    // cannot be taken back: for the comparison below, what is running is what
+    // a start with it disabled would have given. So an enable that lands
+    // before the stop takes hold still needs a restart (review of SUP-5,
+    // round 6).
+    let running_enabled = if hot.is_some() {
         Some(false)
     } else {
         report.enabled_at_start
     };
     let restart_required = match running_enabled {
         _ if matches!(report.outcome, MountOutcome::Refused(_)) => false,
+        // A disable left it with no supervisor that can bring it back: a
+        // later enable changes the config, not that — nor does fixing the
+        // registry (review of SUP-5, rounds 5 and 6).
+        _ if stop_failed => true,
         // A registry that is STILL unusable cannot be applied by restarting — the
         // fix is the file. Saying otherwise sent the user to restart into exactly
         // the same degradation. (The syntactically-invalid case never reaches here;
         // it fails the load. This is the semantic one: a file that parses but
         // disables something the build does not provide.)
         _ if !registry_usable => false,
-        // A disable left it with no supervisor that can bring it back: a
-        // later enable changes the config, not that.
-        _ if stop_failed => true,
         // It WAS unusable at startup and is usable now, so the current config has
         // never been applied.
         None => true,
@@ -319,6 +327,20 @@ async fn settle(
     }
 }
 
+/// The answer's last look: a stop that has failed since `settle` looked is
+/// `Failed` after all. This moment — just before the response is chosen — is
+/// the one the answer describes (review of SUP-5, round 6).
+fn last_look(hot: HotStop, slot: Option<&crate::domain::Disabled>) -> HotStop {
+    use agent24_os_proto::supervisor::Status;
+    let failed = slot.is_some_and(|d| {
+        matches!(
+            *d.status.borrow(),
+            Status::StopFailed { .. } | Status::Panicked | Status::Killed
+        )
+    });
+    if failed { HotStop::Failed } else { hot }
+}
+
 /// A handed-off stop, by whether its module refuses requests, whether THIS
 /// disable asked for it, and its supervisor's status. A failed stop revokes
 /// admission too, so the failure is looked at first.
@@ -486,7 +508,8 @@ pub async fn patch_os(
     };
     // A disable of a running out-of-process module applies now; anything else
     // at the next start.
-    let hot = settle(handed, ADMISSION_CLOSED_WITHIN).await;
+    let slot = handed.as_ref().map(|(_, d)| d.clone());
+    let hot = last_look(settle(handed, ADMISSION_CLOSED_WITHIN).await, slot.as_ref());
     let effect = match hot {
         HotStop::Stopping => "stopping it now",
         HotStop::Pending => "its supervisor was asked to stop it; not yet refusing requests",
@@ -637,6 +660,24 @@ mod tests {
         assert_eq!(classify(true, false, &Status::Stopped), HotStop::Already);
     }
 
+    /// A stop that failed after `settle` looked is still reported failed
+    /// (review of SUP-5, round 6).
+    #[test]
+    fn the_last_look_catches_a_failure_since_settle() {
+        use agent24_os_proto::supervisor::Status;
+        let (tx, status) = tokio::sync::watch::channel(Status::Stopping);
+        let slot = crate::domain::Disabled {
+            current: agent24_os_proto::drain::Current::new(
+                agent24_os_proto::drain::Generation::starting(),
+            ),
+            status,
+        };
+        assert_eq!(last_look(HotStop::Stopping, Some(&slot)), HotStop::Stopping);
+        tx.send_replace(Status::StopFailed { error: "x".into() });
+        assert_eq!(last_look(HotStop::Stopping, Some(&slot)), HotStop::Failed);
+        assert_eq!(last_look(HotStop::NotRunning, None), HotStop::NotRunning);
+    }
+
     /// A disable answers only once the module's generation refuses new work:
     /// here its supervisor gets to it late, and the wait outlasts that. And
     /// the wait is bounded, for a supervisor that never does (SUP-5).
@@ -700,10 +741,20 @@ mod tests {
         // ... and still after the config is switched back on: nothing but a
         // restart brings it back (review of SUP-5, round 5).
         assert!(view(&r, true, true, Some(&failed), Some(true)).restart_required);
-        // A disable asked for, not yet applied: what it still is.
+        // A disable asked for, not yet applied: what it still is, and what
+        // is coming — no restart needed for the disable, but one for an
+        // enable landing before the stop takes hold, which cannot be taken
+        // back (review of SUP-5, round 6).
         let v = view(&r, false, true, Some(&Status::Running), Some(false));
-        assert_eq!(v.state, "mounted");
-        assert!(v.restart_required);
+        assert_eq!(
+            (v.state.as_str(), v.detail.as_deref()),
+            ("mounted", Some("stop requested"))
+        );
+        assert!(!v.restart_required);
+        assert!(view(&r, true, true, Some(&Status::Running), Some(false)).restart_required);
+        assert!(view(&r, true, true, Some(&Status::Stopped), Some(true)).restart_required);
+        // A failed stop needs a restart even with the registry unusable.
+        assert!(view(&r, false, false, Some(&failed), Some(true)).restart_required);
     }
 
     /// A package mounted at start is reported by its supervisor's status NOW:
