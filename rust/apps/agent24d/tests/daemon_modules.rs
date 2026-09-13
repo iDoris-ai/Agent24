@@ -240,10 +240,10 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
     };
     let took = t0.elapsed();
     assert!(exited.success(), "{exited:?}");
-    // TASKS B2: ~2s — SHUTDOWN_GRACE plus the runtime's bounded teardown,
-    // with slack for a loaded machine.
+    // TASKS B2: within 2s — the watchdog guarantees it — with slack for a
+    // loaded machine's scheduling.
     assert!(
-        took < Duration::from_secs(3),
+        took < Duration::from_millis(2500),
         "the daemon took {took:?} to exit"
     );
     let gone_by = Instant::now() + Duration::from_secs(2);

@@ -17,11 +17,12 @@ use rand::RngCore;
 use std::sync::Arc as StdArc;
 use tokio_util::sync::CancellationToken;
 
-/// Grace period for in-flight requests after a shutdown signal; the process
-/// force-exits after this so `kill -TERM` always terminates within ~2s
-/// (TASKS B2 acceptance). Out-of-process modules are stopped in the same
-/// window, alongside the HTTP drain — not after it (SUP-4).
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How long a shutdown's work gets — the HTTP drain, and out-of-process
+/// modules drained and stopped alongside it (SUP-4) — before the server is
+/// abandoned. With [`WATCHDOG_MARGIN`] for the runtime's teardown, `kill -TERM`
+/// ends the process within 2s (TASKS B2 acceptance): the watchdog guarantees
+/// it.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
 
 /// SIGTERM to SIGKILL for an out-of-process module this daemon stops. ⚖️
 /// Much shorter than the library's default so that draining, stopping and
@@ -29,7 +30,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const MODULE_STOP_GRACE: Duration = Duration::from_millis(500);
 
 /// How far past the shutdown deadline the process may run before the watchdog
-/// ends it: the runtime's own bounded teardown (`main`'s `shutdown_timeout`).
+/// ends it: time for the runtime's own bounded teardown (`main`'s
+/// `shutdown_timeout`, shorter than this). [`SHUTDOWN_GRACE`] plus this is the
+/// 2s of TASKS B2.
 const WATCHDOG_MARGIN: Duration = Duration::from_millis(500);
 
 /// How long a shutdown lets out-of-process modules finish the requests they
@@ -37,7 +40,7 @@ const WATCHDOG_MARGIN: Duration = Duration::from_millis(500);
 /// [`MODULE_STOP_GRACE`] share [`SHUTDOWN_GRACE`]: drain first, so a request a
 /// module is working on is answered rather than abandoned; then a short grace,
 /// since a drained module has nothing in flight.
-const MODULE_DRAIN: Duration = Duration::from_secs(1);
+const MODULE_DRAIN: Duration = Duration::from_millis(800);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -78,9 +81,61 @@ pub struct AppState {
     /// it contributed. Never read on purpose — its job is to exist (M-E/E1b).
     #[allow(dead_code, reason = "RAII: keeps MCP child processes alive")]
     pub mcp_servers: Arc<Vec<Arc<agent24_mcp::McpServer>>>,
-    /// Daemon-wide shutdown token; handlers derive request tokens from it so
-    /// shutdown cancels in-flight provider calls (run-level cancel joins in C2)
-    pub shutdown: CancellationToken,
+    /// Daemon-wide shutdown: handlers derive request tokens from it so
+    /// shutdown cancels in-flight provider calls (run-level cancel joins in C2),
+    /// and `POST /api/v1/shutdown` requests it.
+    pub shutdown: Shutdown,
+}
+
+/// A shutdown request, from anything that can make one — a signal, `POST
+/// /api/v1/shutdown`, the server ending. [`Shutdown::request`] is synchronous
+/// and does no I/O: it fixes the deadline, arms the watchdog, and cancels, in
+/// that order — so nothing stuck, a stalled stderr say, keeps a shutdown from
+/// starting or from being bounded (review of SUP-4, rounds 4 and 5). Clones
+/// share one deadline and one watchdog.
+#[derive(Clone)]
+pub struct Shutdown {
+    token: CancellationToken,
+    at: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Shutdown {
+    #[must_use]
+    pub fn new(token: CancellationToken) -> Self {
+        Self {
+            token,
+            at: Arc::new(std::sync::OnceLock::new()),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Begin the shutdown (idempotent).
+    pub fn request(&self) {
+        arm_watchdog(self.deadline(), &self.armed);
+        self.token.cancel();
+    }
+
+    /// When the shutdown's work must be done: fixed by the first
+    /// [`Shutdown::request`], or — for a token cancelled some other way — by
+    /// the first look after it.
+    #[must_use]
+    pub fn deadline(&self) -> tokio::time::Instant {
+        *self
+            .at
+            .get_or_init(|| tokio::time::Instant::now() + SHUTDOWN_GRACE)
+    }
+
+    #[must_use]
+    pub fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    /// A token cancelled with the shutdown.
+    #[must_use]
+    pub fn child_token(&self) -> CancellationToken {
+        self.token.child_token()
+    }
 }
 
 /// The model ids on offer at startup, for the mount-time resource check.
@@ -318,7 +373,7 @@ impl AppState {
             router,
             tools,
             store,
-            shutdown,
+            shutdown: shutdown_token,
             guardian,
             memory,
             mcp_servers,
@@ -352,7 +407,7 @@ impl AppState {
             Arc::clone(&router),
             Arc::clone(&tools),
             StdArc::new(events.clone()),
-            shutdown.clone(),
+            shutdown_token.clone(),
             memory,
         );
         let sched_hub = events.clone();
@@ -383,7 +438,7 @@ impl AppState {
             module_status: Arc::new(std::collections::HashMap::new()),
             runs,
             scheduler,
-            shutdown,
+            shutdown: Shutdown::new(shutdown_token),
         }
     }
 }
@@ -416,8 +471,8 @@ async fn health() -> Json<Health> {
 /// unlike a pid from a possibly-stale state file, this can never kill an
 /// unrelated reused-pid process). Used by `agent24 daemon stop`.
 async fn shutdown_handler(State(state): State<AppState>) -> Response {
+    state.shutdown.request();
     tracing::info!("shutdown requested via /api/v1/shutdown");
-    state.shutdown.cancel();
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "ok": true })),
@@ -860,12 +915,8 @@ pub async fn serve(
     // shutdown, the server ending) fixes it at the first look after the cancel
     // — a scheduling delay later, which the watchdog below bounds (review of
     // SUP-4, round 3).
-    let shutdown_at: Arc<std::sync::OnceLock<tokio::time::Instant>> =
-        Arc::new(std::sync::OnceLock::new());
-    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let signal_cancel = cancel.clone();
-    let signal_at = shutdown_at.clone();
-    let signal_armed = armed.clone();
+    let shutdown = state.shutdown.clone();
+    let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
         tokio::select! {
@@ -877,20 +928,18 @@ pub async fn serve(
             tracing::error!("SIGINT handler failed: {err}");
             std::future::pending::<()>().await;
         }
-        // Deadline, watchdog and cancel first; the log line last — a stalled
-        // stderr must not be what keeps the shutdown from starting.
-        arm_watchdog(deadline_of(&signal_at), &signal_armed);
-        signal_cancel.cancel();
+        // The request first; the log line last — a stalled stderr must not be
+        // what keeps the shutdown from starting.
+        signal_shutdown.request();
         tracing::info!("shutdown signal received");
     });
-    // The hard bound for the shutdowns that do not come from a signal (an
-    // HTTP shutdown, the server ending): armed at the first look after the
-    // cancel. A signal arms it itself, above, before it cancels.
+    // For a token cancelled other than through `Shutdown::request` (a child
+    // token's owner, say): the watchdog is armed at the first look after it.
     {
-        let (cancel, at, armed) = (cancel.clone(), shutdown_at.clone(), armed.clone());
+        let observed = shutdown.clone();
         tokio::spawn(async move {
-            cancel.cancelled().await;
-            arm_watchdog(deadline_of(&at), &armed);
+            observed.token().cancelled().await;
+            observed.request();
         });
     }
 
@@ -915,11 +964,20 @@ pub async fn serve(
     // connection as the end of its run (D1), so one that outlives this
     // process exits on its own.
     let registry = host.as_ref().ok().map(|h| h.supervisors.clone());
-    let stop_cancel = cancel.clone();
-    let stop_deadline = shutdown_at.clone();
+    let stop_shutdown = shutdown.clone();
     let stopping = tokio::spawn(async move {
-        stop_cancel.cancelled().await;
-        let deadline = deadline_of(&stop_deadline);
+        stop_shutdown.token().cancelled().await;
+        let deadline = stop_shutdown.deadline();
+        // The discovery state goes first, off this task: a watchdog exit later
+        // must not leave a state file pointing at a daemon that is gone. (The
+        // singleton lock is held until the process exits, so no second daemon
+        // can start in the meantime.)
+        if !ephemeral {
+            let pid = std::process::id();
+            tokio::task::spawn_blocking(move || {
+                agent24_protocol::state_file::remove_if_owner(pid);
+            });
+        }
         let supervisors = registry.map(|r| r.close()).unwrap_or_default();
         if tokio::time::timeout_at(deadline, stop_supervisors(supervisors))
             .await
@@ -1064,7 +1122,7 @@ pub async fn serve(
         result = server => result,
         () = async {
             cancel.cancelled().await;
-            tokio::time::sleep_until(deadline_of(&shutdown_at)).await;
+            tokio::time::sleep_until(shutdown.deadline()).await;
         } => {
             tracing::warn!("graceful shutdown exceeded {SHUTDOWN_GRACE:?}; forcing exit");
             Ok(())
@@ -1072,7 +1130,7 @@ pub async fn serve(
     };
     // The server can end without a cancel (an accept error); the modules stop
     // either way. The wait is bounded by the task itself.
-    cancel.cancel();
+    shutdown.request();
     let _ = stopping.await;
     // Only remove our own state file — a newer daemon may have replaced it
     if !ephemeral {
@@ -1130,27 +1188,34 @@ fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, St
 /// it; no I/O when it fires, so a stalled stderr cannot hold it; and exit
 /// status 0, because a shutdown was asked for — a supervisor such as launchd
 /// must not read it as a crash and start the daemon again (review of SUP-4,
-/// round 4). Modules it did not get to stop read EOF on their callback
-/// connections, which ends their runs (D1).
+/// round 4). A thread the OS refuses to create ends the process at once,
+/// rather than losing the shutdown (round 5). Modules it did not get to stop
+/// read EOF on their callback connections, which ends their runs (D1).
 fn arm_watchdog(deadline: tokio::time::Instant, armed: &std::sync::atomic::AtomicBool) {
-    if armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    if armed
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
         return;
     }
     let at = deadline.into_std() + WATCHDOG_MARGIN;
-    std::thread::spawn(move || {
-        let now = std::time::Instant::now();
-        if at > now {
-            std::thread::sleep(at - now);
-        }
+    let spawned = std::thread::Builder::new()
+        .name("shutdown-watchdog".to_owned())
+        .spawn(move || {
+            let now = std::time::Instant::now();
+            if at > now {
+                std::thread::sleep(at - now);
+            }
+            std::process::exit(0);
+        });
+    if spawned.is_err() {
         std::process::exit(0);
-    });
-}
-
-/// The shutdown deadline: fixed by the first caller — the signal task, before
-/// it cancels; otherwise the first to look after a cancel (see `shutdown_at` in
-/// `serve`).
-fn deadline_of(at: &std::sync::OnceLock<tokio::time::Instant>) -> tokio::time::Instant {
-    *at.get_or_init(|| tokio::time::Instant::now() + SHUTDOWN_GRACE)
+    }
 }
 
 /// Stop every supervised module, the way SPEC §4 stops one, concurrently for

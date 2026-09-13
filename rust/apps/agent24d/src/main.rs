@@ -74,7 +74,7 @@ fn run_serve(port: u16, ephemeral: bool) -> std::process::ExitCode {
     // a supervisor walking a large package tree in `spawn_blocking` when the
     // shutdown came would otherwise hold the exit past `serve`'s own bound
     // (TASKS B2; review of SUP-4, round 1).
-    runtime.shutdown_timeout(std::time::Duration::from_millis(500));
+    runtime.shutdown_timeout(std::time::Duration::from_millis(300));
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
