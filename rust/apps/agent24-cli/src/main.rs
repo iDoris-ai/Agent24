@@ -67,29 +67,19 @@ enum Command {
 enum OsAction {
     /// Show every domain OS the daemon knows about, and what it did with each
     List,
-    // EXPIRES WHEN `os disable` ACTS ON A RUNNING MODULE — which is NOT the day
-    // ME-3b-5 landed. Both "applies at the next daemon start" lines below are true
-    // for one reason only: a toggle is written to the config and nothing acts on a
-    // running module, so a restart is the only path by which it takes effect.
+    // `Disable`'s line EXPIRED with SUP-5: the daemon's disable path now drains
+    // and stops a running out-of-process module at once, so that line says so,
+    // and keeps "the next daemon start" only for a compiled-in module, which
+    // nothing stops at runtime. The test that pins it is
+    // `a_disable_drains_and_stops_the_running_package` (agent24d
+    // `tests/daemon_modules.rs`).
     //
-    // This note used to say it expired with ME-3b's last slice, and later that
-    // it waited on the daemon refusing out-of-process packages. Since SUP-4 the
-    // daemon does start them — but only at start: a toggle is still written to
-    // the config and nothing acts on a running module, so these lines are still
-    // true. Rewording them now would make a true sentence false.
-    //
-    // What DOES make them false, one line each, because they are different
-    // events: `Disable` — the daemon's disable path calling
-    // `Generation::begin_drain` on a running module (SUP-5); `Enable` — the
-    // daemon spawning a module at runtime rather than at start. The test that
-    // pins today's behaviour is `a_disabled_package_is_never_started` in
-    // `domain.rs` (a disabled package is not started, and the switch is read
-    // only when the daemon starts); whoever makes a toggle act at runtime
-    // changes it, and these lines with it.
-    //
-    // The same promise is made twice more, and expires with these lines:
-    // `os_routes.rs`'s module docs ("A toggle does not take effect until the
-    // daemon restarts") and the `restart_required` field it reports.
+    // `Enable`'s line is STILL true, for one reason only: nothing starts a
+    // module at runtime — a switched-on module waits for the next start. What
+    // makes it false is the daemon spawning a module at runtime (not planned:
+    // the user's decision D2 was hot disable only). Whoever does that changes
+    // this line, the `os_routes.rs` module docs, and `restart_required` for an
+    // enable, together.
     //
     // The note lives here rather than in the follow-ups ledger so that it is
     // read by whoever changes the thing that makes it false.
@@ -98,7 +88,7 @@ enum OsAction {
         /// Module name, e.g. sin90
         name: String,
     },
-    /// Turn one off (applies at the next daemon start)
+    /// Turn one off (a running out-of-process module stops taking requests now, drains for up to 30s, then is stopped; a compiled-in one at the next daemon start)
     Disable { name: String },
     /// Install a domain-OS package directory (takes effect at the next daemon start)
     ///

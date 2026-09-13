@@ -26,13 +26,17 @@
 //! one: it would mean two writers, and the failure it prevents is rarer than the
 //! races it would introduce.
 //!
-//! **A toggle does not take effect until the daemon restarts.** Routes are built
-//! once at startup, and pretending otherwise would be worse than saying so: the
-//! list reports the config state AND the running state separately, and sets
-//! `restart_required` when the config has CHANGED since the mount pass — not
-//! merely when a module is enabled and not running, which would conflate a pending
-//! toggle with a module that is simply unhealthy. A user who toggles a module and
-//! then sees it still serving is looking at a fact, not a bug.
+//! **Disabling a running out-of-process module stops it now; every other toggle
+//! takes effect when the daemon restarts** (SUP-5). A disable stops the module
+//! the SPEC §4 way — DRAINING, then REVOKING — in the background: the request
+//! returns once the config is written AND the module refuses new requests,
+//! and the list reports it `disabled` (with `stopping` while it drains; a
+//! stop that fails is reported `degraded`, as what it is). A compiled-in module, and ANY enable, still
+//! waits for a restart: routes are built once at startup, and nothing starts a
+//! module at runtime. The list reports the config state AND the running state
+//! separately, and sets `restart_required` when the config differs from what is
+//! running — not merely when a module is enabled and not running, which would
+//! conflate a pending toggle with a module that is simply unhealthy.
 
 use agent24_domain::http::error_response;
 use agent24_protocol::{DomainOsList, DomainOsUpdate, DomainOsView};
@@ -53,9 +57,30 @@ fn view(
     enabled_now: bool,
     registry_usable: bool,
     live: Option<&agent24_os_proto::supervisor::Status>,
+    hot: Option<bool>,
 ) -> DomainOsView {
     use agent24_os_proto::supervisor::Status;
+    // `hot`: `None` if no `os disable` asked to stop it since the daemon
+    // started; else whether that has taken effect (see `applied`). A disable
+    // whose stop failed is not applied: the module is reported as what it is
+    // — degraded, with the failure — and a restart is still what settles it
+    // (review of SUP-5, round 1), whatever the config says since (round 5).
+    let stop_failed = hot.is_some()
+        && matches!(
+            live,
+            Some(Status::StopFailed { .. } | Status::Panicked | Status::Killed)
+        );
+    let hot_disabled = hot == Some(true) && !stop_failed;
     let (state, detail) = match (&report.outcome, live) {
+        // Stopped by `os disable` while the daemon runs: disabled, whatever the
+        // mount said — still `stopping` while it drains (SUP-5).
+        (MountOutcome::Mounted, Some(Status::Stopped)) if hot_disabled => ("disabled", None),
+        (MountOutcome::Mounted, _) if hot_disabled => ("disabled", Some("stopping".to_owned())),
+        // Asked to stop and still admitting: what it is, and what is coming —
+        // whatever its supervisor has published yet (review of SUP-5, round 7).
+        (MountOutcome::Mounted, _) if hot == Some(false) && !stop_failed => {
+            ("mounted", Some("stop requested".to_owned()))
+        }
         // A package started at mount: its supervisor says where it is NOW. A
         // mount verdict alone called a module that had since given up
         // "mounted" (review of SUP-4, round 1).
@@ -80,7 +105,12 @@ fn view(
             Status::StopFailed { error } => ("degraded", Some(error.clone())),
             Status::Stopped => ("degraded", Some("stopped".to_owned())),
             Status::Panicked => ("degraded", Some("its supervisor panicked".to_owned())),
-            Status::Killed => ("degraded", Some("killed".to_owned())),
+            Status::Killed => (
+                "degraded",
+                Some(
+                    "its supervisor was cancelled; SIGKILL attempted, exit unconfirmed".to_owned(),
+                ),
+            ),
         },
         (MountOutcome::Mounted, None) => ("mounted", None),
         (MountOutcome::Disabled, _) => ("disabled", None),
@@ -101,8 +131,22 @@ fn view(
     // A REFUSED module is excluded whatever the config says: its manifest is
     // inadmissible for this binary, so a restart cannot deliver it, and asking for
     // one would send the user to do something that changes nothing.
-    let restart_required = match report.enabled_at_start {
+    // A hot disable has already applied "off" — or has asked for it, which
+    // cannot be taken back: for the comparison below, what is running is what
+    // a start with it disabled would have given. So an enable that lands
+    // before the stop takes hold still needs a restart (review of SUP-5,
+    // round 6).
+    let running_enabled = if hot.is_some() {
+        Some(false)
+    } else {
+        report.enabled_at_start
+    };
+    let restart_required = match running_enabled {
         _ if matches!(report.outcome, MountOutcome::Refused(_)) => false,
+        // A disable left it with no supervisor that can bring it back: a
+        // later enable changes the config, not that — nor does fixing the
+        // registry (review of SUP-5, rounds 5 and 6).
+        _ if stop_failed => true,
         // A registry that is STILL unusable cannot be applied by restarting — the
         // fix is the file. Saying otherwise sent the user to restart into exactly
         // the same degradation. (The syntactically-invalid case never reaches here;
@@ -186,6 +230,7 @@ fn render(state: &AppState) -> Response {
                 cfg.is_enabled(&r.name),
                 registry_error.is_none(),
                 live.as_ref(),
+                hot_disabled(state, &r.name),
             )
         })
         .collect();
@@ -194,6 +239,208 @@ fn render(state: &AppState) -> Response {
         registry_error,
     })
     .into_response()
+}
+
+fn hot_disabled(state: &AppState, name: &str) -> Option<bool> {
+    let slot = state
+        .supervisors
+        .as_ref()
+        .and_then(|s| s.disabled_slot(name))?;
+    Some(applied(Some(&slot)))
+}
+
+/// Whether a disable has taken effect: its module no longer admits requests.
+/// Asked for but not yet so, it is still what it was — `mounted`, and
+/// serving (review of SUP-5, round 4).
+fn applied(disabled: Option<&crate::domain::Disabled>) -> bool {
+    disabled
+        .is_some_and(|d| d.current.get().state() != agent24_os_proto::drain::DrainState::Running)
+}
+
+/// How long a disabled module gets to finish the requests it has (DRAINING)
+/// before it is stopped. ⚖️ The proxy's own total deadline for a request, so
+/// every request admitted before the disable either finishes or times out by
+/// itself first — a disable abandons nothing a request's own deadline would not.
+const DISABLE_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a disable waits for the module's generation to stop admitting
+/// requests. Its supervisor does that as soon as it is scheduled; this only
+/// bounds a runtime too busy to schedule it.
+const ADMISSION_CLOSED_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a disable did to the running module (SUP-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotStop {
+    /// Its supervisor is now draining and stopping it, and it refuses new
+    /// requests.
+    Stopping,
+    /// It still admitted requests when the wait ran out — whether this
+    /// disable or an earlier one asked for the stop.
+    Pending,
+    /// An earlier disable asked for the stop, and it refuses requests.
+    Already,
+    /// Its supervisor could not stop it cleanly (`StopFailed`, `Panicked`,
+    /// `Killed`): not a disable applied (review of SUP-5, round 4).
+    Failed,
+    /// Nothing running to stop: a compiled-in module, a package not started
+    /// at mount, or a daemon already shutting down.
+    NotRunning,
+}
+
+/// Hand a running out-of-process module's stop to its supervisor (SUP-5):
+/// it drains and stops in the background, and the shutdown — if it begins
+/// meanwhile — waits for that stop, cutting it off at `cut_off`. Synchronous:
+/// the stop is asked for before this returns. The module's proxy slot, and
+/// whether THIS call asked (`true`) or an earlier disable did; `None` if
+/// there is nothing to stop.
+fn hand_off(
+    supervisors: Option<&crate::domain::Supervisors>,
+    cut_off: impl std::future::Future<Output = ()> + Send + 'static,
+    name: &str,
+) -> Option<(bool, crate::domain::Disabled)> {
+    let supervisors = supervisors?;
+    match supervisors.disable(name, DISABLE_DRAIN, cut_off) {
+        Some(current) => Some((true, current)),
+        None => supervisors.disabled_slot(name).map(|c| (false, c)),
+    }
+}
+
+/// Wait up to `within` for a handed-off module to refuse new requests, so a
+/// request sent after the disable answers is not admitted. What this
+/// establishes is "refuses requests, stop under way": a failure its
+/// supervisor has already reported by then is `Failed`, and one that comes
+/// later is the list's to report — `degraded`, restart required — since
+/// waiting for the stop to finish would hold the answer for the whole drain
+/// (review of SUP-5, round 5). Admission is closed — also on a
+/// repeated disable, whose predecessor may have timed out (review of SUP-5,
+/// round 3).
+async fn settle(
+    handed: Option<(bool, crate::domain::Disabled)>,
+    within: std::time::Duration,
+) -> HotStop {
+    match handed {
+        None => HotStop::NotRunning,
+        Some((asked, d)) => {
+            let closed = admission_closed(&d.current, within).await;
+            let status = d.status.borrow().clone();
+            classify(closed, asked, &status)
+        }
+    }
+}
+
+/// The answer's last look: a stop that has failed since `settle` looked is
+/// `Failed` after all, and one that timed out but refuses requests by now is
+/// under way. This moment — just before the response is chosen — is the one
+/// the answer describes (review of SUP-5, rounds 6 and 7).
+fn last_look(hot: HotStop, slot: Option<&crate::domain::Disabled>) -> HotStop {
+    use agent24_os_proto::supervisor::Status;
+    let failed = slot.is_some_and(|d| {
+        matches!(
+            *d.status.borrow(),
+            Status::StopFailed { .. } | Status::Panicked | Status::Killed
+        )
+    });
+    if failed {
+        HotStop::Failed
+    } else if hot == HotStop::Pending && applied(slot) {
+        HotStop::Stopping
+    } else {
+        hot
+    }
+}
+
+/// A handed-off stop, by whether its module refuses requests, whether THIS
+/// disable asked for it, and its supervisor's status. A failed stop revokes
+/// admission too, so the failure is looked at first.
+fn classify(closed: bool, asked: bool, status: &agent24_os_proto::supervisor::Status) -> HotStop {
+    use agent24_os_proto::supervisor::Status;
+    if matches!(
+        status,
+        Status::StopFailed { .. } | Status::Panicked | Status::Killed
+    ) {
+        return HotStop::Failed;
+    }
+    match (closed, asked) {
+        (false, _) => HotStop::Pending,
+        (true, true) => HotStop::Stopping,
+        (true, false) => HotStop::Already,
+    }
+}
+
+#[cfg(test)]
+async fn stop_now(
+    supervisors: Option<&crate::domain::Supervisors>,
+    cut_off: impl std::future::Future<Output = ()> + Send + 'static,
+    name: &str,
+    within: std::time::Duration,
+) -> HotStop {
+    settle(hand_off(supervisors, cut_off, name), within).await
+}
+
+/// Write `enabled` for `name` to os.json and, for a disable, hand the
+/// running module's stop off. `Err` only if the change was not published;
+/// published with an error — a rename that landed, then a failed directory
+/// fsync — still hands the stop off, so the running state matches what the
+/// file now says, and returns that error alongside (review of SUP-5,
+/// round 3).
+async fn apply(
+    state: &AppState,
+    path: std::path::PathBuf,
+    name: &str,
+    enabled: bool,
+) -> Result<(Option<(bool, crate::domain::Disabled)>, Option<String>), String> {
+    // Off the async workers: the file lock waits for any other writer, for
+    // as long as that takes (review of SUP-5, round 2).
+    let written = tokio::task::spawn_blocking({
+        let (path, name) = (path.clone(), name.to_owned());
+        move || crate::os_config::OsConfig::set_enabled(&path, &name, enabled)
+    })
+    .await;
+    let failed = match written {
+        Ok(Ok(_)) => None,
+        Ok(Err(why)) => Some(why),
+        Err(e) => Some(format!("the config write failed: {e}")),
+    };
+    if let Some(why) = &failed {
+        let published = tokio::task::spawn_blocking({
+            let name = name.to_owned();
+            move || {
+                crate::os_config::OsConfig::load(&path)
+                    .is_ok_and(|c| c.is_enabled(&name) == enabled)
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !published {
+            return Err(why.clone());
+        }
+    }
+    let handed = if enabled {
+        None
+    } else {
+        hand_off(
+            state.supervisors.as_deref(),
+            state.shutdown.modules_cut_off(),
+            name,
+        )
+    };
+    Ok((handed, failed))
+}
+
+/// Wait, for up to `within`, until the generation `current` routes to no
+/// longer admits requests. `false` if it still did then.
+async fn admission_closed(
+    current: &agent24_os_proto::drain::Current,
+    within: std::time::Duration,
+) -> bool {
+    let by = tokio::time::Instant::now() + within;
+    while current.get().state() == agent24_os_proto::drain::DrainState::Running {
+        if tokio::time::Instant::now() >= by {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    true
 }
 
 pub async fn list_os(State(state): State<AppState>) -> Response {
@@ -240,13 +487,88 @@ pub async fn patch_os(
             );
         }
     };
-    if let Err(why) = crate::os_config::OsConfig::set_enabled(&path, &name, update.enabled) {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &why);
-    }
+    // The write and the hand-off of a running module's stop are one step
+    // against another toggle, done in a task of the daemon's own: a client
+    // that goes away half-way cannot leave os.json disabling a module that
+    // keeps serving. The lock is released before the wait for the module to
+    // refuse requests, so a slow module does not hold up other toggles
+    // (review of SUP-5, round 3).
+    let control = state.os_control.clone().lock_owned().await;
+    let step = tokio::spawn({
+        let (state, name) = (state.clone(), name.clone());
+        async move {
+            let _control = control;
+            apply(&state, path, &name, update.enabled).await
+        }
+    });
+    let (handed, write_error) = match step.await {
+        Ok(Ok(applied)) => applied,
+        Ok(Err(why)) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &why);
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("the config change failed: {e}"),
+            );
+        }
+    };
+    // A disable of a running out-of-process module applies now; anything else
+    // at the next start.
+    let slot = handed.as_ref().map(|(_, d)| d.clone());
+    let hot = last_look(settle(handed, ADMISSION_CLOSED_WITHIN).await, slot.as_ref());
+    let effect = match hot {
+        HotStop::Stopping => "stopping it now",
+        HotStop::Pending => "its supervisor was asked to stop it; not yet refusing requests",
+        HotStop::Already => "an earlier disable already stopped it or is stopping it",
+        HotStop::Failed => "its supervisor could not stop it cleanly",
+        HotStop::NotRunning => "takes effect on restart",
+    };
     tracing::info!(
-        "domain OS {name:?} set enabled={} in os.json (takes effect on restart)",
+        "domain OS {name:?} set enabled={} in os.json ({effect})",
         update.enabled
     );
+    // First, so a write error does not hide the code a client acts on
+    // (review of SUP-5, round 5).
+    if hot == HotStop::Failed {
+        let also = write_error
+            .as_deref()
+            .map(|why| format!("; writing os.json also reported: {why}"))
+            .unwrap_or_default();
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stop_failed",
+            &format!(
+                "this request disabled {name:?} in os.json, but its supervisor could not stop it \
+                 cleanly; `agent24 os list` shows why, and a restart is needed{also}"
+            ),
+        );
+    }
+    if let Some(why) = write_error {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &format!(
+                "this request set enabled={} for {name:?} in os.json ({effect}), but writing it \
+                 reported: {why}",
+                update.enabled
+            ),
+        );
+    }
+    // Not a success: a request sent after this answer could still be
+    // admitted (review of SUP-5, rounds 2 and 3).
+    if hot == HotStop::Pending {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "disable_pending",
+            &format!(
+                "this request disabled {name:?} in os.json and asked its supervisor to stop it, \
+                 but it still admitted requests after {ADMISSION_CLOSED_WITHIN:?}; `agent24 os list` \
+                 shows when it has stopped"
+            ),
+        );
+    }
     // Return the whole list so a client sees the new `restart_required` state
     // without a second round trip.
     render(&state)
@@ -259,6 +581,201 @@ mod tests {
     use super::*;
     use crate::domain::{MountOutcome, MountReport, ResourceStatus};
 
+    /// What a disable reports: `Stopping` once the module refuses new
+    /// requests; `Pending` if it still admitted them when the wait ran out —
+    /// here at once, on this single-threaded runtime, before its supervisor
+    /// has run at all — and again `Pending` for a retry while that is still
+    /// so, `Already` once it refuses them; nothing to stop without
+    /// supervisors (review of SUP-5, rounds 2 and 3).
+    #[tokio::test]
+    async fn a_disable_says_whether_the_module_refuses_requests_yet() {
+        let never = std::future::pending::<()>;
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let host = crate::domain::tests::running_package(tmp.path()).await;
+        let zero = std::time::Duration::ZERO;
+        assert_eq!(
+            stop_now(None, never(), "remote", zero).await,
+            HotStop::NotRunning
+        );
+        assert_eq!(
+            stop_now(Some(&host.supervisors), never(), "nope", zero).await,
+            HotStop::NotRunning
+        );
+        assert_eq!(
+            stop_now(Some(&host.supervisors), never(), "remote", zero).await,
+            HotStop::Pending
+        );
+        assert_eq!(
+            stop_now(Some(&host.supervisors), never(), "remote", zero).await,
+            HotStop::Pending,
+            "a retry answered while the module still admits requests"
+        );
+        assert!(
+            !applied(host.supervisors.disabled_slot("remote").as_ref()),
+            "listed as disabled while it still admits requests"
+        );
+        assert_eq!(
+            stop_now(
+                Some(&host.supervisors),
+                never(),
+                "remote",
+                std::time::Duration::from_secs(5)
+            )
+            .await,
+            HotStop::Already
+        );
+        assert!(applied(host.supervisors.disabled_slot("remote").as_ref()));
+        for stop in host.supervisors.close().disabling {
+            stop.await.unwrap();
+        }
+
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let host = crate::domain::tests::running_package(tmp.path()).await;
+        assert_eq!(
+            stop_now(
+                Some(&host.supervisors),
+                never(),
+                "remote",
+                std::time::Duration::from_secs(5)
+            )
+            .await,
+            HotStop::Stopping
+        );
+        for stop in host.supervisors.close().disabling {
+            stop.await.unwrap();
+        }
+    }
+
+    /// A failed stop is not a disable applied, whatever admission says — it
+    /// revokes admission too (review of SUP-5, round 4).
+    #[test]
+    fn a_failed_stop_is_classified_before_admission() {
+        use agent24_os_proto::supervisor::Status;
+        let failed = Status::StopFailed { error: "x".into() };
+        for asked in [true, false] {
+            assert_eq!(classify(true, asked, &failed), HotStop::Failed);
+            assert_eq!(classify(true, asked, &Status::Panicked), HotStop::Failed);
+            assert_eq!(classify(true, asked, &Status::Killed), HotStop::Failed);
+            assert_eq!(classify(false, asked, &Status::Running), HotStop::Pending);
+        }
+        assert_eq!(classify(true, true, &Status::Stopping), HotStop::Stopping);
+        assert_eq!(classify(true, false, &Status::Stopped), HotStop::Already);
+    }
+
+    /// A stop that failed after `settle` looked is still reported failed
+    /// (review of SUP-5, round 6).
+    #[test]
+    fn the_last_look_catches_a_failure_since_settle() {
+        use agent24_os_proto::supervisor::Status;
+        let (tx, status) = tokio::sync::watch::channel(Status::Stopping);
+        let slot = crate::domain::Disabled {
+            current: agent24_os_proto::drain::Current::new(
+                agent24_os_proto::drain::Generation::starting(),
+            ),
+            status,
+        };
+        assert_eq!(last_look(HotStop::Stopping, Some(&slot)), HotStop::Stopping);
+        // Starting is not Running: a pending disable whose module no longer
+        // admits requests by the last look is under way.
+        assert_eq!(last_look(HotStop::Pending, Some(&slot)), HotStop::Stopping);
+        tx.send_replace(Status::StopFailed { error: "x".into() });
+        assert_eq!(last_look(HotStop::Stopping, Some(&slot)), HotStop::Failed);
+        assert_eq!(last_look(HotStop::NotRunning, None), HotStop::NotRunning);
+    }
+
+    /// A disable answers only once the module's generation refuses new work:
+    /// here its supervisor gets to it late, and the wait outlasts that. And
+    /// the wait is bounded, for a supervisor that never does (SUP-5).
+    #[tokio::test]
+    async fn a_disable_waits_until_the_generation_refuses_work() {
+        use agent24_os_proto::drain::{Current, DrainState, Generation};
+        let serving = || {
+            let g = Generation::serving_at("127.0.0.1:1".parse().unwrap());
+            assert!(g.ready());
+            g
+        };
+        let g = serving();
+        let current = Current::new(g.clone());
+        let late = {
+            let g = g.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(g.begin_drain(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(10)
+                ));
+            })
+        };
+        assert!(admission_closed(&current, std::time::Duration::from_secs(5)).await);
+        assert_eq!(g.state(), DrainState::Draining);
+        late.await.unwrap();
+
+        let stuck = Current::new(serving());
+        assert!(!admission_closed(&stuck, std::time::Duration::from_millis(50)).await);
+    }
+
+    /// A module stopped by `os disable` is reported `disabled` — `stopping`
+    /// while it drains — and needs no restart: the running state already
+    /// matches the config (SUP-5). Control: without the hot disable, the same
+    /// config change needs a restart.
+    #[test]
+    fn a_hot_disabled_module_is_disabled_and_needs_no_restart() {
+        use agent24_os_proto::supervisor::Status;
+        let r = report("pkg", MountOutcome::Mounted);
+        let v = view(&r, false, true, Some(&Status::Stopping), Some(true));
+        assert_eq!(
+            (v.state.as_str(), v.detail.as_deref()),
+            ("disabled", Some("stopping"))
+        );
+        assert!(!v.restart_required);
+        let v = view(&r, false, true, Some(&Status::Stopped), Some(true));
+        assert_eq!((v.state.as_str(), v.detail.as_deref()), ("disabled", None));
+        assert!(!v.restart_required);
+        let v = view(&r, false, true, Some(&Status::Running), None);
+        assert!(v.restart_required, "a pending disable not applied yet");
+        // A stop that failed is not a disable applied.
+        let failed = Status::StopFailed {
+            error: "still there".into(),
+        };
+        let v = view(&r, false, true, Some(&failed), Some(true));
+        assert_eq!(
+            (v.state.as_str(), v.detail.as_deref()),
+            ("degraded", Some("still there"))
+        );
+        assert!(v.restart_required);
+        // ... and still after the config is switched back on: nothing but a
+        // restart brings it back (review of SUP-5, round 5).
+        assert!(view(&r, true, true, Some(&failed), Some(true)).restart_required);
+        // A disable asked for, not yet applied: what it still is, and what
+        // is coming — no restart needed for the disable, but one for an
+        // enable landing before the stop takes hold, which cannot be taken
+        // back (review of SUP-5, round 6).
+        let v = view(&r, false, true, Some(&Status::Running), Some(false));
+        assert_eq!(
+            (v.state.as_str(), v.detail.as_deref()),
+            ("mounted", Some("stop requested"))
+        );
+        let v = view(
+            &r,
+            false,
+            true,
+            Some(&Status::Starting { attempt: 1 }),
+            Some(false),
+        );
+        assert_eq!(v.detail.as_deref(), Some("stop requested"));
+        assert!(!v.restart_required);
+        assert!(view(&r, true, true, Some(&Status::Running), Some(false)).restart_required);
+        assert!(view(&r, true, true, Some(&Status::Stopped), Some(true)).restart_required);
+        // A failed stop needs a restart even with the registry unusable.
+        assert!(view(&r, false, false, Some(&failed), Some(true)).restart_required);
+    }
+
     /// A package mounted at start is reported by its supervisor's status NOW:
     /// one that has given up is degraded, with the reason — not "mounted"
     /// (review of SUP-4, round 1). Control: a running one is mounted.
@@ -270,14 +787,14 @@ mod tests {
             failures: 5,
             within: std::time::Duration::from_secs(4),
         };
-        let v = view(&r, true, true, Some(&gave_up));
+        let v = view(&r, true, true, Some(&gave_up), None);
         assert_eq!(v.state, "degraded");
         assert!(
             v.detail.as_deref().is_some_and(|d| d.contains("gave up")),
             "{:?}",
             v.detail
         );
-        let v = view(&r, true, true, Some(&Status::Running));
+        let v = view(&r, true, true, Some(&Status::Running), None);
         assert_eq!(v.state, "mounted");
         assert_eq!(v.detail, None);
     }
@@ -327,14 +844,14 @@ mod tests {
         // user staring at a contradiction; `restart_required` is what turns that
         // into a fact they can act on.
         let running = report("sin90", MountOutcome::Mounted);
-        let v = view(&running, false, true, None);
+        let v = view(&running, false, true, None, None);
         assert_eq!(v.state, "mounted", "it is still serving right now");
         assert!(!v.enabled, "but the config now says off");
         assert!(v.restart_required);
 
         // And the other direction.
         let off = report("sin90", MountOutcome::Disabled);
-        let v = view(&off, true, true, None);
+        let v = view(&off, true, true, None, None);
         assert_eq!(v.state, "disabled");
         assert!(v.enabled);
         assert!(v.restart_required);
@@ -373,17 +890,28 @@ mod tests {
         let mut r = report("sin90", MountOutcome::Degraded("os.json ...".into()));
         r.enabled_at_start = None;
         assert!(
-            !view(&r, true, false, None).restart_required,
+            !view(&r, true, false, None, None).restart_required,
             "the registry is still unusable; the fix is the file, not a restart"
         );
         // Once it IS usable, the config has genuinely never been applied.
-        assert!(view(&r, true, true, None).restart_required);
+        assert!(view(&r, true, true, None, None).restart_required);
     }
 
     #[test]
     fn a_settled_module_does_not_ask_for_a_restart() {
-        assert!(!view(&report("a", MountOutcome::Mounted), true, true, None).restart_required);
-        assert!(!view(&report("a", MountOutcome::Disabled), false, true, None).restart_required);
+        assert!(
+            !view(&report("a", MountOutcome::Mounted), true, true, None, None).restart_required
+        );
+        assert!(
+            !view(
+                &report("a", MountOutcome::Disabled),
+                false,
+                true,
+                None,
+                None
+            )
+            .restart_required
+        );
     }
 
     #[test]
@@ -395,7 +923,7 @@ mod tests {
             "health",
             MountOutcome::Refused("kernel route segment".into()),
         );
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, None);
         assert_eq!(v.state, "refused");
         assert!(v.enabled, "the config wants it");
         assert!(
@@ -417,7 +945,7 @@ mod tests {
             "sin90",
             MountOutcome::Degraded("store failed to open".into()),
         );
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, None);
         assert!(!v.restart_required);
         assert_eq!(
             v.detail.as_deref(),
@@ -427,7 +955,7 @@ mod tests {
 
         // And the case the availability comparison MISSED entirely: disabling an
         // already-degraded module IS a real pending change.
-        assert!(view(&r, false, true, None).restart_required);
+        assert!(view(&r, false, true, None, None).restart_required);
     }
 
     #[tokio::test]
@@ -483,7 +1011,7 @@ mod tests {
             granted: Vec::new(),
             resources: ResourceStatus::NotChecked,
         };
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, None);
         assert_eq!(v.name, "sin90");
         assert_eq!(v.version, "0.2.1");
         assert_eq!(v.state, "degraded");
@@ -507,13 +1035,13 @@ mod tests {
             granted: Vec::new(),
             resources: ResourceStatus::NotChecked,
         };
-        let v = view(&r, false, true, None);
+        let v = view(&r, false, true, None, None);
         assert_eq!(v.state, "disabled");
         assert!(!v.enabled);
         assert!(!v.restart_required, "config and runtime agree");
 
         // And once the user enables it, the list says a restart is what applies it.
-        assert!(view(&r, true, true, None).restart_required);
+        assert!(view(&r, true, true, None, None).restart_required);
     }
 
     #[tokio::test]
@@ -548,12 +1076,12 @@ mod tests {
     fn resource_status_is_flattened_without_losing_which_case_it_was() {
         let mut r = report("m", MountOutcome::Mounted);
         r.resources = ResourceStatus::MissingModels(vec!["ornith-9b".into()]);
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, None);
         assert_eq!(v.resources, "missing");
         assert_eq!(v.missing_models, vec!["ornith-9b".to_owned()]);
 
         r.resources = ResourceStatus::Unknown("provider down".into());
-        let v = view(&r, true, true, None);
+        let v = view(&r, true, true, None, None);
         assert_eq!(v.resources, "unknown");
         assert!(
             v.missing_models.is_empty(),
@@ -561,6 +1089,6 @@ mod tests {
         );
 
         r.resources = ResourceStatus::NotChecked;
-        assert_eq!(view(&r, true, true, None).resources, "not_checked");
+        assert_eq!(view(&r, true, true, None, None).resources, "not_checked");
     }
 }

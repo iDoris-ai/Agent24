@@ -46,6 +46,8 @@ rustix = { version = "0.38", features = ["fs"] }
 tempfile = "3"
 sha2 = "0.10"
 tower = { version = "0.5", features = ["util"] }
+# A paused clock, for deadlines asserted exactly rather than with slack.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true
