@@ -12,9 +12,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// A package module: HTTP on the listener the kernel hands it — `/slow`
-/// answers after 600ms, anything else at once — its pid in its data
-/// directory, the handshake with its own manifest's digest, and an exit when
-/// the callback connection ends (D1).
+/// marks that it has started (`slow-entered`) and answers after 600ms,
+/// anything else at once — its pid in its data directory, the handshake with
+/// its own manifest's digest, and an exit when the callback connection ends
+/// (D1).
 const MODULE: &str = r#"import hashlib, json, os, socket, threading, time
 with open("domain-os.yml", "rb") as f:
     digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
@@ -30,6 +31,7 @@ def answer(conn):
         head += chunk
     path = head.split(b" ")[1]
     if path.endswith(b"/slow"):
+        open(os.path.join(os.environ["A24_DATA_DIR"], "slow-entered"), "w").close()
         time.sleep(0.6)
         body = b"slow done"
     else:
@@ -85,6 +87,25 @@ fn get(port: u16, token: &str, path: &str) -> Option<(u16, String)> {
     Some((status, body))
 }
 
+/// The daemon, killed if the test fails before it stops it — and the module
+/// with it, once its pid is known — so a failing test leaves no process behind.
+struct Running {
+    daemon: std::process::Child,
+    module: Option<i32>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(pid) = self.module {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
 fn alive(pid: i32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -105,7 +126,7 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
         .tempdir_in("/tmp")
         .unwrap();
     install(home.path());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
+    let daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home.path())
@@ -115,8 +136,12 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    let mut run = Running {
+        daemon,
+        module: None,
+    };
     let mut ready = String::new();
-    BufReader::new(daemon.stdout.take().unwrap())
+    BufReader::new(run.daemon.stdout.take().unwrap())
         .read_line(&mut ready)
         .unwrap();
     let ready: serde_json::Value = serde_json::from_str(&ready).expect("the ready line");
@@ -137,16 +162,26 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
         .unwrap()
         .parse()
         .unwrap();
+    run.module = Some(pid);
 
     let slow = {
         let token = token.clone();
         std::thread::spawn(move || get(port, &token, "/api/v1/remote/slow"))
     };
-    std::thread::sleep(Duration::from_millis(200));
+    // SIGTERM once the module is working on it — not after a guessed sleep.
+    let entered = home.path().join(".agent24/os/remote/slow-entered");
+    let by = Instant::now() + Duration::from_secs(10);
+    while !entered.exists() {
+        assert!(
+            Instant::now() < by,
+            "the slow request never reached the module"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let t0 = Instant::now();
     assert!(
         Command::new("kill")
-            .args(["-TERM", &daemon.id().to_string()])
+            .args(["-TERM", &run.daemon.id().to_string()])
             .status()
             .unwrap()
             .success()
@@ -158,13 +193,13 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
         "the request in flight at the shutdown was not drained"
     );
     let exited = loop {
-        if let Some(status) = daemon.try_wait().unwrap() {
+        if let Some(status) = run.daemon.try_wait().unwrap() {
             break status;
         }
-        if t0.elapsed() > Duration::from_secs(10) {
-            let _ = daemon.kill();
-            panic!("the daemon did not exit within 10s of SIGTERM");
-        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the daemon did not exit within 10s of SIGTERM"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     let took = t0.elapsed();

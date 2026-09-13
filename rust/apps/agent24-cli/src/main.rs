@@ -397,6 +397,9 @@ fn os_local(action: &OsAction) -> Option<Result<(), String>> {
                     if removed {
                         println!("removed {name}");
                         println!("  it takes effect at the next daemon start");
+                        println!(
+                            "  (a module of it running now keeps running, but cannot be restarted if it exits)"
+                        );
                     } else {
                         // Not an error: the end state the operator asked for is the
                         // one they have. Saying so beats a failure they must decide

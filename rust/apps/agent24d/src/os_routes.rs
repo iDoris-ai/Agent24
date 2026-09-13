@@ -73,7 +73,7 @@ fn view(
             Status::GaveUp { failures, within } => (
                 "degraded",
                 Some(format!(
-                    "gave up after {failures} failed runs within {}s; restart the daemon to retry",
+                    "gave up after {failures} failed runs within {}s",
                     within.as_secs()
                 )),
             ),

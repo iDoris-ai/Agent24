@@ -128,7 +128,9 @@ pub type MethodsFor = Arc<dyn Fn(&Arc<Generation>) -> Methods + Send + Sync>;
 /// it.
 #[derive(Debug)]
 pub struct SupervisorHandle {
-    stop: watch::Sender<bool>,
+    /// `None` while running; `Some(drain)` once a stop was asked for, with how
+    /// long a run that is serving may take to finish the requests it has.
+    stop: watch::Sender<Option<Duration>>,
     status: watch::Receiver<Status>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -158,8 +160,24 @@ impl SupervisorHandle {
     /// over it; [`SupervisorError::Panicked`] when the loop itself panicked;
     /// [`SupervisorError::Killed`] when the loop had been cancelled without a
     /// stop (its runtime shut down).
-    pub async fn stop(mut self) -> Result<(), SupervisorError> {
-        let _ = self.stop.send(true);
+    pub async fn stop(self) -> Result<(), SupervisorError> {
+        self.drain_and_stop(Duration::ZERO).await
+    }
+
+    /// [`SupervisorHandle::stop`], after DRAINING (SPEC §4): a run that is
+    /// serving refuses new proxied requests and gets up to `drain` to finish
+    /// the ones it has — its callback connection still served, since they may
+    /// call back — then it is revoked and stopped. A run that is still
+    /// starting, or between runs, is stopped without ever serving, and no run
+    /// is started after the request: a module that crashes while draining is
+    /// not restarted into a generation nobody drained (review of SUP-4,
+    /// round 2).
+    ///
+    /// # Errors
+    ///
+    /// As [`SupervisorHandle::stop`].
+    pub async fn drain_and_stop(mut self, drain: Duration) -> Result<(), SupervisorError> {
+        let _ = self.stop.send(Some(drain));
         // Awaited in place, not taken out: a `stop` future dropped half-way —
         // a caller's deadline — drops `self` with the task still in it, and
         // `Drop` aborts it, which SIGKILLs the module now. Taking it out left
@@ -261,7 +279,7 @@ pub fn supervise(
     timings: Timings,
 ) -> Result<SupervisorHandle, SlotHeld> {
     let slot = Slot::claim(current).ok_or(SlotHeld)?;
-    let (stop_tx, stop_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(None);
     let (status_tx, status_rx) = watch::channel(Status::Starting { attempt: 1 });
     // Built here and moved into the task, not built inside it: a task aborted
     // before its first poll drops its future's captures — this guard — but
@@ -414,7 +432,7 @@ async fn run_loop(
     exit: Exit,
     methods: MethodsFor,
     timings: Timings,
-    mut stop: watch::Receiver<bool>,
+    mut stop: watch::Receiver<Option<Duration>>,
 ) {
     let (slot, status) = (&exit.slot, &exit.status);
     let mut policy = RestartPolicy::with_base(timings.backoff_base);
@@ -501,7 +519,7 @@ async fn run_once(
     slot: &Slot,
     methods: &MethodsFor,
     timings: &Timings,
-    stop: &mut watch::Receiver<bool>,
+    stop: &mut watch::Receiver<Option<Duration>>,
     status: &watch::Sender<Status>,
 ) -> Result<Run, Unconfirmed> {
     let failed = |why: Stopped| Run::Ended {
@@ -615,12 +633,17 @@ async fn run_once(
             async move { generation.revoked().await }
         },
     );
+    let mut serve = std::pin::pin!(serve);
     let outcome = tokio::select! {
         biased;
         () = stop_requested(stop) => None,
-        ended = serve => Some(format!("the callback connection ended: {ended:?}")),
+        ended = serve.as_mut() => Some(format!("the callback connection ended: {ended:?}")),
         exited = process.exited() => Some(format!("the module exited: {exited:?}")),
     };
+    if outcome.is_none() {
+        let drain = (*stop.borrow()).unwrap_or_default();
+        drain_run(&generation, drain, &mut serve, &mut process).await;
+    }
     let ended_at = std::time::Instant::now();
     finish(process, timings, &spec.name, status, slot).await?;
     Ok(match outcome {
@@ -644,9 +667,37 @@ async fn run_once(
 /// dropped, and that aborts this task — which must end as `Killed`, not run
 /// a stop path to `Stopped` in the meantime (review of ME3-SUP slice 3a,
 /// round 8).
-async fn stop_requested(stop: &mut watch::Receiver<bool>) {
-    if stop.wait_for(|s| *s).await.is_err() {
+async fn stop_requested(stop: &mut watch::Receiver<Option<Duration>>) {
+    if stop.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+/// Let a serving run finish what it has, for up to `drain`: DRAINING refuses
+/// new proxied requests; this waits until nothing is in flight, the deadline,
+/// the callback connection ending, or the process exiting — whichever is
+/// first. The callback connection is served throughout (`serve` is polled
+/// here), because a request finishing may call back.
+async fn drain_run(
+    generation: &Generation,
+    drain: Duration,
+    serve: &mut std::pin::Pin<&mut impl std::future::Future<Output = rpc::Ended>>,
+    process: &mut ModuleProcess,
+) {
+    if drain.is_zero() || !generation.begin_drain(std::time::Instant::now(), drain) {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + drain;
+    let idle = async {
+        while generation.in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        () = idle => {}
+        () = tokio::time::sleep_until(deadline) => {}
+        _ = serve.as_mut() => {}
+        _ = process.exited() => {}
     }
 }
 
@@ -1223,6 +1274,58 @@ sys.exit(0)
             rustix::process::Pid::from_raw(escaped).unwrap(),
             rustix::process::Signal::Kill,
         );
+    }
+
+    /// `drain_and_stop` drains a serving run before stopping it (SPEC §4):
+    /// the request in flight holds the stop, new ones are refused as
+    /// `Draining` meanwhile, the module keeps running — and once the request
+    /// finishes, the stop goes on at once rather than waiting out the drain
+    /// budget (review of SUP-4, round 2).
+    #[tokio::test]
+    async fn a_drain_lets_the_request_in_flight_finish_then_stops() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let (pid, _) = starts(f.data.path())[0].clone();
+        let generation = current.get();
+        let in_flight = generation.admit_request("r-1".into()).unwrap();
+        let stopping = tokio::spawn(handle.drain_and_stop(Duration::from_secs(10)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while generation.state() != crate::drain::DrainState::Draining {
+            assert!(std::time::Instant::now() < deadline, "never drained");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            generation.admit_request("r-2".into()).unwrap_err(),
+            crate::drain::RequestRefused::Draining
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !stopping.is_finished(),
+            "stopped with a request still in flight"
+        );
+        assert!(
+            rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap())
+                .is_ok(),
+            "the module was stopped while draining"
+        );
+        drop(in_flight);
+        let stopped = tokio::time::timeout(Duration::from_secs(3), stopping)
+            .await
+            .expect("the stop waited out the drain budget after the request finished")
+            .unwrap();
+        assert_eq!(stopped, Ok(()));
+        assert!(gone(pid).await);
     }
 
     /// A `stop` whose caller gives up — its future dropped at a deadline —

@@ -513,6 +513,10 @@ pub struct ProcessHost {
     pub callback_dir: Arc<agent24_os_proto::endpoint::CallbackDir>,
     pub trampoline: agent24_os_proto::launch::Trampoline,
     pub timings: agent24_os_proto::supervisor::Timings,
+    /// The daemon's shutdown: once it has begun, no further package is
+    /// started — a SIGTERM during startup must not keep starting modules the
+    /// shutdown then has to stop (review of SUP-4, round 2).
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// A module started under a supervisor. The daemon stops each before it exits
@@ -521,9 +525,6 @@ pub struct ProcessHost {
 pub struct Supervised {
     pub name: String,
     pub handle: agent24_os_proto::supervisor::SupervisorHandle,
-    /// The module's slot, for a shutdown to drain its current run before
-    /// stopping it (SPEC §4: DRAINING, then REVOKING).
-    pub current: Arc<agent24_os_proto::drain::Current>,
 }
 
 /// Mount everything in `catalogue` under `root`, returning the combined router
@@ -991,9 +992,17 @@ async fn mount_package(
             );
         }
     };
+    if host.shutdown.is_cancelled() {
+        return degraded(app, "the daemon is shutting down".to_owned());
+    }
     let data_dir = manifest.data_dir_under(root);
     if let Err(why) = prepare_dir(&data_dir).await {
         return degraded(app, why);
+    }
+    // Checked again after the one await: a shutdown that began while the
+    // directory was prepared starts nothing either.
+    if host.shutdown.is_cancelled() {
+        return degraded(app, "the daemon is shutting down".to_owned());
     }
     let resources = check_resources(inventory, manifest.requires_models());
     let current =
@@ -1022,15 +1031,11 @@ async fn mount_package(
         "domain OS {name:?} started from {} and proxied at {namespace}",
         package.dir.display()
     );
-    let app = agent24_os_proto::proxy::mount(app, &namespace, current.clone());
+    let app = agent24_os_proto::proxy::mount(app, &namespace, current);
     (
         app,
         report(MountOutcome::Mounted, resources),
-        Some(Supervised {
-            name,
-            handle,
-            current,
-        }),
+        Some(Supervised { name, handle }),
     )
 }
 
@@ -1401,6 +1406,7 @@ while f.readline():
                 stop_grace: std::time::Duration::from_secs(1),
                 ..agent24_os_proto::supervisor::Timings::default()
             },
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -1462,6 +1468,40 @@ while f.readline():
         for s in supervisors {
             s.handle.stop().await.expect("a clean stop");
         }
+    }
+
+    /// Once the daemon's shutdown has begun — a SIGTERM during startup — no
+    /// further package is started: each reports why, and nothing is left for
+    /// the shutdown to stop (review of SUP-4, round 2).
+    #[tokio::test]
+    async fn no_package_is_started_once_shutdown_has_begun() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "remote");
+        let host = test_host(tmp.path());
+        host.shutdown.cancel();
+        let hub = crate::events::EventsHub::default();
+        let (_, reports, _, supervisors) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+        assert!(
+            supervisors.is_empty(),
+            "a package was started during the shutdown"
+        );
     }
 
     /// A disabled package is never started — the same rule as a compiled-in

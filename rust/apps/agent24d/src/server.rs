@@ -817,6 +817,7 @@ pub async fn serve(
     // being built, and none in this build declares one.
     let needs_models = catalogue.iter().any(|e| {
         matches!(&e.build, crate::domain::Build::Package(p) if !p.manifest.requires_models().is_empty())
+            && os_config.as_ref().is_ok_and(|c| c.is_enabled(&e.name))
     });
     let inventory = if needs_models {
         ModelCatalog::probe(&state.router, &cancel).await
@@ -839,23 +840,23 @@ pub async fn serve(
     // synchronously: a SIGTERM arriving while packages start must run this
     // shutdown, which stops them, not the default action, which ends the daemon
     // and leaves them running (review of SUP-4, round 1).
+    // A registration that fails is fatal HERE, before any module runs: a
+    // daemon that cannot hear SIGTERM cannot stop its modules when asked to
+    // (review of SUP-4, round 2).
     #[cfg(unix)]
-    let signals = {
+    let (mut sigterm, mut sigint) = {
         use tokio::signal::unix::{SignalKind, signal};
         (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
         )
     };
     let signal_cancel = cancel.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
-        {
-            let (term, int) = signals;
-            tokio::select! {
-                () = until_signal(term, "SIGTERM") => {},
-                () = until_signal(int, "SIGINT") => {},
-            }
+        tokio::select! {
+            _ = sigterm.recv() => {},
+            _ = sigint.recv() => {},
         }
         #[cfg(not(unix))]
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -865,8 +866,20 @@ pub async fn serve(
         tracing::info!("shutdown signal received");
         signal_cancel.cancel();
     });
+    // The one shutdown deadline, fixed when shutdown begins — also when that is
+    // during startup, before the server exists: everything that waits on the
+    // shutdown waits until this instant, not SHUTDOWN_GRACE after it notices.
+    let shutdown_at: Arc<std::sync::OnceLock<tokio::time::Instant>> =
+        Arc::new(std::sync::OnceLock::new());
+    {
+        let (cancel, shutdown_at) = (cancel.clone(), shutdown_at.clone());
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            let _ = shutdown_at.set(tokio::time::Instant::now() + SHUTDOWN_GRACE);
+        });
+    }
 
-    let host = process_host(if ephemeral { &os_root } else { &state_dir });
+    let host = process_host(if ephemeral { &os_root } else { &state_dir }, &cancel);
     if let Err(why) = &host {
         tracing::error!("out-of-process domain OS modules cannot be started: {why}");
     }
@@ -999,9 +1012,11 @@ pub async fn serve(
     // reads EOF on its callback connection as the end of its run (D1), so one
     // that outlives this process exits on its own.
     let stop_cancel = cancel.clone();
+    let stop_deadline = shutdown_at.clone();
     let stopping = tokio::spawn(async move {
         stop_cancel.cancelled().await;
-        if tokio::time::timeout(SHUTDOWN_GRACE, stop_supervisors(supervisors))
+        let deadline = deadline_of(&stop_deadline);
+        if tokio::time::timeout_at(deadline, stop_supervisors(supervisors))
             .await
             .is_err()
         {
@@ -1019,7 +1034,7 @@ pub async fn serve(
         result = server => result,
         () = async {
             cancel.cancelled().await;
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            tokio::time::sleep_until(deadline_of(&shutdown_at)).await;
         } => {
             tracing::warn!("graceful shutdown exceeded {SHUTDOWN_GRACE:?}; forcing exit");
             Ok(())
@@ -1039,7 +1054,10 @@ pub async fn serve(
 /// What out-of-process modules are started with: the callback directory under
 /// `root` (stale ones cleared first, FU-56), this binary as the trampoline, and
 /// the daemon's stop grace.
-fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, String> {
+fn process_host(
+    root: &std::path::Path,
+    shutdown: &CancellationToken,
+) -> Result<crate::domain::ProcessHost, String> {
     for gone in agent24_os_proto::endpoint::remove_stale(root) {
         tracing::info!(
             "removed the callback directory of a daemon that is gone: {}",
@@ -1074,49 +1092,32 @@ fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, St
             stop_grace: MODULE_STOP_GRACE,
             ..agent24_os_proto::supervisor::Timings::default()
         },
+        shutdown: shutdown.clone(),
     })
 }
 
-/// Wait for a registered signal. A registration that failed never resolves:
-/// resolving would be indistinguishable from a real signal and shut the daemon
-/// down at startup.
-#[cfg(unix)]
-async fn until_signal(registered: std::io::Result<tokio::signal::unix::Signal>, what: &str) {
-    match registered {
-        Ok(mut s) => {
-            s.recv().await;
-        }
-        Err(err) => {
-            tracing::error!("{what} handler failed: {err}");
-            std::future::pending::<()>().await;
-        }
-    }
+/// The shutdown deadline, once shutdown has begun (see `shutdown_at` in
+/// `serve`); a caller that finds it unset — it cannot be, after the cancel it
+/// waited for, but the order of two tasks is not proved here — counts from now.
+fn deadline_of(at: &std::sync::OnceLock<tokio::time::Instant>) -> tokio::time::Instant {
+    *at.get_or_init(|| tokio::time::Instant::now() + SHUTDOWN_GRACE)
 }
 
-/// Stop every supervised module, the way SPEC §4 stops one: DRAINING first —
-/// new proxied requests refused, the ones in flight left to finish, for up to
-/// [`MODULE_DRAIN`] — then REVOKING and the process stop, concurrently for all.
-/// Logs any stop that was not clean. The caller bounds the whole of it.
+/// Stop every supervised module, the way SPEC §4 stops one, concurrently for
+/// all: DRAINING first — new proxied requests refused, the ones in flight left
+/// to finish, for up to [`MODULE_DRAIN`] — then REVOKING and the process stop.
+/// Each supervisor does both itself (`drain_and_stop`), so a module that was
+/// starting is stopped without ever serving and none is restarted into a
+/// generation nobody drained (review of SUP-4, round 2). Logs any stop that
+/// was not clean. The caller bounds the whole of it.
 ///
 /// Draining first is what keeps a shutdown from answering a request a module
 /// is in the middle of `request_abandoned` — and a client that then retries a
 /// write the module did complete (review of SUP-4, round 1).
 async fn stop_supervisors(supervisors: Vec<crate::domain::Supervised>) {
-    let now = std::time::Instant::now();
-    for s in &supervisors {
-        // `false` for a run not serving (starting, or already stopped): there
-        // is nothing to drain, and the stop below handles it.
-        let _ = s.current.get().begin_drain(now, MODULE_DRAIN);
-    }
-    let drained_by = tokio::time::Instant::now() + MODULE_DRAIN;
-    while supervisors.iter().any(|s| s.current.get().in_flight() > 0)
-        && tokio::time::Instant::now() < drained_by
-    {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     let mut stops = tokio::task::JoinSet::new();
     for s in supervisors {
-        stops.spawn(async move { (s.name, s.handle.stop().await) });
+        stops.spawn(async move { (s.name, s.handle.drain_and_stop(MODULE_DRAIN).await) });
     }
     while let Some(done) = stops.join_next().await {
         match done {
