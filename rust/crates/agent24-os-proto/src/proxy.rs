@@ -589,12 +589,12 @@ impl IdleConnections {
 
 /// Send `request` to `generation`'s process: on an idle connection to it if
 /// there is one, else on a new one. A reused connection the module closed in
-/// the meantime, if hyper sees the close before it writes the request, hands
-/// the request back unsent, and it goes once more on a new connection — so a
-/// module's keep-alive timeout seen in time is not a client's 502. One that
-/// lands after the request was written cannot be told from a module that
-/// failed while handling it, and is answered 502: the request may have been
-/// acted on, so it is not sent again (FU-64).
+/// the meantime, if hyper sees the close before it takes the request to
+/// send, hands the request back unsent, and it goes once more on a new
+/// connection — so a module's keep-alive timeout seen in time is not a
+/// client's 502. One that lands after hyper took it cannot be told from a
+/// module that failed while handling it, and is answered 502: the request
+/// may have been sent and acted on, so it is not sent again (FU-64).
 /// Returns the response head and the connection that carries its body.
 async fn exchange(
     idle: &IdleConnections,
@@ -2637,12 +2637,12 @@ mod tests {
     /// passes over a connection seen closed, and one handed over closed
     /// before its request was written is taken back and sent again on a new
     /// connection. Either suffices; with both gone, the requests after the
-    /// first are answered 502. The module answers, keeps the connection open
-    /// while the proxy puts it back in its pool, then closes it and says so;
-    /// only then does the next request go — on loopback the FIN is readable
-    /// by then. A close landing in the same instant a request is written can
-    /// still be answered 502: once written, a request may have been acted
-    /// on, so it is not sent again (FU-64).
+    /// first are answered 502. Each step waits on the proxy's own state, not
+    /// on time: the connection is in the pool, the module closes it, hyper
+    /// has seen the close — then the next request goes. A close landing as
+    /// hyper takes a request can still be answered 502: once taken, a
+    /// request may have been sent and acted on, so it is not sent again
+    /// (FU-64).
     #[tokio::test]
     async fn a_module_closing_an_idle_connection_costs_no_502() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2674,17 +2674,40 @@ mod tests {
                 }
             });
         }
-        let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
+        let state = state_for(NS, running_module(upstream));
+        let idle = state.idle.clone();
+        let proxy = serve(Router::new().fallback(proxy).with_state(state)).await;
         for i in 0..20 {
             let got = call(proxy, Method::GET, &format!("{NS}/{i}"), &[], "").await;
             assert_eq!(got.status, StatusCode::OK, "request {i}: {}", got.body);
-            // Long enough for the proxy to have put the connection back.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // `call` returns as the response ends; the proxy pools the
+            // connection just after.
+            for _ in 0..500 {
+                if idle.lock().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert_eq!(
+                idle.lock().len(),
+                1,
+                "request {i}: its connection was not pooled"
+            );
             close.notify_one();
             tokio::time::timeout(Duration::from_secs(5), closed.recv())
                 .await
                 .expect("the module never closed the connection")
                 .unwrap();
+            for _ in 0..500 {
+                if idle.lock().iter().all(|c| c.sender.is_closed()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert!(
+                idle.lock().iter().all(|c| c.sender.is_closed()),
+                "request {i}: the proxy never saw the close"
+            );
         }
     }
 
