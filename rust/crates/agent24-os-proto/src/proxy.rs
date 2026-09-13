@@ -464,9 +464,18 @@ impl Drop for UpstreamConnection {
 /// another request — its response fully read (SUP-3b). A connection that
 /// carried a body is never reused: hyper can only say the body left this
 /// process, not that the module read it, and a module that answered without
-/// reading would take the next request's bytes after that body's — letting a
-/// client's body smuggle a request of its own, kernel headers and all, past
-/// the proxy's filter (review of SUP-3b, round 3). Every way a request ends
+/// reading would take the NEXT request the proxy sent on that connection
+/// after that body's bytes — letting a client's body smuggle a request of its
+/// own, kernel headers and all, past the proxy's filter (review of SUP-3b,
+/// round 3). That closes the proxy's own reuse as a vector, and only that
+/// one: a NON-compliant module that answers without reading the body and
+/// then parses what is left of it as a pipelined request can still find a
+/// forged request in it on the same connection, with no second request from
+/// the proxy at all. No HTTP/1.1 proxy can prevent a module's own parser
+/// doing that (a compliant hyper/axum module closes a connection whose body
+/// it did not consume, and does not pipeline); a forged `x-a24-*` token in it
+/// is still one the kernel never minted, and moving to Unix sockets (FU-60)
+/// would not change it (FU-62). Every way a request ends
 /// other than a clean reuse drops the connection, which aborts the driver:
 /// nothing of a request outlives it inside the kernel (FU-47). An idle
 /// connection's driver also ends the moment its generation is revoked, so it
@@ -2615,6 +2624,45 @@ mod tests {
             .unwrap();
         });
         (addr, peers)
+    }
+
+    /// FU-63: a module whose keep-alive ends after every response — it closes
+    /// without saying `Connection: close` — costs the client nothing. Two
+    /// things see to it: `IdleConnections::take` passes over a connection
+    /// already seen closed, and a request that finds its reused connection
+    /// closed before it was sent is taken back and sent on a new one. Either
+    /// suffices here: with both gone, requests are answered 502; with only
+    /// the take-back left, none is. The take-back alone matters in the race
+    /// the filter cannot see — a close landing between `take` and the send —
+    /// which this does not pin by itself (FU-64).
+    #[tokio::test]
+    async fn a_module_closing_after_every_response_costs_no_502() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                    // Closed with no `Connection: close`: the proxy keeps it.
+                });
+            }
+        });
+        let proxy = serve(mount(Router::new(), NS, running_module(upstream))).await;
+        for i in 0..200 {
+            let got = call(proxy, Method::GET, &format!("{NS}/{i}"), &[], "").await;
+            assert_eq!(got.status, StatusCode::OK, "request {i}: {}", got.body);
+        }
     }
 
     /// Round 2 of the SUP-3b review: one connection per request made a stream
