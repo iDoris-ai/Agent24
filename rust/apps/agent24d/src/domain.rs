@@ -535,8 +535,10 @@ struct Registry {
     running: Option<Vec<Supervised>>,
     /// The stops `os disable` began and the shutdown has not taken yet.
     disabling: Vec<tokio::task::JoinHandle<()>>,
-    /// Every module `os disable` has stopped since this daemon started.
-    disabled: std::collections::HashSet<String>,
+    /// Every module `os disable` has asked to stop since this daemon started,
+    /// with its proxy slot — so a later disable can see whether it refuses
+    /// requests yet.
+    disabled: std::collections::HashMap<String, Arc<agent24_os_proto::drain::Current>>,
 }
 
 impl Default for Registry {
@@ -544,7 +546,7 @@ impl Default for Registry {
         Self {
             running: Some(Vec::new()),
             disabling: Vec::new(),
-            disabled: std::collections::HashSet::new(),
+            disabled: std::collections::HashMap::new(),
         }
     }
 }
@@ -635,7 +637,7 @@ impl Supervisors {
             handle,
             current,
         } = list.swap_remove(i);
-        registry.disabled.insert(name.clone());
+        registry.disabled.insert(name.clone(), current.clone());
         let stop = handle.drain_and_stop_unless(drain, cut_off);
         let task = tokio::spawn(async move {
             match stop.await {
@@ -652,10 +654,17 @@ impl Supervisors {
         Some(current)
     }
 
-    /// Whether `os disable` has stopped `name` since this daemon started.
+    /// Whether `os disable` has asked to stop `name` since this daemon
+    /// started — stopped, or still stopping.
     #[must_use]
     pub fn is_disabled(&self, name: &str) -> bool {
-        self.lock().disabled.contains(name)
+        self.lock().disabled.contains_key(name)
+    }
+
+    /// The proxy slot of a module an earlier `os disable` asked to stop.
+    #[must_use]
+    pub fn disabled_slot(&self, name: &str) -> Option<Arc<agent24_os_proto::drain::Current>> {
+        self.lock().disabled.get(name).cloned()
     }
 
     /// Close the list and take everything in it — and the stops disables

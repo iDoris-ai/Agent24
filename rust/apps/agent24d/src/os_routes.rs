@@ -242,45 +242,119 @@ const ADMISSION_CLOSED_WITHIN: std::time::Duration = std::time::Duration::from_s
 /// What a disable did to the running module (SUP-5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HotStop {
-    /// Its supervisor is draining and stopping it, and it refuses new
+    /// Its supervisor is now draining and stopping it, and it refuses new
     /// requests.
     Stopping,
-    /// Its supervisor was asked to, but the module still admitted requests
-    /// when the wait ran out.
+    /// It still admitted requests when the wait ran out — whether this
+    /// disable or an earlier one asked for the stop.
     Pending,
-    /// An earlier disable already stopped it.
-    AlreadyStopped,
+    /// An earlier disable asked for the stop, and it refuses requests.
+    Already,
     /// Nothing running to stop: a compiled-in module, a package not started
     /// at mount, or a daemon already shutting down.
     NotRunning,
 }
 
-/// Stop a running out-of-process module now (SUP-5): its supervisor drains
-/// and stops it in the background, and the shutdown — if it begins
-/// meanwhile — waits for that stop, cutting it off at `cut_off`. Waits up to
-/// `within` for the module's generation to refuse new requests, so a request
-/// sent after the disable answers is not admitted.
+/// Hand a running out-of-process module's stop to its supervisor (SUP-5):
+/// it drains and stops in the background, and the shutdown — if it begins
+/// meanwhile — waits for that stop, cutting it off at `cut_off`. Synchronous:
+/// the stop is asked for before this returns. The module's proxy slot, and
+/// whether THIS call asked (`true`) or an earlier disable did; `None` if
+/// there is nothing to stop.
+fn hand_off(
+    supervisors: Option<&crate::domain::Supervisors>,
+    cut_off: impl std::future::Future<Output = ()> + Send + 'static,
+    name: &str,
+) -> Option<(bool, std::sync::Arc<agent24_os_proto::drain::Current>)> {
+    let supervisors = supervisors?;
+    match supervisors.disable(name, DISABLE_DRAIN, cut_off) {
+        Some(current) => Some((true, current)),
+        None => supervisors.disabled_slot(name).map(|c| (false, c)),
+    }
+}
+
+/// Wait up to `within` for a handed-off module to refuse new requests, so a
+/// request sent after the disable answers is not admitted — also on a
+/// repeated disable, whose predecessor may have timed out (review of SUP-5,
+/// round 3).
+async fn settle(
+    handed: Option<(bool, std::sync::Arc<agent24_os_proto::drain::Current>)>,
+    within: std::time::Duration,
+) -> HotStop {
+    match handed {
+        None => HotStop::NotRunning,
+        Some((asked, current)) => match (admission_closed(&current, within).await, asked) {
+            (false, _) => HotStop::Pending,
+            (true, true) => HotStop::Stopping,
+            (true, false) => HotStop::Already,
+        },
+    }
+}
+
+#[cfg(test)]
 async fn stop_now(
     supervisors: Option<&crate::domain::Supervisors>,
     cut_off: impl std::future::Future<Output = ()> + Send + 'static,
     name: &str,
     within: std::time::Duration,
 ) -> HotStop {
-    let Some(supervisors) = supervisors else {
-        return HotStop::NotRunning;
+    settle(hand_off(supervisors, cut_off, name), within).await
+}
+
+/// Write `enabled` for `name` to os.json and, for a disable, hand the
+/// running module's stop off. `Err` only if the change was not published;
+/// published with an error — a rename that landed, then a failed directory
+/// fsync — still hands the stop off, so the running state matches what the
+/// file now says, and returns that error alongside (review of SUP-5,
+/// round 3).
+async fn apply(
+    state: &AppState,
+    path: std::path::PathBuf,
+    name: &str,
+    enabled: bool,
+) -> Result<
+    (
+        Option<(bool, std::sync::Arc<agent24_os_proto::drain::Current>)>,
+        Option<String>,
+    ),
+    String,
+> {
+    // Off the async workers: the file lock waits for any other writer, for
+    // as long as that takes (review of SUP-5, round 2).
+    let written = tokio::task::spawn_blocking({
+        let (path, name) = (path.clone(), name.to_owned());
+        move || crate::os_config::OsConfig::set_enabled(&path, &name, enabled)
+    })
+    .await;
+    let failed = match written {
+        Ok(Ok(_)) => None,
+        Ok(Err(why)) => Some(why),
+        Err(e) => Some(format!("the config write failed: {e}")),
     };
-    let Some(current) = supervisors.disable(name, DISABLE_DRAIN, cut_off) else {
-        return if supervisors.is_disabled(name) {
-            HotStop::AlreadyStopped
-        } else {
-            HotStop::NotRunning
-        };
-    };
-    if admission_closed(&current, within).await {
-        HotStop::Stopping
-    } else {
-        HotStop::Pending
+    if let Some(why) = &failed {
+        let published = tokio::task::spawn_blocking({
+            let name = name.to_owned();
+            move || {
+                crate::os_config::OsConfig::load(&path)
+                    .is_ok_and(|c| c.is_enabled(&name) == enabled)
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !published {
+            return Err(why.clone());
+        }
     }
+    let handed = if enabled {
+        None
+    } else {
+        hand_off(
+            state.supervisors.as_deref(),
+            state.shutdown.modules_cut_off(),
+            name,
+        )
+    };
+    Ok((handed, failed))
 }
 
 /// Wait, for up to `within`, until the generation `current` routes to no
@@ -333,9 +407,6 @@ pub async fn patch_os(
             );
         }
     };
-    // Held to the end: the write, the hot disable and the answer are one step
-    // against another toggle.
-    let _control = state.os_control.lock().await;
     let path = match crate::os_config::config_path() {
         Some(p) => p,
         None => {
@@ -346,15 +417,22 @@ pub async fn patch_os(
             );
         }
     };
-    // Off the async workers: the file lock waits for any other writer, for
-    // as long as that takes (review of SUP-5, round 2).
-    let written = tokio::task::spawn_blocking({
-        let (path, name) = (path.clone(), name.clone());
-        move || crate::os_config::OsConfig::set_enabled(&path, &name, update.enabled)
-    })
-    .await;
-    match written {
-        Ok(Ok(_)) => {}
+    // The write and the hand-off of a running module's stop are one step
+    // against another toggle, done in a task of the daemon's own: a client
+    // that goes away half-way cannot leave os.json disabling a module that
+    // keeps serving. The lock is released before the wait for the module to
+    // refuse requests, so a slow module does not hold up other toggles
+    // (review of SUP-5, round 3).
+    let control = state.os_control.clone().lock_owned().await;
+    let step = tokio::spawn({
+        let (state, name) = (state.clone(), name.clone());
+        async move {
+            let _control = control;
+            apply(&state, path, &name, update.enabled).await
+        }
+    });
+    let (handed, write_error) = match step.await {
+        Ok(Ok(applied)) => applied,
         Ok(Err(why)) => {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &why);
         }
@@ -362,35 +440,36 @@ pub async fn patch_os(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                &format!("the config write failed: {e}"),
+                &format!("the config change failed: {e}"),
             );
         }
-    }
+    };
     // A disable of a running out-of-process module applies now; anything else
     // at the next start.
-    let hot = if update.enabled {
-        HotStop::NotRunning
-    } else {
-        stop_now(
-            state.supervisors.as_deref(),
-            state.shutdown.modules_cut_off(),
-            &name,
-            ADMISSION_CLOSED_WITHIN,
-        )
-        .await
-    };
+    let hot = settle(handed, ADMISSION_CLOSED_WITHIN).await;
     let effect = match hot {
         HotStop::Stopping => "stopping it now",
-        HotStop::Pending => "asked its supervisor to stop it; not yet refusing requests",
-        HotStop::AlreadyStopped => "already stopped by an earlier disable",
+        HotStop::Pending => "its supervisor was asked to stop it; not yet refusing requests",
+        HotStop::Already => "an earlier disable already stopped it or is stopping it",
         HotStop::NotRunning => "takes effect on restart",
     };
     tracing::info!(
         "domain OS {name:?} set enabled={} in os.json ({effect})",
         update.enabled
     );
+    if let Some(why) = write_error {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &format!(
+                "os.json now says enabled={} for {name:?} ({effect}), but writing it reported: \
+                 {why}",
+                update.enabled
+            ),
+        );
+    }
     // Not a success: a request sent after this answer could still be
-    // admitted (review of SUP-5, round 2).
+    // admitted (review of SUP-5, rounds 2 and 3).
     if hot == HotStop::Pending {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -417,8 +496,9 @@ mod tests {
     /// What a disable reports: `Stopping` once the module refuses new
     /// requests; `Pending` if it still admitted them when the wait ran out —
     /// here at once, on this single-threaded runtime, before its supervisor
-    /// has run at all — and `AlreadyStopped` for a second disable; nothing
-    /// to stop without supervisors (review of SUP-5, round 2).
+    /// has run at all — and again `Pending` for a retry while that is still
+    /// so, `Already` once it refuses them; nothing to stop without
+    /// supervisors (review of SUP-5, rounds 2 and 3).
     #[tokio::test]
     async fn a_disable_says_whether_the_module_refuses_requests_yet() {
         let never = std::future::pending::<()>;
@@ -442,7 +522,18 @@ mod tests {
         );
         assert_eq!(
             stop_now(Some(&host.supervisors), never(), "remote", zero).await,
-            HotStop::AlreadyStopped
+            HotStop::Pending,
+            "a retry answered while the module still admits requests"
+        );
+        assert_eq!(
+            stop_now(
+                Some(&host.supervisors),
+                never(),
+                "remote",
+                std::time::Duration::from_secs(5)
+            )
+            .await,
+            HotStop::Already
         );
         for stop in host.supervisors.close().disabling {
             stop.await.unwrap();

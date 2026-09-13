@@ -178,10 +178,12 @@ impl Shutdown {
     /// killed: the budget any module gets once the shutdown begins — its
     /// drain and its stop grace — so a disable's longer drain neither holds
     /// the shutdown past its bound nor gets less than a module the shutdown
-    /// stops itself (SUP-5). An absolute instant, fixed by the shutdown's
-    /// start: measured from whenever this was first polled, a late poll put
-    /// it past the shutdown's own deadline, which then stopped waiting for it
-    /// (review of SUP-5, round 2).
+    /// stops itself (SUP-5). An absolute instant, a fixed margin before the
+    /// shutdown's stored [`Shutdown::deadline`] — which `request` fixes as
+    /// it begins, and every other path at its first look: measured from
+    /// whenever this was first polled, a late poll put it past that
+    /// deadline, which then stopped waiting for it (review of SUP-5, rounds
+    /// 2 and 3).
     pub fn modules_cut_off(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let shutdown = self.clone();
         async move {
@@ -1319,8 +1321,8 @@ async fn stop_supervisors(closed: crate::domain::Closed) {
         }
     }
     // Stops `os disable` began: each ends by `Shutdown::modules_cut_off` at
-    // the latest, with a SIGKILL sent to its module by then — sent, not
-    // confirmed (SUP-5).
+    // the latest, with a SIGKILL of its module attempted by then — attempted,
+    // not confirmed (SUP-5).
     for stop in closed.disabling {
         let _ = stop.await;
     }

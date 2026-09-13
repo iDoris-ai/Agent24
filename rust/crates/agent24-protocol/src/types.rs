@@ -39,10 +39,12 @@ pub struct Model {
 /// One domain OS, as `agent24 os list` sees it.
 ///
 /// It carries TWO states on purpose. `enabled` is what the config says now;
-/// `state` is what the running daemon actually did at startup. They diverge the
-/// moment someone toggles a module, because routes are built once at startup —
-/// and hiding that divergence would leave a user staring at a module that says
-/// "enabled" while every request 503s.
+/// `state` is what the running daemon is actually doing with the module. They
+/// diverge the moment someone toggles a module that needs a restart to follow
+/// (any enable; a disable of a compiled-in module) — routes are built once at
+/// startup, and hiding that divergence would leave a user staring at a module
+/// that says "enabled" while every request 503s. A disable of a running
+/// out-of-process module is applied at once (SUP-5), so its two agree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DomainOsView {
     pub name: String,
@@ -54,8 +56,9 @@ pub struct DomainOsView {
     pub version: String,
     /// What `os.json` says right now.
     pub enabled: bool,
-    /// What the RUNNING daemon did with it. Open enum:
-    /// `mounted` | `disabled` | `degraded` | `refused`.
+    /// What the RUNNING daemon is doing with it: what it did at startup, or —
+    /// for a running module `os disable` stopped since — `disabled`. Open
+    /// enum: `mounted` | `disabled` | `degraded` | `refused`.
     pub state: String,
     /// Why, when there is a reason worth acting on — a degradation or a refusal
     /// — or, for a `mounted` out-of-process module, a passing state worth
@@ -81,10 +84,12 @@ pub struct DomainOsView {
     pub missing_models: Vec<String>,
     /// Open enum: `ok` | `missing` | `unknown` | `not_checked`.
     pub resources: String,
-    /// The registry has CHANGED since the daemon mounted: this module will only
-    /// pick the change up on the next start. Deliberately not "it is enabled but
-    /// not running" — a module that is enabled and merely unhealthy has no pending
-    /// change, and `detail` is what the user should act on there.
+    /// The config says something the running daemon has not applied: this
+    /// module will only pick the change up on the next start. A disable that
+    /// stopped the running module is applied, so it needs none (SUP-5).
+    /// Deliberately not "it is enabled but not running" — a module that is
+    /// enabled and merely unhealthy has no pending change, and `detail` is what
+    /// the user should act on there.
     pub restart_required: bool,
 }
 

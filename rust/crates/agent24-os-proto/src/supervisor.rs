@@ -190,9 +190,9 @@ impl SupervisorHandle {
 
     /// [`SupervisorHandle::drain_and_stop`], unless `abandon` resolves first:
     /// then the loop is aborted AND waited for until it is gone — its module
-    /// process dropped, which revokes the generation and sends its group a
-    /// SIGKILL — before this returns [`SupervisorError::Killed`]. The kill is
-    /// sent, not confirmed (as for `Killed` everywhere). For an owner whose
+    /// process dropped, which revokes the generation and attempts a SIGKILL
+    /// of its group — before this returns [`SupervisorError::Killed`]. The
+    /// kill is attempted, not confirmed (as for `Killed` everywhere). For an owner whose
     /// own deadline must find the kill sent, not merely scheduled: dropping a
     /// stop future only aborts the loop, which is then dropped whenever the
     /// runtime next gets to it (SUP-5, the shutdown cutting short a hot
@@ -277,7 +277,7 @@ impl std::fmt::Display for SupervisorError {
             Self::Panicked => f.write_str("the supervisor loop panicked"),
             Self::Killed => f.write_str(
                 "the supervisor loop was cancelled before a clean stop; a module process not \
-                 yet confirmed gone, if any, was SIGKILLed and the slot kept held",
+                 yet confirmed gone, if any, had a SIGKILL attempted and the slot kept held",
             ),
         }
     }
