@@ -601,8 +601,10 @@ async fn run_once(
     };
     // Raced against a stop: the package check before the spawn walks a whole
     // tree and can be slow. Dropping `spawn` there is safe — its only await
-    // comes before the child exists. (The blocking walk itself runs on to its
-    // end on its own thread, bounded by the entry cap.)
+    // comes before the child exists, and what follows it is a plain `fn`
+    // (`launch::start`), so no later await can be added (FU-58). (The
+    // blocking walk itself runs on to its end on its own thread, bounded by
+    // the entry cap.)
     let spawned = tokio::select! {
         biased;
         () = stop_requested(stop) => return Ok(Run::StopRequested),

@@ -464,9 +464,19 @@ impl Drop for UpstreamConnection {
 /// another request — its response fully read (SUP-3b). A connection that
 /// carried a body is never reused: hyper can only say the body left this
 /// process, not that the module read it, and a module that answered without
-/// reading would take the next request's bytes after that body's — letting a
-/// client's body smuggle a request of its own, kernel headers and all, past
-/// the proxy's filter (review of SUP-3b, round 3). Every way a request ends
+/// reading would take the NEXT request the proxy sent on that connection
+/// after that body's bytes — letting a client's body smuggle a request of its
+/// own, kernel headers and all, past the proxy's filter (review of SUP-3b,
+/// round 3). That closes the proxy's own reuse as a vector, and only that
+/// one: a NON-compliant module that answers without reading the body and
+/// then parses what is left of it as a pipelined request can still find a
+/// forged request in it on the same connection, with no second request from
+/// the proxy at all. No HTTP/1.1 proxy can prevent a module's own parser
+/// doing that (a compliant server — hyper, under axum — drains a body it
+/// did not consume or closes the connection when it cannot, and never
+/// reads framed body bytes as a request head); a forged `x-a24-*` token in
+/// it is still one the kernel never minted, and moving to Unix sockets
+/// (FU-60) would not change it (FU-62). Every way a request ends
 /// other than a clean reuse drops the connection, which aborts the driver:
 /// nothing of a request outlives it inside the kernel (FU-47). An idle
 /// connection's driver also ends the moment its generation is revoked, so it
@@ -579,8 +589,12 @@ impl IdleConnections {
 
 /// Send `request` to `generation`'s process: on an idle connection to it if
 /// there is one, else on a new one. A reused connection the module closed in
-/// the meantime hands the request back unsent, and it goes once more on a new
-/// connection — so a module's keep-alive timeout is never a client's 502.
+/// the meantime, if hyper sees the close before it takes the request to
+/// send, hands the request back unsent, and it goes once more on a new
+/// connection — so a module's keep-alive timeout seen in time is not a
+/// client's 502. One that lands after hyper took it cannot be told from a
+/// module that failed while handling it, and is answered 502: the request
+/// may have been sent and acted on, so it is not sent again (FU-64).
 /// Returns the response head and the connection that carries its body.
 async fn exchange(
     idle: &IdleConnections,
@@ -2615,6 +2629,86 @@ mod tests {
             .unwrap();
         });
         (addr, peers)
+    }
+
+    /// FU-63: a module whose keep-alive ends between requests — it closes
+    /// an idle connection without having said `Connection: close` — costs
+    /// the client no 502 once the close is visible: `IdleConnections::take`
+    /// passes over a connection seen closed, and one handed over closed
+    /// before its request was written is taken back and sent again on a new
+    /// connection. Either suffices; with both gone, the requests after the
+    /// first are answered 502. Each step waits on the proxy's own state, not
+    /// on time: the connection is in the pool, the module closes it, hyper
+    /// has seen the close — then the next request goes. A close landing as
+    /// hyper takes a request can still be answered 502: once taken, a
+    /// request may have been sent and acted on, so it is not sent again
+    /// (FU-64).
+    #[tokio::test]
+    async fn a_module_closing_an_idle_connection_costs_no_502() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let close = Arc::new(tokio::sync::Notify::new());
+        let (closed_tx, mut closed) = tokio::sync::mpsc::unbounded_channel::<()>();
+        {
+            let close = close.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let (close, closed_tx) = (close.clone(), closed_tx.clone());
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await;
+                        close.notified().await;
+                        drop(socket);
+                        let _ = closed_tx.send(());
+                    });
+                }
+            });
+        }
+        let state = state_for(NS, running_module(upstream));
+        let idle = state.idle.clone();
+        let proxy = serve(Router::new().fallback(proxy).with_state(state)).await;
+        for i in 0..20 {
+            let got = call(proxy, Method::GET, &format!("{NS}/{i}"), &[], "").await;
+            assert_eq!(got.status, StatusCode::OK, "request {i}: {}", got.body);
+            // `call` returns as the response ends; the proxy pools the
+            // connection just after.
+            for _ in 0..500 {
+                if idle.lock().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert_eq!(
+                idle.lock().len(),
+                1,
+                "request {i}: its connection was not pooled"
+            );
+            close.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), closed.recv())
+                .await
+                .expect("the module never closed the connection")
+                .unwrap();
+            for _ in 0..500 {
+                if idle.lock().iter().all(|c| c.sender.is_closed()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert!(
+                idle.lock().iter().all(|c| c.sender.is_closed()),
+                "request {i}: the proxy never saw the close"
+            );
+        }
     }
 
     /// Round 2 of the SUP-3b review: one connection per request made a stream

@@ -92,7 +92,10 @@ pub struct DomainOsView {
     /// stopped the running module is applied, so it needs none (SUP-5).
     /// Deliberately not "it is enabled but not running" — a module that is
     /// enabled and merely unhealthy has no pending change, and `detail` is what
-    /// the user should act on there.
+    /// the user should act on there. Defaults to `false` when absent, like its
+    /// neighbours, so a list from an older daemon still reads (PR#183 approve
+    /// Low).
+    #[serde(default)]
     pub restart_required: bool,
 }
 

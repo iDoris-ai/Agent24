@@ -86,7 +86,8 @@ impl std::fmt::Display for EndpointError {
             }
             Self::AlreadyCreated(p) => write!(
                 f,
-                "{} was already taken over by this process; create it once",
+                "{} is still taken over by this process; drop that directory and its \
+                 listeners first",
                 p.display()
             ),
             Self::Io(e) => write!(f, "callback endpoint: {e}"),
@@ -115,12 +116,32 @@ pub struct CallbackDir {
     /// nowhere else, so a number — and with it a socket path — is never used
     /// twice by this directory.
     last: std::sync::atomic::AtomicU64,
+    /// This directory's entry in [`TAKEN_OVER`], shared with every listener
+    /// made from it.
+    claim: std::sync::Arc<Claim>,
 }
 
 /// The socket directories this process has taken over. A second `create` for
 /// one of them would `remove_dir_all` it under listeners the first already
 /// made (PR-Daemon review of #179, L2).
 static TAKEN_OVER: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A directory's entry in [`TAKEN_OVER`], held by its [`CallbackDir`] and by
+/// every [`CallbackListener`] made from it, and removed when the last of
+/// them goes: the directory can then be taken over again in this process,
+/// and not while anything that emptying it would break is still alive
+/// (FU-59).
+#[derive(Debug)]
+struct Claim(PathBuf);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        TAKEN_OVER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|p| p != &self.0);
+    }
+}
 
 impl CallbackDir {
     /// Create (or take over) `<state>/run/<this pid>/`.
@@ -130,15 +151,18 @@ impl CallbackDir {
     /// user cannot rename or replace. Within that, `run/` and the pid directory
     /// are checked here (review of ME3-SUP slice 2, round 1, F8).
     ///
-    /// Once per state directory per process: the pid directory is emptied
-    /// here, so a second call would take the sockets of generations already
-    /// listening away.
+    /// Once at a time per state directory per process: the pid directory is
+    /// emptied here, so a second call while the first directory — or any
+    /// listener made from it — still lives would take the sockets of
+    /// generations already listening away. Once all of them are dropped, it
+    /// can be created again (FU-59).
     ///
     /// # Errors
     ///
     /// [`EndpointError::UnsafeDirectory`] if `run/` or the pid directory is not
-    /// this user's alone; [`EndpointError::AlreadyCreated`] on a second call
-    /// for the same directory; [`EndpointError::Io`] if it cannot be made.
+    /// this user's alone; [`EndpointError::AlreadyCreated`] while a
+    /// directory for the same path, or a listener made from one, still
+    /// lives; [`EndpointError::Io`] if it cannot be made.
     pub fn create(state: &Path) -> Result<Self, EndpointError> {
         let run = state.join("run");
         private_dir(&run)?;
@@ -152,22 +176,17 @@ impl CallbackDir {
             }
             taken.push(path.clone());
         }
+        let claim = std::sync::Arc::new(Claim(path.clone()));
         // Held only by a take-over that succeeds: one that fails made no
         // listener, so nothing it could empty is in use, and a retry once the
-        // cause is fixed must not be refused (review of ME3-SUP slice 3a).
-        match Self::take_over(&path) {
-            Ok(()) => Ok(Self {
-                path,
-                last: std::sync::atomic::AtomicU64::new(0),
-            }),
-            Err(e) => {
-                TAKEN_OVER
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|p| p != &path);
-                Err(e)
-            }
-        }
+        // cause is fixed must not be refused (review of ME3-SUP slice 3a) —
+        // the claim is dropped with the error.
+        Self::take_over(&path)?;
+        Ok(Self {
+            path,
+            last: std::sync::atomic::AtomicU64::new(0),
+            claim,
+        })
     }
 
     /// Empty a stale pid directory of ours, then (re)make it exactly `0700`.
@@ -237,6 +256,7 @@ impl CallbackDir {
             listener,
             node: (meta.dev(), meta.ino()),
             path,
+            _claim: self.claim.clone(),
         };
         if !meta.file_type().is_socket() {
             return Err(EndpointError::UnsafeDirectory {
@@ -371,6 +391,9 @@ pub struct CallbackListener {
     /// replacing entries in the directory concurrently (review of ME3-SUP
     /// slice 2, round 2).
     node: (u64, u64),
+    /// Its directory's take-over, kept while this listener lives. Dropped
+    /// after `Drop` has removed the socket (fields drop after the body).
+    _claim: std::sync::Arc<Claim>,
 }
 
 impl CallbackListener {
@@ -1090,6 +1113,26 @@ mod tests {
             .collect();
         let unique: std::collections::BTreeSet<&PathBuf> = paths.iter().collect();
         assert_eq!(unique.len(), paths.len(), "{paths:?}");
+    }
+
+    /// FU-59: once its directory and every listener made from it are gone,
+    /// the directory can be taken over again in this process — and not while
+    /// a listener still lives, whose socket the take-over would empty away.
+    #[tokio::test]
+    async fn a_socket_directory_is_released_by_the_last_thing_using_it() {
+        let s = state();
+        drop(CallbackDir::create(s.path()).unwrap());
+        let dir = CallbackDir::create(s.path()).expect("a directory nothing uses any more");
+        let listener = dir.listen_next().unwrap();
+        drop(dir);
+        let err = CallbackDir::create(s.path()).expect_err("a listener still lives");
+        assert!(matches!(err, EndpointError::AlreadyCreated(_)), "{err}");
+        assert!(
+            listener.path().exists(),
+            "the live listener's socket was removed"
+        );
+        drop(listener);
+        CallbackDir::create(s.path()).expect("released by the last listener");
     }
 
     /// A second take-over of the same directory is refused — it would empty

@@ -513,14 +513,27 @@ pub struct LaunchSpec<'a> {
 ///
 /// [`LaunchError`] — resolution, ownership, entropy, or the OS refusing.
 pub async fn spawn(spec: LaunchSpec<'_>) -> Result<ModuleProcess, LaunchError> {
-    use command_fds::{CommandFdExt, FdMapping};
-
     let program = {
         let (command, package) = (spec.command.clone(), spec.package_dir.to_owned());
         tokio::task::spawn_blocking(move || resolve(&command, &package))
             .await
             .map_err(|e| LaunchError::Spawn(std::io::Error::other(e)))??
     };
+    start(spec, &program)
+}
+
+/// The half of [`spawn`] that creates the child and hands it back — a plain
+/// `fn`, so nothing in it can await. A caller that races `spawn` against a
+/// stop and drops it when the stop wins (the supervisor does) relies on
+/// that: dropped at its one await, `spawn` has not created a child yet;
+/// once past it, `spawn` runs to the end and returns the child it made.
+/// An await between the fork and the return would let a dropped `spawn`
+/// leave a child nobody holds — and the supervisor, holding no process,
+/// would free a slot with a run still in it. The compiler now refuses that
+/// await, where before only a comment asked for it (FU-58).
+fn start(spec: LaunchSpec<'_>, program: &Path) -> Result<ModuleProcess, LaunchError> {
+    use command_fds::{CommandFdExt, FdMapping};
+
     let token = mint_token()?;
     // The generation's address is the listener it hands over (D4): read now,
     // before the listener moves into the command.
@@ -529,7 +542,7 @@ pub async fn spawn(spec: LaunchSpec<'_>) -> Result<ModuleProcess, LaunchError> {
     let mut cmd = tokio::process::Command::new(&spec.trampoline.program);
     cmd.args(&spec.trampoline.args)
         .arg(TRAMPOLINE_ARG)
-        .arg(&program)
+        .arg(program)
         .args(&spec.command.args)
         .current_dir(spec.package_dir)
         .env_clear()
