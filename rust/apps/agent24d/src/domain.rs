@@ -1185,7 +1185,7 @@ async fn mount_package(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -1650,6 +1650,85 @@ while f.readline():
             host.supervisors.close().is_empty(),
             "a package was started during the shutdown"
         );
+    }
+
+    /// A host with one package, `remote`, started and Running.
+    pub(crate) async fn running_package(tmp: &Path) -> ProcessHost {
+        let packages = tmp.join("packages");
+        write_package(&packages, "remote");
+        let host = test_host(tmp);
+        let hub = crate::events::EventsHub::default();
+        let _ = mount_all(
+            &discovered(&packages),
+            &tmp.join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+        )
+        .await;
+        let mut status = host.supervisors.statuses().remove("remote").unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| *s == agent24_os_proto::supervisor::Status::Running),
+        )
+        .await
+        .expect("the package never ran")
+        .unwrap();
+        host
+    }
+
+    /// A disable and the shutdown racing for the same module, on two threads
+    /// at once: whichever wins, the module is handed to the shutdown exactly
+    /// once — as a module to stop, or as a disable's stop to wait for — never
+    /// both and never neither (SUP-5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disable_racing_the_shutdown_hands_the_module_over_exactly_once() {
+        for _ in 0..5 {
+            let tmp = tempfile::Builder::new()
+                .prefix("a24")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let host = Arc::new(running_package(tmp.path()).await);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let disable = {
+                let (host, barrier) = (host.clone(), barrier.clone());
+                let rt = tokio::runtime::Handle::current();
+                std::thread::spawn(move || {
+                    let _rt = rt.enter();
+                    barrier.wait();
+                    host.supervisors
+                        .disable(
+                            "remote",
+                            std::time::Duration::from_secs(10),
+                            std::future::pending(),
+                        )
+                        .is_some()
+                })
+            };
+            let close = {
+                let (host, barrier) = (host.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    host.supervisors.close()
+                })
+            };
+            let disabled = disable.join().unwrap();
+            let closed = close.join().unwrap();
+            assert_eq!(
+                closed.running.len() + closed.disabling.len(),
+                1,
+                "handed over twice or not at all"
+            );
+            assert_eq!(disabled, closed.disabling.len() == 1);
+            for s in closed.running {
+                s.handle.stop().await.expect("a clean stop");
+            }
+            for stop in closed.disabling {
+                stop.await.unwrap();
+            }
+        }
     }
 
     /// `disable` takes one module out of the list and stops it — once — and

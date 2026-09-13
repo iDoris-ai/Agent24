@@ -178,12 +178,16 @@ impl Shutdown {
     /// killed: the budget any module gets once the shutdown begins — its
     /// drain and its stop grace — so a disable's longer drain neither holds
     /// the shutdown past its bound nor gets less than a module the shutdown
-    /// stops itself (SUP-5).
+    /// stops itself (SUP-5). An absolute instant, fixed by the shutdown's
+    /// start: measured from whenever this was first polled, a late poll put
+    /// it past the shutdown's own deadline, which then stopped waiting for it
+    /// (review of SUP-5, round 2).
     pub fn modules_cut_off(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let token = self.token.clone();
+        let shutdown = self.clone();
         async move {
-            token.cancelled().await;
-            tokio::time::sleep(MODULE_DRAIN + MODULE_STOP_GRACE).await;
+            shutdown.token.cancelled().await;
+            let began = shutdown.deadline() - SHUTDOWN_GRACE;
+            tokio::time::sleep_until(began + MODULE_DRAIN + MODULE_STOP_GRACE).await;
         }
     }
 }
@@ -1315,7 +1319,8 @@ async fn stop_supervisors(closed: crate::domain::Closed) {
         }
     }
     // Stops `os disable` began: each ends by `Shutdown::modules_cut_off` at
-    // the latest, its module killed by the time it does (SUP-5).
+    // the latest, with a SIGKILL sent to its module by then — sent, not
+    // confirmed (SUP-5).
     for stop in closed.disabling {
         let _ = stop.await;
     }
@@ -1511,6 +1516,21 @@ pub(crate) mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// A disable's stop is cut off at a fixed instant after the shutdown
+    /// began — the budget any module gets — however late its waiter is first
+    /// polled (review of SUP-5, round 2). The token is cancelled directly:
+    /// `request` would arm the watchdog, which ends this process.
+    #[tokio::test(start_paused = true)]
+    async fn a_disables_stop_is_cut_off_at_a_fixed_instant_after_the_shutdown_began() {
+        let shutdown = Shutdown::new(CancellationToken::new());
+        let began = tokio::time::Instant::now();
+        let _ = shutdown.deadline();
+        shutdown.token().cancel();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        shutdown.modules_cut_off().await;
+        assert_eq!(began.elapsed(), MODULE_DRAIN + MODULE_STOP_GRACE);
+    }
 
     /// The shutdown waits for the stops `os disable` began, not only for the
     /// modules it stops itself (SUP-5): those end when the shutdown's module

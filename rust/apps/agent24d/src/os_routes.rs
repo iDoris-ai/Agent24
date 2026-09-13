@@ -239,28 +239,48 @@ const DISABLE_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
 /// bounds a runtime too busy to schedule it.
 const ADMISSION_CLOSED_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// What a disable did to the running module (SUP-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotStop {
+    /// Its supervisor is draining and stopping it, and it refuses new
+    /// requests.
+    Stopping,
+    /// Its supervisor was asked to, but the module still admitted requests
+    /// when the wait ran out.
+    Pending,
+    /// An earlier disable already stopped it.
+    AlreadyStopped,
+    /// Nothing running to stop: a compiled-in module, a package not started
+    /// at mount, or a daemon already shutting down.
+    NotRunning,
+}
+
 /// Stop a running out-of-process module now (SUP-5): its supervisor drains
 /// and stops it in the background, and the shutdown — if it begins
-/// meanwhile — waits for that stop, cutting it short at its own module budget.
-/// Returns once the module's generation refuses new requests, so a request
-/// sent after the disable answers is not admitted. `false` if there was
-/// nothing running to stop (a compiled-in module, a package not started at
-/// mount, one already disabled, or a daemon already shutting down).
-async fn stop_now(state: &AppState, name: &str) -> bool {
-    let Some(current) = state
-        .supervisors
-        .as_ref()
-        .and_then(|s| s.disable(name, DISABLE_DRAIN, state.shutdown.modules_cut_off()))
-    else {
-        return false;
+/// meanwhile — waits for that stop, cutting it off at `cut_off`. Waits up to
+/// `within` for the module's generation to refuse new requests, so a request
+/// sent after the disable answers is not admitted.
+async fn stop_now(
+    supervisors: Option<&crate::domain::Supervisors>,
+    cut_off: impl std::future::Future<Output = ()> + Send + 'static,
+    name: &str,
+    within: std::time::Duration,
+) -> HotStop {
+    let Some(supervisors) = supervisors else {
+        return HotStop::NotRunning;
     };
-    if !admission_closed(&current, ADMISSION_CLOSED_WITHIN).await {
-        tracing::warn!(
-            "domain OS {name:?} was disabled, but its supervisor has not begun draining it \
-             within {ADMISSION_CLOSED_WITHIN:?}"
-        );
+    let Some(current) = supervisors.disable(name, DISABLE_DRAIN, cut_off) else {
+        return if supervisors.is_disabled(name) {
+            HotStop::AlreadyStopped
+        } else {
+            HotStop::NotRunning
+        };
+    };
+    if admission_closed(&current, within).await {
+        HotStop::Stopping
+    } else {
+        HotStop::Pending
     }
-    true
 }
 
 /// Wait, for up to `within`, until the generation `current` routes to no
@@ -326,21 +346,62 @@ pub async fn patch_os(
             );
         }
     };
-    if let Err(why) = crate::os_config::OsConfig::set_enabled(&path, &name, update.enabled) {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &why);
+    // Off the async workers: the file lock waits for any other writer, for
+    // as long as that takes (review of SUP-5, round 2).
+    let written = tokio::task::spawn_blocking({
+        let (path, name) = (path.clone(), name.clone());
+        move || crate::os_config::OsConfig::set_enabled(&path, &name, update.enabled)
+    })
+    .await;
+    match written {
+        Ok(Ok(_)) => {}
+        Ok(Err(why)) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &why);
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("the config write failed: {e}"),
+            );
+        }
     }
     // A disable of a running out-of-process module applies now; anything else
     // at the next start.
-    let now = !update.enabled && stop_now(&state, &name).await;
+    let hot = if update.enabled {
+        HotStop::NotRunning
+    } else {
+        stop_now(
+            state.supervisors.as_deref(),
+            state.shutdown.modules_cut_off(),
+            &name,
+            ADMISSION_CLOSED_WITHIN,
+        )
+        .await
+    };
+    let effect = match hot {
+        HotStop::Stopping => "stopping it now",
+        HotStop::Pending => "asked its supervisor to stop it; not yet refusing requests",
+        HotStop::AlreadyStopped => "already stopped by an earlier disable",
+        HotStop::NotRunning => "takes effect on restart",
+    };
     tracing::info!(
-        "domain OS {name:?} set enabled={} in os.json ({})",
-        update.enabled,
-        if now {
-            "stopping it now"
-        } else {
-            "takes effect on restart"
-        }
+        "domain OS {name:?} set enabled={} in os.json ({effect})",
+        update.enabled
     );
+    // Not a success: a request sent after this answer could still be
+    // admitted (review of SUP-5, round 2).
+    if hot == HotStop::Pending {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "disable_pending",
+            &format!(
+                "os.json now disables {name:?} and its supervisor was asked to stop it, but it \
+                 still admitted requests after {ADMISSION_CLOSED_WITHIN:?}; `agent24 os list` \
+                 shows when it has stopped"
+            ),
+        );
+    }
     // Return the whole list so a client sees the new `restart_required` state
     // without a second round trip.
     render(&state)
@@ -352,6 +413,60 @@ mod tests {
 
     use super::*;
     use crate::domain::{MountOutcome, MountReport, ResourceStatus};
+
+    /// What a disable reports: `Stopping` once the module refuses new
+    /// requests; `Pending` if it still admitted them when the wait ran out —
+    /// here at once, on this single-threaded runtime, before its supervisor
+    /// has run at all — and `AlreadyStopped` for a second disable; nothing
+    /// to stop without supervisors (review of SUP-5, round 2).
+    #[tokio::test]
+    async fn a_disable_says_whether_the_module_refuses_requests_yet() {
+        let never = std::future::pending::<()>;
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let host = crate::domain::tests::running_package(tmp.path()).await;
+        let zero = std::time::Duration::ZERO;
+        assert_eq!(
+            stop_now(None, never(), "remote", zero).await,
+            HotStop::NotRunning
+        );
+        assert_eq!(
+            stop_now(Some(&host.supervisors), never(), "nope", zero).await,
+            HotStop::NotRunning
+        );
+        assert_eq!(
+            stop_now(Some(&host.supervisors), never(), "remote", zero).await,
+            HotStop::Pending
+        );
+        assert_eq!(
+            stop_now(Some(&host.supervisors), never(), "remote", zero).await,
+            HotStop::AlreadyStopped
+        );
+        for stop in host.supervisors.close().disabling {
+            stop.await.unwrap();
+        }
+
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let host = crate::domain::tests::running_package(tmp.path()).await;
+        assert_eq!(
+            stop_now(
+                Some(&host.supervisors),
+                never(),
+                "remote",
+                std::time::Duration::from_secs(5)
+            )
+            .await,
+            HotStop::Stopping
+        );
+        for stop in host.supervisors.close().disabling {
+            stop.await.unwrap();
+        }
+    }
 
     /// A disable answers only once the module's generation refuses new work:
     /// here its supervisor gets to it late, and the wait outlasts that. And

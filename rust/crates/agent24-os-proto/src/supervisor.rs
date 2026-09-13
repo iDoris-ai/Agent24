@@ -190,10 +190,11 @@ impl SupervisorHandle {
 
     /// [`SupervisorHandle::drain_and_stop`], unless `abandon` resolves first:
     /// then the loop is aborted AND waited for until it is gone — its module
-    /// process dropped, which revokes the generation and SIGKILLs the group —
-    /// before this returns [`SupervisorError::Killed`]. For an owner whose own
-    /// deadline must find the kill sent, not merely scheduled: dropping a stop
-    /// future only aborts the loop, which is then dropped whenever the
+    /// process dropped, which revokes the generation and sends its group a
+    /// SIGKILL — before this returns [`SupervisorError::Killed`]. The kill is
+    /// sent, not confirmed (as for `Killed` everywhere). For an owner whose
+    /// own deadline must find the kill sent, not merely scheduled: dropping a
+    /// stop future only aborts the loop, which is then dropped whenever the
     /// runtime next gets to it (SUP-5, the shutdown cutting short a hot
     /// disable's drain).
     ///
