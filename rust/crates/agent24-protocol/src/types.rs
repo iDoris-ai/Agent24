@@ -44,7 +44,8 @@ pub struct Model {
 /// (any enable; a disable of a compiled-in module) — routes are built once at
 /// startup, and hiding that divergence would leave a user staring at a module
 /// that says "enabled" while every request 503s. A disable of a running
-/// out-of-process module is applied at once (SUP-5), so its two agree.
+/// out-of-process module is applied at once (SUP-5), so its two agree — until
+/// a later enable, which, like any enable, waits for the next start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DomainOsView {
     pub name: String,
@@ -62,8 +63,10 @@ pub struct DomainOsView {
     pub state: String,
     /// Why, when there is a reason worth acting on — a degradation or a refusal
     /// — or, for a `mounted` out-of-process module, a passing state worth
-    /// knowing (`starting`, `stopping`), and for a module `disabled` while it
-    /// ran, `stopping` until it has drained and stopped (SUP-5). Absent for a
+    /// knowing (`starting`, `stopping`, and `stop requested` for one `os
+    /// disable` asked to stop that still admits requests), and for a module
+    /// `disabled` while it ran, `stopping` until it has drained and stopped
+    /// (SUP-5). Absent for a
     /// `mounted` module that is simply serving, and for a settled `disabled`,
     /// whose reason is that the user said so.
     #[serde(default, skip_serializing_if = "Option::is_none")]

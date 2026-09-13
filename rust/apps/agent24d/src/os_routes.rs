@@ -76,8 +76,9 @@ fn view(
         // mount said — still `stopping` while it drains (SUP-5).
         (MountOutcome::Mounted, Some(Status::Stopped)) if hot_disabled => ("disabled", None),
         (MountOutcome::Mounted, _) if hot_disabled => ("disabled", Some("stopping".to_owned())),
-        // Asked to stop and still admitting: what it is, and what is coming.
-        (MountOutcome::Mounted, Some(Status::Running)) if hot == Some(false) && !stop_failed => {
+        // Asked to stop and still admitting: what it is, and what is coming —
+        // whatever its supervisor has published yet (review of SUP-5, round 7).
+        (MountOutcome::Mounted, _) if hot == Some(false) && !stop_failed => {
             ("mounted", Some("stop requested".to_owned()))
         }
         // A package started at mount: its supervisor says where it is NOW. A
@@ -328,8 +329,9 @@ async fn settle(
 }
 
 /// The answer's last look: a stop that has failed since `settle` looked is
-/// `Failed` after all. This moment — just before the response is chosen — is
-/// the one the answer describes (review of SUP-5, round 6).
+/// `Failed` after all, and one that timed out but refuses requests by now is
+/// under way. This moment — just before the response is chosen — is the one
+/// the answer describes (review of SUP-5, rounds 6 and 7).
 fn last_look(hot: HotStop, slot: Option<&crate::domain::Disabled>) -> HotStop {
     use agent24_os_proto::supervisor::Status;
     let failed = slot.is_some_and(|d| {
@@ -338,7 +340,13 @@ fn last_look(hot: HotStop, slot: Option<&crate::domain::Disabled>) -> HotStop {
             Status::StopFailed { .. } | Status::Panicked | Status::Killed
         )
     });
-    if failed { HotStop::Failed } else { hot }
+    if failed {
+        HotStop::Failed
+    } else if hot == HotStop::Pending && applied(slot) {
+        HotStop::Stopping
+    } else {
+        hot
+    }
 }
 
 /// A handed-off stop, by whether its module refuses requests, whether THIS
@@ -673,6 +681,9 @@ mod tests {
             status,
         };
         assert_eq!(last_look(HotStop::Stopping, Some(&slot)), HotStop::Stopping);
+        // Starting is not Running: a pending disable whose module no longer
+        // admits requests by the last look is under way.
+        assert_eq!(last_look(HotStop::Pending, Some(&slot)), HotStop::Stopping);
         tx.send_replace(Status::StopFailed { error: "x".into() });
         assert_eq!(last_look(HotStop::Stopping, Some(&slot)), HotStop::Failed);
         assert_eq!(last_look(HotStop::NotRunning, None), HotStop::NotRunning);
@@ -750,6 +761,14 @@ mod tests {
             (v.state.as_str(), v.detail.as_deref()),
             ("mounted", Some("stop requested"))
         );
+        let v = view(
+            &r,
+            false,
+            true,
+            Some(&Status::Starting { attempt: 1 }),
+            Some(false),
+        );
+        assert_eq!(v.detail.as_deref(), Some("stop requested"));
         assert!(!v.restart_required);
         assert!(view(&r, true, true, Some(&Status::Running), Some(false)).restart_required);
         assert!(view(&r, true, true, Some(&Status::Stopped), Some(true)).restart_required);
