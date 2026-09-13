@@ -547,7 +547,7 @@ impl Supervisors {
     }
 
     /// Run `start` and keep what it starts — unless the list is closed, in
-    /// which case `start` does not run and this returns `false`. `start` runs
+    /// which case `start` does not run and this returns `None`. `start` runs
     /// under the lock and must not block (starting a supervisor only spawns
     /// its task).
     pub fn start_with<E>(
