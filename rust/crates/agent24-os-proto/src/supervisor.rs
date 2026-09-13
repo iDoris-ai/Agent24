@@ -508,6 +508,13 @@ async fn run_loop(
 /// A run's process could not be confirmed gone: its stop failed.
 struct Unconfirmed(String);
 
+/// What the handshake's end decided (see `run_once`).
+enum Admitted {
+    Ready,
+    Stopping,
+    Revoked,
+}
+
 /// One run: spawn, handshake, serve, and stop. Returns how it ended; the
 /// process is always stopped by the time it returns — or, if that could not
 /// be confirmed, dropped (one more SIGKILL) and reported as [`Unconfirmed`],
@@ -616,24 +623,41 @@ async fn run_once(
             return Ok(run);
         }
     };
-    // The same for the handshake: a stop that landed while it completed must
-    // not see the generation become Running and admit work.
-    if stop.borrow().is_some() {
-        finish(process, timings, &spec.name, status, slot).await?;
-        return Ok(Run::StopRequested);
-    }
-    if !generation.ready() {
-        // Only a revocation moves a generation out of Starting, and only this
-        // run stops its process — so this is not expected. It is still not a
-        // ready module.
-        tracing::error!(module = %spec.name, "the generation was revoked during its handshake");
-        let run = failed(Stopped::StartupTimeout);
-        finish(process, timings, &spec.name, status, slot).await?;
-        return Ok(run);
-    }
     // Built before `Running` is published: a caller's `MethodsFor` that
     // panics must not leave the status saying a module is being served.
     let methods = methods(&generation);
+    // The last stop check and `ready` are ONE step: the stop channel's read
+    // guard is held across both, so a `drain_and_stop` sending its request
+    // lands either before the check — and the generation never runs — or
+    // after `ready`, and the serve loop below drains it. A check followed by a
+    // separate `ready` let a stop land in between and a stopping module admit
+    // work (review of SUP-4, rounds 3 and 4).
+    let admitted = {
+        let stopping = stop.borrow();
+        if stopping.is_some() {
+            Admitted::Stopping
+        } else if generation.ready() {
+            Admitted::Ready
+        } else {
+            Admitted::Revoked
+        }
+    };
+    match admitted {
+        Admitted::Ready => {}
+        Admitted::Stopping => {
+            finish(process, timings, &spec.name, status, slot).await?;
+            return Ok(Run::StopRequested);
+        }
+        Admitted::Revoked => {
+            // Only a revocation moves a generation out of Starting, and only
+            // this run stops its process — so this is not expected. It is
+            // still not a ready module.
+            tracing::error!(module = %spec.name, "the generation was revoked during its handshake");
+            let run = failed(Stopped::StartupTimeout);
+            finish(process, timings, &spec.name, status, slot).await?;
+            return Ok(run);
+        }
+    }
     let ready_at = std::time::Instant::now();
     status.send_replace(Status::Running);
     let serve = rpc::serve_until(
@@ -655,7 +679,7 @@ async fn run_once(
     };
     if outcome.is_none() {
         let drain = (*stop.borrow()).unwrap_or_default();
-        drain_run(&generation, drain, &mut serve, &mut process).await;
+        drain_run(&spec.name, &generation, drain, &mut serve, &mut process).await;
     }
     let ended_at = std::time::Instant::now();
     finish(process, timings, &spec.name, status, slot).await?;
@@ -692,6 +716,7 @@ async fn stop_requested(stop: &mut watch::Receiver<Option<Duration>>) {
 /// first. The callback connection is served throughout (`serve` is polled
 /// here), because a request finishing may call back.
 async fn drain_run(
+    name: &str,
     generation: &Generation,
     drain: Duration,
     serve: &mut std::pin::Pin<&mut impl std::future::Future<Output = rpc::Ended>>,
@@ -700,6 +725,11 @@ async fn drain_run(
     if drain.is_zero() || !generation.begin_drain(std::time::Instant::now(), drain) {
         return;
     }
+    tracing::info!(
+        module = name,
+        in_flight = generation.in_flight(),
+        "draining before the stop"
+    );
     let deadline = tokio::time::Instant::now() + drain;
     let idle = async {
         while generation.in_flight() > 0 {

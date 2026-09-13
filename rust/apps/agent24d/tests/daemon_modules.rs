@@ -209,16 +209,16 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
             .unwrap()
             .success()
     );
-    // The shutdown has begun with the request still held by the module; only
-    // now is it let go — inside the drain budget. Finishing it before the
-    // daemon heard the signal would prove nothing.
+    // Released only once the module's run is DRAINING — the supervisor logs
+    // that after the generation refuses new work — with the request still held
+    // by the module. Releasing it earlier would prove nothing.
     let heard_by = Instant::now() + Duration::from_secs(5);
     loop {
         let left = heard_by.saturating_duration_since(Instant::now());
         match log_rx.recv_timeout(left) {
-            Ok(line) if line.contains("shutdown signal received") => break,
+            Ok(line) if line.contains("draining before the stop") => break,
             Ok(_) => {}
-            Err(_) => panic!("the daemon never logged that it heard the signal"),
+            Err(_) => panic!("the daemon never began draining the module"),
         }
     }
     std::fs::write(home.path().join(".agent24/os/remote/release"), b"").unwrap();
@@ -240,8 +240,10 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
     };
     let took = t0.elapsed();
     assert!(exited.success(), "{exited:?}");
+    // TASKS B2: ~2s — SHUTDOWN_GRACE plus the runtime's bounded teardown,
+    // with slack for a loaded machine.
     assert!(
-        took < Duration::from_secs(4),
+        took < Duration::from_secs(3),
         "the daemon took {took:?} to exit"
     );
     let gone_by = Instant::now() + Duration::from_secs(2);

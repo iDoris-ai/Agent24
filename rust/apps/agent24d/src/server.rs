@@ -28,6 +28,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// reaping every module fit in [`SHUTDOWN_GRACE`].
 const MODULE_STOP_GRACE: Duration = Duration::from_millis(500);
 
+/// How far past the shutdown deadline the process may run before the watchdog
+/// ends it: the runtime's own bounded teardown (`main`'s `shutdown_timeout`).
+const WATCHDOG_MARGIN: Duration = Duration::from_millis(500);
+
 /// How long a shutdown lets out-of-process modules finish the requests they
 /// already have (DRAINING, SPEC §4) before stopping them. ⚖️ This and
 /// [`MODULE_STOP_GRACE`] share [`SHUTDOWN_GRACE`]: drain first, so a request a
@@ -858,8 +862,10 @@ pub async fn serve(
     // SUP-4, round 3).
     let shutdown_at: Arc<std::sync::OnceLock<tokio::time::Instant>> =
         Arc::new(std::sync::OnceLock::new());
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signal_cancel = cancel.clone();
     let signal_at = shutdown_at.clone();
+    let signal_armed = armed.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
         tokio::select! {
@@ -871,26 +877,29 @@ pub async fn serve(
             tracing::error!("SIGINT handler failed: {err}");
             std::future::pending::<()>().await;
         }
-        tracing::info!("shutdown signal received");
-        let _ = deadline_of(&signal_at);
+        // Deadline, watchdog and cancel first; the log line last — a stalled
+        // stderr must not be what keeps the shutdown from starting.
+        arm_watchdog(deadline_of(&signal_at), &signal_armed);
         signal_cancel.cancel();
+        tracing::info!("shutdown signal received");
     });
-    // The hard bound. Whatever is stuck — a module's directory on a stalled
-    // filesystem during startup, a blocking task — the process ends one second
-    // past the deadline. Modules it did not get to stop read EOF on their
-    // callback connections, which ends their runs (D1).
+    // The hard bound for the shutdowns that do not come from a signal (an
+    // HTTP shutdown, the server ending): armed at the first look after the
+    // cancel. A signal arms it itself, above, before it cancels.
     {
-        let (cancel, at) = (cancel.clone(), shutdown_at.clone());
+        let (cancel, at, armed) = (cancel.clone(), shutdown_at.clone(), armed.clone());
         tokio::spawn(async move {
             cancel.cancelled().await;
-            let left = deadline_of(&at).saturating_duration_since(tokio::time::Instant::now());
-            std::thread::spawn(move || {
-                std::thread::sleep(left + Duration::from_secs(1));
-                tracing::error!("shutdown did not finish within its bound; exiting now");
-                std::process::exit(1);
-            });
+            arm_watchdog(deadline_of(&at), &armed);
         });
     }
+
+    // 127.0.0.1 only — never a public bind (SPEC-001 §9). Bound BEFORE any
+    // module is started: a port that is taken fails startup here, rather than
+    // after packages are running, on a path that would leave them to the
+    // runtime's teardown instead of the ordered stop (review of SUP-4, round 4).
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let local = listener.local_addr()?;
 
     let host = process_host(if ephemeral { &os_root } else { &state_dir });
     if let Err(why) = &host {
@@ -1009,9 +1018,14 @@ pub async fn serve(
     );
     let router = build_router_with_modules(state, module_routes);
 
-    // 127.0.0.1 only — never a public bind (SPEC-001 §9)
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    let local = listener.local_addr()?;
+    // A shutdown that began during startup ends it here, before anything says
+    // this daemon is ready: its modules are stopped, and no state file or
+    // ready line advertises a daemon that is about to exit (review of SUP-4,
+    // round 4).
+    if cancel.is_cancelled() {
+        let _ = stopping.await;
+        return Ok(());
+    }
 
     // SPEC-002 §4 ready line: parsers scan stdout for the first type=="ready"
     // JSON line. stdout carries nothing else (logs go to stderr).
@@ -1107,6 +1121,29 @@ fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, St
         },
         supervisors: StdArc::new(crate::domain::Supervisors::default()),
     })
+}
+
+/// Arm the hard bound, once: at `deadline` + [`WATCHDOG_MARGIN`] the process
+/// ends, whatever is stuck — a module's directory on a stalled filesystem
+/// during startup, a blocking task. A native thread, so no scheduling of the
+/// runtime can delay it; an absolute instant, so arming it late does not move
+/// it; no I/O when it fires, so a stalled stderr cannot hold it; and exit
+/// status 0, because a shutdown was asked for — a supervisor such as launchd
+/// must not read it as a crash and start the daemon again (review of SUP-4,
+/// round 4). Modules it did not get to stop read EOF on their callback
+/// connections, which ends their runs (D1).
+fn arm_watchdog(deadline: tokio::time::Instant, armed: &std::sync::atomic::AtomicBool) {
+    if armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let at = deadline.into_std() + WATCHDOG_MARGIN;
+    std::thread::spawn(move || {
+        let now = std::time::Instant::now();
+        if at > now {
+            std::thread::sleep(at - now);
+        }
+        std::process::exit(0);
+    });
 }
 
 /// The shutdown deadline: fixed by the first caller — the signal task, before
