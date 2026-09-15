@@ -96,9 +96,14 @@ impl std::fmt::Display for Decision {
 /// Why a module stopped. The policy treats these the same — SPEC says a startup
 /// timeout is handled *as* a crash — but the caller logs them differently, and
 /// collapsing them here would take that distinction away from it.
+///
+/// A coarse, legacy signal: how a run failed is
+/// [`crate::failure::RunFailure`] (FU-57), and the supervisor derives this
+/// from it with [`crate::failure::FailureKind::legacy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stopped {
-    /// The process exited on its own.
+    /// Any failure but a startup timeout — not necessarily a process that
+    /// exited (a spawn refused, a handshake refused, a broken callback).
     Exited,
     /// It was spawned but never completed `initialize` within
     /// [`STARTUP_TIMEOUT`].

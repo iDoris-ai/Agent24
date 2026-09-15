@@ -86,19 +86,34 @@ fn view(
         // "mounted" (review of SUP-4, round 1).
         (MountOutcome::Mounted, Some(status)) => match status {
             Status::Running => ("mounted", None),
-            Status::Starting { attempt } => ("mounted", Some(format!("starting (run {attempt})"))),
+            Status::Starting { attempt, after } => (
+                "mounted",
+                Some(match after {
+                    // FU-57: what the run before this one failed of.
+                    Some(failed) => format!("starting (run {attempt}) — after: {failed}"),
+                    None => format!("starting (run {attempt})"),
+                }),
+            ),
             Status::Stopping => ("mounted", Some("stopping".to_owned())),
-            Status::Backoff { failures, delay } => (
+            Status::Backoff {
+                failures,
+                delay,
+                last,
+            } => (
                 "degraded",
                 Some(format!(
-                    "restarting in {}ms after {failures} failed run(s)",
+                    "restarting in {}ms after {failures} failed run(s) — last: {last}",
                     delay.as_millis()
                 )),
             ),
-            Status::GaveUp { failures, within } => (
+            Status::GaveUp {
+                failures,
+                within,
+                last,
+            } => (
                 "degraded",
                 Some(format!(
-                    "gave up after {failures} failed runs within {}s",
+                    "gave up after {failures} failed runs within {}s — last: {last}",
                     within.as_secs()
                 )),
             ),
@@ -765,7 +780,10 @@ mod tests {
             &r,
             false,
             true,
-            Some(&Status::Starting { attempt: 1 }),
+            Some(&Status::Starting {
+                attempt: 1,
+                after: None,
+            }),
             Some(false),
         );
         assert_eq!(v.detail.as_deref(), Some("stop requested"));
@@ -783,16 +801,42 @@ mod tests {
     fn a_mounted_package_is_reported_by_its_live_status() {
         use agent24_os_proto::supervisor::Status;
         let r = report("pkg", MountOutcome::Mounted);
+        use agent24_os_proto::failure::{FailureKind, RunFailure};
+        let last = RunFailure::new(FailureKind::Exited, "the module exited with code 3");
         let gave_up = Status::GaveUp {
             failures: 5,
             within: std::time::Duration::from_secs(4),
+            last: last.clone(),
         };
         let v = view(&r, true, true, Some(&gave_up), None);
         assert_eq!(v.state, "degraded");
-        assert!(
-            v.detail.as_deref().is_some_and(|d| d.contains("gave up")),
-            "{:?}",
-            v.detail
+        // FU-57: how the last run failed is part of what is said.
+        assert_eq!(
+            v.detail.as_deref(),
+            Some(
+                "gave up after 5 failed runs within 4s — last: exited (the module exited with code 3)"
+            )
+        );
+        let backoff = Status::Backoff {
+            failures: 2,
+            delay: std::time::Duration::from_millis(800),
+            last: RunFailure::new(FailureKind::Setup, "could not start the module: x"),
+        };
+        assert_eq!(
+            view(&r, true, true, Some(&backoff), None).detail.as_deref(),
+            Some(
+                "restarting in 800ms after 2 failed run(s) — last: setup (could not start the module: x)"
+            )
+        );
+        let starting = Status::Starting {
+            attempt: 3,
+            after: Some(last),
+        };
+        assert_eq!(
+            view(&r, true, true, Some(&starting), None)
+                .detail
+                .as_deref(),
+            Some("starting (run 3) — after: exited (the module exited with code 3)")
         );
         let v = view(&r, true, true, Some(&Status::Running), None);
         assert_eq!(v.state, "mounted");

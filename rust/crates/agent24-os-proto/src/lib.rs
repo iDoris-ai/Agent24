@@ -20,6 +20,7 @@
 
 pub mod drain;
 pub mod endpoint;
+pub mod failure;
 pub mod frame;
 pub mod initialize;
 pub mod launch;
