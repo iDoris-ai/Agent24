@@ -768,6 +768,56 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A fixture that ignores SIGTERM, with a lifetime cap: a member of its
+    /// group that itself ignores TERM and SIGKILLs the whole group after
+    /// `secs`. A test's own stop kills it with the rest; it matters only when
+    /// the test process dies first — a timeout, a mutation run killing it —
+    /// and nothing is left to stop the module, whose group is not the test's.
+    /// 31 such fixtures were found spinning, some for two days (HYG-1).
+    ///
+    /// The shebang is added here, so every such fixture gets the cap.
+    fn stubborn(secs: u32, body: &str) -> String {
+        format!("#!/bin/sh\n( trap '' TERM ; sleep {secs} ; kill -KILL 0 ) &\n{body}")
+    }
+
+    /// How long a stubborn fixture may outlive a test that died: far longer
+    /// than any test here waits on one, far shorter than "two days".
+    const FIXTURE_CAP: u32 = 120;
+
+    /// HYG-1: a stubborn fixture nobody stops ends itself at its cap — here
+    /// 1s, the loop ignoring SIGTERM and started in a group of its own, as the
+    /// daemon starts modules, so nothing of the test's reaches it.
+    #[test]
+    fn a_stubborn_fixture_nobody_stops_ends_itself_at_its_cap() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("mod");
+        exe(
+            &script,
+            &stubborn(1, "trap '' TERM\nwhile : ; do : ; done\n"),
+        );
+        let mut child = std::process::Command::new(&script)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = rustix::process::kill_process_group(
+                    Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+                    rustix::process::Signal::Kill,
+                );
+                let _ = child.wait();
+                panic!("the stubborn fixture outlived its cap");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(9), "{status:?}");
+    }
+
     /// The backoff schedule, as a table. Written out rather than computed,
     /// because a test that recomputes the formula passes for any formula.
     #[test]
@@ -1003,11 +1053,13 @@ mod tests {
         // just starts another. The leader keeps the default and exits on TERM.
         exe(
             &dir.path().join("bin/mod"),
-            &format!(
-                "#!/bin/sh\n\
-                 ( trap '' TERM ; while : ; do touch {m} ; sleep 0.05 ; done ) &\n\
-                 sleep 30\n",
-                m = marker.display()
+            &stubborn(
+                FIXTURE_CAP,
+                &format!(
+                    "( trap '' TERM ; while : ; do touch {m} ; sleep 0.05 ; done ) &\n\
+                     sleep 30\n",
+                    m = marker.display()
+                ),
             ),
         );
         let p = start(dir.path()).await;
@@ -1042,9 +1094,12 @@ mod tests {
         let ready = dir.path().join("trap-installed");
         exe(
             &dir.path().join("bin/mod"),
-            &format!(
-                "#!/bin/sh\ntrap '' TERM\ntouch {}\nwhile : ; do : ; done\n",
-                ready.display()
+            &stubborn(
+                FIXTURE_CAP,
+                &format!(
+                    "trap '' TERM\ntouch {}\nwhile : ; do : ; done\n",
+                    ready.display()
+                ),
             ),
         );
         let p = start(dir.path()).await;
@@ -1262,12 +1317,14 @@ mod tests {
         // marker, so the stop sits in its grace until it is cancelled.
         exe(
             &dir.path().join("bin/mod"),
-            &format!(
-                "#!/bin/sh\n\
-                 trap '' TERM\n\
-                 ( trap '' TERM ; while : ; do touch {m} ; sleep 0.05 ; done ) &\n\
-                 while : ; do touch {m} ; sleep 0.05 ; done\n",
-                m = marker.display()
+            &stubborn(
+                FIXTURE_CAP,
+                &format!(
+                    "trap '' TERM\n\
+                     ( trap '' TERM ; while : ; do touch {m} ; sleep 0.05 ; done ) &\n\
+                     while : ; do touch {m} ; sleep 0.05 ; done\n",
+                    m = marker.display()
+                ),
             ),
         );
         let p = start(dir.path()).await;
