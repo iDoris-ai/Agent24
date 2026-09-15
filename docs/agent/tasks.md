@@ -94,13 +94,13 @@
 > 每一项仍走完整流程：worktree → 实现 → 变异验证 → Codex 对抗轮 → pre-pr-check → PR → PR-Daemon → 合并。**带状态机的项先写一页语义说明并让 Codex 审设计，再写代码**（SUP-5 的教训：7 轮 Codex 里 4 轮在补语义；规则提案已提给 PR-Daemon：jhfnetboy/PR-daemon#8）。
 
 **一、先止血：测试不许再漏进程**（2026-09-13 发现 31 个遗留的「忽略 SIGTERM」测试夹具进程，空转 1–2 天，已全部 SIGKILL）
-- **HYG-1 顽固模块测试夹具的进程组守卫** `READY`：`supervise.rs` / `supervisor.rs` 里起「trap '' TERM」模块的测试，改由守卫在 Drop 里按进程组 SIGKILL —— 断言失败、panic、超时中断都不留进程。判据：跑一个会让测试中途 panic 的变异后，`ps` 里该临时目录下的 `bin/mod` 进程数为 0。
-- **HYG-2 变异脚本收尾** `READY`：`docs/agent/mutate.sh` 每跑完一个变异体，清理本次测试临时目录下残留的模块进程并打印清理数；清理数 ≠ 0 即说明有测试漏收进程，打印为警告。判据：对「去掉 SIGKILL」的变异跑一次，结束后进程数为 0，且警告里点名了漏收的测试。
+- **HYG-1 顽固模块测试夹具的寿命上限** `DONE` — [#186](https://github.com/iDoris-ai/Agent24/pull/186)（`c51a562`，2026-09-15）：`supervise.rs` 三个 shell 顽固夹具经 `stubborn(cap, body)` 生成，带同组、忽略 TERM 的看门狗，120s 到时 `kill -KILL 0`；Drop 守卫在测试进程被杀时来不及跑，所以用夹具自带的寿命上限（主防线）
+- **HYG-2 变异脚本收尾** `DONE` — [#186](https://github.com/iDoris-ai/Agent24/pull/186)：`mutate.py` 每次运行专属 TMPDIR，结束后按命令行清扫被 init 收养的孤儿并以「⚠️ 漏收进程」警告（纵深防御；exec 走的孤儿认不出，记 FU-65）
 
 **二、停机可观测、可调**（用户裁决：参数有问题要能被发现、能被调整）
-- **SHUT-1 停机可观测性** `READY`：① 模块超过停止宽限被 SIGKILL 时 warn（模块名、等了多久）；② 排空到时限仍有在途请求时 warn（切断几个）；③ 每次停机一行汇总（总耗时；每个模块排空耗时、停止耗时、是否被强杀）；④ 写 `~/.agent24/run/last-shutdown.json`（不阻塞看门狗：独立线程、尽力而为）；⑤ 下次启动读它 —— 文件缺失（上次被看门狗强退或崩溃）或有模块被强杀，启动日志告警并在 `agent24 os list` / `doctor` 可见。热 disable 的停止同样记录。
-- **SHUT-2 参数可调** `READY`：排空时长、停止宽限做成配置项（带上下限校验；总和不超过停机预算，超出即拒绝并说明），写进文档；默认值不变。
-- **SHUT-3 测试** `READY`：0.3s 才退出的模块不被强杀；1s 才退出的模块被强杀，且 ①③④ 都有记录；看门狗强退后下次启动告警（正对照：干净停机后不告警）。
+- **SHUT-1 停机可观测性** `IN_PROGRESS` —— 先写语义说明 [`docs/design/SHUT-shutdown-observability.md`](../design/SHUT-shutdown-observability.md)（写代码前 Codex 设计审查 4 轮，v5 定稿），拆三刀叠加：**SHUT-1a** 停止事实记录 + 当场告警 `DONE` — [#187](https://github.com/iDoris-ai/Agent24/pull/187)（`d94217b`）；**SHUT-1b** 参数可调、截止模型、汇总落盘 `last-shutdown.json`、`daemon.alive` 跨启动证据 `IN_REVIEW`；**SHUT-1c** 实时出口（`GET /api/v1/daemon/shutdown`、`agent24 daemon status`、OpenAPI、`daemon` 保留段）`READY`（等 1b 合并）
+- **SHUT-2 参数可调** —— 并入 SHUT-1b：`A24_MODULE_DRAIN_MS`（0–10000，默认 800）/ `A24_MODULE_STOP_GRACE_MS`（100–5000，默认 500），非法值告警回落默认（不拒绝启动：CLI 吞 stderr、launchd 会崩溃循环），调大时上界诚实变大并写进启动日志；TASKS B2 改为「默认参数下 ≤ 2s」
+- **SHUT-3 测试** —— 分散进 1a/1b：超宽限被杀有记录有告警、排空到期切断有记录有告警、SIGKILL 后下次启动告警 / 干净后不告警、ephemeral 不碰证据；0.3s/1s 退出的对照由 `leader` 事实与宽限测试覆盖
 
 **三、收尾 ME3-SUP 的跟进项**
 - **FU-57 Supervisor 失败细分** `READY`：setup / refused / io / timeout / exited，在 `os list` 显示；判据带正对照（spawn 被拒显示 setup，真正退出显示 exited）。

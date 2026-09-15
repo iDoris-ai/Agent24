@@ -296,7 +296,11 @@ fn random_hex(bytes: usize) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Make `dir` (0700) if it is not there — and, when it was just made, fsync
+/// its parent, so the directory's own entry survives a power loss along with
+/// the marker inside it (review of SHUT-1b, round 3).
 fn private_dir(dir: &Path) -> std::io::Result<()> {
+    let existed = dir.is_dir();
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
@@ -304,7 +308,20 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(0o700);
     }
-    b.create(dir)
+    b.create(dir)?;
+    if !existed && let Some(parent) = dir.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+impl StoppingMarker {
+    /// Where the evidence lives, for log lines that must say which state
+    /// directory they are about.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
 }
 
 /// This daemon's `daemon.alive`, while it is starting: dropped before the

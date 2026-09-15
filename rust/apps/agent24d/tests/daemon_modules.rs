@@ -401,7 +401,10 @@ fn an_ephemeral_daemon_leaves_the_shutdown_evidence_alone() {
     let home = tmp_home();
     let run = home.path().join(".agent24/run");
     std::fs::create_dir_all(&run).unwrap();
+    // Both files pre-seeded: the marker says "unconfirmed" to anyone who
+    // reads it — an ephemeral daemon must not even read it.
     std::fs::write(run.join("daemon.alive"), b"sentinel").unwrap();
+    std::fs::write(run.join("last-shutdown.json"), b"old summary").unwrap();
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -409,9 +412,15 @@ fn an_ephemeral_daemon_leaves_the_shutdown_evidence_alone() {
         .args(["serve", "--port", "0", "--ephemeral"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let stderr = daemon.stderr.take().unwrap();
+    let log = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut text);
+        text
+    });
     let stdout = daemon.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -429,7 +438,15 @@ fn an_ephemeral_daemon_leaves_the_shutdown_evidence_alone() {
         std::fs::read(run.join("daemon.alive")).unwrap(),
         b"sentinel"
     );
-    assert!(!run.join("last-shutdown.json").exists());
+    assert_eq!(
+        std::fs::read(run.join("last-shutdown.json")).unwrap(),
+        b"old summary"
+    );
+    let log = log.join().unwrap();
+    assert!(
+        !log.contains("previous daemon") && !log.contains("previous shutdown"),
+        "an ephemeral daemon read the shutdown evidence:\n{log}"
+    );
 }
 
 /// The module named `remote` in an `/api/v1/os` list.

@@ -1145,20 +1145,27 @@ pub async fn serve(
             deadlines.began.elapsed(),
             &records,
         );
-        tracing::info!("{}", summary.describe());
+        // Every evidence line names its state directory (review of SHUT-1b,
+        // round 3): two daemons with different HOMEs log side by side.
+        let evidence = marker
+            .as_ref()
+            .map_or_else(|| "ephemeral".to_owned(), |m| m.dir().display().to_string());
+        tracing::info!(evidence = %evidence, "{}", summary.describe());
         if let Some(marker) = marker {
             let job =
                 tokio::task::spawn_blocking(move || crate::lifecycle::persist(&summary, &marker));
             match tokio::time::timeout_at(deadlines.persist, job).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(e))) => tracing::error!(
-                    "the shutdown summary could not be written ({e}); the next start will not \
-                     be able to confirm this shutdown"
+                    "the shutdown summary could not be written in {evidence} ({e}); the next \
+                     start will not be able to confirm this shutdown"
                 ),
-                Ok(Err(e)) => tracing::error!("writing the shutdown summary failed: {e}"),
+                Ok(Err(e)) => {
+                    tracing::error!("writing the shutdown summary in {evidence} failed: {e}");
+                }
                 Err(_) => tracing::error!(
-                    "the shutdown summary was not on disk by its deadline; the next start will \
-                     not be able to confirm this shutdown"
+                    "the shutdown summary was not on disk in {evidence} by its deadline; the \
+                     next start will not be able to confirm this shutdown"
                 ),
             }
         }
