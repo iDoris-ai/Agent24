@@ -98,7 +98,7 @@
 - **HYG-2 变异脚本收尾** `DONE` — [#186](https://github.com/iDoris-ai/Agent24/pull/186)：`mutate.py` 每次运行专属 TMPDIR，结束后按命令行清扫被 init 收养的孤儿并以「⚠️ 漏收进程」警告（纵深防御；exec 走的孤儿认不出，记 FU-65）
 
 **二、停机可观测、可调**（用户裁决：参数有问题要能被发现、能被调整）
-- **SHUT-1 停机可观测性** `IN_PROGRESS` —— 先写语义说明 [`docs/design/SHUT-shutdown-observability.md`](../design/SHUT-shutdown-observability.md)（写代码前 Codex 设计审查 4 轮，v5 定稿），拆三刀叠加：**SHUT-1a** 停止事实记录 + 当场告警 `DONE` — [#187](https://github.com/iDoris-ai/Agent24/pull/187)（`d94217b`）；**SHUT-1b** 参数可调、截止模型、汇总落盘 `last-shutdown.json`、`daemon.alive` 跨启动证据 `IN_REVIEW`；**SHUT-1c** 实时出口（`GET /api/v1/daemon/shutdown`、`agent24 daemon status`、OpenAPI、`daemon` 保留段）`READY`（等 1b 合并）
+- **SHUT-1 停机可观测性** `IN_PROGRESS` —— 先写语义说明 [`docs/design/SHUT-shutdown-observability.md`](../design/SHUT-shutdown-observability.md)（写代码前 Codex 设计审查 4 轮，v5 定稿），拆三刀叠加：**SHUT-1a** 停止事实记录 + 当场告警 `DONE` — [#187](https://github.com/iDoris-ai/Agent24/pull/187)（`d94217b`）；**SHUT-1b** 参数可调、截止模型、汇总落盘 `last-shutdown.json`、`daemon.alive` 跨启动证据 `IN_REVIEW`；**SHUT-1c** 实时出口（`GET /api/v1/shutdown`、`agent24 daemon status` 的「停机」一段、OpenAPI + api-client、contract 测试）`IN_REVIEW`
 - **SHUT-2 参数可调** —— 并入 SHUT-1b：`A24_MODULE_DRAIN_MS`（0–10000，默认 800）/ `A24_MODULE_STOP_GRACE_MS`（100–5000，默认 500），非法值告警回落默认（不拒绝启动：CLI 吞 stderr、launchd 会崩溃循环），调大时上界诚实变大并写进启动日志；TASKS B2 改为「默认参数下 ≤ 2s」
 - **SHUT-3 测试** —— 分散进 1a/1b：超宽限被杀有记录有告警、排空到期切断有记录有告警、SIGKILL 后下次启动告警 / 干净后不告警、ephemeral 不碰证据；0.3s/1s 退出的对照由 `leader` 事实与宽限测试覆盖
 

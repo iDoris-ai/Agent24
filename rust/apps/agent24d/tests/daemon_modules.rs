@@ -378,6 +378,13 @@ fn a_shutdown_that_did_not_finish_is_told_at_the_next_start() {
         "no warning about the unconfirmed shutdown:\n{}",
         lines.join("\n")
     );
+    // SHUT-1c: the live report says the same, and names the budgets.
+    let (status, body) = call(second.port, &second.token, "GET", "/api/v1/shutdown", "")
+        .expect("the daemon answered");
+    assert_eq!(status, 200, "{body}");
+    let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["previous"], "unconfirmed", "{report}");
+    assert_eq!(report["exit_bound_ms"], 2000, "{report}");
     sigterm_and_wait(&mut second);
     assert!(!run.join("daemon.alive").exists());
     assert!(run.join("last-shutdown.json").exists());

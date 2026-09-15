@@ -232,6 +232,18 @@ pub fn previous(run_dir: &Path) -> Previous {
 }
 
 impl Previous {
+    /// Its name in `GET /api/v1/shutdown`.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoHistory => "no_history",
+            Self::Clean { .. } => "clean",
+            Self::Unreadable => "unreadable",
+            Self::CleanupFailed => "cleanup_failed",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+
     /// A line for the start-up log, or `None` when there is nothing to say.
     #[must_use]
     pub fn warning(&self, run_dir: &Path) -> Option<String> {
@@ -679,6 +691,68 @@ fn bounded(summary: &Summary) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// The summary the daemon before left, if one can be read.
+#[must_use]
+pub fn last_summary(run_dir: &Path) -> Option<Summary> {
+    read_json::<Summary>(&run_dir.join(SUMMARY)).and_then(Result::ok)
+}
+
+fn ms(v: u128) -> u64 {
+    u64::try_from(v).unwrap_or(u64::MAX)
+}
+
+/// What `GET /api/v1/shutdown` answers (SHUT-1c): the budgets in effect,
+/// what was warned about, and the daemon before — each figure the same one
+/// the start-up log gave.
+#[must_use]
+pub fn report(
+    params: &Params,
+    warnings: &[String],
+    evidence: Option<(&Path, &Previous, Option<Summary>)>,
+) -> agent24_protocol::ShutdownReport {
+    let ephemeral = evidence.is_none();
+    let (evidence_dir, previous, previous_detail, last) = match evidence {
+        None => (None, "no_history", None, None),
+        Some((dir, previous, last)) => (
+            Some(dir.display().to_string()),
+            previous.code(),
+            previous.warning(dir),
+            last,
+        ),
+    };
+    agent24_protocol::ShutdownReport {
+        ephemeral,
+        evidence_dir,
+        drain_ms: ms(params.drain.as_millis()),
+        stop_grace_ms: ms(params.stop_grace.as_millis()),
+        exit_bound_ms: ms(params.exit_bound().as_millis()),
+        config_warnings: warnings.to_vec(),
+        previous: previous.to_owned(),
+        previous_detail,
+        last_shutdown: last.map(|s| agent24_protocol::LastShutdown {
+            stop_result: s.stop_result.clone(),
+            began_at_ms: ms(s.began_at_ms),
+            took_ms: ms(s.took_ms),
+            killed_after_grace: s
+                .records
+                .iter()
+                .filter(|m| m.leader.as_deref() == Some("killed_after_grace"))
+                .map(|m| m.name.clone())
+                .collect(),
+            cut_requests: s
+                .records
+                .iter()
+                .filter_map(|m| {
+                    let cut = m.abandoned.unwrap_or(0) + m.never_sent.unwrap_or(0);
+                    (m.drain_ended_by.as_deref() == Some("deadline") && cut > 0)
+                        .then(|| format!("{} ({cut})", m.name))
+                })
+                .collect(),
+            omitted_records: u64::try_from(s.omitted_records).unwrap_or(u64::MAX),
+        }),
+    }
+}
+
 /// Where the two files live, for a non-ephemeral daemon.
 #[must_use]
 pub fn run_dir(state_dir: &Path) -> PathBuf {
@@ -981,6 +1055,55 @@ mod tests {
                 .expect("a FIFO blocked the start"),
             Previous::Unreadable
         );
+    }
+
+    /// The live report says what the start-up log said: the budgets, the
+    /// warnings, the previous daemon, and which modules the last shutdown
+    /// found too slow — the ones to tune for.
+    #[test]
+    fn the_report_names_the_modules_to_tune_for() {
+        let mut slow = rec(ProcessAtStop::Running);
+        slow.group = Some(GroupEnd::Gone);
+        slow.leader = Some(Leader::KilledAfterGrace);
+        let mut cut = rec(ProcessAtStop::Running);
+        cut.group = Some(GroupEnd::Gone);
+        cut.abandoned = Some(1);
+        cut.never_sent = Some(2);
+        cut.drain = Some(DrainEnd {
+            ended_by: DrainEndedBy::Deadline,
+            budget: Duration::from_millis(800),
+            elapsed: Duration::from_millis(800),
+        });
+        let last = Summary::new(
+            "x",
+            &Params::default(),
+            Duration::from_millis(900),
+            &[
+                ("slow".into(), Reason::Shutdown, slow),
+                ("busy".into(), Reason::Shutdown, cut),
+            ],
+        );
+        let d = dir();
+        let r = report(
+            &Params::default(),
+            &["A24_MODULE_DRAIN_MS=\"x\" is not…".to_owned()],
+            Some((d.path(), &Previous::Unconfirmed, Some(last))),
+        );
+        assert!(!r.ephemeral);
+        assert_eq!(
+            (r.drain_ms, r.stop_grace_ms, r.exit_bound_ms),
+            (800, 500, 2000)
+        );
+        assert_eq!(r.config_warnings.len(), 1);
+        assert_eq!(r.previous, "unconfirmed");
+        assert!(r.previous_detail.unwrap().contains("did not confirm"));
+        let last = r.last_shutdown.unwrap();
+        assert_eq!(last.killed_after_grace, ["slow"]);
+        assert_eq!(last.cut_requests, ["busy (3)"]);
+
+        let e = report(&Params::default(), &[], None);
+        assert!(e.ephemeral && e.evidence_dir.is_none() && e.last_shutdown.is_none());
+        assert_eq!(e.previous, "no_history");
     }
 
     /// A summary too big to be read back is cut to fit, and says how much it
