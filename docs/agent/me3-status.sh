@@ -48,23 +48,40 @@ cd "$(dirname "$0")/../.." || exit 1
 # 行首锚定：`^[[:space:]]*<符号>` —— 一个定义在行首（可缩进），一句
 # `// TODO: 将来会有 pub fn accept` 不在行首。
 #
-# 行首锚定认的是「物理行」，不是 Rust 定义：块注释里、raw string 里的一行
+# 行首锚定认的是「物理行」，不是 Rust 定义：注释里、字符串里的一行
 # `pub fn supervise() {}` 同样在行首，会报「已交付」—— 更糟的那个方向（复审
-# PROBE 第 1 轮）。所以先把这两种去掉再 grep（`code_only`）。去不掉的如实写：
-# 普通字符串跨行写出的定义、被 `#[cfg(...)]` 关掉的定义仍会被认成交付；反过来
-# 字符串里的 `/*`（如 "src/*.rs"）会让去注释多吞一段，只会把「已交付」误报成
-# 「未开工」—— 便宜的那个方向。要更准就得真的解析 Rust，这个脚本不做。
-code_only() { # stdin → stdout：去掉块注释与 raw string
-  # raw string：r / br / cr（C 字符串），任意个 #。块注释：Rust 允许嵌套，
-  # 所以用递归 `(?R)`，非贪婪的 `.*?` 会停在内层的 `*/`（复审 PROBE 第 2 轮）。
-  perl -0777 -pe 's{(?<![A-Za-z0-9_])[bc]?r(#*)".*?"\1}{""}gs;
-                  s{/\*(?:[^/*]++|/(?!\*)|\*(?!/)|(?R))*\*/}{}gs'
+# PROBE 第 1 轮）。所以先把注释与字面量去掉再 grep（`code_only`）。
+#
+# 它必须是**一遍、从左到右**的词法扫描：分两遍（先 raw string 后块注释，或反
+# 过来）时，一遍会吞掉另一遍的边界 —— 块注释里的 `r#"` 吃掉注释的 `*/`，字符串
+# 里的 `/*` 吃掉后面的代码（复审 PROBE 第 2、3 轮各找到一种）。一个交替式、按
+# 最左匹配扫下去，谁先开始谁整个被消费，这就是词法器的语义：行注释、嵌套块注释
+# （递归 `(?&cmt)`）、raw string（r / br / cr，任意个 #）、普通 / 字节 / C 字符
+# 串、字符字面量（先认它，免得 '"' 开出一个字符串；生命周期 'a 不匹配）。去掉
+# 时只留下其中的换行，行结构不变。
+#
+# 前提与余下的：假定文件是能编译的 Rust（读的是 main）。一个没闭合的块注释不
+# 合法，从它起到文件尾都当注释（便宜的方向）；未闭合的 `/*` 很多时扫描是平方
+# 级的，只在不合法的输入上。仍会被认成交付的（更糟的方向，接受）：被
+# `#[cfg(...)]` 关掉的定义、写在 `macro_rules!` 体里的定义。要更准就得真的
+# 解析 Rust，这个脚本不做。
+code_only() { # stdin → stdout：去掉注释与字面量，只留其中的换行
+  perl -0777 -pe '
+    s{
+        //[^\n]*
+      | (?<cmt> /\* (?: [^/*]++ | /(?!\*) | \*(?!/) | (?&cmt) )* \*/ )
+      | (?<![A-Za-z0-9_]) [bc]?r (?<h>\#*) " .*? " \k<h>
+      | [bc]? " (?: \\. | [^"\\] )*+ "
+      | \x27 (?: \\. | [^\x27\\\n] ) \x27
+    }{ (my $t = $&) =~ tr/\n//cd; $t }gsxe;
+    s{/\*.*\z}{}s;
+  '
 }
 has_symbol() { # has_symbol <符号>  —— 从 stdin 读内容
   code_only | grep -qE "^[[:space:]]*$1\b"
 }
 command -v perl >/dev/null 2>&1 || {
-  echo "⛔ 需要 perl（去掉块注释与 raw string 再认符号）。**不把「认不了」当成「没有」**。"
+  echo "⛔ 需要 perl（去掉注释与字面量再认符号）。**不把「认不了」当成「没有」**。"
   exit 2
 }
 
@@ -230,6 +247,24 @@ say 1 $? "符号在嵌套块注释里 → 未开工(Rust 的块注释可以嵌�
 printf 'const C: &CStr = cr#"\npub fn in_c_string() {}\n"#;\n' > "$tmp/craw.rs"
 tprobe "$tmp/craw.rs" "pub fn in_c_string"
 say 1 $? "符号只在 raw C 字符串(cr#\"…\"#)里 → 未开工"
+
+# 复审第 3 轮的反例：注释里的 `r#"` 不能吃掉注释的边界。
+printf '/*\npub fn leaked() {}\nr#" */\nconst S: &str = r#"ok"#;\n' > "$tmp/interleaved.rs"
+tprobe "$tmp/interleaved.rs" "pub fn leaked"
+say 1 $? "注释里写着 r#\" 也不会让注释漏出来 → 未开工"
+
+printf 'const S: &str = "\npub fn in_string() {}\n";\n' > "$tmp/string.rs"
+tprobe "$tmp/string.rs" "pub fn in_string"
+say 1 $? "符号只在跨行的普通字符串里 → 未开工"
+
+# 便宜方向的两格：字面量与行注释里的 `/*` 不许吞掉后面的真定义。
+printf 'const G: &str = "src/*.rs";\nconst Q: char = \x27"\x27;\npub fn after_glob() {}\n' > "$tmp/glob.rs"
+tprobe "$tmp/glob.rs" "pub fn after_glob"
+say 0 $? "字符串里的 /* 与字符字面量 '\"' 之后的真定义仍被探到"
+
+printf '// 见 /* 这里\npub fn after_line() {}\n' > "$tmp/line.rs"
+tprobe "$tmp/line.rs" "pub fn after_line"
+say 0 $? "行注释里的 /* 之后的真定义仍被探到"
 
 printf '/* 一段注释 */\npub fn after_comment() {}\n' > "$tmp/after.rs"
 tprobe "$tmp/after.rs" "pub fn after_comment"
