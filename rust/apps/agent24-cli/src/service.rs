@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 8] = [
+pub const PASSTHROUGH_VARS: [&str; 10] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -130,6 +130,11 @@ pub const PASSTHROUGH_VARS: [&str; 8] = [
     // `~/.agent24/packages` — and the CLI still printed "it takes effect at the
     // next daemon start".
     "A24_OS_PACKAGES",
+    // SHUT-1b: the modules' shutdown budgets. A service that should run with
+    // raised ones gets them only through here — and only after `agent24 service
+    // install` is re-run, since this is a snapshot.
+    "A24_MODULE_DRAIN_MS",
+    "A24_MODULE_STOP_GRACE_MS",
 ];
 
 /// Snapshot the environment the daemon should run with.

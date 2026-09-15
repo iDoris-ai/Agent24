@@ -629,7 +629,7 @@ mod tests {
         );
         assert!(applied(host.supervisors.disabled_slot("remote").as_ref()));
         for stop in host.supervisors.close().disabling {
-            stop.await.unwrap();
+            stop.task.await.unwrap();
         }
 
         let tmp = tempfile::Builder::new()
@@ -648,7 +648,7 @@ mod tests {
             HotStop::Stopping
         );
         for stop in host.supervisors.close().disabling {
-            stop.await.unwrap();
+            stop.task.await.unwrap();
         }
     }
 
