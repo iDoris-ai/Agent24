@@ -26,6 +26,11 @@ pub const PERSIST: Duration = Duration::from_millis(200);
 /// After the later of the HTTP and persistence deadlines: the runtime's own
 /// teardown, before the watchdog ends the process.
 pub const WATCHDOG_MARGIN: Duration = Duration::from_millis(300);
+/// How long `main` lets the runtime tear down once `serve` returns. The two
+/// were one number written twice; tied here, so changing one cannot quietly
+/// outgrow the margin the watchdog leaves it (review of #188, L-1).
+pub const RUNTIME_TEARDOWN: Duration = WATCHDOG_MARGIN;
+const _: () = assert!(RUNTIME_TEARDOWN.as_millis() <= WATCHDOG_MARGIN.as_millis());
 
 pub const DRAIN_ENV: &str = "A24_MODULE_DRAIN_MS";
 pub const GRACE_ENV: &str = "A24_MODULE_STOP_GRACE_MS";
