@@ -114,6 +114,9 @@ pub struct StopRecord {
     pub supervisor: Option<SupervisorEnd>,
     /// When the drain began, so a cut can say how long it had run.
     drain_began: Option<(Instant, Duration)>,
+    /// The owner is giving up on the stop: a loop that ends without having
+    /// finished its stop by itself was cut off, not merely killed.
+    abandoning: bool,
 }
 
 impl StopRecord {
@@ -173,8 +176,31 @@ impl StopRecordHandle {
     }
 
     /// The group is confirmed empty: every fact of that, in one step.
+    #[cfg(test)]
     pub(crate) fn gone(&self, facts: GoneFacts) {
+        Self::gone_in(&mut self.lock(), facts);
+    }
+
+    /// The group of the stop that was asked for is confirmed empty, and that
+    /// stop ran no drain of its own — a run that ended by itself as the stop
+    /// arrived: that there was a process, that nothing was drained, and every
+    /// fact of the group's end, under one lock, so no snapshot sees a part
+    /// (review of SHUT-1a, round 2).
+    pub(crate) fn stopped_gone(&self, budget: Duration, facts: GoneFacts) {
         let mut r = self.lock();
+        once(&mut r.process, ProcessAtStop::Running);
+        once(
+            &mut r.drain,
+            DrainEnd {
+                ended_by: DrainEndedBy::Skipped,
+                budget,
+                elapsed: Duration::ZERO,
+            },
+        );
+        Self::gone_in(&mut r, facts);
+    }
+
+    fn gone_in(r: &mut StopRecord, facts: GoneFacts) {
         if r.group.is_some() {
             return;
         }
@@ -193,19 +219,31 @@ impl StopRecordHandle {
         once(&mut self.lock().supervisor, end);
     }
 
-    /// The stop was cut short: its owner gave up on it (only the owner's
-    /// give-up branch says so).
-    pub(crate) fn cut(&self) {
-        once(&mut self.lock().supervisor, SupervisorEnd::CutOff);
+    /// The owner is giving up on the stop — said before it aborts the loop,
+    /// so the loop's end can tell a cut from a kill (review of SHUT-1a,
+    /// round 2).
+    pub(crate) fn abandoning(&self) {
+        self.lock().abandoning = true;
     }
 
     /// The loop is gone — returned, aborted or panicking: fill in what only
-    /// its end can tell (SHUT-1a, review round 1). A drain that began and
-    /// never ended was cut; a stop whose process nobody recorded had one iff
-    /// a process was still unconfirmed; and the loop's own end, unless its
-    /// owner already said it cut the stop short.
-    pub(crate) fn finalize(&self, process_left: bool, end: SupervisorEnd) {
+    /// its end can tell (SHUT-1a, review rounds 1 and 2). A drain that began
+    /// and never ended was cut; a stop whose process nobody recorded had one
+    /// iff a process was still unconfirmed; and the loop's own end: `Stopped`
+    /// only when it `returned` having finished its stop, else `Panicked`, else
+    /// `CutOff` if its owner was giving up on it, else `Killed`. One step, so
+    /// the owner giving up and the loop finishing cannot both be recorded.
+    pub(crate) fn finalize(&self, process_left: bool, panicking: bool, returned: bool) {
         let mut r = self.lock();
+        let end = if panicking {
+            SupervisorEnd::Panicked
+        } else if returned {
+            SupervisorEnd::Stopped
+        } else if r.abandoning {
+            SupervisorEnd::CutOff
+        } else {
+            SupervisorEnd::Killed
+        };
         if r.drain.is_none()
             && let Some((began, budget)) = r.drain_began
         {
@@ -248,7 +286,8 @@ mod tests {
         });
         h.group(GroupEnd::KillAttempted);
         h.supervisor(SupervisorEnd::Stopped);
-        h.cut();
+        h.abandoning();
+        h.finalize(false, false, false);
         let r = h.snapshot();
         assert_eq!(r.process, Some(ProcessAtStop::Running));
         assert_eq!(r.group, Some(GroupEnd::Gone));
@@ -265,18 +304,30 @@ mod tests {
     fn the_loops_end_fills_in_a_cut_drain_and_its_own_end() {
         let h = StopRecordHandle::default();
         h.drain_began(Duration::from_secs(30));
-        h.cut();
-        h.finalize(true, SupervisorEnd::Killed);
+        h.abandoning();
+        h.finalize(true, false, false);
         let r = h.snapshot();
         assert_eq!(r.drain.unwrap().ended_by, DrainEndedBy::Cut);
         assert_eq!(r.supervisor, Some(SupervisorEnd::CutOff));
         assert_eq!(r.process, Some(ProcessAtStop::Running));
         assert!(!r.group_settled(), "a running group's end is still unknown");
 
+        // The owner gave up, but the loop had finished its stop by itself:
+        // that is a stop, not a cut — one decision, not two writers.
+        let h = StopRecordHandle::default();
+        h.abandoning();
+        h.finalize(false, false, true);
+        assert_eq!(h.snapshot().supervisor, Some(SupervisorEnd::Stopped));
+
+        // Aborted without anyone giving up: killed.
+        let h = StopRecordHandle::default();
+        h.finalize(true, false, false);
+        assert_eq!(h.snapshot().supervisor, Some(SupervisorEnd::Killed));
+
         let h = StopRecordHandle::default();
         h.drain_began(Duration::from_secs(30));
         h.drain_skipped(Duration::ZERO);
-        h.finalize(false, SupervisorEnd::Stopped);
+        h.finalize(false, false, true);
         let r = h.snapshot();
         assert_eq!(r.drain.unwrap().ended_by, DrainEndedBy::Skipped);
         assert_eq!(r.process, Some(ProcessAtStop::None));

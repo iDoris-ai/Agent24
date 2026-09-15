@@ -236,15 +236,22 @@ impl SupervisorHandle {
             let joined = match joined {
                 Some(Some(joined)) => Some(joined),
                 Some(None) => {
-                    // Cut short: only this branch says so (SHUT-1a) — a loop
-                    // cancelled any other way is `Killed`, not `CutOff`.
-                    self.record.cut();
-                    if let Some(task) = self.task.take() {
-                        task.abort();
-                        // Resolves only once the task's future is dropped.
-                        let _ = task.await;
+                    // Giving up: said before the abort, so the loop's end
+                    // records a cut rather than a kill (SHUT-1a) — unless the
+                    // loop finished its stop by itself before the abort took,
+                    // which the join below tells apart; then this is a stop
+                    // like any other, and is answered as one (review of
+                    // SHUT-1a, round 2).
+                    self.record.abandoning();
+                    let Some(task) = self.task.take() else {
+                        return Err(SupervisorError::Killed);
+                    };
+                    task.abort();
+                    // Resolves only once the task's future is dropped.
+                    match task.await {
+                        Err(e) if e.is_cancelled() => return Err(SupervisorError::Killed),
+                        finished => Some(finished),
                     }
-                    return Err(SupervisorError::Killed);
                 }
                 None => None,
             };
@@ -487,10 +494,10 @@ impl Drop for Exit {
             .slot
             .unconfirmed
             .load(std::sync::atomic::Ordering::SeqCst);
-        let end = if std::thread::panicking() {
+        let panicking = std::thread::panicking();
+        if panicking {
             tracing::error!("the supervisor loop panicked");
             self.status.send_replace(Status::Panicked);
-            crate::stop_record::SupervisorEnd::Panicked
         } else if !matches!(
             *self.status.borrow(),
             Status::Stopped | Status::StopFailed { .. }
@@ -498,13 +505,16 @@ impl Drop for Exit {
             // Aborted (the handle was dropped): the process went with the task,
             // SIGKILLed, not waited for — so not `Stopped`.
             self.status.send_replace(Status::Killed);
-            crate::stop_record::SupervisorEnd::Killed
-        } else {
-            crate::stop_record::SupervisorEnd::Stopped
-        };
+        }
         // Every way out ends the record, including an abort before the loop
-        // saw the stop (review of SHUT-1a, round 1).
-        self.slot.record.finalize(!holds_no_process, end);
+        // saw the stop (review of SHUT-1a, round 1). Only `Stopped` says the
+        // loop returned having finished its stop: a `StopFailed` loop is still
+        // waiting for one when it is aborted, and one that saw its stop wrote
+        // so itself before returning (round 2).
+        let returned = matches!(*self.status.borrow(), Status::Stopped);
+        self.slot
+            .record
+            .finalize(!holds_no_process, panicking, returned);
         if holds_no_process {
             self.slot.release();
         }
@@ -538,6 +548,11 @@ async fn run_loop(
                     slot.retire();
                     status.send_replace(Status::StopFailed { error });
                     stop_requested(&mut stop).await;
+                    // The stop it waited for: no drain, the group's end is
+                    // `failed`, and the loop returns by itself (review of
+                    // SHUT-1a, round 2).
+                    saw_stop(record, &stop, ProcessAtStop::Running);
+                    record.supervisor(crate::stop_record::SupervisorEnd::Stopped);
                     return;
                 }
                 Ok(Run::StopRequested) => {
@@ -932,9 +947,9 @@ async fn finish(
     let gone = |facts| {
         slot.unconfirmed
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        if stop.borrow().is_some() {
-            saw_stop(record, stop, crate::stop_record::ProcessAtStop::Running);
-            record.gone(facts);
+        let asked = *stop.borrow();
+        if let Some(budget) = asked {
+            record.stopped_gone(budget, facts);
             stop_seen = true;
             warn_if_tight(name, timings, &record.snapshot());
         }
