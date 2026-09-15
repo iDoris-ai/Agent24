@@ -71,6 +71,14 @@ probe() { # probe <描述> <文件> <符号>
     echo "  ◐ 只在本地   $desc   (你这棵树上有,$REF 上还没有 —— 未合并)"
     return 1
   fi
+  # 文件已在 REF、符号却不在：要么还没写（刚开工的空壳，或者这一刀落在一个早就
+  # 存在的文件里，如 3g 的 domain.rs），要么是这一行的符号预言过期了
+  # （交付用了别的名字）。两者探针分不清，所以不下结论，只点名要人核对 ——
+  # 「预言过期」已经发生过两次，每次都是报「未开工」报了好几个 PR 才被发现。
+  if git cat-file -e "$REF:$file" 2>/dev/null; then
+    echo "  ◌ 未开工?    $desc   (文件已在 $REF,但找不到 \`$sym\` —— 还没写,还是这一行的符号过期了?)"
+    return 1
+  fi
   echo "  ○ 未开工     $desc"
   return 1
 }
@@ -97,18 +105,23 @@ echo "  你这棵树是 ${tree_coord}"
 echo
 
 # ⚠️ 未开工那几刀的符号是**预言**,不是读数。交付时若 API 用了别的名字,这一行
-# 会永远停在 ○ —— 那已经发生过一次:`3b-3 进程监督` 原本预言 `pub struct
+# 会永远停在 ○ —— 那已经发生过两次:`3b-3 进程监督` 原本预言 `pub struct
 # Supervisor`,而 #171 交付的是 `RestartPolicy` + `terminate_group`,于是它在
-# supervise.rs 已经合进 main 之后仍报「未开工」。
+# supervise.rs 已经合进 main 之后仍报「未开工」;改成 `terminate_group` 之后,
+# SUP-1…5 又把它和 `pub fn spawn` 一起改掉了(`spawn` 变成 `async`,组终止收进
+# `ModuleProcess::stop`),两格又报了五个 PR 的「未开工」。
 #
 # **所以交付一刀时,改这一行是交付的一部分**,和写测试一样 —— 不是事后整理。
+# 并且:符号写成对无关修饰宽容的形状(`pub (async )?fn`),文件已在 main 而符号
+# 不在时探针报 ◌ 而不是 ○(见 probe),下面的自证在 REF 上探一遍这两个交付过的
+# 符号 —— 这三件都是为了让「预言过期」不再安静。
 probe "3a   发现与安装"          rust/crates/agent24-os-packages/src/install.rs "pub fn install"
 probe "3b-1 framing"             rust/crates/agent24-os-proto/src/frame.rs       "pub fn read_frame"
 probe "3b-2a 版本协商"           rust/crates/agent24-os-proto/src/version.rs     "pub fn negotiate"
 probe "3b-2b initialize 线格式"  rust/crates/agent24-os-proto/src/initialize.rs  "pub fn accept"
 probe "3b-3 manifest spawn 字段" rust/crates/agent24-domain/src/lib.rs           "pub struct SpawnCommand"
-probe "3b-3 解析+起进程"         rust/crates/agent24-os-proto/src/launch.rs      "pub fn spawn"
-probe "3b-3 进程监督"            rust/crates/agent24-os-proto/src/supervise.rs   "pub fn terminate_group"
+probe "3b-3 解析+起进程"         rust/crates/agent24-os-proto/src/launch.rs      "pub (async )?fn spawn"
+probe "3b-3 进程监督"            rust/crates/agent24-os-proto/src/supervisor.rs  "pub fn supervise"
 probe "3b-4 受约束代理"          rust/crates/agent24-os-proto/src/proxy.rs       "pub fn proxy_router"
 probe "3b-5 两阶段热 disable"    rust/crates/agent24-os-proto/src/drain.rs       "pub enum DrainState"
 probe "3c   回调通道其余部分"    rust/crates/agent24-os-proto/src/rpc.rs         "pub fn dispatch"
@@ -153,3 +166,17 @@ say 0 $? "同名符号真的定义了 → 已交付(证明上面两格不是靠�
 printf '    pub fn indented() {}\n' > "$tmp/indent.rs"
 tprobe "$tmp/indent.rs" "pub fn indented"
 say 0 $? "缩进的定义仍被探到(行首锚定不等于必须顶格)"
+
+printf 'pub async fn spawn() {}\n' > "$tmp/async.rs"
+tprobe "$tmp/async.rs" "pub (async )?fn spawn"
+say 0 $? "async 定义被宽容形状探到(\`spawn\` 变成 async 曾让一格静默过期)"
+
+# 上面几格只证识别规则,跑在临时文件上;这两格走真路径 —— 读 $REF —— 探两个
+# 已知交付过的 SUP 符号。它们报 ✗ 说明「读 REF」这条路坏了,或者这两个符号又
+# 被改名了 —— 两种都要有人来改上面的行,而不是让它们安静地报「未开工」。
+REF_SUP_OK=0
+for spec in "rust/crates/agent24-os-proto/src/launch.rs|pub (async )?fn spawn" \
+            "rust/crates/agent24-os-proto/src/supervisor.rs|pub fn supervise"; do
+  git show "$REF:${spec%%|*}" 2>/dev/null | has_symbol "${spec#*|}" || REF_SUP_OK=1
+done
+say 0 $REF_SUP_OK "已知交付的 SUP 符号在 $REF 上被探到(走真的读 REF 路径)"
