@@ -188,7 +188,9 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<Result<T, ()>>
     {
         use std::os::unix::fs::OpenOptionsExt;
         let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
-        opts.custom_flags(i32::try_from(flags.bits()).unwrap_or(0));
+        // Reinterpreted, never defaulted: a fallback of 0 would open through
+        // a link and block on a FIFO — the very things these flags forbid.
+        opts.custom_flags(flags.bits().cast_signed());
     }
     let file = match opts.open(path) {
         Ok(f) => f,
