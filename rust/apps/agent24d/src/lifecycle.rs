@@ -212,23 +212,32 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<Result<T, ()>>
 /// The previous daemon, from the two files — the marker first: while it is
 /// there, a summary that cannot be read does not hide that the daemon that
 /// wrote the marker left no matching one.
-#[must_use]
+#[cfg(test)]
 pub fn previous(run_dir: &Path) -> Previous {
+    evidence(run_dir).0
+}
+
+/// [`previous`], with the summary it was judged from — one read of each
+/// file, so the verdict and the summary it reports on are the same snapshot
+/// (review of SHUT-1c, round 1).
+#[must_use]
+pub fn evidence(run_dir: &Path) -> (Previous, Option<Summary>) {
     let alive = read_json::<Alive>(&run_dir.join(ALIVE));
     if matches!(alive, Some(Err(()))) {
         // A marker that cannot be read: no summary could be matched to it.
-        return Previous::Unconfirmed;
+        return (Previous::Unconfirmed, None);
     }
     let summary = read_json::<Summary>(&run_dir.join(SUMMARY));
-    match (alive, summary) {
+    let previous = match (&alive, &summary) {
         (None, None) => Previous::NoHistory,
         (None, Some(Ok(s))) => Previous::Clean {
-            stop_result: s.stop_result,
+            stop_result: s.stop_result.clone(),
         },
         (None, Some(Err(()))) => Previous::Unreadable,
         (Some(Ok(a)), Some(Ok(s))) if a.instance_id == s.instance_id => Previous::CleanupFailed,
         (Some(_), _) => Previous::Unconfirmed,
-    }
+    };
+    (previous, summary.and_then(Result::ok))
 }
 
 impl Previous {
@@ -635,7 +644,10 @@ impl Summary {
                 if let (Some(by), Some(ms)) = (&m.drain_ended_by, m.drain_ms) {
                     parts.push(format!("drain {by} {ms}ms"));
                 }
-                let cut = m.abandoned.unwrap_or(0) + m.never_sent.unwrap_or(0);
+                let cut = m
+                    .abandoned
+                    .unwrap_or(0)
+                    .saturating_add(m.never_sent.unwrap_or(0));
                 if cut > 0 {
                     parts.push(format!("cut {cut}"));
                 }
@@ -691,12 +703,6 @@ fn bounded(summary: &Summary) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// The summary the daemon before left, if one can be read.
-#[must_use]
-pub fn last_summary(run_dir: &Path) -> Option<Summary> {
-    read_json::<Summary>(&run_dir.join(SUMMARY)).and_then(Result::ok)
-}
-
 fn ms(v: u128) -> u64 {
     u64::try_from(v).unwrap_or(u64::MAX)
 }
@@ -743,7 +749,12 @@ pub fn report(
                 .records
                 .iter()
                 .filter_map(|m| {
-                    let cut = m.abandoned.unwrap_or(0) + m.never_sent.unwrap_or(0);
+                    // Saturating: these come from a file on disk (review of
+                    // SHUT-1c, round 1).
+                    let cut = m
+                        .abandoned
+                        .unwrap_or(0)
+                        .saturating_add(m.never_sent.unwrap_or(0));
                     (m.drain_ended_by.as_deref() == Some("deadline") && cut > 0)
                         .then(|| format!("{} ({cut})", m.name))
                 })

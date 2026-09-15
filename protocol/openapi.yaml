@@ -974,12 +974,15 @@ components:
         drain_ms:
           type: integer
           minimum: 0
+          maximum: 10000
         stop_grace_ms:
           type: integer
           minimum: 0
+          maximum: 5000
         exit_bound_ms:
           type: integer
           minimum: 0
+          maximum: 60000
           description: From SIGTERM to the process gone, at the latest (2000 at the defaults).
         config_warnings:
           type: array
@@ -1002,9 +1005,11 @@ components:
         began_at_ms:
           type: integer
           minimum: 0
+          maximum: 9007199254740991
         took_ms:
           type: integer
           minimum: 0
+          maximum: 9007199254740991
         killed_after_grace:
           type: array
           items:
@@ -1016,6 +1021,7 @@ components:
         omitted_records:
           type: integer
           minimum: 0
+          maximum: 9007199254740991
     Health:
       type: object
       required: [status, version, backend]

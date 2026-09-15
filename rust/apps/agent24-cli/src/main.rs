@@ -140,7 +140,7 @@ struct Endpoint {
 /// which modules its shutdown found too slow — each with the knob to turn.
 fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
     let mut out = vec![format!(
-        "shutdown · drain {}ms · stop grace {}ms · a SIGTERM exits within {}ms",
+        "shutdown · drain {}ms · stop grace {}ms · exits within {}ms of SIGTERM",
         r.drain_ms, r.stop_grace_ms, r.exit_bound_ms
     )];
     for w in &r.config_warnings {
@@ -657,19 +657,31 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                         "running · pid {} · port {} · backend {} · v{}",
                         state.pid, state.port, health.backend, health.version
                     );
-                    // SHUT-1c. A daemon from before it answers 405: nothing
-                    // more to say then.
-                    if let Ok(res) = client()
+                    // SHUT-1c. Only a daemon from before it (405) is skipped
+                    // quietly; any other failure is said, since the report is
+                    // how a budget that is too tight gets noticed (review of
+                    // SHUT-1c, round 1).
+                    match client()
                         .get(format!("{base}/api/v1/shutdown"))
                         .bearer_auth(&state.token)
                         .send()
                         .await
-                        && res.status().is_success()
-                        && let Ok(report) = res.json::<agent24_protocol::ShutdownReport>().await
                     {
-                        for line in shutdown_lines(&report) {
-                            println!("{line}");
+                        Ok(res) if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {}
+                        Ok(res) if res.status().is_success() => {
+                            match res.json::<agent24_protocol::ShutdownReport>().await {
+                                Ok(report) => {
+                                    for line in shutdown_lines(&report) {
+                                        println!("{line}");
+                                    }
+                                }
+                                Err(e) => println!("  (shutdown report unreadable: {e})"),
+                            }
                         }
+                        Ok(res) => {
+                            println!("  (shutdown report: daemon returned {})", res.status())
+                        }
+                        Err(e) => println!("  (shutdown report unavailable: {e})"),
                     }
                 } else {
                     println!(
@@ -833,7 +845,7 @@ mod tests {
             }),
         };
         let lines = shutdown_lines(&r).join("\n");
-        assert!(lines.contains("drain 800ms · stop grace 500ms · a SIGTERM exits within 2000ms"));
+        assert!(lines.contains("drain 800ms · stop grace 500ms · exits within 2000ms of SIGTERM"));
         assert!(lines.contains("! A24_MODULE_DRAIN_MS"));
         assert!(lines.contains("previous shutdown: clean (1120ms)"));
         assert!(lines.contains("slow — raise A24_MODULE_STOP_GRACE_MS"));

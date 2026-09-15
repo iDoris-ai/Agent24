@@ -810,11 +810,11 @@ pub async fn serve(
     } else {
         agent24_protocol::state_file::state_dir().map(|state| {
             let run = crate::lifecycle::run_dir(&state);
-            let previous = crate::lifecycle::previous(&run);
+            let (previous, last) = crate::lifecycle::evidence(&run);
             if let Some(warning) = previous.warning(&run) {
                 tracing::warn!("{warning}");
             }
-            evidence = Some((run.clone(), previous, crate::lifecycle::last_summary(&run)));
+            evidence = Some((run.clone(), previous, last));
             let (guard, warning) = crate::lifecycle::MarkerGuard::create(&run);
             if let Some(warning) = warning {
                 tracing::warn!("{warning}");
