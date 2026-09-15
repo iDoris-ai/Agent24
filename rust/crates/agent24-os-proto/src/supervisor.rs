@@ -133,6 +133,8 @@ pub struct SupervisorHandle {
     stop: watch::Sender<Option<Duration>>,
     status: watch::Receiver<Status>,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// What is known about the stop, written by the loop as it goes.
+    record: crate::stop_record::StopRecordHandle,
 }
 
 impl SupervisorHandle {
@@ -147,6 +149,14 @@ impl SupervisorHandle {
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<Status> {
         self.status.clone()
+    }
+
+    /// A shared handle on what is known about this supervisor's stop — taken
+    /// before the stop is asked for (the stop consumes the handle), read
+    /// after, or at any deadline in between (SHUT-1a).
+    #[must_use]
+    pub fn stop_record(&self) -> crate::stop_record::StopRecordHandle {
+        self.record.clone()
     }
 
     /// Stop the module (revoke, SIGTERM, grace, SIGKILL) and the loop, and
@@ -226,6 +236,9 @@ impl SupervisorHandle {
             let joined = match joined {
                 Some(Some(joined)) => Some(joined),
                 Some(None) => {
+                    // Cut short: only this branch says so (SHUT-1a) — a loop
+                    // cancelled any other way is `Killed`, not `CutOff`.
+                    self.record.cut();
                     if let Some(task) = self.task.take() {
                         task.abort();
                         // Resolves only once the task's future is dropped.
@@ -240,12 +253,22 @@ impl SupervisorHandle {
                 && e.is_panic()
             {
                 tracing::error!("the supervisor loop had panicked: {e}");
+                self.record
+                    .supervisor(crate::stop_record::SupervisorEnd::Panicked);
                 return Err(SupervisorError::Panicked);
             }
             // Only `Stopped` is a clean stop. Anything else at this point — the
             // task cancelled by its runtime's shutdown (`Killed`), say — is
             // not, whatever the `JoinError` said (round 9).
-            match self.status.borrow().clone() {
+            let status = self.status.borrow().clone();
+            self.record.supervisor(match status {
+                Status::Stopped | Status::StopFailed { .. } => {
+                    crate::stop_record::SupervisorEnd::Stopped
+                }
+                Status::Panicked => crate::stop_record::SupervisorEnd::Panicked,
+                _ => crate::stop_record::SupervisorEnd::Killed,
+            });
+            match status {
                 Status::Stopped => Ok(()),
                 Status::StopFailed { error } => Err(SupervisorError::StopFailed { error }),
                 Status::Panicked => Err(SupervisorError::Panicked),
@@ -328,6 +351,7 @@ pub fn supervise(
     timings: Timings,
 ) -> Result<SupervisorHandle, SlotHeld> {
     let slot = Slot::claim(current).ok_or(SlotHeld)?;
+    let record = slot.record.clone();
     let (stop_tx, stop_rx) = watch::channel(None);
     let (status_tx, status_rx) = watch::channel(Status::Starting { attempt: 1 });
     // Built here and moved into the task, not built inside it: a task aborted
@@ -342,6 +366,7 @@ pub fn supervise(
         stop: stop_tx,
         status: status_rx,
         task: Some(task),
+        record,
     })
 }
 
@@ -379,6 +404,9 @@ struct Slot {
     /// which says `Starting` for a loop that never got to spawn anything
     /// (review of ME3-SUP slice 3a, round 8).
     unconfirmed: std::sync::atomic::AtomicBool,
+    /// What is known about this supervisor's stop (SHUT-1a); the handle
+    /// holds a clone.
+    record: crate::stop_record::StopRecordHandle,
 }
 
 impl Slot {
@@ -391,6 +419,7 @@ impl Slot {
             mine: std::sync::Mutex::new(mine),
             released: std::sync::atomic::AtomicBool::new(false),
             unconfirmed: std::sync::atomic::AtomicBool::new(false),
+            record: crate::stop_record::StopRecordHandle::default(),
         })
     }
 
@@ -483,7 +512,9 @@ async fn run_loop(
     timings: Timings,
     mut stop: watch::Receiver<Option<Duration>>,
 ) {
+    use crate::stop_record::ProcessAtStop;
     let (slot, status) = (&exit.slot, &exit.status);
+    let record = &slot.record;
     let mut policy = RestartPolicy::with_base(timings.backoff_base);
     let mut attempt = 0u32;
     loop {
@@ -492,6 +523,9 @@ async fn run_loop(
         let (why, ready_at, ended_at) =
             match run_once(&spec, &dir, slot, &methods, &timings, &mut stop, status).await {
                 Err(Unconfirmed(error)) => {
+                    // The group's end is `failed` (written by `finish` before
+                    // the process was dropped); a process may still be there.
+                    record.process(ProcessAtStop::Running);
                     // No restart over a group that may still be there.
                     tracing::error!(module = %spec.name, "not restarting: {error}");
                     slot.retire();
@@ -531,6 +565,7 @@ async fn run_loop(
                     () = stop_requested(&mut stop) => {
                         // The placeholder put in above must not outlive the
                         // module: `module_not_ready` would promise a return.
+                        record.process(ProcessAtStop::None);
                         slot.stopped(status);
                         return;
                     }
@@ -547,6 +582,7 @@ async fn run_loop(
                     within,
                 });
                 stop_requested(&mut stop).await;
+                record.process(ProcessAtStop::None);
                 slot.stopped(status);
                 return;
             }
@@ -578,6 +614,8 @@ async fn run_once(
     stop: &mut watch::Receiver<Option<Duration>>,
     status: &watch::Sender<Status>,
 ) -> Result<Run, Unconfirmed> {
+    use crate::stop_record::ProcessAtStop;
+    let record = &slot.record;
     let failed = |why: Stopped| Run::Ended {
         why,
         ready_at: None,
@@ -607,7 +645,10 @@ async fn run_once(
     // the entry cap.)
     let spawned = tokio::select! {
         biased;
-        () = stop_requested(stop) => return Ok(Run::StopRequested),
+        () = stop_requested(stop) => {
+            record.process(ProcessAtStop::None);
+            return Ok(Run::StopRequested);
+        }
         spawned = launch::spawn(LaunchSpec {
             name: &spec.name,
             command: &spec.command,
@@ -619,9 +660,13 @@ async fn run_once(
         }) => spawned,
     };
     let mut process = match spawned {
-        Ok(p) => {
+        Ok(mut p) => {
             slot.unconfirmed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Dropped without a confirmed stop — the loop cut short, cancelled
+            // or panicking — the process says whether it sent SIGKILL.
+            let on_drop = record.clone();
+            p.on_unstopped_drop(move |group| on_drop.group(group));
             p
         }
         Err(e) => {
@@ -633,7 +678,8 @@ async fn run_once(
     // past its stop branch lets the spawn finish in the same poll. Stop that
     // process now rather than hand it a generation (review of SUP-4, round 3).
     if stop.borrow().is_some() {
-        finish(process, timings, &spec.name, status, slot).await?;
+        record.process(ProcessAtStop::Running);
+        finish(process, timings, &spec.name, status, slot, true).await?;
         return Ok(Run::StopRequested);
     }
     let generation = process.generation().clone();
@@ -651,13 +697,14 @@ async fn run_once(
     let handshaken = tokio::select! {
         biased;
         () = stop_requested(stop) => {
-            finish(process, timings, &spec.name, status, slot).await?;
+            record.process(ProcessAtStop::Running);
+            finish(process, timings, &spec.name, status, slot, true).await?;
             return Ok(Run::StopRequested);
         }
         exited = process.exited() => {
             tracing::warn!(module = %spec.name, ?exited, "the module exited before its handshake");
             let run = failed(Stopped::Exited);
-            finish(process, timings, &spec.name, status, slot).await?;
+            finish(process, timings, &spec.name, status, slot, false).await?;
             return Ok(run);
         }
         result = async {
@@ -670,7 +717,7 @@ async fn run_once(
         Err(why) => {
             tracing::warn!(module = %spec.name, "the module did not complete its handshake: {why}");
             let run = failed(Stopped::StartupTimeout);
-            finish(process, timings, &spec.name, status, slot).await?;
+            finish(process, timings, &spec.name, status, slot, false).await?;
             return Ok(run);
         }
     };
@@ -696,7 +743,8 @@ async fn run_once(
     match admitted {
         Admitted::Ready => {}
         Admitted::Stopping => {
-            finish(process, timings, &spec.name, status, slot).await?;
+            record.process(ProcessAtStop::Running);
+            finish(process, timings, &spec.name, status, slot, true).await?;
             return Ok(Run::StopRequested);
         }
         Admitted::Revoked => {
@@ -705,7 +753,7 @@ async fn run_once(
             // still not a ready module.
             tracing::error!(module = %spec.name, "the generation was revoked during its handshake");
             let run = failed(Stopped::StartupTimeout);
-            finish(process, timings, &spec.name, status, slot).await?;
+            finish(process, timings, &spec.name, status, slot, false).await?;
             return Ok(run);
         }
     }
@@ -729,11 +777,30 @@ async fn run_once(
         exited = process.exited() => Some(format!("the module exited: {exited:?}")),
     };
     if outcome.is_none() {
+        record.process(ProcessAtStop::Running);
         let drain = (*stop.borrow()).unwrap_or_default();
-        drain_run(&spec.name, &generation, drain, &mut serve, &mut process).await;
+        record.drain(
+            drain_run(
+                &spec.name,
+                &generation,
+                drain,
+                &mut serve,
+                &mut process,
+                record,
+            )
+            .await,
+        );
     }
     let ended_at = std::time::Instant::now();
-    finish(process, timings, &spec.name, status, slot).await?;
+    finish(
+        process,
+        timings,
+        &spec.name,
+        status,
+        slot,
+        outcome.is_none(),
+    )
+    .await?;
     Ok(match outcome {
         None => Run::StopRequested,
         Some(why) => {
@@ -772,10 +839,19 @@ async fn drain_run(
     drain: Duration,
     serve: &mut std::pin::Pin<&mut impl std::future::Future<Output = rpc::Ended>>,
     process: &mut ModuleProcess,
-) {
-    if drain.is_zero() || !generation.begin_drain(std::time::Instant::now(), drain) {
-        return;
+    record: &crate::stop_record::StopRecordHandle,
+) -> crate::stop_record::DrainEnd {
+    use crate::stop_record::{DrainEnd, DrainEndedBy};
+    let began = std::time::Instant::now();
+    let end = |ended_by| DrainEnd {
+        ended_by,
+        budget: drain,
+        elapsed: began.elapsed(),
+    };
+    if drain.is_zero() || !generation.begin_drain(began, drain) {
+        return end(DrainEndedBy::Skipped);
     }
+    record.drain_began(drain);
     tracing::info!(
         module = name,
         in_flight = generation.in_flight(),
@@ -787,24 +863,32 @@ async fn drain_run(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
-    tokio::select! {
-        () = idle => {}
-        () = tokio::time::sleep_until(deadline) => {}
-        _ = serve.as_mut() => {}
-        _ = process.exited() => {}
-    }
+    let ended_by = tokio::select! {
+        () = idle => DrainEndedBy::Idle,
+        () = tokio::time::sleep_until(deadline) => DrainEndedBy::Deadline,
+        _ = serve.as_mut() => DrainEndedBy::CallbackEnded,
+        _ = process.exited() => DrainEndedBy::ProcessExited,
+    };
+    end(ended_by)
 }
 
 /// Stop a run's process, with the status saying so while it happens. A stop
 /// that fails is reported: the process is dropped, which SIGKILLs its group
 /// once more, but its end is not confirmed.
+///
+/// `stopping`: this is the stop that was asked for, so its facts go in the
+/// record (SHUT-1a). A run that ended by itself is stopped here too, but that
+/// is not the stop the record describes — unless it fails, which ends the
+/// supervisor for good and so is recorded either way.
 async fn finish(
     mut process: ModuleProcess,
     timings: &Timings,
     name: &str,
     status: &watch::Sender<Status>,
     slot: &Slot,
+    stopping: bool,
 ) -> Result<(), Unconfirmed> {
+    let record = &slot.record;
     // Revoked before `Stopping` is published: whoever sees `Stopping` must
     // find new work already refused (review of ME3-SUP slice 3a, round 2).
     // A `false` here — revoked by someone else — is reported by `stop`.
@@ -814,9 +898,14 @@ async fn finish(
     // the output drains and before anything that could panic (a log line
     // included), so neither a cancellation nor a panic past that point leaves
     // a stopped supervisor holding its slot (rounds 9 and 10).
-    let gone = || {
+    // The stop's facts are recorded here too, in one step and without a log
+    // line, for the same reason.
+    let gone = |facts| {
         slot.unconfirmed
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        if stopping {
+            record.gone(facts);
+        }
     };
     match process.stop_then(timings.stop_grace, gone).await {
         Ok(report) => {
@@ -827,13 +916,51 @@ async fn finish(
                     "requests in flight when the module stopped: outcome unknown"
                 );
             }
+            if stopping {
+                warn_if_tight(name, timings, &record.snapshot());
+            }
             Ok(())
         }
         Err(failed) => {
+            // Recorded before `failed` — which owns the process — is dropped:
+            // the drop would otherwise describe the group first, as a mere
+            // kill attempt (SHUT-1a).
+            record.group(crate::stop_record::GroupEnd::Failed);
             let error = format!("the module could not be confirmed stopped: {failed}");
+            drop(failed);
             tracing::error!(module = name, "{error}");
             Err(Unconfirmed(error))
         }
+    }
+}
+
+/// Say so, at once, when a stop suggests a budget is too tight: the leader
+/// needed SIGKILL after its grace, or the drain ran out with requests still
+/// in flight (SHUT-1a). The names are the knobs a daemon exposes for them.
+fn warn_if_tight(name: &str, timings: &Timings, r: &crate::stop_record::StopRecord) {
+    use crate::stop_record::{DrainEndedBy, Leader};
+    if r.leader == Some(Leader::KilledAfterGrace) {
+        tracing::warn!(
+            module = name,
+            grace_ms = timings.stop_grace.as_millis(),
+            stop_ms = r.stop_elapsed.unwrap_or_default().as_millis(),
+            "the module did not exit within its stop grace and was SIGKILLed — raise \
+             A24_MODULE_STOP_GRACE_MS if it needs longer to flush"
+        );
+    }
+    let cut = r.abandoned.unwrap_or(0) + r.never_sent.unwrap_or(0);
+    if let Some(drain) = r.drain
+        && drain.ended_by == DrainEndedBy::Deadline
+        && cut > 0
+    {
+        tracing::warn!(
+            module = name,
+            drain_ms = drain.budget.as_millis(),
+            sent_outcome_unknown = r.abandoned.unwrap_or(0),
+            never_sent = r.never_sent.unwrap_or(0),
+            "the drain ended with {cut} request(s) still in flight — raise \
+             A24_MODULE_DRAIN_MS if requests routinely run longer"
+        );
     }
 }
 
@@ -1368,6 +1495,181 @@ sys.exit(0)
             rustix::process::Pid::from_raw(escaped).unwrap(),
             rustix::process::Signal::Kill,
         );
+    }
+
+    // ---- SHUT-1a: what a stop records -----------------------------------
+
+    /// A module that goes on SIGTERM, stopped with no drain: a process was
+    /// there, the drain was skipped, the leader exited within its grace, the
+    /// group is gone with nothing cut, and the loop stopped by itself.
+    #[tokio::test]
+    async fn a_clean_stop_is_recorded_as_one() {
+        use crate::stop_record::*;
+        let f = fixture("normal");
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            Current::new(Generation::starting()),
+            no_methods(),
+            fast(),
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let record = handle.stop_record();
+        stop(handle).await;
+        let r = record.snapshot();
+        assert_eq!(r.process, Some(ProcessAtStop::Running));
+        assert_eq!(r.drain.map(|d| d.ended_by), Some(DrainEndedBy::Skipped));
+        assert_eq!(r.leader, Some(Leader::ExitedInGrace));
+        assert_eq!(r.group, Some(GroupEnd::Gone));
+        assert_eq!((r.abandoned, r.never_sent), (Some(0), Some(0)));
+        assert_eq!(r.supervisor, Some(SupervisorEnd::Stopped));
+    }
+
+    /// A module that ignores SIGTERM is SIGKILLed once its grace runs out —
+    /// and the record says so: the sign that the grace is too short for it.
+    #[tokio::test]
+    async fn a_module_that_outlives_its_grace_is_recorded_as_killed_after_it() {
+        use crate::stop_record::*;
+        let f = fixture("stubborn_serving");
+        let timings = Timings {
+            stop_grace: Duration::from_millis(200),
+            ..fast()
+        };
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            Current::new(Generation::starting()),
+            no_methods(),
+            timings,
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let record = handle.stop_record();
+        stop(handle).await;
+        let r = record.snapshot();
+        assert_eq!(r.leader, Some(Leader::KilledAfterGrace));
+        assert_eq!(r.group, Some(GroupEnd::Gone));
+        assert!(
+            r.stop_elapsed.unwrap() >= Duration::from_millis(200),
+            "{r:?}"
+        );
+    }
+
+    /// A drain that runs out with a request still in flight records that it
+    /// ran out, and the request it cut.
+    #[tokio::test]
+    async fn a_drain_that_runs_out_records_the_request_it_cut() {
+        use crate::stop_record::*;
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let _held = current.get().admit_request("r-1".into()).unwrap();
+        let record = handle.stop_record();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(30),
+            handle.drain_and_stop(Duration::from_millis(200)),
+        )
+        .await
+        .expect("the stop");
+        assert_eq!(stopped, Ok(()));
+        let r = record.snapshot();
+        let drain = r.drain.unwrap();
+        assert_eq!(drain.ended_by, DrainEndedBy::Deadline, "{r:?}");
+        assert_eq!(drain.budget, Duration::from_millis(200));
+        assert_eq!(r.abandoned.unwrap() + r.never_sent.unwrap(), 1, "{r:?}");
+        assert_eq!(r.group, Some(GroupEnd::Gone));
+    }
+
+    /// A stop between runs — the module crashed and the loop is backing off —
+    /// finds no process: nothing to signal, and the record does not pretend
+    /// otherwise.
+    #[tokio::test]
+    async fn a_stop_between_runs_records_that_there_was_no_process() {
+        use crate::stop_record::*;
+        let f = fixture("crash");
+        let timings = Timings {
+            backoff_base: Duration::from_secs(600),
+            ..fast()
+        };
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            Current::new(Generation::starting()),
+            no_methods(),
+            timings,
+        );
+        until(&mut handle.subscribe(), "Backoff", |s| {
+            matches!(s, Status::Backoff { .. })
+        })
+        .await;
+        let record = handle.stop_record();
+        stop(handle).await;
+        let r = record.snapshot();
+        assert_eq!(r.process, Some(ProcessAtStop::None));
+        assert_eq!(r.group, None);
+        assert!(r.group_settled());
+        assert_eq!(r.supervisor, Some(SupervisorEnd::Stopped));
+    }
+
+    /// A stop its owner gives up on in the middle of the drain: the drain is
+    /// recorded as cut, the loop as cut off, and the group as dropped with a
+    /// SIGKILL sent — none of them as a clean stop.
+    #[tokio::test]
+    async fn a_stop_cut_off_mid_drain_records_the_cut_and_the_kill() {
+        use crate::stop_record::*;
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            fast(),
+        );
+        until(&mut handle.subscribe(), "Running", |s| {
+            *s == Status::Running
+        })
+        .await;
+        let generation = current.get();
+        let _held = generation.admit_request("r-1".into()).unwrap();
+        let record = handle.stop_record();
+        let (cut, cut_rx) = tokio::sync::oneshot::channel::<()>();
+        let stopping = tokio::spawn(
+            handle.drain_and_stop_unless(Duration::from_secs(60), async {
+                let _ = cut_rx.await;
+            }),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while generation.state() != crate::drain::DrainState::Draining {
+            assert!(std::time::Instant::now() < deadline, "never drained");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cut.send(()).unwrap();
+        assert_eq!(stopping.await.unwrap(), Err(SupervisorError::Killed));
+        let r = record.snapshot();
+        assert_eq!(
+            r.drain.map(|d| d.ended_by),
+            Some(DrainEndedBy::Cut),
+            "{r:?}"
+        );
+        assert_eq!(r.supervisor, Some(SupervisorEnd::CutOff));
+        assert_eq!(r.group, Some(GroupEnd::KillAttempted));
+        assert_eq!(r.abandoned, None, "a cut stop's revocation is not known");
     }
 
     /// `drain_and_stop` drains a serving run before stopping it (SPEC §4):
