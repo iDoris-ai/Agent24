@@ -169,12 +169,30 @@ fn wall_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// These files are small; anything bigger is not one of ours.
+const MAX_EVIDENCE_BYTES: u64 = 1 << 20;
+
+/// Read one of the two files: `None` if it is not there, `Some(Err)` if it
+/// is there but not a readable record of ours — not a regular file (a
+/// symlink, a FIFO), too big, or not the right JSON. Never follows a link,
+/// never reads more than [`MAX_EVIDENCE_BYTES`] (review of SHUT-1b, round 1).
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<Result<T, ()>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|_| ())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => Some(Err(())),
+    use std::io::Read;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(Err(())),
+    };
+    if !meta.is_file() || meta.len() > MAX_EVIDENCE_BYTES {
+        return Some(Err(()));
     }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_EVIDENCE_BYTES + 1).read_to_end(&mut bytes));
+    if read.is_err() || bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return Some(Err(()));
+    }
+    Some(serde_json::from_slice(&bytes).map_err(|_| ()))
 }
 
 /// The previous daemon, from the two files — the marker first: while it is
@@ -183,6 +201,10 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<Result<T, ()>>
 #[must_use]
 pub fn previous(run_dir: &Path) -> Previous {
     let alive = read_json::<Alive>(&run_dir.join(ALIVE));
+    if matches!(alive, Some(Err(()))) {
+        // A marker that cannot be read: no summary could be matched to it.
+        return Previous::Unconfirmed;
+    }
     let summary = read_json::<Summary>(&run_dir.join(SUMMARY));
     match (alive, summary) {
         (None, None) => Previous::NoHistory,
@@ -231,10 +253,13 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// had already landed — the file is visible, only its durability is unsure.
 fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), (bool, std::io::Error)> {
     use std::io::Write;
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    // A fresh random name, created exclusively: a stale temp file — or a
+    // link planted in its place — is never reused, so its mode is always
+    // ours (review of SHUT-1b, round 1).
+    let tmp = dir.join(format!(".{name}.tmp.{}", random_hex(8)));
     let staged = (|| {
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -250,6 +275,13 @@ fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), (bool, std:
         return Err((false, e));
     }
     sync_dir(dir).map_err(|e| (true, e))
+}
+
+fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut b = vec![0u8; bytes];
+    rand::rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn private_dir(dir: &Path) -> std::io::Result<()> {
@@ -300,19 +332,14 @@ impl StoppingMarker {
 }
 
 impl MarkerGuard {
-    /// Write `daemon.alive` with a new instance id. `(None, Some(warning))`
-    /// when it could not be written — this run then leaves no crash evidence,
-    /// and says so. A rename that landed with the directory's fsync failing
-    /// still yields a guard: the marker is there, only its durability is
-    /// unsure.
+    /// Write `daemon.alive` with a new instance id. Always a guard — this
+    /// run's id and where its summary goes — and a warning when the marker
+    /// could not be written (this run then leaves no crash evidence, and says
+    /// so) or its durability is unsure. A marker that was never written is
+    /// never removed by anyone: removal is by id (review of SHUT-1b, round 1).
     #[must_use]
-    pub fn create(run_dir: &Path) -> (Option<Self>, Option<String>) {
-        let instance_id = {
-            use rand::RngCore;
-            let mut b = [0u8; 16];
-            rand::rng().fill_bytes(&mut b);
-            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-        };
+    pub fn create(run_dir: &Path) -> (Self, Option<String>) {
+        let instance_id = random_hex(16);
         let alive = Alive {
             instance_id: instance_id.clone(),
             pid: std::process::id(),
@@ -327,7 +354,7 @@ impl MarkerGuard {
         };
         if let Err(e) = private_dir(run_dir) {
             return (
-                None,
+                guard(),
                 Some(format!(
                     "cannot create {}: {e}; this run leaves no crash evidence",
                     run_dir.display()
@@ -336,15 +363,15 @@ impl MarkerGuard {
         }
         let bytes = serde_json::to_vec(&alive).unwrap_or_default();
         match write_durable(run_dir, ALIVE, &bytes) {
-            Ok(()) => (Some(guard()), None),
+            Ok(()) => (guard(), None),
             Err((true, e)) => (
-                Some(guard()),
+                guard(),
                 Some(format!(
                     "{ALIVE} was written but its durability is unsure ({e})"
                 )),
             ),
             Err((false, e)) => (
-                None,
+                guard(),
                 Some(format!(
                     "cannot write {ALIVE} in {}: {e}; this run leaves no crash evidence",
                     run_dir.display()
@@ -402,14 +429,41 @@ pub struct ModuleStop {
 pub struct Summary {
     pub version: u32,
     pub instance_id: String,
+    /// Wall-clock milliseconds since the Unix epoch.
     pub began_at_ms: u128,
     pub took_ms: u128,
     /// `clean` | `degraded` | `timed_out` (see [`stop_result`]).
     pub stop_result: String,
+    pub params: SummaryParams,
+    pub records: Vec<ModuleStop>,
+}
+
+/// The budgets in effect, and every deadline they gave, in milliseconds
+/// after the shutdown began.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryParams {
     pub drain_ms: u128,
     pub stop_grace_ms: u128,
-    pub exit_bound_ms: u128,
-    pub records: Vec<ModuleStop>,
+    pub http_deadline_ms: u128,
+    pub module_deadline_ms: u128,
+    pub persist_deadline_ms: u128,
+    pub watchdog_ms: u128,
+}
+
+impl SummaryParams {
+    #[must_use]
+    pub fn of(params: &Params) -> Self {
+        let d = params.deadlines(tokio::time::Instant::now());
+        let after = |t: tokio::time::Instant| (t - d.began).as_millis();
+        Self {
+            drain_ms: params.drain.as_millis(),
+            stop_grace_ms: params.stop_grace.as_millis(),
+            http_deadline_ms: after(d.http),
+            module_deadline_ms: after(d.modules),
+            persist_deadline_ms: after(d.persist),
+            watchdog_ms: after(d.watchdog),
+        }
+    }
 }
 
 fn name_of<T: std::fmt::Debug>(v: Option<T>) -> Option<String> {
@@ -499,9 +553,7 @@ impl Summary {
             began_at_ms: wall_ms().saturating_sub(began_ago.as_millis()),
             took_ms: began_ago.as_millis(),
             stop_result: stop_result(&snapshots).to_owned(),
-            drain_ms: params.drain.as_millis(),
-            stop_grace_ms: params.stop_grace.as_millis(),
-            exit_bound_ms: params.exit_bound().as_millis(),
+            params: SummaryParams::of(params),
             records: records
                 .iter()
                 .map(|(name, reason, r)| ModuleStop::new(name, *reason, r))
@@ -516,7 +568,13 @@ impl Summary {
             .records
             .iter()
             .map(|m| {
-                let mut parts = vec![m.group.clone().unwrap_or_else(|| "unfinished".into())];
+                let end = match (m.process.as_deref(), &m.group, &m.supervisor) {
+                    (Some("none"), _, Some(sup)) => format!("no process, {sup}"),
+                    (Some("none"), _, None) => "no process, unfinished".to_owned(),
+                    (_, Some(group), _) => group.clone(),
+                    (_, None, _) => "unfinished".to_owned(),
+                };
+                let mut parts = vec![end];
                 if let (Some(by), Some(ms)) = (&m.drain_ended_by, m.drain_ms) {
                     parts.push(format!("drain {by} {ms}ms"));
                 }
@@ -768,7 +826,7 @@ mod tests {
         assert!(!run.join(ALIVE).exists(), "a failed start left its marker");
 
         let (guard, _) = MarkerGuard::create(&run);
-        let stopping = guard.unwrap().into_stopping();
+        let stopping = guard.into_stopping();
         assert!(run.join(ALIVE).exists(), "handing over removed the marker");
         let s = summary(stopping.instance_id());
         persist(&s, &stopping).unwrap();
@@ -782,7 +840,7 @@ mod tests {
 
         // Another instance's marker is not removed by this one's summary.
         let (other, _) = MarkerGuard::create(&run);
-        let other = other.unwrap().into_stopping();
+        let other = other.into_stopping();
         persist(&summary("someone-else"), &stopping).unwrap();
         assert!(
             run.join(ALIVE).exists(),
@@ -800,13 +858,98 @@ mod tests {
         let d = dir();
         let run = d.path().join("run");
         let (guard, _) = MarkerGuard::create(&run);
-        let stopping = guard.unwrap().into_stopping();
+        let stopping = guard.into_stopping();
         std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o500)).unwrap();
         let written = persist(&summary(stopping.instance_id()), &stopping);
         std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(written.is_err());
         assert!(run.join(ALIVE).exists());
         assert_eq!(previous(&run), Previous::Unconfirmed);
+    }
+
+    /// A marker that could not be written still leaves this run a summary:
+    /// only the crash evidence is lost, and that is warned about (review of
+    /// SHUT-1b, round 1).
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_that_cannot_be_written_still_gets_a_summary() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir();
+        let run = d.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (guard, warning) = MarkerGuard::create(&run);
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(warning.unwrap().contains("no crash evidence"));
+        assert!(!run.join(ALIVE).exists());
+        let stopping = guard.into_stopping();
+        persist(&summary(stopping.instance_id()), &stopping).unwrap();
+        assert!(run.join(SUMMARY).exists());
+    }
+
+    /// Only a small regular file is read: a link or a huge file is not ours,
+    /// and says so rather than being followed or loaded.
+    #[cfg(unix)]
+    #[test]
+    fn evidence_is_read_only_from_small_regular_files() {
+        let d = dir();
+        let run = d.path();
+        std::os::unix::fs::symlink("/dev/zero", run.join(SUMMARY)).unwrap();
+        assert_eq!(previous(run), Previous::Unreadable);
+        std::fs::remove_file(run.join(SUMMARY)).unwrap();
+        let f = std::fs::File::create(run.join(SUMMARY)).unwrap();
+        f.set_len(MAX_EVIDENCE_BYTES + 1).unwrap();
+        assert_eq!(previous(run), Previous::Unreadable);
+        // A FIFO in its place would block a read for ever — and with it every
+        // start. Not a regular file: not read at all.
+        std::fs::remove_file(run.join(SUMMARY)).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(run.join(SUMMARY))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = run.to_owned();
+        std::thread::spawn(move || {
+            let _ = tx.send(previous(&dir));
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("a FIFO blocked the start"),
+            Previous::Unreadable
+        );
+    }
+
+    /// The file's shape, pinned: what SHUT-1c and a person reading it rely on.
+    #[test]
+    fn the_summary_file_has_the_documented_shape() {
+        let s = summary("id");
+        let v = serde_json::to_value(&s).unwrap();
+        let keys: std::collections::BTreeSet<_> = v.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            [
+                "version",
+                "instance_id",
+                "began_at_ms",
+                "took_ms",
+                "stop_result",
+                "params",
+                "records"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect()
+        );
+        assert_eq!(
+            v["params"],
+            serde_json::json!({
+                "drain_ms": 800, "stop_grace_ms": 500, "http_deadline_ms": 1500,
+                "module_deadline_ms": 1500, "persist_deadline_ms": 1700, "watchdog_ms": 2000
+            })
+        );
     }
 
     /// The log line names each module's end, its drain, what was cut, how the
@@ -835,5 +978,18 @@ mod tests {
             "shutdown took 1120ms, clean: y (gone, drain deadline 800ms, cut 2, killed after grace, stop 512ms)"
         );
         assert_eq!(s.records[0].leader.as_deref(), Some("killed_after_grace"));
+
+        let mut none = rec(ProcessAtStop::None);
+        none.supervisor = Some(SupervisorEnd::Stopped);
+        let s = Summary::new(
+            "x",
+            &Params::default(),
+            Duration::from_millis(3),
+            &[("z".into(), Reason::Shutdown, none)],
+        );
+        assert_eq!(
+            s.describe(),
+            "shutdown took 3ms, clean: z (no process, stopped)"
+        );
     }
 }

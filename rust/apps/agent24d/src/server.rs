@@ -699,18 +699,8 @@ pub async fn serve(
     // The modules' budgets, read first — no I/O, and a bad value is only a
     // warning (SHUT-1b): the shutdown controller's deadlines follow them.
     let (params, config_warnings) = crate::lifecycle::Params::from_process_env();
+    let mut config_warnings = config_warnings;
     let shutdown = Shutdown::with_params(cancel.clone(), params);
-    for warning in &config_warnings {
-        tracing::warn!("{warning}");
-    }
-    tracing::info!(
-        drain_ms = params.drain.as_millis(),
-        stop_grace_ms = params.stop_grace.as_millis(),
-        exit_bound_ms = params.exit_bound().as_millis(),
-        "shutdown budgets for out-of-process modules; a SIGTERM ends this daemon within {}ms \
-         (2000ms at the defaults)",
-        params.exit_bound().as_millis()
-    );
     // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
     // Registered HERE — before any module process can be started — and
     // synchronously: a SIGTERM arriving while packages start must run this
@@ -749,6 +739,20 @@ pub async fn serve(
         signal_shutdown.request();
         tracing::info!("shutdown signal received");
     });
+    // Logged only now, with the signals registered: a stalled stderr must not
+    // widen the window in which a SIGTERM takes the default action (review of
+    // SHUT-1b, round 1).
+    for warning in &config_warnings {
+        tracing::warn!("{warning}");
+    }
+    tracing::info!(
+        drain_ms = params.drain.as_millis(),
+        stop_grace_ms = params.stop_grace.as_millis(),
+        exit_bound_ms = params.exit_bound().as_millis(),
+        "shutdown budgets for out-of-process modules; a SIGTERM ends this daemon within {}ms \
+         (2000ms at the defaults)",
+        params.exit_bound().as_millis()
+    );
     // For a token cancelled other than through `Shutdown::request` (a child
     // token's owner, say): the watchdog is armed at the first look after it.
     {
@@ -778,12 +782,16 @@ pub async fn serve(
     // SHUT-1b: what the previous daemon left, then this one's marker — right
     // after the lock, before the shutdown's task exists, so a shutdown always
     // finds it. A start-up that fails from here drops the guard, which removes
-    // it: a start that failed is not a shutdown that did not finish.
+    // it: a start that failed is not a shutdown that did not finish. (A
+    // shutdown requested before this point — during the lock — can still be
+    // ended by the watchdog before the marker exists; that daemon never got
+    // as far as starting anything, and leaves no evidence.) A marker that
+    // cannot be written still gets its run a summary; the warning is kept.
     // Ephemeral daemons neither read nor write either file.
     let marker = if ephemeral {
         None
     } else {
-        agent24_protocol::state_file::state_dir().and_then(|state| {
+        agent24_protocol::state_file::state_dir().map(|state| {
             let run = crate::lifecycle::run_dir(&state);
             if let Some(warning) = crate::lifecycle::previous(&run).warning(&run) {
                 tracing::warn!("{warning}");
@@ -791,6 +799,7 @@ pub async fn serve(
             let (guard, warning) = crate::lifecycle::MarkerGuard::create(&run);
             if let Some(warning) = warning {
                 tracing::warn!("{warning}");
+                config_warnings.push(warning);
             }
             guard
         })
