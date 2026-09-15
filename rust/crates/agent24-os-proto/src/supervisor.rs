@@ -208,6 +208,11 @@ impl SupervisorHandle {
     /// runtime next gets to it (SUP-5, the shutdown cutting short a hot
     /// disable's drain).
     ///
+    /// `Killed` only when the abort took effect: a loop that finished its
+    /// stop by itself just before keeps its own answer (`Ok`, or
+    /// `StopFailed`), and its stop record says it stopped rather than was cut
+    /// off (review of SHUT-1a, rounds 2 and 3).
+    ///
     /// # Errors
     ///
     /// As [`SupervisorHandle::stop`]; [`SupervisorError::Killed`] when

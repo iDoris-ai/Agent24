@@ -6,7 +6,7 @@
 //! ignored, so two parties racing to describe the same end (a stop confirming
 //! the group empty, and a cancellation dropping the process) cannot both
 //! claim it. The facts of a confirmed stop are written together, under the
-//! record's lock, in one step (see [`StopRecordHandle::gone`]).
+//! record's lock, in one step (see `StopRecordHandle::stopped_gone`).
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
