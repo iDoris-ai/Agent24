@@ -605,19 +605,24 @@ impl ModuleProcess {
 
     /// Returns how the leader ended — kept apart: already gone, gone on TERM
     /// within the grace, or SIGKILLed once the grace ran out (SHUT-1a).
-    async fn terminate(&mut self, grace: Duration) -> std::io::Result<crate::stop_record::Leader> {
+    async fn terminate(
+        &mut self,
+        grace: Duration,
+    ) -> std::io::Result<Option<crate::stop_record::Leader>> {
         use crate::stop_record::Leader;
-        let mut leader = Leader::GoneBeforeTerm;
+        // Already reaped: a retry of a stop that failed after the reap — how
+        // the leader went is not known here (review of SHUT-1a, round 1).
+        let mut leader = None;
         if !self.reaped {
             // The leader is unreaped: the group id is ours.
             let exited_already = self.leader_exited()?;
             self.signal_settling(Signal::Term, exited_already).await?;
             let exited = exited_already || self.leader_exits_within(grace).await?;
-            leader = match (exited_already, exited) {
+            leader = Some(match (exited_already, exited) {
                 (true, _) => Leader::GoneBeforeTerm,
                 (false, true) => Leader::ExitedInGrace,
                 (false, false) => Leader::KilledAfterGrace,
-            };
+            });
             // Once more even if the leader went on TERM: helpers outlive their
             // parent, and "the process we started exited" is not the claim "the
             // tree is gone".
@@ -760,8 +765,11 @@ impl Drop for ModuleProcess {
         // Only while the leader is unreaped: after the reap the id may belong
         // to someone else, and every member has had SIGKILL already.
         use crate::stop_record::GroupEnd;
+        // After the reap nothing is sent — the id may be someone else's — so
+        // this drop cannot kill anything: `KillUnavailable`, not a kill
+        // attempt (review of SHUT-1a, round 1).
         let (sent, killed) = if self.reaped {
-            (true, "already signalled before the reap".to_owned())
+            (false, "already signalled before the reap".to_owned())
         } else {
             match self.leader_exited() {
                 Ok(exited) => match self.signal(Signal::Kill, exited) {
