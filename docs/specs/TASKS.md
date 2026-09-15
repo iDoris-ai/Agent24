@@ -108,6 +108,7 @@
 ### B2 agent24d 骨架
 - `rust/apps/agent24d`：axum；`serve --port 0`；`GET /api/v1/health` 返回 `backend:"rust"`；stdout ready 行（真 token，32B 随机）；Bearer 校验中间件；`CancellationToken` 贯穿 + SIGTERM/SIGINT 优雅关闭（有序：停接新请求 → 等在飞 → 退出，超时强杀自身任务）。
 - 验收：contract-tests 以动态 port+token 对 agent24d 跑 health 用例绿；kill -TERM 下 2s 内干净退出无 panic。
+- 2026-09-15 修订（SHUT-1b，用户裁决「可调，但有日志有跟踪」）：「2s」是**默认参数下**的上界。进程外模块的排空与停止宽限可经 `A24_MODULE_DRAIN_MS`（0–10000，默认 800）/ `A24_MODULE_STOP_GRACE_MS`（100–5000，默认 500）调大，上界随之变为「看门狗时刻减停机开始」，启动日志写明本次的数值（最坏约 15.7s）。非法值告警并回落默认，不拒绝启动。语义见 `docs/design/SHUT-shutdown-observability.md`。
 
 ### B3 ModelProvider trait + chat 透传
 - `agent24-models`：`trait ModelProvider { async fn complete(req, cancel) -> …; async fn stream(req, tx, cancel) -> … (defaulted) }`；`OpenAICompatProvider`（oMLX/Ollama 均适用，reqwest）；**registry map** 注册（禁 if/else 工厂）；`/api/v1/chat`、`/api/v1/models`、`/api/v1/usage` 落地（用量内存累计）。

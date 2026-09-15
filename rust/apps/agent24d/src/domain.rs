@@ -534,7 +534,7 @@ struct Registry {
     /// `None` once the shutdown has closed the list.
     running: Option<Vec<Supervised>>,
     /// The stops `os disable` began and the shutdown has not taken yet.
-    disabling: Vec<tokio::task::JoinHandle<()>>,
+    disabling: Vec<Disabling>,
     /// Every module `os disable` has asked to stop since this daemon started
     /// — so the list and a later disable can see how far that has got.
     disabled: std::collections::HashMap<String, Disabled>,
@@ -559,12 +559,23 @@ pub struct Disabled {
     pub status: tokio::sync::watch::Receiver<agent24_os_proto::supervisor::Status>,
 }
 
+/// A stop `os disable` began: which module, what is known about the stop
+/// (taken before the stop was asked for — SHUT-1b), and the task that waits
+/// for it.
+pub struct Disabling {
+    pub name: String,
+    pub record: agent24_os_proto::stop_record::StopRecordHandle,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 /// What [`Supervisors::close`] hands the shutdown: every module still running,
-/// and every stop a disable began, for it to wait for.
+/// and every stop a disable began and had not finished, for it to wait for
+/// (and to describe in its summary: a disable that finished before is only
+/// history, told in the log when it ended).
 #[derive(Default)]
 pub struct Closed {
     pub running: Vec<Supervised>,
-    pub disabling: Vec<tokio::task::JoinHandle<()>>,
+    pub disabling: Vec<Disabling>,
 }
 
 impl Closed {
@@ -650,6 +661,8 @@ impl Supervisors {
             status: handle.subscribe(),
         };
         registry.disabled.insert(name.clone(), disabled.clone());
+        let record = handle.stop_record();
+        let entry = name.clone();
         let stop = handle.drain_and_stop_unless(drain, cut_off);
         let task = tokio::spawn(async move {
             match stop.await {
@@ -661,8 +674,12 @@ impl Supervisors {
                 }
             }
         });
-        registry.disabling.retain(|t| !t.is_finished());
-        registry.disabling.push(task);
+        registry.disabling.retain(|d| !d.task.is_finished());
+        registry.disabling.push(Disabling {
+            name: entry,
+            record,
+            task,
+        });
         Some(disabled)
     }
 
@@ -685,7 +702,10 @@ impl Supervisors {
         let mut registry = self.lock();
         Closed {
             running: registry.running.take().unwrap_or_default(),
-            disabling: std::mem::take(&mut registry.disabling),
+            disabling: std::mem::take(&mut registry.disabling)
+                .into_iter()
+                .filter(|d| !d.task.is_finished())
+                .collect(),
         }
     }
 }
@@ -1747,7 +1767,7 @@ while f.readline():
                 s.handle.stop().await.expect("a clean stop");
             }
             for stop in closed.disabling {
-                stop.await.unwrap();
+                stop.task.await.unwrap();
             }
         }
     }
@@ -1797,7 +1817,7 @@ while f.readline():
             "the disable's stop, not waited for"
         );
         for stop in closed.disabling {
-            stop.await.unwrap();
+            stop.task.await.unwrap();
         }
         assert_eq!(
             current.get().state(),

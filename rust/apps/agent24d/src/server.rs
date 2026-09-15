@@ -17,30 +17,11 @@ use rand::RngCore;
 use std::sync::Arc as StdArc;
 use tokio_util::sync::CancellationToken;
 
-/// How long a shutdown's work gets — the HTTP drain, and out-of-process
-/// modules drained and stopped alongside it (SUP-4) — before the server is
-/// abandoned. With [`WATCHDOG_MARGIN`] for the runtime's teardown, `kill -TERM`
-/// ends the process within 2s (TASKS B2 acceptance): the watchdog guarantees
-/// it.
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
-
-/// SIGTERM to SIGKILL for an out-of-process module this daemon stops. ⚖️
-/// Much shorter than the library's default so that draining, stopping and
-/// reaping every module fit in [`SHUTDOWN_GRACE`].
-const MODULE_STOP_GRACE: Duration = Duration::from_millis(500);
-
-/// How far past the shutdown deadline the process may run before the watchdog
-/// ends it: time for the runtime's own bounded teardown (`main`'s
-/// `shutdown_timeout`, shorter than this). [`SHUTDOWN_GRACE`] plus this is the
-/// 2s of TASKS B2.
-const WATCHDOG_MARGIN: Duration = Duration::from_millis(500);
-
-/// How long a shutdown lets out-of-process modules finish the requests they
-/// already have (DRAINING, SPEC §4) before stopping them. ⚖️ This and
-/// [`MODULE_STOP_GRACE`] share [`SHUTDOWN_GRACE`]: drain first, so a request a
-/// module is working on is answered rather than abandoned; then a short grace,
-/// since a drained module has nothing in flight.
-const MODULE_DRAIN: Duration = Duration::from_millis(800);
+// A shutdown's budgets and deadlines — the HTTP drain's fixed 1.5s, the
+// out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
+// `A24_MODULE_STOP_GRACE_MS`), the time to put the summary on disk, and the
+// watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
+// defaults `kill -TERM` ends the process within 2s (TASKS B2).
 
 #[derive(Clone)]
 pub struct AppState {
@@ -105,7 +86,10 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct Shutdown {
     token: CancellationToken,
-    at: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    /// When the shutdown began: fixed once, by whoever gets there first.
+    began: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    /// The modules' budgets its deadlines are derived from (SHUT-1b).
+    params: crate::lifecycle::Params,
     armed: Arc<std::sync::atomic::AtomicBool>,
     /// `STARTING`, `READY` or `STOPPING`: readiness and a shutdown request
     /// decide, once and atomically, which came first (see
@@ -118,11 +102,18 @@ const READY: u8 = 1;
 const STOPPING: u8 = 2;
 
 impl Shutdown {
-    #[must_use]
+    #[cfg(test)]
     pub fn new(token: CancellationToken) -> Self {
+        Self::with_params(token, crate::lifecycle::Params::default())
+    }
+
+    /// A controller whose deadlines follow `params` (SHUT-1b).
+    #[must_use]
+    pub fn with_params(token: CancellationToken, params: crate::lifecycle::Params) -> Self {
         Self {
             token,
-            at: Arc::new(std::sync::OnceLock::new()),
+            began: Arc::new(std::sync::OnceLock::new()),
+            params,
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             phase: Arc::new(std::sync::atomic::AtomicU8::new(STARTING)),
         }
@@ -132,7 +123,7 @@ impl Shutdown {
     pub fn request(&self) {
         self.phase
             .store(STOPPING, std::sync::atomic::Ordering::SeqCst);
-        arm_watchdog(self.deadline(), &self.armed);
+        arm_watchdog(self.deadlines().watchdog, &self.armed);
         self.token.cancel();
     }
 
@@ -154,14 +145,27 @@ impl Shutdown {
             .is_ok()
     }
 
-    /// When the shutdown's work must be done: fixed by the first
-    /// [`Shutdown::request`], or — for a token cancelled some other way — by
-    /// the first look after it.
+    /// Every deadline of this shutdown, from the moment it began — fixed by
+    /// the first [`Shutdown::request`], or, for a token cancelled some other
+    /// way, by the first look after it. Every path that sees the cancel calls
+    /// `request` before reading these, so the first to arrive fixes it, once
+    /// (SHUT-1b).
+    #[must_use]
+    pub fn deadlines(&self) -> crate::lifecycle::Deadlines {
+        let began = *self.began.get_or_init(tokio::time::Instant::now);
+        self.params.deadlines(began)
+    }
+
+    /// When the HTTP drain must be done.
     #[must_use]
     pub fn deadline(&self) -> tokio::time::Instant {
-        *self
-            .at
-            .get_or_init(|| tokio::time::Instant::now() + SHUTDOWN_GRACE)
+        self.deadlines().http
+    }
+
+    /// The budgets this shutdown gives modules.
+    #[must_use]
+    pub fn params(&self) -> crate::lifecycle::Params {
+        self.params
     }
 
     #[must_use]
@@ -179,18 +183,18 @@ impl Shutdown {
     /// killed: the budget any module gets once the shutdown begins — its
     /// drain and its stop grace — so a disable's longer drain neither holds
     /// the shutdown past its bound nor gets less than a module the shutdown
-    /// stops itself (SUP-5). An absolute instant, a fixed margin before the
-    /// shutdown's stored [`Shutdown::deadline`] — which `request` fixes as
-    /// it begins, and every other path at its first look: measured from
-    /// whenever this was first polled, a late poll put it past that
+    /// stops itself (SUP-5). An absolute instant after the moment the
+    /// shutdown began, which is stored, not derived: measured from whenever
+    /// this was first polled, a late poll put it past the shutdown's own
     /// deadline, which then stopped waiting for it (review of SUP-5, rounds
-    /// 2 and 3).
+    /// 2 and 3; SHUT-1b).
     pub fn modules_cut_off(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let shutdown = self.clone();
         async move {
             shutdown.token.cancelled().await;
-            let began = shutdown.deadline() - SHUTDOWN_GRACE;
-            tokio::time::sleep_until(began + MODULE_DRAIN + MODULE_STOP_GRACE).await;
+            let began = shutdown.deadlines().began;
+            tokio::time::sleep_until(began + shutdown.params.drain + shutdown.params.stop_grace)
+                .await;
         }
     }
 }
@@ -692,7 +696,11 @@ pub async fn serve(
     // store, MCP servers, model probing) — runs this bounded shutdown rather
     // than the default action, which ends the daemon as signal-killed, a crash
     // to a supervisor such as launchd (review of SUP-4, round 6).
-    let shutdown = Shutdown::new(cancel.clone());
+    // The modules' budgets, read first — no I/O, and a bad value is only a
+    // warning (SHUT-1b): the shutdown controller's deadlines follow them.
+    let (params, config_warnings) = crate::lifecycle::Params::from_process_env();
+    let mut config_warnings = config_warnings;
+    let shutdown = Shutdown::with_params(cancel.clone(), params);
     // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
     // Registered HERE — before any module process can be started — and
     // synchronously: a SIGTERM arriving while packages start must run this
@@ -731,6 +739,20 @@ pub async fn serve(
         signal_shutdown.request();
         tracing::info!("shutdown signal received");
     });
+    // Logged only now, with the signals registered: a stalled stderr must not
+    // widen the window in which a SIGTERM takes the default action (review of
+    // SHUT-1b, round 1).
+    for warning in &config_warnings {
+        tracing::warn!("{warning}");
+    }
+    tracing::info!(
+        drain_ms = params.drain.as_millis(),
+        stop_grace_ms = params.stop_grace.as_millis(),
+        exit_bound_ms = params.exit_bound().as_millis(),
+        "shutdown budgets for out-of-process modules; a SIGTERM ends this daemon within {}ms \
+         (2000ms at the defaults)",
+        params.exit_bound().as_millis()
+    );
     // For a token cancelled other than through `Shutdown::request` (a child
     // token's owner, say): the watchdog is armed at the first look after it.
     {
@@ -756,6 +778,31 @@ pub async fn serve(
                 ));
             }
         }
+    };
+    // SHUT-1b: what the previous daemon left, then this one's marker — right
+    // after the lock, before the shutdown's task exists, so a shutdown always
+    // finds it. A start-up that fails from here drops the guard, which removes
+    // it: a start that failed is not a shutdown that did not finish. (A
+    // shutdown requested before this point — during the lock — can still be
+    // ended by the watchdog before the marker exists; that daemon never got
+    // as far as starting anything, and leaves no evidence.) A marker that
+    // cannot be written still gets its run a summary; the warning is kept.
+    // Ephemeral daemons neither read nor write either file.
+    let marker = if ephemeral {
+        None
+    } else {
+        agent24_protocol::state_file::state_dir().map(|state| {
+            let run = crate::lifecycle::run_dir(&state);
+            if let Some(warning) = crate::lifecycle::previous(&run).warning(&run) {
+                tracing::warn!("{warning}");
+            }
+            let (guard, warning) = crate::lifecycle::MarkerGuard::create(&run);
+            if let Some(warning) = warning {
+                tracing::warn!("{warning}");
+                config_warnings.push(warning);
+            }
+            guard
+        })
     };
 
     let token = generate_token();
@@ -1014,7 +1061,10 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let local = listener.local_addr()?;
 
-    let host = process_host(if ephemeral { &os_root } else { &state_dir });
+    let host = process_host(
+        if ephemeral { &os_root } else { &state_dir },
+        params.stop_grace,
+    );
     if let Err(why) = &host {
         tracing::error!("out-of-process domain OS modules cannot be started: {why}");
     }
@@ -1022,16 +1072,22 @@ pub async fn serve(
     // task exists before the first one does — so a shutdown that begins while
     // later packages are still being mounted stops the earlier ones, within
     // the same bound (review of SUP-4, round 3). It drains and then stops
-    // them, alongside the HTTP drain, inside SHUTDOWN_GRACE (TASKS B2): a
+    // them, alongside the HTTP drain, by the modules' deadline (TASKS B2): a
     // module still stopping at the deadline is dropped with its supervisor,
     // which SIGKILLs its group — and a module reads EOF on its callback
     // connection as the end of its run (D1), so one that outlives this
     // process exits on its own.
     let registry = host.as_ref().ok().map(|h| h.supervisors.clone());
     let stop_shutdown = shutdown.clone();
+    // Handed over here, synchronously, before the task exists: from now on
+    // only a summary on disk removes the marker (SHUT-1b).
+    let marker = marker.map(crate::lifecycle::MarkerGuard::into_stopping);
     let stopping = tokio::spawn(async move {
         stop_shutdown.token().cancelled().await;
-        let deadline = stop_shutdown.deadline();
+        // Whoever cancelled, the shutdown has begun: fixed here if nothing
+        // fixed it yet (SHUT-1b).
+        stop_shutdown.request();
+        let deadlines = stop_shutdown.deadlines();
         // The discovery state goes first, off this task: a watchdog exit later
         // must not leave a state file pointing at a daemon that is gone. (The
         // singleton lock is held until the process exits, so no second daemon
@@ -1046,8 +1102,29 @@ pub async fn serve(
                 .name("state-file-cleanup".to_owned())
                 .spawn(move || agent24_protocol::state_file::remove_if_owner(pid));
         }
-        let supervisors = registry.map(|r| r.close()).unwrap_or_default();
-        if tokio::time::timeout_at(deadline, stop_supervisors(supervisors))
+        let closed = registry.map(|r| r.close()).unwrap_or_default();
+        // What each stop records, taken before the stops consume their
+        // handles; read again at the modules' deadline (SHUT-1b).
+        let tracked: Vec<_> = closed
+            .running
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    crate::lifecycle::Reason::Shutdown,
+                    s.handle.stop_record(),
+                )
+            })
+            .chain(closed.disabling.iter().map(|d| {
+                (
+                    d.name.clone(),
+                    crate::lifecycle::Reason::Disable,
+                    d.record.clone(),
+                )
+            }))
+            .collect();
+        let params = stop_shutdown.params();
+        if tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain))
             .await
             .is_err()
         {
@@ -1055,6 +1132,42 @@ pub async fn serve(
                 "out-of-process modules were still stopping at the deadline; their supervisors \
                  were dropped (SIGKILL attempted, exit unconfirmed)"
             );
+        }
+        let records: Vec<_> = tracked
+            .iter()
+            .map(|(name, reason, record)| (name.clone(), *reason, record.snapshot()))
+            .collect();
+        let summary = crate::lifecycle::Summary::new(
+            marker
+                .as_ref()
+                .map_or("ephemeral", crate::lifecycle::StoppingMarker::instance_id),
+            &params,
+            deadlines.began.elapsed(),
+            &records,
+        );
+        // Every evidence line names its state directory (review of SHUT-1b,
+        // round 3): two daemons with different HOMEs log side by side.
+        let evidence = marker
+            .as_ref()
+            .map_or_else(|| "ephemeral".to_owned(), |m| m.dir().display().to_string());
+        tracing::info!(evidence = %evidence, "{}", summary.describe());
+        if let Some(marker) = marker {
+            let job =
+                tokio::task::spawn_blocking(move || crate::lifecycle::persist(&summary, &marker));
+            match tokio::time::timeout_at(deadlines.persist, job).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => tracing::error!(
+                    "the shutdown summary could not be written in {evidence} ({e}); the next \
+                     start will not be able to confirm this shutdown"
+                ),
+                Ok(Err(e)) => {
+                    tracing::error!("writing the shutdown summary in {evidence} failed: {e}");
+                }
+                Err(_) => tracing::error!(
+                    "the shutdown summary was not on disk in {evidence} by its deadline; the \
+                     next start will not be able to confirm this shutdown"
+                ),
+            }
         }
     });
     let (module_routes, reports, partitions) = crate::domain::mount_all(
@@ -1200,14 +1313,17 @@ pub async fn serve(
         .with_graceful_shutdown(async move { graceful_cancel.cancelled().await });
 
     // Force-exit backstop: once cancelled, in-flight requests get
-    // SHUTDOWN_GRACE to finish, then the process exits regardless.
+    // the HTTP window (1.5s) to finish, then the process exits regardless.
     let result = tokio::select! {
         result = server => result,
         () = async {
             cancel.cancelled().await;
             tokio::time::sleep_until(shutdown.deadline()).await;
         } => {
-            tracing::warn!("graceful shutdown exceeded {SHUTDOWN_GRACE:?}; forcing exit");
+            tracing::warn!(
+                "graceful shutdown exceeded {:?}; forcing exit",
+                crate::lifecycle::HTTP_GRACE
+            );
             Ok(())
         }
     };
@@ -1225,7 +1341,10 @@ pub async fn serve(
 /// What out-of-process modules are started with: the callback directory under
 /// `root` (stale ones cleared first, FU-56), this binary as the trampoline, and
 /// the daemon's stop grace.
-fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, String> {
+fn process_host(
+    root: &std::path::Path,
+    stop_grace: Duration,
+) -> Result<crate::domain::ProcessHost, String> {
     for gone in agent24_os_proto::endpoint::remove_stale(root) {
         tracing::info!(
             "removed the callback directory of a daemon that is gone: {}",
@@ -1257,14 +1376,14 @@ fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, St
             args: Vec::new(),
         },
         timings: agent24_os_proto::supervisor::Timings {
-            stop_grace: MODULE_STOP_GRACE,
+            stop_grace,
             ..agent24_os_proto::supervisor::Timings::default()
         },
         supervisors: StdArc::new(crate::domain::Supervisors::default()),
     })
 }
 
-/// Arm the hard bound, once: at `deadline` + [`WATCHDOG_MARGIN`] the process
+/// Arm the hard bound, once: at `at` — the watchdog instant of `crate::lifecycle` — the process
 /// ends, whatever is stuck — a module's directory on a stalled filesystem
 /// during startup, a blocking task. A native thread, so no scheduling of the
 /// runtime can delay it; an absolute instant, so arming it late does not move
@@ -1274,7 +1393,7 @@ fn process_host(root: &std::path::Path) -> Result<crate::domain::ProcessHost, St
 /// round 4). A thread the OS refuses to create ends the process at once,
 /// rather than losing the shutdown (round 5). Modules it did not get to stop
 /// read EOF on their callback connections, which ends their runs (D1).
-fn arm_watchdog(deadline: tokio::time::Instant, armed: &std::sync::atomic::AtomicBool) {
+fn arm_watchdog(at: tokio::time::Instant, armed: &std::sync::atomic::AtomicBool) {
     if armed
         .compare_exchange(
             false,
@@ -1286,7 +1405,7 @@ fn arm_watchdog(deadline: tokio::time::Instant, armed: &std::sync::atomic::Atomi
     {
         return;
     }
-    let at = deadline.into_std() + WATCHDOG_MARGIN;
+    let at = at.into_std();
     let spawned = std::thread::Builder::new()
         .name("shutdown-watchdog".to_owned())
         .spawn(move || {
@@ -1303,7 +1422,7 @@ fn arm_watchdog(deadline: tokio::time::Instant, armed: &std::sync::atomic::Atomi
 
 /// Stop every supervised module, the way SPEC §4 stops one, concurrently for
 /// all: DRAINING first — new proxied requests refused, the ones in flight left
-/// to finish, for up to [`MODULE_DRAIN`] — then REVOKING and the process stop.
+/// to finish, for up to `drain` — then REVOKING and the process stop.
 /// Each supervisor does both itself (`drain_and_stop`), so a module that was
 /// starting is stopped without ever serving and none is restarted into a
 /// generation nobody drained (review of SUP-4, round 2). Logs any stop that
@@ -1312,10 +1431,10 @@ fn arm_watchdog(deadline: tokio::time::Instant, armed: &std::sync::atomic::Atomi
 /// Draining first is what keeps a shutdown from answering a request a module
 /// is in the middle of `request_abandoned` — and a client that then retries a
 /// write the module did complete (review of SUP-4, round 1).
-async fn stop_supervisors(closed: crate::domain::Closed) {
+async fn stop_supervisors(closed: crate::domain::Closed, drain: Duration) {
     let mut stops = tokio::task::JoinSet::new();
     for s in closed.running {
-        stops.spawn(async move { (s.name, s.handle.drain_and_stop(MODULE_DRAIN).await) });
+        stops.spawn(async move { (s.name, s.handle.drain_and_stop(drain).await) });
     }
     while let Some(done) = stops.join_next().await {
         match done {
@@ -1328,7 +1447,7 @@ async fn stop_supervisors(closed: crate::domain::Closed) {
     // the latest, with a SIGKILL of its module attempted by then — attempted,
     // not confirmed (SUP-5).
     for stop in closed.disabling {
-        let _ = stop.await;
+        let _ = stop.task.await;
     }
 }
 
@@ -1531,11 +1650,12 @@ pub(crate) mod tests {
     async fn a_disables_stop_is_cut_off_at_a_fixed_instant_after_the_shutdown_began() {
         let shutdown = Shutdown::new(CancellationToken::new());
         let began = tokio::time::Instant::now();
-        let _ = shutdown.deadline();
+        let _ = shutdown.deadlines();
         shutdown.token().cancel();
         tokio::time::sleep(Duration::from_millis(250)).await;
         shutdown.modules_cut_off().await;
-        assert_eq!(began.elapsed(), MODULE_DRAIN + MODULE_STOP_GRACE);
+        let p = crate::lifecycle::Params::default();
+        assert_eq!(began.elapsed(), p.drain + p.stop_grace);
     }
 
     /// The shutdown waits for the stops `os disable` began, not only for the
@@ -1552,10 +1672,17 @@ pub(crate) mod tests {
                 done.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         };
-        stop_supervisors(crate::domain::Closed {
-            running: Vec::new(),
-            disabling: vec![stop],
-        })
+        stop_supervisors(
+            crate::domain::Closed {
+                running: Vec::new(),
+                disabling: vec![crate::domain::Disabling {
+                    name: "x".into(),
+                    record: agent24_os_proto::stop_record::StopRecordHandle::default(),
+                    task: stop,
+                }],
+            },
+            Duration::ZERO,
+        )
         .await;
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
     }

@@ -308,6 +308,145 @@ fn a_sigterm_drains_the_packages_request_and_stops_it() {
         "the discovery state file outlived the daemon"
     );
     gone_within(pid, 2, "the module outlived the daemon");
+    // SHUT-1b: the shutdown left its summary, and took its marker back.
+    let run = home.path().join(".agent24/run");
+    assert!(
+        !run.join("daemon.alive").exists(),
+        "the marker outlived a clean shutdown"
+    );
+    let summary: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(run.join("last-shutdown.json")).expect("no shutdown summary"),
+    )
+    .unwrap();
+    assert_eq!(summary["stop_result"], "clean", "{summary}");
+    let m = &summary["records"][0];
+    assert_eq!(
+        (&m["name"], &m["reason"], &m["group"], &m["drain_ended_by"]),
+        (
+            &serde_json::json!("remote"),
+            &serde_json::json!("shutdown"),
+            &serde_json::json!("gone"),
+            &serde_json::json!("idle")
+        ),
+        "{summary}"
+    );
+}
+
+/// Every line the daemon has logged so far, without waiting for more.
+fn logged_so_far(d: &Daemon) -> Vec<String> {
+    std::thread::sleep(Duration::from_millis(300));
+    d.log.try_iter().collect()
+}
+
+fn sigterm_and_wait(d: &mut Daemon) {
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &d.run.daemon.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let by = Instant::now() + Duration::from_secs(10);
+    while d.run.daemon.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < by, "the daemon did not exit on SIGTERM");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// SHUT-1b: a daemon that never finished its shutdown — SIGKILLed here, as
+/// the watchdog or a crash would end it — is told at the next start; one that
+/// did is not (the control). The marker is what tells them apart.
+#[test]
+fn a_shutdown_that_did_not_finish_is_told_at_the_next_start() {
+    let home = tmp_home();
+    let run = home.path().join(".agent24/run");
+    let mut first = start(home.path());
+    assert!(run.join("daemon.alive").exists(), "no marker while running");
+    first.run.daemon.kill().unwrap();
+    first.run.daemon.wait().unwrap();
+    assert!(
+        run.join("daemon.alive").exists(),
+        "a killed daemon's marker is gone"
+    );
+
+    let mut second = start(home.path());
+    let lines = logged_so_far(&second);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("did not confirm a clean shutdown")),
+        "no warning about the unconfirmed shutdown:\n{}",
+        lines.join("\n")
+    );
+    sigterm_and_wait(&mut second);
+    assert!(!run.join("daemon.alive").exists());
+    assert!(run.join("last-shutdown.json").exists());
+
+    let mut third = start(home.path());
+    let lines = logged_so_far(&third);
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("did not confirm") || l.contains("previous daemon")),
+        "a clean shutdown was reported as not:\n{}",
+        lines.join("\n")
+    );
+    sigterm_and_wait(&mut third);
+}
+
+/// SHUT-1b: an ephemeral daemon neither reads, writes nor removes the
+/// shutdown evidence of the state directory it happens to share a HOME with.
+#[test]
+fn an_ephemeral_daemon_leaves_the_shutdown_evidence_alone() {
+    let home = tmp_home();
+    let run = home.path().join(".agent24/run");
+    std::fs::create_dir_all(&run).unwrap();
+    // Both files pre-seeded: the marker says "unconfirmed" to anyone who
+    // reads it — an ephemeral daemon must not even read it.
+    std::fs::write(run.join("daemon.alive"), b"sentinel").unwrap();
+    std::fs::write(run.join("last-shutdown.json"), b"old summary").unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .args(["serve", "--port", "0", "--ephemeral"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = daemon.stderr.take().unwrap();
+    let log = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut text);
+        text
+    });
+    let stdout = daemon.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let ready = rx.recv_timeout(Duration::from_secs(30));
+    let _ = Command::new("kill")
+        .args(["-TERM", &daemon.id().to_string()])
+        .status();
+    let _ = daemon.wait();
+    assert!(ready.is_ok_and(|l| l.contains("ready")), "no ready line");
+    assert_eq!(
+        std::fs::read(run.join("daemon.alive")).unwrap(),
+        b"sentinel"
+    );
+    assert_eq!(
+        std::fs::read(run.join("last-shutdown.json")).unwrap(),
+        b"old summary"
+    );
+    let log = log.join().unwrap();
+    assert!(
+        !log.contains("previous daemon") && !log.contains("previous shutdown"),
+        "an ephemeral daemon read the shutdown evidence:\n{log}"
+    );
 }
 
 /// The module named `remote` in an `/api/v1/os` list.

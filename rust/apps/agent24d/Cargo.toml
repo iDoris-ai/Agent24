@@ -38,11 +38,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # close-on-exec in the child (ME3-SUP slice 1). The rest of the crate — the
 # proxy, the supervisor — is wired in by later slices.
 agent24-os-proto = { path = "../../crates/agent24-os-proto" }
+# SHUT-1b: open the shutdown evidence without following a link or blocking on
+# a FIFO (already in the tree through agent24-os-proto).
+rustix = { version = "0.38", features = ["fs"] }
 
 [dev-dependencies]
-# `tests/trampoline.rs` makes an fd without close-on-exec to prove the binary's
-# trampoline keeps it from the module.
-rustix = { version = "0.38", features = ["fs"] }
 tempfile = "3"
 sha2 = "0.10"
 tower = { version = "0.5", features = ["util"] }

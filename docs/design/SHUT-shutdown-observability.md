@@ -58,7 +58,8 @@
       - **启动阶段**被 Drop（开库、绑端口等启动失败的处理路径）→ 删标记：那是启动失败，不是没停完；
       - 交给停机任务**之前**（在 `tokio::spawn` 调用之前、同步地）就把守卫切到「停机阶段」：此后 Drop **不删**（一个还没被 poll 过就随 unwind 丢掉的任务，或运行时在持久化途中取消它，都不会冒充干净结束）；
       - 停机阶段只有持久化作业**成功回执**才删（且只删 `instance_id` 相同的那个标记）。
-   5. 标记写失败：warn，并在本次的 `config_warnings` 里记「本次运行没有崩溃证据」，照常启动。
+   5. 标记写失败：warn，并在本次的 `config_warnings` 里记「本次运行没有崩溃证据」，照常启动；这次运行的汇总照写（删标记按 id 进行，没写成的标记不会被谁删）。
+   6. **承诺的边界**：在拿到单例锁、写出标记**之前**就收到的停机（启动最早期），看门狗可能在标记出现之前结束进程——那个 daemon 还没启动任何东西，不留证据。
 2. **每次模块停止结束**：Supervisor 在内部逐项填 `StopRecord`（排空结束填 drain 字段，确认进程组为空时在同一把锁里一次写全 `group`、`leader`、`stop_elapsed_ms`、`abandoned`、`never_sent`），**当场**：`leader = killed_after_grace` → warn；`drain.ended_by = deadline` 且 `abandoned + never_sent > 0` → warn；`group = failed` 或 `supervisor = panicked` → error。
 3. **热 disable 的停止**进入一本「停止账本」：发起停止**之前**就建好条目（稳定 id、开始时刻、`Arc<Mutex<StopRecord>>` 共享句柄，即 `stop_record()`）。记录的终态字段先写、账本的「已完成」后写。`close()` 时**一次性固定**纳入本次停机的条目集合：已标「已完成」的只是历史（完成时已记日志）；其余纳入（其中「进程组已 gone、任务还在收尾」与「还在停」是两种不同状态，都照实记）。模块截止时刻对每条记录**在它自己的锁里**深拷贝快照。`cut_off` 只能由放弃分支写，`Status::Killed` 本身不推出 `cut_off`。
 4. **停机**：`began` 由 `request()` 记下（不再用截止时刻倒推）；`request()` 幂等。**任何**观察到取消的路径（包括原始 `CancellationToken` 被外部取消后才醒来的停机任务）在读截止时刻之前都先调一次 `request()`，所以 `began` 总是由第一个到达者确定，且只确定一次。
@@ -91,7 +92,7 @@
   - `module "x" did not exit within its 500ms stop grace; SIGKILLed after 512ms — raise A24_MODULE_STOP_GRACE_MS if it needs longer to flush`
   - `module "x": the 800ms drain ended with 2 request(s) still in flight (1 sent, outcome unknown; 1 never sent) — raise A24_MODULE_DRAIN_MS if requests routinely run longer`
   - 汇总：`shutdown (state dir ~/.agent24) took 1120ms: x completed (drain idle 3ms, exited in grace, stop 40ms); y completed (drain deadline 800ms, cut 2, grace expired, stop 512ms)`
-- **`last-shutdown.json`**：`{version, instance_id, began_at, took_ms, stop_result, params:{drain_ms, stop_grace_ms, module_deadline_ms, persist_deadline_ms, watchdog_ms}, records:[StopRecord…]}`，字段只增不删。
+- **`last-shutdown.json`**：`{version, instance_id, began_at_ms, took_ms, stop_result, params:{drain_ms, stop_grace_ms, http_deadline_ms, module_deadline_ms, persist_deadline_ms, watchdog_ms}, records:[ModuleStop…]}`（`began_at_ms` 是 Unix 纪元以来的墙钟毫秒；各截止为停机开始后的毫秒数），字段只增不删；形状由测试钉住。只从 1 MiB 以内的普通文件读取（不跟随链接）。
 - **实时出口**（SHUT-1c）：新端点 `GET /api/v1/daemon/shutdown`（要 token；`daemon` 加进 `RESERVED_KERNEL_SEGMENTS`，免得哪个领域 OS 的命名空间撞上它，保留段的集合相等测试同步更新）→ `{state_dir, effective:{…参数与三个截止…}, config_warnings:[…], previous, last_shutdown}`；`agent24 daemon status` 多打一段「停机」：生效参数、配置告警、上次停机的结论与被强杀/切断的模块。写进 `protocol/openapi.yaml`。
   **不动** `DomainOsView.detail`（它说的是模块此刻的状态，不塞历史）和 `DomainOsList` 的形状。
 
