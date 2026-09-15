@@ -178,17 +178,29 @@ const MAX_EVIDENCE_BYTES: u64 = 1 << 20;
 /// never reads more than [`MAX_EVIDENCE_BYTES`] (review of SHUT-1b, round 1).
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<Result<T, ()>> {
     use std::io::Read;
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
+    // Opened without following a link and without blocking, then checked on
+    // the descriptor itself: no window between a check by path and the open
+    // for someone to put a link or a FIFO in its place (review of SHUT-1b,
+    // round 2).
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+        opts.custom_flags(i32::try_from(flags.bits()).unwrap_or(0));
+    }
+    let file = match opts.open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(_) => return Some(Err(())),
     };
-    if !meta.is_file() || meta.len() > MAX_EVIDENCE_BYTES {
-        return Some(Err(()));
+    match file.metadata() {
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_EVIDENCE_BYTES => {}
+        _ => return Some(Err(())),
     }
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(path)
-        .and_then(|f| f.take(MAX_EVIDENCE_BYTES + 1).read_to_end(&mut bytes));
+    let read = file.take(MAX_EVIDENCE_BYTES + 1).read_to_end(&mut bytes);
     if read.is_err() || bytes.len() as u64 > MAX_EVIDENCE_BYTES {
         return Some(Err(()));
     }
@@ -322,10 +334,18 @@ impl StoppingMarker {
     }
 
     /// Remove the marker if it is still this instance's.
+    /// Remove the marker if it is still this instance's. A marker that is
+    /// there but cannot be read is an error — not "someone else's" — so a
+    /// shutdown that could not remove it says so (review of SHUT-1b,
+    /// round 2).
     fn remove(&self) -> std::io::Result<()> {
         let path = self.dir.join(ALIVE);
         match read_json::<Alive>(&path) {
             Some(Ok(a)) if a.instance_id == self.instance_id => std::fs::remove_file(&path),
+            Some(Err(())) => Err(std::io::Error::other(format!(
+                "{} is there but cannot be read; left in place",
+                path.display()
+            ))),
             _ => Ok(()),
         }
     }
@@ -436,6 +456,11 @@ pub struct Summary {
     pub stop_result: String,
     pub params: SummaryParams,
     pub records: Vec<ModuleStop>,
+    /// Records left out so the file stays within what a start reads back
+    /// ([`MAX_EVIDENCE_BYTES`]); 0 in any daemon with a sane number of
+    /// modules.
+    #[serde(default)]
+    pub omitted_records: usize,
 }
 
 /// The budgets in effect, and every deadline they gave, in milliseconds
@@ -554,6 +579,7 @@ impl Summary {
             took_ms: began_ago.as_millis(),
             stop_result: stop_result(&snapshots).to_owned(),
             params: SummaryParams::of(params),
+            omitted_records: 0,
             records: records
                 .iter()
                 .map(|(name, reason, r)| ModuleStop::new(name, *reason, r))
@@ -612,10 +638,26 @@ impl Summary {
 ///
 /// The first step that failed; the marker is then still there.
 pub fn persist(summary: &Summary, marker: &StoppingMarker) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(summary).map_err(std::io::Error::other)?;
+    let bytes = bounded(summary)?;
     write_durable(&marker.dir, SUMMARY, &bytes).map_err(|(_, e)| e)?;
     marker.remove()?;
     sync_dir(&marker.dir)
+}
+
+/// The summary as written: within [`MAX_EVIDENCE_BYTES`], so the next start
+/// can read it back — records are dropped from the end, and counted, if the
+/// whole would not fit (review of SHUT-1b, round 2).
+fn bounded(summary: &Summary) -> std::io::Result<Vec<u8>> {
+    let mut s = summary.clone();
+    loop {
+        let bytes = serde_json::to_vec_pretty(&s).map_err(std::io::Error::other)?;
+        if bytes.len() as u64 <= MAX_EVIDENCE_BYTES || s.records.is_empty() {
+            return Ok(bytes);
+        }
+        let drop = (s.records.len() / 8).max(1);
+        s.records.truncate(s.records.len() - drop);
+        s.omitted_records += drop;
+    }
 }
 
 /// Where the two files live, for a non-ephemeral daemon.
@@ -922,6 +964,28 @@ mod tests {
         );
     }
 
+    /// A summary too big to be read back is cut to fit, and says how much it
+    /// left out — a start never meets its own summary as unreadable.
+    #[test]
+    fn a_huge_summary_is_cut_to_what_a_start_reads_back() {
+        let mut r = rec(ProcessAtStop::Running);
+        r.group = Some(GroupEnd::Gone);
+        let records: Vec<_> = (0..20_000)
+            .map(|i| (format!("module-{i:05}"), Reason::Shutdown, r.clone()))
+            .collect();
+        let s = Summary::new(
+            "big",
+            &Params::default(),
+            Duration::from_millis(5),
+            &records,
+        );
+        let bytes = bounded(&s).unwrap();
+        assert!(bytes.len() as u64 <= MAX_EVIDENCE_BYTES);
+        let back: Summary = serde_json::from_slice(&bytes).unwrap();
+        assert!(back.omitted_records > 0);
+        assert_eq!(back.records.len() + back.omitted_records, 20_000);
+    }
+
     /// The file's shape, pinned: what SHUT-1c and a person reading it rely on.
     #[test]
     fn the_summary_file_has_the_documented_shape() {
@@ -937,7 +1001,8 @@ mod tests {
                 "took_ms",
                 "stop_result",
                 "params",
-                "records"
+                "records",
+                "omitted_records"
             ]
             .into_iter()
             .map(String::from)
