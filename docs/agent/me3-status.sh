@@ -47,8 +47,22 @@ cd "$(dirname "$0")/../.." || exit 1
 #
 # 行首锚定：`^[[:space:]]*<符号>` —— 一个定义在行首（可缩进），一句
 # `// TODO: 将来会有 pub fn accept` 不在行首。
-has_symbol() { # has_symbol <内容来源命令...> <符号>  —— 从 stdin 读内容
-  grep -qE "^[[:space:]]*$1\b"
+#
+# 行首锚定认的是「物理行」，不是 Rust 定义：块注释里、raw string 里的一行
+# `pub fn supervise() {}` 同样在行首，会报「已交付」—— 更糟的那个方向（复审
+# PROBE 第 1 轮）。所以先把这两种去掉再 grep（`code_only`）。去不掉的如实写：
+# 普通字符串跨行写出的定义、被 `#[cfg(...)]` 关掉的定义仍会被认成交付；反过来
+# 字符串里的 `/*`（如 "src/*.rs"）会让去注释多吞一段，只会把「已交付」误报成
+# 「未开工」—— 便宜的那个方向。要更准就得真的解析 Rust，这个脚本不做。
+code_only() { # stdin → stdout：去掉块注释与 raw string
+  perl -0777 -pe 's{(?<![A-Za-z0-9_])b?r(#*)".*?"\1}{""}gs; s{/\*.*?\*/}{}gs'
+}
+has_symbol() { # has_symbol <符号>  —— 从 stdin 读内容
+  code_only | grep -qE "^[[:space:]]*$1\b"
+}
+command -v perl >/dev/null 2>&1 || {
+  echo "⛔ 需要 perl（去掉块注释与 raw string 再认符号）。**不把「认不了」当成「没有」**。"
+  exit 2
 }
 
 REF=${ME3_REF:-origin/main}
@@ -56,7 +70,7 @@ REF=${ME3_REF:-origin/main}
 probe() { # probe <描述> <文件> <符号>
   local desc=$1 file=$2 sym=$3 on_ref=1 on_tree=1
   git show "$REF:$file" 2>/dev/null | has_symbol "$sym" && on_ref=0
-  [ -f "$file" ] && grep -qE "^[[:space:]]*${sym}\b" "$file" 2>/dev/null && on_tree=0
+  [ -f "$file" ] && has_symbol "$sym" < "$file" && on_tree=0
 
   if [ $on_ref -eq 0 ]; then
     # 在 main 上有，但本地这棵树没有 —— 说出来，因为读者多半正准备去写它。
@@ -135,11 +149,21 @@ echo "探针只回答「代码在不在」,回答不了「有没有生产调用�
 echo
 echo "--- 探针自证 ---"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-say() { [ "$1" = "$2" ] && echo "  ✓ $3" || echo "  ✗ 探针坏了:$3(得到 $2,应为 $1)"; }
+# 自证坏了要让退出码也坏：只打印 ✗ 而退出 0，调用它的脚本和 CI 看不见（复审
+# PROBE 第 1 轮）。
+SELFTEST_FAILED=0
+say() {
+  if [ "$1" = "$2" ]; then
+    echo "  ✓ $3"
+  else
+    echo "  ✗ 探针坏了:$3(得到 $2,应为 $1)"
+    SELFTEST_FAILED=1
+  fi
+}
 # 自证跑在临时文件上,而临时文件不可能在 REF 里 —— 所以自证用的是同一条 grep
 # 规则,不是同一个 probe。差别写出来:自证证的是**符号识别规则**,不是「读哪棵树」。
-tprobe() { # tprobe <文件> <符号> —— 只测识别规则
-  grep -qE "^[[:space:]]*$2\b" "$1" 2>/dev/null
+tprobe() { # tprobe <文件> <符号> —— 只测识别规则（与 probe 同一个 has_symbol）
+  [ -f "$1" ] && has_symbol "$2" < "$1"
 }
 
 tprobe rust/crates/agent24-domain/src/lib.rs "pub struct DomainOsManifest"
@@ -174,9 +198,30 @@ say 0 $? "async 定义被宽容形状探到(\`spawn\` 变成 async 曾让一格�
 # 上面几格只证识别规则,跑在临时文件上;这两格走真路径 —— 读 $REF —— 探两个
 # 已知交付过的 SUP 符号。它们报 ✗ 说明「读 REF」这条路坏了,或者这两个符号又
 # 被改名了 —— 两种都要有人来改上面的行,而不是让它们安静地报「未开工」。
-REF_SUP_OK=0
-for spec in "rust/crates/agent24-os-proto/src/launch.rs|pub (async )?fn spawn" \
-            "rust/crates/agent24-os-proto/src/supervisor.rs|pub fn supervise"; do
-  git show "$REF:${spec%%|*}" 2>/dev/null | has_symbol "${spec#*|}" || REF_SUP_OK=1
-done
-say 0 $REF_SUP_OK "已知交付的 SUP 符号在 $REF 上被探到(走真的读 REF 路径)"
+#
+# 只在默认的 origin/main 上跑：`ME3_REF` 指向 SUP 之前的某个提交时，这两个符号
+# 本来就不在，报「探针坏了」是冤枉它（复审 PROBE 第 1 轮）。
+if [ -z "${ME3_REF:-}" ]; then
+  REF_SUP_OK=0
+  for spec in "rust/crates/agent24-os-proto/src/launch.rs|pub (async )?fn spawn" \
+              "rust/crates/agent24-os-proto/src/supervisor.rs|pub fn supervise"; do
+    git show "$REF:${spec%%|*}" 2>/dev/null | has_symbol "${spec#*|}" || REF_SUP_OK=1
+  done
+  say 0 $REF_SUP_OK "已知交付的 SUP 符号在 $REF 上被探到(走真的读 REF 路径)"
+else
+  echo "  - 跳过「已知交付的 SUP 符号」:ME3_REF=$ME3_REF 是自定义坐标,那里未必已交付"
+fi
+
+printf '/*\npub fn commented() {}\n*/\n' > "$tmp/block.rs"
+tprobe "$tmp/block.rs" "pub fn commented"
+say 1 $? "符号只在块注释里 → 未开工(更糟的方向:不能报已交付)"
+
+printf 'const S: &str = r#"\npub async fn spawn() {}\n"#;\n' > "$tmp/raw.rs"
+tprobe "$tmp/raw.rs" "pub (async )?fn spawn"
+say 1 $? "符号只在 raw string 里 → 未开工"
+
+printf '/* 一段注释 */\npub fn after_comment() {}\n' > "$tmp/after.rs"
+tprobe "$tmp/after.rs" "pub fn after_comment"
+say 0 $? "块注释之后的真定义仍被探到(证明去注释没有吞掉后面的代码)"
+
+exit $SELFTEST_FAILED
