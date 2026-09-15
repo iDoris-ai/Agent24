@@ -25,6 +25,7 @@ pub mod initialize;
 pub mod launch;
 pub mod proxy;
 pub mod rpc;
+pub mod stop_record;
 pub mod supervise;
 pub mod supervisor;
 pub mod version;

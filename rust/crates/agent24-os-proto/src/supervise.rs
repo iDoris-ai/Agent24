@@ -267,6 +267,18 @@ pub struct ModuleProcess {
     exit: Option<Exit>,
     /// The tasks draining the child's stdout and stderr.
     drains: Vec<tokio::task::JoinHandle<()>>,
+    /// Told how the group ended when this is dropped without a confirmed
+    /// stop — whether a SIGKILL was actually sent (SHUT-1a).
+    on_unstopped_drop: Option<DropReport>,
+}
+
+/// The report [`ModuleProcess::on_unstopped_drop`] installs.
+struct DropReport(Box<dyn FnOnce(crate::stop_record::GroupEnd) + Send + Sync>);
+
+impl std::fmt::Debug for DropReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DropReport")
+    }
 }
 
 /// How a module's leader process ended.
@@ -365,7 +377,17 @@ impl ModuleProcess {
             stopped: false,
             exit: None,
             drains,
+            on_unstopped_drop: None,
         })
+    }
+
+    /// Call `report` if this process is dropped without a confirmed stop,
+    /// with whether its group was actually sent SIGKILL then.
+    pub(crate) fn on_unstopped_drop(
+        &mut self,
+        report: impl FnOnce(crate::stop_record::GroupEnd) + Send + Sync + 'static,
+    ) {
+        self.on_unstopped_drop = Some(DropReport(Box::new(report)));
     }
 
     /// The token this process was started with, for its handshake to compare
@@ -503,7 +525,7 @@ impl ModuleProcess {
     /// retry killing. A retry after the leader was reaped only probes the group
     /// again; it sends no signal (see the type's docs).
     pub async fn stop(self, grace: Duration) -> Result<StopReport, StopFailed> {
-        self.stop_then(grace, || {}).await
+        self.stop_then(grace, |_| {}).await
     }
 
     /// [`ModuleProcess::stop`], calling `gone` the moment the group is
@@ -511,10 +533,13 @@ impl ModuleProcess {
     /// drains that follows. For a caller that must record "no process left" at
     /// the point it becomes true: a cancellation during the drain wait would
     /// otherwise find it unrecorded (review of ME3-SUP slice 3a, round 10).
+    /// `gone` gets every fact of the stop at once — how the leader ended, how
+    /// long it took, what the revocation left in flight — so a caller can
+    /// record them in one step (SHUT-1a).
     pub(crate) async fn stop_then(
         mut self,
         grace: Duration,
-        gone: impl FnOnce(),
+        gone: impl FnOnce(crate::stop_record::GoneFacts),
     ) -> Result<StopReport, StopFailed> {
         self.begin_stop();
         if self.revocation.is_none() {
@@ -537,13 +562,26 @@ impl ModuleProcess {
                 }
             }
         }
-        if let Err(error) = self.terminate(grace).await {
-            return Err(StopFailed {
-                error,
-                process: Box::new(self),
-            });
-        }
-        gone();
+        let signalled = std::time::Instant::now();
+        let leader = match self.terminate(grace).await {
+            Ok(leader) => leader,
+            Err(error) => {
+                return Err(StopFailed {
+                    error,
+                    process: Box::new(self),
+                });
+            }
+        };
+        let (abandoned, never_sent) = self
+            .revocation
+            .as_ref()
+            .map_or((0, 0), |r| (r.abandoned.len(), r.never_sent.len()));
+        gone(crate::stop_record::GoneFacts {
+            leader,
+            stop_elapsed: signalled.elapsed(),
+            abandoned,
+            never_sent,
+        });
         self.finish_drains().await;
         let Some(Revocation {
             permit,
@@ -565,12 +603,26 @@ impl ModuleProcess {
         })
     }
 
-    async fn terminate(&mut self, grace: Duration) -> std::io::Result<()> {
+    /// Returns how the leader ended — kept apart: already gone, gone on TERM
+    /// within the grace, or SIGKILLed once the grace ran out (SHUT-1a).
+    async fn terminate(
+        &mut self,
+        grace: Duration,
+    ) -> std::io::Result<Option<crate::stop_record::Leader>> {
+        use crate::stop_record::Leader;
+        // Already reaped: a retry of a stop that failed after the reap — how
+        // the leader went is not known here (review of SHUT-1a, round 1).
+        let mut leader = None;
         if !self.reaped {
             // The leader is unreaped: the group id is ours.
             let exited_already = self.leader_exited()?;
             self.signal_settling(Signal::Term, exited_already).await?;
             let exited = exited_already || self.leader_exits_within(grace).await?;
+            leader = Some(match (exited_already, exited) {
+                (true, _) => Leader::GoneBeforeTerm,
+                (false, true) => Leader::ExitedInGrace,
+                (false, false) => Leader::KilledAfterGrace,
+            });
             // Once more even if the leader went on TERM: helpers outlive their
             // parent, and "the process we started exited" is not the claim "the
             // tree is gone".
@@ -591,7 +643,8 @@ impl ModuleProcess {
             self.exit = Some(Exit::from(status));
             self.reaped = true;
         }
-        self.group_empties_within(REAP_TIMEOUT).await
+        self.group_empties_within(REAP_TIMEOUT).await?;
+        Ok(leader)
     }
 
     /// Signal the group while the leader is unreaped (so the id is ours).
@@ -711,13 +764,17 @@ impl Drop for ModuleProcess {
             .is_some();
         // Only while the leader is unreaped: after the reap the id may belong
         // to someone else, and every member has had SIGKILL already.
-        let killed = if self.reaped {
-            "already signalled before the reap".to_owned()
+        use crate::stop_record::GroupEnd;
+        // After the reap nothing is sent — the id may be someone else's — so
+        // this drop cannot kill anything: `KillUnavailable`, not a kill
+        // attempt (review of SHUT-1a, round 1).
+        let (sent, killed) = if self.reaped {
+            (false, "already signalled before the reap".to_owned())
         } else {
             match self.leader_exited() {
                 Ok(exited) => match self.signal(Signal::Kill, exited) {
-                    Ok(()) => "SIGKILL sent".to_owned(),
-                    Err(e) => format!("SIGKILL failed: {e}"),
+                    Ok(()) => (true, "SIGKILL sent".to_owned()),
+                    Err(e) => (false, format!("SIGKILL failed: {e}")),
                 },
                 // Only interrupts kept the answer from us. The leader is still
                 // unreaped — only this owner reaps it — so the group id is
@@ -725,13 +782,26 @@ impl Drop for ModuleProcess {
                 // round 3). Any other error leaves ownership unknown.
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                     match self.signal(Signal::Kill, false) {
-                        Ok(()) => "SIGKILL sent (leader state unknown: interrupted)".to_owned(),
-                        Err(e) => format!("SIGKILL failed: {e}"),
+                        Ok(()) => (
+                            true,
+                            "SIGKILL sent (leader state unknown: interrupted)".to_owned(),
+                        ),
+                        Err(e) => (false, format!("SIGKILL failed: {e}")),
                     }
                 }
-                Err(e) => format!("could not tell whether the leader exited: {e}"),
+                Err(e) => (
+                    false,
+                    format!("could not tell whether the leader exited: {e}"),
+                ),
             }
         };
+        if let Some(DropReport(report)) = self.on_unstopped_drop.take() {
+            report(if sent {
+                GroupEnd::KillAttempted
+            } else {
+                GroupEnd::KillUnavailable
+            });
+        }
         tracing::warn!(
             pid = self.group.as_raw_nonzero().get(),
             permit_taken,
