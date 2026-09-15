@@ -1,7 +1,7 @@
 # Agent24 实时状态 — progress
 
 > 「此刻仓库真实发生了什么」。由 `pilot run` 每一步更新。
-> 更新时间：2026-09-11
+> 更新时间：2026-09-13
 >
 > **ME-3 各刀在不在 main 上，不写在这里** —— 那张手写表过期过（见 #165），状态由探针给出：
 > `bash docs/agent/me3-status.sh`。本文件只记「现在在做哪件事、为什么、卡在哪」。
@@ -13,16 +13,18 @@
 - **M1 / F1.1（`Authorizer` 判定接缝）**：`tasks.md` 里的状态未改动，**未重排、也未开工**。
   2026-08-23 之后的工作全部落在 ME-3 上；本文件上一版停在那一天（#140/#141 待合），与仓库脱节了十九天。
 
-## 本轮待办（用户 2026-09-11 定，按顺序）
+## 本轮待办（用户 2026-09-13 定，按顺序）
 
-| # | 做什么 | PR | 完成条件 |
-|---|---|---|---|
-| 1 | ✅ ME-3b-4 受约束代理合入（PLAN T4） | [#173](https://github.com/iDoris-ai/Agent24/pull/173) | APPROVE 后与 #165 冲突 → 合 main 解冲突（只动 SPEC 状态表，取探针）→ 复扫重新 APPROVE → 已合并 `b1b4b82` |
-| 2 | ✅ 变异脚手架收掉复审的三条阻塞（B1 红基线 / B2 测试数 / B3 中途被杀） | [#172](https://github.com/iDoris-ai/Agent24/pull/172) | 多轮复审后对 `dceba02` APPROVE → 已合并 `32ab103`（不阻塞项记 FU-51、FU-52） |
-| 3 | ✅ 本文件与 `tasks.md` 对齐仓库真实状态，并记下这四条 | [#174](https://github.com/iDoris-ai/Agent24/pull/174) | 已合并 `09669bc` |
-| 4 | ✅ ME-3b-5 两阶段热 disable（PLAN T5） | [#175](https://github.com/iDoris-ai/Agent24/pull/175) | 已合并 `4918201`（评审 S1–S3 记 FU-48–50） |
+**ME3-SUP 已全部完成**（#178–#184，2026-09-12/13）：daemon 真正以独立进程启动磁盘上的第三方包、按代代理、崩溃退避与熔断、热 disable、SIGTERM 后 2 秒内全部退出。
 
-PR 的实时状态以 `gh pr view <n>` 为准，本表只记「为什么在等」。
+下一轮的完整队列（止血 → 停机可观测可调 → ME3-SUP 跟进项 → 主线 T8.5/T7/T8/T9 → T10/T11 → **T12 发布 v0.5.0**）写在
+[`tasks.md`](tasks.md)「ME3-NEXT 执行队列」，**不在这里抄第二份**。本轮用户裁决：
+
+- 停机时长保留默认（排空 0.8s + 停止宽限 0.5s，总 2s），但必须有日志、有跟踪、可调（SHUT-1/2/3）。
+- FU-60 改走 Unix socket；FU-61 按「检测变更、报需要重启」；FU-64 幂等重发 + 空闲上限 + 结构化提示。
+- 带状态机的功能先写一页语义说明、让 Codex 审设计，再写代码；已向 PR-Daemon 提规则 S1（jhfnetboy/PR-daemon#8）。
+
+PR 的实时状态以 `gh pr view <n>` 为准。
 
 ## 阻塞项（BLOCKED）
 
@@ -30,6 +32,8 @@ PR 的实时状态以 `gh pr view <n>` 为准，本表只记「为什么在等�
 
 ## 最近完成（2026-08-23 之后，全部 squash 合入 main）
 
+- 2026-09-13 ME3-SUP：#180 Supervisor 循环 · #181 代理按代取上游地址 · #182 daemon 启动磁盘包 + 有界停机 · #183 热 disable · #184 跟进批次（FU-58/59/62/63）。
+- 2026-09-12 #176 3c 回调通道 · #177 3c 收尾 · #178 SUP-1 进程所有权 + 跳板启动 · #179 SUP-2 回调端点 + 握手驱动。
 - 2026-09-12 #172 变异脚手架（`docs/agent/mutate.sh` / `mutate.py`）。
 - 2026-09-11 #175 3b-5 两阶段热 disable · #173 3b-4 受约束代理 · #174 状态文档对齐。
 - 2026-09-11 #165 进程外领域 OS 的路线、v0.5.0 任务分解、`me3-status.sh` 探针。
@@ -44,11 +48,13 @@ PR 的实时状态以 `gh pr view <n>` 为准，本表只记「为什么在等�
   每一项删前都核过：PR 已 MERGED、工作区干净；分支 tip 是该 PR 最终 head 或其祖先 —— 例外是 9 个「被后续评审轮次改过的旧草稿」（`me3b-cuts*`、`pr98-*`、`pr100-r`），它们不是最终版的祖先，也一并删了。
   删之前全部打包进 开发机（MacBook，不是 Mac mini）上的 `~/Dev/auraai/.archive/agent24-cleanup-2026-09-11.bundle`（`git bundle verify` 通过），只在那一台上可恢复。
 - 2026-09-12 #172、#175 合并后，各自的 worktree 与分支（`Agent24-mutation` / `chore/mutation-harness`、`Agent24-me3b5` / `feat/me3b-5-drain`）按同样的核验删除，删前各打一个 bundle 放在同一目录。
+- 2026-09-13 ME3-SUP 合完后：删 `Agent24-sup`、`Agent24-fu` 两个 worktree 与 5 个已合并分支（#180/#181/#182/#183/#184 的头，均核过本地 tip = PR 最终 head），删前打包为 `.archive/agent24-me3-sup-5-hot-disable-2026-09-13.bundle` 与 `.archive/agent24-me3-sup-branches-2026-09-13.bundle`（`git bundle verify` 通过）。
+- 2026-09-13 发现并 SIGKILL 31 个遗留测试进程：`supervise.rs` 里「忽略 SIGTERM」的顽固模块夹具，变异测试中途被杀或变异体去掉了 SIGKILL 时漏收，空转 1–2 天。防再发：tasks.md HYG-1/HYG-2。
 - 保留：`feat/me4-cos72-skeleton`（Cos72 骨架，PLAN T10 要重做成进程外样例，远端也在）。
 
 ## 下一个 READY
 
-- 本轮四条待办已全部完成。**ME3-T6 ME-3c 回调通道其余部分** 已开 [#176](https://github.com/iDoris-ai/Agent24/pull/176)，等外部评审；之后是 **ME3-SUP**（Supervisor 接线，落实 FU-46/49/50）。
+- **HYG-1 顽固模块测试夹具的进程组守卫**，随后 HYG-2、SHUT-1/2/3（见 `tasks.md`「ME3-NEXT 执行队列」）。
 
 ## 本轮的三条纪律（从 F1/F8 二十余轮复审里带出来的，ME-3 仍适用）
 
