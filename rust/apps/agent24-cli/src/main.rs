@@ -661,9 +661,13 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     // quietly; any other failure is said, since the report is
                     // how a budget that is too tight gets noticed (review of
                     // SHUT-1c, round 1).
+                    // The whole exchange is bounded, not just the connect: a
+                    // daemon that stalls mid-response must not hang `status`
+                    // (review of SHUT-1c, round 2).
                     match client()
                         .get(format!("{base}/api/v1/shutdown"))
                         .bearer_auth(&state.token)
+                        .timeout(Duration::from_secs(5))
                         .send()
                         .await
                     {

@@ -703,8 +703,15 @@ fn bounded(summary: &Summary) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// The largest integer the report's schema admits (2^53 - 1): a JSON number
+/// beyond it loses precision in a JavaScript client.
+const JSON_SAFE_MAX: u64 = (1 << 53) - 1;
+
+/// A figure for the report, clamped to [`JSON_SAFE_MAX`] — the persisted ones
+/// come from a file on disk, which may say anything that parses (review of
+/// SHUT-1c, round 2).
 fn ms(v: u128) -> u64 {
-    u64::try_from(v).unwrap_or(u64::MAX)
+    u64::try_from(v).map_or(JSON_SAFE_MAX, |v| v.min(JSON_SAFE_MAX))
 }
 
 /// What `GET /api/v1/shutdown` answers (SHUT-1c): the budgets in effect,
@@ -759,7 +766,7 @@ pub fn report(
                         .then(|| format!("{} ({cut})", m.name))
                 })
                 .collect(),
-            omitted_records: u64::try_from(s.omitted_records).unwrap_or(u64::MAX),
+            omitted_records: ms(s.omitted_records as u128),
         }),
     }
 }
@@ -1115,6 +1122,30 @@ mod tests {
         let e = report(&Params::default(), &[], None);
         assert!(e.ephemeral && e.evidence_dir.is_none() && e.last_shutdown.is_none());
         assert_eq!(e.previous, "no_history");
+    }
+
+    /// A summary on disk may carry figures past what the schema admits; the
+    /// report clamps them rather than hand a JavaScript client a number it
+    /// cannot hold (review of SHUT-1c, round 2).
+    #[test]
+    fn the_report_never_exceeds_the_json_safe_integer() {
+        let mut last = Summary::new("x", &Params::default(), Duration::ZERO, &[]);
+        last.began_at_ms = u128::from(u64::MAX) + 1;
+        last.took_ms = u128::from(JSON_SAFE_MAX) + 1;
+        last.omitted_records = usize::MAX;
+        let d = dir();
+        let r = report(
+            &Params::default(),
+            &[],
+            Some((d.path(), &Previous::NoHistory, Some(last))),
+        );
+        let last = r.last_shutdown.unwrap();
+        assert_eq!(
+            (last.began_at_ms, last.took_ms, last.omitted_records),
+            (JSON_SAFE_MAX, JSON_SAFE_MAX, JSON_SAFE_MAX)
+        );
+        assert_eq!(ms(u128::from(JSON_SAFE_MAX)), JSON_SAFE_MAX);
+        assert_eq!(ms(7), 7);
     }
 
     /// A summary too big to be read back is cut to fit, and says how much it
