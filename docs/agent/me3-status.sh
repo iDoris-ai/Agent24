@@ -55,7 +55,10 @@ cd "$(dirname "$0")/../.." || exit 1
 # 字符串里的 `/*`（如 "src/*.rs"）会让去注释多吞一段，只会把「已交付」误报成
 # 「未开工」—— 便宜的那个方向。要更准就得真的解析 Rust，这个脚本不做。
 code_only() { # stdin → stdout：去掉块注释与 raw string
-  perl -0777 -pe 's{(?<![A-Za-z0-9_])b?r(#*)".*?"\1}{""}gs; s{/\*.*?\*/}{}gs'
+  # raw string：r / br / cr（C 字符串），任意个 #。块注释：Rust 允许嵌套，
+  # 所以用递归 `(?R)`，非贪婪的 `.*?` 会停在内层的 `*/`（复审 PROBE 第 2 轮）。
+  perl -0777 -pe 's{(?<![A-Za-z0-9_])[bc]?r(#*)".*?"\1}{""}gs;
+                  s{/\*(?:[^/*]++|/(?!\*)|\*(?!/)|(?R))*\*/}{}gs'
 }
 has_symbol() { # has_symbol <符号>  —— 从 stdin 读内容
   code_only | grep -qE "^[[:space:]]*$1\b"
@@ -219,6 +222,14 @@ say 1 $? "符号只在块注释里 → 未开工(更糟的方向:不能报已交
 printf 'const S: &str = r#"\npub async fn spawn() {}\n"#;\n' > "$tmp/raw.rs"
 tprobe "$tmp/raw.rs" "pub (async )?fn spawn"
 say 1 $? "符号只在 raw string 里 → 未开工"
+
+printf '/* 外\n/* 内 */\npub fn nested() {}\n*/\n' > "$tmp/nested.rs"
+tprobe "$tmp/nested.rs" "pub fn nested"
+say 1 $? "符号在嵌套块注释里 → 未开工(Rust 的块注释可以嵌套)"
+
+printf 'const C: &CStr = cr#"\npub fn in_c_string() {}\n"#;\n' > "$tmp/craw.rs"
+tprobe "$tmp/craw.rs" "pub fn in_c_string"
+say 1 $? "符号只在 raw C 字符串(cr#\"…\"#)里 → 未开工"
 
 printf '/* 一段注释 */\npub fn after_comment() {}\n' > "$tmp/after.rs"
 tprobe "$tmp/after.rs" "pub fn after_comment"
