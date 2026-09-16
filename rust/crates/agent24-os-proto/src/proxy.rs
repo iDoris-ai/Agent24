@@ -16,11 +16,15 @@
 //! Two of the three rules below are structural; one rests on a convention, and
 //! saying which is which is the point of this paragraph.
 //!
-//! - **The upstream is a [`SocketAddr`], not a URL** — and it is the address
-//!   of the generation a request was admitted into (SUP-3b), set by the kernel
-//!   when it spawned that run on a port of its own (D4). A module therefore has
-//!   no way to name a host — the local-SSRF pivot §1 refuses to allow is not
-//!   defended against here, it is unrepresentable. Structural.
+//! - **The upstream is a filesystem path to a Unix domain socket, not a
+//!   URL** (FU-60) — and it names the generation a request was admitted into
+//!   (SUP-3b), set by the kernel when it spawned that run on a socket of its
+//!   own (D4). A module therefore has no way to name a host — the local-SSRF
+//!   pivot §1 refuses to allow is not defended against here, it is
+//!   unrepresentable. Structural. The `Host` header forwarded to the module is
+//!   a fixed, kernel-chosen value (`agent24-module.invalid`), never derived
+//!   from this path — a path is not an HTTP authority, may hold bytes a header
+//!   cannot, and must not tell the module where the kernel's state lives.
 //! - **Every `X-A24-*` header is dropped in BOTH directions**, then the kernel
 //!   writes its own. A client cannot forge a lease and a module cannot echo one
 //!   back to the client. Structural, for headers under that prefix.
@@ -60,7 +64,7 @@
 //! acted on it; if it had not (still reading the client's body, say),
 //! `module_stopping`, because then the outcome is known — nothing ran.
 
-use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -106,6 +110,14 @@ pub const UPSTREAM_DEADLINE: Duration = Duration::from_secs(30);
 /// wedged, while one that is still streaming a large body is working. Without
 /// this, the two are the same reading 30 seconds later.
 pub const UPSTREAM_HEAD_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The `Host` header every proxied request carries to the module (FU-60):
+/// fixed and kernel-chosen, independent of how the kernel actually reaches the
+/// module (a `SocketAddr` before this change; a filesystem path since). A
+/// path is not a valid HTTP authority and must not be handed to the module —
+/// it would leak where the kernel's state lives. `.invalid` is RFC 2606's
+/// reserved, never-resolvable TLD.
+const UPSTREAM_HOST: &str = "agent24-module.invalid";
 
 /// How many proxied requests one module may be handling at once.
 ///
@@ -407,7 +419,7 @@ struct ProxyState {
     namespace: Arc<String>,
     /// Which run of the module serves this namespace, whether it is taking
     /// requests (ME-3b-5), and where it listens (SUP-3b: each run its own
-    /// port, D4). Read once per request.
+    /// Unix socket, D4/FU-60). Read once per request.
     module: Arc<Current>,
     ids: Arc<RequestIds>,
     limits: Limits,
@@ -503,11 +515,13 @@ struct Upstream {
 }
 
 impl Upstream {
-    async fn connect(generation: Arc<Generation>, addr: SocketAddr) -> Result<Self, String> {
-        let stream = tokio::net::TcpStream::connect(addr)
+    async fn connect(generation: Arc<Generation>, path: &Path) -> Result<Self, String> {
+        // FU-60: a Unix domain socket, not a TCP port — no TIME_WAIT to
+        // accumulate for request-bodied requests this pool cannot reuse. No
+        // Nagle's algorithm on a Unix socket, so no `set_nodelay` equivalent.
+        let stream = tokio::net::UnixStream::connect(path)
             .await
             .map_err(|e| e.to_string())?;
-        let _ = stream.set_nodelay(true);
         let (sender, driver) =
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
                 .await
@@ -599,7 +613,7 @@ impl IdleConnections {
 async fn exchange(
     idle: &IdleConnections,
     generation: &Arc<Generation>,
-    addr: SocketAddr,
+    path: &Path,
     request: Request<Full<Bytes>>,
 ) -> Result<(hyper::Response<hyper::body::Incoming>, Upstream), String> {
     let request = match idle.take(generation) {
@@ -612,7 +626,7 @@ async fn exchange(
         },
         None => request,
     };
-    let mut fresh = Upstream::connect(generation.clone(), addr).await?;
+    let mut fresh = Upstream::connect(generation.clone(), path).await?;
     let response = fresh
         .sender
         .send_request(request)
@@ -897,11 +911,14 @@ async fn forward(
         }
     };
     *upstream_request.headers_mut() = headers;
-    if let Ok(host) = HeaderValue::from_str(&upstream.to_string()) {
-        upstream_request
-            .headers_mut()
-            .insert(axum::http::header::HOST, host);
-    }
+    // FU-60: fixed and kernel-chosen, never derived from `upstream` — a
+    // filesystem path is not an HTTP authority and must not reach the module
+    // (design v2, Medium 2). `.invalid` is RFC 2606's reserved,
+    // never-resolvable TLD, so the value cannot be mistaken for anywhere real.
+    upstream_request.headers_mut().insert(
+        axum::http::header::HOST,
+        HeaderValue::from_static(UPSTREAM_HOST),
+    );
 
     // Two deadlines, because they answer different questions (§5): a module that
     // has not produced a response HEAD is wedged, while one still sending a body
@@ -1171,9 +1188,34 @@ mod tests {
 
     use super::*;
     use axum::http::Method;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
     const NS: &str = "/api/v1/zzmock";
+
+    /// A `/tmp` path for a throwaway mock-module socket, unique enough that a
+    /// later run reusing this process's pid never collides with a node this
+    /// one left behind (review of FU-60, round 1: a pid-only name did). Pid
+    /// plus an atomic counter tells apart calls within one process; the
+    /// nanosecond timestamp tells apart this process from a past one that
+    /// happened to get the same pid and left a node behind. The node itself
+    /// is left behind on purpose (review of FU-60, round 3: no test here
+    /// unlinks it) — these mock modules run in detached `tokio::spawn` tasks
+    /// with no natural moment to clean up, and uniqueness (not cleanup) is
+    /// what keeps the tests hermetic; the OS reaps `/tmp` on its own schedule.
+    fn unique_sock(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        PathBuf::from(format!(
+            "/tmp/a24-{tag}-{}-{nanos}-{n}.sock",
+            std::process::id()
+        ))
+    }
 
     // ── the pure half ────────────────────────────────────────────────────
 
@@ -1461,7 +1503,7 @@ mod tests {
 
     /// A module that has completed its handshake — what every test before
     /// ME-3b-5 implicitly assumed.
-    fn running_module(upstream: SocketAddr) -> Arc<Current> {
+    fn running_module(upstream: PathBuf) -> Arc<Current> {
         Current::new(running_generation(upstream))
     }
 
@@ -1474,10 +1516,24 @@ mod tests {
         addr
     }
 
+    /// A mock module: axum served over a Unix domain socket (FU-60), the way
+    /// a real one is. A short, unique `/tmp` path — not `CallbackDir`'s
+    /// machinery, which these tests have no daemon-lifetime process to tie
+    /// its cleanup to; the socket file is left behind, same as other
+    /// throwaway state this test module leaks on purpose.
+    async fn serve_unix(app: Router) -> PathBuf {
+        let path = unique_sock("mock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        path
+    }
+
     /// A proxy in front of a mock module. Returns (proxy addr, upstream hits).
     async fn proxied() -> (SocketAddr, Hits) {
         let hits = Hits::default();
-        let upstream = serve(
+        let upstream = serve_unix(
             Router::new()
                 .fallback(upstream_handler)
                 .with_state(hits.clone()),
@@ -1576,6 +1632,26 @@ mod tests {
         assert_ne!(id, "forged-by-the-client");
     }
 
+    /// FU-60 (design v4, Medium 2): the `Host` the module sees is the fixed,
+    /// kernel-chosen value — never the filesystem path the kernel actually
+    /// dials, which is not a valid HTTP authority and would leak where the
+    /// kernel's state lives.
+    #[tokio::test]
+    async fn the_module_sees_a_fixed_host_never_the_sockets_path() {
+        let (proxy, _) = proxied().await;
+        let got = call(proxy, Method::GET, &format!("{NS}/things"), &[], "").await;
+        assert_eq!(got.status, StatusCode::OK);
+        let seen = got.json();
+        let host = seen["headers"]["host"].as_str().unwrap();
+        assert_eq!(host, UPSTREAM_HOST);
+        for leaked in [".sock", ".l", "/tmp", "run/"] {
+            assert!(
+                !host.contains(leaked),
+                "the Host header leaked a path fragment ({leaked:?}): {host}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_client_cannot_choose_its_own_request_id() {
         let (proxy, _) = proxied().await;
@@ -1663,8 +1739,8 @@ mod tests {
         // sends 7, and hangs up. Buffering hides this — the status line already
         // said 200 — so a proxy that forwards what it has reports success for a
         // response that never finished.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = listener.local_addr().unwrap();
+        let upstream = unique_sock("partial");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             while let Ok((mut socket, _)) = listener.accept().await {
@@ -1683,12 +1759,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_upstream_that_is_not_listening_is_a_502() {
-        // Bind then drop, so the port is one nothing is answering on rather than
-        // one that might belong to someone else.
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            l.local_addr().unwrap()
-        };
+        // Never bound: a path nothing is listening on, not one that might
+        // belong to someone else.
+        let dead = unique_sock("dead");
         let proxy = serve(mount(Router::new(), NS, running_module(dead))).await;
         let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
@@ -1768,14 +1841,14 @@ mod tests {
     /// Production reads the constants; this exists so the 504 and 503 branches
     /// are reachable in milliseconds. A branch no test can reach and a branch
     /// that is wrong read the same from outside.
-    fn proxy_with(upstream: SocketAddr, limits: Limits, inflight: usize) -> Router {
+    fn proxy_with(upstream: PathBuf, limits: Limits, inflight: usize) -> Router {
         proxy_and_permits(upstream, limits, inflight).0
     }
 
     /// The same, plus the semaphore — so a test can wait until a permit has
     /// actually been taken instead of sleeping and hoping.
     fn proxy_and_permits(
-        upstream: SocketAddr,
+        upstream: PathBuf,
         limits: Limits,
         inflight: usize,
     ) -> (Router, Arc<tokio::sync::Semaphore>) {
@@ -1811,9 +1884,10 @@ mod tests {
     }
 
     /// A socket that accepts and then does exactly what the script says.
-    async fn raw_upstream(script: &'static str) -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn raw_upstream(script: &'static str) -> PathBuf {
+        let path = unique_sock("raw");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let addr = path.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             while let Ok((mut socket, _)) = listener.accept().await {
@@ -1866,7 +1940,11 @@ mod tests {
                                 )
                                 .await;
                             loop {
-                                if socket.write_all(b"c\r\ndata: tick\n\r\n").await.is_err() {
+                                // `data: tick\n` is 11 bytes = 0xb (review of
+                                // FU-60, round 1: this was `c`, one byte off —
+                                // harmless only because this test rejects
+                                // before parsing the body).
+                                if socket.write_all(b"b\r\ndata: tick\n\r\n").await.is_err() {
                                     break;
                                 }
                                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2040,7 +2118,7 @@ mod tests {
         use tower::ServiceExt;
 
         let hits = Hits::default();
-        let upstream = serve(Router::new().fallback(upstream_handler).with_state(hits)).await;
+        let upstream = serve_unix(Router::new().fallback(upstream_handler).with_state(hits)).await;
         let state = state_with(NS, running_module(upstream), Limits::default(), 1);
         let sem = state.inflight.clone();
         let app = Router::new().fallback(proxy).with_state(state);
@@ -2112,7 +2190,7 @@ mod tests {
 
         // The upstream answers instantly, so nothing here can be blamed on it.
         let hits = Hits::default();
-        let upstream = serve(
+        let upstream = serve_unix(
             Router::new()
                 .fallback(upstream_handler)
                 .with_state(hits.clone()),
@@ -2504,10 +2582,10 @@ mod tests {
     /// answers. Resolves `closed` when the proxy ends the connection.
     async fn upstream_watching_close(
         answer: bool,
-    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<()>) {
+    ) -> (PathBuf, tokio::sync::oneshot::Receiver<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let addr = unique_sock("close");
+        let listener = tokio::net::UnixListener::bind(&addr).unwrap();
         let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -2550,8 +2628,8 @@ mod tests {
     async fn dropping_the_connection_guard_ends_a_connection_blocked_on_its_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         const BODY: usize = 64 * 1024 * 1024;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = listener.local_addr().unwrap();
+        let upstream = unique_sock("body");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
         let module = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -2581,10 +2659,10 @@ mod tests {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/a")
-            .header(axum::http::header::HOST, upstream.to_string())
+            .header(axum::http::header::HOST, UPSTREAM_HOST)
             .body(Full::new(Bytes::from(vec![b'x'; BODY])))
             .unwrap();
-        let mut connection = Upstream::connect(running_generation(upstream), upstream)
+        let mut connection = Upstream::connect(running_generation(upstream.clone()), &upstream)
             .await
             .unwrap();
         let response = connection.sender.send_request(request).await.unwrap();
@@ -2602,33 +2680,53 @@ mod tests {
         );
     }
 
-    /// A module that records the peer address of every request, so a test can
-    /// count the connections the proxy opened.
+    /// A module that records which CONNECTION (not address — a Unix socket
+    /// peer has no distinguishing one, FU-60) each request arrived on, so a
+    /// test can count the connections the proxy opened. A raw accept loop,
+    /// like the other hand-rolled mock modules in this file: each accepted
+    /// connection gets a sequential id, kept alive across requests exactly as
+    /// a real keep-alive module would.
     async fn peer_counting_upstream() -> (
-        SocketAddr,
-        Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
+        PathBuf,
+        Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
     ) {
-        use axum::extract::ConnectInfo;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let path = unique_sock("peers");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let peers = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let seen = peers.clone();
-        let app = Router::new().fallback(move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
-            let seen = seen.clone();
-            async move {
-                seen.lock().unwrap().insert(peer);
-                "ok"
+        tokio::spawn(async move {
+            static CONN_SEQ: AtomicU64 = AtomicU64::new(0);
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let conn_id = CONN_SEQ.fetch_add(1, Ordering::SeqCst);
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut head = Vec::new();
+                    loop {
+                        head.clear();
+                        loop {
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        seen.lock().unwrap().insert(conn_id);
+                        if socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-        (addr, peers)
+        (path, peers)
     }
 
     /// FU-63: a module whose keep-alive ends between requests — it closes
@@ -2645,8 +2743,8 @@ mod tests {
     /// (FU-64).
     #[tokio::test]
     async fn a_module_closing_an_idle_connection_costs_no_502() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = listener.local_addr().unwrap();
+        let upstream = unique_sock("idle");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
         let close = Arc::new(tokio::sync::Notify::new());
         let (closed_tx, mut closed) = tokio::sync::mpsc::unbounded_channel::<()>();
         {
@@ -2733,7 +2831,7 @@ mod tests {
     #[tokio::test]
     async fn a_connection_is_never_reused_by_another_generation() {
         let (upstream, peers) = peer_counting_upstream().await;
-        let current = Current::new(running_generation(upstream));
+        let current = Current::new(running_generation(upstream.clone()));
         let proxy = serve(mount(Router::new(), NS, current.clone())).await;
         let got = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
         assert_eq!(got.status, StatusCode::OK);
@@ -2821,7 +2919,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let a = gated(Then::Answer).await;
         let b = gated(Then::Answer).await;
-        let old = running_generation(a.addr);
+        let old = running_generation(a.addr.clone());
         let current = Current::new(old.clone());
         let proxy = serve(mount(Router::new(), NS, current.clone())).await;
 
@@ -2873,7 +2971,7 @@ mod tests {
     /// `arrived` fires once per request that actually reached the module, so a
     /// test can wait for "it is in flight" as a fact, and can count dials.
     struct Gated {
-        addr: SocketAddr,
+        addr: PathBuf,
         arrived: Arc<tokio::sync::Semaphore>,
         release: Arc<tokio::sync::Notify>,
         dials: Arc<AtomicUsize>,
@@ -2883,8 +2981,8 @@ mod tests {
 
     async fn gated(then: Then) -> Gated {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let addr = unique_sock("gated");
+        let listener = tokio::net::UnixListener::bind(&addr).unwrap();
         let arrived = Arc::new(tokio::sync::Semaphore::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
         let dials = Arc::new(AtomicUsize::new(0));
@@ -2952,7 +3050,7 @@ mod tests {
         }
     }
 
-    fn running_generation(upstream: SocketAddr) -> Arc<crate::drain::Generation> {
+    fn running_generation(upstream: PathBuf) -> Arc<crate::drain::Generation> {
         let g = crate::drain::Generation::serving_at(upstream);
         assert!(g.ready());
         g
@@ -2964,7 +3062,7 @@ mod tests {
     #[tokio::test]
     async fn draining_refuses_a_new_request_while_the_one_in_flight_completes() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let first =
@@ -3014,7 +3112,7 @@ mod tests {
     async fn a_request_whose_generation_is_revoked_gets_a_503_not_the_modules_200() {
         let (logs, _guard) = capture_logs();
         let module = gated(Then::Answer).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let first =
@@ -3049,7 +3147,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_killed_under_a_revocation_is_abandoned_not_blamed_on_the_module() {
         let module = gated(Then::Vanish).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let first =
@@ -3071,7 +3169,12 @@ mod tests {
     #[tokio::test]
     async fn a_module_that_vanishes_on_its_own_is_still_a_502() {
         let module = gated(Then::Vanish).await;
-        let proxy = serve(mount(Router::new(), NS, running_module(module.addr))).await;
+        let proxy = serve(mount(
+            Router::new(),
+            NS,
+            running_module(module.addr.clone()),
+        ))
+        .await;
 
         let first =
             tokio::spawn(
@@ -3090,7 +3193,7 @@ mod tests {
     #[tokio::test]
     async fn a_module_that_is_not_ready_is_never_dialled() {
         let module = gated(Then::Answer).await;
-        let generation = crate::drain::Generation::serving_at(module.addr);
+        let generation = crate::drain::Generation::serving_at(module.addr.clone());
         let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let got = call(proxy, Method::GET, &format!("{NS}/a"), &[], "").await;
@@ -3113,7 +3216,7 @@ mod tests {
     #[tokio::test]
     async fn after_a_restart_the_proxy_admits_into_the_new_generation() {
         let module = gated(Then::Answer).await;
-        let old = running_generation(module.addr);
+        let old = running_generation(module.addr.clone());
         let current = Current::new(old.clone());
         let proxy = serve(mount(Router::new(), NS, current.clone())).await;
 
@@ -3126,7 +3229,7 @@ mod tests {
             refused.body
         );
 
-        let _ = current.replace(running_generation(module.addr));
+        let _ = current.replace(running_generation(module.addr.clone()));
         let next =
             tokio::spawn(
                 async move { call(proxy, Method::GET, &format!("{NS}/b"), &[], "").await },
@@ -3179,7 +3282,7 @@ mod tests {
     #[tokio::test]
     async fn a_revoked_request_is_answered_at_once_not_when_the_process_dies() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         let first =
@@ -3204,7 +3307,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (logs, _guard) = capture_logs();
         let module = gated(Then::Answer).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
 
         // A client that promises ten bytes of body and sends one: the request is
@@ -3256,7 +3359,7 @@ mod tests {
     #[tokio::test]
     async fn a_draining_module_that_is_also_full_says_draining_not_overloaded() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let (app, sem) =
             proxy_and_permits_for(Current::new(generation.clone()), Limits::default(), 1);
         let proxy = serve(app).await;
@@ -3285,7 +3388,7 @@ mod tests {
     #[tokio::test]
     async fn forward_does_not_send_a_request_whose_generation_was_revoked() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let state = state_with(
             NS,
             Current::new(generation.clone()),
@@ -3357,7 +3460,7 @@ mod tests {
     #[tokio::test]
     async fn a_revocation_during_the_body_read_stops_forward_from_sending() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let state = state_with(
             NS,
             Current::new(generation.clone()),
@@ -3407,7 +3510,7 @@ mod tests {
     #[tokio::test]
     async fn a_200_that_arrives_after_the_revocation_is_not_committed() {
         let module = gated(Then::Answer).await;
-        let generation = running_generation(module.addr);
+        let generation = running_generation(module.addr.clone());
         let state = state_with(
             NS,
             Current::new(generation.clone()),

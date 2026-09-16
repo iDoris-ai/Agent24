@@ -452,11 +452,20 @@ pub struct LaunchSpec<'a> {
     pub callback_sock: &'a Path,
     /// What the module is started through (see [`Trampoline`]).
     pub trampoline: &'a Trampoline,
-    /// The socket the module serves its HTTP on. Passed as fd [`LISTEN_FD`]
-    /// and closed in this process once the child has it — so when the module
-    /// dies, a connection to its port is refused at once instead of queueing in
-    /// a backlog nobody will ever accept from.
-    pub listener: std::net::TcpListener,
+    /// The socket the module serves its HTTP on (FU-60: a Unix domain socket,
+    /// not a TCP port). Passed as fd [`LISTEN_FD`] and closed in this process
+    /// once the child has it — so when the module dies, a connection to it is
+    /// refused at once instead of queueing in a backlog nobody will ever
+    /// accept from.
+    pub listener: std::os::unix::net::UnixListener,
+    /// The path `listener` is bound at, kept alive for as long as the process
+    /// this spec starts may still be `accept`ing on it — travels with this
+    /// spec into [`ModuleProcess`], not tied to `listener`'s own drop (which
+    /// happens moments after spawn, once the child has its own copy of the
+    /// fd). Dropping this `LaunchSpec` on any early return removes the path
+    /// along with everything else it owns — no orphan `.l` file from a spawn
+    /// that never got as far as a process.
+    pub http_path: crate::endpoint::ModuleListenPath,
 }
 
 /// Start a module as a new generation — created here, with the address of
@@ -535,9 +544,13 @@ fn start(spec: LaunchSpec<'_>, program: &Path) -> Result<ModuleProcess, LaunchEr
     use command_fds::{CommandFdExt, FdMapping};
 
     let token = mint_token()?;
-    // The generation's address is the listener it hands over (D4): read now,
-    // before the listener moves into the command.
-    let upstream = spec.listener.local_addr().map_err(LaunchError::Spawn)?;
+    // The generation's address is the path its listener is bound at (D4,
+    // FU-60): read now, before the listener moves into the command. Cloned,
+    // not borrowed from `spec.http_path` — that value moves into the
+    // `ModuleProcess` this function returns, `Generation` only ever holds an
+    // owned copy (design v2: `Generation`'s Arc lifetime does not govern when
+    // the path is unlinked, so it must not be the one holding the guard).
+    let upstream = spec.http_path.path().to_owned();
 
     let mut cmd = tokio::process::Command::new(&spec.trampoline.program);
     cmd.args(&spec.trampoline.args)
@@ -582,8 +595,14 @@ fn start(spec: LaunchSpec<'_>, program: &Path) -> Result<ModuleProcess, LaunchEr
             "stderr",
         )));
     }
-    ModuleProcess::new(child, Generation::serving_at(upstream), token, drains)
-        .map_err(LaunchError::Spawn)
+    ModuleProcess::new(
+        child,
+        Generation::serving_at(upstream),
+        token,
+        drains,
+        spec.http_path,
+    )
+    .map_err(LaunchError::Spawn)
 }
 
 /// The test binary is its own trampoline: started with `--exact` on
@@ -858,6 +877,33 @@ mod tests {
         assert!(matches!(err, LaunchError::Unresolved(_)), "{err:?}");
     }
 
+    /// FU-60, round 1: a real `spawn()` failure — not a simulated `drop`
+    /// standing in for one — must not leave `.l` behind. `resolve` fails
+    /// before `start` is ever called, so `spawn`'s own early return is what
+    /// drops the whole `LaunchSpec`, guard included.
+    #[tokio::test]
+    async fn a_spawn_that_fails_to_resolve_leaves_no_socket_behind() {
+        let t = pkg();
+        let (l, http_path) = listener();
+        let path = http_path.path().to_owned();
+        assert!(path.exists(), "test setup: the socket should exist yet");
+        let trampoline = test_trampoline();
+        let err = spawn(LaunchSpec {
+            name: "t",
+            command: &cmd("definitely-not-a-real-program-xyz", &[]),
+            package_dir: t.path(),
+            data_dir: &t.path().join("data"),
+            callback_sock: &t.path().join("cb.sock"),
+            trampoline: &trampoline,
+            listener: l,
+            http_path,
+        })
+        .await
+        .expect_err("must not resolve");
+        assert!(matches!(err, LaunchError::Unresolved(_)), "{err:?}");
+        assert!(!path.exists(), "a failed spawn left its socket behind");
+    }
+
     /// The property the handshake's naive comparison rests on: **a fresh secret
     /// per spawn**. Not "usually different" — this is checked as a set.
     #[test]
@@ -874,8 +920,26 @@ mod tests {
         }
     }
 
-    fn listener() -> std::net::TcpListener {
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+    /// A fresh Unix domain socket the module serves its HTTP on, plus the
+    /// guard that must live at least as long as the process using it (FU-60):
+    /// a throwaway state directory keeps every call's number independent, so
+    /// nothing here needs to coordinate across calls the way the real
+    /// `CallbackDir` per daemon does.
+    fn listener() -> (
+        std::os::unix::net::UnixListener,
+        crate::endpoint::ModuleListenPath,
+    ) {
+        // Deliberately leaked: a `TempDir` guard dropped here would delete
+        // the directory the returned socket lives in out from under whatever
+        // uses it next (FU-60) — this function's caller outlives it.
+        let state = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap()
+            .keep();
+        let dir = crate::endpoint::CallbackDir::create(&state).unwrap();
+        let g = dir.open_generation().unwrap();
+        (g.http_listener, g.http_path)
     }
 
     /// When this test binary is started as a module's trampoline (see
@@ -889,13 +953,15 @@ mod tests {
     /// Start `command` from package `t` for a fresh generation, with a fresh
     /// listener.
     async fn start(t: &Path, command: &SpawnCommand) -> ModuleProcess {
-        start_with(t, command, listener()).await
+        let (listener, http_path) = listener();
+        start_with(t, command, listener, http_path).await
     }
 
     async fn start_with(
         t: &Path,
         command: &SpawnCommand,
-        listener: std::net::TcpListener,
+        listener: std::os::unix::net::UnixListener,
+        http_path: crate::endpoint::ModuleListenPath,
     ) -> ModuleProcess {
         // Through the test trampoline, module arguments are libtest filters: one
         // equal to a test's full name would run that test in the child too.
@@ -913,6 +979,7 @@ mod tests {
             callback_sock: &t.join("cb.sock"),
             trampoline: &trampoline,
             listener,
+            http_path,
         })
         .await
         .expect("spawn")
@@ -1074,67 +1141,100 @@ mod tests {
     async fn the_listening_socket_arrives_as_fd_3() {
         use tokio::io::AsyncReadExt;
         let t = pkg();
-        let l = listener();
-        let addr = l.local_addr().unwrap();
+        let (l, http_path) = listener();
+        let path = http_path.path().to_owned();
+        // Two accepts, not one (FU-60, round 1 — design criterion #4): the
+        // listener must stay usable for the module's whole life, not just for
+        // a single connection.
         let mut p = start_with(
             t.path(),
             &python(
                 "import os, socket\n\
                  s = socket.socket(fileno=int(os.environ['A24_LISTEN_FD']))\n\
-                 c, _ = s.accept()\n\
-                 c.sendall(b'hello from fd 3')\n\
-                 c.close()",
+                 for i in range(2):\n\
+                 \x20    c, _ = s.accept()\n\
+                 \x20    c.sendall(b'hello from fd 3 (%d)' % i)\n\
+                 \x20    c.close()",
             ),
             l,
+            http_path,
         )
         .await;
-        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut got = Vec::new();
-        // 30s, like every wait that includes an interpreter starting up (see
-        // `exited`): it returns the moment the module answers.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            conn.read_to_end(&mut got),
-        )
-        .await
-        .expect("no answer within 30s")
-        .unwrap();
-        assert_eq!(got, b"hello from fd 3");
+        for i in 0..2 {
+            let mut conn = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let mut got = Vec::new();
+            // 30s, like every wait that includes an interpreter starting up
+            // (see `exited`): it returns the moment the module answers.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                conn.read_to_end(&mut got),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("no answer to request {i} within 30s"))
+            .unwrap();
+            assert_eq!(got, format!("hello from fd 3 ({i})").into_bytes());
+        }
         exited(&mut p).await;
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 
     /// The listener is closed in the daemon once the child has it: when the
-    /// module is gone, its port refuses at once — a copy kept here would queue
-    /// connections in a backlog nobody accepts from, and a request would hang
-    /// instead of failing.
+    /// module is gone, connecting to it refuses at once — a copy kept here
+    /// would queue connections in a backlog nobody accepts from, and a
+    /// request would hang instead of failing.
     ///
-    /// Up to three attempts, each with a fresh port: other tests in this
-    /// process bind `127.0.0.1:0` concurrently, and one of them can be handed
-    /// the port the moment the module frees it — measured once in 120 full
-    /// runs, as a connection "accepted by a dead module's port". A real leak
-    /// (the daemon keeping its copy) accepts on every attempt, so it stays red;
-    /// a coincidence three times running is about one in a million.
+    /// Checked while `p` (and so its `ModuleListenPath` guard) is still
+    /// alive: the path itself must still be there — the module dying, and the
+    /// daemon's own fd closing, are what refuses the connection, not the path
+    /// having been unlinked out from under it (FU-60; that would be true for
+    /// a wholly different reason, and true even if the daemon leaked its own
+    /// fd). `stop` — which drops `p`, removing the path — comes after.
+    ///
+    /// Up to three attempts, each with a fresh socket: measured once in 120
+    /// full TCP-era runs, as a connection "accepted by a dead module's port"
+    /// (this test predates FU-60's switch to Unix sockets, only its name and
+    /// the wording above still say so). A real leak (the daemon keeping its
+    /// copy) accepts on every attempt, so it stays red; a coincidence three
+    /// times running is about one in a million.
     #[tokio::test]
-    async fn once_the_module_is_gone_its_port_refuses() {
+    async fn once_the_module_is_gone_it_refuses_connections() {
         let mut accepted = Vec::new();
         for _ in 0..3 {
             let t = pkg();
-            let l = listener();
-            let addr = l.local_addr().unwrap();
-            let mut p = start_with(t.path(), &cmd("sh", &["-c", "exit 0"]), l).await;
+            let (l, http_path) = listener();
+            let path = http_path.path().to_owned();
+            let mut p = start_with(t.path(), &cmd("sh", &["-c", "exit 0"]), l, http_path).await;
             exited(&mut p).await;
-            let _ = p.stop(std::time::Duration::from_millis(100)).await;
+            assert!(path.exists(), "the guard was dropped before it should be");
             let connect = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                tokio::net::TcpStream::connect(addr),
+                tokio::net::UnixStream::connect(&path),
             )
             .await
             .expect("the connect hung: something still holds the listener");
+            // Must succeed — a `StopFailed` still owns and drops the process
+            // (and so the guard) on its own error path, which would let this
+            // test's `NotFound` assertion pass for the wrong reason (review
+            // of FU-60, round 2).
+            p.stop(std::time::Duration::from_millis(100))
+                .await
+                .expect("stop must succeed");
             if connect.is_err() {
+                // `stop` above dropped `p` and, with it, the guard: the path
+                // is gone now, and a connect after this point is `NotFound`,
+                // not `ConnectionRefused` (review of FU-60, round 1).
+                assert!(!path.exists(), "stop did not remove the socket");
+                let after_stop = tokio::net::UnixStream::connect(&path).await;
+                assert!(
+                    matches!(
+                        after_stop.as_ref().err().map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::NotFound)
+                    ),
+                    "{after_stop:?}"
+                );
                 return; // refused, as it should be
             }
-            accepted.push(addr);
+            accepted.push(path);
         }
         panic!("a dead module's port accepted a connection on every attempt: {accepted:?}");
     }

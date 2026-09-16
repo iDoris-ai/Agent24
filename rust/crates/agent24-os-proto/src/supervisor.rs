@@ -4,7 +4,8 @@
 //!   ┌──────────────────────────────────────────────────────────────────┐
 //!   ▼                                                                  │
 //! placeholder generation in `Current` (503 module_not_ready)           │
-//!   → bind a fresh port (D4) → listen for the callback → spawn         │
+//!   → open a fresh pair of Unix sockets (D4, FU-60) → listen for the │
+//!     callback → spawn                                               │
 //!   → accept + handshake before the startup deadline                   │
 //!   → ready → serve the callback connection (methods bound to THIS     │
 //!     generation, FU-49) until one of:                                 │
@@ -701,24 +702,27 @@ async fn run_once(
         ready_at: None,
         ended_at: std::time::Instant::now(),
     };
-    // D4: a fresh port for every generation, so a connection pooled or queued
-    // for the previous one can never reach this one.
-    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
-        Ok(l) => l,
+    // D4/FU-60: a fresh pair of Unix domain sockets for every generation — the
+    // callback socket and the module's inbound HTTP listener — so a
+    // connection pooled or queued for the previous one can never reach this
+    // one. Opened together, under one number, so the two can never mismatch
+    // (see `CallbackDir::open_generation`).
+    let sockets = match dir.open_generation() {
+        Ok(s) => s,
         Err(e) => {
-            let failure = failure::bind(&e);
-            tracing::error!(module = %spec.name, "{failure}");
-            return Ok(failed(failure));
-        }
-    };
-    let callback = match dir.listen_next() {
-        Ok(c) => c,
-        Err(e) => {
+            // FU-57's Setup classification, wired in now that it's on `main`
+            // (the design's own dependency note — FU-60 was implemented
+            // before FU-57 merged, and deferred this rather than duplicate
+            // it): neutral wording, since a failure here could be either
+            // socket of the pair (`failure::listen`'s doc comment).
             let failure = failure::listen(&e);
             tracing::error!(module = %spec.name, "{failure}");
             return Ok(failed(failure));
         }
     };
+    let callback = sockets.callback;
+    let listener = sockets.http_listener;
+    let http_path = sockets.http_path;
     // Raced against a stop: the package check before the spawn walks a whole
     // tree and can be slow. Dropping `spawn` there is safe — its only await
     // comes before the child exists, and what follows it is a plain `fn`
@@ -739,6 +743,7 @@ async fn run_once(
             callback_sock: callback.path(),
             trampoline: &spec.trampoline,
             listener,
+            http_path,
         }) => spawned,
     };
     let mut process = match spawned {

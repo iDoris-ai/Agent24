@@ -232,10 +232,11 @@ pub struct Generation {
     /// waiting for its module the moment its generation is revoked rather than
     /// when the process finally dies (see [`InFlight::revoked`]).
     revoked: tokio::sync::watch::Sender<bool>,
-    /// Where this run's process listens for proxied requests: its own port
-    /// (D4), so a request admitted into this generation reaches this process
-    /// and no other. `None` for a placeholder, which never becomes `Running`.
-    upstream: Option<std::net::SocketAddr>,
+    /// Where this run's process listens for proxied requests: its own Unix
+    /// domain socket path (D4, FU-60), so a request admitted into this
+    /// generation reaches this process and no other. `None` for a
+    /// placeholder, which never becomes `Running`.
+    upstream: Option<std::path::PathBuf>,
 }
 
 /// A request admitted into a generation. Leaves the in-flight set when dropped,
@@ -261,11 +262,11 @@ impl Generation {
     /// A freshly spawned module listening at `upstream`, before `initialize`.
     /// Requests admitted into it are sent there and nowhere else (SUP-3b).
     #[must_use]
-    pub fn serving_at(upstream: std::net::SocketAddr) -> Arc<Self> {
+    pub fn serving_at(upstream: std::path::PathBuf) -> Arc<Self> {
         Self::new(Some(upstream))
     }
 
-    fn new(upstream: Option<std::net::SocketAddr>) -> Arc<Self> {
+    fn new(upstream: Option<std::path::PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 state: DrainState::Starting,
@@ -279,10 +280,12 @@ impl Generation {
     }
 
     /// Where this run's process listens; `None` for a placeholder. Every
-    /// `Running` generation has one (see [`Generation::ready`]).
+    /// `Running` generation has one (see [`Generation::ready`]). Borrowed, not
+    /// `Copy` like the `SocketAddr` this replaced (FU-60) — a caller that
+    /// needs to own it clones explicitly.
     #[must_use]
-    pub fn upstream(&self) -> Option<std::net::SocketAddr> {
-        self.upstream
+    pub fn upstream(&self) -> Option<&std::path::Path> {
+        self.upstream.as_deref()
     }
 
     // A poisoned lock means another thread panicked while holding it. The state
@@ -580,7 +583,7 @@ impl InFlight {
     /// Always `Some` for an admitted request: only a `Running` generation
     /// admits, and every `Running` one has an address.
     #[must_use]
-    pub fn upstream(&self) -> Option<std::net::SocketAddr> {
+    pub fn upstream(&self) -> Option<&std::path::Path> {
         self.generation.upstream()
     }
 
@@ -672,7 +675,7 @@ mod tests {
     /// A generation with a process behind it — the address is never dialled
     /// by these tests.
     fn spawned() -> Arc<Generation> {
-        Generation::serving_at("127.0.0.1:9".parse().unwrap())
+        Generation::serving_at("/tmp/a24-test.sock".into())
     }
 
     fn running() -> Arc<Generation> {
