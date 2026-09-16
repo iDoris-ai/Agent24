@@ -135,7 +135,9 @@ export interface ErrorBody {
    * Open enum: invalid_request, unauthorized, not_found, conflict,
    * approval_already_resolved, provider_unavailable,
    * run_not_cancellable (reserved), payload_too_large, internal,
-   * admission_refused, module_panicked, module_killed
+   * admission_refused (T8/ME-3g), module_panicked, module_killed
+   * (the latter two were already in use by ERR-1 but missing from this
+   * list — T8 audited and added them alongside its own new code)
    */
   code: string;
   details?: {

@@ -363,7 +363,7 @@
       "type": "object",
       "properties": {
         "code": {
-          "description": "Open enum: invalid_request, unauthorized, not_found, conflict,\napproval_already_resolved, provider_unavailable,\nrun_not_cancellable (reserved), payload_too_large, internal,\nadmission_refused, module_panicked, module_killed",
+          "description": "Open enum: invalid_request, unauthorized, not_found, conflict,\napproval_already_resolved, provider_unavailable,\nrun_not_cancellable (reserved), payload_too_large, internal,\nadmission_refused (T8/ME-3g), module_panicked, module_killed\n(the latter two were already in use by ERR-1 but missing from this\nlist — T8 audited and added them alongside its own new code)",
           "type": "string"
         },
         "details": {
