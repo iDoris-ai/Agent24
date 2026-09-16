@@ -908,7 +908,8 @@ export interface components {
             /**
              * @description Open enum: invalid_request, unauthorized, not_found, conflict,
              *     approval_already_resolved, provider_unavailable,
-             *     run_not_cancellable (reserved), internal
+             *     run_not_cancellable (reserved), internal,
+             *     admission_refused, module_panicked, module_killed
              */
             code: string;
             message: string;

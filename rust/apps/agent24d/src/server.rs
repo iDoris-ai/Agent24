@@ -46,6 +46,22 @@ pub struct AppState {
     /// `agent24 os enable` needs a name to act on and a module that only appeared
     /// once it was already on could never be turned on.
     pub os_reports: Arc<Vec<crate::domain::MountReport>>,
+    /// Where installed (out-of-process) packages live on disk (ME-3a). Computed
+    /// once at startup (`agent24_os_packages::packages_root`, same call `serve`
+    /// already made) and injected through [`AppDeps`] — unlike `os_reports`, this
+    /// does not depend on the mount pass, so it is known before `AppState::new`
+    /// runs and does not need the "empty until `serve` replaces it" dance.
+    pub packages_root: Arc<std::path::PathBuf>,
+    /// For each name whose catalogue entry was `Build::Package` at startup, the
+    /// directory its manifest was read from (T8/ME-3g). NOT stored on
+    /// `MountReport` — that struct is constructed directly by dozens of existing
+    /// tests, and this is the one thing `enable`'s admission gate needs that
+    /// `MountReport` does not carry: which names were ever a package at all, and
+    /// where, so a currently-`Disabled` package's manifest can be re-checked
+    /// on demand without guessing "not found in a rescan" means "compiled in".
+    /// Empty until `serve` replaces it after the mount pass, same ordering
+    /// reason as `os_reports` above.
+    pub package_dirs: Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     /// The live status of each out-of-process module, by name: what `agent24
     /// os list` reports beyond the startup verdict (a package can be mounted
     /// and since have given up).
@@ -423,6 +439,11 @@ pub struct AppDeps {
     /// Pre-loaded user overrides (H2). Injected rather than loaded here so
     /// tests can wire an empty or hand-built set.
     pub risk_overrides: StdArc<agent24_policy::overrides::RiskOverrideStore>,
+    /// Where installed packages live (T8/ME-3g) — see [`AppState::packages_root`].
+    /// Injected because `serve` already computes it before it needs anything
+    /// else `AppState::new` builds; a test must supply a real temp directory,
+    /// never an empty path pretending to be one.
+    pub packages_root: Arc<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -441,6 +462,7 @@ impl AppState {
             memory,
             mcp_servers,
             risk_overrides,
+            packages_root,
         } = deps;
         let events = crate::events::EventsHub::default();
         // Approval broker: emits onto the same WS hub; timeout from env
@@ -498,6 +520,10 @@ impl AppState {
             // assignment is ordered ahead of router construction rather than left
             // to chance.
             os_reports: Arc::new(Vec::new()),
+            packages_root,
+            // Empty for the same reason and until the same moment as `os_reports`
+            // above — see that field's comment.
+            package_dirs: Arc::new(std::collections::HashMap::new()),
             module_status: Arc::new(std::collections::HashMap::new()),
             supervisors: None,
             os_control: Arc::new(tokio::sync::Mutex::new(())),
@@ -921,6 +947,15 @@ pub async fn serve(
             .as_ref()
             .map(|(dir, previous, last)| (dir.as_path(), previous, last.clone())),
     );
+    // T8/ME-3g: moved ahead of `AppState::new` (it used to be computed much
+    // later, alongside the catalogue) so it can be injected through `AppDeps`
+    // the same way every other dependency is — neither of these two lines
+    // needs anything `AppState::new` builds, so there is no ordering hazard in
+    // moving them here; the `catalogue`/`with_discovered` call below reuses
+    // this same `packages_root`, not a second one.
+    let state_dir = agent24_protocol::state_file::state_dir()
+        .ok_or_else(|| std::io::Error::other("HOME not set"))?;
+    let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
     let mut state = AppState::new(AppDeps {
         token: token.clone(),
         router,
@@ -931,6 +966,7 @@ pub async fn serve(
         guardian,
         memory,
         mcp_servers,
+        packages_root: Arc::clone(&packages_root),
     });
 
     // H3 durable-resume startup, BEFORE accepting any request and BEFORE the
@@ -978,8 +1014,6 @@ pub async fn serve(
     // OS is another entry in the CATALOGUE below — each with its own builder, which
     // the mounter calls only if that module is admissible and enabled, so one that
     // fails to construct cannot stop the others.
-    let state_dir = agent24_protocol::state_file::state_dir()
-        .ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let mode = if ephemeral {
         // Ephemeral daemons get an in-memory store and NO migration: they are
         // private to one CLI invocation and must not touch the user's database.
@@ -1017,8 +1051,8 @@ pub async fn serve(
 
     // ME-3a: the catalogue is no longer only what was compiled in. The merge is a
     // free function so it can be tested without standing up a daemon — see
-    // `with_discovered`.
-    let packages_root = agent24_os_packages::packages_root(&state_dir, ephemeral);
+    // `with_discovered`. `packages_root` was computed earlier, before
+    // `AppState::new`, and injected there too — this reuses that same value.
     let catalogue = with_discovered(catalogue, &packages_root);
 
     let os_config_path =
@@ -1285,6 +1319,20 @@ pub async fn serve(
     // Hand the verdicts to the state BEFORE the router clones it, so `/api/v1/os`
     // can report what the mounter actually decided rather than re-deriving it.
     state.os_reports = Arc::new(reports);
+    // T8/ME-3g: same ordering reason as `os_reports` just above — `catalogue`
+    // is still in scope (only borrowed by `mount_all`, never moved), so this is
+    // a cheap O(n) derivation, not a second discovery pass.
+    state.package_dirs = Arc::new(
+        catalogue
+            .iter()
+            .filter_map(|entry| match &entry.build {
+                crate::domain::Build::Package(package) => {
+                    Some((entry.name.clone(), package.dir.clone()))
+                }
+                crate::domain::Build::InProcess(_) => None,
+            })
+            .collect(),
+    );
     state.module_status = Arc::new(
         host.as_ref()
             .map(|h| h.supervisors.statuses())
@@ -1799,6 +1847,11 @@ pub(crate) mod tests {
             risk_overrides: StdArc::new(agent24_policy::overrides::RiskOverrideStore::from_rows(
                 Vec::new(),
             )),
+            // A real (if immediately-dropped) temp directory, not an empty
+            // path standing in for one — T8/ME-3g's admission gate never
+            // reaches for this unless a test explicitly populates
+            // `package_dirs`, so nothing here actually gets read by default.
+            packages_root: Arc::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()),
         })
     }
 

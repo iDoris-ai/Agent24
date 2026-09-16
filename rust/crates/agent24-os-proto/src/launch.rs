@@ -1105,9 +1105,11 @@ mod tests {
         let stray: Vec<&&str> = env
             .keys()
             .filter(|k| {
-                !(INHERITED_ENV.contains(k) || k.starts_with("LC_") || k.starts_with("A24_"))
-                    // Set by the shell itself, not inherited.
-                    && !["_", "PWD", "SHLVL", "OLDPWD"].contains(k)
+                // The last three are set by the shell itself, not inherited.
+                !(INHERITED_ENV.contains(k)
+                    || k.starts_with("LC_")
+                    || k.starts_with("A24_")
+                    || ["_", "PWD", "SHLVL", "OLDPWD"].contains(k))
             })
             .collect();
         assert!(stray.is_empty(), "not on the allowlist: {stray:?}");

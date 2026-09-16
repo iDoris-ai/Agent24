@@ -177,7 +177,10 @@ pub struct DomainOsUpdate {
 pub struct ErrorBody {
     /// Open enum: invalid_request, unauthorized, not_found, conflict,
     /// approval_already_resolved, provider_unavailable,
-    /// run_not_cancellable (reserved), payload_too_large, internal
+    /// run_not_cancellable (reserved), payload_too_large, internal,
+    /// admission_refused (T8/ME-3g), module_panicked, module_killed
+    /// (the latter two were already in use by ERR-1 but missing from this
+    /// list — T8 audited and added them alongside its own new code)
     pub code: String,
     pub message: String,
     /// What to do about it, when there is a concrete next step (ERR-1). Kept

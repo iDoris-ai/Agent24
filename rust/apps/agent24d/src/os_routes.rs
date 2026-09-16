@@ -228,9 +228,17 @@ fn semantic_registry_error<'a>(
 }
 
 fn render(state: &AppState) -> Response {
+    render_at(state, crate::os_config::config_path())
+}
+
+/// [`render`], reading the config from an injected path instead of the
+/// process's real `$HOME` (T8/ME-3g — the same reason `patch_os_at` exists:
+/// a unit test needs to assert on the file it just wrote, not on whatever
+/// happens to be at `~/.agent24/os.json` on the machine running the test).
+fn render_at(state: &AppState, path: Option<std::path::PathBuf>) -> Response {
     // Read the config fresh: it may have been changed since startup, by this very
     // process, and the point of the view is to show that divergence.
-    let cfg = crate::os_config::config_path()
+    let cfg = path
         .ok_or_else(|| "HOME not set".to_owned())
         .and_then(|p| crate::os_config::OsConfig::load(&p));
     let cfg = match cfg {
@@ -574,10 +582,193 @@ fn stop_now_os_disable_pending_response(name: &str) -> Response {
     )
 }
 
+/// T8/ME-3g: `enable` on a name whose only `os_reports` entry is already
+/// `Refused` — see the design doc's "在哪加、加什么". `why` is used verbatim
+/// as `message` (it is the same string `agent24 os list` already shows as
+/// `detail`), so the two never say different things about the same module.
+fn admission_refused_response(why: &str) -> Response {
+    error_response_with_hint(
+        StatusCode::CONFLICT,
+        "admission_refused",
+        why,
+        &format!(
+            "`agent24 os list` shows the reason; correct it, then {RESTART_DAEMON_INSTRUCTION}, \
+             and retry enable once the module is re-admitted"
+        ),
+    )
+}
+
+/// T8/ME-3g §"重扫挡住时的 hint": deliberately NOT the same hint as
+/// [`admission_refused_response`] — the `MountReport` behind this path still
+/// just says `Disabled`, so the real reason only exists in this one response,
+/// and the right sequence is fix-on-disk → retry `enable` (this time it
+/// persists) → restart once, not "go look at `agent24 os list`".
+fn rescan_blocked_response(message: &str) -> Response {
+    error_response_with_hint(
+        StatusCode::CONFLICT,
+        "admission_refused",
+        message,
+        "the reason is above, not in `agent24 os list` (this module is still recorded as \
+         disabled there); fix it on disk, then retry enable — once it passes, restart the \
+         daemon so it re-admits the module",
+    )
+}
+
+/// T8/ME-3g: everything this needs is on disk, so it runs entirely off the
+/// async executor (`spawn_blocking` — this does real filesystem I/O:
+/// `read_dir`, file reads, hashing, YAML parsing, mirroring how
+/// `OsConfig::set_enabled` is already dispatched a few lines down in
+/// `apply`). `Ok(())` means the package still looks admissible and the
+/// `enable` write may proceed; `Err(message)` is the client-facing reason to
+/// block it with, via [`rescan_blocked_response`].
+///
+/// `dir` is `name`'s directory as recorded in `AppState.package_dirs` at
+/// startup — matching is by directory, not by name, because a manifest that
+/// now fails to parse may not yield a trustworthy name at all (a `Refused`
+/// entry only carries `dir`/`why`).
+fn rescan_disabled_package_on_disk(
+    packages_root: &std::path::Path,
+    name: &str,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    if let Err(e) = agent24_os_packages::check_packages_root(packages_root) {
+        return Err(format!(
+            "the directory installed packages live under ({}) does not check out: {e}",
+            packages_root.display()
+        ));
+    }
+    let scan = agent24_os_packages::discovery::scan(packages_root);
+    classify_scan(&scan, packages_root, name, dir)
+}
+
+/// The pure part of [`rescan_disabled_package_on_disk`] — given a `Scan`
+/// result (real or, in tests, hand-built), decides whether `name`/`dir`
+/// still looks admissible. Split out so judgement criterion 15b can inject a
+/// root-level `Refused` deterministically instead of depending on real
+/// permission bits actually making `read_dir` fail (which root-run tests
+/// would not observe — code review round 1 Low 3).
+fn classify_scan(
+    scan: &agent24_os_packages::discovery::Scan,
+    packages_root: &std::path::Path,
+    name: &str,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    // `check_packages_root` only inspects metadata (symlink/type/ownership/
+    // write bits) — it does not itself try `read_dir`, so a root that passes
+    // it can still fail here. `scan()` reports that as a `Refused` whose
+    // `dir` IS the root, not any package's directory; caught first, or it
+    // gets misattributed to "this package's directory disappeared" below.
+    if let Some(root_refusal) = scan
+        .refused
+        .iter()
+        .find(|r| r.dir.as_path() == packages_root)
+    {
+        return Err(format!(
+            "the directory installed packages live under ({}) could not be read: {}",
+            packages_root.display(),
+            root_refusal.why
+        ));
+    }
+    if let Some(refused) = scan.refused.iter().find(|r| r.dir.as_path() == dir) {
+        return Err(refused.why.clone());
+    }
+    let Some(found) = scan.found.iter().find(|d| d.dir.as_path() == dir) else {
+        return Err(format!(
+            "the package that was installed at {} is no longer there; confirm whether it \
+             was uninstalled, or reinstalled somewhere else",
+            dir.display()
+        ));
+    };
+    let manifest = &found.manifest;
+    // Directory match only proves "this is the package that occupied this
+    // directory at startup" — not that its manifest still declares the name
+    // being enabled. `name` is `os.json`'s configuration key: if the manifest
+    // was renamed since boot, the NEXT boot's catalogue (built fresh from
+    // whatever is on disk then) will never contain the old name at all, so an
+    // `enable` for it must not be allowed to persist (design doc round 5
+    // High 1 — an earlier version of this check dropped this comparison
+    // entirely and reopened exactly the bug T8 exists to close).
+    if manifest.name() != name {
+        return Err(format!(
+            "the manifest at {} now declares the name {:?}, not {name:?} — it may have been \
+             renamed since this module was mounted",
+            dir.display(),
+            manifest.name()
+        ));
+    }
+    // Mirrors `mount_package`'s own delivery-mode check (domain.rs) verbatim —
+    // not a new judgment call, the same question `mount_package` would ask at
+    // the next boot, just asked now instead of then.
+    if manifest
+        .spawn()
+        .filter(|_| !manifest.is_mountable_in_process())
+        .is_none()
+    {
+        return Err(
+            "a package on disk must declare an out-of-process provider with a spawn command; \
+             in-process modules are compiled in"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// `Some(response)` blocks the `enable`; `None` lets the write proceed. Gets
+/// [`rescan_disabled_package_on_disk`] off the async executor and turns its
+/// verdict into a response.
+async fn rescan_disabled_package(
+    state: &AppState,
+    name: &str,
+    dir: &std::path::Path,
+) -> Option<Response> {
+    let packages_root = std::sync::Arc::clone(&state.packages_root);
+    let name = name.to_owned();
+    let dir = dir.to_owned();
+    let outcome = tokio::task::spawn_blocking(move || {
+        rescan_disabled_package_on_disk(&packages_root, &name, &dir)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => None,
+        Ok(Err(message)) => Some(rescan_blocked_response(&message)),
+        Err(e) => {
+            // `JoinError`'s `Display` includes the panic payload when the
+            // blocking task panicked — logged for whoever has to debug it,
+            // never put in the response: a panic message can carry a path or
+            // parsed file content across the API boundary otherwise.
+            tracing::error!("on-demand admission re-check panicked or was cancelled: {e}");
+            Some(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "the on-demand admission re-check failed",
+            ))
+        }
+    }
+}
+
 pub async fn patch_os(
     State(state): State<AppState>,
     Path(name): Path<String>,
     req: Request<Body>,
+) -> Response {
+    patch_os_at(
+        State(state),
+        Path(name),
+        req,
+        crate::os_config::config_path(),
+    )
+    .await
+}
+
+/// [`patch_os`], reading/writing the config at an injected path instead of the
+/// process's real `$HOME` (T8/ME-3g) — the seam judgement criteria use to
+/// assert on exactly what did or did not get written, without touching
+/// `~/.agent24/os.json` on the machine running the test.
+async fn patch_os_at(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    req: Request<Body>,
+    path: Option<std::path::PathBuf>,
 ) -> Response {
     // Refuse a name this daemon does not provide, BEFORE writing anything. This is
     // the reason the daemon owns the file: ME-2a can only report a typo'd entry at
@@ -604,7 +795,32 @@ pub async fn patch_os(
             );
         }
     };
-    let path = match crate::os_config::config_path() {
+    // T8/ME-3g: admission gate, before touching `path`/`os_control` — no point
+    // taking the write lock for a request this is about to refuse. Only ever
+    // engages when this name has EXACTLY ONE `os_reports` entry: a duplicate
+    // name (two catalogue entries claiming it) is left to today's existing
+    // unconditional-allow behavior on purpose (design doc round 3 High 3 —
+    // telling "the one that actually won this name" apart from "a loser
+    // refused only because the name was already taken" needs more provenance
+    // than this gate has, and is out of scope here).
+    if update.enabled {
+        let same_name: Vec<&MountReport> =
+            state.os_reports.iter().filter(|r| r.name == name).collect();
+        if let [only] = same_name.as_slice() {
+            match &only.outcome {
+                MountOutcome::Refused(why) => return admission_refused_response(why),
+                MountOutcome::Disabled => {
+                    if let Some(dir) = state.package_dirs.get(&name)
+                        && let Some(blocked) = rescan_disabled_package(&state, &name, dir).await
+                    {
+                        return blocked;
+                    }
+                }
+                MountOutcome::Mounted | MountOutcome::Degraded(_) => {}
+            }
+        }
+    }
+    let path = match path {
         Some(p) => p,
         None => {
             return error_response(
@@ -614,6 +830,9 @@ pub async fn patch_os(
             );
         }
     };
+    // A clone for the final `render_at` call below — `path` itself moves into
+    // the spawned `apply` task next.
+    let path_for_render = path.clone();
     // The write and the hand-off of a running module's stop are one step
     // against another toggle, done in a task of the daemon's own: a client
     // that goes away half-way cannot leave os.json disabling a module that
@@ -682,7 +901,7 @@ pub async fn patch_os(
     }
     // Return the whole list so a client sees the new `restart_required` state
     // without a second round trip.
-    render(&state)
+    render_at(&state, Some(path_for_render))
 }
 
 /// Hands a running module's stop off RIGHT NOW, without writing `os.json`
@@ -1562,6 +1781,520 @@ mod tests {
         assert_eq!(
             j["error"]["hint"].as_str().unwrap(),
             CONTROL_PLANE_DISABLE_PENDING_HINT
+        );
+    }
+
+    // ── T8/ME-3g: 判据 1-16 ──────────────────────────────────────────────
+
+    /// A minimal, always-parseable manifest — the same shape
+    /// `agent24-os-packages`/`agent24-domain`'s own fixtures use.
+    /// `out_of_process_provider` needs a `spawn` command; `in_process_crate`
+    /// must not have one (both enforced at parse time).
+    fn t8_manifest_yaml(name: &str, version: &str, impl_kind: &str) -> String {
+        let spawn = if impl_kind == "out_of_process_provider" {
+            format!("spawn:\n  command: bin/{name}\n")
+        } else {
+            String::new()
+        };
+        format!(
+            "name: {name}\nversion: {version:?}\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             impl_kind: {impl_kind}\n{spawn}"
+        )
+    }
+
+    /// Installs a package directory under `root` with the given manifest body
+    /// (not necessarily valid — some judgement criteria need an unparseable
+    /// one). Returns the package's own directory.
+    fn t8_install(root: &std::path::Path, name: &str, manifest_body: &str) -> std::path::PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(agent24_os_packages::discovery::MANIFEST_FILE),
+            manifest_body,
+        )
+        .unwrap();
+        dir
+    }
+
+    async fn t8_patch(
+        state: &AppState,
+        name: &str,
+        enabled: bool,
+        path: Option<std::path::PathBuf>,
+    ) -> Response {
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/os/{name}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"enabled": {enabled}}}"#)))
+            .unwrap();
+        patch_os_at(State(state.clone()), Path(name.to_owned()), req, path).await
+    }
+
+    async fn t8_patch_raw_body(
+        state: &AppState,
+        name: &str,
+        body: &str,
+        path: Option<std::path::PathBuf>,
+    ) -> Response {
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/os/{name}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        patch_os_at(State(state.clone()), Path(name.to_owned()), req, path).await
+    }
+
+    /// A base state plus a fresh, writable temp `os.json` path — every T8
+    /// criterion starts here and then layers on `os_reports`/`package_dirs`/
+    /// `packages_root` as needed.
+    async fn t8_state() -> (AppState, tempfile::TempDir, std::path::PathBuf) {
+        let st = crate::server::tests::state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("os.json");
+        (st, dir, path)
+    }
+
+    /// Judgement criterion 1 — a `Refused` module's `enable` is blocked and
+    /// `os.json` is left byte-for-byte as it was (not just "the requested
+    /// name is absent" — code review round 1 Low 5: the finalized criterion
+    /// is about the file as a whole, including entries that have nothing to
+    /// do with this request).
+    #[tokio::test]
+    async fn criterion1_refused_blocks_and_does_not_persist() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![
+            report(
+                "refused-mod",
+                MountOutcome::Refused("catalogue version mismatch".to_owned()),
+            ),
+            report("unrelated-mod", MountOutcome::Mounted),
+        ]);
+        // Seed a real, non-empty os.json with an entry unrelated to this
+        // request, the way a daemon that has been running for a while would
+        // actually have one.
+        crate::os_config::OsConfig::set_enabled(&path, "unrelated-mod", true).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let res = t8_patch(&st, "refused-mod", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let j = body_json(res).await;
+        assert_eq!(j["error"]["code"], "admission_refused");
+        assert_eq!(j["error"]["message"], "catalogue version mismatch");
+        let hint = j["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains(RESTART_DAEMON_INSTRUCTION), "{hint}");
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "a blocked enable must not touch os.json at all, not even to leave it \
+             unchanged content-wise via a rewrite"
+        );
+    }
+
+    /// Judgement criterion 2 — `Degraded` is not blocked by the "exactly one
+    /// report, `Refused`" gate. Positive control: broadening the match arm to
+    /// also catch `Degraded` would turn this red.
+    #[tokio::test]
+    async fn criterion2_degraded_is_not_blocked() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report(
+            "degraded-mod",
+            MountOutcome::Degraded("store open failed: disk full".to_owned()),
+        )]);
+        let res = t8_patch(&st, "degraded-mod", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::OK, "{:?}", body_json(res).await);
+        let cfg = crate::os_config::OsConfig::load(&path).unwrap();
+        assert!(cfg.is_enabled("degraded-mod"));
+    }
+
+    /// Judgement criterion 3 — `enabled: false` on a `Refused` module is
+    /// unaffected by the gate (it only checks `update.enabled`).
+    #[tokio::test]
+    async fn criterion3_disable_of_refused_is_never_blocked() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report(
+            "refused-mod",
+            MountOutcome::Refused("bad manifest".to_owned()),
+        )]);
+        let res = t8_patch(&st, "refused-mod", false, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::OK, "{:?}", body_json(res).await);
+        let cfg = crate::os_config::OsConfig::load(&path).unwrap();
+        assert!(!cfg.is_enabled("refused-mod"));
+    }
+
+    /// Judgement criterion 4 — the blocked `message` is exactly what `os
+    /// list`'s `detail` would show for the same report (both read the same
+    /// `why`, so they cannot drift apart).
+    #[tokio::test]
+    async fn criterion4_message_matches_os_list_detail() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report(
+            "refused-mod",
+            MountOutcome::Refused("the catalogue lists v2 but the manifest says v1".to_owned()),
+        )]);
+        let blocked = body_json(t8_patch(&st, "refused-mod", true, Some(path.clone())).await).await;
+        let list = body_json(render_at(&st, Some(path))).await;
+        let module = list["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "refused-mod")
+            .unwrap();
+        assert_eq!(blocked["error"]["message"], module["detail"]);
+    }
+
+    /// Judgement criterion 5 — an unknown name is still the pre-existing 404,
+    /// never a 409 (the gate only runs after that check).
+    #[tokio::test]
+    async fn criterion5_unknown_name_is_404_not_409() {
+        let (st, _dir, path) = t8_state().await;
+        let res = t8_patch(&st, "nope", true, Some(path)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(res).await["error"]["code"], "not_found");
+    }
+
+    /// Judgement criterion 6 — a duplicate name with one `Mounted` and one
+    /// `Refused` report is left alone (today's unconditional-allow). Positive
+    /// control: matching on "the first same-name report" instead of "exactly
+    /// one" reintroduces the v1/v2 false positive this design closed.
+    #[tokio::test]
+    async fn criterion6_duplicate_mounted_and_refused_is_not_blocked() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![
+            report(
+                "dup",
+                MountOutcome::Refused("empty catalogue version".to_owned()),
+            ),
+            report("dup", MountOutcome::Mounted),
+        ]);
+        let res = t8_patch(&st, "dup", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::OK, "{:?}", body_json(res).await);
+        let cfg = crate::os_config::OsConfig::load(&path).unwrap();
+        assert!(cfg.is_enabled("dup"));
+    }
+
+    /// Judgement criterion 7 — a duplicate name where one report is
+    /// `Disabled` (the real claimant) and the other is a collision `Refused`
+    /// is ALSO left alone — the "exactly one report" precondition skips both
+    /// gates entirely rather than trying to guess which report is the real
+    /// one (design doc round 3 High 3).
+    #[tokio::test]
+    async fn criterion7_duplicate_disabled_and_refused_is_not_blocked() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![
+            report("dup", MountOutcome::Disabled),
+            report(
+                "dup",
+                MountOutcome::Refused("another module already claims the name \"dup\"".to_owned()),
+            ),
+        ]);
+        // Even if "dup" were (wrongly) treated as package-backed, the
+        // multi-report precondition must skip the rescan branch too.
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "dup".to_owned(),
+            std::path::PathBuf::from("/nonexistent"),
+        )]));
+        let res = t8_patch(&st, "dup", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::OK, "{:?}", body_json(res).await);
+        let cfg = crate::os_config::OsConfig::load(&path).unwrap();
+        assert!(cfg.is_enabled("dup"));
+    }
+
+    /// Judgement criterion 8 — the admission gate does not reorder the
+    /// existing "unknown name -> 404" / "malformed body -> 400" checks.
+    #[tokio::test]
+    async fn criterion8_gate_does_not_disturb_existing_check_order() {
+        let (st, _dir, path) = t8_state().await;
+        // Unknown name + malformed body: still 404, the body is never reached.
+        let res = t8_patch_raw_body(&st, "nope", "not json", Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Known-but-Refused name + malformed body: still 400 (body parsing
+        // happens before the gate), not 409.
+        let (mut st2, _dir2, path2) = t8_state().await;
+        st2.os_reports = std::sync::Arc::new(vec![report(
+            "refused-mod",
+            MountOutcome::Refused("bad".to_owned()),
+        )]);
+        let res = t8_patch_raw_body(&st2, "refused-mod", "not json", Some(path2)).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(res).await["error"]["code"], "invalid_request");
+    }
+
+    /// Judgement criterion 9 — the primary case: a `Disabled` package whose
+    /// on-disk manifest still declares the requested name but now says
+    /// `in_process_crate` (delivery-mode self-contradiction for something
+    /// installed as a package) is blocked. The manifest's `version` is
+    /// deliberately different from anything remembered — that comparison was
+    /// removed (design doc round 3 High 1) and must not resurface.
+    #[tokio::test]
+    async fn criterion9_disabled_package_delivery_mismatch_is_blocked() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(
+            root.path(),
+            "pkgmod",
+            &t8_manifest_yaml("pkgmod", "9.9.9", "in_process_crate"),
+        );
+        st.os_reports = std::sync::Arc::new(vec![report("pkgmod", MountOutcome::Disabled)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "pkgmod".to_owned(),
+            pkg_dir,
+        )]));
+
+        let res = t8_patch(&st, "pkgmod", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let j = body_json(res).await;
+        assert_eq!(j["error"]["code"], "admission_refused");
+        assert!(
+            j["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("out-of-process provider with a spawn command")
+        );
+        assert!(
+            !path.exists(),
+            "a blocked enable must not create os.json at all"
+        );
+    }
+
+    /// Judgement criterion 9b — same directory, manifest renamed, delivery
+    /// mode still valid: must still be blocked. Pins the exact bypass round 5
+    /// caught (directory match alone proves "same package", not "same name").
+    #[tokio::test]
+    async fn criterion9b_disabled_package_renamed_manifest_is_blocked() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(
+            root.path(),
+            "alpha",
+            &t8_manifest_yaml("beta", "1.0.0", "out_of_process_provider"),
+        );
+        st.os_reports = std::sync::Arc::new(vec![report("alpha", MountOutcome::Disabled)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "alpha".to_owned(),
+            pkg_dir,
+        )]));
+
+        let res = t8_patch(&st, "alpha", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let msg = body_json(res).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(msg.contains("\"beta\""), "{msg}");
+        assert!(msg.contains("\"alpha\""), "{msg}");
+        assert!(!path.exists());
+    }
+
+    /// Judgement criterion 10 — the common case: a `Disabled` package whose
+    /// manifest is completely fine is allowed through and persists.
+    #[tokio::test]
+    async fn criterion10_disabled_package_clean_manifest_is_allowed() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(
+            root.path(),
+            "pkgmod",
+            &t8_manifest_yaml("pkgmod", "1.0.0", "out_of_process_provider"),
+        );
+        st.os_reports = std::sync::Arc::new(vec![report("pkgmod", MountOutcome::Disabled)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "pkgmod".to_owned(),
+            pkg_dir,
+        )]));
+
+        let res = t8_patch(&st, "pkgmod", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::OK, "{:?}", body_json(res).await);
+        let cfg = crate::os_config::OsConfig::load(&path).unwrap();
+        assert!(cfg.is_enabled("pkgmod"));
+    }
+
+    /// Judgement criterion 11 — a `Disabled` compiled-in module (absent from
+    /// `package_dirs`) never triggers the rescan at all, even with no
+    /// `packages_root` set up to look at.
+    #[tokio::test]
+    async fn criterion11_disabled_compiled_in_is_allowed_without_rescan() {
+        let (mut st, _dir, path) = t8_state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("builtin", MountOutcome::Disabled)]);
+        // `package_dirs` stays empty — "builtin" is not in it.
+        let res = t8_patch(&st, "builtin", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::OK, "{:?}", body_json(res).await);
+        let cfg = crate::os_config::OsConfig::load(&path).unwrap();
+        assert!(cfg.is_enabled("builtin"));
+    }
+
+    /// Judgement criterion 12 — the rescan's blocked `hint` is the dedicated
+    /// one, not `admission_refused_response`'s shared "check `os list`" hint
+    /// (which would be wrong here — the report still just says `Disabled`).
+    #[tokio::test]
+    async fn criterion12_rescan_hint_is_dedicated_not_shared() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(
+            root.path(),
+            "pkgmod",
+            &t8_manifest_yaml("pkgmod", "1.0.0", "in_process_crate"),
+        );
+        st.os_reports = std::sync::Arc::new(vec![report("pkgmod", MountOutcome::Disabled)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "pkgmod".to_owned(),
+            pkg_dir,
+        )]));
+
+        let hint =
+            body_json(t8_patch(&st, "pkgmod", true, Some(path)).await).await["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        assert!(hint.contains("not in `agent24 os list`"), "{hint}");
+        assert!(hint.contains("retry enable"), "{hint}");
+        // The other gate's shared hint reads differently — spot check they are
+        // not literally the same string (that gate's own tests, e.g.
+        // criterion1, pin its exact wording; this just confirms the two do
+        // not accidentally collapse into one).
+        let shared_hint = body_json(admission_refused_response("x")).await["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(hint, shared_hint);
+    }
+
+    /// Judgement criterion 13 — the package's own subdirectory is gone
+    /// (uninstalled), but `packages_root` itself is fine.
+    #[tokio::test]
+    async fn criterion13_package_subdirectory_vanished_is_blocked() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        // Never actually created — this package's directory does not exist.
+        let pkg_dir = root.path().join("gone");
+        st.os_reports = std::sync::Arc::new(vec![report("gone", MountOutcome::Disabled)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "gone".to_owned(),
+            pkg_dir,
+        )]));
+
+        let res = t8_patch(&st, "gone", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let msg = body_json(res).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(msg.contains("no longer there"), "{msg}");
+        assert!(!path.exists());
+    }
+
+    /// Judgement criterion 14 — the package's directory is still there, but
+    /// its manifest fails to parse. Matched by directory (not name — a
+    /// failed parse may not yield a trustworthy name at all).
+    #[tokio::test]
+    async fn criterion14_unparseable_manifest_is_blocked_via_scan_refused() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(root.path(), "broken", "this is not: [valid yaml at all\n");
+        st.os_reports = std::sync::Arc::new(vec![report("broken", MountOutcome::Disabled)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "broken".to_owned(),
+            pkg_dir,
+        )]));
+
+        // The real, independently-observed reason `scan()` gives for this
+        // exact broken manifest — asserted against below instead of a guessed
+        // substring, so this test actually proves the response came from the
+        // `scan.refused` branch (code review round 1 Low 4: deleting that
+        // branch entirely, so the request instead fell through to "package
+        // vanished," previously left this test green because it only checked
+        // the status code).
+        let expected_why = agent24_os_packages::discovery::scan(root.path())
+            .refused
+            .into_iter()
+            .find(|r| r.dir == root.path().join("broken"))
+            .expect("the broken manifest must show up as a scan refusal")
+            .why;
+
+        let res = t8_patch(&st, "broken", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let msg = body_json(res).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(msg, expected_why);
+        assert!(
+            !msg.contains("no longer there"),
+            "must come from scan.refused, not the package-vanished branch: {msg}"
+        );
+        assert!(!path.exists());
+    }
+
+    /// Judgement criterion 15a — `packages_root` itself fails
+    /// `check_packages_root` (world-writable), before any per-package
+    /// matching happens.
+    #[tokio::test]
+    async fn criterion15a_packages_root_check_fails_is_blocked() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let pkg_dir = root.path().join("pkgmod");
+        st.os_reports = std::sync::Arc::new(vec![report("pkgmod", MountOutcome::Disabled)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "pkgmod".to_owned(),
+            pkg_dir,
+        )]));
+
+        let res = t8_patch(&st, "pkgmod", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let msg = body_json(res).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(msg.contains("does not check out"), "{msg}");
+        assert!(!path.exists());
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Judgement criterion 15b — `packages_root` passes `check_packages_root`
+    /// (sane metadata) but `scan()` still reports it unreadable (e.g.
+    /// `read_dir` itself failing). Must be reported as a root-level failure,
+    /// not misattributed to "this package's directory disappeared" (round 6
+    /// Low 1 — `scan()`'s own `Refused{dir: packages_root}` entry has to be
+    /// checked before per-package directory matching).
+    ///
+    /// Drives `classify_scan` directly with a hand-built `Scan` rather than
+    /// relying on real `0o300` permission bits actually making `read_dir`
+    /// fail — under a root-run test process, discretionary permission bits
+    /// on a directory root owns do not restrict it, so the original
+    /// permission-based version of this test was invalid in that
+    /// environment (code review round 1 Low 3).
+    #[test]
+    fn criterion15b_packages_root_unreadable_is_blocked_not_misattributed() {
+        let packages_root = std::path::PathBuf::from("/tmp/t8-criterion15b-root");
+        let pkg_dir = packages_root.join("pkgmod");
+        let scan = agent24_os_packages::discovery::Scan {
+            found: Vec::new(),
+            refused: vec![agent24_os_packages::discovery::Refused {
+                dir: packages_root.clone(),
+                why: "permission denied".to_owned(),
+            }],
+        };
+        let result = classify_scan(&scan, &packages_root, "pkgmod", &pkg_dir);
+        let msg = result.expect_err("a root-level scan.refused entry must block, not allow");
+        assert!(
+            msg.contains("could not be read"),
+            "must be attributed to the ROOT, not to the package's own directory: {msg}"
+        );
+        assert!(
+            !msg.contains("no longer there"),
+            "must not be misreported as the package's own directory vanishing: {msg}"
         );
     }
 }
