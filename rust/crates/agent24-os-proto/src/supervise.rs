@@ -369,17 +369,27 @@ const DRAIN_WAIT: Duration = Duration::from_secs(1);
 
 impl ModuleProcess {
     pub(crate) fn new(
-        child: tokio::process::Child,
+        mut child: tokio::process::Child,
         generation: Arc<Generation>,
         token: String,
         drains: Vec<tokio::task::JoinHandle<()>>,
         http_listen_path: crate::endpoint::ModuleListenPath,
     ) -> std::io::Result<Self> {
-        let group = child
+        let Some(group) = child
             .id()
             .and_then(|id| i32::try_from(id).ok())
             .and_then(Pid::from_raw)
-            .ok_or_else(|| std::io::Error::other("the spawned child has no pid"))?;
+        else {
+            // Unreachable in practice on a supported Unix (a just-spawned
+            // child always has a pid) — but if it ever weren't, dropping
+            // `child` here (tokio does not kill on drop) together with
+            // `http_listen_path` would unlink `.l` while an unmanaged child
+            // is still alive on the other end (review of FU-60, round 1).
+            // Best-effort, not waited for: `new` is called from FU-58's plain
+            // `fn`, nothing here may await.
+            let _ = child.start_kill();
+            return Err(std::io::Error::other("the spawned child has no pid"));
+        };
         Ok(Self {
             child,
             group,

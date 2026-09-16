@@ -877,6 +877,33 @@ mod tests {
         assert!(matches!(err, LaunchError::Unresolved(_)), "{err:?}");
     }
 
+    /// FU-60, round 1: a real `spawn()` failure — not a simulated `drop`
+    /// standing in for one — must not leave `.l` behind. `resolve` fails
+    /// before `start` is ever called, so `spawn`'s own early return is what
+    /// drops the whole `LaunchSpec`, guard included.
+    #[tokio::test]
+    async fn a_spawn_that_fails_to_resolve_leaves_no_socket_behind() {
+        let t = pkg();
+        let (l, http_path) = listener();
+        let path = http_path.path().to_owned();
+        assert!(path.exists(), "test setup: the socket should exist yet");
+        let trampoline = test_trampoline();
+        let err = spawn(LaunchSpec {
+            name: "t",
+            command: &cmd("definitely-not-a-real-program-xyz", &[]),
+            package_dir: t.path(),
+            data_dir: &t.path().join("data"),
+            callback_sock: &t.path().join("cb.sock"),
+            trampoline: &trampoline,
+            listener: l,
+            http_path,
+        })
+        .await
+        .expect_err("must not resolve");
+        assert!(matches!(err, LaunchError::Unresolved(_)), "{err:?}");
+        assert!(!path.exists(), "a failed spawn left its socket behind");
+    }
+
     /// The property the handshake's naive comparison rests on: **a fresh secret
     /// per spawn**. Not "usually different" — this is checked as a set.
     #[test]
@@ -1116,31 +1143,37 @@ mod tests {
         let t = pkg();
         let (l, http_path) = listener();
         let path = http_path.path().to_owned();
+        // Two accepts, not one (FU-60, round 1 — design criterion #4): the
+        // listener must stay usable for the module's whole life, not just for
+        // a single connection.
         let mut p = start_with(
             t.path(),
             &python(
                 "import os, socket\n\
                  s = socket.socket(fileno=int(os.environ['A24_LISTEN_FD']))\n\
-                 c, _ = s.accept()\n\
-                 c.sendall(b'hello from fd 3')\n\
-                 c.close()",
+                 for i in range(2):\n\
+                 \x20    c, _ = s.accept()\n\
+                 \x20    c.sendall(b'hello from fd 3 (%d)' % i)\n\
+                 \x20    c.close()",
             ),
             l,
             http_path,
         )
         .await;
-        let mut conn = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let mut got = Vec::new();
-        // 30s, like every wait that includes an interpreter starting up (see
-        // `exited`): it returns the moment the module answers.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            conn.read_to_end(&mut got),
-        )
-        .await
-        .expect("no answer within 30s")
-        .unwrap();
-        assert_eq!(got, b"hello from fd 3");
+        for i in 0..2 {
+            let mut conn = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let mut got = Vec::new();
+            // 30s, like every wait that includes an interpreter starting up
+            // (see `exited`): it returns the moment the module answers.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                conn.read_to_end(&mut got),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("no answer to request {i} within 30s"))
+            .unwrap();
+            assert_eq!(got, format!("hello from fd 3 ({i})").into_bytes());
+        }
         exited(&mut p).await;
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
@@ -1180,6 +1213,18 @@ mod tests {
             .expect("the connect hung: something still holds the listener");
             let _ = p.stop(std::time::Duration::from_millis(100)).await;
             if connect.is_err() {
+                // `stop` above dropped `p` and, with it, the guard: the path
+                // is gone now, and a connect after this point is `NotFound`,
+                // not `ConnectionRefused` (review of FU-60, round 1).
+                assert!(!path.exists(), "stop did not remove the socket");
+                let after_stop = tokio::net::UnixStream::connect(&path).await;
+                assert!(
+                    matches!(
+                        after_stop.as_ref().err().map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::NotFound)
+                    ),
+                    "{after_stop:?}"
+                );
                 return; // refused, as it should be
             }
             accepted.push(path);

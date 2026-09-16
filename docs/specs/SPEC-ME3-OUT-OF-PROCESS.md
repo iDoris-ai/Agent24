@@ -52,7 +52,7 @@
 >
 > | 给什么 | 名字 / 位置 | 说明 |
 > |---|---|---|
-> | 入站监听 socket | fd **3**，`A24_LISTEN_FD=3` | 与 systemd socket activation 同一约定，按那个约定写的模块不用改。内核这边的那份 fd 在子进程拿到之后立即关闭 —— 模块一死，它的端口立刻拒绝连接，而不是把请求堆进一个没人 accept 的 backlog |
+> | 入站监听 socket | fd **3**，`A24_LISTEN_FD=3` | 与 systemd socket activation 同一约定，按那个约定写的模块不用改（Unix 域套接字，FU-60——`socket.socket(fileno=fd)` 这类写法本就不关心族）。内核这边的那份 fd 在子进程拿到之后立即关闭 —— 模块一死，它立刻拒绝连接，而不是把请求堆进一个没人 accept 的 backlog |
 > | 回调 socket 路径 | `A24_CALLBACK_SOCK` | 见上 |
 > | 握手令牌 | `A24_HANDSHAKE_TOKEN` | 每次 spawn 新铸（§3）；走环境变量而不是命令行，因为 argv 经 `ps` 对本机所有用户可见 |
 > | 数据目录 | `A24_DATA_DIR` | 模块自己的数据目录 |
@@ -78,7 +78,7 @@
 
 ## 2. 入站：受约束的代理，不是「原样转发」
 
-`DomainModule::routes()` 在进程内返回一个 `axum::Router`。这个形状过不了进程边界，但它的**效果**过得去：模块在本地端口上提供 HTTP，内核把自己命名空间下的请求转发过去。内核已经有 axum，为「模块贡献路由」发明协议是把已解决的问题重问一遍。
+`DomainModule::routes()` 在进程内返回一个 `axum::Router`。这个形状过不了进程边界，但它的**效果**过得去：模块在一个 Unix 域套接字上提供 HTTP（FU-60），内核把自己命名空间下的请求转发过去。内核已经有 axum，为「模块贡献路由」发明协议是把已解决的问题重问一遍。
 
 **但不能原样转发。** 内核今天用 `Authorization: Bearer` 鉴权（`rust/apps/agent24d/src/server.rs` 的 `auth` 中间件）。原样转发等于**把内核的 bearer token 交给模块**——它随后可以用这个 token 调用全部内核 API，而不止自己的命名空间。这条与「模块拿不到内核 token」是直接矛盾的，初稿写错了。
 

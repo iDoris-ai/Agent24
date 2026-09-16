@@ -1986,8 +1986,15 @@ pub(crate) mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let connections = StdArc::new(AtomicUsize::new(0));
+        // Pid plus a nanosecond timestamp: a pid-only name left a stale node
+        // for a later run reusing this pid to collide with (review of
+        // FU-60, round 1).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         let upstream =
-            std::env::temp_dir().join(format!("a24-zzproxy-{}.sock", std::process::id()));
+            std::env::temp_dir().join(format!("a24-zzproxy-{}-{nanos}.sock", std::process::id()));
         let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
         let counter = connections.clone();
         tokio::spawn(async move {

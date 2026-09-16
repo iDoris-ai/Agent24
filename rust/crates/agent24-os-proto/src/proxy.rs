@@ -1194,6 +1194,25 @@ mod tests {
 
     const NS: &str = "/api/v1/zzmock";
 
+    /// A `/tmp` path for a throwaway mock-module socket, unique enough that a
+    /// later run reusing this process's pid never collides with a node this
+    /// one left behind (review of FU-60, round 1: a pid-only name did). Pid
+    /// plus an atomic counter tells apart calls within one process; the
+    /// nanosecond timestamp tells apart this process from a past one that
+    /// happened to get the same pid and left a node behind.
+    fn unique_sock(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        PathBuf::from(format!(
+            "/tmp/a24-{tag}-{}-{nanos}-{n}.sock",
+            std::process::id()
+        ))
+    }
+
     // ── the pure half ────────────────────────────────────────────────────
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -1499,9 +1518,7 @@ mod tests {
     /// its cleanup to; the socket file is left behind, same as other
     /// throwaway state this test module leaks on purpose.
     async fn serve_unix(app: Router) -> PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let path = PathBuf::from(format!("/tmp/a24-mock-{}-{n}.sock", std::process::id()));
+        let path = unique_sock("mock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -1611,6 +1628,26 @@ mod tests {
         assert_ne!(id, "forged-by-the-client");
     }
 
+    /// FU-60 (design v4, Medium 2): the `Host` the module sees is the fixed,
+    /// kernel-chosen value — never the filesystem path the kernel actually
+    /// dials, which is not a valid HTTP authority and would leak where the
+    /// kernel's state lives.
+    #[tokio::test]
+    async fn the_module_sees_a_fixed_host_never_the_sockets_path() {
+        let (proxy, _) = proxied().await;
+        let got = call(proxy, Method::GET, &format!("{NS}/things"), &[], "").await;
+        assert_eq!(got.status, StatusCode::OK);
+        let seen = got.json();
+        let host = seen["headers"]["host"].as_str().unwrap();
+        assert_eq!(host, UPSTREAM_HOST);
+        for leaked in [".sock", ".l", "/tmp", "run/"] {
+            assert!(
+                !host.contains(leaked),
+                "the Host header leaked a path fragment ({leaked:?}): {host}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_client_cannot_choose_its_own_request_id() {
         let (proxy, _) = proxied().await;
@@ -1698,9 +1735,7 @@ mod tests {
         // sends 7, and hangs up. Buffering hides this — the status line already
         // said 200 — so a proxy that forwards what it has reports success for a
         // response that never finished.
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let upstream = PathBuf::from(format!("/tmp/a24-partial-{}-{n}.sock", std::process::id()));
+        let upstream = unique_sock("partial");
         let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -1722,9 +1757,7 @@ mod tests {
     async fn an_upstream_that_is_not_listening_is_a_502() {
         // Never bound: a path nothing is listening on, not one that might
         // belong to someone else.
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dead = PathBuf::from(format!("/tmp/a24-dead-{}-{n}.sock", std::process::id()));
+        let dead = unique_sock("dead");
         let proxy = serve(mount(Router::new(), NS, running_module(dead))).await;
         let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
@@ -1848,9 +1881,7 @@ mod tests {
 
     /// A socket that accepts and then does exactly what the script says.
     async fn raw_upstream(script: &'static str) -> PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let path = PathBuf::from(format!("/tmp/a24-raw-{}-{n}.sock", std::process::id()));
+        let path = unique_sock("raw");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let addr = path.clone();
         tokio::spawn(async move {
@@ -1905,7 +1936,11 @@ mod tests {
                                 )
                                 .await;
                             loop {
-                                if socket.write_all(b"c\r\ndata: tick\n\r\n").await.is_err() {
+                                // `data: tick\n` is 11 bytes = 0xb (review of
+                                // FU-60, round 1: this was `c`, one byte off —
+                                // harmless only because this test rejects
+                                // before parsing the body).
+                                if socket.write_all(b"b\r\ndata: tick\n\r\n").await.is_err() {
                                     break;
                                 }
                                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2545,9 +2580,7 @@ mod tests {
         answer: bool,
     ) -> (PathBuf, tokio::sync::oneshot::Receiver<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let addr = PathBuf::from(format!("/tmp/a24-close-{}-{n}.sock", std::process::id()));
+        let addr = unique_sock("close");
         let listener = tokio::net::UnixListener::bind(&addr).unwrap();
         let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -2591,9 +2624,7 @@ mod tests {
     async fn dropping_the_connection_guard_ends_a_connection_blocked_on_its_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         const BODY: usize = 64 * 1024 * 1024;
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let upstream = PathBuf::from(format!("/tmp/a24-body-{}-{n}.sock", std::process::id()));
+        let upstream = unique_sock("body");
         let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
         let module = tokio::spawn(async move {
@@ -2656,9 +2687,7 @@ mod tests {
         Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let path = PathBuf::from(format!("/tmp/a24-peers-{}-{n}.sock", std::process::id()));
+        let path = unique_sock("peers");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let peers = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let seen = peers.clone();
@@ -2710,9 +2739,7 @@ mod tests {
     /// (FU-64).
     #[tokio::test]
     async fn a_module_closing_an_idle_connection_costs_no_502() {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let upstream = PathBuf::from(format!("/tmp/a24-idle-{}-{n}.sock", std::process::id()));
+        let upstream = unique_sock("idle");
         let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
         let close = Arc::new(tokio::sync::Notify::new());
         let (closed_tx, mut closed) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -2950,9 +2977,7 @@ mod tests {
 
     async fn gated(then: Then) -> Gated {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let addr = PathBuf::from(format!("/tmp/a24-gated-{}-{n}.sock", std::process::id()));
+        let addr = unique_sock("gated");
         let listener = tokio::net::UnixListener::bind(&addr).unwrap();
         let arrived = Arc::new(tokio::sync::Semaphore::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
