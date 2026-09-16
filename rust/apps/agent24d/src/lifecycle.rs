@@ -317,6 +317,86 @@ fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), (bool, std:
     sync_dir(dir).map_err(|e| (true, e))
 }
 
+/// A temp file younger than this is left alone even if its name matches
+/// (FU-67, code review round 1 Medium): the singleton lock is held for this
+/// process's *steady-state* life, but a predecessor's `persist` (shutdown
+/// summary write, `server.rs`) runs in `spawn_blocking` and can still be
+/// mid-write for a while after `serve()` returns and drops its own lock
+/// guard — up to `deadlines.persist`'s own timeout, plus however long past
+/// that the blocking task is allowed to keep running before the watchdog and
+/// `main`'s own `runtime.shutdown_timeout(RUNTIME_TEARDOWN)` finally cut it
+/// off. **Round 1's "at most half a second" was the DEFAULT-budget number,
+/// not the bound this actually has to beat** (round 2 caught it): the module
+/// budgets are user-tunable up to `DRAIN_MAX_MS`/`GRACE_MAX_MS`, so the real
+/// worst case is `DRAIN_MAX_MS + GRACE_MAX_MS + CONFIRM + PERSIST +
+/// WATCHDOG_MARGIN + RUNTIME_TEARDOWN` ≈ 16s, not ~0.5s — the const
+/// assertion below ties this constant to that real bound (not just a
+/// comment that can drift), the same way `RUNTIME_TEARDOWN` is already tied
+/// to `WATCHDOG_MARGIN` above. A fresh temp file this young might not be
+/// orphaned at all; it might be a straggling write from the daemon that
+/// *just* exited, and deleting it out from under an in-flight `rename`
+/// would turn a harmless race into a real failure to persist. Genuinely
+/// orphaned files (the process that made them is long gone) are unaffected
+/// by waiting a bit longer — nothing else ever creates, reads, or races for
+/// a name matching this pattern, and this is a startup sweep for disk
+/// litter, not anything latency-sensitive.
+const ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
+const _: () = assert!(
+    ORPHAN_MIN_AGE.as_millis()
+        > (DRAIN_MAX_MS as u128
+            + GRACE_MAX_MS as u128
+            + CONFIRM.as_millis()
+            + PERSIST.as_millis()
+            + WATCHDOG_MARGIN.as_millis()
+            + RUNTIME_TEARDOWN.as_millis())
+);
+
+/// Sweep `run_dir` for `write_durable` temp files a PRIOR life of this daemon
+/// could have left behind on a crash mid-write (FU-67) — `.{name}.tmp.<hex>`,
+/// never reused (`create_new`) and never read back under that name, so a
+/// leftover one costs only disk litter, not a wrong verdict. Matches only the
+/// two names this module actually writes (`ALIVE`, `SUMMARY`); an unrelated
+/// file, even one that merely starts with a dot, is left alone. Only removes
+/// files at least [`ORPHAN_MIN_AGE`] old — see its doc for why a very fresh
+/// match is not swept even though this only ever runs after the singleton
+/// lock is held.
+pub fn sweep_orphaned_temp_files(run_dir: &Path) {
+    let prefixes = [format!(".{ALIVE}.tmp."), format!(".{SUMMARY}.tmp.")];
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        // Not there yet (nothing has ever run non-ephemeral here) or
+        // unreadable — either way, nothing this call can do about it, and
+        // `private_dir` further down creates it fresh when it's needed.
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok());
+        // Unknown age (metadata/clock error) is treated as "too young to
+        // touch" — the same fail-safe direction as everything else here:
+        // litter left behind costs nothing, an unsafe delete could cost a
+        // predecessor's shutdown record.
+        if age.is_none_or(|age| age < ORPHAN_MIN_AGE) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::warn!(
+                "could not remove orphaned temp file {}: {e}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
 fn random_hex(bytes: usize) -> String {
     use rand::RngCore;
     let mut b = vec![0u8; bytes];
@@ -905,6 +985,82 @@ mod tests {
 
     fn summary(id: &str) -> Summary {
         Summary::new(id, &Params::default(), Duration::from_millis(40), &[])
+    }
+
+    /// FU-67: an orphaned temp file from either name `write_durable` writes
+    /// (the marker or the summary) is swept; an unrelated file in the same
+    /// directory is not touched.
+    #[test]
+    fn sweep_removes_only_its_own_orphaned_temp_files() {
+        let d = dir();
+        let run = d.path();
+        let orphan_summary = run.join(format!(".{SUMMARY}.tmp.deadbeef"));
+        let orphan_alive = run.join(format!(".{ALIVE}.tmp.cafef00d"));
+        let unrelated = run.join("unrelated-file.txt");
+        let unrelated_dotfile = run.join(".something-else.tmp.deadbeef");
+        std::fs::write(&orphan_summary, b"partial").unwrap();
+        std::fs::write(&orphan_alive, b"partial").unwrap();
+        std::fs::write(&unrelated, b"keep me").unwrap();
+        std::fs::write(&unrelated_dotfile, b"keep me too").unwrap();
+        // Genuinely orphaned: backdate past ORPHAN_MIN_AGE so the age gate
+        // (round 1 Medium fix) does not mask what this test is checking.
+        age_back(&orphan_summary);
+        age_back(&orphan_alive);
+
+        sweep_orphaned_temp_files(run);
+
+        assert!(
+            !orphan_summary.exists(),
+            "orphaned summary temp file should be swept"
+        );
+        assert!(
+            !orphan_alive.exists(),
+            "orphaned marker temp file should be swept"
+        );
+        assert!(unrelated.exists(), "unrelated file must survive the sweep");
+        assert!(
+            unrelated_dotfile.exists(),
+            "a dotfile that merely resembles the pattern must survive the sweep"
+        );
+    }
+
+    /// Round 1 Medium: a matching temp file too young to safely call
+    /// orphaned (it could still be a predecessor's in-flight `persist`) is
+    /// left alone, even though the name matches exactly.
+    #[test]
+    fn sweep_leaves_a_fresh_matching_file_alone() {
+        let d = dir();
+        let run = d.path();
+        let fresh = run.join(format!(".{SUMMARY}.tmp.deadbeef"));
+        std::fs::write(&fresh, b"maybe still being written").unwrap();
+        // No age_back() — this one is as fresh as sweep_orphaned_temp_files
+        // will ever see it in the real race the age gate exists for.
+
+        sweep_orphaned_temp_files(run);
+
+        assert!(
+            fresh.exists(),
+            "a temp file younger than ORPHAN_MIN_AGE must not be removed"
+        );
+    }
+
+    /// Backdate a file's mtime past [`ORPHAN_MIN_AGE`] for a test that needs
+    /// to look at a genuinely-orphaned (not just-written) file.
+    fn age_back(path: &Path) {
+        let past = std::time::SystemTime::now() - (ORPHAN_MIN_AGE + Duration::from_secs(1));
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+
+    /// A `run/` directory that does not exist yet (fresh install, never
+    /// non-ephemeral before) must not make the sweep — or startup — fail.
+    #[test]
+    fn sweep_on_a_missing_run_dir_is_a_no_op() {
+        let d = dir();
+        let run = d.path().join("does-not-exist-yet");
+        sweep_orphaned_temp_files(&run);
     }
 
     /// Every row of the design's table, the marker first.
