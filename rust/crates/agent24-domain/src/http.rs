@@ -37,11 +37,53 @@ pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response
         error: ErrorBody {
             code: code.to_owned(),
             message: message.to_owned(),
+            hint: None,
             details: None,
         },
     };
     (status, Json(body)).into_response()
 }
+
+/// Build the v1 error envelope with a `hint` (ERR-1): `{ "error": { code,
+/// message, hint } }`. A separate function rather than a new parameter on
+/// [`error_response`] — that one has dozens of call sites that do not need a
+/// hint, and forcing each to pass `None` is noise, not clarity.
+pub fn error_response_with_hint(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    hint: &str,
+) -> Response {
+    let body = ErrorEnvelope {
+        error: ErrorBody {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            hint: Some(hint.to_owned()),
+            details: None,
+        },
+    };
+    (status, Json(body)).into_response()
+}
+
+/// The FU-64/ERR-1 canonical restart instruction, shared verbatim by every
+/// response that tells an operator to restart the daemon (`GaveUp`,
+/// `Stopped`, `PackageChanged`, `StopFailed` — both the proxy path and the
+/// two control-plane call sites). One constant rather than six near-copies:
+/// this line drifting apart across call sites is exactly the failure the
+/// design review caught (FU-64/ERR-1 design doc, Codex round 4 Medium 1).
+///
+/// `agent24 service status` prints `loaded: yes`/`loaded: no`
+/// ([`service::status`](../../agent24-cli/src/service.rs) via `agent24d`'s
+/// dependents) — that is the field this sentence tells the reader to check,
+/// not an abstract "is it managed". `gui/$(id -u)/ai.auraai.agent24` is the
+/// real `launchctl` service target this daemon's own plist installs under
+/// (`service.rs`'s `LABEL` and its `gui/{uid}/{LABEL}` target format) — not a
+/// placeholder, so it can be copied and run as-is. `agent24 daemon stop &&
+/// agent24 daemon start` is unsafe for a launchd-managed install (it detaches
+/// the new process from launchd's supervision, tracked as FU-68) and must
+/// never appear unconditionally — every caller of this constant keeps the
+/// leading "check `agent24 service status` first" clause attached.
+pub const RESTART_DAEMON_INSTRUCTION: &str = "restart the daemon — first run `agent24 service status`: if it says `loaded: yes`, run `launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24`; if it says `loaded: no`, run `agent24 daemon stop && agent24 daemon start`";
 
 /// Read a request body, capped at [`MAX_BODY_BYTES`].
 ///

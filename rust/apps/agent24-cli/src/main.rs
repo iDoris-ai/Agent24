@@ -489,6 +489,21 @@ async fn cmd_uninstall(name: &str) -> Result<(), String> {
     }
 }
 
+/// Render a daemon error envelope the way every call site here should
+/// (ERR-1 — "CLI 原样打印"): the `message`, and — when the daemon gave one —
+/// the `hint` on its own line right after it, unchanged text, no extra
+/// wrapping. Shared by the two call sites that actually parse
+/// `error.message` (`hot_disable_best_effort` and `cmd_os`); a bare
+/// "daemon returned {status}" fallback for a response with no parseable
+/// body is each call site's own concern, not this function's.
+fn daemon_error_line(body: &serde_json::Value) -> String {
+    let message = body["error"]["message"].as_str().unwrap_or("(no detail)");
+    match body["error"]["hint"].as_str() {
+        Some(hint) if !hint.is_empty() => format!("{message}\n  {hint}"),
+        _ => message.to_owned(),
+    }
+}
+
 /// Best-effort: tells an already-running daemon to stop serving `name` now,
 /// rather than leaving a healthy module to keep answering until it next
 /// happens to restart (which the daemon's own re-check then reports as
@@ -531,8 +546,10 @@ async fn hot_disable_best_effort(name: &str) {
         // change it never received. Relay the daemon's own message.
         Ok(res) => {
             let body: serde_json::Value = res.json().await.unwrap_or_default();
-            let msg = body["error"]["message"].as_str().unwrap_or("(no detail)");
-            println!("  the daemon could not fully confirm the stop: {msg}");
+            println!(
+                "  the daemon could not fully confirm the stop: {}",
+                daemon_error_line(&body)
+            );
         }
         // Genuinely ambiguous: the request may never have reached the
         // daemon, or it may have applied the change and the response was
@@ -603,9 +620,10 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         Ok(res) => {
             let status = res.status();
             let body: serde_json::Value = res.json().await.unwrap_or_default();
-            Err(match body["error"]["message"].as_str() {
-                Some(m) => m.to_owned(),
-                None => format!("daemon returned {status}"),
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
             })
         }
         Err(e) => Err(e.to_string()),

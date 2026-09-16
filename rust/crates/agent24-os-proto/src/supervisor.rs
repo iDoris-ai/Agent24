@@ -410,6 +410,11 @@ pub fn supervise(
     timings: Timings,
     package_check: PackageCheck,
 ) -> Result<SupervisorHandle, SlotHeld> {
+    // Cloned before `Slot::claim` consumes `current` — attaching the status
+    // feed below needs its own handle to the same slot (design doc, Codex
+    // round 1 High 7: this is the one production wiring point, and it must
+    // not be possible to reach `Ok(SupervisorHandle)` without it happening).
+    let current_for_status = current.clone();
     let slot = Slot::claim(current).ok_or(SlotHeld)?;
     let record = slot.record.clone();
     let (stop_tx, stop_rx) = watch::channel(None);
@@ -417,6 +422,7 @@ pub fn supervise(
         attempt: 1,
         after: None,
     });
+    current_for_status.attach_status(status_rx.clone());
     // Built here and moved into the task, not built inside it: a task aborted
     // before its first poll drops its future's captures — this guard — but
     // never runs a line of its body (review of ME3-SUP slice 3a, round 4).

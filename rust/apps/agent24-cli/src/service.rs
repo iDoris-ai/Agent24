@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 10] = [
+pub const PASSTHROUGH_VARS: [&str; 11] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -135,6 +135,9 @@ pub const PASSTHROUGH_VARS: [&str; 10] = [
     // install` is re-run, since this is a snapshot.
     "A24_MODULE_DRAIN_MS",
     "A24_MODULE_STOP_GRACE_MS",
+    // FU-64 §B: the idle-connection-pool age cap. Best-effort only (see the
+    // design doc), but still a knob that must reach the daemon.
+    "A24_MODULE_IDLE_CONN_MAX_MS",
 ];
 
 /// Snapshot the environment the daemon should run with.

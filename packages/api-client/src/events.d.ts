@@ -140,6 +140,13 @@ export interface ErrorBody {
   details?: {
     [k: string]: unknown;
   } | null;
+  /**
+   * What to do about it, when there is a concrete next step (ERR-1). Kept
+   * separate from `message` (what happened) rather than folded into it or
+   * into `details`, so a client can render the two differently and a test
+   * can assert on one without parsing the other.
+   */
+  hint?: string | null;
   message: string;
   [k: string]: unknown;
 }

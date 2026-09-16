@@ -1565,6 +1565,7 @@ impl RunManager {
         let body = ErrorBody {
             code: code.to_owned(),
             message: message.to_owned(),
+            hint: None,
             details: None,
         };
         match self
