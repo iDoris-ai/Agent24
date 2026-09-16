@@ -2,7 +2,7 @@
 
 > 状态：设计稿 v4（v1 → v2：4 Medium / 4 Low 全部采纳；v2 → v3：第 2 轮 1 Medium / 3 Low 全部采纳；v3 → v4：第 3 轮（终审）无 Medium+，4 Low 全部采纳，见文末——**设计通过，可以开始写代码**）。来源：`followups.md` FU-60；ME3-NEXT 执行队列第二段（用户已拍板：改走 Unix socket，不做「每模块连接新建速率上限」那个备选）。
 > **协议变更**：`A24_LISTEN_FD` 这个环境变量名字和值（恒为 `3`）不变，但 fd 3 上的套接字族从 `AF_INET` 换成 `AF_UNIX`。SPEC-ME3-OUT-OF-PROCESS.md §1 的表格与 §397 需要同步改写（本设计稿末尾列出改动点）。
-> **排期依赖**：本刀依赖 FU-57（Supervisor 失败分类，`failure.rs`）已经落地（PR #191，写这份 v2 时尚在评审中）。本刀实现前若 FU-57 尚未合并到 `main`，先 rebase 到它合并后的 `main` 再动手；「不改的东西」一节里对 `FailureKind` 的引用，指的是 FU-57 落地后的样子，不是本刀写作时 `origin/main` 的样子（v1 的这处引用被指出与写作时的 `origin/main` 对不上，见文末）。
+> **排期依赖（已解决）**：本刀依赖 FU-57（Supervisor 失败分类，`failure.rs`）已经落地。实现时 FU-57（#191）尚未合并，`open_generation()` 的失败暂时归为 `Stopped::Exited`（不是回归——`main` 上原本就是这样）；FU-57 合并（`606316c`）之后已 rebase 并接上 `failure::listen` 的 `setup` 分类，同时把它的文案改成中性——`open_generation` 一次覆盖两个 socket，从 `Result` 分不清哪一个失败了。
 
 ## 问题
 
