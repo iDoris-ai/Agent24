@@ -104,8 +104,20 @@ fn write_package(home: &Path, name: &str, slow_exit: bool) -> std::path::PathBuf
     )
     .unwrap();
     let sleep_on_term = if slow_exit {
-        "import signal, time\n\
-         signal.signal(signal.SIGTERM, lambda *_: (time.sleep(1), exit(0)))\n"
+        // `python3 -I -S` disables `site`, which is what normally defines
+        // the `exit` builtin — `os._exit`, not that, is what actually ends
+        // the process here (round-4 code review Low: a lambda calling the
+        // undefined `exit` would raise `NameError` instead of exiting
+        // cleanly after the sleep; the process still dies, but not the way
+        // this fixture's own comment claims). `\x20`-prefixed indentation:
+        // Rust's `\` line-continuation strips ALL leading whitespace off
+        // the next line, not just the newline, so plain spaces here would
+        // produce unindented (syntax-error) Python.
+        "import os, signal, time\n\
+        def _term(*_):\n\
+        \x20\x20\x20time.sleep(1)\n\
+        \x20\x20\x20os._exit(0)\n\
+        signal.signal(signal.SIGTERM, _term)\n"
     } else {
         ""
     };
