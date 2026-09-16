@@ -117,6 +117,19 @@ fn view(
                     within.as_secs()
                 )),
             ),
+            // FU-61: caught right before what would have been the next
+            // restart — not a run failure, so it does not go through
+            // `RunFailure`'s `Display`. Recovery is a daemon restart:
+            // `os disable`/`enable` cannot bring the supervisor back
+            // (`enable` only changes config, it does not create a new
+            // supervisor in a running daemon — see the design doc).
+            Status::PackageChanged { reason } => (
+                "degraded",
+                Some(format!(
+                    "package changed: {reason} — restart the daemon to pick up the current \
+                     package (`agent24 daemon stop && agent24 daemon start`)"
+                )),
+            ),
             Status::StopFailed { error } => ("degraded", Some(error.clone())),
             Status::Stopped => ("degraded", Some("stopped".to_owned())),
             Status::Panicked => ("degraded", Some("its supervisor panicked".to_owned())),
@@ -587,6 +600,63 @@ pub async fn patch_os(
     // Return the whole list so a client sees the new `restart_required` state
     // without a second round trip.
     render(&state)
+}
+
+/// Hands a running module's stop off RIGHT NOW, without writing `os.json`
+/// (FU-61 — `uninstall`'s hot-disable step must not reuse `patch_os`:
+/// persisting `enabled:false` for a name about to vanish from discovery
+/// entirely trips `unknown_disabled`'s fail-closed check on the daemon's
+/// next start and takes the WHOLE registry down, not just this package).
+/// Same "refuse an unknown name" guard `patch_os` has (this daemon's own
+/// mount report, a snapshot from startup, still lists a package whose files
+/// were just deleted — that is expected and fine, uninstall is exactly the
+/// moment this route exists for), same `hand_off`/`settle`/`last_look`
+/// machinery (`last_look` is not optional — a one-shot `settle()` alone
+/// would miss a `Stopping` that becomes `StopFailed` moments later, or a
+/// `Pending` that closes admission just after its own timeout, and answer
+/// 2xx for a stop that did not actually land), same error codes for
+/// `Failed`/`Pending` — the only thing genuinely new here is "skip the
+/// config write." The success response does NOT reuse `render(&state)`:
+/// `render` can itself return `503 registry_invalid` if `os.json` happens
+/// to be unreadable at that instant, which would make a fully successful
+/// stop look like a failure for a reason that has nothing to do with it.
+pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if !state.os_reports.iter().any(|r| r.name == name) {
+        let known: Vec<&str> = state.os_reports.iter().map(|r| r.name.as_str()).collect();
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("no domain OS named {name:?}; this daemon provides {known:?}"),
+        );
+    }
+    let handed = hand_off(
+        state.supervisors.as_deref(),
+        state.shutdown.modules_cut_off(),
+        &name,
+    );
+    let slot = handed.as_ref().map(|(_, d)| d.clone());
+    let hot = last_look(settle(handed, ADMISSION_CLOSED_WITHIN).await, slot.as_ref());
+    match hot {
+        HotStop::Failed => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stop_failed",
+            &format!("could not stop {name:?} cleanly; `agent24 os list` shows why"),
+        ),
+        HotStop::Pending => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "disable_pending",
+            &format!(
+                "asked {name:?}'s supervisor to stop it, but it still admitted requests after \
+                 {ADMISSION_CLOSED_WITHIN:?}; `agent24 os list` shows when it has stopped"
+            ),
+        ),
+        // Covers `Stopping`/`Already`/`NotRunning` alike — the body does not
+        // (and must not) claim "it was running and I stopped it"; that
+        // distinction belongs to `agent24 os list`, not to this ack.
+        HotStop::Stopping | HotStop::Already | HotStop::NotRunning => {
+            Json(serde_json::json!({ "name": name, "stopped": true })).into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1096,7 +1166,11 @@ mod tests {
 
         let st = crate::server::tests::state().await;
         let router = crate::server::build_router_with_modules(st, axum::Router::new());
-        for (method, uri) in [("GET", "/api/v1/os"), ("PATCH", "/api/v1/os/sin90")] {
+        for (method, uri) in [
+            ("GET", "/api/v1/os"),
+            ("PATCH", "/api/v1/os/sin90"),
+            ("POST", "/api/v1/os/sin90/stop"),
+        ] {
             let res = router
                 .clone()
                 .oneshot(
@@ -1134,5 +1208,116 @@ mod tests {
 
         r.resources = ResourceStatus::NotChecked;
         assert_eq!(view(&r, true, true, None, None).resources, "not_checked");
+    }
+
+    // FU-61: `stop_now_os` — `uninstall`'s hot-disable step, distinct from
+    // `patch_os` in that it must never write `os.json`.
+
+    #[tokio::test]
+    async fn stop_now_os_refuses_an_unknown_name_naming_the_known_ones() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut st = crate::server::tests::state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("sin90", MountOutcome::Mounted)]);
+        let token = st.token.to_string();
+        let router = crate::server::build_router_with_modules(st, axum::Router::new());
+
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/os/sin09/stop")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(j["error"]["code"], "not_found");
+        let msg = j["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("sin09"), "{msg}");
+        assert!(msg.contains("sin90"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn stop_now_os_stops_a_running_module_with_a_dedicated_response() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let st = crate::domain::tests::running_state(tmp.path()).await;
+        let token = st.token.to_string();
+        let router = crate::server::build_router_with_modules(st, axum::Router::new());
+
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/os/remote/stop")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(res.status().is_success(), "{}", res.status());
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // The dedicated ack shape, NOT `render`'s `DomainOsList` — a
+        // regression to `render(&state)` on success would fail this (no
+        // `"stopped"` field, and a `DomainOsList` has a `"modules"` array
+        // instead), pinning that this route's success path cannot be
+        // coupled to `render`'s own failure mode (a concurrently unreadable
+        // `os.json` making an actually-successful stop look failed).
+        assert_eq!(j["name"], "remote");
+        assert_eq!(j["stopped"], true);
+        assert!(j.get("modules").is_none(), "{j}");
+    }
+
+    #[tokio::test]
+    async fn stop_now_os_reports_not_running_without_claiming_a_live_stop() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // A compiled-in-shaped report with no supervisor at all behind it —
+        // `HotStop::NotRunning`. The 2xx wording must not differ from the
+        // "was actually running" case (`Stopping`/`Already`): the body alone
+        // cannot tell them apart, so the text must not pretend it can.
+        let mut st = crate::server::tests::state().await;
+        st.os_reports = std::sync::Arc::new(vec![report("sin90", MountOutcome::Mounted)]);
+        let token = st.token.to_string();
+        let router = crate::server::build_router_with_modules(st, axum::Router::new());
+
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/os/sin90/stop")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(res.status().is_success(), "{}", res.status());
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(j["stopped"], true);
     }
 }

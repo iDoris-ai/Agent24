@@ -228,6 +228,41 @@ fn read_package(dir: &Path) -> std::result::Result<Discovered, String> {
     })
 }
 
+/// Re-checks the package at `dir` against `expected` (a `ModuleSpec`'s
+/// manifest digest, frozen at mount time). `Ok(())` means manifest-
+/// consistent under THIS check's scope — not a guarantee that nothing about
+/// the package changed: an executable/script/asset changed behind an
+/// unchanged manifest passes this (FU-61's design doc, "范围收窄" — the
+/// digest only ever covered `MANIFEST_FILE`'s bytes, not the whole package
+/// tree). `Err(reason)` covers: the directory no longer exists; it (or its
+/// manifest) is no longer a safe entry to read — this mirrors `scan`'s own
+/// directory-level symlink refusal, which `read_package` alone does not
+/// re-check (it only re-validates the manifest FILE, not the directory it
+/// lives in); or the manifest's digest no longer matches.
+pub fn recheck(dir: &Path, expected: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_symlink() => {
+            return Err("the package directory is now a symlink; refusing to follow it".to_owned());
+        }
+        Ok(m) if !m.is_dir() => {
+            return Err("the package directory is no longer a directory".to_owned());
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("the package directory no longer exists".to_owned());
+        }
+        Err(e) => return Err(format!("could not check the package directory: {e}")),
+    }
+    match read_package(dir) {
+        Ok(found) if found.digest == expected => Ok(()),
+        Ok(found) => Err(format!(
+            "the manifest changed ({expected} \u{2192} {})",
+            found.digest
+        )),
+        Err(why) => Err(format!("the package is no longer usable: {why}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -589,5 +624,108 @@ mod tests {
             .map(|d| d.dir.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["m-a", "m-b", "m-c"]);
+    }
+
+    // FU-61: `recheck` — re-validating a package right before a restart, not
+    // just at install/mount time.
+
+    #[test]
+    fn recheck_accepts_the_manifest_it_saw_before() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = install(
+            root.path(),
+            "cos72",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        let found = read_package(&dir).unwrap();
+
+        assert_eq!(recheck(&dir, &found.digest), Ok(()));
+    }
+
+    #[test]
+    fn recheck_reports_both_digests_when_the_manifest_changed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = install(
+            root.path(),
+            "cos72",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        let old_digest = read_package(&dir).unwrap().digest;
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            manifest_yaml("cos72", "out_of_process_provider").replace("0.1.0", "0.2.0"),
+        )
+        .unwrap();
+
+        let err = recheck(&dir, &old_digest).unwrap_err();
+        assert!(err.contains(&old_digest), "{err}");
+        assert!(err.contains("changed"), "{err}");
+    }
+
+    #[test]
+    fn recheck_reports_a_removed_package_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = install(
+            root.path(),
+            "cos72",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        let digest = read_package(&dir).unwrap().digest;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let err = recheck(&dir, &digest).unwrap_err();
+        assert!(err.contains("no longer exists"), "{err}");
+    }
+
+    #[test]
+    fn recheck_reports_the_path_becoming_a_plain_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = install(
+            root.path(),
+            "cos72",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        let digest = read_package(&dir).unwrap().digest;
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory any more").unwrap();
+
+        let err = recheck(&dir, &digest).unwrap_err();
+        assert!(err.contains("no longer a directory"), "{err}");
+    }
+
+    #[test]
+    fn recheck_refuses_a_package_directory_replaced_by_a_symlink() {
+        // Mirrors `scan`'s own package-directory-level symlink refusal
+        // (`every_entry_is_classified_none_are_silently_dropped`) — even
+        // when the manifest reachable through the link is byte-identical
+        // (same digest), the directory-level check must still say no.
+        // `read_package` alone only re-validates the MANIFEST file; without
+        // this check a symlinked replacement would pass `recheck`.
+        let root = tempfile::tempdir().unwrap();
+        let dir = install(
+            root.path(),
+            "cos72",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        let digest = read_package(&dir).unwrap().digest;
+
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let real = install(
+            &elsewhere,
+            "real",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        // Control: the linked-to manifest really is byte-identical (same
+        // digest) — a digest mismatch alone would also fail `recheck` and
+        // prove nothing about the directory-level check specifically.
+        assert_eq!(read_package(&real).unwrap().digest, digest);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &dir).unwrap();
+
+        let err = recheck(&dir, &digest).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
     }
 }

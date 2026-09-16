@@ -53,6 +53,18 @@ pub struct ModuleSpec {
     pub trampoline: Trampoline,
 }
 
+/// Re-checks a module's installed package right before restarting it
+/// (FU-61): does `spec.package_dir` still hold a package whose manifest
+/// digests to `spec.manifest_digest`? `None` if yes; `Some(reason)`
+/// (human-readable, goes straight into [`Status::PackageChanged`]) if not.
+/// Synchronous and does blocking filesystem I/O — the caller in `run_loop`
+/// runs it through `spawn_blocking`, not directly on the async task. Built
+/// in `agent24d` (the crate that depends on `agent24-os-packages` and knows
+/// the on-disk package format) and handed in as an opaque `Fn`, so this
+/// crate keeps not knowing what a "package" is beyond the `path` + `digest`
+/// it was handed once at mount time.
+pub type PackageCheck = Arc<dyn Fn(&ModuleSpec) -> Option<String> + Send + Sync>;
+
 /// How long the supervisor waits for things. Production uses [`Timings::default`];
 /// tests shorten them so a crash loop runs in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +131,17 @@ pub enum Status {
         within: Duration,
         last: RunFailure,
     },
+    /// FU-61: the installed package's manifest changed or its directory
+    /// became unusable since this module was mounted, caught right before
+    /// what would have been the next restart — not after a spawn/handshake
+    /// failure. The supervisor stops here rather than restarting against a
+    /// manifest/digest that no longer matches what is on disk: for a
+    /// missing directory that restart could only fail to spawn; for a
+    /// changed digest it could only fail the handshake's `manifest_mismatch`
+    /// check. Either way it is not a run that backoff can fix. `reason`:
+    /// what [`PackageCheck`] said. The loop waits for its stop and then
+    /// says `Stopped`, same shape as `GaveUp`.
+    PackageChanged { reason: String },
     /// Ended on request. Any process it ran is confirmed gone.
     Stopped,
     /// A run's process could not be confirmed gone: its stop failed, and the
@@ -385,6 +408,7 @@ pub fn supervise(
     current: Arc<Current>,
     methods: MethodsFor,
     timings: Timings,
+    package_check: PackageCheck,
 ) -> Result<SupervisorHandle, SlotHeld> {
     let slot = Slot::claim(current).ok_or(SlotHeld)?;
     let record = slot.record.clone();
@@ -400,7 +424,15 @@ pub fn supervise(
         slot,
         status: status_tx,
     };
-    let task = tokio::spawn(run_loop(spec, dir, exit, methods, timings, stop_rx));
+    let task = tokio::spawn(run_loop(
+        spec,
+        dir,
+        exit,
+        methods,
+        timings,
+        package_check,
+        stop_rx,
+    ));
     Ok(SupervisorHandle {
         stop: stop_tx,
         status: status_rx,
@@ -559,6 +591,7 @@ async fn run_loop(
     exit: Exit,
     methods: MethodsFor,
     timings: Timings,
+    package_check: PackageCheck,
     mut stop: watch::Receiver<Option<Duration>>,
 ) {
     use crate::stop_record::ProcessAtStop;
@@ -634,6 +667,22 @@ async fn run_loop(
                     }
                     () = tokio::time::sleep(delay) => {}
                 }
+                // FU-61: re-check the package right before the next spawn,
+                // not before this sleep — a deletion/replacement that
+                // happens DURING the backoff would otherwise be missed
+                // until the following backoff cycle. Not counted as an
+                // `RestartPolicy` failure: it skips the decision of
+                // whether to spawn again, it does not produce a new run or
+                // a new `RunFailure`.
+                if let Some(reason) = check_package(&package_check, &spec).await {
+                    tracing::error!(module = %spec.name, %reason, "not restarting: package changed");
+                    slot.retire();
+                    status.send_replace(Status::PackageChanged { reason });
+                    stop_requested(&mut stop).await;
+                    saw_stop(record, &stop, ProcessAtStop::None);
+                    slot.stopped(status);
+                    return;
+                }
             }
             Decision::GiveUp { after, within } => {
                 tracing::error!(
@@ -658,6 +707,21 @@ async fn run_loop(
             }
         }
     }
+}
+
+/// Runs `check` off the async task: it does blocking filesystem I/O
+/// (`symlink_metadata`, a bounded read, a YAML parse) — bounded but not
+/// appropriate on a Tokio worker. `ModuleSpec` is `Clone`; cloning it and
+/// the `Arc<dyn Fn>` to move into `spawn_blocking` is cheap next to the I/O
+/// itself. A panicked closure is reported as a package-changed reason
+/// rather than propagated — this check must never bring the supervisor
+/// loop down.
+async fn check_package(check: &PackageCheck, spec: &ModuleSpec) -> Option<String> {
+    let check = check.clone();
+    let spec = spec.clone();
+    tokio::task::spawn_blocking(move || check(&spec))
+        .await
+        .unwrap_or_else(|e| Some(format!("the package check panicked: {e}")))
 }
 
 /// A run's process could not be confirmed gone: its stop failed.
@@ -1292,6 +1356,12 @@ sys.exit(0)
         Arc::new(|_| Methods::none())
     }
 
+    /// A `PackageCheck` that never reports a change — most tests are not
+    /// about FU-61 and want the package-recheck gate to be invisible.
+    fn no_package_check() -> PackageCheck {
+        Arc::new(|_| None)
+    }
+
     /// Wait (bounded) until the status satisfies `pred`.
     async fn until(
         rx: &mut watch::Receiver<Status>,
@@ -1362,7 +1432,20 @@ sys.exit(0)
         methods: MethodsFor,
         timings: Timings,
     ) -> SupervisorHandle {
-        supervise(spec, dir, current, methods, timings).expect("the slot is free")
+        supervise(spec, dir, current, methods, timings, no_package_check())
+            .expect("the slot is free")
+    }
+
+    /// Like `sup`, with a caller-supplied `PackageCheck` (FU-61 tests).
+    fn sup_checked(
+        spec: ModuleSpec,
+        dir: Arc<CallbackDir>,
+        current: Arc<Current>,
+        methods: MethodsFor,
+        timings: Timings,
+        package_check: PackageCheck,
+    ) -> SupervisorHandle {
+        supervise(spec, dir, current, methods, timings, package_check).expect("the slot is free")
     }
 
     /// Stop, bounded: a stop that hangs fails the test instead of the run.
@@ -1557,6 +1640,7 @@ sys.exit(0)
             current.clone(),
             no_methods(),
             fast(),
+            no_package_check(),
         );
         assert_eq!(refused.err(), Some(SlotHeld));
         assert!(
@@ -1632,7 +1716,15 @@ sys.exit(0)
         assert_eq!(second.block_on(handle.stop()), Err(SupervisorError::Killed));
         let g = fixture("normal");
         assert_eq!(
-            supervise(g.spec.clone(), g.dir.clone(), current, no_methods(), fast()).err(),
+            supervise(
+                g.spec.clone(),
+                g.dir.clone(),
+                current,
+                no_methods(),
+                fast(),
+                no_package_check()
+            )
+            .err(),
             Some(SlotHeld),
             "the slot was released over a module not confirmed gone"
         );
@@ -1693,6 +1785,7 @@ sys.exit(0)
                 current.clone(),
                 no_methods(),
                 fast(),
+                no_package_check(),
             )
             .expect("a stop cancelled after the group was confirmed empty kept the slot");
             stop(next).await;
@@ -2213,7 +2306,8 @@ sys.exit(0)
                 b.dir.clone(),
                 current.clone(),
                 no_methods(),
-                fast()
+                fast(),
+                no_package_check()
             )
             .err(),
             Some(SlotHeld),
@@ -2311,7 +2405,8 @@ sys.exit(0)
                 g.dir.clone(),
                 current.clone(),
                 no_methods(),
-                fast()
+                fast(),
+                no_package_check()
             )
             .err(),
             Some(SlotHeld),
@@ -2360,6 +2455,118 @@ sys.exit(0)
         let mut rx = handle.subscribe();
         until(&mut rx, "GaveUp", |s| matches!(s, Status::GaveUp { .. })).await;
         assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
+        stop(handle).await;
+    }
+
+    // FU-61: the package is re-checked right after the backoff sleep, before
+    // the next restart attempt — a change made DURING that sleep must be
+    // caught, not missed until the following cycle.
+
+    /// The package directory is deleted while the module is in backoff.
+    /// Evidence is the STATUS TRANSITION itself (a second `Backoff` never
+    /// appears), not "did a process start" — a deleted package directory
+    /// makes `launch::resolve` fail before any child exists either way, so a
+    /// start-marker file cannot distinguish "the check worked" from "the
+    /// check did nothing but the spawn would have failed anyway."
+    #[tokio::test]
+    async fn a_deleted_package_directory_during_backoff_skips_straight_to_package_changed() {
+        let f = fixture("crash");
+        let current = Current::new(Generation::starting());
+        let timings = Timings {
+            backoff_base: Duration::from_secs(2),
+            ..fast()
+        };
+        let package_dir = f.spec.package_dir.clone();
+        let package_check: PackageCheck = Arc::new(move |spec| {
+            (!spec.package_dir.exists()).then(|| "the package directory is gone".to_owned())
+        });
+        let handle = sup_checked(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            timings,
+            package_check,
+        );
+        let mut rx = handle.subscribe();
+        until(&mut rx, "the first backoff", |s| {
+            matches!(s, Status::Backoff { failures: 1, .. })
+        })
+        .await;
+        std::fs::remove_dir_all(&package_dir).unwrap();
+        let status = until(&mut rx, "PackageChanged", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. } | Status::Backoff { failures: 2, .. }
+            )
+        })
+        .await;
+        assert!(
+            matches!(status, Status::PackageChanged { .. }),
+            "restarted once more instead of stopping on the deleted package: {status:?}"
+        );
+        assert_eq!(
+            starts(f.data.path()).len(),
+            1,
+            "a restart was attempted against a package directory known to be gone"
+        );
+        assert_eq!(current.get().state(), crate::drain::DrainState::Revoked);
+        stop(handle).await;
+    }
+
+    /// The package's manifest changes (a digest mismatch, in the real
+    /// `PackageCheck`) while the module is in backoff, WITHOUT the directory
+    /// disappearing — spawn would otherwise succeed here, so this is the
+    /// case that proves the check actually prevents a second handshake
+    /// attempt, not just a doomed-anyway spawn: the mock module's start
+    /// marker (written before it ever reaches the handshake) must not gain a
+    /// second entry.
+    #[tokio::test]
+    async fn a_changed_manifest_during_backoff_prevents_a_second_start() {
+        let f = fixture("crash");
+        let digest_file = f.spec.package_dir.join("digest.txt");
+        std::fs::write(&digest_file, "sha256:original").unwrap();
+        let package_check: PackageCheck = Arc::new(move |spec| {
+            let current = std::fs::read_to_string(spec.package_dir.join("digest.txt")).ok();
+            (current.as_deref() != Some("sha256:original"))
+                .then(|| "the manifest changed".to_owned())
+        });
+        let current = Current::new(Generation::starting());
+        let timings = Timings {
+            backoff_base: Duration::from_secs(2),
+            ..fast()
+        };
+        let handle = sup_checked(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            timings,
+            package_check,
+        );
+        let mut rx = handle.subscribe();
+        until(&mut rx, "the first backoff", |s| {
+            matches!(s, Status::Backoff { failures: 1, .. })
+        })
+        .await;
+        assert_eq!(starts(f.data.path()).len(), 1);
+        std::fs::write(&digest_file, "sha256:replaced").unwrap();
+        let status = until(&mut rx, "PackageChanged", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. } | Status::Backoff { failures: 2, .. }
+            )
+        })
+        .await;
+        assert!(
+            matches!(status, Status::PackageChanged { .. }),
+            "restarted against the replaced package instead of stopping: {status:?}"
+        );
+        assert_eq!(
+            starts(f.data.path()).len(),
+            1,
+            "a second handshake attempt was made against the replaced package"
+        );
         stop(handle).await;
     }
 

@@ -1194,6 +1194,14 @@ async fn mount_package(
         manifest_digest: package.digest.clone(),
         trampoline: host.trampoline.clone(),
     };
+    // FU-61: re-checked right before every restart, not just at this mount —
+    // `agent24-os-proto` stays unaware of `agent24-os-packages`'s on-disk
+    // format (`ModuleSpec` already treats `package_dir`/`manifest_digest` as
+    // opaque values), so the check itself lives here and travels in as an
+    // opaque closure.
+    let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(|spec| {
+        agent24_os_packages::discovery::recheck(&spec.package_dir, &spec.manifest_digest).err()
+    });
     // Started and registered in one step, unless the shutdown has closed the
     // list — which it may have while the directory was being prepared.
     let started = host.supervisors.start_with(|| {
@@ -1204,6 +1212,7 @@ async fn mount_package(
             // No callback method is offered to modules yet (ME-3c onward).
             Arc::new(|_| agent24_os_proto::rpc::Methods::none()),
             host.timings,
+            package_check,
         )
         .map(|handle| Supervised {
             name: name.clone(),
@@ -1691,6 +1700,42 @@ while f.readline():
             host.supervisors.close().is_empty(),
             "a package was started during the shutdown"
         );
+    }
+
+    /// A full `AppState` with one package, `remote`, started and Running —
+    /// for tests that need a real HTTP route (`stop_now_os`, `patch_os`)
+    /// rather than just `Supervisors` directly. Builds on `running_package`'s
+    /// same recipe but also wires `os_reports`/`module_status`/`supervisors`
+    /// into the state the same way `server::run` does after its own mount
+    /// pass (`server.rs`, around `state.os_reports = Arc::new(reports)`).
+    pub(crate) async fn running_state(tmp: &Path) -> crate::server::AppState {
+        let packages = tmp.join("packages");
+        write_package(&packages, "remote");
+        let host = test_host(tmp);
+        let hub = crate::events::EventsHub::default();
+        let (_, reports, _) = mount_all(
+            &discovered(&packages),
+            &tmp.join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+        )
+        .await;
+        let mut status = host.supervisors.statuses().remove("remote").unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| *s == agent24_os_proto::supervisor::Status::Running),
+        )
+        .await
+        .expect("the package never ran")
+        .unwrap();
+        let mut state = crate::server::tests::state().await;
+        state.module_status = Arc::new(host.supervisors.statuses());
+        state.os_reports = Arc::new(reports);
+        state.supervisors = Some(host.supervisors.clone());
+        state
     }
 
     /// A host with one package, `remote`, started and Running.
