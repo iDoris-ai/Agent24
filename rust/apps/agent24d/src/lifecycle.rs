@@ -26,6 +26,11 @@ pub const PERSIST: Duration = Duration::from_millis(200);
 /// After the later of the HTTP and persistence deadlines: the runtime's own
 /// teardown, before the watchdog ends the process.
 pub const WATCHDOG_MARGIN: Duration = Duration::from_millis(300);
+/// How long `main` lets the runtime tear down once `serve` returns. The two
+/// were one number written twice; tied here, so changing one cannot quietly
+/// outgrow the margin the watchdog leaves it (review of #188, L-1).
+pub const RUNTIME_TEARDOWN: Duration = WATCHDOG_MARGIN;
+const _: () = assert!(RUNTIME_TEARDOWN.as_millis() <= WATCHDOG_MARGIN.as_millis());
 
 pub const DRAIN_ENV: &str = "A24_MODULE_DRAIN_MS";
 pub const GRACE_ENV: &str = "A24_MODULE_STOP_GRACE_MS";
@@ -212,26 +217,47 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<Result<T, ()>>
 /// The previous daemon, from the two files — the marker first: while it is
 /// there, a summary that cannot be read does not hide that the daemon that
 /// wrote the marker left no matching one.
-#[must_use]
+#[cfg(test)]
 pub fn previous(run_dir: &Path) -> Previous {
+    evidence(run_dir).0
+}
+
+/// [`previous`], with the summary it was judged from — one read of each
+/// file, so the verdict and the summary it reports on are the same snapshot
+/// (review of SHUT-1c, round 1).
+#[must_use]
+pub fn evidence(run_dir: &Path) -> (Previous, Option<Summary>) {
     let alive = read_json::<Alive>(&run_dir.join(ALIVE));
     if matches!(alive, Some(Err(()))) {
         // A marker that cannot be read: no summary could be matched to it.
-        return Previous::Unconfirmed;
+        return (Previous::Unconfirmed, None);
     }
     let summary = read_json::<Summary>(&run_dir.join(SUMMARY));
-    match (alive, summary) {
+    let previous = match (&alive, &summary) {
         (None, None) => Previous::NoHistory,
         (None, Some(Ok(s))) => Previous::Clean {
-            stop_result: s.stop_result,
+            stop_result: s.stop_result.clone(),
         },
         (None, Some(Err(()))) => Previous::Unreadable,
         (Some(Ok(a)), Some(Ok(s))) if a.instance_id == s.instance_id => Previous::CleanupFailed,
         (Some(_), _) => Previous::Unconfirmed,
-    }
+    };
+    (previous, summary.and_then(Result::ok))
 }
 
 impl Previous {
+    /// Its name in `GET /api/v1/shutdown`.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoHistory => "no_history",
+            Self::Clean { .. } => "clean",
+            Self::Unreadable => "unreadable",
+            Self::CleanupFailed => "cleanup_failed",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+
     /// A line for the start-up log, or `None` when there is nothing to say.
     #[must_use]
     pub fn warning(&self, run_dir: &Path) -> Option<String> {
@@ -623,7 +649,10 @@ impl Summary {
                 if let (Some(by), Some(ms)) = (&m.drain_ended_by, m.drain_ms) {
                     parts.push(format!("drain {by} {ms}ms"));
                 }
-                let cut = m.abandoned.unwrap_or(0) + m.never_sent.unwrap_or(0);
+                let cut = m
+                    .abandoned
+                    .unwrap_or(0)
+                    .saturating_add(m.never_sent.unwrap_or(0));
                 if cut > 0 {
                     parts.push(format!("cut {cut}"));
                 }
@@ -676,6 +705,74 @@ fn bounded(summary: &Summary) -> std::io::Result<Vec<u8>> {
         let drop = (s.records.len() / 8).max(1);
         s.records.truncate(s.records.len() - drop);
         s.omitted_records += drop;
+    }
+}
+
+/// The largest integer the report's schema admits (2^53 - 1): a JSON number
+/// beyond it loses precision in a JavaScript client.
+const JSON_SAFE_MAX: u64 = (1 << 53) - 1;
+
+/// A figure for the report, clamped to [`JSON_SAFE_MAX`] — the persisted ones
+/// come from a file on disk, which may say anything that parses (review of
+/// SHUT-1c, round 2).
+fn ms(v: u128) -> u64 {
+    u64::try_from(v).map_or(JSON_SAFE_MAX, |v| v.min(JSON_SAFE_MAX))
+}
+
+/// What `GET /api/v1/shutdown` answers (SHUT-1c): the budgets in effect,
+/// what was warned about, and the daemon before — each figure the same one
+/// the start-up log gave.
+#[must_use]
+pub fn report(
+    params: &Params,
+    warnings: &[String],
+    evidence: Option<(&Path, &Previous, Option<Summary>)>,
+) -> agent24_protocol::ShutdownReport {
+    let ephemeral = evidence.is_none();
+    let (evidence_dir, previous, previous_detail, last) = match evidence {
+        None => (None, "no_history", None, None),
+        Some((dir, previous, last)) => (
+            Some(dir.display().to_string()),
+            previous.code(),
+            previous.warning(dir),
+            last,
+        ),
+    };
+    agent24_protocol::ShutdownReport {
+        ephemeral,
+        evidence_dir,
+        drain_ms: ms(params.drain.as_millis()),
+        stop_grace_ms: ms(params.stop_grace.as_millis()),
+        exit_bound_ms: ms(params.exit_bound().as_millis()),
+        config_warnings: warnings.to_vec(),
+        previous: previous.to_owned(),
+        previous_detail,
+        last_shutdown: last.map(|s| agent24_protocol::LastShutdown {
+            stop_result: s.stop_result.clone(),
+            began_at_ms: ms(s.began_at_ms),
+            took_ms: ms(s.took_ms),
+            killed_after_grace: s
+                .records
+                .iter()
+                .filter(|m| m.leader.as_deref() == Some("killed_after_grace"))
+                .map(|m| m.name.clone())
+                .collect(),
+            cut_requests: s
+                .records
+                .iter()
+                .filter_map(|m| {
+                    // Saturating: these come from a file on disk (review of
+                    // SHUT-1c, round 1).
+                    let cut = m
+                        .abandoned
+                        .unwrap_or(0)
+                        .saturating_add(m.never_sent.unwrap_or(0));
+                    (m.drain_ended_by.as_deref() == Some("deadline") && cut > 0)
+                        .then(|| format!("{} ({cut})", m.name))
+                })
+                .collect(),
+            omitted_records: ms(s.omitted_records as u128),
+        }),
     }
 }
 
@@ -981,6 +1078,79 @@ mod tests {
                 .expect("a FIFO blocked the start"),
             Previous::Unreadable
         );
+    }
+
+    /// The live report says what the start-up log said: the budgets, the
+    /// warnings, the previous daemon, and which modules the last shutdown
+    /// found too slow — the ones to tune for.
+    #[test]
+    fn the_report_names_the_modules_to_tune_for() {
+        let mut slow = rec(ProcessAtStop::Running);
+        slow.group = Some(GroupEnd::Gone);
+        slow.leader = Some(Leader::KilledAfterGrace);
+        let mut cut = rec(ProcessAtStop::Running);
+        cut.group = Some(GroupEnd::Gone);
+        cut.abandoned = Some(1);
+        cut.never_sent = Some(2);
+        cut.drain = Some(DrainEnd {
+            ended_by: DrainEndedBy::Deadline,
+            budget: Duration::from_millis(800),
+            elapsed: Duration::from_millis(800),
+        });
+        let last = Summary::new(
+            "x",
+            &Params::default(),
+            Duration::from_millis(900),
+            &[
+                ("slow".into(), Reason::Shutdown, slow),
+                ("busy".into(), Reason::Shutdown, cut),
+            ],
+        );
+        let d = dir();
+        let r = report(
+            &Params::default(),
+            &["A24_MODULE_DRAIN_MS=\"x\" is not…".to_owned()],
+            Some((d.path(), &Previous::Unconfirmed, Some(last))),
+        );
+        assert!(!r.ephemeral);
+        assert_eq!(
+            (r.drain_ms, r.stop_grace_ms, r.exit_bound_ms),
+            (800, 500, 2000)
+        );
+        assert_eq!(r.config_warnings.len(), 1);
+        assert_eq!(r.previous, "unconfirmed");
+        assert!(r.previous_detail.unwrap().contains("did not confirm"));
+        let last = r.last_shutdown.unwrap();
+        assert_eq!(last.killed_after_grace, ["slow"]);
+        assert_eq!(last.cut_requests, ["busy (3)"]);
+
+        let e = report(&Params::default(), &[], None);
+        assert!(e.ephemeral && e.evidence_dir.is_none() && e.last_shutdown.is_none());
+        assert_eq!(e.previous, "no_history");
+    }
+
+    /// A summary on disk may carry figures past what the schema admits; the
+    /// report clamps them rather than hand a JavaScript client a number it
+    /// cannot hold (review of SHUT-1c, round 2).
+    #[test]
+    fn the_report_never_exceeds_the_json_safe_integer() {
+        let mut last = Summary::new("x", &Params::default(), Duration::ZERO, &[]);
+        last.began_at_ms = u128::from(u64::MAX) + 1;
+        last.took_ms = u128::from(JSON_SAFE_MAX) + 1;
+        last.omitted_records = usize::MAX;
+        let d = dir();
+        let r = report(
+            &Params::default(),
+            &[],
+            Some((d.path(), &Previous::NoHistory, Some(last))),
+        );
+        let last = r.last_shutdown.unwrap();
+        assert_eq!(
+            (last.began_at_ms, last.took_ms, last.omitted_records),
+            (JSON_SAFE_MAX, JSON_SAFE_MAX, JSON_SAFE_MAX)
+        );
+        assert_eq!(ms(u128::from(JSON_SAFE_MAX)), JSON_SAFE_MAX);
+        assert_eq!(ms(7), 7);
     }
 
     /// A summary too big to be read back is cut to fit, and says how much it

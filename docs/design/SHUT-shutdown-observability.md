@@ -93,7 +93,7 @@
   - `module "x": the 800ms drain ended with 2 request(s) still in flight (1 sent, outcome unknown; 1 never sent) — raise A24_MODULE_DRAIN_MS if requests routinely run longer`
   - 汇总：`shutdown (state dir ~/.agent24) took 1120ms: x completed (drain idle 3ms, exited in grace, stop 40ms); y completed (drain deadline 800ms, cut 2, grace expired, stop 512ms)`
 - **`last-shutdown.json`**：`{version, instance_id, began_at_ms, took_ms, stop_result, params:{drain_ms, stop_grace_ms, http_deadline_ms, module_deadline_ms, persist_deadline_ms, watchdog_ms}, records:[ModuleStop…]}`（`began_at_ms` 是 Unix 纪元以来的墙钟毫秒；各截止为停机开始后的毫秒数），字段只增不删；形状由测试钉住。只从 1 MiB 以内的普通文件读取（不跟随链接）。
-- **实时出口**（SHUT-1c）：新端点 `GET /api/v1/daemon/shutdown`（要 token；`daemon` 加进 `RESERVED_KERNEL_SEGMENTS`，免得哪个领域 OS 的命名空间撞上它，保留段的集合相等测试同步更新）→ `{state_dir, effective:{…参数与三个截止…}, config_warnings:[…], previous, last_shutdown}`；`agent24 daemon status` 多打一段「停机」：生效参数、配置告警、上次停机的结论与被强杀/切断的模块。写进 `protocol/openapi.yaml`。
+- **实时出口**（SHUT-1c）：`GET /api/v1/shutdown`（要 token；与已有的 `POST /api/v1/shutdown` 同一路径——GET 看停机配置与上次结果、POST 触发停机。实现时从原设想的 `/api/v1/daemon/shutdown` 改到这里：`shutdown` 本就是内核保留段，不必再占一个 `daemon` 段、平白收走一个模块名）→ `ShutdownReport {ephemeral, evidence_dir, drain_ms, stop_grace_ms, exit_bound_ms, config_warnings, previous, previous_detail, last_shutdown{stop_result, began_at_ms, took_ms, killed_after_grace, cut_requests, omitted_records}}`；`agent24 daemon status` 多打一段「停机」：生效参数、配置告警、上次停机的结论与被强杀/切断的模块。写进 `protocol/openapi.yaml`。
   **不动** `DomainOsView.detail`（它说的是模块此刻的状态，不塞历史）和 `DomainOsList` 的形状。
 
 ## 失败与并发 / Failure and concurrency

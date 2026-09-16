@@ -210,6 +210,23 @@ describe('v1 M-A (live since A5)', () => {
       const body = (await res.json()) as { error: { code: string } }
       expect(body.error.code).toBe('unauthorized')
     })
+    it('GET /api/v1/shutdown → the shutdown budgets and the previous shutdown (SHUT-1c)', async (ctx) => {
+      if (!IS_RUST) return ctx.skip()
+      const res = await get('/api/v1/shutdown')
+      expect(res.status).toBe(200)
+      const r = res.body as {
+        ephemeral: boolean
+        drain_ms: number
+        stop_grace_ms: number
+        exit_bound_ms: number
+        config_warnings: string[]
+        previous: string
+      }
+      expect(typeof r.ephemeral).toBe('boolean')
+      expect(r.exit_bound_ms).toBeGreaterThanOrEqual(r.drain_ms + r.stop_grace_ms)
+      expect(Array.isArray(r.config_warnings)).toBe(true)
+      expect(r.previous).toMatch(/^(no_history|clean|unreadable|cleanup_failed|unconfirmed)$/)
+    })
   })
 })
 

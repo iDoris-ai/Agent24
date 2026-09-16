@@ -15,6 +15,59 @@ pub struct Health {
     pub backend: String,
 }
 
+/// `GET /api/v1/shutdown` (SHUT-1c): the shutdown budgets this daemon runs
+/// with, what it warned about them, and what it found of the daemon before it
+/// — so a budget that is too tight can be found and adjusted without reading
+/// logs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ShutdownReport {
+    /// An ephemeral daemon keeps no shutdown evidence.
+    pub ephemeral: bool,
+    /// Where the evidence lives (`<state dir>/run`), for a daemon that keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_dir: Option<String>,
+    /// `A24_MODULE_DRAIN_MS` in effect.
+    pub drain_ms: u64,
+    /// `A24_MODULE_STOP_GRACE_MS` in effect.
+    pub stop_grace_ms: u64,
+    /// From SIGTERM to the process gone, at the latest (2000 at the defaults).
+    pub exit_bound_ms: u64,
+    /// Values that were rejected (the default used instead), and evidence
+    /// that could not be kept.
+    #[serde(default)]
+    pub config_warnings: Vec<String>,
+    /// Open enum: `no_history` | `clean` | `unreadable` | `cleanup_failed` |
+    /// `unconfirmed` (the daemon before did not confirm a clean shutdown).
+    pub previous: String,
+    /// What `previous` means and what to do about it, when there is something
+    /// to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_detail: Option<String>,
+    /// The summary the daemon before left, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_shutdown: Option<LastShutdown>,
+}
+
+/// The gist of `last-shutdown.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct LastShutdown {
+    /// Open enum: `clean` | `degraded` | `timed_out`.
+    pub stop_result: String,
+    pub began_at_ms: u64,
+    pub took_ms: u64,
+    /// Modules whose leader was SIGKILLed after its stop grace — raise
+    /// `A24_MODULE_STOP_GRACE_MS` if they need longer.
+    #[serde(default)]
+    pub killed_after_grace: Vec<String>,
+    /// Modules whose drain ran out with requests still in flight, as
+    /// `name (count)` — raise `A24_MODULE_DRAIN_MS` if requests run longer.
+    #[serde(default)]
+    pub cut_requests: Vec<String>,
+    /// Records the summary left out to stay small.
+    #[serde(default)]
+    pub omitted_records: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Usage {
     pub prompt_tokens: u64,

@@ -64,6 +64,8 @@ pub struct AppState {
     /// concurrent toggles are applied in one order (SUP-5). The list a PATCH
     /// answers with is rendered after, and shows the state then.
     pub os_control: Arc<tokio::sync::Mutex<()>>,
+    /// What `GET /api/v1/shutdown` answers — fixed at start-up (SHUT-1c).
+    pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
@@ -499,6 +501,11 @@ impl AppState {
             module_status: Arc::new(std::collections::HashMap::new()),
             supervisors: None,
             os_control: Arc::new(tokio::sync::Mutex::new(())),
+            shutdown_report: Arc::new(crate::lifecycle::report(
+                &crate::lifecycle::Params::default(),
+                &[],
+                None,
+            )),
             runs,
             scheduler,
             shutdown,
@@ -541,6 +548,12 @@ async fn shutdown_handler(State(state): State<AppState>) -> Response {
         Json(serde_json::json!({ "ok": true })),
     )
         .into_response()
+}
+
+/// `GET /api/v1/shutdown` (SHUT-1c): the shutdown budgets in effect, what
+/// was warned about them, and the daemon before this one.
+async fn shutdown_report(State(state): State<AppState>) -> Json<agent24_protocol::ShutdownReport> {
+    Json((*state.shutdown_report).clone())
 }
 
 async fn fallback() -> Response {
@@ -659,7 +672,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/os/{name}",
             axum::routing::patch(crate::os_routes::patch_os),
         )
-        .route("/api/v1/shutdown", axum::routing::post(shutdown_handler))
+        .route(
+            "/api/v1/shutdown",
+            axum::routing::post(shutdown_handler).get(shutdown_report),
+        )
         .route(
             "/api/v1/sessions",
             post(crate::runs::create_session).get(crate::runs::list_sessions),
@@ -788,14 +804,17 @@ pub async fn serve(
     // as far as starting anything, and leaves no evidence.) A marker that
     // cannot be written still gets its run a summary; the warning is kept.
     // Ephemeral daemons neither read nor write either file.
+    let mut evidence = None;
     let marker = if ephemeral {
         None
     } else {
         agent24_protocol::state_file::state_dir().map(|state| {
             let run = crate::lifecycle::run_dir(&state);
-            if let Some(warning) = crate::lifecycle::previous(&run).warning(&run) {
+            let (previous, last) = crate::lifecycle::evidence(&run);
+            if let Some(warning) = previous.warning(&run) {
                 tracing::warn!("{warning}");
             }
+            evidence = Some((run.clone(), previous, last));
             let (guard, warning) = crate::lifecycle::MarkerGuard::create(&run);
             if let Some(warning) = warning {
                 tracing::warn!("{warning}");
@@ -888,6 +907,13 @@ pub async fn serve(
                 agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new())
             }
         },
+    );
+    let report = crate::lifecycle::report(
+        &params,
+        &config_warnings,
+        evidence
+            .as_ref()
+            .map(|(dir, previous, last)| (dir.as_path(), previous, last.clone())),
     );
     let mut state = AppState::new(AppDeps {
         token: token.clone(),
@@ -1259,6 +1285,7 @@ pub async fn serve(
             .unwrap_or_default(),
     );
     state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
+    state.shutdown_report = Arc::new(report);
     let router = build_router_with_modules(state, module_routes);
 
     // A shutdown that began during startup ends it here, before anything says

@@ -274,7 +274,15 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * The shutdown budgets in effect and the previous shutdown (authenticated)
+         * @description SHUT-1c. The out-of-process modules' drain and stop grace
+         *     (`A24_MODULE_DRAIN_MS`, `A24_MODULE_STOP_GRACE_MS`), the exit bound
+         *     they give, values that were rejected, and what this daemon found of
+         *     the one before it — so a budget that is too tight can be found and
+         *     adjusted. agent24d only.
+         */
+        get: operations["getShutdownReport"];
         put?: never;
         /**
          * Request graceful daemon shutdown (authenticated)
@@ -518,6 +526,30 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ShutdownReport: {
+            /** @description An ephemeral daemon keeps no shutdown evidence. */
+            ephemeral: boolean;
+            /** @description Where the evidence lives (`<state dir>/run`). */
+            evidence_dir?: string;
+            drain_ms: number;
+            stop_grace_ms: number;
+            /** @description From SIGTERM to the process gone, at the latest (2000 at the defaults). */
+            exit_bound_ms: number;
+            config_warnings: string[];
+            /** @description Open enum: no_history | clean | unreadable | cleanup_failed | unconfirmed. */
+            previous: string;
+            previous_detail?: string;
+            last_shutdown?: components["schemas"]["LastShutdown"];
+        };
+        LastShutdown: {
+            /** @description Open enum: clean | degraded | timed_out. */
+            stop_result: string;
+            began_at_ms: number;
+            took_ms: number;
+            killed_after_grace: string[];
+            cut_requests: string[];
+            omitted_records: number;
+        };
         Health: {
             /** @constant */
             status: "ok";
@@ -1500,6 +1532,35 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    getShutdownReport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The report, fixed at start-up */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShutdownReport"];
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     shutdownDaemon: {

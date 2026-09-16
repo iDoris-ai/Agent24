@@ -135,6 +135,50 @@ struct Endpoint {
     child: Option<tokio::process::Child>,
 }
 
+/// The shutdown part of `agent24 daemon status` (SHUT-1c): the budgets and
+/// the bound they give, anything rejected, the daemon before this one, and
+/// which modules its shutdown found too slow — each with the knob to turn.
+fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
+    let mut out = vec![format!(
+        "shutdown · drain {}ms · stop grace {}ms · exits within {}ms of SIGTERM",
+        r.drain_ms, r.stop_grace_ms, r.exit_bound_ms
+    )];
+    for w in &r.config_warnings {
+        out.push(format!("  ! {w}"));
+    }
+    match (&r.last_shutdown, r.previous.as_str()) {
+        _ if r.ephemeral => {}
+        (Some(last), "clean") => out.push(format!(
+            "  previous shutdown: {} ({}ms)",
+            last.stop_result, last.took_ms
+        )),
+        (_, "no_history") => {}
+        (_, other) => out.push(format!(
+            "  previous shutdown: {other}{}",
+            r.previous_detail
+                .as_deref()
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default()
+        )),
+    }
+    if let Some(last) = &r.last_shutdown {
+        if !last.killed_after_grace.is_empty() {
+            out.push(format!(
+                "  SIGKILLed after their stop grace: {} — raise A24_MODULE_STOP_GRACE_MS \
+                 (then re-run `agent24 service install` for the launchd service)",
+                last.killed_after_grace.join(", ")
+            ));
+        }
+        if !last.cut_requests.is_empty() {
+            out.push(format!(
+                "  requests cut when the drain ran out: {} — raise A24_MODULE_DRAIN_MS",
+                last.cut_requests.join(", ")
+            ));
+        }
+    }
+    out
+}
+
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -613,6 +657,36 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                         "running · pid {} · port {} · backend {} · v{}",
                         state.pid, state.port, health.backend, health.version
                     );
+                    // SHUT-1c. Only a daemon from before it (405) is skipped
+                    // quietly; any other failure is said, since the report is
+                    // how a budget that is too tight gets noticed (review of
+                    // SHUT-1c, round 1).
+                    // The whole exchange is bounded, not just the connect: a
+                    // daemon that stalls mid-response must not hang `status`
+                    // (review of SHUT-1c, round 2).
+                    match client()
+                        .get(format!("{base}/api/v1/shutdown"))
+                        .bearer_auth(&state.token)
+                        .timeout(Duration::from_secs(5))
+                        .send()
+                        .await
+                    {
+                        Ok(res) if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {}
+                        Ok(res) if res.status().is_success() => {
+                            match res.json::<agent24_protocol::ShutdownReport>().await {
+                                Ok(report) => {
+                                    for line in shutdown_lines(&report) {
+                                        println!("{line}");
+                                    }
+                                }
+                                Err(e) => println!("  (shutdown report unreadable: {e})"),
+                            }
+                        }
+                        Ok(res) => {
+                            println!("  (shutdown report: daemon returned {})", res.status())
+                        }
+                        Err(e) => println!("  (shutdown report unavailable: {e})"),
+                    }
                 } else {
                     println!(
                         "state file present (pid {}) but daemon not responding",
@@ -747,9 +821,53 @@ async fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `daemon status` says what the shutdown report says, and names the knob
+    /// for each module found too slow (SHUT-1c).
+    #[test]
+    fn the_status_names_the_knob_for_each_slow_module() {
+        let r = agent24_protocol::ShutdownReport {
+            ephemeral: false,
+            evidence_dir: Some("/h/.agent24/run".into()),
+            drain_ms: 800,
+            stop_grace_ms: 500,
+            exit_bound_ms: 2000,
+            config_warnings: vec!["A24_MODULE_DRAIN_MS=\"x\" … using the default".into()],
+            previous: "clean".into(),
+            previous_detail: None,
+            last_shutdown: Some(agent24_protocol::LastShutdown {
+                stop_result: "clean".into(),
+                began_at_ms: 0,
+                took_ms: 1120,
+                killed_after_grace: vec!["slow".into()],
+                cut_requests: vec!["busy (3)".into()],
+                omitted_records: 0,
+            }),
+        };
+        let lines = shutdown_lines(&r).join("\n");
+        assert!(lines.contains("drain 800ms · stop grace 500ms · exits within 2000ms of SIGTERM"));
+        assert!(lines.contains("! A24_MODULE_DRAIN_MS"));
+        assert!(lines.contains("previous shutdown: clean (1120ms)"));
+        assert!(lines.contains("slow — raise A24_MODULE_STOP_GRACE_MS"));
+        assert!(lines.contains("busy (3) — raise A24_MODULE_DRAIN_MS"));
+
+        let unconfirmed = agent24_protocol::ShutdownReport {
+            previous: "unconfirmed".into(),
+            previous_detail: Some("did not confirm a clean shutdown".into()),
+            last_shutdown: None,
+            config_warnings: vec![],
+            ..r
+        };
+        let lines = shutdown_lines(&unconfirmed).join("\n");
+        assert!(
+            lines.contains("previous shutdown: unconfirmed — did not confirm"),
+            "{lines}"
+        );
+    }
 
     #[test]
     fn the_offline_hint_never_tells_you_to_replace_the_whole_file() {

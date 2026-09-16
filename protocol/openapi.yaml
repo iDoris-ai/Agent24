@@ -461,6 +461,29 @@ paths:
           $ref: "#/components/responses/NotFound"
 
   /shutdown:
+    get:
+      operationId: getShutdownReport
+      tags: [system]
+      summary: The shutdown budgets in effect and the previous shutdown (authenticated)
+      description: |
+        SHUT-1c. The out-of-process modules' drain and stop grace
+        (`A24_MODULE_DRAIN_MS`, `A24_MODULE_STOP_GRACE_MS`), the exit bound
+        they give, values that were rejected, and what this daemon found of
+        the one before it — so a budget that is too tight can be found and
+        adjusted. agent24d only.
+      responses:
+        "200":
+          description: The report, fixed at start-up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ShutdownReport"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     post:
       operationId: shutdownDaemon
       tags: [system]
@@ -938,6 +961,67 @@ components:
             $ref: "#/components/schemas/Error"
 
   schemas:
+    ShutdownReport:
+      type: object
+      required: [ephemeral, drain_ms, stop_grace_ms, exit_bound_ms, config_warnings, previous]
+      properties:
+        ephemeral:
+          type: boolean
+          description: An ephemeral daemon keeps no shutdown evidence.
+        evidence_dir:
+          type: string
+          description: Where the evidence lives (`<state dir>/run`).
+        drain_ms:
+          type: integer
+          minimum: 0
+          maximum: 10000
+        stop_grace_ms:
+          type: integer
+          minimum: 0
+          maximum: 5000
+        exit_bound_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          description: From SIGTERM to the process gone, at the latest (2000 at the defaults).
+        config_warnings:
+          type: array
+          items:
+            type: string
+        previous:
+          type: string
+          description: "Open enum: no_history | clean | unreadable | cleanup_failed | unconfirmed."
+        previous_detail:
+          type: string
+        last_shutdown:
+          $ref: "#/components/schemas/LastShutdown"
+    LastShutdown:
+      type: object
+      required: [stop_result, began_at_ms, took_ms, killed_after_grace, cut_requests, omitted_records]
+      properties:
+        stop_result:
+          type: string
+          description: "Open enum: clean | degraded | timed_out."
+        began_at_ms:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+        took_ms:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+        killed_after_grace:
+          type: array
+          items:
+            type: string
+        cut_requests:
+          type: array
+          items:
+            type: string
+        omitted_records:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
     Health:
       type: object
       required: [status, version, backend]
