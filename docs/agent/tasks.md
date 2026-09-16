@@ -113,7 +113,7 @@
 **四、主线到发布**（任务定义与验收见 [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) §五「主链」）
 - **T8.5 ME-3d 记忆回调**（`private/*`）`READY`
 - **T7 ME-3e 事件 + 审批** `READY`
-- **T8 ME-3g 启用路径准入** `READY`
+- **T8 ME-3g 启用路径准入** `DONE` — [#196](https://github.com/iDoris-ai/Agent24/pull/196)（`de03b4b`，2026-09-16；语义说明 [`T8-ME3g-enable-admission-gate.md`](../design/T8-ME3g-enable-admission-gate.md) v7，写码前 6 轮设计审查，终审无 Medium+；代码 1 轮 Codex 代码审查）：`PATCH /api/v1/os/{name}` 新增准入门，只在这个名字恰好一条 `os_reports` 报告时触碰（重名维持既有的无条件放行，明确划出范围）——已经是 `Refused` 直接拒绝；`Disabled` 的进程外模块现场重扫清单（按目录匹配、先查名字防改名绕过、再查交付方式自洽性），编译进内核的 `Disabled` 模块关不上（核对需要调用 `build()`，架构本身的安全线逼出的限制，记 `FU-6x` 独立跟进）。`AppState` 新增 `packages_root`/`package_dirs`；`ErrorBody.code` 补 `admission_refused`，顺手补全 FU-64/ERR-1 时代漏掉的 `module_panicked`/`module_killed`。17 条判据全部落成确定性测试。
 - **T9 ME-3f 仓外包端到端 —— 验收**（黑盒：不改源码、不重新构建，装一个仓库之外的包，重启后挂载 → 路由代理 → 事件转发全绿）`BLOCKED on T7/T8/T8.5`
 - **T13 `agent24-os-sdk`** 与 **T14 wire 文档 + 非 Rust 参考实现**（可与 T9 之后并行）
 - **T10 Cos72 进程外样例**（重做暂停中的 `feat/me4-cos72-skeleton`）→ **T11 Sin90 迁出内核** → **T12 发布 v0.5.0**
