@@ -275,6 +275,13 @@ pub struct ModuleProcess {
     /// Told how the group ended when this is dropped without a confirmed
     /// stop — whether a SIGKILL was actually sent (SHUT-1a).
     on_unstopped_drop: Option<DropReport>,
+    /// The path of this generation's inbound HTTP listen socket (FU-60): held
+    /// for exactly this process's lifetime, and dropped (removing the path)
+    /// only once this whole struct is — not when the daemon's raw listener fd
+    /// closed moments after spawn, and not tied to `Generation`'s Arc count,
+    /// either of which could unlink the path while the module is still very
+    /// much alive and `accept`ing on it (design note, "生命周期").
+    _http_listen_path: crate::endpoint::ModuleListenPath,
 }
 
 /// The report [`ModuleProcess::on_unstopped_drop`] installs.
@@ -366,6 +373,7 @@ impl ModuleProcess {
         generation: Arc<Generation>,
         token: String,
         drains: Vec<tokio::task::JoinHandle<()>>,
+        http_listen_path: crate::endpoint::ModuleListenPath,
     ) -> std::io::Result<Self> {
         let group = child
             .id()
@@ -383,6 +391,7 @@ impl ModuleProcess {
             exit: None,
             drains,
             on_unstopped_drop: None,
+            _http_listen_path: http_listen_path,
         })
     }
 
@@ -1030,6 +1039,18 @@ mod tests {
             args: vec![],
         };
         let trampoline = crate::launch::test_trampoline();
+        // A throwaway state directory, deliberately leaked: only the
+        // listener/guard pair matters here, not which `CallbackDir` it came
+        // from (FU-60) — and the returned `ModuleProcess` outlives this
+        // function, so a `TempDir` guard dropped here would delete the
+        // sockets out from under the process still using them.
+        let state = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap()
+            .keep();
+        let socket_dir = crate::endpoint::CallbackDir::create(&state).unwrap();
+        let g = socket_dir.open_generation().unwrap();
         crate::launch::spawn(crate::launch::LaunchSpec {
             name: "t",
             command: &spawn_cmd,
@@ -1037,7 +1058,8 @@ mod tests {
             data_dir: dir,
             callback_sock: &dir.join("cb.sock"),
             trampoline: &trampoline,
-            listener: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            listener: g.http_listener,
+            http_path: g.http_path,
         })
         .await
         .expect("spawn")

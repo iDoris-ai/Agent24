@@ -69,14 +69,24 @@ pub enum EndpointError {
 impl std::fmt::Display for EndpointError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Neutral wording (FU-60): this directory now holds a generation's
+            // callback socket AND its inbound listen socket, so nothing here
+            // says "callback" — a `.l` failure must not be reported as one.
             Self::UnsafeDirectory { path, why } => {
-                write!(f, "{} cannot hold callback sockets: {why}", path.display())
+                write!(
+                    f,
+                    "{} cannot hold generation sockets: {why}",
+                    path.display()
+                )
             }
             Self::PathTooLong(p) => write!(
                 f,
-                "the callback socket path {} is longer than {MAX_SOCKET_PATH} bytes",
+                "the socket path {} is longer than {MAX_SOCKET_PATH} bytes",
                 p.display()
             ),
+            // Only the callback connection is accepted and handshaken by the
+            // kernel, so these two stay callback-specific — the module's
+            // inbound listener is never awaited or handshaken here.
             Self::Timeout => f.write_str("no callback connection before the deadline"),
             Self::ForeignPeer { uid } => {
                 write!(
@@ -90,7 +100,7 @@ impl std::fmt::Display for EndpointError {
                  listeners first",
                 p.display()
             ),
-            Self::Io(e) => write!(f, "callback endpoint: {e}"),
+            Self::Io(e) => write!(f, "generation endpoint: {e}"),
         }
     }
 }
@@ -227,6 +237,35 @@ impl CallbackDir {
         self.listen_at(n)
     }
 
+    /// Open both of one generation's sockets — the callback socket and the
+    /// module's inbound HTTP listener (FU-60) — under one number this
+    /// directory has never handed out, so a caller can never mint the two
+    /// separately and risk a mismatched pair (the same reasoning
+    /// [`CallbackDir::listen_next`] exists for: a caller-chosen number
+    /// reopened the door PR-Daemon review #179 L1 closed). Must be called
+    /// within a Tokio runtime (the callback socket is async; the HTTP
+    /// listener is a plain blocking `std` one, bound synchronously here so it
+    /// can move into a child process's fd table unchanged).
+    ///
+    /// Either both bind or neither is left behind: if the HTTP listener fails
+    /// after the callback socket already bound, the callback socket's `Drop`
+    /// removes its path before the error returns.
+    ///
+    /// # Errors
+    ///
+    /// [`EndpointError::PathTooLong`], or the OS refusing either bind.
+    pub fn open_generation(&self) -> Result<GenerationSockets, EndpointError> {
+        let n = self.last.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let callback = self.listen_at(n)?;
+        let (http_listener, http_path) = self.http_listen_at(n)?;
+        Ok(GenerationSockets {
+            n,
+            callback,
+            http_listener,
+            http_path,
+        })
+    }
+
     /// Listen at `<dir>/<n>.sock`. Private: a caller-chosen number is what
     /// [`CallbackDir::listen_next`] exists to rule out.
     fn listen_at(&self, n: u64) -> Result<CallbackListener, EndpointError> {
@@ -270,6 +309,108 @@ impl CallbackDir {
         // defend against a hostile process of the same user).
         std::fs::set_permissions(&bound.path, std::fs::Permissions::from_mode(0o700))?;
         Ok(bound)
+    }
+
+    /// Bind the module's inbound HTTP listener at `<dir>/<n>.l` (FU-60):
+    /// shorter than `.sock` so the callback path — always the longer of the
+    /// two — stays the one [`MAX_SOCKET_PATH`] actually limits. Private, for
+    /// the same reason as `listen_at`: only [`CallbackDir::open_generation`]
+    /// hands out `n`.
+    ///
+    /// A plain `std` (not Tokio) listener: the daemon never `accept`s on it —
+    /// it is moved whole into a child's fd table and the daemon's copy is
+    /// dropped right after spawn, exactly like the TCP listener it replaces.
+    /// The returned [`ModuleListenPath`] is a separate, longer-lived guard —
+    /// unlike [`CallbackListener`], removing its path must wait for the
+    /// generation's process to be confirmed gone, not for this listener value
+    /// to be dropped (design note, "生命周期" — a module may still be
+    /// `accept`ing on its inherited fd long after the daemon closes its own).
+    fn http_listen_at(
+        &self,
+        n: u64,
+    ) -> Result<(std::os::unix::net::UnixListener, ModuleListenPath), EndpointError> {
+        let path = self.path.join(format!("{n}.l"));
+        if path.as_os_str().len() > MAX_SOCKET_PATH {
+            return Err(EndpointError::PathTooLong(path));
+        }
+        // Same reasoning as `listen_at`: nothing is removed first — a node at
+        // an un-issued number is not stale.
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(e.into());
+            }
+        };
+        let guard = ModuleListenPath {
+            path,
+            node: (meta.dev(), meta.ino()),
+            _claim: self.claim.clone(),
+        };
+        if !meta.file_type().is_socket() {
+            return Err(EndpointError::UnsafeDirectory {
+                path: guard.path.clone(),
+                why: "the bound path is not a socket".to_owned(),
+            });
+        }
+        // `0700` on the node itself, not the umask's `0755` — same as the
+        // callback socket (design v4, round 3 Low: this does not follow from
+        // the directory already being `0700`).
+        std::fs::set_permissions(&guard.path, std::fs::Permissions::from_mode(0o700))?;
+        Ok((listener, guard))
+    }
+}
+
+/// One generation's pair of sockets (FU-60): the callback socket the module
+/// connects out on, and the HTTP listener the kernel proxies requests into —
+/// opened together, under one number, so they can never mismatch.
+#[derive(Debug)]
+pub struct GenerationSockets {
+    /// The number both sockets share: `<n>.sock` and `<n>.l`.
+    pub n: u64,
+    pub callback: CallbackListener,
+    /// Raw — moves whole into a child's fd table (`LaunchSpec`); the daemon
+    /// never accepts on it.
+    pub http_listener: std::os::unix::net::UnixListener,
+    /// Outlives `http_listener`: it travels into [`crate::supervise::ModuleProcess`]
+    /// and is not removed until the generation's process is confirmed gone.
+    pub http_path: ModuleListenPath,
+}
+
+/// The path of one generation's HTTP listen socket (FU-60), held for exactly
+/// as long as the generation's process may still be accepting on it —
+/// `crate::supervise::ModuleProcess` is that lifetime, not this guard's own
+/// construction-to-drop span the way [`CallbackListener`] is. Removing the
+/// path any earlier (e.g. when the daemon's raw listener fd is dropped, which
+/// happens moments after spawn) would starve a module that is still very
+/// much alive and `accept`ing on its inherited copy of that fd.
+#[derive(Debug)]
+pub struct ModuleListenPath {
+    path: PathBuf,
+    /// Same best-effort node check as [`CallbackListener`]: `Drop` removes
+    /// the path only if it still names this node.
+    node: (u64, u64),
+    _claim: std::sync::Arc<Claim>,
+}
+
+impl ModuleListenPath {
+    /// The path to hand to a client wanting to connect to this generation
+    /// (stored as `Generation::upstream`, not passed to the module itself —
+    /// the module gets the listener via its inherited fd 3, not this path).
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ModuleListenPath {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.node) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1113,6 +1254,187 @@ mod tests {
             .collect();
         let unique: std::collections::BTreeSet<&PathBuf> = paths.iter().collect();
         assert_eq!(unique.len(), paths.len(), "{paths:?}");
+    }
+
+    // ---- FU-60: the module's inbound HTTP listen socket ------------------
+
+    /// `open_generation` hands out a matched pair, sharing one number.
+    #[tokio::test]
+    async fn open_generation_gives_a_matched_pair_of_sockets() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let g = dir.open_generation().unwrap();
+        let sock_n: u64 = g
+            .callback
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let l_n: u64 = g
+            .http_path
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(g.n, sock_n);
+        assert_eq!(g.n, l_n);
+        assert_eq!(g.callback.path().extension().unwrap(), "sock");
+        assert_eq!(g.http_path.path().extension().unwrap(), "l");
+    }
+
+    /// `listen_next` (callback-only) and `open_generation` (a pair) share one
+    /// counter: interleaving them still gives every listener a distinct
+    /// number, so neither method can be implemented with its own separate
+    /// counter without this going red (review of the FU-60 design, round 2).
+    #[tokio::test]
+    async fn listen_next_and_open_generation_share_one_counter() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let a = dir.listen_next().unwrap();
+        let b = dir.open_generation().unwrap();
+        let c = dir.listen_next().unwrap();
+        let numbers: Vec<u64> = [a.path(), b.callback.path(), b.http_path.path(), c.path()]
+            .iter()
+            .map(|p| p.file_stem().unwrap().to_str().unwrap().parse().unwrap())
+            .collect();
+        let unique: std::collections::BTreeSet<u64> = numbers.iter().copied().collect();
+        // `b`'s own pair shares a number by construction (3 distinct numbers
+        // among 4 listeners: a, b's shared one, c).
+        assert_eq!(unique.len(), 3, "{numbers:?}");
+        assert_ne!(numbers[0], numbers[3], "a and c collided: {numbers:?}");
+    }
+
+    /// `MAX_SOCKET_PATH` is the longest path *accepted*: exactly at the bound
+    /// both sockets are created; one byte over, `open_generation` fails
+    /// whole, leaving neither behind (the callback path is always the longer
+    /// of the two, so it is the one that actually reaches the bound first —
+    /// design v3 originally had this boundary backwards).
+    #[tokio::test]
+    async fn open_generation_succeeds_at_the_bound_and_fails_wholly_one_byte_over() {
+        // A state directory whose `<dir>/1.sock` lands at exactly `target`
+        // bytes. Calibrated, not computed in one shot: `run.canonicalize()`
+        // inside `create` can change length (e.g. macOS `/tmp` ->
+        // `/private/tmp`) by an amount not knowable in advance, so pad once,
+        // measure, then correct by exactly the difference.
+        fn dir_with_sock_path_len(target: usize) -> (tempfile::TempDir, CallbackDir) {
+            // Calibrate against a state path that always goes through
+            // `.join(pad)` (a 1-byte pad, not skipped) — `Path::join` inserts
+            // a separator regardless of the joined component's length, so
+            // comparing against an unjoined baseline is off by one.
+            let probe = state();
+            let base_len = CallbackDir::create(&probe.path().join("y"))
+                .unwrap()
+                .path()
+                .join("1.sock")
+                .as_os_str()
+                .len();
+            let extra = (target as isize - base_len as isize).max(0) as usize;
+            let s = state();
+            let pad = "y".repeat(1 + extra);
+            let dir = CallbackDir::create(&s.path().join(pad)).unwrap();
+            let got = dir.path().join("1.sock").as_os_str().len();
+            assert_eq!(
+                got, target,
+                "calibration failed: wanted {target}, got {got}"
+            );
+            (s, dir)
+        }
+
+        let (_s, dir) = dir_with_sock_path_len(MAX_SOCKET_PATH);
+        let g = dir.open_generation().expect("exactly at the bound");
+        drop(g);
+
+        let (_s2, dir2) = dir_with_sock_path_len(MAX_SOCKET_PATH + 1);
+        let err = dir2.open_generation().expect_err("one byte over");
+        assert!(matches!(err, EndpointError::PathTooLong(_)), "{err}");
+        assert!(
+            !dir2.path().join("1.sock").exists(),
+            "the callback socket was left behind after the pair failed"
+        );
+    }
+
+    /// If the HTTP listener's bind fails after the callback socket already
+    /// bound, the callback socket is cleaned up — no orphan half of a pair —
+    /// and an unrelated file already at that `.l` name is left untouched (not
+    /// cleared and rebound).
+    #[tokio::test]
+    async fn a_partial_failure_cleans_up_its_own_half_and_leaves_others_alone() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        // Occupy `1.l` with something that is not this generation's socket.
+        std::fs::write(dir.path().join("1.l"), b"not a socket").unwrap();
+        let err = dir.open_generation().expect_err("1.l is taken");
+        assert!(matches!(err, EndpointError::Io(_)), "{err}");
+        assert!(
+            !dir.path().join("1.sock").exists(),
+            "the callback socket half of the failed pair was left behind"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("1.l")).unwrap(),
+            b"not a socket",
+            "an unrelated file at the .l name was disturbed"
+        );
+    }
+
+    /// Spawn failure after both sockets bound: dropping the raw listener and
+    /// its guard together (as `launch::start` would on any early return)
+    /// removes the `.l` path — nothing is left orphaned just because a
+    /// process was never actually started.
+    #[tokio::test]
+    async fn dropping_both_halves_of_a_never_launched_generation_leaves_no_trace() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let g = dir.open_generation().unwrap();
+        let l_path = g.http_path.path().to_owned();
+        let sock_path = g.callback.path().to_owned();
+        drop(g); // stands in for LaunchSpec/launch::start dropping on failure
+        assert!(!l_path.exists());
+        assert!(!sock_path.exists());
+    }
+
+    /// The `.l` node itself is exactly `0700`, like the callback socket
+    /// (design v4, round 3 Low: this does not follow from the directory
+    /// alone).
+    #[tokio::test]
+    async fn the_http_listen_node_is_exactly_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let g = dir.open_generation().unwrap();
+        let mode = std::fs::symlink_metadata(g.http_path.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "{mode:04o}");
+    }
+
+    /// Best-effort node check, mirroring
+    /// `a_dropped_listener_does_not_remove_someone_elses_socket`: a
+    /// `ModuleListenPath` removes its path only while the path still names
+    /// the node it bound.
+    #[tokio::test]
+    async fn a_dropped_module_listen_path_does_not_remove_a_replacement() {
+        let s = state();
+        let dir = CallbackDir::create(s.path()).unwrap();
+        let (first_listener, first_guard) = dir.http_listen_at(1).unwrap();
+        let path = first_guard.path().to_owned();
+        drop(first_listener);
+        std::fs::remove_file(&path).unwrap();
+        let (_second_listener, second_guard) = dir.http_listen_at(1).expect("the name is free");
+        drop(first_guard);
+        assert!(
+            path.exists(),
+            "dropping the first guard removed the second's socket"
+        );
+        drop(second_guard);
+        assert!(!path.exists(), "control: the second removes its own");
     }
 
     /// FU-59: once its directory and every listener made from it are gone,

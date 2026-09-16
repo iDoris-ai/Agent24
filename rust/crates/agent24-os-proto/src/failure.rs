@@ -101,28 +101,27 @@ impl std::fmt::Display for RunFailure {
     }
 }
 
-/// Binding the module's own port.
-#[must_use]
-pub fn bind(e: &std::io::Error) -> RunFailure {
-    RunFailure::new(
-        FailureKind::Setup,
-        format!("could not bind the module's port: {e}"),
-    )
-}
-
-/// Preparing this run's callback socket (`CallbackDir::listen_next`).
+/// Opening this generation's sockets (`CallbackDir::open_generation` — FU-60
+/// folded the old separate TCP-port bind into this same step, so `bind` above
+/// this comment used to exist as its own function and no longer does; nothing
+/// else called it). One call covers both the callback socket and the
+/// module's inbound listener, and from the `Result` alone a caller cannot
+/// tell which of the two failed — so the wording stays neutral, not
+/// "callback" (design v4, round 2: `open_generation` exposes one
+/// `Result<_, EndpointError>` for a pair).
 #[must_use]
 pub fn listen(e: &EndpointError) -> RunFailure {
     let kind = match e {
         EndpointError::UnsafeDirectory { .. }
         | EndpointError::PathTooLong(_)
         | EndpointError::Io(_)
-        // Not returned by `listen_next`; still the kernel's own preparation.
+        // Not returned by `open_generation`; still the kernel's own
+        // preparation, and there is no other stage to attribute it to.
         | EndpointError::Timeout
         | EndpointError::ForeignPeer { .. }
         | EndpointError::AlreadyCreated(_) => FailureKind::Setup,
     };
-    RunFailure::new(kind, format!("could not listen for the callback: {e}"))
+    RunFailure::new(kind, format!("could not open the module's sockets: {e}"))
 }
 
 /// Starting the module's process.
@@ -244,6 +243,31 @@ mod tests {
         assert_eq!(accepted, [Io, Io, Timeout, Refused, Io, Io]);
     }
 
+    /// FU-60: `open_generation` opens a pair — the callback socket and the
+    /// module's inbound listener — from one call, so a caller cannot tell
+    /// which one a bind-stage failure came from. `listen`'s own wording must
+    /// not name either — checked on the variants `open_generation` can
+    /// actually return for *either* socket's bind (`UnsafeDirectory`,
+    /// `PathTooLong`, `Io`, `AlreadyCreated`); `Timeout`/`ForeignPeer` are
+    /// genuinely callback-only (only the callback is ever accepted and
+    /// handshaken here) and correctly still say so (design v4, round 2).
+    #[test]
+    fn listen_failures_say_neither_callback_nor_listener_for_shared_variants() {
+        let shared = [
+            EndpointError::UnsafeDirectory {
+                path: "/d".into(),
+                why: "w".into(),
+            },
+            EndpointError::PathTooLong("/p".into()),
+            EndpointError::AlreadyCreated("/d".into()),
+            EndpointError::Io(io_err()),
+        ];
+        for e in &shared {
+            let text = listen(e).to_string();
+            assert!(!text.contains("callback"), "{text}");
+        }
+    }
+
     #[test]
     fn every_launch_error_is_setup() {
         let all = [
@@ -266,7 +290,6 @@ mod tests {
         for e in &all {
             assert_eq!(launch(e).kind, Setup, "{e}");
         }
-        assert_eq!(bind(&io_err()).kind, Setup);
     }
 
     #[test]
