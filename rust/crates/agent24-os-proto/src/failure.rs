@@ -72,7 +72,8 @@ impl std::fmt::Display for FailureKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFailure {
     pub kind: FailureKind,
-    /// The original message, cut to [`MAX_DETAIL_BYTES`] at a char boundary.
+    /// The original message: at most [`MAX_DETAIL_BYTES`] bytes total,
+    /// including the `…` this adds when it cuts.
     pub detail: String,
 }
 
@@ -81,7 +82,9 @@ impl RunFailure {
     pub fn new(kind: FailureKind, detail: impl std::fmt::Display) -> Self {
         let mut detail = detail.to_string();
         if detail.len() > MAX_DETAIL_BYTES {
-            let mut cut = MAX_DETAIL_BYTES;
+            // Leave room for the ellipsis so the total never exceeds the cap
+            // (review of FU-57, round 1).
+            let mut cut = MAX_DETAIL_BYTES - '…'.len_utf8();
             while !detail.is_char_boundary(cut) {
                 cut -= 1;
             }
@@ -328,7 +331,7 @@ mod tests {
     #[test]
     fn a_long_detail_is_cut_at_a_char_boundary() {
         let f = RunFailure::new(Io, "é".repeat(MAX_DETAIL_BYTES));
-        assert!(f.detail.len() <= MAX_DETAIL_BYTES + '…'.len_utf8());
+        assert!(f.detail.len() <= MAX_DETAIL_BYTES);
         assert!(f.detail.ends_with('…'));
         let short = RunFailure::new(Io, "short");
         assert_eq!(short.detail, "short");

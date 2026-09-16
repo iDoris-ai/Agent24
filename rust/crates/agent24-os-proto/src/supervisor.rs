@@ -787,12 +787,8 @@ async fn run_once(
         exited = process.exited() => {
             let failure = failure::exit(&exited);
             tracing::warn!(module = %spec.name, "before its handshake: {failure}");
-            let run = failed(failure);
-            return Ok(if finish(process, timings, &spec.name, status, slot, stop, None).await? {
-                Run::StopRequested
-            } else {
-                run
-            });
+            return ended_by_itself(process, failure, None, timings, &spec.name, status, slot, stop)
+                .await;
         }
         result = async {
             let stream = callback
@@ -926,16 +922,25 @@ async fn ended_by_itself(
     stop: &watch::Receiver<Option<Duration>>,
 ) -> Result<Run, Unconfirmed> {
     let ended_at = std::time::Instant::now();
-    let settle = (failure.kind == FailureKind::Io).then_some(&mut failure);
-    match finish(process, timings, name, status, slot, stop, settle).await {
+    // `finish` always gets the failure now (not only for `io`): if the stop
+    // itself cannot be confirmed, it logs kind and detail together with that
+    // one error line — a structured-log consumer should not have to join two
+    // lines to see why a run that could not be stopped had failed (review of
+    // FU-57, round 1).
+    match finish(
+        process,
+        timings,
+        name,
+        status,
+        slot,
+        stop,
+        Some(&mut failure),
+    )
+    .await
+    {
         Ok(true) => return Ok(Run::StopRequested),
         Ok(false) => {}
-        Err(unconfirmed) => {
-            // `StopFailed` is what the status says now; how the run had
-            // failed before that is still worth a line.
-            tracing::error!(module = name, "the run had failed before: {failure}");
-            return Err(unconfirmed);
-        }
+        Err(unconfirmed) => return Err(unconfirmed),
     }
     tracing::warn!(module = name, "run failed: {failure}");
     Ok(Run::Ended {
@@ -1019,7 +1024,7 @@ async fn finish(
     status: &watch::Sender<Status>,
     slot: &Slot,
     stop: &watch::Receiver<Option<Duration>>,
-    settle: Option<&mut RunFailure>,
+    mut settle: Option<&mut RunFailure>,
 ) -> Result<bool, Unconfirmed> {
     let record = &slot.record;
     // Revoked before `Stopping` is published: whoever sees `Stopping` must
@@ -1031,21 +1036,26 @@ async fn finish(
     // its socket closes before its exit is visible. Revoked already (above),
     // so nothing is admitted meanwhile, give the exit a moment to show
     // before SIGTERM. A stop wins over both: it goes on at once, and the
-    // `gone` below makes this run that stop.
-    if let Some(failure) = settle {
+    // `gone` below makes this run that stop. `settle` also carries the
+    // failure for the Unconfirmed log below when this is a real stop path
+    // (`None`) versus a run that ended by itself; only an `io` kind races —
+    // the others already know how they ended.
+    if let Some(failure) = settle.as_deref_mut()
+        && failure.kind == FailureKind::Io
+    {
         let mut asked = stop.clone();
         tokio::select! {
-            biased;
-            () = stop_requested(&mut asked) => {}
-            exited = process.exited() => {
-                if let Ok(exit) = exited {
-                    *failure = RunFailure::new(
-                        FailureKind::Exited,
-                        format!("the module {exit} (its callback ended first: {})", failure.detail),
-                    );
+                biased;
+                () = stop_requested(&mut asked) => {}
+                exited = process.exited() => {
+                    if let Ok(exit) = exited {
+                        *failure = RunFailure::new(
+                            FailureKind::Exited,
+                            format!("the module {exit} (its callback ended first: {})", failure.detail),
+                        );
+                    }
                 }
-            }
-            () = tokio::time::sleep(timings.exit_settle) => {}
+                () = tokio::time::sleep(timings.exit_settle) => {}
         }
     }
     // Recorded the moment the group is confirmed empty — before the wait for
@@ -1084,7 +1094,18 @@ async fn finish(
             record.group(crate::stop_record::GroupEnd::Failed);
             let error = format!("the module could not be confirmed stopped: {failed}");
             drop(failed);
-            tracing::error!(module = name, "{error}");
+            // FU-57: how the run had failed, before its stop could not be
+            // confirmed, in the same line (review round 1) — a structured
+            // log consumer should not have to join two events.
+            match settle {
+                Some(failure) => tracing::error!(
+                    module = name,
+                    kind = %failure.kind,
+                    detail = %failure.detail,
+                    "{error}"
+                ),
+                None => tracing::error!(module = name, "{error}"),
+            }
             Err(Unconfirmed(error))
         }
     }
@@ -1155,6 +1176,16 @@ if mode == "early":
     sys.exit(4)
 if mode == "badtoken":
     token = "0" * len(token)
+if mode == "crash_once":
+    # First invocation: crash after the handshake, like "crash". Every later
+    # one: never connect, so the attempt stays in `Starting` for its whole
+    # startup timeout — a long, stable window a test can wait out without
+    # racing a transient state (FU-57, review round 1).
+    marker = os.path.join(data, "crashed_once")
+    if os.path.exists(marker):
+        time.sleep(60)
+        sys.exit(0)
+    open(marker, "w").close()
 if mode == "escape":
     import subprocess
     p = subprocess.Popen(["sleep", "30"], start_new_session=True)
@@ -1169,6 +1200,8 @@ s.sendall((json.dumps(req) + "\n").encode())
 f = s.makefile("rb")
 f.readline()
 if mode == "crash":
+    sys.exit(3)
+if mode == "crash_once":
     sys.exit(3)
 if mode == "gated":
     # Hang up the callback, then exit only once the test says so: whether
@@ -2628,8 +2661,7 @@ sys.exit(0)
     /// module hangs up its callback and exits only when released. Released
     /// inside a long window → `exited`; never released with no window →
     /// `io`. While the window is open the generation is already revoked
-    /// (review of the FU-57 design, H1), and `after` carries the failure into
-    /// the next start.
+    /// (review of the FU-57 design, H1).
     #[tokio::test]
     async fn a_crash_that_hangs_up_first_is_still_reported_as_an_exit() {
         let f = fixture("gated");
@@ -2641,7 +2673,7 @@ sys.exit(0)
             no_methods(),
             Timings {
                 exit_settle: Duration::from_secs(30),
-                backoff_base: Duration::from_millis(10),
+                backoff_base: Duration::from_secs(600),
                 ..fast()
             },
         );
@@ -2660,17 +2692,6 @@ sys.exit(0)
         };
         assert_eq!(last.kind, FailureKind::Exited, "{last}");
         assert!(last.detail.contains("code 3"), "{last}");
-        let next = until(&mut rx, "the next start", |s| {
-            matches!(s, Status::Starting { attempt: 2, .. })
-        })
-        .await;
-        assert_eq!(
-            next,
-            Status::Starting {
-                attempt: 2,
-                after: Some(last)
-            }
-        );
         stop(handle).await;
 
         let hung = first_failure(
@@ -2722,6 +2743,50 @@ sys.exit(0)
             !text.contains("module run ended; restarting"),
             "a stopped run was counted as a failure:\n{text}"
         );
+    }
+
+    /// `Starting.after` carries the previous run's failure into the next
+    /// attempt — observed without racing a transient watch value: the
+    /// "crash_once" fixture crashes on its first run and then never connects
+    /// again, so the second attempt sits in `Starting` for its whole (long)
+    /// startup timeout — a stable window, not a flash (review of FU-57,
+    /// round 1: the earlier version of this check raced a fixture that could
+    /// crash again immediately, and could miss the transient state).
+    #[tokio::test]
+    async fn starting_after_a_failure_carries_it_into_the_next_attempt() {
+        let f = fixture("crash_once");
+        let handle = sup(
+            f.spec.clone(),
+            f.dir.clone(),
+            Current::new(Generation::starting()),
+            no_methods(),
+            Timings {
+                startup: Duration::from_secs(600),
+                backoff_base: Duration::from_millis(10),
+                ..fast()
+            },
+        );
+        let mut rx = handle.subscribe();
+        let got = until(&mut rx, "Backoff", |s| matches!(s, Status::Backoff { .. })).await;
+        let Status::Backoff { last, .. } = got else {
+            unreachable!()
+        };
+        assert_eq!(last.kind, FailureKind::Exited, "{last}");
+        assert!(last.detail.contains("code 3"), "{last}");
+        // The second attempt never connects, so it is stuck in `Starting` for
+        // the full `startup` timeout above — plenty of margin to observe it.
+        let next = until(&mut rx, "the next start", |s| {
+            matches!(s, Status::Starting { attempt: 2, .. })
+        })
+        .await;
+        assert_eq!(
+            next,
+            Status::Starting {
+                attempt: 2,
+                after: Some(last)
+            }
+        );
+        stop(handle).await;
     }
 
     /// The first start has nothing before it.
