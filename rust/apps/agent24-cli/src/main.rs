@@ -103,8 +103,13 @@ enum OsAction {
     },
     /// Remove an installed domain-OS package (takes effect at the next daemon start)
     ///
-    /// A module of that package that is running now keeps running, but cannot
-    /// be restarted: if it exits before the next daemon start, it stays down.
+    /// File removal works with the daemon down, same as install. If a daemon is
+    /// reachable, a running module of it is also told to stop now (best-effort).
+    /// If no daemon was reachable at all, a module of it still running elsewhere
+    /// keeps serving until its own next restart, which will report
+    /// `package_changed` instead of crash-looping. If a daemon WAS reachable but
+    /// could not confirm the stop, `agent24 os list` shows why — that module will
+    /// not restart on its own from this.
     Uninstall { name: String },
 }
 
@@ -287,6 +292,21 @@ async fn finish(mut ep: Endpoint) {
     }
 }
 
+/// Attaches to an already-running, healthy daemon; NEVER starts one (unlike
+/// `connect`, which falls back to `spawn_daemon` when none is found) — for a
+/// best-effort step (FU-61's `uninstall` hot-disable) that must not bring up
+/// a fresh ephemeral daemon, which could run the very package being removed.
+/// `None` if no live daemon is discoverable or healthy.
+async fn attach_only() -> Option<Endpoint> {
+    let state = state_file::read_live()?;
+    let base = format!("http://127.0.0.1:{}", state.port);
+    health_ok(&base, &state.token).await.then_some(Endpoint {
+        base,
+        token: state.token,
+        child: None,
+    })
+}
+
 /// Serve agent24d as an MCP server over stdio (E4). Attaches to the running
 /// daemon (or a private ephemeral one) and proxies a curated, host-gated surface
 /// to it. Runs until the MCP client closes stdin.
@@ -375,13 +395,37 @@ async fn cmd_models() -> Result<(), String> {
     out
 }
 
-/// `agent24 os install` / `os uninstall` — the two that do NOT go through the
-/// daemon.
+/// Where installed packages live, honoring `A24_OS_PACKAGES` over `$HOME`.
+///
+/// The state dir is OPTIONAL here, and passing it as an option rather than
+/// resolving it first is the whole difference: `A24_OS_PACKAGES` is consulted
+/// before it, so a container or CI runner with the override set and no `HOME`
+/// installs into the directory it asked for. Resolving `state_dir()` first
+/// reimposed the `HOME` requirement that the override exists to lift, and
+/// reported it with a message identical to the one for "neither is set" —
+/// indistinguishable outputs for two situations, one of which was wrong.
+fn packages_root() -> Result<PathBuf, String> {
+    agent24_os_packages::resolve_packages_root(
+        agent24_os_packages::env_override().as_deref(),
+        state_file::state_dir().as_deref(),
+        false,
+    )
+    .map_err(|e| {
+        format!(
+            "{e} (set HOME, or set {})",
+            agent24_os_packages::PACKAGES_ROOT_ENV
+        )
+    })
+}
+
+/// `agent24 os install` — does NOT go through the daemon.
 ///
 /// Installing writes files into the packages root; the daemon reads them when it
 /// next starts. Making this an RPC would make writing depend on someone reading,
-/// and would mean a module cannot be installed or removed while the daemon is
-/// down — which is exactly when an operator is most likely to be fixing one.
+/// and would mean a module cannot be installed while the daemon is down — which
+/// is exactly when an operator is most likely to be fixing one. `uninstall` is
+/// handled separately by [`cmd_uninstall`] (FU-61: it also does a best-effort hot
+/// stop of a running daemon, which `install` never needs to).
 ///
 /// Every decision lives in `agent24-os-packages`: which directory to write to,
 /// what the installed name is (the manifest's, not the source directory's), and
@@ -389,25 +433,9 @@ async fn cmd_models() -> Result<(), String> {
 /// prints the result. If it ever needs to compute a path or check for a duplicate
 /// itself, the seam is in the wrong place and that logic belongs in the library.
 fn os_local(action: &OsAction) -> Option<Result<(), String>> {
-    // The state dir is OPTIONAL here, and passing it as an option rather than
-    // resolving it first is the whole difference: `A24_OS_PACKAGES` is consulted
-    // before it, so a container or CI runner with the override set and no `HOME`
-    // installs into the directory it asked for. Resolving `state_dir()` first
-    // reimposed the `HOME` requirement that the override exists to lift, and
-    // reported it with a message identical to the one for "neither is set" —
-    // indistinguishable outputs for two situations, one of which was wrong.
-    let root = match agent24_os_packages::resolve_packages_root(
-        agent24_os_packages::env_override().as_deref(),
-        state_file::state_dir().as_deref(),
-        false,
-    ) {
+    let root = match packages_root() {
         Ok(root) => root,
-        Err(e) => {
-            return Some(Err(format!(
-                "{e} (set HOME, or set {})",
-                agent24_os_packages::PACKAGES_ROOT_ENV
-            )));
-        }
+        Err(e) => return Some(Err(e)),
     };
     match action {
         OsAction::Install { path } => Some(
@@ -425,25 +453,96 @@ fn os_local(action: &OsAction) -> Option<Result<(), String>> {
                 })
                 .map_err(|e| e.to_string()),
         ),
-        OsAction::Uninstall { name } => Some(
-            agent24_os_packages::install::uninstall(name, &root)
-                .map(|removed| {
-                    if removed {
-                        println!("removed {name}");
-                        println!("  it takes effect at the next daemon start");
-                        println!(
-                            "  (a module of it running now keeps running, but cannot be restarted if it exits)"
-                        );
-                    } else {
-                        // Not an error: the end state the operator asked for is the
-                        // one they have. Saying so beats a failure they must decide
-                        // to ignore.
-                        println!("{name} was not installed; nothing to remove");
-                    }
-                })
-                .map_err(|e| e.to_string()),
-        ),
+        // Handled before this function is ever called; see `cmd_uninstall`.
+        OsAction::Uninstall { .. } => None,
         _ => None,
+    }
+}
+
+/// `agent24 os uninstall` — file removal decides success or failure by
+/// itself (unchanged contract: works with the daemon down); hot-disable
+/// (FU-61) is a best-effort step tried ONLY after a real removal, whose
+/// outcome can only add an informational line, never flip the `Result` this
+/// function already decided. This split (rather than folding into
+/// `os_local`) exists because the daemon call needs the REAL `bool`
+/// `install::uninstall` returns (was something actually removed just now?)
+/// — `os_local`'s shared `Option<Result<(), String>>` shape has nowhere to
+/// carry that.
+async fn cmd_uninstall(name: &str) -> Result<(), String> {
+    let root = packages_root()?;
+    match agent24_os_packages::install::uninstall(name, &root) {
+        Err(e) => Err(e.to_string()), // nothing removed: no hot-stop, ever
+        Ok(false) => {
+            // Not an error: the end state the operator asked for is the one
+            // they have. Saying so beats a failure they must decide to
+            // ignore. Idempotent: nothing NEW was removed, so there is
+            // nothing for a hot-stop to respond to.
+            println!("{name} was not installed; nothing to remove");
+            Ok(())
+        }
+        Ok(true) => {
+            println!("removed {name}");
+            println!("  it takes effect at the next daemon start");
+            hot_disable_best_effort(name).await;
+            Ok(())
+        }
+    }
+}
+
+/// Best-effort: tells an already-running daemon to stop serving `name` now,
+/// rather than leaving a healthy module to keep answering until it next
+/// happens to restart (which the daemon's own re-check then reports as
+/// `package_changed` — but only for a module that DOES eventually restart;
+/// for a long-healthy one that could be indefinite). Never starts a daemon
+/// (`attach_only`, not `connect`) and never turns into an `Err` — by the
+/// time this runs, `cmd_uninstall`'s `Ok(())` is already final.
+async fn hot_disable_best_effort(name: &str) {
+    let Some(ep) = attach_only().await else {
+        println!(
+            "  no reachable daemon right now; a module of it running elsewhere will report \
+             `package_changed` after its own next restart"
+        );
+        return;
+    };
+    // POST .../stop, NOT the PATCH `agent24 os disable` uses — that one
+    // persists `enabled:false` into `os.json`, which is actively wrong for a
+    // package about to vanish from discovery entirely (it would trip
+    // `unknown_disabled`'s fail-closed check on the daemon's next start and
+    // degrade every OTHER module too). This is a one-shot "stop it now",
+    // nothing written for next time.
+    let sent = bearer(
+        &ep,
+        client().post(format!("{}/api/v1/os/{name}/stop", ep.base)),
+    )
+    .timeout(Duration::from_secs(5))
+    .send()
+    .await;
+    match sent {
+        // 2xx covers the daemon's `Stopping`/`Already`/`NotRunning` alike —
+        // the body alone does not say which, so this must not claim "it was
+        // running and I stopped it".
+        Ok(res) if res.status().is_success() => println!(
+            "  told the running daemon to stop serving it — `agent24 os list` shows whether a \
+             running module was actually there to stop"
+        ),
+        // `disable_pending` / `stop_failed`: the stop was handed off before
+        // either of these is returned, and nothing was persisted either
+        // way — this module will not restart on its own from a config
+        // change it never received. Relay the daemon's own message.
+        Ok(res) => {
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let msg = body["error"]["message"].as_str().unwrap_or("(no detail)");
+            println!("  the daemon could not fully confirm the stop: {msg}");
+        }
+        // Genuinely ambiguous: the request may never have reached the
+        // daemon, or it may have applied the change and the response was
+        // lost. Neither "not stopped" nor "will report package_changed" can
+        // be asserted here — say so plainly instead of guessing.
+        Err(e) => println!(
+            "  could not confirm the daemon received this ({e}) — if it did not, a module of \
+             it still running there will report `package_changed` after its own next restart; \
+             if it did, that module has already been told to stop"
+        ),
     }
 }
 
@@ -453,8 +552,13 @@ fn os_local(action: &OsAction) -> Option<Result<(), String>> {
 /// `os.json`. That is what makes `agent24 os disable sin09` fail HERE, naming the
 /// modules that do exist, instead of writing a file that breaks the registry at
 /// the next start. `install` / `uninstall` are different in kind and are handled
-/// by [`os_local`] before any of that.
+/// before any of that — `install` by [`os_local`], `uninstall` by
+/// [`cmd_uninstall`] (FU-61: it also does a best-effort hot stop, which needs
+/// the daemon call `os_local`'s shared return shape cannot carry).
 async fn cmd_os(action: OsAction) -> Result<(), String> {
+    if let OsAction::Uninstall { name } = &action {
+        return cmd_uninstall(name).await;
+    }
     if let Some(done) = os_local(&action) {
         return done;
     }
@@ -599,6 +703,51 @@ fn print_os(list: &agent24_protocol::DomainOsList) {
     }
 }
 
+/// How long `agent24 daemon stop` waits for the old daemon to actually
+/// release its singleton lock before giving up and saying so. `POST
+/// /shutdown` returns as soon as shutdown is REQUESTED — draining modules,
+/// persisting the shutdown summary and the runtime's own teardown all still
+/// run after that. `lifecycle.rs`'s real worst case is ~15.7s (10s drain +
+/// 5s stop grace + ~0.5s persistence/teardown margin, modules draining
+/// concurrently via a `JoinSet`, not sequentially); 30s leaves close to a
+/// full extra margin over that on top.
+const STOP_CONFIRM_BUDGET: Duration = Duration::from_secs(30);
+
+/// Waits until the daemon that was just asked to stop has actually released
+/// its singleton lock — the SAME lock `agent24 daemon start` will contend
+/// for — rather than trusting `POST /shutdown`'s immediate `202`. Health
+/// going false is not enough evidence: it only means the accept loop closed,
+/// not that the process exited or released the lock (a daemon started by
+/// `agent24 service install` may also still be mid-teardown after that,
+/// which is a distinct, tracked limitation — see FU-68 in followups.md, not
+/// solved here). Probing the lock directly and releasing it at once is a
+/// cheap, non-blocking, cross-process check (`try_lock_exclusive`) — the
+/// exact same test `daemon start`'s own spawn path needs to pass.
+async fn wait_for_stop(state: &DaemonState) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + STOP_CONFIRM_BUDGET;
+    loop {
+        match agent24_protocol::state_file::try_acquire_singleton() {
+            Ok(Some(lock)) => {
+                drop(lock); // release at once — this call only probes
+                println!("stopped (pid {}, port {})", state.pid, state.port);
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("could not check whether it stopped: {e}")),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "shutdown requested (pid {}, port {}) but it did not release its lock \
+                 within {}s — check its logs before starting a new one",
+                state.pid,
+                state.port,
+                STOP_CONFIRM_BUDGET.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
     match action {
         DaemonAction::Start => {
@@ -713,13 +862,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     .send()
                     .await;
                 match res {
-                    Ok(r) if r.status().is_success() => {
-                        println!(
-                            "shutdown requested (pid {}, port {})",
-                            state.pid, state.port
-                        );
-                        Ok(())
-                    }
+                    Ok(r) if r.status().is_success() => wait_for_stop(&state).await,
                     Ok(r) => Err(format!("daemon refused shutdown: {}", r.status())),
                     Err(_) => Err(format!(
                         "daemon not responding on port {} — if it is truly gone, remove ~/.agent24/daemon.json",

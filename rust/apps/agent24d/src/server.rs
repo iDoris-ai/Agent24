@@ -672,6 +672,12 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/os/{name}",
             axum::routing::patch(crate::os_routes::patch_os),
         )
+        // FU-61: transient stop, does not touch os.json (unlike the PATCH
+        // above) — used by `agent24 os uninstall`'s hot-disable step.
+        .route(
+            "/api/v1/os/{name}/stop",
+            axum::routing::post(crate::os_routes::stop_now_os),
+        )
         .route(
             "/api/v1/shutdown",
             axum::routing::post(shutdown_handler).get(shutdown_report),
