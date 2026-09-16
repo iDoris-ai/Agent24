@@ -134,7 +134,8 @@ export interface ErrorBody {
   /**
    * Open enum: invalid_request, unauthorized, not_found, conflict,
    * approval_already_resolved, provider_unavailable,
-   * run_not_cancellable (reserved), payload_too_large, internal
+   * run_not_cancellable (reserved), payload_too_large, internal,
+   * admission_refused, module_panicked, module_killed
    */
   code: string;
   details?: {
