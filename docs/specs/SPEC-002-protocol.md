@@ -195,6 +195,8 @@ agent24d stdout 输出一行: {"type":"ready","port":49317,"token":"<32B 随机>
 `approval_already_resolved` `provider_unavailable` `run_not_cancellable`(保留) `internal`。
 WS 层错误用 `run.failed` / close code，不另设错误信封。
 
+`hint`（可选，ERR-1）：有具体下一步时才带——「该做什么」，和 `message`（「发生了什么」）分开表达，不折进 `message` 里。「连不上模块」这一大类应答（`module_not_ready` / `module_draining` / `module_stopping` / `circuit_breaker_tripped` / `package_changed` / `stop_failed` / `disable_pending`，以及 FU-64 新增的 `upstream_connection_closed`）统一带 `hint`；CLI 原样打印，不加自己的措辞包装。
+
 ## 6. 兼容与演进规则
 
 - v1 内只做**加法**（新端点/新可选字段/新事件类型）；破坏性变更升 v2 前缀

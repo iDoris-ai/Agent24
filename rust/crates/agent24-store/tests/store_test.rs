@@ -167,6 +167,7 @@ async fn run_failure_records_error_body() {
                 error: Some(ErrorBody {
                     code: "provider_unavailable".to_owned(),
                     message: "no provider".to_owned(),
+                    hint: None,
                     details: None,
                 }),
                 ended_at: Some(TS.to_owned()),

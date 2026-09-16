@@ -113,6 +113,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 /// Where one generation is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +505,11 @@ pub struct Current {
     slot: Mutex<Arc<Generation>>,
     /// Whether a supervisor holds this slot (see `claim`).
     held: std::sync::atomic::AtomicBool,
+    /// The status feed of whichever supervisor currently (or most recently)
+    /// claimed this slot (ERR-1/D) — attached from inside `supervise()`
+    /// itself, not by a caller, so it can never be forgotten (design doc,
+    /// Codex round 1 High 7). `None` until a supervisor has ever attached one.
+    status: Mutex<Option<watch::Receiver<crate::supervisor::Status>>>,
 }
 
 impl Current {
@@ -512,7 +518,31 @@ impl Current {
         Arc::new(Self {
             slot: Mutex::new(generation),
             held: std::sync::atomic::AtomicBool::new(false),
+            status: Mutex::new(None),
         })
+    }
+
+    /// Attach the status feed for the supervisor that just claimed this slot.
+    /// Called once from inside `supervisor::supervise()`, right after it
+    /// builds its own `watch::channel` — see the module doc on why this is
+    /// not a step callers opt into.
+    pub(crate) fn attach_status(&self, status: watch::Receiver<crate::supervisor::Status>) {
+        *self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(status);
+    }
+
+    /// The most recently observed `Status` of whichever supervisor has ever
+    /// claimed this slot. `None` only for a `Current` no supervisor has ever
+    /// been attached to (e.g. a bare test fixture built with `new` alone).
+    #[must_use]
+    pub fn status(&self) -> Option<crate::supervisor::Status> {
+        self.status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|rx| rx.borrow().clone())
     }
 
     /// Become the one supervisor of this slot and install `placeholder`, or

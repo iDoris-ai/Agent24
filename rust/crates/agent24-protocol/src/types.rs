@@ -180,11 +180,17 @@ pub struct ErrorBody {
     /// run_not_cancellable (reserved), payload_too_large, internal
     pub code: String,
     pub message: String,
+    /// What to do about it, when there is a concrete next step (ERR-1). Kept
+    /// separate from `message` (what happened) rather than folded into it or
+    /// into `details`, so a client can render the two differently and a test
+    /// can assert on one without parsing the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Map<String, Value>>,
 }
 
-/// HTTP 4xx/5xx body: `{ "error": { code, message, details? } }`
+/// HTTP 4xx/5xx body: `{ "error": { code, message, hint?, details? } }`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorEnvelope {
     pub error: ErrorBody,

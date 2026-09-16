@@ -912,6 +912,11 @@ export interface components {
              */
             code: string;
             message: string;
+            /**
+             * @description What to do about it, when there is a concrete next step (ERR-1).
+             *     Kept separate from `message` (what happened).
+             */
+            hint?: string;
             details?: {
                 [key: string]: unknown;
             };

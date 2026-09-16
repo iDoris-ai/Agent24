@@ -1564,6 +1564,11 @@ components:
             run_not_cancellable (reserved), internal
         message:
           type: string
+        hint:
+          type: string
+          description: |
+            What to do about it, when there is a concrete next step (ERR-1).
+            Kept separate from `message` (what happened).
         details:
           type: object
           additionalProperties: true

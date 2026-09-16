@@ -157,6 +157,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     error: ErrorBody {
                         code: code.to_owned(),
                         message: message.clone(),
+                        hint: None,
                         details: None,
                     },
                 }));

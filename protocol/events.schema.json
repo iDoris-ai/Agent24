@@ -373,6 +373,13 @@
           ],
           "additionalProperties": true
         },
+        "hint": {
+          "description": "What to do about it, when there is a concrete next step (ERR-1). Kept\nseparate from `message` (what happened) rather than folded into it or\ninto `details`, so a client can render the two differently and a test\ncan assert on one without parsing the other.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "message": {
           "type": "string"
         }
