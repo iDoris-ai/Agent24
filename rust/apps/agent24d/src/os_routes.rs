@@ -1342,6 +1342,15 @@ mod tests {
         let token = st.token.to_string();
         let router = crate::server::build_router_with_modules(st, axum::Router::new());
 
+        // FU-61 (round-3 code review Medium): `settled_and_reconciled_calls_
+        // last_look` above proves the HELPER calls `last_look` — it does not
+        // prove `stop_now_os` calls the HELPER rather than bypassing it
+        // (e.g. reverting to a bare `settle(...).await`). Asserting the
+        // counter delta around a real `POST .../stop` closes that gap: it
+        // is the same runtime thread throughout (`#[tokio::test]`'s default
+        // current-thread flavor, matching `LAST_LOOK_CALLS`'s thread-local
+        // isolation), so the delta is exactly this call's contribution.
+        let before = LAST_LOOK_CALLS.with(std::cell::Cell::get);
         let res = router
             .oneshot(
                 Request::builder()
@@ -1353,6 +1362,11 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            LAST_LOOK_CALLS.with(std::cell::Cell::get),
+            before + 1,
+            "stop_now_os must reach last_look through settled_and_reconciled"
+        );
         assert!(res.status().is_success(), "{}", res.status());
         let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
             .await

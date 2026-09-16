@@ -17,6 +17,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -74,16 +76,20 @@ fn alive(pid: i32) -> bool {
         .success()
 }
 
-/// A package whose module writes its own pid to `<data>/pid` only AFTER its
-/// handshake completes — so waiting for that file is waiting for a
-/// genuinely admitted, running module, not merely `Status::Starting`
-/// (which `os list` also renders as `[mounted]` — round-2 code review
-/// Medium 1). `slow_exit`: if true, the module sleeps briefly on SIGTERM
-/// before exiting, giving `agent24 daemon stop` a real drain/grace window
-/// to race — without this, a daemon with nothing to stop shuts down fast
-/// enough that even the OLD fire-and-forget `daemon stop` would happen to
-/// print after the process was already gone, defeating the point of
-/// testing it.
+/// A package whose module answers real HTTP on the listener the kernel
+/// hands it (`A24_LISTEN_FD`) and writes its own pid to `<data>/pid` before
+/// serving — so a caller that gets a real 200 through the proxy has PROOF
+/// the generation is `Running` and admitting requests, not merely
+/// `Status::Starting` (which `os list` also renders as `[mounted]`, and
+/// whose PID a bare post-handshake write would race — round-3 code review
+/// Medium 1: the handshake response is sent by the daemon BEFORE it marks
+/// the generation ready, so a pid file written right after reading that
+/// response does not by itself prove admission is open yet). `slow_exit`:
+/// if true, the module sleeps briefly on SIGTERM before exiting, giving
+/// `agent24 daemon stop` a real drain/grace window to race — without this,
+/// a daemon with nothing to stop shuts down fast enough that even the OLD
+/// fire-and-forget `daemon stop` would happen to print after the process
+/// was already gone, defeating the point of testing it.
 fn write_package(home: &Path, name: &str, slow_exit: bool) -> std::path::PathBuf {
     let dir = home.join("srcpkg").join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -106,9 +112,25 @@ fn write_package(home: &Path, name: &str, slow_exit: bool) -> std::path::PathBuf
     std::fs::write(
         dir.join("mod.py"),
         format!(
-            r#"import hashlib, json, os, socket
+            r#"import hashlib, json, os, socket, threading
 {sleep_on_term}with open("domain-os.yml", "rb") as f:
     digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+with open(os.path.join(os.environ["A24_DATA_DIR"], "pid"), "w") as pf:
+    pf.write(str(os.getpid()))
+listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+def serve():
+    while True:
+        conn, _ = listener.accept()
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            head += chunk
+        body = b"hello"
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
 cb = socket.socket(socket.AF_UNIX)
 cb.connect(os.environ["A24_CALLBACK_SOCK"])
 req = {{"jsonrpc": "2.0", "id": "1", "method": "initialize", "params": {{
@@ -118,8 +140,6 @@ req = {{"jsonrpc": "2.0", "id": "1", "method": "initialize", "params": {{
 cb.sendall((json.dumps(req) + "\n").encode())
 f = cb.makefile("rb")
 f.readline()
-with open(os.path.join(os.environ["A24_DATA_DIR"], "pid"), "w") as pf:
-    pf.write(str(os.getpid()))
 while f.readline():
     pass
 "#
@@ -129,24 +149,58 @@ while f.readline():
     dir
 }
 
-/// Waits for `name`'s module to have completed its handshake (its pid file
-/// exists) and returns that pid.
+/// This daemon's `(port, token)`, from the state file `agent24 daemon
+/// start` just wrote.
+fn daemon_state(home: &Path) -> (u16, String) {
+    let s = std::fs::read_to_string(home.join(".agent24/daemon.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    (
+        u16::try_from(v["port"].as_u64().unwrap()).unwrap(),
+        v["token"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// `GET path` through the daemon's proxy: `(status, body)`, or `None` if
+/// unreachable. Mirrors `agent24d`'s own `tests/daemon_modules.rs::get`.
+fn get(port: u16, token: &str, path: &str) -> Option<(u16, String)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+         connection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok()?;
+    let status = raw.split(' ').nth(1)?.parse().ok()?;
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_owned())?;
+    Some((status, body))
+}
+
+/// Waits until `name`'s module answers a real request through the proxy —
+/// unambiguous proof its generation is `Running`, not `Starting` — and
+/// returns its pid (written before it started serving, so it is already on
+/// disk by the time a request can succeed).
 fn wait_for_running_pid(home: &Path, name: &str) -> i32 {
-    let pid_file = home.join(".agent24/os").join(name).join("pid");
     let by = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok(s) = std::fs::read_to_string(&pid_file)
-            && let Ok(pid) = s.trim().parse()
-        {
-            return pid;
+        let (port, token) = daemon_state(home);
+        if let Some((200, body)) = get(port, &token, &format!("/api/v1/{name}/hi")) {
+            assert_eq!(body, "hello");
+            break;
         }
         assert!(
             Instant::now() < by,
-            "{name} never completed its handshake (no pid file at {})",
-            pid_file.display()
+            "{name} never answered a real request through the proxy"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    std::fs::read_to_string(home.join(".agent24/os").join(name).join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 /// Kills the daemon this test started, whatever happens — a failing
@@ -155,25 +209,59 @@ fn wait_for_running_pid(home: &Path, name: &str) -> i32 {
 /// make the daemon's own pid disappear promptly (a hung/unhealthy daemon,
 /// or an assertion firing mid-drain), force-kills it directly — mirroring
 /// `agent24d`'s own `tests/daemon_modules.rs::Running` guard, which does
-/// not trust a graceful path to always work either.
+/// not trust a graceful path to always work either. `pid` is captured from
+/// `daemon start`'s own output at construction time, NOT re-read from
+/// `daemon.json` during `drop` (round-3 code review Low: the daemon
+/// deletes that file at the very start of its own shutdown, before
+/// draining/stopping modules — reading it here would usually find nothing
+/// to fall back on exactly when the fallback is needed).
 struct Daemon<'a> {
     home: &'a Path,
+    pid: i32,
+}
+
+/// Parses a pid out of a CLI message shaped like "...(pid N, port M)" —
+/// both `daemon start`'s "daemon started" and "daemon already running"
+/// lines use it.
+fn parse_pid(out: &str) -> i32 {
+    out.split("pid ")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse a pid out of: {out}"))
+}
+
+impl<'a> Daemon<'a> {
+    /// Starts the daemon and wraps it, parsing its pid out of `daemon
+    /// start`'s own success line ("daemon started (pid N, port M)").
+    fn start(home: &'a Path) -> Self {
+        let (ok, out) = run(home, &["daemon", "start"]);
+        assert!(ok, "{out}");
+        Self {
+            home,
+            pid: parse_pid(&out),
+        }
+    }
+
+    /// Wraps an already-started daemon (the caller already ran `daemon
+    /// start` itself, typically to assert on its exact output) purely for
+    /// the cleanup this guard's `Drop` gives.
+    fn attached(home: &'a Path, out: &str) -> Self {
+        Self {
+            home,
+            pid: parse_pid(out),
+        }
+    }
 }
 
 impl Drop for Daemon<'_> {
     fn drop(&mut self) {
         let _ = run(self.home, &["daemon", "stop"]);
-        if let Ok(s) = std::fs::read_to_string(self.home.join(".agent24/daemon.json"))
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
-            && let Some(pid) = v["pid"].as_i64()
-        {
-            let pid = pid as i32;
-            if alive(pid) {
-                let _ = Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
+        if alive(self.pid) {
+            let _ = Command::new("kill")
+                .args(["-KILL", &self.pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status();
         }
     }
 }
@@ -194,9 +282,7 @@ fn uninstall_hot_stops_a_running_module_and_leaves_no_tombstone() {
     let (ok, out) = run(home.path(), &["os", "install", &src.to_string_lossy()]);
     assert!(ok, "{out}");
 
-    let (ok, out) = run(home.path(), &["daemon", "start"]);
-    assert!(ok, "{out}");
-    let _daemon = Daemon { home: home.path() };
+    let _daemon = Daemon::start(home.path());
 
     // Proof the module is genuinely running (handshake completed), not
     // merely `Status::Starting` — which `os list` also renders as
@@ -244,9 +330,7 @@ fn uninstall_hot_stops_a_running_module_and_leaves_no_tombstone() {
     // somewhere in the output" (round-2 code review Medium 2).
     let (ok, _) = run(home.path(), &["daemon", "stop"]);
     assert!(ok);
-    let (ok, out) = run(home.path(), &["daemon", "start"]);
-    assert!(ok, "{out}");
-    let _daemon2 = Daemon { home: home.path() };
+    let _daemon2 = Daemon::start(home.path());
     let (ok, out) = run(home.path(), &["os", "list"]);
     assert!(ok, "{out}");
     assert!(
@@ -326,9 +410,7 @@ fn daemon_stop_waits_for_the_lock_before_reporting_success() {
     let src = write_package(home.path(), "fu61demo", true);
     let (ok, out) = run(home.path(), &["os", "install", &src.to_string_lossy()]);
     assert!(ok, "{out}");
-    let (ok, out) = run(home.path(), &["daemon", "start"]);
-    assert!(ok, "{out}");
-    let _daemon = Daemon { home: home.path() };
+    let _daemon = Daemon::start(home.path());
     wait_for_running_pid(home.path(), "fu61demo");
 
     let (ok, out) = run(home.path(), &["daemon", "stop"]);
@@ -346,5 +428,5 @@ fn daemon_stop_waits_for_the_lock_before_reporting_success() {
     let (ok, out) = run(home.path(), &["daemon", "start"]);
     assert!(ok, "daemon start raced the lock right after stop: {out}");
     assert!(out.contains("daemon started"), "{out}");
-    let _daemon2 = Daemon { home: home.path() };
+    let _daemon2 = Daemon::attached(home.path(), &out);
 }
