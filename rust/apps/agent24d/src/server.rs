@@ -816,6 +816,15 @@ pub async fn serve(
     } else {
         agent24_protocol::state_file::state_dir().map(|state| {
             let run = crate::lifecycle::run_dir(&state);
+            // FU-67: this process now holds the singleton lock, so any temp
+            // file a prior life of this same daemon left behind is safe to
+            // sweep here — but a predecessor's shutdown `persist` can still
+            // be mid-write for a while after it dropped the lock (its own
+            // timeout, worst case tens of seconds under a raised budget), so
+            // the sweep itself age-gates what it touches; see
+            // `lifecycle::ORPHAN_MIN_AGE`, not "nothing else can be writing
+            // one" — that was never quite true.
+            crate::lifecycle::sweep_orphaned_temp_files(&run);
             let (previous, last) = crate::lifecycle::evidence(&run);
             if let Some(warning) = previous.warning(&run) {
                 tracing::warn!("{warning}");
