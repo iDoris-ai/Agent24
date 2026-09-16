@@ -1211,7 +1211,13 @@ mod tests {
             )
             .await
             .expect("the connect hung: something still holds the listener");
-            let _ = p.stop(std::time::Duration::from_millis(100)).await;
+            // Must succeed — a `StopFailed` still owns and drops the process
+            // (and so the guard) on its own error path, which would let this
+            // test's `NotFound` assertion pass for the wrong reason (review
+            // of FU-60, round 2).
+            p.stop(std::time::Duration::from_millis(100))
+                .await
+                .expect("stop must succeed");
             if connect.is_err() {
                 // `stop` above dropped `p` and, with it, the guard: the path
                 // is gone now, and a connect after this point is `NotFound`,
