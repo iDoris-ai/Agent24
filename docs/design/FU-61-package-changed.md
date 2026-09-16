@@ -1,6 +1,6 @@
 # FU-61 —— 包在运行中被卸载或原地替换
 
-> 状态：设计稿 v3（v1 → v2：Codex 第 1 轮 6 条 High、5 条 Medium、1 条 Low 全部采纳；v2 → v3：Codex 第 2 轮 1 条 High（部分，恢复命令本身不可靠）、3 条 Medium（返回类型对不上、PATCH 结果文案仍不准、CLI 判据矩阵仍缺）、2 条 Low 全部采纳，见文末「v2 → v3 改动」）。来源：`followups.md` FU-61；ME3-NEXT 执行队列第三段（2026-09-13 用户裁决：按建议「检测变更、报需要重启」+ `uninstall` 先热 disable，不做快照）。
+> 状态：设计稿 v5（v1 → v2：Codex 第 1 轮 6 条 High、5 条 Medium、1 条 Low 全部采纳；v2 → v3：第 2 轮 1 条 High（部分）、3 条 Medium、2 条 Low 全部采纳；v3 → v4：第 3 轮 2 条 High（1 条全新的 tombstone、1 条 stop oracle 仍破）、1 条 Medium（launchd 脱管，记为 FU-68）、1 条 Low 全部采纳；v4 → v5：第 4 轮 1 条 Medium（`stop_now_os` 漏了 `last_look` 复核）、4 条 Low 全部采纳，见文末各段改动记录）。来源：`followups.md` FU-61；ME3-NEXT 执行队列第三段（2026-09-13 用户裁决：按建议「检测变更、报需要重启」+ `uninstall` 先热 disable，不做快照）。
 > **带状态机：先写语义说明，再写代码**（`docs/agent/tasks.md` 的硬规则，SUP-5 的教训）。
 
 ## 问题
@@ -138,6 +138,8 @@ async fn check_package(check: &PackageCheck, spec: &ModuleSpec) -> Option<String
 
 **残余的 TOCTOU 窗口（v2 新增，Codex High 1 的后半句）**：这次检查和下一次 `run_once` 真正 `spawn` 之间仍有一个（很小的）窗口——检查通过之后、spawn 之前的一瞬间包被替换，这次重启仍然可能对着新文件跑。**这个设计不承诺消灭这个窗口**（要做到那一步需要在检查和 spawn 之间持有一个打开的目录 fd 或做快照，属于用户已明确裁决不做的「快照方案」的范畴）——它承诺的是「不会在一个已经确认变了的包上死循环 backoff/熔断」，不是「杜绝任何时序意义上的竞态」。这条边界写在这里，供 review 和以后的读者对照，不是遗漏。
 
+**和 `stop_now_os` 之间的另一条窄竞态（v5 新增，回应第 4 轮 Low）**：如果 `check_package` 正好在退避睡眠之后跑（模块自己崩溃、进入了下一次重启前的核对），而这时 Part B 的 `stop_now_os` 刚好也对同一个模块发来一次热停请求——`check_package` 有可能先发布一次 `PackageChanged`，随后才被热停的 `slot.retire()`/`Stopped` 覆盖掉。这不是安全问题（不会有额外的 spawn 发生，最终状态仍然正确收敛到 `Stopped`），只是操作者可能在 `agent24 os list` 上瞬间看到一次本可以不出现的 `PackageChanged`——「一个已经被热停的模块不会再触发 `PackageChanged`」这句话因此要加一个「稳定态下」的限定，不是任何时刻都成立的绝对保证。这条窄窗口不专门修（修法是让 `check_package` 在发布状态前再看一眼 `stop` 通道，为一个纯展示层面的瞬时噪音换取额外的复杂度不值得），只在这里如实记录。
+
 **为什么核对不算作 `RestartPolicy` 的一次失败**：核对跳过的是「要不要重新 spawn」这个决定本身，不产生新的运行、不产生新的 `RunFailure`,`policy` 的计数器保持不变。
 
 **新状态**（`supervisor.rs::Status`，和 `GaveUp`/`Stopped` 并列）：
@@ -231,23 +233,32 @@ Status::PackageChanged { reason } => (
 /// unknown name" guard `patch_os` has (this daemon's own mount report, a
 /// snapshot from startup, still lists a package whose files were just
 /// deleted — that is expected and fine, uninstall is exactly the moment
-/// this route exists for), same `HotStop`/`settle` machinery, same error
-/// codes for `Failed`/`Pending` — the only thing genuinely new here is
-/// "skip the config write."
+/// this route exists for), same `HotStop`/`settle`/`last_look` machinery
+/// (v5: `last_look` is not optional here — a one-shot `settle()` alone
+/// would miss a `Stopping` that becomes `StopFailed` moments later, or a
+/// `Pending` that closes admission just after its own timeout, and answer
+/// 2xx for a stop that did not actually land), same error codes for
+/// `Failed`/`Pending` — the only thing genuinely new here is "skip the
+/// config write."
 pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     if !state.os_reports.iter().any(|r| r.name == name) {
         let known: Vec<&str> = state.os_reports.iter().map(|r| r.name.as_str()).collect();
         return error_response(
             StatusCode::NOT_FOUND,
-            "unknown_module",
+            "not_found",  // v5: matches `patch_os`'s existing code exactly
             &format!("no domain OS named {name:?}; known: {known:?}"),
         );
     }
-    let hot = settle(
-        hand_off(state.supervisors.as_deref(), state.shutdown.modules_cut_off(), &name),
-        ADMISSION_CLOSED_WITHIN,
-    )
-    .await;
+    // v5 (Codex round 4 Medium): `settle()` alone samples supervisor status
+    // ONCE. `patch_os` deliberately re-checks with `last_look()` afterward —
+    // a `Stopping` that becomes `StopFailed`/`Panicked`/`Killed`, or a
+    // `Pending` that closes admission just after its own timeout, would
+    // otherwise be missed and this route would answer 2xx for a stop that
+    // did not actually succeed. Reuse the identical shape, not a
+    // hand-rolled one-shot read.
+    let handed = hand_off(state.supervisors.as_deref(), state.shutdown.modules_cut_off(), &name);
+    let slot = handed.as_ref().map(|(_, d)| d.clone());
+    let hot = last_look(settle(handed, ADMISSION_CLOSED_WITHIN).await, slot.as_ref());
     match hot {
         HotStop::Failed => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -402,7 +413,7 @@ async fn attach_only() -> Option<Endpoint> {
 ```
 删除，改成上面三种（已停 / daemon 拒绝或够不到 / 没有可达 daemon）分支各自打印的准确文字——不再有一句笼统覆盖所有情形的话。
 
-## 判据（带正对照；v2 改写回应第 1 轮 High 1/Medium 3；v3 改写第 5/8/9/10 条并新增 11–14；v4 改写第 8/10/15 条、新增 16/17，回应第 3 轮「tombstone 拖垮整个注册表」与「stop 的判据用错了 oracle」两条 High）
+## 判据（带正对照；v2 改写回应第 1 轮 High 1/Medium 3；v3 改写第 5/8/9/10 条并新增 11–14；v4 改写第 8/10/15 条、新增 16/17；v5 改写第 15/17 条、新增 18/19，回应第 4 轮「`stop_now_os` 漏了 `last_look` 复核」与相关 Low）
 
 1. **重启前核对，退避期间发生的变更也要抓到**（钉住检查时机在睡眠之后，回应 High 1）：一个模块崩溃一次进入 backoff；在**退避睡眠期间**把 `package_dir` 整个删掉；断言退避结束后状态直接是 `PackageChanged`，而不是「又进了一次 Backoff（`policy.consecutive_failures()` 增加）」——用状态转换序列本身作证据，不依赖对 spawn 内部打点（回应 Medium 3：目录被删的情形下,就算完全没有这次改动,`launch::resolve` 也会在 spawn 之前失败、不会有任何子进程留下痕迹,「子进程有没有起来」这件事本身分不出「检查生效」和「检查没生效但反正也会失败」这两种情况；能分辨的是`policy`的失败计数有没有继续往上走）。
 2. **原地替换：证明真的没有发起第二次握手**（这里 spawn 会成功、能装出「起来了」的假象,所以要用真正能证明「有没有跑」的信号）：包目录本身仍然存在，只改写 `domain-os.yml`（不同摘要）；在退避睡眠期间做这个改写；用现有的「子进程启动时记一笔」夹具模式，断言标记文件的写入次数在改写前后**没有增加**——如果检查没生效,子进程会被 spawn 起来并至少写一次标记（随后才在握手时被拒），计数增加就是检查失效的信号。
@@ -421,9 +432,11 @@ async fn attach_only() -> Option<Endpoint> {
 12. **传输错误的措辞不作假设**：让 `POST .../stop` 请求本身超时或连接被重置（不是拿到一个 HTTP 错误状态码,是连请求都没走完）；断言 CLI 的输出用的是「无法确认」这类中立措辞，既不断言「没停」也不断言「会在下次重启时报 package_changed」。
 13. **确实没有起新进程,不是靠看状态文件猜的**：`spawn_daemon(true)` 起临时 daemon 时故意不写发现用的状态文件，短命子进程也可能在按 pid 扫描之前就已经退出——单纯检查 `run/` 目录或扫描进程列表不能可靠地证明「一次都没被启动过」。改用一个假的 `AGENT24D_BIN`（测试环境变量指向一个 shell 脚本），脚本在被调用的瞬间就往一个测试专属文件追加一行、再退出；`daemon 不可达` 场景下跑完 `uninstall` 后断言这个标记文件不存在（不是「进程列表里没有」，是「这个可执行文件从未被 exec 过」）。
 14. **名字先本地校验再发热停请求**：一个不合法的模块名（未通过 `is_valid_module_name`）执行 `uninstall`；`install::uninstall` 在任何文件系统改动之前就已经拒绝了它（`install.rs` 现有校验），`cmd_uninstall` 走 `Err` 分支直接返回，断言全程没有任何网络请求发出——`hot_disable_best_effort` 只在 `Ok(true)` 分支里才可能被调用，不合法名字连这个分支都进不去。
-15. **`daemon stop && daemon start` 复合命令确实可靠（回应第 C 节；v4 改用真正的 oracle）**：起一个 daemon，跑 `agent24 daemon stop`，断言它返回时 `try_acquire_singleton()` 能拿到锁（不是「health 探测失败」——要拿一个刻意让健康检查先失效、但仍然多持有锁一小段时间的假 daemon 做区分,证明 v3 的 oracle 会提前误报、v4 的不会）；紧接着跑 `agent24 daemon start`，断言它走的是正常 spawn 路径成功（不是撞锁之后的 30 次轮询兜底分支）。负对照：把 `STOP_CONFIRM_BUDGET` 临时调到一个不够长的值,对一个刻意长时间持有锁不放的假 daemon 跑 `stop`，断言它诚实地返回「没能在预期内停止」的错误，而不是谎称成功。
+15. **`daemon stop && daemon start` 复合命令确实可靠（回应第 C 节；v4 改用真正的 oracle）**：持锁方必须是**真正独立的子进程**（不是同一个测试进程内部模拟——`fs2` 的 `try_lock_exclusive` 是按进程通告的,同进程内两次尝试拿同一把锁不能如实反映跨进程行为,v5 回应第 4 轮 Low 明确这一点）：起一个真正的假 daemon 子进程持有 `daemon.singleton.lock`、刻意让健康检查先失效但仍然多持有锁一小段时间；跑 `agent24 daemon stop`，断言它返回时 `try_acquire_singleton()` 已经能拿到锁（不是「health 探测失败」就提前判定——这正是要证明 v3 的 oracle 会提前误报、v4 的不会）；紧接着跑 `agent24 daemon start`，断言它走的是正常 spawn 路径成功（不是撞锁之后的 30 次轮询兜底分支）。负对照：把 `STOP_CONFIRM_BUDGET` 临时调到一个不够长的值,对一个刻意长时间持有锁不放的假 daemon 子进程跑 `stop`，断言它诚实地返回「没能在预期内停止」的错误，而不是谎称成功。
 16. **uninstall 热停之后重启,不能拖垮其它模块**（v4 新增，回应第 3 轮 High「tombstone」——这是本设计最关键的一条回归判据）：默认 `Enabled` 策略下起一个 daemon、挂载两个模块 A、B；`agent24 os uninstall A`（daemon 可达，走完整的「文件删除 + 热停」）；重启 daemon；断言 **B 仍然正常挂载**、daemon 的注册表校验没有报 `registry_error`——变异验证：把 `stop_now_os` 换回旧的 `PATCH`（写 `enabled:false`）,这条测试必须变红。
-17. **`stop_now_os` 路由本身**：对一个不存在的模块名 `POST .../stop`，断言 `404 unknown_module`（复用 `patch_os` 已有的同类校验和错误码）；对一个正常运行的模块，断言响应体是完整的 `DomainOsList` 且这次调用之后 `os.json` 文件的 mtime/内容**没有变化**（直接证明这条路由完全不碰配置文件,不是靠「猜结果对不对」间接证明）。
+17. **`stop_now_os` 路由本身**：对一个不存在的模块名 `POST .../stop`，断言 `404 not_found`（v5 更正：和 `patch_os` 实际用的错误码字面一致，不是编一个新的 `unknown_module`）；对一个正常运行的模块，断言响应体是完整的 `DomainOsList` 且这次调用之后 `os.json` 文件的 mtime/内容**没有变化**（直接证明这条路由完全不碰配置文件,不是靠「猜结果对不对」间接证明）。
+18. **`stop_now_os` 真的做了 `last_look` 复核，不是一次性读一眼**（v5 新增，回应第 4 轮 Medium）：构造一个「`settle()` 采样时还是 `Stopping`、复核那一刻已经变成 `StopFailed`」的时序（复用 `patch_os` 已有测试驱动 `last_look` 的同一套手法）；断言 `stop_now_os` 返回的是 `500 stop_failed`,不是把 `settle()` 那一次性采样直接当结果、误报 2xx。
+19. **鉴权覆盖新路由**（v5 新增，回应第 4 轮 Low）：既有的「注册表鉴权」测试今天只覆盖 `GET`/`PATCH` `/api/v1/os/*`，加上 `POST /api/v1/os/{name}/stop`——鉴权是路由组装之后全局包一层，新路由按结构不会漏,但要有一条测试把这句话钉死,不是靠读代码相信。
 
 ## 不改的东西
 
@@ -470,3 +483,12 @@ async fn attach_only() -> Option<Endpoint> {
 - High（STILL BROKEN，回应第 2 轮同一条）：v3 用 `health_ok()` 变假当作「已经停了」的证据，但这只证明 Axum 的 accept 循环关了，不证明进程已经退出、单例锁已经释放——而后者才是 `daemon start` 真正需要的条件。改法：直接轮询 `agent24_protocol::state_file::try_acquire_singleton()`（`daemon start` 会用的同一把锁），拿到立刻释放。判据 15 改用这个新 oracle 做区分测试。
 - Medium（全新）：`agent24 daemon stop && agent24 daemon start` 会让一个 launchd 托管的 daemon 脱离托管（新进程走手动 spawn，不经过 `launchctl`）——这是既有问题（`restart_required` 提示今天就已经受它影响），不在 FU-61 里解决，记为新的 `followups.md` **FU-68**。
 - Low：`STOP_CONFIRM_BUDGET` 的取值理由改对——`lifecycle.rs` 的真实上限约 15.7s（排空 ≤10s + 宽限 ≤5s + 落盘/收尾余量），模块是用 `JoinSet` **并发**停止的，不是 v3 说的「可能顺序停止」；新 oracle 是本地文件锁探测，没有 v3 那种「`health_ok` 自带 3 秒超时叠加到总预算」的问题。
+
+## v4 → v5 改动（Codex 第 4 轮：0 Critical、0 High（两条第 3 轮 High 均核实为 RESOLVED）、1 条 Medium（全新）、4 条 Low，全部采纳）
+
+- Medium（全新）：`stop_now_os` 只调了一次 `settle()` 就直接决定响应,漏掉了 `patch_os` 本来就有的 `last_look()` 复核——一个采样时是 `Stopping`、复核那一刻已经变成 `StopFailed` 的运行，会被误报成 2xx。改法：`stop_now_os` 换成和 `patch_os` 完全一样的 `hand_off` → `settle` → `last_look` 三步,不是自己另起一套一次性读法。新增判据 18 专门钉住这条复核确实被调用。
+- Low：`stop_now_os` 的「未知名字」错误码从编造的 `unknown_module` 改成和 `patch_os` 字面一致的既有码 `not_found`（判据 17 同步改写）。
+- Low：新增判据 19，把 `POST .../stop` 加进既有的「注册表鉴权」测试——鉴权是路由组装后全局包一层,结构上不会漏,但要有测试钉死而不是靠读代码相信。
+- Low：Part A 新增一段,如实记录 `check_package` 和 `stop_now_os` 之间一条很窄的时序竞态（可能瞬间发布一次随后被覆盖的 `PackageChanged`,不产生任何额外 spawn、最终状态仍然正确）——「热停后的模块不会再触发 `PackageChanged`」这句话加上「稳定态下」的限定,不再是无条件的「从不」。
+- Low：判据 15 明确持锁方必须是真正独立的子进程,不能在同一个测试进程里模拟——`fs2` 的排他锁是按进程通告的,同进程内的两次尝试证明不了跨进程行为。
+- （核实为 RESOLVED，不算改动）第 3 轮两条 High——`stop_now_os` 不写 `os.json`（`hand_off`/`Supervisors::disable` 只改内存态,`render`只读不写）、新 oracle 确实是 `daemon start` 会用的同一把跨进程排他锁——均已核实成立，v5 未改动这两处的机制本身。
