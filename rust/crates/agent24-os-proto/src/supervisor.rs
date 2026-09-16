@@ -4,7 +4,8 @@
 //!   ┌──────────────────────────────────────────────────────────────────┐
 //!   ▼                                                                  │
 //! placeholder generation in `Current` (503 module_not_ready)           │
-//!   → bind a fresh port (D4) → listen for the callback → spawn         │
+//!   → open a fresh pair of Unix sockets (D4, FU-60) → listen for the │
+//!     callback → spawn                                               │
 //!   → accept + handshake before the startup deadline                   │
 //!   → ready → serve the callback connection (methods bound to THIS     │
 //!     generation, FU-49) until one of:                                 │

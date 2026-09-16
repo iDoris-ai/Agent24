@@ -1179,9 +1179,9 @@ mod tests {
     }
 
     /// The listener is closed in the daemon once the child has it: when the
-    /// module is gone, its port refuses at once — a copy kept here would queue
-    /// connections in a backlog nobody accepts from, and a request would hang
-    /// instead of failing.
+    /// module is gone, connecting to it refuses at once — a copy kept here
+    /// would queue connections in a backlog nobody accepts from, and a
+    /// request would hang instead of failing.
     ///
     /// Checked while `p` (and so its `ModuleListenPath` guard) is still
     /// alive: the path itself must still be there — the module dying, and the
@@ -1191,12 +1191,13 @@ mod tests {
     /// fd). `stop` — which drops `p`, removing the path — comes after.
     ///
     /// Up to three attempts, each with a fresh socket: measured once in 120
-    /// full TCP-era runs, as a connection "accepted by a dead module's port".
-    /// A real leak (the daemon keeping its copy) accepts on every attempt, so
-    /// it stays red; a coincidence three times running is about one in a
-    /// million.
+    /// full TCP-era runs, as a connection "accepted by a dead module's port"
+    /// (this test predates FU-60's switch to Unix sockets, only its name and
+    /// the wording above still say so). A real leak (the daemon keeping its
+    /// copy) accepts on every attempt, so it stays red; a coincidence three
+    /// times running is about one in a million.
     #[tokio::test]
-    async fn once_the_module_is_gone_its_port_refuses() {
+    async fn once_the_module_is_gone_it_refuses_connections() {
         let mut accepted = Vec::new();
         for _ in 0..3 {
             let t = pkg();

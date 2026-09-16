@@ -419,7 +419,7 @@ struct ProxyState {
     namespace: Arc<String>,
     /// Which run of the module serves this namespace, whether it is taking
     /// requests (ME-3b-5), and where it listens (SUP-3b: each run its own
-    /// port, D4). Read once per request.
+    /// Unix socket, D4/FU-60). Read once per request.
     module: Arc<Current>,
     ids: Arc<RequestIds>,
     limits: Limits,
@@ -1199,7 +1199,11 @@ mod tests {
     /// one left behind (review of FU-60, round 1: a pid-only name did). Pid
     /// plus an atomic counter tells apart calls within one process; the
     /// nanosecond timestamp tells apart this process from a past one that
-    /// happened to get the same pid and left a node behind.
+    /// happened to get the same pid and left a node behind. The node itself
+    /// is left behind on purpose (review of FU-60, round 3: no test here
+    /// unlinks it) — these mock modules run in detached `tokio::spawn` tasks
+    /// with no natural moment to clean up, and uniqueness (not cleanup) is
+    /// what keeps the tests hermetic; the OS reaps `/tmp` on its own schedule.
     fn unique_sock(tag: &str) -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
