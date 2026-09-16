@@ -1,6 +1,6 @@
 # FU-61 —— 包在运行中被卸载或原地替换
 
-> 状态：设计稿 v5（v1 → v2：Codex 第 1 轮 6 条 High、5 条 Medium、1 条 Low 全部采纳；v2 → v3：第 2 轮 1 条 High（部分）、3 条 Medium、2 条 Low 全部采纳；v3 → v4：第 3 轮 2 条 High（1 条全新的 tombstone、1 条 stop oracle 仍破）、1 条 Medium（launchd 脱管，记为 FU-68）、1 条 Low 全部采纳；v4 → v5：第 4 轮 1 条 Medium（`stop_now_os` 漏了 `last_look` 复核）、4 条 Low 全部采纳，见文末各段改动记录）。来源：`followups.md` FU-61；ME3-NEXT 执行队列第三段（2026-09-13 用户裁决：按建议「检测变更、报需要重启」+ `uninstall` 先热 disable，不做快照）。
+> 状态：设计稿 v6 **终审通过，无 Medium+，可以开始写代码**（v1 → v2：第 1 轮 6 条 High、5 条 Medium、1 条 Low 全部采纳；v2 → v3：第 2 轮 1 条 High（部分）、3 条 Medium、2 条 Low 全部采纳；v3 → v4：第 3 轮 2 条 High（1 条全新的 tombstone、1 条 stop oracle 仍破）、1 条 Medium（launchd 脱管，记为 FU-68）、1 条 Low 全部采纳；v4 → v5：第 4 轮 1 条 Medium（`stop_now_os` 漏了 `last_look` 复核）、4 条 Low 全部采纳；v5 → v6：第 5 轮 0 Critical/High/Medium，3 条 Low 全部采纳，见文末各段改动记录）。来源：`followups.md` FU-61；ME3-NEXT 执行队列第三段（2026-09-13 用户裁决：按建议「检测变更、报需要重启」+ `uninstall` 先热 disable，不做快照）。
 > **带状态机：先写语义说明，再写代码**（`docs/agent/tasks.md` 的硬规则，SUP-5 的教训）。
 
 ## 问题
@@ -200,7 +200,7 @@ Ok(r) if r.status().is_success() => {
 
 **`STOP_CONFIRM_BUDGET`（v4 修正取值理由，回应 Codex 第 3 轮 Low）**：`lifecycle.rs` 里真实的停机上限是排空 ≤10s + 停止宽限 ≤5s + 汇总落盘 ~200ms + 运行时收尾余量 ~300ms ≈ 15.7s——v3 说「多个模块可能顺序停止」是错的（`server.rs` 用 `JoinSet` **并发**停止所有模块，不是排队),不需要按模块数放大;`try_acquire_singleton` 探测本身是本地文件锁,没有 v3 那种「`health_ok` 自带 3 秒超时,叠加到总预算上」的问题。30s 相对 15.7s 的真实上限依然留了近一倍余量，取值不变，理由改对。
 
-**对 launchd 托管的 daemon 不适用（v4 新增,回应 Codex 第 3 轮 Medium，记为新跟进项）**：`agent24 service install` 把 daemon 交给 launchd 管（`KeepAlive`，异常退出自动拉起）；`agent24 daemon stop` 走的是 `POST /shutdown`，进程是**正常退出**（`SuccessfulExit:false` 语义下 launchd 认为「这次退出不需要拉起」)，随后 `agent24 daemon start` 用的是手动 spawn 路径,不经过 `launchctl`——新起的进程脱离了 launchd 的监管，之后崩溃不会再被自动拉起。**这不是 FU-61 引入的新问题**——`os_routes.rs` 现有的 `restart_required` 提示今天就在建议同一句 `agent24 daemon stop && agent24 daemon start`，同样受这个限制；FU-61 只是让这句命令本身变得可靠（旧进程真退出、新进程真起来），不改变它「会让托管中的 daemon 脱离 launchd」这个既有问题。记为新的跟进项 **FU-68**（见 `followups.md`），本设计不解决它。
+**对 launchd 托管的 daemon 不适用（v4 新增,回应 Codex 第 3 轮 Medium，记为新跟进项）**：`agent24 service install` 把 daemon 交给 launchd 管（`KeepAlive`，异常退出自动拉起）；`agent24 daemon stop` 走的是 `POST /shutdown`，进程是**正常退出**（`SuccessfulExit:false` 语义下 launchd 认为「这次退出不需要拉起」)，随后 `agent24 daemon start` 用的是手动 spawn 路径,不经过 `launchctl`——新起的进程脱离了 launchd 的监管，之后崩溃不会再被自动拉起。**这不是 FU-61 引入的新问题**——`os_routes.rs` 现有的 `restart_required` 提示今天就在建议同一句 `agent24 daemon stop && agent24 daemon start`，同样受这个限制；FU-61 只是让这句命令本身变得可靠（旧进程的逻辑停机完成、单例锁真正释放、新进程真起来——v6 措辞收紧，回应第 5 轮 Low：单例锁在 `serve()` 返回时就被释放，这**早于** `main.rs` 的 `runtime.shutdown_timeout(...)` 跑完，锁释放不等于操作系统意义上的进程已经彻底退出,`try_acquire_singleton` 证明的是「`start` 需要的那个条件成立」，不是「旧进程完全没了」——两者对这条命令的可靠性而言等价,但措辞不能混着说），不改变它「会让托管中的 daemon 脱离 launchd」这个既有问题。记为新的跟进项 **FU-68**（见 `followups.md`），本设计不解决它。
 
 这一条**只改变 `daemon stop` 的返回时机和成功文案**（`shutdown requested` → `stopped`，且真的等到确认），`daemon start` 的重试逻辑不用动：`stop` 可靠地等到旧进程释放单例锁之后，`start` 面对的就是一个空锁,今天已有的正常 spawn 路径直接成功,不会走到「撞锁轮询」那个分支。
 
@@ -273,7 +273,16 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
                  {ADMISSION_CLOSED_WITHIN:?}; `agent24 os list` shows when it has stopped"
             ),
         ),
-        HotStop::Stopping | HotStop::Already | HotStop::NotRunning => render(&state),
+        // v6 (Codex round 5 Low): success does NOT reuse `render(&state)`.
+        // `render` can itself return `503 registry_invalid` if `os.json` is
+        // unreadable at that instant — coupling a successful stop's HTTP
+        // status to an unrelated config-file read would make
+        // `hot_disable_best_effort` report "could not confirm the stop" for
+        // a stop that, in fact, fully succeeded. A dedicated ack keeps this
+        // route's success independent of that failure mode.
+        HotStop::Stopping | HotStop::Already | HotStop::NotRunning => {
+            Json(serde_json::json!({ "name": name, "stopped": true })).into_response()
+        }
     }
 }
 ```
@@ -413,6 +422,19 @@ async fn attach_only() -> Option<Endpoint> {
 ```
 删除，改成上面三种（已停 / daemon 拒绝或够不到 / 没有可达 daemon）分支各自打印的准确文字——不再有一句笼统覆盖所有情形的话。
 
+**Clap 的命令帮助文字也要跟着改（v6 新增，回应第 5 轮 Low）**：`apps/agent24-cli/src/main.rs` 里 `OsAction::Uninstall` 的文档注释（`agent24 os uninstall --help` 的来源）今天写的是
+```
+/// A module of that package that is running now keeps running, but cannot
+/// be restarted: if it exits before the next daemon start, it stays down.
+```
+这句话在 Part B 落地之后不再普遍成立——daemon 可达时,正在跑的模块会被立刻要求停止。改成如实反映「尽力而为」的措辞,例如：
+```
+/// If a daemon is reachable, a running module of it is told to stop now
+/// (best-effort); otherwise (or if that fails) it keeps running until its
+/// own next restart, which will report `package_changed` instead of
+/// crash-looping.
+```
+
 ## 判据（带正对照；v2 改写回应第 1 轮 High 1/Medium 3；v3 改写第 5/8/9/10 条并新增 11–14；v4 改写第 8/10/15 条、新增 16/17；v5 改写第 15/17 条、新增 18/19，回应第 4 轮「`stop_now_os` 漏了 `last_look` 复核」与相关 Low）
 
 1. **重启前核对，退避期间发生的变更也要抓到**（钉住检查时机在睡眠之后，回应 High 1）：一个模块崩溃一次进入 backoff；在**退避睡眠期间**把 `package_dir` 整个删掉；断言退避结束后状态直接是 `PackageChanged`，而不是「又进了一次 Backoff（`policy.consecutive_failures()` 增加）」——用状态转换序列本身作证据，不依赖对 spawn 内部打点（回应 Medium 3：目录被删的情形下,就算完全没有这次改动,`launch::resolve` 也会在 spawn 之前失败、不会有任何子进程留下痕迹,「子进程有没有起来」这件事本身分不出「检查生效」和「检查没生效但反正也会失败」这两种情况；能分辨的是`policy`的失败计数有没有继续往上走）。
@@ -434,7 +456,8 @@ async fn attach_only() -> Option<Endpoint> {
 14. **名字先本地校验再发热停请求**：一个不合法的模块名（未通过 `is_valid_module_name`）执行 `uninstall`；`install::uninstall` 在任何文件系统改动之前就已经拒绝了它（`install.rs` 现有校验），`cmd_uninstall` 走 `Err` 分支直接返回，断言全程没有任何网络请求发出——`hot_disable_best_effort` 只在 `Ok(true)` 分支里才可能被调用，不合法名字连这个分支都进不去。
 15. **`daemon stop && daemon start` 复合命令确实可靠（回应第 C 节；v4 改用真正的 oracle）**：持锁方必须是**真正独立的子进程**（不是同一个测试进程内部模拟——`fs2` 的 `try_lock_exclusive` 是按进程通告的,同进程内两次尝试拿同一把锁不能如实反映跨进程行为,v5 回应第 4 轮 Low 明确这一点）：起一个真正的假 daemon 子进程持有 `daemon.singleton.lock`、刻意让健康检查先失效但仍然多持有锁一小段时间；跑 `agent24 daemon stop`，断言它返回时 `try_acquire_singleton()` 已经能拿到锁（不是「health 探测失败」就提前判定——这正是要证明 v3 的 oracle 会提前误报、v4 的不会）；紧接着跑 `agent24 daemon start`，断言它走的是正常 spawn 路径成功（不是撞锁之后的 30 次轮询兜底分支）。负对照：把 `STOP_CONFIRM_BUDGET` 临时调到一个不够长的值,对一个刻意长时间持有锁不放的假 daemon 子进程跑 `stop`，断言它诚实地返回「没能在预期内停止」的错误，而不是谎称成功。
 16. **uninstall 热停之后重启,不能拖垮其它模块**（v4 新增，回应第 3 轮 High「tombstone」——这是本设计最关键的一条回归判据）：默认 `Enabled` 策略下起一个 daemon、挂载两个模块 A、B；`agent24 os uninstall A`（daemon 可达，走完整的「文件删除 + 热停」）；重启 daemon；断言 **B 仍然正常挂载**、daemon 的注册表校验没有报 `registry_error`——变异验证：把 `stop_now_os` 换回旧的 `PATCH`（写 `enabled:false`）,这条测试必须变红。
-17. **`stop_now_os` 路由本身**：对一个不存在的模块名 `POST .../stop`，断言 `404 not_found`（v5 更正：和 `patch_os` 实际用的错误码字面一致，不是编一个新的 `unknown_module`）；对一个正常运行的模块，断言响应体是完整的 `DomainOsList` 且这次调用之后 `os.json` 文件的 mtime/内容**没有变化**（直接证明这条路由完全不碰配置文件,不是靠「猜结果对不对」间接证明）。
+17. **`stop_now_os` 路由本身**：对一个不存在的模块名 `POST .../stop`，断言 `404 not_found`（v5 更正：和 `patch_os` 实际用的错误码字面一致，不是编一个新的 `unknown_module`）；对一个正常运行的模块，断言响应体是 v6 的专用 ack（`{"name", "stopped": true}`）、2xx，且这次调用之后 `os.json` 文件的 mtime/内容**没有变化**（直接证明这条路由完全不碰配置文件,不是靠「猜结果对不对」间接证明）。
+17b.（v6 新增，回应第 5 轮 Low「成功响应被 `render` 的失败模式连累」）**`stop_now_os` 的成功与 `os.json` 是否可读无关**：先让停止本身成功（模块确实被停下),再让 `os.json` 在这之后变得不可读（例如替换成一份损坏的内容）,断言这次调用仍然报告成功——不是因为 `render(&state)` 恰好也能忍受一份坏文件,而是因为这条路径的成功响应根本不读 `os.json`。变异验证：把成功分支换回 `render(&state)`,这条测试必须变红。
 18. **`stop_now_os` 真的做了 `last_look` 复核，不是一次性读一眼**（v5 新增，回应第 4 轮 Medium）：构造一个「`settle()` 采样时还是 `Stopping`、复核那一刻已经变成 `StopFailed`」的时序（复用 `patch_os` 已有测试驱动 `last_look` 的同一套手法）；断言 `stop_now_os` 返回的是 `500 stop_failed`,不是把 `settle()` 那一次性采样直接当结果、误报 2xx。
 19. **鉴权覆盖新路由**（v5 新增，回应第 4 轮 Low）：既有的「注册表鉴权」测试今天只覆盖 `GET`/`PATCH` `/api/v1/os/*`，加上 `POST /api/v1/os/{name}/stop`——鉴权是路由组装之后全局包一层，新路由按结构不会漏,但要有一条测试把这句话钉死,不是靠读代码相信。
 
@@ -492,3 +515,11 @@ async fn attach_only() -> Option<Endpoint> {
 - Low：Part A 新增一段,如实记录 `check_package` 和 `stop_now_os` 之间一条很窄的时序竞态（可能瞬间发布一次随后被覆盖的 `PackageChanged`,不产生任何额外 spawn、最终状态仍然正确）——「热停后的模块不会再触发 `PackageChanged`」这句话加上「稳定态下」的限定,不再是无条件的「从不」。
 - Low：判据 15 明确持锁方必须是真正独立的子进程,不能在同一个测试进程里模拟——`fs2` 的排他锁是按进程通告的,同进程内的两次尝试证明不了跨进程行为。
 - （核实为 RESOLVED，不算改动）第 3 轮两条 High——`stop_now_os` 不写 `os.json`（`hand_off`/`Supervisors::disable` 只改内存态,`render`只读不写）、新 oracle 确实是 `daemon start` 会用的同一把跨进程排他锁——均已核实成立，v5 未改动这两处的机制本身。
+
+## v5 → v6 改动（Codex 第 5 轮：0 Critical、0 High、0 Medium、3 条 Low，全部采纳——终审通过）
+
+- Low：`stop_now_os` 成功时不再复用 `render(&state)`——`render` 在 `os.json` 恰好不可读的瞬间会返回 `503 registry_invalid`，会让一次真正成功的停止被 `hot_disable_best_effort` 误报成「没能确认」。改成一个不读配置文件的专用 ack（`{"name", "stopped": true}`）。判据 17 同步改写，新增判据 17b 专门钉住「停止成功与 `os.json` 是否可读无关」。
+- Low：`agent24 os uninstall --help` 的 Clap 文档注释还停留在「正在跑的模块会继续跑」这句 Part B 之前的旧话——改成如实反映「daemon 可达时会被尽力而为地立刻停止,否则/失败时才维持旧行为」。
+- Low：第 C 节「旧进程真退出」的措辞收紧——单例锁在 `serve()` 返回时释放,这早于 `main.rs` 的运行时收尾（`shutdown_timeout`）完成,锁被释放不等于操作系统意义上的进程已经彻底退出；`try_acquire_singleton` 证明的确切是「`daemon start` 需要的条件成立」，改用这个说法,不再说「进程真退出」。
+
+四轮（第 2、3、4、5 轮）之后没有再出现新的 Medium+，第 5 轮明确给出「可以开始写代码」的终审结论。
