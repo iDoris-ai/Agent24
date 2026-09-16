@@ -1421,20 +1421,32 @@ mod tests {
     /// the node it bound.
     #[tokio::test]
     async fn a_dropped_module_listen_path_does_not_remove_a_replacement() {
+        // A synthetic guard with a node that cannot match anything real,
+        // standing in for "this path was replaced since this guard was
+        // made" — not a real delete-then-rebind-at-the-same-name, which
+        // depends on the OS handing back a freed inode: rare, but real (PR
+        // #192, PR-Daemon round 1 caught this exact test flaking in CI on
+        // inode reuse). The real guard, dropped second, still exercises the
+        // genuine match-and-remove path.
         let s = state();
         let dir = CallbackDir::create(s.path()).unwrap();
-        let (first_listener, first_guard) = dir.http_listen_at(1).unwrap();
-        let path = first_guard.path().to_owned();
-        drop(first_listener);
-        std::fs::remove_file(&path).unwrap();
-        let (_second_listener, second_guard) = dir.http_listen_at(1).expect("the name is free");
-        drop(first_guard);
+        let (_listener, guard) = dir.http_listen_at(1).unwrap();
+        let path = guard.path().to_owned();
+        let impostor = ModuleListenPath {
+            path: path.clone(),
+            node: (u64::MAX, u64::MAX),
+            _claim: dir.claim.clone(),
+        };
+        drop(impostor);
         assert!(
             path.exists(),
-            "dropping the first guard removed the second's socket"
+            "a guard whose node does not match the path removed it anyway"
         );
-        drop(second_guard);
-        assert!(!path.exists(), "control: the second removes its own");
+        drop(guard);
+        assert!(
+            !path.exists(),
+            "control: the matching guard removes its own"
+        );
     }
 
     /// FU-59: once its directory and every listener made from it are gone,

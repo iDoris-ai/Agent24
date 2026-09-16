@@ -253,17 +253,17 @@ mod tests {
     /// handshaken here) and correctly still say so (design v4, round 2).
     #[test]
     fn listen_failures_say_neither_callback_nor_listener_for_shared_variants() {
-        let shared = [
-            EndpointError::UnsafeDirectory {
-                path: "/d".into(),
-                why: "w".into(),
-            },
-            EndpointError::PathTooLong("/p".into()),
-            EndpointError::AlreadyCreated("/d".into()),
-            EndpointError::Io(io_err()),
-        ];
-        for e in &shared {
-            let text = listen(e).to_string();
+        // Derived from `endpoint_errors()`, not a separately typed-out list —
+        // drops the two genuinely callback-only variants rather than
+        // maintaining its own copy that could drift from that fixture
+        // (review of #192, round 4).
+        for e in endpoint_errors().into_iter().filter(|e| {
+            !matches!(
+                e,
+                EndpointError::Timeout | EndpointError::ForeignPeer { .. }
+            )
+        }) {
+            let text = listen(&e).to_string();
             assert!(!text.contains("callback"), "{text}");
         }
     }
