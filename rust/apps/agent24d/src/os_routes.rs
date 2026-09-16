@@ -361,6 +361,15 @@ async fn settle(
 /// under way. This moment — just before the response is chosen — is the one
 /// the answer describes (review of SUP-5, rounds 6 and 7).
 fn last_look(hot: HotStop, slot: Option<&crate::domain::Disabled>) -> HotStop {
+    // Test-only call counter (compiles to nothing in a release build): the
+    // one thing round-2 code review found impossible to pin any other way
+    // is "does `settled_and_reconciled` actually call this function" — its
+    // CORRECTIVE effect (a status that changes between `settle` and this
+    // call) has no scheduler yield point to exploit deterministically, but
+    // whether it is called AT ALL is trivially, deterministically provable
+    // this way.
+    #[cfg(test)]
+    tests::LAST_LOOK_CALLS.with(|n| n.set(n.get() + 1));
     use agent24_os_proto::supervisor::Status;
     let failed = slot.is_some_and(|d| {
         matches!(
@@ -678,6 +687,37 @@ mod tests {
 
     use super::*;
     use crate::domain::{MountOutcome, MountReport, ResourceStatus};
+
+    thread_local! {
+        /// Incremented on every `last_look` call — see its doc comment.
+        /// Thread-local, not a shared global: `#[tokio::test]` (current-
+        /// thread flavor, the default) runs each test's async body on the
+        /// OS thread the test harness gave that test, so a `thread_local`
+        /// counter cannot be perturbed by other tests running concurrently
+        /// on other threads — a shared `static` would have been a flaky
+        /// test in its own right.
+        pub(super) static LAST_LOOK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// FU-61 (round-2 code review Medium): a mutation deleting
+    /// `settled_and_reconciled`'s `last_look` call would leave every
+    /// existing `stop_now_os`/`patch_os` test green, because none of them
+    /// depend on `last_look`'s CORRECTIVE effect being exercised (that
+    /// effect needs a status change to land in a scheduler gap that, on a
+    /// single-threaded runtime, does not exist — see the comment on
+    /// `last_look` itself). This test instead pins that the call happens AT
+    /// ALL, which is the one thing a mutation removing it would actually
+    /// change.
+    #[tokio::test]
+    async fn settled_and_reconciled_calls_last_look() {
+        let before = LAST_LOOK_CALLS.with(std::cell::Cell::get);
+        let _ = settled_and_reconciled(None, std::time::Duration::ZERO).await;
+        assert_eq!(
+            LAST_LOOK_CALLS.with(std::cell::Cell::get),
+            before + 1,
+            "settled_and_reconciled must call last_look exactly once"
+        );
+    }
 
     /// What a disable reports: `Stopping` once the module refuses new
     /// requests; `Pending` if it still admitted them when the wait ran out —

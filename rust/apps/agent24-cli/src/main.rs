@@ -105,10 +105,11 @@ enum OsAction {
     ///
     /// File removal works with the daemon down, same as install. If a daemon is
     /// reachable, a running module of it is also told to stop now (best-effort).
-    /// If no daemon was reachable, or the daemon accepted the stop but could not
-    /// confirm it took effect, a module of it still running elsewhere keeps
-    /// serving until its own next restart, which will report `package_changed`
-    /// instead of crash-looping.
+    /// If no daemon was reachable at all, a module of it still running elsewhere
+    /// keeps serving until its own next restart, which will report
+    /// `package_changed` instead of crash-looping. If a daemon WAS reachable but
+    /// could not confirm the stop, `agent24 os list` shows why — that module will
+    /// not restart on its own from this.
     Uninstall { name: String },
 }
 
