@@ -377,6 +377,21 @@ fn last_look(hot: HotStop, slot: Option<&crate::domain::Disabled>) -> HotStop {
     }
 }
 
+/// `settle` → `last_look`, in one place — shared by `patch_os` and
+/// `stop_now_os` (FU-61) so the reconciliation `last_look` does (a one-shot
+/// `settle()` alone can miss a `Stopping` that becomes `StopFailed` moments
+/// later, or a `Pending` that closes admission just after its own timeout)
+/// cannot silently drift out of sync between the two routes, and a test of
+/// this one function protects both call sites. Takes `handed` rather than
+/// calling `hand_off` itself: `patch_os` already has it from `apply()`.
+async fn settled_and_reconciled(
+    handed: Option<(bool, crate::domain::Disabled)>,
+    within: std::time::Duration,
+) -> HotStop {
+    let slot = handed.as_ref().map(|(_, d)| d.clone());
+    last_look(settle(handed, within).await, slot.as_ref())
+}
+
 /// A handed-off stop, by whether its module refuses requests, whether THIS
 /// disable asked for it, and its supervisor's status. A failed stop revokes
 /// admission too, so the failure is looked at first.
@@ -544,8 +559,7 @@ pub async fn patch_os(
     };
     // A disable of a running out-of-process module applies now; anything else
     // at the next start.
-    let slot = handed.as_ref().map(|(_, d)| d.clone());
-    let hot = last_look(settle(handed, ADMISSION_CLOSED_WITHIN).await, slot.as_ref());
+    let hot = settled_and_reconciled(handed, ADMISSION_CLOSED_WITHIN).await;
     let effect = match hot {
         HotStop::Stopping => "stopping it now",
         HotStop::Pending => "its supervisor was asked to stop it; not yet refusing requests",
@@ -634,8 +648,7 @@ pub async fn stop_now_os(State(state): State<AppState>, Path(name): Path<String>
         state.shutdown.modules_cut_off(),
         &name,
     );
-    let slot = handed.as_ref().map(|(_, d)| d.clone());
-    let hot = last_look(settle(handed, ADMISSION_CLOSED_WITHIN).await, slot.as_ref());
+    let hot = settled_and_reconciled(handed, ADMISSION_CLOSED_WITHIN).await;
     match hot {
         HotStop::Failed => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -862,6 +875,35 @@ mod tests {
         assert!(view(&r, true, true, Some(&Status::Stopped), Some(true)).restart_required);
         // A failed stop needs a restart even with the registry unusable.
         assert!(view(&r, false, false, Some(&failed), Some(true)).restart_required);
+    }
+
+    /// FU-61: `PackageChanged`'s detail names the reason AND the one
+    /// recovery that actually works — restarting the daemon. It must NOT
+    /// suggest `os disable`/`enable`: `enable` only changes config, it does
+    /// not create a new supervisor in a running daemon, so that advice
+    /// would leave the module stopped forever (design doc, "操作者可见文本").
+    #[test]
+    fn a_package_changed_module_is_told_to_restart_the_daemon_not_disable_enable() {
+        use agent24_os_proto::supervisor::Status;
+        let r = report("pkg", MountOutcome::Mounted);
+        let changed = Status::PackageChanged {
+            reason: "the package directory no longer exists".to_owned(),
+        };
+        let v = view(&r, true, true, Some(&changed), None);
+        assert_eq!(v.state, "degraded");
+        let detail = v.detail.unwrap();
+        assert!(
+            detail.contains("the package directory no longer exists"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("agent24 daemon stop && agent24 daemon start"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("disable") && !detail.contains("enable"),
+            "advice that cannot restart a stopped supervisor: {detail}"
+        );
     }
 
     /// A package mounted at start is reported by its supervisor's status NOW:

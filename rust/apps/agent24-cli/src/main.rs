@@ -104,9 +104,11 @@ enum OsAction {
     /// Remove an installed domain-OS package (takes effect at the next daemon start)
     ///
     /// File removal works with the daemon down, same as install. If a daemon is
-    /// reachable, a running module of it is also told to stop now (best-effort);
-    /// otherwise (or if that fails) it keeps running until its own next restart,
-    /// which will report `package_changed` instead of crash-looping.
+    /// reachable, a running module of it is also told to stop now (best-effort).
+    /// If no daemon was reachable, or the daemon accepted the stop but could not
+    /// confirm it took effect, a module of it still running elsewhere keeps
+    /// serving until its own next restart, which will report `package_changed`
+    /// instead of crash-looping.
     Uninstall { name: String },
 }
 

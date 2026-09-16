@@ -2473,7 +2473,7 @@ sys.exit(0)
         let f = fixture("crash");
         let current = Current::new(Generation::starting());
         let timings = Timings {
-            backoff_base: Duration::from_secs(2),
+            backoff_base: Duration::from_secs(5),
             ..fast()
         };
         let package_dir = f.spec.package_dir.clone();
@@ -2533,7 +2533,7 @@ sys.exit(0)
         });
         let current = Current::new(Generation::starting());
         let timings = Timings {
-            backoff_base: Duration::from_secs(2),
+            backoff_base: Duration::from_secs(5),
             ..fast()
         };
         let handle = sup_checked(

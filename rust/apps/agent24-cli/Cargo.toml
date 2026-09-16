@@ -26,5 +26,8 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

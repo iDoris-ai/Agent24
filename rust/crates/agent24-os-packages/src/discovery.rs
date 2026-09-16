@@ -651,14 +651,19 @@ mod tests {
             &manifest_yaml("cos72", "out_of_process_provider"),
         );
         let old_digest = read_package(&dir).unwrap().digest;
-        std::fs::write(
-            dir.join(MANIFEST_FILE),
-            manifest_yaml("cos72", "out_of_process_provider").replace("0.1.0", "0.2.0"),
-        )
-        .unwrap();
+        let new_body = manifest_yaml("cos72", "out_of_process_provider").replace("0.1.0", "0.2.0");
+        std::fs::write(dir.join(MANIFEST_FILE), &new_body).unwrap();
+        let new_digest = manifest_digest(new_body.as_bytes());
+        // Control: the rewrite must actually produce a different digest, or
+        // this test would pass even if `recheck` echoed the same value twice.
+        assert_ne!(old_digest, new_digest);
 
         let err = recheck(&dir, &old_digest).unwrap_err();
         assert!(err.contains(&old_digest), "{err}");
+        assert!(
+            err.contains(&new_digest),
+            "must name what it changed TO, not just what it changed FROM: {err}"
+        );
         assert!(err.contains("changed"), "{err}");
     }
 
