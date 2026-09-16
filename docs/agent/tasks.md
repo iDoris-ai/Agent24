@@ -104,7 +104,7 @@
 
 **三、收尾 ME3-SUP 的跟进项**
 - **FU-57 Supervisor 失败细分** `READY`：setup / refused / io / timeout / exited，在 `os list` 显示；判据带正对照（spawn 被拒显示 setup，真正退出显示 exited）。
-- **PROBE 修 `me3-status.sh`** `READY`：「3b-3 解析+起进程」「3b-3 进程监督」两格还在找旧符号（`pub fn spawn`、`pub fn terminate_group`），SUP 全部合并后仍显示「未开工」—— 正是它自己注释里警告过的失效方式。改成找今天的符号，并加一条「已知存在的 SUP 符号被探到」的自证。
+- **PROBE 修 `me3-status.sh`** `IN_REVIEW`（改成找今天的符号 `pub (async )?fn spawn` / `pub fn supervise`；新增 ◌ 态「文件已在 main、符号不在」；自证在 REF 上探两个已交付的 SUP 符号）：「3b-3 解析+起进程」「3b-3 进程监督」两格还在找旧符号（`pub fn spawn`、`pub fn terminate_group`），SUP 全部合并后仍显示「未开工」—— 正是它自己注释里警告过的失效方式。改成找今天的符号，并加一条「已知存在的 SUP 符号被探到」的自证。
 - **FU-60 模块 HTTP 改走 Unix socket**（用户已拍板）`READY`：D4 从「每代一个新端口」改为「每代一个新 socket 路径」（放在 `CallbackDir` 同一个 `0700` 目录下）；没有 TIME_WAIT，也省掉端口。**带状态机/协议变更：先写语义说明。**判据：带请求体的模块持续压测（2000 req/s × 60s）零 `connect` 失败。
 - **FU-61 包在运行中被卸载或替换**（按建议：检测变更、报「需要重启」，不做快照）`READY`：Supervisor 重启一代之前核对包摘要；包不在或摘要变了 → 不重启，状态 `package_changed`，带原因与解决办法（重启 daemon，或 `agent24 os disable` / `enable`），不再一路崩溃到熔断；`agent24 os uninstall` 对运行中的模块先热 disable 再删文件。**带状态机：先写语义说明。**判据：运行中卸载 → 状态报包已移除而非熔断；原地替换 → 不进入握手失败循环。快照方案记为后续选项，不做。
 - **FU-64 连接复用撞上模块关闭**（按建议：三件一起做）`READY`：① 幂等请求（无请求体的 GET/HEAD/OPTIONS）遇到「发出时连接已被关」自动换新连接重发一次；② 复用连接的空闲上限短于常见的模块 keep-alive，到期不再复用；③ 剩下的 502 返回结构化提示：`code: upstream_connection_closed`、说明「模块在请求发出的同时关闭了连接；这个请求可能已被处理，也可能没有」、解决办法「确认无副作用后重试；频繁出现请调大模块的 keep-alive」。判据：每次应答后立即关连接的模块，连续无间隔 2000 个 GET 零 502；POST 在同一情形下的 502 带上述字段。
