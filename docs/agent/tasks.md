@@ -84,7 +84,7 @@
     - **SUP-3b 代理按代取上游地址** `DONE` — [#181](https://github.com/iDoris-ai/Agent24/pull/181)（`3758836`，2026-09-13；PR 前 Codex 5 轮，外部评审一次 APPROVE，2 条 Info 记 FU-62/63）：`Generation` 带上它那一代的地址（`serving_at`，占位代永不 Running），代理每个请求发往准入它的那一代（D4）；上游连接按代复用、只复用无请求体的请求，其余一律用后即弃并中止驱动，撤销那一代的空闲连接立即关闭（FU-47、FU-50）
   - **SUP-4 接进 daemon，解除挂载拒绝** `DONE` — [#182](https://github.com/iDoris-ai/Agent24/pull/182)（`63060bf`，2026-09-13；PR 前 Codex 8 轮，外部评审一次 APPROVE）：`Installed` 分进程内/进程外两种；绊线测试挪到真实路径；daemon 退出时有界地等所有 Supervisor 停完（否则子进程成孤儿）
   - **SUP-5 热 disable** `DONE` — [#183](https://github.com/iDoris-ai/Agent24/pull/183)（`420c2eb`，2026-09-13；PR 前 Codex 7 轮（第 7 轮无 Medium+），外部评审一次 APPROVE，1 条 Low 在跟进批次收掉）：`os disable` 对运行中的进程外模块走两阶段停止 —— 写配置与交出停止在 daemon 自己的任务里一步完成，PATCH 等到这一代不再准入才回 200（超时 `503 disable_pending`、停止失败 `500 stop_failed`），停机等热停止并在绝对截断时刻中止；CLI help、`os_routes.rs` 文档、`restart_required` 的承诺同时改写
-- **ME3-SUP 全部完成**（SUP-1 … SUP-5，#178–#183）。余下跟进项见 `followups.md`（FU-57、FU-60、FU-61、FU-64 仍开）
+- **ME3-SUP 全部完成**（SUP-1 … SUP-5，#178–#183）。余下跟进项见 `followups.md`（FU-60、FU-61、FU-64 仍开）
 - **SUP-1 验收**（每条带正对照，变异验证）：外部拿不到许可证、调不了 `revoke`、碰不到子进程（5 条 `compile_fail`，各被对应变异单独弄红，对照 `stop` 能编译）；子进程环境里没有父进程的 `CARGO_MANIFEST_DIR`，只有白名单与 `A24_*`；fd 3 上能 accept；子进程只开着 fd 0–3；模块死后端口立刻拒绝；往 stderr 灌 2 MiB 不阻塞；他人可写的包目录 / `bin/` / 程序被拒；`stop` 撤销的是自己那一代并报告 abandoned / never_sent；drop 先撤后杀；首领按时退出、忽略 SIGTERM 的助手仍被杀
 - **依赖**：T6（回调连接循环）✅
 
