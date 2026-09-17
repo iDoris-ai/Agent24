@@ -620,6 +620,19 @@ notify        · **谁该看到它** —— 从 RequestContext 的 run/session/s
 > **注意 `Events` 在 ME-3e 而不是更早**——`_a24/events/emit` 是 ME-3e 的交付项。上一版写「ME-3c 落地时 offer 为空**或只有 `Events`**」，后半句是错的：那正好造出一个「已授予 `Events`、方法却 not found」的状态。
 >
 > **或者**声明 ME-3c/3d/3e 不允许独立合入 main（必须作为一个整体）——二选一，实现前定，写进 PR 描述。
+>
+> **补记（T7a 落地时才发现，本该实现前写下——如实记录这个流程缺口，不是补救就当没发生过）**：上表的阶梯假定按 ME-3d→ME-3e 的编号顺序实现，且 ME-3e 的 `events`/`approval` 一次性一起交付。实际选择的顺序不是这个：ME-3d（进程外 `_a24/memory/private/*`）**没有被排进队列**，ME-3e 被拆成 T7a（先交付 `events`，独立 PR 合入 main）与 T7b（后交付 `approval`，另一个独立 PR）——拆分原因是 ME-3e 一次性设计+评审的体量太大，见 `docs/design/T7a-ME3e-grants-and-events.md`「与 T7b 的分工」。
+>
+> 这不违反本节**真正**定死的那条规则——「生产的 offer set 只包含当前已有 handler 的能力」——T7a 合入时 `events` 有真实 handler，`Offer` 只声明 `events`，不声明 `approval`/`memory`，没有一处「已授予但方法不存在」。违反的只是上表**这一张具体的阶梯**，而那张表是「选了独立合入」这个分支下**按假定实现顺序**画出来的示例，不是规则本身。**实际阶梯改写为**：
+>
+> | 落地阶段 | 生产 offer set | 因为 |
+> |---|---|---|
+> | ME-3b / ME-3c | 空集 | 此时一个业务方法都没有 |
+> | **T7a（ME-3e 前半）** | `{Events}` | `_a24/events/emit` 到位，`memory`/`approval` 都还没有 handler |
+> | **T7b（ME-3e 后半）** | `{Events, Approval}` | `_a24/approval/gate`、`_a24/approval/advise` 到位 |
+> | ME-3d（未排期） | 在它真正交付时并入 `{Events, Approval, Memory}` | 不早于 T7a/T7b，因为它没有被安排在两者之前做 |
+>
+> 把这张表当成活的：谁下一个交付带 handler 的能力，谁就把自己加进 `provides`，前提永远只有那一条「只声明真有 handler 的」，不是重新对照哪一版编号顺序。
 
 > **ME-3b 的交付栏为什么这么重**（两轮修正的结果）：初版把 `initialize` 整个放在 ME-3c，而 ME-3c 依赖 ME-3b —— ME-3b 手上没有本文定义的唯一 ready 判据；第二版只把「握手」挪过来，但读一条 `initialize` 同样需要 framing、单行上限和错误闭集，那些还留在 3c，于是 3b 只能临时猜一种 framing 再由 3c 重写。**凡 ME-3b 判 ready 所必需的 wire，一律并入 ME-3b。**
 
