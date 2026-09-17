@@ -1008,7 +1008,16 @@ async fn proxy(
     };
     let token_hash = crate::drain::sha256(approval_token.as_bytes());
     let generation = state.module.get();
-    let in_flight = match generation.admit_request(request_id.clone(), token_hash) {
+    // T8.5a decision 5: `now`/`budget` are this call's, not a constant read
+    // at the call site — `state.limits.total` is the authoritative ceiling
+    // for this proxied request (see `Limits`'s own doc comment above), and
+    // is what a test can shrink to reach the timeout branch in milliseconds.
+    let in_flight = match generation.admit_request(
+        request_id.clone(),
+        token_hash,
+        Instant::now(),
+        state.limits.total,
+    ) {
         Ok(f) => f,
         Err(refused) => return refused_response(refused, &state.module),
     };
@@ -3906,7 +3915,14 @@ mod tests {
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,
         );
-        let in_flight = generation.admit_request("r-1".into(), [0u8; 32]).unwrap();
+        let in_flight = generation
+            .admit_request(
+                "r-1".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         let _ = generation.revoke();
 
         let uri: Uri = format!("{NS}/a").parse().unwrap();
@@ -3978,7 +3994,14 @@ mod tests {
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,
         );
-        let in_flight = generation.admit_request("r-3".into(), [0u8; 32]).unwrap();
+        let in_flight = generation
+            .admit_request(
+                "r-3".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
         let uri: Uri = format!("{NS}/a").parse().unwrap();
@@ -4028,7 +4051,14 @@ mod tests {
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,
         );
-        let in_flight = generation.admit_request("r-4".into(), [0u8; 32]).unwrap();
+        let in_flight = generation
+            .admit_request(
+                "r-4".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         let uri: Uri = format!("{NS}/a").parse().unwrap();
         let request = Request::builder()
             .uri(uri.clone())

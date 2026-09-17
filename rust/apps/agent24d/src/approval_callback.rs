@@ -310,7 +310,13 @@ mod tests {
     fn admit(g: &Arc<Generation>, id: &str, token: &str) -> agent24_os_proto::drain::InFlight {
         use sha2::Digest;
         let hash: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
-        g.admit_request(id.to_owned(), hash).unwrap()
+        g.admit_request(
+            id.to_owned(),
+            hash,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap()
     }
 
     fn granted(has_approval: bool) -> Grants {

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use agent24_domain::{Capability, EventSink, Grants};
-use agent24_os_proto::drain::{CallbackRefused, Generation};
+use agent24_os_proto::drain::{CallbackRefused, Generation, LifecycleTimeout, bind_to_lifecycle};
 use agent24_os_proto::rpc::{
     CallFuture, ErrorKind, Handler, ParamsBudget, RpcError, walk_params_budget,
 };
@@ -265,14 +265,48 @@ impl Handler for EventsEmitHandler {
                 ));
             }
 
-            // 5. `EventSink::emit`'s own validation (kind length/syntax,
+            // 5. Bind the emit to this call's (possibly absent) request
+            // lifecycle (T8.5a design doc, decision 3). This is the one
+            // real wiring point for `bind_to_lifecycle` this round, and — as
+            // the design doc says up front — it can only prove ROUTING is
+            // correct (judgement 9b): `sink.emit` is a synchronous function,
+            // so `work` here is `std::future::Ready`, resolved on its first
+            // poll before `tokio::select!`'s timeout/ended arms ever get a
+            // chance to win. Proving a long-running callback is actually cut
+            // short (judgement 9a) is done directly against
+            // `bind_to_lifecycle` with a stub future, not through this
+            // handler — that needs a real asynchronous business operation,
+            // which arrives with T8.5c.
+            //
+            // `EventSink::emit`'s own validation (kind length/syntax,
             // enforced identically for in-process and out-of-process
-            // modules) — a failure here is `invalid_params`, not a
-            // capability or lifecycle failure.
-            sink.emit(&parsed.kind, parsed.payload)
-                .map_err(|e| RpcError::invalid_params(e.to_string()))?;
-
-            Ok(Value::Object(Map::new()))
+            // modules) is still `invalid_params`, not a capability or
+            // lifecycle failure.
+            let lifecycle = parsed
+                .request_id
+                .as_deref()
+                .and_then(|id| generation.request_lifecycle(id));
+            match bind_to_lifecycle(
+                lifecycle,
+                std::future::ready(sink.emit(&parsed.kind, parsed.payload)),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(Value::Object(Map::new())),
+                Ok(Err(e)) => Err(RpcError::invalid_params(e.to_string())),
+                // M-new2 (design doc's frozen-design note): these two are
+                // deliberately worded to not presume a fact the code has not
+                // checked — "budget exhausted" does not claim the request has
+                // ended, and vice versa.
+                Err(LifecycleTimeout::BudgetExhausted) => Err(RpcError::application(
+                    ErrorKind::Timeout,
+                    "this callback's request-bound time budget was exhausted",
+                )),
+                Err(LifecycleTimeout::RequestEnded) => Err(RpcError::application(
+                    ErrorKind::Timeout,
+                    "the request this callback was bound to has already ended",
+                )),
+            }
         })
     }
 }
@@ -484,9 +518,23 @@ mod tests {
     #[tokio::test]
     async fn running_without_a_request_id_is_a_background_event() {
         let (bus, sink) = events("probe");
-        let h = handler(running_generation(), true, Some(sink), generous_limiter());
+        let g = running_generation();
+        // Judgement 2 (design doc): a call with no `request_id` is not
+        // affected by any OTHER request's remaining time — a near-expiry
+        // one, kept in flight in the SAME generation, must not make this
+        // background call time out or otherwise change its outcome.
+        let unrelated = g
+            .admit_request(
+                "unrelated-near-expiry".to_owned(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        let h = handler(g, true, Some(sink), generous_limiter());
         h.call(good_params()).await.unwrap();
         assert_eq!(module_events(&bus).len(), 1);
+        drop(unrelated);
     }
 
     #[tokio::test]
@@ -517,7 +565,14 @@ mod tests {
         // Admitted while Running, and kept alive (not dropped) so the id stays
         // in `in_flight` through the drain — this is exactly the "still-live
         // request" case `admit_callback` is meant to allow through.
-        let in_flight = g.admit_request("req-1".to_owned(), [0u8; 32]).unwrap();
+        let in_flight = g
+            .admit_request(
+                "req-1".to_owned(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(g.begin_drain(Instant::now(), Duration::from_secs(30)));
         let h = handler(g, true, Some(sink), generous_limiter());
         let params = json!({"kind": "task.transitioned", "payload": {}, "request_id": "req-1"});
@@ -525,6 +580,53 @@ mod tests {
         assert_eq!(result, json!({}));
         assert_eq!(module_events(&bus).len(), 1);
         drop(in_flight);
+    }
+
+    // ── T8.5a judgement 9b: `bind_to_lifecycle` wiring, routing only ──
+    // (`sink.emit` is synchronous, so none of these can demonstrate a long
+    // callback being cut short — that is judgement 9a, tested directly
+    // against `bind_to_lifecycle` with a stub future in `drain.rs`. These
+    // only prove the `Some`/`None` routing and the parameters passed are
+    // correct — same outcome as before `bind_to_lifecycle` existed.)
+
+    /// A live (still in-flight, Running state) `request_id` lands exactly
+    /// like the no-`request_id` case (`running_without_a_request_id_is_a_background_event`
+    /// above) — `bind_to_lifecycle`'s `Some` branch selects `work`'s result
+    /// because `sink.emit` resolves on its very first poll, before
+    /// `tokio::select!`'s timeout/ended arms get a chance to win.
+    #[tokio::test]
+    async fn a_live_request_id_lands_exactly_like_no_request_id() {
+        let (bus, sink) = events("probe");
+        let g = running_generation();
+        let in_flight = g
+            .admit_request(
+                "req-1".to_owned(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let h = handler(g, true, Some(sink), generous_limiter());
+        let params =
+            json!({"kind": "task.transitioned", "payload": {"x": 1}, "request_id": "req-1"});
+        let result = h.call(params).await.unwrap();
+        assert_eq!(result, json!({}));
+        assert_eq!(module_events(&bus).len(), 1);
+        drop(in_flight);
+    }
+
+    /// A `request_id` that `request_lifecycle` cannot find (Running state,
+    /// so `admit_callback` still admits it — decision 2's range boundary)
+    /// routes to `bind_to_lifecycle`'s `None` branch and lands exactly like
+    /// no `request_id` at all — no spurious timeout from a `None` lifecycle.
+    #[tokio::test]
+    async fn an_unknown_request_id_lands_via_the_none_branch() {
+        let (bus, sink) = events("probe");
+        let h = handler(running_generation(), true, Some(sink), generous_limiter());
+        let params = json!({"kind": "task.transitioned", "payload": {}, "request_id": "ghost"});
+        let result = h.call(params).await.unwrap();
+        assert_eq!(result, json!({}));
+        assert_eq!(module_events(&bus).len(), 1);
     }
 
     /// `CallbackRefused`'s mapping to wire kinds, pinned directly — including
