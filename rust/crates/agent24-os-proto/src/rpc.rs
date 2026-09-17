@@ -136,10 +136,23 @@ pub enum ErrorKind {
     /// T7a/ME-3e: `dispatch()`'s generic node/depth/string-byte budget on
     /// `params`, or an events-specific serialized-size cap, was exceeded.
     PayloadTooLarge,
+    /// T7b/ME-3e (design doc, decision 2): a `_a24/approval/gate`/`advise`
+    /// submission's `{request_id, approval_token}` failed
+    /// `Generation::admit_approval_callback` — the id was never in flight,
+    /// already finished, from an old generation, or the token was wrong or
+    /// already used. Deliberately ONE kind for all of those (see the design
+    /// doc's error matrix): telling them apart would let an unauthorized
+    /// caller learn which half of the pair was wrong.
+    TokenInvalid,
+    /// T7b/ME-3e (design doc, decision 2): `_a24/approval/status` was asked
+    /// for an `approval_id` that does not exist, or exists but belongs to a
+    /// different module. Deliberately ONE kind for both (decision 4): telling
+    /// them apart would let a caller enumerate other modules' approval ids.
+    NotFound,
 }
 
 impl ErrorKind {
-    pub const ALL: [ErrorKind; 15] = [
+    pub const ALL: [ErrorKind; 17] = [
         Self::Forbidden,
         Self::Busy,
         Self::Cancelled,
@@ -155,6 +168,8 @@ impl ErrorKind {
         Self::Revoked,
         Self::RateLimited,
         Self::PayloadTooLarge,
+        Self::TokenInvalid,
+        Self::NotFound,
     ];
 
     /// The wire string.
@@ -176,6 +191,8 @@ impl ErrorKind {
             Self::Revoked => "revoked",
             Self::RateLimited => "rate_limited",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::TokenInvalid => "token_invalid",
+            Self::NotFound => "not_found",
         }
     }
 }
@@ -1918,7 +1935,7 @@ mod tests {
     /// with that edit, not just with the enum.
     #[test]
     fn the_error_kinds_are_exactly_specs_closed_set() {
-        const SPEC: &str = "kind 是闭集（T7a/ME-3e 为 events emit 扩展）：`forbidden` / `busy` / `cancelled` / `timeout` / `quota_exceeded` / `invalid_lease` / `unknown_capability` / `version_mismatch` / **`auth_failed`** / **`manifest_mismatch`** / `not_ready` / `draining` / `revoked` / `rate_limited` / `payload_too_large`";
+        const SPEC: &str = "kind 是闭集（T7a/ME-3e 为 events emit 扩展了 5 个，T7b/ME-3e 又为 approval gate/advise/status 扩展了 2 个）：`forbidden` / `busy` / `cancelled` / `timeout` / `quota_exceeded` / `invalid_lease` / `unknown_capability` / `version_mismatch` / **`auth_failed`** / **`manifest_mismatch`** / `not_ready` / `draining` / `revoked` / `rate_limited` / `payload_too_large` / `token_invalid` / `not_found`";
         let quoted: HashSet<&str> = SPEC.split('`').skip(1).step_by(2).collect();
         let ours: HashSet<&str> = ErrorKind::ALL.iter().map(|k| k.as_str()).collect();
         assert_eq!(ours, quoted);

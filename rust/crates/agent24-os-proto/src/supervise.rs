@@ -1270,9 +1270,13 @@ mod tests {
         let p = start(dir.path()).await;
         let generation = p.generation().clone();
         assert!(generation.ready());
-        let sent = generation.admit_request("sent".to_owned()).unwrap();
+        let sent = generation
+            .admit_request("sent".to_owned(), [0u8; 32])
+            .unwrap();
         assert!(sent.dispatch());
-        let _unsent = generation.admit_request("unsent".to_owned()).unwrap();
+        let _unsent = generation
+            .admit_request("unsent".to_owned(), [0u8; 32])
+            .unwrap();
         // Another generation, to show which one is revoked.
         let other = Generation::starting();
 

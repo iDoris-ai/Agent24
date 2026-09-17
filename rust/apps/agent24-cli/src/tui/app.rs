@@ -269,6 +269,12 @@ impl App {
                 self.log(&p.run_id, format!("⏰ fired by schedule {}", p.schedule_id))
             }
             EventBody::ScheduleDisabled(_) => {}
+            // T7b/ME-3e: module (gate/advise) approvals are a separate REST
+            // surface (`/api/v1/module-approvals`) this TUI does not render
+            // — explicit variants, not a wildcard `_`, so a FUTURE new
+            // `EventBody` variant still fails to compile here until handled
+            // (design doc "现状" 1).
+            EventBody::ModuleApprovalRequired(_) | EventBody::ModuleApprovalResolved { .. } => {}
             // Module events are namespaced to a loadable module (e.g. sin90);
             // the generic CLI TUI has nothing to render for them.
             EventBody::Module(_) => {}

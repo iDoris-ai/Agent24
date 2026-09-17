@@ -140,6 +140,7 @@ dependencies = [
  "rustix 0.38.44",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tower",
@@ -170,9 +171,12 @@ name = "agent24-protocol"
 version = "0.3.0"
 dependencies = [
  "fs2",
+ "hex",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -310,6 +314,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-util",

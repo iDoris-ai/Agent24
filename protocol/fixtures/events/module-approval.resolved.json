@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "seq": 11,
+  "ts": "2026-09-17T12:04:30Z",
+  "type": "module-approval.resolved",
+  "payload": {
+    "id": "b3f1c2a9e4d5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1",
+    "decision": "approved"
+  }
+}

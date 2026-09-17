@@ -699,10 +699,12 @@ impl ScopedMemory for OsScopedMemory {
     }
 }
 
-/// A [`KernelCtx`](agent24_domain::KernelCtx) that also lends memory.
+/// A [`KernelCtx`](agent24_domain::KernelCtx) that also lends memory and
+/// approval (T7b/ME-3e).
 pub struct MemoryCtx {
     pub sink: Option<agent24_domain::EventSink>,
     pub memory: Option<Arc<OsScopedMemory>>,
+    pub approval: Option<agent24_domain::ApprovalRequester>,
 }
 
 impl agent24_domain::KernelCtx for MemoryCtx {
@@ -711,6 +713,9 @@ impl agent24_domain::KernelCtx for MemoryCtx {
     }
     fn memory(&self) -> Option<&dyn ScopedMemory> {
         self.memory.as_deref().map(|m| m as &dyn ScopedMemory)
+    }
+    fn approval(&self) -> Option<&agent24_domain::ApprovalRequester> {
+        self.approval.as_ref()
     }
 }
 

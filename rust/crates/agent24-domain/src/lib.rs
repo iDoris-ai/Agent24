@@ -153,6 +153,9 @@ pub enum Capability {
     /// A SCOPE-LIMITED memory handle (M-D stores). Not ambient. Lands with
     /// `KernelCtx::memory` (ME-1b+).
     Memory,
+    /// Submit `_a24/approval/gate`/`advise` and query `_a24/approval/status`
+    /// (T7b/ME-3e). Lands with `KernelCtx::approval`.
+    Approval,
 }
 
 /// Every capability this build knows, in declaration order. The single place the
@@ -164,6 +167,7 @@ pub const ALL_CAPABILITIES: &[Capability] = &[
     Capability::Scheduler,
     Capability::Policy,
     Capability::Memory,
+    Capability::Approval,
 ];
 
 /// A capability string a manifest asked for that this build does not know.
@@ -213,6 +217,7 @@ impl Capability {
             Capability::Scheduler => "scheduler",
             Capability::Policy => "policy",
             Capability::Memory => "memory",
+            Capability::Approval => "approval",
         }
     }
 }
@@ -909,6 +914,52 @@ pub trait EventBroadcast: Send + Sync {
     fn send(&self, body: EventBody);
 }
 
+/// A boxed, borrowed future — hand-written rather than pulling in `futures`/
+/// `futures-core` for one alias (T7b/ME-3e design doc, decision 6: either is
+/// fine, this crate picks the no-new-dependency option).
+pub type ApprovalFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Where a module's `_a24/approval/gate`/`advise`/`status` calls go
+/// (T7b/ME-3e design doc, decision 6) — the in-process analogue of
+/// [`EventBroadcast`]. The kernel supplies the real implementation
+/// (`PolicyApprovalBackend` in `agent24d`); this crate only holds the
+/// contract, so it need not depend on `agent24-policy` or `agent24-store`.
+pub trait ApprovalBackend: Send + Sync {
+    /// Submit a `gate` (kernel-executed) or `advise` (module-domain) action.
+    /// Returns immediately with `decision: Pending` (or an error) — this is
+    /// the async submit-then-poll model (design doc "v4→v5"), never a
+    /// blocking wait for a human decision.
+    fn submit<'a>(
+        &'a self,
+        module: &'a str,
+        kind: agent24_protocol::ModuleApprovalKind,
+        action: String,
+        target: Option<String>,
+        payload: serde_json::Value,
+    ) -> ApprovalFuture<
+        'a,
+        std::result::Result<
+            agent24_protocol::ApprovalAnswer,
+            agent24_protocol::ApprovalRequestError,
+        >,
+    >;
+
+    /// Query the current decision for `approval_id`, scoped to `module` —
+    /// idempotent, callable any number of times, at any time after submit.
+    fn status<'a>(
+        &'a self,
+        module: &'a str,
+        approval_id: &'a str,
+    ) -> ApprovalFuture<
+        'a,
+        std::result::Result<
+            agent24_protocol::ApprovalAnswer,
+            agent24_protocol::ApprovalRequestError,
+        >,
+    >;
+}
+
 /// Longest acceptable event `kind`. Kinds are dotted names like
 /// `"task.transitioned"`, not payloads.
 const MAX_KIND_BYTES: usize = 96;
@@ -1009,6 +1060,54 @@ impl EventSink {
     }
 }
 
+/// A module's ONLY way to submit/query approvals in-process — bound to a
+/// VALIDATED manifest at construction, exactly like [`EventSink::new`]
+/// (T7b/ME-3e design doc, decision 6: "照抄 `EventSink::new`", not an
+/// `impl Into<String>` a caller could hand an arbitrary string to). The
+/// requester's EXISTENCE is the capability: the kernel builds one only for a
+/// module it granted [`Capability::Approval`].
+pub struct ApprovalRequester {
+    module: String,
+    backend: Arc<dyn ApprovalBackend>,
+}
+
+impl ApprovalRequester {
+    /// Build the requester for `manifest`'s module. The name is taken from
+    /// the manifest, never from a caller-supplied string.
+    #[must_use]
+    pub fn new(manifest: &DomainOsManifest, backend: Arc<dyn ApprovalBackend>) -> Self {
+        Self {
+            module: manifest.name().to_owned(),
+            backend,
+        }
+    }
+
+    /// Submit a `gate`/`advise` action. Returns immediately — see
+    /// [`ApprovalBackend::submit`]'s docs on the async submit-then-poll model.
+    pub async fn submit(
+        &self,
+        kind: agent24_protocol::ModuleApprovalKind,
+        action: impl Into<String>,
+        target: Option<String>,
+        payload: serde_json::Value,
+    ) -> std::result::Result<agent24_protocol::ApprovalAnswer, agent24_protocol::ApprovalRequestError>
+    {
+        self.backend
+            .submit(&self.module, kind, action.into(), target, payload)
+            .await
+    }
+
+    /// Query the current decision for `approval_id`, scoped to this
+    /// requester's module.
+    pub async fn status(
+        &self,
+        approval_id: &str,
+    ) -> std::result::Result<agent24_protocol::ApprovalAnswer, agent24_protocol::ApprovalRequestError>
+    {
+        self.backend.status(&self.module, approval_id).await
+    }
+}
+
 /// What the kernel lends a module. Capability-scoped by SHAPE: an ungranted
 /// capability has no handle, so there is nothing to call and no check to forget.
 ///
@@ -1048,6 +1147,14 @@ pub trait KernelCtx: Send + Sync {
         // Defaulted so existing implementors (and tests) do not have to opt in to
         // a capability they never had. "Not granted" is the honest default: a
         // context that has not been taught to lend memory does not lend it.
+        None
+    }
+
+    /// The module-scoped approval requester, or `None` when
+    /// [`Capability::Approval`] was not granted (T7b/ME-3e). Defaulted for
+    /// the same reason as [`Self::memory`]: existing implementors need not
+    /// opt in to a capability they never had.
+    fn approval(&self) -> Option<&ApprovalRequester> {
         None
     }
 }
@@ -1242,6 +1349,7 @@ impl_kind: in_process_crate
             Capability::Scheduler,
             Capability::Policy,
             Capability::Memory,
+            Capability::Approval,
         ]
         .into_iter()
         .inspect(|c| {
@@ -1252,7 +1360,8 @@ impl_kind: in_process_crate
                 | Capability::Models
                 | Capability::Scheduler
                 | Capability::Policy
-                | Capability::Memory => {}
+                | Capability::Memory
+                | Capability::Approval => {}
             }
         })
         .collect();

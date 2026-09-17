@@ -110,7 +110,7 @@
 //! for "in flight reached zero or the grace ran out" is its business; this
 //! answers "which of those is true at `now`".
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -170,6 +170,24 @@ pub enum CallbackRefused {
     Revoked,
 }
 
+/// Why an approval-submitting callback (`_a24/approval/gate`/`advise`) was
+/// refused (T7b/ME-3e design doc, decision 2). A DELIBERATELY coarser set than
+/// [`CallbackRefused`]: rows 3 and 4 of the decision's error matrix — an id
+/// that was never in flight, one that already finished, one from an old
+/// generation, and one whose token is wrong or already used — all fold into
+/// the same [`Self::TokenInvalid`], so an unauthorized caller cannot tell "bad
+/// id" from "bad token" apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalCallbackRefused {
+    /// Before `initialize` completed nothing is authorised.
+    NotReady,
+    /// The generation is revoked: nothing is admitted.
+    Revoked,
+    /// `request_id` is not in flight, or the token does not match / was
+    /// already used. Deliberately one outcome for all of those (see above).
+    TokenInvalid,
+}
+
 /// The one value that allows killing a module's process group.
 ///
 /// Not `Clone`, not `Default`, no public constructor: [`Generation::revoke`] is
@@ -212,10 +230,27 @@ pub enum DrainProgress {
     Expired { in_flight: usize },
 }
 
+/// One in-flight request's approval-callback token (T7b/ME-3e design doc,
+/// decision 2): the SHA-256 of the plaintext `X-A24-Approval-Token` minted
+/// alongside this request's id, never the plaintext itself, and whether it
+/// has already been spent. Minted and registered in the SAME
+/// [`Generation::admit_request`] call as the id — never a second, later
+/// write — so there is no window where the id is admitted but has no token
+/// yet.
+#[derive(Debug, Clone, Copy)]
+struct ApprovalToken {
+    hash: [u8; 32],
+    used: bool,
+}
+
 #[derive(Debug)]
 struct Inner {
     state: DrainState,
-    in_flight: HashSet<String>,
+    /// Keyed by request id; each entry also carries that request's approval
+    /// token (T7b/ME-3e). A plain `HashSet<String>` was enough before the
+    /// token existed — the value only needs to say "is this id live", now it
+    /// also has to say "and if so, with which secret".
+    in_flight: HashMap<String, ApprovalToken>,
     /// The subset of `in_flight` that has been sent to the module. Marked under
     /// the same lock `revoke` takes, so "sent" and "revoked" are ordered: a
     /// request is either sent before the revocation (its outcome is then
@@ -271,7 +306,7 @@ impl Generation {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 state: DrainState::Starting,
-                in_flight: HashSet::new(),
+                in_flight: HashMap::new(),
                 dispatched: HashSet::new(),
                 drain_deadline: None,
             }),
@@ -331,21 +366,39 @@ impl Generation {
         }
     }
 
-    /// Admit a new proxied request carrying the kernel-minted `id`.
+    /// Admit a new proxied request carrying the kernel-minted `id`, minting
+    /// and registering its approval-callback token in the SAME step
+    /// (T7b/ME-3e design doc, decision 2 — "铸造与登记必须在同一次
+    /// `admit_request` 调用里完成"): there is deliberately no separate,
+    /// later call that attaches a token to an id already admitted, which
+    /// would leave a window where the id exists with no token to check.
+    /// `token_hash` is the SHA-256 of the plaintext token minted alongside
+    /// `id` — never the plaintext itself.
     ///
     /// # Errors
     ///
     /// Anything but `Running` refuses, each state with its own reason.
-    pub fn admit_request(self: &Arc<Self>, id: String) -> Result<InFlight, RequestRefused> {
+    pub fn admit_request(
+        self: &Arc<Self>,
+        id: String,
+        token_hash: [u8; 32],
+    ) -> Result<InFlight, RequestRefused> {
         let mut inner = self.lock();
         match inner.state {
             DrainState::Starting => Err(RequestRefused::NotReady),
             DrainState::Draining => Err(RequestRefused::Draining),
             DrainState::Revoked => Err(RequestRefused::Stopping),
             DrainState::Running => {
-                if !inner.in_flight.insert(id.clone()) {
+                if inner.in_flight.contains_key(&id) {
                     return Err(RequestRefused::DuplicateId);
                 }
+                inner.in_flight.insert(
+                    id.clone(),
+                    ApprovalToken {
+                        hash: token_hash,
+                        used: false,
+                    },
+                );
                 Ok(InFlight {
                     generation: Arc::clone(self),
                     id,
@@ -368,10 +421,51 @@ impl Generation {
             DrainState::Revoked => Err(CallbackRefused::Revoked),
             DrainState::Draining => match request_id {
                 None => Err(CallbackRefused::DrainingWithoutRequest),
-                Some(id) if inner.in_flight.contains(id) => Ok(()),
+                Some(id) if inner.in_flight.contains_key(id) => Ok(()),
                 Some(_) => Err(CallbackRefused::DrainingUnknownRequest),
             },
         }
+    }
+
+    /// May a `_a24/approval/gate`/`advise` SUBMIT proceed, and — if so — mark
+    /// its token used? (T7b/ME-3e design doc, decision 2.) Verification and
+    /// consumption are ONE atomic step under one lock: there is no window
+    /// between "checked valid" and "marked used" in which a second,
+    /// concurrent submit for the same `request_id` could also pass.
+    ///
+    /// Unlike [`Self::admit_callback`], `Running` and `Draining` are treated
+    /// identically here — an approval submission always carries a
+    /// `request_id`, so there is no "background work, no id" case to tell
+    /// apart, and a still-in-flight request's approval submission is exactly
+    /// the case `Draining` must keep admitting (SPEC §4).
+    ///
+    /// # Errors
+    ///
+    /// See [`ApprovalCallbackRefused`] and decision 2's error matrix: an id
+    /// that was never in flight, one that already finished, one from an old
+    /// generation, a wrong token, and an already-used token all collapse into
+    /// [`ApprovalCallbackRefused::TokenInvalid`] — deliberately, so an
+    /// unauthorized caller cannot tell those apart (judgement 3-6).
+    pub fn admit_approval_callback(
+        &self,
+        request_id: &str,
+        token: &str,
+    ) -> Result<(), ApprovalCallbackRefused> {
+        let mut inner = self.lock();
+        match inner.state {
+            DrainState::Starting => return Err(ApprovalCallbackRefused::NotReady),
+            DrainState::Revoked => return Err(ApprovalCallbackRefused::Revoked),
+            DrainState::Running | DrainState::Draining => {}
+        }
+        let Some(entry) = inner.in_flight.get_mut(request_id) else {
+            return Err(ApprovalCallbackRefused::TokenInvalid);
+        };
+        let presented = sha256(token.as_bytes());
+        if entry.used || !constant_time_eq(&entry.hash, &presented) {
+            return Err(ApprovalCallbackRefused::TokenInvalid);
+        }
+        entry.used = true;
+        Ok(())
     }
 
     /// Stop admitting new requests; let in-flight ones run for at most `grace`.
@@ -445,7 +539,7 @@ impl Generation {
             inner.state = DrainState::Revoked;
             let (sent, unsent): (Vec<String>, Vec<String>) = inner
                 .in_flight
-                .iter()
+                .keys()
                 .cloned()
                 .partition(|id| inner.dispatched.contains(id));
             (sent, unsent)
@@ -696,6 +790,29 @@ impl Drop for InFlight {
     }
 }
 
+/// SHA-256 of `bytes` (T7b/ME-3e design doc, decision 2). Used to hash the
+/// plaintext `X-A24-Approval-Token` presented in a `gate`/`advise` submission
+/// against the hash [`Generation::admit_request`] stored — the plaintext
+/// itself is never kept. `pub(crate)`: `proxy.rs` hashes the token it mints
+/// with this same function, so minting and verifying can never disagree on
+/// the hash.
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// Constant-time comparison — a copy of `agent24d::server::constant_time_eq`
+/// (T7b/ME-3e design doc, decision 2: the two crates do not depend on each
+/// other, so the one function is duplicated rather than the dependency
+/// added). Length is checked first — a length mismatch is not the secret
+/// being timed, so this branch not being constant-time gives nothing away.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -722,11 +839,11 @@ mod tests {
     #[test]
     fn draining_refuses_new_requests_but_not_the_ones_in_flight() {
         let g = running();
-        let a = g.admit_request("a".into()).unwrap();
+        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
         assert!(g.begin_drain(Instant::now(), GRACE));
 
         assert_eq!(
-            g.admit_request("b".into()).unwrap_err(),
+            g.admit_request("b".into(), [0u8; 32]).unwrap_err(),
             RequestRefused::Draining
         );
         assert_eq!(RequestRefused::Draining.code(), "module_draining");
@@ -743,8 +860,8 @@ mod tests {
     #[test]
     fn draining_admits_only_callbacks_that_name_a_live_request() {
         let g = running();
-        let a = g.admit_request("a".into()).unwrap();
-        let done = g.admit_request("done".into()).unwrap();
+        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
+        let done = g.admit_request("done".into(), [0u8; 32]).unwrap();
         done.finish().unwrap();
 
         // Control: Running admits all three shapes.
@@ -770,7 +887,7 @@ mod tests {
     #[test]
     fn revoking_refuses_every_callback_including_in_flight_ones() {
         let g = running();
-        let a = g.admit_request("a".into()).unwrap();
+        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
         assert!(g.begin_drain(Instant::now(), GRACE));
         assert_eq!(
             g.admit_callback(Some("a")),
@@ -785,7 +902,7 @@ mod tests {
         assert_eq!(g.admit_callback(Some("a")), Err(CallbackRefused::Revoked));
         assert_eq!(g.admit_callback(None), Err(CallbackRefused::Revoked));
         assert_eq!(
-            g.admit_request("b".into()).unwrap_err(),
+            g.admit_request("b".into(), [0u8; 32]).unwrap_err(),
             RequestRefused::Stopping
         );
         // SPEC §8: *"drain 超时的在途请求返回 503(不假装成功)"*.
@@ -799,7 +916,7 @@ mod tests {
         let t = Instant::now();
 
         let g = running();
-        let a = g.admit_request("a".into()).unwrap();
+        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
         assert!(g.begin_drain(t, GRACE));
         assert_eq!(
             g.progress(t + Duration::from_secs(3)),
@@ -812,7 +929,7 @@ mod tests {
         assert_eq!(g.progress(t + Duration::from_secs(3)), DrainProgress::Idle);
 
         let g = running();
-        let _b = g.admit_request("b".into()).unwrap();
+        let _b = g.admit_request("b".into(), [0u8; 32]).unwrap();
         assert!(g.begin_drain(t, GRACE));
         assert_eq!(
             g.progress(t + GRACE),
@@ -827,7 +944,7 @@ mod tests {
     #[test]
     fn a_dropped_request_leaves_the_in_flight_set() {
         let g = running();
-        let a = g.admit_request("a".into()).unwrap();
+        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
         drop(a);
         assert!(g.begin_drain(Instant::now(), GRACE));
         assert_eq!(g.progress(Instant::now()), DrainProgress::Idle);
@@ -838,7 +955,7 @@ mod tests {
     #[test]
     fn progress_outside_a_drain_is_not_draining() {
         let g = running();
-        let _a = g.admit_request("a".into()).unwrap();
+        let _a = g.admit_request("a".into(), [0u8; 32]).unwrap();
         assert_eq!(g.progress(Instant::now()), DrainProgress::NotDraining);
         // Revoked AFTER a drain began, so a deadline exists: `NotDraining` here
         // must come from the state, not from the deadline being absent.
@@ -857,7 +974,7 @@ mod tests {
         assert!(!g.ready());
         assert_eq!(g.state(), DrainState::Draining);
         assert_eq!(
-            g.admit_request("b".into()).unwrap_err(),
+            g.admit_request("b".into(), [0u8; 32]).unwrap_err(),
             RequestRefused::Draining
         );
     }
@@ -866,7 +983,7 @@ mod tests {
     fn a_second_drain_does_not_extend_the_grace() {
         let t = Instant::now();
         let g = running();
-        let _a = g.admit_request("a".into()).unwrap();
+        let _a = g.admit_request("a".into(), [0u8; 32]).unwrap();
         assert!(g.begin_drain(t, GRACE));
         assert!(!g.begin_drain(t + Duration::from_secs(5), GRACE));
         assert_eq!(
@@ -895,7 +1012,7 @@ mod tests {
     fn a_module_that_is_not_ready_admits_nothing_and_goes_straight_to_revoked() {
         let g = Generation::starting();
         assert_eq!(
-            g.admit_request("a".into()).unwrap_err(),
+            g.admit_request("a".into(), [0u8; 32]).unwrap_err(),
             RequestRefused::NotReady
         );
         assert_eq!(g.admit_callback(None), Err(CallbackRefused::NotReady));
@@ -915,7 +1032,7 @@ mod tests {
     fn a_restart_does_not_carry_a_request_in_flight_into_the_next_run() {
         let current = Current::new(running());
         let old = current.get();
-        let a = old.admit_request("a".into()).unwrap();
+        let a = old.admit_request("a".into(), [0u8; 32]).unwrap();
 
         let next = running();
         let replaced = current.replace(Arc::clone(&next));
@@ -926,7 +1043,7 @@ mod tests {
         let _ = replaced.revoke();
 
         assert_eq!(a.finish(), Err(Abandoned { dispatched: false }));
-        assert!(current.get().admit_request("b".into()).is_ok());
+        assert!(current.get().admit_request("b".into(), [0u8; 32]).is_ok());
         assert!(Arc::ptr_eq(&current.get(), &next));
     }
 
@@ -936,8 +1053,8 @@ mod tests {
     #[test]
     fn after_revocation_nothing_more_is_sent_and_what_was_sent_is_reported() {
         let g = running();
-        let sent = g.admit_request("sent".into()).unwrap();
-        let unsent = g.admit_request("unsent".into()).unwrap();
+        let sent = g.admit_request("sent".into(), [0u8; 32]).unwrap();
+        let unsent = g.admit_request("unsent".into(), [0u8; 32]).unwrap();
         assert!(sent.dispatch(), "control: a running generation may send");
 
         let r = g.revoke().unwrap();
@@ -978,9 +1095,9 @@ mod tests {
     #[test]
     fn a_duplicate_id_is_refused_rather_than_aliased() {
         let g = running();
-        let _a = g.admit_request("a".into()).unwrap();
+        let _a = g.admit_request("a".into(), [0u8; 32]).unwrap();
         assert_eq!(
-            g.admit_request("a".into()).unwrap_err(),
+            g.admit_request("a".into(), [0u8; 32]).unwrap_err(),
             RequestRefused::DuplicateId
         );
     }
@@ -1017,5 +1134,119 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), g.revoked())
             .await
             .expect("a late waiter was not told");
+    }
+
+    // ── T7b/ME-3e: `admit_approval_callback` (design doc decision 2) ──────
+    //
+    // These test the raw primitive directly — the state-machine fact that a
+    // token is checked-and-consumed as one atomic step. The higher-level
+    // policy of a wire resubmission being idempotent (design doc judgement
+    // 16a) is a DIFFERENT layer (`ModuleApprovalBroker`'s idempotency
+    // lookup, which runs BEFORE this primitive is ever called again for the
+    // same `(module, request_id, kind)`); it is tested in `agent24d`, not
+    // here.
+
+    fn admit(g: &Arc<Generation>, id: &str, token: &str) -> InFlight {
+        g.admit_request(id.to_owned(), sha256(token.as_bytes()))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_fresh_token_admits_exactly_once_then_is_invalid() {
+        let g = running();
+        let _in_flight = admit(&g, "r1", "secret-1");
+        // Judgement 3, control: the first use succeeds.
+        assert_eq!(g.admit_approval_callback("r1", "secret-1"), Ok(()));
+        // Judgement 3: the SAME token, used again for the SAME request,
+        // is rejected — `admit_approval_callback` marks it used atomically
+        // with the check, so a second raw call can never pass.
+        assert_eq!(
+            g.admit_approval_callback("r1", "secret-1"),
+            Err(ApprovalCallbackRefused::TokenInvalid)
+        );
+    }
+
+    #[test]
+    fn mismatched_id_and_token_pairs_are_both_refused() {
+        let g = running();
+        let _a = admit(&g, "a", "token-a");
+        let _b = admit(&g, "b", "token-b");
+        // Judgement 4: A's id with B's token, and the reverse.
+        assert_eq!(
+            g.admit_approval_callback("a", "token-b"),
+            Err(ApprovalCallbackRefused::TokenInvalid)
+        );
+        assert_eq!(
+            g.admit_approval_callback("b", "token-a"),
+            Err(ApprovalCallbackRefused::TokenInvalid)
+        );
+        // Control: the correct pairing on either side still works.
+        assert_eq!(g.admit_approval_callback("a", "token-a"), Ok(()));
+        assert_eq!(g.admit_approval_callback("b", "token-b"), Ok(()));
+    }
+
+    #[test]
+    fn a_token_from_a_different_generation_is_refused() {
+        // Judgement 5: a module that restarted (a fresh `Generation`) cannot
+        // use a token minted for its previous run — the two `in_flight`
+        // maps are entirely separate objects.
+        let old_gen = running();
+        let _a = admit(&old_gen, "r1", "secret-1");
+        assert_eq!(old_gen.admit_approval_callback("r1", "secret-1"), Ok(()));
+
+        let new_gen = running();
+        assert_eq!(
+            new_gen.admit_approval_callback("r1", "secret-1"),
+            Err(ApprovalCallbackRefused::TokenInvalid)
+        );
+    }
+
+    #[test]
+    fn a_finished_requests_token_is_refused() {
+        // Judgement 6: once a request has `finish()`ed, its id leaves
+        // `in_flight` — its token (used or not) admits nothing afterwards.
+        let g = running();
+        let in_flight = admit(&g, "r1", "secret-1");
+        in_flight.finish().unwrap();
+        assert_eq!(
+            g.admit_approval_callback("r1", "secret-1"),
+            Err(ApprovalCallbackRefused::TokenInvalid)
+        );
+    }
+
+    #[test]
+    fn admit_approval_callback_follows_the_designed_error_matrix() {
+        // Row 1: Starting → not_ready, regardless of the pair.
+        let starting = Generation::starting();
+        assert_eq!(
+            starting.admit_approval_callback("r1", "secret-1"),
+            Err(ApprovalCallbackRefused::NotReady)
+        );
+
+        // Row 2: Revoked → revoked, regardless of the pair (even one that
+        // was live moments before).
+        let g = running();
+        let _a = admit(&g, "r1", "secret-1");
+        let _ = g.revoke();
+        assert_eq!(
+            g.admit_approval_callback("r1", "secret-1"),
+            Err(ApprovalCallbackRefused::Revoked)
+        );
+
+        // Rows 3/4 (never in flight; wrong/used token) are covered by the
+        // other tests above. Row 5 (success) is the control throughout.
+    }
+
+    #[test]
+    fn draining_still_admits_a_still_in_flight_requests_token() {
+        // Design doc "现状" 2 / decision 2: Running and Draining are treated
+        // identically for approval submission — an approval submission
+        // always carries a live `request_id`, unlike a background
+        // `_a24/events/emit` callback with none.
+        let g = running();
+        let in_flight = admit(&g, "r1", "secret-1");
+        assert!(g.begin_drain(Instant::now(), GRACE));
+        assert_eq!(g.admit_approval_callback("r1", "secret-1"), Ok(()));
+        drop(in_flight);
     }
 }

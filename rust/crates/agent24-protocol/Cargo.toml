@@ -11,6 +11,11 @@ fs2 = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+# T7b/ME-3e: `approval_digest()` (design doc, decision 6) — sha256 of a
+# canonicalized (key-sorted) payload, hex-encoded.
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
 
 [lints]
 workspace = true

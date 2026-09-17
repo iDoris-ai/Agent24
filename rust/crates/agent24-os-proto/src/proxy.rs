@@ -38,11 +38,11 @@
 //! # Not in this slice
 //!
 //! No subprocess: the upstream is an address, so this whole slice is testable
-//! against a mock and lands independently of ME-3b-3. The
-//! `X-A24-Approval-Token` / `X-A24-Request-Lease` injections need ME-3e and a
-//! lease table that does not exist; what IS here for those two is the stripping,
-//! so they can never arrive from a client and can never leave through a module,
-//! before either is ever minted.
+//! against a mock and lands independently of ME-3b-3. `X-A24-Approval-Token`
+//! is minted and injected here as of T7b/ME-3e (see [`mint_approval_token`]) —
+//! `X-A24-Request-Lease` still needs a lease table that does not exist; what
+//! IS here for it is the stripping, so it can never arrive from a client and
+//! can never leave through a module, before it is ever minted.
 //!
 //! The concurrency ceiling and both deadlines (§5) ARE here, and deliberately —
 //! an earlier draft of this comment deferred them to the supervisor. They do not
@@ -85,6 +85,15 @@ use crate::drain::{Abandoned, Current, Generation, RequestRefused};
 
 /// The non-secret correlation id the kernel injects on every proxied request.
 pub const REQUEST_ID_HEADER: &str = "x-a24-request-id";
+
+/// The SECRET the kernel mints alongside `request_id` and injects on every
+/// proxied request (T7b/ME-3e design doc, decision 2). A module presents it
+/// back on `_a24/approval/gate`/`advise` to prove the submission is tied to
+/// THIS proxied request, not merely to a `request_id` it can read off the
+/// wire (`X-A24-Request-Id` is not a secret — see [`RequestIds`] below).
+/// `strips_from_request`/`strips_from_response` cover it automatically: both
+/// already strip every `X-A24-*` header by prefix.
+pub const APPROVAL_TOKEN_HEADER: &str = "x-a24-approval-token";
 
 /// The reserved prefix. Everything under it is kernel-written, in both
 /// directions — see the module docs.
@@ -856,7 +865,8 @@ async fn exchange(
 /// the approval token precisely so that the loggable half can be cheap. The
 /// prefix exists so ids from two daemon lifetimes do not collide in a log, not
 /// to make them unguessable — the thing that must be unguessable is
-/// `X-A24-Approval-Token`, which is minted elsewhere (ME-3e) and never here.
+/// `X-A24-Approval-Token`, minted separately by [`mint_approval_token`] (never
+/// derived from an id here) precisely because these are not.
 struct RequestIds {
     prefix: String,
     next: AtomicU64,
@@ -896,6 +906,25 @@ fn short_prefix() -> String {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     format!("{nanos:08x}")
+}
+
+/// Mint the plaintext `X-A24-Approval-Token` for one proxied request: 32
+/// bytes of `/dev/urandom`, hex-encoded (T7b/ME-3e design doc, decision 2).
+///
+/// Unlike [`short_prefix`], there is NO time-based fallback: a repeated
+/// prefix costs two log lines that look related, but a repeated (or
+/// otherwise weak) approval token is the one secret this whole design's
+/// replay/mismatch guarantees rest on — the same reasoning
+/// `launch::mint_token` already applies to the handshake token. Returns
+/// `None` when the system entropy source cannot be read; the caller fails
+/// just this one request rather than admitting it with a predictable token.
+fn mint_approval_token() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The router that proxies one namespace to one module.
@@ -966,8 +995,20 @@ async fn proxy(
     // draining or stopped takes no new request, and says which — the three are
     // different things to an operator, so they are different `code`s on one 503.
     let request_id = state.ids.mint();
+    // T7b/ME-3e (decision 2): minted and hashed BEFORE `admit_request`, so the
+    // hash can be registered in the SAME call that admits the id — never a
+    // second, later write. A caller that cannot mint a real secret gets a
+    // failed request, not one admitted with a predictable token.
+    let Some(approval_token) = mint_approval_token() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "entropy_unavailable",
+            "could not mint an approval token for this request",
+        );
+    };
+    let token_hash = crate::drain::sha256(approval_token.as_bytes());
     let generation = state.module.get();
-    let in_flight = match generation.admit_request(request_id.clone()) {
+    let in_flight = match generation.admit_request(request_id.clone(), token_hash) {
         Ok(f) => f,
         Err(refused) => return refused_response(refused, &state.module),
     };
@@ -977,7 +1018,7 @@ async fn proxy(
     // total deadline, if it ignores SIGTERM — while the module's answer is still
     // being read into memory, for a response that will be thrown away.
     let response = tokio::select! {
-        r = forward(&state, &original, request, &request_id, &in_flight) => Some(r),
+        r = forward(&state, &original, request, &request_id, &approval_token, &in_flight) => Some(r),
         () = in_flight.revoked() => None,
     };
 
@@ -1129,6 +1170,7 @@ async fn forward(
     original: &Uri,
     request: Request<Body>,
     request_id: &str,
+    approval_token: &str,
     in_flight: &crate::drain::InFlight,
 ) -> Response {
     // The deadline starts HERE, not at the upstream call. Reading the client's
@@ -1176,6 +1218,11 @@ async fn forward(
     let mut headers = sanitize_request_headers(&from_client);
     if let Ok(value) = HeaderValue::from_str(request_id) {
         headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+    // T7b/ME-3e (decision 2): the secret twin of `request_id`, injected at the
+    // same admission point and the same way — never minted anywhere else.
+    if let Ok(value) = HeaderValue::from_str(approval_token) {
+        headers.insert(HeaderName::from_static(APPROVAL_TOKEN_HEADER), value);
     }
 
     // The address of the generation this request was admitted into (D4) —
@@ -3859,7 +3906,7 @@ mod tests {
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,
         );
-        let in_flight = generation.admit_request("r-1".into()).unwrap();
+        let in_flight = generation.admit_request("r-1".into(), [0u8; 32]).unwrap();
         let _ = generation.revoke();
 
         let uri: Uri = format!("{NS}/a").parse().unwrap();
@@ -3867,7 +3914,7 @@ mod tests {
             .uri(uri.clone())
             .body(Body::empty())
             .unwrap();
-        let got = forward(&state, &uri, request, "r-1", &in_flight).await;
+        let got = forward(&state, &uri, request, "r-1", "test-token", &in_flight).await;
 
         assert_eq!(got.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = got.into_body().collect().await.unwrap().to_bytes();
@@ -3931,7 +3978,7 @@ mod tests {
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,
         );
-        let in_flight = generation.admit_request("r-3".into()).unwrap();
+        let in_flight = generation.admit_request("r-3".into(), [0u8; 32]).unwrap();
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
         let uri: Uri = format!("{NS}/a").parse().unwrap();
@@ -3945,7 +3992,7 @@ mod tests {
             }))
             .unwrap();
         let task = tokio::spawn(async move {
-            let got = forward(&state, &uri, request, "r-3", &in_flight).await;
+            let got = forward(&state, &uri, request, "r-3", "test-token", &in_flight).await;
             (got, in_flight)
         });
 
@@ -3981,14 +4028,14 @@ mod tests {
             Limits::default(),
             MAX_INFLIGHT_PER_MODULE,
         );
-        let in_flight = generation.admit_request("r-4".into()).unwrap();
+        let in_flight = generation.admit_request("r-4".into(), [0u8; 32]).unwrap();
         let uri: Uri = format!("{NS}/a").parse().unwrap();
         let request = Request::builder()
             .uri(uri.clone())
             .body(Body::empty())
             .unwrap();
         let task = tokio::spawn(async move {
-            let got = forward(&state, &uri, request, "r-4", &in_flight).await;
+            let got = forward(&state, &uri, request, "r-4", "test-token", &in_flight).await;
             (got, in_flight)
         });
         module.wait_arrived().await;

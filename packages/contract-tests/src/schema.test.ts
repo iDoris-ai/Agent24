@@ -28,7 +28,7 @@ const ENVELOPE = { v: 1, seq: 0, ts: '2026-07-23T12:00:00Z' }
 describe('events schema — fixtures', () => {
   it('accepts every fixture', () => {
     const files = readdirSync(eventsDir).filter((f) => f.endsWith('.json'))
-    expect(files.length).toBeGreaterThanOrEqual(13)
+    expect(files.length).toBeGreaterThanOrEqual(15)
     for (const f of files) {
       const doc = JSON.parse(readFileSync(join(eventsDir, f), 'utf8')) as unknown
       expect(validate(doc), `${f}: ${JSON.stringify(validate.errors)}`).toBe(true)
@@ -64,6 +64,39 @@ describe('events schema — canonical negatives (fail-closed guards)', () => {
           expires_at: '2026-07-23T12:05:00Z', created_at: '2026-07-23T12:00:00Z',
           // decision + decided_at deliberately omitted
         },
+      }),
+    ).toBe(false)
+  })
+
+  it('rejects module-approval.required missing its always-present nullable target/decided_at', () => {
+    expect(
+      validate({
+        ...ENVELOPE,
+        type: 'module-approval.required',
+        payload: {
+          id: 'a'.repeat(64), module: 'sin90', request_id: 'cb-1', kind: 'advise',
+          binding: false, action: 'send_email',
+          payload: {}, payload_digest: 'sha256:x', decision: 'pending',
+          created_at: '2026-09-17T12:00:00Z', expires_at: '2026-09-17T12:05:00Z',
+          // target + decided_at deliberately omitted
+        },
+      }),
+    ).toBe(false)
+  })
+
+  it('accepts module-approval.resolved and rejects it missing `decision`', () => {
+    expect(
+      validate({
+        ...ENVELOPE,
+        type: 'module-approval.resolved',
+        payload: { id: 'a'.repeat(64), decision: 'approved' },
+      }),
+    ).toBe(true)
+    expect(
+      validate({
+        ...ENVELOPE,
+        type: 'module-approval.resolved',
+        payload: { id: 'a'.repeat(64) },
       }),
     ).toBe(false)
   })

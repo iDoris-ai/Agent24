@@ -403,6 +403,172 @@ pub struct Approval {
     pub decided_at: Option<String>,
 }
 
+// ── Module approval (T7b/ME-3e, `docs/design/T7b-ME3e-approvals.md`) ─────────
+//
+// A PARALLEL, independent type from `Approval`/`ApprovalBroker` above (design
+// doc §"现状"4): `run_id` is not required, the interaction model is async
+// submit-then-poll rather than synchronous blocking wait, and there is no
+// "delivery" concept — a decision is a terminal fact the instant it is made,
+// queried by `approval_id` as many times as a module likes.
+
+/// Which of the two protocol methods a [`ModuleApproval`] was submitted
+/// through. Carried explicitly on [`ApprovalAnswer`] too (design doc decision
+/// 6, Codex round 5 High 4) so a caller can never mistake an `Advise` result
+/// for a `Gate` one — the two differ by an order of magnitude in what they
+/// guarantee, and `decision == Approved` alone does not say which this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleApprovalKind {
+    /// A kernel-EXECUTED action. This round's closed set of executable
+    /// actions is empty (T7b scope; see the design doc's opening section), so
+    /// every `gate` submission is `forbidden` before a row is ever written —
+    /// no `ModuleApproval` with this kind exists yet in this build.
+    Gate,
+    /// A module-domain action: the kernel records and presents it, but does
+    /// not execute it and does not guarantee the module honors the answer
+    /// (SPEC §6.1 — knowledge, not a safety control).
+    Advise,
+}
+
+/// The one decision dimension a [`ModuleApproval`] has (design doc decision
+/// 3) — there is no separate "delivered" state, because the async
+/// submit-then-poll model has no delivery step to fail or get stuck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleApprovalDecision {
+    Pending,
+    Approved,
+    Denied,
+    /// Set by the periodic scan (design doc decision 5) once `expires_at`
+    /// passes while still `Pending` — equivalent to a denial, fail-closed.
+    TimedOut,
+}
+
+/// One module approval record (design doc decision 3). `(module, request_id,
+/// kind)` is UNIQUE at the storage layer — both a data-integrity constraint
+/// and the mechanism a resubmitted `{request_id, approval_token, action,
+/// target, payload}` relies on to be idempotent (a lost response, retried by
+/// the module, lands on the same row rather than a second one).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ModuleApproval {
+    /// Minted at submission time: 32 bytes random, hex-encoded. The only
+    /// credential needed to query this record — NOT derived from
+    /// `request_id` or anything else predictable, and treated as a secret
+    /// worth withholding from an unrelated caller (it discloses `action`/
+    /// `target`/`payload` to anyone who has it).
+    pub id: String,
+    /// From the callback connection's identity (the closure that built this
+    /// module's `MethodsFor`) — never self-reported by the module.
+    pub module: String,
+    /// The proxied request's correlation id — one of the two halves of the
+    /// idempotent submission key (with `module`/`kind`).
+    pub request_id: String,
+    pub kind: ModuleApprovalKind,
+    /// Always `false` when `kind == Advise`. Always unreachable when
+    /// `kind == Gate` this round (the closed set is empty, so no `Gate` row
+    /// is ever created) — kept as a real field, not derived from `kind`
+    /// alone, so a future non-empty closed set does not need a wire shape
+    /// change.
+    pub binding: bool,
+    pub action: String,
+    pub target: Option<String>,
+    /// The kernel's own record of what it received at submission time — NOT
+    /// a promise that the module will act on exactly this (SPEC §6.1: for
+    /// `Advise`, this is knowledge, not a safety control). Never accepted as
+    /// an "update" after submission; see [`approval_digest`].
+    pub payload: Value,
+    /// `approval_digest(&payload)`, computed ONCE at submission by the
+    /// kernel — never self-reported by the module.
+    pub payload_digest: String,
+    pub decision: ModuleApprovalDecision,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+    /// After this instant a `Pending` record resolves to `TimedOut` (design
+    /// doc decision 5's periodic scan judges this field).
+    pub expires_at: String,
+}
+
+/// What a `submit`/`status` call on [`agent24_domain`]'s in-process
+/// `ApprovalRequester` (design doc decision 6) gets back. A trimmed
+/// projection of [`ModuleApproval`] — a module needs the decision and enough
+/// to interpret it, not the full record (which also carries data another
+/// module's `payload` should not casually flow through).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ApprovalAnswer {
+    pub approval_id: String,
+    pub kind: ModuleApprovalKind,
+    /// `false` for `Advise`; unreachable (no `Gate` row exists) this round.
+    pub binding: bool,
+    /// `Pending` immediately after a `submit`; the current value on `status`.
+    pub decision: ModuleApprovalDecision,
+}
+
+/// Failure modes of the in-process `ApprovalRequester`'s `submit`/`status`
+/// (design doc decision 6).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ApprovalRequestError {
+    /// Only `submit(Gate, …)` can hit this: the action is not in the (this
+    /// round, empty) kernel-executable closed set. Mapped to the wire's
+    /// existing `Forbidden` kind (design doc decision 4 — SPEC §6.1's wording
+    /// is literal about reusing it, not inventing a more precise kind).
+    #[error("action not in the kernel-executable closed set")]
+    ActionNotInClosedSet,
+    /// `status` was asked for an `approval_id` that does not exist, or exists
+    /// but belongs to a different module. Mapped to the wire's
+    /// `agent24_os_proto::rpc::ErrorKind::NotFound` (design doc decision 2;
+    /// not named as a doc link — this crate does not depend on
+    /// `agent24-os-proto`) — deliberately one outcome for both (decision 4),
+    /// so a caller cannot enumerate other modules' approval ids.
+    #[error("approval not found")]
+    NotFound,
+    /// The storage layer failed. REST maps this to 503; the wire boundary
+    /// maps it to `agent24-os-proto`'s existing internal-error kind. Does not
+    /// apply to the periodic timeout scan (design doc decision 5) — that has
+    /// no caller waiting on an answer, and simply retries next cycle.
+    #[error("approval backend unavailable: {0}")]
+    BackendUnavailable(String),
+}
+
+/// Recursively rebuild `value` with every object's keys inserted in SORTED
+/// order — a `BTreeMap` intermediate guarantees this regardless of whether
+/// `serde_json::Map` itself is a `BTreeMap` (the default) or an `IndexMap`
+/// (the `preserve_order` feature, not enabled anywhere in this workspace
+/// today, but [`approval_digest`] must not silently start disagreeing with
+/// itself the day something enables it transitively).
+fn sort_object_keys_recursively(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
+            let mut out = Map::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                out.insert(k.clone(), sort_object_keys_recursively(v));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(sort_object_keys_recursively).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// The one place a [`ModuleApproval`]'s `payload_digest` is computed (design
+/// doc decision 6) — the wire handler (via `ModuleApprovalBroker::submit`)
+/// and `PolicyApprovalBackend` both go through it rather than each hashing
+/// their own copy. Keys are sorted recursively before hashing so the digest
+/// does not depend on `serde_json`'s internal `Map` ordering.
+#[must_use]
+pub fn approval_digest(payload: &Value) -> String {
+    use sha2::Digest;
+    let canonical = sort_object_keys_recursively(payload);
+    #[allow(
+        clippy::expect_used,
+        reason = "a Value that parsed can always be re-serialized"
+    )]
+    let bytes = serde_json::to_vec(&canonical).expect("Value serialization cannot fail");
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)))
+}
+
 // ── Schedule (SPEC-002 §1.5) ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

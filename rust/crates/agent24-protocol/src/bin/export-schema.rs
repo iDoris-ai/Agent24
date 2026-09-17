@@ -16,6 +16,9 @@ const FORCE_REQUIRED: &[(&str, &[&str])] = &[
     ("RunStartedPayload", &["session_id", "schedule_id"]),
     ("ToolCompletedPayload", &["output_summary"]),
     ("Approval", &["decision", "decided_at", "standing_target"]),
+    // T7b/ME-3e: `target`/`decided_at` are always present, value `null`
+    // until a target/decision exists — same rule as `Approval` above.
+    ("ModuleApproval", &["target", "decided_at"]),
 ];
 
 fn main() {
@@ -31,7 +34,7 @@ fn main() {
         );
         map.insert(
             "description".to_owned(),
-            serde_json::json!("GENERATED from the agent24-protocol Rust crate (task B4) — do not edit by hand; regenerate with `cargo run -p agent24-protocol --bin export-schema`. Wire contract details: docs/specs/SPEC-002-protocol.md §3 (message classes: approval.required is the only REQUEST-class event, answered via POST /api/v1/approvals/{id}; everything else is NOTIFICATION). Conventions: snake_case; ULID ids; ISO 8601 UTC ts; nullable fields always present as null; per-connection monotonic seq; clients ignore unknown types/fields."),
+            serde_json::json!("GENERATED from the agent24-protocol Rust crate (task B4) — do not edit by hand; regenerate with `cargo run -p agent24-protocol --bin export-schema`. Wire contract details: docs/specs/SPEC-002-protocol.md §3 (message classes: approval.required and module-approval.required (T7b/ME-3e) are the REQUEST-class events, answered via POST /api/v1/approvals/{id} and /api/v1/module-approvals/{id} respectively; everything else is NOTIFICATION). Conventions: snake_case; most ids are ULID strings, EXCEPT ModuleApproval.id (`approval_id`), which is 64 hex characters of random entropy, not a ULID (T7b/ME-3e design doc, decision 3); ISO 8601 UTC ts; nullable fields always present as null; per-connection monotonic seq; clients ignore unknown types/fields."),
         );
         // v is the protocol major version — always exactly 1 on the wire
         if let Some(v_schema) = map
@@ -54,8 +57,14 @@ fn main() {
         }
         if let Some(defs) = map.get_mut("$defs").and_then(|d| d.as_object_mut()) {
             // Timestamp-valued fields keep format: date-time in the schema
-            const DATE_TIME_FIELDS: &[(&str, &[&str])] =
-                &[("Approval", &["expires_at", "created_at", "decided_at"])];
+            const DATE_TIME_FIELDS: &[(&str, &[&str])] = &[
+                ("Approval", &["expires_at", "created_at", "decided_at"]),
+                // T7b/ME-3e.
+                (
+                    "ModuleApproval",
+                    &["expires_at", "created_at", "decided_at"],
+                ),
+            ];
             for (def_name, fields) in DATE_TIME_FIELDS {
                 if let Some(props) = defs
                     .get_mut(*def_name)

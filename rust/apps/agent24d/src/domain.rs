@@ -59,22 +59,28 @@ use axum::Router;
 
 /// What the kernel is willing to lend a domain OS today. A module may REQUEST
 /// more in its manifest; [`Grants::granting`] intersects, so asking gains
-/// nothing. The list grows as `KernelCtx` gains handles — `Models`, `Scheduler`,
-/// `Policy` and `Memory` are deliberately absent because there is nothing to hand
-/// out yet, and granting a capability with no handle would be a lie.
+/// nothing. The list grows as `KernelCtx` gains handles — `Models` and
+/// `Scheduler` are deliberately absent because there is nothing to hand out
+/// yet, and granting a capability with no handle would be a lie.
 ///
 /// `Memory` joined the list in F1, when `KernelCtx::memory` gained a handle to
 /// give: a module that asks for it gets a view of the shared memory base scoped
 /// to ITS OWN partition (see [`crate::os_memory`]). Before that handle existed,
 /// two domain OSes under one user shared that base.
-const KERNEL_GRANTS: &[Capability] = &[Capability::Events, Capability::Memory];
+///
+/// `Approval` joined in T7b/ME-3e, when `KernelCtx::approval` gained a handle
+/// (`ApprovalRequester`, backed by [`PolicyApprovalBackend`] below).
+const KERNEL_GRANTS: &[Capability] =
+    &[Capability::Events, Capability::Memory, Capability::Approval];
 
-/// What an out-of-process module may be granted (T7a/ME-3e). Narrower than
+/// What an out-of-process module may be granted. Narrower than
 /// [`KERNEL_GRANTS`] on purpose: an out-of-process `Memory` (proxied to the
-/// M-D store) is not in scope for T7a and needs its own evaluation later —
+/// M-D store) is not in scope yet and needs its own evaluation later —
 /// copying [`KERNEL_GRANTS`] here "because a superset is harmless" would grant
 /// it by accident. See `docs/design/T7a-ME3e-grants-and-events.md` §1.
-const KERNEL_OOP_GRANTS: &[Capability] = &[Capability::Events];
+/// `Approval` joined in T7b/ME-3e, alongside the wire handlers in
+/// `crate::approval_callback` that give it a real handler.
+const KERNEL_OOP_GRANTS: &[Capability] = &[Capability::Events, Capability::Approval];
 
 /// Names a module may not take, because the kernel already serves
 /// `/api/v1/<segment>` and axum PANICS on an exact route overlap:
@@ -109,6 +115,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "chat",
     "events",
     "health",
+    // T7b/ME-3e: `/api/v1/module-approvals`.
+    "module-approvals",
     "models",
     // ME-2b's own registry endpoint. A domain OS named `os` would collide with it
     // — and the set-equality test below is what forced this entry the moment the
@@ -134,6 +142,73 @@ impl EventBroadcast for HubBroadcast {
     fn send(&self, body: EventBody) {
         self.0.broadcast(body);
     }
+}
+
+/// Adapts [`crate::module_approval_broker::ModuleApprovalBroker`] to the
+/// contract's `ApprovalBackend` trait (T7b/ME-3e design doc, decision 6) —
+/// the daemon-side counterpart of [`HubBroadcast`] above. Only the kernel
+/// builds one of these, for a module it granted [`Capability::Approval`].
+struct PolicyApprovalBackend(Arc<crate::module_approval_broker::ModuleApprovalBroker>);
+
+impl agent24_domain::ApprovalBackend for PolicyApprovalBackend {
+    fn submit<'a>(
+        &'a self,
+        module: &'a str,
+        kind: agent24_protocol::ModuleApprovalKind,
+        action: String,
+        target: Option<String>,
+        payload: serde_json::Value,
+    ) -> agent24_domain::ApprovalFuture<
+        'a,
+        std::result::Result<
+            agent24_protocol::ApprovalAnswer,
+            agent24_protocol::ApprovalRequestError,
+        >,
+    > {
+        Box::pin(async move {
+            // `gate` runs through the SAME closed-set check the wire handler
+            // uses (`crate::approval_callback`, design doc decision 4) — one
+            // free function, so the two paths cannot disagree about what is
+            // in the closed set.
+            if kind == agent24_protocol::ModuleApprovalKind::Gate {
+                crate::module_approval_broker::check_closed_set(&action)?;
+            }
+            // No token to admit here (T7b design doc decision 6): an
+            // in-process module IS the daemon, so there is no callback
+            // channel/`Generation` to check against — `submit` composes the
+            // idempotency lookup and the insert directly.
+            self.0
+                .submit(module, &mint_request_id(), kind, action, target, payload)
+                .await
+        })
+    }
+
+    fn status<'a>(
+        &'a self,
+        module: &'a str,
+        approval_id: &'a str,
+    ) -> agent24_domain::ApprovalFuture<
+        'a,
+        std::result::Result<
+            agent24_protocol::ApprovalAnswer,
+            agent24_protocol::ApprovalRequestError,
+        >,
+    > {
+        Box::pin(self.0.status(module, approval_id))
+    }
+}
+
+/// A fresh `request_id` for an in-process submission (T7b/ME-3e). Unlike the
+/// out-of-process wire path, an in-process module has no proxied HTTP
+/// request to correlate with — a Rust function call cannot lose its response
+/// in transit the way a JSON-RPC round trip over a socket can, so there is no
+/// retry scenario for `(module, request_id, kind)` idempotency to protect
+/// against here. A fresh id per call is therefore correct: it simply means
+/// the idempotency lookup this crate's `submit` performs will never find a
+/// match for an in-process caller, which is the right behavior (every
+/// in-process `submit` call is a distinct request).
+fn mint_request_id() -> String {
+    agent24_core::util::ulid()
 }
 
 /// What the kernel needs in order to lend a module a memory partition: the
@@ -758,6 +833,11 @@ pub async fn mount_all(
     inventory: &dyn ModelInventory,
     memory: Option<&MemoryLease>,
     host: std::result::Result<&ProcessHost, &str>,
+    // T7b/ME-3e: threaded to `mount_package` for the OOP `MethodsFor`
+    // closure AND used here for the in-process `PolicyApprovalBackend` —
+    // both need the SAME broker `AppState` holds, so `module-approval.*`
+    // events land on the one WS hub clients are subscribed to.
+    approval_broker: &Arc<crate::module_approval_broker::ModuleApprovalBroker>,
 ) -> (Router, Vec<MountReport>, crate::os_memory::OsMemoryCatalog) {
     let mut app = Router::new();
     let mut reports = Vec::new();
@@ -937,6 +1017,7 @@ pub async fn mount_all(
                     events,
                     inventory,
                     host,
+                    approval_broker,
                 )
                 .await;
                 app = next;
@@ -1064,6 +1145,17 @@ pub async fn mount_all(
             (true, Some(lease)) => lease.lend(manifest, &mut partitions).await,
             _ => None,
         };
+        // Same shape again for approval (T7b/ME-3e): the requester's
+        // EXISTENCE is the capability, built only when granted, and it uses
+        // the SAME `ModuleApprovalBroker` as every other mount path (proxy
+        // wire, REST) — one table, one set of WS pushes.
+        let approval = granted.has(Capability::Approval).then(|| {
+            agent24_domain::ApprovalRequester::new(
+                manifest,
+                Arc::new(PolicyApprovalBackend(approval_broker.clone()))
+                    as Arc<dyn agent24_domain::ApprovalBackend>,
+            )
+        });
         // `granted` must name what the module ACTUALLY holds, not what policy
         // would have allowed — the invariant #134 established for every other
         // capability. A lease refused because its partition could not be recorded
@@ -1075,6 +1167,7 @@ pub async fn mount_all(
         let ctx: Arc<dyn KernelCtx> = Arc::new(crate::os_memory::MemoryCtx {
             sink,
             memory: scoped,
+            approval,
         });
 
         tracing::info!("domain OS {name:?} mounted at {namespace} (grants: {granted_names:?})");
@@ -1112,6 +1205,7 @@ struct MountTarget {
 /// side — its namespace answers `503 module_not_ready` until the module's
 /// handshake, and after a crash while it restarts; the supervisor's status says
 /// which.
+#[allow(clippy::too_many_arguments)]
 async fn mount_package(
     app: Router,
     package: &Package,
@@ -1120,6 +1214,7 @@ async fn mount_package(
     events: &crate::events::EventsHub,
     inventory: &dyn ModelInventory,
     host: std::result::Result<&ProcessHost, &str>,
+    approval_broker: &Arc<crate::module_approval_broker::ModuleApprovalBroker>,
 ) -> (Router, MountReport) {
     let MountTarget {
         name,
@@ -1204,17 +1299,22 @@ async fn mount_package(
     let event_sink = granted
         .has(Capability::Events)
         .then(|| Arc::new(EventSink::new(manifest, broadcast)));
-    let offer = if granted.has(Capability::Events) {
-        agent24_os_proto::initialize::Offer {
-            provides: vec!["_a24/events/".to_owned()],
-        }
-    } else {
-        agent24_os_proto::initialize::Offer::none()
-    };
+    // T7b/ME-3e: additive, not if/else (design doc §"现状" 1) — a module
+    // granted ONLY `approval` (not `events`) must still get a non-empty
+    // `Offer`, which an if/else between the two prefixes could never produce.
+    let mut provides = Vec::new();
+    if granted.has(Capability::Events) {
+        provides.push("_a24/events/".to_owned());
+    }
+    if granted.has(Capability::Approval) {
+        provides.push("_a24/approval/".to_owned());
+    }
+    let offer = agent24_os_proto::initialize::Offer { provides };
     let methods_for: agent24_os_proto::supervisor::MethodsFor = {
         let name = name.clone();
         let granted = granted.clone();
         let event_sink = event_sink.clone();
+        let approval_broker = approval_broker.clone();
         Arc::new(
             move |generation: &Arc<agent24_os_proto::drain::Generation>| {
                 // A fresh bucket every time this closure runs — once per
@@ -1226,16 +1326,50 @@ async fn mount_package(
                     crate::events_emit::EVENTS_RATE_CAPACITY,
                     crate::events_emit::EVENTS_RATE_REFILL_PER_SEC,
                 ));
-                agent24_os_proto::rpc::Methods::none().with(
-                    "_a24/events/emit",
-                    Arc::new(crate::events_emit::EventsEmitHandler {
-                        generation: generation.clone(),
-                        name: name.clone(),
-                        granted: granted.clone(),
-                        sink: event_sink.clone(),
-                        limiter,
-                    }),
-                )
+                // T7b/ME-3e: the three approval methods are registered
+                // UNCONDITIONALLY, exactly like `_a24/events/emit` above —
+                // capability gating happens INSIDE each handler's `call()`,
+                // not by conditionally registering the method (design doc
+                // decision 4).
+                agent24_os_proto::rpc::Methods::none()
+                    .with(
+                        "_a24/events/emit",
+                        Arc::new(crate::events_emit::EventsEmitHandler {
+                            generation: generation.clone(),
+                            name: name.clone(),
+                            granted: granted.clone(),
+                            sink: event_sink.clone(),
+                            limiter,
+                        }),
+                    )
+                    .with(
+                        "_a24/approval/gate",
+                        Arc::new(crate::approval_callback::ApprovalSubmitHandler {
+                            generation: generation.clone(),
+                            module: name.clone(),
+                            granted: granted.clone(),
+                            kind: agent24_protocol::ModuleApprovalKind::Gate,
+                            broker: approval_broker.clone(),
+                        }),
+                    )
+                    .with(
+                        "_a24/approval/advise",
+                        Arc::new(crate::approval_callback::ApprovalSubmitHandler {
+                            generation: generation.clone(),
+                            module: name.clone(),
+                            granted: granted.clone(),
+                            kind: agent24_protocol::ModuleApprovalKind::Advise,
+                            broker: approval_broker.clone(),
+                        }),
+                    )
+                    .with(
+                        "_a24/approval/status",
+                        Arc::new(crate::approval_callback::ApprovalStatusHandler {
+                            module: name.clone(),
+                            granted: granted.clone(),
+                            broker: approval_broker.clone(),
+                        }),
+                    )
             },
         )
     };
@@ -1320,6 +1454,19 @@ pub(crate) mod tests {
         crate::os_config::OsConfig::default()
     }
 
+    /// T7b/ME-3e: a throwaway broker for tests that don't care about approval
+    /// behavior — built on the SAME hub the test passes as `mount_all`'s
+    /// `events`, so a test that DOES look at broadcast events sees module
+    /// approval ones on the same receiver.
+    async fn test_approval_broker(
+        hub: &crate::events::EventsHub,
+    ) -> Arc<crate::module_approval_broker::ModuleApprovalBroker> {
+        crate::module_approval_broker::ModuleApprovalBroker::new(
+            agent24_store::Store::open_memory().await.unwrap(),
+            hub.clone(),
+        )
+    }
+
     /// A model catalogue under the test's control.
     struct TestModels(std::result::Result<Vec<String>, String>);
     impl ModelInventory for TestModels {
@@ -1372,6 +1519,7 @@ pub(crate) mod tests {
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(hub).await,
         )
         .await;
         (app, reports)
@@ -1745,6 +1893,7 @@ while f.readline():
             &no_models(),
             None,
             Ok(&host),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert_eq!(
@@ -1805,6 +1954,7 @@ while f.readline():
             &no_models(),
             None,
             Ok(&host),
+            &test_approval_broker(&hub).await,
         )
         .await;
         match &reports[0].outcome {
@@ -1844,6 +1994,130 @@ while f.readline():
         );
     }
 
+    /// T7b/ME-3e (judgement 17): like [`EVENTS_PROBE_MODULE`], but for
+    /// `_a24/approval/status` — a QUERY method that needs no live
+    /// `request_id`/`approval_token` pair (unlike `gate`/`advise`, which are
+    /// tied to a proxied HTTP request this probe never makes; see the design
+    /// doc "现状" 2 on why `status` is independent of that machinery). Good
+    /// enough to prove offer/grant/real-call agree on `approval` without
+    /// building a probe that also serves HTTP.
+    const APPROVAL_PROBE_MODULE: &str = r#"import hashlib, json, os, socket, threading
+name = os.environ["A24_MODULE_NAME"]
+with open("domain-os.yml", "rb") as f:
+    digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+def serve():
+    while True:
+        conn, _ = listener.accept()
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+cb = socket.socket(socket.AF_UNIX)
+cb.connect(os.environ["A24_CALLBACK_SOCK"])
+req = {"jsonrpc": "2.0", "id": "1", "method": "initialize", "params": {
+    "protocol_versions": {"min": 1, "max": 1000}, "module": name,
+    "manifest_digest": digest, "auth_token": os.environ["A24_HANDSHAKE_TOKEN"],
+    "capabilities": []}}
+cb.sendall((json.dumps(req) + "\n").encode())
+f = cb.makefile("rb")
+init_resp = json.loads(f.readline())
+provides = init_resp.get("result", {}).get("offer", {}).get("provides", [])
+offers_approval = any("_a24/approval/status".startswith(p) for p in provides)
+status_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/approval/status",
+              "params": {"approval_id": "does-not-exist"}}
+cb.sendall((json.dumps(status_req) + "\n").encode())
+status_resp = json.loads(f.readline())
+with open("probe.json", "w") as out:
+    json.dump({"offers_approval": offers_approval, "status_response": status_resp}, out)
+while f.readline():
+    pass
+"#;
+
+    /// T7b/ME-3e (judgement 17): the additive `Offer` rule specifically — a
+    /// module granted ONLY `approval` (not `events`) must still see
+    /// `_a24/approval/` in its offer. An if/else between the two prefixes
+    /// (what T7a shipped) could never produce this: it would pick one
+    /// prefix or the other, never both independently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn approval_only_grant_still_offers_the_approval_prefix_and_the_real_call_agrees() {
+        for (name, capabilities, expect_granted) in
+            [("granted", "[approval]", true), ("ungranted", "[]", false)]
+        {
+            let tmp = tempfile::Builder::new()
+                .prefix("a24")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let packages = tmp.path().join("packages");
+            write_package_with(&packages, name, capabilities, APPROVAL_PROBE_MODULE);
+            let host = test_host(tmp.path());
+            let hub = crate::events::EventsHub::default();
+            let (_, reports, _) = mount_all(
+                &discovered(&packages),
+                &tmp.path().join("os"),
+                &hub,
+                Ok(&all_enabled()),
+                &no_models(),
+                None,
+                Ok(&host),
+                &test_approval_broker(&hub).await,
+            )
+            .await;
+            assert_eq!(
+                reports[0].outcome,
+                MountOutcome::Mounted,
+                "{:?}",
+                reports[0]
+            );
+            assert_eq!(
+                reports[0].granted,
+                if expect_granted {
+                    vec!["approval".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                "MountReport.granted for {name:?} — not `events`, proving Offer is additive \
+                 by capability, not by an if/else"
+            );
+
+            let probe_path = packages.join(name).join("probe.json");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let probe: serde_json::Value = loop {
+                if let Ok(bytes) = std::fs::read(&probe_path) {
+                    break serde_json::from_slice(&bytes).unwrap();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the module never wrote its probe"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+
+            assert_eq!(
+                probe["offers_approval"].as_bool(),
+                Some(expect_granted),
+                "the real handshake's offer for {name:?} must include `_a24/approval/` \
+                 with NO `events` grant at all"
+            );
+            let status_response = &probe["status_response"];
+            if expect_granted {
+                assert_eq!(
+                    status_response["error"]["data"]["kind"].as_str(),
+                    Some("not_found"),
+                    "a granted module's real status call on an unknown id: {status_response}"
+                );
+            } else {
+                assert_eq!(
+                    status_response["error"]["data"]["kind"].as_str(),
+                    Some("forbidden"),
+                    "an ungranted module's real call: {status_response}"
+                );
+            }
+
+            for s in host.supervisors.close().running {
+                s.handle.stop().await.expect("a clean stop");
+            }
+        }
+    }
+
     /// Judgement 10, the three-way consistency check, over a REAL package
     /// process and a REAL `initialize` handshake (not a Rust-side simulation
     /// of the wire): a module granted `events` gets `MountReport.granted ==
@@ -1875,6 +2149,7 @@ while f.readline():
                 &no_models(),
                 None,
                 Ok(&host),
+                &test_approval_broker(&hub).await,
             )
             .await;
             assert_eq!(
@@ -1963,6 +2238,7 @@ while f.readline():
             &no_models(),
             None,
             Ok(&host),
+            &test_approval_broker(&hub).await,
         )
         .await;
         let mut status = host.supervisors.statuses().remove("remote").unwrap();
@@ -2052,6 +2328,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Ok(&host),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -2139,6 +2416,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Ok(&host),
+            &test_approval_broker(&hub).await,
         )
         .await;
         let mut status = host.supervisors.statuses().remove("remote").unwrap();
@@ -2225,6 +2503,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Ok(&host),
+            &test_approval_broker(&hub).await,
         )
         .await;
         let drain = std::time::Duration::from_secs(10);
@@ -2282,6 +2561,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Ok(&host),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Disabled);
@@ -2311,6 +2591,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("the callback directory is not ours"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         match &reports[0].outcome {
@@ -2634,6 +2915,100 @@ raise SystemExit(3)
         assert!(rx.try_recv().is_err(), "and nothing reached the hub");
     }
 
+    // ── T7b/ME-3e: in-process `ApprovalRequester` (judgement 18/18a) ──────
+
+    #[tokio::test]
+    async fn a_module_that_never_asked_for_approval_gets_no_requester() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let m = FakeModule::new("quiet2"); // manifest_yaml's default: [events] only
+        let (_, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
+        assert_eq!(reports[0].outcome, MountOutcome::Mounted);
+        let ctx = m.ctx().expect("routes() was called, so ctx was recorded");
+        assert!(
+            ctx.approval().is_none(),
+            "no grant means no handle at all, same as events/memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_granted_modules_requester_submits_and_queries_for_real() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let yaml = manifest_yaml("approver", "in_process_crate").replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [approval]",
+        );
+        let m = FakeModule::from_yaml(&yaml, false);
+        let (_, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
+        assert_eq!(reports[0].outcome, MountOutcome::Mounted);
+        assert_eq!(reports[0].granted, vec!["approval".to_owned()]);
+
+        let ctx = m.ctx().expect("routes() was called, so ctx was recorded");
+        let approval = ctx.approval().expect("approval was granted");
+
+        // Judgement 18: a real submit/status round trip through the SAME
+        // path the wire handler's in-process counterpart uses
+        // (`PolicyApprovalBackend` → `ModuleApprovalBroker`).
+        let submitted = approval
+            .submit(
+                agent24_protocol::ModuleApprovalKind::Advise,
+                "send_email",
+                Some("ops@example.com".to_owned()),
+                serde_json::json!({"body": "hi"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            submitted.decision,
+            agent24_protocol::ModuleApprovalDecision::Pending
+        );
+        // Judgement 18a: `kind`/`binding` are read from the record, not
+        // assumed — an `Advise` result must never look like a `Gate` one.
+        assert_eq!(submitted.kind, agent24_protocol::ModuleApprovalKind::Advise);
+        assert!(!submitted.binding);
+
+        let queried = approval.status(&submitted.approval_id).await.unwrap();
+        assert_eq!(
+            queried.decision,
+            agent24_protocol::ModuleApprovalDecision::Pending
+        );
+        assert_eq!(queried.kind, agent24_protocol::ModuleApprovalKind::Advise);
+        assert!(!queried.binding);
+    }
+
+    #[tokio::test]
+    async fn a_granted_modules_gate_submission_errs_immediately_without_touching_the_broker() {
+        // Judgement 8, the in-process half: `ApprovalRequester::submit(Gate,
+        // ...)` returns `Err(ActionNotInClosedSet)` directly — it never even
+        // reaches `ModuleApprovalBroker`, so no record is ever created.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let yaml = manifest_yaml("gater", "in_process_crate").replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [approval]",
+        );
+        let m = FakeModule::from_yaml(&yaml, false);
+        let (_, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
+        assert_eq!(reports[0].outcome, MountOutcome::Mounted);
+        let ctx = m.ctx().expect("routes() was called, so ctx was recorded");
+        let approval = ctx.approval().expect("approval was granted");
+
+        let err = approval
+            .submit(
+                agent24_protocol::ModuleApprovalKind::Gate,
+                "transfer_funds",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            agent24_protocol::ApprovalRequestError::ActionNotInClosedSet
+        ));
+    }
+
     // ---------- F1: memory partitions handed out by the MOUNTER ----------
 
     #[tokio::test]
@@ -2666,6 +3041,7 @@ raise SystemExit(3)
             &no_models(),
             Some(&lease),
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -2722,6 +3098,7 @@ raise SystemExit(3)
             &no_models(),
             Some(&lease),
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert!(m.ctx().unwrap().memory().is_none());
@@ -2755,6 +3132,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted, "it still mounts");
@@ -2813,6 +3191,7 @@ raise SystemExit(3)
             &no_models(),
             Some(&lease),
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -2852,6 +3231,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -2912,6 +3292,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&st.events).await,
         )
         .await;
         let app = crate::server::build_router_with_modules(st, modules);
@@ -2954,6 +3335,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -2986,6 +3368,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -3044,6 +3427,7 @@ raise SystemExit(3)
             &TestModels(Ok(vec!["something-else".to_owned()])),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert!(matches!(reports[0].outcome, MountOutcome::Degraded(_)));
@@ -3074,6 +3458,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert_eq!(
@@ -3107,6 +3492,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert_eq!(
@@ -3141,6 +3527,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -3165,6 +3552,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -3194,6 +3582,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -3246,6 +3635,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert!(
@@ -3299,6 +3689,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -3337,6 +3728,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -3397,6 +3789,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -3434,6 +3827,7 @@ raise SystemExit(3)
             &no_models(),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -3547,6 +3941,7 @@ raise SystemExit(3)
             &inv,
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
 
@@ -3583,6 +3978,7 @@ raise SystemExit(3)
             &inv,
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         match &reports[0].resources {
@@ -3606,6 +4002,7 @@ raise SystemExit(3)
             &TestModels(Err("nothing configured".to_owned())),
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
         )
         .await;
         assert_eq!(reports[0].resources, ResourceStatus::Satisfied);
@@ -3629,5 +4026,24 @@ raise SystemExit(3)
         let m = FakeModule::from_yaml(&yaml, false);
         let (_, reports) = mount(&[entry(m)], tmp.path(), &hub).await;
         assert_eq!(reports[0].granted, vec!["events".to_owned()]);
+    }
+
+    /// Judgement 21 (T7b/ME-3e): `RESERVED_KERNEL_SEGMENTS` really does
+    /// block a module literally named `module-approvals` — the REST
+    /// endpoints this design added — the same way it already blocks
+    /// `health`/`approvals`/etc. Without this entry, such a module would
+    /// panic the daemon at startup on the overlapping route rather than
+    /// being refused.
+    #[tokio::test]
+    async fn module_approvals_is_a_reserved_kernel_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let m = FakeModule::new("module-approvals");
+        let (_, reports) = mount(&[entry(m)], tmp.path(), &hub).await;
+        assert!(
+            matches!(reports[0].outcome, MountOutcome::Refused(_)),
+            "{:?}",
+            reports[0]
+        );
     }
 }
