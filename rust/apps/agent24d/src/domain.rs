@@ -166,13 +166,22 @@ impl agent24_domain::ApprovalBackend for PolicyApprovalBackend {
         >,
     > {
         Box::pin(async move {
-            // `gate` runs through the SAME closed-set check the wire handler
-            // uses (`crate::approval_callback`, design doc decision 4) — one
-            // free function, so the two paths cannot disagree about what is
-            // in the closed set.
-            if kind == agent24_protocol::ModuleApprovalKind::Gate {
-                crate::module_approval_broker::check_closed_set(&action)?;
-            }
+            // `gate` runs through the SAME validation the wire handler uses
+            // (`crate::approval_callback`, T7c/ME-3e design doc "闭集匹配") —
+            // one free function, so the two paths cannot disagree about what
+            // is in the closed set OR about how `target` gets canonicalized
+            // (judgement 16). On success, `target` is REPLACED with the
+            // canonicalized form — never the raw string the module passed —
+            // exactly like the wire path does.
+            let (action, target) = if kind == agent24_protocol::ModuleApprovalKind::Gate {
+                let canonical = crate::module_approval_broker::validate_gate_action(
+                    &action,
+                    target.as_deref(),
+                )?;
+                (canonical.action, Some(canonical.target))
+            } else {
+                (action, target)
+            };
             // No token to admit here (T7b design doc decision 6): an
             // in-process module IS the daemon, so there is no callback
             // channel/`Generation` to check against — `submit` composes the
@@ -3006,6 +3015,107 @@ raise SystemExit(3)
         assert!(matches!(
             err,
             agent24_protocol::ApprovalRequestError::ActionNotInClosedSet
+        ));
+    }
+
+    // ── T7c/ME-3e: in-process `schedule_callback` (judgement 1/11/12/16) ───
+
+    #[tokio::test]
+    async fn a_granted_modules_gate_schedule_callback_succeeds_and_canonicalizes_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        // Built directly (not via the `mount` helper, which swallows its own
+        // throwaway broker) so this test can inspect the ACTUAL row the
+        // broker persisted afterwards — a bare `validate_gate_action(...)`
+        // comparison alone would pass even if `PolicyApprovalBackend`
+        // silently stored the module's raw, uncanonicalized string instead
+        // of the canonicalized one (Codex review, criterion 16).
+        let broker = test_approval_broker(&hub).await;
+        let yaml = manifest_yaml("gater2", "in_process_crate").replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [approval]",
+        );
+        let m = FakeModule::from_yaml(&yaml, false);
+        let (_, reports, _) = mount_all(
+            &[entry(m.clone())],
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+            &broker,
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Mounted);
+        let ctx = m.ctx().expect("routes() was called, so ctx was recorded");
+        let approval = ctx.approval().expect("approval was granted");
+
+        let raw_target = "2026-01-01T08:00:00.5+08:00"; // epoch-equal to 2026-01-01T00:00:00Z
+        let submitted = approval
+            .submit(
+                agent24_protocol::ModuleApprovalKind::Gate,
+                "schedule_callback",
+                Some(raw_target.to_owned()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            submitted.decision,
+            agent24_protocol::ModuleApprovalDecision::Pending
+        );
+        assert!(
+            submitted.binding,
+            "a Gate row must be binding (judgement 11)"
+        );
+        assert_eq!(submitted.executed_at, None);
+
+        // Judgement 16: fetch the row the broker ACTUALLY persisted and
+        // assert its stored `target` — not just the validator's return
+        // value in isolation — equals the canonicalized form, proving
+        // `PolicyApprovalBackend` really did replace the module's raw
+        // string with `CanonicalGateAction.target` before writing it.
+        let stored = broker
+            .get(&submitted.approval_id)
+            .await
+            .unwrap()
+            .expect("the row PolicyApprovalBackend inserted must be readable back");
+        assert_eq!(
+            stored.target.as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "the STORED target must be the canonicalized form, not the module's raw string"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_granted_modules_gate_schedule_callback_without_a_target_is_invalid_target() {
+        // Judgement 12, in-process half: missing `target` is `InvalidTarget`,
+        // never `ActionNotInClosedSet` — the action IS in the closed set.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let yaml = manifest_yaml("gater3", "in_process_crate").replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [approval]",
+        );
+        let m = FakeModule::from_yaml(&yaml, false);
+        let (_, reports) = mount(&[entry(m.clone())], tmp.path(), &hub).await;
+        assert_eq!(reports[0].outcome, MountOutcome::Mounted);
+        let ctx = m.ctx().expect("routes() was called, so ctx was recorded");
+        let approval = ctx.approval().expect("approval was granted");
+
+        let err = approval
+            .submit(
+                agent24_protocol::ModuleApprovalKind::Gate,
+                "schedule_callback",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            agent24_protocol::ApprovalRequestError::InvalidTarget(_)
         ));
     }
 

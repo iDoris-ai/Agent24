@@ -803,11 +803,12 @@ export interface components {
             [key: string]: unknown;
         };
         /**
-         * @description Gate: kernel-executed action (this build's closed set is empty, so
-         *     every submission is forbidden and no record is ever created — see
-         *     `docs/design/T7b-ME3e-approvals.md`). Advise: module-domain action —
-         *     presented and recorded for informed consent, not enforced (SPEC
-         *     §6.1: knowledge, not a safety control).
+         * @description Gate: kernel-executed action. This build's closed set has one entry,
+         *     schedule_callback (a one-shot RFC3339 callback — see
+         *     `docs/design/T7c-ME3e-gate-execution.md`); any other action is still
+         *     forbidden and no record is created for it. Advise: module-domain
+         *     action — presented and recorded for informed consent, not enforced
+         *     (SPEC §6.1: knowledge, not a safety control).
          * @enum {string}
          */
         ModuleApprovalKind: "gate" | "advise";
@@ -827,7 +828,7 @@ export interface components {
             /** @description The proxied request's correlation id — one half of the submission's idempotency key. */
             request_id: string;
             kind: components["schemas"]["ModuleApprovalKind"];
-            /** @description Always false for advise. Unreachable (no gate row exists) this round. */
+            /** @description Always false for advise; always true for gate (T7c/ME-3e). */
             binding: boolean;
             action: string;
             target: string | null;
@@ -850,6 +851,16 @@ export interface components {
              * @description After this instant a pending row resolves to timed_out (periodic scan).
              */
             expires_at: string;
+            /**
+             * Format: date-time
+             * @description T7c/ME-3e. null until the periodic scan marks this row executed —
+             *     which can only happen for kind=gate, decision=approved rows whose
+             *     action is in the kernel-executable closed set (this build:
+             *     schedule_callback, once its canonicalized target has been
+             *     reached). advise rows, and any gate row that is not approved,
+             *     stay null forever.
+             */
+            executed_at: string | null;
         };
         /** @description When to fire */
         ScheduleSpec: {

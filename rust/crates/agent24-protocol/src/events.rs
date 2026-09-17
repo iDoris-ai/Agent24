@@ -15,7 +15,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Approval, ErrorBody, ModuleApproval, ModuleApprovalDecision, Usage};
+use crate::types::{Approval, ErrorBody, ModuleApprovalDecision, ModuleApprovalSubmitted, Usage};
 
 /// Common envelope for every WS message. `seq` is monotonically increasing
 /// per connection; a gap means the client must reconcile via REST (no replay
@@ -62,8 +62,13 @@ pub enum EventBody {
     /// `Pending` row. The client answers via
     /// `POST /api/v1/module-approvals/{id}` — `approval.required` is no
     /// longer the only REQUEST-class event.
+    ///
+    /// T7c/ME-3e (design doc criterion 18): the payload is
+    /// [`ModuleApprovalSubmitted`], NOT the full `ModuleApproval` — a frozen
+    /// submission-time snapshot that does not carry `executed_at`, which is
+    /// state only ever learned by querying AFTER submission (REST/`status`).
     #[serde(rename = "module-approval.required")]
-    ModuleApprovalRequired(Box<ModuleApproval>),
+    ModuleApprovalRequired(Box<ModuleApprovalSubmitted>),
     /// Pushed the moment a decision becomes final — the decision CAS
     /// (REST `decide`) or the periodic timeout scan, whichever gets there
     /// first. There is no separate "delivered" event: in the async

@@ -18,7 +18,10 @@ const FORCE_REQUIRED: &[(&str, &[&str])] = &[
     ("Approval", &["decision", "decided_at", "standing_target"]),
     // T7b/ME-3e: `target`/`decided_at` are always present, value `null`
     // until a target/decision exists — same rule as `Approval` above.
-    ("ModuleApproval", &["target", "decided_at"]),
+    // T7c/ME-3e (criterion 18): the WS payload type is `ModuleApprovalSubmitted`,
+    // a frozen submission-time snapshot that deliberately has NO `executed_at`
+    // field at all — do not add it here.
+    ("ModuleApprovalSubmitted", &["target", "decided_at"]),
 ];
 
 fn main() {
@@ -59,9 +62,10 @@ fn main() {
             // Timestamp-valued fields keep format: date-time in the schema
             const DATE_TIME_FIELDS: &[(&str, &[&str])] = &[
                 ("Approval", &["expires_at", "created_at", "decided_at"]),
-                // T7b/ME-3e.
+                // T7b/ME-3e. T7c/ME-3e (criterion 18): `ModuleApprovalSubmitted`
+                // is the WS payload type and has no `executed_at` field.
                 (
-                    "ModuleApproval",
+                    "ModuleApprovalSubmitted",
                     &["expires_at", "created_at", "decided_at"],
                 ),
             ];

@@ -73,7 +73,7 @@ export type Agent24V1WebSocketEventProtocol = {
       [k: string]: unknown;
     }
   | {
-      payload: ModuleApproval;
+      payload: ModuleApprovalSubmitted;
       type: "module-approval.required";
       [k: string]: unknown;
     }
@@ -283,62 +283,28 @@ export interface ScheduleDisabledPayload {
   [k: string]: unknown;
 }
 /**
- * One module approval record (design doc decision 3). `(module, request_id,
- * kind)` is UNIQUE at the storage layer — both a data-integrity constraint
- * and the mechanism a resubmitted `{request_id, approval_token, action,
- * target, payload}` relies on to be idempotent (a lost response, retried by
- * the module, lands on the same row rather than a second one).
+ * The FROZEN `module-approval.required` WS event payload (T7c/ME-3e design
+ * doc criterion 18): everything [`ModuleApproval`] carries at the instant a
+ * `Pending` row is first inserted, EXCEPT `executed_at` — that field is
+ * state a caller can only learn by querying AFTER submission (REST
+ * `GET`/wire `status`/in-process `ApprovalRequester::status`), so it must
+ * never appear on the one-shot event that announces the submission itself.
+ * A deliberately separate type, not `#[serde(skip)]` on `ModuleApproval`,
+ * so the WS wire shape and the REST/status wire shape can never accidentally
+ * be forced to agree again by a future edit to the shared struct.
  */
-export interface ModuleApproval {
+export interface ModuleApprovalSubmitted {
   action: string;
-  /**
-   * Always `false` when `kind == Advise`. Always unreachable when
-   * `kind == Gate` this round (the closed set is empty, so no `Gate` row
-   * is ever created) — kept as a real field, not derived from `kind`
-   * alone, so a future non-empty closed set does not need a wire shape
-   * change.
-   */
   binding: boolean;
   created_at: string;
   decided_at: string | null;
   decision: ModuleApprovalDecision;
-  /**
-   * After this instant a `Pending` record resolves to `TimedOut` (design
-   * doc decision 5's periodic scan judges this field).
-   */
   expires_at: string;
-  /**
-   * Minted at submission time: 32 bytes random, hex-encoded. The only
-   * credential needed to query this record — NOT derived from
-   * `request_id` or anything else predictable, and treated as a secret
-   * worth withholding from an unrelated caller (it discloses `action`/
-   * `target`/`payload` to anyone who has it).
-   */
   id: string;
   kind: ModuleApprovalKind;
-  /**
-   * From the callback connection's identity (the closure that built this
-   * module's `MethodsFor`) — never self-reported by the module.
-   */
   module: string;
-  /**
-   * The kernel's own record of what it received at submission time — NOT
-   * a promise that the module will act on exactly this (SPEC §6.1: for
-   * `Advise`, this is knowledge, not a safety control). Never accepted as
-   * an "update" after submission; see [`approval_digest`].
-   */
-  payload: {
-    [k: string]: unknown;
-  };
-  /**
-   * `approval_digest(&payload)`, computed ONCE at submission by the
-   * kernel — never self-reported by the module.
-   */
+  payload: unknown;
   payload_digest: string;
-  /**
-   * The proxied request's correlation id — one of the two halves of the
-   * idempotent submission key (with `module`/`kind`).
-   */
   request_id: string;
   target: string | null;
   [k: string]: unknown;

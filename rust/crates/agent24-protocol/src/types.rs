@@ -419,10 +419,11 @@ pub struct Approval {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleApprovalKind {
-    /// A kernel-EXECUTED action. This round's closed set of executable
-    /// actions is empty (T7b scope; see the design doc's opening section), so
-    /// every `gate` submission is `forbidden` before a row is ever written —
-    /// no `ModuleApproval` with this kind exists yet in this build.
+    /// A kernel-EXECUTED action. T7b shipped this with an EMPTY closed set
+    /// (every `gate` submission was `forbidden` before a row was ever
+    /// written). T7c/ME-3e adds the first entry, `schedule_callback` — see
+    /// `docs/design/T7c-ME3e-gate-execution.md`; any other `action` is still
+    /// `forbidden`.
     Gate,
     /// A module-domain action: the kernel records and presents it, but does
     /// not execute it and does not guarantee the module honors the answer
@@ -464,11 +465,11 @@ pub struct ModuleApproval {
     /// idempotent submission key (with `module`/`kind`).
     pub request_id: String,
     pub kind: ModuleApprovalKind,
-    /// Always `false` when `kind == Advise`. Always unreachable when
-    /// `kind == Gate` this round (the closed set is empty, so no `Gate` row
-    /// is ever created) — kept as a real field, not derived from `kind`
-    /// alone, so a future non-empty closed set does not need a wire shape
-    /// change.
+    /// Always `false` when `kind == Advise`; always `true` when
+    /// `kind == Gate` (T7c/ME-3e: `binding == (kind == Gate)`) — a real
+    /// column rather than a value derived from `kind` alone at read time, so
+    /// the wire shape never had to change between T7b's empty closed set and
+    /// T7c's first entry.
     pub binding: bool,
     pub action: String,
     pub target: Option<String>,
@@ -486,6 +487,62 @@ pub struct ModuleApproval {
     /// After this instant a `Pending` record resolves to `TimedOut` (design
     /// doc decision 5's periodic scan judges this field).
     pub expires_at: String,
+    /// `None` until the periodic scan (T7c/ME-3e design doc, decision "批准即
+    /// 生效") marks this row as executed — which can only ever happen for a
+    /// `kind == Gate`, `decision == Approved` row whose `action` is in the
+    /// kernel-executable closed set (this round: `schedule_callback`, once
+    /// its canonicalized `target` has been reached). `Advise` rows and any
+    /// `Gate` row that is not `Approved` stay `None` forever. `Some(ts)` is
+    /// the scan's own `now_iso` reading at the instant it flipped this row,
+    /// not a promise about `target` itself.
+    pub executed_at: Option<String>,
+}
+
+/// The FROZEN `module-approval.required` WS event payload (T7c/ME-3e design
+/// doc criterion 18): everything [`ModuleApproval`] carries at the instant a
+/// `Pending` row is first inserted, EXCEPT `executed_at` — that field is
+/// state a caller can only learn by querying AFTER submission (REST
+/// `GET`/wire `status`/in-process `ApprovalRequester::status`), so it must
+/// never appear on the one-shot event that announces the submission itself.
+/// A deliberately separate type, not `#[serde(skip)]` on `ModuleApproval`,
+/// so the WS wire shape and the REST/status wire shape can never accidentally
+/// be forced to agree again by a future edit to the shared struct.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ModuleApprovalSubmitted {
+    pub id: String,
+    pub module: String,
+    pub request_id: String,
+    pub kind: ModuleApprovalKind,
+    pub binding: bool,
+    pub action: String,
+    pub target: Option<String>,
+    pub payload: Value,
+    pub payload_digest: String,
+    pub decision: ModuleApprovalDecision,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+    pub expires_at: String,
+}
+
+impl From<&ModuleApproval> for ModuleApprovalSubmitted {
+    fn from(row: &ModuleApproval) -> Self {
+        Self {
+            id: row.id.clone(),
+            module: row.module.clone(),
+            request_id: row.request_id.clone(),
+            kind: row.kind,
+            binding: row.binding,
+            action: row.action.clone(),
+            target: row.target.clone(),
+            payload: row.payload.clone(),
+            payload_digest: row.payload_digest.clone(),
+            decision: row.decision,
+            created_at: row.created_at.clone(),
+            decided_at: row.decided_at.clone(),
+            expires_at: row.expires_at.clone(),
+            // `executed_at` deliberately dropped — see the type's doc comment.
+        }
+    }
 }
 
 /// What a `submit`/`status` call on [`agent24_domain`]'s in-process
@@ -497,22 +554,40 @@ pub struct ModuleApproval {
 pub struct ApprovalAnswer {
     pub approval_id: String,
     pub kind: ModuleApprovalKind,
-    /// `false` for `Advise`; unreachable (no `Gate` row exists) this round.
+    /// `false` for `Advise`; `true` for `Gate` (T7c/ME-3e).
     pub binding: bool,
     /// `Pending` immediately after a `submit`; the current value on `status`.
     pub decision: ModuleApprovalDecision,
+    /// Mirrors [`ModuleApproval::executed_at`] (T7c/ME-3e) — `null` on the
+    /// wire until the periodic scan marks the row executed. Always present
+    /// (never omitted), matching this repo's "nullable fields are always
+    /// present as null" convention. NOT built by struct-to-struct mapping:
+    /// see `to_answer` in `agent24d::module_approval_broker`, which is the
+    /// one place that must be kept in sync with this field by hand.
+    pub executed_at: Option<String>,
 }
 
 /// Failure modes of the in-process `ApprovalRequester`'s `submit`/`status`
 /// (design doc decision 6).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApprovalRequestError {
-    /// Only `submit(Gate, …)` can hit this: the action is not in the (this
-    /// round, empty) kernel-executable closed set. Mapped to the wire's
-    /// existing `Forbidden` kind (design doc decision 4 — SPEC §6.1's wording
-    /// is literal about reusing it, not inventing a more precise kind).
+    /// Only `submit(Gate, …)` can hit this: `action` itself is not in the
+    /// kernel-executable closed set (T7c/ME-3e: `"schedule_callback"` is the
+    /// only member; matching is exact — no trim, no case-insensitivity).
+    /// Mapped to the wire's existing `Forbidden` kind (design doc decision 4
+    /// — SPEC §6.1's wording is literal about reusing it, not inventing a
+    /// more precise kind).
     #[error("action not in the kernel-executable closed set")]
     ActionNotInClosedSet,
+    /// Only `submit(Gate, "schedule_callback", …)` can hit this: `action` IS
+    /// in the closed set, but `target` is missing, or is not a `target` this
+    /// closed-set entry accepts (T7c/ME-3e decision "闭集匹配" — a legal
+    /// RFC3339 timestamp that `canonicalize_schedule_target` can normalize).
+    /// Distinct from [`Self::ActionNotInClosedSet`] on the wire: mapped to
+    /// `-32602`/invalid params, not `forbidden` — this is "in the closed set,
+    /// bad arguments", not "not in the closed set".
+    #[error("invalid target for schedule_callback: {0}")]
+    InvalidTarget(String),
     /// `status` was asked for an `approval_id` that does not exist, or exists
     /// but belongs to a different module. Mapped to the wire's
     /// `agent24_os_proto::rpc::ErrorKind::NotFound` (design doc decision 2;
