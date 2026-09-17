@@ -69,6 +69,13 @@ use axum::Router;
 /// two domain OSes under one user shared that base.
 const KERNEL_GRANTS: &[Capability] = &[Capability::Events, Capability::Memory];
 
+/// What an out-of-process module may be granted (T7a/ME-3e). Narrower than
+/// [`KERNEL_GRANTS`] on purpose: an out-of-process `Memory` (proxied to the
+/// M-D store) is not in scope for T7a and needs its own evaluation later —
+/// copying [`KERNEL_GRANTS`] here "because a superset is harmless" would grant
+/// it by accident. See `docs/design/T7a-ME3e-grants-and-events.md` §1.
+const KERNEL_OOP_GRANTS: &[Capability] = &[Capability::Events];
+
 /// Names a module may not take, because the kernel already serves
 /// `/api/v1/<segment>` and axum PANICS on an exact route overlap:
 ///
@@ -927,6 +934,7 @@ pub async fn mount_all(
                         enabled_at_start,
                     },
                     root,
+                    events,
                     inventory,
                     host,
                 )
@@ -1109,6 +1117,7 @@ async fn mount_package(
     package: &Package,
     target: MountTarget,
     root: &Path,
+    events: &crate::events::EventsHub,
     inventory: &dyn ModelInventory,
     host: std::result::Result<&ProcessHost, &str>,
 ) -> (Router, MountReport) {
@@ -1118,14 +1127,15 @@ async fn mount_package(
         version,
         enabled_at_start,
     } = target;
+    // Unchanged (Codex round 2 High 2): `Refused`/`Degraded` never had a
+    // `KernelCtx` handed over, so `granted` stays `Vec::new()` for both — only
+    // the `Mounted` branch, built separately below, carries `granted_names`.
     let report = |outcome: MountOutcome, resources: ResourceStatus| MountReport {
         name: name.clone(),
         namespace: namespace.clone(),
         version: version.clone(),
         enabled_at_start,
         outcome,
-        // No capability is granted to an out-of-process module yet: the
-        // handshake offers none (`Offer::none`), so it holds none.
         granted: Vec::new(),
         resources,
     };
@@ -1184,6 +1194,52 @@ async fn mount_package(
         return degraded(app, why);
     }
     let resources = check_resources(inventory, manifest.requires_models());
+
+    // T7a/ME-3e: computed once, before `supervise` — `Offer` and the
+    // `MethodsFor` closure both need it, and it must be the SAME `Grants` that
+    // ends up in `MountReport.granted` below (judgement 10's consistency).
+    let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_OOP_GRANTS);
+    let granted_names: Vec<String> = granted.iter().map(|c| c.as_str().to_owned()).collect();
+    let broadcast: Arc<dyn EventBroadcast> = Arc::new(HubBroadcast(events.clone()));
+    let event_sink = granted
+        .has(Capability::Events)
+        .then(|| Arc::new(EventSink::new(manifest, broadcast)));
+    let offer = if granted.has(Capability::Events) {
+        agent24_os_proto::initialize::Offer {
+            provides: vec!["_a24/events/".to_owned()],
+        }
+    } else {
+        agent24_os_proto::initialize::Offer::none()
+    };
+    let methods_for: agent24_os_proto::supervisor::MethodsFor = {
+        let name = name.clone();
+        let granted = granted.clone();
+        let event_sink = event_sink.clone();
+        Arc::new(
+            move |generation: &Arc<agent24_os_proto::drain::Generation>| {
+                // A fresh bucket every time this closure runs — once per
+                // generation, i.e. once per (re)start. Building it outside the
+                // closure and cloning the `Arc` in would let a restarted module
+                // inherit whatever quota the previous generation had already
+                // spent (Codex round 3 Medium 2).
+                let limiter = Arc::new(crate::events_emit::RateLimiter::new(
+                    crate::events_emit::EVENTS_RATE_CAPACITY,
+                    crate::events_emit::EVENTS_RATE_REFILL_PER_SEC,
+                ));
+                agent24_os_proto::rpc::Methods::none().with(
+                    "_a24/events/emit",
+                    Arc::new(crate::events_emit::EventsEmitHandler {
+                        generation: generation.clone(),
+                        name: name.clone(),
+                        granted: granted.clone(),
+                        sink: event_sink.clone(),
+                        limiter,
+                    }),
+                )
+            },
+        )
+    };
+
     let current =
         agent24_os_proto::drain::Current::new(agent24_os_proto::drain::Generation::starting());
     let spec = agent24_os_proto::supervisor::ModuleSpec {
@@ -1209,8 +1265,8 @@ async fn mount_package(
             spec,
             host.callback_dir.clone(),
             current.clone(),
-            // No callback method is offered to modules yet (ME-3c onward).
-            Arc::new(|_| agent24_os_proto::rpc::Methods::none()),
+            methods_for,
+            offer,
             host.timings,
             package_check,
         )
@@ -1227,11 +1283,25 @@ async fn mount_package(
         Some(Ok(())) => {}
     }
     tracing::info!(
-        "domain OS {name:?} started from {} and proxied at {namespace}",
+        "domain OS {name:?} started from {} and proxied at {namespace} (grants: {granted_names:?})",
         package.dir.display()
     );
     let app = agent24_os_proto::proxy::mount(app, &namespace, current);
-    (app, report(MountOutcome::Mounted, resources))
+    // Only THIS branch — a module actually started — carries `granted_names`;
+    // `report`'s own default (used by `refused`/`degraded` above) stays
+    // `Vec::new()` (Codex round 2 High 2).
+    (
+        app,
+        MountReport {
+            name,
+            namespace,
+            version,
+            enabled_at_start,
+            outcome: MountOutcome::Mounted,
+            granted: granted_names,
+            resources,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1539,10 +1609,55 @@ while f.readline():
     pass
 "#;
 
+    /// T7a/ME-3e (judgement 10): a package module that, after handshaking,
+    /// reads back whether its `initialize` result's `offer` covers
+    /// `_a24/events/`, then makes ONE real `_a24/events/emit` call over the
+    /// callback socket and records the raw JSON-RPC response — so the Rust
+    /// test can assert on the real wire behaviour rather than a Rust-side
+    /// simulation of it. No HTTP listener is served; this probe is only
+    /// about the callback channel.
+    const EVENTS_PROBE_MODULE: &str = r#"import hashlib, json, os, socket, threading
+name = os.environ["A24_MODULE_NAME"]
+with open("domain-os.yml", "rb") as f:
+    digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+def serve():
+    while True:
+        conn, _ = listener.accept()
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+cb = socket.socket(socket.AF_UNIX)
+cb.connect(os.environ["A24_CALLBACK_SOCK"])
+req = {"jsonrpc": "2.0", "id": "1", "method": "initialize", "params": {
+    "protocol_versions": {"min": 1, "max": 1000}, "module": name,
+    "manifest_digest": digest, "auth_token": os.environ["A24_HANDSHAKE_TOKEN"],
+    "capabilities": []}}
+cb.sendall((json.dumps(req) + "\n").encode())
+f = cb.makefile("rb")
+init_resp = json.loads(f.readline())
+provides = init_resp.get("result", {}).get("offer", {}).get("provides", [])
+offers_events = any("_a24/events/emit".startswith(p) for p in provides)
+emit_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/events/emit",
+            "params": {"kind": "task.transitioned", "payload": {"x": 1}}}
+cb.sendall((json.dumps(emit_req) + "\n").encode())
+emit_resp = json.loads(f.readline())
+with open("probe.json", "w") as out:
+    json.dump({"offers_events": offers_events, "emit_response": emit_resp}, out)
+while f.readline():
+    pass
+"#;
+
     /// Write a package for `name` under `packages`: a manifest whose spawn
     /// command runs [`PACKAGE_MODULE`]. The module learns its name from an
     /// argument-free environment, so it is written into the script.
     fn write_package(packages: &Path, name: &str) {
+        write_package_with(packages, name, "[]", PACKAGE_MODULE);
+    }
+
+    /// Like [`write_package`], but with a caller-chosen `kernel_capabilities`
+    /// YAML list and script — for T7a/ME-3e tests that need a module to
+    /// declare `events` (or an unrecognised capability).
+    fn write_package_with(packages: &Path, name: &str, kernel_capabilities: &str, script: &str) {
         let dir = packages.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -1550,14 +1665,14 @@ while f.readline():
             format!(
                 "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
                  event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
-                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 kernel_capabilities: {kernel_capabilities}\nimpl_kind: out_of_process_provider\n\
                  spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
             ),
         )
         .unwrap();
         std::fs::write(
             dir.join("mod.py"),
-            PACKAGE_MODULE.replace("os.environ[\"A24_MODULE_NAME\"]", &format!("{name:?}")),
+            script.replace("os.environ[\"A24_MODULE_NAME\"]", &format!("{name:?}")),
         )
         .unwrap();
     }
@@ -1700,6 +1815,133 @@ while f.readline():
             host.supervisors.close().is_empty(),
             "a package was started during the shutdown"
         );
+    }
+
+    // ── T7a/ME-3e: out-of-process capability grants + `_a24/events/emit` ──
+
+    /// Judgement 9: `Capability::parse` already rejects an unrecognised
+    /// capability name at manifest-parse time — confirmed here at the NEW
+    /// consumption point (an out-of-process package's manifest), not because
+    /// the behaviour is new, but because `mount_package` never used to read
+    /// `kernel_capabilities` at all, so nothing had exercised this combination
+    /// before. There is no "partially granted" outcome: the whole module is
+    /// refused before it ever reaches the catalogue.
+    #[test]
+    fn a_package_declaring_an_unknown_capability_never_reaches_the_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        write_package_with(&packages, "typo", "[events, telepthy]", PACKAGE_MODULE);
+        let scan = agent24_os_packages::discovery::scan(&packages);
+        assert!(
+            scan.found.is_empty(),
+            "a manifest with an unknown capability must not be mountable"
+        );
+        assert_eq!(scan.refused.len(), 1);
+        assert!(
+            scan.refused[0].why.contains("telepthy"),
+            "{}",
+            scan.refused[0].why
+        );
+    }
+
+    /// Judgement 10, the three-way consistency check, over a REAL package
+    /// process and a REAL `initialize` handshake (not a Rust-side simulation
+    /// of the wire): a module granted `events` gets `MountReport.granted ==
+    /// ["events"]`, its handshake's `offer.provides("_a24/events/emit")` is
+    /// true, and a real `_a24/events/emit` call over its callback socket
+    /// succeeds with `{}`. A module granted nothing gets the negative of all
+    /// three: `granted == []`, no offer, and the same call comes back
+    /// `forbidden` — proving the method exists (it is NOT `-32601`) but this
+    /// module cannot use it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn granted_and_offer_and_the_real_call_agree_for_both_outcomes() {
+        for (name, capabilities, expect_granted) in
+            [("granted", "[events]", true), ("ungranted", "[]", false)]
+        {
+            let tmp = tempfile::Builder::new()
+                .prefix("a24")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let packages = tmp.path().join("packages");
+            write_package_with(&packages, name, capabilities, EVENTS_PROBE_MODULE);
+            let host = test_host(tmp.path());
+            let hub = crate::events::EventsHub::default();
+            let mut events = hub.subscribe();
+            let (_, reports, _) = mount_all(
+                &discovered(&packages),
+                &tmp.path().join("os"),
+                &hub,
+                Ok(&all_enabled()),
+                &no_models(),
+                None,
+                Ok(&host),
+            )
+            .await;
+            assert_eq!(
+                reports[0].outcome,
+                MountOutcome::Mounted,
+                "{:?}",
+                reports[0]
+            );
+            assert_eq!(
+                reports[0].granted,
+                if expect_granted {
+                    vec!["events".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                "MountReport.granted for {name:?}"
+            );
+
+            let probe_path = packages.join(name).join("probe.json");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let probe: serde_json::Value = loop {
+                if let Ok(bytes) = std::fs::read(&probe_path) {
+                    break serde_json::from_slice(&bytes).unwrap();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the module never wrote its probe"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+
+            assert_eq!(
+                probe["offers_events"].as_bool(),
+                Some(expect_granted),
+                "the real handshake's offer for {name:?}"
+            );
+            let emit_response = &probe["emit_response"];
+            if expect_granted {
+                assert_eq!(
+                    emit_response["result"],
+                    serde_json::json!({}),
+                    "a granted module's real call must succeed with exactly {{}}: {emit_response}"
+                );
+                let (_, body) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                        .await
+                        .expect("the kernel's WS hub must see the event")
+                        .unwrap();
+                match body {
+                    agent24_protocol::EventBody::Module(m) => {
+                        assert_eq!(m.module, name);
+                        assert_eq!(m.kind, "task.transitioned");
+                    }
+                    other => panic!("expected a module event, got {other:?}"),
+                }
+            } else {
+                assert_eq!(
+                    emit_response["error"]["data"]["kind"].as_str(),
+                    Some("forbidden"),
+                    "an ungranted module's real call: {emit_response}"
+                );
+            }
+
+            for s in host.supervisors.close().running {
+                s.handle.stop().await.expect("a clean stop");
+            }
+        }
     }
 
     /// A full `AppState` with one package, `remote`, started and Running —

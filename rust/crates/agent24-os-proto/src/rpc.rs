@@ -15,22 +15,28 @@
 //! the reason this module exists separately from `initialize`: the same bytes
 //! get a different fate depending on which side of the handshake they arrive.
 //!
-//! # The offer set is empty here
+//! # Methods are always registered; capability gating happens inside `call()`
 //!
-//! No business method is registered by this slice: [`Methods::none`] is what a
-//! kernel at this stage serves, so every call is `-32601`. **Methods are not
-//! registered early to make a `forbidden` test possible** — SPEC §8 forbids that
-//! explicitly (it would collide with "an unimplemented `scoped/*` must be
-//! method-not-found"). "A handler exists but the caller lacks the grant →
-//! forbidden" belongs to ME-3d/3e. Tests here register test-only methods on
-//! their own [`Methods`]; production code never does.
+//! T7a/ME-3e registered the first real method, `_a24/events/emit`
+//! (`agent24d`'s `MethodsFor` — see
+//! `docs/design/T7a-ME3e-grants-and-events.md`): it is on every out-of-process
+//! connection's [`Methods`], whether or not that module's manifest was granted
+//! `events`. **Methods are not registered conditionally to make a `forbidden`
+//! test possible** — SPEC §8 forbids that explicitly (it would collide with "an
+//! unimplemented `scoped/*` must be method-not-found"). "A handler exists but
+//! the caller lacks the grant → forbidden" is the distinction: an unknown method
+//! is `-32601`, an unauthorised call to a real one is `forbidden`, and a handler
+//! decides which by checking its own `Grants`, not by being absent from
+//! [`Methods`]. Tests here also register test-only methods on their own
+//! [`Methods`]; production code registers real ones the same way.
 //!
 //! # Not in this slice
 //!
-//! Wiring [`serve`] into the daemon (the supervisor owns connections; ME3-SUP),
-//! and the DRAINING admission check for callbacks (`drain::Generation::
-//! admit_callback`, ME-3b-5): with no business method there is nothing for it to
-//! admit, and the first handler (ME-3d/3e) is where it gets its call site.
+//! Wiring [`serve`] into the daemon (the supervisor owns connections; ME3-SUP)
+//! is done; the DRAINING admission check for callbacks
+//! (`drain::Generation::admit_callback`, ME-3b-5) is exercised by
+//! `_a24/events/emit`'s handler, which is also `dispatch()`'s first caller of a
+//! business method — see [`dispatch`]'s params budget below.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -54,13 +60,16 @@ use crate::initialize::INITIALIZE_METHOD;
 /// each in-flight call holds its parsed params (from a frame of at most
 /// [`MAX_FRAME_BYTES`]) and, when done, a queued response within the frame
 /// limit. **Parsed params are not frame-sized**: a 1 MiB `{"a":[0,0,…]}` parses
-/// to 524 278 `Value`s of 32 bytes, over 15 MiB (review F4 @ #176), so once a
-/// method accepts array params this ceiling is near 1 GiB per connection. No
-/// method does yet (the offer set is empty); before the first one does (ME-3d),
-/// bound in-flight params by bytes or cap one call's params (FU-53). 64 is the proxy's per-module
-/// ceiling too; that is symmetry, **not** a guarantee that callbacks cannot
-/// outnumber requests — nothing ties the two, and background work (§5) has no
-/// request at all.
+/// to 524 278 `Value`s of 32 bytes, over 15 MiB (review F4 @ #176), so a method
+/// that accepted array params without a check on the parsed shape would push
+/// this ceiling near 1 GiB per connection. `_a24/events/emit` (T7a/ME-3d/3e) is
+/// the first method whose params can hold arrays, and it is admitted only
+/// through [`dispatch`]'s node/depth/string-byte budget (FU-53, closed by T7a —
+/// see `docs/design/T7a-ME3e-grants-and-events.md` §5), which runs before a
+/// frame's `params` is even cloned, let alone handed to a handler. 64 is the
+/// proxy's per-module ceiling too; that is symmetry, **not** a guarantee that
+/// callbacks cannot outnumber requests — nothing ties the two, and background
+/// work (§5) has no request at all.
 pub const MAX_IN_FLIGHT_PER_CONNECTION: usize = 64;
 
 /// How long the kernel works on one callback before answering `timeout`. Not
@@ -96,8 +105,10 @@ pub mod code {
     pub const APPLICATION: i32 = -32000;
 }
 
-/// `error.data.kind` — a **closed** set (SPEC §3). A kind outside this list is a
-/// kind a module cannot have been written against.
+/// `error.data.kind` — a **closed** set (SPEC §3, extended by T7a/ME-3e for
+/// `_a24/events/emit` — see `docs/design/T7a-ME3e-grants-and-events.md` §6).
+/// A kind outside this list is a kind a module cannot have been written
+/// against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     Forbidden,
@@ -110,10 +121,25 @@ pub enum ErrorKind {
     VersionMismatch,
     AuthFailed,
     ManifestMismatch,
+    /// T7a/ME-3e: a callback landed before this generation's `initialize`
+    /// finished (`Generation` still `Starting`) — `CallbackRefused::NotReady`.
+    NotReady,
+    /// T7a/ME-3e: the generation is draining and the callback carries no
+    /// `request_id` still in flight — `CallbackRefused::DrainingWithoutRequest`
+    /// / `DrainingUnknownRequest`.
+    Draining,
+    /// T7a/ME-3e: the generation has been revoked — `CallbackRefused::Revoked`.
+    Revoked,
+    /// T7a/ME-3e: the per-generation token bucket for `_a24/events/emit` is
+    /// exhausted.
+    RateLimited,
+    /// T7a/ME-3e: `dispatch()`'s generic node/depth/string-byte budget on
+    /// `params`, or an events-specific serialized-size cap, was exceeded.
+    PayloadTooLarge,
 }
 
 impl ErrorKind {
-    pub const ALL: [ErrorKind; 10] = [
+    pub const ALL: [ErrorKind; 15] = [
         Self::Forbidden,
         Self::Busy,
         Self::Cancelled,
@@ -124,6 +150,11 @@ impl ErrorKind {
         Self::VersionMismatch,
         Self::AuthFailed,
         Self::ManifestMismatch,
+        Self::NotReady,
+        Self::Draining,
+        Self::Revoked,
+        Self::RateLimited,
+        Self::PayloadTooLarge,
     ];
 
     /// The wire string.
@@ -140,6 +171,11 @@ impl ErrorKind {
             Self::VersionMismatch => "version_mismatch",
             Self::AuthFailed => "auth_failed",
             Self::ManifestMismatch => "manifest_mismatch",
+            Self::NotReady => "not_ready",
+            Self::Draining => "draining",
+            Self::Revoked => "revoked",
+            Self::RateLimited => "rate_limited",
+            Self::PayloadTooLarge => "payload_too_large",
         }
     }
 }
@@ -305,13 +341,16 @@ pub struct Methods {
 }
 
 impl Methods {
-    /// What this slice serves: nothing. Every call is `-32601`.
+    /// No methods at all: every call is `-32601`. What a connection served
+    /// before T7a/ME-3e's `_a24/events/emit` (still used for a placeholder
+    /// generation and in tests that only need a specific handler or two).
     #[must_use]
     pub fn none() -> Self {
         Self::default()
     }
 
-    /// Register a method. Later slices (ME-3d/3e) add their handlers here.
+    /// Register a method. `agent24d`'s `MethodsFor` (T7a/ME-3e onward) calls
+    /// this once per generation to build the real, production set.
     #[must_use]
     pub fn with(mut self, name: &str, handler: Arc<dyn Handler>) -> Self {
         self.map.insert(name.to_owned(), handler);
@@ -338,6 +377,87 @@ pub enum Dispatch {
     /// A notification this channel does not act on. Notifications are never
     /// answered (JSON-RPC 2.0), so an unknown or malformed one is dropped.
     Ignore,
+}
+
+/// Caps on one frame's `params`, enforced in [`dispatch`] before it is cloned
+/// or handed to any handler — generic across every method, not specific to
+/// `_a24/events/emit` (T7a/ME-3e, design doc §5; closes the FU-53 gap
+/// `MAX_IN_FLIGHT_PER_CONNECTION` documents).
+///
+/// Total `Value` node count. `{}` is 1 node; every scalar, array and object is
+/// its own node (object keys are not — see [`ParamsBudget`]).
+const PARAMS_MAX_NODES: usize = 5_000;
+/// Deepest nesting, root at depth 0.
+const PARAMS_MAX_DEPTH: usize = 32;
+/// Total UTF-8 bytes across every string scalar AND every object key
+/// (Codex round 4 High 1: counting only `Value::String` scalars lets a
+/// payload with one enormous key and a `null` value sail through uncounted).
+const PARAMS_MAX_STRING_BYTES: usize = 262_144;
+
+/// One frame's `params`, walked once. The exact recursive definition (design
+/// doc §5), with the examples it gives: `{}` → `(1, 0, 0)`; `{"a":1}` →
+/// `(2, 1, 1)`; `[1,2,3]` → `(4, 1, 0)`; `{"a":{"b":"hello"}}` → `(3, 2, 7)`
+/// (`"a"` 1 byte + `"b"` 1 byte + `"hello"` 5 bytes).
+///
+/// - `Null`/`Bool`/`Number`: one node, no bytes.
+/// - `String(s)`: one node, `s.len()` bytes.
+/// - `Array`: the array itself is one node; each element recurses one level
+///   deeper.
+/// - `Object`: the object itself is one node; each entry's KEY bytes count
+///   (the key is not a node of its own — it belongs to the entry, not to a
+///   separate slot), and the VALUE recurses one level deeper.
+///
+/// `pub` (not just `pub(crate)`): a business method whose resident cost isn't
+/// dominated by its own wire bytes — an event payload kept alive in a shared
+/// ring buffer, say — needs this exact counting, with its own tighter caps,
+/// not a second hand-rolled walker that could quietly drift from this one
+/// (T7a/ME-3e code review round 1 High 1: `agent24d`'s events handler first
+/// shipped with a serialized-byte-only cap, which a payload shaped like
+/// `{"a":[0,0,…]}` sails through — few bytes on the wire, thousands of
+/// resident `Value` nodes at ~32 bytes each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParamsBudget {
+    pub nodes: usize,
+    pub max_depth: usize,
+    pub string_bytes: usize,
+}
+
+/// Walk `value` once, computing `(nodes, max_depth, string_bytes)` per the
+/// recursive definition in `docs/design/T7a-ME3e-grants-and-events.md` §5.
+pub fn walk_params_budget(value: &Value, depth: usize, budget: &mut ParamsBudget) {
+    budget.nodes += 1;
+    budget.max_depth = budget.max_depth.max(depth);
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Value::String(s) => budget.string_bytes += s.len(),
+        Value::Array(items) => {
+            for item in items {
+                walk_params_budget(item, depth + 1, budget);
+            }
+        }
+        Value::Object(entries) => {
+            for (key, val) in entries {
+                budget.string_bytes += key.len();
+                walk_params_budget(val, depth + 1, budget);
+            }
+        }
+    }
+}
+
+/// One-shot: walk `value` from the root and return its budget.
+#[must_use]
+pub fn params_budget_of(value: &Value) -> ParamsBudget {
+    let mut budget = ParamsBudget::default();
+    walk_params_budget(value, 0, &mut budget);
+    budget
+}
+
+/// Whether `value` exceeds any of the three caps.
+fn params_over_budget(value: &Value) -> bool {
+    let budget = params_budget_of(value);
+    budget.nodes > PARAMS_MAX_NODES
+        || budget.max_depth > PARAMS_MAX_DEPTH
+        || budget.string_bytes > PARAMS_MAX_STRING_BYTES
 }
 
 /// Classify one post-handshake frame. Pure: no I/O, no clock.
@@ -444,6 +564,17 @@ pub fn dispatch(frame: &[u8], methods: &Methods, in_flight: &dyn Fn(&str) -> boo
     };
     let params = match obj.get("params") {
         None => Value::Object(Map::new()),
+        // The budget is checked on the REFERENCE, before the `.clone()` below
+        // and before this method's own handler (or even its existence) is
+        // looked at — generic across every method (T7a/ME-3e design doc §5).
+        // A request echoes its (already-validated) id; a notification is
+        // silently ignored, same as any other post-handshake failure.
+        Some(p @ Value::Object(_)) if params_over_budget(p) => {
+            return fail(RpcError::application(
+                ErrorKind::PayloadTooLarge,
+                "params exceed the node count, nesting depth, or string byte budget",
+            ));
+        }
         Some(p @ Value::Object(_)) => p.clone(),
         Some(_) => return fail(RpcError::invalid_params("params must be an object")),
     };
@@ -1691,7 +1822,14 @@ mod tests {
         );
         let () = w;
         assert_eq!(r["id"], "big");
-        assert_eq!(code_of(&r), i64::from(code::METHOD_NOT_FOUND));
+        // T7a/ME-3e added a params budget (256 KiB of string bytes) well below
+        // the 1 MiB frame limit this test pads up to, so the giant `pad`
+        // string is now caught there before method lookup ever runs — this
+        // still proves the line at the limit is READ AND ANSWERED rather than
+        // disconnected (the property this test is actually about), just with
+        // a different, now-earlier-firing reason than `method_not_found`.
+        assert_eq!(code_of(&r), i64::from(code::APPLICATION));
+        assert_eq!(kind(&r), Some("payload_too_large"));
 
         let over = format!("{exact}x\n");
         let writer = tokio::spawn({
@@ -1774,10 +1912,13 @@ mod tests {
     /// SPEC §3's closed set, quoted: the kinds here are exactly the backticked
     /// words of the sentence — not one more, not one fewer — and the handshake's
     /// kinds (ME-3b-2b) are members of it. (SPEC §8: a wire constant must appear
-    /// as a whole word in the quoted SPEC text.)
+    /// as a whole word in the quoted SPEC text.) T7a/ME-3e extended the quoted
+    /// sentence itself (`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md` line ~170) with
+    /// the five kinds `_a24/events/emit` needed; this constant is kept in sync
+    /// with that edit, not just with the enum.
     #[test]
     fn the_error_kinds_are_exactly_specs_closed_set() {
-        const SPEC: &str = "kind 是闭集：`forbidden` / `busy` / `cancelled` / `timeout` / `quota_exceeded` / `invalid_lease` / `unknown_capability` / `version_mismatch` / **`auth_failed`** / **`manifest_mismatch`**";
+        const SPEC: &str = "kind 是闭集（T7a/ME-3e 为 events emit 扩展）：`forbidden` / `busy` / `cancelled` / `timeout` / `quota_exceeded` / `invalid_lease` / `unknown_capability` / `version_mismatch` / **`auth_failed`** / **`manifest_mismatch`** / `not_ready` / `draining` / `revoked` / `rate_limited` / `payload_too_large`";
         let quoted: HashSet<&str> = SPEC.split('`').skip(1).step_by(2).collect();
         let ours: HashSet<&str> = ErrorKind::ALL.iter().map(|k| k.as_str()).collect();
         assert_eq!(ours, quoted);
@@ -1792,6 +1933,215 @@ mod tests {
                 "handshake kind {k} is not in the closed set"
             );
         }
+    }
+
+    // ── T7a/ME-3e: dispatch()'s generic params budget (design doc §5) ────
+
+    /// A JSON object of `pairs` short-keyed `null` entries — the cheapest way
+    /// to move the node count without moving depth or string bytes much.
+    fn wide_object(pairs: usize) -> Value {
+        let mut map = Map::new();
+        for i in 0..pairs {
+            map.insert(format!("k{i}"), Value::Null);
+        }
+        Value::Object(map)
+    }
+
+    /// A single-key object nested `depth` times, bottoming out at `null` — the
+    /// cheapest way to move max depth without a wide fan-out. `D(deep_object(n))
+    /// == n` (design doc §5's recursive definition, worked by hand in the test
+    /// below).
+    fn deep_object(depth: usize) -> Value {
+        let mut v = Value::Null;
+        for _ in 0..depth {
+            v = json!({"a": v});
+        }
+        v
+    }
+
+    /// An object with one key of `key_bytes` bytes and a `null` value — moves
+    /// `string_bytes` through the key alone, with nodes/depth at their floor.
+    fn huge_key_object(key_bytes: usize) -> Value {
+        let mut map = Map::new();
+        map.insert("x".repeat(key_bytes), Value::Null);
+        Value::Object(map)
+    }
+
+    fn frame_with_params(id: Option<&str>, method: &str, params: &Value) -> Vec<u8> {
+        let mut obj = Map::new();
+        obj.insert("jsonrpc".into(), json!("2.0"));
+        if let Some(id) = id {
+            obj.insert("id".into(), json!(id));
+        }
+        obj.insert("method".into(), json!(method));
+        obj.insert("params".into(), params.clone());
+        serde_json::to_vec(&Value::Object(obj)).unwrap()
+    }
+
+    /// The exact recursive definition, worked by hand in the design doc,
+    /// pinned so nobody re-derives it slightly wrong later.
+    #[test]
+    fn params_budget_matches_the_designs_worked_examples() {
+        let cases: [(Value, ParamsBudget); 4] = [
+            (
+                json!({}),
+                ParamsBudget {
+                    nodes: 1,
+                    max_depth: 0,
+                    string_bytes: 0,
+                },
+            ),
+            (
+                json!({"a": 1}),
+                ParamsBudget {
+                    nodes: 2,
+                    max_depth: 1,
+                    string_bytes: 1,
+                },
+            ),
+            (
+                json!([1, 2, 3]),
+                ParamsBudget {
+                    nodes: 4,
+                    max_depth: 1,
+                    string_bytes: 0,
+                },
+            ),
+            (
+                json!({"a": {"b": "hello"}}),
+                ParamsBudget {
+                    nodes: 3,
+                    max_depth: 2,
+                    string_bytes: 7,
+                },
+            ),
+        ];
+        for (value, expected) in cases {
+            let mut budget = ParamsBudget::default();
+            walk_params_budget(&value, 0, &mut budget);
+            assert_eq!(budget, expected, "for {value}");
+        }
+    }
+
+    /// `limit - 1` / `limit` / `limit + 1` for each of the three caps,
+    /// independently: within budget dispatches to the handler, over budget
+    /// answers `payload_too_large` before the method is even looked up (the
+    /// `t/echo` handler exists, but a nonexistent one behaves identically —
+    /// see `the_budget_applies_to_any_method_including_an_unknown_one`).
+    #[test]
+    fn params_budget_boundaries_are_enforced_per_cap() {
+        let assert_within = |params: &Value| {
+            let frame = frame_with_params(Some("1"), "t/echo", params);
+            assert!(
+                matches!(
+                    dispatch(&frame, &fixture().methods, &|_| false),
+                    Dispatch::Call { .. }
+                ),
+                "expected Call for {params}"
+            );
+        };
+        let assert_over = |params: &Value| {
+            let frame = frame_with_params(Some("1"), "t/echo", params);
+            let Dispatch::Respond(r) = dispatch(&frame, &fixture().methods, &|_| false) else {
+                panic!("expected Respond(payload_too_large) for {params}");
+            };
+            assert_eq!(r.id.as_deref(), Some("1"), "the valid id must be echoed");
+            let err = r.outcome.unwrap_err();
+            assert_eq!(err.code, code::APPLICATION);
+            assert_eq!(err.kind, Some(ErrorKind::PayloadTooLarge));
+        };
+
+        // Nodes: `wide_object(n)` has `n + 1` nodes (the object itself, plus
+        // one per entry).
+        assert_within(&wide_object(PARAMS_MAX_NODES - 2)); // nodes == limit - 1
+        assert_within(&wide_object(PARAMS_MAX_NODES - 1)); // nodes == limit
+        assert_over(&wide_object(PARAMS_MAX_NODES)); // nodes == limit + 1
+
+        // Depth: `deep_object(d)` has max depth `d`.
+        assert_within(&deep_object(PARAMS_MAX_DEPTH - 1));
+        assert_within(&deep_object(PARAMS_MAX_DEPTH));
+        assert_over(&deep_object(PARAMS_MAX_DEPTH + 1));
+
+        // String bytes: an empty key plus a string value of exactly the
+        // target length.
+        let bytes_object = |len: usize| {
+            let mut map = Map::new();
+            map.insert(String::new(), Value::String("x".repeat(len)));
+            Value::Object(map)
+        };
+        assert_within(&bytes_object(PARAMS_MAX_STRING_BYTES - 1));
+        assert_within(&bytes_object(PARAMS_MAX_STRING_BYTES));
+        assert_over(&bytes_object(PARAMS_MAX_STRING_BYTES + 1));
+    }
+
+    /// Codex round 4 High 1: a huge OBJECT KEY with a tiny (`null`) value must
+    /// be caught too — counting only `Value::String` scalars and missing
+    /// object keys would let this sail through with `nodes == 2` and
+    /// `max_depth == 1`.
+    #[test]
+    fn a_huge_key_with_a_tiny_value_is_caught_by_the_byte_budget() {
+        let params = huge_key_object(PARAMS_MAX_STRING_BYTES + 1);
+        let frame = frame_with_params(Some("1"), "t/echo", &params);
+        let Dispatch::Respond(r) = dispatch(&frame, &fixture().methods, &|_| false) else {
+            panic!("a huge key must be caught even though nodes and depth are tiny");
+        };
+        assert_eq!(
+            r.outcome.unwrap_err().kind,
+            Some(ErrorKind::PayloadTooLarge)
+        );
+    }
+
+    /// Over-budget wire behaviour splits on whether the frame carries an id:
+    /// a request gets `payload_too_large` under its own (already-validated)
+    /// id; a notification is silently ignored, like any other post-handshake
+    /// failure of a notification.
+    #[test]
+    fn over_budget_wire_behaviour_splits_on_id_vs_notification() {
+        let over = wide_object(PARAMS_MAX_NODES);
+        let request = frame_with_params(Some("req-1"), "t/echo", &over);
+        let Dispatch::Respond(r) = dispatch(&request, &fixture().methods, &|_| false) else {
+            panic!("a request over budget must be answered, not ignored");
+        };
+        assert_eq!(r.id.as_deref(), Some("req-1"));
+        assert_eq!(
+            r.outcome.unwrap_err().kind,
+            Some(ErrorKind::PayloadTooLarge)
+        );
+
+        let notification = frame_with_params(None, "t/echo", &over);
+        assert!(matches!(
+            dispatch(&notification, &fixture().methods, &|_| false),
+            Dispatch::Ignore
+        ));
+    }
+
+    /// The budget applies before method lookup — it catches an oversized
+    /// frame for a method that does not exist at all, never producing
+    /// `method_not_found`/`invalid_params` for it.
+    #[test]
+    fn the_budget_applies_to_any_method_including_an_unknown_one() {
+        let over = wide_object(PARAMS_MAX_NODES);
+        let frame = frame_with_params(Some("1"), "no/such/method", &over);
+        let Dispatch::Respond(r) = dispatch(&frame, &fixture().methods, &|_| false) else {
+            panic!("expected Respond(payload_too_large)");
+        };
+        let err = r.outcome.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::PayloadTooLarge));
+        assert_ne!(err.code, code::METHOD_NOT_FOUND);
+        assert_ne!(err.code, code::INVALID_PARAMS);
+    }
+
+    /// Positive control: a frame within all three caps reaches
+    /// `check_params`/`call()` and is judged on its own merits there, even
+    /// when its content (not its shape) is invalid — the budget must not
+    /// misfire on legitimate small requests.
+    #[test]
+    fn within_budget_frames_are_not_misjudged_by_the_budget_check() {
+        let frame = frame_with_params(Some("1"), "t/strict", &json!({"n": "not a number"}));
+        let Dispatch::Respond(r) = dispatch(&frame, &fixture().methods, &|_| false) else {
+            panic!("expected check_params to reject this, not the budget");
+        };
+        assert_eq!(r.outcome.unwrap_err().code, code::INVALID_PARAMS);
     }
 
     // ── review round 1 (Codex + an independent reviewer) ────────────────

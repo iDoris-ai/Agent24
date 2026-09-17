@@ -20,14 +20,18 @@
 //! - manifest 摘要不符 → `-32000` + `kind: manifest_mismatch`
 //! - 版本区间无交集 → `-32000` + `kind: version_mismatch`
 //!
-//! # The offer set is EMPTY at this slice, and that is deliberate
+//! # What `Offer` means, since T7a/ME-3e
 //!
-//! SPEC §8 fixes the ladder: a capability may be offered only once a handler for
-//! it exists. `memory` arrives in ME-3d, `events`/`approval` in ME-3e. Offering
-//! them here would create the state this design keeps arguing against — granted,
-//! but no method behind it. So [`Offer::none`] is what a kernel at this stage
-//! answers with, and the type exists so that later slices ADD to it rather than
-//! inventing a shape.
+//! `Offer.provides` does **not** mean "a handler happens to be registered" —
+//! `_a24/events/emit` (T7a) is registered on every out-of-process connection
+//! whether or not `events` was granted, so "registered" would make every
+//! connection's `Offer` identical and useless. It means **this connection is
+//! authorised to call this method family, and a call is unlikely to come back
+//! `forbidden`**. [`Offer::none`] is still what a kernel answers with when it
+//! has granted nothing — there is no "supported but disabled" state — but a
+//! non-empty `Offer` is now a real, produced value (`agent24d`'s `mount_package`
+//! computes it from the same `Grants` that decided `MountReport.granted`; see
+//! `docs/design/T7a-ME3e-grants-and-events.md` §2).
 //!
 //! # This module has no production caller yet
 //!
@@ -89,13 +93,32 @@ pub struct InitializeRequest {
     pub params: InitializeParams,
 }
 
-/// What the kernel offers this connection: the method families that actually
-/// have handlers.
+/// What the kernel offers this connection: the method families this
+/// connection is AUTHORISED to call — not (since T7a/ME-3e) the method
+/// families that happen to have a handler registered. `_a24/events/emit` is
+/// registered unconditionally (capability gating happens inside the handler),
+/// so "has a handler" would make `Offer` say the same thing for every
+/// connection regardless of its manifest's grants; "authorised, unlikely to
+/// come back `forbidden`" is the contract that actually varies per module and
+/// is worth a caller checking before it bothers to call.
 ///
-/// It has to be able to say **"this daemon does not provide `memory.scoped`"**
-/// (SPEC §8's acceptance criterion), and it does so by simple absence — a name
-/// not in `provides` is not provided. There is no "supported but disabled"
-/// state, because that is the same lie in a different spelling.
+/// It still has to be able to say **"this daemon does not provide
+/// `memory.scoped`"** (SPEC §8's acceptance criterion), and it does so by
+/// simple absence — a name not in `provides` is not provided, whether that is
+/// because no handler exists at all or because this connection's module was
+/// not granted the capability behind it. `Offer` does not distinguish those
+/// two reasons with a separate "disabled" value — both collapse to plain
+/// absence — so there is no third, in-between wire state to lie with; a
+/// caller that wants the reason calls the method and reads `forbidden` vs
+/// `-32601` off the response instead.
+///
+/// `provides` matches by unbounded [`str::starts_with`] (see
+/// [`Offer::provides`]), so a prefix like `"_a24/events/"` will also match a
+/// hypothetical future sibling method such as `"_a24/events/emitter"` — a
+/// known, accepted imprecision (design doc §2): `Offer` is a handshake-time
+/// hint for a caller deciding whether a call is worth making, not the
+/// authorisation check itself (that is `Methods::get`'s exact-string lookup
+/// plus the handler's own `Grants` check).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Offer {
     /// Method-family prefixes the daemon will answer, e.g. `_a24/memory/private`.
@@ -103,10 +126,12 @@ pub struct Offer {
 }
 
 impl Offer {
-    /// What a kernel at ME-3b-2b offers: nothing.
+    /// What a kernel offers a connection it has granted nothing to: nothing.
     ///
-    /// Not a placeholder. At this slice no business handler exists, so any other
-    /// answer would grant a capability with no method behind it.
+    /// Not a placeholder for "not implemented yet" — a live kernel with a real
+    /// `_a24/events/emit` handler still answers `Offer::none()` to a module
+    /// whose manifest was not granted `events`, because granting nothing means
+    /// authorising nothing, whatever handlers happen to exist on the wire.
     #[must_use]
     pub fn none() -> Self {
         Self::default()
@@ -214,7 +239,12 @@ pub struct Expectation {
     pub auth_token: String,
     /// What this kernel build speaks.
     pub kernel_versions: VersionRange,
-    /// What it can actually serve — [`Offer::none`] until ME-3d.
+    /// What this connection is authorised to call (see [`Offer`]'s doc) —
+    /// computed by the caller from the module's granted [`Capability`]-ies
+    /// (`agent24d`'s `mount_package`, T7a/ME-3e), not by this crate.
+    /// [`Offer::none`] for a module granted nothing.
+    ///
+    /// [`Capability`]: agent24_domain::Capability
     pub offer: Offer,
 }
 
@@ -627,6 +657,31 @@ mod tests {
         assert!(
             !later.provides("_a24/memory/scoped/get"),
             "offering private must not imply scoped"
+        );
+    }
+
+    /// Judgement 11 (design doc §2, `docs/design/T7a-ME3e-grants-and-events.md`):
+    /// `provides` matches by unbounded `str::starts_with`, not by a `/`-delimited
+    /// path segment. `Offer { provides: vec!["_a24/events/"] }` therefore also
+    /// matches a hypothetical sibling method like `"_a24/events/emitter"`, even
+    /// though `Methods` would never register anything by that name — a known,
+    /// accepted imprecision, pinned here so nobody "fixes" it as a bug or relies
+    /// on it as a security boundary (the real authorisation check is
+    /// `Methods::get`'s exact match plus the handler's own `Grants` check, not
+    /// `Offer`).
+    #[test]
+    fn offer_provides_is_an_unbounded_prefix_match_not_a_path_segment_match() {
+        let events = Offer {
+            provides: vec!["_a24/events/".to_owned()],
+        };
+        assert!(events.provides("_a24/events/emit"), "the real method");
+        assert!(
+            events.provides("_a24/events/emitter"),
+            "a hypothetical sibling method is ALSO matched — the known imprecision"
+        );
+        assert!(
+            !events.provides("_a24/approval/gate"),
+            "an unrelated family must still be absent"
         );
     }
 
