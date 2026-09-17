@@ -517,7 +517,7 @@ mod tests {
         // Admitted while Running, and kept alive (not dropped) so the id stays
         // in `in_flight` through the drain — this is exactly the "still-live
         // request" case `admit_callback` is meant to allow through.
-        let in_flight = g.admit_request("req-1".to_owned()).unwrap();
+        let in_flight = g.admit_request("req-1".to_owned(), [0u8; 32]).unwrap();
         assert!(g.begin_drain(Instant::now(), Duration::from_secs(30)));
         let h = handler(g, true, Some(sink), generous_limiter());
         let params = json!({"kind": "task.transitioned", "payload": {}, "request_id": "req-1"});

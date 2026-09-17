@@ -36,6 +36,11 @@ pub struct AppState {
     /// the user adds governs the very next tool call without a restart.
     pub risk_overrides: StdArc<agent24_policy::overrides::RiskOverrideStore>,
     pub broker: Arc<agent24_policy::ApprovalBroker>,
+    /// T7b/ME-3e: module (gate/advise) approvals — a PARALLEL broker, its own
+    /// table, its own async submit-then-poll model (design doc "现状" 4). Not
+    /// `Option`: it needs only a `Store` and the WS hub, both of which exist
+    /// unconditionally by the time `AppState::new` runs.
+    pub module_approval_broker: Arc<crate::module_approval_broker::ModuleApprovalBroker>,
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
     pub store: Store,
@@ -503,6 +508,11 @@ impl AppState {
             }),
             StdArc::new(move |body| sched_hub.broadcast(body)),
         );
+        // T7b/ME-3e: a PARALLEL broker, its own table, its own async
+        // submit-then-poll model — deliberately not built from `broker`
+        // above (design doc "现状" 4).
+        let module_approval_broker =
+            crate::module_approval_broker::ModuleApprovalBroker::new(store.clone(), events.clone());
         Self {
             risk_overrides,
             token: Arc::new(token),
@@ -510,6 +520,7 @@ impl AppState {
             router,
             tools,
             broker,
+            module_approval_broker,
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
             store,
@@ -676,6 +687,17 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route(
             "/api/v1/approvals/{id}",
             get(crate::approvals::get_approval).post(crate::approvals::decide_approval),
+        )
+        // T7b/ME-3e: module (gate/advise) approvals — a parallel surface to
+        // `/api/v1/approvals` above, see `crate::module_approvals`.
+        .route(
+            "/api/v1/module-approvals",
+            get(crate::module_approvals::list_module_approvals),
+        )
+        .route(
+            "/api/v1/module-approvals/{id}",
+            get(crate::module_approvals::get_module_approval)
+                .post(crate::module_approvals::decide_module_approval),
         )
         .route(
             "/api/v1/schedules",
@@ -1014,6 +1036,13 @@ pub async fn serve(
         sched_cancel,
     ));
 
+    // T7b/ME-3e: the periodic module-approval timeout scan (design doc
+    // decision 5) — a plain periodic task, not a per-row timer, on the same
+    // `CancellationToken`/`tokio::spawn` pattern as the scheduler above.
+    state
+        .module_approval_broker
+        .spawn_scan(cancel.child_token());
+
     // Domain OSes (ME-1b-b). THIS is the one place in the kernel that may name a
     // module: someone has to say which OS is installed, and a composition root
     // naming its components is not the coupling ADR-029 objects to. Everything
@@ -1253,6 +1282,7 @@ pub async fn serve(
         &inventory,
         lease.as_ref(),
         host.as_ref().map_err(String::as_str),
+        &state.module_approval_broker,
     )
     .await;
     for p in partitions.partitions() {
@@ -1608,6 +1638,18 @@ pub(crate) mod tests {
 
     // ---- ME-3a: the wiring itself, not just the scanner ---------------------
 
+    /// T7b/ME-3e: a throwaway broker for `mount_all` tests that don't care
+    /// about approval behavior — built on the SAME hub the test passes as
+    /// `mount_all`'s `events`.
+    async fn test_approval_broker(
+        hub: &crate::events::EventsHub,
+    ) -> std::sync::Arc<crate::module_approval_broker::ModuleApprovalBroker> {
+        crate::module_approval_broker::ModuleApprovalBroker::new(
+            agent24_store::Store::open_memory().await.unwrap(),
+            hub.clone(),
+        )
+    }
+
     fn pkg(root: &std::path::Path, name: &str) {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1836,6 +1878,7 @@ pub(crate) mod tests {
             &NoModels,
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&st.events).await,
         )
         .await;
         (build_router_with_modules(st, modules), tmp)
@@ -1991,6 +2034,7 @@ pub(crate) mod tests {
             &NoModels,
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&st.events).await,
         )
         .await;
         assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);
@@ -2711,6 +2755,7 @@ pub(crate) mod tests {
             &NoModels,
             None,
             Err("no process host in this test"),
+            &test_approval_broker(&st.events).await,
         )
         .await;
         let router = build_router_with_modules(st, modules);

@@ -8,7 +8,7 @@
 
 ## 0. 总原则
 
-1. **两类消息**：流式/状态变化 = WS **notification**（单向，无回包）；需要用户决策 = **request**（带 id，客户端必须经 REST 回包）。目前唯一的 request 类事件是 `approval.required`。
+1. **两类消息**：流式/状态变化 = WS **notification**（单向，无回包）；需要用户决策 = **request**（带 id，客户端必须经 REST 回包）。request 类事件：`approval.required`、`module-approval.required`（T7b/ME-3e）。
 2. 所有路径带版本前缀 `/api/v1/`。旧的非版本化路由（`/api/modules` 等模块系统）在 M-E 前保持原样并存，不纳入 v1 契约。
 3. 命名：JSON 字段一律 `snake_case`；事件类型 `名词.动词过去式/现在时`（`run.started`）；id 均为字符串（ULID）。
 4. 时间戳：ISO 8601 UTC 字符串（`2026-07-23T12:00:00Z`）。**可空字段在 wire 上恒出现**（值为 `null`），不允许省略字段——保证 Rust serde 与 TS 生成类型一致。
@@ -158,6 +158,7 @@ M-B agent24d 起动态端口 + `Authorization: Bearer <token>`（启动时 stdou
 | `tool.started` | `{ run_id, tool_call_id, tool, input_summary }` |
 | `tool.completed` | `{ run_id, tool_call_id, status, output_summary }` |
 | `approval.resolved` | `{ approval_id, run_id, decision_type }`（多客户端同步收敛） |
+| `module-approval.resolved` | `{ id, decision }`（T7b/ME-3e；决定 CAS 或周期超时扫描判定的那一刻推，`decision` 为 `approved`\|`denied`\|`timed_out`） |
 | `schedule.fired` | `{ schedule_id, run_id }` |
 | `schedule.disabled` | `{ schedule_id, reason }`（reason 为开放枚举，当前唯一取值 `consecutive_failures`） |
 | `module` | `{ module, kind, payload }` — 可加载模块的命名空间事件信封。`type` 是裸标签 `module`（**唯一豁免**下述点分命名），真实事件名在 `payload.kind`（点分，如 `task.transitioned`）；`module` 须等于模块 manifest 的 `id`（`module.schema.json` 的 pattern）；`payload` 为对象，内核不解释、原样转发。见 SIN90-domain.md §4.2 的用例 |
@@ -167,6 +168,7 @@ M-B agent24d 起动态端口 + `Authorization: Bearer <token>`（启动时 stdou
 | type | payload | 回包途径 |
 |---|---|---|
 | `approval.required` | Approval 对象全文（§1.4，含 `available_decisions`、`expires_at`） | `POST /api/v1/approvals/{id}` |
+| `module-approval.required` | ModuleApproval 对象全文（T7b/ME-3e，见 `docs/design/T7b-ME3e-approvals.md` 决策记录 3/7，含 `action`、`payload`、`expires_at`） | `POST /api/v1/module-approvals/{id}` |
 
 实现约束（硬约束 #8）：Rust 侧事件为 `#[serde(tag = "type")]` 强类型 enum，**每个变体显式 `#[serde(rename = "run.started")]` 式点分命名**（注意：`rename_all = "snake_case"` 会错误产出 `run_started`，禁止依赖它命名事件）；
 TS 侧类型由 `protocol/events.schema.json` 生成。**禁止任何一侧手解析无类型 JSON。**

@@ -6,7 +6,7 @@
  */
 
 /**
- * GENERATED from the agent24-protocol Rust crate (task B4) — do not edit by hand; regenerate with `cargo run -p agent24-protocol --bin export-schema`. Wire contract details: docs/specs/SPEC-002-protocol.md §3 (message classes: approval.required is the only REQUEST-class event, answered via POST /api/v1/approvals/{id}; everything else is NOTIFICATION). Conventions: snake_case; ULID ids; ISO 8601 UTC ts; nullable fields always present as null; per-connection monotonic seq; clients ignore unknown types/fields.
+ * GENERATED from the agent24-protocol Rust crate (task B4) — do not edit by hand; regenerate with `cargo run -p agent24-protocol --bin export-schema`. Wire contract details: docs/specs/SPEC-002-protocol.md §3 (message classes: approval.required and module-approval.required (T7b/ME-3e) are the REQUEST-class events, answered via POST /api/v1/approvals/{id} and /api/v1/module-approvals/{id} respectively; everything else is NOTIFICATION). Conventions: snake_case; most ids are ULID strings, EXCEPT ModuleApproval.id (`approval_id`), which is 64 hex characters of random entropy, not a ULID (T7b/ME-3e design doc, decision 3); ISO 8601 UTC ts; nullable fields always present as null; per-connection monotonic seq; clients ignore unknown types/fields.
  */
 export type Agent24V1WebSocketEventProtocol = {
   seq: number;
@@ -73,6 +73,20 @@ export type Agent24V1WebSocketEventProtocol = {
       [k: string]: unknown;
     }
   | {
+      payload: ModuleApproval;
+      type: "module-approval.required";
+      [k: string]: unknown;
+    }
+  | {
+      payload: {
+        decision: ModuleApprovalDecision;
+        id: string;
+        [k: string]: unknown;
+      };
+      type: "module-approval.resolved";
+      [k: string]: unknown;
+    }
+  | {
       payload: ModuleEventPayload;
       type: "module";
       [k: string]: unknown;
@@ -87,6 +101,20 @@ export type ToolCompletedStatus = "completed" | "failed" | "denied";
  * timed_out is equivalent to a denial (fail-closed)
  */
 export type ApprovalStatus = "pending" | "approved" | "denied" | "aborted" | "timed_out";
+/**
+ * The one decision dimension a [`ModuleApproval`] has (design doc decision
+ * 3) — there is no separate "delivered" state, because the async
+ * submit-then-poll model has no delivery step to fail or get stuck.
+ */
+export type ModuleApprovalDecision = ("pending" | "approved" | "denied") | "timed_out";
+/**
+ * Which of the two protocol methods a [`ModuleApproval`] was submitted
+ * through. Carried explicitly on [`ApprovalAnswer`] too (design doc decision
+ * 6, Codex round 5 High 4) so a caller can never mistake an `Advise` result
+ * for a `Gate` one — the two differ by an order of magnitude in what they
+ * guarantee, and `decision == Approved` alone does not say which this is.
+ */
+export type ModuleApprovalKind = "gate" | "advise";
 
 export interface RunStartedPayload {
   run_id: string;
@@ -252,6 +280,67 @@ export interface ScheduleDisabledPayload {
    */
   reason: string;
   schedule_id: string;
+  [k: string]: unknown;
+}
+/**
+ * One module approval record (design doc decision 3). `(module, request_id,
+ * kind)` is UNIQUE at the storage layer — both a data-integrity constraint
+ * and the mechanism a resubmitted `{request_id, approval_token, action,
+ * target, payload}` relies on to be idempotent (a lost response, retried by
+ * the module, lands on the same row rather than a second one).
+ */
+export interface ModuleApproval {
+  action: string;
+  /**
+   * Always `false` when `kind == Advise`. Always unreachable when
+   * `kind == Gate` this round (the closed set is empty, so no `Gate` row
+   * is ever created) — kept as a real field, not derived from `kind`
+   * alone, so a future non-empty closed set does not need a wire shape
+   * change.
+   */
+  binding: boolean;
+  created_at: string;
+  decided_at: string | null;
+  decision: ModuleApprovalDecision;
+  /**
+   * After this instant a `Pending` record resolves to `TimedOut` (design
+   * doc decision 5's periodic scan judges this field).
+   */
+  expires_at: string;
+  /**
+   * Minted at submission time: 32 bytes random, hex-encoded. The only
+   * credential needed to query this record — NOT derived from
+   * `request_id` or anything else predictable, and treated as a secret
+   * worth withholding from an unrelated caller (it discloses `action`/
+   * `target`/`payload` to anyone who has it).
+   */
+  id: string;
+  kind: ModuleApprovalKind;
+  /**
+   * From the callback connection's identity (the closure that built this
+   * module's `MethodsFor`) — never self-reported by the module.
+   */
+  module: string;
+  /**
+   * The kernel's own record of what it received at submission time — NOT
+   * a promise that the module will act on exactly this (SPEC §6.1: for
+   * `Advise`, this is knowledge, not a safety control). Never accepted as
+   * an "update" after submission; see [`approval_digest`].
+   */
+  payload: {
+    [k: string]: unknown;
+  };
+  /**
+   * `approval_digest(&payload)`, computed ONCE at submission by the
+   * kernel — never self-reported by the module.
+   */
+  payload_digest: string;
+  /**
+   * The proxied request's correlation id — one of the two halves of the
+   * idempotent submission key (with `module`/`kind`).
+   */
+  request_id: string;
+  target: string | null;
   [k: string]: unknown;
 }
 /**

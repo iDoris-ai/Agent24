@@ -42,6 +42,14 @@ pub fn iso8601_before(before: std::time::Duration) -> String {
     iso8601_at(epoch_secs().saturating_sub(before.as_secs()))
 }
 
+/// ISO 8601 UTC timestamp for an ARBITRARY epoch-seconds value, not "now".
+/// (T7b/ME-3e: lets a test-injected clock format its own virtual time
+/// through the same civil-from-days math `now_iso8601`/`iso8601_after` use,
+/// without duplicating it or exposing the private `iso8601_at` directly.)
+pub fn iso8601_from_epoch_secs(secs: u64) -> String {
+    iso8601_at(secs)
+}
+
 fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

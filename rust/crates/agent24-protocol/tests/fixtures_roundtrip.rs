@@ -84,6 +84,8 @@ const REQUIRED_EVENT_FIXTURES: &[&str] = &[
     "tool.completed.json",
     "approval.required.json",
     "approval.resolved.json",
+    "module-approval.required.json",
+    "module-approval.resolved.json",
     "schedule.fired.json",
     "schedule.disabled.json",
     "module.json",

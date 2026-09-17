@@ -2,7 +2,7 @@
   "$id": "https://github.com/iDoris-ai/Agent24/protocol/events.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Agent24 v1 WebSocket Event Protocol",
-  "description": "GENERATED from the agent24-protocol Rust crate (task B4) — do not edit by hand; regenerate with `cargo run -p agent24-protocol --bin export-schema`. Wire contract details: docs/specs/SPEC-002-protocol.md §3 (message classes: approval.required is the only REQUEST-class event, answered via POST /api/v1/approvals/{id}; everything else is NOTIFICATION). Conventions: snake_case; ULID ids; ISO 8601 UTC ts; nullable fields always present as null; per-connection monotonic seq; clients ignore unknown types/fields.",
+  "description": "GENERATED from the agent24-protocol Rust crate (task B4) — do not edit by hand; regenerate with `cargo run -p agent24-protocol --bin export-schema`. Wire contract details: docs/specs/SPEC-002-protocol.md §3 (message classes: approval.required and module-approval.required (T7b/ME-3e) are the REQUEST-class events, answered via POST /api/v1/approvals/{id} and /api/v1/module-approvals/{id} respectively; everything else is NOTIFICATION). Conventions: snake_case; most ids are ULID strings, EXCEPT ModuleApproval.id (`approval_id`), which is 64 hex characters of random entropy, not a ULID (T7b/ME-3e design doc, decision 3); ISO 8601 UTC ts; nullable fields always present as null; per-connection monotonic seq; clients ignore unknown types/fields.",
   "type": "object",
   "properties": {
     "seq": {
@@ -190,6 +190,52 @@
         "type": {
           "type": "string",
           "const": "schedule.disabled"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "description": "REQUEST class (T7b/ME-3e, `docs/design/T7b-ME3e-approvals.md` decision\n7): pushed the moment a `gate`/`advise` submission inserts a new\n`Pending` row. The client answers via\n`POST /api/v1/module-approvals/{id}` — `approval.required` is no\nlonger the only REQUEST-class event.",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/ModuleApproval"
+        },
+        "type": {
+          "type": "string",
+          "const": "module-approval.required"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "description": "Pushed the moment a decision becomes final — the decision CAS\n(REST `decide`) or the periodic timeout scan, whichever gets there\nfirst. There is no separate \"delivered\" event: in the async\nsubmit-then-poll model a decision IS the terminal state the instant\nit is made (design doc decision 5).",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "properties": {
+            "decision": {
+              "$ref": "#/$defs/ModuleApprovalDecision"
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "decision"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "module-approval.resolved"
         }
       },
       "required": [
@@ -403,6 +449,114 @@
       "required": [
         "run_id",
         "text"
+      ]
+    },
+    "ModuleApproval": {
+      "description": "One module approval record (design doc decision 3). `(module, request_id,\nkind)` is UNIQUE at the storage layer — both a data-integrity constraint\nand the mechanism a resubmitted `{request_id, approval_token, action,\ntarget, payload}` relies on to be idempotent (a lost response, retried by\nthe module, lands on the same row rather than a second one).",
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "binding": {
+          "description": "Always `false` when `kind == Advise`. Always unreachable when\n`kind == Gate` this round (the closed set is empty, so no `Gate` row\nis ever created) — kept as a real field, not derived from `kind`\nalone, so a future non-empty closed set does not need a wire shape\nchange.",
+          "type": "boolean"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decided_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "decision": {
+          "$ref": "#/$defs/ModuleApprovalDecision"
+        },
+        "expires_at": {
+          "description": "After this instant a `Pending` record resolves to `TimedOut` (design\ndoc decision 5's periodic scan judges this field).",
+          "type": "string",
+          "format": "date-time"
+        },
+        "id": {
+          "description": "Minted at submission time: 32 bytes random, hex-encoded. The only\ncredential needed to query this record — NOT derived from\n`request_id` or anything else predictable, and treated as a secret\nworth withholding from an unrelated caller (it discloses `action`/\n`target`/`payload` to anyone who has it).",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ModuleApprovalKind"
+        },
+        "module": {
+          "description": "From the callback connection's identity (the closure that built this\nmodule's `MethodsFor`) — never self-reported by the module.",
+          "type": "string"
+        },
+        "payload": {
+          "description": "The kernel's own record of what it received at submission time — NOT\na promise that the module will act on exactly this (SPEC §6.1: for\n`Advise`, this is knowledge, not a safety control). Never accepted as\nan \"update\" after submission; see [`approval_digest`]."
+        },
+        "payload_digest": {
+          "description": "`approval_digest(&payload)`, computed ONCE at submission by the\nkernel — never self-reported by the module.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "The proxied request's correlation id — one of the two halves of the\nidempotent submission key (with `module`/`kind`).",
+          "type": "string"
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "module",
+        "request_id",
+        "kind",
+        "binding",
+        "action",
+        "payload",
+        "payload_digest",
+        "decision",
+        "created_at",
+        "expires_at",
+        "target",
+        "decided_at"
+      ]
+    },
+    "ModuleApprovalDecision": {
+      "description": "The one decision dimension a [`ModuleApproval`] has (design doc decision\n3) — there is no separate \"delivered\" state, because the async\nsubmit-then-poll model has no delivery step to fail or get stuck.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "pending",
+            "approved",
+            "denied"
+          ]
+        },
+        {
+          "description": "Set by the periodic scan (design doc decision 5) once `expires_at`\npasses while still `Pending` — equivalent to a denial, fail-closed.",
+          "type": "string",
+          "const": "timed_out"
+        }
+      ]
+    },
+    "ModuleApprovalKind": {
+      "description": "Which of the two protocol methods a [`ModuleApproval`] was submitted\nthrough. Carried explicitly on [`ApprovalAnswer`] too (design doc decision\n6, Codex round 5 High 4) so a caller can never mistake an `Advise` result\nfor a `Gate` one — the two differ by an order of magnitude in what they\nguarantee, and `decision == Approved` alone does not say which this is.",
+      "oneOf": [
+        {
+          "description": "A kernel-EXECUTED action. This round's closed set of executable\nactions is empty (T7b scope; see the design doc's opening section), so\nevery `gate` submission is `forbidden` before a row is ever written —\nno `ModuleApproval` with this kind exists yet in this build.",
+          "type": "string",
+          "const": "gate"
+        },
+        {
+          "description": "A module-domain action: the kernel records and presents it, but does\nnot execute it and does not guarantee the module honors the answer\n(SPEC §6.1 — knowledge, not a safety control).",
+          "type": "string",
+          "const": "advise"
+        }
       ]
     },
     "ModuleEventPayload": {

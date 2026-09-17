@@ -15,7 +15,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Approval, ErrorBody, Usage};
+use crate::types::{Approval, ErrorBody, ModuleApproval, ModuleApprovalDecision, Usage};
 
 /// Common envelope for every WS message. `seq` is monotonically increasing
 /// per connection; a gap means the client must reconcile via REST (no replay
@@ -57,6 +57,23 @@ pub enum EventBody {
     ScheduleFired(ScheduleFiredPayload),
     #[serde(rename = "schedule.disabled")]
     ScheduleDisabled(ScheduleDisabledPayload),
+    /// REQUEST class (T7b/ME-3e, `docs/design/T7b-ME3e-approvals.md` decision
+    /// 7): pushed the moment a `gate`/`advise` submission inserts a new
+    /// `Pending` row. The client answers via
+    /// `POST /api/v1/module-approvals/{id}` — `approval.required` is no
+    /// longer the only REQUEST-class event.
+    #[serde(rename = "module-approval.required")]
+    ModuleApprovalRequired(Box<ModuleApproval>),
+    /// Pushed the moment a decision becomes final — the decision CAS
+    /// (REST `decide`) or the periodic timeout scan, whichever gets there
+    /// first. There is no separate "delivered" event: in the async
+    /// submit-then-poll model a decision IS the terminal state the instant
+    /// it is made (design doc decision 5).
+    #[serde(rename = "module-approval.resolved")]
+    ModuleApprovalResolved {
+        id: String,
+        decision: ModuleApprovalDecision,
+    },
     /// Opaque event from a loadable module (e.g. Sin90). The kernel carries it
     /// on the same WS stream without understanding its semantics — a generic
     /// capability, NOT knowledge of any specific module. The `type` is the bare
@@ -82,6 +99,8 @@ impl EventBody {
             EventBody::ApprovalResolved(_) => "approval.resolved",
             EventBody::ScheduleFired(_) => "schedule.fired",
             EventBody::ScheduleDisabled(_) => "schedule.disabled",
+            EventBody::ModuleApprovalRequired(_) => "module-approval.required",
+            EventBody::ModuleApprovalResolved { .. } => "module-approval.resolved",
             EventBody::Module(_) => "module",
         }
     }

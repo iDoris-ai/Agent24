@@ -209,6 +209,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/module-approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List module (gate/advise) approvals */
+        get: operations["listModuleApprovals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/module-approvals/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Fetch one module approval by id
+         * @description Not scoped to a calling module — this is an operator surface
+         *     (`curl`/dashboard), unlike the wire `_a24/approval/status` call a
+         *     module itself makes, which IS scoped to its own module.
+         */
+        get: operations["getModuleApproval"];
+        put?: never;
+        /**
+         * Approve or deny a pending module approval
+         * @description Body is `{decision: "approved"|"denied"}` — `pending`/`timed_out` are
+         *     states the SYSTEM assigns (submission, the periodic timeout scan),
+         *     never a value a caller may request directly. The decision CAS also
+         *     checks `expires_at`: a row the periodic scan has not yet reached but
+         *     which is already past its deadline conflicts here too, not just after
+         *     the next scan tick.
+         */
+        post: operations["decideModuleApproval"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/schedules": {
         parameters: {
             query?: never;
@@ -753,6 +801,55 @@ export interface components {
             reason?: string;
         } & {
             [key: string]: unknown;
+        };
+        /**
+         * @description Gate: kernel-executed action (this build's closed set is empty, so
+         *     every submission is forbidden and no record is ever created — see
+         *     `docs/design/T7b-ME3e-approvals.md`). Advise: module-domain action —
+         *     presented and recorded for informed consent, not enforced (SPEC
+         *     §6.1: knowledge, not a safety control).
+         * @enum {string}
+         */
+        ModuleApprovalKind: "gate" | "advise";
+        /**
+         * @description timed_out is equivalent to a denial (fail-closed), assigned by the periodic timeout scan
+         * @enum {string}
+         */
+        ModuleApprovalDecision: "pending" | "approved" | "denied" | "timed_out";
+        ModuleApproval: {
+            /**
+             * @description NOT a ULID (see this document's top-level Conventions note): 64
+             *     hex characters of random entropy, never derived from `request_id`.
+             */
+            id: string;
+            /** @description The submitting module's identity, from its callback connection — never self-reported. */
+            module: string;
+            /** @description The proxied request's correlation id — one half of the submission's idempotency key. */
+            request_id: string;
+            kind: components["schemas"]["ModuleApprovalKind"];
+            /** @description Always false for advise. Unreachable (no gate row exists) this round. */
+            binding: boolean;
+            action: string;
+            target: string | null;
+            /**
+             * @description The kernel's own record of what it received at submission time —
+             *     not a promise the module acts on exactly this.
+             */
+            payload: {
+                [key: string]: unknown;
+            };
+            /** @description sha256:<hex> of the canonicalized payload, computed once at submission. */
+            payload_digest: string;
+            decision: components["schemas"]["ModuleApprovalDecision"];
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            decided_at: string | null;
+            /**
+             * Format: date-time
+             * @description After this instant a pending row resolves to timed_out (periodic scan).
+             */
+            expires_at: string;
         };
         /** @description When to fire */
         ScheduleSpec: {
@@ -1388,6 +1485,102 @@ export interface operations {
                      *       "error": {
                      *         "code": "approval_already_resolved",
                      *         "message": "Approval apr_01H… was already resolved (status=timed_out)"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listModuleApprovals: {
+        parameters: {
+            query?: {
+                decision?: components["schemas"]["ModuleApprovalDecision"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Module approval list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        module_approvals: components["schemas"]["ModuleApproval"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+        };
+    };
+    getModuleApproval: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The module approval */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleApproval"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    decideModuleApproval: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    decision: "approved" | "denied";
+                };
+            };
+        };
+        responses: {
+            /** @description Decision applied */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleApproval"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Module approval already resolved or expired */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "module_approval_already_resolved",
+                     *         "message": "module approval <id> was already resolved or has expired"
                      *       }
                      *     }
                      */

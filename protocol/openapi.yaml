@@ -10,7 +10,11 @@ info:
     fixture round-trip tests). Human-readable spec: `docs/specs/SPEC-002-protocol.md`.
 
     Conventions:
-    - All fields snake_case; ids are ULID strings; timestamps are ISO 8601 UTC.
+    - All fields snake_case; timestamps are ISO 8601 UTC. Most ids are ULID
+      strings, with ONE exception: `ModuleApproval.id` (`approval_id`, T7b/ME-3e)
+      is 64 hex characters of random entropy, not a ULID — see
+      `docs/design/T7b-ME3e-approvals.md` decision 3 for why (it must not be
+      derivable from `request_id` or anything else predictable).
     - Paths marked `x-milestone: M-C` are not implemented by the M-A mock daemon.
     - WS event protocol lives in `protocol/events.schema.json` (not in this file).
     - Auth: `Authorization: Bearer <token>` (agent24d). The M-A mock daemon on
@@ -47,6 +51,14 @@ tags:
     description: Agent runs, their lifecycle, output, and cancellation.
   - name: approvals
     description: Human-in-the-loop tool-call decisions for a run.
+  - name: module-approvals
+    description: |
+      Out-of-process module approvals (T7b/ME-3e) — `advise` (module-domain
+      actions, presented + recorded, not enforced) and `gate` (kernel-executed
+      actions; this build's closed set is empty, so every gate submission is
+      forbidden and no record is ever created for it). A PARALLEL surface to
+      `approvals` above: async submit-then-poll, not run_id-tied, no
+      synchronous wait for a human decision.
   - name: schedules
     description: Cron-driven scheduled runs (CRUD + run-now).
   - name: tools
@@ -340,6 +352,102 @@ paths:
                 error:
                   code: approval_already_resolved
                   message: Approval apr_01H… was already resolved (status=timed_out)
+
+  /module-approvals:
+    get:
+      operationId: listModuleApprovals
+      x-milestone: M-C
+      tags: [module-approvals]
+      summary: List module (gate/advise) approvals
+      parameters:
+        - name: decision
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/ModuleApprovalDecision"
+      responses:
+        "200":
+          description: Module approval list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [module_approvals]
+                properties:
+                  module_approvals:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ModuleApproval"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /module-approvals/{id}:
+    get:
+      operationId: getModuleApproval
+      x-milestone: M-C
+      tags: [module-approvals]
+      summary: Fetch one module approval by id
+      description: |
+        Not scoped to a calling module — this is an operator surface
+        (`curl`/dashboard), unlike the wire `_a24/approval/status` call a
+        module itself makes, which IS scoped to its own module.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: The module approval
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleApproval"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      operationId: decideModuleApproval
+      x-milestone: M-C
+      tags: [module-approvals]
+      summary: Approve or deny a pending module approval
+      description: |
+        Body is `{decision: "approved"|"denied"}` — `pending`/`timed_out` are
+        states the SYSTEM assigns (submission, the periodic timeout scan),
+        never a value a caller may request directly. The decision CAS also
+        checks `expires_at`: a row the periodic scan has not yet reached but
+        which is already past its deadline conflicts here too, not just after
+        the next scan tick.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approved, denied]
+      responses:
+        "200":
+          description: Decision applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleApproval"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Module approval already resolved or expired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: module_approval_already_resolved
+                  message: module approval <id> was already resolved or has expired
 
   /schedules:
     post:
@@ -1305,6 +1413,71 @@ components:
           type: string
           description: Required when type=deny
       additionalProperties: true
+
+    ModuleApprovalKind:
+      type: string
+      description: |
+        Gate: kernel-executed action (this build's closed set is empty, so
+        every submission is forbidden and no record is ever created — see
+        `docs/design/T7b-ME3e-approvals.md`). Advise: module-domain action —
+        presented and recorded for informed consent, not enforced (SPEC
+        §6.1: knowledge, not a safety control).
+      enum: [gate, advise]
+
+    ModuleApprovalDecision:
+      type: string
+      description: timed_out is equivalent to a denial (fail-closed), assigned by the periodic timeout scan
+      enum: [pending, approved, denied, timed_out]
+
+    ModuleApproval:
+      type: object
+      required:
+        [id, module, request_id, kind, binding, action, target, payload,
+         payload_digest, decision, created_at, decided_at, expires_at]
+      properties:
+        id:
+          type: string
+          description: |
+            NOT a ULID (see this document's top-level Conventions note): 64
+            hex characters of random entropy, never derived from `request_id`.
+          minLength: 64
+          maxLength: 64
+        module:
+          type: string
+          description: The submitting module's identity, from its callback connection — never self-reported.
+        request_id:
+          type: string
+          description: The proxied request's correlation id — one half of the submission's idempotency key.
+        kind:
+          $ref: "#/components/schemas/ModuleApprovalKind"
+        binding:
+          type: boolean
+          description: Always false for advise. Unreachable (no gate row exists) this round.
+        action:
+          type: string
+        target:
+          type: [string, "null"]
+        payload:
+          type: object
+          description: |
+            The kernel's own record of what it received at submission time —
+            not a promise the module acts on exactly this.
+          additionalProperties: true
+        payload_digest:
+          type: string
+          description: "sha256:<hex> of the canonicalized payload, computed once at submission."
+        decision:
+          $ref: "#/components/schemas/ModuleApprovalDecision"
+        created_at:
+          type: string
+          format: date-time
+        decided_at:
+          type: [string, "null"]
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: After this instant a pending row resolves to timed_out (periodic scan).
 
     ScheduleSpec:
       description: When to fire

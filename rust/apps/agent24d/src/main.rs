@@ -3,12 +3,15 @@
 //! B2 scope: serve skeleton — `/api/v1/health`, bearer-token handshake via the
 //! stdout ready line, dynamic port, CancellationToken-driven graceful shutdown.
 
+mod approval_callback;
 mod approvals;
 mod domain;
 mod events;
 mod events_emit;
 mod lifecycle;
 mod mcp;
+mod module_approval_broker;
+mod module_approvals;
 mod os_config;
 mod os_memory;
 mod os_routes;

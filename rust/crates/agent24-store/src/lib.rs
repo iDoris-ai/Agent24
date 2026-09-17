@@ -10,6 +10,7 @@
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
 mod audit;
+mod module_approvals;
 mod repo;
 
 pub use audit::AuditEntry;

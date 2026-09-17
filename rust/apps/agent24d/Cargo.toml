@@ -45,6 +45,10 @@ rustix = { version = "0.38", features = ["fs"] }
 [dev-dependencies]
 tempfile = "3"
 sha2 = "0.10"
+# T7b/ME-3e: forces a transient `Store` error in the timeout-scan test by
+# dropping `module_approvals` out from under a live pool — there is no
+# fault-injectable `Store` trait to mock instead.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tower = { version = "0.5", features = ["util"] }
 # A paused clock, for deadlines asserted exactly rather than with slack.
 tokio = { version = "1", features = ["test-util"] }
