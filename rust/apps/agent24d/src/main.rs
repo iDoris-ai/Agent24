@@ -6,6 +6,7 @@
 mod approvals;
 mod domain;
 mod events;
+mod events_emit;
 mod lifecycle;
 mod mcp;
 mod os_config;

@@ -167,7 +167,7 @@
 | 并发与乱序 | 允许并发在途，**响应可乱序**；调用方按 id 配对。并发上限见 §5，超限回 busy 错误而不是排队到内存里 |
 | 重复 ID | 同一连接上一个**仍在途**的 id 被复用 → **该请求失败**（不是覆盖、不是排队） |
 | 未知方法 | JSON-RPC `-32601 Method not found`，**稳定不变**。未授予能力的方法回 forbidden，**不是** `-32601`——两者必须能区分，否则模块分不清「这个 daemon 没有」与「我没被授权」 |
-| 错误形状 | 全部应用层错误用 **`-32000`**，靠 `error.data.kind` 区分，**kind 是闭集**：`forbidden` / `busy` / `cancelled` / `timeout` / `quota_exceeded` / `invalid_lease` / `unknown_capability` / `version_mismatch` / **`auth_failed`** / **`manifest_mismatch`**。后两条是握手期的失败——它们**不是** `-32600`：`-32600` 的含义是「这个 JSON-RPC request 结构无效」，而一个结构完全合法、只是令牌不对或摘要不符的 `initialize` 不属于那一类。上一版把认证失败写成 `-32600`，是把语义错误塞进了协议错误码。协议层沿用标准码：**`-32700` parse error**、`-32600` invalid request、`-32601` method not found、`-32602` invalid params、`-32603` internal。**握手期（首帧）任何协议或语义失败一律断连；握手之后只失败该行、连接继续**——只有 framing 超限才断连。**`error.data` 里不得出现内核内部路径、SQL、token 或其它模块的信息** |
+| 错误形状 | 全部应用层错误用 **`-32000`**，靠 `error.data.kind` 区分，**kind 是闭集**（T7a/ME-3e 为 `_a24/events/emit` 扩展了 5 个，见 `docs/design/T7a-ME3e-grants-and-events.md` §6）：`forbidden` / `busy` / `cancelled` / `timeout` / `quota_exceeded` / `invalid_lease` / `unknown_capability` / `version_mismatch` / **`auth_failed`** / **`manifest_mismatch`** / `not_ready` / `draining` / `revoked` / `rate_limited` / `payload_too_large`。**`auth_failed` 和 `manifest_mismatch` 是握手期的失败**（`not_ready`/`draining`/`revoked`/`rate_limited`/`payload_too_large` 是握手之后、回调/业务方法调用期间的失败，T7a/ME-3e 新增，见上）——握手期这两个**不是** `-32600`：`-32600` 的含义是「这个 JSON-RPC request 结构无效」，而一个结构完全合法、只是令牌不对或摘要不符的 `initialize` 不属于那一类。上一版把认证失败写成 `-32600`，是把语义错误塞进了协议错误码。协议层沿用标准码：**`-32700` parse error**、`-32600` invalid request、`-32601` method not found、`-32602` invalid params、`-32603` internal。**握手期（首帧）任何协议或语义失败一律断连；握手之后只失败该行、连接继续**——只有 framing 超限才断连。**`error.data` 里不得出现内核内部路径、SQL、token 或其它模块的信息** |
 | `initialize` | **必须是连接上的第一条消息，且只能一次**。**首帧不是 `initialize`** → `-32600` 并**断连**（握手期规则）。**握手成功之后再发 `initialize`** → `-32600`，但**只失败该行、连接继续**（握手后规则）。上一版把这两种情形都写成断连，与「握手之后只有 framing 超限才断连」自相矛盾——重复的 `initialize` 按定义发生在握手成功之后。**认证失败 → `-32000` + `kind: auth_failed` 并断连**；**manifest 摘要不符 → `-32000` + `kind: manifest_mismatch` 并断连**。断连一律不给同连接重试的机会；**同一代也不许重连**（D1，见下「允许的连接数」）—— 要再连，只能是内核重启出的新一代：新进程、新令牌、新握手。握手期被拒时，内核**先回一行错误**（带模块发来的 id；id 不可用时为 `null`；版本不符时 `data` 里带双方区间）**再断连**；首帧超长则无法解析，直接断连不回。握手的 id 与通道上其余请求一样是字符串，非字符串 id → `-32600`。**接连接和握手用同一个截止时间**：内核可能在截止时间刚过时接到连接，随后的握手因同一截止时间立即失败；模块也可能收到完整的成功行后连接即被关闭（回写在截止时间之后才完成，内核按启动超时处理）—— 这是内核在边界上 fail-closed，不是协议错误 |
 | 取消 | `$/cancelRequest`（LSP 惯例），**notification**，`params: {id: string}`；被取消的请求**仍回一个响应**（cancelled 错误）。**连接断开**则不同：连接没了，回不了响应也没人收——在途请求就地**中止**，只做内部清理与记账，**不产生响应**（上一版把这两种情形混成一句，读起来自相矛盾）。取消是**尽力而为**：已经提交的副作用不回滚 |
 | 超时 | 双向都有；内核侧超时后**不重试**（回调可能有副作用），记账并回 timeout 错误 |
@@ -620,6 +620,19 @@ notify        · **谁该看到它** —— 从 RequestContext 的 run/session/s
 > **注意 `Events` 在 ME-3e 而不是更早**——`_a24/events/emit` 是 ME-3e 的交付项。上一版写「ME-3c 落地时 offer 为空**或只有 `Events`**」，后半句是错的：那正好造出一个「已授予 `Events`、方法却 not found」的状态。
 >
 > **或者**声明 ME-3c/3d/3e 不允许独立合入 main（必须作为一个整体）——二选一，实现前定，写进 PR 描述。
+>
+> **补记（T7a 落地时才发现，本该实现前写下——如实记录这个流程缺口，不是补救就当没发生过）**：上表的阶梯假定按 ME-3d→ME-3e 的编号顺序实现，且 ME-3e 的 `events`/`approval` 一次性一起交付。实际选择的顺序不是这个：ME-3d（进程外 `_a24/memory/private/*`）**没有被排进队列**，ME-3e 被拆成 T7a（先交付 `events`，独立 PR 合入 main）与 T7b（后交付 `approval`，另一个独立 PR）——拆分原因是 ME-3e 一次性设计+评审的体量太大，见 `docs/design/T7a-ME3e-grants-and-events.md`「与 T7b 的分工」。
+>
+> 这不违反本节**真正**定死的那条规则——「生产的 offer set 只包含当前已有 handler 的能力」——T7a 合入时 `events` 有真实 handler，`Offer` 只声明 `events`，不声明 `approval`/`memory`，没有一处「已授予但方法不存在」。违反的只是上表**这一张具体的阶梯**，而那张表是「选了独立合入」这个分支下**按假定实现顺序**画出来的示例，不是规则本身。**实际阶梯改写为**：
+>
+> | 落地阶段 | 生产 offer set | 因为 |
+> |---|---|---|
+> | ME-3b / ME-3c | 空集 | 此时一个业务方法都没有 |
+> | **T7a（ME-3e 前半）** | `{Events}` | `_a24/events/emit` 到位，`memory`/`approval` 都还没有 handler |
+> | **T7b（ME-3e 后半）** | `{Events, Approval}` | `_a24/approval/gate`、`_a24/approval/advise` 到位 |
+> | ME-3d（未排期） | 在它真正交付时并入 `{Events, Approval, Memory}` | 不早于 T7a/T7b，因为它没有被安排在两者之前做 |
+>
+> 把这张表当成活的：谁下一个交付带 handler 的能力，谁就把自己加进 `provides`，前提永远只有那一条「只声明真有 handler 的」，不是重新对照哪一版编号顺序。
 
 > **ME-3b 的交付栏为什么这么重**（两轮修正的结果）：初版把 `initialize` 整个放在 ME-3c，而 ME-3c 依赖 ME-3b —— ME-3b 手上没有本文定义的唯一 ready 判据；第二版只把「握手」挪过来，但读一条 `initialize` 同样需要 framing、单行上限和错误闭集，那些还留在 3c，于是 3b 只能临时猜一种 framing 再由 3c 重写。**凡 ME-3b 判 ready 所必需的 wire，一律并入 ME-3b。**
 

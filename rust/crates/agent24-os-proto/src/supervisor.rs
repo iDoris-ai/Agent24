@@ -399,6 +399,12 @@ impl Drop for SupervisorHandle {
 /// never share its data directory. A supervisor whose stop failed keeps the
 /// slot for good.
 ///
+/// `offer` is what every run's `initialize` handshake answers with (T7a/ME-3e):
+/// a plain value, not a closure like `methods`, because it depends only on the
+/// module's granted capabilities — decided once at mount time — and not on any
+/// particular generation, so the same `Offer` is reused across restarts. See
+/// `docs/design/T7a-ME3e-grants-and-events.md` §2.
+///
 /// # Errors
 ///
 /// [`SlotHeld`] when another supervisor holds `current`.
@@ -407,6 +413,7 @@ pub fn supervise(
     dir: Arc<CallbackDir>,
     current: Arc<Current>,
     methods: MethodsFor,
+    offer: Offer,
     timings: Timings,
     package_check: PackageCheck,
 ) -> Result<SupervisorHandle, SlotHeld> {
@@ -435,6 +442,7 @@ pub fn supervise(
         dir,
         exit,
         methods,
+        offer,
         timings,
         package_check,
         stop_rx,
@@ -591,11 +599,13 @@ impl Drop for Exit {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     spec: ModuleSpec,
     dir: Arc<CallbackDir>,
     exit: Exit,
     methods: MethodsFor,
+    offer: Offer,
     timings: Timings,
     package_check: PackageCheck,
     mut stop: watch::Receiver<Option<Duration>>,
@@ -609,34 +619,37 @@ async fn run_loop(
     loop {
         attempt += 1;
         status.send_replace(Status::Starting { attempt, after });
-        let (failure, ready_at, ended_at) =
-            match run_once(&spec, &dir, slot, &methods, &timings, &mut stop, status).await {
-                Err(Unconfirmed(error)) => {
-                    // The group's end is `failed` (written by `finish` before
-                    // the process was dropped); a process may still be there.
-                    record.process(ProcessAtStop::Running);
-                    // No restart over a group that may still be there.
-                    tracing::error!(module = %spec.name, "not restarting: {error}");
-                    slot.retire();
-                    status.send_replace(Status::StopFailed { error });
-                    stop_requested(&mut stop).await;
-                    // The stop it waited for: no drain, the group's end is
-                    // `failed`, and the loop returns by itself (review of
-                    // SHUT-1a, round 2).
-                    saw_stop(record, &stop, ProcessAtStop::Running);
-                    record.supervisor(crate::stop_record::SupervisorEnd::Stopped);
-                    return;
-                }
-                Ok(Run::StopRequested) => {
-                    slot.stopped(status);
-                    return;
-                }
-                Ok(Run::Ended {
-                    failure,
-                    ready_at,
-                    ended_at,
-                }) => (failure, ready_at, ended_at),
-            };
+        let (failure, ready_at, ended_at) = match run_once(
+            &spec, &dir, slot, &methods, &offer, &timings, &mut stop, status,
+        )
+        .await
+        {
+            Err(Unconfirmed(error)) => {
+                // The group's end is `failed` (written by `finish` before
+                // the process was dropped); a process may still be there.
+                record.process(ProcessAtStop::Running);
+                // No restart over a group that may still be there.
+                tracing::error!(module = %spec.name, "not restarting: {error}");
+                slot.retire();
+                status.send_replace(Status::StopFailed { error });
+                stop_requested(&mut stop).await;
+                // The stop it waited for: no drain, the group's end is
+                // `failed`, and the loop returns by itself (review of
+                // SHUT-1a, round 2).
+                saw_stop(record, &stop, ProcessAtStop::Running);
+                record.supervisor(crate::stop_record::SupervisorEnd::Stopped);
+                return;
+            }
+            Ok(Run::StopRequested) => {
+                slot.stopped(status);
+                return;
+            }
+            Ok(Run::Ended {
+                failure,
+                ready_at,
+                ended_at,
+            }) => (failure, ready_at, ended_at),
+        };
         if let Some(ready_at) = ready_at {
             policy.ran(ready_at, ended_at);
         }
@@ -756,11 +769,13 @@ enum Admitted {
 /// be confirmed, dropped (one more SIGKILL) and reported as [`Unconfirmed`],
 /// after which the loop starts nothing new (review of ME3-SUP slice 3a,
 /// round 4).
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     spec: &ModuleSpec,
     dir: &CallbackDir,
     slot: &Slot,
     methods: &MethodsFor,
+    offer: &Offer,
     timings: &Timings,
     stop: &mut watch::Receiver<Option<Duration>>,
     status: &watch::Sender<Status>,
@@ -848,7 +863,7 @@ async fn run_once(
         manifest_digest: spec.manifest_digest.clone(),
         auth_token: process.token().to_owned(),
         kernel_versions: crate::version::kernel_range(),
-        offer: Offer::none(),
+        offer: offer.clone(),
     };
     // The same deadline for the accept and the handshake (see `accept_one`).
     let deadline = tokio::time::Instant::now() + timings.startup;
@@ -1430,7 +1445,9 @@ sys.exit(0)
         }
     }
 
-    /// Start a supervisor on a slot the test knows is free.
+    /// Start a supervisor on a slot the test knows is free. `Offer::none()`:
+    /// these tests are about the supervisor loop, not about what a handshake
+    /// offers — the offer-specific tests build their own.
     fn sup(
         spec: ModuleSpec,
         dir: Arc<CallbackDir>,
@@ -1438,8 +1455,16 @@ sys.exit(0)
         methods: MethodsFor,
         timings: Timings,
     ) -> SupervisorHandle {
-        supervise(spec, dir, current, methods, timings, no_package_check())
-            .expect("the slot is free")
+        supervise(
+            spec,
+            dir,
+            current,
+            methods,
+            Offer::none(),
+            timings,
+            no_package_check(),
+        )
+        .expect("the slot is free")
     }
 
     /// Like `sup`, with a caller-supplied `PackageCheck` (FU-61 tests).
@@ -1451,7 +1476,16 @@ sys.exit(0)
         timings: Timings,
         package_check: PackageCheck,
     ) -> SupervisorHandle {
-        supervise(spec, dir, current, methods, timings, package_check).expect("the slot is free")
+        supervise(
+            spec,
+            dir,
+            current,
+            methods,
+            Offer::none(),
+            timings,
+            package_check,
+        )
+        .expect("the slot is free")
     }
 
     /// Stop, bounded: a stop that hangs fails the test instead of the run.
@@ -1645,6 +1679,7 @@ sys.exit(0)
             b.dir.clone(),
             current.clone(),
             no_methods(),
+            Offer::none(),
             fast(),
             no_package_check(),
         );
@@ -1727,6 +1762,7 @@ sys.exit(0)
                 g.dir.clone(),
                 current,
                 no_methods(),
+                Offer::none(),
                 fast(),
                 no_package_check()
             )
@@ -1790,6 +1826,7 @@ sys.exit(0)
                 g.dir.clone(),
                 current.clone(),
                 no_methods(),
+                Offer::none(),
                 fast(),
                 no_package_check(),
             )
@@ -2312,6 +2349,7 @@ sys.exit(0)
                 b.dir.clone(),
                 current.clone(),
                 no_methods(),
+                Offer::none(),
                 fast(),
                 no_package_check()
             )
@@ -2411,6 +2449,7 @@ sys.exit(0)
                 g.dir.clone(),
                 current.clone(),
                 no_methods(),
+                Offer::none(),
                 fast(),
                 no_package_check()
             )
