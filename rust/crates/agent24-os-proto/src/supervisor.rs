@@ -1237,6 +1237,7 @@ mod tests {
 
     use super::*;
     use std::sync::Mutex;
+    use std::time::Instant;
 
     /// A module in Python. `mode`: `normal` (serve until the callback ends —
     /// D1's module side), `crash` (exit right after the handshake), `silent`
@@ -2043,7 +2044,12 @@ sys.exit(0)
         .await;
         let _held = current
             .get()
-            .admit_request("r-1".into(), [0u8; 32])
+            .admit_request(
+                "r-1".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
             .unwrap();
         let record = handle.stop_record();
         let (logs, _guard) = capture_logs();
@@ -2118,7 +2124,14 @@ sys.exit(0)
         })
         .await;
         let generation = current.get();
-        let _held = generation.admit_request("r-1".into(), [0u8; 32]).unwrap();
+        let _held = generation
+            .admit_request(
+                "r-1".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         let record = handle.stop_record();
         let (cut, cut_rx) = tokio::sync::oneshot::channel::<()>();
         let stopping = tokio::spawn(
@@ -2166,7 +2179,14 @@ sys.exit(0)
         .await;
         let (pid, _) = starts(f.data.path())[0].clone();
         let generation = current.get();
-        let in_flight = generation.admit_request("r-1".into(), [0u8; 32]).unwrap();
+        let in_flight = generation
+            .admit_request(
+                "r-1".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         let stopping = tokio::spawn(handle.drain_and_stop(Duration::from_secs(10)));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while generation.state() != crate::drain::DrainState::Draining {
@@ -2175,7 +2195,12 @@ sys.exit(0)
         }
         assert_eq!(
             generation
-                .admit_request("r-2".into(), [0u8; 32])
+                .admit_request(
+                    "r-2".into(),
+                    [0u8; 32],
+                    Instant::now(),
+                    Duration::from_secs(30)
+                )
                 .unwrap_err(),
             crate::drain::RequestRefused::Draining
         );
@@ -2217,7 +2242,14 @@ sys.exit(0)
         })
         .await;
         let generation = current.get();
-        let in_flight = generation.admit_request("r-1".into(), [0u8; 32]).unwrap();
+        let in_flight = generation
+            .admit_request(
+                "r-1".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         let stopping = handle.drain_and_stop(Duration::from_secs(10));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while generation.state() != crate::drain::DrainState::Draining {
@@ -2258,7 +2290,14 @@ sys.exit(0)
         .await;
         let (pid, _) = starts(f.data.path())[0].clone();
         let generation = current.get();
-        let _in_flight = generation.admit_request("r-1".into(), [0u8; 32]).unwrap();
+        let _in_flight = generation
+            .admit_request(
+                "r-1".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         let (abandon, abandoned) = tokio::sync::oneshot::channel::<()>();
         let mut stopping = std::pin::pin!(handle.drain_and_stop_unless(
             Duration::from_secs(60),

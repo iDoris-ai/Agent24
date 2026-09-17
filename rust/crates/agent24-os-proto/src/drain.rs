@@ -111,6 +111,7 @@
 //! answers "which of those is true at `now`".
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -243,14 +244,36 @@ struct ApprovalToken {
     used: bool,
 }
 
+/// One in-flight request's approval token AND its lifecycle signal (T8.5a
+/// design doc, decision 1) — `token`/`deadline`/`ended` are inserted together
+/// by the SAME [`Generation::admit_request`] call and removed together by
+/// `finish`/`Drop`. No tombstone, no second table: once an entry leaves
+/// `in_flight` it is gone for good, exactly the discipline `ApprovalToken`
+/// alone already had.
+#[derive(Debug)]
+struct InFlightEntry {
+    /// Original field, unchanged.
+    token: ApprovalToken,
+    /// This request's own absolute deadline (decision 5): `now.checked_add(budget)`
+    /// at `admit_request` time.
+    deadline: Instant,
+    /// Whether this request has ended — a queryable current value, not an
+    /// event stream (decision 2). `watch::Sender` + `send_replace`, the same
+    /// primitive [`Generation::revoked`] already uses: a `subscribe()` that
+    /// happens after the `send_replace` still sees the current value, so a
+    /// late query cannot miss it.
+    ended: watch::Sender<bool>,
+}
+
 #[derive(Debug)]
 struct Inner {
     state: DrainState,
     /// Keyed by request id; each entry also carries that request's approval
-    /// token (T7b/ME-3e). A plain `HashSet<String>` was enough before the
-    /// token existed — the value only needs to say "is this id live", now it
-    /// also has to say "and if so, with which secret".
-    in_flight: HashMap<String, ApprovalToken>,
+    /// token and lifecycle signal (T7b/T8.5a). A plain `HashSet<String>` was
+    /// enough before either existed — the value only needs to say "is this id
+    /// live", now it also has to say "and if so, with which secret, until
+    /// when, and has it ended".
+    in_flight: HashMap<String, InFlightEntry>,
     /// The subset of `in_flight` that has been sent to the module. Marked under
     /// the same lock `revoke` takes, so "sent" and "revoked" are ordered: a
     /// request is either sent before the revocation (its outcome is then
@@ -375,6 +398,18 @@ impl Generation {
     /// `token_hash` is the SHA-256 of the plaintext token minted alongside
     /// `id` — never the plaintext itself.
     ///
+    /// `now`/`budget` (T8.5a design doc, decision 5) fix this request's own
+    /// absolute deadline at admission time — this module holds no clock of
+    /// its own (see the module doc, "No clock, no waiting"): `now` is always
+    /// the caller's, and `budget` is the caller's own ceiling for this call
+    /// (`proxy.rs` passes `state.limits.total`, a test passes any fixed
+    /// value). `now.checked_add(budget)` overflowing is refused toward the
+    /// SAFER extreme for a hot admission path, unlike [`Self::begin_drain`]'s
+    /// refusal of the whole operation: the deadline becomes `now` itself
+    /// (`remaining` is then always `Duration::ZERO`), and the request is
+    /// still admitted rather than rejected over a case that, in production,
+    /// only an exhausted monotonic clock could ever trigger.
+    ///
     /// # Errors
     ///
     /// Anything but `Running` refuses, each state with its own reason.
@@ -382,6 +417,8 @@ impl Generation {
         self: &Arc<Self>,
         id: String,
         token_hash: [u8; 32],
+        now: Instant,
+        budget: Duration,
     ) -> Result<InFlight, RequestRefused> {
         let mut inner = self.lock();
         match inner.state {
@@ -392,11 +429,16 @@ impl Generation {
                 if inner.in_flight.contains_key(&id) {
                     return Err(RequestRefused::DuplicateId);
                 }
+                let deadline = now.checked_add(budget).unwrap_or(now);
                 inner.in_flight.insert(
                     id.clone(),
-                    ApprovalToken {
-                        hash: token_hash,
-                        used: false,
+                    InFlightEntry {
+                        token: ApprovalToken {
+                            hash: token_hash,
+                            used: false,
+                        },
+                        deadline,
+                        ended: watch::Sender::new(false),
                     },
                 );
                 Ok(InFlight {
@@ -461,11 +503,32 @@ impl Generation {
             return Err(ApprovalCallbackRefused::TokenInvalid);
         };
         let presented = sha256(token.as_bytes());
-        if entry.used || !constant_time_eq(&entry.hash, &presented) {
+        if entry.token.used || !constant_time_eq(&entry.token.hash, &presented) {
             return Err(ApprovalCallbackRefused::TokenInvalid);
         }
-        entry.used = true;
+        entry.token.used = true;
         Ok(())
+    }
+
+    /// This request's lifecycle signal, if `id` is currently in flight in
+    /// this generation — its absolute deadline and a queryable/awaitable
+    /// "has it ended" flag (T8.5a design doc, decisions 1/2).
+    ///
+    /// `None` for BOTH "this id was never admitted into this generation" AND
+    /// "it was, but has already `finish`ed or been dropped" — decision 2's
+    /// deliberate range boundary: once an entry leaves `in_flight` there is no
+    /// remaining time left to report, and a caller in either case falls back
+    /// to the same default budget (decision 3). Only a caller that already
+    /// holds a `RequestLifecycle` from BEFORE the request ended keeps
+    /// learning about it — that `watch::Receiver` is independent of this
+    /// map entry once handed out.
+    #[must_use]
+    pub fn request_lifecycle(&self, id: &str) -> Option<RequestLifecycle> {
+        let inner = self.lock();
+        inner.in_flight.get(id).map(|entry| RequestLifecycle {
+            deadline: entry.deadline,
+            ended: entry.ended.subscribe(),
+        })
     }
 
     /// Stop admitting new requests; let in-flight ones run for at most `grace`.
@@ -568,6 +631,115 @@ impl Generation {
         // The sender lives in `self`; an error here cannot happen while `self`
         // is borrowed, and is read as "never revoked" rather than as revoked.
         let _ = rx.wait_for(|revoked| *revoked).await;
+    }
+}
+
+/// A request's lifecycle signal, as of the moment
+/// [`Generation::request_lifecycle`] returned it: its absolute deadline, and
+/// an awaitable/queryable "has this request ended" flag (T8.5a design doc,
+/// decision 2). Holds no clock of its own (decision 5) — [`Self::remaining`]
+/// takes `now` from its caller, the same discipline [`Generation::begin_drain`]
+/// and [`Generation::progress`] already follow. `Clone`: `watch::Receiver` is
+/// `Clone` unconditionally (it shares the same underlying state), so cloning
+/// this just hands out another handle to the same request's signal — useful
+/// for a caller that needs to observe the same request from more than one
+/// place, and for tests that re-run `bind_to_lifecycle` against one fixed
+/// lifecycle many times.
+#[derive(Debug, Clone)]
+pub struct RequestLifecycle {
+    deadline: Instant,
+    ended: watch::Receiver<bool>,
+}
+
+impl RequestLifecycle {
+    /// How much of this request's budget is left, as of `now`. Saturates at
+    /// zero rather than going negative once `now` reaches or passes the
+    /// deadline.
+    #[must_use]
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
+
+    /// Resolves once this request has ended — immediately if it already had
+    /// by the time this was called. Backed by `watch::Sender::send_replace`
+    /// (decision 2): a `subscribe()` that happens after the request already
+    /// ended still observes the current value, so a late waiter cannot miss
+    /// it the way a plain `send` would let it.
+    pub async fn ended(&mut self) {
+        let _ = self.ended.wait_for(|ended| *ended).await;
+    }
+}
+
+/// Why [`bind_to_lifecycle`] gave up on `work` instead of returning its
+/// result — two different facts, kept distinct rather than folded into one
+/// "the request has already ended" message (T8.5a design doc's frozen-design
+/// note M-new2, which flagged that folding as inaccurate on the first
+/// branch):
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleTimeout {
+    /// This request's own time budget (`remaining` at the time
+    /// [`bind_to_lifecycle`] started) ran out before `work` completed. The
+    /// bound request may or may not still be in flight — this says nothing
+    /// about whether it has ended.
+    BudgetExhausted,
+    /// The bound request ended (`finish`/`Drop`, decision 4) before `work`
+    /// completed.
+    RequestEnded,
+}
+
+/// Bind a business future to a (possibly absent) request lifecycle (T8.5a
+/// design doc, decision 3): with a lifecycle, race `work` against
+/// `min(remaining, natural completion)` AND against the bound request ending,
+/// whichever comes first; with none, `await` `work` unchanged — the caller's
+/// own outer deadline (e.g. `rpc.rs`'s `Limits::call_timeout`) is the only
+/// thing bounding it, exactly as today.
+///
+/// Independent of any specific business handler by design — testable with a
+/// stub future a test controls directly (judgement 9a), rather than only
+/// through a real operation that happens to be asynchronous. Not preemption:
+/// `work` (or whatever it drives, e.g. `sink.emit`) may have already
+/// committed a side effect by the time this returns `Err` — dropping the
+/// future does not undo it (decision 4), the same disclaimer `$/cancelRequest`
+/// already carries. And it can only take effect at `work`'s own next
+/// `.await` point: a `work` that does not yield does not get interrupted
+/// mid-poll.
+///
+/// # Errors
+///
+/// [`LifecycleTimeout`] — see its variants for which of the two happened.
+pub async fn bind_to_lifecycle<T>(
+    lifecycle: Option<RequestLifecycle>,
+    work: impl Future<Output = T>,
+) -> Result<T, LifecycleTimeout> {
+    match lifecycle {
+        Some(mut lifecycle) => {
+            let remaining = lifecycle.remaining(Instant::now());
+            // `biased`, work arm first (Codex review round 1 Medium 1): a
+            // `work` that is already resolved by the time this is first
+            // polled (`std::future::ready(sink.emit(...))` in
+            // `events_emit.rs` always is — `sink.emit` runs eagerly, before
+            // `bind_to_lifecycle` is ever called) and a lifecycle that has
+            // ALSO already ended by then are both immediately ready on the
+            // first poll. Plain `tokio::select!` picks a ready branch at
+            // random, which could report `RequestEnded` for a call whose
+            // effect had already landed — a caller seeing that error has no
+            // way to know the side effect happened and may retry, duplicating
+            // it. Polling the work arm first makes an already-produced result
+            // win deterministically; this cannot starve `ended()`, because
+            // there is exactly one `select!`, not a loop — a pending `work`
+            // still lets `ended()` be polled on every subsequent wakeup.
+            tokio::select! {
+                biased;
+                r = tokio::time::timeout(remaining, work) => {
+                    r.map_err(|_| LifecycleTimeout::BudgetExhausted)
+                }
+                () = lifecycle.ended() => Err(LifecycleTimeout::RequestEnded),
+            }
+        }
+        // No binding (no `request_id`, or one `request_lifecycle` could not
+        // find — decision 2's range boundary): unchanged behaviour, bounded
+        // only by whatever the caller's own outer deadline already is.
+        None => Ok(work.await),
     }
 }
 
@@ -765,12 +937,19 @@ impl InFlight {
         // landing between them lists this request in `Revocation::abandoned`
         // while this returns `Ok` — the kernel would log "outcome unknown" and
         // report success for the same request.
-        let (revoked, dispatched) = {
+        let (revoked, dispatched, entry) = {
             let mut inner = self.generation.lock();
-            inner.in_flight.remove(&self.id);
+            let entry = inner.in_flight.remove(&self.id);
             let dispatched = inner.dispatched.remove(&self.id);
-            (inner.state == DrainState::Revoked, dispatched)
+            (inner.state == DrainState::Revoked, dispatched, entry)
         };
+        // T8.5a decision 4: `send_replace` OUTSIDE the lock, same reason
+        // `revoke` flips `self.revoked` after releasing it — never holding
+        // `Mutex<Inner>` and `watch::Sender`'s own internal lock at once, so
+        // the two never nest and cannot form a new lock order.
+        if let Some(entry) = entry {
+            entry.ended.send_replace(true);
+        }
         self.finished = true;
         if revoked {
             Err(Abandoned { dispatched })
@@ -783,9 +962,15 @@ impl InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         if !self.finished {
-            let mut inner = self.generation.lock();
-            inner.in_flight.remove(&self.id);
-            inner.dispatched.remove(&self.id);
+            let entry = {
+                let mut inner = self.generation.lock();
+                inner.dispatched.remove(&self.id);
+                inner.in_flight.remove(&self.id)
+            };
+            // See the comment in `finish`: outside the lock, same reason.
+            if let Some(entry) = entry {
+                entry.ended.send_replace(true);
+            }
         }
     }
 }
@@ -839,11 +1024,24 @@ mod tests {
     #[test]
     fn draining_refuses_new_requests_but_not_the_ones_in_flight() {
         let g = running();
-        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(g.begin_drain(Instant::now(), GRACE));
 
         assert_eq!(
-            g.admit_request("b".into(), [0u8; 32]).unwrap_err(),
+            g.admit_request(
+                "b".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30)
+            )
+            .unwrap_err(),
             RequestRefused::Draining
         );
         assert_eq!(RequestRefused::Draining.code(), "module_draining");
@@ -860,8 +1058,22 @@ mod tests {
     #[test]
     fn draining_admits_only_callbacks_that_name_a_live_request() {
         let g = running();
-        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
-        let done = g.admit_request("done".into(), [0u8; 32]).unwrap();
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let done = g
+            .admit_request(
+                "done".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         done.finish().unwrap();
 
         // Control: Running admits all three shapes.
@@ -887,7 +1099,14 @@ mod tests {
     #[test]
     fn revoking_refuses_every_callback_including_in_flight_ones() {
         let g = running();
-        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(g.begin_drain(Instant::now(), GRACE));
         assert_eq!(
             g.admit_callback(Some("a")),
@@ -902,7 +1121,13 @@ mod tests {
         assert_eq!(g.admit_callback(Some("a")), Err(CallbackRefused::Revoked));
         assert_eq!(g.admit_callback(None), Err(CallbackRefused::Revoked));
         assert_eq!(
-            g.admit_request("b".into(), [0u8; 32]).unwrap_err(),
+            g.admit_request(
+                "b".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30)
+            )
+            .unwrap_err(),
             RequestRefused::Stopping
         );
         // SPEC §8: *"drain 超时的在途请求返回 503(不假装成功)"*.
@@ -916,7 +1141,14 @@ mod tests {
         let t = Instant::now();
 
         let g = running();
-        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(g.begin_drain(t, GRACE));
         assert_eq!(
             g.progress(t + Duration::from_secs(3)),
@@ -929,7 +1161,14 @@ mod tests {
         assert_eq!(g.progress(t + Duration::from_secs(3)), DrainProgress::Idle);
 
         let g = running();
-        let _b = g.admit_request("b".into(), [0u8; 32]).unwrap();
+        let _b = g
+            .admit_request(
+                "b".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(g.begin_drain(t, GRACE));
         assert_eq!(
             g.progress(t + GRACE),
@@ -944,7 +1183,14 @@ mod tests {
     #[test]
     fn a_dropped_request_leaves_the_in_flight_set() {
         let g = running();
-        let a = g.admit_request("a".into(), [0u8; 32]).unwrap();
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         drop(a);
         assert!(g.begin_drain(Instant::now(), GRACE));
         assert_eq!(g.progress(Instant::now()), DrainProgress::Idle);
@@ -955,7 +1201,14 @@ mod tests {
     #[test]
     fn progress_outside_a_drain_is_not_draining() {
         let g = running();
-        let _a = g.admit_request("a".into(), [0u8; 32]).unwrap();
+        let _a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert_eq!(g.progress(Instant::now()), DrainProgress::NotDraining);
         // Revoked AFTER a drain began, so a deadline exists: `NotDraining` here
         // must come from the state, not from the deadline being absent.
@@ -974,7 +1227,13 @@ mod tests {
         assert!(!g.ready());
         assert_eq!(g.state(), DrainState::Draining);
         assert_eq!(
-            g.admit_request("b".into(), [0u8; 32]).unwrap_err(),
+            g.admit_request(
+                "b".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30)
+            )
+            .unwrap_err(),
             RequestRefused::Draining
         );
     }
@@ -983,7 +1242,14 @@ mod tests {
     fn a_second_drain_does_not_extend_the_grace() {
         let t = Instant::now();
         let g = running();
-        let _a = g.admit_request("a".into(), [0u8; 32]).unwrap();
+        let _a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(g.begin_drain(t, GRACE));
         assert!(!g.begin_drain(t + Duration::from_secs(5), GRACE));
         assert_eq!(
@@ -1012,7 +1278,13 @@ mod tests {
     fn a_module_that_is_not_ready_admits_nothing_and_goes_straight_to_revoked() {
         let g = Generation::starting();
         assert_eq!(
-            g.admit_request("a".into(), [0u8; 32]).unwrap_err(),
+            g.admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30)
+            )
+            .unwrap_err(),
             RequestRefused::NotReady
         );
         assert_eq!(g.admit_callback(None), Err(CallbackRefused::NotReady));
@@ -1032,7 +1304,14 @@ mod tests {
     fn a_restart_does_not_carry_a_request_in_flight_into_the_next_run() {
         let current = Current::new(running());
         let old = current.get();
-        let a = old.admit_request("a".into(), [0u8; 32]).unwrap();
+        let a = old
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
 
         let next = running();
         let replaced = current.replace(Arc::clone(&next));
@@ -1043,7 +1322,17 @@ mod tests {
         let _ = replaced.revoke();
 
         assert_eq!(a.finish(), Err(Abandoned { dispatched: false }));
-        assert!(current.get().admit_request("b".into(), [0u8; 32]).is_ok());
+        assert!(
+            current
+                .get()
+                .admit_request(
+                    "b".into(),
+                    [0u8; 32],
+                    Instant::now(),
+                    Duration::from_secs(30)
+                )
+                .is_ok()
+        );
         assert!(Arc::ptr_eq(&current.get(), &next));
     }
 
@@ -1053,8 +1342,22 @@ mod tests {
     #[test]
     fn after_revocation_nothing_more_is_sent_and_what_was_sent_is_reported() {
         let g = running();
-        let sent = g.admit_request("sent".into(), [0u8; 32]).unwrap();
-        let unsent = g.admit_request("unsent".into(), [0u8; 32]).unwrap();
+        let sent = g
+            .admit_request(
+                "sent".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let unsent = g
+            .admit_request(
+                "unsent".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(sent.dispatch(), "control: a running generation may send");
 
         let r = g.revoke().unwrap();
@@ -1095,9 +1398,22 @@ mod tests {
     #[test]
     fn a_duplicate_id_is_refused_rather_than_aliased() {
         let g = running();
-        let _a = g.admit_request("a".into(), [0u8; 32]).unwrap();
+        let _a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert_eq!(
-            g.admit_request("a".into(), [0u8; 32]).unwrap_err(),
+            g.admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30)
+            )
+            .unwrap_err(),
             RequestRefused::DuplicateId
         );
     }
@@ -1147,8 +1463,13 @@ mod tests {
     // here.
 
     fn admit(g: &Arc<Generation>, id: &str, token: &str) -> InFlight {
-        g.admit_request(id.to_owned(), sha256(token.as_bytes()))
-            .unwrap()
+        g.admit_request(
+            id.to_owned(),
+            sha256(token.as_bytes()),
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1248,5 +1569,321 @@ mod tests {
         assert!(g.begin_drain(Instant::now(), GRACE));
         assert_eq!(g.admit_approval_callback("r1", "secret-1"), Ok(()));
         drop(in_flight);
+    }
+
+    // ── T8.5a: request lifecycle signal (design doc judgements 1/3/4/5/7/8/9a) ──
+
+    /// Judgement 1: `remaining` is computed from the query time, not fixed at
+    /// admission — using fixed `Instant` values, no real sleep. Positive
+    /// control: queried earlier, more is left, proving the value tracks the
+    /// query time rather than being pinned to a short constant.
+    #[test]
+    fn remaining_reflects_the_query_time_not_a_fixed_value() {
+        let t0 = Instant::now();
+        let g = running();
+        let _in_flight = g
+            .admit_request("r1".into(), [0u8; 32], t0, Duration::from_secs(30))
+            .unwrap();
+        let lifecycle = g.request_lifecycle("r1").unwrap();
+        assert_eq!(
+            lifecycle.remaining(t0 + Duration::from_secs(29)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            lifecycle.remaining(t0 + Duration::from_secs(1)),
+            Duration::from_secs(29),
+            "positive control: queried earlier, more time is left"
+        );
+    }
+
+    /// Judgement 3: an id that was never admitted (a stranger, or one from
+    /// another generation) reports `None` — and querying it does not perturb
+    /// a DIFFERENT, live request in the same generation that is close to its
+    /// own deadline (no cross-request interference).
+    #[test]
+    fn an_unknown_id_reports_none_without_cross_request_interference() {
+        let t0 = Instant::now();
+        let g = running();
+        let _about_to_expire = g
+            .admit_request(
+                "about-to-expire".into(),
+                [0u8; 32],
+                t0,
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        assert!(g.request_lifecycle("ghost").is_none());
+        let another_gen = running();
+        assert!(another_gen.request_lifecycle("about-to-expire").is_none());
+
+        let lifecycle = g.request_lifecycle("about-to-expire").unwrap();
+        assert_eq!(
+            lifecycle.remaining(t0),
+            Duration::from_millis(1),
+            "querying an unrelated id must not perturb this one"
+        );
+    }
+
+    /// Judgement 4: a callback waiting on `ended()` is woken promptly when
+    /// its bound request `finish()`es — well inside a short test timeout,
+    /// not the request's real (long) remaining budget. Positive control: a
+    /// DIFFERENT, still in-flight request's lifecycle is unaffected.
+    #[tokio::test]
+    async fn ended_resolves_promptly_after_finish() {
+        let g = running();
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let b = g
+            .admit_request(
+                "b".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let mut lifecycle_a = g.request_lifecycle("a").unwrap();
+        let mut lifecycle_b = g.request_lifecycle("b").unwrap();
+
+        a.finish().unwrap();
+        tokio::time::timeout(Duration::from_millis(200), lifecycle_a.ended())
+            .await
+            .expect("ended() must resolve promptly after finish()");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), lifecycle_b.ended())
+                .await
+                .is_err(),
+            "positive control: an unrelated, still in-flight request must not be woken"
+        );
+        drop(b);
+    }
+
+    /// Judgement 5: same as above, but triggered by `Drop` (a handler
+    /// panicking, being cancelled, or the client disconnecting) rather than
+    /// `finish()` — the two paths must be equivalent to a waiting callback.
+    #[tokio::test]
+    async fn ended_resolves_promptly_after_drop() {
+        let g = running();
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let mut lifecycle = g.request_lifecycle("a").unwrap();
+        drop(a);
+        tokio::time::timeout(Duration::from_millis(200), lifecycle.ended())
+            .await
+            .expect("ended() must resolve promptly after Drop");
+    }
+
+    /// Judgement 7: a request that is `revoke()`d but not yet `finish()`ed
+    /// still reports `Some` from `request_lifecycle` (its pre-revoke
+    /// deadline) — revoke alone does not end it. Only its own `finish()`
+    /// (which now returns `Err(Abandoned)`) flips `ended`.
+    #[tokio::test]
+    async fn revoke_does_not_prematurely_end_a_still_in_flight_request() {
+        let t0 = Instant::now();
+        let g = running();
+        let a = g
+            .admit_request("a".into(), [0u8; 32], t0, Duration::from_secs(30))
+            .unwrap();
+        let mut lifecycle = g.request_lifecycle("a").unwrap();
+        let _ = g.revoke();
+
+        assert!(
+            g.request_lifecycle("a").is_some(),
+            "revoke alone must not remove the entry"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), lifecycle.ended())
+                .await
+                .is_err(),
+            "ended() must not resolve from revoke alone"
+        );
+
+        assert_eq!(a.finish(), Err(Abandoned { dispatched: false }));
+        tokio::time::timeout(Duration::from_millis(200), lifecycle.ended())
+            .await
+            .expect("finish() after revoke must still flip ended");
+    }
+
+    /// Judgement 8: an unrepresentable deadline (`now.checked_add(budget)`
+    /// overflows) fails toward the SAFER extreme for this hot admission
+    /// path — the request is still admitted, and its deadline collapses to
+    /// `now` (so `remaining` is always zero) — unlike `begin_drain`, which
+    /// refuses the whole operation on overflow.
+    #[test]
+    fn an_overflowing_deadline_admits_with_zero_remaining_rather_than_refusing() {
+        let g = running();
+        let now = Instant::now();
+        let in_flight = g
+            .admit_request("a".into(), [0u8; 32], now, Duration::MAX)
+            .expect("admission must still succeed despite the overflow");
+        let lifecycle = g.request_lifecycle("a").unwrap();
+        assert_eq!(lifecycle.remaining(now), Duration::ZERO);
+        assert_eq!(
+            lifecycle.remaining(now + Duration::from_secs(1)),
+            Duration::ZERO,
+            "remaining stays saturated at zero, never wraps"
+        );
+        drop(in_flight);
+    }
+
+    // ── T8.5a judgement 9a: `bind_to_lifecycle` itself, via stub futures ──
+    // (C1 fix — independent of any real business handler; `events_emit.rs`'s
+    // own tests, judgement 9b, only check that it is WIRED correctly.)
+
+    /// A `work` that never completes, bound to a request with a very short
+    /// remaining budget: `bind_to_lifecycle` returns `BudgetExhausted` once
+    /// that budget elapses. Real, short wall-clock wait (L-new1: accepted —
+    /// `admit_request` reads no injectable clock; `proxy.rs`'s own 504 tests
+    /// use the same shape).
+    #[tokio::test]
+    async fn bind_to_lifecycle_times_out_when_the_budget_is_exhausted() {
+        let g = running();
+        let in_flight = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_millis(50),
+            )
+            .unwrap();
+        let lifecycle = g.request_lifecycle("a").unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            bind_to_lifecycle(Some(lifecycle), std::future::pending::<()>()),
+        )
+        .await
+        .expect("bind_to_lifecycle must resolve well inside the 1s outer timeout");
+        assert_eq!(result, Err(LifecycleTimeout::BudgetExhausted));
+        drop(in_flight);
+    }
+
+    /// A `work` that never completes, bound to a request with a generous
+    /// (30s) remaining budget: `finish()`ing that request resolves
+    /// `bind_to_lifecycle` with `RequestEnded` almost immediately — far
+    /// short of the 30s budget, proving the `ended()` arm won the race, not
+    /// the timeout arm.
+    #[tokio::test]
+    async fn bind_to_lifecycle_ends_promptly_when_its_request_finishes() {
+        let g = running();
+        let in_flight = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let lifecycle = g.request_lifecycle("a").unwrap();
+        let bound = tokio::spawn(bind_to_lifecycle(
+            Some(lifecycle),
+            std::future::pending::<()>(),
+        ));
+        in_flight.finish().unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(500), bound)
+            .await
+            .expect("bind_to_lifecycle must resolve well inside the remaining 30s budget")
+            .unwrap();
+        assert_eq!(result, Err(LifecycleTimeout::RequestEnded));
+    }
+
+    /// Same as above, but triggered by `Drop` (mirrors judgement 5, this
+    /// time observed through `bind_to_lifecycle` rather than
+    /// `RequestLifecycle::ended` directly).
+    #[tokio::test]
+    async fn bind_to_lifecycle_ends_promptly_when_its_request_is_dropped() {
+        let g = running();
+        let in_flight = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let lifecycle = g.request_lifecycle("a").unwrap();
+        let bound = tokio::spawn(bind_to_lifecycle(
+            Some(lifecycle),
+            std::future::pending::<()>(),
+        ));
+        drop(in_flight);
+        let result = tokio::time::timeout(Duration::from_millis(500), bound)
+            .await
+            .expect("bind_to_lifecycle must resolve well inside the remaining 30s budget")
+            .unwrap();
+        assert_eq!(result, Err(LifecycleTimeout::RequestEnded));
+    }
+
+    /// Positive control for both of the above: `work` finishing first (and
+    /// promptly) returns `Ok`, unaffected by an unexpired deadline or an
+    /// untriggered `ended()` — the FU-54 acceptance text's other half.
+    #[tokio::test]
+    async fn bind_to_lifecycle_returns_ok_when_work_finishes_first() {
+        let g = running();
+        let in_flight = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let lifecycle = g.request_lifecycle("a").unwrap();
+        let result = bind_to_lifecycle(Some(lifecycle), std::future::ready(42)).await;
+        assert_eq!(result, Ok(42));
+        drop(in_flight);
+    }
+
+    /// Codex review round 1, Medium 1: `work` that has ALREADY produced a
+    /// value by the time `bind_to_lifecycle` is first polled — exactly what
+    /// `events_emit.rs` passes (`std::future::ready(sink.emit(...))`,
+    /// evaluated eagerly before the call) — must win over a lifecycle that
+    /// has ALSO already ended by then, deterministically, not by the luck of
+    /// `tokio::select!`'s (otherwise random) tie-break: a caller that saw
+    /// `Err(RequestEnded)` for a call whose side effect already landed has no
+    /// way to know that and may retry, duplicating it. Run many trials: a
+    /// non-`biased` `select!` would occasionally return `Err(RequestEnded)`
+    /// here.
+    #[tokio::test]
+    async fn already_completed_work_wins_over_an_already_ended_lifecycle() {
+        let g = running();
+        let in_flight = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let lifecycle = g.request_lifecycle("a").unwrap();
+        in_flight.finish().unwrap();
+        for _ in 0..200 {
+            let result = bind_to_lifecycle(Some(lifecycle.clone()), std::future::ready(42)).await;
+            assert_eq!(
+                result,
+                Ok(42),
+                "already-completed work must win over an already-ended lifecycle"
+            );
+        }
+    }
+
+    /// Positive control, no lifecycle at all (no `request_id`, or one that
+    /// query to `None`): behaves exactly like a plain `.await` — nothing
+    /// `bind_to_lifecycle` itself imposes bounds it.
+    #[tokio::test]
+    async fn bind_to_lifecycle_with_no_lifecycle_just_awaits() {
+        let result = bind_to_lifecycle(None, std::future::ready(42)).await;
+        assert_eq!(result, Ok(42));
     }
 }

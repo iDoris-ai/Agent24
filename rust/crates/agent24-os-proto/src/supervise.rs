@@ -1271,11 +1271,21 @@ mod tests {
         let generation = p.generation().clone();
         assert!(generation.ready());
         let sent = generation
-            .admit_request("sent".to_owned(), [0u8; 32])
+            .admit_request(
+                "sent".to_owned(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
             .unwrap();
         assert!(sent.dispatch());
         let _unsent = generation
-            .admit_request("unsent".to_owned(), [0u8; 32])
+            .admit_request(
+                "unsent".to_owned(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
             .unwrap();
         // Another generation, to show which one is revoked.
         let other = Generation::starting();
