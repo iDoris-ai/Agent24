@@ -18,7 +18,7 @@ use agent24_protocol::{ApprovalAnswer, ApprovalRequestError, ModuleApprovalKind}
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::module_approval_broker::{ModuleApprovalBroker, check_closed_set};
+use crate::module_approval_broker::{ModuleApprovalBroker, validate_gate_action};
 
 /// Wire params for `gate`/`advise` (design doc decision 4) — the SUBMIT
 /// shape. `deny_unknown_fields` with an explicit `_meta` (SPEC's `_meta`
@@ -97,6 +97,10 @@ fn request_error(err: ApprovalRequestError) -> RpcError {
         ApprovalRequestError::ActionNotInClosedSet => {
             RpcError::application(ErrorKind::Forbidden, "action not in the closed set")
         }
+        // T7c/ME-3e: "in the closed set, bad arguments" — distinct from the
+        // above on the wire (design doc "闭集匹配"): `-32602`/invalid params,
+        // never `forbidden`.
+        ApprovalRequestError::InvalidTarget(msg) => RpcError::invalid_params(msg),
         ApprovalRequestError::NotFound => {
             RpcError::application(ErrorKind::NotFound, "approval not found")
         }
@@ -140,7 +144,7 @@ impl Handler for ApprovalSubmitHandler {
         Box::pin(async move {
             // `check_params` already proved this deserializes; a failure
             // here is a kernel bug, not a caller error.
-            let parsed = parsed.map_err(|e| {
+            let mut parsed = parsed.map_err(|e| {
                 RpcError::internal(format!(
                     "params for module {module:?} were valid at check_params but not at \
                      call(): {e}"
@@ -161,11 +165,20 @@ impl Handler for ApprovalSubmitHandler {
             // consumption (Codex round 5 High 1 / judgement 16b) — a `gate`
             // call that is always going to be `forbidden` must not burn the
             // token a subsequent `advise` with the same request_id would
-            // still need.
-            if kind == ModuleApprovalKind::Gate
-                && let Err(err) = check_closed_set(&parsed.action)
-            {
-                return Err(request_error(err));
+            // still need. T7c/ME-3e: on success, `parsed.target` is
+            // OVERWRITTEN with `validate_gate_action`'s canonicalized form —
+            // the raw string the module sent is never what gets persisted
+            // (design doc "闭集匹配"); the in-process path
+            // (`crate::domain::PolicyApprovalBackend`) calls this exact same
+            // function, so the two paths cannot disagree (judgement 16).
+            if kind == ModuleApprovalKind::Gate {
+                match validate_gate_action(&parsed.action, parsed.target.as_deref()) {
+                    Ok(canonical) => {
+                        parsed.action = canonical.action;
+                        parsed.target = Some(canonical.target);
+                    }
+                    Err(err) => return Err(request_error(err)),
+                }
             }
 
             // Step 3: idempotent lookup — a resubmit with the same
@@ -202,8 +215,9 @@ impl Handler for ApprovalSubmitHandler {
                 .await
                 .map_err(request_error)?;
 
-            // Step 6: return. `gate` never reaches this line — step 2
-            // always returns first for it, this round.
+            // Step 6: return. T7c/ME-3e: `gate` CAN reach this line now, for
+            // `schedule_callback` — step 2 only returns early for an action
+            // outside the closed set or a bad `target`.
             Ok(answer_json(&answer))
         })
     }
@@ -602,5 +616,94 @@ mod tests {
         };
         let err = r.outcome.unwrap_err();
         assert_eq!(err.code, code::INVALID_PARAMS);
+    }
+
+    // ── T7c/ME-3e: `gate`'s first closed-set entry, `schedule_callback` ────
+
+    fn schedule_callback_params(target: Option<&str>) -> Value {
+        let mut params = json!({
+            "action": "schedule_callback",
+            "payload": {},
+            "request_id": "req-1",
+            "approval_token": "secret-1",
+        });
+        if let Some(t) = target {
+            params["target"] = json!(t);
+        }
+        params
+    }
+
+    #[tokio::test]
+    async fn gate_accepts_schedule_callback_and_stores_the_canonicalized_target() {
+        let broker = test_broker().await;
+        let (g, _in_flight) = generation_with_good_params_admitted();
+        let h = submit_handler(g, true, ModuleApprovalKind::Gate, broker.clone());
+        let raw_target = "2026-01-01T08:00:00.5+08:00"; // epoch-equal to 2026-01-01T00:00:00Z
+        let answer = h
+            .call(schedule_callback_params(Some(raw_target)))
+            .await
+            .unwrap();
+        assert_eq!(answer["decision"], "pending");
+        assert_eq!(answer["kind"], "gate");
+        assert_eq!(
+            answer["binding"], true,
+            "a Gate submission that reaches insert() must be binding (judgement 11)"
+        );
+        assert_eq!(answer["executed_at"], serde_json::Value::Null);
+
+        // Judgement 16 (wire half): the value actually stored is EXACTLY
+        // what calling the shared `validate_gate_action` on the same input
+        // produces — proving the wire path did not roll its own
+        // canonicalization.
+        let expected = crate::module_approval_broker::validate_gate_action(
+            "schedule_callback",
+            Some(raw_target),
+        )
+        .unwrap();
+        let stored = broker
+            .get(answer["approval_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.target.as_deref(), Some(expected.target.as_str()));
+    }
+
+    #[tokio::test]
+    async fn gate_schedule_callback_without_a_target_is_invalid_params_not_forbidden() {
+        // Judgement 12: missing `target` is `-32602`, never `forbidden`.
+        let broker = test_broker().await;
+        let (g, _in_flight) = generation_with_good_params_admitted();
+        let h = submit_handler(g, true, ModuleApprovalKind::Gate, broker.clone());
+        let err = h.call(schedule_callback_params(None)).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_PARAMS);
+        assert!(
+            broker.list(None).await.unwrap().is_empty(),
+            "an invalid target must not create a record"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_schedule_callback_with_an_unparseable_target_is_invalid_params() {
+        let broker = test_broker().await;
+        let (g, _in_flight) = generation_with_good_params_admitted();
+        let h = submit_handler(g, true, ModuleApprovalKind::Gate, broker.clone());
+        let err = h
+            .call(schedule_callback_params(Some("whenever")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn gate_still_forbids_every_other_action_even_with_a_valid_target() {
+        // Judgement 7: a valid `target` does not smuggle an unrelated
+        // `action` into the closed set.
+        let broker = test_broker().await;
+        let (g, _in_flight) = generation_with_good_params_admitted();
+        let h = submit_handler(g, true, ModuleApprovalKind::Gate, broker.clone());
+        let mut params = schedule_callback_params(Some("2026-01-01T00:00:00Z"));
+        params["action"] = json!("transfer_funds");
+        let err = h.call(params).await.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
     }
 }

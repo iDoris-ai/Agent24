@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use agent24_protocol::{
     ApprovalAnswer, ApprovalRequestError, EventBody, ModuleApproval, ModuleApprovalDecision,
-    ModuleApprovalKind,
+    ModuleApprovalKind, ModuleApprovalSubmitted,
 };
 use agent24_store::{Store, StoreError};
 use tokio_util::sync::CancellationToken;
@@ -28,14 +28,81 @@ const MODULE_APPROVAL_TTL_SECS: u64 = 300;
 /// 一次，具体间隔留给实现阶段").
 const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The kernel-executable action closed set (design doc decisions 4 and 6) —
-/// EMPTY this round (T7b scope, see the design doc's opening section): every
-/// `gate` submission hits this and is `forbidden` before a row is ever
-/// written. Shared by the wire handler and `PolicyApprovalBackend` so the two
-/// paths can never disagree about what is in the closed set. T7c delivers
-/// the first non-empty entry.
-pub fn check_closed_set(_action: &str) -> Result<(), ApprovalRequestError> {
-    Err(ApprovalRequestError::ActionNotInClosedSet)
+/// The kernel-executable action closed set (design doc decisions 4 and 6).
+/// T7b shipped this EMPTY (every `gate` submission was `forbidden` before a
+/// row was ever written). T7c/ME-3e (`docs/design/T7c-ME3e-gate-execution.md`,
+/// "闭集匹配") adds the first entry, `schedule_callback` — a one-shot RFC3339
+/// callback, no cron/every. Matching is exact: no trim, no case-insensitive
+/// compare (judgement 7 — `"Schedule_Callback"`/`" schedule_callback "` stay
+/// `forbidden`).
+///
+/// Shared by the wire handler (`crate::approval_callback`) and
+/// `PolicyApprovalBackend` (`crate::domain`) so the two paths can never
+/// disagree about what is in the closed set OR about how `target` gets
+/// canonicalized — both call THIS function, not their own copy (judgement
+/// 16).
+pub fn validate_gate_action(
+    action: &str,
+    target: Option<&str>,
+) -> Result<CanonicalGateAction, ApprovalRequestError> {
+    if action != "schedule_callback" {
+        return Err(ApprovalRequestError::ActionNotInClosedSet);
+    }
+    let target = target.ok_or_else(|| {
+        ApprovalRequestError::InvalidTarget(
+            "schedule_callback requires a target timestamp".to_owned(),
+        )
+    })?;
+    let target = canonicalize_schedule_target(target)?;
+    Ok(CanonicalGateAction {
+        action: action.to_owned(),
+        target,
+    })
+}
+
+/// What [`validate_gate_action`] hands back on success — `target` is already
+/// [`canonicalize_schedule_target`]'s output, which the CALLER must persist
+/// instead of whatever string the module originally sent (design doc
+/// "闭集匹配").
+pub struct CanonicalGateAction {
+    pub action: String,
+    pub target: String,
+}
+
+/// Validate AND reformat a caller-supplied `target` into the EXACT format
+/// [`now_iso`] produces — `YYYY-MM-DDTHH:MM:SSZ`, UTC, whole seconds, `Z`
+/// suffix — so the scan's string comparison against `now_iso()`'s own output
+/// is equivalent to a real time comparison (design doc "时间规范化"). Accepts
+/// any legal RFC3339 offset and any number of fractional-second digits;
+/// sub-second precision is TRUNCATED (floored), never rounded — `12:00:00.9Z`
+/// canonicalizes to `12:00:00Z`, not `12:00:01Z` (judgement 13). A leap
+/// second (`:60`) is rejected as an invalid target, the same as any other
+/// unparseable string — not specially accommodated.
+///
+/// Formats straight off the parsed `chrono::DateTime` (converted to UTC),
+/// never through a `u64` epoch-seconds intermediate — a `u64` conversion
+/// would reject every legal pre-1970 RFC3339 timestamp, and design doc
+/// judgement 9 requires an already-past `target` (which includes
+/// pre-epoch instants) to be ACCEPTED, not rejected as if it were malformed.
+fn canonicalize_schedule_target(target: &str) -> Result<String, ApprovalRequestError> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(target).map_err(|e| {
+        ApprovalRequestError::InvalidTarget(format!("target is not a valid RFC3339 timestamp: {e}"))
+    })?;
+    // chrono represents a leap second by pushing the nanosecond field past
+    // 1_000_000_000 while keeping `.second()` at 59 — detect that encoding
+    // and refuse it rather than silently normalizing it away.
+    if parsed.timestamp_subsec_nanos() >= 1_000_000_000 {
+        return Err(ApprovalRequestError::InvalidTarget(
+            "leap seconds are not accepted in a target".to_owned(),
+        ));
+    }
+    // `%S` prints the whole-second field only — the fractional part is
+    // simply never emitted, which IS the truncation (flooring) judgement 13
+    // requires; there is no rounding step to get wrong.
+    Ok(parsed
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string())
 }
 
 /// Mint a 32-byte random, hex-encoded id (design doc decision 3:
@@ -84,6 +151,11 @@ fn to_answer(row: &ModuleApproval) -> ApprovalAnswer {
         kind: row.kind,
         binding: row.binding,
         decision: row.decision,
+        // T7c/ME-3e: this is a HAND-WRITTEN field-by-field copy, not a
+        // struct-to-struct mapping — `executed_at` must be listed explicitly
+        // here or it silently stays `None` forever even though the stored
+        // row has a real value (design doc "决策4" note, Codex round 2 M4).
+        executed_at: row.executed_at.clone(),
     }
 }
 
@@ -161,9 +233,13 @@ impl ModuleApprovalBroker {
         let digest = agent24_protocol::approval_digest(&payload);
         let created_at = now_iso(self.clock.as_ref());
         let expires_at = now_plus_iso(self.clock.as_ref(), MODULE_APPROVAL_TTL_SECS);
-        // `binding` is always false: `kind == Advise` whenever this line runs
-        // (a `Gate` submission always hits the empty closed set — checked by
-        // the caller — before this method is ever called).
+        // T7c/ME-3e (Codex round 2 High 3): `binding` MUST track `kind` for
+        // real now — T7b hardcoded `false` here because a `Gate` submission
+        // could never reach this line (the closed set was empty, so the
+        // caller's closed-set check always returned first). That premise no
+        // longer holds: `schedule_callback` is the first `action` that
+        // actually reaches `insert()` as a `Gate`.
+        let binding = kind == ModuleApprovalKind::Gate;
         let row = self
             .store
             .insert_module_approval(
@@ -171,7 +247,7 @@ impl ModuleApprovalBroker {
                 module,
                 request_id,
                 kind,
-                false,
+                binding,
                 &action,
                 target.as_deref(),
                 &payload,
@@ -181,8 +257,13 @@ impl ModuleApprovalBroker {
             )
             .await
             .map_err(|e| ApprovalRequestError::BackendUnavailable(e.to_string()))?;
+        // T7c/ME-3e (design doc criterion 18): the WS event carries a frozen
+        // `ModuleApprovalSubmitted` snapshot, NOT the full `ModuleApproval` —
+        // `executed_at` must never appear on the submission event.
         self.events
-            .broadcast(EventBody::ModuleApprovalRequired(Box::new(row.clone())));
+            .broadcast(EventBody::ModuleApprovalRequired(Box::new(
+                ModuleApprovalSubmitted::from(&row),
+            )));
         Ok(to_answer(&row))
     }
 
@@ -295,6 +376,12 @@ impl ModuleApprovalBroker {
     /// One scan pass — separated from [`Self::scan_loop`] so a test can
     /// trigger it directly, without waiting out a real interval (judgement
     /// 14/16).
+    ///
+    /// T7c/ME-3e adds a SECOND query (design doc "扩展 T7b 的周期扫描",
+    /// Codex round 2 Medium 2): the two `match`es below are fully
+    /// independent — one failing is logged and does not `?`/early-`return`,
+    /// so it can never stop the other from running this same cycle
+    /// (judgement 14). Neither shares a transaction with the other.
     pub async fn scan_once(&self) {
         let now = now_iso(self.clock.as_ref());
         match self.store.timeout_expired_module_approvals(&now).await {
@@ -313,6 +400,21 @@ impl ModuleApprovalBroker {
                 );
             }
         }
+        // No `RETURNING`/per-row WS push here on purpose (design doc "这一步
+        // 不需要 RETURNING/逐条推事件"): T7c does not add a WS event for
+        // "executed" this round — `status` polling is enough, and there is
+        // no per-id follow-up work the way the timeout branch above has.
+        match self.store.execute_due_schedule_callbacks(&now).await {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(count = n, "executed {n} due schedule_callback approval(s)"),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "module approval schedule_callback execution scan failed this cycle; \
+                     will retry next interval"
+                );
+            }
+        }
     }
 }
 
@@ -321,6 +423,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use sqlx::Row;
     use std::sync::Mutex;
 
     struct TestClock(Mutex<u64>);
@@ -519,12 +622,23 @@ mod tests {
             "the scan loop exited after a transient store error instead of retrying"
         );
 
-        // Recovery: reapply the SAME migration file (via `include_str!`, so
-        // this can never drift from the real schema) to recreate the table,
-        // then seed an already-expired `pending` row directly.
-        const MIGRATION: &str =
+        // Recovery: reapply the SAME migration files (via `include_str!`, so
+        // this can never drift from the real schema) to recreate the table —
+        // BOTH `0005` (the table itself) and `0006` (T7c/ME-3e's
+        // `executed_at` column + index), since `row_to_module_approval` now
+        // reads `executed_at` unconditionally (design doc note on
+        // `module_approval_broker.rs:525`-ish) — then seed an already-expired
+        // `pending` row directly.
+        const MIGRATION_0005: &str =
             include_str!("../../../crates/agent24-store/migrations/0005_module_approvals.sql");
-        sqlx::raw_sql(MIGRATION)
+        const MIGRATION_0006: &str = include_str!(
+            "../../../crates/agent24-store/migrations/0006_module_approval_executed_at.sql"
+        );
+        sqlx::raw_sql(MIGRATION_0005)
+            .execute(agent24_store::test_hooks::pool(&broker.store))
+            .await
+            .unwrap();
+        sqlx::raw_sql(MIGRATION_0006)
             .execute(agent24_store::test_hooks::pool(&broker.store))
             .await
             .unwrap();
@@ -630,6 +744,545 @@ mod tests {
         assert_eq!(
             row.payload_digest,
             agent24_protocol::approval_digest(&payload)
+        );
+    }
+
+    // ── T7c/ME-3e: `canonicalize_schedule_target` (judgement 13) ──────────
+
+    #[test]
+    fn the_same_real_instant_canonicalizes_byte_identically_regardless_of_offset_or_fraction_digits()
+     {
+        let expected = "2026-01-01T00:00:00Z";
+        for input in [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T08:00:00+08:00",
+            "2025-12-31T16:00:00-08:00",
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:00.000000Z",
+            "2026-01-01T00:00:00.000000000Z",
+            // Truncated (floored), not rounded: .9 must NOT become :01.
+            "2026-01-01T00:00:00.9Z",
+            "2026-01-01T00:00:00.999999999Z",
+        ] {
+            assert_eq!(
+                canonicalize_schedule_target(input).unwrap(),
+                expected,
+                "input {input:?} did not canonicalize to the expected instant"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leap_second_is_rejected_as_an_invalid_target() {
+        assert!(matches!(
+            canonicalize_schedule_target("2026-06-30T23:59:60Z"),
+            Err(ApprovalRequestError::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn garbage_targets_are_rejected_as_invalid_not_panics() {
+        for bad in ["not-a-timestamp", "2026-13-40T99:99:99Z"] {
+            assert!(
+                matches!(
+                    canonicalize_schedule_target(bad),
+                    Err(ApprovalRequestError::InvalidTarget(_))
+                ),
+                "{bad:?} should have been rejected"
+            );
+        }
+    }
+
+    // ── judgement 9: a pre-1970 target is a legal RFC3339 timestamp and
+    // must be ACCEPTED, not rejected as if malformed (Codex review) ────────
+    #[test]
+    fn a_pre_epoch_target_is_accepted_and_canonicalized_not_rejected() {
+        assert_eq!(
+            canonicalize_schedule_target("1969-12-31T23:59:59Z").unwrap(),
+            "1969-12-31T23:59:59Z"
+        );
+        // Also exercise an offset + fractional digits pre-epoch, same as the
+        // post-epoch equivalence test above, to prove the non-u64 formatting
+        // path canonicalizes pre-epoch instants exactly like post-epoch ones.
+        assert_eq!(
+            canonicalize_schedule_target("1969-12-31T23:59:59.999+00:00").unwrap(),
+            "1969-12-31T23:59:59Z"
+        );
+        assert_eq!(
+            canonicalize_schedule_target("1900-01-01T00:00:00Z").unwrap(),
+            "1900-01-01T00:00:00Z"
+        );
+    }
+
+    // ── T7c/ME-3e: `validate_gate_action` (judgement 1/7/12) ───────────────
+
+    #[test]
+    fn schedule_callback_with_a_valid_target_is_accepted_and_canonicalized() {
+        let canonical =
+            validate_gate_action("schedule_callback", Some("2026-01-01T00:00:00.5Z")).unwrap();
+        assert_eq!(canonical.action, "schedule_callback");
+        assert_eq!(canonical.target, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn schedule_callback_without_a_target_is_invalid_target_not_forbidden() {
+        // Judgement 12: missing `target` is "in the closed set, bad
+        // arguments" (`InvalidTarget`/-32602), never `ActionNotInClosedSet`.
+        assert!(matches!(
+            validate_gate_action("schedule_callback", None),
+            Err(ApprovalRequestError::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn schedule_callback_with_an_unparseable_target_is_invalid_target() {
+        assert!(matches!(
+            validate_gate_action("schedule_callback", Some("whenever")),
+            Err(ApprovalRequestError::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn any_other_action_is_not_in_the_closed_set_exact_match_only() {
+        // Judgement 7: no trim, no case-insensitive compare.
+        for (action, target) in [
+            ("transfer_funds", None),
+            ("Schedule_Callback", Some("2026-01-01T00:00:00Z")),
+            (" schedule_callback", Some("2026-01-01T00:00:00Z")),
+            ("schedule_callback ", Some("2026-01-01T00:00:00Z")),
+            ("SCHEDULE_CALLBACK", Some("2026-01-01T00:00:00Z")),
+        ] {
+            assert!(
+                matches!(
+                    validate_gate_action(action, target),
+                    Err(ApprovalRequestError::ActionNotInClosedSet)
+                ),
+                "{action:?} should not be in the closed set"
+            );
+        }
+    }
+
+    // ── T7c/ME-3e: `insert()`'s `binding` derivation (judgement 11) ────────
+
+    #[tokio::test]
+    async fn insert_derives_binding_from_kind_gate_true_advise_false() {
+        let (broker, _events) = broker(Arc::new(SystemClock)).await;
+        let gate = broker
+            .submit(
+                "probe",
+                "req-gate",
+                ModuleApprovalKind::Gate,
+                "schedule_callback".to_owned(),
+                Some("2026-01-01T00:00:00Z".to_owned()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(gate.binding, "a Gate row must be binding");
+        assert_eq!(gate.executed_at, None, "not executed until scanned");
+
+        let advise = broker
+            .submit(
+                "probe",
+                "req-advise",
+                ModuleApprovalKind::Advise,
+                "schedule_callback".to_owned(),
+                Some("2026-01-01T00:00:00Z".to_owned()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(!advise.binding, "an Advise row must never be binding");
+    }
+
+    // ── T7c/ME-3e: end-to-end scan wiring (judgement 2/3/9/10/13/15) ───────
+
+    #[tokio::test]
+    async fn an_approved_schedule_callback_stays_unexecuted_until_its_target_is_reached() {
+        // Clock starts strictly BEFORE `target` (epoch 500 vs. target's
+        // epoch 1_000), so "approving alone does not execute it" and
+        // "target == now counts as reached" (judgement 13) can both be
+        // demonstrated without contradicting each other: the clock only
+        // reaches the target's exact instant after the approval.
+        let clock = TestClock::at(500);
+        let (broker, events) = broker(clock.clone()).await;
+        let mut rx = events.subscribe();
+        // `target` deliberately given with an offset and a fractional digit
+        // that is NOT epoch 1_000's canonical `now_iso` spelling — proving
+        // this whole flow goes through `canonicalize_schedule_target`, not a
+        // raw string compare. `ModuleApprovalBroker::submit`/`insert` are the
+        // low-level primitive both real callers (the wire handler,
+        // `PolicyApprovalBackend`) sit on top of — per their own doc
+        // comments, canonicalization is the CALLER's job, so this test does
+        // it explicitly here too, exactly as those callers do (their own
+        // dedicated tests in `approval_callback.rs`/`domain.rs` prove they
+        // actually call `validate_gate_action` before reaching this point).
+        let target_instant = agent24_core::util::iso8601_from_epoch_secs(1_000);
+        let raw_target = "1970-01-01T00:16:40.999+00:00"; // epoch 1000, +999ms
+        let canonical = validate_gate_action("schedule_callback", Some(raw_target)).unwrap();
+        assert_eq!(canonical.target, target_instant);
+        let submitted = broker
+            .submit(
+                "probe",
+                "req-1",
+                ModuleApprovalKind::Gate,
+                "schedule_callback".to_owned(),
+                Some(canonical.target.clone()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap(); // module-approval.required
+
+        let stored = broker.get(&submitted.approval_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.target.as_deref(),
+            Some(target_instant.as_str()),
+            "the stored target must be the canonicalized form"
+        );
+
+        // Judgement 2: pending, not yet approved — status keeps returning
+        // executed_at: null no matter how many times the scan runs.
+        broker.scan_once().await;
+        let status = broker
+            .status("probe", &submitted.approval_id)
+            .await
+            .unwrap();
+        assert_eq!(status.executed_at, None);
+
+        // Approve it (decision CAS) — this alone does not execute it: the
+        // clock (epoch 500) has not yet reached `target` (epoch 1_000).
+        broker
+            .decide(&submitted.approval_id, ModuleApprovalDecision::Approved)
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap(); // module-approval.resolved (decision)
+        broker.scan_once().await;
+        let status = broker
+            .status("probe", &submitted.approval_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            status.executed_at, None,
+            "approving alone must not execute it — only the scan, once target is reached, does"
+        );
+
+        // Advance the clock to EXACTLY the target's instant — no further.
+        clock.advance(500);
+
+        // The clock is ALREADY at the target's exact instant (judgement 13:
+        // `<=`, not `<`) — the very next scan must execute it, with no
+        // further advance needed.
+        broker.scan_once().await;
+        let status = broker
+            .status("probe", &submitted.approval_id)
+            .await
+            .unwrap();
+        assert_eq!(status.executed_at.as_deref(), Some(target_instant.as_str()));
+        // No extra WS event for "executed" this round (design doc: no
+        // RETURNING/per-row push) — nothing else should have arrived.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn denied_and_pending_schedule_callbacks_are_never_executed_even_once_their_target_passes()
+     {
+        // Judgement 4/10 at the broker/scan_once level (store-level CAS
+        // already covers this directly; this proves `scan_once` itself never
+        // routes a denied or still-pending row into execution).
+        let clock = TestClock::at(0);
+        let (broker, _events) = broker(clock.clone()).await;
+        let past_target = "1970-01-01T00:00:00Z"; // epoch 0 — already "due" at clock 0
+
+        let denied = broker
+            .submit(
+                "probe",
+                "req-denied",
+                ModuleApprovalKind::Gate,
+                "schedule_callback".to_owned(),
+                Some(past_target.to_owned()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        broker
+            .decide(&denied.approval_id, ModuleApprovalDecision::Denied)
+            .await
+            .unwrap();
+
+        let pending = broker
+            .submit(
+                "probe",
+                "req-pending",
+                ModuleApprovalKind::Gate,
+                "schedule_callback".to_owned(),
+                Some(past_target.to_owned()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        broker.scan_once().await;
+
+        let denied_status = broker.status("probe", &denied.approval_id).await.unwrap();
+        assert_eq!(denied_status.executed_at, None);
+        let pending_status = broker.status("probe", &pending.approval_id).await.unwrap();
+        assert_eq!(pending_status.executed_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_brokers_very_first_scan_catches_an_old_due_approved_row_no_startup_sweep_needed()
+     {
+        // Judgement 15: the "daemon restarted" scenario is just an ordinary
+        // scan against state nothing in memory remembers — a stateless
+        // conditional query, run for the first time, already covers it.
+        //
+        // This is tested across TWO SEPARATE `ModuleApprovalBroker`
+        // instances sharing the SAME underlying `Store` (`Store` is
+        // `Clone` over one pool) — broker A creates and approves the row,
+        // is then dropped entirely (simulating the daemon process exiting),
+        // and broker B — constructed fresh afterwards, with no shared
+        // in-memory state of its own — must catch it on ITS very first
+        // scan. Reusing one broker object for both halves (as an earlier
+        // version of this test did) would also pass if the row's
+        // persistence were broken, because nothing would have forced a
+        // reload from storage (Codex review, criterion 15).
+        let clock = TestClock::at(10_000);
+        let store = Store::open_memory().await.unwrap();
+        let events = crate::events::EventsHub::default();
+        let long_past_target = "1970-01-01T00:00:00Z";
+
+        let submitted = {
+            let broker_a =
+                ModuleApprovalBroker::with_clock(store.clone(), events.clone(), clock.clone());
+            let submitted = broker_a
+                .submit(
+                    "probe",
+                    "req-1",
+                    ModuleApprovalKind::Gate,
+                    "schedule_callback".to_owned(),
+                    Some(long_past_target.to_owned()),
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+            broker_a
+                .decide(&submitted.approval_id, ModuleApprovalDecision::Approved)
+                .await
+                .unwrap();
+            submitted
+            // `broker_a` is dropped here — nothing about broker B below
+            // reuses this instance.
+        };
+
+        let broker_b = ModuleApprovalBroker::with_clock(store, events, clock);
+        // The VERY FIRST call to `scan_once` on broker B.
+        broker_b.scan_once().await;
+
+        let status = broker_b
+            .status("probe", &submitted.approval_id)
+            .await
+            .unwrap();
+        assert!(
+            status.executed_at.is_some(),
+            "a freshly-constructed broker's first scan must pick up a row an \
+             earlier, now-dropped broker instance left approved and due"
+        );
+    }
+
+    // ── judgement 9 (end-to-end): a pre-1970 target is accepted at submit
+    // time AND actually gets executed by the scan, not just canonicalized
+    // in isolation (Codex review — the unit-level canonicalization test
+    // above does not by itself prove the scan's SQL string comparison
+    // still works for a pre-epoch value) ──────────────────────────────────
+    #[tokio::test]
+    async fn a_pre_epoch_target_is_accepted_at_submit_and_executed_by_the_scan() {
+        let clock = TestClock::at(0); // "now" == 1970-01-01T00:00:00Z
+        let (broker, _events) = broker(clock.clone()).await;
+        let pre_epoch_target = "1969-12-31T23:59:59Z";
+
+        let submitted = broker
+            .submit(
+                "probe",
+                "req-1",
+                ModuleApprovalKind::Gate,
+                "schedule_callback".to_owned(),
+                Some(pre_epoch_target.to_owned()),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("a past, pre-epoch target must be accepted at submission time");
+        let stored = broker.get(&submitted.approval_id).await.unwrap().unwrap();
+        assert_eq!(stored.target.as_deref(), Some(pre_epoch_target));
+
+        broker
+            .decide(&submitted.approval_id, ModuleApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        // "now" (epoch 0) is already past the pre-epoch target — the very
+        // next scan must execute it.
+        broker.scan_once().await;
+
+        let status = broker
+            .status("probe", &submitted.approval_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            status.executed_at.as_deref(),
+            Some("1970-01-01T00:00:00Z"),
+            "a pre-1970 target must be executed once its instant has passed, \
+             same as any other already-past target"
+        );
+    }
+
+    // ── judgement 8: concurrent scans race, exactly one executes the row ──
+
+    #[tokio::test]
+    async fn two_concurrent_execution_scans_execute_a_due_row_exactly_once() {
+        let clock = TestClock::at(0);
+        let (broker, _events) = broker(clock.clone()).await;
+        let submitted = broker
+            .submit(
+                "probe",
+                "req-1",
+                ModuleApprovalKind::Gate,
+                "schedule_callback".to_owned(),
+                Some("1970-01-01T00:00:00Z".to_owned()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        broker
+            .decide(&submitted.approval_id, ModuleApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        let now = now_iso(clock.as_ref());
+        let a = {
+            let store = broker.store.clone();
+            let now = now.clone();
+            tokio::spawn(async move { store.execute_due_schedule_callbacks(&now).await.unwrap() })
+        };
+        let b = {
+            let store = broker.store.clone();
+            let now = now.clone();
+            tokio::spawn(async move { store.execute_due_schedule_callbacks(&now).await.unwrap() })
+        };
+        let (a, b) = tokio::join!(a, b);
+        let total = a.unwrap() + b.unwrap();
+        assert_eq!(
+            total, 1,
+            "exactly one of the two concurrent scans must have executed the row"
+        );
+
+        let status = broker
+            .status("probe", &submitted.approval_id)
+            .await
+            .unwrap();
+        assert_eq!(status.executed_at.as_deref(), Some(now.as_str()));
+    }
+
+    // ── judgement 14: the two scan queries fail and succeed independently ──
+
+    #[tokio::test]
+    async fn the_execution_scan_can_fail_while_the_timeout_scan_still_succeeds() {
+        let clock = TestClock::at(0);
+        let (broker, events) = broker(clock.clone()).await;
+        let mut rx = events.subscribe();
+
+        // An expired PENDING row for the timeout scan to catch.
+        let expiring = broker
+            .submit(
+                "probe",
+                "req-expiring",
+                ModuleApprovalKind::Advise,
+                "a".to_owned(),
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap(); // module-approval.required
+        clock.advance(MODULE_APPROVAL_TTL_SECS + 1);
+
+        // Break ONLY the execution query: drop `target` (and its own
+        // partial index, which references it) — the timeout query never
+        // references `target` at all.
+        let pool = agent24_store::test_hooks::pool(&broker.store);
+        sqlx::query("DROP INDEX idx_module_approvals_pending_schedule")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE module_approvals DROP COLUMN target")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        broker.scan_once().await;
+
+        let (_ts, resolved) = rx.recv().await.unwrap();
+        assert_eq!(resolved.wire_type(), "module-approval.resolved");
+        let row = sqlx::query("SELECT decision FROM module_approvals WHERE id = ?")
+            .bind(&expiring.approval_id)
+            .fetch_one(agent24_store::test_hooks::pool(&broker.store))
+            .await
+            .unwrap();
+        let decision: String = row.get("decision");
+        assert_eq!(
+            decision, "timed_out",
+            "the timeout scan must still have succeeded even though the execution \
+             scan's query failed this same cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_timeout_scan_can_fail_while_the_execution_scan_still_succeeds() {
+        let clock = TestClock::at(0);
+        let (broker, _events) = broker(clock.clone()).await;
+
+        let submitted = broker
+            .submit(
+                "probe",
+                "req-1",
+                ModuleApprovalKind::Gate,
+                "schedule_callback".to_owned(),
+                Some("1970-01-01T00:00:00Z".to_owned()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        broker
+            .decide(&submitted.approval_id, ModuleApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        // Break ONLY the timeout query: drop its own dedicated partial index
+        // and the `expires_at` column it filters on — the execution query
+        // never references `expires_at` at all.
+        let pool = agent24_store::test_hooks::pool(&broker.store);
+        sqlx::query("DROP INDEX idx_module_approvals_pending_expiry")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE module_approvals DROP COLUMN expires_at")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        broker.scan_once().await;
+
+        let row = sqlx::query("SELECT executed_at FROM module_approvals WHERE id = ?")
+            .bind(&submitted.approval_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let executed_at: Option<String> = row.get("executed_at");
+        assert!(
+            executed_at.is_some(),
+            "the execution scan must still have succeeded even though the timeout \
+             scan's query failed this same cycle"
         );
     }
 }
