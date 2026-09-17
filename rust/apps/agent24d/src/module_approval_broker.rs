@@ -96,13 +96,25 @@ fn canonicalize_schedule_target(target: &str) -> Result<String, ApprovalRequestE
             "leap seconds are not accepted in a target".to_owned(),
         ));
     }
+    let utc = parsed.with_timezone(&chrono::Utc);
+    // `execute_due_schedule_callbacks` compares `target <= now` as a plain
+    // SQL string, which is only equivalent to a real time comparison when
+    // every stored string is the same fixed 4-digit-year width. A year
+    // outside 0000..=9999 makes `%Y` emit a different number of digits
+    // (`10000-...` sorts as LESS than `2026-...` because '1' < '2'),
+    // silently reordering the timeline and making the row look already due.
+    // Reject those instead of canonicalizing them.
+    use chrono::Datelike;
+    let year = utc.year();
+    if !(0..=9999).contains(&year) {
+        return Err(ApprovalRequestError::InvalidTarget(
+            "target year must be within 0000..=9999 (fixed 4-digit-year comparison)".to_owned(),
+        ));
+    }
     // `%S` prints the whole-second field only — the fractional part is
     // simply never emitted, which IS the truncation (flooring) judgement 13
     // requires; there is no rounding step to get wrong.
-    Ok(parsed
-        .with_timezone(&chrono::Utc)
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string())
+    Ok(utc.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 /// Mint a 32-byte random, hex-encoded id (design doc decision 3:
@@ -812,6 +824,27 @@ mod tests {
         assert_eq!(
             canonicalize_schedule_target("1900-01-01T00:00:00Z").unwrap(),
             "1900-01-01T00:00:00Z"
+        );
+    }
+
+    // ── year ≥ 10000 breaks the fixed-4-digit-width assumption that makes
+    // `execute_due_schedule_callbacks`'s SQL string comparison (`target <=
+    // now`) equivalent to a real time comparison — "10000-..." sorts BEFORE
+    // "2026-..." lexicographically, which would make a far-future target
+    // fire immediately (independently found in review). Reject it instead. ─
+    #[test]
+    fn a_target_with_a_five_digit_year_is_rejected_not_silently_misordered() {
+        assert!(matches!(
+            canonicalize_schedule_target("10000-01-01T00:00:00Z"),
+            Err(ApprovalRequestError::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn the_last_four_digit_year_is_still_accepted() {
+        assert_eq!(
+            canonicalize_schedule_target("9999-12-31T23:59:59Z").unwrap(),
+            "9999-12-31T23:59:59Z"
         );
     }
 
