@@ -82,6 +82,72 @@ struct Bucket {
     last: Instant,
 }
 
+/// T8.5c-P (design §6.2, "负成本 Low"): the number of tokens one
+/// [`RateLimiter::try_acquire_weighted`] call spends. A non-negative integer
+/// *by construction* — there is no path from a caller-supplied `f64` (which
+/// could be negative, `NaN`, or `Infinity`, any of which would corrupt
+/// [`Bucket::tokens`]'s invariant) to a `ScanCost`, so this holds in release
+/// builds exactly as in debug ones, unlike a `debug_assert!` that a release
+/// build compiles away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCost(u32);
+
+// `from_rows`/`from_rows_const`/`saturating_add`/`as_u32` are exercised by
+// `os_memory_page.rs`'s tests and will be exercised by `main()` once T8.5c-W
+// wires `OsScopedMemory::{remember_checked,recall_page,recent_page}`
+// (`os_memory.rs`) into a real RPC handler — see that module's doc comment
+// for why nothing does yet. `dead_code`'s reachability analysis for a binary
+// crate starts at `main` and does not see `#[cfg(test)]` code, so these are
+// flagged from the plain `--bin` target despite being real, tested code.
+#[allow(dead_code)]
+impl ScanCost {
+    pub const ONE: ScanCost = ScanCost(1);
+
+    /// `recall`/`recent`'s scanning cost is a row count — always a
+    /// non-negative `usize` at the call site, but this still refuses to
+    /// silently truncate a `usize` that happens to exceed `u32::MAX` rather
+    /// than wrapping it into a smaller, wrong cost.
+    #[must_use]
+    pub fn from_rows(rows: usize) -> ScanCost {
+        ScanCost(u32::try_from(rows).unwrap_or(u32::MAX))
+    }
+
+    /// `const fn` counterpart of [`Self::from_rows`], for defining `const`
+    /// costs (`.expect()` is not available in a `const fn` on a `Result`).
+    /// Every call site today is a small literal
+    /// (`MEMORY_SCAN_ROW_BUDGET`/`ROW_BUFFER_MARGIN`), far below `u32::MAX` —
+    /// this `assert!` turns a future call site that is not into a compile
+    /// error instead of a silently truncated constant (T8.5c-P §6.2, "溢出截断
+    /// Low").
+    #[must_use]
+    pub const fn from_rows_const(rows: usize) -> ScanCost {
+        assert!(
+            rows <= u32::MAX as usize,
+            "ScanCost::from_rows_const: rows must fit in u32, or the cast below \
+             silently truncates a compile-time constant"
+        );
+        ScanCost(rows as u32)
+    }
+
+    /// Saturating addition, for combining a scan count with a margin at
+    /// settlement time (T8.5c-P §6.4) without risking a panic on overflow —
+    /// the result is then clamped again against `reserved`, so saturation
+    /// here never inflates a real charge.
+    #[must_use]
+    pub const fn saturating_add(self, other: ScanCost) -> ScanCost {
+        ScanCost(self.0.saturating_add(other.0))
+    }
+
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    fn as_f64(self) -> f64 {
+        self.0 as f64
+    }
+}
+
 /// A per-`Generation` token bucket (design §5): capacity and refill rate are
 /// fixed at construction, refill is computed lazily on each call, and the
 /// check-and-decrement happens as ONE step under a single lock — never
@@ -120,7 +186,22 @@ impl RateLimiter {
     /// Refill lazily (`min(capacity, tokens + elapsed * refill_per_sec)`),
     /// then try to spend exactly one token, all under one lock. `true` if a
     /// token was spent, `false` if the bucket was empty.
+    ///
+    /// T8.5c-P (design §6.2): now sugar for
+    /// [`Self::try_acquire_weighted`]`(ScanCost::ONE)` — `_a24/events/emit`'s
+    /// existing call sites and behaviour are unchanged (still exactly one
+    /// token), the weighted form is purely additive.
     pub fn try_acquire(&self) -> bool {
+        self.try_acquire_weighted(ScanCost::ONE)
+    }
+
+    /// Same lock, same lazily-computed refill, same single check-and-decrement
+    /// step as [`Self::try_acquire`] — just spending `cost` tokens instead of
+    /// a fixed one (T8.5c-P design §6.2). `ScanCost` already excludes
+    /// negative/NaN/infinite costs at the type level, so there is nothing left
+    /// to validate here.
+    pub fn try_acquire_weighted(&self, cost: ScanCost) -> bool {
+        let cost = cost.as_f64();
         let mut bucket = self
             .bucket
             .lock()
@@ -129,12 +210,33 @@ impl RateLimiter {
         let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         bucket.last = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
+        if bucket.tokens >= cost {
+            bucket.tokens -= cost;
             true
         } else {
             false
         }
+    }
+
+    /// Return `amount` tokens to the bucket, clamped at `capacity` (T8.5c-P
+    /// design §6.4, decision P5b's reservation/refund model). Shares the same
+    /// lock as `try_acquire_weighted` so a concurrent spend and a concurrent
+    /// refund can never interleave into a torn read-modify-write on
+    /// `bucket.tokens`. Deliberately does NOT recompute the lazy refill (does
+    /// not touch `bucket.last`): a refund undoes part of a specific earlier
+    /// reservation, it is not time passing, and conflating the two would make
+    /// "how much of this bucket's current level came from elapsed time vs.
+    /// from a refund" unrecoverable from the state alone.
+    // See the comment on `impl ScanCost` above: real, tested code
+    // (`Reservation::commit`/`Drop`, `os_memory_page.rs`) with no caller
+    // reachable from `main` yet.
+    #[allow(dead_code)]
+    pub(crate) fn refund(&self, amount: u32) {
+        let mut bucket = self
+            .bucket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bucket.tokens = (bucket.tokens + amount as f64).min(self.capacity);
     }
 }
 
@@ -834,6 +936,120 @@ mod tests {
         // The one token is gone even though the call "failed":
         let err2 = h.call(good_params()).await.unwrap_err();
         assert_eq!(err2.kind, Some(ErrorKind::RateLimited));
+    }
+
+    // ── T8.5c-P: `ScanCost`/`try_acquire_weighted`/`refund` — direct unit
+    // coverage of the weighted-limiter primitive itself, independent of the
+    // T8.5c-P pagination/reservation state machine that will consume it
+    // (`os_memory_page.rs`, which has its own extensive judgement suite).
+    // These exist so this extension isn't shipped with zero coverage of its
+    // own basic contract: `try_acquire` is unchanged sugar for a 1-token
+    // weighted acquire, a weighted acquire spends exactly `cost` tokens
+    // (never more, never less), an over-cost acquire fails and leaves the
+    // bucket untouched, and `refund` gives tokens back without exceeding
+    // capacity. ──
+
+    #[test]
+    fn try_acquire_is_unchanged_sugar_for_a_one_token_weighted_acquire() {
+        let clock = Arc::new(TestClock::frozen_at(Instant::now()));
+        let limiter = RateLimiter::with_clock(1.0, 0.0, clock);
+        assert!(limiter.try_acquire(), "the single token must be spendable");
+        assert!(
+            !limiter.try_acquire(),
+            "try_acquire must spend exactly ScanCost::ONE, not less"
+        );
+    }
+
+    #[test]
+    fn try_acquire_weighted_spends_exactly_cost_tokens_not_more_or_less() {
+        let clock = Arc::new(TestClock::frozen_at(Instant::now()));
+        let limiter = RateLimiter::with_clock(10.0, 0.0, clock);
+        assert!(
+            limiter.try_acquire_weighted(ScanCost::from_rows_const(7)),
+            "7 of 10 tokens must be affordable"
+        );
+        // Exactly 3 remain: a further cost-3 acquire succeeds, a subsequent
+        // cost-1 acquire (which would need a 4th token) fails.
+        assert!(
+            limiter.try_acquire_weighted(ScanCost::from_rows_const(3)),
+            "exactly the remaining 3 tokens must be affordable, not fewer"
+        );
+        assert!(
+            !limiter.try_acquire_weighted(ScanCost::ONE),
+            "the bucket must now be fully spent, not left with slack"
+        );
+    }
+
+    #[test]
+    fn an_over_cost_acquire_fails_and_leaves_the_bucket_untouched() {
+        let clock = Arc::new(TestClock::frozen_at(Instant::now()));
+        let limiter = RateLimiter::with_clock(5.0, 0.0, clock);
+        assert!(
+            !limiter.try_acquire_weighted(ScanCost::from_rows_const(6)),
+            "a cost exceeding capacity must be refused outright"
+        );
+        // The refusal must not have partially spent the bucket: all 5
+        // tokens are still individually acquirable afterwards.
+        for _ in 0..5 {
+            assert!(
+                limiter.try_acquire(),
+                "a failed over-cost acquire must not have left the bucket partially spent"
+            );
+        }
+        assert!(!limiter.try_acquire(), "and no more than the original 5");
+    }
+
+    #[test]
+    fn refund_returns_tokens_without_exceeding_capacity() {
+        let clock = Arc::new(TestClock::frozen_at(Instant::now()));
+        let limiter = RateLimiter::with_clock(5.0, 0.0, clock);
+        assert!(limiter.try_acquire_weighted(ScanCost::from_rows_const(5)));
+        assert!(
+            !limiter.try_acquire(),
+            "bucket must be empty before the refund"
+        );
+        limiter.refund(3);
+        assert!(
+            limiter.try_acquire_weighted(ScanCost::from_rows_const(3)),
+            "the refunded 3 tokens must be spendable"
+        );
+        assert!(
+            !limiter.try_acquire(),
+            "a refund must not have overshot what was actually spent"
+        );
+
+        // Refunding past capacity must clamp, not overflow the bucket into a
+        // state where it can spend more than `capacity` at once.
+        limiter.refund(1_000);
+        assert!(
+            !limiter.try_acquire_weighted(ScanCost::from_rows_const(6)),
+            "a refund must clamp at capacity, never let the bucket exceed it"
+        );
+        assert!(limiter.try_acquire_weighted(ScanCost::from_rows_const(5)));
+    }
+
+    #[test]
+    fn scan_cost_saturating_add_does_not_panic_or_wrap_on_overflow() {
+        let near_max = ScanCost::from_rows(u32::MAX as usize - 1);
+        let summed = near_max.saturating_add(ScanCost::from_rows_const(10));
+        assert_eq!(
+            summed.as_u32(),
+            u32::MAX,
+            "must saturate at u32::MAX, not wrap around to a small value"
+        );
+    }
+
+    #[test]
+    fn scan_cost_from_rows_truncates_an_oversized_usize_to_u32_max_not_wrapping() {
+        // A `usize` that overflows `u32` must become `u32::MAX`, not silently
+        // wrap into an arbitrary small `u32` via `as` — this is the runtime
+        // (`usize` input) counterpart of `from_rows_const`'s compile-time
+        // `assert!` for the same failure mode.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let oversized = u32::MAX as usize + 1;
+            assert_eq!(ScanCost::from_rows(oversized).as_u32(), u32::MAX);
+        }
     }
 
     // ── judgement 16: forbidden + malformed params → -32602, not forbidden ──
