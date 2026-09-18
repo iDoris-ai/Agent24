@@ -65,6 +65,19 @@ pub enum MemoryError {
     /// non-finite component (review #123 M1/M2/M3).
     #[error("embedder: {0}")]
     Embedder(String),
+    /// T8.5b: `owner` is at its `mem_owner_quota` limit on the given
+    /// `dimension` (`"rows"` or `"bytes"`). Raised by the `mem_events_bi_quota`
+    /// trigger (migration 0014) as `RAISE(ABORT, 'mem_quota:rows'|'mem_quota:bytes')`
+    /// and mapped here from the raw `sqlx::Error::Database` — see
+    /// `event::map_quota_error` — so a caller can match this instead of parsing
+    /// a SQLite error message. A precise replay of an id that already exists
+    /// never reaches this: the trigger's `WHEN NOT EXISTS(...)` guard makes a
+    /// true no-op replay skip the quota check entirely, at any usage level.
+    #[error("quota exceeded for owner {owner:?}: {dimension} limit reached")]
+    QuotaExceeded {
+        owner: String,
+        dimension: &'static str,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -120,6 +133,22 @@ pub struct OsPartitionIdentity<'a> {
 /// `mem_events` and `mem_checkpoints` are absent because they ARE moved. The
 /// assertion FTS shadow is absent because it is trigger-maintained from
 /// `mem_assertions`, which is here.
+///
+/// T8.5b's `mem_owner_usage` (migration 0014) is ALSO deliberately absent, for
+/// the same "it is moved, not checked" reason — but it earns its own line
+/// because the failure mode of getting this wrong is worse than for the tables
+/// above. `mem_owner_usage` gets a row for essentially every `owner` that has
+/// EVER written an event (the `mem_events_ai_usage` trigger creates one on
+/// first insert), so almost every legacy partition already has one. Adding it
+/// here would make rekey refuse almost every partition it is ever asked to
+/// move, not just the rare one that genuinely still holds orphanable data. It
+/// does not need checking because it is not orphanable: `mem_events_au_owner_usage`
+/// (0014) is an `AFTER UPDATE OF scope_owner ON mem_events` trigger, so it
+/// fires automatically, row by row, as part of `rekey_os_partition`'s own
+/// `UPDATE mem_events SET scope_owner = ?` — the usage counters follow the
+/// events they describe without `rekey_os_partition` knowing this table
+/// exists. Do not "fix" this by adding `mem_owner_usage` here; that would
+/// re-break the thing this comment exists to prevent.
 ///
 /// A new owner-scoped table must be added to this list or explicitly moved.
 /// Nothing enforces that mechanically — a schema-introspecting test was
@@ -1458,5 +1487,177 @@ mod tests {
             Some(serde_json::json!("v"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- T8.5b: rekey + mem_owner_usage (migration 0014) ----
+
+    async fn t85b_usage_of(pool: &SqlitePool, owner: &str) -> (i64, i64) {
+        sqlx::query("SELECT row_count, byte_count FROM mem_owner_usage WHERE owner = ?")
+            .bind(owner)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .map(|r| (r.get::<i64, _>("row_count"), r.get::<i64, _>("byte_count")))
+            .unwrap_or((0, 0))
+    }
+
+    #[tokio::test]
+    async fn t85b_rekey_moves_owner_usage_authoritatively_and_new_key_is_quota_enforced() {
+        // Judgement 9 (a core one) — and confirms the design doc's decision 6:
+        // mem_owner_usage is NOT in OTHER_OWNER_SCOPED_TABLES, so this rekey is
+        // not refused (every partition with history already has a usage row —
+        // if it WERE in that list, this test's rekey call would fail). Usage is
+        // instead MOVED, as a side effect of rekey_os_partition's own
+        // `UPDATE mem_events SET scope_owner = ?`, which the
+        // mem_events_au_owner_usage trigger (0014) picks up row by row.
+        let kv = KvStore::open_memory().await.unwrap();
+        let org = kv.ensure_org_for_user("alice").await.unwrap();
+        kv.record_os_partition(OsPartitionIdentity {
+            owner_key: "old",
+            key_version: "v1",
+            org_id: &org,
+            space_id: "os:sin90",
+            user: "alice",
+            module: "sin90",
+        })
+        .await
+        .unwrap();
+        let log = kv.events();
+        for id in ["e1", "e2", "e3"] {
+            log.append(&event::MemEvent::new(
+                id,
+                event::Scope::owner("old"),
+                "note",
+                serde_json::json!({"k": id}),
+                event::Origin {
+                    source: "test".into(),
+                    trust: event::Trust::ToolOutput,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+        let (old_rows, old_bytes) = t85b_usage_of(&kv.pool, "old").await;
+        assert_eq!(old_rows, 3);
+        assert!(old_bytes > 0);
+
+        assert_eq!(kv.rekey_os_partition("old", "new", "v2").await.unwrap(), 3);
+
+        let (new_rows, new_bytes) = t85b_usage_of(&kv.pool, "new").await;
+        assert_eq!(
+            new_rows, 3,
+            "usage must equal the events actually moved under new_key"
+        );
+        assert_eq!(new_bytes, old_bytes, "byte total travels with the rows");
+        let actual: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mem_events WHERE scope_owner = ?")
+                .bind("new")
+                .fetch_one(&kv.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            new_rows, actual,
+            "mem_owner_usage must agree with mem_events' real row count"
+        );
+
+        // old_key is zeroed — an accurate "nothing here now", not a stale claim.
+        assert_eq!(t85b_usage_of(&kv.pool, "old").await, (0, 0));
+
+        // Quota now follows the MOVED owner: tighten new_key's row limit to
+        // exactly its current usage and confirm the very next write is rejected
+        // — rekey does not leave the new owner "looking like zero usage" and
+        // therefore unenforceable (the second bad outcome the task description
+        // named).
+        sqlx::query(
+            "INSERT INTO mem_owner_quota (owner, max_rows, max_bytes) VALUES (?, ?, 268435456)
+             ON CONFLICT(owner) DO UPDATE SET max_rows = excluded.max_rows",
+        )
+        .bind("new")
+        .bind(new_rows)
+        .execute(&kv.pool)
+        .await
+        .unwrap();
+        let err = log
+            .append(&event::MemEvent::new(
+                "e4",
+                event::Scope::owner("new"),
+                "note",
+                serde_json::json!({}),
+                event::Origin {
+                    source: "test".into(),
+                    trust: event::Trust::ToolOutput,
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                MemoryError::QuotaExceeded { owner, dimension: "rows" } if owner == "new"
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_rekey_refusal_leaves_owner_usage_unchanged() {
+        // Judgement 10 — mirrors `a_rekey_refuses_when_another_owner_scoped_table_holds_rows`
+        // above: when rekey refuses because another owner-scoped table still
+        // holds rows, mem_owner_usage must not have been touched by the refused
+        // attempt either.
+        let kv = KvStore::open_memory().await.unwrap();
+        let org = kv.ensure_org_for_user("alice").await.unwrap();
+        kv.record_os_partition(OsPartitionIdentity {
+            owner_key: "old",
+            key_version: "v1",
+            org_id: &org,
+            space_id: "os:sin90",
+            user: "alice",
+            module: "sin90",
+        })
+        .await
+        .unwrap();
+        kv.events()
+            .append(&event::MemEvent::new(
+                "e1",
+                event::Scope::owner("old"),
+                "note",
+                serde_json::json!({}),
+                event::Origin {
+                    source: "test".into(),
+                    trust: event::Trust::ToolOutput,
+                },
+            ))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO mem_instructions
+                 (scope_owner, id, layer, priority, body, triggers, status, at)
+             VALUES (?, 'i1', 'global', 0, 'remember this', '[]', 'active', ?)",
+        )
+        .bind("old")
+        .bind(now_iso8601())
+        .execute(&kv.pool)
+        .await
+        .unwrap();
+
+        let before = t85b_usage_of(&kv.pool, "old").await;
+
+        let err = kv
+            .rekey_os_partition("old", "new", "v2")
+            .await
+            .expect_err("a partition with rows this cannot move must not move");
+        assert!(matches!(err, MemoryError::Conflict(_)), "{err}");
+
+        assert_eq!(
+            t85b_usage_of(&kv.pool, "old").await,
+            before,
+            "a refused rekey must not have touched the old owner's usage"
+        );
+        assert_eq!(
+            t85b_usage_of(&kv.pool, "new").await,
+            (0, 0),
+            "a refused rekey must not create a usage row for the never-realized new owner"
+        );
     }
 }

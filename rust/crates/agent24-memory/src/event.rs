@@ -25,6 +25,35 @@ pub type EventId = String;
 /// never fetch an unbounded set (review #114 B3).
 const DEFAULT_SCAN_LIMIT: i64 = 50_000;
 
+/// T8.5b: map a `mem_events_bi_quota` trigger's `RAISE(ABORT, 'mem_quota:rows')`
+/// / `RAISE(ABORT, 'mem_quota:bytes')` (migration 0014) to a typed
+/// [`crate::MemoryError::QuotaExceeded`], leaving every other database error —
+/// a UNIQUE violation on `id`, a CHECK failure, anything else — untouched and
+/// passed through as `MemoryError::Sqlx` exactly as before. The prefix match
+/// (rather than exact equality) is deliberate: it is the contract with the
+/// trigger's message text, not a parse of a structured error code — SQLite has
+/// none for a custom `RAISE(ABORT, ...)` message, so a fixed string prefix is
+/// the only channel available, verified against a live `sqlite3` connection to
+/// round-trip through `sqlx::Error::Database::message()` unmodified.
+fn map_quota_error(owner: &str) -> impl FnOnce(sqlx::Error) -> crate::MemoryError {
+    let owner = owner.to_owned();
+    move |e| match &e {
+        sqlx::Error::Database(db) if db.message().starts_with("mem_quota:rows") => {
+            crate::MemoryError::QuotaExceeded {
+                owner,
+                dimension: "rows",
+            }
+        }
+        sqlx::Error::Database(db) if db.message().starts_with("mem_quota:bytes") => {
+            crate::MemoryError::QuotaExceeded {
+                owner,
+                dimension: "bytes",
+            }
+        }
+        _ => crate::MemoryError::from(e),
+    }
+}
+
 /// Where a memory belongs. `owner` is MANDATORY; the rest narrow it. Used for
 /// isolation and (MD-4+) capability-scoped access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +316,8 @@ impl EventLog {
         .bind(&causal)
         .bind(&e.at)
         .execute(&mut *conn)
-        .await?;
+        .await
+        .map_err(map_quota_error(&e.scope.owner))?;
         Ok(())
     }
 
@@ -340,7 +370,8 @@ impl EventStore for EventLog {
         .bind(&causal)
         .bind(&e.at)
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(map_quota_error(&e.scope.owner))?;
         if let Some(row) = inserted {
             return Ok(row.get("seq"));
         }
@@ -895,5 +926,600 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["e6", "e5"]
         );
+    }
+
+    // ---- T8.5b: authoritative event usage counting + quota (migration 0014) ----
+    // See docs/design/T8.5b-authoritative-quota.md for the judgement list these
+    // tests are named after.
+
+    async fn usage_of(pool: &SqlitePool, owner: &str) -> (i64, i64) {
+        sqlx::query("SELECT row_count, byte_count FROM mem_owner_usage WHERE owner = ?")
+            .bind(owner)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .map(|r| (r.get::<i64, _>("row_count"), r.get::<i64, _>("byte_count")))
+            .unwrap_or((0, 0))
+    }
+
+    async fn set_quota(pool: &SqlitePool, owner: &str, max_rows: i64, max_bytes: i64) {
+        sqlx::query(
+            "INSERT INTO mem_owner_quota (owner, max_rows, max_bytes) VALUES (?, ?, ?)
+             ON CONFLICT(owner) DO UPDATE SET
+                 max_rows = excluded.max_rows, max_bytes = excluded.max_bytes",
+        )
+        .bind(owner)
+        .bind(max_rows)
+        .bind(max_bytes)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn payload_bytes(e: &MemEvent) -> i64 {
+        serde_json::to_string(&e.body).unwrap().len() as i64
+    }
+
+    #[tokio::test]
+    async fn t85b_append_and_append_tx_both_authoritatively_update_usage() {
+        // Judgement 1: EventLog::append (the &pool path) and EventLog::append_tx
+        // (the caller's own transaction — writer.rs::commit_with_audit's only
+        // production call site) both update mem_owner_usage without either one
+        // calling anything that says "update usage": the trigger attached to
+        // mem_events does it, not the Rust call site.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        let e1 = ev("via-pool", "u1", None, "msg");
+        log.append(&e1).await.unwrap();
+        assert_eq!(usage_of(&kv.pool, "u1").await, (1, payload_bytes(&e1)));
+
+        let e2 = ev("via-tx", "u1", None, "msg");
+        let mut tx = kv.pool.begin().await.unwrap();
+        EventLog::append_tx(&mut tx, &e2).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            usage_of(&kv.pool, "u1").await,
+            (2, payload_bytes(&e1) + payload_bytes(&e2)),
+            "append_tx's insert is covered by mem_events_ai_usage with no explicit call"
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_authoritative_via_raw_sql_insert_bypassing_event_log() {
+        // Judgement 2: covers the TABLE, not the call site — a raw INSERT that
+        // never goes through any EventLog method (standing in for a future write
+        // path that forgets to) still updates mem_owner_usage correctly.
+        let kv = KvStore::open_memory().await.unwrap();
+        let payload = r#"{"x":1}"#;
+        sqlx::query(
+            "INSERT INTO mem_events
+                 (id, scope_owner, scope_session, scope, kind, payload,
+                  origin_source, origin_trust, causal, at)
+             VALUES ('raw-1', 'u1', NULL, '{}', 'note', ?, 't', 'user_said', '[]', '2020-01-01')",
+        )
+        .bind(payload)
+        .execute(&kv.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            usage_of(&kv.pool, "u1").await,
+            (1, payload.len() as i64),
+            "a raw INSERT that never touches EventLog is still covered by the trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_authoritative_via_raw_sql_delete() {
+        // Judgement 3: mirrors consolidator.rs's #[cfg(test)] raw
+        // `DELETE FROM mem_events` — the one existing path that deletes from the
+        // append-only log at all, entirely outside EventLog.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        let e1 = ev("d1", "u1", None, "note");
+        let e2 = ev("d2", "u1", None, "note");
+        log.append(&e1).await.unwrap();
+        log.append(&e2).await.unwrap();
+        assert_eq!(
+            usage_of(&kv.pool, "u1").await,
+            (2, payload_bytes(&e1) + payload_bytes(&e2))
+        );
+
+        sqlx::query("DELETE FROM mem_events WHERE id = 'd1'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_of(&kv.pool, "u1").await, (1, payload_bytes(&e2)));
+    }
+
+    #[tokio::test]
+    async fn t85b_raw_sql_update_of_payload_is_refused_not_silently_desyncing_usage() {
+        // Low (Codex code review, follow-up): none of the three usage-
+        // maintaining triggers fire on (or account for) a change to the
+        // `payload` column itself — only INSERT, UPDATE OF scope_owner, and
+        // DELETE were covered. A raw `UPDATE mem_events SET payload = ...`
+        // would silently desync `byte_count` from reality and bypass the byte
+        // quota forever (the quota gate only runs on INSERT). Refused outright
+        // instead, matching the append-only invariant the design already
+        // claims for this table.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        let e1 = ev("immutable-1", "u1", None, "note");
+        log.append(&e1).await.unwrap();
+        let before = usage_of(&kv.pool, "u1").await;
+
+        let err =
+            sqlx::query("UPDATE mem_events SET payload = '\"changed\"' WHERE id = 'immutable-1'")
+                .execute(&kv.pool)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, sqlx::Error::Database(_)), "{err}");
+        assert_eq!(
+            usage_of(&kv.pool, "u1").await,
+            before,
+            "a refused payload update must not have touched usage"
+        );
+
+        // Positive control: updating a DIFFERENT column on the same row (the
+        // one write shape that IS meant to happen, for a different reason —
+        // rekey) is unaffected by this guard.
+        sqlx::query("UPDATE mem_events SET scope_owner = 'u2' WHERE id = 'immutable-1'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_of(&kv.pool, "u2").await, before);
+    }
+
+    #[tokio::test]
+    async fn t85b_real_byte_counting_is_utf8_bytes_not_char_count() {
+        // Judgement 4. The ASCII case is a POSITIVE CONTROL: char count and byte
+        // count coincide there, so it alone cannot distinguish a correct
+        // implementation from the char-counting bug the design doc's decision 3
+        // records (SQLite's plain LENGTH() on TEXT).
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+
+        let mut ascii = ev("ascii", "ascii_owner", None, "note");
+        ascii.body = serde_json::json!("xxxxxxxxxx");
+        log.append(&ascii).await.unwrap();
+        let ascii_payload = serde_json::to_string(&ascii.body).unwrap();
+        assert_eq!(ascii_payload.chars().count(), ascii_payload.len());
+        assert_eq!(
+            usage_of(&kv.pool, "ascii_owner").await.1,
+            ascii_payload.len() as i64
+        );
+
+        let mut emoji = ev("emoji", "emoji_owner", None, "note");
+        emoji.body = serde_json::json!("🎉🎉🎉🎉");
+        log.append(&emoji).await.unwrap();
+        let emoji_payload = serde_json::to_string(&emoji.body).unwrap();
+        assert!(
+            emoji_payload.chars().count() < emoji_payload.len(),
+            "the fixture itself must be multi-byte or this test proves nothing"
+        );
+        let (_, bytes) = usage_of(&kv.pool, "emoji_owner").await;
+        assert_eq!(
+            bytes,
+            emoji_payload.len() as i64,
+            "byte_count must be UTF-8 bytes, not Unicode characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_quota_blocks_exactly_at_row_limit_and_leaves_usage_unchanged() {
+        // Judgement 5.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        set_quota(&kv.pool, "capped", 2, 268_435_456).await;
+
+        log.append(&ev("r1", "capped", None, "note")).await.unwrap();
+        log.append(&ev("r2", "capped", None, "note")).await.unwrap();
+        let before = usage_of(&kv.pool, "capped").await;
+        assert_eq!(before.0, 2);
+
+        let err = log
+            .append(&ev("r3", "capped", None, "note"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::MemoryError::QuotaExceeded { owner, dimension: "rows" } if owner == "capped"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            usage_of(&kv.pool, "capped").await,
+            before,
+            "a rejected insert must not have partially updated usage"
+        );
+
+        // Positive control: a DIFFERENT owner is unaffected by "capped"'s limit.
+        log.append(&ev("r3", "other", None, "note")).await.unwrap();
+        assert_eq!(usage_of(&kv.pool, "other").await.0, 1);
+    }
+
+    #[tokio::test]
+    async fn t85b_quota_blocks_exactly_at_byte_limit_and_leaves_usage_unchanged() {
+        // Judgement 6.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+
+        let mut first = ev("b1", "byte_capped", None, "note");
+        first.body = serde_json::json!("x");
+        let first_bytes = payload_bytes(&first);
+
+        // Room for exactly one more 10-byte write, not two.
+        set_quota(&kv.pool, "byte_capped", 200_000, first_bytes + 10).await;
+        log.append(&first).await.unwrap();
+
+        let mut second = ev("b2", "byte_capped", None, "note");
+        second.body = serde_json::json!("xxxxxxxx"); // 8 chars + 2 quotes = 10 bytes as JSON
+        let second_bytes = payload_bytes(&second);
+        assert_eq!(
+            second_bytes, 10,
+            "fixture must land exactly on the boundary"
+        );
+        log.append(&second).await.unwrap();
+        let before = usage_of(&kv.pool, "byte_capped").await;
+        assert_eq!(
+            before,
+            (2, first_bytes + 10),
+            "exactly AT the limit must be allowed, not rejected"
+        );
+
+        let mut third = ev("b3", "byte_capped", None, "note");
+        third.body = serde_json::json!("x");
+        let err = log.append(&third).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::MemoryError::QuotaExceeded { owner, dimension: "bytes" } if owner == "byte_capped"
+            ),
+            "{err}"
+        );
+        assert_eq!(usage_of(&kv.pool, "byte_capped").await, before);
+    }
+
+    #[tokio::test]
+    async fn t85b_idempotent_replay_skips_quota_check_even_when_full() {
+        // Judgement 7 (the core one): the WHEN NOT EXISTS guard on
+        // mem_events_bi_quota must let a true replay through untouched, even at
+        // 100% quota — and still reject a genuinely new id at the same quota.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        set_quota(&kv.pool, "full", 1, 268_435_456).await;
+
+        let e1 = ev("only", "full", None, "note");
+        let s1 = log.append(&e1).await.unwrap();
+        let before = usage_of(&kv.pool, "full").await;
+        assert_eq!(before.0, 1);
+
+        let s2 = log.append(&e1).await.unwrap();
+        assert_eq!(s1, s2, "a true replay must return the same seq");
+        assert_eq!(
+            usage_of(&kv.pool, "full").await,
+            before,
+            "a replay must not touch usage, even at full quota"
+        );
+
+        // Positive control: a brand-new id at the SAME full quota IS rejected.
+        let err = log
+            .append(&ev("new", "full", None, "note"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::MemoryError::QuotaExceeded { .. }),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_cross_owner_id_collision_at_full_quota_is_conflict_not_quota_exceeded() {
+        // Judgement 8: the WHEN NOT EXISTS guard only looks at whether `id`
+        // exists, not who owns it or what it contains — so a cross-owner id
+        // collision must fall through to the SAME Conflict logic `append`
+        // already has (event.rs:354-366), not a misleading QuotaExceeded.
+        //
+        // Low (Codex code review): the WRITER (`attacker`), not the id's
+        // existing owner (`victim`), is the one whose quota the naive trigger
+        // would check first if the WHEN NOT EXISTS guard were ever removed —
+        // so `attacker`, not `victim`, must be the one actually at full quota
+        // for this test to be able to kill that mutation. The original version
+        // capped `victim` instead, which the writer's own quota check would
+        // never consult, so removing the guard would still (correctly, for the
+        // wrong reason) produce Conflict and this test would not notice.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        log.append(&ev("shared-id", "victim", None, "note"))
+            .await
+            .unwrap();
+        let victim_before = usage_of(&kv.pool, "victim").await;
+
+        // Put the WRITER at full quota via a different, non-colliding id
+        // first, so the collision attempt below happens while `attacker`
+        // itself has zero headroom left.
+        set_quota(&kv.pool, "attacker", 1, 268_435_456).await;
+        log.append(&ev("attacker-own-id", "attacker", None, "note"))
+            .await
+            .unwrap();
+        let attacker_before = usage_of(&kv.pool, "attacker").await;
+
+        let err = log
+            .append(&ev("shared-id", "attacker", None, "note"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::MemoryError::Conflict(_)),
+            "must be Conflict, not QuotaExceeded, even though the writer is at full quota: {err}"
+        );
+        assert_eq!(usage_of(&kv.pool, "victim").await, victim_before);
+        assert_eq!(
+            usage_of(&kv.pool, "attacker").await,
+            attacker_before,
+            "the colliding write must not be counted against the writer either"
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_quota_is_configurable_by_updating_the_table_not_the_triggers() {
+        // Judgement 12: the SAME append code path is rejected earlier once the
+        // configured limit is lowered by a plain UPDATE — no trigger SQL, no
+        // migration, changes.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        log.append(&ev("under-default", "unconfigured", None, "note"))
+            .await
+            .unwrap();
+
+        set_quota(&kv.pool, "unconfigured", 1, 268_435_456).await;
+        let err = log
+            .append(&ev("blocked-by-override", "unconfigured", None, "note"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::MemoryError::QuotaExceeded {
+                    dimension: "rows",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_migration_backfill_matches_group_by_over_existing_mem_events() {
+        // Judgement 11. Builds a standalone pool with `mem_events` in its
+        // post-0011 shape, seeds rows as if written before 0014 ever existed,
+        // then runs the REAL 0014 migration file (not a re-derived copy of its
+        // SQL) against it, and checks the backfilled mem_owner_usage against a
+        // manual GROUP BY over the same table.
+        let options: sqlx::sqlite::SqliteConnectOptions = "sqlite::memory:".parse().unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE TABLE mem_events (
+                seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+                id            TEXT NOT NULL UNIQUE,
+                scope_owner   TEXT NOT NULL
+                    CHECK (trim(scope_owner, char(32) || char(9) || char(10) || char(13)) <> ''),
+                scope_session TEXT,
+                scope         TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                payload       TEXT NOT NULL,
+                origin_source TEXT NOT NULL,
+                origin_trust  TEXT NOT NULL,
+                causal        TEXT NOT NULL DEFAULT '[]',
+                at            TEXT NOT NULL
+             );
+             CREATE INDEX mem_events_owner_seq   ON mem_events(scope_owner, seq);
+             CREATE INDEX mem_events_session_seq ON mem_events(scope_owner, scope_session, seq);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (id, owner, payload) in [
+            ("h1", "legacy-a", r#"{"n":1}"#),
+            ("h2", "legacy-a", r#"{"n":22}"#),
+            ("h3", "legacy-b", "\"🎉\""),
+        ] {
+            sqlx::query(
+                "INSERT INTO mem_events
+                     (id, scope_owner, scope_session, scope, kind, payload,
+                      origin_source, origin_trust, causal, at)
+                 VALUES (?, ?, NULL, '{}', 'note', ?, 't', 'user_said', '[]', '2020-01-01')",
+            )
+            .bind(id)
+            .bind(owner)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::raw_sql(include_str!("../migrations/0014_owner_usage_quota.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut expected: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT scope_owner, COUNT(*), SUM(LENGTH(CAST(payload AS BLOB)))
+             FROM mem_events GROUP BY scope_owner ORDER BY scope_owner",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut actual: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT owner, row_count, byte_count FROM mem_owner_usage ORDER BY owner",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "backfill must match a fresh GROUP BY, owner by owner"
+        );
+        assert!(
+            !actual.is_empty(),
+            "the fixture must actually exercise the backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_all_five_event_triggers_survive_kvstore_open() {
+        // Judgement 13, the guard against a future mem_events rebuild silently
+        // dropping these triggers (SQLite's DROP TABLE cascades onto triggers
+        // attached to it — the same trap 0011's index-name comment already
+        // records for indexes). If this ever goes red, the fix is to make the
+        // rebuild recreate the triggers, per the migration file's own comments —
+        // not to delete this test.
+        let kv = KvStore::open_memory().await.unwrap();
+        let mut names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'trigger' AND tbl_name = 'mem_events' ORDER BY name",
+        )
+        .fetch_all(&kv.pool)
+        .await
+        .unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "mem_events_ad_usage".to_owned(),
+                "mem_events_ai_usage".to_owned(),
+                "mem_events_au_owner_usage".to_owned(),
+                "mem_events_bi_quota".to_owned(),
+                "mem_events_bu_payload_immutable".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn t85b_m1_deleting_the_default_quota_row_is_refused() {
+        // M1: without this trigger, deleting the '*' fallback row makes quota
+        // enforcement silently vanish for any owner with no override row — no
+        // error, no trace, just an unenforced ceiling (the COALESCE chain in
+        // mem_events_bi_quota falls through to NULL, and `WHERE ... > NULL` is
+        // false in SQLite). This trigger makes the DELETE itself fail instead.
+        let kv = KvStore::open_memory().await.unwrap();
+        let err = sqlx::query("DELETE FROM mem_owner_quota WHERE owner = '*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sqlx::Error::Database(_)), "{err}");
+
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mem_owner_quota WHERE owner = '*'")
+                .fetch_one(&kv.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "the default row must survive the refused delete"
+        );
+
+        // Only '*' is protected — a per-owner override can still be deleted
+        // freely, so this is not a blanket "quota rows are immutable" rule.
+        sqlx::query(
+            "INSERT INTO mem_owner_quota (owner, max_rows, max_bytes) VALUES ('scoped', 5, 5)",
+        )
+        .execute(&kv.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM mem_owner_quota WHERE owner = 'scoped'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn t85b_m1_renaming_the_default_quota_row_away_is_also_refused() {
+        // Medium (Codex code review): the DELETE guard above doesn't stop a
+        // plain `UPDATE ... SET owner = 'x' WHERE owner = '*'` from making the
+        // '*' row disappear just as effectively as a delete would — same
+        // silent-quota-vanishes failure mode, different statement shape.
+        let kv = KvStore::open_memory().await.unwrap();
+        let err = sqlx::query("UPDATE mem_owner_quota SET owner = 'renamed' WHERE owner = '*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sqlx::Error::Database(_)), "{err}");
+
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mem_owner_quota WHERE owner = '*'")
+                .fetch_one(&kv.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "the default row must survive the refused rename"
+        );
+
+        // Only renaming AWAY from '*' is blocked — updating its limits in
+        // place (the actual configuration use case) must still work.
+        sqlx::query("UPDATE mem_owner_quota SET max_rows = 5 WHERE owner = '*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn t85b_h1_a_brand_new_owners_first_write_is_quota_checked_not_free() {
+        // High (Codex code review): a scalar subquery against
+        // `mem_owner_usage` for an owner with NO row yet returns NULL for the
+        // WHOLE subquery (there is no row to run the inner COALESCE against) —
+        // not a row containing NULL columns. `mem_events_bi_quota` used to
+        // write `(SELECT COALESCE(row_count, 0) FROM ... WHERE owner = ?) + 1`,
+        // so a brand-new owner made the entire `(...)+1` expression NULL, and
+        // `NULL > limit` is false in SQLite: the very first write for ANY new
+        // owner was silently exempt from both the row and the byte quota,
+        // regardless of how low that quota was set. Fixed by moving the
+        // COALESCE outside the subquery so a missing row — not just a missing
+        // column value — still coalesces to 0.
+        let kv = KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+
+        // Row quota of 0: a correctly-enforced owner can NEVER write, not even
+        // once. The bug this test kills lets exactly one write through.
+        set_quota(&kv.pool, "zero_rows", 0, 268_435_456).await;
+        let err = log
+            .append(&ev("first", "zero_rows", None, "note"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::MemoryError::QuotaExceeded { owner, dimension: "rows" } if owner == "zero_rows"
+            ),
+            "a zero-row quota must reject the very first write, not just the second: {err}"
+        );
+        assert_eq!(
+            usage_of(&kv.pool, "zero_rows").await,
+            (0, 0),
+            "the rejected first write must not have left any usage behind"
+        );
+
+        // Byte quota smaller than the first payload: same story for bytes.
+        let mut oversized = ev("first", "zero_bytes", None, "note");
+        oversized.body = serde_json::json!("this payload is bigger than the quota allows");
+        let oversized_bytes = payload_bytes(&oversized);
+        set_quota(&kv.pool, "zero_bytes", 200_000, oversized_bytes - 1).await;
+        let err = log.append(&oversized).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::MemoryError::QuotaExceeded { owner, dimension: "bytes" } if owner == "zero_bytes"
+            ),
+            "a byte quota smaller than the first payload must reject that first write: {err}"
+        );
+        assert_eq!(usage_of(&kv.pool, "zero_bytes").await, (0, 0));
     }
 }
