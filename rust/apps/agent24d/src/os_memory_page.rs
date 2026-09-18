@@ -745,23 +745,42 @@ mod tests {
     /// `Pending` from the underlying I/O (design §9, judgement 2b).
     struct ReadyStream {
         rows: std::collections::VecDeque<Result<StoredEvent, MemoryError>>,
-        /// Broadcasts how many rows have been handed out so far, so a test
-        /// can synchronize on "the scan has reached row N" without polling.
-        progress: Option<tokio::sync::watch::Sender<usize>>,
         handed_out: usize,
+        /// CI flakiness fix (was: a separately `tokio::spawn`ed task woke on a
+        /// `watch` channel and then called `InFlight::finish()` — two
+        /// scheduling hops whose latency is bounded by nothing, so under a
+        /// contended CI runner (many `cargo test` threads sharing few real
+        /// cores) that task could be delayed for far longer than the scan's
+        /// own `SCAN_YIELD_INTERVAL_ROWS` cadence, observed in CI as
+        /// `scanned` landing 100+ rows past `trigger_at` instead of within
+        /// one interval — a test-synchronization bug, not a production one).
+        /// Firing the cancellation SYNCHRONOUSLY, in the same `poll_next`
+        /// call that hands out the trigger row — i.e. on the very same task
+        /// that drives `page_from_stream`, with no cross-task handoff at all
+        /// — makes "how many rows late" bounded purely by the scan loop's
+        /// own yield cadence, which is the thing judgement 2b exists to
+        /// measure.
+        trigger: Option<(usize, agent24_os_proto::drain::InFlight)>,
     }
 
     impl ReadyStream {
         fn filled(n: usize) -> Self {
             Self {
                 rows: (1..=n as i64).map(|seq| Ok(fake_row(seq))).collect(),
-                progress: None,
                 handed_out: 0,
+                trigger: None,
             }
         }
 
-        fn with_progress(mut self, tx: tokio::sync::watch::Sender<usize>) -> Self {
-            self.progress = Some(tx);
+        /// Ends `in_flight` (triggering `lifecycle.ended()`) the instant the
+        /// `at`-th row is handed out — synchronously, within this same poll,
+        /// not via a second task that has to be scheduled.
+        fn with_cancel_trigger(
+            mut self,
+            at: usize,
+            in_flight: agent24_os_proto::drain::InFlight,
+        ) -> Self {
+            self.trigger = Some((at, in_flight));
             self
         }
     }
@@ -773,8 +792,13 @@ mod tests {
             match this.rows.pop_front() {
                 Some(item) => {
                     this.handed_out += 1;
-                    if let Some(tx) = &this.progress {
-                        let _ = tx.send(this.handed_out);
+                    if this
+                        .trigger
+                        .as_ref()
+                        .is_some_and(|(at, _)| this.handed_out == *at)
+                    {
+                        let (_, in_flight) = this.trigger.take().unwrap();
+                        let _ = in_flight.finish();
                     }
                     Poll::Ready(Some(item))
                 }
@@ -913,10 +937,6 @@ mod tests {
     // offsets against an always-`Ready` fake stream. ──
 
     async fn cancel_at_offset(trigger_at: usize) -> (Result<RecallPage, MemoryRpcError>, u32) {
-        let (tx, mut rx) = tokio::sync::watch::channel(0usize);
-        let stream = ReadyStream::filled(MEMORY_SCAN_ROW_BUDGET).with_progress(tx);
-        let mut pinned = std::pin::pin!(stream);
-
         let generation = running_generation();
         let in_flight = generation
             .admit_request(
@@ -928,10 +948,14 @@ mod tests {
             .unwrap();
         let lifecycle = generation.request_lifecycle("cancel-probe").unwrap();
 
-        let monitor = tokio::spawn(async move {
-            let _ = rx.wait_for(|&n| n >= trigger_at).await;
-            let _ = in_flight.finish();
-        });
+        // CI flakiness fix (see `ReadyStream::with_cancel_trigger`'s doc
+        // comment): the trigger fires synchronously, on the SAME task that
+        // drives `page_from_stream`, when the stream hands out row
+        // `trigger_at` — no second task needs to be scheduled promptly for
+        // this test to measure the yield cadence it claims to measure.
+        let stream =
+            ReadyStream::filled(MEMORY_SCAN_ROW_BUDGET).with_cancel_trigger(trigger_at, in_flight);
+        let mut pinned = std::pin::pin!(stream);
 
         let mut reservation = Reservation::reserve(
             generous_limiter(),
@@ -951,7 +975,6 @@ mod tests {
             ),
         )
         .await;
-        monitor.await.unwrap();
         let scanned = reservation.scanned_for_test();
         let result = match outcome {
             Ok(inner) => inner,
@@ -1153,9 +1176,12 @@ mod tests {
     async fn a_mid_scan_cancellation_settles_by_scanned_state_not_a_full_refund() {
         // judgement 7c's second half (H2): cancel AFTER the loop has started
         // (touched=true) — the reservation must NOT refund in full.
-        let (tx, mut rx) = tokio::sync::watch::channel(0usize);
-        let stream = ReadyStream::filled(MEMORY_SCAN_ROW_BUDGET).with_progress(tx);
-        let mut pinned = std::pin::pin!(stream);
+        //
+        // CI flakiness fix (see `ReadyStream::with_cancel_trigger`'s doc
+        // comment): was a separately `tokio::spawn`ed monitor task woken via
+        // a `watch` channel, which under a contended CI runner could be
+        // scheduled arbitrarily late — the trigger now fires synchronously,
+        // in the same task/poll that hands out row 1900.
         // Capacity == reserved cost, frozen clock — see the exact-settlement
         // test above for why.
         let limiter = frozen_limiter(MEMORY_SCAN_ROW_BUDGET as f64);
@@ -1172,10 +1198,9 @@ mod tests {
             )
             .unwrap();
         let lifecycle = generation.request_lifecycle("mid-scan-cancel").unwrap();
-        let monitor = tokio::spawn(async move {
-            let _ = rx.wait_for(|&n| n >= 1900).await;
-            let _ = in_flight.finish();
-        });
+        let stream =
+            ReadyStream::filled(MEMORY_SCAN_ROW_BUDGET).with_cancel_trigger(1900, in_flight);
+        let mut pinned = std::pin::pin!(stream);
         let outcome = agent24_os_proto::drain::bind_to_lifecycle(
             Some(lifecycle),
             page_from_stream(
@@ -1189,7 +1214,6 @@ mod tests {
             ),
         )
         .await;
-        monitor.await.unwrap();
         assert!(
             matches!(outcome, Err(LifecycleTimeout::RequestEnded)),
             "expected the request to be cancelled near the end of the budget"
