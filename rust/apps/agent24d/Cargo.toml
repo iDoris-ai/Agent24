@@ -19,6 +19,8 @@ agent24-scheduler = { path = "../../crates/agent24-scheduler" }
 agent24-sin90-os = { path = "../../crates/agent24-sin90-os" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 async-trait = "0.1"
+# T8.5c-P: cursor tokens are `base64(v2:<seq>:<fingerprint>)` (design §7.1).
+base64 = "0.22"
 agent24-store = { path = "../../crates/agent24-store" }
 agent24-tools = { path = "../../crates/agent24-tools" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
@@ -29,7 +31,10 @@ http-body-util = "0.1"
 rand = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+# T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
+# with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

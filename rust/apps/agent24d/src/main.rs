@@ -14,6 +14,7 @@ mod module_approval_broker;
 mod module_approvals;
 mod os_config;
 mod os_memory;
+mod os_memory_page;
 mod os_routes;
 mod overrides;
 mod routes;
