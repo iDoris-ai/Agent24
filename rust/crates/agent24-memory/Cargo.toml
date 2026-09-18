@@ -10,6 +10,12 @@ description = "Agent24 memory (M-D/D1): L0 SQLite key-value store + canonical se
 agent24-core = { path = "../agent24-core" }
 agent24-models = { path = "../agent24-models" }
 async-trait = "0.1"
+# T8.5c-P: `EventLog::scan_stream` is a genuinely streaming, row-by-row
+# consumer of `sqlx::query(..).fetch(&pool)` (a `BoxStream`) — `StreamExt` and
+# the `Stream` trait bound live here, not pulled in transitively, so the
+# streaming contract is an explicit dependency of this crate rather than an
+# accident of what sqlx happens to re-export.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"

@@ -82,6 +82,28 @@ pub enum MemoryError {
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
+/// T8.5c-P (design §3.2, v2 "sqlx 预取 High", v4 "常量口径 Medium" M1): the
+/// SQLite connection option `SqliteConnectOptions::row_buffer_size` — the
+/// capacity of the bounded channel sqlx-sqlite's worker thread blocking-sends
+/// rows into ahead of a consumer's `.next()`. Deliberately smaller than the
+/// sqlx default (50): it bounds how many rows [`event::EventLog::scan_stream`]
+/// can have "in flight" (read from SQLite, not yet observed by the consumer)
+/// at once, which is what keeps a cancelled or early-returning scan's
+/// unobserved-row count small (see `event::ROW_BUFFER_MARGIN` in
+/// `agent24d::os_memory_page`, which is this constant plus one — the extra
+/// one is the row sqlx's worker thread may be blocked mid-send on when a
+/// consumer stops pulling).
+///
+/// **The single shared source for this value.** Every pool that can produce an
+/// [`event::EventLog`] — today [`KvStore::open`] and [`KvStore::open_memory`] —
+/// MUST configure this same constant, and nowhere else may hardcode `8` (or
+/// whatever this is changed to): a second call site that drifted from this one
+/// would silently change the worker-thread lead behind `EventLog::scan_stream`
+/// without changing the downstream `ROW_BUFFER_MARGIN` that accounts for it,
+/// which is exactly the two-independent-configuration-sources bug T8.5c-P's
+/// design doc (§3.2/§6.4, M4) requires this constant to make impossible.
+pub const MEMORY_SQLITE_ROW_BUFFER_SIZE: usize = 8;
+
 /// One durably recorded domain-OS memory partition.
 ///
 /// See `mem_os_partitions` (migrations 0012 and 0013) for why each field is
@@ -200,7 +222,12 @@ impl KvStore {
             // FKs are OFF by default in SQLite; the trace projection (MD-8) relies
             // on a composite FK so a node's ref can never be unresolvable.
             .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5));
+            .busy_timeout(std::time::Duration::from_secs(5))
+            // T8.5c-P §3.2 (v2 "sqlx 预取 High", v4 M1 "常量口径"): shrink
+            // sqlx-sqlite's worker-thread row lookahead from its default of
+            // 50 to the single shared constant every `EventLog`-producing
+            // pool must reference — see `MEMORY_SQLITE_ROW_BUFFER_SIZE`'s doc.
+            .row_buffer_size(MEMORY_SQLITE_ROW_BUFFER_SIZE);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
@@ -214,7 +241,12 @@ impl KvStore {
     pub async fn open_memory() -> Result<Self> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?
             .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5));
+            .busy_timeout(std::time::Duration::from_secs(5))
+            // Same shared constant as `open` — see its comment there. Tests
+            // that exercise `EventLog::scan_stream`'s row-lookahead bound
+            // (T8.5c-P judgement 9c-adjacent behaviour) run against
+            // `open_memory`, so this path must not silently default to 50.
+            .row_buffer_size(MEMORY_SQLITE_ROW_BUFFER_SIZE);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
