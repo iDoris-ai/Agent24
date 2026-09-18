@@ -13,6 +13,7 @@
 
 use agent24_core::util::now_iso8601;
 use async_trait::async_trait;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
@@ -271,6 +272,157 @@ pub trait EventStore: Send + Sync {
     async fn checkpoint_seq(&self, name: &str, owner: &str) -> Result<Option<i64>>;
 }
 
+/// T8.5c-P (§3.2): the SQL text `scan` and `scan_stream` both execute, kept as
+/// a single function so the two never drift apart ("两条路径的 WHERE/ORDER
+/// BY/LIMIT 语义必须逐字一致"). Returns a `'static` literal rather than
+/// building a `String`: `scan_stream`'s returned stream borrows this text for
+/// as long as it is polled (sqlx's `Query::fetch` carries a `'q: 'e` bound
+/// tying the row stream's lifetime to the SQL string's), and this workspace
+/// forbids `unsafe_code` — so there is no self-referential-struct escape hatch
+/// for handing the stream an owned, locally-built `String` to borrow from.
+/// `EventQuery`'s three optional filters plus sort order are a small closed
+/// set (8 filter combinations × 2 orders = 16), enumerable exhaustively rather
+/// than assembled at runtime.
+fn scan_sql(q: &EventQuery) -> &'static str {
+    match (
+        q.session.is_some(),
+        q.after_seq.is_some(),
+        q.before_seq.is_some(),
+        q.newest_first,
+    ) {
+        (false, false, false, false) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " ORDER BY seq ASC LIMIT ?"
+        ),
+        (false, false, false, true) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " ORDER BY seq DESC LIMIT ?"
+        ),
+        (false, false, true, false) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND seq < ?",
+            " ORDER BY seq ASC LIMIT ?"
+        ),
+        (false, false, true, true) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND seq < ?",
+            " ORDER BY seq DESC LIMIT ?"
+        ),
+        (false, true, false, false) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND seq > ?",
+            " ORDER BY seq ASC LIMIT ?"
+        ),
+        (false, true, false, true) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND seq > ?",
+            " ORDER BY seq DESC LIMIT ?"
+        ),
+        (false, true, true, false) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND seq > ?",
+            " AND seq < ?",
+            " ORDER BY seq ASC LIMIT ?"
+        ),
+        (false, true, true, true) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND seq > ?",
+            " AND seq < ?",
+            " ORDER BY seq DESC LIMIT ?"
+        ),
+        (true, false, false, false) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND scope_session = ?",
+            " ORDER BY seq ASC LIMIT ?"
+        ),
+        (true, false, false, true) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND scope_session = ?",
+            " ORDER BY seq DESC LIMIT ?"
+        ),
+        (true, false, true, false) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND scope_session = ?",
+            " AND seq < ?",
+            " ORDER BY seq ASC LIMIT ?"
+        ),
+        (true, false, true, true) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND scope_session = ?",
+            " AND seq < ?",
+            " ORDER BY seq DESC LIMIT ?"
+        ),
+        (true, true, false, false) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND scope_session = ?",
+            " AND seq > ?",
+            " ORDER BY seq ASC LIMIT ?"
+        ),
+        (true, true, false, true) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND scope_session = ?",
+            " AND seq > ?",
+            " ORDER BY seq DESC LIMIT ?"
+        ),
+        (true, true, true, false) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND scope_session = ?",
+            " AND seq > ?",
+            " AND seq < ?",
+            " ORDER BY seq ASC LIMIT ?"
+        ),
+        (true, true, true, true) => concat!(
+            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at \
+             FROM mem_events WHERE scope_owner = ?",
+            " AND scope_session = ?",
+            " AND seq > ?",
+            " AND seq < ?",
+            " ORDER BY seq DESC LIMIT ?"
+        ),
+    }
+}
+
+/// Bind `q`'s values, in the fixed order `scan_sql`'s optional fragments
+/// appear in (owner, session?, after?, before?, limit) — shared by `scan` and
+/// `scan_stream` for the same reason `scan_sql` is shared: one binding order,
+/// not two hand-kept-in-sync copies.
+fn bind_scan_query<'q>(
+    sql: &'q str,
+    q: &'q EventQuery,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    let mut query = sqlx::query(sql).bind(&q.owner);
+    if let Some(s) = &q.session {
+        query = query.bind(s);
+    }
+    if let Some(a) = q.after_seq {
+        query = query.bind(a);
+    }
+    if let Some(b) = q.before_seq {
+        query = query.bind(b);
+    }
+    // `.max(1)` again at the point of binding, not only in the builder: the
+    // field is public, so a struct update or a direct assignment reaches this
+    // without passing through `limit()`. A negative LIMIT is unbounded in
+    // SQLite, and "a scan is ALWAYS bounded" has to be true of the SQL, not of
+    // the API's good manners.
+    query.bind(q.limit.unwrap_or(DEFAULT_SCAN_LIMIT).max(1))
+}
+
 /// SQLite-backed event log. Shares the memory DB pool (see
 /// [`crate::KvStore::events`]) so the log and KV live in the same DB file — but
 /// NOT (yet) the same transaction (that cross-store seam is MD-2b).
@@ -341,6 +493,42 @@ impl EventLog {
             },
         })
     }
+
+    /// T8.5c-P (design §3.2): row-by-row streaming scan, not "fetch a whole
+    /// batch then iterate it". Inherent, not on [`EventStore`] — `EventLog` is
+    /// the trait's only implementor (see the module doc's ADR reference and
+    /// `os_memory.rs`'s precedent of `remember_checked`/`recall_page`/
+    /// `recent_page` also being inherent), so a new inherent method is not a
+    /// breaking change.
+    ///
+    /// This is NOT "one row at a time from SQLite": sqlx-sqlite's connection
+    /// worker thread blocking-sends rows into a bounded channel ahead of the
+    /// consumer (`KvStore::MEMORY_SQLITE_ROW_BUFFER_SIZE` sets that channel's
+    /// capacity), so at any instant up to `MEMORY_SQLITE_ROW_BUFFER_SIZE + 1`
+    /// rows may already be read out of SQLite and resident but not yet
+    /// observed by whoever is polling this stream (the `+ 1` is one row the
+    /// worker thread may be blocked mid-send on) — `os_memory_page.rs`'s
+    /// `ROW_BUFFER_MARGIN` is exactly this bound, used both for the
+    /// scan-cancellation accounting (T8.5c-P §8 P7 scenario 2) and for
+    /// billing an interrupted scan's unobserved rows (§6.4). What this
+    /// streaming form DOES eliminate, relative to `scan`'s `fetch_all`, is
+    /// unbounded-with-page-size materialization: nothing here ever holds more
+    /// than that small, constant number of rows at once, regardless of how
+    /// large the matching partition is or how early the consumer stops
+    /// pulling.
+    ///
+    /// SQL-level `LIMIT` (`q.limit`) still applies as defense in depth: even
+    /// if a caller's own loop forgot to stop early, SQLite is never asked to
+    /// produce unbounded rows.
+    pub fn scan_stream<'a>(
+        &'a self,
+        q: &'a EventQuery,
+    ) -> impl futures::Stream<Item = Result<StoredEvent>> + Send + 'a {
+        bind_scan_query(scan_sql(q), q).fetch(&self.pool).map(|r| {
+            r.map_err(Into::into)
+                .and_then(|row| Self::row_to_stored(&row))
+        })
+    }
 }
 
 #[async_trait]
@@ -400,41 +588,9 @@ impl EventStore for EventLog {
     async fn scan(&self, q: &EventQuery) -> Result<Vec<StoredEvent>> {
         // owner is ALWAYS bound (a scan is always owner-scoped); an explicit or
         // default LIMIT is ALWAYS applied so a scan cannot fetch an unbounded set.
-        let mut sql = String::from(
-            "SELECT seq, id, scope, kind, payload, origin_source, origin_trust, causal, at
-             FROM mem_events WHERE scope_owner = ?",
-        );
-        if q.session.is_some() {
-            sql.push_str(" AND scope_session = ?");
-        }
-        if q.after_seq.is_some() {
-            sql.push_str(" AND seq > ?");
-        }
-        if q.before_seq.is_some() {
-            sql.push_str(" AND seq < ?");
-        }
-        sql.push_str(if q.newest_first {
-            " ORDER BY seq DESC LIMIT ?"
-        } else {
-            " ORDER BY seq ASC LIMIT ?"
-        });
-        let mut query = sqlx::query(&sql).bind(&q.owner);
-        if let Some(s) = &q.session {
-            query = query.bind(s);
-        }
-        if let Some(a) = q.after_seq {
-            query = query.bind(a);
-        }
-        if let Some(b) = q.before_seq {
-            query = query.bind(b);
-        }
-        // `.max(1)` again at the point of binding, not only in the builder: the
-        // field is public, so a struct update or a direct assignment reaches this
-        // without passing through `limit()`. A negative LIMIT is unbounded in
-        // SQLite, and "a scan is ALWAYS bounded" has to be true of the SQL, not of
-        // the API's good manners.
-        query = query.bind(q.limit.unwrap_or(DEFAULT_SCAN_LIMIT).max(1));
-        let rows = query.fetch_all(&self.pool).await?;
+        let rows = bind_scan_query(scan_sql(q), q)
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(Self::row_to_stored).collect()
     }
 
@@ -871,6 +1027,94 @@ mod tests {
         let mut q = EventQuery::owner("alice");
         q.limit = Some(-1); // straight past the builder
         assert_eq!(log.scan(&q).await.unwrap().len(), 1);
+    }
+
+    // ---- T8.5c-P: `scan_stream` — direct unit coverage of the streaming
+    // primitive itself, independent of the T8.5c-P pagination state machine
+    // that consumes it (`os_memory_page.rs`'s `page_from_stream`, which has
+    // its own extensive judgement suite). These tests exist so this method
+    // is not shipped with zero coverage of its own basic contract: same
+    // ordering as `scan`, respects `LIMIT`, and reports exhaustion via
+    // `None` rather than hanging or erroring. ----
+
+    #[tokio::test]
+    async fn scan_stream_yields_the_same_rows_in_the_same_order_as_scan() {
+        let kv = crate::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        for i in 0..5 {
+            log.append(&MemEvent::new(
+                format!("e{i}"),
+                Scope::owner("alice"),
+                "chat",
+                serde_json::json!({"i": i}),
+                Origin {
+                    source: "test".into(),
+                    trust: Trust::UserSaid,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+        let q = EventQuery::owner("alice");
+        let via_scan = log.scan(&q).await.unwrap();
+
+        let stream = log.scan_stream(&q);
+        futures::pin_mut!(stream);
+        let mut via_stream = Vec::new();
+        while let Some(row) = stream.next().await {
+            via_stream.push(row.unwrap());
+        }
+        assert_eq!(
+            via_stream, via_scan,
+            "scan_stream must yield exactly the rows scan does, in the same order"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_stream_respects_limit_like_scan_does() {
+        let kv = crate::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        for i in 0..10 {
+            log.append(&MemEvent::new(
+                format!("e{i}"),
+                Scope::owner("alice"),
+                "chat",
+                serde_json::json!({"i": i}),
+                Origin {
+                    source: "test".into(),
+                    trust: Trust::UserSaid,
+                },
+            ))
+            .await
+            .unwrap();
+        }
+        let q = EventQuery::owner("alice").limit(3);
+        let stream = log.scan_stream(&q);
+        futures::pin_mut!(stream);
+        let mut count = 0;
+        while let Some(row) = stream.next().await {
+            row.unwrap();
+            count += 1;
+        }
+        assert_eq!(
+            count, 3,
+            "scan_stream must honor LIMIT, not drain the table"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_stream_on_an_empty_partition_yields_none_immediately() {
+        let kv = crate::KvStore::open_memory().await.unwrap();
+        let log = kv.events();
+        let q = EventQuery::owner("nobody-has-written-here");
+        let stream = log.scan_stream(&q);
+        futures::pin_mut!(stream);
+        assert!(
+            stream.next().await.is_none(),
+            "an empty partition must report exhaustion via None, not hang or error"
+        );
+        // Polling again after exhaustion must stay None, not panic or loop.
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

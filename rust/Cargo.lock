@@ -89,6 +89,7 @@ dependencies = [
  "agent24-core",
  "agent24-models",
  "async-trait",
+ "futures",
  "serde",
  "serde_json",
  "sha2",
