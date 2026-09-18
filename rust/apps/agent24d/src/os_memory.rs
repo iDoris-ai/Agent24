@@ -109,6 +109,17 @@ use std::sync::Arc;
 use agent24_domain::memory::{MemoryId, Recollection, Remember, Remembered, ScopedMemory};
 use agent24_domain::{DomainError, DomainOsManifest};
 use agent24_memory::event::{EventQuery, EventStore, MemEvent, Origin, Scope, Trust};
+use agent24_os_proto::drain::{RequestLifecycle, bind_to_lifecycle};
+use agent24_os_proto::rpc::ErrorKind;
+use tokio::sync::Semaphore;
+
+use crate::events_emit::RateLimiter;
+use crate::os_memory_page::{
+    MEMORY_COST_RECALL, MEMORY_COST_REMEMBER, MEMORY_MAX_PAGE_SIZE,
+    MEMORY_PAGE_RESPONSE_BUDGET_BYTES, MEMORY_SCAN_ROW_BUDGET, METHOD_TAG_RECALL,
+    METHOD_TAG_RECENT, MemoryRpcError, Needle, PageMode, RecallPage, Reservation, decode_cursor,
+    memory_cost_recent, page_from_stream,
+};
 
 /// The most rows either read method will ever return.
 ///
@@ -132,13 +143,17 @@ const RECALL_PAGE: i64 = 500;
 /// blobs into the database B shares. These two caps are the cheap floor: they do
 /// not make it a quota, and they do stop one module from filling `memory.db`
 /// with a single call.
-const MAX_KIND_BYTES: usize = 128;
+///
+/// `pub(crate)`: T8.5c-P's `os_memory_page.rs` needs this same value for its
+/// compile-time response-byte-budget proof (design §5.1) — one constant, not
+/// two independently maintained copies.
+pub(crate) const MAX_KIND_BYTES: usize = 128;
 
 /// The largest serialized body a module may remember in one call.
 ///
 /// Well under the 1 MiB HTTP body cap, because this is one memory rather than
-/// one request.
-const MAX_BODY_BYTES: usize = 64 * 1024;
+/// one request. `pub(crate)` for the same reason as [`MAX_KIND_BYTES`].
+pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// The derived-key format version. Bump ONLY together with a migration that can
 /// read the previous one — the catalog is what makes that possible.
@@ -550,7 +565,11 @@ struct Page {
     short: bool,
 }
 
-fn to_recollection(s: agent24_memory::event::StoredEvent) -> Recollection {
+/// `pub(crate)`: T8.5c-P's `page_from_stream` (`os_memory_page.rs`) needs the
+/// exact same row → `Recollection` mapping `page()`'s in-process path uses,
+/// so the two never disagree about what a stored event looks like on the
+/// wire.
+pub(crate) fn to_recollection(s: agent24_memory::event::StoredEvent) -> Recollection {
     Recollection {
         id: MemoryId::from_kernel(s.event.id),
         kind: s.event.kind,
@@ -564,30 +583,33 @@ fn to_recollection(s: agent24_memory::event::StoredEvent) -> Recollection {
     }
 }
 
-#[async_trait::async_trait]
-impl ScopedMemory for OsScopedMemory {
-    async fn remember(&self, what: Remember) -> agent24_domain::Result<Remembered> {
+impl OsScopedMemory {
+    /// The bound checks and `MemEvent` construction `remember`/
+    /// `remember_checked` (T8.5c-P) both need — factored out so the
+    /// in-process trait path and the OOP wire path can never validate a
+    /// `Remember` differently. Returns a human-readable message on failure;
+    /// each caller maps it into its own error type (`DomainError` for the
+    /// trait path, `MemoryRpcError` for the wire path).
+    fn build_remember_event(&self, what: Remember) -> Result<MemEvent, String> {
         // Bounded BEFORE anything is written. See `MAX_KIND_BYTES`: the partition
         // stops A from reading B, and these stop A from crowding B out of the
         // database they share.
         if what.kind.trim().is_empty() {
-            return Err(DomainError::Memory("kind must not be empty".into()));
+            return Err("kind must not be empty".into());
         }
         if what.kind.len() > MAX_KIND_BYTES {
-            return Err(DomainError::Memory(format!(
-                "kind exceeds {MAX_KIND_BYTES} bytes"
-            )));
+            return Err(format!("kind exceeds {MAX_KIND_BYTES} bytes"));
         }
         let body = serde_json::Value::Object(what.body);
-        let encoded = serde_json::to_string(&body)
-            .map_err(|e| DomainError::Memory(format!("body is not serialisable: {e}")))?;
+        let encoded =
+            serde_json::to_string(&body).map_err(|e| format!("body is not serialisable: {e}"))?;
         if encoded.len() > MAX_BODY_BYTES {
-            return Err(DomainError::Memory(format!(
+            return Err(format!(
                 "body is {} bytes, over the {MAX_BODY_BYTES}-byte limit for one memory",
                 encoded.len()
-            )));
+            ));
         }
-        let ev = MemEvent::new(
+        Ok(MemEvent::new(
             self.mint_id(),
             // The scope the module never gets to choose. `agent` records the
             // module for diagnostics ONLY — it is enforced nowhere, which the
@@ -621,7 +643,16 @@ impl ScopedMemory for OsScopedMemory {
                 // keeps this a documented limitation rather than a live hole.
                 trust: Trust::ToolOutput,
             },
-        );
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl ScopedMemory for OsScopedMemory {
+    async fn remember(&self, what: Remember) -> agent24_domain::Result<Remembered> {
+        let ev = self
+            .build_remember_event(what)
+            .map_err(DomainError::Memory)?;
         let at = ev.at.clone();
         let id = ev.id.clone();
         self.events
@@ -696,6 +727,203 @@ impl ScopedMemory for OsScopedMemory {
             return Ok(Vec::new());
         }
         Ok(self.page(None, want as i64).await?.items)
+    }
+}
+
+// ---- T8.5c-P: the OOP wire entry points — `recall_page`/`recent_page`/
+// `remember_checked` (T8.5c v1 decision D4 already planned these three
+// existing; this crate gives them their real, fully-wired bodies). Inherent,
+// not on `ScopedMemory` (that trait is the IN-PROCESS capability surface;
+// these are the paginated/budgeted/billed OOP-wire surface T8.5c v1 D4
+// distinguishes them from — see this file's module doc).
+//
+// `limiter`/`admission`/`lifecycle` are explicit parameters rather than
+// fields on `OsScopedMemory` because creating the daemon-level `RateLimiter`/
+// `Semaphore` SINGLETONS (design §6.3's "mount 层创建一次" / §6.5's "与共享
+// 池同作用域创建一次") is mount-time wiring that belongs in `domain.rs`/
+// `server.rs` — outside this design doc's scope (§0) and explicitly left to
+// T8.5c-W (§12). These three methods are where those singletons get USED.
+//
+// `#[allow(dead_code)]`: real, tested code (this crate's own tests below and
+// `os_memory_page.rs`'s) with no caller reachable from `main` yet, for the
+// same reason `os_memory_page.rs`'s module doc explains — `dead_code`'s
+// binary-crate reachability analysis starts at `main` and does not see
+// `#[cfg(test)]` code.
+#[allow(dead_code)]
+impl OsScopedMemory {
+    /// Design §6.5's `remember_checked` pseudocode: reservation → admission
+    /// permit (inside the `bind_to_lifecycle`-wrapped work future) → append →
+    /// commit. `ev` is validated up front, outside the reservation/permit —
+    /// a malformed `Remember` must not spend a rate-limit token or wait on
+    /// the shared connection semaphore (decision P5's "capability first,
+    /// cost second" ordering, mirrored from `_a24/events/emit`).
+    pub async fn remember_checked(
+        &self,
+        lifecycle: Option<RequestLifecycle>,
+        limiter: Arc<RateLimiter>,
+        admission: Arc<Semaphore>,
+        what: Remember,
+    ) -> Result<Remembered, MemoryRpcError> {
+        let ev = self
+            .build_remember_event(what)
+            .map_err(MemoryRpcError::Invalid)?;
+        let Some(mut reservation) = Reservation::reserve(limiter, MEMORY_COST_REMEMBER) else {
+            return Err(MemoryRpcError::application(
+                ErrorKind::RateLimited,
+                "memory rate limit exceeded",
+            ));
+        };
+        let events = self.events.clone();
+        let outcome = bind_to_lifecycle(lifecycle, async move {
+            let _permit = admission.acquire_owned().await.map_err(|_| {
+                MemoryRpcError::Store("connection admission semaphore closed".into())
+            })?;
+            // About to touch the shared pool — see `Reservation::mark_touched`
+            // for the precise (conservative) meaning of this boundary.
+            reservation.mark_touched();
+            events
+                .append(&ev)
+                .await
+                .map_err(|e| MemoryRpcError::Store(e.to_string()))?;
+            reservation.commit();
+            Ok(Remembered {
+                id: MemoryId::from_kernel(ev.id.clone()),
+                at: ev.at.clone(),
+            })
+        })
+        .await;
+        match outcome {
+            Ok(inner) => inner,
+            Err(timeout) => Err(MemoryRpcError::from(timeout)),
+        }
+    }
+
+    /// Design §4.2/§6.5's `recall_page`: decode+validate the cursor against
+    /// `needle` (§7.1's fingerprint check), reserve the worst-case scan cost,
+    /// then — inside the `bind_to_lifecycle`-wrapped, fully owned work
+    /// future — acquire the shared admission permit and drive
+    /// [`page_from_stream`] over a real [`agent24_memory::event::EventLog::scan_stream`].
+    pub async fn recall_page(
+        &self,
+        lifecycle: Option<RequestLifecycle>,
+        limiter: Arc<RateLimiter>,
+        admission: Arc<Semaphore>,
+        needle: &Needle,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Result<RecallPage, MemoryRpcError> {
+        if page_size == 0 || page_size > MEMORY_MAX_PAGE_SIZE {
+            return Err(MemoryRpcError::Invalid(format!(
+                "page_size must be between 1 and {MEMORY_MAX_PAGE_SIZE}"
+            )));
+        }
+        let resolved_seq = match cursor {
+            Some(token) => Some(decode_cursor(token, METHOD_TAG_RECALL, needle)?),
+            None => None,
+        };
+        let Some(mut reservation) = Reservation::reserve(limiter, MEMORY_COST_RECALL) else {
+            return Err(MemoryRpcError::application(
+                ErrorKind::RateLimited,
+                "memory rate limit exceeded",
+            ));
+        };
+        let events = self.events.clone();
+        let key = self.key.clone();
+        let needle = needle.clone();
+        let outcome = bind_to_lifecycle(lifecycle, async move {
+            let _permit = admission.acquire_owned().await.map_err(|_| {
+                MemoryRpcError::Store("connection admission semaphore closed".into())
+            })?;
+            let mut q = EventQuery::owner(&key)
+                .newest()
+                .limit(MEMORY_SCAN_ROW_BUDGET as i64);
+            if let Some(s) = resolved_seq {
+                q = q.before(s);
+            }
+            let mut stream = std::pin::pin!(events.scan_stream(&q));
+            let page = page_from_stream(
+                stream.as_mut(),
+                PageMode::Recall(&needle),
+                page_size,
+                MEMORY_SCAN_ROW_BUDGET,
+                MEMORY_PAGE_RESPONSE_BUDGET_BYTES,
+                resolved_seq,
+                &mut reservation,
+            )
+            .await?;
+            reservation.commit();
+            Ok(page)
+        })
+        .await;
+        match outcome {
+            Ok(inner) => inner,
+            Err(timeout) => Err(MemoryRpcError::from(timeout)),
+        }
+    }
+
+    /// Design §4.2/§6.5's `recent_page` — same shape as `recall_page`, with
+    /// `MatchPolicy::Always` (via [`PageMode::Recent`]), the reservation sized
+    /// to `page_size` (design §6.3's `memory_cost_recent`, v3 L2: a
+    /// reservation, not a promise the settlement equals it), and
+    /// [`Needle::none_for_recent`]'s fixed empty-string cursor fingerprint.
+    pub async fn recent_page(
+        &self,
+        lifecycle: Option<RequestLifecycle>,
+        limiter: Arc<RateLimiter>,
+        admission: Arc<Semaphore>,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Result<RecallPage, MemoryRpcError> {
+        if page_size == 0 || page_size > MEMORY_MAX_PAGE_SIZE {
+            return Err(MemoryRpcError::Invalid(format!(
+                "page_size must be between 1 and {MEMORY_MAX_PAGE_SIZE}"
+            )));
+        }
+        let fingerprint_needle = Needle::none_for_recent();
+        let resolved_seq = match cursor {
+            Some(token) => Some(decode_cursor(
+                token,
+                METHOD_TAG_RECENT,
+                &fingerprint_needle,
+            )?),
+            None => None,
+        };
+        let Some(mut reservation) = Reservation::reserve(limiter, memory_cost_recent(page_size))
+        else {
+            return Err(MemoryRpcError::application(
+                ErrorKind::RateLimited,
+                "memory rate limit exceeded",
+            ));
+        };
+        let events = self.events.clone();
+        let key = self.key.clone();
+        let outcome = bind_to_lifecycle(lifecycle, async move {
+            let _permit = admission.acquire_owned().await.map_err(|_| {
+                MemoryRpcError::Store("connection admission semaphore closed".into())
+            })?;
+            let mut q = EventQuery::owner(&key).newest().limit(page_size as i64);
+            if let Some(s) = resolved_seq {
+                q = q.before(s);
+            }
+            let mut stream = std::pin::pin!(events.scan_stream(&q));
+            let page = page_from_stream(
+                stream.as_mut(),
+                PageMode::Recent,
+                page_size,
+                page_size,
+                MEMORY_PAGE_RESPONSE_BUDGET_BYTES,
+                resolved_seq,
+                &mut reservation,
+            )
+            .await?;
+            reservation.commit();
+            Ok(page)
+        })
+        .await;
+        match outcome {
+            Ok(inner) => inner,
+            Err(timeout) => Err(MemoryRpcError::from(timeout)),
+        }
     }
 }
 
@@ -1620,5 +1848,718 @@ mod tests {
         assert_eq!(rows[0].module_name, "sin90");
         assert_eq!(rows[0].key_version, KEY_VERSION);
         assert_eq!(rows[0].logical_user, "alice");
+    }
+
+    // ==== T8.5c-P: `recall_page`/`recent_page`/`remember_checked` ====
+    // (design doc `docs/design/T8.5c-P-pagination-cursor.md`, §9's judgement
+    // list) — integration-level, against a real `OsScopedMemory` backed by a
+    // real SQLite pool, a real `Semaphore` and a real `RateLimiter`. The pure
+    // state-machine judgements (1, 2, 2b, 5, 5b, 7c, 7d, 9c) live in
+    // `os_memory_page.rs`'s own test module, next to `page_from_stream`.
+
+    fn generous_limiter() -> Arc<RateLimiter> {
+        Arc::new(RateLimiter::new(1e12, 1e12))
+    }
+
+    fn admission(permits: usize) -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(permits))
+    }
+
+    async fn seed(m: &OsScopedMemory, n: usize, kind: &str) {
+        for i in 0..n {
+            let mut b = serde_json::Map::new();
+            b.insert("n".into(), i.into());
+            m.remember(Remember::new(kind, b)).await.unwrap();
+        }
+    }
+
+    /// Codex review round 2 (Low): a fixed `sleep` before checking
+    /// `JoinHandle::is_finished()` is not a reliable way to prove a spawned
+    /// call really registered as a blocked waiter (on the admission
+    /// semaphore, or — for a write competing with an external SQLite lock —
+    /// on the database) rather than merely "has not been scheduled onto a
+    /// worker thread yet". This wraps a future so the FIRST time polling it
+    /// returns `Poll::Pending`, it fires a oneshot — deterministic proof the
+    /// call actually blocked, not a timing guess. Everything before that
+    /// first real block in `remember_checked`/`recall_page`/`recent_page`
+    /// (building the query, `Reservation::reserve`) is synchronous, so the
+    /// first `Pending` genuinely corresponds to "waiting on the admission
+    /// permit" or "waiting on the database", not some unrelated earlier
+    /// yield point.
+    struct NotifyFirstPending<F> {
+        inner: F,
+        notify: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl<F: std::future::Future + Unpin> std::future::Future for NotifyFirstPending<F> {
+        type Output = F::Output;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            match std::pin::Pin::new(&mut self.inner).poll(cx) {
+                std::task::Poll::Pending => {
+                    if let Some(tx) = self.notify.take() {
+                        let _ = tx.send(());
+                    }
+                    std::task::Poll::Pending
+                }
+                ready => ready,
+            }
+        }
+    }
+
+    /// Spawns `fut` (boxed, so it is `Unpin` regardless of what it captures)
+    /// wrapped in [`NotifyFirstPending`], and returns once that first real
+    /// block has actually been observed — the caller's next assertion (e.g.
+    /// `available_permits() == 0`, or `!task.is_finished()`) is then
+    /// checking a fact that has already happened, not racing a `sleep`
+    /// against the scheduler.
+    async fn spawn_and_confirm_blocked<T: Send + 'static>(
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
+    ) -> tokio::task::JoinHandle<T> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(NotifyFirstPending {
+            inner: fut,
+            notify: Some(tx),
+        });
+        rx.await
+            .expect("the call must have blocked at least once before finishing this fast");
+        task
+    }
+
+    // ---- judgement 3a/3b/3c/6 ----
+
+    #[tokio::test]
+    async fn judgement_3a_a_full_short_page_yields_a_cursor_that_then_observes_none() {
+        // Partition has EXACTLY page_size matching rows, nothing older.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        seed(&m, 5, "note").await;
+        let needle = Needle::normalize("");
+        let page = m
+            .recall_page(None, generous_limiter(), admission(4), &needle, 5, None)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 5);
+        let cursor = page
+            .cursor
+            .expect("the state machine does not pull one more row to check");
+        let next = m
+            .recall_page(
+                None,
+                generous_limiter(),
+                admission(4),
+                &needle,
+                5,
+                Some(&cursor),
+            )
+            .await
+            .unwrap();
+        assert!(next.items.is_empty());
+        assert!(
+            next.cursor.is_none(),
+            "the next call must honestly observe the end"
+        );
+    }
+
+    #[tokio::test]
+    async fn judgement_3b_a_full_page_with_more_data_behind_it_can_be_paged_further() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        seed(&m, 8, "note").await;
+        let needle = Needle::normalize("");
+        let page1 = m
+            .recall_page(None, generous_limiter(), admission(4), &needle, 5, None)
+            .await
+            .unwrap();
+        assert_eq!(page1.items.len(), 5);
+        let cursor = page1.cursor.expect("more data remains");
+        let page2 = m
+            .recall_page(
+                None,
+                generous_limiter(),
+                admission(4),
+                &needle,
+                5,
+                Some(&cursor),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.items.len(), 3, "the 3 older rows, and only those");
+        assert!(page2.cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn judgement_3c_6_a_scan_budget_exhausted_by_non_matches_returns_empty_with_a_cursor() {
+        // Every row present fails to match; the partition has MORE rows behind
+        // the scan-budget boundary that DO match — proving the scan stopped at
+        // MEMORY_SCAN_ROW_BUDGET, not at the partition's real end, and that the
+        // cursor still lets a caller reach the match on the next call.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        let mut needle_body = serde_json::Map::new();
+        needle_body.insert("text".into(), "the-match".into());
+        m.remember(Remember::new("note", needle_body))
+            .await
+            .unwrap();
+        seed(&m, MEMORY_SCAN_ROW_BUDGET, "noise").await;
+
+        let needle = Needle::normalize("the-match");
+        let page = m
+            .recall_page(None, generous_limiter(), admission(4), &needle, 10, None)
+            .await
+            .unwrap();
+        assert!(
+            page.items.is_empty(),
+            "the match is older than the scan budget"
+        );
+        let cursor = page.cursor.expect("must be non-empty: more to scan");
+
+        let page2 = m
+            .recall_page(
+                None,
+                generous_limiter(),
+                admission(4),
+                &needle,
+                10,
+                Some(&cursor),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.items.len(), 1, "the match is found on the next call");
+        assert_eq!(
+            page2.items[0].body.get("text").and_then(|v| v.as_str()),
+            Some("the-match")
+        );
+    }
+
+    // ---- judgement 4 ----
+
+    #[tokio::test]
+    async fn judgement_4_page_size_zero_is_invalid_params_and_touches_nothing() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        seed(&m, 3, "note").await;
+        let needle = Needle::normalize("");
+        let err = m
+            .recall_page(None, generous_limiter(), admission(4), &needle, 0, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoryRpcError::Invalid(_)));
+        let err = m
+            .recent_page(None, generous_limiter(), admission(4), 0, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoryRpcError::Invalid(_)));
+        // Over the cap is refused the same way.
+        let err = m
+            .recall_page(
+                None,
+                generous_limiter(),
+                admission(4),
+                &needle,
+                MEMORY_MAX_PAGE_SIZE + 1,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoryRpcError::Invalid(_)));
+    }
+
+    // ---- judgement 7 / 7b: weighted rate limiting ----
+
+    #[tokio::test]
+    async fn judgement_7_recall_and_remember_spend_different_amounts() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        seed(&m, 5, "note").await;
+        let limiter = Arc::new(RateLimiter::new(10_000.0, 0.0));
+        let needle = Needle::normalize("");
+        // One recall (full-budget reservation) vs. many remembers: the
+        // reservation alone (2000) already dwarfs a single `remember` (1) by
+        // three orders of magnitude — this is the "one token per call" model
+        // T8.5c v1 D2 shipped, now replaced by a weighted one.
+        m.recall_page(None, limiter.clone(), admission(4), &needle, 1, None)
+            .await
+            .unwrap();
+        let mut remembers_possible = 0;
+        for _ in 0..5000 {
+            if m.remember_checked(
+                None,
+                limiter.clone(),
+                admission(4),
+                Remember::new("note", serde_json::Map::new()),
+            )
+            .await
+            .is_ok()
+            {
+                remembers_possible += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            remembers_possible > 1000,
+            "remember must cost far less than a recall's worst-case reservation: {remembers_possible}"
+        );
+    }
+
+    #[tokio::test]
+    async fn judgement_7b_a_cheap_first_row_hit_settles_for_far_less_than_the_worst_case() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        let mut needle_body = serde_json::Map::new();
+        needle_body.insert("text".into(), "hit".into());
+        m.remember(Remember::new("note", needle_body))
+            .await
+            .unwrap();
+        let limiter = Arc::new(RateLimiter::new(MEMORY_SCAN_ROW_BUDGET as f64 + 50.0, 0.0));
+        let needle = Needle::normalize("hit");
+        m.recall_page(None, limiter.clone(), admission(4), &needle, 1, None)
+            .await
+            .unwrap();
+        // If the old "flat MEMORY_COST_RECALL, never refunded" model were
+        // still in effect, the bucket would now have (roughly) nothing left.
+        // Under the reservation/refund model, only ~1 + ROW_BUFFER_MARGIN was
+        // actually kept — comfortably more than that must remain.
+        assert!(
+            limiter.try_acquire_weighted(crate::events_emit::ScanCost::from_rows_const(
+                MEMORY_SCAN_ROW_BUDGET - 100
+            )),
+            "a first-row-hit recall must settle for far less than the full reservation"
+        );
+
+        // Positive control: a query that scans the full budget without a
+        // match settles near the full amount (T8.5c v1's judgement 6, not
+        // weakened by the reservation/refund model).
+        let kv2 = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m2 = handle(&kv2, "alice", "sin90").await;
+        seed(&m2, MEMORY_SCAN_ROW_BUDGET, "noise").await;
+        let limiter2 = Arc::new(RateLimiter::new(MEMORY_SCAN_ROW_BUDGET as f64, 0.0));
+        let miss_needle = Needle::normalize("never-appears");
+        m2.recall_page(None, limiter2.clone(), admission(4), &miss_needle, 10, None)
+            .await
+            .unwrap();
+        assert!(
+            !limiter2.try_acquire_weighted(crate::events_emit::ScanCost::from_rows_const(50)),
+            "a full-budget miss must settle near the full reservation, not be refunded like a cheap hit"
+        );
+    }
+
+    // ---- method-layer admission contract (a fast, deterministic
+    // complement to judgement 9b below, NOT a substitute for it — Codex
+    // review round 1 on this diff: a hand-built `Arc<Semaphore>` fed
+    // directly into all three methods proves they all honour WHATEVER
+    // semaphore they are given and that permits/waiters are not leaked
+    // across methods or modules, but it cannot prove W will actually wire
+    // ONE daemon-level singleton with `max_connections - 1` headroom, or
+    // that four calls really hold four physical SQLite pool connections
+    // (`open_memory()` here is a single-connection pool; this test never
+    // lets any call reach a real contended connection). See
+    // `judgement_9b_real_sqlite_connections_prove_cross_module_sharing_and_process_internal_headroom`
+    // below for the judgement that exercises the real resource, per design
+    // §6.5 M4.) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn method_layer_admission_contract_recall_recent_remember_share_one_semaphore() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        // Two independently mounted modules, both handed the SAME
+        // `Arc<Semaphore>` by this test. This proves the three methods all
+        // honour whatever admission semaphore they are given (permits are
+        // not leaked, waiters are not stranded) regardless of which module
+        // or method holds/awaits them — it does NOT prove W actually wires
+        // one daemon-level singleton (Codex review round 2 on this diff:
+        // that claim needs the real construction path, which does not exist
+        // in this codebase yet — see the real-resource test below for what
+        // this one still cannot show). `Arc`-wrapped so a genuine
+        // `tokio::spawn`ed task (a real, independently-scheduled competitor —
+        // not a future this test polls once via `select!` and then abandons,
+        // which tokio's FAIR semaphore would leave permanently queued behind)
+        // can hold one.
+        let holder = Arc::new(handle(&kv, "alice", "sin90").await);
+        let contender = Arc::new(handle(&kv, "alice", "cos72").await);
+        seed(&holder, 1, "note").await;
+        seed(&contender, 1, "note").await;
+
+        let shared_admission = admission(2); // small on purpose: easy to saturate
+        let limiter = generous_limiter();
+
+        // ---- (1) recall_page queues on an exhausted shared permit, and
+        // proceeds once one frees up. ----
+        let p1 = shared_admission.clone().acquire_owned().await.unwrap();
+        let p2 = shared_admission.clone().acquire_owned().await.unwrap();
+        assert_eq!(shared_admission.available_permits(), 0);
+
+        let recall_task = {
+            let holder = holder.clone();
+            let admission = shared_admission.clone();
+            let limiter = limiter.clone();
+            spawn_and_confirm_blocked(Box::pin(async move {
+                let needle = Needle::normalize("");
+                holder
+                    .recall_page(None, limiter, admission, &needle, 1, None)
+                    .await
+            }))
+            .await
+        };
+        assert!(
+            !recall_task.is_finished(),
+            "recall_page must queue while both permits are held"
+        );
+        drop(p1);
+        let page = tokio::time::timeout(std::time::Duration::from_secs(5), recall_task)
+            .await
+            .expect("must eventually complete once a permit frees up")
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        // `recall_page`'s own permit is released when it finishes — one of
+        // the two original permits (`p2`) is still held, so exactly one slot
+        // is free again.
+        assert_eq!(shared_admission.available_permits(), 1);
+
+        // ---- (2) a DIFFERENT module's `remember_checked` competes for, and
+        // can take, the SAME permit `p2` releases — proving the semaphore
+        // itself has no notion of which `OsScopedMemory` is waiting (the
+        // cross-module half of M4), given that it IS shared. ----
+        let p1b = shared_admission.clone().acquire_owned().await.unwrap();
+        assert_eq!(shared_admission.available_permits(), 0);
+        let remember_task = {
+            let contender = contender.clone();
+            let admission = shared_admission.clone();
+            let limiter = limiter.clone();
+            spawn_and_confirm_blocked(Box::pin(async move {
+                contender
+                    .remember_checked(
+                        None,
+                        limiter,
+                        admission,
+                        Remember::new("note", serde_json::Map::new()),
+                    )
+                    .await
+            }))
+            .await
+        };
+        assert!(
+            !remember_task.is_finished(),
+            "remember_checked must queue behind the same exhausted permit"
+        );
+        drop(p2);
+        let remembered = tokio::time::timeout(std::time::Duration::from_secs(5), remember_task)
+            .await
+            .expect("must eventually complete once a permit frees up")
+            .unwrap();
+        assert!(
+            remembered.is_ok(),
+            "a released permit must be usable by a different module: {remembered:?}"
+        );
+        drop(p1b);
+
+        // ---- (3) `recent_page` shares the same pool too — M4's "not just
+        // remember_checked" requirement, one more independent
+        // saturate/queue/release cycle. ----
+        let p3 = shared_admission.clone().acquire_owned().await.unwrap();
+        let p4 = shared_admission.clone().acquire_owned().await.unwrap();
+        assert_eq!(shared_admission.available_permits(), 0);
+        let recent_task = {
+            let contender = contender.clone();
+            let admission = shared_admission.clone();
+            let limiter = limiter.clone();
+            spawn_and_confirm_blocked(Box::pin(async move {
+                contender
+                    .recent_page(None, limiter, admission, 1, None)
+                    .await
+            }))
+            .await
+        };
+        assert!(
+            !recent_task.is_finished(),
+            "recent_page must also queue on the shared permit"
+        );
+        drop(p3);
+        let recent_page = tokio::time::timeout(std::time::Duration::from_secs(5), recent_task)
+            .await
+            .expect("recent_page must proceed once the permit frees up")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recent_page.items.len(), 1);
+        drop(p4);
+    }
+
+    // ---- judgement 9b proper (design §6.5/§9, M4): real SQLite pool
+    // connections, a real external writer holding a real lock, and the
+    // permit sized to the pool's actual `max_connections - 1` headroom —
+    // the model Codex review round 1 on this diff asked for in place of
+    // (or alongside) the method-layer contract test above.
+    //
+    // What this test does NOT prove (Codex review round 2, Low): that
+    // T8.5c-W's eventual mount-time wiring creates exactly one daemon-level
+    // `Semaphore` singleton, or that a real `Handler::call` → `CallFuture` →
+    // `bind_to_lifecycle` chain satisfies the same constraints — this test
+    // still hands a test-constructed `Arc<Semaphore>` to both modules by
+    // hand. What it DOES prove, which the method-layer contract test above
+    // cannot: that when the three methods share one admission permit sized
+    // to a real pool's actual headroom, real concurrent writers really do
+    // occupy real pool connections, a real in-process read really is not
+    // starved by them, and all three OOP methods (including a queued
+    // `remember_checked`, not just the two reads) really do queue on that
+    // one permit rather than finding a spare pool connection to race for.
+    // ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn judgement_9b_real_sqlite_connections_prove_cross_module_sharing_and_process_internal_headroom()
+     {
+        use sqlx::Connection as _;
+        use std::str::FromStr as _;
+
+        // A real, FILE-backed pool (`KvStore::open`, not `open_memory`) —
+        // `max_connections(5)`, WAL mode — so "4 permits held" and "4 real
+        // pool connections held" are the same fact, not two independent
+        // claims that happen to agree in this test.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.db");
+        let kv = agent24_memory::KvStore::open(&db_path).await.unwrap();
+        // Two independently mounted modules under the same user, both
+        // handed the SAME `Arc<Semaphore>` by this test — the cross-module
+        // sharing half of M4 (see the note above on what this does and does
+        // not prove about a future daemon-level singleton).
+        let holder = Arc::new(handle(&kv, "alice", "sin90").await);
+        let contender = Arc::new(handle(&kv, "alice", "cos72").await);
+
+        // An independent connection OUTSIDE the shared pool and OUTSIDE the
+        // admission permit entirely — a pure lock-contention source, not
+        // the thing under test — holding a real SQLite write lock on the
+        // SAME database file via `BEGIN IMMEDIATE`.
+        let mut lock_conn = sqlx::sqlite::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::from_str(&format!(
+                "sqlite://{}",
+                db_path.display()
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock_conn)
+            .await
+            .unwrap();
+
+        // `max_connections(5) - 1 = 4`: the exact headroom design §6.5's
+        // MUST contract #2 requires.
+        let shared_admission = admission(4);
+        let limiter = generous_limiter();
+
+        // 4 real `remember_checked` calls, split across BOTH modules — each
+        // acquires a real admission permit AND a real pool connection, then
+        // genuinely blocks trying to `INSERT` against the external write
+        // lock (`busy_timeout`), holding both for real — not a stand-in.
+        // `spawn_and_confirm_blocked` (Codex round 2, Low) waits for each
+        // task's first real `Poll::Pending` — proof it actually blocked,
+        // not a `sleep` guessing it probably did by now.
+        let mut write_tasks = Vec::new();
+        for i in 0..4u32 {
+            let m = if i % 2 == 0 {
+                holder.clone()
+            } else {
+                contender.clone()
+            };
+            let admission = shared_admission.clone();
+            let limiter = limiter.clone();
+            write_tasks.push(
+                spawn_and_confirm_blocked(Box::pin(async move {
+                    m.remember_checked(
+                        None,
+                        limiter,
+                        admission,
+                        Remember::new("note", serde_json::Map::new()),
+                    )
+                    .await
+                }))
+                .await,
+            );
+        }
+        assert_eq!(
+            shared_admission.available_permits(),
+            0,
+            "all 4 permits must be held by real writers"
+        );
+        for t in &write_tasks {
+            assert!(
+                !t.is_finished(),
+                "each write must still be blocked on the external write lock"
+            );
+        }
+
+        // Headroom (design §6.5 MUST contract #2): a 5th, IN-PROCESS read
+        // — `ScopedMemory::recent`, which T8.5c v1 decision D4 already
+        // established does not take this permit at all — must still
+        // succeed on the pool's 5th connection while the other 4 sit busy.
+        // WAL mode is what makes this a read against a committed snapshot
+        // rather than a wait on the pending writer. Bounded by an explicit
+        // timeout (Codex round 2, Low) so a regression that DOES starve it
+        // fails fast with a clear message instead of hanging the suite.
+        let headroom_read =
+            tokio::time::timeout(std::time::Duration::from_secs(5), holder.recent(10))
+                .await
+                .expect("the in-process path must not be starved by 4 busy OOP writers");
+        assert!(headroom_read.is_ok(), "{headroom_read:?}");
+
+        // A 6th, 7th and 8th call — through `remember_checked`, `recall_page`
+        // AND `recent_page` respectively (M4: "not just remember_checked" —
+        // Codex round 2 explicitly asked for the queued `remember_checked`
+        // case too, not just the two reads) — must queue on the exhausted
+        // admission permit. The pool itself still has an idle connection at
+        // this point (the headroom read above returned it) — the fact that
+        // matters is that these three are blocked by the PERMIT, not by a
+        // lack of pool connections, which is exactly what M4 asks this
+        // judgement to distinguish.
+        let remember_probe = {
+            let holder = holder.clone();
+            let admission = shared_admission.clone();
+            let limiter = limiter.clone();
+            spawn_and_confirm_blocked(Box::pin(async move {
+                holder
+                    .remember_checked(
+                        None,
+                        limiter,
+                        admission,
+                        Remember::new("note", serde_json::Map::new()),
+                    )
+                    .await
+            }))
+            .await
+        };
+        let recall_probe = {
+            let holder = holder.clone();
+            let admission = shared_admission.clone();
+            let limiter = limiter.clone();
+            spawn_and_confirm_blocked(Box::pin(async move {
+                let needle = Needle::normalize("");
+                holder
+                    .recall_page(None, limiter, admission, &needle, 1, None)
+                    .await
+            }))
+            .await
+        };
+        let recent_probe = {
+            let contender = contender.clone();
+            let admission = shared_admission.clone();
+            let limiter = limiter.clone();
+            spawn_and_confirm_blocked(Box::pin(async move {
+                contender
+                    .recent_page(None, limiter, admission, 1, None)
+                    .await
+            }))
+            .await
+        };
+        assert!(
+            !remember_probe.is_finished(),
+            "a 5th remember_checked must queue on the same exhausted permit"
+        );
+        assert!(
+            !recall_probe.is_finished(),
+            "recall_page must queue on the same exhausted permit"
+        );
+        assert!(
+            !recent_probe.is_finished(),
+            "recent_page must queue on the same exhausted permit"
+        );
+
+        // Release the external write lock — the 4 real writes unblock and
+        // commit, freeing their permits AND their pool connections, which
+        // is what finally lets the three queued OOP calls proceed.
+        sqlx::query("COMMIT").execute(&mut lock_conn).await.unwrap();
+        drop(lock_conn);
+
+        for t in write_tasks {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), t)
+                .await
+                .expect("each write must complete once the external lock releases")
+                .unwrap();
+            assert!(outcome.is_ok(), "{outcome:?}");
+        }
+        // The three queued probes were spawned WHILE all 4 permits were
+        // held, and SQLite serializes the 4 real writes one at a time as
+        // the external lock releases — so a queued probe can be admitted
+        // (and run its query) as soon as just ONE of the 4 permits frees,
+        // not necessarily after all 4 writes have landed. That race is
+        // real and does not need suppressing: what judgement 9b actually
+        // asks this test to prove is that all three calls DO complete once
+        // permits become available (not stuck forever on a permit no
+        // release path reaches) — not a specific row count at an
+        // unspecified point in that interleaving, which `page_size=1`
+        // already bounds to at most one row either way.
+        let remembered = tokio::time::timeout(std::time::Duration::from_secs(5), remember_probe)
+            .await
+            .expect("the 5th remember_checked must proceed once a permit frees up")
+            .unwrap();
+        assert!(remembered.is_ok(), "{remembered:?}");
+        let recall_page = tokio::time::timeout(std::time::Duration::from_secs(5), recall_probe)
+            .await
+            .expect("recall_page must proceed once a permit frees up")
+            .unwrap()
+            .unwrap();
+        assert!(recall_page.items.len() <= 1);
+        let recent_page = tokio::time::timeout(std::time::Duration::from_secs(5), recent_probe)
+            .await
+            .expect("recent_page must proceed once a permit frees up")
+            .unwrap()
+            .unwrap();
+        assert!(recent_page.items.len() <= 1);
+    }
+
+    // ---- judgement 9b, cancellation while queued on the admission permit ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_queued_on_the_admission_permit_can_be_cancelled_cleanly() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let m = handle(&kv, "alice", "sin90").await;
+        seed(&m, 1, "note").await;
+        let shared_admission = admission(1);
+        let _held = shared_admission.clone().acquire_owned().await.unwrap();
+        let limiter = generous_limiter();
+
+        let generation =
+            agent24_os_proto::drain::Generation::serving_at("/tmp/does-not-need-to-exist".into());
+        assert!(generation.ready());
+        let in_flight = generation
+            .admit_request(
+                "queued-cancel".to_owned(),
+                [0u8; 32],
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+        let lifecycle = generation.request_lifecycle("queued-cancel").unwrap();
+
+        let needle = Needle::normalize("");
+        let call = m.recall_page(
+            Some(lifecycle),
+            limiter,
+            shared_admission.clone(),
+            &needle,
+            1,
+            None,
+        );
+        let mut call = Box::pin(call);
+        tokio::select! {
+            _ = &mut call => panic!("must be queued, not completed, while the permit is held"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(30)) => {}
+        }
+        // Cancel while still queued (never touched the DB) — this must
+        // produce no response, and must not leave the permit count
+        // corrupted.
+        let _ = in_flight.finish();
+        let outcome = call.await;
+        assert!(
+            outcome.is_err(),
+            "a cancelled queued call must not produce a page"
+        );
+        drop(_held);
+        // The permit must still be exactly usable once — proving the
+        // cancelled call's (never-acquired) slot was not double-counted.
+        let _p = shared_admission.clone().acquire_owned().await.unwrap();
+        assert_eq!(shared_admission.available_permits(), 0);
     }
 }
