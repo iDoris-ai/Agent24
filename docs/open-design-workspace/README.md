@@ -6,7 +6,8 @@
 
 - Git 分支：`feat/open-design-workspace`
 - 独立 worktree：`/Users/jason/Dev/auraai/Agent24-open-design-workspace`
-- 基线提交：`04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
+- 初始基线提交：`04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
+- 已同步 Agent24 主干至：`ef768023fd54d83d1d5220cbfacec4d7ba07c73c`
 - 状态：**仅完成资料归档与工作计划，尚未开始实现**
 - 下一门禁：计划需由仓库所有者 review/批准
 
@@ -14,6 +15,8 @@
 
 - [原始共享会话](source/chatgpt-shared-conversation-2026-09-19.md)
 - [实施计划（待 review）](PLAN.md)
+- [如何启动与多 Agent 执行规则](EXECUTION.md)
+- [Agent24 主干依赖台账](AGENT24-DEPENDENCIES.md)
 
 ## 原始会话完整性
 
@@ -30,4 +33,4 @@
 
 ## 协作约定
 
-原始 `Agent24` worktree 保持在 `main`，供当前其他工作继续使用；本工作只在独立 worktree 上进行。若 `main` 有新变化，本分支采用显式 merge 同步，不对已共享的集成分支做强制 rebase，也不覆盖其他 worktree 的未提交内容。
+原始 `Agent24` worktree 保持在 `main`，供当前其他工作继续使用；本工作只在独立 worktree 上进行。若 `main` 有新变化，本分支先审计差异，再采用显式 merge 同步，不对已共享的集成分支做强制 rebase，也不覆盖其他 worktree 的未提交内容。

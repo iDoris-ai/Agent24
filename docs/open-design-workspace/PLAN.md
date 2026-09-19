@@ -6,7 +6,9 @@
 >
 > 工作分支：`feat/open-design-workspace`
 >
-> 基线：Agent24 `04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
+> 初始基线：Agent24 `04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
+>
+> 已同步主干：Agent24 `ef768023fd54d83d1d5220cbfacec4d7ba07c73c`
 
 ## 1. 目标与非目标
 
@@ -51,6 +53,8 @@
 ### 由事实得出的结论
 
 网页版讨论的总体方向成立，但真正的第一个技术前置不是“加一个 runtime def”，而是先补齐 Agent24 的 **按 run workspace contract**。否则 ACP 能对话，却不能安全地在正确的 Open Design 项目目录中生成和修改 artifact。
+
+Agent24 主干依赖、负责分支、合并顺序和非依赖项统一登记在 [AGENT24-DEPENDENCIES.md](AGENT24-DEPENDENCIES.md)。P2 workspace contract 与 P3 ACP bridge 在最终集成前必须进入 Agent24 主干；桌面 sidecar/WebContentsView 线可以与后端依赖线并行开发。
 
 ## 3. 建议冻结的技术选择
 
@@ -100,6 +104,8 @@ Agent24 Electron main process
 ## 5. 工作分解
 
 每个阶段必须独立通过验收门禁后才能进入下一阶段。估时按 1 名熟悉两个代码库的工程师计算，不包含外部评审等待时间。
+
+具体执行采用“强模型设计冻结 → 多个 Luna 在独立 worktree 分波次实现 → 5.6-SOL review → 修复与复审 → 主线程合并”的方式，启动口令和控制语义见 [EXECUTION.md](EXECUTION.md)。P0–P9 不会被一次性同时启动；只有依赖独立、文件所有权不重叠的工作才并行。
 
 ### P0 — 决策冻结与基线（1–2 天）
 
@@ -326,6 +332,7 @@ Agent24 Electron main process
 ### Agent24 仓库
 
 - `feat/open-design-workspace` 是本工作的 integration branch。
+- Agent24 主干硬依赖使用独立 feature branches 实现并分别进入 `main`，不长期只存在于 integration branch；权威清单见 [AGENT24-DEPENDENCIES.md](AGENT24-DEPENDENCIES.md)。
 - 大块实现优先使用短分支/小 PR，再合回 integration branch，避免一个不可评审的大提交。
 - `main` 更新后：先 `fetch`，查看差异和测试状态，再显式 merge `origin/main`。
 - integration branch 一旦共享，不 force-push、不重写别人已基于的历史。
