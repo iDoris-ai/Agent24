@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Row, Sqlite, Transaction};
 
 use crate::{Result, Store, StoreError};
 
@@ -39,22 +39,16 @@ fn entry_hash(prev_hash: &str, ts: &str, actor: &str, action: &str, detail: &str
 }
 
 impl Store {
-    /// Append an audit entry, chaining onto the latest hash. Serialized via
-    /// BEGIN IMMEDIATE so concurrent appends cannot fork the chain.
-    pub async fn append_audit(
-        &self,
+    pub(crate) async fn append_audit_tx(
+        tx: &mut Transaction<'_, Sqlite>,
         ts: &str,
         actor: &str,
         action: &str,
         detail: &Value,
     ) -> Result<AuditEntry> {
         let detail_str = serde_json::to_string(detail)?;
-        // BEGIN IMMEDIATE: take the write lock up front so two concurrent
-        // appends can never read the same prev_hash and fork the chain
-        // (a plain begin() is DEFERRED and only locks at first write).
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let prev_hash: String = sqlx::query("SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1")
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .map(|r| r.get("hash"))
             .unwrap_or_else(|| GENESIS.to_owned());
@@ -69,9 +63,8 @@ impl Store {
         .bind(&detail_str)
         .bind(&prev_hash)
         .bind(&hash)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        tx.commit().await?;
         Ok(AuditEntry {
             seq: result.last_insert_rowid(),
             ts: ts.to_owned(),
@@ -81,6 +74,24 @@ impl Store {
             prev_hash,
             hash,
         })
+    }
+
+    /// Append an audit entry, chaining onto the latest hash. Serialized via
+    /// BEGIN IMMEDIATE so concurrent appends cannot fork the chain.
+    pub async fn append_audit(
+        &self,
+        ts: &str,
+        actor: &str,
+        action: &str,
+        detail: &Value,
+    ) -> Result<AuditEntry> {
+        // BEGIN IMMEDIATE: take the write lock up front so two concurrent
+        // appends can never read the same prev_hash and fork the chain
+        // (a plain begin() is DEFERRED and only locks at first write).
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let entry = Self::append_audit_tx(&mut tx, ts, actor, action, detail).await?;
+        tx.commit().await?;
+        Ok(entry)
     }
 
     pub async fn list_audit(&self) -> Result<Vec<AuditEntry>> {
