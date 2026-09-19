@@ -281,7 +281,27 @@ fn start(home: &Path) -> Daemon {
     }
 }
 
-fn stop(d: Daemon) {
+/// Graceful first: the module is spawned into its own process group
+/// (`agent24_os_proto::launch`) and the daemon's own supervisor is what
+/// terminates that group on a clean shutdown — a daemon SIGKILLed outright
+/// never runs that logic (`agent24_os_proto::supervise` documents this),
+/// which reliably orphaned the Python module blocked forever in
+/// `listener.accept()` before this fix (Codex review). SIGTERM and a bounded
+/// wait give the daemon's real shutdown path a chance to reap it; `Running`'s
+/// `Drop` (unconditional SIGKILL) remains the safety net for a test that
+/// panics before reaching here.
+fn stop(mut d: Daemon) {
+    let pid = d.run.0.id();
+    if Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        let by = Instant::now() + Duration::from_secs(10);
+        while d.run.0.try_wait().unwrap().is_none() && Instant::now() < by {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     drop(d);
 }
 
