@@ -1062,13 +1062,19 @@ mod real_resource_tests {
 
         let g = running_generation();
         // A budget far shorter than the pool's 5s `busy_timeout` (judgement
-        // 7's setup, same constant) — the queue wait WILL outlast it.
+        // 7's setup, same constant) — the queue wait WILL outlast it. 300ms,
+        // not 50ms (Codex review round 2, Low): `spawn_and_confirm_blocked`
+        // must observe a real `Pending` poll BEFORE this budget elapses, and
+        // on a loaded CI runner 50ms was tight enough to risk a scheduling
+        // delay racing the budget itself, which would fail loud rather than
+        // silently pass — still comfortably under the 5s busy_timeout, so it
+        // does not risk the filler tasks timing out first.
         let _live = g
             .admit_request(
                 "r1".to_owned(),
                 [0u8; 32],
                 Instant::now(),
-                Duration::from_millis(50),
+                Duration::from_millis(300),
             )
             .unwrap();
         // Codex review round 1 (M3): use `RecallHandler` (matches the
