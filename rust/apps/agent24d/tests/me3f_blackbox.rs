@@ -57,14 +57,16 @@ use std::time::{Duration, Instant};
 
 /// The out-of-process module: declares `events`/`memory`/`approval`, does two
 /// real callback round trips right after handshaking (remember, recall —
-/// neither needs a live HTTP request), then serves exactly one HTTP request
-/// through the real proxy. Inside that request's handler — because both
-/// calls genuinely cannot happen any earlier — it reads the real per-request
-/// headers, submits `_a24/approval/gate` once with a DELIBERATELY WRONG
-/// token (must be rejected without consuming the real one), once for real,
-/// and emits `_a24/events/emit` — moved here, not right after handshake, so
-/// a WS subscriber the Rust test connects BEFORE this request is what proves
-/// delivery, not just the callback's ack.
+/// neither needs a live HTTP request), then serves HTTP requests through the
+/// real proxy IN A LOOP — more than one, because the Rust side may need to
+/// retry its trigger if the WS subscriber it connects before this loop races
+/// the daemon's own subscription setup (see `spawn_ws_subscriber`'s doc).
+/// Inside each request's handler — because both calls genuinely cannot
+/// happen any earlier — it reads the real per-request headers, submits
+/// `_a24/approval/gate` once with a DELIBERATELY WRONG token (must be
+/// rejected without consuming the real one), once for real, and emits
+/// `_a24/events/emit` — moved here, not right after handshake, so a WS
+/// subscriber proves delivery, not just the callback's ack.
 const BLACKBOX_MODULE: &str = r#"import hashlib, json, os, socket, sys
 with open("domain-os.yml", "rb") as f:
     digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
@@ -376,42 +378,50 @@ fn a_package_from_outside_the_repo() {
     // The module's handler also submits a real `_a24/approval/gate`, which
     // itself broadcasts `module-approval.required` on the same bus — so each
     // attempt reads until it finds a `module`-typed frame rather than
-    // assuming the first one it sees is it. The overall deadline is checked
-    // BEFORE every blocking receive (not derived from a possibly-already-hit
-    // one, and never satisfied by a message that merely arrived before it
-    // expired) — a steady stream of non-`module` frames cannot spin this
-    // loop past it.
+    // assuming the first one it sees is it.
+    //
+    // The retry trigger runs on ITS OWN thread and is never awaited directly
+    // — a synchronous `get()` in the middle of this loop would let its own
+    // (up to 10s) socket read timeout blow straight through
+    // `overall_deadline`, or return just after an event it caused already
+    // landed, only for the deadline check right after it to discard that
+    // event as "too late". Every wait below is bounded by
+    // `overall_deadline` alone, computed fresh each iteration — never by a
+    // fixed per-attempt window that could itself outlive it.
     let overall_deadline = Instant::now() + Duration::from_secs(30);
-    let event = 'retry: loop {
-        let per_attempt_deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            assert!(
-                Instant::now() < overall_deadline,
-                "the WS subscriber connected before the request never received \
-                 the module's event after retrying the trigger; daemon stderr:\n{}",
-                d2.recent_stderr()
-            );
-            let remaining = per_attempt_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                // This attempt's window closed with no `module` frame — retry
-                // the trigger (the subscription is certainly live by now if
-                // it was merely racing the first one) rather than waiting
-                // out the full overall deadline on a single attempt.
-                let (status, _) = get(d2.port, &d2.token, "/api/v1/blackbox/hi")
-                    .expect("the module answered before; a retry must too");
-                assert_eq!(status, 200);
-                continue 'retry;
-            }
-            match events.recv_timeout(remaining) {
-                Ok(event) if event["type"] == "module" => break 'retry event,
-                Ok(_) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "the WS subscriber thread ended; daemon stderr:\n{}",
-                        d2.recent_stderr()
-                    )
-                }
+    let mut next_retry_at = Instant::now() + Duration::from_secs(3);
+    let event = loop {
+        let remaining = overall_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "the WS subscriber connected before the request never received \
+             the module's event after retrying the trigger; daemon stderr:\n{}",
+            d2.recent_stderr()
+        );
+        if Instant::now() >= next_retry_at {
+            // Fire-and-forget: this thread's own success/failure is not
+            // asserted on — the FIRST trigger already proved the proxy round
+            // trip (round trips 1/2 above); a retry here exists only to give
+            // the module another chance to emit in case the previous one
+            // raced the WS subscription. If the daemon is genuinely gone,
+            // `recv_timeout` below will time out on `overall_deadline` and
+            // fail with a clear message instead.
+            let (port, token) = (d2.port, d2.token.clone());
+            std::thread::spawn(move || {
+                let _ = get(port, &token, "/api/v1/blackbox/hi");
+            });
+            next_retry_at = Instant::now() + Duration::from_secs(3);
+        }
+        let step = remaining.min(next_retry_at.saturating_duration_since(Instant::now()));
+        match events.recv_timeout(step) {
+            Ok(event) if event["type"] == "module" => break event,
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "the WS subscriber thread ended; daemon stderr:\n{}",
+                    d2.recent_stderr()
+                )
             }
         }
     };
@@ -489,8 +499,14 @@ fn a_package_from_outside_the_repo() {
 
 /// Connect to the real `GET /api/v1/events` WS endpoint and hand back a
 /// channel of decoded [`agent24_protocol::Event`] JSON values, one per
-/// frame. Blocks until the WS upgrade completes, so a caller that calls this
-/// before triggering whatever should emit an event cannot miss it to a race.
+/// frame. Blocks until the CLIENT side of the WS upgrade completes — this is
+/// NOT proof the server has reached `hub.subscribe()` yet (that runs inside
+/// the task the upgrade handler spawns, a moment strictly after the upgrade
+/// response is sent), and the hub has no replay, so an event fired in that
+/// gap is lost for good, not merely delayed. A caller cannot treat "this
+/// function returned" as "no event before my next line can be missed" — see
+/// the retry loop at the one call site for how that residual race is
+/// actually closed.
 fn spawn_ws_subscriber(port: u16, token: &str) -> std::sync::mpsc::Receiver<serde_json::Value> {
     use tokio_tungstenite::tungstenite;
     use tungstenite::client::IntoClientRequest;
