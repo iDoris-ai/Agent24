@@ -163,16 +163,15 @@ impl OwnedGeneration {
     pub fn reap_after_stop(&mut self) -> Result<ExitStatus, StopError> {
         if matches!(self.phase, Phase::Reaped) {
             self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
-            return self
-                .status
-                .clone()
-                .ok_or(StopError::Unconfirmed {
-                    operation: "reap",
-                    source: io::Error::other("reaped generation has no exit status"),
-                });
+            return self.status.ok_or(StopError::Unconfirmed {
+                operation: "reap",
+                source: io::Error::other("reaped generation has no exit status"),
+            });
         }
         if !matches!(self.phase, Phase::ForceKillRequested) {
-            return Err(StopError::InvalidState("generation has not been force-killed"));
+            return Err(StopError::InvalidState(
+                "generation has not been force-killed",
+            ));
         }
 
         // WNOWAIT pins the leader's PID/PGID while the mandatory group kill is
@@ -185,7 +184,7 @@ impl OwnedGeneration {
             });
         }
         let status = self.reap_bounded(LEADER_EXIT_TIMEOUT)?;
-        self.status = Some(status.clone());
+        self.status = Some(status);
         self.phase = Phase::Reaped;
         self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
         Ok(status)
@@ -297,7 +296,9 @@ impl Drop for OwnedGeneration {
             // Drop is deliberately non-blocking. Child::wait here used to
             // hang the host forever on an uninterruptible process; ownership
             // is reported as unconfirmed by the next explicit stop attempt.
-            let _ = killpg(self.group, Signal::SIGKILL);
+            // Reuse the ownership-safe signal path so macOS EPERM is only
+            // accepted after WNOWAIT confirms this leader has exited.
+            let _ = self.signal(Signal::SIGKILL, Phase::ForceKillRequested);
         }
     }
 }
@@ -316,6 +317,13 @@ mod tests {
 
     fn sleeping_generation() -> OwnedGeneration {
         match OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("sleep 30")) {
+            Ok(generation) => generation,
+            Err(error) => panic!("spawn /bin/sh: {error}"),
+        }
+    }
+
+    fn exiting_generation() -> OwnedGeneration {
+        match OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 0")) {
             Ok(generation) => generation,
             Err(error) => panic!("spawn /bin/sh: {error}"),
         }
@@ -345,5 +353,56 @@ mod tests {
         };
         assert!(!status.success());
         assert!(generation.force_kill().is_err());
+    }
+
+    #[test]
+    fn phase_transitions_are_monotonic_and_idempotent() {
+        let mut generation = sleeping_generation();
+        assert!(generation.terminate().is_ok());
+        assert!(generation.terminate().is_ok());
+        assert!(generation.force_kill().is_ok());
+        assert!(generation.force_kill().is_ok());
+        // A force-kill request is terminal for signalling; terminate must not
+        // regress it or send SIGTERM after SIGKILL.
+        assert!(generation.terminate().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
+        assert!(generation.terminate().is_err());
+    }
+
+    #[test]
+    fn drop_does_not_wait_for_the_child() {
+        let started = std::time::Instant::now();
+        let generation = sleeping_generation();
+        drop(generation);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "Drop unexpectedly waited for the child"
+        );
+    }
+
+    #[test]
+    fn exited_leader_is_confirmed_before_group_kill_and_reap() {
+        let mut generation = exiting_generation();
+        assert!(matches!(
+            generation.wait_for_leader_exit(std::time::Duration::from_secs(1)),
+            Ok(true)
+        ));
+        assert!(generation.force_kill().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
+    }
+
+    /// This exercises the macOS all-zombie `killpg(SIGKILL) -> EPERM` case.
+    /// Other platforms do not claim this regression because their kernel
+    /// reports a different result for an exited, unreaped process group.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_exited_unreaped_group_eperm_is_retry_safe() {
+        let mut generation = exiting_generation();
+        assert!(matches!(
+            generation.wait_for_leader_exit(std::time::Duration::from_secs(1)),
+            Ok(true)
+        ));
+        assert!(generation.force_kill().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
     }
 }
