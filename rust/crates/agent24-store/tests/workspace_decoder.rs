@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent24_store::{Store, WorkspaceRow, test_hooks};
+use agent24_store::{Store, WorkspaceInstant, WorkspaceRow, test_hooks};
 
 const CREATED: &str = "2026-09-19T00:00:00.000Z";
 const EXPIRES: &str = "2026-09-20T00:00:00.000Z";
@@ -155,4 +155,20 @@ async fn workspace_decoder_matches_cleanup_state_nullability() {
     )
     .await;
     assert!(decode(&store, id).await.is_ok());
+}
+
+#[tokio::test]
+async fn workspace_timestamps_require_fixed_utc_z_shape() {
+    assert!(WorkspaceInstant::parse("2026-09-19T07:00:00.000+07:00").is_err());
+    assert!(WorkspaceInstant::parse("2026-09-19T00:00:00.000+00:00").is_err());
+
+    let store = Store::open_memory().await.unwrap();
+    let id = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4Y1";
+    seed(&store, id).await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET created_at = '2026-09-19T07:00:00.000+07:00' WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4Y1'",
+    )
+    .await;
+    assert!(decode(&store, id).await.is_err());
 }
