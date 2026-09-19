@@ -653,6 +653,34 @@ mod tests {
     }
 
     #[test]
+    fn dropped_leader_reap_retry_keeps_permit_until_group_is_empty() {
+        let _test_guard = test_lock();
+        let mut generation = OwnedGeneration::launch(
+            LaunchSpec::new("/bin/sh", "/")
+                .arg("-c")
+                .arg("sleep 30 & exit 0"),
+        )
+        .unwrap_or_else(|error| panic!("spawn /bin/sh: {error}"));
+        assert!(matches!(
+            generation.wait_for_leader_exit(Duration::from_secs(1)),
+            Ok(true)
+        ));
+        let status = generation
+            .reap_bounded(Duration::from_secs(1))
+            .unwrap_or_else(|error| panic!("reap leader: {error}"));
+        let group = generation.group;
+        generation.status = Some(status);
+        generation.phase = Phase::LeaderReaped;
+        drop(generation);
+
+        let second =
+            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 0"));
+        assert!(matches!(second, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        let _ = killpg(group, Signal::SIGKILL);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
     fn phase_transitions_are_monotonic_and_idempotent() {
         let _test_guard = test_lock();
         let mut generation = sleeping_generation();
