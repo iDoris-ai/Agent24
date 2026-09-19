@@ -16,6 +16,7 @@ pub mod workspace_api;
 pub mod workspace_decode;
 pub(crate) mod workspace_decode_support;
 pub mod workspace_lease_decode;
+mod workspace_registry;
 pub(crate) mod workspace_tx;
 pub mod workspaces;
 pub use workspace_api::{
