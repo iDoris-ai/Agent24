@@ -1416,8 +1416,28 @@ async fn mount_package(
         let granted = granted.clone();
         let event_sink = event_sink.clone();
         let approval_broker = approval_broker.clone();
+        // T8.5c-W-mount decision 3: captured HERE, outside the `move`
+        // closure below, and only `.clone()`d inside it — the opposite of
+        // `_a24/events/emit`'s limiter, which is deliberately rebuilt every
+        // generation. `memory_entitlement` was already computed exactly
+        // once for this mount (above); if it were not captured into this
+        // closure at all, the `Arc<RateLimiter>`/`Arc<Semaphore>` it holds
+        // would be dropped the moment `mount_package` returns, and nothing
+        // would keep decision 3's "one limiter per mount, reused across
+        // every restart generation" promise. `_a24/memory/private/*`'s
+        // `Handler::call()` implementation is T8.5c-W-wire's job (not this
+        // document's, §8) — this crate has no method to register it with
+        // yet, so the binding is unread for now (`_`-prefixed on purpose,
+        // like `PrivateMemoryHandle`'s fields — see their own doc comment).
+        let _memory_entitlement = memory_entitlement.clone();
         Arc::new(
             move |generation: &Arc<agent24_os_proto::drain::Generation>| {
+                // Capturing `_memory_entitlement` into this generation-scoped
+                // closure body (not just the outer one) is what makes it
+                // survive as long as the `Arc<dyn Fn>` this whole block
+                // builds does — i.e. for the module's entire supervised
+                // lifetime, not just until this block finishes running.
+                let _memory_entitlement = _memory_entitlement.clone();
                 // A fresh bucket every time this closure runs — once per
                 // generation, i.e. once per (re)start. Building it outside the
                 // closure and cloning the `Arc` in would let a restarted module
@@ -1520,9 +1540,23 @@ async fn mount_package(
     // T8.5c-W-mount decision 5 (H1): only now — supervisor slot occupied,
     // child task spawned — is this partition really "mounted" in the sense
     // that lets the durable catalog advance `last_seen_at`. The two failure
-    // branches above return before reaching here, so a `lend()` that
-    // succeeded but whose module then failed to start leaves the durable
-    // identity row recorded (from `ensure_recorded`) but NOT marked active.
+    // branches above `return` before reaching here (verified by reading the
+    // `match` above, twice, independently — this is the exact H1 regression
+    // this decision exists to prevent), so a `lend()` that succeeded but
+    // whose module then failed to start leaves the durable identity row
+    // recorded (from `ensure_recorded`) but NOT marked active.
+    //
+    // Known gap, honestly recorded rather than silently skipped: there is
+    // no end-to-end test that forces `Some(Err(held))` specifically (a real
+    // supervisor-slot conflict) — `mount_all`'s own `claimed.insert(name)`
+    // check already makes it unreachable in ordinary sequential mounting,
+    // and provoking it would need an injectable seam into
+    // `agent24_os_proto::supervisor::supervise` that does not exist today.
+    // `an_oop_module_whose_partition_cannot_be_recorded_mounts_without_memory`
+    // (this module's tests) covers the other, reachable failure —
+    // `ensure_recorded` itself failing — end to end; the catalog-level
+    // `mark_mounted`/`ensure_recorded` split (`os_memory::tests`) covers the
+    // durable-state half of this exact scenario directly.
     if let Some((_, partition, _, lease)) = memory_lend {
         partitions
             .mark_mounted(partition, &lease.kv, &agent24_memory::SystemClock)

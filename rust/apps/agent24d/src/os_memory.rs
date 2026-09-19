@@ -317,10 +317,12 @@ pub struct OsMemoryPartition {
 /// - the partition a module left behind when it was renamed,
 /// - partitions created under an older [`KEY_VERSION`].
 ///
-/// Those four are the entire reason a catalog was required. So [`Self::record`]
-/// now WRITES, and the `Vec` is what it says it is: this run's mount inventory,
-/// used for the startup log and for tests. Anything asking "which partitions
-/// exist for this org" must ask the table — [`Self::durable_for_org`] — not this.
+/// Those four are the entire reason a catalog was required. So
+/// [`Self::ensure_recorded`] now WRITES, and the `Vec` (populated by
+/// [`Self::mark_mounted`]) is what it says it is: this run's mount
+/// inventory, used for the startup log and for tests. Anything asking
+/// "which partitions exist for this org" must ask the table —
+/// [`Self::durable_for_org`] — not this.
 #[derive(Debug, Clone, Default)]
 pub struct OsMemoryCatalog {
     partitions: Vec<OsMemoryPartition>,
