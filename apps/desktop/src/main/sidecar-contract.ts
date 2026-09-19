@@ -38,12 +38,17 @@ export interface SidecarOwnership {
   readonly startedAt: number
 }
 
-export function createOwnership(sidecarId: string, pid: number): SidecarOwnership {
+/** `processGroupId` is evidence from the launcher that a dedicated group exists. */
+export function createOwnership(
+  sidecarId: string,
+  pid: number,
+  processGroupId: number | null = null,
+): SidecarOwnership {
   return {
     sidecarId,
     instanceId: randomUUID(),
     pid,
-    processGroupId: process.platform === 'win32' ? null : pid,
+    processGroupId,
     startedAt: Date.now(),
   }
 }

@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { MemoryEndpointHandoff } from './sidecar-contract'
+import { createOwnership, MemoryEndpointHandoff } from './sidecar-contract'
+
+describe('createOwnership', () => {
+  it('only records a process group when the launcher proves one exists', () => {
+    expect(createOwnership('creative', 123).processGroupId).toBeNull()
+    expect(createOwnership('creative', 123, 123).processGroupId).toBe(123)
+  })
+})
 
 describe('MemoryEndpointHandoff', () => {
   it('publishes a host-only endpoint and returns a defensive copy', () => {
