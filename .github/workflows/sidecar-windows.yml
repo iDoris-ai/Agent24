@@ -1,0 +1,60 @@
+name: Sidecar Windows
+
+on:
+  pull_request:
+    paths:
+      - "rust/apps/agent24-sidecar-host/**"
+      - "rust/crates/agent24-sidecar-host-protocol/**"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/sidecar-windows.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sidecar-windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust sidecar host + protocol
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-sidecar-windows-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+
+      - name: fmt
+        working-directory: rust
+        shell: bash
+        run: cargo fmt --check --package agent24-sidecar-host --package agent24-sidecar-host-protocol
+
+      - name: check
+        working-directory: rust
+        run: cargo check --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol
+
+      - name: test
+        working-directory: rust
+        run: cargo test --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol
+
+      - name: clippy
+        working-directory: rust
+        run: cargo clippy --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol --all-targets -- -D warnings
