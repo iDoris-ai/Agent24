@@ -73,7 +73,9 @@ impl WorkspaceInstant {
                 field: "expires_at",
             })?
             .to_rfc3339_opts(SecondsFormat::Millis, true);
-        Self::parse(&text)
+        Self::parse(&text).map_err(|_| WorkspaceStoreError::InvalidValue {
+            field: "expires_at",
+        })
     }
 }
 
