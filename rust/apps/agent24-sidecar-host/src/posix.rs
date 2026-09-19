@@ -58,6 +58,7 @@ enum Phase {
     Running,
     TerminationRequested,
     ForceKillRequested,
+    LeaderReaped,
     Reaped,
 }
 
@@ -167,7 +168,7 @@ impl OwnedGeneration {
     pub fn terminate(&mut self) -> io::Result<()> {
         match self.phase {
             Phase::Running => self.signal(Signal::SIGTERM, Phase::TerminationRequested),
-            Phase::TerminationRequested | Phase::ForceKillRequested => Ok(()),
+            Phase::TerminationRequested | Phase::ForceKillRequested | Phase::LeaderReaped => Ok(()),
             Phase::Reaped => Err(invalid_state("generation has been reaped")),
         }
     }
@@ -179,7 +180,7 @@ impl OwnedGeneration {
             }
             // A force-kill request is idempotent. In particular, a later
             // terminate call cannot regress this phase or send SIGTERM.
-            Phase::ForceKillRequested => Ok(()),
+            Phase::ForceKillRequested | Phase::LeaderReaped => Ok(()),
             Phase::Reaped => Err(invalid_state("generation has been reaped")),
         }
     }
@@ -189,6 +190,15 @@ impl OwnedGeneration {
     pub fn reap_after_stop(&mut self) -> Result<ExitStatus, StopError> {
         if matches!(self.phase, Phase::Reaped) {
             self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
+            self.permit.take();
+            return self.status.ok_or(StopError::Unconfirmed {
+                operation: "reap",
+                source: io::Error::other("reaped generation has no exit status"),
+            });
+        }
+        if matches!(self.phase, Phase::LeaderReaped) {
+            self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
+            self.phase = Phase::Reaped;
             self.permit.take();
             return self.status.ok_or(StopError::Unconfirmed {
                 operation: "reap",
@@ -212,8 +222,13 @@ impl OwnedGeneration {
         }
         let status = self.reap_bounded(LEADER_EXIT_TIMEOUT)?;
         self.status = Some(status);
-        self.phase = Phase::Reaped;
+        // Keep a distinct state while group confirmation is pending. If the
+        // bounded confirmation fails, Drop must transfer the permit to a
+        // group-only retry job rather than releasing it with descendants
+        // still owned by this generation.
+        self.phase = Phase::LeaderReaped;
         self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
+        self.phase = Phase::Reaped;
         // The permit is released only after both exact-child reaping and
         // process-group emptiness have been confirmed.
         self.permit.take();
@@ -339,38 +354,47 @@ impl Drop for OwnedGeneration {
             // is reported as unconfirmed by the next explicit stop attempt.
             // Reuse the ownership-safe signal path so macOS EPERM is only
             // accepted after WNOWAIT confirms this leader has exited.
-            let _ = self.signal(Signal::SIGKILL, Phase::ForceKillRequested);
-            if let Some(child) = self.child.take() {
-                let permit = match self.permit.take() {
-                    Some(permit) => permit,
-                    None => {
-                        // This is an internal invariant violation: a live
-                        // child can only exist while its generation permit is
-                        // held. Abort before `Child` is dropped, so the host
-                        // cannot silently leak an unreaped process.
-                        std::process::abort();
-                    }
-                };
-                let job = ReapJob {
-                    child,
-                    group: self.group,
-                    _permit: permit,
-                    child_reaped: false,
-                };
-                if let Err(job) = global_reaper().enqueue(job) {
-                    // The permit makes this impossible in a valid state. Do
-                    // not drop the exact Child if corruption ever violates
-                    // that invariant: abort while it is still owned.
-                    let _ = job;
+            if self.phase != Phase::LeaderReaped {
+                let _ = self.signal(Signal::SIGKILL, Phase::ForceKillRequested);
+            }
+            let child = self.child.take();
+            let child_reaped = match (self.phase, child.is_some()) {
+                (Phase::LeaderReaped, false) => true,
+                (_, true) => false,
+                // A live generation cannot lose its exact Child without
+                // first becoming LeaderReaped; abort before that Child could
+                // be silently discarded.
+                _ => std::process::abort(),
+            };
+            let permit = match self.permit.take() {
+                Some(permit) => permit,
+                None => {
+                    // This is an internal invariant violation: a live
+                    // child can only exist while its generation permit is
+                    // held. Abort before `Child` is dropped, so the host
+                    // cannot silently leak an unreaped process.
                     std::process::abort();
                 }
+            };
+            let job = ReapJob {
+                child,
+                group: self.group,
+                _permit: permit,
+                child_reaped,
+            };
+            if let Err(job) = global_reaper().enqueue(job) {
+                // The permit makes this impossible in a valid state. Do not
+                // drop the exact Child if corruption ever violates that
+                // invariant: abort while it is still owned.
+                let _ = job;
+                std::process::abort();
             }
         }
     }
 }
 
 struct ReapJob {
-    child: Child,
+    child: Option<Child>,
     group: Pid,
     _permit: GenerationPermit,
     child_reaped: bool,
@@ -381,9 +405,12 @@ impl ReapJob {
     /// process group is confirmed empty. Errors retain the Child for retry.
     fn reap_once(&mut self) -> bool {
         if !self.child_reaped {
-            match self.child.try_wait() {
-                Ok(Some(_status)) => self.child_reaped = true,
-                Ok(None) | Err(_) => return false,
+            match self.child.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_status)) => self.child_reaped = true,
+                    Ok(None) | Err(_) => return false,
+                },
+                None => return false,
             }
         }
         group_is_empty(self.group)
