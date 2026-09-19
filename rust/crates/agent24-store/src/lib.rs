@@ -12,18 +12,22 @@
 mod audit;
 mod module_approvals;
 mod repo;
+pub mod workspace_api;
 pub mod workspace_decode;
 pub(crate) mod workspace_decode_support;
 pub mod workspace_lease_decode;
 pub(crate) mod workspace_tx;
 pub mod workspaces;
+pub use workspace_api::{
+    WorkspaceListCursor, WorkspaceListLimit, WorkspaceListQuery, WorkspacePage,
+};
 pub use workspace_decode::WorkspaceRow;
 pub use workspace_lease_decode::WorkspaceLeaseRow;
 pub use workspaces::{
     HostLeaseTtl, LeaseKind, LifecycleOwnerRef, NewScratchWorkspace, RootIdentity,
-    TrustedRootRegistration, WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceInstant,
-    WorkspaceKind, WorkspaceLeaseId, WorkspaceLeaseRecord, WorkspaceProvenanceInput,
-    WorkspaceResult, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
+    TrustedRootRegistration, WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceConflict,
+    WorkspaceInstant, WorkspaceKind, WorkspaceLeaseId, WorkspaceLeaseRecord,
+    WorkspaceProvenanceInput, WorkspaceResult, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
 };
 
 pub use audit::AuditEntry;
