@@ -163,7 +163,7 @@ impl OwnedGeneration {
     pub fn reap_after_stop(&mut self) -> Result<ExitStatus, StopError> {
         if matches!(self.phase, Phase::Reaped) {
             self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
-            return self.status.clone().ok_or(StopError::Unconfirmed {
+            return self.status.ok_or(StopError::Unconfirmed {
                 operation: "reap",
                 source: io::Error::other("reaped generation has no exit status"),
             });
@@ -184,7 +184,7 @@ impl OwnedGeneration {
             });
         }
         let status = self.reap_bounded(LEADER_EXIT_TIMEOUT)?;
-        self.status = Some(status.clone());
+        self.status = Some(status);
         self.phase = Phase::Reaped;
         self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
         Ok(status)
@@ -381,11 +381,10 @@ mod tests {
     #[test]
     fn exited_leader_is_confirmed_before_group_kill_and_reap() {
         let mut generation = exiting_generation();
-        assert!(
-            generation
-                .wait_for_leader_exit(std::time::Duration::from_secs(1))
-                .unwrap()
-        );
+        assert!(matches!(
+            generation.wait_for_leader_exit(std::time::Duration::from_secs(1)),
+            Ok(true)
+        ));
         assert!(generation.force_kill().is_ok());
         assert!(generation.reap_after_stop().is_ok());
     }
@@ -397,11 +396,10 @@ mod tests {
     #[test]
     fn macos_exited_unreaped_group_eperm_is_retry_safe() {
         let mut generation = exiting_generation();
-        assert!(
-            generation
-                .wait_for_leader_exit(std::time::Duration::from_secs(1))
-                .unwrap()
-        );
+        assert!(matches!(
+            generation.wait_for_leader_exit(std::time::Duration::from_secs(1)),
+            Ok(true)
+        ));
         assert!(generation.force_kill().is_ok());
         assert!(generation.reap_after_stop().is_ok());
     }
