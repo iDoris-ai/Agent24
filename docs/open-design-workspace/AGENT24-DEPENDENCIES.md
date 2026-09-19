@@ -1,12 +1,12 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 ready to implement
+> 状态：P0 frozen / A24-OD-00 gate passed, stacked PRs pending merge / A24-OD-01 in progress
 >
 > 日期：2026-09-19
 >
 > integration branch：`feat/open-design-workspace`
 >
-> 已审计 Agent24 主干：`origin/main@69baf50d62e6e3db5ca41a8882d35deb45ea3454`
+> 已审计 Agent24 主干：`origin/main@0495b5c70ac1a913a9cd04bdf24a1fc1f8809974`
 
 ## 1. 目的
 
@@ -36,7 +36,7 @@
 
 ### A24-OD-00 — Capability-scoped daemon authority
 
-状态：`DESIGN_FROZEN`
+状态：`IMPLEMENTED / SOL PASS / PR STACK OPEN`
 
 目标分支：`feat/a24-capability-auth`
 
@@ -56,7 +56,7 @@
 
 ### A24-OD-01 — Opaque workspace registry
 
-状态：`PLANNED`
+状态：`IN_PROGRESS`
 
 目标分支：`feat/a24-workspace-registry`
 

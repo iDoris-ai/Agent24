@@ -1,6 +1,6 @@
 # Agent24 × Open Design 实施计划（已批准，执行中）
 
-> 状态：Approved / P0 completed / A24-OD-00 next
+> 状态：Approved / P0 + A24-OD-00 + P1 gates passed / P2 in progress
 >
 > 日期：2026-09-19
 >
