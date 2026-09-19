@@ -341,7 +341,7 @@ Agent24 Electron main process
 
 - `feat/open-design-workspace` 是本工作的 integration branch。
 - Agent24 主干硬依赖使用独立 feature branches 实现并分别进入 `main`，不长期只存在于 integration branch；权威清单见 [AGENT24-DEPENDENCIES.md](AGENT24-DEPENDENCIES.md)。
-- 大块实现优先使用短分支/小 PR，再合回 integration branch，避免一个不可评审的大提交。
+- 实现按单一 feature/职责聚类为短分支和小 PR：默认目标不超过 190 个变更行，尽量不超过 200 行；达到上限先拆分，禁止积攒千行级 PR。不可分割的生成物或机械变更须显式说明例外。
 - `main` 更新后：先 `fetch`，查看差异和测试状态，再显式 merge `origin/main`。
 - integration branch 一旦共享，不 force-push、不重写别人已基于的历史。
 - 不触碰其他 worktree 中的未提交文件。
