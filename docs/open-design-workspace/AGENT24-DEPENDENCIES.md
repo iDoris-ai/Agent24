@@ -1,6 +1,6 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 CREATE/GET/LIST SOL passed, lifecycle implementing / A24-OD-05 platform owners SOL passed, common owner base in review
+> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 CREATE/GET/LIST SOL passed, lifecycle implementing / A24-OD-05 common owner base SOL passed, actor implementing
 >
 > 日期：2026-09-19
 >
@@ -141,7 +141,7 @@
 
 ### A24-OD-05 — 通用 sidecar manager
 
-状态：`FOUNDATION + HOST PROTOCOL + PLATFORM OWNERS PASS / ACTOR DESIGNING / UNWIRED`
+状态：`FOUNDATION + HOST PROTOCOL + COMMON OWNER BASE PASS / ACTOR IMPLEMENTING / UNWIRED`
 
 目标分支：`feat/a24-desktop-sidecar-manager`
 
