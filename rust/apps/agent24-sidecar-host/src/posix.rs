@@ -296,7 +296,9 @@ impl Drop for OwnedGeneration {
             // Drop is deliberately non-blocking. Child::wait here used to
             // hang the host forever on an uninterruptible process; ownership
             // is reported as unconfirmed by the next explicit stop attempt.
-            let _ = killpg(self.group, Signal::SIGKILL);
+            // Reuse the ownership-safe signal path so macOS EPERM is only
+            // accepted after WNOWAIT confirms this leader has exited.
+            let _ = self.signal(Signal::SIGKILL, Phase::ForceKillRequested);
         }
     }
 }
