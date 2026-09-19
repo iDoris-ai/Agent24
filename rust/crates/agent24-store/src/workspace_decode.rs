@@ -219,3 +219,72 @@ impl WorkspaceRow {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_redacts_root_generation_identity_and_cleanup() {
+        let created_at = WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap();
+        let expires_at = WorkspaceInstant::parse("2026-09-19T00:01:00.000Z").unwrap();
+        let id = WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5").unwrap();
+        let row = WorkspaceRow {
+            id: id.clone(),
+            kind: WorkspaceKind::OrchestratorScratch,
+            state: WorkspaceState::CleanupFailed,
+            authority: WorkspaceAuthority {
+                provenance_source: "git".into(),
+                provenance_project_ref: Some("project".into()),
+                provenance_base_revision: Some("base".into()),
+                lifecycle_owner_kind: "orchestrator".into(),
+                lifecycle_owner_ref: "owner".into(),
+                writeback_policy: "external".into(),
+                concurrency_policy: "serial".into(),
+            },
+            root: TrustedRootRegistration::new(
+                "/secret/root".into(),
+                "generation-1".into(),
+                RootIdentity::unix(&[0; 8], &[1; 8]).unwrap(),
+            )
+            .unwrap(),
+            created_at: created_at.clone(),
+            expires_at: expires_at.clone(),
+            renewed_at: None,
+            released_at: None,
+            revision: 1,
+            cleanup: WorkspaceCleanupRecord {
+                state: WorkspaceState::CleanupFailed,
+                quarantined_at: None,
+                quarantine_root: None,
+                attempts: 1,
+                last_attempt_at: Some(created_at.clone()),
+                error: Some("secret cleanup".into()),
+                retry_at: Some(expires_at.clone()),
+            },
+            ttl: WorkspaceTtl::new(60_000).unwrap(),
+        };
+        let public = row.project();
+        assert_eq!(public.id, id);
+        assert_eq!(public.kind, "orchestrator_scratch");
+        assert_eq!(public.state, "cleanup_failed");
+        assert_eq!(public.provenance.source, "git");
+        assert_eq!(public.lifecycle_owner.reference, "owner");
+        assert_eq!(public.created_at, created_at.as_str());
+        assert_eq!(public.expires_at, expires_at.as_str());
+        assert_eq!(public.revision, 1);
+        let wire = serde_json::to_string(&public).unwrap();
+        for secret in [
+            "/secret/root",
+            "generation-1",
+            "secret cleanup",
+            "canonical_root",
+            "root_generation",
+            "quarantine_root",
+            "cleanup_error",
+        ] {
+            assert!(!wire.contains(secret), "projection leaked {secret}");
+        }
+    }
+}
