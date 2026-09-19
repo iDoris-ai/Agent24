@@ -2,7 +2,8 @@
 
 use agent24_protocol::WorkspaceId;
 use agent24_store::{
-    Store, WorkspaceListCursor, WorkspaceListLimit, WorkspaceListQuery, WorkspaceState, test_hooks,
+    Store, WorkspaceListCursor, WorkspaceListLimit, WorkspaceListQuery, WorkspaceState,
+    WorkspaceStoreError, test_hooks,
 };
 
 const EXPIRES: &str = "2026-09-20T00:00:00.000Z";
@@ -43,6 +44,21 @@ fn ids(page: &agent24_store::WorkspacePage) -> Vec<String> {
         .iter()
         .map(|workspace| workspace.id.to_string())
         .collect()
+}
+
+async fn tamper(store: &Store, sql: &str) {
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(test_hooks::pool(store))
+        .await
+        .unwrap();
+    sqlx::query(sql)
+        .execute(test_hooks::pool(store))
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(test_hooks::pool(store))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -170,4 +186,65 @@ async fn list_state_filter_applies_before_keyset_boundary() {
         .await
         .unwrap();
     assert_eq!(ids(&page), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1"]);
+}
+
+#[tokio::test]
+async fn list_decodes_the_sentinel_and_fails_the_whole_page_on_corruption() {
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2",
+        "active",
+        "2026-09-19T00:01:00.000Z",
+    )
+    .await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET state = 'private-corruption'
+         WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1'",
+    )
+    .await;
+
+    let error = store
+        .list_workspaces(&query(None, None, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "state",
+        }
+    );
+    assert_eq!(error.to_string(), "corrupt workspaces row: invalid state");
+    assert!(!error.to_string().contains("private-corruption"));
+}
+
+#[tokio::test]
+async fn list_empty_and_database_failures_have_static_results() {
+    let store = Store::open_memory().await.unwrap();
+    let empty = store
+        .list_workspaces(&query(Some(WorkspaceState::Released), None, 1))
+        .await
+        .unwrap();
+    assert!(empty.items().is_empty());
+    assert!(empty.next_cursor().is_none());
+
+    sqlx::query("DROP TABLE workspaces")
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    let error = store
+        .list_workspaces(&query(None, None, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(error, WorkspaceStoreError::Database);
+    assert_eq!(error.to_string(), "workspace database error");
 }
