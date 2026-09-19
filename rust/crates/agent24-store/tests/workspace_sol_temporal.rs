@@ -68,6 +68,8 @@ async fn cleanup_states_and_workspace_release_order_are_temporal() {
         .execute(test_hooks::pool(&store))
         .await
         .unwrap();
+    assert!(sqlx::query("UPDATE workspaces SET renewed_at = '2026-09-19T00:00:10.000Z', quarantined_at = '2026-09-19T00:00:05.000Z' WHERE id = ?")
+        .bind(ID).execute(test_hooks::pool(&store)).await.is_err());
     assert!(
         sqlx::query("UPDATE workspaces SET state = 'active' WHERE id = ?")
             .bind(ID)
@@ -119,4 +121,45 @@ async fn host_leases_enforce_interval_and_release_order() {
     .await;
     assert!(sqlx::query("UPDATE workspace_leases SET released_at = '2026-09-19T00:00:10.000Z' WHERE lease_id = ?")
         .bind("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7").execute(test_hooks::pool(&store)).await.is_err());
+}
+
+#[tokio::test]
+async fn host_exact_ninety_second_bound_accepts_every_millisecond() {
+    let store = Store::open_memory().await.unwrap();
+    workspace(&store).await;
+    for millis in 0..1000 {
+        let lease_id = format!("wl_{millis:026X}");
+        let host = format!("boundary-{millis}");
+        let acquired = format!("2026-09-19T00:00:00.{millis:03}Z");
+        let expires = format!("2026-09-19T00:01:30.{millis:03}Z");
+        sqlx::query(
+            "INSERT INTO workspace_leases
+             (lease_id, workspace_id, root_generation, owner_id, kind,
+              daemon_generation, host_instance_id, acquired_at, expires_at)
+             VALUES (?, ?, 'g1', ?, 'host', 'daemon-1', ?, ?, ?)",
+        )
+        .bind(lease_id)
+        .bind(ID)
+        .bind(&host)
+        .bind(&host)
+        .bind(acquired)
+        .bind(expires)
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    }
+    assert!(
+        sqlx::query(
+            "INSERT INTO workspace_leases
+         (lease_id, workspace_id, root_generation, owner_id, kind,
+          daemon_generation, host_instance_id, acquired_at, expires_at)
+         VALUES ('wl_00000000000000000000000000', ?, 'g1', 'over', 'host',
+                 'daemon-1', 'over', '2026-09-19T00:00:00.000Z',
+                 '2026-09-19T00:01:30.001Z')",
+        )
+        .bind(ID)
+        .execute(test_hooks::pool(&store))
+        .await
+        .is_err()
+    );
 }
