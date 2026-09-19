@@ -1,18 +1,126 @@
 //! Daemon discovery state file (`~/.agent24/daemon.json`).
 //!
 //! Written by agent24d after the ready line, removed on graceful shutdown.
-//! The CLI's attached mode reads it to find a running daemon. Contains the
-//! bearer token → created with 0600 permissions on unix.
+//! The CLI's attached mode reads it to find a running daemon. Legacy state
+//! contains the bearer token; capability-mode state deliberately does not.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// The authentication authority advertised by a daemon discovery record.
+///
+/// This is intentionally an enum rather than a boolean. Adding another mode
+/// must be an explicit protocol change, and serde rejects unknown values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// The migration-era, broad daemon bearer stored in `daemon.json`.
+    #[default]
+    LegacySingleToken,
+    /// Discovery contains endpoint metadata only; host authority stays in
+    /// the trusted desktop process memory.
+    Capabilities,
+}
+
+impl AuthMode {
+    pub fn is_capabilities(self) -> bool {
+        matches!(self, Self::Capabilities)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonState {
     pub port: u16,
+    /// Absent in capability mode. `default` keeps old daemon.json files
+    /// readable while `skip_serializing_if` prevents a capability record from
+    /// accidentally growing an empty bearer field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token: String,
     pub pid: u32,
     pub version: String,
+    /// A daemon incarnation identifier. Older discovery files did not have
+    /// this field, so an empty value is accepted only for legacy records.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generation: String,
+    /// Missing means the pre-capability legacy format.
+    #[serde(default)]
+    pub auth_mode: AuthMode,
+}
+
+impl DaemonState {
+    /// Construct and validate a legacy discovery record.
+    pub fn new_legacy(
+        port: u16,
+        token: impl Into<String>,
+        pid: u32,
+        version: impl Into<String>,
+        generation: impl Into<String>,
+    ) -> Result<Self, String> {
+        let state = Self {
+            port,
+            token: token.into(),
+            pid,
+            version: version.into(),
+            generation: generation.into(),
+            auth_mode: AuthMode::LegacySingleToken,
+        };
+        state.validate().map(|()| state)
+    }
+
+    /// Construct and validate a capability discovery record. No bearer is
+    /// accepted by this constructor, making the safe shape easy to use.
+    pub fn new_capabilities(
+        port: u16,
+        pid: u32,
+        version: impl Into<String>,
+        generation: impl Into<String>,
+    ) -> Result<Self, String> {
+        let state = Self {
+            port,
+            token: String::new(),
+            pid,
+            version: version.into(),
+            generation: generation.into(),
+            auth_mode: AuthMode::Capabilities,
+        };
+        state.validate().map(|()| state)
+    }
+
+    /// Check the mutually-exclusive credential contract.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.auth_mode {
+            AuthMode::LegacySingleToken => {
+                if self.token.is_empty() {
+                    return Err(
+                        "legacy_single_token auth mode requires a non-empty token".to_owned()
+                    );
+                }
+            }
+            AuthMode::Capabilities => {
+                if !self.token.is_empty() {
+                    return Err("capabilities auth mode must not contain a token".to_owned());
+                }
+                if self.generation.is_empty() {
+                    return Err("capabilities auth mode requires a daemon generation".to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the bearer usable by a host-authority caller. Capability mode
+    /// intentionally has no such value in discovery and fails closed.
+    pub fn bearer_token(&self) -> Result<&str, &'static str> {
+        self.validate()
+            .map_err(|_| "invalid daemon discovery state")?;
+        match self.auth_mode {
+            AuthMode::LegacySingleToken if self.token.is_empty() => {
+                Err("legacy daemon discovery token missing")
+            }
+            AuthMode::LegacySingleToken => Ok(&self.token),
+            AuthMode::Capabilities => Err("host authority unavailable"),
+        }
+    }
 }
 
 pub fn state_dir() -> Option<PathBuf> {
@@ -39,6 +147,7 @@ fn hold_lock(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 
 pub fn write(state: &DaemonState) -> std::io::Result<()> {
+    state.validate().map_err(std::io::Error::other)?;
     let Some(dir) = state_dir() else {
         return Err(std::io::Error::other("HOME not set"));
     };
@@ -100,6 +209,7 @@ pub fn read_live() -> Option<DaemonState> {
     let path = state_path()?;
     let raw = std::fs::read_to_string(path).ok()?;
     let state: DaemonState = serde_json::from_str(&raw).ok()?;
+    state.validate().ok()?;
     if pid_alive(state.pid) {
         Some(state)
     } else {
@@ -118,6 +228,7 @@ pub fn remove_if_owner(pid: u32) {
         return;
     };
     if let Ok(state) = serde_json::from_str::<DaemonState>(&raw)
+        && state.validate().is_ok()
         && state.pid == pid
     {
         let _ = std::fs::remove_file(&path);
@@ -166,5 +277,47 @@ mod tests {
     fn bogus_pid_is_dead() {
         // PID_MAX on macOS is 99998; 4194304 is safely out of range on linux defaults too
         assert!(!pid_alive(4_194_303));
+    }
+
+    #[test]
+    fn old_json_defaults_to_legacy_mode() {
+        let state: DaemonState =
+            serde_json::from_str(r#"{"port":1234,"token":"old-token","pid":42,"version":"0.3.0"}"#)
+                .unwrap();
+        assert_eq!(state.auth_mode, AuthMode::LegacySingleToken);
+        assert_eq!(state.generation, "");
+        assert_eq!(state.bearer_token(), Ok("old-token"));
+    }
+
+    #[test]
+    fn capability_state_omits_token_and_requires_generation() {
+        let state = DaemonState::new_capabilities(1234, 42, "0.3.0", "gen-1").unwrap();
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["auth_mode"], "capabilities");
+        assert_eq!(json["generation"], "gen-1");
+        assert!(json.get("token").is_none());
+        assert_eq!(state.bearer_token(), Err("host authority unavailable"));
+    }
+
+    #[test]
+    fn auth_modes_reject_mutually_incompatible_credentials() {
+        let with_token = DaemonState {
+            port: 1,
+            token: "secret".into(),
+            pid: 1,
+            version: "v".into(),
+            generation: "gen".into(),
+            auth_mode: AuthMode::Capabilities,
+        };
+        assert!(with_token.validate().is_err());
+        let without_token = DaemonState {
+            port: 1,
+            token: String::new(),
+            pid: 1,
+            version: "v".into(),
+            generation: "gen".into(),
+            auth_mode: AuthMode::LegacySingleToken,
+        };
+        assert!(without_token.validate().is_err());
     }
 }
