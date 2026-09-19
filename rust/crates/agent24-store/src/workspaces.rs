@@ -145,3 +145,159 @@ impl RootIdentity {
         })
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceKind {
+    OrchestratorScratch,
+    LegacyCompat,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceState {
+    Active,
+    Expired,
+    Releasing,
+    Released,
+    CleanupFailed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseKind {
+    Run,
+    Host,
+}
+
+macro_rules! closed_enum {
+    ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
+        impl $name {
+            pub fn parse(value: &str) -> WorkspaceResult<Self> {
+                match value { $( $text => Ok(Self::$variant), )+ _ => Err(WorkspaceStoreError::InvalidValue { field: stringify!($name) }) }
+            }
+            pub fn as_str(self) -> &'static str {
+                match self { $( Self::$variant => $text, )+ }
+            }
+        }
+    };
+}
+closed_enum!(WorkspaceKind { OrchestratorScratch => "orchestrator_scratch", LegacyCompat => "legacy_compat" });
+closed_enum!(WorkspaceState { Active => "active", Expired => "expired", Releasing => "releasing", Released => "released", CleanupFailed => "cleanup_failed" });
+closed_enum!(LeaseKind { Run => "run", Host => "host" });
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedRootRegistration {
+    pub canonical_root: String,
+    pub root_generation: String,
+    pub identity: RootIdentity,
+}
+impl TrustedRootRegistration {
+    pub fn new(
+        canonical_root: String,
+        root_generation: String,
+        identity: RootIdentity,
+    ) -> WorkspaceResult<Self> {
+        if canonical_root.trim().is_empty() || canonical_root.contains('\0') {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "canonical_root",
+            });
+        }
+        if root_generation.trim().is_empty() || root_generation.contains('\0') {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "root_generation",
+            });
+        }
+        Ok(Self {
+            canonical_root,
+            root_generation,
+            identity,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewScratchWorkspace {
+    pub id: String,
+    pub root: TrustedRootRegistration,
+    pub created_at: WorkspaceInstant,
+    pub expires_at: WorkspaceInstant,
+    pub provenance_source: String,
+    pub provenance_project_ref: Option<String>,
+    pub provenance_base_revision: Option<String>,
+}
+impl NewScratchWorkspace {
+    pub fn new(
+        id: String,
+        root: TrustedRootRegistration,
+        created_at: WorkspaceInstant,
+        expires_at: WorkspaceInstant,
+        provenance_source: String,
+    ) -> WorkspaceResult<Self> {
+        if id.trim().is_empty()
+            || provenance_source.trim().is_empty()
+            || provenance_source.contains('\0')
+            || expires_at <= created_at
+        {
+            return Err(WorkspaceStoreError::InvalidValue { field: "workspace" });
+        }
+        WorkspaceTtl::new(expires_at.epoch_millis - created_at.epoch_millis)?;
+        Ok(Self {
+            id,
+            root,
+            created_at,
+            expires_at,
+            provenance_source,
+            provenance_project_ref: None,
+            provenance_base_revision: None,
+        })
+    }
+    pub fn kind(&self) -> WorkspaceKind {
+        WorkspaceKind::OrchestratorScratch
+    }
+    pub fn state(&self) -> WorkspaceState {
+        WorkspaceState::Active
+    }
+    pub fn revision(&self) -> u64 {
+        1
+    }
+    pub fn writeback_policy(&self) -> &'static str {
+        "external"
+    }
+    pub fn lifecycle_owner_kind(&self) -> &'static str {
+        "orchestrator"
+    }
+    pub fn concurrency_policy(&self) -> &'static str {
+        "serial"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceAuthority {
+    pub provenance_source: String,
+    pub provenance_project_ref: Option<String>,
+    pub provenance_base_revision: Option<String>,
+    pub lifecycle_owner_kind: String,
+    pub lifecycle_owner_ref: String,
+    pub writeback_policy: String,
+    pub concurrency_policy: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCleanupRecord {
+    pub state: WorkspaceState,
+    pub quarantine_root: Option<String>,
+    pub quarantined_at: Option<WorkspaceInstant>,
+    pub attempts: u64,
+    pub last_attempt_at: Option<WorkspaceInstant>,
+    pub error: Option<String>,
+    pub retry_at: Option<WorkspaceInstant>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceLeaseRecord {
+    pub id: WorkspaceLeaseId,
+    pub workspace_id: String,
+    pub root_generation: String,
+    pub owner_id: String,
+    pub kind: LeaseKind,
+    pub daemon_generation: Option<String>,
+    pub host_instance_id: Option<String>,
+    pub acquired_at: WorkspaceInstant,
+    pub expires_at: Option<WorkspaceInstant>,
+    pub renewed_at: Option<WorkspaceInstant>,
+    pub released_at: Option<WorkspaceInstant>,
+}
