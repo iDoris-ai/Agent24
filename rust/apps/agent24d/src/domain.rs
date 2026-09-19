@@ -121,6 +121,7 @@ const KERNEL_OOP_GRANTS: &[Capability] =
 /// raised there rather than changed here.
 const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "approvals",
+    "capabilities",
     "chat",
     "events",
     "health",
