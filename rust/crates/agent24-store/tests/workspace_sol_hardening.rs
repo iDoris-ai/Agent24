@@ -101,3 +101,29 @@ async fn every_timestamp_round_trips_and_workspace_ttl_is_bounded() {
     assert!(sqlx::query("INSERT INTO workspace_leases (lease_id, workspace_id, root_generation, owner_id, kind, acquired_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X5', ?, 'g1', 'run-1', 'run', '2026-02-30T00:00:00.000Z')")
         .bind(ID).execute(test_hooks::pool(&store)).await.is_err());
 }
+
+#[tokio::test]
+async fn counters_require_integer_values_in_the_safe_range() {
+    let store = Store::open_memory().await.unwrap();
+    workspace(&store, Some(ID), CREATED, EXPIRES).await.unwrap();
+    for value in ["abc", "9223372036854775808"] {
+        assert!(
+            sqlx::query("UPDATE workspaces SET revision = ? WHERE id = ?")
+                .bind(value)
+                .bind(ID)
+                .execute(test_hooks::pool(&store))
+                .await
+                .is_err()
+        );
+    }
+    for value in ["abc", "-1"] {
+        assert!(
+            sqlx::query("UPDATE workspaces SET cleanup_attempts = ? WHERE id = ?")
+                .bind(value)
+                .bind(ID)
+                .execute(test_hooks::pool(&store))
+                .await
+                .is_err()
+        );
+    }
+}
