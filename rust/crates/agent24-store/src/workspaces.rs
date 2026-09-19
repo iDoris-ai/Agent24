@@ -1,5 +1,5 @@
 use agent24_protocol::WorkspaceId;
-use chrono::{DateTime, SecondsFormat};
+use chrono::{DateTime, SecondsFormat, Utc};
 use thiserror::Error;
 
 const MAX_WORKSPACE_MS: i64 = 7 * 86_400_000;
@@ -46,6 +46,20 @@ impl WorkspaceInstant {
     }
     pub fn epoch_millis(&self) -> i64 {
         self.epoch_millis
+    }
+
+    pub fn checked_add_workspace_ttl(&self, ttl: WorkspaceTtl) -> WorkspaceResult<Self> {
+        let millis = self.epoch_millis.checked_add(ttl.millis()).ok_or(
+            WorkspaceStoreError::InvalidValue {
+                field: "expires_at",
+            },
+        )?;
+        let text = DateTime::<Utc>::from_timestamp_millis(millis)
+            .ok_or(WorkspaceStoreError::InvalidValue {
+                field: "expires_at",
+            })?
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        Self::parse(&text)
     }
 }
 
@@ -225,54 +239,97 @@ impl TrustedRootRegistration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceProvenanceInput {
+    source: String,
+    project_ref: Option<String>,
+    base_revision: Option<String>,
+}
+impl WorkspaceProvenanceInput {
+    pub fn new(
+        source: String,
+        project_ref: Option<String>,
+        base_revision: Option<String>,
+    ) -> WorkspaceResult<Self> {
+        if source.trim().is_empty()
+            || source.contains('\0')
+            || project_ref.as_deref().is_some_and(|v| v.contains('\0'))
+            || base_revision.as_deref().is_some_and(|v| v.contains('\0'))
+        {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "provenance",
+            });
+        }
+        Ok(Self {
+            source,
+            project_ref,
+            base_revision,
+        })
+    }
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    pub fn project_ref(&self) -> Option<&str> {
+        self.project_ref.as_deref()
+    }
+    pub fn base_revision(&self) -> Option<&str> {
+        self.base_revision.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleOwnerRef(String);
+impl LifecycleOwnerRef {
+    pub fn new(value: String) -> WorkspaceResult<Self> {
+        if value.trim().is_empty() || value.contains('\0') {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "lifecycle_owner_ref",
+            });
+        }
+        Ok(Self(value))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewScratchWorkspace {
     id: WorkspaceId,
     root: TrustedRootRegistration,
-    created_at: WorkspaceInstant,
-    expires_at: WorkspaceInstant,
-    provenance_source: String,
-    provenance_project_ref: Option<String>,
-    provenance_base_revision: Option<String>,
+    provenance: WorkspaceProvenanceInput,
+    lifecycle_owner_ref: LifecycleOwnerRef,
+    ttl: WorkspaceTtl,
 }
 impl NewScratchWorkspace {
     pub fn new(
-        id: String,
+        id: WorkspaceId,
         root: TrustedRootRegistration,
-        created_at: WorkspaceInstant,
-        expires_at: WorkspaceInstant,
-        provenance_source: String,
-    ) -> WorkspaceResult<Self> {
-        let id = WorkspaceId::parse(id)
-            .map_err(|_| WorkspaceStoreError::InvalidValue { field: "id" })?;
-        if provenance_source.trim().is_empty()
-            || provenance_source.contains('\0')
-            || expires_at <= created_at
-        {
-            return Err(WorkspaceStoreError::InvalidValue { field: "workspace" });
-        }
-        WorkspaceTtl::new(
-            expires_at
-                .epoch_millis
-                .checked_sub(created_at.epoch_millis)
-                .ok_or(WorkspaceStoreError::InvalidValue {
-                    field: "workspace_ttl",
-                })?,
-        )?;
-        Ok(Self {
+        provenance: WorkspaceProvenanceInput,
+        lifecycle_owner_ref: LifecycleOwnerRef,
+        ttl: WorkspaceTtl,
+    ) -> Self {
+        Self {
             id,
             root,
-            created_at,
-            expires_at,
-            provenance_source,
-            provenance_project_ref: None,
-            provenance_base_revision: None,
-        })
+            provenance,
+            lifecycle_owner_ref,
+            ttl,
+        }
     }
     pub fn id(&self) -> &WorkspaceId {
         &self.id
     }
     pub fn root(&self) -> &TrustedRootRegistration {
         &self.root
+    }
+    pub fn provenance(&self) -> &WorkspaceProvenanceInput {
+        &self.provenance
+    }
+    pub fn lifecycle_owner_ref(&self) -> &LifecycleOwnerRef {
+        &self.lifecycle_owner_ref
+    }
+    pub fn ttl(&self) -> WorkspaceTtl {
+        self.ttl
     }
     pub fn kind(&self) -> WorkspaceKind {
         WorkspaceKind::OrchestratorScratch
