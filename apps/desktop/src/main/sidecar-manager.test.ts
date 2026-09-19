@@ -1,15 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
-import { exactTreeStopper, SidecarManager, validateReady, type SidecarHealth, type SidecarLauncher, type SidecarStopper, type SidecarTreeRunner } from './sidecar-manager'
+import { exactTreeStopper, SidecarManager, validateReady, type SidecarHealth, type SidecarLauncher, type SidecarStopper, type SidecarTreeController } from './sidecar-manager'
 import { MemoryEndpointHandoff } from './sidecar-contract'
 
 const spec = { sidecarId: 'creative', readyTimeoutMs: 50, healthIntervalMs: 100, healthTimeoutMs: 10, maxHealthFailures: 2, shutdown: { termGraceMs: 1, killAfterMs: 1 } }
 const child = { pid: 42, exitCode: null, onExit: vi.fn().mockReturnValue(() => {}) }
 const ready = Promise.resolve({ endpoint: { origin: 'http://127.0.0.1:4312', secret: 's'.repeat(32) } })
-const tree: SidecarTreeRunner = { signal: vi.fn().mockResolvedValue(undefined), isEmpty: vi.fn().mockResolvedValue(true) }
+const tree: SidecarTreeController = { signal: vi.fn().mockResolvedValue(undefined), isEmpty: vi.fn().mockResolvedValue(true) }
 
 describe('SidecarManager', () => {
   it('rejects non-positive or non-finite lifecycle bounds', () => {
-    expect(() => new SidecarManager({ ...spec, healthTimeoutMs: 0 }, { launch: () => ({ child, tree, ready }) }, { check: vi.fn() })).toThrow('finite and positive')
+    expect(() => new SidecarManager({ ...spec, healthTimeoutMs: 0 }, { launch: () => ({ child, tree, ready }) }, { check: vi.fn() })).toThrow('timer-safe')
+    expect(() => new SidecarManager({ ...spec, healthIntervalMs: 2_147_483_648 }, { launch: () => ({ child, tree, ready }) }, { check: vi.fn() })).toThrow('timer-safe')
     expect(() => new SidecarManager({ ...spec, maxHealthFailures: Number.NaN }, { launch: () => ({ child, tree, ready }) }, { check: vi.fn() })).toThrow('failure bound')
   })
 
@@ -21,8 +22,10 @@ describe('SidecarManager', () => {
   })
 
   it('rejects invalid child ownership and retains ownership when shutdown fails', async () => {
-    const invalid = new SidecarManager(spec, { launch: () => ({ child: { pid: -1, exitCode: null } as typeof child, ready }) }, { check: vi.fn() })
+    const invalid = new SidecarManager(spec, { launch: () => ({ child: { pid: -1, exitCode: null } as typeof child, tree, ready }) }, { check: vi.fn() })
     await expect(invalid.start()).rejects.toThrow('valid pid')
+    const missingTree = new SidecarManager(spec, { launch: () => ({ child, processGroupId: 42, dedicatedProcessGroup: true, ready } as never) }, { check: vi.fn() })
+    await expect(missingTree.start()).rejects.toThrow('verified tree')
     const badGroupStop = { stop: vi.fn().mockResolvedValue(undefined) }
     const badGroup = new SidecarManager(spec, { launch: () => ({ child, processGroupId: 99, dedicatedProcessGroup: true, tree, ready }) }, { check: vi.fn() }, badGroupStop)
     await expect(badGroup.start()).rejects.toThrow('owned child group')
@@ -50,7 +53,7 @@ describe('SidecarManager', () => {
     const exitingChild = { pid: 45, exitCode: null, onExit: (listener: (code: number | null) => void) => { exit = listener; return () => {} } }
     const pendingProbe = new Promise<boolean>((_resolve, reject) => { rejectProbe = reject })
     const health: SidecarHealth = { check: vi.fn().mockResolvedValueOnce(true).mockReturnValueOnce(pendingProbe) }
-    const retainedTree: SidecarTreeRunner = { signal: vi.fn().mockResolvedValue(undefined), isEmpty: vi.fn().mockResolvedValue(false) }
+    const retainedTree: SidecarTreeController = { signal: vi.fn().mockResolvedValue(undefined), isEmpty: vi.fn().mockResolvedValue(false) }
     const manager = new SidecarManager({ ...spec, healthIntervalMs: 5 }, { launch: () => ({ child: exitingChild, processGroupId: 45, dedicatedProcessGroup: true, tree: retainedTree, ready }) }, health, { stop: vi.fn().mockResolvedValue(undefined) })
     await manager.start()
     await new Promise((resolve) => setTimeout(resolve, 10))
@@ -60,12 +63,28 @@ describe('SidecarManager', () => {
     expect(manager.status().state).toBe('failed')
   })
 
+  it('does not install an interval when the child exits during initial health', async () => {
+    let exit!: (code: number | null) => void
+    let resolveHealth!: (value: boolean) => void
+    const exitingChild = { pid: 46, exitCode: null, onExit: (listener: (code: number | null) => void) => { exit = listener; return () => {} } }
+    const initialHealth = new Promise<boolean>((resolve) => { resolveHealth = resolve })
+    const health: SidecarHealth = { check: vi.fn().mockReturnValue(initialHealth) }
+    const manager = new SidecarManager({ ...spec, healthIntervalMs: 2 }, { launch: () => ({ child: exitingChild, processGroupId: 46, dedicatedProcessGroup: true, tree, ready }) }, health, { stop: vi.fn().mockResolvedValue(undefined) })
+    const started = manager.start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    exit(0)
+    resolveHealth(true)
+    await expect(started).rejects.toThrow('initial health')
+    await new Promise((resolve) => setTimeout(resolve, 8))
+    expect(health.check).toHaveBeenCalledTimes(1)
+  })
+
   it('uses graceful then forced signals for an owned process group', async () => {
     let forced = false
-    const nonEmpty: SidecarTreeRunner = { signal: vi.fn().mockImplementation((_owner, force) => { forced = force; return Promise.resolve() }), isEmpty: vi.fn().mockImplementation(() => Promise.resolve(forced)) }
-    await exactTreeStopper.stop({ sidecarId: 'creative', instanceId: 'a', pid: 42, processGroupId: 42, startedAt: 0 }, child, 1, 1, nonEmpty)
-    expect(nonEmpty.signal).toHaveBeenNthCalledWith(1, expect.objectContaining({ pid: 42 }), false)
-    expect(nonEmpty.signal).toHaveBeenNthCalledWith(2, expect.objectContaining({ pid: 42 }), true)
+    const nonEmpty: SidecarTreeController = { signal: vi.fn().mockImplementation((force) => { forced = force; return Promise.resolve() }), isEmpty: vi.fn().mockImplementation(() => Promise.resolve(forced)) }
+    await exactTreeStopper.stop(nonEmpty, 1, 1)
+    expect(nonEmpty.signal).toHaveBeenNthCalledWith(1, false)
+    expect(nonEmpty.signal).toHaveBeenNthCalledWith(2, true)
   })
 
   it('requires readiness and health before reporting healthy, then stops its exact owner', async () => {
@@ -79,7 +98,7 @@ describe('SidecarManager', () => {
     expect(logger.info).toHaveBeenCalledWith('sidecar.ready', expect.objectContaining({ sidecarId: 'creative' }))
     expect(JSON.stringify(logger.info.mock.calls)).not.toContain('secret')
     await manager.stop()
-    expect(stopper.stop).toHaveBeenCalledWith(expect.objectContaining({ pid: 42, processGroupId: 42 }), child, 1, 1, tree)
+    expect(stopper.stop).toHaveBeenCalledWith(tree, 1, 1)
     expect(manager.status().state).toBe('stopped')
   })
 
@@ -87,7 +106,7 @@ describe('SidecarManager', () => {
     let exit!: (code: number | null) => void
     const exitingChild = { pid: 43, exitCode: null, onExit: (listener: (code: number | null) => void) => { exit = listener; return () => {} } }
     const stopper = { stop: vi.fn().mockResolvedValue(undefined) }
-    const exitedTree: SidecarTreeRunner = { signal: vi.fn().mockResolvedValue(undefined), isEmpty: vi.fn().mockResolvedValue(true) }
+    const exitedTree: SidecarTreeController = { signal: vi.fn().mockResolvedValue(undefined), isEmpty: vi.fn().mockResolvedValue(true) }
     const manager = new SidecarManager(spec, { launch: () => ({ child: exitingChild, processGroupId: 43, dedicatedProcessGroup: true, tree: exitedTree, ready }) }, { check: vi.fn().mockResolvedValue(true) }, stopper)
     await manager.start()
     exit(0)
@@ -100,7 +119,7 @@ describe('SidecarManager', () => {
   it('clears handoff immediately when descendant reap needs retry', async () => {
     let exit!: (code: number | null) => void
     const exitingChild = { pid: 44, exitCode: null, onExit: (listener: (code: number | null) => void) => { exit = listener; return () => {} } }
-    const exitedTree: SidecarTreeRunner = { signal: vi.fn().mockResolvedValue(undefined), isEmpty: vi.fn().mockResolvedValue(false) }
+    const exitedTree: SidecarTreeController = { signal: vi.fn().mockResolvedValue(undefined), isEmpty: vi.fn().mockResolvedValue(false) }
     const handoff = new MemoryEndpointHandoff()
     const manager = new SidecarManager(spec, { launch: () => ({ child: exitingChild, processGroupId: 44, dedicatedProcessGroup: true, tree: exitedTree, ready }) }, { check: vi.fn().mockResolvedValue(true) }, { stop: vi.fn().mockResolvedValue(undefined) }, handoff)
     await manager.start()

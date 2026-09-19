@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process'
 import {
   createOwnership,
   MemoryEndpointHandoff,
@@ -18,22 +17,23 @@ export interface SidecarLaunch {
   readonly child: SidecarChild
   readonly processGroupId?: number
   readonly dedicatedProcessGroup?: boolean
-  readonly tree?: SidecarTreeRunner
+  /** Generation-bound kernel handle; production adapters must provide POSIX generation-pinned or Windows Job Object/equivalent control. */
+  readonly tree: SidecarTreeController
   readonly ready: Promise<SidecarReady>
 }
 /** Launch is synchronous: spawn and ownership setup must complete before returning. */
 export interface SidecarLauncher { launch(): SidecarLaunch }
 export interface SidecarHealth { check(endpoint: SidecarReady['endpoint'], timeoutMs: number): Promise<boolean> }
-export interface SidecarTreeRunner {
-  signal(owner: SidecarOwnership, force: boolean): Promise<void>
-  isEmpty(owner: SidecarOwnership): Promise<boolean>
+export interface SidecarTreeController {
+  signal(force: boolean): Promise<void>
+  isEmpty(): Promise<boolean>
 }
 export interface SidecarLogger {
   info(event: string, fields?: Record<string, string | number>): void
   warn(event: string, fields?: Record<string, string | number>): void
 }
 export interface SidecarStopper {
-  stop(owner: SidecarOwnership, child: SidecarChild, gracefulMs: number, killAfterMs: number, tree?: SidecarTreeRunner): Promise<void>
+  stop(tree: SidecarTreeController, gracefulMs: number, killAfterMs: number): Promise<void>
 }
 export interface SidecarSpec {
   readonly sidecarId: string
@@ -56,57 +56,25 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () =>
 
 function validateSpec(spec: SidecarSpec): void {
   const timeouts = [spec.readyTimeoutMs, spec.healthIntervalMs, spec.healthTimeoutMs, spec.shutdown.termGraceMs, spec.shutdown.killAfterMs]
-  if (timeouts.some((value) => !Number.isFinite(value) || value <= 0)) throw new Error('sidecar timeouts must be finite and positive')
+  if (timeouts.some((value) => !Number.isFinite(value) || value <= 0 || value > 2_147_483_647)) throw new Error('sidecar timeouts must be finite, positive, and timer-safe')
   if (!Number.isInteger(spec.maxHealthFailures) || spec.maxHealthFailures <= 0) throw new Error('sidecar health failure bound is invalid')
 }
 
-/** Signals only the manager-owned PID or the launcher-provided dedicated group. */
-export function signalOwnedTree(owner: SidecarOwnership, signal: NodeJS.Signals): Promise<void> {
-  if (!Number.isInteger(owner.pid) || owner.pid <= 0) throw new Error('sidecar pid is invalid')
-  if (owner.processGroupId !== null && (!Number.isInteger(owner.processGroupId) || owner.processGroupId <= 0)) {
-    throw new Error('sidecar process group is invalid')
-  }
-  if (process.platform === 'win32') {
-    return new Promise((resolve, reject) => {
-      const taskkill = spawn('taskkill.exe', ['/PID', String(owner.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])], { stdio: 'ignore', windowsHide: true })
-      taskkill.once('error', reject)
-      taskkill.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with ${String(code)}`)))
-    })
-  }
-  const target = owner.processGroupId === null ? owner.pid : -owner.processGroupId
-  try { process.kill(target, signal) } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
-  }
-  return Promise.resolve()
-}
-
-const nativeTreeRunner: SidecarTreeRunner = {
-  signal: (owner, force) => signalOwnedTree(owner, force ? 'SIGKILL' : 'SIGTERM'),
-  async isEmpty(owner) {
-    if (process.platform === 'win32') throw new Error('verified Windows tree control is required')
-    if (owner.processGroupId === null) return false
-    try { process.kill(-owner.processGroupId, 0); return false } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true
-      throw error
-    }
-  },
-}
-
-async function waitForEmpty(tree: SidecarTreeRunner, owner: SidecarOwnership, timeoutMs: number): Promise<boolean> {
+async function waitForEmpty(tree: SidecarTreeController, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   do {
-    if (await tree.isEmpty(owner)) return true
+    if (await tree.isEmpty()) return true
     await wait(Math.min(10, Math.max(1, deadline - Date.now())))
   } while (Date.now() < deadline)
-  return tree.isEmpty(owner)
+  return tree.isEmpty()
 }
 
 export const exactTreeStopper: SidecarStopper = {
-  async stop(owner, _child, gracefulMs, killAfterMs, tree = nativeTreeRunner) {
-    await tree.signal(owner, false)
-    if (await waitForEmpty(tree, owner, gracefulMs)) return
-    await tree.signal(owner, true)
-    if (!await waitForEmpty(tree, owner, killAfterMs)) throw new Error('sidecar process tree did not exit')
+  async stop(tree, gracefulMs, killAfterMs) {
+    await tree.signal(false)
+    if (await waitForEmpty(tree, gracefulMs)) return
+    await tree.signal(true)
+    if (!await waitForEmpty(tree, killAfterMs)) throw new Error('sidecar process tree did not exit')
   },
 }
 
@@ -130,7 +98,7 @@ export class SidecarManager {
   private active: {
     owner: SidecarOwnership
     child: SidecarChild
-    tree?: SidecarTreeRunner
+    tree: SidecarTreeController
     ready?: SidecarReady
     removeExit?: () => void
     failures: number
@@ -171,18 +139,12 @@ export class SidecarManager {
       const pid = launch.child.pid
       if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) throw new Error('sidecar did not provide a valid pid')
       const group = launch.processGroupId
+      if (!launch.tree || typeof launch.tree.signal !== 'function' || typeof launch.tree.isEmpty !== 'function') throw new Error('verified tree control is required')
       let owner = createOwnership(this.spec.sidecarId, pid)
       this.active = { owner, child: launch.child, tree: launch.tree, failures: 0, probing: false }
-      if (process.platform !== 'win32' && launch.dedicatedProcessGroup !== true) {
-        throw new Error('sidecar dedicated process group is required')
-      }
-      if (process.platform === 'win32' && !launch.tree) throw new Error('verified Windows tree control is required')
-      if (process.platform !== 'win32' && (typeof group !== 'number' || !Number.isInteger(group) || group !== pid || group <= 0)) {
-        throw new Error('sidecar process group is not an owned child group')
-      }
-      if (process.platform !== 'win32' && launch.dedicatedProcessGroup !== true && group !== undefined) {
-        throw new Error('sidecar process group evidence is missing')
-      }
+      const hasGroupEvidence = group !== undefined || launch.dedicatedProcessGroup !== undefined
+      if (hasGroupEvidence && (launch.dedicatedProcessGroup !== true || typeof group !== 'number' || !Number.isInteger(group) || group !== pid || group <= 0)) throw new Error('sidecar process group is not an owned child group')
+      if (process.platform !== 'win32' && !hasGroupEvidence) throw new Error('sidecar dedicated process group is required')
       owner = createOwnership(this.spec.sidecarId, pid, process.platform === 'win32' ? null : group ?? null)
       this.active = { owner, child: launch.child, tree: launch.tree, failures: 0, probing: false }
       const generation = owner.instanceId
@@ -194,8 +156,13 @@ export class SidecarManager {
       this.handoff.publish(owner.instanceId, ready.endpoint)
       this.state = 'ready'
       this.logger.info('sidecar.ready', { sidecarId: this.spec.sidecarId, instanceId: owner.instanceId })
-      await this.probe()
-      this.timer = setInterval(() => { void this.probe() }, this.spec.healthIntervalMs)
+      await this.probe(generation)
+      if (this.active?.owner.instanceId !== generation || !['ready', 'healthy', 'degraded'].includes(this.state)) throw new Error('sidecar exited during initial health')
+      const timer = setInterval(() => {
+        if (this.active?.owner.instanceId !== generation) { clearInterval(timer); if (this.timer === timer) this.timer = null; return }
+        void this.probe(generation)
+      }, this.spec.healthIntervalMs)
+      this.timer = timer
     } catch (error) {
       this.state = 'failed'
       this.logger.warn('sidecar.failed', { sidecarId: this.spec.sidecarId })
@@ -213,7 +180,7 @@ export class SidecarManager {
   }
 
   private async stopInternal(): Promise<SidecarStatus> {
-    if (!this.active) { this.state = 'stopped'; return this.status() }
+    if (!this.active) { if (this.timer) clearInterval(this.timer); this.timer = null; this.state = 'stopped'; return this.status() }
     this.state = 'stopping'
     this.logger.info('sidecar.stopping', { sidecarId: this.spec.sidecarId })
     await this.stopActive(this.active)
@@ -221,14 +188,14 @@ export class SidecarManager {
     return this.status()
   }
 
-  private async stopActive(active: { owner: SidecarOwnership; child: SidecarChild; tree?: SidecarTreeRunner; removeExit?: () => void; reaping?: Promise<void> }): Promise<void> {
+  private async stopActive(active: { owner: SidecarOwnership; child: SidecarChild; tree: SidecarTreeController; removeExit?: () => void; reaping?: Promise<void> }): Promise<void> {
     if (this.active?.reaping) await this.active.reaping
     if (this.active?.owner.instanceId !== active.owner.instanceId) return
     if (this.timer) clearInterval(this.timer)
     this.timer = null
     this.handoff.clear(active.owner.instanceId)
     try {
-      await this.stopper.stop(active.owner, active.child, this.spec.shutdown.termGraceMs, this.spec.shutdown.killAfterMs, this.active.tree)
+      await this.stopper.stop(active.tree, this.spec.shutdown.termGraceMs, this.spec.shutdown.killAfterMs)
     } catch (error) {
       if (this.active?.owner.instanceId === active.owner.instanceId) this.state = 'failed'
       throw error
@@ -240,9 +207,9 @@ export class SidecarManager {
     }
   }
 
-  private async probe(): Promise<void> {
+  private async probe(expectedGeneration?: string): Promise<void> {
     const active = this.active
-    if (!active?.ready || active.probing) return
+    if (!active?.ready || active.probing || (expectedGeneration && active.owner.instanceId !== expectedGeneration)) return
     active.probing = true
     try {
       const ok = await withTimeout(
@@ -251,12 +218,12 @@ export class SidecarManager {
         () => {},
         'sidecar health timeout',
       )
-      if (this.state === 'stopping' || this.state === 'failed' || this.active?.owner.instanceId !== active.owner.instanceId) return
+      if (this.state === 'stopping' || this.state === 'failed' || this.active?.owner.instanceId !== active.owner.instanceId || (expectedGeneration && active.owner.instanceId !== expectedGeneration)) return
       active.failures = ok ? 0 : active.failures + 1
       this.state = ok ? 'healthy' : (active.failures >= this.spec.maxHealthFailures ? 'degraded' : 'ready')
       if (this.state === 'degraded') this.logger.warn('sidecar.degraded', { sidecarId: this.spec.sidecarId, failures: active.failures })
     } catch (error) {
-      if (this.active?.owner.instanceId === active.owner.instanceId && this.state !== 'stopping' && this.state !== 'failed') {
+      if (this.active?.owner.instanceId === active.owner.instanceId && this.state !== 'stopping' && this.state !== 'failed' && (!expectedGeneration || active.owner.instanceId === expectedGeneration)) {
         active.failures += 1
         this.state = active.failures >= this.spec.maxHealthFailures ? 'degraded' : 'ready'
         this.logger.warn('sidecar.health_error', { sidecarId: this.spec.sidecarId, failures: active.failures })
@@ -275,11 +242,10 @@ export class SidecarManager {
     active.reaping = this.reapExited(active)
   }
 
-  private async reapExited(active: { owner: SidecarOwnership; tree?: SidecarTreeRunner; removeExit?: () => void }): Promise<void> {
+  private async reapExited(active: { owner: SidecarOwnership; tree: SidecarTreeController; removeExit?: () => void }): Promise<void> {
     try {
-      const tree = active.tree ?? nativeTreeRunner
-      await tree.signal(active.owner, true)
-      if (!await waitForEmpty(tree, active.owner, this.spec.shutdown.killAfterMs)) throw new Error('sidecar descendants remain')
+      await active.tree.signal(true)
+      if (!await waitForEmpty(active.tree, this.spec.shutdown.killAfterMs)) throw new Error('sidecar descendants remain')
       if (this.active?.owner.instanceId === active.owner.instanceId) {
         active.removeExit?.()
         active.removeExit = undefined
