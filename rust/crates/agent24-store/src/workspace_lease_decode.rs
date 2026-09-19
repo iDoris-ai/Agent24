@@ -38,10 +38,7 @@ fn opt_text(row: &SqliteRow, field: &'static str) -> WorkspaceResult<Option<Stri
 fn instant(row: &SqliteRow, field: &'static str) -> WorkspaceResult<WorkspaceInstant> {
     WorkspaceInstant::parse(&text(row, field)?).map_err(|_| bad(field))
 }
-fn opt_instant(
-    row: &SqliteRow,
-    field: &'static str,
-) -> WorkspaceResult<Option<WorkspaceInstant>> {
+fn opt_instant(row: &SqliteRow, field: &'static str) -> WorkspaceResult<Option<WorkspaceInstant>> {
     opt_text(row, field)?
         .map(|v| WorkspaceInstant::parse(&v).map_err(|_| bad(field)))
         .transpose()
@@ -63,10 +60,9 @@ pub struct WorkspaceLeaseRow {
 
 impl WorkspaceLeaseRow {
     pub fn decode(row: &SqliteRow) -> WorkspaceResult<Self> {
-        let id = WorkspaceLeaseId::parse(&text(row, "lease_id")?)
-            .map_err(|_| bad("lease_id"))?;
-        let workspace_id = WorkspaceId::parse(text(row, "workspace_id")?)
-            .map_err(|_| bad("workspace_id"))?;
+        let id = WorkspaceLeaseId::parse(&text(row, "lease_id")?).map_err(|_| bad("lease_id"))?;
+        let workspace_id =
+            WorkspaceId::parse(text(row, "workspace_id")?).map_err(|_| bad("workspace_id"))?;
         let root_generation = nonblank(row, "root_generation")?;
         let owner_id = nonblank(row, "owner_id")?;
         let kind = LeaseKind::parse(&text(row, "kind")?).map_err(|_| bad("kind"))?;
@@ -78,15 +74,19 @@ impl WorkspaceLeaseRow {
         let released_at = opt_instant(row, "released_at")?;
 
         match kind {
-            LeaseKind::Run if daemon_generation.is_some()
-                || host_instance_id.is_some()
-                || expires_at.is_some()
-                || renewed_at.is_some() =>
+            LeaseKind::Run
+                if daemon_generation.is_some()
+                    || host_instance_id.is_some()
+                    || expires_at.is_some()
+                    || renewed_at.is_some() =>
             {
                 return Err(bad("kind"));
             }
+            LeaseKind::Run => {}
             LeaseKind::Host => {
-                let daemon = daemon_generation.as_deref().ok_or(bad("daemon_generation"))?;
+                let daemon = daemon_generation
+                    .as_deref()
+                    .ok_or(bad("daemon_generation"))?;
                 if daemon.trim().is_empty() {
                     return Err(bad("daemon_generation"));
                 }
