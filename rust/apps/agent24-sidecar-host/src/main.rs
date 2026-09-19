@@ -1,4 +1,5 @@
 #[cfg(windows)]
+#[allow(dead_code)]
 mod owner;
 
 fn main() {
