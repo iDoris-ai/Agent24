@@ -25,6 +25,7 @@ impl WorkspaceId {
             .strip_prefix("ws_")
             .ok_or(WorkspaceValidationError::InvalidId)?;
         if suffix.len() != 26
+            || suffix.as_bytes()[0] > b'7'
             || !suffix
                 .bytes()
                 .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
