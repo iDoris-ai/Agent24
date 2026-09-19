@@ -10,6 +10,7 @@ agent24-sidecar-host-protocol = { path = "../../crates/agent24-sidecar-host-prot
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["process", "signal"] }
+rustix = { version = "1", features = ["process"] }
 
 [lints]
 workspace = true
