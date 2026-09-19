@@ -254,6 +254,20 @@ SkillBank 主分支
 
 ## 六、Roadmap（里程碑）
 
+> ## ⛔ 本节已作废（2026-09-19 标注）
+>
+> 下面的 M1–M5 是 **Rust 核心重写（[ADR-026](ADR-026-rust-core-polyglot.md)）之前**的产品规划，
+> 写于 Electron + Node.js daemon 时代（文中「AuraAIHQ/Agent24 仓库（已建）」这类措辞即为当时留下）。
+> 今天的架构是 **Rust daemon（`agent24d`）+ 进程外领域 OS 模块生态**，与本节的里程碑划分
+> **没有对应关系**。
+>
+> **不要再照本节排期。** 当前真实执行状态的唯一权威来源是
+> [`agent/tasks.md`](agent/tasks.md)（配套：[`agent/PLAN-OOP-OS-AND-BACKLOG.md`](agent/PLAN-OOP-OS-AND-BACKLOG.md)
+> 的任务定义与验收，以及可执行探针 `bash docs/agent/me3-status.sh`）。
+> 未来的产品路线见 [`agent/roadmap.md`](agent/roadmap.md)（M1–M6，当前暂停）。
+>
+> 本节**保留不删**，仅供历史考古：它记录了 Agent24 立项时的产品意图。
+
 ```
 M1 (4-6周) — Desktop 壳 + 模块化骨架
   □ AuraAIHQ/Agent24 仓库（已建）

@@ -1,8 +1,27 @@
 # Roadmap
 
-> 主里程碑列表见 [PLAN.md 第六节](PLAN.md#六roadmap里程碑)。本文档维护当前进度。
+## ⛔ 本文档已作废（2026-09-19 标注）—— 不是当前进度
+
+本文档最后更新于 **2026-05-13**，记录的是 **Rust 核心重写（[ADR-026](ADR-026-rust-core-polyglot.md)）
+之前**的 Electron + Node.js daemon 时代进展。下面标着「✅ 完成」的 M0–M3 和「待合并 main」的
+M4a/b/c，指的都是**那个已经被替换掉的技术栈里的交付物**（Electron 壳、Node.js HTTP daemon、
+TypeScript `CapabilityModule`、BoxLite 服务容器）。ADR-023 / ADR-026 之后，内核用 Rust 重写，
+模块生态改为进程外领域 OS —— 这些条目**在今天的架构里没有等价物，不能读作「这些能力今天还在」**。
+
+**当前进展的权威来源有两处，都不在本文档**：
+
+- [`agent/tasks.md`](agent/tasks.md) —— **当前执行状态**（ME-3 进程外 OS 专项，目标 v0.5.0）。
+  配套 [`agent/PLAN-OOP-OS-AND-BACKLOG.md`](agent/PLAN-OOP-OS-AND-BACKLOG.md)（任务定义与验收）
+  与可执行探针 `bash docs/agent/me3-status.sh`。
+- [`agent/roadmap.md`](agent/roadmap.md) —— **未来产品路线**（M1–M6），**当前暂停**，等 v0.5.0 发布后再捡。
+
+本文档**保留不删**，仅供历史考古。
+
+---
+
+> ~~主里程碑列表见 [PLAN.md 第六节](PLAN.md#六roadmap里程碑)。本文档维护当前进度。~~（已作废，见上）
 > 所有重大决策见 [decision.md](decision.md)。
-> 最后更新：2026-05-13
+> 最后更新：2026-05-13（**内容截止于此，之后未再维护**）
 
 ---
 

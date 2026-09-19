@@ -168,10 +168,10 @@ probe "3b-3 进程监督"            rust/crates/agent24-os-proto/src/supervisor
 probe "3b-4 受约束代理"          rust/crates/agent24-os-proto/src/proxy.rs       "pub fn proxy_router"
 probe "3b-5 两阶段热 disable"    rust/crates/agent24-os-proto/src/drain.rs       "pub enum DrainState"
 probe "3c   回调通道其余部分"    rust/crates/agent24-os-proto/src/rpc.rs         "pub fn dispatch"
-probe "3d   记忆回调"            rust/crates/agent24-os-proto/src/memory.rs      "pub fn handle_memory"
-probe "3e   事件 + 审批"         rust/crates/agent24-os-proto/src/events.rs      "pub fn handle_event"
+probe "3d   记忆回调"            rust/apps/agent24d/src/os_memory.rs             "pub struct RememberHandler"
+probe "3e   事件 + 审批"         rust/apps/agent24d/src/module_approvals.rs      "pub async fn decide_module_approval"
 probe "3f   仓外包端到端"        rust/apps/agent24d/tests/me3f_blackbox.rs       "fn a_package_from_outside_the_repo"
-probe "3g   启用路径准入"        rust/apps/agent24d/src/domain.rs                "fn admit_on_enable"
+probe "3g   启用路径准入"        rust/apps/agent24d/src/os_routes.rs             "fn admission_refused_response"
 echo
 echo "验收(3f)未通过之前,「支持第三方 OS」只是一句声称。"
 echo "探针只回答「代码在不在」,回答不了「有没有生产调用方」—— 🟢 与 ✅ 的区别仍要人判断。"
