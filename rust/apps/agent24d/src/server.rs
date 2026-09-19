@@ -1402,6 +1402,8 @@ pub async fn serve(
                 token: token.clone(),
                 pid: daemon_pid,
                 version: env!("CARGO_PKG_VERSION").to_owned(),
+                generation: String::new(),
+                auth_mode: agent24_protocol::state_file::AuthMode::LegacySingleToken,
             })
     {
         tracing::warn!("could not write daemon state file: {err}");
