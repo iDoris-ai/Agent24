@@ -7,7 +7,7 @@
 #[cfg(unix)]
 mod posix;
 #[cfg(unix)]
-pub use posix::{LaunchSpec, OwnedGeneration};
+pub use posix::{LaunchSpec, OwnedGeneration, StopError};
 
 /// Run the host process.
 pub fn run() -> std::io::Result<()> {
