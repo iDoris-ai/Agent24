@@ -233,7 +233,7 @@ mod tests {
         let row = WorkspaceRow {
             id: id.clone(),
             kind: WorkspaceKind::OrchestratorScratch,
-            state: WorkspaceState::Active,
+            state: WorkspaceState::CleanupFailed,
             authority: WorkspaceAuthority {
                 provenance_source: "git".into(),
                 provenance_project_ref: Some("project".into()),
@@ -255,24 +255,36 @@ mod tests {
             released_at: None,
             revision: 1,
             cleanup: WorkspaceCleanupRecord {
-                state: WorkspaceState::Active,
-                quarantine_root: Some("/secret/quarantine".into()),
+                state: WorkspaceState::CleanupFailed,
                 quarantined_at: None,
-                attempts: 0,
-                last_attempt_at: None,
-                error: None,
-                retry_at: None,
+                quarantine_root: None,
+                attempts: 1,
+                last_attempt_at: Some(created_at.clone()),
+                error: Some("secret cleanup".into()),
+                retry_at: Some(expires_at.clone()),
             },
             ttl: WorkspaceTtl::new(60_000).unwrap(),
         };
         let public = row.project();
         assert_eq!(public.id, id);
         assert_eq!(public.kind, "orchestrator_scratch");
-        assert_eq!(public.state, "active");
+        assert_eq!(public.state, "cleanup_failed");
         assert_eq!(public.provenance.source, "git");
         assert_eq!(public.lifecycle_owner.reference, "owner");
         assert_eq!(public.created_at, created_at.as_str());
         assert_eq!(public.expires_at, expires_at.as_str());
         assert_eq!(public.revision, 1);
+        let wire = serde_json::to_string(&public).unwrap();
+        for secret in [
+            "/secret/root",
+            "generation-1",
+            "secret cleanup",
+            "canonical_root",
+            "root_generation",
+            "quarantine_root",
+            "cleanup_error",
+        ] {
+            assert!(!wire.contains(secret), "projection leaked {secret}");
+        }
     }
 }
