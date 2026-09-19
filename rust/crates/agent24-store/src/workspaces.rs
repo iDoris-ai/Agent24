@@ -28,7 +28,7 @@ pub struct WorkspaceInstant {
 
 impl WorkspaceInstant {
     pub fn parse(text: &str) -> WorkspaceResult<Self> {
-        if text.get(17..19) == Some("60") {
+        if text.len() != 24 || !text.ends_with('Z') || text.get(17..19) == Some("60") {
             return Err(WorkspaceStoreError::InvalidValue { field: "timestamp" });
         }
         let parsed = DateTime::parse_from_rfc3339(text)
