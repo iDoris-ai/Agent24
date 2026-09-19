@@ -389,10 +389,18 @@ impl Reaper {
     }
 
     fn run(self: Arc<Self>) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop()));
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop())).is_err();
         let mut state = recover_lock(self.state.lock());
         state.worker_started = false;
         self.available.notify_all();
+        drop(state);
+        if panicked {
+            // A poisoned worker must not strand queued Children. Re-starting
+            // is bounded to one worker; launch still reports a fresh thread
+            // allocation failure before creating a new Child.
+            let _ = self.start();
+        }
     }
 
     fn run_loop(&self) {
