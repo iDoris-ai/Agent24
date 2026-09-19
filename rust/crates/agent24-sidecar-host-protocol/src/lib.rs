@@ -252,6 +252,7 @@ pub fn validate_event(event: &Event) -> Result<(), ProtocolError> {
 }
 
 fn encode_frame<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, ProtocolError> {
+    // The actor still owns allocation-bounded serialization; this cap is post-serialization.
     let mut bytes = serde_json::to_vec(value).map_err(|_| ProtocolError::InvalidMessage)?;
     bytes.push(b'\n');
     if bytes.len() > limit {
@@ -568,6 +569,80 @@ mod tests {
             }),
             Ok(())
         );
+    }
+
+    #[test]
+    fn empty_reply_and_malformed_fields_are_strict() {
+        let reply = Reply::Empty {
+            version: 1,
+            request_id: 2,
+            empty: true,
+        };
+        let bytes = encode_reply(&reply).unwrap();
+        assert_eq!(decode_reply(&bytes), Ok(reply));
+        assert_eq!(
+            decode_reply(
+                br#"{"type":"empty","version":1,"request_id":2,"empty":"yes"}
+"#
+            ),
+            Err(ProtocolError::InvalidJson)
+        );
+        assert_eq!(
+            decode_reply(
+                br#"{"type":"empty","version":1,"request_id":2}
+"#
+            ),
+            Err(ProtocolError::InvalidJson)
+        );
+        assert_eq!(decode_request(br#"{"type":"launch","version":1,"request_id":1,"executable":"/x","cwd":"/y","env":{}}
+"#, &mut RequestSequence::new()), Err(ProtocolError::InvalidJson));
+        assert_eq!(decode_request(br#"{"type":"launch","version":1,"request_id":1,"executable":"/x","cwd":"/y","argv":[]}
+"#, &mut RequestSequence::new()), Err(ProtocolError::InvalidJson));
+        assert_eq!(
+            RequestSequence::new().validate(&custom(1, exe(), "relative", vec![], vec![])),
+            Err(ProtocolError::InvalidMessage)
+        );
+        assert_eq!(
+            decode_reply(
+                br#"{"type":"result","version":1,"request_id":1}garbage
+"#
+            ),
+            Err(ProtocolError::InvalidJson)
+        );
+    }
+
+    #[test]
+    fn secret_rules_and_failed_encode_do_not_advance_state() {
+        for token in [
+            "",
+            &"t".repeat(31),
+            &format!("{} ", "t".repeat(31)),
+            &format!("{} ", "t".repeat(31)),
+        ] {
+            assert_eq!(
+                validate_event(&Event::Ready {
+                    protocol: 1,
+                    port: 1,
+                    token: token.to_string(),
+                    version: "v".into()
+                }),
+                Err(ProtocolError::InvalidMessage)
+            );
+        }
+        let huge = Request::Launch {
+            version: 1,
+            request_id: 1,
+            executable: exe().into(),
+            cwd: cwd().into(),
+            argv: vec!["x".repeat(4096); 20],
+            env: BTreeMap::new(),
+        };
+        let mut sequence = RequestSequence::new();
+        assert_eq!(
+            encode_request(&huge, &mut sequence),
+            Err(ProtocolError::TooLarge)
+        );
+        assert_eq!(sequence.validate(&launch(1)), Ok(()));
     }
 }
 
