@@ -2,9 +2,31 @@ use agent24_protocol::{Workspace, WorkspaceId};
 use sqlx::{Sqlite, Transaction};
 
 use crate::{
-    LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, WorkspaceInstant, WorkspaceResult,
-    WorkspaceRow, WorkspaceStoreError,
+    LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, WorkspaceInstant,
+    WorkspaceListCursor, WorkspaceListQuery, WorkspacePage, WorkspaceResult, WorkspaceRow,
+    WorkspaceStoreError,
 };
+
+const LIST_ALL: &str = "SELECT * FROM workspaces
+                        ORDER BY created_at COLLATE BINARY DESC, id COLLATE BINARY DESC
+                        LIMIT ?";
+const LIST_STATE: &str = "SELECT * FROM workspaces
+                          WHERE state COLLATE BINARY = ? COLLATE BINARY
+                          ORDER BY created_at COLLATE BINARY DESC, id COLLATE BINARY DESC
+                          LIMIT ?";
+const LIST_CURSOR: &str = "SELECT * FROM workspaces
+                           WHERE (created_at COLLATE BINARY < ? COLLATE BINARY
+                                  OR (created_at COLLATE BINARY = ? COLLATE BINARY
+                                      AND id COLLATE BINARY < ? COLLATE BINARY))
+                           ORDER BY created_at COLLATE BINARY DESC, id COLLATE BINARY DESC
+                           LIMIT ?";
+const LIST_STATE_CURSOR: &str = "SELECT * FROM workspaces
+                                 WHERE state COLLATE BINARY = ? COLLATE BINARY
+                                   AND (created_at COLLATE BINARY < ? COLLATE BINARY
+                                        OR (created_at COLLATE BINARY = ? COLLATE BINARY
+                                            AND id COLLATE BINARY < ? COLLATE BINARY))
+                                 ORDER BY created_at COLLATE BINARY DESC, id COLLATE BINARY DESC
+                                 LIMIT ?";
 
 fn decode_row(row: &sqlx::sqlite::SqliteRow) -> WorkspaceResult<Workspace> {
     WorkspaceRow::decode(row)
@@ -127,6 +149,47 @@ async fn insert_workspace(
 }
 
 impl Store {
+    /// Read one page directly from the pool without applying lifecycle policy.
+    pub async fn list_workspaces(
+        &self,
+        query: &WorkspaceListQuery,
+    ) -> WorkspaceResult<WorkspacePage> {
+        let fetch_limit = i64::from(query.limit().value()) + 1;
+        let statement = match (query.state(), query.after()) {
+            (None, None) => sqlx::query(LIST_ALL),
+            (Some(state), None) => sqlx::query(LIST_STATE).bind(state.as_str()),
+            (None, Some(after)) => sqlx::query(LIST_CURSOR)
+                .bind(after.created_at().as_str())
+                .bind(after.created_at().as_str())
+                .bind(after.id().as_str()),
+            (Some(state), Some(after)) => sqlx::query(LIST_STATE_CURSOR)
+                .bind(state.as_str())
+                .bind(after.created_at().as_str())
+                .bind(after.created_at().as_str())
+                .bind(after.id().as_str()),
+        };
+        let rows = statement
+            .bind(fetch_limit)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        let rows = rows
+            .iter()
+            .map(WorkspaceRow::decode)
+            .collect::<WorkspaceResult<Vec<_>>>()?;
+        let limit = usize::from(query.limit().value());
+        let next_cursor = (rows.len() > limit).then(|| {
+            let row = &rows[limit - 1];
+            WorkspaceListCursor::new(row.created_at.clone(), row.id.clone())
+        });
+        let items = rows
+            .into_iter()
+            .take(limit)
+            .map(|row| row.project())
+            .collect();
+        Ok(WorkspacePage::new(items, next_cursor))
+    }
+
     /// Read one workspace directly from the pool without applying lifecycle policy.
     pub async fn get_workspace(&self, id: &WorkspaceId) -> WorkspaceResult<Workspace> {
         let row = sqlx::query("SELECT * FROM workspaces WHERE id = ? COLLATE BINARY LIMIT 1")
