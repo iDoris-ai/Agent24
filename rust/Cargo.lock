@@ -203,6 +203,7 @@ name = "agent24-sidecar-host"
 version = "0.1.0"
 dependencies = [
  "agent24-sidecar-host-protocol",
+ "nix",
 ]
 
 [[package]]
