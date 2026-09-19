@@ -171,6 +171,7 @@ dependencies = [
 name = "agent24-protocol"
 version = "0.3.0"
 dependencies = [
+ "chrono",
  "fs2",
  "hex",
  "schemars",
