@@ -10,7 +10,7 @@
 | A24-OD-00 capability 安全前置 | PASS（待逐层合并） | SOL 无 blocker/high；全量 Agent24/协议/CLI 测试及私有 ready-pipe 烟测通过 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
 | P2 workspace contract | IN PROGRESS | A24-OD-01 types、schema、store models、CREATE 与 GET 已通过 SOL；LIST 设计中 |
-| A24-OD-05 sidecar foundation | PASS（未接线） | manager foundation `a3b83fb` + host protocol `21ecfe7` 均通过 SOL exact-head 复核；平台 owner 实现中 |
+| A24-OD-05 sidecar foundation | PASS（未接线） | manager `a3b83fb`、host protocol `21ecfe7`、POSIX owner `247b355` 与 Windows owner/validation `b8cfc3d` 均通过 SOL exact-head 复核 |
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 `outdated_cli / incompatible opencode args` 失败，随后停滞，需要 bounded SIGINT。
@@ -84,5 +84,7 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - foundation final：`a3b83fb22e8559319fe8ed677e9cbc40a64258ac`，SOL 无 blocker/high/medium；
 - 110/110 desktop tests、完整 desktop typecheck 与 exact-head diff check 通过；
 - private host protocol：#275/#278/#279/#282/#283/#284/#285/#290，分别为 159/129/80/84/141/108/145/75 changed lines；final `21ecfe7759e3e6d90daf1132095bbff337eb7f23`，SOL `PASS`；
+- POSIX generation owner：#291/#292/#302/#303/#306/#312/#315/#313，全部不超过 200 changed lines；final `247b355e0d9c693d6f580f9372c7f16eaab2fe2e`，9 tests，SOL `PASS`；
+- Windows Job owner/validation：#299/#300/#307/#308/#316，全部不超过 200 changed lines；final `b8cfc3ddc2054953688aa94dc096e1eab08f8f28`，Windows Server 2025 上 5 owner + 6 protocol tests，SOL `PASS`；
 - foundation 仍未接入 renderer、IPC 或产品路由；
-- POSIX generation-pinned controller 与 Windows Job Object（或等价控制器）是产品接线前硬门禁，必须作为后续独立小 PR 实现。
+- 下一门禁是 allocation-bounded stdio actor、ready/exit supervision 与 bounded graceful→forced shutdown；通过前仍不得产品接线。

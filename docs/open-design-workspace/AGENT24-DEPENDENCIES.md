@@ -1,6 +1,6 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 GET SOL passed, LIST designing / A24-OD-05 host protocol SOL passed, platform owners implementing
+> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 GET SOL passed, LIST implementing / A24-OD-05 platform owners SOL passed, actor designing
 >
 > 日期：2026-09-19
 >
@@ -141,13 +141,13 @@
 
 ### A24-OD-05 — 通用 sidecar manager
 
-状态：`FOUNDATION + HOST PROTOCOL PASS / PLATFORM OWNERS IMPLEMENTING / UNWIRED`
+状态：`FOUNDATION + HOST PROTOCOL + PLATFORM OWNERS PASS / ACTOR DESIGNING / UNWIRED`
 
 目标分支：`feat/a24-desktop-sidecar-manager`
 
 要求：显式进程 ownership、动态端口/token、ready/health、重启策略、手动停止、graceful → forced shutdown、进程树清理、日志和 bounded shutdown。禁止用 `pkill -f` 之类模糊匹配终止 Open Design。
 
-当前证据：manager #253/#254/#255/#259/#260/#261 与 host protocol #275/#278/#279/#282/#283/#284/#285/#290 均不超过 200 changed lines；protocol final `21ecfe7759e3e6d90daf1132095bbff337eb7f23` 已通过 SOL exact-head 复核。foundation 未接入 renderer、IPC 或产品路由。生产 launcher 必须提供 POSIX generation-pinned controller 与 Windows Job Object（或等价控制器）；这是接线前硬门禁，不得退化为 PID/PGID 数字信号或 `taskkill`。
+当前证据：manager、host protocol、POSIX owner 与 Windows Job owner/CI 均以不超过 200 changed lines 的 PR 栈通过 SOL exact-head 复核；platform final 分别为 `247b355e0d9c693d6f580f9372c7f16eaab2fe2e` 与 `b8cfc3ddc2054953688aa94dc096e1eab08f8f28`。foundation 未接入 renderer、IPC 或产品路由；actor/supervision 通过前不得接线，也不得退化为 PID/PGID 数字信号或 `taskkill`。
 
 ### A24-OD-06 — Creative 独立 session/CSP
 
