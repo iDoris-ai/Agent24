@@ -1424,25 +1424,23 @@ async fn mount_package(
         // closure at all, the `Arc<RateLimiter>`/`Arc<Semaphore>` it holds
         // would be dropped the moment `mount_package` returns, and nothing
         // would keep decision 3's "one limiter per mount, reused across
-        // every restart generation" promise. `_a24/memory/private/*`'s
-        // `Handler::call()` implementation is T8.5c-W-wire's job (not this
-        // document's, §8) — this crate has no method to register it with
-        // yet, so the binding is unread for now (`_`-prefixed on purpose,
-        // like `PrivateMemoryHandle`'s fields — see their own doc comment).
-        let _memory_entitlement = memory_entitlement.clone();
+        // every restart generation" promise.
+        let memory_entitlement = memory_entitlement.clone();
         Arc::new(
             move |generation: &Arc<agent24_os_proto::drain::Generation>| {
                 // This inner clone itself only lives to the end of THIS
                 // `MethodsFor` call — the returned `Methods` does not carry
                 // it anywhere. What actually persists across restarts is the
-                // OUTER `_memory_entitlement` binding above: it is captured
+                // OUTER `memory_entitlement` binding above: it is captured
                 // by THIS `move` closure once, and the closure itself
                 // (`Arc<dyn Fn>`) is what the supervisor loop holds for the
                 // module's whole supervised lifetime, calling it once per
-                // generation. A future `_a24/memory/private/*` `Handler`
-                // reads from a clone made HERE, inside the closure body —
-                // this line is where that will happen.
-                let _memory_entitlement = _memory_entitlement.clone();
+                // generation. Each of the three `_a24/memory/private/*`
+                // Handlers below reads from a clone made HERE, inside the
+                // closure body — so a restarted generation's Handlers still
+                // see the same mount-time `Arc<RateLimiter>`/`Arc<Semaphore>`
+                // (T8.5c-W-mount decision 3/4), never a freshly-built one.
+                let memory_entitlement = memory_entitlement.clone();
                 // A fresh bucket every time this closure runs — once per
                 // generation, i.e. once per (re)start. Building it outside the
                 // closure and cloning the `Arc` in would let a restarted module
@@ -1494,6 +1492,35 @@ async fn mount_package(
                             module: name.clone(),
                             granted: granted.clone(),
                             broker: approval_broker.clone(),
+                        }),
+                    )
+                    // T8.5c-W-wire decision W4: registered UNCONDITIONALLY,
+                    // exactly like `_a24/events/emit`/the three approval
+                    // methods above — `entitlement.private_handle()` is
+                    // checked INSIDE each handler's `call()` (mount design
+                    // §2.1), not by conditionally registering the method.
+                    // `_a24/memory/scoped/*` (decision W6) is deliberately
+                    // NOT registered anywhere in this crate — see
+                    // `memory_callback`'s module doc.
+                    .with(
+                        "_a24/memory/private/remember",
+                        Arc::new(crate::memory_callback::RememberHandler {
+                            generation: generation.clone(),
+                            entitlement: memory_entitlement.clone(),
+                        }),
+                    )
+                    .with(
+                        "_a24/memory/private/recall",
+                        Arc::new(crate::memory_callback::RecallHandler {
+                            generation: generation.clone(),
+                            entitlement: memory_entitlement.clone(),
+                        }),
+                    )
+                    .with(
+                        "_a24/memory/private/recent",
+                        Arc::new(crate::memory_callback::RecentHandler {
+                            generation: generation.clone(),
+                            entitlement: memory_entitlement.clone(),
                         }),
                     )
             },

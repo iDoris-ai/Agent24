@@ -266,7 +266,11 @@ pub struct EventsEmitHandler {
     pub limiter: Arc<RateLimiter>,
 }
 
-fn refused_error(refused: CallbackRefused) -> RpcError {
+/// `pub(crate)`: shared with `memory_callback.rs` (T8.5c-W-wire) — both
+/// modules are background callbacks with identical draining/revoked
+/// semantics, so both map `CallbackRefused` to `RpcError` the same way rather
+/// than each defining their own copy.
+pub(crate) fn refused_error(refused: CallbackRefused) -> RpcError {
     match refused {
         CallbackRefused::NotReady => RpcError::application(
             ErrorKind::NotReady,
