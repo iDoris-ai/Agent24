@@ -474,10 +474,10 @@ impl OsMemoryCatalog {
                 }
                 // The module does NOT then mount with an empty partition: the
                 // stale v1 row still holds this (org, space), and that pair is
-                // UNIQUE in the catalog, so `record` fails and `lend` withholds
-                // the capability entirely. Losing memory for a run is the
-                // correct outcome; silently starting a fresh partition beside
-                // the old one is not.
+                // UNIQUE in the catalog, so `ensure_recorded` fails and `lend`
+                // withholds the capability entirely. Losing memory for a run is
+                // the correct outcome; silently starting a fresh partition
+                // beside the old one is not.
                 Err(e) => tracing::error!(
                     module = %row.module_name,
                     error = %e,
@@ -1948,6 +1948,44 @@ mod tests {
         assert_eq!(
             after_second_mount[0].first_seen_at, after_first_mount[0].first_seen_at,
             "and first_seen_at must not move with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_recorded_after_mark_mounted_does_not_reset_last_seen_at() {
+        // Regression companion to the two tests above: those prove `ensure_recorded`
+        // never advances `last_seen_at` on its own, and that `mark_mounted` is what
+        // gives it its first real value. Neither pins what happens to an ALREADY
+        // touched row when a later restart re-`ensure_recorded`s the same partition
+        // (e.g. the next daemon start re-recording every mounted module before it
+        // knows which ones will actually come up) — `ensure_recorded`'s ON CONFLICT
+        // branch must leave a real timestamp exactly as `mark_mounted` left it, not
+        // reset it back toward NULL and not advance it itself.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let org = org_of(&kv, "alice").await;
+        let mut cat = OsMemoryCatalog::default();
+        let p = cat
+            .ensure_recorded(&org, "alice", &manifest("sin90"), &kv)
+            .await
+            .unwrap();
+        cat.mark_mounted(p, &kv, &FixedClock(1_700_000_000)).await;
+        let touched = OsMemoryCatalog::durable_for_org(&kv, &org).await.unwrap();
+
+        cat.ensure_recorded(&org, "alice", &manifest("sin90"), &kv)
+            .await
+            .unwrap();
+        let after_repeat = OsMemoryCatalog::durable_for_org(&kv, &org).await.unwrap();
+
+        assert_eq!(
+            after_repeat[0].last_seen_at, touched[0].last_seen_at,
+            "a later ensure_recorded for a partition that has already been \
+             mark_mounted must leave last_seen_at exactly as mark_mounted left \
+             it — ensure_recorded is not allowed to reset it back toward NULL, \
+             or to advance it again itself"
+        );
+        assert_eq!(
+            after_repeat[0].first_seen_at, touched[0].first_seen_at,
+            "and first_seen_at must not move with any of this"
         );
     }
 
