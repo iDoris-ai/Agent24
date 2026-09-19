@@ -1,5 +1,5 @@
 use agent24_protocol::WorkspaceId;
-use sqlx::{Row, sqlite::SqliteRow};
+use sqlx::{Row, TypeInfo, ValueRef, sqlite::SqliteRow};
 
 use crate::{
     HostLeaseTtl, LeaseKind, WorkspaceInstant, WorkspaceLeaseId, WorkspaceLeaseRecord,
@@ -13,6 +13,10 @@ fn bad(field: &'static str) -> WorkspaceStoreError {
     }
 }
 fn text(row: &SqliteRow, field: &'static str) -> WorkspaceResult<String> {
+    let raw = row.try_get_raw(field).map_err(|_| bad(field))?;
+    if raw.is_null() || raw.type_info().name() != "TEXT" {
+        return Err(bad(field));
+    }
     let value = row.try_get::<String, _>(field).map_err(|_| bad(field))?;
     if value.is_empty() || value.contains('\0') {
         return Err(bad(field));
@@ -27,6 +31,13 @@ fn nonblank(row: &SqliteRow, field: &'static str) -> WorkspaceResult<String> {
     Ok(value)
 }
 fn opt_text(row: &SqliteRow, field: &'static str) -> WorkspaceResult<Option<String>> {
+    let raw = row.try_get_raw(field).map_err(|_| bad(field))?;
+    if raw.is_null() {
+        return Ok(None);
+    }
+    if raw.type_info().name() != "TEXT" {
+        return Err(bad(field));
+    }
     let value = row
         .try_get::<Option<String>, _>(field)
         .map_err(|_| bad(field))?;
