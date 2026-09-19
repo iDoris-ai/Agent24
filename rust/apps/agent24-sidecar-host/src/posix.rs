@@ -7,7 +7,6 @@ use nix::{
 };
 use std::os::unix::process::CommandExt;
 use std::{
-    collections::VecDeque,
     ffi::OsString,
     io,
     path::PathBuf,
@@ -22,7 +21,6 @@ use std::{
 const LEADER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const GROUP_EMPTY_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL: Duration = Duration::from_millis(10);
-const REAPER_QUEUE_CAPACITY: usize = 64;
 
 /// Inputs for one helper generation. The owner, not the caller, chooses the
 /// process group: the child becomes the group leader before it can exec.
@@ -110,6 +108,7 @@ pub struct OwnedGeneration {
     group: Pid,
     phase: Phase,
     status: Option<ExitStatus>,
+    permit: Option<GenerationPermit>,
 }
 
 impl OwnedGeneration {
@@ -128,19 +127,40 @@ impl OwnedGeneration {
             .stderr(Stdio::null());
         command.process_group(0);
         let reaper = global_reaper();
+        // Start the permanent worker and reserve the single generation slot
+        // before creating a process. This makes the one-host/one-generation
+        // rule a property of this type, rather than a promise to callers.
         reaper.start()?;
-        let child = command.spawn()?;
-        let leader = i32::try_from(child.id()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "child pid does not fit POSIX pid_t",
-            )
-        })?;
+        let permit = reaper.reserve()?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                drop(permit);
+                return Err(error);
+            }
+        };
+        let leader = match i32::try_from(child.id()) {
+            Ok(leader) => leader,
+            Err(_) => {
+                // This cannot happen on a conforming POSIX host, but retain
+                // ownership if it does: terminate and reap before returning
+                // the initialization error and releasing the permit.
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(permit);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "child pid does not fit POSIX pid_t",
+                ));
+            }
+        };
         Ok(Self {
             child: Some(child),
             group: Pid::from_raw(leader),
             phase: Phase::Running,
             status: None,
+            permit: Some(permit),
         })
     }
 
@@ -169,6 +189,7 @@ impl OwnedGeneration {
     pub fn reap_after_stop(&mut self) -> Result<ExitStatus, StopError> {
         if matches!(self.phase, Phase::Reaped) {
             self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
+            self.permit.take();
             return self.status.ok_or(StopError::Unconfirmed {
                 operation: "reap",
                 source: io::Error::other("reaped generation has no exit status"),
@@ -193,6 +214,9 @@ impl OwnedGeneration {
         self.status = Some(status);
         self.phase = Phase::Reaped;
         self.confirm_group_empty(GROUP_EMPTY_TIMEOUT)?;
+        // The permit is released only after both exact-child reaping and
+        // process-group emptiness have been confirmed.
+        self.permit.take();
         Ok(status)
     }
 
@@ -317,27 +341,83 @@ impl Drop for OwnedGeneration {
             // accepted after WNOWAIT confirms this leader has exited.
             let _ = self.signal(Signal::SIGKILL, Phase::ForceKillRequested);
             if let Some(child) = self.child.take() {
-                global_reaper().enqueue(child);
+                let permit = match self.permit.take() {
+                    Some(permit) => permit,
+                    None => {
+                        // This is an internal invariant violation: a live
+                        // child can only exist while its generation permit is
+                        // held. Abort before `Child` is dropped, so the host
+                        // cannot silently leak an unreaped process.
+                        std::process::abort();
+                    }
+                };
+                let job = ReapJob {
+                    child,
+                    group: self.group,
+                    _permit: permit,
+                    child_reaped: false,
+                };
+                if let Err(job) = global_reaper().enqueue(job) {
+                    // The permit makes this impossible in a valid state. Do
+                    // not drop the exact Child if corruption ever violates
+                    // that invariant: abort while it is still owned.
+                    let _ = job;
+                    std::process::abort();
+                }
             }
         }
     }
 }
 
 struct ReapJob {
-    child: Option<Child>,
+    child: Child,
+    group: Pid,
+    _permit: GenerationPermit,
+    child_reaped: bool,
 }
 
 impl ReapJob {
-    fn reap_once(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.wait();
-            self.child = None;
+    /// Return `true` only after the exact leader has been reaped and its
+    /// process group is confirmed empty. Errors retain the Child for retry.
+    fn reap_once(&mut self) -> bool {
+        if !self.child_reaped {
+            match self.child.try_wait() {
+                Ok(Some(_status)) => self.child_reaped = true,
+                Ok(None) | Err(_) => return false,
+            }
         }
+        group_is_empty(self.group)
+    }
+}
+
+struct GenerationPermit {
+    reaper: Arc<Reaper>,
+}
+
+impl std::fmt::Debug for GenerationPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerationPermit").finish_non_exhaustive()
+    }
+}
+
+impl Drop for GenerationPermit {
+    fn drop(&mut self) {
+        let mut state = recover_lock(self.reaper.state.lock());
+        // A permit is the authoritative active-generation bit. The slot may
+        // already be empty because the worker owns the job, so only this bit
+        // is cleared here.
+        state.permit_held = false;
+        self.reaper.available.notify_all();
     }
 }
 
 struct ReaperState {
-    queue: VecDeque<ReapJob>,
+    /// Exactly one generation may hold this permit. It remains held while a
+    /// dropped child's job is owned by the worker.
+    permit_held: bool,
+    /// Permanent single-slot handoff. There is deliberately no queue: a
+    /// second job cannot exist while the permit is held.
+    slot: Option<ReapJob>,
     worker_started: bool,
 }
 
@@ -350,7 +430,8 @@ impl Reaper {
     fn new() -> Self {
         Self {
             state: Mutex::new(ReaperState {
-                queue: VecDeque::with_capacity(REAPER_QUEUE_CAPACITY),
+                permit_held: false,
+                slot: None,
                 worker_started: false,
             }),
             available: Condvar::new(),
@@ -362,6 +443,9 @@ impl Reaper {
         if state.worker_started {
             return Ok(());
         }
+        // Keep the state lock through spawn so a concurrent launcher cannot
+        // observe a worker that is merely starting and reserve a child before
+        // thread creation has succeeded.
         state.worker_started = true;
         let worker = Arc::clone(self);
         if let Err(error) = thread::Builder::new()
@@ -374,58 +458,54 @@ impl Reaper {
         Ok(())
     }
 
-    fn enqueue(self: &Arc<Self>, child: Child) {
-        // The queue is deliberately bounded. Waiting for one slot is
-        // backpressure, but never drops the exact Child handle on overflow.
+    fn reserve(self: &Arc<Self>) -> io::Result<GenerationPermit> {
         let mut state = recover_lock(self.state.lock());
-        let mut child = Some(child);
-        while state.queue.len() >= REAPER_QUEUE_CAPACITY {
-            state = recover_lock(self.available.wait(state));
+        if state.permit_held || state.slot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another sidecar generation is still owned",
+            ));
         }
-        if let Some(child) = child.take() {
-            state.queue.push_back(ReapJob { child: Some(child) });
-            self.available.notify_one();
+        state.permit_held = true;
+        Ok(GenerationPermit {
+            reaper: Arc::clone(self),
+        })
+    }
+
+    fn enqueue(self: &Arc<Self>, job: ReapJob) -> Result<(), ReapJob> {
+        let mut state = recover_lock(self.state.lock());
+        if state.slot.is_some() || !state.permit_held {
+            return Err(job);
         }
+        state.slot = Some(job);
+        self.available.notify_one();
+        Ok(())
     }
 
     fn run(self: Arc<Self>) {
-        let panicked =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop())).is_err();
-        let mut state = recover_lock(self.state.lock());
-        state.worker_started = false;
-        self.available.notify_all();
-        drop(state);
-        if panicked {
-            // A poisoned worker must not strand queued Children. Re-starting
-            // is bounded to one worker; launch still reports a fresh thread
-            // allocation failure before creating a new Child.
-            let _ = self.start();
-        }
+        self.run_loop();
     }
 
     fn run_loop(&self) {
         loop {
             let mut job = {
                 let mut state = recover_lock(self.state.lock());
-                while state.queue.is_empty() {
+                while state.slot.is_none() {
                     state = recover_lock(self.available.wait(state));
                 }
-                let job = state.queue.pop_front();
-                self.available.notify_all();
-                match job {
+                // The mutex is released before any wait/retry operation on
+                // the child, so launches and the worker handoff never block
+                // behind a stuck process.
+                match state.slot.take() {
                     Some(job) => job,
                     None => continue,
                 }
             };
-            // Keep the Child in `job` across a panic, then retry. The worker
-            // itself is detached and remains alive for the host lifetime.
-            loop {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.reap_once()))
-                    .is_ok()
-                {
-                    break;
-                }
+            while !job.reap_once() {
+                thread::sleep(EXIT_POLL);
             }
+            // Dropping the job releases the permit only after exact-child
+            // reaping and group-empty confirmation have both succeeded.
         }
     }
 }
@@ -449,6 +529,10 @@ fn invalid_state(message: &'static str) -> io::Error {
 
 fn timeout_error(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
+fn group_is_empty(group: Pid) -> bool {
+    matches!(killpg(group, None), Err(Errno::ESRCH))
 }
 
 #[cfg(test)]
