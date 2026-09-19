@@ -20,9 +20,10 @@ pub mod workspaces;
 pub use workspace_decode::WorkspaceRow;
 pub use workspace_lease_decode::WorkspaceLeaseRow;
 pub use workspaces::{
-    HostLeaseTtl, LeaseKind, NewScratchWorkspace, RootIdentity, TrustedRootRegistration,
-    WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceInstant, WorkspaceKind, WorkspaceLeaseId,
-    WorkspaceLeaseRecord, WorkspaceResult, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
+    HostLeaseTtl, LeaseKind, LifecycleOwnerRef, NewScratchWorkspace, RootIdentity,
+    TrustedRootRegistration, WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceInstant,
+    WorkspaceKind, WorkspaceLeaseId, WorkspaceLeaseRecord, WorkspaceProvenanceInput,
+    WorkspaceResult, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
 };
 
 pub use audit::AuditEntry;
