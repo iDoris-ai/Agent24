@@ -31,6 +31,7 @@ http-body-util = "0.1"
 rand = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 # T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
 # with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
 futures = { version = "0.3", default-features = false, features = ["std"] }
@@ -49,7 +50,6 @@ rustix = { version = "0.38", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
-sha2 = "0.10"
 # T7b/ME-3e: forces a transient `Store` error in the timeout-scan test by
 # dropping `module_approvals` out from under a live pool — there is no
 # fault-injectable `Store` trait to mock instead.
