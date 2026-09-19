@@ -14,8 +14,9 @@ mod module_approvals;
 mod repo;
 pub mod workspaces;
 pub use workspaces::{
-    HostLeaseTtl, RootIdentity, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
-    WorkspaceTtl,
+    HostLeaseTtl, LeaseKind, NewScratchWorkspace, RootIdentity, TrustedRootRegistration,
+    WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceInstant, WorkspaceKind, WorkspaceLeaseId,
+    WorkspaceLeaseRecord, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
 };
 
 pub use audit::AuditEntry;
