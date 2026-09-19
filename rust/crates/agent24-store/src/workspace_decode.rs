@@ -2,7 +2,7 @@ use agent24_protocol::WorkspaceId;
 use sqlx::sqlite::SqliteRow;
 
 use super::workspace_decode_support::{
-    at_least, bad, blob, count, instant, nonblank, opt_instant, opt_text, text,
+    at_least, bad, blob, count, instant, nonblank, opt_instant, opt_nonblank, opt_text, text,
 };
 
 use crate::{
@@ -104,7 +104,7 @@ impl WorkspaceRow {
         }
         let cleanup = WorkspaceCleanupRecord {
             state,
-            quarantine_root: opt_text(row, "quarantine_root")?,
+            quarantine_root: opt_nonblank(row, "quarantine_root")?,
             quarantined_at,
             attempts: cleanup_attempts,
             last_attempt_at,
@@ -152,6 +152,11 @@ impl WorkspaceRow {
         }
         if state != WorkspaceState::Released && released_at.is_some() {
             return Err(bad("released_at"));
+        }
+        if state != WorkspaceState::CleanupFailed
+            && (cleanup.error.is_some() || cleanup.retry_at.is_some())
+        {
+            return Err(bad("state"));
         }
         let writeback_policy = text(row, "writeback_policy")?;
         let lifecycle_owner_kind = text(row, "lifecycle_owner_kind")?;

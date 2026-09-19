@@ -42,6 +42,16 @@ pub(super) fn opt_text(row: &SqliteRow, field: &'static str) -> WorkspaceResult<
     }
     Ok(value)
 }
+pub(super) fn opt_nonblank(
+    row: &SqliteRow,
+    field: &'static str,
+) -> WorkspaceResult<Option<String>> {
+    let value = opt_text(row, field)?;
+    if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+        return Err(bad(field));
+    }
+    Ok(value)
+}
 pub(super) fn instant(row: &SqliteRow, field: &'static str) -> WorkspaceResult<WorkspaceInstant> {
     WorkspaceInstant::parse(&text(row, field)?).map_err(|_| bad(field))
 }

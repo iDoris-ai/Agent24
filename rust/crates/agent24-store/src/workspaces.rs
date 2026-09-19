@@ -28,6 +28,9 @@ pub struct WorkspaceInstant {
 
 impl WorkspaceInstant {
     pub fn parse(text: &str) -> WorkspaceResult<Self> {
+        if text.get(17..19) == Some("60") {
+            return Err(WorkspaceStoreError::InvalidValue { field: "timestamp" });
+        }
         let parsed = DateTime::parse_from_rfc3339(text)
             .map_err(|_| WorkspaceStoreError::InvalidValue { field: "timestamp" })?;
         if parsed.to_rfc3339_opts(SecondsFormat::Millis, true) != text {
