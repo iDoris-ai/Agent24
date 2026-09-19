@@ -211,11 +211,36 @@ fn get(port: u16, token: &str, path: &str) -> Option<(u16, String)> {
     Some((status, body))
 }
 
-/// The daemon, killed on drop so a failing test leaves no process behind.
+/// The daemon — graceful-first, on EVERY exit path (a panicking assertion
+/// unwinds through this exactly the same as a normal `stop()`, since both
+/// just drop the `Daemon`/`Running`). The module is spawned into its own
+/// process group (`agent24_os_proto::launch`) and it is the daemon's OWN
+/// supervisor that reaps that group on a clean shutdown —
+/// `agent24_os_proto::supervise` documents that a SIGKILLed daemon never
+/// runs that logic. SIGTERM and a bounded wait give the real shutdown path
+/// (the one that reaps the module) a chance to run; SIGKILL is only the
+/// fallback for a daemon that does not exit in time. Confirmed empirically
+/// (Codex review): unconditional SIGKILL here left the Python module
+/// orphaned, blocked forever in `listener.accept()` — `ps` showed 34
+/// accumulated from this file's own prior runs before this fix, 0 after.
 struct Running(std::process::Child);
 
 impl Drop for Running {
     fn drop(&mut self) {
+        let pid = self.0.id();
+        if Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let by = Instant::now() + Duration::from_secs(10);
+            while self.0.try_wait().is_ok_and(|s| s.is_none()) && Instant::now() < by {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // Fallback: not reached if SIGTERM above already got it (`kill()`
+        // and `wait()` on an already-exited/reaped `Child` are no-ops), so
+        // this never double-reaps or re-signals a process that is gone.
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -243,6 +268,15 @@ impl Daemon {
 /// Start the already-built `agent24d` binary against `home` — no `cargo
 /// build` here or anywhere else in this file. Matches `daemon_modules.rs`'s
 /// `start`.
+///
+/// The `Child` is wrapped into `Running` IMMEDIATELY after a successful
+/// `spawn()` — before the readiness wait below, which can itself panic on a
+/// timeout or malformed ready line. A bare `std::process::Child` dropped by
+/// an early panic here is NOT terminated (dropping a `Child` is a no-op on
+/// the OS process); wrapping first means that panic still unwinds through
+/// `Running`'s `Drop` and the daemon (and anything it had already spawned)
+/// gets the same graceful-then-SIGKILL cleanup as every other exit path
+/// (Codex review).
 fn start(home: &Path) -> Daemon {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
         .env_clear()
@@ -255,6 +289,8 @@ fn start(home: &Path) -> Daemon {
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let run = Running(child);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -266,7 +302,6 @@ fn start(home: &Path) -> Daemon {
         .expect("no ready line within 30s");
     let ready: serde_json::Value = serde_json::from_str(&ready).expect("the ready line");
     let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let stderr = child.stderr.take().unwrap();
     let sink = stderr_lines.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
@@ -274,34 +309,14 @@ fn start(home: &Path) -> Daemon {
         }
     });
     Daemon {
-        run: Running(child),
+        run,
         port: u16::try_from(ready["port"].as_u64().unwrap()).unwrap(),
         token: ready["token"].as_str().unwrap().to_owned(),
         stderr: stderr_lines,
     }
 }
 
-/// Graceful first: the module is spawned into its own process group
-/// (`agent24_os_proto::launch`) and the daemon's own supervisor is what
-/// terminates that group on a clean shutdown — a daemon SIGKILLed outright
-/// never runs that logic (`agent24_os_proto::supervise` documents this),
-/// which reliably orphaned the Python module blocked forever in
-/// `listener.accept()` before this fix (Codex review). SIGTERM and a bounded
-/// wait give the daemon's real shutdown path a chance to reap it; `Running`'s
-/// `Drop` (unconditional SIGKILL) remains the safety net for a test that
-/// panics before reaching here.
-fn stop(mut d: Daemon) {
-    let pid = d.run.0.id();
-    if Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status()
-        .is_ok_and(|s| s.success())
-    {
-        let by = Instant::now() + Duration::from_secs(10);
-        while d.run.0.try_wait().unwrap().is_none() && Instant::now() < by {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
+fn stop(d: Daemon) {
     drop(d);
 }
 
