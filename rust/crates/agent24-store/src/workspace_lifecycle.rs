@@ -85,7 +85,10 @@ impl Store {
         expected.revision = revision;
         let reselected = select_workspace(&mut tx, id).await?;
         if reselected != expected {
-            return Err(WorkspaceStoreError::Database);
+            return Err(WorkspaceStoreError::CorruptRow {
+                table: "workspaces",
+                field: "row",
+            });
         }
         let detail = json!({
             "id": reselected.id.as_str(),
@@ -117,16 +120,16 @@ impl Store {
     ) -> WorkspaceResult<Workspace> {
         let mut tx = self.begin_workspace_immediate().await?;
         let workspace = select_workspace(&mut tx, id).await?;
+        if workspace.authority.lifecycle_owner_ref != authorized_owner.as_str() {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "lifecycle_owner_ref",
+            });
+        }
         if !matches!(
             workspace.state,
             WorkspaceState::Active | WorkspaceState::Expired
         ) {
             return commit_unchanged(tx, workspace).await;
-        }
-        if workspace.authority.lifecycle_owner_ref != authorized_owner.as_str() {
-            return Err(WorkspaceStoreError::InvalidValue {
-                field: "lifecycle_owner_ref",
-            });
         }
 
         let revision = next_revision(workspace.revision)?;
@@ -154,7 +157,10 @@ impl Store {
         expected.revision = revision;
         let reselected = select_workspace(&mut tx, id).await?;
         if reselected != expected {
-            return Err(WorkspaceStoreError::Database);
+            return Err(WorkspaceStoreError::CorruptRow {
+                table: "workspaces",
+                field: "row",
+            });
         }
         let detail = json!({
             "id": reselected.id.as_str(),
