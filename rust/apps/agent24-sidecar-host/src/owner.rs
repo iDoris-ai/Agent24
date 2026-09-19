@@ -95,26 +95,33 @@ mod tests {
             .expect("child pid is numeric")
     }
 
-    fn process_is_alive(pid: u32) -> bool {
-        std::process::Command::new("tasklist")
+    fn process_is_alive(pid: u32) -> io::Result<bool> {
+        let output = std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
-            .unwrap_or(false)
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "tasklist failed with status {}",
+                output.status
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
     }
 
-    fn wait_until_gone(pid: u32) {
+    fn wait_until_gone(pid: u32) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if !process_is_alive(pid) {
-                return;
+            if !process_is_alive(pid)? {
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(
-            !process_is_alive(pid),
-            "process {pid} survived Job teardown"
-        );
+        if process_is_alive(pid)? {
+            return Err(io::Error::other(format!(
+                "process {pid} survived Job teardown"
+            )));
+        }
+        Ok(())
     }
 
     #[test]
@@ -171,7 +178,7 @@ mod tests {
         }
         let descendant = read_pid(&marker);
         drop(process);
-        wait_until_gone(descendant);
+        wait_until_gone(descendant).expect("tasklist must confirm descendant teardown");
         let _ = std::fs::remove_file(marker);
     }
 
@@ -195,7 +202,7 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), process.wait())
             .await
             .expect_err("the sleep must outlive the bounded wait");
-        wait_until_gone(child);
+        wait_until_gone(child).expect("tasklist must confirm owned process teardown");
         let _ = std::fs::remove_file(marker);
     }
 }
