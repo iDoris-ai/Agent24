@@ -6,6 +6,7 @@ members = [
     "crates/agent24-domain",
     "crates/agent24-os-packages",
     "crates/agent24-os-proto",
+    "crates/agent24-sidecar-host-protocol",
     "crates/agent24-mcp",
     "crates/agent24-memory",
     "crates/agent24-models",

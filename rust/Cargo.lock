@@ -199,6 +199,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-sidecar-host-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agent24-sin90"
 version = "0.1.0"
 dependencies = [
