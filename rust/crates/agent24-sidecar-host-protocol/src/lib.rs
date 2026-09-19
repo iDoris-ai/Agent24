@@ -93,11 +93,67 @@ impl fmt::Display for ProtocolError {
 }
 impl std::error::Error for ProtocolError {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestSequence {
+    phase: SequencePhase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SequencePhase {
+    AwaitLaunch,
+    Running { last_id: u64 },
+}
+
+impl Default for RequestSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl RequestSequence {
+    pub const fn new() -> Self {
+        Self {
+            phase: SequencePhase::AwaitLaunch,
+        }
+    }
+
+    pub fn validate(&self, request: &Request) -> Result<(), ProtocolError> {
+        validate_request_data(request)?;
+        match (&self.phase, request) {
+            (SequencePhase::AwaitLaunch, Request::Launch { .. }) => Ok(()),
+            (
+                SequencePhase::Running { last_id },
+                Request::Signal { request_id, .. } | Request::IsEmpty { request_id, .. },
+            ) if request_id > last_id => Ok(()),
+            _ => Err(ProtocolError::WrongSequence),
+        }
+    }
+
+    pub fn accept(&mut self, request: &Request) -> Result<(), ProtocolError> {
+        self.validate(request)?;
+        self.advance(request);
+        Ok(())
+    }
+
+    fn advance(&mut self, request: &Request) {
+        let request_id = match request {
+            Request::Launch { request_id, .. }
+            | Request::Signal { request_id, .. }
+            | Request::IsEmpty { request_id, .. } => *request_id,
+        };
+        self.phase = SequencePhase::Running {
+            last_id: request_id,
+        };
+    }
+}
+
 fn content(s: &str) -> bool {
     s.len() <= 4096 && s.chars().all(|c| !c.is_control())
 }
 fn nonempty_content(s: &str) -> bool {
     !s.is_empty() && content(s)
+}
+fn secret(s: &str) -> bool {
+    s.len() >= 32 && nonempty_content(s) && !s.chars().any(char::is_whitespace)
 }
 fn version(v: u8) -> Result<(), ProtocolError> {
     if v == PROTOCOL_VERSION {
@@ -106,11 +162,7 @@ fn version(v: u8) -> Result<(), ProtocolError> {
         Err(ProtocolError::InvalidMessage)
     }
 }
-pub fn validate_request(
-    request: &Request,
-    launched: bool,
-    previous_id: Option<u64>,
-) -> Result<(), ProtocolError> {
+fn validate_request_data(request: &Request) -> Result<(), ProtocolError> {
     match request {
         Request::Launch {
             version: v,
@@ -121,13 +173,8 @@ pub fn validate_request(
             env,
         } => {
             version(*v)?;
-            if *request_id == 0 {
-                return Err(ProtocolError::InvalidMessage);
-            }
-            if previous_id.is_some_and(|old| *request_id <= old) || launched {
-                return Err(ProtocolError::WrongSequence);
-            }
-            if !Path::new(executable).is_absolute()
+            if *request_id == 0
+                || !Path::new(executable).is_absolute()
                 || !nonempty_content(executable)
                 || !Path::new(cwd).is_absolute()
                 || !nonempty_content(cwd)
@@ -149,9 +196,6 @@ pub fn validate_request(
             version(*v)?;
             if *request_id == 0 {
                 return Err(ProtocolError::InvalidMessage);
-            }
-            if !launched || previous_id.is_some_and(|old| *request_id <= old) {
-                return Err(ProtocolError::WrongSequence);
             }
         }
     }
@@ -195,7 +239,7 @@ pub fn validate_event(event: &Event) -> Result<(), ProtocolError> {
             version(*protocol)?;
             if *port == 0
                 || token.len() < 32
-                || !nonempty_content(token)
+                || !secret(token)
                 || !nonempty_content(target_version)
                 || target_version.len() > 128
             {
@@ -237,19 +281,19 @@ fn decode_frame<T: serde::de::DeserializeOwned>(
 
 pub fn encode_request(
     request: &Request,
-    launched: bool,
-    previous_id: Option<u64>,
+    sequence: &mut RequestSequence,
 ) -> Result<Vec<u8>, ProtocolError> {
-    validate_request(request, launched, previous_id)?;
-    encode_frame(request, MAX_CONTROL_FRAME_BYTES)
+    sequence.validate(request)?;
+    let bytes = encode_frame(request, MAX_CONTROL_FRAME_BYTES)?;
+    sequence.advance(request);
+    Ok(bytes)
 }
 pub fn decode_request(
     bytes: &[u8],
-    launched: bool,
-    previous_id: Option<u64>,
+    sequence: &mut RequestSequence,
 ) -> Result<Request, ProtocolError> {
     let request: Request = decode_frame(bytes, MAX_CONTROL_FRAME_BYTES)?;
-    validate_request(&request, launched, previous_id)?;
+    sequence.accept(&request)?;
     Ok(request)
 }
 pub fn encode_reply(reply: &Reply) -> Result<Vec<u8>, ProtocolError> {
@@ -317,13 +361,27 @@ mod tests {
         }
     }
 
+    fn validate_request(
+        request: &Request,
+        launched: bool,
+        previous_id: Option<u64>,
+    ) -> Result<(), ProtocolError> {
+        let mut sequence = RequestSequence::new();
+        if launched {
+            sequence.accept(&launch(previous_id.unwrap_or(1))).ok();
+        }
+        sequence.validate(request)
+    }
+
     #[test]
     fn golden_request_and_ready_frames() {
         let request = launch(1);
-        let bytes = encode_request(&request, false, None).unwrap();
+        let mut sequence = RequestSequence::new();
+        let bytes = encode_request(&request, &mut sequence).unwrap();
         assert_eq!(bytes, br#"{"type":"launch","version":1,"request_id":1,"executable":"/opt/sidecar","cwd":"/tmp/sidecar","argv":[],"env":{"A":"value with spaces"}}
 "#);
-        assert_eq!(decode_request(&bytes, false, None), Ok(request));
+        let mut decoded_sequence = RequestSequence::new();
+        assert_eq!(decode_request(&bytes, &mut decoded_sequence), Ok(request));
         let ready = Event::Ready {
             protocol: 1,
             port: 8080,
