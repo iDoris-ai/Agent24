@@ -71,7 +71,7 @@ async fn legacy_kind_is_rejected_without_mutation() {
 }
 
 #[tokio::test]
-async fn post_update_tamper_is_database_and_rolls_back() {
+async fn post_update_tamper_is_corrupt_row_and_rolls_back() {
     let store = Store::open_memory().await.unwrap();
     create(&store).await;
     sqlx::query(
@@ -89,7 +89,13 @@ async fn post_update_tamper_is_database_and_rolls_back() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error, WorkspaceStoreError::Database);
+    assert_eq!(
+        error,
+        WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "row"
+        }
+    );
     let row = sqlx::query("SELECT state, revision FROM workspaces WHERE id = ?")
         .bind(ID)
         .fetch_one(test_hooks::pool(&store))
