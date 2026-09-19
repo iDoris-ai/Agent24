@@ -530,3 +530,100 @@ async fn list_reuses_a_cursor_with_a_different_state_filter() {
         .unwrap();
     assert_eq!(ids(&expired), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2"]);
 }
+
+#[tokio::test]
+async fn list_rejects_corrupt_returned_public_state_with_a_static_error() {
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET state = 'private-public-state'
+         WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1'",
+    )
+    .await;
+
+    let error = store
+        .list_workspaces(&query(None, None, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "state",
+        }
+    );
+    assert_eq!(error.to_string(), "corrupt workspaces row: invalid state");
+    assert!(!error.to_string().contains("private-public-state"));
+}
+
+#[tokio::test]
+async fn list_rejects_corrupt_private_root_and_identity_with_static_errors() {
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET canonical_root = CAST('/private/list/root' AS BLOB)
+         WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1'",
+    )
+    .await;
+    let root_error = store
+        .list_workspaces(&query(None, None, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        root_error,
+        WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "canonical_root",
+        }
+    );
+    assert_eq!(
+        root_error.to_string(),
+        "corrupt workspaces row: invalid canonical_root"
+    );
+    assert!(!root_error.to_string().contains("/private/list/root"));
+
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET unix_device = CAST('private-list-identity' AS TEXT)
+         WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1'",
+    )
+    .await;
+    let identity_error = store
+        .list_workspaces(&query(None, None, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        identity_error,
+        WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "unix_device",
+        }
+    );
+    assert_eq!(
+        identity_error.to_string(),
+        "corrupt workspaces row: invalid unix_device"
+    );
+    assert!(!identity_error.to_string().contains("private-list-identity"));
+}
