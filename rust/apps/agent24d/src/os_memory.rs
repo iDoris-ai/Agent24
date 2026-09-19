@@ -1663,10 +1663,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_the_same_partition_twice_advances_only_last_seen_at() {
+    async fn recording_the_same_partition_twice_leaves_last_seen_at_untouched() {
         // Restarts re-record every mounted partition, so `record` must be
         // idempotent. `first_seen_at` and `module_name` are write-once: a rename
         // must NOT rewrite the row that says what the key originally meant.
+        //
+        // T8.5c-W-mount decision 5 moved "advance last_seen_at" out of `record`
+        // entirely (see `record_os_partition`'s doc comment in agent24-memory):
+        // a row `record` has never lent out must not read as "just active" to an
+        // operator. So unlike the old upsert, `last_seen_at` here isn't merely
+        // unchanged between two `record` calls — it never had a value to begin
+        // with, on the first call or any repeat.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let mut cat = OsMemoryCatalog::default();
         let p = cat
@@ -1681,6 +1688,11 @@ mod tests {
         let first = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
             .await
             .unwrap();
+        assert_eq!(
+            first[0].last_seen_at, None,
+            "a partition record() has just created was never lent — it must not \
+             already read as seen"
+        );
         cat.record(
             &org_of(&kv, "alice").await,
             "alice",
@@ -1696,32 +1708,51 @@ mod tests {
         assert_eq!(again[0].owner_key, p.key);
         assert_eq!(again[0].first_seen_at, first[0].first_seen_at);
         assert_eq!(again[0].module_name, "sin90");
+        assert_eq!(
+            again[0].last_seen_at, None,
+            "record must not be the thing that advances last_seen_at, not even on \
+             a repeat call — that is touch_os_partition_last_seen's job alone"
+        );
     }
 
     #[tokio::test]
-    async fn a_repeat_recording_advances_last_seen_at() {
-        // Split from the test above, which asserted row count and the immutable
-        // columns and would therefore have passed with the upsert changed to
-        // `DO NOTHING` — leaving every repeatedly-mounted partition with a
-        // `last_seen_at` frozen at its first sighting, which is the one column an
-        // operator would use to tell a live partition from an abandoned one.
+    async fn touching_last_seen_at_advances_it_and_a_later_record_call_does_not_reset_it() {
+        // Companion to the test above: that one proves `record` never advances
+        // `last_seen_at`. This one proves the other half of decision 5 — the
+        // column is not stuck at NULL forever, `touch_os_partition_last_seen` is
+        // what a confirmed mount uses to advance it, and — the part the old,
+        // single-method version of this invariant could not even express — a
+        // LATER `record` call (e.g. the next daemon restart re-recording the same
+        // partition) must not stomp a real `last_seen_at` back to NULL or
+        // otherwise disturb it.
         //
         // `now_iso8601` has second resolution, so the wait is what makes the two
         // stamps distinguishable at all. It is the price of asserting the thing
         // rather than asserting around it.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let mut cat = OsMemoryCatalog::default();
-        cat.record(
-            &org_of(&kv, "alice").await,
-            "alice",
-            &manifest("sin90"),
-            &kv,
-        )
-        .await
-        .unwrap();
-        let first = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+        let p = cat
+            .record(
+                &org_of(&kv, "alice").await,
+                "alice",
+                &manifest("sin90"),
+                &kv,
+            )
             .await
             .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        kv.touch_os_partition_last_seen(&p.key, &agent24_memory::SystemClock)
+            .await
+            .unwrap();
+        let touched = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+            .await
+            .unwrap();
+        assert!(
+            touched[0].last_seen_at.is_some(),
+            "touch_os_partition_last_seen must give a NULL last_seen_at its first \
+             real value"
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         cat.record(
@@ -1732,19 +1763,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let again = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
-            .await
-            .unwrap();
+        let after_repeat_record =
+            OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
+                .await
+                .unwrap();
 
-        assert!(
-            again[0].last_seen_at > first[0].last_seen_at,
-            "last_seen_at must advance: {} -> {}",
-            first[0].last_seen_at,
-            again[0].last_seen_at
+        assert_eq!(
+            after_repeat_record[0].last_seen_at, touched[0].last_seen_at,
+            "a later record() call for a partition that has already been touched \
+             must leave last_seen_at exactly as touch left it — record is not \
+             allowed to reset it back toward NULL, or to advance it again itself"
         );
         assert_eq!(
-            again[0].first_seen_at, first[0].first_seen_at,
-            "and first_seen_at must not move with it"
+            after_repeat_record[0].first_seen_at, touched[0].first_seen_at,
+            "and first_seen_at must not move with any of this"
         );
     }
 
