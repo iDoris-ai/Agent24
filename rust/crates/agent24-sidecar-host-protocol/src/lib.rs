@@ -1,7 +1,12 @@
 //! Private v1 NDJSON messages exchanged by the sidecar host and helper.
 
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt, path::Path};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    io::{self, Write},
+    path::Path,
+};
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_TARGET_READY_FRAME_BYTES: usize = 16 * 1024;
@@ -251,14 +256,57 @@ pub fn validate_event(event: &Event) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn encode_frame<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, ProtocolError> {
-    // The actor still owns allocation-bounded serialization; this cap is post-serialization.
-    let mut bytes = serde_json::to_vec(value).map_err(|_| ProtocolError::InvalidMessage)?;
-    bytes.push(b'\n');
-    if bytes.len() > limit {
-        return Err(ProtocolError::TooLarge);
+struct CappedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl CappedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(4096)),
+            limit,
+            overflowed: false,
+        }
     }
-    Ok(bytes)
+}
+
+impl Write for CappedWriter {
+    fn write(&mut self, incoming: &[u8]) -> io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if incoming.len() > remaining {
+            self.overflowed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "frame limit exceeded",
+            ));
+        }
+        if incoming.len() > self.bytes.capacity().saturating_sub(self.bytes.len()) {
+            self.bytes.reserve_exact(
+                incoming.len() - self.bytes.capacity().saturating_sub(self.bytes.len()),
+            );
+        }
+        self.bytes.extend_from_slice(incoming);
+        Ok(incoming.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_frame<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, ProtocolError> {
+    let mut writer = CappedWriter::new(limit);
+    let result = match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => writer.write_all(b"\n").map_err(|_| ()),
+        Err(_) => Err(()),
+    };
+    match result {
+        Ok(()) => Ok(writer.bytes),
+        Err(_) if writer.overflowed => Err(ProtocolError::TooLarge),
+        Err(_) => Err(ProtocolError::InvalidMessage),
+    }
 }
 fn decode_frame<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
@@ -377,6 +425,18 @@ mod tests {
             argv: argv.into_iter().map(Into::into).collect(),
             env: env.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
         }
+    }
+
+    fn boundary_launch(extra_len: usize) -> Request {
+        let mut argv = vec!["a".repeat(4096); 15];
+        argv.push("a".repeat(extra_len));
+        custom(
+            1,
+            exe(),
+            cwd(),
+            argv.iter().map(String::as_str).collect(),
+            vec![],
+        )
     }
 
     #[test]
@@ -643,6 +703,37 @@ mod tests {
             Err(ProtocolError::TooLarge)
         );
         assert_eq!(sequence.validate(&launch(1)), Ok(()));
+    }
+
+    #[test]
+    fn bounded_encoding_handles_escaping_and_exact_newline_boundary() {
+        let prefix = boundary_launch(0);
+        let prefix_len = serde_json::to_vec(&prefix).unwrap().len();
+        let extra_len = MAX_CONTROL_FRAME_BYTES - 1 - prefix_len;
+        assert!(extra_len <= 4096);
+
+        let exact = boundary_launch(extra_len);
+        let mut sequence = RequestSequence::new();
+        let bytes = encode_request(&exact, &mut sequence).unwrap();
+        assert_eq!(bytes.len(), MAX_CONTROL_FRAME_BYTES);
+        assert_eq!(bytes.last(), Some(&b'\n'));
+
+        let mut unchanged = RequestSequence::new();
+        let raw = "\\".repeat(4096);
+        let escaped = custom(1, exe(), cwd(), vec![raw.as_str(); 15], vec![]);
+        assert!(raw.len() * 15 < MAX_CONTROL_FRAME_BYTES);
+        assert_eq!(
+            encode_request(&escaped, &mut unchanged),
+            Err(ProtocolError::TooLarge)
+        );
+        assert_eq!(unchanged.validate(&launch(1)), Ok(()));
+
+        let over = boundary_launch(extra_len + 1);
+        assert_eq!(
+            encode_request(&over, &mut unchanged),
+            Err(ProtocolError::TooLarge)
+        );
+        assert_eq!(unchanged.validate(&launch(1)), Ok(()));
     }
 }
 
