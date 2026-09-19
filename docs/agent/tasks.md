@@ -1,5 +1,41 @@
 # Agent24 任务台账 — Task
 
+## 🔴 本文件是当前唯一权威的执行状态来源（2026-09-19）
+
+仓库里有四份路线图/进展文档，**以谁为准只有一个答案**：
+
+| 文档 | 地位 |
+|---|---|
+| **本文件 `docs/agent/tasks.md`** | ✅ **权威**。当前在做什么、做到哪一步，以这里为准 |
+| [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀的任务定义与验收标准（§五「主链」T1–T14） |
+| [`me3-status.sh`](me3-status.sh) | ✅ **权威**（可执行）。`bash docs/agent/me3-status.sh` 直接读 `origin/main` 的代码回答「哪一刀已经在 main 上」 |
+| [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ⏸️ **暂停中**。是「未来要做什么」，不是「现在在做什么」；M1 等 v0.5.0 发布后再捡 |
+| [`../PLAN.md`](../PLAN.md) §六 Roadmap、[`../ROADMAP.md`](../ROADMAP.md) | ⛔ **已作废**。Rust 核心重写（ADR-026）之前的 Electron/Node.js 时代规划，仅供历史考古，**不要照它排期** |
+
+**当前执行**：ME-3（进程外领域 OS）专项，目标 v0.5.0。
+
+**当前正在做**：**T8.5c-W-wire 实现**（`_a24/memory/private/*` 三方法 JSON-RPC `Handler`、`map_memory_error` 统一脱敏、`scoped/*` 不注册产出 `-32601`）。设计已于 2026-09-19 冻结并合入（[#221](https://github.com/iDoris-ai/Agent24/pull/221)），代码尚未开工。
+
+**ME-3 收口路径（用户 2026-09-19 拍板，按此顺序走）**：
+
+```
+T8.5c-W-wire 实现  →  T9（ME-3f 仓外包端到端验收）  →  T10（Cos72 进程外样例）
+                   →  T11（Sin90 迁出内核）  →  T12（发布 v0.5.0）
+```
+（T13 `agent24-os-sdk` / T14 wire 文档可与 T9 之后并行。）
+
+**之后**：v0.5.0 发布后回头捡 [`roadmap.md`](roadmap.md) 的 **M1（记忆成为产品）**；`../PLAN.md` / `../ROADMAP.md` 完全作废。
+
+> **探针的已知偏差**：`me3-status.sh` 在 `origin/main`（`ef76802`）上，`3d` / `3e` / `3g` 三行读的是
+> 重构前的旧文件路径与旧符号名，于是 **`3e` 与 `3g` 被误报成「未开工」**——这两刀实际都已合并
+> （3e = [#199](https://github.com/iDoris-ai/Agent24/pull/199)/[#201](https://github.com/iDoris-ai/Agent24/pull/201)/[#203](https://github.com/iDoris-ai/Agent24/pull/203)，2026-09-17；
+> 3g = [#196](https://github.com/iDoris-ai/Agent24/pull/196)，2026-09-16）。
+> 修正后的 `3d` 行读 `os_memory.rs` 的 `pub struct RememberHandler`，**仍报「未开工?」——这是真的**，
+> 它正是 T8.5c-W-wire 还没写的那个 Handler。
+> 探针修复在 [#222](https://github.com/iDoris-ai/Agent24/pull/222)（与本文档是两个独立 PR），合并后重跑即可。
+
+---
+
 > 前置：[`roadmap.md`](roadmap.md)（M→F）·[`architecture.md`](architecture.md) ·[`spec.md`](spec.md)
 > 每个 Task 自包含，可独立开发与验收。**验收标准可机器验证**。
 > 状态：BACKLOG · READY · IN_PROGRESS · BLOCKED · PR_OPEN · CHANGES_REQUESTED · APPROVED · DONE
@@ -98,7 +134,7 @@
 - **HYG-2 变异脚本收尾** `DONE` — [#186](https://github.com/iDoris-ai/Agent24/pull/186)：`mutate.py` 每次运行专属 TMPDIR，结束后按命令行清扫被 init 收养的孤儿并以「⚠️ 漏收进程」警告（纵深防御；exec 走的孤儿认不出，记 FU-65）
 
 **二、停机可观测、可调**（用户裁决：参数有问题要能被发现、能被调整）
-- **SHUT-1 停机可观测性** `IN_PROGRESS` —— 先写语义说明 [`docs/design/SHUT-shutdown-observability.md`](../design/SHUT-shutdown-observability.md)（写代码前 Codex 设计审查 4 轮，v5 定稿），拆三刀叠加：**SHUT-1a** 停止事实记录 + 当场告警 `DONE` — [#187](https://github.com/iDoris-ai/Agent24/pull/187)（`d94217b`）；**SHUT-1b** 参数可调、截止模型、汇总落盘 `last-shutdown.json`、`daemon.alive` 跨启动证据 `DONE` — [#188](https://github.com/iDoris-ai/Agent24/pull/188)（`51e19fa`）；**SHUT-1c** 实时出口（`GET /api/v1/shutdown`、`agent24 daemon status` 的「停机」一段、OpenAPI + api-client、contract 测试）`IN_REVIEW`
+- **SHUT-1 停机可观测性** `DONE`（2026-09-19 校对：三刀 #187/#188/#189 均已合并，原状态 `IN_PROGRESS`/`IN_REVIEW` 过期）—— 先写语义说明 [`docs/design/SHUT-shutdown-observability.md`](../design/SHUT-shutdown-observability.md)（写代码前 Codex 设计审查 4 轮，v5 定稿），拆三刀叠加：**SHUT-1a** 停止事实记录 + 当场告警 `DONE` — [#187](https://github.com/iDoris-ai/Agent24/pull/187)（`d94217b`）；**SHUT-1b** 参数可调、截止模型、汇总落盘 `last-shutdown.json`、`daemon.alive` 跨启动证据 `DONE` — [#188](https://github.com/iDoris-ai/Agent24/pull/188)（`51e19fa`）；**SHUT-1c** 实时出口（`GET /api/v1/shutdown`、`agent24 daemon status` 的「停机」一段、OpenAPI + api-client、contract 测试）`DONE` — [#189](https://github.com/iDoris-ai/Agent24/pull/189)（2026-09-16）
 - **SHUT-2 参数可调** —— 并入 SHUT-1b：`A24_MODULE_DRAIN_MS`（0–10000，默认 800）/ `A24_MODULE_STOP_GRACE_MS`（100–5000，默认 500），非法值告警回落默认（不拒绝启动：CLI 吞 stderr、launchd 会崩溃循环），调大时上界诚实变大并写进启动日志；TASKS B2 改为「默认参数下 ≤ 2s」
 - **SHUT-3 测试** —— 分散进 1a/1b：超宽限被杀有记录有告警、排空到期切断有记录有告警、SIGKILL 后下次启动告警 / 干净后不告警、ephemeral 不碰证据；0.3s/1s 退出的对照由 `leader` 事实与宽限测试覆盖
 
