@@ -9,32 +9,11 @@
 //! `SCAN_YIELD_INTERVAL_ROWS` yield point) and P8 (§6.5, the shared
 //! connection-admission [`tokio::sync::Semaphore`]).
 //!
-//! # What this module does NOT do
-//!
-//! Wire `recall_page`/`recent_page`/`remember_checked` into a real
-//! `_a24/memory/private/*` JSON-RPC [`agent24_os_proto::rpc::Handler`] — that
-//! surface (`memory_callback.rs`, `MemoryEntitlement` checks, T8.5c v1
-//! decisions D3/D5/D8) does not exist anywhere in this codebase yet, and
-//! building it is explicitly T8.5c-W's job (design §12). What IS implemented,
-//! in `os_memory.rs`, is the real async entry point each of those three
-//! methods will eventually be called from: the admission-permit acquisition,
-//! the resource reservation, the streaming scan loop and the
-//! request-lifecycle binding are all live code exercised end to end by this
-//! crate's own tests (not a mock) — a future `Handler::call` only needs to
-//! add the entitlement check in front and call straight through.
-
-// This module's production surface (everything outside `mod tests`) has no
-// caller in `main()` yet — wiring `OsScopedMemory::{remember_checked,
-// recall_page, recent_page}` (`os_memory.rs`) into a real
-// `_a24/memory/private/*` `Handler` is T8.5c-W's job (this module's doc
-// comment, and design §12), not this design doc's. Every item here IS
-// exercised end to end by this crate's own tests (`cargo test`, not `cargo
-// build`), which is what makes `-D warnings`'s `dead_code` lint fire on the
-// plain `--bin` target: rustc's reachability analysis for a binary crate
-// starts at `main`, and `#[cfg(test)]` code is a separate compilation the
-// lint does not see. `#![allow(dead_code)]` here is that gap, not a claim
-// this code is actually unreachable or untested.
-#![allow(dead_code)]
+//! `recall_page`/`recent_page`/`remember_checked` (`os_memory.rs`) are wired
+//! into the real `_a24/memory/private/*` JSON-RPC
+//! [`agent24_os_proto::rpc::Handler`]s in `memory_callback.rs`
+//! (T8.5c-W-wire) — `map_memory_error` below is the two real error-mapping
+//! call sites that surface exist for.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -190,6 +169,48 @@ impl MemoryRpcError {
             Self::Invalid(m) => RpcError::invalid_params(m),
             Self::Store(m) => RpcError::internal(m),
             Self::Application(kind, m) => RpcError::application(kind, m),
+        }
+    }
+}
+
+/// The single `agent24_memory::MemoryError` → [`MemoryRpcError`] conversion
+/// point (T8.5c-W-wire design doc, decision W5). Both real call sites
+/// (`os_memory.rs`'s `remember_checked`, on `events.append`'s failure branch;
+/// this module's `page_from_stream`, on the scan loop's `row.map_err(...)`)
+/// go through this function instead of writing
+/// `MemoryRpcError::Store(e.to_string())` directly — that pattern is what let
+/// `MemoryError::QuotaExceeded`'s `Display` (`"quota exceeded for owner
+/// {owner:?}: ..."`) put an internal owner/partition key straight into a
+/// `-32603` response before a `Handler` existed to make that reachable.
+///
+/// Default-deny, allowlist-permit: only a variant explicitly matched below
+/// gets its own `ErrorKind`; everything else falls through to a single static
+/// message with no part of `e` in it. A new `MemoryError` variant therefore
+/// starts out safe by construction — it has to be deliberately added to the
+/// allowlist to say anything about itself to a caller, rather than starting
+/// out exposed until someone remembers to audit it.
+pub(crate) fn map_memory_error(e: &MemoryError) -> MemoryRpcError {
+    match e {
+        // The one variant confirmed today to carry an internal identifier in
+        // its `Display` (`agent24-memory/src/lib.rs`). The caller-visible
+        // message says only which dimension was exceeded; `owner` goes to
+        // `tracing` — an operationally-visible signal, not a JSON-RPC
+        // response an external caller controls the audience of.
+        MemoryError::QuotaExceeded { owner, dimension } => {
+            tracing::warn!(owner = %owner, dimension = %dimension, "memory quota exceeded");
+            MemoryRpcError::application(
+                ErrorKind::QuotaExceeded,
+                format!("memory {dimension} quota exceeded for this module"),
+            )
+        }
+        // Every other variant: today's known-reachable ones on this path
+        // (`Sqlx`, `Serde`) do not carry owner/partition keys, but "does not
+        // today" is not a promise a `Display` impl anywhere else in this
+        // codebase has made — deny by default rather than re-auditing this
+        // match every time a variant's message wording changes.
+        other => {
+            tracing::error!(error = %other, "memory storage error");
+            MemoryRpcError::Store("an internal memory storage error occurred".into())
         }
     }
 }
@@ -616,7 +637,7 @@ where
         if scanned.is_multiple_of(SCAN_YIELD_INTERVAL_ROWS) {
             tokio::task::yield_now().await;
         }
-        let row = row.map_err(|e| MemoryRpcError::Store(e.to_string()))?;
+        let row = row.map_err(|e| map_memory_error(&e))?;
         let seq = row.seq;
         let recollection = to_recollection(row);
         let is_match = match_policy.matches(&recollection);
@@ -714,6 +735,65 @@ mod tests {
 
     fn generous_limiter() -> Arc<RateLimiter> {
         Arc::new(RateLimiter::new(1e12, 1e12))
+    }
+
+    // ── T8.5c-W-wire decision W5, judgement 3: `map_memory_error` must not
+    // leak an internal identifier for ANY variant, not just the one known
+    // today to carry one ──
+
+    #[test]
+    fn quota_exceeded_owner_never_reaches_the_caller_visible_message() {
+        const MARK: &str = "some-internal-marker-value";
+        let e = MemoryError::QuotaExceeded {
+            owner: MARK.to_owned(),
+            dimension: "rows",
+        };
+        let mapped = map_memory_error(&e);
+        assert!(
+            matches!(
+                &mapped,
+                MemoryRpcError::Application(ErrorKind::QuotaExceeded, _)
+            ),
+            "{mapped:?}"
+        );
+        let rpc = mapped.into_rpc_error();
+        assert!(
+            !rpc.message.contains(MARK),
+            "the caller-visible message must not contain the internal owner key: {:?}",
+            rpc.message
+        );
+        assert!(
+            rpc.message.contains("rows"),
+            "the message should still say which dimension was exceeded: {:?}",
+            rpc.message
+        );
+    }
+
+    #[test]
+    fn every_default_branch_variant_is_scrubbed_of_its_marker_too() {
+        const MARK: &str = "some-internal-marker-value";
+        let variants: Vec<MemoryError> = vec![
+            MemoryError::Io(MARK.to_owned()),
+            MemoryError::NotFound(MARK.to_owned()),
+            MemoryError::Conflict(MARK.to_owned()),
+            MemoryError::Summarizer(MARK.to_owned()),
+            MemoryError::Replay(MARK.to_owned()),
+            MemoryError::Condenser(MARK.to_owned()),
+            MemoryError::Embedder(MARK.to_owned()),
+            // A real `Serde` variant (not a hand-built `String` payload) —
+            // the two real call sites this function protects
+            // (`remember_checked`'s `events.append`, `page_from_stream`'s
+            // row decode) can both surface this one for real.
+            MemoryError::from(serde_json::from_str::<serde_json::Value>(MARK).unwrap_err()),
+        ];
+        for e in variants {
+            let rpc = map_memory_error(&e).into_rpc_error();
+            assert!(
+                !rpc.message.contains(MARK),
+                "{e:?} leaked its marker into the caller-visible message: {:?}",
+                rpc.message
+            );
+        }
     }
 
     /// A clock frozen at construction, for settlement-amount assertions that

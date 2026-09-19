@@ -549,15 +549,8 @@ pub struct MemoryEntitlement {
 }
 
 /// The three parts an OOP module needs to actually call
-/// `remember_checked`/`recall_page`/`recent_page` — all real, all required.
-///
-/// `#[allow(dead_code)]`: this mount-layer design doc's job stops at handing
-/// this struct to T8.5c-W-wire's `Handler::call()` implementation, which is
-/// what actually reads `memory`/`limiter`/`admission` — not built yet, so
-/// rustc's `--bin`-target reachability analysis (see `os_memory_page.rs`'s
-/// module doc for why `cargo test` does not silence this) sees three fields
-/// that are written but never read.
-#[allow(dead_code)]
+/// `remember_checked`/`recall_page`/`recent_page` — all real, all required,
+/// and (T8.5c-W-wire) all read by `memory_callback.rs`'s three `Handler`s.
 #[derive(Clone)]
 pub struct PrivateMemoryHandle {
     pub memory: Arc<OsScopedMemory>,
@@ -906,12 +899,8 @@ impl ScopedMemory for OsScopedMemory {
 // `server.rs` — outside this design doc's scope (§0) and explicitly left to
 // T8.5c-W (§12). These three methods are where those singletons get USED.
 //
-// `#[allow(dead_code)]`: real, tested code (this crate's own tests below and
-// `os_memory_page.rs`'s) with no caller reachable from `main` yet, for the
-// same reason `os_memory_page.rs`'s module doc explains — `dead_code`'s
-// binary-crate reachability analysis starts at `main` and does not see
-// `#[cfg(test)]` code.
-#[allow(dead_code)]
+// T8.5c-W-wire's three `Handler`s (`memory_callback.rs`) are the real
+// callers reachable from `main` today.
 impl OsScopedMemory {
     /// Design §6.5's `remember_checked` pseudocode: reservation → admission
     /// permit (inside the `bind_to_lifecycle`-wrapped work future) → append →
@@ -946,7 +935,7 @@ impl OsScopedMemory {
             events
                 .append(&ev)
                 .await
-                .map_err(|e| MemoryRpcError::Store(e.to_string()))?;
+                .map_err(|e| crate::os_memory_page::map_memory_error(&e))?;
             reservation.commit();
             Ok(Remembered {
                 id: MemoryId::from_kernel(ev.id.clone()),
