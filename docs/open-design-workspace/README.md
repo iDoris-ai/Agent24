@@ -7,9 +7,9 @@
 - Git 分支：`feat/open-design-workspace`
 - 独立 worktree：`/Users/jason/Dev/auraai/Agent24-open-design-workspace`
 - 初始基线提交：`04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
-- 已审计 Agent24 主干至：`69baf50d62e6e3db5ca41a8882d35deb45ea3454`
-- 状态：**计划已批准；P0 最终 SOL Gate 已 PASS，下一步实现 A24-OD-00 capability 安全层**
-- 下一门禁：计划需由仓库所有者 review/批准
+- 已审计 Agent24 主干至：`0495b5c70ac1a913a9cd04bdf24a1fc1f8809974`
+- 状态：**P0、A24-OD-00 安全门禁与 P1 基线门禁均 PASS；P2 workspace contract 执行中**
+- 实时台账：[STATUS.md](STATUS.md)
 
 ## 文档
 
@@ -17,6 +17,7 @@
 - [实施计划（待 review）](PLAN.md)
 - [如何启动与多 Agent 执行规则](EXECUTION.md)
 - [Agent24 主干依赖台账](AGENT24-DEPENDENCIES.md)
+- [执行状态、PR 栈与门禁证据](STATUS.md)
 
 ## 原始会话完整性
 
