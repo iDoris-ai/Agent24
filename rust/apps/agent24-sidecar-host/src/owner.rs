@@ -87,12 +87,26 @@ mod tests {
         ))
     }
 
-    fn read_pid(path: &Path) -> u32 {
-        std::fs::read_to_string(path)
-            .expect("child wrote its pid")
-            .trim()
-            .parse()
-            .expect("child pid is numeric")
+    fn read_pid(path: &Path) -> io::Result<u32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last_error = None;
+        while Instant::now() < deadline {
+            match std::fs::read_to_string(path).and_then(|raw| {
+                raw.trim().parse().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid child pid: {error}"),
+                    )
+                })
+            }) {
+                Ok(pid) => return Ok(pid),
+                Err(error) => last_error = Some(error),
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "child pid marker was not readable")
+        }))
     }
 
     fn process_is_alive(pid: u32) -> io::Result<bool> {
@@ -176,7 +190,7 @@ mod tests {
         while !marker.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let descendant = read_pid(&marker);
+        let descendant = read_pid(&marker).expect("child must publish a readable pid");
         drop(process);
         wait_until_gone(descendant).expect("tasklist must confirm descendant teardown");
         let _ = std::fs::remove_file(marker);
@@ -198,7 +212,7 @@ mod tests {
         while !marker.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let child = read_pid(&marker);
+        let child = read_pid(&marker).expect("child must publish a readable pid");
         tokio::time::timeout(Duration::from_millis(100), process.wait())
             .await
             .expect_err("the sleep must outlive the bounded wait");
