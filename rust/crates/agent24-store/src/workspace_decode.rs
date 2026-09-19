@@ -12,18 +12,18 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRow {
-    pub id: WorkspaceId,
-    pub kind: WorkspaceKind,
-    pub state: WorkspaceState,
-    pub authority: WorkspaceAuthority,
-    pub root: TrustedRootRegistration,
-    pub created_at: WorkspaceInstant,
-    pub expires_at: WorkspaceInstant,
-    pub renewed_at: Option<WorkspaceInstant>,
-    pub released_at: Option<WorkspaceInstant>,
-    pub revision: u64,
-    pub cleanup: WorkspaceCleanupRecord,
-    pub ttl: WorkspaceTtl,
+    pub(crate) id: WorkspaceId,
+    pub(crate) kind: WorkspaceKind,
+    pub(crate) state: WorkspaceState,
+    pub(crate) authority: WorkspaceAuthority,
+    pub(crate) root: TrustedRootRegistration,
+    pub(crate) created_at: WorkspaceInstant,
+    pub(crate) expires_at: WorkspaceInstant,
+    pub(crate) renewed_at: Option<WorkspaceInstant>,
+    pub(crate) released_at: Option<WorkspaceInstant>,
+    pub(crate) revision: u64,
+    pub(crate) cleanup: WorkspaceCleanupRecord,
+    pub(crate) ttl: WorkspaceTtl,
 }
 
 impl WorkspaceRow {
@@ -192,5 +192,30 @@ impl WorkspaceRow {
             cleanup,
             ttl,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn project(&self) -> agent24_protocol::Workspace {
+        agent24_protocol::Workspace {
+            id: self.id.clone(),
+            kind: self.kind.as_str().to_owned(),
+            state: self.state.as_str().to_owned(),
+            provenance: agent24_protocol::WorkspaceProvenance {
+                source: self.authority.provenance_source.clone(),
+                project_ref: self.authority.provenance_project_ref.clone(),
+                base_revision: self.authority.provenance_base_revision.clone(),
+            },
+            writeback_policy: self.authority.writeback_policy.clone(),
+            lifecycle_owner: agent24_protocol::LifecycleOwner {
+                kind: self.authority.lifecycle_owner_kind.clone(),
+                reference: self.authority.lifecycle_owner_ref.clone(),
+            },
+            concurrency_policy: self.authority.concurrency_policy.clone(),
+            created_at: self.created_at.as_str().to_owned(),
+            expires_at: self.expires_at.as_str().to_owned(),
+            renewed_at: self.renewed_at.as_ref().map(|v| v.as_str().to_owned()),
+            released_at: self.released_at.as_ref().map(|v| v.as_str().to_owned()),
+            revision: self.revision,
+        }
     }
 }

@@ -18,6 +18,20 @@ pub enum WorkspaceStoreError {
     InvalidValue { field: &'static str },
     #[error("workspace database error")]
     Database,
+    #[error("workspace not found")]
+    NotFound,
+    #[error("workspace conflict: {0}")]
+    Conflict(WorkspaceConflict),
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceConflict {
+    #[error("identifier")]
+    Identifier,
+    #[error("canonical root")]
+    CanonicalRoot,
+    #[error("root identity")]
+    RootIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -279,7 +293,7 @@ impl WorkspaceProvenanceInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleOwnerRef(String);
 impl LifecycleOwnerRef {
-    pub fn new(value: String) -> WorkspaceResult<Self> {
+    pub fn parse(value: String) -> WorkspaceResult<Self> {
         if value.trim().is_empty() || value.contains('\0') {
             return Err(WorkspaceStoreError::InvalidValue {
                 field: "lifecycle_owner_ref",
