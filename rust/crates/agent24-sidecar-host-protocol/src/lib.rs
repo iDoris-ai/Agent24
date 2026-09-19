@@ -260,15 +260,21 @@ struct CappedWriter {
     bytes: Vec<u8>,
     limit: usize,
     overflowed: bool,
+    allocation_failed: bool,
 }
 
 impl CappedWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(limit.min(4096)),
+    fn new(limit: usize) -> io::Result<Self> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(limit.min(4096))
+            .map_err(|_| io::Error::other("frame allocation failed"))?;
+        Ok(Self {
+            bytes,
             limit,
             overflowed: false,
-        }
+            allocation_failed: false,
+        })
     }
 }
 
@@ -282,10 +288,11 @@ impl Write for CappedWriter {
                 "frame limit exceeded",
             ));
         }
-        if incoming.len() > self.bytes.capacity().saturating_sub(self.bytes.len()) {
-            self.bytes.reserve_exact(
-                incoming.len() - self.bytes.capacity().saturating_sub(self.bytes.len()),
-            );
+        if incoming.len() > self.bytes.capacity().saturating_sub(self.bytes.len())
+            && self.bytes.try_reserve_exact(incoming.len()).is_err()
+        {
+            self.allocation_failed = true;
+            return Err(io::Error::other("frame allocation failed"));
         }
         self.bytes.extend_from_slice(incoming);
         Ok(incoming.len())
@@ -297,7 +304,7 @@ impl Write for CappedWriter {
 }
 
 fn encode_frame<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, ProtocolError> {
-    let mut writer = CappedWriter::new(limit);
+    let mut writer = CappedWriter::new(limit).map_err(|_| ProtocolError::InvalidMessage)?;
     let result = match serde_json::to_writer(&mut writer, value) {
         Ok(()) => writer.write_all(b"\n").map_err(|_| ()),
         Err(_) => Err(()),
@@ -305,6 +312,7 @@ fn encode_frame<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, Protoc
     match result {
         Ok(()) => Ok(writer.bytes),
         Err(_) if writer.overflowed => Err(ProtocolError::TooLarge),
+        Err(_) if writer.allocation_failed => Err(ProtocolError::InvalidMessage),
         Err(_) => Err(ProtocolError::InvalidMessage),
     }
 }
@@ -437,6 +445,16 @@ mod tests {
             argv.iter().map(String::as_str).collect(),
             vec![],
         )
+    }
+
+    #[test]
+    fn capped_writer_growth_stays_within_logical_limit() {
+        let limit = 5_000;
+        let mut writer = CappedWriter::new(limit).unwrap();
+        writer.write_all(b"x").unwrap();
+        writer.write_all(&[b'x'; 4_096]).unwrap();
+        assert_eq!(writer.bytes.len(), 4_097);
+        assert!(writer.bytes.capacity() <= limit);
     }
 
     #[test]
