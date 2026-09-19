@@ -72,6 +72,21 @@ with open("domain-os.yml", "rb") as f:
     digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
 data_dir = os.environ["A24_DATA_DIR"]
 
+def dump_atomic(name, value):
+    # gate_probe.json in particular gets rewritten on every retry (the Rust
+    # side may trigger more than one request) while the Rust side can be
+    # reading it concurrently the moment it observes a WS event — a plain
+    # `open(..., "w")` truncates before writing, so a read landing in that
+    # window sees an empty or partial file. Write-to-temp + rename is atomic
+    # on the same filesystem (POSIX rename(2)), so any concurrent reader
+    # sees either the old complete file or the new complete one, never
+    # neither.
+    path = os.path.join(data_dir, name)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as out:
+        json.dump(value, out)
+    os.replace(tmp, path)
+
 cb = socket.socket(socket.AF_UNIX)
 cb.connect(os.environ["A24_CALLBACK_SOCK"])
 f = cb.makefile("rb")
@@ -101,12 +116,11 @@ try:
     remember_resp = rpc("_a24/memory/private/remember", {"kind": "t9-note", "body": {"text": "t9-blackbox"}})
     recall_resp = rpc("_a24/memory/private/recall", {"query": "t9-note", "page_size": 10})
 
-    with open(os.path.join(data_dir, "callback_probe.json"), "w") as out:
-        json.dump({
-            "provides": provides,
-            "remember_response": remember_resp,
-            "recall_response": recall_resp,
-        }, out)
+    dump_atomic("callback_probe.json", {
+        "provides": provides,
+        "remember_response": remember_resp,
+        "recall_response": recall_resp,
+    })
 
     listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
     # Serves MORE THAN ONE request: the Rust side may need to retry the HTTP
@@ -146,13 +160,12 @@ try:
             **gate_params, "approval_token": headers.get("x-a24-approval-token", ""),
         })
         emit_resp = rpc("_a24/events/emit", {"kind": "task.transitioned", "payload": {"probe": "t9"}})
-        with open(os.path.join(data_dir, "gate_probe.json"), "w") as out:
-            json.dump({
-                "headers_seen": headers,
-                "bad_gate_response": bad_gate_resp,
-                "gate_response": gate_resp,
-                "emit_response": emit_resp,
-            }, out)
+        dump_atomic("gate_probe.json", {
+            "headers_seen": headers,
+            "bad_gate_response": bad_gate_resp,
+            "gate_response": gate_resp,
+            "emit_response": emit_resp,
+        })
 
         body = b"hello"
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
@@ -412,7 +425,15 @@ fn a_package_from_outside_the_repo() {
             });
             next_retry_at = Instant::now() + Duration::from_secs(3);
         }
-        let step = remaining.min(next_retry_at.saturating_duration_since(Instant::now()));
+        // Recomputed AFTER the possible spawn above, not reused from the
+        // `remaining` taken at the top of this iteration — spawning a
+        // thread is normally sub-millisecond but is not free, and reusing a
+        // stale value here is exactly the kind of small, needless deadline
+        // overrun a later reviewer would have to re-derive this same fix to
+        // close.
+        let step = overall_deadline
+            .saturating_duration_since(Instant::now())
+            .min(next_retry_at.saturating_duration_since(Instant::now()));
         match events.recv_timeout(step) {
             Ok(event) if event["type"] == "module" => break event,
             Ok(_) => continue,
