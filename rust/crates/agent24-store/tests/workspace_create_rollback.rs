@@ -98,6 +98,50 @@ async fn sqlite_failures_are_database_and_redacted_then_recover() {
 }
 
 #[tokio::test]
+async fn deferred_commit_failure_rolls_back_workspace_and_side_row() {
+    let store = Store::open_memory().await.unwrap();
+    sqlx::query("PRAGMA defer_foreign_keys = ON")
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER defer_workspace_lease_fk AFTER INSERT ON workspaces
+         BEGIN
+             INSERT INTO workspace_leases
+                 (lease_id, workspace_id, root_generation, owner_id, kind, acquired_at)
+             VALUES
+                 ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6',
+                  'ws_missing_for_deferred_fk', NEW.root_generation,
+                  'run-owner', 'run', NEW.created_at);
+         END",
+    )
+    .execute(test_hooks::pool(&store))
+    .await
+    .unwrap();
+
+    assert_eq!(create(&store).await, Err(WorkspaceStoreError::Database));
+    let counts = sqlx::query(
+        "SELECT (SELECT COUNT(*) FROM workspaces) AS workspaces,
+                (SELECT COUNT(*) FROM workspace_leases) AS side_rows",
+    )
+    .fetch_one(test_hooks::pool(&store))
+    .await
+    .unwrap();
+    assert_eq!(counts.get::<i64, _>("workspaces"), 0);
+    assert_eq!(counts.get::<i64, _>("side_rows"), 0);
+
+    sqlx::query("DROP TRIGGER defer_workspace_lease_fk")
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA defer_foreign_keys = OFF")
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    assert!(create(&store).await.is_ok());
+}
+
+#[tokio::test]
 async fn preflight_conflict_does_not_depend_on_sqlite_error_text() {
     let store = Store::open_memory().await.unwrap();
     create(&store).await.unwrap();
