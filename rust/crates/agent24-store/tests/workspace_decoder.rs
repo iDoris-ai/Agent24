@@ -112,3 +112,47 @@ async fn workspace_decoder_rejects_quarantine_before_renewal() {
     .await;
     assert!(decode(&store, id).await.is_err());
 }
+
+#[tokio::test]
+async fn workspace_decoder_rejects_sqlite_incompatible_leap_seconds() {
+    let store = Store::open_memory().await.unwrap();
+    let id = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X8";
+    seed(&store, id).await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET created_at = '2015-02-18T23:59:60.000Z' WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X8'",
+    )
+    .await;
+    assert!(decode(&store, id).await.is_err());
+}
+
+#[tokio::test]
+async fn workspace_decoder_matches_cleanup_state_nullability() {
+    let id = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X9";
+    let store = Store::open_memory().await.unwrap();
+    seed(&store, id).await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET state = 'releasing', quarantine_root = '   ', quarantined_at = '2026-09-19T00:00:02.000Z' WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X9'",
+    )
+    .await;
+    assert!(decode(&store, id).await.is_err());
+
+    let store = Store::open_memory().await.unwrap();
+    seed(&store, id).await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET state = 'releasing', cleanup_error = 'stale', cleanup_retry_at = '2026-09-19T00:00:02.000Z' WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X9'",
+    )
+    .await;
+    assert!(decode(&store, id).await.is_err());
+
+    let store = Store::open_memory().await.unwrap();
+    seed(&store, id).await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET state = 'cleanup_failed', cleanup_error = 'busy', cleanup_retry_at = '2026-09-19T00:00:02.000Z', cleanup_attempts = 1, cleanup_last_attempt_at = '2026-09-19T00:00:01.000Z' WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X9'",
+    )
+    .await;
+    assert!(decode(&store, id).await.is_ok());
+}
