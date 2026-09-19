@@ -10,7 +10,7 @@
 | A24-OD-00 capability 安全前置 | PASS（待逐层合并） | SOL 无 blocker/high；全量 Agent24/协议/CLI 测试及私有 ready-pipe 烟测通过 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
 | P2 workspace contract | IN PROGRESS | A24-OD-01 types + SQLite schema 已通过 SOL；store API 正在设计 |
-| A24-OD-05 sidecar foundation | IN REVIEW | #253/#254/#255/#259/#260；未接线，正在做第二轮 SOL review |
+| A24-OD-05 sidecar foundation | PASS（未接线） | #253/#254/#255/#259/#260/#261；final `a3b83fb`，SOL exact-head 复核通过 |
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 `outdated_cli / incompatible opencode args` 失败，随后停滞，需要 bounded SIGINT。
@@ -70,3 +70,12 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - schema final：`1167301d67b4940c7a68db64a06ee94454583297`，SOL 无 blocker/high/medium；
 - 已验证 canonical timestamp、精确 7 天/90 秒边界、typed counters、真实 v6→v7 upgrade、root identity 与 lease/state 约束；
 - 下一切片只实现 store/repository API，不提前加入 A24-OD-02 的 run/session 字段。
+
+## A24-OD-05 已通过基础切片
+
+- sidecar manager：#253/#254/#255/#259/#260/#261，分别为
+  97/174/141/173/89/151 changed lines；
+- foundation final：`a3b83fb22e8559319fe8ed677e9cbc40a64258ac`，SOL 无 blocker/high/medium；
+- 110/110 desktop tests、完整 desktop typecheck 与 exact-head diff check 通过；
+- foundation 仍未接入 renderer、IPC 或产品路由；
+- POSIX generation-pinned controller 与 Windows Job Object（或等价控制器）是产品接线前硬门禁，必须作为后续独立小 PR 实现。
