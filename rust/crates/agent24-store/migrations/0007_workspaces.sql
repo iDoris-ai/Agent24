@@ -16,7 +16,7 @@ CREATE TABLE workspaces (
     expires_at               TEXT NOT NULL,
     renewed_at               TEXT,
     released_at              TEXT,
-    revision                 INTEGER NOT NULL CHECK (revision >= 1),
+    revision                 INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 1 AND revision <= 9223372036854775807),
 
     canonical_root           TEXT NOT NULL CHECK (length(trim(canonical_root)) > 0 AND instr(canonical_root, char(0)) = 0),
     root_generation          TEXT NOT NULL CHECK (length(trim(root_generation)) > 0 AND instr(root_generation, char(0)) = 0),
@@ -28,7 +28,7 @@ CREATE TABLE workspaces (
 
     quarantine_root          TEXT CHECK (quarantine_root IS NULL OR (length(trim(quarantine_root)) > 0 AND instr(quarantine_root, char(0)) = 0)),
     quarantined_at           TEXT,
-    cleanup_attempts         INTEGER NOT NULL DEFAULT 0 CHECK (cleanup_attempts >= 0),
+    cleanup_attempts         INTEGER NOT NULL DEFAULT 0 CHECK (typeof(cleanup_attempts) = 'integer' AND cleanup_attempts >= 0 AND cleanup_attempts <= 9223372036854775807),
     cleanup_last_attempt_at  TEXT,
     cleanup_error            TEXT CHECK (cleanup_error IS NULL OR instr(cleanup_error, char(0)) = 0),
     cleanup_retry_at         TEXT,
@@ -48,11 +48,18 @@ CREATE TABLE workspaces (
     CHECK (cleanup_retry_at IS NULL OR (length(cleanup_retry_at) = 24 AND cleanup_retry_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' AND julianday(cleanup_retry_at) IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', julianday(cleanup_retry_at)) = cleanup_retry_at)),
     CHECK (julianday(expires_at) > julianday(created_at)),
     CHECK (renewed_at IS NULL OR (julianday(renewed_at) >= julianday(created_at) AND julianday(renewed_at) < julianday(expires_at))),
-    CHECK (julianday(expires_at) - julianday(COALESCE(renewed_at, created_at)) <= 7.0),
+    CHECK (
+        (CAST(strftime('%s', expires_at) AS INTEGER) * 1000 + CAST(substr(expires_at, 21, 3) AS INTEGER))
+        - (CAST(strftime('%s', COALESCE(renewed_at, created_at)) AS INTEGER) * 1000
+            + CAST(substr(COALESCE(renewed_at, created_at), 21, 3) AS INTEGER)) <= 604800000
+    ),
     CHECK (released_at IS NULL OR julianday(released_at) >= julianday(created_at)),
     CHECK (quarantined_at IS NULL OR julianday(quarantined_at) >= julianday(created_at)),
     CHECK (released_at IS NULL OR renewed_at IS NULL OR julianday(released_at) >= julianday(renewed_at)),
     CHECK (released_at IS NULL OR quarantined_at IS NULL OR julianday(released_at) >= julianday(quarantined_at)),
+    CHECK (quarantined_at IS NULL OR renewed_at IS NULL OR
+        (CAST(strftime('%s', quarantined_at) AS INTEGER) * 1000 + CAST(substr(quarantined_at, 21, 3) AS INTEGER)) >=
+        (CAST(strftime('%s', renewed_at) AS INTEGER) * 1000 + CAST(substr(renewed_at, 21, 3) AS INTEGER))),
 
     CHECK (
         (root_identity_kind = 'unix'
@@ -129,7 +136,9 @@ CREATE TABLE workspace_leases (
             AND host_instance_id IS NOT NULL AND length(trim(host_instance_id)) > 0
             AND owner_id = host_instance_id AND expires_at IS NOT NULL
             AND julianday(expires_at) > julianday(acquired_at)
-            AND julianday(expires_at) - julianday(COALESCE(renewed_at, acquired_at)) <= (90.0 / 86400.0)
+            AND (CAST(strftime('%s', expires_at) AS INTEGER) * 1000 + CAST(substr(expires_at, 21, 3) AS INTEGER))
+                - (CAST(strftime('%s', COALESCE(renewed_at, acquired_at)) AS INTEGER) * 1000
+                    + CAST(substr(COALESCE(renewed_at, acquired_at), 21, 3) AS INTEGER)) <= 90000
             AND (renewed_at IS NULL OR (julianday(renewed_at) >= julianday(acquired_at)
                 AND julianday(renewed_at) < julianday(expires_at))))
     ),
