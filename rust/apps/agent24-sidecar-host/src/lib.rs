@@ -9,6 +9,11 @@ mod posix;
 #[cfg(unix)]
 pub use posix::{LaunchSpec, OwnedGeneration, StopError};
 
+#[cfg(windows)]
+mod owner;
+#[cfg(windows)]
+pub use owner::{GenerationId, GenerationOwner, OwnedProcess};
+
 /// Run the host process.
 pub fn run() -> std::io::Result<()> {
     // The stdio actor and protocol dispatch are introduced in a later slice.
