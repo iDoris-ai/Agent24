@@ -272,10 +272,7 @@ async fn get_does_not_see_uncommitted_wal_row_but_sees_commit() {
 
 #[tokio::test]
 async fn cancelled_queued_get_releases_pool_waiter() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("registry.sqlite"))
-        .await
-        .unwrap();
+    let store = Store::open_memory().await.unwrap();
     create(&store).await;
     let id = WorkspaceId::parse(ID).unwrap();
     let held = test_hooks::pool(&store).acquire().await.unwrap();
