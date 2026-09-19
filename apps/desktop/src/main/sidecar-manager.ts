@@ -13,6 +13,10 @@ export interface SidecarReady { readonly endpoint: { readonly origin: string; re
 export interface SidecarLaunch { readonly child: SidecarChild; readonly processGroupId?: number; readonly ready: Promise<SidecarReady> }
 export interface SidecarLauncher { launch(): Promise<SidecarLaunch> }
 export interface SidecarHealth { check(endpoint: SidecarReady['endpoint'], timeoutMs: number): Promise<boolean> }
+export interface SidecarLogger {
+  info(event: string, fields?: Record<string, string | number>): void
+  warn(event: string, fields?: Record<string, string | number>): void
+}
 export interface SidecarStopper {
   stop(owner: SidecarOwnership, child: SidecarChild, gracefulMs: number, killAfterMs: number): Promise<void>
 }
@@ -26,6 +30,7 @@ export interface SidecarSpec {
 }
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+const silentLogger: SidecarLogger = { info: () => {}, warn: () => {} }
 
 /** Signals only the manager-owned PID or the launcher-provided dedicated group. */
 export function signalOwnedTree(owner: SidecarOwnership, signal: NodeJS.Signals): void {
@@ -64,6 +69,7 @@ export class SidecarManager {
     private readonly health: SidecarHealth,
     private readonly stopper: SidecarStopper = exactTreeStopper,
     private readonly handoff: SidecarEndpointHandoff = new MemoryEndpointHandoff(),
+    private readonly logger: SidecarLogger = silentLogger,
   ) {}
 
   status(): SidecarStatus {
@@ -73,6 +79,7 @@ export class SidecarManager {
   async start(): Promise<SidecarStatus> {
     if (this.state !== 'stopped') return this.status()
     this.state = 'starting'
+    this.logger.info('sidecar.starting', { sidecarId: this.spec.sidecarId })
     try {
       const launch = await this.launcher.launch()
       if (!launch.child.pid) throw new Error('sidecar did not provide a pid')
@@ -82,10 +89,12 @@ export class SidecarManager {
       this.active.ready = ready
       this.handoff.publish(owner.instanceId, ready.endpoint)
       this.state = 'ready'
+      this.logger.info('sidecar.ready', { sidecarId: this.spec.sidecarId, instanceId: owner.instanceId })
       await this.probe()
       this.timer = setInterval(() => { void this.probe() }, this.spec.healthIntervalMs)
     } catch (error) {
       this.state = 'failed'
+      this.logger.warn('sidecar.failed', { sidecarId: this.spec.sidecarId })
       const active = this.active
       if (active) await this.stopActive(active)
       throw error
@@ -96,6 +105,7 @@ export class SidecarManager {
   async stop(): Promise<SidecarStatus> {
     if (!this.active) { this.state = 'stopped'; return this.status() }
     this.state = 'stopping'
+    this.logger.info('sidecar.stopping', { sidecarId: this.spec.sidecarId })
     await this.stopActive(this.active)
     this.state = 'stopped'
     return this.status()
@@ -117,6 +127,7 @@ export class SidecarManager {
       const ok = await this.health.check(active.ready.endpoint, this.spec.healthTimeoutMs)
       this.failures = ok ? 0 : this.failures + 1
       this.state = ok ? 'healthy' : (this.failures >= this.spec.maxHealthFailures ? 'degraded' : 'ready')
+      if (this.state === 'degraded') this.logger.warn('sidecar.degraded', { sidecarId: this.spec.sidecarId, failures: this.failures })
     } finally { this.probing = false }
   }
 }

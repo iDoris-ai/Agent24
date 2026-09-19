@@ -10,9 +10,12 @@ describe('SidecarManager', () => {
     const launcher: SidecarLauncher = { launch: () => Promise.resolve({ child, processGroupId: 42, ready }) }
     const health: SidecarHealth = { check: vi.fn().mockResolvedValue(true) }
     const stopper: SidecarStopper = { stop: vi.fn().mockResolvedValue(undefined) }
-    const manager = new SidecarManager(spec, launcher, health, stopper)
+    const logger = { info: vi.fn(), warn: vi.fn() }
+    const manager = new SidecarManager(spec, launcher, health, stopper, undefined, logger)
 
     await expect(manager.start()).resolves.toMatchObject({ state: 'healthy', sidecarId: 'creative' })
+    expect(logger.info).toHaveBeenCalledWith('sidecar.ready', expect.objectContaining({ sidecarId: 'creative' }))
+    expect(JSON.stringify(logger.info.mock.calls)).not.toContain('secret')
     await manager.stop()
     expect(stopper.stop).toHaveBeenCalledWith(expect.objectContaining({ pid: 42, processGroupId: 42 }), child, 1, 1)
     expect(manager.status().state).toBe('stopped')
