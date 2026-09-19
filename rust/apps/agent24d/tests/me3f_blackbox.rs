@@ -55,13 +55,17 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The out-of-process module: declares `events`/`memory`/`approval`, does
-/// three real callback round trips right after handshaking (emit, remember,
-/// recall — none of which need a live HTTP request), then serves exactly one
-/// HTTP request through the real proxy, reads the real per-request headers
-/// off it, and makes the fourth callback round trip (`approval/gate`) using
-/// those — the one call that genuinely cannot happen before a request exists.
-const BLACKBOX_MODULE: &str = r#"import hashlib, json, os, socket
+/// The out-of-process module: declares `events`/`memory`/`approval`, does two
+/// real callback round trips right after handshaking (remember, recall —
+/// neither needs a live HTTP request), then serves exactly one HTTP request
+/// through the real proxy. Inside that request's handler — because both
+/// calls genuinely cannot happen any earlier — it reads the real per-request
+/// headers, submits `_a24/approval/gate` once with a DELIBERATELY WRONG
+/// token (must be rejected without consuming the real one), once for real,
+/// and emits `_a24/events/emit` — moved here, not right after handshake, so
+/// a WS subscriber the Rust test connects BEFORE this request is what proves
+/// delivery, not just the callback's ack.
+const BLACKBOX_MODULE: &str = r#"import hashlib, json, os, socket, sys
 with open("domain-os.yml", "rb") as f:
     digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
 data_dir = os.environ["A24_DATA_DIR"]
@@ -72,56 +76,83 @@ f = cb.makefile("rb")
 next_id = [0]
 def rpc(method, params):
     next_id[0] += 1
-    req = {"jsonrpc": "2.0", "id": str(next_id[0]), "method": method, "params": params}
+    this_id = str(next_id[0])
+    req = {"jsonrpc": "2.0", "id": this_id, "method": method, "params": params}
     cb.sendall((json.dumps(req) + "\n").encode())
-    return json.loads(f.readline())
+    line = f.readline()
+    if not line:
+        raise RuntimeError(f"callback socket closed waiting for a response to {method}")
+    resp = json.loads(line)
+    if resp.get("id") != this_id:
+        raise RuntimeError(
+            f"response id {resp.get('id')!r} != request id {this_id!r} for {method}: {resp}"
+        )
+    return resp
 
-init_resp = rpc("initialize", {
-    "protocol_versions": {"min": 1, "max": 1000}, "module": "blackbox",
-    "manifest_digest": digest, "auth_token": os.environ["A24_HANDSHAKE_TOKEN"],
-    "capabilities": ["events", "memory", "approval"]})
-provides = init_resp.get("result", {}).get("offer", {}).get("provides", [])
+try:
+    init_resp = rpc("initialize", {
+        "protocol_versions": {"min": 1, "max": 1000}, "module": "blackbox",
+        "manifest_digest": digest, "auth_token": os.environ["A24_HANDSHAKE_TOKEN"],
+        "capabilities": ["events", "memory", "approval"]})
+    provides = init_resp.get("result", {}).get("offer", {}).get("provides", [])
 
-emit_resp = rpc("_a24/events/emit", {"kind": "task.transitioned", "payload": {"probe": "t9"}})
-remember_resp = rpc("_a24/memory/private/remember", {"kind": "t9-note", "body": {"text": "t9-blackbox"}})
-recall_resp = rpc("_a24/memory/private/recall", {"query": "t9-note", "page_size": 10})
+    remember_resp = rpc("_a24/memory/private/remember", {"kind": "t9-note", "body": {"text": "t9-blackbox"}})
+    recall_resp = rpc("_a24/memory/private/recall", {"query": "t9-note", "page_size": 10})
 
-with open(os.path.join(data_dir, "callback_probe.json"), "w") as out:
-    json.dump({
-        "provides": provides,
-        "emit_response": emit_resp,
-        "remember_response": remember_resp,
-        "recall_response": recall_resp,
-    }, out)
+    with open(os.path.join(data_dir, "callback_probe.json"), "w") as out:
+        json.dump({
+            "provides": provides,
+            "remember_response": remember_resp,
+            "recall_response": recall_resp,
+        }, out)
 
-listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
-conn, _ = listener.accept()
-head = b""
-while b"\r\n\r\n" not in head:
-    chunk = conn.recv(4096)
-    if not chunk:
-        break
-    head += chunk
-lines = head.split(b"\r\n")
-headers = {}
-for line in lines[1:]:
-    if b":" in line:
-        k, v = line.split(b":", 1)
-        headers[k.strip().lower().decode()] = v.strip().decode()
+    listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+    conn, _ = listener.accept()
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    lines = head.split(b"\r\n")
+    headers = {}
+    for line in lines[1:]:
+        if b":" in line:
+            k, v = line.split(b":", 1)
+            headers[k.strip().lower().decode()] = v.strip().decode()
 
-gate_resp = rpc("_a24/approval/gate", {
-    "action": "schedule_callback",
-    "target": "2099-01-01T00:00:00Z",
-    "payload": {},
-    "request_id": headers.get("x-a24-request-id", ""),
-    "approval_token": headers.get("x-a24-approval-token", ""),
-})
-with open(os.path.join(data_dir, "gate_probe.json"), "w") as out:
-    json.dump({"headers_seen": headers, "gate_response": gate_resp}, out)
+    gate_params = {
+        "action": "schedule_callback",
+        "target": "2099-01-01T00:00:00Z",
+        "payload": {},
+        "request_id": headers.get("x-a24-request-id", ""),
+    }
+    # Negative control FIRST, same request_id: a wrong token must be refused
+    # and — per the kernel's own admission semantics — must NOT consume the
+    # real token, so the correct call right after it still succeeds.
+    bad_gate_resp = rpc("_a24/approval/gate", {
+        **gate_params, "approval_token": "definitely-not-the-real-token",
+    })
+    gate_resp = rpc("_a24/approval/gate", {
+        **gate_params, "approval_token": headers.get("x-a24-approval-token", ""),
+    })
+    emit_resp = rpc("_a24/events/emit", {"kind": "task.transitioned", "payload": {"probe": "t9"}})
+    with open(os.path.join(data_dir, "gate_probe.json"), "w") as out:
+        json.dump({
+            "headers_seen": headers,
+            "bad_gate_response": bad_gate_resp,
+            "gate_response": gate_resp,
+            "emit_response": emit_resp,
+        }, out)
 
-body = b"hello"
-conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
-conn.close()
+    body = b"hello"
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+    conn.close()
+except Exception as e:
+    with open(os.path.join(data_dir, "error.txt"), "w") as out:
+        out.write(repr(e))
+    print(f"blackbox module failed: {e!r}", file=sys.stderr)
+    raise
 
 while f.readline():
     pass
@@ -175,6 +206,16 @@ struct Daemon {
     run: Running,
     port: u16,
     token: String,
+    /// The daemon's stderr, line by line — surfaced on a timeout panic so a
+    /// hang is diagnosable instead of just "the module never answered"
+    /// (Codex review: Python failures were fail-closed but silent).
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Daemon {
+    fn recent_stderr(&self) -> String {
+        self.stderr.lock().unwrap().join("\n")
+    }
 }
 
 /// Start the already-built `agent24d` binary against `home` — no `cargo
@@ -188,7 +229,7 @@ fn start(home: &Path) -> Daemon {
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -202,10 +243,19 @@ fn start(home: &Path) -> Daemon {
         .recv_timeout(Duration::from_secs(30))
         .expect("no ready line within 30s");
     let ready: serde_json::Value = serde_json::from_str(&ready).expect("the ready line");
+    let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr = child.stderr.take().unwrap();
+    let sink = stderr_lines.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push(line);
+        }
+    });
     Daemon {
         run: Running(child),
         port: u16::try_from(ready["port"].as_u64().unwrap()).unwrap(),
         token: ready["token"].as_str().unwrap().to_owned(),
+        stderr: stderr_lines,
     }
 }
 
@@ -269,16 +319,23 @@ fn a_package_from_outside_the_repo() {
     // Second lifetime: a real restart, same binary, same $HOME.
     let d2 = start(home.path());
 
+    // Subscribe to the real WS event consumer BEFORE triggering the request
+    // that makes the module emit — the callback's own `{}` ack proves the
+    // kernel accepted the call, not that anything downstream received it
+    // (Codex review: a regression that acked without broadcasting would
+    // still pass an ack-only check). `spawn_ws_subscriber` blocks until the
+    // upgrade completes, so no event emitted after this line can be missed.
+    let events = spawn_ws_subscriber(d2.port, &d2.token);
+
     // ── 1. Mount + 2. Routing proxy ──────────────────────────────────────
     // `os list` can report `mounted` slightly before the module has finished
     // its handshake (spawned + registered vs. ready to actually serve a
     // proxied request are two different moments) — `daemon_modules.rs`'s own
     // `serving()` helper hits the same thing and retries the real HTTP call
     // rather than gating on the list, so this does the same. The module's
-    // handler also does the approval round trip (round trip 5) before it
-    // answers, so this call exercises proxy + approval together — approval
-    // submission needs a request actually in flight, so it cannot be tested
-    // any earlier than this.
+    // handler also does the approval round trip before it answers, so this
+    // call exercises proxy + approval + events together — none of the three
+    // can be tested any earlier than a request actually being in flight.
     let deadline = Instant::now() + Duration::from_secs(30);
     let (status, body) = loop {
         if let Some((status, body)) = get(d2.port, &d2.token, "/api/v1/blackbox/hi")
@@ -288,17 +345,48 @@ fn a_package_from_outside_the_repo() {
         }
         assert!(
             Instant::now() < deadline,
-            "the module never answered through the real proxy"
+            "the module never answered through the real proxy; daemon stderr:\n{}",
+            d2.recent_stderr()
         );
         std::thread::sleep(Duration::from_millis(100));
     };
-    assert_eq!((status, body.as_str()), (200, "hello"));
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "hello"),
+        "daemon stderr:\n{}",
+        d2.recent_stderr()
+    );
     assert_eq!(
         os_list_entry(d2.port, &d2.token, "blackbox")["state"],
         "mounted"
     );
 
-    // ── 3/4. Event forwarding + memory read/write ───────────────────────
+    // ── 3. Event forwarding, observed at the real consumer boundary ─────
+    // The module's handler also submits a real `_a24/approval/gate`, which
+    // itself broadcasts `module-approval.required` on the same bus — so this
+    // reads until it finds the `module` event rather than assuming it is the
+    // first frame.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let event = loop {
+        let event = events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect(
+                "the WS subscriber connected before the request never received \
+                 the module's event",
+            );
+        if event["type"] == "module" {
+            break event;
+        }
+    };
+    assert_eq!(event["payload"]["module"], "blackbox", "{event}");
+    assert_eq!(event["payload"]["kind"], "task.transitioned", "{event}");
+    assert_eq!(
+        event["payload"]["payload"],
+        serde_json::json!({"probe": "t9"}),
+        "{event}"
+    );
+
+    // ── 4. Memory read/write, correlated by ID and body ─────────────────
     let probe_path = home.path().join(".agent24/os/blackbox/callback_probe.json");
     let probe: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&probe_path).unwrap()).unwrap();
@@ -307,32 +395,29 @@ fn a_package_from_outside_the_repo() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|p| "_a24/events/emit".starts_with(p.as_str().unwrap())),
-        "the handshake offer must cover events: {probe}"
+            .any(|p| "_a24/memory/private/".starts_with(p.as_str().unwrap())),
+        "the handshake offer must cover memory: {probe}"
     );
-    assert_eq!(
-        probe["emit_response"]["result"],
-        serde_json::json!({}),
-        "a real _a24/events/emit call must succeed: {probe}"
-    );
+    let remembered_id = probe["remember_response"]["result"]["id"].clone();
     assert!(
-        probe["remember_response"].get("result").is_some(),
-        "a real _a24/memory/private/remember call must succeed: {probe}"
+        !remembered_id.is_null(),
+        "a real _a24/memory/private/remember call must return a real id: {probe}"
     );
     let recall_result = &probe["recall_response"]["result"];
-    assert!(
-        recall_result.is_object(),
-        "a real _a24/memory/private/recall call must succeed: {probe}"
-    );
     let items = recall_result["items"]
         .as_array()
         .unwrap_or_else(|| panic!("recall result must have an items array: {probe}"));
-    assert!(
-        items.iter().any(|i| i["kind"] == "t9-note"),
-        "recall must read back the note this same test just remembered: {probe}"
-    );
+    let recalled = items
+        .iter()
+        .find(|i| i["id"] == remembered_id)
+        .unwrap_or_else(|| {
+            panic!("recall must contain the EXACT record just remembered (by id): {probe}")
+        });
+    assert_eq!(recalled["kind"], "t9-note", "{probe}");
+    assert_eq!(recalled["body"]["text"], "t9-blackbox", "{probe}");
 
-    // ── 5. Approval round trip ───────────────────────────────────────────
+    // ── 5. Approval round trip — a bad token is rejected, the real one
+    //      still works (proving the reject path did not burn it) ────────
     let gate_path = home.path().join(".agent24/os/blackbox/gate_probe.json");
     let gate: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&gate_path).unwrap()).unwrap();
@@ -351,11 +436,58 @@ fn a_package_from_outside_the_repo() {
         "the proxy must mint a real per-request approval token header: {gate}"
     );
     assert_eq!(
+        gate["bad_gate_response"]["error"]["data"]["kind"], "token_invalid",
+        "a submission with the right request_id but a wrong token must be \
+         rejected as token_invalid — proving this isn't an unconditional \
+         'pending' regression: {gate}"
+    );
+    assert_eq!(
         gate["gate_response"]["result"]["decision"], "pending",
-        "a real _a24/approval/gate submission using the real per-request headers must succeed: {gate}"
+        "the SAME request_id, now with the real per-request token, must \
+         still succeed — proving the rejected attempt did not consume it: {gate}"
     );
 
     stop(d2);
+}
+
+/// Connect to the real `GET /api/v1/events` WS endpoint and hand back a
+/// channel of decoded [`agent24_protocol::Event`] JSON values, one per
+/// frame. Blocks until the WS upgrade completes, so a caller that calls this
+/// before triggering whatever should emit an event cannot miss it to a race.
+fn spawn_ws_subscriber(port: u16, token: &str) -> std::sync::mpsc::Receiver<serde_json::Value> {
+    use tokio_tungstenite::tungstenite;
+    use tungstenite::client::IntoClientRequest;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let url = format!("ws://127.0.0.1:{port}/api/v1/events");
+    let token = token.to_owned();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let mut request = url.into_client_request().expect("a valid ws:// url");
+            request
+                .headers_mut()
+                .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            let (mut socket, _) = tokio_tungstenite::connect_async(request)
+                .await
+                .expect("the real WS upgrade must succeed");
+            let _ = ready_tx.send(());
+            use futures::StreamExt;
+            while let Some(Ok(tungstenite::Message::Text(text))) = socket.next().await {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the WS subscriber never finished its upgrade");
+    rx
 }
 
 /// Negative control: a package declared `impl_kind: in_process_crate` (the
@@ -372,22 +504,24 @@ fn an_in_process_declaration_for_an_uncompiled_crate_is_still_refused() {
         dir.join("domain-os.yml"),
         "name: not-really-in-process\nversion: \"0.1.0\"\n\
          route_namespace: /api/v1/not-really-in-process\n\
-         event_module: not-really-in-process\ndata_dir: ~/.agent24/os/nripp/\n\
+         event_module: not-really-in-process\n\
+         data_dir: ~/.agent24/os/not-really-in-process/\n\
          kernel_capabilities: []\nimpl_kind: in_process_crate\n",
     )
     .unwrap();
     let d = start(home.path());
-    // Whether a manifest this malformed even reaches a reportable `os list`
-    // entry, or is dropped at discovery, is not this test's business — what
-    // must be true regardless is that no client can ever reach it: proven at
-    // the one boundary a black-box test is entitled to look at, the HTTP
-    // route.
-    let (status, _) = get(d.port, &d.token, "/api/v1/not-really-in-process/hi")
-        .expect("the daemon answered (refused or 404, but answered)");
-    assert_ne!(
-        status, 200,
-        "a crate this binary never compiled in must not mount just because \
-         its manifest asked to"
+    let entry = os_list_entry(d.port, &d.token, "not-really-in-process");
+    assert_eq!(
+        entry["state"], "refused",
+        "a crate this binary never compiled in must be reported REFUSED, not \
+         silently absent or mounted: {entry}"
+    );
+    let (status, _) =
+        get(d.port, &d.token, "/api/v1/not-really-in-process/hi").expect("the daemon answered");
+    assert_eq!(
+        status, 404,
+        "a refused module must have no route at all — not 200, and not some \
+         other non-200 status that could equally mean 'mounted but broken'"
     );
     stop(d);
 }
