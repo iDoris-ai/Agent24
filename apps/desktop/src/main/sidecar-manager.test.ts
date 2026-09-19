@@ -1,11 +1,18 @@
 import { describe, expect, it, vi } from 'vitest'
-import { SidecarManager, type SidecarHealth, type SidecarLauncher, type SidecarStopper } from './sidecar-manager'
+import { exactTreeStopper, SidecarManager, type SidecarHealth, type SidecarLauncher, type SidecarStopper } from './sidecar-manager'
 
 const spec = { sidecarId: 'creative', readyTimeoutMs: 50, healthIntervalMs: 100, healthTimeoutMs: 10, maxHealthFailures: 2, shutdown: { termGraceMs: 1, killAfterMs: 1 } }
 const child = { pid: 42, exitCode: null }
 const ready = Promise.resolve({ endpoint: { origin: 'http://127.0.0.1:4312', secret: 'secret' } })
 
 describe('SidecarManager', () => {
+  it('uses graceful then forced signals for an owned process group', async () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+    await exactTreeStopper.stop({ sidecarId: 'creative', instanceId: 'a', pid: 42, processGroupId: 42, startedAt: 0 }, child, 1, 1)
+    expect(kill.mock.calls.map(([pid, signal]) => [pid, signal])).toEqual([[-42, 'SIGTERM'], [-42, 'SIGKILL']])
+    kill.mockRestore()
+  })
+
   it('requires readiness and health before reporting healthy, then stops its exact owner', async () => {
     const launcher: SidecarLauncher = { launch: () => Promise.resolve({ child, processGroupId: 42, ready }) }
     const health: SidecarHealth = { check: vi.fn().mockResolvedValue(true) }
