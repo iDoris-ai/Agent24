@@ -31,6 +31,28 @@ async fn insert(store: &Store, id: &str, state: &str, created_at: &str) {
     .unwrap();
 }
 
+async fn insert_with_inode(store: &Store, id: &str, created_at: &str, inode: [u8; 8]) {
+    sqlx::query(
+        "INSERT INTO workspaces
+         (id, kind, state, provenance_source, writeback_policy,
+          lifecycle_owner_kind, lifecycle_owner_ref, concurrency_policy,
+          created_at, expires_at, revision, canonical_root, root_generation,
+          root_identity_kind, unix_device, unix_inode)
+         VALUES (?, 'orchestrator_scratch', 'active', 'git', 'external',
+                 'orchestrator', 'list-owner', 'serial', ?, ?, 1, ?,
+                 'list-generation', 'unix', ?, ?)",
+    )
+    .bind(id)
+    .bind(created_at)
+    .bind(EXPIRES)
+    .bind(format!("/private/list/{id}"))
+    .bind([1; 8].as_slice())
+    .bind(inode.as_slice())
+    .execute(test_hooks::pool(store))
+    .await
+    .unwrap();
+}
+
 fn query(
     state: Option<WorkspaceState>,
     after: Option<WorkspaceListCursor>,
@@ -405,4 +427,106 @@ async fn list_cursor_keeps_inter_page_boundary_stable_when_newer_rows_arrive() {
             "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
         ]
     );
+}
+
+#[tokio::test]
+async fn list_exact_limit_rows_have_no_cursor() {
+    let store = Store::open_memory().await.unwrap();
+    for (id, created_at) in [
+        ("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1", "2026-09-19T00:00:00.000Z"),
+        ("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2", "2026-09-19T00:01:00.000Z"),
+    ] {
+        insert(&store, id, "active", created_at).await;
+    }
+
+    let page = store.list_workspaces(&query(None, None, 2)).await.unwrap();
+    assert_eq!(page.items().len(), 2);
+    assert!(page.next_cursor().is_none());
+}
+
+#[tokio::test]
+async fn list_accepts_the_limit_one_hundred_boundary() {
+    let store = Store::open_memory().await.unwrap();
+    let prefix = "01J5M4Q2Y7N8P9R0S1T2V3W4";
+    let alphabet = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    for value in 0..100usize {
+        let id = format!(
+            "ws_{prefix}{}{}",
+            char::from(alphabet[value / alphabet.len()]),
+            char::from(alphabet[value % alphabet.len()])
+        );
+        let mut inode = [0; 8];
+        inode[..2].copy_from_slice(&[
+            alphabet[value / alphabet.len()],
+            alphabet[value % alphabet.len()],
+        ]);
+        insert_with_inode(&store, &id, "2026-09-19T00:00:00.000Z", inode).await;
+    }
+
+    let page = store
+        .list_workspaces(&query(None, None, 100))
+        .await
+        .unwrap();
+    assert_eq!(page.items().len(), 100);
+    assert!(page.next_cursor().is_none());
+}
+
+#[tokio::test]
+async fn list_accepts_a_synthetic_cursor_between_existing_ids() {
+    let store = Store::open_memory().await.unwrap();
+    for id in [
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X3",
+    ] {
+        insert(&store, id, "active", "2026-09-19T00:00:00.000Z").await;
+    }
+    let synthetic = WorkspaceListCursor::new(
+        agent24_store::WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap(),
+        WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2").unwrap(),
+    );
+
+    let page = store
+        .list_workspaces(&query(None, Some(synthetic), 10))
+        .await
+        .unwrap();
+    assert_eq!(ids(&page), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1"]);
+    assert!(page.next_cursor().is_none());
+}
+
+#[tokio::test]
+async fn list_reuses_a_cursor_with_a_different_state_filter() {
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2",
+        "expired",
+        "2026-09-19T00:01:00.000Z",
+    )
+    .await;
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X3",
+        "active",
+        "2026-09-19T00:02:00.000Z",
+    )
+    .await;
+
+    let first = store.list_workspaces(&query(None, None, 1)).await.unwrap();
+    assert_eq!(ids(&first), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X3"]);
+    let expired = store
+        .list_workspaces(&query(
+            Some(WorkspaceState::Expired),
+            first.next_cursor().cloned(),
+            10,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ids(&expired), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2"]);
 }
