@@ -153,7 +153,7 @@ async fn host_exact_ninety_second_bound_accepts_every_millisecond() {
             "INSERT INTO workspace_leases
          (lease_id, workspace_id, root_generation, owner_id, kind,
           daemon_generation, host_instance_id, acquired_at, expires_at)
-         VALUES ('wl_00000000000000000000000000', ?, 'g1', 'over', 'host',
+         VALUES ('wl_00000000000000000000000001', ?, 'g1', 'over', 'host',
                  'daemon-1', 'over', '2026-09-19T00:00:00.000Z',
                  '2026-09-19T00:01:30.001Z')",
         )
