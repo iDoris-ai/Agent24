@@ -10,7 +10,12 @@ import {
 
 export interface SidecarChild { readonly pid?: number; readonly exitCode: number | null }
 export interface SidecarReady { readonly endpoint: { readonly origin: string; readonly secret: string } }
-export interface SidecarLaunch { readonly child: SidecarChild; readonly processGroupId?: number; readonly ready: Promise<SidecarReady> }
+export interface SidecarLaunch {
+  readonly child: SidecarChild
+  readonly processGroupId?: number
+  readonly dedicatedProcessGroup?: boolean
+  readonly ready: Promise<SidecarReady>
+}
 export interface SidecarLauncher { launch(): Promise<SidecarLaunch> }
 export interface SidecarHealth { check(endpoint: SidecarReady['endpoint'], timeoutMs: number): Promise<boolean> }
 export interface SidecarLogger {
@@ -33,27 +38,47 @@ const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, 
 const silentLogger: SidecarLogger = { info: () => {}, warn: () => {} }
 
 /** Signals only the manager-owned PID or the launcher-provided dedicated group. */
-export function signalOwnedTree(owner: SidecarOwnership, signal: NodeJS.Signals): void {
-  if (!Number.isInteger(owner.pid) || owner.pid <= 0) return
+export function signalOwnedTree(owner: SidecarOwnership, signal: NodeJS.Signals): Promise<void> {
+  if (!Number.isInteger(owner.pid) || owner.pid <= 0) throw new Error('sidecar pid is invalid')
+  if (owner.processGroupId !== null && (!Number.isInteger(owner.processGroupId) || owner.processGroupId <= 0)) {
+    throw new Error('sidecar process group is invalid')
+  }
   if (process.platform === 'win32') {
-    spawn('taskkill.exe', ['/PID', String(owner.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])], { stdio: 'ignore', windowsHide: true })
-    return
+    return new Promise((resolve, reject) => {
+      const taskkill = spawn('taskkill.exe', ['/PID', String(owner.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])], { stdio: 'ignore', windowsHide: true })
+      taskkill.once('error', reject)
+      taskkill.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with ${String(code)}`)))
+    })
   }
   const target = owner.processGroupId === null ? owner.pid : -owner.processGroupId
   try { process.kill(target, signal) } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
   }
+  return Promise.resolve()
 }
 
 export const exactTreeStopper: SidecarStopper = {
   async stop(owner, child, gracefulMs, killAfterMs) {
-    signalOwnedTree(owner, 'SIGTERM')
+    await signalOwnedTree(owner, 'SIGTERM')
     await wait(gracefulMs)
     if (child.exitCode === null) {
-      signalOwnedTree(owner, 'SIGKILL')
+      await signalOwnedTree(owner, 'SIGKILL')
       await wait(killAfterMs)
     }
   },
+}
+
+export function validateReady(ready: SidecarReady): void {
+  if (!ready.endpoint.secret) throw new Error('sidecar readiness secret is empty')
+  const url = new URL(ready.endpoint.origin)
+  if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', '[::1]'].includes(url.hostname)) {
+    throw new Error('sidecar endpoint must use a loopback HTTP(S) origin')
+  }
+  if (!url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('sidecar endpoint must include an explicit loopback port')
+  }
+  const port = Number(url.port)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('sidecar endpoint port is invalid')
 }
 
 export class SidecarManager {
@@ -62,6 +87,7 @@ export class SidecarManager {
   private timer: NodeJS.Timeout | null = null
   private failures = 0
   private probing = false
+  private lifecycle: Promise<SidecarStatus>
 
   constructor(
     private readonly spec: SidecarSpec,
@@ -70,22 +96,41 @@ export class SidecarManager {
     private readonly stopper: SidecarStopper = exactTreeStopper,
     private readonly handoff: SidecarEndpointHandoff = new MemoryEndpointHandoff(),
     private readonly logger: SidecarLogger = silentLogger,
-  ) {}
+  ) {
+    this.lifecycle = Promise.resolve(this.status())
+  }
 
   status(): SidecarStatus {
     return { state: this.state, sidecarId: this.spec.sidecarId, instanceId: this.active?.owner.instanceId }
   }
 
-  async start(): Promise<SidecarStatus> {
+  start(): Promise<SidecarStatus> {
+    const operation = this.lifecycle.then(() => this.startInternal())
+    this.lifecycle = operation.catch(() => this.status())
+    return operation
+  }
+
+  private async startInternal(): Promise<SidecarStatus> {
     if (this.state !== 'stopped') return this.status()
     this.state = 'starting'
-    this.logger.info('sidecar.starting', { sidecarId: this.spec.sidecarId })
+      this.logger.info('sidecar.starting', { sidecarId: this.spec.sidecarId })
     try {
       const launch = await this.launcher.launch()
-      if (!launch.child.pid) throw new Error('sidecar did not provide a pid')
-      const owner = createOwnership(this.spec.sidecarId, launch.child.pid, launch.processGroupId ?? null)
+      const pid = launch.child.pid
+      if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) throw new Error('sidecar did not provide a valid pid')
+      const group = launch.processGroupId
+      let owner = createOwnership(this.spec.sidecarId, pid)
+      this.active = { owner, child: launch.child }
+      if (process.platform !== 'win32' && launch.dedicatedProcessGroup === true && (typeof group !== 'number' || !Number.isInteger(group) || group !== pid || group <= 0)) {
+        throw new Error('sidecar process group is not an owned child group')
+      }
+      if (process.platform !== 'win32' && launch.dedicatedProcessGroup !== true && group !== undefined) {
+        throw new Error('sidecar process group evidence is missing')
+      }
+      owner = createOwnership(this.spec.sidecarId, pid, process.platform === 'win32' ? null : group ?? null)
       this.active = { owner, child: launch.child }
       const ready = await Promise.race([launch.ready, wait(this.spec.readyTimeoutMs).then(() => { throw new Error('sidecar readiness timeout') })])
+      validateReady(ready)
       this.active.ready = ready
       this.handoff.publish(owner.instanceId, ready.endpoint)
       this.state = 'ready'
@@ -102,7 +147,13 @@ export class SidecarManager {
     return this.status()
   }
 
-  async stop(): Promise<SidecarStatus> {
+  stop(): Promise<SidecarStatus> {
+    const operation = this.lifecycle.then(() => this.stopInternal())
+    this.lifecycle = operation.catch(() => this.status())
+    return operation
+  }
+
+  private async stopInternal(): Promise<SidecarStatus> {
     if (!this.active) { this.state = 'stopped'; return this.status() }
     this.state = 'stopping'
     this.logger.info('sidecar.stopping', { sidecarId: this.spec.sidecarId })
@@ -115,8 +166,13 @@ export class SidecarManager {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
     this.handoff.clear(active.owner.instanceId)
-    this.active = null
-    await this.stopper.stop(active.owner, active.child, this.spec.shutdown.termGraceMs, this.spec.shutdown.killAfterMs)
+    try {
+      await this.stopper.stop(active.owner, active.child, this.spec.shutdown.termGraceMs, this.spec.shutdown.killAfterMs)
+    } catch (error) {
+      if (this.active?.owner.instanceId === active.owner.instanceId) this.state = 'failed'
+      throw error
+    }
+    if (this.active?.owner.instanceId === active.owner.instanceId) this.active = null
   }
 
   private async probe(): Promise<void> {
@@ -125,6 +181,7 @@ export class SidecarManager {
     this.probing = true
     try {
       const ok = await this.health.check(active.ready.endpoint, this.spec.healthTimeoutMs)
+      if (this.state === 'stopping' || this.active?.owner.instanceId !== active.owner.instanceId) return
       this.failures = ok ? 0 : this.failures + 1
       this.state = ok ? 'healthy' : (this.failures >= this.spec.maxHealthFailures ? 'degraded' : 'ready')
       if (this.state === 'degraded') this.logger.warn('sidecar.degraded', { sidecarId: this.spec.sidecarId, failures: this.failures })
