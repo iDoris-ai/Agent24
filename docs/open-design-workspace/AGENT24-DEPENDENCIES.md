@@ -1,12 +1,12 @@
 # Agent24 主干依赖台账
 
-> 状态：Draft / 随 P0 冻结
+> 状态：P0 frozen / A24-OD-00 ready to implement
 >
 > 日期：2026-09-19
 >
 > integration branch：`feat/open-design-workspace`
 >
-> 已审计 Agent24 主干：`origin/main@ef768023fd54d83d1d5220cbfacec4d7ba07c73c`
+> 已审计 Agent24 主干：`origin/main@69baf50d62e6e3db5ca41a8882d35deb45ea3454`
 
 ## 1. 目的
 
@@ -34,6 +34,26 @@
 
 ## 3. 必须进入 Agent24 主干的硬依赖
 
+### A24-OD-00 — Capability-scoped daemon authority
+
+状态：`DESIGN_FROZEN`
+
+目标分支：`feat/a24-capability-auth`
+
+阻塞：A24-OD-01～09、P1 之后的所有真实 Creative runtime
+
+必须提供：
+
+- `product_host`、`creative_runtime` audience/claims；capability mode 的 discovery 不含 token；
+- 全权 credential 只经 ready pipe 交给原始可信 parent，不写 `daemon.json`；packaged desktop 必须拥有它启动的 daemon，禁止隐式 host handover；
+- opaque token hash/store、mint/revoke/expiry、workspace/attachment/principal/session/instance generation binding；durable principal ownership survives token rotation without cross-conversation access；
+- action + resource 双重 authorization，Creative 明确拒绝 approval decision、grant/override、host lease、capability mint、shutdown 和跨 workspace/session/run；
+- project root 外 host-private handoff；WS/event 每次发送复验、revoke 主动断流、daemon restart 全部 creative token 失效；
+- packaged Creative 禁止 fallback 到 single-token；standalone legacy mode 禁止启动 Creative；
+- 负向测试证明读取 discovery、控制 ACP、持有 workspace/principal A token均不能取得 host authority、workspace B 或同 workspace principal B 数据；rotation 后只恢复原 principal 的 session/run。
+
+契约：[design/ADR-005-CAPABILITY-AUTHORITY.md](design/ADR-005-CAPABILITY-AUTHORITY.md)。预计 4–7 个工程日。该层完成并通过 SOL review 之前，不启动 Open Design sidecar。
+
 ### A24-OD-01 — Opaque workspace registry
 
 状态：`PLANNED`
@@ -59,7 +79,7 @@
 
 目标分支：`feat/a24-run-workspace-binding`
 
-依赖：A24-OD-01
+依赖：A24-OD-00、A24-OD-01
 
 阻塞：P3、P5
 
@@ -81,7 +101,7 @@
 
 目标分支：`feat/a24-acp-bridge`
 
-依赖：A24-OD-01、A24-OD-02 的契约与实现
+依赖：A24-OD-00、A24-OD-01、A24-OD-02 的契约与实现
 
 阻塞：P4、P5、P6 packaged flow
 
@@ -186,7 +206,7 @@
 
 原因：Open Design 采用独立 fork + sidecar + `agent24 acp` + Agent24 workspace contract，不作为 Agent24 Domain OS 包挂载。只有未来改变产品边界、把 Open Design 改成 OOP Domain OS 时，才需要重新评估 T8.5c-W/T9 依赖。
 
-当前 `origin/main@ef76802` 已包含 T8.5c-W-wire v5 冻结设计，但尚未包含其实现。若该实现并行进行：
+当前 `origin/main@69baf50` 已包含 T8.5c-W-wire v5 冻结设计，但尚未包含其实现。若该实现并行进行：
 
 - 必须从最新 `origin/main` 建新分支；
 - 不使用旧的 `chore/t8.5c-w-wire-design-freeze` 或 `feat/t8.5c-w-mount-domain-wiring` 作为实现基线；
@@ -200,15 +220,17 @@
 ## 7. 建议分支图与合并顺序
 
 ```text
-origin/main (创建时取最新；审计时为 ef76802)
+origin/main (创建时取最新；审计时为 69baf50)
 │
-├─ A24-OD-01 feat/a24-workspace-registry
+├─ A24-OD-00 feat/a24-capability-auth
 │    └─ merge → main
-│         └─ A24-OD-02 feat/a24-run-workspace-binding
+│         └─ A24-OD-01 feat/a24-workspace-registry
 │              └─ merge → main
-│                   └─ A24-OD-03 feat/a24-acp-bridge
+│                   └─ A24-OD-02 feat/a24-run-workspace-binding
 │                        └─ merge → main
-│                             └─ A24-OD-04 feat/a24-desktop-cli-packaging
+│                             └─ A24-OD-03 feat/a24-acp-bridge
+│                                  └─ merge → main
+│                                       └─ A24-OD-04 feat/a24-desktop-cli-packaging
 │
 ├─ A24-OD-05 feat/a24-desktop-sidecar-manager
 │    └─ A24-OD-06 feat/a24-desktop-creative-session
@@ -225,7 +247,8 @@ feat/open-design-workspace
 
 允许的并行：
 
-- A24-OD-01、A24-OD-05、OD-01 可作为第一波并行；
+- 用户要求 capability security layer 完成后再继续，因此第一波只实现并审查 A24-OD-00；
+- A24-OD-00 合入后，A24-OD-01、A24-OD-05、OD-01 可并行；
 - A24-OD-03 与 A24-OD-06/07 可在 workspace 契约稳定后并行；
 - OD-02 可根据冻结 ACP contract 先写 fixture/adapter，但真实 E2E 等 A24-OD-03；
 - SOL review 在每波 Luna 完成后进行，不与未稳定的同文件写入交错。
@@ -279,9 +302,9 @@ feat/open-design-workspace
 收到 [EXECUTION.md](EXECUTION.md) 中的完整启动口令后：
 
 1. 刷新并审计 `origin/main`；
-2. P0 冻结 workspace/ACP/desktop host ADR；
+2. P0 冻结 capability/workspace/ACP/desktop host ADR；
 3. 更新本台账状态；
-4. 第一波并行创建 A24-OD-01、A24-OD-05、OD-01 的独立 worktree/branch；
+4. 第一波只创建 A24-OD-00 独立 worktree/branch并完成安全层；
 5. 每个 Luna 只领取一个有文件所有权的工作包；
 6. 等待全部实现与测试结果；
 7. 启动 5.6-SOL review；

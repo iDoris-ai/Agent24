@@ -1,6 +1,6 @@
-# Agent24 × Open Design 实施计划（待 review）
+# Agent24 × Open Design 实施计划（已批准，执行中）
 
-> 状态：Draft / 未批准 / 不得开始实现
+> 状态：Approved / P0 completed / A24-OD-00 next
 >
 > 日期：2026-09-19
 >
@@ -8,7 +8,7 @@
 >
 > 初始基线：Agent24 `04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
 >
-> 已同步主干：Agent24 `ef768023fd54d83d1d5220cbfacec4d7ba07c73c`
+> 已同步主干：Agent24 `69baf50d62e6e3db5ca41a8882d35deb45ea3454`
 
 ## 1. 目标与非目标
 
@@ -68,6 +68,7 @@ Agent24 主干依赖、负责分支、合并顺序和非依赖项统一登记在
 | workspace 标识 | opaque `workspace_id`，不让 run API 接受任意裸路径 | 可做 canonicalization、生命周期、授权和审计；未来支持本地/临时/远端后端 |
 | workspace 类型 | 首版支持 `orchestrator_scratch`，writeback 固定为 `external` | 与 Open Design 现有 provenance 契约一致，避免 OD 直接修改源仓库 |
 | 权限 authority | Agent24 本机审批为唯一 authority；OD/ACP 客户端不得代替用户自动批准 | 保持 Agent24 policy 边界，不把权限下放给 Creative UI |
+| credential boundary | `product_host` 不落 discovery；Creative 只持有 workspace-scoped、短 TTL capability；OD 属于 pin/hash 验证 TCB | 单 bearer 无法隔离同用户 sidecar；ADR-005 已批准 |
 | UI 宿主 | Agent24 Electron 管理 OD headless sidecars，并用 `WebContentsView` 承载 Creative 页面 | 保留单一 main process，隔离两套前端构建/CSS/路由，减少上游 diff |
 | 品牌层 | 通过薄 brand/product adapter 命名为 `Agent24 Creative`（工作名） | Apache-2.0 不授予上游商标权；避免深改核心 UI |
 | 同步策略 | integration branch 只 merge `origin/main`，不强制 rebase；Open Design fork 通过独立 upstream-sync PR 更新 | 适合多人/多 agent 并行，历史可审计 |
@@ -109,6 +110,8 @@ Agent24 Electron main process
 
 ### P0 — 决策冻结与基线（1–2 天）
 
+状态：`COMPLETED`（5.6-SOL final Gate `PASS`）
+
 交付物：
 
 - ADR：产品边界、源码边界、ACP、workspace authority、Electron 宿主方式。
@@ -137,12 +140,14 @@ Agent24 Electron main process
 - 能从干净 clone 复现 web、daemon、packaged/headless 构建。
 - upstream remote 与 pin 可机器校验。
 
-### P2 — Agent24 workspace contract（4–7 天）
+### P2 — Agent24 capability security + workspace contract（8–14 天）
 
 这是后续所有工作的一票否决前置。
 
 建议契约：
 
+- 先实现 A24-OD-00 capability auth：host/user/creative audience、mint/revoke/TTL、资源级过滤和负向测试；
+- 全权 credential 不写入 Creative 可读取的 discovery；packaged Creative 禁止 single-token fallback；
 - 新增 workspace registry：创建、查询、释放/过期。
 - `RunCreate` 接受 `workspace_id`，而不是任意文件路径。
 - workspace 记录至少包含：kind、canonical root、provenance、base revision、writeback policy、lifecycle owner。
@@ -153,6 +158,7 @@ Agent24 Electron main process
 
 验收：
 
+- Creative token 无法审批、grant、shutdown、mint capability、取得 host lease或访问其他 workspace/session/event；
 - 两个并行 run 在不同 workspace 中读写，互不可见。
 - 任意裸路径不能通过公开 run API 获得访问权限。
 - run 取消、失败、daemon 重启不会错误清理另一个 workspace。

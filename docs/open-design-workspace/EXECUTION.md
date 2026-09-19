@@ -131,9 +131,10 @@ Luna 不独立改变已冻结架构。发现规格缺口时必须停止该工作
 
 截至 2026-09-19：
 
-- 计划和依赖已记录；
-- integration branch 已同步到 `origin/main@ef76802`；
-- 尚未开始 P0–P9 实现；
+- 计划已获用户批准并开始执行；
+- integration branch 已审计到 `origin/main@69baf50`；
+- P0 初审发现 single-bearer authority blocker，用户批准 capability 分层方案，最终 SOL Gate 已 `PASS`；
+- 用户要求 capability security layer 完成并通过门禁后再继续其他实现；
 - 尚未创建计划中的实现分支；
 - 尚未创建 Open Design 远端 fork；
-- 等待用户发出明确启动口令。
+- 下一步是创建并实现 `feat/a24-capability-auth`。
