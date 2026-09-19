@@ -14,25 +14,26 @@
 
 **当前执行**：ME-3（进程外领域 OS）专项，目标 v0.5.0。
 
-**当前正在做**：**T8.5c-W-wire 实现**（`_a24/memory/private/*` 三方法 JSON-RPC `Handler`、`map_memory_error` 统一脱敏、`scoped/*` 不注册产出 `-32601`）。设计已于 2026-09-19 冻结并合入（[#221](https://github.com/iDoris-ai/Agent24/pull/221)），代码尚未开工。
+**T8.5c-W-wire 实现已完成**（`DONE` — [#224](https://github.com/iDoris-ai/Agent24/pull/224)+[#225](https://github.com/iDoris-ai/Agent24/pull/225)，2026-09-19；语义说明 [`T8.5c-W-wire.md`](../design/T8.5c-W-wire.md) v5，5 轮设计评审冻结；代码 2 轮 Codex 代码评审——首轮 5 Medium(判据覆盖面问题，未发现生产代码缺陷)，修复后二轮 approve，另发现 1 Low(超时预算 50ms→300ms)已修复）：`Generation::admit_callback_bound`（#224，修复真实 TOCTOU 竞态，单锁内原子完成"准入+取绑定生命周期"）+ `memory_callback.rs` 的 `RememberHandler`/`RecallHandler`/`RecentHandler` 三个 Handler、`map_memory_error` 结构性 default-deny 堵住 `QuotaExceeded` 的 owner/partition key 泄露、`_a24/memory/scoped/*` 不注册产出 `-32601`（#225）。`cargo test --workspace`：1300 passed。**已知覆盖缺口**（Codex 确认风险可接受，留作后续 follow-up）：真实子进程握手验证 `Offer.provides` 包含 memory 能力这条端到端测试未覆盖，不影响生产代码正确性。
+
+至此 **T8.5c-W（mount + wire）整体交付完毕**，ME-3 专项只剩 **T9** 这一道关。
+
+**当前正在做**：**T9（ME-3f 仓外包端到端验收）**——尚未开工。
 
 **ME-3 收口路径（用户 2026-09-19 拍板，按此顺序走）**：
 
 ```
-T8.5c-W-wire 实现  →  T9（ME-3f 仓外包端到端验收）  →  T10（Cos72 进程外样例）
-                   →  T11（Sin90 迁出内核）  →  T12（发布 v0.5.0）
+T9（ME-3f 仓外包端到端验收）  →  T10（Cos72 进程外样例）
+                             →  T11（Sin90 迁出内核）  →  T12（发布 v0.5.0）
 ```
 （T13 `agent24-os-sdk` / T14 wire 文档可与 T9 之后并行。）
 
 **之后**：v0.5.0 发布后回头捡 [`roadmap.md`](roadmap.md) 的 **M1（记忆成为产品）**；`../PLAN.md` / `../ROADMAP.md` 完全作废。
 
-> **探针的已知偏差**：`me3-status.sh` 在 `origin/main`（`ef76802`）上，`3d` / `3e` / `3g` 三行读的是
-> 重构前的旧文件路径与旧符号名，于是 **`3e` 与 `3g` 被误报成「未开工」**——这两刀实际都已合并
-> （3e = [#199](https://github.com/iDoris-ai/Agent24/pull/199)/[#201](https://github.com/iDoris-ai/Agent24/pull/201)/[#203](https://github.com/iDoris-ai/Agent24/pull/203)，2026-09-17；
-> 3g = [#196](https://github.com/iDoris-ai/Agent24/pull/196)，2026-09-16）。
-> 修正后的 `3d` 行读 `os_memory.rs` 的 `pub struct RememberHandler`，**仍报「未开工?」——这是真的**，
-> 它正是 T8.5c-W-wire 还没写的那个 Handler。
-> 探针修复在 [#222](https://github.com/iDoris-ai/Agent24/pull/222)（与本文档是两个独立 PR），合并后重跑即可。
+> **探针的历史偏差记录**（`me3-status.sh` 这一行的"预言过期"已经发生过至少 4 次，这里如实记账，别指望它以后不再发生）：
+> `3e`/`3g` 曾因重构前的旧文件路径/旧符号名被误报"未开工"（3e = [#199](https://github.com/iDoris-ai/Agent24/pull/199)/[#201](https://github.com/iDoris-ai/Agent24/pull/201)/[#203](https://github.com/iDoris-ai/Agent24/pull/203)，2026-09-17；3g = [#196](https://github.com/iDoris-ai/Agent24/pull/196)，2026-09-16），[#222](https://github.com/iDoris-ai/Agent24/pull/222) 修正。
+> `3d` 的占位符号在 #222 里猜测会落在 `os_memory.rs`，T8.5c-W-wire 实际把它放进了新文件 `memory_callback.rs`——连实现落地都还没写完预言就已经猜错路径，[#234](https://github.com/iDoris-ai/Agent24/pull/234) 修正。
+> 修正后重跑 `bash docs/agent/me3-status.sh`：3a-3e/3g 全部正确报"已在 main"，**3f（T9）仍正确报未开工——这是 ME-3 收口前唯一剩下的真实缺口**。
 
 ---
 
@@ -154,7 +155,7 @@ T8.5c-W-wire 实现  →  T9（ME-3f 仓外包端到端验收）  →  T10（Cos
     - **T8.5c-P 分页/游标/资源计费状态机** `DONE` — [#210](https://github.com/iDoris-ai/Agent24/pull/210)+[#211](https://github.com/iDoris-ai/Agent24/pull/211)+[#212](https://github.com/iDoris-ai/Agent24/pull/212)（2026-09-19；语义说明 [`T8.5c-P-pagination-cursor.md`](../design/T8.5c-P-pagination-cursor.md) v4，4 轮 Codex 设计评审——v1 reject(1 Critical+3 High+2 Medium+1 Low)→v2 reject(3 High+3 Medium+2 Low)→v3 reject(1 High+6 Medium+1 Low)→v4 approve-with-followups；代码 3 轮 Codex 代码评审收敛 APPROVE，首轮 1 Medium(判据 9b 手工信号量证明力不够，改真实文件后端 pool+池外独立连接真实占写锁)、二轮 3 Low(sleep 同步不可靠等)全部修复）：为避免一次性提交 2000+ 行的大 PR，实现按依赖顺序拆成 3 个 PR 顺序合并——#210(存储层 `EventLog::scan_stream` 流式扫描)→#211(`RateLimiter` 加权扣费/退款)→#212(核心状态机 `os_memory_page.rs`：cursor=最后一个已解决行、`Reservation`(拥有 `Arc<RateLimiter>` 无生命周期参数满足 `CallFuture: 'static+Send`)、`Needle`/`PageMode` 统一 normalize、跨模块共享 `Arc<Semaphore>` 连接池准入)。`OsScopedMemory::{remember_checked,recall_page,recent_page}` 做成 inherent 方法(显式接收 lifecycle/limiter/admission 参数)——T8.5c v1 的 JSON-RPC Handler/`MemoryEntitlement` 在仓库里完全不存在，mount 层单例创建、真实 wire 接线留给 T8.5c-W。15 条判据全部落成测试。
     - **T8.5c-W 挂载/wire接线/entitlement**——v1 设计文档（`docs/design/T8.5c-W-mount-wire-entitlement.md`，worktree `Agent24-t8.5c-w`）送 1 轮 Codex 设计评审 reject（2 Critical：`Capability::Memory` 没被加进 `KERNEL_OOP_GRANTS`，按设计原样实现功能永远不可达；admission 容量假设 5 个连接，但 ephemeral 模式连接池实际只有 1 个，会让 OOP 调用完全饿死进程内路径，违反 T8.5c-P §12 的 MUST。3 High：catalog 拆分只堵了内存态清单没堵住持久 `last_seen_at` 幽灵刷新；错误脱敏只处理 `QuotaExceeded` 一种、其它底层错误原样透传上 wire——**这个具体缺口（`os_memory.rs:787`）是已合并代码里真实存在的信息泄露 bug，但目前没有任何 JSON-RPC Handler 接线到这几个方法，外部攻击面不可达，不需要单独热修，随 T8.5c-W 一起修**；真实资源竞争判据没进 W 的验收）。Codex 建议按时序分组拆成两份（不是按决策编号逐个拆——W1/W2/W3 共享同一条 `lend→entitlement→supervisor注册→catalog激活` 时序，拆散会漏跨阶段不变式）。2026-09-19 用户拍板采纳，重排为：
       - **T8.5c-W-mount 挂载/entitlement/限流器/catalog** `DONE` — [#216](https://github.com/iDoris-ai/Agent24/pull/216)+[#217](https://github.com/iDoris-ai/Agent24/pull/217)+[#218](https://github.com/iDoris-ai/Agent24/pull/218)（2026-09-19；语义说明 [`T8.5c-W-mount.md`](../design/T8.5c-W-mount.md) v6，6 轮 Codex 设计评审——v1 reject(2 High+3 Medium+1 Low)→v2 reject(1 Critical+3 High+5 Medium)→v3 reject(3 High+4 Medium+2 Low)→v4 reject(1 High+2 Medium+1 Low，首次无 Critical)→v5 reject(1 High，纯口径一致性)→v6 approve/FREEZE；同步把 `T8.5c-P-pagination-cursor.md` 修订到 v5 §13，正式声明 admission MUST 契约排除 ephemeral 单连接池，不是下游文档单方面解释）：`KERNEL_OOP_GRANTS` 加入 `Capability::Memory`；admission `Semaphore` 构造挪进 `KvStore::open`/`open_memory` 内部（ephemeral 结构性不发放 OOP memory 能力，而不是构造一个容量为 0 的死锁 permit）；`OsMemoryCatalog` 拆成 `ensure_recorded`/`mark_mounted` 两阶段，修正 `last_seen_at` 假活跃问题（迁移 0015）。实现按依赖顺序拆 3 个 PR：#216(设计冻结文档本身)→#217(agent24-memory 存储层)→#218(agent24d 挂载接线)。中途 #217 因 `last_seen_at: String→Option<String>` 破坏了 agent24d 里两个既有测试的编译被 `clestons` 打回，修复后 #217 独立合入；#218 rebase 到新 base 上（冲突全部出在同一批测试的改名，保留 #218 自己的 `ensure_recorded`/`mark_mounted` 版本）后重新过 `clestons` 评审收敛。收尾 follow-up `DONE` — [#219](https://github.com/iDoris-ai/Agent24/pull/219)：补 rebase 冲突解决时冲掉的一条回归断言（"已有真实 `last_seen_at` 的分区再次 `ensure_recorded` 不得被重置"）+ 一处过时注释。
-      - **T8.5c-W-wire JSON-RPC Handler/错误映射/scoped 路由**（`_a24/memory/private/*` 三方法 `Handler`、`map_memory_error` 统一脱敏、`scoped/*` 不注册产出 -32601）——依赖已解除，`READY`。mount 冻结/合入过程中产出的 `docs/design/T8.5c-W-mount-wire-entitlement.md`（worktree `Agent24-t8.5c-w`）是拆分前的旧稿（v1，未送审），wire 这半还没有自己的冻结设计，需要重新写。
+      - **T8.5c-W-wire JSON-RPC Handler/错误映射/scoped 路由** `DONE` — [#221](https://github.com/iDoris-ai/Agent24/pull/221)(设计冻结)+[#224](https://github.com/iDoris-ai/Agent24/pull/224)+[#225](https://github.com/iDoris-ai/Agent24/pull/225)（2026-09-19；语义说明 [`T8.5c-W-wire.md`](../design/T8.5c-W-wire.md) v5，5 轮 Codex 设计评审——v1 reject(2 Critical+5 High+2 Medium+2 Low)→v2 reject(1 Critical+4 High+2 Medium+1 Low)→v3 reject(2 High+1 Medium+2 Low，首次无 Critical)→v4 reject(1 High+1 Medium+1 Low)→v5 approve/FREEZE；代码 2 轮 Codex 代码评审——首轮 5 Medium(判据覆盖面，未发现生产代码缺陷)，修复后二轮 approve，另发现 1 Low 已修复）：详见上方"当前正在做"之前的完成记录。旧稿 `T8.5c-W-mount-wire-entitlement.md`（拆分前 v1，未送审）已删除。
     两者设计各自独立评审收敛，实现阶段仍可合一个 PR 交付。
   三轮评审详情见 Codex session `01a0ae9e-79a4-76f1-93c5-b160579de7c5`（`codex resume 01a0ae9e-79a4-76f1-93c5-b160579de7c5` 可续）。
 - **T7 ME-3e 事件 + 审批** —— 设计阶段拆成三块：**T7a**（能力授予接线 + `_a24/events/emit`）`DONE` — [#199](https://github.com/iDoris-ai/Agent24/pull/199)（`147f8bf`，2026-09-17；语义说明 [`T7a-ME3e-grants-and-events.md`](../design/T7a-ME3e-grants-and-events.md) v4，写码前 4 轮设计审查，终审 0 Medium+；代码 1 轮 Codex 代码审查，修复 events 专属资源上限的度量方式）：`Offer`/`Grants`/`MethodsFor` 从「进程外模块永远拿不到能力授予」改成「按 manifest 声明真授予」，交付第一个真实回调方法 `_a24/events/emit`；`dispatch()` 新增对所有方法通用的 params 体积预算（节点数/深度/字符串字节，含 object key）。SPEC §8 的 offer set 阶梯按实际交付顺序补记（Memory 未排期，Events 独立先行）。**T7b**（`gate`/`advise`/`status` 模块审批）`DONE` — [#201](https://github.com/iDoris-ai/Agent24/pull/201)（`a37e9ef`，2026-09-17；语义说明 [`T7b-ME3e-approvals.md`](../design/T7b-ME3e-approvals.md) v6，写码前 5 轮设计审查——前 4 轮针对同步阻塞模型，第 4 轮发现该模型与现有 30 秒 RPC/代理超时冲突，架构改为异步提交+轮询后第 5 轮收敛；代码 1 轮 Codex 代码审查）：`approval_token` 与 `request_id` 同一次 `admit_request` 原子登记；提交按 `(module, request_id, kind)` 幂等去重；`gate` 命中空闭集不消耗令牌；`ModuleApproval` 单一 `decision` 维度 + 周期扫描判定超时（容忍单次存储失败、daemon 重启无需特殊清扫）；REST `/api/v1/module-approvals` + WS `module-approval.{required,resolved}`。`gate` 本轮闭集仍为空，真实执行留给 T7c。**T7c**（`gate` 第一个内核可执行动作：`schedule_callback`）`DONE` — [#203](https://github.com/iDoris-ai/Agent24/pull/203)（`5129c55`+`e0c4c12`，2026-09-17；语义说明 [`T7c-ME3e-gate-execution.md`](../design/T7c-ME3e-gate-execution.md) v3，2 轮设计审查——第 1 轮发现"接 `agent24-scheduler` 引擎"这条路有 4 个 Critical，第 2 轮确认"改成直接扩展 T7b 自己的周期扫描"消除了全部 Critical；代码 2 轮 Codex 代码审查，首轮 1 High(迁移文件未入库)+2 Medium(pre-epoch 时间戳误拒/`executed_at` 泄漏进冻结事件)+3 Low，二轮 APPROVE；合入后外部评审又独立抓到 year≥10000 时间戳字典序比较破口，同 PR 追加 `0..=9999` 年份守卫后合并）：`execute_due_schedule_callbacks` 独立 CAS 扫描；`validate_gate_action`/`canonicalize_schedule_target` 双路（wire/in-process）共用；`ModuleApprovalSubmitted` 专用 WS payload 不含 `executed_at`。T7（a/b/c）三块全部合入 main。
