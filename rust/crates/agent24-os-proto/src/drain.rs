@@ -456,15 +456,55 @@ impl Generation {
     ///
     /// See the table in the module docs.
     pub fn admit_callback(&self, request_id: Option<&str>) -> Result<(), CallbackRefused> {
+        self.admit_callback_bound(request_id).map(|_lifecycle| ())
+    }
+
+    /// The atomic version of [`Self::admit_callback`] +
+    /// [`Self::request_lifecycle`] (T8.5c-W-wire design doc, decision W4b):
+    /// one lock decides BOTH "may this callback proceed?" and "what is the
+    /// lifecycle of the request it is bound to?", so there is no window
+    /// between the two in which a concurrent [`InFlight::finish`] could end
+    /// the request `admit_callback`/`request_lifecycle` each separately
+    /// looked up — a callback a draining generation just admitted because it
+    /// carried a still-in-flight `request_id` could otherwise become
+    /// unbound, uncancellable background work by the time its caller went to
+    /// fetch that lifecycle.
+    ///
+    /// [`Self::admit_callback`]'s **public signature stays unchanged** —
+    /// `_a24/events/emit` (T7a, already merged) keeps calling it exactly as
+    /// before, with no observable difference (its own two-step call/lookup
+    /// window was real but had no observable consequence for a synchronous
+    /// handler — see the design doc's decision W4b). Only its INTERNAL
+    /// implementation now delegates here, so the two never drift into
+    /// separate state machines. A new caller that may run for longer than a
+    /// synchronous handler (`_a24/memory/private/*`) MUST call this method
+    /// directly instead.
+    ///
+    /// # Errors
+    ///
+    /// See [`CallbackRefused`] — identical error semantics to
+    /// [`Self::admit_callback`].
+    pub fn admit_callback_bound(
+        &self,
+        request_id: Option<&str>,
+    ) -> Result<Option<RequestLifecycle>, CallbackRefused> {
         let inner = self.lock();
+        let lifecycle_of = |id: &str| {
+            inner.in_flight.get(id).map(|entry| RequestLifecycle {
+                deadline: entry.deadline,
+                ended: entry.ended.subscribe(),
+            })
+        };
         match inner.state {
             DrainState::Starting => Err(CallbackRefused::NotReady),
-            DrainState::Running => Ok(()),
             DrainState::Revoked => Err(CallbackRefused::Revoked),
+            DrainState::Running => Ok(request_id.and_then(lifecycle_of)),
             DrainState::Draining => match request_id {
                 None => Err(CallbackRefused::DrainingWithoutRequest),
-                Some(id) if inner.in_flight.contains_key(id) => Ok(()),
-                Some(_) => Err(CallbackRefused::DrainingUnknownRequest),
+                Some(id) => match lifecycle_of(id) {
+                    Some(lifecycle) => Ok(Some(lifecycle)),
+                    None => Err(CallbackRefused::DrainingUnknownRequest),
+                },
             },
         }
     }
@@ -1132,6 +1172,106 @@ mod tests {
         );
         // SPEC §8: *"drain 超时的在途请求返回 503(不假装成功)"*.
         assert_eq!(a.finish(), Err(Abandoned { dispatched: false }));
+    }
+
+    // ── T8.5c-W-wire decision W4b: `admit_callback_bound` ──────────────
+
+    /// Every branch [`Generation::admit_callback`] has, `admit_callback_bound`
+    /// must agree with exactly (this is the "no drift" half of decision
+    /// W4b) — driven directly rather than only through the delegating
+    /// `admit_callback`, so a future change that breaks the delegation still
+    /// fails a test that names `admit_callback_bound` itself.
+    #[test]
+    fn admit_callback_bound_agrees_with_admit_callback_on_every_branch() {
+        let starting = Generation::starting();
+        assert_eq!(
+            starting.admit_callback_bound(None).unwrap_err(),
+            CallbackRefused::NotReady
+        );
+
+        let g = running();
+        // Running, no request_id: admitted, no lifecycle to report.
+        assert!(g.admit_callback_bound(None).unwrap().is_none());
+
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        // Running, a real in-flight id: admitted, WITH its lifecycle.
+        assert!(
+            g.admit_callback_bound(Some("a")).unwrap().is_some(),
+            "Running + a real in-flight id must hand back a lifecycle, not just Ok"
+        );
+        // Running, an id that was never admitted: still admitted (Running
+        // does not check `in_flight` at all — matches `admit_callback`'s
+        // existing `DrainState::Running => Ok(())` branch), but there is no
+        // lifecycle to report.
+        assert!(g.admit_callback_bound(Some("ghost")).unwrap().is_none());
+
+        assert!(g.begin_drain(Instant::now(), GRACE));
+        assert_eq!(
+            g.admit_callback_bound(None).unwrap_err(),
+            CallbackRefused::DrainingWithoutRequest
+        );
+        assert_eq!(
+            g.admit_callback_bound(Some("ghost")).unwrap_err(),
+            CallbackRefused::DrainingUnknownRequest
+        );
+        assert!(
+            g.admit_callback_bound(Some("a")).unwrap().is_some(),
+            "Draining + a still-in-flight id must admit AND hand back its lifecycle \
+             — the exact case decision W4b closes the race window on"
+        );
+
+        let r = g.revoke().unwrap();
+        assert_eq!(
+            g.admit_callback_bound(Some("a")).unwrap_err(),
+            CallbackRefused::Revoked
+        );
+        assert_eq!(
+            g.admit_callback_bound(None).unwrap_err(),
+            CallbackRefused::Revoked
+        );
+        drop(r);
+        let _ = a.finish();
+    }
+
+    /// Decision W4b's actual point: `admit_callback` and
+    /// `admit_callback_bound` must be looking at the SAME lock acquisition,
+    /// not two independent ones — the original Critical was a real window
+    /// between two separate locks, not a hypothetical one. This does not
+    /// prove the absence of a race directly (that is what the code review's
+    /// job is, and what "one `self.lock()` call, one match" in the
+    /// implementation itself guarantees structurally) — it pins the
+    /// observable CONTRACT `admit_callback` promises callers of the old,
+    /// still-public method: delegating to `admit_callback_bound` must not
+    /// change `_a24/events/emit`'s existing behaviour at all.
+    #[test]
+    fn admit_callback_still_returns_ok_or_err_unit_exactly_as_before() {
+        let g = running();
+        assert_eq!(g.admit_callback(None), Ok(()));
+        let a = g
+            .admit_request(
+                "a".into(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(g.admit_callback(Some("a")), Ok(()));
+        assert!(g.begin_drain(Instant::now(), GRACE));
+        assert_eq!(g.admit_callback(Some("a")), Ok(()));
+        assert_eq!(
+            g.admit_callback(None),
+            Err(CallbackRefused::DrainingWithoutRequest)
+        );
+        let _ = g.revoke();
+        assert_eq!(g.admit_callback(Some("a")), Err(CallbackRefused::Revoked));
+        let _ = a.finish();
     }
 
     /// The drain ends at whichever comes first: in-flight reaching zero, or the

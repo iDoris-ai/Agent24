@@ -168,7 +168,7 @@ probe "3b-3 进程监督"            rust/crates/agent24-os-proto/src/supervisor
 probe "3b-4 受约束代理"          rust/crates/agent24-os-proto/src/proxy.rs       "pub fn proxy_router"
 probe "3b-5 两阶段热 disable"    rust/crates/agent24-os-proto/src/drain.rs       "pub enum DrainState"
 probe "3c   回调通道其余部分"    rust/crates/agent24-os-proto/src/rpc.rs         "pub fn dispatch"
-probe "3d   记忆回调"            rust/apps/agent24d/src/os_memory.rs             "pub struct RememberHandler"
+probe "3d   记忆回调"            rust/apps/agent24d/src/memory_callback.rs       "pub struct RememberHandler"
 probe "3e   事件 + 审批"         rust/apps/agent24d/src/module_approvals.rs      "pub async fn decide_module_approval"
 probe "3f   仓外包端到端"        rust/apps/agent24d/tests/me3f_blackbox.rs       "fn a_package_from_outside_the_repo"
 probe "3g   启用路径准入"        rust/apps/agent24d/src/os_routes.rs             "fn admission_refused_response"
