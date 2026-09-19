@@ -379,9 +379,11 @@ impl OsMemoryCatalog {
     /// site allowed to advance the durable `last_seen_at` signal.
     ///
     /// Idempotent by the partition's physical `key` (T8.5c-W-mount M2): a
-    /// second call for the same partition adds nothing to this run's
-    /// inventory and only re-touches an already-fresh durable timestamp
-    /// (harmless).
+    /// second call for the same partition within this run returns
+    /// immediately — it neither adds a second entry to this run's inventory
+    /// nor touches the durable timestamp again (the implementation below
+    /// checks `self.partitions` and returns before doing either; it does
+    /// NOT fall through to a harmless re-touch).
     pub async fn mark_mounted(
         &mut self,
         partition: OsMemoryPartition,

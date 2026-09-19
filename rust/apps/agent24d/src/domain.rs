@@ -1432,11 +1432,16 @@ async fn mount_package(
         let _memory_entitlement = memory_entitlement.clone();
         Arc::new(
             move |generation: &Arc<agent24_os_proto::drain::Generation>| {
-                // Capturing `_memory_entitlement` into this generation-scoped
-                // closure body (not just the outer one) is what makes it
-                // survive as long as the `Arc<dyn Fn>` this whole block
-                // builds does — i.e. for the module's entire supervised
-                // lifetime, not just until this block finishes running.
+                // This inner clone itself only lives to the end of THIS
+                // `MethodsFor` call — the returned `Methods` does not carry
+                // it anywhere. What actually persists across restarts is the
+                // OUTER `_memory_entitlement` binding above: it is captured
+                // by THIS `move` closure once, and the closure itself
+                // (`Arc<dyn Fn>`) is what the supervisor loop holds for the
+                // module's whole supervised lifetime, calling it once per
+                // generation. A future `_a24/memory/private/*` `Handler`
+                // reads from a clone made HERE, inside the closure body —
+                // this line is where that will happen.
                 let _memory_entitlement = _memory_entitlement.clone();
                 // A fresh bucket every time this closure runs — once per
                 // generation, i.e. once per (re)start. Building it outside the
