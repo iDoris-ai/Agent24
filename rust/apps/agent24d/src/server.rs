@@ -628,24 +628,86 @@ async fn fallback() -> Response {
 /// This note lives beside the auth middleware rather than beside the proxy
 /// because the person adding such a header is reading this file
 /// (SPEC-ME3-OUT-OF-PROCESS §2.1).
-async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
+async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
     }
-    let authorized = req
+    let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()));
-    if authorized {
-        next.run(req).await
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match state.auth_mode {
+        AuthMode::LegacySingleToken => {
+            if bearer.is_some_and(|presented| {
+                constant_time_eq(presented.as_bytes(), state.token.as_bytes())
+            }) {
+                next.run(req).await
+            } else {
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                )
+            }
+        }
+        AuthMode::Capabilities => {
+            let Some(store) = state.capabilities.as_ref() else {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "host_authority_unavailable",
+                    "Capability authority unavailable",
+                );
+            };
+            let Some(bearer) = bearer else {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                );
+            };
+            let operation = required_operation(req.method(), req.uri().path());
+            match store.validate_bearer(
+                bearer,
+                operation,
+                &crate::capabilities::Resource::global(),
+                crate::capabilities::unix_now(),
+            ) {
+                Ok(authorization) => {
+                    req.extensions_mut().insert(authorization);
+                    next.run(req).await
+                }
+                Err(
+                    crate::capabilities::CapabilityError::OperationDenied
+                    | crate::capabilities::CapabilityError::ResourceDenied
+                    | crate::capabilities::CapabilityError::HostRequired,
+                ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
+                Err(_) => error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                ),
+            }
+        }
+    }
+}
+
+/// Capability policy is deliberately closed. Until durable workspace/session
+/// ownership lands, Creative can use only the global model catalogue. Every
+/// other existing or future route maps to a host-only operation by default.
+fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
+    use crate::capabilities::Operation;
+    if method == Method::GET && path == "/api/v1/models" {
+        Operation::ModelsRead
+    } else if method == Method::POST && path == "/api/v1/capabilities/creative" {
+        Operation::CapabilityMint
+    } else if method == Method::POST
+        && path.starts_with("/api/v1/capabilities/")
+        && path.ends_with("/revoke")
+    {
+        Operation::CapabilityRevoke
     } else {
-        error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        )
+        Operation::ModelsAdmin
     }
 }
 
