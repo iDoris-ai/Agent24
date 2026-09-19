@@ -281,6 +281,90 @@ pub fn decode_event(bytes: &[u8]) -> Result<Event, ProtocolError> {
     Ok(event)
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    fn launch(id: u64) -> Request {
+        Request::Launch {
+            version: 1,
+            request_id: id,
+            executable: "/opt/sidecar".into(),
+            cwd: "/tmp/sidecar".into(),
+            argv: vec![],
+            env: [("A", "value with spaces")]
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn golden_request_and_ready_frames() {
+        let request = launch(1);
+        let bytes = encode_request(&request, false, None).unwrap();
+        assert_eq!(bytes, br#"{"type":"launch","version":1,"request_id":1,"executable":"/opt/sidecar","cwd":"/tmp/sidecar","argv":[],"env":{"A":"value with spaces"}}
+"#);
+        assert_eq!(decode_request(&bytes, false, None), Ok(request));
+        let ready = Event::Ready {
+            protocol: 1,
+            port: 8080,
+            token: "t".repeat(32),
+            version: "target-1".into(),
+        };
+        let encoded = encode_event(&ready).unwrap();
+        assert_eq!(decode_event(&encoded), Ok(ready));
+    }
+
+    #[test]
+    fn adversarial_frames_fail_closed_without_echoing() {
+        assert_eq!(
+            decode_reply(br#"{"type":"result","version":1,"request_id":1}"#),
+            Err(ProtocolError::MissingNewline)
+        );
+        assert_eq!(
+            decode_reply(
+                br#"{"type":"result","version":1,"request_id":1}
+{"type":"result","version":1,"request_id":2}
+"#
+            ),
+            Err(ProtocolError::TrailingData)
+        );
+        assert_eq!(
+            decode_reply(
+                br#"{"type":"result","version":1,"request_id":1,"raw":"bad"}
+"#
+            ),
+            Err(ProtocolError::InvalidJson)
+        );
+        assert_eq!(
+            decode_reply(&vec![b' '; MAX_CONTROL_FRAME_BYTES + 1]),
+            Err(ProtocolError::TooLarge)
+        );
+        let padded = format!(
+            r#"{{"type":"ready","protocol":1,"port":1,"token":"{}","version":"v"}}{}
+"#,
+            "t".repeat(32),
+            " ".repeat(MAX_TARGET_READY_FRAME_BYTES)
+        );
+        assert_eq!(
+            decode_event(padded.as_bytes()),
+            Err(ProtocolError::TooLarge)
+        );
+        let token = "secret-token".repeat(4);
+        assert!(!format!("{}", ProtocolError::InvalidMessage).contains(&token));
+        assert_eq!(
+            validate_request(&launch(0), false, None),
+            Err(ProtocolError::InvalidMessage)
+        );
+        assert_eq!(
+            validate_request(&launch(1), true, Some(1)),
+            Err(ProtocolError::WrongSequence)
+        );
+    }
+}
+
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
