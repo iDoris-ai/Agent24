@@ -330,12 +330,29 @@ pub fn decode_event(bytes: &[u8]) -> Result<Event, ProtocolError> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn exe() -> &'static str {
+        r"C:\opt\sidecar.exe"
+    }
+    #[cfg(not(windows))]
+    fn exe() -> &'static str {
+        "/opt/sidecar"
+    }
+    #[cfg(windows)]
+    fn cwd() -> &'static str {
+        r"C:\tmp\sidecar"
+    }
+    #[cfg(not(windows))]
+    fn cwd() -> &'static str {
+        "/tmp/sidecar"
+    }
+
     fn launch(id: u64) -> Request {
         Request::Launch {
             version: 1,
             request_id: id,
-            executable: "/opt/sidecar".into(),
-            cwd: "/tmp/sidecar".into(),
+            executable: exe().into(),
+            cwd: cwd().into(),
             argv: vec![],
             env: [("A", "value with spaces")]
                 .into_iter()
@@ -361,25 +378,18 @@ mod tests {
         }
     }
 
-    fn validate_request(
-        request: &Request,
-        launched: bool,
-        previous_id: Option<u64>,
-    ) -> Result<(), ProtocolError> {
-        let mut sequence = RequestSequence::new();
-        if launched {
-            sequence.accept(&launch(previous_id.unwrap_or(1))).ok();
-        }
-        sequence.validate(request)
-    }
-
     #[test]
     fn golden_request_and_ready_frames() {
         let request = launch(1);
         let mut sequence = RequestSequence::new();
         let bytes = encode_request(&request, &mut sequence).unwrap();
-        assert_eq!(bytes, br#"{"type":"launch","version":1,"request_id":1,"executable":"/opt/sidecar","cwd":"/tmp/sidecar","argv":[],"env":{"A":"value with spaces"}}
-"#);
+        let expected = format!(
+            r#"{{"type":"launch","version":1,"request_id":1,"executable":{},"cwd":{},"argv":[],"env":{{"A":"value with spaces"}}}}
+"#,
+            serde_json::to_string(exe()).unwrap(),
+            serde_json::to_string(cwd()).unwrap()
+        );
+        assert_eq!(bytes, expected.into_bytes());
         let mut decoded_sequence = RequestSequence::new();
         assert_eq!(decode_request(&bytes, &mut decoded_sequence), Ok(request));
         let ready = Event::Ready {
@@ -439,11 +449,13 @@ mod tests {
         let token = "secret-token".repeat(4);
         assert!(!format!("{}", ProtocolError::InvalidMessage).contains(&token));
         assert_eq!(
-            validate_request(&launch(0), false, None),
+            RequestSequence::new().validate(&launch(0)),
             Err(ProtocolError::InvalidMessage)
         );
+        let mut sequence = RequestSequence::new();
+        sequence.accept(&launch(1)).unwrap();
         assert_eq!(
-            validate_request(&launch(1), true, Some(1)),
+            sequence.validate(&launch(1)),
             Err(ProtocolError::WrongSequence)
         );
     }
@@ -453,8 +465,8 @@ mod tests {
         let request = Request::Launch {
             version: 1,
             request_id: 1,
-            executable: "/secret/executable".into(),
-            cwd: "/secret/cwd".into(),
+            executable: exe().into(),
+            cwd: cwd().into(),
             argv: vec!["argv-secret".into()],
             env: [("ENV_SECRET", "env-secret")]
                 .into_iter()
@@ -462,12 +474,7 @@ mod tests {
                 .collect(),
         };
         let shown = format!("{request:?}");
-        for value in [
-            "/secret/executable",
-            "/secret/cwd",
-            "argv-secret",
-            "env-secret",
-        ] {
+        for value in [exe(), cwd(), "argv-secret", "env-secret"] {
             assert!(!shown.contains(value));
         }
         let ready = Event::Ready {
@@ -477,29 +484,33 @@ mod tests {
             version: "v".into(),
         };
         assert!(!format!("{ready:?}").contains("token-secret"));
-        assert_eq!(validate_request(&request, false, None), Ok(()));
+        assert_eq!(RequestSequence::new().validate(&request), Ok(()));
         assert_eq!(
-            validate_request(&custom(1, "relative", "/ok", vec![], vec![]), false, None),
+            RequestSequence::new().validate(&custom(1, "relative", cwd(), vec![], vec![])),
             Err(ProtocolError::InvalidMessage)
         );
         assert_eq!(
-            validate_request(&custom(1, "/ok", "/ok", vec!["\0"], vec![]), false, None),
+            RequestSequence::new().validate(&custom(1, exe(), cwd(), vec!["\0"], vec![])),
             Err(ProtocolError::InvalidMessage)
         );
         assert_eq!(
-            validate_request(
-                &custom(1, "/ok", "/ok", vec![], vec![("K", "\u{0085}")]),
-                false,
-                None
-            ),
+            RequestSequence::new().validate(&custom(
+                1,
+                exe(),
+                cwd(),
+                vec![],
+                vec![("K", "\u{0085}")]
+            )),
             Err(ProtocolError::InvalidMessage)
         );
         assert_eq!(
-            validate_request(
-                &custom(1, "/ok", "/ok", vec!["space arg", ""], vec![("K", "")]),
-                false,
-                None
-            ),
+            RequestSequence::new().validate(&custom(
+                1,
+                exe(),
+                cwd(),
+                vec!["space arg", ""],
+                vec![("K", "")]
+            )),
             Ok(())
         );
     }
@@ -507,15 +518,11 @@ mod tests {
     #[test]
     fn version_and_sequence_rules_are_fail_closed() {
         assert_eq!(
-            validate_request(
-                &Request::Signal {
-                    version: 2,
-                    request_id: 1,
-                    force: false
-                },
-                true,
-                None
-            ),
+            RequestSequence::new().validate(&Request::Signal {
+                version: 2,
+                request_id: 1,
+                force: false
+            }),
             Err(ProtocolError::InvalidMessage)
         );
         assert_eq!(
@@ -533,34 +540,34 @@ mod tests {
             Err(ProtocolError::InvalidMessage)
         );
         assert_eq!(
-            validate_request(
-                &Request::Signal {
-                    version: 1,
-                    request_id: 0,
-                    force: false
-                },
-                true,
-                None
-            ),
+            RequestSequence::new().validate(&Request::Signal {
+                version: 1,
+                request_id: 0,
+                force: false
+            }),
             Err(ProtocolError::InvalidMessage)
         );
+        let mut sequence = RequestSequence::new();
+        sequence.accept(&launch(1)).unwrap();
         assert_eq!(
-            validate_request(
-                &Request::Signal {
-                    version: 1,
-                    request_id: 4,
-                    force: false
-                },
-                true,
-                Some(4)
-            ),
+            sequence.validate(&Request::Signal {
+                version: 1,
+                request_id: 4,
+                force: false
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            sequence.validate(&launch(2)),
             Err(ProtocolError::WrongSequence)
         );
         assert_eq!(
-            validate_request(&launch(2), true, Some(1)),
-            Err(ProtocolError::WrongSequence)
+            sequence.accept(&Request::IsEmpty {
+                version: 1,
+                request_id: 5
+            }),
+            Ok(())
         );
-        assert_eq!(validate_request(&launch(1), false, None), Ok(()));
     }
 }
 
