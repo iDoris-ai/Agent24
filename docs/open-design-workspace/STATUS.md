@@ -1,6 +1,6 @@
 # Agent24 × Open Design 执行状态
 
-> 更新：2026-09-19（Asia/Bangkok）
+> 更新：2026-09-20（Asia/Bangkok）
 
 ## 阶段门禁
 
@@ -9,7 +9,8 @@
 | P0 设计冻结 | PASS | ADR-001～005、依赖台账、风险与兼容矩阵已冻结并通过 SOL review |
 | A24-OD-00 capability 安全前置 | PASS（待逐层合并） | SOL 无 blocker/high；全量 Agent24/协议/CLI 测试及私有 ready-pipe 烟测通过 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
-| P2 workspace contract | IN PROGRESS | 从 A24-OD-01 opaque registry 的最小类型层开始 |
+| P2 workspace contract | IN PROGRESS | A24-OD-01 types + SQLite schema 已通过 SOL；store API 正在设计 |
+| A24-OD-05 sidecar foundation | IN REVIEW | #253/#254/#255/#259/#260；未接线，正在做第二轮 SOL review |
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 `outdated_cli / incompatible opencode args` 失败，随后停滞，需要 bounded SIGINT。
@@ -60,3 +61,12 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - workspace/session/run/events/approval 均保持 Creative default deny；
 - A24-OD-01 与 A24-OD-02 必须共同消费 ADR-002，不能各自发明字段；
 - 所有实现继续按功能拆分，PR 默认不超过约 200 changed lines。
+
+## A24-OD-01 已通过切片
+
+- protocol types：#245（199 行）与 #246（104 行），final `814bb9c`，SOL `PASS`；
+- SQLite schema：#248/#249/#250/#251/#252/#256/#257/#258，分别为
+  163/172/151/95/103/167/81/165 changed lines；
+- schema final：`1167301d67b4940c7a68db64a06ee94454583297`，SOL 无 blocker/high/medium；
+- 已验证 canonical timestamp、精确 7 天/90 秒边界、typed counters、真实 v6→v7 upgrade、root identity 与 lease/state 约束；
+- 下一切片只实现 store/repository API，不提前加入 A24-OD-02 的 run/session 字段。

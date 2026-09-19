@@ -8,7 +8,9 @@
 >
 > 初始基线：Agent24 `04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
 >
-> 已同步主干：Agent24 `69baf50d62e6e3db5ca41a8882d35deb45ea3454`
+> 已合并主干：Agent24 `0495b5c70ac1a913a9cd04bdf24a1fc1f8809974`
+>
+> 已审计最新主干：Agent24 `9dfe91a0b66d2715e59dcda150ad2437b93d2bc9`（仅文档变化，待下一集成切片显式 merge）
 
 ## 1. 目标与非目标
 
