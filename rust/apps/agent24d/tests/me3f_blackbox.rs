@@ -227,11 +227,17 @@ struct Running(std::process::Child);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let pid = self.0.id();
-        if Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .is_ok_and(|s| s.success())
+        // A direct signal call, not `Command::new("kill")`: that shells out
+        // to a PATH-found binary, and its own launch failure was silently
+        // swallowed by the old `.status().is_ok_and(...)` check — degrading
+        // straight to the SIGKILL fallback below on any environment missing
+        // (or slow to launch) a `kill` executable, defeating the entire
+        // point of this Drop (Codex review). `rustix` is already a direct
+        // dependency of this crate and is what the daemon's own supervisor
+        // uses for the identical signal (`agent24_os_proto::supervisor`).
+        #[allow(clippy::cast_possible_wrap)]
+        if let Some(pid) = rustix::process::Pid::from_raw(self.0.id() as i32)
+            && rustix::process::kill_process(pid, rustix::process::Signal::Term).is_ok()
         {
             let by = Instant::now() + Duration::from_secs(10);
             while self.0.try_wait().is_ok_and(|s| s.is_none()) && Instant::now() < by {
@@ -269,14 +275,17 @@ impl Daemon {
 /// build` here or anywhere else in this file. Matches `daemon_modules.rs`'s
 /// `start`.
 ///
-/// The `Child` is wrapped into `Running` IMMEDIATELY after a successful
-/// `spawn()` — before the readiness wait below, which can itself panic on a
-/// timeout or malformed ready line. A bare `std::process::Child` dropped by
-/// an early panic here is NOT terminated (dropping a `Child` is a no-op on
-/// the OS process); wrapping first means that panic still unwinds through
-/// `Running`'s `Drop` and the daemon (and anything it had already spawned)
-/// gets the same graceful-then-SIGKILL cleanup as every other exit path
-/// (Codex review).
+/// The `Child` is wrapped into `Running` right after `spawn()` — before the
+/// readiness wait below, which can itself panic on a timeout or malformed
+/// ready line. (The two `.take().unwrap()` calls for the piped stdout/stderr
+/// handles happen first: they cannot fail on handles this function itself
+/// just configured as piped, so they are not the kind of panic this
+/// ordering is defending against — Codex review.) A bare
+/// `std::process::Child` dropped by an early panic is NOT terminated
+/// (dropping a `Child` is a no-op on the OS process); wrapping before the
+/// readiness wait means a timeout or bad ready line still unwinds through
+/// `Running`'s `Drop` and gets the same graceful-then-SIGKILL cleanup as
+/// every other exit path.
 fn start(home: &Path) -> Daemon {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
         .env_clear()
