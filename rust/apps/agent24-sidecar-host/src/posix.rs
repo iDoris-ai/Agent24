@@ -7,10 +7,13 @@ use nix::{
 };
 use std::os::unix::process::CommandExt;
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     io,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -19,6 +22,7 @@ use std::{
 const LEADER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const GROUP_EMPTY_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL: Duration = Duration::from_millis(10);
+const REAPER_QUEUE_CAPACITY: usize = 64;
 
 /// Inputs for one helper generation. The owner, not the caller, chooses the
 /// process group: the child becomes the group leader before it can exec.
@@ -102,7 +106,7 @@ impl std::error::Error for StopError {
 /// is deciding whether graceful termination was sufficient.
 #[derive(Debug)]
 pub struct OwnedGeneration {
-    child: Child,
+    child: Option<Child>,
     group: Pid,
     phase: Phase,
     status: Option<ExitStatus>,
@@ -123,6 +127,8 @@ impl OwnedGeneration {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command.process_group(0);
+        let reaper = global_reaper();
+        reaper.start()?;
         let child = command.spawn()?;
         let leader = i32::try_from(child.id()).map_err(|_| {
             io::Error::new(
@@ -131,7 +137,7 @@ impl OwnedGeneration {
             )
         })?;
         Ok(Self {
-            child,
+            child: Some(child),
             group: Pid::from_raw(leader),
             phase: Phase::Running,
             status: None,
@@ -246,8 +252,19 @@ impl OwnedGeneration {
     fn reap_bounded(&mut self, limit: Duration) -> Result<ExitStatus, StopError> {
         let deadline = Instant::now() + limit;
         loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
+            match self
+                .child
+                .as_mut()
+                .ok_or_else(|| StopError::Retryable {
+                    operation: "reap leader",
+                    source: io::Error::other("owned child handle is missing"),
+                })?
+                .try_wait()
+            {
+                Ok(Some(status)) => {
+                    self.child = None;
+                    return Ok(status);
+                }
                 Ok(None) if Instant::now() < deadline => std::thread::sleep(EXIT_POLL),
                 Ok(None) => {
                     return Err(StopError::Retryable {
@@ -299,9 +316,124 @@ impl Drop for OwnedGeneration {
             // Reuse the ownership-safe signal path so macOS EPERM is only
             // accepted after WNOWAIT confirms this leader has exited.
             let _ = self.signal(Signal::SIGKILL, Phase::ForceKillRequested);
+            if let Some(child) = self.child.take() {
+                global_reaper().enqueue(child);
+            }
         }
     }
 }
+
+struct ReapJob {
+    child: Option<Child>,
+}
+
+impl ReapJob {
+    fn reap_once(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait();
+            self.child = None;
+        }
+    }
+}
+
+struct ReaperState {
+    queue: VecDeque<ReapJob>,
+    worker_started: bool,
+}
+
+struct Reaper {
+    state: Mutex<ReaperState>,
+    available: Condvar,
+}
+
+impl Reaper {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ReaperState {
+                queue: VecDeque::with_capacity(REAPER_QUEUE_CAPACITY),
+                worker_started: false,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn start(self: &Arc<Self>) -> io::Result<()> {
+        let mut state = recover_lock(self.state.lock());
+        if state.worker_started {
+            return Ok(());
+        }
+        state.worker_started = true;
+        let worker = Arc::clone(self);
+        if let Err(error) = thread::Builder::new()
+            .name("agent24-sidecar-reaper".to_owned())
+            .spawn(move || worker.run())
+        {
+            state.worker_started = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn enqueue(self: &Arc<Self>, child: Child) {
+        // The queue is deliberately bounded. Waiting for one slot is
+        // backpressure, but never drops the exact Child handle on overflow.
+        let mut state = recover_lock(self.state.lock());
+        let mut child = Some(child);
+        while state.queue.len() >= REAPER_QUEUE_CAPACITY {
+            state = recover_lock(self.available.wait(state));
+        }
+        if let Some(child) = child.take() {
+            state.queue.push_back(ReapJob { child: Some(child) });
+            self.available.notify_one();
+        }
+    }
+
+    fn run(self: Arc<Self>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop()));
+        let mut state = recover_lock(self.state.lock());
+        state.worker_started = false;
+        self.available.notify_all();
+    }
+
+    fn run_loop(&self) {
+        loop {
+            let mut job = {
+                let mut state = recover_lock(self.state.lock());
+                while state.queue.is_empty() {
+                    state = recover_lock(self.available.wait(state));
+                }
+                let job = state.queue.pop_front();
+                self.available.notify_all();
+                match job {
+                    Some(job) => job,
+                    None => continue,
+                }
+            };
+            // Keep the Child in `job` across a panic, then retry. The worker
+            // itself is detached and remains alive for the host lifetime.
+            loop {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.reap_once()))
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn recover_lock<T>(result: std::sync::LockResult<T>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn global_reaper() -> Arc<Reaper> {
+    REAPER.get_or_init(|| Arc::new(Reaper::new())).clone()
+}
+
+static REAPER: OnceLock<Arc<Reaper>> = OnceLock::new();
 
 fn invalid_state(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -378,6 +510,38 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(100),
             "Drop unexpectedly waited for the child"
         );
+    }
+
+    #[test]
+    fn drop_is_reaped_by_the_long_lived_global_worker() {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+        let generation = sleeping_generation();
+        let pid = match generation.child.as_ref() {
+            Some(child) => child.id(),
+            None => panic!("generation lost its child before drop"),
+        };
+        let started = Instant::now();
+        drop(generation);
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let pid = match i32::try_from(pid).ok().and_then(Pid::from_raw) {
+            Some(pid) => pid,
+            None => panic!("child pid does not fit POSIX pid_t"),
+        };
+        let flags = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match waitid(WaitId::Pid(pid), flags) {
+                Err(error) if error == rustix::io::Errno::CHILD => break,
+                Err(error) if error == rustix::io::Errno::INTR => {}
+                Ok(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(_) => panic!("global worker did not reap child before deadline"),
+                Err(error) => panic!("waitid: {error}"),
+            }
+        }
     }
 
     #[test]
