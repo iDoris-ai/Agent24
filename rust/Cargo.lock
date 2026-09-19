@@ -246,6 +246,7 @@ version = "0.3.0"
 dependencies = [
  "agent24-core",
  "agent24-protocol",
+ "chrono",
  "serde",
  "serde_json",
  "sha2",
