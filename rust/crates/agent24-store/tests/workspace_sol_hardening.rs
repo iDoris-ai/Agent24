@@ -106,7 +106,15 @@ async fn every_timestamp_round_trips_and_workspace_ttl_is_bounded() {
 async fn counters_require_integer_values_in_the_safe_range() {
     let store = Store::open_memory().await.unwrap();
     workspace(&store, Some(ID), CREATED, EXPIRES).await.unwrap();
-    for value in ["abc", "9223372036854775808"] {
+    assert!(
+        sqlx::query("UPDATE workspaces SET revision = ? WHERE id = ?")
+            .bind(i64::MAX)
+            .bind(ID)
+            .execute(test_hooks::pool(&store))
+            .await
+            .is_ok()
+    );
+    for value in ["abc", "1.5", "9223372036854775808"] {
         assert!(
             sqlx::query("UPDATE workspaces SET revision = ? WHERE id = ?")
                 .bind(value)
@@ -116,7 +124,13 @@ async fn counters_require_integer_values_in_the_safe_range() {
                 .is_err()
         );
     }
-    for value in ["abc", "-1"] {
+    sqlx::query("UPDATE workspaces SET state = 'releasing', quarantine_root = '/counter-q', cleanup_attempts = 1, cleanup_last_attempt_at = ? WHERE id = ?")
+        .bind(CREATED)
+        .bind(ID)
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    for value in ["abc", "1.5", "-1", "9223372036854775808"] {
         assert!(
             sqlx::query("UPDATE workspaces SET cleanup_attempts = ? WHERE id = ?")
                 .bind(value)
@@ -126,4 +140,28 @@ async fn counters_require_integer_values_in_the_safe_range() {
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn workspace_exact_seven_day_millisecond_bound_is_enforced() {
+    let exact = Store::open_memory().await.unwrap();
+    workspace(
+        &exact,
+        Some(ID),
+        "2026-09-19T00:00:00.999Z",
+        "2026-09-26T00:00:00.999Z",
+    )
+    .await
+    .unwrap();
+    let over = Store::open_memory().await.unwrap();
+    assert!(
+        workspace(
+            &over,
+            Some(ID),
+            "2026-09-19T00:00:00.999Z",
+            "2026-09-26T00:00:01.000Z",
+        )
+        .await
+        .is_err()
+    );
 }
