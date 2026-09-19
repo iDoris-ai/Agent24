@@ -1,6 +1,6 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 registry models SOL passed, CREATE implementing / A24-OD-05 host protocol SOL passed, platform owners implementing
+> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 CREATE SOL passed, GET designing / A24-OD-05 host protocol SOL passed, platform owners implementing
 >
 > 日期：2026-09-19
 >
@@ -56,7 +56,7 @@
 
 ### A24-OD-01 — Opaque workspace registry
 
-状态：`IN_PROGRESS / REGISTRY MODELS SOL PASS / CREATE IMPLEMENTING`
+状态：`IN_PROGRESS / REGISTRY CREATE SOL PASS / GET DESIGNING`
 
 目标分支：`feat/a24-workspace-registry`
 
