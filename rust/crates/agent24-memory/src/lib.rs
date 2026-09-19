@@ -500,18 +500,30 @@ impl KvStore {
     /// [`record_os_partition`](Self::record_os_partition) deliberately does
     /// not. For a row whose `last_seen_at` was `NULL`, this is the first real
     /// value it ever receives.
+    ///
+    /// `Err` if no row matched `owner_key` — a caller asking to advance a
+    /// row that is not there is not the same fact as "advanced it", and
+    /// `Ok(())` on zero rows affected would let that difference disappear
+    /// silently (the caller, `OsMemoryCatalog::mark_mounted`, relies on this
+    /// to decide whether to warn rather than assume the touch landed).
     pub async fn touch_os_partition_last_seen(
         &self,
         owner_key: &str,
         clock: &dyn Clock,
     ) -> Result<()> {
-        sqlx::query("UPDATE mem_os_partitions SET last_seen_at = ? WHERE owner_key = ?")
+        let res = sqlx::query("UPDATE mem_os_partitions SET last_seen_at = ? WHERE owner_key = ?")
             .bind(agent24_core::util::iso8601_from_epoch_secs(
                 clock.now_epoch_secs(),
             ))
             .bind(owner_key)
             .execute(&self.pool)
             .await?;
+        if res.rows_affected() == 0 {
+            return Err(MemoryError::NotFound(format!(
+                "memory partition {owner_key:?} has no recorded row to touch — \
+                 ensure_recorded must run before mark_mounted for it"
+            )));
+        }
         Ok(())
     }
 
@@ -1295,9 +1307,31 @@ mod tests {
             .unwrap();
         let by_index_name =
             |name: &str| indexes.iter().find(|r| r.get::<String, _>("name") == name);
-        assert!(
-            by_index_name("mem_os_partitions_user").is_some(),
-            "the provenance lookup index must survive the rebuild"
+        // `index_list` alone only proves an index by that NAME exists — it
+        // says nothing about which column(s) it actually covers or whether
+        // it is unique. `index_info` is what closes that gap: a rebuild
+        // that accidentally built `mem_os_partitions_user` on the wrong
+        // column, or made it UNIQUE, or built the space index on the wrong
+        // column set, would still pass a name-only check.
+        async fn columns_of(pool: &SqlitePool, index_name: &str) -> Vec<String> {
+            sqlx::query(&format!("PRAGMA index_info({index_name})"))
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("name"))
+                .collect()
+        }
+        let user_index = by_index_name("mem_os_partitions_user")
+            .expect("the provenance lookup index must survive the rebuild");
+        assert_eq!(
+            user_index.get::<i64, _>("unique"),
+            0,
+            "mem_os_partitions_user must NOT be unique — many partitions share one user"
+        );
+        assert_eq!(
+            columns_of(&kv.pool, "mem_os_partitions_user").await,
+            vec!["logical_user".to_owned()]
         );
         let space_index = by_index_name("mem_os_partitions_space")
             .expect("the (org_id, space_id) index must survive");
@@ -1306,6 +1340,11 @@ mod tests {
             1,
             "mem_os_partitions_space must stay UNIQUE — a re-key that failed \
              halfway would otherwise look like a space with two partitions"
+        );
+        assert_eq!(
+            columns_of(&kv.pool, "mem_os_partitions_space").await,
+            vec!["org_id".to_owned(), "space_id".to_owned()],
+            "must cover exactly (org_id, space_id), in that order"
         );
 
         // CHECK constraints, verified functionally (SQLite's PRAGMAs do not
@@ -1440,6 +1479,22 @@ mod tests {
              clock said, not SystemTime::now() — this is the real NULL -> \
              timestamp transition H1's judgement requires"
         );
+    }
+
+    #[tokio::test]
+    async fn touching_an_unrecorded_owner_key_is_an_error_not_a_silent_no_op() {
+        // Pins the `rows_affected() == 0` guard: without it, `UPDATE ...
+        // WHERE owner_key = ?` matching nothing still returns `Ok(())` from
+        // `execute()`, and a caller (`OsMemoryCatalog::mark_mounted`) would
+        // add a partition to its in-memory inventory believing the durable
+        // timestamp was advanced when nothing was.
+        let kv = KvStore::open_memory().await.unwrap();
+        let clock = FrozenClock(std::sync::atomic::AtomicU64::new(1_700_000_000));
+        let err = kv
+            .touch_os_partition_last_seen("no-such-key", &clock)
+            .await
+            .expect_err("there is no row for this owner_key");
+        assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
