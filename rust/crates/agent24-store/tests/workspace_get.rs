@@ -241,3 +241,107 @@ async fn cancelled_queued_get_releases_pool_waiter() {
     drop(held);
     assert_eq!(store.get_workspace(&id).await.unwrap().id, id);
 }
+
+async fn tamper(store: &Store, sql: &str) {
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(test_hooks::pool(store))
+        .await
+        .unwrap();
+    sqlx::query(sql)
+        .execute(test_hooks::pool(store))
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(test_hooks::pool(store))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn get_rejects_wrong_storage_for_private_root_and_identity() {
+    let store = Store::open_memory().await.unwrap();
+    insert_raw(&store, ID, "2026-09-19T00:01:00.000Z").await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET canonical_root = CAST('/secret/root' AS BLOB)
+         WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'",
+    )
+    .await;
+    let id = WorkspaceId::parse(ID).unwrap();
+    assert_eq!(
+        store.get_workspace(&id).await,
+        Err(WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "canonical_root"
+        })
+    );
+
+    let store = Store::open_memory().await.unwrap();
+    insert_raw(&store, ID, "2026-09-19T00:01:00.000Z").await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET unix_device = CAST('private-identity' AS TEXT)
+         WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'",
+    )
+    .await;
+    let error = store.get_workspace(&id).await.unwrap_err();
+    assert_eq!(
+        error,
+        WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "unix_device"
+        }
+    );
+    assert!(!error.to_string().contains("private-identity"));
+}
+
+#[tokio::test]
+async fn get_rejects_enum_and_cross_field_corruption() {
+    let store = Store::open_memory().await.unwrap();
+    insert_raw(&store, ID, "2026-09-19T00:01:00.000Z").await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET state = 'secret_state' WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'",
+    )
+    .await;
+    let id = WorkspaceId::parse(ID).unwrap();
+    assert_eq!(
+        store.get_workspace(&id).await,
+        Err(WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "state"
+        })
+    );
+
+    let store = Store::open_memory().await.unwrap();
+    insert_raw(&store, ID, "2026-09-19T00:01:00.000Z").await;
+    tamper(
+        &store,
+        "UPDATE workspaces SET cleanup_error = 'private-cleanup'
+         WHERE id = 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'",
+    )
+    .await;
+    let error = store.get_workspace(&id).await.unwrap_err();
+    assert_eq!(
+        error,
+        WorkspaceStoreError::CorruptRow {
+            table: "workspaces",
+            field: "state"
+        }
+    );
+    assert!(!error.to_string().contains("private-cleanup"));
+}
+
+#[tokio::test]
+async fn get_missing_table_is_static_database_error() {
+    let store = Store::open_memory().await.unwrap();
+    sqlx::query("DROP TABLE workspaces")
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    let id = WorkspaceId::parse(ID).unwrap();
+    let error = store.get_workspace(&id).await.unwrap_err();
+    assert_eq!(error, WorkspaceStoreError::Database);
+    assert_eq!(error.to_string(), "workspace database error");
+    assert!(!error.to_string().contains("no such table"));
+}
