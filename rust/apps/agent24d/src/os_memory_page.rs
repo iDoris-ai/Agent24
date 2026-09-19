@@ -785,6 +785,15 @@ mod tests {
             // (`remember_checked`'s `events.append`, `page_from_stream`'s
             // row decode) can both surface this one for real.
             MemoryError::from(serde_json::from_str::<serde_json::Value>(MARK).unwrap_err()),
+            // Codex review round 1 (M4): `Sqlx`/`Migrate` are real `#[from]`
+            // wraps, not hand-built `String` payloads — `Sqlx` in particular
+            // is genuinely reachable from both protected call sites (a real
+            // driver error), so it must be covered by name, not assumed
+            // "probably fine" because it wasn't in the original list.
+            MemoryError::from(sqlx::Error::Protocol(MARK.to_owned())),
+            MemoryError::from(sqlx::migrate::MigrateError::Execute(sqlx::Error::Protocol(
+                MARK.to_owned(),
+            ))),
         ];
         for e in variants {
             let rpc = map_memory_error(&e).into_rpc_error();

@@ -507,50 +507,144 @@ mod tests {
             std::time::Duration::from_secs(10)
         ));
 
-        let remember = RememberHandler {
-            generation: g.clone(),
-            entitlement: entitlement.clone(),
-        };
-        let recall = RecallHandler {
-            generation: g.clone(),
-            entitlement: entitlement.clone(),
-        };
-        let recent = RecentHandler {
-            generation: g.clone(),
-            entitlement: entitlement.clone(),
-        };
-
-        // No request_id at all: every one of the three must refuse — none
-        // may fall back to "just run it anyway".
-        let err = remember
-            .call(json!({"kind": "note", "body": {}}))
-            .await
+        // Codex review round 1 (M2): the frozen design requires this matrix
+        // for EACH of the three handlers independently, not just
+        // `RememberHandler` — a copy-paste regression in `RecallHandler`'s
+        // or `RecentHandler`'s `call()` (e.g. forgetting to wire
+        // `admit_callback_bound` at all) must fail a test named after it.
+        let cases: [(
+            &str,
+            serde_json::Value,
+            serde_json::Value,
+            serde_json::Value,
+        ); 3] = [
+            (
+                "remember",
+                json!({"kind": "note", "body": {}}),
+                json!({"kind": "note", "body": {}, "request_id": "ghost"}),
+                json!({"kind": "note", "body": {}, "request_id": "r1"}),
+            ),
+            (
+                "recall",
+                json!({"query": "", "page_size": 1}),
+                json!({"query": "", "page_size": 1, "request_id": "ghost"}),
+                json!({"query": "", "page_size": 1, "request_id": "r1"}),
+            ),
+            (
+                "recent",
+                json!({"page_size": 1}),
+                json!({"page_size": 1, "request_id": "ghost"}),
+                json!({"page_size": 1, "request_id": "r1"}),
+            ),
+        ];
+        for (label, params_no_id, params_unknown_id, params_live_id) in cases {
+            // No request_id at all: must refuse — no fallback to "just run
+            // it anyway".
+            let err = match label {
+                "remember" => {
+                    RememberHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_no_id.clone())
+                    .await
+                }
+                "recall" => {
+                    RecallHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_no_id.clone())
+                    .await
+                }
+                _ => {
+                    RecentHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_no_id.clone())
+                    .await
+                }
+            }
             .unwrap_err();
-        assert_eq!(err.kind, Some(ErrorKind::Draining));
-        let err = recall
-            .call(json!({"query": "", "page_size": 1}))
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind, Some(ErrorKind::Draining));
-        let err = recent.call(json!({"page_size": 1})).await.unwrap_err();
-        assert_eq!(err.kind, Some(ErrorKind::Draining));
+            assert_eq!(
+                err.kind,
+                Some(ErrorKind::Draining),
+                "{label}: no request_id"
+            );
 
-        // An id that is not in flight: same refusal, distinct only at the
-        // `CallbackRefused` level (both map to `ErrorKind::Draining`).
-        let err = remember
-            .call(json!({"kind": "note", "body": {}, "request_id": "ghost"}))
-            .await
+            // An id that is not in flight: same refusal (both fold into
+            // `ErrorKind::Draining` — `DrainingWithoutRequest` vs
+            // `DrainingUnknownRequest` are distinguished at the
+            // `CallbackRefused` level, not the wire level).
+            let err = match label {
+                "remember" => {
+                    RememberHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_unknown_id.clone())
+                    .await
+                }
+                "recall" => {
+                    RecallHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_unknown_id.clone())
+                    .await
+                }
+                _ => {
+                    RecentHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_unknown_id.clone())
+                    .await
+                }
+            }
             .unwrap_err();
-        assert_eq!(err.kind, Some(ErrorKind::Draining));
+            assert_eq!(
+                err.kind,
+                Some(ErrorKind::Draining),
+                "{label}: unknown request_id"
+            );
 
-        // A real, still-in-flight request_id: draining must still admit it
-        // (background work bound to a live request is exactly what draining
-        // keeps serving).
-        let ok = remember
-            .call(json!({"kind": "note", "body": {}, "request_id": "r1"}))
-            .await
-            .unwrap();
-        assert!(ok.get("id").is_some());
+            // A real, still-in-flight request_id: draining must still admit
+            // it (background work bound to a live request is exactly what
+            // draining keeps serving).
+            let ok = match label {
+                "remember" => {
+                    RememberHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_live_id.clone())
+                    .await
+                }
+                "recall" => {
+                    RecallHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_live_id.clone())
+                    .await
+                }
+                _ => {
+                    RecentHandler {
+                        generation: g.clone(),
+                        entitlement: entitlement.clone(),
+                    }
+                    .call(params_live_id.clone())
+                    .await
+                }
+            }
+            .unwrap_or_else(|e| panic!("{label}: live request_id must be admitted: {e:?}"));
+            assert!(
+                ok.is_object(),
+                "{label}: a genuinely admitted call must really execute and return a result"
+            );
+        }
         drop(live);
     }
 
@@ -805,6 +899,48 @@ mod real_resource_tests {
             .expect("module B's call must complete once a permit frees up")
             .unwrap();
         assert!(result.is_ok(), "{result:?}");
+
+        // Codex review round 1 (M1): the frozen criterion names BOTH read
+        // methods (`recall_page`/`recent_page`), not just one — a second
+        // round, same technique, with `RecentHandler` this time.
+        let mut lock_conn = take_external_writer_lock(&db_path).await;
+        let mut write_tasks = Vec::new();
+        for _ in 0..4u32 {
+            let h = RememberHandler {
+                generation: running_generation(),
+                entitlement: module_a.clone(),
+            };
+            write_tasks.push(
+                spawn_and_confirm_blocked(Box::pin(async move {
+                    h.call(json!({"kind": "note", "body": {}})).await
+                }))
+                .await,
+            );
+        }
+        let recent_probe = RecentHandler {
+            generation: running_generation(),
+            entitlement: module_b.clone(),
+        };
+        let recent_probe_task = spawn_and_confirm_blocked(Box::pin(async move {
+            recent_probe.call(json!({"page_size": 1})).await
+        }))
+        .await;
+        assert!(
+            !recent_probe_task.is_finished(),
+            "module B's RecentHandler must also be blocked on the shared permit"
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut lock_conn)
+            .await
+            .unwrap();
+        for t in write_tasks {
+            t.await.unwrap().unwrap();
+        }
+        let recent_result = tokio::time::timeout(Duration::from_secs(5), recent_probe_task)
+            .await
+            .expect("must complete once a permit frees up")
+            .unwrap();
+        assert!(recent_result.is_ok(), "{recent_result:?}");
     }
 
     /// Judgement 8a: a real `Handler::call()` genuinely queued on the
@@ -837,6 +973,12 @@ mod real_resource_tests {
             );
         }
 
+        assert_eq!(
+            kv.oop_admission().unwrap().available_permits(),
+            0,
+            "all 4 real permits must be occupied before the 5th call is even attempted"
+        );
+
         let g = running_generation();
         let live = g
             .admit_request(
@@ -846,13 +988,16 @@ mod real_resource_tests {
                 Duration::from_secs(30), // generous — this test cancels via `finish`, not the budget
             )
             .unwrap();
-        let fifth = RememberHandler {
+        // Codex review round 1 (M3): the frozen design's judgement 8a/8b
+        // specify `recall_page`, not `remember_checked` — a queued READ,
+        // not a queued write, is the case that had no coverage at all.
+        let fifth = RecallHandler {
             generation: g,
             entitlement: entitlement.clone(),
         };
         let fifth_task = spawn_and_confirm_blocked(Box::pin(async move {
             fifth
-                .call(json!({"kind": "note", "body": {}, "request_id": "r1"}))
+                .call(json!({"query": "", "page_size": 1, "request_id": "r1"}))
                 .await
         }))
         .await;
@@ -909,6 +1054,12 @@ mod real_resource_tests {
             );
         }
 
+        assert_eq!(
+            kv.oop_admission().unwrap().available_permits(),
+            0,
+            "all 4 real permits must be occupied before the 5th call is even attempted"
+        );
+
         let g = running_generation();
         // A budget far shorter than the pool's 5s `busy_timeout` (judgement
         // 7's setup, same constant) — the queue wait WILL outlast it.
@@ -920,13 +1071,26 @@ mod real_resource_tests {
                 Duration::from_millis(50),
             )
             .unwrap();
-        let fifth = RememberHandler {
+        // Codex review round 1 (M3): use `RecallHandler` (matches the
+        // frozen design's judgement 8b) AND confirm the call has genuinely
+        // been polled to `Pending` at least once (`spawn_and_confirm_blocked`)
+        // BEFORE letting the 50ms budget run out — awaiting it directly
+        // cannot distinguish "it queued, then the budget expired" from "the
+        // budget was already gone before this even reached `acquire_owned`".
+        let fifth = RecallHandler {
             generation: g,
             entitlement: entitlement.clone(),
         };
-        let err = fifth
-            .call(json!({"kind": "note", "body": {}, "request_id": "r1"}))
+        let fifth_task = spawn_and_confirm_blocked(Box::pin(async move {
+            fifth
+                .call(json!({"query": "", "page_size": 1, "request_id": "r1"}))
+                .await
+        }))
+        .await;
+        let err = tokio::time::timeout(Duration::from_secs(5), fifth_task)
             .await
+            .expect("must resolve once its budget is exhausted, not hang")
+            .unwrap()
             .unwrap_err();
         assert_eq!(err.kind, Some(ErrorKind::Timeout));
         assert!(
