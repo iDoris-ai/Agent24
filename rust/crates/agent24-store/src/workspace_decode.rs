@@ -1,5 +1,5 @@
 use agent24_protocol::WorkspaceId;
-use sqlx::{Row, sqlite::SqliteRow};
+use sqlx::sqlite::SqliteRow;
 
 use super::workspace_decode_support::{
     at_least, bad, blob, count, instant, nonblank, opt_instant, opt_text, text,
