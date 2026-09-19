@@ -16,7 +16,7 @@ pub mod workspaces;
 pub use workspaces::{
     HostLeaseTtl, LeaseKind, NewScratchWorkspace, RootIdentity, TrustedRootRegistration,
     WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceInstant, WorkspaceKind, WorkspaceLeaseId,
-    WorkspaceLeaseRecord, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
+    WorkspaceLeaseRecord, WorkspaceResult, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
 };
 
 pub use audit::AuditEntry;
