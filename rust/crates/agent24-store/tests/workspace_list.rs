@@ -248,3 +248,161 @@ async fn list_empty_and_database_failures_have_static_results() {
     assert_eq!(error, WorkspaceStoreError::Database);
     assert_eq!(error.to_string(), "workspace database error");
 }
+
+#[tokio::test]
+async fn list_performs_no_workspace_or_lease_mutation() {
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    for (name, event, table) in [
+        ("list_deny_workspace_insert", "INSERT", "workspaces"),
+        ("list_deny_workspace_update", "UPDATE", "workspaces"),
+        ("list_deny_workspace_delete", "DELETE", "workspaces"),
+        ("list_deny_lease_insert", "INSERT", "workspace_leases"),
+        ("list_deny_lease_update", "UPDATE", "workspace_leases"),
+        ("list_deny_lease_delete", "DELETE", "workspace_leases"),
+    ] {
+        let statement = format!(
+            "CREATE TRIGGER {name} BEFORE {event} ON {table}
+             BEGIN SELECT RAISE(ABORT, 'list mutation denied'); END"
+        );
+        sqlx::query(&statement)
+            .execute(test_hooks::pool(&store))
+            .await
+            .unwrap();
+    }
+    let before_workspaces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    let before_leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_leases")
+        .fetch_one(test_hooks::pool(&store))
+        .await
+        .unwrap();
+
+    let page = store.list_workspaces(&query(None, None, 10)).await.unwrap();
+    assert_eq!(page.items().len(), 1);
+    let after_workspaces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    let after_leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_leases")
+        .fetch_one(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    assert_eq!(after_workspaces, before_workspaces);
+    assert_eq!(after_leases, before_leases);
+}
+
+#[tokio::test]
+async fn list_does_not_see_an_uncommitted_wal_row_but_sees_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("registry.sqlite"))
+        .await
+        .unwrap();
+    let mut tx = test_hooks::pool(&store).begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO workspaces
+         (id, kind, state, provenance_source, writeback_policy,
+          lifecycle_owner_kind, lifecycle_owner_ref, concurrency_policy,
+          created_at, expires_at, revision, canonical_root, root_generation,
+          root_identity_kind, unix_device, unix_inode)
+         VALUES (?, 'orchestrator_scratch', 'active', 'git', 'external',
+                 'orchestrator', 'list-owner', 'serial', ?, ?, 1, ?,
+                 'list-generation', 'unix', ?, ?)",
+    )
+    .bind("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1")
+    .bind("2026-09-19T00:00:00.000Z")
+    .bind(EXPIRES)
+    .bind("/private/list/wal")
+    .bind([7; 8].as_slice())
+    .bind([8; 8].as_slice())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let before_commit = store.list_workspaces(&query(None, None, 10)).await.unwrap();
+    assert!(before_commit.items().is_empty());
+    tx.commit().await.unwrap();
+    let after_commit = store.list_workspaces(&query(None, None, 10)).await.unwrap();
+    assert_eq!(ids(&after_commit), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1"]);
+}
+
+#[tokio::test]
+async fn cancelled_queued_list_releases_the_single_memory_pool_waiter() {
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    let held = test_hooks::pool(&store).acquire().await.unwrap();
+    let queued = {
+        let store = store.clone();
+        tokio::spawn(async move { store.list_workspaces(&query(None, None, 10)).await })
+    };
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!queued.is_finished(), "LIST completed while pool was held");
+    queued.abort();
+    let error = queued.await.expect_err("queued LIST should be cancelled");
+    assert!(error.is_cancelled());
+    drop(held);
+    let page = store.list_workspaces(&query(None, None, 10)).await.unwrap();
+    assert_eq!(ids(&page), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1"]);
+}
+
+#[tokio::test]
+async fn list_cursor_keeps_inter_page_boundary_stable_when_newer_rows_arrive() {
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2",
+        "active",
+        "2026-09-19T00:01:00.000Z",
+    )
+    .await;
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X3",
+        "active",
+        "2026-09-19T00:01:00.000Z",
+    )
+    .await;
+    let first = store.list_workspaces(&query(None, None, 1)).await.unwrap();
+    assert_eq!(ids(&first), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X3"]);
+
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X4",
+        "active",
+        "2026-09-19T00:02:00.000Z",
+    )
+    .await;
+    let second = store
+        .list_workspaces(&query(None, first.next_cursor().cloned(), 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&second),
+        vec![
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        ]
+    );
+}
