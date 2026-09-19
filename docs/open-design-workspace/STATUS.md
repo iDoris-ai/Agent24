@@ -9,8 +9,8 @@
 | P0 设计冻结 | PASS | ADR-001～005、依赖台账、风险与兼容矩阵已冻结并通过 SOL review |
 | A24-OD-00 capability 安全前置 | PASS（待逐层合并） | SOL 无 blocker/high；全量 Agent24/协议/CLI 测试及私有 ready-pipe 烟测通过 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
-| P2 workspace contract | IN PROGRESS | A24-OD-01 types + schema + store foundation 已通过 SOL；registry CRUD 下一批实现 |
-| A24-OD-05 sidecar foundation | PASS（未接线） | #253/#254/#255/#259/#260/#261；final `a3b83fb`，SOL exact-head 复核通过 |
+| P2 workspace contract | IN PROGRESS | A24-OD-01 types、schema、store foundation 与 registry models 已通过 SOL；CREATE 实现中 |
+| A24-OD-05 sidecar foundation | PASS（未接线） | manager foundation `a3b83fb` + host protocol `21ecfe7` 均通过 SOL exact-head 复核；平台 owner 实现中 |
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 `outdated_cli / incompatible opencode args` 失败，随后停滞，需要 bounded SIGINT。
@@ -72,7 +72,8 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - store foundation：#263～#274、#276～#277、#280～#281，全部不超过 200 changed lines；
 - store final：`f2a6032378107c1e73b6553a6597b4d30f6b5fef`，58 tests，SOL 无 blocker/high/medium；
 - 已验证 fail-closed workspace/lease decode、SQLite storage affinity、固定 UTC `Z`/闰秒拒绝、cleanup 状态与 `BEGIN IMMEDIATE`；
-- 下一切片实现 registry create/get/list，不提前加入 A24-OD-02 的 run/session 字段。
+- registry models/projection：#286/#287/#288/#289，分别为 132/156/69/95 changed lines；final `6394b50b0b80a21701717ddf1fecaf163fe0d8c0`，63 tests，SOL `PASS`；
+- 下一切片只实现 registry CREATE；get/list 分批跟进，不提前加入 A24-OD-02 的 run/session 字段。
 
 ## A24-OD-05 已通过基础切片
 
@@ -80,5 +81,6 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
   97/174/141/173/89/151 changed lines；
 - foundation final：`a3b83fb22e8559319fe8ed677e9cbc40a64258ac`，SOL 无 blocker/high/medium；
 - 110/110 desktop tests、完整 desktop typecheck 与 exact-head diff check 通过；
+- private host protocol：#275/#278/#279/#282/#283/#284/#285/#290，分别为 159/129/80/84/141/108/145/75 changed lines；final `21ecfe7759e3e6d90daf1132095bbff337eb7f23`，SOL `PASS`；
 - foundation 仍未接入 renderer、IPC 或产品路由；
 - POSIX generation-pinned controller 与 Windows Job Object（或等价控制器）是产品接线前硬门禁，必须作为后续独立小 PR 实现。
