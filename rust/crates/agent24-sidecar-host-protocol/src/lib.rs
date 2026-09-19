@@ -1,7 +1,7 @@
 //! Private v1 NDJSON messages exchanged by the sidecar host and helper.
 
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, path::Path};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
@@ -72,6 +72,133 @@ pub enum ErrorCode {
     LaunchFailed,
     SignalFailed,
     Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolError {
+    InvalidMessage,
+    WrongSequence,
+}
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid sidecar message")
+    }
+}
+impl std::error::Error for ProtocolError {}
+
+fn content(s: &str) -> bool {
+    s.len() <= 4096 && s.chars().all(|c| !c.is_control())
+}
+fn nonempty_content(s: &str) -> bool {
+    !s.is_empty() && content(s)
+}
+fn version(v: u8) -> Result<(), ProtocolError> {
+    if v == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidMessage)
+    }
+}
+pub fn validate_request(
+    request: &Request,
+    launched: bool,
+    previous_id: Option<u64>,
+) -> Result<(), ProtocolError> {
+    match request {
+        Request::Launch {
+            version: v,
+            request_id,
+            executable,
+            cwd,
+            argv,
+            env,
+        } => {
+            version(*v)?;
+            if *request_id == 0 {
+                return Err(ProtocolError::InvalidMessage);
+            }
+            if previous_id.is_some_and(|old| *request_id <= old) || launched {
+                return Err(ProtocolError::WrongSequence);
+            }
+            if !Path::new(executable).is_absolute()
+                || !nonempty_content(executable)
+                || !Path::new(cwd).is_absolute()
+                || !nonempty_content(cwd)
+                || argv.iter().any(|arg| !content(arg))
+                || env.iter().any(|(k, v)| !nonempty_content(k) || !content(v))
+            {
+                return Err(ProtocolError::InvalidMessage);
+            }
+        }
+        Request::Signal {
+            version: v,
+            request_id,
+            ..
+        }
+        | Request::IsEmpty {
+            version: v,
+            request_id,
+        } => {
+            version(*v)?;
+            if *request_id == 0 {
+                return Err(ProtocolError::InvalidMessage);
+            }
+            if !launched || previous_id.is_some_and(|old| *request_id <= old) {
+                return Err(ProtocolError::WrongSequence);
+            }
+        }
+    }
+    Ok(())
+}
+pub fn validate_reply(reply: &Reply) -> Result<(), ProtocolError> {
+    let (v, id) = match reply {
+        Reply::Owned {
+            version,
+            request_id,
+        }
+        | Reply::Result {
+            version,
+            request_id,
+        }
+        | Reply::Empty {
+            version,
+            request_id,
+            ..
+        }
+        | Reply::Error {
+            version,
+            request_id,
+            ..
+        } => (version, request_id),
+    };
+    version(*v)?;
+    if *id == 0 {
+        return Err(ProtocolError::InvalidMessage);
+    }
+    Ok(())
+}
+pub fn validate_event(event: &Event) -> Result<(), ProtocolError> {
+    match event {
+        Event::Ready {
+            protocol,
+            port,
+            token,
+            version: target_version,
+        } => {
+            version(*protocol)?;
+            if *port == 0
+                || token.len() < 32
+                || !nonempty_content(token)
+                || !nonempty_content(target_version)
+                || target_version.len() > 128
+            {
+                return Err(ProtocolError::InvalidMessage);
+            }
+        }
+        Event::Exit { protocol, .. } => version(*protocol)?,
+    }
+    Ok(())
 }
 
 impl fmt::Debug for Request {
