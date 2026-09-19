@@ -107,47 +107,54 @@ try:
         }, out)
 
     listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
-    conn, _ = listener.accept()
-    head = b""
-    while b"\r\n\r\n" not in head:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        head += chunk
-    lines = head.split(b"\r\n")
-    headers = {}
-    for line in lines[1:]:
-        if b":" in line:
-            k, v = line.split(b":", 1)
-            headers[k.strip().lower().decode()] = v.strip().decode()
+    # Serves MORE THAN ONE request: the Rust side may need to retry the HTTP
+    # trigger if its WS subscription (a separate, unsynchronized connection)
+    # was not yet live in time for the FIRST emit — each retry gets its own
+    # real request_id/approval_token from the proxy, so retrying is not
+    # replaying anything, it is a fresh real request every time.
+    while True:
+        conn, _ = listener.accept()
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            head += chunk
+        lines = head.split(b"\r\n")
+        headers = {}
+        for line in lines[1:]:
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers[k.strip().lower().decode()] = v.strip().decode()
 
-    gate_params = {
-        "action": "schedule_callback",
-        "target": "2099-01-01T00:00:00Z",
-        "payload": {},
-        "request_id": headers.get("x-a24-request-id", ""),
-    }
-    # Negative control FIRST, same request_id: a wrong token must be refused
-    # and — per the kernel's own admission semantics — must NOT consume the
-    # real token, so the correct call right after it still succeeds.
-    bad_gate_resp = rpc("_a24/approval/gate", {
-        **gate_params, "approval_token": "definitely-not-the-real-token",
-    })
-    gate_resp = rpc("_a24/approval/gate", {
-        **gate_params, "approval_token": headers.get("x-a24-approval-token", ""),
-    })
-    emit_resp = rpc("_a24/events/emit", {"kind": "task.transitioned", "payload": {"probe": "t9"}})
-    with open(os.path.join(data_dir, "gate_probe.json"), "w") as out:
-        json.dump({
-            "headers_seen": headers,
-            "bad_gate_response": bad_gate_resp,
-            "gate_response": gate_resp,
-            "emit_response": emit_resp,
-        }, out)
+        gate_params = {
+            "action": "schedule_callback",
+            "target": "2099-01-01T00:00:00Z",
+            "payload": {},
+            "request_id": headers.get("x-a24-request-id", ""),
+        }
+        # Negative control FIRST, same request_id: a wrong token must be
+        # refused and — per the kernel's own admission semantics — must NOT
+        # consume the real token, so the correct call right after it still
+        # succeeds.
+        bad_gate_resp = rpc("_a24/approval/gate", {
+            **gate_params, "approval_token": "definitely-not-the-real-token",
+        })
+        gate_resp = rpc("_a24/approval/gate", {
+            **gate_params, "approval_token": headers.get("x-a24-approval-token", ""),
+        })
+        emit_resp = rpc("_a24/events/emit", {"kind": "task.transitioned", "payload": {"probe": "t9"}})
+        with open(os.path.join(data_dir, "gate_probe.json"), "w") as out:
+            json.dump({
+                "headers_seen": headers,
+                "bad_gate_response": bad_gate_resp,
+                "gate_response": gate_resp,
+                "emit_response": emit_resp,
+            }, out)
 
-    body = b"hello"
-    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
-    conn.close()
+        body = b"hello"
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        conn.close()
 except Exception as e:
     with open(os.path.join(data_dir, "error.txt"), "w") as out:
         out.write(repr(e))
@@ -319,12 +326,19 @@ fn a_package_from_outside_the_repo() {
     // Second lifetime: a real restart, same binary, same $HOME.
     let d2 = start(home.path());
 
-    // Subscribe to the real WS event consumer BEFORE triggering the request
+    // Subscribe to the real WS event consumer BEFORE triggering any request
     // that makes the module emit — the callback's own `{}` ack proves the
-    // kernel accepted the call, not that anything downstream received it
-    // (Codex review: a regression that acked without broadcasting would
-    // still pass an ack-only check). `spawn_ws_subscriber` blocks until the
-    // upgrade completes, so no event emitted after this line can be missed.
+    // kernel accepted the call, not that anything downstream received it.
+    // `spawn_ws_subscriber` blocks until the CLIENT side of the upgrade
+    // completes, but that is not proof the SERVER has reached
+    // `hub.subscribe()` yet (it runs inside the spawned `client_loop` task,
+    // a moment strictly after the upgrade response is sent) — the broadcast
+    // hub has no replay, so a request fired in that gap's event is lost for
+    // good, not merely delayed. Rather than a fixed sleep (still racy, just
+    // narrower), round trip 3 below retries the HTTP trigger — each retry is
+    // a fresh real request with its own request_id/approval_token, not a
+    // replay — until an event is actually observed, bounding the race to "at
+    // most a handful of harmless extra requests" instead of "flaky".
     let events = spawn_ws_subscriber(d2.port, &d2.token);
 
     // ── 1. Mount + 2. Routing proxy ──────────────────────────────────────
@@ -332,10 +346,7 @@ fn a_package_from_outside_the_repo() {
     // its handshake (spawned + registered vs. ready to actually serve a
     // proxied request are two different moments) — `daemon_modules.rs`'s own
     // `serving()` helper hits the same thing and retries the real HTTP call
-    // rather than gating on the list, so this does the same. The module's
-    // handler also does the approval round trip before it answers, so this
-    // call exercises proxy + approval + events together — none of the three
-    // can be tested any earlier than a request actually being in flight.
+    // rather than gating on the list, so this does the same.
     let deadline = Instant::now() + Duration::from_secs(30);
     let (status, body) = loop {
         if let Some((status, body)) = get(d2.port, &d2.token, "/api/v1/blackbox/hi")
@@ -363,19 +374,45 @@ fn a_package_from_outside_the_repo() {
 
     // ── 3. Event forwarding, observed at the real consumer boundary ─────
     // The module's handler also submits a real `_a24/approval/gate`, which
-    // itself broadcasts `module-approval.required` on the same bus — so this
-    // reads until it finds the `module` event rather than assuming it is the
-    // first frame.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let event = loop {
-        let event = events
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect(
+    // itself broadcasts `module-approval.required` on the same bus — so each
+    // attempt reads until it finds a `module`-typed frame rather than
+    // assuming the first one it sees is it. The overall deadline is checked
+    // BEFORE every blocking receive (not derived from a possibly-already-hit
+    // one, and never satisfied by a message that merely arrived before it
+    // expired) — a steady stream of non-`module` frames cannot spin this
+    // loop past it.
+    let overall_deadline = Instant::now() + Duration::from_secs(30);
+    let event = 'retry: loop {
+        let per_attempt_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(
+                Instant::now() < overall_deadline,
                 "the WS subscriber connected before the request never received \
-                 the module's event",
+                 the module's event after retrying the trigger; daemon stderr:\n{}",
+                d2.recent_stderr()
             );
-        if event["type"] == "module" {
-            break event;
+            let remaining = per_attempt_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // This attempt's window closed with no `module` frame — retry
+                // the trigger (the subscription is certainly live by now if
+                // it was merely racing the first one) rather than waiting
+                // out the full overall deadline on a single attempt.
+                let (status, _) = get(d2.port, &d2.token, "/api/v1/blackbox/hi")
+                    .expect("the module answered before; a retry must too");
+                assert_eq!(status, 200);
+                continue 'retry;
+            }
+            match events.recv_timeout(remaining) {
+                Ok(event) if event["type"] == "module" => break 'retry event,
+                Ok(_) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "the WS subscriber thread ended; daemon stderr:\n{}",
+                        d2.recent_stderr()
+                    )
+                }
+            }
         }
     };
     assert_eq!(event["payload"]["module"], "blackbox", "{event}");
@@ -400,8 +437,8 @@ fn a_package_from_outside_the_repo() {
     );
     let remembered_id = probe["remember_response"]["result"]["id"].clone();
     assert!(
-        !remembered_id.is_null(),
-        "a real _a24/memory/private/remember call must return a real id: {probe}"
+        remembered_id.as_str().is_some_and(|s| !s.is_empty()),
+        "a real _a24/memory/private/remember call must return a non-empty string id: {probe}"
     );
     let recall_result = &probe["recall_response"]["result"];
     let items = recall_result["items"]
@@ -515,6 +552,17 @@ fn an_in_process_declaration_for_an_uncompiled_crate_is_still_refused() {
         entry["state"], "refused",
         "a crate this binary never compiled in must be reported REFUSED, not \
          silently absent or mounted: {entry}"
+    );
+    // `Refused` also covers several unrelated causes (duplicate/reserved
+    // name, manifest identity mismatch, ...) — pin the SPECIFIC detail this
+    // test means to exercise, not just the generic `refused` state, so a
+    // regression that started refusing this manifest for some other reason
+    // could not silently keep this test green.
+    assert_eq!(
+        entry["detail"],
+        "a package on disk must declare an out-of-process provider with a \
+         spawn command; in-process modules are compiled in",
+        "{entry}"
     );
     let (status, _) =
         get(d.port, &d.token, "/api/v1/not-really-in-process/hi").expect("the daemon answered");
