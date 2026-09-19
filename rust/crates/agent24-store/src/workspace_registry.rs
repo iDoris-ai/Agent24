@@ -1,0 +1,185 @@
+use agent24_protocol::Workspace;
+use sqlx::{Sqlite, Transaction};
+
+use crate::{
+    LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, WorkspaceInstant, WorkspaceResult,
+    WorkspaceRow, WorkspaceStoreError,
+};
+
+fn decode_row(row: &sqlx::sqlite::SqliteRow) -> WorkspaceResult<Workspace> {
+    WorkspaceRow::decode(row)
+        .map(|workspace| workspace.project())
+        .map_err(|error| match error {
+            WorkspaceStoreError::CorruptRow { .. } => error,
+            _ => WorkspaceStoreError::CorruptRow {
+                table: "workspaces",
+                field: "row",
+            },
+        })
+}
+
+async fn exists(
+    tx: &mut Transaction<'_, Sqlite>,
+    query: &str,
+    value: &str,
+) -> WorkspaceResult<bool> {
+    sqlx::query(query)
+        .bind(value)
+        .fetch_optional(&mut **tx)
+        .await
+        .map(|row| row.is_some())
+        .map_err(|_| WorkspaceStoreError::Database)
+}
+
+async fn identity_exists(
+    tx: &mut Transaction<'_, Sqlite>,
+    identity: RootIdentity,
+) -> WorkspaceResult<bool> {
+    let row = match identity {
+        RootIdentity::Unix { device, inode } => {
+            sqlx::query(
+                "SELECT 1 FROM workspaces
+                 WHERE root_identity_kind = 'unix' AND unix_device = ? AND unix_inode = ?
+                 LIMIT 1",
+            )
+            .bind(device.to_vec())
+            .bind(inode.to_vec())
+            .fetch_optional(&mut **tx)
+            .await
+        }
+        RootIdentity::Windows {
+            volume_serial,
+            file_id,
+        } => {
+            sqlx::query(
+                "SELECT 1 FROM workspaces
+                 WHERE root_identity_kind = 'windows'
+                   AND windows_volume_serial = ? AND windows_file_id = ?
+                 LIMIT 1",
+            )
+            .bind(volume_serial.to_vec())
+            .bind(file_id.to_vec())
+            .fetch_optional(&mut **tx)
+            .await
+        }
+    };
+    row.map(|value| value.is_some())
+        .map_err(|_| WorkspaceStoreError::Database)
+}
+
+async fn insert_workspace(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &NewScratchWorkspace,
+    now: &WorkspaceInstant,
+    expires_at: &WorkspaceInstant,
+) -> WorkspaceResult<()> {
+    let (identity_kind, unix_device, unix_inode, windows_volume_serial, windows_file_id) =
+        match input.root().identity() {
+            RootIdentity::Unix { device, inode } => (
+                "unix",
+                Some(device.to_vec()),
+                Some(inode.to_vec()),
+                None,
+                None,
+            ),
+            RootIdentity::Windows {
+                volume_serial,
+                file_id,
+            } => (
+                "windows",
+                None,
+                None,
+                Some(volume_serial.to_vec()),
+                Some(file_id.to_vec()),
+            ),
+        };
+    sqlx::query(
+        "INSERT INTO workspaces
+         (id, kind, state, provenance_source, provenance_project_ref,
+          provenance_base_revision, writeback_policy, lifecycle_owner_kind,
+          lifecycle_owner_ref, concurrency_policy, created_at, expires_at,
+          renewed_at, released_at, revision, canonical_root, root_generation,
+          root_identity_kind, unix_device, unix_inode, windows_volume_serial,
+          windows_file_id, quarantine_root, quarantined_at, cleanup_attempts,
+          cleanup_last_attempt_at, cleanup_error, cleanup_retry_at)
+         VALUES (?, 'orchestrator_scratch', 'active', ?, ?, ?, 'external',
+                 'orchestrator', ?, 'serial', ?, ?, NULL, NULL, 1, ?, ?, ?,
+                 ?, ?, ?, ?, NULL, NULL, 0, NULL, NULL, NULL)",
+    )
+    .bind(input.id().as_str())
+    .bind(input.provenance().source())
+    .bind(input.provenance().project_ref())
+    .bind(input.provenance().base_revision())
+    .bind(input.lifecycle_owner_ref().as_str())
+    .bind(now.as_str())
+    .bind(expires_at.as_str())
+    .bind(input.root().canonical_root())
+    .bind(input.root().root_generation())
+    .bind(identity_kind)
+    .bind(unix_device)
+    .bind(unix_inode)
+    .bind(windows_volume_serial)
+    .bind(windows_file_id)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(|_| WorkspaceStoreError::Database)
+}
+
+impl Store {
+    /// Create an orchestrator-owned scratch workspace under one SQLite write lock.
+    pub async fn create_workspace(
+        &self,
+        input: &NewScratchWorkspace,
+        authorized_owner: &LifecycleOwnerRef,
+        now: &WorkspaceInstant,
+    ) -> WorkspaceResult<Workspace> {
+        if input.lifecycle_owner_ref() != authorized_owner {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "lifecycle_owner_ref",
+            });
+        }
+        let expires_at = now.checked_add_workspace_ttl(input.ttl())?;
+        let mut tx = self.begin_workspace_immediate().await?;
+
+        if exists(
+            &mut tx,
+            "SELECT 1 FROM workspaces WHERE id = ? LIMIT 1",
+            input.id().as_str(),
+        )
+        .await?
+        {
+            return Err(WorkspaceStoreError::Conflict(
+                crate::WorkspaceConflict::Identifier,
+            ));
+        }
+        if exists(
+            &mut tx,
+            "SELECT 1 FROM workspaces WHERE canonical_root = ? COLLATE BINARY LIMIT 1",
+            input.root().canonical_root(),
+        )
+        .await?
+        {
+            return Err(WorkspaceStoreError::Conflict(
+                crate::WorkspaceConflict::CanonicalRoot,
+            ));
+        }
+        if identity_exists(&mut tx, input.root().identity()).await? {
+            return Err(WorkspaceStoreError::Conflict(
+                crate::WorkspaceConflict::RootIdentity,
+            ));
+        }
+
+        insert_workspace(&mut tx, input, now, &expires_at).await?;
+        let row = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
+            .bind(input.id().as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        let workspace = decode_row(&row)?;
+        tx.commit()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        Ok(workspace)
+    }
+}
