@@ -91,6 +91,47 @@ async fn preflights_are_ordered_identifier_then_root_then_identity() {
 }
 
 #[tokio::test]
+async fn overlapping_conflicts_keep_identifier_before_root_and_identity() {
+    let store = Store::open_memory().await.unwrap();
+    let existing = input(
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+        "/overlap/root",
+        RootIdentity::unix(&[11; 8], &[12; 8]).unwrap(),
+    );
+    create(&store, &existing).await.unwrap();
+
+    let all_three = create(
+        &store,
+        &input(
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+            "/overlap/root",
+            RootIdentity::unix(&[11; 8], &[12; 8]).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        all_three,
+        Err(WorkspaceStoreError::Conflict(WorkspaceConflict::Identifier))
+    );
+
+    let root_and_identity = create(
+        &store,
+        &input(
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+            "/overlap/root",
+            RootIdentity::unix(&[11; 8], &[12; 8]).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        root_and_identity,
+        Err(WorkspaceStoreError::Conflict(
+            WorkspaceConflict::CanonicalRoot
+        ))
+    );
+}
+
+#[tokio::test]
 async fn canonical_root_is_exact_binary_and_inactive_rows_reserve_all_keys() {
     let store = Store::open_memory().await.unwrap();
     let existing = input(
