@@ -192,10 +192,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let child = read_pid(&marker);
-        let timed_out = tokio::time::timeout(Duration::from_millis(100), process.wait())
+        tokio::time::timeout(Duration::from_millis(100), process.wait())
             .await
             .expect_err("the sleep must outlive the bounded wait");
-        drop(timed_out);
         wait_until_gone(child);
         let _ = std::fs::remove_file(marker);
     }
