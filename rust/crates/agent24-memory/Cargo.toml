@@ -22,6 +22,12 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 thiserror = "2"
 tracing = "0.1"
+# T8.5c-W-mount 决策 4: the OOP connection-admission `Semaphore` is constructed
+# inside `KvStore::open`/`open_memory` themselves (so the ephemeral/file-backed
+# split cannot be gotten wrong by a caller) — library code, not just tests,
+# needs `tokio::sync::Semaphore`. `sqlx`'s `runtime-tokio` feature already
+# pulls in the real tokio runtime; this only adds the `sync` primitives.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"

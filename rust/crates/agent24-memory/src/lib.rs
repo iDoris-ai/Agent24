@@ -25,6 +25,7 @@ pub mod writer;
 
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use agent24_core::util::now_iso8601;
 use serde::Serialize;
@@ -104,6 +105,39 @@ pub type Result<T> = std::result::Result<T, MemoryError>;
 /// design doc (§3.2/§6.4, M4) requires this constant to make impossible.
 pub const MEMORY_SQLITE_ROW_BUFFER_SIZE: usize = 8;
 
+/// T8.5c-W-mount 决策 4: `KvStore::open`'s `max_connections` — the ONE source
+/// this crate and `agent24d`'s OOP connection-admission `Semaphore`
+/// (`KvStore::oop_admission`) both read to agree on how much headroom the
+/// in-process path needs kept back. `u32` because that is what
+/// `SqlitePoolOptions::max_connections` requires on sqlx 0.8; a permit count
+/// is `usize`, so the one subtraction this constant feeds
+/// (`KVSTORE_MAX_CONNECTIONS - 1`) is done in `u32` (no underflow: `5 - 1`)
+/// and widened with `as usize` (lossless on every target this crate runs on).
+pub const KVSTORE_MAX_CONNECTIONS: u32 = 5;
+
+/// A clock `agent24-memory` can be told the time by, so a caller that needs to
+/// verify "did this write really just happen" can hand it a controlled value
+/// instead of racing `SystemTime::now()`. Same shape as
+/// `agent24d::events_emit::Clock`/`agent24d::module_approval_broker::Clock` —
+/// not shared code, but the same already-established answer to the same
+/// problem, so [`touch_os_partition_last_seen`](KvStore::touch_os_partition_last_seen)
+/// is not inventing a fourth one.
+pub trait Clock: Send + Sync {
+    fn now_epoch_secs(&self) -> u64;
+}
+
+#[derive(Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_epoch_secs(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
 /// One durably recorded domain-OS memory partition.
 ///
 /// See `mem_os_partitions` (migrations 0012 and 0013) for why each field is
@@ -123,7 +157,11 @@ pub struct OsPartitionRow {
     pub logical_user: String,
     pub module_name: String,
     pub first_seen_at: String,
-    pub last_seen_at: String,
+    /// `None`: this identity has been recorded (`record_os_partition`) but no
+    /// mount has ever been confirmed successful for it
+    /// (`touch_os_partition_last_seen`) — T8.5c-W-mount decision 5. Migration
+    /// 0015 made the column nullable for exactly this state.
+    pub last_seen_at: Option<String>,
 }
 
 /// The identity of a partition, as the kernel states it when recording one.
@@ -198,7 +236,7 @@ fn os_partition_row(r: &sqlx::sqlite::SqliteRow) -> OsPartitionRow {
         logical_user: r.get("logical_user"),
         module_name: r.get("module_name"),
         first_seen_at: r.get("first_seen_at"),
-        last_seen_at: r.get("last_seen_at"),
+        last_seen_at: r.get::<Option<String>, _>("last_seen_at"),
     }
 }
 
@@ -206,6 +244,22 @@ fn os_partition_row(r: &sqlx::sqlite::SqliteRow) -> OsPartitionRow {
 #[derive(Clone)]
 pub struct KvStore {
     pool: SqlitePool,
+    /// `Some` iff this store came from [`KvStore::open`] (file-backed,
+    /// multiple connections, WAL). [`KvStore::open_memory`] is always `None`
+    /// — NOT because its pool "is not a shared pool" (it is: one `SqlitePool`,
+    /// every `KvStore` clone's handle points at it, and callers queue on its
+    /// one connection) but because that shared pool has exactly one
+    /// connection, the in-process path already needs it, and
+    /// `max_connections - 1 = 0` leaves nothing to lend an out-of-process
+    /// caller (T8.5c-P-pagination-cursor.md §13). `0` permits is not "less
+    /// headroom", it is "no headroom exists to give".
+    ///
+    /// Private: the only way to read it is [`KvStore::oop_admission`] — this
+    /// is T8.5c-W-mount decision 4's fix for the earlier design (where a
+    /// caller passed a `Semaphore` in and nothing stopped it from pairing the
+    /// wrong one with the wrong pool). The ephemeral/file-backed split is now
+    /// guaranteed by the two constructors below, not by caller convention.
+    oop_admission: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl KvStore {
@@ -229,11 +283,16 @@ impl KvStore {
             // pool must reference — see `MEMORY_SQLITE_ROW_BUFFER_SIZE`'s doc.
             .row_buffer_size(MEMORY_SQLITE_ROW_BUFFER_SIZE);
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(KVSTORE_MAX_CONNECTIONS)
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
+                (KVSTORE_MAX_CONNECTIONS - 1) as usize,
+            ))),
+        })
     }
 
     /// In-memory database for tests. A single connection: every `:memory:`
@@ -252,7 +311,25 @@ impl KvStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        // T8.5c-W-mount decision 4: this pool's one connection is already
+        // needed by the in-process path, so there is no headroom to lend an
+        // out-of-process caller — `oop_admission` stays `None`, not
+        // `Some(Semaphore::new(0))` (a permit count of zero would make every
+        // OOP memory call hang at `acquire()` instead of being told plainly
+        // there is no capability).
+        Ok(Self {
+            pool,
+            oop_admission: None,
+        })
+    }
+
+    /// T8.5c-W-mount decision 4: the daemon-level connection-admission
+    /// permit for out-of-process `_a24/memory/private/*` calls — `Some` iff
+    /// this store is file-backed. Returns a clone (it is an `Arc`) because
+    /// the caller (`agent24d::MemoryLease::admission`) needs an owned handle
+    /// it can hold across an `.await`.
+    pub fn oop_admission(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.oop_admission.clone()
     }
 
     /// An [`event::EventLog`] over the SAME database file — MD-2's append-only
@@ -316,14 +393,22 @@ impl KvStore {
         vector::VectorRetriever::new(self.pool.clone(), embedder)
     }
 
-    /// Record that `owner_key` is the memory partition of `(user, module)`, and
-    /// that it was seen now.
+    /// Ensure that `owner_key` is durably recorded as the memory partition of
+    /// `(user, module)`. Does **not** advance `last_seen_at` — T8.5c-W-mount
+    /// decision 5: this call happens before the kernel knows whether the
+    /// module will actually mount successfully, so it must not make the
+    /// durable catalog claim a partition is "just seen active" until
+    /// [`touch_os_partition_last_seen`](Self::touch_os_partition_last_seen)
+    /// says so for real. A first-time identity gets `last_seen_at = NULL`
+    /// (migration 0015 made the column nullable for exactly this); a repeat
+    /// call leaves an existing `last_seen_at` exactly as it was.
     ///
-    /// Idempotent, and **write-once on the immutable columns**: a repeat call with
-    /// the same identity advances `last_seen_at` and nothing else, because
-    /// `first_seen_at` and `module_name` exist to say what a partition ORIGINALLY
-    /// was. A module rename must leave the old row intact — that row is the only
-    /// thing that can tell a later migration what `…os:calendar` used to mean.
+    /// Idempotent, and **write-once on the immutable columns**: a repeat call
+    /// with the same identity is a no-op on every column, because
+    /// `first_seen_at` and `module_name` exist to say what a partition
+    /// ORIGINALLY was. A module rename must leave the old row intact — that
+    /// row is the only thing that can tell a later migration what
+    /// `…os:calendar` used to mean.
     ///
     /// A repeat call that DISAGREES about `key_version`, `org_id`, `space_id` or
     /// `module_name` is a [`MemoryError::Conflict`], not an update and not a
@@ -373,12 +458,19 @@ impl KvStore {
         // The guarded arm updates ZERO rows when the immutable columns disagree,
         // which is how the disagreement is detected: SQLite reports the conflict
         // as "handled" either way, so `rows_affected()` is the only signal.
+        //
+        // INSERT binds a literal NULL for `last_seen_at` (not `now` — that was
+        // the T8.5c-W-mount decision-5 bug: it made a first-time, never-mounted
+        // identity read as "just active"). The ON CONFLICT arm's SET target is
+        // a self-assignment (`first_seen_at = first_seen_at`): the conflict is
+        // detected by the WHERE clause + `rows_affected()`, not by which column
+        // the SET targets, and this arm must not touch `last_seen_at` either.
         let res = sqlx::query(
             "INSERT INTO mem_os_partitions
                  (owner_key, key_version, org_id, space_id, logical_user,
                   module_name, first_seen_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(owner_key) DO UPDATE SET last_seen_at = excluded.last_seen_at
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+             ON CONFLICT(owner_key) DO UPDATE SET first_seen_at = first_seen_at
                WHERE key_version = excluded.key_version
                  AND org_id = excluded.org_id
                  AND space_id = excluded.space_id
@@ -391,7 +483,6 @@ impl KvStore {
         .bind(id.user)
         .bind(id.module)
         .bind(&now)
-        .bind(&now)
         .execute(&self.pool)
         .await?;
         if res.rows_affected() == 0 {
@@ -399,6 +490,38 @@ impl KvStore {
                 "memory partition {:?} is already recorded with a different identity \
                  than ({}, {}, {}, {}) — refusing to re-attribute it",
                 id.owner_key, id.key_version, id.org_id, id.space_id, id.module
+            )));
+        }
+        Ok(())
+    }
+
+    /// Advance `owner_key`'s `last_seen_at` to `clock.now_epoch_secs()`. The
+    /// **only** method allowed to change this column —
+    /// [`record_os_partition`](Self::record_os_partition) deliberately does
+    /// not. For a row whose `last_seen_at` was `NULL`, this is the first real
+    /// value it ever receives.
+    ///
+    /// `Err` if no row matched `owner_key` — a caller asking to advance a
+    /// row that is not there is not the same fact as "advanced it", and
+    /// `Ok(())` on zero rows affected would let that difference disappear
+    /// silently (the caller, `OsMemoryCatalog::mark_mounted`, relies on this
+    /// to decide whether to warn rather than assume the touch landed).
+    pub async fn touch_os_partition_last_seen(
+        &self,
+        owner_key: &str,
+        clock: &dyn Clock,
+    ) -> Result<()> {
+        let res = sqlx::query("UPDATE mem_os_partitions SET last_seen_at = ? WHERE owner_key = ?")
+            .bind(agent24_core::util::iso8601_from_epoch_secs(
+                clock.now_epoch_secs(),
+            ))
+            .bind(owner_key)
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(MemoryError::NotFound(format!(
+                "memory partition {owner_key:?} has no recorded row to touch — \
+                 ensure_recorded must run before mark_mounted for it"
             )));
         }
         Ok(())
@@ -1103,6 +1226,275 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(members, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_0015_keeps_the_0013_schema_and_only_makes_last_seen_at_nullable() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = KvStore::open(&dir.path().join("m.db")).await.unwrap();
+
+        let columns = sqlx::query("PRAGMA table_info(mem_os_partitions)")
+            .fetch_all(&kv.pool)
+            .await
+            .unwrap();
+        let mut by_name: std::collections::BTreeMap<String, (bool, bool)> = columns
+            .iter()
+            .map(|r| {
+                let name: String = r.get("name");
+                let notnull: i64 = r.get("notnull");
+                let pk: i64 = r.get("pk");
+                (name, (notnull != 0, pk != 0))
+            })
+            .collect();
+        let mut expected_columns = vec![
+            "owner_key",
+            "key_version",
+            "org_id",
+            "space_id",
+            "logical_user",
+            "module_name",
+            "first_seen_at",
+            "last_seen_at",
+        ];
+        expected_columns.sort_unstable();
+        assert_eq!(
+            by_name.keys().cloned().collect::<Vec<_>>(),
+            expected_columns,
+            "0015 must keep exactly F8's eight columns — not 0012's six"
+        );
+        assert_eq!(
+            by_name.remove("owner_key").unwrap(),
+            (false, true),
+            "owner_key stays the primary key (SQLite does not separately set the \
+             NOT NULL flag on a non-INTEGER TEXT PRIMARY KEY column)"
+        );
+        for c in [
+            "key_version",
+            "space_id",
+            "logical_user",
+            "module_name",
+            "org_id",
+            "first_seen_at",
+        ] {
+            assert!(
+                by_name.remove(c).unwrap().0,
+                "{c} must stay NOT NULL after the rebuild"
+            );
+        }
+        assert_eq!(
+            by_name.remove("last_seen_at").unwrap(),
+            (false, false),
+            "last_seen_at is the one column 0015 makes nullable"
+        );
+        assert!(by_name.is_empty());
+
+        let fks = sqlx::query("PRAGMA foreign_key_list(mem_os_partitions)")
+            .fetch_all(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            fks.len(),
+            1,
+            "org_id's FK to mem_orgs must survive the rebuild"
+        );
+        assert_eq!(fks[0].get::<String, _>("from"), "org_id");
+        assert_eq!(fks[0].get::<String, _>("table"), "mem_orgs");
+        assert_eq!(fks[0].get::<String, _>("to"), "org_id");
+
+        let indexes = sqlx::query("PRAGMA index_list(mem_os_partitions)")
+            .fetch_all(&kv.pool)
+            .await
+            .unwrap();
+        let by_index_name =
+            |name: &str| indexes.iter().find(|r| r.get::<String, _>("name") == name);
+        // `index_list` alone only proves an index by that NAME exists — it
+        // says nothing about which column(s) it actually covers or whether
+        // it is unique. `index_info` is what closes that gap: a rebuild
+        // that accidentally built `mem_os_partitions_user` on the wrong
+        // column, or made it UNIQUE, or built the space index on the wrong
+        // column set, would still pass a name-only check.
+        async fn columns_of(pool: &SqlitePool, index_name: &str) -> Vec<String> {
+            sqlx::query(&format!("PRAGMA index_info({index_name})"))
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("name"))
+                .collect()
+        }
+        let user_index = by_index_name("mem_os_partitions_user")
+            .expect("the provenance lookup index must survive the rebuild");
+        assert_eq!(
+            user_index.get::<i64, _>("unique"),
+            0,
+            "mem_os_partitions_user must NOT be unique — many partitions share one user"
+        );
+        assert_eq!(
+            columns_of(&kv.pool, "mem_os_partitions_user").await,
+            vec!["logical_user".to_owned()]
+        );
+        let space_index = by_index_name("mem_os_partitions_space")
+            .expect("the (org_id, space_id) index must survive");
+        assert_eq!(
+            space_index.get::<i64, _>("unique"),
+            1,
+            "mem_os_partitions_space must stay UNIQUE — a re-key that failed \
+             halfway would otherwise look like a space with two partitions"
+        );
+        assert_eq!(
+            columns_of(&kv.pool, "mem_os_partitions_space").await,
+            vec!["org_id".to_owned(), "space_id".to_owned()],
+            "must cover exactly (org_id, space_id), in that order"
+        );
+
+        // CHECK constraints, verified functionally (SQLite's PRAGMAs do not
+        // surface CHECK text): an all-whitespace value in each checked column
+        // must still be refused after the rebuild.
+        let org_id = kv.ensure_org_for_user("alice").await.unwrap();
+        for col in ["key_version", "space_id", "logical_user", "module_name"] {
+            let mut values = std::collections::BTreeMap::from([
+                ("key_version", "v2"),
+                ("org_id", org_id.as_str()),
+                ("space_id", "os:x"),
+                ("logical_user", "alice"),
+                ("module_name", "x"),
+            ]);
+            values.insert(col, "   ");
+            let res = sqlx::query(
+                "INSERT INTO mem_os_partitions
+                     (owner_key, key_version, org_id, space_id, logical_user,
+                      module_name, first_seen_at, last_seen_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+            )
+            .bind(format!("k-{col}"))
+            .bind(values["key_version"])
+            .bind(values["org_id"])
+            .bind(values["space_id"])
+            .bind(values["logical_user"])
+            .bind(values["module_name"])
+            .bind(now_iso8601())
+            .execute(&kv.pool)
+            .await;
+            assert!(res.is_err(), "{col}'s CHECK must survive the rebuild");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_0015_preserves_existing_rows_including_a_non_null_last_seen_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let pool = pool_migrated_up_to(&path, 15).await;
+
+        // Seeded on the 0014 schema (`last_seen_at` is `NOT NULL` there): a
+        // real org, membership, and one fully-populated partition row.
+        sqlx::query(
+            "INSERT INTO mem_orgs (org_id, display_name, created_at) VALUES ('org_x', 'X', ?)",
+        )
+        .bind(now_iso8601())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO mem_org_members (org_id, user_id, joined_at) VALUES ('org_x', 'alice', ?)",
+        )
+        .bind(now_iso8601())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO mem_os_partitions
+                 (owner_key, key_version, org_id, space_id, logical_user,
+                  module_name, first_seen_at, last_seen_at)
+             VALUES ('k1', 'v2', 'org_x', 'os:sin90', 'alice', 'sin90',
+                     '2026-08-22T00:00:00Z', '2026-08-22T01:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        // Now run 0015.
+        let kv = KvStore::open(&path).await.unwrap();
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(rows.len(), 1, "the rebuild must not lose the row");
+        let r = &rows[0];
+        assert_eq!(r.owner_key, "k1");
+        assert_eq!(r.key_version, "v2");
+        assert_eq!(r.org_id, "org_x");
+        assert_eq!(r.space_id, "os:sin90");
+        assert_eq!(r.logical_user, "alice");
+        assert_eq!(r.module_name, "sin90");
+        assert_eq!(r.first_seen_at, "2026-08-22T00:00:00Z");
+        assert_eq!(
+            r.last_seen_at.as_deref(),
+            Some("2026-08-22T01:00:00Z"),
+            "a historical non-null last_seen_at must not be wiped to NULL by the rebuild — \
+             the migration only changes what a NEW insert writes, not existing rows"
+        );
+    }
+
+    struct FrozenClock(std::sync::atomic::AtomicU64);
+    impl Clock for FrozenClock {
+        fn now_epoch_secs(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn record_os_partition_leaves_last_seen_at_null_until_touched() {
+        let kv = KvStore::open_memory().await.unwrap();
+        let org_id = kv.ensure_org_for_user("alice").await.unwrap();
+        let id = OsPartitionIdentity {
+            owner_key: "k1",
+            key_version: "v2",
+            org_id: &org_id,
+            space_id: "os:sin90",
+            user: "alice",
+            module: "sin90",
+        };
+        kv.record_os_partition(id).await.unwrap();
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(
+            rows[0].last_seen_at, None,
+            "a first-time record must not claim the partition was ever seen active \
+             — this is the H1 bug: the old INSERT branch bound `now` here too"
+        );
+
+        // A repeat `record_os_partition` (the `ON CONFLICT` branch) must also
+        // leave it alone.
+        kv.record_os_partition(id).await.unwrap();
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(
+            rows[0].last_seen_at, None,
+            "record_os_partition must never advance last_seen_at, not even on a repeat call"
+        );
+
+        let clock = FrozenClock(std::sync::atomic::AtomicU64::new(1_700_000_000));
+        kv.touch_os_partition_last_seen("k1", &clock).await.unwrap();
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(
+            rows[0].last_seen_at.as_deref(),
+            Some(agent24_core::util::iso8601_from_epoch_secs(1_700_000_000)).as_deref(),
+            "touch_os_partition_last_seen must write exactly what the injected \
+             clock said, not SystemTime::now() — this is the real NULL -> \
+             timestamp transition H1's judgement requires"
+        );
+    }
+
+    #[tokio::test]
+    async fn touching_an_unrecorded_owner_key_is_an_error_not_a_silent_no_op() {
+        // Pins the `rows_affected() == 0` guard: without it, `UPDATE ...
+        // WHERE owner_key = ?` matching nothing still returns `Ok(())` from
+        // `execute()`, and a caller (`OsMemoryCatalog::mark_mounted`) would
+        // add a partition to its in-memory inventory believing the durable
+        // timestamp was advanced when nothing was.
+        let kv = KvStore::open_memory().await.unwrap();
+        let clock = FrozenClock(std::sync::atomic::AtomicU64::new(1_700_000_000));
+        let err = kv
+            .touch_os_partition_last_seen("no-such-key", &clock)
+            .await
+            .expect_err("there is no row for this owner_key");
+        assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
