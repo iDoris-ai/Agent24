@@ -162,23 +162,77 @@ async fn get_returns_valid_inactive_and_cleanup_failed_rows() {
 async fn get_triggers_no_workspace_or_lease_mutation() {
     let store = Store::open_memory().await.unwrap();
     create(&store).await;
-    sqlx::query(
-        "CREATE TRIGGER deny_workspace_update BEFORE UPDATE ON workspaces
-         BEGIN SELECT RAISE(ABORT, 'workspace update denied'); END",
-    )
-    .execute(test_hooks::pool(&store))
-    .await
-    .unwrap();
-    sqlx::query(
-        "CREATE TRIGGER deny_lease_update BEFORE UPDATE ON workspace_leases
-         BEGIN SELECT RAISE(ABORT, 'lease update denied'); END",
-    )
-    .execute(test_hooks::pool(&store))
-    .await
-    .unwrap();
+    for (name, event, table, message) in [
+        (
+            "deny_workspace_insert",
+            "INSERT",
+            "workspaces",
+            "workspace insert denied",
+        ),
+        (
+            "deny_workspace_update",
+            "UPDATE",
+            "workspaces",
+            "workspace update denied",
+        ),
+        (
+            "deny_workspace_delete",
+            "DELETE",
+            "workspaces",
+            "workspace delete denied",
+        ),
+        (
+            "deny_lease_insert",
+            "INSERT",
+            "workspace_leases",
+            "lease insert denied",
+        ),
+        (
+            "deny_lease_update",
+            "UPDATE",
+            "workspace_leases",
+            "lease update denied",
+        ),
+        (
+            "deny_lease_delete",
+            "DELETE",
+            "workspace_leases",
+            "lease delete denied",
+        ),
+    ] {
+        let statement = format!(
+            "CREATE TRIGGER {name} BEFORE {event} ON {table}
+             BEGIN SELECT RAISE(ABORT, '{message}'); END"
+        );
+        sqlx::query(&statement)
+            .execute(test_hooks::pool(&store))
+            .await
+            .unwrap();
+    }
+
+    let before_workspaces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    let before_leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_leases")
+        .fetch_one(test_hooks::pool(&store))
+        .await
+        .unwrap();
 
     let id = WorkspaceId::parse(ID).unwrap();
-    assert_eq!(store.get_workspace(&id).await.unwrap().id, id);
+    let got = store.get_workspace(&id).await.unwrap();
+    assert_eq!(got.id, id);
+    assert_eq!(got.state, "active");
+    let after_workspaces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    let after_leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_leases")
+        .fetch_one(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    assert_eq!(after_workspaces, before_workspaces);
+    assert_eq!(after_leases, before_leases);
 }
 
 #[tokio::test]
@@ -224,10 +278,7 @@ async fn cancelled_queued_get_releases_pool_waiter() {
         .unwrap();
     create(&store).await;
     let id = WorkspaceId::parse(ID).unwrap();
-    let mut held = Vec::new();
-    for _ in 0..5 {
-        held.push(test_hooks::pool(&store).acquire().await.unwrap());
-    }
+    let held = test_hooks::pool(&store).acquire().await.unwrap();
     let queued = {
         let store = store.clone();
         let id = id.clone();
@@ -236,8 +287,10 @@ async fn cancelled_queued_get_releases_pool_waiter() {
     for _ in 0..4 {
         tokio::task::yield_now().await;
     }
+    assert!(!queued.is_finished(), "GET completed while pool was held");
     queued.abort();
-    let _ = queued.await;
+    let error = queued.await.expect_err("queued GET should be cancelled");
+    assert!(error.is_cancelled());
     drop(held);
     assert_eq!(store.get_workspace(&id).await.unwrap().id, id);
 }
