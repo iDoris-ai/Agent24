@@ -566,6 +566,29 @@ fn group_is_empty(group: Pid) -> bool {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        match TEST_LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn wait_for_reaper_idle() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match global_reaper().reserve() {
+                Ok(permit) => {
+                    drop(permit);
+                    return;
+                }
+                Err(_) if Instant::now() < deadline => thread::sleep(EXIT_POLL),
+                Err(error) => panic!("reaper did not become idle: {error}"),
+            }
+        }
+    }
+
     fn sleeping_generation() -> OwnedGeneration {
         match OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("sleep 30")) {
             Ok(generation) => generation,
@@ -582,6 +605,7 @@ mod tests {
 
     #[test]
     fn graceful_stop_keeps_leader_owned_until_reap() {
+        let _test_guard = test_lock();
         let mut generation = sleeping_generation();
         assert!(generation.reap_after_stop().is_err());
         assert!(generation.terminate().is_ok());
@@ -596,6 +620,7 @@ mod tests {
 
     #[test]
     fn force_kill_is_limited_to_the_owned_group() {
+        let _test_guard = test_lock();
         let mut generation = sleeping_generation();
         assert!(generation.force_kill().is_ok());
         let status = match generation.reap_after_stop() {
@@ -607,7 +632,29 @@ mod tests {
     }
 
     #[test]
+    fn a_second_launch_is_rejected_until_the_owned_generation_is_reaped() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        let second =
+            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 0"));
+        assert!(matches!(second, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+
+        assert!(generation.force_kill().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
+        let replacement = match OwnedGeneration::launch(
+            LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 0"),
+        ) {
+            Ok(generation) => generation,
+            Err(error) => panic!("permit was not released after ownership-safe stop: {error}"),
+        };
+        let mut replacement = replacement;
+        assert!(replacement.force_kill().is_ok());
+        assert!(replacement.reap_after_stop().is_ok());
+    }
+
+    #[test]
     fn phase_transitions_are_monotonic_and_idempotent() {
+        let _test_guard = test_lock();
         let mut generation = sleeping_generation();
         assert!(generation.terminate().is_ok());
         assert!(generation.terminate().is_ok());
@@ -622,6 +669,7 @@ mod tests {
 
     #[test]
     fn drop_does_not_wait_for_the_child() {
+        let _test_guard = test_lock();
         let started = std::time::Instant::now();
         let generation = sleeping_generation();
         drop(generation);
@@ -629,10 +677,12 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(100),
             "Drop unexpectedly waited for the child"
         );
+        wait_for_reaper_idle();
     }
 
     #[test]
     fn drop_is_reaped_by_the_long_lived_global_worker() {
+        let _test_guard = test_lock();
         use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
 
         let generation = sleeping_generation();
@@ -665,6 +715,7 @@ mod tests {
 
     #[test]
     fn exited_leader_is_confirmed_before_group_kill_and_reap() {
+        let _test_guard = test_lock();
         let mut generation = exiting_generation();
         assert!(matches!(
             generation.wait_for_leader_exit(std::time::Duration::from_secs(1)),
@@ -680,6 +731,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_exited_unreaped_group_eperm_is_retry_safe() {
+        let _test_guard = test_lock();
         let mut generation = exiting_generation();
         assert!(matches!(
             generation.wait_for_leader_exit(std::time::Duration::from_secs(1)),
