@@ -74,13 +74,22 @@ const KERNEL_GRANTS: &[Capability] =
     &[Capability::Events, Capability::Memory, Capability::Approval];
 
 /// What an out-of-process module may be granted. Narrower than
-/// [`KERNEL_GRANTS`] on purpose: an out-of-process `Memory` (proxied to the
-/// M-D store) is not in scope yet and needs its own evaluation later —
-/// copying [`KERNEL_GRANTS`] here "because a superset is harmless" would grant
-/// it by accident. See `docs/design/T7a-ME3e-grants-and-events.md` §1.
+/// [`KERNEL_GRANTS`] on purpose — see `docs/design/T7a-ME3e-grants-and-events.md`
+/// §1 for why this list exists at all.
 /// `Approval` joined in T7b/ME-3e, alongside the wire handlers in
 /// `crate::approval_callback` that give it a real handler.
-const KERNEL_OOP_GRANTS: &[Capability] = &[Capability::Events, Capability::Approval];
+///
+/// `Memory` joined in T8.5c-W-mount. Out-of-process access to the shared
+/// memory base goes through the OOP wire surface (`_a24/memory/private/*`,
+/// T8.5c-W-wire), gated by [`crate::os_memory::MemoryEntitlement`] rather
+/// than by this list alone — a module may be in this grant set and still
+/// receive `MemoryEntitlement::NONE` (its partition could not be recorded,
+/// or the daemon has no connection-admission budget to offer — see
+/// `MemoryLease::admission()`). This list only says the kernel is WILLING to
+/// consider lending memory to an out-of-process module; whether it actually
+/// can is decided per mount.
+const KERNEL_OOP_GRANTS: &[Capability] =
+    &[Capability::Events, Capability::Approval, Capability::Memory];
 
 /// Names a module may not take, because the kernel already serves
 /// `/api/v1/<segment>` and axum PANICS on an exact route overlap:
@@ -271,7 +280,22 @@ impl MemoryLease {
             kv,
         })
     }
-    /// Lend `manifest`'s partition — or NOTHING, if it could not be recorded.
+    /// T8.5c-W-mount decision 4: the daemon-level OOP connection-admission
+    /// permit, or `None` if this lease's store has no headroom to offer one
+    /// (the ephemeral `:memory:` pool — its one connection is already needed
+    /// in-process, so `max_connections - 1 = 0` leaves nothing to lend; see
+    /// `agent24_memory::KvStore::oop_admission`'s doc). Reads `self.kv`
+    /// fresh every call rather than caching: there is then no second copy of
+    /// this value that could ever disagree with what `self.kv` actually is.
+    pub fn admission(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.kv.oop_admission()
+    }
+
+    /// Ensure `manifest`'s partition is durably recorded — or NOTHING, if it
+    /// could not be. Does not by itself confirm this run mounted it; the
+    /// caller must call [`crate::os_memory::OsMemoryCatalog::mark_mounted`]
+    /// once it has confirmed the mount actually succeeded (T8.5c-W-mount
+    /// decision 5).
     ///
     /// The catalog write is a precondition, not bookkeeping done afterwards. A
     /// partition the kernel lends but never records is orphaned data: rows under
@@ -282,15 +306,19 @@ impl MemoryLease {
     async fn lend(
         &self,
         manifest: &agent24_domain::DomainOsManifest,
-        catalogue: &mut crate::os_memory::OsMemoryCatalog,
-    ) -> Option<Arc<crate::os_memory::OsScopedMemory>> {
+        catalogue: &crate::os_memory::OsMemoryCatalog,
+    ) -> Option<(
+        Arc<crate::os_memory::OsScopedMemory>,
+        crate::os_memory::OsMemoryPartition,
+    )> {
         match catalogue
-            .record(&self.org, &self.user, manifest, &self.kv)
+            .ensure_recorded(&self.org, &self.user, manifest, &self.kv)
             .await
         {
-            Ok(partition) => Some(Arc::new(crate::os_memory::OsScopedMemory::new(
-                &partition, &self.kv,
-            ))),
+            Ok(partition) => Some((
+                Arc::new(crate::os_memory::OsScopedMemory::new(&partition, &self.kv)),
+                partition,
+            )),
             Err(e) => {
                 tracing::error!(
                     module = manifest.name(),
@@ -1025,6 +1053,8 @@ pub async fn mount_all(
                     root,
                     events,
                     inventory,
+                    memory,
+                    &mut partitions,
                     host,
                     approval_broker,
                 )
@@ -1150,10 +1180,18 @@ pub async fn mount_all(
         // Same shape for memory: the HANDLE is the capability. A module that did
         // not ask for it, or that the kernel has no base to lend, gets `None` —
         // not an unusable object it has to remember to check.
-        let scoped = match (granted.has(Capability::Memory), memory) {
-            (true, Some(lease)) => lease.lend(manifest, &mut partitions).await,
+        // Carries `lease` alongside the lend result (rather than
+        // re-deriving it from `memory` afterwards) so the `mark_mounted`
+        // call below needs no `Option::expect` — `scoped_lend` being `Some`
+        // is then a type-level guarantee that a lease is right there with it.
+        let scoped_lend = match (granted.has(Capability::Memory), memory) {
+            (true, Some(lease)) => lease
+                .lend(manifest, &partitions)
+                .await
+                .map(|(s, p)| (s, p, lease)),
             _ => None,
         };
+        let scoped = scoped_lend.as_ref().map(|(s, ..)| s.clone());
         // Same shape again for approval (T7b/ME-3e): the requester's
         // EXISTENCE is the capability, built only when granted, and it uses
         // the SAME `ModuleApprovalBroker` as every other mount path (proxy
@@ -1181,6 +1219,15 @@ pub async fn mount_all(
 
         tracing::info!("domain OS {name:?} mounted at {namespace} (grants: {granted_names:?})");
         app = app.nest(&namespace, module.routes(ctx));
+        // T8.5c-W-mount decision 5 (H1): only mark this partition "mounted"
+        // now that the route is actually nested — not right after `lend()`
+        // succeeded, which is what let a mount that failed AFTER `lend()`
+        // still get recorded as "just active" in the durable catalog.
+        if let Some((_, partition, lease)) = scoped_lend {
+            partitions
+                .mark_mounted(partition, &lease.kv, &agent24_memory::SystemClock)
+                .await;
+        }
         reports.push(MountReport {
             name,
             namespace,
@@ -1222,6 +1269,8 @@ async fn mount_package(
     root: &Path,
     events: &crate::events::EventsHub,
     inventory: &dyn ModelInventory,
+    memory: Option<&MemoryLease>,
+    partitions: &mut crate::os_memory::OsMemoryCatalog,
     host: std::result::Result<&ProcessHost, &str>,
     approval_broker: &Arc<crate::module_approval_broker::ModuleApprovalBroker>,
 ) -> (Router, MountReport) {
@@ -1303,11 +1352,51 @@ async fn mount_package(
     // `MethodsFor` closure both need it, and it must be the SAME `Grants` that
     // ends up in `MountReport.granted` below (judgement 10's consistency).
     let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_OOP_GRANTS);
-    let granted_names: Vec<String> = granted.iter().map(|c| c.as_str().to_owned()).collect();
     let broadcast: Arc<dyn EventBroadcast> = Arc::new(HubBroadcast(events.clone()));
     let event_sink = granted
         .has(Capability::Events)
         .then(|| Arc::new(EventSink::new(manifest, broadcast)));
+    // T8.5c-W-mount decision 4: only try to lend when this lease's store has
+    // OOP admission budget to offer (`admission()` is `None` for the
+    // ephemeral pool) — two different reasons to end up with nothing
+    // (`memory` is `None`, or it is `Some` but has no admission), same
+    // observable result either way: `memory_lend` is `None`.
+    // Carries `lease` alongside the result (rather than re-deriving it from
+    // `memory` where `mark_mounted` is called below) so that call needs no
+    // `Option::expect` — `memory_lend` being `Some` is a type-level
+    // guarantee that a lease is right there with it.
+    let memory_lend: Option<(
+        Arc<crate::os_memory::OsScopedMemory>,
+        crate::os_memory::OsMemoryPartition,
+        Arc<tokio::sync::Semaphore>,
+        &MemoryLease,
+    )> = if granted.has(Capability::Memory) {
+        match memory.and_then(|lease| lease.admission().map(|admission| (lease, admission))) {
+            Some((lease, admission)) => lease
+                .lend(manifest, partitions)
+                .await
+                .map(|(scoped, partition)| (scoped, partition, admission, lease)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let memory_entitlement = crate::os_memory::build_private_memory_entitlement(
+        memory_lend
+            .as_ref()
+            .map(|(scoped, _partition, admission, _lease)| (scoped.clone(), admission.clone())),
+    );
+    let memory_grant = crate::os_memory::memory_grant_name(&memory_entitlement);
+    // `granted` must name what the module ACTUALLY holds (invariant #134),
+    // so a `granted.has(Capability::Memory)` that did not turn into a real
+    // handle (`lend()` failed, or ephemeral has no admission) must not
+    // appear here — the same rule the in-process path already applies via
+    // `scoped.is_some()`.
+    let granted_names: Vec<String> = granted
+        .iter()
+        .map(|c| c.as_str().to_owned())
+        .filter(|c| c != Capability::Memory.as_str() || memory_grant.is_some())
+        .collect();
     // T7b/ME-3e: additive, not if/else (design doc §"现状" 1) — a module
     // granted ONLY `approval` (not `events`) must still get a non-empty
     // `Offer`, which an if/else between the two prefixes could never produce.
@@ -1318,14 +1407,42 @@ async fn mount_package(
     if granted.has(Capability::Approval) {
         provides.push("_a24/approval/".to_owned());
     }
+    if memory_grant.is_some() {
+        provides.push("_a24/memory/private/".to_owned());
+    }
     let offer = agent24_os_proto::initialize::Offer { provides };
     let methods_for: agent24_os_proto::supervisor::MethodsFor = {
         let name = name.clone();
         let granted = granted.clone();
         let event_sink = event_sink.clone();
         let approval_broker = approval_broker.clone();
+        // T8.5c-W-mount decision 3: captured HERE, outside the `move`
+        // closure below, and only `.clone()`d inside it — the opposite of
+        // `_a24/events/emit`'s limiter, which is deliberately rebuilt every
+        // generation. `memory_entitlement` was already computed exactly
+        // once for this mount (above); if it were not captured into this
+        // closure at all, the `Arc<RateLimiter>`/`Arc<Semaphore>` it holds
+        // would be dropped the moment `mount_package` returns, and nothing
+        // would keep decision 3's "one limiter per mount, reused across
+        // every restart generation" promise. `_a24/memory/private/*`'s
+        // `Handler::call()` implementation is T8.5c-W-wire's job (not this
+        // document's, §8) — this crate has no method to register it with
+        // yet, so the binding is unread for now (`_`-prefixed on purpose,
+        // like `PrivateMemoryHandle`'s fields — see their own doc comment).
+        let _memory_entitlement = memory_entitlement.clone();
         Arc::new(
             move |generation: &Arc<agent24_os_proto::drain::Generation>| {
+                // This inner clone itself only lives to the end of THIS
+                // `MethodsFor` call — the returned `Methods` does not carry
+                // it anywhere. What actually persists across restarts is the
+                // OUTER `_memory_entitlement` binding above: it is captured
+                // by THIS `move` closure once, and the closure itself
+                // (`Arc<dyn Fn>`) is what the supervisor loop holds for the
+                // module's whole supervised lifetime, calling it once per
+                // generation. A future `_a24/memory/private/*` `Handler`
+                // reads from a clone made HERE, inside the closure body —
+                // this line is where that will happen.
+                let _memory_entitlement = _memory_entitlement.clone();
                 // A fresh bucket every time this closure runs — once per
                 // generation, i.e. once per (re)start. Building it outside the
                 // closure and cloning the `Arc` in would let a restarted module
@@ -1424,6 +1541,31 @@ async fn mount_package(
         // A fresh slot, held by nobody: not expected. Still not a mounted module.
         Some(Err(held)) => return degraded(app, held.to_string()),
         Some(Ok(())) => {}
+    }
+    // T8.5c-W-mount decision 5 (H1): only now — supervisor slot occupied,
+    // child task spawned — is this partition really "mounted" in the sense
+    // that lets the durable catalog advance `last_seen_at`. The two failure
+    // branches above `return` before reaching here (verified by reading the
+    // `match` above, twice, independently — this is the exact H1 regression
+    // this decision exists to prevent), so a `lend()` that succeeded but
+    // whose module then failed to start leaves the durable identity row
+    // recorded (from `ensure_recorded`) but NOT marked active.
+    //
+    // Known gap, honestly recorded rather than silently skipped: there is
+    // no end-to-end test that forces `Some(Err(held))` specifically (a real
+    // supervisor-slot conflict) — `mount_all`'s own `claimed.insert(name)`
+    // check already makes it unreachable in ordinary sequential mounting,
+    // and provoking it would need an injectable seam into
+    // `agent24_os_proto::supervisor::supervise` that does not exist today.
+    // `an_oop_module_whose_partition_cannot_be_recorded_mounts_without_memory`
+    // (this module's tests) covers the other, reachable failure —
+    // `ensure_recorded` itself failing — end to end; the catalog-level
+    // `mark_mounted`/`ensure_recorded` split (`os_memory::tests`) covers the
+    // durable-state half of this exact scenario directly.
+    if let Some((_, partition, _, lease)) = memory_lend {
+        partitions
+            .mark_mounted(partition, &lease.kv, &agent24_memory::SystemClock)
+            .await;
     }
     tracing::info!(
         "domain OS {name:?} started from {} and proxied at {namespace} (grants: {granted_names:?})",
@@ -3314,6 +3456,308 @@ raise SystemExit(3)
         );
         assert!(!reports[0].granted.contains(&"memory".to_owned()));
         assert!(partitions.partitions().is_empty());
+    }
+
+    // ---------- T8.5c-W-mount: OOP memory entitlement (C1/C2/H1/H3/M2) ----------
+
+    #[tokio::test]
+    async fn memory_grant_name_reflects_only_whether_a_real_handle_exists() {
+        // §5.3 unit-level judgement: the rule both `granted_names`/`provides`
+        // filtering in `mount_package` rely on, in isolation from any mount.
+        assert_eq!(
+            crate::os_memory::memory_grant_name(&crate::os_memory::MemoryEntitlement::NONE),
+            None
+        );
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let with_handle = crate::os_memory::build_private_memory_entitlement(Some((
+            Arc::new(crate::os_memory::OsScopedMemory::new(
+                &crate::os_memory::OsMemoryPartition {
+                    key: "k".to_owned(),
+                    org: crate::os_memory::OrgId::from_store("org"),
+                    space: crate::os_memory::SpaceId::module_private("m"),
+                    user: "alice".to_owned(),
+                    module: "m".to_owned(),
+                },
+                &kv,
+            )),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        )));
+        assert_eq!(
+            crate::os_memory::memory_grant_name(&with_handle),
+            Some("memory")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_private_memory_entitlement_preserves_admission_and_creates_a_fresh_limiter() {
+        // §4.1/§7.1 judgement 4, unit level: given the same admission `Arc`
+        // twice, the function must hand it back unchanged (not clone into a
+        // new object) — and must build a NEW `RateLimiter` every call, never
+        // a daemon-level singleton.
+        let admission = Arc::new(tokio::sync::Semaphore::new(4));
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let a = crate::os_memory::build_private_memory_entitlement(Some((
+            Arc::new(crate::os_memory::OsScopedMemory::new(
+                &crate::os_memory::OsMemoryPartition {
+                    key: "k-a".to_owned(),
+                    org: crate::os_memory::OrgId::from_store("org"),
+                    space: crate::os_memory::SpaceId::module_private("a"),
+                    user: "alice".to_owned(),
+                    module: "a".to_owned(),
+                },
+                &kv,
+            )),
+            admission.clone(),
+        )));
+        let b = crate::os_memory::build_private_memory_entitlement(Some((
+            Arc::new(crate::os_memory::OsScopedMemory::new(
+                &crate::os_memory::OsMemoryPartition {
+                    key: "k-b".to_owned(),
+                    org: crate::os_memory::OrgId::from_store("org"),
+                    space: crate::os_memory::SpaceId::module_private("b"),
+                    user: "alice".to_owned(),
+                    module: "b".to_owned(),
+                },
+                &kv,
+            )),
+            admission.clone(),
+        )));
+        let ha = a.private_handle().unwrap();
+        let hb = b.private_handle().unwrap();
+        assert!(
+            Arc::ptr_eq(&ha.admission, &hb.admission),
+            "the same admission Arc handed in twice must come back unchanged"
+        );
+        assert!(
+            !Arc::ptr_eq(&ha.limiter, &hb.limiter),
+            "each call must build its OWN RateLimiter, never share a daemon-level one"
+        );
+    }
+
+    #[test]
+    fn two_modules_rate_limiters_are_behaviourally_isolated_not_just_different_pointers() {
+        // §7.1 judgement 4's negative control: a pointer-inequality check alone
+        // cannot rule out two `RateLimiter`s sharing internal state. This drains
+        // module A's limiter to empty and asserts module B's is unaffected —
+        // using `RateLimiter::with_clock` with a clock that never advances, so
+        // the number of calls needed to exhaust the budget is a constant, not a
+        // race against real refill (same pattern as `os_memory_page`'s
+        // `frozen_limiter`).
+        struct FrozenClock(std::time::Instant);
+        impl crate::events_emit::Clock for FrozenClock {
+            fn now(&self) -> std::time::Instant {
+                self.0
+            }
+        }
+        let frozen = std::time::Instant::now();
+        let a =
+            crate::events_emit::RateLimiter::with_clock(1.0, 0.0, Arc::new(FrozenClock(frozen)));
+        let b =
+            crate::events_emit::RateLimiter::with_clock(1.0, 0.0, Arc::new(FrozenClock(frozen)));
+        assert!(a.try_acquire(), "A's first call spends its only token");
+        assert!(
+            !a.try_acquire(),
+            "A must now be exhausted (frozen clock: no refill)"
+        );
+        assert!(
+            b.try_acquire(),
+            "B must be a completely separate budget, unaffected by A's exhaustion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_backed_kv_stores_real_oop_admission_permit_count_is_exactly_max_minus_one() {
+        // §7.1 judgement 4, Low fix (round 4): the permit count must come from
+        // a REAL `KvStore::open`, not from re-deriving the same formula the
+        // test would also use to construct a fake — that would only prove the
+        // test agrees with itself, not that `KvStore::open` computed it right.
+        let tmp = tempfile::tempdir().unwrap();
+        let kv = agent24_memory::KvStore::open(&tmp.path().join("m.db"))
+            .await
+            .unwrap();
+        let admission = kv.oop_admission().expect("file-backed must have admission");
+        assert_eq!(
+            admission.available_permits(),
+            (agent24_memory::KVSTORE_MAX_CONNECTIONS - 1) as usize
+        );
+        assert!(
+            agent24_memory::KvStore::open_memory()
+                .await
+                .unwrap()
+                .oop_admission()
+                .is_none(),
+            "ephemeral must never construct an admission permit, not even a zero-capacity one"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oop_module_that_asks_for_memory_is_granted_it_over_a_file_backed_lease() {
+        // ★ C1 positive judgement, integration level: a REAL out-of-process
+        // package, a REAL supervisor start, a file-backed (non-ephemeral)
+        // lease. Whether `Offer` itself carries the value over the real
+        // handshake is T8.5c-W-wire's job (§3.3's acceptance gap) — this
+        // proves the mount layer's own return values (`MountReport`,
+        // `OsMemoryCatalog`) are correct.
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package_with(&packages, "hungry-oop", "[memory]", PACKAGE_MODULE);
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let kv = agent24_memory::KvStore::open(&tmp.path().join("mem.db"))
+            .await
+            .unwrap();
+        let lease = MemoryLease::open("alice", kv).await.unwrap();
+        let (_, reports, partitions) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            Some(&lease),
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+        )
+        .await;
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "{:?}",
+            reports[0]
+        );
+        assert_eq!(reports[0].granted, vec!["memory".to_owned()]);
+        assert_eq!(
+            partitions.partitions().len(),
+            1,
+            "a real successful mount must confirm the partition (mark_mounted), \
+             not just record it (ensure_recorded)"
+        );
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oop_module_whose_partition_cannot_be_recorded_mounts_without_memory() {
+        // C1's negative control, integration level, provoked the way it could
+        // really happen (like `a_partition_that_cannot_be_recorded_is_not_lent`
+        // above, but through the OOP path): the durable identity row already
+        // exists under a DIFFERENT identity, so `ensure_recorded` refuses it.
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package_with(&packages, "hungry-oop", "[memory]", PACKAGE_MODULE);
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let kv = agent24_memory::KvStore::open(&tmp.path().join("mem.db"))
+            .await
+            .unwrap();
+        let org =
+            crate::os_memory::OrgId::from_store(kv.ensure_org_for_user("alice").await.unwrap());
+        let key = crate::os_memory::partition_key(
+            &org,
+            &crate::os_memory::SpaceId::module_private("hungry-oop"),
+        );
+        kv.record_os_partition(agent24_memory::OsPartitionIdentity {
+            owner_key: &key,
+            key_version: "v0-from-an-older-kernel",
+            org_id: org.as_str(),
+            space_id: "os:hungry-oop",
+            user: "alice",
+            module: "hungry-oop",
+        })
+        .await
+        .unwrap();
+        let lease = MemoryLease::open("alice", kv).await.unwrap();
+        let (_, reports, partitions) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            Some(&lease),
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+        )
+        .await;
+
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "a bookkeeping failure must not take down the module's process"
+        );
+        assert!(!reports[0].granted.contains(&"memory".to_owned()));
+        assert!(partitions.partitions().is_empty());
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ephemeral_withholds_oop_memory_but_not_in_process_memory() {
+        // ★ C2 boundary judgement: ephemeral withholds the OOP capability
+        // (no admission budget to offer — decision 4) while an in-process
+        // module under the SAME lease is completely unaffected (positive
+        // control — proves this is an admission-budget boundary, not
+        // ephemeral turning memory off altogether).
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package_with(&packages, "hungry-oop", "[memory]", PACKAGE_MODULE);
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        assert!(
+            kv.oop_admission().is_none(),
+            "sanity: the ephemeral pool must never carry an admission permit"
+        );
+        let lease = MemoryLease::open("alice", kv).await.unwrap();
+
+        let in_process_wants_memory = {
+            let yaml = manifest_yaml("hungry-in-process", "in_process_crate").replace(
+                "kernel_capabilities: [events]",
+                "kernel_capabilities: [memory]",
+            );
+            FakeModule::from_yaml(&yaml, false)
+        };
+        let mut catalogue = discovered(&packages);
+        catalogue.push(entry(in_process_wants_memory.clone()));
+
+        let (_, reports, _) = mount_all(
+            &catalogue,
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            Some(&lease),
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+        )
+        .await;
+
+        let oop_report = reports.iter().find(|r| r.name == "hungry-oop").unwrap();
+        assert_eq!(oop_report.outcome, MountOutcome::Mounted);
+        assert!(
+            !oop_report.granted.contains(&"memory".to_owned()),
+            "ephemeral must withhold the OOP memory capability"
+        );
+        assert!(
+            in_process_wants_memory.ctx().unwrap().memory().is_some(),
+            "ephemeral must NOT withhold in-process memory — only the OOP \
+             admission budget is absent, decision 4's whole point"
+        );
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
     }
 
     // ---------- ME-2: the registry ----------

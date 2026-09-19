@@ -107,7 +107,7 @@
 use std::sync::Arc;
 
 use agent24_domain::memory::{MemoryId, Recollection, Remember, Remembered, ScopedMemory};
-use agent24_domain::{DomainError, DomainOsManifest};
+use agent24_domain::{Capability, DomainError, DomainOsManifest};
 use agent24_memory::event::{EventQuery, EventStore, MemEvent, Origin, Scope, Trust};
 use agent24_os_proto::drain::{RequestLifecycle, bind_to_lifecycle};
 use agent24_os_proto::rpc::ErrorKind;
@@ -317,25 +317,34 @@ pub struct OsMemoryPartition {
 /// - the partition a module left behind when it was renamed,
 /// - partitions created under an older [`KEY_VERSION`].
 ///
-/// Those four are the entire reason a catalog was required. So [`Self::record`]
-/// now WRITES, and the `Vec` is what it says it is: this run's mount inventory,
-/// used for the startup log and for tests. Anything asking "which partitions
-/// exist for this org" must ask the table — [`Self::durable_for_org`] — not this.
+/// Those four are the entire reason a catalog was required. So
+/// [`Self::ensure_recorded`] now WRITES, and the `Vec` (populated by
+/// [`Self::mark_mounted`]) is what it says it is: this run's mount
+/// inventory, used for the startup log and for tests. Anything asking
+/// "which partitions exist for this org" must ask the table —
+/// [`Self::durable_for_org`] — not this.
 #[derive(Debug, Clone, Default)]
 pub struct OsMemoryCatalog {
     partitions: Vec<OsMemoryPartition>,
 }
 
 impl OsMemoryCatalog {
-    /// Durably record the partition for `(user, manifest)` and note it in this
-    /// run's inventory.
+    /// Ensure the durable identity row for `(user, manifest)` exists.
     ///
-    /// Fallible ON PURPOSE, and the caller must not lend a partition it could not
-    /// record: an unrecorded partition is precisely the orphaned data this exists
-    /// to prevent — rows under a NUL-containing owner key that nothing can later
-    /// attribute to a user or a module.
-    pub async fn record(
-        &mut self,
+    /// T8.5c-W-mount decision 5 (H1): this does **not** touch this run's
+    /// in-memory inventory and does **not** advance `last_seen_at` — it runs
+    /// BEFORE the kernel knows whether the module will actually mount
+    /// successfully, so it must not let the durable catalog claim a
+    /// partition is "just seen active" on a mount that then fails. The
+    /// caller must call [`Self::mark_mounted`] once it has confirmed the
+    /// mount actually succeeded.
+    ///
+    /// Fallible ON PURPOSE, and the caller must not lend a partition it could
+    /// not record: an unrecorded partition is precisely the orphaned data
+    /// this exists to prevent — rows under a NUL-containing owner key that
+    /// nothing can later attribute to a user or a module.
+    pub async fn ensure_recorded(
+        &self,
         org: &OrgId,
         user: &str,
         manifest: &DomainOsManifest,
@@ -359,8 +368,47 @@ impl OsMemoryCatalog {
         })
         .await
         .map_err(|e| e.to_string())?;
-        self.partitions.push(p.clone());
         Ok(p)
+    }
+
+    /// Confirm that `partition`'s module really did mount successfully this
+    /// run — routes are nested (in-process) or the supervisor has registered
+    /// it as a running child (OOP; see the module docs for what that
+    /// boundary does and does not mean). This is the only true source of
+    /// [`Self::partitions`] ("what mounted this run"), and the only call
+    /// site allowed to advance the durable `last_seen_at` signal.
+    ///
+    /// Idempotent by the partition's physical `key` (T8.5c-W-mount M2): a
+    /// second call for the same partition within this run returns
+    /// immediately — it neither adds a second entry to this run's inventory
+    /// nor touches the durable timestamp again (the implementation below
+    /// checks `self.partitions` and returns before doing either; it does
+    /// NOT fall through to a harmless re-touch).
+    pub async fn mark_mounted(
+        &mut self,
+        partition: OsMemoryPartition,
+        kv: &agent24_memory::KvStore,
+        clock: &dyn agent24_memory::Clock,
+    ) {
+        if self.partitions.iter().any(|p| p.key == partition.key) {
+            return;
+        }
+        // Best-effort: the caller has already decided this mount succeeded
+        // (its precondition for calling this at all — see the two call
+        // sites in `domain.rs`), so a failure to advance the durable
+        // timestamp must not un-mount it. It only makes the durable catalog
+        // under-report this partition's liveness until the next successful
+        // mount, which is logged rather than propagated.
+        if let Err(e) = kv.touch_os_partition_last_seen(&partition.key, clock).await {
+            tracing::warn!(
+                module = %partition.module,
+                error = %e,
+                "mounted, but could not advance this partition's last-seen-at; \
+                 the durable catalog will under-report its liveness until the \
+                 next successful mount"
+            );
+        }
+        self.partitions.push(partition);
     }
 
     /// Re-key every partition still stored under F1's `v1` format.
@@ -469,6 +517,120 @@ impl OsMemoryCatalog {
             .await
             .map_err(|e| e.to_string())
     }
+}
+
+/// T8.5c-W-mount decision 1: mount layer's single source of truth for
+/// "can this (out-of-process) module use `_a24/memory/private/*` right
+/// now, or the future `_a24/memory/scoped/*`".
+///
+/// Invariant: `private` is `Some` if and only if all three required parts —
+/// a real `Arc<OsScopedMemory>`, this `(module, partition)`'s own
+/// `Arc<RateLimiter>` (decision 3), and the daemon-level shared
+/// `Arc<Semaphore>` (decision 4) — are present together.
+/// [`PrivateMemoryHandle`]'s three fields are none of them `Option`, so the
+/// only way `private` can be `None` is the whole `Option` being `None` —
+/// there is no "half a handle" state.
+#[derive(Clone)]
+pub struct MemoryEntitlement {
+    private: Option<PrivateMemoryHandle>,
+    /// Always `None` — SPEC §3 leaves door 5: an old manifest's `memory`
+    /// maps only to `private`; `scoped` is a future capability. No
+    /// construction path can set this to `Some` today (`ScopedMemoryHandle`
+    /// declares no fields, see below).
+    ///
+    /// `#[allow(dead_code)]`: never READ today for the same reason
+    /// `PrivateMemoryHandle`'s fields below are not — nothing consumes
+    /// `MemoryEntitlement` yet except this mount layer's own `granted`/
+    /// `provides` filtering (`memory_grant_name`), which only asks
+    /// `private_handle().is_some()`. `_a24/memory/scoped/*`'s wire
+    /// implementation (F8c/F9) is what will read it.
+    #[allow(dead_code)]
+    scoped: Option<ScopedMemoryHandle>,
+}
+
+/// The three parts an OOP module needs to actually call
+/// `remember_checked`/`recall_page`/`recent_page` — all real, all required.
+///
+/// `#[allow(dead_code)]`: this mount-layer design doc's job stops at handing
+/// this struct to T8.5c-W-wire's `Handler::call()` implementation, which is
+/// what actually reads `memory`/`limiter`/`admission` — not built yet, so
+/// rustc's `--bin`-target reachability analysis (see `os_memory_page.rs`'s
+/// module doc for why `cargo test` does not silence this) sees three fields
+/// that are written but never read.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct PrivateMemoryHandle {
+    pub memory: Arc<OsScopedMemory>,
+    pub limiter: Arc<RateLimiter>,
+    /// Always real — not `Option`. `Option` lives only in
+    /// [`crate::domain::MemoryLease::admission`]'s return value;
+    /// [`PrivateMemoryHandle`] is only ever constructed once that call
+    /// already returned `Some` (T8.5c-W-mount decision 4).
+    pub admission: Arc<Semaphore>,
+}
+
+/// A placeholder type with no fields today — `Infallible` makes it
+/// uninhabited, turning "`scoped` is not reachable yet" from a doc promise
+/// into a compile-time fact. When F8c/F9 design `scoped` for real, this
+/// type gains real fields and the `Option<ScopedMemoryHandle>` construction
+/// path opens up — `MemoryEntitlement`'s shape does not need to change.
+#[derive(Clone)]
+pub struct ScopedMemoryHandle(std::convert::Infallible);
+
+impl MemoryEntitlement {
+    pub const NONE: MemoryEntitlement = MemoryEntitlement {
+        private: None,
+        scoped: None,
+    };
+
+    pub fn private(handle: PrivateMemoryHandle) -> MemoryEntitlement {
+        MemoryEntitlement {
+            private: Some(handle),
+            scoped: None,
+        }
+    }
+
+    pub fn private_handle(&self) -> Option<&PrivateMemoryHandle> {
+        self.private.as_ref()
+    }
+}
+
+/// T8.5c-W-mount decision 3/4: given the result of one `lend()` call (just
+/// the two `Arc`s this function actually needs — `partition` is left with
+/// the caller, for `mark_mounted`, so this cannot accidentally consume it),
+/// build the `MemoryEntitlement` that mount should hand this module. Pure —
+/// no I/O, no dependency on any other local state in `mount_package` — so it
+/// is unit-testable without running a mount at all.
+pub(crate) fn build_private_memory_entitlement(
+    lend: Option<(Arc<OsScopedMemory>, Arc<Semaphore>)>,
+) -> MemoryEntitlement {
+    match lend {
+        Some((scoped, admission)) => MemoryEntitlement::private(PrivateMemoryHandle {
+            memory: scoped,
+            // Exactly one limiter per call to this function — not inside the
+            // `methods_for` closure, which runs once per restart generation
+            // and must only ever CLONE this `Arc`, never rebuild it (unlike
+            // `_a24/events/emit`'s deliberately-per-generation limiter).
+            limiter: Arc::new(RateLimiter::new(
+                crate::os_memory_page::MEMORY_RATE_CAPACITY,
+                crate::os_memory_page::MEMORY_RATE_REFILL_PER_SEC,
+            )),
+            admission,
+        }),
+        None => MemoryEntitlement::NONE,
+    }
+}
+
+/// T8.5c-W-mount decision 2 (§5.3): whether `"memory"` belongs in
+/// `MountReport.granted`/`Offer.provides` — the single rule both call sites
+/// in `mount_package` use, so they cannot drift apart. `Some("memory")` iff
+/// `entitlement` really carries a handle: granting the capability without a
+/// handle would be a lie the caller has no way to detect.
+pub(crate) fn memory_grant_name(entitlement: &MemoryEntitlement) -> Option<&'static str> {
+    entitlement
+        .private_handle()
+        .is_some()
+        .then_some(Capability::Memory.as_str())
 }
 
 /// A module's handle onto the shared memory base.
@@ -969,10 +1131,31 @@ mod tests {
     }
 
     async fn handle(kv: &agent24_memory::KvStore, user: &str, name: &str) -> OsScopedMemory {
-        let mut cat = OsMemoryCatalog::default();
+        let cat = OsMemoryCatalog::default();
         let org = org_of(kv, user).await;
-        let p = cat.record(&org, user, &manifest(name), kv).await.unwrap();
+        let p = cat
+            .ensure_recorded(&org, user, &manifest(name), kv)
+            .await
+            .unwrap();
         OsScopedMemory::new(&p, kv)
+    }
+
+    /// Test-only convenience for the (many) tests here that only care about
+    /// the OLD, single-step `record` behaviour — `ensure_recorded` followed
+    /// immediately by `mark_mounted`, as if the mount that follows always
+    /// succeeds. The tests that specifically exercise the split (H1) call
+    /// the two steps separately instead of using this.
+    async fn record_and_mark(
+        cat: &mut OsMemoryCatalog,
+        org: &OrgId,
+        user: &str,
+        manifest: &DomainOsManifest,
+        kv: &agent24_memory::KvStore,
+    ) -> OsMemoryPartition {
+        let p = cat.ensure_recorded(org, user, manifest, kv).await.unwrap();
+        cat.mark_mounted(p.clone(), kv, &agent24_memory::SystemClock)
+            .await;
+        p
     }
 
     #[tokio::test]
@@ -1559,25 +1742,30 @@ mod tests {
         // partitions by LIKE-matching strings that contain NUL.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let mut cat = OsMemoryCatalog::default();
-        cat.record(
+        record_and_mark(
+            &mut cat,
             &org_of(&kv, "alice").await,
             "alice",
             &manifest("sin90"),
             &kv,
         )
-        .await
-        .unwrap();
-        cat.record(
+        .await;
+        record_and_mark(
+            &mut cat,
             &org_of(&kv, "alice").await,
             "alice",
             &manifest("cos72"),
             &kv,
         )
-        .await
-        .unwrap();
-        cat.record(&org_of(&kv, "bob").await, "bob", &manifest("sin90"), &kv)
-            .await
-            .unwrap();
+        .await;
+        record_and_mark(
+            &mut cat,
+            &org_of(&kv, "bob").await,
+            "bob",
+            &manifest("sin90"),
+            &kv,
+        )
+        .await;
 
         let alice = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
             .await
@@ -1614,10 +1802,10 @@ mod tests {
 
         // Run 1: two modules mount and write.
         {
-            let mut cat = OsMemoryCatalog::default();
+            let cat = OsMemoryCatalog::default();
             for name in ["sin90", "cos72"] {
                 let p = cat
-                    .record(&org_of(&kv, "alice").await, "alice", &manifest(name), &kv)
+                    .ensure_recorded(&org_of(&kv, "alice").await, "alice", &manifest(name), &kv)
                     .await
                     .unwrap();
                 OsScopedMemory::new(&p, &kv)
@@ -1629,14 +1817,14 @@ mod tests {
         // Run 2: cos72 has been disabled, and sin90 renamed to schedule — so the
         // fresh run's inventory knows about ONE partition while three exist.
         let mut run2 = OsMemoryCatalog::default();
-        run2.record(
+        record_and_mark(
+            &mut run2,
             &org_of(&kv, "alice").await,
             "alice",
             &manifest("schedule"),
             &kv,
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(run2.partitions().len(), 1);
 
         let rows = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
@@ -1663,21 +1851,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_the_same_partition_twice_leaves_last_seen_at_untouched() {
-        // Restarts re-record every mounted partition, so `record` must be
-        // idempotent. `first_seen_at` and `module_name` are write-once: a rename
-        // must NOT rewrite the row that says what the key originally meant.
-        //
-        // T8.5c-W-mount decision 5 moved "advance last_seen_at" out of `record`
-        // entirely (see `record_os_partition`'s doc comment in agent24-memory):
-        // a row `record` has never lent out must not read as "just active" to an
-        // operator. So unlike the old upsert, `last_seen_at` here isn't merely
-        // unchanged between two `record` calls — it never had a value to begin
-        // with, on the first call or any repeat.
+    async fn ensure_recorded_is_idempotent_and_never_advances_last_seen_at() {
+        // Restarts re-record every mounted partition, so `ensure_recorded` must
+        // be idempotent. `first_seen_at` and `module_name` are write-once: a
+        // rename must NOT rewrite the row that says what the key originally
+        // meant. And — T8.5c-W-mount decision 5 (H1) — `ensure_recorded` runs
+        // BEFORE the kernel knows whether the mount will succeed, so neither
+        // the first call nor a repeat may advance `last_seen_at`: only
+        // `mark_mounted` may, and only once the mount is confirmed.
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
-        let mut cat = OsMemoryCatalog::default();
+        let cat = OsMemoryCatalog::default();
         let p = cat
-            .record(
+            .ensure_recorded(
                 &org_of(&kv, "alice").await,
                 "alice",
                 &manifest("sin90"),
@@ -1690,10 +1875,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             first[0].last_seen_at, None,
-            "a partition record() has just created was never lent — it must not \
-             already read as seen"
+            "a first-time ensure_recorded must not claim the partition was ever \
+             seen active — the mount it precedes has not been confirmed yet"
         );
-        cat.record(
+
+        cat.ensure_recorded(
             &org_of(&kv, "alice").await,
             "alice",
             &manifest("sin90"),
@@ -1710,29 +1896,73 @@ mod tests {
         assert_eq!(again[0].module_name, "sin90");
         assert_eq!(
             again[0].last_seen_at, None,
-            "record must not be the thing that advances last_seen_at, not even on \
-             a repeat call — that is touch_os_partition_last_seen's job alone"
+            "a repeat ensure_recorded must not advance last_seen_at either — \
+             that is the ON CONFLICT branch, and it must behave like the INSERT \
+             branch on this column"
+        );
+    }
+
+    struct FixedClock(u64);
+    impl agent24_memory::Clock for FixedClock {
+        fn now_epoch_secs(&self) -> u64 {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_mounted_is_the_only_thing_that_advances_last_seen_at() {
+        // Split from the test above (which pins that `ensure_recorded` never
+        // advances `last_seen_at`, not even on a repeat call): this pins that
+        // `mark_mounted` — and only `mark_mounted` — does, using an injected
+        // clock rather than racing `SystemTime::now()`'s one-second resolution.
+        // Two separate `OsMemoryCatalog`s stand in for two separate daemon
+        // runs re-mounting the same module — `mark_mounted`'s own dedup
+        // (M2, tested below) is a WITHIN-one-run guard, not a claim that a
+        // later run's confirmed mount should leave last_seen_at alone.
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let org = org_of(&kv, "alice").await;
+        let p = OsMemoryCatalog::default()
+            .ensure_recorded(&org, "alice", &manifest("sin90"), &kv)
+            .await
+            .unwrap();
+
+        let mut run1 = OsMemoryCatalog::default();
+        run1.mark_mounted(p.clone(), &kv, &FixedClock(1_700_000_000))
+            .await;
+        let after_first_mount = OsMemoryCatalog::durable_for_org(&kv, &org).await.unwrap();
+        assert_eq!(
+            after_first_mount[0].last_seen_at.as_deref(),
+            Some(agent24_core::util::iso8601_from_epoch_secs(1_700_000_000)).as_deref(),
+            "mark_mounted must write exactly the injected clock's value — the \
+             None -> timestamp transition this decision exists to make real"
+        );
+
+        let mut run2 = OsMemoryCatalog::default();
+        run2.mark_mounted(p, &kv, &FixedClock(1_700_000_100)).await;
+        let after_second_mount = OsMemoryCatalog::durable_for_org(&kv, &org).await.unwrap();
+        assert_eq!(
+            after_second_mount[0].last_seen_at.as_deref(),
+            Some(agent24_core::util::iso8601_from_epoch_secs(1_700_000_100)).as_deref(),
+            "a later run's confirmed mount must advance last_seen_at again"
+        );
+        assert_eq!(
+            after_second_mount[0].first_seen_at, after_first_mount[0].first_seen_at,
+            "and first_seen_at must not move with it"
         );
     }
 
     #[tokio::test]
-    async fn touching_last_seen_at_advances_it_and_a_later_record_call_does_not_reset_it() {
-        // Companion to the test above: that one proves `record` never advances
-        // `last_seen_at`. This one proves the other half of decision 5 — the
-        // column is not stuck at NULL forever, `touch_os_partition_last_seen` is
-        // what a confirmed mount uses to advance it, and — the part the old,
-        // single-method version of this invariant could not even express — a
-        // LATER `record` call (e.g. the next daemon restart re-recording the same
-        // partition) must not stomp a real `last_seen_at` back to NULL or
-        // otherwise disturb it.
-        //
-        // `now_iso8601` has second resolution, so the wait is what makes the two
-        // stamps distinguishable at all. It is the price of asserting the thing
-        // rather than asserting around it.
+    async fn mark_mounted_dedupes_by_partition_key_within_one_run() {
+        // M2: `mark_mounted` claimed to be idempotent while its first
+        // implementation was an unconditional `Vec::push`. Pinned two ways:
+        // the SAME partition twice must not grow `partitions()`, and a
+        // DIFFERENT partition in between must still be added normally — so
+        // this is deduping by key, not "this method can only ever be called
+        // once".
         let kv = agent24_memory::KvStore::open_memory().await.unwrap();
         let mut cat = OsMemoryCatalog::default();
-        let p = cat
-            .record(
+        let sin90 = cat
+            .ensure_recorded(
                 &org_of(&kv, "alice").await,
                 "alice",
                 &manifest("sin90"),
@@ -1740,43 +1970,30 @@ mod tests {
             )
             .await
             .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        kv.touch_os_partition_last_seen(&p.key, &agent24_memory::SystemClock)
-            .await
-            .unwrap();
-        let touched = OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
-            .await
-            .unwrap();
-        assert!(
-            touched[0].last_seen_at.is_some(),
-            "touch_os_partition_last_seen must give a NULL last_seen_at its first \
-             real value"
+        cat.mark_mounted(sin90.clone(), &kv, &FixedClock(1)).await;
+        assert_eq!(cat.partitions().len(), 1);
+        cat.mark_mounted(sin90, &kv, &FixedClock(2)).await;
+        assert_eq!(
+            cat.partitions().len(),
+            1,
+            "a repeat mark_mounted for the SAME partition must not grow the inventory"
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        cat.record(
-            &org_of(&kv, "alice").await,
-            "alice",
-            &manifest("sin90"),
-            &kv,
-        )
-        .await
-        .unwrap();
-        let after_repeat_record =
-            OsMemoryCatalog::durable_for_org(&kv, &org_of(&kv, "alice").await)
-                .await
-                .unwrap();
-
+        let cos72 = cat
+            .ensure_recorded(
+                &org_of(&kv, "alice").await,
+                "alice",
+                &manifest("cos72"),
+                &kv,
+            )
+            .await
+            .unwrap();
+        cat.mark_mounted(cos72, &kv, &FixedClock(3)).await;
         assert_eq!(
-            after_repeat_record[0].last_seen_at, touched[0].last_seen_at,
-            "a later record() call for a partition that has already been touched \
-             must leave last_seen_at exactly as touch left it — record is not \
-             allowed to reset it back toward NULL, or to advance it again itself"
-        );
-        assert_eq!(
-            after_repeat_record[0].first_seen_at, touched[0].first_seen_at,
-            "and first_seen_at must not move with any of this"
+            cat.partitions().len(),
+            2,
+            "a DIFFERENT partition must still be added — dedup is by key, not a \
+             one-call-ever limit"
         );
     }
 
