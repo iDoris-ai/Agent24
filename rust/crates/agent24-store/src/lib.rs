@@ -14,8 +14,10 @@ mod module_approvals;
 mod repo;
 pub mod workspace_decode;
 pub(crate) mod workspace_decode_support;
+pub mod workspace_lease_decode;
 pub mod workspaces;
 pub use workspace_decode::WorkspaceRow;
+pub use workspace_lease_decode::WorkspaceLeaseRow;
 pub use workspaces::{
     HostLeaseTtl, LeaseKind, NewScratchWorkspace, RootIdentity, TrustedRootRegistration,
     WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceInstant, WorkspaceKind, WorkspaceLeaseId,

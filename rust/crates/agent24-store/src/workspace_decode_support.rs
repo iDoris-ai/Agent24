@@ -3,10 +3,10 @@ use sqlx::{Row, sqlite::SqliteRow};
 use crate::{WorkspaceInstant, WorkspaceResult, WorkspaceStoreError};
 
 pub(super) fn bad(field: &'static str) -> WorkspaceStoreError {
-    WorkspaceStoreError::CorruptRow {
-        table: "workspaces",
-        field,
-    }
+    bad_table("workspaces", field)
+}
+pub(super) fn bad_table(table: &'static str, field: &'static str) -> WorkspaceStoreError {
+    WorkspaceStoreError::CorruptRow { table, field }
 }
 pub(super) fn text(row: &SqliteRow, field: &'static str) -> WorkspaceResult<String> {
     let value = row.try_get::<String, _>(field).map_err(|_| bad(field))?;
