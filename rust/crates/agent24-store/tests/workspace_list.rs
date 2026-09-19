@@ -359,3 +359,50 @@ async fn cancelled_queued_list_releases_the_single_memory_pool_waiter() {
     let page = store.list_workspaces(&query(None, None, 10)).await.unwrap();
     assert_eq!(ids(&page), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1"]);
 }
+
+#[tokio::test]
+async fn list_cursor_keeps_inter_page_boundary_stable_when_newer_rows_arrive() {
+    let store = Store::open_memory().await.unwrap();
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        "active",
+        "2026-09-19T00:00:00.000Z",
+    )
+    .await;
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2",
+        "active",
+        "2026-09-19T00:01:00.000Z",
+    )
+    .await;
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X3",
+        "active",
+        "2026-09-19T00:01:00.000Z",
+    )
+    .await;
+    let first = store.list_workspaces(&query(None, None, 1)).await.unwrap();
+    assert_eq!(ids(&first), vec!["ws_01J5M4Q2Y7N8P9R0S1T2V3W4X3"]);
+
+    insert(
+        &store,
+        "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X4",
+        "active",
+        "2026-09-19T00:02:00.000Z",
+    )
+    .await;
+    let second = store
+        .list_workspaces(&query(None, first.next_cursor().cloned(), 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&second),
+        vec![
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        ]
+    );
+}
