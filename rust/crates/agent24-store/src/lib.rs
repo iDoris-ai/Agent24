@@ -12,6 +12,11 @@
 mod audit;
 mod module_approvals;
 mod repo;
+pub mod workspaces;
+pub use workspaces::{
+    HostLeaseTtl, RootIdentity, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
+    WorkspaceTtl,
+};
 
 pub use audit::AuditEntry;
 pub use repo::*;

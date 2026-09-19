@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Agent24 persistence — sqlx SQLite repositories enforcing agent24-core transitions, plus a hash-chained audit log"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 tracing = "0.1"
 agent24-core = { path = "../agent24-core" }
 agent24-protocol = { path = "../agent24-protocol" }
