@@ -9,7 +9,7 @@
 | P0 设计冻结 | PASS | ADR-001～005、依赖台账、风险与兼容矩阵已冻结并通过 SOL review |
 | A24-OD-00 capability 安全前置 | PASS（待逐层合并） | SOL 无 blocker/high；全量 Agent24/协议/CLI 测试及私有 ready-pipe 烟测通过 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
-| P2 workspace contract | IN PROGRESS | A24-OD-01 types、schema、store models 与 CREATE 已通过 SOL；GET 设计中 |
+| P2 workspace contract | IN PROGRESS | A24-OD-01 types、schema、store models、CREATE 与 GET 已通过 SOL；LIST 设计中 |
 | A24-OD-05 sidecar foundation | PASS（未接线） | manager foundation `a3b83fb` + host protocol `21ecfe7` 均通过 SOL exact-head 复核；平台 owner 实现中 |
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
@@ -74,7 +74,8 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 已验证 fail-closed workspace/lease decode、SQLite storage affinity、固定 UTC `Z`/闰秒拒绝、cleanup 状态与 `BEGIN IMMEDIATE`；
 - registry models/projection：#286/#287/#288/#289，分别为 132/156/69/95 changed lines；final `6394b50b0b80a21701717ddf1fecaf163fe0d8c0`，63 tests，SOL `PASS`；
 - registry CREATE：#293～#298、#304～#305，全部不超过 200 changed lines；final `b8a4621a00e9fce9e53f48d69792ed2ba1d83803`，81 tests，SOL 无 blocker/high/medium/low；
-- 下一切片只实现 registry GET；LIST 另批跟进，不提前加入 A24-OD-02 的 run/session 字段。
+- registry GET：#309～#311、#314、#317，全部不超过 200 changed lines；final `33b2e018a098ce48bb299ff3a40bd17fec52aaaf`，88 tests，SOL 无 blocker/high/medium/low；
+- 下一切片只实现 registry LIST，不提前加入 A24-OD-02 的 run/session 字段。
 
 ## A24-OD-05 已通过基础切片
 
