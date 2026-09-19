@@ -1,4 +1,4 @@
-use agent24_protocol::Workspace;
+use agent24_protocol::{Workspace, WorkspaceId};
 use sqlx::{Sqlite, Transaction};
 
 use crate::{
@@ -127,6 +127,17 @@ async fn insert_workspace(
 }
 
 impl Store {
+    /// Read one workspace directly from the pool without applying lifecycle policy.
+    pub async fn get_workspace(&self, id: &WorkspaceId) -> WorkspaceResult<Workspace> {
+        let row = sqlx::query("SELECT * FROM workspaces WHERE id = ? COLLATE BINARY LIMIT 1")
+            .bind(id.as_str())
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?
+            .ok_or(WorkspaceStoreError::NotFound)?;
+        decode_row(&row)
+    }
+
     /// Create an orchestrator-owned scratch workspace under one SQLite write lock.
     pub async fn create_workspace(
         &self,
