@@ -1280,7 +1280,11 @@ mod tests {
             .fetch_all(&kv.pool)
             .await
             .unwrap();
-        assert_eq!(fks.len(), 1, "org_id's FK to mem_orgs must survive the rebuild");
+        assert_eq!(
+            fks.len(),
+            1,
+            "org_id's FK to mem_orgs must survive the rebuild"
+        );
         assert_eq!(fks[0].get::<String, _>("from"), "org_id");
         assert_eq!(fks[0].get::<String, _>("table"), "mem_orgs");
         assert_eq!(fks[0].get::<String, _>("to"), "org_id");
@@ -1289,13 +1293,14 @@ mod tests {
             .fetch_all(&kv.pool)
             .await
             .unwrap();
-        let by_index_name = |name: &str| indexes.iter().find(|r| r.get::<String, _>("name") == name);
+        let by_index_name =
+            |name: &str| indexes.iter().find(|r| r.get::<String, _>("name") == name);
         assert!(
             by_index_name("mem_os_partitions_user").is_some(),
             "the provenance lookup index must survive the rebuild"
         );
-        let space_index =
-            by_index_name("mem_os_partitions_space").expect("the (org_id, space_id) index must survive");
+        let space_index = by_index_name("mem_os_partitions_space")
+            .expect("the (org_id, space_id) index must survive");
         assert_eq!(
             space_index.get::<i64, _>("unique"),
             1,
@@ -1343,11 +1348,13 @@ mod tests {
 
         // Seeded on the 0014 schema (`last_seen_at` is `NOT NULL` there): a
         // real org, membership, and one fully-populated partition row.
-        sqlx::query("INSERT INTO mem_orgs (org_id, display_name, created_at) VALUES ('org_x', 'X', ?)")
-            .bind(now_iso8601())
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO mem_orgs (org_id, display_name, created_at) VALUES ('org_x', 'X', ?)",
+        )
+        .bind(now_iso8601())
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO mem_org_members (org_id, user_id, joined_at) VALUES ('org_x', 'alice', ?)",
         )
