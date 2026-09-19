@@ -1,6 +1,6 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 types + schema SOL passed, store API implementing / A24-OD-05 unwired foundation SOL passed
+> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 types + schema + store foundation SOL passed, registry CRUD next / A24-OD-05 unwired foundation SOL passed
 >
 > 日期：2026-09-19
 >
@@ -56,7 +56,7 @@
 
 ### A24-OD-01 — Opaque workspace registry
 
-状态：`IN_PROGRESS / TYPES + SCHEMA SOL PASS / STORE API DESIGNING`
+状态：`IN_PROGRESS / TYPES + SCHEMA + STORE FOUNDATION SOL PASS / REGISTRY CRUD NEXT`
 
 目标分支：`feat/a24-workspace-registry`
 
