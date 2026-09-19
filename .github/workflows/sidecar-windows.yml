@@ -9,6 +9,9 @@ on:
       - "**/Cargo.lock"
       - ".github/workflows/sidecar-windows.yml"
 
+permissions:
+  contents: read
+
 concurrency:
   group: sidecar-windows-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -24,6 +27,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           submodules: false
+          persist-credentials: false
 
       - name: Rust toolchain
         shell: bash
@@ -45,12 +49,12 @@ jobs:
 
       - name: check
         working-directory: rust
-        run: cargo check -p agent24-sidecar-host -p agent24-sidecar-host-protocol
+        run: cargo check --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol
 
       - name: test
         working-directory: rust
-        run: cargo test -p agent24-sidecar-host -p agent24-sidecar-host-protocol
+        run: cargo test --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol
 
       - name: clippy
         working-directory: rust
-        run: cargo clippy -p agent24-sidecar-host -p agent24-sidecar-host-protocol --all-targets -- -D warnings
+        run: cargo clippy --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol --all-targets -- -D warnings
