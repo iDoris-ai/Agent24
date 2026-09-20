@@ -35,7 +35,7 @@
 owner 谓词。持有原始句柄的模块不需要「绕过」隔离，它只是不再经过隔离。
 
 **今天靠什么保证**：**机制 + 类型**。`ScopedMemory` 只暴露三个业务方法，没有任何 accessor
-返回底层 store（`agent24-domain/src/memory.rs:167`）；daemon 的实现字段私有、无 getter
+返回底层 store（`agent24-domain/src/memory.rs:167`；模块文档 `:12-24` 同样写明「没有底层句柄外逃」）；daemon 的实现字段私有、无 getter
 （`agent24d/src/os_memory.rs:636`）。进程外模块根本不链接本仓库的 crate，连类型都拿不到。
 
 ---
@@ -65,7 +65,7 @@ owner 由 `OsScopedMemory` 自己派生并自填。
 它读不到别人的数据，但能让别人读到暂时的空。
 
 **今天靠什么保证**：**机制**。`ScopedMemory` 上没有任何全局操作（`agent24-domain/src/memory.rs:167`）；
-`rebuild` 只存在于 crate 层（`agent24-memory/src/retriever.rs:55`），而模块拿不到 crate。
+`rebuild` 只存在于 crate 层（`agent24-memory/src/retriever.rs:55`）；模块拿到的 `KernelCtx` 只暴露 `events()` 与 `memory()`（`agent24-domain/src/lib.rs:1126-1151`）。进程外模块不链接本仓 crate；编译进内核的模块若直接依赖 crate 绕过，那是复审/信任边界，不是沙箱。
 F1 复审逐条扫过「接受 owner 作为参数的 API」，确认没有暴露给模块。
 
 ---

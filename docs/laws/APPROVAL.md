@@ -12,7 +12,7 @@
 
 | 查了什么 | 结果 | 位置 |
 |---|---|---|
-| override store 是否只有一个用户写入入口 | **是？** 只有一个 `set_risk_override`，注释写明安装路径不得调用；**没有机械门** | `agent24-store/src/repo.rs:746-775`；`../specs/TASKS.md` §「H2」 |
+| override store 是否只有一个用户写入入口 | **只有一个入口，但不是机械门。** 只有一个 `set_risk_override`，注释写明安装路径不得调用；**没有机械门** | `agent24-store/src/repo.rs:746-775`；`../specs/TASKS.md` §「H2」 |
 | override 是否只改风险级、不放行具体调用 | **是。** override 参与算 `effective_risk`，放行仍走同一条门禁 | `agent24-tools/src/lib.rs:279+` |
 | 内置工具能否被 override 放宽 | **不能。** 内置只可收紧，放宽沿 `RiskClass::escape_rank` 被拒并告警 | 同上 |
 | external 是否还提供 `approve_for_session` | **不提供。** 有定向目标时只给 `approve_for_target` | `agent24-policy/src/lib.rs:40-66` |
