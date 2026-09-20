@@ -123,13 +123,48 @@ Claude Code 一直在 `Agent24` 上持续开发（主 worktree + 15 个 feature 
 
 ---
 
-## 7. 当前状态
+## 7. 当前状态 —— **初始化已完成**（2026-09-20 19:12）
 
 - [x] 卸载不兼容插件 `@z47_rose_1/dsh-session-sync`
 - [x] 安装 `@claude2dsh/plugin@0.3.0` 并注册为 profile bundle
+- [x] 重启 DSH Desktop，插件加载成功（15 个 `claude2dsh_*` 工具已注册）
+- [x] **首次导入完成**：9/9 会话，共 **365 轮对话 / 17,659 个事件**
+- [x] **Auto mirror 已开启**并落盘到 `settings.yaml`（`paused: false, conflicts: [], pending: []`）
 - [x] 建立 DSH 专用 worktree `Agent24-dsh`（分支 `feat/a24-dsh`）
 - [x] 写入本文档
-- [ ] **重启 DSH Desktop** ← claude2dsh 必须重启才会加载
-- [ ] 首次导入 Agent24 的 9 个会话（5.1）
-- [ ] 打开 Auto mirror（5.2）
-- [ ] 删除任务表里的示例行，填入真实任务
+- [ ] 删除 4.2 任务表里的示例行，填入真实任务
+
+### 7.1 导入明细（首批）
+
+| 源会话 | 轮数 | 事件 | 工具调用 |
+|---|---|---|---|
+| `01018bd3…` | 30 | 2271 | 418 |
+| `17234327…` | 15 | 2830 | 549 |
+| `5f3d565a…` | 4 | 440 | 83 |
+| `92218e04…` | 31 | 1782 | 325 |
+| `93b8fc9f…` | 37 | 2088 | 373 |
+| `a90126ee…` | 104 | 3199 | 525 |
+| `ba90fc8c…` | 102 | 2385 | 367 |
+| `e9f936cf…` | 19 | 955 | 171 |
+| `fe14b3a4…` | 23 | 1709 | 317 |
+
+落盘位置：
+
+- 会话本体：`<DSH_HOME>/sessions/--Users-jason-Dev-auraai-Agent24--/claude-<uuid>/`（`session.v3.jsonl.zstd`）
+- 去重登记：`<DSH_HOME>/claude2dsh/registry.json`
+- 来源映射：`<DSH_HOME>/claude2dsh/session-sources.json`
+- 镜像状态：`<DSH_HOME>/claude2dsh/auto-sync-state.json`
+
+### 7.2 重跑 / 改设置
+
+重复导入同一目录是**幂等**的：已导入报 `already-imported`，源文件长出新轮次则报 `appended`（两边都改过时会**暂停**而不是覆盖）。
+
+设置页对应的 HTTP 接口（仅本机可信，无需 token）：
+
+```sh
+U='http://127.0.0.1:43129/plugins/claude2dsh/settings'
+curl -s "$U" -H 'Host: 127.0.0.1:43129'                    # GET 当前设置
+curl -s -X POST "$U" -H 'Host: 127.0.0.1:43129' \\
+     -H 'content-type: application/json' \\
+     -d '{"autoSync":{"enabled":false}}'                     # PATCH 设置
+```
