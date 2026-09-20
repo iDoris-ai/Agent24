@@ -57,6 +57,10 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tower = { version = "0.5", features = ["util"] }
 # A paused clock, for deadlines asserted exactly rather than with slack.
 tokio = { version = "1", features = ["test-util"] }
+# T9/ME-3f: the black-box test observes event forwarding at the real
+# `GET /api/v1/events` consumer boundary, not just the callback's ack — same
+# version/feature set `agent24-cli`'s TUI already uses as a client.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 
 [lints]
 workspace = true
