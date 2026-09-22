@@ -1,6 +1,6 @@
 # Agent24 × Open Design 实施计划（已批准，执行中）
 
-> 状态：Approved / P0 completed / A24-OD-00 next
+> 状态：Approved / P0 + A24-OD-00 + P1 gates passed / P2 in progress
 >
 > 日期：2026-09-19
 >
@@ -8,7 +8,9 @@
 >
 > 初始基线：Agent24 `04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
 >
-> 已同步主干：Agent24 `69baf50d62e6e3db5ca41a8882d35deb45ea3454`
+> 已合并主干：Agent24 `0495b5c70ac1a913a9cd04bdf24a1fc1f8809974`
+>
+> 已审计最新主干：Agent24 `9dfe91a0b66d2715e59dcda150ad2437b93d2bc9`（仅文档变化，待下一集成切片显式 merge）
 
 ## 1. 目标与非目标
 
@@ -339,7 +341,7 @@ Agent24 Electron main process
 
 - `feat/open-design-workspace` 是本工作的 integration branch。
 - Agent24 主干硬依赖使用独立 feature branches 实现并分别进入 `main`，不长期只存在于 integration branch；权威清单见 [AGENT24-DEPENDENCIES.md](AGENT24-DEPENDENCIES.md)。
-- 大块实现优先使用短分支/小 PR，再合回 integration branch，避免一个不可评审的大提交。
+- 实现按单一 feature/职责聚类为短分支和小 PR：默认目标不超过 190 个变更行，尽量不超过 200 行；达到上限先拆分，禁止积攒千行级 PR。不可分割的生成物或机械变更须显式说明例外。
 - `main` 更新后：先 `fetch`，查看差异和测试状态，再显式 merge `origin/main`。
 - integration branch 一旦共享，不 force-push、不重写别人已基于的历史。
 - 不触碰其他 worktree 中的未提交文件。

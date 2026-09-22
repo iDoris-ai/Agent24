@@ -1,12 +1,14 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 ready to implement
+> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 DB-only lifecycle SOL passed, renew designing / A24-OD-05 bounded codec SOL passed, frame reader designing
 >
-> 日期：2026-09-19
+> 日期：2026-09-20
 >
 > integration branch：`feat/open-design-workspace`
 >
-> 已审计 Agent24 主干：`origin/main@69baf50d62e6e3db5ca41a8882d35deb45ea3454`
+> 已审计 Agent24 主干：`origin/main@9ab5b6ee112e7e601758cb04c9aafac4c94680c7`
+>
+> 2026-09-22 漂移复核：新增 #262/#341 仅涉及 T9/ME-3f 黑盒测试、`agent24d` 测试依赖与状态文档；未改变 workspace/store/sidecar 契约。`Cargo.lock` 的独立依赖增量需在最终 rebase 时保留。
 
 ## 1. 目的
 
@@ -36,7 +38,7 @@
 
 ### A24-OD-00 — Capability-scoped daemon authority
 
-状态：`DESIGN_FROZEN`
+状态：`IMPLEMENTED / SOL PASS / PR STACK OPEN`
 
 目标分支：`feat/a24-capability-auth`
 
@@ -56,7 +58,7 @@
 
 ### A24-OD-01 — Opaque workspace registry
 
-状态：`PLANNED`
+状态：`IN_PROGRESS / REGISTRY + DB-ONLY EXPIRY/RELEASE SOL PASS / RENEW DESIGNING`
 
 目标分支：`feat/a24-workspace-registry`
 
@@ -141,11 +143,13 @@
 
 ### A24-OD-05 — 通用 sidecar manager
 
-状态：`PLANNED`
+状态：`FOUNDATION + HOST PROTOCOL + COMMON OWNER BASE PASS / ACTOR IMPLEMENTING / UNWIRED`
 
 目标分支：`feat/a24-desktop-sidecar-manager`
 
 要求：显式进程 ownership、动态端口/token、ready/health、重启策略、手动停止、graceful → forced shutdown、进程树清理、日志和 bounded shutdown。禁止用 `pkill -f` 之类模糊匹配终止 Open Design。
+
+当前证据：manager、host protocol、POSIX owner 与 Windows Job owner/CI 均以不超过 200 changed lines 的 PR 栈通过 SOL exact-head 复核；platform final 分别为 `247b355e0d9c693d6f580f9372c7f16eaab2fe2e` 与 `b8cfc3ddc2054953688aa94dc096e1eab08f8f28`。common owner base final 为 `df84c16c9d0ac19b7ee91e87b3060fcb70a54fd3`；bounded actor codec 经 #328/#340 修复并在 `c5b83201a06cd394ac22f2fb323bbb1be5326479` 通过 SOL，序列化帧和实际 allocation capacity 均受 65,536-byte 上限约束。foundation 未接入 renderer、IPC 或产品路由；frame reader、actor/supervision 通过前不得接线，也不得退化为 PID/PGID 数字信号或 `taskkill`。
 
 ### A24-OD-06 — Creative 独立 session/CSP
 
