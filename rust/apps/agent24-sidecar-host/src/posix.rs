@@ -603,20 +603,20 @@ fn group_is_empty(group: Pid) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
 
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         match TEST_LOCK.get_or_init(|| Mutex::new(())).lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
-    fn wait_for_reaper_idle() {
+    pub(crate) fn wait_for_reaper_idle() {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match global_reaper().reserve() {
