@@ -687,6 +687,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("read stderr: {error}"));
         assert_eq!(stdout_text, "out:hello");
         assert_eq!(stderr_text, "err:hello");
+        assert!(matches!(
+            generation.wait_for_leader_exit(Duration::from_secs(1)),
+            Ok(true)
+        ));
         assert!(generation.force_kill().is_ok());
         assert!(generation.reap_after_stop().is_ok());
     }
