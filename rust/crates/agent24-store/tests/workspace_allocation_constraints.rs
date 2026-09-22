@@ -288,7 +288,7 @@ async fn allocation_ids_names_times_and_failure_reasons_are_bounded() {
     let valid_workspace = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1";
     let invalid_ids = [
         (
-            format!("wa_{}", "A".repeat(27)),
+            format!("wa_0{}", "A".repeat(26)),
             valid_workspace.to_owned(),
             "allocation id length 30",
         ),
@@ -299,7 +299,7 @@ async fn allocation_ids_names_times_and_failure_reasons_are_bounded() {
         ),
         (
             valid_allocation.to_owned(),
-            format!("ws_{}", "A".repeat(27)),
+            format!("ws_0{}", "A".repeat(26)),
             "workspace id length 30",
         ),
         (
