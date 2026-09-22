@@ -405,6 +405,109 @@ pub(crate) fn plan_ready_mutation(
     }))
 }
 
+#[allow(dead_code)]
+pub(crate) async fn apply_ready_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    approval_id: &str,
+    ready_at: WorkspaceInstant,
+) -> WorkspaceResult<Option<ReadyMutation>> {
+    let hold = read_hold_tx(tx, run_id).await?;
+    if hold.approval_id.as_deref() != Some(approval_id) {
+        return Err(WorkspaceStoreError::InvalidValue {
+            field: "approval_id",
+        });
+    }
+    let run = read_run_facts(tx, &hold.run_id)
+        .await?
+        .ok_or(WorkspaceStoreError::CorruptRow {
+            table: "legacy_recovery_holds",
+            field: "run_id",
+        })?;
+    let approval =
+        read_approval_facts(tx, approval_id)
+            .await?
+            .ok_or(WorkspaceStoreError::CorruptRow {
+                table: "legacy_recovery_holds",
+                field: "approval_id",
+            })?;
+    if approval.run_id != run.id {
+        return Err(WorkspaceStoreError::CorruptRow {
+            table: "approvals",
+            field: "run_id",
+        });
+    }
+    let resolved = matches!(
+        approval.status,
+        ApprovalStatus::Approved
+            | ApprovalStatus::Denied
+            | ApprovalStatus::Aborted
+            | ApprovalStatus::TimedOut
+    );
+    let Some(mutation) =
+        plan_ready_mutation(&hold, run.status, resolved, approval_id, ready_at.clone())?
+    else {
+        return Ok(None);
+    };
+    let original_status =
+        serde_json::to_value(hold.original_status).map_err(|_| WorkspaceStoreError::Database)?;
+    let original_status = original_status
+        .as_str()
+        .ok_or(WorkspaceStoreError::Database)?;
+    let affected = sqlx::query(
+        "UPDATE legacy_recovery_holds SET recovery_state = ?, ready_at = ?
+         WHERE run_id = ? COLLATE BINARY AND cohort_id = ? COLLATE BINARY
+           AND workspace_id = ? COLLATE BINARY AND root_generation = ? COLLATE BINARY
+           AND original_status = ? COLLATE BINARY
+           AND recovery_state = ? COLLATE BINARY
+           AND approval_id = ? COLLATE BINARY
+           AND ready_at IS NULL AND reason_code IS ?
+           AND released_at IS NULL AND active_resume_approval_id IS NULL",
+    )
+    .bind(RecoveryState::Ready.as_str())
+    .bind(ready_at.as_str())
+    .bind(&hold.run_id)
+    .bind(&hold.cohort_id)
+    .bind(hold.workspace_id.as_str())
+    .bind(&hold.root_generation)
+    .bind(original_status)
+    .bind(hold.recovery_state.as_str())
+    .bind(approval_id)
+    .bind(hold.reason_code.as_deref())
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    if affected.rows_affected() != 1 {
+        return Err(WorkspaceStoreError::Database);
+    }
+    let mut expected = hold.clone();
+    expected.recovery_state = RecoveryState::Ready;
+    expected.ready_at = Some(ready_at.clone());
+    if read_hold_tx(tx, run_id).await? != expected {
+        return Err(WorkspaceStoreError::CorruptRow {
+            table: "legacy_recovery_holds",
+            field: "row",
+        });
+    }
+    let detail = serde_json::json!({
+        "run_id": mutation.run_id,
+        "cohort_id": mutation.cohort_id,
+        "workspace_id": mutation.workspace_id.as_str(),
+        "approval_id": approval_id,
+        "result_state": mutation.recovery_state.as_str(),
+    });
+    Store::append_audit_tx(
+        tx,
+        ready_at.as_str(),
+        "legacy_recovery",
+        "legacy_recovery.ready",
+        &detail,
+    )
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    Ok(Some(mutation))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +547,7 @@ mod tests {
              (run_id,cohort_id,workspace_id,root_generation,original_status,recovery_state,approval_id)
              VALUES ('run-strict','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5',
                      'g1','running','awaiting_decision','approval-strict');
+             UPDATE legacy_recovery_holds SET reason_code='legacy_reason';
              INSERT INTO workspace_leases
              (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at)
              VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6',
@@ -459,6 +563,32 @@ mod tests {
             .unwrap();
         assert!(violations.is_empty());
         store
+    }
+
+    type LeaseFacts = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    #[allow(clippy::unwrap_used)]
+    async fn lease_facts(tx: &mut Transaction<'_, Sqlite>) -> LeaseFacts {
+        sqlx::query_as(
+            "SELECT lease_id,workspace_id,root_generation,owner_id,kind,daemon_generation,
+                    host_instance_id,acquired_at,expires_at,renewed_at,released_at
+             FROM workspace_leases WHERE lease_id = 'wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6'",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -526,6 +656,76 @@ mod tests {
             ApprovalStatus::Approved
         );
         tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn apply_ready_tx_promotes_once_and_audits_atomically() {
+        let store = strict_facts_fixture().await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let hold_before = read_hold_tx(&mut tx, "run-strict").await.unwrap();
+        let run_before = read_run_facts(&mut tx, "run-strict").await.unwrap();
+        let approval_before = read_approval_facts(&mut tx, "approval-strict")
+            .await
+            .unwrap();
+        let lease_before = lease_facts(&mut tx).await;
+        sqlx::query("UPDATE approvals SET status='approved' WHERE id='approval-strict'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let ready_at = WorkspaceInstant::parse("2026-09-20T00:00:00.000Z").unwrap();
+        apply_ready_tx(&mut tx, "run-strict", "approval-strict", ready_at.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            apply_ready_tx(
+                &mut tx,
+                "run-strict",
+                "approval-strict",
+                WorkspaceInstant::parse("2026-09-20T00:01:00.000Z").unwrap(),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let mut expected_hold = hold_before.clone();
+        expected_hold.recovery_state = RecoveryState::Ready;
+        expected_hold.ready_at = Some(ready_at);
+        assert_eq!(
+            read_hold_tx(&mut tx, "run-strict").await.unwrap(),
+            expected_hold
+        );
+        assert_eq!(
+            read_run_facts(&mut tx, "run-strict").await.unwrap(),
+            run_before
+        );
+        let mut expected_approval = approval_before.unwrap();
+        expected_approval.status = ApprovalStatus::Approved;
+        assert_eq!(
+            read_approval_facts(&mut tx, "approval-strict")
+                .await
+                .unwrap(),
+            Some(expected_approval)
+        );
+        let lease_after = lease_facts(&mut tx).await;
+        assert_eq!(lease_after, lease_before);
+        tx.commit().await.unwrap();
+        let audit = store.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].actor, "legacy_recovery");
+        assert_eq!(audit[0].action, "legacy_recovery.ready");
+        assert_eq!(
+            audit[0].detail,
+            serde_json::json!({
+                "run_id": "run-strict",
+                "cohort_id": "cohort-strict",
+                "workspace_id": "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                "approval_id": "approval-strict",
+                "result_state": "ready",
+            })
+        );
+        store.verify_audit_chain().await.unwrap();
     }
 
     #[tokio::test]
