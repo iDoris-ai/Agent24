@@ -94,6 +94,7 @@ impl NdjsonFrameReader {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::{Request, RequestSequence, decode_request, encode_request};
     use super::*;
 
     fn complete(result: FrameRead, bytes: &[u8], consumed: usize) {
@@ -129,6 +130,12 @@ mod tests {
                 _ => panic!("unexpected framing result"),
             }
         }
+    }
+
+    #[test]
+    fn crlf_is_preserved_as_two_framing_bytes() {
+        let mut reader = NdjsonFrameReader::with_limit(4);
+        complete(reader.push(b"\r\n").unwrap(), b"\r\n", 2);
     }
 
     #[test]
@@ -208,6 +215,121 @@ mod tests {
             reader.push(&input[FRAME_READ_CHUNK_BYTES..]).unwrap(),
             &input,
             1,
+        );
+    }
+
+    #[test]
+    fn raw_invalid_json_and_utf8_are_framed_before_decode_rejects_them() {
+        for raw in [&b"\xff\n"[..], b"{broken}\n"] {
+            let mut reader = NdjsonFrameReader::control();
+            let frame = match reader.push(raw).unwrap() {
+                FrameRead::Complete { consumed, frame } => {
+                    assert_eq!(consumed, raw.len());
+                    frame
+                }
+                _ => panic!("framing must not parse payload bytes"),
+            };
+            assert_eq!(
+                decode_request(&frame, &mut RequestSequence::new()),
+                Err(super::super::ProtocolError::InvalidJson)
+            );
+        }
+    }
+
+    #[test]
+    fn crafted_growth_and_large_slices_remain_bounded_and_progress() {
+        let mut small = NdjsonFrameReader::with_limit(5000);
+        assert!(matches!(
+            small.push(b"x"),
+            Ok(FrameRead::NeedMore { consumed: 1 })
+        ));
+        assert!(matches!(
+            small.push(&[b'x'; FRAME_READ_CHUNK_BYTES]),
+            Ok(FrameRead::NeedMore {
+                consumed: FRAME_READ_CHUNK_BYTES
+            })
+        ));
+        assert!(small.buffer.capacity() <= small.limit);
+
+        let mut input = vec![b'x'; FRAME_READ_CHUNK_BYTES * 3];
+        input.push(b'\n');
+        let mut reader = NdjsonFrameReader::control();
+        let mut offset = 0;
+        loop {
+            match reader.push(&input[offset..]).unwrap() {
+                FrameRead::NeedMore { consumed } => {
+                    assert!(consumed > 0 && consumed <= FRAME_READ_CHUNK_BYTES);
+                    offset += consumed;
+                }
+                FrameRead::Complete { consumed, frame } => {
+                    assert!(consumed <= FRAME_READ_CHUNK_BYTES);
+                    assert_eq!(offset + consumed, input.len());
+                    assert_eq!(frame, input);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_limits_reject_unterminated_control_and_ready_frames() {
+        for (mut reader, limit) in [
+            (
+                NdjsonFrameReader::control(),
+                super::super::MAX_CONTROL_FRAME_BYTES,
+            ),
+            (
+                NdjsonFrameReader::target_ready(),
+                super::super::MAX_TARGET_READY_FRAME_BYTES,
+            ),
+        ] {
+            let input = vec![b'x'; limit + 1];
+            let mut offset = 0;
+            loop {
+                match reader.push(&input[offset..]) {
+                    Ok(FrameRead::NeedMore { consumed }) => offset += consumed,
+                    Err(FrameReadError::TooLarge { limit: actual }) => {
+                        assert_eq!(actual, limit);
+                        break;
+                    }
+                    _ => panic!("unterminated frame must exceed its limit"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_request_roundtrips_through_multichunk_framing() {
+        #[cfg(windows)]
+        let (executable, cwd) = (r"C:\agent\helper.exe", r"C:\agent");
+        #[cfg(not(windows))]
+        let (executable, cwd) = ("/agent/helper", "/agent");
+        let request = Request::Launch {
+            version: 1,
+            request_id: 1,
+            executable: executable.into(),
+            cwd: cwd.into(),
+            argv: vec!["x".repeat(4096); 2],
+            env: Default::default(),
+        };
+        let encoded = encode_request(&request, &mut RequestSequence::new()).unwrap();
+        let mut reader = NdjsonFrameReader::control();
+        let mut offset = 0;
+        let frame = loop {
+            match reader.push(&encoded[offset..]).unwrap() {
+                FrameRead::NeedMore { consumed } => {
+                    assert!(consumed <= FRAME_READ_CHUNK_BYTES);
+                    offset += consumed;
+                }
+                FrameRead::Complete { consumed, frame } => {
+                    assert!(consumed <= FRAME_READ_CHUNK_BYTES);
+                    break frame;
+                }
+            }
+        };
+        assert_eq!(
+            decode_request(&frame, &mut RequestSequence::new()),
+            Ok(request)
         );
     }
 }
