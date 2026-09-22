@@ -24,7 +24,7 @@ CREATE TABLE legacy_recovery_cohorts (
 );
 
 CREATE TABLE legacy_recovery_holds (
-    run_id TEXT PRIMARY KEY REFERENCES runs(id),
+    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(id),
     cohort_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     root_generation TEXT NOT NULL,
