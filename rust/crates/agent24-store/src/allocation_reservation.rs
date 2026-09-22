@@ -144,7 +144,9 @@ mod tests {
     use super::*;
     use agent24_protocol::WorkspaceId;
     use sqlx::Row;
-    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqliteOperation, SqlitePoolOptions,
+    };
     use std::{path::Path, str::FromStr, sync::Arc, sync::mpsc};
     use tokio::sync::Barrier;
     use tokio::time::{Duration, timeout};
@@ -332,6 +334,124 @@ mod tests {
             ))
         ));
         assert_eq!(counts(&reopened).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_before_commit_rolls_back_after_connection_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-commit-cancel.sqlite");
+        let task_intent = intent(
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+            "pre-commit-cancel",
+        );
+        let store = timeout(HOOK_TIMEOUT, hooked_store(&path)).await.unwrap();
+        let observer = timeout(HOOK_TIMEOUT, Store::open(&path))
+            .await
+            .unwrap()
+            .unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        // `hooked_store` has exactly one WAL connection. Installing the hook on
+        // that connection makes the callback boundary deterministic: the INSERT
+        // is visible only inside the uncommitted transaction, before the audit
+        // INSERT and COMMIT can run.
+        let mut connection = timeout(HOOK_TIMEOUT, store.pool.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut hook_handle = timeout(HOOK_TIMEOUT, connection.lock_handle())
+            .await
+            .unwrap()
+            .unwrap();
+        hook_handle.set_update_hook(move |event| {
+            if event.operation == SqliteOperation::Insert
+                && event.database == "main"
+                && event.table == "workspace_allocations"
+            {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(HOOK_TIMEOUT);
+            }
+        });
+        drop(hook_handle);
+        drop(connection);
+
+        let task_store = store.clone();
+        let task_intent = Arc::new(task_intent);
+        let task_intent_for_task = Arc::clone(&task_intent);
+        let task = tokio::spawn(async move {
+            task_store
+                .reserve_workspace_allocation(&task_intent_for_task)
+                .await
+        });
+        timeout(
+            HOOK_TIMEOUT,
+            tokio::task::spawn_blocking(move || entered_rx.recv_timeout(HOOK_TIMEOUT)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        // The worker is inside the SQLite update hook, so the transaction has
+        // not reached COMMIT. Aborting drops the SQLx transaction and queues its
+        // rollback; the callback is released only after cancellation is known.
+        assert_eq!(
+            timeout(HOOK_TIMEOUT, counts(&observer)).await.unwrap(),
+            (0, 0)
+        );
+        task.abort();
+        assert!(matches!(
+            timeout(HOOK_TIMEOUT, task).await,
+            Ok(Err(error)) if error.is_cancelled()
+        ));
+        release_tx.send(()).unwrap();
+
+        // A query on the same physical connection is a FIFO barrier behind the
+        // rollback queued by Transaction::drop. Do not inspect the database
+        // until this barrier completes.
+        let mut barrier = timeout(HOOK_TIMEOUT, store.pool.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(HOOK_TIMEOUT, sqlx::query("SELECT 1").execute(&mut *barrier))
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(HOOK_TIMEOUT, barrier.lock_handle())
+            .await
+            .unwrap()
+            .unwrap()
+            .remove_update_hook();
+        drop(barrier);
+        timeout(HOOK_TIMEOUT, store.pool.close()).await.unwrap();
+
+        let reopened = timeout(HOOK_TIMEOUT, Store::open(&path))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            timeout(HOOK_TIMEOUT, counts(&reopened)).await.unwrap(),
+            (0, 0)
+        );
+        let record = timeout(
+            HOOK_TIMEOUT,
+            reopened.reserve_workspace_allocation(&task_intent),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.id().as_str(), task_intent.allocation_id().as_str());
+        assert_eq!(record.phase(), AllocationPhase::Reserved);
+        assert_eq!(
+            timeout(HOOK_TIMEOUT, counts(&reopened)).await.unwrap(),
+            (1, 1)
+        );
+        timeout(HOOK_TIMEOUT, reopened.verify_audit_chain())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
