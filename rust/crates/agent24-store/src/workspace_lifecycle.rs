@@ -195,7 +195,6 @@ impl Store {
         ttl: WorkspaceTtl,
         now: &WorkspaceInstant,
     ) -> WorkspaceResult<Workspace> {
-        let proposed_expiry = now.checked_add_workspace_ttl(ttl)?;
         let mut tx = self.begin_workspace_immediate().await?;
         let mut workspace = select_workspace(&mut tx, id).await?;
 
@@ -221,6 +220,8 @@ impl Store {
         if workspace.state != WorkspaceState::Active {
             return commit_unchanged(tx, workspace).await;
         }
+
+        let proposed_expiry = now.checked_add_workspace_ttl(ttl)?;
 
         if workspace.renewed_at.as_ref() == Some(now) && workspace.expires_at == proposed_expiry {
             return commit_unchanged(tx, workspace).await;
