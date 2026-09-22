@@ -144,6 +144,8 @@ mod tests {
     use super::*;
     use agent24_protocol::WorkspaceId;
     use sqlx::Row;
+    use std::{path::Path, sync::Arc};
+    use tokio::sync::Barrier;
 
     fn intent(id: &str, workspace: &str, name: &str) -> AllocationIntent {
         AllocationIntent::new(
@@ -166,6 +168,129 @@ mod tests {
         .await
         .unwrap();
         (row.get("allocations"), row.get("audit"))
+    }
+
+    async fn wal_race(
+        path: &Path,
+        left: AllocationIntent,
+        right: AllocationIntent,
+    ) -> (
+        WorkspaceResult<AllocationRecord>,
+        WorkspaceResult<AllocationRecord>,
+        Store,
+    ) {
+        let first = Store::open(path).await.unwrap();
+        let second = Store::open(path).await.unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let first_gate = Arc::clone(&barrier);
+        let second_gate = Arc::clone(&barrier);
+        let (left, right) = tokio::join!(
+            async move {
+                first_gate.wait().await;
+                first.reserve_workspace_allocation(&left).await
+            },
+            async move {
+                second_gate.wait().await;
+                second.reserve_workspace_allocation(&right).await
+            },
+        );
+        (left, right, Store::open(path).await.unwrap())
+    }
+
+    async fn assert_wal_conflict(
+        path: &Path,
+        left: AllocationIntent,
+        right: AllocationIntent,
+        conflict: WorkspaceConflict,
+    ) {
+        let (left_result, right_result, observer) = wal_race(path, left, right).await;
+        assert!(left_result.is_ok() ^ right_result.is_ok());
+        let winner = left_result
+            .as_ref()
+            .ok()
+            .or_else(|| right_result.as_ref().ok())
+            .unwrap();
+        let loser = if left_result.is_ok() {
+            right_result.as_ref().err().unwrap()
+        } else {
+            left_result.as_ref().err().unwrap()
+        };
+        assert_eq!(loser, &WorkspaceStoreError::Conflict(conflict));
+        let visible = observer
+            .get_workspace_allocation(winner.id())
+            .await
+            .unwrap();
+        assert_eq!(visible.id().as_str(), winner.id().as_str());
+        assert_eq!(counts(&observer).await, (1, 1));
+        observer.verify_audit_chain().await.unwrap();
+
+        let replay = AllocationIntent::new(
+            winner.id().clone(),
+            winner.workspace_id().clone(),
+            winner.root_generation().to_owned(),
+            winner.relative_name().to_owned(),
+            winner.parent_identity(),
+            winner.created_at().clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            observer.reserve_workspace_allocation(&replay).await,
+            Err(WorkspaceStoreError::Conflict(
+                WorkspaceConflict::AllocationIdentifier
+            ))
+        ));
+        assert_eq!(counts(&observer).await, (1, 1));
+        observer.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_reservation_conflicts_are_serialized_and_replay_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_wal_conflict(
+            &dir.path().join("same-id.sqlite"),
+            intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                "same-id-left",
+            ),
+            intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+                "same-id-right",
+            ),
+            WorkspaceConflict::AllocationIdentifier,
+        )
+        .await;
+        assert_wal_conflict(
+            &dir.path().join("same-workspace.sqlite"),
+            intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X8",
+                "same-workspace-name",
+            ),
+            intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X9",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X8",
+                "same-workspace-name",
+            ),
+            WorkspaceConflict::AllocationWorkspace,
+        )
+        .await;
+        assert_wal_conflict(
+            &dir.path().join("same-relative-name.sqlite"),
+            intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XA",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XB",
+                "same-relative-name",
+            ),
+            intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XC",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XD",
+                "same-relative-name",
+            ),
+            WorkspaceConflict::AllocationRelativeName,
+        )
+        .await;
     }
 
     #[tokio::test]
