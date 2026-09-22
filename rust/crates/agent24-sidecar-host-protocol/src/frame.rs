@@ -5,7 +5,7 @@ use std::mem;
 pub const FRAME_READ_CHUNK_BYTES: usize = 4096;
 
 pub enum FrameRead {
-    NeedMore,
+    NeedMore { consumed: usize },
     Complete { consumed: usize, frame: Vec<u8> },
 }
 
@@ -76,7 +76,7 @@ impl NdjsonFrameReader {
                 frame: mem::take(&mut self.buffer),
             });
         }
-        Ok(FrameRead::NeedMore)
+        Ok(FrameRead::NeedMore { consumed: take })
     }
 
     pub fn finish(&mut self) -> Result<(), FrameReadError> {
@@ -109,12 +109,20 @@ mod tests {
     #[test]
     fn frames_across_push_shapes_and_leaves_next_frame_unconsumed() {
         let mut reader = NdjsonFrameReader::with_limit(16);
-        complete(reader.push(b"one\nrest").unwrap(), b"one\n", 4);
+        let input = b"one\nrest\n";
+        let consumed = match reader.push(input).unwrap() {
+            FrameRead::Complete { consumed, frame } => {
+                assert_eq!(frame, b"one\n");
+                consumed
+            }
+            _ => panic!("expected first frame"),
+        };
+        complete(reader.push(&input[consumed..]).unwrap(), b"rest\n", 5);
         complete(reader.push(b"\r\n").unwrap(), b"\r\n", 2);
         let mut bytewise = NdjsonFrameReader::with_limit(16);
         for byte in b"abc\n" {
             match bytewise.push(std::slice::from_ref(byte)).unwrap() {
-                FrameRead::NeedMore if *byte != b'\n' => (),
+                FrameRead::NeedMore { consumed: 1 } if *byte != b'\n' => (),
                 FrameRead::Complete { consumed: 1, frame } if *byte == b'\n' => {
                     assert_eq!(frame, b"abc\n");
                 }
@@ -138,7 +146,10 @@ mod tests {
     #[test]
     fn eof_and_constructor_limits_are_fail_closed() {
         let mut eof = NdjsonFrameReader::with_limit(8);
-        assert!(matches!(eof.push(b"part"), Ok(FrameRead::NeedMore)));
+        assert!(matches!(
+            eof.push(b"part"),
+            Ok(FrameRead::NeedMore { consumed: 4 })
+        ));
         assert_eq!(eof.finish(), Err(FrameReadError::UnexpectedEof));
         assert!(matches!(eof.push(b"\n"), Err(FrameReadError::Closed)));
         assert_eq!(
@@ -164,7 +175,7 @@ mod tests {
             let mut result = None;
             for chunk in frame.chunks(FRAME_READ_CHUNK_BYTES) {
                 match reader.push(chunk).unwrap() {
-                    FrameRead::NeedMore => (),
+                    FrameRead::NeedMore { .. } => (),
                     FrameRead::Complete {
                         consumed,
                         frame: bytes,
@@ -176,5 +187,27 @@ mod tests {
             }
             assert_eq!(result.as_deref(), Some(frame.as_slice()));
         }
+    }
+
+    #[test]
+    fn push_reports_bounded_progress_and_empty_input() {
+        let mut reader = NdjsonFrameReader::with_limit(8192);
+        assert!(matches!(
+            reader.push(b""),
+            Ok(FrameRead::NeedMore { consumed: 0 })
+        ));
+        let mut input = vec![b'x'; FRAME_READ_CHUNK_BYTES];
+        input.push(b'\n');
+        assert!(matches!(
+            reader.push(&input),
+            Ok(FrameRead::NeedMore {
+                consumed: FRAME_READ_CHUNK_BYTES
+            })
+        ));
+        complete(
+            reader.push(&input[FRAME_READ_CHUNK_BYTES..]).unwrap(),
+            &input,
+            1,
+        );
     }
 }
