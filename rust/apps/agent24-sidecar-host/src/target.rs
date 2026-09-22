@@ -107,8 +107,8 @@ mod tests {
         assert!(target.take_pipes().is_err());
         let OwnedPipes {
             mut stdin,
-            mut stdout,
-            mut stderr,
+            stdout,
+            stderr,
         } = pipes;
         let (stdout_text, stderr_text) = tokio::time::timeout(Duration::from_secs(10), async {
             stdin.write_all(b"hello\n").await.expect("write stdin");
