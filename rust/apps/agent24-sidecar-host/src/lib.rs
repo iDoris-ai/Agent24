@@ -7,6 +7,8 @@
 #[allow(dead_code)]
 pub(crate) mod actor;
 #[allow(dead_code)]
+mod cleanup;
+#[allow(dead_code)]
 mod control_io;
 #[allow(dead_code)]
 mod output_io;
