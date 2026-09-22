@@ -54,8 +54,8 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
   journal 写事务，不是直接把调用方路径登记为 FS authority。
 - #379 的五态 recovery model 与 60-case pure decision matrix 通过 SOL；它只表达持久化
   决策，不提供 approval authority、执行权或启动恢复。
-- #378 bounded control reader 与 #381 resumable writer 通过 SOL；#382 POSIX owned pipes
-  已创建、CI 绿色、等待 exact-head review。host `run()` 仍 inert，G8 不能标为完成。
+- #378 bounded control reader、#381 resumable writer 与 #382 POSIX owned pipes 均通过
+  SOL。host `run()` 仍 inert，G8 不能标为完成；下一切片是 Windows pipes/observe/Job empty。
 - 01:48 监控：#227 仍 `REVIEW_REQUIRED`；#228/#229 的 approval 不能越过它；其余本计划
   PR 没有 external `APPROVED`/`REQUEST_CHANGES`，本轮无 merge。
 - 200 行仍是硬门禁。#362/#370/#373/#378 均恰好 200 行，#374 为 199、#381 为 195；
