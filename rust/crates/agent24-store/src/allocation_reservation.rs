@@ -142,6 +142,10 @@ impl Store {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::{
+        LifecycleOwnerRef, NewScratchWorkspace, TrustedRootRegistration, WorkspaceInstant,
+        WorkspaceProvenanceInput, WorkspaceTtl,
+    };
     use agent24_protocol::WorkspaceId;
     use sqlx::Row;
     use sqlx::sqlite::{
@@ -190,6 +194,32 @@ mod tests {
         .await
         .unwrap();
         (row.get("allocations"), row.get("audit"))
+    }
+
+    fn legacy_workspace(id: &str, root: &str, identity: RootIdentity) -> NewScratchWorkspace {
+        NewScratchWorkspace::new(
+            WorkspaceId::parse(id).unwrap(),
+            TrustedRootRegistration::new(root.into(), "generation-1".into(), identity).unwrap(),
+            WorkspaceProvenanceInput::new("git".into(), None, None).unwrap(),
+            LifecycleOwnerRef::parse("orchestrator-1".into()).unwrap(),
+            WorkspaceTtl::new(60_000).unwrap(),
+        )
+    }
+
+    async fn ordering_counts(store: &Store) -> (i64, i64, i64) {
+        let row = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM workspaces) AS workspaces,
+                    (SELECT COUNT(*) FROM workspace_allocations) AS allocations,
+                    (SELECT COUNT(*) FROM audit_log) AS audit",
+        )
+        .fetch_one(crate::test_hooks::pool(store))
+        .await
+        .unwrap();
+        (
+            row.get("workspaces"),
+            row.get("allocations"),
+            row.get("audit"),
+        )
     }
 
     async fn wal_race(
@@ -708,5 +738,95 @@ mod tests {
             .await
             .unwrap();
         assert!(store.reserve_workspace_allocation(&i).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_create_and_reservation_ordering_preserves_each_contract() {
+        let now = WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap();
+        let owner = LifecycleOwnerRef::parse("orchestrator-1".into()).unwrap();
+
+        // Legacy create wins: reservation sees the real public workspace row.
+        let store = Store::open_memory().await.unwrap();
+        let first = intent(
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+            "legacy-first",
+        );
+        store
+            .create_workspace(
+                &legacy_workspace(
+                    first.workspace_id().as_str(),
+                    "/legacy/first",
+                    first.parent_identity(),
+                ),
+                &owner,
+                &now,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.reserve_workspace_allocation(&first).await,
+            Err(WorkspaceStoreError::Conflict(WorkspaceConflict::Identifier))
+        ));
+        assert_eq!(ordering_counts(&store).await, (1, 0, 0));
+        store.verify_audit_chain().await.unwrap();
+
+        // Reservation wins: legacy create may still materialize the same ID;
+        // replaying the intent is an allocation-ID conflict with no new audit.
+        let store = Store::open_memory().await.unwrap();
+        let second = intent(
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+            "legacy-after-reserve",
+        );
+        store.reserve_workspace_allocation(&second).await.unwrap();
+        assert_eq!(ordering_counts(&store).await, (0, 1, 1));
+        store
+            .create_workspace(
+                &legacy_workspace(
+                    second.workspace_id().as_str(),
+                    "/legacy/after-reserve",
+                    second.parent_identity(),
+                ),
+                &owner,
+                &now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordering_counts(&store).await, (1, 1, 1));
+        assert_eq!(store.list_audit().await.unwrap().len(), 1);
+        store.verify_audit_chain().await.unwrap();
+        assert!(matches!(
+            store.reserve_workspace_allocation(&second).await,
+            Err(WorkspaceStoreError::Conflict(
+                WorkspaceConflict::AllocationIdentifier
+            ))
+        ));
+        assert_eq!(ordering_counts(&store).await, (1, 1, 1));
+        store.verify_audit_chain().await.unwrap();
+
+        // Different IDs remain a positive control: a reservation does not
+        // block a legacy workspace with an independent identity and ID.
+        let store = Store::open_memory().await.unwrap();
+        let reserved = intent(
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+            "different-reserved",
+        );
+        store.reserve_workspace_allocation(&reserved).await.unwrap();
+        store
+            .create_workspace(
+                &legacy_workspace(
+                    "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X8",
+                    "/legacy/different",
+                    RootIdentity::unix(&[3; 8], &[4; 8]).unwrap(),
+                ),
+                &owner,
+                &now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordering_counts(&store).await, (1, 1, 1));
+        store.verify_audit_chain().await.unwrap();
     }
 }
