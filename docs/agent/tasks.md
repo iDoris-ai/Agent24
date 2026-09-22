@@ -26,12 +26,23 @@
 
 `bash docs/agent/me3-status.sh` 核对：**3a-3g 全部 14 行"已在 main"，一个不剩**——ME-3（进程外领域 OS）专项到此整体交付完毕。
 
-**当前正在做**：**T10（Cos72 进程外样例，重做 `feat/me4-cos72-skeleton`）**——尚未开工。
+## 🔴 2026-09-20 待办清单（Codex 额度耗尽期间的收尾点，下次先核实再用）
 
-**收口后路径（用户 2026-09-19 拍板，按此顺序走）**：
+**用户 2026-09-20 改了顺序：T10（Cos72）暂停，优先做 T11（Sin90 迁出内核）**——借这个机会把 Sin90 从待办清单升级成完整 Life OS，设计输入见 `iDoris-ai/Sin90` 的 `docs/LIFEOS-DESIGN-INPUT.md`/`docs/DESIGN-LIFEOS.md`。
+
+- **P0，随时可能翻盘**：PR [#342](https://github.com/iDoris-ai/Agent24/pull/342)（T11 内核侧收尾——删掉编译进内核的 `agent24-sin90{,-os,-store}`）等 `clestons` 复审，`REVIEW_REQUIRED`。已经独立编译这个分支的二进制、跑通 Sin90 那边的真实端到端挂载黑盒测试（挂载/代理/事件转发全过），对内容有信心，但仍要等外部 review 批准才能合并。**批了就合，合并后本节这条 TODO 删掉，补一条 T11 完成记录（当前文档里 T11 还没有独立的完成条目）**。
+- **P0，额度恢复后立刻做**：Codex CLI 额度 2026-09-22 19:18 恢复后，`iDoris-ai/Sin90` 的 M0/M1/M2/挂载修复（commit `0d66f24`/`4032e82`/`8056ade`/`ab66b37`）目前只经过本地自审，没有真正的对抗式评审——尤其挂载修复里的 actor-key 门禁安全问题，应该优先送审。
+- **P1，已知遗留**：`docs/SIN90-PET0-INTEGRATION.md` 整篇假设"内核内置 Sin90"，T11 PR #342 合并后这个假设不成立，需要独立重写（`~/.agent24/os/sin90/sin90.db` 核实过是空的，不是紧急的破坏性变更，是文档债）。
+- **P2，明确暂停中**：T10（Cos72）——`feat/me4-cos72-skeleton` 分支保留，除非用户明确说继续，不要主动捡起来。
+- **P2**：T12（发布 v0.5.0）——依赖 T10（暂停）+ T11（等 #342 合并）。
+- **P3，可并行，未开始**：T13（`agent24-os-sdk`）+ T14（wire 文档）。
+
+完整会话记忆见协调 Claude 的 `project_todo_2026-09-20` 记忆条目（本机 `~/.claude/projects/-Users-jason-Dev-auraai-Agent24/memory/`）。
+
+**收口后路径（用户 2026-09-19 拍板，本轮插入了 T11 优先，其余顺序不变）**：
 
 ```
-T10（Cos72 进程外样例）→ T11（Sin90 迁出内核）→ T12（发布 v0.5.0）
+T11（Sin90 迁出内核，进行中）→ T10（Cos72 进程外样例，暂停）→ T12（发布 v0.5.0）
 ```
 （T13 `agent24-os-sdk` / T14 wire 文档可并行。）
 
