@@ -143,6 +143,30 @@ impl Store {
 mod tests {
     use super::*;
     use agent24_protocol::WorkspaceId;
+    use sqlx::Row;
+
+    fn intent(id: &str, workspace: &str, name: &str) -> AllocationIntent {
+        AllocationIntent::new(
+            crate::AllocationId::parse(id).unwrap(),
+            WorkspaceId::parse(workspace).unwrap(),
+            "generation-1".into(),
+            name.into(),
+            RootIdentity::unix(&[1; 8], &[2; 8]).unwrap(),
+            crate::WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn counts(store: &Store) -> (i64, i64) {
+        let row = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM workspace_allocations) AS allocations,
+                    (SELECT COUNT(*) FROM audit_log) AS audit",
+        )
+        .fetch_one(crate::test_hooks::pool(store))
+        .await
+        .unwrap();
+        (row.get("allocations"), row.get("audit"))
+    }
 
     #[tokio::test]
     async fn reserves_both_parent_identities_with_audit() {
@@ -183,5 +207,112 @@ mod tests {
                 .all(|entry| entry.action == "workspace_allocation.reserved")
         );
         store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_failure_rolls_back_and_connection_recovers() {
+        let store = Store::open_memory().await.unwrap();
+        let i = intent(
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+            "audit-failure",
+        );
+        sqlx::query(
+            "CREATE TRIGGER reject_reservation_audit BEFORE INSERT ON audit_log
+             BEGIN SELECT RAISE(ABORT, 'secret reservation audit'); END",
+        )
+        .execute(crate::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let error = store.reserve_workspace_allocation(&i).await.err().unwrap();
+        assert_eq!(error, WorkspaceStoreError::Database);
+        assert_eq!(error.to_string(), "workspace database error");
+        assert!(!error.to_string().contains("secret reservation audit"));
+        assert_eq!(counts(&store).await, (0, 0));
+        sqlx::query("DROP TRIGGER reject_reservation_audit")
+            .execute(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert!(store.reserve_workspace_allocation(&i).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn strict_reread_failures_roll_back_and_recover() {
+        for (name, trigger_name, update, field) in [
+            (
+                "mismatch",
+                "mismatch",
+                "UPDATE workspace_allocations SET root_generation = 'other-generation' WHERE allocation_id = NEW.allocation_id",
+                "row",
+            ),
+            (
+                "invalid-field",
+                "invalid_field",
+                "UPDATE workspace_allocations SET root_generation = CAST(42 AS BLOB) WHERE allocation_id = NEW.allocation_id",
+                "root_generation",
+            ),
+        ] {
+            let store = Store::open_memory().await.unwrap();
+            let i = intent(
+                if name == "mismatch" {
+                    "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X8"
+                } else {
+                    "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X9"
+                },
+                if name == "mismatch" {
+                    "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X8"
+                } else {
+                    "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X9"
+                },
+                name,
+            );
+            let trigger = format!(
+                "CREATE TRIGGER tamper_{trigger_name} AFTER INSERT ON workspace_allocations BEGIN {update}; END"
+            );
+            sqlx::query(&trigger)
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            assert_eq!(
+                store.reserve_workspace_allocation(&i).await.err(),
+                Some(WorkspaceStoreError::CorruptRow {
+                    table: "workspace_allocations",
+                    field,
+                })
+            );
+            assert_eq!(counts(&store).await, (0, 0));
+            sqlx::query(&format!("DROP TRIGGER tamper_{trigger_name}"))
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            assert!(store.reserve_workspace_allocation(&i).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn allocation_insert_failure_is_redacted_and_recovers() {
+        let store = Store::open_memory().await.unwrap();
+        let i = intent(
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XA",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XA",
+            "insert-failure",
+        );
+        sqlx::query(
+            "CREATE TRIGGER reject_reservation_insert BEFORE INSERT ON workspace_allocations
+             BEGIN SELECT RAISE(ABORT, 'secret reservation insert'); END",
+        )
+        .execute(crate::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let error = store.reserve_workspace_allocation(&i).await.err().unwrap();
+        assert_eq!(error, WorkspaceStoreError::Database);
+        assert_eq!(error.to_string(), "workspace database error");
+        assert!(!error.to_string().contains("secret reservation insert"));
+        assert_eq!(counts(&store).await, (0, 0));
+        sqlx::query("DROP TRIGGER reject_reservation_insert")
+            .execute(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert!(store.reserve_workspace_allocation(&i).await.is_ok());
     }
 }
