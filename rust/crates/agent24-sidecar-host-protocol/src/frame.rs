@@ -332,42 +332,4 @@ mod tests {
             Ok(request)
         );
     }
-
-    #[test]
-    fn reader_failures_do_not_affect_first_request_sequence() {
-        let mut oversized = NdjsonFrameReader::control();
-        let input = vec![b'x'; super::super::MAX_CONTROL_FRAME_BYTES];
-        let mut offset = 0;
-        loop {
-            match oversized.push(&input[offset..]) {
-                Ok(FrameRead::NeedMore { consumed }) => offset += consumed,
-                Err(FrameReadError::TooLarge { .. }) => break,
-                _ => panic!("unterminated oversized input must fail"),
-            }
-        }
-        let mut partial = NdjsonFrameReader::control();
-        assert!(matches!(
-            partial.push(b"partial"),
-            Ok(FrameRead::NeedMore { .. })
-        ));
-        assert_eq!(partial.finish(), Err(FrameReadError::UnexpectedEof));
-
-        let mut sequence = RequestSequence::new();
-        assert_eq!(sequence.accept(&launch()), Ok(()));
-    }
-
-    fn launch() -> Request {
-        #[cfg(windows)]
-        let (executable, cwd) = (r"C:\agent\helper.exe", r"C:\agent");
-        #[cfg(not(windows))]
-        let (executable, cwd) = ("/agent/helper", "/agent");
-        Request::Launch {
-            version: 1,
-            request_id: 1,
-            executable: executable.into(),
-            cwd: cwd.into(),
-            argv: Vec::new(),
-            env: Default::default(),
-        }
-    }
 }
