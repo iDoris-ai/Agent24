@@ -7,14 +7,28 @@
 | 阶段 | 状态 | 证据 |
 | --- | --- | --- |
 | P0 设计冻结 | PASS | ADR-001～005、依赖台账、风险与兼容矩阵已冻结并通过 SOL review |
-| A24-OD-00 capability 安全前置 | PASS（待逐层合并） | SOL 无 blocker/high；全量 Agent24/协议/CLI 测试及私有 ready-pipe 烟测通过 |
+| A24-OD-00 capability 安全前置 | PASS（逐层合并中） | #226 已合入 main；#227 retarget 后等待重新审批，其余保持堆叠顺序 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
-| P2 workspace contract | IN PROGRESS | A24-OD-01 registry CREATE/GET/LIST 与 DB-only expiry/release-request 已零遗留通过 SOL；renew 设计中 |
-| A24-OD-05 sidecar foundation | PASS（未接线） | manager、protocol、POSIX/Windows owner、common owner base 与 bounded actor codec 均通过 SOL；frame reader 设计中 |
+| P2 workspace contract | IN PROGRESS | DB registry/lifecycle/renew 与 allocation journal schema/约束通过 SOL；安全 root allocator/host lease/run binding 未完成 |
+| A24-OD-05 sidecar foundation | PASS（未接线） | manager、protocol、platform owner、codec、frame reader 与 actor state policy 通过 SOL；owned pipes/I/O 未完成 |
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 `outdated_cli / incompatible opencode args` 失败，随后停滞，需要 bounded SIGINT。
 这是显式基线例外，后续不得把它写成 PASS，也不得让它掩盖新增失败。
+
+## 2026-09-22 Wave 2 门禁
+
+- capability stack：#226 已 merge；#227 的旧审批因 base retarget 被 GitHub 正确作废，
+  当前等待新 approval，#228 以后不得越过依赖顺序合并；
+- renew：#349～#351 初审发现到期成功返回、时间 anchor 倒退和 CAS 缺口；#355 修复与
+  #360 原子回滚/审计/lease-preservation 测试均通过 SOL；
+- G1 root service：#359 只建立不可构造的 crate boundary；#363 allocation journal schema、
+  #364/#366 SQLite 约束矩阵通过 SOL。它们仍不代表 filesystem allocator 已实现；
+- sidecar：#352/#353 frame reader 修复/对抗测试、#362 one-generation actor state policy
+  通过 SOL；真实 owned pipes、bounded decoder、launch/ready/control/exit loop 尚未接线；
+- design：#354 G1/G2 scratch service plan、#358 durable legacy recovery holds、#361 G8
+  actor plan、#365 bounded Launch decoder 均已文档化并通过内部 exact-head review；
+- 上述新 PR 均已请求外部 review；除 #226 外尚无新的 external `APPROVED`，因此未合并。
 
 ## A24-OD-00 小 PR 栈
 
