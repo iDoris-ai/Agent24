@@ -16,6 +16,13 @@ pub(crate) enum ExitObservation {
     Exited { code: Option<i32> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeObservation {
+    Present,
+    ConfirmedEmpty,
+    Unconfirmed,
+}
+
 /// The common lifecycle boundary keeps its native owner private.
 pub(crate) struct OwnedTarget {
     owner: PlatformOwner,
