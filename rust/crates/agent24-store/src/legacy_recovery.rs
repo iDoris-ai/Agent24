@@ -1,8 +1,8 @@
 use crate::{
     Store, WorkspaceInstant, WorkspaceResult, WorkspaceStoreError, workspace_decode_support,
 };
-use agent24_protocol::{RunStatus, WorkspaceId};
-use sqlx::sqlite::SqliteRow;
+use agent24_protocol::{ApprovalStatus, RunStatus, WorkspaceId};
+use sqlx::{Sqlite, Transaction, sqlite::SqliteRow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryState {
@@ -55,6 +55,89 @@ pub struct LegacyRecoveryHold {
 
 fn bad(field: &'static str) -> WorkspaceStoreError {
     workspace_decode_support::bad_table("legacy_recovery_holds", field)
+}
+
+fn facts_text(
+    row: &SqliteRow,
+    table: &'static str,
+    field: &'static str,
+) -> WorkspaceResult<String> {
+    workspace_decode_support::text(row, field)
+        .map_err(|_| workspace_decode_support::bad_table(table, field))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct RunFacts {
+    id: String,
+    status: RunStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct ApprovalFacts {
+    id: String,
+    run_id: String,
+    status: ApprovalStatus,
+}
+
+#[allow(dead_code)]
+fn parse_run_status(value: &str) -> Option<RunStatus> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
+}
+
+#[allow(dead_code)]
+fn parse_approval_status(value: &str) -> Option<ApprovalStatus> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
+}
+
+#[allow(dead_code)]
+async fn read_run_facts(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+) -> WorkspaceResult<Option<RunFacts>> {
+    let row = sqlx::query("SELECT id,status FROM runs WHERE id = ? COLLATE BINARY LIMIT 1")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?;
+    let Some(row) = row else { return Ok(None) };
+    let actual_id = facts_text(&row, "runs", "id")?;
+    if actual_id != id {
+        return Err(workspace_decode_support::bad_table("runs", "id"));
+    }
+    let status = parse_run_status(&facts_text(&row, "runs", "status")?)
+        .ok_or_else(|| workspace_decode_support::bad_table("runs", "status"))?;
+    Ok(Some(RunFacts {
+        id: actual_id,
+        status,
+    }))
+}
+
+#[allow(dead_code)]
+async fn read_approval_facts(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+) -> WorkspaceResult<Option<ApprovalFacts>> {
+    let row =
+        sqlx::query("SELECT id,run_id,status FROM approvals WHERE id = ? COLLATE BINARY LIMIT 1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+    let Some(row) = row else { return Ok(None) };
+    let actual_id = facts_text(&row, "approvals", "id")?;
+    if actual_id != id {
+        return Err(workspace_decode_support::bad_table("approvals", "id"));
+    }
+    let run_id = facts_text(&row, "approvals", "run_id")?;
+    let status = parse_approval_status(&facts_text(&row, "approvals", "status")?)
+        .ok_or_else(|| workspace_decode_support::bad_table("approvals", "status"))?;
+    Ok(Some(ApprovalFacts {
+        id: actual_id,
+        run_id,
+        status,
+    }))
 }
 
 fn check<T>(result: WorkspaceResult<T>, field: &'static str) -> WorkspaceResult<T> {
@@ -304,6 +387,112 @@ pub(crate) fn plan_ready_mutation(
 mod tests {
     use super::*;
     use sqlx::SqlitePool;
+
+    #[allow(clippy::unwrap_used)]
+    async fn strict_facts_fixture() -> Store {
+        let store = Store::open_memory().await.unwrap();
+        let pool = store.pool();
+        let fk_enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(fk_enabled, 1);
+        sqlx::raw_sql(
+            "INSERT INTO workspaces
+             (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,
+              lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,
+              canonical_root,root_generation,root_identity_kind,unix_device,unix_inode)
+             VALUES ('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','legacy_compat','active','test',
+                     'external','orchestrator','owner','serial','2026-09-19T00:00:00.000Z',
+                     '2026-09-20T00:00:00.000Z',1,'/tmp/strict','g1','unix',zeroblob(8),zeroblob(8));
+             INSERT INTO legacy_recovery_cohorts
+             (cohort_id,migration_version,legacy_workspace_id,root_generation,created_at)
+             VALUES ('cohort-strict',1,'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1',
+                     '2026-09-19T00:00:00.000Z');
+             INSERT INTO runs (id,status,input,usage,created_at,workspace_id)
+             VALUES ('run-strict','running','{}','{}','2026-09-19T00:00:00.000Z',
+                     'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5');
+             INSERT INTO approvals
+             (id,run_id,tool_call_id,kind,summary,payload,available_decisions,status,
+              expires_at,created_at,workspace_id)
+             VALUES ('approval-strict','run-strict','tool','exec','test','{}','[]','pending',
+                     '2026-09-20T00:00:00.000Z','2026-09-19T00:00:00.000Z',
+                     'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5');
+             INSERT INTO legacy_recovery_holds
+             (run_id,cohort_id,workspace_id,root_generation,original_status,recovery_state,approval_id)
+             VALUES ('run-strict','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5',
+                     'g1','running','awaiting_decision','approval-strict');
+             INSERT INTO workspace_leases
+             (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at)
+             VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6',
+                     'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','run-strict','run',
+                     '2026-09-19T00:00:00.000Z');",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let violations = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        assert!(violations.is_empty());
+        store
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn strict_facts_are_tx_local_and_read_only() {
+        let store = strict_facts_fixture().await;
+        let pool = store.pool();
+        let before: (String, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT recovery_state FROM legacy_recovery_holds WHERE run_id='run-strict'),
+                    (SELECT count(*) FROM audit_log), (SELECT count(*) FROM workspace_leases), total_changes()",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(read_run_facts(&mut tx, "RUN-STRICT").await.unwrap(), None);
+        assert_eq!(
+            read_run_facts(&mut tx, "run-strict").await.unwrap(),
+            Some(RunFacts {
+                id: "run-strict".to_owned(),
+                status: RunStatus::Running
+            })
+        );
+        assert_eq!(
+            read_approval_facts(&mut tx, "approval-strict")
+                .await
+                .unwrap(),
+            Some(ApprovalFacts {
+                id: "approval-strict".to_owned(),
+                run_id: "run-strict".to_owned(),
+                status: ApprovalStatus::Pending,
+            })
+        );
+        let after: (String, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT recovery_state FROM legacy_recovery_holds WHERE run_id='run-strict'),
+                    (SELECT count(*) FROM audit_log), (SELECT count(*) FROM workspace_leases), total_changes()",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(after, before);
+        sqlx::query("UPDATE approvals SET status='approved' WHERE id='approval-strict'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_approval_facts(&mut tx, "approval-strict")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::Approved
+        );
+        tx.rollback().await.unwrap();
+    }
 
     #[allow(clippy::unwrap_used)]
     async fn execute(store: &Store, statement: &str) {
