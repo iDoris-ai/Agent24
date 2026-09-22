@@ -26,11 +26,15 @@ pub(crate) enum TreeObservation {
 /// The common lifecycle boundary keeps its native owner private.
 pub(crate) struct OwnedTarget {
     owner: PlatformOwner,
+    confirmed_empty: bool,
 }
 
 impl OwnedTarget {
     pub(crate) fn from_owned(owner: PlatformOwner) -> Self {
-        Self { owner }
+        Self {
+            owner,
+            confirmed_empty: false,
+        }
     }
 
     pub(crate) fn take_pipes(&mut self) -> io::Result<OwnedPipes> {
@@ -38,17 +42,19 @@ impl OwnedTarget {
     }
 
     pub(crate) fn request_stop(&mut self, force: bool) -> io::Result<()> {
-        if force {
-            return self.owner.force_kill();
-        }
-        #[cfg(unix)]
-        {
-            self.owner.terminate()
-        }
-        #[cfg(windows)]
-        {
-            Ok(())
-        }
+        self.request_stop_with(force, |owner, force| {
+            if force {
+                return owner.force_kill();
+            }
+            #[cfg(unix)]
+            {
+                owner.terminate()
+            }
+            #[cfg(windows)]
+            {
+                Ok(())
+            }
+        })
     }
 
     pub(crate) fn observe_exit(&mut self) -> io::Result<ExitObservation> {
@@ -68,7 +74,31 @@ impl OwnedTarget {
     }
 
     pub(crate) fn reap_step(&mut self) -> io::Result<TreeObservation> {
-        self.owner.reap_step()
+        self.reap_step_with(|owner| owner.reap_step())
+    }
+
+    fn request_stop_with<F>(&mut self, force: bool, stop: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut PlatformOwner, bool) -> io::Result<()>,
+    {
+        if self.confirmed_empty {
+            return Ok(());
+        }
+        stop(&mut self.owner, force)
+    }
+
+    fn reap_step_with<F>(&mut self, reap: F) -> io::Result<TreeObservation>
+    where
+        F: FnOnce(&mut PlatformOwner) -> io::Result<TreeObservation>,
+    {
+        if self.confirmed_empty {
+            return Ok(TreeObservation::ConfirmedEmpty);
+        }
+        let observation = reap(&mut self.owner)?;
+        if observation == TreeObservation::ConfirmedEmpty {
+            self.confirmed_empty = true;
+        }
+        Ok(observation)
     }
 }
 
@@ -169,6 +199,94 @@ mod tests {
                 TreeObservation::Unconfirmed => panic!("POSIX reap must not be unconfirmed"),
             }
         }
+        drop(target);
+        wait_for_reaper_idle();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_empty_is_a_common_tombstone_for_stop_and_reap() {
+        use crate::posix::{LaunchSpec, tests::test_lock, tests::wait_for_reaper_idle};
+
+        let _test_guard = test_lock();
+        let owner = PlatformOwner::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("true"))
+            .expect("spawn /bin/sh");
+        let mut target = OwnedTarget::from_owned(owner);
+        let mut reap_calls = 0;
+        assert_eq!(
+            target
+                .reap_step_with(|_| {
+                    reap_calls += 1;
+                    Ok(TreeObservation::ConfirmedEmpty)
+                })
+                .expect("initial reap"),
+            TreeObservation::ConfirmedEmpty
+        );
+        let mut stop_calls = 0;
+        target
+            .request_stop_with(false, |_, _| {
+                stop_calls += 1;
+                Err(io::Error::other("native stop must be bypassed"))
+            })
+            .expect("soft stop after tombstone");
+        target
+            .request_stop_with(true, |_, _| {
+                stop_calls += 1;
+                Err(io::Error::other("native stop must be bypassed"))
+            })
+            .expect("force stop after tombstone");
+        assert_eq!(
+            target
+                .reap_step_with(|_| {
+                    reap_calls += 1;
+                    Err(io::Error::other("native reap must be bypassed"))
+                })
+                .expect("repeat reap"),
+            TreeObservation::ConfirmedEmpty
+        );
+        assert_eq!(reap_calls, 1);
+        assert_eq!(stop_calls, 0);
+        drop(target);
+        wait_for_reaper_idle();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn present_and_error_do_not_latch_confirmed_empty() {
+        use crate::posix::{LaunchSpec, tests::test_lock, tests::wait_for_reaper_idle};
+
+        let _test_guard = test_lock();
+        let owner = PlatformOwner::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("true"))
+            .expect("spawn /bin/sh");
+        let mut target = OwnedTarget::from_owned(owner);
+        let mut reap_calls = 0;
+        assert_eq!(
+            target
+                .reap_step_with(|_| {
+                    reap_calls += 1;
+                    Ok(TreeObservation::Present)
+                })
+                .expect("present reap"),
+            TreeObservation::Present
+        );
+        assert!(
+            target
+                .reap_step_with(|_| {
+                    reap_calls += 1;
+                    Err(io::Error::other("probe failed"))
+                })
+                .is_err()
+        );
+        assert_eq!(
+            target
+                .reap_step_with(|_| {
+                    reap_calls += 1;
+                    Ok(TreeObservation::ConfirmedEmpty)
+                })
+                .expect("confirm reap"),
+            TreeObservation::ConfirmedEmpty
+        );
+        assert_eq!(reap_calls, 3);
         drop(target);
         wait_for_reaper_idle();
     }
