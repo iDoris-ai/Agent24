@@ -284,6 +284,48 @@ async fn allocation_remaining_database_constraints() {
 #[tokio::test]
 async fn allocation_ids_names_times_and_failure_reasons_are_bounded() {
     let store = Store::open_memory().await.unwrap();
+    let valid_allocation = "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X0";
+    let valid_workspace = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1";
+    let invalid_ids = [
+        (
+            format!("wa_{}", "A".repeat(27)),
+            valid_workspace.to_owned(),
+            "allocation id length 30",
+        ),
+        (
+            "wa_8AAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            valid_workspace.to_owned(),
+            "allocation id first ULID digit 8",
+        ),
+        (
+            valid_allocation.to_owned(),
+            format!("ws_{}", "A".repeat(27)),
+            "workspace id length 30",
+        ),
+        (
+            valid_allocation.to_owned(),
+            "ws_9AAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "workspace id first ULID digit 9",
+        ),
+    ];
+    for (allocation, workspace, label) in invalid_ids {
+        assert!(
+            !custom(
+                &store,
+                &allocation,
+                &workspace,
+                "valid-root",
+                UNIX,
+                NONE,
+                "reserved",
+                NOW,
+                None
+            )
+            .await,
+            "{label} must be rejected independently"
+        );
+    }
+
     let valid = [
         (
             "ax_01J5M4Q2Y7N8P9R0S1T2V3W4X0",
