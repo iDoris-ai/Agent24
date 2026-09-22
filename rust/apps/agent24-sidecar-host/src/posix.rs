@@ -10,7 +10,7 @@ use std::{
     ffi::OsString,
     io,
     path::PathBuf,
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     sync::{Arc, Condvar, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
@@ -24,12 +24,23 @@ const EXIT_POLL: Duration = Duration::from_millis(10);
 
 /// Inputs for one helper generation. The owner, not the caller, chooses the
 /// process group: the child becomes the group leader before it can exec.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LaunchSpec {
     executable: PathBuf,
     cwd: PathBuf,
     argv: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
+}
+
+impl std::fmt::Debug for LaunchSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchSpec")
+            .field("executable", &"<redacted>")
+            .field("cwd", &"<redacted>")
+            .field("argv_count", &self.argv.len())
+            .field("env_count", &self.env.len())
+            .finish()
+    }
 }
 
 impl LaunchSpec {
@@ -112,6 +123,14 @@ pub struct OwnedGeneration {
     permit: Option<GenerationPermit>,
 }
 
+/// The only handles through which the actor may communicate with its child.
+#[derive(Debug)]
+pub struct OwnedPipes {
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
+    pub stderr: ChildStderr,
+}
+
 impl OwnedGeneration {
     pub fn launch(spec: LaunchSpec) -> io::Result<Self> {
         if !spec.executable.is_absolute() || !spec.cwd.is_absolute() {
@@ -121,11 +140,15 @@ impl OwnedGeneration {
             ));
         }
         let mut command = Command::new(spec.executable);
-        command.current_dir(spec.cwd).args(spec.argv).envs(spec.env);
         command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .current_dir(spec.cwd)
+            .args(spec.argv)
+            .env_clear()
+            .envs(spec.env);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         command.process_group(0);
         let reaper = global_reaper();
         // Start the permanent worker and reserve the single generation slot
@@ -163,6 +186,27 @@ impl OwnedGeneration {
             status: None,
             permit: Some(permit),
         })
+    }
+
+    /// Transfers all three child pipes exactly once.
+    pub fn take_pipes(&mut self) -> io::Result<OwnedPipes> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| invalid_state("generation no longer owns its child"))?;
+        match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+            (Some(stdin), Some(stdout), Some(stderr)) => Ok(OwnedPipes {
+                stdin,
+                stdout,
+                stderr,
+            }),
+            _ => Err(invalid_state("child pipes have already been taken")),
+        }
+    }
+
+    /// Observes exit without reaping the leader or releasing ownership.
+    pub fn leader_exited(&self) -> io::Result<bool> {
+        self.leader_exited_wnowait()
     }
 
     pub fn terminate(&mut self) -> io::Result<()> {
@@ -252,10 +296,6 @@ impl OwnedGeneration {
         }
         self.phase = next;
         Ok(())
-    }
-
-    fn leader_exited(&self) -> io::Result<bool> {
-        self.leader_exited_wnowait()
     }
 
     fn leader_exited_wnowait(&self) -> io::Result<bool> {
@@ -565,6 +605,7 @@ fn group_is_empty(group: Pid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -601,6 +642,53 @@ mod tests {
             Ok(generation) => generation,
             Err(error) => panic!("spawn /bin/sh: {error}"),
         }
+    }
+
+    #[test]
+    fn launch_debug_redacts_paths_arguments_and_environment() {
+        let spec = LaunchSpec::new("/secret/program", "/secret/cwd")
+            .arg("secret-argument")
+            .env("SECRET_KEY", "secret-value");
+        let debug = format!("{spec:?}");
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("argv_count: 1"));
+        assert!(debug.contains("env_count: 1"));
+    }
+
+    #[test]
+    fn child_pipes_are_owned_and_transferred_exactly_once() {
+        let _test_guard = test_lock();
+        let mut generation = OwnedGeneration::launch(
+            LaunchSpec::new("/bin/sh", "/")
+                .arg("-c")
+                .arg("read line; printf 'out:%s' \"$line\"; printf 'err:%s' \"$line\" >&2"),
+        )
+        .unwrap_or_else(|error| panic!("spawn /bin/sh: {error}"));
+        let pipes = generation
+            .take_pipes()
+            .unwrap_or_else(|error| panic!("take pipes: {error}"));
+        assert!(generation.take_pipes().is_err());
+        let OwnedPipes {
+            mut stdin,
+            mut stdout,
+            mut stderr,
+        } = pipes;
+        stdin
+            .write_all(b"hello\n")
+            .unwrap_or_else(|error| panic!("write stdin: {error}"));
+        drop(stdin);
+        let mut stdout_text = String::new();
+        let mut stderr_text = String::new();
+        stdout
+            .read_to_string(&mut stdout_text)
+            .unwrap_or_else(|error| panic!("read stdout: {error}"));
+        stderr
+            .read_to_string(&mut stderr_text)
+            .unwrap_or_else(|error| panic!("read stderr: {error}"));
+        assert_eq!(stdout_text, "out:hello");
+        assert_eq!(stderr_text, "err:hello");
+        assert!(generation.force_kill().is_ok());
+        assert!(generation.reap_after_stop().is_ok());
     }
 
     #[test]
