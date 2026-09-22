@@ -13,6 +13,8 @@ use std::{
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_TARGET_READY_FRAME_BYTES: usize = 16 * 1024;
 pub const PROTOCOL_VERSION: u8 = 1;
+const MAX_ARGV_ENTRIES: usize = 128;
+const MAX_ENV_ENTRIES: usize = 64;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -185,8 +187,12 @@ fn validate_request_data(request: &Request) -> Result<(), ProtocolError> {
                 || !nonempty_content(executable)
                 || !Path::new(cwd).is_absolute()
                 || !nonempty_content(cwd)
+                || argv.len() > MAX_ARGV_ENTRIES
                 || argv.iter().any(|arg| !content(arg))
-                || env.iter().any(|(k, v)| !nonempty_content(k) || !content(v))
+                || env.len() > MAX_ENV_ENTRIES
+                || env
+                    .iter()
+                    .any(|(k, v)| !nonempty_content(k) || k.contains('=') || !content(v))
             {
                 return Err(ProtocolError::InvalidMessage);
             }
@@ -723,6 +729,92 @@ mod tests {
             Err(ProtocolError::TooLarge)
         );
         assert_eq!(sequence.validate(&launch(1)), Ok(()));
+    }
+
+    #[test]
+    fn launch_argument_and_environment_counts_are_bounded() {
+        let at_limits = Request::Launch {
+            version: 1,
+            request_id: 1,
+            executable: exe().into(),
+            cwd: cwd().into(),
+            argv: (0..MAX_ARGV_ENTRIES).map(|n| format!("arg-{n}")).collect(),
+            env: (0..MAX_ENV_ENTRIES)
+                .map(|n| (format!("KEY_{n}"), format!("value-{n}")))
+                .collect(),
+        };
+        let mut sequence = RequestSequence::new();
+        let encoded = encode_request(&at_limits, &mut sequence).unwrap();
+        assert_eq!(
+            decode_request(&encoded, &mut RequestSequence::new()),
+            Ok(at_limits)
+        );
+
+        for invalid in [
+            Request::Launch {
+                version: 1,
+                request_id: 1,
+                executable: exe().into(),
+                cwd: cwd().into(),
+                argv: (0..=MAX_ARGV_ENTRIES).map(|n| format!("arg-{n}")).collect(),
+                env: BTreeMap::new(),
+            },
+            Request::Launch {
+                version: 1,
+                request_id: 1,
+                executable: exe().into(),
+                cwd: cwd().into(),
+                argv: Vec::new(),
+                env: (0..=MAX_ENV_ENTRIES)
+                    .map(|n| (format!("KEY_{n}"), format!("value-{n}")))
+                    .collect(),
+            },
+        ] {
+            let mut sequence = RequestSequence::new();
+            assert_eq!(
+                encode_request(&invalid, &mut sequence),
+                Err(ProtocolError::InvalidMessage)
+            );
+            assert!(encode_request(&launch(1), &mut sequence).is_ok());
+        }
+    }
+
+    #[test]
+    fn environment_keys_reject_equals_before_encode_and_after_decode() {
+        let raw_equals = custom(1, exe(), cwd(), vec![], vec![("A=B", "value")]);
+        let mut encode_sequence = RequestSequence::new();
+        assert_eq!(
+            encode_request(&raw_equals, &mut encode_sequence),
+            Err(ProtocolError::InvalidMessage)
+        );
+        let valid = encode_request(&launch(1), &mut encode_sequence).unwrap();
+
+        let json = serde_json::to_string(&raw_equals).unwrap();
+        let mut escaped_equals = json.replace("A=B", r"A\u003dB").into_bytes();
+        escaped_equals.push(b'\n');
+        let mut decode_sequence = RequestSequence::new();
+        assert_eq!(
+            decode_request(&escaped_equals, &mut decode_sequence),
+            Err(ProtocolError::InvalidMessage)
+        );
+        assert!(decode_request(&valid, &mut decode_sequence).is_ok());
+        let signal = encode_frame(
+            &Request::Signal {
+                version: 1,
+                request_id: 2,
+                force: false,
+            },
+            MAX_CONTROL_FRAME_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_request(&signal, &mut decode_sequence),
+            Ok(Request::Signal {
+                version: 1,
+                request_id: 2,
+                force: false,
+            })
+        );
     }
 
     #[test]
