@@ -9,6 +9,7 @@
 //! compile-time-checked macros + committed `.sqlx` offline data is planned
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
+mod allocation_types;
 mod audit;
 mod module_approvals;
 mod repo;
@@ -32,6 +33,9 @@ pub use workspaces::{
     WorkspaceProvenanceInput, WorkspaceResult, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
 };
 
+pub use allocation_types::{
+    AllocationFailureReason, AllocationId, AllocationPhase, AllocationValueError,
+};
 pub use audit::AuditEntry;
 pub use repo::*;
 
