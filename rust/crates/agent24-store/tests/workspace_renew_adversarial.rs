@@ -4,6 +4,7 @@ use agent24_store::{
     LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, TrustedRootRegistration,
     WorkspaceInstant, WorkspaceProvenanceInput, WorkspaceStoreError, WorkspaceTtl, test_hooks,
 };
+use serde_json::json;
 use sqlx::Row;
 
 const ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
@@ -31,6 +32,71 @@ async fn create(store: &Store) {
         )
         .await
         .unwrap();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LeaseSnapshot {
+    lease_id: String,
+    workspace_id: String,
+    root_generation: String,
+    owner_id: String,
+    kind: String,
+    daemon_generation: Option<String>,
+    host_instance_id: Option<String>,
+    acquired_at: String,
+    expires_at: Option<String>,
+    renewed_at: Option<String>,
+    released_at: Option<String>,
+}
+
+async fn lease_snapshot(store: &Store) -> Vec<LeaseSnapshot> {
+    sqlx::query("SELECT * FROM workspace_leases ORDER BY lease_id")
+        .fetch_all(test_hooks::pool(store))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| LeaseSnapshot {
+            lease_id: row.get("lease_id"),
+            workspace_id: row.get("workspace_id"),
+            root_generation: row.get("root_generation"),
+            owner_id: row.get("owner_id"),
+            kind: row.get("kind"),
+            daemon_generation: row.get("daemon_generation"),
+            host_instance_id: row.get("host_instance_id"),
+            acquired_at: row.get("acquired_at"),
+            expires_at: row.get("expires_at"),
+            renewed_at: row.get("renewed_at"),
+            released_at: row.get("released_at"),
+        })
+        .collect()
+}
+
+async fn seed_leases(store: &Store) {
+    sqlx::query(
+        "INSERT INTO workspace_leases
+         (lease_id, workspace_id, root_generation, owner_id, kind, acquired_at)
+         VALUES (?, ?, 'generation-renew', 'run-owner-opaque', 'run', ?)",
+    )
+    .bind("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6")
+    .bind(ID)
+    .bind(CREATED)
+    .execute(test_hooks::pool(store))
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_leases
+         (lease_id, workspace_id, root_generation, owner_id, kind, daemon_generation,
+          host_instance_id, acquired_at, expires_at)
+         VALUES (?, ?, 'generation-renew', 'host-owner-opaque', 'host',
+                 'daemon-generation-opaque', 'host-owner-opaque', ?, ?)",
+    )
+    .bind("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7")
+    .bind(ID)
+    .bind(CREATED)
+    .bind("2026-09-19T00:00:45.000Z")
+    .execute(test_hooks::pool(store))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -255,4 +321,116 @@ async fn releasing_cleanup_failed_and_released_workspaces_are_unchanged() {
         assert_eq!(row.renewed_at, None);
         assert!(s.list_audit().await.unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn renewal_success_replay_and_lazy_expiry_preserve_every_lease_field() {
+    let s = Store::open_memory().await.unwrap();
+    create(&s).await;
+    seed_leases(&s).await;
+    let before = lease_snapshot(&s).await;
+    assert_eq!(before.len(), 2);
+    let id = WorkspaceId::parse(ID).unwrap();
+    let owner = LifecycleOwnerRef::parse("owner".into()).unwrap();
+    let ttl = WorkspaceTtl::new(120_000).unwrap();
+    let renewed_at = WorkspaceInstant::parse("2026-09-19T00:00:30.000Z").unwrap();
+
+    let renewed = s
+        .renew_workspace(&id, &owner, ttl, &renewed_at)
+        .await
+        .unwrap();
+    assert_eq!(lease_snapshot(&s).await, before);
+    assert_eq!(
+        s.renew_workspace(&id, &owner, ttl, &renewed_at).await,
+        Ok(renewed)
+    );
+    assert_eq!(lease_snapshot(&s).await, before);
+
+    let expiry = WorkspaceInstant::parse("2026-09-19T00:03:00.000Z").unwrap();
+    assert_eq!(
+        s.renew_workspace(&id, &owner, ttl, &expiry).await,
+        Err(WorkspaceStoreError::InvalidValue {
+            field: "workspace_state"
+        })
+    );
+    assert_eq!(lease_snapshot(&s).await, before);
+}
+
+#[tokio::test]
+async fn renewal_audit_payload_is_exact_and_excludes_private_root_material() {
+    let s = Store::open_memory().await.unwrap();
+    create(&s).await;
+    let id = WorkspaceId::parse(ID).unwrap();
+    let owner = LifecycleOwnerRef::parse("owner".into()).unwrap();
+    let now = WorkspaceInstant::parse("2026-09-19T00:00:30.000Z").unwrap();
+    s.renew_workspace(&id, &owner, WorkspaceTtl::new(120_000).unwrap(), &now)
+        .await
+        .unwrap();
+
+    let audit = s.list_audit().await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].ts, now.as_str());
+    assert_eq!(audit[0].actor, "workspace_lifecycle");
+    assert_eq!(audit[0].action, "workspace.renewed");
+    assert_eq!(
+        audit[0].detail,
+        json!({
+            "id": ID,
+            "kind": "orchestrator_scratch",
+            "result_state": "active",
+            "owner_ref": "owner",
+            "reason": "owner_requested"
+        })
+    );
+    let payload = audit[0].detail.to_string();
+    for private in ["/renew/adversarial", "generation-renew", "token", "secret"] {
+        assert!(!payload.contains(private));
+    }
+}
+
+#[tokio::test]
+async fn deferred_renewal_commit_failure_rolls_back_workspace_audit_and_leases() {
+    let s = Store::open_memory().await.unwrap();
+    create(&s).await;
+    seed_leases(&s).await;
+    let leases_before = lease_snapshot(&s).await;
+    sqlx::query("PRAGMA defer_foreign_keys = ON")
+        .execute(test_hooks::pool(&s))
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER defer_renewal_lease AFTER UPDATE OF renewed_at ON workspaces
+         BEGIN
+             INSERT INTO workspace_leases
+                 (lease_id, workspace_id, root_generation, owner_id, kind, acquired_at)
+             VALUES
+                 ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X8',
+                  'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X9', NEW.root_generation,
+                  'orphan-owner', 'run', NEW.created_at);
+         END",
+    )
+    .execute(test_hooks::pool(&s))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        s.renew_workspace(
+            &WorkspaceId::parse(ID).unwrap(),
+            &LifecycleOwnerRef::parse("owner".into()).unwrap(),
+            WorkspaceTtl::new(120_000).unwrap(),
+            &WorkspaceInstant::parse("2026-09-19T00:00:30.000Z").unwrap(),
+        )
+        .await,
+        Err(WorkspaceStoreError::Database)
+    );
+    let row = s
+        .get_workspace(&WorkspaceId::parse(ID).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(row.state, "active");
+    assert_eq!(row.expires_at, "2026-09-19T00:01:00.000Z");
+    assert_eq!(row.renewed_at, None);
+    assert_eq!(row.revision, 1);
+    assert!(s.list_audit().await.unwrap().is_empty());
+    assert_eq!(lease_snapshot(&s).await, leases_before);
 }
