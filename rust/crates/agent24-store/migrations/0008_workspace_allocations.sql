@@ -49,17 +49,20 @@ CREATE TABLE workspace_allocations (
     CHECK (
         (root_identity_kind IS NULL AND root_unix_device IS NULL AND root_unix_inode IS NULL
             AND root_windows_volume IS NULL AND root_windows_file_id IS NULL)
-        OR (root_identity_kind = 'unix'
+        OR (root_identity_kind IS NOT NULL AND root_identity_kind = 'unix'
             AND typeof(root_unix_device) = 'blob' AND length(root_unix_device) = 8
             AND typeof(root_unix_inode) = 'blob' AND length(root_unix_inode) = 8
             AND root_windows_volume IS NULL AND root_windows_file_id IS NULL)
-        OR (root_identity_kind = 'windows'
+        OR (root_identity_kind IS NOT NULL AND root_identity_kind = 'windows'
             AND root_unix_device IS NULL AND root_unix_inode IS NULL
             AND typeof(root_windows_volume) = 'blob' AND length(root_windows_volume) = 8
             AND typeof(root_windows_file_id) = 'blob' AND length(root_windows_file_id) = 16)
     ),
     CHECK (
-        (phase = 'reserved' AND root_identity_kind IS NULL AND failure_reason IS NULL)
+        (phase = 'reserved' AND root_identity_kind IS NULL
+            AND root_unix_device IS NULL AND root_unix_inode IS NULL
+            AND root_windows_volume IS NULL AND root_windows_file_id IS NULL
+            AND failure_reason IS NULL)
         OR (phase IN ('materialized', 'committed') AND root_identity_kind IS NOT NULL AND failure_reason IS NULL)
         OR (phase = 'retained' AND failure_reason IS NOT NULL)
     )

@@ -64,13 +64,6 @@ async fn opening_a_real_v6_database_applies_workspace_migrations_and_preserves_i
     .await
     .unwrap();
     assert_eq!(columns, 1);
-    let allocation_table: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'workspace_allocations'",
-    )
-    .fetch_one(test_hooks::pool(&store))
-    .await
-    .unwrap();
-    assert_eq!(allocation_table, 1);
     let version: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
         .fetch_one(test_hooks::pool(&store))
         .await

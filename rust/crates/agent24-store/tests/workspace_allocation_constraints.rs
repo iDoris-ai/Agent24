@@ -1,0 +1,113 @@
+#![allow(clippy::unwrap_used, clippy::type_complexity)]
+
+use agent24_store::{Store, test_hooks};
+
+const E8: &[u8] = &[1; 8];
+const E16: &[u8] = &[2; 16];
+const NOW: &str = "2026-09-19T00:00:00.000Z";
+
+#[derive(Clone, Copy)]
+struct Root {
+    kind: Option<&'static str>,
+    ud: Option<&'static [u8]>,
+    ui: Option<&'static [u8]>,
+    wv: Option<&'static [u8]>,
+    wf: Option<&'static [u8]>,
+}
+
+const NONE: Root = Root {
+    kind: None,
+    ud: None,
+    ui: None,
+    wv: None,
+    wf: None,
+};
+const UNIX: Root = Root {
+    kind: Some("unix"),
+    ud: Some(E8),
+    ui: Some(E8),
+    wv: None,
+    wf: None,
+};
+const WINDOWS: Root = Root {
+    kind: Some("windows"),
+    ud: None,
+    ui: None,
+    wv: Some(E8),
+    wf: Some(E16),
+};
+
+async fn insert(store: &Store, n: usize, phase: &str, root: Root, failure: Option<&str>) -> bool {
+    sqlx::query(
+        "INSERT INTO workspace_allocations
+        (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,
+         parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,
+         root_unix_inode,root_windows_volume,root_windows_file_id,phase,created_at,failure_reason)
+        VALUES (?,?,'g1',?,'unix',X'0101010101010101',X'0101010101010101',?,?,?,?,?,?,?,?)",
+    )
+    .bind(format!("wa_01J5M4Q2Y7N8P9R0S1T2V3W4X{n:X}"))
+    .bind(format!("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X{n:X}"))
+    .bind(format!("root-{n}"))
+    .bind(root.kind)
+    .bind(root.ud)
+    .bind(root.ui)
+    .bind(root.wv)
+    .bind(root.wf)
+    .bind(phase)
+    .bind(NOW)
+    .bind(failure)
+    .execute(test_hooks::pool(store))
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn allocation_root_identity_and_phase_checks_are_two_valued() {
+    let store = Store::open_memory().await.unwrap();
+    let null_kind_unix = Root {
+        kind: None,
+        ud: Some(E8),
+        ui: Some(E8),
+        ..NONE
+    };
+    let null_kind_windows = Root {
+        kind: None,
+        wv: Some(E8),
+        wf: Some(E16),
+        ..NONE
+    };
+    let partial = Root {
+        kind: Some("unix"),
+        ud: Some(E8),
+        ..NONE
+    };
+    let mixed = Root {
+        kind: Some("windows"),
+        ud: Some(E8),
+        ui: Some(E8),
+        wv: Some(E8),
+        wf: Some(E16),
+    };
+    let cases = [
+        ("reserved", NONE, None, true),
+        ("materialized", UNIX, None, true),
+        ("committed", WINDOWS, None, true),
+        ("materialized", null_kind_unix, None, false),
+        ("materialized", null_kind_windows, None, false),
+        ("materialized", partial, None, false),
+        ("committed", mixed, None, false),
+        ("committed", NONE, None, false),
+        ("retained", NONE, Some("io_error"), true),
+        ("retained", UNIX, Some("io_error"), true),
+        ("retained", NONE, None, false),
+        ("retained", NONE, Some(""), false),
+        ("retained", NONE, Some("/private/path"), false),
+    ];
+    for (n, (phase, root, failure, expected)) in cases.into_iter().enumerate() {
+        assert_eq!(
+            insert(&store, n, phase, root, failure).await,
+            expected,
+            "case {n}"
+        );
+    }
+}
