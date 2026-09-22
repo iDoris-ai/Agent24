@@ -53,8 +53,11 @@ control-character 规则；随后才 `try_reserve_exact` 并复制。未转义�
 转义字符串会使用 serde_json 内部 scratch，因此 4096 是输出 String 限制，不能宣称
 parser scratch 也只有 4096；scratch 仍由 64KiB frame 上限约束。
 
-argv item/env value 可空；executable、cwd、env key 不可空。本 slice 不新增 ASCII-only
-key 规则或其他未冻结平台限制。
+argv item/env value 可空；executable、cwd、env key 不可空。decoded env key 还必须在
+native tracker/value 前拒绝任意 `=`（含 `\u003d`），避免 spawn 时被重解释；映射为
+InvalidMessage。本 slice 不新增 ASCII-only key 规则或其他未冻结平台限制。共享
+`validate_request_data` 与 `encode_request` 必须执行相同 key/quota 规则，不能让本地
+encoder 产生 peer 必拒 frame。
 
 `FieldSeed` 不分配 String，直接映射八个 key：`type/version/request_id/executable/cwd/
 argv/env/force`。`KindSeed` 同样映射 `launch/signal/is_empty`。escaped key 必须与其解码
@@ -99,6 +102,7 @@ key/value 仍进入 BTreeMap，不 lowercase。Unix 允许 `PATH` 与 `Path`；W
 | JSON、类型、字段集合、重复 key、错误 kind | InvalidJson |
 | quota、字符串/control、reserve 失败 | InvalidMessage |
 | version/ID/path 数据规则 | 现有 InvalidMessage |
+| env key 为空、含 `=` 或 control | InvalidMessage |
 | sequence 规则 | WrongSequence |
 
 重复 env 不新增 wire ErrorCode。错误 Display/Debug、日志和测试失败输出都不得包含
@@ -110,6 +114,7 @@ executable、cwd、env、token 或 raw frame sentinel。
 - env 0/64 成功、65 失败，且第65 key 不 materialize；
 - 解码后 4096/4097 bytes、多字节/escape/surrogate；
 - exact/escaped env duplicate；八个 top-level key逐一 duplicate；
+- Unix/Windows 都拒绝 raw/escaped `=` env key；encoder/decoder validation 保持对称；
 - type 首/中/尾；缺/null/unknown/cross-variant 字段；
 - 失败后合法 Launch 证明 sequence 未推进；成功后坏 Signal 不推进更高 ID；
 - raw error/Debug/Display 不泄漏 sentinel；
