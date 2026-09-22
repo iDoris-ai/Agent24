@@ -126,7 +126,7 @@ impl Store {
             &mut tx,
             record.created_at().as_str(),
             "workspace_allocation",
-            "workspace_allocation.reserved",
+            "workspace.allocation_reserved",
             &detail,
         )
         .await
@@ -180,7 +180,7 @@ mod tests {
         assert!(
             audit
                 .iter()
-                .all(|entry| entry.action == "workspace_allocation.reserved")
+                .all(|entry| entry.action == "workspace.allocation_reserved")
         );
         store.verify_audit_chain().await.unwrap();
     }
