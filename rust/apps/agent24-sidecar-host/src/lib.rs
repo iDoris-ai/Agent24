@@ -6,6 +6,8 @@
 
 #[allow(dead_code)]
 pub(crate) mod actor;
+#[allow(dead_code)]
+mod control_io;
 
 #[cfg(unix)]
 mod posix;
