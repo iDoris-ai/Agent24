@@ -844,6 +844,107 @@ mod tests {
         store.verify_audit_chain().await.unwrap();
     }
 
+    #[allow(clippy::unwrap_used)]
+    async fn ready_boundary_case(
+        run_status: &str,
+        approval_status: &str,
+        hold_state: Option<&str>,
+        expected_ready: bool,
+    ) {
+        let store = strict_facts_fixture().await;
+        sqlx::query("UPDATE runs SET status=? WHERE id='run-strict'")
+            .bind(run_status)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        if let Some(state) = hold_state {
+            let sql = match state {
+                "ready" => {
+                    "UPDATE legacy_recovery_holds SET recovery_state='ready', ready_at='2026-09-20T00:00:00.000Z', released_at=NULL, active_resume_approval_id=NULL"
+                }
+                "active" => {
+                    "UPDATE legacy_recovery_holds SET recovery_state='active', ready_at=NULL, released_at=NULL, active_resume_approval_id='approval-strict'"
+                }
+                "needs_attention" => {
+                    "UPDATE legacy_recovery_holds SET recovery_state='needs_attention', ready_at=NULL, reason_code='boundary_reason', released_at=NULL, active_resume_approval_id=NULL"
+                }
+                "released" => {
+                    "UPDATE legacy_recovery_holds SET recovery_state='released', ready_at=NULL, released_at='2026-09-20T00:00:00.000Z', active_resume_approval_id=NULL"
+                }
+                _ => unreachable!(),
+            };
+            execute(&store, sql).await;
+        }
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE approvals SET status=? WHERE id='approval-strict'")
+            .bind(approval_status)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let before = ready_facts(&mut tx).await;
+        let result = ready(&mut tx).await.unwrap();
+        if !expected_ready {
+            assert_eq!(result, None);
+            assert_eq!(ready_facts(&mut tx).await, before);
+        } else {
+            assert!(result.is_some());
+            let after = ready_facts(&mut tx).await;
+            let mut expected_hold = before.0.clone();
+            expected_hold.recovery_state = RecoveryState::Ready;
+            expected_hold.ready_at =
+                Some(WorkspaceInstant::parse("2026-09-20T00:00:00.000Z").unwrap());
+            assert_eq!(after.0, expected_hold);
+            assert_eq!(after.1, before.1);
+            assert_eq!(after.2, before.2);
+            assert_eq!(after.3, before.3);
+            assert_eq!(after.4, before.4 + 1);
+            let (actor, action, detail): (String, String, String) =
+                sqlx::query_as("SELECT actor,action,detail FROM audit_log")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                (actor, action),
+                ("legacy_recovery".into(), "legacy_recovery.ready".into())
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&detail).unwrap(),
+                serde_json::json!({
+                    "run_id": "run-strict", "cohort_id": "cohort-strict",
+                    "workspace_id": "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                    "approval_id": "approval-strict", "result_state": "ready",
+                })
+            );
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn ready_writer_covers_valid_status_and_hold_boundaries() {
+        for (approval, expected) in [
+            ("pending", false),
+            ("approved", true),
+            ("denied", true),
+            ("aborted", true),
+            ("timed_out", true),
+        ] {
+            ready_boundary_case("running", approval, None, expected).await;
+        }
+        for (run, expected) in [
+            ("queued", true),
+            ("awaiting_approval", true),
+            ("completed", false),
+            ("failed", false),
+            ("cancelled", false),
+        ] {
+            ready_boundary_case(run, "approved", None, expected).await;
+        }
+        for state in ["ready", "active", "needs_attention", "released"] {
+            ready_boundary_case("running", "approved", Some(state), false).await;
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn strict_facts_classify_storage_enums_and_sql_failures() {
