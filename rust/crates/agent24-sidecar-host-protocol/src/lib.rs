@@ -1,5 +1,7 @@
 //! Private v1 NDJSON messages exchanged by the sidecar host and helper.
 
+pub mod frame;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
