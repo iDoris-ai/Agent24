@@ -1,6 +1,7 @@
 use agent24_protocol::{Workspace, WorkspaceId};
 use sqlx::{Sqlite, Transaction};
 
+use crate::{AllocationId, AllocationRecord};
 use crate::{
     LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, WorkspaceInstant,
     WorkspaceListCursor, WorkspaceListQuery, WorkspacePage, WorkspaceResult, WorkspaceRow,
@@ -149,6 +150,23 @@ async fn insert_workspace(
 }
 
 impl Store {
+    /// Read one allocation journal row without mutating any store table.
+    pub async fn get_workspace_allocation(
+        &self,
+        id: &AllocationId,
+    ) -> WorkspaceResult<AllocationRecord> {
+        let row = sqlx::query(
+            "SELECT * FROM workspace_allocations
+             WHERE allocation_id = ? COLLATE BINARY LIMIT 1",
+        )
+        .bind(id.as_str())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?
+        .ok_or(WorkspaceStoreError::NotFound)?;
+        AllocationRecord::decode(&row)
+    }
+
     /// Read one page directly from the pool without applying lifecycle policy.
     pub async fn list_workspaces(
         &self,
