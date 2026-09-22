@@ -119,6 +119,7 @@ impl Phase {
             Self::GracefulStopping(_)
             | Self::ForceStopping(_)
             | Self::Draining(_)
+            | Self::Unconfirmed
             | Self::Empty => Ok(Self::Empty),
             _ => Err(ActorError::InvalidTransition),
         }
@@ -193,5 +194,37 @@ mod tests {
             waiting.ready(deadline, L),
             Ok(Phase::ForceStopping(deadline + L.force))
         );
+    }
+
+    #[test]
+    fn unconfirmed_observation_is_terminal_and_restart_safe() {
+        let now = Instant::now();
+        let force_deadline = now + L.force;
+        let draining = Phase::Running
+            .stop(true, now, L)
+            .expect("force stop")
+            .advance(force_deadline, L);
+        let drain_deadline = force_deadline + L.drain;
+        assert_eq!(draining, Phase::Draining(drain_deadline));
+
+        let unconfirmed = draining.advance(drain_deadline, L);
+        assert_eq!(unconfirmed, Phase::Unconfirmed);
+        assert_eq!(
+            unconfirmed.advance(drain_deadline + Duration::from_secs(60), L),
+            Phase::Unconfirmed
+        );
+        assert!(!unconfirmed.restart_allowed());
+        assert_eq!(unconfirmed.launch(now, L), Err(ActorError::Unconfirmed));
+        assert_eq!(
+            unconfirmed.stop(false, now, L),
+            Err(ActorError::Unconfirmed)
+        );
+        assert_eq!(unconfirmed.stop(true, now, L), Err(ActorError::Unconfirmed));
+
+        let empty = unconfirmed.observe_empty().expect("observed empty");
+        assert_eq!(empty, Phase::Empty);
+        assert_eq!(empty.observe_empty(), Ok(Phase::Empty));
+        assert_eq!(empty.stop(false, now, L), Ok(Phase::Empty));
+        assert_eq!(empty.launch(now, L), Err(ActorError::InvalidTransition));
     }
 }
