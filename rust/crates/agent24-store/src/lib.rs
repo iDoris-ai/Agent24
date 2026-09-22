@@ -10,6 +10,7 @@
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
 mod audit;
+mod legacy_recovery;
 mod module_approvals;
 mod repo;
 pub mod workspace_api;
@@ -33,6 +34,9 @@ pub use workspaces::{
 };
 
 pub use audit::AuditEntry;
+pub use legacy_recovery::{
+    LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
+};
 pub use repo::*;
 
 use sqlx::SqlitePool;
