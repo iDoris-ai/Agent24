@@ -94,6 +94,35 @@ impl<'de> Visitor<'de> for ArgvVisitor<'_> {
     }
 }
 
+struct EnvSeed<'a>(&'a RequestDecodeContext);
+impl<'de> DeserializeSeed<'de> for EnvSeed<'_> {
+    type Value = BTreeMap<String, String>;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(EnvVisitor(self.0))
+    }
+}
+struct EnvVisitor<'a>(&'a RequestDecodeContext);
+impl<'de> Visitor<'de> for EnvVisitor<'_> {
+    type Value = BTreeMap<String, String>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a bounded environment map")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut env = BTreeMap::new();
+        for _ in 0..MAX_ENV_ENTRIES {
+            let Some(key) = map.next_key::<String>()? else {
+                return Ok(env);
+            };
+            env.insert(key, map.next_value::<String>()?);
+        }
+        let _ = map.next_key_seed(RejectSeed(self.0))?;
+        Ok(env)
+    }
+}
+
 struct RequestVisitor<'a>(&'a RequestDecodeContext);
 impl<'de> Visitor<'de> for RequestVisitor<'_> {
     type Value = Request;
@@ -114,7 +143,7 @@ impl<'de> Visitor<'de> for RequestVisitor<'_> {
                 }
                 "cwd" if cwd.is_none() => cwd = Some(map.next_value::<String>()?),
                 "argv" if argv.is_none() => argv = Some(map.next_value_seed(ArgvSeed(self.0))?),
-                "env" if env.is_none() => env = Some(map.next_value::<BTreeMap<String, String>>()?),
+                "env" if env.is_none() => env = Some(map.next_value_seed(EnvSeed(self.0))?),
                 "force" if force.is_none() => force = Some(map.next_value::<bool>()?),
                 _ => {
                     return Err(de::Error::unknown_field(
@@ -968,6 +997,42 @@ mod tests {
         assert_eq!(
             decode_request(&valid_frame, &mut decode_sequence),
             Ok(at_limit)
+        );
+    }
+
+    #[test]
+    fn decoded_env_limit_counts_raw_entries_before_value() {
+        let frame = |extra: Option<serde_json::Value>| {
+            let mut value = serde_json::to_value(custom(1, exe(), cwd(), vec![], vec![])).unwrap();
+            let mut env = serde_json::Map::new();
+            for n in 0..MAX_ENV_ENTRIES {
+                env.insert(format!("K{n:03}"), serde_json::json!("v"));
+            }
+            if let Some(extra) = extra {
+                env.insert(format!("K{MAX_ENV_ENTRIES:03}"), extra);
+            }
+            value["env"] = serde_json::Value::Object(env);
+            format!("{}\n", serde_json::to_string(&value).unwrap()).into_bytes()
+        };
+        let valid = frame(None);
+        let over = frame(Some(serde_json::json!({"not": "a string"})));
+        let mut sequence = RequestSequence::new();
+        assert!(decode_request(&valid, &mut sequence).is_ok());
+        let mut retry = RequestSequence::new();
+        assert_eq!(
+            decode_request(&over, &mut retry),
+            Err(ProtocolError::InvalidMessage)
+        );
+        assert!(decode_request(&valid, &mut retry).is_ok());
+        let duplicate = format!(
+            r#"{{"type":"launch","version":1,"request_id":1,"executable":{},"cwd":{},"argv":[],"env":{{"K":"first","K":"last"}}}}
+"#,
+            serde_json::to_string(exe()).unwrap(),
+            serde_json::to_string(cwd()).unwrap()
+        );
+        assert_eq!(
+            decode_request(duplicate.as_bytes(), &mut RequestSequence::new()),
+            Ok(custom(1, exe(), cwd(), vec![], vec![("K", "last")]))
         );
     }
 
