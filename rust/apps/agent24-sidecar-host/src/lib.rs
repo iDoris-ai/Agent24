@@ -14,7 +14,7 @@ mod output_io;
 #[cfg(unix)]
 mod posix;
 #[cfg(unix)]
-pub use posix::{LaunchSpec, OwnedGeneration, StopError};
+pub use posix::{LaunchSpec, OwnedGeneration, OwnedPipes, StopError};
 
 #[cfg(windows)]
 mod owner;
