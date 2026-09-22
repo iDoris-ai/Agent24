@@ -5,6 +5,8 @@
 pub enum AllocationValueError {
     InvalidId,
     InvalidFailureReason,
+    InvalidRootGeneration,
+    InvalidRelativeName,
 }
 
 impl std::fmt::Display for AllocationValueError {
@@ -12,6 +14,8 @@ impl std::fmt::Display for AllocationValueError {
         formatter.write_str(match self {
             Self::InvalidId => "invalid allocation id",
             Self::InvalidFailureReason => "invalid allocation failure reason",
+            Self::InvalidRootGeneration => "invalid allocation root generation",
+            Self::InvalidRelativeName => "invalid allocation relative name",
         })
     }
 }
