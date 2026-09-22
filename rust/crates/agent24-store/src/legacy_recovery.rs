@@ -1,4 +1,6 @@
-use crate::{WorkspaceInstant, WorkspaceResult, WorkspaceStoreError, workspace_decode_support};
+use crate::{
+    Store, WorkspaceInstant, WorkspaceResult, WorkspaceStoreError, workspace_decode_support,
+};
 use agent24_protocol::{RunStatus, WorkspaceId};
 use sqlx::sqlite::SqliteRow;
 
@@ -51,17 +53,14 @@ pub struct LegacyRecoveryHold {
     pub(crate) active_resume_approval_id: Option<String>,
 }
 
-#[allow(dead_code)] // Wired by the strict hold getter slice that follows this codec.
 fn bad(field: &'static str) -> WorkspaceStoreError {
     workspace_decode_support::bad_table("legacy_recovery_holds", field)
 }
 
-#[allow(dead_code)] // Wired by the strict hold getter slice that follows this codec.
 fn check<T>(result: WorkspaceResult<T>, field: &'static str) -> WorkspaceResult<T> {
     result.map_err(|_| bad(field))
 }
 
-#[allow(dead_code)] // Wired by the strict hold getter slice that follows this codec.
 fn opt_nonempty(row: &SqliteRow, field: &'static str) -> WorkspaceResult<Option<String>> {
     let value = workspace_decode_support::opt_text(row, field)?;
     if value.as_deref().is_some_and(|v| v.is_empty()) {
@@ -71,7 +70,6 @@ fn opt_nonempty(row: &SqliteRow, field: &'static str) -> WorkspaceResult<Option<
 }
 
 impl LegacyRecoveryHold {
-    #[allow(dead_code)] // Wired by the strict hold getter slice that follows this codec.
     pub(crate) fn decode(row: SqliteRow) -> WorkspaceResult<Self> {
         let run_id = check(workspace_decode_support::text(&row, "run_id"), "run_id")?;
         let cohort_id = check(
@@ -205,6 +203,26 @@ impl LegacyRecoveryHold {
     }
 }
 
+impl Store {
+    /// Reads a persisted hold without applying recovery or admission policy.
+    pub async fn get_legacy_recovery_hold(
+        &self,
+        run_id: &str,
+    ) -> WorkspaceResult<LegacyRecoveryHold> {
+        let row = sqlx::query(
+            "SELECT run_id,cohort_id,workspace_id,root_generation,original_status,
+             recovery_state,approval_id,ready_at,reason_code,released_at,active_resume_approval_id
+             FROM legacy_recovery_holds WHERE run_id = ? COLLATE BINARY LIMIT 1",
+        )
+        .bind(run_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?
+        .ok_or(WorkspaceStoreError::NotFound)?;
+        LegacyRecoveryHold::decode(row)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryDecisionEffect {
     Unchanged,
@@ -239,6 +257,144 @@ pub fn recovery_decision_effect(
 mod tests {
     use super::*;
     use sqlx::SqlitePool;
+
+    #[allow(clippy::unwrap_used)]
+    async fn execute(store: &Store, statement: &str) {
+        sqlx::raw_sql(statement)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn changes(store: &Store) -> i64 {
+        sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn damaged(store: &Store, field: &'static str, value: &str, storage: &str) {
+        execute(
+            store,
+            &format!(
+                "DELETE FROM legacy_recovery_holds;
+             INSERT INTO legacy_recovery_holds VALUES
+             ('run','cohort','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','queued',
+              'awaiting_decision','a',NULL,NULL,NULL,NULL);
+             UPDATE legacy_recovery_holds SET {field}={value}"
+            ),
+        )
+        .await;
+        let actual: String = sqlx::query_scalar(&format!(
+            "SELECT typeof({field}) FROM legacy_recovery_holds"
+        ))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(actual, storage);
+        let before = changes(store).await;
+        let expected = Err(WorkspaceStoreError::CorruptRow {
+            table: "legacy_recovery_holds",
+            field,
+        });
+        let key = if field == "run_id" {
+            match value {
+                "1" => "1",
+                "1.5" => "1.5",
+                "x'61'" => "a",
+                "''" => "",
+                "'a'||char(0)" => "a\0",
+                _ => "run",
+            }
+        } else {
+            "run"
+        };
+        let result = store.get_legacy_recovery_hold(key).await;
+        if field == "run_id" && storage != "text" {
+            assert_eq!(result, Err(WorkspaceStoreError::NotFound));
+            let row = sqlx::query("SELECT * FROM legacy_recovery_holds")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+            assert_eq!(LegacyRecoveryHold::decode(row), expected);
+        } else if value == "NULL"
+            && matches!(
+                field,
+                "ready_at" | "reason_code" | "released_at" | "active_resume_approval_id"
+            )
+        {
+            assert!(result.is_ok(), "{field}");
+        } else {
+            assert_eq!(result, expected, "{field}={value}");
+        }
+        assert_eq!(changes(store).await, before);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn getter_rejects_storage_and_value_corruption_without_writes() {
+        let store = Store {
+            pool: sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        };
+        // No affinity: a TEXT column would silently coerce INTEGER/REAL samples.
+        let fields = [
+            "run_id",
+            "cohort_id",
+            "workspace_id",
+            "root_generation",
+            "original_status",
+            "recovery_state",
+            "approval_id",
+            "ready_at",
+            "reason_code",
+            "released_at",
+            "active_resume_approval_id",
+        ];
+        execute(
+            &store,
+            &format!("CREATE TABLE legacy_recovery_holds ({})", fields.join(",")),
+        )
+        .await;
+        for field in fields {
+            for (value, storage) in [
+                ("1", "integer"),
+                ("1.5", "real"),
+                ("x'61'", "blob"),
+                ("NULL", "null"),
+                ("'a'||char(0)", "text"),
+                ("''", "text"),
+            ] {
+                damaged(&store, field, value, storage).await;
+            }
+        }
+        for (field, value) in [
+            ("workspace_id", "'ws_invalid'"),
+            ("root_generation", "'   '"),
+            ("original_status", "'completed'"),
+            ("recovery_state", "'READY'"),
+            ("reason_code", "'Bad reason'"),
+            ("ready_at", "'2026-09-19T00:00:00Z'"),
+            ("released_at", "'2026-02-30T00:00:00.000Z'"),
+        ] {
+            damaged(&store, field, value, "text").await;
+        }
+        execute(&store, "DROP TABLE legacy_recovery_holds").await;
+        assert_eq!(
+            store.get_legacy_recovery_hold("run").await,
+            Err(WorkspaceStoreError::Database)
+        );
+        store.pool().close().await;
+        assert_eq!(
+            store.get_legacy_recovery_hold("run").await,
+            Err(WorkspaceStoreError::Database)
+        );
+    }
 
     const STATES: [RecoveryState; 5] = [
         RecoveryState::AwaitingDecision,

@@ -114,6 +114,37 @@ async fn cohort_hold_constraints_are_dormant_and_run_scoped() {
             .await
             .unwrap();
     assert_eq!(holds, 2);
+    let before: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let audit = store.list_audit().await.unwrap();
+    let hold = store.get_legacy_recovery_hold("r1").await.unwrap();
+    assert_eq!(hold.run_id(), "r1");
+    assert_eq!(hold.cohort_id(), "cohort-a");
+    assert_eq!(hold.workspace_id().as_str(), WS);
+    assert_eq!(hold.root_generation(), "g1");
+    assert_eq!(hold.original_status(), agent24_protocol::RunStatus::Queued);
+    assert_eq!(hold.recovery_state().as_str(), "awaiting_decision");
+    assert_eq!(hold.approval_id(), Some("a1"));
+    assert_eq!(hold.ready_at(), None);
+    assert_eq!(hold.reason_code(), None);
+    assert_eq!(hold.released_at(), None);
+    assert_eq!(hold.active_resume_approval_id(), None);
+    let ready = store.get_legacy_recovery_hold("r2").await.unwrap();
+    assert_eq!(ready.ready_at().map(|ts| ts.as_str()), Some(TS));
+    for id in ["missing", "R1"] {
+        assert_eq!(
+            store.get_legacy_recovery_hold(id).await,
+            Err(agent24_store::WorkspaceStoreError::NotFound)
+        );
+    }
+    let after: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(audit, store.list_audit().await.unwrap());
     let leases: i64 = sqlx::query_scalar("SELECT count(*) FROM workspace_leases")
         .fetch_one(pool)
         .await
