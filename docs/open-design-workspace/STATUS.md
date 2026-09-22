@@ -1,6 +1,6 @@
 # Agent24 × Open Design 执行状态
 
-> 更新：2026-09-22（Asia/Bangkok）
+> 更新：2026-09-23（Asia/Bangkok）
 
 ## 阶段门禁
 
@@ -29,6 +29,23 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - design：#354 G1/G2 scratch service plan、#358 durable legacy recovery holds、#361 G8
   actor plan、#365 bounded Launch decoder 均已文档化并通过内部 exact-head review；
 - 上述新 PR 均已请求外部 review；除 #226 外尚无新的 external `APPROVED`，因此未合并。
+
+## 2026-09-23 Wave 3 门禁
+
+- #368 将 allocation 类型放入 service crate，违反单向依赖边界；#371 从其父提交重建，
+  把 ID、phase 和 failure reason 单一定义在 store。#371 SOL `PASS` 后，#368 作为
+  superseded PR 关闭，未改写历史；#373 的严格 row decoder 也已 SOL `PASS`。
+- #372 的五处 nullable workspace binding 已通过真实 v8→v9、FK、旧数据、audit chain
+  与原 insert path 的 SOL 门禁；#374 的 recovery cohort/hold schema 仍是 dormant
+  persistence，不能解释为恢复执行已接通。
+- #370 首轮 SOL 阻塞了可伪造的错误字符串分类；新 head 改用 per-decode typed flag，
+  200 changed lines，复核 `PASS`。#375 的 env raw-entry 上限也已 SOL `PASS`。
+- #374 的复核证明 nullable `TEXT PRIMARY KEY` 可绕过 hold 的 Run/approval FK；该 PR
+  当前为 `REQUEST_CHANGES` 内部门禁，修复和 NULL 对抗测试通过前不得向下推进运行时恢复。
+- 截至 00:35，#227 仍 `REVIEW_REQUIRED`；#228/#229 虽已批准但等待父依赖；
+  #371～#375 尚无 external approval，本轮没有 merge。
+- 进度注册表持续保存在 `.loopx/pr-program/agent24-open-design/`；它是本地控制面状态，
+  不作为代码或外部 approval 的替代证据。
 
 ## A24-OD-00 小 PR 栈
 
