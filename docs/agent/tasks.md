@@ -26,23 +26,24 @@
 
 `bash docs/agent/me3-status.sh` 核对：**3a-3g 全部 14 行"已在 main"，一个不剩**——ME-3（进程外领域 OS）专项到此整体交付完毕。
 
-## 🔴 2026-09-20 待办清单（Codex 额度耗尽期间的收尾点，下次先核实再用）
+## 🎉 T11 已交付（2026-09-22）
 
-**用户 2026-09-20 改了顺序：T10（Cos72）暂停，优先做 T11（Sin90 迁出内核）**——借这个机会把 Sin90 从待办清单升级成完整 Life OS，设计输入见 `iDoris-ai/Sin90` 的 `docs/LIFEOS-DESIGN-INPUT.md`/`docs/DESIGN-LIFEOS.md`。
+**T11（Sin90 迁出内核）`DONE`** — [#342](https://github.com/iDoris-ai/Agent24/pull/342)（`bb9b9d5`，2026-09-22；`clestons` APPROVED，CI 全绿后合并）：删掉编译进内核的 `agent24-sin90{,-os,-store}` 三个 crate（`agent24d`/`agent24-cli`/`agent24-protocol` 相应接线一并清理，净减 ~5000 行）。合并前已独立编译该分支二进制、跑通 Sin90 侧真实端到端挂载黑盒测试（`AGENT24_CHECKOUT` 指向该分支 → `agent24_mount_blackbox.rs --ignored`：挂载/代理/路由行为不变/事件转发 4 条判据全过）。配套的 [#343](https://github.com/iDoris-ai/Agent24/pull/343)（2026-09-20 待办快照文档）同日合并。
 
-- **P0，随时可能翻盘**：PR [#342](https://github.com/iDoris-ai/Agent24/pull/342)（T11 内核侧收尾——删掉编译进内核的 `agent24-sin90{,-os,-store}`）等 `clestons` 复审，`REVIEW_REQUIRED`。已经独立编译这个分支的二进制、跑通 Sin90 那边的真实端到端挂载黑盒测试（挂载/代理/事件转发全过），对内容有信心，但仍要等外部 review 批准才能合并。**批了就合，合并后本节这条 TODO 删掉，补一条 T11 完成记录（当前文档里 T11 还没有独立的完成条目）**。
-- **P0，额度恢复后立刻做**：Codex CLI 额度 2026-09-22 19:18 恢复后，`iDoris-ai/Sin90` 的 M0/M1/M2/挂载修复（commit `0d66f24`/`4032e82`/`8056ade`/`ab66b37`）目前只经过本地自审，没有真正的对抗式评审——尤其挂载修复里的 actor-key 门禁安全问题，应该优先送审。
-- **P1，已知遗留**：`docs/SIN90-PET0-INTEGRATION.md` 整篇假设"内核内置 Sin90"，T11 PR #342 合并后这个假设不成立，需要独立重写（`~/.agent24/os/sin90/sin90.db` 核实过是空的，不是紧急的破坏性变更，是文档债）。
+## 🔴 2026-09-22 待办清单（下次先核实再用）
+
+- **P0，Codex 额度已恢复（原定 2026-09-22 19:18，现已过点）**：`iDoris-ai/Sin90` 的 M0/M1/M2/挂载修复（commit `0d66f24`/`4032e82`/`8056ade`/`ab66b37`）目前只经过本地自审，没有真正的对抗式评审——尤其挂载修复里的 actor-key 门禁安全问题（`ab66b37`），应该优先送审。
+- **P1**：`docs/SIN90-PET0-INTEGRATION.md` 整篇假设"内核内置 Sin90"，T11 #342 已合并，这个假设已不成立，需要独立重写。
 - **P2，明确暂停中**：T10（Cos72）——`feat/me4-cos72-skeleton` 分支保留，除非用户明确说继续，不要主动捡起来。
-- **P2**：T12（发布 v0.5.0）——依赖 T10（暂停）+ T11（等 #342 合并）。
+- **P2**：T12（发布 v0.5.0）——依赖 T10（暂停）+ T11（已 `DONE`）。
 - **P3，可并行，未开始**：T13（`agent24-os-sdk`）+ T14（wire 文档）。
 
 完整会话记忆见协调 Claude 的 `project_todo_2026-09-20` 记忆条目（本机 `~/.claude/projects/-Users-jason-Dev-auraai-Agent24/memory/`）。
 
-**收口后路径（用户 2026-09-19 拍板，本轮插入了 T11 优先，其余顺序不变）**：
+**收口后路径（用户 2026-09-19 拍板，T11 已完成）**：
 
 ```
-T11（Sin90 迁出内核，进行中）→ T10（Cos72 进程外样例，暂停）→ T12（发布 v0.5.0）
+T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→ T12（发布 v0.5.0）
 ```
 （T13 `agent24-os-sdk` / T14 wire 文档可并行。）
 
@@ -180,7 +181,8 @@ T11（Sin90 迁出内核，进行中）→ T10（Cos72 进程外样例，暂停�
 - **T8 ME-3g 启用路径准入** `DONE` — [#196](https://github.com/iDoris-ai/Agent24/pull/196)（`de03b4b`，2026-09-16；语义说明 [`T8-ME3g-enable-admission-gate.md`](../design/T8-ME3g-enable-admission-gate.md) v7，写码前 6 轮设计审查，终审无 Medium+；代码 1 轮 Codex 代码审查）：`PATCH /api/v1/os/{name}` 新增准入门，只在这个名字恰好一条 `os_reports` 报告时触碰（重名维持既有的无条件放行，明确划出范围）——已经是 `Refused` 直接拒绝；`Disabled` 的进程外模块现场重扫清单（按目录匹配、先查名字防改名绕过、再查交付方式自洽性），编译进内核的 `Disabled` 模块关不上（核对需要调用 `build()`，架构本身的安全线逼出的限制，记 `FU-6x` 独立跟进）。`AppState` 新增 `packages_root`/`package_dirs`；`ErrorBody.code` 补 `admission_refused`，顺手补全 FU-64/ERR-1 时代漏掉的 `module_panicked`/`module_killed`。17 条判据全部落成确定性测试。
 - **T9 ME-3f 仓外包端到端 —— 验收** `DONE` — [#262](https://github.com/iDoris-ai/Agent24/pull/262)（2026-09-19）：详见上方"T9 已交付，ME-3 专项整体收口"记录。**ME-3 专项到此全部完成。**
 - **T13 `agent24-os-sdk`** 与 **T14 wire 文档 + 非 Rust 参考实现**（可与 T9 之后并行）
-- **T10 Cos72 进程外样例**（重做暂停中的 `feat/me4-cos72-skeleton`）→ **T11 Sin90 迁出内核** → **T12 发布 v0.5.0**
+- **T11 Sin90 迁出内核** `DONE` — [#342](https://github.com/iDoris-ai/Agent24/pull/342)（2026-09-22，详见上方"T11 已交付"记录）
+- **T10 Cos72 进程外样例**（重做暂停中的 `feat/me4-cos72-skeleton`，明确暂停）→ **T12 发布 v0.5.0**
 
 **五、仓外事项**
 - **PR-Daemon 规则 S1**：状态机改动先交一页语义说明，否则 block。已提 [jhfnetboy/PR-daemon#8](https://github.com/jhfnetboy/PR-daemon/issues/8)，等 PR-Daemon 落地；落地前本仓库按上面的约定人工执行。
