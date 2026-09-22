@@ -4,6 +4,9 @@
 //! Platform lifecycle code lives here so the executable remains a thin entry
 //! point and cannot grow a second protocol implementation.
 
+#[allow(dead_code)]
+pub(crate) mod actor;
+
 #[cfg(unix)]
 mod posix;
 #[cfg(unix)]
