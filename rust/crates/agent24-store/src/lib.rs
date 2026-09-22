@@ -9,6 +9,8 @@
 //! compile-time-checked macros + committed `.sqlx` offline data is planned
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
+#[allow(dead_code)] // Wired by the allocation query slice that follows this value-type slice.
+mod allocation_record;
 mod allocation_types;
 mod audit;
 mod module_approvals;
@@ -33,6 +35,7 @@ pub use workspaces::{
     WorkspaceProvenanceInput, WorkspaceResult, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
 };
 
+pub use allocation_record::AllocationRecord;
 pub use allocation_types::{
     AllocationFailureReason, AllocationId, AllocationPhase, AllocationValueError,
 };
