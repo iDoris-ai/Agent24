@@ -265,19 +265,25 @@ mod tests {
             mut stdout,
             mut stderr,
         } = pipes;
-        stdin.write_all(b"hello\n").await.expect("write stdin");
-        stdin.shutdown().await.expect("close stdin");
-        let mut stdout_text = String::new();
-        let mut stderr_text = String::new();
-        stdout
-            .read_to_string(&mut stdout_text)
+        let (stdout_text, stderr_text, status) =
+            tokio::time::timeout(Duration::from_secs(10), async {
+                stdin.write_all(b"hello\n").await.expect("write stdin");
+                drop(stdin);
+                let mut stdout_text = String::new();
+                let mut stderr_text = String::new();
+                stdout
+                    .read_to_string(&mut stdout_text)
+                    .await
+                    .expect("read stdout");
+                stderr
+                    .read_to_string(&mut stderr_text)
+                    .await
+                    .expect("read stderr");
+                let status = wait_until_exit(&mut process).await;
+                (stdout_text, stderr_text, status)
+            })
             .await
-            .expect("read stdout");
-        stderr
-            .read_to_string(&mut stderr_text)
-            .await
-            .expect("read stderr");
-        let status = wait_until_exit(&mut process).await;
+            .expect("pipe roundtrip deadline");
         assert_eq!(
             process.observe_exit().expect("repeat observe"),
             Some(status)
