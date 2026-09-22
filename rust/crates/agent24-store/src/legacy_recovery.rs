@@ -591,6 +591,66 @@ mod tests {
         .unwrap()
     }
 
+    type ReadyFacts = (LegacyRecoveryHold, RunFacts, ApprovalFacts, LeaseFacts, i64);
+
+    #[allow(clippy::unwrap_used)]
+    async fn ready_facts(tx: &mut Transaction<'_, Sqlite>) -> ReadyFacts {
+        (
+            read_hold_tx(tx, "run-strict").await.unwrap(),
+            read_run_facts(tx, "run-strict").await.unwrap().unwrap(),
+            read_approval_facts(tx, "approval-strict")
+                .await
+                .unwrap()
+                .unwrap(),
+            lease_facts(tx).await,
+            sqlx::query_scalar("SELECT count(*) FROM audit_log")
+                .fetch_one(&mut **tx)
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn approve_tx(tx: &mut Transaction<'_, Sqlite>) {
+        sqlx::query("UPDATE approvals SET status='approved' WHERE id='approval-strict'")
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn ready(tx: &mut Transaction<'_, Sqlite>) -> WorkspaceResult<Option<ReadyMutation>> {
+        apply_ready_tx(
+            tx,
+            "run-strict",
+            "approval-strict",
+            WorkspaceInstant::parse("2026-09-20T00:00:00.000Z").unwrap(),
+        )
+        .await
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn ready_trigger_case(trigger: &str, name: &str, expected: WorkspaceStoreError) {
+        let store = strict_facts_fixture().await;
+        execute(&store, trigger).await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let before = ready_facts(&mut tx).await;
+        approve_tx(&mut tx).await;
+        assert_eq!(ready(&mut tx).await, Err(expected));
+        tx.rollback().await.unwrap();
+        let mut check = store.pool().begin().await.unwrap();
+        assert_eq!(ready_facts(&mut check).await, before);
+        check.rollback().await.unwrap();
+        assert!(store.list_audit().await.unwrap().is_empty());
+        execute(&store, &format!("DROP TRIGGER {name}")).await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        approve_tx(&mut tx).await;
+        assert!(ready(&mut tx).await.unwrap().is_some());
+        tx.commit().await.unwrap();
+        assert_eq!(store.list_audit().await.unwrap().len(), 1);
+        store.verify_audit_chain().await.unwrap();
+    }
+
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn strict_facts_are_tx_local_and_read_only() {
@@ -725,6 +785,62 @@ mod tests {
                 "result_state": "ready",
             })
         );
+        store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_writer_faults_rollback_and_recover() {
+        ready_trigger_case(
+            "CREATE TRIGGER ready_abort BEFORE UPDATE OF recovery_state
+             ON legacy_recovery_holds WHEN NEW.recovery_state='ready'
+             BEGIN SELECT RAISE(ABORT, 'secret-update'); END",
+            "ready_abort",
+            WorkspaceStoreError::Database,
+        )
+        .await;
+        ready_trigger_case(
+            "CREATE TRIGGER ready_tamper AFTER UPDATE OF recovery_state
+             ON legacy_recovery_holds WHEN NEW.recovery_state='ready'
+             BEGIN UPDATE legacy_recovery_holds SET reason_code='tampered'
+             WHERE run_id=NEW.run_id; END",
+            "ready_tamper",
+            WorkspaceStoreError::CorruptRow {
+                table: "legacy_recovery_holds",
+                field: "row",
+            },
+        )
+        .await;
+        ready_trigger_case(
+            "CREATE TRIGGER audit_abort BEFORE INSERT ON audit_log
+             BEGIN SELECT RAISE(ABORT, 'secret-audit'); END",
+            "audit_abort",
+            WorkspaceStoreError::Database,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn ready_writer_respects_caller_rollback_and_reuses_connection() {
+        let store = strict_facts_fixture().await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let before = ready_facts(&mut tx).await;
+        approve_tx(&mut tx).await;
+        assert!(ready(&mut tx).await.unwrap().is_some());
+        let inside = ready_facts(&mut tx).await;
+        assert_eq!(inside.0.recovery_state(), RecoveryState::Ready);
+        assert_eq!(inside.2.status, ApprovalStatus::Approved);
+        assert_eq!(inside.4, 1);
+        tx.rollback().await.unwrap();
+        let mut check = store.pool().begin().await.unwrap();
+        assert_eq!(ready_facts(&mut check).await, before);
+        check.rollback().await.unwrap();
+        assert!(store.list_audit().await.unwrap().is_empty());
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        approve_tx(&mut tx).await;
+        assert!(ready(&mut tx).await.unwrap().is_some());
+        tx.commit().await.unwrap();
+        assert_eq!(store.list_audit().await.unwrap().len(), 1);
         store.verify_audit_chain().await.unwrap();
     }
 
