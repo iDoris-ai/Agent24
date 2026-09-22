@@ -280,3 +280,124 @@ async fn allocation_remaining_database_constraints() {
         .await
     );
 }
+
+#[tokio::test]
+async fn allocation_ids_names_times_and_failure_reasons_are_bounded() {
+    let store = Store::open_memory().await.unwrap();
+    let valid = [
+        (
+            "ax_01J5M4Q2Y7N8P9R0S1T2V3W4X0",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X1",
+        ),
+        (
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X2",
+        ),
+        (
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XI",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X3",
+        ),
+        (
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X4",
+            "wx_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+        ),
+        (
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X",
+        ),
+        (
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XI",
+        ),
+    ];
+    for (n, (a, w)) in valid.into_iter().enumerate() {
+        assert!(
+            !custom(
+                &store,
+                a,
+                w,
+                "invalid-id",
+                UNIX,
+                NONE,
+                "reserved",
+                NOW,
+                None
+            )
+            .await,
+            "identifier {n}"
+        );
+    }
+
+    let names = [
+        (".".to_owned(), false),
+        ("..".to_owned(), false),
+        ("a/b".to_owned(), false),
+        ("a\\b".to_owned(), false),
+        ("a\0b".to_owned(), false),
+        ("".to_owned(), false),
+        ("x".to_owned(), true),
+        ("x".repeat(255), true),
+        ("x".repeat(256), false),
+    ];
+    for (n, (name, expected)) in names.into_iter().enumerate() {
+        let (a, w) = ids(n);
+        assert_eq!(
+            custom(&store, &a, &w, &name, UNIX, NONE, "reserved", NOW, None).await,
+            expected,
+            "relative name {n}"
+        );
+    }
+
+    for (n, date) in [
+        "2026-09-19T00:00:00Z",
+        "2026-09-19T00:00:00.000+00:00",
+        "bad",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (a, w) = ids(n + 12);
+        assert!(
+            !custom(
+                &store,
+                &a,
+                &w,
+                &format!("date-{n}"),
+                UNIX,
+                NONE,
+                "reserved",
+                date,
+                None
+            )
+            .await
+        );
+    }
+
+    let reasons = [
+        ("x".to_owned(), true),
+        ("x".repeat(128), true),
+        ("x".repeat(129), false),
+        ("UPPER".to_owned(), false),
+        ("bad\0reason".to_owned(), false),
+        ("bad/reason".to_owned(), false),
+    ];
+    for (n, (reason, expected)) in reasons.into_iter().enumerate() {
+        let (a, w) = ids(n + 20);
+        assert_eq!(
+            custom(
+                &store,
+                &a,
+                &w,
+                &format!("reason-{n}"),
+                UNIX,
+                NONE,
+                "retained",
+                NOW,
+                Some(&reason)
+            )
+            .await,
+            expected,
+            "failure reason {n}"
+        );
+    }
+}
