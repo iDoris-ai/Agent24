@@ -170,6 +170,14 @@ async fn allocation_root_identity_and_phase_checks_are_two_valued() {
         0,
         "reserved allocations must be accepted before workspace registration"
     );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_list('workspace_allocations')")
+            .fetch_all(test_hooks::pool(&store))
+            .await
+            .unwrap()
+            .is_empty(),
+        "allocation journal must have no foreign keys"
+    );
 }
 
 #[tokio::test]
