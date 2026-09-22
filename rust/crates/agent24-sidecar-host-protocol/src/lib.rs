@@ -2,7 +2,10 @@
 
 pub mod frame;
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
+};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -16,7 +19,7 @@ pub const PROTOCOL_VERSION: u8 = 1;
 const MAX_ARGV_ENTRIES: usize = 128;
 const MAX_ENV_ENTRIES: usize = 64;
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Launch {
@@ -36,6 +39,143 @@ pub enum Request {
         version: u8,
         request_id: u64,
     },
+}
+
+const ARGV_LIMIT_ERROR: &str = "sidecar argv limit exceeded";
+
+struct ArgvSeed;
+impl<'de> DeserializeSeed<'de> for ArgvSeed {
+    type Value = Vec<String>;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(ArgvVisitor)
+    }
+}
+
+struct ArgvVisitor;
+struct RejectSeed;
+impl<'de> DeserializeSeed<'de> for RejectSeed {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, _deserializer: D) -> Result<(), D::Error> {
+        Err(de::Error::custom(ARGV_LIMIT_ERROR))
+    }
+}
+impl<'de> Visitor<'de> for ArgvVisitor {
+    type Value = Vec<String>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a bounded argv array")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut argv = Vec::new();
+        argv.try_reserve_exact(MAX_ARGV_ENTRIES)
+            .map_err(|_| de::Error::custom(ARGV_LIMIT_ERROR))?;
+        while argv.len() < MAX_ARGV_ENTRIES {
+            let Some(arg) = seq.next_element::<String>()? else {
+                return Ok(argv);
+            };
+            argv.push(arg);
+        }
+        let _ = seq.next_element_seed(RejectSeed)?;
+        Ok(argv)
+    }
+}
+
+struct RequestVisitor;
+impl<'de> Visitor<'de> for RequestVisitor {
+    type Value = Request;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a sidecar request")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Request, A::Error> {
+        let (mut kind, mut version, mut request_id) = (None, None, None);
+        let (mut executable, mut cwd, mut argv, mut env, mut force) =
+            (None, None, None, None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" if kind.is_none() => kind = Some(map.next_value::<String>()?),
+                "version" if version.is_none() => version = Some(map.next_value::<u8>()?),
+                "request_id" if request_id.is_none() => request_id = Some(map.next_value::<u64>()?),
+                "executable" if executable.is_none() => {
+                    executable = Some(map.next_value::<String>()?)
+                }
+                "cwd" if cwd.is_none() => cwd = Some(map.next_value::<String>()?),
+                "argv" if argv.is_none() => argv = Some(map.next_value_seed(ArgvSeed)?),
+                "env" if env.is_none() => env = Some(map.next_value::<BTreeMap<String, String>>()?),
+                "force" if force.is_none() => force = Some(map.next_value::<bool>()?),
+                "type" => return Err(de::Error::duplicate_field("type")),
+                "version" => return Err(de::Error::duplicate_field("version")),
+                "request_id" => return Err(de::Error::duplicate_field("request_id")),
+                "executable" => return Err(de::Error::duplicate_field("executable")),
+                "cwd" => return Err(de::Error::duplicate_field("cwd")),
+                "argv" => return Err(de::Error::duplicate_field("argv")),
+                "env" => return Err(de::Error::duplicate_field("env")),
+                "force" => return Err(de::Error::duplicate_field("force")),
+                _ => {
+                    return Err(de::Error::unknown_field(
+                        &key,
+                        &[
+                            "type",
+                            "version",
+                            "request_id",
+                            "executable",
+                            "cwd",
+                            "argv",
+                            "env",
+                            "force",
+                        ],
+                    ));
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
+        let version = version.ok_or_else(|| de::Error::missing_field("version"))?;
+        let request_id = request_id.ok_or_else(|| de::Error::missing_field("request_id"))?;
+        match kind.as_str() {
+            "launch" if force.is_none() => Ok(Request::Launch {
+                version,
+                request_id,
+                executable: executable.ok_or_else(|| de::Error::missing_field("executable"))?,
+                cwd: cwd.ok_or_else(|| de::Error::missing_field("cwd"))?,
+                argv: argv.ok_or_else(|| de::Error::missing_field("argv"))?,
+                env: env.ok_or_else(|| de::Error::missing_field("env"))?,
+            }),
+            "signal"
+                if executable.is_none() && cwd.is_none() && argv.is_none() && env.is_none() =>
+            {
+                Ok(Request::Signal {
+                    version,
+                    request_id,
+                    force: force.ok_or_else(|| de::Error::missing_field("force"))?,
+                })
+            }
+            "is_empty"
+                if executable.is_none()
+                    && cwd.is_none()
+                    && argv.is_none()
+                    && env.is_none()
+                    && force.is_none() =>
+            {
+                Ok(Request::IsEmpty {
+                    version,
+                    request_id,
+                })
+            }
+            "launch" | "signal" | "is_empty" => {
+                Err(de::Error::custom("invalid sidecar request fields"))
+            }
+            _ => Err(de::Error::unknown_variant(
+                &kind,
+                &["launch", "signal", "is_empty"],
+            )),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(RequestVisitor)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,9 +497,31 @@ pub fn decode_request(
     bytes: &[u8],
     sequence: &mut RequestSequence,
 ) -> Result<Request, ProtocolError> {
-    let request: Request = decode_frame(bytes, MAX_CONTROL_FRAME_BYTES)?;
+    if bytes.len() > MAX_CONTROL_FRAME_BYTES {
+        return Err(ProtocolError::TooLarge);
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err(ProtocolError::MissingNewline);
+    }
+    let body = &bytes[..bytes.len() - 1];
+    if body.is_empty() {
+        return Err(ProtocolError::InvalidJson);
+    }
+    if body.contains(&b'\n') {
+        return Err(ProtocolError::TrailingData);
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let request = Request::deserialize(&mut deserializer).map_err(request_decode_error)?;
+    deserializer.end().map_err(request_decode_error)?;
     sequence.accept(&request)?;
     Ok(request)
+}
+fn request_decode_error(error: serde_json::Error) -> ProtocolError {
+    if error.to_string().contains(ARGV_LIMIT_ERROR) {
+        ProtocolError::InvalidMessage
+    } else {
+        ProtocolError::InvalidJson
+    }
 }
 pub fn encode_reply(reply: &Reply) -> Result<Vec<u8>, ProtocolError> {
     validate_reply(reply)?;
@@ -777,6 +939,32 @@ mod tests {
             );
             assert!(encode_request(&launch(1), &mut sequence).is_ok());
         }
+    }
+
+    #[test]
+    fn decoded_argv_limit_is_enforced_during_sequence_visitation() {
+        let at_limit = custom(1, exe(), cwd(), vec!["arg"; MAX_ARGV_ENTRIES], vec![]);
+        let mut valid_sequence = RequestSequence::new();
+        let valid_frame = encode_request(&at_limit, &mut valid_sequence).unwrap();
+        assert_eq!(
+            decode_request(&valid_frame, &mut RequestSequence::new()),
+            Ok(at_limit.clone())
+        );
+
+        let over_limit = custom(1, exe(), cwd(), vec!["arg"; MAX_ARGV_ENTRIES + 1], vec![]);
+        let mut value = serde_json::to_value(&over_limit).unwrap();
+        value["argv"][MAX_ARGV_ENTRIES] = serde_json::json!({"unparsed": [1, 2, 3]});
+        let mut frame = serde_json::to_vec(&value).unwrap();
+        frame.push(b'\n');
+        let mut decode_sequence = RequestSequence::new();
+        assert_eq!(
+            decode_request(&frame, &mut decode_sequence),
+            Err(ProtocolError::InvalidMessage)
+        );
+        assert_eq!(
+            decode_request(&valid_frame, &mut decode_sequence),
+            Ok(at_limit)
+        );
     }
 
     #[test]
