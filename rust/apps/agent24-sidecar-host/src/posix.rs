@@ -1,6 +1,6 @@
 //! POSIX lifecycle ownership primitives.
 
-use crate::target::ExitObservation;
+use crate::target::{ExitObservation, TreeObservation};
 use nix::{
     errno::Errno,
     sys::signal::{Signal, killpg},
@@ -132,6 +132,7 @@ pub struct OwnedPipes {
     pub stderr: ChildStderr,
 }
 
+#[allow(dead_code)]
 impl OwnedGeneration {
     pub fn launch(spec: LaunchSpec) -> io::Result<Self> {
         if !spec.executable.is_absolute() || !spec.cwd.is_absolute() {
@@ -248,6 +249,54 @@ impl OwnedGeneration {
             // terminate call cannot regress this phase or send SIGTERM.
             Phase::ForceKillRequested | Phase::LeaderReaped => Ok(()),
             Phase::Reaped => Err(invalid_state("generation has been reaped")),
+        }
+    }
+
+    /// Performs one nonblocking leader-reap or process-group probe.
+    pub(crate) fn reap_step(&mut self) -> io::Result<TreeObservation> {
+        self.reap_step_with(|child| child.try_wait(), |group| killpg(group, None))
+    }
+
+    fn reap_step_with<W, P>(&mut self, wait: W, probe: P) -> io::Result<TreeObservation>
+    where
+        W: FnOnce(&mut Child) -> io::Result<Option<ExitStatus>>,
+        P: FnOnce(Pid) -> Result<(), Errno>,
+    {
+        match self.phase {
+            Phase::Running | Phase::TerminationRequested => {
+                Err(invalid_state("generation has not been force-killed"))
+            }
+            Phase::ForceKillRequested => {
+                let child = self.child.as_mut().ok_or_else(|| {
+                    io::Error::other("force-killed generation has no owned child")
+                })?;
+                match wait(child)? {
+                    None => Ok(TreeObservation::Present),
+                    Some(status) => {
+                        self.child = None;
+                        self.status = Some(status);
+                        self.phase = Phase::LeaderReaped;
+                        self.probe_reap_step(probe)
+                    }
+                }
+            }
+            Phase::LeaderReaped => self.probe_reap_step(probe),
+            Phase::Reaped => Ok(TreeObservation::ConfirmedEmpty),
+        }
+    }
+
+    fn probe_reap_step<P>(&mut self, probe: P) -> io::Result<TreeObservation>
+    where
+        P: FnOnce(Pid) -> Result<(), Errno>,
+    {
+        match probe(self.group) {
+            Err(Errno::ESRCH) => {
+                self.phase = Phase::Reaped;
+                self.permit.take();
+                Ok(TreeObservation::ConfirmedEmpty)
+            }
+            Ok(()) | Err(Errno::EPERM) => Ok(TreeObservation::Present),
+            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
         }
     }
 
@@ -964,6 +1013,148 @@ pub(crate) mod tests {
         generation
             .reap_after_stop()
             .expect("reap signal-exited child");
+    }
+
+    #[test]
+    fn reap_step_waits_at_most_once_and_does_not_probe_before_reap() {
+        use crate::target::TreeObservation;
+        use std::cell::Cell;
+
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        generation
+            .force_kill()
+            .unwrap_or_else(|error| panic!("force: {error}"));
+        let waits = Cell::new(0);
+        let probes = Cell::new(0);
+        assert_eq!(
+            generation
+                .reap_step_with(
+                    |_| {
+                        waits.set(waits.get() + 1);
+                        Ok(None)
+                    },
+                    |_| {
+                        probes.set(probes.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap_or_else(|error| panic!("reap step: {error}")),
+            TreeObservation::Present
+        );
+        assert_eq!(waits.get(), 1);
+        assert_eq!(probes.get(), 0);
+        assert!(generation.child.is_some());
+        assert!(global_reaper().reserve().is_err());
+        assert!(
+            generation
+                .reap_step_with(
+                    |_| Err(io::Error::other("try_wait failed")),
+                    |_| panic!("probe must not run after try_wait error"),
+                )
+                .is_err()
+        );
+        assert_eq!(generation.phase, Phase::ForceKillRequested);
+        assert!(global_reaper().reserve().is_err());
+        drop(generation);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn reap_step_reaps_before_probe_and_retry_skips_wait() {
+        use crate::target::TreeObservation;
+
+        let _test_guard = test_lock();
+        let mut generation = exiting_generation();
+        let exited = generation.wait_for_leader_exit(Duration::from_secs(1));
+        assert!(matches!(exited, Ok(true)));
+        assert!(generation.force_kill().is_ok());
+        let probes = std::cell::Cell::new(0);
+        assert!(
+            generation
+                .reap_step_with(
+                    |child| child.try_wait(),
+                    |_| {
+                        probes.set(probes.get() + 1);
+                        Err(Errno::EIO)
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(generation.phase, Phase::LeaderReaped);
+        assert!(generation.child.is_none());
+        assert!(generation.status.is_some());
+        assert_eq!(probes.get(), 1);
+        assert_eq!(
+            generation
+                .reap_step_with(
+                    |_| panic!("retry must not wait again"),
+                    |_| Err(Errno::ESRCH),
+                )
+                .unwrap_or_else(|error| panic!("retry reap step: {error}")),
+            TreeObservation::ConfirmedEmpty
+        );
+        assert_eq!(generation.phase, Phase::Reaped);
+        assert!(global_reaper().reserve().is_ok());
+    }
+
+    #[test]
+    fn reap_step_probe_matrix_and_reaped_cache() {
+        use crate::target::TreeObservation;
+
+        let _test_guard = test_lock();
+        for result in [Ok(()), Err(Errno::EPERM), Err(Errno::EIO)] {
+            let mut generation = exiting_generation();
+            assert!(matches!(
+                generation.wait_for_leader_exit(Duration::from_secs(1)),
+                Ok(true)
+            ));
+            generation
+                .force_kill()
+                .unwrap_or_else(|error| panic!("force: {error}"));
+            let step = generation.reap_step_with(|child| child.try_wait(), |_| result);
+            match result {
+                Ok(()) | Err(Errno::EPERM) => assert_eq!(
+                    step.unwrap_or_else(|error| panic!("probe: {error}")),
+                    TreeObservation::Present
+                ),
+                Err(Errno::EIO) => assert!(step.is_err()),
+                Err(_) => unreachable!(),
+            }
+            assert!(global_reaper().reserve().is_err());
+            assert!(
+                generation
+                    .reap_step_with(
+                        |_| panic!("probe retry must not wait"),
+                        |_| Err(Errno::ESRCH),
+                    )
+                    .is_ok()
+            );
+        }
+
+        let mut generation = exiting_generation();
+        assert!(matches!(
+            generation.wait_for_leader_exit(Duration::from_secs(1)),
+            Ok(true)
+        ));
+        generation
+            .force_kill()
+            .unwrap_or_else(|error| panic!("force: {error}"));
+        assert_eq!(
+            generation
+                .reap_step_with(|child| child.try_wait(), |_| Err(Errno::ESRCH))
+                .unwrap_or_else(|error| panic!("reap: {error}")),
+            TreeObservation::ConfirmedEmpty
+        );
+        assert_eq!(
+            generation
+                .reap_step_with(
+                    |_| panic!("reaped state must not wait"),
+                    |_| panic!("reaped state must not probe"),
+                )
+                .unwrap_or_else(|error| panic!("cached observation: {error}")),
+            TreeObservation::ConfirmedEmpty
+        );
     }
 
     /// This exercises the macOS all-zombie `killpg(SIGKILL) -> EPERM` case.
