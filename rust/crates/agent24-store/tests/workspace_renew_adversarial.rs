@@ -159,3 +159,100 @@ async fn wal_expiry_race_never_resurrects_or_loses_audit() {
     ));
     s.verify_audit_chain().await.unwrap();
 }
+
+#[tokio::test]
+async fn lazy_expiry_commits_before_renewal_rejects_without_repeating_writes() {
+    let s = Store::open_memory().await.unwrap();
+    create(&s).await;
+    let id = WorkspaceId::parse(ID).unwrap();
+    let owner = LifecycleOwnerRef::parse("owner".into()).unwrap();
+    let now = WorkspaceInstant::parse("2026-09-19T00:02:00.000Z").unwrap();
+    let ttl = WorkspaceTtl::new(120_000).unwrap();
+    let expected = Err(WorkspaceStoreError::InvalidValue {
+        field: "workspace_state",
+    });
+    assert_eq!(s.renew_workspace(&id, &owner, ttl, &now).await, expected);
+    let expired = s.get_workspace(&id).await.unwrap();
+    assert_eq!(expired.state, "expired");
+    assert_eq!(expired.revision, 2);
+    assert_eq!(expired.expires_at, "2026-09-19T00:01:00.000Z");
+    let audit = s.list_audit().await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "workspace.expired");
+
+    assert_eq!(s.renew_workspace(&id, &owner, ttl, &now).await, expected);
+    assert_eq!(s.get_workspace(&id).await.unwrap(), expired);
+    assert_eq!(s.list_audit().await.unwrap(), audit);
+}
+
+#[tokio::test]
+async fn renewal_rejects_times_before_creation_or_prior_renewal() {
+    let s = Store::open_memory().await.unwrap();
+    create(&s).await;
+    let id = WorkspaceId::parse(ID).unwrap();
+    let owner = LifecycleOwnerRef::parse("owner".into()).unwrap();
+    let ttl = WorkspaceTtl::new(120_000).unwrap();
+    let before_create = WorkspaceInstant::parse("2026-09-18T23:59:59.999Z").unwrap();
+    assert_eq!(
+        s.renew_workspace(&id, &owner, ttl, &before_create).await,
+        Err(WorkspaceStoreError::InvalidValue {
+            field: "renewed_at"
+        })
+    );
+    let first = WorkspaceInstant::parse("2026-09-19T00:00:30.000Z").unwrap();
+    s.renew_workspace(&id, &owner, ttl, &first).await.unwrap();
+    let before_renewal = WorkspaceInstant::parse("2026-09-19T00:00:29.999Z").unwrap();
+    assert_eq!(
+        s.renew_workspace(&id, &owner, ttl, &before_renewal).await,
+        Err(WorkspaceStoreError::InvalidValue {
+            field: "renewed_at"
+        })
+    );
+    let row = s.get_workspace(&id).await.unwrap();
+    assert_eq!(row.renewed_at.as_deref(), Some(first.as_str()));
+    assert_eq!(row.revision, 2);
+    assert_eq!(s.list_audit().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn releasing_cleanup_failed_and_released_workspaces_are_unchanged() {
+    for (state, setup) in [
+        (
+            "releasing",
+            "UPDATE workspaces SET state='releasing' WHERE id=?",
+        ),
+        (
+            "cleanup_failed",
+            "UPDATE workspaces SET state='cleanup_failed', cleanup_error='failed', cleanup_retry_at=?, cleanup_attempts=1, cleanup_last_attempt_at=? WHERE id=?",
+        ),
+        (
+            "released",
+            "UPDATE workspaces SET state='released', released_at=?, quarantine_root='/quarantine', quarantined_at=? WHERE id=?",
+        ),
+    ] {
+        let s = Store::open_memory().await.unwrap();
+        create(&s).await;
+        let mut query = sqlx::query(setup);
+        if state == "cleanup_failed" || state == "released" {
+            query = query.bind(CREATED).bind(CREATED).bind(ID);
+        } else {
+            query = query.bind(ID);
+        }
+        query.execute(test_hooks::pool(&s)).await.unwrap();
+        let id = WorkspaceId::parse(ID).unwrap();
+        let owner = LifecycleOwnerRef::parse("owner".into()).unwrap();
+        let now = WorkspaceInstant::parse("2026-09-19T00:00:30.000Z").unwrap();
+        assert_eq!(
+            s.renew_workspace(&id, &owner, WorkspaceTtl::new(120_000).unwrap(), &now)
+                .await,
+            Err(WorkspaceStoreError::InvalidValue {
+                field: "workspace_state"
+            })
+        );
+        let row = s.get_workspace(&id).await.unwrap();
+        assert_eq!(row.state, state);
+        assert_eq!(row.revision, 1);
+        assert_eq!(row.renewed_at, None);
+        assert!(s.list_audit().await.unwrap().is_empty());
+    }
+}

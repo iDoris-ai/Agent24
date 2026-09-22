@@ -61,15 +61,20 @@ async fn renew_core_table_covers_extension_replay_invalid_and_lazy_expiry() {
         })
     );
     let expired_store = store().await;
-    let expired = expired_store
-        .renew_workspace(
-            &id,
-            &owner,
-            ttl,
-            &WorkspaceInstant::parse("2026-09-19T00:01:00.000Z").unwrap(),
-        )
-        .await
-        .unwrap();
+    assert_eq!(
+        expired_store
+            .renew_workspace(
+                &id,
+                &owner,
+                ttl,
+                &WorkspaceInstant::parse("2026-09-19T00:01:00.000Z").unwrap(),
+            )
+            .await,
+        Err(WorkspaceStoreError::InvalidValue {
+            field: "workspace_state"
+        })
+    );
+    let expired = expired_store.get_workspace(&id).await.unwrap();
     assert_eq!((expired.state.as_str(), expired.revision), ("expired", 2));
     assert_eq!(
         expired_store.list_audit().await.unwrap()[0].action,
