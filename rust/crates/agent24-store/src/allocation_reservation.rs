@@ -335,6 +335,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_commit_rolls_back_and_retry_on_new_connection_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commit-rejected.sqlite");
+        let intent = intent(
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+            "commit-rejected",
+        );
+        let store = hooked_store(&path).await;
+        let observer = Store::open(&path).await.unwrap();
+        let (hooked_tx, hooked_rx) = mpsc::sync_channel(1);
+        let mut connection = store.pool.acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(move || {
+                let _ = hooked_tx.try_send(());
+                false
+            });
+        drop(connection);
+
+        let error = store
+            .reserve_workspace_allocation(&intent)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, WorkspaceStoreError::Database);
+        assert_eq!(error.to_string(), "workspace database error");
+        assert!(!error.to_string().contains("commit"));
+        timeout(
+            HOOK_TIMEOUT,
+            tokio::task::spawn_blocking(move || hooked_rx.recv_timeout(HOOK_TIMEOUT)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(counts(&observer).await, (0, 0));
+
+        let mut connection = store.pool.acquire().await.unwrap();
+        connection.lock_handle().await.unwrap().remove_commit_hook();
+        drop(connection);
+        timeout(HOOK_TIMEOUT, store.pool.close()).await.unwrap();
+
+        let reopened = Store::open(&path).await.unwrap();
+        assert_eq!(counts(&reopened).await, (0, 0));
+        let record = reopened
+            .reserve_workspace_allocation(&intent)
+            .await
+            .unwrap();
+        assert_eq!(record.id().as_str(), intent.allocation_id().as_str());
+        assert_eq!(record.phase(), AllocationPhase::Reserved);
+        assert_eq!(counts(&reopened).await, (1, 1));
+        reopened.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn wal_reservation_conflicts_are_serialized_and_replay_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         assert_wal_conflict(
