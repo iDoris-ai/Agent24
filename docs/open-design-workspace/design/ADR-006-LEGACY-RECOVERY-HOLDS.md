@@ -86,7 +86,7 @@ hash chain，只追加迁移事件。
 | 历史状态 | 恢复结果 |
 | --- | --- |
 | awaiting approval + pending 且 checkpoint 完整 | `awaiting_decision` |
-| approval 已决定且 thread/payload 仍匹配 | 持久化 `ready` intent |
+| `awaiting_decision` 且 approval 已决定、thread/payload 匹配 | 持久化 `ready` intent |
 | queued/running | `needs_attention`；不自动重放、不自动取消 |
 | tool/payload/72h/root identity 校验失败 | `needs_attention`；零工具调用 |
 | 用户明确 cancel/abort | 正常 terminal，并原子释放 lease/hold |
@@ -94,8 +94,11 @@ hash chain，只追加迁移事件。
 Ready Runs 按 `ready_at, run_id` 稳定排序。promotion 在同一事务重读 Run、hold、decision、
 workspace/root，插入唯一 Run lease并把 hold 标为 active；并发 promotion 最多一个成功。
 
-approval decision 与 ready intent 应同事务提交，通知和事件在 commit 后发出。对升级前已
-落库的 resolved decision，启动 reconciler 验证 thread/payload 后补齐 intent。
+approval transaction 依当前 hold state 决定写入：`awaiting_decision + resolved` 才同
+事务转 `ready`；`active + resolved` 保持 active 和原 lease，只写 decision 与
+`active_resume` marker；`needs_attention` 不因 decision 自动转 ready；terminal 永远获胜。
+通知和事件都在 commit 后发出。对升级前已落库的 resolved decision，启动 reconciler
+按同一矩阵验证 thread/payload 后补齐 intent/marker，不能让已有 executor 重复 promotion。
 
 重启遇到 active hold 时：完整 awaiting-approval checkpoint 恢复原 lease 归属；
 queued/running 的执行结果不确定，转为 needs-attention 并保留 lease/hold，直到用户明确
@@ -117,6 +120,7 @@ lease identity，也不把“approval 已批准”表述为“工具已执行”
 - pending/approved/denied/aborted、缺失 tool row/thread、terminal 混合；
 - 每个事务写点、audit 与 commit-unknown 失败都无半回填；
 - decision commit 后 crash，重启仍 ready，不被 orphan sweep 取消；
+- active -> approval -> decision 在 crash/restart 后仍 active 且复用原 lease，不进 ready queue；
 - 两个 decision/promotion 并发，最多一个 executor；
 - active 再次 awaiting approval 时 lease 不释放；
 - terminal/cancel/promotion 竞争保持 terminal + lease + hold 原子；
