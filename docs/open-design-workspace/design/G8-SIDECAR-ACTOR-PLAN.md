@@ -17,9 +17,12 @@ AwaitLaunch -> Launching -> AwaitReady -> Running
            -> GracefulStopping -> ForceStopping -> Draining -> Empty
 ```
 
-任何 fatal transport/protocol failure 都进入同一清理路径。若 deadline 后仍不能证明
-tree empty，状态是 `Unconfirmed`：继续持有 owner、返回失败并禁止新 generation，绝不能
-用超时冒充 `empty:true`。
+任何 fatal transport/protocol failure 都进入同一清理路径。`Draining` 只能依据 owner
+证据转到 `Empty`，或在 deadline/观察失败时转到 `Unconfirmed`。`Unconfirmed` 继续持有
+owner、返回失败并禁止新 generation；只有后续 owner-backed force/probe/reap 确认 tree
+empty 才能转 `Empty`。parent EOF/cancellation/connection loss 发生在 confirmed Empty 前
+时，helper/supervisor 必须保持 blocked cleanup，不能退出、drop owner 或重启。绝不能用
+超时冒充 `empty:true`。
 
 ## 2. Owner 前置接口
 
@@ -46,6 +49,12 @@ impl OwnedTarget {
 group；Windows 保留同一 Job handle，soft stop 用 target stdin EOF，force 用 exact Job
 kill，不能把 processkit 的 Windows shutdown 当成 SIGTERM。
 
+`TargetPipes.stdin` 的关闭 authority 属于 actor：soft stop 只关闭一次 stdin。关闭后
+Windows `request_stop(false)` 是幂等 no-op，`force=true` 才调用 exact
+`ProcessGroup::kill_all()`；owner 不得重新取得或复制 stdin。Windows empty probe 必须给
+固定 `processkit = 3.3.4` 显式启用 `stats` feature，并读取固定结构的
+`stats().active_process_count`；禁止用会分配 PID `Vec` 的 `members()`。
+
 ## 3. Allocation-bounded I/O
 
 | 资源 | 固定上限 |
@@ -63,7 +72,10 @@ kill，不能把 processkit 的 Windows shutdown 当成 SIGTERM。
 后移动 Vec，不 clone；严格按 `consumed` 推进；partial EOF 是协议失败。单-slot writer
 必须继续 partial write，不能取消半帧后写下一条；writer 阻塞不能阻止 owner force/observe。
 
-Wire frame 有界不等于 JSON heap 有界。Launch 增加 actor-level 约束：argv 最多 128、env
+Wire frame 有界不等于 JSON heap 有界。必须在 protocol crate 增加 bounded Serde
+visitor/seed，在 materialize 前计数并拒绝重复 top-level key、所有平台重复 env key及
+Windows 大小写等价 env key；actor 禁止先调用现有 `decode_request`。visitor 成功后才
+允许 `RequestSequence::accept`。Launch 约束：argv 最多 128、env
 最多 64、单字符串复用 4096 上限；env key 非空且无 `=`/控制字符，Windows 按平台语义
 拒绝大小写重复。数量检查必须在 materialize 容器前完成。
 
