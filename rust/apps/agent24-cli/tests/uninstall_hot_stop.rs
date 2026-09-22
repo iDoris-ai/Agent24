@@ -285,13 +285,26 @@ impl Drop for Daemon<'_> {
 /// `unknown_disabled`'s fail-closed check on the next start and degraded
 /// EVERY module, not just the uninstalled one. This test proves the real,
 /// wired-together system: the module's process actually exits, no
-/// tombstone, and an unrelated module (the compiled-in `sin90`) survives a
-/// restart mounted and running.
+/// tombstone, and an unrelated module survives a restart mounted and
+/// running.
+///
+/// The unrelated module used to be the compiled-in `sin90` — free, since the
+/// daemon always had it. T11 removed the last compiled-in domain OS, so this
+/// installs a second out-of-process package (`survivor`) instead: same
+/// property (uninstalling one module must not disturb any other), proven the
+/// same way a second real package would be affected if the registry write
+/// were scoped wrong, just without a compiled-in module to lean on for free.
 #[test]
 fn uninstall_hot_stops_a_running_module_and_leaves_no_tombstone() {
     let home = tmp_home();
     let src = write_package(home.path(), "fu61demo", false);
     let (ok, out) = run(home.path(), &["os", "install", &src.to_string_lossy()]);
+    assert!(ok, "{out}");
+    let survivor_src = write_package(home.path(), "survivor", false);
+    let (ok, out) = run(
+        home.path(),
+        &["os", "install", &survivor_src.to_string_lossy()],
+    );
     assert!(ok, "{out}");
 
     let _daemon = Daemon::start(home.path());
@@ -303,6 +316,11 @@ fn uninstall_hot_stops_a_running_module_and_leaves_no_tombstone() {
     assert!(
         alive(pid),
         "the module process must be alive before uninstall"
+    );
+    let survivor_pid = wait_for_running_pid(home.path(), "survivor");
+    assert!(
+        alive(survivor_pid),
+        "the unrelated module must be alive before uninstall too"
     );
 
     let (ok, out) = run(home.path(), &["os", "uninstall", "fu61demo"]);
@@ -337,9 +355,10 @@ fn uninstall_hot_stops_a_running_module_and_leaves_no_tombstone() {
     );
 
     // Restart: the uninstalled package is gone from the catalogue, and the
-    // registry is genuinely healthy — `sin90` (compiled in, unrelated)
-    // mounts and reports `[mounted]`, not merely "no error string appeared
-    // somewhere in the output" (round-2 code review Medium 2).
+    // registry is genuinely healthy — `survivor` (an unrelated package that
+    // was never touched) mounts and reports `[mounted]`, not merely "no
+    // error string appeared somewhere in the output" (round-2 code review
+    // Medium 2).
     let (ok, _) = run(home.path(), &["daemon", "stop"]);
     assert!(ok);
     let _daemon2 = Daemon::start(home.path());
@@ -350,8 +369,8 @@ fn uninstall_hot_stops_a_running_module_and_leaves_no_tombstone() {
         "the uninstalled package must be gone from the catalogue: {out}"
     );
     assert!(
-        out.contains("sin90") && out.contains("[mounted]"),
-        "an unrelated compiled-in module must still mount cleanly after the restart: {out}"
+        out.contains("survivor") && out.contains("[mounted]"),
+        "an unrelated package must still mount cleanly after the restart: {out}"
     );
 }
 
