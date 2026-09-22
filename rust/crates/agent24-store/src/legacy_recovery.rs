@@ -253,6 +253,53 @@ pub fn recovery_decision_effect(
     }
 }
 
+/// A crate-private, immutable plan for the only field changes made by the
+/// legacy recovery Ready transition. This is persistence data, not an
+/// eligibility or capability token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ReadyMutation {
+    run_id: String,
+    cohort_id: String,
+    workspace_id: WorkspaceId,
+    root_generation: String,
+    original_status: RunStatus,
+    approval_id: String,
+    recovery_state: RecoveryState,
+    ready_at: WorkspaceInstant,
+}
+
+/// Plans `awaiting_decision -> ready` without performing any I/O.
+#[allow(dead_code)]
+pub(crate) fn plan_ready_mutation(
+    hold: &LegacyRecoveryHold,
+    run_status: RunStatus,
+    approval_resolved: bool,
+    approval_id: &str,
+    ready_at: WorkspaceInstant,
+) -> WorkspaceResult<Option<ReadyMutation>> {
+    if recovery_decision_effect(run_status, hold.recovery_state, approval_resolved)
+        != RecoveryDecisionEffect::MarkReady
+    {
+        return Ok(None);
+    }
+    if hold.approval_id.as_deref() != Some(approval_id) {
+        return Err(WorkspaceStoreError::InvalidValue {
+            field: "approval_id",
+        });
+    }
+    Ok(Some(ReadyMutation {
+        run_id: hold.run_id.clone(),
+        cohort_id: hold.cohort_id.clone(),
+        workspace_id: hold.workspace_id.clone(),
+        root_generation: hold.root_generation.clone(),
+        original_status: hold.original_status,
+        approval_id: approval_id.to_owned(),
+        recovery_state: RecoveryState::Ready,
+        ready_at,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +494,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn ready_mutation_preserves_identity_and_changes_only_ready_fields() {
+        let hold = fixture(
+            "awaiting_decision",
+            Some("approval-1"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ready_at = WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap();
+        let mutation = plan_ready_mutation(
+            &hold,
+            RunStatus::Running,
+            true,
+            "approval-1",
+            ready_at.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mutation.run_id, hold.run_id);
+        assert_eq!(mutation.cohort_id, hold.cohort_id);
+        assert_eq!(mutation.workspace_id, hold.workspace_id);
+        assert_eq!(mutation.root_generation, hold.root_generation);
+        assert_eq!(mutation.original_status, hold.original_status);
+        assert_eq!(mutation.approval_id, "approval-1");
+        assert_eq!(mutation.recovery_state, RecoveryState::Ready);
+        assert_eq!(mutation.ready_at, ready_at);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn ready_mutation_rejects_wrong_approval_and_ignores_pending_or_other_states() {
+        let hold = fixture(
+            "awaiting_decision",
+            Some("approval-1"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ready_at = WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap();
+        assert_eq!(
+            plan_ready_mutation(
+                &hold,
+                RunStatus::Running,
+                false,
+                "approval-1",
+                ready_at.clone()
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            plan_ready_mutation(&hold, RunStatus::Completed, true, "wrong", ready_at.clone())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            plan_ready_mutation(&hold, RunStatus::Running, true, "wrong", ready_at.clone())
+                .unwrap_err(),
+            WorkspaceStoreError::InvalidValue {
+                field: "approval_id"
+            }
+        );
+        let ready = fixture(
+            "ready",
+            Some("approval-1"),
+            Some("2026-09-18T00:00:00.000Z"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plan_ready_mutation(&ready, RunStatus::Running, true, "approval-1", ready_at).unwrap(),
+            None
+        );
     }
     #[allow(clippy::unwrap_used)]
     async fn fixture(
