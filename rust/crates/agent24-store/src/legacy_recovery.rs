@@ -292,18 +292,40 @@ impl Store {
         &self,
         run_id: &str,
     ) -> WorkspaceResult<LegacyRecoveryHold> {
-        let row = sqlx::query(
-            "SELECT run_id,cohort_id,workspace_id,root_generation,original_status,
-             recovery_state,approval_id,ready_at,reason_code,released_at,active_resume_approval_id
-             FROM legacy_recovery_holds WHERE run_id = ? COLLATE BINARY LIMIT 1",
-        )
-        .bind(run_id)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(|_| WorkspaceStoreError::Database)?
-        .ok_or(WorkspaceStoreError::NotFound)?;
-        LegacyRecoveryHold::decode(row)
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        let hold = read_hold_tx(&mut tx, run_id).await?;
+        tx.commit()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        Ok(hold)
     }
+}
+
+/// Reads a hold under a caller-owned transaction. The explicit projection is
+/// part of the decoder contract: schema drift is reported as `Database`.
+pub(crate) async fn read_hold_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+) -> WorkspaceResult<LegacyRecoveryHold> {
+    let row = sqlx::query(
+        "SELECT run_id,cohort_id,workspace_id,root_generation,original_status,
+         recovery_state,approval_id,ready_at,reason_code,released_at,active_resume_approval_id
+         FROM legacy_recovery_holds WHERE run_id = ? COLLATE BINARY LIMIT 1",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?
+    .ok_or(WorkspaceStoreError::NotFound)?;
+    let hold = LegacyRecoveryHold::decode(row)?;
+    if hold.run_id != run_id {
+        return Err(bad("run_id"));
+    }
+    Ok(hold)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +475,14 @@ mod tests {
         .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            read_hold_tx(&mut tx, "run-strict").await.unwrap().run_id(),
+            "run-strict"
+        );
+        assert_eq!(
+            read_hold_tx(&mut tx, "RUN-STRICT").await,
+            Err(WorkspaceStoreError::NotFound)
+        );
         assert_eq!(read_run_facts(&mut tx, "RUN-STRICT").await.unwrap(), None);
         assert_eq!(
             read_run_facts(&mut tx, "run-strict").await.unwrap(),
@@ -470,6 +500,10 @@ mod tests {
                 run_id: "run-strict".to_owned(),
                 status: ApprovalStatus::Pending,
             })
+        );
+        assert_eq!(
+            read_approval_facts(&mut tx, "APPROVAL-STRICT").await,
+            Ok(None)
         );
         let after: (String, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT recovery_state FROM legacy_recovery_holds WHERE run_id='run-strict'),
@@ -490,6 +524,87 @@ mod tests {
                 .unwrap()
                 .status,
             ApprovalStatus::Approved
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn strict_facts_classify_storage_enums_and_sql_failures() {
+        let store = Store {
+            pool: sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        };
+        execute(
+            &store,
+            "CREATE TABLE runs (id INTEGER,status);
+             INSERT INTO runs VALUES
+                ('run-storage',1),('run-enum','bogus'),('1','running');
+             CREATE TABLE approvals (id INTEGER,run_id,status);
+             INSERT INTO approvals VALUES
+                ('approval-storage','run',1),
+                ('approval-enum','run','bogus'),
+                ('approval-run-storage','run', 'pending'),
+                ('1','run','pending');
+             UPDATE approvals SET run_id=1 WHERE id='approval-run-storage';",
+        )
+        .await;
+        let mut tx = store.pool().begin().await.unwrap();
+        for (id, field) in [
+            ("run-storage", "status"),
+            ("run-enum", "status"),
+            ("1", "id"),
+        ] {
+            assert_eq!(
+                read_run_facts(&mut tx, id).await,
+                Err(WorkspaceStoreError::CorruptRow {
+                    table: "runs",
+                    field
+                })
+            );
+        }
+        for (id, field) in [
+            ("approval-storage", "status"),
+            ("approval-enum", "status"),
+            ("approval-run-storage", "run_id"),
+            ("1", "id"),
+        ] {
+            assert_eq!(
+                read_approval_facts(&mut tx, id).await,
+                Err(WorkspaceStoreError::CorruptRow {
+                    table: "approvals",
+                    field
+                })
+            );
+        }
+        assert_eq!(read_run_facts(&mut tx, "missing").await, Ok(None));
+        assert_eq!(read_approval_facts(&mut tx, "MISSING").await, Ok(None));
+        assert_eq!(
+            read_hold_tx(&mut tx, "run").await,
+            Err(WorkspaceStoreError::Database)
+        );
+        tx.rollback().await.unwrap();
+
+        execute(&store, "DROP TABLE runs; DROP TABLE approvals").await;
+        let mut tx = store.pool().begin().await.unwrap();
+        assert_eq!(
+            read_run_facts(&mut tx, "run").await,
+            Err(WorkspaceStoreError::Database)
+        );
+        assert_eq!(
+            read_approval_facts(&mut tx, "approval").await,
+            Err(WorkspaceStoreError::Database)
+        );
+        tx.rollback().await.unwrap();
+
+        execute(&store, "CREATE TABLE legacy_recovery_holds (run_id)").await;
+        let mut tx = store.pool().begin().await.unwrap();
+        assert_eq!(
+            read_hold_tx(&mut tx, "run").await,
+            Err(WorkspaceStoreError::Database)
         );
         tx.rollback().await.unwrap();
     }
