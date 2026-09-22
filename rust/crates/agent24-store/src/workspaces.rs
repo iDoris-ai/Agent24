@@ -28,6 +28,12 @@ pub enum WorkspaceStoreError {
 pub enum WorkspaceConflict {
     #[error("identifier")]
     Identifier,
+    #[error("allocation identifier")]
+    AllocationIdentifier,
+    #[error("allocation workspace")]
+    AllocationWorkspace,
+    #[error("allocation relative name")]
+    AllocationRelativeName,
     #[error("canonical root")]
     CanonicalRoot,
     #[error("root identity")]

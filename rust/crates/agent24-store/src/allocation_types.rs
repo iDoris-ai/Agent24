@@ -41,6 +41,10 @@ impl AllocationId {
         }
         Ok(Self(value.to_owned()))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Closed allocation journal lifecycle.
