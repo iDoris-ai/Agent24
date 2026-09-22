@@ -1,9 +1,9 @@
 //! Windows lifecycle ownership backed by a processkit Job Object.
 
-use std::io;
+use std::{io, process::Stdio};
 
 use processkit::ProcessGroup;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GenerationId(u64);
@@ -29,7 +29,11 @@ impl GenerationOwner {
             .map_err(io::Error::other)
     }
 
-    pub fn spawn(self, command: Command) -> io::Result<OwnedProcess> {
+    pub fn spawn(self, mut command: Command) -> io::Result<OwnedProcess> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let generation = self.generation;
         let child = self.group.spawn(command).map_err(io::Error::other)?;
         Ok(OwnedProcess {
@@ -38,6 +42,14 @@ impl GenerationOwner {
             owner: self,
         })
     }
+}
+
+/// The only handles through which the actor may communicate with its child.
+#[derive(Debug)]
+pub struct OwnedPipes {
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
+    pub stderr: ChildStderr,
 }
 
 #[derive(Debug)]
@@ -52,10 +64,42 @@ impl OwnedProcess {
         self.generation
     }
 
-    pub async fn wait(mut self) -> io::Result<std::process::ExitStatus> {
-        let result = self.child.wait().await;
-        drop(self.owner);
-        result
+    /// Transfers all three child pipes exactly once.
+    pub fn take_pipes(&mut self) -> io::Result<OwnedPipes> {
+        match (
+            self.child.stdin.take(),
+            self.child.stdout.take(),
+            self.child.stderr.take(),
+        ) {
+            (Some(stdin), Some(stdout), Some(stderr)) => Ok(OwnedPipes {
+                stdin,
+                stdout,
+                stderr,
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child pipes have already been taken",
+            )),
+        }
+    }
+
+    /// Observes exit without consuming this process or releasing its Job.
+    pub fn observe_exit(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Uses the Job Object's bounded counter, never a PID snapshot.
+    pub fn tree_is_empty(&self) -> io::Result<bool> {
+        self.owner
+            .group
+            .stats()
+            .map(|stats| stats.active_process_count == 0)
+            .map_err(io::Error::other)
+    }
+
+    /// Force-kills exactly this owned Job tree. Repeated calls are safe.
+    pub fn force_kill(&mut self) -> io::Result<()> {
+        self.owner.group.kill_all().map_err(io::Error::other)
     }
 }
 
@@ -65,6 +109,7 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn powershell(script: &str) -> Command {
         let mut command = Command::new("powershell.exe");
@@ -140,6 +185,34 @@ mod tests {
         Ok(())
     }
 
+    async fn wait_until_exit(process: &mut OwnedProcess) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match process.observe_exit() {
+                Ok(Some(status)) => return status,
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(None) => panic!("child did not exit before deadline"),
+                Err(error) => panic!("observe child exit: {error}"),
+            }
+        }
+    }
+
+    async fn wait_until_empty(process: &OwnedProcess) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match process.tree_is_empty() {
+                Ok(true) => return,
+                Ok(false) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(false) => panic!("Job tree did not empty before deadline"),
+                Err(error) => panic!("read Job stats: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn generation_zero_is_rejected() {
         let error = GenerationId::new(0).expect_err("zero must not own a process");
@@ -169,11 +242,71 @@ mod tests {
         let owner = GenerationOwner::new(generation).expect("Job Object");
         let mut command = Command::new("cmd.exe");
         command.args(["/C", "exit", "0"]);
-        let process = owner
+        let mut process = owner
             .spawn(command)
             .expect("suspended spawn and assignment");
         assert_eq!(process.generation(), generation);
-        assert!(process.wait().await.expect("wait").success());
+        assert!(wait_until_exit(&mut process).await.success());
+        assert!(process.tree_is_empty().expect("Job stats"));
+    }
+
+    #[tokio::test]
+    async fn pipes_transfer_once_and_exit_observation_keeps_job_owned() {
+        let generation = GenerationId::new(4).expect("non-zero generation");
+        let owner = GenerationOwner::new(generation).expect("Job Object");
+        let script = "$line=[Console]::In.ReadLine(); [Console]::Out.Write(\"out:$line\"); [Console]::Error.Write(\"err:$line\")";
+        let mut process = owner
+            .spawn(powershell(script))
+            .expect("suspended spawn and assignment");
+        let pipes = process.take_pipes().expect("owned pipes");
+        assert!(process.take_pipes().is_err());
+        let OwnedPipes {
+            mut stdin,
+            mut stdout,
+            mut stderr,
+        } = pipes;
+        stdin.write_all(b"hello\n").await.expect("write stdin");
+        stdin.shutdown().await.expect("close stdin");
+        let mut stdout_text = String::new();
+        let mut stderr_text = String::new();
+        stdout
+            .read_to_string(&mut stdout_text)
+            .await
+            .expect("read stdout");
+        stderr
+            .read_to_string(&mut stderr_text)
+            .await
+            .expect("read stderr");
+        let status = wait_until_exit(&mut process).await;
+        assert_eq!(
+            process.observe_exit().expect("repeat observe"),
+            Some(status)
+        );
+        assert_eq!(stdout_text, "out:hello");
+        assert_eq!(stderr_text, "err:hello");
+        assert!(process.tree_is_empty().expect("Job stats"));
+    }
+
+    #[tokio::test]
+    async fn exited_leader_does_not_hide_descendant_from_force_or_empty() {
+        let marker = marker_path("exit-descendant");
+        let marker_text = marker.display().to_string().replace('\'', "''");
+        let script = format!(
+            "$child = Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker_text}' -Value $child.Id"
+        );
+        let owner =
+            GenerationOwner::new(GenerationId::new(5).expect("generation")).expect("Job Object");
+        let mut process = owner
+            .spawn(powershell(&script))
+            .expect("spawn process tree");
+        let descendant = read_pid(&marker).expect("child must publish a readable pid");
+        assert!(wait_until_exit(&mut process).await.success());
+        assert!(!process.tree_is_empty().expect("Job stats"));
+        process.force_kill().expect("force Job tree");
+        process.force_kill().expect("repeat force Job tree");
+        wait_until_empty(&process).await;
+        wait_until_gone(descendant).expect("descendant teardown");
+        let _ = std::fs::remove_file(marker);
     }
 
     #[tokio::test]
@@ -199,7 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_wait_drops_the_owned_process_and_kills_it() {
+    async fn dropping_owned_process_kills_it() {
         let marker = marker_path("cancel-wait");
         let marker_text = marker.display().to_string().replace('\'', "''");
         let script = format!(
@@ -215,9 +348,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let child = read_pid(&marker).expect("child must publish a readable pid");
-        tokio::time::timeout(Duration::from_millis(100), process.wait())
-            .await
-            .expect_err("the sleep must outlive the bounded wait");
+        drop(process);
         wait_until_gone(child).expect("tasklist must confirm owned process teardown");
         let _ = std::fs::remove_file(marker);
     }
