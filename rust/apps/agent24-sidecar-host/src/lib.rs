@@ -19,7 +19,7 @@ pub use posix::{LaunchSpec, OwnedGeneration, OwnedPipes, StopError};
 #[cfg(windows)]
 mod owner;
 #[cfg(windows)]
-pub use owner::{GenerationId, GenerationOwner, OwnedProcess};
+pub use owner::{GenerationId, GenerationOwner, OwnedPipes, OwnedProcess};
 
 /// Run the host process.
 pub fn run() -> std::io::Result<()> {
