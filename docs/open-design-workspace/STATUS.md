@@ -41,11 +41,25 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - #370 首轮 SOL 阻塞了可伪造的错误字符串分类；新 head 改用 per-decode typed flag，
   200 changed lines，复核 `PASS`。#375 的 env raw-entry 上限也已 SOL `PASS`。
 - #374 的复核证明 nullable `TEXT PRIMARY KEY` 可绕过 hold 的 Run/approval FK；该 PR
-  当前为 `REQUEST_CHANGES` 内部门禁，修复和 NULL 对抗测试通过前不得向下推进运行时恢复。
+  已用显式 `NOT NULL` 与 NULL 对抗测试修复并通过 SOL；这仍不等于运行时恢复已接通。
 - 截至 00:35，#227 仍 `REVIEW_REQUIRED`；#228/#229 虽已批准但等待父依赖；
   #371～#375 尚无 external approval，本轮没有 merge。
 - 进度注册表持续保存在 `.loopx/pr-program/agent24-open-design/`；它是本地控制面状态，
   不作为代码或外部 approval 的替代证据。
+
+## 2026-09-23 Wave 4 门禁
+
+- #377 getter core 与 #380 对抗证据分别通过 SOL：strict decoder、typed errors、合法
+  Unix/Windows identity、完整 corruption matrix 与三张业务表只读证明均成立；下一步是
+  journal 写事务，不是直接把调用方路径登记为 FS authority。
+- #379 的五态 recovery model 与 60-case pure decision matrix 通过 SOL；它只表达持久化
+  决策，不提供 approval authority、执行权或启动恢复。
+- #378 bounded control reader 与 #381 resumable writer 通过 SOL；#382 POSIX owned pipes
+  已创建、CI 绿色、等待 exact-head review。host `run()` 仍 inert，G8 不能标为完成。
+- 01:48 监控：#227 仍 `REVIEW_REQUIRED`；#228/#229 的 approval 不能越过它；其余本计划
+  PR 没有 external `APPROVED`/`REQUEST_CHANGES`，本轮无 merge。
+- 200 行仍是硬门禁。#362/#370/#373/#378 均恰好 200 行，#374 为 199、#381 为 195；
+  #373/#377/#380 的拆分证明门槛已有真实协调成本。弹性规则已提议但尚未获用户确认。
 
 ## A24-OD-00 小 PR 栈
 
