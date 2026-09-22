@@ -8,6 +8,8 @@
 pub(crate) mod actor;
 #[allow(dead_code)]
 mod control_io;
+#[allow(dead_code)]
+mod output_io;
 
 #[cfg(unix)]
 mod posix;
