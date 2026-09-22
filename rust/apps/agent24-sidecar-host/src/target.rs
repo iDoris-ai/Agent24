@@ -10,6 +10,12 @@ pub(crate) use crate::owner::OwnedPipes;
 #[cfg(unix)]
 pub(crate) use crate::posix::OwnedPipes;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitObservation {
+    Running,
+    Exited { code: Option<i32> },
+}
+
 /// The common lifecycle boundary keeps its native owner private.
 pub(crate) struct OwnedTarget {
     owner: PlatformOwner,
@@ -35,6 +41,22 @@ impl OwnedTarget {
         #[cfg(windows)]
         {
             Ok(())
+        }
+    }
+
+    pub(crate) fn observe_exit(&mut self) -> io::Result<ExitObservation> {
+        #[cfg(unix)]
+        {
+            self.owner.observe_exit()
+        }
+        #[cfg(windows)]
+        {
+            self.owner.observe_exit().map(|status| match status {
+                Some(status) => ExitObservation::Exited {
+                    code: status.code(),
+                },
+                None => ExitObservation::Running,
+            })
         }
     }
 }
@@ -80,6 +102,37 @@ mod tests {
         assert_eq!(stderr_text, "err:hello");
         target.request_stop(false).expect("graceful stop");
         target.request_stop(true).expect("force stop");
+        drop(target);
+        wait_for_reaper_idle();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_contract_observes_exit_without_consuming_the_owner() {
+        use crate::posix::{LaunchSpec, tests::test_lock, tests::wait_for_reaper_idle};
+        use std::time::Duration;
+
+        let _test_guard = test_lock();
+        let owner = PlatformOwner::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 7"))
+            .expect("spawn /bin/sh");
+        let mut target = OwnedTarget::from_owned(owner);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match target.observe_exit().expect("observe exit") {
+                ExitObservation::Exited { code } => {
+                    assert_eq!(code, Some(7));
+                    break;
+                }
+                ExitObservation::Running if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                ExitObservation::Running => panic!("exit was not observed before deadline"),
+            }
+        }
+        assert_eq!(
+            target.observe_exit().expect("repeat observation"),
+            ExitObservation::Exited { code: Some(7) }
+        );
         drop(target);
         wait_for_reaper_idle();
     }

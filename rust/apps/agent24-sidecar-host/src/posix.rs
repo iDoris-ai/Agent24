@@ -1,5 +1,6 @@
 //! POSIX lifecycle ownership primitives.
 
+use crate::target::ExitObservation;
 use nix::{
     errno::Errno,
     sys::signal::{Signal, killpg},
@@ -206,7 +207,28 @@ impl OwnedGeneration {
 
     /// Observes exit without reaping the leader or releasing ownership.
     pub fn leader_exited(&self) -> io::Result<bool> {
-        self.leader_exited_wnowait()
+        Ok(matches!(
+            self.observe_exit()?,
+            ExitObservation::Exited { .. }
+        ))
+    }
+
+    /// Observes exit without changing lifecycle ownership or consuming the
+    /// leader. Active phases use one nonblocking WNOWAIT query; reaped phases
+    /// read the status cached by `reap_after_stop`.
+    pub(crate) fn observe_exit(&self) -> io::Result<ExitObservation> {
+        match self.phase {
+            Phase::Running | Phase::TerminationRequested | Phase::ForceKillRequested => {
+                self.observe_exit_wnowait()
+            }
+            Phase::LeaderReaped | Phase::Reaped => self
+                .status
+                .as_ref()
+                .map(|status| ExitObservation::Exited {
+                    code: status.code(),
+                })
+                .ok_or_else(|| invalid_state("reaped generation has no exit status")),
+        }
     }
 
     pub fn terminate(&mut self) -> io::Result<()> {
@@ -298,15 +320,20 @@ impl OwnedGeneration {
         Ok(())
     }
 
-    fn leader_exited_wnowait(&self) -> io::Result<bool> {
+    fn observe_exit_wnowait(&self) -> io::Result<ExitObservation> {
         use rustix::process::{Pid as RustixPid, WaitId, WaitIdOptions, waitid};
         let pid = RustixPid::from_raw(self.group.as_raw())
             .ok_or_else(|| io::Error::other("invalid owned process-group id"))?;
         let flags = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
         match waitid(WaitId::Pid(pid), flags) {
-            Ok(Some(status)) if status.exited() || status.killed() || status.dumped() => Ok(true),
-            Ok(_) => Ok(false),
-            Err(error) if error == rustix::io::Errno::INTR => Ok(false),
+            Ok(Some(status)) if status.exited() => Ok(ExitObservation::Exited {
+                code: status.exit_status(),
+            }),
+            Ok(Some(status)) if status.killed() || status.dumped() => {
+                Ok(ExitObservation::Exited { code: None })
+            }
+            Ok(_) => Ok(ExitObservation::Running),
+            Err(error) if error == rustix::io::Errno::INTR => Ok(ExitObservation::Running),
             Err(error) => Err(io::Error::from_raw_os_error(error.raw_os_error())),
         }
     }
@@ -843,6 +870,100 @@ pub(crate) mod tests {
         ));
         assert!(generation.force_kill().is_ok());
         assert!(generation.reap_after_stop().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn observe_exit_reports_running_exit_code_and_preserves_wnowait() {
+        use crate::target::ExitObservation;
+        use rustix::process::{Pid as RustixPid, WaitId, WaitIdOptions, waitid};
+
+        let _test_guard = test_lock();
+        let mut running = sleeping_generation();
+        assert_eq!(
+            running.observe_exit().expect("observe running"),
+            ExitObservation::Running
+        );
+        running.force_kill().expect("force running child");
+        running.reap_after_stop().expect("reap running child");
+
+        let mut generation =
+            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("exit 7"))
+                .expect("spawn /bin/sh");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match generation.observe_exit().expect("observe exit") {
+                ExitObservation::Exited { code } => {
+                    assert_eq!(code, Some(7));
+                    break;
+                }
+                ExitObservation::Running if Instant::now() < deadline => thread::sleep(EXIT_POLL),
+                ExitObservation::Running => panic!("exit was not observed before deadline"),
+            }
+        }
+        assert_eq!(
+            generation.observe_exit().expect("repeat observation"),
+            ExitObservation::Exited { code: Some(7) }
+        );
+        let pid = RustixPid::from_raw(generation.group.as_raw()).expect("child pid");
+        assert!(
+            waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )
+            .expect("direct WNOWAIT control")
+            .is_some()
+        );
+        generation.force_kill().expect("force exited child");
+        let status = generation.reap_after_stop().expect("reap exited child");
+        assert_eq!(
+            generation.observe_exit().expect("cached observation"),
+            ExitObservation::Exited {
+                code: status.code()
+            }
+        );
+        assert!(
+            waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn observe_exit_reports_signal_without_signal_code() {
+        use crate::target::ExitObservation;
+
+        let _test_guard = test_lock();
+        let mut generation = OwnedGeneration::launch(
+            LaunchSpec::new("/bin/sh", "/")
+                .arg("-c")
+                .arg("kill -TERM $$"),
+        )
+        .expect("spawn /bin/sh");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match generation.observe_exit().expect("observe signal exit") {
+                ExitObservation::Exited { code } => {
+                    assert_eq!(code, None);
+                    break;
+                }
+                ExitObservation::Running if Instant::now() < deadline => thread::sleep(EXIT_POLL),
+                ExitObservation::Running => panic!("signal exit was not observed"),
+            }
+        }
+        assert_eq!(
+            generation
+                .observe_exit()
+                .expect("repeat signal observation"),
+            ExitObservation::Exited { code: None }
+        );
+        generation.force_kill().expect("force signal-exited child");
+        generation
+            .reap_after_stop()
+            .expect("reap signal-exited child");
     }
 
     /// This exercises the macOS all-zombie `killpg(SIGKILL) -> EPERM` case.
