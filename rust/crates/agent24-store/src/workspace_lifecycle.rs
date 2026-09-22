@@ -196,7 +196,7 @@ impl Store {
         now: &WorkspaceInstant,
     ) -> WorkspaceResult<Workspace> {
         let mut tx = self.begin_workspace_immediate().await?;
-        let mut workspace = select_workspace(&mut tx, id).await?;
+        let workspace = select_workspace(&mut tx, id).await?;
 
         if workspace.authority.lifecycle_owner_ref != authorized_owner.as_str() {
             return Err(WorkspaceStoreError::InvalidValue {
@@ -210,15 +210,29 @@ impl Store {
         }
 
         if workspace.state == WorkspaceState::Active && now >= &workspace.expires_at {
-            workspace = expire_workspace_tx(&mut tx, id, now, &workspace).await?;
+            expire_workspace_tx(&mut tx, id, now, &workspace).await?;
             tx.commit()
                 .await
                 .map_err(|_| WorkspaceStoreError::Database)?;
-            return Ok(workspace.project());
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "workspace_state",
+            });
         }
 
         if workspace.state != WorkspaceState::Active {
-            return commit_unchanged(tx, workspace).await;
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "workspace_state",
+            });
+        }
+
+        let renewal_anchor = workspace
+            .renewed_at
+            .as_ref()
+            .unwrap_or(&workspace.created_at);
+        if now < renewal_anchor {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "renewed_at",
+            });
         }
 
         let proposed_expiry = now.checked_add_workspace_ttl(ttl)?;
@@ -235,17 +249,24 @@ impl Store {
         let revision = next_revision(workspace.revision)?;
         let affected = sqlx::query(
             "UPDATE workspaces SET renewed_at = ?, expires_at = ?, revision = ?
-             WHERE id = ? COLLATE BINARY AND state = 'active'
+             WHERE id = ? COLLATE BINARY AND kind = ? COLLATE BINARY
+               AND created_at = ? COLLATE BINARY AND state = 'active'
                AND lifecycle_owner_ref = ? COLLATE BINARY
-               AND expires_at = ? COLLATE BINARY AND renewed_at IS ?
+               AND expires_at = ? COLLATE BINARY
+               AND expires_at > ? COLLATE BINARY AND expires_at < ? COLLATE BINARY
+               AND renewed_at IS ?
                AND revision = ? AND root_generation = ? COLLATE BINARY",
         )
         .bind(now.as_str())
         .bind(proposed_expiry.as_str())
         .bind(i64::try_from(revision).map_err(|_| WorkspaceStoreError::Database)?)
         .bind(id.as_str())
+        .bind(workspace.kind.as_str())
+        .bind(workspace.created_at.as_str())
         .bind(authorized_owner.as_str())
         .bind(workspace.expires_at.as_str())
+        .bind(now.as_str())
+        .bind(proposed_expiry.as_str())
         .bind(workspace.renewed_at.as_ref().map(WorkspaceInstant::as_str))
         .bind(i64::try_from(workspace.revision).map_err(|_| WorkspaceStoreError::Database)?)
         .bind(workspace.root.root_generation())
