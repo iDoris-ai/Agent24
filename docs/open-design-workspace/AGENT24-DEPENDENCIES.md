@@ -1,12 +1,14 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 CREATE/GET/LIST SOL passed, lifecycle implementing / A24-OD-05 bounded codec SOL passed, frame reader designing
+> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 DB-only lifecycle SOL passed, renew designing / A24-OD-05 bounded codec SOL passed, frame reader designing
 >
 > 日期：2026-09-20
 >
 > integration branch：`feat/open-design-workspace`
 >
-> 已审计 Agent24 主干：`origin/main@9dfe91a0b66d2715e59dcda150ad2437b93d2bc9`
+> 已审计 Agent24 主干：`origin/main@9ab5b6ee112e7e601758cb04c9aafac4c94680c7`
+>
+> 2026-09-22 漂移复核：新增 #262/#341 仅涉及 T9/ME-3f 黑盒测试、`agent24d` 测试依赖与状态文档；未改变 workspace/store/sidecar 契约。`Cargo.lock` 的独立依赖增量需在最终 rebase 时保留。
 
 ## 1. 目的
 
@@ -56,7 +58,7 @@
 
 ### A24-OD-01 — Opaque workspace registry
 
-状态：`IN_PROGRESS / REGISTRY CREATE + GET + LIST SOL PASS / LIFECYCLE IMPLEMENTING`
+状态：`IN_PROGRESS / REGISTRY + DB-ONLY EXPIRY/RELEASE SOL PASS / RENEW DESIGNING`
 
 目标分支：`feat/a24-workspace-registry`
 
