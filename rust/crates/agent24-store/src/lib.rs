@@ -12,6 +12,8 @@
 mod allocation_intent;
 #[allow(dead_code)] // Wired by the allocation query slice that follows this value-type slice.
 mod allocation_record;
+#[allow(dead_code)] // Wired by the allocation service slice that follows the reservation core.
+mod allocation_reservation;
 mod allocation_types;
 mod audit;
 mod module_approvals;
