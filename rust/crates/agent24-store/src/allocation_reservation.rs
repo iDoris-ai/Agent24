@@ -593,6 +593,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_wal_legacy_create_and_reservation_race_has_only_valid_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-reservation-race.sqlite");
+        let now = WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap();
+        let owner = LifecycleOwnerRef::parse("orchestrator-1".into()).unwrap();
+        let workspace_id = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let allocation_id = "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let intent = intent(allocation_id, workspace_id, "wal-race");
+        let legacy = legacy_workspace(workspace_id, "/legacy/wal-race", intent.parent_identity());
+        let legacy_store = hooked_store(&path).await;
+        let reservation_store = hooked_store(&path).await;
+        let legacy_task_store = legacy_store.clone();
+        let reservation_task_store = reservation_store.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let legacy_gate = Arc::clone(&barrier);
+        let reservation_gate = Arc::clone(&barrier);
+        let legacy_owner = owner.clone();
+        let legacy_now = now.clone();
+        let (legacy_result, reservation_result) = tokio::join!(
+            async move {
+                legacy_gate.wait().await;
+                legacy_task_store
+                    .create_workspace(&legacy, &legacy_owner, &legacy_now)
+                    .await
+            },
+            async move {
+                reservation_gate.wait().await;
+                reservation_task_store
+                    .reserve_workspace_allocation(&intent)
+                    .await
+            },
+        );
+        let reservation_won = match (&legacy_result, &reservation_result) {
+            (Ok(workspace), Err(WorkspaceStoreError::Conflict(WorkspaceConflict::Identifier))) => {
+                assert_eq!(workspace.id.as_str(), workspace_id);
+                false
+            }
+            (Ok(workspace), Ok(record)) => {
+                assert_eq!(workspace.id.as_str(), workspace_id);
+                assert_eq!(record.id().as_str(), allocation_id);
+                true
+            }
+            _ => panic!("unexpected legacy/reservation WAL result"),
+        };
+        legacy_store.pool.close().await;
+        reservation_store.pool.close().await;
+
+        let reopened = Store::open(&path).await.unwrap();
+        let workspace_key = WorkspaceId::parse(workspace_id).unwrap();
+        let allocation_key = crate::AllocationId::parse(allocation_id).unwrap();
+        assert_eq!(
+            reopened.get_workspace(&workspace_key).await.unwrap().id,
+            workspace_key
+        );
+        if reservation_won {
+            assert!(
+                reopened
+                    .get_workspace_allocation(&allocation_key)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(ordering_counts(&reopened).await, (1, 1, 1));
+        } else {
+            assert!(matches!(
+                reopened.get_workspace_allocation(&allocation_key).await,
+                Err(WorkspaceStoreError::NotFound)
+            ));
+            assert_eq!(ordering_counts(&reopened).await, (1, 0, 0));
+        }
+        reopened.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allocation_conflict_priority_is_adjacent_and_legacy_is_below_journal_name() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .reserve_workspace_allocation(&intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                "identifier-priority",
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .reserve_workspace_allocation(&intent(
+                    "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                    "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+                    "identifier-vs-workspace",
+                ))
+                .await,
+            Err(WorkspaceStoreError::Conflict(
+                WorkspaceConflict::AllocationIdentifier
+            ))
+        ));
+
+        store
+            .reserve_workspace_allocation(&intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+                "workspace-priority",
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .reserve_workspace_allocation(&intent(
+                    "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X7",
+                    "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6",
+                    "workspace-priority",
+                ))
+                .await,
+            Err(WorkspaceStoreError::Conflict(
+                WorkspaceConflict::AllocationWorkspace
+            ))
+        ));
+
+        let legacy_id = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X8";
+        store
+            .reserve_workspace_allocation(&intent(
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X9",
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X9",
+                "journal-and-legacy",
+            ))
+            .await
+            .unwrap();
+        let now = WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap();
+        let owner = LifecycleOwnerRef::parse("orchestrator-1".into()).unwrap();
+        store
+            .create_workspace(
+                &legacy_workspace(
+                    legacy_id,
+                    "/legacy/priority",
+                    RootIdentity::unix(&[3; 8], &[4; 8]).unwrap(),
+                ),
+                &owner,
+                &now,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .reserve_workspace_allocation(&intent(
+                    "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XA",
+                    legacy_id,
+                    "journal-and-legacy",
+                ))
+                .await,
+            Err(WorkspaceStoreError::Conflict(
+                WorkspaceConflict::AllocationRelativeName
+            ))
+        ));
+        assert_eq!(ordering_counts(&store).await, (1, 3, 3));
+        store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn reserves_both_parent_identities_with_audit() {
         let store = Store::open_memory().await.unwrap();
         for (aid, wid, name, identity) in [
