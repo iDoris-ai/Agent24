@@ -99,17 +99,17 @@ impl OwnedProcess {
     }
 
     pub(crate) fn reap_step(&mut self) -> io::Result<TreeObservation> {
-        self.reap_step_with(|child| child.try_wait(), |owner| owner.tree_is_empty())
+        self.reap_step_with(|child| child.try_wait(), |process| process.tree_is_empty())
     }
 
     fn reap_step_with<W, P>(&mut self, wait: W, probe: P) -> io::Result<TreeObservation>
     where
         W: FnOnce(&mut Child) -> io::Result<Option<std::process::ExitStatus>>,
-        P: FnOnce(&GenerationOwner) -> io::Result<bool>,
+        P: FnOnce(&OwnedProcess) -> io::Result<bool>,
     {
         match wait(&mut self.child)? {
             None => Ok(TreeObservation::Present),
-            Some(_) => Ok(if probe(&self.owner)? {
+            Some(_) => Ok(if probe(self)? {
                 TreeObservation::ConfirmedEmpty
             } else {
                 TreeObservation::Present
