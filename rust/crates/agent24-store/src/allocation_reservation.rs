@@ -131,6 +131,23 @@ impl Store {
         )
         .await
         .map_err(|_| WorkspaceStoreError::Database)?;
+
+        // A legacy workspace can appear after the journal INSERT (for
+        // example, through a trigger or a future internal write path).
+        // Recheck in this transaction after the audit INSERT so every
+        // successful reservation still owns the workspace identifier at the
+        // commit boundary.  Keep this conflict static: callers must not see
+        // database/trigger details or the submitted identifier.
+        let workspace_exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM workspaces WHERE id = ? COLLATE BINARY LIMIT 1")
+                .bind(intent.workspace_id().as_str())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| WorkspaceStoreError::Database)?;
+        if workspace_exists.is_some() {
+            return Err(WorkspaceStoreError::Conflict(WorkspaceConflict::Identifier));
+        }
+
         tx.commit()
             .await
             .map_err(|_| WorkspaceStoreError::Database)?;
@@ -867,6 +884,104 @@ mod tests {
                 .await
                 .unwrap();
             assert!(store.reserve_workspace_allocation(&i).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_id_guard_rolls_back_when_allocation_or_audit_insert_moves_sentinel() {
+        for (trigger_name, table) in [
+            ("allocation_workspace_id_guard", "workspace_allocations"),
+            ("audit_workspace_id_guard", "audit_log"),
+        ] {
+            let store = Store::open_memory().await.unwrap();
+            let target = intent(
+                if table == "workspace_allocations" {
+                    "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XB"
+                } else {
+                    "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XC"
+                },
+                if table == "workspace_allocations" {
+                    "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XB"
+                } else {
+                    "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XC"
+                },
+                trigger_name,
+            );
+            let sentinel_id = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XA";
+            let sentinel = legacy_workspace(
+                sentinel_id,
+                if table == "workspace_allocations" {
+                    "/legacy/guard-allocation"
+                } else {
+                    "/legacy/guard-audit"
+                },
+                RootIdentity::unix(
+                    if table == "workspace_allocations" {
+                        &[5; 8]
+                    } else {
+                        &[6; 8]
+                    },
+                    if table == "workspace_allocations" {
+                        &[7; 8]
+                    } else {
+                        &[8; 8]
+                    },
+                )
+                .unwrap(),
+            );
+            let owner = LifecycleOwnerRef::parse("orchestrator-1".into()).unwrap();
+            let now = WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap();
+            store
+                .create_workspace(&sentinel, &owner, &now)
+                .await
+                .unwrap();
+
+            let trigger = format!(
+                "CREATE TRIGGER {trigger_name} AFTER INSERT ON {table}
+                 BEGIN UPDATE workspaces SET id = '{}' WHERE id = '{}'; END",
+                target.workspace_id().as_str(),
+                sentinel_id,
+            );
+            sqlx::query(&trigger)
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+
+            let error = match store.reserve_workspace_allocation(&target).await {
+                Ok(_) => panic!("workspace ID guard must reject the reservation"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                WorkspaceStoreError::Conflict(WorkspaceConflict::Identifier)
+            );
+            assert!(!error.to_string().contains(target.workspace_id().as_str()));
+            assert_eq!(ordering_counts(&store).await, (1, 0, 0));
+            assert_eq!(
+                store
+                    .get_workspace(&WorkspaceId::parse(sentinel_id).unwrap())
+                    .await
+                    .unwrap()
+                    .id
+                    .as_str(),
+                sentinel_id
+            );
+            assert!(matches!(
+                store.get_workspace(target.workspace_id()).await,
+                Err(WorkspaceStoreError::NotFound)
+            ));
+
+            sqlx::query(&format!("DROP TRIGGER {trigger_name}"))
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            let record = store.reserve_workspace_allocation(&target).await.unwrap();
+            assert_eq!(
+                record.workspace_id().as_str(),
+                target.workspace_id().as_str()
+            );
+            assert_eq!(ordering_counts(&store).await, (1, 1, 1));
+            store.verify_audit_chain().await.unwrap();
         }
     }
 
