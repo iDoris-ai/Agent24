@@ -61,14 +61,16 @@ impl Phase {
 
     pub(crate) fn owned(self, now: Instant, limits: Deadlines) -> Result<Self, ActorError> {
         match self {
-            Self::Launching(_) => Ok(Self::AwaitReady(now + limits.ready)),
+            Self::Launching(deadline) if now < deadline => Ok(Self::AwaitReady(now + limits.ready)),
+            Self::Launching(_) => Ok(Self::ForceStopping(now + limits.force)),
             _ => Err(ActorError::InvalidTransition),
         }
     }
 
-    pub(crate) fn ready(self) -> Result<Self, ActorError> {
+    pub(crate) fn ready(self, now: Instant, limits: Deadlines) -> Result<Self, ActorError> {
         match self {
-            Self::AwaitReady(_) => Ok(Self::Running),
+            Self::AwaitReady(deadline) if now < deadline => Ok(Self::Running),
+            Self::AwaitReady(_) => Ok(Self::ForceStopping(now + limits.force)),
             _ => Err(ActorError::InvalidTransition),
         }
     }
@@ -99,10 +101,11 @@ impl Phase {
 
     pub(crate) fn advance(self, now: Instant, limits: Deadlines) -> Self {
         match self {
-            Self::Launching(deadline) | Self::AwaitReady(deadline) if now >= deadline => {
-                Self::ForceStopping(now + limits.force)
-            }
-            Self::GracefulStopping(deadline) if now >= deadline => {
+            Self::Launching(deadline)
+            | Self::AwaitReady(deadline)
+            | Self::GracefulStopping(deadline)
+                if now >= deadline =>
+            {
                 Self::ForceStopping(now + limits.force)
             }
             Self::ForceStopping(deadline) if now >= deadline => Self::Draining(now + limits.drain),
@@ -127,65 +130,68 @@ impl Phase {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
-    #[allow(clippy::expect_used)]
-    fn limits() -> Deadlines {
-        Deadlines {
-            launch: Duration::from_secs(10),
-            ready: Duration::from_secs(30),
-            graceful: Duration::from_secs(5),
-            force: Duration::from_secs(2),
-            drain: Duration::from_secs(3),
-        }
-    }
+    const L: Deadlines = Deadlines {
+        launch: Duration::from_secs(10),
+        ready: Duration::from_secs(30),
+        graceful: Duration::from_secs(5),
+        force: Duration::from_secs(2),
+        drain: Duration::from_secs(3),
+    };
 
-    #[allow(clippy::expect_used)]
     #[test]
-    fn graceful_retry_keeps_original_deadline_and_force_cannot_downgrade() {
+    fn state_policy_preserves_safety_invariants() {
         let now = Instant::now();
-        let graceful = Phase::Running.stop(false, now, limits()).expect("graceful");
+        let graceful = Phase::Running.stop(false, now, L).expect("graceful");
         let repeated = graceful
-            .stop(false, now + Duration::from_secs(4), limits())
+            .stop(false, now + Duration::from_secs(4), L)
             .expect("repeat");
         assert_eq!(graceful, repeated);
-        let forced = repeated.stop(true, now, limits()).expect("force");
+        let forced = repeated.stop(true, now, L).expect("force");
         assert!(matches!(forced, Phase::ForceStopping(_)));
-        assert_eq!(
-            forced.stop(false, now, limits()).expect("no downgrade"),
-            forced
-        );
-    }
+        assert_eq!(forced.stop(false, now, L).expect("no downgrade"), forced);
 
-    #[allow(clippy::expect_used)]
-    #[test]
-    fn confirmed_empty_is_an_idempotent_tombstone() {
-        let now = Instant::now();
-        let stopping = Phase::Running.stop(true, now, limits()).expect("stop");
+        let stopping = Phase::Running.stop(true, now, L).expect("stop");
         let empty = stopping.observe_empty().expect("empty");
-        assert_eq!(empty.observe_empty().expect("idempotent"), Phase::Empty);
-        assert_eq!(
-            empty.stop(false, now, limits()).expect("tombstone"),
-            Phase::Empty
-        );
+        assert_eq!(empty.observe_empty().expect("repeat"), Phase::Empty);
+        assert_eq!(empty.stop(false, now, L).expect("tombstone"), Phase::Empty);
         assert!(empty.restart_allowed());
-    }
 
-    #[allow(clippy::expect_used)]
-    #[test]
-    fn unconfirmed_never_authorizes_a_new_generation() {
-        let now = Instant::now();
         let draining = Phase::Running
-            .stop(true, now, limits())
+            .stop(true, now, L)
             .expect("stop")
-            .advance(now + Duration::from_secs(2), limits());
-        let unconfirmed = draining.advance(now + Duration::from_secs(5), limits());
+            .advance(now + Duration::from_secs(2), L);
+        let unconfirmed = draining.advance(now + Duration::from_secs(5), L);
         assert_eq!(unconfirmed, Phase::Unconfirmed);
         assert!(!unconfirmed.restart_allowed());
+        assert_eq!(unconfirmed.launch(now, L), Err(ActorError::Unconfirmed));
+    }
+
+    #[test]
+    fn owned_and_ready_deadlines_are_inclusive() {
+        let now = Instant::now();
+        let launching = Phase::initial().launch(now, L).expect("launch");
+        let deadline = now + L.launch;
+        let before = deadline - Duration::from_nanos(1);
         assert_eq!(
-            unconfirmed.launch(now, limits()),
-            Err(ActorError::Unconfirmed)
+            launching.owned(before, L),
+            Ok(Phase::AwaitReady(before + L.ready))
+        );
+        assert_eq!(
+            launching.owned(deadline, L),
+            Ok(Phase::ForceStopping(deadline + L.force))
+        );
+        let waiting = Phase::AwaitReady(deadline);
+        assert_eq!(
+            waiting.ready(deadline - Duration::from_nanos(1), L),
+            Ok(Phase::Running)
+        );
+        assert_eq!(
+            waiting.ready(deadline, L),
+            Ok(Phase::ForceStopping(deadline + L.force))
         );
     }
 }
