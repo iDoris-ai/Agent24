@@ -258,6 +258,8 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
                     token,
                     pid,
                     version: state["version"].as_str().unwrap_or("").to_owned(),
+                    generation: String::new(),
+                    auth_mode: agent24_protocol::state_file::AuthMode::LegacySingleToken,
                 },
                 child,
             ));
