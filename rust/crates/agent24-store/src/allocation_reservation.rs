@@ -132,6 +132,11 @@ impl Store {
         .await
         .map_err(|_| WorkspaceStoreError::Database)?;
 
+        // The audit INSERT is an in-transaction mutation point (including
+        // through SQLite triggers), so reread the allocation before checking
+        // the legacy workspace guard and crossing the commit boundary.
+        let record = select_reserved(&mut tx, intent).await?;
+
         // A legacy workspace can appear after the journal INSERT (for
         // example, through a trigger or a future internal write path).
         // Recheck in this transaction after the audit INSERT so every
@@ -884,6 +889,60 @@ mod tests {
                 .await
                 .unwrap();
             assert!(store.reserve_workspace_allocation(&i).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_insert_mutations_are_caught_by_final_strict_reread() {
+        for (name, update, field) in [
+            (
+                "semantic",
+                "UPDATE workspace_allocations SET root_generation = 'other-generation' WHERE allocation_id = (SELECT json_extract(NEW.detail, '$.allocation_id'))",
+                "row",
+            ),
+            (
+                "storage",
+                "UPDATE workspace_allocations SET root_generation = CAST('generation-1' AS BLOB) WHERE allocation_id = (SELECT json_extract(NEW.detail, '$.allocation_id'))",
+                "root_generation",
+            ),
+        ] {
+            let store = Store::open_memory().await.unwrap();
+            let id = if name == "semantic" {
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XB"
+            } else {
+                "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XC"
+            };
+            let workspace = if name == "semantic" {
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XB"
+            } else {
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XC"
+            };
+            let i = intent(id, workspace, name);
+            let trigger_name = format!("tamper_audit_{name}");
+            let trigger = format!(
+                "CREATE TRIGGER {trigger_name} AFTER INSERT ON audit_log
+                 WHEN NEW.action = 'workspace.allocation_reserved'
+                 BEGIN {update}; END"
+            );
+            sqlx::query(&trigger)
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            assert_eq!(
+                store.reserve_workspace_allocation(&i).await.err(),
+                Some(WorkspaceStoreError::CorruptRow {
+                    table: "workspace_allocations",
+                    field,
+                })
+            );
+            assert_eq!(counts(&store).await, (0, 0));
+            sqlx::query(&format!("DROP TRIGGER {trigger_name}"))
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            assert!(store.reserve_workspace_allocation(&i).await.is_ok());
+            assert_eq!(counts(&store).await, (1, 1));
+            store.verify_audit_chain().await.unwrap();
         }
     }
 
