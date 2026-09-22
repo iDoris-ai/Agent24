@@ -52,7 +52,7 @@ async fn fresh_install_creates_registry_without_legacy_row() {
 }
 
 #[tokio::test]
-async fn opening_a_real_v6_database_applies_0007_and_preserves_it() {
+async fn opening_a_real_v6_database_applies_workspace_migrations_and_preserves_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("agent24.db");
     run_v6(&path).await;
@@ -68,7 +68,7 @@ async fn opening_a_real_v6_database_applies_0007_and_preserves_it() {
         .fetch_one(test_hooks::pool(&store))
         .await
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     drop(store);
     let reopened = Store::open(&path).await.unwrap();
     assert_eq!(
