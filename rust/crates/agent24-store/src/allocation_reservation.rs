@@ -144,8 +144,28 @@ mod tests {
     use super::*;
     use agent24_protocol::WorkspaceId;
     use sqlx::Row;
-    use std::{path::Path, sync::Arc};
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::{path::Path, str::FromStr, sync::Arc, sync::mpsc};
     use tokio::sync::Barrier;
+    use tokio::time::{Duration, timeout};
+
+    const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn hooked_store(path: &Path) -> Store {
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(HOOK_TIMEOUT)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        Store { pool }
+    }
 
     fn intent(id: &str, workspace: &str, name: &str) -> AllocationIntent {
         AllocationIntent::new(
@@ -241,6 +261,77 @@ mod tests {
         ));
         assert_eq!(counts(&observer).await, (1, 1));
         observer.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_after_commit_hook_entry_keeps_durable_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commit-uncertain.sqlite");
+        let intent = intent(
+            "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+            "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5",
+            "commit-uncertain",
+        );
+        let store = hooked_store(&path).await;
+        let observer = Store::open(&path).await.unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut connection = store.pool.acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(move || {
+                let _ = entered_tx.send(());
+                release_rx.recv_timeout(HOOK_TIMEOUT).is_ok()
+            });
+        drop(connection);
+        let task_store = store.clone();
+        let task_intent = Arc::new(intent);
+        let task_intent_for_task = Arc::clone(&task_intent);
+        let task = tokio::spawn(async move {
+            task_store
+                .reserve_workspace_allocation(&task_intent_for_task)
+                .await
+        });
+        timeout(
+            HOOK_TIMEOUT,
+            tokio::task::spawn_blocking(move || entered_rx.recv_timeout(HOOK_TIMEOUT)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(counts(&observer).await, (0, 0));
+        task.abort();
+        assert!(matches!(
+            timeout(HOOK_TIMEOUT, task).await,
+            Ok(Err(error)) if error.is_cancelled()
+        ));
+        release_tx.send(()).unwrap();
+        timeout(HOOK_TIMEOUT, store.pool.close()).await.unwrap();
+
+        let reopened = Store::open(&path).await.unwrap();
+        assert_eq!(counts(&reopened).await, (1, 1));
+        let record = reopened
+            .get_workspace_allocation(task_intent.allocation_id())
+            .await
+            .unwrap();
+        assert!(record.id() == task_intent.allocation_id());
+        assert!(record.workspace_id() == task_intent.workspace_id());
+        assert_eq!(record.root_generation(), task_intent.root_generation());
+        assert_eq!(record.relative_name(), task_intent.relative_name());
+        assert!(record.parent_identity() == task_intent.parent_identity());
+        assert!(record.created_at() == task_intent.created_at());
+        assert_eq!(record.phase(), AllocationPhase::Reserved);
+        assert!(record.root_identity().is_none() && record.failure_reason().is_none());
+        assert!(matches!(
+            reopened.reserve_workspace_allocation(&task_intent).await,
+            Err(WorkspaceStoreError::Conflict(
+                WorkspaceConflict::AllocationIdentifier
+            ))
+        ));
+        assert_eq!(counts(&reopened).await, (1, 1));
     }
 
     #[tokio::test]
