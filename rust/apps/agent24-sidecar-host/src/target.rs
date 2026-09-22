@@ -66,6 +66,10 @@ impl OwnedTarget {
             })
         }
     }
+
+    pub(crate) fn reap_step(&mut self) -> io::Result<TreeObservation> {
+        self.owner.reap_step()
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +148,31 @@ mod tests {
         wait_for_reaper_idle();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_contract_reaps_through_the_common_owner_boundary() {
+        use crate::posix::{LaunchSpec, tests::test_lock, tests::wait_for_reaper_idle};
+        use std::time::{Duration, Instant};
+
+        let _test_guard = test_lock();
+        let owner =
+            PlatformOwner::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("sleep 30"))
+                .expect("spawn /bin/sh");
+        let mut target = OwnedTarget::from_owned(owner);
+        target.request_stop(true).expect("force stop");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match target.reap_step().expect("reap step") {
+                TreeObservation::ConfirmedEmpty => break,
+                TreeObservation::Present if Instant::now() < deadline => {}
+                TreeObservation::Present => panic!("process group was not reaped before deadline"),
+                TreeObservation::Unconfirmed => panic!("POSIX reap must not be unconfirmed"),
+            }
+        }
+        drop(target);
+        wait_for_reaper_idle();
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_contract_transfers_pipes_once_and_stops_the_same_owner() {
@@ -202,5 +231,32 @@ mod tests {
         );
         target.request_stop(true).expect("force stop");
         drop(target);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_reaps_through_the_common_owner_boundary() {
+        use std::time::{Duration, Instant};
+        use tokio::process::Command;
+
+        let owner = crate::owner::GenerationOwner::new(
+            crate::owner::GenerationId::new(8).expect("generation"),
+        )
+        .expect("Job Object");
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "exit", "0"]);
+        let process = owner.spawn(command).expect("spawn process");
+        let mut target = OwnedTarget::from_owned(process);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match target.reap_step().expect("reap step") {
+                TreeObservation::ConfirmedEmpty => break,
+                TreeObservation::Present if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                TreeObservation::Present => panic!("Job tree was not reaped before deadline"),
+                TreeObservation::Unconfirmed => panic!("Windows reap must not be unconfirmed"),
+            }
+        }
     }
 }

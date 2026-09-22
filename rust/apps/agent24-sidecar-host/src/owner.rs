@@ -2,6 +2,7 @@
 
 use std::{io, process::Stdio};
 
+use crate::target::TreeObservation;
 use processkit::ProcessGroup;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
@@ -95,6 +96,25 @@ impl OwnedProcess {
             .stats()
             .map(|stats| stats.active_process_count == 0)
             .map_err(io::Error::other)
+    }
+
+    pub(crate) fn reap_step(&mut self) -> io::Result<TreeObservation> {
+        self.reap_step_with(|child| child.try_wait(), |owner| owner.tree_is_empty())
+    }
+
+    fn reap_step_with<W, P>(&mut self, wait: W, probe: P) -> io::Result<TreeObservation>
+    where
+        W: FnOnce(&mut Child) -> io::Result<Option<std::process::ExitStatus>>,
+        P: FnOnce(&GenerationOwner) -> io::Result<bool>,
+    {
+        match wait(&mut self.child)? {
+            None => Ok(TreeObservation::Present),
+            Some(_) => Ok(if probe(&self.owner)? {
+                TreeObservation::ConfirmedEmpty
+            } else {
+                TreeObservation::Present
+            }),
+        }
     }
 
     /// Force-kills exactly this owned Job tree. Repeated calls are safe.
@@ -199,16 +219,21 @@ mod tests {
         }
     }
 
-    async fn wait_until_empty(process: &OwnedProcess) {
+    async fn wait_until_confirmed_empty(process: &mut OwnedProcess) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            match process.tree_is_empty() {
-                Ok(true) => return,
-                Ok(false) if Instant::now() < deadline => {
+            match process.reap_step() {
+                Ok(TreeObservation::ConfirmedEmpty) => return,
+                Ok(TreeObservation::Present) if Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                Ok(false) => panic!("Job tree did not empty before deadline"),
-                Err(error) => panic!("read Job stats: {error}"),
+                Ok(TreeObservation::Present) => {
+                    panic!("Job tree did not become confirmed empty before deadline")
+                }
+                Ok(TreeObservation::Unconfirmed) => {
+                    panic!("Windows reap does not produce unconfirmed observations")
+                }
+                Err(error) => panic!("reap Job tree: {error}"),
             }
         }
     }
@@ -307,12 +332,115 @@ mod tests {
             .expect("spawn process tree");
         let descendant = read_pid(&marker).expect("child must publish a readable pid");
         assert!(wait_until_exit(&mut process).await.success());
-        assert!(!process.tree_is_empty().expect("Job stats"));
+        assert_eq!(
+            process.reap_step().expect("leader-exit reap step"),
+            TreeObservation::Present,
+            "leader exit must not be mistaken for an empty Job tree"
+        );
         process.force_kill().expect("force Job tree");
         process.force_kill().expect("repeat force Job tree");
-        wait_until_empty(&process).await;
+        wait_until_confirmed_empty(&mut process).await;
+        assert_eq!(
+            process
+                .reap_step()
+                .expect("repeat confirmed-empty reap step"),
+            TreeObservation::ConfirmedEmpty
+        );
         wait_until_gone(descendant).expect("descendant teardown");
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn reap_step_waits_at_most_once_and_does_not_probe_before_leader_exit() {
+        use std::cell::Cell;
+
+        let generation = GenerationId::new(6).expect("generation");
+        let owner = GenerationOwner::new(generation).expect("Job Object");
+        let mut process = owner
+            .spawn(powershell("Start-Sleep -Seconds 30"))
+            .expect("spawn process");
+        let waits = Cell::new(0);
+        let probes = Cell::new(0);
+        assert_eq!(
+            process
+                .reap_step_with(
+                    |_| {
+                        waits.set(waits.get() + 1);
+                        Ok(None)
+                    },
+                    |_| {
+                        probes.set(probes.get() + 1);
+                        Ok(true)
+                    },
+                )
+                .expect("reap step"),
+            TreeObservation::Present
+        );
+        assert_eq!(waits.get(), 1);
+        assert_eq!(probes.get(), 0);
+        assert!(
+            process
+                .reap_step_with(
+                    |_| Err(io::Error::other("try_wait failed")),
+                    |_| panic!("probe must not run after try_wait error"),
+                )
+                .is_err()
+        );
+        assert_eq!(probes.get(), 0);
+        process.force_kill().expect("force Job tree");
+    }
+
+    #[test]
+    fn reap_step_exited_leader_uses_job_probe_and_preserves_errors() {
+        let owner =
+            GenerationOwner::new(GenerationId::new(7).expect("generation")).expect("Job Object");
+        let mut process = owner.spawn(powershell("exit 0")).expect("spawn process");
+        let probes = std::cell::Cell::new(0);
+        let nonempty = process
+            .reap_step_with(
+                |_| Ok(Some(std::process::ExitStatus::default())),
+                |_| {
+                    probes.set(probes.get() + 1);
+                    Ok(false)
+                },
+            )
+            .expect("nonempty probe");
+        assert_eq!(nonempty, TreeObservation::Present);
+        assert_eq!(probes.get(), 1);
+
+        let error = process.reap_step_with(
+            |_| Ok(Some(std::process::ExitStatus::default())),
+            |_| {
+                probes.set(probes.get() + 1);
+                Err(io::Error::other("stats failed"))
+            },
+        );
+        assert!(error.is_err());
+        assert_eq!(probes.get(), 2);
+
+        assert_eq!(
+            process
+                .reap_step_with(
+                    |_| Ok(Some(std::process::ExitStatus::default())),
+                    |_| {
+                        probes.set(probes.get() + 1);
+                        Ok(true)
+                    },
+                )
+                .expect("empty probe"),
+            TreeObservation::ConfirmedEmpty
+        );
+        assert_eq!(probes.get(), 3);
+        assert_eq!(
+            process
+                .reap_step_with(
+                    |_| Ok(Some(std::process::ExitStatus::default())),
+                    |_| Ok(true),
+                )
+                .expect("repeat empty probe"),
+            TreeObservation::ConfirmedEmpty
+        );
+        process.force_kill().expect("force Job tree");
     }
 
     #[tokio::test]
