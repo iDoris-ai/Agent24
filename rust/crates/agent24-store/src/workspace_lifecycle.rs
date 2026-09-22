@@ -4,7 +4,7 @@ use sqlx::{Sqlite, Transaction, sqlite::SqliteRow};
 
 use crate::{
     LifecycleOwnerRef, Store, WorkspaceInstant, WorkspaceKind, WorkspaceResult, WorkspaceRow,
-    WorkspaceState, WorkspaceStoreError,
+    WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
 };
 
 const AUDIT_ACTOR: &str = "workspace_lifecycle";
@@ -177,6 +177,108 @@ impl Store {
             now.as_str(),
             AUDIT_ACTOR,
             "workspace.release_requested",
+            &detail,
+        )
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?;
+        tx.commit()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        Ok(reselected.project())
+    }
+
+    /// Extend an active workspace's expiry for its exact lifecycle owner.
+    pub async fn renew_workspace(
+        &self,
+        id: &WorkspaceId,
+        authorized_owner: &LifecycleOwnerRef,
+        ttl: WorkspaceTtl,
+        now: &WorkspaceInstant,
+    ) -> WorkspaceResult<Workspace> {
+        let proposed_expiry = now.checked_add_workspace_ttl(ttl)?;
+        let mut tx = self.begin_workspace_immediate().await?;
+        let mut workspace = select_workspace(&mut tx, id).await?;
+
+        if workspace.authority.lifecycle_owner_ref != authorized_owner.as_str() {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "lifecycle_owner_ref",
+            });
+        }
+        if workspace.kind != WorkspaceKind::OrchestratorScratch {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "workspace_kind",
+            });
+        }
+
+        if workspace.state == WorkspaceState::Active && now >= &workspace.expires_at {
+            workspace = expire_workspace_tx(&mut tx, id, now, &workspace).await?;
+            tx.commit()
+                .await
+                .map_err(|_| WorkspaceStoreError::Database)?;
+            return Ok(workspace.project());
+        }
+
+        if workspace.state != WorkspaceState::Active {
+            return commit_unchanged(tx, workspace).await;
+        }
+
+        if workspace.renewed_at.as_ref() == Some(now) && workspace.expires_at == proposed_expiry {
+            return commit_unchanged(tx, workspace).await;
+        }
+        if proposed_expiry <= workspace.expires_at {
+            return Err(WorkspaceStoreError::InvalidValue {
+                field: "expires_at",
+            });
+        }
+
+        let revision = next_revision(workspace.revision)?;
+        let affected = sqlx::query(
+            "UPDATE workspaces SET renewed_at = ?, expires_at = ?, revision = ?
+             WHERE id = ? COLLATE BINARY AND state = 'active'
+               AND lifecycle_owner_ref = ? COLLATE BINARY
+               AND expires_at = ? COLLATE BINARY AND renewed_at IS ?
+               AND revision = ? AND root_generation = ? COLLATE BINARY",
+        )
+        .bind(now.as_str())
+        .bind(proposed_expiry.as_str())
+        .bind(i64::try_from(revision).map_err(|_| WorkspaceStoreError::Database)?)
+        .bind(id.as_str())
+        .bind(authorized_owner.as_str())
+        .bind(workspace.expires_at.as_str())
+        .bind(workspace.renewed_at.as_ref().map(WorkspaceInstant::as_str))
+        .bind(i64::try_from(workspace.revision).map_err(|_| WorkspaceStoreError::Database)?)
+        .bind(workspace.root.root_generation())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?;
+        if affected.rows_affected() != 1 {
+            return Err(WorkspaceStoreError::Database);
+        }
+
+        let mut expected = workspace.clone();
+        expected.renewed_at = Some(now.clone());
+        expected.expires_at = proposed_expiry.clone();
+        expected.ttl = ttl;
+        expected.revision = revision;
+        let reselected = select_workspace(&mut tx, id).await?;
+        if reselected != expected {
+            return Err(WorkspaceStoreError::CorruptRow {
+                table: "workspaces",
+                field: "row",
+            });
+        }
+        let detail = json!({
+            "id": reselected.id.as_str(),
+            "kind": reselected.kind.as_str(),
+            "result_state": reselected.state.as_str(),
+            "owner_ref": authorized_owner.as_str(),
+            "reason": "owner_requested",
+        });
+        Store::append_audit_tx(
+            &mut tx,
+            now.as_str(),
+            AUDIT_ACTOR,
+            "workspace.renewed",
             &detail,
         )
         .await
