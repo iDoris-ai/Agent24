@@ -111,6 +111,11 @@ macro_rules! copied_accessors {
     )+ };
 }
 
+/// Strictly decoded state from one workspace allocation journal row.
+///
+/// A record describes database reservation state only. A `Reserved` record
+/// does not imply that a workspace is registered or that any filesystem path
+/// has been materialized.
 pub struct AllocationRecord {
     id: AllocationId,
     workspace_id: WorkspaceId,

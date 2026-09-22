@@ -37,11 +37,21 @@ async fn select_reserved(
 }
 
 impl Store {
-    /// Atomically persist a validated allocation intent and its audit evidence.
+    /// Reserve a validated intent in the database-only allocation journal.
     ///
-    /// This is intentionally crate-private: filesystem materialization and the
-    /// public workspace service are later slices of the allocation protocol.
-    pub(crate) async fn reserve_workspace_allocation(
+    /// This does not register a workspace or materialize any filesystem path.
+    /// The reservation row and its `workspace.allocation_reserved` audit entry
+    /// are committed atomically. Conflicts are checked in this order:
+    /// allocation identifier, allocation workspace, allocation relative name,
+    /// then a legacy workspace identifier. Replaying the exact allocation
+    /// identifier returns `Conflict(WorkspaceConflict::AllocationIdentifier)`.
+    ///
+    /// The returned record is strictly reread after the audit write. If the
+    /// commit result is uncertain, reconcile with
+    /// [`Store::get_workspace_allocation`] using `intent.allocation_id()`.
+    /// Errors are typed, static, and redacted: database or trigger details and
+    /// submitted identifiers are not exposed.
+    pub async fn reserve_workspace_allocation(
         &self,
         intent: &AllocationIntent,
     ) -> WorkspaceResult<AllocationRecord> {
