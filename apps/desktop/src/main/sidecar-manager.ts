@@ -10,7 +10,12 @@ import {
 
 export interface SidecarChild { readonly pid?: number; readonly exitCode: number | null }
 export interface SidecarReady { readonly endpoint: { readonly origin: string; readonly secret: string } }
-export interface SidecarLaunch { readonly child: SidecarChild; readonly processGroupId?: number; readonly ready: Promise<SidecarReady> }
+export interface SidecarLaunch {
+  readonly child: SidecarChild
+  readonly processGroupId?: number
+  readonly dedicatedProcessGroup?: boolean
+  readonly ready: Promise<SidecarReady>
+}
 export interface SidecarLauncher { launch(): Promise<SidecarLaunch> }
 export interface SidecarHealth { check(endpoint: SidecarReady['endpoint'], timeoutMs: number): Promise<boolean> }
 export interface SidecarLogger {
@@ -33,27 +38,52 @@ const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, 
 const silentLogger: SidecarLogger = { info: () => {}, warn: () => {} }
 
 /** Signals only the manager-owned PID or the launcher-provided dedicated group. */
-export function signalOwnedTree(owner: SidecarOwnership, signal: NodeJS.Signals): void {
-  if (!Number.isInteger(owner.pid) || owner.pid <= 0) return
+export function signalOwnedTree(owner: SidecarOwnership, signal: NodeJS.Signals): Promise<void> {
+  if (!Number.isInteger(owner.pid) || owner.pid <= 0) throw new Error('sidecar pid is invalid')
+  if (owner.processGroupId !== null && (!Number.isInteger(owner.processGroupId) || owner.processGroupId <= 0)) {
+    throw new Error('sidecar process group is invalid')
+  }
   if (process.platform === 'win32') {
-    spawn('taskkill.exe', ['/PID', String(owner.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])], { stdio: 'ignore', windowsHide: true })
-    return
+    return new Promise((resolve, reject) => {
+      const taskkill = spawn('taskkill.exe', ['/PID', String(owner.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])], { stdio: 'ignore', windowsHide: true })
+      taskkill.once('error', reject)
+      taskkill.once('close', (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with ${String(code)}`)))
+    })
   }
   const target = owner.processGroupId === null ? owner.pid : -owner.processGroupId
   try { process.kill(target, signal) } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
   }
+  return Promise.resolve()
 }
 
 export const exactTreeStopper: SidecarStopper = {
   async stop(owner, child, gracefulMs, killAfterMs) {
-    signalOwnedTree(owner, 'SIGTERM')
+    await signalOwnedTree(owner, 'SIGTERM')
     await wait(gracefulMs)
     if (child.exitCode === null) {
-      signalOwnedTree(owner, 'SIGKILL')
+      await signalOwnedTree(owner, 'SIGKILL')
       await wait(killAfterMs)
     }
   },
+}
+
+/** Reject endpoint records that would expose a non-local or ambiguous target. */
+export function validateReady(ready: SidecarReady): void {
+  const endpoint = ready?.endpoint
+  if (typeof endpoint?.secret !== 'string' || endpoint.secret.length === 0) {
+    throw new Error('sidecar readiness secret is empty')
+  }
+  if (typeof endpoint.origin !== 'string') throw new Error('sidecar endpoint origin is invalid')
+  const url = new URL(endpoint.origin)
+  if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', '[::1]'].includes(url.hostname)) {
+    throw new Error('sidecar endpoint must use a loopback HTTP(S) origin')
+  }
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('sidecar endpoint must not include credentials, a path, query, or fragment')
+  }
+  const port = url.port === '' ? (url.protocol === 'http:' ? 80 : 443) : Number(url.port)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('sidecar endpoint port is invalid')
 }
 
 type ActiveSidecar = {
@@ -72,6 +102,7 @@ export class SidecarManager {
   private failures = 0
   private generation = 0
   private stopping: Promise<void> | null = null
+  private readonly detached = new Set<ActiveSidecar>()
 
   constructor(
     private readonly spec: SidecarSpec,
@@ -87,26 +118,32 @@ export class SidecarManager {
   }
 
   async start(): Promise<SidecarStatus> {
-    if (this.state !== 'stopped') return this.status()
+    if (this.state !== 'stopped' || this.detached.size !== 0) return this.status()
     const token = ++this.generation
     this.state = 'starting'
     this.failures = 0
     this.logger.info('sidecar.starting', { sidecarId: this.spec.sidecarId })
     let attempt: ActiveSidecar | null = null
+    let cleaningCancelledAttempt = false
     try {
       const launch = await this.launcher.launch()
+      void launch.ready.catch(() => {})
       if (!Number.isInteger(launch.child.pid) || !launch.child.pid || launch.child.pid < 1) {
         if (!this.isStarting(token)) return this.cancelled()
         throw new Error('sidecar did not provide a pid')
       }
-      attempt = {
-        token,
-        owner: createOwnership(this.spec.sidecarId, launch.child.pid, launch.processGroupId ?? null),
-        child: launch.child,
-        probing: false,
+      attempt = { token, owner: createOwnership(this.spec.sidecarId, launch.child.pid), child: launch.child, probing: false }
+      const processGroupId = launch.processGroupId
+      if (process.platform !== 'win32' && launch.dedicatedProcessGroup === true) {
+        if (typeof processGroupId !== 'number' || !Number.isInteger(processGroupId) || processGroupId !== launch.child.pid) {
+          throw new Error('sidecar process group is not an owned child group')
+        }
+        attempt = { ...attempt, owner: createOwnership(this.spec.sidecarId, launch.child.pid, processGroupId) }
+      } else if (process.platform !== 'win32' && processGroupId !== undefined) {
+        throw new Error('sidecar process group evidence is missing')
       }
       if (!this.isStarting(token)) {
-        void launch.ready.catch(() => {})
+        cleaningCancelledAttempt = true
         await this.stopActive(attempt)
         return this.cancelled()
       }
@@ -124,6 +161,7 @@ export class SidecarManager {
         if (readyTimeout) clearTimeout(readyTimeout)
       }
       if (!this.isCurrent(token, attempt)) return this.cancelled()
+      validateReady(ready)
       attempt.ready = ready
       this.handoff.publish(attempt.owner.instanceId, ready.endpoint)
       this.state = 'ready'
@@ -132,10 +170,12 @@ export class SidecarManager {
       if (!this.isCurrent(token, attempt)) return this.cancelled()
       this.timer = setInterval(() => { void this.probe(attempt!).catch(() => {}) }, this.spec.healthIntervalMs)
     } catch (error) {
-      if (attempt ? !this.isCurrent(token, attempt) : !this.isStarting(token)) {
-        if (attempt) {
-          try { await this.stopActive(attempt) } catch { /* cancellation remains a stopped result */ }
-        }
+      if (cleaningCancelledAttempt) throw error
+      const cancelled = attempt
+        ? !this.isCurrent(token, attempt) && !this.isStarting(token)
+        : !this.isStarting(token)
+      if (cancelled) {
+        if (attempt) await this.stopActive(attempt)
         return this.cancelled()
       }
       this.state = 'failed'
@@ -149,21 +189,30 @@ export class SidecarManager {
   async stop(): Promise<SidecarStatus> {
     const token = ++this.generation
     const active = this.active
-    if (!active) {
+    const attempts = [...new Set(active ? [active, ...this.detached] : this.detached)]
+    if (attempts.length === 0) {
       const stopping = this.stopping
       if (stopping) await stopping
-      if (this.generation === token && !this.active) this.state = 'stopped'
+      if (this.generation === token && !this.active && this.detached.size === 0) this.state = 'stopped'
+      return this.status()
+    }
+    if (this.stopping) {
+      try {
+        await this.stopping
+      } finally {
+        if (this.generation === token && !this.active && this.detached.size === 0) this.state = 'stopped'
+      }
       return this.status()
     }
     this.state = 'stopping'
     this.logger.info('sidecar.stopping', { sidecarId: this.spec.sidecarId })
-    const stopping = this.stopActive(active)
+    const stopping = Promise.all(attempts.map((attempt) => this.stopActive(attempt))).then(() => {})
     this.stopping = stopping
     try {
       await stopping
     } finally {
       if (this.stopping === stopping) this.stopping = null
-      if (this.generation === token && !this.active) this.state = 'stopped'
+      if (this.generation === token && !this.active && this.detached.size === 0) this.state = 'stopped'
     }
     return this.status()
   }
@@ -182,16 +231,33 @@ export class SidecarManager {
 
   private stopActive(active: ActiveSidecar): Promise<void> {
     if (active.stopPromise) return active.stopPromise
+    const detached = this.active !== active
+    if (detached) {
+      this.detached.add(active)
+      if (!this.active && this.state === 'stopped') this.state = 'stopping'
+    }
     if (this.active === active) {
       if (this.timer) clearInterval(this.timer)
       this.timer = null
       this.handoff.clear(active.owner.instanceId)
-      this.active = null
     }
-    active.stopPromise = Promise.resolve().then(() =>
+    const stopping = Promise.resolve().then(() =>
       this.stopper.stop(active.owner, active.child, this.spec.shutdown.termGraceMs, this.spec.shutdown.killAfterMs),
+    ).then(
+      () => {
+        if (this.active === active) this.active = null
+        this.detached.delete(active)
+        if (!this.active && this.detached.size === 0 && this.state === 'stopping' && this.generation > active.token) this.state = 'stopped'
+      },
+      (error) => {
+        if (this.active === active) this.state = 'failed'
+        else if (!this.active && this.state === 'stopping') this.state = 'failed'
+        if (active.stopPromise === stopping) active.stopPromise = undefined
+        throw error
+      },
     )
-    return active.stopPromise
+    active.stopPromise = stopping
+    return stopping
   }
 
   private async probe(active: ActiveSidecar): Promise<void> {
@@ -201,9 +267,7 @@ export class SidecarManager {
     let ok = false
     try {
       ok = await this.health.check(active.ready.endpoint, this.spec.healthTimeoutMs)
-    } catch {
-      // Health failures are counted without exposing endpoint or error details.
-    } finally {
+    } catch { ok = false } finally {
       active.probing = false
     }
     if (!this.isCurrent(token, active)) return
