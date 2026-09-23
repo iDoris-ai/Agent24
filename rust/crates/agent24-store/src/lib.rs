@@ -10,6 +10,7 @@
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
 mod allocation_intent;
+mod allocation_materialization;
 mod allocation_record;
 // The authorized service slice has not wired this internal journal primitive yet.
 #[allow(dead_code)]
