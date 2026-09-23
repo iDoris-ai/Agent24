@@ -89,6 +89,12 @@ pub struct AppState {
     pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
+    /// ME4-1.3.1: the module deliverer `KernelTrigger`'s `Module` arm calls.
+    /// Kept here (not only inside `KernelTrigger`, which `AppState` cannot
+    /// see through its type-erased `Arc<dyn RunTrigger>`) so `serve` can call
+    /// `set_supervisors` on the SAME instance right after `mount_all` returns
+    /// (design §4.6).
+    pub deliverer: Arc<crate::scheduler_deliver::ModuleDeliverer>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
     /// McpServer kills its child process, which would silently break every tool
     /// it contributed. Never read on purpose — its job is to exist (M-E/E1b).
@@ -293,25 +299,27 @@ impl crate::domain::ModelInventory for ModelCatalog {
     }
 }
 
-/// Adapts the run manager (and, in spirit, the eventual module deliverer) to
-/// the scheduler's `RunTrigger` (design
-/// `docs/design/ME4-S1-scheduler-callback.md` §3.3) — a fired schedule
-/// becomes a background run tagged with the schedule id.
+/// Adapts the run manager and the module deliverer to the scheduler's
+/// `RunTrigger` (design `docs/design/ME4-S1-scheduler-callback.md` §3.3) — a
+/// fired schedule becomes either a background run tagged with the schedule
+/// id (`AgentRun`) or a real kernel request into the module's live
+/// `Generation` (`Module`, ME4-1.3.1).
 ///
 /// Named `KernelTrigger` (not `RunManagerTrigger`, its ME4-1.2.2b2/b3 working
 /// name) because it now speaks for BOTH arms of the kernel's own trigger
 /// interface, not just `RunManager`: the `AgentRun` arm is the original
 /// `RunManagerTrigger` body, byte-identical, wrapped to classify into
 /// `FireOutcome` (`Ok(run_id)` -> `AgentRun`, `Err(e)` -> `Failed`). The
-/// `Module` arm is reachable now that `agent24-scheduler`'s tick loop
-/// actually drives module rows (ME4-1.2.2b3's `fire_module`) — but still a
-/// stub here: ME4-1.3.1 wires a real `ModuleDeliverer` (kernel-request path
-/// over each module's live `Generation`, design §5) behind it. Until then
-/// every module fire this daemon's tick records is answered `Deferred
-/// (MountPending)` — never a failure (§4.1: none of `DeferReason`'s variants
-/// are the module's fault).
+/// `Module` arm delegates to `ModuleDeliverer` (`scheduler_deliver.rs`), which
+/// is `Deferred(MountPending)` for every fire until `server::serve` calls
+/// `ModuleDeliverer::set_supervisors` right after `mount_all` returns (design
+/// §4.6) — never a failure either way (§4.1: none of `DeferReason`'s variants
+/// are the module's fault). Only the DELIVERY PUMP
+/// (`agent24_scheduler::deliveries::DeliveryPump`) ever calls this arm for a
+/// module row — the tick itself never does (design §3.2).
 struct KernelTrigger {
     runs: Arc<agent24_agent::RunManager>,
+    deliverer: Arc<crate::scheduler_deliver::ModuleDeliverer>,
 }
 
 #[async_trait::async_trait]
@@ -347,10 +355,16 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     },
                 }
             }
-            agent24_scheduler::InvocationTarget::Module { .. } => {
-                agent24_scheduler::FireOutcome::Deferred {
-                    reason: agent24_scheduler::DeferReason::MountPending,
-                }
+            agent24_scheduler::InvocationTarget::Module { owner, fire_id } => {
+                self.deliverer
+                    .deliver(
+                        owner,
+                        fire_id,
+                        invocation.trigger.as_str(),
+                        &agent24_scheduler::next_fire::fmt_iso(invocation.scheduled_for),
+                        &agent24_scheduler::next_fire::fmt_iso(invocation.fired_at),
+                    )
+                    .await
             }
         }
     }
@@ -530,10 +544,14 @@ impl AppState {
             memory,
         );
         let sched_hub = events.clone();
+        let deliverer = StdArc::new(crate::scheduler_deliver::ModuleDeliverer::new(
+            crate::scheduler_deliver::PRODUCTION_LIMITS,
+        ));
         let scheduler = agent24_scheduler::Scheduler::new(
             store.clone(),
             StdArc::new(KernelTrigger {
                 runs: Arc::clone(&runs),
+                deliverer: StdArc::clone(&deliverer),
             }),
             StdArc::new(move |body| sched_hub.broadcast(body)),
         );
@@ -574,6 +592,7 @@ impl AppState {
             )),
             runs,
             scheduler,
+            deliverer,
             shutdown,
         }
     }
@@ -1057,21 +1076,12 @@ pub async fn serve(
         tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
     }
 
-    // Scheduler tick loop: polls due schedules and fires runs. Cadence from
-    // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
-    // minute, so a few seconds' latency is invisible).
-    let tick_secs = std::env::var("A24_SCHEDULER_TICK_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(10);
-    let scheduler = Arc::clone(&state.scheduler);
-    let sched_cancel = cancel.clone();
-    tokio::spawn(scheduler.run(
-        StdArc::new(agent24_scheduler::SystemClock),
-        Duration::from_secs(tick_secs),
-        sched_cancel,
-    ));
+    // ME4-1.3.1 (design §3.2/§4.6, S1-6): the scheduler's tick loop AND
+    // delivery pump are spawned AFTER `mount_all` returns, below — not here.
+    // Before `mount_all` there is no `ProcessHost`/`Supervisors` for a module
+    // fire to be delivered into, and no `InstalledOwners` catalogue for the
+    // tick to gate delivery-row recording on; starting either loop first
+    // would let a tick land on a module row before either exists.
 
     // T7b/ME-3e: the periodic module-approval timeout scan (design doc
     // decision 5) — a plain periodic task, not a per-row timer, on the same
@@ -1298,6 +1308,55 @@ pub async fn serve(
         },
     )
     .await;
+
+    // ME4-1.3.1 (design §4.6): right after `mount_all` returns — before the
+    // tick loop or the delivery pump ever run — set the two handles they and
+    // `KernelTrigger`'s `Module` arm depend on.
+    //
+    // `InstalledOwners` gets every name `mount_all` was given (mounted,
+    // disabled in os.json, refused — anything the catalogue discovered), NOT
+    // only what mounted successfully (design v2, M5): a disabled entry is
+    // still "installed" and its schedules must keep pre-advancing even though
+    // no delivery row is recorded for them.
+    state
+        .scheduler
+        .installed_owners()
+        .set(catalogue.iter().map(|entry| entry.name.clone()).collect());
+    // `host` being `Err` means this daemon cannot start out-of-process
+    // modules at all (design §4.6, v2 L5): the deliverer's `OnceLock` is left
+    // unset, so every module fire stays `Deferred(MountPending)` until its
+    // 24h TTL — the tick loop below still starts unconditionally, so AgentRun
+    // rows are unaffected.
+    if let Ok(h) = &host {
+        state.deliverer.set_supervisors(h.supervisors.clone());
+    }
+
+    // Scheduler tick loop: polls due schedules, pre-advances, and fires
+    // AgentRun rows / records module deliveries. Cadence from
+    // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
+    // minute, so a few seconds' latency is invisible).
+    let tick_secs = std::env::var("A24_SCHEDULER_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(10);
+    let tick_scheduler = Arc::clone(&state.scheduler);
+    let tick_cancel = cancel.clone();
+    tokio::spawn(tick_scheduler.run(
+        StdArc::new(agent24_scheduler::SystemClock),
+        Duration::from_secs(tick_secs),
+        tick_cancel,
+    ));
+    // ME4-1.3.1 (design §5.4): the delivery pump — independent of the tick,
+    // its own cadence, driven by the same real clock. Cancelled by the SAME
+    // `CancellationToken` the tick loop uses: on shutdown, an attempt still in
+    // flight is aborted (its `JoinSet` is dropped) rather than awaited, and
+    // its delivery row is left `pending`/`deferred` for the next start
+    // (design §4.6/§5.4, judgement C4.12).
+    let pump = agent24_scheduler::deliveries::DeliveryPump::new(Arc::clone(&state.scheduler));
+    let pump_cancel = cancel.clone();
+    tokio::spawn(pump.run(StdArc::new(agent24_scheduler::SystemClock), pump_cancel));
+
     for p in partitions.partitions() {
         tracing::info!(
             "domain OS {} was lent a memory partition for user {}",
@@ -2505,7 +2564,15 @@ pub(crate) mod tests {
     // ── ME4-1.2.2b (top-level cut): KernelTrigger, review H1 ─────────────────
 
     fn kernel_trigger_for_tests(runs: Arc<agent24_agent::RunManager>) -> KernelTrigger {
-        KernelTrigger { runs }
+        KernelTrigger {
+            runs,
+            // Unset `ModuleDeliverer` — every module fire this trigger sees
+            // in these tests is `Deferred(MountPending)` (design §4.6), same
+            // as before ME4-1.3.1 wired a real deliverer behind it.
+            deliverer: Arc::new(crate::scheduler_deliver::ModuleDeliverer::new(
+                crate::scheduler_deliver::PRODUCTION_LIMITS,
+            )),
+        }
     }
 
     async fn test_run_manager() -> Arc<agent24_agent::RunManager> {

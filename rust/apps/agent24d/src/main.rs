@@ -22,6 +22,7 @@ mod overrides;
 mod routes;
 mod runs;
 mod scheduler_callback;
+mod scheduler_deliver;
 mod schedules;
 mod server;
 
