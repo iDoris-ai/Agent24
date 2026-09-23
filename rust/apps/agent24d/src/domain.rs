@@ -5,12 +5,14 @@
 //! constructed modules — decides which of them should run, builds those, gives
 //! each a directory and a [`KernelCtx`], and nests its routes under a namespace
 //! derived from its identity. The mounting LOGIC has no module-specific branch — that is the ME-1
-//! acceptance — and the tests below mount fake modules rather than Sin90, so the
-//! property cannot quietly become "the mounter happens to work for Sin90". As of
-//! ME-1b-b this file names no module at all: Sin90 mounts through exactly this
-//! path, and the only place in the kernel that says "sin90" is `serve`, which has
-//! to name the OS it installs. (Fake modules give regression evidence, not proof
-//! that no special case exists.)
+//! acceptance — and the tests below mount fake modules, so the property cannot
+//! quietly become "the mounter happens to work for this one module". As of
+//! ME-1b-b this file names no module at all — a compiled-in OS would be named
+//! by `serve`'s catalogue, but as of T11 that catalogue is empty: Sin90 (the
+//! only module that ever exercised the in-process path) now ships from
+//! `iDoris-ai/Sin90` and mounts exclusively through `with_discovered`, like any
+//! other out-of-process package. (Fake modules give regression evidence, not
+//! proof that no special case exists.)
 //!
 //! Five rules the CONTRACT cannot enforce on its own, which therefore live here:
 //!
@@ -609,6 +611,14 @@ pub enum Build {
     /// Compiled in: build it by calling this. Manifest-derived admission
     /// necessarily happens after, because the manifest does not exist until the
     /// module does.
+    ///
+    /// No production code constructs this variant as of T11 (Sin90, the one
+    /// compiled-in module this ever named, now ships out-of-process from
+    /// `iDoris-ai/Sin90`) — the tests below still do, to exercise the mounter's
+    /// in-process path with fake modules. `#[allow(dead_code)]` rather than
+    /// deleting the variant: a future compiled-in OS is still just another
+    /// catalogue entry, and this is the arm it would use.
+    #[allow(dead_code)]
     #[allow(clippy::type_complexity)]
     InProcess(Box<dyn Fn() -> std::result::Result<Arc<dyn DomainModule>, String> + Send + Sync>),
     /// A package found on disk, run as its own process (ME-3, SUP-4). Its
