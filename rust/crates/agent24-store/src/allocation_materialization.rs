@@ -6,6 +6,9 @@ use crate::{
     WorkspaceResult, WorkspaceRow, WorkspaceStoreError,
 };
 
+#[cfg(test)]
+mod adversarial_tests;
+
 async fn select_record(
     tx: &mut Transaction<'_, Sqlite>,
     intent: &AllocationIntent,
