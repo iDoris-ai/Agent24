@@ -293,29 +293,29 @@ impl crate::domain::ModelInventory for ModelCatalog {
     }
 }
 
-/// Adapts the run manager to the scheduler's `RunTrigger` (design
+/// Adapts the run manager (and, in spirit, the eventual module deliverer) to
+/// the scheduler's `RunTrigger` (design
 /// `docs/design/ME4-S1-scheduler-callback.md` §3.3) — a fired schedule
 /// becomes a background run tagged with the schedule id.
 ///
-/// ME4-1.2.2b2 (this cut) is forced to make this mechanical update the
-/// moment `agent24-scheduler` swaps `Scheduler` onto the new trait — Rust
-/// compiles a workspace atomically, so the crate that changes a public trait
-/// signature and the crate that implements it cannot land in different
-/// commits without breaking the build in between. The `AgentRun` arm is the
-/// OLD body, byte-identical, wrapped to classify into `FireOutcome`
-/// (`Ok(run_id)` -> `AgentRun`, `Err(e)` -> `Failed`). The `Module` arm is a
-/// stub: ME4-1.2.2b3 gives `agent24-scheduler` a module-row tick branch (so
-/// this arm becomes reachable), and ME4-1.3.1 wires a real `ModuleDeliverer`
-/// behind it; until then every module fire is answered `Deferred
+/// Named `KernelTrigger` (not `RunManagerTrigger`, its ME4-1.2.2b2/b3 working
+/// name) because it now speaks for BOTH arms of the kernel's own trigger
+/// interface, not just `RunManager`: the `AgentRun` arm is the original
+/// `RunManagerTrigger` body, byte-identical, wrapped to classify into
+/// `FireOutcome` (`Ok(run_id)` -> `AgentRun`, `Err(e)` -> `Failed`). The
+/// `Module` arm is reachable now that `agent24-scheduler`'s tick loop
+/// actually drives module rows (ME4-1.2.2b3's `fire_module`) — but still a
+/// stub here: ME4-1.3.1 wires a real `ModuleDeliverer` (kernel-request path
+/// over each module's live `Generation`, design §5) behind it. Until then
+/// every module fire this daemon's tick records is answered `Deferred
 /// (MountPending)` — never a failure (§4.1: none of `DeferReason`'s variants
-/// are the module's fault). ME4-1.2.2b (the top-level cut) renames this
-/// struct to `KernelTrigger` once that module-row support is complete.
-struct RunManagerTrigger {
+/// are the module's fault).
+struct KernelTrigger {
     runs: Arc<agent24_agent::RunManager>,
 }
 
 #[async_trait::async_trait]
-impl agent24_scheduler::RunTrigger for RunManagerTrigger {
+impl agent24_scheduler::RunTrigger for KernelTrigger {
     async fn trigger(
         &self,
         invocation: &agent24_scheduler::ScheduleInvocation,
@@ -532,7 +532,7 @@ impl AppState {
         let sched_hub = events.clone();
         let scheduler = agent24_scheduler::Scheduler::new(
             store.clone(),
-            StdArc::new(RunManagerTrigger {
+            StdArc::new(KernelTrigger {
                 runs: Arc::clone(&runs),
             }),
             StdArc::new(move |body| sched_hub.broadcast(body)),
@@ -2486,5 +2486,123 @@ pub(crate) mod tests {
             "but shell_exec is still exec — a builtin may be tightened, never relaxed"
         );
         assert!(reg.tool_requires_approval("shell_exec"));
+    }
+
+    // ── ME4-1.2.2b (top-level cut): KernelTrigger, review H1 ─────────────────
+
+    fn kernel_trigger_for_tests(runs: Arc<agent24_agent::RunManager>) -> KernelTrigger {
+        KernelTrigger { runs }
+    }
+
+    async fn test_run_manager() -> Arc<agent24_agent::RunManager> {
+        agent24_agent::RunManager::new(
+            agent24_store::Store::open_memory().await.unwrap(),
+            Arc::new(ModelRouter::with_defaults(vec![])),
+            Arc::new(agent24_tools::ToolRegistry::new()),
+            Arc::new(crate::events::EventsHub::default()) as Arc<dyn agent24_agent::EventSink>,
+            CancellationToken::new(),
+        )
+    }
+
+    fn module_invocation(
+        schedule_id: &str,
+        trigger: agent24_scheduler::FireTrigger,
+    ) -> agent24_scheduler::ScheduleInvocation {
+        let now = chrono::Utc::now();
+        agent24_scheduler::ScheduleInvocation {
+            schedule_id: schedule_id.to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger,
+            target: agent24_scheduler::InvocationTarget::Module {
+                owner: agent24_scheduler::ModuleScheduleKey {
+                    owner_module: "mod-a".to_owned(),
+                    module_key: "k".to_owned(),
+                },
+                fire_id: agent24_scheduler::FireId::derive(trigger, schedule_id, now),
+            },
+        }
+    }
+
+    /// Review H1: `KernelTrigger`'s `Module` arm is a stub until ME4-1.3.1
+    /// wires a real `ModuleDeliverer` — every module target it is asked to
+    /// fire must come back `Deferred(MountPending)`, never a failure (design
+    /// §4.1: none of `DeferReason`'s variants are the module's fault, and a
+    /// mis-wired daemon must never burn a module's failure budget before the
+    /// real deliverer even exists).
+    #[tokio::test]
+    async fn kernel_trigger_module_arm_is_deferred_mount_pending() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let invocation = module_invocation("sch_test", agent24_scheduler::FireTrigger::Tick);
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
+        assert_eq!(
+            outcome,
+            agent24_scheduler::FireOutcome::Deferred {
+                reason: agent24_scheduler::DeferReason::MountPending
+            }
+        );
+    }
+
+    /// Review H1: the `AgentRun` arm's failure path — `RunManager` refusing
+    /// the run (here: a `session_id` that was never created, which
+    /// `start_run_with_schedule` rejects with `SessionNotFound` before
+    /// anything else happens) — must classify as `FireOutcome::Failed`, not
+    /// panic or silently swallow the error.
+    #[tokio::test]
+    async fn kernel_trigger_agent_run_failure_maps_to_failed() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let now = chrono::Utc::now();
+        let invocation = agent24_scheduler::ScheduleInvocation {
+            schedule_id: "sch_test".to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger: agent24_scheduler::FireTrigger::Tick,
+            target: agent24_scheduler::InvocationTarget::AgentRun(
+                agent24_protocol::ScheduleAction::AgentRun {
+                    prompt: "x".to_owned(),
+                    session_id: Some("sess_nonexistent".to_owned()),
+                    model_override: None,
+                },
+            ),
+        };
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
+        match outcome {
+            agent24_scheduler::FireOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("sess_nonexistent"),
+                    "expected the SessionNotFound reason to name the missing session, got: {reason}"
+                );
+            }
+            other => panic!("expected Failed for a rejected run, got {other:?}"),
+        }
+    }
+
+    /// Positive control for the AgentRun arm's SUCCESS path (the failure
+    /// test above only proves half of H1's classification): a run that
+    /// `RunManager` actually accepts must come back `AgentRun{run_id}`.
+    #[tokio::test]
+    async fn kernel_trigger_agent_run_success_maps_to_agent_run() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let now = chrono::Utc::now();
+        let invocation = agent24_scheduler::ScheduleInvocation {
+            schedule_id: "sch_test".to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger: agent24_scheduler::FireTrigger::Tick,
+            target: agent24_scheduler::InvocationTarget::AgentRun(
+                agent24_protocol::ScheduleAction::AgentRun {
+                    prompt: "x".to_owned(),
+                    session_id: None,
+                    model_override: None,
+                },
+            ),
+        };
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
+        match outcome {
+            agent24_scheduler::FireOutcome::AgentRun { run_id } => {
+                assert!(run_id.starts_with("run_"), "{run_id}");
+            }
+            other => panic!("expected AgentRun for an accepted run, got {other:?}"),
+        }
     }
 }
