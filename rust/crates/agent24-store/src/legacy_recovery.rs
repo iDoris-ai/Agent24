@@ -998,10 +998,25 @@ pub(crate) async fn apply_ready_tx(
 mod tests {
     use super::*;
     use sqlx::{Row, SqlitePool};
+    use std::{path::Path, sync::Arc};
+    use tokio::sync::Barrier;
 
     #[allow(clippy::unwrap_used)]
     async fn strict_facts_fixture() -> Store {
         let store = Store::open_memory().await.unwrap();
+        strict_facts_seed(&store).await;
+        store
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn strict_facts_file(path: &Path) -> Store {
+        let store = Store::open(path).await.unwrap();
+        strict_facts_seed(&store).await;
+        store
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn strict_facts_seed(store: &Store) {
         let pool = store.pool();
         let fk_enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
             .fetch_one(pool)
@@ -1048,7 +1063,6 @@ mod tests {
             .await
             .unwrap();
         assert!(violations.is_empty());
-        store
     }
 
     type LeaseFacts = (
@@ -1890,6 +1904,41 @@ mod tests {
             .unwrap()
     }
 
+    type PromotionSnapshot = (
+        String,
+        Vec<(String, String, String, String, String)>,
+        Vec<crate::AuditEntry>,
+    );
+
+    #[allow(clippy::unwrap_used)]
+    async fn promotion_snapshot(store: &Store) -> PromotionSnapshot {
+        let state: (String, i64, String, Option<String>, Option<String>, Option<String>, String) =
+            sqlx::query_as("SELECT w.state,w.revision,h.recovery_state,h.ready_at,h.reason_code,h.active_resume_approval_id,a.available_decisions FROM workspaces w JOIN legacy_recovery_holds h ON h.workspace_id=w.id JOIN approvals a ON a.id=h.approval_id WHERE h.run_id='run-strict'")
+                .fetch_one(store.pool()).await.unwrap();
+        let leases = sqlx::query_as("SELECT lease_id,workspace_id,root_generation,owner_id,kind FROM workspace_leases ORDER BY lease_id")
+            .fetch_all(store.pool()).await.unwrap();
+        (
+            format!("{state:?}"),
+            leases,
+            store.list_audit().await.unwrap(),
+        )
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn assert_active_audit(store: &Store) {
+        let audit = store.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            (audit[0].actor.as_str(), audit[0].action.as_str()),
+            ("legacy_recovery", "legacy_recovery.active")
+        );
+        assert_eq!(
+            audit[0].detail,
+            serde_json::json!({"run_id":"run-strict","cohort_id":"cohort-strict","workspace_id":"ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5","result_state":"active"})
+        );
+        store.verify_audit_chain().await.unwrap();
+    }
+
     #[allow(clippy::unwrap_used)]
     async fn damaged(store: &Store, field: &'static str, value: &str, storage: &str) {
         execute(
@@ -2326,6 +2375,361 @@ expect_promotion_error(&store, attempt, WorkspaceStoreError::CorruptRow { table,
 }
 }
 
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn promotion_at_exact_expiry_commits_only_expiry_and_retry_is_read_only() {
+        let store = strict_facts_fixture().await;
+        let attempt = ready_promotion_attempt(&store).await;
+        let mut attempt = attempt;
+        attempt.acquired_at = WorkspaceInstant::parse("2026-09-20T00:00:00.000Z").unwrap();
+        let clocks: (String, String) =
+            sqlx::query_as("SELECT created_at,expires_at FROM workspaces WHERE id=?")
+                .bind(attempt.hint.workspace_id.as_str())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(clocks.0 < clocks.1);
+        assert_eq!(clocks.1, attempt.acquired_at.as_str());
+        let before: (String, i64, String, Option<String>, i64, i64) = sqlx::query_as("SELECT w.state,w.revision,h.recovery_state,h.ready_at,(SELECT count(*) FROM workspace_leases),(SELECT count(*) FROM audit_log) FROM workspaces w JOIN legacy_recovery_holds h ON h.workspace_id=w.id WHERE w.id=?")
+            .bind(attempt.hint.workspace_id.as_str()).fetch_one(store.pool()).await.unwrap();
+        assert_eq!(
+            before,
+            (
+                "active".into(),
+                1,
+                "ready".into(),
+                attempt
+                    .hint
+                    .ready_at
+                    .as_ref()
+                    .map(|v| v.as_str().to_owned()),
+                0,
+                0
+            )
+        );
+        assert_eq!(
+            store
+                .promote_legacy_recovery(attempt.clone())
+                .await
+                .unwrap(),
+            LegacyRecoveryPromotionOutcome::WorkspaceUnavailable
+        );
+        let expired: (String, i64, String, Option<String>, i64, i64) = sqlx::query_as("SELECT w.state,w.revision,h.recovery_state,h.ready_at,(SELECT count(*) FROM workspace_leases),(SELECT count(*) FROM audit_log) FROM workspaces w JOIN legacy_recovery_holds h ON h.workspace_id=w.id WHERE w.id=?")
+            .bind(attempt.hint.workspace_id.as_str()).fetch_one(store.pool()).await.unwrap();
+        assert_eq!(
+            expired,
+            ("expired".into(), 2, "ready".into(), before.3.clone(), 0, 1)
+        );
+        let audit = store.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            (
+                audit[0].seq,
+                audit[0].ts.as_str(),
+                audit[0].prev_hash.as_str()
+            ),
+            (1, attempt.acquired_at.as_str(), "genesis")
+        );
+        assert_eq!(audit[0].hash.len(), 64);
+        assert_eq!(
+            (audit[0].actor.as_str(), audit[0].action.as_str()),
+            ("workspace_lifecycle", "workspace.expired")
+        );
+        assert_eq!(
+            audit[0].detail,
+            serde_json::json!({"id": attempt.hint.workspace_id.as_str(), "kind": "legacy_compat", "result_state": "expired", "reason": "ttl"})
+        );
+        store.verify_audit_chain().await.unwrap();
+        let before_retry = changes(&store).await;
+        assert_eq!(
+            store.promote_legacy_recovery(attempt).await.unwrap(),
+            LegacyRecoveryPromotionOutcome::WorkspaceUnavailable
+        );
+        assert_eq!(changes(&store).await, before_retry);
+        assert_eq!(store.list_audit().await.unwrap(), audit);
+        let after: (String, i64, String, Option<String>, i64) = sqlx::query_as("SELECT w.state,w.revision,h.recovery_state,h.ready_at,(SELECT count(*) FROM workspace_leases) FROM workspaces w JOIN legacy_recovery_holds h ON h.workspace_id=w.id WHERE w.id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'").fetch_one(store.pool()).await.unwrap();
+        assert_eq!(after, ("expired".into(), 2, "ready".into(), before.3, 0));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn promotion_busy_for_workspace_or_run_owner_without_writes() {
+        for same_workspace in [true, false] {
+            let store = strict_facts_fixture().await;
+            let attempt = ready_promotion_attempt(&store).await;
+            let workspace = if same_workspace {
+                attempt.hint.workspace_id.as_str()
+            } else {
+                execute(&store, "INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES ('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6','orchestrator_scratch','active','test','external','orchestrator','owner','serial','2026-09-19T00:00:00.000Z','2026-09-20T00:00:00.000Z',1,'/tmp/other','g2','unix',X'0101010101010101',X'0202020202020202')").await;
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6"
+            };
+            let owner = if same_workspace {
+                "another-run"
+            } else {
+                "run-strict"
+            };
+            sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6',?,? ,?,'run','2026-09-19T00:00:00.000Z')")
+                .bind(workspace).bind(if same_workspace { "g1" } else { "g2" }).bind(owner).execute(store.pool()).await.unwrap();
+            let before = changes(&store).await;
+            let snapshot = promotion_snapshot(&store).await;
+            assert_eq!(
+                store.promote_legacy_recovery(attempt).await.unwrap(),
+                LegacyRecoveryPromotionOutcome::Busy
+            );
+            assert_eq!(changes(&store).await, before);
+            assert_eq!(promotion_snapshot(&store).await, snapshot);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn promotion_rejects_changed_and_non_oldest_ready_hints_without_writes() {
+        let store = strict_facts_fixture().await;
+        let attempt = ready_promotion_attempt(&store).await;
+        execute(
+            &store,
+            "UPDATE legacy_recovery_holds SET reason_code='changed' WHERE run_id='run-strict'",
+        )
+        .await;
+        let before = changes(&store).await;
+        let snapshot = promotion_snapshot(&store).await;
+        assert_eq!(
+            store.promote_legacy_recovery(attempt).await.unwrap(),
+            LegacyRecoveryPromotionOutcome::StaleHint
+        );
+        assert_eq!(changes(&store).await, before);
+        assert_eq!(promotion_snapshot(&store).await, snapshot);
+
+        for (run, approval, current_ready_at) in [
+            ("run-aaa", "approval-aaa", None),
+            (
+                "run-earlier-time",
+                "approval-earlier-time",
+                Some("2026-09-19T00:00:00.001Z"),
+            ),
+        ] {
+            let store = strict_facts_fixture().await;
+            let mut attempt = ready_promotion_attempt(&store).await;
+            if let Some(ready_at) = current_ready_at {
+                execute(&store, &format!("UPDATE legacy_recovery_holds SET ready_at='{ready_at}' WHERE run_id='run-strict'")).await;
+                attempt.hint = store.get_legacy_recovery_hold("run-strict").await.unwrap();
+                assert_eq!(attempt.hint.ready_at.as_ref().unwrap().as_str(), ready_at);
+            }
+            insert_reader_hold(
+                &store,
+                run,
+                Some(approval),
+                "ready",
+                Some("2026-09-19T00:00:00.000Z"),
+                None,
+                None,
+                None,
+            )
+            .await;
+            execute(&store, &format!("UPDATE approvals SET status='approved',decision='{{\"type\":\"approve\"}}',available_decisions='[\"approve\"]',decided_at='2026-09-19T00:00:00.000Z' WHERE id='{approval}'")).await;
+            let before = changes(&store).await;
+            let snapshot = promotion_snapshot(&store).await;
+            assert_eq!(
+                store.promote_legacy_recovery(attempt).await.unwrap(),
+                LegacyRecoveryPromotionOutcome::StaleHint
+            );
+            assert_eq!(changes(&store).await, before);
+            assert_eq!(promotion_snapshot(&store).await, snapshot);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn promotion_ignored_cas_rolls_back_lease_and_audit_then_retries() {
+        let store = strict_facts_fixture().await;
+        let attempt = ready_promotion_attempt(&store).await;
+        let before = promotion_snapshot(&store).await;
+        execute(&store, "CREATE TRIGGER ignore_promotion BEFORE UPDATE OF recovery_state ON legacy_recovery_holds WHEN NEW.recovery_state='active' BEGIN SELECT RAISE(IGNORE); END").await;
+        assert_eq!(
+            store.promote_legacy_recovery(attempt.clone()).await,
+            Err(WorkspaceStoreError::Database)
+        );
+        assert_eq!(promotion_snapshot(&store).await, before);
+        execute(&store, "DROP TRIGGER ignore_promotion").await;
+        assert!(matches!(
+            store.promote_legacy_recovery(attempt).await.unwrap(),
+            LegacyRecoveryPromotionOutcome::Admitted(_)
+        ));
+        assert_active_audit(&store).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn promotion_post_audit_valid_mutations_roll_back_and_retry() {
+        for (name, mutation) in [
+            (
+                "lease_owner",
+                "UPDATE workspace_leases SET owner_id='other-run' WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7'",
+            ),
+            (
+                "hold_reason",
+                "UPDATE legacy_recovery_holds SET reason_code='tampered' WHERE run_id='run-strict'",
+            ),
+            (
+                "approval_decisions",
+                "UPDATE approvals SET available_decisions='[\"deny\"]' WHERE id='approval-strict'",
+            ),
+        ] {
+            let store = strict_facts_fixture().await;
+            let attempt = ready_promotion_attempt(&store).await;
+            let before = promotion_snapshot(&store).await;
+            execute(&store, &format!("CREATE TRIGGER tamper_{name} AFTER INSERT ON audit_log WHEN NEW.action='legacy_recovery.active' BEGIN {mutation}; END")).await;
+            assert_eq!(
+                store.promote_legacy_recovery(attempt.clone()).await,
+                Err(WorkspaceStoreError::CorruptRow {
+                    table: "legacy_recovery_holds",
+                    field: "row"
+                })
+            );
+            assert_eq!(promotion_snapshot(&store).await, before);
+            execute(&store, &format!("DROP TRIGGER tamper_{name}")).await;
+            assert!(matches!(
+                store.promote_legacy_recovery(attempt).await.unwrap(),
+                LegacyRecoveryPromotionOutcome::Admitted(_)
+            ));
+            assert_active_audit(&store).await;
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn promotion_same_hint_wal_race_admits_once_and_reopens_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("promotion-race.db");
+        let seed = strict_facts_file(&path).await;
+        let attempt = ready_promotion_attempt(&seed).await;
+        drop(seed);
+        let left = Store::open(&path).await.unwrap();
+        let right = Store::open(&path).await.unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let a = Arc::clone(&barrier);
+        let b = Arc::clone(&barrier);
+        let (l, r) = tokio::join!(
+            async {
+                a.wait().await;
+                left.promote_legacy_recovery(attempt.clone()).await.unwrap()
+            },
+            async {
+                b.wait().await;
+                right
+                    .promote_legacy_recovery(attempt.clone())
+                    .await
+                    .unwrap()
+            },
+        );
+        assert_eq!(
+            usize::from(matches!(l, LegacyRecoveryPromotionOutcome::Admitted(_)))
+                + usize::from(matches!(r, LegacyRecoveryPromotionOutcome::Admitted(_))),
+            1
+        );
+        assert_eq!(
+            usize::from(matches!(
+                l,
+                LegacyRecoveryPromotionOutcome::ObservedCommitted(_)
+            )) + usize::from(matches!(
+                r,
+                LegacyRecoveryPromotionOutcome::ObservedCommitted(_)
+            )),
+            1
+        );
+        let reopened = Store::open(&path).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_legacy_recovery_hold("run-strict")
+                .await
+                .unwrap()
+                .recovery_state,
+            RecoveryState::Active
+        );
+        let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM workspace_leases),(SELECT count(*) FROM audit_log WHERE action='legacy_recovery.active')").fetch_one(reopened.pool()).await.unwrap();
+        assert_eq!(counts, (1, 1));
+        let lease: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT lease_id,workspace_id,root_generation,owner_id,kind FROM workspace_leases",
+        )
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            lease,
+            (
+                "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7".into(),
+                "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5".into(),
+                "g1".into(),
+                "run-strict".into(),
+                "run".into()
+            )
+        );
+        let audit = reopened.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!((audit[0].seq, audit[0].prev_hash.as_str()), (1, "genesis"));
+        assert_eq!(audit[0].hash.len(), 64);
+        assert_eq!(
+            (audit[0].actor.as_str(), audit[0].action.as_str()),
+            ("legacy_recovery", "legacy_recovery.active")
+        );
+        assert_eq!(
+            audit[0].detail,
+            serde_json::json!({"run_id":"run-strict","cohort_id":"cohort-strict","workspace_id":"ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5","result_state":"active"})
+        );
+        reopened.verify_audit_chain().await.unwrap();
+        assert!(matches!(
+            reopened.promote_legacy_recovery(attempt).await.unwrap(),
+            LegacyRecoveryPromotionOutcome::ObservedCommitted(_)
+        ));
+        assert_eq!(reopened.list_audit().await.unwrap(), audit);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn promotion_rejected_commit_reopens_ready_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("promotion-commit-reject.db");
+        let store = strict_facts_file(&path).await;
+        let attempt = ready_promotion_attempt(&store).await;
+        let mut pinned = Vec::new();
+        for _ in 0..4 {
+            pinned.push(store.pool().acquire().await.unwrap());
+        }
+        let mut connection = store.pool().acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(|| false);
+        drop(connection);
+        assert_eq!(
+            store.promote_legacy_recovery(attempt.clone()).await,
+            Err(WorkspaceStoreError::Database)
+        );
+        drop(pinned);
+        store.pool().close().await;
+        let reopened = Store::open(&path).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_legacy_recovery_hold("run-strict")
+                .await
+                .unwrap()
+                .recovery_state,
+            RecoveryState::Ready
+        );
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM workspace_leases),(SELECT count(*) FROM audit_log)",
+        )
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
+        assert!(matches!(
+            reopened.promote_legacy_recovery(attempt).await.unwrap(),
+            LegacyRecoveryPromotionOutcome::Admitted(_)
+        ));
+        assert_active_audit(&reopened).await;
+    }
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn read_next_ready_tx_returns_none_for_empty_and_non_ready_states() {
