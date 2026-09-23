@@ -28,6 +28,8 @@ mod ready_io;
 mod ready_read_worker;
 #[allow(dead_code)]
 mod stderr_drain_worker;
+#[allow(dead_code)]
+mod worker_slots;
 
 #[cfg(unix)]
 mod posix;

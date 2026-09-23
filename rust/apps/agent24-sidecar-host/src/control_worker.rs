@@ -1,8 +1,8 @@
 use crate::control_io::{ControlIngress, IngressError, IngressStep};
+use crate::worker_slots::{WorkerRole, WorkerSlotError, WorkerSlots, hold_permit};
 use std::{
-    io::{self, Read},
+    io::Read,
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -55,18 +55,32 @@ pub(crate) struct ControlWorker {
 }
 
 impl ControlWorker {
-    pub(crate) fn new<R: Read + Send + 'static>(reader: R, budget: Duration) -> io::Result<Self> {
+    pub(crate) fn new_in<R: Read + Send + 'static>(
+        slots: &'static WorkerSlots,
+        reader: R,
+        budget: Duration,
+    ) -> Result<Self, WorkerSlotError> {
         let (credit_tx, credit_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
-        thread::Builder::new()
-            .name("sidecar-control".into())
-            .spawn(move || control_loop(ControlIngress::new(reader), credit_rx, result_tx))?;
+        slots.spawn(WorkerRole::Control, "sidecar-control", move |permit| {
+            hold_permit(permit, || {
+                control_loop(ControlIngress::new(reader), credit_rx, result_tx)
+            })
+        })?;
         Ok(Self {
             credits: credit_tx,
             results: result_rx,
             budget,
             state: State::Idle,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new<R: Read + Send + 'static>(
+        reader: R,
+        budget: Duration,
+    ) -> Result<Self, WorkerSlotError> {
+        Self::new_in(WorkerSlots::isolated(), reader, budget)
     }
 
     /// Give the one worker permission to perform one control read attempt.
@@ -152,11 +166,13 @@ mod tests {
     use agent24_sidecar_host_protocol::{Request, RequestSequence, encode_request};
     use std::{
         collections::{HashSet, VecDeque},
+        io,
         io::ErrorKind,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
     };
 
     const BUDGET: Duration = Duration::from_secs(2);

@@ -1,4 +1,5 @@
 use crate::output_io::{OutputWriteError, OutputWriter, PutFrameError, WriteStep};
+use crate::worker_slots::{WorkerRole, WorkerSlotError, WorkerSlots, hold_permit};
 use std::{
     io::{self, Write},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -27,18 +28,32 @@ pub(crate) struct OutputWorker {
 }
 
 impl OutputWorker {
-    pub(crate) fn new<W: Write + Send + 'static>(writer: W, budget: Duration) -> io::Result<Self> {
+    pub(crate) fn new_in<W: Write + Send + 'static>(
+        slots: &'static WorkerSlots,
+        writer: W,
+        budget: Duration,
+    ) -> Result<Self, WorkerSlotError> {
         let (command_tx, command_rx) = mpsc::sync_channel::<Vec<u8>>(1);
         let (result_tx, result_rx) = mpsc::sync_channel::<ResultFrame>(1);
-        thread::Builder::new()
-            .name("sidecar-stdout".into())
-            .spawn(move || output_loop(OutputWriter::new(writer), command_rx, result_tx))?;
+        slots.spawn(WorkerRole::Output, "sidecar-stdout", move |permit| {
+            hold_permit(permit, || {
+                output_loop(OutputWriter::new(writer), command_rx, result_tx)
+            })
+        })?;
         Ok(Self {
             commands: command_tx,
             results: result_rx,
             budget,
             state: State::Idle,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new<W: Write + Send + 'static>(
+        writer: W,
+        budget: Duration,
+    ) -> Result<Self, WorkerSlotError> {
+        Self::new_in(WorkerSlots::isolated(), writer, budget)
     }
 
     pub(crate) fn put(&mut self, frame: Vec<u8>, now: Instant) -> Result<(), PutFrameError> {
