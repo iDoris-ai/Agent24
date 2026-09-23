@@ -115,6 +115,14 @@ pub enum KernelCallError {
     MaybeSent(String),
     Timeout,
     ResponseTooLarge,
+    /// Review round 1, L3: a NON-2xx response's body failed to read for a
+    /// reason OTHER than exceeding `limits.max_response_bytes` (a length
+    /// limit hit is [`Self::ResponseTooLarge`] instead) — a truncated or
+    /// reset connection while the module was answering, most likely. Kept
+    /// distinct from `ResponseTooLarge` so `last_error` reports what
+    /// actually happened rather than claiming a size limit that was never
+    /// reached.
+    ResponseBodyError(String),
     /// A `Running` generation always has one; refused rather than trusted.
     NoUpstream,
 }
@@ -323,13 +331,22 @@ async fn exchange_once(
     // touched, so a revocation or an oversized body afterward cannot erase a
     // 2xx that already happened (design v2, L2).
     let _ = head.set(parts.status);
-    if Limited::new(body, limits.max_response_bytes)
+    // Review round 1, L3: only a genuine length-limit hit is `ResponseTooLarge`
+    // — any OTHER body-read failure (the module hung up mid-answer, a reset
+    // connection) is a real, different problem and must say so, not claim a
+    // size limit that was never reached. A 2xx head is unaffected either way
+    // (design v2, L2): `send_kernel_request`'s own head-check treats it as
+    // `Ok` regardless of what this function returns.
+    if let Err(err) = Limited::new(body, limits.max_response_bytes)
         .collect()
         .await
-        .is_err()
         && !parts.status.is_success()
     {
-        return Err(KernelCallError::ResponseTooLarge);
+        return if proxy::is_length_limit(&*err) {
+            Err(KernelCallError::ResponseTooLarge)
+        } else {
+            Err(KernelCallError::ResponseBodyError(err.to_string()))
+        };
     }
     Ok(KernelResponse {
         status: parts.status,
@@ -340,6 +357,7 @@ async fn exchange_once(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::drain::CallbackRefused;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64 as StdAtomicU64;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -478,15 +496,22 @@ mod tests {
         assert_eq!(body, b"{\"key\":\"k\"}");
     }
 
-    /// design v2 (H1) / v3 (H-A), judgement C4.7a: revoked AFTER admission but
-    /// BEFORE the first `dispatch()` — nothing must reach the wire.
+    /// Review round 1, M2: this used to be named as if it exercised C4.7a's
+    /// own window — it does not. `send_kernel_request` calls its OWN internal
+    /// `admit_request` first; a generation already revoked before that call
+    /// even starts is refused at ADMISSION (`RequestRefused::Stopping`), never
+    /// reaching `exchange_once`'s `dispatch()` check at all. Renamed to say
+    /// so; the real C4.7a window (revoked between `admit_request` succeeding
+    /// and the first `dispatch()` call, inside ONE `exchange_once` call) is
+    /// `exchange_once_returns_not_dispatched_when_revoked_before_the_first_
+    /// dispatch_call` below, which calls the private `exchange_once` directly.
     #[tokio::test]
-    async fn revoked_before_the_first_dispatch_sends_nothing() {
+    async fn admission_is_refused_once_the_generation_is_already_revoked() {
         let (path, rx) =
             raw_upstream_capturing(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
         let generation = running_generation(path);
-        // `admit_request` succeeds (Running); revoke immediately after, before
-        // the caller ever calls `dispatch()` — exactly the C4.7a window.
+        // A throwaway probe id, admitted then immediately revoked — just to
+        // put the generation into `Revoked` before the real call below.
         let in_flight = generation
             .admit_request(
                 "probe".to_owned(),
@@ -496,9 +521,6 @@ mod tests {
             )
             .unwrap();
         assert!(generation.revoke().is_some());
-        // The revoked generation must refuse admission for the REAL call too
-        // (a fresh id — `admit_request` only ever returns one live `InFlight`
-        // per id, and this one is the probe's).
         drop(in_flight);
         let result =
             send_kernel_request(&generation, &ids(), fired_request(), limits(), None).await;
@@ -517,17 +539,11 @@ mod tests {
         );
     }
 
-    /// design v2 (H1), judgement C4.7a's OWN window (constructed, dispatch()
-    /// not yet called) is exercised at the `exchange_once` level: a
-    /// generation revoked between `admit_request` and the first `dispatch()`
-    /// inside the SAME call. Since `send_kernel_request` calls `dispatch()`
-    /// immediately after building the request with no `.await` in between,
-    /// the only way to land a test in that exact window is the `before_guard`
-    /// seam used below for C4.7b — this test instead pins the OUTER
-    /// contract: `dispatch()` returning `false` (revoked) yields
-    /// `NotDispatched` with zero bytes sent, whatever revoked it.
+    /// Review round 1, M2 (same reclassification as the test above): a
+    /// generation revoked with NOTHING ever admitted into it also refuses
+    /// admission — the same `Refused` path, one step simpler.
     #[tokio::test]
-    async fn dispatch_returning_false_sends_nothing_and_is_not_dispatched() {
+    async fn a_generation_with_nothing_ever_admitted_also_refuses_once_revoked() {
         let (path, rx) =
             raw_upstream_capturing(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
         let generation = running_generation(path);
@@ -542,6 +558,59 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(200), rx)
                 .await
                 .is_err()
+        );
+    }
+
+    /// Review round 1, **M2**, judgement **C4.7a**, the REAL window this time:
+    /// `admit_request` succeeds (the generation is `Running`), THEN it is
+    /// revoked, THEN `exchange_once` is called on the resulting `InFlight` —
+    /// exactly the sequence `send_kernel_request` itself runs, but with the
+    /// revoke landing in the one-line gap between admission and the first
+    /// `dispatch()` call that no external caller can otherwise pry open (no
+    /// `.await` separates them in `send_kernel_request`). Calling the private
+    /// `exchange_once` directly, from this same module's test code, is the
+    /// only way to land the test deterministically in that exact gap.
+    ///
+    /// Mutation: delete the `if !in_flight.dispatch() { return Err(
+    /// NotDispatched); }` check at the top of `exchange_once` — this test
+    /// goes red (the mock upstream then receives a real request instead of
+    /// zero bytes).
+    #[tokio::test]
+    async fn exchange_once_returns_not_dispatched_when_revoked_before_the_first_dispatch_call() {
+        let (path, rx) =
+            raw_upstream_capturing(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let generation = running_generation(path);
+        let in_flight = generation
+            .admit_request(
+                "x".to_owned(),
+                sha256(b"t"),
+                Instant::now(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(generation.revoke().is_some());
+        let flag = AtomicBool::new(false);
+        let head = std::sync::OnceLock::new();
+        let result = exchange_once(
+            &in_flight,
+            "x",
+            "tok",
+            fired_request(),
+            limits(),
+            &flag,
+            &head,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(KernelCallError::NotDispatched)),
+            "{result:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx)
+                .await
+                .is_err(),
+            "the module must never have been dialled"
         );
     }
 
@@ -720,6 +789,102 @@ mod tests {
         }
     }
 
+    /// Review round 1, **M5**, judgement **C4.6**: the request id
+    /// `send_kernel_request` mints is a REAL in-flight request of its
+    /// `generation` for exactly as long as the call runs — so a callback
+    /// carrying it passes `admit_callback_bound` even once the generation
+    /// starts Draining mid-delivery, a random id does not, and once the
+    /// delivery has ended the SAME id no longer does either (design §5.2's
+    /// own claim, quoted in its doc comment).
+    #[tokio::test]
+    async fn the_delivery_request_id_is_bound_while_draining_and_unbound_once_it_ends() {
+        let path = unique_sock("c4-6");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(idx) = text.find("\r\n\r\n") {
+                    let head = text[..idx].to_owned();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().to_owned())
+                        })
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= idx + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            // Tell the test "the request is fully in" and then wait for the
+            // test's go-ahead before answering — so the delivery is
+            // genuinely still in flight while the test drives the generation
+            // into Draining and probes `admit_callback_bound`.
+            let _ = read_tx.send(());
+            let _ = release_rx.await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        });
+        let generation = running_generation(path);
+        let call_generation = Arc::clone(&generation);
+        // `ids()` mints a fresh `KernelRequestIds` whose first id is always
+        // `sch-aaaaaaaa-0` (its counter starts at zero) — this is the only
+        // call made against it, so that is the exact id this delivery uses.
+        let bound_id = "sch-aaaaaaaa-0";
+        let call = tokio::spawn(async move {
+            send_kernel_request(&call_generation, &ids(), fired_request(), limits(), None).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), read_rx)
+            .await
+            .expect("the module never finished reading the request")
+            .unwrap();
+
+        assert!(generation.begin_drain(Instant::now(), Duration::from_secs(30)));
+        assert!(
+            generation.admit_callback_bound(Some(bound_id)).is_ok(),
+            "the in-flight delivery's own request id must still be admitted while Draining"
+        );
+        assert_eq!(
+            generation.admit_callback_bound(Some("forged-id")).err(),
+            Some(CallbackRefused::DrainingUnknownRequest),
+            "a random id must never be admitted, Draining or not"
+        );
+
+        let _ = release_tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("send_kernel_request must finish once the module answers")
+            .unwrap();
+        assert!(
+            matches!(result, Ok(KernelResponse { status }) if status.is_success()),
+            "{result:?}"
+        );
+
+        // The delivery has ended (`InFlight::finish` ran) — the exact same id
+        // must not be admitted any more.
+        assert_eq!(
+            generation.admit_callback_bound(Some(bound_id)).err(),
+            Some(CallbackRefused::DrainingUnknownRequest),
+            "the id must stop being bound the moment the delivery ends"
+        );
+    }
+
     /// design v2 (L2), judgement **C4.13**: a 2xx head is the acknowledgement
     /// even when the body that follows blows past the response cap.
     #[tokio::test]
@@ -784,6 +949,46 @@ mod tests {
             matches!(result, Err(KernelCallError::ResponseTooLarge)),
             "{result:?}"
         );
+    }
+
+    /// Review round 1, **L3**: a non-2xx response whose body ends early for a
+    /// reason that is NOT the size limit (the module promises more bytes via
+    /// `Content-Length` than it ever sends, then hangs up) must be reported
+    /// as `ResponseBodyError`, never `ResponseTooLarge` — the body here never
+    /// gets anywhere near `limits.max_response_bytes`.
+    #[tokio::test]
+    async fn a_non_2xx_body_that_ends_early_for_a_non_size_reason_is_not_reported_as_too_large() {
+        let path = unique_sock("l3-body-error");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            // Promises 1000 bytes, sends 10, then hangs up — well under the
+            // response cap, so a length-limit read can never be the cause.
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 1000\r\n\r\n0123456789",
+                )
+                .await;
+        });
+        let generation = running_generation(path);
+        let result = send_kernel_request(
+            &generation,
+            &ids(),
+            fired_request(),
+            short_limits(Duration::from_secs(5)),
+            None,
+        )
+        .await;
+        match result {
+            Err(KernelCallError::ResponseBodyError(msg)) => {
+                assert!(!msg.is_empty(), "the body-read error must say something");
+            }
+            other => panic!("expected ResponseBodyError, got {other:?}"),
+        }
     }
 
     /// A module that never answers hits the injected (short) timeout without

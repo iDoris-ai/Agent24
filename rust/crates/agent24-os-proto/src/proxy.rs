@@ -1843,7 +1843,7 @@ fn timed_out(state: &ProxyState, which: TimedOut) -> Response {
     error_response(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", &message)
 }
 
-fn is_length_limit(e: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_length_limit(e: &(dyn std::error::Error + 'static)) -> bool {
     let mut source = Some(e);
     while let Some(err) = source {
         if err.is::<http_body_util::LengthLimitError>() {
