@@ -21,9 +21,10 @@ pub struct AuditEntry {
     pub hash: String,
 }
 
-const GENESIS: &str = "genesis";
+pub(crate) const GENESIS: &str = "genesis";
 
-fn entry_hash(prev_hash: &str, ts: &str, actor: &str, action: &str, detail: &str) -> String {
+#[rustfmt::skip]
+pub(crate) fn entry_hash(prev_hash: &str, ts: &str, actor: &str, action: &str, detail: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prev_hash.as_bytes());
     hasher.update(b"|");
