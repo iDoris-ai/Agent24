@@ -17,7 +17,7 @@ use sqlx::{Sqlite, Transaction};
 
 use crate::{Result, Store, StoreError};
 
-fn status_str(s: RunStatus) -> &'static str {
+pub(crate) fn status_str(s: RunStatus) -> &'static str {
     match s {
         RunStatus::Queued => "queued",
         RunStatus::Running => "running",
@@ -81,6 +81,54 @@ pub struct RunPatch {
     pub usage: Option<Usage>,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
+}
+
+#[allow(dead_code)]
+pub(crate) async fn transition_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    from: RunStatus,
+    to: RunStatus,
+    patch: &RunPatch,
+) -> Result<bool> {
+    check_run_transition(from, to)
+        .map_err(|_| StoreError::Conflict(format!("run {id} transition conflict")))?;
+    let result = sqlx::query(
+        "UPDATE runs SET status = ?,
+             output = COALESCE(?, output), error = COALESCE(?, error),
+             usage = COALESCE(?, usage), started_at = COALESCE(?, started_at),
+             ended_at = COALESCE(?, ended_at)
+         WHERE id = ? COLLATE BINARY AND status = ? COLLATE BINARY",
+    )
+    .bind(status_str(to))
+    .bind(
+        patch
+            .output
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(
+        patch
+            .error
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(
+        patch
+            .usage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(&patch.started_at)
+    .bind(&patch.ended_at)
+    .bind(id)
+    .bind(status_str(from))
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 impl Store {

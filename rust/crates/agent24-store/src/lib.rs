@@ -13,6 +13,7 @@ mod audit;
 mod legacy_recovery;
 mod module_approvals;
 mod repo;
+mod terminal_helpers;
 pub mod workspace_api;
 pub mod workspace_decode;
 pub(crate) mod workspace_decode_support;
