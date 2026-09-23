@@ -178,6 +178,7 @@ mod tests {
     use crate::{
         actor::{Deadlines, Phase},
         cleanup::CleanupStepError,
+        control_io::IngressError,
         output_io::{OutputWriteError, PutFrameError, WriteStep},
         target::{ExitObservation, TreeObservation},
     };
@@ -276,11 +277,21 @@ mod tests {
         o: impl IntoIterator<Item = Result<WriteStep, OutputWriteError>>,
         e: impl IntoIterator<Item = io::Result<ExitObservation>>,
     ) -> GenerationDriver<Launch, Sink, Control> {
+        d_at(r, s, p, o, e, Phase::Launching(Instant::now() + L.launch))
+    }
+    fn d_at(
+        r: Arc<Mutex<R>>,
+        s: impl IntoIterator<Item = Result<ControlStep, ControlWorkerError>>,
+        p: impl IntoIterator<Item = Result<(), ControlPermitError>>,
+        o: impl IntoIterator<Item = Result<WriteStep, OutputWriteError>>,
+        e: impl IntoIterator<Item = io::Result<ExitObservation>>,
+        phase: Phase,
+    ) -> GenerationDriver<Launch, Sink, Control> {
         GenerationDriver::new(
             ActorLaunchOrder::new(
                 Launch(r.clone(), e.into_iter().collect()),
                 Sink(r.clone(), o.into_iter().collect()),
-                Phase::Launching(Instant::now() + L.launch),
+                phase,
                 L,
             ),
             Control {
@@ -373,5 +384,278 @@ mod tests {
             Err(ActorLaunchOrderError::CleanupRequired)
         );
         assert_eq!(r.lock().unwrap().stops, vec![true]);
+    }
+
+    #[test]
+    fn eof_matrix_gracefully_stops_active_once_and_never_reopens_ingress() {
+        let n = Instant::now();
+        for phase in [
+            Phase::AwaitLaunch,
+            Phase::Launching(n + L.launch),
+            Phase::AwaitReady(n + L.ready),
+            Phase::Running,
+        ] {
+            let r = Arc::new(Mutex::new(R::default()));
+            let mut x = d_at(
+                r.clone(),
+                [Ok(ControlStep::Complete(IngressStep::Eof))],
+                [],
+                [],
+                [Ok(ExitObservation::Running), Ok(ExitObservation::Running)],
+                phase,
+            );
+
+            x.step(n).unwrap();
+            assert!(matches!(
+                x.schedule_state().phase,
+                Phase::GracefulStopping(_)
+            ));
+            x.step(n).unwrap();
+
+            let r = r.lock().unwrap();
+            assert_eq!(r.stops, vec![false]);
+            assert_eq!(r.polls, 1);
+        }
+
+        for phase in [
+            Phase::GracefulStopping(n + L.graceful),
+            Phase::ForceStopping(n + L.force),
+            Phase::Draining(n + L.drain),
+        ] {
+            let r = Arc::new(Mutex::new(R::default()));
+            r.lock().unwrap().trees.push_back(TreeObservation::Present);
+            let mut x = d_at(
+                r.clone(),
+                [Ok(ControlStep::Complete(IngressStep::Eof))],
+                [],
+                [],
+                [Ok(ExitObservation::Running)],
+                phase,
+            );
+
+            x.step(n).unwrap();
+            assert_eq!(x.schedule_state().phase, phase);
+            x.step(n).unwrap();
+
+            let r = r.lock().unwrap();
+            assert!(r.stops.iter().all(|force| *force));
+            assert_eq!(r.polls, 1);
+        }
+    }
+
+    #[test]
+    fn eof_unconfirmed_becomes_empty_only_on_confirmed_tree_evidence() {
+        let r = Arc::new(Mutex::new(R::default()));
+        r.lock().unwrap().trees.extend([
+            TreeObservation::Unconfirmed,
+            TreeObservation::ConfirmedEmpty,
+        ]);
+        let n = Instant::now();
+        let mut x = d_at(
+            r.clone(),
+            [Ok(ControlStep::Complete(IngressStep::Eof))],
+            [],
+            [],
+            [],
+            Phase::Unconfirmed,
+        );
+
+        x.step(n).unwrap();
+        assert_eq!(x.schedule_state().phase, Phase::Unconfirmed);
+        x.step(n).unwrap();
+        assert_eq!(x.schedule_state().phase, Phase::Empty);
+
+        let r = r.lock().unwrap();
+        assert!(r.stops.iter().all(|force| *force));
+        assert_eq!((r.polls, r.cleanups), (1, 2));
+    }
+
+    #[test]
+    fn completion_survives_retained_exit_and_exit_precedes_its_reply() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let n = Instant::now();
+        let mut x = d(
+            r.clone(),
+            [Ok(ControlStep::Complete(IngressStep::Request(
+                Request::IsEmpty {
+                    version: PROTOCOL_VERSION,
+                    request_id: 41,
+                },
+            )))],
+            [],
+            [
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+            ],
+            [Ok(ExitObservation::Exited { code: Some(17) })],
+        );
+        prime(&mut x, n);
+        x.actor.ready(n, ready()).unwrap();
+
+        x.step(n).unwrap();
+        assert!(matches!(
+            x.completed,
+            Some(Request::IsEmpty { request_id: 41, .. })
+        ));
+        assert!(x.schedule_state().exit_retained);
+        for _ in 0..5 {
+            x.step(n).unwrap();
+        }
+        assert!(x.completed.is_none());
+
+        let r = r.lock().unwrap();
+        assert_eq!(r.stops, vec![true]);
+        assert!(matches!(
+            decode_reply(&r.frames[0]),
+            Ok(Reply::Owned { .. })
+        ));
+        assert!(matches!(
+            decode_event(&r.frames[1]),
+            Ok(Event::Ready { .. })
+        ));
+        assert!(matches!(
+            decode_event(&r.frames[2]),
+            Ok(Event::Exit { code: Some(17), .. })
+        ));
+        assert!(matches!(
+            decode_reply(&r.frames[3]),
+            Ok(Reply::Empty {
+                request_id: 41,
+                empty: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            r.frames
+                .iter()
+                .filter(|frame| matches!(decode_event(frame), Ok(Event::Exit { .. })))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn second_completion_fails_closed_without_replacing_the_first_slot() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let n = Instant::now();
+        let a = sig(101);
+        let b = sig(102);
+        let mut x = d(
+            r.clone(),
+            [
+                Ok(ControlStep::Complete(IngressStep::Request(a.clone()))),
+                Ok(ControlStep::Complete(IngressStep::Request(b))),
+            ],
+            [],
+            [Ok(WriteStep::Complete)],
+            [],
+        );
+        prime(&mut x, n);
+        reply(&mut x, 9);
+
+        x.step(n).unwrap();
+        assert_eq!(x.completed, Some(a));
+        assert_eq!(x.step(n), Err(ActorLaunchOrderError::CleanupRequired));
+        assert_eq!(x.completed, Some(sig(101)));
+        assert!(x.control_eof);
+        x.step(n).unwrap();
+        assert_eq!(x.schedule_state().phase, Phase::Empty);
+
+        let r = r.lock().unwrap();
+        assert_eq!((r.polls, r.stops.clone()), (2, vec![true]));
+        assert_eq!(r.frames.len(), 2);
+        assert!(matches!(
+            decode_reply(&r.frames[1]),
+            Ok(Reply::Result { request_id: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn closed_permit_retries_cleanup_through_reap_and_tree_evidence() {
+        let r = Arc::new(Mutex::new(R::default()));
+        {
+            let mut r = r.lock().unwrap();
+            r.stop_errors.push_back(io::ErrorKind::WouldBlock);
+            r.reap_errors.push_back(io::ErrorKind::Interrupted);
+            r.trees.extend([
+                TreeObservation::Unconfirmed,
+                TreeObservation::Unconfirmed,
+                TreeObservation::ConfirmedEmpty,
+            ]);
+        }
+        let n = Instant::now();
+        let mut x = d(
+            r.clone(),
+            [Ok(ControlStep::Idle)],
+            [Err(ControlPermitError::Closed)],
+            [],
+            [],
+        );
+
+        x.step(n).unwrap();
+        assert_eq!(x.failure, FailureState::DeferredTransport);
+        assert_eq!(x.step(n), Err(ActorLaunchOrderError::CleanupRequired));
+        assert_eq!(x.failure, FailureState::LatchedTransport);
+        assert_eq!(
+            x.step(n),
+            Err(ActorLaunchOrderError::Reap(io::ErrorKind::Interrupted))
+        );
+        x.step(n + L.force).unwrap();
+        x.step(n + L.force + L.drain).unwrap();
+        assert_eq!(x.schedule_state().phase, Phase::Unconfirmed);
+        x.step(n + L.force + L.drain + L.drain).unwrap();
+        assert_eq!(x.schedule_state().phase, Phase::Empty);
+
+        let r = r.lock().unwrap();
+        assert_eq!((r.polls, r.permits), (1, 1));
+        assert_eq!(r.stops, vec![true, true]);
+        assert_eq!(r.cleanups, 4);
+    }
+
+    #[test]
+    fn fatal_control_table_latches_pending_output_but_empty_still_drains_it() {
+        let n = Instant::now();
+        for error in [
+            ControlWorkerError::TimedOut,
+            ControlWorkerError::Ingress(IngressError::Io(io::ErrorKind::InvalidData)),
+            ControlWorkerError::Closed,
+        ] {
+            let r = Arc::new(Mutex::new(R::default()));
+            let mut x = d(r.clone(), [Err(error)], [], [Ok(WriteStep::Complete)], []);
+            prime(&mut x, n);
+            reply(&mut x, 55);
+
+            assert_eq!(x.step(n), Err(ActorLaunchOrderError::CleanupRequired));
+            assert!(x.schedule_state().terminal);
+            assert!(x.schedule_state().output_pending);
+            assert_eq!(r.lock().unwrap().stops, vec![true]);
+            assert_eq!(r.lock().unwrap().frames.len(), 1);
+        }
+
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut x = d(
+            r.clone(),
+            [Err(ControlWorkerError::Closed)],
+            [],
+            [Ok(WriteStep::Complete)],
+            [],
+        );
+        empty(&mut x, &r, n);
+        reply(&mut x, 56);
+
+        x.step(n).unwrap();
+        assert!(x.schedule_state().output_pending);
+        x.step(n).unwrap();
+        assert!(!x.schedule_state().output_pending);
+
+        let r = r.lock().unwrap();
+        assert!(r.stops.is_empty());
+        assert_eq!(r.polls, 1);
+        assert!(matches!(
+            decode_reply(&r.frames[0]),
+            Ok(Reply::Result { request_id: 56, .. })
+        ));
     }
 }
