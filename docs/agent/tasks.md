@@ -1,18 +1,69 @@
 # Agent24 任务台账 — Task
 
-## 🔴 本文件是当前唯一权威的执行状态来源（2026-09-19）
+## 🔴 本文件是当前唯一权威的执行状态来源（2026-09-19 立，2026-09-23 更新）
 
 仓库里有四份路线图/进展文档，**以谁为准只有一个答案**：
 
 | 文档 | 地位 |
 |---|---|
 | **本文件 `docs/agent/tasks.md`** | ✅ **权威**。当前在做什么、做到哪一步，以这里为准 |
-| [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀的任务定义与验收标准（§五「主链」T1–T14） |
+| [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md) | ✅ **权威**（配套，2026-09-23 起）。**ME-4 当前主线**的任务定义、技术规范（S1–S5）与验收标准 |
+| [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀（已收口）的任务定义与验收标准（§五「主链」T1–T14） |
 | [`me3-status.sh`](me3-status.sh) | ✅ **权威**（可执行）。`bash docs/agent/me3-status.sh` 直接读 `origin/main` 的代码回答「哪一刀已经在 main 上」 |
 | [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ⏸️ **暂停中**。是「未来要做什么」，不是「现在在做什么」；M1 等 v0.5.0 发布后再捡 |
 | [`../PLAN.md`](../PLAN.md) §六 Roadmap、[`../ROADMAP.md`](../ROADMAP.md) | ⛔ **已作废**。Rust 核心重写（ADR-026）之前的 Electron/Node.js 时代规划，仅供历史考古，**不要照它排期** |
 
-**当前执行**：ME-3（进程外领域 OS）专项，目标 v0.5.0。
+**当前执行（2026-09-23 起）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
+定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
+
+## ME-4 台账（2026-09-23 立；本表是 ME-4 唯一的状态来源）
+
+> 定义/验收在 PLAN-ME4 §三；Sin90 侧 task 的定义与状态在 `iDoris-ai/Sin90` 的 `docs/agent/tasks.md`，这里只记**门**。
+> 状态：BACKLOG · READY · IN_PROGRESS · BLOCKED · PR_OPEN · CHANGES_REQUESTED · APPROVED · DONE。推进时回填 PR/commit。
+
+| ID | 仓库 | 任务 | 依赖 | 状态 | 证据 |
+|---|---|---|---|---|---|
+| ME4-0.1 | Sin90 | 合并已批准的 #2/#3/#4（Sin90 T0.1） | — | `READY` | |
+| ME4-0.2 | 两仓 | 合并本规划 PR（Agent24 `docs/me4-plan-2026-09-23` / Sin90 `docs/pilot-me4-plan`） | — | `PR_OPEN`（开 PR 后回填） | |
+| ME4-0.3 | Sin90 | CI + 陈旧文档（Sin90 T0.2/T0.3） | 0.1 | `BACKLOG` | |
+| ME4-0.4 | Sin90 | Codex 补审历史改动（Sin90 T0.4） | 0.1 | `BACKLOG` | |
+| ME4-1.1.1 | Agent24 | 调度回调设计冻结 + SPEC 改写 | 0.2 | `BACKLOG` | |
+| ME4-1.2.1 | Agent24 | schedules 存储层（owner/key/revision/暂停三态 + 并发安全 upsert + `schedule_deliveries`） | 1.1.1 | `BACKLOG` | |
+| ME4-1.2.2 | Agent24 | `ScheduleInvocation`/`FireOutcome` + REST 护栏 | 1.2.1 | `BACKLOG` | |
+| ME4-1.3.1 | Agent24 | fired 投递器（InFlight 准入 + dispatch、确定性 fire_id、重启续投、Deferred 不计失败、scheduler 挪到 mount_all 后） | 1.2.2 | `BACKLOG` | |
+| ME4-1.3.2 | Agent24 | 代理保留 `/_a24/` 路径（规范化后判定） | 1.1.1 | `BACKLOG` | |
+| ME4-1.4.1 | Agent24 | `_a24/scheduler/*` handler + 授权/配额/限流 | 1.2.1 | `BACKLOG` | |
+| ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `BACKLOG` | |
+| ME4-M2 门 | Sin90 | Sin90 M3（T3.1.1–T3.5.1）全 DONE | 1.5.1, 0.1 | `BACKLOG` | |
+| ME4-M3 门 | Sin90 | Sin90 M4（T4.1.1–T4.4.1）全 DONE | M2 门 | `BACKLOG` | |
+| ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `BACKLOG`（可与 M2/M3 并行） | |
+| ME4-4.2.1 | Agent24 | `model_access` manifest 字段 + Models 授权 | 4.1.1, 1.5.1 | `BACKLOG` | |
+| ME4-4.2.2a | Agent24 | `agent24-models` 契约扩展（max_tokens / model_id） | 4.1.1 | `BACKLOG` | |
+| ME4-4.2.2b | Agent24 | `_a24/model/complete` handler | 4.2.1, 4.2.2a, 1.5.1 | `BACKLOG` | |
+| ME4-4.2.3 | Agent24 | 按模块持久化用量 | 4.2.2b | `BACKLOG` | |
+| ME4-4.3.1 | Agent24 | 推理黑盒验收 + 探针 `4b` | 4.2.2b, 4.2.3 | `BACKLOG` | |
+| ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `BACKLOG` | |
+| ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `BACKLOG` | |
+| ME4-5.1.2a | Agent24 | SDK transport + 握手（只经 proto）+ 结构测试 | 5.1.1 | `BACKLOG` | |
+| ME4-5.1.2b | Agent24 | SDK 五种类型化客户端 | 5.1.2a | `BACKLOG` | |
+| ME4-5.1.2c | Agent24 | fired 注册点 + example + tag + 探针 `4c` | 5.1.2b | `BACKLOG` | |
+| ME4-5.2.1 | Sin90 | Sin90 迁到 SDK（Sin90 TS.1.1） | 5.1.2c | `BACKLOG` | |
+| ME4-5.3.1 | Cos72 | Cos72 仓库 pilot 七件套 | 5.1.2c | `BACKLOG` | |
+| ME4-5.3.2 | Cos72 | 骨架（manifest + SDK 挂载 + 迁移 + 事件） | 5.3.1 | `BACKLOG` | |
+| ME4-5.3.3a | Cos72 | mytask 实体与路由 | 5.3.2 | `BACKLOG` | |
+| ME4-5.3.3b | Cos72 | 审批发积分 + 账本回放 + 摘要进记忆 | 5.3.3a | `BACKLOG` | |
+| ME4-5.3.4 | Cos72 | Cos72 真实挂载黑盒（含与 Sin90 共存隔离） | 5.3.3b, 5.2.1 | `BACKLOG` | |
+| ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2c | `BACKLOG` | |
+| ME4-6.0.1 | Agent24 | 冻结 v0.5.0 专用发布清单 | 5.3.4, 5.4.1 | `BACKLOG` | |
+| ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `BACKLOG` | |
+| ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `BACKLOG` | |
+| ME4-6.1.2 | Agent24 | 发布 v0.5.0 | 6.1.1 | `BACKLOG` | |
+| ME4-6.1.3 | Mac mini | 干净机器只用发布物安装验收 | 6.1.2 | `BACKLOG` | |
+| ME4-6.1.4 | 三仓 | 最终台账收口 PR（本轮最后一个 PR） | 6.1.3 | `BACKLOG` | |
+
+**需要用户手动做**（不是 goal task）：给 `iDoris-ai/Sin90` 与 `MushroomDAO/Cos72` 的 main 开 ruleset（1 个审批 + dismiss stale）。
+
+> 台账回填规则（PLAN-ME4 §一 第 7 条）：task PR 合并后，`DONE`/证据由下一个 PR 顺带回填，或攒到 ME4-6.1.4 的最终台账收口 PR。
 
 **T8.5c-W-wire 实现已完成**（`DONE` — [#224](https://github.com/iDoris-ai/Agent24/pull/224)+[#225](https://github.com/iDoris-ai/Agent24/pull/225)，2026-09-19；语义说明 [`T8.5c-W-wire.md`](../design/T8.5c-W-wire.md) v5，5 轮设计评审冻结；代码 2 轮 Codex 代码评审——首轮 5 Medium(判据覆盖面问题，未发现生产代码缺陷)，修复后二轮 approve，另发现 1 Low(超时预算 50ms→300ms)已修复）：`Generation::admit_callback_bound`（#224，修复真实 TOCTOU 竞态，单锁内原子完成"准入+取绑定生命周期"）+ `memory_callback.rs` 的 `RememberHandler`/`RecallHandler`/`RecentHandler` 三个 Handler、`map_memory_error` 结构性 default-deny 堵住 `QuotaExceeded` 的 owner/partition key 泄露、`_a24/memory/scoped/*` 不注册产出 `-32601`（#225）。`cargo test --workspace`：1300 passed。**已知覆盖缺口**（Codex 确认风险可接受，留作后续 follow-up）：真实子进程握手验证 `Offer.provides` 包含 memory 能力这条端到端测试未覆盖，不影响生产代码正确性。
 
@@ -30,7 +81,9 @@
 
 **T11（Sin90 迁出内核）`DONE`** — [#342](https://github.com/iDoris-ai/Agent24/pull/342)（`bb9b9d5`，2026-09-22；`clestons` APPROVED，CI 全绿后合并）：删掉编译进内核的 `agent24-sin90{,-os,-store}` 三个 crate（`agent24d`/`agent24-cli`/`agent24-protocol` 相应接线一并清理，净减 ~5000 行）。合并前已独立编译该分支二进制、跑通 Sin90 侧真实端到端挂载黑盒测试（`AGENT24_CHECKOUT` 指向该分支 → `agent24_mount_blackbox.rs --ignored`：挂载/代理/路由行为不变/事件转发 4 条判据全过）。配套的 [#343](https://github.com/iDoris-ai/Agent24/pull/343)（2026-09-20 待办快照文档）同日合并。
 
-## 🔴 2026-09-22 待办清单（下次先核实再用）
+## 🔴 2026-09-22 待办清单 —— ⛔ 已被上方「ME-4 台账」取代（2026-09-23）
+
+> 逐条去向：P0 Codex 补审 → ME4-0.4；P1 `SIN90-PET0-INTEGRATION.md` 重写 → 已由 #357 合并；T10/T12/T13/T14 → ME4-5.x / ME4-6.x。下面保留原文作历史。
 
 - **P0，Codex 额度已恢复（原定 2026-09-22 19:18，现已过点）**：`iDoris-ai/Sin90` 的 M0/M1/M2/挂载修复（commit `0d66f24`/`4032e82`/`8056ade`/`ab66b37`）目前只经过本地自审，没有真正的对抗式评审——尤其挂载修复里的 actor-key 门禁安全问题（`ab66b37`），应该优先送审。
 - **P1**：`docs/SIN90-PET0-INTEGRATION.md` 整篇假设"内核内置 Sin90"，T11 #342 已合并，这个假设已不成立，需要独立重写。

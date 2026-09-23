@@ -83,6 +83,19 @@ allow ⟺ space == SpaceId::module_private(req.module)
 
 **跟今天完全等价。** 它不是 access control，也不许被描述成 access control。
 
+## ME-4 新增边界（2026-09-23，与下面的既有边界同等效力）
+
+- **内核→模块只有一条路：代理通道的 UDS 上游**。调度 fired 投递复用它，不新开 socket、不走 loopback HTTP + bearer。
+- **`/api/v1/<ns>/_a24/` 是内核保留路径**：客户端请求（先规范化再判定）一律 404 不转发。代理请求侧先剥掉客户端的全部 `X-A24-*` 再注入内核头，响应侧只剥不注入。
+  它保证的是「经内核 HTTP 代理进入的外部客户端无法伪造 fired」，**不是**「fired 只可能来自内核」—— 同 UID 进程可直连模块 socket（SPEC-ME3 §0）。
+- **内核→模块的投递必须经 `Generation` 准入持有 `InFlight`**；只写 `X-A24-Request-Id` 头不构成在途请求。
+- **模块不可用 ≠ 投递失败**：Starting/Draining/Revoked/未安装时到点记 `Deferred`，不累计失败、不触发自动禁用。
+- **模块拥有的 schedules 行 owner 由内核注入**，params 没有 owner 字段；模块永远不能注册 `AgentRun`；模块投递动作不进用户可反序列化的 `ScheduleAction`，REST 不能创建它、不能改模块行的 action/owner/key/spec。
+- **用户暂停（`user_suspended`）高于模块意愿**：模块 upsert 永远不能清除它。
+- **模块调模型默认 LocalOnly**，params 里没有能改 privacy 的字段；远端只由 manifest 显式声明放开。
+- **SDK 不解析协议帧**：帧/握手/错误只在 `agent24-os-proto`，SDK 只是它之上的类型化客户端。
+- **模块的业务真相只在模块自己的 SQLite**（`~/.agent24/os/<name>/`）；模块可以显式把**派生摘要**写进自己的内核 private-memory 分区，那份副本不是真相来源。
+
 ## 不可动摇的边界
 
 - **模块永远拿不到 `KvStore`、pool、`EventLog` 或任何由它们派生的原始 store。** 拿到 `KvStore` 就等于拿到全部（events / artifacts / assertions / retriever / consolidation / knowledge / trace / vector 的访问器都挂在它上面）。

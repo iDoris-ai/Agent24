@@ -1,5 +1,12 @@
 # Agent24 Roadmap — Milestone → Feature
 
+## ▶️ 2026-09-23：当前在做 ME-4（不在本文档的 M1–M6 里）
+
+ME-3 收口、T11 交付后，用户 2026-09-23 裁决下一轮 = **ME-4 外置 OS 的内核能力面**：
+调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → `agent24-os-sdk` / Cos72 最小样例（mytask）/ wire 文档 → **v0.5.0**。
+里程碑 ME4-M0…M6 的定义与规范见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见 [`tasks.md`](tasks.md)「ME-4 台账」。
+下面 M1–M6 仍是「v0.5.0 之后」的产品路线；其中 **M4/M5 的 Cos72 将建立在 ME4-M5 的 Cos72 最小样例之上**（仓库 `MushroomDAO/Cos72`）。
+
 ## ⏸️ 2026-09-19 现状说明 —— 本文档描述的不是当前在做的事
 
 **本文档 M1–M6 的全部内容今天都未开工，且本轮不做。** 现在在做什么，见
