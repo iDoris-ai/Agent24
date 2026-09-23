@@ -137,9 +137,11 @@ AI(本地脑或 Codex)产出的一切都是 `Sin90Proposal`，经确定性校验
 这条不变。**新增的一层**（T11 迁出后才补上，`iDoris-ai/Sin90` 自己实现，不是内核）：
 
 > **Actor-Key 门禁（design §7.1，`src/http/actor.rs`）**：Sin90 自己区分"人类直写"与
-> "自动化只能走 Proposal"两种调用方——除 `GET`/`POST /proposals`/`POST
-> /proposals/{id}/accept`/`POST /capture` 外，其余直写路由(`POST /areas`、
-> `PATCH /tasks/{id}` 等)一律要求携带**人类 key**。
+> "自动化只能走 Proposal"两种调用方——自动化 key 只能用于 `POST /proposals`
+> （提交提议）和 `POST /capture`（低风险收件箱录入）；其余写操作一律要求**人类
+> key**，**包括 `POST /proposals/{id}/accept`**——自动化可以提议，但不能批准自己
+> 的提议（Sin90 #1，2026-09-23 合并；此前 accept 两种 key 都收，Codex 评审判为
+> High）。只读路由不需要 key。
 >
 > **⚠️ Pet0 集成时最容易踩的坑**：鉴权 header 是 **`x-sin90-actor-key`**，
 > **不是** `Authorization`。原因：Agent24 的受约束代理会剥掉每个转发请求的
@@ -148,8 +150,15 @@ AI(本地脑或 Codex)产出的一切都是 `Sin90Proposal`，经确定性校验
 > 直调 `router()` 的测试里才work。这是 2026-09-20 一次真实端到端挂载验证抓到的
 > 生产级 bug（`ab66b37`，已修复），Pet0 客户端从一开始就要用对的 header 名，
 > 不要照抄内核其它 API 的 `Authorization: Bearer <token>` 惯例。
-> `SIN90_HUMAN_KEY` / `SIN90_AUTOMATION_KEY` 两个环境变量对应两把 key（未设置会在
-> 启动日志打印一次性生成的随机值，生产部署务必显式设置并妥善保管）。
+>
+> **两把 key 从哪来**：挂载在 Agent24 下时，Sin90 首次启动会在自己的数据目录生成
+> `actor-keys.json`（默认 `~/.agent24/os/sin90/actor-keys.json`，权限 `0600`，
+> `human`/`automation` 两个字段），之后每次重启复用同一对 key。Pet0 壳要直写就读
+> 这个文件拿 `human` key。**key 不会出现在任何日志里**——Agent24 会转记模块的每一行
+> 输出，打日志等于泄露。`SIN90_HUMAN_KEY`/`SIN90_AUTOMATION_KEY` 环境变量只对
+> standalone 开发模式有效（Agent24 不向模块透传这两个变量）。key 文件对
+> group/other 可读、两把 key 相同或过短（<32 字符）时 Sin90 拒绝启动。
+> （Sin90 #2 起生效；#2 合并前的旧行为是每次启动重新生成并打印到日志。）
 
 ```
 AI 输出 → Sin90Proposal → 确定性校验(schema + 状态机) → 事务写入 + 产事件
@@ -204,8 +213,9 @@ AI 输出 → Sin90Proposal → 确定性校验(schema + 状态机) → 事务�
    `POST /directions`）建立第一个 Area/Direction。
 6. **只经 `agent24d` 消费 Sin90**：本地 HTTP/WS，**绝不直连 `sin90.db`、绝不直连
    Sin90 进程端口、绝不重写状态机/事件/proposal**。
-7. **鉴权**：直写请求带上正确的 `x-sin90-actor-key`（§3.3），Proposal 路由与
-   `capture`/只读路由不需要或接受自动化 key。
+7. **鉴权**：写请求带上正确的 `x-sin90-actor-key`（§3.3）：人类操作（包括批准
+   提议）用 `actor-keys.json` 里的 `human` key；壳里的自动化逻辑只能提交提议和
+   `capture`；只读路由不需要 key。
 8. **产品语义输入**：Sin90 实体字段与状态机由 Pet0 作为领域专家与 Sin90 团队共定，
    **实现权归 `iDoris-ai/Sin90`**（不再是 Agent24）。
 
@@ -251,7 +261,7 @@ PATCH            /api/v1/sin90/weeks/{id}                # 人类 key
 GET              /api/v1/sin90/weeks/{id}/attention      # 无需鉴权（只读）
 POST|GET         /api/v1/sin90/proposals                # 人类或自动化 key
 GET              /api/v1/sin90/proposals/{id}
-POST             /api/v1/sin90/proposals/{id}/accept     # 人类或自动化 key
+POST             /api/v1/sin90/proposals/{id}/accept     # 仅人类 key（自动化不能自批）
 GET              /api/v1/sin90/attention?start&end       # 无需鉴权（只读）
 GET              /api/v1/sin90/events                    # 无需鉴权（只读）
 POST             /api/v1/sin90/packs/install             # 人类 key，种子五大生活系统
