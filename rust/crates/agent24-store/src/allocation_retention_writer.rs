@@ -393,6 +393,7 @@ mod tests {
     struct GateState {
         entered: bool,
         released: bool,
+        expired: bool,
     }
 
     /// A connection-local SQLite callback gate. The deadline makes a failed
@@ -411,6 +412,8 @@ mod tests {
                 let (next, timeout) = self.changed.wait_timeout(state, GATE_WAIT).unwrap();
                 state = next;
                 if timeout.timed_out() {
+                    state.expired = true;
+                    self.changed.notify_all();
                     return;
                 }
             }
@@ -422,7 +425,14 @@ mod tests {
                 .changed
                 .wait_timeout_while(state, GATE_WAIT, |state| !state.entered)
                 .unwrap();
-            state.entered
+            state.entered && !state.expired
+        }
+
+        fn assert_not_expired(&self) {
+            assert!(
+                !self.state.lock().unwrap().expired,
+                "retention gate watchdog expired"
+            );
         }
 
         fn release(&self) {
@@ -752,6 +762,7 @@ mod tests {
             result = &mut retain => panic!("retention finished before the gate: {result:?}"),
             result = entered => assert!(matches!(result, Ok(true)), "retention gate was not entered"),
         }
+        gate.assert_not_expired();
         drop(retain);
         drop(release);
 
@@ -779,5 +790,213 @@ mod tests {
         let mut proof = store.pool().begin().await.unwrap();
         assert_eq!(caller_sentinels(&mut proof).await, "before|after");
         proof.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_wal_frozen_retention_loser_retries_observed_after_winner_outer_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retention-wal.sqlite");
+        let seed = Store::open(&path).await.unwrap();
+        let input = intent(RootIdentity::unix(&[1; 8], &[2; 8]).unwrap());
+        let reason = AllocationFailureReason::parse("io_error").unwrap();
+        source(
+            &seed,
+            &input,
+            AllocationPhase::Committed,
+            RootIdentity::unix(&[3; 8], &[4; 8]).unwrap(),
+        )
+        .await;
+        let before = raw_snapshot(&seed).await;
+        drop(seed);
+
+        // Separate Store pools plus held PoolConnections make these two physical
+        // WAL connections explicit.  No later operation may select another one.
+        let left = Store::open(&path).await.unwrap();
+        let right = Store::open(&path).await.unwrap();
+        let mut left_connection = left.pool().acquire().await.unwrap();
+        let mut right_connection = right.pool().acquire().await.unwrap();
+        for connection in [&mut left_connection, &mut right_connection] {
+            sqlx::query("PRAGMA busy_timeout=0")
+                .execute(&mut **connection)
+                .await
+                .unwrap();
+        }
+
+        let mut prepare_left = left_connection.begin().await.unwrap();
+        let left_attempt =
+            Store::prepare_allocation_retention_tx(&mut prepare_left, &input, reason.clone())
+                .await
+                .unwrap();
+        prepare_left.commit().await.unwrap();
+        let mut prepare_right = right_connection.begin().await.unwrap();
+        let right_attempt =
+            Store::prepare_allocation_retention_tx(&mut prepare_right, &input, reason.clone())
+                .await
+                .unwrap();
+        prepare_right.commit().await.unwrap();
+        let (prospective, tail) = match &left_attempt.0 {
+            Attempt::Fresh(fresh) => (fresh.prospective.clone(), fresh.tail.clone()),
+            Attempt::Replay { .. } => panic!("both attempts must freeze before any write"),
+        };
+        match &right_attempt.0 {
+            Attempt::Fresh(fresh) => {
+                assert_eq!(fresh.prospective, prospective);
+                assert!(fresh.tail == tail);
+            }
+            Attempt::Replay { .. } => panic!("both attempts must freeze before any write"),
+        }
+
+        let gate = Arc::new(RetentionGate {
+            state: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+        });
+        let release = GateRelease(gate.clone());
+        let callback_gate = gate.clone();
+        left_connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .create_collation("retention_wal_gate", move |left, right| {
+                callback_gate.enter();
+                left.cmp(right)
+            })
+            .unwrap();
+        sqlx::query(
+            "CREATE TEMP TRIGGER retention_wal_gate_update
+             AFTER UPDATE OF phase ON workspace_allocations
+             WHEN NEW.phase='retained'
+             BEGIN
+                 SELECT NEW.allocation_id COLLATE retention_wal_gate = NEW.workspace_id;
+             END",
+        )
+        .execute(&mut *left_connection)
+        .await
+        .unwrap();
+
+        let mut winner = left_connection.begin().await.unwrap();
+        let mut loser = right_connection.begin().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE retention_caller_sentinels (marker TEXT NOT NULL)")
+            .execute(&mut *loser)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO retention_caller_sentinels(marker) VALUES ('before')")
+            .execute(&mut *loser)
+            .await
+            .unwrap();
+        // Establish B's WAL read snapshot while A has not started its update.
+        assert_eq!(raw_snapshot_tx(&mut loser).await, before);
+
+        let entered_gate = gate.clone();
+        let entered = tokio::task::spawn_blocking(move || entered_gate.wait_until_entered());
+        let mut retain = Box::pin(Store::retain_allocation_tx(&mut winner, &left_attempt));
+        tokio::select! {
+            result = &mut retain => panic!("winner finished before the update gate: {result:?}"),
+            result = entered => assert!(matches!(result, Ok(true)), "winner did not reach allocation update"),
+        }
+        gate.assert_not_expired();
+
+        assert_eq!(
+            Store::retain_allocation_tx(&mut loser, &right_attempt).await,
+            Err(WorkspaceStoreError::Database),
+            "a stale WAL reader must fail only when its frozen fresh write promotes"
+        );
+        gate.assert_not_expired();
+        assert_eq!(raw_snapshot_tx(&mut loser).await, before);
+        assert_eq!(caller_sentinels(&mut loser).await, "before");
+        sqlx::query("INSERT INTO retention_caller_sentinels(marker) VALUES ('after')")
+            .execute(&mut *loser)
+            .await
+            .unwrap();
+        assert_eq!(caller_sentinels(&mut loser).await, "before|after");
+        loser.commit().await.unwrap();
+
+        drop(release);
+        assert_eq!(
+            retain.await.unwrap(),
+            AllocationRetentionResult::Applied,
+            "the gated winner owns only its savepoint"
+        );
+        gate.assert_not_expired();
+
+        // A successful savepoint is not durable: the caller's outer transaction
+        // has not committed, so B observes the exact pre-commit bytes.
+        let mut precommit_observer = right_connection.begin().await.unwrap();
+        assert_eq!(
+            caller_sentinels(&mut precommit_observer).await,
+            "before|after"
+        );
+        assert_eq!(raw_snapshot_tx(&mut precommit_observer).await, before);
+        precommit_observer.commit().await.unwrap();
+        winner.commit().await.unwrap();
+
+        let mut retry = right_connection.begin().await.unwrap();
+        let retry_before = raw_snapshot_tx(&mut retry).await;
+        assert_eq!(
+            Store::retain_allocation_tx(&mut retry, &right_attempt)
+                .await
+                .unwrap(),
+            AllocationRetentionResult::Observed
+        );
+        assert_eq!(raw_snapshot_tx(&mut retry).await, retry_before);
+        retry.commit().await.unwrap();
+
+        drop(left_connection);
+        drop(right_connection);
+        drop(left);
+        drop(right);
+        let reopened = Store::open(&path).await.unwrap();
+        let mut final_tx = reopened.pool().begin().await.unwrap();
+        crate::audit::verify_prospective_audit_tx(&mut final_tx, &prospective)
+            .await
+            .unwrap();
+        crate::audit::verify_prospective_tail_tx(&mut final_tx, &prospective)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT seq FROM sqlite_sequence WHERE name='audit_log'")
+                .fetch_one(&mut *final_tx)
+                .await
+                .unwrap(),
+            prospective.seq()
+        );
+        final_tx.commit().await.unwrap();
+        let durable = raw_snapshot(&reopened).await;
+        assert_eq!(durable, retry_before);
+        assert_eq!(durable.registry, before.registry);
+        assert_eq!(
+            durable.high_water,
+            vec![vec![
+                "'audit_log'".into(),
+                "text".into(),
+                prospective.seq().to_string(),
+                "integer".into(),
+            ]]
+        );
+        assert_eq!(
+            reopened
+                .get_workspace_allocation(input.allocation_id())
+                .await
+                .unwrap()
+                .phase(),
+            AllocationPhase::Retained
+        );
+        assert!(
+            reopened
+                .get_workspace_allocation(input.allocation_id())
+                .await
+                .unwrap()
+                .failure_reason()
+                == Some(&reason)
+        );
+        assert_eq!(
+            reopened
+                .list_audit()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.action == ACTION)
+                .count(),
+            1
+        );
     }
 }
