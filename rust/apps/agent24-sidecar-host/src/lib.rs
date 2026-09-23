@@ -13,6 +13,8 @@ mod control_io;
 #[allow(dead_code)]
 mod launch;
 #[allow(dead_code)]
+mod launch_order;
+#[allow(dead_code)]
 mod output_io;
 #[allow(dead_code)]
 mod ready_io;
