@@ -85,7 +85,7 @@ pub(crate) struct AllocationRetentionPlan {
 }
 
 impl AllocationRetentionPlan {
-    fn from_evidence(evidence: RetentionEvidence) -> WorkspaceResult<Self> {
+    pub(crate) fn from_evidence(evidence: &RetentionEvidence) -> WorkspaceResult<Self> {
         let reason = evidence.allocation.failure_reason().cloned().ok_or(
             WorkspaceStoreError::CorruptRow {
                 table: "workspace_allocations",
@@ -99,7 +99,7 @@ impl AllocationRetentionPlan {
             source: evidence.source_phase,
             replay: AllocationReplay::from_record(&evidence.allocation),
             root_cas: NullableRootCas::from_record(&evidence.allocation),
-            registry: evidence.workspace,
+            registry: evidence.workspace.clone(),
         })
     }
 
@@ -165,7 +165,7 @@ impl Store {
         intent: &crate::AllocationIntent,
     ) -> WorkspaceResult<AllocationRetentionPlan> {
         let evidence = Self::retained_allocation_evidence_tx(tx, intent).await?;
-        AllocationRetentionPlan::from_evidence(evidence)
+        AllocationRetentionPlan::from_evidence(&evidence)
     }
 
     /// Build a read-only retained-allocation plan in a short transaction.
