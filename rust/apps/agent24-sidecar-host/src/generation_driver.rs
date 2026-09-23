@@ -12,6 +12,9 @@ use crate::{
         ScheduleState,
     },
     output_worker::OutputWorker,
+    ready_read_worker::{
+        ReadyRead, ReadyReadError, ReadyReadPermitError, ReadyReadStep, ReadyReadWorker,
+    },
 };
 
 /// Only the detached worker is admitted: never synchronous `OutputWriter`.
@@ -32,6 +35,20 @@ impl ControlPort for ControlWorker {
     }
 }
 
+/// Private channel-only adapter for the generation's one stdout reader.
+trait ReadyPort {
+    fn step(&mut self) -> Result<ReadyReadStep, ReadyReadError>;
+    fn permit(&mut self) -> Result<(), ReadyReadPermitError>;
+}
+impl ReadyPort for ReadyReadWorker {
+    fn step(&mut self) -> Result<ReadyReadStep, ReadyReadError> {
+        Self::step(self)
+    }
+    fn permit(&mut self) -> Result<(), ReadyReadPermitError> {
+        Self::permit(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureState {
     None,
@@ -40,28 +57,46 @@ enum FailureState {
 }
 
 /// One actor, one control port, and exactly one completed request slot.
-pub(crate) struct GenerationDriver<L, S, C> {
+pub(crate) struct GenerationDriver<L, S, C, R> {
     actor: ActorLaunchOrder<L, S>,
     control: C,
+    ready: R,
     completed: Option<Request>,
     control_eof: bool,
+    ready_eof: bool,
     failure: FailureState,
 }
 
 #[allow(private_bounds)]
-impl<L, S, C> GenerationDriver<L, S, C>
+impl<L, S, C, R> GenerationDriver<L, S, C, R>
 where
     L: LaunchIdentity + LaunchControl,
     S: GenerationSink,
     C: ControlPort,
+    R: ReadyPort,
 {
-    pub(crate) fn new(actor: ActorLaunchOrder<L, S>, control: C) -> Self {
+    /// Admit `Owned` before the first turn while retaining all owners for cleanup.
+    pub(crate) fn new(
+        mut actor: ActorLaunchOrder<L, S>,
+        control: C,
+        ready: R,
+        now: Instant,
+    ) -> Self {
+        actor.begin_turn();
+        let failure = if actor.queue_owned(now).is_ok() {
+            FailureState::None
+        } else {
+            // `queue_owned` forced containment; retain owners for retry/reap.
+            FailureState::LatchedTransport
+        };
         Self {
             actor,
             control,
+            ready,
             completed: None,
             control_eof: false,
-            failure: FailureState::None,
+            ready_eof: false,
+            failure,
         }
     }
 
@@ -69,8 +104,9 @@ where
         self.actor.schedule_state()
     }
 
-    /// One turn: failure cleanup; one poll; one lifecycle path; output
-    /// barrier; at most one dispatch; then at most one final permit.
+    /// One turn: control poll/EOF; one lifecycle path; a Ready poll only for
+    /// an active generation; output barrier; at most one dispatch; then at
+    /// most one Ready credit followed by one control credit.
     pub(crate) fn step(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError> {
         self.actor.begin_turn();
         if self.failure == FailureState::DeferredTransport {
@@ -125,16 +161,44 @@ where
             return maintenance.map(|_| ());
         }
         let exit_barrier = state.exit_retained;
+        if !exit_barrier
+            && !self.ready_eof
+            && matches!(
+                state.phase,
+                crate::actor::Phase::AwaitReady(_) | crate::actor::Phase::Running
+            )
+        {
+            match self.ready.step() {
+                Ok(ReadyReadStep::Idle | ReadyReadStep::Pending)
+                | Ok(ReadyReadStep::Complete(ReadyRead::Pending)) => {}
+                Ok(ReadyReadStep::Complete(ReadyRead::Chunk { bytes, len })) => {
+                    self.actor.ready(now, &bytes[..len])?;
+                }
+                Ok(ReadyReadStep::Complete(ReadyRead::Eof)) => {
+                    self.ready_eof = true;
+                    self.actor.ready_eof(now)?;
+                }
+                Err(_) => {
+                    self.ready_eof = true;
+                    self.latch_transport(now);
+                    return Err(ActorLaunchOrderError::CleanupRequired);
+                }
+            }
+        }
+        let state = self.schedule_state();
+        if state.terminal {
+            return Ok(());
+        }
         if state.output_pending {
             self.actor.output_step(now)?;
-            if exit_barrier || self.schedule_state().terminal {
-                return maintenance.map(|_| ());
-            }
             maintenance?;
+            if exit_barrier || self.schedule_state().exit_retained {
+                return Ok(());
+            }
             return self.permit_last(now);
         }
-        if exit_barrier {
-            return maintenance.map(|_| ());
+        if state.exit_retained {
+            return maintenance;
         }
         maintenance?;
         self.actor.dispatch_completed(&mut self.completed, now)?;
@@ -145,6 +209,24 @@ where
     }
 
     fn permit_last(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError> {
+        let state = self.schedule_state();
+        if !self.ready_eof
+            && !state.terminal
+            && !state.exit_retained
+            && matches!(
+                state.phase,
+                crate::actor::Phase::AwaitReady(_) | crate::actor::Phase::Running
+            )
+        {
+            match self.ready.permit() {
+                Ok(()) | Err(ReadyReadPermitError::Busy) => {}
+                Err(ReadyReadPermitError::Closed) => {
+                    self.ready_eof = true;
+                    self.failure = FailureState::DeferredTransport;
+                    return Ok(());
+                }
+            }
+        }
         if self.control_eof || self.completed.is_some() || !self.actor.control_permit_allowed() {
             return Ok(());
         }
@@ -208,6 +290,9 @@ mod tests {
         trees: VecDeque<TreeObservation>,
         polls: usize,
         permits: usize,
+        ready_polls: usize,
+        ready_permits: usize,
+        reject_puts: usize,
         frames: Vec<Vec<u8>>,
     }
     struct Launch(Arc<Mutex<R>>, VecDeque<io::Result<ExitObservation>>);
@@ -247,7 +332,12 @@ mod tests {
     struct Sink(Arc<Mutex<R>>, VecDeque<Result<WriteStep, OutputWriteError>>);
     impl FrameSink for Sink {
         fn put(&mut self, f: Vec<u8>, _: Instant) -> Result<(), PutFrameError> {
-            self.0.lock().unwrap().frames.push(f);
+            let mut r = self.0.lock().unwrap();
+            if r.reject_puts > 0 {
+                r.reject_puts -= 1;
+                return Err(PutFrameError::Closed(f));
+            }
+            r.frames.push(f);
             Ok(())
         }
         fn step(&mut self, _: Instant) -> Result<WriteStep, OutputWriteError> {
@@ -270,13 +360,28 @@ mod tests {
             self.p.pop_front().unwrap_or(Ok(()))
         }
     }
+    struct Ready {
+        r: Arc<Mutex<R>>,
+        s: VecDeque<Result<ReadyReadStep, ReadyReadError>>,
+        p: VecDeque<Result<(), ReadyReadPermitError>>,
+    }
+    impl ReadyPort for Ready {
+        fn step(&mut self) -> Result<ReadyReadStep, ReadyReadError> {
+            self.r.lock().unwrap().ready_polls += 1;
+            self.s.pop_front().unwrap_or(Ok(ReadyReadStep::Idle))
+        }
+        fn permit(&mut self) -> Result<(), ReadyReadPermitError> {
+            self.r.lock().unwrap().ready_permits += 1;
+            self.p.pop_front().unwrap_or(Ok(()))
+        }
+    }
     fn d(
         r: Arc<Mutex<R>>,
         s: impl IntoIterator<Item = Result<ControlStep, ControlWorkerError>>,
         p: impl IntoIterator<Item = Result<(), ControlPermitError>>,
         o: impl IntoIterator<Item = Result<WriteStep, OutputWriteError>>,
         e: impl IntoIterator<Item = io::Result<ExitObservation>>,
-    ) -> GenerationDriver<Launch, Sink, Control> {
+    ) -> GenerationDriver<Launch, Sink, Control, Ready> {
         d_at(r, s, p, o, e, Phase::Launching(Instant::now() + L.launch))
     }
     fn d_at(
@@ -286,19 +391,66 @@ mod tests {
         o: impl IntoIterator<Item = Result<WriteStep, OutputWriteError>>,
         e: impl IntoIterator<Item = io::Result<ExitObservation>>,
         phase: Phase,
-    ) -> GenerationDriver<Launch, Sink, Control> {
+    ) -> GenerationDriver<Launch, Sink, Control, Ready> {
+        let actor = ActorLaunchOrder::new(
+            Launch(r.clone(), e.into_iter().collect()),
+            Sink(r.clone(), o.into_iter().collect()),
+            phase,
+            L,
+        );
+        let control = Control {
+            r: r.clone(),
+            s: s.into_iter().collect(),
+            p: p.into_iter().collect(),
+        };
+        let ready = Ready {
+            r,
+            s: VecDeque::new(),
+            p: VecDeque::new(),
+        };
+        if matches!(phase, Phase::Launching(_)) {
+            GenerationDriver::new(actor, control, ready, Instant::now())
+        } else {
+            GenerationDriver {
+                actor,
+                control,
+                ready,
+                completed: None,
+                control_eof: false,
+                ready_eof: false,
+                failure: FailureState::None,
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn d_ready(
+        r: Arc<Mutex<R>>,
+        control_steps: impl IntoIterator<Item = Result<ControlStep, ControlWorkerError>>,
+        control_permits: impl IntoIterator<Item = Result<(), ControlPermitError>>,
+        ready_steps: impl IntoIterator<Item = Result<ReadyReadStep, ReadyReadError>>,
+        ready_permits: impl IntoIterator<Item = Result<(), ReadyReadPermitError>>,
+        output: impl IntoIterator<Item = Result<WriteStep, OutputWriteError>>,
+        exits: impl IntoIterator<Item = io::Result<ExitObservation>>,
+        now: Instant,
+    ) -> GenerationDriver<Launch, Sink, Control, Ready> {
         GenerationDriver::new(
             ActorLaunchOrder::new(
-                Launch(r.clone(), e.into_iter().collect()),
-                Sink(r.clone(), o.into_iter().collect()),
-                phase,
+                Launch(r.clone(), exits.into_iter().collect()),
+                Sink(r.clone(), output.into_iter().collect()),
+                Phase::Launching(now + L.launch),
                 L,
             ),
             Control {
-                r,
-                s: s.into_iter().collect(),
-                p: p.into_iter().collect(),
+                r: r.clone(),
+                s: control_steps.into_iter().collect(),
+                p: control_permits.into_iter().collect(),
             },
+            Ready {
+                r,
+                s: ready_steps.into_iter().collect(),
+                p: ready_permits.into_iter().collect(),
+            },
+            now,
         )
     }
     fn sig(id: u64) -> Request {
@@ -312,16 +464,24 @@ mod tests {
         br#"{"type":"ready","protocol":1,"port":1,"token":"tttttttttttttttttttttttttttttttt","version":"v"}
 "#
     }
-    fn prime(x: &mut GenerationDriver<Launch, Sink, Control>, n: Instant) {
-        x.actor.queue_owned(n).unwrap();
+    fn chunk(input: &[u8]) -> [u8; crate::ready_read_worker::READ_CHUNK_BYTES] {
+        let mut bytes = [0; crate::ready_read_worker::READ_CHUNK_BYTES];
+        bytes[..input.len()].copy_from_slice(input);
+        bytes
+    }
+    fn prime(x: &mut GenerationDriver<Launch, Sink, Control, Ready>, n: Instant) {
         x.actor.output_step(n).unwrap();
     }
-    fn empty(x: &mut GenerationDriver<Launch, Sink, Control>, r: &Arc<Mutex<R>>, n: Instant) {
+    fn empty(
+        x: &mut GenerationDriver<Launch, Sink, Control, Ready>,
+        r: &Arc<Mutex<R>>,
+        n: Instant,
+    ) {
         x.actor.stop(true, n).unwrap();
         x.actor.cleanup_tick(n).unwrap();
         r.lock().unwrap().stops.clear()
     }
-    fn reply(x: &mut GenerationDriver<Launch, Sink, Control>, id: u64) {
+    fn reply(x: &mut GenerationDriver<Launch, Sink, Control, Ready>, id: u64) {
         x.actor
             .queue_reply(&Reply::Result {
                 version: 1,
@@ -332,10 +492,39 @@ mod tests {
 
     #[rustfmt::skip] #[test] fn owned_ready_exit_order(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[],[],[Ok(WriteStep::Complete);3],[Ok(ExitObservation::Running),Ok(ExitObservation::Exited{code:Some(9)})]);prime(&mut x,n);x.actor.ready(n,ready()).unwrap();for _ in 0..3{x.step(n).unwrap()}let f=&r.lock().unwrap().frames;assert!(matches!(decode_reply(&f[0]),Ok(Reply::Owned{..})));assert!(matches!(decode_event(&f[1]),Ok(Event::Ready{..})));assert!(matches!(decode_event(&f[2]),Ok(Event::Exit{code:Some(9),..})));}
     #[rustfmt::skip] #[test] fn output_barrier_retains_request_and_one_credit(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Ok(ControlStep::Complete(IngressStep::Request(sig(11))))],[],[Ok(WriteStep::Complete),Ok(WriteStep::Pending),Ok(WriteStep::Complete)],[]);prime(&mut x,n);reply(&mut x,10);x.step(n).unwrap();assert!(x.completed.is_some());for _ in 0..3{x.step(n).unwrap()}assert!(x.completed.is_none());x.step(n).unwrap();let f=&r.lock().unwrap().frames;assert!(matches!(decode_reply(&f[1]),Ok(Reply::Result{request_id:10,..})));assert!(matches!(decode_reply(&f[2]),Ok(Reply::Result{request_id:11,..})));let r=Arc::new(Mutex::new(R::default()));let mut x=d(r.clone(),[Ok(ControlStep::Idle)],[Ok(())],[Ok(WriteStep::Complete)],[]);prime(&mut x,n);x.step(n).unwrap();let s=r.lock().unwrap();assert_eq!((s.polls,s.permits),(1,1));}
-    #[rustfmt::skip] #[test] fn deadlines_and_force_are_once_per_turn(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[],[],[Ok(WriteStep::Pending)],[]);x.actor.queue_owned(n).unwrap();x.step(n+L.ready).unwrap();assert!(matches!(x.schedule_state().phase,Phase::ForceStopping(_)));assert_eq!(r.lock().unwrap().stops,vec![true]);let r=Arc::new(Mutex::new(R::default()));r.lock().unwrap().stop_errors.push_back(io::ErrorKind::WouldBlock);let mut x=d(r.clone(),[],[],[Err(OutputWriteError::Closed)],[]);x.actor.queue_owned(n).unwrap();assert_eq!(x.step(n+L.ready),Err(ActorLaunchOrderError::CleanupRequired));assert_eq!(r.lock().unwrap().stops,vec![true]);}
-    #[rustfmt::skip] #[test] fn eof_stops_running_and_closed_empty_drains(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Ok(ControlStep::Complete(IngressStep::Eof))],[],[Ok(WriteStep::Complete)],[Ok(ExitObservation::Running)]);prime(&mut x,n);x.actor.ready(n,ready()).unwrap();x.step(n).unwrap();assert_eq!(r.lock().unwrap().stops,vec![false]);let r=Arc::new(Mutex::new(R::default()));let mut x=d(r.clone(),[Err(ControlWorkerError::Closed)],[],[Ok(WriteStep::Complete)],[]);empty(&mut x,&r,n);reply(&mut x,8);x.step(n).unwrap();x.step(n).unwrap();let s=r.lock().unwrap();assert!(s.stops.is_empty());assert_eq!((s.polls,s.frames.len()),(1,1));}
+    #[test]
+    fn deadlines_and_force_are_once_per_turn() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_ready(r.clone(), [], [], [], [], [Ok(WriteStep::Pending)], [], now);
+        x.step(now + L.ready).unwrap();
+        assert!(matches!(x.schedule_state().phase, Phase::ForceStopping(_)));
+        assert_eq!(r.lock().unwrap().stops, vec![true]);
+
+        let r = Arc::new(Mutex::new(R::default()));
+        r.lock()
+            .unwrap()
+            .stop_errors
+            .push_back(io::ErrorKind::WouldBlock);
+        let mut x = d_ready(
+            r.clone(),
+            [],
+            [],
+            [],
+            [],
+            [Err(OutputWriteError::Closed)],
+            [],
+            now,
+        );
+        assert_eq!(
+            x.step(now + L.ready),
+            Err(ActorLaunchOrderError::CleanupRequired)
+        );
+        assert_eq!(r.lock().unwrap().stops, vec![true]);
+    }
+    #[rustfmt::skip] #[test] fn eof_stops_running_and_closed_empty_drains(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Ok(ControlStep::Complete(IngressStep::Eof))],[],[Ok(WriteStep::Complete)],[Ok(ExitObservation::Running)]);prime(&mut x,n);x.actor.ready(n,ready()).unwrap();x.step(n).unwrap();assert_eq!(r.lock().unwrap().stops,vec![false]);let r=Arc::new(Mutex::new(R::default()));let mut x=d(r.clone(),[Err(ControlWorkerError::Closed)],[],[Ok(WriteStep::Complete)],[]);empty(&mut x,&r,n);reply(&mut x,8);x.step(n).unwrap();x.step(n).unwrap();let s=r.lock().unwrap();assert!(s.stops.is_empty());assert_eq!((s.polls,s.frames.len()),(1,2));}
     #[rustfmt::skip] #[test] fn maintenance_errors_and_transport_cleanup_retry_without_starvation(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Err(ControlWorkerError::Closed)],[],[],[]);assert_eq!(x.step(n),Err(ActorLaunchOrderError::CleanupRequired));r.lock().unwrap().reap_errors.push_back(io::ErrorKind::Interrupted);assert_eq!(x.step(n),Err(ActorLaunchOrderError::Reap(io::ErrorKind::Interrupted)));x.step(n).unwrap();let s=r.lock().unwrap();assert_eq!((s.cleanups,s.stops.clone()),(2,vec![true]));drop(s);let r=Arc::new(Mutex::new(R::default()));let mut x=d(r.clone(),[],[],[Ok(WriteStep::Complete)],[Err(io::Error::from(io::ErrorKind::Interrupted)),Err(io::Error::from(io::ErrorKind::Interrupted))]);prime(&mut x,n);reply(&mut x,9);for _ in 0..2{assert_eq!(x.step(n),Err(ActorLaunchOrderError::Observe(io::ErrorKind::Interrupted)))}assert_eq!(r.lock().unwrap().frames.len(),2);}
-    #[rustfmt::skip] #[test] fn closed_permit_and_empty_output_failure_do_not_force_empty(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Ok(ControlStep::Idle)],[Err(ControlPermitError::Closed)],[],[]);x.step(n).unwrap();assert_eq!(x.step(n),Err(ActorLaunchOrderError::CleanupRequired));assert_eq!(r.lock().unwrap().stops,vec![true]);let r=Arc::new(Mutex::new(R::default()));let mut x=d(r.clone(),[],[],[Err(OutputWriteError::Closed)],[]);empty(&mut x,&r,n);reply(&mut x,10);x.step(n).unwrap();assert_eq!(x.step(n),Err(ActorLaunchOrderError::CleanupRequired));assert_eq!(x.schedule_state().phase,Phase::Empty);assert!(r.lock().unwrap().stops.is_empty());}
+    #[rustfmt::skip] #[test] fn closed_permit_and_empty_output_failure_do_not_force_empty(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Ok(ControlStep::Idle)],[Err(ControlPermitError::Closed)],[],[]);x.step(n).unwrap();assert_eq!(x.step(n),Err(ActorLaunchOrderError::CleanupRequired));assert_eq!(r.lock().unwrap().stops,vec![true]);let r=Arc::new(Mutex::new(R::default()));let mut x=d_at(r.clone(),[],[],[Err(OutputWriteError::Closed)],[],Phase::Empty);reply(&mut x,10);x.step(n).unwrap();assert_eq!(x.step(n),Err(ActorLaunchOrderError::CleanupRequired));assert_eq!(x.schedule_state().phase,Phase::Empty);assert!(r.lock().unwrap().stops.is_empty());}
 
     #[test]
     fn eof_unconfirmed_continues_maintenance_without_a_new_stop() {
@@ -371,14 +560,16 @@ mod tests {
             .stop_errors
             .push_back(io::ErrorKind::WouldBlock);
         let n = Instant::now();
-        let mut x = d(
+        let mut x = d_ready(
             r.clone(),
             [Ok(ControlStep::Complete(IngressStep::Eof))],
             [],
+            [],
+            [],
             [Err(OutputWriteError::Closed)],
             [],
+            n,
         );
-        x.actor.queue_owned(n).unwrap();
         assert_eq!(
             x.step(n + L.ready),
             Err(ActorLaunchOrderError::CleanupRequired)
@@ -635,14 +826,14 @@ mod tests {
         }
 
         let r = Arc::new(Mutex::new(R::default()));
-        let mut x = d(
+        let mut x = d_at(
             r.clone(),
             [Err(ControlWorkerError::Closed)],
             [],
             [Ok(WriteStep::Complete)],
             [],
+            Phase::Empty,
         );
-        empty(&mut x, &r, n);
         reply(&mut x, 56);
 
         x.step(n).unwrap();
@@ -657,5 +848,252 @@ mod tests {
             decode_reply(&r.frames[0]),
             Ok(Reply::Result { request_id: 56, .. })
         ));
+    }
+
+    #[test]
+    fn fragmented_ready_waits_for_owned_flush_and_then_releases_in_order() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let bytes = ready();
+        let split = bytes.len() / 2;
+        let mut x = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Idle), Ok(ControlStep::Idle)],
+            [Ok(()), Ok(())],
+            [
+                Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                    bytes: chunk(&bytes[..split]),
+                    len: split,
+                })),
+                Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                    bytes: chunk(&bytes[split..]),
+                    len: bytes.len() - split,
+                })),
+            ],
+            [Ok(()), Ok(())],
+            [Ok(WriteStep::Complete), Ok(WriteStep::Complete)],
+            [Ok(ExitObservation::Running), Ok(ExitObservation::Running)],
+            now,
+        );
+
+        x.step(now).unwrap();
+        assert_eq!(r.lock().unwrap().frames.len(), 1);
+        x.step(now).unwrap();
+
+        let r = r.lock().unwrap();
+        assert!(matches!(
+            decode_reply(&r.frames[0]),
+            Ok(Reply::Owned { .. })
+        ));
+        assert!(matches!(
+            decode_event(&r.frames[1]),
+            Ok(Event::Ready { .. })
+        ));
+        assert_eq!((r.ready_polls, r.ready_permits), (2, 2));
+    }
+
+    #[test]
+    fn ready_deadline_at_the_exact_instant_wins_before_ready_poll() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Idle)],
+            [],
+            [Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                bytes: chunk(ready()),
+                len: ready().len(),
+            }))],
+            [],
+            [Ok(WriteStep::Pending)],
+            [],
+            now,
+        );
+
+        x.step(now + L.ready).unwrap();
+        assert!(matches!(x.schedule_state().phase, Phase::ForceStopping(_)));
+        let r = r.lock().unwrap();
+        assert_eq!(r.ready_polls, 0);
+        assert_eq!(r.stops, vec![true]);
+    }
+
+    #[test]
+    fn exit_wins_over_simultaneous_control_and_ready() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Complete(IngressStep::Request(sig(88))))],
+            [],
+            [Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                bytes: chunk(ready()),
+                len: ready().len(),
+            }))],
+            [],
+            [Ok(WriteStep::Complete), Ok(WriteStep::Complete)],
+            [Ok(ExitObservation::Exited { code: Some(7) })],
+            now,
+        );
+
+        x.step(now).unwrap();
+        x.step(now).unwrap();
+        let r = r.lock().unwrap();
+        assert_eq!(r.ready_polls, 0);
+        assert!(matches!(
+            decode_reply(&r.frames[0]),
+            Ok(Reply::Owned { .. })
+        ));
+        assert!(matches!(
+            decode_event(&r.frames[1]),
+            Ok(Event::Exit { code: Some(7), .. })
+        ));
+    }
+
+    #[test]
+    fn ready_eof_after_ready_only_closes_stdout() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Idle), Ok(ControlStep::Idle)],
+            [Ok(()), Ok(())],
+            [
+                Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                    bytes: chunk(ready()),
+                    len: ready().len(),
+                })),
+                Ok(ReadyReadStep::Complete(ReadyRead::Eof)),
+            ],
+            [Ok(()), Ok(())],
+            [Ok(WriteStep::Complete), Ok(WriteStep::Complete)],
+            [Ok(ExitObservation::Running), Ok(ExitObservation::Running)],
+            now,
+        );
+
+        x.step(now).unwrap();
+        x.step(now).unwrap();
+        assert!(x.ready_eof);
+        assert_eq!(x.schedule_state().phase, Phase::Running);
+        assert!(r.lock().unwrap().stops.is_empty());
+    }
+
+    #[test]
+    fn rejected_owned_admission_retains_the_driver_for_force_and_reap_retry() {
+        let r = Arc::new(Mutex::new(R::default()));
+        {
+            let mut state = r.lock().unwrap();
+            state.reject_puts = 1;
+            state.stop_errors.push_back(io::ErrorKind::WouldBlock);
+        }
+        let now = Instant::now();
+        let mut x = GenerationDriver::new(
+            ActorLaunchOrder::new(
+                Launch(r.clone(), VecDeque::new()),
+                Sink(r.clone(), VecDeque::new()),
+                Phase::Launching(now + L.launch),
+                L,
+            ),
+            Control {
+                r: r.clone(),
+                s: VecDeque::new(),
+                p: VecDeque::new(),
+            },
+            Ready {
+                r: r.clone(),
+                s: VecDeque::new(),
+                p: VecDeque::new(),
+            },
+            now,
+        );
+
+        assert_eq!(x.failure, FailureState::LatchedTransport);
+        assert_eq!(r.lock().unwrap().stops, vec![true]);
+        x.step(now).unwrap();
+        assert_eq!(x.schedule_state().phase, Phase::Empty);
+        let state = r.lock().unwrap();
+        assert_eq!(state.stops, vec![true, true]);
+        assert_eq!((state.polls, state.ready_polls), (0, 0));
+    }
+
+    #[test]
+    fn retained_exit_output_never_grants_a_control_credit_in_its_final_turn() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_ready(
+            r.clone(),
+            [
+                Ok(ControlStep::Idle),
+                Ok(ControlStep::Idle),
+                Ok(ControlStep::Idle),
+            ],
+            [Ok(()), Ok(()), Ok(())],
+            [],
+            [],
+            [
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+            ],
+            [Ok(ExitObservation::Exited { code: Some(3) })],
+            now,
+        );
+
+        x.step(now).unwrap();
+        x.step(now).unwrap();
+        x.step(now).unwrap();
+        assert!(!x.schedule_state().exit_retained && !x.schedule_state().output_pending);
+        let state = r.lock().unwrap();
+        assert_eq!(state.permits, 0);
+        assert!(matches!(
+            decode_event(&state.frames[1]),
+            Ok(Event::Exit { code: Some(3), .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_ready_forces_once_and_ready_closed_defers_control() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Idle), Ok(ControlStep::Idle)],
+            [Ok(()), Ok(())],
+            [
+                Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                    bytes: chunk(ready()),
+                    len: ready().len(),
+                })),
+                Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                    bytes: chunk(b"pollution"),
+                    len: 9,
+                })),
+            ],
+            [Ok(()), Ok(())],
+            [Ok(WriteStep::Complete)],
+            [Ok(ExitObservation::Running), Ok(ExitObservation::Running)],
+            now,
+        );
+        x.step(now).unwrap();
+        assert_eq!(x.step(now), Err(ActorLaunchOrderError::CleanupRequired));
+        x.step(now).unwrap();
+        assert_eq!(r.lock().unwrap().stops, vec![true]);
+
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut x = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Idle)],
+            [Ok(())],
+            [Ok(ReadyReadStep::Idle)],
+            [Err(ReadyReadPermitError::Closed)],
+            [Ok(WriteStep::Complete)],
+            [Ok(ExitObservation::Running)],
+            now,
+        );
+        x.step(now).unwrap();
+        assert_eq!(x.failure, FailureState::DeferredTransport);
+        let counts = r.lock().unwrap();
+        assert_eq!((counts.ready_permits, counts.permits), (1, 0));
+        drop(counts);
+        assert_eq!(x.step(now), Err(ActorLaunchOrderError::CleanupRequired));
     }
 }
