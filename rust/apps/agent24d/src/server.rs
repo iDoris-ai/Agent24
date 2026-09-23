@@ -1293,6 +1293,9 @@ pub async fn serve(
         lease.as_ref(),
         host.as_ref().map_err(String::as_str),
         &state.module_approval_broker,
+        crate::domain::CallbackDeps {
+            scheduler: state.scheduler.clone(),
+        },
     )
     .await;
     for p in partitions.partitions() {
@@ -1999,6 +2002,9 @@ pub(crate) mod tests {
             None,
             Err("no process host in this test"),
             &test_approval_broker(&st.events).await,
+            crate::domain::CallbackDeps {
+                scheduler: st.scheduler.clone(),
+            },
         )
         .await;
         assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);

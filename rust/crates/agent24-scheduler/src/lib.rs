@@ -183,6 +183,52 @@ impl Scheduler {
         &self.installed_owners
     }
 
+    /// ME4-1.4.1 (design §6): `agent24d::scheduler_callback`'s three
+    /// `Handler`s read and write module-owned schedule rows via these three
+    /// NARROW wrappers over the store's own `upsert_module_schedule` (design
+    /// §13) rather than a broad `&Store` accessor (review round 2, L4: a
+    /// wide accessor lets a future caller reach in and bypass whatever THIS
+    /// struct's own methods keep an invariant over — `create`/`update`/
+    /// `suspend`/`resume`/the CAS'd tick path all stay the only way to touch
+    /// anything they own).
+    ///
+    /// # Errors
+    /// [`StoreError::QuotaExceeded`] (a brand-new key past `quota` rows for
+    /// this owner), or storage/serialization.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_module(
+        &self,
+        new_id: &str,
+        owner: &str,
+        key: &str,
+        desired: &agent24_store::ModuleScheduleDesired,
+        next_if_recomputed: Option<&str>,
+        now: &str,
+        quota: u32,
+    ) -> agent24_store::Result<(
+        agent24_store::UpsertOutcome,
+        agent24_store::ModuleScheduleState,
+    )> {
+        self.store
+            .upsert_module_schedule(new_id, owner, key, desired, next_if_recomputed, now, quota)
+            .await
+    }
+
+    /// # Errors
+    /// Storage.
+    pub async fn delete_module(&self, owner: &str, key: &str) -> agent24_store::Result<bool> {
+        self.store.delete_module_schedule(owner, key).await
+    }
+
+    /// # Errors
+    /// Storage/serialization.
+    pub async fn list_module(
+        &self,
+        owner: &str,
+    ) -> agent24_store::Result<Vec<agent24_store::ModuleScheduleState>> {
+        self.store.list_module_schedules(owner).await
+    }
+
     /// The delivery pump's wake signal (§5.4), for ME4-1.3.1 to `.notified()`
     /// on.
     #[must_use]
