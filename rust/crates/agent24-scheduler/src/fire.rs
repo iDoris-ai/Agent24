@@ -92,4 +92,24 @@ mod tests {
         assert_eq!(a.as_str().len(), 5 + 32);
         assert!(a.as_str().starts_with(FireId::PREFIX));
     }
+
+    /// Known-answer test (review H1): pins `FireId::derive` to the exact
+    /// bytes design §4.2 specifies, computed independently (Python
+    /// `hashlib.sha256`) rather than by re-deriving with this same code.
+    /// Mutation: dropping the `"agent24-fire-v2\0"` domain prefix, or
+    /// reordering the concatenation, changes these hashes — this test goes
+    /// red where the pure-Rust round-trip test above cannot (it only checks
+    /// internal consistency, never an external oracle).
+    #[test]
+    fn known_answer_matches_the_independently_computed_design_hash() {
+        let t = parse_iso("2026-09-23T09:00:00Z").unwrap();
+        assert_eq!(
+            FireId::derive(FireTrigger::Tick, "sch_A", t).as_str(),
+            "fire_8d5458c6d9386057e407072576e2d791"
+        );
+        assert_eq!(
+            FireId::derive(FireTrigger::RunNow, "sch_A", t).as_str(),
+            "fire_f70986e012407d1b55f90f173b1d1a8e"
+        );
+    }
 }

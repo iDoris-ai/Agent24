@@ -28,9 +28,23 @@ impl InstalledOwners {
         self.0.get().is_none_or(|set| set.contains(owner))
     }
 
-    /// Idempotent: a second call is a no-op (mirrors `OnceLock::set`).
+    /// Idempotent: a second call is a no-op (mirrors `OnceLock::set`) — but a
+    /// SECOND call is never expected in production (design: set exactly once,
+    /// right after `mount_all`, before the tick loop starts). Review L5: a
+    /// caller bug that calls this twice (e.g. two racing startup paths) would
+    /// otherwise silently keep the FIRST set and drop the second — surface it
+    /// loudly rather than let a wrong catalogue silently win.
     pub fn set(&self, owners: HashSet<String>) {
-        let _ = self.0.set(owners);
+        if self.0.set(owners).is_err() {
+            tracing::warn!(
+                "InstalledOwners::set called more than once; the first call wins, this one was \
+                 dropped — set should happen exactly once, right after mount_all"
+            );
+            debug_assert!(
+                false,
+                "InstalledOwners::set called twice — should be set exactly once, after mount_all"
+            );
+        }
     }
 }
 
@@ -51,8 +65,19 @@ mod tests {
         owners.set(HashSet::from(["mod-a".to_owned()]));
         assert!(owners.may_record("mod-a"));
         assert!(!owners.may_record("mod-b"));
-        // idempotent: a second `set` does not clobber the first
+    }
+
+    /// Review L5: a second `set` is a caller bug (design: set exactly once,
+    /// right after `mount_all`), not a legitimate "idempotent" path — it must
+    /// be loud, not silently keep the first value. In a `debug_assertions`
+    /// build (every test run) that means a panic; a release build would warn
+    /// and still keep the first value (the `OnceLock` underneath never lets
+    /// the second one win either way — only the loudness differs).
+    #[test]
+    #[should_panic(expected = "InstalledOwners::set called twice")]
+    fn a_second_set_call_debug_asserts_rather_than_silently_dropping() {
+        let owners = InstalledOwners::new();
+        owners.set(HashSet::from(["mod-a".to_owned()]));
         owners.set(HashSet::from(["mod-b".to_owned()]));
-        assert!(!owners.may_record("mod-b"));
     }
 }
