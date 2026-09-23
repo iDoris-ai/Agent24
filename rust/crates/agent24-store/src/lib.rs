@@ -13,6 +13,7 @@ mod audit;
 mod legacy_recovery;
 mod module_approvals;
 mod repo;
+mod terminal_core;
 mod terminal_helpers;
 pub(crate) mod terminal_mutations;
 pub(crate) mod terminal_plan;
