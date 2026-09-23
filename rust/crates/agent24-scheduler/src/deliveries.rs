@@ -244,13 +244,33 @@ pub fn apply_outcome(
     })
 }
 
-/// Review round 1, L2: how long, after a write to `schedule_deliveries`
-/// itself fails (a storage error, not a delivery outcome), the pump leaves
-/// that ONE schedule out of its due query — the same shape as
-/// [`DEFER_RECHECK`], for the same reason: without it, a database that is
-/// erroring on every write gets hammered every [`PUMP_INTERVAL`] for the
-/// exact schedule that just failed, instead of backing off briefly.
+/// Review round 2, L-c: the FLOOR of the DB-write-error backoff — a single
+/// failure gets this much; each consecutive failure for the SAME schedule
+/// doubles it, capped at [`DB_WRITE_ERROR_RETRY_MAX`]. Same shape as
+/// [`DEFER_RECHECK`], for the same reason: without it, a database erroring
+/// on every write gets hammered every [`PUMP_INTERVAL`] for the exact
+/// schedule that just failed, instead of backing off.
 pub const DB_WRITE_ERROR_RETRY_AFTER: Duration = Duration::from_secs(2);
+/// Review round 2, L-c: the ceiling the exponential backoff above saturates
+/// at — a database that is down for a while must not make the pump wait
+/// longer and longer forever; a minute is short enough that recovery is
+/// still noticed quickly once the database comes back.
+pub const DB_WRITE_ERROR_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Review round 2, **L-c**: `consecutive_db_failures` (1-indexed: the value
+/// AFTER counting the failure that just happened) → how long this schedule
+/// is left out of the due query. Doubles each time
+/// (`DB_WRITE_ERROR_RETRY_AFTER * 2^(n-1)`), capped at
+/// [`DB_WRITE_ERROR_RETRY_MAX`]. A pure function so the doubling/cap
+/// arithmetic is directly testable without any database.
+#[must_use]
+fn db_write_backoff(consecutive_db_failures: u32) -> Duration {
+    let shift = consecutive_db_failures.saturating_sub(1).min(6);
+    std::cmp::min(
+        DB_WRITE_ERROR_RETRY_AFTER * (1u32 << shift),
+        DB_WRITE_ERROR_RETRY_MAX,
+    )
+}
 
 /// One attempt's inputs (from a fetched [`DueDelivery`]) and its outcome,
 /// handed from the spawned attempt task back to the pump loop.
@@ -304,18 +324,17 @@ async fn run_attempt(trigger: Arc<dyn crate::RunTrigger>, row: DueDelivery) -> A
 /// the owner-skip cache have to live here, not be recomputed each wake.
 struct PumpState {
     tasks: JoinSet<AttemptDone>,
-    /// Review round 1, **M1**: `JoinSet::try_join_next_with_id`'s `Err` arm
-    /// (a panicked attempt) only carries a [`tokio::task::Id`] — not the
-    /// `DueDelivery` the panicking task was working on. Without this map,
-    /// there is no way to find which schedule's slot to release, and that
-    /// schedule's `in_flight_schedules`/`in_flight_per_owner` entries would
-    /// never be cleared: the row becomes permanently unfetchable (reviewer's
-    /// reproduction: one crash on a schedule's first-ever attempt wedges it
-    /// forever, and four crashes across one owner wedge the WHOLE owner,
-    /// since `PER_OWNER_IN_FLIGHT` slots never free up either). Populated
-    /// the moment a task is spawned, removed the moment it is joined
-    /// (`Ok` or `Err`).
-    in_flight_task_owners: HashMap<tokio::task::Id, (String, String)>,
+    /// Review round 1, **M1** / round 2, **M-A**: `JoinSet::
+    /// try_join_next_with_id`'s `Err` arm (a panicked attempt) only carries a
+    /// [`tokio::task::Id`] — not the `DueDelivery` the panicking task was
+    /// working on. Without this map, there is no way to find which
+    /// schedule's slot to release (round 1's bug), AND no way to route the
+    /// panic through [`apply_outcome`] as a real sent failure (round 2's
+    /// fix: storing the id-keyed schedule/owner pair alone let a panic keep
+    /// the row `pending` forever with no backoff and no failure count — see
+    /// [`DeliveryPump::apply_joined`]'s doc comment). Populated the moment a
+    /// task is spawned, removed the moment it is joined (`Ok` or `Err`).
+    in_flight_task_rows: HashMap<tokio::task::Id, DueDelivery>,
     in_flight_per_owner: HashMap<String, usize>,
     /// design §5.4: "同一 schedule 同时至多一个在途尝试".
     in_flight_schedules: HashSet<String>,
@@ -326,12 +345,15 @@ struct PumpState {
     /// [`PER_OWNER_IN_FLIGHT`] (4) of its rows — the rest of that owner's
     /// backlog, however large, costs nothing between recheck windows.
     owner_skip_until: HashMap<String, DateTime<Utc>>,
-    /// Review round 1, **L2**: a schedule whose LAST WRITE to
-    /// `schedule_deliveries` itself failed (a storage error, not a delivery
-    /// outcome) is left out of the due query for [`DB_WRITE_ERROR_RETRY_
-    /// AFTER`] — otherwise a database erroring on every write gets hammered
-    /// once per [`PUMP_INTERVAL`] for that exact schedule.
-    schedule_retry_after: HashMap<String, DateTime<Utc>>,
+    /// Review round 1, **L2** / round 2, **L-c**: a schedule whose LAST
+    /// WRITE to `schedule_deliveries` itself failed (a storage error, not a
+    /// delivery outcome) is left out of the due query — the `DateTime` is
+    /// when it becomes eligible again, the `u32` is how many CONSECUTIVE
+    /// write failures this schedule has had (reset to nothing the moment a
+    /// write succeeds), which the backoff below doubles against, capped at
+    /// [`DB_WRITE_ERROR_RETRY_MAX`] — a database erroring on every write for
+    /// a while must not be hammered once per [`PUMP_INTERVAL`] forever.
+    schedule_retry_after: HashMap<String, (DateTime<Utc>, u32)>,
     last_sweep: DateTime<Utc>,
 }
 
@@ -339,7 +361,7 @@ impl PumpState {
     fn new(now: DateTime<Utc>) -> Self {
         Self {
             tasks: JoinSet::new(),
-            in_flight_task_owners: HashMap::new(),
+            in_flight_task_rows: HashMap::new(),
             in_flight_per_owner: HashMap::new(),
             in_flight_schedules: HashSet::new(),
             owner_skip_until: HashMap::new(),
@@ -358,6 +380,17 @@ impl PumpState {
         serde_json::to_string(&owners).unwrap_or_else(|_| "[]".to_owned())
     }
 
+    /// Review round 2, **L-b**: drop entries whose window has already
+    /// passed, instead of only ever ignoring them at read time — otherwise
+    /// every owner/schedule that ever hit a transient defer or a transient
+    /// DB error stays in these maps, doing nothing but taking up space, for
+    /// as long as the pump runs.
+    fn prune_stale_caches(&mut self, now: DateTime<Utc>) {
+        self.owner_skip_until.retain(|_, until| *until > now);
+        self.schedule_retry_after
+            .retain(|_, (until, _)| *until > now);
+    }
+
     fn begin_attempt(&mut self, schedule_id: &str, owner_module: &str) {
         self.in_flight_schedules.insert(schedule_id.to_owned());
         *self
@@ -366,17 +399,14 @@ impl PumpState {
             .or_insert(0) += 1;
     }
 
-    /// `deferred`: whether this attempt's outcome was `Deferred` (bumps
-    /// [`Self::owner_skip_until`]) — a panicked attempt (review round 1, M1)
-    /// passes `false`, the same as a real sent outcome, since a kernel-side
-    /// panic says nothing about whether the MODULE is reachable.
-    fn end_attempt(
-        &mut self,
-        schedule_id: &str,
-        owner_module: &str,
-        now: DateTime<Utc>,
-        deferred: bool,
-    ) {
+    /// Only the concurrency bookkeeping — never touches
+    /// [`Self::owner_skip_until`]. Used directly (skipping [`Self::
+    /// end_attempt`]) for a panicked attempt (review round 2, **M-A**): a
+    /// kernel-side panic proves nothing about whether the MODULE is
+    /// reachable, so it must neither arm a fresh skip window (as a real
+    /// `Deferred` would) nor clear an EXISTING one set by a different
+    /// schedule's genuine `Deferred` result on the same owner.
+    fn release_slot(&mut self, schedule_id: &str, owner_module: &str) {
         self.in_flight_schedules.remove(schedule_id);
         if let Some(count) = self.in_flight_per_owner.get_mut(owner_module) {
             *count = count.saturating_sub(1);
@@ -384,6 +414,20 @@ impl PumpState {
                 self.in_flight_per_owner.remove(owner_module);
             }
         }
+    }
+
+    /// `deferred`: whether this attempt's outcome was `Deferred` (bumps
+    /// [`Self::owner_skip_until`]); otherwise any existing window is
+    /// cleared — a REAL attempt (sent, or the module answered) proves the
+    /// owner is reachable RIGHT NOW.
+    fn end_attempt(
+        &mut self,
+        schedule_id: &str,
+        owner_module: &str,
+        now: DateTime<Utc>,
+        deferred: bool,
+    ) {
+        self.release_slot(schedule_id, owner_module);
         if deferred {
             self.owner_skip_until.insert(
                 owner_module.to_owned(),
@@ -417,13 +461,17 @@ impl DeliveryPump {
     /// `attempts` unchanged, ready for the next start to pick up with the
     /// SAME `fire_id` (design §4.6/§5.4, judgement C4.12).
     ///
-    /// Review round 1, **L1**: `biased;`, with the cancellation branch
-    /// listed FIRST — a pending cancellation is honoured before a
-    /// simultaneously-ready sleep/notify wakes the loop for another round —
-    /// and, on cancellation, every attempt that ALREADY finished is drained
-    /// and applied before returning, so a result that landed a moment
-    /// before shutdown is not silently discarded; only attempts genuinely
-    /// still running are left for the `JoinSet`'s `Drop` to abort.
+    /// Review round 1, **L1** / round 2, **L-a**: `biased;`, with the
+    /// cancellation branch listed FIRST — a pending cancellation is honoured
+    /// before a simultaneously-ready sleep/notify wakes the loop for
+    /// another round; on cancellation, every attempt that ALREADY finished
+    /// is drained and applied before returning, so a result that landed a
+    /// moment before shutdown is not silently discarded (only attempts
+    /// genuinely still running are left for the `JoinSet`'s `Drop` to
+    /// abort). The SECOND branch applies a completed attempt's outcome the
+    /// INSTANT it finishes, rather than waiting for the next sleep/notify
+    /// wake — with a real `PUMP_INTERVAL` (1s) a result that is already
+    /// known would otherwise sit unwritten for up to a second.
     pub async fn run(self, clock: Arc<dyn Clock>, cancel: CancellationToken) {
         tracing::info!("delivery pump started ({PUMP_INTERVAL:?} cadence)");
         let mut state = PumpState::new(clock.now());
@@ -442,6 +490,9 @@ impl DeliveryPump {
                     );
                     return;
                 }
+                Some(joined) = state.tasks.join_next_with_id(), if !state.tasks.is_empty() => {
+                    self.apply_joined(&mut state, joined, clock.now()).await;
+                }
                 () = clock.sleep(PUMP_INTERVAL) => {}
                 () = self.scheduler.delivery_notify().notified() => {}
             }
@@ -454,11 +505,21 @@ impl DeliveryPump {
     }
 
     /// One joined task's result — successful (apply its outcome as before)
-    /// or panicked (review round 1, **M1**: release the schedule's slot so
-    /// it is fetched again on the next round; the row itself is left
-    /// untouched, exactly like a cancelled attempt — a panic inside
-    /// `trigger()` is a kernel-side bug, not a real sent attempt against the
-    /// module's own failure budget).
+    /// or panicked. Review round 2, **M-A**: a panic used to just release
+    /// the schedule's slot with NO further consequence — which the reviewer
+    /// showed leaves a schedule that panics on every attempt retrying at
+    /// roughly the pump's own cadence FOREVER: never reaching `failed`,
+    /// never counting against `consecutive_failures`, and — if the panic
+    /// happens after the bytes were dispatched — redelivering to the module
+    /// every round too. That also contradicted this file's own rule
+    /// (`apply_outcome`, `AgentRun` for a module target) that a kernel-side
+    /// mistake is classified as a real sent failure, not trusted or
+    /// silently retried. Fixed: a panic is now routed through
+    /// [`Self::apply_attempt`] as `FireOutcome::Failed{reason: "kernel bug:
+    /// attempt panicked"}` — subject to the exact same `MAX_SENT_ATTEMPTS`/
+    /// backoff/disable rules as a real failure — with `touch_skip_window =
+    /// false` (a panic says nothing about the MODULE's reachability, so it
+    /// must not touch the owner's skip cache either way).
     async fn apply_joined(
         &self,
         state: &mut PumpState,
@@ -467,18 +528,26 @@ impl DeliveryPump {
     ) {
         match joined {
             Ok((id, done)) => {
-                state.in_flight_task_owners.remove(&id);
-                self.apply_attempt(state, done, now).await;
+                state.in_flight_task_rows.remove(&id);
+                self.apply_attempt(state, done, now, true).await;
             }
             Err(join_err) => {
                 let id = join_err.id();
-                if let Some((schedule_id, owner_module)) = state.in_flight_task_owners.remove(&id) {
-                    state.end_attempt(&schedule_id, &owner_module, now, false);
+                if let Some(row) = state.in_flight_task_rows.remove(&id) {
                     tracing::error!(
-                        "delivery pump: attempt for schedule {schedule_id} (owner {owner_module}) \
-                         panicked: {join_err}; its slot was released, the row is untouched and \
-                         will be retried"
+                        "delivery pump: attempt for schedule {} (owner {}) panicked: {join_err}; \
+                         classified as a sent failure (kernel bug) — subject to the normal \
+                         retry/failure budget, not retried forever",
+                        row.schedule_id,
+                        row.owner_module
                     );
+                    let done = AttemptDone {
+                        row,
+                        outcome: FireOutcome::Failed {
+                            reason: "kernel bug: attempt panicked".to_owned(),
+                        },
+                    };
+                    self.apply_attempt(state, done, now, false).await;
                 } else {
                     tracing::error!(
                         "delivery pump: an attempt task panicked with no known schedule/owner \
@@ -507,6 +576,9 @@ impl DeliveryPump {
 
     async fn fetch_and_spawn(&self, state: &mut PumpState, now: DateTime<Utc>) {
         self.maybe_sweep(state, now).await;
+        // Review round 2, L-b: drop expired skip/backoff entries before
+        // using either map, not just at read time.
+        state.prune_stale_caches(now);
         if state.tasks.len() >= GLOBAL_IN_FLIGHT {
             return;
         }
@@ -544,32 +616,47 @@ impl DeliveryPump {
             if state.in_flight_schedules.contains(&row.schedule_id) {
                 continue;
             }
-            // Review round 1, L2: a schedule whose last DB write errored is
-            // left alone for a short while, independent of the owner cache
-            // above (a write can fail for reasons that have nothing to do
-            // with the module being unreachable).
+            // Review round 1, L2 / round 2, L-c: a schedule whose last DB
+            // write errored is left alone for an exponentially growing
+            // while, independent of the owner cache above (a write can fail
+            // for reasons that have nothing to do with the module being
+            // unreachable).
             if state
                 .schedule_retry_after
                 .get(&row.schedule_id)
-                .is_some_and(|until| *until > now)
+                .is_some_and(|(until, _)| *until > now)
             {
                 continue;
             }
             let schedule_id = row.schedule_id.clone();
             let owner_module = row.owner_module.clone();
             state.begin_attempt(&schedule_id, &owner_module);
+            let row_for_panic = row.clone();
             let trigger = Arc::clone(self.scheduler.trigger());
             let abort_handle = state.tasks.spawn(run_attempt(trigger, row));
             state
-                .in_flight_task_owners
-                .insert(abort_handle.id(), (schedule_id, owner_module));
+                .in_flight_task_rows
+                .insert(abort_handle.id(), row_for_panic);
         }
     }
 
-    async fn apply_attempt(&self, state: &mut PumpState, done: AttemptDone, now: DateTime<Utc>) {
+    /// `touch_skip_window`: `false` only for a panicked attempt (review
+    /// round 2, **M-A** — see [`Self::apply_joined`]'s doc comment); `true`
+    /// for every real attempt outcome.
+    async fn apply_attempt(
+        &self,
+        state: &mut PumpState,
+        done: AttemptDone,
+        now: DateTime<Utc>,
+        touch_skip_window: bool,
+    ) {
         let AttemptDone { row, outcome } = done;
-        let deferred = matches!(outcome, FireOutcome::Deferred { .. });
-        state.end_attempt(&row.schedule_id, &row.owner_module, now, deferred);
+        if touch_skip_window {
+            let deferred = matches!(outcome, FireOutcome::Deferred { .. });
+            state.end_attempt(&row.schedule_id, &row.owner_module, now, deferred);
+        } else {
+            state.release_slot(&row.schedule_id, &row.owner_module);
+        }
 
         let from = DeliveryStatus::from_due_row(&row.status);
         let applied = match apply_outcome(from, row.attempts as u32, &outcome, now) {
@@ -599,6 +686,10 @@ impl DeliveryPump {
             .await
         {
             Ok((landed, disabled)) => {
+                // Review round 2, L-c: a write that lands resets this
+                // schedule's consecutive-DB-failure count — the database is
+                // demonstrably working for it again right now.
+                state.schedule_retry_after.remove(&row.schedule_id);
                 if landed && applied.emit_delivered {
                     self.scheduler.emit_event(EventBody::ScheduleDelivered(
                         ScheduleDeliveredPayload {
@@ -620,17 +711,32 @@ impl DeliveryPump {
                 }
             }
             Err(err) => {
-                // Review round 1, L2: a short in-memory backoff for THIS
-                // schedule, so a database erroring on every write is not
-                // hammered once per `PUMP_INTERVAL` for the exact row that
-                // just failed.
-                state.schedule_retry_after.insert(
-                    row.schedule_id.clone(),
-                    now + chrono::Duration::from_std(DB_WRITE_ERROR_RETRY_AFTER)
-                        .unwrap_or_default(),
-                );
+                // Review round 2, L-c: an EXPONENTIALLY growing backoff for
+                // THIS schedule (capped at `DB_WRITE_ERROR_RETRY_MAX`), not a
+                // flat one — a database that stays down must not be hammered
+                // at a constant rate forever. Note what this does NOT do:
+                // `attempts` is not incremented and no delivery outcome is
+                // recorded — the module-facing "3 sent attempts" budget is
+                // untouched by a storage failure that never durably landed
+                // anything; only the PUMP's own polling rate backs off.
+                let count = {
+                    let entry = state
+                        .schedule_retry_after
+                        .entry(row.schedule_id.clone())
+                        .or_insert((now, 0));
+                    entry.1 = entry.1.saturating_add(1);
+                    entry.1
+                };
+                let backoff = db_write_backoff(count);
+                let until = now + chrono::Duration::from_std(backoff).unwrap_or_default();
+                state
+                    .schedule_retry_after
+                    .insert(row.schedule_id.clone(), (until, count));
                 tracing::error!(
-                    "delivery pump: could not apply the outcome for fire {}: {err}",
+                    "delivery pump: could not apply the outcome for fire {} (consecutive DB \
+                     write failure #{count} for this schedule; backing off {backoff:?}; \
+                     attempts was NOT incremented — this outcome was never durably recorded): \
+                     {err}",
                     row.fire_id
                 );
             }
@@ -727,6 +833,20 @@ mod tests {
     fn worst_case_retry_span_is_under_the_minimum_period() {
         let span = DELIVERY_TIMEOUT * MAX_SENT_ATTEMPTS + RETRY_BACKOFF[0] + RETRY_BACKOFF[1];
         assert!(span < Duration::from_secs(60), "{span:?}");
+    }
+
+    /// Review round 2, **L-c**: the DB-write-failure backoff doubles each
+    /// consecutive failure and saturates at `DB_WRITE_ERROR_RETRY_MAX`,
+    /// rather than staying flat at `DB_WRITE_ERROR_RETRY_AFTER` forever.
+    #[test]
+    fn db_write_backoff_doubles_and_saturates() {
+        assert_eq!(db_write_backoff(1), DB_WRITE_ERROR_RETRY_AFTER);
+        assert_eq!(db_write_backoff(2), DB_WRITE_ERROR_RETRY_AFTER * 2);
+        assert_eq!(db_write_backoff(3), DB_WRITE_ERROR_RETRY_AFTER * 4);
+        assert_eq!(db_write_backoff(4), DB_WRITE_ERROR_RETRY_AFTER * 8);
+        // 2s * 2^5 = 64s > the 60s cap.
+        assert_eq!(db_write_backoff(6), DB_WRITE_ERROR_RETRY_MAX);
+        assert_eq!(db_write_backoff(100), DB_WRITE_ERROR_RETRY_MAX);
     }
 
     /// A module target answering `AgentRun` (kernel bug) is treated as a
@@ -898,13 +1018,16 @@ mod pump_tests {
         }
     }
 
-    /// Review round 1, **M1**: panics on its FIRST call, delivers on every
-    /// call after that.
-    struct PanicOnce {
+    /// Review round 2, **M-A**: panics on EVERY call — for proving a
+    /// schedule that panics forever still gets bounded by the exact same
+    /// `MAX_SENT_ATTEMPTS`/backoff/`failed` machinery a real sent failure
+    /// does, not retried at ~1Hz forever (the reviewer's own reproduction of
+    /// the bug the un-fixed code had).
+    struct AlwaysPanics {
         calls: AtomicUsize,
     }
 
-    impl PanicOnce {
+    impl AlwaysPanics {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 calls: AtomicUsize::new(0),
@@ -916,18 +1039,10 @@ mod pump_tests {
     }
 
     #[async_trait]
-    impl RunTrigger for PanicOnce {
-        async fn trigger(&self, invocation: &ScheduleInvocation) -> FireOutcome {
-            let k = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
-            if k == 0 {
-                panic!("PanicOnce: injected panic on the first attempt");
-            }
-            let InvocationTarget::Module { fire_id, .. } = &invocation.target else {
-                panic!("PanicOnce is only exercised with Module targets in these tests");
-            };
-            FireOutcome::ModuleDelivered {
-                fire_id: fire_id.clone(),
-            }
+    impl RunTrigger for AlwaysPanics {
+        async fn trigger(&self, _invocation: &ScheduleInvocation) -> FireOutcome {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            panic!("AlwaysPanics: injected panic");
         }
     }
 
@@ -1496,15 +1611,38 @@ mod pump_tests {
         assert_eq!(last_fire.status, "deferred");
         let stable_fire_id = last_fire.fire_id.clone();
 
-        // Review round 1, L6: `updated_at` must NOT have moved across those
-        // repeated Deferred rounds (T4: repeating Deferred from Deferred
-        // writes nothing at all).
-        let (_, updated_at_before) = fetch_attempts_and_updated_at(&store, &stable_fire_id).await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        let (_, updated_at_after) = fetch_attempts_and_updated_at(&store, &stable_fire_id).await;
+        // Review round 1, L6 / round 2, **M-D(1)**: `updated_at` must NOT
+        // move across REPEATED Deferred rounds (T4: repeating Deferred from
+        // an already-`deferred` row writes nothing). The original version of
+        // this check was nearly vacuous: it compared two reads 30ms apart
+        // while the virtual clock was FROZEN and the owner was still inside
+        // its `DEFER_RECHECK` skip window, so the pump could not have
+        // touched the row again either way, mutated or not. Fixed: capture
+        // `updated_at` right after the FIRST write (the Pending→Deferred
+        // transition just confirmed above, which DOES write), then drive
+        // SEVERAL more `DEFER_RECHECK`-gated rounds — each one's `calls()`
+        // increase is proof the PREVIOUS round already went all the way
+        // through `apply_joined`/`apply_attempt` (this same schedule cannot
+        // be re-spawned until its slot is released there), so by the time
+        // the loop ends, every round up to the second-to-last is provably
+        // applied; one extra round beyond the count this test cares about
+        // is what proves the last one is too.
+        let (_, updated_at_after_first_write) =
+            fetch_attempts_and_updated_at(&store, &stable_fire_id).await;
+        let mut seen = trigger.calls().len();
+        for _ in 0..5 {
+            clock.set(clock.now() + chrono::Duration::seconds(3)); // > DEFER_RECHECK (2s)
+            wait_until(
+                || async { trigger.calls().len() > seen },
+                "the pump never re-polled after the skip window",
+            )
+            .await;
+            seen = trigger.calls().len();
+        }
+        let (_, updated_at_now) = fetch_attempts_and_updated_at(&store, &stable_fire_id).await;
         assert_eq!(
-            updated_at_before, updated_at_after,
-            "repeated Deferred rounds must not touch updated_at"
+            updated_at_after_first_write, updated_at_now,
+            "repeated Deferred rounds after the first write must land NO further writes at all"
         );
 
         // The module "comes back": swap in a trigger that delivers.
@@ -1625,18 +1763,31 @@ mod pump_tests {
         cancel2.cancel();
         handle2.await.unwrap();
 
-        // Review round 1, L6: a THIRD "restart" must never call trigger()
-        // again — the row is `delivered`, a terminal state.
-        struct PanicIfCalled;
+        // Review round 1, L6 / round 2, **M-D(2)**: a THIRD "restart" must
+        // never call `trigger()` again — the row is `delivered`, a terminal
+        // state `due_deliveries` never returns. The original version of this
+        // check used a trigger that PANICKED if called and then asserted the
+        // row was still `delivered` — but since round 2's own M-A fix, a
+        // panic is now CAUGHT by `apply_joined` and routed through
+        // `apply_attempt` rather than crashing the test, so that assertion
+        // would hold trivially whether or not `trigger()` was ever actually
+        // invoked (a caught panic changes nothing about the row's already-
+        // terminal status either way). Fixed: count calls directly and
+        // assert the count is exactly zero.
+        struct CountIfCalled(AtomicUsize);
         #[async_trait]
-        impl RunTrigger for PanicIfCalled {
+        impl RunTrigger for CountIfCalled {
             async fn trigger(&self, _invocation: &ScheduleInvocation) -> FireOutcome {
-                panic!("a delivered (terminal) row must never be retried");
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                FireOutcome::Failed {
+                    reason: "a delivered (terminal) row must never be retried".to_owned(),
+                }
             }
         }
+        let count_if_called = Arc::new(CountIfCalled(AtomicUsize::new(0)));
         let (scheduler3, _events3) = scheduler_with(
             store.clone(),
-            Arc::new(PanicIfCalled) as Arc<dyn RunTrigger>,
+            Arc::clone(&count_if_called) as Arc<dyn RunTrigger>,
         );
         let clock3 = TestClock::at(now0 + chrono::Duration::seconds(65));
         let cancel3 = CancellationToken::new();
@@ -1645,57 +1796,117 @@ mod pump_tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel3.cancel();
         handle3.await.unwrap();
+        assert_eq!(
+            count_if_called.0.load(AtomicOrdering::SeqCst),
+            0,
+            "a delivered (terminal) row must never be re-fetched, let alone retried"
+        );
         let states = store.list_module_schedules("mod-d").await.unwrap();
         assert_eq!(
             states[0].last_fire.tick.as_ref().unwrap().status,
             "delivered",
-            "still delivered — the panic-if-called trigger was never reached"
+            "still delivered — the row was never touched again"
         );
     }
 
-    /// Review round 1, **M1** (the reviewer's own reproduction): an attempt
-    /// that PANICS must release its schedule's in-flight slot — otherwise
-    /// the schedule (and, after enough panics across one owner, the whole
-    /// owner) is wedged forever, since the slot the panicking task held is
-    /// never freed. Mutation: revert `apply_joined`'s `Err` arm to only log
-    /// (no `end_attempt`) — this test times out (the schedule never gets a
-    /// second attempt).
+    /// Review round 1, **M1** / round 2, **M-A** (the reviewer's own
+    /// reproduction, and its fix): a schedule whose trigger panics on EVERY
+    /// attempt must still (a) release its slot each time — the round 1 half,
+    /// otherwise it is wedged after the FIRST panic — and (b), the round 2
+    /// half, reach `failed` after exactly `MAX_SENT_ATTEMPTS` panicking
+    /// attempts, with `attempts` counted and `consecutive_failures` charged
+    /// exactly once — never retried at roughly the pump's own cadence
+    /// forever (the pre-round-2 bug: a panic released the slot but recorded
+    /// no outcome at all, so the row stayed `pending` with no backoff,
+    /// `attempts` frozen at 0, and — had the panic happened after dispatch —
+    /// the module would have been redelivered to every single round too).
+    ///
+    /// Mutation: revert `apply_joined`'s `Err` arm to release the slot
+    /// WITHOUT routing it through `apply_attempt` (the pre-round-2 shape) —
+    /// this test goes red: `trigger.calls()` keeps growing past 3 as the
+    /// clock advances, `attempts` never reaches 3, and the row never reaches
+    /// `failed`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_panicking_attempt_releases_its_schedule_slot_for_the_next_try() {
+    async fn a_schedule_that_always_panics_still_reaches_failed_with_a_bounded_attempt_count() {
         let store = Store::open_memory().await.unwrap();
-        let trigger = PanicOnce::new();
+        let trigger = AlwaysPanics::new();
         let (scheduler, _events) =
             scheduler_with(store.clone(), trigger.clone() as Arc<dyn RunTrigger>);
         let now0 = utc("2026-08-01T00:00:00Z");
-        seed_module_fire(&scheduler, &store, "mod-p", "k", now0).await;
+        let schedule_id = seed_module_fire(&scheduler, &store, "mod-p", "k", now0).await;
         let clock = TestClock::at(now0 + chrono::Duration::seconds(65));
         let cancel = CancellationToken::new();
         let pump = DeliveryPump::new(Arc::clone(&scheduler));
         let handle =
             tokio::spawn(pump.run(Arc::clone(&clock) as Arc<dyn Clock>, cancel.child_token()));
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let states = store.list_module_schedules("mod-p").await.unwrap();
-            if states[0]
-                .last_fire
-                .tick
-                .as_ref()
-                .is_some_and(|f| f.status == "delivered")
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the schedule never recovered after the panic — its slot must have leaked"
-            );
-            clock.set(clock.now() + chrono::Duration::seconds(1));
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        // Same clock choreography as `three_failures_...`: the panic route's
+        // backoff is computed (inside `apply_attempt`, from whichever branch
+        // of `run`'s `select!` observed the panic) using whatever the clock
+        // holds AT THAT MOMENT — freeze it between rounds and only advance
+        // once this test has proof the previous round already landed.
+        async fn wait_for_last_error(store: &Store, owner: &str, expected: &str) {
+            wait_until(
+                || async {
+                    let states = store.list_module_schedules(owner).await.unwrap();
+                    states[0]
+                        .last_fire
+                        .tick
+                        .as_ref()
+                        .and_then(|f| f.last_error.as_deref())
+                        == Some(expected)
+                },
+                &format!("last_error never became {expected:?}"),
+            )
+            .await;
         }
-        assert!(
-            trigger.calls() >= 2,
-            "the panicking attempt must not have been the only one"
+
+        wait_for_last_error(&store, "mod-p", "kernel bug: attempt panicked").await;
+        let t1 = clock.now();
+        clock.set(t1 + chrono::Duration::seconds(6)); // past the 5s backoff
+        wait_until(
+            || async { trigger.calls() >= 2 },
+            "the second attempt never happened",
+        )
+        .await;
+        let t2 = clock.now();
+        clock.set(t2 + chrono::Duration::seconds(16)); // past the 15s backoff
+        wait_until(
+            || async { trigger.calls() >= 3 },
+            "the third attempt never happened",
+        )
+        .await;
+
+        wait_until(
+            || async {
+                let states = store.list_module_schedules("mod-p").await.unwrap();
+                states[0]
+                    .last_fire
+                    .tick
+                    .as_ref()
+                    .is_some_and(|f| f.status == "failed")
+            },
+            "the schedule never reached failed after three panicking attempts",
+        )
+        .await;
+        // A bounded wait to prove it does NOT keep retrying past three.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            trigger.calls(),
+            3,
+            "a schedule that always panics must stop at MAX_SENT_ATTEMPTS, not retry forever"
         );
+
+        let schedule = store.get_schedule(&schedule_id).await.unwrap().unwrap();
+        assert_eq!(
+            schedule.consecutive_failures, 1,
+            "three panicking attempts of ONE fire must count as a single failure, not three"
+        );
+        let states = store.list_module_schedules("mod-p").await.unwrap();
+        let fire_id = states[0].last_fire.tick.as_ref().unwrap().fire_id.clone();
+        let (attempts, _) = fetch_attempts_and_updated_at(&store, &fire_id).await;
+        assert_eq!(attempts, 3, "the failed row must record exactly 3 attempts");
+
         cancel.cancel();
         handle.await.unwrap();
     }
@@ -1815,6 +2026,218 @@ mod pump_tests {
             0,
             "a schedule must not be spawned for an owner already at its per-owner cap, even when \
              none of that owner's OTHER in-flight attempts are represented as real rows"
+        );
+    }
+
+    /// Review round 2, **M-B**: the "same schedule at most one in-flight
+    /// attempt" rule (design §5.4) was NOT actually exercised by any
+    /// existing test — every scenario that seeds one due row per schedule
+    /// can only ever have zero or one in-flight attempt for it regardless of
+    /// this check, so disabling it (`if false &&`) left every test green.
+    /// This test constructs the state directly: `in_flight_schedules`
+    /// already contains the one schedule that is due — `fetch_and_spawn`
+    /// must not spawn a second attempt for it.
+    ///
+    /// Mutation: delete the `in_flight_schedules.contains(..)` check — this
+    /// test goes red (a second task is spawned for the same schedule).
+    #[tokio::test]
+    async fn fetch_and_spawn_refuses_a_schedule_already_in_flight() {
+        let store = Store::open_memory().await.unwrap();
+        let trigger = ScriptedTrigger::new([FireOutcome::Deferred {
+            reason: DeferReason::NotRunning,
+        }]);
+        let (scheduler, _events) = scheduler_with(store.clone(), trigger as Arc<dyn RunTrigger>);
+        let now0 = utc("2026-08-01T00:00:00Z");
+        let schedule_id = seed_module_fire(&scheduler, &store, "owner-x", "k", now0).await;
+
+        let now = now0 + chrono::Duration::seconds(65);
+        let mut state = PumpState::new(now);
+        // Stands in for "an attempt for this exact schedule is already
+        // running from an earlier round" — no real task backs it, only the
+        // bookkeeping `fetch_and_spawn` actually reads.
+        state.in_flight_schedules.insert(schedule_id);
+        let pump = DeliveryPump::new(Arc::clone(&scheduler));
+        pump.fetch_and_spawn(&mut state, now).await;
+        assert_eq!(
+            state.tasks.len(),
+            0,
+            "a schedule already recorded as in-flight must not be spawned a second time"
+        );
+    }
+
+    /// Review round 2, **M-B**: same blind spot as the test above, for the
+    /// GLOBAL ceiling — `due_deliveries`'s own SQL `LIMIT` already caps ONE
+    /// query's results at `GLOBAL_IN_FLIGHT`, which hid a disabled
+    /// client-side check in every existing single-round test. This test
+    /// pre-fills `state.tasks` with `GLOBAL_IN_FLIGHT` attempts that never
+    /// resolve (standing in for a full window carried over from an earlier
+    /// round) and proves a brand-new, otherwise-eligible schedule is not
+    /// spawned on top of it.
+    ///
+    /// Mutation: delete the `state.tasks.len() >= GLOBAL_IN_FLIGHT` check at
+    /// the TOP of `fetch_and_spawn` (the one that would otherwise return
+    /// before even querying) — this test goes red (a 17th task is spawned).
+    #[tokio::test]
+    async fn fetch_and_spawn_refuses_when_the_global_ceiling_is_already_reached() {
+        let store = Store::open_memory().await.unwrap();
+        let trigger = ScriptedTrigger::new([FireOutcome::Deferred {
+            reason: DeferReason::NotRunning,
+        }]);
+        let (scheduler, _events) = scheduler_with(store.clone(), trigger as Arc<dyn RunTrigger>);
+        let now0 = utc("2026-08-01T00:00:00Z");
+        // THREE distinct, otherwise-eligible schedules (different owners, so
+        // the per-owner cap never interferes) — `due_deliveries` will offer
+        // all three in ONE query, since its own `LIMIT` is a flat
+        // `GLOBAL_IN_FLIGHT`, not "however much room is left" (it has no way
+        // to know that).
+        for n in 0..3 {
+            seed_module_fire(&scheduler, &store, &format!("owner-y{n}"), "k", now0).await;
+        }
+
+        let now = now0 + chrono::Duration::seconds(65);
+        let mut state = PumpState::new(now);
+        // `GLOBAL_IN_FLIGHT - 1`: one slot short of full — the TOP-of-
+        // function early return alone would let this call proceed to query
+        // and iterate; only the IN-LOOP check stops it from spawning more
+        // than the one remaining slot.
+        for _ in 0..GLOBAL_IN_FLIGHT - 1 {
+            state.tasks.spawn(std::future::pending::<AttemptDone>());
+        }
+        let pump = DeliveryPump::new(Arc::clone(&scheduler));
+        pump.fetch_and_spawn(&mut state, now).await;
+        assert_eq!(
+            state.tasks.len(),
+            GLOBAL_IN_FLIGHT,
+            "fetch_and_spawn must stop spawning the moment the global ceiling is reached, even \
+             mid-batch — not spawn every eligible row a single query happened to return"
+        );
+    }
+
+    /// Review round 2, **L-f** (the L1 half): an attempt that has ALREADY
+    /// finished when cancellation fires must still have its outcome
+    /// durably applied — not discarded because the `JoinSet`'s `Drop`
+    /// (which aborts everything STILL running) raced ahead of it. Uses a
+    /// trigger the test controls precisely: it signals "I have been called"
+    /// and then returns immediately, so the test can release it and cancel
+    /// the pump back-to-back, racing the real completion against the real
+    /// cancellation on a genuine multi-threaded runtime.
+    ///
+    /// Mutation: make the cancellation branch of `run`'s `select!` return
+    /// immediately instead of draining `try_join_next_with_id` first — this
+    /// test goes red intermittently (the delivered write is sometimes lost).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_attempt_that_finishes_right_as_cancel_fires_still_lands() {
+        struct SignalThenDeliver {
+            called: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl RunTrigger for SignalThenDeliver {
+            async fn trigger(&self, invocation: &ScheduleInvocation) -> FireOutcome {
+                self.called.notify_one();
+                let InvocationTarget::Module { fire_id, .. } = &invocation.target else {
+                    panic!("SignalThenDeliver is only exercised with Module targets");
+                };
+                FireOutcome::ModuleDelivered {
+                    fire_id: fire_id.clone(),
+                }
+            }
+        }
+        let store = Store::open_memory().await.unwrap();
+        let trigger = Arc::new(SignalThenDeliver {
+            called: tokio::sync::Notify::new(),
+        });
+        let (scheduler, _events) =
+            scheduler_with(store.clone(), Arc::clone(&trigger) as Arc<dyn RunTrigger>);
+        let now0 = utc("2026-08-01T00:00:00Z");
+        seed_module_fire(&scheduler, &store, "mod-race", "k", now0).await;
+        let clock = TestClock::at(now0 + chrono::Duration::seconds(65));
+        let cancel = CancellationToken::new();
+        let pump = DeliveryPump::new(Arc::clone(&scheduler));
+        let handle =
+            tokio::spawn(pump.run(Arc::clone(&clock) as Arc<dyn Clock>, cancel.child_token()));
+
+        tokio::time::timeout(Duration::from_secs(5), trigger.called.notified())
+            .await
+            .expect("the attempt never started");
+        // The trigger has been called and is about to return `ModuleDelivered`
+        // — cancel RIGHT NOW, racing the real task completion against the
+        // real cancellation, exactly the window `run`'s cancel branch has to
+        // cover by draining `try_join_next_with_id` before it returns.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the pump must stop promptly")
+            .unwrap();
+
+        let states = store.list_module_schedules("mod-race").await.unwrap();
+        assert_eq!(
+            states[0].last_fire.tick.as_ref().unwrap().status,
+            "delivered",
+            "an attempt that finished before (or exactly as) cancellation fired must still land"
+        );
+    }
+
+    /// Review round 2, **L-f** (the L2 half): a GENUINE storage failure
+    /// inside `apply_delivery_outcome`'s own `UPDATE` — using the same SQL
+    /// fault-injection technique `agent24-store`'s own tests use (a `BEFORE
+    /// UPDATE` trigger that aborts the write) — must back the schedule off
+    /// (review round 2, L-c) rather than touch `attempts`/`status` at all,
+    /// and must not crash the pump. Drives `fetch_and_spawn`/`apply_joined`
+    /// directly (not the full `run()` loop) so the failure's effect can be
+    /// inspected precisely, without racing a background task.
+    #[tokio::test]
+    async fn a_failing_db_write_backs_off_without_touching_the_row() {
+        let store = Store::open_memory().await.unwrap();
+        let trigger = ScriptedTrigger::new([FireOutcome::ModuleDelivered {
+            fire_id: FireId::from_stored("placeholder".into()),
+        }]);
+        let (scheduler, _events) = scheduler_with(store.clone(), trigger as Arc<dyn RunTrigger>);
+        let now0 = utc("2026-08-01T00:00:00Z");
+        seed_module_fire(&scheduler, &store, "inject-fail-owner", "k", now0).await;
+
+        // Fault injection: the SAME technique `agent24-store`'s own
+        // `advance_and_record_fire` tests use (design §11, C1.7) — a
+        // trigger that aborts the exact write `apply_delivery_outcome` is
+        // about to attempt.
+        sqlx::query(
+            "CREATE TRIGGER inject_fail BEFORE UPDATE ON schedule_deliveries \
+             WHEN OLD.owner_module = 'inject-fail-owner' \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+
+        let now = now0 + chrono::Duration::seconds(65);
+        let mut state = PumpState::new(now);
+        let pump = DeliveryPump::new(Arc::clone(&scheduler));
+        pump.fetch_and_spawn(&mut state, now).await;
+        let joined = state.tasks.join_next_with_id().await.unwrap();
+        pump.apply_joined(&mut state, joined, now).await;
+
+        // Nothing durable changed — the failed write never landed.
+        let states = store
+            .list_module_schedules("inject-fail-owner")
+            .await
+            .unwrap();
+        let last_fire = states[0].last_fire.tick.as_ref().unwrap();
+        assert_eq!(
+            last_fire.status, "pending",
+            "a failed DB write must not change the row's status"
+        );
+        let (attempts, _) = fetch_attempts_and_updated_at(&store, &last_fire.fire_id).await;
+        assert_eq!(
+            attempts, 0,
+            "a failed DB write must not touch attempts either"
+        );
+
+        // The schedule is now backed off (L-c) — an IMMEDIATE second
+        // `fetch_and_spawn` must not re-attempt it.
+        pump.fetch_and_spawn(&mut state, now).await;
+        assert_eq!(
+            state.tasks.len(),
+            0,
+            "a schedule backing off from a DB write failure must not be re-fetched immediately"
         );
     }
 
