@@ -9,6 +9,7 @@
 //! compile-time-checked macros + committed `.sqlx` offline data is planned
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
+mod allocation_commitment;
 mod allocation_intent;
 mod allocation_materialization;
 mod allocation_record;
