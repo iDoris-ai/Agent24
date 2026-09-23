@@ -1,6 +1,12 @@
 use std::{ffi::OsString, fmt, io, path::PathBuf};
 
-use crate::pipe_access::TargetPipes;
+use crate::{
+    actor::Phase,
+    cleanup::{CleanupStepError, cleanup_step},
+    launch_order::LaunchControl,
+    pipe_access::TargetPipes,
+    target::{ExitObservation, TreeObservation},
+};
 use agent24_sidecar_host_protocol::Request;
 
 #[cfg(windows)]
@@ -66,8 +72,18 @@ pub(crate) enum LaunchFailure {
     Start(io::ErrorKind),
     Pipes {
         kind: io::ErrorKind,
-        target: Box<OwnedTarget>,
+        cleanup: Box<CleanupOwner>,
     },
+}
+
+pub(crate) struct CleanupOwner(OwnedTarget);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchCleanupError {
+    Stop(io::ErrorKind),
+    Observe(io::ErrorKind),
+    Reap(io::ErrorKind),
+    InvalidPhase,
 }
 
 impl fmt::Debug for LaunchFailure {
@@ -97,11 +113,45 @@ impl PartialEq for LaunchFailure {
 impl Eq for LaunchFailure {}
 
 impl LaunchFailure {
-    pub(crate) fn target_mut(&mut self) -> Option<&mut OwnedTarget> {
+    /// The failed pipe transfer retains containment, but exposes only cleanup.
+    pub(crate) fn cleanup_tick(
+        &mut self,
+        phase: &mut Phase,
+    ) -> Option<Result<TreeObservation, LaunchCleanupError>> {
         match self {
-            Self::Pipes { target, .. } => Some(target),
+            Self::Pipes { cleanup, .. } => Some(cleanup.tick(phase)),
             Self::NotLaunch | Self::Start(_) => None,
         }
+    }
+}
+
+impl CleanupOwner {
+    fn tick(&mut self, phase: &mut Phase) -> Result<TreeObservation, LaunchCleanupError> {
+        if matches!(phase, Phase::GracefulStopping(_)) {
+            match self
+                .0
+                .observe_exit()
+                .map_err(|error| LaunchCleanupError::Observe(error.kind()))?
+            {
+                ExitObservation::Running => return Ok(TreeObservation::Present),
+                ExitObservation::Exited { .. } => {}
+            }
+        }
+        if matches!(
+            phase,
+            Phase::GracefulStopping(_)
+                | Phase::ForceStopping(_)
+                | Phase::Draining(_)
+                | Phase::Unconfirmed
+        ) {
+            self.0
+                .request_stop(true)
+                .map_err(|error| LaunchCleanupError::Stop(error.kind()))?;
+        }
+        cleanup_step(phase, &mut self.0).map_err(|error| match error {
+            CleanupStepError::Reap(error) => LaunchCleanupError::Reap(error.kind()),
+            CleanupStepError::Phase(_) => LaunchCleanupError::InvalidPhase,
+        })
     }
 }
 
@@ -135,7 +185,7 @@ fn take_pipes(target: OwnedTarget) -> Result<(OwnedTarget, OwnedPipes), LaunchFa
         Ok((target, pipes)) => Ok((target, pipes)),
         Err((kind, target)) => Err(LaunchFailure::Pipes {
             kind,
-            target: Box::new(target),
+            cleanup: Box::new(CleanupOwner(target)),
         }),
     }
 }
@@ -165,12 +215,34 @@ impl OwnedLaunch {
         self.request_id
     }
 
-    pub(crate) fn target_mut(&mut self) -> &mut OwnedTarget {
+    fn target_mut(&mut self) -> &mut OwnedTarget {
         &mut self.target
     }
 
-    pub(crate) fn parts_mut(&mut self) -> (&mut OwnedTarget, &mut TargetPipes) {
+    fn parts_mut(&mut self) -> (&mut OwnedTarget, &mut TargetPipes) {
         (&mut self.target, &mut self.pipes)
+    }
+
+    pub(crate) fn pipes_mut(&mut self) -> &mut TargetPipes {
+        &mut self.pipes
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl LaunchControl for OwnedLaunch {
+    fn stop(&mut self, force: bool) -> io::Result<()> {
+        if force {
+            self.target_mut().request_stop(true)
+        } else {
+            self.parts_mut().1.close_stdin();
+            self.target_mut().request_stop(false)
+        }
+    }
+    fn observe_exit(&mut self) -> io::Result<crate::target::ExitObservation> {
+        self.target_mut().observe_exit()
+    }
+    fn cleanup(&mut self, phase: &mut Phase) -> Result<TreeObservation, CleanupStepError> {
+        cleanup_step(phase, self.target_mut())
     }
 }
 
@@ -203,12 +275,16 @@ impl OwnedLaunch {
         self.request_id
     }
 
-    pub(crate) fn target_mut(&mut self) -> &mut OwnedTarget {
+    fn target_mut(&mut self) -> &mut OwnedTarget {
         &mut self.target
     }
 
-    pub(crate) fn parts_mut(&mut self) -> (&mut OwnedTarget, &mut TargetPipes) {
+    fn parts_mut(&mut self) -> (&mut OwnedTarget, &mut TargetPipes) {
         (&mut self.target, &mut self.pipes)
+    }
+
+    pub(crate) fn pipes_mut(&mut self) -> &mut TargetPipes {
+        &mut self.pipes
     }
 }
 
