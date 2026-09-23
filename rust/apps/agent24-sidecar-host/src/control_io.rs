@@ -214,11 +214,15 @@ mod tests {
         ControlIngress::new(scripted(steps))
     }
     fn launch(id: u64) -> Request {
+        #[cfg(windows)]
+        let (executable, cwd) = (r"C:\agent\helper.exe", r"C:\agent");
+        #[cfg(not(windows))]
+        let (executable, cwd) = ("/bin/true", "/tmp");
         Request::Launch {
             version: 1,
             request_id: id,
-            executable: "/bin/true".into(),
-            cwd: "/tmp".into(),
+            executable: executable.into(),
+            cwd: cwd.into(),
             argv: vec![],
             env: Default::default(),
         }
