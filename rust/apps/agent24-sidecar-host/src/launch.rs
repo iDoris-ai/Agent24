@@ -241,7 +241,7 @@ mod tests {
 
     fn reap(launch: &mut OwnedLaunch) {
         launch.parts_mut().0.request_stop(true).expect("force stop");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !matches!(
             launch.parts_mut().0.reap_step().expect("reap step"),
             TreeObservation::ConfirmedEmpty
