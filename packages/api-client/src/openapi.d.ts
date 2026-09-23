@@ -895,12 +895,35 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /**
+         * @description Which module owns this row, and its key with that module — `null`
+         *     exactly when this is a plain user (AgentRun) row (design
+         *     docs/design/ME4-S1-scheduler-callback.md §8.1).
+         */
+        ScheduleOwner: {
+            module: string;
+            key: string;
+        };
+        /**
+         * @description Which layer is holding a schedule from firing, or `null` when
+         *     `effective_enabled` is `true`. Priority: `user_suspended` → `user`,
+         *     then `system_disabled_reason` → `system`, then `!enabled` → `module`
+         *     (module row) / `user` (user row) (§8.1, v3 L-D).
+         * @enum {string|null}
+         */
+        DisabledBy: "module" | "user" | "system" | null;
         Schedule: {
             id: string;
             name: string;
             enabled: boolean;
             spec: components["schemas"]["ScheduleSpec"];
-            action: components["schemas"]["ScheduleAction"];
+            /**
+             * @description `null` exactly when `owner` is non-null: module rows carry no
+             *     AgentRun action (§8.1). A client can never create a module row
+             *     through `POST /schedules` — `ScheduleCreate` has no `owner`
+             *     field and `ScheduleAction` has exactly one variant (S1-2).
+             */
+            action: components["schemas"]["ScheduleAction"] | null;
             delivery: components["schemas"]["DeliveryTarget"][];
             /** Format: date-time */
             last_run_at: string | null;
@@ -911,6 +934,19 @@ export interface components {
             next_run_at: string | null;
             /** @description Auto-disables the schedule at 5 (emits schedule.disabled) */
             consecutive_failures: number;
+            /** @description Non-null exactly for a module row (§8.1). */
+            owner: components["schemas"]["ScheduleOwner"] | null;
+            /** @description Only ever true on a module row (migration 0007's CHECK). */
+            user_suspended: boolean;
+            /** @description Only ever non-null on a module row (same CHECK). */
+            system_disabled_reason: string | null;
+            /**
+             * @description Whether this row will actually fire right now: for a user row,
+             *     equals `enabled`; for a module row, `enabled && !user_suspended
+             *     && system_disabled_reason == null`.
+             */
+            effective_enabled: boolean;
+            disabled_by: components["schemas"]["DisabledBy"];
         };
         ScheduleCreate: {
             name: string;

@@ -188,18 +188,24 @@ impl Tool for SelfWakeTool {
             name: SELF_WAKE_NAME.to_owned(),
             enabled: true,
             spec: ScheduleSpec::At { ts: ts.clone() },
-            action: ScheduleAction::AgentRun {
+            action: Some(ScheduleAction::AgentRun {
                 prompt,
                 // Deliver into THIS session so the woken run continues the
                 // conversation (its prior context is reloaded on run).
                 session_id: ctx.session_id.clone(),
                 model_override: None,
-            },
+            }),
             delivery: vec![],
             last_run_at: None,
             // One-shot: fire once at `ts`, then the scheduler clears this.
             next_run_at: Some(ts.clone()),
             consecutive_failures: 0,
+            // A self-wake is always a plain user (AgentRun) row.
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
         };
         self.store
             .upsert_schedule(&schedule)
@@ -253,12 +259,13 @@ mod tests {
         assert!(matches!(s.spec, ScheduleSpec::At { .. }));
         assert!(s.next_run_at.is_some());
         match &s.action {
-            ScheduleAction::AgentRun {
+            Some(ScheduleAction::AgentRun {
                 prompt, session_id, ..
-            } => {
+            }) => {
                 assert_eq!(prompt, "check the build");
                 assert_eq!(session_id.as_deref(), Some("sess_1"));
             }
+            None => panic!("a self-wake is always a user row: action must be Some"),
         }
     }
 

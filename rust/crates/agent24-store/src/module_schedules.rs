@@ -37,7 +37,7 @@
 //! own use rather than defining a second, same-named type (see
 //! `TickScheduleRow`'s doc comment).
 
-use agent24_protocol::{Schedule, ScheduleAction, ScheduleSpec};
+use agent24_protocol::{Schedule, ScheduleSpec};
 use serde::Serialize;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -1010,97 +1010,47 @@ impl Store {
     }
 }
 
-// ── tick read-model (ME4-1.2.1d) ────────────────────────────────────────────
+// ── tick read-model (ME4-1.2.1d, collapsed onto `Schedule` by ME4-1.2.2a) ───
 
-/// One schedule row's currently-eligible state for the tick loop (ME4-1.2.2b
-/// reads this instead of `list_schedules_lenient`, which cannot represent a
-/// module row's sentinel `action`). Unfiltered — like
-/// `list_schedules_lenient`, every row is returned and the caller decides
-/// `enabled`/due/suspended/owner-installed, so a change to those rules never
-/// requires a store-layer change.
-///
-/// A row whose `spec` JSON does not deserialize is skipped and logged, same
-/// as `list_schedules_lenient` — one corrupt row must never wedge the tick.
-///
-/// Review, M-3: added `consecutive_failures`/`last_run_at`, missing from the
-/// first cut — the tick's AgentRun failure-counting branch and
-/// `update_schedule_runtime_cas`'s CAS both need to have read them from
-/// *somewhere*, and this is that somewhere.
-///
-/// Convergence note (not yet done — flagged for whoever picks up
-/// ME4-1.2.2a/b): once ME4-1.2.2a makes `agent24_protocol::Schedule.action`
-/// an `Option<ScheduleAction>`, this type's reason for existing (working
-/// around `Schedule` being unable to represent a module row) goes away, and
-/// it should collapse into the design's `ScheduleRecord { schedule: Schedule,
-/// revision: i64 }` (§13) built on the real `Schedule`/`row_to_schedule`
-/// instead of a parallel struct. Do not let this type and `Schedule` drift
-/// apart in the meantime. Also: `agent24-scheduler` (ME4-1.2.2b) should `pub
-/// use agent24_store::FireTrigger` for its own tick/run_now tag rather than
-/// defining a second, same-named type — `FireTrigger` here has no
-/// `agent24-scheduler` dependency to avoid, so there is nothing this crate's
-/// "store-only" scope note (top of file) stops it from being reused as-is.
-pub struct TickScheduleRow {
-    pub id: String,
+/// A schedule row bundled with its `revision` (design §13). Before
+/// ME4-1.2.2a this was a separate `TickScheduleRow` type that duplicated
+/// `Schedule`'s columns, because the old `Schedule.action: ScheduleAction`
+/// (non-`Option`) could not represent a module row at all — the tick needed
+/// a second, parallel struct just to see them. Now that `Schedule.action` is
+/// `Option<ScheduleAction>` (§8.1), every field the tick loop (ME4-1.2.2b)
+/// needs is already on `Schedule`/[`Store::row_to_schedule`]; only
+/// `revision` — a storage/CAS concept, not part of the wire view — has to
+/// ride alongside it. Keeping this as ONE struct (rather than the old
+/// parallel one) means a future field can't drift between the two.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleRecord {
+    pub schedule: Schedule,
     pub revision: i64,
-    pub enabled: bool,
-    pub spec: ScheduleSpec,
-    pub next_run_at: Option<String>,
-    pub last_run_at: Option<String>,
-    pub consecutive_failures: i64,
-    pub user_suspended: bool,
-    pub system_disabled_reason: Option<String>,
-    pub owner_module: Option<String>,
-    pub module_key: Option<String>,
-    /// `Some` for a user (AgentRun) row; `None` for a module row, whose
-    /// `action` column holds [`MODULE_ACTION_SENTINEL`] rather than a real
-    /// `ScheduleAction` (§2.1). Deciding this from `owner_module` — instead
-    /// of attempting (and failing) to deserialize the sentinel — is what
-    /// keeps a module row from vanishing off the tick's radar the way it
-    /// does from the strict `list_schedules`/`get_schedule` paths.
-    pub action: Option<ScheduleAction>,
-}
-
-fn tick_row_from(r: &SqliteRow) -> Result<TickScheduleRow> {
-    let owner_module: Option<String> = r.get("owner_module");
-    let action = if owner_module.is_none() {
-        Some(serde_json::from_str::<ScheduleAction>(
-            &r.get::<String, _>("action"),
-        )?)
-    } else {
-        None
-    };
-    Ok(TickScheduleRow {
-        id: r.get("id"),
-        revision: r.get("revision"),
-        enabled: r.get("enabled"),
-        spec: serde_json::from_str(&r.get::<String, _>("spec"))?,
-        next_run_at: r.get("next_run_at"),
-        last_run_at: r.get("last_run_at"),
-        consecutive_failures: r.get("consecutive_failures"),
-        user_suspended: r.get("user_suspended"),
-        system_disabled_reason: r.get("system_disabled_reason"),
-        owner_module,
-        module_key: r.get("module_key"),
-        action,
-    })
 }
 
 impl Store {
     /// Every schedule row (user AND module), unfiltered, for the tick loop
-    /// (ME4-1.2.2b) — see [`TickScheduleRow`]. A row whose `spec`/`action`
-    /// JSON does not deserialize is skipped and logged, exactly like
-    /// [`Store::list_schedules_lenient`].
+    /// (ME4-1.2.2b) — see [`ScheduleRecord`]. Built on the exact same
+    /// `row_to_schedule` the strict `list_schedules`/`get_schedule` paths
+    /// use, so a row whose `spec`/`action` JSON does not deserialize is
+    /// skipped and logged, exactly like [`Store::list_schedules_lenient`] —
+    /// one corrupt row must never wedge the whole tick. The caller decides
+    /// `enabled`/due/suspended/owner-installed, so a change to those rules
+    /// never requires a store-layer change.
     ///
     /// # Errors
     /// Storage.
-    pub async fn list_schedules_for_tick(&self) -> Result<Vec<TickScheduleRow>> {
+    pub async fn list_schedules_for_tick(&self) -> Result<Vec<ScheduleRecord>> {
         let rows = sqlx::query("SELECT * FROM schedules ORDER BY name ASC")
             .fetch_all(self.pool())
             .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
-            match tick_row_from(row) {
-                Ok(r) => out.push(r),
+            match Store::row_to_schedule(row) {
+                Ok(schedule) => out.push(ScheduleRecord {
+                    schedule,
+                    revision: row.get("revision"),
+                }),
                 Err(err) => {
                     let id: String = row.get("id");
                     tracing::error!("skipping unreadable schedule {id} in tick read-model: {err}");
@@ -1116,6 +1066,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use agent24_protocol::ScheduleAction;
     use sqlx::SqlitePool;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
@@ -3058,15 +3009,20 @@ mod tests {
             name: "renamed".into(),
             enabled: true,
             spec: ScheduleSpec::Every { secs: 60 },
-            action: ScheduleAction::AgentRun {
+            action: Some(ScheduleAction::AgentRun {
                 prompt: "p".into(),
                 session_id: None,
                 model_override: None,
-            },
+            }),
             delivery: vec![],
             last_run_at: None,
             next_run_at: None,
             consecutive_failures: 0,
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
         };
         let stale = store
             .update_user_schedule_cas(&patched, rev, next_read.as_deref(), last_read.as_deref())
@@ -3111,15 +3067,20 @@ mod tests {
             name: "hijack".into(),
             enabled: true,
             spec: ScheduleSpec::Every { secs: 60 },
-            action: ScheduleAction::AgentRun {
+            action: Some(ScheduleAction::AgentRun {
                 prompt: "x".into(),
                 session_id: None,
                 model_override: None,
-            },
+            }),
             delivery: vec![],
             last_run_at: None,
             next_run_at: None,
             consecutive_failures: 0,
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
         };
         assert!(
             !store.upsert_schedule(&hijack).await.unwrap(),
@@ -3355,15 +3316,20 @@ mod tests {
             name: "hijack".into(),
             enabled: false,
             spec: ScheduleSpec::Every { secs: 60 },
-            action: ScheduleAction::AgentRun {
+            action: Some(ScheduleAction::AgentRun {
                 prompt: "x".into(),
                 session_id: None,
                 model_override: None,
-            },
+            }),
             delivery: vec![],
             last_run_at: None,
             next_run_at: None,
             consecutive_failures: 9,
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: false,
+            disabled_by: Some(agent24_protocol::DisabledBy::User),
         };
         assert!(
             !store.update_schedule_runtime(&module_row).await.unwrap(),
@@ -3402,18 +3368,205 @@ mod tests {
             .await
             .unwrap();
         let rows = store.list_schedules_for_tick().await.unwrap();
-        let module_row = rows.iter().find(|r| r.id == "sch_1").unwrap();
-        assert!(module_row.action.is_none() && module_row.owner_module.as_deref() == Some("m"));
+        let module_row = &rows
+            .iter()
+            .find(|r| r.schedule.id == "sch_1")
+            .unwrap()
+            .schedule;
+        assert!(
+            module_row.action.is_none()
+                && module_row.owner.as_ref().map(|o| o.module.as_str()) == Some("m")
+        );
         // review, M-3: consecutive_failures/last_run_at are on the type too
         assert_eq!(module_row.consecutive_failures, 0);
         assert_eq!(module_row.last_run_at, None);
 
-        let user_row = rows.iter().find(|r| r.id == "sch_old").unwrap();
-        assert!(user_row.action.is_some() && user_row.owner_module.is_none());
+        let user_row = &rows
+            .iter()
+            .find(|r| r.schedule.id == "sch_old")
+            .unwrap()
+            .schedule;
+        assert!(user_row.action.is_some() && user_row.owner.is_none());
         assert_eq!(
             user_row.consecutive_failures, 2,
             "SEED_SCH_OLD's seeded value"
         );
         assert_eq!(user_row.last_run_at, None);
+    }
+
+    // ── ME4-1.2.2a — the view fields, round-tripped through the strict paths ─
+
+    /// C1's "fixtures round-trip" for the protocol view (design §13
+    /// acceptance): a module row now decodes cleanly through the STRICT
+    /// `get_schedule`/`list_schedules` (not just the lenient tick path) —
+    /// the whole point of `action` becoming `Option<ScheduleAction>`. Before
+    /// this task both paths returned `Err` for a module row's sentinel
+    /// `action` (§14 R7).
+    #[tokio::test]
+    async fn module_row_roundtrips_through_the_strict_get_and_list_with_full_view_fields() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "sin90",
+                "daily-digest",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+
+        let got = store.get_schedule("sch_1").await.unwrap().unwrap();
+        assert_eq!(got.action, None);
+        assert_eq!(
+            got.owner,
+            Some(agent24_protocol::ScheduleOwner {
+                module: "sin90".into(),
+                key: "daily-digest".into(),
+            })
+        );
+        assert!(!got.user_suspended);
+        assert_eq!(got.system_disabled_reason, None);
+        assert!(got.effective_enabled);
+        assert_eq!(got.disabled_by, None);
+        assert_eq!(got.next_run_at.as_deref(), Some("2026-09-23T09:01:00Z"));
+
+        // list_schedules (strict) must also see it — this used to 500
+        // (§14 R7's decode failure) rather than skip-and-log like the
+        // lenient tick path.
+        let all = store.list_schedules().await.unwrap();
+        assert!(all.iter().any(|s| s.id == "sch_1" && s.action.is_none()));
+        assert!(all.iter().any(|s| s.id == "sch_old" && s.action.is_some()));
+    }
+
+    /// `disabled_by`/`effective_enabled` priority (design §8.1, v3 L-D) as
+    /// actually computed by `row_to_schedule` — not hand-asserted, READ BACK
+    /// from the store after each real mutating call. User-suspended beats
+    /// system-disabled beats the module's own `enabled=false`.
+    #[tokio::test]
+    async fn disabled_by_priority_is_user_then_system_then_module_enabled() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+
+        // 1. enabled, nothing blocking it → eligible.
+        let s = store.get_schedule("sch_1").await.unwrap().unwrap();
+        assert!(s.effective_enabled);
+        assert_eq!(s.disabled_by, None);
+
+        // 2. one failed delivery attempt, `disable_at = 1` → system-disable.
+        // `enabled` stays `true` on the row (T6, §4.3): only
+        // `system_disabled_reason` is set.
+        assert!(
+            store
+                .record_run_now_fire(
+                    "sch_1",
+                    "fire_1",
+                    "2026-09-23T09:02:00Z",
+                    "2026-09-24T09:02:00Z"
+                )
+                .await
+                .unwrap()
+        );
+        let (_applied, disabled) = store
+            .apply_delivery_outcome(
+                "fire_1",
+                0,
+                &DeliveryOutcomeWrite {
+                    status: "failed",
+                    attempts: 1,
+                    next_attempt_at: None,
+                    last_error: Some("boom"),
+                    reset_schedule_failures: false,
+                    count_schedule_failure: true,
+                },
+                "2026-09-23T09:02:01Z",
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(
+            disabled,
+            "one failure past disable_at=1 must system-disable"
+        );
+        let s = store.get_schedule("sch_1").await.unwrap().unwrap();
+        assert!(
+            s.enabled,
+            "system-disable does not touch the module's own enabled flag"
+        );
+        assert!(!s.effective_enabled);
+        assert_eq!(s.disabled_by, Some(agent24_protocol::DisabledBy::System));
+
+        // 3. user-suspend ON TOP of the still-set system reason → "user" wins
+        // over "system" (§8.1's priority: user_suspended checked first).
+        let outcome = store
+            .set_user_suspended("sch_1", true, None, 0, "2026-09-23T09:03:00Z")
+            .await
+            .unwrap();
+        assert_eq!(outcome, SuspendOutcome::Changed);
+        let s = store.get_schedule("sch_1").await.unwrap().unwrap();
+        assert!(s.user_suspended);
+        assert!(s.system_disabled_reason.is_some(), "still set underneath");
+        assert!(!s.effective_enabled);
+        assert_eq!(s.disabled_by, Some(agent24_protocol::DisabledBy::User));
+
+        // 4. resume clears BOTH `user_suspended` and `system_disabled_reason`
+        // (v2, M2) in one call → back to eligible.
+        let rev = revision_of(&store, "sch_1").await;
+        let outcome = store
+            .set_user_suspended(
+                "sch_1",
+                false,
+                Some("2026-09-23T10:00:00Z"),
+                rev,
+                "2026-09-23T09:04:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, SuspendOutcome::Changed);
+        let s = store.get_schedule("sch_1").await.unwrap().unwrap();
+        assert!(!s.user_suspended);
+        assert_eq!(s.system_disabled_reason, None);
+        assert!(s.effective_enabled);
+        assert_eq!(s.disabled_by, None);
+
+        // 5. the module itself turns `enabled` off (nothing else blocking) →
+        // "module" — distinct from "user"/"system" above.
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &ModuleScheduleDesired {
+                    spec: ScheduleSpec::Every { secs: 60 },
+                    enabled: false,
+                    label: "k".into(),
+                },
+                None,
+                "2026-09-23T09:05:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let s = store.get_schedule("sch_1").await.unwrap().unwrap();
+        assert!(!s.effective_enabled);
+        assert_eq!(s.disabled_by, Some(agent24_protocol::DisabledBy::Module));
+
+        // positive control: a plain enabled user row is never blocked.
+        let user_row = store.get_schedule("sch_old").await.unwrap().unwrap();
+        assert!(user_row.effective_enabled);
+        assert_eq!(user_row.disabled_by, None);
     }
 }
