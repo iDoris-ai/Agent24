@@ -416,10 +416,17 @@ pub(crate) async fn compose_terminal_tx(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::legacy_recovery::tests::{strict_facts_file, strict_facts_fixture};
+    use crate::{
+        WorkspaceLeaseId,
+        legacy_recovery::{
+            LegacyRecoveryPromotionAttempt, LegacyRecoveryPromotionOutcome,
+            tests::{strict_facts_file, strict_facts_fixture},
+        },
+    };
     use sqlx::Connection;
     use std::{path::Path, sync::Arc, time::Duration};
     use tokio::sync::Barrier;
+    const RACE_GATE_TIMEOUT: Duration = Duration::from_secs(5);
     #[rustfmt::skip] async fn facts(tx: &mut Transaction<'_, Sqlite>) -> TerminalReleaseSnapshot { snapshot_tx(tx, "run-strict").await.unwrap() }
     #[rustfmt::skip] fn attempt(status: RunStatus) -> TerminalAttempt { TerminalAttempt::new(status, WorkspaceInstant::parse("2026-09-19T00:00:01.000Z").unwrap()) }
     #[rustfmt::skip]
@@ -935,5 +942,378 @@ mod tests {
             .find(|contender| contender.outcome == TerminalCompositionOutcome::Applied)
             .unwrap();
         assert_reopened_terminal_race_facts(&path, &baseline, &history, &winner.attempt).await;
+    }
+
+    // G4/D3: these use the real WAL writer lock.  The gates name a precise
+    // transaction boundary; no scheduler delay is part of either ordering.
+    #[rustfmt::skip]
+    async fn ready_terminal_promotion_fixture(path: &Path) -> (LegacyRecoveryPromotionAttempt, TerminalReleaseSnapshot, Vec<WorkspaceLeaseRow>, Vec<crate::terminal_helpers::TerminalApprovalFacts>) {
+        let seed = strict_facts_file(path).await;
+        usable(&seed).await;
+        // The history row is deliberately retained, while Ready has no live
+        // lease.  That makes cancellation's ExpectedLease::None meaningful.
+        sqlx::raw_sql("DELETE FROM workspace_leases;
+             INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at)
+             VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6',
+                     'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','run-strict','run',
+                     '2026-09-19T00:00:00.000Z','2026-09-19T00:00:00.000Z');
+             UPDATE approvals SET status='approved',decision='{\"type\":\"approve\"}',available_decisions='[\"approve\"]',decided_at='2026-09-19T00:00:00.000Z' WHERE id='approval-strict';
+             INSERT INTO approvals (id,run_id,tool_call_id,kind,summary,payload,available_decisions,status,decision,expires_at,created_at,decided_at,workspace_id)
+             VALUES ('approval-extra','run-strict','tool-extra','exec','extra','{}','[\"approve\"]','approved','{\"type\":\"approve\"}','2026-09-20T00:00:00.000Z','2026-09-19T00:00:00.000Z','2026-09-19T00:00:00.000Z','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5');
+             UPDATE legacy_recovery_holds SET recovery_state='ready',ready_at='2026-09-19T00:00:00.001Z',active_resume_approval_id=NULL WHERE run_id='run-strict'").execute(seed.pool()).await.unwrap();
+        let hint = seed.get_legacy_recovery_hold("run-strict").await.unwrap();
+        let attempt = LegacyRecoveryPromotionAttempt {
+            hint,
+            lease_id: WorkspaceLeaseId::parse("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7").unwrap(),
+            acquired_at: WorkspaceInstant::parse("2026-09-19T00:00:00.002Z").unwrap(),
+        };
+        let mut tx = seed.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let snapshot = facts(&mut tx).await;
+        let history = read_run_lease_history_tx(&mut tx, &snapshot.hold).await.unwrap();
+        let approvals = read_all_approvals_tx(&mut tx, "run-strict").await.unwrap();
+        assert!(snapshot.lease.is_none());
+        assert_eq!(snapshot.hold.recovery_state(), RecoveryState::Ready);
+        assert_eq!(history.len(), 1);
+        assert_eq!(approvals.len(), 2);
+        assert!(history[0].record.released_at.is_some());
+        tx.rollback().await.unwrap();
+        seed.pool().close().await;
+        (attempt, snapshot, history, approvals)
+    }
+
+    #[rustfmt::skip]
+    fn terminal_audit_entry(seq: i64, prev_hash: &str, hold: &LegacyRecoveryHold, terminal: &TerminalAttempt) -> crate::AuditEntry {
+        let (action, raw_detail) = audit_parts(hold, terminal).unwrap();
+        crate::AuditEntry {
+            seq,
+            ts: terminal.ended_at().as_str().into(),
+            actor: "legacy_recovery".into(),
+            action: action.clone(),
+            detail: serde_json::from_str(&raw_detail).unwrap(),
+            prev_hash: prev_hash.into(),
+            hash: crate::audit::entry_hash(prev_hash, terminal.ended_at().as_str(), "legacy_recovery", &action, &raw_detail),
+        }
+    }
+
+    #[rustfmt::skip]
+    fn active_audit_entry(attempt: &LegacyRecoveryPromotionAttempt) -> crate::AuditEntry {
+        let detail = serde_json::json!({
+            "run_id": "run-strict", "cohort_id": "cohort-strict",
+            "workspace_id": "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5", "result_state": "active",
+        });
+        let raw_detail = serde_json::to_string(&detail).unwrap();
+        let action = "legacy_recovery.active".to_owned();
+        crate::AuditEntry {
+            seq: 1,
+            ts: attempt.acquired_at.as_str().into(),
+            actor: "legacy_recovery".into(),
+            action: action.clone(),
+            detail,
+            prev_hash: crate::audit::GENESIS.into(),
+            hash: crate::audit::entry_hash(crate::audit::GENESIS, attempt.acquired_at.as_str(), "legacy_recovery", &action, &raw_detail),
+        }
+    }
+
+    #[rustfmt::skip]
+    async fn assert_terminal_promotion_result(store: &crate::Store, baseline: &TerminalReleaseSnapshot, history: &[WorkspaceLeaseRow], approvals: &[crate::terminal_helpers::TerminalApprovalFacts], terminal: &TerminalAttempt, admitted: Option<WorkspaceLeaseRow>, prior_audit: Vec<crate::AuditEntry>) {
+        let terminal_audit = terminal_audit_entry(i64::try_from(prior_audit.len()).unwrap() + 1, prior_audit.last().map_or(crate::audit::GENESIS, |entry| entry.hash.as_str()), &baseline.hold, terminal);
+        let mut expected = baseline.clone();
+        expected.run.run.status = terminal.result();
+        expected.run.run.ended_at = Some(terminal.ended_at().as_str().into());
+        expected.hold.recovery_state = RecoveryState::Released;
+        expected.hold.ready_at = None;
+        expected.hold.active_resume_approval_id = None;
+        expected.hold.released_at = Some(terminal.ended_at().clone());
+        expected.cohort.completed_at = Some(terminal.ended_at().clone());
+        expected.lease = None;
+        expected.latest_audit = Some(TerminalAuditFacts { seq: terminal_audit.seq, ts: terminal.ended_at().clone(), actor: terminal_audit.actor.clone(), action: terminal_audit.action.clone(), raw_detail: serde_json::to_string(&terminal_audit.detail).unwrap(), prev_hash: terminal_audit.prev_hash.clone(), hash: terminal_audit.hash.clone() });
+        let mut expected_history = history.to_vec();
+        if let Some(mut lease) = admitted {
+            lease.record.released_at = Some(terminal.ended_at().clone());
+            expected_history.push(lease);
+            expected_history.sort_by(|left, right| left.record.id.as_str().cmp(right.record.id.as_str()));
+        }
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(facts(&mut tx).await, expected, "exact run/workspace/hold/cohort/approval facts");
+        assert_eq!(read_all_approvals_tx(&mut tx, "run-strict").await.unwrap(), approvals, "all resolved approvals survive exactly");
+        assert_eq!(read_run_lease_history_tx(&mut tx, &baseline.hold).await.unwrap(), expected_history, "full released lease history survives");
+        tx.commit().await.unwrap();
+        let mut expected_audit = prior_audit;
+        expected_audit.push(terminal_audit);
+        assert_eq!(store.list_audit().await.unwrap(), expected_audit, "no extra audit writes");
+        store.verify_audit_chain().await.unwrap();
+    }
+
+    #[rustfmt::skip]
+    async fn compose_retry(store: &crate::Store, terminal: &TerminalAttempt, expected_lease: ExpectedLease) -> TerminalCompositionOutcome {
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let snapshot = facts(&mut tx).await;
+        let outcome = compose_terminal_tx(&mut tx, &CompositionAttempt::new(terminal.clone(), expected_lease), &snapshot).await.unwrap();
+        tx.commit().await.unwrap();
+        outcome
+    }
+
+    async fn abort_task<T>(task: &mut tokio::task::JoinHandle<T>) {
+        task.abort();
+        let _ = tokio::time::timeout(RACE_GATE_TIMEOUT, task).await;
+    }
+
+    async fn join_race<T, U>(
+        left: &mut tokio::task::JoinHandle<T>,
+        left_name: &str,
+        right: &mut tokio::task::JoinHandle<U>,
+        right_name: &str,
+    ) -> (T, U) {
+        let left = match tokio::time::timeout(RACE_GATE_TIMEOUT, &mut *left).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                abort_task(right).await;
+                panic!("{left_name} failed: {error}");
+            }
+            Err(_) => {
+                abort_task(left).await;
+                abort_task(right).await;
+                panic!("{left_name} timed out");
+            }
+        };
+        let right = match tokio::time::timeout(RACE_GATE_TIMEOUT, &mut *right).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => panic!("{right_name} failed: {error}"),
+            Err(_) => {
+                abort_task(right).await;
+                panic!("{right_name} timed out");
+            }
+        };
+        (left, right)
+    }
+
+    #[tokio::test]
+    async fn terminal_cancellation_first_makes_ready_promotion_stale_then_observable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-before-promotion.db");
+        let (promotion, baseline, history, approvals) =
+            ready_terminal_promotion_fixture(&path).await;
+        let canceller = crate::Store::open(&path).await.unwrap();
+        let promoter = crate::Store::open(&path).await.unwrap();
+        let terminal = attempt(RunStatus::Cancelled);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut cancel = tokio::spawn({
+            let store = canceller.clone();
+            let entered = Arc::clone(&entered);
+            let resume = Arc::clone(&resume);
+            let terminal = terminal.clone();
+            async move {
+                let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+                let snapshot = facts(&mut tx).await;
+                let outcome = compose_terminal_tx(
+                    &mut tx,
+                    &CompositionAttempt::new(terminal, ExpectedLease::None)
+                        .pausing(entered, resume),
+                    &snapshot,
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+                outcome
+            }
+        });
+        if tokio::time::timeout(RACE_GATE_TIMEOUT, entered.notified())
+            .await
+            .is_err()
+        {
+            abort_task(&mut cancel).await;
+            panic!("cancellation did not reach its terminal-update gate");
+        }
+        let (promotion_started, promotion_started_at) = tokio::sync::oneshot::channel();
+        let mut promote = tokio::spawn({
+            let store = promoter.clone();
+            async move {
+                promotion_started.send(()).unwrap();
+                store.promote_legacy_recovery(promotion).await.unwrap()
+            }
+        });
+        if !matches!(
+            tokio::time::timeout(RACE_GATE_TIMEOUT, promotion_started_at).await,
+            Ok(Ok(()))
+        ) {
+            resume.notify_one();
+            abort_task(&mut cancel).await;
+            abort_task(&mut promote).await;
+            panic!("promotion did not start");
+        }
+        assert!(
+            !promote.is_finished(),
+            "promotion is behind cancellation's BEGIN IMMEDIATE"
+        );
+        resume.notify_one();
+        let (cancelled, promoted) =
+            join_race(&mut cancel, "cancellation", &mut promote, "promotion").await;
+        assert_eq!(cancelled, TerminalCompositionOutcome::Applied);
+        assert_eq!(promoted, LegacyRecoveryPromotionOutcome::StaleHint);
+        assert_eq!(
+            compose_retry(&canceller, &terminal, ExpectedLease::None).await,
+            TerminalCompositionOutcome::ObservedApplied
+        );
+        assert_terminal_promotion_result(
+            &canceller,
+            &baseline,
+            &history,
+            &approvals,
+            &terminal,
+            None,
+            vec![],
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_promotion_first_rejects_old_preconditions_then_retries_exact_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("promotion-before-terminal.db");
+        let (promotion, baseline, history, approvals) =
+            ready_terminal_promotion_fixture(&path).await;
+        let promoter = crate::Store::open(&path).await.unwrap();
+        let terminal_store = crate::Store::open(&path).await.unwrap();
+        // Pin four connections so promotion must use the exact fifth connection
+        // carrying this one-shot hook; terminal uses its independent pool.
+        let mut pins = Vec::new();
+        for _ in 0..4 {
+            pins.push(promoter.pool().acquire().await.unwrap());
+        }
+        let mut hooked = promoter.pool().acquire().await.unwrap();
+        let (commit_entered, commit_entered_at) = std::sync::mpsc::channel();
+        let (commit_resume, commit_resume_at) = std::sync::mpsc::channel();
+        let once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        hooked.lock_handle().await.unwrap().set_commit_hook({
+            let once = Arc::clone(&once);
+            move || {
+                if once.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    commit_entered.send(()).unwrap();
+                    commit_resume_at.recv_timeout(RACE_GATE_TIMEOUT).is_ok()
+                } else {
+                    true
+                }
+            }
+        });
+        drop(hooked);
+        let mut promote = tokio::spawn({
+            let store = promoter.clone();
+            async move {
+                store
+                    .promote_legacy_recovery(promotion.clone())
+                    .await
+                    .unwrap()
+            }
+        });
+        let mut commit_entered =
+            tokio::task::spawn_blocking(move || commit_entered_at.recv_timeout(RACE_GATE_TIMEOUT));
+        if !matches!(
+            tokio::time::timeout(RACE_GATE_TIMEOUT, &mut commit_entered).await,
+            Ok(Ok(Ok(())))
+        ) {
+            let _ = commit_resume.send(());
+            abort_task(&mut promote).await;
+            let _ = tokio::time::timeout(RACE_GATE_TIMEOUT, &mut commit_entered).await;
+            panic!("promotion did not reach its commit hook");
+        }
+        let terminal = attempt(RunStatus::Cancelled);
+        let (terminal_started, terminal_started_at) = tokio::sync::oneshot::channel();
+        let old_snapshot = baseline.clone();
+        let old_terminal = terminal.clone();
+        let mut old = tokio::spawn({
+            let store = terminal_store.clone();
+            async move {
+                terminal_started.send(()).unwrap();
+                let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+                let outcome = compose_terminal_tx(
+                    &mut tx,
+                    &CompositionAttempt::new(old_terminal, ExpectedLease::None),
+                    &old_snapshot,
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+                outcome
+            }
+        });
+        if !matches!(
+            tokio::time::timeout(RACE_GATE_TIMEOUT, terminal_started_at).await,
+            Ok(Ok(()))
+        ) {
+            let _ = commit_resume.send(());
+            abort_task(&mut promote).await;
+            abort_task(&mut old).await;
+            panic!("terminal did not start");
+        }
+        assert!(
+            !old.is_finished(),
+            "terminal waits behind promotion's commit gate"
+        );
+        commit_resume.send(()).unwrap();
+        let (promotion, old_outcome) =
+            join_race(&mut promote, "promotion", &mut old, "terminal").await;
+        let admitted = match promotion {
+            LegacyRecoveryPromotionOutcome::Admitted(admission) => admission.lease,
+            other => panic!("promotion did not admit: {other:?}"),
+        };
+        assert_eq!(old_outcome, TerminalCompositionOutcome::Conflict);
+        let mut tx = terminal_store
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        let active = facts(&mut tx).await;
+        assert_eq!(active.hold.recovery_state(), RecoveryState::Active);
+        assert_eq!(active.lease.as_ref(), Some(&admitted));
+        assert_eq!(
+            compose_terminal_tx(
+                &mut tx,
+                &CompositionAttempt::new(terminal.clone(), ExpectedLease::None),
+                &active,
+            )
+            .await
+            .unwrap(),
+            TerminalCompositionOutcome::Conflict,
+            "old ExpectedLease::None conflicts even with a fresh Active snapshot"
+        );
+        let exact = ExpectedLease::Exact(Box::new(admitted.clone()));
+        assert_eq!(
+            compose_terminal_tx(
+                &mut tx,
+                &CompositionAttempt::new(terminal.clone(), exact.clone()),
+                &active,
+            )
+            .await
+            .unwrap(),
+            TerminalCompositionOutcome::Applied
+        );
+        let released = facts(&mut tx).await;
+        assert_eq!(
+            compose_terminal_tx(
+                &mut tx,
+                &CompositionAttempt::new(terminal.clone(), exact),
+                &released,
+            )
+            .await
+            .unwrap(),
+            TerminalCompositionOutcome::ObservedApplied
+        );
+        tx.commit().await.unwrap();
+        drop(pins);
+        assert_terminal_promotion_result(
+            &terminal_store,
+            &baseline,
+            &history,
+            &approvals,
+            &terminal,
+            Some(admitted),
+            vec![active_audit_entry(&LegacyRecoveryPromotionAttempt {
+                hint: baseline.hold.clone(),
+                lease_id: WorkspaceLeaseId::parse("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7").unwrap(),
+                acquired_at: WorkspaceInstant::parse("2026-09-19T00:00:00.002Z").unwrap(),
+            })],
+        )
+        .await;
     }
 }
