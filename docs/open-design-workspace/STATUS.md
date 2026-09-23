@@ -206,6 +206,12 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - G4 #491 叠加 #468（`0529c98`，+201/-2）覆盖 terminal durability ownership，内部 exact review `PASS`；GitHub 当前仅 CLA green，external review pending。
 - #259 与 #485 继续 CI green、review pending；所有上述 PR 仍受 review 和/或依赖门禁约束，均非 merge-ready，P2/P9 仍 `IN PROGRESS`。
 
+## 2026-09-24 Wave 16 当前门禁
+
+- G8 #492（叠 #485，`99b105c`，+399/-5）GenerationDriver 两次 exact review `PASS`，首轮 macOS 偶发失败后重跑三平台全绿，review 未提交；#494（叠 #492，`001e4cd`，+285/-1）对抗 review `PASS`，完整 sidecar matrix green，review 未提交。
+- G1 #495（叠 #490，`391e2e3`，+306）public retention 两次 review `PASS`；G4 #493（叠 #491，`1e089a8`，+266/-1）terminal WAL `PASS`，#496（叠 #493，`e3045ef`，+381/-1）terminal/promotion 两次 review `PASS`；后三者 GitHub 当前仅 CLA green、review 未提交。
+- 全部仍是 dependency-stacked；#259 仍为 root `REVIEW_REQUIRED`。没有 merge-ready 或 P2 complete 结论，P2/P9 继续 `IN PROGRESS`。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
