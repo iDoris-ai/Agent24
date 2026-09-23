@@ -13,6 +13,7 @@ mod allocation_commitment;
 mod allocation_intent;
 mod allocation_materialization;
 mod allocation_record;
+mod allocation_registration;
 mod allocation_reservation;
 mod allocation_types;
 mod audit;
