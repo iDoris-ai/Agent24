@@ -37,10 +37,25 @@ async fn select_reserved(
 }
 
 impl Store {
-    /// Atomically persist a validated allocation intent and its audit evidence.
+    /// Reserve a trusted, structurally validated intent in the allocation journal.
     ///
-    /// This is intentionally crate-private: filesystem materialization and the
-    /// public workspace service are later slices of the allocation protocol.
+    /// This internal journal primitive does not authorize its caller, establish
+    /// lifecycle ownership, register a workspace, or materialize a filesystem
+    /// path. Its IDs and locators must be internally derived, never
+    /// request-controlled. Public exposure is deferred to the authorized
+    /// `WorkspaceService` layer.
+    ///
+    /// The reservation row and its `workspace.allocation_reserved` audit entry
+    /// are committed atomically. Conflicts are checked in this order:
+    /// allocation identifier, allocation workspace, allocation relative name,
+    /// then a legacy workspace identifier. Replaying the exact allocation
+    /// identifier returns `Conflict(WorkspaceConflict::AllocationIdentifier)`.
+    ///
+    /// The returned record is strictly reread after the audit write. If the
+    /// commit result is uncertain, reconcile with
+    /// [`Store::get_workspace_allocation`] using `intent.allocation_id()`.
+    /// Errors are typed, static, and redacted: database or trigger details and
+    /// submitted identifiers are not exposed.
     pub(crate) async fn reserve_workspace_allocation(
         &self,
         intent: &AllocationIntent,
@@ -178,6 +193,8 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+    const ALLOCATION_ID: &str = "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+    const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
 
     async fn hooked_store(path: &Path) -> Store {
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
@@ -216,6 +233,38 @@ mod tests {
         .await
         .unwrap();
         (row.get("allocations"), row.get("audit"))
+    }
+
+    #[tokio::test]
+    async fn reservation_is_db_only_and_exact_replay_is_idempotently_rejected() {
+        let store = Store::open_memory().await.unwrap();
+        let input = intent(ALLOCATION_ID, WORKSPACE_ID, "public-api");
+
+        let record = store.reserve_workspace_allocation(&input).await.unwrap();
+        assert_eq!(record.id().as_str(), ALLOCATION_ID);
+        assert_eq!(record.workspace_id().as_str(), WORKSPACE_ID);
+        assert_eq!(record.phase(), AllocationPhase::Reserved);
+        assert!(record.root_identity().is_none());
+        assert!(record.failure_reason().is_none());
+        assert_eq!(
+            store
+                .get_workspace(&WorkspaceId::parse(WORKSPACE_ID).unwrap())
+                .await
+                .err(),
+            Some(WorkspaceStoreError::NotFound)
+        );
+
+        let audit = store.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, "workspace.allocation_reserved");
+
+        assert_eq!(
+            store.reserve_workspace_allocation(&input).await.err(),
+            Some(WorkspaceStoreError::Conflict(
+                WorkspaceConflict::AllocationIdentifier
+            ))
+        );
+        assert_eq!(store.list_audit().await.unwrap().len(), 1);
     }
 
     fn legacy_workspace(id: &str, root: &str, identity: RootIdentity) -> NewScratchWorkspace {
