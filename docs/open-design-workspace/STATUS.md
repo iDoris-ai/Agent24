@@ -125,7 +125,7 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
   core；#433 是其 adversarial test。G4 #434 是 dormant Ready→Active core。精确内部结论为：
   #432/#433/#434 各两份 SOL `PASS`，#435 一份 SOL `PASS`；external reviews 均 pending。
   #432、#433、#434 不接 runtime，也不代表 P2/P9 完成。
-- PR 行数规则维持日常目标 200–300、硬上限 500；301–500 行原子例外须两次独立 SOL。
+- PR 行数规则维持日常目标 200–300、硬上限 500；301–500 行原子例外须两次独立 smart-model exact-head review。
   #430（494，two SOL PASS）、#432（422）、#433（373）、#434（499）是已说明并审查的原子例外。
 - 下一步为 G1 registration writer（#432/#433 commit adversarial matrix 已完成）、G4 promotion
   adversarial test 与 G8 fixed stdout worker；#436 grace primitive 正在审查中，再经后续门禁才能进入 runtime。
@@ -164,6 +164,19 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - terminal core 经重新设计拆为 planning/release primitives 与 caller-owned transactional
   composition 两个堆叠 PR；旧 +698/-45 和后续压缩草稿均不得提交。
 - 当前仍无 dependency-ready Open Design root 可 merge；P2/P9 均不得标记 complete。
+
+## 2026-09-23 Wave 12 当前门禁
+
+- G1 #458（head `619e567`，+471/-2）提供 POSIX pinned allocation-root identity，Windows
+  在真实 HANDLE evidence 前返回 unsupported；两份 Astra exact-diff review `PASS`。下一步先做
+  store registration projection + exact retained writer，再做跨 crate composition。
+- G4 #459（head `bfbee86`，+494/-2）提供 owner-scoped lease、hold/cohort CAS 与 terminal
+  planning；两份 Astra exact-diff review `PASS`。Released 只产生 observation candidate，完整
+  approval/audit/released-lease/cohort 证明仍属于下一 transactional composition slice。
+- G8 #452（head `0e10510`，+176/-110）把 stdout/stderr 改为独立 single-take pipe；#460
+  （head `b9cbc30`，+417/-0）增加 dormant fixed-thread Ready reader。后者只输出 transport chunk，
+  不持有 ReadyGate/deadline，也未接 actor/runtime；二者 review 门禁均通过。
+- 这些 PR 均为 frontier descendants，不改变 #228/#254 主干根门禁，也不授权越序 merge。
 
 ## A24-OD-00 小 PR 栈
 
@@ -210,7 +223,7 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - workspace/session/run/events/approval 均保持 Creative default deny；
 - A24-OD-01 与 A24-OD-02 必须共同消费 ADR-002，不能各自发明字段；
 - 所有实现继续按功能拆分，PR 日常目标为 200–300 changed lines，硬上限 500；
-  301–500 行仅用于不可合理拆分的原子切片，并强制两次独立 SOL exact-head review。
+  301–500 行仅用于不可合理拆分的原子切片，并强制两次独立 smart-model exact-head review。
 
 ## A24-OD-01 已通过切片
 
