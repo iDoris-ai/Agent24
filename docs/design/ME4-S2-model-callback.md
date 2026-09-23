@@ -1,6 +1,10 @@
 # ME4-S2 —— 推理回调 `_a24/model/*`（ME4-4.1.1 设计）
 
-> **草稿 v3，待第 3 轮评审**（2026-09-24）。v1 第 1 轮 **REQUEST_CHANGES（0 C / 2 H / 7 M / 10 L）** → v2 全部采纳；
+> **设计已冻结（v3.1，2026-09-24）**。第 3 轮评审 **APPROVE**（0 C / 0 H / 2 M / 7 L），M/L 全部折入 v3.1（见「v3 → v3.1 改动记录」）。
+> **全部三轮都是 Tier 2 本地评审**（全新上下文 Opus 子代理；Codex 额度耗尽），记 **ME4-CODEX-DEBT-3**：额度恢复后请 Codex 补审，重点
+> ① reqwest / hyper-util 在别的平台与特性组合下的代理行为（`no_proxy()` 是否覆盖系统代理设置、macOS 以外的实现）；② J19 在真实停机时序下是否 flaky。
+>
+> 此前：v1 第 1 轮 **REQUEST_CHANGES（0 C / 2 H / 7 M / 10 L）** → v2 全部采纳；
 > v2 第 2 轮 **REQUEST_CHANGES（0 C / 1 H / 6 M / 5 L；第 1 轮 19 条中 16 FIXED、3 PARTIAL）** → v3 全部采纳，见「v2 → v3 改动记录」。
 > 评审方：按 `docs/agent/PLAN-ME4-OS-CAPABILITIES.md` §一 第 3 条——Codex 额度 2026-09-29 19:28 前耗尽，
 > 期间由**全新上下文的 Opus 子代理**做对抗评审（Critical/High/Medium/Low + file:line），评审记录在此处逐轮追加，
@@ -10,7 +14,7 @@
 > |---|---|---|---|
 > | 第 1 轮（v1） | 全新上下文 Opus 子代理（Tier 2，Codex 额度耗尽） | REQUEST_CHANGES | 0 / 2 / 7 / 10 |
 > | 第 2 轮（v2） | 全新上下文 Opus 子代理（验证 crate `scratchpad/me4s2-review2/`：proxy / redirect / mapped） | REQUEST_CHANGES（16 FIXED / 3 PARTIAL） | 0 / 1 / 6 / 5 |
-> | 第 3 轮（v3） | 待送审 | — | — |
+> | 第 3 轮（v3） | 全新上下文 Opus 子代理（验证 `scratchpad/me4s2-review3/`：删 `.no_proxy()` / 删 `redirect::Policy::none()` 各自让对应测试变红） | **APPROVE（可冻结）** | 0 / 0 / 2 / 7 |
 >
 > **与 ME4-1.1.1（调度回调设计 `docs/design/ME4-S1-scheduler-callback.md`，另一个 worktree 并行写、同在评审中）的改动需要合并**——
 > 不只是 SPEC 文本，还有 `KERNEL_OOP_GRANTS`、`mount_all`/`mount_package` 的 **`CallbackDeps`**（S1 v3 定义、按值传入 `mount_all`；本文只往里加 `models` 字段，不另加参数）、
@@ -23,9 +27,25 @@
 
 | 版本 | 日期 | 改动 |
 |---|---|---|
+| v3.1 | 2026-09-24 | **冻结版**。第 3 轮 APPROVE 的 2 M + 7 L 折入（见下表）；followups 改为 §13 的待登记文本（编号由统筹在规划分支分配） |
 | v3 | 2026-09-24 | 第 2 轮评审 12 条 + 3 条 PARTIAL 全部采纳（见下表）。要点：N1 `Local` 的定义收紧为「端点在回环上、不经代理、不跟随重定向」（`OpenAiCompatProvider::loopback_only`，并入 FU-71）；N4 结果按序列化后长度判定；N5 生产接线判据 J19；N6/N7 切法再拆（b1a/b1b/b2、4.2.3a/b）；与 S1 v3 的 `CallbackDeps` 对齐 |
 | v2 | 2026-09-24 | 第 1 轮评审 19 条全部采纳（见下表）。要点：H1 Tier 标签改用 HTTP 客户端同一解析器判定（现有代码缺陷，登记 FU-71）；H2 每个模块走独立健康表的路由器；M1 取消根与用量写者挂到 `modules_cut_off()`；M2 全局并发加公平规则；M3 结果文本 ≤ 512 KiB；M4 `UsageSink` + 4.2.2b 预拆 b1/b2 + §10.2 完整切法；M5 `OLLAMA_URL` 可配、黑盒做 LocalOnly 负对照；M6/M7 SPEC 措辞与合并清单；L1–L10 |
 | v1 | 2026-09-23 | 初稿。裁决 S2-1（`model_access` 字段）、S2-4（选 **(a) 按方法超时 + 统一桥接取消**）、S2-2（`max_tokens: Option<NonZeroU32>` / `model_id: Option<String>`）、S2-5（并发 2/全局 4、令牌桶 30/0.5s、`module_model_usage` 表与 `GET /api/v1/usage?module=`）、S2-6（新增 `unavailable` 一个 kind）、S2-3（`_a24/model/complete` 的确切 JSON 形状；不做 `_a24/model/list`）。同分支改 SPEC-ME3 的 Models 相关内容 |
+
+## v3 → v3.1 改动记录（第 3 轮：APPROVE，0 C / 0 H / 2 M / 7 L，全部折入）
+
+| # | 级别 | 问题 | v3.1 的处理 |
+|---|---|---|---|
+| M-1 | Medium | SPEC §8 offer set 阶梯表缺 ME-4b 行 | SPEC §8 阶梯表加 `ME-4b（ME4-4.2.2b2） \| {Events, Approval, Memory, Scheduler, Models}`；§10.3 合并表加一行「§8 阶梯表：后合并方追加自己的行」 |
+| M-2 | Medium | J19 的第二个变异（删掉等写者）靠时序，不确定 | §6.3/J19：等写者收成具名函数 `stop_usage_writer(handle, deadline)`；`UsageRecorder::spawn_with_write_delay` 注入确定的写入延迟（生产为 0）。J19 拆两半：结构测试钉「`serve()` 在 supervisor 停止之后调用它」，行为测试在 100 ms 写延迟下断言「不等就 0 行、等了就 1 行」——变异「函数立即返回」**每次**变红（scratch 连跑 3 次实测） |
+| L-1 | Low | `Tier::Local` 的前提只写在设计里 | `Tier::Local`、`ModelRouter::new`、`with_defaults` 的文档写明「Local provider 必须是 `loopback_only()` 构造的」（provider 自报判定作为可选项不做，见 §12） |
+| L-2 | Low | `loopback_only` 构造失败时 `unwrap_or_default()` 退回会读代理的默认 client | 改为 `expect`（带 `#[expect(clippy::expect_used, reason = …)]`，工作区禁 `expect`）：失败即关闭 |
+| L-3 | Low | `new` 与 `loopback_only` 各写一份 builder | 抽 `base_client_builder()`，两者共用 |
+| L-4 | Low | 真 oMLX 冒烟的运行方式没写 | J14 写明用精确测试名：`cargo test -p agent24d --test me4_model_blackbox -- --exact real_omlx_smoke --ignored` |
+| L-5 | Low | b2 的依赖理由写成 ME4-1.5.1 | 改为「ME4-1.4.1（S1 引入 `CallbackDeps`）」 |
+| L-6 | Low | §8 开头写 J1–J18 | 改为 J1–J19 |
+| L-7 | Low | §10.3 合并表是否还需按 S1 冻结版再对一遍 | 保持：合并表已按 S1 冻结版 `7543eb3` 定终态（第 3 轮评审核过 `CallbackDeps`、迁移号、timeout 文案、`ErrorKind`、§9 终态一致），§10.3 备注一句 |
+| （统筹） | — | 本分支 `followups.md` 自编的 FU-71/72/73 与规划分支编号冲突 | `followups.md` 撤回为与 `origin/docs/me4-plan-2026-09-23` 一致；要登记的条目文本写在 §13。回环判定缺陷对应规划分支的 **FU-72**（统筹扩展为「解析 + 代理 + 重定向」） |
 
 ## v2 → v3 改动记录（第 2 轮：REQUEST_CHANGES，0 C / 1 H / 6 M / 5 L，另 3 条 PARTIAL，全部采纳）
 
@@ -197,7 +217,7 @@ impl DomainOsManifest {
 `remote_allowed` 的调用以 `Privacy::Any` 路由，模块只能给 `complexity: simple | complex`（缺省 `simple`）：`Simple` 本地优先、`Complex` 远端优先（`router.rs:78-87`）。
 选哪个 provider、用哪个模型，**全由内核**。
 
-### 2.3 `Tier` 标签的判定（v2 H1；ME4-4.2.2a，现有代码缺陷 FU-71）
+### 2.3 `Tier` 标签的判定（v2 H1；ME4-4.2.2a，现有代码缺陷——规划分支 FU-72）
 
 `router.rs` 的 `url_host`/`is_loopback_host`（§1 第 16 条）删除，`env_local_tier` 改为：
 
@@ -233,15 +253,22 @@ impl OpenAiCompatProvider {
     /// 判为 Local 的 provider 必须这样构建：不经代理、不跟随重定向（3xx → 非成功状态 → Rejected）。
     #[must_use]
     pub fn loopback_only(mut self) -> Self {
-        self.client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
+        // v3.1 L-2：失败即关闭——unwrap_or_default() 会退回一个读代理、跟随重定向的默认 client。
+        #[expect(clippy::expect_used, reason = "a Local provider must never fall back to a proxy-reading client")]
+        let client = base_client_builder()                     // v3.1 L-3：与 new() 共用
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default();
+            .expect("building the loopback-only HTTP client failed");
+        self.client = client;
         self
     }
 }
+/// v3.1 L-3：所有 provider client 共享的设置；new() 用 base_client_builder().build().unwrap_or_default()。
+fn base_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().connect_timeout(Duration::from_secs(2))
+}
+// v3.1 L-1：Tier::Local、ModelRouter::new、with_defaults 的文档写明「Local provider 必须是 loopback_only() 构造的」。
 // router.rs from_env：
 let build = |name: &str, url: String, key: Option<String>, tier: Tier| -> Arc<dyn ModelProvider> {
     let p = crate::OpenAiCompatProvider::new(name, url, key, tier_label(tier), default_model.clone());
@@ -761,14 +788,28 @@ impl UsageSink for UsageRecorder { /* try_send；满 → dropped += 1 + warn */ 
     最后一个 sender 消失时，队列里已有的记录全部写完，任务返回。
   - 硬上限 = `hard_stop`：`serve` 传入「停机 token 取消后，`sleep_until(shutdown.deadlines().modules)`」，即 cut-off + `CONFIRM`（200ms）。
     到点即关通道、丢弃剩余并 `warn!(lost = n)`。**不新增停机预算**：`deadlines().modules` 本来就在 `persist`/`watchdog` 之前（`lifecycle.rs:104-116`），默认 2s 的退出上限不变。
-  - `serve` 在停机序列里等写者的 `JoinHandle`，与等 supervisor 并列，上限同一个 `deadlines().modules`。
+  - `serve` 在停机序列里、supervisor 停止之后调用 `stop_usage_writer(writer, shutdown.deadlines().modules)`（v3.1 M-2 具名，J19 钉住）：
+
+```rust
+// agentd/src/usage_recorder.rs —— 4.2.3b（scratch 已 check + test）
+pub async fn stop_usage_writer(writer: tokio::task::JoinHandle<()>, deadline: tokio::time::Instant) {
+    if tokio::time::timeout_at(deadline, writer).await.is_err() {
+        tracing::warn!("the model usage writer did not finish by the modules deadline");
+    }
+}
+impl UsageRecorder {
+    /// 测试缝：每次写库前固定延迟（生产 spawn = 0）。J19 用它让「没等写者」确定可见。
+    pub fn spawn_with_write_delay(store: Store, hard_stop: impl Future<Output = ()> + Send + 'static,
+                                  write_delay: Duration) -> (Arc<Self>, tokio::task::JoinHandle<()>);
+}
+```
 - 写失败 `error` 日志，不重试。
 
 ### 6.4 费用字段怎么填
 
 **不填 0**。今天 `Usage.cost_usd` 恒 `0.0`（§1 第 1 条），provider 不回报费用、内核没有价目表——一个恒为 0 的「费用」在远端调用上是**错误的事实陈述**。
 所以表里**没有费用列**，`GET /api/v1/usage?module=` 的 `cost_usd` 恒为 **`null`**（含义：未知，不是免费）。将来有价目表时加一列 + 迁移，`null` 变成真数。
-不带 `module` 的全局响应里那个恒 `0.0` 的 `cost_usd` 同样是错误陈述，但改它就改了 `/api/v1/usage` 的既有输出——登记 **FU-72**，不在本轮改。
+不带 `module` 的全局响应里那个恒 `0.0` 的 `cost_usd` 同样是错误陈述，但改它就改了 `/api/v1/usage` 的既有输出——**待登记 §13-B**，不在本轮改。
 
 ### 6.5 `GET /api/v1/usage?module=<name>`
 
@@ -837,7 +878,7 @@ impl UsageSink for UsageRecorder { /* try_send；满 → dropped += 1 + warn */ 
 ---
 ## 8. 判据（每条带正对照；`cargo test <过滤>` 一律先 `-- --list` 断言非空，PLAN §一 第 5 条）
 
-> 编号 J1–J18。「变异」= `docs/agent/mutate.sh` 的改回方式，改回后该判据必须变红。括号里是所属任务（切法见 §10.2）。
+> 编号 J1–J19。「变异」= `docs/agent/mutate.sh` 的改回方式，改回后该判据必须变红。括号里是所属任务（切法见 §10.2）。
 
 **J1 manifest（4.2.1，`cargo test -p agent24-domain model_access`）**：缺省 → `LocalOnly`；`[models]` + `remote_allowed` → `RemoteAllowed`；
 显式 `local_only` → `LocalOnly`（正对照）；`model_access: remote` → 错误且消息同时含 `"remote"` 与 `remote_allowed`；`[events]` + `remote_allowed` → 错误且消息含 `models`；
@@ -909,7 +950,9 @@ store 层：WAL 文件库上 50 个并发记录 → 合计恰为 50；token 饱�
 - **正对照**：`m_remote` + `complexity:"complex"` → `tier:"remote"`、远端桩计数 1。
 - `GET /api/v1/usage?module=m_local` 计数与上面一致；重启 daemon 后仍在。
 - 本地桩对下一次调用挂起，期间 `agent24 os disable m_local` → 本地桩观察到连接关闭（撤销路径的真实版）。
-- 未请求 `models` 的第三个模块 → `forbidden`（正对照）。另留 `#[ignore]` 的真 oMLX 冒烟。
+- 未请求 `models` 的第三个模块 → `forbidden`（正对照）。另留 `#[ignore]` 的真 oMLX 冒烟 `real_omlx_smoke`。
+- **运行说明（v3.1 L-4）**：黑盒 `cargo test -p agent24d --test me4_model_blackbox`（先 `-- --list` 断言非空）；冒烟**只用精确测试名**跑：
+  `cargo test -p agent24d --test me4_model_blackbox -- --exact real_omlx_smoke --ignored`（`--ignored` 不带 `--exact` 会连带其它 ignored 测试）。
 
 **J15 LocalOnly 绊线（4.2.2b1）**：正常路由下不可达，用变异测：把 `tier_order` 的 `LocalOnly` 分支加上 `Tier::Remote` → J3 的「桩计数 0」变红、**且**模块收到 `-32603`。
 （它只证明绊线接上了；打错标签不在它的能力范围内，见 J16。）
@@ -943,8 +986,13 @@ store 层：WAL 文件库上 50 个并发记录 → 合计恰为 50；token 饱�
 provider 指向挂起的 TCP 桩；模块发起一个不带 `request_id` 的调用、桩确认收到后，发起停机（`Shutdown::request`）→ 断言：模块收到 `cancelled`（或连接随撤销关闭，二者之一，取决于撤销与 cut-off 谁先到），
 桩观察到连接关闭；daemon 退出后以同一数据文件打开 `Store`，`module_model_usage` 的 `none` 行 `calls_cancelled = 1`。
 覆盖的正是 b2 的 `spawn_cancel_root(shutdown.modules_cut_off())` 与 4.2.3b 的「停机序列等写者」。
-变异：`serve()` 里取消根改挂一个永不取消的 token → 调用活过写者硬上限，记录不落库，红；把「等写者」删掉 → 记录可能在进程退出时丢失（同样红，偶发性由 10 次连跑覆盖）。
-（scratch `cut_off_cancels_in_flight_calls_and_their_record_lands_in_the_store`：真 provider + 真 `UsageRecorder` + `spawn_cancel_root` + `CallbackDeps` 按值 drop 组装的版本，变异「取消根改为永不取消」已实测变红。）
+变异 1：`serve()` 里取消根改挂一个永不取消的 token → 调用活过写者硬上限，记录不落库，红。
+**变异 2（v3.1 M-2，确定性）**：「等写者」收成具名函数 `stop_usage_writer(writer, deadline)`（§6.3），由两条测试钉住——
+(a) 结构测试（照 `domain.rs` 读 `include_str!` 的先例）：`serve()` 的源码里 `stop_usage_writer(` 出现在「等 supervisor 停止」那段之后，正对照：删掉调用 → 红；
+(b) 行为测试：`UsageRecorder::spawn_with_write_delay(store, pending, 100ms)` 记一笔后 drop sender——**此刻**断言 0 行（负对照，证明延迟使「不等」可见），`stop_usage_writer` 返回后断言 1 行；
+变异「`stop_usage_writer` 立即返回」→ 第二个断言**每次**变红（不依赖停机时序）。J19 的 daemon 级部分仍跑真实停机，作为接线的端到端证据。
+（scratch `cut_off_cancels_in_flight_calls_and_their_record_lands_in_the_store`：真 provider + 真 `UsageRecorder` + `spawn_cancel_root` + `CallbackDeps` 按值 drop 组装的版本，变异 1 已实测变红；
+`waiting_for_the_writer_is_what_lands_the_record`：变异 2 连跑 3 次每次变红。）
 
 ---
 
@@ -975,8 +1023,8 @@ provider 指向挂起的 TCP 桩；模块发起一个不带 `request_id` 的调�
 | crate / 文件 | 新增或改动 | 任务 |
 |---|---|---|
 | `agent24-domain/src/lib.rs` | `ModelAccess` + `ALL`/`as_str`/`parse`；`RawManifest.model_access: Option<String>`；`DomainOsManifest::model_access()`；解析期两条校验 | 4.2.1 |
-| `agent24-models/src/lib.rs` | **（v3）`OpenAiCompatProvider::loopback_only()`**；`CompletionRequest.max_tokens: Option<NonZeroU32>`；`CompletionResponse.model_id: Option<String>`；`OaChatResponse.model`；条件写 `max_tokens`；**`ModelError::Rejected { status, message }`**，`friendly_http_error` 对 4xx（非 429）返回它 | 4.2.2a |
-| `agent24-models/src/router.rs` | `Served { provider, tier, response }`；`complete_served`；`complete` 改为投影；**`with_separate_health`**；**`is_loopback_url` + 新 `env_local_tier`**（删 `url_host`/`is_loopback_host`）；**`OLLAMA_URL`**；**（v3）`from_env` 对 `Local` 调 `loopback_only`、`tier_label`** | 4.2.2a |
+| `agent24-models/src/lib.rs` | **（v3）`OpenAiCompatProvider::loopback_only()`**（v3.1：`expect` 失败即关闭）、**`base_client_builder()`**（v3.1 L-3）；`CompletionRequest.max_tokens: Option<NonZeroU32>`；`CompletionResponse.model_id: Option<String>`；`OaChatResponse.model`；条件写 `max_tokens`；**`ModelError::Rejected { status, message }`**，`friendly_http_error` 对 4xx（非 429）返回它 | 4.2.2a |
+| `agent24-models/src/router.rs` | `Served { provider, tier, response }`；`complete_served`；`complete` 改为投影；**`with_separate_health`**；**`is_loopback_url` + 新 `env_local_tier`**（删 `url_host`/`is_loopback_host`）；**`OLLAMA_URL`**；**（v3）`from_env` 对 `Local` 调 `loopback_only`、`tier_label`**；**（v3.1 L-1）`Tier::Local`/`new`/`with_defaults` 文档写明 Local provider 必须 `loopback_only()`** | 4.2.2a |
 | `agent24-cli/src/service.rs` | **（v3 N2）`PASSTHROUGH_VARS` 加 `"OLLAMA_URL"`（`[&str; 11]` → `[&str; 12]`）** | 4.2.2a |
 | 工作区其它 crate | 15 处结构体字面量补字段；`agent24-agent/src/lib.rs:1026-1031` 与 `agentd routes.rs:140-152` 两处 `ModelError` 穷尽 `match` 加 `Rejected` 分支（与 `Provider` 同处理） | 4.2.2a |
 | `agent24-os-proto/src/rpc.rs` | `Handler::call_timeout`（默认 `None`，文档含并发警示）；`MAX_METHOD_CALL_TIMEOUT`；`effective_call_timeout`；`Conn.by_task` 带时长；`on_frame`/`finished`；`ErrorKind::Unavailable`（`ALL` 18）；闭集测试的 SPEC 拷贝 | 4.2.2-0 |
@@ -984,10 +1032,10 @@ provider 指向挂起的 TCP 桩；模块发起一个不带 `request_id` 的调�
 | `agentd/src/domain.rs` | `KERNEL_OOP_GRANTS` 加 `Models`；**S1 v3 的 `CallbackDeps` 加字段 `models: Option<ModelCallbackDeps>`（不另加参数）**；闭包外建 `ModelGrant`；`provides`/`granted_names`；注册 `_a24/model/complete` | 4.2.2b2 |
 | `agentd/src/server.rs` | `serve()`：`spawn_cancel_root(shutdown.modules_cut_off())`、`ModelAdmission::new(4, 2)`、sink（b2 为 `MemoryUsageSink`，4.2.3 换成 `UsageRecorder::spawn(store, hard_stop)` 并在停机序列里等它）、按值传给 `mount_all` | 4.2.2b2 / 4.2.3 |
 | `agent24-store` | 迁移 `0008_module_model_usage.sql`（合并时若已有更大号则 max+1）；`module_model_usage.rs`：`ServedBy`、`ModelUsageDelta`、`ModelUsageRow`、三个 `Store` 方法 | 4.2.3a |
-| `agentd/src/usage_recorder.rs`（新） | `UsageRecorder`（`spawn`、`dropped`、`impl UsageSink`） | 4.2.3b |
+| `agentd/src/usage_recorder.rs`（新） | `UsageRecorder`（`spawn`、`spawn_with_write_delay`、`dropped`、`impl UsageSink`）、`stop_usage_writer` | 4.2.3b |
 | `agentd/src/routes.rs` | `get_usage` 改读 `RawQuery` + `module_selector`；`ModuleUsageResponse`/`UsageCounts`/`DailyUsage` | 4.2.3b |
 | `docs/specs/SPEC-ME3-OUT-OF-PROCESS.md` | §3 offer set 首句 + ME-4b 注、错误闭集句、「超时」行、方法表行；§5「模型回调」段；§8 ME-4b 行与 3c 表超时行注；§9 | **本分支已改** |
-| `docs/agent/followups.md` | FU-71（H1 现有缺陷）、FU-72（全局 `cost_usd: 0.0`）、FU-73（`model_access` 不在 `/api/v1/os`）、`ME4-CODEX-DEBT` 一行 | **本分支已改** |
+| `docs/agent/followups.md` | **本分支不改**（v3.1）；待登记条目见 §13，由统筹在规划分支登记 | — |
 
 ### 10.2 交给 PLAN 的切法（开工前先改 PLAN §三 与 `tasks.md` 台账；本文不改 PLAN）
 
@@ -997,10 +1045,10 @@ provider 指向挂起的 TCP 桩；模块发起一个不带 `request_id` 的调�
 |---|---|---|---|---|---|
 | **ME4-4.2.1** manifest 字段 | `agent24-domain` 的 `ModelAccess` 与两条校验 | 4.1.1 冻结 | J1 | ~70 | **收窄**：`KERNEL_OOP_GRANTS`/`provides`/`model_grant` 判据挪到 b2；不再改 `mount_package`，不必排在 ME4-1.5.1 之后 |
 | **ME4-4.2.2-0**（新） 回调通道按方法超时 + `unavailable` | `rpc.rs` §3.2 六处 + `ErrorKind::Unavailable` + 闭集测试拷贝 + SPEC 闭集句 | 4.1.1 冻结 | J5、J13 闭集部分 | ~60 | 新增；只动 `agent24-os-proto` |
-| **ME4-4.2.2a** 模型契约 + 标签修复 | §4.1 全部；§2.3（H1 解析 + **N1 `loopback_only`** + L-e `tier_label`）；`with_separate_health`；`OLLAMA_URL` **与 `PASSTHROUGH_VARS` 同 PR**（N2）；`Rejected` 及两处 `match` | 4.1.1 冻结 | J4、J16（含代理/重定向两格） | ~190 | **扩大**：修现有缺陷 FU-71 的两条路 |
+| **ME4-4.2.2a** 模型契约 + 标签修复 | §4.1 全部；§2.3（H1 解析 + **N1 `loopback_only`** + L-e `tier_label`）；`with_separate_health`；`OLLAMA_URL` **与 `PASSTHROUGH_VARS` 同 PR**（N2）；`Rejected` 及两处 `match` | 4.1.1 冻结 | J4、J16（含代理/重定向两格） | ~190 | **扩大**：修现有缺陷（规划分支 FU-72，§13-A）的三条路 |
 | **ME4-4.2.2b1a**（新拆） 类型、准入、sink、错误映射 | `model_callback.rs` 的 §5.2 常量、`ModelCallbackDeps`/`ModelGrant`、`ModelAdmission`、`UsageOutcome`/`UsageSink`/`MemoryUsageSink`/`UsageTicket`、`UnavailableCause`/`map_model_error`；**顶部 `#![cfg_attr(not(test), allow(dead_code))]`** | 4.2.1、4.2.2-0、4.2.2a | J9（`ModelAdmission` 单测）、J13（映射 + cause 闭集）、J17（健康表隔离，grant 级） | ~230 | 由原 4.2.2b 拆出（N6） |
 | **ME4-4.2.2b1b**（新拆） handler | wire 类型（`ModelCompleteParams` 等）、`ModelCompleteHandler`、结果大小常量 | 4.2.2b1a | J3、J6、J7、J8、J9（handler 级）、J10（前半）、J15、J18 | ~190 | 由原 4.2.2b 拆出（N6）；仍不注册（`dead_code` 由 b1a 的属性覆盖） |
-| **ME4-4.2.2b2**（新拆） 授予与接线 | `KERNEL_OOP_GRANTS += Models`、`CallbackDeps.models`、`provides`、注册、`serve()` 构造 deps（`spawn_cancel_root(shutdown.modules_cut_off())`、`ModelAdmission::new(4, 2)`、sink 仍为内存）；**删除** `dead_code` 属性与 J2 的「不引用 handler」结构测试（N7） | 4.2.2b1b、**ME4-1.5.1**（S1 引入 `CallbackDeps`） | J2、J10（跨代）、J19（取消部分，断言对象为内存 sink） | ~80 | **offer set 阶梯只由它跨越** |
+| **ME4-4.2.2b2**（新拆） 授予与接线 | `KERNEL_OOP_GRANTS += Models`、`CallbackDeps.models`、`provides`、注册、`serve()` 构造 deps（`spawn_cancel_root(shutdown.modules_cut_off())`、`ModelAdmission::new(4, 2)`、sink 仍为内存）；**删除** `dead_code` 属性与 J2 的「不引用 handler」结构测试（N7） | 4.2.2b1b、**ME4-1.4.1**（S1 引入 `CallbackDeps`） | J2、J10（跨代）、J19（取消部分，断言对象为内存 sink） | ~80 | **offer set 阶梯只由它跨越** |
 | **ME4-4.2.3a**（新拆） 用量存储 | 迁移 0008、`agent24-store` 的 `module_model_usage.rs` | 4.1.1 冻结（只动 store，可提前） | J11 的 store 部分（并发 50、饱和、CHECK） | ~150 | 由原 4.2.3 拆出（N6） |
 | **ME4-4.2.3b**（新拆） 写者与 API | `usage_recorder.rs`、`serve()` 换 sink 并在停机序列等写者、`routes.rs` 的 `?module=` | 4.2.2b2、4.2.3a | J11 其余、J12、J19（完整：落库） | ~210 | 由原 4.2.3 拆出（N6） |
 | **ME4-4.3.1** 黑盒 + 探针 | `me4_model_blackbox.rs`（J14，含 LocalOnly 负对照）、`me3-status.sh` 的 `4b 推理回调` | 4.2.3b | J14 | 以测试为主 | 黑盒加负对照（v2 M5，v3 用 `[::ffff:127.0.0.1]`） |
@@ -1027,7 +1075,8 @@ scratch 实测：`model_callback.rs` 非测试部分 417 行（b1a 覆盖其中�
 | `Handler` trait（`rpc.rs:326`） | （若调度也要按方法超时）复用本文的 `call_timeout` | 加 `call_timeout` | 一个默认方法，谁先合谁定义，另一方只 `impl` |
 | 迁移号 | 0007 | 0008 | **后合并方 rebase 时迁移号取 max+1**；两者无表冲突 |
 | `docs/agent/me3-status.sh` 探针 | `4a 调度回调` | `4b 推理回调` | 两行 |
-| `docs/agent/followups.md` | （若新增 FU） | FU-71/72/73 + CODEX-DEBT 一行 | **编号冲突时后合并方顺延编号**，并同步改本文 §12 与各自设计里的引用 |
+| `docs/agent/followups.md` | 规划分支统一编号（FU-71 cron、FU-72 回环判定、FU-73 孤儿 schedules、FU-74 其它本机 client 读代理） | 本分支不改；§13 的条目由统筹登记 | 以规划分支为准 |
+| SPEC §8 offer set 阶梯表（v3.1 M-1） | 追加 ME-4a 行 | 追加 ME-4b 行 | **后合并方追加自己的行**，两行都在 |
 
 ---
 
@@ -1039,7 +1088,7 @@ scratch 实测：`model_callback.rs` 非测试部分 417 行（b1a 覆盖其中�
 | R2 | 被代理请求内联推理受 30s 代理总时限、fired 内联推理受投递超时约束 | 由 §3.4 的使用指引（先应答、再后台）承担，写进 SPEC 方法表与 T14 wire 文档 |
 | R3 | 全局 4 并发不含 `/api/v1/chat` 与 agent loop，本地 oMLX 仍可能过载；公平规则**只保证其他活跃模块 ≤ 2 个时新模块首调有槽**（v3 N3）——有 3 个其他活跃模块时可能 `busy`（反例 A1、A2、B1、C1 → D），≥ 4 个时第 5 个同样 `busy` | 内核自己的用量不该被模块挤占；两个模块占不满已由规则保证；更多模块同时推理是本机算力问题，不是分配问题 |
 | R4 | 用量记录在队列满、或停机硬上限（cut-off + 200ms）后仍排队时会丢；取消的远端调用费用未知 | `dropped` 计数、`lost` 日志可观测；不为用量延长停机；费用本来未知（§6.4） |
-| R5 | `model_access` 不在 `/api/v1/os` / `agent24 os list` 里显示 | 远端来源今天只有非回环的 `OMLX_URL`/`OLLAMA_URL`；**FU-73**（ME4→next，Medium） |
+| R5 | `model_access` 不在 `/api/v1/os` / `agent24 os list` 里显示 | 远端来源今天只有非回环的 `OMLX_URL`/`OLLAMA_URL`；**待登记 §13-C**（ME4→next，Medium） |
 | R6 | 没有按日远端 token 预算，`remote_allowed` 模块在令牌桶内可持续外发 | 需要价目表与远端配置入口，本轮都不做；remote 需 manifest 显式声明 |
 | R7 | `CompletionRequest`/`CompletionResponse` 加字段、`ModelError` 加变体，对**外部**直接构造/穷尽匹配它们的 crate 是源码不兼容 | 工作区内已列全（§10.1）；外部（若 Sin90 仍 git 依赖 `agent24-models`）在其 M5 前同步——4.2.2a 的 PR body 点名 |
 | R8 | ~~共享健康表~~ | **v2 已消除**（H2，§5.1） |
@@ -1051,13 +1100,25 @@ scratch 实测：`model_callback.rs` 非测试部分 417 行（b1a 覆盖其中�
 
 ---
 
-## 12. 登记的 followups（本分支已写入 `docs/agent/followups.md`）
+## 12. 冻结说明
 
-- **FU-71**（现有缺陷，High，**由 ME4-4.2.2a 关闭**；v3 扩到代理/重定向两条路）：`ModelRouter::from_env` 的 `url_host`/`is_loopback_host` 与 reqwest 的 WHATWG 解析不一致，
-  `OMLX_URL=http://evil.example\@127.0.0.1:8088` 被标 `Local`、实际连 `evil.example`——**所有** LocalOnly 使用方（Guardian、会话摘要器，以及本文的模块回调）的隐私保证因此不成立。**v3**：同一缺陷还有两条路——默认 client 读 `HTTP_PROXY`/`ALL_PROXY`（不绕过回环）、跟随重定向；修法 `loopback_only()`。修法与判据见本文 §2.3 / J16。
-- **FU-72**（Low，ME4→next）：`GET /api/v1/usage`（不带 `module`）的 `cost_usd` 恒 `0.0`，对远端调用是错误陈述；应为 `null` 或去掉，需要评估客户端兼容。
-- **FU-73**（Medium，ME4→next）：`MountReport`/`agent24 os list` 显示模块的 `model_access`（R5）。
-- **ME4-CODEX-DEBT**：本设计 v1 经 Opus 子代理评审（REQUEST_CHANGES 0/2/7/10），v2 待第 2 轮；额度恢复后补 Codex。
+- 冻结版 = v3.1（本提交）。实现照 §10.2 的切法开工前，先由统筹改 PLAN §三 与 `tasks.md` 台账。
+- **（v3.1 L-7）§10.3 合并表已是终态**：第 3 轮评审按 S1 冻结版 `7543eb3` 核过 `CallbackDeps`（按值传入 `mount_all`，本文只加 `models` 字段）、迁移号（S1 0007 / 本文 0008，后合并方 max+1）、timeout 文案、`ErrorKind`（本文 17 → 18，S1 不碰）、SPEC §9 终态（「不做 `Policy`」），两份设计一致，不再逐轮重对。
+- **（v3.1 L-1）不做**「provider 自报是否为 loopback_only 构造」：`ModelProvider` trait 加一个自报方法会让所有 provider 实现方都要回答一个只有 `OpenAiCompatProvider` 能诚实回答的问题；契约写在 `Tier::Local`/`ModelRouter::new` 的文档里，`from_env` 由 J16 的代理/重定向格钉住。
+- **ME4-CODEX-DEBT-3**（规划分支已有此条）：三轮均为 Opus 子代理评审；额度恢复后 Codex 补审重点见冻结头。
+
+## 13. 待登记的 followups（本分支不改 `followups.md`；由统筹在规划分支登记、分配编号）
+
+- **§13-A → 规划分支 FU-72 的扩展**（统筹处理）：现有 FU-72 记的是「回环判定的手写解析与 reqwest 不一致」。请扩为同一缺陷的三条路：
+  ① 手写 `url_host`/`is_loopback_host` 与 WHATWG 解析不一致（`http://evil.example\@127.0.0.1:8088` 被标 `Local`、实连 `evil.example`）；
+  ② 默认 reqwest client 读 `HTTP_PROXY`/`ALL_PROXY` 且不绕过回环（`agent24-models/src/lib.rs:202-205`），发往 127.0.0.1 的请求体进代理；
+  ③ 默认 client 跟随 307/308，请求体被重定向到别处。
+  影响所有 LocalOnly 使用方（Guardian、会话摘要器、模块推理回调）。**由 ME4-4.2.2a 关闭**：`env_local_tier` 用 `reqwest::Url` 判三个实际请求的 URL；`OpenAiCompatProvider::loopback_only()`（`.no_proxy()` + 不跟随重定向，构造失败即 `expect`）；`from_env` 对 `Local` 调用。
+  判据（带正对照）：变体矩阵（`\@`、userinfo、`%2F`、制表符、`[::ffff:127.0.0.1]`、`0.0.0.0`）→ `Remote`，`http://127.0.0.1:8088`/`http://localhost:8088` → `Local`；子进程设 `HTTP_PROXY` → 代理桩计数 0（正对照默认 client 1）；307 → 目标计数 0（正对照 1）；变异：换回手写解析 / 删 `.no_proxy()` / 删 `Policy::none()` 各自变红。
+- **§13-B**（新，Low，ME4→next）：`GET /api/v1/usage`（不带 `module`）返回的 `cost_usd` 恒为 `0.0`（`agent24-models` 从不计价），对远端调用是错误陈述；应改为 `null` 或去掉，改前需确认 CLI/客户端是否读这个字段。
+  判据：远端调用后该字段不再是 `0.0`（正对照：纯本地调用时也不假称 0，或显式标注未计价）。src = ME4-4.1.1 第 1 轮 L5。
+- **§13-C**（新，Medium，ME4→next）：`MountReport` / `/api/v1/os` / `agent24 os list` 不显示模块的 `model_access`，用户要读 manifest 才知道一个模块能否外发推理。
+  判据：`remote_allowed` 模块在 `os list` 显示 `model_access: remote_allowed`（正对照：缺省模块显示 `local_only`，未授予 `models` 的模块不出现该字段）。src = 本设计 R5。
 
 ---
 
@@ -1069,7 +1130,7 @@ scratch 实测：`model_callback.rs` 非测试部分 417 行（b1a 覆盖其中�
 `agent24-protocol`/`agent24-core` 仍 path 依赖 worktree），按本文 §2.1 / §2.3 / §3.2 / §4.1 / §6.1 / §7 打补丁；再加一个 `me4s2-check` crate：
 `model_callback.rs`（§4.2–§7：handler、wire 类型、grant、准入、错误、`UsageSink`）、`usage_recorder.rs`（§6.3 写者）、`usage_route.rs`（§6.5）、`mount_sketch.rs`（§2.4 的 `CallbackDeps`/`model_grant`、§3.3 的 `spawn_cancel_root`）、以及测试。
 
-变异实测（改回后恢复原样）：`from_env` 不调 `loopback_only` → `from_env_local_providers_ignore_http_proxy` 红；取消根改为永不取消的 token → `cut_off_cancels_in_flight_calls_and_their_record_lands_in_the_store` 在 2s 超时处红。
+变异实测（改回后恢复原样）：`from_env` 不调 `loopback_only` → `from_env_local_providers_ignore_http_proxy` 红；取消根改为永不取消的 token → `cut_off_cancels_in_flight_calls_and_their_record_lands_in_the_store` 在 2s 超时处红；`stop_usage_writer` 改为立即返回 → `waiting_for_the_writer_is_what_lands_the_record` 连跑 3 次均红（v3.1 M-2）。
 
 ```sh
 S=/private/tmp/claude-502/-Users-jason-Dev-auraai-Agent24/977deb42-1aba-448f-95e7-5bae2dee6fd4/scratchpad/me4s2-check
@@ -1085,55 +1146,27 @@ CARGO_TARGET_DIR=target cargo test -p me4s2-domain
 
 工具链：本机 `cargo +1.98.0` 不可用（Homebrew rustc 1.95.0），scratch 用默认工具链；实现 PR 仍按 PLAN §一 第 8 条用 `+1.98.0` 跑全局前置。
 
-输出（v3，2026-09-24；clippy 覆盖整个 scratch 工作区）：
+输出（v3.1 冻结版，2026-09-24；clippy 覆盖整个 scratch 工作区）：
 
 ```
 $ cargo check --workspace --all-targets
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.31s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.05s
 $ cargo clippy --workspace --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.86s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.65s
 $ cargo test -p me4s2-check
-test model_callback::tests::fairness_holds_with_two_others_and_not_with_three ... ok
-test model_callback::tests::fair_global_admission ... ok
-test model_callback::tests::no_grant_is_forbidden ... ok
-test model_callback::tests::local_only_never_reaches_a_remote_provider_and_remote_allowed_does ... ok
-test model_callback::tests::an_unknown_request_id_is_refused_not_run_unbound ... ok
-test model_callback::tests::params_shape ... ok
-test model_callback::tests::an_overlong_model_id_is_dropped_not_truncated ... ok
-test model_callback::tests::module_failures_do_not_cool_down_the_kernels_router ... ok
-test manifest_tests::model_access_default_explicit_and_rejections ... ok
-test usage_route::tests::selector ... ok
-test model_callback::tests::unavailable_causes_are_exactly_specs_closed_set ... ok
-test wire_tests::max_tokens_is_forwarded_only_when_set_and_model_id_is_parsed ... ok
-test usage_recorder::tests::writer_drains_and_exits_when_the_channel_closes ... ok
-test model_callback::tests::busy_spends_no_token ... ok
-test model_callback::tests::cancelling_the_root_reaches_the_provider_and_records_it ... ok
-test usage_recorder::tests::the_hard_stop_ends_the_writer_even_with_a_live_sender ... ok
-test wire_tests::cancel_root_reaches_the_real_provider_and_answers_cancelled ... ok
 test wire_tests::cut_off_cancels_in_flight_calls_and_their_record_lands_in_the_store ... ok
-test model_callback::tests::result_size_is_judged_after_serialization ... ok
-test model_callback::tests::dropping_the_call_future_cancels_the_provider_token_and_records_cancelled ... ok
-test wire_tests::dropping_the_provider_future_closes_the_upstream_connection ... ok
-test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+test usage_recorder::tests::waiting_for_the_writer_is_what_lands_the_record ... ok
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
 $ cargo test -p me4s2-os-proto --lib rpc::
-test rpc::tests::a_declared_budget_is_clamped_and_an_absent_one_is_the_default ... ok
-test rpc::tests::the_error_kinds_are_exactly_specs_closed_set ... ok
-test rpc::tests::the_handshakes_error_kinds_are_members_of_the_closed_set ... ok
-test rpc::tests::per_method_budget_outlives_the_connection_budget ... ok
-test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 268 filtered out; finished in 1.02s
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 268 filtered out; finished in 1.03s
 $ cargo test -p me4s2-store module_model_usage
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.09s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.04s
 $ cargo test -p me4s2-models
-test router::tests::proxy_child_default_client ... ignored, child process of from_env_local_providers_ignore_http_proxy
-test router::tests::from_env_reports_the_judged_tier ... ok
-test router::tests::proxy_child_from_env ... ignored, child process of from_env_local_providers_ignore_http_proxy
-test tests::status_becomes_a_cause_a_user_can_act_on ... ok
-test router::tests::env_local_tier_uses_the_http_clients_own_parser ... ok
 test router::tests::a_loopback_only_provider_does_not_follow_redirects ... ok
-test router::tests::from_env_local_providers_ignore_http_proxy ... ok   (spawns proxy_child_from_env / proxy_child_default_client)
-test result: ok. 30 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+test router::tests::from_env_local_providers_ignore_http_proxy ... ok
+test result: ok. 30 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.42s
 $ cargo test -p me4s2-domain
-test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
 scratch 与真实代码的差异（如实）：`agentd` 是 binary crate，`RateLimiter`/`Clock`/`refused_error` 按原形状复制进 `check/src/events_emit.rs`；

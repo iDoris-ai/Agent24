@@ -662,6 +662,7 @@ notify        · **谁该看到它** —— 从 RequestContext 的 run/session/s
 > | **T7b（ME-3e 后半）** | `{Events, Approval}` | `_a24/approval/gate`、`_a24/approval/advise` 到位 |
 > | ME-3d（未排期） | 在它真正交付时并入 `{Events, Approval, Memory}` | 不早于 T7a/T7b，因为它没有被安排在两者之前做 |
 > | **ME-4a**（ME4-1.4.1） | `{Events, Approval, Memory, Scheduler}` | `_a24/scheduler/{upsert,delete,list}` 的 handler 与 `KERNEL_OOP_GRANTS`/`provides` 的改动在**同一个** PR 落地，不早于它 |
+> | **ME-4b（ME4-4.2.2b2）** | `{Events, Approval, Memory, Scheduler, Models}` | `_a24/model/complete` 的授予、`provides`、注册在同一个 PR（b2）落地；排在 ME-4a（调度，`Scheduler`）之后，故含 `Scheduler`。ME-4a 的行由调度设计追加，后合并方追加自己的行 |
 >
 > 把这张表当成活的：谁下一个交付带 handler 的能力，谁就把自己加进 `provides`，前提永远只有那一条「只声明真有 handler 的」，不是重新对照哪一版编号顺序。
 
