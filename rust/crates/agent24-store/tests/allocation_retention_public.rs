@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use agent24_protocol::WorkspaceId;
 use agent24_store::{
     AllocationFailureReason, AllocationId, AllocationIntent, AllocationPhase, RootIdentity, Store,
@@ -33,7 +35,7 @@ fn reason(value: &str) -> AllocationFailureReason {
 }
 
 async fn materialized(store: &Store, input: &AllocationIntent, root: RootIdentity) {
-    store.reserve_workspace_allocation(input).await.unwrap();
+    common::insert_reserved_allocation(store, input).await;
     store
         .materialize_workspace_allocation(input, root)
         .await
@@ -96,7 +98,7 @@ async fn retained_reserved_and_materialized_rows_survive_reopen_and_exact_replay
         if is_materialized {
             materialized(&store, &input, identity(20 + n)).await;
         } else {
-            store.reserve_workspace_allocation(&input).await.unwrap();
+            common::insert_reserved_allocation(&store, &input).await;
         }
 
         store
@@ -193,7 +195,7 @@ async fn rejected_outer_commit_reopens_original_state_then_allows_retry() {
     let path = dir.path().join("retention-commit-reject.sqlite");
     let store = Store::open(&path).await.unwrap();
     let input = intent(4);
-    store.reserve_workspace_allocation(&input).await.unwrap();
+    common::insert_reserved_allocation(&store, &input).await;
 
     let pinned = pin_four(&store).await;
     let (seen_tx, seen_rx) = mpsc::sync_channel(1);
