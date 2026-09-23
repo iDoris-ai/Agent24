@@ -12,6 +12,8 @@
 mod allocation_intent;
 mod allocation_materialization;
 mod allocation_record;
+// The authorized service slice has not wired this internal journal primitive yet.
+#[allow(dead_code)]
 mod allocation_reservation;
 mod allocation_types;
 mod audit;
@@ -68,6 +70,15 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Persistence boundary for trusted, internally authorized workflow code.
+///
+/// `Store` validates and journals persistence data; it does not establish
+/// caller authorization, filesystem authority, or lifecycle ownership. Public
+/// workspace operations belong to the authorized `WorkspaceService` layer.
+///
+/// ```compile_fail
+/// let _ = agent24_store::Store::reserve_workspace_allocation;
+/// ```
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
