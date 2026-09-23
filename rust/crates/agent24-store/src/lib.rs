@@ -16,6 +16,7 @@ mod allocation_record;
 mod allocation_registration;
 mod allocation_reservation;
 mod allocation_retention_evidence;
+mod allocation_retention_plan;
 mod allocation_types;
 mod audit;
 mod module_approvals;
