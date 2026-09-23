@@ -399,6 +399,27 @@ pub(crate) async fn read_audit_tx(
         .then_some(facts)
         .ok_or_else(|| bad("audit_log", "seq"))
 }
+/// Looks up only the canonical terminal record.  Retrying terminalization must
+/// never treat a merely similar audit entry as evidence of a prior apply.
+pub(crate) async fn read_exact_terminal_audits_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ts: &WorkspaceInstant,
+    action: &str,
+    raw_detail: &str,
+) -> WorkspaceResult<Vec<TerminalAuditFacts>> {
+    let rows = sqlx::query(
+        "SELECT seq,ts,actor,action,detail,prev_hash,hash FROM audit_log
+         WHERE ts=? COLLATE BINARY AND actor='legacy_recovery' COLLATE BINARY
+           AND action=? COLLATE BINARY AND detail=? COLLATE BINARY ORDER BY seq",
+    )
+    .bind(ts.as_str())
+    .bind(action)
+    .bind(raw_detail)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    rows.iter().map(decode_audit).collect()
+}
 pub(crate) async fn verify_audit_tx(
     tx: &mut Transaction<'_, Sqlite>,
     expected: &TerminalAuditFacts,
