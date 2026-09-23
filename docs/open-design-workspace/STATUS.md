@@ -7,10 +7,14 @@
 | 阶段 | 状态 | 证据 |
 | --- | --- | --- |
 | P0 设计冻结 | PASS | ADR-001～005、依赖台账、风险与兼容矩阵已冻结并通过 SOL review |
-| A24-OD-00 capability 安全前置 | PASS（逐层合并中） | #226/#227 已合入 main；#228 已 retarget 到 main 并等待重新审批，其余保持堆叠顺序 |
+| A24-OD-00 capability 安全前置 | PASS（逐层合并中） | #226/#227 已合入 main；#228 在 main 上等待 rereview，其后代保持依赖顺序 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
 | P2 workspace contract | IN PROGRESS | DB registry/lifecycle/renew 与 allocation journal schema/约束通过 SOL；安全 root allocator/host lease/run binding 未完成 |
-| A24-OD-05 sidecar foundation | PASS（未接线） | manager、protocol、platform owner、codec、frame reader、owned pipes 与 launch ordering 已形成受审栈；host `run()`/产品路由仍未接线 |
+| A24-OD-05 sidecar foundation | IN PROGRESS（未接线） | #253 合入 desktop sidecar ownership/endpoint-handoff contract；manager 由 #254 承担，#429 controlled pipes、#431 graceful stdin close、#435 soft-stop seam、#436 dormant grace observe/force/reap primitive 推进中；host `run()`/产品路由仍未接线 |
+
+当前 PR 监控结论（2026-09-23 Wave 9）：完整 monitor 请求下，只有已满足依赖的 #253
+已合入；其他已批准后代仍堆叠等待 #228/#254 与各自前沿，不得越序合并。#254 五项 CI 全绿，
+rereview/approval pending。#228 rereview 已请求，其后代继续 dependency-blocked。
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 `outdated_cli / incompatible opencode args` 失败，随后停滞，需要 bounded SIGINT。
@@ -99,6 +103,36 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 本轮在三个实现 PR、门禁证据和本地 PR-program 快照都收口后按 owner 指令暂停；恢复后外部
   review 仍按 3 小时 cadence 观察，并从这里继续，暂停期间不启动新的大事务切片。
 
+## 2026-09-23 Wave 9 当前门禁
+
+- #253 已于 2026-09-23 合入 main，merge commit 为
+  `bb6f62bad5e75fdf64a375bb4acaec50f1230683`。最新 `origin/main` 与该提交完全一致；变更
+  仅增加 desktop sidecar ownership/endpoint-handoff contract
+  （`sidecar-contract.ts` 与对应测试），没有改动 store/host core。manager 由 #254 提供。
+  integration candidate 的
+  Cargo manifest/lock 冲突提示沿用此前审计结论，最终集成仍需保留独立依赖增量。
+- #254 已 retarget `main`，head 为 `6fcae9e`；旧 `CHANGES_REQUESTED` 已修复，Typecheck + Test、
+  CLA、Rust fmt/clippy/test、Contract Tests + Codegen Drift、Contract (agent24d) 五项 CI 全绿；
+  rereview/approval pending。
+- #228 已请求 rereview；其后代仍 dependency-blocked，不允许绕过父 PR 或前沿。
+- G8 #429 controlled pipe access head `ce9adb0`：Ubuntu/macOS/Windows 三平台 CI 绿；
+  #431 graceful stdin close head `65e79bf`：三平台 CI 绿。#435 soft-stop seam 通过
+  一份内部 SOL review；external reviews pending。
+- G8 #436（head `74587f1`，stack #435，136 changed lines）加入 dormant grace
+  observe/force/reap primitive，无 run-loop wiring；Ubuntu/macOS/Windows/CLA green，一份
+  SOL `PASS`，external review pending。下一步为 fixed stdout worker。
+- G1 #430 是 materialization adversarial slice；#432 是 Materialized→Committed dormant
+  core；#433 是其 adversarial test。G4 #434 是 dormant Ready→Active core。精确内部结论为：
+  #432/#433/#434 各两份 SOL `PASS`，#435 一份 SOL `PASS`；external reviews 均 pending。
+  #432、#433、#434 不接 runtime，也不代表 P2/P9 完成。
+- PR 行数规则维持日常目标 200–300、硬上限 500；301–500 行原子例外须两次独立 SOL。
+  #430（494，two SOL PASS）、#432（422）、#433（373）、#434（499）是已说明并审查的原子例外。
+- 下一步为 G1 registration writer（#432/#433 commit adversarial matrix 已完成）、G4 promotion
+  adversarial test 与 G8 fixed stdout worker；#436 grace primitive 正在审查中，再经后续门禁才能进入 runtime。
+  不得声称 P2 或 P9 完成。
+- complete monitor 请求下，本轮唯一满足依赖并可合并的 PR 是 #253，现已 merged；其他
+  approved descendants 仍 stacked，受 #228/#254/frontiers 阻塞，不能合并。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
@@ -165,8 +199,9 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 
 ## A24-OD-05 已通过基础切片
 
-- sidecar manager：#253/#254/#255/#259/#260/#261，分别为
-  97/174/141/173/89/151 changed lines；
+- sidecar contract/manager 栈：#253 为 ownership/endpoint-handoff contract；manager 切片
+  #254/#255/#259/#260/#261 的初始历史行数为 174/141/173/89/151；当前 #254 head
+  `6fcae9e` 经修复后为 373 additions（live PR），不能把历史初始行数当作当前规模；
 - foundation final：`a3b83fb22e8559319fe8ed677e9cbc40a64258ac`，SOL 无 blocker/high/medium；
 - 110/110 desktop tests、完整 desktop typecheck 与 exact-head diff check 通过；
 - private host protocol：#275/#278/#279/#282/#283/#284/#285/#290，分别为 159/129/80/84/141/108/145/75 changed lines；final `21ecfe7759e3e6d90daf1132095bbff337eb7f23`，SOL `PASS`；

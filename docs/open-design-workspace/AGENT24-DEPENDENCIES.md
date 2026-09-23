@@ -1,14 +1,18 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 gate passed / A24-OD-01 DB-only lifecycle SOL passed, renew designing / A24-OD-05 bounded codec SOL passed, frame reader designing
+> 状态：P0 frozen / A24-OD-00 逐层合并 / A24-OD-01 journal 与 dormant transaction slices 进行中 / A24-OD-05 pipe、stdin-close 与 actor seam 分片进行中
 >
-> 日期：2026-09-20
+> 日期：2026-09-23
 >
 > integration branch：`feat/open-design-workspace`
 >
-> 已审计 Agent24 主干：`origin/main@9ab5b6ee112e7e601758cb04c9aafac4c94680c7`
+> 已审计 Agent24 主干：`origin/main@bb6f62bad5e75fdf64a375bb4acaec50f1230683`（#253 merge）
 >
-> 2026-09-22 漂移复核：新增 #262/#341 仅涉及 T9/ME-3f 黑盒测试、`agent24d` 测试依赖与状态文档；未改变 workspace/store/sidecar 契约。`Cargo.lock` 的独立依赖增量需在最终 rebase 时保留。
+> 2026-09-22 漂移复核：当时新增 #262/#341 仅涉及 T9/ME-3f 黑盒测试、`agent24d` 测试依赖与状态文档；未改变 workspace/store/sidecar 契约。`Cargo.lock` 的独立依赖增量需在最终 rebase 时保留。
+
+> 2026-09-23 漂移复核：#253 merge 仅增加 desktop sidecar ownership/endpoint-handoff contract
+> （`sidecar-contract.ts` 与对应测试），不改变 store/host core；manager 仍由 #254 提供。
+> integration candidate 的 Cargo manifest/lock 冲突提示仍需在最终合并前逐项保留和复核。
 
 ## 1. 目的
 
@@ -58,7 +62,7 @@
 
 ### A24-OD-01 — Opaque workspace registry
 
-状态：`IN_PROGRESS / REGISTRY + DB-ONLY EXPIRY/RELEASE SOL PASS / RENEW DESIGNING`
+状态：`IN PROGRESS / REGISTRY + DB-ONLY EXPIRY/RELEASE + RENEW SOL PASS / ROOT-SERVICE & HOST-LEASE PENDING`
 
 目标分支：`feat/a24-workspace-registry`
 
@@ -210,7 +214,8 @@
 
 原因：Open Design 采用独立 fork + sidecar + `agent24 acp` + Agent24 workspace contract，不作为 Agent24 Domain OS 包挂载。只有未来改变产品边界、把 Open Design 改成 OOP Domain OS 时，才需要重新评估 T8.5c-W/T9 依赖。
 
-当前 `origin/main@69baf50` 已包含 T8.5c-W-wire v5 冻结设计，但尚未包含其实现。若该实现并行进行：
+初始审计时的 `origin/main@69baf50` 已包含 T8.5c-W-wire v5 冻结设计，但尚未包含其实现；
+#253 后的最新 main 为 `bb6f62b`，未改变本项依赖判断。若该实现并行进行：
 
 - 必须从最新 `origin/main` 建新分支；
 - 不使用旧的 `chore/t8.5c-w-wire-design-freeze` 或 `feat/t8.5c-w-mount-domain-wiring` 作为实现基线；
@@ -224,7 +229,7 @@
 ## 7. 建议分支图与合并顺序
 
 ```text
-origin/main (创建时取最新；审计时为 69baf50)
+origin/main (创建时取最新；Wave 9 审计时为 bb6f62b)
 │
 ├─ A24-OD-00 feat/a24-capability-auth
 │    └─ merge → main
