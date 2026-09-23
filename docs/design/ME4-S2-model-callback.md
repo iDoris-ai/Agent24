@@ -1,7 +1,7 @@
 # ME4-S2 —— 推理回调 `_a24/model/*`（ME4-4.1.1 设计）
 
-> **草稿 v2，待第 2 轮评审**（2026-09-24）。v1 经第 1 轮对抗评审 **REQUEST_CHANGES（0 Critical / 2 High / 7 Medium / 10 Low）**，
-> 19 条逐条核对后全部采纳，处理见下方「v1 → v2 改动记录」。
+> **草稿 v3，待第 3 轮评审**（2026-09-24）。v1 第 1 轮 **REQUEST_CHANGES（0 C / 2 H / 7 M / 10 L）** → v2 全部采纳；
+> v2 第 2 轮 **REQUEST_CHANGES（0 C / 1 H / 6 M / 5 L；第 1 轮 19 条中 16 FIXED、3 PARTIAL）** → v3 全部采纳，见「v2 → v3 改动记录」。
 > 评审方：按 `docs/agent/PLAN-ME4-OS-CAPABILITIES.md` §一 第 3 条——Codex 额度 2026-09-29 19:28 前耗尽，
 > 期间由**全新上下文的 Opus 子代理**做对抗评审（Critical/High/Medium/Low + file:line），评审记录在此处逐轮追加，
 > 并在 `docs/agent/followups.md` 的 `ME4-CODEX-DEBT` 追加一行，额度恢复后补 Codex 一轮。
@@ -9,11 +9,12 @@
 > | 轮次 | 评审方 | 结论 | C / H / M / L |
 > |---|---|---|---|
 > | 第 1 轮（v1） | 全新上下文 Opus 子代理（Tier 2，Codex 额度耗尽） | REQUEST_CHANGES | 0 / 2 / 7 / 10 |
-> | 第 2 轮（v2） | 待送审 | — | — |
+> | 第 2 轮（v2） | 全新上下文 Opus 子代理（验证 crate `scratchpad/me4s2-review2/`：proxy / redirect / mapped） | REQUEST_CHANGES（16 FIXED / 3 PARTIAL） | 0 / 1 / 6 / 5 |
+> | 第 3 轮（v3） | 待送审 | — | — |
 >
 > **与 ME4-1.1.1（调度回调设计 `docs/design/ME4-S1-scheduler-callback.md`，另一个 worktree 并行写、同在评审中）的改动需要合并**——
-> 不只是 SPEC 文本，还有 `KERNEL_OOP_GRANTS`、`mount_all`/`mount_package` 参数表、`provides` 块、`MethodsFor` 闭包体、`serve()` 接线、
-> `ErrorKind::ALL` 长度（它的判据 C5.9 钉住 17，本文把它变成 18）、迁移号（它用 0007，本文用 0008）等。完整清单与解决原则见 §10.3。
+> 不只是 SPEC 文本，还有 `KERNEL_OOP_GRANTS`、`mount_all`/`mount_package` 的 **`CallbackDeps`**（S1 v3 定义、按值传入 `mount_all`；本文只往里加 `models` 字段，不另加参数）、
+> `provides` 块、`MethodsFor` 闭包体、`serve()` 接线、`ErrorKind::ALL`（本文 17 → 18；S1 v3 按 diff 脚本判定其 PR 不碰 `ErrorKind`，不冲突）、迁移号（S1 0007，本文 0008，后合并方 max+1）等。完整清单见 §10.3。
 > 本分支对 SPEC **只加 model 相关的行/段**，不动 scheduler 的内容。
 >
 > 设计里每一段 Rust 签名/片段都在 scratch crate 里 `cargo check` / `cargo test` 过，命令与输出见附录 A。
@@ -22,8 +23,28 @@
 
 | 版本 | 日期 | 改动 |
 |---|---|---|
+| v3 | 2026-09-24 | 第 2 轮评审 12 条 + 3 条 PARTIAL 全部采纳（见下表）。要点：N1 `Local` 的定义收紧为「端点在回环上、不经代理、不跟随重定向」（`OpenAiCompatProvider::loopback_only`，并入 FU-71）；N4 结果按序列化后长度判定；N5 生产接线判据 J19；N6/N7 切法再拆（b1a/b1b/b2、4.2.3a/b）；与 S1 v3 的 `CallbackDeps` 对齐 |
 | v2 | 2026-09-24 | 第 1 轮评审 19 条全部采纳（见下表）。要点：H1 Tier 标签改用 HTTP 客户端同一解析器判定（现有代码缺陷，登记 FU-71）；H2 每个模块走独立健康表的路由器；M1 取消根与用量写者挂到 `modules_cut_off()`；M2 全局并发加公平规则；M3 结果文本 ≤ 512 KiB；M4 `UsageSink` + 4.2.2b 预拆 b1/b2 + §10.2 完整切法；M5 `OLLAMA_URL` 可配、黑盒做 LocalOnly 负对照；M6/M7 SPEC 措辞与合并清单；L1–L10 |
 | v1 | 2026-09-23 | 初稿。裁决 S2-1（`model_access` 字段）、S2-4（选 **(a) 按方法超时 + 统一桥接取消**）、S2-2（`max_tokens: Option<NonZeroU32>` / `model_id: Option<String>`）、S2-5（并发 2/全局 4、令牌桶 30/0.5s、`module_model_usage` 表与 `GET /api/v1/usage?module=`）、S2-6（新增 `unavailable` 一个 kind）、S2-3（`_a24/model/complete` 的确切 JSON 形状；不做 `_a24/model/list`）。同分支改 SPEC-ME3 的 Models 相关内容 |
+
+## v2 → v3 改动记录（第 2 轮：REQUEST_CHANGES，0 C / 1 H / 6 M / 5 L，另 3 条 PARTIAL，全部采纳）
+
+| # | 级别 | 问题（已核实 / 实测） | v3 的处理（位置） |
+|---|---|---|---|
+| N1 | High | **判定的地址 ≠ 实际连接的地址（第二条路）**：`OpenAiCompatProvider` 的默认 reqwest client（`lib.rs:202-205`）读 `HTTP_PROXY`/`ALL_PROXY` 且**不自动绕过回环**，默认还跟随 307——评审实测 `HTTP_PROXY` 下发往 `127.0.0.1` 的请求体进了代理桩；本文 scratch 复现（正对照） | §2.3：新增 `OpenAiCompatProvider::loopback_only()`（重建 client：`.no_proxy()` + `redirect::Policy::none()`），`from_env` 对判为 `Local` 的 provider 调用它；3xx 变成非成功状态 → `Rejected`。**`Local` 的定义收紧为「端点在回环上、不经代理、不跟随重定向」**（SPEC §3 同步）。J16 加两格：代理（子进程带 `HTTP_PROXY` 重跑测试二进制）→ 代理桩计数 0，正对照默认 client 计数 1；307 → 目标计数 0，正对照同上。变异：`from_env` 不调 `loopback_only` → 红（已实测）。本机网关（如 127.0.0.1 上的 LiteLLM）把请求转发到远端**不在保证范围内**（R13）。并入 FU-71（同一现有缺陷的第二条路） |
+| N2 | Medium | 新读 `OLLAMA_URL` 会让 `agent24-cli/src/service.rs` 的 `passthrough_list_matches_what_the_daemon_actually_reads`（`service.rs:359`）变红 | 4.2.2a 同时把 `"OLLAMA_URL"` 加进 `PASSTHROUGH_VARS`（`service.rs:120`，`[&str; 11]` → `[&str; 12]`）；§10.1/§10.2。J16 的代理子进程用**按测试名**选择而不是自定义环境变量——那个扫描器会收集 `crates/` 下所有环境变量读取 |
+| N3 | Medium | M2 公平性质措辞过强：A1、A2、B1、C1 后（3 个其他活跃模块）D 首调 `busy` | §5.3、R3、SPEC §5 改为精确性质：**其他活跃模块不超过 `GLOBAL − 2` = 2 个时，新模块首调有槽**；J9 加这个反例（scratch `fairness_holds_with_two_others_and_not_with_three`） |
+| N4 | Medium | 按原始 `text` 长度判定低估转义膨胀；`model_id` 无上限 | §4.3/§4.4：构造结果后按 `serde_json::to_vec` 的**实际字节数**判 `≤ MAX_FRAME_BYTES − RESULT_ENVELOPE_MARGIN`（4 KiB，覆盖最长 id 的 6 倍转义 + 信封，编译期 `assert!`）；**先判再 `finish`**，不会出现「计量记成功、模块收到 `-32603`」；`model_id` > 256 字节记 `None`（不截断）。J18 重写：2 MiB 纯文本 → 过大；400 KiB 全是 `"`（序列化 800 KiB）→ 成功；200 KiB 全是 U+0001（序列化 1.2 MiB，v2 的原始长度判定会放过）→ 过大；边界 ±1。R10 删除 |
+| N5 | Medium | 生产接线（b2 的 `spawn_cancel_root(modules_cut_off())`、4.2.3 的停机等写者）没有判据 | 新增 **J19**（daemon 级）：停机时有调用在途 → 其 `Cancelled` 记录落库；变异：`serve()` 里取消根改挂永不取消的 token → 红。scratch 用真 provider + 真 recorder + `spawn_cancel_root` 组装的版本跑通，变异已实测变红 |
+| N6 | Medium | 切法过大：`model_callback.rs` 非测试代码 ~410 行、4.2.3 ~360 行 | §10.2：b1 拆 **b1a**（常量、`UsageSink`/`UsageTicket`、`ModelAdmission`、`ModelGrant`/deps、错误映射）与 **b1b**（wire 类型 + handler）；4.2.3 拆 **4.2.3a**（迁移 + store）与 **4.2.3b**（recorder + route + `serve` 换 sink）。行数估计按 scratch 实测重写 |
+| N7 | Medium | b1 的未注册 handler 在 binary crate 里触发 `dead_code` → `clippy -D warnings` 失败 | §10.2：b1a/b1b 在 `model_callback.rs` 顶部加 `#![cfg_attr(not(test), allow(dead_code))]`，**由 b2 删除**；J2 里「b1 的 `domain.rs` 不引用 handler」的结构测试同样**由 b2 删除** |
+| L-a | Low | SPEC 145 行健康表措辞 | 改为「模块的调用失败**不写内核的健康表**」，代价引用设计 R12 |
+| L-b | Low | `cause` 闭集未被测试钉住 | `UnavailableCause::ALL` + SPEC 句子拷贝测试（J13；scratch `unavailable_causes_are_exactly_specs_closed_set`） |
+| L-c | Low | SPEC 466 行「不计量」列表不全 | 补 `not_ready`/`draining`/`revoked`/`request_id` 不在途，与 §6.2 一致 |
+| L-d | Low | J4、J12 的「逐字节相同」没有落成字面量 | J4/J12 写出 golden 字面量 |
+| L-e | Low | `from_env` 给 provider 的 tier 字符串写死 `"local"` | 用判定出的 tier 填（`tier_label`），`/api/v1/models` 如实报 `remote`；4.2.2a 顺手 |
+| （M5 补充） | — | 黑盒远端桩地址 | 首选 `http://[::ffff:127.0.0.1]:<p>`（评审实测能连回、判 `Remote`、无需监听全部网卡），`0.0.0.0` 作备选 |
+| （S1 对齐） | — | S1 v3 把 `mount_all` 的新参数定为按值的 `deps: CallbackDeps` | `models` 成为 `CallbackDeps` 的字段；删除 S2 里引用 S1 v1 的过时内容（`scheduler: &Arc<Scheduler>`、「C5.9 钉 17」） |
 
 ## v1 → v2 改动记录（第 1 轮：REQUEST_CHANGES，0 C / 2 H / 7 M / 10 L，全部采纳）
 
@@ -63,7 +84,7 @@
 | S2-3 方法最小集 | §4.2–§4.4 决策 M4 | 只有 `_a24/model/complete`，确切 params/result 见 §4.2/§4.3；不开 tools；**不做** `_a24/model/list` |
 | S2-5 限流 + 计量 | §5 决策 M5、§6 决策 M7 | 每模块并发 2、全 daemon 4（带公平规则）、每模块令牌桶（挂载级，跨 generation 不重置）、**每模块独立健康表**；新表 `module_model_usage`，失败/取消都计、被挡在路由器之前的不计、`cost_usd` 恒 `null` |
 | S2-6 错误 | §7 决策 M6 | 闭集加一个 `unavailable`，`data.retryable` + `data.cause`（闭集 4 值），provider 名/URL/原文一律不出内核 |
-| （评审 H1） | §2.3 | LocalOnly 的前提——`Tier` 标签诚实——今天被手写 URL 解析破坏；改为与 HTTP 客户端同一解析器 |
+| （评审 H1 / N1） | §2.3 | LocalOnly 的前提——`Tier` 标签诚实——今天被两条路破坏：手写 URL 解析，与代理环境变量/重定向。`Local` 收紧为「端点在回环上、不经代理、不跟随重定向」 |
 | S2-7 测试 | §8 判据 | 进程内用 Rust 桩 + 手建 `ModelRouter`；黑盒用 Python 桩当 `OMLX_URL`，python3 缺失即失败；另留 `#[ignore]` 真 oMLX 冒烟 |
 
 **不解决**（写进 SPEC §9，见 §11 残余风险）：tools / function calling；流式输出；模块自选模型；`_a24/model/list`；
@@ -123,6 +144,10 @@ embeddings。**进程内**模块的模型句柄（`KernelCtx` 没有，本文不
     `record_failure`（`router.rs:257`）在任何调用方遇到 `Unavailable` 时把该 provider 冷却，所有调用方随之跳过它。
 18. **（v2，M1）停机的时间点**：`Shutdown::modules_cut_off()`（`server.rs:214-223`）= 停机开始 + 模块 drain + stop grace；
     `Deadlines.modules` = 它 + `CONFIRM` 200ms（`lifecycle.rs:106`），其后才是写停机摘要的 `PERSIST`。模块的在途请求/回调活到 cut-off。
+19. **（v3，N1）默认 HTTP client 会改道**：`OpenAiCompatProvider::new` 的 client 只设了 `connect_timeout`（`lib.rs:202-205`），reqwest 默认读 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`
+    （对回环**不**自动绕过，除非 `NO_PROXY` 覆盖）并跟随至多 10 次重定向（307/308 会带着请求体重发）。评审 `scratchpad/me4s2-review2/` 的 proxy/redirect 两个模式实测；本文 J16 复现并做正对照。
+20. **（v3，N2）env 透传清单**：`agent24-cli/src/service.rs:120` 的 `PASSTHROUGH_VARS: [&str; 11]` 列出 daemon 读的环境变量（LaunchAgent 启动时只透传这些）；
+    `service.rs:359` 的测试扫描 `apps/agent24d/src` 与 `crates/` 下**所有**（含测试代码里的）`env::var` 读取，少列即红。
 
 ---
 
@@ -165,7 +190,7 @@ impl DomainOsManifest {
 |---|---|---|
 | wire（`ModelCompleteParams`，§4.2） | `deny_unknown_fields`，**没有** `privacy`/`model`/`tools`/`provider`/`tier` 字段；`_meta` 宽容但**永不被读** | 能改隐私的字段根本不存在，不是「存在但被忽略」 |
 | 挂载（`ModelGrant::new`，§5.1） | `privacy = match manifest.model_access() { RemoteAllowed => Privacy::Any, LocalOnly => Privacy::LocalOnly }`，一次算好存进挂载级 grant | 隐私的**唯一来源**；handler 从 grant 取，不从 params 取 |
-| 标签（`env_local_tier`，§2.3，v2 H1） | 每个 provider 的 `Tier` 用与 HTTP 客户端**同一个**解析器判定；判不准一律 `Remote` | 路由层的强制完全依赖标签诚实；标签错了，下一层什么都挡不住 |
+| 标签（`env_local_tier` + `loopback_only`，§2.3，v2 H1 / v3 N1） | 每个 provider 的 `Tier` 用与 HTTP 客户端**同一个**解析器判定、判不准一律 `Remote`；判为 `Local` 的 provider 的 client **不走代理、不跟随重定向** | 路由层的强制完全依赖标签诚实，而「诚实」= 判定的地址就是连接的地址；标签错了，下一层什么都挡不住 |
 | 路由（`ModelRouter::route` / `tier_order`，既有） | `LocalOnly` 的层序只有 `Local/Lora`；空路由即 `Unavailable`，**不碰远端 provider** | 既有、已测的唯一强制点（§1 第 3 条）；本文不另造第二个会漂移的判断 |
 | 事后绊线（handler，§4.4） | `privacy == LocalOnly && !served.tier.is_local()` → 记 `error` 日志、结果**不返回**、回 `-32603` | **只是检测，不是防护**——字节已经发出去了。**而且它读的是同一个 `Tier` 标签**（v2 L1）：它只能抓到 `tier_order` 的回归（J15），**抓不到打错的标签**——一个被误标成 `Local` 的远端 provider 在绊线看来就是本地的。标签的正确性只由 §2.3 与 J16 保证 |
 
@@ -199,20 +224,51 @@ fn env_local_tier(url: &str) -> Tier {
 
 - 为什么判三个 URL：适配器请求的是 `format!("{base}/v1/chat/completions")`（`lib.rs:520-521`），不是基址；只判基址，就又留下「判的串 ≠ 连的串」这同一类缺口。
 - 判定是**保守**的：`::ffff:127.0.0.1`（`Ipv6Addr::is_loopback` 为假）、`0.0.0.0`、`localhost.` 都判 `Remote`——它们也许实际连回本机，但把本机标成远端不会泄露，反过来才会。
-  J14 的黑盒正是利用这一点用 `0.0.0.0:<port>` 造一个「标签为远端、实际在本机」的桩。
-- `OLLAMA_URL`（v2 M5）：`from_env` 里写死的 `http://127.0.0.1:11434` 改为 `std::env::var("OLLAMA_URL")`（缺省值不变），同一规则判层。
-- SPEC §3 的表述收窄为「**以 `Tier` 标签为准**；`from_env` 用与 HTTP 客户端同一解析器判定回环，判不准即 `Remote`」——不再写成「LocalOnly 绝不外发」这种比机制强的话。
+  J14 的黑盒正是利用这一点造一个「标签为远端、实际在本机」的桩：首选 `http://[::ffff:127.0.0.1]:<port>`（评审实测能连回 `127.0.0.1` 上的监听、无需监听全部网卡），`0.0.0.0:<port>` 作备选。
+- **（v3 N1）判定之后还要保证连接不改道**：reqwest 默认 client 读代理环境变量（对回环不自动绕过）、跟随重定向——两条路都能把请求体送到 `base_url` 以外。所以：
+
+```rust
+// agent24-models/src/lib.rs（scratch 已改真实文件的拷贝并测试）
+impl OpenAiCompatProvider {
+    /// 判为 Local 的 provider 必须这样构建：不经代理、不跟随重定向（3xx → 非成功状态 → Rejected）。
+    #[must_use]
+    pub fn loopback_only(mut self) -> Self {
+        self.client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
+        self
+    }
+}
+// router.rs from_env：
+let build = |name: &str, url: String, key: Option<String>, tier: Tier| -> Arc<dyn ModelProvider> {
+    let p = crate::OpenAiCompatProvider::new(name, url, key, tier_label(tier), default_model.clone());
+    Arc::new(if tier.is_local() { p.loopback_only() } else { p })   // v3 N1；tier_label：v3 L-e
+};
+```
+
+  **`Local` 的完整定义**：端点在回环上（按 HTTP 客户端的解析器）、**不经代理、不跟随重定向**。它**不**保证回环上的那个进程自己不再往外发——
+  127.0.0.1 上的本机网关（LiteLLM 之类）把请求转发到远端，不在任何一个标签能看见的范围内（R13）。`Remote` 标签的 provider 仍用默认 client（尊重用户的代理配置）。
+- `OLLAMA_URL`（v2 M5）：`from_env` 里写死的 `http://127.0.0.1:11434` 改为读 `OLLAMA_URL`（缺省值不变），同一规则判层；**（v3 N2）同一 PR 把它加进 `PASSTHROUGH_VARS`**。
+- **（v3 L-e）** provider 自报的 tier 字符串（`/api/v1/models` 显示的那个）用判定结果 `tier_label(tier)`，不再写死 `"local"`。
+- SPEC §3 的表述收窄为「**以 `Tier` 标签为准**；`Local` = 端点在回环上（与 HTTP 客户端同一解析器判定）、不经代理、不跟随重定向；判不准即 `Remote`」——不再写成「LocalOnly 绝不外发」这种比机制强的话。
 
 ### 2.4 授予与挂载接线
 
 - `KERNEL_OOP_GRANTS` 加 `Capability::Models`；**进程内 `KERNEL_GRANTS` 不加**（`KernelCtx` 没有模型句柄——授予没有句柄的能力就是撒谎，SPEC §3）。
-- `mount_all`/`mount_package` 多一个参数 `models: Option<ModelCallbackDeps>`（daemon 级依赖，§5.1；**按值**传入，`mount_all` 返回时它随之 drop，于是用量通道的 sender 只剩 grant 里的那些，§6.3）。`ModelGrant` 在 `MethodsFor` **闭包外**建一次：
+- **（v3，与 S1 v3 对齐）不另加参数**：S1 v3 给 `mount_all` 加了按值传入的 `deps: CallbackDeps`（`mount_package` 借用它），本文只往这个结构体里加一个字段 `models: Option<ModelCallbackDeps>`（daemon 级依赖，§5.1）。
+  `mount_all` 返回时 `CallbackDeps` 随之 drop，于是用量通道的 sender 只剩 grant 里的那些（§6.3）。`ModelGrant` 在 `MethodsFor` **闭包外**建一次：
 
 ```rust
 // scratch check/src/mount_sketch.rs（已 check）
+pub struct CallbackDeps {                     // S1 v3 所有；S1 的 scheduler 字段此处略
+    pub models: Option<ModelCallbackDeps>,
+}
 pub fn model_grant(name: &str, manifest: &DomainOsManifest, granted: &Grants,
-                   deps: Option<&ModelCallbackDeps>) -> Option<ModelGrant> {
-    match (granted.has(Capability::Models), deps) {
+                   deps: &CallbackDeps) -> Option<ModelGrant> {
+    match (granted.has(Capability::Models), deps.models.as_ref()) {
         (true, Some(deps)) => Some(ModelGrant::new(name.to_owned(), manifest.model_access(), deps.clone())),
         _ => None, // 没真的持有 → 不报 granted、不进 provides（invariant #134，同 memory）
     }
@@ -376,7 +432,8 @@ Rejected { status: u16, message: String },     // friendly_http_error 对 4xx（
   路由语义同 `Provider`（终止，不 fallthrough）。工作区里对 `ModelError` 的穷尽 `match` 只有两处——`agent24-agent/src/lib.rs:1026-1031` 与 `agentd routes.rs:140-152`——
   各加一个与 `Provider` 同样处理的分支，所以 `/api/v1/chat` 与 agent loop 的输出**一字不变**；`agent24-models` 自己的三条断言（401/404/403）改为断言 `Rejected { status }`。
 - **（v2 H2）** `ModelRouter::with_separate_health(&self) -> ModelRouter`：同一组 provider（`Arc` 共享、标签相同、冷却参数相同）、**空的**健康表。
-- **（v2 H1/M5）** `env_local_tier` 换实现（§2.3）；`OLLAMA_URL` 可配。
+- **（v2 H1/M5）** `env_local_tier` 换实现（§2.3）；`OLLAMA_URL` 可配（v3：并进 `PASSTHROUGH_VARS`）。
+- **（v3 N1/L-e）** `OpenAiCompatProvider::loopback_only()`；`from_env` 对 `Local` 调用它，并用 `tier_label(tier)` 填 tier 字符串。
 - 类型选择：`max_tokens` 用 `NonZeroU32`——0 在 OpenAI 语义里无意义，让它**不可表示**；`u32` 足够（没有 provider 接受 >2^32）。
   `model_id` 用 `Option<String>`——很多 OpenAI 兼容服务确实省略它，`String` 就得造一个假值。
 - **对 `/api/v1/chat` 零变化**的论证：`post_chat` 构造 `max_tokens: None`（请求体不出现该键）；`model_id` 只是多解析一个 `#[serde(default)]` 字段，
@@ -436,10 +493,24 @@ struct WireJsonSchema { name: String, schema: Map<String, Value>, #[serde(defaul
   "usage": { "prompt_tokens": 12, "completion_tokens": 34 } }
 ```
 
-`text` = 助手消息的 `content`（没有则 `""`；不开 tools，所以不返回 `tool_calls`）。**（v2 M3）`text` ≤ `MODEL_MAX_TEXT_BYTES` = 512 KiB**，
-在构造结果**之前**检查：provider 的响应体上限是 8 MiB（`lib.rs` `MAX_CHAT_RESPONSE_BYTES`），回调响应帧上限是 1 MiB，不在这里挡，超大答案会被 `response_line` 换成 `-32603`。
+`text` = 助手消息的 `content`（没有则 `""`；不开 tools，所以不返回 `tool_calls`）。
+
+**结果大小（v2 M3 → v3 N4）**：provider 的响应体上限是 8 MiB（`MAX_CHAT_RESPONSE_BYTES`），回调响应帧上限是 1 MiB；不在 handler 里挡，超大答案会被 `response_line` 换成 `-32603`。
+v3 **按序列化后的实际字节数**判定（原始 `text` 长度会低估转义：`"` 序列化成 2 字节，控制字符成 6 字节）：
+
+```rust
+/// 响应行是 {"jsonrpc":"2.0","id":<id>,"result":<这个>}\n，须装进 1 MiB 帧。id 是 ≤ 256 字节的字符串，
+/// 最坏转义 6 倍；4 KiB 覆盖它与信封。
+pub const RESULT_ENVELOPE_MARGIN: usize = 4096;
+pub const MODEL_MAX_RESULT_BYTES: usize = agent24_os_proto::frame::MAX_FRAME_BYTES - RESULT_ENVELOPE_MARGIN;
+const _: () = assert!(6 * agent24_os_proto::rpc::MAX_ID_BYTES + 64 <= RESULT_ENVELOPE_MARGIN);
+/// provider 报的 model id 超过它就记 None——截断会造出一个不存在的模型名。
+pub const MODEL_MAX_MODEL_ID_BYTES: usize = 256;
+```
+
 超出 → `unavailable` + `retryable:false` + `cause:"response_too_large"`（文案提示调小 `max_tokens`），计量为 `FailedAfterServe`（token 已花，记在所属层的行上）。
-512 KiB 给 JSON 转义留了一倍余量（最坏情况每字节转义成 `\uXXXX` 是 6 倍，那种输出由 `response_line` 兜底为 `-32603`，见 R10）。`tier` 是本文在 PLAN 最小集上**加**的一个字段：
+**先判定、再 `finish`**：计量永远与模块实际收到的结果一致。
+`tier` 是本文在 PLAN 最小集上**加**的一个字段：
 `remote_allowed` 的模块据此知道这次数据是否离开了设备（它可以记进自己的审计），且它只暴露层级，不暴露 provider 名/URL。
 `Lora` 计为 `local`。`usage.total_tokens` 不给（冗余）。
 
@@ -498,14 +569,23 @@ impl Handler for ModelCompleteHandler {
                 ticket.finish(UsageOutcome::FailedAfterServe { served: s, prompt_tokens: p, completion_tokens: c });
                 return Err(RpcError::internal("the kernel routed this call incorrectly; the result is withheld"));
             }
-            let text = served.response.message.content.clone().unwrap_or_default();
-            if text.len() > MODEL_MAX_TEXT_BYTES {                               // v2 M3
+            let result = ModelCompleteResult {
+                text: served.response.message.content.clone().unwrap_or_default(),
+                model_id: served.response.model_id.clone().filter(|m| m.len() <= MODEL_MAX_MODEL_ID_BYTES),
+                tier: if served.tier.is_local() { "local" } else { "remote" },
+                usage: ResultUsage { prompt_tokens: p, completion_tokens: c },
+            };
+            // v3 N4：量的是真正要写出去的字节，量完再记账。
+            let value = serde_json::to_value(&result)
+                .map_err(|e| RpcError::internal(format!("result not serialisable: {e}")))?;
+            let size = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(usize::MAX);
+            if size > MODEL_MAX_RESULT_BYTES {
                 ticket.finish(UsageOutcome::FailedAfterServe { served: s, prompt_tokens: p, completion_tokens: c });
                 return Err(unavailable(UnavailableCause::ResponseTooLarge,
                     "the model's answer exceeds the size a callback result may carry; lower max_tokens"));
             }
             ticket.finish(UsageOutcome::Ok { served: s, prompt_tokens: p, completion_tokens: c });
-            // …序列化 §4.3 的 result
+            Ok(value)
         })
     }
 }
@@ -527,7 +607,7 @@ impl Handler for ModelCompleteHandler {
 ### 5.1 三层对象
 
 ```rust
-/// daemon 级：serve() 里建一次，按值交给 mount_all，mount_all 返回即 drop（§6.3）。
+/// daemon 级：serve() 里建一次，作为 CallbackDeps.models 按值交给 mount_all，mount_all 返回即 drop（§6.3）。
 #[derive(Clone)]
 pub struct ModelCallbackDeps {
     pub router: Arc<ModelRouter>,            // AppState.router——内核自己的；模块从不直接用它路由（v2 H2）
@@ -563,9 +643,10 @@ impl ModelGrant {
 | `MODEL_MAX_IN_FLIGHT_GLOBAL` ⚖️ | 4 | 所有模块合计，带 §5.3 的公平规则。**不含** `/api/v1/chat` 与 agent loop——内核自己的用量不被模块挤占，但也因此不能保证 oMLX 不过载（R3） |
 | `MODEL_RATE_CAPACITY` / `MODEL_RATE_REFILL_PER_SEC` ⚖️ | 30 / 0.5 | 突发 30 次、持续 30 次/分钟。按次计，不按 token 计（token 在调用前未知） |
 | `MODEL_CALL_TIMEOUT` | 120s | = provider 自己的 `chat_timeout`（`lib.rs:206`）。**（v2 L2 改正方向）**两者几乎同时起算，**RPC 的计时先到点**（它在 handler 之前就开始计），所以模块看到的总是 `timeout` 而不是 provider 的超时；且路由器按序尝试多个 provider——**第一个慢 provider 可以吃完整个 120s**，后面的 provider 轮不到（R11） |
-| `MODEL_MAX_TOKENS_CEILING` / 缺省 ⚖️ | 4096 / 1024 | 4096 token 的文本远低于 512 KiB 的结果上限；缺省给个上限，免得没写 `max_tokens` 的模块把 120s 跑满 |
+| `MODEL_MAX_TOKENS_CEILING` / 缺省 ⚖️ | 4096 / 1024 | 4096 token 的文本远低于结果上限（~1 MiB 序列化后）；缺省给个上限，免得没写 `max_tokens` 的模块把 120s 跑满 |
 | `MODEL_MAX_MESSAGES` ⚖️ | 64 | 字节已由 dispatch 预算兜住，条数防病态的「一万条空消息」 |
-| `MODEL_MAX_TEXT_BYTES` ⚖️ | 512 KiB | v2 M3，见 §4.3 |
+| `MODEL_MAX_RESULT_BYTES` / `RESULT_ENVELOPE_MARGIN` | 1 MiB − 4 KiB / 4 KiB | v3 N4，按序列化后字节判，见 §4.3（余量由编译期 `assert!` 与 `MAX_ID_BYTES` 绑定） |
+| `MODEL_MAX_MODEL_ID_BYTES` ⚖️ | 256 | v3 N4 |
 
 - 满了**不排队**：`try_admit` 失败即 `busy`（同回调通道的并发语义，队列是对端控制的内存）。
 - **跨重启**：令牌桶在挂载级，**跨 restart generation 不重置**（SPEC §5「限流桶不能被崩溃重置」）；**daemon 重启会重置**——模块触发不了 daemon 重启。
@@ -587,8 +668,9 @@ impl ModelAdmission {
 }
 ```
 
-性质：「第 2 个及以后」的调用最多占 `GLOBAL − 1` 个槽，所以**两个模块永远占不满 4 个**；只要同时活跃的模块数 < `GLOBAL`，新模块的第一个调用总能拿到槽。
-**不保证**的：≥ 4 个模块同时各有 1 个在途时，第 5 个模块会 `busy`（R3）——那时每个模块都只拿着 1 个槽，已经是这个上限下能做到的最公平。
+性质（v3 N3 改为精确表述）：「第 2 个及以后」的调用最多占 `GLOBAL − 1` 个槽，所以**两个模块永远占不满 4 个**；
+**只要其他活跃模块不超过 `GLOBAL − 2` = 2 个，新模块的第一个调用一定有槽**（证明：2 个其他模块最多占 1 + 1 + 1 = 3 个——第 2 个模块的第二个调用要求 total + 1 < 4，只在总数 ≤ 2 时成立——剩 ≥ 1 个）。
+**不保证**的：有 3 个其他活跃模块时，新模块可能 `busy`——反例 A1、A2、B1、C1 之后 D 首调 `busy`（J9 钉住）；≥ 4 个模块各有 1 个在途时第 5 个同样 `busy`（R3）。
 `MODEL_MAX_IN_FLIGHT_PER_MODULE` 的独立信号量因此并入 `ModelAdmission`（v1 的 `module_admission: Arc<Semaphore>` 与 `global_admission` 删除）。
 
 ---
@@ -639,7 +721,7 @@ impl Store {
 | 调用结局 | 计不计 | 记在哪 |
 |---|---|---|
 | 成功 | 计 | `served_by = local/remote`，`calls_ok += 1`，token = provider 回报值（没回报就是 0） |
-| **（v2）** provider 答了、内核拒绝转交（结果超过 512 KiB、LocalOnly 绊线） | 计 | **所属层的行**，`calls_failed += 1`，token 照记（已经花了） |
+| **（v2）** provider 答了、内核拒绝转交（序列化后结果超过 `MODEL_MAX_RESULT_BYTES`、LocalOnly 绊线） | 计 | **所属层的行**，`calls_failed += 1`，token 照记（已经花了） |
 | 路由器返回 `Unavailable` / `Rejected` / `Provider` | 计 | `none` 行 `calls_failed += 1`，token 0 |
 | 进了路由器后被取消（`$/cancelRequest`、连接断、撤销、方法超时、所绑请求结束、取消根） | 计 | `none` 行 `calls_cancelled += 1`，token 0 |
 | 被挡在路由器之前（`-32602`、`forbidden`、`not_ready`/`draining`/`revoked`、`request_id` 不在途、`busy`、`rate_limited`） | **不计** | ——它们没有用到任何模型 |
@@ -675,7 +757,7 @@ impl UsageSink for UsageRecorder { /* try_send；满 → dropped += 1 + warn */ 
 
 - `UsageTicket` 在确定进路由器时建；**每次进了路由器的调用恰好一笔**由类型结构保证。`Drop` 里只有同步的 `record`，不违反 `Handler` 契约「调用的全部工作必须在返回的 future 里」（SPEC ME-3c 表）。
 - **写者的生命周期（v2 M1）**：
-  - 正常结束 = **通道关闭**：sender 只存在于 `ModelCallbackDeps`（`serve` 按值交给 `mount_all`，返回即 drop）与各 `ModelGrant`（活在 `MethodsFor` 闭包里，闭包随 supervisor 拆除而 drop）。
+  - 正常结束 = **通道关闭**：sender 只存在于 `CallbackDeps.models`（`serve` 按值交给 `mount_all`，返回即 drop）与各 `ModelGrant`（活在 `MethodsFor` 闭包里，闭包随 supervisor 拆除而 drop）。
     最后一个 sender 消失时，队列里已有的记录全部写完，任务返回。
   - 硬上限 = `hard_stop`：`serve` 传入「停机 token 取消后，`sleep_until(shutdown.deadlines().modules)`」，即 cut-off + `CONFIRM`（200ms）。
     到点即关通道、丢弃剩余并 `warn!(lost = n)`。**不新增停机预算**：`deadlines().modules` 本来就在 `persist`/`watchdog` 之前（`lifecycle.rs:104-116`），默认 2s 的退出上限不变。
@@ -725,7 +807,7 @@ impl UsageSink for UsageRecorder { /* try_send；满 → dropped += 1 + warn */ 
 | `no_provider` | `ModelError::Unavailable`（LocalOnly 空路由、429、5xx、连不上、provider 超时） | `true` | 稍后重试 / 走规则兜底 |
 | `request_rejected` | `ModelError::Rejected { status: 400 \| 408 \| 409 \| 413 \| 422 }` | `false` | 改请求（缩短 prompt、改 schema） |
 | `backend_config` | `Rejected { 401 \| 403 \| 404 \| 其余 4xx }`、`ModelError::Provider(_)`（坏 JSON、超大响应体、无 choices） | `false` | 不要重试；告诉用户后端配置有问题 |
-| `response_too_large` | 结果 `text` > 512 KiB（§4.3） | `false` | 调小 `max_tokens` |
+| `response_too_large` | 序列化后的结果 > `MODEL_MAX_RESULT_BYTES`（§4.3，v3 N4） | `false` | 调小 `max_tokens` |
 
 完整映射：
 
@@ -734,7 +816,7 @@ impl UsageSink for UsageRecorder { /* try_send；满 → dropped += 1 + warn */ 
 | `ModelError::Unavailable(_)` | `-32000` `unavailable` | 「no model this module may use is available right now」 | `retryable:true, cause:no_provider` |
 | `ModelError::Rejected{..}` | `-32000` `unavailable` | 「the model backend refused this request」 | `retryable:false, cause:request_rejected\|backend_config` |
 | `ModelError::Provider(_)` | `-32000` `unavailable` | 「the model backend failed this request」 | `retryable:false, cause:backend_config` |
-| 结果过大 | `-32000` `unavailable` | 「…exceeds the size a callback result may carry; lower max_tokens」 | `retryable:false, cause:response_too_large` |
+| 结果过大（序列化后） | `-32000` `unavailable` | 「…exceeds the size a callback result may carry; lower max_tokens」 | `retryable:false, cause:response_too_large` |
 | `ModelError::Cancelled`（取消根，即 cut-off） | `-32000` `cancelled` | 「the daemon is shutting down」 | — |
 | `LifecycleTimeout::{BudgetExhausted, RequestEnded}` | `-32000` `timeout` | 同 memory 的两条（`os_memory_page.rs:218-231`） | — |
 | `request_id` 不在途（§3.4） | `-32000` `timeout` | 「request_id is not (or no longer) in flight; …」 | **`retryable:false`**（v2 L4） |
@@ -749,7 +831,8 @@ impl UsageSink for UsageRecorder { /* try_send；满 → dropped += 1 + warn */ 
 - provider 细节只进 daemon 日志（`tracing::warn!(module, status, detail)`），同 `map_memory_error` 的默认拒绝。
 - 对 `local_only` 模块，「只配了远端」与「本地全挂」给**同一句**（都是 `no_provider`）：模块不该能从错误里推断 daemon 有没有远端。
 - 闭集扩展的同步改动（ME4-4.2.2-0，一个 PR 内）：`ErrorKind` 加变体 + `ALL` + `as_str`；`rpc.rs` 测试 `the_error_kinds_are_exactly_specs_closed_set` 里的 SPEC 句子拷贝；
-  SPEC §3「错误形状」那一句（本分支已改）。scratch 已按改后的句子跑过该测试。**ME4-S1 的判据 C5.9 断言 `ALL.len() == 17`**，谁后合谁把它改成「不因调度而变」（§10.3）。
+  SPEC §3「错误形状」那一句（本分支已改）。scratch 已按改后的句子跑过该测试。ME4-S1 v3 用 diff 脚本判定它那组 PR 不碰 `ErrorKind`，与本文的扩展不冲突。
+- **（v3 L-b）`cause` 闭集也被钉住**：`UnavailableCause::ALL: [UnavailableCause; 4]`；测试用 SPEC §3 方法表里那句「`unavailable` 的 `data` 固定为 `{retryable: bool, cause: …}`」的拷贝比对集合（同 `ErrorKind` 的做法）。
 
 ---
 ## 8. 判据（每条带正对照；`cargo test <过滤>` 一律先 `-- --list` 断言非空，PLAN §一 第 5 条）
@@ -763,7 +846,8 @@ impl UsageSink for UsageRecorder { /* try_send；满 → dropped += 1 + warn */ 
 
 **J2 授予与注册（4.2.2b2，`-p agent24d model_grant`）**：未请求 `models` 的模块调 `_a24/model/complete` → `forbidden`（**不是** `-32601`）；其 `offer.provides` **不含** `_a24/model/`；
 请求了 `models` 的模块 → `provides` 含 `_a24/model/`、`MountReport.granted` 含 `models`（正对照）。`models = None` 的挂载 → 即使请求了也不出现在 `granted`/`provides`（invariant #134）。
-**4.2.2b1 合入后、b2 合入前**：生产 `Methods` 里**没有** `_a24/model/complete`（`-32601`），`provides` 不含 `_a24/model/`——结构测试断言 b1 的 `domain.rs` 不引用 `ModelCompleteHandler`。
+**4.2.2b1a/b1b 合入后、b2 合入前**：生产 `Methods` 里**没有** `_a24/model/complete`（`-32601`），`provides` 不含 `_a24/model/`——结构测试（照 `domain.rs` 读 `include_str!` 的先例）断言 `domain.rs` 不引用 `ModelCompleteHandler`。
+**（v3 N7）这条结构测试与 `model_callback.rs` 顶部的 `#![cfg_attr(not(test), allow(dead_code))]` 一起由 b2 删除**（b2 的 PR 描述点名）。
 
 **J3 LocalOnly 负对照（4.2.2b1，`-p agent24d model_callback`）**：手建 `ModelRouter::new(vec![(远端桩, Tier::Remote)])`，`local_only` 模块调用 →
 `unavailable`、`retryable:true`、`cause:"no_provider"`、**远端桩收到的请求数 = 0**、消息不含桩名；**正对照**：同一路由器、`remote_allowed` 模块 → 成功、`tier:"remote"`、桩计数 1。
@@ -772,7 +856,9 @@ params 里放 `privacy`/`model`/`tools` → `-32602` 且桩计数 0；`_meta: {p
 
 **J4 契约（4.2.2a，`-p agent24-models max_tokens`、`-p agent24-models model_id` 两条命令）**：真 TCP 桩记录请求体——`max_tokens: Some(77)` → 体里 `"max_tokens": 77`；
 **正对照** `None` → 体里没有这个键。桩回 `"model": "stub-actual-7b"` → `model_id == Some(..)`，≠ provider 名、≠ 请求名；桩不回 `model` → `None`。
-**/chat 零变化**：经真实 `post_chat` 打桩，请求体键集合 == `{model, messages, stream}`；桩回 401 时 `/chat` 的错误 JSON 与改动前逐字节相同（`Rejected` 与 `Provider` 同文）。（scratch `wire_tests` 已跑通前两部分；401/404/403 → `Rejected{status}` 的断言在 models 的既有测试里改写并通过。）
+**/chat 零变化（v3 L-d：golden 字面量）**：经真实 `post_chat` 打桩（`DEFAULT_MODEL` 固定为 `m`），桩收到的请求体 == `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}`（按 `serde_json::Value` 相等比较，键序无关）；
+桩对 401 回 `{"error":{"message":"bad key","code":"invalid_api_key"}}` 时，`/chat` 的响应体 == `{"error":{"code":"internal","message":"omlx: authentication failed — the API key is missing, wrong, or expired (HTTP 401: bad key [invalid_api_key])"}}`
+（形状按 `server.rs` 的 `error_response` 实际输出填写，实现时先在 main 上跑一次录下，再改代码，断言不变）。（scratch `wire_tests` 已跑通前两部分；401/404/403 → `Rejected{status}` 的断言在 models 的既有测试里改写并通过。）
 
 **J5 按方法超时（4.2.2-0，`-p agent24-os-proto per_method_budget`）**：`Limits.call_timeout = 100ms`；声明 800ms 的 handler 睡 300ms → 成功；
 **正对照**：不声明 → `timeout` 且文案含 `100ms`；声明 400ms、睡 5s → `timeout` 且文案含 `400ms`。`effective_call_timeout`：`None → default`、`120s → 120s`、`1h → 300s`、`5ms → 5ms`。
@@ -796,6 +882,7 @@ params 里放 `privacy`/`model`/`tools` → `-32602` 且桩计数 0；`_meta: {p
 - 同一模块 2 个挂起调用在途，第 3 个 → `busy`。
 - **`busy` 不花令牌**：冻结时钟、容量 3——c1、c2 挂起（剩 1），c3 `busy`，abort c1，c4 → **成功**；变异：把「扣令牌」挪到「准入」之前 → c4 变 `rate_limited`。
 - **（v2 M2）公平**（`ModelAdmission::new(4, 2)` 单测 + handler 级各一遍）：A 两个、B 一个在途时，B 的第二个 → `busy`，C 的第一个 → 执行；A、B 各尝试两个时合计只成 3 个，C 仍能进。
+  **（v3 N3）性质的边界**：A1、A2、B1、C1 之后 D 首调 → `busy`（3 个其他活跃模块时不承诺）。
   正对照：没有公平规则（变异成「只看 total < GLOBAL」）→ A、B 各 2 个占满 4 个，C `busy`，红。（scratch `fair_global_admission`、`busy_spends_no_token` 已跑通。）
 
 **J10 令牌桶与跨代（4.2.2b1/b2，`-p agent24d model_callback_rate`）**：`ModelGrant::with_clock` 冻结时钟，第 31 次 → `rate_limited`；时钟前进 2s → 成功（正对照）。
@@ -807,14 +894,15 @@ params 里放 `privacy`/`model`/`tools` → `-32602` 且桩计数 0；`_meta: {p
 store 层：WAL 文件库上 50 个并发记录 → 合计恰为 50；token 饱和到 `i64::MAX`；`none` 行带 token 被 CHECK 拒。
 写者：所有 sender drop 后写完队列并退出（正对照：还有 sender 时只有 `hard_stop` 能让它退出）。等待落盘用轮询（≤ 5s）。（scratch store 3 个 + recorder 2 个测试已跑通。）
 
-**J12 用量 API（4.2.3，`-p agent24d usage_by_module_api`）**：不带 `module` → 与改动前**逐字节**相同；**（v2 L5）`?%zz`、`?a=1&a=2` → 同样逐字节相同的 200**；
+**J12 用量 API（4.2.3b，`-p agent24d usage_by_module_api`）**：新 daemon 先 `POST /api/v1/chat` 一次（桩回 `usage:{prompt_tokens:3,completion_tokens:2,total_tokens:5}`），
+不带 `module` → 响应体 == **`{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"cost_usd":0.0}`**（v3 L-d golden，按 `Value` 相等）；**`?%zz`、`?a=1&a=2` → 同一字面量的 200**；
 `?module=../x` → 400；`?module=never_called` → 200、全 0、`by_served` 三键齐全、`cost_usd: null`；`?module=a&module=b` → 400 `invalid_request` JSON。（scratch `module_selector` 单测已跑通前三类。）
 
 **J13 错误映射（4.2.2b1 + 4.2.2-0）**：桩名 `stub-SECRET`、URL 含 `secret-host`：`Unavailable` → `unavailable` + `retryable:true` + `cause:no_provider`，整个 `error` JSON 不含 `SECRET`/`secret-host`；
 桩回 400 → `cause:request_rejected`；401 → `cause:backend_config`；两者 `retryable:false`，同样不含。闭集测试的 SPEC 拷贝含 `unavailable`；变异：从拷贝删掉 `unavailable` → 红。
 
 **J14 黑盒（4.3.1，`--test me4_model_blackbox`，连跑 10 次；v2 M5 加 LocalOnly 负对照）**：两个 Python `http.server` 桩（python3 缺失即失败）：
-本地桩绑 `127.0.0.1:<p1>`、`OMLX_URL=http://127.0.0.1:<p1>`（`Local`）；远端桩绑 `0.0.0.0:<p2>`、**`OLLAMA_URL=http://0.0.0.0:<p2>`**（§2.3 判 `Remote`，实际连回本机）。
+本地桩绑 `127.0.0.1:<p1>`、`OMLX_URL=http://127.0.0.1:<p1>`（`Local`）；远端桩绑 `127.0.0.1:<p2>`、**`OLLAMA_URL=http://[::ffff:127.0.0.1]:<p2>`**（v3 首选：§2.3 判 `Remote`、实际连回本机、无需监听全部网卡；备选：桩绑 `0.0.0.0:<p2>`、`OLLAMA_URL=http://0.0.0.0:<p2>`）。
 两个仓外 Python 模块：`m_local`（`[models]`，缺省 `local_only`）、`m_remote`（`[models]` + `remote_allowed`）。
 - 正常：`m_local` 不带 `request_id` 调一次 → `tier:local`、`model_id` = 本地桩回的 id；远端桩计数 0。
 - **负对照**：本地桩切到「回 503」→ `m_local` → `unavailable`/`no_provider`，**远端桩计数仍为 0**。
@@ -830,14 +918,33 @@ store 层：WAL 文件库上 50 个并发记录 → 合计恰为 50；token 饱�
 `Local`（正对照）：`http://127.0.0.1:8088`、`http://localhost:8088`、`http://LOCALHOST:8088`、`https://[::1]:8443`、`http://user:pw@127.0.0.1:8088`、`http://evil.example%2F@127.0.0.1:8088`（`%2F` 留在 userinfo）、`http://0x7f000001:8088`（WHATWG 规范化为 127.0.0.1）、`http://loc<TAB>alhost:8088`（制表符被剥）、`http://127.0.0.1:8088?@evil.example`；
 `Remote`：**`http://evil.example\@127.0.0.1:8088`**（H1 原向量）、`http://evil.example:80\@localhost/`、`http://127.0.0.1<TAB>.evil.example:8088`、`http://[::ffff:127.0.0.1]:8088`、`http://0.0.0.0:8088`、`http://localhost.:8088`、`http://192.168.1.50:8088`、`https://inference.example.com`、`not a url`、`file:///tmp/x`、空串。
 另断言 `reqwest::Url::parse(H1 向量).host_str() == Some("evil.example")`——证明量具（判定器与 HTTP 客户端）看到的是同一个 host。
-变异：换回手写 `url_host` → H1 向量变红。（scratch 已跑通，models 27 个测试全绿。）
+**（v3 N1）两格「连接不改道」**：
+- **代理**（`from_env_local_providers_ignore_http_proxy`）：两个线程桩（目标、代理）；**子进程**重跑测试二进制、按测试名只跑 `#[ignore]` 的 `proxy_child_from_env`，
+  环境 `OMLX_URL=http://127.0.0.1:<目标>`、`HTTP_PROXY`/`http_proxy`/`ALL_PROXY=http://127.0.0.1:<代理>`、去掉 `NO_PROXY`——断言**代理桩计数 0**、目标计数 1。
+  正对照：同样的环境跑 `proxy_child_default_client`（默认 client）→ 代理桩计数 1、目标 0。用子进程是因为 edition 2024 的 `set_var` 是 `unsafe`、工作区禁 `unsafe`；
+  用测试名而不是自定义环境变量选择子进程行为，是因为 `PASSTHROUGH_VARS` 扫描器会收集 `crates/` 下所有环境变量读取（§1 第 20 条）。
+- **重定向**（`a_loopback_only_provider_does_not_follow_redirects`）：目标桩回 `307`，`location` 指向另一个桩（`http://[::ffff:127.0.0.1]:<p>`）→ `loopback_only` provider 得到 `Rejected{status:307}`、**第二个桩计数 0**；正对照：默认 client → 计数 1。
+- 变异：`from_env` 不调 `loopback_only` → 代理格变红（已实测）。
+变异：换回手写 `url_host` → H1 向量变红。（scratch 已跑通，models 30 个测试全绿 + 2 个 ignored 子进程测试。）
 
 **J17 健康表隔离（4.2.2b1，`-p agent24d model_callback_health`；v2 H2）**：内核路由器 = `[a(Local), b(Local)]`；`a` 对模块调用回不可用（500）→ 模块调用经 `b` 成功；
 随后 `a` 恢复，内核路由器（`/api/v1/chat` 用的那一个）的下一次调用**打到 `a`**（`a` 计数 +1）。**负对照**：同一序列走**同一个**路由器 → 第二次调用跳过 `a`（`a` 计数不变）。
 变异：`ModelGrant` 里用 `deps.router` 而不是 `with_separate_health()` → 红。（scratch `module_failures_do_not_cool_down_the_kernels_router` 已跑通，含负对照。）
 
-**J18 结果大小（4.2.2b1；v2 M3）**：TCP 桩回 2 MiB 的 `content` → `unavailable` + `retryable:false` + `cause:"response_too_large"`，连接不断、下一次调用正常；
-sink 一笔 `FailedAfterServe` 且 token 非 0。正对照：恰好 512 KiB → 成功。变异：删掉检查 → 得到 `-32603`（帧上限），红。（scratch 用进程内桩跑通 512 KiB+1 / 512 KiB 两格。）
+**J18 结果大小（4.2.2b1b；v2 M3 → v3 N4）**：进程内桩（handler 级）与 TCP 桩（经真 `serve()`）各一遍——
+- 2 MiB 纯文本 → `unavailable` + `retryable:false` + `cause:"response_too_large"`，连接不断、下一次调用正常；sink 一笔 `FailedAfterServe`、token 非 0；
+- **400 KiB 全是 `"`**（序列化 800 KiB）→ **成功**（正对照：原始长度 400 KiB、序列化后仍在帧内）；
+- **200 KiB 全是 U+0001**（原始 200 KiB，序列化 1.2 MiB）→ `response_too_large`——v2 的原始长度判定会放过它、再被帧上限换成 `-32603`；
+- 边界：用真序列化器量出信封开销后，恰好 `MODEL_MAX_RESULT_BYTES` → 成功，多 1 字节 → 过大；
+- `model_id` 257 字节 → 结果里为 `null`。
+变异：改回按 `text.len()` 判定 → U+0001 格变成 `-32603`，红。（scratch `result_size_is_judged_after_serialization`、`an_overlong_model_id_is_dropped_not_truncated` 已跑通。）
+
+**J19 生产接线（v3 N5；4.2.2b2 起、4.2.3b 完整；`-p agent24d model_shutdown_wiring`，daemon 级）**：真 `serve()` 起 daemon（ephemeral store 换成临时文件库），挂一个请求 `models` 的 fixture 模块，
+provider 指向挂起的 TCP 桩；模块发起一个不带 `request_id` 的调用、桩确认收到后，发起停机（`Shutdown::request`）→ 断言：模块收到 `cancelled`（或连接随撤销关闭，二者之一，取决于撤销与 cut-off 谁先到），
+桩观察到连接关闭；daemon 退出后以同一数据文件打开 `Store`，`module_model_usage` 的 `none` 行 `calls_cancelled = 1`。
+覆盖的正是 b2 的 `spawn_cancel_root(shutdown.modules_cut_off())` 与 4.2.3b 的「停机序列等写者」。
+变异：`serve()` 里取消根改挂一个永不取消的 token → 调用活过写者硬上限，记录不落库，红；把「等写者」删掉 → 记录可能在进程退出时丢失（同样红，偶发性由 10 次连跑覆盖）。
+（scratch `cut_off_cancels_in_flight_calls_and_their_record_lands_in_the_store`：真 provider + 真 `UsageRecorder` + `spawn_cancel_root` + `CallbackDeps` 按值 drop 组装的版本，变异「取消根改为永不取消」已实测变红。）
 
 ---
 
@@ -855,6 +962,9 @@ sink 一笔 `FailedAfterServe` 且 token 非 0。正对照：恰好 512 KiB → 
 8. **offer set 阶梯**：b1 不注册、b2 一次跨越（§2.4/§10.2）。
 9. **片段都编过**：附录 A。scratch 是真实 crate 的拷贝打补丁；`agentd` 是 binary crate，handler 所需的 `RateLimiter`/`refused_error`/`Clock` 按原形状复制，
    挂载与 `serve()` 接线写成纯函数（`mount_sketch.rs`：`model_grant`、`provides_model`、`with_model_method`、`spawn_cancel_root`）。
+10. **（v3）「诚实的标签」到底是什么**：v2 只修了「判的串 ≠ 连的串」的解析那一半；代理与重定向是同一类缺口的另两条路（N1）。v3 把定义写死为「回环 + 不经代理 + 不跟随重定向」，
+    并如实写出它**不能**覆盖的：回环上的进程自己再外发（R13）。
+11. **（v3）计量与结果一致**：先按序列化后字节判定、再记账（N4）；取消根与写者的生产接线有 daemon 级判据（J19）。
 
 ---
 
@@ -865,32 +975,37 @@ sink 一笔 `FailedAfterServe` 且 token 非 0。正对照：恰好 512 KiB → 
 | crate / 文件 | 新增或改动 | 任务 |
 |---|---|---|
 | `agent24-domain/src/lib.rs` | `ModelAccess` + `ALL`/`as_str`/`parse`；`RawManifest.model_access: Option<String>`；`DomainOsManifest::model_access()`；解析期两条校验 | 4.2.1 |
-| `agent24-models/src/lib.rs` | `CompletionRequest.max_tokens: Option<NonZeroU32>`；`CompletionResponse.model_id: Option<String>`；`OaChatResponse.model`；条件写 `max_tokens`；**`ModelError::Rejected { status, message }`**，`friendly_http_error` 对 4xx（非 429）返回它 | 4.2.2a |
-| `agent24-models/src/router.rs` | `Served { provider, tier, response }`；`complete_served`；`complete` 改为投影；**`with_separate_health`**；**`is_loopback_url` + 新 `env_local_tier`**（删 `url_host`/`is_loopback_host`）；**`OLLAMA_URL`** | 4.2.2a |
+| `agent24-models/src/lib.rs` | **（v3）`OpenAiCompatProvider::loopback_only()`**；`CompletionRequest.max_tokens: Option<NonZeroU32>`；`CompletionResponse.model_id: Option<String>`；`OaChatResponse.model`；条件写 `max_tokens`；**`ModelError::Rejected { status, message }`**，`friendly_http_error` 对 4xx（非 429）返回它 | 4.2.2a |
+| `agent24-models/src/router.rs` | `Served { provider, tier, response }`；`complete_served`；`complete` 改为投影；**`with_separate_health`**；**`is_loopback_url` + 新 `env_local_tier`**（删 `url_host`/`is_loopback_host`）；**`OLLAMA_URL`**；**（v3）`from_env` 对 `Local` 调 `loopback_only`、`tier_label`** | 4.2.2a |
+| `agent24-cli/src/service.rs` | **（v3 N2）`PASSTHROUGH_VARS` 加 `"OLLAMA_URL"`（`[&str; 11]` → `[&str; 12]`）** | 4.2.2a |
 | 工作区其它 crate | 15 处结构体字面量补字段；`agent24-agent/src/lib.rs:1026-1031` 与 `agentd routes.rs:140-152` 两处 `ModelError` 穷尽 `match` 加 `Rejected` 分支（与 `Provider` 同处理） | 4.2.2a |
 | `agent24-os-proto/src/rpc.rs` | `Handler::call_timeout`（默认 `None`，文档含并发警示）；`MAX_METHOD_CALL_TIMEOUT`；`effective_call_timeout`；`Conn.by_task` 带时长；`on_frame`/`finished`；`ErrorKind::Unavailable`（`ALL` 18）；闭集测试的 SPEC 拷贝 | 4.2.2-0 |
-| `agentd/src/model_callback.rs`（新，`main.rs` 加 `mod model_callback;`） | §5.2 常量、wire 类型、`ModelCallbackDeps`、`ModelGrant`（`new`/`with_clock`）、`ModelAdmission`/`AdmissionGuard`、`ModelCompleteHandler`、`UnavailableCause`、`map_model_error`、`Served`/`UsageOutcome`/`UsageSink`/`MemoryUsageSink`/`UsageTicket` | 4.2.2b1 |
-| `agentd/src/domain.rs` | `KERNEL_OOP_GRANTS` 加 `Models`；`mount_all`/`mount_package` 加 `models: Option<ModelCallbackDeps>`；闭包外建 `ModelGrant`；`provides`/`granted_names`；注册 `_a24/model/complete` | 4.2.2b2 |
+| `agentd/src/model_callback.rs`（新，`main.rs` 加 `mod model_callback;`；顶部 `#![cfg_attr(not(test), allow(dead_code))]`，b2 删） | b1a：§5.2 常量、`ModelCallbackDeps`、`ModelGrant`（`new`/`with_clock`）、`ModelAdmission`/`AdmissionGuard`、`UnavailableCause`（含 `ALL`）、`map_model_error`、`Served`/`UsageOutcome`/`UsageSink`/`MemoryUsageSink`/`UsageTicket`；b1b：wire 类型、`ModelCompleteHandler`、`RESULT_ENVELOPE_MARGIN`/`MODEL_MAX_RESULT_BYTES`/`MODEL_MAX_MODEL_ID_BYTES` | 4.2.2b1a / b1b |
+| `agentd/src/domain.rs` | `KERNEL_OOP_GRANTS` 加 `Models`；**S1 v3 的 `CallbackDeps` 加字段 `models: Option<ModelCallbackDeps>`（不另加参数）**；闭包外建 `ModelGrant`；`provides`/`granted_names`；注册 `_a24/model/complete` | 4.2.2b2 |
 | `agentd/src/server.rs` | `serve()`：`spawn_cancel_root(shutdown.modules_cut_off())`、`ModelAdmission::new(4, 2)`、sink（b2 为 `MemoryUsageSink`，4.2.3 换成 `UsageRecorder::spawn(store, hard_stop)` 并在停机序列里等它）、按值传给 `mount_all` | 4.2.2b2 / 4.2.3 |
-| `agent24-store` | 迁移 `0008_module_model_usage.sql`（合并时若已有更大号则 max+1）；`module_model_usage.rs`：`ServedBy`、`ModelUsageDelta`、`ModelUsageRow`、三个 `Store` 方法 | 4.2.3 |
-| `agentd/src/usage_recorder.rs`（新） | `UsageRecorder`（`spawn`、`dropped`、`impl UsageSink`） | 4.2.3 |
-| `agentd/src/routes.rs` | `get_usage` 改读 `RawQuery` + `module_selector`；`ModuleUsageResponse`/`UsageCounts`/`DailyUsage` | 4.2.3 |
+| `agent24-store` | 迁移 `0008_module_model_usage.sql`（合并时若已有更大号则 max+1）；`module_model_usage.rs`：`ServedBy`、`ModelUsageDelta`、`ModelUsageRow`、三个 `Store` 方法 | 4.2.3a |
+| `agentd/src/usage_recorder.rs`（新） | `UsageRecorder`（`spawn`、`dropped`、`impl UsageSink`） | 4.2.3b |
+| `agentd/src/routes.rs` | `get_usage` 改读 `RawQuery` + `module_selector`；`ModuleUsageResponse`/`UsageCounts`/`DailyUsage` | 4.2.3b |
 | `docs/specs/SPEC-ME3-OUT-OF-PROCESS.md` | §3 offer set 首句 + ME-4b 注、错误闭集句、「超时」行、方法表行；§5「模型回调」段；§8 ME-4b 行与 3c 表超时行注；§9 | **本分支已改** |
 | `docs/agent/followups.md` | FU-71（H1 现有缺陷）、FU-72（全局 `cost_usd: 0.0`）、FU-73（`model_access` 不在 `/api/v1/os`）、`ME4-CODEX-DEBT` 一行 | **本分支已改** |
 
 ### 10.2 交给 PLAN 的切法（开工前先改 PLAN §三 与 `tasks.md` 台账；本文不改 PLAN）
 
-| 任务 | 内容 | 依赖 | 验收（判据） | 与原 PLAN 的差异 |
-|---|---|---|---|---|
-| **ME4-4.2.1** manifest 字段 | 只做 `agent24-domain` 的 `ModelAccess` 与校验 | 4.1.1 冻结 | J1 | **收窄**：原来还含 `KERNEL_OOP_GRANTS`/`provides` 与 `-p agentd model_grant`——挪到 b2。**不再改 `mount_package`，不必排在 ME4-1.5.1 之后**，可与 M1 并行 |
-| **ME4-4.2.2-0**（新） 回调通道按方法超时 + `unavailable` | `rpc.rs` 的 §3.2 六处 + `ErrorKind::Unavailable` + 闭集测试拷贝 + SPEC 闭集句 | 4.1.1 冻结 | J5、J13 的闭集部分 | 新增。只动 `agent24-os-proto`，可与 4.2.2a、M1 并行；与 ME4-S1 的交集见 §10.3 |
-| **ME4-4.2.2a** 模型契约 + 标签修复 | §4.1 全部 + §2.3（H1）+ `with_separate_health` + `OLLAMA_URL` + `Rejected` | 4.1.1 冻结 | J4、J16（及 models 既有测试改写） | **扩大**：加入 H1（修现有缺陷，关 FU-71）、H2 的路由器侧、`Rejected` |
-| **ME4-4.2.2b1**（新拆） handler | `model_callback.rs` 全部（不注册、不授予）；`MemoryUsageSink` | 4.2.1、4.2.2-0、4.2.2a | J3、J6、J7、J8、J9、J10（前半）、J13、J15、J17、J18 | 由原 4.2.2b 拆出；**不改 `domain.rs`**，因此不依赖 ME4-1.5.1 |
-| **ME4-4.2.2b2**（新拆） 授予与接线 | `KERNEL_OOP_GRANTS += Models`、`mount_all`/`mount_package` 参数、`provides`、注册、`serve()` 构造 deps（sink 仍为内存） | 4.2.2b1、**ME4-1.5.1**（两条回调都改 `mount_package`） | J2、J10（跨代） | **offer set 阶梯只由它跨越** |
-| **ME4-4.2.3** 按模块用量 | 迁移、store 方法、`UsageRecorder`、`serve()` 换 sink 并在停机序列等写者、`/api/v1/usage?module=` | 4.2.2b2 | J11、J12 | 落库断言从 4.2.2b 挪来 |
-| **ME4-4.3.1** 黑盒 + 探针 | `me4_model_blackbox.rs`（J14，含 LocalOnly 负对照）、`me3-status.sh` 的 `4b 推理回调` | 4.2.3 | J14 | 黑盒加负对照（v2 M5） |
+行数为**非测试代码**、按 scratch 实测（非空、非纯注释行，含文档注释）；测试另计。
 
-规模估计（均 ≤ 300 行量级，不含测试）：4.2.1 ~60；4.2.2-0 ~60；4.2.2a ~150；4.2.2b1 ~280；4.2.2b2 ~80；4.2.3 ~250；4.3.1 以测试为主。
+| 任务 | 内容 | 依赖 | 验收（判据） | ~行数 | 与原 PLAN 的差异 |
+|---|---|---|---|---|---|
+| **ME4-4.2.1** manifest 字段 | `agent24-domain` 的 `ModelAccess` 与两条校验 | 4.1.1 冻结 | J1 | ~70 | **收窄**：`KERNEL_OOP_GRANTS`/`provides`/`model_grant` 判据挪到 b2；不再改 `mount_package`，不必排在 ME4-1.5.1 之后 |
+| **ME4-4.2.2-0**（新） 回调通道按方法超时 + `unavailable` | `rpc.rs` §3.2 六处 + `ErrorKind::Unavailable` + 闭集测试拷贝 + SPEC 闭集句 | 4.1.1 冻结 | J5、J13 闭集部分 | ~60 | 新增；只动 `agent24-os-proto` |
+| **ME4-4.2.2a** 模型契约 + 标签修复 | §4.1 全部；§2.3（H1 解析 + **N1 `loopback_only`** + L-e `tier_label`）；`with_separate_health`；`OLLAMA_URL` **与 `PASSTHROUGH_VARS` 同 PR**（N2）；`Rejected` 及两处 `match` | 4.1.1 冻结 | J4、J16（含代理/重定向两格） | ~190 | **扩大**：修现有缺陷 FU-71 的两条路 |
+| **ME4-4.2.2b1a**（新拆） 类型、准入、sink、错误映射 | `model_callback.rs` 的 §5.2 常量、`ModelCallbackDeps`/`ModelGrant`、`ModelAdmission`、`UsageOutcome`/`UsageSink`/`MemoryUsageSink`/`UsageTicket`、`UnavailableCause`/`map_model_error`；**顶部 `#![cfg_attr(not(test), allow(dead_code))]`** | 4.2.1、4.2.2-0、4.2.2a | J9（`ModelAdmission` 单测）、J13（映射 + cause 闭集）、J17（健康表隔离，grant 级） | ~230 | 由原 4.2.2b 拆出（N6） |
+| **ME4-4.2.2b1b**（新拆） handler | wire 类型（`ModelCompleteParams` 等）、`ModelCompleteHandler`、结果大小常量 | 4.2.2b1a | J3、J6、J7、J8、J9（handler 级）、J10（前半）、J15、J18 | ~190 | 由原 4.2.2b 拆出（N6）；仍不注册（`dead_code` 由 b1a 的属性覆盖） |
+| **ME4-4.2.2b2**（新拆） 授予与接线 | `KERNEL_OOP_GRANTS += Models`、`CallbackDeps.models`、`provides`、注册、`serve()` 构造 deps（`spawn_cancel_root(shutdown.modules_cut_off())`、`ModelAdmission::new(4, 2)`、sink 仍为内存）；**删除** `dead_code` 属性与 J2 的「不引用 handler」结构测试（N7） | 4.2.2b1b、**ME4-1.5.1**（S1 引入 `CallbackDeps`） | J2、J10（跨代）、J19（取消部分，断言对象为内存 sink） | ~80 | **offer set 阶梯只由它跨越** |
+| **ME4-4.2.3a**（新拆） 用量存储 | 迁移 0008、`agent24-store` 的 `module_model_usage.rs` | 4.1.1 冻结（只动 store，可提前） | J11 的 store 部分（并发 50、饱和、CHECK） | ~150 | 由原 4.2.3 拆出（N6） |
+| **ME4-4.2.3b**（新拆） 写者与 API | `usage_recorder.rs`、`serve()` 换 sink 并在停机序列等写者、`routes.rs` 的 `?module=` | 4.2.2b2、4.2.3a | J11 其余、J12、J19（完整：落库） | ~210 | 由原 4.2.3 拆出（N6） |
+| **ME4-4.3.1** 黑盒 + 探针 | `me4_model_blackbox.rs`（J14，含 LocalOnly 负对照）、`me3-status.sh` 的 `4b 推理回调` | 4.2.3b | J14 | 以测试为主 | 黑盒加负对照（v2 M5，v3 用 `[::ffff:127.0.0.1]`） |
+
+scratch 实测：`model_callback.rs` 非测试部分 417 行（b1a 覆盖其中常量/usage/准入/grant/错误映射五段，b1b 覆盖 params/result/handler 三段）；`module_model_usage.rs` 138 + 迁移 13；`usage_recorder.rs` 93 + `usage_route.rs` 114。
 
 ### 10.3 与 ME4-1.1.1（调度，`docs/design/ME4-S1-scheduler-callback.md`）的合并点（v2 M7 补全代码层）
 
@@ -900,14 +1015,14 @@ sink 一笔 `FailedAfterServe` 且 token 非 0。正对照：恰好 512 KiB → 
 |---|---|---|---|
 | SPEC §3 offer set 首句 | 加 `Scheduler` | 「ME-3 为 {…}；ME-4b 起为 {Memory, Events, Approval, Models}」 | 两条增量都在：「ME-3 为 `{Memory, Events, Approval}`；ME-4a 起加 `Scheduler`，ME-4b 起加 `Models`」 |
 | SPEC §3 方法表末尾 | `_a24/scheduler/*` 行 | `_a24/model/complete` 行 | 两组行都在（两边的 grep 验收各自命中） |
-| SPEC §3 错误闭集句 | 不扩展（C5.9） | 加 `unavailable` | 含 `unavailable` 的句子；**ME4-S1 的 C5.9 改为「调度不改变闭集」**（不再断言 `== 17`） |
+| SPEC §3 错误闭集句 | 不扩展（v3：按 diff 脚本判定其 PR 不碰 `ErrorKind`） | 加 `unavailable` | 含 `unavailable` 的句子；两边判据不冲突 |
 | SPEC §8 交付表 | ME-3g 后加 ME-4a 行 | ME-3g 后加 ME-4b 行 | 两行，按 4a、4b 顺序 |
 | SPEC §9 | 去掉 `Scheduler` | 去掉 `Models`（v2 M6 措辞） | 「不做 `Policy`」+ 两边各自的「不做」补充条 |
 | `KERNEL_OOP_GRANTS`（`domain.rs:93-94`）及其文档注释 | `+= Scheduler`，改写「Narrower than KERNEL_GRANTS」注释 | `+= Models` | `[Events, Approval, Memory, Scheduler, Models]`；注释两边的理由都保留 |
-| `mount_all`/`mount_package` 参数表（`domain.rs:875`、`1275`）与**全部调用点和测试**（`mount_package` 唯一调用点 `domain.rs:1054`；`mount_all` 在 `server.rs:1250`、`server.rs:1956` 与 `domain.rs` 测试里多处——实现时 `grep -n 'mount_all(' rust/apps/agent24d/src` 逐个补） | `scheduler: &Arc<Scheduler>` | `models: Option<ModelCallbackDeps>` | 两个参数都加；调用点逐个补齐（`#[allow(clippy::too_many_arguments)]` 已在） |
+| `mount_all`/`mount_package` 参数表（`domain.rs:875`、`1275`）与全部调用点和测试（`mount_package` 唯一调用点 `domain.rs:1054`；`mount_all` 在 `server.rs:1250`、`server.rs:1956` 与 `domain.rs` 测试里多处） | **v3：新增按值的 `deps: CallbackDeps`**（`mount_package` 借用），含 `scheduler` 字段；调用点由 S1 补齐 | 只往 `CallbackDeps` 加 `models: Option<ModelCallbackDeps>` 字段；调用点构造处多填一个字段（测试里多为 `None`） | 一个参数、两个字段；谁后合谁在构造处补自己的字段 |
 | `provides` 块（`domain.rs:1413-1423`） | push `_a24/scheduler/` | push `_a24/model/`（仅当持有 grant） | 两个 push 都在，互不嵌套 |
 | `MethodsFor` 闭包体（`domain.rs:1424-1537`） | 注册三个 scheduler 方法，闭包外建令牌桶 | 注册 `_a24/model/complete`，闭包外建 `ModelGrant` | 两组 `.with(..)` 都在；两个闭包外对象都 clone 进闭包 |
-| `server.rs` `serve()` | tick 循环挪到 `mount_all` 之后、`OnceLock`、投递泵 | 构造 `ModelCallbackDeps`（取消根、准入、sink）、4.2.3 起等写者 | 两段都在；本文的构造放在 `mount_all` **之前**（它是参数），调度的启动放在之后 |
+| `server.rs` `serve()` | 构造 `CallbackDeps`；tick 循环挪到 `mount_all` 之后、`OnceLock`、投递泵 | 往 `CallbackDeps` 填 `models`（取消根、准入、sink）、4.2.3b 起等写者 | 两段都在；`CallbackDeps` 在 `mount_all` **之前**构造并按值交出，调度的启动放在之后 |
 | `ErrorKind::ALL` 与闭集测试的 SPEC 拷贝（`rpc.rs:155`、`rpc.rs:1937-1953`） | 不动 | 17 → 18 | 18；拷贝含 `unavailable` |
 | `Handler` trait（`rpc.rs:326`） | （若调度也要按方法超时）复用本文的 `call_timeout` | 加 `call_timeout` | 一个默认方法，谁先合谁定义，另一方只 `impl` |
 | 迁移号 | 0007 | 0008 | **后合并方 rebase 时迁移号取 max+1**；两者无表冲突 |
@@ -922,23 +1037,24 @@ sink 一笔 `FailedAfterServe` 且 token 非 0。正对照：恰好 512 KiB → 
 |---|---|---|
 | R1 | 同步调用最长占一个回调槽 120s；推理结果在连接断开后取不回 | (a) 的固有代价（§3.1）；每模块 2 并发把它压住；需要「提交后离开」的模块用自己的 outbox |
 | R2 | 被代理请求内联推理受 30s 代理总时限、fired 内联推理受投递超时约束 | 由 §3.4 的使用指引（先应答、再后台）承担，写进 SPEC 方法表与 T14 wire 文档 |
-| R3 | 全局 4 并发不含 `/api/v1/chat` 与 agent loop，本地 oMLX 仍可能过载；**≥ 4 个模块同时活跃时第 5 个 `busy`**（v2 M2） | 内核自己的用量不该被模块挤占；公平规则已保证两三个模块占不满；更多模块同时推理是本机算力问题，不是分配问题 |
+| R3 | 全局 4 并发不含 `/api/v1/chat` 与 agent loop，本地 oMLX 仍可能过载；公平规则**只保证其他活跃模块 ≤ 2 个时新模块首调有槽**（v3 N3）——有 3 个其他活跃模块时可能 `busy`（反例 A1、A2、B1、C1 → D），≥ 4 个时第 5 个同样 `busy` | 内核自己的用量不该被模块挤占；两个模块占不满已由规则保证；更多模块同时推理是本机算力问题，不是分配问题 |
 | R4 | 用量记录在队列满、或停机硬上限（cut-off + 200ms）后仍排队时会丢；取消的远端调用费用未知 | `dropped` 计数、`lost` 日志可观测；不为用量延长停机；费用本来未知（§6.4） |
 | R5 | `model_access` 不在 `/api/v1/os` / `agent24 os list` 里显示 | 远端来源今天只有非回环的 `OMLX_URL`/`OLLAMA_URL`；**FU-73**（ME4→next，Medium） |
 | R6 | 没有按日远端 token 预算，`remote_allowed` 模块在令牌桶内可持续外发 | 需要价目表与远端配置入口，本轮都不做；remote 需 manifest 显式声明 |
 | R7 | `CompletionRequest`/`CompletionResponse` 加字段、`ModelError` 加变体，对**外部**直接构造/穷尽匹配它们的 crate 是源码不兼容 | 工作区内已列全（§10.1）；外部（若 Sin90 仍 git 依赖 `agent24-models`）在其 M5 前同步——4.2.2a 的 PR body 点名 |
 | R8 | ~~共享健康表~~ | **v2 已消除**（H2，§5.1） |
 | R9 | daemon 重启重置令牌桶 | 模块无法触发 daemon 重启（§0 同 UID 敌意进程除外） |
-| R10 | 512 KiB 的文本在 JSON 里最坏可膨胀 6 倍（全是需转义的控制字符）而超过 1 MiB 帧 → 仍会是 `-32603` | 只有病态输出才会；兜底仍是既有的 `response_line`（不断连）；要消除需按序列化后字节检查，代价是先序列化一遍 |
+| R10 | ~~原始长度判定低估转义膨胀~~ | **v3 已消除**（N4：按序列化后字节判定） |
 | R11 | 按序尝试多个 provider 时，第一个慢 provider 可吃完整个 120s（v2 L2） | 路由器的既有行为；冷却会让它下次被跳过（在本模块自己的健康表里） |
 | R12 | 模块不能从内核已知的冷却受益，会自己再撞一次不可用的 provider（v2 H2 的代价） | 最多多一次 connect 超时（2s）；换来的是模块无法操纵内核路由 |
+| R13 | **（v3 N1）`Local` 只说明「连到回环上的那个端点、不经代理、不被重定向」，不说明那个进程之后做什么**：127.0.0.1 上的本机网关（LiteLLM、自建反代）把请求转发到远端，任何标签都看不见 | 这是运维配置，不是内核能判定的事实；SPEC 措辞已收窄到机制能保证的范围。把这类网关指给 `OMLX_URL` 的用户须自知（写进 wire 文档与 `agent24 doctor` 的 followup 候选） |
 
 ---
 
 ## 12. 登记的 followups（本分支已写入 `docs/agent/followups.md`）
 
-- **FU-71**（现有缺陷，High，**由 ME4-4.2.2a 关闭**）：`ModelRouter::from_env` 的 `url_host`/`is_loopback_host` 与 reqwest 的 WHATWG 解析不一致，
-  `OMLX_URL=http://evil.example\@127.0.0.1:8088` 被标 `Local`、实际连 `evil.example`——**所有** LocalOnly 使用方（Guardian、会话摘要器，以及本文的模块回调）的隐私保证因此不成立。修法与判据见本文 §2.3 / J16。
+- **FU-71**（现有缺陷，High，**由 ME4-4.2.2a 关闭**；v3 扩到代理/重定向两条路）：`ModelRouter::from_env` 的 `url_host`/`is_loopback_host` 与 reqwest 的 WHATWG 解析不一致，
+  `OMLX_URL=http://evil.example\@127.0.0.1:8088` 被标 `Local`、实际连 `evil.example`——**所有** LocalOnly 使用方（Guardian、会话摘要器，以及本文的模块回调）的隐私保证因此不成立。**v3**：同一缺陷还有两条路——默认 client 读 `HTTP_PROXY`/`ALL_PROXY`（不绕过回环）、跟随重定向；修法 `loopback_only()`。修法与判据见本文 §2.3 / J16。
 - **FU-72**（Low，ME4→next）：`GET /api/v1/usage`（不带 `module`）的 `cost_usd` 恒 `0.0`，对远端调用是错误陈述；应为 `null` 或去掉，需要评估客户端兼容。
 - **FU-73**（Medium，ME4→next）：`MountReport`/`agent24 os list` 显示模块的 `model_access`（R5）。
 - **ME4-CODEX-DEBT**：本设计 v1 经 Opus 子代理评审（REQUEST_CHANGES 0/2/7/10），v2 待第 2 轮；额度恢复后补 Codex。
@@ -951,68 +1067,73 @@ sink 一笔 `FailedAfterServe` 且 token 非 0。正对照：恰好 512 KiB → 
 
 构成：把 worktree（`73a9592`）的 `agent24-models`、`agent24-domain`、`agent24-os-proto`、`agent24-store` **整份拷贝**进来（包名改 `me4s2-*`、lib 名不变，
 `agent24-protocol`/`agent24-core` 仍 path 依赖 worktree），按本文 §2.1 / §2.3 / §3.2 / §4.1 / §6.1 / §7 打补丁；再加一个 `me4s2-check` crate：
-`model_callback.rs`（§4.2–§7：handler、wire 类型、grant、准入、错误、`UsageSink`）、`usage_recorder.rs`（§6.3 写者）、`usage_route.rs`（§6.5）、`mount_sketch.rs`（§2.4、§3.3 接线）、以及测试。
+`model_callback.rs`（§4.2–§7：handler、wire 类型、grant、准入、错误、`UsageSink`）、`usage_recorder.rs`（§6.3 写者）、`usage_route.rs`（§6.5）、`mount_sketch.rs`（§2.4 的 `CallbackDeps`/`model_grant`、§3.3 的 `spawn_cancel_root`）、以及测试。
+
+变异实测（改回后恢复原样）：`from_env` 不调 `loopback_only` → `from_env_local_providers_ignore_http_proxy` 红；取消根改为永不取消的 token → `cut_off_cancels_in_flight_calls_and_their_record_lands_in_the_store` 在 2s 超时处红。
 
 ```sh
 S=/private/tmp/claude-502/-Users-jason-Dev-auraai-Agent24/977deb42-1aba-448f-95e7-5bae2dee6fd4/scratchpad/me4s2-check
 cd $S
 CARGO_TARGET_DIR=target cargo check --workspace --all-targets
-CARGO_TARGET_DIR=target cargo clippy -p me4s2-check --all-targets -- -D warnings
+CARGO_TARGET_DIR=target cargo clippy --workspace --all-targets -- -D warnings
 CARGO_TARGET_DIR=target cargo test -p me4s2-check                   # handler / params / manifest / wire / recorder / route
 CARGO_TARGET_DIR=target cargo test -p me4s2-os-proto --lib rpc::    # 既有 rpc 测试 + 按方法超时 + 闭集
 CARGO_TARGET_DIR=target cargo test -p me4s2-store module_model_usage
-CARGO_TARGET_DIR=target cargo test -p me4s2-models                  # 既有测试（/chat 路径回归）+ J16 变体矩阵
+CARGO_TARGET_DIR=target cargo test -p me4s2-models                  # 既有测试 + J16 变体矩阵 + 代理（子进程）/重定向两格
 CARGO_TARGET_DIR=target cargo test -p me4s2-domain
 ```
 
 工具链：本机 `cargo +1.98.0` 不可用（Homebrew rustc 1.95.0），scratch 用默认工具链；实现 PR 仍按 PLAN §一 第 8 条用 `+1.98.0` 跑全局前置。
 
-输出（v2，2026-09-24）：
+输出（v3，2026-09-24；clippy 覆盖整个 scratch 工作区）：
 
 ```
 $ cargo check --workspace --all-targets
-    Checking me4s2-check v0.0.0 (…/me4s2-check/check)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.14s
-$ cargo clippy -p me4s2-check --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.55s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.31s
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.86s
 $ cargo test -p me4s2-check
+test model_callback::tests::fairness_holds_with_two_others_and_not_with_three ... ok
 test model_callback::tests::fair_global_admission ... ok
 test model_callback::tests::no_grant_is_forbidden ... ok
 test model_callback::tests::local_only_never_reaches_a_remote_provider_and_remote_allowed_does ... ok
-test model_callback::tests::params_shape ... ok
 test model_callback::tests::an_unknown_request_id_is_refused_not_run_unbound ... ok
-test usage_route::tests::selector ... ok
+test model_callback::tests::params_shape ... ok
+test model_callback::tests::an_overlong_model_id_is_dropped_not_truncated ... ok
 test model_callback::tests::module_failures_do_not_cool_down_the_kernels_router ... ok
-test model_callback::tests::an_oversize_answer_is_a_defined_error_and_its_tokens_are_kept ... ok
 test manifest_tests::model_access_default_explicit_and_rejections ... ok
+test usage_route::tests::selector ... ok
+test model_callback::tests::unavailable_causes_are_exactly_specs_closed_set ... ok
 test wire_tests::max_tokens_is_forwarded_only_when_set_and_model_id_is_parsed ... ok
 test usage_recorder::tests::writer_drains_and_exits_when_the_channel_closes ... ok
 test model_callback::tests::busy_spends_no_token ... ok
-test usage_recorder::tests::the_hard_stop_ends_the_writer_even_with_a_live_sender ... ok
 test model_callback::tests::cancelling_the_root_reaches_the_provider_and_records_it ... ok
+test usage_recorder::tests::the_hard_stop_ends_the_writer_even_with_a_live_sender ... ok
 test wire_tests::cancel_root_reaches_the_real_provider_and_answers_cancelled ... ok
+test wire_tests::cut_off_cancels_in_flight_calls_and_their_record_lands_in_the_store ... ok
+test model_callback::tests::result_size_is_judged_after_serialization ... ok
 test model_callback::tests::dropping_the_call_future_cancels_the_provider_token_and_records_cancelled ... ok
 test wire_tests::dropping_the_provider_future_closes_the_upstream_connection ... ok
-test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
 $ cargo test -p me4s2-os-proto --lib rpc::
 test rpc::tests::a_declared_budget_is_clamped_and_an_absent_one_is_the_default ... ok
 test rpc::tests::the_error_kinds_are_exactly_specs_closed_set ... ok
 test rpc::tests::the_handshakes_error_kinds_are_members_of_the_closed_set ... ok
 test rpc::tests::per_method_budget_outlives_the_connection_budget ... ok
-test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 268 filtered out; finished in 1.04s
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 268 filtered out; finished in 1.02s
 $ cargo test -p me4s2-store module_model_usage
-test module_model_usage::tests::the_none_row_cannot_carry_tokens ... ok
-test module_model_usage::tests::per_module_rows_accumulate_and_stay_separate ... ok
-test module_model_usage::tests::concurrent_records_lose_no_increment ... ok
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.04s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.09s
 $ cargo test -p me4s2-models
+test router::tests::proxy_child_default_client ... ignored, child process of from_env_local_providers_ignore_http_proxy
+test router::tests::from_env_reports_the_judged_tier ... ok
+test router::tests::proxy_child_from_env ... ignored, child process of from_env_local_providers_ignore_http_proxy
 test tests::status_becomes_a_cause_a_user_can_act_on ... ok
-test tests::transient_errors_allow_fallthrough_config_errors_do_not ... ok
 test router::tests::env_local_tier_uses_the_http_clients_own_parser ... ok
-test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+test router::tests::a_loopback_only_provider_does_not_follow_redirects ... ok
+test router::tests::from_env_local_providers_ignore_http_proxy ... ok   (spawns proxy_child_from_env / proxy_child_default_client)
+test result: ok. 30 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 $ cargo test -p me4s2-domain
-test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 ```
 
 scratch 与真实代码的差异（如实）：`agentd` 是 binary crate，`RateLimiter`/`Clock`/`refused_error` 按原形状复制进 `check/src/events_emit.rs`；
