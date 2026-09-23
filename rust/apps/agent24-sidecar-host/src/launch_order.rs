@@ -204,6 +204,12 @@ pub(crate) struct ActorLaunchOrder<L, S> {
     force_ok: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForceAttempt {
+    Confirmed,
+    Pending,
+}
+
 impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
     pub(crate) fn new(launch: L, sink: S, phase: Phase, limits: Deadlines) -> Self {
         Self {
@@ -308,6 +314,12 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
                 self.released_ready = None;
                 Ok(())
             }
+            // Darwin can report a transient WouldBlock while SIGKILL races
+            // the kernel's publication of the leader exit. Keep ownership
+            // and the original force deadline; cleanup will issue one retry.
+            Err(error) if force && error.kind() == io::ErrorKind::WouldBlock => {
+                Err(ActorLaunchOrderError::Stop(io::ErrorKind::WouldBlock))
+            }
             Err(error) => {
                 if !force {
                     self.phase = Phase::ForceStopping(now + self.limits.force);
@@ -339,8 +351,9 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         if matches!(
             self.phase,
             Phase::ForceStopping(_) | Phase::Draining(_) | Phase::Unconfirmed
-        ) {
-            self.try_force()?;
+        ) && self.try_force()? == ForceAttempt::Pending
+        {
+            return Ok(TreeObservation::Present);
         }
         self.order
             .launch
@@ -390,15 +403,16 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         error
     }
 
-    fn try_force(&mut self) -> Result<(), ActorLaunchOrderError> {
+    fn try_force(&mut self) -> Result<ForceAttempt, ActorLaunchOrderError> {
         if self.force_ok {
-            return Ok(());
+            return Ok(ForceAttempt::Confirmed);
         }
         match self.order.launch.stop(true) {
             Ok(()) => {
                 self.force_ok = true;
-                Ok(())
+                Ok(ForceAttempt::Confirmed)
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(ForceAttempt::Pending),
             Err(error) => Err(ActorLaunchOrderError::Stop(error.kind())),
         }
     }
@@ -666,6 +680,73 @@ mod tests {
         );
         assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
         assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
+    }
+
+    #[test]
+    fn pending_force_does_not_latch_or_reset_deadline() {
+        let now = Instant::now();
+        let deadline = now + LIMITS.force;
+        let mut actor = actor(
+            [
+                io_error(io::ErrorKind::WouldBlock),
+                io_error(io::ErrorKind::WouldBlock),
+                io_error(io::ErrorKind::WouldBlock),
+                io_error(io::ErrorKind::WouldBlock),
+                io_error(io::ErrorKind::WouldBlock),
+            ],
+            [Ok(TreeObservation::ConfirmedEmpty)],
+            vec![],
+        );
+        actor.phase = Phase::ForceStopping(deadline);
+
+        assert_eq!(
+            actor.stop(true, now),
+            Err(ActorLaunchOrderError::Stop(io::ErrorKind::WouldBlock))
+        );
+        assert_eq!(actor.phase, Phase::ForceStopping(deadline));
+        assert!(actor.terminal.is_none());
+        assert!(!actor.force_ok);
+        assert_eq!(actor.order.launch.forces, vec![true]);
+
+        assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::Present));
+        assert_eq!(actor.phase, Phase::ForceStopping(deadline));
+        assert!(actor.terminal.is_none());
+        assert!(!actor.force_ok);
+        assert_eq!(actor.order.launch.forces, vec![true, true]);
+        assert_eq!(
+            actor.order.launch.reaps.len(),
+            1,
+            "pending force must not reap"
+        );
+
+        assert_eq!(
+            actor.cleanup_tick(now + std::time::Duration::from_millis(1)),
+            Ok(TreeObservation::Present)
+        );
+        assert_eq!(actor.phase, Phase::ForceStopping(deadline));
+        assert!(actor.terminal.is_none());
+        assert!(!actor.force_ok);
+        assert_eq!(actor.order.launch.forces, vec![true, true, true]);
+        assert_eq!(actor.order.launch.reaps.len(), 1);
+
+        assert_eq!(actor.cleanup_tick(deadline), Ok(TreeObservation::Present));
+        assert_eq!(actor.phase, Phase::Draining(deadline + LIMITS.drain));
+        assert!(actor.terminal.is_none());
+        assert!(!actor.force_ok);
+        assert_eq!(actor.order.launch.forces, vec![true, true, true, true]);
+
+        assert_eq!(
+            actor.cleanup_tick(deadline + LIMITS.drain),
+            Ok(TreeObservation::Present)
+        );
+        assert_eq!(actor.phase, Phase::Unconfirmed);
+        assert!(actor.terminal.is_none());
+        assert!(!actor.force_ok);
+        assert_eq!(
+            actor.order.launch.forces,
+            vec![true, true, true, true, true]
+        );
+        assert_eq!(actor.order.launch.reaps.len(), 1);
     }
 
     #[test]
