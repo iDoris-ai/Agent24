@@ -995,14 +995,14 @@ pub(crate) async fn apply_ready_tx(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sqlx::{Row, SqlitePool};
     use std::{path::Path, sync::Arc};
     use tokio::sync::Barrier;
 
     #[allow(clippy::unwrap_used)]
-    async fn strict_facts_fixture() -> Store {
+    pub(crate) async fn strict_facts_fixture() -> Store {
         let store = Store::open_memory().await.unwrap();
         strict_facts_seed(&store).await;
         store

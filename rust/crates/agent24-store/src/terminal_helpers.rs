@@ -268,6 +268,29 @@ pub(crate) async fn read_pending_approvals_tx(
         })
         .collect()
 }
+pub(crate) async fn read_all_approvals_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+) -> WorkspaceResult<Vec<TerminalApprovalFacts>> {
+    let rows = sqlx::query(
+        "SELECT id,run_id,tool_call_id,kind,summary,payload,available_decisions,standing_target,
+                workspace_id,status,decision,created_at,expires_at,decided_at
+         FROM approvals WHERE run_id=? COLLATE BINARY
+         ORDER BY created_at COLLATE BINARY, id COLLATE BINARY",
+    )
+    .bind(run_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    rows.into_iter()
+        .map(|row| {
+            let facts = decode_approval(&row)?;
+            (facts.run_id == run_id)
+                .then_some(facts)
+                .ok_or_else(|| bad("approvals", "row"))
+        })
+        .collect()
+}
 pub(crate) async fn read_workspace_tx(
     tx: &mut Transaction<'_, Sqlite>,
     hold: &LegacyRecoveryHold,
