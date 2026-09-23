@@ -22,6 +22,8 @@ mod tests {
         WorkspaceProvenanceInput, WorkspaceTtl,
     };
     use agent24_protocol::WorkspaceId;
+    use std::{path::Path, sync::Arc};
+    use tokio::sync::Barrier;
 
     fn intent() -> AllocationIntent {
         AllocationIntent::new(
@@ -55,6 +57,120 @@ mod tests {
         sqlx::query("UPDATE workspace_allocations SET phase='materialized', root_identity_kind='unix', root_unix_device=X'0303030303030303', root_unix_inode=X'0404040404040404' WHERE allocation_id=?")
             .bind(intent.allocation_id().as_str()).execute(crate::test_hooks::pool(&store)).await.unwrap();
         (store, intent, root)
+    }
+
+    async fn fixture_as(
+        parent: RootIdentity,
+        root: RootIdentity,
+    ) -> (crate::Store, AllocationIntent, RootIdentity) {
+        let store = crate::Store::open_memory().await.unwrap();
+        let mut intent = intent();
+        intent = AllocationIntent::new(
+            intent.allocation_id().clone(),
+            intent.workspace_id().clone(),
+            intent.root_generation().into(),
+            intent.relative_name().into(),
+            parent,
+            intent.created_at().clone(),
+        )
+        .unwrap();
+        store.reserve_workspace_allocation(&intent).await.unwrap();
+        let ws = NewScratchWorkspace::new(
+            intent.workspace_id().clone(),
+            TrustedRootRegistration::new(
+                "C:/scratch".into(),
+                intent.root_generation().into(),
+                root,
+            )
+            .unwrap(),
+            WorkspaceProvenanceInput::new("test".into(), None, None).unwrap(),
+            LifecycleOwnerRef::parse("test-owner".into()).unwrap(),
+            WorkspaceTtl::new(60_000).unwrap(),
+        );
+        store
+            .create_workspace(&ws, ws.lifecycle_owner_ref(), intent.created_at())
+            .await
+            .unwrap();
+        let (kind, unix_device, unix_inode, windows_volume, windows_file_id) = match root {
+            RootIdentity::Unix { device, inode } => (
+                "unix",
+                Some(device.to_vec()),
+                Some(inode.to_vec()),
+                None,
+                None,
+            ),
+            RootIdentity::Windows {
+                volume_serial,
+                file_id,
+            } => (
+                "windows",
+                None,
+                None,
+                Some(volume_serial.to_vec()),
+                Some(file_id.to_vec()),
+            ),
+        };
+        sqlx::query("UPDATE workspace_allocations SET phase='materialized', root_identity_kind=?, root_unix_device=?, root_unix_inode=?, root_windows_volume=?, root_windows_file_id=? WHERE allocation_id=?")
+            .bind(kind).bind(unix_device).bind(unix_inode).bind(windows_volume).bind(windows_file_id)
+            .bind(intent.allocation_id().as_str()).execute(crate::test_hooks::pool(&store)).await.unwrap();
+        (store, intent, root)
+    }
+
+    async fn baseline(
+        store: &crate::Store,
+        intent: &AllocationIntent,
+    ) -> (String, String, Vec<crate::AuditEntry>) {
+        let allocation: (String, Option<String>, String) = sqlx::query_as("SELECT phase, failure_reason, relative_name FROM workspace_allocations WHERE allocation_id=?")
+            .bind(intent.allocation_id().as_str()).fetch_one(crate::test_hooks::pool(store)).await.unwrap();
+        let workspace: (String, String, i64) =
+            sqlx::query_as("SELECT canonical_root, state, revision FROM workspaces WHERE id=?")
+                .bind(intent.workspace_id().as_str())
+                .fetch_one(crate::test_hooks::pool(store))
+                .await
+                .unwrap();
+        (
+            format!("{allocation:?}"),
+            format!("{workspace:?}"),
+            store.list_audit().await.unwrap(),
+        )
+    }
+
+    async fn assert_baseline(
+        store: &crate::Store,
+        intent: &AllocationIntent,
+        before: &(String, String, Vec<crate::AuditEntry>),
+    ) {
+        assert_eq!(baseline(store, intent).await, *before);
+    }
+
+    async fn drop_trigger(store: &crate::Store, name: &str) {
+        sqlx::query(&format!("DROP TRIGGER {name}"))
+            .execute(crate::test_hooks::pool(store))
+            .await
+            .unwrap();
+    }
+
+    fn trigger(name: &str, event: &str, body: &str) -> String {
+        format!("CREATE TRIGGER {name} {event} BEGIN {body}; END")
+    }
+
+    async fn install(store: &crate::Store, sql: String) {
+        sqlx::query(&sql)
+            .execute(crate::test_hooks::pool(store))
+            .await
+            .unwrap();
+    }
+
+    async fn success(store: &crate::Store, intent: &AllocationIntent, root: RootIdentity) {
+        let mut tx = store.begin_workspace_immediate().await.unwrap();
+        assert_eq!(
+            commit_materialized_allocation_tx(&mut tx, intent, root)
+                .await
+                .unwrap()
+                .phase(),
+            AllocationPhase::Committed
+        );
+        tx.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -244,6 +360,263 @@ mod tests {
                 crate::WorkspaceConflict::RootIdentity
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn windows_commit_and_replay_preserve_blobs_and_audit_chain() {
+        let parent = RootIdentity::windows(&[11; 8], &[12; 16]).unwrap();
+        let root = RootIdentity::windows(&[13; 8], &[14; 16]).unwrap();
+        let (store, intent, root) = fixture_as(parent, root).await;
+        success(&store, &intent, root).await;
+        success(&store, &intent, root).await;
+        let (kind, ud, ui, volume, file, parent_kind, pud, pui, pvolume, pfile): (String, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as("SELECT root_identity_kind, root_unix_device, root_unix_inode, root_windows_volume, root_windows_file_id, parent_identity_kind, parent_unix_device, parent_unix_inode, parent_windows_volume, parent_windows_file_id FROM workspace_allocations WHERE allocation_id=?")
+            .bind(intent.allocation_id().as_str()).fetch_one(crate::test_hooks::pool(&store)).await.unwrap();
+        assert_eq!(
+            (kind.as_str(), ud, ui, volume, file),
+            ("windows", None, None, Some(vec![13; 8]), Some(vec![14; 16]))
+        );
+        assert_eq!(
+            (parent_kind.as_str(), pud, pui, pvolume, pfile),
+            ("windows", None, None, Some(vec![11; 8]), Some(vec![12; 16]))
+        );
+        let audit = store.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 2);
+        let commit = audit.last().unwrap();
+        assert_eq!(
+            (commit.actor.as_str(), commit.action.as_str()),
+            ("workspace_allocation", "workspace.allocation_committed")
+        );
+        assert_eq!(
+            commit.detail,
+            json!({"allocation_id": intent.allocation_id().as_str(), "workspace_id": intent.workspace_id().as_str(), "phase": "committed"})
+        );
+        assert_eq!(commit.prev_hash, audit[0].hash);
+    }
+
+    #[tokio::test]
+    async fn ignored_cas_is_database_error_and_can_retry() {
+        let (store, intent, root) = fixture().await;
+        let before = baseline(&store, &intent).await;
+        install(
+            &store,
+            trigger(
+                "ignore_commit",
+                "BEFORE UPDATE OF phase ON workspace_allocations WHEN NEW.phase='committed'",
+                "SELECT RAISE(IGNORE)",
+            ),
+        )
+        .await;
+        let mut tx = store.begin_workspace_immediate().await.unwrap();
+        assert_eq!(
+            commit_materialized_allocation_tx(&mut tx, &intent, root)
+                .await
+                .err()
+                .unwrap(),
+            WorkspaceStoreError::Database
+        );
+        drop(tx);
+        assert_baseline(&store, &intent, &before).await;
+        drop_trigger(&store, "ignore_commit").await;
+        success(&store, &intent, root).await;
+        assert_eq!(store.list_audit().await.unwrap().len(), before.2.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn phase_trigger_corrupting_allocation_rolls_back_and_retries() {
+        let (store, intent, root) = fixture().await;
+        let before = baseline(&store, &intent).await;
+        install(&store, trigger("alter_allocation", "AFTER UPDATE OF phase ON workspace_allocations WHEN NEW.phase='committed'", "UPDATE workspace_allocations SET relative_name='tampered' WHERE allocation_id=NEW.allocation_id")).await;
+        let mut tx = store.begin_workspace_immediate().await.unwrap();
+        assert_eq!(
+            commit_materialized_allocation_tx(&mut tx, &intent, root)
+                .await
+                .err()
+                .unwrap(),
+            WorkspaceStoreError::Database
+        );
+        drop(tx);
+        assert_baseline(&store, &intent, &before).await;
+        drop_trigger(&store, "alter_allocation").await;
+        success(&store, &intent, root).await;
+    }
+
+    #[tokio::test]
+    async fn audit_triggers_are_verified_and_rollback_every_table() {
+        for (name, body) in [
+            (
+                "audit_allocation",
+                "UPDATE workspace_allocations SET relative_name='tampered' WHERE allocation_id='wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5'",
+            ),
+            (
+                "audit_workspace",
+                "UPDATE workspaces SET canonical_root='/tampered' WHERE id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'",
+            ),
+            (
+                "audit_competitor",
+                "UPDATE workspace_allocations SET phase='materialized',root_identity_kind='unix',root_unix_device=X'0303030303030303',root_unix_inode=X'0404040404040404' WHERE allocation_id='wa_01J5M4Q2Y7N8P9R0S1T2V3W4X6'",
+            ),
+            (
+                "audit_detail",
+                "UPDATE audit_log SET detail=detail||' ' WHERE seq=NEW.seq",
+            ),
+        ] {
+            let (store, intent, root) = fixture().await;
+            if name == "audit_competitor" {
+                let other = AllocationIntent::new(
+                    crate::AllocationId::parse("wa_01J5M4Q2Y7N8P9R0S1T2V3W4X6").unwrap(),
+                    WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6").unwrap(),
+                    "generation-2".into(),
+                    "other".into(),
+                    RootIdentity::unix(&[7; 8], &[8; 8]).unwrap(),
+                    intent.created_at().clone(),
+                )
+                .unwrap();
+                store.reserve_workspace_allocation(&other).await.unwrap();
+            }
+            let before = baseline(&store, &intent).await;
+            install(
+                &store,
+                trigger(
+                    name,
+                    "AFTER INSERT ON audit_log WHEN NEW.action='workspace.allocation_committed'",
+                    body,
+                ),
+            )
+            .await;
+            let mut tx = store.begin_workspace_immediate().await.unwrap();
+            assert_eq!(
+                commit_materialized_allocation_tx(&mut tx, &intent, root)
+                    .await
+                    .err()
+                    .unwrap(),
+                WorkspaceStoreError::Database,
+                "{name}"
+            );
+            drop(tx);
+            assert_baseline(&store, &intent, &before).await;
+            if name == "audit_competitor" {
+                let row: (String, Option<String>, Option<Vec<u8>>) = sqlx::query_as("SELECT phase, root_identity_kind, root_unix_device FROM workspace_allocations WHERE allocation_id='wa_01J5M4Q2Y7N8P9R0S1T2V3W4X6'")
+                    .fetch_one(crate::test_hooks::pool(&store)).await.unwrap();
+                assert_eq!(row, ("reserved".into(), None, None));
+            }
+            drop_trigger(&store, name).await;
+            success(&store, &intent, root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_rollback_discards_helper_success_and_allows_retry() {
+        let (store, intent, root) = fixture().await;
+        let before = baseline(&store, &intent).await;
+        let mut tx = store.begin_workspace_immediate().await.unwrap();
+        assert_eq!(
+            commit_materialized_allocation_tx(&mut tx, &intent, root)
+                .await
+                .unwrap()
+                .phase(),
+            AllocationPhase::Committed
+        );
+        tx.rollback().await.unwrap();
+        assert_baseline(&store, &intent, &before).await;
+        success(&store, &intent, root).await;
+    }
+
+    #[tokio::test]
+    async fn caller_commit_rejection_rolls_back_and_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commit-reject.db");
+        let (store, intent, root) = file_fixture(&path).await;
+        let before = baseline(&store, &intent).await;
+        let mut pinned = Vec::new();
+        for _ in 0..4 {
+            pinned.push(crate::test_hooks::pool(&store).acquire().await.unwrap());
+        }
+        let mut connection = crate::test_hooks::pool(&store).acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(|| false);
+        drop(connection);
+        let mut tx = store.begin_workspace_immediate().await.unwrap();
+        commit_materialized_allocation_tx(&mut tx, &intent, root)
+            .await
+            .unwrap();
+        assert!(tx.commit().await.is_err());
+        drop(pinned);
+        crate::test_hooks::pool(&store).close().await;
+        let reopened = crate::Store::open(&path).await.unwrap();
+        assert_baseline(&reopened, &intent, &before).await;
+        success(&reopened, &intent, root).await;
+    }
+
+    async fn file_fixture(path: &Path) -> (crate::Store, AllocationIntent, RootIdentity) {
+        let store = crate::Store::open(path).await.unwrap();
+        let intent = intent();
+        store.reserve_workspace_allocation(&intent).await.unwrap();
+        let root = RootIdentity::unix(&[3; 8], &[4; 8]).unwrap();
+        let ws = NewScratchWorkspace::new(
+            intent.workspace_id().clone(),
+            TrustedRootRegistration::new("/scratch".into(), intent.root_generation().into(), root)
+                .unwrap(),
+            WorkspaceProvenanceInput::new("test".into(), None, None).unwrap(),
+            LifecycleOwnerRef::parse("test-owner".into()).unwrap(),
+            WorkspaceTtl::new(60_000).unwrap(),
+        );
+        store
+            .create_workspace(&ws, ws.lifecycle_owner_ref(), intent.created_at())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace_allocations SET phase='materialized', root_identity_kind='unix', root_unix_device=X'0303030303030303', root_unix_inode=X'0404040404040404' WHERE allocation_id=?").bind(intent.allocation_id().as_str()).execute(crate::test_hooks::pool(&store)).await.unwrap();
+        (store, intent, root)
+    }
+
+    #[tokio::test]
+    async fn file_wal_same_intent_race_commits_once_and_reopens_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allocation.db");
+        let (seed, intent, root) = file_fixture(&path).await;
+        drop(seed);
+        let left = crate::Store::open(&path).await.unwrap();
+        let right = crate::Store::open(&path).await.unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let a = Arc::clone(&barrier);
+        let b = Arc::clone(&barrier);
+        let (l, r) = tokio::join!(
+            async {
+                a.wait().await;
+                let mut tx = left.begin_workspace_immediate().await.unwrap();
+                let result = commit_materialized_allocation_tx(&mut tx, &intent, root)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                result
+            },
+            async {
+                b.wait().await;
+                let mut tx = right.begin_workspace_immediate().await.unwrap();
+                let result = commit_materialized_allocation_tx(&mut tx, &intent, root)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                result
+            },
+        );
+        assert_eq!(l.phase(), AllocationPhase::Committed);
+        assert_eq!(r.phase(), AllocationPhase::Committed);
+        let reopened = crate::Store::open(&path).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_workspace_allocation(intent.allocation_id())
+                .await
+                .unwrap()
+                .phase(),
+            AllocationPhase::Committed
+        );
+        let audit = reopened.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[1].action, "workspace.allocation_committed");
+        assert_eq!(audit[1].prev_hash, audit[0].hash);
     }
 }
 
