@@ -6,6 +6,7 @@ use crate::{AllocationId, AllocationValueError, RootIdentity, WorkspaceInstant};
 ///
 /// Constructing an intent performs no database, workspace-registration, or
 /// filesystem operation; it is only the validated input to the journal API.
+#[derive(Clone)]
 pub struct AllocationIntent {
     allocation_id: AllocationId,
     workspace_id: WorkspaceId,

@@ -116,6 +116,7 @@ macro_rules! copied_accessors {
 /// A record describes database reservation state only. A `Reserved` record
 /// does not imply that a workspace is registered or that any filesystem path
 /// has been materialized.
+#[derive(Clone)]
 pub struct AllocationRecord {
     id: AllocationId,
     workspace_id: WorkspaceId,

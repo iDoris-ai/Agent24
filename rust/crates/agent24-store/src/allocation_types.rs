@@ -74,6 +74,11 @@ impl AllocationFailureReason {
         }
         Ok(Self(value.to_owned()))
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[cfg(test)]
