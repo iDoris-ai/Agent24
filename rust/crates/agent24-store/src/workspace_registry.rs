@@ -144,7 +144,7 @@ async fn allocation_identity_exists(
         .map_err(|_| WorkspaceStoreError::Database)
 }
 
-async fn insert_workspace(
+pub(crate) async fn insert_workspace(
     tx: &mut Transaction<'_, Sqlite>,
     input: &NewScratchWorkspace,
     now: &WorkspaceInstant,
