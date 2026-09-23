@@ -6,9 +6,9 @@
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, Transaction, TypeInfo, ValueRef, sqlite::SqliteRow};
 
-use crate::{Result, Store, StoreError};
+use crate::{Result, Store, StoreError, WorkspaceResult, WorkspaceStoreError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditEntry {
@@ -22,6 +22,59 @@ pub struct AuditEntry {
 }
 
 const GENESIS: &str = "genesis";
+
+#[allow(dead_code)]
+fn corrupt(field: &'static str) -> WorkspaceStoreError {
+    WorkspaceStoreError::CorruptRow {
+        table: "audit_log",
+        field,
+    }
+}
+#[allow(dead_code)]
+fn strict_text(row: &SqliteRow, field: &'static str) -> WorkspaceResult<String> {
+    let raw = row.try_get_raw(field).map_err(|_| corrupt(field))?;
+    if raw.is_null() || raw.type_info().name() != "TEXT" {
+        return Err(corrupt(field));
+    }
+    row.try_get(field).map_err(|_| corrupt(field))
+}
+#[allow(dead_code)]
+fn strict_seq(row: &SqliteRow) -> WorkspaceResult<i64> {
+    let raw = row.try_get_raw("seq").map_err(|_| corrupt("seq"))?;
+    if raw.is_null() || raw.type_info().name() != "INTEGER" {
+        return Err(corrupt("seq"));
+    }
+    row.try_get("seq").map_err(|_| corrupt("seq"))
+}
+#[allow(dead_code)]
+pub(crate) async fn strict_audit_chain_tx(tx: &mut Transaction<'_, Sqlite>) -> WorkspaceResult<()> {
+    let rows = sqlx::query(
+        "SELECT seq, ts, actor, action, detail, prev_hash, hash FROM audit_log ORDER BY seq ASC",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    let mut previous = GENESIS.to_owned();
+    for (expected, row) in (1_i64..).zip(rows) {
+        let (seq, ts, actor, action, detail, prior, hash) = (
+            strict_seq(&row)?,
+            strict_text(&row, "ts")?,
+            strict_text(&row, "actor")?,
+            strict_text(&row, "action")?,
+            strict_text(&row, "detail")?,
+            strict_text(&row, "prev_hash")?,
+            strict_text(&row, "hash")?,
+        );
+        if seq != expected
+            || prior != previous
+            || entry_hash(&prior, &ts, &actor, &action, &detail) != hash
+        {
+            return Err(corrupt("chain"));
+        }
+        previous = hash;
+    }
+    Ok(())
+}
 
 fn entry_hash(prev_hash: &str, ts: &str, actor: &str, action: &str, detail: &str) -> String {
     let mut hasher = Sha256::new();

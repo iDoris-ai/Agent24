@@ -17,6 +17,7 @@ mod allocation_registration;
 // The authorized service slice has not wired this internal journal primitive yet.
 #[allow(dead_code)]
 mod allocation_reservation;
+mod allocation_retention_evidence;
 mod allocation_types;
 mod audit;
 mod module_approvals;
