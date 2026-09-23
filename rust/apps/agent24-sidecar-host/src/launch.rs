@@ -227,16 +227,6 @@ mod tests {
         }
     }
 
-    fn reap(launch: &mut OwnedLaunch) {
-        launch.target_mut().request_stop(true).expect("force stop");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !matches!(
-            launch.target_mut().reap_step().expect("reap step"),
-            TreeObservation::ConfirmedEmpty
-        ) {
-            assert!(Instant::now() < deadline, "child was not reaped");
-        }
-    }
     #[test]
     fn launch_intent_preserves_fields_and_redacts_debug() {
         let intent = LaunchIntent::from_request(request("/bin/sh", "/")).expect("launch");
@@ -268,32 +258,7 @@ mod tests {
         let mut stdout_text = [0; 28];
         pipes.stdout.read_exact(&mut stdout_text).expect("stdout");
         assert_eq!(stdout_text, *b"/|env-value|argv-value|unset");
-        reap(&mut launch);
-        drop(launch);
-        wait_for_reaper_idle();
-    }
-
-    #[test]
-    fn missing_executable_is_static_and_redacted() {
-        let _test_guard = crate::posix::tests::test_lock();
-        let missing = "/definitely/missing/agent24-sidecar-executable";
-        let error =
-            match OwnedLaunch::start(LaunchIntent::from_request(request(missing, "/")).unwrap()) {
-                Err(error) => error,
-                Ok(_) => panic!("missing executable must fail"),
-            };
-        assert_eq!(error, LaunchFailure::Start(io::ErrorKind::NotFound));
-        assert!(!format!("{error:?}").contains(missing));
-    }
-
-    #[test]
-    fn pipe_transfer_failure_keeps_target_for_cleanup() {
-        let _test_guard = crate::posix::tests::test_lock();
-        let owner =
-            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("sleep 30"))
-                .expect("spawn helper");
-        let mut target = OwnedTarget::from_owned(owner);
-        target.take_pipes().expect("first transfer");
+        let OwnedLaunch { target, .. } = launch;
         let mut failure = match take_pipes(target) {
             Ok(_) => panic!("second transfer must fail"),
             Err(error) => error,
@@ -308,6 +273,21 @@ mod tests {
         while target.reap_step().expect("reap retained target") != TreeObservation::ConfirmedEmpty {
             assert!(Instant::now() < deadline, "retained target was not reaped");
         }
+        drop(failure);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn missing_executable_is_static_and_redacted() {
+        let _test_guard = crate::posix::tests::test_lock();
+        let missing = "/definitely/missing/agent24-sidecar-executable";
+        let error =
+            match OwnedLaunch::start(LaunchIntent::from_request(request(missing, "/")).unwrap()) {
+                Err(error) => error,
+                Ok(_) => panic!("missing executable must fail"),
+            };
+        assert_eq!(error, LaunchFailure::Start(io::ErrorKind::NotFound));
+        assert!(!format!("{error:?}").contains(missing));
     }
 }
 
