@@ -24,6 +24,8 @@ mod output_worker;
 mod pipe_access;
 #[allow(dead_code)]
 mod ready_io;
+#[allow(dead_code)]
+mod ready_read_worker;
 
 #[cfg(unix)]
 mod posix;
