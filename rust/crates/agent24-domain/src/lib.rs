@@ -222,6 +222,54 @@ impl Capability {
     }
 }
 
+/// ME4-4.2.1: where a module's `_a24/model/complete` calls MAY run (user
+/// decision D2, 2026-09-23). Default `LocalOnly`: an absent `model_access`
+/// can never widen what a module gets. Not `Deserialize` for the same reason
+/// [`Capability`] is not — see [`ModelAccess::parse`].
+///
+/// This type only PARSES the manifest field. It grants nothing: nothing in
+/// this crate maps it onto a privacy tier or a mount-time grant yet
+/// (ME4-4.2.2b2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccess {
+    /// Every call is routed with `Privacy::LocalOnly` — on-device tiers only.
+    #[default]
+    LocalOnly,
+    /// Calls are routed with `Privacy::Any`; the kernel still chooses the
+    /// provider (the module only states a complexity preference).
+    RemoteAllowed,
+}
+
+impl ModelAccess {
+    pub const ALL: &'static [ModelAccess] = &[ModelAccess::LocalOnly, ModelAccess::RemoteAllowed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelAccess::LocalOnly => "local_only",
+            ModelAccess::RemoteAllowed => "remote_allowed",
+        }
+    }
+
+    /// Names the rejected string and the choices, like [`Capability::parse`].
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|a| a.as_str() == s)
+            .ok_or_else(|| {
+                format!(
+                    "model_access: {s:?} is not one of {}",
+                    Self::ALL
+                        .iter()
+                        .map(|a| a.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
 /// How a domain OS is implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -372,6 +420,10 @@ struct RawManifest {
     /// recoverable from the message.
     #[serde(default)]
     kernel_capabilities: Vec<String>,
+    /// ME4-4.2.1. A STRING, mapped afterwards (same reason as
+    /// `kernel_capabilities`): the error must quote what the author typed.
+    #[serde(default)]
+    model_access: Option<String>,
     #[serde(default)]
     ui_entry: Option<String>,
     impl_kind: ImplKind,
@@ -417,6 +469,7 @@ pub struct DomainOsManifest {
     requires_apis: Vec<String>,
     requires_deps: Vec<String>,
     kernel_capabilities: Vec<Capability>,
+    model_access: ModelAccess,
     ui_entry: Option<String>,
     impl_kind: ImplKind,
     spawn: Option<SpawnCommand>,
@@ -743,6 +796,24 @@ impl DomainOsManifest {
             caps.push(Capability::parse(c).map_err(|e| DomainError::Manifest(e.to_string()))?);
         }
 
+        // ME4-4.2.1: absent → LocalOnly. Present without `models` requested is a
+        // contradiction (it would read as "this module uses remote models" while
+        // the module can reach no model at all), refused like impl_kind/spawn.
+        let model_access = match raw.model_access.as_deref() {
+            None => ModelAccess::LocalOnly,
+            Some(s) => {
+                let access = ModelAccess::parse(s).map_err(DomainError::Manifest)?;
+                if !caps.contains(&Capability::Models) {
+                    return Err(DomainError::Manifest(format!(
+                        "model_access is {:?} but kernel_capabilities does not request \
+                         `models`; declare both or neither",
+                        access.as_str()
+                    )));
+                }
+                access
+            }
+        };
+
         // `spawn` and `impl_kind` must agree, in BOTH directions.
         //
         // Missing when out-of-process: the kernel would have a module it cannot
@@ -783,6 +854,7 @@ impl DomainOsManifest {
             requires_apis: raw.requires_apis,
             requires_deps: raw.requires_deps,
             kernel_capabilities: caps,
+            model_access,
             ui_entry: raw.ui_entry,
             impl_kind: raw.impl_kind,
             spawn: raw.spawn,
@@ -821,6 +893,12 @@ impl DomainOsManifest {
 
     pub fn kernel_capabilities(&self) -> &[Capability] {
         &self.kernel_capabilities
+    }
+
+    /// ME4-4.2.1: `LocalOnly` unless the manifest said `remote_allowed`. This
+    /// is parsed data only — nothing in this crate grants it (ME4-4.2.2b2).
+    pub fn model_access(&self) -> ModelAccess {
+        self.model_access
     }
 
     pub fn ui_entry(&self) -> Option<&str> {
@@ -1382,6 +1460,98 @@ impl_kind: in_process_crate
         }
         // Control: the parser is not simply accepting everything.
         assert!(Capability::parse("definitely-not-a-capability").is_err());
+    }
+
+    // ---------- model_access (ME4-4.2.1; SPEC J1) -----------------------------
+    //
+    // Parsing only — nothing here grants anything (ME4-4.2.2b2 wires the grant).
+    // `SIN90_YAML` requests only `[events]`, so every case that writes
+    // `model_access` here must also widen `kernel_capabilities` to include
+    // `models`, or it is testing the "field without the capability" rejection
+    // instead (see `model_access_without_the_models_capability_is_rejected`).
+
+    #[test]
+    fn model_access_defaults_to_local_only_when_absent() {
+        // `SIN90_YAML` has no `model_access` key at all.
+        assert!(!SIN90_YAML.contains("model_access"));
+        let m = DomainOsManifest::from_yaml(SIN90_YAML).unwrap();
+        assert_eq!(m.model_access(), ModelAccess::LocalOnly);
+    }
+
+    #[test]
+    fn model_access_remote_allowed_is_parsed() {
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [models]",
+        ) + "model_access: remote_allowed\n";
+        let m = DomainOsManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.model_access(), ModelAccess::RemoteAllowed);
+    }
+
+    #[test]
+    fn model_access_explicit_local_only_is_accepted() {
+        // Positive control for the case below: writing the DEFAULT value
+        // explicitly is not itself an error — only writing it without `models`
+        // requested is (see `model_access_without_the_models_capability_is_rejected`).
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [models]",
+        ) + "model_access: local_only\n";
+        let m = DomainOsManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.model_access(), ModelAccess::LocalOnly);
+    }
+
+    #[test]
+    fn model_access_rejects_a_value_that_is_not_one_of_the_two() {
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [models]",
+        ) + "model_access: remote\n";
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        // Must quote what the author typed AND name the accepted spelling —
+        // "remote" alone would not tell them it should be "remote_allowed".
+        assert!(err.contains("remote"), "{err}");
+        assert!(err.contains("remote_allowed"), "{err}");
+    }
+
+    #[test]
+    fn model_access_without_the_models_capability_is_rejected() {
+        // `SIN90_YAML` requests `[events]` only. Writing `model_access` here
+        // reads as "this module uses remote models" while the module can reach
+        // no model at all — refused like impl_kind/spawn's own two-way check.
+        let yaml = format!("{SIN90_YAML}model_access: remote_allowed\n");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("models"), "{err}");
+    }
+
+    #[test]
+    fn model_access_an_empty_capability_list_with_the_default_value_is_still_rejected() {
+        // (v2 L8) The field being PRESENT is what triggers the check, not the
+        // value it holds — `local_only` is also the default, but writing it
+        // explicitly with no `models` capability at all must still be refused.
+        let yaml = SIN90_YAML.replace("kernel_capabilities: [events]", "kernel_capabilities: []")
+            + "model_access: local_only\n";
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("models"), "{err}");
+    }
+
+    #[test]
+    fn model_access_null_is_treated_as_absent() {
+        // (v2 L8) `model_access: ~` must be accepted and default to `LocalOnly`
+        // even though `kernel_capabilities` here does not request `models` —
+        // `~` is not "present", it is YAML's null spelling of "not set".
+        let yaml = format!("{SIN90_YAML}model_access: ~\n");
+        let m = DomainOsManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.model_access(), ModelAccess::LocalOnly);
+    }
+
+    #[test]
+    fn model_access_field_typo_is_rejected_by_deny_unknown_fields() {
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [models]",
+        ) + "model_acess: remote_allowed\n";
+        assert!(DomainOsManifest::from_yaml(&yaml).is_err());
     }
 
     #[test]
