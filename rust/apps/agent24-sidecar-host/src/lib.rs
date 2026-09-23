@@ -17,6 +17,8 @@ mod launch;
 #[allow(dead_code)]
 mod launch_order;
 #[allow(dead_code)]
+mod outbox;
+#[allow(dead_code)]
 mod output_io;
 #[allow(dead_code)]
 mod output_worker;

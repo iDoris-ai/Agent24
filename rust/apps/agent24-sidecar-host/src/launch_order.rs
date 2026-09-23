@@ -4,6 +4,7 @@ use crate::{
     actor::{Deadlines, Phase},
     cleanup::CleanupStepError,
     launch::OwnedLaunch,
+    outbox::{DriveStep, Outbox},
     output_io::{OutputWriteError, OutputWriter, PutFrameError, WriteStep},
     ready_io::ReadyGate,
     target::{ExitObservation, TreeObservation},
@@ -237,6 +238,7 @@ pub(crate) struct ActorLaunchOrder<L, S> {
     terminal: Option<ActorLaunchOrderError>,
     force_ok: bool,
     pending_exit: Option<Event>,
+    outbox: Outbox,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,6 +257,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             terminal: None,
             force_ok: false,
             pending_exit: None,
+            outbox: Outbox::default(),
         }
     }
 
@@ -269,12 +272,17 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             return Err(error);
         }
         self.advance(now);
+        if self.pending_exit.is_some() {
+            self.admit_pending_exit()?;
+            return Ok(None);
+        }
         match self.phase {
             Phase::GracefulStopping(_) => return Ok(None),
-            Phase::Empty => return Ok(self.pending_exit.take()),
+            Phase::Empty => return Ok(None),
             Phase::ForceStopping(_) | Phase::Draining(_) | Phase::Unconfirmed => {
                 self.try_force()?;
-                return Ok(self.pending_exit.take());
+                self.admit_pending_exit()?;
+                return Ok(None);
             }
             _ => {}
         }
@@ -294,8 +302,8 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
                     .phase
                     .stop(true, now, self.limits)
                     .map_err(|_| self.latch(ActorLaunchOrderError::InvalidTransition))?;
-                self.try_force()?;
-                Ok(self.pending_exit.take())
+                self.admit_pending_exit()?;
+                Ok(None)
             }
             Err(error) => Err(ActorLaunchOrderError::Observe(error.kind())),
         }
@@ -325,6 +333,19 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         if let Some(error) = self.terminal {
             return Err(error);
         }
+        if self.outbox.has_work()
+            && self.order.stage != LaunchOrderStage::OwnedPending
+            && !(self.order.stage == LaunchOrderStage::Contained && self.order.pre_owned_output)
+        {
+            return match self
+                .outbox
+                .drive(&mut self.order.sink, now)
+                .map_err(|_| self.fail_force(now))?
+            {
+                DriveStep::Idle | DriveStep::Complete(_) => Ok(WriteStep::Complete),
+                DriveStep::Pending | DriveStep::Admitted(_) => Ok(WriteStep::Pending),
+            };
+        }
         let step = self
             .order
             .output_step(now)
@@ -334,6 +355,9 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             && !self.stopping()
         {
             self.phase_ready(now)?;
+            self.outbox
+                .ready(&event)
+                .map_err(|_| self.fail_force(now))?;
             self.released_ready = Some(event);
         }
         Ok(step)
@@ -343,14 +367,33 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
     pub(crate) fn put_frame(
         &mut self,
         frame: Vec<u8>,
-        now: Instant,
+        _now: Instant,
     ) -> Result<(), ActorLaunchOrderError> {
         if let Some(error) = self.terminal {
             return Err(error);
         }
-        self.order
-            .put_frame(frame, now)
-            .map_err(|_| self.fail_force(now))
+        self.outbox
+            .encoded_reply(frame)
+            .map_err(|_| ActorLaunchOrderError::CleanupRequired)
+    }
+
+    /// Queue a completed control reply without displacing a prior reply.
+    /// A reply from an already-issued request may still flush after Exit gates
+    /// future permits and dispatch.
+    pub(crate) fn queue_reply(&mut self, reply: &Reply) -> Result<(), ActorLaunchOrderError> {
+        self.outbox
+            .reply(reply)
+            .map_err(|_| ActorLaunchOrderError::CleanupRequired)
+    }
+
+    /// Whether a runtime may grant another control read permit or dispatch a
+    /// completed request.  Output and cleanup deliberately do not use this gate.
+    pub(crate) fn control_permit_allowed(&self) -> bool {
+        !self.exit_retained()
+    }
+
+    pub(crate) fn completed_request_dispatch_allowed(&self) -> bool {
+        !self.exit_retained()
     }
 
     pub(crate) fn ready(
@@ -366,6 +409,9 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         let event = self.order.ready(input).map_err(|_| self.fail_force(now))?;
         let Some(event) = event else { return Ok(None) };
         self.phase_ready(now)?;
+        self.outbox
+            .ready(&event)
+            .map_err(|_| self.fail_force(now))?;
         Ok(Some(event))
     }
 
@@ -379,7 +425,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
     }
 
     pub(crate) fn take_ready(&mut self) -> Option<Event> {
-        if self.terminal.is_none() && self.phase == Phase::Running {
+        if self.terminal.is_none() {
             self.released_ready.take()
         } else {
             None
@@ -413,7 +459,6 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             Ok(()) => {
                 self.force_ok |= force;
                 self.order.held_ready = None;
-                self.released_ready = None;
                 Ok(())
             }
             // Darwin can report a transient WouldBlock while SIGKILL races
@@ -441,7 +486,11 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         if matches!(self.phase, Phase::GracefulStopping(_)) {
             match self.order.launch.observe_exit() {
                 Ok(ExitObservation::Running) => return Ok(TreeObservation::Present),
-                Ok(ExitObservation::Exited { .. }) => {
+                Ok(ExitObservation::Exited { code }) => {
+                    self.pending_exit = Some(Event::Exit {
+                        protocol: PROTOCOL_VERSION,
+                        code,
+                    });
                     self.phase = self
                         .phase
                         .stop(true, now, self.limits)
@@ -457,13 +506,16 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         {
             return Ok(TreeObservation::Present);
         }
-        self.order
+        let result = self
+            .order
             .launch
             .cleanup(&mut self.phase)
             .map_err(|error| match error {
                 CleanupStepError::Phase(_) => ActorLaunchOrderError::InvalidTransition,
                 CleanupStepError::Reap(error) => ActorLaunchOrderError::Reap(error.kind()),
-            })
+            })?;
+        self.admit_pending_exit()?;
+        Ok(result)
     }
 
     fn check(&mut self) -> Result<(), ActorLaunchOrderError> {
@@ -511,7 +563,6 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         self.terminal = Some(error);
         self.order.stage = LaunchOrderStage::CleanupRequired;
         self.order.held_ready = None;
-        self.released_ready = None;
         error
     }
 
@@ -528,13 +579,33 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             Err(error) => Err(ActorLaunchOrderError::Stop(error.kind())),
         }
     }
+
+    /// Keep the observed Exit in actor state until both containment and the
+    /// bounded outbox accept it.  In particular, neither an occupied slot nor
+    /// a transient/real stop error transfers the event to a caller.
+    fn admit_pending_exit(&mut self) -> Result<(), ActorLaunchOrderError> {
+        let Some(event) = self.pending_exit.clone() else {
+            return Ok(());
+        };
+        if !self.force_ok && self.try_force()? != ForceAttempt::Confirmed {
+            return Ok(());
+        }
+        if self.outbox.exit(&event).is_ok() {
+            self.pending_exit = None;
+        }
+        Ok(())
+    }
+
+    fn exit_retained(&self) -> bool {
+        self.pending_exit.is_some() || self.outbox.exit_retained()
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use agent24_sidecar_host_protocol::{Request, decode_reply};
+    use agent24_sidecar_host_protocol::{ErrorCode, Request, decode_event, decode_reply};
     use std::{
         collections::{BTreeMap, VecDeque},
         sync::{Arc, Condvar, Mutex},
@@ -550,6 +621,7 @@ mod tests {
 
     struct FakeSink {
         frame: Option<Vec<u8>>,
+        frames: Vec<Vec<u8>>,
         steps: Vec<Result<WriteStep, OutputWriteError>>,
         put_now: Vec<Instant>,
         step_now: Vec<Instant>,
@@ -557,6 +629,7 @@ mod tests {
 
     impl FrameSink for FakeSink {
         fn put(&mut self, frame: Vec<u8>, now: Instant) -> Result<(), PutFrameError> {
+            self.frames.push(frame.clone());
             self.frame = Some(frame);
             self.put_now.push(now);
             Ok(())
@@ -573,6 +646,7 @@ mod tests {
             FakeLaunch(7),
             FakeSink {
                 frame: None,
+                frames: Vec::new(),
                 steps,
                 put_now: Vec::new(),
                 step_now: Vec::new(),
@@ -735,6 +809,7 @@ mod tests {
             },
             FakeSink {
                 frame: None,
+                frames: Vec::new(),
                 steps,
                 put_now: Vec::new(),
                 step_now: Vec::new(),
@@ -1102,24 +1177,38 @@ mod tests {
         assert_eq!(exact.order.launch.forces, vec![true]);
 
         let mut retry = actor(
-            [io_error(io::ErrorKind::BrokenPipe), Ok(())],
+            [
+                io_error(io::ErrorKind::BrokenPipe),
+                io_error(io::ErrorKind::WouldBlock),
+                Ok(()),
+            ],
             [Ok(TreeObservation::ConfirmedEmpty)],
-            vec![],
+            vec![Ok(WriteStep::Complete)],
         );
         retry.phase = Phase::GracefulStopping(now + LIMITS.graceful);
         retry
             .order
             .launch
             .observations
-            .push_back(Ok(ExitObservation::Exited { code: None }));
+            .push_back(Ok(ExitObservation::Exited { code: Some(41) }));
         assert_eq!(
             retry.cleanup_tick(now),
             Err(ActorLaunchOrderError::Stop(io::ErrorKind::BrokenPipe))
         );
         assert!(matches!(retry.phase, Phase::ForceStopping(_)));
         assert!(!retry.force_ok);
+        assert!(retry.pending_exit.is_some());
+        assert_eq!(retry.cleanup_tick(now), Ok(TreeObservation::Present));
         assert_eq!(retry.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
-        assert_eq!(retry.order.launch.forces, vec![true, true]);
+        assert_eq!(retry.phase, Phase::Empty);
+        assert_eq!(retry.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(retry.output_step(now), Ok(WriteStep::Complete));
+        assert!(matches!(
+            decode_event(&retry.order.sink.frames[0]),
+            Ok(Event::Exit { code: Some(41), .. })
+        ));
+        assert_eq!(retry.order.sink.frames.len(), 1);
+        assert_eq!(retry.order.launch.forces, vec![true, true, true]);
         assert_eq!(retry.order.launch.observed, 1);
 
         let mut observe_error = actor([Ok(())], [Ok(TreeObservation::ConfirmedEmpty)], vec![]);
@@ -1184,7 +1273,7 @@ mod tests {
         running.stop(true, now).unwrap();
         assert_eq!(running.order.launch.forces, vec![false, false, true]);
         running.cleanup_tick(now).unwrap();
-        assert!(running.take_ready().is_none());
+        assert!(running.take_ready().is_some());
 
         let mut held = actor([Ok(())], [], vec![]);
         queue_ready(&mut held, now);
@@ -1248,17 +1337,23 @@ mod tests {
         assert_eq!(empty.tick(now), Ok(None));
         assert_eq!(empty.phase(), Phase::Empty);
 
-        let mut exited = actor([Ok(())], [Ok(TreeObservation::ConfirmedEmpty)], vec![]);
+        let mut exited = actor(
+            [Ok(())],
+            [Ok(TreeObservation::ConfirmedEmpty)],
+            vec![Ok(WriteStep::Complete)],
+        );
         exited.phase = Phase::Running;
         exited
             .order
             .launch
             .observations
             .push_back(Ok(ExitObservation::Exited { code: Some(9) }));
-        assert!(matches!(
-            exited.tick(now),
-            Ok(Some(Event::Exit { code: Some(9), .. }))
-        ));
+        assert_eq!(exited.tick(now), Ok(None));
+        assert!(!exited.control_permit_allowed());
+        assert!(!exited.completed_request_dispatch_allowed());
+        assert_eq!(exited.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(exited.output_step(now), Ok(WriteStep::Complete));
+        assert!(exited.control_permit_allowed());
         assert_eq!(exited.order.launch.observed, 1);
         assert_eq!(
             exited.cleanup_tick(now),
@@ -1273,7 +1368,7 @@ mod tests {
         let mut exited = actor(
             [io_error(io::ErrorKind::BrokenPipe), Ok(())],
             [Ok(TreeObservation::ConfirmedEmpty)],
-            vec![],
+            vec![Ok(WriteStep::Complete)],
         );
         exited.phase = Phase::Running;
         exited
@@ -1291,12 +1386,109 @@ mod tests {
             exited.cleanup_tick(now),
             Ok(TreeObservation::ConfirmedEmpty)
         );
-        assert!(matches!(
-            exited.tick(now),
-            Ok(Some(Event::Exit { code: Some(9), .. }))
-        ));
+        assert_eq!(exited.phase(), Phase::Empty);
+        assert!(exited.outbox.exit_retained());
+        assert_eq!(exited.tick(now), Ok(None));
+        assert!(!exited.control_permit_allowed());
+        assert_eq!(exited.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(exited.output_step(now), Ok(WriteStep::Complete));
+        assert!(exited.control_permit_allowed());
         assert_eq!(exited.order.launch.observed, 1);
         assert_eq!(exited.order.launch.forces, vec![true, true]);
+    }
+
+    #[test]
+    fn occupied_exit_retains_observation_until_empty_handoff_once() {
+        let now = Instant::now();
+        let mut actor = actor(
+            [Ok(())],
+            [],
+            vec![Ok(WriteStep::Complete), Ok(WriteStep::Complete)],
+        );
+        actor.phase = Phase::Running;
+        actor
+            .order
+            .launch
+            .observations
+            .push_back(Ok(ExitObservation::Exited { code: Some(9) }));
+        actor
+            .outbox
+            .exit(&Event::Exit {
+                protocol: 1,
+                code: Some(8),
+            })
+            .unwrap();
+        assert_eq!(actor.tick(now), Ok(None));
+        assert!(actor.pending_exit.is_some());
+        assert!(!actor.control_permit_allowed());
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Complete));
+        assert_eq!(actor.tick(now), Ok(None));
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Complete));
+        assert_eq!(actor.order.sink.put_now.len(), 2);
+        assert!(actor.control_permit_allowed());
+    }
+
+    #[test]
+    fn queued_ready_survives_exit_with_partial_reply_ready_and_closed_gates() {
+        let now = Instant::now();
+        let mut ready = actor(
+            [Ok(())],
+            [],
+            vec![
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Pending),
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Pending),
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+            ],
+        );
+        queue_ready(&mut ready, now);
+        ready
+            .queue_reply(&Reply::Error {
+                version: 1,
+                request_id: 7,
+                code: ErrorCode::LaunchFailed,
+            })
+            .unwrap();
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Complete));
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Pending));
+        ready
+            .order
+            .launch
+            .observations
+            .push_back(Ok(ExitObservation::Exited { code: Some(9) }));
+        assert_eq!(ready.tick(now), Ok(None));
+        assert!(!ready.control_permit_allowed() && !ready.completed_request_dispatch_allowed());
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Complete));
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Pending));
+        assert!(!ready.control_permit_allowed() && !ready.completed_request_dispatch_allowed());
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Complete));
+        assert!(!ready.control_permit_allowed() && !ready.completed_request_dispatch_allowed());
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Pending));
+        assert!(!ready.control_permit_allowed() && !ready.completed_request_dispatch_allowed());
+        assert_eq!(ready.output_step(now), Ok(WriteStep::Complete));
+        assert!(ready.control_permit_allowed());
+        assert!(ready.completed_request_dispatch_allowed());
+        assert!(matches!(
+            decode_reply(&ready.order.sink.frames[1]),
+            Ok(Reply::Error {
+                code: ErrorCode::LaunchFailed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_event(&ready.order.sink.frames[2]),
+            Ok(Event::Ready { .. })
+        ));
+        assert!(matches!(
+            decode_event(&ready.order.sink.frames[3]),
+            Ok(Event::Exit { code: Some(9), .. })
+        ));
     }
 
     #[test]
@@ -1346,6 +1538,7 @@ mod tests {
         failed_launch
             .put_frame(b"launch-failed\n".to_vec(), now)
             .unwrap();
+        assert_eq!(failed_launch.output_step(now), Ok(WriteStep::Pending));
         assert_eq!(failed_launch.output_step(now), Ok(WriteStep::Complete));
         assert!(failed_launch.order.sink.frame.is_some());
 
@@ -1353,6 +1546,7 @@ mod tests {
         stopped.phase = Phase::Empty;
         stopped.order.stage = LaunchOrderStage::Ready;
         stopped.put_frame(b"exit\n".to_vec(), now).unwrap();
+        assert_eq!(stopped.output_step(now), Ok(WriteStep::Pending));
         assert_eq!(stopped.output_step(now), Ok(WriteStep::Complete));
     }
 
