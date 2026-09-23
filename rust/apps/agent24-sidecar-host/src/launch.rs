@@ -60,11 +60,48 @@ impl fmt::Debug for LaunchIntent {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LaunchFailure {
     NotLaunch,
     Start(io::ErrorKind),
-    Pipes(io::ErrorKind),
+    Pipes {
+        kind: io::ErrorKind,
+        target: Box<OwnedTarget>,
+    },
+}
+
+impl fmt::Debug for LaunchFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLaunch => formatter.write_str("NotLaunch"),
+            Self::Start(kind) => formatter.debug_tuple("Start").field(kind).finish(),
+            Self::Pipes { kind, .. } => formatter
+                .debug_struct("Pipes")
+                .field("kind", kind)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl PartialEq for LaunchFailure {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::NotLaunch, Self::NotLaunch) => true,
+            (Self::Start(left), Self::Start(right)) => left == right,
+            (Self::Pipes { kind: left, .. }, Self::Pipes { kind: right, .. }) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LaunchFailure {}
+
+impl LaunchFailure {
+    pub(crate) fn target_mut(&mut self) -> Option<&mut OwnedTarget> {
+        match self {
+            Self::Pipes { target, .. } => Some(target),
+            Self::NotLaunch | Self::Start(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for LaunchFailure {
@@ -80,6 +117,17 @@ pub(crate) struct OwnedLaunch {
     pipes: OwnedPipes,
 }
 
+#[cfg(any(unix, windows))]
+fn take_pipes(mut target: OwnedTarget) -> Result<(OwnedTarget, OwnedPipes), LaunchFailure> {
+    match target.take_pipes() {
+        Ok(pipes) => Ok((target, pipes)),
+        Err(error) => Err(LaunchFailure::Pipes {
+            kind: error.kind(),
+            target: Box::new(target),
+        }),
+    }
+}
+
 #[cfg(unix)]
 impl OwnedLaunch {
     pub(crate) fn start(intent: LaunchIntent) -> Result<Self, LaunchFailure> {
@@ -93,10 +141,7 @@ impl OwnedLaunch {
         }
         let owner =
             OwnedGeneration::launch(spec).map_err(|error| LaunchFailure::Start(error.kind()))?;
-        let mut target = OwnedTarget::from_owned(owner);
-        let pipes = target
-            .take_pipes()
-            .map_err(|error| LaunchFailure::Pipes(error.kind()))?;
+        let (target, pipes) = take_pipes(OwnedTarget::from_owned(owner))?;
         Ok(Self {
             request_id,
             target,
@@ -134,10 +179,7 @@ impl OwnedLaunch {
         let owner = owner
             .spawn(command)
             .map_err(|error| LaunchFailure::Start(error.kind()))?;
-        let mut target = OwnedTarget::from_owned(owner);
-        let pipes = target
-            .take_pipes()
-            .map_err(|error| LaunchFailure::Pipes(error.kind()))?;
+        let (target, pipes) = take_pipes(OwnedTarget::from_owned(owner))?;
         Ok(Self {
             request_id,
             target,
@@ -242,6 +284,30 @@ mod tests {
             };
         assert_eq!(error, LaunchFailure::Start(io::ErrorKind::NotFound));
         assert!(!format!("{error:?}").contains(missing));
+    }
+
+    #[test]
+    fn pipe_transfer_failure_keeps_target_for_cleanup() {
+        let _test_guard = crate::posix::tests::test_lock();
+        let owner =
+            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("sleep 30"))
+                .expect("spawn helper");
+        let mut target = OwnedTarget::from_owned(owner);
+        target.take_pipes().expect("first transfer");
+        let mut failure = match take_pipes(target) {
+            Ok(_) => panic!("second transfer must fail"),
+            Err(error) => error,
+        };
+        match &failure {
+            LaunchFailure::Pipes { kind, .. } => assert_eq!(*kind, io::ErrorKind::InvalidInput),
+            _ => panic!("pipe transfer must report Pipes"),
+        }
+        let target = failure.target_mut().expect("failure retains target");
+        target.request_stop(true).expect("force retained target");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while target.reap_step().expect("reap retained target") != TreeObservation::ConfirmedEmpty {
+            assert!(Instant::now() < deadline, "retained target was not reaped");
+        }
     }
 }
 
