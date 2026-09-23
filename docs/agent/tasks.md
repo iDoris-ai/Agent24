@@ -27,10 +27,13 @@
 | ME4-0.2 | 两仓 | 合并本规划 PR（Agent24 `docs/me4-plan-2026-09-23` / Sin90 `docs/pilot-me4-plan`） | — | `PR_OPEN`（开 PR 后回填） | |
 | ME4-0.3 | Sin90 | CI + 陈旧文档（Sin90 T0.2/T0.3） | 0.1 | `BACKLOG` | |
 | ME4-0.4 | Sin90 | Codex 补审历史改动（Sin90 T0.4） | 0.1 | `BACKLOG` | |
-| ME4-1.1.1 | Agent24 | 调度回调设计冻结 + SPEC 改写 | 0.2 | `BACKLOG` | |
+| ME4-1.1.1 | Agent24 | 调度回调设计冻结 + SPEC 改写 | 0.2 | `PR_OPEN` | #444（冻结 v3.1；3 轮 Opus 评审，第 3 轮 APPROVE） |
 | ME4-1.2.1 | Agent24 | schedules 存储层（owner/key/revision/暂停三态 + 并发安全 upsert + `schedule_deliveries`） | 1.1.1 | `BACKLOG` | |
-| ME4-1.2.2 | Agent24 | `ScheduleInvocation`/`FireOutcome` + REST 护栏 | 1.2.1 | `BACKLOG` | |
-| ME4-1.3.1 | Agent24 | fired 投递器（InFlight 准入 + dispatch、确定性 fire_id、重启续投、Deferred 不计失败、scheduler 挪到 mount_all 后） | 1.2.2 | `BACKLOG` | |
+| ME4-1.2.2a | Agent24 | 协议与视图（Schedule 新字段、openapi/fixtures/api-client） | 1.2.1 | `BACKLOG` | |
+| ME4-1.2.2b | Agent24 | 触发接口与 tick（ScheduleInvocation/FireOutcome/RunTrigger、CAS 版 fire、模块臂先 Deferred） | 1.2.2a | `BACKLOG` | |
+| ME4-1.2.2c | Agent24 | REST 护栏（update CAS、suspend/resume、409、run_now 双响应、self-wake owner 过滤） | 1.2.2b | `BACKLOG` | |
+| ME4-1.2.2d | Agent24 | 桌面端（effective_enabled ?? enabled、run_id ?? fire_id，前向兼容） | 1.2.1 | `BACKLOG` | |
+| ME4-1.3.1 | Agent24 | fired 投递器（InFlight 准入 + dispatch、确定性 fire_id、重启续投、Deferred 不计失败、scheduler 挪到 mount_all 后） | 1.2.2c | `BACKLOG` | |
 | ME4-1.3.2 | Agent24 | 代理保留 `/_a24/` 路径（规范化后判定） | 1.1.1 | `BACKLOG` | |
 | ME4-1.4.1 | Agent24 | `_a24/scheduler/*` handler + 授权/配额/限流 | 1.2.1 | `BACKLOG` | |
 | ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `BACKLOG` | |
