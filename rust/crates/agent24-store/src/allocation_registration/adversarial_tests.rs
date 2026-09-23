@@ -3,14 +3,19 @@ use crate::{
     AllocationId, RootIdentity, TrustedRootRegistration, WorkspaceProvenanceInput, WorkspaceTtl,
 };
 use agent24_protocol::WorkspaceId;
-use sqlx::Row;
-use std::{path::Path, sync::Arc};
-use tokio::sync::Barrier;
+use sqlx::{Row, sqlite::SqliteOperation};
+use std::{
+    path::Path,
+    sync::{Arc, mpsc},
+    time::Duration,
+};
+use tokio::{sync::Barrier, time::timeout};
 
 const AID: &str = "wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
 const WID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
 const CREATED: &str = "2026-09-19T00:00:00.000Z";
 const NOW: &str = "2026-09-19T00:00:01.000Z";
+const WAIT: Duration = Duration::from_secs(5);
 
 fn now() -> WorkspaceInstant {
     WorkspaceInstant::parse(NOW).unwrap()
@@ -192,7 +197,7 @@ async fn entry_and_time_table_rejects_every_mismatch_without_writes() {
         let before = baseline(&store).await;
         assert!(
             store
-                .register_materialized_scratch(&call_intent, &call_input, &call_owner, &now())
+                .register_workspace_allocation(&call_intent, &call_input, &call_owner, &now())
                 .await
                 .is_err(),
             "{case}"
@@ -215,7 +220,7 @@ async fn entry_and_time_table_rejects_every_mismatch_without_writes() {
         let before = baseline(&store).await;
         assert!(
             store
-                .register_materialized_scratch(
+                .register_workspace_allocation(
                     &intent,
                     &input,
                     &owner,
@@ -267,7 +272,7 @@ async fn insert_commit_and_audit_triggers_roll_back_the_complete_baseline() {
             .unwrap();
         assert!(
             store
-                .register_materialized_scratch(&intent, &input, &owner, &now())
+                .register_workspace_allocation(&intent, &input, &owner, &now())
                 .await
                 .is_err(),
             "{name}"
@@ -304,7 +309,7 @@ async fn committed_replay_requires_the_initial_exact_active_row() {
     );
     assert!(matches!(
         store
-            .register_materialized_scratch(&intent, &wrong, &owner, &now())
+            .register_workspace_allocation(&intent, &wrong, &owner, &now())
             .await,
         Err(WorkspaceStoreError::Conflict(
             crate::WorkspaceConflict::RootIdentity
@@ -329,7 +334,7 @@ async fn committed_replay_requires_the_initial_exact_active_row() {
         let before = baseline(&store).await;
         assert!(matches!(
             store
-                .register_materialized_scratch(&intent, &input, &owner, &now())
+                .register_workspace_allocation(&intent, &input, &owner, &now())
                 .await,
             Err(WorkspaceStoreError::CorruptRow { .. })
         ));
@@ -368,28 +373,19 @@ async fn file_wal_race_commits_once_and_reopens_one_workspace_and_audit() {
     let (first, second) = tokio::join!(
         async {
             left_gate.wait().await;
-            left.register_materialized_scratch(&intent, &input, &owner, &now())
+            left.register_workspace_allocation(&intent, &input, &owner, &now())
                 .await
                 .unwrap()
         },
         async {
             right_gate.wait().await;
             right
-                .register_materialized_scratch(&intent, &input, &owner, &now())
+                .register_workspace_allocation(&intent, &input, &owner, &now())
                 .await
                 .unwrap()
         },
     );
-    assert!(matches!(
-        (first, second),
-        (
-            RegistrationOutcome::Registered { .. },
-            RegistrationOutcome::AlreadyCommitted { .. }
-        ) | (
-            RegistrationOutcome::AlreadyCommitted { .. },
-            RegistrationOutcome::Registered { .. }
-        )
-    ));
+    assert_eq!(first, second);
     let reopened = Store::open(&path).await.unwrap();
     let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM audit_log WHERE action='workspace.allocation_committed')").fetch_one(crate::test_hooks::pool(&reopened)).await.unwrap();
     assert_eq!(counts, (1, 1));
@@ -415,7 +411,7 @@ async fn rejected_commit_reopens_materialized_without_workspace_or_audit_then_re
     drop(connection);
     assert_eq!(
         store
-            .register_materialized_scratch(&intent, &input, &owner, &now())
+            .register_workspace_allocation(&intent, &input, &owner, &now())
             .await
             .err(),
         Some(WorkspaceStoreError::Database)
@@ -424,13 +420,70 @@ async fn rejected_commit_reopens_materialized_without_workspace_or_audit_then_re
     crate::test_hooks::pool(&store).close().await;
     let reopened = Store::open(&path).await.unwrap();
     unchanged(&reopened, &before).await;
-    assert!(matches!(
+    assert!(
         reopened
-            .register_materialized_scratch(&intent, &input, &owner, &now())
+            .register_workspace_allocation(&intent, &input, &owner, &now())
             .await
-            .unwrap(),
-        RegistrationOutcome::Registered { .. }
-    ));
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn public_registration_cancellation_at_commit_mutation_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("registration-cancel.sqlite");
+    let (store, intent, input, owner) = file_materialized(&path).await;
+    let before = baseline(&store).await;
+    let mut pinned = Vec::new();
+    for _ in 0..4 {
+        pinned.push(crate::test_hooks::pool(&store).acquire().await.unwrap());
+    }
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let mut connection = crate::test_hooks::pool(&store).acquire().await.unwrap();
+    connection
+        .lock_handle()
+        .await
+        .unwrap()
+        .set_update_hook(move |event| {
+            if event.operation == SqliteOperation::Update && event.table == "workspace_allocations"
+            {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(WAIT);
+            }
+        });
+    drop(connection);
+    let task = tokio::spawn({
+        let store = store.clone();
+        let intent = intent.clone();
+        let input = input.clone();
+        let owner = owner.clone();
+        async move {
+            store
+                .register_workspace_allocation(&intent, &input, &owner, &now())
+                .await
+        }
+    });
+    timeout(
+        WAIT,
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(WAIT)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    task.abort();
+    release_tx.send(()).unwrap();
+    assert!(matches!(timeout(WAIT, task).await, Ok(Err(error)) if error.is_cancelled()));
+    let mut connection = crate::test_hooks::pool(&store).acquire().await.unwrap();
+    timeout(WAIT, sqlx::query("SELECT 1").execute(&mut *connection))
+        .await
+        .unwrap()
+        .unwrap();
+    connection.lock_handle().await.unwrap().remove_update_hook();
+    drop(connection);
+    drop(pinned);
+    unchanged(&store, &before).await;
 }
 
 #[tokio::test]
@@ -447,7 +500,7 @@ async fn windows_identity_blobs_are_preserved_in_database_rows() {
         .await
         .unwrap();
     store
-        .register_materialized_scratch(&intent, &input, &owner, &now())
+        .register_workspace_allocation(&intent, &input, &owner, &now())
         .await
         .unwrap();
     let row = sqlx::query("SELECT root_identity_kind, root_unix_device, root_unix_inode, root_windows_volume, root_windows_file_id, parent_identity_kind, parent_unix_device, parent_unix_inode, parent_windows_volume, parent_windows_file_id FROM workspace_allocations WHERE allocation_id=?").bind(intent.allocation_id().as_str()).fetch_one(crate::test_hooks::pool(&store)).await.unwrap();

@@ -100,6 +100,30 @@ fn matches_workspace(
 }
 
 impl Store {
+    /// Register one materialized scratch allocation and return its public
+    /// workspace snapshot. This is a registration result, not an admission
+    /// check; callers must use the lifecycle APIs to establish current use.
+    ///
+    /// A fresh registration rejects an expired instant, while an exact
+    /// committed replay returns the original validated snapshot without
+    /// writing or re-reading it after commit.
+    pub async fn register_workspace_allocation(
+        &self,
+        intent: &AllocationIntent,
+        input: &NewScratchWorkspace,
+        owner: &LifecycleOwnerRef,
+        registration_now: &WorkspaceInstant,
+    ) -> WorkspaceResult<agent24_protocol::Workspace> {
+        let outcome = self
+            .register_materialized_scratch(intent, input, owner, registration_now)
+            .await?;
+        let workspace = match outcome {
+            RegistrationOutcome::Registered { workspace, .. }
+            | RegistrationOutcome::AlreadyCommitted { workspace, .. } => workspace,
+        };
+        Ok(workspace.project())
+    }
+
     /// Register the exact scratch workspace for a materialized allocation and
     /// commit both journal and registry changes under one SQLite write lock.
     pub(crate) async fn register_materialized_scratch(
