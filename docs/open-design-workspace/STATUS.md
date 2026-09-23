@@ -7,14 +7,14 @@
 | 阶段 | 状态 | 证据 |
 | --- | --- | --- |
 | P0 设计冻结 | PASS | ADR-001～005、依赖台账、风险与兼容矩阵已冻结并通过 SOL review |
-| A24-OD-00 capability 安全前置 | PASS（逐层合并中） | #226/#227 已合入 main；#228 在 main 上等待 rereview，其后代保持依赖顺序 |
+| A24-OD-00 capability 安全前置 | PASS（逐层合并中） | #226/#227 已合入 main；#228 等待基线更新后的重新批准，其后代保持依赖顺序 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
 | P2 workspace contract | IN PROGRESS | DB registry/lifecycle/renew 与 allocation journal schema/约束通过 SOL；安全 root allocator/host lease/run binding 未完成 |
-| A24-OD-05 sidecar foundation | IN PROGRESS（未接线） | #253 合入 desktop sidecar ownership/endpoint-handoff contract；manager 由 #254 承担，#429 controlled pipes、#431 graceful stdin close、#435 soft-stop seam、#436 dormant grace observe/force/reap primitive 推进中；host `run()`/产品路由仍未接线 |
+| A24-OD-05 sidecar foundation | IN PROGRESS（未接线） | #253 合入 desktop sidecar ownership/endpoint-handoff contract；manager 由 #254 承担，#429 controlled pipes、#431 graceful stdin close、#435 soft-stop seam、#436 dormant grace primitive 与 #438 fixed stdout worker 推进中；host `run()`/产品路由仍未接线 |
 
-当前 PR 监控结论（2026-09-23 Wave 9）：完整 monitor 请求下，只有已满足依赖的 #253
-已合入；其他已批准后代仍堆叠等待 #228/#254 与各自前沿，不得越序合并。#254 五项 CI 全绿，
-rereview/approval pending。#228 rereview 已请求，其后代继续 dependency-blocked。
+当前 PR 监控结论（2026-09-23 Wave 10）：3 小时完整 monitor 未发现 eligible Open Design
+root。#253 已合入；其他已批准后代仍堆叠等待 #228/#254 与各自前沿，不得越序合并。#254 五项
+CI 全绿但旧 change request 等待新的 approval；#228 等待基线后的重新批准，其后代继续 dependency-blocked。
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 `outdated_cli / incompatible opencode args` 失败，随后停滞，需要 bounded SIGINT。
@@ -132,6 +132,20 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
   不得声称 P2 或 P9 完成。
 - complete monitor 请求下，本轮唯一满足依赖并可合并的 PR 是 #253，现已 merged；其他
   approved descendants 仍 stacked，受 #228/#254/frontiers 阻塞，不能合并。
+
+## 2026-09-23 Wave 10 当前门禁
+
+- #253 已 merge 为 `bb6f62b`；#228 等待基线更新后的重新批准。#254 head `6fcae9e` 的五项
+  CI 仍全绿，但旧 change request 仍等待新 approval，不能据此合并或解锁后代。
+- G4 #437 为 recovery promotion adversarial slice；#440 registration writer（head `0a0a373`，
+  421 additions / 1 deletion）依赖 #433，已有两份 Astra `PASS`，但仍是 dormant persistence
+  工作，未接 runtime。
+- G8 #438 fixed stdout/output worker（head `25999b0`，427 additions / 6 deletions）依赖 #436；
+  两份 Astra `PASS`，Ubuntu/macOS/Windows 与 CLA 全绿。它仍未把 host `run()` 或产品路由接线。
+- G4 terminal 草稿（+698/-45）经 audit 不可提交；必须拆成 helper、core、adversarial 三个切片。
+  Darwin `EPERM` retry 另列切片，不能混入该终态变更。
+- 本次 3 小时完整 monitor 没有 eligible Open Design root；绿色 CI、内部审查或 stacked
+  descendant approval 都不构成越序 merge 授权。P2 仍为 `IN PROGRESS`。
 
 ## A24-OD-00 小 PR 栈
 

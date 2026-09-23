@@ -1,6 +1,6 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 逐层合并 / A24-OD-01 journal 与 dormant transaction slices 进行中 / A24-OD-05 pipe、stdin-close 与 actor seam 分片进行中
+> 状态：P0 frozen / A24-OD-00 逐层合并（#228 等待重新批准）/ A24-OD-01 journal、registration writer 与 dormant transaction slices 进行中 / A24-OD-05 pipe、stdin-close、output worker 与 actor seam 分片进行中
 >
 > 日期：2026-09-23
 >
@@ -13,6 +13,8 @@
 > 2026-09-23 漂移复核：#253 merge 仅增加 desktop sidecar ownership/endpoint-handoff contract
 > （`sidecar-contract.ts` 与对应测试），不改变 store/host core；manager 仍由 #254 提供。
 > integration candidate 的 Cargo manifest/lock 冲突提示仍需在最终合并前逐项保留和复核。
+> #254 head `6fcae9e` 的五项 CI 全绿但旧 change request 等待新 approval；此状态不解除
+> #228、#254 或其后代的 merge 依赖。
 
 ## 1. 目的
 
