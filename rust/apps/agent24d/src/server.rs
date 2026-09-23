@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use agent24_models::router::ModelRouter;
 use agent24_protocol::Health;
+use agent24_protocol::state_file::AuthMode;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
@@ -26,6 +27,12 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct AppState {
     pub token: Arc<String>,
+    /// Legacy and capability authority are mutually exclusive. Tests and
+    /// existing callers continue to construct legacy state through
+    /// [`AppState::new`]; production capability mode replaces it before the
+    /// router is built.
+    pub auth_mode: AuthMode,
+    pub capabilities: Option<crate::capabilities::CapabilityStore>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -516,6 +523,8 @@ impl AppState {
         Self {
             risk_overrides,
             token: Arc::new(token),
+            auth_mode: AuthMode::LegacySingleToken,
+            capabilities: None,
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -551,6 +560,12 @@ impl AppState {
 }
 
 impl AppState {
+    fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
+        self.token = Arc::new(String::new());
+        self.auth_mode = AuthMode::Capabilities;
+        self.capabilities = Some(store);
+    }
+
     /// Re-read the override set after the user changed it.
     ///
     /// A failed reload leaves the previous snapshot in place rather than
@@ -616,6 +631,16 @@ async fn fallback() -> Response {
 async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
+    }
+    // Route policy is not available on this stacked change yet. Treat a
+    // capability-mode state as unauthenticated rather than comparing against
+    // its deliberately empty legacy-token sentinel.
+    if state.auth_mode != AuthMode::LegacySingleToken {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Capability authentication is not available",
+        );
     }
     let authorized = req
         .headers()
@@ -759,8 +784,30 @@ pub fn generate_token() -> String {
 pub async fn serve(
     port: u16,
     ephemeral: bool,
+    auth_mode: AuthMode,
+    host_bootstrap_stdio: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
+    let (mut host_ready, parent_liveness) = match (auth_mode, host_bootstrap_stdio) {
+        (AuthMode::Capabilities, true) => {
+            let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
+            (Some(writer), Some(liveness))
+        }
+        (AuthMode::Capabilities, false) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "capability mode requires trusted host bootstrap stdio",
+            ));
+        }
+        (AuthMode::LegacySingleToken, false) => (None, None),
+        (AuthMode::LegacySingleToken, true) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host bootstrap stdio is valid only in capability mode",
+            ));
+        }
+    };
     // The shutdown controller, and the signals that request it, before
     // anything else: a SIGTERM during startup — which can take seconds (the
     // store, MCP servers, model probing) — runs this bounded shutdown rather
@@ -771,6 +818,14 @@ pub async fn serve(
     let (params, config_warnings) = crate::lifecycle::Params::from_process_env();
     let mut config_warnings = config_warnings;
     let shutdown = Shutdown::with_params(cancel.clone(), params);
+    if let Some(parent_liveness) = parent_liveness {
+        let parent_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            parent_liveness.closed().await;
+            parent_shutdown.request();
+            tracing::info!("trusted host bootstrap closed; shutting down capability daemon");
+        });
+    }
     // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
     // Registered HERE — before any module process can be started — and
     // synchronously: a SIGTERM arriving while packages start must run this
@@ -887,7 +942,22 @@ pub async fn serve(
         })
     };
 
-    let token = generate_token();
+    let daemon_generation = generate_token();
+    let (token, capability_store, product_host_token) = match auth_mode {
+        AuthMode::LegacySingleToken => (generate_token(), None, None),
+        AuthMode::Capabilities => {
+            let store = crate::capabilities::CapabilityStore::new(daemon_generation.clone());
+            let minted = store
+                .mint_product_host(
+                    generate_token(),
+                    Duration::from_secs(u64::MAX),
+                    crate::capabilities::unix_now(),
+                )
+                .map_err(std::io::Error::other)?;
+            let (bearer, _, _) = minted.into_bearer_parts();
+            (String::new(), Some(store), Some(bearer))
+        }
+    };
     // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
     let store = if ephemeral {
         Store::open_memory().await.map_err(std::io::Error::other)?
@@ -999,6 +1069,9 @@ pub async fn serve(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    if let Some(capability_store) = capability_store {
+        state.enable_capability_auth(capability_store);
+    }
 
     // H3 durable-resume startup, BEFORE accepting any request and BEFORE the
     // orphan sweep: restore restorable parked approvals (re-broadcast + keep
@@ -1390,23 +1463,32 @@ pub async fn serve(
         return Ok(());
     }
 
-    // SPEC-002 §4 ready line: parsers scan stdout for the first type=="ready"
-    // JSON line. stdout carries nothing else (logs go to stderr).
+    // SPEC-002 §4 ready line: legacy parsers scan stdout; capability mode first
+    // proves stdin/stdout are parent-owned pipes and binds lifetime to stdin.
+    // stdout carries nothing else in either mode (logs go to stderr).
     // Discovery state file BEFORE the ready line: a CLI that has seen the
     // ready line may immediately rely on attached-mode discovery.
     let daemon_pid = std::process::id();
-    if !ephemeral
-        && let Err(err) =
-            agent24_protocol::state_file::write(&agent24_protocol::state_file::DaemonState {
-                port: local.port(),
-                token: token.clone(),
-                pid: daemon_pid,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                generation: String::new(),
-                auth_mode: agent24_protocol::state_file::AuthMode::LegacySingleToken,
-            })
-    {
-        tracing::warn!("could not write daemon state file: {err}");
+    if !ephemeral {
+        let discovery = match auth_mode {
+            AuthMode::LegacySingleToken => agent24_protocol::state_file::DaemonState::new_legacy(
+                local.port(),
+                token.clone(),
+                daemon_pid,
+                env!("CARGO_PKG_VERSION"),
+                daemon_generation.clone(),
+            ),
+            AuthMode::Capabilities => agent24_protocol::state_file::DaemonState::new_capabilities(
+                local.port(),
+                daemon_pid,
+                env!("CARGO_PKG_VERSION"),
+                daemon_generation.clone(),
+            ),
+        }
+        .map_err(std::io::Error::other)?;
+        if let Err(err) = agent24_protocol::state_file::write(&discovery) {
+            tracing::warn!("could not write daemon state file: {err}");
+        }
     }
 
     // The state file is written; now readiness and a shutdown request race
@@ -1420,15 +1502,50 @@ pub async fn serve(
         let _ = stopping.await;
         return Ok(());
     }
-    println!(
-        "{}",
-        serde_json::json!({
+    let ready = match auth_mode {
+        AuthMode::LegacySingleToken => serde_json::json!({
             "type": "ready",
             "port": local.port(),
             "token": token,
+            "auth_mode": "legacy_single_token",
+            "generation": daemon_generation,
             "version": env!("CARGO_PKG_VERSION"),
-        })
-    );
+        }),
+        AuthMode::Capabilities => {
+            let product_host_token = product_host_token.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "capability startup lost its host credential",
+                )
+            })?;
+            serde_json::json!({
+                "type": "ready",
+                "port": local.port(),
+                // This secret crosses only the inherited ready pipe to the
+                // spawning trusted host. It is never written to daemon.json.
+                "product_host_token": product_host_token,
+                "auth_mode": "capabilities",
+                "generation": daemon_generation,
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+        }
+    };
+    match auth_mode {
+        AuthMode::LegacySingleToken => println!("{ready}"),
+        AuthMode::Capabilities => {
+            let host_ready = host_ready.as_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "capability startup lost its private ready pipe",
+                )
+            })?;
+            host_ready.send(&ready).await?;
+        }
+    }
+    // In capability mode `ready` is the only temporary owner of the raw host
+    // bearer after the private write completes. Do not retain it for daemon
+    // lifetime; the authority store keeps only its digest.
+    drop(ready);
 
     let graceful_cancel = cancel.clone();
     let server = axum::serve(listener, router)
@@ -1458,6 +1575,29 @@ pub async fn serve(
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
     }
     result
+}
+
+const CAPABILITY_ROUTE_POLICY_PENDING: &str =
+    "capability authentication cannot start until capability route policy lands";
+
+/// Capability credentials are unsafe until every route has a policy. This is
+/// intentionally the first `serve` action: no listener, store, token, state
+/// file, or ready record can exist on the rejected path.
+fn validate_auth_startup(
+    auth_mode: AuthMode,
+    host_bootstrap_stdio: bool,
+) -> Result<(), std::io::Error> {
+    match (auth_mode, host_bootstrap_stdio) {
+        (AuthMode::Capabilities, _) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            CAPABILITY_ROUTE_POLICY_PENDING,
+        )),
+        (AuthMode::LegacySingleToken, true) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "host bootstrap stdio is valid only in capability mode",
+        )),
+        (AuthMode::LegacySingleToken, false) => Ok(()),
+    }
 }
 
 /// What out-of-process modules are started with: the callback directory under
@@ -1959,6 +2099,60 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["backend"], "rust");
         assert!(json["version"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn capability_startup_is_rejected_before_ready_or_credential() {
+        let err = serve(
+            0,
+            true,
+            AuthMode::Capabilities,
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("route-policy-less capability startup must fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(err.to_string(), CAPABILITY_ROUTE_POLICY_PENDING);
+    }
+
+    #[tokio::test]
+    async fn capability_state_does_not_accept_the_empty_legacy_sentinel() {
+        let mut capability_state = state().await;
+        capability_state.enable_capability_auth(crate::capabilities::CapabilityStore::new(
+            "capability-generation".to_owned(),
+        ));
+
+        let res = build_router(capability_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(res).await["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn legacy_state_still_accepts_its_bearer_token() {
+        let res = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

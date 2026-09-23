@@ -1,10 +1,18 @@
 //! agent24d — the Agent24 Rust daemon (SPEC-002).
 //!
-//! B2 scope: serve skeleton — `/api/v1/health`, bearer-token handshake via the
-//! stdout ready line, dynamic port, CancellationToken-driven graceful shutdown.
+//! B2 scope: serve skeleton — `/api/v1/health`, bearer-token handshake via a
+//! ready pipe, dynamic port, CancellationToken-driven graceful shutdown.
 
 mod approval_callback;
 mod approvals;
+// Capability authority is staged ahead of its route policy. Keep the allowance
+// confined to that deferred module rather than weakening the daemon's lints.
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "capability route policy has not landed"
+)]
+mod capabilities;
 mod domain;
 mod events;
 mod events_emit;
@@ -53,8 +61,23 @@ mod runs;
 mod schedules;
 mod server;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AuthModeArg {
+    LegacySingleToken,
+    Capabilities,
+}
+
+impl From<AuthModeArg> for agent24_protocol::state_file::AuthMode {
+    fn from(value: AuthModeArg) -> Self {
+        match value {
+            AuthModeArg::LegacySingleToken => Self::LegacySingleToken,
+            AuthModeArg::Capabilities => Self::Capabilities,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "agent24d", version, about = "Agent24 daemon")]
@@ -73,6 +96,14 @@ enum Command {
         /// and the discovery state file
         #[arg(long, default_value_t = false)]
         ephemeral: bool,
+        /// Authentication authority. Capability mode keeps host authority out
+        /// of daemon.json and emits it only on the trusted ready pipe.
+        #[arg(long, value_enum, default_value_t = AuthModeArg::LegacySingleToken)]
+        auth_mode: AuthModeArg,
+        /// Confirm that stdin/stdout are private pipes owned by the host.
+        /// Required for capability mode and hidden from ordinary CLI help.
+        #[arg(long, hide = true, default_value_t = false)]
+        host_bootstrap_stdio: bool,
     },
 }
 
@@ -87,16 +118,26 @@ fn main() -> std::process::ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr) // stdout is reserved for the ready line
+        .with_writer(std::io::stderr) // stdout is reserved for the private ready line
         .init();
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { port, ephemeral } => run_serve(port, ephemeral),
+        Command::Serve {
+            port,
+            ephemeral,
+            auth_mode,
+            host_bootstrap_stdio,
+        } => run_serve(port, ephemeral, auth_mode.into(), host_bootstrap_stdio),
     }
 }
 
-fn run_serve(port: u16, ephemeral: bool) -> std::process::ExitCode {
+fn run_serve(
+    port: u16,
+    ephemeral: bool,
+    auth_mode: agent24_protocol::state_file::AuthMode,
+    host_bootstrap_stdio: bool,
+) -> std::process::ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(err) => {
@@ -106,7 +147,13 @@ fn run_serve(port: u16, ephemeral: bool) -> std::process::ExitCode {
     };
 
     let cancel = CancellationToken::new();
-    let result = runtime.block_on(server::serve(port, ephemeral, cancel));
+    let result = runtime.block_on(server::serve(
+        port,
+        ephemeral,
+        auth_mode,
+        host_bootstrap_stdio,
+        cancel,
+    ));
     // Bounded, not the default `Drop`, which waits for every blocking task:
     // a supervisor walking a large package tree in `spawn_blocking` when the
     // shutdown came would otherwise hold the exit past `serve`'s own bound
