@@ -76,10 +76,9 @@ impl ModuleDeliverer {
         }
     }
 
-    /// design §5.1/§5.3: find the module's live generation, build the fired
-    /// request from `owner`/`fire_id`/`trigger`/`scheduled_for`/`fired_at`,
-    /// send it, and classify the result. Never panics, never blocks the tick
-    /// — the delivery pump awaits this once per attempt, at most
+    /// design §5.1/§5.3: find the module's live generation, then delegate to
+    /// [`Self::deliver_on`]. Never panics, never blocks the tick — the
+    /// delivery pump awaits this once per attempt, at most
     /// `PER_OWNER_IN_FLIGHT` at a time per owner.
     pub async fn deliver(
         &self,
@@ -99,7 +98,33 @@ impl ModuleDeliverer {
                 reason: DeferReason::NotRunning,
             };
         };
-        let generation = current.get();
+        self.deliver_on(
+            &current.get(),
+            owner,
+            fire_id,
+            trigger,
+            scheduled_for,
+            fired_at,
+        )
+        .await
+    }
+
+    /// Review round 1, **M3**: the actual send, split out of
+    /// [`Self::deliver`] so a test can drive it against a REAL
+    /// `Generation`/UDS mock upstream directly — without needing a real
+    /// `Supervisors`/`SupervisorHandle` (which, per this module's own doc
+    /// comment, has no public constructor outside a genuinely supervised
+    /// process). Builds the fired request from `owner`/`fire_id`/`trigger`/
+    /// `scheduled_for`/`fired_at`, sends it, and classifies the result.
+    async fn deliver_on(
+        &self,
+        generation: &Arc<agent24_os_proto::drain::Generation>,
+        owner: &ModuleScheduleKey,
+        fire_id: &FireId,
+        trigger: &str,
+        scheduled_for: &str,
+        fired_at: &str,
+    ) -> FireOutcome {
         let namespace = agent24_domain::DomainOsManifest::declared_namespace(&owner.owner_module);
         let path = format!("{namespace}/_a24/scheduler/fired");
         let body = FiredBody {
@@ -140,7 +165,7 @@ impl ModuleDeliverer {
             ],
             body: body_bytes.into(),
         };
-        let result = send_kernel_request(&generation, &self.ids, request, self.limits, None).await;
+        let result = send_kernel_request(generation, &self.ids, request, self.limits, None).await;
         classify(fire_id, result)
     }
 }
@@ -217,11 +242,149 @@ fn classify(fire_id: &FireId, result: Result<KernelResponse, KernelCallError>) -
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use agent24_os_proto::drain::{Current, Generation};
+    use agent24_os_proto::drain::Generation;
     use agent24_scheduler::FireTrigger;
 
     fn fid() -> FireId {
         FireId::derive(FireTrigger::Tick, "sch_test", chrono::Utc::now())
+    }
+
+    /// Review round 1, **M3**, judgement **C4.1** (end to end this time, not
+    /// just at the `classify` unit level): `deliver_on` against a REAL
+    /// `Generation` and a real UDS mock upstream — proves the path is built
+    /// from `DomainOsManifest::declared_namespace` (never hand-assembled a
+    /// second way) and the body is exactly the `FiredBody` shape design §5.3
+    /// promises: `{key, trigger, scheduled_for, fired_at}`.
+    ///
+    /// Mutation: rename a `FiredBody` field (e.g. `key` → `module_key`), or
+    /// hand-build the path without `declared_namespace` — this test goes
+    /// red (the JSON keys / path this test asserts on stop matching).
+    #[tokio::test]
+    async fn deliver_on_posts_the_declared_namespace_path_and_the_fired_body_shape() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn unique_sock(tag: &str) -> std::path::PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            std::path::PathBuf::from(format!(
+                "/tmp/a24-scheduler-deliver-{tag}-{}-{nanos}.sock",
+                std::process::id()
+            ))
+        }
+
+        let path = unique_sock("c4-1");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                let Some(idx) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let head = text[..idx].to_owned();
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().to_owned())
+                    })
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if buf.len() < idx + 4 + content_length {
+                    continue;
+                }
+                let body = buf[idx + 4..idx + 4 + content_length].to_vec();
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = tx.send((head, body));
+                return;
+            }
+        });
+        let generation = Generation::serving_at(path);
+        assert!(generation.ready());
+        let deliverer = ModuleDeliverer::new(PRODUCTION_LIMITS);
+        let owner = ModuleScheduleKey {
+            owner_module: "zzmod".to_owned(),
+            module_key: "k1".to_owned(),
+        };
+        // Captured ONCE: `fid()` derives from `Utc::now()`, so calling it
+        // again for the assertion below could (rarely, across a second
+        // boundary) mint a DIFFERENT id than the one actually sent.
+        let fire_id = fid();
+        let outcome = deliverer
+            .deliver_on(
+                &generation,
+                &owner,
+                &fire_id,
+                "tick",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:05Z",
+            )
+            .await;
+        assert!(
+            matches!(outcome, FireOutcome::ModuleDelivered { .. }),
+            "{outcome:?}"
+        );
+
+        let (head, body) = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the mock upstream never received a complete request")
+            .unwrap();
+        let expected_path = format!(
+            "{}/_a24/scheduler/fired",
+            agent24_domain::DomainOsManifest::declared_namespace("zzmod")
+        );
+        assert!(
+            head.starts_with(&format!("POST {expected_path} HTTP/1.1")),
+            "{head}"
+        );
+        // Review round 2, M-C: the header contract itself, not just the path
+        // and the body shape. `x-a24-schedule-key`/`x-a24-fire-id` must
+        // carry the EXACT values this call was given;
+        // `x-a24-request-id`/`x-a24-approval-token` must simply be present
+        // (their values are internal, minted per attempt — design §5.2).
+        let lower = head.to_ascii_lowercase();
+        assert!(
+            lower
+                .lines()
+                .any(|l| l.trim() == format!("x-a24-fire-id: {}", fire_id.as_str())),
+            "{head}"
+        );
+        assert!(
+            lower.lines().any(|l| l.trim() == "x-a24-schedule-key: k1"),
+            "{head}"
+        );
+        assert!(
+            lower
+                .lines()
+                .any(|l| l.trim_start().starts_with("x-a24-request-id:")),
+            "{head}"
+        );
+        assert!(
+            lower
+                .lines()
+                .any(|l| l.trim_start().starts_with("x-a24-approval-token:")),
+            "{head}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["key"], "k1");
+        assert_eq!(json["trigger"], "tick");
+        assert_eq!(json["scheduled_for"], "2026-01-01T00:00:00Z");
+        assert_eq!(json["fired_at"], "2026-01-01T00:00:05Z");
     }
 
     #[test]
@@ -375,28 +538,39 @@ mod tests {
         );
     }
 
-    /// A `Starting` generation (handshake not complete) reachable through
-    /// `running_slot` is `Deferred(NotReady)`, never a failure — same
-    /// admission every proxied request goes through.
+    /// Review round 2, **L-e**: a `Starting` generation (handshake not
+    /// complete) is `Deferred(NotReady)`, never a failure — same admission
+    /// every proxied request goes through. Now exercised directly through
+    /// `deliver_on` (the M3 split, round 1): the stale comment this test
+    /// used to carry claimed this was "proven end-to-end ... in the
+    /// black-box test module instead" — untrue (ME4-1.5.1's black-box suite
+    /// does not exist yet in this cut) — and settled for pinning
+    /// `admit_request`'s own refusal one layer below `deliver_on` instead of
+    /// this module's own code path.
     #[tokio::test]
     async fn a_starting_generation_defers_as_not_ready() {
         let generation = Generation::starting();
-        let current = Current::new(generation);
-        // `running_slot` needs a real `Supervised` entry, which needs a real
-        // `SupervisorHandle` — out of reach without a full supervised process
-        // (see `scheduler_deliver`'s own module doc). This test instead pins
-        // the layer directly below `running_slot`: `deliver`'s behaviour once
-        // it HAS a `Current` for a Starting generation, by exercising
-        // `send_kernel_request`'s own admission refusal through the same
-        // `classify` this module uses — proven end-to-end (with a REAL
-        // running_slot lookup) in the black-box test module instead.
-        let admitted = current.get().admit_request(
-            "probe".to_owned(),
-            [0u8; 32],
-            std::time::Instant::now(),
-            Duration::from_secs(1),
+        let deliverer = ModuleDeliverer::new(PRODUCTION_LIMITS);
+        let owner = ModuleScheduleKey {
+            owner_module: "zzmod".to_owned(),
+            module_key: "k1".to_owned(),
+        };
+        let outcome = deliverer
+            .deliver_on(
+                &generation,
+                &owner,
+                &fid(),
+                "tick",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            FireOutcome::Deferred {
+                reason: DeferReason::NotReady
+            }
         );
-        assert_eq!(admitted.err(), Some(RequestRefused::NotReady));
     }
 
     /// design §11 C4.11: the tick loop AND the delivery pump must be spawned
@@ -425,583 +599,36 @@ mod tests {
             pump_at > mount_at,
             "the delivery pump must be spawned after mount_all (design §4.6)"
         );
-    }
-}
 
-/// ME4-1.3.1 (design §11, C4): the delivery pump (`agent24_scheduler::
-/// deliveries::DeliveryPump`) driven end to end against a REAL
-/// `agent24_store::Store` and a scripted `RunTrigger` — the pump's own
-/// concurrency/retry/cancellation behaviour, independent of the transport
-/// (`kernel_call`'s revoke races are covered in `agent24-os-proto`; the
-/// `ModuleDeliverer`/`classify` mapping is covered by `tests` above).
-///
-/// A REAL `Supervisors`/`Generation`/UDS module is deliberately NOT used
-/// here: `agent24_os_proto::supervisor::SupervisorHandle` has no public
-/// constructor outside a genuinely supervised process
-/// (`crate::domain::Supervisors::start_with`'s closure needs one), so a
-/// `running_slot`-reachable module for these tests would need the daemon's
-/// full out-of-process package harness (`domain.rs`'s `write_package_with` +
-/// `test_host`) rather than the lighter, deterministic scripted trigger used
-/// here. The `Deferred(NotReady)` test above and `agent24-os-proto`'s own
-/// `kernel_call` suite already prove the transport layer that harness would
-/// otherwise be re-proving.
-#[cfg(test)]
-mod pump_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex as StdMutex};
-    use std::time::{Duration, Instant};
-
-    use agent24_protocol::EventBody;
-    use agent24_scheduler::deliveries::DeliveryPump;
-    use agent24_scheduler::next_fire::{fmt_iso, next_fire, parse_iso};
-    use agent24_scheduler::{
-        Clock, FireOutcome, InvocationTarget, RunTrigger, ScheduleInvocation, Scheduler,
-    };
-    use agent24_store::{ModuleScheduleDesired, Store};
-    use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
-    use tokio_util::sync::CancellationToken;
-
-    /// A clock this test fully controls: `now()` is whatever the test last
-    /// set it to (never tied to real elapsed time, so `RETRY_BACKOFF`'s fixed
-    /// 5s/15s waits never cost a real second); `sleep()` returns almost at
-    /// once regardless of the requested duration, so the pump's own
-    /// `PUMP_INTERVAL` cadence never makes a test wait a real second either.
-    /// Tests observe outcomes by bounded polling (`wait_until`), never by
-    /// assuming a fixed number of pump iterations happened.
-    #[derive(Clone)]
-    struct TestClock(Arc<StdMutex<DateTime<Utc>>>);
-
-    impl TestClock {
-        fn at(now: DateTime<Utc>) -> Arc<Self> {
-            Arc::new(Self(Arc::new(StdMutex::new(now))))
-        }
-        fn set(&self, now: DateTime<Utc>) {
-            *self.0.lock().unwrap() = now;
-        }
-    }
-
-    #[async_trait]
-    impl Clock for TestClock {
-        fn now(&self) -> DateTime<Utc> {
-            *self.0.lock().unwrap()
-        }
-        async fn sleep(&self, _dur: Duration) {
-            tokio::time::sleep(Duration::from_millis(3)).await;
-        }
-    }
-
-    /// One recorded call: enough to assert `fire_id`/`scheduled_for`/
-    /// `fired_at` stayed byte-identical across retries (design §4.2/§5.3).
-    #[derive(Debug, Clone, PartialEq)]
-    struct RecordedCall {
-        fire_id: String,
-        scheduled_for: DateTime<Utc>,
-        fired_at: DateTime<Utc>,
-    }
-
-    /// A `RunTrigger` a test scripts: each call to `trigger()` for a `Module`
-    /// target pops the next canned `FireOutcome` (the last one repeats once
-    /// the queue is empty, so a test does not have to over-provision it).
-    struct ScriptedTrigger {
-        outcomes: StdMutex<VecDeque<FireOutcome>>,
-        calls: StdMutex<Vec<RecordedCall>>,
-    }
-
-    impl ScriptedTrigger {
-        fn new(outcomes: impl IntoIterator<Item = FireOutcome>) -> Arc<Self> {
-            Arc::new(Self {
-                outcomes: StdMutex::new(outcomes.into_iter().collect()),
-                calls: StdMutex::new(Vec::new()),
-            })
-        }
-        fn calls(&self) -> Vec<RecordedCall> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl RunTrigger for ScriptedTrigger {
-        async fn trigger(&self, invocation: &ScheduleInvocation) -> FireOutcome {
-            let InvocationTarget::Module { fire_id, .. } = &invocation.target else {
-                panic!("ScriptedTrigger is only exercised with Module targets in these tests");
-            };
-            self.calls.lock().unwrap().push(RecordedCall {
-                fire_id: fire_id.as_str().to_owned(),
-                scheduled_for: invocation.scheduled_for,
-                fired_at: invocation.fired_at,
-            });
-            let mut outcomes = self.outcomes.lock().unwrap();
-            if outcomes.len() > 1 {
-                outcomes.pop_front().unwrap()
-            } else {
-                outcomes.front().cloned().unwrap_or(FireOutcome::Deferred {
-                    reason: agent24_scheduler::DeferReason::NotRunning,
-                })
-            }
-        }
-    }
-
-    /// A `RunTrigger` whose `Module` arm blocks forever (never resolves) — for
-    /// judgement C4.12: an attempt genuinely "in flight" when the pump is
-    /// cancelled.
-    struct BlockingTrigger {
-        started: tokio::sync::Notify,
-    }
-
-    impl BlockingTrigger {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                started: tokio::sync::Notify::new(),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl RunTrigger for BlockingTrigger {
-        async fn trigger(&self, _invocation: &ScheduleInvocation) -> FireOutcome {
-            self.started.notify_one();
-            std::future::pending::<()>().await;
-            unreachable!("pending() never resolves")
-        }
-    }
-
-    fn utc(s: &str) -> DateTime<Utc> {
-        parse_iso(s).unwrap()
-    }
-
-    fn every_module(secs: u32) -> ModuleScheduleDesired {
-        ModuleScheduleDesired {
-            spec: agent24_protocol::ScheduleSpec::Every { secs },
-            enabled: true,
-            label: "k".to_owned(),
-        }
-    }
-
-    /// Seeds one module row and records its first tick fire — the same
-    /// recipe `agent24-scheduler`'s own `module_row_tick_records_a_pending_
-    /// delivery_and_counts_no_failure` test uses, via the SAME `Scheduler`
-    /// this test then hands to a `DeliveryPump`.
-    async fn seed_module_fire(
-        scheduler: &Arc<Scheduler>,
-        store: &Store,
-        owner: &str,
-        key: &str,
-        now0: DateTime<Utc>,
-    ) -> String {
-        let desired = every_module(60);
-        let next = next_fire(&desired.spec, now0).unwrap().map(fmt_iso);
-        let schedule_id = format!("sch_{owner}_{key}");
-        store
-            .upsert_module_schedule(
-                &schedule_id,
-                owner,
-                key,
-                &desired,
-                next.as_deref(),
-                &fmt_iso(now0),
-                256,
-            )
-            .await
-            .unwrap();
-        let due = now0 + chrono::Duration::seconds(65);
+        // Review round 1, L5: also pin exactly how many `.run(` spawns exist
+        // inside `serve` itself — the tick loop's and the pump's, and no
+        // more, no fewer (a regression that spawns the pump twice, or drops
+        // one of the two spawns while leaving a stray `.run(`-shaped call
+        // sitting around, would slip past the two `find`-based checks above,
+        // which only look for the FIRST occurrence of each marker).
+        let serve_start = src
+            .find("pub async fn serve(")
+            .expect("serve must exist in server.rs");
+        let serve_body = &src[serve_start..];
+        let serve_end = serve_body
+            .find("\n}\n")
+            .expect("serve must be brace-terminated");
+        let serve_body = &serve_body[..serve_end];
+        // Review round 2, L-d: strip `//` line comments first — otherwise an
+        // EXPLANATORY comment mentioning a third `.run(`-shaped call (a
+        // perfectly normal thing to write while explaining why something is
+        // NOT spawned, say) would inflate this count and make the test
+        // falsely red for a change that never touched real code.
+        let serve_body_no_comments: String = serve_body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let run_spawns = serve_body_no_comments.matches(".run(").count();
         assert_eq!(
-            scheduler.tick(due).await.unwrap(),
-            1,
-            "the seeded row must fire on this tick"
+            run_spawns, 2,
+            "serve() must spawn exactly two `.run(` loops (the tick scheduler and the delivery \
+             pump) — found {run_spawns}"
         );
-        schedule_id
-    }
-
-    /// Bounded polling — never a real sleep the test's own correctness
-    /// depends on: `condition` is checked immediately and then at a short
-    /// real interval (irrelevant to `TestClock`'s virtual time) until
-    /// `deadline` is hit, at which point this panics with `on_timeout`'s
-    /// message.
-    async fn wait_until<F: Fn() -> bool>(condition: F, on_timeout: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if condition() {
-                return;
-            }
-            assert!(Instant::now() < deadline, "{on_timeout}");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    fn scheduler_with(
-        store: Store,
-        trigger: Arc<dyn RunTrigger>,
-    ) -> (Arc<Scheduler>, Arc<StdMutex<Vec<EventBody>>>) {
-        let events = Arc::new(StdMutex::new(Vec::new()));
-        let ev = Arc::clone(&events);
-        let emit: Arc<dyn Fn(EventBody) + Send + Sync> = Arc::new(move |body: EventBody| {
-            ev.lock().unwrap().push(body);
-        });
-        (Scheduler::new(store, trigger, emit), events)
-    }
-
-    /// design §4.3 (T2): a module fire that comes back `ModuleDelivered` on
-    /// its first attempt lands `delivered`, resets `consecutive_failures`,
-    /// and emits `schedule.delivered`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_successful_first_attempt_is_delivered_and_emits_the_event() {
-        let store = Store::open_memory().await.unwrap();
-        let trigger = ScriptedTrigger::new([FireOutcome::ModuleDelivered {
-            fire_id: agent24_scheduler::FireId::from_stored("placeholder".into()),
-        }]);
-        let (scheduler, events) = scheduler_with(store.clone(), trigger as Arc<dyn RunTrigger>);
-        let now0 = utc("2026-08-01T00:00:00Z");
-        let schedule_id = seed_module_fire(&scheduler, &store, "mod-a", "k", now0).await;
-
-        let clock = TestClock::at(now0 + chrono::Duration::seconds(65));
-        let cancel = CancellationToken::new();
-        let pump = DeliveryPump::new(Arc::clone(&scheduler));
-        let handle = tokio::spawn(pump.run(clock as Arc<dyn Clock>, cancel.child_token()));
-
-        wait_until(
-            || {
-                let states =
-                    futures::executor::block_on(store.list_module_schedules("mod-a")).unwrap();
-                states[0]
-                    .last_fire
-                    .tick
-                    .as_ref()
-                    .is_some_and(|f| f.status == "delivered")
-            },
-            "the fire never reached delivered",
-        )
-        .await;
-        cancel.cancel();
-        handle.await.unwrap();
-
-        let schedule = store.get_schedule(&schedule_id).await.unwrap().unwrap();
-        assert_eq!(schedule.consecutive_failures, 0);
-        assert!(
-            events
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|e| matches!(e, EventBody::ScheduleDelivered(_))),
-            "schedule.delivered must have been emitted"
-        );
-    }
-
-    /// design §4.2/§4.3/§4.4 (T5/T6), judgement **C4.2/C4.3**: three sent
-    /// failures fail the fire ONCE (not three times), `consecutive_failures`
-    /// goes to 1, and every attempt carried the exact same `fire_id`/
-    /// `scheduled_for`/`fired_at` — the retries of ONE slot, not three
-    /// different fires. The positive control (a later, different slot gets a
-    /// different `fire_id`) is asserted in the same test.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn three_failures_fail_once_with_a_stable_fire_id_then_the_next_slot_differs() {
-        let store = Store::open_memory().await.unwrap();
-        let trigger = ScriptedTrigger::new([
-            FireOutcome::Failed {
-                reason: "boom 1".into(),
-            },
-            FireOutcome::Failed {
-                reason: "boom 2".into(),
-            },
-            FireOutcome::Failed {
-                reason: "boom 3".into(),
-            },
-            // The row is `failed` (terminal) after the third attempt — this
-            // fourth entry must never be reached for THIS fire; it exists
-            // only so `ScriptedTrigger` has something to hand back if the
-            // pump's own CAS ever (wrongly) retried past three.
-            FireOutcome::ModuleDelivered {
-                fire_id: agent24_scheduler::FireId::from_stored("must-not-be-reached".into()),
-            },
-        ]);
-        let (scheduler, _events) =
-            scheduler_with(store.clone(), trigger.clone() as Arc<dyn RunTrigger>);
-        let now0 = utc("2026-08-01T00:00:00Z");
-        let schedule_id = seed_module_fire(&scheduler, &store, "mod-b", "k", now0).await;
-
-        let clock = TestClock::at(now0 + chrono::Duration::seconds(65));
-        let cancel = CancellationToken::new();
-        let pump = DeliveryPump::new(Arc::clone(&scheduler));
-        let handle =
-            tokio::spawn(pump.run(Arc::clone(&clock) as Arc<dyn Clock>, cancel.child_token()));
-
-        // §4.4's backoff (5s, then 15s) is computed from `clock.now()` AT THE
-        // MOMENT the pump applies an attempt's outcome — not at the moment it
-        // was dispatched. So the clock must stay FROZEN while an attempt is
-        // in flight (advancing it early would inflate that attempt's own
-        // `next_attempt_at`) and only move once this test has PROOF (the
-        // expected `last_error` landed in the store) that attempt N's
-        // outcome was applied while the clock held the value this test last
-        // set — only then is "that value + the fixed backoff" the exact
-        // threshold the next attempt needs.
-        async fn wait_for_last_error(store: &Store, owner: &str, expected: &str) {
-            wait_until(
-                || {
-                    let states =
-                        futures::executor::block_on(store.list_module_schedules(owner)).unwrap();
-                    states[0]
-                        .last_fire
-                        .tick
-                        .as_ref()
-                        .and_then(|f| f.last_error.as_deref())
-                        == Some(expected)
-                },
-                &format!("last_error never became {expected:?}"),
-            )
-            .await;
-        }
-
-        wait_for_last_error(&store, "mod-b", "boom 1").await;
-        let t1 = clock.now(); // unchanged since `at()`: still now0 + 65s
-        clock.set(t1 + chrono::Duration::seconds(6)); // past the 5s backoff
-        wait_for_last_error(&store, "mod-b", "boom 2").await;
-        let t2 = clock.now(); // unchanged since the line above
-        clock.set(t2 + chrono::Duration::seconds(16)); // past the 15s backoff
-        wait_until(
-            || trigger.calls().len() >= 3,
-            "the third attempt never happened",
-        )
-        .await;
-
-        wait_until(
-            || {
-                let states =
-                    futures::executor::block_on(store.list_module_schedules("mod-b")).unwrap();
-                states[0]
-                    .last_fire
-                    .tick
-                    .as_ref()
-                    .is_some_and(|f| f.status == "failed")
-            },
-            "the fire never reached failed after three attempts",
-        )
-        .await;
-        // Give the pump a moment to prove it does NOT attempt a fourth time.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            trigger.calls().len(),
-            3,
-            "a failed fire must not be retried a fourth time"
-        );
-
-        let schedule = store.get_schedule(&schedule_id).await.unwrap().unwrap();
-        assert_eq!(
-            schedule.consecutive_failures, 1,
-            "three attempts of ONE fire must count as a single failure, not three"
-        );
-
-        let calls = trigger.calls();
-        assert_eq!(calls.len(), 3);
-        assert!(
-            calls.iter().all(|c| c.fire_id == calls[0].fire_id),
-            "every retry of one fire must carry the exact same fire_id: {calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .all(|c| c.scheduled_for == calls[0].scheduled_for
-                    && c.fired_at == calls[0].fired_at),
-            "every retry of one fire must carry the exact same scheduled_for/fired_at: {calls:?}"
-        );
-
-        cancel.cancel();
-        handle.await.unwrap();
-
-        // Positive control: a later, DIFFERENT slot gets a different fire_id.
-        let trigger2 = ScriptedTrigger::new([FireOutcome::ModuleDelivered {
-            fire_id: agent24_scheduler::FireId::from_stored("placeholder".into()),
-        }]);
-        let (scheduler2, _events2) =
-            scheduler_with(store.clone(), trigger2.clone() as Arc<dyn RunTrigger>);
-        let now1 = now0 + chrono::Duration::seconds(200);
-        assert_eq!(scheduler2.tick(now1).await.unwrap(), 1);
-        let clock2 = TestClock::at(now1);
-        let cancel2 = CancellationToken::new();
-        let pump2 = DeliveryPump::new(Arc::clone(&scheduler2));
-        let handle2 = tokio::spawn(pump2.run(clock2 as Arc<dyn Clock>, cancel2.child_token()));
-        wait_until(
-            || !trigger2.calls().is_empty(),
-            "the next slot's fire never attempted",
-        )
-        .await;
-        cancel2.cancel();
-        handle2.await.unwrap();
-        assert_ne!(
-            trigger2.calls()[0].fire_id,
-            calls[0].fire_id,
-            "a different slot must never reuse the same fire_id"
-        );
-    }
-
-    /// design §4.1/§5.3/§9, judgement **C4.4**: the module being unreachable
-    /// (`Deferred`) never counts as a failure and never stops — the row is
-    /// picked up again once the module comes back, still carrying the SAME
-    /// `fire_id`. Also stands in for **C4.10** (the pure `apply_outcome`
-    /// "repeating Deferred writes nothing" contract is unit-tested directly
-    /// in `agent24_scheduler::deliveries`; here the pump-level effect —
-    /// `consecutive_failures` never moves while the module stays
-    /// unavailable, however many rounds it takes — is what's under test).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unavailable_module_never_counts_as_a_failure_and_recovers_with_the_same_fire_id() {
-        let store = Store::open_memory().await.unwrap();
-        let trigger = ScriptedTrigger::new([FireOutcome::Deferred {
-            reason: agent24_scheduler::DeferReason::NotRunning,
-        }]);
-        let (scheduler, _events) =
-            scheduler_with(store.clone(), trigger.clone() as Arc<dyn RunTrigger>);
-        let now0 = utc("2026-08-01T00:00:00Z");
-        let schedule_id = seed_module_fire(&scheduler, &store, "mod-c", "k", now0).await;
-
-        let clock = TestClock::at(now0 + chrono::Duration::seconds(65));
-        let cancel = CancellationToken::new();
-        let pump = DeliveryPump::new(Arc::clone(&scheduler));
-        let handle =
-            tokio::spawn(pump.run(Arc::clone(&clock) as Arc<dyn Clock>, cancel.child_token()));
-
-        // Several rounds while the module stays unavailable: never a failure.
-        // The pump's `DEFER_RECHECK` owner-skip cache is keyed off the SAME
-        // virtual clock, so it must be advanced past each 2s window for the
-        // pump to re-poll — a real `tokio::time::sleep` here would just wait
-        // out a virtual window that never moves on its own.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if trigger.calls().len() >= 3 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the pump never re-polled the unavailable module"
-            );
-            clock.set(clock.now() + chrono::Duration::seconds(3));
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let schedule = store.get_schedule(&schedule_id).await.unwrap().unwrap();
-        assert_eq!(
-            schedule.consecutive_failures, 0,
-            "Deferred must never count as a failure"
-        );
-        let states = store.list_module_schedules("mod-c").await.unwrap();
-        let last_fire = states[0].last_fire.tick.clone().unwrap();
-        assert_eq!(last_fire.status, "deferred");
-        let stable_fire_id = last_fire.fire_id.clone();
-
-        // The module "comes back": swap in a trigger that delivers.
-        trigger.outcomes.lock().unwrap().clear();
-        trigger
-            .outcomes
-            .lock()
-            .unwrap()
-            .push_back(FireOutcome::ModuleDelivered {
-                fire_id: agent24_scheduler::FireId::from_stored(stable_fire_id.clone()),
-            });
-        // Same reason as above: advance the virtual clock past the owner's
-        // remaining `DEFER_RECHECK` window, since nothing else will.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let states = store.list_module_schedules("mod-c").await.unwrap();
-            if states[0]
-                .last_fire
-                .tick
-                .as_ref()
-                .is_some_and(|f| f.status == "delivered")
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the fire never delivered once the module recovered"
-            );
-            clock.set(clock.now() + chrono::Duration::seconds(3));
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let states = store.list_module_schedules("mod-c").await.unwrap();
-        assert_eq!(
-            states[0].last_fire.tick.as_ref().unwrap().fire_id,
-            stable_fire_id,
-            "recovery must deliver the SAME fire, not a new one"
-        );
-        cancel.cancel();
-        handle.await.unwrap();
-    }
-
-    /// design §4.6/§5.4, judgement **C4.12**: an attempt genuinely in flight
-    /// when the pump is cancelled leaves its row untouched (`pending`,
-    /// `attempts` unchanged) — the `JoinSet` aborts it, it never gets to
-    /// apply an outcome. Judgement **C4.8**: a fresh `Scheduler`+`DeliveryPump`
-    /// against the SAME store (standing in for "the next start") then
-    /// redelivers with the EXACT SAME `fire_id`, and it succeeds.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cancelled_in_flight_attempt_leaves_its_row_pending_for_the_next_start() {
-        let store = Store::open_memory().await.unwrap();
-        let trigger = BlockingTrigger::new();
-        let (scheduler, _events) =
-            scheduler_with(store.clone(), trigger.clone() as Arc<dyn RunTrigger>);
-        let now0 = utc("2026-08-01T00:00:00Z");
-        let schedule_id = seed_module_fire(&scheduler, &store, "mod-d", "k", now0).await;
-        let fire_id_before = store.list_module_schedules("mod-d").await.unwrap()[0]
-            .last_fire
-            .tick
-            .clone()
-            .unwrap()
-            .fire_id;
-
-        let clock = TestClock::at(now0 + chrono::Duration::seconds(65));
-        let cancel = CancellationToken::new();
-        let pump = DeliveryPump::new(Arc::clone(&scheduler));
-        let handle = tokio::spawn(pump.run(clock as Arc<dyn Clock>, cancel.child_token()));
-
-        tokio::time::timeout(Duration::from_secs(5), trigger.started.notified())
-            .await
-            .expect("the attempt never started");
-        // Genuinely in flight now (blocked inside `trigger()`, forever).
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("the pump must stop promptly on cancellation, not wait out the blocked attempt")
-            .unwrap();
-
-        let states = store.list_module_schedules("mod-d").await.unwrap();
-        let after_cancel = states[0].last_fire.tick.clone().unwrap();
-        assert_eq!(
-            after_cancel.status, "pending",
-            "a cancelled in-flight attempt must leave the row pending"
-        );
-        assert_eq!(after_cancel.fire_id, fire_id_before);
-        let schedule = store.get_schedule(&schedule_id).await.unwrap().unwrap();
-        assert_eq!(schedule.consecutive_failures, 0);
-
-        // "The next start": a FRESH Scheduler + DeliveryPump over the SAME
-        // store, with a trigger that now delivers.
-        let trigger2 = ScriptedTrigger::new([FireOutcome::ModuleDelivered {
-            fire_id: agent24_scheduler::FireId::from_stored(fire_id_before.clone()),
-        }]);
-        let (scheduler2, _events2) = scheduler_with(store.clone(), trigger2 as Arc<dyn RunTrigger>);
-        let clock2 = TestClock::at(now0 + chrono::Duration::seconds(65));
-        let cancel2 = CancellationToken::new();
-        let pump2 = DeliveryPump::new(Arc::clone(&scheduler2));
-        let handle2 = tokio::spawn(pump2.run(clock2 as Arc<dyn Clock>, cancel2.child_token()));
-        wait_until(
-            || {
-                let states =
-                    futures::executor::block_on(store.list_module_schedules("mod-d")).unwrap();
-                states[0]
-                    .last_fire
-                    .tick
-                    .as_ref()
-                    .is_some_and(|f| f.status == "delivered")
-            },
-            "the restarted pump never redelivered the pending fire",
-        )
-        .await;
-        let states = store.list_module_schedules("mod-d").await.unwrap();
-        assert_eq!(
-            states[0].last_fire.tick.as_ref().unwrap().fire_id,
-            fire_id_before,
-            "the restart must redeliver the SAME fire_id, not a new one"
-        );
-        cancel2.cancel();
-        handle2.await.unwrap();
     }
 }
