@@ -39,7 +39,7 @@
 | ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `BACKLOG` | |
 | ME4-M2 门 | Sin90 | Sin90 M3（T3.1.1–T3.5.1）全 DONE | 1.5.1, 0.1 | `BACKLOG` | |
 | ME4-M3 门 | Sin90 | Sin90 M4（T4.1.1–T4.4.1）全 DONE | M2 门 | `BACKLOG` | |
-| ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `PR_OPEN` | #445（冻结 v3.1；3 轮 Opus 评审，第 3 轮 APPROVE）—— 切法以设计 §10.2 为准 |
+| ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `PR_OPEN` | #446（冻结 v3.1；3 轮 Opus 评审，第 3 轮 APPROVE）—— 切法以设计 §10.2 为准 |
 | ME4-4.2.1 | Agent24 | `model_access` manifest 字段解析（只做 manifest，不授予） | 4.1.1 | `BACKLOG` | |
 | ME4-4.2.2-0 | Agent24 | rpc 按方法超时 + ErrorKind `unavailable`（17→18）+ SPEC 闭集句 | 4.1.1 | `BACKLOG` | |
 | ME4-4.2.2a | Agent24 | `agent24-models` 契约扩展（max_tokens / model_id / Rejected）+ 回环判定改 reqwest::Url + `loopback_only()` + `OLLAMA_URL` 进 PASSTHROUGH_VARS（关闭 FU-72） | 4.1.1 | `BACKLOG` | |
