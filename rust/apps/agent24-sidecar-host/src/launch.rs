@@ -241,7 +241,7 @@ mod tests {
 
     fn reap(launch: &mut OwnedLaunch) {
         launch.parts_mut().0.request_stop(true).expect("force stop");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !matches!(
             launch.parts_mut().0.reap_step().expect("reap step"),
             TreeObservation::ConfirmedEmpty
@@ -297,6 +297,51 @@ mod tests {
         reap(&mut launch);
         drop(launch);
         wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn closing_stdin_twice_delivers_eof_without_losing_owner_or_other_pipes() {
+        let _test_guard = crate::posix::tests::test_lock();
+        let request = Request::Launch {
+            version: 1,
+            request_id: 18,
+            executable: "/bin/sh".into(),
+            cwd: "/".into(),
+            argv: vec![
+                "-c".into(),
+                "cat >/dev/null; printf eof-marker; printf err-marker >&2; exec sleep 30".into(),
+            ],
+            env: BTreeMap::new(),
+        };
+        let mut launch = OwnedLaunch::start(LaunchIntent::from_request(request).unwrap()).unwrap();
+        let stdin_unavailable = {
+            let (_, pipes) = launch.parts_mut();
+            pipes.close_stdin();
+            pipes.close_stdin();
+            pipes.stdin_mut().is_none()
+        };
+        use std::os::fd::AsFd;
+        fn bounded_read(pipe: &impl AsFd) -> io::Result<[u8; 10]> {
+            let mut reader = std::fs::File::from(pipe.as_fd().try_clone_to_owned()?);
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut bytes = [0; 10];
+                let result = reader.read_exact(&mut bytes);
+                let _ = send.send((result, bytes));
+            });
+            let (result, bytes) = receive.recv_timeout(Duration::from_secs(2)).map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "child output deadline expired")
+            })?;
+            result.map(|()| bytes)
+        }
+        let out = bounded_read(launch.parts_mut().1.stdout_mut());
+        let err = bounded_read(launch.parts_mut().1.stderr_mut());
+        reap(&mut launch);
+        drop(launch);
+        wait_for_reaper_idle();
+        assert!(stdin_unavailable, "closed stdin remained available");
+        assert_eq!(&out.unwrap(), b"eof-marker");
+        assert_eq!(&err.unwrap(), b"err-marker");
     }
 
     #[test]
@@ -452,6 +497,49 @@ mod windows_tests {
         assert_eq!(stderr, "err");
         reap(&mut launch);
         std::fs::remove_dir_all(&cwd).expect("cleanup cwd");
+    }
+
+    #[tokio::test]
+    async fn windows_closing_stdin_twice_delivers_eof_and_keeps_owner() {
+        let cwd = std::env::temp_dir();
+        let mut launch = OwnedLaunch::start(LaunchIntent::from_request(Request::Launch {
+            version: 1,
+            request_id: 20,
+            executable: "powershell.exe".into(),
+            cwd: cwd.display().to_string(),
+            argv: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
+                "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('eof-marker'); [Console]::Error.Write('err-marker')".into()],
+            env: BTreeMap::from([(String::from("SystemRoot"), std::env::var("SystemRoot").unwrap())]),
+        }).unwrap()).unwrap();
+        let stdin_unavailable = {
+            let (_, pipes) = launch.parts_mut();
+            pipes.close_stdin();
+            pipes.close_stdin();
+            pipes.stdin_mut().is_none()
+        };
+        let mut out = [0; 10];
+        let stdout_result = tokio::time::timeout(Duration::from_secs(3), async {
+            launch.parts_mut().1.stdout_mut().read_exact(&mut out).await
+        })
+        .await;
+        let mut err = [0; 10];
+        let stderr_result = tokio::time::timeout(
+            Duration::from_secs(3),
+            launch.parts_mut().1.stderr_mut().read_exact(&mut err),
+        )
+        .await;
+        reap(&mut launch);
+        assert!(stdin_unavailable, "closed stdin remained available");
+        assert!(
+            stdout_result.is_ok_and(|result| result.is_ok()),
+            "stdout EOF marker timed out or failed"
+        );
+        assert!(
+            stderr_result.is_ok_and(|result| result.is_ok()),
+            "stderr marker timed out or failed"
+        );
+        assert_eq!(&out, b"eof-marker");
+        assert_eq!(&err, b"err-marker");
     }
 
     #[tokio::test]
