@@ -1,7 +1,8 @@
 use crate::{
-    Store, WorkspaceInstant, WorkspaceResult, WorkspaceStoreError, workspace_decode_support,
+    Store, StoreError, WorkspaceInstant, WorkspaceResult, WorkspaceStoreError,
+    workspace_decode_support,
 };
-use agent24_protocol::{ApprovalStatus, RunStatus, WorkspaceId};
+use agent24_protocol::{Approval, ApprovalStatus, Decision, RunStatus, WorkspaceId};
 use sqlx::{Sqlite, Transaction, sqlite::SqliteRow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,22 @@ pub struct LegacyRecoveryHold {
     pub(crate) active_resume_approval_id: Option<String>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, PartialEq)]
+pub(crate) enum LegacyApprovalResolution {
+    ApprovalOnly(Approval),
+    Ready(Approval),
+}
+#[allow(dead_code)]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ResolveLegacyApprovalError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Recovery(#[from] WorkspaceStoreError),
+    #[error("legacy recovery unavailable")]
+    RecoveryUnavailable,
+}
 fn bad(field: &'static str) -> WorkspaceStoreError {
     workspace_decode_support::bad_table("legacy_recovery_holds", field)
 }
@@ -286,7 +303,61 @@ impl LegacyRecoveryHold {
     }
 }
 
+#[allow(dead_code)]
 impl Store {
+    pub(crate) async fn resolve_approval_with_legacy_ready(
+        &self,
+        id: &str,
+        to: ApprovalStatus,
+        decision: Option<&Decision>,
+        resolved_at: WorkspaceInstant,
+    ) -> Result<LegacyApprovalResolution, ResolveLegacyApprovalError> {
+        agent24_core::check_approval_transition(ApprovalStatus::Pending, to)
+            .map_err(StoreError::from)
+            .map_err(ResolveLegacyApprovalError::Store)?;
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StoreError::from)
+            .map_err(ResolveLegacyApprovalError::Store)?;
+        let approval = Store::resolve_approval_tx(&mut tx, id, to, decision, resolved_at.as_str())
+            .await
+            .map_err(ResolveLegacyApprovalError::Store)?;
+        let held = sqlx::query(
+            "SELECT 1 FROM legacy_recovery_holds
+             WHERE run_id = ? COLLATE BINARY LIMIT 1",
+        )
+        .bind(&approval.run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ResolveLegacyApprovalError::Recovery(WorkspaceStoreError::Database))?
+        .is_some();
+        if !held {
+            tx.commit()
+                .await
+                .map_err(StoreError::from)
+                .map_err(ResolveLegacyApprovalError::Store)?;
+            return Ok(LegacyApprovalResolution::ApprovalOnly(approval));
+        }
+        match apply_ready_tx(&mut tx, &approval.run_id, id, resolved_at).await {
+            Ok(Some(_)) => {
+                tx.commit()
+                    .await
+                    .map_err(StoreError::from)
+                    .map_err(ResolveLegacyApprovalError::Store)?;
+                Ok(LegacyApprovalResolution::Ready(approval))
+            }
+            Ok(None) => {
+                let _ = tx.rollback().await;
+                Err(ResolveLegacyApprovalError::RecoveryUnavailable)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(ResolveLegacyApprovalError::Recovery(error))
+            }
+        }
+    }
     /// Reads a persisted hold without applying recovery or admission policy.
     pub async fn get_legacy_recovery_hold(
         &self,
@@ -619,6 +690,21 @@ mod tests {
     }
 
     #[allow(clippy::unwrap_used)]
+    async fn composed_facts(
+        store: &Store,
+    ) -> (String, Option<String>, String, Option<String>, i64) {
+        sqlx::query_as(
+            "SELECT a.status,a.decided_at,h.recovery_state,h.ready_at,
+                    (SELECT count(*) FROM audit_log)
+             FROM approvals a JOIN legacy_recovery_holds h ON h.run_id=a.run_id
+             WHERE a.id='approval-strict'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+    }
+
+    #[allow(clippy::unwrap_used)]
     async fn ready(tx: &mut Transaction<'_, Sqlite>) -> WorkspaceResult<Option<ReadyMutation>> {
         apply_ready_tx(
             tx,
@@ -786,6 +872,145 @@ mod tests {
             })
         );
         store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn composed_resolution_is_approval_only_without_a_hold() {
+        let ts = WorkspaceInstant::parse("2026-09-20T00:00:00.123Z").unwrap();
+        let store = strict_facts_fixture().await;
+        let resolved = store
+            .resolve_approval_with_legacy_ready(
+                "approval-strict",
+                ApprovalStatus::Approved,
+                None,
+                ts.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resolved, LegacyApprovalResolution::Ready(ref a) if a.status == ApprovalStatus::Approved)
+        );
+        let facts = composed_facts(&store).await;
+        assert_eq!(facts.1.as_deref(), Some(ts.as_str()));
+        assert_eq!(facts.3.as_deref(), Some(ts.as_str()));
+
+        let store = strict_facts_fixture().await;
+        execute(&store, "DELETE FROM legacy_recovery_holds").await;
+        let resolved = store
+            .resolve_approval_with_legacy_ready(
+                "approval-strict",
+                ApprovalStatus::Denied,
+                None,
+                ts.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resolved, LegacyApprovalResolution::ApprovalOnly(a) if a.status == ApprovalStatus::Denied)
+        );
+        assert!(store.list_audit().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn composed_resolution_fails_closed_for_active_or_terminal_recovery() {
+        for sql in [
+            "UPDATE legacy_recovery_holds SET recovery_state='active',active_resume_approval_id='approval-strict'",
+            "UPDATE runs SET status='completed' WHERE id='run-strict'",
+        ] {
+            let store = strict_facts_fixture().await;
+            execute(&store, sql).await;
+            let before = composed_facts(&store).await;
+            let result = store
+                .resolve_approval_with_legacy_ready(
+                    "approval-strict",
+                    ApprovalStatus::Approved,
+                    None,
+                    WorkspaceInstant::parse("2026-09-20T00:00:00.123Z").unwrap(),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(ResolveLegacyApprovalError::RecoveryUnavailable)
+            ));
+            let after = composed_facts(&store).await;
+            assert_eq!(after, before);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn composed_resolution_rolls_back_recovery_audit_failure_and_retries() {
+        let store = strict_facts_fixture().await;
+        execute(
+            &store,
+            "CREATE TRIGGER composed_audit_abort BEFORE INSERT ON audit_log
+             BEGIN SELECT RAISE(ABORT, 'secret-audit'); END",
+        )
+        .await;
+        let result = store
+            .resolve_approval_with_legacy_ready(
+                "approval-strict",
+                ApprovalStatus::Approved,
+                None,
+                WorkspaceInstant::parse("2026-09-20T00:00:00.123Z").unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ResolveLegacyApprovalError::Recovery(
+                WorkspaceStoreError::Database
+            ))
+        ));
+        let facts = composed_facts(&store).await;
+        assert_eq!(
+            facts,
+            ("pending".into(), None, "awaiting_decision".into(), None, 0)
+        );
+        execute(&store, "DROP TRIGGER composed_audit_abort").await;
+        let _result = store
+            .resolve_approval_with_legacy_ready(
+                "approval-strict",
+                ApprovalStatus::Approved,
+                None,
+                WorkspaceInstant::parse("2026-09-20T00:00:00.123Z").unwrap(),
+            )
+            .await
+            .unwrap();
+        let audit = store.list_audit().await.unwrap();
+        assert_eq!(audit[0].ts, "2026-09-20T00:00:00.123Z");
+        store.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn composed_resolution_classifies_hold_probe_sql_failure_as_recovery() {
+        let store = strict_facts_fixture().await;
+        execute(&store, "DROP TABLE legacy_recovery_holds").await;
+        let error = store
+            .resolve_approval_with_legacy_ready(
+                "approval-strict",
+                ApprovalStatus::Approved,
+                None,
+                WorkspaceInstant::parse("2026-09-20T00:00:00.123Z").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        let display = error.to_string();
+        assert!(matches!(
+            error,
+            ResolveLegacyApprovalError::Recovery(WorkspaceStoreError::Database)
+        ));
+        assert_eq!(display, "workspace database error");
+        assert!(!display.contains("secret"));
+        let facts: (String, Option<String>) =
+            sqlx::query_as("SELECT status,decided_at FROM approvals WHERE id='approval-strict'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(facts, ("pending".into(), None));
+        assert!(store.list_audit().await.unwrap().is_empty());
     }
 
     #[tokio::test]
