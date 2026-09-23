@@ -6,7 +6,7 @@ use crate::{
     launch::OwnedLaunch,
     output_io::{OutputWriteError, OutputWriter, PutFrameError, WriteStep},
     ready_io::ReadyGate,
-    target::TreeObservation,
+    target::{ExitObservation, TreeObservation},
 };
 use std::{
     io::{self, Write},
@@ -152,6 +152,7 @@ impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
 
 pub(crate) trait LaunchControl {
     fn stop(&mut self, force: bool) -> io::Result<()>;
+    fn observe_exit(&mut self) -> io::Result<ExitObservation>;
     fn cleanup(&mut self, phase: &mut Phase) -> Result<TreeObservation, CleanupStepError>;
 }
 
@@ -166,6 +167,10 @@ impl LaunchControl for OwnedLaunch {
         }
     }
 
+    fn observe_exit(&mut self) -> io::Result<ExitObservation> {
+        self.target_mut().observe_exit()
+    }
+
     fn cleanup(&mut self, phase: &mut Phase) -> Result<TreeObservation, CleanupStepError> {
         crate::cleanup::cleanup_step(phase, self.target_mut())
     }
@@ -176,6 +181,7 @@ pub(crate) enum ActorLaunchOrderError {
     CleanupRequired,
     InvalidTransition,
     Stop(io::ErrorKind),
+    Observe(io::ErrorKind),
     Reap(io::ErrorKind),
 }
 
@@ -308,6 +314,18 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         now: Instant,
     ) -> Result<TreeObservation, ActorLaunchOrderError> {
         self.advance(now);
+        if matches!(self.phase, Phase::GracefulStopping(_)) {
+            match self.order.launch.observe_exit() {
+                Ok(ExitObservation::Running) => return Ok(TreeObservation::Present),
+                Ok(ExitObservation::Exited { .. }) => {
+                    self.phase = self
+                        .phase
+                        .stop(true, now, self.limits)
+                        .map_err(|_| ActorLaunchOrderError::InvalidTransition)?;
+                }
+                Err(error) => return Err(ActorLaunchOrderError::Observe(error.kind())),
+            }
+        }
         if matches!(
             self.phase,
             Phase::ForceStopping(_) | Phase::Draining(_) | Phase::Unconfirmed
@@ -489,6 +507,8 @@ mod tests {
         id: u64,
         stops: VecDeque<io::Result<()>>,
         forces: Vec<bool>,
+        observations: VecDeque<io::Result<ExitObservation>>,
+        observed: usize,
         reaps: VecDeque<io::Result<TreeObservation>>,
     }
 
@@ -504,6 +524,13 @@ mod tests {
             self.stops
                 .pop_front()
                 .unwrap_or_else(|| panic!("scripted stop"))
+        }
+
+        fn observe_exit(&mut self) -> io::Result<ExitObservation> {
+            self.observed += 1;
+            self.observations
+                .pop_front()
+                .unwrap_or(Ok(ExitObservation::Running))
         }
 
         fn cleanup(&mut self, phase: &mut Phase) -> Result<TreeObservation, CleanupStepError> {
@@ -537,6 +564,8 @@ mod tests {
                 id: 7,
                 stops: stops.into_iter().collect(),
                 forces: Vec::new(),
+                observations: VecDeque::new(),
+                observed: 0,
                 reaps: reaps.into_iter().collect(),
             },
             FakeSink { frame: None, steps },
@@ -624,6 +653,111 @@ mod tests {
         );
         assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
         assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
+    }
+
+    #[test]
+    fn graceful_observation_running_waits_and_exit_forces_before_reap() {
+        let now = Instant::now();
+        let mut running = actor([], [], vec![]);
+        running.phase = Phase::GracefulStopping(now + LIMITS.graceful);
+        assert_eq!(running.cleanup_tick(now), Ok(TreeObservation::Present));
+        assert_eq!(running.order.launch.observed, 1);
+        assert!(running.order.launch.forces.is_empty());
+        assert!(matches!(running.phase, Phase::GracefulStopping(_)));
+
+        let mut exited = actor([Ok(())], [Ok(TreeObservation::ConfirmedEmpty)], vec![]);
+        exited.phase = Phase::GracefulStopping(now + LIMITS.graceful);
+        exited
+            .order
+            .launch
+            .observations
+            .push_back(Ok(ExitObservation::Exited { code: Some(0) }));
+        assert_eq!(
+            exited.cleanup_tick(now),
+            Ok(TreeObservation::ConfirmedEmpty)
+        );
+        assert_eq!(exited.order.launch.observed, 1);
+        assert_eq!(exited.order.launch.forces, vec![true]);
+        assert_eq!(exited.phase, Phase::Empty);
+    }
+
+    #[test]
+    fn graceful_deadline_and_observation_or_force_errors_retry_safely() {
+        let now = Instant::now();
+        let mut exact = actor([Ok(())], [Ok(TreeObservation::ConfirmedEmpty)], vec![]);
+        exact.phase = Phase::GracefulStopping(now + LIMITS.graceful);
+        assert_eq!(
+            exact.cleanup_tick(now + LIMITS.graceful),
+            Ok(TreeObservation::ConfirmedEmpty)
+        );
+        assert_eq!(exact.order.launch.observed, 0);
+        assert_eq!(exact.order.launch.forces, vec![true]);
+
+        let mut retry = actor(
+            [io_error(io::ErrorKind::BrokenPipe), Ok(())],
+            [Ok(TreeObservation::ConfirmedEmpty)],
+            vec![],
+        );
+        retry.phase = Phase::GracefulStopping(now + LIMITS.graceful);
+        retry
+            .order
+            .launch
+            .observations
+            .push_back(Ok(ExitObservation::Exited { code: None }));
+        assert_eq!(
+            retry.cleanup_tick(now),
+            Err(ActorLaunchOrderError::Stop(io::ErrorKind::BrokenPipe))
+        );
+        assert!(matches!(retry.phase, Phase::ForceStopping(_)));
+        assert!(!retry.force_ok);
+        assert_eq!(retry.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
+        assert_eq!(retry.order.launch.forces, vec![true, true]);
+        assert_eq!(retry.order.launch.observed, 1);
+
+        let mut observe_error = actor([Ok(())], [Ok(TreeObservation::ConfirmedEmpty)], vec![]);
+        observe_error.phase = Phase::GracefulStopping(now + LIMITS.graceful);
+        observe_error
+            .order
+            .launch
+            .observations
+            .push_back(io_error(io::ErrorKind::Interrupted));
+        assert_eq!(
+            observe_error.cleanup_tick(now),
+            Err(ActorLaunchOrderError::Observe(io::ErrorKind::Interrupted))
+        );
+        assert!(matches!(observe_error.phase, Phase::GracefulStopping(_)));
+        assert!(observe_error.order.launch.forces.is_empty());
+        assert_eq!(
+            observe_error.cleanup_tick(now + LIMITS.graceful),
+            Ok(TreeObservation::ConfirmedEmpty)
+        );
+        assert_eq!(observe_error.order.launch.observed, 1);
+        assert_eq!(observe_error.order.launch.forces, vec![true]);
+    }
+
+    #[test]
+    fn empty_is_idempotent_and_unconfirmed_accepts_late_empty() {
+        let now = Instant::now();
+        let mut empty = actor([], [], vec![]);
+        empty.phase = Phase::Empty;
+        assert_eq!(empty.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
+        assert_eq!(empty.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
+        assert!(empty.order.launch.forces.is_empty());
+
+        let mut late = actor(
+            [Ok(())],
+            [
+                Ok(TreeObservation::Unconfirmed),
+                Ok(TreeObservation::ConfirmedEmpty),
+            ],
+            vec![],
+        );
+        late.phase = Phase::Unconfirmed;
+        assert_eq!(late.cleanup_tick(now), Ok(TreeObservation::Unconfirmed));
+        assert_eq!(late.phase, Phase::Unconfirmed);
+        assert_eq!(late.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
+        assert_eq!(late.phase, Phase::Empty);
+        assert_eq!(late.order.launch.forces, vec![true]);
     }
 
     #[test]
