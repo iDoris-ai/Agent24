@@ -3,10 +3,17 @@ use std::{
     io::{self, Write},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type ResultFrame = Result<(), OutputWriteError>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    Idle,
+    InFlight { deadline: Instant },
+    Closed,
+}
 
 /// One detached worker is created per adapter instance; actor calls only poll channels.
 /// A generic blocked `Write` may outlive `Drop`. This type is crate-private and unwired:
@@ -15,12 +22,12 @@ type ResultFrame = Result<(), OutputWriteError>;
 pub(crate) struct OutputWorker {
     commands: SyncSender<Vec<u8>>,
     results: Receiver<ResultFrame>,
-    in_flight: bool,
-    terminal: bool,
+    budget: Duration,
+    state: State,
 }
 
 impl OutputWorker {
-    pub(crate) fn new<W: Write + Send + 'static>(writer: W) -> io::Result<Self> {
+    pub(crate) fn new<W: Write + Send + 'static>(writer: W, budget: Duration) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::sync_channel::<Vec<u8>>(1);
         let (result_tx, result_rx) = mpsc::sync_channel::<ResultFrame>(1);
         thread::Builder::new()
@@ -29,55 +36,64 @@ impl OutputWorker {
         Ok(Self {
             commands: command_tx,
             results: result_rx,
-            in_flight: false,
-            terminal: false,
+            budget,
+            state: State::Idle,
         })
     }
 
-    pub(crate) fn put(&mut self, frame: Vec<u8>) -> Result<(), PutFrameError> {
-        if self.terminal {
+    pub(crate) fn put(&mut self, frame: Vec<u8>, now: Instant) -> Result<(), PutFrameError> {
+        if self.state == State::Closed {
             return Err(PutFrameError::Closed(frame));
         }
         if frame.len() > agent24_sidecar_host_protocol::MAX_CONTROL_FRAME_BYTES {
             return Err(PutFrameError::TooLarge(frame));
         }
-        if self.in_flight {
+        if matches!(self.state, State::InFlight { .. }) {
             return Err(PutFrameError::Busy(frame));
         }
         match self.commands.try_send(frame) {
             Ok(()) => {
-                self.in_flight = true;
+                // A deadline covers both admission and the actor observing a
+                // completed flush. Overflow is fail-closed rather than a
+                // panic or an unbounded write lease.
+                let deadline = now.checked_add(self.budget).unwrap_or(now);
+                self.state = State::InFlight { deadline };
                 Ok(())
             }
             Err(TrySendError::Full(frame)) => Err(PutFrameError::Busy(frame)),
             Err(TrySendError::Disconnected(frame)) => {
-                self.terminal = true;
+                self.state = State::Closed;
                 Err(PutFrameError::Closed(frame))
             }
         }
     }
 
-    pub(crate) fn step(&mut self) -> Result<WriteStep, OutputWriteError> {
-        if self.terminal {
-            return Err(OutputWriteError::Closed);
-        }
-        if !self.in_flight {
-            return Ok(WriteStep::Idle);
+    pub(crate) fn step(&mut self, now: Instant) -> Result<WriteStep, OutputWriteError> {
+        let State::InFlight { deadline } = self.state else {
+            return if self.state == State::Closed {
+                Err(OutputWriteError::Closed)
+            } else {
+                Ok(WriteStep::Idle)
+            };
+        };
+        // The deadline has priority over a result already waiting in the
+        // channel: at the boundary, never claim a flush was observed in time.
+        if now >= deadline {
+            self.state = State::Closed;
+            return Err(OutputWriteError::Io(io::ErrorKind::TimedOut));
         }
         match self.results.try_recv() {
             Ok(Ok(())) => {
-                self.in_flight = false;
+                self.state = State::Idle;
                 Ok(WriteStep::Complete)
             }
             Ok(Err(error)) => {
-                self.in_flight = false;
-                self.terminal = true;
+                self.state = State::Closed;
                 Err(error)
             }
             Err(TryRecvError::Empty) => Ok(WriteStep::Pending),
             Err(TryRecvError::Disconnected) => {
-                self.in_flight = false;
-                self.terminal = true;
+                self.state = State::Closed;
                 Err(OutputWriteError::Closed)
             }
         }
@@ -151,14 +167,20 @@ mod tests {
         }
     }
 
+    const BUDGET: Duration = Duration::from_secs(3);
+
     fn worker(script: Arc<Mutex<Script>>) -> OutputWorker {
-        OutputWorker::new(ScriptWriter(script)).unwrap()
+        OutputWorker::new(ScriptWriter(script), BUDGET).unwrap()
     }
 
-    fn wait_step(worker: &mut OutputWorker) -> Result<WriteStep, OutputWriteError> {
+    fn worker_with_budget(script: Arc<Mutex<Script>>, budget: Duration) -> OutputWorker {
+        OutputWorker::new(ScriptWriter(script), budget).unwrap()
+    }
+
+    fn wait_step(worker: &mut OutputWorker, now: Instant) -> Result<WriteStep, OutputWriteError> {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let step = worker.step();
+            let step = worker.step(now);
             if step != Ok(WriteStep::Pending) || Instant::now() >= deadline {
                 return step;
             }
@@ -181,12 +203,13 @@ mod tests {
             ..Script::default()
         }));
         let mut worker = worker(script.clone());
-        worker.put(b"exact-frame\n".to_vec()).unwrap();
+        let now = Instant::now();
+        worker.put(b"exact-frame\n".to_vec(), now).unwrap();
         assert_eq!(
-            worker.put(b"second\n".to_vec()),
+            worker.put(b"second\n".to_vec(), now),
             Err(PutFrameError::Busy(b"second\n".to_vec()))
         );
-        assert_eq!(wait_step(&mut worker), Ok(WriteStep::Complete));
+        assert_eq!(wait_step(&mut worker, now), Ok(WriteStep::Complete));
         let state = script.lock().unwrap();
         assert_eq!(state.bytes, b"exact-frame\n");
         assert_eq!(state.flushed, 2);
@@ -200,14 +223,15 @@ mod tests {
     fn frame_limit_is_enforced_and_boundary_frame_is_moved_once() {
         let script = Arc::new(Mutex::new(Script::default()));
         let mut worker = worker(script.clone());
+        let now = Instant::now();
         let too_large = vec![0; agent24_sidecar_host_protocol::MAX_CONTROL_FRAME_BYTES + 1];
         assert_eq!(
-            worker.put(too_large.clone()),
+            worker.put(too_large.clone(), now),
             Err(PutFrameError::TooLarge(too_large))
         );
         let frame = vec![b'x'; agent24_sidecar_host_protocol::MAX_CONTROL_FRAME_BYTES];
-        worker.put(frame.clone()).unwrap();
-        assert_eq!(wait_step(&mut worker), Ok(WriteStep::Complete));
+        worker.put(frame.clone(), now).unwrap();
+        assert_eq!(wait_step(&mut worker, now), Ok(WriteStep::Complete));
         assert_eq!(script.lock().unwrap().bytes, frame);
     }
 
@@ -236,13 +260,14 @@ mod tests {
                 ..Script::default()
             }));
             let mut worker = worker(script);
-            worker.put(b"failure\n".to_vec()).unwrap();
-            assert_eq!(wait_step(&mut worker), Err(expected));
+            let now = Instant::now();
+            worker.put(b"failure\n".to_vec(), now).unwrap();
+            assert_eq!(wait_step(&mut worker, now), Err(expected));
             assert_eq!(
-                worker.put(b"again\n".to_vec()),
+                worker.put(b"again\n".to_vec(), now),
                 Err(PutFrameError::Closed(b"again\n".to_vec()))
             );
-            assert_eq!(worker.step(), Err(OutputWriteError::Closed));
+            assert_eq!(worker.step(now), Err(OutputWriteError::Closed));
         }
     }
 
@@ -253,11 +278,128 @@ mod tests {
         let (_, disconnected) = mpsc::sync_channel(1);
         let old = std::mem::replace(&mut worker.results, disconnected);
         drop(old);
-        worker.put(b"one-frame\n".to_vec()).unwrap();
-        assert_eq!(worker.step(), Err(OutputWriteError::Closed));
+        let now = Instant::now();
+        worker.put(b"one-frame\n".to_vec(), now).unwrap();
+        assert_eq!(worker.step(now), Err(OutputWriteError::Closed));
         assert_eq!(
-            worker.put(b"again\n".to_vec()),
+            worker.put(b"again\n".to_vec(), now),
             Err(PutFrameError::Closed(b"again\n".to_vec()))
         );
+    }
+
+    #[test]
+    fn admission_starts_one_fixed_deadline_and_completion_returns_to_idle() {
+        let now = Instant::now();
+        let budget = Duration::from_secs(1);
+        let mut worker = worker_with_budget(Arc::new(Mutex::new(Script::default())), budget);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let old = std::mem::replace(&mut worker.results, result_rx);
+        drop(old);
+
+        worker.put(b"one\n".to_vec(), now).unwrap();
+        result_tx.send(Ok(())).unwrap();
+        assert_eq!(
+            worker.step(now + budget - Duration::from_nanos(1)),
+            Ok(WriteStep::Complete)
+        );
+        assert_eq!(worker.step(now + budget), Ok(WriteStep::Idle));
+    }
+
+    #[test]
+    fn failed_admission_does_not_create_or_refresh_a_deadline() {
+        let now = Instant::now();
+        let budget = Duration::from_secs(1);
+        let mut worker = worker_with_budget(Arc::new(Mutex::new(Script::default())), budget);
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        command_tx.send(vec![0]).unwrap();
+        worker.commands = command_tx;
+        assert_eq!(
+            worker.put(b"full\n".to_vec(), now),
+            Err(PutFrameError::Busy(b"full\n".to_vec()))
+        );
+        assert_eq!(worker.step(now + budget), Ok(WriteStep::Idle));
+        drop(command_rx);
+
+        let too_large = vec![0; agent24_sidecar_host_protocol::MAX_CONTROL_FRAME_BYTES + 1];
+        assert_eq!(
+            worker.put(too_large.clone(), now + budget),
+            Err(PutFrameError::TooLarge(too_large))
+        );
+        assert_eq!(worker.step(now + budget), Ok(WriteStep::Idle));
+    }
+
+    #[test]
+    fn pending_before_deadline_and_busy_admission_do_not_extend_it() {
+        let now = Instant::now();
+        let budget = Duration::from_secs(1);
+        let mut worker = worker_with_budget(Arc::new(Mutex::new(Script::default())), budget);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let old = std::mem::replace(&mut worker.results, result_rx);
+        drop(old);
+
+        worker.put(b"held\n".to_vec(), now).unwrap();
+        assert_eq!(
+            worker.step(now + budget - Duration::from_nanos(1)),
+            Ok(WriteStep::Pending)
+        );
+        assert_eq!(
+            worker.put(b"second\n".to_vec(), now + budget - Duration::from_nanos(1)),
+            Err(PutFrameError::Busy(b"second\n".to_vec()))
+        );
+        assert_eq!(
+            worker.step(now + budget),
+            Err(OutputWriteError::Io(io::ErrorKind::TimedOut))
+        );
+        drop(result_tx);
+    }
+
+    #[test]
+    fn command_channel_disconnect_is_terminal_without_creating_a_lease() {
+        let now = Instant::now();
+        let mut worker = worker(Arc::new(Mutex::new(Script::default())));
+        let (commands, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        worker.commands = commands;
+
+        assert_eq!(
+            worker.put(b"closed\n".to_vec(), now),
+            Err(PutFrameError::Closed(b"closed\n".to_vec()))
+        );
+        assert_eq!(worker.step(now), Err(OutputWriteError::Closed));
+    }
+
+    #[test]
+    fn deadline_is_inclusive_and_has_priority_over_a_queued_completion() {
+        let now = Instant::now();
+        let budget = Duration::from_secs(1);
+        let mut worker = worker_with_budget(Arc::new(Mutex::new(Script::default())), budget);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let old = std::mem::replace(&mut worker.results, result_rx);
+        drop(old);
+
+        worker.put(b"late\n".to_vec(), now).unwrap();
+        result_tx.send(Ok(())).unwrap();
+        assert_eq!(
+            worker.step(now + budget),
+            Err(OutputWriteError::Io(io::ErrorKind::TimedOut))
+        );
+        assert_eq!(worker.step(now), Err(OutputWriteError::Closed));
+        assert_eq!(
+            worker.put(b"again\n".to_vec(), now),
+            Err(PutFrameError::Closed(b"again\n".to_vec()))
+        );
+    }
+
+    #[test]
+    fn zero_and_overflow_budgets_expire_without_panicking() {
+        let now = Instant::now();
+        for budget in [Duration::ZERO, Duration::MAX] {
+            let mut worker = worker_with_budget(Arc::new(Mutex::new(Script::default())), budget);
+            worker.put(b"deadline\n".to_vec(), now).unwrap();
+            assert_eq!(
+                worker.step(now),
+                Err(OutputWriteError::Io(io::ErrorKind::TimedOut))
+            );
+        }
     }
 }
