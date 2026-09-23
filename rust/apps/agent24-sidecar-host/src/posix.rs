@@ -357,14 +357,29 @@ impl OwnedGeneration {
                 "generation has been reaped",
             ));
         }
-        match killpg(self.group, signal) {
-            Ok(()) | Err(Errno::ESRCH) => {}
-            // macOS reports EPERM for an exited leader whose whole group is
-            // zombies. Accept that only after waitpid WNOWAIT confirms this
-            // exact child has exited; EPERM with a live leader is real.
-            Err(Errno::EPERM) if self.leader_exited()? => {}
-            Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
-        }
+        let result = killpg(self.group, signal);
+        let observation = if result == Err(Errno::EPERM) {
+            self.observe_exit()
+        } else {
+            Ok(ExitObservation::Running)
+        };
+        self.apply_signal_result(
+            result,
+            next,
+            cfg!(target_os = "macos") && signal == Signal::SIGKILL,
+            observation,
+        )?;
+        Ok(())
+    }
+
+    fn apply_signal_result(
+        &mut self,
+        result: Result<(), Errno>,
+        next: Phase,
+        darwin: bool,
+        observation: io::Result<ExitObservation>,
+    ) -> io::Result<()> {
+        signal_accepted(result, darwin, || observation)?;
         self.phase = next;
         Ok(())
     }
@@ -672,6 +687,25 @@ fn invalid_state(message: &'static str) -> io::Error {
 
 fn timeout_error(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
+/// Darwin can reject a signal to an all-zombie process group with `EPERM`
+/// before the exact leader's exit is visible through WNOWAIT. That narrow
+/// window is a pending force request, not a permission failure: retaining the
+/// child and permit lets the actor retry without risking PID/PGID reuse.
+fn signal_accepted<O>(result: Result<(), Errno>, darwin: bool, observe: O) -> io::Result<()>
+where
+    O: FnOnce() -> io::Result<ExitObservation>,
+{
+    match result {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(Errno::EPERM) => match observe()? {
+            ExitObservation::Exited { .. } => Ok(()),
+            ExitObservation::Running if darwin => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            ExitObservation::Running => Err(io::Error::from_raw_os_error(Errno::EPERM as i32)),
+        },
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+    }
 }
 
 fn group_is_empty(group: Pid) -> bool {
@@ -1159,19 +1193,79 @@ pub(crate) mod tests {
         );
     }
 
-    /// This exercises the macOS all-zombie `killpg(SIGKILL) -> EPERM` case.
-    /// Other platforms do not claim this regression because their kernel
-    /// reports a different result for an exited, unreaped process group.
-    #[cfg(target_os = "macos")]
     #[test]
-    fn macos_exited_unreaped_group_eperm_is_retry_safe() {
+    fn injected_darwin_eperm_pending_retains_owner_then_succeeds() {
         let _test_guard = test_lock();
-        let mut generation = exiting_generation();
-        assert!(matches!(
-            generation.wait_for_leader_exit(std::time::Duration::from_secs(1)),
-            Ok(true)
-        ));
-        assert!(generation.force_kill().is_ok());
-        assert!(generation.reap_after_stop().is_ok());
+        let mut generation = sleeping_generation();
+        let error = match generation.apply_signal_result(
+            Err(Errno::EPERM),
+            Phase::ForceKillRequested,
+            true,
+            Ok(ExitObservation::Running),
+        ) {
+            Ok(()) => panic!("Darwin pending force must retry"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::WouldBlock,
+            "Darwin pending force must be distinguishable from permission denial"
+        );
+        assert_eq!(generation.phase, Phase::Running);
+        assert!(generation.child.is_some());
+        assert!(generation.permit.is_some());
+        assert!(global_reaper().reserve().is_err());
+
+        generation
+            .apply_signal_result(
+                Ok(()),
+                Phase::ForceKillRequested,
+                true,
+                Ok(ExitObservation::Running),
+            )
+            .unwrap_or_else(|error| panic!("injected force success: {error}"));
+        assert_eq!(generation.phase, Phase::ForceKillRequested);
+        assert!(generation.child.is_some());
+        assert!(generation.permit.is_some());
+        drop(generation);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn injected_darwin_eperm_after_exit_advances_force_phase() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        generation
+            .apply_signal_result(
+                Err(Errno::EPERM),
+                Phase::ForceKillRequested,
+                true,
+                Ok(ExitObservation::Exited { code: None }),
+            )
+            .unwrap_or_else(|error| panic!("exited leader must accept EPERM: {error}"));
+        assert_eq!(generation.phase, Phase::ForceKillRequested);
+        assert!(generation.child.is_some());
+        assert!(generation.permit.is_some());
+        drop(generation);
+        wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn injected_non_darwin_eperm_remains_permission_denied() {
+        let _test_guard = test_lock();
+        let mut generation = sleeping_generation();
+        let error = match generation.apply_signal_result(
+            Err(Errno::EPERM),
+            Phase::ForceKillRequested,
+            false,
+            Ok(ExitObservation::Running),
+        ) {
+            Ok(()) => panic!("non-Darwin EPERM must remain a failure"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(generation.phase, Phase::Running);
+        drop(generation);
+        wait_for_reaper_idle();
     }
 }
