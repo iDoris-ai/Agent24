@@ -64,6 +64,7 @@ pub(crate) struct LaunchOrder<L, S> {
     gate: ReadyGate,
     held_ready: Option<Event>,
     stage: LaunchOrderStage,
+    pre_owned_output: bool,
 }
 
 impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
@@ -74,6 +75,7 @@ impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
             gate: ReadyGate::new(),
             held_ready: None,
             stage: LaunchOrderStage::Contained,
+            pre_owned_output: false,
         }
     }
 
@@ -97,6 +99,28 @@ impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
     }
 
     pub(crate) fn output_step(&mut self, now: Instant) -> Result<WriteStep, LaunchOrderStage> {
+        if self.stage == LaunchOrderStage::Contained {
+            if !self.pre_owned_output {
+                return self.fail();
+            }
+            return match self.sink.step(now) {
+                Ok(WriteStep::Complete) => {
+                    self.pre_owned_output = false;
+                    Ok(WriteStep::Complete)
+                }
+                Ok(WriteStep::Pending) => Ok(WriteStep::Pending),
+                Ok(WriteStep::Idle) | Err(_) => self.fail(),
+            };
+        }
+        if matches!(
+            self.stage,
+            LaunchOrderStage::AwaitReady | LaunchOrderStage::Ready
+        ) {
+            return self
+                .sink
+                .step(now)
+                .map_err(|_| LaunchOrderStage::CleanupRequired);
+        }
         if self.stage != LaunchOrderStage::OwnedPending {
             return self.fail();
         }
@@ -112,6 +136,27 @@ impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
             Err(OutputWriteError::Io(io::ErrorKind::TimedOut)) => self.fail_preserving_ready(),
             Ok(WriteStep::Idle) | Err(_) => self.fail(),
         }
+    }
+
+    /// Admit one already-encoded non-ownership frame to the one output sink.
+    /// Ownership itself is deliberately kept on `queue_owned`: it is the
+    /// transition which starts the Ready deadline.
+    pub(crate) fn put_frame(
+        &mut self,
+        frame: Vec<u8>,
+        now: Instant,
+    ) -> Result<(), LaunchOrderStage> {
+        if self.stage == LaunchOrderStage::CleanupRequired {
+            return self.fail();
+        }
+        let result = self
+            .sink
+            .put(frame, now)
+            .map_err(|_| LaunchOrderStage::CleanupRequired);
+        if result.is_ok() && self.stage == LaunchOrderStage::Contained {
+            self.pre_owned_output = true;
+        }
+        result
     }
 
     pub(crate) fn ready(&mut self, input: &[u8]) -> Result<Option<Event>, LaunchOrderStage> {
@@ -175,26 +220,6 @@ pub(crate) trait LaunchControl {
     fn cleanup(&mut self, phase: &mut Phase) -> Result<TreeObservation, CleanupStepError>;
 }
 
-#[cfg(any(unix, windows))]
-impl LaunchControl for OwnedLaunch {
-    fn stop(&mut self, force: bool) -> io::Result<()> {
-        if force {
-            self.target_mut().request_stop(true)
-        } else {
-            self.parts_mut().1.close_stdin();
-            self.target_mut().request_stop(false)
-        }
-    }
-
-    fn observe_exit(&mut self) -> io::Result<ExitObservation> {
-        self.target_mut().observe_exit()
-    }
-
-    fn cleanup(&mut self, phase: &mut Phase) -> Result<TreeObservation, CleanupStepError> {
-        crate::cleanup::cleanup_step(phase, self.target_mut())
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActorLaunchOrderError {
     CleanupRequired,
@@ -211,6 +236,7 @@ pub(crate) struct ActorLaunchOrder<L, S> {
     released_ready: Option<Event>,
     terminal: Option<ActorLaunchOrderError>,
     force_ok: bool,
+    pending_exit: Option<Event>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,7 +254,56 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             released_ready: None,
             terminal: None,
             force_ok: false,
+            pending_exit: None,
         }
+    }
+
+    pub(crate) const fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Advance deadlines and make one non-consuming leader observation.
+    /// The caller owns scheduling; repeated idle ticks never renew deadlines.
+    pub(crate) fn tick(&mut self, now: Instant) -> Result<Option<Event>, ActorLaunchOrderError> {
+        if let Some(error) = self.terminal {
+            return Err(error);
+        }
+        self.advance(now);
+        match self.phase {
+            Phase::GracefulStopping(_) => return Ok(None),
+            Phase::Empty => return Ok(self.pending_exit.take()),
+            Phase::ForceStopping(_) | Phase::Draining(_) | Phase::Unconfirmed => {
+                self.try_force()?;
+                return Ok(self.pending_exit.take());
+            }
+            _ => {}
+        }
+        if !matches!(self.phase, Phase::AwaitReady(_) | Phase::Running)
+            || self.pending_exit.is_some()
+        {
+            return Ok(None);
+        }
+        match self.order.launch.observe_exit() {
+            Ok(ExitObservation::Running) => Ok(None),
+            Ok(ExitObservation::Exited { code }) => {
+                self.pending_exit = Some(Event::Exit {
+                    protocol: PROTOCOL_VERSION,
+                    code,
+                });
+                self.phase = self
+                    .phase
+                    .stop(true, now, self.limits)
+                    .map_err(|_| self.latch(ActorLaunchOrderError::InvalidTransition))?;
+                self.try_force()?;
+                Ok(self.pending_exit.take())
+            }
+            Err(error) => Err(ActorLaunchOrderError::Observe(error.kind())),
+        }
+    }
+
+    /// Latch a transport failure and retain the owner exclusively for cleanup.
+    pub(crate) fn fail_transport(&mut self, now: Instant) -> ActorLaunchOrderError {
+        self.fail_force(now)
     }
 
     pub(crate) fn queue_owned(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError> {
@@ -247,10 +322,8 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
     }
 
     pub(crate) fn output_step(&mut self, now: Instant) -> Result<WriteStep, ActorLaunchOrderError> {
-        self.check()?;
-        self.advance(now);
-        if self.stopping() {
-            return Err(self.fail_force(now));
+        if let Some(error) = self.terminal {
+            return Err(error);
         }
         let step = self
             .order
@@ -258,11 +331,26 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             .map_err(|_| self.fail_force(now))?;
         if step == WriteStep::Complete
             && let Some(event) = self.order.take_ready()
+            && !self.stopping()
         {
             self.phase_ready(now)?;
             self.released_ready = Some(event);
         }
         Ok(step)
+    }
+
+    /// The runtime's only bounded output-admission seam after `Owned`.
+    pub(crate) fn put_frame(
+        &mut self,
+        frame: Vec<u8>,
+        now: Instant,
+    ) -> Result<(), ActorLaunchOrderError> {
+        if let Some(error) = self.terminal {
+            return Err(error);
+        }
+        self.order
+            .put_frame(frame, now)
+            .map_err(|_| self.fail_force(now))
     }
 
     pub(crate) fn ready(
@@ -404,7 +492,12 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
     }
 
     fn fail_force(&mut self, now: Instant) -> ActorLaunchOrderError {
-        self.phase = Phase::ForceStopping(now + self.limits.force);
+        if !matches!(
+            self.phase,
+            Phase::ForceStopping(_) | Phase::Draining(_) | Phase::Unconfirmed
+        ) {
+            self.phase = Phase::ForceStopping(now + self.limits.force);
+        }
         let _ = self.try_force();
         // The output deadline is a control-plane failure, not a transfer of
         // process ownership. Keep a captured READY event available to cleanup
@@ -1134,13 +1227,143 @@ mod tests {
         assert!(matches!(force_first.phase, Phase::ForceStopping(_)));
     }
 
+    #[test]
+    fn runtime_tick_keeps_absolute_ready_deadline_and_reaps_one_exit() {
+        let now = Instant::now();
+        let deadline = now + LIMITS.ready;
+        let mut late = actor([Ok(())], [], vec![]);
+        late.phase = Phase::AwaitReady(deadline);
+        assert_eq!(late.tick(deadline), Ok(None));
+        assert_eq!(late.phase(), Phase::ForceStopping(deadline + LIMITS.force));
+        assert_eq!(late.order.launch.forces, vec![true]);
+
+        let grace_deadline = now + LIMITS.graceful;
+        let mut graceful = actor([], [], vec![]);
+        graceful.phase = Phase::GracefulStopping(grace_deadline);
+        assert_eq!(graceful.tick(now), Ok(None));
+        assert_eq!(graceful.phase(), Phase::GracefulStopping(grace_deadline));
+        assert!(graceful.order.launch.forces.is_empty());
+        let mut empty = actor([], [], vec![]);
+        empty.phase = Phase::Empty;
+        assert_eq!(empty.tick(now), Ok(None));
+        assert_eq!(empty.phase(), Phase::Empty);
+
+        let mut exited = actor([Ok(())], [Ok(TreeObservation::ConfirmedEmpty)], vec![]);
+        exited.phase = Phase::Running;
+        exited
+            .order
+            .launch
+            .observations
+            .push_back(Ok(ExitObservation::Exited { code: Some(9) }));
+        assert!(matches!(
+            exited.tick(now),
+            Ok(Some(Event::Exit { code: Some(9), .. }))
+        ));
+        assert_eq!(exited.order.launch.observed, 1);
+        assert_eq!(
+            exited.cleanup_tick(now),
+            Ok(TreeObservation::ConfirmedEmpty)
+        );
+        assert_eq!(exited.order.launch.observed, 1);
+    }
+
+    #[test]
+    fn runtime_tick_preserves_exit_across_force_retry() {
+        let now = Instant::now();
+        let mut exited = actor(
+            [io_error(io::ErrorKind::BrokenPipe), Ok(())],
+            [Ok(TreeObservation::ConfirmedEmpty)],
+            vec![],
+        );
+        exited.phase = Phase::Running;
+        exited
+            .order
+            .launch
+            .observations
+            .push_back(Ok(ExitObservation::Exited { code: Some(9) }));
+
+        assert_eq!(
+            exited.tick(now),
+            Err(ActorLaunchOrderError::Stop(io::ErrorKind::BrokenPipe))
+        );
+        assert!(matches!(exited.phase(), Phase::ForceStopping(_)));
+        assert_eq!(
+            exited.cleanup_tick(now),
+            Ok(TreeObservation::ConfirmedEmpty)
+        );
+        assert!(matches!(
+            exited.tick(now),
+            Ok(Some(Event::Exit { code: Some(9), .. }))
+        ));
+        assert_eq!(exited.order.launch.observed, 1);
+        assert_eq!(exited.order.launch.forces, vec![true, true]);
+    }
+
+    #[test]
+    fn held_ready_completed_during_shutdown_does_not_fail_output() {
+        let now = Instant::now();
+        let mut actor = actor(
+            [Ok(())],
+            [],
+            vec![Ok(WriteStep::Pending), Ok(WriteStep::Complete)],
+        );
+        queue_ready(&mut actor, now);
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Pending));
+
+        assert_eq!(actor.tick(now + LIMITS.ready), Ok(None));
+        assert!(matches!(actor.phase(), Phase::ForceStopping(_)));
+        assert_eq!(
+            actor.output_step(now + LIMITS.ready),
+            Ok(WriteStep::Complete)
+        );
+        assert!(actor.order.held_ready.is_none());
+        assert!(actor.take_ready().is_none());
+        assert!(actor.terminal.is_none());
+    }
+
+    #[test]
+    fn runtime_transport_failure_forces_while_sink_is_pending() {
+        let now = Instant::now();
+        let mut actor = actor(
+            [Ok(())],
+            [Ok(TreeObservation::ConfirmedEmpty)],
+            vec![Ok(WriteStep::Pending)],
+        );
+        actor.queue_owned(now).unwrap();
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(
+            actor.fail_transport(now),
+            ActorLaunchOrderError::CleanupRequired
+        );
+        assert_eq!(actor.order.launch.forces, vec![true]);
+        assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
+    }
+
+    #[test]
+    fn output_health_is_independent_of_stopping_and_pre_owned_lifecycle() {
+        let now = Instant::now();
+        let mut failed_launch = actor([], [], vec![Ok(WriteStep::Complete)]);
+        failed_launch
+            .put_frame(b"launch-failed\n".to_vec(), now)
+            .unwrap();
+        assert_eq!(failed_launch.output_step(now), Ok(WriteStep::Complete));
+        assert!(failed_launch.order.sink.frame.is_some());
+
+        let mut stopped = actor([], [], vec![Ok(WriteStep::Complete)]);
+        stopped.phase = Phase::Empty;
+        stopped.order.stage = LaunchOrderStage::Ready;
+        stopped.put_frame(b"exit\n".to_vec(), now).unwrap();
+        assert_eq!(stopped.output_step(now), Ok(WriteStep::Complete));
+    }
+
     fn force_and_reap(launch: &mut OwnedLaunch) -> io::Result<()> {
         use std::time::Duration;
 
         let force = LaunchControl::stop(launch, true);
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut phase = Phase::ForceStopping(Instant::now() + Duration::from_secs(10));
         let reap = loop {
-            match launch.target_mut().reap_step() {
+            match LaunchControl::cleanup(launch, &mut phase) {
                 Ok(TreeObservation::ConfirmedEmpty) => break Ok(()),
                 Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
                 Ok(_) => {
@@ -1149,7 +1372,8 @@ mod tests {
                         "reap deadline expired",
                     ));
                 }
-                Err(error) => break Err(error),
+                Err(CleanupStepError::Reap(error)) => break Err(error),
+                Err(CleanupStepError::Phase(_)) => break Err(io::Error::other("invalid phase")),
             }
         };
         force?;
@@ -1200,7 +1424,7 @@ mod tests {
             OwnedLaunch::start(crate::launch::LaunchIntent::from_request(request).unwrap())
                 .unwrap();
         let (stdout_pipe, stderr_pipe) = {
-            let pipes = launch.parts_mut().1;
+            let pipes = launch.pipes_mut();
             let Some(stdout) = pipes.take_stdout() else {
                 panic!("stdout moves once");
             };
@@ -1212,7 +1436,7 @@ mod tests {
         let ready = finish_bounded_read(start_bounded_read::<6, _>(stdout_pipe));
         let first_stop = LaunchControl::stop(&mut launch, false);
         let second_stop = LaunchControl::stop(&mut launch, false);
-        let stdin_closed = launch.parts_mut().1.stdin_mut().is_none();
+        let stdin_closed = launch.pipes_mut().stdin_mut().is_none();
         let (ready, stdout_pipe) = match ready {
             Ok((ready, stdout_pipe)) => (Ok(ready), Some(stdout_pipe)),
             Err(error) => (Err(error), None),
@@ -1249,7 +1473,7 @@ mod tests {
             OwnedLaunch::start(crate::launch::LaunchIntent::from_request(request).unwrap())
                 .unwrap();
         let (mut stdout_pipe, mut stderr_pipe) = {
-            let pipes = launch.parts_mut().1;
+            let pipes = launch.pipes_mut();
             let Some(stdout) = pipes.take_stdout() else {
                 panic!("stdout moves once");
             };
@@ -1260,7 +1484,7 @@ mod tests {
         };
         let first_stop = LaunchControl::stop(&mut launch, false);
         let second_stop = LaunchControl::stop(&mut launch, false);
-        let stdin_closed = launch.parts_mut().1.stdin_mut().is_none();
+        let stdin_closed = launch.pipes_mut().stdin_mut().is_none();
         let mut out = [0; 8];
         let stdout = tokio::time::timeout(Duration::from_secs(3), stdout_pipe.read_exact(&mut out))
             .await
