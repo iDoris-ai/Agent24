@@ -240,6 +240,7 @@ pub(crate) struct ActorLaunchOrder<L, S> {
     terminal: Option<ActorLaunchOrderError>,
     force_ok: bool,
     force_attempted: bool,
+    force_attempted_this_turn: bool,
     pending_exit: Option<Event>,
     outbox: Outbox,
 }
@@ -276,6 +277,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             terminal: None,
             force_ok: false,
             force_attempted: false,
+            force_attempted_this_turn: false,
             pending_exit: None,
             outbox: Outbox::default(),
         }
@@ -283,6 +285,13 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
 
     pub(crate) const fn phase(&self) -> Phase {
         self.phase
+    }
+
+    /// Reset the driver's per-turn force guard before it invokes any actor
+    /// operation.  This prevents a maintenance force and an output failure
+    /// from issuing two native force attempts in one scheduler turn.
+    pub(crate) fn begin_turn(&mut self) {
+        self.force_attempted_this_turn = false;
     }
 
     pub(crate) fn schedule_state(&self) -> ScheduleState {
@@ -576,6 +585,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             };
         }
         self.force_attempted |= force;
+        self.force_attempted_this_turn |= force;
         match self.order.launch.stop(force) {
             Ok(()) => {
                 self.force_ok |= force;
@@ -665,13 +675,17 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
     }
 
     fn fail_force(&mut self, now: Instant) -> ActorLaunchOrderError {
-        if !matches!(
-            self.phase,
-            Phase::ForceStopping(_) | Phase::Draining(_) | Phase::Unconfirmed
-        ) {
+        if !matches!(self.phase, Phase::Empty)
+            && !matches!(
+                self.phase,
+                Phase::ForceStopping(_) | Phase::Draining(_) | Phase::Unconfirmed
+            )
+        {
             self.phase = Phase::ForceStopping(now + self.limits.force);
         }
-        let _ = self.try_force();
+        if !self.force_attempted_this_turn && !matches!(self.phase, Phase::Empty) {
+            let _ = self.try_force();
+        }
         // The output deadline is a control-plane failure, not a transfer of
         // process ownership. Keep a captured READY event available to cleanup
         // diagnostics while permanently latching the actor.
@@ -691,6 +705,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         if self.force_ok {
             return Ok(ForceAttempt::Confirmed);
         }
+        self.force_attempted_this_turn = true;
         self.force_attempted = true;
         match self.order.launch.stop(true) {
             Ok(()) => {

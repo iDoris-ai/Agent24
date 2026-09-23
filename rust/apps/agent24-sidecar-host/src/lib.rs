@@ -13,6 +13,8 @@ mod control_io;
 #[allow(dead_code)]
 mod control_worker;
 #[allow(dead_code)]
+mod generation_driver;
+#[allow(dead_code)]
 mod launch;
 #[allow(dead_code)]
 mod launch_order;
