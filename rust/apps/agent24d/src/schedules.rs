@@ -31,6 +31,22 @@ fn map_error(err: ScheduleError) -> Response {
                 "storage error",
             )
         }
+        // ME4-1.2.2c1 stopgap: `agent24-scheduler` gained these variants in
+        // this same cut (module-row PATCH/suspend/resume guardrails, design
+        // §8.2/§8.3), but nothing on THIS side constructs them yet — the
+        // REST routes/error mapping that produce them land in the stacked
+        // ME4-1.2.2c-rest-guards cut. Kept as one internal-error catch-all
+        // purely to keep this match exhaustive in the meantime; replaced
+        // there with the real per-variant 409 mapping (module_owned_schedule
+        // / not_a_module_schedule / schedule_conflict / quota_exceeded).
+        ScheduleError::ModuleOwned(_)
+        | ScheduleError::NotModuleOwned(_)
+        | ScheduleError::Conflict(_)
+        | ScheduleError::QuotaExceeded(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "unmapped schedule error (ME4-1.2.2c-rest-guards not yet applied)",
+        ),
     }
 }
 
