@@ -1,4 +1,6 @@
-use agent24_sidecar_host_protocol::{Event, PROTOCOL_VERSION, Reply, encode_reply};
+use agent24_sidecar_host_protocol::{
+    ErrorCode, Event, PROTOCOL_VERSION, Reply, Request, encode_reply,
+};
 
 use crate::{
     actor::{Deadlines, Phase},
@@ -237,8 +239,25 @@ pub(crate) struct ActorLaunchOrder<L, S> {
     released_ready: Option<Event>,
     terminal: Option<ActorLaunchOrderError>,
     force_ok: bool,
+    force_attempted: bool,
     pending_exit: Option<Event>,
     outbox: Outbox,
+}
+
+/// The scheduler gets facts, not the actor's owner, sink, or bounded outbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScheduleState {
+    pub(crate) phase: Phase,
+    pub(crate) terminal: bool,
+    pub(crate) output_pending: bool,
+    pub(crate) exit_retained: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DispatchStep {
+    Idle,
+    Blocked,
+    Replied,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +275,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             released_ready: None,
             terminal: None,
             force_ok: false,
+            force_attempted: false,
             pending_exit: None,
             outbox: Outbox::default(),
         }
@@ -263,6 +283,89 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
 
     pub(crate) const fn phase(&self) -> Phase {
         self.phase
+    }
+
+    pub(crate) fn schedule_state(&self) -> ScheduleState {
+        ScheduleState {
+            phase: self.phase,
+            terminal: self.terminal.is_some()
+                || self.order.stage == LaunchOrderStage::CleanupRequired,
+            output_pending: self.output_pending(),
+            exit_retained: self.exit_retained(),
+        }
+    }
+
+    /// Run exactly one lifecycle path.  A stopping actor never receives a
+    /// second force attempt from `tick` and `cleanup_tick` in the same turn.
+    pub(crate) fn maintenance(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError> {
+        if self.schedule_state().terminal || self.stopping() {
+            self.cleanup_tick(now).map(|_| ())
+        } else {
+            self.tick(now).map(|_| ())
+        }
+    }
+
+    /// Consume one completed request only when its reply can be admitted
+    /// without overtaking output or an observed Exit.  The caller owns the
+    /// one-slot completed-request buffer; this actor never creates a queue.
+    pub(crate) fn dispatch_completed(
+        &mut self,
+        completed: &mut Option<Request>,
+        now: Instant,
+    ) -> Result<DispatchStep, ActorLaunchOrderError> {
+        if completed.is_none() {
+            return Ok(DispatchStep::Idle);
+        }
+        self.advance(now);
+        if !self.completed_request_dispatch_allowed() {
+            return Ok(DispatchStep::Blocked);
+        }
+
+        let Some(request) = completed.take() else {
+            return Ok(DispatchStep::Idle);
+        };
+        let reply = match request {
+            Request::Launch { request_id, .. } => Reply::Error {
+                version: PROTOCOL_VERSION,
+                request_id,
+                code: ErrorCode::InvalidRequest,
+            },
+            Request::IsEmpty { request_id, .. } => Reply::Empty {
+                version: PROTOCOL_VERSION,
+                request_id,
+                empty: matches!(self.phase, Phase::Empty),
+            },
+            Request::Signal { request_id, .. } if matches!(self.phase, Phase::Unconfirmed) => {
+                Reply::Error {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    code: ErrorCode::SignalFailed,
+                }
+            }
+            Request::Signal {
+                request_id, force, ..
+            } => match self.stop(force, now) {
+                Ok(()) => Reply::Result {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                },
+                // A non-blocking native signal can race its publication. The
+                // actor retains containment and emits only this static code.
+                Err(ActorLaunchOrderError::Stop(io::ErrorKind::WouldBlock))
+                    if self.terminal.is_none() =>
+                {
+                    Reply::Error {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        code: ErrorCode::SignalFailed,
+                    }
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        self.queue_reply(&reply)
+            .map_err(|_| self.fail_transport(now))?;
+        Ok(DispatchStep::Replied)
     }
 
     /// Advance deadlines and make one non-consuming leader observation.
@@ -393,7 +496,11 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
     }
 
     pub(crate) fn completed_request_dispatch_allowed(&self) -> bool {
-        !self.exit_retained()
+        let state = self.schedule_state();
+        !state.terminal
+            && !state.exit_retained
+            && !state.output_pending
+            && self.owned_acknowledged()
     }
 
     pub(crate) fn ready(
@@ -455,6 +562,20 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             .phase
             .stop(force, now, self.limits)
             .map_err(|_| self.latch(ActorLaunchOrderError::InvalidTransition))?;
+        if force
+            && self.force_attempted
+            && matches!(
+                self.phase,
+                Phase::ForceStopping(_) | Phase::Draining(_) | Phase::Unconfirmed
+            )
+        {
+            return if self.force_ok {
+                Ok(())
+            } else {
+                Err(ActorLaunchOrderError::Stop(io::ErrorKind::WouldBlock))
+            };
+        }
+        self.force_attempted |= force;
         match self.order.launch.stop(force) {
             Ok(()) => {
                 self.force_ok |= force;
@@ -570,6 +691,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         if self.force_ok {
             return Ok(ForceAttempt::Confirmed);
         }
+        self.force_attempted = true;
         match self.order.launch.stop(true) {
             Ok(()) => {
                 self.force_ok = true;
@@ -598,6 +720,19 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
 
     fn exit_retained(&self) -> bool {
         self.pending_exit.is_some() || self.outbox.exit_retained()
+    }
+
+    fn output_pending(&self) -> bool {
+        self.outbox.has_work()
+            || self.order.pre_owned_output
+            || self.order.stage == LaunchOrderStage::OwnedPending
+    }
+
+    fn owned_acknowledged(&self) -> bool {
+        matches!(
+            self.order.stage,
+            LaunchOrderStage::AwaitReady | LaunchOrderStage::Ready
+        )
     }
 }
 
@@ -833,6 +968,36 @@ mod tests {
     fn queue_ready(actor: &mut ActorLaunchOrder<ScriptLaunch, FakeSink>, now: Instant) {
         actor.queue_owned(now).unwrap();
         assert_eq!(actor.ready(now, ready()), Ok(None));
+    }
+
+    fn dispatcher(
+        stops: impl IntoIterator<Item = io::Result<()>>,
+        steps: Vec<Result<WriteStep, OutputWriteError>>,
+    ) -> ActorLaunchOrder<ScriptLaunch, FakeSink> {
+        let mut actor = actor(stops, [], steps);
+        actor.phase = Phase::Running;
+        actor.order.stage = LaunchOrderStage::Ready;
+        actor
+    }
+
+    fn flush_reply(actor: &mut ActorLaunchOrder<ScriptLaunch, FakeSink>, now: Instant) {
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Complete));
+    }
+
+    fn signal(request_id: u64, force: bool) -> Request {
+        Request::Signal {
+            version: PROTOCOL_VERSION,
+            request_id,
+            force,
+        }
+    }
+
+    fn is_empty(request_id: u64) -> Request {
+        Request::IsEmpty {
+            version: PROTOCOL_VERSION,
+            request_id,
+        }
     }
 
     #[test]
@@ -1548,6 +1713,301 @@ mod tests {
         stopped.put_frame(b"exit\n".to_vec(), now).unwrap();
         assert_eq!(stopped.output_step(now), Ok(WriteStep::Pending));
         assert_eq!(stopped.output_step(now), Ok(WriteStep::Complete));
+    }
+
+    #[test]
+    fn dispatcher_waits_for_owned_ack_before_consuming_a_completed_request() {
+        let now = Instant::now();
+        let mut actor = actor(
+            [],
+            [],
+            vec![Ok(WriteStep::Complete), Ok(WriteStep::Complete)],
+        );
+        let mut request = Some(signal(1, true));
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Blocked)
+        );
+        assert!(request.is_some());
+
+        actor.queue_owned(now).unwrap();
+        let mut empty = Some(is_empty(2));
+        assert_eq!(
+            actor.dispatch_completed(&mut empty, now),
+            Ok(DispatchStep::Blocked)
+        );
+        assert!(empty.is_some());
+        assert_eq!(actor.output_step(now), Ok(WriteStep::Complete));
+        assert!(actor.completed_request_dispatch_allowed());
+        assert_eq!(
+            actor.dispatch_completed(&mut empty, now),
+            Ok(DispatchStep::Replied)
+        );
+        flush_reply(&mut actor, now);
+        assert!(matches!(
+            decode_reply(&actor.order.sink.frames[0]),
+            Ok(Reply::Owned { .. })
+        ));
+    }
+
+    #[test]
+    fn owned_dispatch_maps_signal_empty_and_launch_without_new_ownership() {
+        let now = Instant::now();
+        let mut actor = dispatcher(
+            [Ok(())],
+            vec![
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Complete),
+            ],
+        );
+
+        let mut request = Some(signal(11, true));
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        assert!(request.is_none());
+        assert!(matches!(
+            actor.schedule_state().phase,
+            Phase::ForceStopping(_)
+        ));
+        flush_reply(&mut actor, now);
+        assert!(matches!(
+            decode_reply(&actor.order.sink.frames[0]),
+            Ok(Reply::Result { request_id: 11, .. })
+        ));
+
+        let mut request = Some(is_empty(12));
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        flush_reply(&mut actor, now);
+        assert!(matches!(
+            decode_reply(&actor.order.sink.frames[1]),
+            Ok(Reply::Empty {
+                request_id: 12,
+                empty: false,
+                ..
+            })
+        ));
+
+        let mut request = Some(Request::Launch {
+            version: PROTOCOL_VERSION,
+            request_id: 13,
+            executable: "/ignored".into(),
+            cwd: "/".into(),
+            argv: vec![],
+            env: BTreeMap::new(),
+        });
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        flush_reply(&mut actor, now);
+        assert!(matches!(
+            decode_reply(&actor.order.sink.frames[2]),
+            Ok(Reply::Error {
+                request_id: 13,
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        actor.phase = Phase::Empty;
+        let mut request = Some(is_empty(14));
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        flush_reply(&mut actor, now);
+        assert!(matches!(
+            decode_reply(&actor.order.sink.frames[3]),
+            Ok(Reply::Empty {
+                request_id: 14,
+                empty: true,
+                ..
+            })
+        ));
+        assert_eq!(actor.order.launch.forces, vec![true]);
+    }
+
+    #[test]
+    fn draining_deadline_signal_is_static_then_maintenance_can_confirm_empty() {
+        let now = Instant::now();
+        let mut actor = actor(
+            [Ok(())],
+            [Ok(TreeObservation::ConfirmedEmpty)],
+            vec![Ok(WriteStep::Complete)],
+        );
+        actor.phase = Phase::Draining(now);
+        actor.order.stage = LaunchOrderStage::Ready;
+        let mut request = Some(signal(31, true));
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        assert_eq!(actor.phase(), Phase::Unconfirmed);
+        flush_reply(&mut actor, now);
+        assert!(matches!(
+            decode_reply(&actor.order.sink.frames[0]),
+            Ok(Reply::Error {
+                request_id: 31,
+                code: ErrorCode::SignalFailed,
+                ..
+            })
+        ));
+        assert!(!actor.schedule_state().terminal);
+        assert_eq!(actor.maintenance(now), Ok(()));
+        assert_eq!(actor.phase(), Phase::Empty);
+        assert_eq!(actor.order.launch.forces, vec![true]);
+    }
+
+    #[test]
+    fn graceful_and_duplicate_successful_force_signals_are_nonblocking() {
+        let now = Instant::now();
+        let mut graceful = dispatcher([Ok(())], vec![Ok(WriteStep::Complete)]);
+        let mut request = Some(signal(41, false));
+        assert_eq!(
+            graceful.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        assert!(matches!(graceful.phase(), Phase::GracefulStopping(_)));
+        assert_eq!(graceful.order.launch.forces, vec![false]);
+
+        let mut forced = dispatcher(
+            [Ok(())],
+            vec![Ok(WriteStep::Complete), Ok(WriteStep::Complete)],
+        );
+        let mut request = Some(signal(42, true));
+        forced.dispatch_completed(&mut request, now).unwrap();
+        flush_reply(&mut forced, now);
+        let mut duplicate = Some(signal(43, true));
+        assert_eq!(
+            forced.dispatch_completed(&mut duplicate, now),
+            Ok(DispatchStep::Replied)
+        );
+        assert_eq!(forced.order.launch.forces, vec![true]);
+    }
+
+    #[test]
+    fn dispatcher_leaves_one_completed_request_outside_while_output_is_occupied() {
+        let now = Instant::now();
+        let mut actor = dispatcher([], vec![Ok(WriteStep::Complete), Ok(WriteStep::Complete)]);
+        actor
+            .queue_reply(&Reply::Result {
+                version: PROTOCOL_VERSION,
+                request_id: 1,
+            })
+            .unwrap();
+        let mut request = Some(is_empty(2));
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Blocked)
+        );
+        assert!(request.is_some());
+        assert!(actor.schedule_state().output_pending);
+        assert!(!actor.completed_request_dispatch_allowed());
+        flush_reply(&mut actor, now);
+        assert!(actor.completed_request_dispatch_allowed());
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        assert!(request.is_none());
+    }
+
+    #[test]
+    fn dispatcher_gates_pending_and_inflight_exit_and_retains_exit_through_empty() {
+        let now = Instant::now();
+        let exit = Event::Exit {
+            protocol: PROTOCOL_VERSION,
+            code: Some(7),
+        };
+        let mut pending = dispatcher([], vec![]);
+        pending.pending_exit = Some(exit.clone());
+        let mut request = Some(is_empty(1));
+        assert_eq!(
+            pending.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Blocked)
+        );
+        assert!(request.is_some());
+
+        let mut inflight = dispatcher([], vec![]);
+        inflight.outbox.exit(&exit).unwrap();
+        assert_eq!(inflight.output_step(now), Ok(WriteStep::Pending));
+        let mut request = Some(is_empty(2));
+        assert_eq!(
+            inflight.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Blocked)
+        );
+        assert!(inflight.schedule_state().exit_retained);
+
+        let mut empty = dispatcher([], vec![]);
+        empty.phase = Phase::Empty;
+        empty.force_ok = true;
+        empty.pending_exit = Some(exit);
+        assert_eq!(empty.maintenance(now), Ok(()));
+        assert_eq!(empty.schedule_state().phase, Phase::Empty);
+        assert!(empty.schedule_state().exit_retained);
+    }
+
+    #[test]
+    fn maintenance_uses_one_force_path_and_duplicate_signal_does_not_repeat_force() {
+        let now = Instant::now();
+        let mut actor = dispatcher(
+            [io_error(io::ErrorKind::WouldBlock)],
+            vec![Ok(WriteStep::Complete)],
+        );
+        actor.phase = Phase::ForceStopping(now + LIMITS.force);
+        assert_eq!(actor.maintenance(now), Ok(()));
+        assert_eq!(actor.order.launch.forces, vec![true]);
+        assert_eq!(actor.order.launch.reaps.len(), 0);
+
+        let mut request = Some(signal(3, true));
+        assert_eq!(
+            actor.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        assert!(request.is_none());
+        assert_eq!(actor.order.launch.forces, vec![true]);
+    }
+
+    #[test]
+    fn recoverable_signal_failure_is_static_and_fatal_failure_never_replies() {
+        let now = Instant::now();
+        let mut recoverable = dispatcher(
+            [io_error(io::ErrorKind::WouldBlock)],
+            vec![Ok(WriteStep::Complete)],
+        );
+        let mut request = Some(signal(41, true));
+        assert_eq!(
+            recoverable.dispatch_completed(&mut request, now),
+            Ok(DispatchStep::Replied)
+        );
+        flush_reply(&mut recoverable, now);
+        assert!(matches!(
+            decode_reply(&recoverable.order.sink.frames[0]),
+            Ok(Reply::Error {
+                code: ErrorCode::SignalFailed,
+                request_id: 41,
+                ..
+            })
+        ));
+        assert_eq!(recoverable.order.launch.forces, vec![true]);
+
+        let mut fatal = dispatcher([io_error(io::ErrorKind::BrokenPipe), Ok(())], vec![]);
+        let mut request = Some(signal(42, true));
+        assert_eq!(
+            fatal.dispatch_completed(&mut request, now),
+            Err(ActorLaunchOrderError::Stop(io::ErrorKind::BrokenPipe))
+        );
+        assert!(fatal.schedule_state().terminal);
+        assert!(fatal.order.sink.frames.is_empty());
+        assert_eq!(fatal.maintenance(now), Ok(()));
+        assert!(fatal.order.sink.frames.is_empty());
     }
 
     fn force_and_reap(launch: &mut OwnedLaunch) -> io::Result<()> {
