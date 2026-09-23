@@ -1,4 +1,4 @@
-name: Sidecar Windows
+name: Sidecar Cross-Platform
 
 on:
   pull_request:
@@ -13,13 +13,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: sidecar-windows-${{ github.event.pull_request.number || github.ref }}
+  group: sidecar-cross-platform-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   rust:
-    name: Rust sidecar host + protocol
-    runs-on: windows-latest
+    name: Rust sidecar host + protocol (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
 
     steps:
@@ -30,7 +33,6 @@ jobs:
           persist-credentials: false
 
       - name: Rust toolchain
-        shell: bash
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
       - name: Cache cargo
@@ -40,11 +42,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust/target
-          key: cargo-sidecar-windows-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+          key: cargo-sidecar-${{ matrix.os }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
 
       - name: fmt
         working-directory: rust
-        shell: bash
         run: cargo fmt --check --package agent24-sidecar-host --package agent24-sidecar-host-protocol
 
       - name: check
