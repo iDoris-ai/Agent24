@@ -18,6 +18,7 @@ mod allocation_registration;
 #[allow(dead_code)]
 mod allocation_reservation;
 mod allocation_retention_evidence;
+mod allocation_retention_expectation;
 mod allocation_retention_plan;
 mod allocation_types;
 mod audit;

@@ -14,6 +14,8 @@ pub(crate) struct RetentionEvidence {
     pub(crate) workspace: Option<WorkspaceRow>,
     pub(crate) audit_seq: i64,
     pub(crate) audit_ts: String,
+    pub(crate) audit_actor: String,
+    pub(crate) audit_action: String,
     pub(crate) audit_raw_detail: String,
     pub(crate) audit_prev_hash: String,
     pub(crate) audit_hash: String,
@@ -88,10 +90,10 @@ async fn source_audit(
 ) -> WorkspaceResult<(
     AllocationPhase,
     Option<WorkspaceRow>,
-    (i64, String, String, String, String),
+    (i64, String, String, String, String, String, String),
 )> {
     crate::audit::strict_audit_chain_tx(tx).await?;
-    let rows = sqlx::query("SELECT seq, ts, detail, prev_hash, hash FROM audit_log WHERE actor='workspace_allocation' AND action='workspace.allocation_retained'")
+    let rows = sqlx::query("SELECT seq, ts, actor, action, detail, prev_hash, hash FROM audit_log WHERE actor='workspace_allocation' AND action='workspace.allocation_retained'")
         .fetch_all(&mut **tx).await.map_err(|_| WorkspaceStoreError::Database)?;
     let mut event = None;
     for row in rows {
@@ -101,6 +103,12 @@ async fn source_audit(
         let ts: String = row
             .try_get("ts")
             .map_err(|_| corrupt("audit_log", "detail"))?;
+        let actor: String = row
+            .try_get("actor")
+            .map_err(|_| corrupt("audit_log", "actor"))?;
+        let action: String = row
+            .try_get("action")
+            .map_err(|_| corrupt("audit_log", "action"))?;
         let raw: String = row
             .try_get("detail")
             .map_err(|_| corrupt("audit_log", "detail"))?;
@@ -117,13 +125,14 @@ async fn source_audit(
             .and_then(serde_json::Value::as_str)
             == Some(intent.allocation_id().as_str())
             && event
-                .replace((seq, ts, raw, prev_hash, hash, value))
+                .replace((seq, ts, actor, action, raw, prev_hash, hash, value))
                 .is_some()
         {
             return Err(corrupt("audit_log", "detail"));
         }
     }
-    let (seq, ts, raw, prev_hash, hash, detail) = event.ok_or(corrupt("audit_log", "detail"))?;
+    let (seq, ts, actor, action, raw, prev_hash, hash, detail) =
+        event.ok_or(corrupt("audit_log", "detail"))?;
     if ts != record.created_at().as_str() {
         return Err(corrupt("audit_log", "detail"));
     }
@@ -159,7 +168,11 @@ async fn source_audit(
     if raw != serde_json::to_string(&expected).map_err(|_| WorkspaceStoreError::Database)? {
         return Err(corrupt("audit_log", "detail"));
     }
-    Ok((phase, workspace, (seq, ts, raw, prev_hash, hash)))
+    Ok((
+        phase,
+        workspace,
+        (seq, ts, actor, action, raw, prev_hash, hash),
+    ))
 }
 
 impl Store {
@@ -179,7 +192,15 @@ impl Store {
         let (
             source_phase,
             workspace,
-            (audit_seq, audit_ts, audit_raw_detail, audit_prev_hash, audit_hash),
+            (
+                audit_seq,
+                audit_ts,
+                audit_actor,
+                audit_action,
+                audit_raw_detail,
+                audit_prev_hash,
+                audit_hash,
+            ),
         ) = source_audit(tx, intent, &allocation).await?;
         Ok(RetentionEvidence {
             allocation,
@@ -187,6 +208,8 @@ impl Store {
             workspace,
             audit_seq,
             audit_ts,
+            audit_actor,
+            audit_action,
             audit_raw_detail,
             audit_prev_hash,
             audit_hash,
@@ -268,6 +291,8 @@ mod tests {
             assert!(
                 proof.audit_seq > 0
                     && !proof.audit_ts.is_empty()
+                    && !proof.audit_actor.is_empty()
+                    && !proof.audit_action.is_empty()
                     && !proof.audit_raw_detail.is_empty()
                     && !proof.audit_prev_hash.is_empty()
                     && !proof.audit_hash.is_empty()
