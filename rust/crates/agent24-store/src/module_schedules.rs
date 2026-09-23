@@ -1,18 +1,20 @@
-//! ME4-1.2.1a/b — module-owned schedules and their deliveries. See
-//! `docs/design/ME4-S1-scheduler-callback.md`:
+//! ME4-1.2.1a/b/c — module-owned schedules, their deliveries, and the REST
+//! guardrails on top of both. See `docs/design/ME4-S1-scheduler-callback.md`:
 //! - §2 (D1) — migration `0007_module_schedules.sql` (full table, landed in
-//!   1.2.1a), the revision rule, the tick's CAS pre-advance (1.2.1b, this
-//!   cut).
+//!   1.2.1a), the revision rule, the tick's CAS pre-advance (1.2.1b), the
+//!   REST PATCH CAS (1.2.1c, this cut).
 //! - §4 (D3) — the `schedule_deliveries` state machine's storage side
-//!   (1.2.1b, this cut): recording a fire (with supersede + prune, same
-//!   transaction as the pre-advance), applying one attempt's outcome (CAS'd),
-//!   the pump's due query, the expiry sweep.
+//!   (1.2.1b): recording a fire (with supersede + prune, same transaction as
+//!   the pre-advance), applying one attempt's outcome (CAS'd), the pump's due
+//!   query, the expiry sweep.
 //! - §6.1/§6.2 (D5) — the upsert SQL and outcome judgement, the `list`/upsert
 //!   read-model (1.2.1a).
+//! - §8.2 (D7) — suspend/resume (idempotent, with a revision CAS on resume —
+//!   review, M-2) and the PATCH write-back CAS, for both user and AgentRun
+//!   rows (1.2.1c, this cut).
 //!
-//! Stacked on top: ME4-1.2.1c (`feat/me4-1.2.1c-rest-guards`) adds
-//! suspend/resume and the REST PATCH CAS. ME4-1.2.1d
-//! (`feat/me4-1.2.1-schedule-store`) adds the tick loop's read-model.
+//! Stacked on top: ME4-1.2.1d (`feat/me4-1.2.1-schedule-store`) adds the tick
+//! loop's read-model.
 //!
 //! Scope note (task ME4-1.2.1 is store-only): the pure delivery state
 //! machine (`apply_outcome`/`FireOutcome`/`Applied`) and the trigger
@@ -26,7 +28,7 @@
 //! the `schedule_deliveries.fire_trigger` CHECK column correctly); the
 //! scheduler crate's own, richer version is a separate type.
 
-use agent24_protocol::ScheduleSpec;
+use agent24_protocol::{Schedule, ScheduleSpec};
 use serde::Serialize;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -764,11 +766,247 @@ impl Store {
     }
 }
 
+// ── §8.2 REST guardrails on the `schedules` table (ME4-1.2.1c) ─────────────
+
+/// `Scheduler::update` (REST PATCH, user rows) write-back, CAS'd on what it
+/// read (v2, M9). `revision` alone is not enough: the tick's pre-advance does
+/// NOT bump it, so the CAS also pins `next_run_at`/`last_run_at` — otherwise a
+/// PATCH that read `next_run_at = X` before a tick advanced it to `Y` writes
+/// `X` back and the slot fires twice.
+const UPDATE_USER_SCHEDULE_CAS_SQL: &str = "\
+UPDATE schedules \
+SET name = ?1, enabled = ?2, spec = ?3, action = ?4, delivery = ?5, \
+    next_run_at = ?6, consecutive_failures = ?7, revision = revision + 1 \
+WHERE id = ?8 AND owner_module IS NULL AND revision = ?9 \
+  AND next_run_at IS ?10 AND last_run_at IS ?11";
+
+/// The AgentRun path's post-fire runtime write (§2.3's closing rule:
+/// "AgentRun 的失败计数 / 失败禁用写也改成带 `AND revision = ?` 的版本").
+///
+/// Review, M-1 (three problems in the pre-review version, all fixed here):
+/// 1. It used to blind-write `next_run_at`/`last_run_at` even though it only
+///    CAS'd on `revision` — a tick's pre-advance does NOT bump revision
+///    (§2.2's table), so this write could land AFTER a newer pre-advance and
+///    clobber it back to a stale value, re-arming the same slot (exactly the
+///    M9 pattern §2.4 already closed for the REST PATCH path). Fixed: the
+///    CAS now also pins `next_run_at IS ?`/`last_run_at IS ?` (what the
+///    caller read), like `UPDATE_USER_SCHEDULE_CAS_SQL`; `next_run_at` is
+///    only ever WRITTEN (nulled) on `disable`, `last_run_at` is never
+///    written by this statement at all — pre-advance owns both columns.
+/// 2. A failure that crosses the disable threshold changes whether the row
+///    can fire but did not bump `revision`, violating §2.2 ("改变是否触发的
+///    写 revision +1"). Fixed: `revision = revision + CASE WHEN ?disable
+///    THEN 1 ELSE 0 END`.
+/// 3. No `owner_module IS NULL` guard — a caller bug could flip a MODULE
+///    row's `enabled`. Fixed: added, matching `upsert_schedule`'s guard.
+const UPDATE_SCHEDULE_RUNTIME_CAS_SQL: &str = "\
+UPDATE schedules \
+SET consecutive_failures = ?1, \
+    enabled = ?2, \
+    next_run_at = CASE WHEN ?3 THEN NULL ELSE next_run_at END, \
+    revision = revision + CASE WHEN ?3 THEN 1 ELSE 0 END \
+WHERE id = ?4 AND owner_module IS NULL AND revision = ?5 \
+  AND next_run_at IS ?6 AND last_run_at IS ?7";
+
+/// REST suspend/resume, module rows only (§8.2). Idempotent (v3, L-C): a
+/// suspend of an already-suspended row, or a resume of a row that is neither
+/// suspended nor system-disabled, matches 0 rows — no revision bump, no
+/// recomputed `next_run_at` (a repeated resume must not push the next slot
+/// out). `?2` is `next_fire(spec, now)`, computed by the caller. Resume is an
+/// explicit user act, so it ALSO clears a kernel `system_disabled_reason`
+/// (v2, M2) — otherwise a user could never un-disable a row whose module does
+/// not re-upsert.
+///
+/// Review, M-2: resume's `?2` (`next_run_at`) is computed by the caller from
+/// a `spec` it read earlier — if a module upsert changes `spec` between that
+/// read and this write, `?2` is stale for the NEW spec. `AND revision = ?4`
+/// (gated to the resume arm only — suspending needs no such check, it does
+/// not compute anything from `spec`) catches that race: the upsert bumps
+/// revision, so a stale resume loses the CAS and `set_user_suspended`
+/// classifies the miss as [`SuspendOutcome::Conflict`] rather than a
+/// (wrong) no-op.
+const SET_USER_SUSPENDED_SQL: &str = "\
+UPDATE schedules \
+SET user_suspended = ?1, \
+    system_disabled_reason = CASE WHEN ?1 = 0 THEN NULL ELSE system_disabled_reason END, \
+    next_run_at = CASE WHEN ?1 = 0 AND enabled = 1 THEN ?2 ELSE NULL END, \
+    consecutive_failures = CASE WHEN ?1 = 0 THEN 0 ELSE consecutive_failures END, \
+    revision = revision + 1 \
+WHERE id = ?3 AND owner_module IS NOT NULL \
+  AND ((?1 = 1 AND user_suspended = 0) \
+       OR (?1 = 0 AND (user_suspended = 1 OR system_disabled_reason IS NOT NULL) AND revision = ?4))";
+
+/// [`Store::set_user_suspended`]'s result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendOutcome {
+    /// The row's state actually changed.
+    Changed,
+    /// Already in the requested state — a no-op, not an error (suspend of an
+    /// already-suspended row; resume of a row that was neither suspended nor
+    /// system-disabled, including one whose module itself set `enabled =
+    /// false`, §8.2's `disabled_by = "module"` case).
+    NoOp,
+    /// Resume only (review, M-2): the row WAS suspended/system-disabled as
+    /// expected, but its `revision` had moved since the caller read the
+    /// `spec` it computed `resume_next_run_at` from. The caller must re-read
+    /// the row and retry with a freshly computed `next_run_at`/`revision`.
+    Conflict,
+}
+
+impl Store {
+    /// REST PATCH write-back on a USER row (v2, M9) — CAS'd on the revision
+    /// AND the `next_run_at`/`last_run_at` the caller read (§2.4); a tick's
+    /// pre-advance does not bump revision, so revision alone would not catch
+    /// "PATCH read → tick advanced → PATCH writes the stale value back".
+    /// Returns whether the write landed; on `false` the caller re-reads and
+    /// re-applies its `ScheduleUpdate` (a pure function of the row), up to 3
+    /// times, before surfacing `409 schedule_conflict`.
+    ///
+    /// # Errors
+    /// Storage/serialization.
+    pub async fn update_user_schedule_cas(
+        &self,
+        schedule: &Schedule,
+        seen_revision: i64,
+        seen_next_run_at: Option<&str>,
+        seen_last_run_at: Option<&str>,
+    ) -> Result<bool> {
+        let r = sqlx::query(UPDATE_USER_SCHEDULE_CAS_SQL)
+            .bind(&schedule.name)
+            .bind(schedule.enabled)
+            .bind(serde_json::to_string(&schedule.spec)?)
+            .bind(serde_json::to_string(&schedule.action)?)
+            .bind(serde_json::to_string(&schedule.delivery)?)
+            .bind(&schedule.next_run_at)
+            .bind(schedule.consecutive_failures)
+            .bind(&schedule.id)
+            .bind(seen_revision)
+            .bind(seen_next_run_at)
+            .bind(seen_last_run_at)
+            .execute(self.pool())
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// The AgentRun path's post-fire runtime write — see
+    /// [`UPDATE_SCHEDULE_RUNTIME_CAS_SQL`]'s doc comment for the three bugs
+    /// this closes (review, M-1). `disable` is a SEPARATE flag from `enabled`
+    /// (rather than inferring "disabling" from `enabled == false`) so the
+    /// SQL's one conditional expression can decide the revision bump/`NULL`
+    /// without also having to reconstruct "did this write just now turn it
+    /// off" from `enabled` alone.
+    ///
+    /// # Errors
+    /// Storage.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_schedule_runtime_cas(
+        &self,
+        id: &str,
+        seen_revision: i64,
+        seen_next_run_at: Option<&str>,
+        seen_last_run_at: Option<&str>,
+        consecutive_failures: i64,
+        enabled: bool,
+        disable: bool,
+    ) -> Result<bool> {
+        let r = sqlx::query(UPDATE_SCHEDULE_RUNTIME_CAS_SQL)
+            .bind(consecutive_failures)
+            .bind(enabled)
+            .bind(disable)
+            .bind(id)
+            .bind(seen_revision)
+            .bind(seen_next_run_at)
+            .bind(seen_last_run_at)
+            .execute(self.pool())
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// REST suspend/resume, module rows only (§8.2). Idempotent (v3, L-C).
+    /// When this call SETS `suspended = true` and it changed a row, the same
+    /// transaction retires the schedule's outstanding deliveries (T9,
+    /// `EXPIRE_OUTSTANDING_SQL` with reason `"suspended"`) — a fire for a slot
+    /// the user just paused must not be delivered later. `resume_next_run_at`
+    /// is `next_fire(spec, now)`, computed by the caller; ignored when
+    /// `suspended` is `true`. `seen_revision` (review, M-2) is the revision
+    /// the caller read `resume_next_run_at`'s `spec` from; only checked when
+    /// resuming (see [`SET_USER_SUSPENDED_SQL`]'s doc comment) — a suspend
+    /// call may pass any value (conventionally the row's last-known revision,
+    /// but it is not load-bearing for that direction).
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn set_user_suspended(
+        &self,
+        id: &str,
+        suspended: bool,
+        resume_next_run_at: Option<&str>,
+        seen_revision: i64,
+        now: &str,
+    ) -> Result<SuspendOutcome> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let r = sqlx::query(SET_USER_SUSPENDED_SQL)
+            .bind(suspended)
+            .bind(resume_next_run_at)
+            .bind(id)
+            .bind(seen_revision)
+            .execute(&mut *tx)
+            .await?;
+        let outcome = if r.rows_affected() > 0 {
+            SuspendOutcome::Changed
+        } else {
+            let row = sqlx::query(
+                "SELECT user_suspended, system_disabled_reason, revision FROM schedules \
+                 WHERE id = ? AND owner_module IS NOT NULL",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match row {
+                None => SuspendOutcome::NoOp, // gone, or not a module row: nothing this call can do
+                Some(row) => {
+                    let cur_suspended: bool = row.get("user_suspended");
+                    let cur_sys: Option<String> = row.get("system_disabled_reason");
+                    let cur_rev: i64 = row.get("revision");
+                    let already_target_state = if suspended {
+                        cur_suspended
+                    } else {
+                        !cur_suspended && cur_sys.is_none()
+                    };
+                    if already_target_state {
+                        SuspendOutcome::NoOp
+                    } else if !suspended && cur_rev != seen_revision {
+                        SuspendOutcome::Conflict
+                    } else {
+                        // Not already at the target state, revision matches
+                        // (or this is a suspend, which never checks
+                        // revision) — the CAS should have landed above. This
+                        // arm is unreachable in practice; NoOp is the safe
+                        // default if it ever is.
+                        SuspendOutcome::NoOp
+                    }
+                }
+            }
+        };
+        if matches!(outcome, SuspendOutcome::Changed) && suspended {
+            sqlx::query(EXPIRE_OUTSTANDING_SQL)
+                .bind("suspended")
+                .bind(now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(outcome)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use agent24_protocol::ScheduleAction;
     use sqlx::SqlitePool;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
@@ -2376,5 +2614,664 @@ mod tests {
             failures, 0,
             "a recompute must clear a partial failure streak, not just a full system-disable"
         );
+    }
+
+    // ── C1.15 — suspend/resume are idempotent, resume clears system-disable ─
+
+    #[tokio::test]
+    async fn user_suspend_resume_survive_module_upserts_and_are_idempotent() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev1 = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            store
+                .set_user_suspended("sch_1", true, None, rev1, "2026-09-23T09:00:30Z")
+                .await
+                .unwrap(),
+            SuspendOutcome::Changed
+        );
+        let (_, s) = store
+            .upsert_module_schedule(
+                "x",
+                "m",
+                "k",
+                &every(120),
+                Some("2026-09-23T09:02:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        assert!(
+            s.user_suspended && s.next_run_at.is_none(),
+            "a suspended row must not resume ticking via upsert"
+        );
+        // positive control: resume fires again
+        let rev2 = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            store
+                .set_user_suspended(
+                    "sch_1",
+                    false,
+                    Some("2026-09-23T09:05:00Z"),
+                    rev2,
+                    "2026-09-23T09:05:00Z"
+                )
+                .await
+                .unwrap(),
+            SuspendOutcome::Changed
+        );
+        let s = store.list_module_schedules("m").await.unwrap().remove(0);
+        assert!(!s.user_suspended && s.next_run_at.as_deref() == Some("2026-09-23T09:05:00Z"));
+        // a repeated resume is a no-op: 0 rows, next_run_at not pushed out
+        let rev3 = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            store
+                .set_user_suspended(
+                    "sch_1",
+                    false,
+                    Some("2026-09-23T09:59:00Z"),
+                    rev3,
+                    "2026-09-23T09:05:00Z"
+                )
+                .await
+                .unwrap(),
+            SuspendOutcome::NoOp
+        );
+        let s = store.list_module_schedules("m").await.unwrap().remove(0);
+        assert_eq!(
+            s.next_run_at.as_deref(),
+            Some("2026-09-23T09:05:00Z"),
+            "a repeated resume must not push next_run_at out"
+        );
+        // a repeated suspend is likewise a no-op
+        let rev4 = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            store
+                .set_user_suspended("sch_1", true, None, rev4, "2026-09-23T09:06:00Z")
+                .await
+                .unwrap(),
+            SuspendOutcome::Changed
+        );
+        assert_eq!(
+            store
+                .set_user_suspended("sch_1", true, None, rev4, "2026-09-23T09:07:00Z")
+                .await
+                .unwrap(),
+            SuspendOutcome::NoOp
+        );
+        // suspend/resume on a USER row is a no-op (the guard is `owner_module IS NOT NULL`)
+        assert_eq!(
+            store
+                .set_user_suspended("sch_old", true, None, 0, "2026-09-23T09:06:00Z")
+                .await
+                .unwrap(),
+            SuspendOutcome::NoOp
+        );
+
+        // M2: resume also clears a kernel system-disable
+        store
+            .upsert_module_schedule(
+                "sch_2",
+                "m",
+                "b",
+                &every(60),
+                Some("2026-09-23T09:00:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schedules SET system_disabled_reason = 'consecutive_failures', next_run_at = NULL WHERE id = 'sch_2'")
+            .execute(pool(&store))
+            .await
+            .unwrap();
+        let rev5 = revision_of(&store, "sch_2").await;
+        assert_eq!(
+            store
+                .set_user_suspended(
+                    "sch_2",
+                    false,
+                    Some("2026-09-23T09:05:00Z"),
+                    rev5,
+                    "2026-09-23T09:05:00Z"
+                )
+                .await
+                .unwrap(),
+            SuspendOutcome::Changed
+        );
+        let (reason, next): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT system_disabled_reason, next_run_at FROM schedules WHERE id = 'sch_2'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(
+            (reason, next.as_deref()),
+            (None, Some("2026-09-23T09:05:00Z"))
+        );
+    }
+
+    // ── review, M-2 — resume conflicts on a concurrent spec change ──────────
+
+    #[tokio::test]
+    async fn resume_conflicts_when_spec_changed_after_the_callers_read() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev_before_suspend = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            store
+                .set_user_suspended(
+                    "sch_1",
+                    true,
+                    None,
+                    rev_before_suspend,
+                    "2026-09-23T09:00:30Z"
+                )
+                .await
+                .unwrap(),
+            SuspendOutcome::Changed
+        );
+        // the caller's "read" of `spec`/`revision` for its resume attempt
+        let seen_rev = revision_of(&store, "sch_1").await;
+        // a module upsert changes spec in between — bumps revision
+        store
+            .upsert_module_schedule(
+                "x",
+                "m",
+                "k",
+                &every(120),
+                Some("2026-09-23T10:00:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        // the resume, computed from the now-STALE spec, must conflict rather
+        // than silently write a next_run_at for the OLD spec
+        let outcome = store
+            .set_user_suspended(
+                "sch_1",
+                false,
+                Some("2026-09-23T09:05:00Z"),
+                seen_rev,
+                "2026-09-23T09:05:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, SuspendOutcome::Conflict);
+        let suspended: bool =
+            sqlx::query_scalar("SELECT user_suspended FROM schedules WHERE id = 'sch_1'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert!(suspended, "the stale resume must not have landed");
+
+        // positive control: no concurrent change → Changed
+        let fresh_rev = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            store
+                .set_user_suspended(
+                    "sch_1",
+                    false,
+                    Some("2026-09-23T09:06:00Z"),
+                    fresh_rev,
+                    "2026-09-23T09:06:00Z"
+                )
+                .await
+                .unwrap(),
+            SuspendOutcome::Changed
+        );
+        // already resumed → NoOp
+        let after_rev = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            store
+                .set_user_suspended(
+                    "sch_1",
+                    false,
+                    Some("2026-09-23T09:07:00Z"),
+                    after_rev,
+                    "2026-09-23T09:07:00Z"
+                )
+                .await
+                .unwrap(),
+            SuspendOutcome::NoOp
+        );
+    }
+
+    // ── suspend expires outstanding deliveries in the same transaction (T9) ──
+
+    #[tokio::test]
+    async fn suspend_expires_the_schedules_outstanding_deliveries() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_1").await;
+        let due = "2026-09-23T09:01:00Z";
+        let f = NewFire {
+            fire_id: "fire_pending",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        store
+            .advance_and_record_fire(
+                "sch_1",
+                rev,
+                due,
+                Some("2026-09-23T09:02:00Z"),
+                due,
+                Some(f),
+            )
+            .await
+            .unwrap();
+        let rev2 = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            store
+                .set_user_suspended("sch_1", true, None, rev2, "2026-09-23T09:01:30Z")
+                .await
+                .unwrap(),
+            SuspendOutcome::Changed
+        );
+        let (status, last_error): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, last_error FROM schedule_deliveries WHERE fire_id = 'fire_pending'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(
+            (status.as_str(), last_error.as_deref()),
+            ("expired", Some("suspended"))
+        );
+    }
+
+    // ── C1.14 — REST PATCH write-back CAS ────────────────────────────────────
+
+    #[tokio::test]
+    async fn patch_write_back_cas_loses_to_a_stale_read_and_wins_after_a_reread() {
+        let (store, _dir) = fresh(1).await;
+        let (rev, next_read, last_read): (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT revision, next_run_at, last_run_at FROM schedules WHERE id = 'sch_old'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        // a tick advances the row between the PATCH's read and its write
+        store
+            .advance_and_record_fire(
+                "sch_old",
+                rev,
+                next_read.as_deref().unwrap(),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patched = Schedule {
+            id: "sch_old".into(),
+            name: "renamed".into(),
+            enabled: true,
+            spec: ScheduleSpec::Every { secs: 60 },
+            action: ScheduleAction::AgentRun {
+                prompt: "p".into(),
+                session_id: None,
+                model_override: None,
+            },
+            delivery: vec![],
+            last_run_at: None,
+            next_run_at: None,
+            consecutive_failures: 0,
+        };
+        let stale = store
+            .update_user_schedule_cas(&patched, rev, next_read.as_deref(), last_read.as_deref())
+            .await
+            .unwrap();
+        assert!(
+            !stale,
+            "a PATCH that read next_run_at before the tick advanced it must lose"
+        );
+
+        let (next2, last2): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT next_run_at, last_run_at FROM schedules WHERE id = 'sch_old'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        let fresh_write = store
+            .update_user_schedule_cas(&patched, rev, next2.as_deref(), last2.as_deref())
+            .await
+            .unwrap();
+        assert!(fresh_write, "positive control: re-read then write wins");
+    }
+
+    // ── C1.8 — the REST/self-wake upsert cannot touch a module row ──────────
+
+    #[tokio::test]
+    async fn rest_upsert_cannot_touch_a_module_row_but_still_updates_a_user_row() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                None,
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let hijack = Schedule {
+            id: "sch_1".into(),
+            name: "hijack".into(),
+            enabled: true,
+            spec: ScheduleSpec::Every { secs: 60 },
+            action: ScheduleAction::AgentRun {
+                prompt: "x".into(),
+                session_id: None,
+                model_override: None,
+            },
+            delivery: vec![],
+            last_run_at: None,
+            next_run_at: None,
+            consecutive_failures: 0,
+        };
+        assert!(
+            !store.upsert_schedule(&hijack).await.unwrap(),
+            "the guard must refuse a module row and report that it wrote nothing"
+        );
+        let (name, action): (String, String) =
+            sqlx::query_as("SELECT name, action FROM schedules WHERE id = 'sch_1'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(
+            (name.as_str(), action.as_str()),
+            ("k", MODULE_ACTION_SENTINEL)
+        );
+
+        // positive control: a user row still updates, bumps revision, and reports true
+        let renamed = Schedule {
+            id: "sch_old".into(),
+            name: "renamed".into(),
+            ..hijack
+        };
+        assert!(store.upsert_schedule(&renamed).await.unwrap());
+        let name2: String = sqlx::query_scalar("SELECT name FROM schedules WHERE id = 'sch_old'")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(name2, "renamed");
+        let rev: i64 = sqlx::query_scalar("SELECT revision FROM schedules WHERE id = 'sch_old'")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(rev, 1);
+    }
+
+    // ── review, M-1 — the AgentRun runtime-write CAS ─────────────────────────
+
+    #[tokio::test]
+    async fn update_schedule_runtime_cas_loses_to_an_interleaving_tick() {
+        let (store, _dir) = fresh(1).await;
+        let (rev, next, last): (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT revision, next_run_at, last_run_at FROM schedules WHERE id = 'sch_old'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        // a tick pre-advances the row between the caller's read and its write.
+        // Crucially, the pre-advance does NOT bump revision (§2.2) — so a CAS
+        // on revision alone would not catch this race.
+        store
+            .advance_and_record_fire(
+                "sch_old",
+                rev,
+                next.as_deref().unwrap(),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                None,
+            )
+            .await
+            .unwrap();
+        let stale = store
+            .update_schedule_runtime_cas(
+                "sch_old",
+                rev,
+                next.as_deref(),
+                last.as_deref(),
+                1,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !stale,
+            "a post-fire write that read next_run_at before the tick advanced it must lose"
+        );
+        let failures: i64 =
+            sqlx::query_scalar("SELECT consecutive_failures FROM schedules WHERE id = 'sch_old'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(
+            failures, 2,
+            "the seeded value must be unchanged — the stale write never landed"
+        );
+
+        // positive control: re-read then write wins
+        let (next2, last2): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT next_run_at, last_run_at FROM schedules WHERE id = 'sch_old'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert!(
+            store
+                .update_schedule_runtime_cas(
+                    "sch_old",
+                    rev,
+                    next2.as_deref(),
+                    last2.as_deref(),
+                    1,
+                    true,
+                    false
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_runtime_cas_disable_bumps_revision_and_nulls_next_run_at() {
+        let (store, _dir) = fresh(1).await;
+        let (rev, next, last): (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT revision, next_run_at, last_run_at FROM schedules WHERE id = 'sch_old'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert!(
+            store
+                .update_schedule_runtime_cas(
+                    "sch_old",
+                    rev,
+                    next.as_deref(),
+                    last.as_deref(),
+                    5,
+                    false,
+                    true
+                )
+                .await
+                .unwrap()
+        );
+        let (enabled, next_after, rev_after, failures): (bool, Option<String>, i64, i64) =
+            sqlx::query_as(
+                "SELECT enabled, next_run_at, revision, consecutive_failures FROM schedules WHERE id = 'sch_old'",
+            )
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert!(!enabled);
+        assert_eq!(next_after, None);
+        assert_eq!(
+            rev_after,
+            rev + 1,
+            "system-disable changes whether the row can fire — it must bump revision (§2.2)"
+        );
+        assert_eq!(failures, 5);
+    }
+
+    #[tokio::test]
+    async fn update_schedule_runtime_cas_cannot_write_a_module_row() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let (rev, next, last): (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT revision, next_run_at, last_run_at FROM schedules WHERE id = 'sch_1'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        let ok = store
+            .update_schedule_runtime_cas(
+                "sch_1",
+                rev,
+                next.as_deref(),
+                last.as_deref(),
+                1,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !ok,
+            "a module row must be unwritable via this AgentRun-only path"
+        );
+        let enabled: bool = sqlx::query_scalar("SELECT enabled FROM schedules WHERE id = 'sch_1'")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert!(enabled, "the module row's enabled must be untouched");
+
+        // positive control: the SAME call shape against a user row succeeds
+        let (rev2, next2, last2): (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT revision, next_run_at, last_run_at FROM schedules WHERE id = 'sch_old'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert!(
+            store
+                .update_schedule_runtime_cas(
+                    "sch_old",
+                    rev2,
+                    next2.as_deref(),
+                    last2.as_deref(),
+                    1,
+                    true,
+                    false
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    // ── review, L-6 — the pre-existing, non-CAS runtime write is also guarded ─
+
+    #[tokio::test]
+    async fn update_schedule_runtime_cannot_write_a_module_row_either() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let module_row = Schedule {
+            id: "sch_1".into(),
+            name: "hijack".into(),
+            enabled: false,
+            spec: ScheduleSpec::Every { secs: 60 },
+            action: ScheduleAction::AgentRun {
+                prompt: "x".into(),
+                session_id: None,
+                model_override: None,
+            },
+            delivery: vec![],
+            last_run_at: None,
+            next_run_at: None,
+            consecutive_failures: 9,
+        };
+        assert!(
+            !store.update_schedule_runtime(&module_row).await.unwrap(),
+            "the pre-existing runtime write must also refuse a module row"
+        );
+        let enabled: bool = sqlx::query_scalar("SELECT enabled FROM schedules WHERE id = 'sch_1'")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert!(enabled, "the module row's enabled must be untouched");
+
+        // positive control: a user row still updates
+        let user_row = Schedule {
+            id: "sch_old".into(),
+            enabled: false,
+            ..module_row
+        };
+        assert!(store.update_schedule_runtime(&user_row).await.unwrap());
     }
 }
