@@ -189,6 +189,7 @@ impl ExplorerSubagent {
                 model: None,
                 tools: tool_specs.clone(),
                 response_format: None,
+                max_tokens: None,
             };
             // Privacy note: the explorer uses the SAME (default) profile as a
             // normal run. It is not more privileged than the main agent w.r.t.
@@ -340,6 +341,7 @@ mod tests {
             Ok(CompletionResponse {
                 message,
                 usage: Usage::default(),
+                model_id: None,
             })
         }
         async fn models(

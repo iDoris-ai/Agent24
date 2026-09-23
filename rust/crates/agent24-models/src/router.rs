@@ -25,6 +25,11 @@ use crate::{CompletionRequest, CompletionResponse, ModelError, ModelProvider};
 /// for privacy purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
+    /// On-device. v3.1 L-1: a provider carrying this label MUST be an
+    /// `OpenAiCompatProvider` built with `loopback_only()` (or an equivalent
+    /// that neither reads proxy variables nor follows redirects) pointing at a
+    /// loopback address — the LocalOnly guarantee is exactly as good as this
+    /// label. `from_env` does it; a hand-built router must too.
     Local,
     Remote,
     Lora,
@@ -100,6 +105,16 @@ struct Routed {
     tier: Tier,
 }
 
+/// ME4-4.2.2a: a successful completion plus where it ran. `tier` is the
+/// routing label of the provider that answered — the fact the per-module
+/// usage ledger (`served_by`) and the LocalOnly tripwire both read.
+#[derive(Debug, Clone)]
+pub struct Served {
+    pub provider: String,
+    pub tier: Tier,
+    pub response: CompletionResponse,
+}
+
 /// Routes completions across tiered providers with a health/cooldown loop.
 pub struct ModelRouter {
     providers: Vec<Routed>,
@@ -113,57 +128,70 @@ pub struct ModelRouter {
 /// can never overflow (review D2).
 const COOLDOWN_HARD_CAP: Duration = Duration::from_secs(24 * 3600);
 
-/// Extract the host from an `http(s)://host[:port][/path]` URL (no url-crate
-/// dependency). IPv6 literals in `[...]` are unwrapped.
-fn url_host(url: &str) -> Option<&str> {
-    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    // strip userinfo
-    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if let Some(rest) = hostport.strip_prefix('[') {
-        // IPv6: [::1]:port → ::1
-        return rest.split(']').next().filter(|h| !h.is_empty());
+/// ME4-S2 H1: is `url` — parsed by the SAME parser the HTTP client uses
+/// (`reqwest::Url`, WHATWG) — an on-device endpoint? IPv4/IPv6 literals:
+/// `is_loopback()` (so `::ffff:127.0.0.1` and `0.0.0.0` are NOT loopback —
+/// conservative: a Remote label on a host that happens to be local cannot
+/// leak); a domain: only `localhost`, exactly; anything that fails to parse,
+/// has no host, or is not http(s): not loopback.
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
     }
-    hostport.split(':').next().filter(|h| !h.is_empty())
-}
-
-/// True only for genuinely ON-DEVICE hosts — loopback or `localhost`. A LAN or
-/// any other address is NOT local for privacy purposes: sending data there
-/// leaves the device (review D2). Used by [`ModelRouter::from_env`] to decide
-/// whether an env-configured provider may carry the `Tier::Local` label.
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    match host.parse::<std::net::IpAddr>() {
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // `host_str` gives IPv6 literals in brackets.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
         Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
-        Err(_) => false,
+        Err(_) => bare.eq_ignore_ascii_case("localhost"),
     }
 }
 
-/// The tier an env-configured "local" provider actually deserves: `Local` only
-/// if its URL is genuinely loopback, else `Remote` (fail-safe — a LocalOnly
-/// task then refuses it rather than leaking to it).
+/// The tier an env-configured "local" provider actually deserves: `Local`
+/// only if the base URL AND every URL the adapter will actually request
+/// (`{base}/v1/chat/completions`, `{base}/v1/models`) are loopback under the
+/// client's own parser; else `Remote` (fail-safe).
 fn env_local_tier(url: &str) -> Tier {
-    match url_host(url) {
-        Some(host) if is_loopback_host(host) => Tier::Local,
-        _ => {
-            tracing::warn!(
-                "provider URL {url} is not loopback — labeling Remote so \
-                 LocalOnly tasks won't route to it"
-            );
-            Tier::Remote
-        }
+    let requested = [
+        url.to_owned(),
+        format!("{url}/v1/chat/completions"),
+        format!("{url}/v1/models"),
+    ];
+    if requested.iter().all(|u| is_loopback_url(u)) {
+        Tier::Local
+    } else {
+        tracing::warn!(
+            "provider URL {url} is not loopback — labeling Remote so \
+             LocalOnly tasks won't route to it"
+        );
+        Tier::Remote
+    }
+}
+
+/// The open-enum tier string reported on `/models` for a judged tier.
+fn tier_label(t: Tier) -> &'static str {
+    match t {
+        Tier::Local => "local",
+        Tier::Lora => "lora",
+        Tier::Remote => "remote",
     }
 }
 
 impl ModelRouter {
     /// Build from `(provider, tier)` pairs. Cooldown grows exponentially from
     /// `base_cooldown`, capped at `max_cooldown`.
+    ///
+    /// v3.1 L-1: every `Tier::Local`/`Tier::Lora` provider passed here must be
+    /// built with `OpenAiCompatProvider::loopback_only()` (see [`Tier::Local`]).
     ///
     /// PRIVACY CONTRACT: the [`Tier`] label states WHERE a provider runs and is
     /// the sole basis of the LocalOnly guarantee. `Tier::Local` / `Tier::Lora`
@@ -192,7 +220,32 @@ impl ModelRouter {
         }
     }
 
-    /// Convenience default: 2s base, 60s cap.
+    /// ME4-S2 H2: a router over the SAME providers (shared `Arc`s, same tier
+    /// labels, same cooldown parameters) with its OWN, empty health table. A
+    /// caller whose failures must not steer anyone else's routing — an
+    /// out-of-process module, which can provoke 5xx/429 at will — routes
+    /// through one of these, so the cooldowns it causes are visible only to
+    /// itself; `/api/v1/chat`, the guardian and the session summarizer keep
+    /// routing on the kernel's own table.
+    #[must_use]
+    pub fn with_separate_health(&self) -> Self {
+        Self {
+            providers: self
+                .providers
+                .iter()
+                .map(|r| Routed {
+                    provider: Arc::clone(&r.provider),
+                    tier: r.tier,
+                })
+                .collect(),
+            health: Mutex::new(HashMap::new()),
+            base_cooldown: self.base_cooldown,
+            max_cooldown: self.max_cooldown,
+        }
+    }
+
+    /// Convenience default: 2s base, 60s cap. Same PRIVACY CONTRACT as
+    /// [`Self::new`]: Local providers must be `loopback_only()`.
     pub fn with_defaults(providers: Vec<(Arc<dyn ModelProvider>, Tier)>) -> Self {
         Self::new(providers, Duration::from_secs(2), Duration::from_secs(60))
     }
@@ -212,22 +265,31 @@ impl ModelRouter {
         // pointed at a non-loopback address is treated as Remote so a
         // LocalOnly task never silently leaks to it (review D2).
         let omlx_tier = env_local_tier(&omlx_url);
-        let ollama_url = "http://127.0.0.1:11434";
-        let ollama_tier = env_local_tier(ollama_url);
-        let omlx: Arc<dyn ModelProvider> = Arc::new(crate::OpenAiCompatProvider::new(
-            "omlx",
-            omlx_url,
-            Some(omlx_key),
-            "local",
-            default_model.clone(),
-        ));
-        let ollama: Arc<dyn ModelProvider> = Arc::new(crate::OpenAiCompatProvider::new(
-            "ollama",
-            ollama_url,
-            None,
-            "local",
-            default_model,
-        ));
+        // ME4-S2 M5: overridable (was hard-coded). Labeled by the same rule
+        // as OMLX_URL, so a non-loopback value is Remote.
+        let ollama_url =
+            std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned());
+        let ollama_tier = env_local_tier(&ollama_url);
+        // v3 N1: a provider labeled Local talks ONLY to its loopback address —
+        // no proxy, no redirect. v3 L-e: its reported tier string is the
+        // judged tier, not a hard-coded "local".
+        let build =
+            |name: &str, url: String, key: Option<String>, tier: Tier| -> Arc<dyn ModelProvider> {
+                let p = crate::OpenAiCompatProvider::new(
+                    name,
+                    url,
+                    key,
+                    tier_label(tier),
+                    default_model.clone(),
+                );
+                Arc::new(if tier.is_local() {
+                    p.loopback_only()
+                } else {
+                    p
+                })
+            };
+        let omlx = build("omlx", omlx_url, Some(omlx_key), omlx_tier);
+        let ollama = build("ollama", ollama_url, None, ollama_tier);
         Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)])
     }
 
@@ -277,16 +339,31 @@ impl ModelRouter {
         }
     }
 
-    /// Route and complete. Only `Unavailable` falls through to the next routed
-    /// provider (and records a cooldown); `Provider`/`Cancelled` errors stop
-    /// immediately. A LocalOnly task with no available local provider errors
-    /// rather than ever touching a remote one.
+    /// Route and complete — unchanged signature and behaviour (`/api/v1/chat`
+    /// and the agent loop call this). Now a thin projection of
+    /// [`Self::complete_served`].
     pub async fn complete(
         &self,
         profile: TaskProfile,
         req: &CompletionRequest,
         cancel: &CancellationToken,
     ) -> Result<(String, CompletionResponse), ModelError> {
+        self.complete_served(profile, req, cancel)
+            .await
+            .map(|s| (s.provider, s.response))
+    }
+
+    /// ME4-4.2.2a: route and complete, and say WHICH TIER served it. Only
+    /// `Unavailable` falls through to the next routed provider (and records a
+    /// cooldown); `Provider`/`Cancelled` errors stop immediately. A LocalOnly
+    /// task with no available local provider errors rather than ever touching
+    /// a remote one — `route()` never yields a remote index for it.
+    pub async fn complete_served(
+        &self,
+        profile: TaskProfile,
+        req: &CompletionRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Served, ModelError> {
         let route = self.route(profile, Instant::now());
         if route.is_empty() {
             return Err(ModelError::Unavailable(match profile.privacy {
@@ -302,9 +379,13 @@ impl ModelRouter {
         for idx in route {
             let r = &self.providers[idx];
             match r.provider.complete(req, cancel).await {
-                Ok(res) => {
+                Ok(response) => {
                     self.record_success(r.provider.name());
-                    return Ok((r.provider.name().to_owned(), res));
+                    return Ok(Served {
+                        provider: r.provider.name().to_owned(),
+                        tier: r.tier,
+                        response,
+                    });
                 }
                 Err(ModelError::Unavailable(msg)) => {
                     tracing::debug!("provider {} unavailable: {msg}", r.provider.name());
@@ -432,6 +513,7 @@ mod tests {
                         total_tokens: 2,
                         cost_usd: 0.0,
                     },
+                    model_id: None,
                 })
             }
         }
@@ -454,6 +536,7 @@ mod tests {
             model: None,
             tools: vec![],
             response_format: None,
+            max_tokens: None,
         }
     }
 
@@ -714,33 +797,200 @@ mod tests {
     }
 
     #[test]
-    fn url_host_and_loopback_classification() {
-        assert_eq!(url_host("http://127.0.0.1:8088"), Some("127.0.0.1"));
-        assert_eq!(url_host("http://localhost:11434/v1"), Some("localhost"));
-        assert_eq!(url_host("https://[::1]:8443/x"), Some("::1"));
-        assert_eq!(url_host("http://api.openai.com/v1"), Some("api.openai.com"));
-        assert_eq!(url_host("http://192.168.1.50:8088"), Some("192.168.1.50"));
+    fn env_local_tier_uses_the_http_clients_own_parser() {
+        // Positive controls.
+        for u in [
+            "http://127.0.0.1:8088",
+            "http://localhost:8088",
+            "http://LOCALHOST:8088",
+            "https://[::1]:8443",
+            "http://user:pw@127.0.0.1:8088", // real userinfo: host IS 127.0.0.1
+            "http://evil.example%2F@127.0.0.1:8088", // %2F stays in userinfo
+            "http://0x7f000001:8088",        // WHATWG normalises to 127.0.0.1
+            "http://loc\talhost:8088",       // tab stripped → localhost (reqwest agrees)
+            "http://127.0.0.1:8088?@evil.example", // `?` ends the authority → 127.0.0.1
+        ] {
+            assert_eq!(env_local_tier(u), Tier::Local, "{u:?}");
+        }
+        // Must be Remote.
+        for u in [
+            "http://evil.example\\@127.0.0.1:8088", // H1: `\` ends the authority → evil.example
+            "http://evil.example:80\\@localhost/",
+            "http://127.0.0.1\t.evil.example:8088", // tab stripped → a domain
+            "http://[::ffff:127.0.0.1]:8088",       // mapped v6: not is_loopback()
+            "http://0.0.0.0:8088",
+            "http://localhost.:8088",
+            "http://192.168.1.50:8088",
+            "https://inference.example.com",
+            "not a url",
+            "file:///tmp/x",
+            "",
+        ] {
+            assert_eq!(env_local_tier(u), Tier::Remote, "{u:?}");
+        }
+        // The reviewer's exact H1 vector, checked against the parser reqwest uses.
+        let h1 = "http://evil.example\\@127.0.0.1:8088";
+        assert_eq!(
+            reqwest::Url::parse(h1).unwrap().host_str(),
+            Some("evil.example")
+        );
+    }
 
-        assert!(is_loopback_host("127.0.0.1"));
-        assert!(is_loopback_host("localhost"));
-        assert!(is_loopback_host("::1"));
-        // a LAN box is NOT on-device — data would leave the machine
-        assert!(!is_loopback_host("192.168.1.50"));
-        assert!(!is_loopback_host("10.0.0.5"));
-        assert!(!is_loopback_host("api.openai.com"));
+    // ---- v3 N1: proxy / redirect must not move a Local provider's traffic ----
+
+    /// A blocking stub on its own thread: counts connections, answers `reply`.
+    fn thread_stub(reply: String) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut buf = [0u8; 65536];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (port, n)
+    }
+
+    fn http_ok() -> String {
+        let body = r#"{"model":"m","choices":[{"message":{"role":"assistant","content":"x"}}]}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn secret_request() -> CompletionRequest {
+        CompletionRequest {
+            messages: vec![Msg::user("SECRET")],
+            model: None,
+            tools: vec![],
+            response_format: None,
+            max_tokens: None,
+        }
+    }
+
+    // The two CHILD tests below run only inside a fresh process started by
+    // `from_env_local_providers_ignore_http_proxy` (edition 2024 makes
+    // `set_var` unsafe and the workspace forbids unsafe, so the env is given
+    // to a new process). They are selected by exact name, not by an env var:
+    // `agent24-cli`'s PASSTHROUGH_VARS scanner collects every environment read
+    // under crates/, and a test-only variable would trip it.
+
+    /// Child: the production path — from_env labels OMLX_URL Local → loopback_only.
+    #[tokio::test]
+    #[ignore = "child process of from_env_local_providers_ignore_http_proxy"]
+    async fn proxy_child_from_env() {
+        let r = ModelRouter::from_env();
+        let profile = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            ..Default::default()
+        };
+        let _ = r
+            .complete(profile, &secret_request(), &CancellationToken::new())
+            .await;
+    }
+
+    /// Child: positive control — the default client, same URL, same env.
+    #[tokio::test]
+    #[ignore = "child process of from_env_local_providers_ignore_http_proxy"]
+    async fn proxy_child_default_client() {
+        let url = std::env::var("OMLX_URL").unwrap_or_default(); // already in PASSTHROUGH_VARS
+        let p = crate::OpenAiCompatProvider::new("omlx", url, None, "local", "m");
+        let _ = p
+            .complete(&secret_request(), &CancellationToken::new())
+            .await;
+    }
+
+    fn run_child(test: &str, target: u16, proxy: u16) {
+        let exe = std::env::current_exe().unwrap();
+        let proxy_url = format!("http://127.0.0.1:{proxy}");
+        let status = std::process::Command::new(exe)
+            .args(["--exact", test, "--ignored", "--nocapture"])
+            .env("OMLX_URL", format!("http://127.0.0.1:{target}"))
+            .env("OLLAMA_URL", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
-    fn env_local_tier_demotes_non_loopback_to_remote() {
-        assert_eq!(env_local_tier("http://127.0.0.1:8088"), Tier::Local);
-        assert_eq!(env_local_tier("http://localhost:8088"), Tier::Local);
-        // a misconfigured "local" URL pointing off-device must NOT be Local —
-        // else a LocalOnly task would leak to it (review D2)
-        assert_eq!(env_local_tier("http://192.168.1.50:8088"), Tier::Remote);
+    fn from_env_local_providers_ignore_http_proxy() {
+        let (tp, target) = thread_stub(http_ok());
+        let (pp, proxy) = thread_stub(http_ok());
+        run_child("router::tests::proxy_child_from_env", tp, pp);
         assert_eq!(
-            env_local_tier("https://inference.example.com"),
-            Tier::Remote
+            proxy.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the proxy saw a Local provider's request"
         );
+        assert_eq!(target.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Positive control: the default client under the same env goes through the proxy.
+        let (tp2, target2) = thread_stub(http_ok());
+        let (pp2, proxy2) = thread_stub(http_ok());
+        run_child("router::tests::proxy_child_default_client", tp2, pp2);
+        assert_eq!(
+            proxy2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "measuring instrument: proxy env must take effect"
+        );
+        assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_loopback_only_provider_does_not_follow_redirects() {
+        let (rp, redirected) = thread_stub(http_ok());
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://[::ffff:127.0.0.1]:{rp}/v1/chat/completions\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        let req = CompletionRequest {
+            messages: vec![Msg::user("SECRET")],
+            model: None,
+            tools: vec![],
+            response_format: None,
+            max_tokens: None,
+        };
+        let c = CancellationToken::new();
+        let (tp, _) = thread_stub(redirect.clone());
+        let p = crate::OpenAiCompatProvider::new(
+            "omlx",
+            format!("http://127.0.0.1:{tp}"),
+            None,
+            "local",
+            "m",
+        )
+        .loopback_only();
+        let e = p.complete(&req, &c).await.unwrap_err();
+        assert!(matches!(e, ModelError::Rejected { status: 307, .. }), "{e}");
+        assert_eq!(redirected.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Positive control: the default client follows the 307 with the body.
+        let (tp2, _) = thread_stub(redirect);
+        let p = crate::OpenAiCompatProvider::new(
+            "omlx",
+            format!("http://127.0.0.1:{tp2}"),
+            None,
+            "local",
+            "m",
+        );
+        let _ = p.complete(&req, &c).await;
+        assert_eq!(redirected.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn from_env_reports_the_judged_tier() {
+        assert_eq!(tier_label(env_local_tier("http://0.0.0.0:1")), "remote");
+        assert_eq!(tier_label(env_local_tier("http://127.0.0.1:1")), "local");
     }
 
     #[test]

@@ -89,6 +89,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         model: chat.model,
         tools: vec![],
         response_format: None,
+        max_tokens: None,
     };
     // Transient run: session_id null, full run lifecycle events (SPEC-002 §2)
     let run_id = format!("run_{}", agent24_core::util::ulid());
@@ -149,6 +150,11 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     "request cancelled".to_owned(),
                 ),
                 ModelError::Provider(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg),
+                // ME4-S2 L3: same handling as `Provider` — same `Display`
+                // text, so `/api/v1/chat`'s response body is unchanged.
+                ModelError::Rejected { message, .. } => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+                }
             };
             state
                 .events
