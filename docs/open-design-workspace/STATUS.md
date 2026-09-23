@@ -105,7 +105,8 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - P2 期间 Creative 仍只能 `GET /api/v1/models`；
 - workspace/session/run/events/approval 均保持 Creative default deny；
 - A24-OD-01 与 A24-OD-02 必须共同消费 ADR-002，不能各自发明字段；
-- 所有实现继续按功能拆分，PR 默认不超过约 200 changed lines。
+- 所有实现继续按功能拆分，PR 日常目标为 200–300 changed lines，硬上限 500；
+  301–500 行仅用于不可合理拆分的原子切片，并强制两次独立 SOL exact-head review。
 
 ## A24-OD-01 已通过切片
 

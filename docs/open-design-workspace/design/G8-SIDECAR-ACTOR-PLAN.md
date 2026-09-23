@@ -148,7 +148,7 @@ Ready；Ready 缺失/两次/污染/超时；partial/broken/blocked writer；stde
 exit+grandchild；graceful接受/忽略与force优先；各状态 parent EOF；cancel/probe/reap
 failure；Unconfirmed；POSIX reuse；Windows descendant teardown；真实 stdio helper smoke。
 
-严格 `<=200 changed lines` 顺序：state/policy/error、bounded Launch decode、control reader、
+按 [执行门禁](../EXECUTION.md) 顺序拆分：state/policy/error、bounded Launch decode、control reader、
 single-slot writer、POSIX pipes/observe、Windows pipes/observe/Job empty、common owner seam、
 Launch/Owned、Ready、dispatch/sequence、exit cleanup、deadlines、EOF/cancel 合流、redaction/
 stderr、`run()` helper 接入、POSIX/Windows process smoke、aggregate SOL review。

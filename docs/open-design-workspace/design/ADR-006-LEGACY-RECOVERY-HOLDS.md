@@ -131,7 +131,7 @@ lease identity，也不把“approval 已批准”表述为“工具已执行”
 
 ## 8. 实现与未来改变成本
 
-按 `<=200 changed lines` 逐层交付：ADR/fixtures、nullable bindings、cohort/hold schema、
+按 [执行门禁](../EXECUTION.md) 逐层交付：ADR/fixtures、nullable bindings、cohort/hold schema、
 typed store、legacy root seam、cohort snapshot、approval/tool/grant 回填、marker/invariants、
 classification、sweep protection、decision+intent、ready query、promotion、terminal release、
 RunManager/restart reconcile、projection、scheduler、启动屏障与 E2E。
