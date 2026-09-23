@@ -1,0 +1,25 @@
+name: Workspace root authority
+
+on:
+  push:
+    paths: [rust/crates/agent24-workspace/**, rust/Cargo.toml, rust/Cargo.lock, .github/workflows/workspace-root.yml]
+  pull_request:
+    paths: [rust/crates/agent24-workspace/**, rust/Cargo.toml, rust/Cargo.lock, .github/workflows/workspace-root.yml]
+
+jobs:
+  workspace-root:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Rust stable minimal
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - run: cargo fmt --all --check
+      - run: cargo check -p agent24-workspace
+      - run: cargo test -p agent24-workspace
+      - run: cargo clippy -p agent24-workspace --all-targets -- -D warnings
