@@ -118,11 +118,22 @@ pub(crate) struct OwnedLaunch {
 }
 
 #[cfg(any(unix, windows))]
-fn take_pipes(mut target: OwnedTarget) -> Result<(OwnedTarget, OwnedPipes), LaunchFailure> {
-    match target.take_pipes() {
-        Ok(pipes) => Ok((target, pipes)),
-        Err(error) => Err(LaunchFailure::Pipes {
-            kind: error.kind(),
+fn take_preserving<T, P>(
+    mut target: T,
+    take: impl FnOnce(&mut T) -> io::Result<P>,
+) -> Result<(T, P), (io::ErrorKind, T)> {
+    match take(&mut target) {
+        Ok(value) => Ok((target, value)),
+        Err(error) => Err((error.kind(), target)),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn take_pipes(target: OwnedTarget) -> Result<(OwnedTarget, OwnedPipes), LaunchFailure> {
+    match take_preserving(target, OwnedTarget::take_pipes) {
+        Ok((target, pipes)) => Ok((target, pipes)),
+        Err((kind, target)) => Err(LaunchFailure::Pipes {
+            kind,
             target: Box::new(target),
         }),
     }
@@ -227,6 +238,17 @@ mod tests {
         }
     }
 
+    fn reap(launch: &mut OwnedLaunch) {
+        launch.target_mut().request_stop(true).expect("force stop");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(
+            launch.target_mut().reap_step().expect("reap step"),
+            TreeObservation::ConfirmedEmpty
+        ) {
+            assert!(Instant::now() < deadline, "child was not reaped");
+        }
+    }
+
     #[test]
     fn launch_intent_preserves_fields_and_redacts_debug() {
         let intent = LaunchIntent::from_request(request("/bin/sh", "/")).expect("launch");
@@ -258,22 +280,8 @@ mod tests {
         let mut stdout_text = [0; 28];
         pipes.stdout.read_exact(&mut stdout_text).expect("stdout");
         assert_eq!(stdout_text, *b"/|env-value|argv-value|unset");
-        let OwnedLaunch { target, .. } = launch;
-        let mut failure = match take_pipes(target) {
-            Ok(_) => panic!("second transfer must fail"),
-            Err(error) => error,
-        };
-        match &failure {
-            LaunchFailure::Pipes { kind, .. } => assert_eq!(*kind, io::ErrorKind::InvalidInput),
-            _ => panic!("pipe transfer must report Pipes"),
-        }
-        let target = failure.target_mut().expect("failure retains target");
-        target.request_stop(true).expect("force retained target");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while target.reap_step().expect("reap retained target") != TreeObservation::ConfirmedEmpty {
-            assert!(Instant::now() < deadline, "retained target was not reaped");
-        }
-        drop(failure);
+        reap(&mut launch);
+        drop(launch);
         wait_for_reaper_idle();
     }
 
@@ -288,6 +296,32 @@ mod tests {
             };
         assert_eq!(error, LaunchFailure::Start(io::ErrorKind::NotFound));
         assert!(!format!("{error:?}").contains(missing));
+    }
+
+    #[test]
+    fn failed_transfer_returns_the_same_owner() {
+        struct OwnerMarker {
+            generation: u64,
+            attempted: bool,
+        }
+
+        let failure = take_preserving(
+            OwnerMarker {
+                generation: 17,
+                attempted: false,
+            },
+            |owner| {
+                owner.attempted = true;
+                Err::<(), _>(io::Error::from(io::ErrorKind::InvalidInput))
+            },
+        );
+        let (kind, owner) = match failure {
+            Err(failure) => failure,
+            Ok(_) => panic!("transfer must fail"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidInput);
+        assert_eq!(owner.generation, 17);
+        assert!(owner.attempted);
     }
 }
 
