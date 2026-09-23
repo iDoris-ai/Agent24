@@ -11,6 +11,7 @@ use std::{
     fmt,
     io::{self, Write},
     path::Path,
+    process::Command,
 };
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
@@ -41,8 +42,22 @@ pub enum Request {
     },
 }
 
+#[derive(Clone, Copy)]
+enum DecodeFailure {
+    InvalidJson,
+    InvalidMessage,
+}
+
 #[derive(Default)]
-struct RequestDecodeContext(std::cell::Cell<bool>);
+struct RequestDecodeContext(std::cell::Cell<Option<DecodeFailure>>);
+impl RequestDecodeContext {
+    fn fail(&self, failure: DecodeFailure) {
+        if self.0.get().is_none() {
+            self.0.set(Some(failure));
+        }
+    }
+}
+
 struct RequestSeed<'a>(&'a RequestDecodeContext);
 impl<'de> DeserializeSeed<'de> for RequestSeed<'_> {
     type Value = Request;
@@ -52,6 +67,41 @@ impl<'de> DeserializeSeed<'de> for RequestSeed<'_> {
     ) -> Result<Request, D::Error> {
         deserializer.deserialize_map(RequestVisitor(self.0))
     }
+}
+
+struct TextSeed<'a>(&'a RequestDecodeContext);
+struct TextVisitor<'a>(&'a RequestDecodeContext);
+impl<'de> DeserializeSeed<'de> for TextSeed<'_> {
+    type Value = String;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(TextVisitor(self.0))
+    }
+}
+impl<'de> Visitor<'de> for TextVisitor<'_> {
+    type Value = String;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a bounded string")
+    }
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+        copy_text(self.0, value)
+    }
+}
+
+fn copy_text<E: de::Error>(context: &RequestDecodeContext, value: &str) -> Result<String, E> {
+    if !content(value) {
+        context.fail(DecodeFailure::InvalidMessage);
+        return Err(E::custom("bounded string rejected"));
+    }
+    let mut owned = String::new();
+    owned.try_reserve_exact(value.len()).map_err(|_| {
+        context.fail(DecodeFailure::InvalidMessage);
+        E::custom("string allocation failed")
+    })?;
+    owned.push_str(value);
+    Ok(owned)
 }
 
 struct ArgvSeed<'a>(&'a RequestDecodeContext);
@@ -70,8 +120,8 @@ struct RejectSeed<'a>(&'a RequestDecodeContext);
 impl<'de> DeserializeSeed<'de> for RejectSeed<'_> {
     type Value = ();
     fn deserialize<D: serde::Deserializer<'de>>(self, _deserializer: D) -> Result<(), D::Error> {
-        self.0.0.set(true);
-        Err(de::Error::custom("argv limit exceeded"))
+        self.0.fail(DecodeFailure::InvalidMessage);
+        Err(de::Error::custom("request collection limit exceeded"))
     }
 }
 impl<'de> Visitor<'de> for ArgvVisitor<'_> {
@@ -81,10 +131,12 @@ impl<'de> Visitor<'de> for ArgvVisitor<'_> {
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut argv = Vec::new();
-        argv.try_reserve_exact(MAX_ARGV_ENTRIES)
-            .map_err(|_| de::Error::custom("argv allocation failed"))?;
+        argv.try_reserve_exact(MAX_ARGV_ENTRIES).map_err(|_| {
+            self.0.fail(DecodeFailure::InvalidMessage);
+            de::Error::custom("argv allocation failed")
+        })?;
         while argv.len() < MAX_ARGV_ENTRIES {
-            let Some(arg) = seq.next_element::<String>()? else {
+            let Some(arg) = seq.next_element_seed(TextSeed(self.0))? else {
                 return Ok(argv);
             };
             argv.push(arg);
@@ -112,14 +164,103 @@ impl<'de> Visitor<'de> for EnvVisitor<'_> {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut env = BTreeMap::new();
+        let mut native_keys = NativeEnvKeys::new();
         for _ in 0..MAX_ENV_ENTRIES {
-            let Some(key) = map.next_key::<String>()? else {
+            let Some(key) = map.next_key_seed(TextSeed(self.0))? else {
                 return Ok(env);
             };
-            env.insert(key, map.next_value::<String>()?);
+            if key.is_empty() || key.contains('=') || key.chars().any(char::is_control) {
+                self.0.fail(DecodeFailure::InvalidMessage);
+                return Err(de::Error::custom("invalid environment key"));
+            }
+            if env.contains_key(&key) || native_keys.insert(&key) {
+                self.0.fail(DecodeFailure::InvalidJson);
+                return Err(de::Error::custom("duplicate environment key"));
+            }
+            let value = map.next_value_seed(TextSeed(self.0))?;
+            env.insert(key, value);
         }
         let _ = map.next_key_seed(RejectSeed(self.0))?;
         Ok(env)
+    }
+}
+
+struct NativeEnvKeys(Command);
+impl NativeEnvKeys {
+    fn new() -> Self {
+        let mut command = Command::new("agent24-sidecar");
+        command.env_clear();
+        Self(command)
+    }
+    fn insert(&mut self, key: &str) -> bool {
+        let before = self.0.get_envs().count();
+        self.0.env(key, "");
+        self.0.get_envs().count() == before
+    }
+}
+
+struct FieldSeed;
+impl<'de> DeserializeSeed<'de> for FieldSeed {
+    type Value = u8;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_identifier(NameVisitor {
+            expected: "a sidecar request field",
+            error: "unknown request field",
+            map: request_field,
+        })
+    }
+}
+fn request_field(value: &str) -> Option<u8> {
+    match value {
+        "type" => Some(0),
+        "version" => Some(1),
+        "request_id" => Some(2),
+        "executable" => Some(3),
+        "cwd" => Some(4),
+        "argv" => Some(5),
+        "env" => Some(6),
+        "force" => Some(7),
+        _ => None,
+    }
+}
+
+struct KindSeed;
+impl<'de> DeserializeSeed<'de> for KindSeed {
+    type Value = u8;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(NameVisitor {
+            expected: "a sidecar request kind",
+            error: "unknown request kind",
+            map: request_kind,
+        })
+    }
+}
+struct NameVisitor<T> {
+    expected: &'static str,
+    error: &'static str,
+    map: fn(&str) -> Option<T>,
+}
+impl<'de, T> Visitor<'de> for NameVisitor<T> {
+    type Value = T;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.expected)
+    }
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<T, E> {
+        (self.map)(value).ok_or_else(|| E::custom(self.error))
+    }
+}
+fn request_kind(value: &str) -> Option<u8> {
+    match value {
+        "launch" => Some(0),
+        "signal" => Some(1),
+        "is_empty" => Some(2),
+        _ => None,
     }
 }
 
@@ -133,40 +274,41 @@ impl<'de> Visitor<'de> for RequestVisitor<'_> {
         let (mut kind, mut version, mut request_id) = (None, None, None);
         let (mut executable, mut cwd, mut argv, mut env, mut force) =
             (None, None, None, None, None);
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "type" if kind.is_none() => kind = Some(map.next_value::<String>()?),
-                "version" if version.is_none() => version = Some(map.next_value::<u8>()?),
-                "request_id" if request_id.is_none() => request_id = Some(map.next_value::<u64>()?),
-                "executable" if executable.is_none() => {
-                    executable = Some(map.next_value::<String>()?)
-                }
-                "cwd" if cwd.is_none() => cwd = Some(map.next_value::<String>()?),
-                "argv" if argv.is_none() => argv = Some(map.next_value_seed(ArgvSeed(self.0))?),
-                "env" if env.is_none() => env = Some(map.next_value_seed(EnvSeed(self.0))?),
-                "force" if force.is_none() => force = Some(map.next_value::<bool>()?),
-                _ => {
-                    return Err(de::Error::unknown_field(
-                        &key,
-                        &[
-                            "type",
-                            "version",
-                            "request_id",
-                            "executable",
-                            "cwd",
-                            "argv",
-                            "env",
-                            "force",
-                        ],
-                    ));
-                }
+        let mut seen = 0u8;
+        while let Some(field) = map.next_key_seed(FieldSeed)? {
+            let bit = 1 << field;
+            if seen & bit != 0 {
+                self.0.fail(DecodeFailure::InvalidJson);
+                return Err(de::Error::custom("duplicate request field"));
+            }
+            seen |= bit;
+            match field {
+                0 => kind = Some(map.next_value_seed(KindSeed)?),
+                1 => version = Some(map.next_value::<u8>()?),
+                2 => request_id = Some(map.next_value::<u64>()?),
+                3 => executable = Some(map.next_value_seed(TextSeed(self.0))?),
+                4 => cwd = Some(map.next_value_seed(TextSeed(self.0))?),
+                5 => argv = Some(map.next_value_seed(ArgvSeed(self.0))?),
+                6 => env = Some(map.next_value_seed(EnvSeed(self.0))?),
+                7 => force = Some(map.next_value::<bool>()?),
+                _ => unreachable!(),
             }
         }
-        let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
-        let version = version.ok_or_else(|| de::Error::missing_field("version"))?;
-        let request_id = request_id.ok_or_else(|| de::Error::missing_field("request_id"))?;
-        match kind.as_str() {
-            "launch" if force.is_none() => Ok(Request::Launch {
+        let kind = kind.ok_or_else(|| de::Error::custom("missing request kind"))?;
+        let version = version.ok_or_else(|| de::Error::custom("missing request version"))?;
+        let request_id = request_id.ok_or_else(|| de::Error::custom("missing request id"))?;
+        let required = match kind {
+            0 => 0b0111_1111,
+            1 => 0b1000_0111,
+            2 => 0b0000_0111,
+            _ => unreachable!(),
+        };
+        if seen != required {
+            self.0.fail(DecodeFailure::InvalidJson);
+            return Err(de::Error::custom("invalid request field set"));
+        }
+        match kind {
+            0 => Ok(Request::Launch {
                 version,
                 request_id,
                 executable: executable.ok_or_else(|| de::Error::missing_field("executable"))?,
@@ -174,34 +316,16 @@ impl<'de> Visitor<'de> for RequestVisitor<'_> {
                 argv: argv.ok_or_else(|| de::Error::missing_field("argv"))?,
                 env: env.ok_or_else(|| de::Error::missing_field("env"))?,
             }),
-            "signal"
-                if executable.is_none() && cwd.is_none() && argv.is_none() && env.is_none() =>
-            {
-                Ok(Request::Signal {
-                    version,
-                    request_id,
-                    force: force.ok_or_else(|| de::Error::missing_field("force"))?,
-                })
-            }
-            "is_empty"
-                if executable.is_none()
-                    && cwd.is_none()
-                    && argv.is_none()
-                    && env.is_none()
-                    && force.is_none() =>
-            {
-                Ok(Request::IsEmpty {
-                    version,
-                    request_id,
-                })
-            }
-            "launch" | "signal" | "is_empty" => {
-                Err(de::Error::custom("invalid sidecar request fields"))
-            }
-            _ => Err(de::Error::unknown_variant(
-                &kind,
-                &["launch", "signal", "is_empty"],
-            )),
+            1 => Ok(Request::Signal {
+                version,
+                request_id,
+                force: force.ok_or_else(|| de::Error::missing_field("force"))?,
+            }),
+            2 => Ok(Request::IsEmpty {
+                version,
+                request_id,
+            }),
+            _ => unreachable!(),
         }
     }
 }
@@ -344,6 +468,21 @@ fn version(v: u8) -> Result<(), ProtocolError> {
         Err(ProtocolError::InvalidMessage)
     }
 }
+fn validate_environment(env: &BTreeMap<String, String>) -> Result<(), ProtocolError> {
+    if env.len() > MAX_ENV_ENTRIES {
+        return Err(ProtocolError::InvalidMessage);
+    }
+    let mut native_keys = NativeEnvKeys::new();
+    for (key, value) in env {
+        if !nonempty_content(key) || key.contains('=') || !content(value) {
+            return Err(ProtocolError::InvalidMessage);
+        }
+        if native_keys.insert(key) {
+            return Err(ProtocolError::InvalidMessage);
+        }
+    }
+    Ok(())
+}
 fn validate_request_data(request: &Request) -> Result<(), ProtocolError> {
     match request {
         Request::Launch {
@@ -362,13 +501,10 @@ fn validate_request_data(request: &Request) -> Result<(), ProtocolError> {
                 || !nonempty_content(cwd)
                 || argv.len() > MAX_ARGV_ENTRIES
                 || argv.iter().any(|arg| !content(arg))
-                || env.len() > MAX_ENV_ENTRIES
-                || env
-                    .iter()
-                    .any(|(k, v)| !nonempty_content(k) || k.contains('=') || !content(v))
             {
                 return Err(ProtocolError::InvalidMessage);
             }
+            validate_environment(env)?;
         }
         Request::Signal {
             version: v,
@@ -547,10 +683,9 @@ pub fn decode_request(
     Ok(request)
 }
 fn request_decode_error(context: &RequestDecodeContext) -> ProtocolError {
-    if context.0.get() {
-        ProtocolError::InvalidMessage
-    } else {
-        ProtocolError::InvalidJson
+    match context.0.get() {
+        Some(DecodeFailure::InvalidMessage) => ProtocolError::InvalidMessage,
+        Some(DecodeFailure::InvalidJson) | None => ProtocolError::InvalidJson,
     }
 }
 pub fn encode_reply(reply: &Reply) -> Result<Vec<u8>, ProtocolError> {
@@ -633,6 +768,18 @@ mod tests {
             argv: argv.into_iter().map(Into::into).collect(),
             env: env.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
         }
+    }
+
+    fn raw_launch(argv: &str, env: &str) -> Vec<u8> {
+        format!(
+            r#"{{"type":"launch","version":1,"request_id":1,"executable":{},"cwd":{},"argv":[{}],"env":{}}}
+"#,
+            serde_json::to_string(exe()).unwrap(),
+            serde_json::to_string(cwd()).unwrap(),
+            argv,
+            env
+        )
+        .into_bytes()
     }
 
     fn boundary_launch(extra_len: usize) -> Request {
@@ -1032,7 +1179,7 @@ mod tests {
         );
         assert_eq!(
             decode_request(duplicate.as_bytes(), &mut RequestSequence::new()),
-            Ok(custom(1, exe(), cwd(), vec![], vec![("K", "last")]))
+            Err(ProtocolError::InvalidJson)
         );
     }
 
@@ -1072,6 +1219,108 @@ mod tests {
                 force: false,
             })
         );
+    }
+
+    #[test]
+    fn bounded_text_decodes_escapes_and_multibyte_edges() {
+        let exact = "é".repeat(2_048);
+        let exact_frame = raw_launch(&serde_json::to_string(&exact).unwrap(), "{}");
+        assert!(decode_request(&exact_frame, &mut RequestSequence::new()).is_ok());
+        let over = "é".repeat(2_049);
+        let over_frame = raw_launch(&serde_json::to_string(&over).unwrap(), "{}");
+        assert_eq!(
+            decode_request(&over_frame, &mut RequestSequence::new()),
+            Err(ProtocolError::InvalidMessage)
+        );
+        let escaped = raw_launch(r#""\u0061""#, r#"{"K":"\u0062"}"#);
+        let decoded = decode_request(&escaped, &mut RequestSequence::new()).unwrap();
+        assert_eq!(
+            decoded,
+            custom(1, exe(), cwd(), vec!["a"], vec![("K", "b")])
+        );
+        let control = raw_launch(r#""\u0000""#, "{}");
+        assert_eq!(
+            decode_request(&control, &mut RequestSequence::new()),
+            Err(ProtocolError::InvalidMessage)
+        );
+    }
+
+    #[test]
+    fn escaped_duplicate_environment_key_is_rejected_before_value() {
+        let frame = raw_launch("", r#"{"KEY":"first","\u004bEY":"second"}"#);
+        assert_eq!(
+            decode_request(&frame, &mut RequestSequence::new()),
+            Err(ProtocolError::InvalidJson)
+        );
+        let equals = raw_launch("", r#"{"A\u003dB":"value"}"#);
+        assert_eq!(
+            decode_request(&equals, &mut RequestSequence::new()),
+            Err(ProtocolError::InvalidMessage)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_allows_case_distinct_environment_keys() {
+        let frame = raw_launch("", r#"{"PATH":"one","Path":"two"}"#);
+        assert!(decode_request(&frame, &mut RequestSequence::new()).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_equivalent_environment_keys_are_rejected() {
+        let frame = raw_launch("", r#"{"PATH":"one","Path":"two","π":"three"}"#);
+        assert_eq!(
+            decode_request(&frame, &mut RequestSequence::new()),
+            Err(ProtocolError::InvalidJson)
+        );
+    }
+
+    #[test]
+    fn duplicate_top_level_fields_and_u64_sequence_fail_without_mutation() {
+        let duplicate = raw_launch("", "{}");
+        let duplicate = String::from_utf8(duplicate)
+            .unwrap()
+            .replacen(
+                r#""type":"launch""#,
+                r#""type":"launch","type":"launch""#,
+                1,
+            )
+            .into_bytes();
+        assert_eq!(
+            decode_request(&duplicate, &mut RequestSequence::new()),
+            Err(ProtocolError::InvalidJson)
+        );
+        let escaped = raw_launch("", "{}");
+        let escaped = String::from_utf8(escaped)
+            .unwrap()
+            .replacen(
+                r#""type":"launch""#,
+                r#""type":"launch","\u0074ype":"launch""#,
+                1,
+            )
+            .into_bytes();
+        assert_eq!(
+            decode_request(&escaped, &mut RequestSequence::new()),
+            Err(ProtocolError::InvalidJson)
+        );
+
+        let max = custom(u64::MAX, exe(), cwd(), vec![], vec![]);
+        let max_frame = encode_frame(&max, MAX_CONTROL_FRAME_BYTES).unwrap();
+        let mut sequence = RequestSequence::new();
+        assert_eq!(decode_request(&max_frame, &mut sequence), Ok(max));
+        let before = sequence.clone();
+        let signal = Request::Signal {
+            version: 1,
+            request_id: u64::MAX,
+            force: false,
+        };
+        let signal_frame = encode_frame(&signal, MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(
+            decode_request(&signal_frame, &mut sequence),
+            Err(ProtocolError::WrongSequence)
+        );
+        assert_eq!(sequence, before);
     }
 
     #[test]
