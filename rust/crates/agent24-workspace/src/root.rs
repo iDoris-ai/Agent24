@@ -150,3 +150,6 @@ impl ManagedParent {
         Err(WorkspaceError::UnsupportedPlatform)
     }
 }
+
+#[cfg(test)]
+mod tests;
