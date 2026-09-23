@@ -1,13 +1,14 @@
 # ME4-S1 —— 调度回调 `_a24/scheduler/*` + fired 投递（ME4-1.1.1）
 
-> **草稿 v2，待第 2 轮评审**（2026-09-24）。v1 经第 1 轮对抗评审（全新上下文 Opus 子代理，Codex 额度耗尽期间）**REQUEST_CHANGES**，21 条逐条核对后全部采纳，见「v1 → v2 改动记录」。
+> **草稿 v3，待第 3 轮评审**（2026-09-24）。第 1 轮（v1）REQUEST_CHANGES 21 条全部采纳；第 2 轮（v2）REQUEST_CHANGES：第 1 轮大部分确认 FIXED，新提 2 High + 4 Medium + 6 Low + 3 处补全，全部采纳，见「v2 → v3 改动记录」。两轮均由全新上下文的 Opus 子代理做（Codex 额度耗尽期间）。
 > 评审方：Codex 额度 2026-09-29 19:28 前耗尽 → 按 `PLAN-ME4-OS-CAPABILITIES.md` §一 第 3 条，由**全新上下文的 Opus 子代理**做对抗评审，并在 `followups.md` 记 `ME4-CODEX-DEBT`，额度恢复后补审。
 > 冻结条件（ME4-1.1.1 验收）：末轮 approve 且无 Critical/High；本文所有 Rust 片段在 scratch crate 里 `cargo check`/`clippy -D warnings`/`test` 通过（附录 A）；SPEC-ME3 §3 方法表出现 `_a24/scheduler/*` 行。
 >
 > | 轮次 | 版本 | 结论 | Critical | High | Medium | Low |
 > |---|---|---|---|---|---|---|
 > | 1 | v1 | REQUEST_CHANGES | 0 | 3 | 10 | 8 |
-> | — | v2 | 待送审 | — | — | — | — |
+> | 2 | v2 | REQUEST_CHANGES | 0 | 2 | 4 | 6 |
+> | — | v3 | 待送审 | — | — | — | — |
 >
 > 输入：`docs/agent/PLAN-ME4-OS-CAPABILITIES.md` §〇/§一/§二 S1（**硬约束是下限**，本文只收紧、不放松）/§三 ME4-1.1.1…1.5.1/§五；`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md` §0 §2 §3 §5 §8 §9。
 > 格式照 `docs/design/T8.5c-W-wire.md`。
@@ -16,8 +17,31 @@
 
 | 版本 | 改了什么 | 为什么 |
 |---|---|---|
-| v2 | 第 1 轮评审 21 条全部采纳（下表） | 见「v1 → v2 改动记录」 |
+| v3 | 第 2 轮评审 12 条 + 3 处补全全部采纳 | 见「v2 → v3 改动记录」 |
+| v2 | 第 1 轮评审 21 条全部采纳 | 见「v1 → v2 改动记录」 |
 | v1（草稿） | 初稿。另吸收一条来自 Sin90 T3.1.1 对抗评审、已核实的补充输入：cron 0.15 的星期字段不是 POSIX（1..=7 且 1=周日）→ §6.3 裁决模块路径的星期字段只收 `*` 与英文缩写 | 统筹者 2026-09-23 转达；scratch crate 用真实 `next_fire` 复现：`0 7 * * 1-5` 从周六起算，下一次落在**周日**（附录 A 测试 `mon_fri_first_fire_is_a_monday` 的负对照） |
+
+## v2 → v3 改动记录（第 2 轮：0 Critical / 2 High / 4 Medium / 6 Low，全部采纳；评审验证 crate `scratchpad/r2-review/`）
+
+| # | 级别 | 问题（已对照代码 / scratch 核实） | v3 的处理 |
+|---|---|---|---|
+| H-A | High | v2 的「字节可能已离开」标志只在 `exchange` **返回**时置位，但真实 `exchange` 在 `send_request(..).await` 里一直等到响应头才返回（`proxy.rs:855-858`）：请求已写出、模块没回头时被 revoke → `select!` 丢掉 `exchange` → 标志仍为 false → `Deferred(NeverSent)`。每收到 fired 就崩溃的模块又会被无限重投，C4.9 结果不确定 | 标志改在 **`send_guard` 放行的那一刻**置位（`let guard = \|\| { let ok = in_flight.dispatch(); if ok { flag.store(true) } ok }` 传给 `exchange`；scratch 已编译，桩按真实顺序调用 guard）。「guard 放行 → hyper 接手」之间被 revoke 会偏保守地多算一次尝试，写进残余 R11。C4.9 改成确定性：上游**读完整个请求后阻塞** → revoke → 断言 `Failed`、`attempts=1` |
+| H-B | High | `_a24` 后面接点段会原样转发：`/_a24/scheduler/fired/../../..`、`/_a24/..`、`/_a24/../x`、`/_a24/%2e%2e`、`/_a24;/..` 在 v2 里全判 Forward（v2 只看规范化后的首段，而转发的是原始路径；模块按前缀匹配就会被伪造） | 采用 (a)：**解码后只要出现点段（`.`/`..`，含 `;` 形式、含去掉末尾空格/点后的 `..%20`、`...`）一律 400**，不再在内核视图里「解析」它们（§7.2 第 3 步，scratch 已改）。C3.1 里 `./_a24`、`x/../_a24`、`x/%2e%2e/_a24`、`x/..;/_a24` 等从 404 移到 C3.2 的 400；C3.2 加上面 5 例 + `x/..%20/_a24`、`x/.../_a24`、`routines/./today`；变异：只判规范化视图 → 这些用例变红（C3.5）。§7.4 的保证措辞同步 |
+| M-A | Medium | `last_fire` 只取最新一行，run_now 会把 tick 那条的结果盖住 | `last_fire: {tick: Option<LastFire>, run_now: Option<LastFire>}`（scratch `MODULE_STATE_SELECT` 两个 LEFT JOIN）；C1.12 加「`At` 过期后再 run_now，tick 那条的 `expired` 仍可见」 |
+| M-B | Medium | `CallbackDeps` 按引用传，S2 需要它随 `mount_all` 返回而 drop 来关闭用量通道；§10.3 的 SPEC 终态缺 S2 的补充不做条目，还留着过时的「ME4-4.2.1 依赖 ME4-1.5.1」 | `mount_all(…, deps: CallbackDeps, …)` **按值**，借给每个 `mount_package` 的是 `&CallbackDeps`，`mount_all` 返回即 drop（scratch `mount_all_shape`）；§10.3 写明这一点；§9 终态改为「不做 `Policy`；S2 的补充不做条目（tools、流式、`model/list`）保留」；删掉过时依赖句（S2 已挪到 4.2.2b2） |
+| M-C | Medium | C6 靠环境变量控制测试模块，但 `launch.rs:561-562` 先 `env_clear()` 再只放白名单（`INHERITED_ENV`），变量传不进模块 | 改为模块自判：数据目录里已有 `at` 文件 = 第二次启动 → 握手前 sleep 3s（< `STARTUP_TIMEOUT` 10s）；加前置断言（重启前探针文件里没有该 key，且此刻早于 `At - 5s`；不满足直接失败，防止空转）；`At` 放宽到首次启动 + 15s；措辞改为「Starting 期间到点 → 延迟 → 投递」 |
+| M-D | Medium | 测试缝放错 crate：C2.9 需要打断 `Scheduler::update` 的读与写；C4.7a/b 需要 `Generation::revoke`，它是 `pub(crate)` | C2.9 移到 `-p agent24-scheduler`，`update` 委托给带普通 `Option` 钩子参数的内部函数，生产传 `None`（照 `TakeSendGate`，scratch `BetweenReadAndWrite`）；C4.7a/b 移到 `-p agent24-os-proto kernel_call`，由 `send_kernel_request` 自带的 `before_guard: Option<&(dyn Fn() + Sync)>` 缝提供时机（scratch 已编译） |
+| L-A | Low | 「`attempts=0` = 从未发出」不成立：尝试进行中崩溃 / 停机，或 tick 与在途尝试竞态，都会留下 `attempts=0` 却已发出的行 | 措辞改正（§4.2、§4.3 T8a）：`attempts=0` 只表示「没有**已落库**的尝试结果」；删它只影响可观测性（取代本来就意味着不再投），不影响任何投递决定。C4.8 固定 `Clock`（或用 `At`），不依赖真实时间 |
+| L-B | Low | 自审第 6 条「最新行必在修剪保留集里」的论证不成立：修剪按 schedule，5 次已投递的 run_now 会把 tick 那条挤掉 | 修剪改成**按 (schedule, 来源)** 各留 4 条（scratch `PRUNE_TERMINAL_SQL` + 测试：6 次 run_now 后 tick 行数不变，且该测试在按 schedule 修剪时会失败）；自审第 6 条按新规则重写论证 |
+| L-C | Low | resume 不幂等：重复 resume 会 bump revision 并把 `next_run_at` 往后推 | suspend/resume 的 `WHERE` 加状态条件（suspend 只命中未暂停的行；resume 只命中 `user_suspended = 1 OR system_disabled_reason IS NOT NULL` 的行）；重复调用影响 0 行，REST 仍回 200 + 当前视图（scratch 测试） |
+| L-D | Low | 视图只有 `effective_enabled`，看不出是谁停的 | 视图加 `disabled_by: "module" \| "user" \| "system" \| null`（scratch `effective()`；优先级 user > system > module） |
+| L-E | Low | C5.9 的「按 diff 判」不可执行 | 改成脚本判定：`git diff -U0 origin/main...HEAD -- rust/crates/agent24-os-proto/src/rpc.rs docs/specs/SPEC-ME3-OUT-OF-PROCESS.md \| grep -E 'ErrorKind\|ALL\|unavailable\|闭集'` 输出为空 |
+| L-F | Low | `DELIVERY_TIMEOUT` 写死 10s，C4.5 要真等 10s | `ModuleDeliverer` 持有 `KernelLimits`（生产 = 10s / 64 KiB），测试注入 300ms；C4.5 用 300ms |
+| 补 | — | 冻结头轮次表缺 v2 行 | 已补 |
+| 补 | — | M1 的桌面端改动清单不全 | §8.2 / §13 补全：`Schedules.tsx:105`（切换）、`:240`、`:256`（列表里读 `enabled` 的两处显示），`api.ts:39-50` 的 `Schedule` 类型（`action` 可空、加 `effective_enabled`/`disabled_by`/`owner`），全部回退写成 `effective_enabled ?? enabled`（旧 daemon 前向兼容） |
+| 补 | — | M3 只改了容量 | SPEC 的 upsert 行写明「对账必须能承受 `rate_limited` 并退避重试」 |
+
+另外，ME4-1.2.2 的切法写进了 §13「交给 PLAN」：1.2.2a 协议与视图 → 1.2.2b 触发接口与 tick → 1.2.2c REST 护栏；1.2.2d 桌面端可与 a 并行。
 
 ## v1 → v2 改动记录（第 1 轮：0 Critical / 3 High / 10 Medium / 8 Low，全部采纳）
 
@@ -302,7 +326,7 @@ v1 写的是「每一个被记录的 fire 至少一次」，那**不成立**，v
 2. **退役**（T9）：模块改了 spec / 关了 `enabled`、或用户暂停，旧 slot 的未完成 fire 不再投。
 3. **过期**（T7）：`fired_at` 之后 24h 仍未送达。
 
-所以**模块不得假设每个 slot 都会送达**，也不得假设送达顺序；它要做的是按 `fire_id` 去重，并在需要时用 `_a24/scheduler/list` 的 `last_fire`（§6.1）确认最近一次的去向 —— 一个一次性 `At` 过期没送到，与送到了，在 `list` 里是可区分的（`last_fire.status = expired` vs `delivered`）。
+所以**模块不得假设每个 slot 都会送达**，也不得假设送达顺序；它要做的是按 `fire_id` 去重，并在需要时用 `_a24/scheduler/list` 的 `last_fire.tick` / `last_fire.run_now`（§6.1，v3 按来源分开）确认最近一次的去向 —— 一个一次性 `At` 过期没送到，与送到了，在 `list` 里是可区分的（`last_fire.tick.status = expired` vs `delivered`），之后的 run_now 也不会盖住它。
 
 ### 4.2 确定性 `fire_id` 与记录事务
 
@@ -318,9 +342,9 @@ pub fn derive(trigger: FireTrigger, schedule_id: &str, scheduled_for: DateTime<U
 
 tick 对模块行（owner 在 `InstalledOwners` 里）：在**一个** `BEGIN IMMEDIATE` 事务里（scratch `advance_and_record_fire`）：
 1. §2.3 的 CAS pre-advance；输了 → 回滚，什么都不写。
-2. **取代同来源的旧未完成投递**：`attempts = 0` 的（从未发出，没有任何值得留的痕迹）直接 `DELETE`；`attempts > 0` 的置 `expired('superseded')`。条件都带 `fire_trigger = 本次 trigger`。
+2. **取代同来源的旧未完成投递**：`attempts = 0` 的直接 `DELETE`，`attempts > 0` 的置 `expired('superseded')`；条件都带 `fire_trigger = 本次 trigger`。**v3 更正（L-A）**：`attempts = 0` **不等于**「从未发出」—— 尝试进行中 daemon 崩溃 / 停机，或 tick 取代时恰好有一次在途尝试，都会留下 `attempts = 0` 却已发出的行。它只表示「没有已落库的尝试结果」。删掉它只损失可观测性（被取代本来就意味着不再投递；在途那次若随后 2xx，CAS 失败、结果丢弃，模块已收到），不影响任何投递决定。
 3. `INSERT … status='pending', attempts=0, next_attempt_at=now, expires_at=fired_at+24h ON CONFLICT(fire_id) DO NOTHING`。
-4. **修剪终态行**：同一 schedule 的终态行只留 `updated_at` 最新的 4 条（`PRUNE_TERMINAL_SQL`）。
+4. **修剪终态行**：同一 schedule、**同一来源**的终态行只留 `(updated_at, rowid)` 最新的 4 条（`PRUNE_TERMINAL_SQL`；v3 L-B 从「按 schedule」改为「按 (schedule, 来源)」）。
 
 崩溃分析：1–4 要么全落要么全不落。全不落 → `next_run_at` 没动，下一次 tick 读到同一个到点 slot，算出**同一个 fire_id**。全落 → 行在表里，重启后泵续投（§4.6）。**「pre-advance 之后、trigger 之前崩溃丢一次」这个窗口不复存在。**
 
@@ -339,15 +363,15 @@ owner **不在** `InstalledOwners`（本次启动的 catalogue 里根本没有�
 | T5 | pending / deferred | `Failed`，且 attempts+1 < 3 | pending | +1 | now + [5s, 15s][attempts] | 无 | — |
 | T6 | pending / deferred | `Failed`，且 attempts+1 = 3 | failed | 3 | NULL | `consecutive_failures += 1`；到 5 → `system_disabled_reason='consecutive_failures'`、`next_run_at=NULL`、revision+1 | 首次越线发 `schedule.disabled` |
 | T7 | pending / deferred | `expires_at <= now`（清扫） | expired（`ttl`） | 不变 | NULL | 无 | — |
-| T8a | pending / deferred，attempts = 0 | 同 schedule **同来源**记录了新 fire | （行删除） | — | — | 无 | — |
+| T8a | pending / deferred，attempts = 0（没有已落库的尝试结果；不保证未发出，见 §4.2） | 同 schedule **同来源**记录了新 fire | （行删除） | — | — | 无 | — |
 | T8b | pending / deferred，attempts > 0 | 同上 | expired（`superseded`） | 不变 | NULL | 无 | — |
 | T9 | pending / deferred | 模块 upsert 改了 spec 或把 `enabled` 关掉；用户 suspend | expired（`superseded_by_upsert` / `suspended`） | 不变 | NULL | 同事务 | — |
 | T10 | 任意 | schedule 行被删（模块 delete / REST DELETE） | （行消失，FK 级联） | — | — | — | — |
-| T11 | delivered / failed / expired | 同 schedule 的终态行超过 4 条（每次记录 fire 时修剪） | （较旧的行删除） | — | — | — | — |
+| T11 | delivered / failed / expired | 同 schedule 同来源的终态行超过 4 条（每次记录该来源的 fire 时修剪） | （较旧的行删除） | — | — | — | — |
 
 - T2/T5/T6 由泵按 `(fire_id, status ∈ {pending,deferred}, attempts = 读到的值)` **CAS** 落库，与该 schedule 的计数器同一事务（scratch `apply_delivery_outcome`）。CAS 输（被 T7/T8/T9/T10 抢先）→ 结果丢弃；即便那次其实已 2xx，也不补发事件 —— 模块已经收到了，丢的只是一条通知。
 - 状态机本身是纯函数 `apply_outcome(from, attempts, &FireOutcome, now) -> Result<Applied, NotApplied>`（scratch `src/delivery.rs`，含单测：三次失败只计一次失败；重复延迟 `NotApplied::NoChange` 不写库也不计数；终态不动）。
-- 修剪永远保留**最新**的终态行，所以 `list` 的 `last_fire`（取最新创建的一行）不会被修剪掉。
+- 修剪不会删掉某来源 `last_fire` 指向的那一行，论证见 §12 第 6 条（v3 重写）。
 
 ### 4.4 重试次数与退避上限（S1-8 裁决）
 
@@ -359,7 +383,7 @@ owner **不在** `InstalledOwners`（本次启动的 catalogue 里根本没有�
 ### 4.5 过期策略（S1-6/S1-8 裁决）
 
 - `expires_at = fired_at + 24h`（`DELIVERY_TTL`）。**从 `fired_at` 起算，不从 `scheduled_for`**：daemon 停机三天后启动，skip-missed 触发的那一次 `scheduled_for` 是三天前，若从它起算会立刻过期 —— 那等于把 skip-missed 的「触发一次」吞掉。
-- 过期清扫每 60s 一次（`SWEEP_INTERVAL`），不是每轮泵 —— 它是写语句，没必要每秒抢写锁。终态行的回收由 T11（按 schedule 留 4 条）负责，不再有按时间的 GC。
+- 过期清扫每 60s 一次（`SWEEP_INTERVAL`），不是每轮泵 —— 它是写语句，没必要每秒抢写锁。终态行的回收由 T11（按 (schedule, 来源) 各留 4 条）负责，不再有按时间的 GC。
 - 过期是终态、**不计失败**：过期意味着模块在 24h 内一直没处于可投状态，那是「不可用」，不是「投递失败」。过期行保留在表里（受 T11 约束），`last_fire` 可见。
 
 ### 4.6 重启恢复流程
@@ -440,11 +464,23 @@ pub const FIRE_ID_HEADER: &str = "x-a24-fire-id";
 3. 构造请求：`POST <path>`，头 = 调用方给的 `x-a24-schedule-key`/`x-a24-fire-id` + `x-a24-request-id` + `x-a24-approval-token` + `Host: agent24-module.invalid` + `Content-Type: application/json`。审批 token 也注入 —— fired handler 与任何被代理请求一样，可以在处理期间提交一次 `_a24/approval/advise`。
 4. **构造完之后才 `in_flight.dispatch()`**；`false`（准入之后被 revoke）→ `NotDispatched`，**一个字节都不发**（S1-7）。
 5. `exchange(…, force_fresh = true, None, Some(&|| in_flight.dispatch()))`：**每次新连接、不入池**（内核请求不幂等，不给复用连接留任何半关闭窗口），连接之后发送之前再查一次 `dispatch()`（沿用 FU-64 的 `send_guard`；这里为 `false` 时 `exchange` 回 `NotSent`，零字节）。
-6. **「字节可能已离开」标志（v2 H1）**：`send_kernel_request` 自己持有一个 `AtomicBool`，**只在** `exchange` 返回响应头、或返回 `MaybeSent` 时置位。`dispatch()` 被调了两次（第 4 步与第 5 步的 `send_guard`），所以 `Generation` 记下的「已 dispatch」只说明「`dispatch()` 曾返回过 `true`」，**不说明字节离开过** —— v1 用 `finish()` 返回的 `Abandoned.dispatched` 判定，会把「连接之后、`send_guard` 之前被 revoke」这一格（零字节）误判成已发出。
+6. **「字节可能已离开」标志（v2 H1，v3 H-A 改正置位点）**：`send_kernel_request` 自己持有一个 `AtomicBool`，**在 `send_guard` 放行的那一刻置位**：
+   ```rust
+   let guard = || {
+       if let Some(hook) = before_guard { hook(); }   // 测试缝，生产为 None
+       let ok = in_flight.dispatch();
+       if ok { may_have_left.store(true, SeqCst); }
+       ok
+   };
+   // exchange(…, force_fresh = true, None, Some(&guard))
+   ```
+   `dispatch()` 被调了两次（第 4 步与 `send_guard`），所以 `Generation` 记下的「已 dispatch」只说明「`dispatch()` 曾返回过 `true`」，**不说明字节离开过** —— v1 用 `Abandoned.dispatched` 判定，会把「连接之后、`send_guard` 之前被 revoke」这一格（零字节）误判成已发出。v2 改成「`exchange` 返回响应头或 `MaybeSent` 时置位」，又漏了另一格：真实 `exchange` 在 `send_request(..).await` 里一直等到**响应头**才返回（`proxy.rs:855-858`），模块读完请求却不回头时被 revoke，`select!` 直接丢掉 `exchange`，标志仍为 false —— 毒丸截断失效。v3 在 guard 里置位覆盖了这两格；代价是「guard 放行 → hyper 真正接手」之间被 revoke 会偏保守地算一次尝试（残余 R11）。
 7. 整个交换与 `in_flight.revoked()` 赛跑（同 `proxy()`），外层 `timeout(limits.total)`；响应 body 在 64 KiB 上限内读完即弃。
 8. **判定顺序**：先 `finish()`（提交点，且让 id 立即出表）。然后：**收到过 2xx 响应头 → `Ok`**，不管 body 是否超限、是否超时、`finish()` 是否报 Abandoned（v2 L2：2xx 头就是确认）；否则 `finish()` 为 `Err(Abandoned)` 或被 revoke 抢先 → `Abandoned{ dispatched: 标志 }`；否则取传输结果。
 
-scratch 的 `send_kernel_request` / `exchange_once` 按以上八步完整实现并通过 clippy（物理发送用同形桩，桩的签名带 `send_guard`）。
+scratch 的 `send_kernel_request` / `exchange_once` 按以上八步完整实现并通过 clippy（物理发送用同形桩，桩按真实顺序先调 `send_guard` 再「发送」）。
+
+**测试缝与可注入上限（v3 M-D / L-F）**：`send_kernel_request(generation, ids, request, limits, before_guard: Option<&(dyn Fn() + Sync)>)` —— `before_guard` 在连接建立之后、`send_guard` 之前执行，生产传 `None`；它让 **os-proto 自己的测试**（能调 `pub(crate)` 的 `Generation::revoke`）确定性地命中 C4.7b 那一格。`limits` 由 `ModuleDeliverer` 持有并注入（生产 `KernelLimits { total: 10s, max_response_bytes: 64 KiB }`），测试用 300ms。
 
 InFlight 的生命周期因此是：`admit_request` 起 → 响应读完或超时或被 revoke 止，**始终由 `send_kernel_request` 的栈帧持有**；任何 early return / panic / 被取消都经 `Drop` 出表（`drain.rs:1002`）。**投递进行中，模块 fired handler 用 `X-A24-Request-Id` 发的回调在 Draining 期间仍能通过 `admit_callback_bound`；投递结束的那一刻起同一个 id 就不能**（判据 C4.6）。hot-disable 的 drain 宽限是 30s（`os_routes.rs:300`）> 10s 投递上限，所以正常情况下投递在宽限内自然结束。
 
@@ -465,7 +501,7 @@ InFlight 的生命周期因此是：`admit_request` 起 → 响应读完或超�
 | `Refused(NotReady / Draining / Stopping)` | `Deferred(NotReady / Draining / Stopping)` |
 | `Refused(DuplicateId)`、`EntropyUnavailable` | `Deferred(KernelTransient)` |
 | `NotDispatched`、`Abandoned{dispatched:false}`（标志未置位，含「连接后、`send_guard` 前被 revoke」） | `Deferred(NeverSent)` |
-| `Abandoned{dispatched:true}`（标志已置位：拿到过非 2xx 头或 `MaybeSent`，随后被 revoke） | **`Failed`**（见下） |
+| `Abandoned{dispatched:true}`（标志已置位：`send_guard` 放行过，随后被 revoke —— 含「模块读完请求、还没回头」） | **`Failed`**（见下） |
 | `NotSent`（generation 未被 revoke 却连不上）、`MaybeSent`、`Timeout`、`ResponseTooLarge` | `Failed` |
 
 `Abandoned{dispatched:true}`（字节可能已离开，随后 generation 被 revoke）算一次**已发出的失败尝试**，而不是延迟：
@@ -525,12 +561,13 @@ pub struct SchedulerListParams { request_id: Option<String>, _meta: Option<Map<S
 pub struct ModuleScheduleState {
     pub key: String, pub spec: ScheduleSpec, pub enabled: bool, pub label: String,
     pub user_suspended: bool, pub system_disabled_reason: Option<String>, pub next_run_at: Option<String>,
-    pub last_fire: Option<LastFire>,   // v2（H3）
+    pub last_fire: LastFires,          // v2（H3），v3（M-A）按来源分开
 }
 #[derive(Serialize)]
-pub struct LastFire {                  // 该 schedule 最近一次 fire（按创建先后），不论状态
+pub struct LastFires { pub tick: Option<LastFire>, pub run_now: Option<LastFire> }
+#[derive(Serialize)]
+pub struct LastFire {                  // 该来源最近一次 fire（按创建先后），不论状态
     pub fire_id: String, pub scheduled_for: String,
-    pub trigger: String,               // tick | run_now
     pub status: String,                // pending | deferred | delivered | failed | expired
     pub last_error: Option<String>,
 }
@@ -541,7 +578,7 @@ pub struct LastFire {                  // 该 schedule 最近一次 fire（按�
 
 - 模块侧的 spec **不是** `agent24_protocol::ScheduleSpec` 本身：后者在变体内部不拒未知键（`types.rs:649`），改它会改 REST 契约。`ModuleSpec` 在每一层都严格，再转换成 `ScheduleSpec` 存库。scratch 断言 `{"type":"every","secs":60,"x":1}` 与 `{"type":"cron",…,"zone":"UTC"}` 都是解析失败。
 - params 里**没有** owner 字段；顶层带 `owner_module` 是解析失败；`_meta` 里的任何东西（含 `owner_module`/`org`）都不被读（S1-10）。
-- `list` 返回**完整期望状态**（S1-4）：`spec/enabled/label` 是模块自己能比对的期望，`user_suspended/system_disabled_reason` 告诉它内核为什么没按期望触发，`next_run_at` 供诊断，`last_fire` 让模块看得见最近一次 fire 的去向（v2 H3：一次性 `At` 过期没送到 → `last_fire.status = "expired"`，与 `"delivered"` 可区分）。**从不返回内核的 `schedule_id`**。256 条 × 每条 < 1.5 KiB（key ≤128、label ≤128、cron ≤128、tz ≤64、ts ≤64、`last_fire` ≈ 200 + `last_error` ≤ 256）< 400 KiB，低于 1 MiB 帧上限，所以不分页。`list` 与 upsert 回读都用同一条 SQL（scratch `MODULE_STATE_SELECT`：`schedules LEFT JOIN` 该 schedule 最新创建的一行投递）。`last_error` 只含内核自己写的分类文案（`ttl`、`superseded`、`module answered HTTP 500` 这一类），不含 provider/路径信息。
+- `list` 返回**完整期望状态**（S1-4）：`spec/enabled/label` 是模块自己能比对的期望，`user_suspended/system_disabled_reason` 告诉它内核为什么没按期望触发，`next_run_at` 供诊断，`last_fire.{tick,run_now}` 让模块看得见每个来源最近一次 fire 的去向（v2 H3：一次性 `At` 过期没送到 → `last_fire.tick.status = "expired"`，与 `"delivered"` 可区分；v3 M-A：之后的 run_now 不会盖住它）。**从不返回内核的 `schedule_id`**。256 条 × 每条 < 1.5 KiB（key ≤128、label ≤128、cron ≤128、tz ≤64、ts ≤64、两个 `last_fire` 各 ≈ 200 + `last_error` ≤ 256）< 500 KiB，低于 1 MiB 帧上限，所以不分页。`list` 与 upsert 回读都用同一条 SQL（scratch `MODULE_STATE_SELECT`：`schedules` 各 `LEFT JOIN` 该 schedule 的 tick 与 run_now 各自最新创建的一行投递）。`last_error` 只含内核自己写的分类文案（`ttl`、`superseded`、`module answered HTTP 500` 这一类），不含 provider/路径信息。
 
 ### 6.2 upsert 的 SQL 与 outcome 判定（S1-4；scratch `upsert_module_schedule` 全文在 SQLite 上执行）
 
@@ -582,7 +619,7 @@ pub struct LastFire {                  // 该 schedule 最近一次 fire（按�
 2. `granted.has(Capability::Scheduler)` 否 → `forbidden`（方法**恒注册**，`rpc.rs` 模块文档的原则）。
 3. `generation.admit_callback_bound(params.request_id)` → `not_ready` / `draining` / `revoked`（`events_emit::refused_error`）；**一次加锁**同时拿到 lifecycle。
    3b. **带了 `request_id` 却拿不到 lifecycle**（Running 下 id 从未在途或已结束 —— `admit_callback_bound` 此时回 `Ok(None)`）→ **`timeout`，`data.retryable: false`**，文案「request_id is not (or no longer) in flight; send no request_id for background work」（v2 M8，与 S2 推理回调同一条规则；scratch `bound_or_timeout`）。memory 的三个 handler 在这里降级成无绑定调用，调度不这样做：fired handler 结束后才发出的 upsert 不应悄悄变成后台工作。
-4. 令牌桶 `try_acquire()` 否 → `rate_limited`。桶**每挂载一个、在 `MethodsFor` 闭包外建**（照 `domain.rs:1438` 的记忆限流器，不照 events 的每代重建），**容量 300、每秒回填 1**（v2 M3：≥ 配额 256 + 余量，模块启动时对账全部 key 不会被自己的配额挡住）—— 跨模块重启不重置（S1-10）。三个方法各耗 1 个。
+4. 令牌桶 `try_acquire()` 否 → `rate_limited`。桶**每挂载一个、在 `MethodsFor` 闭包外建**（照 `domain.rs:1438` 的记忆限流器，不照 events 的每代重建），**容量 300、每秒回填 1**（v2 M3：≥ 配额 256 + 余量，模块启动时对账全部 key 不会被自己的配额挡住）—— 跨模块重启不重置（S1-10）。三个方法各耗 1 个。**对账方必须能承受 `rate_limited` 并退避重试**（SPEC upsert 行同步写明）：容量覆盖一次全量对账，但不覆盖「刚对完账又立刻重对一次」。
 5. `bind_to_lifecycle(lifecycle, store_op).await`：`BudgetExhausted` / `RequestEnded` → `timeout`（同 events 的文案）。存储事务被取消 = 回滚；已提交而响应丢失 → 模块重试 → upsert 幂等（`unchanged`）。
 6. 结果 / 错误映射：`QuotaExceeded` → `quota_exceeded`；存储错误 → `-32603` 且消息固定为 `"storage error"`（不带 SQL、路径、owner —— SPEC §3「error.data 不得出现内核内部信息」）。
 
@@ -591,7 +628,7 @@ pub struct LastFire {                  // 该 schedule 最近一次 fire（按�
 ### 6.5 接线
 
 - `KERNEL_OOP_GRANTS` 加 `Capability::Scheduler`；**`KERNEL_GRANTS`（进程内）不加** —— 进程内没有 scheduler 句柄，授予一个没有句柄的能力是撒谎（`domain.rs:62-66` 自己写下的规矩）。`KERNEL_OOP_GRANTS` 的文档注释「Narrower than KERNEL_GRANTS」同步改写（本仓 T11 后不再编译进程内模块，这一维「更宽」是有句柄支撑的）。
-- `mount_all` / `mount_package` 多一个参数 **`deps: &CallbackDeps`**（v2 L7；`CallbackDeps { scheduler: Arc<Scheduler> }`，S2 的 PR 往同一个结构体里加 `models: Option<ModelCallbackDeps>`，而不是再加一个参数；scratch 已编译）；`provides` 在 `granted.has(Scheduler)` 时 push `"_a24/scheduler/"`；`Methods` 恒注册三个方法（handler 结构体持 `generation, module, granted, scheduler, limiter`）。
+- `mount_all` 多一个参数 **`deps: CallbackDeps`（按值，v3 M-B）**，借给每个 `mount_package` 的是 `&CallbackDeps`；handler 要留的东西从里面 clone 出 `Arc`，结构体本身在 `mount_all` 返回时 drop（S2 靠这次 drop 关闭用量通道）（v2 L7；`CallbackDeps { scheduler: Arc<Scheduler> }`，S2 的 PR 往同一个结构体里加 `models: Option<ModelCallbackDeps>`，而不是再加一个参数；scratch 已编译）；`provides` 在 `granted.has(Scheduler)` 时 push `"_a24/scheduler/"`；`Methods` 恒注册三个方法（handler 结构体持 `generation, module, granted, scheduler, limiter`）。
 - **offer set 阶梯**：`Scheduler` 进 `KERNEL_OOP_GRANTS` 与 `provides` 的改动落在 ME4-1.4.1（handler 同 PR），不早于它 —— SPEC §8「生产 offer set 只包含已有 handler 的能力」。
 
 ---
@@ -610,9 +647,9 @@ pub struct LastFire {                  // 该 schedule 最近一次 fire（按�
    - **第 1 轮严格解码**：`%` 后不是两个十六进制数字 → **拒**（非法序列）。
    - **第 2–4 轮宽松解码**（只解合法的 `%XX`，其余原样），直到不动点；4 轮后仍在变 → **拒**（病态嵌套）。这一步让 `%255f` → `%5f` → `_` 这类「每经一层框架剥一层」的编码也被看穿。
    - **每一轮的中间结果**都必须是合法 UTF-8，且不含 `/`、`\`、NUL 与任何控制字符 → 否则**拒**。于是编码斜杠（`%2F`、`%2f`、`%252F`）、编码反斜杠、超长 UTF-8（`%C0%AF`）都在任何深度被拒。
-3. 用**解码后的最终形式**处理点段，**先把段截到第一个 `;`**（v2 H2）：截出部分是 `""`/`.`/`..` 就按点段处理 —— `""`（即 `//` 与末尾 `/`，以及 `;x` 这种只有参数的段）与 `.` 丢弃；`..` 弹栈，栈空时弹 → **拒**（越出命名空间根，同 `normalise_dot_segments` 的「拒而不夹」）。于是 `%2e%2e`、`.%2E`、**`..;`、`..;a=b`、`..%3B`**、`.;` 都按点段处理 —— servlet 容器先剥 `;参数` 再规范化，内核按它的读法判。截出部分不是点段的段原样保留（`..a` 是一个名字）。
+3. **任何点段一律拒（400）**（v3 H-B；v2 是在内核视图里「解析」点段，而转发的是原始路径 —— `/_a24/scheduler/fired/../../..` 在内核视图里首段为空、被转发，模块若按前缀匹配 `/_a24/` 就被伪造）。「点段」在解码后的最终形式上判，且覆盖一台服务器可能把它折叠成点段的全部形式：先截到第一个 `;`（servlet 路径参数：`..;`、`..;a=b`、`..%3B`、`.;`），截出部分若**非空且只由 `.` 与空格组成**（`.`、`..`、`...`、`..%20` —— IIS 会剥末尾点与空格）→ **拒**。截出部分为空（`//`、末尾 `/`、只有 `;参数` 的段）→ 跳过。其余段原样入栈（`..a`、`a.b`、`c.` 是名字）。
 4. 余下的**第一段**：截到第一个 `;`（路径参数）、`?` 或 `#`（被解码出来的分隔符，防止粗心模块再解析一次）为止，**再去掉末尾的 `.` 与空格**（v2 H2：IIS 一类服务器会剥掉它们，`_a24.`、`_a24%20` 在那里就是 `_a24`），**ASCII 不区分大小写**等于 `_a24` → **保留**。
-5. **保留 → `404 not_found`；不可规范化（第 1、2、3 步的「拒」）→ `400 invalid_request_path`**（v2 L8：让操作者分得清「路径写坏了」与「那是内核的路径」）。两者都不转发、上游零请求。其余照常转发原始路径。
+5. **保留 → `404 not_found`；不可规范化（第 1、2、3 步的「拒」，含任何点段）→ `400 invalid_request_path`**（v2 L8：让操作者分得清「路径写坏了」与「那是内核的路径」）。两者都不转发、上游零请求。其余照常转发原始路径 —— 由于第 3 步，**被转发的原始路径里不含任何点段**，内核判定时看到的段序列与模块看到的一致（在第 2 步的解码规则之内）。
 
 大小写的裁决：**`_a24` 段不区分 ASCII 大小写**。内核判不了模块用的路由器是否大小写敏感（ASP.NET、部分 Node 路由默认不敏感），fail-closed。非 ASCII 的「看起来像」（全角 `＿ａ２４`、Unicode 兼容等价）**不处理**，列入残余 R2。
 
@@ -622,7 +659,7 @@ pub struct LastFire {                  // 该 schedule 最近一次 fire（按�
 
 ### 7.4 它保证什么、不保证什么（S1-9）
 
-保证：**经内核 HTTP 代理进入的外部客户端无法把请求送到 `/api/v1/<ns>/_a24/…`**，所以无法伪造 fired。**不保证**「fired 只可能来自内核」：同 UID 进程可以直连模块的 UDS（SPEC §0）。模块若想把 fired 与伪造区分开，本轮能依赖的只有这一条；`X-A24-Fire-Id` 不是凭据。
+保证：**经内核 HTTP 代理进入的外部客户端，无法让一个首段（在第 2 步的解码、第 4 步的截断与去尾之后，ASCII 不区分大小写）为 `_a24` 的路径到达模块，也无法让任何含点段的路径到达模块** —— 所以一个按前缀 `/api/v1/<ns>/_a24/` 匹配 fired 路由的模块，收不到经代理伪造的 fired（v3 H-B 把「含点段」补进了保证）。**不保证**「fired 只可能来自内核」：同 UID 进程可以直连模块的 UDS（SPEC §0）。模块若想把 fired 与伪造区分开，本轮能依赖的只有这一条；`X-A24-Fire-Id` 不是凭据。
 
 ---
 
@@ -630,7 +667,7 @@ pub struct LastFire {                  // 该 schedule 最近一次 fire（按�
 
 ### 8.1 视图字段
 
-`agent24_protocol::Schedule` 新增：`owner: Option<ScheduleOwner{module, key}>`、`user_suspended: bool`、`system_disabled_reason: Option<String>`、**`effective_enabled: bool`**（v2 M1：这一行会不会自己触发 —— 用户行等于 `enabled`；模块行等于 `enabled ∧ ¬user_suspended ∧ system_disabled_reason = null`）；`action` 改为 `Option<ScheduleAction>` —— **恰在 `owner` 为 `Some` 时为 `null`**。用户行的 JSON 只多四个字段，`action` 的值不变。`ScheduleAction` 本身**不加变体**：REST 反序列化得到的动作永远只可能是 `AgentRun`，模块投递从结构上进不来（S1-2）。`ScheduleCreate` 不加 `deny_unknown_fields`（加了会让今天带多余字段的客户端变成 400）；它没有 owner 字段，多余的 `owner_module` 键被丢弃也到不了存储。
+`agent24_protocol::Schedule` 新增：`owner: Option<ScheduleOwner{module, key}>`、`user_suspended: bool`、`system_disabled_reason: Option<String>`、**`effective_enabled: bool`**（v2 M1：这一行会不会自己触发 —— 用户行等于 `enabled`；模块行等于 `enabled ∧ ¬user_suspended ∧ system_disabled_reason = null`）、**`disabled_by: "module" | "user" | "system" | null`**（v3 L-D：谁让它不触发；优先级 `user_suspended` → `user`，`system_disabled_reason` → `system`，`!enabled` → 模块行 `module`、用户行 `user`；scratch `effective()`）；`action` 改为 `Option<ScheduleAction>` —— **恰在 `owner` 为 `Some` 时为 `null`**。用户行的 JSON 只多五个字段，`action` 的值不变。`ScheduleAction` 本身**不加变体**：REST 反序列化得到的动作永远只可能是 `AgentRun`，模块投递从结构上进不来（S1-2）。`ScheduleCreate` 不加 `deny_unknown_fields`（加了会让今天带多余字段的客户端变成 400）；它没有 owner 字段，多余的 `owner_module` 键被丢弃也到不了存储。
 
 ### 8.2 每个端点对模块行
 
@@ -641,12 +678,12 @@ pub struct LastFire {                  // 该 schedule 最近一次 fire（按�
 | `PATCH /schedules/{id}` | **恰好只有 `enabled`**（v2 M1）：`false` → 同 suspend，`true` → 同 resume（桌面端今天的切换发的就是这个形状）。**其余任何字段、或 `enabled` 之外多带任何字段** → `409 module_owned_schedule`，hint 指向 suspend/resume/DELETE。判断在 `Scheduler::update` 里（scratch `module_row_patch`），SQL 层 `WHERE owner_module IS NULL` 再兜一道 | 写回改为 CAS（§2.4），冲突 3 次 → `409 schedule_conflict`；其余不变 |
 | `DELETE /schedules/{id}` | 允许（级联删投递行）。**注意**：模块下次对账会重新 upsert 回来；想让它别再触发，用 suspend | 不变 |
 | `POST /schedules/{id}/run_now` | `202 {"fire_id"}`（§4.7） | `202 {"run_id"}`，不变 |
-| `POST /schedules/{id}/suspend`（新） | `200 Schedule`，幂等；`user_suspended=1`、`next_run_at=NULL`、revision+1，同事务把未完成投递置 `expired`（T9） | `409 not_a_module_schedule`（用户行用 `PATCH enabled`） |
-| `POST /schedules/{id}/resume`（新） | `200 Schedule`，幂等；`user_suspended=0`，**同时清 `system_disabled_reason`**（v2 M2：用户显式操作，否则一个不再 upsert 的模块的行永远解不开），`enabled` 时 `next_run_at = next_fire(spec, now)`（skip-missed）、计数清零、revision+1 | `409 not_a_module_schedule` |
+| `POST /schedules/{id}/suspend`（新） | `200 Schedule`，幂等（v3 L-C：只命中 `user_suspended = 0` 的行）；`user_suspended=1`、`next_run_at=NULL`、revision+1，同事务把未完成投递置 `expired`（T9） | `409 not_a_module_schedule`（用户行用 `PATCH enabled`） |
+| `POST /schedules/{id}/resume`（新） | `200 Schedule`，幂等（v3 L-C：只命中 `user_suspended = 1 OR system_disabled_reason IS NOT NULL` 的行，否则 0 行、不 bump、不重算 `next_run_at`，仍回 200 + 当前视图）；`user_suspended=0`，**同时清 `system_disabled_reason`**（v2 M2：用户显式操作，否则一个不再 upsert 的模块的行永远解不开），`enabled` 时 `next_run_at = next_fire(spec, now)`（skip-missed）、计数清零、revision+1 | `409 not_a_module_schedule` |
 
 「对模块行不可改的字段」完整列表：`name/label`、`spec`、`action`、`delivery`、`owner_module`、`module_key`，以及模块自己的 `enabled` 列（PATCH `{enabled}` 改的是 `user_suspended`，不是它）。用户对模块行能做的只有：suspend、resume（含只带 `enabled` 的 PATCH）、delete、run_now。
 
-**桌面端**（ME4-1.2.2 同 PR，v2 M1）：`Schedules.tsx` 的切换改读 `s.effective_enabled`（对用户行与 `enabled` 相同，行为不变；对模块行才让「已暂停」显示为关）；`api.ts` 的 `runScheduleNow` 返回 `run_id ?? fire_id`，通知文案对 `fire_` 前缀显示「已触发投递」；`api.test.ts` 加 `{fire_id}` 用例。
+**桌面端**（v2 M1；v3 补全清单，切法见 §13 的 1.2.2d）：`apps/desktop/src/renderer/pages/agent/api.ts:39-50` 的 `Schedule` 类型改为 `action: ScheduleAction | null`，并加可选的 `owner`、`effective_enabled`、`disabled_by`、`user_suspended`、`system_disabled_reason`；`Schedules.tsx:105`（切换发 `{ enabled: !eff }`）、`:240`（行透明度）、`:256`（「禁用/启用」按钮文案）三处都改读 `const eff = s.effective_enabled ?? s.enabled` —— **`?? enabled` 回退让新桌面端对旧 daemon 前向兼容**，所以 1.2.2d 可以先于 daemon 侧合并；对用户行 `eff === enabled`，行为不变。`api.ts:137-143` 的 `runScheduleNow` 返回 `data.run_id ?? data.fire_id`，`Schedules.tsx:123-124` 对 `fire_` 前缀显示「已触发投递 …」。测试：`api.test.ts` 加 `{fire_id}` 用例；`Schedules.test.tsx` 加一个 `enabled:true, effective_enabled:false, disabled_by:"user"` 的模块行，断言显示为关、点击发 `{enabled:true}`；再加一个不带 `effective_enabled` 的旧形状行，断言按 `enabled` 显示（正对照前向兼容）。
 
 suspend/resume 的 SQL（scratch `SET_USER_SUSPENDED_SQL`，已执行；`WHERE … AND owner_module IS NOT NULL`，对用户行影响 0 行）：
 
@@ -658,6 +695,8 @@ SET user_suspended = ?1,
     consecutive_failures = CASE WHEN ?1 = 0 THEN 0 ELSE consecutive_failures END,
     revision = revision + 1
 WHERE id = ?3 AND owner_module IS NOT NULL
+  AND ((?1 = 1 AND user_suspended = 0)
+       OR (?1 = 0 AND (user_suspended = 1 OR system_disabled_reason IS NOT NULL)))   -- v3 L-C：幂等
 ```
 
 ### 8.3 `ScheduleError` 新变体
@@ -695,11 +734,11 @@ WHERE id = ?3 AND owner_module IS NOT NULL
 3. **S1-6 的底线（不在模块不在时累计失败）由分类保证，不由写库保证**：§5.3 的表里，模块不在 `running`、不 Running、未发出，全部是 `Deferred`，T3/T4 不碰 `attempts` 与 `consecutive_failures`。
 
 **有界性（v2 M5，真实上界）**：设一个模块有 `n ≤ 256` 行。
-- **在装（catalogue 里有）但不可用**：每个 schedule 每个来源至多 1 条未完成行（T8；从未发出的被取代行直接删），即 ≤ 2 条；终态行按 schedule 修剪到 ≤ 4 条（T11）。所以 `schedule_deliveries` 里这个模块 **≤ 6n ≤ 1536 行**，且每 2s 只有一次探测、零写（§5.4）。每个 slot 仍有一次写（pre-advance 与记录同事务，被取代行的删除在同一事务里），写频率 = 该模块 schedule 的触发频率，与它可用时相同。
-- **已卸载（catalogue 里没有）**：新投递行 **0**；已有的未完成行 ≤ 2n，24h 内全部变成终态；终态行 ≤ 4n 且不再增长（不再记录 fire，就不再触发修剪，也不再新增）。每个 slot 只有一次 pre-advance 写。
+- **在装（catalogue 里有）但不可用**：每个 schedule 每个来源至多 1 条未完成行（T8；从未发出的被取代行直接删），即 ≤ 2 条；终态行按 (schedule, 来源) 修剪到各 ≤ 4 条，即 ≤ 8 条（T11，v3 L-B）。所以 `schedule_deliveries` 里这个模块 **≤ 10n ≤ 2560 行**，且每 2s 只有一次探测、零写（§5.4）。每个 slot 仍有一次写（pre-advance 与记录同事务，被取代行的删除在同一事务里），写频率 = 该模块 schedule 的触发频率，与它可用时相同。
+- **已卸载（catalogue 里没有）**：新投递行 **0**；已有的未完成行 ≤ 2n，24h 内全部变成终态；终态行 ≤ 8n 且不再增长（run_now 仍可由用户显式记录，但同样受每来源 4 条的修剪）（不再记录 fire，就不再触发修剪，也不再新增）。每个 slot 只有一次 pre-advance 写。
 - 用户行（AgentRun）不产生投递行。
 
-**孤儿行的清理入口**：用户可以 REST `DELETE` 模块行（不会被已卸载的模块重新创建）。`GET /schedules` 里这些行 `owner.module` 指向一个 `agent24 os list` 里不存在的模块，足以识别。孤儿 schedules 本身（以及它们残留的 ≤ 4n 条终态行）的自动清理交给 followup `FU-ME4-ORPHAN`（需要一个比「本次启动没发现这个包」更可靠的卸载信号，文本见 §13）。
+**孤儿行的清理入口**：用户可以 REST `DELETE` 模块行（不会被已卸载的模块重新创建）。`GET /schedules` 里这些行 `owner.module` 指向一个 `agent24 os list` 里不存在的模块，足以识别。孤儿 schedules 本身（以及它们残留的 ≤ 8n 条终态行）的自动清理交给 followup `FU-ME4-ORPHAN`（需要一个比「本次启动没发现这个包」更可靠的卸载信号，文本见 §13）。
 
 **同名重装**：新装的包若与旧模块同名，会继承旧的 schedules —— 与内核的身份模型一致（记忆分区同样按名字 `os:<name>` 归属），不是本设计新增的性质（§14 R3）。
 
@@ -711,7 +750,7 @@ WHERE id = ?3 AND owner_module IS NOT NULL
 
 1. **§3 开头**：offer set 改写为「ME-3 结束时是 `{Memory, Events, Approval}`；**ME-4a（ME4-M1）加入 `Scheduler`**；`Models`（ME-4b，另立设计）与 `Policy` 仍不在」，并注明 `Scheduler` 只进进程外 grant、不进进程内 `KERNEL_GRANTS` 的理由。
 2. **§3 方法表**加三行（每行以 `` | `_a24/scheduler/…` `` 开头，满足 ME4-1.1.1 的 grep 验收）：`upsert`、`delete`、`list`；表后加一段「内核 → 模块：fired 投递」说明路径、头、body、**「最新一次至少一次」及三种不送达**（v2 H3）、`fire_id` 去重、`last_fire`、`Deferred` 不计失败，以及 v2 M10 的三条时效：投递结束后注入的审批 token 作废；Draining 期间不带 id 的回调被拒；模块应**先按 `fire_id` 去重、再提交审批**（否则一次重投会提交第二个审批）。
-3. **§2 注入清单**加 `X-A24-Schedule-Key` / `X-A24-Fire-Id`（只出现在内核主动发起的 fired 请求上）；**§2.1 表**加两行：「保留路径 `/api/v1/<ns>/_a24/`」（v2：含 `;` 点段与末尾点/空格规则、保留 404 / 不可规范化 400）与「内核主动请求」（v2 L4：不占代理 64 在途名额，由投递泵每 owner ≤ 4 另限）。
+3. **§2 注入清单**加 `X-A24-Schedule-Key` / `X-A24-Fire-Id`（只出现在内核主动发起的 fired 请求上）；**§2.1 表**加两行：「保留路径 `/api/v1/<ns>/_a24/`」（v2：含 `;` 形式与末尾点/空格规则、保留 404 / 不可规范化 400；v3：任何点段一律 400）与「内核主动请求」（v2 L4：不占代理 64 在途名额，由投递泵每 owner ≤ 4 另限；v3：「字节可能已离开」在发送守卫放行时置位）。v3 另：upsert 行写明对账须承受 `rate_limited` 并重试；`list` 行与 fired 段的 `last_fire` 按来源分开。
 4. **§8 交付表**加 **ME-4a** 行；offer set 阶梯表加 `ME-4a | {Events, Approval, Memory, Scheduler}` 一行。
 5. **§9**：「不做 `Models`/`Scheduler`/`Policy`」改为「不做 `Models`（ME-4b 另立）/`Policy`」，`Scheduler` 由 ME-4a 交付并指回本文。
 
@@ -724,11 +763,11 @@ WHERE id = ?3 AND owner_module IS NOT NULL
 S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这样（后合并的那个 PR 负责把 SPEC 改成这个终态，冲突时以此为准）：
 
 - **§3 开头**：「ME-3 结束时内核的 offer set 是 `{Memory, Events, Approval}`；ME-4a 加入 `Scheduler`、ME-4b 加入 `Models`（设计分别见 `docs/design/ME4-S1-scheduler-callback.md`、`docs/design/ME4-S2-model-callback.md`）—— `Policy` 仍不在（§9）。`Scheduler` 与 `Models` 只进进程外 grant：进程内没有这两个句柄。」
-- **§8 offer set 阶梯**：`ME-4a | {Events, Approval, Memory, Scheduler}`，`ME-4b | {Events, Approval, Memory, Scheduler, Models}`（ME-4b 排在 ME-4a 之后，PLAN §三 ME4-4.2.1 依赖 ME4-1.5.1）。
-- **§9**：「**不做 `Policy` 能力的回调。**进程内还没有稳定消费者，先有消费者再有提供者。（`Scheduler` 由 ME-4a、`Models` 由 ME-4b 交付。）」
+- **§8 offer set 阶梯**：`ME-4a | {Events, Approval, Memory, Scheduler}`，`ME-4b | {Events, Approval, Memory, Scheduler, Models}`（ME-4b 的 handler 落地在 ME-4a 之后；具体依赖以 S2 设计与 PLAN §三 为准，本文不再复述）。
+- **§9**：「**不做 `Policy` 能力的回调。**进程内还没有稳定消费者，先有消费者再有提供者。（`Scheduler` 由 ME-4a、`Models` 由 ME-4b 交付。）」**另保留 S2 补充的不做条目**（模块推理不开放 tools、不做流式响应、不做 `_a24/model/list`，以 S2 设计原文为准）—— S1 合并时不删它们，S2 合并时不删 S1 的条目。
 - **§3 错误闭集句**：S2 加 `unavailable`；S1 不改。
 - **迁移号**：S1 是 `0007_module_schedules.sql`；S2 取下一个（`0008`）。
-- **`mount_all`/`mount_package`**：一个 `deps: &CallbackDeps` 参数，`CallbackDeps { scheduler, models: Option<ModelCallbackDeps> }`。
+- **`mount_all`/`mount_package`**：`mount_all(…, deps: CallbackDeps, …)` **按值**、`mount_package(…, deps: &CallbackDeps, …)`；`CallbackDeps { scheduler, models: Option<ModelCallbackDeps> }`；`mount_all` 返回即 drop（v3 M-B）。
 
 ---
 
@@ -745,10 +784,11 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 - **C1.7** 同事务：`advance_and_record_fire` 的记录步骤注入失败（测试钩子让 INSERT 报错）→ `next_run_at` 未推进。正对照：无注入时两者都落。
 - **C1.8** `upsert_schedule` 对模块行 `rows_affected == 0`、`name/action` 不变；对用户行更新且 revision+1。
 - **C1.9** 取代与级联（v2 H3/M5）：同 schedule、同来源第二次记录 fire → 第一条若 `attempts=0` 被**删除**、若 `attempts>0` 变 `expired('superseded')`；**不同来源**（`run_now` vs tick）互不取代（正对照）；删 schedule → 投递行全无。
-- **C1.11** 修剪：同一 schedule 连续 8 次记录 fire（每次把上一条设为已发出）→ 终态行恰为 4、未完成行 1；`list` 的 `last_fire` 是最新那条。
-- **C1.12** `At` 过期可见（v2 H3）：`At` 记录 fire 后跑过期清扫 → `list` 的 `last_fire = {fire_id, status:"expired", last_error:"ttl"}`、`next_run_at = null`。正对照：清扫前 `status = "pending"`。
+- **C1.11** 修剪（v3 L-B：按来源）：同一 schedule 连续 8 次记录 tick fire（每次把上一条设为已发出）→ tick 终态行恰为 4、未完成行 1；**随后 6 次已投递的 run_now 不减少 tick 的行数**，`last_fire.tick` 与 `last_fire.run_now` 都在。变异：修剪去掉 `fire_trigger = ?` 条件 → tick 行被挤掉，变红（scratch 已验证这个测试对「按 schedule 修剪」会失败）。
+- **C1.12** `At` 过期可见（v2 H3 / v3 M-A）：`At` 记录 fire 后跑过期清扫 → `list` 的 `last_fire.tick = {fire_id, status:"expired", last_error:"ttl"}`、`next_run_at = null`；**之后再 run_now 一次 → `last_fire.tick` 仍是 `expired`、`last_fire.run_now` 是 `pending`**。正对照：清扫前 `tick.status = "pending"`。
 - **C1.13** 已卸载 owner（v2 M5）：`InstalledOwners` 不含 `m` 时 tick 推进 `next_run_at` 但投递表零新行。正对照：含 `m` 时写一行。
 - **C1.14** PATCH 写回 CAS（v2 M9）：读到 `(revision, next_run_at, last_run_at)` 后 tick 推进 → `UPDATE_USER_SCHEDULE_CAS_SQL` 影响 0 行；重读后影响 1 行。变异：CAS 只比 `revision` → 过时写回成功，变红。
+- **C1.15** resume / suspend 幂等（v3 L-C）：对已 resume 的行再 resume → 影响 0 行、`revision` 与 `next_run_at` 不变；对已暂停的行再 suspend 同理。正对照：第一次 resume 影响 1 行。
 - **C1.10** 泵取行查询：owner A 10 条、B 2 条 → A 4 条、B 2 条；A 在跳过缓存里 → 只剩 B。正对照：缓存为空时 A 出现。
 
 ### C2 —— ME4-1.2.2 触发接口与 REST 护栏（`cargo +1.98.0 test -p agent24d schedules_rest_guard`）
@@ -757,7 +797,7 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 - **C2.2** PATCH 模块行的 `action` / `spec` / `name` / `delivery` 各一次、以及 `{enabled:false, name:"x"}` → 全部 409 `module_owned_schedule`，行不变。**只带 `{enabled:false}` → 200 且 `user_suspended=true`、`effective_enabled=false`；`{enabled:true}` → 200 且恢复**（v2 M1）。正对照：PATCH 用户行 → 200。
 - **C2.3** 用户 suspend 模块行 → 模块 upsert `enabled=true`（spec 也变）→ 仍 `user_suspended=true`、`next_run_at=null`。正对照：resume 后下一次 upsert/tick 生效，`next_run_at` 非空。
 - **C2.3b** resume 清 system-disable（v2 M2）：强制置 `system_disabled_reason` 后 resume → 它为 null、`next_run_at` 非空、计数归零。
-- **C2.9** PATCH 与 tick 交错（v2 M9）：测试钩子让 `update` 在读与写之间放行一次 tick → 同一 slot 只触发一次（`RecordingTrigger` 计数 1），PATCH 成功（重试后）。
+- **C2.9** PATCH 与 tick 交错（v2 M9；v3 M-D 挪到 **`cargo +1.98.0 test -p agent24-scheduler update_cas`**）：`Scheduler::update` 委托给带普通 `Option` 钩子参数（`BetweenReadAndWrite`，生产 `None`，照 `TakeSendGate`）的内部函数；测试的钩子在读与写之间真跑一次 `tick` → 同一 slot 只触发一次（`RecordingTrigger` 计数 1），PATCH 在重试后成功。变异：CAS 去掉 `next_run_at IS ?` → 计数 2，变红。
 - **C2.10** 桌面端（v2 M1）：`api.test.ts` 加 `run_now` 返回 `{fire_id}` 的用例；`Schedules.test.tsx` 加模块行（`enabled:true, effective_enabled:false`）显示为关、点击发 `{enabled:true}`。
 - **C2.4** suspend/resume 用户行 → 409 `not_a_module_schedule`。
 - **C2.5** `run_now` 模块行 → `202 {"fire_id": "fire_…"}`，`next_run_at` 不变，投递表多一行 `fire_trigger='run_now'`，**已有的 tick 未完成行不受影响**（v2 H3）。正对照：用户行 → `202 {"run_id"}` 与今天相同。
@@ -767,11 +807,11 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 
 ### C3 —— ME4-1.3.2 保留路径（`cargo +1.98.0 test -p agent24-os-proto reserved_path`）
 
-- **C3.1** 保留变体全部 **404** 且 mock 上游**零请求**：`_a24`、`_A24`、`//_a24`、`./_a24`、`x/../_a24`、`x/%2e%2e/_a24`、`x/.%2E/_a24`、`%5fa24`、`%5Fa24`、`%5F%61%32%34`、`%255fa24`、`%25255fa24`、`_a24;x=1`、`_a24%3Fq`、`_a24%23f`、`_a24`（无尾段）、`_a24/`、query 变体 `…/_a24/scheduler/fired?x=1`；**v2 H2**：`x/..;/_a24`、`x/..%3B/_a24`、`x/..;a=b/_a24`、`.;/_a24`、`_a24.`、`_a24%20`、`_a24.%20.`。
-- **C3.2** 不可规范化矩阵（**400 `invalid_request_path`**，v2 L8；零请求）：`x%2F..%2F_a24`、`x%2f..%2f_a24`、`x%252F..%252F_a24`、`x%5C..%5C_a24`、原始 `\`、`_a24%`、`_a24%zz`、`%C0%AF_a24`、`%00_a24`、`../<ns>/_a24`、`%2e%2e/admin`。
-- **C3.3** 正对照照常转发（上游收到**原始**路径）：`/api/v1/<ns>`、`/api/v1/<ns>/`、`/anything`、`/a24x`、`/_a24x/y`、`/_a25/…`、`/x/_a24/…`（非首段）、`/routines/%E4%BD%A0%E5%A5%BD`、`/a%20b`、`x/..a/_a24/…`（`..a` 是名字）、`/_a24x./y`。
-- **C3.5** 变异（v2 H2）：去掉「先截 `;` 再判点段」→ `x/..;/_a24` 用例变红；去掉末尾点/空格处理 → `_a24.` 用例变红。
+- **C3.1** 保留变体全部 **404** 且 mock 上游**零请求**：`_a24`、`_A24`、`//_a24`、`%5fa24`、`%5Fa24`、`%5F%61%32%34`、`%255fa24`、`%25255fa24`、`_a24;x=1`、`_a24%3Fq`、`_a24%23f`、`_a24`（无尾段）、`_a24/`、query 变体 `…/_a24/scheduler/fired?x=1`、`_a24.`、`_a24%20`、`_a24.%20.`。
+- **C3.2** 不可规范化矩阵（**400 `invalid_request_path`**，v2 L8；零请求）：`x%2F..%2F_a24`、`x%2f..%2f_a24`、`x%252F..%252F_a24`、`x%5C..%5C_a24`、原始 `\`、`_a24%`、`_a24%zz`、`%C0%AF_a24`、`%00_a24`、`../<ns>/_a24`、`%2e%2e/admin`；**v3 H-B：任何点段**——`./_a24`、`x/../_a24`、`x/%2e%2e/_a24`、`x/.%2E/_a24`、`x/..;/_a24`、`x/..%3B/_a24`、`x/..;a=b/_a24`、`.;/_a24`、**`_a24/scheduler/fired/../../..`、`_a24/..`、`_a24/../x`、`_a24/%2e%2e`、`_a24;/..`**、`x/..%20/_a24`、`x/.../_a24`，以及非保留路径里的 `routines/./today`。
+- **C3.3** 正对照照常转发（上游收到**原始**路径）：`/api/v1/<ns>`、`/api/v1/<ns>/`、`/anything`、`/a24x`、`/_a24x/y`、`/_a25/…`、`/x/_a24/…`（非首段）、`/routines/%E4%BD%A0%E5%A5%BD`、`/a%20b`、`x/..a/y`（`..a` 是名字）、`x/a.b/c.`、`/_a24x./y`。
 - **C3.4** 变异：把判定换成对原始路径的 `starts_with("/_a24")` → C3.1 的编码变体用例变红；去掉「每轮中间结果查 `/`」→ `%252F` 用例变红。
+- **C3.5** 变异（v2 H2 / v3 H-B）：点段改回「在内核视图里解析、只判规范化后的首段」→ `_a24/scheduler/fired/../../..` 与 `_a24/..` 用例变红；去掉「先截 `;`」→ `x/..;/_a24` 变红；去掉末尾空格处理 → `x/..%20/_a24` 变红；去掉末尾点/空格的首段处理 → `_a24.` 变红。
 
 ### C4 —— ME4-1.3.1 fired 投递器（`cargo +1.98.0 test -p agent24d scheduler_deliver`）
 
@@ -779,12 +819,12 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 - **C4.2** 上游 500 → 第 2、3 次尝试的 `x-a24-fire-id` 与 body **逐字节相同**；正对照：下一个 slot 的 `fire_id` 不同。
 - **C4.3** 上游 500 × 3 → 行 `failed`、`attempts=3`、`consecutive_failures` **+1**（不是 +3）；正对照：第 2 次返回 200 → `delivered`、计数归零。
 - **C4.4** 模块 `Starting` / `Draining` / 未安装（不在 `running`）/ `running_slot` 前（`OnceLock` 未 set）时到点 → 行 `deferred`、`attempts=0`、`consecutive_failures` 不变、上游零请求；之后模块 `Running` → `delivered` 且 `fire_id` 不变。
-- **C4.5** 超时：上游不回 → 10s 后 `Failed`（计一次尝试）；同期另一个 schedule 的 tick 与投递照常进行（tick 不被阻塞）。
+- **C4.5** 超时（v3 L-F：`ModuleDeliverer` 注入 `KernelLimits { total: 300ms, .. }`）：上游不回 → 约 300ms 后 `Failed`（计一次尝试）；同期另一个 schedule 的 tick 与投递照常进行（tick 不被阻塞）。
 - **C4.6** 投递持有的 request id：上游 handler 阻塞期间让 generation 进 Draining → handler 用该 id 调 `admit_callback_bound` 通过；随机 id 不通过；投递结束后同一 id 不通过。
-- **C4.7a** `dispatch()` 失败：`admit_request` 之后、第一次 `dispatch()` 之前 revoke（测试钩子）→ `NotDispatched` → `Deferred(NeverSent)`，`attempts=0`，上游**零请求**。变异：去掉 `dispatch()` 检查 → 上游收到请求，变红。
-- **C4.7b**（v2 H1）**连接建立之后、`send_guard` 之前** revoke（测试钩子，复用 FU-64 的 `TakeSendGate` 同类 rendezvous）→ `exchange` 回 `NotSent`、`finish()` 回 Abandoned → 结果 **`Deferred(NeverSent)`**、`attempts=0`、上游零请求（上游 accept 了连接但没读到任何请求字节）。变异：用 `Abandoned.dispatched` 代替本地标志 → 变成 `Failed`、`attempts=1`，变红。
-- **C4.8** 崩溃恢复：写好投递行后、投递前「杀掉」（测试钩子让泵在取行后 panic / 直接重建 `Scheduler` 与泵）→ 重启后该行以**同一 `fire_id`** 被投递。正对照：已 `delivered` 的行重启后**不**重投。
-- **C4.9** 上游收到请求后、回响应头之前进程被杀（模拟崩溃：revoke）→ `Abandoned{dispatched:true}` → `Failed` 计一次尝试；连续三次 → `failed`。正对照：C4.7b（零字节）→ `Deferred`。
+- **C4.7a**（v3 M-D：放在 **`cargo +1.98.0 test -p agent24-os-proto kernel_call`**，那里能调 `pub(crate)` 的 `Generation::revoke`）`admit_request` 之后、第一次 `dispatch()` 之前 revoke → `NotDispatched`，上游**零请求**；agent24d 侧的分类单测断言它映射成 `Deferred(NeverSent)`、`attempts=0`。变异：去掉 `dispatch()` 检查 → 上游收到请求，变红。
+- **C4.7b**（v2 H1；v3 M-D 同上 crate）用 `send_kernel_request` 的 `before_guard` 缝在**连接建立之后、`send_guard` 之前** revoke → `exchange` 回 `NotSent`、`finish()` 回 Abandoned → 结果 **`Abandoned{dispatched:false}`**（→ `Deferred(NeverSent)`），上游 accept 了连接但读到 0 个请求字节。变异：用 `Abandoned.dispatched` 代替本地标志 → `dispatched:true`，变红。
+- **C4.8** 崩溃恢复（v3 L-A：固定 `Clock`，或用 `At` spec，不依赖真实时间推进）：写好投递行后、投递前「杀掉」（测试钩子让泵在取行后 panic / 直接重建 `Scheduler` 与泵，重建时用同一个固定 `now`）→ 重启后该行以**同一 `fire_id`** 被投递。正对照：已 `delivered` 的行重启后**不**重投。
+- **C4.9**（v3 H-A，确定性）上游**读完完整请求后阻塞**（用 `Notify` 告诉测试「已读完」）→ 测试 revoke（`-p agent24-os-proto kernel_call` 里调 `Generation::revoke`；agent24d 侧用真实进程的崩溃）→ `Abandoned{dispatched:true}` → `Failed`、`attempts=1`；连续三次 → `failed`。正对照：C4.7b（零字节）→ `Deferred`。变异：标志改回「`exchange` 返回时才置位」→ 此用例得到 `dispatched:false`，变红。
 - **C4.12**（v2 L6）停机时投递在途：上游 handler 阻塞期间取消 daemon 的 `CancellationToken` → 行保持 `pending`、`attempts` 不变；重建泵后同一 `fire_id` 被投递。
 - **C4.13**（v2 L2）上游回 `200` 头后发一个 > 64 KiB 的 body（或回头后立刻让 generation 被 revoke）→ 行 `delivered`。正对照：回 `500` 头后同样的 body → `Failed`。
 - **C4.10** 死模块零写：owner 不可用期间跑 N 轮泵，`schedule_deliveries` 的 `updated_at` 不变（T4 不写库）。
@@ -800,15 +840,15 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 - **C5.6** `list` 返回完整期望状态：含 `user_suspended`、`system_disabled_reason`（用 REST suspend 与强制 system-disable 构造）与 `last_fire`，不含 `schedule_id`。
 - **C5.7** 令牌桶：256 个 key 的对账（256 次 upsert + 1 次 list）**全部成功**（v2 M3）；紧接着再连打到第 301 次 → `rate_limited`；模块重启（新 generation）后桶**不**回满。正对照：等回填后成功。
 - **C5.8** Draining 期间：不带 `request_id` 的 upsert → `draining`；带在途 fired 投递 id 的 upsert → 成功。**Running 下带一个已结束的投递 id → `timeout`、`data.retryable == false`**（v2 M8）；正对照：同一调用不带 `request_id` → 成功。
-- **C5.9** ErrorKind 闭集（v2 M7）：本组 PR（ME4-1.2.1…1.5.1）的 diff 不触碰 `rust/crates/agent24-os-proto/src/rpc.rs` 里的 `enum ErrorKind`、`ErrorKind::ALL`、`the_error_kinds_are_exactly_specs_closed_set`，也不触碰 SPEC §3 的闭集句 —— 在 PR 描述里附 `git diff origin/main -- rust/crates/agent24-os-proto/src/rpc.rs` 的相关 hunk 为空的证据，不写死数字。
+- **C5.9** ErrorKind 闭集（v2 M7；v3 L-E 改成脚本判定）：`git diff -U0 origin/main...HEAD -- rust/crates/agent24-os-proto/src/rpc.rs docs/specs/SPEC-ME3-OUT-OF-PROCESS.md | grep -E 'ErrorKind|ALL|unavailable|闭集'` **输出为空**（每个 ME4-1.2.x…1.5.1 PR 的 body 附这条命令与空输出）。不写死数字——并行的 S2 要加 `unavailable`。
 
 ### C6 —— ME4-1.5.1 黑盒（`cargo +1.98.0 test -p agent24d --test me4_scheduler_blackbox`，连跑 10 次）
 
 照 PLAN 原文，本设计补三点：
 
 1. Python 模块的 fired handler 必须回 2xx，并把 `x-a24-fire-id` / `trigger` / `scheduled_for` 追加写入探针文件。
-2. **「重启续投」用一个 spec 固定的独立 key**（v2 M6：PLAN 的 `routine.x` 用 `At = 当前 + 3s`，重启后模块再 upsert 必然改 spec → T9 退役旧投递，与「续投同一 fire_id」矛盾）：模块第一次启动时算 `At = 当前 + 6s` 并把这个值写进自己的数据目录，之后每次启动都读回**同一个值**再 upsert（→ `unchanged`）。测试在该 `At` 之前约 3s 重启 daemon，并给模块设 `A24_TEST_HANDSHAKE_DELAY_MS=3000`（测试模块自己读的环境变量，**不是** daemon 钩子）让第二次启动在握手前多停 3s —— 于是这次到点必然落在「模块 Starting」期间。断言：握手后 **30s 内**（等待上限写死）探针出现该 key 的一条 fire，`fire_id == derive(Tick, schedule_id, At)`（从 `GET /schedules` 拿 id 自算），且 `GET /schedules` 里该行 `consecutive_failures == 0`。
-3. 客户端伪造 fired 用 C3.1 的至少 5 个编码变体（含 `x/..;/_a24`）→ 404，C3.2 的至少 2 个 → 400，探针文件无新增。
+2. **「重启续投」用一个 spec 固定的独立 key**（v2 M6；v3 M-C 改为模块自判，因为 `launch.rs:561-562` 先 `env_clear()` 再只放白名单，测试给的环境变量进不了模块）：模块第一次启动时算 `At = 当前 + 15s`，把它写进自己数据目录的 `at` 文件，之后每次启动读回**同一个值**再 upsert（→ `unchanged`）。**模块启动时若 `at` 文件已存在（= 第二次启动），握手前 sleep 3s**（< `STARTUP_TIMEOUT` 10s，不会被判启动超时）。测试流程：首次启动 → 读 `at` → **前置断言**：此刻早于 `At - 5s` 且探针文件里没有该 key 的任何 fire（不满足**直接失败**，防止 fire 在重启前就已到达、测试空转通过）→ 重启 daemon → 到点落在第二次启动的 Starting 期间 → 延迟 → 握手后投递。断言：重启后 **30s 内**（等待上限写死）探针出现该 key 的一条 fire，`fire_id == derive(Tick, schedule_id, At)`（`schedule_id` 从 `GET /schedules` 拿），`scheduled_for == At`，且该行 `consecutive_failures == 0`。
+3. 客户端伪造 fired：C3.1 的至少 5 个编码变体 → 404；C3.2 的至少 3 个（含 `x/..;/_a24` 与 `_a24/scheduler/fired/../../..`）→ 400；探针文件无新增。
 
 ---
 
@@ -819,11 +859,15 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 3. **自己找到的、PLAN 没点名的缺口**：self-wake 计数被模块 label 污染（§8.5）；6 段 cron 让模块行每秒触发（§6.3）；cron 星期数字歧义（统筹者转达，已用真实 `next_fire` 复现）；`ScheduleSpec` 变体内不拒未知键（§6.1）；死模块的延迟行每轮写库、并占满查询窗口（§5.4 的跳过缓存 + 每 owner 窗口）；`Abandoned{dispatched:true}` 若算延迟会成毒丸循环（§5.3）；upsert 改 spec 后旧 slot 的未完成投递仍会被投（T9）；TTL 从 `scheduled_for` 起算会吞掉 skip-missed（§4.5）；`trigger` 是 SQLite 关键字（§2.1）。
 4. **可能被质疑的取舍**，理由已写在正文：模块行不 CAS 失败计数器（§2.2）；run_now 不看 suspend（§4.7）；保留路径对所有模块路径拒编码斜杠（§7.3）；uninstall 不删 schedules（§9）。
 5. **编译验证覆盖面**：§2.1 的迁移、§2.2/§2.3/§4.2/§4.3/§5.4/§6.2/§8.2 的全部 SQL 在 SQLite 上执行并有断言；§3.1、§4.2、§5.1、§5.2、§5.3、§6.1、§6.3、§7.2、§8.3 的 Rust 全部 `cargo check` + `clippy -D warnings` + 单测（附录 A）。**未编译的**只有「改动既有函数」类描述（例如 `mount_package` 多一个参数、`Scheduler::update` 里加一行 owner 判断）—— 它们是对现有签名的增量，不引入新类型。
-6. **v2 自查（第 1 轮评审之外，改稿时顺手核的）**：
+6. **自查（v2 起；第 2 条在 v3 按第 2 轮评审 L-B 重写）**：
    - M9 的修法若照评审原话只加 `AND revision = 读到的值`，挡不住「PATCH 读 → tick 推进 → PATCH 写回」，因为 tick 的 pre-advance 不 bump revision；v2 的 CAS 额外钉住 `next_run_at`/`last_run_at`，scratch 测试同时覆盖了「过时读输」与「重读后赢」。
-   - H3 的「最新一次至少一次」依赖 T11 修剪永远保留**最新**终态行，否则 `last_fire` 会被修剪掉 —— 修剪按 `updated_at DESC, rowid DESC` 保留前 4 条，而 `last_fire` 按 `created_at DESC, rowid DESC` 取；最新创建的行若已终态，其 `updated_at` 也不早于更旧的终态行（终态之后不再更新），所以它必在保留集中。scratch `v2_last_fire_resume_update_cas_and_prune` 断言了修剪后的数量。
+   - **（v3 L-B 重写，v2 的论证是错的）**修剪不会删掉某来源 `last_fire` 指向的行。v2 论证「最新创建的行一旦终态，其 `updated_at` 不早于其它终态行」—— 对**别的来源**不成立（五次已投递的 run_now 都比 tick 的最后一行更新，按 schedule 修剪会把它挤掉），所以 v3 改成按 (schedule, 来源) 修剪，论证只在同一来源内做：
+     1. 修剪只在「记录同来源一个新 fire」的事务里、**插入之后**执行；此刻该来源的 `last_fire` 就是刚插入的这行，它是 `pending`，不在修剪范围内。
+     2. 唯一例外是 `INSERT … DO NOTHING`（同一秒重复 run_now）：`last_fire` 是已存在的那行 X。同来源其它行都早于 X 创建：它们要么在 X 被记录那一刻被取代（`updated_at` = X 的 `created_at`），要么更早就已终态；且 rowid 都小于 X（SQLite 无 AUTOINCREMENT 时新行取 `max(rowid)+1`）。按 `(updated_at DESC, rowid DESC)` 排，X 排第一，必被保留。
+     3. scratch 测试：8 次 tick 后再 6 次已投递的 run_now，tick 的行数不变，`last_fire.tick` 与 `.run_now` 都在；同一测试在「按 schedule 修剪」下会失败（tick 行从 5 条掉到 1 条）。
    - M1 的 PATCH 映射只接受「恰好只有 `enabled`」：`{enabled:false, name:"x"}` 仍 409，否则 PATCH 会变成一条绕过 §8.2 字段表的后门。
-   - H2 的第 3 步把 `;` 截断放在**解码之后**，所以 `..%3B` 与 `..;` 同样处理；它不会把 `a;b` 这种普通段误判（截出部分 `a` 不是点段，原段保留）。
+   - H2 / H-B 的第 3 步把 `;` 截断放在**解码之后**，所以 `..%3B` 与 `..;` 同样处理；它不会把 `a;b` 这种普通段误判（截出部分 `a` 不是点段，原段保留）。v3 起点段一律拒而不解析，所以「内核视图」与「被转发的原始路径」不再有段序列上的差异。
+   - H-A 的置位点：放在 guard 里而不是 `exchange` 返回之后，是因为 guard 是本函数能观察到的、hyper 接手之前的最后一刻；更晚的点（`send_request` 内部）不对外暴露。
 
 ---
 
@@ -835,26 +879,25 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 - 类型：`ModuleScheduleDesired`、`ModuleScheduleState`、`UpsertOutcome`、`Advance`、`NewFire`、`StoreError::QuotaExceeded`。
 - 测试 helper：同形 `pool_migrated_up_to`。
 
-**ME4-1.2.2（agent24-protocol / agent24-scheduler / agent24d REST / agent24-agent）**
-- protocol：`Schedule.{owner, user_suspended, system_disabled_reason, effective_enabled}`、`action: Option<ScheduleAction>`、`ScheduleOwner`、`EventBody::ScheduleDelivered(ScheduleDeliveredPayload)`（`schedule.delivered`）；openapi / events.schema / fixtures / api-client 同步。
-- scheduler：`FireId`、`ModuleScheduleKey`、`FireTrigger`、`InvocationTarget`、`ScheduleInvocation`、`DeferReason`、`FireOutcome`、新 `RunTrigger`、`RunNowOutcome`；`fire()` 改为 CAS 版本；模块行的 tick 分支（记录 fire + `Notify`）；`update()` 的 owner 检查；`suspend/resume`；`ScheduleError::{ModuleOwned, NotModuleOwned, QuotaExceeded}`。
-- scheduler（v2）：`update()` 改用 `UPDATE_USER_SCHEDULE_CAS_SQL` + 最多 3 次重试 + `ScheduleError::Conflict`；模块行上只带 `enabled` 的 PATCH 走 `module_row_patch` → suspend/resume；`InstalledOwners`（`set` 与 `may_record`）。
-- agent24d：`RunManagerTrigger` → `KernelTrigger`（模块臂先返回 `Deferred(MountPending)`，1.3.1 接上真实投递器）；`schedules.rs` 两个新路由与 409 映射（`module_owned_schedule`/`not_a_module_schedule`/`schedule_conflict`）、`run_now` 双响应。
-- 桌面端（v2 M1）：`apps/desktop/src/renderer/pages/Schedules.tsx` 切换读 `effective_enabled`；`apps/desktop/src/renderer/pages/agent/api.ts` 的 `runScheduleNow` 返回 `run_id ?? fire_id`；`api.test.ts`、`Schedules.test.tsx` 各加一条（C2.10）。
-- agent24-agent：`self_wake.rs` 计数加 `owner.is_none()`。
+**ME4-1.2.2 —— 交给 PLAN 的切法（v3，第 2 轮评审要求；按层拆，每刀 ≤ 300 行量级）**
+
+- **1.2.2a 协议与视图**（依赖 1.2.1）：protocol 的 `Schedule.{owner, user_suspended, system_disabled_reason, effective_enabled, disabled_by}`、`action: Option<ScheduleAction>`、`ScheduleOwner`、`DisabledBy`、`EventBody::ScheduleDelivered(ScheduleDeliveredPayload)`（`schedule.delivered`）；store 的 `row_to_schedule` 读新列、按 `owner_module` 决定 `action`、算 `effective_enabled`/`disabled_by`；`protocol/openapi.yaml`、`protocol/events.schema.json`、`protocol/fixtures/events/schedule.delivered.json`、`export-schema.rs` 的 `FORCE_REQUIRED`、`packages/api-client` 重新生成。验收：既有 REST/协议测试不改断言全绿 + fixtures 往返 + `pnpm gen:api` 后干净。
+- **1.2.2b 触发接口与 tick**（依赖 1.2.2a）：scheduler 的 `FireId`、`ModuleScheduleKey`、`FireTrigger`、`InvocationTarget`、`ScheduleInvocation`、`DeferReason`、`FireOutcome`、新 `RunTrigger`、`RunNowOutcome`；`fire()` 改为 CAS 版本；模块行的 tick 分支（记录 fire + `Notify`；`InstalledOwners::may_record`）；`run_now` 双分支；agent24d 的 `RunManagerTrigger` → `KernelTrigger` 适配（**模块臂先回 `Deferred(MountPending)`**，1.3.1 接上真实投递器）。验收：C1.13、C2.5–C2.7。
+- **1.2.2c REST 护栏**（依赖 1.2.2b）：`Scheduler::update` 的 owner 检查、`module_row_patch`、`UPDATE_USER_SCHEDULE_CAS_SQL` + 3 次重试 + `BetweenReadAndWrite` 测试缝；`suspend/resume`（幂等）；`ScheduleError::{ModuleOwned, NotModuleOwned, Conflict, QuotaExceeded}` 与 409 映射（`module_owned_schedule`/`not_a_module_schedule`/`schedule_conflict`）；`schedules.rs` 两个新路由与 `run_now` 双响应；agent24-agent `self_wake.rs` 计数加 `owner.is_none()`。验收：C2.1–C2.4、C2.8、C2.9（`-p agent24-scheduler update_cas`）。
+- **1.2.2d 桌面端**（可与 1.2.2a 并行：`?? enabled` / `?? fire_id` 回退让它对旧 daemon 前向兼容）：`api.ts:39-50` 的 `Schedule` 类型、`Schedules.tsx:105/240/256`、`api.ts:137-143`、`Schedules.tsx:123-124`；测试 C2.10（§8.2 的清单）。
 
 **ME4-1.3.1（agent24-os-proto / agent24-scheduler / agent24d）**
-- os-proto：`kernel_call.rs`（§5.2 全部公开项）；`proxy.rs` 的 `exchange`/`Upstream`/`mint_approval_token` 改 `pub(crate)`；`SCHEDULE_KEY_HEADER`/`FIRE_ID_HEADER`。
+- os-proto：`kernel_call.rs`（§5.2 全部公开项，含 v3 的 `before_guard` 测试缝与 guard 内置位）；`proxy.rs` 的 `exchange`/`Upstream`/`mint_approval_token` 改 `pub(crate)`；`SCHEDULE_KEY_HEADER`/`FIRE_ID_HEADER`。
 - scheduler：`deliveries.rs`（`DeliveryPump`、`apply_outcome`、§4.4/§4.5/§5.4 的常量）。
 - agent24d（v2）：`server.rs` 在 `mount_all` 之后 `installed_owners.set(catalogue 名字)`；`host` 为 `Err` 时不设 `OnceLock`（§4.6）。
-- agent24d：`Supervisors::running_slot`；`scheduler_deliver.rs`（`ModuleDeliverer`、`classify`、`FiredBody`）；`server.rs` 把 tick spawn 挪到 `mount_all` 之后、set `OnceLock`、spawn 泵。
+- agent24d：`Supervisors::running_slot`；`scheduler_deliver.rs`（`ModuleDeliverer`（持有注入的 `KernelLimits`，v3 L-F）、`classify`、`FiredBody`）；`server.rs` 把 tick spawn 挪到 `mount_all` 之后、set `OnceLock`、spawn 泵。
 
 **ME4-1.3.2（agent24-os-proto）**
 - `proxy.rs`：`judge(namespace, raw_path) -> PathVerdict`（§7.2，参考实现即 scratch `reserved_path.rs`），在 `proxy()` 最前面调用；`Reserved` → 404 `not_found`，`Rejected` → 400 `invalid_request_path`。
 
 **ME4-1.4.1（agent24d）**
 - `scheduler_callback.rs`：三个 handler、§6.1 参数类型（含 `LastFire`）、`validate_key/validate_label/validate_module_spec/validate_dow`、`bound_or_timeout`、`SCHEDULER_RATE_*`（300 / 1）、`MODULE_SCHEDULE_QUOTA`。
-- `domain.rs`：`KERNEL_OOP_GRANTS += Scheduler`（及注释）、`mount_all/mount_package` 的 `deps: &CallbackDeps` 参数、`provides.push("_a24/scheduler/")`、闭包外建令牌桶、恒注册三个方法。
+- `domain.rs`：`KERNEL_OOP_GRANTS += Scheduler`（及注释）、`mount_all(deps: CallbackDeps)`（按值）/`mount_package(deps: &CallbackDeps` 参数、`provides.push("_a24/scheduler/")`、闭包外建令牌桶、恒注册三个方法。
 - `docs/agent/me3-status.sh` 的 `4a 调度回调` 探针在 1.5.1 落。
 
 **ME4-1.5.1**：`tests/me4_scheduler_blackbox.rs`（§11 C6）。
@@ -863,7 +906,7 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 
 - **FU-71**（已登记，本设计只引用）：REST / self-wake 路径的 cron 星期字段数字歧义；v2 补充：日与星期同时受限时 cron crate 取 AND、POSIX 取 OR，也归这一条。
 - **FU-ME4-ORPHAN**（新）：
-  > `- [ ] FU-ME4-ORPHAN · B · src=ME4-1.1.1 设计 §9 · 2026-09-24 · 已卸载模块（本次启动的 catalogue 里没有该包）的 schedules 永久保留：tick 只推进 `next_run_at` 不再写投递行（v2 M5），但 schedules 行本身、以及它们卸载前留下的 ≤ 4 条/schedule 终态投递行，只能靠用户 REST `DELETE` 清理。不做自动删除的原因：daemon 观察不到原子的卸载（CLI 可离线删包目录），「本次启动没发现这个包」与「包目录暂时读不出 / 正在替换」不可区分，按它删会丢掉用户的 `user_suspended` 与模块的期望状态。需要先有可靠的卸载信号（例如 `os uninstall` 经 daemon 写一条持久化的卸载记录，或连续 N 次启动都未发现 + 包目录确定不存在），再做「卸载超过 T 天自动删除」。判据（带正对照）：带卸载记录的 owner 在 T 天后 schedules 与投递行全无；没有卸载记录、只是一次启动没发现的 owner 不删。`
+  > `- [ ] FU-ME4-ORPHAN · B · src=ME4-1.1.1 设计 §9 · 2026-09-24 · 已卸载模块（本次启动的 catalogue 里没有该包）的 schedules 永久保留：tick 只推进 `next_run_at` 不再写投递行（v2 M5），但 schedules 行本身、以及它们卸载前留下的每 (schedule, 来源) ≤ 4 条终态投递行，只能靠用户 REST `DELETE` 清理。不做自动删除的原因：daemon 观察不到原子的卸载（CLI 可离线删包目录），「本次启动没发现这个包」与「包目录暂时读不出 / 正在替换」不可区分，按它删会丢掉用户的 `user_suspended` 与模块的期望状态。需要先有可靠的卸载信号（例如 `os uninstall` 经 daemon 写一条持久化的卸载记录，或连续 N 次启动都未发现 + 包目录确定不存在），再做「卸载超过 T 天自动删除」。判据（带正对照）：带卸载记录的 owner 在 T 天后 schedules 与投递行全无；没有卸载记录、只是一次启动没发现的 owner 不删。`
 - `ME4-CODEX-DEBT`：追加本设计（v1/v2 均只经本地 Opus 子代理评审）。
 
 ---
@@ -876,6 +919,8 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 - **R4 慢 fired handler 与崩溃**（v2 L1 改写）：fired handler 超过 10s → `Timeout`，记一次失败尝试（hot-disable 期间也是这一条，因为 30s 宽限 > 10s）；模块处理 fired 时崩溃 → `Abandoned{dispatched:true}`，同样记一次尝试。需要连续三次才 `failed`，五个 `failed` 才禁用；用户可用 resume 解除（v2 M2）。
 - **R9 不送达是承诺的一部分**（v2 H3）：取代、退役、24h 过期都会让某些 slot 永远不送达；只对每个 schedule 每个来源的最新一次 fire 承诺至少一次。模块用 `last_fire` 观察，不能假设每个 slot 都到。
 - **R10 保留路径只覆盖已知的规范化差异**（v2 H2）：`;` 点段、末尾点/空格、多重编码、大小写已处理；未来某个框架若有新的路径折叠规则（例如把 `%u005f` 解成 `_`），需要回来加一条。
+- **R11 guard 放行到 hyper 接手之间的 revoke 偏保守**（v3 H-A）：`send_guard` 返回 `true` 之后、hyper 真正把请求交给连接之前被 revoke，字节其实没离开，却记成一次已发出的失败尝试。窗口是一次普通的 async 函数调用长度；后果是多算一次尝试（三次才 `failed`），不会让一个没收到的 fire 被当成已投递。
+- **R12 点段一律 400**（v3 H-B）：模块路径里任何位置出现 `.`/`..`（含 `..;`、`..%20` 等形式）的客户端请求都会被拒，不再由内核或模块去解析。合法客户端本就不该发送未规范化的路径（浏览器与常见 HTTP 客户端会先规范化），代价与 R8 同类。
 - **R5 至少一次的重复**：崩溃 / 响应丢失 / 超时后重投同一 `fire_id`；模块必须按 `fire_id` 去重，且 fired handler 应当快速 2xx（10s 上限）、把长工作放到后台。
 - **R6 `Scheduler::update` 两个并发 PATCH 丢失更新**：既有，与本设计正交；tick 那一侧的覆盖已由 revision CAS 关掉。
 - **R7 降级**：回滚到不认识 0007 的旧二进制，严格的 `list_schedules`（REST `GET /schedules`）会因模块行的哨兵 action 解析失败而 500；宽松的 tick 列表会跳过它们（不会误触发）。本仓不支持降级，如实记录。
@@ -892,12 +937,12 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 | `fire.rs` | §4.2 | `FireId::derive(trigger, …)` + 测试（同 slot 同 id、次秒折叠、下一 slot / 别的 schedule / 别的 trigger 不同） |
 | `invocation.rs` | §3 | 全部触发接口类型、`RunTrigger`、`AgentRunAdapter`、`agent_run_result` |
 | `delivery.rs` | §4.3–4.5、§5.4 | 常量、`apply_outcome` 迁移表 + 测试（三次失败只计一次、延迟不写不计、终态不动、重试总时长 < 60s） |
-| `store_sql.rs` | §2、§4、§6.2、§8.2 | 迁移 0007 与全部 SQL，在 WAL 文件库上执行：迁移保旧行 + CHECK、outcome、双连接并发一行、配额在事务内、tick CAS 输给新 spec、记录/取代/级联、3×5 失败 → system-disable → upsert 清除、suspend 不被 upsert 清除 + resume 正对照、`upsert_schedule` 改不到模块行、取行查询公平性与跳过缓存、改 spec 退役旧投递；**v2**：`last_fire`（`At` 过期可见）、同来源取代 / 从未发出即删、终态修剪到 4 条、resume 清 system-disable、PATCH 写回 CAS（过时读输、重读后赢） |
-| `params.rs` | §6.1、§6.3 | 参数类型、各层 `deny_unknown_fields`、key 规则、5 段 cron、星期字段只收名字（`0 7 * * 1-5` 被拒；`MON-FRI` 从周六起第一次落在周一；负对照：数字 `1-5` 在引擎里落在周日）；**v2**：日与星期同时受限被拒（含正对照）、`At` 规范化、`LastFire`、`bound_or_timeout`、令牌桶容量 300 |
-| `reserved_path.rs` | §7 | `judge` 参考实现 + C3.1–C3.3、C3.5 的矩阵（**v2**：`..;`、`..%3B`、`..;a=b`、`.;`、`_a24.`、`_a24%20`；正对照 `..a`、`_a24x.`；不可规范化 → `Rejected`/400） |
-| `kernel_call.rs` | §5.2–5.3 | `send_kernel_request` 完整流程（真实 `Generation::admit_request` / `InFlight::dispatch/revoked/finish/upstream`，仅物理发送为桩）、`classify`、`FiredBody`；**v2**：「字节可能已离开」标志（H1）、2xx 头即确认（L2）、桩带 `send_guard`、`FiredBody.trigger` |
-| `accessor.rs` | §5.1、§6.5、§4.2 | `Supervisors::running_slot`（字段一致的镜像结构）；**v2**：`CallbackDeps`、`InstalledOwners` |
-| `rest.rs` | §8 | `ScheduleError` 新变体（含 v2 `Conflict`）、视图字段（含 `effective_enabled`）、`module_row_patch`、`run_now` 响应体 |
+| `store_sql.rs` | §2、§4、§6.2、§8.2 | 迁移 0007 与全部 SQL，在 WAL 文件库上执行：迁移保旧行 + CHECK、outcome、双连接并发一行、配额在事务内、tick CAS 输给新 spec、记录/取代/级联、3×5 失败 → system-disable → upsert 清除、suspend 不被 upsert 清除 + resume 正对照、`upsert_schedule` 改不到模块行、取行查询公平性与跳过缓存、改 spec 退役旧投递；**v2**：`last_fire`（`At` 过期可见）、同来源取代 / 从未发出即删、终态修剪到 4 条、resume 清 system-disable、PATCH 写回 CAS（过时读输、重读后赢）；**v3**：`last_fire` 按来源、修剪按 (schedule, 来源)（含对「按 schedule 修剪」会失败的断言）、suspend/resume 幂等 |
+| `params.rs` | §6.1、§6.3 | 参数类型、各层 `deny_unknown_fields`、key 规则、5 段 cron、星期字段只收名字（`0 7 * * 1-5` 被拒；`MON-FRI` 从周六起第一次落在周一；负对照：数字 `1-5` 在引擎里落在周日）；**v2**：日与星期同时受限被拒（含正对照）、`At` 规范化、`LastFire`、`bound_or_timeout`、令牌桶容量 300；**v3**：`LastFires` |
+| `reserved_path.rs` | §7 | `judge` 参考实现 + C3.1–C3.5 的矩阵（v2：`;` 形式、`_a24.`、`_a24%20`；**v3**：任何点段 → `Rejected`/400，含 `_a24/scheduler/fired/../../..`、`_a24/..`、`_a24/../x`、`_a24/%2e%2e`、`_a24;/..`、`..%20`、`...`；正对照 `..a`、`a.b/c.`、`_a24x.`） |
+| `kernel_call.rs` | §5.2–5.3 | `send_kernel_request` 完整流程（真实 `Generation::admit_request` / `InFlight::dispatch/revoked/finish/upstream`，仅物理发送为桩）、`classify`、`FiredBody`；**v2**：「字节可能已离开」标志（H1）、2xx 头即确认（L2）、桩带 `send_guard`、`FiredBody.trigger`；**v3**：标志在 `send_guard` 放行时置位（H-A）、`before_guard` 测试缝（M-D），桩按「先 guard 后发送」的真实顺序 |
+| `accessor.rs` | §5.1、§6.5、§4.2 | `Supervisors::running_slot`（字段一致的镜像结构）；**v2**：`CallbackDeps`、`InstalledOwners`；**v3**：`CallbackDeps` 按值（`mount_all_shape`） |
+| `rest.rs` | §8 | `ScheduleError` 新变体（含 v2 `Conflict`）、视图字段（含 `effective_enabled`）、`module_row_patch`、`run_now` 响应体；**v3**：`DisabledBy` + `effective()`、`BetweenReadAndWrite` 测试缝 |
 
 命令与结果（2026-09-23，本机 rustup 工具链 1.98.0）：
 
@@ -905,7 +950,7 @@ S1 与 S2 各自改 SPEC-ME3；两者都合并后，三处应当读作下面这�
 cd /private/tmp/claude-502/-Users-jason-Dev-auraai-Agent24/977deb42-1aba-448f-95e7-5bae2dee6fd4/scratchpad/me4s1-check
 rustup run 1.98.0 cargo check --all-targets                  # Finished `dev` profile
 rustup run 1.98.0 cargo clippy --all-targets -- -D warnings  # Finished `dev` profile（零警告）
-rustup run 1.98.0 cargo test                                 # test result: ok. 24 passed; 0 failed（v2）
+rustup run 1.98.0 cargo test                                 # test result: ok. 24 passed; 0 failed（v3；新增断言并入既有测试函数）
 ```
 
 （`cargo +1.98.0` 在本机 Homebrew cargo 上不可用，等价写法是 `rustup run 1.98.0 cargo`。）
