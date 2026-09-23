@@ -1157,10 +1157,36 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn start_bounded_read<const N: usize, R>(
+        mut reader: R,
+    ) -> std::sync::mpsc::Receiver<(io::Result<[u8; N]>, R)>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = [0; N];
+            let result = reader.read_exact(&mut bytes).map(|()| bytes);
+            let _ = send.send((result, reader));
+        });
+        receive
+    }
+
+    #[cfg(unix)]
+    fn finish_bounded_read<const N: usize, R>(
+        receive: std::sync::mpsc::Receiver<(io::Result<[u8; N]>, R)>,
+    ) -> io::Result<([u8; N], R)> {
+        let (result, reader) = receive
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "child marker deadline expired")
+            })?;
+        result.map(|bytes| (bytes, reader))
+    }
+
+    #[cfg(unix)]
     #[test]
     fn owned_soft_stop_closes_stdin_twice_then_force_reaps_same_owner() {
-        use std::{io::Read, os::fd::AsFd, time::Duration};
-
         let _test_guard = crate::posix::tests::test_lock();
         let request = Request::Launch {
             version: PROTOCOL_VERSION,
@@ -1173,24 +1199,26 @@ mod tests {
         let mut launch =
             OwnedLaunch::start(crate::launch::LaunchIntent::from_request(request).unwrap())
                 .unwrap();
-        fn bounded_read<const N: usize>(pipe: &impl AsFd) -> io::Result<[u8; N]> {
-            let mut reader = std::fs::File::from(pipe.as_fd().try_clone_to_owned()?);
-            let (send, receive) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let mut bytes = [0; N];
-                let result = reader.read_exact(&mut bytes).map(|()| bytes);
-                let _ = send.send(result);
-            });
-            receive.recv_timeout(Duration::from_secs(3)).map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "child marker deadline expired")
-            })?
-        }
-        let ready = bounded_read::<6>(launch.parts_mut().1.stdout_mut());
+        let (stdout_pipe, stderr_pipe) = {
+            let pipes = launch.parts_mut().1;
+            let Some(stdout) = pipes.take_stdout() else {
+                panic!("stdout moves once");
+            };
+            let Some(stderr) = pipes.take_stderr() else {
+                panic!("stderr moves once");
+            };
+            (stdout, stderr)
+        };
+        let ready = finish_bounded_read(start_bounded_read::<6, _>(stdout_pipe));
         let first_stop = LaunchControl::stop(&mut launch, false);
         let second_stop = LaunchControl::stop(&mut launch, false);
         let stdin_closed = launch.parts_mut().1.stdin_mut().is_none();
-        let stdout = bounded_read::<8>(launch.parts_mut().1.stdout_mut());
-        let stderr = bounded_read::<8>(launch.parts_mut().1.stderr_mut());
+        let (ready, stdout_pipe) = match ready {
+            Ok((ready, stdout_pipe)) => (Ok(ready), Some(stdout_pipe)),
+            Err(error) => (Err(error), None),
+        };
+        let stdout = stdout_pipe.map(|pipe| finish_bounded_read(start_bounded_read::<8, _>(pipe)));
+        let stderr = finish_bounded_read(start_bounded_read::<8, _>(stderr_pipe));
         let cleanup = force_and_reap(&mut launch);
         drop(launch);
         crate::posix::tests::wait_for_reaper_idle();
@@ -1199,8 +1227,8 @@ mod tests {
         second_stop.unwrap();
         assert_eq!(&ready.unwrap(), b"ready!");
         assert!(stdin_closed, "soft stop left stdin open");
-        assert_eq!(&stdout.unwrap(), b"out-eof!");
-        assert_eq!(&stderr.unwrap(), b"err-eof!");
+        assert_eq!(&stdout.unwrap().unwrap().0, b"out-eof!");
+        assert_eq!(&stderr.unwrap().0, b"err-eof!");
     }
 
     #[cfg(windows)]
@@ -1220,25 +1248,29 @@ mod tests {
         let mut launch =
             OwnedLaunch::start(crate::launch::LaunchIntent::from_request(request).unwrap())
                 .unwrap();
+        let (mut stdout_pipe, mut stderr_pipe) = {
+            let pipes = launch.parts_mut().1;
+            let Some(stdout) = pipes.take_stdout() else {
+                panic!("stdout moves once");
+            };
+            let Some(stderr) = pipes.take_stderr() else {
+                panic!("stderr moves once");
+            };
+            (stdout, stderr)
+        };
         let first_stop = LaunchControl::stop(&mut launch, false);
         let second_stop = LaunchControl::stop(&mut launch, false);
         let stdin_closed = launch.parts_mut().1.stdin_mut().is_none();
         let mut out = [0; 8];
-        let stdout = tokio::time::timeout(
-            Duration::from_secs(3),
-            launch.parts_mut().1.stdout_mut().read_exact(&mut out),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child stdout deadline expired"))
-        .and_then(|result| result.map(|_| out));
+        let stdout = tokio::time::timeout(Duration::from_secs(3), stdout_pipe.read_exact(&mut out))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child stdout deadline expired"))
+            .and_then(|result| result.map(|_| out));
         let mut err = [0; 8];
-        let stderr = tokio::time::timeout(
-            Duration::from_secs(3),
-            launch.parts_mut().1.stderr_mut().read_exact(&mut err),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child stderr deadline expired"))
-        .and_then(|result| result.map(|_| err));
+        let stderr = tokio::time::timeout(Duration::from_secs(3), stderr_pipe.read_exact(&mut err))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child stderr deadline expired"))
+            .and_then(|result| result.map(|_| err));
         let cleanup = force_and_reap(&mut launch);
         cleanup.unwrap();
         first_stop.unwrap();
