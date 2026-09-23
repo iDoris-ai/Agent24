@@ -7,8 +7,6 @@
 //! itself prove that a FIFO or socket is private; that remains the launcher's
 //! placement contract. stdin EOF ends the owning-parent lease.
 
-#![allow(dead_code)] // Staged until the capability startup layer consumes it.
-
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
