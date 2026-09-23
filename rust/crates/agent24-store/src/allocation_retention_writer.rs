@@ -415,4 +415,222 @@ mod tests {
     #[tokio::test]
     #[rustfmt::skip]
     async fn frozen_replay_rejects_mutated_retained_root() { let store=Store::open_memory().await.unwrap(); let input=intent(RootIdentity::unix(&[1;8],&[2;8]).unwrap()); source(&store,&input,AllocationPhase::Materialized,RootIdentity::unix(&[3;8],&[4;8]).unwrap()).await; let fresh=prepare(&store,&input,"io_error").await; let mut tx=store.pool().begin().await.unwrap(); Store::retain_allocation_tx(&mut tx,&fresh).await.unwrap(); tx.commit().await.unwrap(); let replay=prepare(&store,&input,"io_error").await; sqlx::query("UPDATE workspace_allocations SET root_unix_device=X'0909090909090909'").execute(crate::test_hooks::pool(&store)).await.unwrap(); let mut tx=store.pool().begin().await.unwrap(); assert!(Store::retain_allocation_tx(&mut tx,&replay).await.is_err()); tx.commit().await.unwrap(); }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RawSnapshot {
+        allocations: Vec<Vec<String>>,
+        registry: Vec<Vec<String>>,
+        audit: Vec<Vec<String>>,
+        high_water: Vec<Vec<String>>,
+    }
+
+    /// Return every stored value as SQLite's `quote(value), typeof(value)` pair.
+    /// This deliberately avoids decoded model values: trigger rollback must restore
+    /// storage classes as well as the semantic rows consumed by the writer.
+    async fn raw_table(tx: &mut Transaction<'_, Sqlite>, table: &str) -> Vec<Vec<String>> {
+        let columns = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(&mut **tx)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        let fields = columns
+            .iter()
+            .map(|name| format!("quote(\"{name}\"), typeof(\"{name}\")"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sqlx::query(&format!("SELECT {fields} FROM \"{table}\" ORDER BY rowid"))
+            .fetch_all(&mut **tx)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (0..row.len())
+                    .map(|index| row.try_get::<String, _>(index).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    async fn raw_snapshot_tx(tx: &mut Transaction<'_, Sqlite>) -> RawSnapshot {
+        RawSnapshot {
+            allocations: raw_table(tx, "workspace_allocations").await,
+            registry: raw_table(tx, "workspaces").await,
+            audit: raw_table(tx, "audit_log").await,
+            high_water: raw_table(tx, "sqlite_sequence").await,
+        }
+    }
+
+    async fn raw_snapshot(store: &Store) -> RawSnapshot {
+        let mut tx = store.pool().begin().await.unwrap();
+        let snapshot = raw_snapshot_tx(&mut tx).await;
+        tx.commit().await.unwrap();
+        snapshot
+    }
+
+    async fn caller_sentinels(tx: &mut Transaction<'_, Sqlite>) -> String {
+        sqlx::query(
+            "SELECT group_concat(marker, '|')
+             FROM (SELECT marker FROM retention_caller_sentinels ORDER BY rowid)",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn adversarial_retention_triggers_rollback_raw_storage_and_keep_caller_usable() {
+        const AFTER_ALLOCATION_UPDATE: &str =
+            "AFTER UPDATE OF phase ON workspace_allocations WHEN NEW.phase='retained'";
+        const AFTER_AUDIT_INSERT: &str =
+            "AFTER INSERT ON audit_log WHEN NEW.action='workspace.allocation_retained'";
+
+        // The same destructive matrix runs at each writer boundary.  The update
+        // boundary targets the pre-existing audit tail; the insert boundary uses
+        // the freshly inserted `NEW` row where that makes the attack sharper.
+        for (boundary, event, cases) in [
+            (
+                "update",
+                AFTER_ALLOCATION_UPDATE,
+                [
+                    (
+                        "allocation_mutate",
+                        "UPDATE workspace_allocations SET relative_name='tampered' WHERE allocation_id=NEW.allocation_id",
+                    ),
+                    (
+                        "allocation_delete",
+                        "DELETE FROM workspace_allocations WHERE allocation_id=NEW.allocation_id",
+                    ),
+                    (
+                        "registry_mutate",
+                        "UPDATE workspaces SET lifecycle_owner_ref='tampered' WHERE id=NEW.workspace_id",
+                    ),
+                    (
+                        "registry_delete",
+                        "DELETE FROM workspaces WHERE id=NEW.workspace_id",
+                    ),
+                    (
+                        "audit_tail_mutate",
+                        "UPDATE audit_log SET hash='tampered' WHERE seq=(SELECT max(seq) FROM audit_log)",
+                    ),
+                    (
+                        "audit_tail_delete",
+                        "DELETE FROM audit_log WHERE seq=(SELECT max(seq) FROM audit_log)",
+                    ),
+                    (
+                        "high_water_mutate",
+                        "UPDATE sqlite_sequence SET seq=0 WHERE name='audit_log'",
+                    ),
+                    (
+                        "high_water_delete",
+                        "DELETE FROM sqlite_sequence WHERE name='audit_log'",
+                    ),
+                ],
+            ),
+            (
+                "audit",
+                AFTER_AUDIT_INSERT,
+                [
+                    (
+                        "allocation_mutate",
+                        "UPDATE workspace_allocations SET relative_name='tampered' WHERE allocation_id=(SELECT json_extract(NEW.detail, '$.allocation_id'))",
+                    ),
+                    (
+                        "allocation_delete",
+                        "DELETE FROM workspace_allocations WHERE allocation_id=(SELECT json_extract(NEW.detail, '$.allocation_id'))",
+                    ),
+                    (
+                        "registry_mutate",
+                        "UPDATE workspaces SET lifecycle_owner_ref='tampered' WHERE id=(SELECT json_extract(NEW.detail, '$.workspace_id'))",
+                    ),
+                    (
+                        "registry_delete",
+                        "DELETE FROM workspaces WHERE id=(SELECT json_extract(NEW.detail, '$.workspace_id'))",
+                    ),
+                    (
+                        "audit_tail_mutate",
+                        "UPDATE audit_log SET hash='tampered' WHERE seq=NEW.seq",
+                    ),
+                    (
+                        "audit_tail_delete",
+                        "DELETE FROM audit_log WHERE seq=NEW.seq",
+                    ),
+                    (
+                        "high_water_mutate",
+                        "UPDATE sqlite_sequence SET seq=0 WHERE name='audit_log'; UPDATE audit_log SET seq=seq+1 WHERE seq=NEW.seq",
+                    ),
+                    (
+                        "high_water_delete",
+                        "DELETE FROM sqlite_sequence WHERE name='audit_log'; UPDATE audit_log SET seq=seq+1 WHERE seq=NEW.seq",
+                    ),
+                ],
+            ),
+        ] {
+            for (case, body) in cases {
+                let store = Store::open_memory().await.unwrap();
+                let input = intent(RootIdentity::unix(&[1; 8], &[2; 8]).unwrap());
+                source(
+                    &store,
+                    &input,
+                    AllocationPhase::Committed,
+                    RootIdentity::unix(&[3; 8], &[4; 8]).unwrap(),
+                )
+                .await;
+                let attempt = prepare(&store, &input, "io_error").await;
+                let trigger_name = format!("retention_{boundary}_{case}");
+                sqlx::query(&format!(
+                    "CREATE TRIGGER {trigger_name} {event} BEGIN {body}; END"
+                ))
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+                sqlx::query("CREATE TEMP TABLE retention_caller_sentinels (marker TEXT NOT NULL)")
+                    .execute(crate::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+
+                let before = raw_snapshot(&store).await;
+                let mut tx = store.pool().begin().await.unwrap();
+                sqlx::query("INSERT INTO retention_caller_sentinels(marker) VALUES ('before')")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                assert!(
+                    Store::retain_allocation_tx(&mut tx, &attempt)
+                        .await
+                        .is_err(),
+                    "{boundary}/{case} must be rejected"
+                );
+                assert_eq!(raw_snapshot_tx(&mut tx).await, before, "{boundary}/{case}");
+                assert_eq!(
+                    caller_sentinels(&mut tx).await,
+                    "before",
+                    "{boundary}/{case}"
+                );
+
+                sqlx::query("INSERT INTO retention_caller_sentinels(marker) VALUES ('after')")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    caller_sentinels(&mut tx).await,
+                    "before|after",
+                    "{boundary}/{case}"
+                );
+                tx.commit().await.unwrap();
+
+                assert_eq!(raw_snapshot(&store).await, before, "{boundary}/{case}");
+                let mut proof = store.pool().begin().await.unwrap();
+                assert_eq!(
+                    caller_sentinels(&mut proof).await,
+                    "before|after",
+                    "{boundary}/{case}"
+                );
+                proof.commit().await.unwrap();
+            }
+        }
+    }
 }
