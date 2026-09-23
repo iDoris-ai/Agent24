@@ -11,6 +11,7 @@ mod events_emit;
 mod lifecycle;
 mod mcp;
 mod memory_callback;
+mod model_callback;
 mod module_approval_broker;
 mod module_approvals;
 mod os_config;
