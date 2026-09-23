@@ -7,6 +7,7 @@ use crate::{AllocationId, AllocationValueError, RootIdentity, WorkspaceInstant};
 /// Constructing an intent performs no database, workspace-registration, or
 /// filesystem operation. Its validation establishes neither caller
 /// authorization nor filesystem authority or ownership.
+#[derive(Clone)]
 pub struct AllocationIntent {
     allocation_id: AllocationId,
     workspace_id: WorkspaceId,

@@ -199,6 +199,69 @@ impl StrictAuditTail {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) async fn append_prospective_audit_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    tuple: &ProspectiveAuditTuple,
+) -> WorkspaceResult<()> {
+    sqlx::query(
+        "INSERT INTO audit_log (seq,ts,actor,action,detail,prev_hash,hash) VALUES (?,?,?,?,?,?,?)",
+    )
+    .bind(tuple.seq)
+    .bind(&tuple.ts)
+    .bind(&tuple.actor)
+    .bind(&tuple.action)
+    .bind(&tuple.detail)
+    .bind(&tuple.prev_hash)
+    .bind(&tuple.hash)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) async fn verify_prospective_tail_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    tuple: &ProspectiveAuditTuple,
+) -> WorkspaceResult<()> {
+    let tail = strict_audit_tail_tx(tx).await?;
+    let actual = tail.tuple.ok_or(corrupt("tail"))?;
+    (actual.seq == tuple.seq
+        && actual.ts == tuple.ts
+        && actual.actor == tuple.actor
+        && actual.action == tuple.action
+        && actual.detail == tuple.detail
+        && actual.prev_hash == tuple.prev_hash
+        && actual.hash == tuple.hash)
+        .then_some(())
+        .ok_or(corrupt("tail"))
+}
+
+#[allow(dead_code)]
+pub(crate) async fn verify_prospective_audit_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    tuple: &ProspectiveAuditTuple,
+) -> WorkspaceResult<()> {
+    strict_audit_chain_tx(tx).await?;
+    let row =
+        sqlx::query("SELECT seq,ts,actor,action,detail,prev_hash,hash FROM audit_log WHERE seq=?")
+            .bind(tuple.seq)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?
+            .ok_or(corrupt("tail"))?;
+    (strict_seq(&row)? == tuple.seq
+        && strict_text(&row, "ts")? == tuple.ts
+        && strict_text(&row, "actor")? == tuple.actor
+        && strict_text(&row, "action")? == tuple.action
+        && strict_text(&row, "detail")? == tuple.detail
+        && strict_text(&row, "prev_hash")? == tuple.prev_hash
+        && strict_text(&row, "hash")? == tuple.hash)
+        .then_some(())
+        .ok_or(corrupt("tail"))
+}
+
 pub(crate) fn entry_hash(
     prev_hash: &str,
     ts: &str,

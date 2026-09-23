@@ -20,6 +20,7 @@ mod allocation_reservation;
 mod allocation_retention_evidence;
 mod allocation_retention_expectation;
 mod allocation_retention_plan;
+mod allocation_retention_writer;
 mod allocation_types;
 mod audit;
 mod module_approvals;
