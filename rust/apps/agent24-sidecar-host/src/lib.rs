@@ -11,6 +11,8 @@ mod cleanup;
 #[allow(dead_code)]
 mod control_io;
 #[allow(dead_code)]
+mod launch;
+#[allow(dead_code)]
 mod output_io;
 
 #[cfg(unix)]
