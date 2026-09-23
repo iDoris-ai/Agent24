@@ -2,10 +2,11 @@ use agent24_protocol::WorkspaceId;
 
 use crate::{AllocationId, AllocationValueError, RootIdentity, WorkspaceInstant};
 
-/// Validated, inert input for reserving a workspace allocation journal row.
+/// Structurally validated, inert input for a workspace allocation journal row.
 ///
 /// Constructing an intent performs no database, workspace-registration, or
-/// filesystem operation; it is only the validated input to the journal API.
+/// filesystem operation. Its validation establishes neither caller
+/// authorization nor filesystem authority or ownership.
 pub struct AllocationIntent {
     allocation_id: AllocationId,
     workspace_id: WorkspaceId,
