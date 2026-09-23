@@ -16,24 +16,43 @@
 
 **T8.5c-W-wire 实现已完成**（`DONE` — [#224](https://github.com/iDoris-ai/Agent24/pull/224)+[#225](https://github.com/iDoris-ai/Agent24/pull/225)，2026-09-19；语义说明 [`T8.5c-W-wire.md`](../design/T8.5c-W-wire.md) v5，5 轮设计评审冻结；代码 2 轮 Codex 代码评审——首轮 5 Medium(判据覆盖面问题，未发现生产代码缺陷)，修复后二轮 approve，另发现 1 Low(超时预算 50ms→300ms)已修复）：`Generation::admit_callback_bound`（#224，修复真实 TOCTOU 竞态，单锁内原子完成"准入+取绑定生命周期"）+ `memory_callback.rs` 的 `RememberHandler`/`RecallHandler`/`RecentHandler` 三个 Handler、`map_memory_error` 结构性 default-deny 堵住 `QuotaExceeded` 的 owner/partition key 泄露、`_a24/memory/scoped/*` 不注册产出 `-32601`（#225）。`cargo test --workspace`：1300 passed。**已知覆盖缺口**（Codex 确认风险可接受，留作后续 follow-up）：真实子进程握手验证 `Offer.provides` 包含 memory 能力这条端到端测试未覆盖，不影响生产代码正确性。
 
-至此 **T8.5c-W（mount + wire）整体交付完毕**，ME-3 专项只剩 **T9** 这一道关。
+至此 **T8.5c-W（mount + wire）整体交付完毕**。
 
-**当前正在做**：**T9（ME-3f 仓外包端到端验收）**——尚未开工。
+## 🎉 T9 已交付，ME-3 专项整体收口（2026-09-20）
 
-**ME-3 收口路径（用户 2026-09-19 拍板，按此顺序走）**：
+**T9（ME-3f 仓外包端到端验收）`DONE`** — [#262](https://github.com/iDoris-ai/Agent24/pull/262)（2026-09-19；8 轮 Codex 对抗式代码评审，第 8 轮 APPROVE 无新发现）：新增 `rust/apps/agent24d/tests/me3f_blackbox.rs`，核心测试 `a_package_from_outside_the_repo`——daemon 先以空 packages 目录起一次 → 停止 → 在跟仓库物理无关的临时目录下生成并安装一个 `impl_kind: out_of_process_provider` 的 Python 模块包 → 用同一个已编译好的二进制重启（全程无 `cargo build`）→ 真实断言五件事全部成立：挂载（`/api/v1/os` 报 `mounted`）、路由代理（真实 HTTP 经内核代理命中模块）、事件转发（真实 WS 消费者边界观测投递）、记忆读写（真实 `remember`+`recall`，精确 id/body 关联）、审批往返（代理真实注入的 request-id/approval-token，先错误 token 验证拒绝不消耗真实 token，再真实 token 验证成功）。负对照 `an_in_process_declaration_for_an_uncompiled_crate_is_still_refused` 证明挂载校验没有被意外放宽。
+
+评审过程中第 6 轮独立通读抓到一个真实资源泄漏：`stop()` 用 SIGKILL 终止 daemon，绕过了 daemon 自己负责 reap 模块子进程的正常关闭路径，导致 Python 模块进程永久孤儿化（`ps` 实测修复前累积 34 个孤儿）；改成 SIGTERM+有界等待+SIGKILL 兜底、塞进 `Running::drop()` 覆盖所有退出路径（含 panic）后归零，第 8 轮进一步把发信号换成 `rustix::process::kill_process`（daemon 自己 supervisor 同款 API），消除 shell 出去的 `kill` 命令带来的 PATH 依赖。`cargo test --workspace` 全绿，`me3f_blackbox` 单独重跑 20+ 次稳定通过。
+
+`bash docs/agent/me3-status.sh` 核对：**3a-3g 全部 14 行"已在 main"，一个不剩**——ME-3（进程外领域 OS）专项到此整体交付完毕。
+
+## 🎉 T11 已交付（2026-09-22）
+
+**T11（Sin90 迁出内核）`DONE`** — [#342](https://github.com/iDoris-ai/Agent24/pull/342)（`bb9b9d5`，2026-09-22；`clestons` APPROVED，CI 全绿后合并）：删掉编译进内核的 `agent24-sin90{,-os,-store}` 三个 crate（`agent24d`/`agent24-cli`/`agent24-protocol` 相应接线一并清理，净减 ~5000 行）。合并前已独立编译该分支二进制、跑通 Sin90 侧真实端到端挂载黑盒测试（`AGENT24_CHECKOUT` 指向该分支 → `agent24_mount_blackbox.rs --ignored`：挂载/代理/路由行为不变/事件转发 4 条判据全过）。配套的 [#343](https://github.com/iDoris-ai/Agent24/pull/343)（2026-09-20 待办快照文档）同日合并。
+
+## 🔴 2026-09-22 待办清单（下次先核实再用）
+
+- **P0，Codex 额度已恢复（原定 2026-09-22 19:18，现已过点）**：`iDoris-ai/Sin90` 的 M0/M1/M2/挂载修复（commit `0d66f24`/`4032e82`/`8056ade`/`ab66b37`）目前只经过本地自审，没有真正的对抗式评审——尤其挂载修复里的 actor-key 门禁安全问题（`ab66b37`），应该优先送审。
+- **P1**：`docs/SIN90-PET0-INTEGRATION.md` 整篇假设"内核内置 Sin90"，T11 #342 已合并，这个假设已不成立，需要独立重写。
+- **P2，明确暂停中**：T10（Cos72）——`feat/me4-cos72-skeleton` 分支保留，除非用户明确说继续，不要主动捡起来。
+- **P2**：T12（发布 v0.5.0）——依赖 T10（暂停）+ T11（已 `DONE`）。
+- **P3，可并行，未开始**：T13（`agent24-os-sdk`）+ T14（wire 文档）。
+
+完整会话记忆见协调 Claude 的 `project_todo_2026-09-20` 记忆条目（本机 `~/.claude/projects/-Users-jason-Dev-auraai-Agent24/memory/`）。
+
+**收口后路径（用户 2026-09-19 拍板，T11 已完成）**：
 
 ```
-T9（ME-3f 仓外包端到端验收）  →  T10（Cos72 进程外样例）
-                             →  T11（Sin90 迁出内核）  →  T12（发布 v0.5.0）
+T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→ T12（发布 v0.5.0）
 ```
-（T13 `agent24-os-sdk` / T14 wire 文档可与 T9 之后并行。）
+（T13 `agent24-os-sdk` / T14 wire 文档可并行。）
 
 **之后**：v0.5.0 发布后回头捡 [`roadmap.md`](roadmap.md) 的 **M1（记忆成为产品）**；`../PLAN.md` / `../ROADMAP.md` 完全作废。
 
-> **探针的历史偏差记录**（`me3-status.sh` 这一行的"预言过期"已经发生过至少 4 次，这里如实记账，别指望它以后不再发生）：
+> **探针的历史偏差记录**（`me3-status.sh` 这一行的"预言过期"发生过 4 次，如实记账）：
 > `3e`/`3g` 曾因重构前的旧文件路径/旧符号名被误报"未开工"（3e = [#199](https://github.com/iDoris-ai/Agent24/pull/199)/[#201](https://github.com/iDoris-ai/Agent24/pull/201)/[#203](https://github.com/iDoris-ai/Agent24/pull/203)，2026-09-17；3g = [#196](https://github.com/iDoris-ai/Agent24/pull/196)，2026-09-16），[#222](https://github.com/iDoris-ai/Agent24/pull/222) 修正。
-> `3d` 的占位符号在 #222 里猜测会落在 `os_memory.rs`，T8.5c-W-wire 实际把它放进了新文件 `memory_callback.rs`——连实现落地都还没写完预言就已经猜错路径，[#234](https://github.com/iDoris-ai/Agent24/pull/234) 修正。
-> 修正后重跑 `bash docs/agent/me3-status.sh`：3a-3e/3g 全部正确报"已在 main"，**3f（T9）仍正确报未开工——这是 ME-3 收口前唯一剩下的真实缺口**。
+> `3d` 的占位符号在 #222 里猜测会落在 `os_memory.rs`，T8.5c-W-wire 实际把它放进了新文件 `memory_callback.rs`，[#234](https://github.com/iDoris-ai/Agent24/pull/234) 修正。
+> `3f` 的坐标（`me3f_blackbox.rs` + `a_package_from_outside_the_repo`）是唯一一次"设计探针时预留的坐标，实现落地后直接对上、不用改"——4 次偏差里唯一的例外，记一笔正对照。
 
 ---
 
@@ -160,9 +179,10 @@ T9（ME-3f 仓外包端到端验收）  →  T10（Cos72 进程外样例）
   三轮评审详情见 Codex session `01a0ae9e-79a4-76f1-93c5-b160579de7c5`（`codex resume 01a0ae9e-79a4-76f1-93c5-b160579de7c5` 可续）。
 - **T7 ME-3e 事件 + 审批** —— 设计阶段拆成三块：**T7a**（能力授予接线 + `_a24/events/emit`）`DONE` — [#199](https://github.com/iDoris-ai/Agent24/pull/199)（`147f8bf`，2026-09-17；语义说明 [`T7a-ME3e-grants-and-events.md`](../design/T7a-ME3e-grants-and-events.md) v4，写码前 4 轮设计审查，终审 0 Medium+；代码 1 轮 Codex 代码审查，修复 events 专属资源上限的度量方式）：`Offer`/`Grants`/`MethodsFor` 从「进程外模块永远拿不到能力授予」改成「按 manifest 声明真授予」，交付第一个真实回调方法 `_a24/events/emit`；`dispatch()` 新增对所有方法通用的 params 体积预算（节点数/深度/字符串字节，含 object key）。SPEC §8 的 offer set 阶梯按实际交付顺序补记（Memory 未排期，Events 独立先行）。**T7b**（`gate`/`advise`/`status` 模块审批）`DONE` — [#201](https://github.com/iDoris-ai/Agent24/pull/201)（`a37e9ef`，2026-09-17；语义说明 [`T7b-ME3e-approvals.md`](../design/T7b-ME3e-approvals.md) v6，写码前 5 轮设计审查——前 4 轮针对同步阻塞模型，第 4 轮发现该模型与现有 30 秒 RPC/代理超时冲突，架构改为异步提交+轮询后第 5 轮收敛；代码 1 轮 Codex 代码审查）：`approval_token` 与 `request_id` 同一次 `admit_request` 原子登记；提交按 `(module, request_id, kind)` 幂等去重；`gate` 命中空闭集不消耗令牌；`ModuleApproval` 单一 `decision` 维度 + 周期扫描判定超时（容忍单次存储失败、daemon 重启无需特殊清扫）；REST `/api/v1/module-approvals` + WS `module-approval.{required,resolved}`。`gate` 本轮闭集仍为空，真实执行留给 T7c。**T7c**（`gate` 第一个内核可执行动作：`schedule_callback`）`DONE` — [#203](https://github.com/iDoris-ai/Agent24/pull/203)（`5129c55`+`e0c4c12`，2026-09-17；语义说明 [`T7c-ME3e-gate-execution.md`](../design/T7c-ME3e-gate-execution.md) v3，2 轮设计审查——第 1 轮发现"接 `agent24-scheduler` 引擎"这条路有 4 个 Critical，第 2 轮确认"改成直接扩展 T7b 自己的周期扫描"消除了全部 Critical；代码 2 轮 Codex 代码审查，首轮 1 High(迁移文件未入库)+2 Medium(pre-epoch 时间戳误拒/`executed_at` 泄漏进冻结事件)+3 Low，二轮 APPROVE；合入后外部评审又独立抓到 year≥10000 时间戳字典序比较破口，同 PR 追加 `0..=9999` 年份守卫后合并）：`execute_due_schedule_callbacks` 独立 CAS 扫描；`validate_gate_action`/`canonicalize_schedule_target` 双路（wire/in-process）共用；`ModuleApprovalSubmitted` 专用 WS payload 不含 `executed_at`。T7（a/b/c）三块全部合入 main。
 - **T8 ME-3g 启用路径准入** `DONE` — [#196](https://github.com/iDoris-ai/Agent24/pull/196)（`de03b4b`，2026-09-16；语义说明 [`T8-ME3g-enable-admission-gate.md`](../design/T8-ME3g-enable-admission-gate.md) v7，写码前 6 轮设计审查，终审无 Medium+；代码 1 轮 Codex 代码审查）：`PATCH /api/v1/os/{name}` 新增准入门，只在这个名字恰好一条 `os_reports` 报告时触碰（重名维持既有的无条件放行，明确划出范围）——已经是 `Refused` 直接拒绝；`Disabled` 的进程外模块现场重扫清单（按目录匹配、先查名字防改名绕过、再查交付方式自洽性），编译进内核的 `Disabled` 模块关不上（核对需要调用 `build()`，架构本身的安全线逼出的限制，记 `FU-6x` 独立跟进）。`AppState` 新增 `packages_root`/`package_dirs`；`ErrorBody.code` 补 `admission_refused`，顺手补全 FU-64/ERR-1 时代漏掉的 `module_panicked`/`module_killed`。17 条判据全部落成确定性测试。
-- **T9 ME-3f 仓外包端到端 —— 验收**（黑盒：不改源码、不重新构建，装一个仓库之外的包，重启后挂载 → 路由代理 → 事件转发全绿）`BLOCKED on T8.5c`（T7、T8、T8.5a、T8.5b 均已 DONE）
+- **T9 ME-3f 仓外包端到端 —— 验收** `DONE` — [#262](https://github.com/iDoris-ai/Agent24/pull/262)（2026-09-19）：详见上方"T9 已交付，ME-3 专项整体收口"记录。**ME-3 专项到此全部完成。**
 - **T13 `agent24-os-sdk`** 与 **T14 wire 文档 + 非 Rust 参考实现**（可与 T9 之后并行）
-- **T10 Cos72 进程外样例**（重做暂停中的 `feat/me4-cos72-skeleton`）→ **T11 Sin90 迁出内核** → **T12 发布 v0.5.0**
+- **T11 Sin90 迁出内核** `DONE` — [#342](https://github.com/iDoris-ai/Agent24/pull/342)（2026-09-22，详见上方"T11 已交付"记录）
+- **T10 Cos72 进程外样例**（重做暂停中的 `feat/me4-cos72-skeleton`，明确暂停）→ **T12 发布 v0.5.0**
 
 **五、仓外事项**
 - **PR-Daemon 规则 S1**：状态机改动先交一页语义说明，否则 block。已提 [jhfnetboy/PR-daemon#8](https://github.com/jhfnetboy/PR-daemon/issues/8)，等 PR-Daemon 落地；落地前本仓库按上面的约定人工执行。
