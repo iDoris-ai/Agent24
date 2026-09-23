@@ -203,6 +203,26 @@ async fn observed(
 }
 
 impl Store {
+    /// Durably retain a failed database-only workspace allocation.
+    ///
+    /// The allocation transition and its audit evidence share one immediate
+    /// transaction.  Success is reported only after that outer transaction
+    /// commits; an exact replay observes the already-retained evidence without
+    /// writing another audit record.
+    pub async fn retain_workspace_allocation(
+        &self,
+        intent: &AllocationIntent,
+        reason: AllocationFailureReason,
+    ) -> WorkspaceResult<()> {
+        let mut tx = self.begin_workspace_immediate().await?;
+        let attempt = Self::prepare_allocation_retention_tx(&mut tx, intent, reason).await?;
+        Self::retain_allocation_tx(&mut tx, &attempt).await?;
+        tx.commit()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        Ok(())
+    }
+
     /// Freeze one fresh retention or validate an already-applied exact replay.
     pub(crate) async fn prepare_allocation_retention_tx(
         tx: &mut Transaction<'_, Sqlite>,
@@ -489,6 +509,7 @@ mod tests {
     struct RawSnapshot {
         allocations: Vec<Vec<String>>,
         registry: Vec<Vec<String>>,
+        leases: Vec<Vec<String>>,
         audit: Vec<Vec<String>>,
         high_water: Vec<Vec<String>>,
     }
@@ -526,6 +547,7 @@ mod tests {
         RawSnapshot {
             allocations: raw_table(tx, "workspace_allocations").await,
             registry: raw_table(tx, "workspaces").await,
+            leases: raw_table(tx, "workspace_leases").await,
             audit: raw_table(tx, "audit_log").await,
             high_water: raw_table(tx, "sqlite_sequence").await,
         }
@@ -536,6 +558,43 @@ mod tests {
         let snapshot = raw_snapshot_tx(&mut tx).await;
         tx.commit().await.unwrap();
         snapshot
+    }
+
+    #[tokio::test]
+    async fn public_retention_preserves_committed_registry_and_lease_bytes() {
+        let store = Store::open_memory().await.unwrap();
+        let input = intent(RootIdentity::unix(&[1; 8], &[2; 8]).unwrap());
+        source(
+            &store,
+            &input,
+            AllocationPhase::Committed,
+            RootIdentity::unix(&[3; 8], &[4; 8]).unwrap(),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO workspace_leases
+             (lease_id, workspace_id, root_generation, owner_id, kind, acquired_at)
+             VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X5', ?, ?, 'run-owner', 'run', ?)",
+        )
+        .bind(input.workspace_id().as_str())
+        .bind(input.root_generation())
+        .bind(input.created_at().as_str())
+        .execute(crate::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let before = raw_snapshot(&store).await;
+
+        store
+            .retain_workspace_allocation(
+                &input,
+                AllocationFailureReason::parse("io_error").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let after = raw_snapshot(&store).await;
+        assert_eq!(after.registry, before.registry);
+        assert_eq!(after.leases, before.leases);
     }
 
     async fn caller_sentinels(tx: &mut Transaction<'_, Sqlite>) -> String {
