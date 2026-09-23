@@ -1,6 +1,7 @@
 //! Workspace service boundary. Filesystem and persistence behavior live in later slices.
 
 mod error;
+mod root;
 mod service;
 mod spec;
 
