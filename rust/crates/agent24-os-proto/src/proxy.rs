@@ -447,6 +447,10 @@ struct ProxyState {
     /// so the constant is not yet wrong — only unguarded, and the day this
     /// becomes per-module the text starts lying with nothing to catch it.
     capacity: usize,
+    /// ME4-1.3.2: bounds how often a refused (reserved/rejected) request
+    /// logs — a probe or a confused client must not be able to fill the
+    /// daemon's log by hammering `_a24` or a malformed path.
+    reject_log: Arc<RejectedPathLog>,
 }
 
 /// Deadlines, as data rather than as constants read at the call site.
@@ -1084,6 +1088,48 @@ fn decode_percent(s: &str, strict: bool) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// At most this many "reserved/rejected path" debug lines per second, per
+/// mounted namespace — a client hammering `_a24` (or sending malformed
+/// paths) must not be able to fill the daemon's log, mirroring
+/// [`crate::launch::LOG_LINES_PER_SECOND`]'s reasoning for module output.
+const REJECTED_PATH_LOG_LINES_PER_SECOND: u32 = 20;
+
+/// A fixed one-second-window counter, independent per [`ProxyState`] (so one
+/// namespace's probing does not steal another's log budget).
+struct RejectedPathLog {
+    window: std::sync::Mutex<(Instant, u32)>,
+}
+
+impl Default for RejectedPathLog {
+    fn default() -> Self {
+        Self {
+            window: std::sync::Mutex::new((Instant::now(), 0)),
+        }
+    }
+}
+
+impl RejectedPathLog {
+    /// `true` the first [`REJECTED_PATH_LOG_LINES_PER_SECOND`] times in any
+    /// rolling one-second window, `false` after — the caller only logs when
+    /// this returns `true`, so log volume is bounded even under a flood.
+    fn admit(&self) -> bool {
+        let mut w = self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        if now.duration_since(w.0) >= Duration::from_secs(1) {
+            *w = (now, 0);
+        }
+        if w.1 < REJECTED_PATH_LOG_LINES_PER_SECOND {
+            w.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The router that proxies one namespace to one module.
 ///
 /// It is a bare fallback, because a module owns every path under its namespace
@@ -1140,6 +1186,7 @@ fn state_with(
         inflight: Arc::new(tokio::sync::Semaphore::new(inflight)),
         idle: Arc::new(IdleConnections::default()),
         capacity: inflight,
+        reject_log: Arc::new(RejectedPathLog::default()),
     }
 }
 
@@ -1154,7 +1201,20 @@ async fn proxy(
     // process sees zero bytes of it. `original.path()` is the raw,
     // percent-encoded, query-free path; `state.namespace` is the same
     // `/api/v1/<ns>` axum's `nest` already matched byte-exactly.
-    match judge(&state.namespace, original.path()) {
+    let verdict = judge(&state.namespace, original.path());
+    // `{:?}` (not `{}`) so a refused path's own bytes cannot inject a
+    // newline or other control character into the log — Rust's `Debug` for
+    // `str` escapes them, same reasoning as `launch::log_line`'s cap on
+    // module output, just for content rather than volume.
+    if !matches!(verdict, PathVerdict::Forward) && state.reject_log.admit() {
+        tracing::debug!(
+            namespace = %state.namespace,
+            path = ?original.path(),
+            reserved = matches!(verdict, PathVerdict::Reserved),
+            "request path refused before admission"
+        );
+    }
+    match verdict {
         PathVerdict::Reserved => {
             return error_response(StatusCode::NOT_FOUND, "not_found", "no such route");
         }
@@ -5035,6 +5095,16 @@ mod tests {
             // segment too — an IIS-style server strips it to empty, same
             // meaning as `//`.
             "/x/%20%20/y",
+            // Pathological nesting (§7.2's "4 轮后仍在变 → 拒"): rejected NOT
+            // because it settles to `..` — traced by hand, it never does.
+            // `%252525252e` needs a 5th decode round to finish unwrapping
+            // (`%2525252e` → `%25252e` → `%252e` → `%2e`, still `%2e` — not
+            // `.` — after the 3 extra rounds `canonical_segment` allows); one
+            // more decode of `%2e` still changes it (to `.`), so the fixed-
+            // point check fails and the WHOLE segment is refused on that
+            // basis alone, independent of whatever it might eventually
+            // decode to.
+            "/x/%252525252e/_a24",
         ];
 
         // ---- C3.3: positive controls — forwarded, path untouched --------
@@ -5077,29 +5147,252 @@ mod tests {
             }
         }
 
-        /// C3.4 (`starts_with` mutant) / C3.5 (kernel-view resolution
-        /// mutant) are verified by hand, not shipped as broken code in this
-        /// crate (there is no mutation-testing harness wired into this
-        /// repo's `cargo test`): every case a described mutation flips is
-        /// already an assertion above or below —
-        /// `%5fa24`/`%255fa24` (C3.4a: a naive `starts_with("/_a24")` on the
-        /// raw path calls these `Forward`), `x%252F..%252F_a24` (C3.4b:
-        /// skipping the per-round `/` check calls it `Forward`),
-        /// `_a24/scheduler/fired/../../..` and `_a24/..` (C3.5: resolving
-        /// dot segments in the kernel's own view instead of rejecting them
-        /// calls both `Forward`), `x/..;/_a24` (C3.5: dropping the `;` cut
-        /// before the dot-segment check calls it `Forward`),
-        /// `x/..%20/_a24` (C3.5: dropping the trailing-space trim in the
-        /// dot-segment check calls it `Forward`), `_a24.` (C3.5: dropping
-        /// the trailing dot/space trim on the FIRST segment calls it
-        /// `Forward` instead of `Reserved`). Each was confirmed to flip red
-        /// against a hand-built mutant in the implementation session.
+        /// Rule 1 (§7.2): the path must start with `namespace`, and what
+        /// follows must be empty or start with `/`. Unreachable through
+        /// axum's own `nest` in production (it only ever calls `proxy` for
+        /// paths that already match byte-exactly), so `judge` is a general
+        /// function that has to fail closed here on its own — this is the
+        /// only place that branch is exercised directly.
         #[test]
-        fn c3_4_and_c3_5_mutation_notes() {
-            // No executable content — see the doc comment. This test exists
-            // so `cargo test reserved_path -- --list` finds it and a reader
-            // grepping test names finds the mutation record next to the
-            // matrices it is about.
+        fn rule1_path_must_start_with_namespace_then_be_empty_or_slash() {
+            // `namespace` is a byte-exact PREFIX of the raw path, but the very
+            // next byte is neither end-of-string nor `/` — e.g. a sibling
+            // namespace `/api/v1/zzmockx` that happens to start with ours.
+            assert_eq!(
+                judge(NS, &format!("{NS}x")),
+                PathVerdict::Rejected,
+                "namespace prefix not followed by '/' or end of string"
+            );
+            // Does not start with `namespace` at all.
+            assert_eq!(
+                judge(NS, "/other"),
+                PathVerdict::Rejected,
+                "raw path outside the namespace entirely"
+            );
+        }
+
+        // ---- C3.4 / C3.5: reproducible mutation testing ------------------
+        //
+        // This repo has no mutation-testing harness wired into `cargo test`,
+        // so each mutation below is a small, LOCAL reimplementation of
+        // `judge` with exactly one behaviour changed — never the real
+        // `judge` itself — checked against the SAME `RESERVED`/`REJECTED`
+        // tables the real matrices above use. Each mutant function is
+        // deliberately dumb: it does not reuse the piece of `judge` it is
+        // mutating, only the pieces it is not (e.g. `canonical_segment` for
+        // decoding, when the mutation is only about how a dot segment is
+        // judged afterward).
+
+        /// C3.4a mutant: judge the RAW, still percent-encoded path with a
+        /// naive `starts_with` — the check an implementer might reach for
+        /// before realising why `judge` decodes and canonicalises at all.
+        fn judge_naive_starts_with(namespace: &str, raw_path: &str) -> PathVerdict {
+            let Some(rest) = raw_path.strip_prefix(namespace) else {
+                return PathVerdict::Rejected;
+            };
+            if rest == "/_a24" || rest.starts_with("/_a24/") {
+                PathVerdict::Reserved
+            } else {
+                PathVerdict::Forward
+            }
+        }
+
+        /// C3.4b mutant's segment canonicaliser: like `canonical_segment`,
+        /// but never calls `reject_structural` — a slash unwrapped at any
+        /// decode depth (`%252F` → `%2F` → `/`) survives into the
+        /// "canonical" segment instead of being refused.
+        fn canonical_segment_no_slash_check(raw: &str) -> Option<String> {
+            if raw.bytes().any(|b| b == b'\\') {
+                return None;
+            }
+            let mut cur = decode_percent(raw, true)?;
+            for _ in 0..EXTRA_DECODE_ROUNDS {
+                let next = decode_percent(&cur, false)?;
+                if next == cur {
+                    return Some(cur);
+                }
+                cur = next;
+            }
+            (decode_percent(&cur, false)? == cur).then_some(cur)
+        }
+
+        /// C3.4b mutant: `judge`, with every per-round `/`/`\`/control-char
+        /// check dropped.
+        fn judge_no_slash_check(namespace: &str, raw_path: &str) -> PathVerdict {
+            let Some(rest) = raw_path.strip_prefix(namespace) else {
+                return PathVerdict::Rejected;
+            };
+            if !(rest.is_empty() || rest.starts_with('/')) {
+                return PathVerdict::Rejected;
+            }
+            let mut stack: Vec<String> = Vec::new();
+            for raw in rest.split('/') {
+                let Some(seg) = canonical_segment_no_slash_check(raw) else {
+                    return PathVerdict::Rejected;
+                };
+                let base = seg.split([';', '?', '#']).next().unwrap_or("");
+                if !base.is_empty() && base.chars().all(|c| c == '.' || c == ' ') {
+                    return PathVerdict::Rejected;
+                }
+                if base.is_empty() {
+                    continue;
+                }
+                stack.push(seg);
+            }
+            match stack.first() {
+                Some(first) if is_reserved(first) => PathVerdict::Reserved,
+                _ => PathVerdict::Forward,
+            }
+        }
+
+        /// C3.5a mutant: RESOLVE a dot segment (pop `..`, drop `.`) instead
+        /// of rejecting the whole path — the exact v2 bug (design H-B): the
+        /// kernel forwards the RAW path, so resolving `..` only in the
+        /// kernel's own view lets `_a24/scheduler/fired/../../..` (first
+        /// canonical segment after resolving: none) or `_a24/..` through to
+        /// a module that prefix-matches `/_a24/…`.
+        fn judge_resolves_dots_in_kernel_view(namespace: &str, raw_path: &str) -> PathVerdict {
+            let Some(rest) = raw_path.strip_prefix(namespace) else {
+                return PathVerdict::Rejected;
+            };
+            if !(rest.is_empty() || rest.starts_with('/')) {
+                return PathVerdict::Rejected;
+            }
+            let mut stack: Vec<String> = Vec::new();
+            for raw in rest.split('/') {
+                let Some(seg) = canonical_segment(raw) else {
+                    return PathVerdict::Rejected;
+                };
+                let base = seg.split([';', '?', '#']).next().unwrap_or("");
+                if base == "." {
+                    continue;
+                }
+                if base == ".." {
+                    stack.pop();
+                    continue;
+                }
+                if base.is_empty() {
+                    continue;
+                }
+                stack.push(seg);
+            }
+            match stack.first() {
+                Some(first) if is_reserved(first) => PathVerdict::Reserved,
+                _ => PathVerdict::Forward,
+            }
+        }
+
+        /// C3.5b mutant: the dot-segment check cuts only at `;`, not at
+        /// `;`/`?`/`#` — reintroduces the pre-v3.1 inconsistency (design
+        /// L1) between this check and the first-segment reserved check.
+        fn judge_dotseg_cuts_only_semicolon(namespace: &str, raw_path: &str) -> PathVerdict {
+            let Some(rest) = raw_path.strip_prefix(namespace) else {
+                return PathVerdict::Rejected;
+            };
+            if !(rest.is_empty() || rest.starts_with('/')) {
+                return PathVerdict::Rejected;
+            }
+            let mut stack: Vec<String> = Vec::new();
+            for raw in rest.split('/') {
+                let Some(seg) = canonical_segment(raw) else {
+                    return PathVerdict::Rejected;
+                };
+                let base = seg.split(';').next().unwrap_or("");
+                if !base.is_empty() && base.chars().all(|c| c == '.' || c == ' ') {
+                    return PathVerdict::Rejected;
+                }
+                if base.is_empty() {
+                    continue;
+                }
+                stack.push(seg);
+            }
+            match stack.first() {
+                Some(first) if is_reserved(first) => PathVerdict::Reserved,
+                _ => PathVerdict::Forward,
+            }
+        }
+
+        /// C3.5c mutant's first-segment check: like `is_reserved`, but never
+        /// trims a trailing `.`/space — reintroduces the pre-v2 bug (design
+        /// H2): `_a24.` and `_a24%20` stop matching `_a24`.
+        fn is_reserved_no_trim(segment: &str) -> bool {
+            let head = segment.split([';', '?', '#']).next().unwrap_or("");
+            head.eq_ignore_ascii_case(RESERVED_SEGMENT)
+        }
+
+        /// C3.5c mutant: `judge`, with the first segment's trailing-dot/space
+        /// trim dropped.
+        fn judge_first_segment_not_trimmed(namespace: &str, raw_path: &str) -> PathVerdict {
+            let Some(rest) = raw_path.strip_prefix(namespace) else {
+                return PathVerdict::Rejected;
+            };
+            if !(rest.is_empty() || rest.starts_with('/')) {
+                return PathVerdict::Rejected;
+            }
+            let mut stack: Vec<String> = Vec::new();
+            for raw in rest.split('/') {
+                let Some(seg) = canonical_segment(raw) else {
+                    return PathVerdict::Rejected;
+                };
+                let base = seg.split([';', '?', '#']).next().unwrap_or("");
+                if !base.is_empty() && base.chars().all(|c| c == '.' || c == ' ') {
+                    return PathVerdict::Rejected;
+                }
+                if base.is_empty() {
+                    continue;
+                }
+                stack.push(seg);
+            }
+            match stack.first() {
+                Some(first) if is_reserved_no_trim(first) => PathVerdict::Reserved,
+                _ => PathVerdict::Forward,
+            }
+        }
+
+        /// A mutant `judge`, by name.
+        type MutantJudge = fn(&str, &str) -> PathVerdict;
+
+        /// For every mutant above: somewhere in `RESERVED ∪ REJECTED` there
+        /// must be a case where the mutant disagrees with the real `judge`
+        /// AND the mutant's (wrong) answer is `Forward` — i.e. the mutation
+        /// would let something reach the module that must not. A future
+        /// refactor that reintroduces any of these five bugs turns this test
+        /// red, not just the doc comment that used to be here.
+        #[test]
+        fn c3_4_and_c3_5_mutations_are_caught_by_the_matrix() {
+            let all_cases: Vec<String> = RESERVED
+                .iter()
+                .chain(REJECTED.iter())
+                .map(|p| format!("{NS}{p}"))
+                .collect();
+            let mutants: &[(&str, MutantJudge)] = &[
+                ("C3.4a naive starts_with", judge_naive_starts_with),
+                ("C3.4b no per-round / check", judge_no_slash_check),
+                (
+                    "C3.5a resolve dots in kernel view",
+                    judge_resolves_dots_in_kernel_view,
+                ),
+                (
+                    "C3.5b dot segment cuts only at ;",
+                    judge_dotseg_cuts_only_semicolon,
+                ),
+                (
+                    "C3.5c first segment not trimmed",
+                    judge_first_segment_not_trimmed,
+                ),
+            ];
+            for (name, mutant) in mutants {
+                let killed = all_cases.iter().any(|full| {
+                    let real = judge(NS, full);
+                    let got = mutant(NS, full);
+                    got != real && got == PathVerdict::Forward
+                });
+                assert!(
+                    killed,
+                    "mutation `{name}` survived the RESERVED/REJECTED matrix — \
+                     no case in it flips to Forward under this mutant"
+                );
+            }
         }
 
         /// The r3-review table (`scratchpad/r3-review/src/rp.rs`, `requested`
@@ -5122,8 +5415,11 @@ mod tests {
                 ("/x/.%2e/_a24/scheduler/fired", PathVerdict::Rejected),
                 ("/x/%2e./_a24/scheduler/fired", PathVerdict::Rejected),
                 ("/x/..;a=b/_a24/scheduler/fired", PathVerdict::Rejected),
-                // Nested `%25`-encodings that DO settle to `..` within the
-                // 4 decode rounds this judgement allows.
+                // Nested `%25`-encodings that DO settle to the fixed point
+                // `..` within the 3 extra decode rounds `canonical_segment`
+                // allows (traced by hand: `%252e%252e` → `%2e%2e` → `..`,
+                // two rounds; `%25252e%25252e` needs three) — genuine dot
+                // segments, rejected on that basis.
                 ("/x/%252e%252e/_a24/scheduler/fired", PathVerdict::Rejected),
                 (
                     "/x/%25252e%25252e/_a24/scheduler/fired",
@@ -5133,6 +5429,10 @@ mod tests {
                     "/x/%2525252e%2525252e/_a24/scheduler/fired",
                     PathVerdict::Rejected,
                 ),
+                // NOT in the "settles to `..`" group above: `%252525252e`
+                // needs a 5th round to finish unwrapping and is rejected as
+                // pathological nesting instead — see the dedicated, labelled
+                // case in `REJECTED` (C3.2) for the traced-by-hand reasoning.
                 ("/x/%252525252e/_a24", PathVerdict::Rejected),
                 // `//` and a segment that is only `;params` are skipped, not
                 // pushed — so `_a24` right after one is still the effective
@@ -5153,14 +5453,11 @@ mod tests {
                 ("/x/.. /_a24", PathVerdict::Rejected),
                 ("/x/%2e%2e%2f_a24", PathVerdict::Rejected),
                 ("/x/..%00/_a24", PathVerdict::Rejected),
-                // `%u002e` is not a valid `%XX` escape (only two hex digits
-                // after `%`) — the LITERAL `u002e` survives decoding, so the
-                // segment is `..%u002e%u002e`... no: `%u` itself is an
-                // illegal escape only in round 1 if strict; here it is not
-                // `_a24`'s own segment, so the illegal `%u` makes the WHOLE
-                // segment unparseable only if round 1 is strict about it —
-                // round 1 IS strict, and `%u0` is `%` followed by `u`, not a
-                // hex digit, so round 1 rejects it outright.
+                // IIS's legacy `%uXXXX` form is not `%XX` — `%u0` is `%`
+                // followed by `u`, and `u` is not a hex digit, so the
+                // STRICT round-1 decode rejects the whole segment outright
+                // (rule 2's "非法 % 序列即拒") before there is any question
+                // of what `%u002e` might otherwise mean.
                 ("/x/%u002e%u002e/_a24", PathVerdict::Rejected),
                 // `_a24` with trailing dots from `%2e%2e` — a NAME (not a
                 // dot segment, since it also has letters), still recognised
@@ -5169,16 +5466,38 @@ mod tests {
                 // An encoded slash inside the segment — rejected regardless
                 // of what surrounds it (rule 2).
                 ("/_a24%3B%2F../x", PathVerdict::Rejected),
-                // Pathological nesting that does NOT settle to `..` within
-                // budget: `..%2525` decodes, over the rounds this judgement
-                // allows, to `..%` (not `..`) — not a dot segment, and
-                // harmless here because `_a24` is not the first segment
-                // regardless (the first segment is `x`).
+                // `..%2525` DOES reach a fixed point within budget — traced
+                // by hand: `..%2525` → `..%25` → `..%`, and decoding `..%`
+                // again is a no-op, so `canonical_segment` stops there. `..%`
+                // is not a dot segment (it has a non-dot, non-space byte,
+                // the literal `%`), so `judge` pushes it as an ordinary
+                // segment name and `_a24` is not first. That is NOT the
+                // safety argument, though: this crate never resolves a dot
+                // segment (rule 3 rejects the whole path instead of
+                // popping), so nothing here could have promoted `_a24` to
+                // first position regardless of how `..%` canonicalises —
+                // the `x` ahead of it is itself an ordinary, permanently
+                // stack-resident segment. What `Forward` here actually
+                // rests on is the residual risk this design accepts and
+                // names (R10): `judge` does not know whether some module's
+                // OWN framework would decode `..%2525` further (to `..%25`,
+                // `..%`, or beyond) and treat THAT as `..` once the raw path
+                // reaches it unchanged — `review_r3_fuzz_reduced` below
+                // checks this Forward verdict against 80 plausible
+                // module-side normalisers and finds none that do, but a
+                // model outside that 80 is exactly R10's disclosed gap, not
+                // something this test can rule out.
                 ("/x/..%2525/_a24", PathVerdict::Forward),
-                // Ideographic full stop (U+3002, `。`), not ASCII `.` — not
-                // treated as a dot segment (design R2: non-ASCII lookalikes
-                // are out of scope); again harmless because `_a24` is not
-                // first.
+                // Ideographic full stop (U+3002, `。`), not ASCII `.` or
+                // space — `judge` never treats it as dot-segment material,
+                // by design (R2: non-ASCII lookalikes are explicitly out of
+                // scope, not silently assumed safe). As above, `_a24` not
+                // being first here is a consequence of `judge` never
+                // resolving segments at all, not of this segment being
+                // "harmless" in some absolute sense — a module that itself
+                // folds `。` to `.` before routing would see something this
+                // judgement did not predict, which is exactly what R2 says
+                // out loud rather than papering over.
                 ("/x/%E3%80%82%E3%80%82/_a24", PathVerdict::Forward),
             ];
             for (p, want) in cases {
@@ -5188,16 +5507,25 @@ mod tests {
         }
 
         // ---- reduced fuzz (r3-review's `fuzz`, scaled down per task: the
-        // full 28-token set kept, sequence length cut from 4 to 3 so this
-        // runs in well under a second) --------------------------------
+        // full 28-token set kept, sequence length cut from 4 to 3, so this
+        // runs in a few seconds rather than r3-review's own multi-minute
+        // 659,373-path run) -------------------------------------------
         //
-        // Cross-checks `judge`'s `Forward` verdicts against 80 different
+        // Cross-checks `judge`'s `Forward` verdicts against 160 different
         // plausible MODULE-side path normalizers (decode rounds ×
         // strip-`;params` × trim-trailing × collapse-empty × re-parse at
-        // `?`/`#`, all on/off) — not just against itself. The claim under
-        // test is stronger than "`judge` agrees with `judge`": it is that
-        // no `Forward`-verdicted raw path, decoded and normalised by any of
-        // these 80 models, ever begins with `_a24` as its first segment.
+        // `?`/`#` × resolve-dot-segments-at-all, all on/off) — not just
+        // against itself. Two claims are checked per `Forward`-verdicted raw
+        // path, both halves of design §7.4's guarantee:
+        //  1. under none of the 160 models does the result begin with
+        //     `_a24` as its first segment (the guarantee's first half —
+        //     `_a24` unreachable);
+        //  2. under the `resolve_dots = false` models (a module that
+        //     decodes for its own purposes but does not itself special-case
+        //     `.`/`..`, e.g. an exact-match static-file router), the result
+        //     never CONTAINS a literal `.` or `..` segment at all — the
+        //     guarantee's other half, "任何含点段的路径到达不了模块", checked
+        //     directly rather than only inferred from (1).
         fn dec_one(s: &str) -> String {
             let b = s.as_bytes();
             let mut o = Vec::new();
@@ -5219,8 +5547,14 @@ mod tests {
             String::from_utf8_lossy(&o).into_owned()
         }
 
-        /// One of the 80 hypothetical module-side canonicalisers this fuzz
-        /// checks `judge`'s `Forward` verdicts against.
+        /// One of the 160 hypothetical module-side canonicalisers this fuzz
+        /// checks `judge`'s `Forward` verdicts against. `resolve_dots`:
+        /// `true` models a router that pops `..` and drops `.`, same as
+        /// `judge`'s peers usually do; `false` models one that decodes but
+        /// never special-cases a `.`/`..` segment (an exact-match router,
+        /// say) — those segments survive into the returned string literally,
+        /// which is what lets the caller check for them directly.
+        #[allow(clippy::too_many_arguments)]
         fn module_view(
             raw: &str,
             rounds: usize,
@@ -5228,6 +5562,7 @@ mod tests {
             trim: bool,
             collapse: bool,
             reparse: bool,
+            resolve_dots: bool,
         ) -> String {
             let mut p = raw.to_string();
             for _ in 0..rounds {
@@ -5248,10 +5583,10 @@ mod tests {
                         s = seg.to_string();
                     }
                 }
-                if s == "." {
+                if resolve_dots && s == "." {
                     continue;
                 }
-                if s == ".." {
+                if resolve_dots && s == ".." {
                     st.pop();
                     continue;
                 }
@@ -5295,23 +5630,38 @@ mod tests {
             let mut check = |segs: &[&'static str]| {
                 let raw = format!("{NS}/{}", segs.join("/"));
                 n += 1;
-                if judge(NS, &raw) == PathVerdict::Forward {
-                    fwd += 1;
-                    if raw.starts_with(&reserved_prefix) || raw.eq_ignore_ascii_case(&reserved_bare)
-                    {
-                        bad.push(format!("RAW {raw}"));
-                    }
-                    for rounds in 0..=4 {
-                        for sp in [false, true] {
-                            for tr in [false, true] {
-                                for co in [false, true] {
-                                    for rp in [false, true] {
-                                        let mv = module_view(&raw, rounds, sp, tr, co, rp);
+                if judge(NS, &raw) != PathVerdict::Forward {
+                    return;
+                }
+                fwd += 1;
+                if raw.starts_with(&reserved_prefix) || raw.eq_ignore_ascii_case(&reserved_bare) {
+                    bad.push(format!("RAW {raw} reaches _a24 directly"));
+                }
+                for rounds in 0..=4 {
+                    for sp in [false, true] {
+                        for tr in [false, true] {
+                            for co in [false, true] {
+                                for rp in [false, true] {
+                                    for rd in [false, true] {
+                                        let mv = module_view(&raw, rounds, sp, tr, co, rp, rd);
+                                        let tag =
+                                            format!("r{rounds} sp{sp} tr{tr} co{co} rp{rp} rd{rd}");
+                                        // Half 1 of §7.4: `_a24` unreachable.
                                         if mv.starts_with(&format!("{NS}/_a24/"))
                                             || mv == format!("{NS}/_a24")
                                         {
+                                            bad.push(format!("{raw} {tag} -> {mv} (reaches _a24)"));
+                                        }
+                                        // Half 2 of §7.4: no dot segment
+                                        // survives into the module's own
+                                        // view either — checked only where
+                                        // this model would not itself have
+                                        // resolved one away (`rd == false`),
+                                        // since a resolving model can never
+                                        // emit one by construction.
+                                        if !rd && mv.split('/').any(|s| s == "." || s == "..") {
                                             bad.push(format!(
-                                                "{raw} r{rounds} sp{sp} tr{tr} co{co} rp{rp} -> {mv}"
+                                                "{raw} {tag} -> {mv} (dot segment survives)"
                                             ));
                                         }
                                     }
@@ -5321,15 +5671,26 @@ mod tests {
                     }
                 }
             };
-            // Depth 3 (not r3-review's 4): full token set, ~22.8k raw paths,
-            // ~1k of them `Forward` and so run through the 80 module models
-            // — well under a second in a debug build (measured: ~500ms).
+            // Depth 3 (not r3-review's 4) for the plain sequence recursion,
+            // PLUS r3-review's "two tokens concatenated into one segment"
+            // form (`{a}{b}/c}`), which the recursion alone cannot produce.
+            // Together: 44,717 raw paths, 5,185 of them `Forward` and so run
+            // through the 160 module models (≈830k `module_view` calls
+            // total) — a few seconds in a debug build (measured: ~4.3s).
             rec(&mut Vec::new(), &toks_s, 3, &mut check);
-            assert!(n > 20_000, "sanity: the fuzz should have run, n={n}");
+            for a in &toks_s {
+                for b in &toks_s {
+                    let concat: &'static str = Box::leak(format!("{a}{b}").into_boxed_str());
+                    for c in &toks_s {
+                        check(&[concat, c]);
+                    }
+                }
+            }
+            assert!(n > 40_000, "sanity: the fuzz should have run, n={n}");
             assert!(fwd > 0, "sanity: some paths should have forwarded");
             assert!(
                 bad.is_empty(),
-                "a Forward-verdicted path reaches `_a24` under some module model: {:#?}",
+                "§7.4 violated under some module model: {:#?}",
                 &bad[..bad.len().min(20)]
             );
         }
@@ -5400,6 +5761,114 @@ mod tests {
             assert_eq!(got.status, StatusCode::NOT_FOUND);
             assert_eq!(got.json()["error"]["code"], "not_found");
             assert_eq!(hits.0.load(Ordering::SeqCst), 0);
+        }
+
+        /// L3: the judgement does not depend on the HTTP method — a HEAD or
+        /// a POST to a reserved path must be refused exactly like a GET.
+        /// `judge` never looks at the method at all, but that is exactly
+        /// the kind of invariant that is easy to break by accident (e.g. by
+        /// moving the judgement into a GET-only branch during a refactor),
+        /// so it is worth pinning through the real router rather than only
+        /// trusting the pure function's signature.
+        #[tokio::test]
+        async fn reserved_paths_are_judged_regardless_of_method() {
+            let (proxy, hits) = proxied().await;
+
+            let head = call(
+                proxy,
+                Method::HEAD,
+                &format!("{NS}/_a24/scheduler/fired"),
+                &[],
+                "",
+            )
+            .await;
+            assert_eq!(head.status, StatusCode::NOT_FOUND);
+
+            let post = call(
+                proxy,
+                Method::POST,
+                &format!("{NS}/_a24/scheduler/fired"),
+                &[],
+                "{}",
+            )
+            .await;
+            assert_eq!(post.status, StatusCode::NOT_FOUND);
+            assert_eq!(post.json()["error"]["code"], "not_found");
+
+            assert_eq!(
+                hits.0.load(Ordering::SeqCst),
+                0,
+                "neither HEAD nor POST to a reserved path may reach the module"
+            );
+        }
+
+        /// L2: the judgement precedes EVERY side effect of admission, not
+        /// only "no request reaches the module". Checked two ways at once:
+        /// while a genuine request is held open, a reserved/rejected call
+        /// sneaking into `Generation::in_flight` even briefly would show up
+        /// as a count of 2; and the request-id counter (`RequestIds`, a
+        /// monotonic `AtomicU64` — `proxy.rs`) must advance by exactly one
+        /// across the whole batch of reserved/rejected calls fired between
+        /// two legitimate ones, proving none of them minted an id.
+        #[tokio::test]
+        async fn rejection_happens_before_any_admission_or_id_mint() {
+            let module = gated(Then::Answer).await;
+            let generation = running_generation(module.addr.clone());
+            let proxy = serve(mount(Router::new(), NS, Current::new(generation.clone()))).await;
+            assert_eq!(generation.in_flight(), 0);
+
+            let held = tokio::spawn(async move {
+                call(proxy, Method::GET, &format!("{NS}/held"), &[], "").await
+            });
+            module.wait_arrived().await;
+            assert_eq!(generation.in_flight(), 1);
+
+            for p in RESERVED.iter().chain(REJECTED.iter()) {
+                let full = format!("{NS}{p}");
+                let got = call(proxy, Method::GET, &full, &[], "").await;
+                assert_ne!(got.status, StatusCode::OK, "{full}");
+                assert_eq!(
+                    generation.in_flight(),
+                    1,
+                    "a reserved/rejected request must never be admitted \
+                     while another is genuinely in flight: {full}"
+                );
+            }
+            assert_eq!(
+                module.dials.load(Ordering::SeqCst),
+                1,
+                "only the held request should ever have reached the module"
+            );
+
+            module.release.notify_waiters();
+            let held = held.await.unwrap();
+            assert_eq!(held.status, StatusCode::OK);
+            assert_eq!(generation.in_flight(), 0);
+
+            let next = tokio::spawn(async move {
+                call(proxy, Method::GET, &format!("{NS}/next"), &[], "").await
+            });
+            module.wait_arrived().await;
+            module.release.notify_waiters();
+            let next = next.await.unwrap();
+            assert_eq!(next.status, StatusCode::OK);
+
+            // The ids the MODULE saw, in arrival order — exactly two, back
+            // to back, with none of the reserved/rejected calls above ever
+            // having minted one in between.
+            let ids = module.ids.lock().unwrap().clone();
+            assert_eq!(ids.len(), 2, "{ids:?}");
+            let n = |id: &str| -> u64 {
+                id.rsplit('-')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("not a `<prefix>-<n>` id: {id:?}"))
+            };
+            assert_eq!(
+                n(&ids[1]),
+                n(&ids[0]) + 1,
+                "a reserved/rejected request must never mint a request id: {ids:?}"
+            );
         }
     }
 }
