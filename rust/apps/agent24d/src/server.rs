@@ -1629,20 +1629,17 @@ pub async fn serve(
     result
 }
 
-const CAPABILITY_ROUTE_POLICY_PENDING: &str =
-    "capability authentication cannot start until capability route policy lands";
-
-/// Capability credentials are unsafe until every route has a policy. This is
-/// intentionally the first `serve` action: no listener, store, token, state
-/// file, or ready record can exist on the rejected path.
+/// Capability mode requires the trusted host-bootstrap transport; the route
+/// middleware maps every request before accepting its bearer.
 fn validate_auth_startup(
     auth_mode: AuthMode,
     host_bootstrap_stdio: bool,
 ) -> Result<(), std::io::Error> {
     match (auth_mode, host_bootstrap_stdio) {
-        (AuthMode::Capabilities, _) => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            CAPABILITY_ROUTE_POLICY_PENDING,
+        (AuthMode::Capabilities, true) => Ok(()),
+        (AuthMode::Capabilities, false) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "capability mode requires trusted host bootstrap stdio",
         )),
         (AuthMode::LegacySingleToken, true) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2153,20 +2150,12 @@ pub(crate) mod tests {
         assert!(json["version"].as_str().is_some());
     }
 
-    #[tokio::test]
-    async fn capability_startup_is_rejected_before_ready_or_credential() {
-        let err = serve(
-            0,
-            true,
-            AuthMode::Capabilities,
-            true,
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("route-policy-less capability startup must fail");
-
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-        assert_eq!(err.to_string(), CAPABILITY_ROUTE_POLICY_PENDING);
+    #[test]
+    fn capability_startup_requires_the_trusted_host_bootstrap_transport() {
+        assert!(validate_auth_startup(AuthMode::Capabilities, true).is_ok());
+        let err = validate_auth_startup(AuthMode::Capabilities, false)
+            .expect_err("capability startup without private host pipes");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]
@@ -2189,6 +2178,61 @@ pub(crate) mod tests {
 
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body_json(res).await["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn creative_bearer_can_read_models_but_not_the_closed_default_route() {
+        let store = crate::capabilities::CapabilityStore::new("capability-generation");
+        let host = store
+            .mint_product_host(
+                "host-generation",
+                Duration::from_secs(60),
+                crate::capabilities::unix_now(),
+            )
+            .unwrap();
+        let creative = store
+            .mint_creative(
+                host.token(),
+                crate::capabilities::CreativeMintRequest::new(
+                    "workspace",
+                    "attachment",
+                    "principal",
+                    "sidecar-generation",
+                    Duration::from_secs(60),
+                    crate::capabilities::unix_now(),
+                ),
+            )
+            .unwrap();
+        let (creative_bearer, _, _) = creative.into_bearer_parts();
+        let mut capability_state = state().await;
+        capability_state.enable_capability_auth(store);
+        let router = build_router(capability_state);
+
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+
+        let default_route = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_route.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(default_route).await["error"]["code"], "forbidden");
     }
 
     #[tokio::test]

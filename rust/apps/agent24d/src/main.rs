@@ -5,12 +5,11 @@
 
 mod approval_callback;
 mod approvals;
-// Capability authority is staged ahead of its route policy. Keep the allowance
-// confined to that deferred module rather than weakening the daemon's lints.
+// Remaining public capability primitives are staged for the next endpoints.
 #[allow(
     dead_code,
     unused_imports,
-    reason = "capability route policy has not landed"
+    reason = "capability API is intentionally staged beyond route policy"
 )]
 mod capabilities;
 mod domain;
@@ -20,7 +19,10 @@ mod events_emit;
 mod host_bootstrap;
 #[cfg(not(unix))]
 mod host_bootstrap {
-    #![allow(dead_code)] // Staged until the capability startup layer consumes it.
+    #![allow(
+        dead_code,
+        reason = "capability bootstrap is unavailable without Unix descriptor validation"
+    )]
 
     use std::io;
 
