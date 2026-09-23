@@ -158,7 +158,12 @@ pub(crate) trait LaunchControl {
 #[cfg(any(unix, windows))]
 impl LaunchControl for OwnedLaunch {
     fn stop(&mut self, force: bool) -> io::Result<()> {
-        self.target_mut().request_stop(force)
+        if force {
+            self.target_mut().request_stop(true)
+        } else {
+            self.parts_mut().1.close_stdin();
+            self.target_mut().request_stop(false)
+        }
     }
 
     fn cleanup(&mut self, phase: &mut Phase) -> Result<TreeObservation, CleanupStepError> {
@@ -375,8 +380,8 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use agent24_sidecar_host_protocol::decode_reply;
-    use std::collections::VecDeque;
+    use agent24_sidecar_host_protocol::{Request, decode_reply};
+    use std::collections::{BTreeMap, VecDeque};
 
     struct FakeLaunch(u64);
 
@@ -673,5 +678,124 @@ mod tests {
             cleanup_required(launch.queue_owned(at));
             assert!(launch.order.sink.frame.is_none());
         }
+
+        let mut force_first = actor([Ok(())], [], vec![]);
+        force_first.stop(true, now).unwrap();
+        assert_eq!(force_first.order.launch.forces, vec![true]);
+        assert!(matches!(force_first.phase, Phase::ForceStopping(_)));
+    }
+
+    fn force_and_reap(launch: &mut OwnedLaunch) -> io::Result<()> {
+        use std::time::Duration;
+
+        let force = LaunchControl::stop(launch, true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reap = loop {
+            match launch.target_mut().reap_step() {
+                Ok(TreeObservation::ConfirmedEmpty) => break Ok(()),
+                Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Ok(_) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "reap deadline expired",
+                    ));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        force?;
+        reap
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_soft_stop_closes_stdin_twice_then_force_reaps_same_owner() {
+        use std::{io::Read, os::fd::AsFd, time::Duration};
+
+        let _test_guard = crate::posix::tests::test_lock();
+        let request = Request::Launch {
+            version: PROTOCOL_VERSION,
+            request_id: 71,
+            executable: "/bin/sh".into(),
+            cwd: "/".into(),
+            argv: vec!["-c".into(), "trap '' TERM; printf 'ready!'; IFS= read -r line || :; printf 'out-eof!'; printf 'err-eof!' >&2; exec sleep 30".into()],
+            env: BTreeMap::new(),
+        };
+        let mut launch =
+            OwnedLaunch::start(crate::launch::LaunchIntent::from_request(request).unwrap())
+                .unwrap();
+        fn bounded_read<const N: usize>(pipe: &impl AsFd) -> io::Result<[u8; N]> {
+            let mut reader = std::fs::File::from(pipe.as_fd().try_clone_to_owned()?);
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut bytes = [0; N];
+                let result = reader.read_exact(&mut bytes).map(|()| bytes);
+                let _ = send.send(result);
+            });
+            receive.recv_timeout(Duration::from_secs(3)).map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "child marker deadline expired")
+            })?
+        }
+        let ready = bounded_read::<6>(launch.parts_mut().1.stdout_mut());
+        let first_stop = LaunchControl::stop(&mut launch, false);
+        let second_stop = LaunchControl::stop(&mut launch, false);
+        let stdin_closed = launch.parts_mut().1.stdin_mut().is_none();
+        let stdout = bounded_read::<8>(launch.parts_mut().1.stdout_mut());
+        let stderr = bounded_read::<8>(launch.parts_mut().1.stderr_mut());
+        let cleanup = force_and_reap(&mut launch);
+        drop(launch);
+        crate::posix::tests::wait_for_reaper_idle();
+        cleanup.unwrap();
+        first_stop.unwrap();
+        second_stop.unwrap();
+        assert_eq!(&ready.unwrap(), b"ready!");
+        assert!(stdin_closed, "soft stop left stdin open");
+        assert_eq!(&stdout.unwrap(), b"out-eof!");
+        assert_eq!(&stderr.unwrap(), b"err-eof!");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn owned_soft_stop_closes_stdin_twice_then_force_reaps_same_owner() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let request = Request::Launch {
+            version: PROTOCOL_VERSION,
+            request_id: 72,
+            executable: "powershell.exe".into(),
+            cwd: std::env::temp_dir().display().to_string(),
+            argv: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('out-eof!'); [Console]::Out.Flush(); [Console]::Error.Write('err-eof!'); [Console]::Error.Flush(); Start-Sleep -Seconds 30".into()],
+            env: BTreeMap::from([(String::from("SystemRoot"), std::env::var("SystemRoot").unwrap())]),
+        };
+        let mut launch =
+            OwnedLaunch::start(crate::launch::LaunchIntent::from_request(request).unwrap())
+                .unwrap();
+        let first_stop = LaunchControl::stop(&mut launch, false);
+        let second_stop = LaunchControl::stop(&mut launch, false);
+        let stdin_closed = launch.parts_mut().1.stdin_mut().is_none();
+        let mut out = [0; 8];
+        let stdout = tokio::time::timeout(
+            Duration::from_secs(3),
+            launch.parts_mut().1.stdout_mut().read_exact(&mut out),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child stdout deadline expired"))
+        .and_then(|result| result.map(|_| out));
+        let mut err = [0; 8];
+        let stderr = tokio::time::timeout(
+            Duration::from_secs(3),
+            launch.parts_mut().1.stderr_mut().read_exact(&mut err),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child stderr deadline expired"))
+        .and_then(|result| result.map(|_| err));
+        let cleanup = force_and_reap(&mut launch);
+        cleanup.unwrap();
+        first_stop.unwrap();
+        second_stop.unwrap();
+        assert!(stdin_closed, "soft stop left stdin open");
+        assert_eq!(&stdout.unwrap(), b"out-eof!");
+        assert_eq!(&stderr.unwrap(), b"err-eof!");
     }
 }
