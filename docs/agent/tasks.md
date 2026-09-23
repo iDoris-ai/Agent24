@@ -35,7 +35,7 @@
 | ME4-1.2.2d | Agent24 | 桌面端（effective_enabled ?? enabled、run_id ?? fire_id，前向兼容） | 1.2.1 | `BACKLOG` | |
 | ME4-1.3.1 | Agent24 | fired 投递器（InFlight 准入 + dispatch、确定性 fire_id、重启续投、Deferred 不计失败、scheduler 挪到 mount_all 后） | 1.2.2c | `BACKLOG` | |
 | ME4-1.3.2 | Agent24 | 代理保留 `/_a24/` 路径（规范化后判定） | 1.1.1 | `BACKLOG` | |
-| ME4-1.4.1 | Agent24 | `_a24/scheduler/*` handler + 授权/配额/限流 | 1.2.1 | `BACKLOG` | |
+| ME4-1.4.1 | Agent24 | `_a24/scheduler/*` handler + 授权/配额/限流（**唯一会生产模块行的调用方，必须排在 1.2.2c 之后**：模块行护栏与 self-wake 过滤就绪前不得产生模块行） | 1.2.2c | `BACKLOG` | |
 | ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `BACKLOG` | |
 | ME4-M2 门 | Sin90 | Sin90 M3（T3.1.1–T3.5.1）全 DONE | 1.5.1, 0.1 | `BACKLOG` | |
 | ME4-M3 门 | Sin90 | Sin90 M4（T4.1.1–T4.4.1）全 DONE | M2 门 | `BACKLOG` | |
