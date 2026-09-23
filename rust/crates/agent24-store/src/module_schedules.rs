@@ -231,7 +231,7 @@ impl Store {
                     } else {
                         None
                     };
-                    sqlx::query(
+                    let updated = sqlx::query(
                         "UPDATE schedules SET name = ?, enabled = ?, spec = ?, next_run_at = ?, \
                              consecutive_failures = CASE WHEN ? THEN 0 ELSE consecutive_failures END, \
                              system_disabled_reason = NULL, revision = revision + 1 \
@@ -246,6 +246,16 @@ impl Store {
                     .bind(revision)
                     .execute(&mut *tx)
                     .await?;
+                    // Structurally cannot miss: `id`/`revision` were just read
+                    // inside THIS `BEGIN IMMEDIATE` transaction, which holds
+                    // the write lock for its whole duration — nothing else
+                    // could have changed the row between the SELECT above and
+                    // this UPDATE. A 0 here would mean that invariant broke.
+                    debug_assert_eq!(
+                        updated.rows_affected(),
+                        1,
+                        "upsert_module_schedule's own read-then-write raced itself"
+                    );
                     if spec_changed || (enabled_changed && !desired.enabled) {
                         sqlx::query(EXPIRE_OUTSTANDING_SQL)
                             .bind("superseded_by_upsert")
@@ -312,7 +322,7 @@ mod tests {
     use sqlx::SqlitePool;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use tempfile::TempDir;
 
     fn every(secs: u32) -> ModuleScheduleDesired {
         ModuleScheduleDesired {
@@ -326,20 +336,13 @@ mod tests {
         crate::test_hooks::pool(store)
     }
 
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_db_path() -> std::path::PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agent24-store-module-schedules-{}-{n}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("s.db")
+    /// A fresh `TempDir` (auto-cleaned on drop — the caller must keep it
+    /// bound, e.g. `let (_dir, path) = temp_db();`, for as long as the
+    /// database file needs to exist) and the `s.db` path inside it.
+    fn temp_db() -> (TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        (dir, path)
     }
 
     /// Same shape as `agent24-memory`'s `pool_migrated_up_to`
@@ -387,31 +390,57 @@ mod tests {
         '[]', NULL, '2026-09-23T09:00:00Z', 2)";
 
     /// A fully-migrated (through 0007) WAL file database with `conns`
-    /// connections and the `sch_old` fixture row.
-    async fn fresh(conns: u32) -> Store {
-        let path = temp_db_path();
+    /// connections and the `sch_old` fixture row. Returns the `TempDir`
+    /// alongside the `Store` — the caller must keep it bound (`let (store,
+    /// _dir) = fresh(1).await;`) for the file to survive the test.
+    async fn fresh(conns: u32) -> (Store, TempDir) {
+        let (dir, path) = temp_db();
         let pool = pool_migrated_up_to(&path, 1000, conns).await;
         sqlx::query(SEED_SCH_OLD).execute(&pool).await.unwrap();
-        crate::test_hooks::from_pool(pool)
+        (crate::test_hooks::from_pool(pool), dir)
     }
 
     // ── C1.5 — migration keeps old rows, and the new CHECKs hold ───────────
 
     #[tokio::test]
     async fn migration_keeps_old_rows_and_the_index_is_module_only() {
-        let path = temp_db_path();
+        let (_dir, path) = temp_db();
         let pool = pool_migrated_up_to(&path, 7, 1).await; // through 0006 only
         sqlx::query(SEED_SCH_OLD).execute(&pool).await.unwrap();
-        const MIGRATION_0007: &str = include_str!("../migrations/0007_module_schedules.sql");
-        sqlx::raw_sql(MIGRATION_0007).execute(&pool).await.unwrap();
+        // Resume the SAME migrator, untruncated: `_sqlx_migrations` already
+        // has 1..6 recorded, so only 0007 applies now — through the REAL
+        // migrator, not by hand-executing the file's SQL (review fix).
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
         let r = sqlx::query("SELECT * FROM schedules WHERE id = 'sch_old'")
             .fetch_one(&pool)
             .await
             .unwrap();
+        // every pre-0007 column, byte-for-byte
+        assert_eq!(r.get::<String, _>("id"), "sch_old");
+        assert_eq!(r.get::<String, _>("name"), "n");
+        assert!(r.get::<bool, _>("enabled"));
+        assert_eq!(
+            r.get::<String, _>("spec"),
+            "{\"type\":\"every\",\"secs\":60}"
+        );
+        assert_eq!(
+            r.get::<String, _>("action"),
+            "{\"type\":\"agent_run\",\"prompt\":\"p\",\"session_id\":null,\"model_override\":null}"
+        );
+        assert_eq!(r.get::<String, _>("delivery"), "[]");
+        assert_eq!(r.get::<Option<String>, _>("last_run_at"), None);
+        assert_eq!(
+            r.get::<Option<String>, _>("next_run_at").as_deref(),
+            Some("2026-09-23T09:00:00Z")
+        );
         assert_eq!(r.get::<i64, _>("consecutive_failures"), 2);
+        // the new columns, all defaulted
+        assert_eq!(r.get::<Option<String>, _>("owner_module"), None);
+        assert_eq!(r.get::<Option<String>, _>("module_key"), None);
         assert_eq!(r.get::<i64, _>("revision"), 0);
-        assert!(r.get::<Option<String>, _>("owner_module").is_none());
+        assert!(!r.get::<bool, _>("user_suspended"));
+        assert_eq!(r.get::<Option<String>, _>("system_disabled_reason"), None);
 
         let store = crate::test_hooks::from_pool(pool.clone());
         store
@@ -445,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn module_key_unique_index_rejects_a_second_row_for_the_same_owner_key() {
-        let store = fresh(1).await;
+        let (store, _dir) = fresh(1).await;
         store
             .upsert_module_schedule(
                 "sch_1",
@@ -519,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraints_reject_half_null_owner_and_user_row_module_flags() {
-        let store = fresh(1).await;
+        let (store, _dir) = fresh(1).await;
         let p = pool(&store);
         // half-null owner/key
         let half = sqlx::query(
@@ -562,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_outcomes_and_one_row_per_key() {
-        let store = fresh(1).await;
+        let (store, _dir) = fresh(1).await;
         let n = Some("2026-09-23T09:01:00Z");
         let (o1, _) = store
             .upsert_module_schedule(
@@ -634,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_upserts_on_two_connections_make_one_row() {
-        let store = fresh(2).await; // WAL file, 2 connections (design §11 C1.2)
+        let (store, _dir) = fresh(2).await; // WAL file, 2 connections (design §11 C1.2)
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let run = |id: &'static str| {
             let (store, barrier) = (store.clone(), barrier.clone());
@@ -666,7 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn quota_is_counted_inside_the_transaction() {
-        let store = fresh(1).await;
+        let (store, _dir) = fresh(1).await;
         for i in 0..3 {
             store
                 .upsert_module_schedule(
