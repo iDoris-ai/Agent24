@@ -417,3 +417,7 @@ mod tests {
         assert_eq!(store.list_audit().await.unwrap().len(), audit_count);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::type_complexity, clippy::unwrap_used)]
+mod adversarial_tests;
