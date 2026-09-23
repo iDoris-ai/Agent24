@@ -90,6 +90,60 @@ async fn identity_exists(
         .map_err(|_| WorkspaceStoreError::Database)
 }
 
+async fn allocation_workspace_exists(
+    tx: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+) -> WorkspaceResult<bool> {
+    exists(
+        tx,
+        "SELECT 1 FROM workspace_allocations
+         WHERE phase IN ('materialized', 'committed', 'retained')
+           AND workspace_id = ? COLLATE BINARY
+         LIMIT 1",
+        workspace_id,
+    )
+    .await
+}
+
+async fn allocation_identity_exists(
+    tx: &mut Transaction<'_, Sqlite>,
+    identity: RootIdentity,
+) -> WorkspaceResult<bool> {
+    let row = match identity {
+        RootIdentity::Unix { device, inode } => {
+            sqlx::query(
+                "SELECT 1 FROM workspace_allocations
+                 WHERE phase IN ('materialized', 'committed', 'retained')
+                   AND root_identity_kind = 'unix'
+                   AND root_unix_device = ? AND root_unix_inode = ?
+                 LIMIT 1",
+            )
+            .bind(device.to_vec())
+            .bind(inode.to_vec())
+            .fetch_optional(&mut **tx)
+            .await
+        }
+        RootIdentity::Windows {
+            volume_serial,
+            file_id,
+        } => {
+            sqlx::query(
+                "SELECT 1 FROM workspace_allocations
+                 WHERE phase IN ('materialized', 'committed', 'retained')
+                   AND root_identity_kind = 'windows'
+                   AND root_windows_volume = ? AND root_windows_file_id = ?
+                 LIMIT 1",
+            )
+            .bind(volume_serial.to_vec())
+            .bind(file_id.to_vec())
+            .fetch_optional(&mut **tx)
+            .await
+        }
+    };
+    row.map(|value| value.is_some())
+        .map_err(|_| WorkspaceStoreError::Database)
+}
+
 async fn insert_workspace(
     tx: &mut Transaction<'_, Sqlite>,
     input: &NewScratchWorkspace,
@@ -245,6 +299,11 @@ impl Store {
                 crate::WorkspaceConflict::Identifier,
             ));
         }
+        if allocation_workspace_exists(&mut tx, input.id().as_str()).await? {
+            return Err(WorkspaceStoreError::Conflict(
+                crate::WorkspaceConflict::Identifier,
+            ));
+        }
         if exists(
             &mut tx,
             "SELECT 1 FROM workspaces WHERE canonical_root = ? COLLATE BINARY LIMIT 1",
@@ -261,6 +320,11 @@ impl Store {
                 crate::WorkspaceConflict::RootIdentity,
             ));
         }
+        if allocation_identity_exists(&mut tx, input.root().identity()).await? {
+            return Err(WorkspaceStoreError::Conflict(
+                crate::WorkspaceConflict::RootIdentity,
+            ));
+        }
 
         insert_workspace(&mut tx, input, now, &expires_at).await?;
         let row = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
@@ -268,7 +332,23 @@ impl Store {
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| WorkspaceStoreError::Database)?;
-        let workspace = decode_row(&row)?;
+        let workspace_row = WorkspaceRow::decode(&row)?;
+        let workspace_identity = workspace_row.root.identity();
+        let workspace = workspace_row.project();
+
+        // Keep the allocation journal and legacy registry mutually exclusive
+        // even when a trigger or a future write path mutates the journal after
+        // the workspace INSERT. Reserved rows intentionally remain compatible.
+        if allocation_workspace_exists(&mut tx, input.id().as_str()).await? {
+            return Err(WorkspaceStoreError::Conflict(
+                crate::WorkspaceConflict::Identifier,
+            ));
+        }
+        if allocation_identity_exists(&mut tx, workspace_identity).await? {
+            return Err(WorkspaceStoreError::Conflict(
+                crate::WorkspaceConflict::RootIdentity,
+            ));
+        }
         tx.commit()
             .await
             .map_err(|_| WorkspaceStoreError::Database)?;
