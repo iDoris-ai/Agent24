@@ -94,3 +94,4 @@
 
 - [ ] ME4-CODEX-DEBT-1 `docs/agent/PLAN-ME4-OS-CAPABILITIES.md` v3.1：Codex 第 1/2 轮已审（REQUEST_CHANGES → 全部采纳），第 3 轮核到一半额度耗尽，余下三点（§五 R3-1..R3-4）由本地模型收尾 —— 补一轮 Codex 核验即关闭。
 - （后续 task 的 PR 若走了 Opus 子代理评审，在此追加一行：PR 号 + 分支 + 评审报告位置。）
+- [ ] FU-71 · B · src=Sin90 T3.1.1 Opus 评审 H1 · 2026-09-23 · `agent24-scheduler` 的 cron（crate `cron` 0.15）星期字段以 1=周日（`days_of_week.rs`，`number_from_sunday`），与 POSIX 不同：`0 7 * * 1-5` 实际是周日到周四，POSIX 的 0 被拒。模块路径由 ME4-1.1.1 设计收紧（只收英文缩写）；**REST / self-wake 路径仍接受数字**，用户或 agent 写的 cron 可能静默错一天。判据：REST 创建 `0 7 * * 1-5` 被拒或按 POSIX 规范化（二选一，需决定），`MON-FRI` 的第一次触发在周一（固定起点）；正对照同上
