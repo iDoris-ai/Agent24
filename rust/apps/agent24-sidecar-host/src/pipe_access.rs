@@ -15,16 +15,16 @@ pub(crate) type NativeStderr = tokio::process::ChildStderr;
 
 pub(crate) struct TargetPipes {
     stdin: Option<NativeStdin>,
-    stdout: NativeStdout,
-    stderr: NativeStderr,
+    stdout: Option<NativeStdout>,
+    stderr: Option<NativeStderr>,
 }
 
 impl From<OwnedPipes> for TargetPipes {
     fn from(pipes: OwnedPipes) -> Self {
         Self {
             stdin: Some(pipes.stdin),
-            stdout: pipes.stdout,
-            stderr: pipes.stderr,
+            stdout: Some(pipes.stdout),
+            stderr: Some(pipes.stderr),
         }
     }
 }
@@ -38,11 +38,11 @@ impl TargetPipes {
         self.stdin.as_mut()
     }
 
-    pub(crate) fn stdout_mut(&mut self) -> &mut NativeStdout {
-        &mut self.stdout
+    pub(crate) fn take_stdout(&mut self) -> Option<NativeStdout> {
+        self.stdout.take()
     }
 
-    pub(crate) fn stderr_mut(&mut self) -> &mut NativeStderr {
-        &mut self.stderr
+    pub(crate) fn take_stderr(&mut self) -> Option<NativeStderr> {
+        self.stderr.take()
     }
 }

@@ -220,6 +220,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         io::Read,
+        sync::mpsc,
         time::{Duration, Instant},
     };
 
@@ -250,6 +251,30 @@ mod tests {
         }
     }
 
+    fn start_bounded_read<const N: usize, R>(
+        mut reader: R,
+    ) -> mpsc::Receiver<(io::Result<[u8; N]>, R)>
+    where
+        R: Read + Send + 'static,
+    {
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = [0; N];
+            let result = reader.read_exact(&mut bytes).map(|()| bytes);
+            let _ = send.send((result, reader));
+        });
+        receive
+    }
+
+    fn finish_bounded_read<const N: usize, R>(
+        receive: mpsc::Receiver<(io::Result<[u8; N]>, R)>,
+    ) -> io::Result<([u8; N], R)> {
+        let (result, reader) = receive.recv_timeout(Duration::from_secs(2)).map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "child marker deadline expired")
+        })?;
+        result.map(|bytes| (bytes, reader))
+    }
+
     #[test]
     fn launch_intent_preserves_fields_and_redacts_debug() {
         let intent = LaunchIntent::from_request(request("/bin/sh", "/")).expect("launch");
@@ -277,22 +302,17 @@ mod tests {
         let intent = LaunchIntent::from_request(request("/bin/sh", "/")).expect("launch");
         let mut launch = OwnedLaunch::start(intent).expect("owned launch");
         let mut stdout_text = [0; 28];
-        {
+        let (mut stdout, _stderr) = {
             let (_, pipes) = launch.parts_mut();
             let _ = pipes.stdin_mut().expect("stdin");
-            pipes
-                .stdout_mut()
-                .read_exact(&mut stdout_text[..1])
-                .expect("first stdout borrow");
-        }
-        {
-            let (_, pipes) = launch.parts_mut();
-            pipes
-                .stdout_mut()
-                .read_exact(&mut stdout_text[1..])
-                .expect("second stdout borrow");
-            let _ = pipes.stderr_mut();
-        }
+            (
+                pipes.take_stdout().expect("stdout moves once"),
+                pipes.take_stderr().expect("stderr stays available"),
+            )
+        };
+        stdout
+            .read_exact(&mut stdout_text)
+            .expect("read moved stdout");
         assert_eq!(stdout_text, *b"/|env-value|argv-value|unset");
         reap(&mut launch);
         drop(launch);
@@ -300,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_stdin_twice_delivers_eof_without_losing_owner_or_other_pipes() {
+    fn moved_pipes_deliver_eof_and_leave_the_launch_authoritative() {
         let _test_guard = crate::posix::tests::test_lock();
         let request = Request::Launch {
             version: 1,
@@ -314,34 +334,42 @@ mod tests {
             env: BTreeMap::new(),
         };
         let mut launch = OwnedLaunch::start(LaunchIntent::from_request(request).unwrap()).unwrap();
+        assert_eq!(launch.request_id(), 18);
+        let (stdout, stderr) = {
+            let (_, pipes) = launch.parts_mut();
+            let stdout = pipes.take_stdout().expect("stdout moves once");
+            assert!(pipes.take_stdout().is_none(), "stdout moved twice");
+            assert!(pipes.stdin_mut().is_some(), "moving stdout closed stdin");
+            let stderr = pipes.take_stderr().expect("stderr moves once");
+            assert!(pipes.take_stderr().is_none(), "stderr moved twice");
+            assert!(pipes.stdin_mut().is_some(), "moving stderr closed stdin");
+            (stdout, stderr)
+        };
+        let stdout_reader = start_bounded_read::<10, _>(stdout);
+        let stderr_reader = start_bounded_read::<10, _>(stderr);
         let stdin_unavailable = {
             let (_, pipes) = launch.parts_mut();
             pipes.close_stdin();
             pipes.close_stdin();
             pipes.stdin_mut().is_none()
         };
-        use std::os::fd::AsFd;
-        fn bounded_read(pipe: &impl AsFd) -> io::Result<[u8; 10]> {
-            let mut reader = std::fs::File::from(pipe.as_fd().try_clone_to_owned()?);
-            let (send, receive) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let mut bytes = [0; 10];
-                let result = reader.read_exact(&mut bytes);
-                let _ = send.send((result, bytes));
-            });
-            let (result, bytes) = receive.recv_timeout(Duration::from_secs(2)).map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "child output deadline expired")
-            })?;
-            result.map(|()| bytes)
-        }
-        let out = bounded_read(launch.parts_mut().1.stdout_mut());
-        let err = bounded_read(launch.parts_mut().1.stderr_mut());
+        let stdout = finish_bounded_read(stdout_reader);
+        let stderr = finish_bounded_read(stderr_reader);
+        let observation = launch.target_mut().observe_exit();
         reap(&mut launch);
         drop(launch);
         wait_for_reaper_idle();
         assert!(stdin_unavailable, "closed stdin remained available");
-        assert_eq!(&out.unwrap(), b"eof-marker");
-        assert_eq!(&err.unwrap(), b"err-marker");
+        assert_eq!(
+            observation.expect("observe owner"),
+            crate::target::ExitObservation::Running
+        );
+        let (out, mut stdout) = stdout.expect("stdout EOF marker");
+        let (err, _stderr) = stderr.expect("stderr EOF marker");
+        assert_eq!(&out, b"eof-marker");
+        assert_eq!(&err, b"err-marker");
+        let mut eof = [0];
+        assert_eq!(stdout.read(&mut eof).expect("moved stdout stays open"), 0);
     }
 
     #[test]
@@ -465,29 +493,17 @@ mod windows_tests {
                 .expect("owned launch");
         assert_eq!(launch.request_id(), 17);
         let mut stdout = String::new();
-        {
+        let (mut stdout_pipe, mut stderr_pipe) = {
             let (_, pipes) = launch.parts_mut();
             let _ = pipes.stdin_mut().expect("stdin");
-            let mut first = [0; 1];
-            pipes.stdout_mut().read_exact(&mut first).await.unwrap();
-            stdout.push(first[0] as char);
-        }
-        {
-            let (_, pipes) = launch.parts_mut();
-            pipes
-                .stdout_mut()
-                .read_to_string(&mut stdout)
-                .await
-                .unwrap();
-        }
+            (
+                pipes.take_stdout().expect("stdout moves once"),
+                pipes.take_stderr().expect("stderr moves once"),
+            )
+        };
+        stdout_pipe.read_to_string(&mut stdout).await.unwrap();
         let mut stderr = String::new();
-        launch
-            .parts_mut()
-            .1
-            .stderr_mut()
-            .read_to_string(&mut stderr)
-            .await
-            .unwrap();
+        stderr_pipe.read_to_string(&mut stderr).await.unwrap();
         let fields: Vec<_> = stdout.split('|').collect();
         assert_eq!(fields[0], "cwd-ok");
         assert_eq!(
@@ -500,7 +516,7 @@ mod windows_tests {
     }
 
     #[tokio::test]
-    async fn windows_closing_stdin_twice_delivers_eof_and_keeps_owner() {
+    async fn windows_moved_pipes_deliver_eof_and_leave_the_launch_authoritative() {
         let cwd = std::env::temp_dir();
         let mut launch = OwnedLaunch::start(LaunchIntent::from_request(Request::Launch {
             version: 1,
@@ -508,9 +524,20 @@ mod windows_tests {
             executable: "powershell.exe".into(),
             cwd: cwd.display().to_string(),
             argv: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
-                "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('eof-marker'); [Console]::Error.Write('err-marker')".into()],
+                "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('eof-marker'); [Console]::Out.Flush(); [Console]::Error.Write('err-marker'); [Console]::Error.Flush(); Start-Sleep -Seconds 30".into()],
             env: BTreeMap::from([(String::from("SystemRoot"), std::env::var("SystemRoot").unwrap())]),
         }).unwrap()).unwrap();
+        assert_eq!(launch.request_id(), 20);
+        let (mut stdout, mut stderr) = {
+            let (_, pipes) = launch.parts_mut();
+            let stdout = pipes.take_stdout().expect("stdout moves once");
+            assert!(pipes.take_stdout().is_none(), "stdout moved twice");
+            assert!(pipes.stdin_mut().is_some(), "moving stdout closed stdin");
+            let stderr = pipes.take_stderr().expect("stderr moves once");
+            assert!(pipes.take_stderr().is_none(), "stderr moved twice");
+            assert!(pipes.stdin_mut().is_some(), "moving stderr closed stdin");
+            (stdout, stderr)
+        };
         let stdin_unavailable = {
             let (_, pipes) = launch.parts_mut();
             pipes.close_stdin();
@@ -518,17 +545,17 @@ mod windows_tests {
             pipes.stdin_mut().is_none()
         };
         let mut out = [0; 10];
-        let stdout_result = tokio::time::timeout(Duration::from_secs(3), async {
-            launch.parts_mut().1.stdout_mut().read_exact(&mut out).await
-        })
-        .await;
+        let stdout_result =
+            tokio::time::timeout(Duration::from_secs(3), stdout.read_exact(&mut out)).await;
         let mut err = [0; 10];
-        let stderr_result = tokio::time::timeout(
-            Duration::from_secs(3),
-            launch.parts_mut().1.stderr_mut().read_exact(&mut err),
-        )
-        .await;
+        let stderr_result =
+            tokio::time::timeout(Duration::from_secs(3), stderr.read_exact(&mut err)).await;
+        assert!(matches!(
+            launch.target_mut().observe_exit().expect("observe owner"),
+            ExitObservation::Running
+        ));
         reap(&mut launch);
+        drop(launch);
         assert!(stdin_unavailable, "closed stdin remained available");
         assert!(
             stdout_result.is_ok_and(|result| result.is_ok()),
@@ -540,6 +567,14 @@ mod windows_tests {
         );
         assert_eq!(&out, b"eof-marker");
         assert_eq!(&err, b"err-marker");
+        let mut eof = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), stdout.read(&mut eof))
+                .await
+                .expect("moved stdout stays open")
+                .expect("moved stdout read"),
+            0
+        );
     }
 
     #[tokio::test]
@@ -550,13 +585,12 @@ mod windows_tests {
         )
         .expect("owned launch");
         let mut ready = [0; 5];
-        launch
+        let mut stdout = launch
             .parts_mut()
             .1
-            .stdout_mut()
-            .read_exact(&mut ready)
-            .await
-            .expect("ready");
+            .take_stdout()
+            .expect("stdout moves once");
+        stdout.read_exact(&mut ready).await.expect("ready");
         assert_eq!(&ready, b"ready");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
