@@ -1,8 +1,8 @@
 use crate::pipe_access::NativeStdout;
+use crate::worker_slots::{WorkerRole, WorkerSlotError, WorkerSlots, hold_permit};
 use std::{
-    io::{self, ErrorKind, Read},
+    io::{ErrorKind, Read},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-    thread,
 };
 
 /// The maximum data returned for one actor credit.  This worker owns no
@@ -80,27 +80,39 @@ impl ReadyReadWorker {
     /// handle to a `std::fs::File`; no raw-handle clone or competing reader is
     /// created.
     #[cfg(unix)]
-    pub(crate) fn from_native_stdout(stdout: NativeStdout) -> io::Result<Self> {
-        Self::new(stdout)
+    pub(crate) fn from_native_stdout(stdout: NativeStdout) -> Result<Self, WorkerSlotError> {
+        Self::new_in(WorkerSlots::host(), stdout)
     }
 
     #[cfg(windows)]
-    pub(crate) fn from_native_stdout(stdout: NativeStdout) -> io::Result<Self> {
-        let file = std::fs::File::from(stdout.into_owned_handle()?);
-        Self::new(file)
+    pub(crate) fn from_native_stdout(stdout: NativeStdout) -> Result<Self, WorkerSlotError> {
+        let file = std::fs::File::from(
+            stdout
+                .into_owned_handle()
+                .map_err(|error| WorkerSlotError::Spawn(error.kind()))?,
+        );
+        Self::new_in(WorkerSlots::host(), file)
     }
 
-    pub(crate) fn new<R: Read + Send + 'static>(reader: R) -> io::Result<Self> {
+    pub(crate) fn new_in<R: Read + Send + 'static>(
+        slots: &'static WorkerSlots,
+        reader: R,
+    ) -> Result<Self, WorkerSlotError> {
         let (credit_tx, credit_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
-        thread::Builder::new()
-            .name("sidecar-ready-read".into())
-            .spawn(move || ready_read_loop(reader, credit_rx, result_tx))?;
+        slots.spawn(WorkerRole::ReadyRead, "sidecar-ready-read", move |permit| {
+            hold_permit(permit, || ready_read_loop(reader, credit_rx, result_tx))
+        })?;
         Ok(Self {
             credits: credit_tx,
             results: result_rx,
             state: State::Idle,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new<R: Read + Send + 'static>(reader: R) -> Result<Self, WorkerSlotError> {
+        Self::new_in(WorkerSlots::isolated(), reader)
     }
 
     /// Admit exactly one bounded read without blocking the actor.
@@ -186,10 +198,12 @@ mod tests {
     use super::*;
     use std::{
         collections::{HashSet, VecDeque},
+        io,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
         time::{Duration, Instant},
     };
 

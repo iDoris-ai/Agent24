@@ -1,6 +1,7 @@
 use crate::pipe_access::NativeStderr;
+use crate::worker_slots::{WorkerRole, WorkerSlotError, WorkerSlots, hold_permit};
 use std::{
-    io::{self, ErrorKind, Read},
+    io::{ErrorKind, Read},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -52,34 +53,44 @@ impl StderrDrainWorker {
     /// still-unpolled async handle immediately and turns its owned handle into
     /// a `File`; it does not clone a raw handle or create a competing reader.
     #[cfg(unix)]
-    pub(crate) fn from_native_stderr(stderr: NativeStderr) -> io::Result<Self> {
-        Self::new(stderr)
+    pub(crate) fn from_native_stderr(stderr: NativeStderr) -> Result<Self, WorkerSlotError> {
+        Self::new_in(WorkerSlots::host(), stderr)
     }
 
     #[cfg(windows)]
-    pub(crate) fn from_native_stderr(stderr: NativeStderr) -> io::Result<Self> {
-        let file = std::fs::File::from(stderr.into_owned_handle()?);
-        Self::new(file)
+    pub(crate) fn from_native_stderr(stderr: NativeStderr) -> Result<Self, WorkerSlotError> {
+        let file = std::fs::File::from(
+            stderr
+                .into_owned_handle()
+                .map_err(|error| WorkerSlotError::Spawn(error.kind()))?,
+        );
+        Self::new_in(WorkerSlots::host(), file)
     }
 
     /// Start the one drain thread immediately.
-    pub(crate) fn new<R: Read + Send + 'static>(reader: R) -> io::Result<Self> {
+    pub(crate) fn new_in<R: Read + Send + 'static>(
+        slots: &'static WorkerSlots,
+        reader: R,
+    ) -> Result<Self, WorkerSlotError> {
         let bytes = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (terminal_tx, terminal) = mpsc::sync_channel(1);
-        thread::Builder::new()
-            .name("sidecar-stderr-drain".into())
-            .spawn({
-                let bytes = Arc::clone(&bytes);
-                let stop = Arc::clone(&stop);
-                move || drain_loop(reader, bytes, stop, terminal_tx)
-            })?;
+        slots.spawn(WorkerRole::StderrDrain, "sidecar-stderr-drain", {
+            let bytes = Arc::clone(&bytes);
+            let stop = Arc::clone(&stop);
+            move |permit| hold_permit(permit, || drain_loop(reader, bytes, stop, terminal_tx))
+        })?;
         Ok(Self {
             bytes,
             stop,
             terminal,
             cached_terminal: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new<R: Read + Send + 'static>(reader: R) -> Result<Self, WorkerSlotError> {
+        Self::new_in(WorkerSlots::isolated(), reader)
     }
 
     /// Observe progress without blocking or performing caller-thread I/O.
@@ -160,7 +171,9 @@ mod tests {
     use super::*;
     use std::{
         collections::{HashSet, VecDeque},
+        io,
         sync::{Arc, Mutex},
+        thread,
         time::{Duration, Instant},
     };
 
