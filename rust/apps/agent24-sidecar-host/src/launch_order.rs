@@ -675,6 +675,7 @@ mod tests {
             entered: bool,
             released: bool,
             flushed: bool,
+            writer_dropped: bool,
             bytes: Vec<u8>,
         }
         type GateState = Arc<(Mutex<State>, Condvar)>;
@@ -696,6 +697,13 @@ mod tests {
                 lock.lock().unwrap().flushed = true;
                 changed.notify_all();
                 Ok(())
+            }
+        }
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                let (lock, changed) = &*self.0;
+                lock.lock().unwrap().writer_dropped = true;
+                changed.notify_all();
             }
         }
         struct Release(GateState);
@@ -760,6 +768,15 @@ mod tests {
             )
             .map(|(state, timeout)| state.flushed && !timeout.timed_out())
             .unwrap_or(false);
+        let worker_dropped = changed
+            .wait_timeout_while(
+                lock.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                std::time::Duration::from_secs(3),
+                |state| !state.writer_dropped,
+            )
+            .map(|(state, timeout)| state.writer_dropped && !timeout.timed_out())
+            .unwrap_or(false);
         drop(release);
         assert!(entered, "writer never reached gate");
         assert!(
@@ -777,6 +794,10 @@ mod tests {
         assert_eq!(cleanup, Ok(TreeObservation::ConfirmedEmpty));
         assert_eq!(forces, vec![true]);
         assert!(flushed, "released worker did not flush before deadline");
+        assert!(
+            worker_dropped,
+            "detached output worker did not exit before deadline"
+        );
         assert_eq!(lock.lock().unwrap().bytes, b"held-frame\n");
     }
 
