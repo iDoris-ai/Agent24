@@ -30,6 +30,10 @@ impl From<OwnedPipes> for TargetPipes {
 }
 
 impl TargetPipes {
+    pub(crate) fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
     pub(crate) fn stdin_mut(&mut self) -> Option<&mut NativeStdin> {
         self.stdin.as_mut()
     }
