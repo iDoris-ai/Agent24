@@ -514,6 +514,15 @@ paths:
       description: |
         Any subset of name/enabled/spec/action/delivery. Changing `spec`
         recomputes `next_run_at` immediately.
+
+        On a module-owned row (design
+        docs/design/ME4-S1-scheduler-callback.md §8.2), the ONLY accepted
+        shape is exactly `{"enabled": ...}` — mapped onto suspend/resume
+        (`false`→suspend, `true`→resume). Any other field present, or
+        `enabled` together with anything else, is `409
+        module_owned_schedule`. The write-back on a USER row is CAS'd
+        (§2.4); a concurrent tick/PATCH that keeps losing the race for 3
+        retries is `409 schedule_conflict`.
       parameters:
         - $ref: "#/components/parameters/PathId"
       requestBody:
@@ -533,6 +542,32 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            Module-owned row rejected a field other than a lone `enabled`
+            (`module_owned_schedule`), or the CAS write-back never landed
+            after 3 retries (`schedule_conflict`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                module_owned_schedule:
+                  value:
+                    error:
+                      code: module_owned_schedule
+                      message: schedule sch_01H… is owned by a module
+                      hint: >-
+                        this field is controlled by the module; use POST
+                        .../suspend, POST .../resume, a PATCH of exactly
+                        {"enabled": true|false}, or DELETE
+                schedule_conflict:
+                  value:
+                    error:
+                      code: schedule_conflict
+                      message: >-
+                        schedule sch_01H… was modified concurrently; retry
+                        the request
     delete:
       operationId: deleteSchedule
       x-milestone: M-C
@@ -552,21 +587,118 @@ paths:
       x-milestone: M-C
       tags: [schedules]
       summary: Trigger one run immediately (does not change next_run_at)
+      description: |
+        Design §4.7: a user (AgentRun) row answers `{run_id}`, same as
+        always; a module-owned row answers `{fire_id}` — it records a fire
+        (own `fire_id`, `fire_trigger=run_now`) for the delivery pump to
+        pick up, without touching `next_run_at` or disturbing the tick
+        source's own outstanding fire. Neither arm looks at `enabled` /
+        `user_suspended` / `system_disabled_reason` — this is an explicit
+        "try it now" the user asked for.
       parameters:
         - $ref: "#/components/parameters/PathId"
       responses:
         "202":
-          description: Run started
+          description: Run queued (user row) or fire recorded (module row)
           content:
             application/json:
               schema:
-                type: object
-                required: [run_id]
-                properties:
-                  run_id:
-                    type: string
+                oneOf:
+                  - type: object
+                    required: [run_id]
+                    properties:
+                      run_id:
+                        type: string
+                  - type: object
+                    required: [fire_id]
+                    properties:
+                      fire_id:
+                        type: string
         "404":
           $ref: "#/components/responses/NotFound"
+
+  /schedules/{id}/suspend:
+    post:
+      operationId: suspendSchedule
+      x-milestone: M-C
+      tags: [schedules]
+      summary: Suspend a module-owned schedule (design §8.2)
+      description: |
+        Module rows only. Idempotent: suspending an already-suspended row
+        is a no-op that still answers `200` with the current view. Clears
+        `next_run_at` and, in the same transaction, retires the schedule's
+        outstanding (pending/deferred) deliveries. A user (AgentRun) row —
+        use `PATCH {"enabled": false}` instead — answers `409
+        not_a_module_schedule`.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Suspended (or already was) — the current view
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Not a module-owned schedule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: not_a_module_schedule
+                  message: schedule sch_01H… is not a module-owned schedule
+                  hint: 'use PATCH {"enabled": true|false} on a user-owned schedule'
+
+  /schedules/{id}/resume:
+    post:
+      operationId: resumeSchedule
+      x-milestone: M-C
+      tags: [schedules]
+      summary: Resume a module-owned schedule (design §8.2)
+      description: |
+        Module rows only. Idempotent: resuming a row that is neither
+        suspended nor system-disabled is a no-op — 0 rows affected, still
+        `200` with the current view (a module's own `enabled=false` shows
+        up as `disabled_by="module"` and is unaffected by resume). Also
+        clears a kernel `system_disabled_reason` (v2 M2) and, when the row
+        is enabled, recomputes `next_run_at` from the current spec
+        (skip-missed). A user (AgentRun) row answers `409
+        not_a_module_schedule`.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Resumed (or already was) — the current view
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Not a module-owned schedule, or a concurrent module upsert raced the resume 3 times
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                not_a_module_schedule:
+                  value:
+                    error:
+                      code: not_a_module_schedule
+                      message: schedule sch_01H… is not a module-owned schedule
+                      hint: 'use PATCH {"enabled": true|false} on a user-owned schedule'
+                schedule_conflict:
+                  value:
+                    error:
+                      code: schedule_conflict
+                      message: >-
+                        schedule sch_01H… was modified concurrently; retry
+                        the request
 
   /shutdown:
     get:
@@ -1796,7 +1928,8 @@ components:
             Open enum: invalid_request, unauthorized, not_found, conflict,
             approval_already_resolved, provider_unavailable,
             run_not_cancellable (reserved), internal,
-            admission_refused, module_panicked, module_killed
+            admission_refused, module_panicked, module_killed,
+            module_owned_schedule, not_a_module_schedule, schedule_conflict
         message:
           type: string
         hint:
