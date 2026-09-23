@@ -1,5 +1,6 @@
-//! ME4-1.2.1a/b/c — module-owned schedules, their deliveries, and the REST
-//! guardrails on top of both. See `docs/design/ME4-S1-scheduler-callback.md`:
+//! ME4-1.2.1a/b/c/d — module-owned schedules, their deliveries, the REST
+//! guardrails on top of both, and the tick loop's read-model. See
+//! `docs/design/ME4-S1-scheduler-callback.md`:
 //! - §2 (D1) — migration `0007_module_schedules.sql` (full table, landed in
 //!   1.2.1a), the revision rule, the tick's CAS pre-advance (1.2.1b), the
 //!   REST PATCH CAS (1.2.1c, this cut).
@@ -11,24 +12,32 @@
 //!   read-model (1.2.1a).
 //! - §8.2 (D7) — suspend/resume (idempotent, with a revision CAS on resume —
 //!   review, M-2) and the PATCH write-back CAS, for both user and AgentRun
-//!   rows (1.2.1c, this cut).
+//!   rows (1.2.1c).
+//! - `TickScheduleRow`/`list_schedules_for_tick` (1.2.1d, this cut) — the
+//!   tick loop's read-model; see its own doc comment for the convergence
+//!   note (ME4-1.2.2a should let this collapse into the design's
+//!   `ScheduleRecord`).
 //!
-//! Stacked on top: ME4-1.2.1d (`feat/me4-1.2.1-schedule-store`) adds the tick
-//! loop's read-model.
+//! ME4-1.2.1 (this whole stack) is now complete: a/b/c/d together are the
+//! store layer the design's §13 lists under ME4-1.2.1. ME4-1.2.2a/b/c (the
+//! protocol view, the trigger interface + tick, the REST routes) build on
+//! top of it from here, in a separate task.
 //!
 //! Scope note (task ME4-1.2.1 is store-only): the pure delivery state
 //! machine (`apply_outcome`/`FireOutcome`/`Applied`) and the trigger
 //! interface (`FireId`/`RunTrigger`) belong to `agent24-scheduler`
-//! (ME4-1.2.2b/1.3.1) and are NOT introduced here or in any later cut of
-//! this task — this crate has no dependency on `agent24-scheduler`. Every
-//! function below therefore takes already-decided, primitive values (status
-//! strings, attempt counts, pre-formatted ISO-8601 timestamps, `fire_id` as
-//! `&str`) rather than those crate's types. `FireTrigger` below is a minimal
-//! store-local stand-in for the `tick`/`run_now` domain tag (needed to bind
-//! the `schedule_deliveries.fire_trigger` CHECK column correctly); the
-//! scheduler crate's own, richer version is a separate type.
+//! (ME4-1.2.2b/1.3.1) and are NOT introduced here — this crate has no
+//! dependency on `agent24-scheduler`. Every function below therefore takes
+//! already-decided, primitive values (status strings, attempt counts,
+//! pre-formatted ISO-8601 timestamps, `fire_id` as `&str`) rather than those
+//! crate's types. `FireTrigger` below is a minimal store-local stand-in for
+//! the `tick`/`run_now` domain tag (needed to bind the
+//! `schedule_deliveries.fire_trigger` CHECK column correctly) — review:
+//! `agent24-scheduler` should `pub use agent24_store::FireTrigger` for its
+//! own use rather than defining a second, same-named type (see
+//! `TickScheduleRow`'s doc comment).
 
-use agent24_protocol::{Schedule, ScheduleSpec};
+use agent24_protocol::{Schedule, ScheduleAction, ScheduleSpec};
 use serde::Serialize;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -1001,12 +1010,112 @@ impl Store {
     }
 }
 
+// ── tick read-model (ME4-1.2.1d) ────────────────────────────────────────────
+
+/// One schedule row's currently-eligible state for the tick loop (ME4-1.2.2b
+/// reads this instead of `list_schedules_lenient`, which cannot represent a
+/// module row's sentinel `action`). Unfiltered — like
+/// `list_schedules_lenient`, every row is returned and the caller decides
+/// `enabled`/due/suspended/owner-installed, so a change to those rules never
+/// requires a store-layer change.
+///
+/// A row whose `spec` JSON does not deserialize is skipped and logged, same
+/// as `list_schedules_lenient` — one corrupt row must never wedge the tick.
+///
+/// Review, M-3: added `consecutive_failures`/`last_run_at`, missing from the
+/// first cut — the tick's AgentRun failure-counting branch and
+/// `update_schedule_runtime_cas`'s CAS both need to have read them from
+/// *somewhere*, and this is that somewhere.
+///
+/// Convergence note (not yet done — flagged for whoever picks up
+/// ME4-1.2.2a/b): once ME4-1.2.2a makes `agent24_protocol::Schedule.action`
+/// an `Option<ScheduleAction>`, this type's reason for existing (working
+/// around `Schedule` being unable to represent a module row) goes away, and
+/// it should collapse into the design's `ScheduleRecord { schedule: Schedule,
+/// revision: i64 }` (§13) built on the real `Schedule`/`row_to_schedule`
+/// instead of a parallel struct. Do not let this type and `Schedule` drift
+/// apart in the meantime. Also: `agent24-scheduler` (ME4-1.2.2b) should `pub
+/// use agent24_store::FireTrigger` for its own tick/run_now tag rather than
+/// defining a second, same-named type — `FireTrigger` here has no
+/// `agent24-scheduler` dependency to avoid, so there is nothing this crate's
+/// "store-only" scope note (top of file) stops it from being reused as-is.
+pub struct TickScheduleRow {
+    pub id: String,
+    pub revision: i64,
+    pub enabled: bool,
+    pub spec: ScheduleSpec,
+    pub next_run_at: Option<String>,
+    pub last_run_at: Option<String>,
+    pub consecutive_failures: i64,
+    pub user_suspended: bool,
+    pub system_disabled_reason: Option<String>,
+    pub owner_module: Option<String>,
+    pub module_key: Option<String>,
+    /// `Some` for a user (AgentRun) row; `None` for a module row, whose
+    /// `action` column holds [`MODULE_ACTION_SENTINEL`] rather than a real
+    /// `ScheduleAction` (§2.1). Deciding this from `owner_module` — instead
+    /// of attempting (and failing) to deserialize the sentinel — is what
+    /// keeps a module row from vanishing off the tick's radar the way it
+    /// does from the strict `list_schedules`/`get_schedule` paths.
+    pub action: Option<ScheduleAction>,
+}
+
+fn tick_row_from(r: &SqliteRow) -> Result<TickScheduleRow> {
+    let owner_module: Option<String> = r.get("owner_module");
+    let action = if owner_module.is_none() {
+        Some(serde_json::from_str::<ScheduleAction>(
+            &r.get::<String, _>("action"),
+        )?)
+    } else {
+        None
+    };
+    Ok(TickScheduleRow {
+        id: r.get("id"),
+        revision: r.get("revision"),
+        enabled: r.get("enabled"),
+        spec: serde_json::from_str(&r.get::<String, _>("spec"))?,
+        next_run_at: r.get("next_run_at"),
+        last_run_at: r.get("last_run_at"),
+        consecutive_failures: r.get("consecutive_failures"),
+        user_suspended: r.get("user_suspended"),
+        system_disabled_reason: r.get("system_disabled_reason"),
+        owner_module,
+        module_key: r.get("module_key"),
+        action,
+    })
+}
+
+impl Store {
+    /// Every schedule row (user AND module), unfiltered, for the tick loop
+    /// (ME4-1.2.2b) — see [`TickScheduleRow`]. A row whose `spec`/`action`
+    /// JSON does not deserialize is skipped and logged, exactly like
+    /// [`Store::list_schedules_lenient`].
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn list_schedules_for_tick(&self) -> Result<Vec<TickScheduleRow>> {
+        let rows = sqlx::query("SELECT * FROM schedules ORDER BY name ASC")
+            .fetch_all(self.pool())
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match tick_row_from(row) {
+                Ok(r) => out.push(r),
+                Err(err) => {
+                    let id: String = row.get("id");
+                    tracing::error!("skipping unreadable schedule {id} in tick read-model: {err}");
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use agent24_protocol::ScheduleAction;
     use sqlx::SqlitePool;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
@@ -3273,5 +3382,38 @@ mod tests {
             ..module_row
         };
         assert!(store.update_schedule_runtime(&user_row).await.unwrap());
+    }
+
+    // ── the tick read-model tells module rows and user rows apart ───────────
+
+    #[tokio::test]
+    async fn tick_read_model_omits_action_for_module_rows_and_carries_it_for_user_rows() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rows = store.list_schedules_for_tick().await.unwrap();
+        let module_row = rows.iter().find(|r| r.id == "sch_1").unwrap();
+        assert!(module_row.action.is_none() && module_row.owner_module.as_deref() == Some("m"));
+        // review, M-3: consecutive_failures/last_run_at are on the type too
+        assert_eq!(module_row.consecutive_failures, 0);
+        assert_eq!(module_row.last_run_at, None);
+
+        let user_row = rows.iter().find(|r| r.id == "sch_old").unwrap();
+        assert!(user_row.action.is_some() && user_row.owner_module.is_none());
+        assert_eq!(
+            user_row.consecutive_failures, 2,
+            "SEED_SCH_OLD's seeded value"
+        );
+        assert_eq!(user_row.last_run_at, None);
     }
 }
