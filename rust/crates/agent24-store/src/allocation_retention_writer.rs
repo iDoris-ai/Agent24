@@ -382,6 +382,65 @@ mod tests {
         TrustedRootRegistration, WorkspaceInstant, WorkspaceProvenanceInput, WorkspaceTtl,
     };
     use agent24_protocol::WorkspaceId;
+    use std::{
+        sync::{Arc, Condvar, Mutex},
+        time::Duration,
+    };
+
+    const GATE_WAIT: Duration = Duration::from_secs(5);
+
+    #[derive(Default)]
+    struct GateState {
+        entered: bool,
+        released: bool,
+    }
+
+    /// A connection-local SQLite callback gate. The deadline makes a failed
+    /// cancellation test bounded without relying on scheduler sleeps.
+    struct RetentionGate {
+        state: Mutex<GateState>,
+        changed: Condvar,
+    }
+
+    impl RetentionGate {
+        fn enter(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.entered = true;
+            self.changed.notify_all();
+            while !state.released {
+                let (next, timeout) = self.changed.wait_timeout(state, GATE_WAIT).unwrap();
+                state = next;
+                if timeout.timed_out() {
+                    return;
+                }
+            }
+        }
+
+        fn wait_until_entered(&self) -> bool {
+            let state = self.state.lock().unwrap();
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, GATE_WAIT, |state| !state.entered)
+                .unwrap();
+            state.entered
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Ensure an assertion or early return cannot strand SQLite's callback
+    /// thread while this test owns the only in-memory connection.
+    struct GateRelease(Arc<RetentionGate>);
+
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
 
     #[rustfmt::skip]
     fn intent(parent: RootIdentity) -> AllocationIntent { AllocationIntent::new(AllocationId::parse("wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5").unwrap(), WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5").unwrap(), "generation-1".into(), "scratch".into(), parent, WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap()).unwrap() }
@@ -632,5 +691,93 @@ mod tests {
                 proof.commit().await.unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retention_update_rolls_back_savepoint_and_keeps_outer_usable() {
+        let store = Store::open_memory().await.unwrap();
+        let input = intent(RootIdentity::unix(&[1; 8], &[2; 8]).unwrap());
+        source(
+            &store,
+            &input,
+            AllocationPhase::Materialized,
+            RootIdentity::unix(&[3; 8], &[4; 8]).unwrap(),
+        )
+        .await;
+        let attempt = prepare(&store, &input, "io_error").await;
+        let before = raw_snapshot(&store).await;
+
+        let gate = Arc::new(RetentionGate {
+            state: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+        });
+        let release = GateRelease(gate.clone());
+        let mut connection = store.pool().acquire().await.unwrap();
+        let callback_gate = gate.clone();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .create_collation("retention_gate", move |left, right| {
+                callback_gate.enter();
+                left.cmp(right)
+            })
+            .unwrap();
+        sqlx::query(
+            "CREATE TEMP TRIGGER retention_gate_update
+             AFTER UPDATE OF phase ON workspace_allocations
+             WHEN NEW.phase='retained'
+             BEGIN
+                 SELECT NEW.allocation_id COLLATE retention_gate = NEW.workspace_id;
+             END",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+
+        let mut tx = connection.begin().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE retention_caller_sentinels (marker TEXT NOT NULL)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO retention_caller_sentinels(marker) VALUES ('before')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let entered_gate = gate.clone();
+        let entered = tokio::task::spawn_blocking(move || entered_gate.wait_until_entered());
+        let mut retain = Box::pin(Store::retain_allocation_tx(&mut tx, &attempt));
+        tokio::select! {
+            result = &mut retain => panic!("retention finished before the gate: {result:?}"),
+            result = entered => assert!(matches!(result, Ok(true)), "retention gate was not entered"),
+        }
+        drop(retain);
+        drop(release);
+
+        // This waits behind the released callback and proves SQLx finished the
+        // cancellation cleanup before the caller reuses its outer transaction.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(raw_snapshot_tx(&mut tx).await, before);
+        assert_eq!(caller_sentinels(&mut tx).await, "before");
+
+        sqlx::query("INSERT INTO retention_caller_sentinels(marker) VALUES ('after')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(caller_sentinels(&mut tx).await, "before|after");
+        tx.commit().await.unwrap();
+        drop(connection);
+
+        assert_eq!(raw_snapshot(&store).await, before);
+        let mut proof = store.pool().begin().await.unwrap();
+        assert_eq!(caller_sentinels(&mut proof).await, "before|after");
+        proof.commit().await.unwrap();
     }
 }
