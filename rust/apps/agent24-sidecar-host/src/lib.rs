@@ -14,6 +14,8 @@ mod control_io;
 mod launch;
 #[allow(dead_code)]
 mod output_io;
+#[allow(dead_code)]
+mod ready_io;
 
 #[cfg(unix)]
 mod posix;
