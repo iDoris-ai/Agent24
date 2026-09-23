@@ -212,6 +212,14 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - G1 #495（叠 #490，`391e2e3`，+306）public retention 两次 review `PASS`；G4 #493（叠 #491，`1e089a8`，+266/-1）terminal WAL `PASS`，#496（叠 #493，`e3045ef`，+381/-1）terminal/promotion 两次 review `PASS`；后三者 GitHub 当前仅 CLA green、review 未提交。
 - 全部仍是 dependency-stacked；#259 仍为 root `REVIEW_REQUIRED`。没有 merge-ready 或 P2 complete 结论，P2/P9 继续 `IN PROGRESS`。
 
+## 2026-09-24 Wave 17 当前门禁
+
+- 安全栈：#238 修复为 `fd20034`，#239 修复为 `905efbe`，#240 修复为 `f277f2c`；#239 在 #240 落地前 fail closed，#240 再原子启用 capability-aware route policy。#239/#240 均经两次 exact-diff Astra 安全审查 `PASS`，真实 listener 证明 minted host bearer 200、empty bearer 401。#238/#239 的旧 change-request 仍待新外部评审覆盖，不能跳栈合并。
+- workspace allocation 从 #406 到 #497 已用普通 no-ff merge 逐层传播父修复，没有 rebase/force。发生实质重排/冲突的 #430（`2eb3c84`，497 行）、#440（`d834940`，422 行）、#484（`4d0c967`，489 行）均经两次新 exact-head Astra 审查 `PASS`；reservation 仍为 `pub(crate)`，privacy doctest 与严格 clippy 通过。
+- 尾部 #495（`628dbe6`，373 行）与 #497（`468c9bc`，231 行）改用 test-only raw seed 建立已授权 reserved 边界，没有公开 reservation API；两次 exact-head Astra 审查及 retention/registration 公共、对抗、回滚测试全部 `PASS`，已推送并重新请求评审。
+- G8 #498（`b5124d4`，498 行）三平台 CI 全绿；#499（`4baef45`，299+1 test-only）在修复两个审查发现的覆盖空洞后 exact review `PASS`，Ubuntu/macOS/Windows CI 全绿，external review pending。
+- root #228 与 #259 仍为 `REVIEW_REQUIRED`；上述 workspace/G8 PR 仍 dependency-stacked。本波没有新的 main merge，P2/P9 继续 `IN PROGRESS`。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
