@@ -3,11 +3,19 @@ use serde_json::json;
 use sqlx::{Sqlite, Transaction, sqlite::SqliteRow};
 
 use crate::{
-    LifecycleOwnerRef, Store, WorkspaceInstant, WorkspaceKind, WorkspaceResult, WorkspaceRow,
-    WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
+    AuditEntry, LifecycleOwnerRef, Store, WorkspaceInstant, WorkspaceKind, WorkspaceResult,
+    WorkspaceRow, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
 };
 
 const AUDIT_ACTOR: &str = "workspace_lifecycle";
+
+#[rustfmt::skip]
+pub(crate) async fn verify_audit_entry_tx(tx: &mut Transaction<'_, Sqlite>, expected: &AuditEntry) -> WorkspaceResult<()> {
+let (seq, ts, actor, action, raw, prev_hash, hash): (i64,String,String,String,String,String,String) = sqlx::query_as("SELECT seq,ts,actor,action,detail,prev_hash,hash FROM audit_log WHERE seq=?").bind(expected.seq).fetch_optional(&mut **tx).await.map_err(|_| WorkspaceStoreError::Database)?.ok_or(WorkspaceStoreError::CorruptRow { table: "audit_log", field: "row" })?;
+let detail = serde_json::to_string(&expected.detail).map_err(|_| WorkspaceStoreError::Database)?;
+if raw != detail || seq != expected.seq || ts != expected.ts || actor != expected.actor || action != expected.action || prev_hash != expected.prev_hash || hash != expected.hash { return Err(WorkspaceStoreError::CorruptRow { table: "audit_log", field: "row" }); }
+Ok(())
+}
 
 fn decode_lifecycle_row(row: &SqliteRow) -> WorkspaceResult<WorkspaceRow> {
     let workspace = WorkspaceRow::decode(row)?;
@@ -46,7 +54,8 @@ async fn commit_unchanged(
     Ok(workspace.project())
 }
 
-async fn expire_workspace_tx(
+#[rustfmt::skip]
+pub(crate) async fn expire_workspace_tx(
     tx: &mut Transaction<'_, Sqlite>,
     id: &WorkspaceId,
     now: &WorkspaceInstant,
@@ -76,7 +85,13 @@ async fn expire_workspace_tx(
     expected.state = WorkspaceState::Expired;
     expected.cleanup.state = WorkspaceState::Expired;
     expected.revision = revision;
-    let reselected = select_workspace(tx, id).await?;
+    let row = sqlx::query("SELECT * FROM workspaces WHERE id = ? COLLATE BINARY LIMIT 1")
+        .bind(id.as_str())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?
+        .ok_or(WorkspaceStoreError::NotFound)?;
+    let reselected = WorkspaceRow::decode(&row)?;
     if reselected != expected {
         return Err(WorkspaceStoreError::CorruptRow {
             table: "workspaces",
@@ -89,9 +104,12 @@ async fn expire_workspace_tx(
         "result_state": reselected.state.as_str(),
         "reason": "ttl",
     });
-    Store::append_audit_tx(tx, now.as_str(), AUDIT_ACTOR, "workspace.expired", &detail)
+    let audit = Store::append_audit_tx(tx, now.as_str(), AUDIT_ACTOR, "workspace.expired", &detail)
         .await
         .map_err(|_| WorkspaceStoreError::Database)?;
+    verify_audit_entry_tx(tx, &audit).await?;
+    let row = sqlx::query("SELECT * FROM workspaces WHERE id = ? COLLATE BINARY LIMIT 1").bind(id.as_str()).fetch_optional(&mut **tx).await.map_err(|_| WorkspaceStoreError::Database)?.ok_or(WorkspaceStoreError::CorruptRow { table: "workspaces", field: "row" })?;
+    if WorkspaceRow::decode(&row).map_err(|_| WorkspaceStoreError::CorruptRow { table: "workspaces", field: "row" })? != expected { return Err(WorkspaceStoreError::CorruptRow { table: "workspaces", field: "row" }); }
     Ok(reselected)
 }
 

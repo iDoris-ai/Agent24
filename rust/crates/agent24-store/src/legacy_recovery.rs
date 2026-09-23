@@ -1,5 +1,7 @@
+use crate::workspace_decode_support::bad_table;
 use crate::{
-    Store, StoreError, WorkspaceInstant, WorkspaceResult, WorkspaceStoreError,
+    LeaseKind, Store, StoreError, WorkspaceInstant, WorkspaceKind, WorkspaceLeaseId,
+    WorkspaceLeaseRow, WorkspaceResult, WorkspaceRow, WorkspaceState, WorkspaceStoreError,
     workspace_decode_support,
 };
 use agent24_protocol::{Approval, ApprovalStatus, Decision, RunStatus, WorkspaceId};
@@ -88,6 +90,7 @@ fn facts_text(
 struct RunFacts {
     id: String,
     status: RunStatus,
+    created_at: WorkspaceInstant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,11 +116,12 @@ async fn read_run_facts(
     tx: &mut Transaction<'_, Sqlite>,
     id: &str,
 ) -> WorkspaceResult<Option<RunFacts>> {
-    let row = sqlx::query("SELECT id,status FROM runs WHERE id = ? COLLATE BINARY LIMIT 1")
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|_| WorkspaceStoreError::Database)?;
+    let row =
+        sqlx::query("SELECT id,status,created_at FROM runs WHERE id = ? COLLATE BINARY LIMIT 1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
     let Some(row) = row else { return Ok(None) };
     let actual_id = facts_text(&row, "runs", "id")?;
     if actual_id != id {
@@ -125,9 +129,12 @@ async fn read_run_facts(
     }
     let status = parse_run_status(&facts_text(&row, "runs", "status")?)
         .ok_or_else(|| workspace_decode_support::bad_table("runs", "status"))?;
+    let created_at = workspace_decode_support::instant(&row, "created_at")
+        .map_err(|_| workspace_decode_support::bad_table("runs", "created_at"))?;
     Ok(Some(RunFacts {
         id: actual_id,
         status,
+        created_at,
     }))
 }
 
@@ -418,6 +425,393 @@ pub(crate) async fn read_next_ready_tx(
     .await
     .map_err(|_| WorkspaceStoreError::Database)?;
     row.map(LegacyRecoveryHold::decode).transpose()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct LegacyRecoveryPromotionAttempt {
+    pub(crate) hint: LegacyRecoveryHold,
+    pub(crate) lease_id: WorkspaceLeaseId,
+    pub(crate) acquired_at: WorkspaceInstant,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct LegacyRecoveryAdmission {
+    pub(crate) hold: LegacyRecoveryHold,
+    pub(crate) lease: WorkspaceLeaseRow,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum LegacyRecoveryPromotionOutcome {
+    Admitted(LegacyRecoveryAdmission),
+    ObservedCommitted(LegacyRecoveryAdmission),
+    StaleHint,
+    Terminal,
+    Busy,
+    WorkspaceUnavailable,
+}
+#[derive(Debug, Clone, PartialEq)]
+struct PromotionFacts {
+    run: RunFacts,
+    approval_id: String,
+    decision: Decision,
+    workspace: WorkspaceRow,
+    approval_created_at: WorkspaceInstant,
+    approval_expires_at: WorkspaceInstant,
+    approval_decided_at: WorkspaceInstant,
+    cohort_created_at: WorkspaceInstant,
+    cohort_migration_version: u64,
+}
+
+#[rustfmt::skip]
+async fn select_recovery_workspace_tx(tx: &mut Transaction<'_, Sqlite>, id: &WorkspaceId) -> WorkspaceResult<WorkspaceRow> {
+let row = sqlx::query("SELECT * FROM workspaces WHERE id = ? COLLATE BINARY LIMIT 1").bind(id.as_str()).fetch_optional(&mut **tx).await.map_err(|_| WorkspaceStoreError::Database)?.ok_or_else(|| bad("workspace_id"))?;
+WorkspaceRow::decode(&row)
+}
+#[rustfmt::skip]
+async fn promotion_lease_tx(tx: &mut Transaction<'_, Sqlite>, lease_id: &WorkspaceLeaseId) -> WorkspaceResult<Option<WorkspaceLeaseRow>> {
+let row = sqlx::query("SELECT * FROM workspace_leases WHERE lease_id = ? COLLATE BINARY LIMIT 1").bind(lease_id.as_str()).fetch_optional(&mut **tx).await.map_err(|_| WorkspaceStoreError::Database)?;
+row.map(|row| WorkspaceLeaseRow::decode(&row)).transpose()
+}
+
+async fn promotion_facts_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    hold: &LegacyRecoveryHold,
+    ready_at: &WorkspaceInstant,
+    now: &WorkspaceInstant,
+) -> WorkspaceResult<Option<PromotionFacts>> {
+    let Some(run) = read_run_facts(tx, &hold.run_id).await? else {
+        return Err(bad("run_id"));
+    };
+    if matches!(
+        run.status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+    ) {
+        return Ok(None);
+    }
+    let Some(approval_id) = hold.approval_id.as_deref() else {
+        return Err(bad("approval_id"));
+    };
+    let approval = sqlx::query(
+        "SELECT a.id,a.run_id,a.status,a.decision,a.available_decisions,a.created_at,a.expires_at,a.decided_at,a.workspace_id,
+                r.workspace_id AS run_workspace_id
+         FROM approvals a JOIN runs r ON r.id = a.run_id
+         WHERE a.id = ? COLLATE BINARY AND r.id = ? COLLATE BINARY LIMIT 1",
+    )
+    .bind(approval_id)
+    .bind(&hold.run_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?
+    .ok_or_else(|| bad("approval_id"))?;
+    let actual_approval_id = facts_text(&approval, "approvals", "id")?;
+    let approval_run_id = facts_text(&approval, "approvals", "run_id")?;
+    let approval_status = parse_approval_status(&facts_text(&approval, "approvals", "status")?)
+        .ok_or_else(|| bad_table("approvals", "status"))?;
+    let available_decisions: Vec<String> =
+        serde_json::from_str(&facts_text(&approval, "approvals", "available_decisions")?)
+            .map_err(|_| bad_table("approvals", "available_decisions"))?;
+    let raw_decision = workspace_decode_support::opt_text(&approval, "decision")
+        .map_err(|_| bad_table("approvals", "decision"))?;
+    let Some(raw_decision) = raw_decision else {
+        return Ok(None);
+    };
+    let decision: Decision =
+        serde_json::from_str(&raw_decision).map_err(|_| bad_table("approvals", "decision"))?;
+    let approval_created_at = workspace_decode_support::instant(&approval, "created_at")
+        .map_err(|_| bad_table("approvals", "created_at"))?;
+    let approval_expires_at = workspace_decode_support::instant(&approval, "expires_at")
+        .map_err(|_| bad_table("approvals", "expires_at"))?;
+    let approval_decided_at = workspace_decode_support::opt_instant(&approval, "decided_at")
+        .map_err(|_| bad_table("approvals", "decided_at"))?
+        .ok_or_else(|| bad_table("approvals", "decided_at"))?;
+    let approval_workspace = workspace_decode_support::opt_text(&approval, "workspace_id")
+        .map_err(|_| bad_table("approvals", "workspace_id"))?;
+    let run_workspace = workspace_decode_support::opt_text(&approval, "run_workspace_id")
+        .map_err(|_| bad_table("runs", "workspace_id"))?;
+    if actual_approval_id != approval_id
+        || approval_run_id != hold.run_id
+        || approval_workspace.as_deref() != Some(hold.workspace_id.as_str())
+        || run_workspace.as_deref() != Some(hold.workspace_id.as_str())
+        || approval_status != ApprovalStatus::Approved
+        || !matches!(decision.kind.as_str(), "approve" | "approve_for_session")
+        || !available_decisions
+            .iter()
+            .any(|offered| offered == &decision.kind)
+        || approval_created_at > approval_decided_at
+        || now < &approval_decided_at
+        || approval_decided_at > approval_expires_at
+    {
+        return Ok(None);
+    }
+
+    let cohort = sqlx::query(
+        "SELECT cohort_id,migration_version,legacy_workspace_id,root_generation,created_at,completed_at
+         FROM legacy_recovery_cohorts WHERE cohort_id = ? COLLATE BINARY LIMIT 1",
+    )
+    .bind(&hold.cohort_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?
+    .ok_or_else(|| bad("cohort_id"))?;
+    let cohort_migration_version = workspace_decode_support::count(&cohort, "migration_version")
+        .map_err(|_| bad_table("legacy_recovery_cohorts", "migration_version"))?;
+    if cohort_migration_version == 0 {
+        return Err(bad_table("legacy_recovery_cohorts", "migration_version"));
+    }
+    let cohort_id = facts_text(&cohort, "legacy_recovery_cohorts", "cohort_id")?;
+    let cohort_workspace = facts_text(&cohort, "legacy_recovery_cohorts", "legacy_workspace_id")?;
+    let cohort_root = facts_text(&cohort, "legacy_recovery_cohorts", "root_generation")?;
+    let created_at = workspace_decode_support::instant(&cohort, "created_at")
+        .map_err(|_| bad_table("legacy_recovery_cohorts", "created_at"))?;
+    let completed_at = workspace_decode_support::opt_instant(&cohort, "completed_at")
+        .map_err(|_| bad_table("legacy_recovery_cohorts", "completed_at"))?;
+    if cohort_id != hold.cohort_id
+        || cohort_workspace != hold.workspace_id.as_str()
+        || cohort_root != hold.root_generation
+        || now < &created_at
+        || ready_at < &created_at
+        || ready_at < &run.created_at
+        || ready_at < &approval_decided_at
+        || completed_at.is_some()
+    {
+        return Ok(None);
+    }
+
+    let workspace = select_recovery_workspace_tx(tx, &hold.workspace_id).await?;
+    if workspace.id != hold.workspace_id
+        || workspace.kind != WorkspaceKind::LegacyCompat
+        || workspace.root.root_generation() != hold.root_generation
+        || workspace.state != WorkspaceState::Active
+        || now < &workspace.created_at
+        || ready_at < &workspace.created_at
+        || now < ready_at
+    {
+        return Ok(None);
+    }
+    Ok(Some(PromotionFacts {
+        run,
+        approval_id: approval_id.to_owned(),
+        decision,
+        workspace,
+        approval_created_at,
+        approval_expires_at,
+        approval_decided_at,
+        cohort_created_at: created_at,
+        cohort_migration_version,
+    }))
+}
+
+#[rustfmt::skip]
+fn expected_promotion_lease(attempt: &LegacyRecoveryPromotionAttempt, hold: &LegacyRecoveryHold) -> WorkspaceLeaseRow {
+    WorkspaceLeaseRow { record: crate::WorkspaceLeaseRecord {
+        id: attempt.lease_id.clone(), workspace_id: hold.workspace_id.clone(),
+        root_generation: hold.root_generation.clone(), owner_id: hold.run_id.clone(), kind: LeaseKind::Run,
+        daemon_generation: None, host_instance_id: None, acquired_at: attempt.acquired_at.clone(),
+        expires_at: None, renewed_at: None, released_at: None,
+    }}
+}
+
+#[rustfmt::skip]
+async fn open_run_lease_exists_tx(tx: &mut Transaction<'_, Sqlite>, workspace_id: &WorkspaceId, run_id: &str) -> WorkspaceResult<bool> {
+sqlx::query("SELECT 1 FROM workspace_leases WHERE kind='run' AND released_at IS NULL AND (workspace_id=? COLLATE BINARY OR owner_id=? COLLATE BINARY) LIMIT 1").bind(workspace_id.as_str()).bind(run_id).fetch_optional(&mut **tx).await.map(|row| row.is_some()).map_err(|_| WorkspaceStoreError::Database)
+}
+
+async fn admission_reread_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    expected_hold: &LegacyRecoveryHold,
+    expected_lease: &WorkspaceLeaseRow,
+) -> WorkspaceResult<LegacyRecoveryAdmission> {
+    let hold = read_hold_tx(tx, &expected_hold.run_id).await?;
+    let lease = promotion_lease_tx(tx, &expected_lease.record.id)
+        .await?
+        .ok_or(WorkspaceStoreError::CorruptRow {
+            table: "workspace_leases",
+            field: "lease_id",
+        })?;
+    if &hold != expected_hold || &lease != expected_lease {
+        return Err(WorkspaceStoreError::CorruptRow {
+            table: "legacy_recovery_holds",
+            field: "row",
+        });
+    }
+    Ok(LegacyRecoveryAdmission { hold, lease })
+}
+
+#[allow(dead_code)]
+impl Store {
+    /// Atomically promotes the exact oldest Ready hold into a legacy run lease.
+    pub(crate) async fn promote_legacy_recovery(
+        &self,
+        attempt: LegacyRecoveryPromotionAttempt,
+    ) -> WorkspaceResult<LegacyRecoveryPromotionOutcome> {
+        let mut tx = self.begin_workspace_immediate().await?;
+
+        if let Some(existing) = promotion_lease_tx(&mut tx, &attempt.lease_id).await? {
+            let expected = expected_promotion_lease(&attempt, &attempt.hint);
+            if existing != expected {
+                return Ok(LegacyRecoveryPromotionOutcome::Busy);
+            }
+            let active = read_hold_tx(&mut tx, &attempt.hint.run_id).await?;
+            let mut expected_active = attempt.hint.clone();
+            expected_active.recovery_state = RecoveryState::Active;
+            expected_active.ready_at = None;
+            expected_active.active_resume_approval_id = expected_active.approval_id.clone();
+            if active != expected_active
+                || promotion_facts_tx(
+                    &mut tx,
+                    &active,
+                    attempt.hint.ready_at.as_ref().ok_or(bad("ready_at"))?,
+                    &attempt.acquired_at,
+                )
+                .await?
+                .is_none()
+            {
+                return Ok(LegacyRecoveryPromotionOutcome::Busy);
+            }
+            let admission = admission_reread_tx(&mut tx, &active, &expected).await?;
+            tx.commit()
+                .await
+                .map_err(|_| WorkspaceStoreError::Database)?;
+            return Ok(LegacyRecoveryPromotionOutcome::ObservedCommitted(admission));
+        }
+
+        let next = read_next_ready_tx(&mut tx).await?;
+        if next.as_ref() != Some(&attempt.hint) {
+            return Ok(LegacyRecoveryPromotionOutcome::StaleHint);
+        }
+        let run = read_run_facts(&mut tx, &attempt.hint.run_id).await?.ok_or(
+            WorkspaceStoreError::CorruptRow {
+                table: "legacy_recovery_holds",
+                field: "run_id",
+            },
+        )?;
+        if matches!(
+            run.status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            return Ok(LegacyRecoveryPromotionOutcome::Terminal);
+        }
+        if attempt.acquired_at < *attempt.hint.ready_at.as_ref().ok_or(bad("ready_at"))? {
+            return Ok(LegacyRecoveryPromotionOutcome::WorkspaceUnavailable);
+        }
+        let Some(facts) = promotion_facts_tx(
+            &mut tx,
+            &attempt.hint,
+            attempt.hint.ready_at.as_ref().ok_or(bad("ready_at"))?,
+            &attempt.acquired_at,
+        )
+        .await?
+        else {
+            return Ok(LegacyRecoveryPromotionOutcome::WorkspaceUnavailable);
+        };
+        if facts.run.id != attempt.hint.run_id
+            || facts.approval_id != attempt.hint.approval_id.as_deref().unwrap_or_default()
+        {
+            return Ok(LegacyRecoveryPromotionOutcome::WorkspaceUnavailable);
+        }
+        if attempt.acquired_at >= facts.workspace.expires_at {
+            crate::workspace_lifecycle::expire_workspace_tx(
+                &mut tx,
+                &attempt.hint.workspace_id,
+                &attempt.acquired_at,
+                &facts.workspace,
+            )
+            .await?;
+            tx.commit()
+                .await
+                .map_err(|_| WorkspaceStoreError::Database)?;
+            return Ok(LegacyRecoveryPromotionOutcome::WorkspaceUnavailable);
+        }
+        if open_run_lease_exists_tx(&mut tx, &attempt.hint.workspace_id, &attempt.hint.run_id)
+            .await?
+        {
+            return Ok(LegacyRecoveryPromotionOutcome::Busy);
+        }
+        let lease = expected_promotion_lease(&attempt, &attempt.hint);
+        sqlx::query(
+            "INSERT INTO workspace_leases
+             (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at)
+             VALUES (?,?,?,?,'run',?)",
+        )
+        .bind(lease.record.id.as_str())
+        .bind(lease.record.workspace_id.as_str())
+        .bind(&lease.record.root_generation)
+        .bind(&lease.record.owner_id)
+        .bind(lease.record.acquired_at.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?;
+
+        let original_status = serde_json::to_value(attempt.hint.original_status)
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        let original_status = original_status
+            .as_str()
+            .ok_or(WorkspaceStoreError::Database)?;
+        let affected = sqlx::query(
+            "UPDATE legacy_recovery_holds
+             SET recovery_state='active', ready_at=NULL, active_resume_approval_id=approval_id
+             WHERE run_id = ? COLLATE BINARY AND cohort_id = ? COLLATE BINARY
+               AND workspace_id = ? COLLATE BINARY AND root_generation = ? COLLATE BINARY
+               AND original_status = ? COLLATE BINARY AND recovery_state = 'ready'
+               AND approval_id = ? COLLATE BINARY AND ready_at = ? COLLATE BINARY
+               AND reason_code IS ? AND released_at IS NULL
+               AND active_resume_approval_id IS NULL",
+        )
+        .bind(&attempt.hint.run_id)
+        .bind(&attempt.hint.cohort_id)
+        .bind(attempt.hint.workspace_id.as_str())
+        .bind(&attempt.hint.root_generation)
+        .bind(original_status)
+        .bind(attempt.hint.approval_id.as_deref())
+        .bind(attempt.hint.ready_at.as_ref().map(WorkspaceInstant::as_str))
+        .bind(attempt.hint.reason_code.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?;
+        if affected.rows_affected() != 1 {
+            return Err(WorkspaceStoreError::Database);
+        }
+        let mut active = attempt.hint.clone();
+        active.recovery_state = RecoveryState::Active;
+        active.ready_at = None;
+        active.active_resume_approval_id = active.approval_id.clone();
+        admission_reread_tx(&mut tx, &active, &lease).await?;
+        let audit = Store::append_audit_tx(
+            &mut tx,
+            attempt.acquired_at.as_str(),
+            "legacy_recovery",
+            "legacy_recovery.active",
+            &serde_json::json!({"run_id": active.run_id, "cohort_id": active.cohort_id,
+                    "workspace_id": active.workspace_id.as_str(), "result_state": "active"}),
+        )
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?;
+        crate::workspace_lifecycle::verify_audit_entry_tx(&mut tx, &audit).await?;
+        let post_hold = read_hold_tx(&mut tx, &active.run_id).await?;
+        let post_lease = promotion_lease_tx(&mut tx, &lease.record.id).await?;
+        let post_facts = promotion_facts_tx(
+            &mut tx,
+            &active,
+            attempt.hint.ready_at.as_ref().ok_or(bad("ready_at"))?,
+            &attempt.acquired_at,
+        )
+        .await?;
+        if post_hold != active
+            || post_lease.as_ref() != Some(&lease)
+            || post_facts.as_ref() != Some(&facts)
+        {
+            return Err(WorkspaceStoreError::CorruptRow {
+                table: "legacy_recovery_holds",
+                field: "row",
+            });
+        }
+        let admission = admission_reread_tx(&mut tx, &active, &lease).await?;
+        tx.commit()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        Ok(LegacyRecoveryPromotionOutcome::Admitted(admission))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,7 +1179,8 @@ mod tests {
             read_run_facts(&mut tx, "run-strict").await.unwrap(),
             Some(RunFacts {
                 id: "run-strict".to_owned(),
-                status: RunStatus::Running
+                status: RunStatus::Running,
+                created_at: WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap(),
             })
         );
         assert_eq!(
@@ -1400,6 +1795,7 @@ mod tests {
             "CREATE TABLE runs (id INTEGER,status);
              INSERT INTO runs VALUES
                 ('run-storage',1),('run-enum','bogus'),('1','running');
+             ALTER TABLE runs ADD COLUMN created_at TEXT NOT NULL DEFAULT '2026-09-19T00:00:00Z';
              CREATE TABLE approvals (id INTEGER,run_id,status);
              INSERT INTO approvals VALUES
                 ('approval-storage','run',1),
@@ -1473,6 +1869,18 @@ mod tests {
             .await
             .unwrap();
     }
+
+    #[allow(clippy::unwrap_used)] #[rustfmt::skip]
+    async fn ready_promotion_attempt(store: &Store) -> LegacyRecoveryPromotionAttempt {
+        execute(store, "DELETE FROM workspace_leases; UPDATE approvals SET status='approved',decision='{\"type\":\"approve\"}',available_decisions='[\"approve\"]',decided_at='2026-09-19T00:00:00.000Z'; UPDATE legacy_recovery_holds SET recovery_state='ready',ready_at='2026-09-19T00:00:00.000Z' WHERE run_id='run-strict'").await;
+        LegacyRecoveryPromotionAttempt { hint: store.get_legacy_recovery_hold("run-strict").await.unwrap(), lease_id: WorkspaceLeaseId::parse("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7").unwrap(), acquired_at: WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap() }
+    }
+
+    #[allow(clippy::unwrap_used)] #[rustfmt::skip]
+    async fn expect_promotion(store: &Store, attempt: LegacyRecoveryPromotionAttempt, expected: LegacyRecoveryPromotionOutcome) { assert_eq!(store.promote_legacy_recovery(attempt).await.unwrap(), expected); }
+
+    #[rustfmt::skip]
+    async fn expect_promotion_error(store: &Store, attempt: LegacyRecoveryPromotionAttempt, expected: WorkspaceStoreError) { assert_eq!(store.promote_legacy_recovery(attempt).await, Err(expected)); }
 
     #[allow(clippy::unwrap_used)]
     async fn changes(store: &Store) -> i64 {
@@ -1868,6 +2276,55 @@ mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test] #[allow(clippy::unwrap_used)] #[rustfmt::skip]
+    async fn promotion_commits_once_and_stable_retry_observes_commit() {
+let store = strict_facts_fixture().await; let attempt = ready_promotion_attempt(&store).await;
+execute(&store, "UPDATE runs SET status='completed' WHERE id='run-strict'; UPDATE approvals SET status='corrupt' WHERE id='approval-strict'").await; expect_promotion(&store, attempt.clone(), LegacyRecoveryPromotionOutcome::Terminal).await; assert!(store.list_audit().await.unwrap().is_empty());
+execute(&store, "UPDATE runs SET status='running' WHERE id='run-strict'; UPDATE approvals SET status='approved' WHERE id='approval-strict'").await;
+assert!(matches!(store.promote_legacy_recovery(attempt.clone()).await.unwrap(), LegacyRecoveryPromotionOutcome::Admitted(_))); assert!(matches!(store.promote_legacy_recovery(attempt).await.unwrap(), LegacyRecoveryPromotionOutcome::ObservedCommitted(_)));
+let audit = store.list_audit().await.unwrap(); assert_eq!(audit.len(), 1); assert_eq!(audit[0].action, "legacy_recovery.active"); store.verify_audit_chain().await.unwrap();
+    }
+    #[tokio::test] #[allow(clippy::unwrap_used)] #[rustfmt::skip]
+async fn promotion_rejects_bad_decision_time_and_missing_workspace() {
+let store = strict_facts_fixture().await; let attempt = ready_promotion_attempt(&store).await;
+execute(&store, "UPDATE approvals SET available_decisions='[]' WHERE id='approval-strict'").await; let before = changes(&store).await;
+expect_promotion(&store, attempt.clone(), LegacyRecoveryPromotionOutcome::WorkspaceUnavailable).await; assert_eq!(changes(&store).await, before);
+execute(&store, "UPDATE approvals SET available_decisions='[\"approve\"]' WHERE id='approval-strict'").await;
+for decision in [None, Some(r#"{"type":"deny"}"#), Some(r#"{"type":"abort"}"#)] {
+    sqlx::query("UPDATE approvals SET decision=? WHERE id='approval-strict'").bind(decision).execute(store.pool()).await.unwrap(); expect_promotion(&store, attempt.clone(), LegacyRecoveryPromotionOutcome::WorkspaceUnavailable).await;
+}
+execute(&store, "UPDATE approvals SET decision='{' WHERE id='approval-strict'").await; expect_promotion_error(&store, attempt.clone(), WorkspaceStoreError::CorruptRow { table: "approvals", field: "decision" }).await;
+execute(&store, "UPDATE approvals SET available_decisions='{' WHERE id='approval-strict'").await; expect_promotion_error(&store, attempt.clone(), WorkspaceStoreError::CorruptRow { table: "approvals", field: "available_decisions" }).await;
+execute(&store, "UPDATE approvals SET decision='{\"type\":\"approve\"}' WHERE id='approval-strict'; UPDATE workspaces SET kind='orchestrator_scratch',expires_at='2026-09-19T00:00:00.001Z' WHERE id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'").await;
+let mut wrong_kind = ready_promotion_attempt(&store).await; wrong_kind.acquired_at = WorkspaceInstant::parse("2026-09-19T00:00:00.002Z").unwrap(); let before = changes(&store).await; expect_promotion(&store, wrong_kind, LegacyRecoveryPromotionOutcome::WorkspaceUnavailable).await; assert_eq!(changes(&store).await, before);
+let missing = ready_promotion_attempt(&store).await; execute(&store, "PRAGMA foreign_keys=OFF; DELETE FROM workspaces WHERE id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'").await; expect_promotion_error(&store, missing, WorkspaceStoreError::CorruptRow { table: "legacy_recovery_holds", field: "workspace_id" }).await;
+    }
+
+    #[tokio::test] #[allow(clippy::unwrap_used)] #[rustfmt::skip]
+    async fn promotion_rejects_each_clock_rollback_without_writes() { let updates = ["UPDATE runs SET created_at='2026-09-19T00:00:00.001Z'", "UPDATE approvals SET decided_at='2026-09-19T00:00:00.001Z'", "UPDATE legacy_recovery_cohorts SET created_at='2026-09-19T00:00:00.001Z'", "UPDATE workspaces SET created_at='2026-09-19T00:00:00.001Z'", ""];
+for (index, update) in updates.into_iter().enumerate() { let store = strict_facts_fixture().await; let mut attempt = ready_promotion_attempt(&store).await;
+if index == 4 { attempt.acquired_at = WorkspaceInstant::parse("2026-09-18T23:59:59.999Z").unwrap(); } else { attempt.acquired_at = WorkspaceInstant::parse("2026-09-19T00:00:00.002Z").unwrap(); execute(&store, update).await; }
+let before = changes(&store).await; expect_promotion(&store, attempt, LegacyRecoveryPromotionOutcome::WorkspaceUnavailable).await; assert_eq!(changes(&store).await, before); let hold = store.get_legacy_recovery_hold("run-strict").await.unwrap(); let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM workspace_leases),(SELECT count(*) FROM audit_log)").fetch_one(store.pool()).await.unwrap(); assert_eq!(hold.recovery_state, RecoveryState::Ready); assert_eq!(counts, (0, 0));
+}}
+    #[tokio::test] #[allow(clippy::unwrap_used)] #[rustfmt::skip]
+    async fn promotion_rolls_back_post_audit_cohort_version_tamper() {
+let store = strict_facts_fixture().await; let attempt = ready_promotion_attempt(&store).await;
+execute(&store, "CREATE TRIGGER mutate_cohort_version AFTER INSERT ON audit_log WHEN NEW.action='legacy_recovery.active' BEGIN UPDATE legacy_recovery_cohorts SET migration_version=2 WHERE cohort_id='cohort-strict'; END").await;
+expect_promotion_error(&store, attempt, WorkspaceStoreError::CorruptRow { table: "legacy_recovery_holds", field: "row" }).await;
+let facts: (i64, String, i64, i64) = sqlx::query_as("SELECT migration_version,(SELECT recovery_state FROM legacy_recovery_holds WHERE run_id='run-strict'),(SELECT count(*) FROM workspace_leases),(SELECT count(*) FROM audit_log) FROM legacy_recovery_cohorts WHERE cohort_id='cohort-strict'").fetch_one(store.pool()).await.unwrap(); assert_eq!(facts, (1, "ready".into(), 0, 0));
+    }
+    #[tokio::test] #[allow(clippy::unwrap_used)] #[rustfmt::skip]
+    async fn promotion_rolls_back_missing_or_changed_audit() {
+for trigger in ["DELETE FROM audit_log WHERE seq=NEW.seq", "UPDATE audit_log SET actor='tampered' WHERE seq=NEW.seq", "UPDATE audit_log SET detail=detail || ' ' WHERE seq=NEW.seq"] { let store = strict_facts_fixture().await; let attempt = ready_promotion_attempt(&store).await; execute(&store, &format!("CREATE TRIGGER tamper_audit AFTER INSERT ON audit_log BEGIN {trigger}; END")).await;
+expect_promotion_error(&store, attempt, WorkspaceStoreError::CorruptRow { table: "audit_log", field: "row" }).await; let counts: (String,i64,i64) = sqlx::query_as("SELECT (SELECT recovery_state FROM legacy_recovery_holds WHERE run_id='run-strict'),(SELECT count(*) FROM workspace_leases),(SELECT count(*) FROM audit_log)").fetch_one(store.pool()).await.unwrap(); assert_eq!(counts, ("ready".into(), 0, 0));
+}}
+    #[tokio::test] #[allow(clippy::unwrap_used)] #[rustfmt::skip]
+async fn promotion_ttl_audit_raw_tamper_rolls_back_workspace_expiry() {
+for (trigger, table) in [("UPDATE audit_log SET detail=detail || ' ' WHERE seq=NEW.seq", "audit_log"), ("UPDATE workspaces SET state='active' WHERE id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'", "workspaces")] { let store = strict_facts_fixture().await; let mut attempt = ready_promotion_attempt(&store).await; attempt.acquired_at = WorkspaceInstant::parse("2026-09-19T00:00:00.002Z").unwrap();
+execute(&store, &format!("UPDATE workspaces SET expires_at='2026-09-19T00:00:00.001Z' WHERE id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'; CREATE TRIGGER tamper_expiry_audit AFTER INSERT ON audit_log WHEN NEW.action='workspace.expired' BEGIN {trigger}; END")).await;
+expect_promotion_error(&store, attempt, WorkspaceStoreError::CorruptRow { table, field: "row" }).await; let rows: (String,String,i64,i64) = sqlx::query_as("SELECT state,(SELECT recovery_state FROM legacy_recovery_holds WHERE run_id='run-strict'),(SELECT count(*) FROM workspace_leases),(SELECT count(*) FROM audit_log) FROM workspaces WHERE id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'").fetch_one(store.pool()).await.unwrap(); assert_eq!(rows, ("active".into(), "ready".into(), 0, 0));
+}
+}
 
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
