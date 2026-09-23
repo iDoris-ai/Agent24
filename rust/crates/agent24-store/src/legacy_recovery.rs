@@ -945,6 +945,200 @@ mod tests {
         }
     }
 
+    type RawFacts = (i64, i64, Option<String>, Option<String>);
+
+    #[allow(clippy::unwrap_used)]
+    async fn raw_facts(store: &Store) -> RawFacts {
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM runs),(SELECT count(*) FROM approvals),
+                    (SELECT id FROM runs ORDER BY id LIMIT 1),
+                    (SELECT id FROM approvals ORDER BY id LIMIT 1)",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn writer_error_case(
+        run_id: &str,
+        approval_id: &str,
+        run_status: Option<&str>,
+        expected: WorkspaceStoreError,
+    ) {
+        let store = strict_facts_fixture().await;
+        if let Some(status) = run_status {
+            sqlx::query("UPDATE runs SET status=? WHERE id='run-strict'")
+                .bind(status)
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        let before = raw_facts(&store).await;
+        let changes_before = changes(&store).await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            apply_ready_tx(
+                &mut tx,
+                run_id,
+                approval_id,
+                WorkspaceInstant::parse("2026-09-20T00:00:00.000Z").unwrap(),
+            )
+            .await
+            .unwrap_err(),
+            expected
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(raw_facts(&store).await, before);
+        assert_eq!(changes(&store).await, changes_before);
+        assert!(store.list_audit().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn ready_writer_freezes_caller_identity_and_missing_hold_errors() {
+        writer_error_case(
+            "run-strict",
+            "wrong",
+            None,
+            WorkspaceStoreError::InvalidValue {
+                field: "approval_id",
+            },
+        )
+        .await;
+        writer_error_case(
+            "run-strict",
+            "APPROVAL-STRICT",
+            None,
+            WorkspaceStoreError::InvalidValue {
+                field: "approval_id",
+            },
+        )
+        .await;
+        for run_id in ["RUN-STRICT", "missing"] {
+            writer_error_case(
+                run_id,
+                "approval-strict",
+                None,
+                WorkspaceStoreError::NotFound,
+            )
+            .await;
+        }
+        writer_error_case(
+            "run-strict",
+            "wrong",
+            Some("completed"),
+            WorkspaceStoreError::InvalidValue {
+                field: "approval_id",
+            },
+        )
+        .await;
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn damaged_writer_case(
+        damage: &str,
+        disable_fk: bool,
+        table: &'static str,
+        field: &'static str,
+    ) {
+        let store = strict_facts_fixture().await;
+        if disable_fk {
+            // Adversarial corruption is applied only after the valid FK fixture exists.
+            let mut conn = store.pool().acquire().await.unwrap();
+            sqlx::query("PRAGMA foreign_keys=OFF")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            sqlx::query(damage).execute(&mut *conn).await.unwrap();
+        } else {
+            sqlx::query(damage).execute(store.pool()).await.unwrap();
+        }
+        let before = raw_facts(&store).await;
+        let changes_before = changes(&store).await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            ready(&mut tx).await,
+            Err(WorkspaceStoreError::CorruptRow { table, field })
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(raw_facts(&store).await, before);
+        assert_eq!(changes(&store).await, changes_before);
+        assert!(store.list_audit().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn ready_writer_classifies_referenced_fact_damage_without_writes() {
+        for (damage, fk, table, field) in [
+            (
+                "DELETE FROM runs WHERE id='run-strict'",
+                true,
+                "legacy_recovery_holds",
+                "run_id",
+            ),
+            (
+                "UPDATE runs SET status='bogus' WHERE id='run-strict'",
+                false,
+                "runs",
+                "status",
+            ),
+            (
+                "DELETE FROM approvals WHERE id='approval-strict'",
+                true,
+                "legacy_recovery_holds",
+                "approval_id",
+            ),
+            (
+                "UPDATE approvals SET status='bogus' WHERE id='approval-strict'",
+                false,
+                "approvals",
+                "status",
+            ),
+            (
+                "UPDATE approvals SET run_id='run-other' WHERE id='approval-strict'",
+                true,
+                "approvals",
+                "run_id",
+            ),
+            (
+                "UPDATE legacy_recovery_holds SET root_generation=''",
+                true,
+                "legacy_recovery_holds",
+                "root_generation",
+            ),
+        ] {
+            damaged_writer_case(damage, fk, table, field).await;
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn ready_writer_rejects_schema_valid_non_null_ready_at_cas_source() {
+        let store = strict_facts_fixture().await;
+        execute(
+            &store,
+            "UPDATE legacy_recovery_holds SET ready_at='2026-09-20T00:00:00.000Z'",
+        )
+        .await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        approve_tx(&mut tx).await;
+        let before = ready_facts(&mut tx).await;
+        let changes_before: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(ready(&mut tx).await, Err(WorkspaceStoreError::Database));
+        assert_eq!(ready_facts(&mut tx).await, before);
+        let changes_after: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(changes_after, changes_before);
+        tx.rollback().await.unwrap();
+        assert!(store.list_audit().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn strict_facts_classify_storage_enums_and_sql_failures() {
