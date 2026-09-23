@@ -183,8 +183,8 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - #254 已合入 main（merge commit `95eb36b`）。#255 已直接基于当前 main head `f14bd1e` 重建，
   实际变更为 +283/-101=384；两份独立内部 exact-tree review `PASS`，但 CI/rereview 仍 pending，
   未获新的外部 approval 且未全绿前不可 merge。
-- G8：#460/#463 的 Windows rerun 均 green；#468（head `2f7a8ea`，+499）完成 lease-history
-  verification；#474（`5007634`，+340/-40）完成 runtime lifecycle/order；#475（`45343cc`，+414）
+- G8：#460/#463 的 Windows rerun 均 green；G4 #468（head `2f7a8ea`，+499）完成 terminal
+  composition；#474（`5007634`，+340/-40）完成 runtime lifecycle/order；#475（`45343cc`，+414）
   完成 state plan；#477（`3815cbe`，+79/-14）增加 optional control timeout；#480（`9edf631`，
   +235/-9）完成 exact audit replay。
 - 所有上述后代仍 dependency-stacked，等待外部 review；没有 runtime product wiring，P2/P9 仍未完成。
@@ -198,6 +198,13 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
   head `f41c561`，+218 test-only）exact review `PASS`；二者 CI green、review pending。
 - 已批准且 CI green 的堆叠祖先仍不具 dependency-ready 条件；#228 仍是 root `REVIEW_REQUIRED`。
   因此没有新增 merge-ready Open Design PR，P2/P9 继续 `IN PROGRESS`。
+
+## 2026-09-24 Wave 15 当前门禁
+
+- #489 叠加 #486（`9f374a2`，+147 test-only cancellation），内部 `PASS+CI`；GitHub 当前仅 CLA green，external review pending。
+- #490 叠加 #489（`eaa98bd`，+220/-1）覆盖 WAL contention，内部 exact review `PASS`；GitHub 当前仅 CLA green，external review pending。
+- G4 #491 叠加 #468（`0529c98`，+201/-2）覆盖 terminal durability ownership，内部 exact review `PASS`；GitHub 当前仅 CLA green，external review pending。
+- #259 与 #485 继续 CI green、review pending；所有上述 PR 仍受 review 和/或依赖门禁约束，均非 merge-ready，P2/P9 仍 `IN PROGRESS`。
 
 ## A24-OD-00 小 PR 栈
 
