@@ -17,6 +17,8 @@ mod launch_order;
 #[allow(dead_code)]
 mod output_io;
 #[allow(dead_code)]
+mod pipe_access;
+#[allow(dead_code)]
 mod ready_io;
 
 #[cfg(unix)]

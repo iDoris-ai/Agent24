@@ -1,5 +1,6 @@
 use std::{ffi::OsString, fmt, io, path::PathBuf};
 
+use crate::pipe_access::TargetPipes;
 use agent24_sidecar_host_protocol::Request;
 
 #[cfg(windows)]
@@ -114,7 +115,7 @@ impl fmt::Display for LaunchFailure {
 pub(crate) struct OwnedLaunch {
     request_id: u64,
     target: OwnedTarget,
-    pipes: OwnedPipes,
+    pipes: TargetPipes,
 }
 
 #[cfg(any(unix, windows))]
@@ -156,7 +157,7 @@ impl OwnedLaunch {
         Ok(Self {
             request_id,
             target,
-            pipes,
+            pipes: pipes.into(),
         })
     }
 
@@ -168,8 +169,8 @@ impl OwnedLaunch {
         &mut self.target
     }
 
-    pub(crate) fn pipes_mut(&mut self) -> &mut OwnedPipes {
-        &mut self.pipes
+    pub(crate) fn parts_mut(&mut self) -> (&mut OwnedTarget, &mut TargetPipes) {
+        (&mut self.target, &mut self.pipes)
     }
 }
 
@@ -194,7 +195,7 @@ impl OwnedLaunch {
         Ok(Self {
             request_id,
             target,
-            pipes,
+            pipes: pipes.into(),
         })
     }
 
@@ -206,8 +207,8 @@ impl OwnedLaunch {
         &mut self.target
     }
 
-    pub(crate) fn pipes_mut(&mut self) -> &mut OwnedPipes {
-        &mut self.pipes
+    pub(crate) fn parts_mut(&mut self) -> (&mut OwnedTarget, &mut TargetPipes) {
+        (&mut self.target, &mut self.pipes)
     }
 }
 
@@ -239,10 +240,10 @@ mod tests {
     }
 
     fn reap(launch: &mut OwnedLaunch) {
-        launch.target_mut().request_stop(true).expect("force stop");
+        launch.parts_mut().0.request_stop(true).expect("force stop");
         let deadline = Instant::now() + Duration::from_secs(2);
         while !matches!(
-            launch.target_mut().reap_step().expect("reap step"),
+            launch.parts_mut().0.reap_step().expect("reap step"),
             TreeObservation::ConfirmedEmpty
         ) {
             assert!(Instant::now() < deadline, "child was not reaped");
@@ -275,10 +276,23 @@ mod tests {
         assert!(std::env::var_os("HOME").is_some());
         let intent = LaunchIntent::from_request(request("/bin/sh", "/")).expect("launch");
         let mut launch = OwnedLaunch::start(intent).expect("owned launch");
-        let pipes = launch.pipes_mut();
-        let _ = (&pipes.stdin, &pipes.stderr);
         let mut stdout_text = [0; 28];
-        pipes.stdout.read_exact(&mut stdout_text).expect("stdout");
+        {
+            let (_, pipes) = launch.parts_mut();
+            let _ = pipes.stdin_mut().expect("stdin");
+            pipes
+                .stdout_mut()
+                .read_exact(&mut stdout_text[..1])
+                .expect("first stdout borrow");
+        }
+        {
+            let (_, pipes) = launch.parts_mut();
+            pipes
+                .stdout_mut()
+                .read_exact(&mut stdout_text[1..])
+                .expect("second stdout borrow");
+            let _ = pipes.stderr_mut();
+        }
         assert_eq!(stdout_text, *b"/|env-value|argv-value|unset");
         reap(&mut launch);
         drop(launch);
@@ -371,11 +385,12 @@ mod windows_tests {
 
     fn reap(launch: &mut OwnedLaunch) {
         launch
-            .target_mut()
+            .parts_mut()
+            .0
             .request_stop(true)
             .expect("force Job tree");
         for _ in 0..100 {
-            if launch.target_mut().reap_step().expect("reap Job tree")
+            if launch.parts_mut().0.reap_step().expect("reap Job tree")
                 == TreeObservation::ConfirmedEmpty
             {
                 return;
@@ -404,12 +419,30 @@ mod windows_tests {
             OwnedLaunch::start(LaunchIntent::from_request(request(&cwd)).expect("intent"))
                 .expect("owned launch");
         assert_eq!(launch.request_id(), 17);
-        let pipes = launch.pipes_mut();
-        let _ = &pipes.stdin;
         let mut stdout = String::new();
-        pipes.stdout.read_to_string(&mut stdout).await.unwrap();
+        {
+            let (_, pipes) = launch.parts_mut();
+            let _ = pipes.stdin_mut().expect("stdin");
+            let mut first = [0; 1];
+            pipes.stdout_mut().read_exact(&mut first).await.unwrap();
+            stdout.push(first[0] as char);
+        }
+        {
+            let (_, pipes) = launch.parts_mut();
+            pipes
+                .stdout_mut()
+                .read_to_string(&mut stdout)
+                .await
+                .unwrap();
+        }
         let mut stderr = String::new();
-        pipes.stderr.read_to_string(&mut stderr).await.unwrap();
+        launch
+            .parts_mut()
+            .1
+            .stderr_mut()
+            .read_to_string(&mut stderr)
+            .await
+            .unwrap();
         let fields: Vec<_> = stdout.split('|').collect();
         assert_eq!(fields[0], "cwd-ok");
         assert_eq!(
@@ -428,9 +461,14 @@ mod windows_tests {
             LaunchIntent::from_request(descendant_request(&cwd)).expect("intent"),
         )
         .expect("owned launch");
-        let pipes = launch.pipes_mut();
         let mut ready = [0; 5];
-        pipes.stdout.read_exact(&mut ready).await.expect("ready");
+        launch
+            .parts_mut()
+            .1
+            .stdout_mut()
+            .read_exact(&mut ready)
+            .await
+            .expect("ready");
         assert_eq!(&ready, b"ready");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
