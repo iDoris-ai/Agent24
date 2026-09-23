@@ -1009,7 +1009,7 @@ pub(crate) mod tests {
     }
 
     #[allow(clippy::unwrap_used)]
-    async fn strict_facts_file(path: &Path) -> Store {
+    pub(crate) async fn strict_facts_file(path: &Path) -> Store {
         let store = Store::open(path).await.unwrap();
         strict_facts_seed(&store).await;
         store

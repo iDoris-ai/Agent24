@@ -416,7 +416,8 @@ pub(crate) async fn compose_terminal_tx(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::legacy_recovery::tests::strict_facts_fixture;
+    use crate::legacy_recovery::tests::{strict_facts_file, strict_facts_fixture};
+    use sqlx::Connection;
     #[rustfmt::skip] async fn facts(tx: &mut Transaction<'_, Sqlite>) -> TerminalReleaseSnapshot { snapshot_tx(tx, "run-strict").await.unwrap() }
     #[rustfmt::skip] fn attempt(status: RunStatus) -> TerminalAttempt { TerminalAttempt::new(status, WorkspaceInstant::parse("2026-09-19T00:00:01.000Z").unwrap()) }
     #[rustfmt::skip]
@@ -471,5 +472,203 @@ mod tests {
         let entered = std::sync::Arc::new(tokio::sync::Notify::new()); let resume = std::sync::Arc::new(tokio::sync::Notify::new()); let terminal = composition(RunStatus::Cancelled, &before).pausing(entered.clone(), resume);
         { let future = compose_terminal_tx(&mut tx, &terminal, &before); tokio::pin!(future); tokio::select! { _ = entered.notified() => {}, _ = &mut future => panic!("compose completed") } }
         tx.commit().await.unwrap(); let mut check = store.pool().begin().await.unwrap(); assert_eq!(facts(&mut check).await, before); check.rollback().await.unwrap(); }
+    }
+
+    #[tokio::test]
+    async fn file_backed_terminal_commit_reopens_and_observes_original_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-commit.db");
+        let store = strict_facts_file(&path).await;
+        usable(&store).await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE legacy_recovery_holds SET reason_code='caller_owned_commit' WHERE run_id='run-strict'")
+            .execute(&mut *tx).await.unwrap();
+        let before = facts(&mut tx).await;
+        let lease = before.lease.clone().unwrap();
+        let history = read_run_lease_history_tx(&mut tx, &before.hold)
+            .await
+            .unwrap();
+        let terminal = composition(RunStatus::Cancelled, &before);
+        let expected_lease = terminal.lease().clone();
+        assert_eq!(
+            compose_terminal_tx(&mut tx, &terminal, &before)
+                .await
+                .unwrap(),
+            TerminalCompositionOutcome::Applied
+        );
+        tx.commit().await.unwrap();
+        store.pool().close().await;
+
+        let reopened = crate::Store::open(&path).await.unwrap();
+        let mut check = reopened.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let released = facts(&mut check).await;
+        let ended = terminal.terminal().ended_at().clone();
+        assert_eq!(released.run.run.status, RunStatus::Cancelled);
+        assert_eq!(released.hold.recovery_state(), RecoveryState::Released);
+        assert_eq!(released.hold.reason_code(), Some("caller_owned_commit"));
+        assert_eq!(released.hold.released_at(), Some(&ended));
+        assert_eq!(released.cohort.completed_at, Some(ended.clone()));
+        assert!(released.lease.is_none());
+        assert!(released.pending_approvals.is_empty());
+        let approval = released.hold_approval.as_ref().unwrap();
+        assert_eq!(approval.status, ApprovalStatus::Aborted);
+        assert_eq!(approval.decided_at.as_ref(), Some(&ended));
+        let mut expected_history = history;
+        expected_history[0].record.released_at = Some(ended.clone());
+        assert_eq!(
+            read_run_lease_history_tx(&mut check, &released.hold)
+                .await
+                .unwrap(),
+            expected_history
+        );
+        assert_eq!(expected_history[0].record.id, lease.record.id);
+        assert_eq!(
+            expected_history[0].record.released_at.as_ref(),
+            Some(&ended)
+        );
+        assert_eq!(terminal.lease(), &expected_lease);
+        assert_eq!(
+            compose_terminal_tx(&mut check, &terminal, &before)
+                .await
+                .unwrap(),
+            TerminalCompositionOutcome::Conflict
+        );
+        assert_eq!(
+            compose_terminal_tx(&mut check, &terminal, &released)
+                .await
+                .unwrap(),
+            TerminalCompositionOutcome::ObservedApplied
+        );
+        check.commit().await.unwrap();
+        let audit = reopened.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            (
+                audit[0].seq,
+                audit[0].ts.as_str(),
+                audit[0].actor.as_str(),
+                audit[0].action.as_str(),
+                audit[0].prev_hash.as_str()
+            ),
+            (
+                1,
+                ended.as_str(),
+                "legacy_recovery",
+                "legacy_recovery.cancelled",
+                crate::audit::GENESIS
+            )
+        );
+        assert_eq!(
+            audit[0].detail,
+            serde_json::json!({"run_id":"run-strict","cohort_id":"cohort-strict","workspace_id":"ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5","result_state":"cancelled"})
+        );
+        assert_eq!(audit[0].hash.len(), 64);
+        reopened.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_backed_terminal_rollback_restores_facts_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-rollback.db");
+        let store = strict_facts_file(&path).await;
+        usable(&store).await;
+        let mut initial_tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let original = facts(&mut initial_tx).await;
+        let original_history = read_run_lease_history_tx(&mut initial_tx, &original.hold)
+            .await
+            .unwrap();
+        initial_tx.rollback().await.unwrap();
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE legacy_recovery_holds SET reason_code='caller_owned_rollback' WHERE run_id='run-strict'")
+            .execute(&mut *tx).await.unwrap();
+        let before = facts(&mut tx).await;
+        let terminal = composition(RunStatus::Cancelled, &before);
+        let expected_lease = terminal.lease().clone();
+        assert_eq!(
+            compose_terminal_tx(&mut tx, &terminal, &before)
+                .await
+                .unwrap(),
+            TerminalCompositionOutcome::Applied
+        );
+        tx.rollback().await.unwrap();
+        store.pool().close().await;
+
+        let reopened = crate::Store::open(&path).await.unwrap();
+        let mut retry_tx = reopened.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let fresh = facts(&mut retry_tx).await;
+        assert_eq!(fresh, original);
+        assert_eq!(
+            read_run_lease_history_tx(&mut retry_tx, &fresh.hold)
+                .await
+                .unwrap(),
+            original_history
+        );
+        assert_eq!(terminal.lease(), &expected_lease);
+        assert_eq!(
+            compose_terminal_tx(&mut retry_tx, &terminal, &fresh)
+                .await
+                .unwrap(),
+            TerminalCompositionOutcome::Applied
+        );
+        retry_tx.commit().await.unwrap();
+        assert_eq!(reopened.list_audit().await.unwrap().len(), 1);
+        reopened.verify_audit_chain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_outer_commit_rolls_back_terminal_writes_on_its_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-commit-reject.db");
+        let store = strict_facts_file(&path).await;
+        usable(&store).await;
+        let mut baseline_tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let baseline = facts(&mut baseline_tx).await;
+        let history = read_run_lease_history_tx(&mut baseline_tx, &baseline.hold)
+            .await
+            .unwrap();
+        baseline_tx.rollback().await.unwrap();
+        let mut connection = store.pool().acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_commit_hook(|| false);
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE legacy_recovery_holds SET reason_code='caller_owned_reject' WHERE run_id='run-strict'")
+            .execute(&mut *tx).await.unwrap();
+        let before = facts(&mut tx).await;
+        let terminal = composition(RunStatus::Cancelled, &before);
+        let expected_lease = terminal.lease().clone();
+        assert_eq!(
+            compose_terminal_tx(&mut tx, &terminal, &before)
+                .await
+                .unwrap(),
+            TerminalCompositionOutcome::Applied
+        );
+        assert!(tx.commit().await.is_err());
+        drop(connection);
+        store.pool().close().await;
+
+        let reopened = crate::Store::open(&path).await.unwrap();
+        let mut retry_tx = reopened.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let fresh = facts(&mut retry_tx).await;
+        assert_eq!(fresh, baseline);
+        assert_eq!(
+            read_run_lease_history_tx(&mut retry_tx, &fresh.hold)
+                .await
+                .unwrap(),
+            history
+        );
+        assert!(reopened.list_audit().await.unwrap().is_empty());
+        assert_eq!(terminal.lease(), &expected_lease);
+        assert_eq!(
+            compose_terminal_tx(&mut retry_tx, &terminal, &fresh)
+                .await
+                .unwrap(),
+            TerminalCompositionOutcome::Applied
+        );
+        retry_tx.commit().await.unwrap();
+        assert_eq!(reopened.list_audit().await.unwrap().len(), 1);
+        reopened.verify_audit_chain().await.unwrap();
     }
 }
