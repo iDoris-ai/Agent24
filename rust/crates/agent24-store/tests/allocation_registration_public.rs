@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use agent24_protocol::WorkspaceId;
 use agent24_store::{
     AllocationId, AllocationIntent, LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store,
@@ -47,7 +49,7 @@ async fn public_registration_returns_a_redacted_committed_snapshot_on_reopen() {
     let path = dir.path().join("registration.sqlite");
     let store = Store::open(&path).await.unwrap();
     let (intent, input, owner, root) = inputs();
-    store.reserve_workspace_allocation(&intent).await.unwrap();
+    common::insert_reserved_allocation(&store, &intent).await;
     store
         .materialize_workspace_allocation(&intent, root)
         .await
