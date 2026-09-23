@@ -7,8 +7,8 @@
 - Git 分支：`feat/open-design-workspace`
 - 独立 worktree：`/Users/jason/Dev/auraai/Agent24-open-design-workspace`
 - 初始基线提交：`04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
-- 已审计 Agent24 主干至：`9ab5b6ee112e7e601758cb04c9aafac4c94680c7`
-- 状态：**P0、A24-OD-00 安全门禁与 P1 基线门禁均 PASS；P2 workspace contract 执行中**
+- 已审计 Agent24 主干至：`bb6f62bad5e75fdf64a375bb4acaec50f1230683`（#253 merge）
+- 状态：**P0、A24-OD-00 安全门禁与 P1 基线门禁均 PASS；P2 workspace contract 执行中；Wave 10 状态见 [STATUS.md](STATUS.md)**
 - 实时台账：[STATUS.md](STATUS.md)
 
 ## 文档

@@ -77,9 +77,14 @@ Luna 不独立改变已冻结架构。发现规格缺口时必须停止该工作
 - 对应依赖 ID；
 - 失败、阻塞和回滚说明。
 
-提交与 PR 以单一、可独立审查的功能切片为边界：默认目标不超过 190 个变更行，
-并尽量确保每个 PR 不超过 200 个变更行。达到上限时必须先按功能或测试职责拆分，
-不得积攒成千行级 PR；只有不可分割的生成物或机械变更可以例外，并须在 PR 中说明。
+提交与 PR 以单一、可独立审查的功能切片为边界：日常目标为 200–300 个变更行，
+500 个变更行为硬上限。只有不可合理拆分的原子事务、状态机，或实现与其必要负向测试
+必须共同审查时，才可使用 301–500 行；此类 PR 必须经过两次独立 SOL exact-head review，
+并在正文写清不可拆原因、排除范围和回退点。超过 500 行必须拆分，禁止用无关改动凑批次。
+
+外部 PR review 队列较长时，默认每 3 小时做一次完整 scoped 状态核对；不再用 15 分钟
+轮询占用开发时段。CI 主动失败、external `REQUEST_CHANGES` 或明确 approval 通知可提前触发
+一次核对；合并仍必须同时满足 exact head、external `APPROVED`、检查全绿和依赖就绪。
 
 ## 5. 阶段门禁
 
@@ -133,12 +138,12 @@ Luna 不独立改变已冻结架构。发现规格缺口时必须停止该工作
 
 ## 8. 当前启动状态
 
-截至 2026-09-19：
+启动历史（2026-09-19；当前门禁见 [STATUS.md](STATUS.md)）：
 
 - 计划已获用户批准并开始执行；
-- integration branch 已审计到 `origin/main@69baf50`；
+- initial audit baseline was `origin/main@69baf50`; latest audited main is recorded in [AGENT24-DEPENDENCIES.md](AGENT24-DEPENDENCIES.md);
 - P0 初审发现 single-bearer authority blocker，用户批准 capability 分层方案，最终 SOL Gate 已 `PASS`；
 - 用户要求 capability security layer 完成并通过门禁后再继续其他实现；
-- 尚未创建计划中的实现分支；
-- 尚未创建 Open Design 远端 fork；
-- 下一步是创建并实现 `feat/a24-capability-auth`。
+- 当时尚未创建计划中的实现分支；
+- 当时尚未创建 Open Design 远端 fork；
+- 当时下一步是创建并实现 `feat/a24-capability-auth`。

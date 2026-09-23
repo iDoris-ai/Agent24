@@ -124,7 +124,7 @@ executable、cwd、env、token 或 raw frame sentinel。
 结构/限额测试可在 Unix 跑；Windows key 等价必须由真实 Windows CI 验证，ASCII mock
 不能代替平台门禁。
 
-## 8. `<=200` 行实现切片
+## 8. 按执行门禁拆分实现切片
 
 1. DecodeContext + TextSeed/RejectSeed 与字符串边界；
 2. FieldSeed/KindSeed 与 escaped/unknown key；

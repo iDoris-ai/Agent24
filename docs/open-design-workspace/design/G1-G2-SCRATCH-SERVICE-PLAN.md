@@ -150,7 +150,7 @@ generation 和 durable entitlement 由后续 G5/G10 接线提供，因此本 cor
 严格顺序：journal/internal snapshot -> Unix/Windows pinned primitive -> root service ->
 host admission/lease -> exact resolve -> aggregate SOL review。
 
-实现继续按单一 invariant 拆分，每 PR changed lines `<=200`：crate skeleton、journal
+实现继续按单一 invariant 和 [执行门禁](../EXECUTION.md) 拆分：crate skeleton、journal
 migration/decoder/transactions、CREATE transaction helper、Unix primitive/tests、Windows
 platform gate、service state machine/crash tests、root snapshot/admission、host acquire/renew/
 release/recovery、resolve normalization/admission、pure auth guard、aggregate regression。
