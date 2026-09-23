@@ -293,8 +293,23 @@ impl crate::domain::ModelInventory for ModelCatalog {
     }
 }
 
-/// Adapts the run manager to the scheduler's `RunTrigger` — a fired schedule
+/// Adapts the run manager to the scheduler's `RunTrigger` (design
+/// `docs/design/ME4-S1-scheduler-callback.md` §3.3) — a fired schedule
 /// becomes a background run tagged with the schedule id.
+///
+/// ME4-1.2.2b2 (this cut) is forced to make this mechanical update the
+/// moment `agent24-scheduler` swaps `Scheduler` onto the new trait — Rust
+/// compiles a workspace atomically, so the crate that changes a public trait
+/// signature and the crate that implements it cannot land in different
+/// commits without breaking the build in between. The `AgentRun` arm is the
+/// OLD body, byte-identical, wrapped to classify into `FireOutcome`
+/// (`Ok(run_id)` -> `AgentRun`, `Err(e)` -> `Failed`). The `Module` arm is a
+/// stub: ME4-1.2.2b3 gives `agent24-scheduler` a module-row tick branch (so
+/// this arm becomes reachable), and ME4-1.3.1 wires a real `ModuleDeliverer`
+/// behind it; until then every module fire is answered `Deferred
+/// (MountPending)` — never a failure (§4.1: none of `DeferReason`'s variants
+/// are the module's fault). ME4-1.2.2b (the top-level cut) renames this
+/// struct to `KernelTrigger` once that module-row support is complete.
 struct RunManagerTrigger {
     runs: Arc<agent24_agent::RunManager>,
 }
@@ -303,27 +318,41 @@ struct RunManagerTrigger {
 impl agent24_scheduler::RunTrigger for RunManagerTrigger {
     async fn trigger(
         &self,
-        action: &agent24_protocol::ScheduleAction,
-        schedule_id: &str,
-    ) -> Result<String, String> {
-        let agent24_protocol::ScheduleAction::AgentRun {
-            prompt,
-            session_id,
-            model_override,
-        } = action;
-        let create = agent24_protocol::RunCreate {
-            session_id: session_id.clone(),
-            prompt: prompt.clone(),
-            model_override: model_override.clone(),
-            // Scheduled runs are unattended — plan mode needs a human to approve
-            // the plan, so a fired schedule always runs Normal.
-            mode: agent24_protocol::RunMode::Normal,
-        };
-        self.runs
-            .start_run_with_schedule(create, Some(schedule_id.to_owned()))
-            .await
-            .map(|run| run.id)
-            .map_err(|err| err.to_string())
+        invocation: &agent24_scheduler::ScheduleInvocation,
+    ) -> agent24_scheduler::FireOutcome {
+        match &invocation.target {
+            agent24_scheduler::InvocationTarget::AgentRun(action) => {
+                let agent24_protocol::ScheduleAction::AgentRun {
+                    prompt,
+                    session_id,
+                    model_override,
+                } = action;
+                let create = agent24_protocol::RunCreate {
+                    session_id: session_id.clone(),
+                    prompt: prompt.clone(),
+                    model_override: model_override.clone(),
+                    // Scheduled runs are unattended — plan mode needs a human
+                    // to approve the plan, so a fired schedule always runs
+                    // Normal.
+                    mode: agent24_protocol::RunMode::Normal,
+                };
+                match self
+                    .runs
+                    .start_run_with_schedule(create, Some(invocation.schedule_id.clone()))
+                    .await
+                {
+                    Ok(run) => agent24_scheduler::FireOutcome::AgentRun { run_id: run.id },
+                    Err(err) => agent24_scheduler::FireOutcome::Failed {
+                        reason: err.to_string(),
+                    },
+                }
+            }
+            agent24_scheduler::InvocationTarget::Module { .. } => {
+                agent24_scheduler::FireOutcome::Deferred {
+                    reason: agent24_scheduler::DeferReason::MountPending,
+                }
+            }
+        }
     }
 }
 

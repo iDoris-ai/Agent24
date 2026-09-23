@@ -106,10 +106,24 @@ pub async fn delete_schedule(State(state): State<AppState>, Path(id): Path<Strin
 }
 
 pub async fn run_now(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.scheduler.run_now(&id).await {
-        Ok(run_id) => (
+    // ME4-1.2.2b2: `Scheduler::run_now` now answers with the design's
+    // `RunNowOutcome` (§4.7) instead of a bare `run_id` string — forced by
+    // the same trait-signature swap that touched `server.rs`'s trigger
+    // adapter (Rust compiles a workspace atomically). The `Run` arm is
+    // byte-identical to before (still `202 {"run_id"}`); the `Fire` arm (a
+    // module row) is not reachable yet — `Scheduler::run_now`'s module
+    // branch still errors out until ME4-1.2.2b3 — but the match must be
+    // exhaustive, so it is wired to its final §4.7 shape now rather than
+    // left to panic.
+    match state.scheduler.run_now(&id, Utc::now()).await {
+        Ok(agent24_scheduler::RunNowOutcome::Run { run_id }) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "run_id": run_id })),
+        )
+            .into_response(),
+        Ok(agent24_scheduler::RunNowOutcome::Fire { fire_id }) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "fire_id": fire_id.as_str() })),
         )
             .into_response(),
         Err(err) => map_error(err),
