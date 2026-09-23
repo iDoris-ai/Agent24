@@ -399,6 +399,27 @@ pub(crate) async fn read_hold_tx(
     Ok(hold)
 }
 
+/// Reads the oldest persisted Ready hold under a caller-owned transaction.
+/// Selection is deterministic and decoding is intentionally fail-closed: a
+/// corrupt first candidate is returned as an error instead of being skipped.
+#[allow(dead_code)]
+pub(crate) async fn read_next_ready_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> WorkspaceResult<Option<LegacyRecoveryHold>> {
+    let row = sqlx::query(
+        "SELECT run_id,cohort_id,workspace_id,root_generation,original_status,
+         recovery_state,approval_id,ready_at,reason_code,released_at,active_resume_approval_id
+         FROM legacy_recovery_holds
+         WHERE recovery_state = 'ready'
+           AND recovery_state COLLATE BINARY = 'ready' COLLATE BINARY
+         ORDER BY ready_at COLLATE BINARY ASC, run_id COLLATE BINARY ASC LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    row.map(LegacyRecoveryHold::decode).transpose()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryDecisionEffect {
     Unchanged,
@@ -582,7 +603,7 @@ pub(crate) async fn apply_ready_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::SqlitePool;
+    use sqlx::{Row, SqlitePool};
 
     #[allow(clippy::unwrap_used)]
     async fn strict_facts_fixture() -> Store {
@@ -1792,5 +1813,313 @@ mod tests {
         reject!("released_at", "released", none, none, none, none, none);
         reject!("released_at", "ready", Some("a"), ts, none, ts, none);
         reject!(marker, "ready", Some("a"), ts, none, none, Some("a"));
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::unwrap_used)]
+    async fn insert_reader_hold(
+        store: &Store,
+        run_id: &str,
+        approval_id: Option<&str>,
+        state: &str,
+        ready_at: Option<&str>,
+        reason_code: Option<&str>,
+        released_at: Option<&str>,
+        active_resume_approval_id: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO runs (id,status,input,usage,created_at,workspace_id)
+             VALUES (?,'running','{}','{}','2026-09-19T00:00:00.000Z',
+                     'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5')",
+        )
+        .bind(run_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        if let Some(approval_id) = approval_id {
+            sqlx::query(
+                "INSERT INTO approvals
+                 (id,run_id,tool_call_id,kind,summary,payload,available_decisions,status,
+                  expires_at,created_at,workspace_id)
+                 VALUES (? ,?,'tool','exec','test','{}','[]','pending',
+                         '2026-09-20T00:00:00.000Z','2026-09-19T00:00:00.000Z',
+                         'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5')",
+            )
+            .bind(approval_id)
+            .bind(run_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO legacy_recovery_holds
+             (run_id,cohort_id,workspace_id,root_generation,original_status,recovery_state,
+              approval_id,ready_at,reason_code,released_at,active_resume_approval_id)
+             VALUES (?,'cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','running',
+                     ?,?,?,?,?,?)",
+        )
+        .bind(run_id)
+        .bind(state)
+        .bind(approval_id)
+        .bind(ready_at)
+        .bind(reason_code)
+        .bind(released_at)
+        .bind(active_resume_approval_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn read_next_ready_tx_returns_none_for_empty_and_non_ready_states() {
+        let store = strict_facts_fixture().await;
+        execute(&store, "DELETE FROM legacy_recovery_holds").await;
+        insert_reader_hold(
+            &store,
+            "run-awaiting",
+            Some("approval-awaiting"),
+            "awaiting_decision",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_reader_hold(
+            &store,
+            "run-active",
+            Some("approval-active"),
+            "active",
+            None,
+            None,
+            None,
+            Some("approval-active"),
+        )
+        .await;
+        insert_reader_hold(
+            &store,
+            "run-attention",
+            None,
+            "needs_attention",
+            None,
+            Some("repair_needed"),
+            None,
+            None,
+        )
+        .await;
+        insert_reader_hold(
+            &store,
+            "run-released",
+            None,
+            "released",
+            None,
+            None,
+            Some("2026-09-20T00:00:00.000Z"),
+            None,
+        )
+        .await;
+        let mut tx = store.pool().begin().await.unwrap();
+        assert_eq!(read_next_ready_tx(&mut tx).await.unwrap(), None);
+        tx.rollback().await.unwrap();
+        execute(&store, "DELETE FROM legacy_recovery_holds").await;
+        let mut tx = store.pool().begin().await.unwrap();
+        assert_eq!(read_next_ready_tx(&mut tx).await.unwrap(), None);
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn read_next_ready_tx_orders_timestamp_then_binary_run_id() {
+        let store = strict_facts_fixture().await;
+        execute(&store, "DELETE FROM legacy_recovery_holds").await;
+        insert_reader_hold(
+            &store,
+            "run-z",
+            Some("approval-z"),
+            "ready",
+            Some("2026-09-20T00:00:00.124Z"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_reader_hold(
+            &store,
+            "run-a",
+            Some("approval-a"),
+            "ready",
+            Some("2026-09-20T00:00:00.123Z"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_reader_hold(
+            &store,
+            "run-A",
+            Some("approval-A"),
+            "ready",
+            Some("2026-09-20T00:00:00.123Z"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        let mut tx = store.pool().begin().await.unwrap();
+        let hold = read_next_ready_tx(&mut tx).await.unwrap().unwrap();
+        assert_eq!(hold.run_id(), "run-A");
+        assert_eq!(
+            hold.ready_at().unwrap().as_str(),
+            "2026-09-20T00:00:00.123Z"
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn read_next_ready_tx_uses_ready_index_without_temp_sort() {
+        let store = strict_facts_fixture().await;
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             SELECT run_id,cohort_id,workspace_id,root_generation,original_status,
+                    recovery_state,approval_id,ready_at,reason_code,released_at,
+                    active_resume_approval_id
+             FROM legacy_recovery_holds
+             WHERE recovery_state = 'ready'
+               AND recovery_state COLLATE BINARY = 'ready' COLLATE BINARY
+             ORDER BY ready_at COLLATE BINARY ASC, run_id COLLATE BINARY ASC LIMIT 1",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("detail").unwrap())
+        .collect::<Vec<_>>();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("USING INDEX idx_legacy_recovery_ready")),
+            "unexpected query plan: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "unexpected temporary sort: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn read_next_ready_tx_fails_closed_on_corrupt_first_candidate() {
+        let store = strict_facts_fixture().await;
+        execute(&store, "DELETE FROM legacy_recovery_holds").await;
+        insert_reader_hold(
+            &store,
+            "run-first",
+            Some("approval-first"),
+            "ready",
+            Some("2026-09-20T00:00:00.123Z"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_reader_hold(
+            &store,
+            "run-second",
+            Some("approval-second"),
+            "ready",
+            Some("2026-09-20T00:00:00.124Z"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        execute(
+            &store,
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE legacy_recovery_holds SET original_status='corrupt' WHERE run_id='run-first';
+             PRAGMA ignore_check_constraints=OFF",
+        )
+        .await;
+        let mut tx = store.pool().begin().await.unwrap();
+        assert_eq!(
+            read_next_ready_tx(&mut tx).await,
+            Err(WorkspaceStoreError::CorruptRow {
+                table: "legacy_recovery_holds",
+                field: "original_status",
+            })
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn read_next_ready_tx_maps_sql_errors_to_database() {
+        let store = strict_facts_fixture().await;
+        execute(&store, "DROP TABLE legacy_recovery_holds").await;
+        let mut tx = store.pool().begin().await.unwrap();
+        assert_eq!(
+            read_next_ready_tx(&mut tx).await,
+            Err(WorkspaceStoreError::Database)
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn read_next_ready_tx_is_read_only_even_with_write_blocking_triggers() {
+        let store = strict_facts_fixture().await;
+        execute(
+            &store,
+            "UPDATE legacy_recovery_holds SET recovery_state='ready',
+                    ready_at='2026-09-20T00:00:00.123Z'",
+        )
+        .await;
+        let before: i64 = changes(&store).await;
+        execute(
+            &store,
+            "CREATE TRIGGER reader_block_insert BEFORE INSERT ON legacy_recovery_holds
+             BEGIN SELECT RAISE(ABORT, 'reader is read only'); END;
+             CREATE TRIGGER reader_block_update BEFORE UPDATE ON legacy_recovery_holds
+             BEGIN SELECT RAISE(ABORT, 'reader is read only'); END;
+             CREATE TRIGGER reader_block_delete BEFORE DELETE ON legacy_recovery_holds
+             BEGIN SELECT RAISE(ABORT, 'reader is read only'); END",
+        )
+        .await;
+        let mut tx = store.pool().begin().await.unwrap();
+        assert_eq!(
+            read_next_ready_tx(&mut tx).await.unwrap().unwrap().run_id(),
+            "run-strict"
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(changes(&store).await, before);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn read_next_ready_tx_leaves_transaction_ownership_to_caller() {
+        let store = strict_facts_fixture().await;
+        execute(
+            &store,
+            "UPDATE legacy_recovery_holds SET recovery_state='ready',
+                    ready_at='2026-09-20T00:00:00.123Z'",
+        )
+        .await;
+        let mut tx = store.pool().begin().await.unwrap();
+        assert!(read_next_ready_tx(&mut tx).await.unwrap().is_some());
+        sqlx::query(
+            "UPDATE legacy_recovery_holds SET reason_code='caller_only'
+             WHERE run_id='run-strict'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT reason_code FROM legacy_recovery_holds WHERE run_id='run-strict'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(reason.as_deref(), Some("legacy_reason"));
     }
 }
