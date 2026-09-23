@@ -81,6 +81,24 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 外部 reviewer 预计处理当前百余 PR 需要较长时间；按 owner 最新指令，完整 PR 状态轮询
   从每 15 分钟降为每 3 小时，期间优先继续实现与开小型、可审查 PR。
 
+## 2026-09-23 Wave 6 收口
+
+- #426 以 407 changed lines 完成 bounded request decode：文本与集合在 owned copy 前受限，
+  duplicate/native-equivalent env key 与失败后的 sequence mutation 均被拒绝。macOS CI 两次命中
+  已有 global reaper 的 2 秒测试窗口，测试专用窗口改为 10 秒后 Ubuntu/macOS/Windows 全绿，
+  两份 SOL exact-head review 均 `PASS`。
+- #427 以 499 changed lines 实现 dormant Reserved→Materialized 原子事务：写前 ownership 冲突
+  保留 typed `Conflict`，任何写后异常静态化为 `Database` 并整体回滚；157 个 store 测试和两份
+  独立 SOL exact-diff review 通过。它不操作文件系统，也不开放 runtime 调用。
+- #428 以 273 changed lines 组合 `ControlReader + RequestSequence + ingress state`；首个 framing、
+  I/O、protocol 或 sequence 错误只报告一次，之后永久 `Closed` 且不再读取。Windows 首轮 CI
+  揭示测试夹具用了 Unix 路径；改为 native absolute path 后三平台 CI 与新 exact-head SOL 全绿。
+- 下一批边界已经冻结但尚未开工：G1 先补 materialization 对抗测试再做 commit core；G4 只做
+  crate-private Ready→Active DB admission，禁止 runtime wiring；G8 依次做 controlled pipe access、
+  graceful stdin close、blocking I/O deadline 与最后的 actor wiring。
+- 本轮在三个实现 PR、门禁证据和本地 PR-program 快照都收口后按 owner 指令暂停；恢复后外部
+  review 仍按 3 小时 cadence 观察，并从这里继续，暂停期间不启动新的大事务切片。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
