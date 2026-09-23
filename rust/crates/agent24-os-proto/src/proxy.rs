@@ -522,7 +522,7 @@ impl Drop for UpstreamConnection {
 /// short requests from closing one socket each into TIME_WAIT (round 2);
 /// keying it by generation rather than by address keeps a connection from
 /// ever serving a later run (FU-50).
-struct Upstream {
+pub(crate) struct Upstream {
     generation: Arc<Generation>,
     sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
     /// In the pool, waiting: what a revocation ends the driver for.
@@ -636,7 +636,7 @@ fn idle_max_age_from_process_env() -> Duration {
 }
 
 /// A module proxy's idle connections, each to the generation it was opened for.
-struct IdleConnections {
+pub(crate) struct IdleConnections {
     connections: std::sync::Mutex<Vec<Upstream>>,
     /// (FU-64 §B) A connection idle longer than this is treated as already
     /// dead on `take()` and dropped without being tried — best-effort, not a
@@ -712,7 +712,7 @@ impl IdleConnections {
 /// freshly-connected `send_request` can fail just as ambiguously as a reused
 /// one, once its handshake has completed.
 #[derive(Debug)]
-enum ExchangeError {
+pub(crate) enum ExchangeError {
     /// This attempt is certain never to have reached the module: either a
     /// reused connection told hyper so before any bytes went out (already
     /// retried on a fresh connection inside `exchange`, and that retry also
@@ -742,7 +742,7 @@ impl std::fmt::Display for ExchangeError {
 /// with `tokio::select!` against `ready.notified()` knows `exchange` is
 /// truly parked — not just that a `Notify::notify_one()` landed early and
 /// was banked for later. Only ever constructed inside `#[cfg(test)]`.
-struct TakeSendGate<'a> {
+pub(crate) struct TakeSendGate<'a> {
     ready: &'a tokio::sync::Notify,
     proceed: &'a tokio::sync::Notify,
 }
@@ -759,7 +759,7 @@ struct TakeSendGate<'a> {
 /// the request may have been sent and acted on, so `exchange` itself never
 /// sends it again — that decision belongs to the caller (FU-64).
 /// Returns the response head and the connection that carries its body.
-async fn exchange(
+pub(crate) async fn exchange(
     idle: &IdleConnections,
     generation: &Arc<Generation>,
     path: &Path,
@@ -922,7 +922,7 @@ fn short_prefix() -> String {
 /// `launch::mint_token` already applies to the handshake token. Returns
 /// `None` when the system entropy source cannot be read; the caller fails
 /// just this one request rather than admitting it with a predictable token.
-fn mint_approval_token() -> Option<String> {
+pub(crate) fn mint_approval_token() -> Option<String> {
     use std::io::Read;
     let mut bytes = [0u8; 32];
     std::fs::File::open("/dev/urandom")
