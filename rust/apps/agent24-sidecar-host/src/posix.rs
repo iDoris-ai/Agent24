@@ -693,7 +693,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn wait_for_reaper_idle() {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // macOS CI can retain an exited process group for several seconds
+        // before the background reaper can observe that it is empty.
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match global_reaper().reserve() {
                 Ok(permit) => {
