@@ -418,6 +418,8 @@ mod tests {
     use super::*;
     use crate::legacy_recovery::tests::{strict_facts_file, strict_facts_fixture};
     use sqlx::Connection;
+    use std::{path::Path, sync::Arc, time::Duration};
+    use tokio::sync::Barrier;
     #[rustfmt::skip] async fn facts(tx: &mut Transaction<'_, Sqlite>) -> TerminalReleaseSnapshot { snapshot_tx(tx, "run-strict").await.unwrap() }
     #[rustfmt::skip] fn attempt(status: RunStatus) -> TerminalAttempt { TerminalAttempt::new(status, WorkspaceInstant::parse("2026-09-19T00:00:01.000Z").unwrap()) }
     #[rustfmt::skip]
@@ -670,5 +672,268 @@ mod tests {
         retry_tx.commit().await.unwrap();
         assert_eq!(reopened.list_audit().await.unwrap().len(), 1);
         reopened.verify_audit_chain().await.unwrap();
+    }
+
+    #[derive(Debug)]
+    struct WalContender {
+        attempt: TerminalAttempt,
+        outcome: TerminalCompositionOutcome,
+        snapshot: TerminalReleaseSnapshot,
+    }
+
+    async fn wal_contender(
+        store: crate::Store,
+        barrier: Arc<Barrier>,
+        attempt: TerminalAttempt,
+        expected_lease: ExpectedLease,
+    ) -> WalContender {
+        // The gate is deliberately before the caller-owned write transaction.
+        barrier.wait().await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        // This write belongs to the caller, not compose_terminal_tx's savepoint.
+        sqlx::query(
+            "UPDATE workspaces SET revision=revision+1 WHERE id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        // Read only after BEGIN IMMEDIATE has acquired the WAL writer lock.
+        let snapshot = facts(&mut tx).await;
+        let outcome = compose_terminal_tx(
+            &mut tx,
+            &CompositionAttempt::new(attempt.clone(), expected_lease),
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        WalContender {
+            attempt,
+            outcome,
+            snapshot,
+        }
+    }
+
+    async fn seeded_terminal_wal_file(
+        path: &Path,
+    ) -> (TerminalReleaseSnapshot, Vec<WorkspaceLeaseRow>) {
+        let seed = strict_facts_file(path).await;
+        usable(&seed).await;
+        // Preserve an already-released owner lease so the race proves history is
+        // retained, rather than merely checking the one live lease disappears.
+        sqlx::query(
+            "INSERT INTO workspace_leases
+             (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at)
+             VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7',
+                     'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','run-strict','run',
+                     '2026-09-19T00:00:00.000Z','2026-09-19T00:00:00.000Z')",
+        )
+        .execute(seed.pool())
+        .await
+        .unwrap();
+        let mut tx = seed.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let snapshot = facts(&mut tx).await;
+        let history = read_run_lease_history_tx(&mut tx, &snapshot.hold)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        seed.pool().close().await;
+        (snapshot, history)
+    }
+
+    async fn run_terminal_wal_race(
+        path: &Path,
+        attempts: [TerminalAttempt; 2],
+    ) -> (
+        TerminalReleaseSnapshot,
+        Vec<WorkspaceLeaseRow>,
+        [WalContender; 2],
+    ) {
+        let (baseline, history) = seeded_terminal_wal_file(path).await;
+        // The attempt's lease precondition is immutable caller input, not a
+        // value reconstructed from either contender's post-lock validation read.
+        let expected_lease = baseline.lease.clone().map_or(ExpectedLease::None, |lease| {
+            ExpectedLease::Exact(Box::new(lease))
+        });
+        // These are independently opened pools/connections over the same WAL file.
+        let left = crate::Store::open(path).await.unwrap();
+        let right = crate::Store::open(path).await.unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let (left_result, right_result) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                wal_contender(
+                    left.clone(),
+                    Arc::clone(&barrier),
+                    attempts[0].clone(),
+                    expected_lease.clone(),
+                ),
+                wal_contender(
+                    right.clone(),
+                    Arc::clone(&barrier),
+                    attempts[1].clone(),
+                    expected_lease.clone(),
+                ),
+            )
+        })
+        .await
+        .unwrap();
+        left.pool().close().await;
+        right.pool().close().await;
+        (baseline, history, [left_result, right_result])
+    }
+
+    fn expected_terminal_audit(
+        hold: &LegacyRecoveryHold,
+        attempt: &TerminalAttempt,
+    ) -> TerminalAuditFacts {
+        let (action, raw_detail) = audit_parts(hold, attempt).unwrap();
+        TerminalAuditFacts {
+            seq: 1,
+            ts: attempt.ended_at().clone(),
+            actor: "legacy_recovery".into(),
+            prev_hash: crate::audit::GENESIS.into(),
+            hash: crate::audit::entry_hash(
+                crate::audit::GENESIS,
+                attempt.ended_at().as_str(),
+                "legacy_recovery",
+                &action,
+                &raw_detail,
+            ),
+            action,
+            raw_detail,
+        }
+    }
+
+    async fn assert_reopened_terminal_race_facts(
+        path: &Path,
+        baseline: &TerminalReleaseSnapshot,
+        history: &[WorkspaceLeaseRow],
+        attempt: &TerminalAttempt,
+    ) {
+        let reopened = crate::Store::open(path).await.unwrap();
+        let mut check = reopened.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let actual = facts(&mut check).await;
+        let audit = expected_terminal_audit(&baseline.hold, attempt);
+        let mut expected = baseline.clone();
+        expected.workspace.revision += 2; // both caller-owned commits persisted
+        expected.run.run.status = attempt.result();
+        expected.run.run.ended_at = Some(attempt.ended_at().as_str().to_owned());
+        expected.hold.recovery_state = RecoveryState::Released;
+        expected.hold.ready_at = None;
+        expected.hold.active_resume_approval_id = None;
+        expected.hold.released_at = Some(attempt.ended_at().clone());
+        expected.hold_approval.as_mut().unwrap().status = ApprovalStatus::Aborted;
+        expected.hold_approval.as_mut().unwrap().decision = None;
+        expected.hold_approval.as_mut().unwrap().decided_at = Some(attempt.ended_at().clone());
+        expected.pending_approvals.clear();
+        expected.cohort.completed_at = Some(attempt.ended_at().clone());
+        expected.lease = None;
+        expected.latest_audit = Some(audit.clone());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            read_all_approvals_tx(&mut check, "run-strict")
+                .await
+                .unwrap(),
+            vec![expected.hold_approval.clone().unwrap()]
+        );
+        let mut expected_history = history.to_vec();
+        expected_history
+            .iter_mut()
+            .find(|lease| lease.record.released_at.is_none())
+            .unwrap()
+            .record
+            .released_at = Some(attempt.ended_at().clone());
+        assert_eq!(
+            read_run_lease_history_tx(&mut check, &actual.hold)
+                .await
+                .unwrap(),
+            expected_history
+        );
+        check.commit().await.unwrap();
+        assert_eq!(reopened.list_audit().await.unwrap().len(), 1);
+        reopened.verify_audit_chain().await.unwrap();
+    }
+
+    fn assert_fresh_wal_snapshots(contenders: &[WalContender; 2]) {
+        assert_eq!(
+            contenders
+                .iter()
+                .filter(|contender| contender.snapshot.run.run.status == RunStatus::Running)
+                .count(),
+            1
+        );
+        assert_eq!(
+            contenders
+                .iter()
+                .filter(
+                    |contender| contender.snapshot.hold.recovery_state() == RecoveryState::Released
+                )
+                .count(),
+            1
+        );
+        let mut revisions = contenders
+            .iter()
+            .map(|contender| contender.snapshot.workspace.revision)
+            .collect::<Vec<_>>();
+        revisions.sort_unstable();
+        assert_eq!(revisions, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn file_backed_wal_identical_terminal_attempt_applies_once_and_observes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-identical-wal.db");
+        let attempt = attempt(RunStatus::Cancelled);
+        let (baseline, history, contenders) =
+            run_terminal_wal_race(&path, [attempt.clone(), attempt.clone()]).await;
+        assert_eq!(
+            contenders
+                .iter()
+                .filter(|contender| contender.outcome == TerminalCompositionOutcome::Applied)
+                .count(),
+            1
+        );
+        assert_eq!(
+            contenders
+                .iter()
+                .filter(|contender| contender.outcome == TerminalCompositionOutcome::ObservedApplied)
+                .count(),
+            1
+        );
+        assert_fresh_wal_snapshots(&contenders);
+        assert_reopened_terminal_race_facts(&path, &baseline, &history, &attempt).await;
+    }
+
+    #[tokio::test]
+    async fn file_backed_wal_different_terminal_timestamps_apply_once_and_conflict_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-different-wal.db");
+        let first = attempt(RunStatus::Cancelled);
+        let second = TerminalAttempt::new(
+            RunStatus::Cancelled,
+            WorkspaceInstant::parse("2026-09-19T00:00:02.000Z").unwrap(),
+        );
+        let (baseline, history, contenders) =
+            run_terminal_wal_race(&path, [first.clone(), second.clone()]).await;
+        assert_eq!(
+            contenders
+                .iter()
+                .filter(|contender| contender.outcome == TerminalCompositionOutcome::Applied)
+                .count(),
+            1
+        );
+        assert_eq!(
+            contenders
+                .iter()
+                .filter(|contender| contender.outcome == TerminalCompositionOutcome::Conflict)
+                .count(),
+            1
+        );
+        assert_fresh_wal_snapshots(&contenders);
+        let winner = contenders
+            .iter()
+            .find(|contender| contender.outcome == TerminalCompositionOutcome::Applied)
+            .unwrap();
+        assert_reopened_terminal_race_facts(&path, &baseline, &history, &winner.attempt).await;
     }
 }
