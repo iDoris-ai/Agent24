@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unwrap_used,
+    reason = "fixed capability test fixtures intentionally panic on impossible setup failures"
+)]
+
 use super::*;
 use std::time::Duration;
 
