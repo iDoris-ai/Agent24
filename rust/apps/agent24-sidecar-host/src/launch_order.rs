@@ -25,27 +25,27 @@ impl LaunchIdentity for OwnedLaunch {
 }
 
 pub(crate) trait FrameSink {
-    fn put(&mut self, frame: Vec<u8>) -> Result<(), PutFrameError>;
-    fn step(&mut self) -> Result<WriteStep, OutputWriteError>;
+    fn put(&mut self, frame: Vec<u8>, now: Instant) -> Result<(), PutFrameError>;
+    fn step(&mut self, now: Instant) -> Result<WriteStep, OutputWriteError>;
 }
 
 impl<W: Write> FrameSink for OutputWriter<W> {
-    fn put(&mut self, frame: Vec<u8>) -> Result<(), PutFrameError> {
+    fn put(&mut self, frame: Vec<u8>, _now: Instant) -> Result<(), PutFrameError> {
         OutputWriter::put(self, frame)
     }
 
-    fn step(&mut self) -> Result<WriteStep, OutputWriteError> {
+    fn step(&mut self, _now: Instant) -> Result<WriteStep, OutputWriteError> {
         OutputWriter::write_step(self)
     }
 }
 
 impl FrameSink for crate::output_worker::OutputWorker {
-    fn put(&mut self, frame: Vec<u8>) -> Result<(), PutFrameError> {
-        crate::output_worker::OutputWorker::put(self, frame)
+    fn put(&mut self, frame: Vec<u8>, now: Instant) -> Result<(), PutFrameError> {
+        crate::output_worker::OutputWorker::put(self, frame, now)
     }
 
-    fn step(&mut self) -> Result<WriteStep, OutputWriteError> {
-        crate::output_worker::OutputWorker::step(self)
+    fn step(&mut self, now: Instant) -> Result<WriteStep, OutputWriteError> {
+        crate::output_worker::OutputWorker::step(self, now)
     }
 }
 
@@ -77,7 +77,7 @@ impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
         }
     }
 
-    pub(crate) fn queue_owned(&mut self) -> Result<(), LaunchOrderStage> {
+    pub(crate) fn queue_owned(&mut self, now: Instant) -> Result<(), LaunchOrderStage> {
         if self.stage != LaunchOrderStage::Contained {
             return self.fail();
         }
@@ -89,23 +89,27 @@ impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
             Ok(frame) => frame,
             Err(_) => return self.fail(),
         };
-        if self.sink.put(frame).is_err() {
+        if self.sink.put(frame, now).is_err() {
             return self.fail();
         }
         self.stage = LaunchOrderStage::OwnedPending;
         Ok(())
     }
 
-    pub(crate) fn output_step(&mut self) -> Result<WriteStep, LaunchOrderStage> {
+    pub(crate) fn output_step(&mut self, now: Instant) -> Result<WriteStep, LaunchOrderStage> {
         if self.stage != LaunchOrderStage::OwnedPending {
             return self.fail();
         }
-        match self.sink.step() {
+        match self.sink.step(now) {
             Ok(WriteStep::Pending) => Ok(WriteStep::Pending),
             Ok(WriteStep::Complete) => {
                 self.stage = LaunchOrderStage::AwaitReady;
                 Ok(WriteStep::Complete)
             }
+            // An output deadline flows to ActorLaunchOrder::fail_force(now).
+            // Do not discard an already parsed READY while that transition
+            // retains the same launch owner for cleanup.
+            Err(OutputWriteError::Io(io::ErrorKind::TimedOut)) => self.fail_preserving_ready(),
             Ok(WriteStep::Idle) | Err(_) => self.fail(),
         }
     }
@@ -156,6 +160,11 @@ impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
     fn fail<T>(&mut self) -> Result<T, LaunchOrderStage> {
         self.stage = LaunchOrderStage::CleanupRequired;
         self.held_ready = None;
+        Err(LaunchOrderStage::CleanupRequired)
+    }
+
+    fn fail_preserving_ready<T>(&mut self) -> Result<T, LaunchOrderStage> {
+        self.stage = LaunchOrderStage::CleanupRequired;
         Err(LaunchOrderStage::CleanupRequired)
     }
 }
@@ -232,7 +241,9 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             Ok(next @ Phase::AwaitReady(_)) => next,
             _ => return Err(self.fail_force(now)),
         };
-        self.order.queue_owned().map_err(|_| self.fail_force(now))
+        self.order
+            .queue_owned(now)
+            .map_err(|_| self.fail_force(now))
     }
 
     pub(crate) fn output_step(&mut self, now: Instant) -> Result<WriteStep, ActorLaunchOrderError> {
@@ -241,7 +252,10 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
         if self.stopping() {
             return Err(self.fail_force(now));
         }
-        let step = self.order.output_step().map_err(|_| self.fail_force(now))?;
+        let step = self
+            .order
+            .output_step(now)
+            .map_err(|_| self.fail_force(now))?;
         if step == WriteStep::Complete
             && let Some(event) = self.order.take_ready()
         {
@@ -392,7 +406,12 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
     fn fail_force(&mut self, now: Instant) -> ActorLaunchOrderError {
         self.phase = Phase::ForceStopping(now + self.limits.force);
         let _ = self.try_force();
-        self.latch(ActorLaunchOrderError::CleanupRequired)
+        // The output deadline is a control-plane failure, not a transfer of
+        // process ownership. Keep a captured READY event available to cleanup
+        // diagnostics while permanently latching the actor.
+        self.terminal = Some(ActorLaunchOrderError::CleanupRequired);
+        self.order.stage = LaunchOrderStage::CleanupRequired;
+        ActorLaunchOrderError::CleanupRequired
     }
 
     fn latch(&mut self, error: ActorLaunchOrderError) -> ActorLaunchOrderError {
@@ -439,21 +458,33 @@ mod tests {
     struct FakeSink {
         frame: Option<Vec<u8>>,
         steps: Vec<Result<WriteStep, OutputWriteError>>,
+        put_now: Vec<Instant>,
+        step_now: Vec<Instant>,
     }
 
     impl FrameSink for FakeSink {
-        fn put(&mut self, frame: Vec<u8>) -> Result<(), PutFrameError> {
+        fn put(&mut self, frame: Vec<u8>, now: Instant) -> Result<(), PutFrameError> {
             self.frame = Some(frame);
+            self.put_now.push(now);
             Ok(())
         }
 
-        fn step(&mut self) -> Result<WriteStep, OutputWriteError> {
+        fn step(&mut self, now: Instant) -> Result<WriteStep, OutputWriteError> {
+            self.step_now.push(now);
             self.steps.remove(0)
         }
     }
 
     fn order(steps: Vec<Result<WriteStep, OutputWriteError>>) -> LaunchOrder<FakeLaunch, FakeSink> {
-        LaunchOrder::new(FakeLaunch(7), FakeSink { frame: None, steps })
+        LaunchOrder::new(
+            FakeLaunch(7),
+            FakeSink {
+                frame: None,
+                steps,
+                put_now: Vec::new(),
+                step_now: Vec::new(),
+            },
+        )
     }
 
     fn ready() -> &'static [u8] {
@@ -463,30 +494,44 @@ mod tests {
 
     #[test]
     fn owned_and_ready_are_ordered_and_released_once() {
+        let now = Instant::now();
         let mut owned = order(vec![Ok(WriteStep::Pending), Ok(WriteStep::Complete)]);
         assert!(owned.sink.frame.is_none());
-        owned.queue_owned().unwrap();
+        owned.queue_owned(now).unwrap();
         assert!(matches!(
             decode_reply(owned.sink.frame.as_ref().unwrap()).unwrap(),
             Reply::Owned { request_id: 7, .. }
         ));
         assert_eq!(owned.ready(ready()), Ok(None));
-        assert_eq!(owned.output_step(), Ok(WriteStep::Pending));
-        assert_eq!(owned.output_step(), Ok(WriteStep::Complete));
+        assert_eq!(owned.output_step(now), Ok(WriteStep::Pending));
+        assert_eq!(owned.output_step(now), Ok(WriteStep::Complete));
         assert!(owned.take_ready().is_some());
         assert!(owned.take_ready().is_none());
 
         let mut late = order(vec![Ok(WriteStep::Complete)]);
-        late.queue_owned().unwrap();
-        late.output_step().unwrap();
+        late.queue_owned(now).unwrap();
+        late.output_step(now).unwrap();
         assert!(late.ready(ready()).unwrap().is_some());
     }
 
     #[test]
+    fn launch_order_forwards_admission_and_poll_timestamps() {
+        let now = Instant::now();
+        let poll = now + std::time::Duration::from_millis(1);
+        let mut order = order(vec![Ok(WriteStep::Pending)]);
+
+        order.queue_owned(now).unwrap();
+        assert_eq!(order.output_step(poll), Ok(WriteStep::Pending));
+        assert_eq!(order.sink.put_now, vec![now]);
+        assert_eq!(order.sink.step_now, vec![poll]);
+    }
+
+    #[test]
     fn malformed_order_and_ready_streams_latch_cleanup() {
+        let now = Instant::now();
         let mut before_queue = order(vec![]);
         assert_eq!(
-            before_queue.output_step(),
+            before_queue.output_step(now),
             Err(LaunchOrderStage::CleanupRequired)
         );
         assert_eq!(
@@ -495,21 +540,21 @@ mod tests {
         );
 
         let mut pre_ready_eof = order(vec![Ok(WriteStep::Complete)]);
-        pre_ready_eof.queue_owned().unwrap();
+        pre_ready_eof.queue_owned(now).unwrap();
         assert_eq!(
             pre_ready_eof.ready_eof(),
             Err(LaunchOrderStage::CleanupRequired)
         );
 
         let mut post_ready_eof = order(vec![Ok(WriteStep::Complete)]);
-        post_ready_eof.queue_owned().unwrap();
-        post_ready_eof.output_step().unwrap();
+        post_ready_eof.queue_owned(now).unwrap();
+        post_ready_eof.output_step(now).unwrap();
         assert!(post_ready_eof.ready(ready()).unwrap().is_some());
         assert_eq!(post_ready_eof.ready_eof(), Ok(()));
 
         let mut trailing = order(vec![Ok(WriteStep::Complete)]);
-        trailing.queue_owned().unwrap();
-        trailing.output_step().unwrap();
+        trailing.queue_owned(now).unwrap();
+        trailing.output_step(now).unwrap();
         trailing.ready(ready()).unwrap();
         let mut bytes = ready().to_vec();
         bytes.extend_from_slice(ready());
@@ -519,9 +564,9 @@ mod tests {
         );
 
         let mut write_error = order(vec![Err(OutputWriteError::Closed)]);
-        write_error.queue_owned().unwrap();
+        write_error.queue_owned(now).unwrap();
         assert_eq!(
-            write_error.output_step(),
+            write_error.output_step(now),
             Err(LaunchOrderStage::CleanupRequired)
         );
         assert_eq!(
@@ -595,7 +640,12 @@ mod tests {
                 observed: 0,
                 reaps: reaps.into_iter().collect(),
             },
-            FakeSink { frame: None, steps },
+            FakeSink {
+                frame: None,
+                steps,
+                put_now: Vec::new(),
+                step_now: Vec::new(),
+            },
             Phase::Launching(Instant::now() + LIMITS.launch),
             LIMITS,
         )
@@ -750,6 +800,40 @@ mod tests {
     }
 
     #[test]
+    fn output_timeout_forces_once_and_preserves_owner_and_held_ready() {
+        let now = Instant::now();
+        let deadline = now + LIMITS.force;
+        let mut actor = actor(
+            [
+                io_error(io::ErrorKind::WouldBlock),
+                io_error(io::ErrorKind::WouldBlock),
+                io_error(io::ErrorKind::WouldBlock),
+            ],
+            [Ok(TreeObservation::ConfirmedEmpty)],
+            vec![Err(OutputWriteError::Io(io::ErrorKind::TimedOut))],
+        );
+        queue_ready(&mut actor, now);
+
+        cleanup_required(actor.output_step(now));
+        assert_eq!(actor.phase, Phase::ForceStopping(deadline));
+        assert_eq!(actor.order.launch.forces, vec![true]);
+        assert!(actor.order.held_ready.is_some());
+        assert!(actor.terminal.is_some());
+
+        assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::Present));
+        assert_eq!(actor.phase, Phase::ForceStopping(deadline));
+        assert_eq!(actor.order.launch.forces, vec![true, true]);
+        assert_eq!(actor.order.launch.reaps.len(), 1);
+        assert_eq!(
+            actor.cleanup_tick(now + std::time::Duration::from_millis(1)),
+            Ok(TreeObservation::Present)
+        );
+        assert_eq!(actor.phase, Phase::ForceStopping(deadline));
+        assert_eq!(actor.order.launch.forces, vec![true, true, true]);
+        assert_eq!(actor.order.launch.reaps.len(), 1);
+    }
+
+    #[test]
     fn blocked_output_worker_does_not_block_force_or_cleanup() {
         #[derive(Default)]
         struct State {
@@ -806,7 +890,11 @@ mod tests {
         let now = Instant::now();
         let gate = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let release = Release(gate.clone());
-        let sink = crate::output_worker::OutputWorker::new(Gate(gate.clone())).unwrap();
+        let sink = crate::output_worker::OutputWorker::new(
+            Gate(gate.clone()),
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap();
         let actor = ActorLaunchOrder::new(
             ScriptLaunch {
                 id: 8,
@@ -823,9 +911,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut actor = actor;
-            let put = actor.order.sink.put(b"held-frame\n".to_vec());
-            let step = actor.order.sink.step();
-            let busy = actor.order.sink.put(b"second\n".to_vec());
+            let put = actor.order.sink.put(b"held-frame\n".to_vec(), now);
+            let step = actor.order.sink.step(now);
+            let busy = actor.order.sink.put(b"second\n".to_vec(), now);
             let cleanup = actor.cleanup_tick(now);
             let forces = actor.order.launch.forces;
             let _ = tx.send((put, step, busy, cleanup, forces));
