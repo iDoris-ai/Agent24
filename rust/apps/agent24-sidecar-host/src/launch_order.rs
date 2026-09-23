@@ -39,6 +39,16 @@ impl<W: Write> FrameSink for OutputWriter<W> {
     }
 }
 
+impl FrameSink for crate::output_worker::OutputWorker {
+    fn put(&mut self, frame: Vec<u8>) -> Result<(), PutFrameError> {
+        crate::output_worker::OutputWorker::put(self, frame)
+    }
+
+    fn step(&mut self) -> Result<WriteStep, OutputWriteError> {
+        crate::output_worker::OutputWorker::step(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LaunchOrderStage {
     Contained,
@@ -399,7 +409,10 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
 mod tests {
     use super::*;
     use agent24_sidecar_host_protocol::{Request, decode_reply};
-    use std::collections::{BTreeMap, VecDeque};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        sync::{Arc, Condvar, Mutex},
+    };
 
     struct FakeLaunch(u64);
 
@@ -653,6 +666,139 @@ mod tests {
         );
         assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
         assert_eq!(actor.cleanup_tick(now), Ok(TreeObservation::ConfirmedEmpty));
+    }
+
+    #[test]
+    fn blocked_output_worker_does_not_block_force_or_cleanup() {
+        #[derive(Default)]
+        struct State {
+            entered: bool,
+            released: bool,
+            flushed: bool,
+            writer_dropped: bool,
+            bytes: Vec<u8>,
+        }
+        type GateState = Arc<(Mutex<State>, Condvar)>;
+        struct Gate(GateState);
+        impl Write for Gate {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let (lock, changed) = &*self.0;
+                let mut state = lock.lock().unwrap();
+                state.entered = true;
+                changed.notify_all();
+                while !state.released {
+                    state = changed.wait(state).unwrap();
+                }
+                state.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                let (lock, changed) = &*self.0;
+                lock.lock().unwrap().flushed = true;
+                changed.notify_all();
+                Ok(())
+            }
+        }
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                let (lock, changed) = &*self.0;
+                lock.lock().unwrap().writer_dropped = true;
+                changed.notify_all();
+            }
+        }
+        struct Release(GateState);
+        impl Release {
+            fn now(&self) {
+                let (lock, changed) = &*self.0;
+                lock.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .released = true;
+                changed.notify_all();
+            }
+        }
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.now();
+            }
+        }
+
+        let now = Instant::now();
+        let gate = Arc::new((Mutex::new(State::default()), Condvar::new()));
+        let release = Release(gate.clone());
+        let sink = crate::output_worker::OutputWorker::new(Gate(gate.clone())).unwrap();
+        let actor = ActorLaunchOrder::new(
+            ScriptLaunch {
+                id: 8,
+                stops: [Ok(())].into(),
+                forces: Vec::new(),
+                observations: VecDeque::new(),
+                observed: 0,
+                reaps: VecDeque::new(),
+            },
+            sink,
+            Phase::ForceStopping(now + LIMITS.force),
+            LIMITS,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut actor = actor;
+            let put = actor.order.sink.put(b"held-frame\n".to_vec());
+            let step = actor.order.sink.step();
+            let busy = actor.order.sink.put(b"second\n".to_vec());
+            let cleanup = actor.cleanup_tick(now);
+            let forces = actor.order.launch.forces;
+            let _ = tx.send((put, step, busy, cleanup, forces));
+        });
+        let (lock, changed) = &*gate;
+        let state = lock.lock().unwrap();
+        let entered = changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(3), |state| {
+                !state.entered
+            })
+            .map(|(state, timeout)| state.entered && !timeout.timed_out())
+            .unwrap_or(false);
+        let early = rx.recv_timeout(std::time::Duration::from_secs(2)).ok();
+        release.now();
+        let flushed = changed
+            .wait_timeout_while(
+                lock.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                std::time::Duration::from_secs(3),
+                |state| !state.flushed,
+            )
+            .map(|(state, timeout)| state.flushed && !timeout.timed_out())
+            .unwrap_or(false);
+        let worker_dropped = changed
+            .wait_timeout_while(
+                lock.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                std::time::Duration::from_secs(3),
+                |state| !state.writer_dropped,
+            )
+            .map(|(state, timeout)| state.writer_dropped && !timeout.timed_out())
+            .unwrap_or(false);
+        drop(release);
+        assert!(entered, "writer never reached gate");
+        assert!(
+            early.is_some(),
+            "actor watchdog expired before gate release"
+        );
+        let (put, step, busy, cleanup, forces) = early.unwrap();
+        assert!(put.is_ok());
+        assert_eq!(
+            step,
+            Ok(WriteStep::Pending),
+            "output polling blocked behind writer"
+        );
+        assert_eq!(busy, Err(PutFrameError::Busy(b"second\n".to_vec())));
+        assert_eq!(cleanup, Ok(TreeObservation::ConfirmedEmpty));
+        assert_eq!(forces, vec![true]);
+        assert!(flushed, "released worker did not flush before deadline");
+        assert!(
+            worker_dropped,
+            "detached output worker did not exit before deadline"
+        );
+        assert_eq!(lock.lock().unwrap().bytes, b"held-frame\n");
     }
 
     #[test]

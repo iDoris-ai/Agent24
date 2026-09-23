@@ -114,11 +114,11 @@ mod tests {
         use std::io::{Read, Write};
 
         let _test_guard = test_lock();
-        let owner =
-            PlatformOwner::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg(
-                "read line; printf 'out:%s' \"$line\"; printf 'err:%s' \"$line\" >&2; sleep 30",
-            ))
-            .expect("spawn /bin/sh");
+        let owner = PlatformOwner::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg(
+            "trap '' TERM; read line; printf 'out:%s' \"$line\"; \
+                 printf 'err:%s' \"$line\" >&2; exec /bin/sleep 30",
+        ))
+        .expect("spawn /bin/sh");
         let mut target = OwnedTarget::from_owned(owner);
         let pipes = target.take_pipes().expect("owned pipes");
         assert!(target.take_pipes().is_err());
@@ -143,6 +143,16 @@ mod tests {
         assert_eq!(stderr_text, "err:hello");
         target.request_stop(false).expect("graceful stop");
         target.request_stop(true).expect("force stop");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match target.reap_step().expect("reap stopped target") {
+                TreeObservation::ConfirmedEmpty => break,
+                TreeObservation::Present if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                observation => panic!("target did not become empty: {observation:?}"),
+            }
+        }
         drop(target);
         wait_for_reaper_idle();
     }
