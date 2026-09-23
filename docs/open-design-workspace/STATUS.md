@@ -147,6 +147,24 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 本次 3 小时完整 monitor 没有 eligible Open Design root；绿色 CI、内部审查或 stacked
   descendant approval 都不构成越序 merge 授权。P2 仍为 `IN PROGRESS`。
 
+## 2026-09-23 Wave 11 当前门禁
+
+- 主干根门禁没有变化：#228 仍待重新批准；#254 修复 head `6fcae9e` 的五项 CI 全绿，
+  但旧 `CHANGES_REQUESTED` 尚未被新 approval 替代。#438 虽已 approved 且三平台全绿，
+  其依赖链最终仍落到 #254，因此不可越序合并。
+- G1 #445 为 registration adversarial slice（head `f385cef`，+485/-0），覆盖 WAL 双 Store
+  竞争、commit hook rollback/reopen/retry 与 corruption replay；两份 Astra exact-diff review
+  `PASS`。下一步是 pinned locator / filesystem identity evidence，仍不得接 runtime。
+- G8 #441 为 Darwin `EPERM` retry，#443 为 fixed admission-to-completion deadline；#449 为
+  private bounded control worker（head `65f44c6`，+385/-0）。#449 两份 Astra exact-diff review
+  `PASS`，但未移动 pipe、未实现 Ready/stderr reader，也未接产品 host `run()`。
+- G4 #442 为 strict terminal readers；#450 为 terminal mutation helpers（head `aca765d`，
+  +498/-2），严格处理全部 pending approvals、exact lease release、audit tail/chain 与 released
+  retry。两份 Astra exact-diff review `PASS`；仍无 finish API、runtime wiring 或顶层 commit ownership。
+- terminal core 经重新设计拆为 planning/release primitives 与 caller-owned transactional
+  composition 两个堆叠 PR；旧 +698/-45 和后续压缩草稿均不得提交。
+- 当前仍无 dependency-ready Open Design root 可 merge；P2/P9 均不得标记 complete。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
