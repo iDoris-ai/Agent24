@@ -73,8 +73,13 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
   Ready 队列读取器解释为 lease、admission 或恢复执行权。
 - G1 materialization 初版达到 486 changed lines；审查要求先加入 legacy `create_workspace`
   跨表 ownership 前置保护，并把核心状态转换与对抗性证据拆成相邻 PR，避免突破 500 行或压缩测试。
+- #424 以 442 changed lines 加固 `create_workspace` 对 Materialized/Committed/Retained journal
+  ownership 的反向守卫，真实双连接 WAL 竞争与两次独立 SOL exact-head review 均 `PASS`；
+  #425 以 331 changed lines加入只读 Ready 队列读取器、partial-index plan 证据与同级双审。
 - 当前合法 merge 集仍为空：#228/#417 等前沿等待外部审批；监控不得把内部 SOL、绿色 CI
   或下游 approval 当成可越序合并的授权。
+- 外部 reviewer 预计处理当前百余 PR 需要较长时间；按 owner 最新指令，完整 PR 状态轮询
+  从每 15 分钟降为每 3 小时，期间优先继续实现与开小型、可审查 PR。
 
 ## A24-OD-00 小 PR 栈
 
