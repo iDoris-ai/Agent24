@@ -9,7 +9,7 @@ use agent24_protocol::state_file::AuthMode;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Extension, Path, State};
+use axum::extract::State;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -1028,6 +1028,7 @@ pub async fn serve(
     host_bootstrap_stdio: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
     let (mut host_ready, parent_liveness) = match (auth_mode, host_bootstrap_stdio) {
         (AuthMode::Capabilities, true) => {
             let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
@@ -1750,32 +1751,41 @@ pub async fn serve(
             "generation": daemon_generation,
             "version": env!("CARGO_PKG_VERSION"),
         }),
-        AuthMode::Capabilities => serde_json::json!({
-            "type": "ready",
-            "port": local.port(),
-            // This secret crosses only the inherited ready pipe to the
-            // spawning trusted host. It is never written to daemon.json.
-            "product_host_token": product_host_token.expect("minted in capability mode"),
-            "auth_mode": "capabilities",
-            "generation": daemon_generation,
-            "version": env!("CARGO_PKG_VERSION"),
-        }),
+        AuthMode::Capabilities => {
+            let product_host_token = product_host_token.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "capability startup lost its host credential",
+                )
+            })?;
+            serde_json::json!({
+                "type": "ready",
+                "port": local.port(),
+                // This secret crosses only the inherited ready pipe to the
+                // spawning trusted host. It is never written to daemon.json.
+                "product_host_token": product_host_token,
+                "auth_mode": "capabilities",
+                "generation": daemon_generation,
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+        }
     };
     match auth_mode {
         AuthMode::LegacySingleToken => println!("{ready}"),
         AuthMode::Capabilities => {
-            host_ready
-                .as_mut()
-                .expect("validated capability bootstrap")
-                .send(&ready)
-                .await?;
+            let host_ready = host_ready.as_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "capability startup lost its private ready pipe",
+                )
+            })?;
+            host_ready.send(&ready).await?;
         }
     }
     // In capability mode `ready` is the only temporary owner of the raw host
     // bearer after the private write completes. Do not retain it for daemon
     // lifetime; the authority store keeps only its digest.
     drop(ready);
-    drop(host_ready);
 
     let graceful_cancel = cancel.clone();
     let server = axum::serve(listener, router)
@@ -1805,6 +1815,26 @@ pub async fn serve(
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
     }
     result
+}
+
+/// Capability mode requires the trusted host-bootstrap transport; the route
+/// middleware maps every request before accepting its bearer.
+fn validate_auth_startup(
+    auth_mode: AuthMode,
+    host_bootstrap_stdio: bool,
+) -> Result<(), std::io::Error> {
+    match (auth_mode, host_bootstrap_stdio) {
+        (AuthMode::Capabilities, true) => Ok(()),
+        (AuthMode::Capabilities, false) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "capability mode requires trusted host bootstrap stdio",
+        )),
+        (AuthMode::LegacySingleToken, true) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "host bootstrap stdio is valid only in capability mode",
+        )),
+        (AuthMode::LegacySingleToken, false) => Ok(()),
+    }
 }
 
 /// What out-of-process modules are started with: the callback directory under
@@ -2306,6 +2336,107 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["backend"], "rust");
         assert!(json["version"].as_str().is_some());
+    }
+
+    #[test]
+    fn capability_startup_requires_the_trusted_host_bootstrap_transport() {
+        assert!(validate_auth_startup(AuthMode::Capabilities, true).is_ok());
+        let err = validate_auth_startup(AuthMode::Capabilities, false)
+            .expect_err("capability startup without private host pipes");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn capability_state_does_not_accept_the_empty_legacy_sentinel() {
+        let mut capability_state = state().await;
+        capability_state.enable_capability_auth(crate::capabilities::CapabilityStore::new(
+            "capability-generation".to_owned(),
+        ));
+
+        let res = build_router(capability_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(res).await["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn creative_bearer_can_read_models_but_not_the_closed_default_route() {
+        let store = crate::capabilities::CapabilityStore::new("capability-generation");
+        let host = store
+            .mint_product_host(
+                "host-generation",
+                Duration::from_secs(60),
+                crate::capabilities::unix_now(),
+            )
+            .unwrap();
+        let creative = store
+            .mint_creative(
+                host.token(),
+                crate::capabilities::CreativeMintRequest::new(
+                    "workspace",
+                    "attachment",
+                    "principal",
+                    "sidecar-generation",
+                    Duration::from_secs(60),
+                    crate::capabilities::unix_now(),
+                ),
+            )
+            .unwrap();
+        let (creative_bearer, _, _) = creative.into_bearer_parts();
+        let mut capability_state = state().await;
+        capability_state.enable_capability_auth(store);
+        let router = build_router(capability_state);
+
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+
+        let default_route = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_route.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(default_route).await["error"]["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn legacy_state_still_accepts_its_bearer_token() {
+        let res = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
