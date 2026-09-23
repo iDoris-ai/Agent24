@@ -5,6 +5,13 @@
 
 mod approval_callback;
 mod approvals;
+// Capability authority is staged ahead of its route policy. Keep the allowance
+// confined to that deferred module rather than weakening the daemon's lints.
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "capability route policy has not landed"
+)]
 mod capabilities;
 mod domain;
 mod events;
