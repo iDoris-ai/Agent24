@@ -178,6 +178,18 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
   不持有 ReadyGate/deadline，也未接 actor/runtime；二者 review 门禁均通过。
 - 这些 PR 均为 frontier descendants，不改变 #228/#254 主干根门禁，也不授权越序 merge。
 
+## 2026-09-24 Wave 13 当前门禁
+
+- #254 已合入 main（merge commit `95eb36b`）。#255 已直接基于当前 main head `f14bd1e` 重建，
+  实际变更为 +283/-101=384；两份独立内部 exact-tree review `PASS`，但 CI/rereview 仍 pending，
+  未获新的外部 approval 且未全绿前不可 merge。
+- G8：#460/#463 的 Windows rerun 均 green；#468（head `2f7a8ea`，+499）完成 lease-history
+  verification；#474（`5007634`，+340/-40）完成 runtime lifecycle/order；#475（`45343cc`，+414）
+  完成 state plan；#477（`3815cbe`，+79/-14）增加 optional control timeout；#480（`9edf631`，
+  +235/-9）完成 exact audit replay。
+- 所有上述后代仍 dependency-stacked，等待外部 review；没有 runtime product wiring，P2/P9 仍未完成。
+  下一步限于 G8 bounded outbox，以及 G1 B1c tail/high-water。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
