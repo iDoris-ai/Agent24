@@ -19,6 +19,12 @@ pub(crate) struct RootIdentity {
     pub(crate) ino_le: [u8; 8],
 }
 
+/// Deliberately uninhabited evidence on platforms without a safe directory
+/// handle identity implementation. It can never authenticate a root.
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootIdentity;
+
 #[cfg(unix)]
 pub(crate) struct ManagedParent {
     file: File,
@@ -28,7 +34,7 @@ pub(crate) struct ManagedParent {
 
 #[cfg(not(unix))]
 pub(crate) struct ManagedParent {
-    _private: (),
+    pub(crate) _private: (),
 }
 
 #[cfg(unix)]
@@ -51,7 +57,7 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn inspect(file: &File, owner: u64, reason: &'static str) -> Result<RootIdentity> {
+pub(crate) fn inspect(file: &File, owner: u64, reason: &'static str) -> Result<RootIdentity> {
     let stat = fs::fstat(file).map_err(|_| unavailable(reason))?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
         return Err(unavailable("root_not_directory"));
@@ -135,12 +141,27 @@ impl ManagedParent {
     pub(crate) fn identity(&self) -> RootIdentity {
         self.identity
     }
+
+    pub(crate) fn verify_identity(&self) -> Result<()> {
+        if inspect(&self.file, self.trusted_owner, "workspace_roots_metadata")? != self.identity {
+            return Err(unavailable("workspace_roots_identity_mismatch"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn trusted_owner(&self) -> u64 {
+        self.trusted_owner
+    }
 }
 
 #[cfg(unix)]
 impl PinnedWorkspaceRoot {
     pub(crate) fn identity(&self) -> RootIdentity {
         self.identity
+    }
+
+    pub(crate) fn into_parts(self) -> (File, RootIdentity) {
+        (self.file, self.identity)
     }
 }
 
