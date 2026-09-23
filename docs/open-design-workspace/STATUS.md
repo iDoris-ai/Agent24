@@ -7,10 +7,10 @@
 | 阶段 | 状态 | 证据 |
 | --- | --- | --- |
 | P0 设计冻结 | PASS | ADR-001～005、依赖台账、风险与兼容矩阵已冻结并通过 SOL review |
-| A24-OD-00 capability 安全前置 | PASS（逐层合并中） | #226 已合入 main；#227 retarget 后等待重新审批，其余保持堆叠顺序 |
+| A24-OD-00 capability 安全前置 | PASS（逐层合并中） | #226/#227 已合入 main；#228 已 retarget 到 main 并等待重新审批，其余保持堆叠顺序 |
 | P1 Open Design 原样基线 | PASS | `open-design-v0.22.2@73953213a`，fork PR #1，SOL exact-head 复核通过 |
 | P2 workspace contract | IN PROGRESS | DB registry/lifecycle/renew 与 allocation journal schema/约束通过 SOL；安全 root allocator/host lease/run binding 未完成 |
-| A24-OD-05 sidecar foundation | PASS（未接线） | manager、protocol、platform owner、codec、frame reader 与 actor state policy 通过 SOL；owned pipes/I/O 未完成 |
+| A24-OD-05 sidecar foundation | PASS（未接线） | manager、protocol、platform owner、codec、frame reader、owned pipes 与 launch ordering 已形成受审栈；host `run()`/产品路由仍未接线 |
 
 P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 `outdated_cli / incompatible opencode args` 失败，随后停滞，需要 bounded SIGINT。
@@ -59,7 +59,22 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 01:48 监控：#227 仍 `REVIEW_REQUIRED`；#228/#229 的 approval 不能越过它；其余本计划
   PR 没有 external `APPROVED`/`REQUEST_CHANGES`，本轮无 merge。
 - 200 行仍是硬门禁。#362/#370/#373/#378 均恰好 200 行，#374 为 199、#381 为 195；
-  #373/#377/#380 的拆分证明门槛已有真实协调成本。弹性规则已提议但尚未获用户确认。
+  #373/#377/#380 的拆分证明门槛已有真实协调成本。此历史门禁随后已由下文的 500 行弹性规则取代。
+
+## 2026-09-23 Wave 5 门禁
+
+- #227 已在 exact head `f70c11a` 获 external `APPROVED` 且检查全绿后合入 main；#228
+  自动 retarget 到 main 后旧审批被正确作废，已重新请求 review，未越过依赖合并。
+- sidecar #421/#422 已 external `APPROVED` 且三平台 CI 全绿，但仍分别等待 #417 与 #421；
+  #423 exact head `ea14072b` 的 Ubuntu/macOS/Windows 与 CLA 全绿，等待 external review。
+- #423 的 pipe-transfer 失败路径保留同一 authoritative owner，并以纯内存 deterministic
+  regression 取代会放大全局 reaper 竞态的额外真实进程测试；本地 SOL exact-diff review `PASS`。
+- ADR-006 已由项目 owner 的 P0–P9 执行授权正式接受并冻结；G4 可以按小切片继续，但不得把
+  Ready 队列读取器解释为 lease、admission 或恢复执行权。
+- G1 materialization 初版达到 486 changed lines；审查要求先加入 legacy `create_workspace`
+  跨表 ownership 前置保护，并把核心状态转换与对抗性证据拆成相邻 PR，避免突破 500 行或压缩测试。
+- 当前合法 merge 集仍为空：#228/#417 等前沿等待外部审批；监控不得把内部 SOL、绿色 CI
+  或下游 approval 当成可越序合并的授权。
 
 ## A24-OD-00 小 PR 栈
 
