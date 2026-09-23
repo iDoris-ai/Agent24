@@ -7,7 +7,8 @@ use crate::{
     terminal_helpers::{
         TerminalAuditFacts, TerminalReleaseSnapshot, read_all_approvals_tx, read_audit_tx,
         read_cohort_tx, read_exact_terminal_audits_tx, read_pending_approvals_tx,
-        read_run_lease_tx, read_terminal_run_tx, read_workspace_tx, verify_audit_tx,
+        read_run_lease_history_tx, read_run_lease_tx, read_terminal_run_tx, read_workspace_tx,
+        verify_audit_tx,
     },
     terminal_mutations::{
         TerminalAuditInput, TerminalMutation, abort_all_pending_terminal_approvals_tx,
@@ -108,36 +109,25 @@ async fn released_attempt_lease_tx(
     result: RunStatus,
     expected: &ExpectedLease,
 ) -> WorkspaceResult<TerminalMutation<Option<WorkspaceLeaseRow>>> {
-    let rows = sqlx::query(
-        "SELECT * FROM workspace_leases WHERE owner_id=? COLLATE BINARY
-         AND kind='run' COLLATE BINARY ORDER BY lease_id COLLATE BINARY",
-    )
-    .bind(hold.run_id())
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|_| WorkspaceStoreError::Database)?;
-    let leases: Vec<WorkspaceLeaseRow> = rows
-        .iter()
-        .map(WorkspaceLeaseRow::decode)
-        .collect::<WorkspaceResult<_>>()?;
-    if leases.is_empty() {
-        return Ok(
-            if result == RunStatus::Cancelled && *expected == ExpectedLease::None {
-                TerminalMutation::Applied(None)
-            } else {
-                TerminalMutation::Conflict
-            },
-        );
+    let leases = read_run_lease_history_tx(tx, hold).await?;
+    if leases.iter().any(|lease| lease.record.released_at.is_none()) {
+        return Ok(TerminalMutation::Conflict);
     }
     let exact = match expected {
-        ExpectedLease::Exact(lease) => {
+        ExpectedLease::Exact(lease) if lease.record.released_at.is_none() => {
             let mut released = (**lease).clone();
             released.record.released_at = Some(ended_at.clone());
-            released
+            Some(released)
         }
+        ExpectedLease::Exact(_) => return Ok(TerminalMutation::Conflict),
+        ExpectedLease::None if result == RunStatus::Cancelled => None,
         ExpectedLease::None => return Ok(TerminalMutation::Conflict),
     };
-    Ok(if leases.len() == 1 && leases[0] == exact { TerminalMutation::Applied(Some(exact)) } else { TerminalMutation::Conflict })
+    Ok(match exact {
+        Some(lease) if leases.contains(&lease) => TerminalMutation::Applied(Some(lease)),
+        None => TerminalMutation::Applied(None),
+        Some(_) => TerminalMutation::Conflict,
+    })
 }
 async fn closed_cohort_tx(
     tx: &mut Transaction<'_, Sqlite>,
@@ -203,6 +193,7 @@ async fn fresh_apply_tx(
     snapshot: &TerminalReleaseSnapshot,
 ) -> WorkspaceResult<TerminalCompositionOutcome> {
     let attempt = composition.terminal();
+    let lease_history = read_run_lease_history_tx(tx, &snapshot.hold).await?;
     if matches!(attempt.result(), RunStatus::Completed | RunStatus::Failed)
         && !matches!(composition.lease(), ExpectedLease::Exact(_))
         || match composition.lease() {
@@ -268,6 +259,15 @@ async fn fresh_apply_tx(
             Some(lease)
         }
     };
+    let expected_history = lease_history
+        .into_iter()
+        .map(|mut lease| {
+            if Some(&lease) == snapshot.lease.as_ref() {
+                lease.record.released_at = Some(attempt.ended_at().clone());
+            }
+            lease
+        })
+        .collect::<Vec<_>>();
     expected.lease = None;
     let (action, detail) = audit_parts(&snapshot.hold, attempt)?;
     let prev_hash = snapshot
@@ -365,6 +365,7 @@ async fn fresh_apply_tx(
     let final_facts = snapshot_tx(tx, snapshot.hold.run_id()).await?;
     if final_facts != expected
         || read_all_approvals_tx(tx, snapshot.hold.run_id()).await? != approvals
+        || read_run_lease_history_tx(tx, &snapshot.hold).await? != expected_history
         || !matches!(released_attempt_lease_tx(tx, &expected.hold, attempt.ended_at(), attempt.result(), composition.lease()).await?, TerminalMutation::Applied(actual) if actual == expected_lease)
         || !closed_cohort_tx(tx, &expected.hold, attempt.ended_at()).await?
     {
@@ -434,30 +435,30 @@ mod tests {
     #[rustfmt::skip]
     #[tokio::test]
     async fn trigger_rereads_rollback_without_partial_writes() {
-        for (event, body) in [("UPDATE OF completed_at ON legacy_recovery_cohorts", "UPDATE legacy_recovery_holds SET reason_code='twist' WHERE run_id='run-strict'"), ("INSERT ON audit_log", "UPDATE approvals SET summary='twist' WHERE id='approval-strict'"), ("UPDATE OF released_at ON workspace_leases", "UPDATE workspace_leases SET acquired_at='2026-09-19T00:00:00.001Z' WHERE lease_id=NEW.lease_id"), ("INSERT ON audit_log", "UPDATE legacy_recovery_holds SET recovery_state='needs_attention',released_at=NULL,reason_code='x' WHERE run_id='peer'"), ("INSERT ON audit_log", "UPDATE legacy_recovery_holds SET released_at='2026-09-19T00:00:02.000Z' WHERE run_id='peer'"), ("INSERT ON audit_log", "DELETE FROM legacy_recovery_holds WHERE run_id='peer'")] {
+        for (event, body) in [("UPDATE OF completed_at ON legacy_recovery_cohorts", "UPDATE legacy_recovery_holds SET reason_code='twist' WHERE run_id='run-strict'"), ("INSERT ON audit_log", "UPDATE approvals SET summary='twist' WHERE id='approval-strict'"), ("UPDATE OF released_at ON workspace_leases", "UPDATE workspace_leases SET acquired_at='2026-09-19T00:00:00.001Z' WHERE lease_id=NEW.lease_id"), ("UPDATE OF released_at ON workspace_leases", "DELETE FROM workspace_leases WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7'"), ("UPDATE OF released_at ON workspace_leases", "UPDATE workspace_leases SET acquired_at='2026-09-19T00:00:00.001Z' WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7'"), ("INSERT ON audit_log", "UPDATE legacy_recovery_holds SET recovery_state='needs_attention',released_at=NULL,reason_code='x' WHERE run_id='peer'"), ("INSERT ON audit_log", "UPDATE legacy_recovery_holds SET released_at='2026-09-19T00:00:02.000Z' WHERE run_id='peer'"), ("INSERT ON audit_log", "DELETE FROM legacy_recovery_holds WHERE run_id='peer'")] {
             let store = strict_facts_fixture().await; usable(&store).await; let (state, released) = if body.starts_with("DELETE") { ("needs_attention", "NULL") } else { ("released", "'2026-09-19T00:00:01.000Z'") };
-            sqlx::raw_sql(&format!("INSERT INTO runs (id,status,input,usage,created_at,workspace_id) VALUES ('peer','running','{{}}','{{}}','2026-09-19T00:00:00.000Z','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'); INSERT INTO legacy_recovery_holds (run_id,cohort_id,workspace_id,root_generation,original_status,recovery_state,reason_code,released_at) VALUES ('peer','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','running','{state}','x',{released})")).execute(store.pool()).await.unwrap();
+            sqlx::raw_sql(&format!("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','run-strict','run','2026-09-19T00:00:00.000Z','2026-09-19T00:00:00.000Z'); INSERT INTO runs (id,status,input,usage,created_at,workspace_id) VALUES ('peer','running','{{}}','{{}}','2026-09-19T00:00:00.000Z','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'); INSERT INTO legacy_recovery_holds (run_id,cohort_id,workspace_id,root_generation,original_status,recovery_state,reason_code,released_at) VALUES ('peer','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','running','{state}','x',{released})")).execute(store.pool()).await.unwrap();
             sqlx::raw_sql(&format!("CREATE TRIGGER twist AFTER {event} BEGIN {body}; END")).execute(store.pool()).await.unwrap();
             let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap(); let before = facts(&mut tx).await;
             assert!(!matches!(compose_terminal_tx(&mut tx, &composition(RunStatus::Cancelled, &before), &before).await, Ok(TerminalCompositionOutcome::Applied)), "{body}");
-            tx.commit().await.unwrap(); assert!(store.list_audit().await.unwrap().is_empty());
+            tx.commit().await.unwrap(); let facts: (String,String,i64) = sqlx::query_as("SELECT (SELECT status FROM runs WHERE id='run-strict'),(SELECT acquired_at FROM workspace_leases WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7'),(SELECT count(*) FROM audit_log)").fetch_one(store.pool()).await.unwrap(); assert_eq!(facts, ("running".into(), "2026-09-19T00:00:00.000Z".into(), 0));
         }
     }
     #[rustfmt::skip]
     #[tokio::test]
     async fn partial_cohort_applies_then_observes() {
-        let store = strict_facts_fixture().await; usable(&store).await; sqlx::raw_sql("DELETE FROM workspace_leases; INSERT INTO runs (id,status,input,usage,created_at,workspace_id) VALUES ('peer-b','running','{}','{}','2026-09-19T00:00:00.000Z','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'),('peer-c','running','{}','{}','2026-09-19T00:00:00.000Z','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'); INSERT INTO legacy_recovery_holds (run_id,cohort_id,workspace_id,root_generation,original_status,recovery_state,reason_code,released_at) VALUES ('peer-b','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','running','released','x','2026-09-19T00:00:02.000Z'),('peer-c','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','running','needs_attention','x',NULL)").execute(store.pool()).await.unwrap();
+        let store = strict_facts_fixture().await; usable(&store).await; sqlx::raw_sql("DELETE FROM workspace_leases; INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','run-strict','run','2026-09-19T00:00:00.000Z','2026-09-19T00:00:00.000Z'); INSERT INTO runs (id,status,input,usage,created_at,workspace_id) VALUES ('peer-b','running','{}','{}','2026-09-19T00:00:00.000Z','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'),('peer-c','running','{}','{}','2026-09-19T00:00:00.000Z','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'); INSERT INTO legacy_recovery_holds (run_id,cohort_id,workspace_id,root_generation,original_status,recovery_state,reason_code,released_at) VALUES ('peer-b','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','running','released','x','2026-09-19T00:00:02.000Z'),('peer-c','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','running','needs_attention','x',NULL)").execute(store.pool()).await.unwrap();
         let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap(); let before = facts(&mut tx).await; let terminal = composition(RunStatus::Cancelled, &before);
-        assert_eq!(compose_terminal_tx(&mut tx, &terminal, &before).await.unwrap(), TerminalCompositionOutcome::Applied); let released = facts(&mut tx).await; assert!(released.cohort.completed_at.is_none());
+        assert_eq!(compose_terminal_tx(&mut tx, &terminal, &before).await.unwrap(), TerminalCompositionOutcome::Applied); let released = facts(&mut tx).await; assert!(released.cohort.completed_at.is_none()); assert_eq!(sqlx::query_scalar::<_, String>("SELECT released_at FROM workspace_leases WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7'").fetch_one(&mut *tx).await.unwrap(), "2026-09-19T00:00:00.000Z");
         assert_eq!(compose_terminal_tx(&mut tx, &terminal, &released).await.unwrap(), TerminalCompositionOutcome::ObservedApplied);
     }
     #[rustfmt::skip]
     #[tokio::test]
     async fn exact_lease_terminal_retries_reject_lost_or_changed_history() {
-        for (result, damage) in [(RunStatus::Completed, "DELETE FROM workspace_leases WHERE owner_id='run-strict'"), (RunStatus::Failed, "UPDATE workspace_leases SET acquired_at='2026-09-19T00:00:00.001Z' WHERE owner_id='run-strict'")] { let store = strict_facts_fixture().await; usable(&store).await;
-            sqlx::raw_sql("UPDATE approvals SET status='approved',decision='{\"type\":\"approve\"}',available_decisions='[\"approve\"]',decided_at='2026-09-19T00:00:00.000Z'; UPDATE legacy_recovery_holds SET recovery_state='active',active_resume_approval_id='approval-strict',reason_code=NULL WHERE run_id='run-strict'").execute(store.pool()).await.unwrap();
+        for (result, damage) in [(RunStatus::Completed, "DELETE FROM workspace_leases WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6'"), (RunStatus::Failed, "UPDATE workspace_leases SET acquired_at='2026-09-19T00:00:00.001Z' WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6'")] { let store = strict_facts_fixture().await; usable(&store).await;
+            sqlx::raw_sql("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','run-strict','run','2026-09-19T00:00:00.000Z','2026-09-19T00:00:00.000Z'); UPDATE approvals SET status='approved',decision='{\"type\":\"approve\"}',available_decisions='[\"approve\"]',decided_at='2026-09-19T00:00:00.000Z'; UPDATE legacy_recovery_holds SET recovery_state='active',active_resume_approval_id='approval-strict',reason_code=NULL WHERE run_id='run-strict'").execute(store.pool()).await.unwrap();
             let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap(); let before = facts(&mut tx).await; let terminal = composition(result, &before);
-            assert_eq!(compose_terminal_tx(&mut tx, &terminal, &before).await.unwrap(), TerminalCompositionOutcome::Applied); let released = facts(&mut tx).await;
+            assert_eq!(compose_terminal_tx(&mut tx, &terminal, &before).await.unwrap(), TerminalCompositionOutcome::Applied); let released = facts(&mut tx).await; assert_eq!(sqlx::query_scalar::<_, String>("SELECT released_at FROM workspace_leases WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7'").fetch_one(&mut *tx).await.unwrap(), "2026-09-19T00:00:00.000Z");
             assert_eq!(compose_terminal_tx(&mut tx, &terminal, &released).await.unwrap(), TerminalCompositionOutcome::ObservedApplied); sqlx::raw_sql(damage).execute(&mut *tx).await.unwrap();
             assert_eq!(compose_terminal_tx(&mut tx, &terminal, &released).await.unwrap(), TerminalCompositionOutcome::Conflict);
         }

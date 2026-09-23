@@ -343,6 +343,8 @@ pub(crate) async fn read_run_lease_tx(
     }
     Ok(Some(lease))
 }
+#[rustfmt::skip]
+pub(crate) async fn read_run_lease_history_tx(tx: &mut Transaction<'_, Sqlite>, hold: &LegacyRecoveryHold) -> WorkspaceResult<Vec<WorkspaceLeaseRow>> { sqlx::query("SELECT * FROM workspace_leases WHERE owner_id=? COLLATE BINARY AND kind='run' COLLATE BINARY ORDER BY lease_id COLLATE BINARY").bind(hold.run_id()).fetch_all(&mut **tx).await.map_err(|_| WorkspaceStoreError::Database)?.iter().map(WorkspaceLeaseRow::decode).collect() }
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TerminalAuditFacts {
     pub(crate) seq: i64,
