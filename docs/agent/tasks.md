@@ -23,7 +23,7 @@
 
 | ID | 仓库 | 任务 | 依赖 | 状态 | 证据 |
 |---|---|---|---|---|---|
-| ME4-0.1 | Sin90 | 合并已批准的 #2/#3/#4（Sin90 T0.1） | — | `READY` | |
+| ME4-0.1 | Sin90 | 合并已批准的 #2/#3/#4（Sin90 T0.1） | — | `IN_PROGRESS` | #2 `0949d37`、#3 `bd84e9a` 已合并；#4 rebase 待重审 |
 | ME4-0.2 | 两仓 | 合并本规划 PR（Agent24 `docs/me4-plan-2026-09-23` / Sin90 `docs/pilot-me4-plan`） | — | `PR_OPEN`（开 PR 后回填） | |
 | ME4-0.3 | Sin90 | CI + 陈旧文档（Sin90 T0.2/T0.3） | 0.1 | `BACKLOG` | |
 | ME4-0.4 | Sin90 | Codex 补审历史改动（Sin90 T0.4） | 0.1 | `BACKLOG` | |
