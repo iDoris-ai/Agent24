@@ -60,11 +60,48 @@ impl fmt::Debug for LaunchIntent {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LaunchFailure {
     NotLaunch,
     Start(io::ErrorKind),
-    Pipes(io::ErrorKind),
+    Pipes {
+        kind: io::ErrorKind,
+        target: Box<OwnedTarget>,
+    },
+}
+
+impl fmt::Debug for LaunchFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLaunch => formatter.write_str("NotLaunch"),
+            Self::Start(kind) => formatter.debug_tuple("Start").field(kind).finish(),
+            Self::Pipes { kind, .. } => formatter
+                .debug_struct("Pipes")
+                .field("kind", kind)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl PartialEq for LaunchFailure {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::NotLaunch, Self::NotLaunch) => true,
+            (Self::Start(left), Self::Start(right)) => left == right,
+            (Self::Pipes { kind: left, .. }, Self::Pipes { kind: right, .. }) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LaunchFailure {}
+
+impl LaunchFailure {
+    pub(crate) fn target_mut(&mut self) -> Option<&mut OwnedTarget> {
+        match self {
+            Self::Pipes { target, .. } => Some(target),
+            Self::NotLaunch | Self::Start(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for LaunchFailure {
@@ -80,6 +117,28 @@ pub(crate) struct OwnedLaunch {
     pipes: OwnedPipes,
 }
 
+#[cfg(any(unix, windows))]
+fn take_preserving<T, P>(
+    mut target: T,
+    take: impl FnOnce(&mut T) -> io::Result<P>,
+) -> Result<(T, P), (io::ErrorKind, T)> {
+    match take(&mut target) {
+        Ok(value) => Ok((target, value)),
+        Err(error) => Err((error.kind(), target)),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn take_pipes(target: OwnedTarget) -> Result<(OwnedTarget, OwnedPipes), LaunchFailure> {
+    match take_preserving(target, OwnedTarget::take_pipes) {
+        Ok((target, pipes)) => Ok((target, pipes)),
+        Err((kind, target)) => Err(LaunchFailure::Pipes {
+            kind,
+            target: Box::new(target),
+        }),
+    }
+}
+
 #[cfg(unix)]
 impl OwnedLaunch {
     pub(crate) fn start(intent: LaunchIntent) -> Result<Self, LaunchFailure> {
@@ -93,10 +152,7 @@ impl OwnedLaunch {
         }
         let owner =
             OwnedGeneration::launch(spec).map_err(|error| LaunchFailure::Start(error.kind()))?;
-        let mut target = OwnedTarget::from_owned(owner);
-        let pipes = target
-            .take_pipes()
-            .map_err(|error| LaunchFailure::Pipes(error.kind()))?;
+        let (target, pipes) = take_pipes(OwnedTarget::from_owned(owner))?;
         Ok(Self {
             request_id,
             target,
@@ -134,10 +190,7 @@ impl OwnedLaunch {
         let owner = owner
             .spawn(command)
             .map_err(|error| LaunchFailure::Start(error.kind()))?;
-        let mut target = OwnedTarget::from_owned(owner);
-        let pipes = target
-            .take_pipes()
-            .map_err(|error| LaunchFailure::Pipes(error.kind()))?;
+        let (target, pipes) = take_pipes(OwnedTarget::from_owned(owner))?;
         Ok(Self {
             request_id,
             target,
@@ -195,6 +248,7 @@ mod tests {
             assert!(Instant::now() < deadline, "child was not reaped");
         }
     }
+
     #[test]
     fn launch_intent_preserves_fields_and_redacts_debug() {
         let intent = LaunchIntent::from_request(request("/bin/sh", "/")).expect("launch");
@@ -242,6 +296,32 @@ mod tests {
             };
         assert_eq!(error, LaunchFailure::Start(io::ErrorKind::NotFound));
         assert!(!format!("{error:?}").contains(missing));
+    }
+
+    #[test]
+    fn failed_transfer_returns_the_same_owner() {
+        struct OwnerMarker {
+            generation: u64,
+            attempted: bool,
+        }
+
+        let failure = take_preserving(
+            OwnerMarker {
+                generation: 17,
+                attempted: false,
+            },
+            |owner| {
+                owner.attempted = true;
+                Err::<(), _>(io::Error::from(io::ErrorKind::InvalidInput))
+            },
+        );
+        let (kind, owner) = match failure {
+            Err(failure) => failure,
+            Ok(_) => panic!("transfer must fail"),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidInput);
+        assert_eq!(owner.generation, 17);
+        assert!(owner.attempted);
     }
 }
 
