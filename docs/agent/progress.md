@@ -19,6 +19,27 @@
 2. ME4-1.1.1 调度回调设计冻结（Codex 评审到 approve）；可并行 ME4-4.1.1 推理回调设计。
 3. ME4-0.3 / ME4-0.4 Sin90 CI 与 Codex 补审。
 
+## 2026-09-23 夜 → 09-24 凌晨：无人值守一夜的战报
+
+**模式**：统筹（Opus）+ Sonnet 子代理开发（≤3 并发）+ 全新上下文 Opus 子代理对抗评审（Codex 额度 09-23 耗尽、09-29 19:28 恢复，期间全部记 `ME4-CODEX-DEBT`）。用户指示：当晚只开 PR、不盯 PR 状态、不找 PR-Daemon 复审——所以**当晚没有任何合并**，有依赖的任务全部以 stacked PR 叠放，合并顺序写在各 PR body。
+
+**Agent24 已开 PR**（按合并顺序）：
+- #439 ME-4 规划（本文件所在分支）
+- #444 ME4-1.1.1 调度回调设计冻结 v3.1（3 轮 Opus 评审，第 3 轮 APPROVE；保留路径经 659,373 条路径穷举验证）
+  - #447 ME4-1.3.2 保留路径实现（Opus APPROVE + 跟进 commit）
+  - #453 → #454 → #455 → #456 ME4-1.2.1 存储层四刀（Opus APPROVE + M-1..M-3 修复）
+- #446 ME4-4.1.1 推理回调设计冻结 v3.1（3 轮 Opus 评审，第 3 轮 APPROVE）
+  - #448 ME4-4.2.2a 回环判定/代理/重定向安全修复（关闭 FU-72）+ 模型契约扩展
+  - #451 ME4-4.2.2-0 rpc 按方法超时 + ErrorKind unavailable
+- 进行中（未开 PR）：ME4-1.2.2a 协议与视图、ME4-4.2.1 manifest 字段
+
+**评审抓到的真问题（摘要）**：cron crate 星期字段 1=周日、日/星期取 AND（FU-71）；回环判定解析器与 reqwest 不一致 + 默认 client 读 HTTP_PROXY（FU-72，已修 #448）；CLI/worker 访问本机也走代理（FU-74）；调度设计里「只写 X-A24-Request-Id 不构成在途请求」「scheduler 先于 mount_all 启动会永久禁用模块 schedule」「..; 绕过保留路径」等（均在设计中修正）。
+
+**明早要做的**：
+1. 按各 PR body 的合并顺序合并（每合一个前先把子 PR 的 base 改成 main）。评审服务 clestons 今晚被占用，PR 等它审。
+2. Codex 额度 09-29 恢复后按 followups.md 的 `ME4-CODEX-DEBT-*` 清单补审。
+3. 用户手动：给 `iDoris-ai/Sin90`、`MushroomDAO/Cos72` main 开 ruleset。
+
 ## 阻塞项（BLOCKED）
 
 - 无。
