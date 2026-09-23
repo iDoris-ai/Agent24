@@ -1,12 +1,12 @@
 #![allow(clippy::unwrap_used)]
 
-use agent24_protocol::WorkspaceId;
-use agent24_store::{
+use crate::{
     AllocationId, AllocationIntent, AllocationPhase, AllocationRecord, LifecycleOwnerRef,
     NewScratchWorkspace, RootIdentity, Store, TrustedRootRegistration, WorkspaceConflict,
     WorkspaceInstant, WorkspaceProvenanceInput, WorkspaceResult, WorkspaceStoreError, WorkspaceTtl,
     test_hooks,
 };
+use agent24_protocol::WorkspaceId;
 use sqlx::{Row, sqlite::SqliteOperation};
 use std::{
     sync::{Arc, mpsc},
