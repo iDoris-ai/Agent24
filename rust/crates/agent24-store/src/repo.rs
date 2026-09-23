@@ -13,6 +13,7 @@ use agent24_protocol::{
 use serde_json::Value;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
+use sqlx::{Sqlite, Transaction};
 
 use crate::{Result, Store, StoreError};
 
@@ -442,6 +443,46 @@ impl Store {
         rows.iter().map(Self::row_to_approval).collect()
     }
 
+    /// Resolve a pending approval inside the caller's transaction.
+    pub(crate) async fn resolve_approval_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        to: ApprovalStatus,
+        decision: Option<&Decision>,
+        decided_at: &str,
+    ) -> Result<Approval> {
+        agent24_core::check_approval_transition(ApprovalStatus::Pending, to)?;
+        let result = sqlx::query(
+            "UPDATE approvals SET status = ?, decision = ?, decided_at = ?
+             WHERE id = ? AND status = 'pending'",
+        )
+        .bind(approval_status_str(to))
+        .bind(decision.map(serde_json::to_string).transpose()?)
+        .bind(decided_at)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("approval {id}")))?;
+            Self::row_to_approval(&row)?;
+            return Err(StoreError::Conflict(format!(
+                "approval {id} already resolved"
+            )));
+        }
+        let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        row.as_ref()
+            .map(Self::row_to_approval)
+            .transpose()?
+            .ok_or_else(|| StoreError::NotFound(format!("approval {id}")))
+    }
+
     /// Resolve a pending approval exactly once (pending-only WHERE clause —
     /// the second resolver gets Conflict, giving the REST layer its 409).
     pub async fn resolve_approval(
@@ -452,27 +493,10 @@ impl Store {
         decided_at: String,
     ) -> Result<Approval> {
         agent24_core::check_approval_transition(ApprovalStatus::Pending, to)?;
-        let result = sqlx::query(
-            "UPDATE approvals SET status = ?, decision = ?, decided_at = ?
-             WHERE id = ? AND status = 'pending'",
-        )
-        .bind(approval_status_str(to))
-        .bind(decision.map(serde_json::to_string).transpose()?)
-        .bind(&decided_at)
-        .bind(id)
-        .execute(self.pool())
-        .await?;
-        if result.rows_affected() == 0 {
-            return match self.get_approval(id).await? {
-                None => Err(StoreError::NotFound(format!("approval {id}"))),
-                Some(_) => Err(StoreError::Conflict(format!(
-                    "approval {id} already resolved"
-                ))),
-            };
-        }
-        self.get_approval(id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("approval {id}")))
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let approval = Self::resolve_approval_tx(&mut tx, id, to, decision, &decided_at).await?;
+        tx.commit().await?;
+        Ok(approval)
     }
 
     /// Fail-closed startup sweep: abort every approval left pending by a
@@ -869,6 +893,30 @@ mod tests {
 
     use super::*;
 
+    async fn approval_store(payload: &str) -> Store {
+        let store = Store::open_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at)
+             VALUES ('run_1', 'queued', '{}', '{}', '2026-07-24T00:00:00Z')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO approvals
+                (id, run_id, tool_call_id, kind, summary, payload,
+                 available_decisions, status, expires_at, created_at)
+             VALUES ('apr_1', 'run_1', 'tc_1', 'exec', 'summary', ?,
+                     '[]', 'pending', '2026-07-24T00:05:00Z',
+                     '2026-07-24T00:00:00Z')",
+        )
+        .bind(payload)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        store
+    }
+
     #[test]
     fn status_strings_roundtrip_through_serde() {
         // Guards the hand-maintained *_str tables against drifting from the
@@ -907,5 +955,114 @@ mod tests {
                     .unwrap();
             assert_eq!(parsed, s);
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_tx_is_visible_then_rolls_back() {
+        let store = approval_store("{}").await;
+        let lock = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            store.resolve_approval("apr_1", ApprovalStatus::Pending, None, "ts".to_owned()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(err, StoreError::Transition(_)));
+        drop(lock);
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let resolved = Store::resolve_approval_tx(
+            &mut tx,
+            "apr_1",
+            ApprovalStatus::Approved,
+            None,
+            "2026-07-24T00:01:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.status, ApprovalStatus::Approved);
+        let row = sqlx::query("SELECT status, decision, decided_at FROM approvals WHERE id = ?")
+            .bind("apr_1")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "approved");
+        assert!(row.get::<Option<String>, _>("decision").is_none());
+        assert_eq!(
+            row.get::<Option<String>, _>("decided_at").as_deref(),
+            Some("2026-07-24T00:01:00Z")
+        );
+        drop(tx);
+        let pending = store.get_approval("apr_1").await.unwrap().unwrap();
+        assert_eq!(pending.status, ApprovalStatus::Pending);
+        assert!(pending.decision.is_none());
+        assert!(pending.decided_at.is_none());
+
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        Store::resolve_approval_tx(
+            &mut tx,
+            "apr_1",
+            ApprovalStatus::Approved,
+            None,
+            "2026-07-24T00:01:00Z",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            store.get_approval("apr_1").await.unwrap().unwrap().status,
+            ApprovalStatus::Approved
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_rolls_back_decode_failure_and_can_retry() {
+        let store = approval_store("not-json").await;
+        let err = store
+            .resolve_approval(
+                "apr_1",
+                ApprovalStatus::Approved,
+                None,
+                "2026-07-24T00:01:00Z".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Serde(_)));
+        let row = sqlx::query("SELECT status, decision, decided_at FROM approvals WHERE id = ?")
+            .bind("apr_1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert!(row.get::<Option<String>, _>("decision").is_none());
+        assert!(row.get::<Option<String>, _>("decided_at").is_none());
+
+        sqlx::query("UPDATE approvals SET payload = '{}' WHERE id = 'apr_1'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_approval(
+                    "apr_1",
+                    ApprovalStatus::Approved,
+                    None,
+                    "2026-07-24T00:01:00Z".to_owned()
+                )
+                .await
+                .unwrap()
+                .status,
+            ApprovalStatus::Approved
+        );
+
+        sqlx::query("UPDATE approvals SET payload = 'not-json' WHERE id = 'apr_1'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let err = store
+            .resolve_approval("apr_1", ApprovalStatus::Denied, None, "ts".to_owned())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Serde(_)));
     }
 }
