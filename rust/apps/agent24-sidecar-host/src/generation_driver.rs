@@ -453,6 +453,40 @@ mod tests {
             now,
         )
     }
+    #[allow(clippy::too_many_arguments)]
+    fn d_ready_at(
+        r: Arc<Mutex<R>>,
+        control_steps: impl IntoIterator<Item = Result<ControlStep, ControlWorkerError>>,
+        control_permits: impl IntoIterator<Item = Result<(), ControlPermitError>>,
+        ready_steps: impl IntoIterator<Item = Result<ReadyReadStep, ReadyReadError>>,
+        ready_permits: impl IntoIterator<Item = Result<(), ReadyReadPermitError>>,
+        output: impl IntoIterator<Item = Result<WriteStep, OutputWriteError>>,
+        exits: impl IntoIterator<Item = io::Result<ExitObservation>>,
+        phase: Phase,
+    ) -> GenerationDriver<Launch, Sink, Control, Ready> {
+        GenerationDriver {
+            actor: ActorLaunchOrder::new(
+                Launch(r.clone(), exits.into_iter().collect()),
+                Sink(r.clone(), output.into_iter().collect()),
+                phase,
+                L,
+            ),
+            control: Control {
+                r: r.clone(),
+                s: control_steps.into_iter().collect(),
+                p: control_permits.into_iter().collect(),
+            },
+            ready: Ready {
+                r,
+                s: ready_steps.into_iter().collect(),
+                p: ready_permits.into_iter().collect(),
+            },
+            completed: None,
+            control_eof: false,
+            ready_eof: false,
+            failure: FailureState::None,
+        }
+    }
     fn sig(id: u64) -> Request {
         Request::Signal {
             version: PROTOCOL_VERSION,
@@ -489,7 +523,35 @@ mod tests {
             })
             .unwrap()
     }
-
+    fn counted_step(
+        x: &mut GenerationDriver<Launch, Sink, Control, Ready>,
+        r: &Arc<Mutex<R>>,
+        now: Instant,
+    ) {
+        let before = {
+            let state = r.lock().unwrap();
+            (
+                state.ready_polls,
+                state.ready_permits,
+                state.polls,
+                state.permits,
+            )
+        };
+        x.step(now).unwrap();
+        let after = {
+            let state = r.lock().unwrap();
+            (
+                state.ready_polls,
+                state.ready_permits,
+                state.polls,
+                state.permits,
+            )
+        };
+        assert!(after.0 - before.0 <= 1);
+        assert!(after.1 - before.1 <= 1);
+        assert!(after.2 - before.2 <= 1);
+        assert!(after.3 - before.3 <= 1);
+    }
     #[rustfmt::skip] #[test] fn owned_ready_exit_order(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[],[],[Ok(WriteStep::Complete);3],[Ok(ExitObservation::Running),Ok(ExitObservation::Exited{code:Some(9)})]);prime(&mut x,n);x.actor.ready(n,ready()).unwrap();for _ in 0..3{x.step(n).unwrap()}let f=&r.lock().unwrap().frames;assert!(matches!(decode_reply(&f[0]),Ok(Reply::Owned{..})));assert!(matches!(decode_event(&f[1]),Ok(Event::Ready{..})));assert!(matches!(decode_event(&f[2]),Ok(Event::Exit{code:Some(9),..})));}
     #[rustfmt::skip] #[test] fn output_barrier_retains_request_and_one_credit(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Ok(ControlStep::Complete(IngressStep::Request(sig(11))))],[],[Ok(WriteStep::Complete),Ok(WriteStep::Pending),Ok(WriteStep::Complete)],[]);prime(&mut x,n);reply(&mut x,10);x.step(n).unwrap();assert!(x.completed.is_some());for _ in 0..3{x.step(n).unwrap()}assert!(x.completed.is_none());x.step(n).unwrap();let f=&r.lock().unwrap().frames;assert!(matches!(decode_reply(&f[1]),Ok(Reply::Result{request_id:10,..})));assert!(matches!(decode_reply(&f[2]),Ok(Reply::Result{request_id:11,..})));let r=Arc::new(Mutex::new(R::default()));let mut x=d(r.clone(),[Ok(ControlStep::Idle)],[Ok(())],[Ok(WriteStep::Complete)],[]);prime(&mut x,n);x.step(n).unwrap();let s=r.lock().unwrap();assert_eq!((s.polls,s.permits),(1,1));}
     #[test]
@@ -1095,5 +1157,241 @@ mod tests {
         assert_eq!((counts.ready_permits, counts.permits), (1, 0));
         drop(counts);
         assert_eq!(x.step(now), Err(ActorLaunchOrderError::CleanupRequired));
+    }
+    #[test]
+    fn missing_ready_fails_closed_and_closed_ready_credit_latches_next_turn() {
+        let now = Instant::now();
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut missing = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Idle)],
+            [Ok(())],
+            [Ok(ReadyReadStep::Complete(ReadyRead::Eof))],
+            [],
+            [Ok(WriteStep::Complete)],
+            [Ok(ExitObservation::Running)],
+            now,
+        );
+        assert_eq!(
+            missing.step(now),
+            Err(ActorLaunchOrderError::CleanupRequired)
+        );
+        let state = r.lock().unwrap();
+        assert_eq!(state.permits, 0);
+        assert_eq!(state.stops, vec![true]);
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut closed = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Idle)],
+            [Ok(())],
+            [Ok(ReadyReadStep::Idle)],
+            [Err(ReadyReadPermitError::Closed)],
+            [Ok(WriteStep::Complete)],
+            [Ok(ExitObservation::Running)],
+            now,
+        );
+        closed.step(now).unwrap();
+        assert_eq!(closed.failure, FailureState::DeferredTransport);
+        assert_eq!(r.lock().unwrap().permits, 0);
+        assert_eq!(
+            closed.step(now),
+            Err(ActorLaunchOrderError::CleanupRequired)
+        );
+    }
+    #[test]
+    fn second_ready_and_post_ready_stdout_pollution_are_both_protocol_failures() {
+        let now = Instant::now();
+        for trailing in [ready(), b"not-an-event".as_slice()] {
+            let r = Arc::new(Mutex::new(R::default()));
+            let mut x = d_ready(
+                r.clone(),
+                [Ok(ControlStep::Idle), Ok(ControlStep::Idle)],
+                [],
+                [
+                    Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                        bytes: chunk(ready()),
+                        len: ready().len(),
+                    })),
+                    Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                        bytes: chunk(trailing),
+                        len: trailing.len(),
+                    })),
+                ],
+                [Ok(()), Ok(())],
+                [Ok(WriteStep::Complete)],
+                [Ok(ExitObservation::Running), Ok(ExitObservation::Running)],
+                now,
+            );
+            x.step(now).unwrap();
+            assert_eq!(x.step(now), Err(ActorLaunchOrderError::CleanupRequired));
+            assert_eq!(r.lock().unwrap().stops, vec![true]);
+        }
+    }
+    #[test]
+    fn stopping_unconfirmed_and_empty_never_poll_or_credit_ready() {
+        let now = Instant::now();
+        let present = [TreeObservation::Present, TreeObservation::Present];
+        let unconfirmed = [TreeObservation::Unconfirmed, TreeObservation::Unconfirmed];
+        let scenarios: [(Phase, &[TreeObservation]); 4] = [
+            (Phase::GracefulStopping(now + L.graceful), &[]),
+            (Phase::ForceStopping(now + L.force), &present),
+            (Phase::Unconfirmed, &unconfirmed),
+            (Phase::Empty, &[]),
+        ];
+        for (phase, trees) in scenarios {
+            let r = Arc::new(Mutex::new(R::default()));
+            r.lock().unwrap().trees.extend(trees.iter().copied());
+            let mut x = d_ready_at(
+                r.clone(),
+                [Ok(ControlStep::Idle)],
+                [Ok(())],
+                [Ok(ReadyReadStep::Idle)],
+                [Ok(())],
+                [],
+                [Ok(ExitObservation::Running)],
+                phase,
+            );
+            x.step(now).unwrap();
+            assert_eq!(x.schedule_state().phase, phase);
+            let state = r.lock().unwrap();
+            assert_eq!((state.ready_polls, state.ready_permits), (0, 0));
+        }
+    }
+    #[test]
+    fn ready_output_barrier_precedes_retained_exit_and_blocks_subsequent_credits() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_ready(
+            r.clone(),
+            [Ok(ControlStep::Idle), Ok(ControlStep::Idle)],
+            [Ok(()), Ok(())],
+            [Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                bytes: chunk(ready()),
+                len: ready().len(),
+            }))],
+            [Ok(())],
+            [Ok(WriteStep::Complete), Ok(WriteStep::Complete)],
+            [
+                Ok(ExitObservation::Running),
+                Ok(ExitObservation::Exited { code: Some(23) }),
+            ],
+            now,
+        );
+
+        x.step(now).unwrap();
+        x.step(now).unwrap();
+        let state = r.lock().unwrap();
+        assert_eq!(state.ready_polls, 1);
+        assert_eq!((state.ready_permits, state.permits), (1, 1));
+        assert!(matches!(
+            decode_reply(&state.frames[0]),
+            Ok(Reply::Owned { .. })
+        ));
+        assert!(matches!(
+            decode_event(&state.frames[1]),
+            Ok(Event::Ready { .. })
+        ));
+        drop(state);
+
+        x.step(now).unwrap();
+        x.step(now).unwrap();
+        let state = r.lock().unwrap();
+        assert!(matches!(
+            decode_event(&state.frames[2]),
+            Ok(Event::Exit { code: Some(23), .. })
+        ));
+        assert_eq!(
+            (state.ready_polls, state.ready_permits, state.permits),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn ready_output_barrier_retains_one_completion_and_credits_each_port_once_per_turn() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let request_id = 73;
+        let mut x = d_ready(
+            r.clone(),
+            [
+                Ok(ControlStep::Complete(IngressStep::Request(
+                    Request::IsEmpty {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                    },
+                ))),
+                Ok(ControlStep::Idle),
+                Ok(ControlStep::Idle),
+                Ok(ControlStep::Idle),
+                Ok(ControlStep::Idle),
+                Ok(ControlStep::Idle),
+            ],
+            [Ok(()); 6],
+            [
+                Ok(ReadyReadStep::Complete(ReadyRead::Chunk {
+                    bytes: chunk(ready()),
+                    len: ready().len(),
+                })),
+                Ok(ReadyReadStep::Idle),
+                Ok(ReadyReadStep::Idle),
+                Ok(ReadyReadStep::Idle),
+                Ok(ReadyReadStep::Idle),
+                Ok(ReadyReadStep::Idle),
+            ],
+            [Ok(()); 6],
+            [
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Pending),
+                Ok(WriteStep::Complete),
+                Ok(WriteStep::Pending),
+                Ok(WriteStep::Complete),
+            ],
+            [
+                Ok(ExitObservation::Running),
+                Ok(ExitObservation::Running),
+                Ok(ExitObservation::Running),
+                Ok(ExitObservation::Running),
+                Ok(ExitObservation::Running),
+                Ok(ExitObservation::Running),
+            ],
+            now,
+        );
+        counted_step(&mut x, &r, now);
+        assert!(matches!(
+            x.completed,
+            Some(Request::IsEmpty { request_id: 73, .. })
+        ));
+        assert!(x.schedule_state().output_pending);
+        for _ in 0..3 {
+            counted_step(&mut x, &r, now);
+            assert!(matches!(
+                x.completed,
+                Some(Request::IsEmpty { request_id: 73, .. })
+            ));
+        }
+        counted_step(&mut x, &r, now);
+        assert!(x.completed.is_none());
+        counted_step(&mut x, &r, now);
+        for _ in 0..3 {
+            counted_step(&mut x, &r, now);
+        }
+        let state = r.lock().unwrap();
+        assert_eq!(state.frames.len(), 3);
+        assert_eq!(
+            state
+                .frames
+                .iter()
+                .filter(|frame| {
+                    matches!(
+                        decode_reply(frame),
+                        Ok(Reply::Empty {
+                            request_id: id,
+                            ..
+                        }) if id == request_id
+                    )
+                })
+                .count(),
+            1
+        );
     }
 }
