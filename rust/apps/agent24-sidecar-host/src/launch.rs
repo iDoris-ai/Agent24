@@ -2,11 +2,18 @@ use std::{ffi::OsString, fmt, io, path::PathBuf};
 
 use agent24_sidecar_host_protocol::Request;
 
+#[cfg(windows)]
+use crate::{
+    owner::{GenerationId, GenerationOwner},
+    target::{OwnedPipes, OwnedTarget},
+};
 #[cfg(unix)]
 use crate::{
     posix::{LaunchSpec, OwnedGeneration},
     target::{OwnedPipes, OwnedTarget},
 };
+#[cfg(windows)]
+use tokio::process::Command;
 
 pub(crate) struct LaunchIntent {
     request_id: u64,
@@ -66,7 +73,7 @@ impl fmt::Display for LaunchFailure {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct OwnedLaunch {
     request_id: u64,
     target: OwnedTarget,
@@ -86,6 +93,47 @@ impl OwnedLaunch {
         }
         let owner =
             OwnedGeneration::launch(spec).map_err(|error| LaunchFailure::Start(error.kind()))?;
+        let mut target = OwnedTarget::from_owned(owner);
+        let pipes = target
+            .take_pipes()
+            .map_err(|error| LaunchFailure::Pipes(error.kind()))?;
+        Ok(Self {
+            request_id,
+            target,
+            pipes,
+        })
+    }
+
+    pub(crate) const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub(crate) fn target_mut(&mut self) -> &mut OwnedTarget {
+        &mut self.target
+    }
+
+    pub(crate) fn pipes_mut(&mut self) -> &mut OwnedPipes {
+        &mut self.pipes
+    }
+}
+
+#[cfg(windows)]
+impl OwnedLaunch {
+    pub(crate) fn start(intent: LaunchIntent) -> Result<Self, LaunchFailure> {
+        let request_id = intent.request_id;
+        let generation =
+            GenerationId::new(request_id).map_err(|error| LaunchFailure::Start(error.kind()))?;
+        let owner =
+            GenerationOwner::new(generation).map_err(|error| LaunchFailure::Start(error.kind()))?;
+        let mut command = Command::new(intent.executable);
+        command
+            .current_dir(intent.cwd)
+            .args(intent.argv)
+            .env_clear()
+            .envs(intent.env);
+        let owner = owner
+            .spawn(command)
+            .map_err(|error| LaunchFailure::Start(error.kind()))?;
         let mut target = OwnedTarget::from_owned(owner);
         let pipes = target
             .take_pipes()
@@ -193,6 +241,151 @@ mod tests {
                 Ok(_) => panic!("missing executable must fail"),
             };
         assert_eq!(error, LaunchFailure::Start(io::ErrorKind::NotFound));
+        assert!(!format!("{error:?}").contains(missing));
+    }
+}
+
+#[cfg(all(test, windows))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod windows_tests {
+    use super::*;
+    use crate::target::{ExitObservation, TreeObservation};
+    use std::{collections::BTreeMap, path::Path, time::Duration};
+    use tokio::io::AsyncReadExt;
+
+    fn request(cwd: &Path) -> Request {
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot");
+        Request::Launch {
+            version: 1,
+            request_id: 17,
+            executable: String::from("powershell.exe"),
+            cwd: cwd.display().to_string(),
+            argv: vec![
+                String::from("-NoLogo"),
+                String::from("-NoProfile"),
+                String::from("-NonInteractive"),
+                String::from("-File"),
+                cwd.join("launch.ps1").display().to_string(),
+                String::from("ignored-zero"),
+                String::from("argv-value"),
+            ],
+            env: BTreeMap::from([
+                (String::from("SIDE"), String::from("env-value")),
+                (String::from("SystemRoot"), system_root),
+            ]),
+        }
+    }
+
+    fn descendant_request(cwd: &Path) -> Request {
+        let mut request = request(cwd);
+        if let Request::Launch { argv, env, .. } = &mut request {
+            argv[3] = String::from("-Command");
+            argv[4] = String::from(
+                "$child = Start-Process \"$PSHOME\\powershell.exe\" -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; [Console]::Out.Write('ready'); [Console]::Out.Flush()",
+            );
+            argv.truncate(5);
+            env.remove("SIDE");
+        }
+        request
+    }
+
+    fn reap(launch: &mut OwnedLaunch) {
+        launch
+            .target_mut()
+            .request_stop(true)
+            .expect("force Job tree");
+        for _ in 0..100 {
+            if launch.target_mut().reap_step().expect("reap Job tree")
+                == TreeObservation::ConfirmedEmpty
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("Job tree was not reaped before deadline");
+    }
+
+    #[tokio::test]
+    async fn windows_launch_preserves_request_and_all_pipes() {
+        let parent_current_dir = std::env::current_dir().expect("current cwd");
+        let mut cwd = std::env::temp_dir();
+        cwd.push(format!("agent24-sidecar-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::write(cwd.join("cwd-sentinel"), b"").expect("sentinel");
+        std::fs::write(
+            cwd.join("launch.ps1"),
+            b"param($first,$second)\n$inherited = if ($env:PATH) {$env:PATH} else {'unset'}\n$cwd=if(Test-Path -LiteralPath 'cwd-sentinel') {'cwd-ok'} else {'cwd-bad'}\n$out=\"$cwd|$env:SIDE|$first,$second|$inherited\"\n[Console]::Out.Write($out)\n[Console]::Out.Flush()\n[Console]::Error.Write('err')\n[Console]::Error.Flush()",
+        )
+        .expect("script");
+        assert_ne!(cwd, parent_current_dir);
+        assert!(!parent_current_dir.join("cwd-sentinel").exists());
+        assert!(std::env::var_os("PATH").is_some());
+        let mut launch =
+            OwnedLaunch::start(LaunchIntent::from_request(request(&cwd)).expect("intent"))
+                .expect("owned launch");
+        assert_eq!(launch.request_id(), 17);
+        let pipes = launch.pipes_mut();
+        let _ = &pipes.stdin;
+        let mut stdout = String::new();
+        pipes.stdout.read_to_string(&mut stdout).await.unwrap();
+        let mut stderr = String::new();
+        pipes.stderr.read_to_string(&mut stderr).await.unwrap();
+        let fields: Vec<_> = stdout.split('|').collect();
+        assert_eq!(fields[0], "cwd-ok");
+        assert_eq!(
+            &fields[1..],
+            ["env-value", "ignored-zero,argv-value", "unset"]
+        );
+        assert_eq!(stderr, "err");
+        reap(&mut launch);
+        std::fs::remove_dir_all(&cwd).expect("cleanup cwd");
+    }
+
+    #[tokio::test]
+    async fn windows_launch_keeps_job_authority_after_leader_exit() {
+        let cwd = std::env::temp_dir();
+        let mut launch = OwnedLaunch::start(
+            LaunchIntent::from_request(descendant_request(&cwd)).expect("intent"),
+        )
+        .expect("owned launch");
+        let pipes = launch.pipes_mut();
+        let mut ready = [0; 5];
+        pipes.stdout.read_exact(&mut ready).await.expect("ready");
+        assert_eq!(&ready, b"ready");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match launch.target_mut().observe_exit().expect("observe leader") {
+                ExitObservation::Exited { .. } => break,
+                ExitObservation::Running if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                ExitObservation::Running => panic!("leader did not exit before deadline"),
+            }
+        }
+        assert_eq!(
+            launch.target_mut().reap_step().expect("observe Job"),
+            TreeObservation::Present
+        );
+        reap(&mut launch);
+    }
+
+    #[test]
+    fn windows_missing_executable_is_static_and_redacted() {
+        let missing = "agent24-sidecar-program-that-does-not-exist.exe";
+        let error = OwnedLaunch::start(
+            LaunchIntent::from_request(Request::Launch {
+                version: 1,
+                request_id: 19,
+                executable: missing.to_owned(),
+                cwd: std::env::temp_dir().display().to_string(),
+                argv: Vec::new(),
+                env: BTreeMap::new(),
+            })
+            .expect("intent"),
+        )
+        .err()
+        .expect("missing executable must fail");
+        assert!(matches!(error, LaunchFailure::Start(_)));
         assert!(!format!("{error:?}").contains(missing));
     }
 }
