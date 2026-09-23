@@ -271,7 +271,8 @@ mod tests {
             entered: entered_tx.clone(),
         };
         let now = Instant::now();
-        let mut control = ControlWorker::new_in(slots, read(), Duration::from_secs(1)).unwrap();
+        let mut control =
+            ControlWorker::new_in(slots, read(), Some(Duration::from_secs(1))).unwrap();
         let mut output =
             OutputWorker::new_in(slots, BlockingWrite(read()), Duration::from_secs(1)).unwrap();
         let mut ready = ReadyReadWorker::new_in(slots, read()).unwrap();
@@ -305,7 +306,7 @@ mod tests {
             entered: entered_tx.clone(),
         };
         let now = Instant::now();
-        let mut control = ControlWorker::new_in(slots, read(), Duration::ZERO).unwrap();
+        let mut control = ControlWorker::new_in(slots, read(), Some(Duration::ZERO)).unwrap();
         let mut output =
             OutputWorker::new_in(slots, BlockingWrite(read()), Duration::ZERO).unwrap();
         control.permit(now).unwrap();

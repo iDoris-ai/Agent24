@@ -35,7 +35,7 @@ pub(crate) enum ControlStep {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Idle,
-    InFlight { deadline: Instant },
+    InFlight { deadline: Option<Instant> },
     Closed,
 }
 
@@ -50,7 +50,7 @@ enum State {
 pub(crate) struct ControlWorker {
     credits: SyncSender<()>,
     results: Receiver<WorkerResult>,
-    budget: Duration,
+    budget: Option<Duration>,
     state: State,
 }
 
@@ -58,7 +58,7 @@ impl ControlWorker {
     pub(crate) fn new_in<R: Read + Send + 'static>(
         slots: &'static WorkerSlots,
         reader: R,
-        budget: Duration,
+        budget: Option<Duration>,
     ) -> Result<Self, WorkerSlotError> {
         let (credit_tx, credit_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
@@ -78,7 +78,7 @@ impl ControlWorker {
     #[cfg(test)]
     pub(crate) fn new<R: Read + Send + 'static>(
         reader: R,
-        budget: Duration,
+        budget: Option<Duration>,
     ) -> Result<Self, WorkerSlotError> {
         Self::new_in(WorkerSlots::isolated(), reader, budget)
     }
@@ -95,7 +95,11 @@ impl ControlWorker {
         match self.credits.try_send(()) {
             Ok(()) => {
                 self.state = State::InFlight {
-                    deadline: now.checked_add(self.budget).unwrap_or(now),
+                    // An overflowing finite budget is an immediately expired
+                    // deadline, never an accidental unlimited operation.
+                    deadline: self
+                        .budget
+                        .map(|budget| now.checked_add(budget).unwrap_or(now)),
                 };
                 Ok(())
             }
@@ -117,7 +121,7 @@ impl ControlWorker {
                 Ok(ControlStep::Idle)
             };
         };
-        if now >= deadline {
+        if deadline.is_some_and(|deadline| now >= deadline) {
             self.state = State::Closed;
             return Err(ControlWorkerError::TimedOut);
         }
@@ -266,7 +270,7 @@ mod tests {
     #[test]
     fn no_permit_does_not_read_and_second_permit_is_busy() {
         let (input, calls, _) = reader(vec![Err(ErrorKind::WouldBlock)]);
-        let mut worker = ControlWorker::new(input, BUDGET).unwrap();
+        let mut worker = ControlWorker::new(input, Some(BUDGET)).unwrap();
         let now = Instant::now();
         assert_eq!(worker.step(now), Ok(ControlStep::Idle));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -286,7 +290,7 @@ mod tests {
         let mut input = encode_request(&launch(1), &mut sequence).unwrap();
         input.extend(encode_request(&signal(2), &mut sequence).unwrap());
         let (input, _, threads) = reader(vec![Ok(input)]);
-        let mut worker = ControlWorker::new(input, BUDGET).unwrap();
+        let mut worker = ControlWorker::new(input, Some(BUDGET)).unwrap();
         let now = Instant::now();
 
         worker.permit(now).unwrap();
@@ -314,7 +318,7 @@ mod tests {
             Ok(frame[split..].to_vec()),
             Ok(Vec::new()),
         ]);
-        let mut worker = ControlWorker::new(input, BUDGET).unwrap();
+        let mut worker = ControlWorker::new(input, Some(BUDGET)).unwrap();
         let now = Instant::now();
 
         worker.permit(now).unwrap();
@@ -338,7 +342,7 @@ mod tests {
     #[test]
     fn disconnected_result_worker_and_ingress_failure_are_terminal() {
         let (input, _, _) = reader(vec![Err(ErrorKind::PermissionDenied)]);
-        let mut worker = ControlWorker::new(input, BUDGET).unwrap();
+        let mut worker = ControlWorker::new(input, Some(BUDGET)).unwrap();
         let now = Instant::now();
         worker.permit(now).unwrap();
         assert_eq!(
@@ -350,7 +354,7 @@ mod tests {
         assert_eq!(worker.permit(now), Err(ControlPermitError::Closed));
 
         let (input, _, _) = reader(vec![Err(ErrorKind::WouldBlock)]);
-        let mut disconnected = ControlWorker::new(input, BUDGET).unwrap();
+        let mut disconnected = ControlWorker::new(input, Some(BUDGET)).unwrap();
         let (_, receiver) = mpsc::sync_channel(1);
         let old = std::mem::replace(&mut disconnected.results, receiver);
         drop(old);
@@ -381,7 +385,7 @@ mod tests {
                 started: started_tx,
                 release: release_rx,
             },
-            Duration::from_millis(1),
+            Some(Duration::from_millis(1)),
         )
         .unwrap();
         worker.permit(now).unwrap();
@@ -395,5 +399,65 @@ mod tests {
         drop(worker);
         assert!(began.elapsed() < Duration::from_millis(100));
         release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn no_budget_completes_even_when_polled_far_after_admission() {
+        let (input, _, _) = reader(vec![Err(ErrorKind::WouldBlock)]);
+        let mut worker = ControlWorker::new(input, None).unwrap();
+        let now = Instant::now();
+        worker.permit(now).unwrap();
+        let far_future = now
+            .checked_add(Duration::from_secs(100 * 365 * 24 * 60 * 60))
+            .unwrap();
+        assert_eq!(
+            complete(&mut worker, far_future),
+            Ok(ControlStep::Complete(IngressStep::Pending))
+        );
+    }
+
+    #[test]
+    fn finite_budget_is_inclusive_and_overflow_is_terminal() {
+        let (input, _, _) = reader(vec![Err(ErrorKind::WouldBlock)]);
+        let now = Instant::now();
+        let mut zero = ControlWorker::new(input, Some(Duration::ZERO)).unwrap();
+        zero.permit(now).unwrap();
+        assert_eq!(zero.step(now), Err(ControlWorkerError::TimedOut));
+
+        let (input, _, _) = reader(vec![Err(ErrorKind::WouldBlock)]);
+        let mut overflow = ControlWorker::new(input, Some(Duration::MAX)).unwrap();
+        overflow.permit(now).unwrap();
+        assert_eq!(overflow.step(now), Err(ControlWorkerError::TimedOut));
+    }
+
+    #[test]
+    fn queued_completion_loses_to_an_expired_deadline() {
+        let (input, calls, _) = reader(vec![Err(ErrorKind::WouldBlock)]);
+        let now = Instant::now();
+        let mut worker = ControlWorker::new(input, Some(Duration::from_secs(1))).unwrap();
+        worker.permit(now).unwrap();
+        while calls.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        assert_eq!(
+            worker.step(now + Duration::from_secs(1)),
+            Err(ControlWorkerError::TimedOut)
+        );
+    }
+
+    #[test]
+    fn busy_permit_does_not_renew_the_original_deadline() {
+        let (input, _, _) = reader(vec![Err(ErrorKind::WouldBlock)]);
+        let now = Instant::now();
+        let mut worker = ControlWorker::new(input, Some(Duration::from_secs(1))).unwrap();
+        worker.permit(now).unwrap();
+        assert_eq!(
+            worker.permit(now + Duration::from_millis(500)),
+            Err(ControlPermitError::Busy)
+        );
+        assert_eq!(
+            worker.step(now + Duration::from_secs(1)),
+            Err(ControlWorkerError::TimedOut)
+        );
     }
 }
