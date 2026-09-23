@@ -161,4 +161,150 @@ describe('SchedulesPage', () => {
       ),
     )
   })
+
+  // ME4-1.2.2d — desktop forward-compat for the v3 protocol's module schedule
+  // rows (design ME4-S1-scheduler-callback.md §8.2, judgement C2.10).
+
+  it('a new-shape user row (owner null) behaves exactly as before: eff === enabled', async () => {
+    mount([{ ...SCHEDULE, owner: null, effective_enabled: true, disabled_by: null, user_suspended: false, system_disabled_reason: null }])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('每日晨报')).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: '禁用' })).toBeInTheDocument()
+    // no module-only affordances leak onto a user row
+    expect(screen.queryByText(/来自模块/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/处理$/)).not.toBeInTheDocument()
+  })
+
+  it('old-shape row (no effective_enabled/disabled_by/owner at all) still renders by enabled — forward compat', async () => {
+    // SCHEDULE as-is is exactly what a pre-1.2.2 daemon sends: no owner,
+    // effective_enabled, disabled_by, user_suspended, system_disabled_reason.
+    mount([{ ...SCHEDULE, enabled: true }])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('每日晨报')).toBeInTheDocument())
+    // Mutation check: reading only `effective_enabled` (undefined here) would
+    // be falsy and flip this to '启用' — this assertion goes red under that
+    // mutation (§13 1.2.2d).
+    expect(screen.getByRole('button', { name: '禁用' })).toBeInTheDocument()
+  })
+
+  it('a module row user-suspended by the user shows the reason, module source, and toggles via {enabled:true}', async () => {
+    const proxy = mount([
+      {
+        ...SCHEDULE,
+        id: 'sch_mod_1',
+        name: '天气播报',
+        action: null,
+        owner: { module: 'weather', key: 'daily' },
+        enabled: true,
+        effective_enabled: false,
+        disabled_by: 'user',
+        user_suspended: true,
+        system_disabled_reason: null,
+      },
+    ])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('天气播报')).toBeInTheDocument())
+    expect(screen.getByText('已被你暂停')).toBeInTheDocument()
+    expect(screen.getByText('来自模块 weather')).toBeInTheDocument()
+    expect(screen.getByText('由模块 weather 处理')).toBeInTheDocument()
+    // effectively off → button offers to turn it back on
+    fireEvent.click(screen.getByRole('button', { name: '启用' }))
+    await waitFor(() =>
+      expect(calls).toContainEqual(
+        expect.objectContaining({ method: 'PATCH', path: '/api/v1/schedules/sch_mod_1', body: { enabled: true } }),
+      ),
+    )
+    expect(proxy).toHaveBeenCalled()
+  })
+
+  it('a module row disabled by the system shows the system reason', async () => {
+    mount([
+      {
+        ...SCHEDULE,
+        id: 'sch_mod_2',
+        name: '库存同步',
+        action: null,
+        owner: { module: 'inventory', key: 'sync' },
+        enabled: true,
+        effective_enabled: false,
+        disabled_by: 'system',
+        user_suspended: false,
+        system_disabled_reason: 'consecutive_failures',
+      },
+    ])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('库存同步')).toBeInTheDocument())
+    expect(screen.getByText('系统因连续失败禁用')).toBeInTheDocument()
+  })
+
+  it('a module row that disabled itself shows the module reason (resume would hit 0 rows, v3.1 L5)', async () => {
+    mount([
+      {
+        ...SCHEDULE,
+        id: 'sch_mod_3',
+        name: '每周报表',
+        action: null,
+        owner: { module: 'reports', key: 'weekly' },
+        enabled: false,
+        effective_enabled: false,
+        disabled_by: 'module',
+        user_suspended: false,
+        system_disabled_reason: null,
+      },
+    ])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('每周报表')).toBeInTheDocument())
+    expect(screen.getByText('模块自己停用')).toBeInTheDocument()
+  })
+
+  it('a healthy, enabled module row shows the source and "handled by module" line but no reason', async () => {
+    mount([
+      {
+        ...SCHEDULE,
+        id: 'sch_mod_4',
+        name: '健康检查',
+        action: null,
+        owner: { module: 'health', key: 'check' },
+        enabled: true,
+        effective_enabled: true,
+        disabled_by: null,
+        user_suspended: false,
+        system_disabled_reason: null,
+      },
+    ])
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('健康检查')).toBeInTheDocument())
+    expect(screen.getByText('来自模块 health')).toBeInTheDocument()
+    expect(screen.getByText('由模块 health 处理')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '禁用' })).toBeInTheDocument()
+    // no leftover reason text for a row nothing is holding back
+    expect(screen.queryByText('已被你暂停')).not.toBeInTheDocument()
+    expect(screen.queryByText('系统因连续失败禁用')).not.toBeInTheDocument()
+    expect(screen.queryByText('模块自己停用')).not.toBeInTheDocument()
+  })
+
+  it('run_now on a module row shows the fire_id notice, not "已触发运行 undefined"', async () => {
+    const proxy = vi.fn((req: { method: string; path: string }) => {
+      if (req.method === 'GET') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          data: {
+            schedules: [
+              { ...SCHEDULE, id: 'sch_mod_5', action: null, owner: { module: 'weather', key: 'daily' } },
+            ],
+          },
+        })
+      }
+      if (req.path.endsWith('/run_now')) {
+        return Promise.resolve({ ok: true, status: 202, data: { fire_id: 'fire_xyz789' } })
+      }
+      return Promise.resolve({ ok: true, status: 200, data: SCHEDULE })
+    })
+    window.agent24 = { backendProxy: proxy } as never
+    render(<SchedulesPage />)
+    await waitFor(() => expect(screen.getByText('每日晨报')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '立即运行' }))
+    await waitFor(() => expect(screen.getByText('已投递给模块（fire_id fire_xyz789）')).toBeInTheDocument())
+  })
 })

@@ -65,6 +65,14 @@ describe('agent api', () => {
     ])
   })
 
+  it('run_now on a module row returns the fire_id, not run_id (design §8.2)', async () => {
+    setProxy((req) => {
+      if (req.path.endsWith('/run_now')) return { ok: true, status: 202, data: { fire_id: 'fire_abc123' } }
+      return { ok: true, status: 200, data: {} }
+    })
+    expect(await runScheduleNow('sch_mod')).toBe('fire_abc123')
+  })
+
   it('schedule mutations surface errors', async () => {
     setProxy(() => ({ ok: false, status: 400, data: { error: { message: 'bad spec' } } }))
     await expect(
