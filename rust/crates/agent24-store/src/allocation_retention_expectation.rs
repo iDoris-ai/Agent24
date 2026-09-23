@@ -82,6 +82,46 @@ impl AllocationRetentionExpectation {
     }
 }
 
+/// Replay expectation plus a separately strict audit-tail precondition.
+pub(crate) struct AllocationRetentionAuditExpectation {
+    replay: AllocationRetentionExpectation,
+    tail: crate::audit::StrictAuditTail,
+}
+
+impl AllocationRetentionAuditExpectation {
+    pub(crate) async fn verify_replay_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        intent: &AllocationIntent,
+    ) -> WorkspaceResult<()> {
+        self.replay.verify_replay_tx(tx, intent).await
+    }
+
+    pub(crate) async fn verify_tail_unchanged_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+    ) -> WorkspaceResult<()> {
+        if self.tail == crate::audit::strict_audit_tail_tx(tx).await? {
+            Ok(())
+        } else {
+            Err(WorkspaceStoreError::CorruptRow {
+                table: "audit_log",
+                field: "tail",
+            })
+        }
+    }
+
+    pub(crate) fn prospective_audit_tuple(
+        &self,
+        ts: &str,
+        actor: &str,
+        action: &str,
+        raw_detail: &str,
+    ) -> WorkspaceResult<crate::audit::ProspectiveAuditTuple> {
+        self.tail.prospective(ts, actor, action, raw_detail)
+    }
+}
+
 impl Store {
     /// Read one retained allocation and build its state/audit replay expectation.
     pub(crate) async fn retained_allocation_expectation_tx(
@@ -90,6 +130,18 @@ impl Store {
     ) -> WorkspaceResult<AllocationRetentionExpectation> {
         let evidence = Self::retained_allocation_evidence_tx(tx, intent).await?;
         AllocationRetentionExpectation::from_evidence(&evidence)
+    }
+
+    /// Capture replay evidence and the exact audit append precondition in this transaction.
+    pub(crate) async fn retained_allocation_audit_expectation_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        intent: &AllocationIntent,
+    ) -> WorkspaceResult<AllocationRetentionAuditExpectation> {
+        let replay = Self::retained_allocation_expectation_tx(tx, intent).await?;
+        Ok(AllocationRetentionAuditExpectation {
+            replay,
+            tail: crate::audit::strict_audit_tail_tx(tx).await?,
+        })
     }
 }
 
@@ -103,11 +155,6 @@ mod tests {
     };
     use agent24_protocol::WorkspaceId;
     use serde_json::json;
-    use sha2::{Digest, Sha256};
-
-    #[rustfmt::skip]
-    fn audit_hash(prev: &str, ts: &str, actor: &str, action: &str, detail: &str) -> String { let mut hash = Sha256::new(); hash.update(prev.as_bytes()); hash.update(b"|"); hash.update(ts.as_bytes()); hash.update(b"|"); hash.update(actor.as_bytes()); hash.update(b"|"); hash.update(action.as_bytes()); hash.update(b"|"); hash.update(detail.as_bytes()); hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect() }
-
     #[rustfmt::skip]
     fn intent() -> AllocationIntent {
         AllocationIntent::new(
@@ -144,6 +191,13 @@ mod tests {
         let expectation = Store::retained_allocation_expectation_tx(&mut tx, input).await.unwrap();
         tx.commit().await.unwrap();
         expectation
+    }
+
+    #[rustfmt::skip]
+    async fn audit_expectation(store: &Store, input: &AllocationIntent) -> AllocationRetentionAuditExpectation {
+        let mut tx = store.pool().begin().await.unwrap();
+        let expectation = Store::retained_allocation_audit_expectation_tx(&mut tx, input).await.unwrap();
+        tx.commit().await.unwrap(); expectation
     }
 
     #[tokio::test]
@@ -187,7 +241,7 @@ mod tests {
         let store = Store::open_memory().await.unwrap(); let input = intent(); retained(&store, &input, AllocationPhase::Reserved).await;
         let expected = expectation(&store, &input).await;
         let (prev, raw): (String, String) = sqlx::query_as("SELECT prev_hash,detail FROM audit_log WHERE seq=2").fetch_one(crate::test_hooks::pool(&store)).await.unwrap();
-        let raw = format!(" {raw}"); let hash = audit_hash(&prev, input.created_at().as_str(), ACTOR, ACTION, &raw);
+        let raw = format!(" {raw}"); let hash = crate::audit::entry_hash(&prev, input.created_at().as_str(), ACTOR, ACTION, &raw);
         sqlx::query("UPDATE audit_log SET detail=?,hash=? WHERE seq=2").bind(raw).bind(hash).execute(crate::test_hooks::pool(&store)).await.unwrap();
         let mut tx = store.pool().begin().await.unwrap(); assert!(expected.verify_replay_tx(&mut tx, &input).await.is_err()); tx.rollback().await.unwrap();
         let store = Store::open_memory().await.unwrap(); let input = intent(); retained(&store, &input, AllocationPhase::Reserved).await;
@@ -196,5 +250,45 @@ mod tests {
         let store = Store::open_memory().await.unwrap(); let input = intent(); retained(&store, &input, AllocationPhase::Reserved).await;
         let expected = expectation(&store, &input).await; sqlx::query("DELETE FROM audit_log WHERE seq=2").execute(crate::test_hooks::pool(&store)).await.unwrap();
         let mut tx = store.pool().begin().await.unwrap(); assert!(expected.verify_replay_tx(&mut tx, &input).await.is_err()); tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn unchanged_tail_is_read_only_but_unrelated_append_only_breaks_tail() {
+        let store = Store::open_memory().await.unwrap(); let input = intent(); retained(&store, &input, AllocationPhase::Reserved).await;
+        let expected = audit_expectation(&store, &input).await; let before = store.list_audit().await.unwrap().len(); let mut tx = store.pool().begin().await.unwrap();
+        expected.verify_replay_tx(&mut tx, &input).await.unwrap(); expected.verify_tail_unchanged_tx(&mut tx).await.unwrap();
+        let tuple = expected.prospective_audit_tuple("2026-09-19T00:00:02.000Z", "next", "append", "{}").unwrap(); assert_eq!(tuple.seq(), 3); tx.commit().await.unwrap(); assert_eq!(store.list_audit().await.unwrap().len(), before);
+        store.append_audit("2026-09-19T00:00:03.000Z", "other", "other", &json!({})).await.unwrap(); let mut tx = store.pool().begin().await.unwrap();
+        expected.verify_replay_tx(&mut tx, &input).await.unwrap(); assert!(expected.verify_tail_unchanged_tx(&mut tx).await.is_err()); tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn first_prospective_tuple_uses_genesis_and_checked_sequence() {
+        let store = Store::open_memory().await.unwrap(); let mut tx = store.pool().begin().await.unwrap(); let tail = crate::audit::strict_audit_tail_tx(&mut tx).await.unwrap();
+        let tuple = tail.prospective("2026-09-19T00:00:00.000Z", "actor", "action", "{}").unwrap(); assert_eq!(tuple.seq(), 1); assert_eq!(tuple.prev_hash(), "genesis"); assert_eq!(tuple.hash(), crate::audit::entry_hash("genesis", "2026-09-19T00:00:00.000Z", "actor", "action", "{}")); tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn deleted_rehashed_or_blob_tail_rejects_and_transaction_can_continue() {
+        for sql in ["DELETE FROM audit_log WHERE seq=2", "UPDATE audit_log SET hash=X'00' WHERE seq=2"] {
+            let store = Store::open_memory().await.unwrap(); let input = intent(); retained(&store, &input, AllocationPhase::Reserved).await; let expected = audit_expectation(&store, &input).await;
+            sqlx::query(sql).execute(crate::test_hooks::pool(&store)).await.unwrap(); let mut tx = store.pool().begin().await.unwrap(); let error = expected.verify_tail_unchanged_tx(&mut tx).await.unwrap_err();
+            if sql.contains("hash=X") { assert_eq!(error, WorkspaceStoreError::CorruptRow { table: "audit_log", field: "hash" }); } else { assert!(matches!(error, WorkspaceStoreError::CorruptRow { .. })); } sqlx::query("INSERT INTO audit_log (ts,actor,action,detail,prev_hash,hash) VALUES ('2026-09-19T00:00:02.000Z','test','continued','{}','x','y')").execute(&mut *tx).await.unwrap(); tx.commit().await.unwrap();
+        }
+        let store = Store::open_memory().await.unwrap(); let input = intent(); retained(&store, &input, AllocationPhase::Reserved).await; let expected = audit_expectation(&store, &input).await;
+        let raw = "{\"changed\":true}"; let hash = crate::audit::entry_hash(&store.list_audit().await.unwrap()[0].hash, input.created_at().as_str(), ACTOR, ACTION, raw);
+        sqlx::query("UPDATE audit_log SET detail=?,hash=? WHERE seq=2").bind(raw).bind(hash).execute(crate::test_hooks::pool(&store)).await.unwrap(); let mut tx = store.pool().begin().await.unwrap(); assert!(expected.verify_tail_unchanged_tx(&mut tx).await.is_err()); tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn duplicate_or_malformed_high_water_rejects_without_poisoning_caller_transaction() {
+        for (sql, error) in [("INSERT INTO sqlite_sequence (name,seq) VALUES ('audit_log',2)", WorkspaceStoreError::CorruptRow { table: "sqlite_sequence", field: "row" }), ("INSERT INTO sqlite_sequence (name,seq) VALUES ('audit_log',X'00')", WorkspaceStoreError::CorruptRow { table: "sqlite_sequence", field: "row" }), ("UPDATE sqlite_sequence SET seq=X'00' WHERE name='audit_log'", WorkspaceStoreError::CorruptRow { table: "sqlite_sequence", field: "seq" }), ("UPDATE sqlite_sequence SET seq=3 WHERE name='audit_log'", WorkspaceStoreError::CorruptRow { table: "audit_log", field: "tail" })] {
+            let store = Store::open_memory().await.unwrap(); let input = intent(); retained(&store, &input, AllocationPhase::Reserved).await; sqlx::query(sql).execute(crate::test_hooks::pool(&store)).await.unwrap(); let mut tx = store.pool().begin().await.unwrap();
+            let actual = match Store::retained_allocation_audit_expectation_tx(&mut tx, &input).await { Err(actual) => actual, Ok(_) => unreachable!() }; assert_eq!(actual, error); assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log").fetch_one(&mut *tx).await.unwrap(), 2); tx.commit().await.unwrap();
+        }
     }
 }
