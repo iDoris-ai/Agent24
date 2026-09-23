@@ -140,6 +140,8 @@ struct Endpoint {
     child: Option<tokio::process::Child>,
 }
 
+const HOST_AUTHORITY_UNAVAILABLE: &str = "host authority unavailable";
+
 /// The shutdown part of `agent24 daemon status` (SHUT-1c): the budgets and
 /// the bound they give, anything rejected, the daemon before this one, and
 /// which modules its shutdown found too slow — each with the knob to turn.
@@ -204,6 +206,67 @@ async fn health_ok(base: &str, token: &str) -> bool {
     )
 }
 
+fn discovery_health_token(state: &DaemonState) -> &str {
+    &state.token
+}
+
+/// Resolve a discovery record for an operation that needs the host bearer.
+/// Capability discovery is intentionally not upgraded into authority by
+/// treating an absent token as an anonymous request.
+fn host_token(state: &DaemonState) -> Result<&str, String> {
+    state.bearer_token().map_err(|err| match err {
+        HOST_AUTHORITY_UNAVAILABLE => HOST_AUTHORITY_UNAVAILABLE.to_owned(),
+        _ => format!("invalid daemon discovery state: {err}"),
+    })
+}
+
+fn endpoint_from_state(state: DaemonState) -> Result<Endpoint, String> {
+    let token = host_token(&state)?.to_owned();
+    Ok(Endpoint {
+        base: format!("http://127.0.0.1:{}", state.port),
+        token,
+        child: None,
+    })
+}
+
+/// Parse the ready line without ever manufacturing a host token for a
+/// capability daemon. The daemon output remains backward-compatible: missing
+/// `auth_mode` means legacy, and legacy ready lines must still carry `token`.
+fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState, String> {
+    if value["type"] != "ready" {
+        return Err("not a daemon ready line".to_owned());
+    }
+    let port = value["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
+        .ok_or_else(|| "ready line has invalid port".to_owned())?;
+    let auth_mode = value
+        .get("auth_mode")
+        .cloned()
+        .map(serde_json::from_value::<agent24_protocol::state_file::AuthMode>)
+        .transpose()
+        .map_err(|_| "ready line has unknown auth_mode".to_owned())?
+        .unwrap_or_default();
+    let token = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let state = DaemonState {
+        port,
+        token,
+        pid,
+        version: value["version"].as_str().unwrap_or("").to_owned(),
+        generation: value["generation"].as_str().unwrap_or("").to_owned(),
+        auth_mode,
+    };
+    state
+        .validate()
+        .map_err(|e| format!("invalid ready line: {e}"))?;
+    Ok(state)
+}
+
 fn agent24d_binary() -> String {
     if let Some(bin) = std::env::var_os("AGENT24D_BIN") {
         return bin.to_string_lossy().into_owned();
@@ -249,20 +312,9 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
         if let Ok(state) = serde_json::from_str::<serde_json::Value>(&line)
             && state["type"] == "ready"
         {
-            let port = state["port"].as_u64().unwrap_or(0) as u16;
-            let token = state["token"].as_str().unwrap_or("").to_owned();
             let pid = child.id().unwrap_or(0);
-            return Ok((
-                DaemonState {
-                    port,
-                    token,
-                    pid,
-                    version: state["version"].as_str().unwrap_or("").to_owned(),
-                    generation: String::new(),
-                    auth_mode: agent24_protocol::state_file::AuthMode::LegacySingleToken,
-                },
-                child,
-            ));
+            let parsed = parse_ready_state(&state, pid)?;
+            return Ok((parsed, child));
         }
     }
 }
@@ -271,19 +323,21 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
 async fn connect() -> Result<Endpoint, String> {
     if let Some(state) = state_file::read_live() {
         let base = format!("http://127.0.0.1:{}", state.port);
-        if health_ok(&base, &state.token).await {
-            return Ok(Endpoint {
-                base,
-                token: state.token,
-                child: None,
-            });
+        if state.auth_mode.is_capabilities() {
+            // Health is deliberately anonymous, but it never grants the
+            // bearer needed by the operation that called `connect`.
+            let _ = health_ok(&base, "").await;
+            return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+        }
+        if health_ok(&base, discovery_health_token(&state)).await {
+            return endpoint_from_state(state);
         }
     }
     let (state, child) = spawn_daemon(true).await?;
     let base = format!("http://127.0.0.1:{}", state.port);
     Ok(Endpoint {
         base,
-        token: state.token,
+        token: host_token(&state)?.to_owned(),
         child: Some(child),
     })
 }
@@ -301,12 +355,14 @@ async fn finish(mut ep: Endpoint) {
 /// `None` if no live daemon is discoverable or healthy.
 async fn attach_only() -> Option<Endpoint> {
     let state = state_file::read_live()?;
+    if state.auth_mode.is_capabilities() {
+        return None;
+    }
     let base = format!("http://127.0.0.1:{}", state.port);
-    health_ok(&base, &state.token).await.then_some(Endpoint {
-        base,
-        token: state.token,
-        child: None,
-    })
+    health_ok(&base, discovery_health_token(&state))
+        .await
+        .then(|| endpoint_from_state(state).ok())
+        .flatten()
 }
 
 /// Serve agent24d as an MCP server over stdio (E4). Attaches to the running
@@ -773,7 +829,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         DaemonAction::Start => {
             if let Some(state) = state_file::read_live() {
                 let base = format!("http://127.0.0.1:{}", state.port);
-                if health_ok(&base, &state.token).await {
+                if health_ok(&base, discovery_health_token(&state)).await {
                     println!(
                         "daemon already running (pid {}, port {})",
                         state.pid, state.port
@@ -791,7 +847,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     for _ in 0..30 {
                         if let Some(state) = state_file::read_live() {
                             let base = format!("http://127.0.0.1:{}", state.port);
-                            if health_ok(&base, &state.token).await {
+                            if health_ok(&base, discovery_health_token(&state)).await {
                                 println!(
                                     "daemon already running (pid {}, port {})",
                                     state.pid, state.port
@@ -814,10 +870,9 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         DaemonAction::Status => match state_file::read_live() {
             Some(state) => {
                 let base = format!("http://127.0.0.1:{}", state.port);
-                if health_ok(&base, &state.token).await {
+                if health_ok(&base, "").await {
                     let res = client()
                         .get(format!("{base}/api/v1/health"))
-                        .bearer_auth(&state.token)
                         .send()
                         .await
                         .map_err(|e| e.to_string())?;
@@ -833,28 +888,32 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     // The whole exchange is bounded, not just the connect: a
                     // daemon that stalls mid-response must not hang `status`
                     // (review of SHUT-1c, round 2).
-                    match client()
-                        .get(format!("{base}/api/v1/shutdown"))
-                        .bearer_auth(&state.token)
-                        .timeout(Duration::from_secs(5))
-                        .send()
-                        .await
-                    {
-                        Ok(res) if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {}
-                        Ok(res) if res.status().is_success() => {
-                            match res.json::<agent24_protocol::ShutdownReport>().await {
-                                Ok(report) => {
-                                    for line in shutdown_lines(&report) {
-                                        println!("{line}");
+                    if state.auth_mode.is_capabilities() {
+                        println!("  shutdown report unavailable: {HOST_AUTHORITY_UNAVAILABLE}");
+                    } else {
+                        match client()
+                            .get(format!("{base}/api/v1/shutdown"))
+                            .bearer_auth(host_token(&state).map_err(|e| e.to_owned())?)
+                            .timeout(Duration::from_secs(5))
+                            .send()
+                            .await
+                        {
+                            Ok(res) if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {}
+                            Ok(res) if res.status().is_success() => {
+                                match res.json::<agent24_protocol::ShutdownReport>().await {
+                                    Ok(report) => {
+                                        for line in shutdown_lines(&report) {
+                                            println!("{line}");
+                                        }
                                     }
+                                    Err(e) => println!("  (shutdown report unreadable: {e})"),
                                 }
-                                Err(e) => println!("  (shutdown report unreadable: {e})"),
                             }
+                            Ok(res) => {
+                                println!("  (shutdown report: daemon returned {})", res.status())
+                            }
+                            Err(e) => println!("  (shutdown report unavailable: {e})"),
                         }
-                        Ok(res) => {
-                            println!("  (shutdown report: daemon returned {})", res.status())
-                        }
-                        Err(e) => println!("  (shutdown report unavailable: {e})"),
                     }
                 } else {
                     println!(
@@ -871,13 +930,16 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         },
         DaemonAction::Stop => match state_file::read_live() {
             Some(state) => {
+                if state.auth_mode.is_capabilities() {
+                    return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+                }
                 // Authenticated shutdown: the bearer token proves this is OUR
                 // daemon — a reused pid of an unrelated process can never be
                 // hit (review B6)
                 let base = format!("http://127.0.0.1:{}", state.port);
                 let res = client()
                     .post(format!("{base}/api/v1/shutdown"))
-                    .bearer_auth(&state.token)
+                    .bearer_auth(host_token(&state).map_err(|e| e.to_owned())?)
                     .timeout(Duration::from_secs(5))
                     .send()
                     .await;
@@ -988,6 +1050,43 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn old_ready_line_requires_and_keeps_legacy_token() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "token": "legacy", "version": "v"
+        });
+        let state = parse_ready_state(&ready, 7).unwrap();
+        assert_eq!(
+            state.auth_mode,
+            agent24_protocol::state_file::AuthMode::LegacySingleToken
+        );
+        assert_eq!(host_token(&state), Ok("legacy"));
+    }
+
+    #[test]
+    fn capability_ready_line_never_mints_a_host_token() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "version": "v",
+            "auth_mode": "capabilities", "generation": "gen-1"
+        });
+        let state = parse_ready_state(&ready, 7).unwrap();
+        assert!(state.token.is_empty());
+        assert_eq!(
+            host_token(&state),
+            Err(HOST_AUTHORITY_UNAVAILABLE.to_owned())
+        );
+    }
+
+    #[test]
+    fn capability_ready_line_with_token_fails_closed() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "token": "must-not-be-here",
+            "auth_mode": "capabilities", "generation": "gen-1"
+        });
+        let err = parse_ready_state(&ready, 7).unwrap_err();
+        assert!(err.contains("must not contain a token"), "{err}");
+    }
 
     /// `daemon status` says what the shutdown report says, and names the knob
     /// for each module found too slow (SHUT-1c).
