@@ -318,11 +318,10 @@ pub(crate) async fn read_run_lease_tx(
 ) -> WorkspaceResult<Option<WorkspaceLeaseRow>> {
     let rows = sqlx::query(
         "SELECT * FROM workspace_leases WHERE kind='run' AND released_at IS NULL
-         AND (owner_id=? COLLATE BINARY OR workspace_id=? COLLATE BINARY)
+         AND owner_id=? COLLATE BINARY
          ORDER BY lease_id COLLATE BINARY",
     )
     .bind(hold.run_id())
-    .bind(hold.workspace_id().as_str())
     .fetch_all(&mut **tx)
     .await
     .map_err(|_| WorkspaceStoreError::Database)?;

@@ -35,6 +35,16 @@ fn terminal_action(status: RunStatus) -> Option<&'static str> {
         RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingApproval => None,
     }
 }
+fn run_status_text(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::AwaitingApproval => "awaiting_approval",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
 
 pub(crate) async fn abort_all_pending_terminal_approvals_tx(
     tx: &mut Transaction<'_, Sqlite>,
@@ -172,6 +182,100 @@ fn expected_released_hold(
     expected.active_resume_approval_id = None;
     expected.released_at = Some(ended_at.clone());
     expected
+}
+pub(crate) async fn release_terminal_hold_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    held: &LegacyRecoveryHold,
+    ended_at: &WorkspaceInstant,
+) -> WorkspaceResult<TerminalMutation<LegacyRecoveryHold>> {
+    if held.recovery_state == RecoveryState::Released {
+        return Ok(TerminalMutation::Conflict);
+    }
+    let expected = expected_released_hold(held, ended_at);
+    let changed = sqlx::query(
+        "UPDATE legacy_recovery_holds SET recovery_state='released',ready_at=NULL,
+             released_at=?,active_resume_approval_id=NULL
+         WHERE run_id=? COLLATE BINARY AND cohort_id=? COLLATE BINARY
+           AND workspace_id=? COLLATE BINARY AND root_generation=? COLLATE BINARY
+           AND original_status=? COLLATE BINARY AND recovery_state=? COLLATE BINARY
+           AND approval_id IS ? AND ready_at IS ? AND reason_code IS ?
+           AND released_at IS NULL AND active_resume_approval_id IS ?",
+    )
+    .bind(ended_at.as_str())
+    .bind(held.run_id())
+    .bind(held.cohort_id())
+    .bind(held.workspace_id().as_str())
+    .bind(held.root_generation())
+    .bind(run_status_text(held.original_status()))
+    .bind(held.recovery_state().as_str())
+    .bind(held.approval_id())
+    .bind(held.ready_at().map(WorkspaceInstant::as_str))
+    .bind(held.reason_code())
+    .bind(held.active_resume_approval_id())
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    if changed.rows_affected() != 1 {
+        return Ok(TerminalMutation::Conflict);
+    }
+    match read_hold_tx(tx, held.run_id()).await? {
+        actual if actual == expected => Ok(TerminalMutation::Applied(expected)),
+        _ => Err(bad("legacy_recovery_holds", "row")),
+    }
+}
+pub(crate) async fn close_terminal_cohort_if_last_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    held: &LegacyRecoveryHold,
+    ended_at: &WorkspaceInstant,
+) -> WorkspaceResult<TerminalMutation<Option<crate::terminal_helpers::TerminalCohortFacts>>> {
+    if held.recovery_state != RecoveryState::Released
+        || held.released_at.as_ref() != Some(ended_at)
+        || read_hold_tx(tx, held.run_id()).await? != *held
+    {
+        return Ok(TerminalMutation::Conflict);
+    }
+    let cohort = read_cohort_tx(tx, held).await?;
+    if cohort.completed_at.is_some() {
+        return Ok(TerminalMutation::Conflict);
+    }
+    let (open, latest): (i64, Option<String>) = sqlx::query_as(
+        "SELECT count(CASE WHEN released_at IS NULL THEN 1 END), max(released_at)
+         FROM legacy_recovery_holds WHERE cohort_id=? COLLATE BINARY",
+    )
+    .bind(held.cohort_id())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    if open != 0 {
+        return Ok(TerminalMutation::Applied(None));
+    }
+    if latest.as_deref().is_some_and(|at| at > ended_at.as_str()) {
+        return Ok(TerminalMutation::Conflict);
+    }
+    let mut expected = cohort.clone();
+    expected.completed_at = Some(ended_at.clone());
+    let changed = sqlx::query(
+        "UPDATE legacy_recovery_cohorts SET completed_at=? WHERE cohort_id=? COLLATE BINARY
+         AND migration_version=? AND legacy_workspace_id=? COLLATE BINARY
+         AND root_generation=? COLLATE BINARY AND created_at=? COLLATE BINARY
+         AND completed_at IS NULL",
+    )
+    .bind(ended_at.as_str())
+    .bind(&cohort.cohort_id)
+    .bind(cohort.migration_version as i64)
+    .bind(cohort.workspace_id.as_str())
+    .bind(&cohort.root_generation)
+    .bind(cohort.created_at.as_str())
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| WorkspaceStoreError::Database)?;
+    if changed.rows_affected() != 1 {
+        return Ok(TerminalMutation::Conflict);
+    }
+    match read_cohort_tx(tx, held).await? {
+        actual if actual == expected => Ok(TerminalMutation::Applied(Some(expected))),
+        _ => Err(bad("legacy_recovery_cohorts", "row")),
+    }
 }
 pub(crate) async fn observe_released_terminal_tx(
     tx: &mut Transaction<'_, Sqlite>,
@@ -378,6 +482,55 @@ mod tests {
             })
         ));
         tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hold_and_last_cohort_writes_are_cas_reread() {
+        let store = crate::legacy_recovery::tests::strict_facts_fixture().await;
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let held = read_hold_tx(&mut tx, "run-strict").await.unwrap();
+        let ended = WorkspaceInstant::parse("2026-09-19T00:00:01.000Z").unwrap();
+        let released = match release_terminal_hold_tx(&mut tx, &held, &ended)
+            .await
+            .unwrap()
+        {
+            TerminalMutation::Applied(value) => value,
+            TerminalMutation::Conflict => panic!("fresh hold must release"),
+        };
+        assert_eq!(read_hold_tx(&mut tx, "run-strict").await.unwrap(), released);
+        sqlx::raw_sql(
+            "INSERT INTO runs (id,status,input,usage,created_at,workspace_id)
+             VALUES ('later','running','{}','{}','2026-09-19T00:00:00.000Z',
+                     'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5');
+             INSERT INTO legacy_recovery_holds
+             (run_id,cohort_id,workspace_id,root_generation,original_status,recovery_state,released_at)
+             VALUES ('later','cohort-strict','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5',
+                     'g1','running','released','2026-09-19T00:00:02.000Z');",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(
+            close_terminal_cohort_if_last_tx(&mut tx, &released, &ended)
+                .await
+                .unwrap(),
+            TerminalMutation::Conflict
+        );
+        sqlx::query("UPDATE legacy_recovery_holds SET released_at=? WHERE run_id='later'")
+            .bind(ended.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let closed = close_terminal_cohort_if_last_tx(&mut tx, &released, &ended)
+            .await
+            .unwrap();
+        assert!(matches!(closed, TerminalMutation::Applied(Some(_))));
+        assert!(matches!(
+            release_terminal_hold_tx(&mut tx, &held, &ended)
+                .await
+                .unwrap(),
+            TerminalMutation::Conflict
+        ));
     }
 
     #[tokio::test]
