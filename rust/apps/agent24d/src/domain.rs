@@ -1977,8 +1977,18 @@ emit_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/events/emit",
             "params": {"kind": "task.transitioned", "payload": {"x": 1}}}
 cb.sendall((json.dumps(emit_req) + "\n").encode())
 emit_resp = json.loads(f.readline())
-with open("probe.json", "w") as out:
+# Write-to-temp + rename is atomic on the same filesystem (POSIX rename(2)):
+# a plain `open(..., "w")` truncates the file before any bytes are written
+# (and the buffered writer may not flush until `close()`), so a concurrent
+# reader can observe an empty or partial file — this is what let
+# `granted_and_offer_and_the_real_call_agree_for_both_outcomes` fail with
+# "EOF while parsing a value" under load (FU-78). This way any concurrent
+# reader sees either the old (absent) file or the new complete one, never
+# a half-written one. See `me3f_blackbox.rs`'s `dump_atomic` for the same
+# pattern.
+with open("probe.json.tmp", "w") as out:
     json.dump({"offers_events": offers_events, "emit_response": emit_resp}, out)
+os.replace("probe.json.tmp", "probe.json")
 while f.readline():
     pass
 "#;
@@ -2214,8 +2224,17 @@ status_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/approval/status",
               "params": {"approval_id": "does-not-exist"}}
 cb.sendall((json.dumps(status_req) + "\n").encode())
 status_resp = json.loads(f.readline())
-with open("probe.json", "w") as out:
+# Write-to-temp + rename is atomic on the same filesystem (POSIX rename(2)):
+# a plain `open(..., "w")` truncates the file before any bytes are written
+# (and the buffered writer may not flush until `close()`), so a concurrent
+# reader can observe an empty or partial file — this is what let this test
+# fail with "EOF while parsing a value" under load (FU-78). This way any
+# concurrent reader sees either the old (absent) file or the new complete
+# one, never a half-written one. See `me3f_blackbox.rs`'s `dump_atomic` for
+# the same pattern.
+with open("probe.json.tmp", "w") as out:
     json.dump({"offers_approval": offers_approval, "status_response": status_resp}, out)
+os.replace("probe.json.tmp", "probe.json")
 while f.readline():
     pass
 "#;
