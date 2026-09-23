@@ -39,12 +39,16 @@
 | ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `BACKLOG` | |
 | ME4-M2 门 | Sin90 | Sin90 M3（T3.1.1–T3.5.1）全 DONE | 1.5.1, 0.1 | `BACKLOG` | |
 | ME4-M3 门 | Sin90 | Sin90 M4（T4.1.1–T4.4.1）全 DONE | M2 门 | `BACKLOG` | |
-| ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `BACKLOG`（可与 M2/M3 并行） | |
-| ME4-4.2.1 | Agent24 | `model_access` manifest 字段 + Models 授权 | 4.1.1, 1.5.1 | `BACKLOG` | |
-| ME4-4.2.2a | Agent24 | `agent24-models` 契约扩展（max_tokens / model_id） | 4.1.1 | `BACKLOG` | |
-| ME4-4.2.2b | Agent24 | `_a24/model/complete` handler | 4.2.1, 4.2.2a, 1.5.1 | `BACKLOG` | |
-| ME4-4.2.3 | Agent24 | 按模块持久化用量 | 4.2.2b | `BACKLOG` | |
-| ME4-4.3.1 | Agent24 | 推理黑盒验收 + 探针 `4b` | 4.2.2b, 4.2.3 | `BACKLOG` | |
+| ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `PR_OPEN` | #445（冻结 v3.1；3 轮 Opus 评审，第 3 轮 APPROVE）—— 切法以设计 §10.2 为准 |
+| ME4-4.2.1 | Agent24 | `model_access` manifest 字段解析（只做 manifest，不授予） | 4.1.1 | `BACKLOG` | |
+| ME4-4.2.2-0 | Agent24 | rpc 按方法超时 + ErrorKind `unavailable`（17→18）+ SPEC 闭集句 | 4.1.1 | `BACKLOG` | |
+| ME4-4.2.2a | Agent24 | `agent24-models` 契约扩展（max_tokens / model_id / Rejected）+ 回环判定改 reqwest::Url + `loopback_only()` + `OLLAMA_URL` 进 PASSTHROUGH_VARS（关闭 FU-72） | 4.1.1 | `BACKLOG` | |
+| ME4-4.2.2b1a | Agent24 | model_callback 基础（常量、UsageSink/Ticket、ModelAdmission、ModelGrant、错误映射；未注册） | 4.2.2-0, 4.2.2a | `BACKLOG` | |
+| ME4-4.2.2b1b | Agent24 | model_callback wire 类型 + handler（未注册） | 4.2.2b1a | `BACKLOG` | |
+| ME4-4.2.2b2 | Agent24 | 授予 Models + provides + 注册 + serve 接线（CallbackDeps.models）；删 dead_code 豁免 | 4.2.2b1b, 4.2.1, 1.4.1 | `BACKLOG` | |
+| ME4-4.2.3a | Agent24 | 用量迁移 + store（module_model_usage） | 4.2.2b2 | `BACKLOG` | |
+| ME4-4.2.3b | Agent24 | 用量 recorder + `/api/v1/usage?module=` + serve 换 sink | 4.2.3a | `BACKLOG` | |
+| ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `BACKLOG` | |
 | ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `BACKLOG` | |
 | ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `BACKLOG` | |
 | ME4-5.1.2a | Agent24 | SDK transport + 握手（只经 proto）+ 结构测试 | 5.1.1 | `BACKLOG` | |
