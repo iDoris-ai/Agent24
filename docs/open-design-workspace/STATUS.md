@@ -190,6 +190,15 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 所有上述后代仍 dependency-stacked，等待外部 review；没有 runtime product wiring，P2/P9 仍未完成。
   下一步限于 G8 bounded outbox，以及 G1 B1c tail/high-water。
 
+## 2026-09-24 Wave 14 当前门禁
+
+- #255 已合入 main（merge commit `530bd46`）。#259 已直接在 main 重建，head `0f7fd36`，
+  +277/-31；两份独立 exact-diff review `PASS` 且五项 CI green，但 new review 尚待完成，不能据此宣称可 merge。
+- 新堆叠 #485（依赖 #483，head `23d0497`，+462/-2）两份 exact-diff `PASS`；#486（依赖 #484，
+  head `f41c561`，+218 test-only）exact review `PASS`；二者 CI green、review pending。
+- 已批准且 CI green 的堆叠祖先仍不具 dependency-ready 条件；#228 仍是 root `REVIEW_REQUIRED`。
+  因此没有新增 merge-ready Open Design PR，P2/P9 继续 `IN PROGRESS`。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
