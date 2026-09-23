@@ -1,6 +1,8 @@
 # ADR-006：Legacy Recovery Holds
 
-> 状态：Proposed / G4 implementation blocked until accepted
+> 状态：Accepted / frozen for incremental G4 implementation
+>
+> 接受依据：项目 owner 已批准 P0–P9 计划与阶段门禁后的自动推进；后续切片不得偏离本 ADR，重大设计变化仍需重新确认。
 >
 > 覆盖：A24-OD-02 历史 Run 迁移、恢复与 serial admission
 >
