@@ -168,16 +168,41 @@ pub struct HttpMlWorker {
 impl HttpMlWorker {
     /// Build a client for a worker at `base_url` (e.g. `http://127.0.0.1:8099`).
     /// A trailing slash is trimmed so path joining is unambiguous.
+    ///
+    /// FU-74: unlike `agent24-models`' providers (which point at
+    /// user-configured `OMLX_URL`/`OLLAMA_URL` and so can legitimately be
+    /// remote, hence that crate's `env_local_tier` + `loopback_only` gate),
+    /// the ML worker is — per this module's doc comment — "a separate process
+    /// the daemon spawns": there is no caller anywhere in the workspace today
+    /// that points `base_url` at anything but a locally spawned worker, and no
+    /// env var configures it. So this client is unconditionally loopback-only
+    /// rather than gated on parsing `base_url`. Embed requests carry raw
+    /// memory content, and the default reqwest client both reads
+    /// `HTTP_PROXY`/`ALL_PROXY` (without bypassing loopback) and follows
+    /// redirects — either would ship that content off-box whenever the
+    /// caller's shell happens to export a proxy. If `base_url` ever becomes
+    /// remote-configurable, replace this with the same `reqwest::Url`-based
+    /// loopback check `agent24-models` uses instead of assuming local.
     pub fn new(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
+        // A worker that accepts TCP but never answers must not hang the
+        // daemon: a bounded connect timeout classifies as Unavailable.
+        // FU-74: no_proxy() + redirect::none(), unconditionally — see this
+        // method's doc comment for why.
+        #[expect(
+            clippy::expect_used,
+            reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
+                      redirect-following client FU-74 exists to rule out; fail closed instead"
+        )]
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("building the loopback-only ML worker HTTP client failed");
         Self {
             base_url,
-            // A worker that accepts TCP but never answers must not hang the
-            // daemon: a bounded connect timeout classifies as Unavailable.
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .build()
-                .unwrap_or_default(),
+            client,
             call_timeout: Duration::from_secs(120),
             quick_timeout: Duration::from_secs(5),
         }
@@ -698,5 +723,129 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "cancel not prompt"
         );
+    }
+
+    // ── FU-74: HttpMlWorker's client must not honour HTTP_PROXY ────────────
+    //
+    // Same shape as agent24-models' `from_env_local_providers_ignore_http_proxy`
+    // (rust/crates/agent24-models/src/router.rs): a child process gets
+    // HTTP_PROXY/ALL_PROXY pointed at a proxy stub and no NO_PROXY, then makes
+    // one request; the proxy stub's connection count tells us whether the
+    // client obeyed the proxy env. A positive control (plain
+    // `reqwest::Client::builder()...build()`, no `no_proxy()`) proves the env
+    // was actually in effect for the child, so a green test isn't measuring a
+    // proxy that was never reachable in the first place.
+    //
+    // The child tests below use a lowercase env var name
+    // (`fu74_worker_target_port`) to pass the stub's port, deliberately NOT
+    // SCREAMING_SNAKE_CASE: `agent24-cli`'s `passthrough_list_matches_what_the_daemon_actually_reads`
+    // test scans every `env::var("...")`/`env::var_os("...")` literal under
+    // `crates/` (this crate included) and demands every SHOUTY-cased name be in
+    // `PASSTHROUGH_VARS` — a launchd LaunchAgent gets none of the login shell's
+    // env otherwise. A test-only variable would trip that scanner for no
+    // reason; the scanner's own shouty-case filter is the documented escape
+    // hatch for exactly this.
+
+    /// A blocking stub on its own thread: counts connections, answers `reply`.
+    fn thread_stub(reply: String) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut buf = [0u8; 65536];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (port, n)
+    }
+
+    fn health_ok_reply() -> String {
+        let body = r#"{"status":"ok","capabilities":["embed"]}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn target_port() -> u16 {
+        // Deliberately lowercase — see the module comment above.
+        std::env::var("fu74_worker_target_port")
+            .expect("run_child must set fu74_worker_target_port")
+            .parse()
+            .expect("fu74_worker_target_port must be a u16")
+    }
+
+    /// Child: the production path — `HttpMlWorker::new` must be loopback-only.
+    #[tokio::test]
+    #[ignore = "child process of http_ml_worker_ignores_http_proxy"]
+    async fn proxy_child_http_ml_worker() {
+        let url = format!("http://127.0.0.1:{}", target_port());
+        let worker = HttpMlWorker::new(url)
+            .with_timeouts(Duration::from_millis(500), Duration::from_millis(500));
+        let _ = worker.health(&CancellationToken::new()).await;
+    }
+
+    /// Child: positive control — the bare default client, same URL, same env.
+    #[tokio::test]
+    #[ignore = "child process of http_ml_worker_ignores_http_proxy"]
+    async fn proxy_child_default_client() {
+        let url = format!("http://127.0.0.1:{}", target_port());
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let _ = client
+            .get(url)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    }
+
+    fn run_child(test: &str, target: u16, proxy: u16) {
+        let exe = std::env::current_exe().unwrap();
+        let proxy_url = format!("http://127.0.0.1:{proxy}");
+        let status = std::process::Command::new(exe)
+            .args(["--exact", test, "--ignored", "--nocapture"])
+            .env("fu74_worker_target_port", target.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn http_ml_worker_ignores_http_proxy() {
+        let (tp, target) = thread_stub(health_ok_reply());
+        let (pp, proxy) = thread_stub(health_ok_reply());
+        run_child("tests::proxy_child_http_ml_worker", tp, pp);
+        assert_eq!(
+            proxy.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the proxy saw HttpMlWorker's request"
+        );
+        assert_eq!(target.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Positive control: the default client under the same env goes through
+        // the proxy — proves HTTP_PROXY was actually live for the child.
+        let (tp2, target2) = thread_stub(health_ok_reply());
+        let (pp2, proxy2) = thread_stub(health_ok_reply());
+        run_child("tests::proxy_child_default_client", tp2, pp2);
+        assert_eq!(
+            proxy2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "measuring instrument: proxy env must take effect"
+        );
+        assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

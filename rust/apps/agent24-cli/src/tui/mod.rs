@@ -31,11 +31,26 @@ pub struct Conn {
 }
 
 impl Conn {
+    /// FU-74: `self.base` is always the daemon on loopback (`agent24-cli`
+    /// only ever constructs `Conn` from an `Endpoint` whose base is
+    /// `http://127.0.0.1:{port}`), and every call through this client carries
+    /// the bearer token. The default reqwest
+    /// client reads `HTTP_PROXY`/`ALL_PROXY` without bypassing loopback and
+    /// follows redirects — a stray proxy env var (or an impersonator that
+    /// answers with a 3xx, since the daemon itself never redirects) would
+    /// otherwise ship the bearer token off-box.
     fn client(&self) -> reqwest::Client {
+        #[expect(
+            clippy::expect_used,
+            reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
+                      redirect-following client FU-74 exists to rule out; fail closed instead"
+        )]
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default()
+            .expect("building the loopback-only daemon HTTP client failed")
     }
 
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -375,6 +390,8 @@ async fn reconcile(conn: &Conn, app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -400,5 +417,122 @@ mod tests {
         );
         // other Ctrl combos are ignored, not passed through as Char
         assert_eq!(map_key(KeyCode::Char('a'), KeyModifiers::CONTROL), None);
+    }
+
+    // ── FU-74: `Conn::client()` must not honour HTTP_PROXY ─────────────────
+    //
+    // Same shape as `tests::cli_client_ignores_http_proxy` in `super::super`
+    // (crate::main), agent24-models' `from_env_local_providers_ignore_http_proxy`,
+    // and agent24-worker's `http_ml_worker_ignores_http_proxy`. See the CLI
+    // client test's comment for why the target-port env var is safe to spell
+    // SCREAMING_SNAKE_CASE here: `apps/agent24-cli` is outside what
+    // `passthrough_list_matches_what_the_daemon_actually_reads` scans.
+
+    /// A blocking stub on its own thread: counts connections, answers `reply`.
+    fn thread_stub(reply: String) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut buf = [0u8; 65536];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (port, n)
+    }
+
+    fn runs_ok_reply() -> String {
+        let body = r#"{"runs":[]}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn target_port() -> u16 {
+        std::env::var("AGENT24_TUI_TEST_TARGET_PORT")
+            .expect("run_child must set AGENT24_TUI_TEST_TARGET_PORT")
+            .parse()
+            .expect("AGENT24_TUI_TEST_TARGET_PORT must be a u16")
+    }
+
+    /// Child: the production path — `Conn::client()` must be loopback-only,
+    /// and the bearer token must not be handed to a proxy.
+    #[tokio::test]
+    #[ignore = "child process of tui_conn_client_ignores_http_proxy"]
+    async fn proxy_child_conn_client() {
+        let conn = Conn {
+            base: format!("http://127.0.0.1:{}", target_port()),
+            token: "SECRET-BEARER".to_owned(),
+        };
+        let _ = conn
+            .auth(conn.client().get(format!("{}/api/v1/runs", conn.base)))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    }
+
+    /// Child: positive control — the bare default client, same URL, same env.
+    #[tokio::test]
+    #[ignore = "child process of tui_conn_client_ignores_http_proxy"]
+    async fn proxy_child_default_client() {
+        let url = format!("http://127.0.0.1:{}/api/v1/runs", target_port());
+        let raw_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let _ = raw_client
+            .get(url)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    }
+
+    fn run_child(test: &str, target: u16, proxy: u16) {
+        let exe = std::env::current_exe().unwrap();
+        let proxy_url = format!("http://127.0.0.1:{proxy}");
+        let status = std::process::Command::new(exe)
+            .args(["--exact", test, "--ignored", "--nocapture"])
+            .env("AGENT24_TUI_TEST_TARGET_PORT", target.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn tui_conn_client_ignores_http_proxy() {
+        let (tp, target) = thread_stub(runs_ok_reply());
+        let (pp, proxy) = thread_stub(runs_ok_reply());
+        run_child("tui::tests::proxy_child_conn_client", tp, pp);
+        assert_eq!(
+            proxy.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the proxy saw the TUI daemon client's request"
+        );
+        assert_eq!(target.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Positive control: the default client under the same env goes through
+        // the proxy — proves HTTP_PROXY was actually live for the child.
+        let (tp2, target2) = thread_stub(runs_ok_reply());
+        let (pp2, proxy2) = thread_stub(runs_ok_reply());
+        run_child("tui::tests::proxy_child_default_client", tp2, pp2);
+        assert_eq!(
+            proxy2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "measuring instrument: proxy env must take effect"
+        );
+        assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
