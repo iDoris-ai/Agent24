@@ -208,31 +208,11 @@ try:
                 "request_id": rid, "fire_id": headers.get("x-a24-fire-id", ""),
             })
             go_path = os.path.join(data_dir, "go_after_drain")
-            # Kept SMALL and well clear of the production DELIVERY_TIMEOUT
+            # Kept small and well clear of the production DELIVERY_TIMEOUT
             # (10s, `agent24_scheduler::deliveries::DELIVERY_TIMEOUT`) that
-            # governs THIS SAME kernel-initiated request end to end.
-            #
-            # A real, reproduced failure mode this budget guards against
-            # (found empirically, not hypothesised): if the WHOLE round trip
-            # from this delivery's `admit_request` to the module's eventual
-            # response is allowed to approach 10s, the kernel's own timeout
-            # can fire FIRST — `send_kernel_request` drops the in-flight
-            # exchange and calls `finish()`, which brings the module's
-            # `in_flight` count to 0 purely because the KERNEL gave up, not
-            # because anything was answered. `supervisor.rs`'s `drain_run`
-            # polls exactly that count every 10ms and, seeing it hit 0, tears
-            # the module process down right then — mid-hot-disable, the
-            # module can be SIGTERM'd while it is still between writing
-            # `handler_result.json` and finishing `append_atomic("fires.json"`
-            # (`os.replace`'s rename never runs), losing that fire's record
-            # with no exception and no `error.txt` (a bare SIGTERM bypasses
-            # Python's `except Exception` entirely — it is not a raised
-            # exception at all). This is why the budget below has to leave
-            # real headroom, not just be "less than 10s": add the pump's own
-            # wake-up cadence (`PUMP_INTERVAL`, ≤1s) and the hot-disable
-            # REST call's own worst case (`ADMISSION_CLOSED_WITHIN`, ≤2s,
-            # both on the Rust side of this same round trip) to whatever is
-            # spent HERE, and the total must still clear 10s with margin.
+            # governs this same kernel-initiated request end to end, so the
+            # test itself never becomes the reason a real delivery attempt
+            # runs long. Ordinary bounded wait — no other significance.
             deadline = time.time() + 3
             while not os.path.exists(go_path) and time.time() < deadline:
                 time.sleep(0.05)
@@ -1018,6 +998,33 @@ fn scheduler_callback_blackbox_round_trip() {
         Duration::from_secs(10),
         || d2.recent_stderr(),
     );
+    // The handler writes `handler_result.json` BEFORE it appends to
+    // `fires.json` (see MODULE_SCRIPT) — the two are not one atomic step, so
+    // observing the first is not proof the second has happened yet. Poll
+    // `fires.json` itself (same bounded-wait shape as scenario 4's own
+    // `run_now_fires` above) until this fire's OWN entry is actually there,
+    // rather than reading it once, immediately, and risking the narrow
+    // window between the two writes.
+    let blocked_run_now_fires = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let fires: Vec<serde_json::Value> = fires_with_trigger(home.path(), "run_now")
+                .into_iter()
+                .filter(|f| f["fire_id_header"] == blocked_fire_id)
+                .collect();
+            if !fires.is_empty() {
+                break fires;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the blocked run_now's own fire never appeared in fires.json; \
+                 daemon stderr:\n{}",
+                d2.recent_stderr()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert_eq!(blocked_run_now_fires.len(), 1, "{blocked_run_now_fires:?}");
     assert_eq!(result["saw_go"], true, "{result}");
     assert!(
         result["good"].get("error").is_none(),
@@ -1042,7 +1049,10 @@ fn scheduler_callback_blackbox_round_trip() {
     //    probe file one more time, now that every scenario has run — catches
     //    a duplicate delivery of a fire that an earlier, narrower assertion
     //    (checked right after triggering it, before later scenarios had a
-    //    chance to run) would have missed.
+    //    chance to run) would have missed. Safe to read straight through
+    //    now (no polling needed here): `blocked_run_now_fires` above already
+    //    waited for scenario 6's own fire to actually land in `fires.json`,
+    //    which is the only entry in this whole test that write ever raced.
     //
     // Checked FIRST, before the counts below: unlike every earlier
     // `wait_for_probe` call in this test, a plain re-read of `fires.json`
@@ -1066,25 +1076,6 @@ fn scheduler_callback_blackbox_round_trip() {
     // `{}` on exactly that, but the raw dump costs nothing and remains the
     // fastest way to see it) would be invisible to `fires_with_trigger`'s
     // filter but still show up here.
-    //
-    // KNOWN RARE FLAKE (residual risk, not yet root-caused): roughly 1 in
-    // 10-30 runs, `run_now_fires`/`final_run_now_fires` below is missing
-    // scenario 6's own fire entirely — no duplicate, no malformed/`null`
-    // entry in `all_fires`, and no `error.txt` (ruled out: a Python
-    // exception between `handler_result.json` and `append_atomic("fires.json"`
-    // would raise and be caught above). Wall-clock instrumentation across
-    // 100+ runs (since removed) showed the WHOLE round trip from `run_now`
-    // to `handler_result.json` completing in ~110-170ms even on runs that
-    // went on to fail this check — ruling out every timing-budget theory
-    // this file's history briefly carried (racing `DELIVERY_TIMEOUT`,
-    // `ADMISSION_CLOSED_WITHIN`, the pump's `PUMP_INTERVAL`): none of those
-    // budgets are anywhere close to being exhausted when this happens.
-    // Failures cluster in bursts against this same shared, often
-    // heavily-loaded machine (`uptime` showed load averages of 5-7 during
-    // one such burst) rather than spreading evenly, which points at an OS
-    // scheduling stall of the module's single thread at an unlucky instant
-    // rather than a logic bug this file's own review could keep chasing
-    // productively. Tracked for follow-up rather than fixed here.
     let all_fires = read_probe(home.path(), "fires.json").unwrap_or(serde_json::json!([]));
     let final_tick_fires = fires_with_trigger(home.path(), "tick");
     assert_eq!(
