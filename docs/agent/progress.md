@@ -37,6 +37,17 @@
 2. Codex 额度 09-29 恢复后按 followups.md 的 `ME4-CODEX-DEBT-*` 清单补审。
 3. 用户手动：给 `iDoris-ai/Sin90`、`MushroomDAO/Cos72` main 开 ruleset。
 
+## 2026-09-24 夜（第二段）：战报
+
+**合并**（approve 覆盖当前 head 才合）：Agent24 #439（规划）、#473（FU-74）、#476（FU-78）、#482（FU-79）；Sin90 #5（规划）、#4、#6（CI）、#7（文档）、#29（SFU-9/10）。Sin90 main CI 绿。
+**新开 PR**：Agent24 #500 → #501 → #502（ME4-1.3.1 fired 投递，Opus 2 轮）；Sin90 #35 → #36 → #37（T5.2.1 classify，Opus 3 轮）。
+**rebase 待重审**：Sin90 #8、#9、#14（与更新后的 main 冲突，已 rebase 并留言）。
+**进行中**：ME4-1.5.1 调度黑盒（10/10 绿，评审中）；Sin90 T5.4.1 propose（叠在 #37 上，Opus 第 3 轮评审中）。
+**误操作 / 教训**：
+- 为合 #439，把子 PR #444/#446 的 base 改成 main，**两者已有的 approve 被作废**（不可逆），需重审；已记入 memory。
+- 按过时台账重做了一遍 T0.2（开了重复的 Sin90 #38，已关闭）；开工前应先查 PR 列表。
+**待登记 Sin90 followups**：SFU-12（J7 检查器误拒 `pub(crate)`）、SFU-13（CreateTasks validate 缺标题 / direction 检查）、SFU-14（precheck 拿不到写锁时 fail-open）。
+
 ## 阻塞项（BLOCKED）
 
 - 无。
