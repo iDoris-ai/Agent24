@@ -133,13 +133,20 @@ probe() { # probe <描述> <文件> <符号>
 # `cargo test -- --list` 真的列出这个测试名，比 grep 更接近「能不能跑」，虽然
 # 仍不等于「跑了并且绿」（那是验收本身的事，`me4_scheduler_blackbox.rs` 顶部
 # 判据自己连跑 10 次）。
+#
+# 评审 M3 的复现：第一版在**本地工作树**里跑 `--list`，却把结果标成
+# 「● 已在 $REF」——REF 上哪怕是一份编译不过的旧版本，只要本地工作树上是好的，
+# 也会被喊 ●。改法：把 $REF 真的检出到一个临时 worktree（`git worktree add
+# --detach`），在那份检出里跑 `--list`，答的是「REF 上这个测试能不能跑」，不是
+# 「我这棵树能不能跑」；且工作树上这个文件只要和 REF 的版本不是字节一致（未合并
+# 或有本地改动），就不拿"曾经在 REF 上跑通"去冒充"这就是你现在的改动"，降级为
+# ◐。临时 worktree 的 `CARGO_TARGET_DIR` 指到本仓库自己的 `rust/target`（同一份
+# 依赖缓存），REF 与本地大部分依赖版本相同时不用重新编译整个依赖图。
 probe_4a() {
   local desc="4a   调度回调" file="rust/apps/agent24d/tests/me4_scheduler_blackbox.rs"
   local test_name="scheduler_callback_blackbox_round_trip"
-  local on_ref=1 on_tree=1
 
-  git cat-file -e "$REF:$file" 2>/dev/null && on_ref=0
-  if [ $on_ref -ne 0 ]; then
+  if ! git cat-file -e "$REF:$file" 2>/dev/null; then
     if [ -f "$file" ]; then
       echo "  ◐ 只在本地   $desc   (你这棵树上有,$REF 上还没有 —— 未合并)"
     else
@@ -147,25 +154,50 @@ probe_4a() {
     fi
     return 1
   fi
+
+  # REF 上有这个文件——但工作树上的版本和它字节一致吗？不一致（未合并、或合并
+  # 之后又有本地改动）就不能拿"跑 REF 的检出"这件事去回答"我这棵树怎么样"，
+  # 降级为 ◐（评审 M3）。
+  local ref_blob local_blob
+  ref_blob=$(git rev-parse "$REF:$file" 2>/dev/null)
+  if [ -f "$file" ]; then
+    local_blob=$(git hash-object "$file" 2>/dev/null)
+  else
+    local_blob=""
+  fi
+  if [ "$ref_blob" != "$local_blob" ]; then
+    echo "  ◐ 只在本地   $desc   (工作树上这个文件和 $REF 的版本不是字节一致 —— 未合并,或合并后又改过;不能拿 $REF 的结果代表这棵树)"
+    return 1
+  fi
+
   if ! command -v rustup >/dev/null 2>&1; then
     echo "  ⛔ 4a   调度回调   本机没有 rustup,无法真的跑 \`cargo test -- --list\` 判定"
     echo "     —— 不当成「未开工」,是「判不了」"
     return 2
   fi
-  if [ -f "$file" ] \
-     && (cd rust && rustup run 1.98.0 cargo test -p agent24d --test me4_scheduler_blackbox -- --list 2>/dev/null \
-         | grep -qE "^${test_name}: test\$"); then
-    on_tree=0
+  local tmp_wt main_target ok=1
+  tmp_wt=$(mktemp -d)
+  main_target="$(pwd)/rust/target"
+  if ! git worktree add --detach --quiet "$tmp_wt" "$REF" >/dev/null 2>&1; then
+    rm -rf "$tmp_wt"
+    echo "  ⛔ 4a   调度回调   \`git worktree add\` 检出 $REF 失败,无法判定它是否真的能跑"
+    return 2
   fi
-  if [ $on_tree -eq 0 ]; then
-    echo "  ● 已在 $REF  $desc   (\`cargo test -p agent24d --test me4_scheduler_blackbox -- --list\` 真的列出了 $test_name)"
+  if [ -f "$tmp_wt/$file" ] \
+     && (cd "$tmp_wt/rust" \
+         && CARGO_TARGET_DIR="$main_target" rustup run 1.98.0 cargo test \
+              -p agent24d --test me4_scheduler_blackbox -- --list 2>/dev/null \
+         | grep -qE "^${test_name}: test\$"); then
+    ok=0
+  fi
+  git worktree remove --force "$tmp_wt" >/dev/null 2>&1 || rm -rf "$tmp_wt"
+  git worktree prune >/dev/null 2>&1 || true
+
+  if [ $ok -eq 0 ]; then
+    echo "  ● 已在 $REF  $desc   (在 $REF 自己的一份临时检出里,\`cargo test --list\` 真的列出了 $test_name)"
     return 0
   fi
-  if [ -f "$file" ]; then
-    echo "  ◌ 未开工?    $desc   (文件在,但 cargo test --list 列不出 $test_name —— 编译坏了,还是测试改名/丢了 #[test]?)"
-  else
-    echo "  ◌ 未开工?    $desc   (文件已在 $REF,本地这棵树上却没有)"
-  fi
+  echo "  ◌ 未开工?    $desc   ($REF 上有这个文件,但在它自己的检出里 cargo test --list 列不出 $test_name —— 编译坏了,还是测试改名/丢了 #[test]?)"
   return 1
 }
 
