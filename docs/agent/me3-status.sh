@@ -126,6 +126,49 @@ probe() { # probe <描述> <文件> <符号>
   return 1
 }
 
+# ME4-1.5.1：4a 这一格不用 `probe` 的文本 grep —— 符号存在只证明「写过这个函数
+# 名」，证明不了「这条链路（真实 daemon 进程 + 真实 tick + 真实 out-of-process
+# Python 模块）真的能跑」：函数名可能没被 `cargo test` 认作测试（比如漏了
+# `#[test]`），或者这个 `--test` target 编译不过。**判定问 cargo 本身**——
+# `cargo test -- --list` 真的列出这个测试名，比 grep 更接近「能不能跑」，虽然
+# 仍不等于「跑了并且绿」（那是验收本身的事，`me4_scheduler_blackbox.rs` 顶部
+# 判据自己连跑 10 次）。
+probe_4a() {
+  local desc="4a   调度回调" file="rust/apps/agent24d/tests/me4_scheduler_blackbox.rs"
+  local test_name="scheduler_callback_blackbox_round_trip"
+  local on_ref=1 on_tree=1
+
+  git cat-file -e "$REF:$file" 2>/dev/null && on_ref=0
+  if [ $on_ref -ne 0 ]; then
+    if [ -f "$file" ]; then
+      echo "  ◐ 只在本地   $desc   (你这棵树上有,$REF 上还没有 —— 未合并)"
+    else
+      echo "  ○ 未开工     $desc"
+    fi
+    return 1
+  fi
+  if ! command -v rustup >/dev/null 2>&1; then
+    echo "  ⛔ 4a   调度回调   本机没有 rustup,无法真的跑 \`cargo test -- --list\` 判定"
+    echo "     —— 不当成「未开工」,是「判不了」"
+    return 2
+  fi
+  if [ -f "$file" ] \
+     && (cd rust && rustup run 1.98.0 cargo test -p agent24d --test me4_scheduler_blackbox -- --list 2>/dev/null \
+         | grep -qE "^${test_name}: test\$"); then
+    on_tree=0
+  fi
+  if [ $on_tree -eq 0 ]; then
+    echo "  ● 已在 $REF  $desc   (\`cargo test -p agent24d --test me4_scheduler_blackbox -- --list\` 真的列出了 $test_name)"
+    return 0
+  fi
+  if [ -f "$file" ]; then
+    echo "  ◌ 未开工?    $desc   (文件在,但 cargo test --list 列不出 $test_name —— 编译坏了,还是测试改名/丢了 #[test]?)"
+  else
+    echo "  ◌ 未开工?    $desc   (文件已在 $REF,本地这棵树上却没有)"
+  fi
+  return 1
+}
+
 # 坐标。三处「它报的坐标不是它量的坐标」都在这里被回答：
 #   ① 手写表会静默过期            → 换成探针
 #   ② 打印 HEAD 却读工作树        → 脏树标记（下面 tree_coord）
@@ -172,6 +215,7 @@ probe "3d   记忆回调"            rust/apps/agent24d/src/memory_callback.rs  
 probe "3e   事件 + 审批"         rust/apps/agent24d/src/module_approvals.rs      "pub async fn decide_module_approval"
 probe "3f   仓外包端到端"        rust/apps/agent24d/tests/me3f_blackbox.rs       "fn a_package_from_outside_the_repo"
 probe "3g   启用路径准入"        rust/apps/agent24d/src/os_routes.rs             "fn admission_refused_response"
+probe_4a
 echo
 echo "验收(3f)未通过之前,「支持第三方 OS」只是一句声称。"
 echo "探针只回答「代码在不在」,回答不了「有没有生产调用方」—— 🟢 与 ✅ 的区别仍要人判断。"
