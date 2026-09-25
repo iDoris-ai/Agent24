@@ -71,7 +71,7 @@ use agent24_protocol::{
     EventBody, Schedule, ScheduleCreate, ScheduleDisabledPayload, ScheduleFiredPayload,
     ScheduleUpdate,
 };
-use agent24_store::{Advance, NewFire, ScheduleRecord, Store, StoreError};
+use agent24_store::{Advance, NewFire, ScheduleRecord, Store, StoreError, SuspendOutcome};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
@@ -93,6 +93,31 @@ pub enum ScheduleError {
     Invalid(String),
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// Design §8.2/§8.3: a module-owned row was sent a PATCH that touched
+    /// anything other than a lone `enabled` field. REST maps this to `409
+    /// module_owned_schedule`.
+    #[error(
+        "schedule {0} is owned by a module; only suspend/resume (or a PATCH \
+         of exactly {{\"enabled\": ...}}), and DELETE, are allowed"
+    )]
+    ModuleOwned(String),
+    /// Design §8.2/§8.3: `suspend`/`resume` was called on a USER row — those
+    /// endpoints only mean anything for a module row (a user row already has
+    /// `PATCH {enabled}`). REST maps this to `409 not_a_module_schedule`.
+    #[error("schedule {0} is not a module-owned schedule")]
+    NotModuleOwned(String),
+    /// Design §2.4/§8.2 (v2 M9, review M-2): the REST PATCH write-back, or a
+    /// `resume`, lost its CAS on every retry — a concurrent tick/PATCH/module
+    /// upsert kept moving the row out from under it. REST maps this to `409
+    /// schedule_conflict`.
+    #[error("schedule {0} was modified concurrently; retry the request")]
+    Conflict(String),
+    /// Design §8.3: RPC-only (`_a24/scheduler/upsert`'s per-owner quota,
+    /// ME4-1.4.1) — no REST path constructs this today, but the variant
+    /// lives here because `ScheduleError` is the one error type both surfaces
+    /// share.
+    #[error("module schedule quota exceeded: {0} rows")]
+    QuotaExceeded(u32),
 }
 
 impl From<SpecError> for ScheduleError {
@@ -219,29 +244,143 @@ impl Scheduler {
         Ok(self.store.list_schedules().await?)
     }
 
-    /// Apply a partial update. Changing `spec`, or toggling `enabled`,
-    /// recomputes `next_run_at`; disabling clears it.
+    /// Apply a partial update (design §2.4/§8.2, ME4-1.2.2c).
+    ///
+    /// A USER row: changing `spec`, or toggling `enabled`, recomputes
+    /// `next_run_at`; disabling clears it. The write-back is CAS'd on the
+    /// revision AND `next_run_at`/`last_run_at` this call read (§2.4, v2 M9)
+    /// — a tick's pre-advance does not bump revision, so revision alone
+    /// would not catch "this call read `next_run_at = X` → a tick advanced
+    /// it to `Y` → this call writes `X` back", which would re-arm an already
+    /// -advanced slot. A lost CAS re-reads and re-applies the SAME (pure)
+    /// `ScheduleUpdate`, up to 3 times total, before giving up with
+    /// [`ScheduleError::Conflict`].
+    ///
+    /// A MODULE row (§8.2): the only shape this accepts is EXACTLY
+    /// `{"enabled": ...}` (no other field, and no other field alongside
+    /// `enabled`) — mapped onto [`suspend`](Self::suspend)/
+    /// [`resume`](Self::resume). Anything else is
+    /// [`ScheduleError::ModuleOwned`].
     pub async fn update(
         &self,
         id: &str,
         update: ScheduleUpdate,
         now: DateTime<Utc>,
     ) -> Result<Schedule, ScheduleError> {
-        let mut schedule = self.get(id).await?;
-        let mut recompute = false;
-        if let Some(name) = update.name {
-            schedule.name = name;
+        self.update_inner(id, update, now, || async {}).await
+    }
+
+    /// The actual implementation, with a test seam (design §13 M-D, C2.9):
+    /// `between_read_and_write` runs on EVERY attempt, after that attempt's
+    /// read (and the pure recompute derived from it) and before that
+    /// attempt's write — exactly the window a concurrent tick's pre-advance
+    /// (or another writer) can land in. Production always calls
+    /// [`update`](Self::update), which passes a no-op (`FnMut`, not
+    /// `FnOnce`, purely so a test racer that only fires once — e.g. a single
+    /// real tick — is naturally harmless on the attempts after the one it
+    /// raced, rather than because production needs more than one call).
+    /// Mirrors [`fire_agent_run`](Self::fire_agent_run)/
+    /// [`fire_agent_run_inner`](Self::fire_agent_run_inner)'s existing seam.
+    /// Only the crate's own tests (`-p agent24-scheduler update_cas`) reach
+    /// for this directly.
+    async fn update_inner<F, Fut>(
+        &self,
+        id: &str,
+        update: ScheduleUpdate,
+        now: DateTime<Utc>,
+        mut between_read_and_write: F,
+    ) -> Result<Schedule, ScheduleError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let first = self
+            .store
+            .get_schedule_record(id)
+            .await?
+            .ok_or_else(|| ScheduleError::NotFound(id.to_owned()))?;
+        if first.schedule.owner.is_some() {
+            // §8.2: module rows never go through the CAS retry loop below —
+            // `suspend`/`resume` (§8.2's SQL) are each already their own
+            // idempotent, correctly-CAS'd write.
+            return self.module_row_patch(id, &update, now).await;
         }
-        if let Some(spec) = update.spec {
-            validate(&spec)?;
-            schedule.spec = spec;
+
+        let mut record = first;
+        for _attempt in 0..3 {
+            let ScheduleRecord {
+                schedule: current,
+                revision,
+            } = record;
+            let seen_next_run_at = current.next_run_at.clone();
+            let seen_last_run_at = current.last_run_at.clone();
+            let schedule = Self::apply_user_update(current, &update, now)?;
+
+            // Runs on EVERY attempt, between this attempt's read and its
+            // write — exactly the window a concurrent tick/PATCH/upsert can
+            // land in. Production always passes a no-op (`|| async {}`), so
+            // this costs nothing there; only the crate's own tests
+            // (`-p agent24-scheduler update_cas`) pass one that does
+            // anything, and a no-op racer that fires only once (e.g. a
+            // single real tick) is naturally harmless on the attempts after
+            // the one it raced.
+            between_read_and_write().await;
+
+            let landed = self
+                .store
+                .update_user_schedule_cas(
+                    &schedule,
+                    revision,
+                    seen_next_run_at.as_deref(),
+                    seen_last_run_at.as_deref(),
+                )
+                .await?;
+            if landed {
+                return Ok(schedule);
+            }
+            // Lost the CAS — a concurrent tick/PATCH moved the row. Re-read
+            // and re-apply the SAME (pure) update (design §2.4).
+            record = self
+                .store
+                .get_schedule_record(id)
+                .await?
+                .ok_or_else(|| ScheduleError::NotFound(id.to_owned()))?;
+            if record.schedule.owner.is_some() {
+                // Ownership is immutable in this design (nothing ever turns
+                // a user row into a module row or back) — unreachable in
+                // practice, but this loop is not the module row's path.
+                return Err(ScheduleError::ModuleOwned(id.to_owned()));
+            }
+        }
+        Err(ScheduleError::Conflict(id.to_owned()))
+    }
+
+    /// The pure part of a user-row PATCH (design §2.4: "`ScheduleUpdate` 是
+    /// 行的纯函数" — the CAS retry loop above re-applies this, unchanged, to
+    /// a freshly read row). Only ever called on a USER row (module rows are
+    /// routed to [`module_row_patch`](Self::module_row_patch) before
+    /// reaching here), so `user_suspended`/`system_disabled_reason` are
+    /// always false/None (migration 0007's CHECK) — `!enabled` is the only
+    /// thing `disabled_by` can be tracking.
+    fn apply_user_update(
+        mut schedule: Schedule,
+        update: &ScheduleUpdate,
+        now: DateTime<Utc>,
+    ) -> Result<Schedule, ScheduleError> {
+        let mut recompute = false;
+        if let Some(name) = &update.name {
+            schedule.name = name.clone();
+        }
+        if let Some(spec) = &update.spec {
+            validate(spec)?;
+            schedule.spec = spec.clone();
             recompute = true;
         }
-        if let Some(action) = update.action {
-            schedule.action = Some(action);
+        if let Some(action) = &update.action {
+            schedule.action = Some(action.clone());
         }
-        if let Some(delivery) = update.delivery {
-            schedule.delivery = delivery;
+        if let Some(delivery) = &update.delivery {
+            schedule.delivery = delivery.clone();
         }
         if let Some(enabled) = update.enabled {
             if enabled != schedule.enabled {
@@ -249,21 +388,8 @@ impl Scheduler {
             }
             schedule.enabled = enabled;
         }
-        // Keep the view fields consistent with a changed `enabled`. This
-        // crate only ever legitimately handles USER rows today (module-row
-        // PATCH guardrails are ME4-1.2.2c's job, not wired up yet) — on one,
-        // `user_suspended`/`system_disabled_reason` are always
-        // false/None (migration 0007's CHECK), so `!enabled` is the only
-        // thing `disabled_by` can be tracking. Leave a module row's view
-        // fields alone rather than guess at them.
-        if schedule.owner.is_none()
-            && !schedule.user_suspended
-            && schedule.system_disabled_reason.is_none()
-        {
-            schedule.effective_enabled = schedule.enabled;
-            schedule.disabled_by =
-                (!schedule.enabled).then_some(agent24_protocol::DisabledBy::User);
-        }
+        schedule.effective_enabled = schedule.enabled;
+        schedule.disabled_by = (!schedule.enabled).then_some(agent24_protocol::DisabledBy::User);
         if recompute {
             schedule.next_run_at = if schedule.enabled {
                 next_fire(&schedule.spec, now)?.map(fmt_iso)
@@ -273,8 +399,98 @@ impl Scheduler {
             // A manual re-enable / spec change is a fresh start
             schedule.consecutive_failures = 0;
         }
-        self.store.upsert_schedule(&schedule).await?;
         Ok(schedule)
+    }
+
+    /// Design §8.2: a module row's PATCH is meaningful only when it is
+    /// EXACTLY `{"enabled": ...}` — mapped onto `suspend`/`resume`, which is
+    /// what the desktop app already sends for its toggle (§8.2's closing
+    /// note: "PATCH `{enabled}` 改的是 `user_suspended`, 不是它"). Any other
+    /// shape — any other field present, or `enabled` together with anything
+    /// else — is `409 module_owned_schedule`, unchanged.
+    async fn module_row_patch(
+        &self,
+        id: &str,
+        update: &ScheduleUpdate,
+        now: DateTime<Utc>,
+    ) -> Result<Schedule, ScheduleError> {
+        let is_enabled_only = update.enabled.is_some()
+            && update.name.is_none()
+            && update.spec.is_none()
+            && update.action.is_none()
+            && update.delivery.is_none();
+        if !is_enabled_only {
+            return Err(ScheduleError::ModuleOwned(id.to_owned()));
+        }
+        if update.enabled == Some(true) {
+            self.resume(id, now).await
+        } else {
+            self.suspend(id, now).await
+        }
+    }
+
+    /// `POST /schedules/{id}/suspend` (design §8.2), and the module-row
+    /// PATCH's `{"enabled": false}` arm. Idempotent (v3 L-C —
+    /// [`SuspendOutcome::NoOp`] is not an error, just "already suspended");
+    /// [`ScheduleError::NotModuleOwned`] on a user row.
+    pub async fn suspend(&self, id: &str, now: DateTime<Utc>) -> Result<Schedule, ScheduleError> {
+        let record = self
+            .store
+            .get_schedule_record(id)
+            .await?
+            .ok_or_else(|| ScheduleError::NotFound(id.to_owned()))?;
+        if record.schedule.owner.is_none() {
+            return Err(ScheduleError::NotModuleOwned(id.to_owned()));
+        }
+        // `seen_revision` is only load-bearing for `resume` (§8.2's SQL doc
+        // comment, review M-2) — any value is safe on the suspend direction.
+        self.store
+            .set_user_suspended(id, true, None, record.revision, &fmt_iso(now))
+            .await?;
+        self.get(id).await
+    }
+
+    /// `POST /schedules/{id}/resume` (design §8.2), and the module-row
+    /// PATCH's `{"enabled": true}` arm. Idempotent (v3 L-C); clears a kernel
+    /// `system_disabled_reason` (v2 M2); recomputes `next_run_at` from the
+    /// row's CURRENT spec. Review M-2: a module upsert that changes `spec`
+    /// between this call's read and its write makes the freshly computed
+    /// `next_run_at` stale for the NEW spec —
+    /// [`SuspendOutcome::Conflict`] (the resume-only revision CAS inside
+    /// `set_user_suspended`'s SQL) catches that; retried up to 3 times with
+    /// a fresh read before surfacing [`ScheduleError::Conflict`], the same
+    /// shape as the PATCH CAS retry above.
+    pub async fn resume(&self, id: &str, now: DateTime<Utc>) -> Result<Schedule, ScheduleError> {
+        for _attempt in 0..3 {
+            let record = self
+                .store
+                .get_schedule_record(id)
+                .await?
+                .ok_or_else(|| ScheduleError::NotFound(id.to_owned()))?;
+            if record.schedule.owner.is_none() {
+                return Err(ScheduleError::NotModuleOwned(id.to_owned()));
+            }
+            let next_run_at = if record.schedule.enabled {
+                next_fire(&record.schedule.spec, now)?.map(fmt_iso)
+            } else {
+                None
+            };
+            let outcome = self
+                .store
+                .set_user_suspended(
+                    id,
+                    false,
+                    next_run_at.as_deref(),
+                    record.revision,
+                    &fmt_iso(now),
+                )
+                .await?;
+            match outcome {
+                SuspendOutcome::Changed | SuspendOutcome::NoOp => return self.get(id).await,
+                SuspendOutcome::Conflict => continue,
+            }
+        }
+        Err(ScheduleError::Conflict(id.to_owned()))
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), ScheduleError> {
@@ -1902,5 +2118,159 @@ mod tests {
             2,
             "a same-second repeat run_now must not add a new row"
         );
+    }
+
+    // ── ME4-1.2.2c: `Scheduler::update`'s CAS retry loop (design §2.4/§13
+    // M-D, judged by C2.9) — nested so `cargo test -p agent24-scheduler
+    // update_cas` selects this module (the acceptance command's own filter).
+    mod update_cas {
+        use super::*;
+
+        #[tokio::test]
+        async fn patch_racing_a_tick_retries_and_fires_once() {
+            // Design §2.4/§13 M-D (C2.9): a PATCH that read the row a moment
+            // before a concurrent tick advanced its slot must not undo the
+            // tick's advance — the lost CAS re-reads and re-applies the SAME
+            // (pure) update against the tick's NEW next_run_at/last_run_at,
+            // and the slot fires exactly once (via the tick, never via a
+            // stale PATCH write-back re-arming it).
+            let trig = RecordingTrigger::new();
+            let (sched, _ev, store) =
+                scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+            let created = sched
+                .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(created.next_run_at.as_deref(), Some("2026-07-24T10:01:00Z"));
+
+            let now1 = utc("2026-07-24T10:01:05Z");
+            let id = created.id.clone();
+            let updated = sched
+                .update_inner(
+                    &id,
+                    ScheduleUpdate {
+                        name: Some("renamed".to_owned()),
+                        ..Default::default()
+                    },
+                    now1,
+                    || {
+                        let sched = Arc::clone(&sched);
+                        async move {
+                            // A real tick, landing "between" each attempt's
+                            // read and its write. It only actually fires
+                            // (and advances the slot) the FIRST time it
+                            // runs — a due schedule's own pre-advance makes
+                            // it not-due again, so every attempt after the
+                            // one it raced is a harmless no-op (0 fired) —
+                            // exactly the property this test is checking.
+                            sched.tick(now1).await.unwrap();
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                updated.name, "renamed",
+                "the retry re-applied the SAME update the caller asked for"
+            );
+            assert_eq!(
+                trig.count(),
+                1,
+                "the slot must fire exactly once, via the tick — not twice, \
+                 and not skipped by the PATCH's retry"
+            );
+            let after = store.get_schedule(&id).await.unwrap().unwrap();
+            assert_eq!(
+                after.next_run_at.as_deref(),
+                Some("2026-07-24T10:02:05Z"),
+                "the tick's advance must survive the PATCH's retried write-back"
+            );
+            assert_eq!(after.name, "renamed");
+
+            // positive control (C2.7-shaped): the exact same PATCH with no
+            // concurrent tick lands on the FIRST attempt — no retry needed.
+            let created2 = sched
+                .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+                .await
+                .unwrap();
+            let updated2 = sched
+                .update(
+                    &created2.id,
+                    ScheduleUpdate {
+                        name: Some("renamed2".to_owned()),
+                        ..Default::default()
+                    },
+                    utc("2026-07-24T10:00:30Z"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated2.name, "renamed2");
+            assert_eq!(
+                updated2.next_run_at, created2.next_run_at,
+                "a name-only PATCH must not move next_run_at"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cas_that_keeps_losing_gives_up_after_three_attempts_as_a_conflict() {
+            // Design §2.4: "仍冲突 → 409 schedule_conflict" — a PATCH whose
+            // CAS loses on EVERY attempt (a concurrent writer bumps revision
+            // again each time, right before each write) must give up after
+            // 3 attempts rather than loop forever.
+            let trig = RecordingTrigger::new();
+            let (sched, _ev, store) =
+                scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+            let created = sched
+                .create(every_create(3600), utc("2026-07-24T10:00:00Z"))
+                .await
+                .unwrap();
+            let id = created.id.clone();
+            let attempts = Arc::new(Mutex::new(0usize));
+            let attempts_hook = Arc::clone(&attempts);
+            let store_for_hook = store.clone();
+            let id_for_hook = id.clone();
+            let err = sched
+                .update_inner(
+                    &id,
+                    ScheduleUpdate {
+                        name: Some("renamed".to_owned()),
+                        ..Default::default()
+                    },
+                    utc("2026-07-24T10:00:30Z"),
+                    move || {
+                        *attempts_hook.lock().unwrap() += 1;
+                        let store = store_for_hook.clone();
+                        let id = id_for_hook.clone();
+                        async move {
+                            // A generic racer: bump the row's revision (a
+                            // rename-only PATCH would do the same) right
+                            // before every single write attempt, so none of
+                            // the 3 attempts can ever land.
+                            sqlx::query(
+                                "UPDATE schedules SET revision = revision + 1 WHERE id = ?",
+                            )
+                            .bind(&id)
+                            .execute(agent24_store::test_hooks::pool(&store))
+                            .await
+                            .unwrap();
+                        }
+                    },
+                )
+                .await;
+            assert_eq!(
+                *attempts.lock().unwrap(),
+                3,
+                "the hook runs once per attempt, 3 attempts total"
+            );
+            assert!(
+                matches!(err, Err(ScheduleError::Conflict(ref got)) if got == &id),
+                "{err:?}"
+            );
+            // The row itself is untouched — every attempt's write was
+            // refused by the CAS.
+            let after = store.get_schedule(&id).await.unwrap().unwrap();
+            assert_eq!(after.name, "test", "the name-only PATCH never landed");
+        }
     }
 }

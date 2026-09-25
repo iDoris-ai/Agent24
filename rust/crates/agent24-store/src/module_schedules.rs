@@ -1059,6 +1059,30 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Single-row counterpart to [`list_schedules_for_tick`] (ME4-1.2.2c):
+    /// the REST PATCH CAS retry loop (§2.4) and `suspend`/`resume` (§8.2)
+    /// need one row's `revision` without pulling every schedule. Same
+    /// `row_to_schedule` mapping, same "corrupt row" error surfacing as
+    /// [`Store::get_schedule`] — the REST layer already treats a corrupt row
+    /// as a 500, unlike the tick's lenient skip.
+    ///
+    /// # Errors
+    /// Storage/serialization.
+    pub async fn get_schedule_record(&self, id: &str) -> Result<Option<ScheduleRecord>> {
+        let row = sqlx::query("SELECT * FROM schedules WHERE id = ?")
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await?;
+        row.as_ref()
+            .map(|row| -> Result<ScheduleRecord> {
+                Ok(ScheduleRecord {
+                    schedule: Store::row_to_schedule(row)?,
+                    revision: row.get("revision"),
+                })
+            })
+            .transpose()
+    }
 }
 
 #[cfg(test)]
