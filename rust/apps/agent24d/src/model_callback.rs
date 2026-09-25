@@ -1278,6 +1278,14 @@ mod handler_tests {
     enum Behave {
         Ok,
         Hang,
+        /// L1 (Opus review round on top of `bb6fb0e`): unlike `Hang` (which
+        /// never returns on its own — proving DROP-based cancellation, e.g.
+        /// `$/cancelRequest`'s `handle.abort()`, reaches the provider), this
+        /// mirrors the REAL `OpenAiCompatProvider::complete`'s own
+        /// `tokio::select! { .., () = cancel.cancelled() => return
+        /// Err(ModelError::Cancelled) }` (`agent24-models/src/lib.rs`): it
+        /// resolves BY ITSELF once cancelled, with no external abort needed.
+        HangUntilCancelled,
         Big(usize),
         Repeat(char, usize),
     }
@@ -1312,6 +1320,11 @@ mod handler_tests {
                     });
                     std::future::pending::<()>().await;
                     unreachable!()
+                }
+                Behave::HangUntilCancelled => {
+                    cancel.cancelled().await;
+                    self.saw_cancel.store(true, Ordering::SeqCst);
+                    return Err(ModelError::Cancelled);
                 }
                 Behave::Ok => "ok".to_owned(),
                 Behave::Big(n) => "x".repeat(n),
@@ -1519,7 +1532,7 @@ mod handler_tests {
     /// piece by piece.
     #[tokio::test]
     async fn model_shutdown_wiring_cuts_off_an_in_flight_call_and_records_cancelled() {
-        let local = stub("l", Behave::Hang);
+        let local = stub("l", Behave::HangUntilCancelled);
         let (mut d, sink) = deps(router(vec![(local.clone(), Tier::Local)]));
         let (cut_off_tx, cut_off_rx) = tokio::sync::oneshot::channel::<()>();
         d.cancel_root = spawn_cancel_root(async move {
@@ -1551,8 +1564,18 @@ mod handler_tests {
             local.saw_cancel.load(Ordering::SeqCst),
             "the provider must observe the cancellation once modules_cut_off resolves"
         );
-        call.abort();
-        let _ = call.await;
+        // L1 (Opus review round on top of `bb6fb0e`): `call.abort()` here
+        // would make the `Cancelled` outcome near-tautological — the task
+        // gets torn down by the abort regardless of what the cancel root
+        // did. Instead, let the call's own future resolve on its own terms
+        // (bounded, so a regression hangs the test rather than passing it)
+        // and assert what it actually returned.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("the call must resolve on its own once the cancel root fires")
+            .expect("the spawned task must not panic");
+        let err = outcome.expect_err("a cut-off call must not succeed");
+        assert_eq!(err.kind, Some(ErrorKind::Cancelled), "{err:?}");
         assert_eq!(sink.take(), vec![("m".to_owned(), UsageOutcome::Cancelled)]);
     }
 

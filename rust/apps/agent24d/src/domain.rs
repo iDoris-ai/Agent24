@@ -5158,7 +5158,7 @@ while f.readline():
     /// no model offer, and the call comes back `forbidden` (proving the
     /// method exists — it is NOT `-32601` — but this module cannot use it).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn model_callback_forbidden_without_grant_and_offered_and_working_with_it() {
+    async fn model_grant_forbidden_without_it_offered_and_working_with_it() {
         for (name, capabilities, expect_granted) in [
             ("modelgranted", "[models]", true),
             ("modelungranted", "[events]", false),
@@ -5247,6 +5247,84 @@ while f.readline():
         }
     }
 
+    /// M1 (Opus review round on top of `bb6fb0e`): J2's missing negative —
+    /// a module that DOES request `models` and IS granted the capability
+    /// (`granted.has(Capability::Models)` is true) must still get NOTHING if
+    /// the daemon itself has no model deps configured (`CallbackDeps.models:
+    /// None` — `test_callback_deps()`, not `_with_models()`). `model_grant`
+    /// is the AND of both halves (design §2.4): `MountReport.granted` must
+    /// not list `models`, `provides` must not include `_a24/model/`, and a
+    /// real call must come back `forbidden` — the exact same observable
+    /// shape as a module that never asked for `models` at all (invariant
+    /// #134, same rule `memory_grant.is_some()` already follows for memory).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_grant_is_none_when_the_daemon_has_no_model_deps_even_if_granted() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package_with(&packages, "modelnodeps", "[models]", MODEL_PROBE_MODULE);
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        // `models: None` — the daemon built no router at all, unlike
+        // `test_callback_deps_with_models()`.
+        let deps = test_callback_deps().await;
+        let (_, reports, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            deps,
+        )
+        .await;
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "{:?}",
+            reports[0]
+        );
+        assert_eq!(
+            reports[0].granted,
+            Vec::<String>::new(),
+            "requesting models when the daemon has no model deps must not be granted: {:?}",
+            reports[0]
+        );
+
+        let probe_path = packages.join("modelnodeps").join("probe.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let probe: serde_json::Value = loop {
+            if let Ok(bytes) = std::fs::read(&probe_path) {
+                break serde_json::from_slice(&bytes).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the module never wrote its probe"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            probe["offers_model"].as_bool(),
+            Some(false),
+            "no `_a24/model/` offer when the daemon has no model deps, even \
+             though the module was granted the capability: {probe}"
+        );
+        assert_eq!(
+            probe["complete_response"]["error"]["data"]["kind"].as_str(),
+            Some("forbidden"),
+            "{}",
+            probe["complete_response"]
+        );
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
     /// Review round 2, M2 (second half): the ONLY way to actually exercise
     /// (and mutation-test) "the scheduler token bucket is built OUTSIDE
     /// `build_methods_for`'s per-generation closure, so a restart reuses it"
@@ -5331,7 +5409,7 @@ while f.readline():
     /// control: a DIFFERENT module's first call is unaffected — proving the
     /// exhaustion is per-module, not a global fluke.
     #[tokio::test]
-    async fn model_rate_limit_survives_a_restart_through_the_real_build_methods_for() {
+    async fn model_callback_rate_survives_a_restart_through_the_real_build_methods_for() {
         let hub = crate::events::EventsHub::default();
         let broker = test_approval_broker(&hub).await;
         let deps = test_callback_deps_with_models().await;
@@ -5354,14 +5432,32 @@ while f.readline():
             }
         }
 
+        // L2 (Opus review round on top of `bb6fb0e`): a frozen, ADVANCEABLE
+        // clock (same shape as model_callback.rs's own
+        // `the_31st_call_is_rate_limited_and_refill_lets_the_32nd_through`)
+        // — no dependency on the wall clock actually taking 0.5 tokens/sec
+        // to refill during the loop below, and it lets a positive control
+        // advance time by exactly 2s to prove the SAME bucket refills rather
+        // than merely staying exhausted forever. Built directly via
+        // `ModelGrant::with_clock`, bypassing `crate::model_callback::model_grant`
+        // (whose granted/deps gating is already J2/M1's job, not J10's).
+        struct Movable(std::sync::Mutex<std::time::Instant>);
+        impl crate::events_emit::Clock for Movable {
+            fn now(&self) -> std::time::Instant {
+                *self.0.lock().unwrap()
+            }
+        }
+        let clock = Arc::new(Movable(std::sync::Mutex::new(std::time::Instant::now())));
+
         let granted = Grants::granting(&[Capability::Models], KERNEL_OOP_GRANTS);
-        let model_grant = crate::model_callback::model_grant(
-            "probe",
+        let model_grant = crate::model_callback::ModelGrant::with_clock(
+            "probe".to_owned(),
             ModelAccess::LocalOnly,
-            &granted,
-            deps.models.as_ref(),
+            deps.models
+                .clone()
+                .expect("test_callback_deps_with_models sets this"),
+            clock.clone(),
         );
-        assert!(model_grant.is_some(), "a granted module must get a grant");
         let methods_for = build_methods_for(
             "probe".to_owned(),
             granted,
@@ -5369,7 +5465,7 @@ while f.readline():
             broker.clone(),
             crate::os_memory::MemoryEntitlement::NONE,
             deps.scheduler.clone(),
-            model_grant,
+            Some(model_grant),
         );
 
         // Generation 1: exhaust the 30-call burst. No provider is configured
@@ -5411,6 +5507,19 @@ while f.readline():
             "the bucket must not reset across a restart — if this went green after \
              moving `model_grant` construction INSIDE the `move |generation| {{…}}` \
              closure, that mutation was not caught"
+        );
+
+        // L2 positive control: MODEL_RATE_REFILL_PER_SEC = 0.5, so +2s on the
+        // SAME clock (still the same `Arc<RateLimiter>`, second generation)
+        // refills exactly one token — proving the bucket is a real,
+        // refilling rate limiter and not merely "always empty after any use".
+        *clock.0.lock().unwrap() += std::time::Duration::from_secs(2);
+        let err_after_refill = call_complete(&methods2, 1).await.unwrap_err();
+        assert_eq!(
+            err_after_refill.kind,
+            Some(agent24_os_proto::rpc::ErrorKind::Unavailable),
+            "one token refilled after 2s must let the call reach the (empty) \
+             router, not stay rate-limited: {err_after_refill:?}"
         );
 
         // Positive control: a DIFFERENT module's `ModelGrant` is a fresh
