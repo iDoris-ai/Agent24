@@ -1556,11 +1556,35 @@ components:
           examples: [desktop_notification]
       additionalProperties: true
 
+    ScheduleOwner:
+      type: object
+      description: |
+        Which module owns this row, and its key with that module — `null`
+        exactly when this is a plain user (AgentRun) row (design
+        docs/design/ME4-S1-scheduler-callback.md §8.1).
+      required: [module, key]
+      properties:
+        module:
+          type: string
+        key:
+          type: string
+
+    DisabledBy:
+      type: [string, "null"]
+      enum: [module, user, system, null]
+      description: |
+        Which layer is holding a schedule from firing, or `null` when
+        `effective_enabled` is `true`. Priority: `user_suspended` → `user`,
+        then `system_disabled_reason` → `system`, then `!enabled` → `module`
+        (module row) / `user` (user row) (§8.1, v3 L-D).
+
     Schedule:
       type: object
       required:
         [id, name, enabled, spec, action, delivery,
-         last_run_at, next_run_at, consecutive_failures]
+         last_run_at, next_run_at, consecutive_failures,
+         owner, user_suspended, system_disabled_reason,
+         effective_enabled, disabled_by]
       properties:
         id:
           type: string
@@ -1571,7 +1595,14 @@ components:
         spec:
           $ref: "#/components/schemas/ScheduleSpec"
         action:
-          $ref: "#/components/schemas/ScheduleAction"
+          description: |
+            `null` exactly when `owner` is non-null: module rows carry no
+            AgentRun action (§8.1). A client can never create a module row
+            through `POST /schedules` — `ScheduleCreate` has no `owner`
+            field and `ScheduleAction` has exactly one variant (S1-2).
+          oneOf:
+            - $ref: "#/components/schemas/ScheduleAction"
+            - type: "null"
         delivery:
           type: array
           items:
@@ -1586,6 +1617,25 @@ components:
         consecutive_failures:
           type: integer
           description: Auto-disables the schedule at 5 (emits schedule.disabled)
+        owner:
+          description: Non-null exactly for a module row (§8.1).
+          oneOf:
+            - $ref: "#/components/schemas/ScheduleOwner"
+            - type: "null"
+        user_suspended:
+          type: boolean
+          description: Only ever true on a module row (migration 0007's CHECK).
+        system_disabled_reason:
+          type: [string, "null"]
+          description: Only ever non-null on a module row (same CHECK).
+        effective_enabled:
+          type: boolean
+          description: |
+            Whether this row will actually fire right now: for a user row,
+            equals `enabled`; for a module row, `enabled && !user_suspended
+            && system_disabled_reason == null`.
+        disabled_by:
+          $ref: "#/components/schemas/DisabledBy"
 
     ScheduleCreate:
       type: object

@@ -198,6 +198,23 @@
       ]
     },
     {
+      "description": "Module-delivery counterpart of `schedule.fired` (design\n`docs/design/ME4-S1-scheduler-callback.md` §5.5): emitted once the\ndelivery pump's T2 transition (a 2xx from the module's\n`_a24/scheduler/fired` handler) lands in `schedule_deliveries`. Does\nNOT carry a `run_id` — module deliveries have none; only AgentRun rows\nemit `schedule.fired`. Wired up by ME4-1.3.1's delivery pump; this\ntask (ME4-1.2.2a) only adds the wire type.",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/ScheduleDeliveredPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "schedule.delivered"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
       "description": "REQUEST class (T7b/ME-3e, `docs/design/T7b-ME3e-approvals.md` decision\n7): pushed the moment a `gate`/`advise` submission inserts a new\n`Pending` row. The client answers via\n`POST /api/v1/module-approvals/{id}` — `approval.required` is no\nlonger the only REQUEST-class event.\n\nT7c/ME-3e (design doc criterion 18): the payload is\n[`ModuleApprovalSubmitted`], NOT the full `ModuleApproval` — a frozen\nsubmission-time snapshot that does not carry `executed_at`, which is\nstate only ever learned by querying AFTER submission (REST/`status`).",
       "type": "object",
       "properties": {
@@ -657,6 +674,36 @@
         "run_id",
         "session_id",
         "schedule_id"
+      ]
+    },
+    "ScheduleDeliveredPayload": {
+      "description": "design §5.5: `{schedule_id, module, key, fire_id, scheduled_for}`, all\nrequired (no optional fields to force-require in export-schema.rs).",
+      "type": "object",
+      "properties": {
+        "fire_id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "module": {
+          "type": "string"
+        },
+        "schedule_id": {
+          "type": "string"
+        },
+        "scheduled_for": {
+          "description": "ISO-8601 UTC (fmt_iso), the slot this fire was recorded for.",
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "schedule_id",
+        "module",
+        "key",
+        "fire_id",
+        "scheduled_for"
       ]
     },
     "ScheduleDisabledPayload": {

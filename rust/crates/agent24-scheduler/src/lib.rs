@@ -114,11 +114,24 @@ impl Scheduler {
             name: create.name,
             enabled: create.enabled,
             spec: create.spec,
-            action: create.action,
+            // ME4-1.2.2a: `Schedule.action` is `Option<ScheduleAction>` now
+            // (module rows), but `ScheduleCreate`'s isn't — REST can only
+            // ever create a user (AgentRun) row (S1-2), so this is always
+            // `Some`.
+            action: Some(create.action),
             delivery: create.delivery,
             last_run_at: None,
             next_run_at,
             consecutive_failures: 0,
+            // This crate only ever constructs USER rows (module rows are
+            // created by `Store::upsert_module_schedule`, ME4-1.2.1a) — the
+            // five view fields are all at their "nothing is blocking it"
+            // defaults, mirroring a fresh user row's real values.
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: create.enabled,
+            disabled_by: (!create.enabled).then_some(agent24_protocol::DisabledBy::User),
         };
         self.store.upsert_schedule(&schedule).await?;
         Ok(schedule)
@@ -154,7 +167,7 @@ impl Scheduler {
             recompute = true;
         }
         if let Some(action) = update.action {
-            schedule.action = action;
+            schedule.action = Some(action);
         }
         if let Some(delivery) = update.delivery {
             schedule.delivery = delivery;
@@ -164,6 +177,21 @@ impl Scheduler {
                 recompute = true;
             }
             schedule.enabled = enabled;
+        }
+        // Keep the view fields consistent with a changed `enabled`. This
+        // crate only ever legitimately handles USER rows today (module-row
+        // PATCH guardrails are ME4-1.2.2c's job, not wired up yet) — on one,
+        // `user_suspended`/`system_disabled_reason` are always
+        // false/None (migration 0007's CHECK), so `!enabled` is the only
+        // thing `disabled_by` can be tracking. Leave a module row's view
+        // fields alone rather than guess at them.
+        if schedule.owner.is_none()
+            && !schedule.user_suspended
+            && schedule.system_disabled_reason.is_none()
+        {
+            schedule.effective_enabled = schedule.enabled;
+            schedule.disabled_by =
+                (!schedule.enabled).then_some(agent24_protocol::DisabledBy::User);
         }
         if recompute {
             schedule.next_run_at = if schedule.enabled {
@@ -187,10 +215,22 @@ impl Scheduler {
     }
 
     /// Fire immediately without touching `next_run_at` (manual "run now").
+    ///
+    /// A module row's `run_now` (design §4.7: `202 {"fire_id"}`, no
+    /// `next_run_at` change, doesn't disturb the tick's own outstanding
+    /// fire) is ME4-1.2.2b/§13's job, not this task's — `get()` can now
+    /// return one (ME4-1.2.2a fixed the strict read path), so this only
+    /// needs to fail without panicking rather than implement §4.7 early.
     pub async fn run_now(&self, id: &str) -> Result<String, ScheduleError> {
         let schedule = self.get(id).await?;
+        let Some(action) = schedule.action.as_ref() else {
+            return Err(ScheduleError::Invalid(format!(
+                "schedule {} is module-owned; run_now for module rows lands in ME4-1.2.2b",
+                schedule.id
+            )));
+        };
         self.trigger
-            .trigger(&schedule.action, &schedule.id)
+            .trigger(action, &schedule.id)
             .await
             .map_err(ScheduleError::Invalid)
     }
@@ -205,6 +245,17 @@ impl Scheduler {
         let mut fired = 0;
         for schedule in schedules {
             if !schedule.enabled {
+                continue;
+            }
+            if schedule.action.is_none() {
+                // Module-owned row (design §8.1: `action` is `None` exactly
+                // when `owner` is `Some`). This crate's tick only drives
+                // AgentRun rows until ME4-1.2.2b adds the module-delivery
+                // branch (§3.2/§4.2) — skip it here rather than in `fire()`,
+                // the direct successor of the OLD behaviour where a module
+                // row's sentinel `action` failed to deserialize and
+                // `list_schedules_lenient` silently dropped it before it
+                // ever reached this loop.
                 continue;
             }
             let Some(next_run_at) = &schedule.next_run_at else {
@@ -275,8 +326,18 @@ impl Scheduler {
             return Ok(());
         }
 
-        // Trigger the run (synchronous creation; the run executes in the bg)
-        match self.trigger.trigger(&schedule.action, &schedule.id).await {
+        // Trigger the run (synchronous creation; the run executes in the bg).
+        // `tick()` only calls `fire()` for rows with `Some(action)` (module
+        // rows are filtered out above) — this `let else` documents that
+        // invariant without an `unwrap`/`expect` on the Option.
+        let Some(action) = schedule.action.clone() else {
+            tracing::error!(
+                "schedule {} fire() called with no action (module row?); skipping",
+                schedule.id
+            );
+            return Ok(());
+        };
+        match self.trigger.trigger(&action, &schedule.id).await {
             Ok(run_id) => {
                 if schedule.consecutive_failures != 0 {
                     schedule.consecutive_failures = 0;

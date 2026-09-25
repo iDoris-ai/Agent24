@@ -1730,15 +1730,20 @@ mod tests {
             name: "nightly".to_owned(),
             enabled: true,
             spec: agent24_protocol::ScheduleSpec::Every { secs: 60 },
-            action: agent24_protocol::ScheduleAction::AgentRun {
+            action: Some(agent24_protocol::ScheduleAction::AgentRun {
                 prompt: "go".to_owned(),
                 session_id: None,
                 model_override: None,
-            },
+            }),
             delivery: vec![],
             last_run_at: None,
             next_run_at: None,
             consecutive_failures: 0,
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
         };
         store.upsert_schedule(&schedule).await.unwrap();
         store

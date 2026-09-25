@@ -168,13 +168,31 @@ impl Tool for SelfWakeTool {
 
         // Bound outstanding self-wakes so a loop can't flood the schedule table.
         // Fail-closed on a store error (don't create under uncertainty).
+        //
+        // `s.owner.is_none()` (ME4-1.2.2a): before this task, a module row's
+        // sentinel `action` failed to deserialize in `row_to_schedule`, so
+        // `list_schedules_lenient` silently dropped every module row before
+        // it ever reached this filter — a module could not have inflated
+        // this count no matter what it named its schedule. This task's fix
+        // to `row_to_schedule` (module rows now decode successfully) is what
+        // makes a module row reachable here for the first time, so the
+        // owner-exclusion needed to keep this count meaning "the AGENT's own
+        // self-wakes" lands in the same PR, not deferred to ME4-1.2.2c
+        // (design §8.5: a module could otherwise name every one of its 256
+        // schedules `"self-wake"` and permanently `Denied` the agent's own
+        // tool).
         let pending = self
             .store
             .list_schedules_lenient()
             .await
             .map_err(|e| ToolError::Failed(format!("could not read schedules: {e}")))?
             .into_iter()
-            .filter(|s| s.name == SELF_WAKE_NAME && s.enabled && s.next_run_at.is_some())
+            .filter(|s| {
+                s.owner.is_none()
+                    && s.name == SELF_WAKE_NAME
+                    && s.enabled
+                    && s.next_run_at.is_some()
+            })
             .count();
         if pending >= MAX_PENDING_WAKES {
             return Err(ToolError::Denied(format!(
@@ -188,18 +206,24 @@ impl Tool for SelfWakeTool {
             name: SELF_WAKE_NAME.to_owned(),
             enabled: true,
             spec: ScheduleSpec::At { ts: ts.clone() },
-            action: ScheduleAction::AgentRun {
+            action: Some(ScheduleAction::AgentRun {
                 prompt,
                 // Deliver into THIS session so the woken run continues the
                 // conversation (its prior context is reloaded on run).
                 session_id: ctx.session_id.clone(),
                 model_override: None,
-            },
+            }),
             delivery: vec![],
             last_run_at: None,
             // One-shot: fire once at `ts`, then the scheduler clears this.
             next_run_at: Some(ts.clone()),
             consecutive_failures: 0,
+            // A self-wake is always a plain user (AgentRun) row.
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
         };
         self.store
             .upsert_schedule(&schedule)
@@ -218,6 +242,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use agent24_store::ModuleScheduleDesired;
 
     fn ctx(session: Option<&str>) -> ToolContext {
         ToolContext {
@@ -253,12 +278,13 @@ mod tests {
         assert!(matches!(s.spec, ScheduleSpec::At { .. }));
         assert!(s.next_run_at.is_some());
         match &s.action {
-            ScheduleAction::AgentRun {
+            Some(ScheduleAction::AgentRun {
                 prompt, session_id, ..
-            } => {
+            }) => {
                 assert_eq!(prompt, "check the build");
                 assert_eq!(session_id.as_deref(), Some("sess_1"));
             }
+            None => panic!("a self-wake is always a user row: action must be Some"),
         }
     }
 
@@ -334,6 +360,79 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let mut over = Map::new();
+        over.insert("prompt".to_owned(), json!("one too many"));
+        over.insert("after_secs".to_owned(), json!(3600));
+        let err = tool
+            .call(&ctx(Some("s")), &over, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err:?}");
+    }
+
+    /// ME4-1.2.2a: before this task's fix to `row_to_schedule`, a module
+    /// row's sentinel `action` failed to deserialize, so
+    /// `list_schedules_lenient` silently dropped every module row before it
+    /// ever reached this tool's pending-count filter — a module could not
+    /// have inflated the count no matter what it named its schedule. That
+    /// fix makes a module row reachable here for the first time, so a
+    /// module could otherwise name every one of its (up to 256) schedules
+    /// `"self-wake"`, enabled, and permanently `Denied` the agent's own tool
+    /// (design §8.5). `s.owner.is_none()` in the pending filter is what
+    /// closes that: a module-owned row shaped exactly like a self-wake must
+    /// not count, while a REAL self-wake (owner-less, created by this same
+    /// tool) still does — proven here by reaching the same `Denied` at
+    /// exactly `MAX_PENDING_WAKES` real wakes that
+    /// `pending_self_wakes_are_capped` above proves for the no-module-row
+    /// case (that test is the "user rows count +1" positive control this
+    /// one builds on).
+    #[tokio::test]
+    async fn a_module_owned_row_named_self_wake_does_not_count_toward_the_agents_quota() {
+        let (tool, store) = tool().await;
+        // One real self-wake short of the cap.
+        for i in 0..MAX_PENDING_WAKES - 1 {
+            let mut input = Map::new();
+            input.insert("prompt".to_owned(), json!(format!("wake {i}")));
+            input.insert("after_secs".to_owned(), json!(3600));
+            tool.call(&ctx(Some("s")), &input, &CancellationToken::new())
+                .await
+                .unwrap();
+        }
+
+        // A module-owned row: enabled, named exactly `SELF_WAKE_NAME`, with a
+        // pending `next_run_at` — everything the filter checks except
+        // ownership.
+        store
+            .upsert_module_schedule(
+                "sch_mod_1",
+                "some-module",
+                "k",
+                &ModuleScheduleDesired {
+                    spec: ScheduleSpec::Every { secs: 3600 },
+                    enabled: true,
+                    label: SELF_WAKE_NAME.to_owned(),
+                },
+                Some("2026-09-24T00:00:00Z"),
+                "2026-09-23T00:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+
+        // If the module row counted, pending would already be at the cap
+        // (31 real + 1 module = 32) and this would be `Denied`.
+        let mut one_more = Map::new();
+        one_more.insert("prompt".to_owned(), json!("still fits"));
+        one_more.insert("after_secs".to_owned(), json!(3600));
+        tool.call(&ctx(Some("s")), &one_more, &CancellationToken::new())
+            .await
+            .expect(
+                "a module-owned row named self-wake must not count toward \
+                 the agent's own quota",
+            );
+
+        // Now genuinely at the cap with 32 REAL self-wakes — the next one is
+        // denied, same as `pending_self_wakes_are_capped`.
         let mut over = Map::new();
         over.insert("prompt".to_owned(), json!("one too many"));
         over.insert("after_secs".to_owned(), json!(3600));

@@ -57,6 +57,15 @@ pub enum EventBody {
     ScheduleFired(ScheduleFiredPayload),
     #[serde(rename = "schedule.disabled")]
     ScheduleDisabled(ScheduleDisabledPayload),
+    /// Module-delivery counterpart of `schedule.fired` (design
+    /// `docs/design/ME4-S1-scheduler-callback.md` §5.5): emitted once the
+    /// delivery pump's T2 transition (a 2xx from the module's
+    /// `_a24/scheduler/fired` handler) lands in `schedule_deliveries`. Does
+    /// NOT carry a `run_id` — module deliveries have none; only AgentRun rows
+    /// emit `schedule.fired`. Wired up by ME4-1.3.1's delivery pump; this
+    /// task (ME4-1.2.2a) only adds the wire type.
+    #[serde(rename = "schedule.delivered")]
+    ScheduleDelivered(ScheduleDeliveredPayload),
     /// REQUEST class (T7b/ME-3e, `docs/design/T7b-ME3e-approvals.md` decision
     /// 7): pushed the moment a `gate`/`advise` submission inserts a new
     /// `Pending` row. The client answers via
@@ -104,6 +113,7 @@ impl EventBody {
             EventBody::ApprovalResolved(_) => "approval.resolved",
             EventBody::ScheduleFired(_) => "schedule.fired",
             EventBody::ScheduleDisabled(_) => "schedule.disabled",
+            EventBody::ScheduleDelivered(_) => "schedule.delivered",
             EventBody::ModuleApprovalRequired(_) => "module-approval.required",
             EventBody::ModuleApprovalResolved { .. } => "module-approval.resolved",
             EventBody::Module(_) => "module",
@@ -215,4 +225,16 @@ pub struct ScheduleDisabledPayload {
     pub schedule_id: String,
     /// Open enum; currently only consecutive_failures
     pub reason: String,
+}
+
+/// design §5.5: `{schedule_id, module, key, fire_id, scheduled_for}`, all
+/// required (no optional fields to force-require in export-schema.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleDeliveredPayload {
+    pub schedule_id: String,
+    pub module: String,
+    pub key: String,
+    pub fire_id: String,
+    /// ISO-8601 UTC (fmt_iso), the slot this fire was recorded for.
+    pub scheduled_for: String,
 }

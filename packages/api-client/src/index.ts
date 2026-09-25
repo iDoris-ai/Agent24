@@ -20,6 +20,7 @@ export type {
   ApprovalResolvedPayload,
   ScheduleFiredPayload,
   ScheduleDisabledPayload,
+  ScheduleDeliveredPayload,
   ModuleEventPayload,
   Approval,
   ApprovalStatus,
