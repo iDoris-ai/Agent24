@@ -593,7 +593,7 @@ impl AppState {
     }
 }
 
-pub use agent24_domain::http::error_response;
+pub use agent24_domain::http::{error_response, error_response_with_hint};
 
 async fn health() -> Json<Health> {
     Json(Health {
@@ -741,6 +741,14 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route(
             "/api/v1/schedules/{id}/run_now",
             axum::routing::post(crate::schedules::run_now),
+        )
+        .route(
+            "/api/v1/schedules/{id}/suspend",
+            axum::routing::post(crate::schedules::suspend_schedule),
+        )
+        .route(
+            "/api/v1/schedules/{id}/resume",
+            axum::routing::post(crate::schedules::resume_schedule),
         )
         .route("/api/v1/events", get(crate::events::ws_events))
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.

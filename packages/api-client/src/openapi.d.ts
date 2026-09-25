@@ -294,6 +294,15 @@ export interface paths {
          * Partially update a schedule
          * @description Any subset of name/enabled/spec/action/delivery. Changing `spec`
          *     recomputes `next_run_at` immediately.
+         *
+         *     On a module-owned row (design
+         *     docs/design/ME4-S1-scheduler-callback.md §8.2), the ONLY accepted
+         *     shape is exactly `{"enabled": ...}` — mapped onto suspend/resume
+         *     (`false`→suspend, `true`→resume). Any other field present, or
+         *     `enabled` together with anything else, is `409
+         *     module_owned_schedule`. The write-back on a USER row is CAS'd
+         *     (§2.4); a concurrent tick/PATCH that keeps losing the race for 3
+         *     retries is `409 schedule_conflict`.
          */
         patch: operations["updateSchedule"];
         trace?: never;
@@ -307,8 +316,69 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Trigger one run immediately (does not change next_run_at) */
+        /**
+         * Trigger one run immediately (does not change next_run_at)
+         * @description Design §4.7: a user (AgentRun) row answers `{run_id}`, same as
+         *     always; a module-owned row answers `{fire_id}` — it records a fire
+         *     (own `fire_id`, `fire_trigger=run_now`) for the delivery pump to
+         *     pick up, without touching `next_run_at` or disturbing the tick
+         *     source's own outstanding fire. Neither arm looks at `enabled` /
+         *     `user_suspended` / `system_disabled_reason` — this is an explicit
+         *     "try it now" the user asked for.
+         */
         post: operations["runScheduleNow"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/schedules/{id}/suspend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Suspend a module-owned schedule (design §8.2)
+         * @description Module rows only. Idempotent: suspending an already-suspended row
+         *     is a no-op that still answers `200` with the current view. Clears
+         *     `next_run_at` and, in the same transaction, retires the schedule's
+         *     outstanding (pending/deferred) deliveries. A user (AgentRun) row —
+         *     use `PATCH {"enabled": false}` instead — answers `409
+         *     not_a_module_schedule`.
+         */
+        post: operations["suspendSchedule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/schedules/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resume a module-owned schedule (design §8.2)
+         * @description Module rows only. Idempotent: resuming a row that is neither
+         *     suspended nor system-disabled is a no-op — 0 rows affected, still
+         *     `200` with the current view (a module's own `enabled=false` shows
+         *     up as `disabled_by="module"` and is unaffected by resume). Also
+         *     clears a kernel `system_disabled_reason` (v2 M2) and, when the row
+         *     is enabled, recomputes `next_run_at` from the current spec
+         *     (skip-missed). A user (AgentRun) row answers `409
+         *     not_a_module_schedule`.
+         */
+        post: operations["resumeSchedule"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1053,7 +1123,8 @@ export interface components {
              * @description Open enum: invalid_request, unauthorized, not_found, conflict,
              *     approval_already_resolved, provider_unavailable,
              *     run_not_cancellable (reserved), internal,
-             *     admission_refused, module_panicked, module_killed
+             *     admission_refused, module_panicked, module_killed,
+             *     module_owned_schedule, not_a_module_schedule, schedule_conflict
              */
             code: string;
             message: string;
@@ -1753,6 +1824,19 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description Module-owned row rejected a field other than a lone `enabled`
+             *     (`module_owned_schedule`), or the CAS write-back never landed
+             *     after 3 retries (`schedule_conflict`).
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     runScheduleNow: {
@@ -1766,7 +1850,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Run started */
+            /** @description Run queued (user row) or fire recorded (module row) */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -1774,10 +1858,85 @@ export interface operations {
                 content: {
                     "application/json": {
                         run_id: string;
+                    } | {
+                        fire_id: string;
                     };
                 };
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    suspendSchedule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Suspended (or already was) — the current view */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Not a module-owned schedule */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "not_a_module_schedule",
+                     *         "message": "schedule sch_01H… is not a module-owned schedule",
+                     *         "hint": "use PATCH {\"enabled\": true|false} on a user-owned schedule"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    resumeSchedule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Resumed (or already was) — the current view */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Not a module-owned schedule, or a concurrent module upsert raced the resume 3 times */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getShutdownReport: {
