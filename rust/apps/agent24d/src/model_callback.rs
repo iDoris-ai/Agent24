@@ -1,10 +1,10 @@
-//! `_a24/model/complete` (ME4-S2 v3.1, §5–§7). **4.2.2b1a**: constants,
+//! `_a24/model/complete` (ME4-S2 v3.1, §4–§7). **4.2.2b1a**: constants,
 //! admission (§5), the usage sink (§6.3), grants/deps (§5.1), and error
-//! mapping (§7) — the parts of the callback that do not need the wire types
-//! or the handler itself. **Not** in this file (see the split in
-//! `docs/design/ME4-S2-model-callback.md` §10.2): wire types and
-//! `ModelCompleteHandler` (4.2.2b1b), registration/`serve()` wiring
-//! (4.2.2b2), and persisted usage (4.2.3).
+//! mapping (§7). **4.2.2b1b** (this increment): the wire types (§4.2/§4.3)
+//! and `ModelCompleteHandler` (§4.4) — everything the handler needs except
+//! registration. **Not** in this file (see the split in
+//! `docs/design/ME4-S2-model-callback.md` §10.2): registration/`serve()`
+//! wiring (4.2.2b2) and persisted usage (4.2.3).
 //!
 //! v3 N7: until 4.2.2b2 registers `_a24/model/complete`, most of this is
 //! unreachable from a binary crate's point of view — `allow(dead_code)`
@@ -13,17 +13,20 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent24_domain::ModelAccess;
-use agent24_models::ModelError;
-use agent24_models::router::{ModelRouter, Privacy, Tier};
-use agent24_os_proto::rpc::{ErrorKind, RpcError};
-use serde_json::Value;
+use agent24_models::router::{Complexity, ModelRouter, Privacy, TaskProfile, Tier};
+use agent24_models::{CompletionRequest, ModelError, Msg, ResponseFormat};
+use agent24_os_proto::drain::{Generation, LifecycleTimeout, bind_to_lifecycle};
+use agent24_os_proto::rpc::{CallFuture, ErrorKind, Handler, RpcError};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::events_emit::{Clock, RateLimiter};
+use crate::events_emit::{Clock, RateLimiter, refused_error};
 
 // ---- §5.2 numbers (⚖️ = chosen, not derived) ----
 
@@ -45,6 +48,149 @@ pub const MODEL_DEFAULT_MAX_TOKENS: u32 = 1024;
 /// ⚖️ §4.2: message count bound (string bytes are already bounded by
 /// `dispatch()`'s 256 KiB params budget). Consumed by 4.2.2b1b.
 pub const MODEL_MAX_MESSAGES: usize = 64;
+/// §4.3 (v3 N4): the largest SERIALIZED result. The response line is
+/// `{"jsonrpc":"2.0","id":<id>,"result":<this>}\n` and must fit the 1 MiB
+/// frame. The id is a string of at most `MAX_ID_BYTES` (256) bytes, which
+/// JSON-escapes to at most 6 × 256; 4 KiB covers it and the envelope. Checked
+/// on the serialized bytes — raw text length undercounts escapes (a quote is
+/// 2 bytes, a control character 6).
+pub const RESULT_ENVELOPE_MARGIN: usize = 4096;
+pub const MODEL_MAX_RESULT_BYTES: usize =
+    agent24_os_proto::frame::MAX_FRAME_BYTES - RESULT_ENVELOPE_MARGIN;
+const _: () = assert!(6 * agent24_os_proto::rpc::MAX_ID_BYTES + 64 <= RESULT_ENVELOPE_MARGIN);
+/// v3 N4: a provider-reported model id longer than this is dropped (`None`),
+/// not truncated — a truncated id would name a model that does not exist.
+pub const MODEL_MAX_MODEL_ID_BYTES: usize = 256;
+
+// ---- §4.2 params (deny_unknown_fields + _meta) ----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ModelCompleteParams {
+    messages: Vec<WireMessage>,
+    #[serde(default)]
+    response_format: Option<WireResponseFormat>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    complexity: Option<WireComplexity>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    _meta: Option<Map<String, Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireMessage {
+    role: WireRole,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRole {
+    System,
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireComplexity {
+    Simple,
+    Complex,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum WireResponseFormat {
+    JsonSchema { json_schema: WireJsonSchema },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireJsonSchema {
+    name: String,
+    schema: Map<String, Value>,
+    #[serde(default)]
+    strict: bool,
+}
+
+impl ModelCompleteParams {
+    fn validate(&self) -> Result<(), String> {
+        if self.messages.is_empty() || self.messages.len() > MODEL_MAX_MESSAGES {
+            return Err(format!(
+                "messages must hold 1..={MODEL_MAX_MESSAGES} entries"
+            ));
+        }
+        if let Some(n) = self.max_tokens
+            && !(1..=MODEL_MAX_TOKENS_CEILING).contains(&n)
+        {
+            return Err(format!(
+                "max_tokens must be between 1 and {MODEL_MAX_TOKENS_CEILING}"
+            ));
+        }
+        if let Some(WireResponseFormat::JsonSchema { json_schema }) = &self.response_format
+            && json_schema.name.is_empty()
+        {
+            return Err("response_format.json_schema.name must not be empty".to_owned());
+        }
+        Ok(())
+    }
+
+    fn parse(params: Value) -> Result<Self, String> {
+        let p: Self = serde_json::from_value(params).map_err(|e| e.to_string())?;
+        p.validate()?;
+        Ok(p)
+    }
+
+    fn into_request(self) -> (CompletionRequest, Complexity, Option<String>) {
+        let max = self.max_tokens.unwrap_or(MODEL_DEFAULT_MAX_TOKENS);
+        let request = CompletionRequest {
+            messages: self
+                .messages
+                .into_iter()
+                .map(|m| match m.role {
+                    WireRole::System => Msg::system(m.content),
+                    WireRole::User => Msg::user(m.content),
+                    WireRole::Assistant => Msg::assistant(Some(m.content), vec![]),
+                })
+                .collect(),
+            model: None,
+            tools: vec![],
+            response_format: self.response_format.map(
+                |WireResponseFormat::JsonSchema { json_schema }| ResponseFormat::JsonSchema {
+                    name: json_schema.name,
+                    schema: Value::Object(json_schema.schema),
+                    strict: json_schema.strict,
+                },
+            ),
+            max_tokens: NonZeroU32::new(max),
+        };
+        let complexity = match self.complexity {
+            Some(WireComplexity::Complex) => Complexity::Complex,
+            Some(WireComplexity::Simple) | None => Complexity::Simple,
+        };
+        (request, complexity, self.request_id)
+    }
+}
+
+// ---- §4.3 result ----
+
+#[derive(Debug, Serialize)]
+struct ModelCompleteResult {
+    text: String,
+    model_id: Option<String>,
+    tier: &'static str,
+    usage: ResultUsage,
+}
+
+#[derive(Debug, Serialize)]
+struct ResultUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
 
 // ---- §6 usage: outcomes and the sink (4.2.2b1a). Storage is 4.2.3. ----
 
@@ -369,6 +515,187 @@ pub fn map_model_error(module: &str, e: &ModelError) -> RpcError {
         ModelError::Cancelled => {
             RpcError::application(ErrorKind::Cancelled, "the daemon is shutting down")
         }
+    }
+}
+
+fn forbidden() -> RpcError {
+    RpcError::application(
+        ErrorKind::Forbidden,
+        "this module was not granted model access",
+    )
+}
+
+fn busy() -> RpcError {
+    RpcError::application(
+        ErrorKind::Busy,
+        "too many model calls are already in flight",
+    )
+}
+
+fn lifecycle_error(e: LifecycleTimeout) -> RpcError {
+    match e {
+        LifecycleTimeout::BudgetExhausted => RpcError::application(
+            ErrorKind::Timeout,
+            "this call's request-bound time budget was exhausted",
+        ),
+        LifecycleTimeout::RequestEnded => RpcError::application(
+            ErrorKind::Timeout,
+            "the request this call was bound to has already ended",
+        ),
+    }
+}
+
+// ---- §4.4 the handler ----
+
+pub struct ModelCompleteHandler {
+    pub generation: Arc<Generation>,
+    /// `None` → `forbidden`; the method is registered unconditionally from
+    /// 4.2.2b2 on regardless of whether this module holds a grant.
+    pub grant: Option<ModelGrant>,
+}
+
+impl Handler for ModelCompleteHandler {
+    fn check_params(&self, params: &Value) -> Result<(), String> {
+        ModelCompleteParams::parse(params.clone()).map(|_| ())
+    }
+
+    fn call_timeout(&self) -> Option<Duration> {
+        Some(MODEL_CALL_TIMEOUT)
+    }
+
+    fn call(&self, params: Value) -> CallFuture {
+        let parsed = ModelCompleteParams::parse(params);
+        let grant = self.grant.clone();
+        let generation = self.generation.clone();
+        Box::pin(async move {
+            let parsed = parsed.map_err(|e| {
+                RpcError::internal(format!(
+                    "params valid at check_params but not at call(): {e}"
+                ))
+            })?;
+            let Some(grant) = grant else {
+                return Err(forbidden());
+            };
+            let (request, complexity, request_id) = parsed.into_request();
+
+            // One lock: admission + the bound request's lifecycle (W4b). Does
+            // not repeat FU-70.
+            let lifecycle = generation
+                .admit_callback_bound(request_id.as_deref())
+                .map_err(refused_error)?;
+            if request_id.is_some() && lifecycle.is_none() {
+                // §3.4: stricter than memory — an id that is not (or no
+                // longer) in flight is refused, not silently run unbound.
+                return Err(RpcError::application(
+                    ErrorKind::Timeout,
+                    "request_id is not (or no longer) in flight; send no request_id for background work",
+                )
+                .with_data("retryable", Value::Bool(false))); // v2 L4
+            }
+
+            // §5: fair admission first (no queueing: `busy`), THEN the token
+            // bucket — a call refused as busy must not spend a token.
+            let Some(_admitted) = grant.deps.admission.try_admit(&grant.module) else {
+                return Err(busy());
+            };
+            if !grant.limiter.try_acquire() {
+                return Err(RpcError::application(
+                    ErrorKind::RateLimited,
+                    "model call rate limit reached",
+                ));
+            }
+
+            let profile = TaskProfile {
+                privacy: grant.privacy,
+                complexity,
+            };
+            let cancel = grant.deps.cancel_root.child_token(); // v2 M1
+            let _cancel_on_drop = cancel.clone().drop_guard(); // §3.3
+            let ticket = UsageTicket::new(grant.deps.usage.clone(), grant.module.clone()); // §6.3
+
+            let served = match bind_to_lifecycle(
+                lifecycle,
+                grant.router.complete_served(profile, &request, &cancel), // v2 H2
+            )
+            .await
+            {
+                Err(lt) => return Err(lifecycle_error(lt)), // ticket drops → Cancelled
+                Ok(Err(e)) => {
+                    ticket.finish(match e {
+                        ModelError::Cancelled => UsageOutcome::Cancelled,
+                        _ => UsageOutcome::Failed,
+                    });
+                    return Err(map_model_error(&grant.module, &e)); // §7
+                }
+                Ok(Ok(served)) => served,
+            };
+            let u = &served.response.usage;
+            let (p, c, s) = (u.prompt_tokens, u.completion_tokens, served_of(served.tier));
+            // §2.2 tripwire — only catches a `tier_order` regression (L1):
+            // it reads the same `Tier` label routing trusted, so it cannot
+            // catch a mislabelled provider (that is §2.3/J16's job).
+            if grant.privacy == Privacy::LocalOnly && !served.tier.is_local() {
+                tracing::error!(
+                    module = %grant.module,
+                    provider = %served.provider,
+                    "LocalOnly model call was served by a non-local tier — router invariant broken"
+                );
+                ticket.finish(UsageOutcome::FailedAfterServe {
+                    served: s,
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                });
+                return Err(RpcError::internal(
+                    "the kernel routed this call incorrectly; the result is withheld",
+                ));
+            }
+            let result = ModelCompleteResult {
+                text: served.response.message.content.clone().unwrap_or_default(),
+                model_id: served
+                    .response
+                    .model_id
+                    .clone()
+                    .filter(|m| m.len() <= MODEL_MAX_MODEL_ID_BYTES),
+                tier: if served.tier.is_local() {
+                    "local"
+                } else {
+                    "remote"
+                },
+                usage: ResultUsage {
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                },
+            };
+            // v3 N4: measure what will actually be written, THEN record —
+            // metering never disagrees with what the module actually got.
+            let value = serde_json::to_value(&result)
+                .map_err(|e| RpcError::internal(format!("result not serialisable: {e}")))?;
+            let size = serde_json::to_vec(&value)
+                .map(|v| v.len())
+                .unwrap_or(usize::MAX);
+            if size > MODEL_MAX_RESULT_BYTES {
+                tracing::warn!(
+                    module = %grant.module,
+                    bytes = size,
+                    "model call: answer too large to return"
+                );
+                ticket.finish(UsageOutcome::FailedAfterServe {
+                    served: s,
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                });
+                return Err(unavailable(
+                    UnavailableCause::ResponseTooLarge,
+                    "the model's answer exceeds the size a callback result may carry; lower max_tokens",
+                ));
+            }
+            ticket.finish(UsageOutcome::Ok {
+                served: s,
+                prompt_tokens: p,
+                completion_tokens: c,
+            });
+            Ok(value)
+        })
     }
 }
 
@@ -796,5 +1123,538 @@ mod tests {
         assert!(!grant.deps.cancel_root.is_cancelled());
         cancel_root.cancel();
         assert!(grant.deps.cancel_root.is_cancelled());
+    }
+}
+
+/// 4.2.2b1b: the handler itself. J3, J6 (call_timeout only — see note below),
+/// J7, J8, J9 (handler level), J10 (前半: single-generation rate limiting),
+/// J15, J18.
+#[cfg(test)]
+mod handler_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use agent24_models::{CompletionResponse, ModelProvider};
+    use agent24_protocol::{Model, Usage};
+    use serde_json::json;
+
+    use super::*;
+
+    fn ok_params() -> Value {
+        json!({"messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    // ---- §4.2 wire validation ----
+
+    #[test]
+    fn params_shape() {
+        assert!(ModelCompleteParams::parse(ok_params()).is_ok());
+        // Nothing that could change privacy/model/provider exists at all.
+        let mut p = ok_params();
+        p["privacy"] = json!("any");
+        assert!(
+            ModelCompleteParams::parse(p)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+        let mut p = ok_params();
+        p["model"] = json!("gpt-remote");
+        assert!(ModelCompleteParams::parse(p).is_err());
+        // `_meta` is tolerated and never read.
+        let mut p = ok_params();
+        p["_meta"] = json!({"privacy": "any", "tier": "remote"});
+        assert!(ModelCompleteParams::parse(p).is_ok());
+        let mut p = ok_params();
+        p["max_tokens"] = json!(0);
+        assert!(
+            ModelCompleteParams::parse(p)
+                .unwrap_err()
+                .contains("between 1 and 4096")
+        );
+        let mut p = ok_params();
+        p["max_tokens"] = json!(4097);
+        assert!(ModelCompleteParams::parse(p).is_err());
+        let mut p = ok_params();
+        p["max_tokens"] = json!(4096);
+        assert!(ModelCompleteParams::parse(p).is_ok());
+        assert!(ModelCompleteParams::parse(json!({"messages": []})).is_err());
+        assert!(
+            ModelCompleteParams::parse(json!({"messages": [{"role": "tool", "content": "x"}]}))
+                .is_err()
+        );
+        let rf = json!({"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}, "strict": true}});
+        let mut p = ok_params();
+        p["response_format"] = rf.clone();
+        assert!(ModelCompleteParams::parse(p).is_ok());
+        let mut p = ok_params();
+        let mut bad = rf.clone();
+        bad["extra"] = json!(1);
+        p["response_format"] = bad;
+        assert!(ModelCompleteParams::parse(p).is_err());
+        let mut p = ok_params();
+        let mut bad = rf;
+        bad["json_schema"]["extra"] = json!(1);
+        p["response_format"] = bad;
+        assert!(ModelCompleteParams::parse(p).is_err());
+        let mut p = ok_params();
+        p["response_format"] = json!({"type": "json_object"});
+        assert!(ModelCompleteParams::parse(p).is_err());
+    }
+
+    /// `Handler::call_timeout` reports the literal 120s (§5.2). The
+    /// end-to-end proof that this OVERRIDES a real connection's 30s default
+    /// (J6, `... sleeps 31s → success`) needs a real `serve()`/`Conn` on a
+    /// duplex socket, which nothing in this crate's unit tests builds yet;
+    /// left to the daemon-level wiring judgement (J19-style) once 4.2.2b2
+    /// registers the method. `effective_call_timeout`'s own scaling
+    /// (declared vs. connection-level vs. `MAX_METHOD_CALL_TIMEOUT`) is
+    /// already pinned by J5 in `agent24-os-proto` (ME4-4.2.2-0).
+    #[test]
+    fn call_timeout_is_the_frozen_120s() {
+        let h = ModelCompleteHandler {
+            generation: running(),
+            grant: None,
+        };
+        assert_eq!(h.call_timeout(), Some(MODEL_CALL_TIMEOUT));
+    }
+
+    #[derive(Clone, Copy)]
+    enum Behave {
+        Ok,
+        Hang,
+        Big(usize),
+        Repeat(char, usize),
+    }
+
+    struct Stub {
+        name: &'static str,
+        calls: AtomicUsize,
+        behave: Mutex<Behave>,
+        saw_cancel: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for Stub {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn complete(
+            &self,
+            _r: &CompletionRequest,
+            cancel: &CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let b = *self.behave.lock().unwrap();
+            let text = match b {
+                Behave::Hang => {
+                    let c = cancel.clone();
+                    let saw = self.saw_cancel.clone();
+                    tokio::spawn(async move {
+                        c.cancelled().await;
+                        saw.store(true, Ordering::SeqCst);
+                    });
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+                Behave::Ok => "ok".to_owned(),
+                Behave::Big(n) => "x".repeat(n),
+                Behave::Repeat(ch, n) => std::iter::repeat_n(ch, n).collect(),
+            };
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some(text), vec![]),
+                usage: Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                    cost_usd: 0.0,
+                },
+                model_id: Some("stub-actual-7b".into()),
+            })
+        }
+
+        async fn models(&self, _c: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    fn stub(name: &'static str, b: Behave) -> Arc<Stub> {
+        Arc::new(Stub {
+            name,
+            calls: AtomicUsize::new(0),
+            behave: Mutex::new(b),
+            saw_cancel: Arc::default(),
+        })
+    }
+
+    fn deps(router: Arc<ModelRouter>) -> (ModelCallbackDeps, Arc<MemoryUsageSink>) {
+        let sink = Arc::new(MemoryUsageSink::default());
+        (
+            ModelCallbackDeps {
+                router,
+                usage: sink.clone(),
+                cancel_root: CancellationToken::new(),
+                admission: ModelAdmission::new(
+                    MODEL_MAX_IN_FLIGHT_GLOBAL,
+                    MODEL_MAX_IN_FLIGHT_PER_MODULE,
+                ),
+            },
+            sink,
+        )
+    }
+
+    fn router(p: Vec<(Arc<Stub>, Tier)>) -> Arc<ModelRouter> {
+        Arc::new(ModelRouter::with_defaults(
+            p.into_iter()
+                .map(|(s, t)| (s as Arc<dyn ModelProvider>, t))
+                .collect(),
+        ))
+    }
+
+    fn running() -> Arc<Generation> {
+        let g = Generation::serving_at("/tmp/me4s2b1b-never-dialled.sock".into());
+        assert!(g.ready());
+        g
+    }
+
+    fn handler(grant: ModelGrant) -> Arc<ModelCompleteHandler> {
+        Arc::new(ModelCompleteHandler {
+            generation: running(),
+            grant: Some(grant),
+        })
+    }
+
+    // ---- J3: LocalOnly negative control / positive control ----
+
+    #[tokio::test]
+    async fn local_only_never_reaches_a_remote_provider_and_remote_allowed_does() {
+        let remote = stub("stub-SECRET", Behave::Ok);
+        let (d, sink) = deps(router(vec![(remote.clone(), Tier::Remote)]));
+        let h = handler(ModelGrant::new(
+            "sin90".into(),
+            ModelAccess::LocalOnly,
+            d.clone(),
+        ));
+        let e = h.call(ok_params()).await.unwrap_err();
+        assert_eq!(e.kind, Some(ErrorKind::Unavailable));
+        let data = e.data.clone().unwrap();
+        assert_eq!(
+            (data["retryable"].clone(), data["cause"].clone()),
+            (json!(true), json!("no_provider"))
+        );
+        assert!(!e.message.contains("SECRET"));
+        assert_eq!(
+            remote.calls.load(Ordering::SeqCst),
+            0,
+            "remote stub must see ZERO requests"
+        );
+        // Fields that could change privacy do not exist — proven again here
+        // against the SAME router, so a positive control is on record too.
+        let mut p = ok_params();
+        p["_meta"] = json!({"privacy": "any", "tier": "remote"});
+        let e = h.call(p).await.unwrap_err();
+        assert_eq!(e.kind, Some(ErrorKind::Unavailable));
+        assert_eq!(remote.calls.load(Ordering::SeqCst), 0);
+
+        let h = handler(ModelGrant::new(
+            "sin90".into(),
+            ModelAccess::RemoteAllowed,
+            d,
+        ));
+        let v = h.call(ok_params()).await.unwrap();
+        assert_eq!(
+            (v["tier"].clone(), v["model_id"].clone()),
+            (json!("remote"), json!("stub-actual-7b"))
+        );
+        assert_eq!(remote.calls.load(Ordering::SeqCst), 1);
+        // Three records: the router itself is what refuses LocalOnly (empty
+        // `tier_order`, §2.2) — a call still reaches it and is ticketed, it
+        // just never reaches `remote`. So: Failed, Failed, then Ok.
+        let recs = sink.take();
+        assert_eq!(recs.len(), 3);
+        assert!(matches!(recs[0].1, UsageOutcome::Failed));
+        assert!(matches!(recs[1].1, UsageOutcome::Failed));
+        assert!(matches!(recs[2].1, UsageOutcome::Ok { .. }));
+    }
+
+    // ---- J7: cancellation reaches the provider; recorded on `MemoryUsageSink` ----
+
+    #[tokio::test]
+    async fn dropping_the_call_future_cancels_the_provider_token_and_records_cancelled() {
+        let local = stub("l", Behave::Hang);
+        let (d, sink) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
+        let r = tokio::time::timeout(Duration::from_millis(200), h.call(ok_params())).await;
+        assert!(r.is_err(), "the call is still pending at 200ms");
+        for _ in 0..50 {
+            if local.saw_cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(local.saw_cancel.load(Ordering::SeqCst));
+        assert_eq!(
+            sink.take(),
+            vec![("sin90".to_owned(), UsageOutcome::Cancelled)]
+        );
+    }
+
+    /// v2 M1 / J7(d): cancelling the ROOT (what `modules_cut_off` does in
+    /// production, wired up in 4.2.2b2) reaches the provider and is recorded.
+    #[tokio::test]
+    async fn cancelling_the_root_reaches_the_provider_and_records_it() {
+        let local = stub("l", Behave::Hang);
+        let (d, sink) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let root = d.cancel_root.clone();
+        let h = handler(ModelGrant::new("m".into(), ModelAccess::LocalOnly, d));
+        let call = tokio::spawn(h.call(ok_params()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        root.cancel();
+        for _ in 0..50 {
+            if local.saw_cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(local.saw_cancel.load(Ordering::SeqCst));
+        call.abort();
+        let _ = call.await;
+        assert_eq!(sink.take(), vec![("m".to_owned(), UsageOutcome::Cancelled)]);
+    }
+
+    // ---- J8: lifecycle binding ----
+
+    #[tokio::test]
+    async fn an_unknown_request_id_is_refused_not_run_unbound() {
+        let local = stub("l", Behave::Ok);
+        let (d, _s) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let h = handler(ModelGrant::new("m".into(), ModelAccess::LocalOnly, d));
+        let mut p = ok_params();
+        p["request_id"] = json!("req_not_in_flight");
+        let e = h.call(p).await.unwrap_err();
+        assert_eq!(e.kind, Some(ErrorKind::Timeout));
+        assert_eq!(e.data.unwrap()["retryable"], false);
+        assert_eq!(
+            local.calls.load(Ordering::SeqCst),
+            0,
+            "never reached the router"
+        );
+        // Positive control: no `request_id` at all runs fine.
+        assert!(h.call(ok_params()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_just_finished_request_id_is_refused_the_same_way() {
+        let local = stub("l", Behave::Ok);
+        let (d, _s) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let generation = running();
+        let in_flight = generation
+            .admit_request(
+                "req_already_finished".into(),
+                [0u8; 32],
+                std::time::Instant::now(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        in_flight.finish().unwrap();
+        let h = Arc::new(ModelCompleteHandler {
+            generation,
+            grant: Some(ModelGrant::new("m".into(), ModelAccess::LocalOnly, d)),
+        });
+        let mut p = ok_params();
+        p["request_id"] = json!("req_already_finished");
+        let e = h.call(p).await.unwrap_err();
+        assert_eq!(e.kind, Some(ErrorKind::Timeout));
+        assert_eq!(e.data.unwrap()["retryable"], false);
+        assert_eq!(local.calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ---- J9 (handler level): busy spends no token ----
+
+    #[tokio::test]
+    async fn busy_spends_no_token() {
+        struct Frozen(std::time::Instant);
+        impl Clock for Frozen {
+            fn now(&self) -> std::time::Instant {
+                self.0
+            }
+        }
+        let local = stub("l", Behave::Hang);
+        let (mut d, _s) = deps(router(vec![(local.clone(), Tier::Local)]));
+        d.admission = ModelAdmission::new(8, 2);
+        let clock = Arc::new(Frozen(std::time::Instant::now()));
+        let mut grant = ModelGrant::with_clock("m".into(), ModelAccess::LocalOnly, d, clock);
+        grant.limiter = Arc::new(RateLimiter::with_clock(
+            3.0,
+            0.0,
+            Arc::new(Frozen(std::time::Instant::now())),
+        ));
+        let h = handler(grant);
+        let c1 = tokio::spawn(h.call(ok_params()));
+        let c2 = tokio::spawn(h.call(ok_params()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            h.call(ok_params()).await.unwrap_err().kind,
+            Some(ErrorKind::Busy),
+            "the module's own per-module cap (2) is already at 2 in-flight"
+        );
+        c1.abort();
+        let _ = c1.await;
+        *local.behave.lock().unwrap() = Behave::Ok;
+        assert!(
+            h.call(ok_params()).await.is_ok(),
+            "the busy call above must not have spent the 3rd (and last) token"
+        );
+        c2.abort();
+    }
+
+    // ---- J10 (前半): the token bucket itself, and its refill ----
+
+    #[tokio::test]
+    async fn the_31st_call_is_rate_limited_and_refill_lets_the_32nd_through() {
+        struct Movable(Mutex<std::time::Instant>);
+        impl Clock for Movable {
+            fn now(&self) -> std::time::Instant {
+                *self.0.lock().unwrap()
+            }
+        }
+        let local = stub("l", Behave::Ok);
+        let (d, _s) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let clock = Arc::new(Movable(Mutex::new(std::time::Instant::now())));
+        let grant = ModelGrant::with_clock("m".into(), ModelAccess::LocalOnly, d, clock.clone());
+        let h = handler(grant);
+        for i in 0..30 {
+            assert!(
+                h.call(ok_params()).await.is_ok(),
+                "call {i} of 30 (capacity)"
+            );
+        }
+        assert_eq!(
+            h.call(ok_params()).await.unwrap_err().kind,
+            Some(ErrorKind::RateLimited),
+            "the 31st call exceeds the burst capacity"
+        );
+        // MODEL_RATE_REFILL_PER_SEC = 0.5: +2s refills exactly one token.
+        *clock.0.lock().unwrap() += Duration::from_secs(2);
+        assert!(
+            h.call(ok_params()).await.is_ok(),
+            "one token refilled after 2s"
+        );
+    }
+
+    // J15 (the LocalOnly tripwire, `grant.privacy == LocalOnly &&
+    // !served.tier.is_local()` in `call()`) cannot be exercised by a normal
+    // test: a real LocalOnly `tier_order` never yields `Remote` (that
+    // guarantee is §2.3/J16, in `agent24-models`), and J3 above already
+    // pins the routing-level behaviour this tripwire backs up. J15 is a
+    // `docs/agent/mutate.sh` judgement — widen `tier_order` for
+    // `Privacy::LocalOnly` to include `Tier::Remote` and confirm J3's
+    // "remote stub must see ZERO requests" assertion turns red AND the
+    // module gets `-32603` — not a standing test in this file.
+
+    // ---- J18: result size, judged after serialization ----
+
+    async fn size_case(b: Behave) -> (Result<Value, RpcError>, Vec<(String, UsageOutcome)>) {
+        let (d, sink) = deps(router(vec![(stub("l", b), Tier::Local)]));
+        let r = handler(ModelGrant::new("m".into(), ModelAccess::LocalOnly, d))
+            .call(ok_params())
+            .await;
+        (r, sink.take())
+    }
+
+    #[tokio::test]
+    async fn result_size_is_judged_after_serialization() {
+        // 2 MiB of plain text → too large, recorded as FailedAfterServe with tokens.
+        let (r, recs) = size_case(Behave::Big(2 * 1024 * 1024)).await;
+        let e = r.unwrap_err();
+        assert_eq!(
+            (e.kind, e.data.unwrap()["cause"].clone()),
+            (Some(ErrorKind::Unavailable), json!("response_too_large"))
+        );
+        assert!(matches!(
+            recs[0].1,
+            UsageOutcome::FailedAfterServe {
+                prompt_tokens: 3,
+                ..
+            }
+        ));
+
+        // 400 KiB of `"` → 800 KiB serialized: fits, succeeds (positive control).
+        let (r, recs) = size_case(Behave::Repeat('"', 400 * 1024)).await;
+        assert!(r.is_ok());
+        assert!(matches!(recs[0].1, UsageOutcome::Ok { .. }));
+
+        // 200 KiB of U+0001 → 1.2 MiB serialized: a raw-length check (v2)
+        // would have passed it and the frame limit would have turned it into
+        // -32603 instead.
+        let (r, recs) = size_case(Behave::Repeat('\u{1}', 200 * 1024)).await;
+        assert_eq!(r.unwrap_err().data.unwrap()["cause"], "response_too_large");
+        assert!(matches!(recs[0].1, UsageOutcome::FailedAfterServe { .. }));
+
+        // The boundary itself, measured on the real serializer.
+        let overhead = serde_json::to_vec(
+            &json!({"text":"","model_id":"stub-actual-7b","tier":"local",
+            "usage":{"prompt_tokens":3,"completion_tokens":2}}),
+        )
+        .unwrap()
+        .len();
+        let (r, _) = size_case(Behave::Big(MODEL_MAX_RESULT_BYTES - overhead)).await;
+        assert!(r.is_ok(), "exactly at the limit passes");
+        let (r, _) = size_case(Behave::Big(MODEL_MAX_RESULT_BYTES - overhead + 1)).await;
+        assert!(r.is_err(), "one byte over fails");
+    }
+
+    #[tokio::test]
+    async fn an_overlong_model_id_is_dropped_not_truncated() {
+        struct LongId;
+        #[async_trait::async_trait]
+        impl ModelProvider for LongId {
+            fn name(&self) -> &str {
+                "l"
+            }
+            async fn complete(
+                &self,
+                _r: &CompletionRequest,
+                _c: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                Ok(CompletionResponse {
+                    message: Msg::assistant(Some("x".into()), vec![]),
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                        cost_usd: 0.0,
+                    },
+                    model_id: Some("m".repeat(MODEL_MAX_MODEL_ID_BYTES + 1)),
+                })
+            }
+            async fn models(&self, _c: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let r = Arc::new(ModelRouter::with_defaults(vec![(
+            Arc::new(LongId) as Arc<dyn ModelProvider>,
+            Tier::Local,
+        )]));
+        let (d, _s) = deps(r);
+        let v = handler(ModelGrant::new("m".into(), ModelAccess::LocalOnly, d))
+            .call(ok_params())
+            .await
+            .unwrap();
+        assert!(v["model_id"].is_null());
+    }
+
+    // ---- forbidden ----
+
+    #[tokio::test]
+    async fn no_grant_is_forbidden() {
+        let h = ModelCompleteHandler {
+            generation: running(),
+            grant: None,
+        };
+        assert_eq!(
+            h.call(ok_params()).await.unwrap_err().kind,
+            Some(ErrorKind::Forbidden)
+        );
     }
 }
