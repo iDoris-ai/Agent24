@@ -1,7 +1,8 @@
 //! Agent24 wall-clock scheduler (C5).
 //!
-//! The product soul: cron / every / at schedules that fire agent runs. Design
-//! constraints (SPEC-002 §1.5, ADR-026 hard constraint #7):
+//! The product soul: cron / every / at schedules that fire agent runs, and
+//! (ME4-1.2.2b, in progress) module-owned schedules that fire callback
+//! deliveries. Design constraints (SPEC-002 §1.5, ADR-026 hard constraint #7):
 //! - **pre-advance**: a due schedule's `next_run_at` is recomputed and
 //!   persisted BEFORE the run is triggered, so a crash mid-fire cannot double
 //!   fire (openfang's cron lesson).
@@ -10,17 +11,40 @@
 //!   its next future slot — never a replay burst (`MissedTickBehavior::Skip`).
 //! - **fail-safe disable**: `MAX_CONSECUTIVE_FAILURES` trigger failures in a
 //!   row disable the schedule and emit `schedule.disabled`.
+//! - **revision CAS** (`docs/design/ME4-S1-scheduler-callback.md` §2.3): the
+//!   pre-advance write is conditioned on the revision AND slot the tick read.
+//!   A concurrent spec change (or a racing tick) loses the write and the CAS
+//!   is discarded — the whole event never happens for that tick.
 //!
 //! `tick(now)` is a single pass driven by an injected instant, so the whole
 //! engine is testable with a mock clock and NO real sleeps.
 //!
-//! ME4-1.2.2b1 (this cut) adds the design's §3 trigger-interface TYPES only
-//! (`fire`/`installed_owners`/`invocation` below) — nothing in `Scheduler`
-//! consumes them yet, and the crate's OLD `RunTrigger` trait (just below)
-//! is still what `tick`/`fire`/`run_now` use. ME4-1.2.2b2 swaps `Scheduler`
-//! onto `invocation::RunTrigger` (dropping the old trait here) for the
-//! AgentRun path; ME4-1.2.2b3 wires `installed_owners`/`fire_module` in for
-//! module rows. See `docs/design/ME4-S1-scheduler-callback.md` §3/§13.
+//! ME4-1.2.2b2 (this cut): `Scheduler` now consumes [`invocation::RunTrigger`]
+//! (design §3) instead of the crate's old inline trait — the AgentRun path
+//! (`fire_agent_run`, `run_now`'s `AgentRun` arm) is rewired onto it and onto
+//! the CAS'd store calls (`advance_and_record_fire`/
+//! `update_schedule_runtime_cas`), with byte-identical AgentRun *behaviour*
+//! to before on the non-racing path (C2.7). `tick()` still SKIPS
+//! module-owned rows outright (same `continue` the old code had) — the
+//! module row's tick branch (`fire_module`/`InstalledOwners`) and
+//! `run_now`'s module arm land in ME4-1.2.2b3. See
+//! `docs/design/ME4-S1-scheduler-callback.md` §3/§13.
+//!
+//! Review fixes folded into this cut (Opus review of the pre-split 4f64743):
+//! - **M2**: the pre-advance CAS's slot condition is pinned to the RAW
+//!   `next_run_at` string the tick actually read off the row, never a
+//!   re-`fmt_iso`'d one — a legacy row whose `next_run_at` is a
+//!   non-canonical-but-valid RFC-3339 spelling (milliseconds, a `+00:00`
+//!   offset) must still fire; re-canonicalizing before the compare would
+//!   silently make the CAS lose against the row's own actual value.
+//! - **M1**: the post-trigger counter/disable write is itself CAS'd
+//!   (`update_schedule_runtime_cas` already was); this cut makes
+//!   `emit_disabled` conditional on that write actually landing — a schedule
+//!   whose disabling write lost a race must not announce a disable that
+//!   never happened.
+//! - **L1**: `tick()`'s returned count no longer includes a slot whose
+//!   pre-advance CAS lost (row deleted / revision moved concurrently) — see
+//!   its doc comment.
 
 pub mod fire;
 pub mod installed_owners;
@@ -33,13 +57,21 @@ use std::time::Duration;
 use agent24_core::record_schedule_result;
 use agent24_core::util::ulid;
 use agent24_protocol::{
-    EventBody, Schedule, ScheduleAction, ScheduleCreate, ScheduleDisabledPayload,
-    ScheduleFiredPayload, ScheduleUpdate,
+    EventBody, Schedule, ScheduleCreate, ScheduleDisabledPayload, ScheduleFiredPayload,
+    ScheduleUpdate,
 };
-use agent24_store::{Store, StoreError};
+use agent24_store::{Advance, ScheduleRecord, Store, StoreError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
+
+// ME4-1.2.2b3 additionally re-exports `fire::FireId` and
+// `installed_owners::InstalledOwners` here, once `Scheduler` actually uses
+// them (`fire_module`/`run_now`'s module arm).
+pub use invocation::{
+    DeferReason, FireOutcome, FireTrigger, InvocationTarget, RunNowOutcome, RunTrigger,
+    ScheduleInvocation, agent_run_result,
+};
 
 use next_fire::{SpecError, fmt_iso, next_fire, validate};
 
@@ -57,13 +89,6 @@ impl From<SpecError> for ScheduleError {
     fn from(err: SpecError) -> Self {
         ScheduleError::Invalid(err.to_string())
     }
-}
-
-/// Fires a schedule's action, returning the created run id. Implemented by the
-/// daemon over `RunManager` — the scheduler crate stays free of the agent loop.
-#[async_trait]
-pub trait RunTrigger: Send + Sync {
-    async fn trigger(&self, action: &ScheduleAction, schedule_id: &str) -> Result<String, String>;
 }
 
 /// Injectable clock so the background loop can be driven without real time.
@@ -225,54 +250,77 @@ impl Scheduler {
         }
     }
 
-    /// Fire immediately without touching `next_run_at` (manual "run now").
-    ///
-    /// A module row's `run_now` (design §4.7: `202 {"fire_id"}`, no
-    /// `next_run_at` change, doesn't disturb the tick's own outstanding
-    /// fire) is ME4-1.2.2b/§13's job, not this task's — `get()` can now
-    /// return one (ME4-1.2.2a fixed the strict read path), so this only
-    /// needs to fail without panicking rather than implement §4.7 early.
-    pub async fn run_now(&self, id: &str) -> Result<String, ScheduleError> {
+    /// Fire immediately without touching `next_run_at` (manual "run now",
+    /// design §4.7). A user (AgentRun) row triggers synchronously, exactly as
+    /// before (rewired onto [`ScheduleInvocation`]/[`agent_run_result`], same
+    /// observable behaviour). A module row's `run_now` (own `fire_id`,
+    /// `scheduled_for = fired_at = now`, doesn't disturb the tick source's
+    /// own outstanding fire) is ME4-1.2.2b3's job — `get()` can already
+    /// return a module row (ME4-1.2.2a), so this only needs to fail without
+    /// panicking rather than implement §4.7 early.
+    pub async fn run_now(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RunNowOutcome, ScheduleError> {
         let schedule = self.get(id).await?;
-        let Some(action) = schedule.action.as_ref() else {
+        let Some(action) = schedule.action.clone() else {
             return Err(ScheduleError::Invalid(format!(
-                "schedule {} is module-owned; run_now for module rows lands in ME4-1.2.2b",
+                "schedule {} is module-owned; run_now for module rows lands in ME4-1.2.2b3",
                 schedule.id
             )));
         };
-        self.trigger
-            .trigger(action, &schedule.id)
-            .await
+        let invocation = ScheduleInvocation {
+            schedule_id: schedule.id.clone(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger: FireTrigger::RunNow,
+            target: InvocationTarget::AgentRun(action),
+        };
+        let outcome = self.trigger.trigger(&invocation).await;
+        agent_run_result(outcome)
+            .map(|run_id| RunNowOutcome::Run { run_id })
             .map_err(ScheduleError::Invalid)
     }
 
     // ── the tick ─────────────────────────────────────────────────────────────
 
-    /// Process every schedule due at `now`. Returns how many fired. Free of
-    /// real time — the caller supplies `now`, so tests drive it directly.
+    /// Process every schedule due at `now`. Returns how many fired.
+    ///
+    /// Review L1 (behaviour note, not new — this is what the CAS'd rewrite
+    /// makes explicit): a slot whose pre-advance CAS LOST — the row was
+    /// deleted, or its revision/slot moved — since this tick read it does
+    /// NOT count, even though the pre-1.2.2b code's non-CAS'd version used to
+    /// count "the row was gone by the time we tried to write" as a fire (it
+    /// returned `Ok(())` either way). Nothing was actually fired in that
+    /// case, so the new count is the more honest one; nothing today reads
+    /// this return value expecting the old, slightly-off number.
+    ///
+    /// Free of real time — the caller supplies `now`, so tests drive it
+    /// directly.
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<usize, ScheduleError> {
-        // Lenient list: a single corrupt row must not wedge every future tick
-        let schedules = self.store.list_schedules_lenient().await?;
+        // Every row (user AND module); a single corrupt row is skipped and
+        // logged rather than wedging every future tick (`list_schedules_for_
+        // tick`'s own doc comment).
+        let records = self.store.list_schedules_for_tick().await?;
         let mut fired = 0;
-        for schedule in schedules {
-            if !schedule.enabled {
-                continue;
-            }
+        for record in records {
+            let ScheduleRecord { schedule, revision } = record;
             if schedule.action.is_none() {
                 // Module-owned row (design §8.1: `action` is `None` exactly
                 // when `owner` is `Some`). This crate's tick only drives
-                // AgentRun rows until ME4-1.2.2b adds the module-delivery
-                // branch (§3.2/§4.2) — skip it here rather than in `fire()`,
-                // the direct successor of the OLD behaviour where a module
-                // row's sentinel `action` failed to deserialize and
-                // `list_schedules_lenient` silently dropped it before it
-                // ever reached this loop.
+                // AgentRun rows until ME4-1.2.2b3 adds the module-delivery
+                // branch (§3.2/§4.2) — skip it here, same as the pre-ME4-
+                // 1.2.2b behaviour (then it was the OLD lenient list quietly
+                // dropping a row whose sentinel `action` failed to
+                // deserialize; now it is an explicit skip on the same
+                // condition).
                 continue;
             }
-            let Some(next_run_at) = &schedule.next_run_at else {
+            let Some(next_run_at) = schedule.next_run_at.clone() else {
                 continue;
             };
-            let due = match next_fire::parse_iso(next_run_at) {
+            let due = match next_fire::parse_iso(&next_run_at) {
                 Ok(due) => due,
                 Err(err) => {
                     tracing::error!("schedule {} has unparsable next_run_at: {err}", schedule.id);
@@ -282,77 +330,172 @@ impl Scheduler {
             if due > now {
                 continue;
             }
-            // Isolate per-schedule failures: a genuine StoreError while firing
-            // ONE schedule (e.g. a transient SQLITE_BUSY under concurrent
-            // approval/tool/audit writes to the same file) must not abort the
-            // whole batch and starve every other healthy due schedule (review
-            // #39). The failed schedule keeps its persisted next_run_at and is
-            // retried next tick.
+            // Isolate per-schedule failures: a genuine StoreError while
+            // firing ONE schedule (e.g. a transient SQLITE_BUSY under
+            // concurrent approval/tool/audit writes to the same file) must
+            // not abort the whole batch and starve every other healthy due
+            // schedule (review #39). The failed schedule keeps its persisted
+            // next_run_at and is retried next tick.
             let id = schedule.id.clone();
-            match self.fire(schedule, now).await {
-                Ok(()) => fired += 1,
+            match self
+                .fire_agent_run(schedule, revision, &next_run_at, due, now)
+                .await
+            {
+                Ok(did_fire) => {
+                    if did_fire {
+                        fired += 1;
+                    }
+                }
                 Err(err) => tracing::error!("schedule {id} fire failed: {err}; skipping this tick"),
             }
         }
         Ok(fired)
     }
 
-    /// Pre-advance THEN trigger. The advanced `next_run_at` is persisted first
-    /// so a crash between here and the trigger cannot re-fire the same slot.
-    ///
-    /// Every persist in this path is an UPDATE-if-exists (never an upsert): a
-    /// schedule DELETEd concurrently mid-fire must not be resurrected by a
-    /// post-trigger write (review C5). If the pre-advance write finds the row
-    /// already gone, the fire is abandoned before the trigger runs.
+    /// Pre-advance THEN trigger, for a user (AgentRun) row — unchanged
+    /// behaviour from before ME4-1.2.2b on the non-racing path (design
+    /// §3.3/C2.7), just re-plumbed onto the CAS'd store calls:
+    /// `advance_and_record_fire` (§2.3's revision CAS; `fire: None` — a user
+    /// row has no delivery table) for the pre-advance,
+    /// `update_schedule_runtime_cas` (§2.3's closing rule: the AgentRun
+    /// failure-counter/disable write is CAS'd too) for the post-fire
+    /// counters. `raw_next_run_at` is the LITERAL string this tick read off
+    /// the row (review M2) — the pre-advance CAS pins the DB column to that
+    /// exact spelling, never a re-`fmt_iso`'d `due`, so a legacy row with a
+    /// non-canonical-but-valid RFC-3339 `next_run_at` (milliseconds, a
+    /// `+00:00` offset) still fires; `due` (parsed from it) is only used for
+    /// the invocation's `scheduled_for` and for computing the next slot.
     ///
     /// Event ordering note: `schedule.fired` is emitted the moment the run is
-    /// created (queued); the run's own `run.started` is emitted later from its
-    /// execution task and may interleave. Clients that need the causal link
-    /// read `schedule_id` off `RunStartedPayload` rather than relying on the
-    /// relative order of the two events on the broadcast bus.
-    async fn fire(&self, mut schedule: Schedule, now: DateTime<Utc>) -> Result<(), ScheduleError> {
-        // Skip-missed: next slot is computed from `now`, not the stale due time
+    /// created (queued); the run's own `run.started` is emitted later from
+    /// its execution task and may interleave. Clients that need the causal
+    /// link read `schedule_id` off `RunStartedPayload` rather than relying on
+    /// the relative order of the two events on the broadcast bus.
+    async fn fire_agent_run(
+        &self,
+        schedule: Schedule,
+        revision: i64,
+        raw_next_run_at: &str,
+        due: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, ScheduleError> {
+        self.fire_agent_run_inner(schedule, revision, raw_next_run_at, due, now, || async {})
+            .await
+    }
+
+    /// The actual implementation, with a test seam (review M1):
+    /// `between_advance_and_write` runs AFTER the pre-advance CAS lands and
+    /// BEFORE the post-trigger counter/disable CAS — exactly the window a
+    /// concurrent PATCH could land in (the pre-advance does not bump
+    /// `revision`, so a PATCH racing THIS window is invisible to the first
+    /// CAS but not the second). Production always calls [`fire_agent_run`],
+    /// which passes a no-op; only tests reach for this directly.
+    async fn fire_agent_run_inner<F, Fut>(
+        &self,
+        schedule: Schedule,
+        revision: i64,
+        raw_next_run_at: &str,
+        due: DateTime<Utc>,
+        now: DateTime<Utc>,
+        between_advance_and_write: F,
+    ) -> Result<bool, ScheduleError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let now_str = fmt_iso(now);
+        // Skip-missed: next slot is computed from `now`, not the stale due time.
         let advanced = match next_fire(&schedule.spec, now) {
             Ok(next) => next.map(fmt_iso),
             Err(err) => {
-                // A spec that no longer computes (shouldn't happen post-validate)
-                // disables the schedule rather than looping forever.
+                // A spec that no longer computes (shouldn't happen
+                // post-validate) disables the schedule rather than looping
+                // forever. No pre-advance has happened yet, so the CAS here
+                // is on what the tick's list read straight off the row.
                 tracing::error!(
                     "schedule {} next_fire failed: {err}; disabling",
                     schedule.id
                 );
-                schedule.enabled = false;
-                schedule.next_run_at = None;
-                self.store.update_schedule_runtime(&schedule).await?;
-                self.emit_disabled(&schedule.id, "next_fire_error");
-                return Ok(());
+                let landed = self
+                    .store
+                    .update_schedule_runtime_cas(
+                        &schedule.id,
+                        revision,
+                        Some(raw_next_run_at),
+                        schedule.last_run_at.as_deref(),
+                        i64::from(schedule.consecutive_failures),
+                        false,
+                        true,
+                    )
+                    .await?;
+                // Review M1: a lost CAS here means nothing actually changed —
+                // announcing "disabled" for a schedule that is not, in fact,
+                // newly disabled would be a lie on the event bus.
+                if landed {
+                    self.emit_disabled(&schedule.id, "next_fire_error");
+                }
+                return Ok(false);
             }
         };
-        schedule.last_run_at = Some(fmt_iso(now));
-        schedule.next_run_at = advanced;
-        // Pre-advance: if the row is already gone (concurrent delete), stop —
-        // don't trigger a run for a schedule the user just removed.
-        if !self.store.update_schedule_runtime(&schedule).await? {
-            tracing::debug!("schedule {} deleted before fire; skipping", schedule.id);
-            return Ok(());
-        }
-
-        // Trigger the run (synchronous creation; the run executes in the bg).
-        // `tick()` only calls `fire()` for rows with `Some(action)` (module
-        // rows are filtered out above) — this `let else` documents that
-        // invariant without an `unwrap`/`expect` on the Option.
         let Some(action) = schedule.action.clone() else {
             tracing::error!(
-                "schedule {} fire() called with no action (module row?); skipping",
+                "schedule {} fire_agent_run called with no action (module row?); skipping",
                 schedule.id
             );
-            return Ok(());
+            return Ok(false);
         };
-        match self.trigger.trigger(&action, &schedule.id).await {
+        // Pre-advance, CAS'd on the revision and slot this tick read (§2.3):
+        // if the row's revision moved (a concurrent PATCH) or this slot was
+        // already advanced past (a racing tick), the whole transaction rolls
+        // back — nothing is written, this tick skips the row.
+        let advance = self
+            .store
+            .advance_and_record_fire(
+                &schedule.id,
+                revision,
+                raw_next_run_at,
+                advanced.as_deref(),
+                &now_str,
+                None,
+            )
+            .await?;
+        if matches!(advance, Advance::Lost) {
+            tracing::debug!(
+                "schedule {} tick CAS lost (revision/slot moved concurrently); skipping this tick",
+                schedule.id
+            );
+            return Ok(false);
+        }
+
+        between_advance_and_write().await;
+
+        let invocation = ScheduleInvocation {
+            schedule_id: schedule.id.clone(),
+            scheduled_for: due,
+            fired_at: now,
+            trigger: FireTrigger::Tick,
+            target: InvocationTarget::AgentRun(action),
+        };
+        match agent_run_result(self.trigger.trigger(&invocation).await) {
             Ok(run_id) => {
                 if schedule.consecutive_failures != 0 {
-                    schedule.consecutive_failures = 0;
-                    self.store.update_schedule_runtime(&schedule).await?;
+                    // The row's next_run_at/last_run_at were just set by the
+                    // pre-advance above — that is what this CAS must pin. A
+                    // lost CAS here only costs observability (the counter
+                    // stays at its old value until the next successful
+                    // write) — there is no event tied to a mere reset, so
+                    // nothing further to gate on `landed`.
+                    self.store
+                        .update_schedule_runtime_cas(
+                            &schedule.id,
+                            revision,
+                            advanced.as_deref(),
+                            Some(&now_str),
+                            0,
+                            true,
+                            false,
+                        )
+                        .await?;
                 }
                 self.emit.as_ref()(EventBody::ScheduleFired(ScheduleFiredPayload {
                     schedule_id: schedule.id.clone(),
@@ -361,18 +504,31 @@ impl Scheduler {
             }
             Err(err) => {
                 tracing::warn!("schedule {} trigger failed: {err}", schedule.id);
-                let health = record_schedule_result(&mut schedule.consecutive_failures, false);
-                if health == agent24_core::ScheduleHealth::MustDisable {
-                    schedule.enabled = false;
-                    schedule.next_run_at = None;
-                    self.store.update_schedule_runtime(&schedule).await?;
+                let mut failures = schedule.consecutive_failures;
+                let health = record_schedule_result(&mut failures, false);
+                let disable = health == agent24_core::ScheduleHealth::MustDisable;
+                let landed = self
+                    .store
+                    .update_schedule_runtime_cas(
+                        &schedule.id,
+                        revision,
+                        advanced.as_deref(),
+                        Some(&now_str),
+                        i64::from(failures),
+                        !disable,
+                        disable,
+                    )
+                    .await?;
+                // Review M1: only announce a disable that actually landed —
+                // a lost CAS (a concurrent PATCH raced this exact write)
+                // means the row was NOT disabled by this call, whatever this
+                // call locally computed.
+                if disable && landed {
                     self.emit_disabled(&schedule.id, "consecutive_failures");
-                } else {
-                    self.store.update_schedule_runtime(&schedule).await?;
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn emit_disabled(&self, schedule_id: &str, reason: &str) {
@@ -415,11 +571,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use agent24_protocol::ScheduleAction;
     use agent24_protocol::ScheduleSpec;
     use next_fire::parse_iso;
     use std::sync::Mutex;
 
-    /// Records every trigger; optionally fails the first N calls.
+    /// Records every AgentRun trigger; optionally fails the first N calls. A
+    /// Module target is answered the way the daemon's real trigger answers
+    /// one until ME4-1.2.2b3 wires module-row tick support and ME4-1.3.1
+    /// wires a real deliverer (design §3.3): `Deferred(MountPending)`, never
+    /// a failure. Nothing in THIS cut's tests constructs a Module target yet
+    /// — the arm exists purely so the match stays exhaustive against the new
+    /// trait.
     struct RecordingTrigger {
         calls: Mutex<Vec<String>>,
         fail_until: Mutex<usize>,
@@ -445,19 +608,28 @@ mod tests {
 
     #[async_trait]
     impl RunTrigger for RecordingTrigger {
-        async fn trigger(
-            &self,
-            _action: &ScheduleAction,
-            schedule_id: &str,
-        ) -> Result<String, String> {
-            let mut fail_until = self.fail_until.lock().unwrap();
-            if *fail_until > 0 {
-                *fail_until = fail_until.saturating_sub(1);
-                return Err("trigger boom".to_owned());
+        async fn trigger(&self, invocation: &ScheduleInvocation) -> FireOutcome {
+            match &invocation.target {
+                InvocationTarget::AgentRun(_action) => {
+                    {
+                        let mut fail_until = self.fail_until.lock().unwrap();
+                        if *fail_until > 0 {
+                            *fail_until = fail_until.saturating_sub(1);
+                            return FireOutcome::Failed {
+                                reason: "trigger boom".to_owned(),
+                            };
+                        }
+                    }
+                    let mut calls = self.calls.lock().unwrap();
+                    calls.push(invocation.schedule_id.clone());
+                    FireOutcome::AgentRun {
+                        run_id: format!("run_{}", calls.len()),
+                    }
+                }
+                InvocationTarget::Module { .. } => FireOutcome::Deferred {
+                    reason: DeferReason::MountPending,
+                },
             }
-            let mut calls = self.calls.lock().unwrap();
-            calls.push(schedule_id.to_owned());
-            Ok(format!("run_{}", calls.len()))
         }
     }
 
@@ -716,7 +888,13 @@ mod tests {
             .create(every_create(3600), utc("2026-07-24T10:00:00Z"))
             .await
             .unwrap();
-        let run_id = sched.run_now(&created.id).await.unwrap();
+        let outcome = sched
+            .run_now(&created.id, utc("2026-07-24T10:05:00Z"))
+            .await
+            .unwrap();
+        let RunNowOutcome::Run { run_id } = outcome else {
+            panic!("expected a user row to answer Run, got {outcome:?}");
+        };
         assert!(run_id.starts_with("run_"));
         assert_eq!(trig.count(), 1);
         // next_run_at unchanged; no schedule.fired event (that's tick-only)
@@ -735,13 +913,14 @@ mod tests {
         }
         #[async_trait]
         impl RunTrigger for DeletingTrigger {
-            async fn trigger(
-                &self,
-                _action: &ScheduleAction,
-                schedule_id: &str,
-            ) -> Result<String, String> {
-                self.store.delete_schedule(schedule_id).await.unwrap();
-                Err("boom after delete".to_owned())
+            async fn trigger(&self, invocation: &ScheduleInvocation) -> FireOutcome {
+                self.store
+                    .delete_schedule(&invocation.schedule_id)
+                    .await
+                    .unwrap();
+                FireOutcome::Failed {
+                    reason: "boom after delete".to_owned(),
+                }
             }
         }
         let store = Store::open_memory().await.unwrap();
@@ -816,7 +995,13 @@ mod tests {
         assert!(!disabled.enabled);
         assert_eq!(disabled.next_run_at, None);
 
-        let run_id = sched.run_now(&created.id).await.unwrap();
+        let outcome = sched
+            .run_now(&created.id, utc("2026-07-24T10:06:00Z"))
+            .await
+            .unwrap();
+        let RunNowOutcome::Run { run_id } = outcome else {
+            panic!("expected a user row to answer Run, got {outcome:?}");
+        };
         assert!(run_id.starts_with("run_"));
         assert_eq!(trig.count(), 1);
         // still disabled, next_run_at still None — run_now changed neither
@@ -848,5 +1033,229 @@ mod tests {
                 .unwrap_err(),
             ScheduleError::NotFound(_)
         ));
+    }
+
+    // ── ME4-1.2.2b2 review fixes (H1/M1/M2) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn a_stale_agentrun_fire_loses_its_cas_and_the_next_real_tick_fires_once() {
+        // Review H1: a concurrent revision bump between what a tick read and
+        // what it would write must make that tick's fire a complete no-op
+        // (no trigger call, no event) — and the SLOT is still due, so the
+        // very next real tick fires normally, exactly once. Only a single
+        // tick's worth of delay, never a double-fire and never a stuck row.
+        let trig = RecordingTrigger::new();
+        let (sched, events, store) = scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+        let created = sched
+            .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(created.next_run_at.as_deref(), Some("2026-07-24T10:01:00Z"));
+
+        // What a tick would have read a moment before the concurrent PATCH.
+        let stale = store
+            .list_schedules_for_tick()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.schedule.id == created.id)
+            .unwrap();
+        assert_eq!(stale.revision, 0);
+
+        // Concurrent PATCH: rename only (spec/enabled unchanged) → revision
+        // bumps (upsert_schedule always bumps it on a USER row), next_run_at
+        // stays put (`recompute` only trips on spec/enabled).
+        sched
+            .update(
+                &created.id,
+                ScheduleUpdate {
+                    name: Some("renamed".to_owned()),
+                    ..Default::default()
+                },
+                utc("2026-07-24T10:00:30Z"),
+            )
+            .await
+            .unwrap();
+        let after_patch = store.get_schedule(&created.id).await.unwrap().unwrap();
+        assert_eq!(
+            after_patch.next_run_at, stale.schedule.next_run_at,
+            "a rename-only PATCH must not move next_run_at"
+        );
+
+        // Drive the STALE record straight into the private fire path, as if
+        // this tick's read had raced the PATCH's commit.
+        let due = next_fire::parse_iso(stale.schedule.next_run_at.as_deref().unwrap()).unwrap();
+        let raw_next = stale.schedule.next_run_at.clone().unwrap();
+        let now1 = utc("2026-07-24T10:01:05Z");
+        let fired = sched
+            .fire_agent_run(stale.schedule, stale.revision, &raw_next, due, now1)
+            .await
+            .unwrap();
+        assert!(
+            !fired,
+            "a stale revision must lose the CAS and fire nothing"
+        );
+        assert_eq!(trig.count(), 0, "trigger must not be called on a lost CAS");
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no schedule.fired for a lost CAS"
+        );
+
+        // The next REAL tick (a fresh read) fires normally — exactly once,
+        // only a tick later than it "should" have.
+        assert_eq!(sched.tick(now1).await.unwrap(), 1);
+        assert_eq!(trig.count(), 1);
+        assert_eq!(
+            events.lock().unwrap().clone(),
+            vec!["schedule.fired".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cas_loss_between_pre_advance_and_the_disable_write_suppresses_the_event() {
+        // Review M1: the pre-advance can land (so the trigger DOES run and
+        // DOES fail — this is the 5th, disabling failure) while the SEPARATE
+        // post-trigger counter/disable write loses its own CAS (a concurrent
+        // PATCH landed in the narrow window between the two writes). That
+        // must not announce `schedule.disabled` for a disable that never
+        // actually landed.
+        let trig = RecordingTrigger::always_failing();
+        let (sched, events, store) = scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+        let created = sched
+            .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        // Drive 4 failing ticks normally: consecutive_failures -> 4, still enabled.
+        let mut t = utc("2026-07-24T10:01:05Z");
+        for _ in 0..4 {
+            sched.tick(t).await.unwrap();
+            t += chrono::Duration::seconds(60);
+        }
+        let before = store.get_schedule(&created.id).await.unwrap().unwrap();
+        assert_eq!(before.consecutive_failures, 4);
+        assert!(before.enabled);
+
+        // The 5th tick's read.
+        let stale = store
+            .list_schedules_for_tick()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.schedule.id == created.id)
+            .unwrap();
+        let raw_next = stale.schedule.next_run_at.clone().unwrap();
+        let due = next_fire::parse_iso(&raw_next).unwrap();
+
+        // Between THIS tick's pre-advance and its (disabling) counter write,
+        // a concurrent PATCH (rename only) bumps revision without moving
+        // next_run_at — invisible to the pre-advance CAS (which already
+        // landed by then) but not to the second one.
+        let id = created.id.clone();
+        let fired = sched
+            .fire_agent_run_inner(
+                stale.schedule,
+                stale.revision,
+                &raw_next,
+                due,
+                t,
+                || async {
+                    sched
+                        .update(
+                            &id,
+                            ScheduleUpdate {
+                                name: Some("renamed".to_owned()),
+                                ..Default::default()
+                            },
+                            t,
+                        )
+                        .await
+                        .unwrap();
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            fired,
+            "the trigger DID run (pre-advance landed) — only the disable write lost"
+        );
+
+        let after = store.get_schedule(&created.id).await.unwrap().unwrap();
+        assert!(
+            after.enabled,
+            "a lost disable-write CAS must leave the schedule enabled — it was never disabled"
+        );
+        assert_eq!(
+            after.consecutive_failures, 4,
+            "the lost write's failures=5 never landed either"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e == "schedule.disabled"),
+            "a lost CAS must not emit schedule.disabled"
+        );
+
+        // positive control: a subsequent tick with no race really does
+        // disable and emit, once its own (unraced) 5th failure lands.
+        let after_pre_advance = store.get_schedule(&created.id).await.unwrap().unwrap();
+        let due2 = next_fire::parse_iso(after_pre_advance.next_run_at.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sched
+                .tick(due2 + chrono::Duration::seconds(5))
+                .await
+                .unwrap(),
+            1
+        );
+        let final_state = store.get_schedule(&created.id).await.unwrap().unwrap();
+        assert!(!final_state.enabled);
+        assert_eq!(final_state.consecutive_failures, 5);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e == "schedule.disabled"),
+            "an UNraced 5th failure must still disable and announce it"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_matches_the_raw_stored_next_run_at_not_a_recanonicalized_one() {
+        // Review M2: a legacy (or otherwise non-canonically-spelled) but
+        // valid RFC-3339 `next_run_at` — milliseconds included — must still
+        // fire. A CAS that compared against `fmt_iso(due)` (re-canonicalized:
+        // no milliseconds) instead of the RAW stored string would spuriously
+        // lose every time, because the DB's actual column never matches that
+        // re-derived spelling.
+        let trig = RecordingTrigger::new();
+        let (sched, _ev, store) = scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+        let schedule = Schedule {
+            id: "sch_noncanon".to_owned(),
+            name: "t".to_owned(),
+            enabled: true,
+            spec: ScheduleSpec::Every { secs: 60 },
+            action: Some(ScheduleAction::AgentRun {
+                prompt: "x".to_owned(),
+                session_id: None,
+                model_override: None,
+            }),
+            delivery: vec![],
+            last_run_at: None,
+            // Non-canonical: `fmt_iso` would spell this "2026-07-24T10:01:00Z"
+            // (no milliseconds) — a different string.
+            next_run_at: Some("2026-07-24T10:01:00.000Z".to_owned()),
+            consecutive_failures: 0,
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
+        };
+        store.upsert_schedule(&schedule).await.unwrap();
+
+        assert_eq!(sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap(), 1);
+        assert_eq!(trig.count(), 1);
     }
 }
