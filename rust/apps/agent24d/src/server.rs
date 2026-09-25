@@ -1305,6 +1305,23 @@ pub async fn serve(
         &state.module_approval_broker,
         crate::domain::CallbackDeps {
             scheduler: state.scheduler.clone(),
+            // ME4-4.2.2b2 (design §2.4/§10.1): `router` is the SAME kernel
+            // router `/api/v1/chat` uses — each grant takes its own
+            // `with_separate_health()` view of it (v2 H2), never routing
+            // through it directly. `cancel_root` fires at
+            // `modules_cut_off()`, not at the start of shutdown (§3.3): a
+            // module's in-flight inference lives exactly as long as its own
+            // drain allows. The usage sink is still the in-memory one here
+            // (4.2.3 replaces it with `UsageRecorder::spawn`).
+            models: Some(crate::model_callback::ModelCallbackDeps {
+                router: state.router.clone(),
+                usage: Arc::new(crate::model_callback::MemoryUsageSink::default()),
+                cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
+                admission: crate::model_callback::ModelAdmission::new(
+                    crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+                    crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+                ),
+            }),
         },
     )
     .await;
@@ -1710,6 +1727,53 @@ fn with_discovered(
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    // ---- ME4-4.2.2b2 H1 (Opus review round on top of `bb6fb0e`) -------------
+
+    /// A real end-to-end daemon test
+    /// (`apps/agent24d/tests/me4_model_shutdown_wiring.rs`) empirically
+    /// CANNOT reliably pin this one line: `Shutdown::request()` also revokes
+    /// the module's `Generation` as part of stopping it — design
+    /// §3.3's OWN "代次撤销" row, pre-existing `os-proto` machinery that
+    /// independently cancels an in-flight model call within tens of
+    /// milliseconds of the SAME `spawn_cancel_root(shutdown.modules_cut_off())`
+    /// cut-off. Measured with a real subprocess module (SIGTERM-ignoring, one
+    /// proxied request kept in flight so its own drain doesn't finish early)
+    /// and a real hung TCP provider: correct code closes the provider
+    /// connection ~630–670ms after `POST /api/v1/shutdown`; wiring the cancel
+    /// root to `CancellationToken::new()` (never fires) still closes it at
+    /// ~670–760ms via the OTHER path — overlapping ranges, not a reliable
+    /// red/green signal for CI. This structural test is the deterministic
+    /// fallback the design's own review round asked for when the daemon-level
+    /// test can't be made to pin it: it pins the EXACT call, so a mutation to
+    /// either half — the constructor (`CancellationToken::new()` instead of
+    /// `spawn_cancel_root`) or the argument (anything other than
+    /// `shutdown.modules_cut_off()`, e.g. `shutdown.token().cancelled()` to
+    /// fire at the START of shutdown instead of at cut-off) — turns it red.
+    #[test]
+    fn the_model_callback_cancel_root_is_spawned_from_modules_cut_off() {
+        // Scoped to `serve()`'s OWN body — never to the whole file, which
+        // would make this test tautological (the string above, in this
+        // test's own source, would always make a whole-file `.contains`
+        // pass regardless of what `serve()` actually does). Same technique
+        // as `module_routes_are_behind_kernel_auth`'s sibling
+        // `build_router_with_modules` scan below: find the function, cut at
+        // the first column-zero `}` (every brace inside a rustfmt'd function
+        // body is indented).
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function must be brace-terminated");
+        let body = &body[..end];
+        assert!(
+            body.contains("spawn_cancel_root(shutdown.modules_cut_off())"),
+            "serve() must build ModelCallbackDeps.cancel_root as \
+             spawn_cancel_root(shutdown.modules_cut_off()) — design \
+             docs/design/ME4-S2-model-callback.md §3.3"
+        );
+    }
+
     // ---- ME-3a: the wiring itself, not just the scanner ---------------------
 
     /// T7b/ME-3e: a throwaway broker for `mount_all` tests that don't care
@@ -2063,6 +2127,7 @@ pub(crate) mod tests {
             &test_approval_broker(&st.events).await,
             crate::domain::CallbackDeps {
                 scheduler: st.scheduler.clone(),
+                models: None,
             },
         )
         .await;

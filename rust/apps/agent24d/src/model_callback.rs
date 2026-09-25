@@ -1,23 +1,20 @@
 //! `_a24/model/complete` (ME4-S2 v3.1, §4–§7). **4.2.2b1a**: constants,
 //! admission (§5), the usage sink (§6.3), grants/deps (§5.1), and error
-//! mapping (§7). **4.2.2b1b** (this increment): the wire types (§4.2/§4.3)
-//! and `ModelCompleteHandler` (§4.4) — everything the handler needs except
-//! registration. **Not** in this file (see the split in
-//! `docs/design/ME4-S2-model-callback.md` §10.2): registration/`serve()`
-//! wiring (4.2.2b2) and persisted usage (4.2.3).
-//!
-//! v3 N7: until 4.2.2b2 registers `_a24/model/complete`, most of this is
-//! unreachable from a binary crate's point of view — `allow(dead_code)`
-//! outside test builds; **removed by 4.2.2b2** together with the structural
-//! test in `domain.rs` that pins "not registered yet" (J2).
-#![cfg_attr(not(test), allow(dead_code))]
+//! mapping (§7). **4.2.2b1b**: the wire types (§4.2/§4.3) and
+//! `ModelCompleteHandler` (§4.4). **4.2.2b2** (this increment):
+//! [`model_grant`] — built once per mount, outside the `MethodsFor` closure,
+//! same shape as `crate::os_memory::memory_grant_name` — and
+//! `crate::domain` wires `KERNEL_OOP_GRANTS`, `CallbackDeps.models`,
+//! `provides`, and registers `_a24/model/complete` unconditionally (design
+//! §2.4). **Not** in this file (see the split in
+//! `docs/design/ME4-S2-model-callback.md` §10.2): persisted usage (4.2.3).
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent24_domain::ModelAccess;
+use agent24_domain::{Capability, Grants, ModelAccess};
 use agent24_models::router::{Complexity, ModelRouter, Privacy, TaskProfile, Tier};
 use agent24_models::{CompletionRequest, ModelError, Msg, ResponseFormat};
 use agent24_os_proto::drain::{Generation, LifecycleTimeout, bind_to_lifecycle};
@@ -26,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::events_emit::{Clock, RateLimiter, refused_error};
+#[cfg(test)]
+use crate::events_emit::Clock;
+use crate::events_emit::{RateLimiter, refused_error};
 
 // ---- §5.2 numbers (⚖️ = chosen, not derived) ----
 
@@ -235,6 +234,12 @@ pub trait UsageSink: Send + Sync {
 pub struct MemoryUsageSink(Mutex<Vec<(String, UsageOutcome)>>);
 
 impl MemoryUsageSink {
+    /// Test-only: production reads the sink through `UsageSink::record`
+    /// alone (4.2.3 replaces this sink entirely). Not gated at the file
+    /// level any more (4.2.2b2 removed that blanket allow, since most of
+    /// this file is now reachable from `serve()`) — gated here instead, on
+    /// the one method nothing in the production path calls.
+    #[cfg(test)]
     pub fn take(&self) -> Vec<(String, UsageOutcome)> {
         std::mem::take(
             &mut *self
@@ -369,6 +374,28 @@ impl Drop for AdmissionGuard {
     }
 }
 
+// ---- §3.3 cancel root wiring (serve()) ----
+
+/// §3.3/§3.4: the parent of every in-flight call's cancellation token.
+/// `modules_cut_off` is `Shutdown::modules_cut_off()` in production — NOT the
+/// start of shutdown, deliberately: a module's in-flight inference is allowed
+/// to run to completion through its own drain, and only stops when the
+/// module itself is about to be cut off (design §3.3 "为什么不在停机一开始就
+/// 中止"). Spawns a task that waits for that future, then fires the token;
+/// the returned token is what `ModelCallbackDeps::cancel_root` holds and every
+/// call's `cancel_root.child_token()` (§4.4) descends from.
+pub(crate) fn spawn_cancel_root(
+    modules_cut_off: impl std::future::Future<Output = ()> + Send + 'static,
+) -> CancellationToken {
+    let root = CancellationToken::new();
+    let fire = root.clone();
+    tokio::spawn(async move {
+        modules_cut_off.await;
+        fire.cancel();
+    });
+    root
+}
+
 // ---- §5.1 grants and daemon-level deps ----
 
 /// Daemon-level: built once in `serve()` (4.2.2b2), handed to `mount_all` BY
@@ -410,7 +437,10 @@ impl ModelGrant {
         )
     }
 
-    /// v2 L6: the same, with an injected clock for the bucket (tests).
+    /// v2 L6: the same, with an injected clock for the bucket. Test-only —
+    /// production always uses the wall clock via `new` (4.2.2b2 note: not
+    /// gated at the file level, see `MemoryUsageSink::take`'s comment).
+    #[cfg(test)]
     pub fn with_clock(
         module: String,
         access: ModelAccess,
@@ -444,6 +474,28 @@ impl ModelGrant {
     }
 }
 
+/// §2.4: built once per mount, OUTSIDE the `MethodsFor` closure — same shape
+/// and reason as `crate::os_memory::memory_grant_name` (a restarted
+/// generation must see the same limiter/health-table, not a fresh one).
+/// `None` unless BOTH halves hold: the module actually requested and was
+/// granted [`Capability::Models`], AND this daemon built model deps at all
+/// (`deps` is `None` for a `CallbackDeps` with no router configured — no such
+/// daemon exists in production, but tests that don't care about model
+/// routing take that shortcut). Never lets a module appear in
+/// `granted`/`provides` for a capability it does not actually hold
+/// (invariant #134, the same rule `memory` follows).
+pub(crate) fn model_grant(
+    name: &str,
+    access: ModelAccess,
+    granted: &Grants,
+    deps: Option<&ModelCallbackDeps>,
+) -> Option<ModelGrant> {
+    match (granted.has(Capability::Models), deps) {
+        (true, Some(deps)) => Some(ModelGrant::new(name.to_owned(), access, deps.clone())),
+        _ => None,
+    }
+}
+
 // ---- §7 error mapping ----
 
 /// v2 L3: `data.cause` is a closed set.
@@ -457,6 +509,10 @@ pub enum UnavailableCause {
 
 impl UnavailableCause {
     /// v3 L-b: the closed set, pinned against the SPEC sentence by a test.
+    /// Test-only: nothing in the production path iterates the closed set
+    /// (4.2.2b2 note: not gated at the file level, see
+    /// `MemoryUsageSink::take`'s comment).
+    #[cfg(test)]
     pub const ALL: [UnavailableCause; 4] = [
         Self::NoProvider,
         Self::RequestRejected,
@@ -1222,6 +1278,14 @@ mod handler_tests {
     enum Behave {
         Ok,
         Hang,
+        /// L1 (Opus review round on top of `bb6fb0e`): unlike `Hang` (which
+        /// never returns on its own — proving DROP-based cancellation, e.g.
+        /// `$/cancelRequest`'s `handle.abort()`, reaches the provider), this
+        /// mirrors the REAL `OpenAiCompatProvider::complete`'s own
+        /// `tokio::select! { .., () = cancel.cancelled() => return
+        /// Err(ModelError::Cancelled) }` (`agent24-models/src/lib.rs`): it
+        /// resolves BY ITSELF once cancelled, with no external abort needed.
+        HangUntilCancelled,
         Big(usize),
         Repeat(char, usize),
     }
@@ -1256,6 +1320,11 @@ mod handler_tests {
                     });
                     std::future::pending::<()>().await;
                     unreachable!()
+                }
+                Behave::HangUntilCancelled => {
+                    cancel.cancelled().await;
+                    self.saw_cancel.store(true, Ordering::SeqCst);
+                    return Err(ModelError::Cancelled);
                 }
                 Behave::Ok => "ok".to_owned(),
                 Behave::Big(n) => "x".repeat(n),
@@ -1419,6 +1488,94 @@ mod handler_tests {
         assert!(local.saw_cancel.load(Ordering::SeqCst));
         call.abort();
         let _ = call.await;
+        assert_eq!(sink.take(), vec![("m".to_owned(), UsageOutcome::Cancelled)]);
+    }
+
+    // ---- J19 (4.2.2b2, "取消部分"): `spawn_cancel_root` — the production
+    // cut-off root `serve()` builds from `Shutdown::modules_cut_off()` — is
+    // what `ModelCallbackDeps.cancel_root` actually is in production. The
+    // test above already proves cancelling `deps.cancel_root` reaches the
+    // provider; these two prove `spawn_cancel_root` itself turns "the future
+    // resolved" into "the token is cancelled", and that the two compose
+    // end-to-end through the real handler. Named with a `model_shutdown_wiring`
+    // substring so `cargo test -p agent24d model_shutdown_wiring` (design §8
+    // J19's own command) selects both. 4.2.3b upgrades the sink assertion to
+    // a real `Store` row; this increment's assertion target is the
+    // `MemoryUsageSink` (task scope: "J19 的取消部分，断言对象是内存 sink").
+
+    #[tokio::test]
+    async fn model_shutdown_wiring_spawn_cancel_root_only_fires_once_its_future_resolves() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let root = spawn_cancel_root(async move {
+            let _ = rx.await;
+        });
+        assert!(!root.is_cancelled());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !root.is_cancelled(),
+            "must not fire before its future resolves"
+        );
+        tx.send(()).unwrap();
+        for _ in 0..50 {
+            if root.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(root.is_cancelled());
+    }
+
+    /// J19: the SAME wiring `serve()` uses (`spawn_cancel_root` feeding
+    /// `ModelCallbackDeps.cancel_root`) reaches a real in-flight call's
+    /// provider and lands a `Cancelled` outcome — proving "the daemon cuts
+    /// off in-flight model calls at `modules_cut_off()`" end to end, not just
+    /// piece by piece.
+    #[tokio::test]
+    async fn model_shutdown_wiring_cuts_off_an_in_flight_call_and_records_cancelled() {
+        let local = stub("l", Behave::HangUntilCancelled);
+        let (mut d, sink) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let (cut_off_tx, cut_off_rx) = tokio::sync::oneshot::channel::<()>();
+        d.cancel_root = spawn_cancel_root(async move {
+            let _ = cut_off_rx.await;
+        });
+        let h = handler(ModelGrant::new("m".into(), ModelAccess::LocalOnly, d));
+        let call = tokio::spawn(h.call(ok_params()));
+        for _ in 0..50 {
+            if local.calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            local.calls.load(Ordering::SeqCst),
+            1,
+            "the call must have reached the provider before cut-off"
+        );
+        cut_off_tx
+            .send(())
+            .expect("spawn_cancel_root's task must still be waiting on this");
+        for _ in 0..50 {
+            if local.saw_cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            local.saw_cancel.load(Ordering::SeqCst),
+            "the provider must observe the cancellation once modules_cut_off resolves"
+        );
+        // L1 (Opus review round on top of `bb6fb0e`): `call.abort()` here
+        // would make the `Cancelled` outcome near-tautological — the task
+        // gets torn down by the abort regardless of what the cancel root
+        // did. Instead, let the call's own future resolve on its own terms
+        // (bounded, so a regression hangs the test rather than passing it)
+        // and assert what it actually returned.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("the call must resolve on its own once the cancel root fires")
+            .expect("the spawned task must not panic");
+        let err = outcome.expect_err("a cut-off call must not succeed");
+        assert_eq!(err.kind, Some(ErrorKind::Cancelled), "{err:?}");
         assert_eq!(sink.take(), vec![("m".to_owned(), UsageOutcome::Cancelled)]);
     }
 
