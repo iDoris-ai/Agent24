@@ -11,9 +11,11 @@
 
 mod audit;
 mod module_approvals;
+mod module_schedules;
 mod repo;
 
 pub use audit::AuditEntry;
+pub use module_schedules::*;
 pub use repo::*;
 
 use sqlx::SqlitePool;
@@ -35,6 +37,13 @@ pub enum StoreError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// ME4-1.2.1 / design §6.2, §6.4: a module's `_a24/scheduler/upsert` for
+    /// a brand-new key when it already owns 256 rows. Counted inside the
+    /// `BEGIN IMMEDIATE` transaction that would have inserted the row, so
+    /// nothing is written and two concurrent upserts cannot jointly cross
+    /// the line.
+    #[error("module schedule quota reached")]
+    QuotaExceeded,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -88,6 +97,19 @@ impl Store {
 pub mod test_hooks {
     pub fn pool(store: &super::Store) -> &sqlx::SqlitePool {
         store.pool()
+    }
+
+    /// Build a `Store` around an already-migrated pool a test built by hand
+    /// (a WAL file with a chosen connection count, or a migrator truncated to
+    /// an older version) — `Store::open`/`open_memory` hardcode their own
+    /// pool options and always run every migration. ME4-1.2.1a note: this
+    /// moved here (rather than the tick-read-model cut where it was first
+    /// sketched) because C1.2's own concurrency test — in THIS cut — already
+    /// needs a WAL file at `max_connections(2)`, which only this hook can
+    /// build.
+    #[must_use]
+    pub fn from_pool(pool: sqlx::SqlitePool) -> super::Store {
+        super::Store { pool }
     }
 
     /// Insert a schedule row with arbitrary (possibly invalid) JSON columns —
