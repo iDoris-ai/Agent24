@@ -21,6 +21,7 @@ mod os_routes;
 mod overrides;
 mod routes;
 mod runs;
+mod scheduler_callback;
 mod schedules;
 mod server;
 
