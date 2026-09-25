@@ -865,6 +865,28 @@ impl Supervisors {
         self.lock().disabled.get(name).cloned()
     }
 
+    /// design §5.1: the proxy slot of the module `name` if — and only if — it
+    /// is in the running list right now. `None` for: never started, disabled
+    /// in os.json, hot-disabled (`disable` already `swap_remove`d it),
+    /// uninstalled, refused, and every module once the shutdown has closed
+    /// the list. Read-only: clones an `Arc`, changes nothing, takes the same
+    /// short lock [`Self::statuses`] takes.
+    ///
+    /// "In the list" only means a supervisor holds it, not that it is ready:
+    /// the caller (`agent24d::scheduler_deliver::ModuleDeliverer`) still asks
+    /// its `Generation` (`current.get()`) and lets `admit_request` decide
+    /// Starting/Draining/Revoked — the same admission every proxied request
+    /// goes through.
+    #[must_use]
+    pub fn running_slot(&self, name: &str) -> Option<Arc<agent24_os_proto::drain::Current>> {
+        self.lock()
+            .running
+            .as_ref()?
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| Arc::clone(&s.current))
+    }
+
     /// Close the list and take everything in it — and the stops disables
     /// began. Later starts and disables are refused.
     pub fn close(&self) -> Closed {
