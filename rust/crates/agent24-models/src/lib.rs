@@ -99,6 +99,13 @@ pub struct CompletionRequest {
     /// forwards it as `response_format`; providers that ignore it degrade to
     /// free text, so callers must still validate (Sin90's Local brain does).
     pub response_format: Option<ResponseFormat>,
+    /// ME4-4.2.2a: upper bound on generated tokens. `None` = the field is NOT
+    /// sent (today's behaviour, so `/api/v1/chat` is byte-for-byte unchanged).
+    /// `NonZeroU32`: the lower bound (≥ 1) is a type fact; the upper bound is
+    /// the CALLER's policy (`_a24/model/complete` caps at
+    /// `MODEL_MAX_TOKENS_CEILING`), not this crate's — the adapter forwards
+    /// the value verbatim and never clamps it silently.
+    pub max_tokens: Option<std::num::NonZeroU32>,
 }
 
 /// Structured-output request, mirroring the OpenAI `response_format` wire shape
@@ -137,6 +144,11 @@ impl ResponseFormat {
 pub struct CompletionResponse {
     pub message: Msg,
     pub usage: Usage,
+    /// ME4-4.2.2a: the model id the PROVIDER reported serving this call
+    /// (OpenAI `response.model`). `None` = the provider did not say — never
+    /// back-filled with the requested name or the provider name, because
+    /// that would state as fact something nobody observed.
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -147,6 +159,14 @@ pub enum ModelError {
     /// Provider reachable but the call failed — NOT retried on another provider
     #[error("provider error: {0}")]
     Provider(String),
+    /// ME4-S2 L3: the provider answered with a non-transient HTTP status
+    /// (4xx other than 429). Same routing semantics and the SAME `Display`
+    /// text as `Provider`, so `/api/v1/chat` and the agent loop say exactly
+    /// what they said before; `status` lets a caller that must not quote
+    /// provider text (the module callback) still tell "your request was
+    /// refused" from "the backend is misconfigured".
+    #[error("provider error: {message}")]
+    Rejected { status: u16, message: String },
     #[error("cancelled")]
     Cancelled,
 }
@@ -182,6 +202,14 @@ pub struct OpenAiCompatProvider {
     quick_timeout: Duration,
 }
 
+/// v3.1 L-3: the settings every provider client shares; `new` and
+/// `loopback_only` both start from here so they cannot drift.
+fn base_client_builder() -> reqwest::ClientBuilder {
+    // A provider that accepts TCP but never answers must not hang the daemon:
+    // bounded connect (+ per-request timeouts at the call sites).
+    reqwest::Client::builder().connect_timeout(Duration::from_secs(2))
+}
+
 impl OpenAiCompatProvider {
     pub fn new(
         name: impl Into<String>,
@@ -199,13 +227,34 @@ impl OpenAiCompatProvider {
             // A provider that accepts TCP but never answers must not hang the
             // daemon: bounded connect + per-request timeouts, classified as
             // Unavailable so the registry can still fall through.
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .build()
-                .unwrap_or_default(),
+            client: base_client_builder().build().unwrap_or_default(),
             chat_timeout: Duration::from_secs(120),
             quick_timeout: Duration::from_secs(5),
         }
+    }
+
+    /// ME4-S2 v3 N1: make "the address judged" and "the address connected
+    /// to" the same thing. The default client honours `HTTP_PROXY`/`ALL_PROXY`
+    /// (and does NOT bypass loopback) and follows redirects — either one sends
+    /// the request body somewhere other than `base_url`. A provider labeled
+    /// `Tier::Local` must be built with this: no proxy, no redirect (a 3xx
+    /// becomes a non-success status → `Rejected`).
+    #[must_use]
+    pub fn loopback_only(mut self) -> Self {
+        // v3.1 L-2: fail closed. `unwrap_or_default()` here would silently fall
+        // back to a client that DOES read proxy variables and follow redirects —
+        // the exact thing this method exists to rule out.
+        #[expect(
+            clippy::expect_used,
+            reason = "a Local provider must never fall back to a proxy-reading client"
+        )]
+        let client = base_client_builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("building the loopback-only HTTP client failed");
+        self.client = client;
+        self
     }
 
     /// Override request budgets (tests use tiny values against hanging servers)
@@ -318,6 +367,10 @@ struct OaUsage {
 struct OaChatResponse {
     choices: Vec<OaChoice>,
     usage: Option<OaUsage>,
+    /// ME4-4.2.2a: the served model id. Optional on the wire — some
+    /// OpenAI-compatible servers omit it.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -412,7 +465,10 @@ fn friendly_http_error(provider: &str, status: reqwest::StatusCode, body: &str) 
     if code == 429 || status.is_server_error() {
         ModelError::Unavailable(msg)
     } else {
-        ModelError::Provider(msg)
+        ModelError::Rejected {
+            status: code,
+            message: msg,
+        }
     }
 }
 
@@ -515,6 +571,10 @@ impl ModelProvider for OpenAiCompatProvider {
         if let Some(rf) = &req.response_format {
             body["response_format"] = rf.to_wire();
         }
+        // ME4-4.2.2a: only when set — an absent key keeps /chat's body unchanged.
+        if let Some(n) = req.max_tokens {
+            body["max_tokens"] = Value::from(n.get());
+        }
         let fut = self
             .authed(
                 self.client
@@ -534,6 +594,7 @@ impl ModelProvider for OpenAiCompatProvider {
         }
         let parsed: OaChatResponse =
             read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, &self.name).await?;
+        let model_id = parsed.model.filter(|m| !m.is_empty());
         let choice =
             parsed.choices.into_iter().next().ok_or_else(|| {
                 ModelError::Provider(format!("{} returned no choices", self.name))
@@ -555,6 +616,7 @@ impl ModelProvider for OpenAiCompatProvider {
         Ok(CompletionResponse {
             message: choice.message.into(),
             usage,
+            model_id,
         })
     }
 
@@ -701,11 +763,11 @@ mod tests {
     fn status_becomes_a_cause_a_user_can_act_on() {
         use reqwest::StatusCode;
         let auth = friendly_http_error("openai", StatusCode::UNAUTHORIZED, "");
-        assert!(matches!(auth, ModelError::Provider(_)));
+        assert!(matches!(auth, ModelError::Rejected { status: 401, .. }));
         assert!(auth.to_string().contains("authentication failed"));
 
         let missing = friendly_http_error("ollama", StatusCode::NOT_FOUND, "");
-        assert!(matches!(missing, ModelError::Provider(_)));
+        assert!(matches!(missing, ModelError::Rejected { status: 404, .. }));
         assert!(missing.to_string().contains("model id"));
     }
 
@@ -725,7 +787,7 @@ mod tests {
         ));
         assert!(matches!(
             friendly_http_error("p", StatusCode::FORBIDDEN, ""),
-            ModelError::Provider(_)
+            ModelError::Rejected { status: 403, .. }
         ));
     }
 
@@ -779,6 +841,7 @@ mod tests {
                     total_tokens: 2,
                     cost_usd: 0.0,
                 },
+                model_id: None,
             })
         }
         async fn models(&self, _cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
@@ -811,7 +874,109 @@ mod tests {
             model: None,
             tools: vec![],
             response_format: None,
+            max_tokens: None,
         }
+    }
+
+    // ── J4 (ME4-4.2.2a): max_tokens forwarded only when set; model_id parsed ──
+
+    fn req_with_max_tokens(max: Option<u32>) -> CompletionRequest {
+        CompletionRequest {
+            max_tokens: max.and_then(std::num::NonZeroU32::new),
+            ..req()
+        }
+    }
+
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 65536];
+        let mut got = Vec::new();
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            got.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&got).to_string();
+            if let Some(idx) = text.find("\r\n\r\n") {
+                let len: usize = text
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if got.len() >= idx + 4 + len {
+                    return text[idx + 4..].to_string();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn max_tokens_is_forwarded_only_when_set_and_model_id_is_parsed() {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = vec![];
+            for _ in 0..2 {
+                let (mut s, _) = l.accept().await.unwrap();
+                bodies.push(read_request(&mut s).await);
+                let body = r#"{"model":"stub-actual-7b","choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let p = OpenAiCompatProvider::new("omlx", url, None, "local", "Qwen3-8B-4bit");
+        let c = CancellationToken::new();
+        // model_id: parsed from the provider's own report, not back-filled
+        // from the provider name ("omlx") or the requested model name.
+        let r = p
+            .complete(&req_with_max_tokens(Some(77)), &c)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.model_id.as_deref(),
+            Some("stub-actual-7b"),
+            "not the provider name, not the requested name"
+        );
+        // Positive control: max_tokens absent → key absent from the body,
+        // which is what keeps /api/v1/chat byte-for-byte unchanged.
+        let _ = p.complete(&req_with_max_tokens(None), &c).await.unwrap();
+        let bodies = server.await.unwrap();
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(first["max_tokens"], 77);
+        assert!(
+            second.get("max_tokens").is_none(),
+            "absent → not sent (/chat unchanged)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_omits_the_model_field_reports_no_model_id() {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let _ = read_request(&mut s).await;
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"x"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let p = OpenAiCompatProvider::new("omlx", url, None, "local", "m");
+        let r = p
+            .complete(&req_with_max_tokens(None), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(r.model_id, None);
     }
 
     #[tokio::test]

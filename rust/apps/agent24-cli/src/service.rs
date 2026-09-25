@@ -117,10 +117,14 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 11] = [
+pub const PASSTHROUGH_VARS: [&str; 12] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
+    // ME4-S2 v3 N2 / ME4-4.2.2a: `ModelRouter::from_env` reads this (was
+    // hard-coded) so the Ollama endpoint can be pointed off the default port
+    // too; a launchd-started daemon must see it or it silently falls back.
+    "OLLAMA_URL",
     "A24_GUARDIAN",
     "A24_GUARDIAN_ALWAYS_REVIEW",
     "A24_APPROVAL_TIMEOUT_SECS",
