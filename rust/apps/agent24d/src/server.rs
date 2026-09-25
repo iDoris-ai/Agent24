@@ -1305,6 +1305,23 @@ pub async fn serve(
         &state.module_approval_broker,
         crate::domain::CallbackDeps {
             scheduler: state.scheduler.clone(),
+            // ME4-4.2.2b2 (design §2.4/§10.1): `router` is the SAME kernel
+            // router `/api/v1/chat` uses — each grant takes its own
+            // `with_separate_health()` view of it (v2 H2), never routing
+            // through it directly. `cancel_root` fires at
+            // `modules_cut_off()`, not at the start of shutdown (§3.3): a
+            // module's in-flight inference lives exactly as long as its own
+            // drain allows. The usage sink is still the in-memory one here
+            // (4.2.3 replaces it with `UsageRecorder::spawn`).
+            models: Some(crate::model_callback::ModelCallbackDeps {
+                router: state.router.clone(),
+                usage: Arc::new(crate::model_callback::MemoryUsageSink::default()),
+                cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
+                admission: crate::model_callback::ModelAdmission::new(
+                    crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+                    crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+                ),
+            }),
         },
     )
     .await;
@@ -2063,6 +2080,7 @@ pub(crate) mod tests {
             &test_approval_broker(&st.events).await,
             crate::domain::CallbackDeps {
                 scheduler: st.scheduler.clone(),
+                models: None,
             },
         )
         .await;
