@@ -57,6 +57,7 @@
 //!   follow-up (FU) rather than implemented — see the comment at the log
 //!   call site.
 
+pub mod deliveries;
 pub mod fire;
 pub mod installed_owners;
 pub mod invocation;
@@ -234,6 +235,32 @@ impl Scheduler {
     #[must_use]
     pub fn delivery_notify(&self) -> &tokio::sync::Notify {
         &self.delivery_notify
+    }
+
+    /// ME4-1.3.1: the delivery pump (`deliveries::DeliveryPump`) needs the
+    /// same store handle the tick uses, to read/write `schedule_deliveries`.
+    /// `Store` is a cheap `Clone` over a shared pool (not a second
+    /// connection), so this is not a second database.
+    #[must_use]
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// ME4-1.3.1: the delivery pump calls the SAME `RunTrigger` the tick uses
+    /// for `AgentRun` rows — for a module row this is what actually performs
+    /// the kernel request (design §3.2: tick never calls `trigger()` for a
+    /// module row; the pump does, once per due delivery).
+    #[must_use]
+    pub fn trigger(&self) -> &Arc<dyn RunTrigger> {
+        &self.trigger
+    }
+
+    /// ME4-1.3.1: lets `deliveries::DeliveryPump` broadcast `schedule.
+    /// delivered`/`schedule.disabled` through the same sink the tick uses,
+    /// without exposing the sink itself (which would let a caller emit
+    /// anything, not just react to a delivery outcome).
+    pub fn emit_event(&self, body: EventBody) {
+        self.emit.as_ref()(body);
     }
 
     // ── CRUD ─────────────────────────────────────────────────────────────────
