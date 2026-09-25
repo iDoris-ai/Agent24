@@ -1,23 +1,30 @@
-//! ME4-1.2.1a — module-owned schedules: ownership/identity columns and the
-//! idempotent upsert. See `docs/design/ME4-S1-scheduler-callback.md`:
-//! - §2 (D1) — migration `0007_module_schedules.sql` (full table, this cut),
-//!   the revision rule.
+//! ME4-1.2.1a/b — module-owned schedules and their deliveries. See
+//! `docs/design/ME4-S1-scheduler-callback.md`:
+//! - §2 (D1) — migration `0007_module_schedules.sql` (full table, landed in
+//!   1.2.1a), the revision rule, the tick's CAS pre-advance (1.2.1b, this
+//!   cut).
+//! - §4 (D3) — the `schedule_deliveries` state machine's storage side
+//!   (1.2.1b, this cut): recording a fire (with supersede + prune, same
+//!   transaction as the pre-advance), applying one attempt's outcome (CAS'd),
+//!   the pump's due query, the expiry sweep.
 //! - §6.1/§6.2 (D5) — the upsert SQL and outcome judgement, the `list`/upsert
-//!   read-model (`ModuleScheduleState`, `last_fire` per source).
+//!   read-model (1.2.1a).
 //!
-//! Stacked on top: ME4-1.2.1b (`feat/me4-1.2.1b-deliveries`) adds the
-//! `schedule_deliveries` writers (tick pre-advance + fire recording, the
-//! pump's due query, the outcome CAS) — `MODULE_STATE_SELECT` below already
-//! reads that table (for `last_fire`) even though nothing in this cut writes
-//! it yet. ME4-1.2.1c (`feat/me4-1.2.1c-rest-guards`) adds suspend/resume and
-//! the REST PATCH CAS. ME4-1.2.1d (`feat/me4-1.2.1-schedule-store`) adds the
-//! tick loop's read-model.
+//! Stacked on top: ME4-1.2.1c (`feat/me4-1.2.1c-rest-guards`) adds
+//! suspend/resume and the REST PATCH CAS. ME4-1.2.1d
+//! (`feat/me4-1.2.1-schedule-store`) adds the tick loop's read-model.
 //!
 //! Scope note (task ME4-1.2.1 is store-only): the pure delivery state
 //! machine (`apply_outcome`/`FireOutcome`/`Applied`) and the trigger
 //! interface (`FireId`/`RunTrigger`) belong to `agent24-scheduler`
 //! (ME4-1.2.2b/1.3.1) and are NOT introduced here or in any later cut of
-//! this task — this crate has no dependency on `agent24-scheduler`.
+//! this task — this crate has no dependency on `agent24-scheduler`. Every
+//! function below therefore takes already-decided, primitive values (status
+//! strings, attempt counts, pre-formatted ISO-8601 timestamps, `fire_id` as
+//! `&str`) rather than those crate's types. `FireTrigger` below is a minimal
+//! store-local stand-in for the `tick`/`run_now` domain tag (needed to bind
+//! the `schedule_deliveries.fire_trigger` CHECK column correctly); the
+//! scheduler crate's own, richer version is a separate type.
 
 use agent24_protocol::ScheduleSpec;
 use serde::Serialize;
@@ -32,6 +39,24 @@ use crate::{Result, Store, StoreError};
 /// instead of firing it — the row's meaning comes from `owner_module`, never
 /// from this column (§2.1).
 pub const MODULE_ACTION_SENTINEL: &str = r#"{"type":"module_delivery"}"#;
+
+/// `schedule_deliveries.fire_trigger` (§2.1: named `fire_trigger`, not
+/// `trigger` — `TRIGGER` is a SQLite keyword).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireTrigger {
+    Tick,
+    RunNow,
+}
+
+impl FireTrigger {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tick => "tick",
+            Self::RunNow => "run_now",
+        }
+    }
+}
 
 // ── §6.1 read-model types ────────────────────────────────────────────────────
 
@@ -314,6 +339,431 @@ impl Store {
     }
 }
 
+// ── §2.3/§4.2 tick pre-advance + fire recording (ME4-1.2.1b) ────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Advance {
+    /// Pre-advance landed (and the fire, if any, was recorded in the same
+    /// transaction).
+    Advanced,
+    /// The CAS lost: the row is gone, its revision moved, it is no longer
+    /// eligible (disabled/suspended/system-disabled), or this `next_run_at`
+    /// slot was already advanced past. Nothing was written; the caller skips
+    /// this row for this tick.
+    Lost,
+}
+
+/// A module fire to record in the same transaction as the tick's pre-advance
+/// (`advance_and_record_fire`) or a `run_now` (`record_run_now_fire`).
+///
+/// `owner_module`/`module_key` are advisory for `advance_and_record_fire`
+/// (review, L-1): it re-reads both from the `schedules` row itself, inside
+/// the same transaction, rather than trusting these fields — a caller bug
+/// (stale/mismatched owner or key) must not corrupt `schedule_deliveries`.
+/// `record_run_now_fire` builds its own `NewFire` from a row it already read,
+/// so for that path these fields are simply correct by construction.
+pub struct NewFire<'a> {
+    pub fire_id: &'a str,
+    pub owner_module: &'a str,
+    pub module_key: &'a str,
+    pub scheduled_for: &'a str,
+    pub fired_at: &'a str,
+    pub trigger: FireTrigger,
+    pub expires_at: &'a str,
+}
+
+/// Terminal rows kept per (schedule, source) — v3 (L-B): per SOURCE, not per
+/// schedule. Five delivered `run_now`s after the schedule's last tick fire
+/// must not prune the tick fire's `last_fire` away. (Review, L-4: named
+/// `..._PER_SOURCE`, not `..._PER_SCHEDULE` — the cap is per (schedule,
+/// source), and the old name read as "per schedule" on its own.)
+pub const KEEP_TERMINAL_PER_SOURCE: i64 = 4;
+
+const PRUNE_TERMINAL_SQL: &str = "\
+DELETE FROM schedule_deliveries \
+WHERE schedule_id = ?1 AND fire_trigger = ?2 AND status IN ('delivered', 'failed', 'expired') \
+  AND rowid NOT IN ( \
+      SELECT rowid FROM schedule_deliveries \
+      WHERE schedule_id = ?1 AND fire_trigger = ?2 \
+        AND status IN ('delivered', 'failed', 'expired') \
+      ORDER BY updated_at DESC, rowid DESC LIMIT ?3)";
+
+/// Supersede older outstanding fires of this schedule **with the same
+/// trigger** (a `run_now` never retires a tick fire, nor the reverse, v2 H3):
+/// a row never sent (`attempts = 0`) is deleted outright — it left no trace
+/// worth keeping (v3, L-A: `attempts = 0` does not prove it was never sent,
+/// only that no attempt result was ever recorded; deleting it only costs
+/// observability, never a delivery guarantee); one sent at least once becomes
+/// `expired('superseded')`. Then insert this fire (idempotent on `fire_id`)
+/// and prune this source's terminal rows to `KEEP_TERMINAL_PER_SOURCE`.
+async fn record_fire_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    schedule_id: &str,
+    f: &NewFire<'_>,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM schedule_deliveries \
+         WHERE schedule_id = ? AND fire_trigger = ? AND status IN ('pending', 'deferred') \
+           AND attempts = 0 AND fire_id <> ?",
+    )
+    .bind(schedule_id)
+    .bind(f.trigger.as_str())
+    .bind(f.fire_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE schedule_deliveries \
+         SET status = 'expired', next_attempt_at = NULL, last_error = 'superseded', updated_at = ? \
+         WHERE schedule_id = ? AND fire_trigger = ? AND status IN ('pending', 'deferred') \
+           AND fire_id <> ?",
+    )
+    .bind(now)
+    .bind(schedule_id)
+    .bind(f.trigger.as_str())
+    .bind(f.fire_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO schedule_deliveries (fire_id, schedule_id, owner_module, module_key, \
+             scheduled_for, fired_at, fire_trigger, status, attempts, next_attempt_at, \
+             expires_at, last_error, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, NULL, ?, ?) \
+         ON CONFLICT (fire_id) DO NOTHING",
+    )
+    .bind(f.fire_id)
+    .bind(schedule_id)
+    .bind(f.owner_module)
+    .bind(f.module_key)
+    .bind(f.scheduled_for)
+    .bind(f.fired_at)
+    .bind(f.trigger.as_str())
+    .bind(now)
+    .bind(f.expires_at)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(PRUNE_TERMINAL_SQL)
+        .bind(schedule_id)
+        .bind(f.trigger.as_str())
+        .bind(KEEP_TERMINAL_PER_SOURCE)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+// ── §5.4 pump read model (ME4-1.2.1b) ───────────────────────────────────────
+
+/// One row the delivery pump picked up to attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DueDelivery {
+    pub fire_id: String,
+    pub schedule_id: String,
+    pub owner_module: String,
+    pub module_key: String,
+    pub scheduled_for: String,
+    pub fired_at: String,
+    /// `"tick"` | `"run_now"`.
+    pub fire_trigger: String,
+    /// `"pending"` | `"deferred"`.
+    pub status: String,
+    pub attempts: i64,
+}
+
+/// The pump's due set (§5.4): non-terminal, due, not expired, owner not in
+/// the pump's skip cache (`?2` = JSON array of owner names), at most
+/// `?3` rows per owner (so one owner's backlog cannot fill the window),
+/// oldest slot first, capped overall at `?4`.
+const DUE_DELIVERIES_SQL: &str = "\
+SELECT fire_id, schedule_id, owner_module, module_key, scheduled_for, fired_at, \
+       fire_trigger, status, attempts \
+FROM ( \
+    SELECT *, ROW_NUMBER() OVER ( \
+               PARTITION BY owner_module ORDER BY scheduled_for, fire_id) AS rn \
+    FROM schedule_deliveries \
+    WHERE status IN ('pending', 'deferred') AND next_attempt_at <= ?1 AND expires_at > ?1 \
+      AND owner_module NOT IN (SELECT value FROM json_each(?2)) \
+) \
+WHERE rn <= ?3 \
+ORDER BY scheduled_for, fire_id \
+LIMIT ?4";
+
+fn due_delivery_from(r: &SqliteRow) -> DueDelivery {
+    DueDelivery {
+        fire_id: r.get("fire_id"),
+        schedule_id: r.get("schedule_id"),
+        owner_module: r.get("owner_module"),
+        module_key: r.get("module_key"),
+        scheduled_for: r.get("scheduled_for"),
+        fired_at: r.get("fired_at"),
+        fire_trigger: r.get("fire_trigger"),
+        status: r.get("status"),
+        attempts: r.get("attempts"),
+    }
+}
+
+/// A non-terminal row older than 24h from `fired_at` (§4.5's sweep, `EXPIRE_SQL`).
+const EXPIRE_SQL: &str = "\
+UPDATE schedule_deliveries \
+SET status = 'expired', next_attempt_at = NULL, last_error = 'ttl', updated_at = ?1 \
+WHERE status IN ('pending', 'deferred') AND expires_at <= ?1";
+
+/// What one delivery attempt's already-decided outcome writes (the pure
+/// judgement — "3 failures at 5s/15s back off, then `failed`" — is
+/// `agent24-scheduler`'s `apply_outcome`, ME4-1.3.1; this is only the CAS'd
+/// write of its result).
+pub struct DeliveryOutcomeWrite<'a> {
+    /// `"delivered"` | `"pending"` | `"deferred"` | `"failed"`.
+    pub status: &'a str,
+    pub attempts: i64,
+    /// `Some` iff `status` is non-terminal (mirrors the table's CHECK).
+    pub next_attempt_at: Option<&'a str>,
+    pub last_error: Option<&'a str>,
+    /// `consecutive_failures = 0` on the schedule.
+    pub reset_schedule_failures: bool,
+    /// `consecutive_failures += 1` on the schedule (and maybe system-disable
+    /// once it reaches `disable_at`).
+    pub count_schedule_failure: bool,
+}
+
+impl Store {
+    /// S1-4 + S1-8: the tick's runtime write, revision-CAS'd (§2.3), and —
+    /// when the row turns out to be module-owned and `fire` is `Some` — the
+    /// delivery row, in ONE `BEGIN IMMEDIATE` transaction (§4.2). Used for
+    /// BOTH row kinds: an AgentRun row's pre-advance passes `fire: None` (it
+    /// has no delivery row); a module row's tick passes `fire: Some(..)`
+    /// when its owner is installed this run, `None` otherwise (v2, M5 — the
+    /// caller decides installedness, not this function).
+    ///
+    /// Review, L-1: `owner_module`/`module_key` for the delivery row are
+    /// read fresh from `schedules` inside this transaction, not taken from
+    /// `fire`'s fields — so a caller bug (wrong owner/key, or passing
+    /// `Some(fire)` for what the row turns out to be, a USER row) cannot
+    /// corrupt `schedule_deliveries`; a fire is recorded if and only if the
+    /// row is module-owned.
+    ///
+    /// # Errors
+    /// Storage/serialization.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn advance_and_record_fire(
+        &self,
+        schedule_id: &str,
+        seen_revision: i64,
+        due: &str,
+        advanced_next: Option<&str>,
+        now: &str,
+        fire: Option<NewFire<'_>>,
+    ) -> Result<Advance> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let r = sqlx::query(
+            "UPDATE schedules SET last_run_at = ?, next_run_at = ? \
+             WHERE id = ? AND revision = ? AND next_run_at = ? \
+               AND enabled = 1 AND user_suspended = 0 AND system_disabled_reason IS NULL",
+        )
+        .bind(now)
+        .bind(advanced_next)
+        .bind(schedule_id)
+        .bind(seen_revision)
+        .bind(due)
+        .execute(&mut *tx)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Ok(Advance::Lost);
+        }
+        let owner_row = sqlx::query("SELECT owner_module, module_key FROM schedules WHERE id = ?")
+            .bind(schedule_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let owner_module: Option<String> = owner_row.get("owner_module");
+        match (owner_module, fire) {
+            (Some(owner), Some(f)) => {
+                debug_assert_eq!(
+                    f.trigger,
+                    FireTrigger::Tick,
+                    "advance_and_record_fire is the TICK pre-advance path; \
+                     run_now goes through record_run_now_fire"
+                );
+                let key: String = owner_row.get("module_key");
+                let corrected = NewFire {
+                    fire_id: f.fire_id,
+                    owner_module: &owner,
+                    module_key: &key,
+                    scheduled_for: f.scheduled_for,
+                    fired_at: f.fired_at,
+                    trigger: f.trigger,
+                    expires_at: f.expires_at,
+                };
+                record_fire_in(&mut tx, schedule_id, &corrected, now).await?;
+            }
+            (None, _fire) => {
+                // A USER (AgentRun) row has no delivery table: never record a
+                // fire for it, even if the caller mistakenly passed one — a
+                // fail-safe skip, not a panic (`advance_and_record_fire_never_
+                // writes_a_delivery_row_for_a_user_schedule`).
+            }
+            (Some(_), None) => {} // module row, no fire recorded this pre-advance
+        }
+        tx.commit().await?;
+        Ok(Advance::Advanced)
+    }
+
+    /// `run_now` on a module row (§4.7): record a fire with
+    /// `scheduled_for = fired_at = now`, without touching `next_run_at` or
+    /// retiring the tick source's outstanding fire (v2, H3). `None` if the id
+    /// is not a module row (or gone) — the caller then takes the AgentRun /
+    /// not-found path. `fire_id` is supplied by the caller (`FireId::derive`,
+    /// ME4-1.2.2b) rather than computed here, keeping this crate free of that
+    /// hashing logic.
+    ///
+    /// # Errors
+    /// Storage/serialization.
+    pub async fn record_run_now_fire(
+        &self,
+        schedule_id: &str,
+        fire_id: &str,
+        now: &str,
+        expires_at: &str,
+    ) -> Result<bool> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let Some(row) = sqlx::query(
+            "SELECT owner_module, module_key FROM schedules WHERE id = ? AND owner_module IS NOT NULL",
+        )
+        .bind(schedule_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(false);
+        };
+        let owner: String = row.get("owner_module");
+        let key: String = row.get("module_key");
+        let f = NewFire {
+            fire_id,
+            owner_module: &owner,
+            module_key: &key,
+            scheduled_for: now,
+            fired_at: now,
+            trigger: FireTrigger::RunNow,
+            expires_at,
+        };
+        record_fire_in(&mut tx, schedule_id, &f, now).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    // ── §4.3 delivery outcome / §5.4 pump / §4.5 sweep ──────────────────────
+
+    /// Apply one attempt's already-decided [`DeliveryOutcomeWrite`] with a
+    /// CAS on `(fire_id, status IN (pending, deferred), attempts)`, plus the
+    /// schedule-side counters and system-disable, in one transaction. Returns
+    /// `(applied, newly_system_disabled)` — `applied = false` means the CAS
+    /// lost to expiry/supersede/delete (the row moved since the attempt was
+    /// read; the result is discarded, not retried against a different row).
+    ///
+    /// # Errors
+    /// Storage/serialization.
+    pub async fn apply_delivery_outcome(
+        &self,
+        fire_id: &str,
+        seen_attempts: i64,
+        write: &DeliveryOutcomeWrite<'_>,
+        now: &str,
+        disable_at: i64,
+    ) -> Result<(bool, bool)> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let r = sqlx::query(
+            "UPDATE schedule_deliveries \
+             SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ? \
+             WHERE fire_id = ? AND status IN ('pending', 'deferred') AND attempts = ?",
+        )
+        .bind(write.status)
+        .bind(write.attempts)
+        .bind(write.next_attempt_at)
+        .bind(write.last_error)
+        .bind(now)
+        .bind(fire_id)
+        .bind(seen_attempts)
+        .execute(&mut *tx)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Ok((false, false)); // lost to expiry / supersede / delete
+        }
+        let schedule_id: String =
+            sqlx::query_scalar("SELECT schedule_id FROM schedule_deliveries WHERE fire_id = ?")
+                .bind(fire_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let mut disabled = false;
+        if write.reset_schedule_failures {
+            sqlx::query(
+                "UPDATE schedules SET consecutive_failures = 0 WHERE id = ? AND consecutive_failures <> 0",
+            )
+            .bind(&schedule_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if write.count_schedule_failure {
+            sqlx::query(
+                "UPDATE schedules SET consecutive_failures = consecutive_failures + 1 WHERE id = ?",
+            )
+            .bind(&schedule_id)
+            .execute(&mut *tx)
+            .await?;
+            let r = sqlx::query(
+                "UPDATE schedules \
+                 SET system_disabled_reason = 'consecutive_failures', next_run_at = NULL, \
+                     revision = revision + 1 \
+                 WHERE id = ? AND consecutive_failures >= ? AND system_disabled_reason IS NULL",
+            )
+            .bind(&schedule_id)
+            .bind(disable_at)
+            .execute(&mut *tx)
+            .await?;
+            disabled = r.rows_affected() > 0;
+        }
+        tx.commit().await?;
+        Ok((true, disabled))
+    }
+
+    /// The pump's due set (§5.4). `skip_owners_json` is a JSON array of owner
+    /// names the pump has recently seen `Deferred` from (its `DEFER_RECHECK`
+    /// cache — a caller concern, ME4-1.3.1); `per_owner`/`limit` bound how
+    /// many rows come back.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn due_deliveries(
+        &self,
+        now: &str,
+        skip_owners_json: &str,
+        per_owner: i64,
+        limit: i64,
+    ) -> Result<Vec<DueDelivery>> {
+        let rows = sqlx::query(DUE_DELIVERIES_SQL)
+            .bind(now)
+            .bind(skip_owners_json)
+            .bind(per_owner)
+            .bind(limit)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows.iter().map(due_delivery_from).collect())
+    }
+
+    /// The 24h TTL sweep (§4.5): every non-terminal row past its
+    /// `expires_at` becomes `expired('ttl')`. Returns how many rows this call
+    /// flipped.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn expire_deliveries(&self, now: &str) -> Result<u64> {
+        let r = sqlx::query(EXPIRE_SQL)
+            .bind(now)
+            .execute(self.pool())
+            .await?;
+        Ok(r.rows_affected())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -398,6 +848,14 @@ mod tests {
         let pool = pool_migrated_up_to(&path, 1000, conns).await;
         sqlx::query(SEED_SCH_OLD).execute(&pool).await.unwrap();
         (crate::test_hooks::from_pool(pool), dir)
+    }
+
+    async fn revision_of(store: &Store, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT revision FROM schedules WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool(store))
+            .await
+            .unwrap()
     }
 
     // ── C1.5 — migration keeps old rows, and the new CHECKs hold ───────────
@@ -745,6 +1203,1178 @@ mod tests {
                 .unwrap()
                 .0,
             UpsertOutcome::Updated
+        );
+    }
+
+    // ── C1.3 — tick CAS loses to a newer spec ────────────────────────────────
+
+    #[tokio::test]
+    async fn tick_cas_loses_to_a_newer_spec() {
+        let (store, _dir) = fresh(1).await;
+        let due = "2026-09-23T09:01:00Z";
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some(due),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_1").await;
+        // the module changes its spec between the tick's read and its write
+        store
+            .upsert_module_schedule(
+                "x",
+                "m",
+                "k",
+                &every(3600),
+                Some("2026-09-23T10:00:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let f = NewFire {
+            fire_id: "fire_tick_sch_1_stale",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        let r = store
+            .advance_and_record_fire(
+                "sch_1",
+                rev,
+                due,
+                Some("2026-09-23T09:02:00Z"),
+                due,
+                Some(f),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r, Advance::Lost);
+        let next: Option<String> =
+            sqlx::query_scalar("SELECT next_run_at FROM schedules WHERE id = 'sch_1'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(
+            next.as_deref(),
+            Some("2026-09-23T10:00:00Z"),
+            "the new spec's next_run_at survives"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no delivery row without the pre-advance landing");
+    }
+
+    // ── C1.3 (isolated) — the revision guard alone, independent of
+    // `next_run_at` ─────────────────────────────────────────────────────────
+    //
+    // The test above changes spec AND next_run_at together, so a mutation
+    // that drops "AND revision = ?" from the CAS still passes it (the
+    // `next_run_at = due` clause alone already loses the race). A label-only
+    // upsert bumps `revision` (§2.2's table: every `Updated` write bumps it)
+    // while `recompute = false` keeps `next_run_at` byte-identical — the one
+    // scenario that isolates the revision guard's own contribution.
+
+    #[tokio::test]
+    async fn tick_cas_loses_on_a_stale_revision_even_when_next_run_at_is_unchanged() {
+        let (store, _dir) = fresh(1).await;
+        let due = "2026-09-23T09:01:00Z";
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some(due),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let stale_rev = revision_of(&store, "sch_1").await;
+        // a label-only upsert: same spec/enabled, so `recompute = false` and
+        // `next_run_at` is carried over unchanged — but the row is still
+        // `Updated` (a real desired-state change), which bumps revision.
+        let mut relabelled = every(60);
+        relabelled.label = "renamed".into();
+        let (outcome, _) = store
+            .upsert_module_schedule(
+                "x",
+                "m",
+                "k",
+                &relabelled,
+                Some(due),
+                "2026-09-23T09:00:30Z",
+                256,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpsertOutcome::Updated);
+        let fresh_rev = revision_of(&store, "sch_1").await;
+        assert_eq!(
+            fresh_rev,
+            stale_rev + 1,
+            "a label change must bump revision"
+        );
+        let unchanged_next: Option<String> =
+            sqlx::query_scalar("SELECT next_run_at FROM schedules WHERE id = 'sch_1'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(
+            unchanged_next.as_deref(),
+            Some(due),
+            "recompute = false must leave next_run_at byte-identical"
+        );
+
+        let f = NewFire {
+            fire_id: "fire_tick_stale_revision",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        // the CAS reads the STALE revision but `due` still matches the
+        // (unchanged) stored `next_run_at` — only the revision mismatch can
+        // stop this from landing.
+        let r = store
+            .advance_and_record_fire(
+                "sch_1",
+                stale_rev,
+                due,
+                Some("2026-09-23T09:02:00Z"),
+                due,
+                Some(f),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            Advance::Lost,
+            "a stale revision must lose even when next_run_at still matches"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        // positive control: the CURRENT revision succeeds
+        let f2 = NewFire {
+            fire_id: "fire_tick_current_revision",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        assert_eq!(
+            store
+                .advance_and_record_fire(
+                    "sch_1",
+                    fresh_rev,
+                    due,
+                    Some("2026-09-23T09:02:00Z"),
+                    due,
+                    Some(f2)
+                )
+                .await
+                .unwrap(),
+            Advance::Advanced
+        );
+    }
+
+    // ── C1.7 — the pre-advance and the delivery insert are one transaction ──
+
+    #[tokio::test]
+    async fn advance_and_record_fire_is_all_or_nothing() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_1").await;
+        // Test hook: a trigger that aborts exactly the one INSERT this test
+        // will attempt — simulating a storage failure inside
+        // `record_fire_in`, after the pre-advance's UPDATE already ran in the
+        // same (uncommitted) transaction (design §11, C1.7).
+        sqlx::query(
+            "CREATE TRIGGER inject_fail BEFORE INSERT ON schedule_deliveries \
+             WHEN NEW.fire_id = 'inject-fail' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(pool(&store))
+        .await
+        .unwrap();
+        let due = "2026-09-23T09:01:00Z";
+        let failing = NewFire {
+            fire_id: "inject-fail",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        assert!(
+            store
+                .advance_and_record_fire(
+                    "sch_1",
+                    rev,
+                    due,
+                    Some("2026-09-23T09:02:00Z"),
+                    due,
+                    Some(failing)
+                )
+                .await
+                .is_err()
+        );
+        let next: Option<String> =
+            sqlx::query_scalar("SELECT next_run_at FROM schedules WHERE id = 'sch_1'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(
+            next.as_deref(),
+            Some(due),
+            "the pre-advance must have rolled back with the failed insert"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        // positive control: without the injected fire_id, both statements land
+        let ok = NewFire {
+            fire_id: "fire_ok",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        assert_eq!(
+            store
+                .advance_and_record_fire(
+                    "sch_1",
+                    rev,
+                    due,
+                    Some("2026-09-23T09:02:00Z"),
+                    due,
+                    Some(ok)
+                )
+                .await
+                .unwrap(),
+            Advance::Advanced
+        );
+    }
+
+    // ── review, L-1 — the row's OWN owner/key are used, not the caller's ────
+
+    #[tokio::test]
+    async fn advance_and_record_fire_never_writes_a_delivery_row_for_a_user_schedule() {
+        let (store, _dir) = fresh(1).await;
+        let (rev, next): (i64, Option<String>) =
+            sqlx::query_as("SELECT revision, next_run_at FROM schedules WHERE id = 'sch_old'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        let due = next.unwrap();
+        // a caller bug: passing `Some(fire)` — with a bogus owner/key — for
+        // what is actually `sch_old`, a USER row.
+        let bogus = NewFire {
+            fire_id: "fire_bogus",
+            owner_module: "not-even-real",
+            module_key: "k",
+            scheduled_for: &due,
+            fired_at: &due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:00:00Z",
+        };
+        let r = store
+            .advance_and_record_fire(
+                "sch_old",
+                rev,
+                &due,
+                Some("2026-09-23T09:01:00Z"),
+                &due,
+                Some(bogus),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r, Advance::Advanced, "the pre-advance itself still lands");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "a user row must never get a delivery row, even if the caller passed one"
+        );
+    }
+
+    // ── C1.9 — supersede (same trigger only) and cascade delete ────────────
+
+    #[tokio::test]
+    async fn advance_records_supersedes_same_trigger_only_and_cascades() {
+        let (store, _dir) = fresh(1).await;
+        let t1 = "2026-09-23T09:01:00Z";
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some(t1),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_1").await;
+        let f1 = NewFire {
+            fire_id: "fire_tick_1",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: t1,
+            fired_at: t1,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        assert_eq!(
+            store
+                .advance_and_record_fire(
+                    "sch_1",
+                    rev,
+                    t1,
+                    Some("2026-09-23T09:02:00Z"),
+                    t1,
+                    Some(f1)
+                )
+                .await
+                .unwrap(),
+            Advance::Advanced
+        );
+        // replaying the same slot (e.g. a second tick that read stale state) is a no-op
+        assert_eq!(
+            store
+                .advance_and_record_fire("sch_1", rev, t1, Some("x"), t1, None)
+                .await
+                .unwrap(),
+            Advance::Lost
+        );
+        // mark fire_tick_1 as having been sent at least once, THEN supersede
+        // it — it must become `expired('superseded')`, not be deleted.
+        sqlx::query("UPDATE schedule_deliveries SET attempts = 1 WHERE fire_id = 'fire_tick_1'")
+            .execute(pool(&store))
+            .await
+            .unwrap();
+        let t2 = "2026-09-23T09:02:00Z";
+        let f2 = NewFire {
+            fire_id: "fire_tick_2",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: t2,
+            fired_at: t2,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:02:00Z",
+        };
+        store
+            .advance_and_record_fire("sch_1", rev, t2, Some("2026-09-23T09:03:00Z"), t2, Some(f2))
+            .await
+            .unwrap();
+        let (status1, last_error1): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, last_error FROM schedule_deliveries WHERE fire_id = 'fire_tick_1'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(
+            (status1.as_str(), last_error1.as_deref()),
+            ("expired", Some("superseded")),
+            "a sent (attempts > 0) superseded fire becomes expired, not deleted"
+        );
+        // run_now: its own fire id; does NOT retire the tick fire (v2, H3)
+        let now = "2026-09-23T09:02:30Z";
+        assert!(
+            store
+                .record_run_now_fire("sch_1", "fire_run_now_1", now, "2026-09-24T09:02:30Z")
+                .await
+                .unwrap()
+        );
+        let st: String = sqlx::query_scalar(
+            "SELECT status FROM schedule_deliveries WHERE fire_id = 'fire_tick_2'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(st, "pending");
+        // reverse direction: a NEW tick fire must not retire the outstanding
+        // run_now fire either.
+        let t3 = "2026-09-23T09:03:00Z";
+        let f3 = NewFire {
+            fire_id: "fire_tick_3",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: t3,
+            fired_at: t3,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:03:00Z",
+        };
+        store
+            .advance_and_record_fire("sch_1", rev, t3, Some("2026-09-23T09:04:00Z"), t3, Some(f3))
+            .await
+            .unwrap();
+        let st_run_now: String = sqlx::query_scalar(
+            "SELECT status FROM schedule_deliveries WHERE fire_id = 'fire_run_now_1'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(
+            st_run_now, "pending",
+            "a new tick fire must not retire the outstanding run_now fire"
+        );
+        // not a module row → false
+        assert!(
+            !store
+                .record_run_now_fire("sch_old", "fire_x", now, now)
+                .await
+                .unwrap()
+        );
+        // delete cascades to every delivery row
+        assert!(store.delete_module_schedule("m", "k").await.unwrap());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // ── C1.13 — an uninstalled owner never gets a delivery row ──────────────
+
+    #[tokio::test]
+    async fn uninstalled_owner_advances_next_run_at_without_a_delivery_row() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_1").await;
+        let due = "2026-09-23T09:01:00Z";
+        // the caller decides installedness — passing `fire: None` is what an
+        // owner missing from this run's InstalledOwners set looks like (v2, M5)
+        let r = store
+            .advance_and_record_fire("sch_1", rev, due, Some("2026-09-23T09:02:00Z"), due, None)
+            .await
+            .unwrap();
+        assert_eq!(r, Advance::Advanced);
+        let next: Option<String> =
+            sqlx::query_scalar("SELECT next_run_at FROM schedules WHERE id = 'sch_1'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(next.as_deref(), Some("2026-09-23T09:02:00Z"));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no delivery row for an uninstalled owner");
+        // positive control: installed this time → a row is written
+        let rev2 = revision_of(&store, "sch_1").await;
+        let f = NewFire {
+            fire_id: "fire_installed",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: "2026-09-23T09:02:00Z",
+            fired_at: "2026-09-23T09:02:00Z",
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:02:00Z",
+        };
+        store
+            .advance_and_record_fire(
+                "sch_1",
+                rev2,
+                "2026-09-23T09:02:00Z",
+                Some("2026-09-23T09:03:00Z"),
+                "2026-09-23T09:02:00Z",
+                Some(f),
+            )
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    // ── system-disable at 5 failed fires, cleared by the module's next upsert ─
+    //
+    // Not itself one of §11's C1.N judgements, but exercises two of this
+    // task's own functions end to end: `apply_delivery_outcome`'s
+    // `disable_at` branch and `upsert_module_schedule`'s
+    // `system_disabled_reason`-clearing branch.
+
+    #[tokio::test]
+    async fn five_failed_fires_system_disable_the_schedule_and_the_next_upsert_clears_it() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let revision_before_failures = revision_of(&store, "sch_1").await;
+        let mut disabled_at = None;
+        for slot in 0u32..5 {
+            let ts = format!("2026-09-23T09:{:02}:00Z", slot + 1);
+            let next = format!("2026-09-23T09:{:02}:00Z", slot + 2);
+            let rev = revision_of(&store, "sch_1").await;
+            let fid = format!("fire_tick_slot_{slot}");
+            let f = NewFire {
+                fire_id: &fid,
+                owner_module: "m",
+                module_key: "k",
+                scheduled_for: &ts,
+                fired_at: &ts,
+                trigger: FireTrigger::Tick,
+                expires_at: "2026-09-25T00:00:00Z",
+            };
+            assert_eq!(
+                store
+                    .advance_and_record_fire("sch_1", rev, &ts, Some(&next), &ts, Some(f))
+                    .await
+                    .unwrap(),
+                Advance::Advanced
+            );
+            let mut attempts = 0i64;
+            let mut last_status = String::new();
+            for _ in 0..3 {
+                let sent = attempts + 1;
+                let (status, next_attempt_at, count_fail) = if sent >= 3 {
+                    ("failed", None, true)
+                } else {
+                    ("pending", Some(ts.as_str()), false)
+                };
+                let write = DeliveryOutcomeWrite {
+                    status,
+                    attempts: sent,
+                    next_attempt_at,
+                    last_error: Some("500"),
+                    reset_schedule_failures: false,
+                    count_schedule_failure: count_fail,
+                };
+                let (applied, disabled) = store
+                    .apply_delivery_outcome(&fid, attempts, &write, &ts, 5)
+                    .await
+                    .unwrap();
+                assert!(applied);
+                if disabled {
+                    disabled_at = Some(slot);
+                }
+                attempts = sent;
+                last_status = status.to_owned();
+            }
+            assert_eq!(last_status, "failed");
+        }
+        assert_eq!(
+            disabled_at,
+            Some(4),
+            "the 5th failed fire (not the 15th attempt) crosses the line"
+        );
+        let (reason, next, revision_after_disable): (Option<String>, Option<String>, i64) =
+            sqlx::query_as(
+                "SELECT system_disabled_reason, next_run_at, revision FROM schedules WHERE id = 'sch_1'",
+            )
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(
+            (reason.as_deref(), next),
+            (Some("consecutive_failures"), None)
+        );
+        assert_eq!(
+            revision_after_disable,
+            revision_before_failures + 1,
+            "system-disable is a write that changes whether the row can fire — it must bump revision (§2.2)"
+        );
+        // the module's next upsert (even with the SAME desired state) clears
+        // it — outcome is `Updated`, not `Unchanged` (§6.2)
+        let (o, s) = store
+            .upsert_module_schedule(
+                "x",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T10:00:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        assert_eq!(o, UpsertOutcome::Updated);
+        assert!(s.system_disabled_reason.is_none() && s.next_run_at.is_some());
+    }
+
+    // ── apply_delivery_outcome is a CAS on `attempts`, not just on status ────
+
+    #[tokio::test]
+    async fn apply_delivery_outcome_is_cas_on_attempts() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_1").await;
+        let due = "2026-09-23T09:01:00Z";
+        let f = NewFire {
+            fire_id: "fire_x",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        store
+            .advance_and_record_fire(
+                "sch_1",
+                rev,
+                due,
+                Some("2026-09-23T09:02:00Z"),
+                due,
+                Some(f),
+            )
+            .await
+            .unwrap();
+
+        let write = DeliveryOutcomeWrite {
+            status: "pending",
+            attempts: 1,
+            next_attempt_at: Some(due),
+            last_error: Some("500"),
+            reset_schedule_failures: false,
+            count_schedule_failure: false,
+        };
+        // a stale `seen_attempts` (the row is at 0; this call claims to have
+        // read 1) must lose the CAS
+        let (applied, disabled) = store
+            .apply_delivery_outcome("fire_x", 1, &write, due, 5)
+            .await
+            .unwrap();
+        assert!(!applied && !disabled, "a stale attempts read must lose");
+        let (status, attempts): (String, i64) = sqlx::query_as(
+            "SELECT status, attempts FROM schedule_deliveries WHERE fire_id = 'fire_x'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(
+            (status.as_str(), attempts),
+            ("pending", 0),
+            "the stale write must not have landed"
+        );
+
+        // positive control: the correct seen_attempts (0) succeeds
+        let (applied2, _) = store
+            .apply_delivery_outcome("fire_x", 0, &write, due, 5)
+            .await
+            .unwrap();
+        assert!(applied2);
+        let (status2, attempts2): (String, i64) = sqlx::query_as(
+            "SELECT status, attempts FROM schedule_deliveries WHERE fire_id = 'fire_x'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!((status2.as_str(), attempts2), ("pending", 1));
+    }
+
+    // ── C1.12 — an expired `At` is visible via `last_fire`, run_now doesn't hide it ─
+
+    #[tokio::test]
+    async fn at_expiry_is_visible_in_last_fire_and_a_later_run_now_does_not_hide_it() {
+        let (store, _dir) = fresh(1).await;
+        let at = ModuleScheduleDesired {
+            spec: ScheduleSpec::At {
+                ts: "2026-09-23T09:00:00Z".into(),
+            },
+            enabled: true,
+            label: "a".into(),
+        };
+        let t = "2026-09-23T09:00:00Z";
+        store
+            .upsert_module_schedule("sch_at", "m", "a", &at, Some(t), t, 256)
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_at").await;
+        let f = NewFire {
+            fire_id: "fire_at_1",
+            owner_module: "m",
+            module_key: "a",
+            scheduled_for: t,
+            fired_at: t,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:00:00Z",
+        };
+        store
+            .advance_and_record_fire("sch_at", rev, t, None, t, Some(f))
+            .await
+            .unwrap();
+        let s0 = store.list_module_schedules("m").await.unwrap().remove(0);
+        assert_eq!(s0.last_fire.tick.as_ref().unwrap().status, "pending");
+
+        store
+            .expire_deliveries("2026-09-24T09:00:00Z")
+            .await
+            .unwrap();
+        let s1 = store.list_module_schedules("m").await.unwrap().remove(0);
+        let lf = s1.last_fire.tick.clone().unwrap();
+        assert_eq!(
+            (
+                lf.fire_id.as_str(),
+                lf.status.as_str(),
+                lf.last_error.as_deref()
+            ),
+            ("fire_at_1", "expired", Some("ttl"))
+        );
+        assert!(s1.next_run_at.is_none() && s1.last_fire.run_now.is_none());
+
+        // v3, M-A: a run_now afterwards does not hide the expired tick fire
+        let now = "2026-09-24T10:00:00Z";
+        assert!(
+            store
+                .record_run_now_fire("sch_at", "fire_run_now_at", now, "2026-09-25T10:00:00Z")
+                .await
+                .unwrap()
+        );
+        let s2 = store.list_module_schedules("m").await.unwrap().remove(0);
+        assert_eq!(s2.last_fire.tick.unwrap().status, "expired");
+        assert_eq!(s2.last_fire.run_now.unwrap().status, "pending");
+    }
+
+    // ── last_fire's tie-break: (created_at DESC, rowid DESC) ────────────────
+
+    #[tokio::test]
+    async fn last_fire_tie_break_prefers_the_higher_rowid_on_equal_created_at() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        // two terminal tick rows inserted with the IDENTICAL created_at (same
+        // second) — MODULE_STATE_SELECT's decider must fall through to rowid.
+        for fid in ["fire_a", "fire_b"] {
+            sqlx::query(
+                "INSERT INTO schedule_deliveries (fire_id, schedule_id, owner_module, module_key, \
+                     scheduled_for, fired_at, fire_trigger, status, attempts, next_attempt_at, \
+                     expires_at, last_error, created_at, updated_at) \
+                 VALUES (?, 'sch_1', 'm', 'k', '2026-09-23T09:00:00Z', '2026-09-23T09:00:00Z', \
+                     'tick', 'delivered', 1, NULL, '2026-09-25T00:00:00Z', NULL, \
+                     '2026-09-23T09:00:00Z', '2026-09-23T09:00:00Z')",
+            )
+            .bind(fid)
+            .execute(pool(&store))
+            .await
+            .unwrap();
+        }
+        // fire_b was inserted SECOND, so it has the higher rowid despite the
+        // tie on created_at.
+        let s = store.list_module_schedules("m").await.unwrap().remove(0);
+        assert_eq!(s.last_fire.tick.unwrap().fire_id, "fire_b");
+    }
+
+    // ── C1.11 — terminal rows are pruned per (schedule, source) ─────────────
+
+    #[tokio::test]
+    async fn terminal_deliveries_are_pruned_per_schedule_and_source() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_2",
+                "m",
+                "b",
+                &every(60),
+                Some("2026-09-23T09:00:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let mut prev: Option<String> = None;
+        for i in 0u32..8 {
+            let ts = format!("2026-09-23T09:{i:02}:00Z");
+            let next = format!("2026-09-23T09:{:02}:00Z", i + 10);
+            let rev = revision_of(&store, "sch_2").await;
+            let due: Option<String> =
+                sqlx::query_scalar("SELECT next_run_at FROM schedules WHERE id = 'sch_2'")
+                    .fetch_one(pool(&store))
+                    .await
+                    .unwrap();
+            let due = due.unwrap();
+            if let Some(p) = &prev {
+                sqlx::query("UPDATE schedule_deliveries SET attempts = 1 WHERE fire_id = ?")
+                    .bind(p)
+                    .execute(pool(&store))
+                    .await
+                    .unwrap();
+            }
+            let fid = format!("fire_tick_prune_{i}");
+            let f = NewFire {
+                fire_id: &fid,
+                owner_module: "m",
+                module_key: "b",
+                scheduled_for: &ts,
+                fired_at: &ts,
+                trigger: FireTrigger::Tick,
+                expires_at: "2026-09-25T00:00:00Z",
+            };
+            store
+                .advance_and_record_fire("sch_2", rev, &due, Some(&next), &ts, Some(f))
+                .await
+                .unwrap();
+            prev = Some(fid);
+        }
+        let (term, open): (i64, i64) = sqlx::query_as(
+            "SELECT SUM(status IN ('delivered', 'failed', 'expired')), SUM(status IN ('pending', 'deferred')) \
+             FROM schedule_deliveries WHERE schedule_id = 'sch_2'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!((term, open), (KEEP_TERMINAL_PER_SOURCE, 1));
+
+        // v3, L-B: many delivered run_nows do not prune the tick source's rows
+        let tick_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries WHERE schedule_id = 'sch_2' AND fire_trigger = 'tick'")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        for i in 0u32..6 {
+            let now = format!("2026-09-24T12:00:{i:02}Z");
+            let fid = format!("fire_run_now_prune_{i}");
+            store
+                .record_run_now_fire("sch_2", &fid, &now, "2026-09-26T00:00:00Z")
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE schedule_deliveries SET status = 'delivered', next_attempt_at = NULL, attempts = 1, \
+                 updated_at = '2026-09-30T00:00:00Z' WHERE fire_id = ?",
+            )
+            .bind(&fid)
+            .execute(pool(&store))
+            .await
+            .unwrap();
+        }
+        let tick_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_deliveries WHERE schedule_id = 'sch_2' AND fire_trigger = 'tick'")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(
+            tick_before, tick_after,
+            "run_now deliveries must not prune the tick source's rows"
+        );
+        let st = store
+            .list_module_schedules("m")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.key == "b")
+            .unwrap();
+        assert!(st.last_fire.tick.is_some() && st.last_fire.run_now.is_some());
+    }
+
+    // ── C1.10 — the pump's due query is fair and skips cached owners ────────
+
+    #[tokio::test]
+    async fn due_query_is_fair_skips_cached_owners_and_spec_change_retires_fires() {
+        let (store, _dir) = fresh(1).await;
+        let t = "2026-09-23T09:00:00Z";
+        for (owner, n) in [("a", 10), ("b", 2)] {
+            for i in 0..n {
+                let key = format!("k{i}");
+                let id = format!("sch_{owner}{i}");
+                store
+                    .upsert_module_schedule(
+                        &id,
+                        owner,
+                        &key,
+                        &every(60),
+                        Some(t),
+                        "2026-09-23T09:00:00Z",
+                        256,
+                    )
+                    .await
+                    .unwrap();
+                let rev = revision_of(&store, &id).await;
+                let fid = format!("fire_due_{id}");
+                let f = NewFire {
+                    fire_id: &fid,
+                    owner_module: owner,
+                    module_key: &key,
+                    scheduled_for: t,
+                    fired_at: t,
+                    trigger: FireTrigger::Tick,
+                    expires_at: "2026-09-24T09:00:00Z",
+                };
+                store
+                    .advance_and_record_fire(&id, rev, t, Some("2026-09-23T09:01:00Z"), t, Some(f))
+                    .await
+                    .unwrap();
+            }
+        }
+        let owners = |rows: &[DueDelivery]| {
+            rows.iter()
+                .map(|r| r.owner_module.clone())
+                .collect::<Vec<_>>()
+        };
+        let rows = store.due_deliveries(t, "[]", 4, 64).await.unwrap();
+        let o = owners(&rows);
+        assert_eq!(
+            o.iter().filter(|x| x.as_str() == "a").count(),
+            4,
+            "a is capped at 4 per pass"
+        );
+        assert_eq!(
+            o.iter().filter(|x| x.as_str() == "b").count(),
+            2,
+            "b is not starved by a's backlog"
+        );
+        let rows = store.due_deliveries(t, r#"["a"]"#, 4, 64).await.unwrap();
+        assert!(
+            owners(&rows).iter().all(|x| x == "b"),
+            "a is in the skip cache"
+        );
+
+        // a spec change retires b/k0's outstanding fire (T9); b/k1's stays
+        store
+            .upsert_module_schedule(
+                "x",
+                "b",
+                "k0",
+                &every(120),
+                Some("2026-09-23T09:02:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let st: Vec<(String, String)> =
+            sqlx::query_as("SELECT module_key, status FROM schedule_deliveries WHERE owner_module = 'b' ORDER BY module_key")
+                .fetch_all(pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(
+            st,
+            vec![
+                ("k0".into(), "expired".into()),
+                ("k1".into(), "pending".into())
+            ]
+        );
+    }
+
+    // ── review gap #5 — the due query's OWN expires_at > now filter ─────────
+
+    #[tokio::test]
+    async fn due_deliveries_excludes_rows_whose_expires_at_has_passed() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_1").await;
+        let due = "2026-09-23T09:01:00Z";
+        // a fire whose `expires_at` is already in the PAST relative to the
+        // due query's `now`, but whose status is still 'pending' (the 60s
+        // sweep has not run yet) — due_deliveries must filter it out itself.
+        let f = NewFire {
+            fire_id: "fire_already_expired",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-23T09:00:30Z",
+        };
+        store
+            .advance_and_record_fire(
+                "sch_1",
+                rev,
+                due,
+                Some("2026-09-23T09:02:00Z"),
+                due,
+                Some(f),
+            )
+            .await
+            .unwrap();
+        let rows = store.due_deliveries(due, "[]", 4, 64).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "a row whose expires_at <= now must not be picked up, even before the sweep runs"
+        );
+    }
+
+    // ── review gap #4 — upsert turning `enabled` off is T9 too ──────────────
+
+    #[tokio::test]
+    async fn upsert_disabling_enabled_expires_outstanding_fires() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        let rev = revision_of(&store, "sch_1").await;
+        let due = "2026-09-23T09:01:00Z";
+        let f = NewFire {
+            fire_id: "fire_x",
+            owner_module: "m",
+            module_key: "k",
+            scheduled_for: due,
+            fired_at: due,
+            trigger: FireTrigger::Tick,
+            expires_at: "2026-09-24T09:01:00Z",
+        };
+        store
+            .advance_and_record_fire(
+                "sch_1",
+                rev,
+                due,
+                Some("2026-09-23T09:02:00Z"),
+                due,
+                Some(f),
+            )
+            .await
+            .unwrap();
+
+        let mut disabled = every(60);
+        disabled.enabled = false;
+        store
+            .upsert_module_schedule("x", "m", "k", &disabled, None, "2026-09-23T09:03:00Z", 256)
+            .await
+            .unwrap();
+        let (status, last_error): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, last_error FROM schedule_deliveries WHERE fire_id = 'fire_x'",
+        )
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(
+            (status.as_str(), last_error.as_deref()),
+            ("expired", Some("superseded_by_upsert"))
+        );
+    }
+
+    // ── review gap #7 — a recompute clears a partial (not-yet-disabling)
+    // failure streak too ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upsert_recompute_clears_consecutive_failures() {
+        let (store, _dir) = fresh(1).await;
+        store
+            .upsert_module_schedule(
+                "sch_1",
+                "m",
+                "k",
+                &every(60),
+                Some("2026-09-23T09:01:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schedules SET consecutive_failures = 3 WHERE id = 'sch_1'")
+            .execute(pool(&store))
+            .await
+            .unwrap();
+        // a spec change forces `recompute = true`
+        let (outcome, _) = store
+            .upsert_module_schedule(
+                "x",
+                "m",
+                "k",
+                &every(120),
+                Some("2026-09-23T09:05:00Z"),
+                "2026-09-23T09:00:00Z",
+                256,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpsertOutcome::Updated);
+        let failures: i64 =
+            sqlx::query_scalar("SELECT consecutive_failures FROM schedules WHERE id = 'sch_1'")
+                .fetch_one(pool(&store))
+                .await
+                .unwrap();
+        assert_eq!(
+            failures, 0,
+            "a recompute must clear a partial failure streak, not just a full system-disable"
         );
     }
 }
