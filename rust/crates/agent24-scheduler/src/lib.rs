@@ -13,7 +13,18 @@
 //!
 //! `tick(now)` is a single pass driven by an injected instant, so the whole
 //! engine is testable with a mock clock and NO real sleeps.
+//!
+//! ME4-1.2.2b1 (this cut) adds the design's §3 trigger-interface TYPES only
+//! (`fire`/`installed_owners`/`invocation` below) — nothing in `Scheduler`
+//! consumes them yet, and the crate's OLD `RunTrigger` trait (just below)
+//! is still what `tick`/`fire`/`run_now` use. ME4-1.2.2b2 swaps `Scheduler`
+//! onto `invocation::RunTrigger` (dropping the old trait here) for the
+//! AgentRun path; ME4-1.2.2b3 wires `installed_owners`/`fire_module` in for
+//! module rows. See `docs/design/ME4-S1-scheduler-callback.md` §3/§13.
 
+pub mod fire;
+pub mod installed_owners;
+pub mod invocation;
 pub mod next_fire;
 
 use std::sync::Arc;
