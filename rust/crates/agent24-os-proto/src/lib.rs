@@ -23,6 +23,7 @@ pub mod endpoint;
 pub mod failure;
 pub mod frame;
 pub mod initialize;
+pub mod kernel_call;
 pub mod launch;
 pub mod proxy;
 pub mod rpc;
