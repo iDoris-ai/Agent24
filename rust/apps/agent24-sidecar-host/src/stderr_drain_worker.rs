@@ -54,17 +54,33 @@ impl StderrDrainWorker {
     /// a `File`; it does not clone a raw handle or create a competing reader.
     #[cfg(unix)]
     pub(crate) fn from_native_stderr(stderr: NativeStderr) -> Result<Self, WorkerSlotError> {
-        Self::new_in(WorkerSlots::host(), stderr)
+        Self::from_native_stderr_in(WorkerSlots::host(), stderr)
     }
 
     #[cfg(windows)]
     pub(crate) fn from_native_stderr(stderr: NativeStderr) -> Result<Self, WorkerSlotError> {
+        Self::from_native_stderr_in(WorkerSlots::host(), stderr)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn from_native_stderr_in(
+        slots: &'static WorkerSlots,
+        stderr: NativeStderr,
+    ) -> Result<Self, WorkerSlotError> {
+        Self::new_in(slots, stderr)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_native_stderr_in(
+        slots: &'static WorkerSlots,
+        stderr: NativeStderr,
+    ) -> Result<Self, WorkerSlotError> {
         let file = std::fs::File::from(
             stderr
                 .into_owned_handle()
                 .map_err(|error| WorkerSlotError::Spawn(error.kind()))?,
         );
-        Self::new_in(WorkerSlots::host(), file)
+        Self::new_in(slots, file)
     }
 
     /// Start the one drain thread immediately.

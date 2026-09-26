@@ -107,7 +107,7 @@ impl<'host> NativeGeneration<'host> {
             }
         };
 
-        let ready = match ReadyReadWorker::new_in(slots, stdout) {
+        let ready = match ReadyReadWorker::from_native_stdout_in(slots, stdout) {
             Ok(ready) => ready,
             Err(error) => {
                 return Err(build_error(
@@ -116,7 +116,7 @@ impl<'host> NativeGeneration<'host> {
                 ));
             }
         };
-        let stderr = match StderrDrainWorker::new_in(slots, stderr) {
+        let stderr = match StderrDrainWorker::from_native_stderr_in(slots, stderr) {
             Ok(stderr) => stderr,
             Err(error) => {
                 return Err(build_error(
