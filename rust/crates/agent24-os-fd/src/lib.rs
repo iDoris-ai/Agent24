@@ -29,6 +29,14 @@ pub enum InheritError {
     NotUnix,
     NotStream,
     NotListening,
+    /// The fd carries `FD_CLOEXEC`, which means this process opened it
+    /// itself (std, tokio, and rustix's plain `socket()`/`socket_with`
+    /// default all set it); only a fd the kernel `dup2`'d into fd 3 across
+    /// `exec` (never CLOEXEC, see `launch.rs`) may be adopted. Rejecting
+    /// this closes the gap where a child that inherits `A24_LISTEN_FD=3`
+    /// but never actually got fd 3 from the kernel has itself opened some
+    /// other socket that happens to land on fd 3.
+    NotInherited,
     Io(std::io::Error),
 }
 
@@ -36,8 +44,11 @@ pub enum InheritError {
 ///
 /// Reads `A24_LISTEN_FD` itself, requires it to be `3`, checks the fd is an
 /// `AF_UNIX` `SOCK_STREAM` socket that is listening (Linux: `SO_ACCEPTCONN`;
-/// macOS: the weaker "no peer" check, see `is_listening`), then sets `FD_CLOEXEC`
-/// (children must not inherit it) and `O_NONBLOCK` (tokio needs it).
+/// macOS: the weaker "no peer" check, see `is_listening`) and does NOT
+/// already carry `FD_CLOEXEC` — proof it crossed `exec` from the kernel
+/// launcher rather than being something this process opened itself onto the
+/// same fd number (see `NotInherited`) — then sets `FD_CLOEXEC` (children
+/// must not inherit it) and `O_NONBLOCK` (tokio needs it).
 /// A failed check leaves the fd open and un-owned (never closed: it might be
 /// someone else's), and still consumes the one attempt.
 ///
@@ -64,13 +75,19 @@ pub fn take_inherited_listener() -> Result<UnixListener, InheritError> {
 /// first and only then claims ownership, so a wrong fd is never closed.
 #[allow(unsafe_code)]
 fn adopt(fd: RawFd) -> Result<OwnedFd, InheritError> {
-    // SAFETY: `fd` is 3 (checked by the caller), inherited from the kernel
-    // across exec; nothing in this process opened or owns it, and the
-    // `TAKEN` swap guarantees this function runs at most once, so no second
-    // owner can exist. The borrow does not outlive this call.
+    // SAFETY: `fd` is 3 (checked by the caller). This borrow does not by
+    // itself prove fd 3 is the kernel's inherited fd and not something this
+    // process already had open at that number — `validate` below is what
+    // proves that (via the `FD_CLOEXEC` check: everything this process opens
+    // itself carries it, the kernel's cross-exec fd never does). The `TAKEN`
+    // swap guarantees this function runs at most once, so no second owner
+    // can exist, and the borrow does not outlive this call.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     validate(borrowed)?;
-    // SAFETY: as above; validation proved it is the listening socket.
+    // SAFETY: as above — `validate` proved it is the listening socket AND
+    // that it lacks `FD_CLOEXEC`, i.e. it was not opened by this process and
+    // can only be the fd the kernel handed us across `exec`. No other owner
+    // exists.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -89,6 +106,21 @@ fn validate(fd: BorrowedFd<'_>) -> Result<(), InheritError> {
     }
     if !is_listening(fd)? {
         return Err(InheritError::NotListening);
+    }
+    // A fd this process opened itself — std, tokio, rustix's `socket_with`
+    // with `SocketFlags::CLOEXEC` — always carries `FD_CLOEXEC` (Rust has set
+    // it on every fd it creates for a long time; rustix's plain `socket()`
+    // is the one exception used by this crate's own fixtures, see the
+    // tests). The kernel launcher hands fd 3 to the child via `dup2`
+    // (`launch.rs`), which never sets `FD_CLOEXEC`. So its absence is the
+    // actual evidence this fd crossed `exec` from the kernel, rather than
+    // being some other socket this process already had open at fd 3 while a
+    // misconfigured child also believes `A24_LISTEN_FD=3` was inherited.
+    if rustix::io::fcntl_getfd(fd)
+        .map_err(|e| InheritError::Io(e.into()))?
+        .contains(rustix::io::FdFlags::CLOEXEC)
+    {
+        return Err(InheritError::NotInherited);
     }
     Ok(())
 }
@@ -133,13 +165,37 @@ mod tests {
         validate(fd.as_fd())
     }
 
+    /// Std sets `FD_CLOEXEC` on every fd it creates; strip it back off so a
+    /// std-created fixture can stand in for a fd the kernel handed across
+    /// `exec` (which never carries it).
+    fn clear_cloexec(fd: &OwnedFd) {
+        rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty()).unwrap();
+    }
+
     #[test]
     fn a_listening_unix_socket_passes() {
         let dir = std::env::temp_dir().join(format!("a24fd-{}", std::process::id()));
         let _ = std::fs::remove_file(&dir);
         let l = UnixListener::bind(&dir).unwrap();
         let fd: OwnedFd = l.into();
+        // std sets FD_CLOEXEC by default; clear it so this fixture reads as
+        // an inherited-across-exec fd, which is what `validate` now requires.
+        clear_cloexec(&fd);
         assert!(check_owned(fd).is_ok());
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// A plain std `UnixListener` keeps `FD_CLOEXEC` set — i.e. it was opened
+    /// by this process, not handed across `exec` by the kernel — so it must
+    /// be rejected even though it is otherwise a perfectly good listening
+    /// AF_UNIX/SOCK_STREAM socket.
+    #[test]
+    fn a_cloexec_listener_is_rejected_as_not_inherited() {
+        let dir = std::env::temp_dir().join(format!("a24fd-ni-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let l = UnixListener::bind(&dir).unwrap();
+        let fd: OwnedFd = l.into();
+        assert!(matches!(check_owned(fd), Err(InheritError::NotInherited)));
         let _ = std::fs::remove_file(&dir);
     }
 
