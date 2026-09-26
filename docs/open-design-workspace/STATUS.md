@@ -223,7 +223,7 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 
 - capability #241 已用普通 merge/后续提交修复到 `fb38a5c`：恢复 restack 时丢失的 axum `Extension`/`Path` 导入，并把 #241 新增的 `capabilities` kernel namespace 同步纳入 reserved segments，使该 PR 自身不再依赖 #242 才能通过既有一致性测试。`agent24d` 全包、strict clippy、fmt/diff check 与 fresh exact review 均 `PASS`；GitHub 当前 `CLEAN`、CLA green，但现有 external approval 仍指向旧 head `802b977`，必须 fresh rereview。
 - #242 以普通 no-ff merge 顺序传播新 #241，当前 head `4a55f4c`；相对 #241 仅保留 155 行 isolation tests。`agent24d` 318 unit + 8 integration、strict clippy/fmt/diff check 全绿；GitHub 当前 `CLEAN`、CLA green，approval 指向当前 head。全程无 rebase/force。
-- G8 在 #499 后新增 #517（`447aea8`，102 行），只增加 host-lifetime port borrowing seam：`GenerationDriver` 可借用 `ControlWorker`/`OutputWorker`，driver drop 后两者仍可继续服务 host；sidecar 146 tests 与 strict clippy 本地全绿。native generation assembly、host stdio bootstrap、event loop 与 `run()` wiring 仍未接入；#517 三平台 CI / external review 继续作为门禁。
+- G8 在 #499 后新增 #517（`447aea8`，102 行），只增加 host-lifetime port borrowing seam：`GenerationDriver` 可借用 `ControlWorker`/`OutputWorker`，driver drop 后两者仍可继续服务 host；sidecar 146 tests、strict clippy 与 exact review 均 `PASS`。首轮 Windows CI 仅两个未改动 native timing tests 超时，failed-job rerun 后 Ubuntu/macOS/Windows 全绿；native generation assembly、host stdio bootstrap、event loop 与 `run()` wiring 仍未接入，external review pending。
 - root #228/#259 与其余 dependency stack 门禁未改变；本波没有新的 main merge，P2/P9 继续 `IN PROGRESS`。
 
 ## A24-OD-00 小 PR 栈
