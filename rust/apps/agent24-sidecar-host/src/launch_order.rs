@@ -52,6 +52,16 @@ impl FrameSink for crate::output_worker::OutputWorker {
     }
 }
 
+impl FrameSink for &mut crate::output_worker::OutputWorker {
+    fn put(&mut self, frame: Vec<u8>, now: Instant) -> Result<(), PutFrameError> {
+        crate::output_worker::OutputWorker::put(self, frame, now)
+    }
+
+    fn step(&mut self, now: Instant) -> Result<WriteStep, OutputWriteError> {
+        crate::output_worker::OutputWorker::step(self, now)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LaunchOrderStage {
     Contained,
