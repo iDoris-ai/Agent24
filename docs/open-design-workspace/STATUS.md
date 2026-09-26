@@ -219,6 +219,13 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 尾部 #495（`628dbe6`，373 行）与 #497（`468c9bc`，231 行）改用 test-only raw seed 建立已授权 reserved 边界，没有公开 reservation API；两次 exact-head Astra 审查及 retention/registration 公共、对抗、回滚测试全部 `PASS`，已推送并重新请求评审。
 - G8 #498（`b5124d4`，498 行）三平台 CI 全绿；#499（`4baef45`，299+1 test-only）修复两个审查发现的覆盖空洞后 exact review `PASS`，三平台 CI 全绿、external review pending；root #228/#259 仍为 `REVIEW_REQUIRED`，上述 workspace/G8 PR 仍 dependency-stacked。本波没有新的 main merge，P2/P9 继续 `IN PROGRESS`。
 
+## 2026-09-26 Wave 18 当前门禁
+
+- capability #241 已用普通 merge/后续提交修复到 `fb38a5c`：恢复 restack 时丢失的 axum `Extension`/`Path` 导入，并把 #241 新增的 `capabilities` kernel namespace 同步纳入 reserved segments，使该 PR 自身不再依赖 #242 才能通过既有一致性测试。`agent24d` 全包、strict clippy、fmt/diff check 与 fresh exact review 均 `PASS`；GitHub 当前 `CLEAN`、CLA green，但现有 external approval 仍指向旧 head `802b977`，必须 fresh rereview。
+- #242 以普通 no-ff merge 顺序传播新 #241，当前 head `4a55f4c`；相对 #241 仅保留 155 行 isolation tests。`agent24d` 318 unit + 8 integration、strict clippy/fmt/diff check 全绿；GitHub 当前 `CLEAN`、CLA green，approval 指向当前 head。全程无 rebase/force。
+- G8 在 #499 后新增 #517（`447aea8`，102 行），只增加 host-lifetime port borrowing seam：`GenerationDriver` 可借用 `ControlWorker`/`OutputWorker`，driver drop 后两者仍可继续服务 host；sidecar 146 tests 与 strict clippy 本地全绿。native generation assembly、host stdio bootstrap、event loop 与 `run()` wiring 仍未接入；#517 三平台 CI / external review 继续作为门禁。
+- root #228/#259 与其余 dependency stack 门禁未改变；本波没有新的 main merge，P2/P9 继续 `IN PROGRESS`。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
