@@ -32,7 +32,7 @@ pub(crate) enum NativeGenerationBuildErrorKind {
 /// launch only to force/observe/reap the same target, never to retry assembly.
 pub(crate) struct NativeGenerationBuildError {
     kind: NativeGenerationBuildErrorKind,
-    launch: OwnedLaunch,
+    launch: Box<OwnedLaunch>,
 }
 
 impl NativeGenerationBuildError {
@@ -41,7 +41,7 @@ impl NativeGenerationBuildError {
     }
 
     pub(crate) fn into_cleanup_launch(self) -> OwnedLaunch {
-        self.launch
+        *self.launch
     }
 }
 
@@ -154,7 +154,10 @@ fn build_error(
     kind: NativeGenerationBuildErrorKind,
     launch: OwnedLaunch,
 ) -> NativeGenerationBuildError {
-    NativeGenerationBuildError { kind, launch }
+    NativeGenerationBuildError {
+        kind,
+        launch: Box::new(launch),
+    }
 }
 
 #[cfg(all(test, unix))]
