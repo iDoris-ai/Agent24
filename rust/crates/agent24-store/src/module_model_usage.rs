@@ -17,6 +17,13 @@
 //! J11's store-level judgements: 50 concurrent writers summing exactly,
 //! per-column saturation at `i64::MAX` (no wraparound), and the CHECK
 //! constraints above rejecting illegal rows.
+//!
+//! **`day` is always caller-supplied** (this crate never reads a clock): it
+//! must be today's UTC calendar day as `'YYYY-MM-DD'`. Producing it from the
+//! right clock (UTC, not local time — two recorders in different timezones
+//! must still land in the same bucket) is 4.2.3b's job, in the recorder that
+//! calls [`Store::record_module_model_usage`]; this store only enforces the
+//! *shape* (`CHECK (length(day) = 10)`), never the value.
 
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -127,11 +134,35 @@ fn clamp_i64(x: u64) -> i64 {
     i64::try_from(x).unwrap_or(i64::MAX)
 }
 
+/// The same `i64::MAX` ceiling the write side clamps to ([`I64_MAX_SQL`]),
+/// applied again when folding several already-clamped rows together in Rust
+/// (`module_model_usage_totals`, review M1): plain [`u64::saturating_add`]
+/// only saturates at `u64::MAX`, which is roughly double `i64::MAX` — two
+/// per-day rows each individually capped at `i64::MAX` would otherwise sum
+/// to `2 * i64::MAX` (still a valid `u64`, no panic, but not the same
+/// ceiling every stored row itself is held to). Capping the *sum* to the
+/// same ceiling keeps "totals across days" indistinguishable, from the
+/// caller's point of view, from "one more day that happened to be huge".
+fn saturating_add_capped(a: u64, b: u64) -> u64 {
+    let cap = u64::try_from(i64::MAX).unwrap_or(u64::MAX);
+    a.saturating_add(b).min(cap)
+}
+
 /// A stored counter column, read back as `u64`. The table's own CHECK
-/// constraints guarantee every stored value is `>= 0`, so this only needs a
-/// defensive fallback (never `>= 0` violating rows exist to trigger it).
+/// constraints guarantee every stored value is `>= 0`, so a negative value
+/// here should be unreachable through this crate's own writes; if one ever
+/// shows up (e.g. a row written by something outside this module, or a
+/// corrupted file), warn loudly and fall back to 0 rather than panicking a
+/// read.
 fn nonneg_u64(x: i64) -> u64 {
-    u64::try_from(x).unwrap_or(0)
+    u64::try_from(x).unwrap_or_else(|_| {
+        tracing::warn!(
+            value = x,
+            "module_model_usage: read a negative counter — the table's CHECK constraints \
+             should make this impossible; the data may be corrupted"
+        );
+        0
+    })
 }
 
 fn row_with_day(r: &SqliteRow, day: String) -> ModelUsageRow {
@@ -153,10 +184,21 @@ impl Store {
     /// so two concurrent recorders for the same key serialise on SQLite's
     /// own writer lock rather than racing a separate read-modify-write.
     ///
+    /// An all-zero `delta` (review, L2) is a no-op that writes nothing — not
+    /// even to create an empty row on first use. There is no `UsageOutcome`
+    /// that legitimately produces a zero delta (every variant counts at
+    /// least one call), so this only guards a caller bug or a future variant
+    /// that forgets to set anything; without it, such a bug would silently
+    /// litter `module_model_usage` with all-zero rows for modules that were
+    /// never actually served.
+    ///
     /// # Errors
     /// Storage — including a CHECK violation if `served_by = ServedBy::None`
     /// is combined with a non-zero `calls_ok`/token delta (§6.2: a call that
-    /// never reached a provider cannot have been served or billed).
+    /// never reached a provider cannot have been served or billed). This
+    /// applies equally whether the row is being created or already exists
+    /// (SQLite re-checks every `CHECK` constraint on the `ON CONFLICT DO
+    /// UPDATE` path too, not just on `INSERT`).
     pub async fn record_module_model_usage(
         &self,
         module: &str,
@@ -164,6 +206,9 @@ impl Store {
         served_by: ServedBy,
         delta: ModelUsageDelta,
     ) -> Result<()> {
+        if delta == ModelUsageDelta::default() {
+            return Ok(());
+        }
         sqlx::query(&record_usage_sql())
             .bind(module)
             .bind(day)
@@ -213,26 +258,56 @@ impl Store {
     /// every returned row is `String::new()` (see [`ModelUsageRow`]'s doc
     /// comment) — this query has no single day to report.
     ///
+    /// Review, M1: this does NOT sum with SQL's `SUM()` — a per-day column
+    /// can independently be saturated to `i64::MAX` (this module's own
+    /// saturating upsert allows it), and SQLite's `SUM()` does not saturate:
+    /// it raises a hard `"integer overflow"` error the moment two summands
+    /// would exceed `i64::MAX`, which two maxed-out days trivially would.
+    /// Instead, every row for `module` is read back individually (already
+    /// each `>= 0` and `<= i64::MAX` by the table's own CHECKs) and folded in
+    /// Rust with [`saturating_add_capped`] — a saturating add capped at the
+    /// same `i64::MAX` ceiling the write side clamps to, matching that clamp
+    /// exactly rather than trading it for a read-side panic.
+    ///
     /// # Errors
     /// Storage.
     pub async fn module_model_usage_totals(&self, module: &str) -> Result<Vec<ModelUsageRow>> {
         let rows = sqlx::query(
-            "SELECT served_by, \
-                    SUM(calls_ok) AS calls_ok, SUM(calls_failed) AS calls_failed, \
-                    SUM(calls_cancelled) AS calls_cancelled, \
-                    SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens \
+            "SELECT served_by, calls_ok, calls_failed, calls_cancelled, \
+                    prompt_tokens, completion_tokens \
              FROM module_model_usage \
-             WHERE module = ? \
-             GROUP BY served_by \
-             ORDER BY served_by ASC",
+             WHERE module = ?",
         )
         .bind(module)
         .fetch_all(self.pool())
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| row_with_day(r, String::new()))
-            .collect())
+
+        let mut totals: std::collections::BTreeMap<String, ModelUsageRow> =
+            std::collections::BTreeMap::new();
+        for r in &rows {
+            let served_by: String = r.get("served_by");
+            let day = row_with_day(r, String::new());
+            let acc = totals
+                .entry(served_by.clone())
+                .or_insert_with(|| ModelUsageRow {
+                    day: String::new(),
+                    served_by,
+                    calls_ok: 0,
+                    calls_failed: 0,
+                    calls_cancelled: 0,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                });
+            acc.calls_ok = saturating_add_capped(acc.calls_ok, day.calls_ok);
+            acc.calls_failed = saturating_add_capped(acc.calls_failed, day.calls_failed);
+            acc.calls_cancelled = saturating_add_capped(acc.calls_cancelled, day.calls_cancelled);
+            acc.prompt_tokens = saturating_add_capped(acc.prompt_tokens, day.prompt_tokens);
+            acc.completion_tokens =
+                saturating_add_capped(acc.completion_tokens, day.completion_tokens);
+        }
+        // BTreeMap keys iterate in ascending order, matching the old query's
+        // `ORDER BY served_by ASC`.
+        Ok(totals.into_values().collect())
     }
 }
 
@@ -333,10 +408,11 @@ mod tests {
         );
     }
 
-    // ── J11 (store part) — token 饱和到 i64::MAX，不回绕 ────────────────────
+    // ── J11 (store part) — token 饱和到 i64::MAX，不回绕（v2, L3: 覆盖
+    // calls_ok 之外的 prompt_tokens / completion_tokens 两列） ──────────────
 
     #[tokio::test]
-    async fn calls_ok_saturates_at_i64_max_instead_of_wrapping() {
+    async fn calls_ok_and_token_counters_saturate_at_i64_max_instead_of_wrapping() {
         let (store, _dir) = fresh_wal(1).await;
         let day = "2026-09-26";
 
@@ -355,9 +431,10 @@ mod tests {
         let remote = normal.iter().find(|r| r.served_by == "remote").unwrap();
         assert_eq!(remote.calls_ok, 2, "two ordinary +1s must add up to 2");
 
-        // saturating path: one write already at i64::MAX, then one more on
-        // top — must clamp at the ceiling, never overflow into a negative
-        // (wrapped) value.
+        // saturating path: one write already at i64::MAX on calls_ok AND
+        // both token columns, then one more increment on each — every
+        // counter must clamp independently at the ceiling, never overflow
+        // into a negative (wrapped) value.
         let max = u64::try_from(i64::MAX).unwrap();
         store
             .record_module_model_usage(
@@ -366,20 +443,190 @@ mod tests {
                 ServedBy::Local,
                 ModelUsageDelta {
                     calls_ok: max,
+                    prompt_tokens: max,
+                    completion_tokens: max,
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
         store
-            .record_module_model_usage("m", day, ServedBy::Local, one_ok())
+            .record_module_model_usage(
+                "m",
+                day,
+                ServedBy::Local,
+                ModelUsageDelta {
+                    calls_ok: 5,
+                    prompt_tokens: 5,
+                    completion_tokens: 5,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let rows = store.module_model_usage("m", day).await.unwrap();
         let local = rows.iter().find(|r| r.served_by == "local").unwrap();
         assert_eq!(
             local.calls_ok, max,
-            "adding past i64::MAX must saturate at the ceiling, not wrap around"
+            "adding past i64::MAX must saturate calls_ok at the ceiling, not wrap around"
+        );
+        assert_eq!(
+            local.prompt_tokens, max,
+            "adding past i64::MAX must saturate prompt_tokens at the ceiling, not wrap around"
+        );
+        assert_eq!(
+            local.completion_tokens, max,
+            "adding past i64::MAX must saturate completion_tokens at the ceiling, not wrap around"
+        );
+    }
+
+    // ── M1 (review) — totals 汇总不走 SQL SUM，跨天饱和不报错 ────────────────
+
+    #[tokio::test]
+    async fn totals_saturate_across_days_without_a_sql_sum_overflow() {
+        let (store, _dir) = fresh_wal(1).await;
+        let max = u64::try_from(i64::MAX).unwrap();
+        // Two DIFFERENT days, each independently saturated to i64::MAX on
+        // prompt_tokens for the same (module, served_by). SQL's `SUM()`
+        // summing these two columns would raise a hard "integer overflow"
+        // error (verified: reverting `module_model_usage_totals` to a
+        // `SUM()`-based query turns this test red — see the task's mutation
+        // note). The Rust-side saturating fold must instead clamp at
+        // i64::MAX and return normally.
+        store
+            .record_module_model_usage(
+                "m",
+                "2026-09-25",
+                ServedBy::Local,
+                ModelUsageDelta {
+                    prompt_tokens: max,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_module_model_usage(
+                "m",
+                "2026-09-26",
+                ServedBy::Local,
+                ModelUsageDelta {
+                    prompt_tokens: max,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // positive control: an ordinary (non-saturated) tier on the same
+        // module sums normally across the same two days.
+        store
+            .record_module_model_usage("m", "2026-09-25", ServedBy::Remote, one_ok())
+            .await
+            .unwrap();
+        store
+            .record_module_model_usage("m", "2026-09-26", ServedBy::Remote, one_ok())
+            .await
+            .unwrap();
+
+        let totals = store.module_model_usage_totals("m").await.unwrap();
+        let local = totals.iter().find(|r| r.served_by == "local").unwrap();
+        assert_eq!(
+            local.prompt_tokens, max,
+            "totals must saturate at i64::MAX across days, not error or wrap"
+        );
+        let remote = totals.iter().find(|r| r.served_by == "remote").unwrap();
+        assert_eq!(
+            remote.calls_ok, 2,
+            "positive control: an ordinary tier's totals still sum normally across days"
+        );
+    }
+
+    // ── L2 (review) — 全零增量是 no-op，不建行 ──────────────────────────────
+
+    #[tokio::test]
+    async fn an_all_zero_delta_writes_nothing() {
+        let (store, _dir) = fresh_wal(1).await;
+        let day = "2026-09-26";
+        store
+            .record_module_model_usage("m", day, ServedBy::Local, ModelUsageDelta::default())
+            .await
+            .unwrap();
+        assert!(
+            store.module_model_usage("m", day).await.unwrap().is_empty(),
+            "an all-zero delta must not create an empty row"
+        );
+
+        // positive control: a real (non-zero) delta right after does create
+        // exactly one row — this isn't a store that silently drops writes.
+        store
+            .record_module_model_usage("m", day, ServedBy::Local, one_ok())
+            .await
+            .unwrap();
+        let rows = store.module_model_usage("m", day).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].calls_ok, 1);
+    }
+
+    // ── L4 (review) — 已存在的 none 行走 UPDATE 路径也被 CHECK 拒绝 ─────────
+
+    #[tokio::test]
+    async fn adding_tokens_to_an_existing_none_row_is_rejected_on_the_update_path() {
+        let (store, _dir) = fresh_wal(1).await;
+        let day = "2026-09-26";
+        // establish a legal 'none' row first (an INSERT, not yet an UPDATE)
+        store
+            .record_module_model_usage(
+                "m",
+                day,
+                ServedBy::None,
+                ModelUsageDelta {
+                    calls_failed: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // now hit the SAME key again with a token delta: this goes through
+        // `ON CONFLICT DO UPDATE`, not `INSERT` — the CHECK must still fire.
+        let err = store
+            .record_module_model_usage(
+                "m",
+                day,
+                ServedBy::None,
+                ModelUsageDelta {
+                    prompt_tokens: 3,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "the CHECK must also reject the ON CONFLICT DO UPDATE path, not just a fresh INSERT"
+        );
+
+        // positive control: a further legal update (another calls_failed) to
+        // the SAME existing row still succeeds, and the earlier rejected
+        // update did not partially apply.
+        store
+            .record_module_model_usage(
+                "m",
+                day,
+                ServedBy::None,
+                ModelUsageDelta {
+                    calls_failed: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rows = store.module_model_usage("m", day).await.unwrap();
+        let none = rows.iter().find(|r| r.served_by == "none").unwrap();
+        assert_eq!(none.calls_failed, 2, "the rejected update wrote nothing");
+        assert_eq!(
+            none.prompt_tokens, 0,
+            "the rejected token delta never landed"
         );
     }
 
