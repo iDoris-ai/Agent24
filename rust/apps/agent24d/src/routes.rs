@@ -73,26 +73,37 @@ impl From<&ModelUsageRow> for UsageCounts {
             calls_cancelled: row.calls_cancelled,
             prompt_tokens: row.prompt_tokens,
             completion_tokens: row.completion_tokens,
-            total_tokens: row.prompt_tokens.saturating_add(row.completion_tokens),
+            // Review, L2: `prompt_tokens`/`completion_tokens` are each
+            // independently capped at `i64::MAX` by the store (`ModelUsageRow`
+            // already reflects that), so their sum could in principle reach
+            // `2 * i64::MAX` — `agent24_store::saturating_add_capped` is the
+            // same ceiling the store itself uses, not a second one that could
+            // disagree.
+            total_tokens: agent24_store::saturating_add_capped(
+                row.prompt_tokens,
+                row.completion_tokens,
+            ),
         }
     }
 }
 
 impl UsageCounts {
-    /// Only ever adds `by_served`'s (at most three, already individually
-    /// `<= i64::MAX`) rows together to build `totals` — nowhere near
-    /// `u64::MAX`, so a plain saturating add (not `agent24-store`'s
-    /// `i64::MAX`-ceiling one) is the right tool here.
+    /// Adds `by_served`'s (at most three) rows together to build `totals`.
+    /// Review, L2: reuses `agent24-store`'s own `saturating_add_capped`
+    /// (capped at `i64::MAX`, the same ceiling every stored row is already
+    /// individually held to) rather than a second, independent
+    /// `u64::saturating_add` (capped at `u64::MAX` instead) — one function
+    /// decides what "too big to be real" means for this table, not two that
+    /// could silently disagree.
     fn plus(self, other: Self) -> Self {
+        use agent24_store::saturating_add_capped as add;
         Self {
-            calls_ok: self.calls_ok.saturating_add(other.calls_ok),
-            calls_failed: self.calls_failed.saturating_add(other.calls_failed),
-            calls_cancelled: self.calls_cancelled.saturating_add(other.calls_cancelled),
-            prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
-            completion_tokens: self
-                .completion_tokens
-                .saturating_add(other.completion_tokens),
-            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            calls_ok: add(self.calls_ok, other.calls_ok),
+            calls_failed: add(self.calls_failed, other.calls_failed),
+            calls_cancelled: add(self.calls_cancelled, other.calls_cancelled),
+            prompt_tokens: add(self.prompt_tokens, other.prompt_tokens),
+            completion_tokens: add(self.completion_tokens, other.completion_tokens),
+            total_tokens: add(self.total_tokens, other.total_tokens),
         }
     }
 }
@@ -130,23 +141,30 @@ struct ModuleUsageResponse {
 
 /// §6.5 (v2 L5): at most one `module` key in the raw query string decides
 /// everything here — the rest of the query, however malformed
-/// (`?%zz`, `?a=1&a=2`, …), never affects the answer. `serde_urlencoded`'s
-/// parse is itself lenient about stray `%`/repeated keys; if it fails
-/// outright (e.g. invalid UTF-8 after percent-decoding), that is treated the
-/// same as "no `module` key at all" — the global counters, not an error —
-/// which is what keeps `?%zz` a plain 200.
+/// (`?%zz`, `?a=1&a=2`, …), never affects the answer.
+///
+/// Review, L1: this used to say `serde_urlencoded`'s parse "fails outright"
+/// on bad input and treated that (hypothetical) failure as "no `module`
+/// key". That was wrong on two counts, checked empirically: `%zz` does NOT
+/// fail to parse — it comes back as a literal one-pair list
+/// `[("%zz", "")]` — and even genuinely invalid UTF-8 after percent-decoding
+/// (`%FF`) decodes losslessly to U+FFFD rather than erroring. `form_urlencoded`
+/// (the crate `serde_urlencoded` itself delegates to, used here directly
+/// instead) makes this a property of the type, not an implementation detail
+/// to trust: `Parse` is a plain iterator with no `Result` in sight, so there
+/// is no error branch left to (mis-)handle, and — the actual risk L1 named —
+/// no way for one malformed key/value pair to make an unrelated, well-formed
+/// `module=` key elsewhere in the same query string silently disappear: each
+/// `&`-separated pair is decoded independently of every other one.
 ///
 /// - `Ok(None)`: no `module` key — read the global in-memory counters.
 /// - `Ok(Some(name))`: exactly one `module` key, value `name` (not yet
 ///   validated as a legal module name — the caller does that).
 /// - `Err(())`: two or more `module` keys — `400 invalid_request`.
 fn module_selector(raw: Option<&str>) -> Result<Option<String>, ()> {
-    let pairs: Vec<(String, String)> =
-        serde_urlencoded::from_str(raw.unwrap_or("")).unwrap_or_default();
-    let mut modules = pairs
-        .into_iter()
+    let mut modules = form_urlencoded::parse(raw.unwrap_or("").as_bytes())
         .filter(|(k, _)| k == "module")
-        .map(|(_, v)| v);
+        .map(|(_, v)| v.into_owned());
     match (modules.next(), modules.next()) {
         (None, _) => Ok(None),
         (Some(name), None) => Ok(Some(name)),
@@ -386,7 +404,7 @@ mod tests {
     // ── module_selector (§6.5, unit level) ──────────────────────────────────
 
     #[test]
-    fn no_module_key_selects_the_global_counters() {
+    fn usage_by_module_api_no_module_key_selects_the_global_counters() {
         assert_eq!(module_selector(None), Ok(None));
         assert_eq!(module_selector(Some("")), Ok(None));
         assert_eq!(
@@ -397,15 +415,19 @@ mod tests {
     }
 
     #[test]
-    fn malformed_query_falls_back_to_the_global_counters_not_an_error() {
-        // `%zz` is not valid percent-encoding; serde_urlencoded's parse of
-        // the whole string fails, which module_selector treats the same as
-        // "no module key" — never a 400 (v2 L5).
+    fn usage_by_module_api_malformed_query_falls_back_to_the_global_counters_not_an_error() {
+        // Review, L1: `%zz` is not valid percent-encoding, but
+        // `form_urlencoded::parse` does not error on it — it decodes
+        // losslessly to the literal pair `("%zz", "")` (verified
+        // empirically). That key is simply not `"module"`, so this falls to
+        // the global-counters branch for the same reason any query without a
+        // `module` key does — never a 400 (v2 L5), and never because of a
+        // parse failure that does not actually occur.
         assert_eq!(module_selector(Some("%zz")), Ok(None));
     }
 
     #[test]
-    fn exactly_one_module_key_selects_it() {
+    fn usage_by_module_api_exactly_one_module_key_selects_it() {
         assert_eq!(
             module_selector(Some("module=sin90")),
             Ok(Some("sin90".to_owned()))
@@ -418,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn two_or_more_module_keys_is_rejected() {
+    fn usage_by_module_api_two_or_more_module_keys_is_rejected() {
         assert_eq!(module_selector(Some("module=a&module=b")), Err(()));
     }
 
@@ -539,7 +561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_module_key_returns_the_unchanged_global_counters() {
+    async fn usage_by_module_api_no_module_key_returns_the_unchanged_global_counters() {
         let state = state_with_stub().await;
         let token = state.token.to_string();
         post_chat_once(router(state.clone()), &token).await;
@@ -550,7 +572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_malformed_query_still_returns_the_same_golden_global_literal() {
+    async fn usage_by_module_api_a_malformed_query_still_returns_the_same_golden_global_literal() {
         let state = state_with_stub().await;
         let token = state.token.to_string();
         post_chat_once(router(state.clone()), &token).await;
@@ -569,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn module_calls_never_add_to_the_global_counter() {
+    async fn usage_by_module_api_module_calls_never_add_to_the_global_counter() {
         // §6.5: "模块调用不加进全局计数器" — a module-scoped GET does not itself
         // call /chat, so this asserts the negative the other way round: a
         // module name that was never called stays at all zero even though
@@ -606,7 +628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_invalid_module_name_is_400_invalid_request() {
+    async fn usage_by_module_api_an_invalid_module_name_is_400_invalid_request() {
         let state = state_with_stub().await;
         let token = state.token.to_string();
         let (status, body) = get(router(state), &token, "/api/v1/usage?module=../x").await;
@@ -615,11 +637,198 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_module_keys_is_400_invalid_request_json_not_axums_plain_text() {
+    async fn usage_by_module_api_two_module_keys_is_400_invalid_request_json_not_axums_plain_text()
+    {
         let state = state_with_stub().await;
         let token = state.token.to_string();
         let (status, body) = get(router(state), &token, "/api/v1/usage?module=a&module=b").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    // ── H1 (review): the actual positive path — real per-module data, ───────
+    // ── isolation, windowing and the totals/by_served/daily shapes ──────────
+
+    /// Review, H1: `module_calls_never_add_to_the_global_counter` above only
+    /// ever exercised the ALL-ZERO case (`?module=never_called`) — which
+    /// passes identically whether `get_usage` reads the module the caller
+    /// asked for or a hardcoded, always-empty one. This test seeds REAL,
+    /// distinguishable rows for two modules across multiple days and all
+    /// three `served_by` tiers — one row deliberately a day outside the
+    /// `daily` window — directly through `Store::record_module_model_usage`
+    /// (bypassing `/api/v1/chat` entirely, so the numbers are exact and
+    /// under this test's own control), then asserts on the full response
+    /// shape: module isolation (both directions), `daily`'s exact newest-
+    /// first order and its exclusion of the out-of-window row, `totals`/
+    /// `by_served`'s ALL-TIME correctness (which must still include that same
+    /// out-of-window row — §6.5: "totals/by_served 为全期"), and
+    /// `total_tokens` being `prompt_tokens + completion_tokens`.
+    ///
+    /// Mutation (verified): changing the two `state.store.module_model_usage*`
+    /// calls in `get_usage` to query a hardcoded `"zzz"` instead of `&module`
+    /// turns this test red (module "a"'s non-zero totals/daily all come back
+    /// zero/empty) — the OLD test suite (only ever asserting all-zero
+    /// responses) did not catch that mutation at all.
+    #[tokio::test]
+    async fn usage_by_module_api_totals_and_daily_are_module_scoped_and_windowed() {
+        let state = state_with_stub().await;
+        let token = state.token.to_string();
+
+        let day = |offset_days: i64| {
+            (chrono::Utc::now().date_naive() - chrono::Duration::days(offset_days))
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let t0 = day(0);
+        let t1 = day(1);
+        let t29 = day(29); // the OLDEST day still inside the 30-day daily window
+        let t31 = day(31); // outside the daily window, but still counted in totals
+
+        async fn record(
+            state: &AppState,
+            module: &str,
+            day: &str,
+            served_by: agent24_store::ServedBy,
+            delta: agent24_store::ModelUsageDelta,
+        ) {
+            state
+                .store
+                .record_module_model_usage(module, day, served_by, delta)
+                .await
+                .unwrap();
+        }
+
+        fn delta(
+            calls_ok: u64,
+            calls_failed: u64,
+            prompt_tokens: u64,
+            completion_tokens: u64,
+        ) -> agent24_store::ModelUsageDelta {
+            agent24_store::ModelUsageDelta {
+                calls_ok,
+                calls_failed,
+                prompt_tokens,
+                completion_tokens,
+                ..Default::default()
+            }
+        }
+
+        // Module "a": five rows, three tiers, four distinct days.
+        record(
+            &state,
+            "a",
+            &t0,
+            agent24_store::ServedBy::Local,
+            delta(2, 0, 20, 10),
+        )
+        .await;
+        record(
+            &state,
+            "a",
+            &t1,
+            agent24_store::ServedBy::Remote,
+            delta(1, 0, 5, 1),
+        )
+        .await;
+        record(
+            &state,
+            "a",
+            &t1,
+            agent24_store::ServedBy::None,
+            delta(0, 1, 0, 0),
+        )
+        .await;
+        record(
+            &state,
+            "a",
+            &t29,
+            agent24_store::ServedBy::Local,
+            delta(1, 0, 1, 1),
+        )
+        .await;
+        record(
+            &state,
+            "a",
+            &t31,
+            agent24_store::ServedBy::Local,
+            delta(100, 0, 1000, 1000),
+        )
+        .await;
+
+        // Module "b": isolation control — large-looking numbers of its own
+        // that must never leak into "a"'s response, and vice versa.
+        record(
+            &state,
+            "b",
+            &t0,
+            agent24_store::ServedBy::Remote,
+            delta(5, 0, 50, 5),
+        )
+        .await;
+
+        let (status, a) = get(router(state.clone()), &token, "/api/v1/usage?module=a").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(a["module"], "a");
+        assert_eq!(a["cost_usd"], serde_json::Value::Null);
+        assert_eq!(
+            a["totals"],
+            serde_json::json!({
+                "calls_ok": 104, "calls_failed": 1, "calls_cancelled": 0,
+                "prompt_tokens": 1026, "completion_tokens": 1012, "total_tokens": 2038
+            }),
+            "totals must be ALL-TIME — including the day-31 row outside the daily window"
+        );
+        assert_eq!(
+            a["by_served"],
+            serde_json::json!({
+                "local": {"calls_ok": 103, "calls_failed": 0, "calls_cancelled": 0,
+                           "prompt_tokens": 1021, "completion_tokens": 1011, "total_tokens": 2032},
+                "remote": {"calls_ok": 1, "calls_failed": 0, "calls_cancelled": 0,
+                            "prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+                "none": {"calls_ok": 0, "calls_failed": 1, "calls_cancelled": 0,
+                          "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            })
+        );
+        assert_eq!(
+            a["daily"],
+            serde_json::json!([
+                {"day": t0, "served_by": "local", "calls_ok": 2, "calls_failed": 0,
+                 "calls_cancelled": 0, "prompt_tokens": 20, "completion_tokens": 10,
+                 "total_tokens": 30},
+                {"day": t1, "served_by": "none", "calls_ok": 0, "calls_failed": 1,
+                 "calls_cancelled": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                 "total_tokens": 0},
+                {"day": t1, "served_by": "remote", "calls_ok": 1, "calls_failed": 0,
+                 "calls_cancelled": 0, "prompt_tokens": 5, "completion_tokens": 1,
+                 "total_tokens": 6},
+                {"day": t29, "served_by": "local", "calls_ok": 1, "calls_failed": 0,
+                 "calls_cancelled": 0, "prompt_tokens": 1, "completion_tokens": 1,
+                 "total_tokens": 2}
+            ]),
+            "daily must be newest-first, at most the last 30 UTC days (today included), \
+             and exclude the day-31 row entirely — it must still count in totals/by_served \
+             (checked above)"
+        );
+
+        // Module "b": isolation the other way, and its own correctness.
+        let (status, b) = get(router(state.clone()), &token, "/api/v1/usage?module=b").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(b["module"], "b");
+        assert_eq!(
+            b["totals"],
+            serde_json::json!({
+                "calls_ok": 5, "calls_failed": 0, "calls_cancelled": 0,
+                "prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55
+            }),
+            "module b's totals must not include any of module a's rows"
+        );
+        assert_eq!(
+            b["daily"],
+            serde_json::json!([
+                {"day": t0, "served_by": "remote", "calls_ok": 5, "calls_failed": 0,
+                 "calls_cancelled": 0, "prompt_tokens": 50, "completion_tokens": 5,
+                 "total_tokens": 55}
+            ])
+        );
     }
 }
