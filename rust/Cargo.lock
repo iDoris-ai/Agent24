@@ -140,6 +140,7 @@ version = "0.3.0"
 dependencies = [
  "agent24-domain",
  "agent24-os-fd",
+ "agent24-os-proto",
  "axum",
  "bytes",
  "close_fds",

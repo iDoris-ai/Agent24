@@ -817,6 +817,13 @@ impl InheritedListener {
 /// or via a `connect()` without `with_env`). Everything else uses
 /// `testing::fake_kernel` / `FakeEndpoint` + `with_env`.
 ///
+/// Must be called from inside a tokio runtime: `UnixListener::from_std`
+/// registers the fd with tokio's reactor, which panics ("there is no reactor
+/// running") outside one. Production callers already run inside
+/// `#[tokio::main]`/`ModuleBuilder::connect()`'s runtime; a test that calls
+/// this directly needs `#[tokio::test]` (or an equivalent runtime guard) for
+/// the same reason.
+///
 /// # Errors
 /// See [`ListenError`].
 pub fn take_listener() -> Result<InheritedListener, ListenError> {
@@ -1033,22 +1040,53 @@ mod tests {
     use tokio::net::UnixListener;
     use tokio::net::unix::OwnedReadHalf;
 
-    fn tempdir() -> std::path::PathBuf {
+    /// A drop guard around a manually-created temp dir. `tempfile::TempDir`
+    /// (already a dev-dependency, used elsewhere in this crate) was tried
+    /// first, but `Builder::tempdir` appends its own random suffix on top of
+    /// our prefix, and these particular temp dirs hold a `cb.sock` AF_UNIX
+    /// path — that extra suffix was enough to blow macOS's ~104-byte
+    /// `sun_path` limit ("path must be shorter than SUN_LEN"). Building the
+    /// exact, length-budgeted name ourselves and only borrowing `tempfile`'s
+    /// idea (a guard that removes the dir on drop) keeps both properties.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// B1 (external review of #515): plain `SystemTime::now()` nanoseconds
+    /// collided under parallel `cargo test` on macOS (clock resolution),
+    /// producing `AddrInUse`/`EEXIST` for the socket path built on top of
+    /// this dir. A process-local counter makes each call unique regardless
+    /// of clock resolution; the returned guard additionally cleans the
+    /// directory up on drop instead of leaking it into the temp dir on every
+    /// test run.
+    fn tempdir() -> TempDir {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "a24proto-mod-{}-{}",
+            "a24proto-mod-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     async fn connected_pair() -> (UnixStream, UnixStream) {
         let dir = tempdir();
-        let sock_path = dir.join("cb.sock");
+        let sock_path = dir.path().join("cb.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let client = UnixStream::connect(&sock_path).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
@@ -1139,7 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn connect_from_env_sends_manifest_derived_hello_and_parses_the_reply() {
         let dir = tempdir();
-        let (env, endpoint) = testing::FakeEndpoint::bind(&dir);
+        let (env, endpoint) = testing::FakeEndpoint::bind(dir.path());
         let hello = Hello {
             module: "minimal",
             manifest_bytes: b"name: minimal\n",
@@ -1167,13 +1205,13 @@ mod tests {
     #[tokio::test]
     async fn connect_from_env_rejects_residual_bytes_after_the_handshake() {
         let dir = tempdir();
-        let sock_path = dir.join("cb.sock");
+        let sock_path = dir.path().join("cb.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let env = ModuleEnv::from_vars(|k| {
             Some(match k {
                 "A24_CALLBACK_SOCK" => sock_path.clone().into_os_string(),
                 "A24_HANDSHAKE_TOKEN" => "tok".into(),
-                _ => dir.as_os_str().to_owned(),
+                _ => dir.path().as_os_str().to_owned(),
             })
         })
         .unwrap();
@@ -1438,7 +1476,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_in_flight_call_gets_connection_lost_and_never_retries() {
         let dir = tempdir();
-        let sock_path = dir.join("cb.sock");
+        let sock_path = dir.path().join("cb.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let client = UnixStream::connect(&sock_path).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();

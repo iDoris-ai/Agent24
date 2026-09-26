@@ -50,6 +50,14 @@ sha2 = "0.10"
 serde_yaml = "0.9"
 
 [dev-dependencies]
+# B2 (external review of #515): the `test-util`-gated handshake tests
+# (`connect_from_env_*`) never ran in CI because plain `cargo test`/`clippy
+# --all-targets` don't pass `--features test-util`. Depending on ourselves
+# with the feature turned on for dev builds only pulls it in for `#[cfg(test)]`
+# builds of this crate, so the default `cargo test -p agent24-os-proto` and
+# `cargo clippy --all-targets` now cover them without a workspace-wide
+# feature flip.
+agent24-os-proto = { path = ".", features = ["test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 # To assert the "outcome unknown" log line is actually written.
