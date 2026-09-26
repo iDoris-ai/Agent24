@@ -226,6 +226,14 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - G8 在 #499 后新增 #517（`447aea8`，102 行），只增加 host-lifetime port borrowing seam：`GenerationDriver` 可借用 `ControlWorker`/`OutputWorker`，driver drop 后两者仍可继续服务 host；sidecar 146 tests、strict clippy 与 exact review 均 `PASS`。首轮 Windows CI 仅两个未改动 native timing tests 超时，failed-job rerun 后 Ubuntu/macOS/Windows 全绿；native generation assembly、host stdio bootstrap、event loop 与 `run()` wiring 仍未接入，external review pending。
 - root #228/#259 与其余 dependency stack 门禁未改变；本波没有新的 main merge，P2/P9 继续 `IN PROGRESS`。
 
+## 2026-09-26 Wave 19 可接力 checkpoint
+
+- G8 #519 直接叠在 #517，当前 head `6f82db0`，383 additions / 4 deletions：新增 dormant native generation assembly，真实 `OwnedLaunch` 的 stdout/stderr 各只移交一次给 generation-local Ready/Stderr workers，host-lifetime Control/Output workers 继续借用；worker admission 失败时不发 `Owned`，并返回同一 authoritative process owner 供 force/reap。Windows native handle 转换复用统一 `from_native_*_in` seam，build error 中 Box cleanup owner 以满足 strict clippy。本文更新时 Ubuntu/macOS 已绿、Windows final-head CI 仍在运行；该 301–500 行原子切片必须两次 independent exact-head review。
+- 全量本机施工现场审计确认 G4 三个 dirty legacy-recovery worktree 都是已被正式远端栈替代的早期草稿：ready-tx 被 #408+ 后续覆盖，terminal/terminal-core 被 #442→#450→#459→#468 与 #491 覆盖；均不得作为续接点或重新 push。
+- G1 六个 dirty allocation/retention worktree 同样全部 superseded：registration 三份 staged 草稿会重新公开 raw reservation API，已被 `460daae` 明确撤销；retention store/writer/plan 草稿已由 #467→#475→#480→#481→#484→#495/#497 的更强实现覆盖。当前 G1/G4 没有 unique-unfinished 本地改动需要补 PR。
+- 换机续接时以 GitHub PR/remote head 为 authority；本机保留的 superseded dirty worktree 仅作为历史草稿，不代表未上传工作。当前有效新施工点为 #517 → #519，文档 checkpoint 为 #518。
+- dependency roots 与产品完成度没有变化；没有越序 main merge，P2/P9 继续 `IN PROGRESS`。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
