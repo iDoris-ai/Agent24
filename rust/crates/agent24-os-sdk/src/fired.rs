@@ -70,10 +70,14 @@ impl<S: Send + Sync> FromRequest<S> for FiredDelivery {
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let (parts, body) = req.into_parts();
+        // Sin90 `http/mod.rs`'s `require_fire_id`: an empty header value is
+        // rejected the same way a missing header is — there is nothing to
+        // dedupe a kernel retry against either way.
         let fire_id = parts
             .headers
             .get(FIRE_ID_HEADER)
             .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .ok_or(FiredRejection::MissingFireId)?;
         let schedule_key = parts
@@ -171,6 +175,21 @@ mod tests {
     #[tokio::test]
     async fn missing_fire_id_header_is_rejected_400() {
         let req = HttpRequest::post(FIRED_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body_json()).unwrap()))
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Sin90 `require_fire_id`: an EMPTY header value must be rejected the
+    /// same way a wholly-missing header already is (the test above) — not
+    /// silently accepted as `fire_id: ""`, which would leave nothing to
+    /// dedupe a kernel retry against.
+    #[tokio::test]
+    async fn empty_fire_id_header_is_rejected_400_same_as_missing() {
+        let req = HttpRequest::post(FIRED_PATH)
+            .header(FIRE_ID_HEADER, "")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body_json()).unwrap()))
             .unwrap();
