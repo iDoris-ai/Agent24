@@ -213,11 +213,11 @@
 
 以 idoris 会话的一手回复为准（附录 B）。原先 §1–§6 里从仓库推断的 iDoris 内容，凡与本节冲突的，一律以本节为准。
 
-**排期**：代码已写完，但**一行都还没合进 iDoris 的集成分支**（32 个 PR 串成 30 层的 stacked 链，全部 open）。接口契约已冻结，可以先照着写；但 **P4（iDoris provider）只有等 iDoris 链合进 `preview` 之后才能排期**。「iDoris 已可依赖」不写进任何时间表。
+**排期**（截至 2026-09-26）：代码已写完，但**一行都还没合进 iDoris 的集成分支**（32 个 PR 串成 30 层的 stacked 链，全部 open；其中 7 个 CHANGES_REQUESTED 已在 2026-09-26 修完，gates 由红转绿，但仍未合并）。接口契约已冻结，可以先照着写；但 **P4（iDoris provider）只有等 iDoris 链合进 `preview` 之后才能排期**。「iDoris 已可依赖」不写进任何时间表。
 
 **更正**
 - 本地编排**不用 llama-swap**，直接用 oMLX 原生的多模型 + LRU + memory-guard。
-- 「没有鉴权」**是有意为之**：Router 只消费已验明身份的 tenant_id；personal 模式靠 loopback 绑定。绑定地址写死为 127.0.0.1，与 D2（LAN 算远程）一致。
+- Router 本身不做鉴权，只接收已验明身份的 tenant_id（认证归组织侧/AirAccount）。绑定地址写死为 127.0.0.1，这与 D2（LAN 算远程）一致。但 **loopback 不等于授权**，见下文「真缺口」和 §6 修订。
 - iDoris 侧已经拍板接法：**作为 `agent24-models` 的 OpenAI-compat provider**，要求纯加法、零回归，与 §4 B1 一致。
 
 **tier 与 locality 是两件事（iDoris 指出，采纳）**
@@ -247,9 +247,10 @@
 
 **隐私映射（单向，两道门同向叠加）**：manifest 没有声明 `model_access` 时发 `X-iDoris-Privacy: local_only`，声明了 `remote_allowed` 时发 `any`。iDoris 那边仍会独立做一次 fail-closed 复核，不信任上游的声明。
 
-**内存（Mac mini M4 24GB）**：常驻 9B（约 9.8GB）+ 临时 ≤14B。千问 2B/7B 可以随便加载；**27B Q4（约 15–16GB）和 9B 常驻共存会超内存（`requires_eviction`）**；35B MoE 判为 BLOCKED。调度混合模式之前先查 `/capabilities`，不要等到 OOM。
+**内存（Mac mini M4 24GB）**：常驻 9B（约 9.8GB），外加临时模型 ≤14B。千问 2B/7B 可以随便加载；35B MoE 判为 BLOCKED。调度混合模式前先查 `/capabilities`，不要等到 OOM 才发现。
+- **千问 27B：catalog 里没有这个条目，下面是按 catalog 反推的估算，没有实测。** 按 q4_k_m 约 0.55–0.62 GB/十亿参数估算，权重约 15–17GB，再加 KV cache。它和常驻的 9B **不能同时加载**（`requires_eviction`）。就算驱逐掉常驻模型，24GB 机器的实用预算只有 15.8–18GB（`RAM×0.66 ~ RAM−6`），27B 仍然处在边缘。可作参照的是 35B：q4 约 19.3GB，被判为 `min_ram_gb: 32`。**如果 27B 对混合模式重要，先给它建一条带实测 `weights_gb` 的 catalog 条目，不要照本文的数字排期。**（上一版写的「15–16GB」是 idoris 会话的口算值，已由它本人更正。）
 
-**§6「→ iDoris」诉求修订**：第 1 条的鉴权和守护进程入口，改为「personal 模式下 loopback 即授权，无需鉴权」；第 2 条落点头，改为 Served-Locality 三值，契约已定，实现待链合并；第 3–5 条保留。
+**§6「→ iDoris」诉求修订**：第 1 条改为：personal 模式下 **loopback 绑定限制了能访问它的范围，但这不等于授权**。同一台机器上的任何进程都能调用它，Router 不区分调用方，这正是本节登记的 followup（缺调用方身份）。目前实际起保护作用的是「只能从本机访问 + 默认策略本地优先 + 订阅中转需要三重显式开启」，**不是「已鉴权」**。端口方面：`startRouter({port})` 默认是 `0`（随机，供测试用）；**生产部署必须显式指定端口**。iDoris 侧目前还没有 `IDORIS_PORT` 或固定默认值，这是 iDoris 侧的待办；落地之前，`IDORIS_URL` 里的端口由部署方自行固定；第 2 条落点头，改为 Served-Locality 三值，契约已定，实现待链合并；第 3–5 条保留。
 
 ---
 
@@ -340,8 +341,8 @@
 - **② 外部 API**：只做了通用 OpenAI-compat 槽位和冒烟测试，故意没做选型。保真度矩阵标为 BLOCKED，等真实消费者出现。
 
 ## 对外接口
-- 地址 `http://127.0.0.1:<port>/v1`。**绑定写死 loopback**（server.ts:47），端口可配置，默认 0（随机）。
-- 端点：`/v1/models`、`/v1/chat/completions`（SSE）、`/capabilities`（返回 `admission_status: ready|requires_eviction|blocked`）、`/health`。
+- 地址 `http://127.0.0.1:<port>/v1`。**绑定写死 loopback**（server.ts:47）。端口可配置，默认 0（随机，供测试用），生产部署必须显式指定；目前还没有 `IDORIS_PORT`。
+- 端点：`/v1/models`、`/v1/chat/completions`（`stream: true` 时是 SSE，否则返回 JSON）、`/capabilities`（返回 `admission_status: ready|requires_eviction|blocked`）、`/health`。
 - 流式一旦开始吐 token 就不再重试，出错时以 SSE error 事件结束；非流式最多退避重试 2 次。
 - **Router 本身不做鉴权**：只消费已验明的 tenant_id，认证归组织侧 / AirAccount；personal 模式靠 loopback 绑定保护。
 - 用量回传：响应头 `X-iDoris-Reason` / `X-iDoris-Provider` / `X-iDoris-Cost-Minor`；另有 `GET /idoris/tenants/{id}/usage?period=`，返回里带 `billing_timezone` 和 `range_utc`。审计只存元数据，不存内容。
@@ -360,5 +361,5 @@
 ## 诉求与约束
 - 对 Agent24 的需求见 `docs/09-对Agent24的需求.md` R1–R6：接入为 provider；任务画像走 header；LocalOnly 贯穿且 fail-closed；硬件感知推荐；后端不绑定 oMLX；危险动作照走审批门。**不要求 Agent24 做破坏性改动。**
 - 凭证：iDoris 只管 provider key；DID 归 AirAccount；工具凭证归 Agent24；设备权限归 AgentEar。
-- 内存（Mac mini M4 24GB）：常驻 9B（Ornith-1.0-9B Q6_K，约 9.8GB）+ 临时模型 ≤14B。35B MoE 判为 BLOCKED。千问 2B/7B 可以随时挂载；**27B Q4 约 15–16GB，和 9B 常驻共存会超内存，属于 `requires_eviction`**。`/capabilities` 会提前告知。
+- 内存（Mac mini M4 24GB）：常驻 9B（Ornith-1.0-9B Q6_K，约 9.8GB）+ 临时模型 ≤14B。35B MoE 判为 BLOCKED。千问 2B/7B 可以随时挂载；27B 在 catalog 里没有条目（见 §9，需要先实测再排期）。`/capabilities` 会提前告知加载状态。
 - 纯本地离线：默认策略就是 local-first 且 fail-closed；设 `IDORIS_DISABLE_SUBSCRIPTION=1` 可全绿运行；有出网启动断言。
