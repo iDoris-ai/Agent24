@@ -1302,6 +1302,26 @@ SPEC-MD-ME §5 的 ME-3 行写的是「经 MCP/协议」，那是立项时的猜
 
 ---
 
+## ADR-032：AgentEar（语音）与 iDoris（模型网关）接入 Agent24 —— 提议中
+
+**状态**：提议中（2026-09-26）。完整规划与证据见 [`docs/design/INTEGRATION-AGENTEAR-IDORIS.md`](design/INTEGRATION-AGENTEAR-IDORIS.md)；§7 待拍板项未决前不开工 P2 及以后。
+
+**背景**：jason 的目标是 Agent24 当协调者，一端接 iDoris（本地 2B/7B/27B 千问 + 外部 API 的混合大脑），另一端接 AgentEar（本机语音耳朵和嘴巴）；两个仓库保持独立，只通过通用接口配合。
+
+**提议的决策**
+1. **AgentEar 以 OOP 模块接入**（SPEC-ME3），同时保留独立运行模式。热键、麦克风、会话状态机、打断、TTS 播放都留在 AgentEar，不搬走。Agent24 的角色是**能力提供方 + 执行方**（推理、事件、审批、私有记忆、提案执行），**不做逐轮中继**。
+2. **iDoris 以 `agent24-models` 的 OpenAI-compat provider 接入**，不做成 OOP 模块。拆成两个逻辑 provider：`idoris-local`（Local 层，强制 `X-iDoris-Privacy: local_only`）和 `idoris-any`（Remote 层）。iDoris 需要回报实际落点，用来关闭 ME4-S2 R13 的缺口（回环端点背后可能转发到外部）。
+3. **隐私分四层**：音频和原始转写不出本机 → manifest 的 `model_access` 决定 Privacy → 调 iDoris 时强制带 local_only 头 → iDoris 在没有本地候选时 fail-closed。
+4. **分阶段**：P0 拍板 ADR-0008 §5 的六问 → P1 AgentEar 直连 iDoris（零代码）→ P2 AgentEar 模块化（非流式，排在 ME4-M5 SDK 之后）→ P3 推理回调流式（排在 v0.5.0 之后，目标首字 ≤3s）→ P4 接入 iDoris provider → P5 gate 闭集执行提案。
+
+**已知缺口**
+- 推理回调和反向代理都不支持流式：非流式首字 4.86s，直连流式 2.80s。
+- `IDORIS_URL` 没有接线。
+- REST `/api/v1/chat` 固定走 `Privacy::Any`。
+- gate 的可执行动作还是空集。
+
+**待拍板**（设计文档 §7）：P2 是否允许先上非流式；LAN/Tailscale 节点算不算「本地」；独立模式下是否保留 MiniCPM 边车；TCC 权限归属（需要 spike 验证）；AgentEar 的开机自启和由 Agent24 拉起之间的冲突怎么处理。
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
