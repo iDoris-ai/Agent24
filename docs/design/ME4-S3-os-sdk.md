@@ -1,6 +1,6 @@
 # ME4-S3 —— `agent24-os-sdk` 设计（ME4-5.1.1：从两个调用方提取）
 
-> **状态：草案 v0（2026-09-26），未送评审，未冻结。** 按 PLAN-ME4 §一 第 2 条，本文要先经对抗评审（Codex；额度耗尽期间为全新上下文 Opus 子代理）到 APPROVE 才冻结，冻结前不写 SDK 代码。
+> **状态：v1（草案，待评审），2026-09-26。** 开放问题 Q1–Q11（§8）已由 jason 于 2026-09-26 全部拍板（按本文推荐），§8 已从「待用户拍板的开放问题」改写为「已拍板决策」，正文里依赖这些问题的「待定 / 若…则…」措辞已按拍板结果改为确定表述（见版本改动记录）。**仍未送评审，未冻结。** 按 PLAN-ME4 §一 第 2 条，本文要先经对抗评审（Codex；额度耗尽期间为全新上下文 Opus 子代理）到 APPROVE 才冻结，冻结前不写 SDK 代码。
 > 文件名按 PLAN-ME4 §三 ME4-5.1.1 的原文取 `ME4-S3-os-sdk.md`（S3 = PLAN §二 的「S3 `agent24-os-sdk`」；`S5` 是 T14 wire 文档那一节，不用这个编号，免得撞名）。
 >
 > **盘点基线**：
@@ -15,6 +15,7 @@
 | 版本 | 日期 | 改动 |
 |---|---|---|
 | v0 | 2026-09-26 | 初稿：盘点 + 边界 + API 草图（已编译）+ 迁移 + 判据 + 切法 + 开放问题 |
+| v1 | 2026-09-26 | jason 拍板 Q1–Q11（全部按推荐；Q3 选 (a) advise+轮询，gate 回调回推留 followup；Q4/Q1 选 (a) 五种客户端全进 v0.1.0）：§8 由「待用户拍板的开放问题」改写为「已拍板决策」，正文里 §1.2 盘点表、§2.1/2.4/2.6/2.7/2.8、§4.3、§5.2、§7 切法依赖、附录处的相关「待定/见 §8 Qx/若…则…」措辞改为确定表述；三个 followup（gate 回调回推、内核 remember 幂等键、proto kernel/module feature 拆分）登记进 `docs/agent/followups.md` FU-84~FU-86；送评审 |
 
 ---
 
@@ -31,7 +32,7 @@
 **不解决**：
 - 内核回调面本身（调度、推理、记忆、审批的内核实现已由 ME4-S1/S2 与 ME-3e 冻结；SDK 按 PLAN「不带来任何新能力」）。
 - T14 wire 文档正文（ME4-5.4.1，规范 S5）；本文只规定 SDK 与 wire 文档的对齐方式（§2.9）。
-- Cos72 的业务设计（ME4-5.3.1 起在 Cos72 仓库做）；本文只把 Cos72 对 SDK 的需求推到够用，并把一处与内核闭集冲突的计划措辞交给用户（§8 Q3）。
+- Cos72 的业务设计（ME4-5.3.1 起在 Cos72 仓库做）；本文只把 Cos72 对 SDK 的需求推到够用，并按 Q3 的拍板把一处与内核闭集冲突的计划措辞改为 advise（§8 Q3）。
 
 ---
 
@@ -60,15 +61,15 @@
 | 9 | 闭集错误 `ClientError` + `is_permanent`/`is_retryable` + 两路映射（传输错误、内核 `kind`） | `clients/error.rs:73-397` | **SDK** | 要 | 唯一的 Sin90 耦合：`Unavailable.cause` 用的是 `crate::ai::UnavailableCause`（`error.rs:217-229`、`378-397`）。SDK 自带同名四值闭集，Sin90 在自己的 `ModelFailure` 映射里转换 |
 | 10 | 「omit, don't null」可选字段约定 | `clients/mod.rs:74-78` | **SDK** | 要 | 内核 params 全是 `deny_unknown_fields` + `#[serde(default)]`；发 `null` 与缺省语义不同的地方（如 scheduler `enabled`）会出错 |
 | 11 | `EventSink`：同步 `emit`、256 容量队列、4 个固定 worker、32 子配额、5s 等位、满即丢并按 2 的幂打日志 | `mod.rs:86-122`、`mod.rs:425-503` | **SDK** | 要（每个动作发事件） | 这套数字是两轮评审（N-M1/N-M2/M5）磨出来的，任何模块自己再写一遍大概率回到「每次 emit spawn 一个任务」的旧缺陷。SDK 同时给「可等待的 `emit`」与「即发即弃的 sink」 |
-| 12 | `SchedulerClient`（upsert/delete/list + 类型） | `clients/scheduler.rs:35-243` | **SDK** | 见 §8 Q4 | Cos72 的 S4 闭环不用调度；但 ME4-5.3.4 要验证「互相读不到对方的 schedules」，Cos72 若不申请 `scheduler` 就只能从内核 REST 侧验。第二个真实调用方是 Agent24 黑盒 Python 模块（`me4_scheduler_blackbox.rs:75-240`）与 T14 Node 模块 |
+| 12 | `SchedulerClient`（upsert/delete/list + 类型） | `clients/scheduler.rs:35-243` | **SDK** | 按 §8 Q4 拍板：进（是否申请由 5.3.1 定） | Cos72 的 S4 闭环不用调度；但 ME4-5.3.4 要验证「互相读不到对方的 schedules」，Cos72 若不申请 `scheduler` 就只能从内核 REST 侧验。第二个真实调用方是 Agent24 黑盒 Python 模块（`me4_scheduler_blackbox.rs:75-240`）与 T14 Node 模块 |
 | 13 | `MemoryClient`（remember/recall/recent） | `clients/memory.rs:30-149` | **SDK** | 要（摘要进记忆） | |
-| 14 | `remember` 不幂等 → 先 `recall` 翻页找 dedup 标记再写 | `reconciler.rs:255-386`（`RECALL_PRECHECK_MAX_PAGES = 10`） | **待定（§8 Q5）** | 要（摘要写入同样会遇到「超时后重试写出两条」） | 算法依赖内核 `recall` 的实际语义（子串匹配、每次最多扫 2000 行、`cursor` 表示「窗口扫完了」而非「还有匹配」，`reconciler.rs:100-120`），很容易写错；但它是在绕内核缺一个幂等键 |
-| 15 | `ApprovalClient`（gate/advise/status，`ApprovalToken` 脱敏） | `clients/approval.rs:38-209` | **SDK** | 要 | Sin90 **没有业务调用方**，只有 test-hooks 路由（`kernel_roundtrip.rs:227-254`）。Cos72 是它第一个真实用户。注意 gate 的动作闭集今天只有 `schedule_callback`（`agent24-protocol/src/types.rs:421-431, 575-590`），见 §8 Q3 |
+| 14 | `remember` 不幂等 → 先 `recall` 翻页找 dedup 标记再写 | `reconciler.rs:255-386`（`RECALL_PRECHECK_MAX_PAGES = 10`） | **SDK（`remember_once`，按 §8 Q5 拍板）** | 要（摘要写入同样会遇到「超时后重试写出两条」） | 算法依赖内核 `recall` 的实际语义（子串匹配、每次最多扫 2000 行、`cursor` 表示「窗口扫完了」而非「还有匹配」，`reconciler.rs:100-120`），很容易写错；本轮原样搬进 SDK，内核加幂等键留作下一轮 followup（FU-85） |
+| 15 | `ApprovalClient`（gate/advise/status，`ApprovalToken` 脱敏） | `clients/approval.rs:38-209` | **SDK** | 要 | Sin90 **没有业务调用方**，只有 test-hooks 路由（`kernel_roundtrip.rs:227-254`）。Cos72 是它第一个真实用户。注意 gate 的动作闭集今天只有 `schedule_callback`（`agent24-protocol/src/types.rs:421-431, 575-590`），按 §8 Q3 拍板：Cos72 用 advise |
 | 16 | 从被代理请求头取 `X-A24-Request-Id` / `X-A24-Approval-Token` | `kernel_roundtrip.rs:227-254`；Python 黑盒 `me4_scheduler_blackbox.rs:201-221` | **SDK（`RequestContext` 提取器）** | 要（审批必须带这两样） | 头名 proto 已有：`proxy.rs:87`、`proxy.rs:96` |
-| 17 | `ModelClient` 的 wire 部分（`_a24/model/complete` 参数/结果、125s 响应期限） | `clients/model.rs:44-156` | **SDK（wire 形状）** | 不要 | 见 §8 Q4。Sin90 自己的 `Role` 没有 `Assistant`、`usage` 用 `u32`，内核是 `System/User/Assistant` 与 `u64`（`agentd model_callback.rs:91-96, 189-193`）。SDK 按内核 wire 定义 |
+| 17 | `ModelClient` 的 wire 部分（`_a24/model/complete` 参数/结果、125s 响应期限） | `clients/model.rs:44-156` | **SDK（wire 形状）** | 不要 | 按 §8 Q4 拍板进 SDK（Cos72 不需要，但目前只有 Sin90 用，T14 的 Rust 对照需要它）。Sin90 自己的 `Role` 没有 `Assistant`、`usage` 用 `u32`，内核是 `System/User/Assistant` 与 `u64`（`agentd model_callback.rs:91-96, 189-193`）。SDK 按内核 wire 定义 |
 | 18 | `ModelPort`/`ModelCaller` 适配、`ClientError → ModelFailure` 映射、`SemaphoredModelCaller` 每模块并发 2 | `clients/model.rs:159-215`、`mod.rs:567-579` | **留 Sin90** | — | Sin90 AI 引擎梯的端口，领域语义 |
 | 19 | `wire_kernel_clients`：没给能力时降级为 `NullEventSink`、能力前缀表 | `mod.rs:175-204`、`mod.rs:544-581` | **留 Sin90**（降级策略）；「按 `Offer` 返回 `Option`」的机制进 SDK | 各自写 | 各模块的「缺能力怎么降级」不同 |
-| 20 | `listener_from_fd`（`unsafe { from_raw_fd }`） | `mod.rs:600-604` | **proto**（需要一个 `unsafe` 决定，§8 Q2） | 要 | 工作区 `unsafe_code = "forbid"`（`rust/Cargo.toml:33`），proto 继承 |
+| 20 | `listener_from_fd`（`unsafe { from_raw_fd }`） | `mod.rs:600-604` | **proto**（按 §8 Q2 拍板：独立小 crate `agent24-os-fd` 持有 `unsafe`） | 要 | 工作区 `unsafe_code = "forbid"`（`rust/Cargo.toml:33`），proto 继承 |
 | 21 | fired 保留路由：`X-A24-Fire-Id` 必填、body `deny_unknown_fields`、定宽 ISO-8601 校验、任何结果都回 2xx | `http/mod.rs:190`、`http/mod.rs:320-338`、`http/mod.rs:1347-1359`、`http/mod.rs:1376-1478` | 解析/校验进 **SDK**（`FiredDelivery` 提取器 + `with_fired` 注册点）；「按 `fire_id` 去重写库、镜像事件」**留 Sin90** | 仅当 Cos72 申请 scheduler | Sin90 的分层（`lib.rs:3`：`core ← store ← http ← adapter_agent24`，`http` 不许依赖 Agent24 类型）决定了 Sin90 在 5.2.1 **不**改用 SDK 提取器（§5.2）。内核侧 `FiredBody` 是 `agentd scheduler_deliver.rs:178` 的私有借用类型，SDK 与内核共用一个需要把它挪进 proto |
 | 22 | 主流程：读 env → 握手 → 建客户端 → 开 store → nest 到 `/api/v1/sin90` → `axum::serve` | `main.rs:118-262` | 骨架进 **SDK**（`Module::builder(..).connect()` / `serve(router)`）；中间 Sin90 的 store、actor keys、reconciler、test-hooks 合并留 Sin90 | 要 | `route_namespace` 从 manifest 读（Sin90 手写了 `"/api/v1/sin90"`，`main.rs:259`） |
 | 23 | 连接死 → `exit(70)` | `main.rs:138-145` | **SDK 默认值**，可覆盖 | 要 | §2.6 |
@@ -76,13 +77,13 @@
 | 25 | Actor keys（人 / 自动化两把钥匙） | `http/actor.rs` | **留 Sin90** | 各自 | 领域的「AI 不直接写」门 |
 | 26 | test-hooks 调试路由、假内核测试夹具 | `kernel_roundtrip.rs`、`reconciler_debug.rs`、`clients/test_support.rs` | 调试路由**留 Sin90**；假内核夹具进 **proto**（`test-util` feature） | 要夹具 | SDK 自己的测试也不能开 socket（clippy 判据对 `--all-targets` 生效），只能用 proto 给的内存假内核 |
 
-**Cos72 需要的集合**（推演结论）：1–11、13、15、16、20、22、23、24（分类部分），外加 14（形式待定）。调度（12、21）取决于 §8 Q4 / ME4-5.3.4 的验法；推理（17）不要。
+**Cos72 需要的集合**（推演结论）：1–11、13、14、15、16、20、22、23、24（分类部分）。调度（12、21）按 §8 Q4 拍板进 SDK，Cos72 是否申请由 5.3.1 定，隔离验法见 ME4-5.3.4；推理（17）Cos72 不要。
 
 ### 1.3 这份盘点揭出的三件计划里没写到的事
 
 1. **proto 今天没有任何模块侧 API。** PLAN S3-1 写「proto 提供两个入口 `Client::connect_from_env()` 和 `listener_from_env()`」——这两个入口**不存在**（`rg connect_from_env|listener_from_env rust/` 为空）。proto 22,713 行全是内核侧：`accept`（握手判定）、`rpc::serve`（服务模块的调用）、launch/supervise/proxy。所以 5.1.2a 的大头是「把 Sin90 的 transport 搬进 proto 当模块侧客户端」，不是写 SDK。
-2. **`listener_from_env` 需要 `unsafe`，而工作区禁了。** 把一个 fd 号变成 socket 只有 `FromRawFd::from_raw_fd`，是 `unsafe`；`rust/Cargo.toml:33` 是 `unsafe_code = "forbid"`（forbid 不能被 `#[allow]` 局部放开）。ME3-SUP 的先例是「用小 crate 代替自己写 unsafe」（`agent24-os-proto/Cargo.toml` 注释里的 command-fds / close_fds 决定 D3）。这要用户拍板（§8 Q2）。
-3. **PLAN S4 写「发积分经内核审批（`_a24/approval/gate`）」，但 gate 今天只接受 `schedule_callback` 一个动作**，其余一律 `forbidden`（`types.rs:421-431`）。按现状 Cos72 只能用 `advise` + 轮询 `status`（§8 Q3）。这影响 SDK 要不要多一个「审批裁决回调」注册点。
+2. **`listener_from_env` 需要 `unsafe`，而工作区禁了。** 把一个 fd 号变成 socket 只有 `FromRawFd::from_raw_fd`，是 `unsafe`；`rust/Cargo.toml:33` 是 `unsafe_code = "forbid"`（forbid 不能被 `#[allow]` 局部放开）。ME3-SUP 的先例是「用小 crate 代替自己写 unsafe」（`agent24-os-proto/Cargo.toml` 注释里的 command-fds / close_fds 决定 D3）。**已拍板**：新建独立小 crate `agent24-os-fd`（§8 Q2）。
+3. **PLAN S4 写「发积分经内核审批（`_a24/approval/gate`）」，但 gate 今天只接受 `schedule_callback` 一个动作**，其余一律 `forbidden`（`types.rs:421-431`）。**已拍板**：Cos72 用 `advise` + 轮询 `status`（§8 Q3）；「审批裁决回调」注册点放下一轮 followup（FU-84）。
 
 ---
 
@@ -93,7 +94,7 @@
 - 名字 `agent24-os-sdk`，位置 `rust/crates/agent24-os-sdk`（PLAN S3-1）。工作区成员，继承 `[lints] workspace = true`（因此 `unsafe_code = "forbid"` 自动生效）。
 - **普通依赖里 `agent24-*` 只有 `agent24-os-proto` 一个**（判据 J2）。其余：`axum 0.8`（`default-features = false, features = ["json","tokio","http1"]`，与 proto 同主版本）、`serde`、`serde_json`、`thiserror`、`tokio`（`sync`,`time`,`rt`,`macros`）、`tracing`。
 - SDK 需要 manifest 的三个字段。proto 本来就依赖 `agent24-domain`（`agent24-os-proto/Cargo.toml:10`），所以由 proto 新增一个 `manifest` 模块做薄转出（§4.4），SDK 不直接依赖 `agent24-domain`。
-- **依赖重量的代价**：proto 今天连带 `command-fds`、`close_fds = "=0.3.2"`（精确钉版）、`rustix`、`hyper`/`hyper-util`、`agent24-domain`（→ `serde_yaml`、`agent24-protocol` → `schemars`）。Sin90/Cos72 以 git 依赖引入 SDK 时这些都要编译。要不要给 proto 拆 `kernel`/`module` feature 交用户定（§8 Q8）。
+- **依赖重量的代价**：proto 今天连带 `command-fds`、`close_fds = "=0.3.2"`（精确钉版）、`rustix`、`hyper`/`hyper-util`、`agent24-domain`（→ `serde_yaml`、`agent24-protocol` → `schemars`）。Sin90/Cos72 以 git 依赖引入 SDK 时这些都要编译。**已拍板**：本轮不拆 proto `kernel`/`module` feature（§8 Q8，followup FU-86）。
 
 ### 2.2 结构性判据：SDK 从不持有 socket（PLAN S3-1，已在 scratch 验证）
 
@@ -137,8 +138,8 @@ PLAN S3-2 与 ME4-5.1.2b 原文列的五种是 **Events / Memory / Approval / Sc
 | `EventsClient` | `_a24/events/` | `emit{kind, payload, request_id?}`（`agentd events_emit.rs:251-256`） | `KernelEventSink`（`mod.rs:425-503`），不发 `request_id` | Cos72（S4）、Python 黑盒 |
 | `MemoryClient` | `_a24/memory/private/` | `remember/recall/recent`（`memory_callback.rs:36-67`） | `clients/memory.rs` | Cos72（S4）、Python 黑盒 |
 | `ApprovalClient` | `_a24/approval/` | `gate/advise/status`（`approval_callback.rs:34-64`） | `clients/approval.rs`（无业务调用方） | Cos72（S4） |
-| `SchedulerClient` | `_a24/scheduler/` | `upsert/delete/list`（`scheduler_callback.rs:75-143`） | `clients/scheduler.rs` | Python 黑盒、T14 Node；Cos72 视 §8 Q4 |
-| `ModelClient` | `_a24/model/` | `complete`（`model_callback.rs:68-116, 181-193`） | `clients/model.rs:44-156` | 暂无（§8 Q4） |
+| `SchedulerClient` | `_a24/scheduler/` | `upsert/delete/list`（`scheduler_callback.rs:75-143`） | `clients/scheduler.rs` | Python 黑盒、T14 Node；Cos72 是否申请由 5.3.1 定（§8 Q4 已拍板进 SDK） |
+| `ModelClient` | `_a24/model/` | `complete`（`model_callback.rs:68-116, 181-193`） | `clients/model.rs:44-156` | 暂无（§8 Q4 已拍板进 SDK，目前只有 Sin90 用） |
 
 共同规则（从 Sin90 原样继承）：
 - 构造函数 `new(&Arc<Connection>) -> Option<Self>`：`Offer` 不覆盖本前缀就返回 `None`，**没有「照样调、调了必败」的路径**（Sin90 `clients/mod.rs:5-11`，architecture.md 不可破边界 #7）。
@@ -161,7 +162,7 @@ PLAN S3-2 与 ME4-5.1.2b 原文列的五种是 **Events / Memory / Approval / Sc
 - 两处合并保留（Sin90 L-6）：本端 64 在途满 与 内核 `busy` → `Busy`；本端帧超限 与 内核 `payload_too_large` → `PayloadTooLarge`。
 - `UnavailableCause` 改为 SDK 自有的四值闭集（去掉对 Sin90 `crate::ai` 的耦合）。
 - **新增** `ClientError::retry_class() -> RetryClass`（纯分类，SDK 自己从不重试）：`Revoked → GenerationOver`；`ConnectionLost | Cancelled → OutcomeUnknown`；`RateLimited | Busy | NotReady | Draining → BackoffPauseBatch`；其余按 `is_permanent`/`is_retryable` → `Permanent`/`Backoff`，剩下 `Unclassified`。这是把 Sin90 `reconciler.rs:692-728` 的表抽成与存储无关的形式，给 Cos72 的 outbox 用。**注意**：Sin90 今天把 `Cancelled` 放进「其它 → 退避 + other-bucket 计数」（`reconciler.rs:745-752` 的 `Err(e)` 兜底分支；它的注释列举 `timeout`/`not_sent`/`request_not_in_flight`/`other`，没有 `cancelled`，但 `Cancelled` 实际落在这里），与 `retry_class` 的 `OutcomeUnknown` 不同；所以 5.2.1 里 Sin90 **不改用** `retry_class`（零行为变化），是否对齐留作 Sin90 后续 task。
-- 要不要给 `ClientError` 加 `#[non_exhaustive]` 交用户定（§8 Q6）；草图按推荐**不加**。
+- **已拍板**：`ClientError` 不加 `#[non_exhaustive]`（§8 Q6）；草图按此写。
 
 ### 2.7 超时、重试、并发：谁负责
 
@@ -176,13 +177,13 @@ PLAN S3-2 与 ME4-5.1.2b 原文列的五种是 **Events / Memory / Approval / Sc
 | **重试** | **调用方** | SDK 与 proto 永不自动重试。`NotSent` 表示没上线；`ConnectionLost`/`Timeout`/`Cancelled` 表示结果未知 | Sin90 `transport.rs:36-48`、`error.rs:262-279` |
 | 退避曲线、outbox、耗尽阈值、幂等 | **调用方** | SDK 只给 `retry_class()` | §2.6 |
 | 推理的每模块并发上限 | **调用方**（内核另有自己的 2 并发） | Sin90 `SemaphoredModelCaller` | ME4-S2 §5 |
-| 连接死后怎么办 | SDK 提供 `FatalHook` 注入；**默认** `warn!` + `std::process::exit(70)` | 与 Sin90 `main.rs:138-145` 相同；supervisor 起新一代 | 库里默认退出进程是否可接受见 §8 Q10 |
+| 连接死后怎么办 | SDK 提供 `FatalHook` 注入；**默认** `warn!` + `std::process::exit(70)` | 与 Sin90 `main.rs:138-145` 相同；supervisor 起新一代 | 已拍板：默认可接受，可用 `on_connection_lost` 覆盖（§8 Q10） |
 
 ### 2.8 版本与兼容
 
 - **SDK 自身**：SemVer 从 `0.1.0` 起（PLAN S3-3）。发布方式：Agent24 仓库打 tag `agent24-os-sdk-v0.1.0`，外部仓库 `agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0" }`。0.x 期间 minor 升级即可破坏兼容；新增错误 `kind` 属于破坏性变化（§8 Q6）。
 - **工具链**：Agent24 是 edition 2024、CI 钉 `1.98.0`，agentd 已用 let-chains（`model_callback.rs:126-127`、`133-134`），需要 Rust ≥ 1.88。Sin90 CI 用 `dtolnay/rust-toolchain@stable`（`.github/workflows/ci.yml:24-25`），当前 stable 满足。SDK `Cargo.toml` 写 `rust-version = "1.88"` 并在 SDK 的 CI 里用 1.88 跑一次 `cargo check -p agent24-os-sdk`（防止无意中抬高 MSRV 打坏下游），是否值得多这一条 CI 作业由评审定。
-- **wire 协议版本**：SDK 在 `initialize` 里声明的范围。Sin90 今天是 `1..=1000`（`mod.rs:73-74`），内核 `negotiate` 取 `min(module.max, kernel.max)`（`version.rs:175-189`），内核是 v1（`agent24-domain lib.rs:397`）→ 今天两种写法结果都是 1。但 `1..=1000` 意味着将来 v2 内核会和只懂 v1 的 SDK「协商成功」地讲 v2。推荐 SDK 只声明它实际实现的范围 `1..=1`（§8 Q7）；草图里常量暂按 Sin90 现状写 `1000`，冻结时按裁决改。
+- **wire 协议版本**：SDK 在 `initialize` 里声明的范围。Sin90 今天是 `1..=1000`（`mod.rs:73-74`），内核 `negotiate` 取 `min(module.max, kernel.max)`（`version.rs:175-189`），内核是 v1（`agent24-domain lib.rs:397`）→ 今天两种写法结果都是 1。但 `1..=1000` 意味着将来 v2 内核会和只懂 v1 的 SDK「协商成功」地讲 v2。**已拍板**：SDK 只声明它实际实现的范围 `1..=1`（§8 Q7）；实现时常量写 `1`，不沿用 Sin90 现状的 `1000`。
 - **内核加字段**：响应类型宽松解析，不破坏旧模块。**内核加必填参数**：属于 wire 破坏，SPEC 与 SDK 同 PR 改，SDK minor 升。**内核加错误 kind**：落 `Other` 直到 SDK 升级（deny by default），不 panic。
 
 ### 2.9 非 Rust 模块（T14 Node.js）如何对齐 wire
@@ -432,7 +433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 4.3 监听 fd
 
-- `listener_from_env(&ModuleEnv) -> std::io::Result<tokio::net::UnixListener>`：唯一一处把 fd 号变成 socket 的地方。**实现需要 `unsafe`**，方案待 §8 Q2 裁决。
+- `listener_from_env(&ModuleEnv) -> std::io::Result<tokio::net::UnixListener>`：唯一一处把 fd 号变成 socket 的地方。**实现需要 `unsafe`**；已拍板放进独立小 crate `agent24-os-fd`（§8 Q2）。
 
 ### 4.4 其它补齐
 
@@ -471,7 +472,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 5.2 零行为变化的验收办法
 
 1. **真实挂载黑盒不变全绿**：`AGENT24_CHECKOUT=../Agent24 cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1`，先 `-- --list --ignored` 断言恰好 5 条（`sin90_mounts_under_a_real_agent24_daemon`、`kernel_clients_roundtrip`、`routine_m3_real_mount_acceptance`、`t441_finalized_review_summary_is_recallable_from_kernel_memory`、`t551_ai_v1_m5_real_mount_acceptance`，`tests/agent24_mount_blackbox.rs:908/1175/1419/1861/2158`），跑之前 `../Agent24` ff 到含 SDK tag 的 main。
-2. **线协议金样逐条相等**：TS.1.0 录的 golden 在迁移后重跑逐条相等（用 proto `test-util` 假内核录）。唯一允许的差异在 §8 Q7 裁决后写死（若改成 `1..=1`，`initialize.params.protocol_versions.max` 从 1000 变 1——这是**有意的**变化，在 PR body 里单列，不算回归）。变异：在迁移后的 Sin90 里把 `upsert` 的 `label` 改成发 `null` → golden 测试变红。
+2. **线协议金样逐条相等**：TS.1.0 录的 golden 在迁移后重跑逐条相等（用 proto `test-util` 假内核录）。唯一允许的差异已按 §8 Q7 拍板写死：`initialize.params.protocol_versions.max` 从 1000 变 1——这是**有意的**变化，在 PR body 里单列，不算回归。变异：在迁移后的 Sin90 里把 `upsert` 的 `label` 改成发 `null` → golden 测试变红。
 3. **常量同值**：一条 Sin90 单测断言 `EventSinkConfig::default()` 等于 `256/4/32/5s`、`MODEL_RESPONSE_TIMEOUT == 125s`；连接死时退出码仍是 70（`main.rs` 的钩子原样传入）。
 4. **HTTP 面不变**：Sin90 `cargo test` 全绿（包含 `http/tests.rs` 的 fired 400 用例，因为 fired handler 没动）。
 5. **净删代码**：`git diff --stat origin/main -- src/adapter_agent24` 删除行 > 新增行（TS.1.1 原验收）。按 §1.2 粗估：删 `frame.rs`（147）、`transport.rs`（1368）、`clients/` 下除 model 外的 6 个文件（约 2136）、`mod.rs` 约 700 行、`model.rs` 约 250 行，新增 < 200 行。
@@ -512,9 +513,9 @@ PLAN 里的 5.1.2a/b/c 三个 PR 装不下：盘点后「非测试代码」大�
 
 | 新编号 | 内容 | 仓库 | 估算（非测试） | 依赖 |
 |---|---|---|---|---|
-| ME4-5.1.2a1 | proto `module`：`ModuleEnv`、`Hello`、`manifest_digest` 公开、`connect_from_env` 的握手部分（先返回一个只能 `offer()` 的连接）、`manifest` 转出、`FiredBody` 挪进 `kernel_call` 并让 agentd 改用；J-S11、J-S12 | Agent24 | ~180 | 5.1.1 冻结 + §8 Q2 裁决 |
+| ME4-5.1.2a1 | proto `module`：`ModuleEnv`、`Hello`、`manifest_digest` 公开、`connect_from_env` 的握手部分（先返回一个只能 `offer()` 的连接）、`manifest` 转出、`FiredBody` 挪进 `kernel_call` 并让 agentd 改用；J-S11、J-S12 | Agent24 | ~180 | 5.1.1 评审通过（冻结） |
 | ME4-5.1.2a2 | proto `Connection` 多路复用（移植 Sin90 transport）+ `test-util` 假内核；J-S8、J-S9 前半 | Agent24 | ~300（若超，拆 a2-core：读写任务/分发/在途上限 与 a2-cancel：`CallGuard`/超时/`slot_wait`/`declare_dead`） | a1 |
-| ME4-5.1.2a3 | `listener_from_env`（按 Q2 方案）+ SDK crate 骨架（`Cargo.toml`、`clippy.toml`、`positive-control`、`Module`/`ModuleBuilder`/`SdkError`/`serve`）+ CI 步骤；J-S1、J-S2、J-S3 | Agent24 | ~180 | a2 |
+| ME4-5.1.2a3 | `listener_from_env`（按 §8 Q2 拍板：独立小 crate `agent24-os-fd`）+ SDK crate 骨架（`Cargo.toml`、`clippy.toml`、`positive-control`、`Module`/`ModuleBuilder`/`SdkError`/`serve`）+ CI 步骤；J-S1、J-S2、J-S3 | Agent24 | ~180 | a2 |
 | ME4-5.1.2b1 | `ClientError`/`RetryClass`/映射、`RequestContext`、客户端公共 `Core`；J-S4 | Agent24 | ~270 | a3 |
 | ME4-5.1.2b2 | Events（含 sink）/ Memory / Approval；J-S5、J-S6 的对应部分 | Agent24 | ~250 | b1 |
 | ME4-5.1.2b3 | Scheduler / Model + agentd 侧 wire 对等测试；J-S5/J-S6 其余、J-S7、J-S9 后半 | Agent24 | ~210 | b2 |
@@ -524,64 +525,70 @@ PLAN 里的 5.1.2a/b/c 三个 PR 装不下：盘点后「非测试代码」大�
 | ME4-5.2.1 / Sin90 TS.1.1 | 迁移；J-S16 | Sin90 | 净删 | c2、TS.1.0 |
 
 说明：
-- 若 §8 Q2 选「独立小 crate」，a3 里多一个 `rust/crates/agent24-os-fd`（约 20 行），仍在 300 行内。
-- 若 §8 Q5 选「SDK 带 `remember` 去重助手」，放在 b2 之后单独一个 PR（约 120 行 + 测试），不塞进 b2。
-- 若 §8 Q8 选「给 proto 拆 feature」，那是 a1 之前的一个独立重构 PR，改动面大（22k 行的 crate 的 `#[cfg]` 划分），不建议放在本轮。
+- 按 §8 Q2 拍板，a3 里多一个 `rust/crates/agent24-os-fd`（约 20 行），仍在 300 行内。
+- 按 §8 Q5 拍板，SDK 带 `remember` 去重助手（`remember_once`），放在 b2 之后单独一个 PR（约 120 行 + 测试），不塞进 b2。
+- §8 Q8 已拍板本轮不拆 proto feature（followup FU-86）；若该 followup 落地，会是 a1 之前的一个独立重构 PR，改动面大（22k 行的 crate 的 `#[cfg]` 划分），不放在本轮。
 
 ---
 
-## 8. 待用户拍板的开放问题
+## 8. 已拍板决策（原「待用户拍板的开放问题」）
 
-每个问题列选项与推荐；推荐只是推荐，未经确认不按它写代码。
+> 2026-09-26，jason 全部拍板，均按本文当时的推荐选项裁决。以下按裁决结果记录：决策 / 拍板人 / 日期 / 理由。原选项列表保留供溯源。
 
-**Q1（范围）——「只有两个调用方都要的才进 SDK」与 PLAN「五种客户端」怎么取舍？** 见 Q4，这是 Q4 的总括。
+**Q1（范围）——「只有两个调用方都要的才进 SDK」与 PLAN「五种客户端」怎么取舍？**
+- **决策**：随 Q4 一并裁决——SDK v0.1.0 五种客户端（Events/Memory/Approval/Scheduler/Model）全进。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：与 PLAN「五种客户端」原文一致；Cos72、Python 黑盒、T14 Node 已构成多个真实/计划中的调用方，Q1 本身不单独取舍，见 Q4。
 
-**Q2（架构/安全）——`listener_from_env` 的 `unsafe` 放哪？** 工作区 `unsafe_code = "forbid"`，一个 fd 号变 socket 只能 `unsafe { from_raw_fd }`。
-- (a) 新建极小 crate `agent24-os-fd`（~20 行，该 crate 单独 `unsafe_code = "deny"` + 一处带 SAFETY 说明的 `#[allow]`），proto 依赖它；proto 与 SDK 继续 `forbid`。
-- (b) proto 的 lint 从 `forbid` 降为 `deny`，在 `listener_from_env` 一处 `#[allow(unsafe_code)]`。
-- (c) 不用 fd：内核改为给模块一个监听 socket 路径（`A24_LISTEN_PATH`），模块自己 bind——改内核 launch 契约、SPEC、Python 黑盒、以及「fd 3 由内核持有」的既有安全设计，代价大。
-- (d) 依赖第三方 crate 代劳——已知的 `listenfd` 要求 systemd 风格 `LISTEN_FDS`/`LISTEN_PID` 环境变量，内核不设，需要改 launch。
-- **推荐 (a)**：unsafe 被隔离在一个一眼能审完的 crate 里，不给 proto 这个 22k 行的内核协议 crate 开口子；与 ME3-SUP D3「用小 crate 替代自己写 unsafe」的精神一致（只是这次小 crate 是自己的）。
+**Q2（架构/安全）——`listener_from_env` 的 `unsafe` 放哪？** 工作区 `unsafe_code = "forbid"`，一个 fd 号变 socket 只能 `unsafe { from_raw_fd }`。原选项：(a) 新建极小 crate `agent24-os-fd`；(b) proto 的 lint 降为 `deny` 局部 `#[allow]`；(c) 改内核 launch 契约为监听 socket 路径；(d) 依赖第三方 `listenfd`。
+- **决策**：方案 (a)。新建独立小 crate `agent24-os-fd`（~20 行，该 crate 单独 `unsafe_code = "deny"` + 一处带 SAFETY 说明的 `#[allow]`），proto 依赖它；proto 与 SDK 继续 `forbid`。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：unsafe 被隔离在一个一眼能审完的 crate 里，不给 proto 这个 22k 行的内核协议 crate 开口子；与 ME3-SUP D3「用小 crate 替代自己写 unsafe」的精神一致（只是这次小 crate 是自己的）。
 
-**Q3（产品/架构）——Cos72「发积分经内核审批」用 gate 还是 advise？** PLAN S4 写 `_a24/approval/gate`，但 gate 只接受内核能执行的闭集（今天只有 `schedule_callback`），发积分是 Cos72 自己库里的动作，内核执行不了。
-- (a) 用 **advise** + 模块轮询 `status(approval_id)`，批准后 Cos72 自己入账；PLAN S4 措辞改成 advise。审批的约束力来自 Cos72 自己守规矩（SPEC §6.1：advise 是「知识，不是安全控制」）——但积分账本的真相本来就只在 Cos72 库里，内核无论如何都执行不了它。
-- (b) 扩 gate 闭集：新增一种「内核批准后回调模块」的可执行动作（形态类似 fired：内核 POST `/api/v1/<ns>/_a24/approval/decided`），SDK 再多一个注册点。这是新的内核能力 + 新的保留路由 + SPEC 改动，要走一轮设计评审。
-- **推荐 (a)**，(b) 记入下一轮。若选 (a)，SDK 是否提供轮询助手 `ApprovalClient::wait_decided(id, interval, deadline)` 顺带定（推荐不提供，Cos72 在自己的 outbox/泵里轮询，免得 SDK 替调用方决定轮询节奏）。
+**Q3（产品/架构）——Cos72「发积分经内核审批」用 gate 还是 advise？** PLAN S4 写 `_a24/approval/gate`，但 gate 只接受内核能执行的闭集（今天只有 `schedule_callback`），发积分是 Cos72 自己库里的动作，内核执行不了。原选项：(a) advise + 轮询 `status`；(b) 扩 gate 闭集，新增「内核批准后回调模块」的可执行动作。
+- **决策**：方案 (a)。Cos72 用 **advise** + 模块轮询 `status(approval_id)`，批准后 Cos72 自己入账；PLAN S4 措辞改成 advise。SDK **不**提供轮询助手（如 `wait_decided`），Cos72 在自己的 outbox/泵里轮询，避免 SDK 替调用方决定轮询节奏。方案 (b)「gate 扩展为批准后回调模块」放到下一轮，登记为 followup（FU-84）。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：积分账本的真相本来就只在 Cos72 库里，内核无论如何都执行不了它；扩 gate 闭集是新的内核能力 + 新的保留路由 + SPEC 改动，要走单独一轮设计评审，不放在本轮。
 
-**Q4（范围）——Scheduler / Model / fired 进不进 SDK v0.1.0？** 按「两个真实调用方」规则：Events/Memory/Approval 两边都要；Scheduler 与 fired 的第二个调用方是 Python 黑盒与未来的 Node 模块，Cos72 只有在 ME4-5.3.4 想从模块侧验「读不到 Sin90 的 schedules」时才需要；Model 只有 Sin90。
-- (a) 五个客户端 + fired 全进（与 PLAN 一致）。理由：Scheduler/Model 的 wire 已被 ME4-S1/S2 冻结，SDK 这一层只是机械翻译，形状出错的风险低；T14 的 Rust 对照需要它们。
-- (b) Events/Memory/Approval + Scheduler + fired 进；Model 留在 Sin90，直到第二个用户出现（PLAN §三 与 5.1.2b 的验收要改）。
-- (c) 只进三件（Events/Memory/Approval），其余留 Sin90。
-- **推荐 (a)**。Cos72 是否申请 `scheduler` 由 5.3.1 定；若不申请，5.3.4 的 schedules 隔离从内核 REST 侧验。
+**Q4（范围，含 Q1）——Scheduler / Model / fired 进不进 SDK v0.1.0？** 按「两个真实调用方」规则：Events/Memory/Approval 两边都要；Scheduler 与 fired 的第二个调用方是 Python 黑盒与未来的 Node 模块，Cos72 只有在 ME4-5.3.4 想从模块侧验「读不到 Sin90 的 schedules」时才需要；Model 只有 Sin90。原选项：(a) 五个客户端 + fired 全进；(b) Model 留 Sin90；(c) 只进三件。
+- **决策**：方案 (a)。SDK v0.1.0 五种客户端（Events/Memory/Approval/Scheduler/Model）+ fired 全部进。Cos72 是否申请 `scheduler` 由 5.3.1 定；若不申请，5.3.4 的 schedules 隔离从内核 REST 侧验。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：Scheduler/Model 的 wire 已被 ME4-S1/S2 冻结，SDK 这一层只是机械翻译，形状出错的风险低；T14 的 Rust 对照需要它们。
 
-**Q5（架构）——`remember` 的幂等问题谁解？** Sin90 用「写前先 recall 翻最多 10 页找标记」绕开（`reconciler.rs:255-386`），Cos72 的摘要写入会遇到同一个问题。
-- (a) SDK 提供 `MemoryClient::remember_once(kind, body, dedup_marker, ...)`，把 Sin90 的翻页算法原样搬进来（含「翻不完就报错而不是当作不存在」）。
-- (b) 内核给 `remember` 加可选幂等键（如 `dedup_key`，同模块同键返回已有 id）——新的 wire 字段 + 存储唯一索引 + SPEC 改动，是本轮计划外的内核 task。
-- (c) 各模块自己写。
-- **推荐**：本轮 (a)，并登记 (b) 为下一轮 followup；(b) 落地后 `remember_once` 改走内核幂等键，签名不变。
+**Q5（架构）——`remember` 的幂等问题谁解？** Sin90 用「写前先 recall 翻最多 10 页找标记」绕开（`reconciler.rs:255-386`），Cos72 的摘要写入会遇到同一个问题。原选项：(a) SDK 提供 `MemoryClient::remember_once`，翻页算法原样搬进来；(b) 内核给 `remember` 加可选幂等键；(c) 各模块自己写。
+- **决策**：本轮方案 (a)。SDK 提供 `MemoryClient::remember_once(kind, body, dedup_marker, ...)`，把 Sin90 的翻页算法原样搬进来（含「翻不完就报错而不是当作不存在」）。方案 (b)「内核加幂等键」登记为下一轮 followup（FU-85）；落地后 `remember_once` 改走内核幂等键，SDK 侧签名不变。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：Cos72 的摘要写入会遇到与 Sin90 同样的「超时后重试写出两条」问题，本轮先用已验证过的翻页算法堵住；内核幂等键是新的 wire 字段 + 存储唯一索引 + SPEC 改动，是计划外的内核 task。
 
-**Q6（兼容策略）——`ClientError` 要不要 `#[non_exhaustive]`？**
-- (a) 不加：新增 kind = SDK 0.x minor 升级（0.x 下 minor 本就可破坏）；下游可以写无通配的穷举 match，漏处理新变体时**编译失败**——Sin90 `model.rs:166-188` 正是故意这样写的。
-- (b) 加：SDK 加变体不破坏下游编译，但下游必须写 `_ =>`，失去编译期提醒。
-- **推荐 (a)**（草图已按此）。
+**Q6（兼容策略）——`ClientError` 要不要 `#[non_exhaustive]`？** 原选项：(a) 不加；(b) 加。
+- **决策**：方案 (a)。不加 `#[non_exhaustive]`。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：新增 kind 属于 SDK 0.x minor 升级（0.x 下 minor 本就可破坏兼容）；下游可以写无通配的穷举 match，漏处理新变体时**编译失败**——Sin90 `model.rs:166-188` 正是故意这样写的，加 `#[non_exhaustive]` 会让下游必须写 `_ =>`，失去编译期提醒。
 
 **Q7（兼容策略）——SDK 在 `initialize` 声明的协议范围：`1..=1000`（Sin90 现状）还是 `1..=1`？** 内核取 `min(模块上限, 内核上限)`：声明 1000 时，将来的 v2 内核会跟只懂 v1 的模块「成功」协商成 v2。今天内核是 v1，两种写法行为相同。
-- **推荐 `1..=1`**（SDK 只声明它实现了的），新协议版本随 SDK 升级一起放开。Sin90 迁移后这是握手 params 里唯一有意的变化（§5.2 第 2 条单列）。
+- **决策**：`1..=1`。SDK 只声明它实际实现的范围，实现时常量写 1，不沿用 Sin90 现状的 1000。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：避免将来 v2 内核与只懂 v1 的 SDK「协商成功」讲 v2；新协议版本随 SDK 升级一起放开。Sin90 迁移后这是握手 params 里唯一有意的变化（§5.2 第 2 条单列）。
 
 **Q8（工程成本）——proto 要不要拆 `kernel` / `module` feature？** 不拆：Sin90/Cos72 编译时带上 `command-fds`、`close_fds`（精确钉版）、`rustix`、`hyper`、`agent24-domain`（`serde_yaml`、`schemars`）。拆：proto 22k 行要按 feature 划 `#[cfg]`，本轮工作量明显变大。
-- **推荐本轮不拆**，在 5.2.1 的 PR 里记录 Sin90 冷编译时间变化，登记 followup；若 Cos72 或第三方反馈成本不可接受再拆。
+- **决策**：本轮不拆。在 5.2.1 的 PR 里记录 Sin90 冷编译时间变化；登记为下一轮 followup（FU-86），若 Cos72 或第三方反馈成本不可接受再拆。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：22k 行的 crate 按 feature 划 `#[cfg]` 本轮工作量明显变大，且当前没有实测数据证明成本不可接受。
 
-**Q9（治理）——`agent24-os-sdk` 的 tag 由谁打、`0.1.x` 补丁怎么发？** PLAN 只写了 `agent24-os-sdk-v0.1.0`。建议：SDK tag 与 Agent24 版本 tag 独立，只在 SDK 或 proto `module` 有改动时打；每个 SDK tag 在 `CHANGELOG.md` 的独立小节列出对应的内核最低版本。v0.5.0 发布清单（ME4-6.0.1）要把这个 tag 列进去。需要用户确认「SDK 与 daemon 分开打 tag」这件事本身。
+**Q9（治理）——`agent24-os-sdk` 的 tag 由谁打、`0.1.x` 补丁怎么发？** PLAN 只写了 `agent24-os-sdk-v0.1.0`。
+- **决策**：SDK 与 Agent24（daemon）版本分开打 tag，只在 SDK 或 proto `module` 有改动时打；每个 SDK tag 在 `CHANGELOG.md` 的独立小节列出对应的内核最低版本；v0.5.0 发布清单（ME4-6.0.1）把这个 tag 列进去。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：SDK 与内核的演进节奏不同，绑在一起打 tag 会造成不必要的版本号跳动，也不利于下游按需锁定 SDK 版本。
 
-**Q10（架构）——库默认 `exit(70)` 可以吗？** 连接断了这一代就结束（无重连），Sin90 的做法是立刻退出让 supervisor 重启。
-- (a) SDK 默认同 Sin90（`warn!` + `exit(70)`），可用 `on_connection_lost` 覆盖。
-- (b) SDK 默认只记日志，让 `Module::serve` 返回错误、由 `main` 决定——代价是 serve 要同时盯连接存活，在途 HTTP 请求会被中断，且退出码变了。
-- **推荐 (a)**：零配置就是正确行为，覆盖口留给测试。
+**Q10（架构）——库默认 `exit(70)` 可以吗？** 连接断了这一代就结束（无重连），Sin90 的做法是立刻退出让 supervisor 重启。原选项：(a) 默认同 Sin90，可覆盖；(b) 默认只记日志、由 `main` 决定。
+- **决策**：方案 (a)。SDK 默认 `warn!` + `exit(70)`（Sin90 现状），可用 `on_connection_lost` 覆盖。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：零配置就是正确行为；方案 (b) 要 serve 同时盯连接存活、在途 HTTP 请求会被中断、退出码也会变，代价更大，覆盖口留给测试足够。
 
-**Q11（架构）——wire DTO 放两份（内核私有 + SDK）还是挪进 proto 共用？** 内核的 params 类型都在 agentd 里且大多私有（`memory_callback.rs:36-67` 等）。
-- (a) SDK 自己一份（请求严格、响应宽松），agentd 加对等测试钉住（J-S7）。
-- (b) 把请求/响应类型挪进 proto，内核与 SDK 共用——要改已冻结的 S1/S2/ME-3e 各 handler 的类型出处，改动面大、要再过评审。
-- **推荐 (a)**，唯一例外是 `FiredBody`（它原本就只是一个借用序列化结构，挪进 proto 成本极小，且方向是内核→模块，两边共用一份最省事）。
+**Q11（架构）——wire DTO 放两份（内核私有 + SDK）还是挪进 proto 共用？** 内核的 params 类型都在 agentd 里且大多私有（`memory_callback.rs:36-67` 等）。原选项：(a) SDK 自带一份 + agentd 对等测试；(b) 挪进 proto 共用。
+- **决策**：方案 (a)。SDK 自带一份 wire 类型（请求严格、响应宽松），agentd 加对等测试钉住（J-S7）；唯一例外是 `FiredBody`，挪进 `agent24_os_proto::kernel_call`，内核与 SDK 共用一份。
+- 拍板人：jason。日期：2026-09-26。
+- 理由：内核 params 类型已被 S1/S2/ME-3e 冻结，把它们全挪进 proto 改动面大、要再过一轮评审；`FiredBody` 本来就只是一个借用序列化结构，挪动成本极小，且方向单一（内核→模块），两边共用一份最省事。
 
 ---
 
@@ -596,11 +603,16 @@ PLAN 里的 5.1.2a/b/c 三个 PR 装不下：盘点后「非测试代码」大�
 
 ---
 
-## 10. 待登记的 followups（本分支不改 `followups.md`；由统筹在规划分支登记编号）
+## 10. followups
 
-- 内核 `remember` 幂等键（§8 Q5 (b)）。
-- 审批裁决回推（§8 Q3 (b)）。
-- proto `kernel`/`module` feature 拆分（§8 Q8）。
+**已登记（2026-09-26，jason 拍板后本分支直接登记进 `docs/agent/followups.md`）：**
+
+- **FU-84** 审批裁决回推（§8 Q3 (b)：gate 扩展为「内核批准后回调模块」的可执行动作）。
+- **FU-85** 内核 `remember` 幂等键（§8 Q5 (b)）。
+- **FU-86** proto `kernel`/`module` feature 拆分（§8 Q8）。
+
+**尚未登记（不在本次三条 followup 范围内，留待后续统筹处理）：**
+
 - Sin90 的 reconciler 是否改用 `retry_class`（`Cancelled` 分类差异，§2.6）。
 - 本文评审若仍是 Tier 2（Opus 子代理），记 `ME4-CODEX-DEBT`，额度恢复后补 Codex 一轮。
 
@@ -757,7 +769,7 @@ pub mod module {
     }
 
     /// Adopt `A24_LISTEN_FD` as a listener axum can serve on. The ONE place
-    /// an fd number becomes a socket (needs the unsafe decision, §8 Q2).
+    /// an fd number becomes a socket (unsafe lives in `agent24-os-fd`, §8 Q2).
     pub fn listener_from_env(env: &ModuleEnv) -> std::io::Result<tokio::net::UnixListener> { … }
 }
 ```

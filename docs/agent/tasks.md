@@ -50,17 +50,22 @@
 | ME4-4.2.3b | Agent24 | 用量 recorder + `/api/v1/usage?module=` + serve 换 sink | 4.2.3a | `DONE` | #510（用量写者 UsageRecorder）→ #511（GET /api/v1/usage?module=）全部合并于 2026-09-26 |
 | ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `PR_OPEN` | #512（Opus 本地评审 2 轮：CHANGES → APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-7） |
 | ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `BACKLOG` | |
-| ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `BACKLOG` | |
-| ME4-5.1.2a | Agent24 | SDK transport + 握手（只经 proto）+ 结构测试 | 5.1.1 | `BACKLOG` | |
-| ME4-5.1.2b | Agent24 | SDK 五种类型化客户端 | 5.1.2a | `BACKLOG` | |
-| ME4-5.1.2c | Agent24 | fired 注册点 + example + tag + 探针 `4c` | 5.1.2b | `BACKLOG` | |
-| ME4-5.2.1 | Sin90 | Sin90 迁到 SDK（Sin90 TS.1.1） | 5.1.2c | `BACKLOG` | |
-| ME4-5.3.1 | Cos72 | Cos72 仓库 pilot 七件套 | 5.1.2c | `BACKLOG` | |
+| ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `IN_PROGRESS` | 设计 v1（`docs/design/ME4-S3-os-sdk.md`）：jason 2026-09-26 拍板 Q1–Q11，开放问题章节改为已拍板决策，待送评审（Codex/Opus）冻结 |
+| ME4-5.1.2a1 | Agent24 | proto `module`：`ModuleEnv`/`Hello`/`manifest_digest` 公开、`connect_from_env` 握手部分（先返回只能 `offer()` 的连接）、`manifest` 转出、`FiredBody` 挪进 `kernel_call`；J-S11、J-S12 | 5.1.1 | `BACKLOG` | |
+| ME4-5.1.2a2 | Agent24 | proto `Connection` 多路复用（移植 Sin90 transport）+ `test-util` 假内核；J-S8、J-S9 前半 | 5.1.2a1 | `BACKLOG` | |
+| ME4-5.1.2a3 | Agent24 | `listener_from_env`（独立小 crate `agent24-os-fd`，§8 Q2 拍板）+ SDK crate 骨架 + CI；J-S1、J-S2、J-S3 | 5.1.2a2 | `BACKLOG` | |
+| ME4-5.1.2b1 | Agent24 | `ClientError`/`RetryClass`/映射、`RequestContext`、客户端公共 `Core`；J-S4 | 5.1.2a3 | `BACKLOG` | |
+| ME4-5.1.2b2 | Agent24 | Events（含 sink）/ Memory（含 `remember_once` 去重助手，§8 Q5 拍板，另一个约 120 行 + 测试的子 PR）/ Approval；J-S5、J-S6 对应部分 | 5.1.2b1 | `BACKLOG` | |
+| ME4-5.1.2b3 | Agent24 | Scheduler / Model（§8 Q4 拍板：五种客户端全进 v0.1.0）+ agentd 侧 wire 对等测试；J-S5/J-S6 其余、J-S7、J-S9 后半 | 5.1.2b2 | `BACKLOG` | |
+| ME4-5.1.2c1 | Agent24 | fired 提取器与 `with_fired` 注册点；J-S10 | 5.1.2b3 | `BACKLOG` | |
+| ME4-5.1.2c2 | Agent24 | `examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + tag `agent24-os-sdk-v0.1.0`；J-S13、J-S14 | 5.1.2c1 | `BACKLOG` | |
+| ME4-5.2.1 | Sin90 | Sin90 迁到 SDK（Sin90 TS.1.1） | 5.1.2c2 | `BACKLOG` | 前置 Sin90 TS.1.0（迁移前用假内核夹具给每条打内核的业务路径录一份线协议金样；迁移后逐条比对相等，见 ME4-S3-os-sdk.md §5.1/§5.2） |
+| ME4-5.3.1 | Cos72 | Cos72 仓库 pilot 七件套 | 5.1.2c2 | `BACKLOG` | |
 | ME4-5.3.2 | Cos72 | 骨架（manifest + SDK 挂载 + 迁移 + 事件） | 5.3.1 | `BACKLOG` | |
 | ME4-5.3.3a | Cos72 | mytask 实体与路由 | 5.3.2 | `BACKLOG` | |
 | ME4-5.3.3b | Cos72 | 审批发积分 + 账本回放 + 摘要进记忆 | 5.3.3a | `BACKLOG` | |
 | ME4-5.3.4 | Cos72 | Cos72 真实挂载黑盒（含与 Sin90 共存隔离） | 5.3.3b, 5.2.1 | `BACKLOG` | |
-| ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2c | `BACKLOG` | |
+| ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2c2 | `BACKLOG` | |
 | ME4-6.0.1 | Agent24 | 冻结 v0.5.0 专用发布清单 | 5.3.4, 5.4.1 | `BACKLOG` | |
 | ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `BACKLOG` | |
 | ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `BACKLOG` | |

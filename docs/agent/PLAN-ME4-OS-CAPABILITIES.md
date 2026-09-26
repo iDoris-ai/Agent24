@@ -300,9 +300,16 @@ Sin90 `F5.0 设计补丁（新 Op 先进 DESIGN §2，送对抗评审）` → `F
 
 **ME4-5.1.1 SDK 设计冻结：`docs/design/ME4-S3-os-sdk.md`** —— 从 Sin90 adapter（T3.2.0 transport + 五种客户端 + fired）与黑盒 Python 模块逐行对照提取 API（规范 S3）。依赖：ME4-M4b 门。
 
-**ME4-5.1.2a SDK transport + 握手**（只经 proto）+ S3 第 1 条的结构测试。
-**ME4-5.1.2b 五种类型化客户端**（Events/Memory/Approval/Scheduler/Model）+ 单测。
-**ME4-5.1.2c fired 注册点 + `examples/minimal.rs` + 挂载冒烟 + tag `agent24-os-sdk-v0.1.0` + 探针 `4c SDK`**。
+**ME4-5.1.2a/b/c 按 ME4-S3 §7（2026-09-26 jason 拍板，Q1–Q11 全部裁决后）拆成 8 个 stacked PR，每个 ≤ 300 行非测试代码：**
+
+- **ME4-5.1.2a1** proto `module`：`ModuleEnv`、`Hello`、`manifest_digest` 公开、`connect_from_env` 的握手部分（先返回一个只能 `offer()` 的连接）、`manifest` 转出、`FiredBody` 挪进 `kernel_call` 并让 agentd 改用；判据 J-S11、J-S12。依赖：ME4-5.1.1 评审通过（冻结）。
+- **ME4-5.1.2a2** proto `Connection` 多路复用（移植 Sin90 transport）+ `test-util` 假内核；判据 J-S8、J-S9 前半。依赖：a1。
+- **ME4-5.1.2a3** `listener_from_env`（按 §8 Q2 拍板：独立小 crate `agent24-os-fd` 唯一持有 `unsafe`）+ SDK crate 骨架（`Cargo.toml`、`clippy.toml`、`positive-control`、`Module`/`ModuleBuilder`/`SdkError`/`serve`）+ CI 步骤；判据 J-S1、J-S2、J-S3。依赖：a2。
+- **ME4-5.1.2b1** `ClientError`/`RetryClass`/映射、`RequestContext`、客户端公共 `Core`；判据 J-S4。依赖：a3。
+- **ME4-5.1.2b2** Events（含 sink）/ Memory（含 §8 Q5 拍板的 `remember_once` 去重助手，另开一个约 120 行 + 测试的子 PR，紧跟 b2 之后）/ Approval；判据 J-S5、J-S6 的对应部分。依赖：b1。
+- **ME4-5.1.2b3** Scheduler / Model（按 §8 Q4 拍板：五种客户端全进 v0.1.0）+ agentd 侧 wire 对等测试；判据 J-S5/J-S6 其余、J-S7、J-S9 后半。依赖：b2（含 remember_once 子 PR）。
+- **ME4-5.1.2c1** fired 提取器与 `with_fired`；判据 J-S10。依赖：b3。
+- **ME4-5.1.2c2** `examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + tag `agent24-os-sdk-v0.1.0`；判据 J-S13、J-S14。依赖：c1。
 - 验收：`cargo +1.98.0 test -p agent24-os-sdk`；S3 第 1 条的 clippy `disallowed-types` 判据（含正对照）；`examples/minimal` 挂载冒烟通过；`git ls-remote --tags origin agent24-os-sdk-v0.1.0` 非空。
 
 **ME4-5.2.1 Sin90 迁到 SDK**（Sin90 `TS.1.1`）—— `src/adapter_agent24/` 净减；Sin90 真实挂载黑盒（M3/M4/M5 全部判据）不变全绿。
