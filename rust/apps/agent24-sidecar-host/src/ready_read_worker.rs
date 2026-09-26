@@ -81,17 +81,33 @@ impl ReadyReadWorker {
     /// created.
     #[cfg(unix)]
     pub(crate) fn from_native_stdout(stdout: NativeStdout) -> Result<Self, WorkerSlotError> {
-        Self::new_in(WorkerSlots::host(), stdout)
+        Self::from_native_stdout_in(WorkerSlots::host(), stdout)
     }
 
     #[cfg(windows)]
     pub(crate) fn from_native_stdout(stdout: NativeStdout) -> Result<Self, WorkerSlotError> {
+        Self::from_native_stdout_in(WorkerSlots::host(), stdout)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn from_native_stdout_in(
+        slots: &'static WorkerSlots,
+        stdout: NativeStdout,
+    ) -> Result<Self, WorkerSlotError> {
+        Self::new_in(slots, stdout)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_native_stdout_in(
+        slots: &'static WorkerSlots,
+        stdout: NativeStdout,
+    ) -> Result<Self, WorkerSlotError> {
         let file = std::fs::File::from(
             stdout
                 .into_owned_handle()
                 .map_err(|error| WorkerSlotError::Spawn(error.kind()))?,
         );
-        Self::new_in(WorkerSlots::host(), file)
+        Self::new_in(slots, file)
     }
 
     pub(crate) fn new_in<R: Read + Send + 'static>(

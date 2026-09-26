@@ -19,6 +19,8 @@ mod launch;
 #[allow(dead_code)]
 mod launch_order;
 #[allow(dead_code)]
+mod native_generation;
+#[allow(dead_code)]
 mod outbox;
 #[allow(dead_code)]
 mod output_io;
