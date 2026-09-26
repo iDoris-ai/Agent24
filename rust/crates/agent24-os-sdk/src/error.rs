@@ -233,40 +233,57 @@ mod tests {
         })
     }
 
-    type KindCheck = (&'static str, fn(ClientError) -> bool);
+    /// Nit (external review of #516): driven from `agent24_os_proto::rpc::
+    /// ErrorKind::ALL` — the source of truth for "the 18 kernel kinds" this
+    /// module's doc comment and `From<CallError>` both reference — instead
+    /// of a hand-copied array of kind strings, so a kind ADDED to `ALL`
+    /// without a mapping decision here fails this test instead of silently
+    /// going untested. Each arm's comment mirrors this module's top-level
+    /// doc comment for why that kind maps where it does.
+    fn expected_check(kind: agent24_os_proto::rpc::ErrorKind) -> fn(ClientError) -> bool {
+        use agent24_os_proto::rpc::ErrorKind;
+        match kind {
+            ErrorKind::Forbidden => |e| matches!(e, ClientError::Forbidden(_)),
+            ErrorKind::Busy => |e| matches!(e, ClientError::Busy(_)),
+            ErrorKind::Cancelled => |e| matches!(e, ClientError::Cancelled),
+            ErrorKind::Timeout => |e| matches!(e, ClientError::Timeout(_)),
+            ErrorKind::QuotaExceeded => |e| matches!(e, ClientError::QuotaExceeded(_)),
+            // No client here ever sends the shapes that provoke these three,
+            // and the handshake-only pair below is never seen on an ordinary
+            // call — both fall to `Other` (module doc comment, L4 "don't
+            // guess").
+            ErrorKind::InvalidLease
+            | ErrorKind::UnknownCapability
+            | ErrorKind::VersionMismatch
+            | ErrorKind::AuthFailed
+            | ErrorKind::ManifestMismatch => |e| matches!(e, ClientError::Other(_)),
+            ErrorKind::NotReady => |e| matches!(e, ClientError::NotReady(_)),
+            ErrorKind::Draining => |e| matches!(e, ClientError::Draining(_)),
+            ErrorKind::Revoked => |e| matches!(e, ClientError::Revoked(_)),
+            ErrorKind::RateLimited => |e| matches!(e, ClientError::RateLimited(_)),
+            ErrorKind::PayloadTooLarge => |e| matches!(e, ClientError::PayloadTooLarge(_)),
+            ErrorKind::TokenInvalid => |e| matches!(e, ClientError::TokenInvalid(_)),
+            ErrorKind::NotFound => |e| matches!(e, ClientError::NotFound(_)),
+            // No `cause`/`retryable` data on this bare call:
+            // `unavailable_from_data` documents that as falling to `Other`
+            // rather than guessing; the WITH-data cases are covered
+            // separately by `unavailable_needs_both_cause_and_retryable_else_other`.
+            ErrorKind::Unavailable => |e| matches!(e, ClientError::Other(_)),
+        }
+    }
 
     // J-S4: every one of the 18 kernel kinds maps somewhere sane, plus the
     // three non-kind special cases.
     #[test]
     fn all_eighteen_kernel_kinds_map_to_a_documented_variant() {
-        let cases: &[KindCheck] = &[
-            ("forbidden", |e| matches!(e, ClientError::Forbidden(_))),
-            ("busy", |e| matches!(e, ClientError::Busy(_))),
-            ("cancelled", |e| matches!(e, ClientError::Cancelled)),
-            ("timeout", |e| matches!(e, ClientError::Timeout(_))),
-            ("quota_exceeded", |e| {
-                matches!(e, ClientError::QuotaExceeded(_))
-            }),
-            ("invalid_lease", |e| matches!(e, ClientError::Other(_))),
-            ("unknown_capability", |e| matches!(e, ClientError::Other(_))),
-            ("version_mismatch", |e| matches!(e, ClientError::Other(_))),
-            ("auth_failed", |e| matches!(e, ClientError::Other(_))),
-            ("manifest_mismatch", |e| matches!(e, ClientError::Other(_))),
-            ("not_ready", |e| matches!(e, ClientError::NotReady(_))),
-            ("draining", |e| matches!(e, ClientError::Draining(_))),
-            ("revoked", |e| matches!(e, ClientError::Revoked(_))),
-            ("rate_limited", |e| matches!(e, ClientError::RateLimited(_))),
-            ("payload_too_large", |e| {
-                matches!(e, ClientError::PayloadTooLarge(_))
-            }),
-            ("token_invalid", |e| {
-                matches!(e, ClientError::TokenInvalid(_))
-            }),
-            ("not_found", |e| matches!(e, ClientError::NotFound(_))),
-        ];
-        for (kind, check) in cases {
-            let mapped = ClientError::from(rpc(-32000, Some(kind), None));
-            assert!(check(mapped.clone()), "kind {kind} mapped to {mapped:?}");
+        for kind in agent24_os_proto::rpc::ErrorKind::ALL {
+            let mapped = ClientError::from(rpc(-32000, Some(kind.as_str()), None));
+            let check = expected_check(kind);
+            assert!(
+                check(mapped.clone()),
+                "kind {} mapped to {mapped:?}",
+                kind.as_str()
+            );
         }
     }
 
