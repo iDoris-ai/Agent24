@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use axum::body::Bytes;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
+use serde::{Deserialize, Serialize};
 
 use crate::drain::{Abandoned, Generation, InFlight, RequestRefused, sha256};
 use crate::proxy::{self, ExchangeError, IdleConnections};
@@ -90,6 +91,25 @@ pub struct KernelLimits {
 #[derive(Debug)]
 pub struct KernelResponse {
     pub status: StatusCode,
+}
+
+/// ME4-S3 §2.5/§4.4 (M7): the body of `POST /api/v1/<ns>/_a24/scheduler/
+/// fired` — moved here (owned) from `agent24d::scheduler_deliver`'s private
+/// borrowed `FiredBody<'a>` so the kernel (this module, serializing) and the
+/// SDK's `fired` extractor (deserializing) share one type instead of two
+/// independently-maintained mirrors. `deny_unknown_fields`: unlike a call
+/// RESPONSE (§2.4's "responses are lenient" rule doesn't apply here — this is
+/// the kernel-originated REQUEST body on the reverse channel), the kernel
+/// controls both ends of this shape and a drifting field should fail loudly
+/// rather than be silently dropped by an older SDK.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FiredBody {
+    pub key: String,
+    /// `"tick"` | `"run_now"`.
+    pub trigger: String,
+    pub scheduled_for: String,
+    pub fired_at: String,
 }
 
 /// Every way [`send_kernel_request`] did not produce a response. The split

@@ -670,6 +670,90 @@ mod tests {
             err.message
         );
     }
+
+    // ── J-S7: SDK wire parity (ME4-S3 §6) ───────────────────────────────
+    //
+    // The SDK's `MemoryClient` runs against `agent24_os_sdk::testing::
+    // fake_kernel`; the fake kernel's peer hands the raw params straight to
+    // THIS module's real `RememberHandler`/`RecallHandler::call` (the same
+    // construction `granted_entitlement` gives the tests above), and the
+    // handler's own result is fed back for the SDK to parse.
+
+    async fn respond_rpc_result(
+        peer: &mut agent24_os_sdk::testing::FakePeer,
+        req: &Value,
+        result: Result<Value, RpcError>,
+    ) {
+        match result {
+            Ok(v) => agent24_os_sdk::testing::respond(peer, req, v).await,
+            Err(e) => {
+                let mut data = e.data.clone().unwrap_or_default();
+                if let Some(kind) = e.kind {
+                    data.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+                }
+                if data.is_empty() {
+                    agent24_os_sdk::testing::respond_error(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        "",
+                        &e.message,
+                    )
+                    .await;
+                } else {
+                    agent24_os_sdk::testing::respond_error_with_data(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        &e.message,
+                        Value::Object(data),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_wire_parity_memory_remember_then_recall() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let entitlement = granted_entitlement(&kv, "alice", "sin90").await;
+        let remember_handler = RememberHandler {
+            generation: running_generation(),
+            entitlement: entitlement.clone(),
+        };
+        let recall_handler = RecallHandler {
+            generation: running_generation(),
+            entitlement,
+        };
+
+        let (conn, mut peer) =
+            agent24_os_sdk::testing::fake_kernel(vec!["_a24/memory/private/".to_owned()]).await;
+        let client = agent24_os_sdk::MemoryClient::new(&conn).expect("offer covers memory");
+        let mut body = Map::new();
+        body.insert("text".to_owned(), json!("hello from the SDK"));
+        let request_id = agent24_os_sdk::RequestId::for_test("req-1");
+
+        let (remembered, ()) =
+            tokio::join!(client.remember("note", body, Some(&request_id)), async {
+                let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+                let result = remember_handler.call(req["params"].clone()).await;
+                respond_rpc_result(&mut peer, &req, result).await;
+            });
+        let remembered = remembered.expect("SDK remember must succeed against the real handler");
+
+        let (recalled, ()) =
+            tokio::join!(client.recall("hello", 10, None, Some(&request_id)), async {
+                let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+                let result = recall_handler.call(req["params"].clone()).await;
+                respond_rpc_result(&mut peer, &req, result).await;
+            });
+        let page = recalled.expect("SDK recall must succeed against the real handler");
+        assert!(
+            page.items.iter().any(|it| it.id == remembered.id),
+            "the memory just written must be recallable through the same real handler"
+        );
+    }
 }
 
 #[cfg(test)]

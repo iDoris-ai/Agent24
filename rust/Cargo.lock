@@ -161,6 +161,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-os-sdk"
+version = "0.1.0"
+dependencies = [
+ "agent24-os-proto",
+ "agent24-os-sdk",
+ "axum",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "agent24-policy"
 version = "0.3.0"
 dependencies = [
@@ -272,6 +287,7 @@ dependencies = [
  "agent24-models",
  "agent24-os-packages",
  "agent24-os-proto",
+ "agent24-os-sdk",
  "agent24-policy",
  "agent24-protocol",
  "agent24-scheduler",
