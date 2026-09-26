@@ -1087,4 +1087,79 @@ mod tests {
             "check_params runs before call(): forbidden never gets a chance to fire"
         );
     }
+
+    // ── J-S7: SDK wire parity (ME4-S3 §6) ───────────────────────────────
+    //
+    // The SDK's `EventsClient` runs against `agent24_os_sdk::testing::
+    // fake_kernel`; the fake kernel's peer hands the raw params straight to
+    // THIS module's real `EventsEmitHandler::call` (the same fixture the
+    // tests above use), and the handler's own result is fed back for the
+    // SDK to parse. Proves the SDK's wire shape and this handler's
+    // `deny_unknown_fields` params agree with each other, not just with a
+    // hand-written `json!` literal.
+
+    /// Feeds a handler's `Result<Value, RpcError>` back to a fake-kernel
+    /// peer exactly as the real wire would encode it (`RpcError::to_json`'s
+    /// own shape: `data.kind` merged alongside any other `data` fields).
+    async fn respond_rpc_result(
+        peer: &mut agent24_os_sdk::testing::FakePeer,
+        req: &Value,
+        result: Result<Value, RpcError>,
+    ) {
+        match result {
+            Ok(v) => agent24_os_sdk::testing::respond(peer, req, v).await,
+            Err(e) => {
+                let mut data = e.data.clone().unwrap_or_default();
+                if let Some(kind) = e.kind {
+                    data.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+                }
+                if data.is_empty() {
+                    agent24_os_sdk::testing::respond_error(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        "",
+                        &e.message,
+                    )
+                    .await;
+                } else {
+                    agent24_os_sdk::testing::respond_error_with_data(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        &e.message,
+                        Value::Object(data),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_wire_parity_events_emit() {
+        let (bus, sink) = events("probe");
+        let h = handler(running_generation(), true, Some(sink), generous_limiter());
+        let (conn, mut peer) =
+            agent24_os_sdk::testing::fake_kernel(vec!["_a24/events/".to_owned()]).await;
+        let client = agent24_os_sdk::EventsClient::new(&conn).expect("offer covers events");
+        let mut payload = Map::new();
+        payload.insert("x".to_owned(), json!(1));
+        let request_id = agent24_os_sdk::RequestId::for_test("req-1");
+
+        let (outcome, ()) = tokio::join!(
+            client.emit("task.transitioned", payload, Some(&request_id)),
+            async {
+                let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+                let result = h.call(req["params"].clone()).await;
+                respond_rpc_result(&mut peer, &req, result).await;
+            }
+        );
+        outcome.expect("SDK call must succeed against the real handler");
+        assert_eq!(
+            module_events(&bus).len(),
+            1,
+            "the handler must have actually run"
+        );
+    }
 }

@@ -1814,4 +1814,76 @@ mod handler_tests {
             Some(ErrorKind::Forbidden)
         );
     }
+
+    // ── J-S7: SDK wire parity (ME4-S3 §6) ───────────────────────────────
+    //
+    // The SDK's `ModelClient` runs against `agent24_os_sdk::testing::
+    // fake_kernel`; the fake kernel's peer hands the raw params straight to
+    // THIS module's real `ModelCompleteHandler::call` (the same fixture the
+    // tests above use, over a local-tier stub provider), and the handler's
+    // own result is fed back for the SDK to parse.
+
+    async fn respond_rpc_result(
+        peer: &mut agent24_os_sdk::testing::FakePeer,
+        req: &Value,
+        result: Result<Value, RpcError>,
+    ) {
+        match result {
+            Ok(v) => agent24_os_sdk::testing::respond(peer, req, v).await,
+            Err(e) => {
+                let mut data = e.data.clone().unwrap_or_default();
+                if let Some(kind) = e.kind {
+                    data.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+                }
+                if data.is_empty() {
+                    agent24_os_sdk::testing::respond_error(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        "",
+                        &e.message,
+                    )
+                    .await;
+                } else {
+                    agent24_os_sdk::testing::respond_error_with_data(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        &e.message,
+                        Value::Object(data),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_wire_parity_model_complete() {
+        let local = stub("l", Behave::Ok);
+        let (d, _sink) = deps(router(vec![(local, Tier::Local)]));
+        let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
+
+        let (conn, mut peer) =
+            agent24_os_sdk::testing::fake_kernel(vec!["_a24/model/".to_owned()]).await;
+        let client = agent24_os_sdk::ModelClient::new(&conn).expect("offer covers model");
+        let req = agent24_os_sdk::CompleteRequest {
+            messages: vec![agent24_os_sdk::ModelMessage {
+                role: agent24_os_sdk::ModelRole::User,
+                content: "hi".to_owned(),
+            }],
+            response_format: None,
+            max_tokens: None,
+            complexity: None,
+        };
+
+        let (result, ()) = tokio::join!(client.complete(&req, None), async {
+            let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+            let result = h.call(req["params"].clone()).await;
+            respond_rpc_result(&mut peer, &req, result).await;
+        });
+        let result = result.expect("SDK complete must succeed against the real handler");
+        assert_eq!(result.text, "ok");
+        assert_eq!(result.tier, agent24_os_sdk::ServedTier::Local);
+    }
 }

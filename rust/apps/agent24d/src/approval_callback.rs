@@ -712,4 +712,104 @@ mod tests {
         let err = h.call(params).await.unwrap_err();
         assert_eq!(err.kind, Some(ErrorKind::Forbidden));
     }
+
+    // ── J-S7: SDK wire parity (ME4-S3 §6) ───────────────────────────────
+    //
+    // The SDK's `ApprovalClient` runs against `agent24_os_sdk::testing::
+    // fake_kernel`; the fake kernel's peer hands the raw params straight to
+    // THIS module's real `ApprovalSubmitHandler::call` (the same fixture
+    // `submit_handler` gives the tests above), and the handler's own result
+    // is fed back for the SDK to parse.
+
+    async fn respond_rpc_result(
+        peer: &mut agent24_os_sdk::testing::FakePeer,
+        req: &Value,
+        result: Result<Value, RpcError>,
+    ) {
+        match result {
+            Ok(v) => agent24_os_sdk::testing::respond(peer, req, v).await,
+            Err(e) => {
+                let mut data = e.data.clone().unwrap_or_default();
+                if let Some(kind) = e.kind {
+                    data.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+                }
+                if data.is_empty() {
+                    agent24_os_sdk::testing::respond_error(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        "",
+                        &e.message,
+                    )
+                    .await;
+                } else {
+                    agent24_os_sdk::testing::respond_error_with_data(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        &e.message,
+                        Value::Object(data),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Test-only construction of an `agent24_os_sdk::ApprovalToken` — the
+    /// SDK's normal API has none; it only ever comes off a proxied request's
+    /// headers.
+    fn approval_token_for_test(token: &str) -> agent24_os_sdk::ApprovalToken {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            agent24_os_proto::proxy::APPROVAL_TOKEN_HEADER,
+            axum::http::HeaderValue::from_str(token).unwrap(),
+        );
+        agent24_os_sdk::RequestContext::from_headers(&headers)
+            .approval_token
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sdk_wire_parity_approval_advise_then_status() {
+        let broker = test_broker().await;
+        let (g, _in_flight) = generation_with_good_params_admitted();
+        let advise_handler = submit_handler(g, true, ModuleApprovalKind::Advise, broker.clone());
+        let status_handler = status_handler(true, broker.clone());
+
+        let (conn, mut peer) =
+            agent24_os_sdk::testing::fake_kernel(vec!["_a24/approval/".to_owned()]).await;
+        let client = agent24_os_sdk::ApprovalClient::new(&conn).expect("offer covers approval");
+        let request_id = agent24_os_sdk::RequestId::for_test("req-1");
+        let token = approval_token_for_test("secret-1");
+        let submit = agent24_os_sdk::ApprovalSubmit {
+            action: "send_email",
+            target: Some("ops@example.com"),
+            payload: json!({"body": "hi"}),
+            request_id: &request_id,
+            approval_token: &token,
+        };
+
+        let (answer, ()) = tokio::join!(client.advise(&submit), async {
+            let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+            let result = advise_handler.call(req["params"].clone()).await;
+            respond_rpc_result(&mut peer, &req, result).await;
+        });
+        let answer = answer.expect("SDK advise must succeed against the real handler");
+        assert_eq!(answer.decision, agent24_os_sdk::ApprovalDecision::Pending);
+        assert_eq!(answer.kind, agent24_os_sdk::ApprovalKind::Advise);
+
+        let approval_id = answer.approval_id.clone();
+        let (looked_up, ()) = tokio::join!(client.status(&approval_id), async {
+            let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+            let result = status_handler.call(req["params"].clone()).await;
+            respond_rpc_result(&mut peer, &req, result).await;
+        });
+        let looked_up = looked_up.expect("SDK status must succeed against the real handler");
+        assert_eq!(looked_up.approval_id, answer.approval_id);
+        assert_eq!(
+            looked_up.decision,
+            agent24_os_sdk::ApprovalDecision::Pending
+        );
+    }
 }
