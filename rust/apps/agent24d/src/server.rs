@@ -2320,6 +2320,40 @@ pub(crate) mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn capability_state() -> (AppState, String, String) {
+        let mut state = state().await;
+        let now = crate::capabilities::unix_now();
+        let store = crate::capabilities::CapabilityStore::new("daemon-test");
+        let host = store
+            .mint_product_host("host-test", Duration::from_secs(3_600), now)
+            .unwrap();
+        let (host_bearer, _, _) = host.into_bearer_parts();
+        let host_authorization = store
+            .validate_bearer(
+                &host_bearer,
+                crate::capabilities::Operation::ModelsRead,
+                &crate::capabilities::Resource::global(),
+                now,
+            )
+            .unwrap();
+        let creative = store
+            .mint_creative_authorized(
+                &host_authorization,
+                crate::capabilities::CreativeMintRequest::new(
+                    "workspace-test",
+                    "attachment-test",
+                    "principal-test",
+                    "sidecar-test",
+                    Duration::from_secs(300),
+                    now,
+                ),
+            )
+            .unwrap();
+        let (creative_bearer, _, _) = creative.into_bearer_parts();
+        state.enable_capability_auth(store);
+        (state, host_bearer, creative_bearer)
+    }
+
     #[tokio::test]
     async fn health_needs_no_token() {
         let res = build_router(state().await)
@@ -2692,6 +2726,127 @@ pub(crate) mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let json = body_json(res).await;
         assert_eq!(json["error"]["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn creative_is_default_denied_except_for_models() {
+        let (state, _, creative) = capability_state().await;
+        let router = build_router(state);
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+
+        for (method, path) in [
+            ("POST", "/api/v1/chat"),
+            ("GET", "/api/v1/sessions"),
+            ("POST", "/api/v1/runs"),
+            ("GET", "/api/v1/events"),
+            ("GET", "/api/v1/approvals"),
+            ("GET", "/api/v1/tools"),
+            ("POST", "/api/v1/shutdown"),
+            ("GET", "/api/v1/future-unregistered-route"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {creative}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_can_mint_and_idempotently_revoke_creative_authority() {
+        let (state, host, existing_creative) = capability_state().await;
+        let router = build_router(state);
+
+        let creative_mint_attempt = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/capabilities/creative")
+                    .header("Authorization", format!("Bearer {existing_creative}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(creative_mint_attempt.status(), StatusCode::FORBIDDEN);
+
+        let minted = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/capabilities/creative")
+                    .header("Authorization", format!("Bearer {host}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspace_id": "workspace-new",
+                            "creative_attachment_id": "attachment-new",
+                            "creative_principal_id": "principal-new",
+                            "sidecar_generation": "sidecar-new",
+                            "ttl_seconds": 60,
+                            "allowed_operations": ["models.read"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(minted.status(), StatusCode::CREATED);
+        let minted = body_json(minted).await;
+        let id = minted["capability_id"].as_str().unwrap();
+        let token = minted["token"].as_str().unwrap();
+
+        for _ in 0..2 {
+            let revoked = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/capabilities/{id}/revoke"))
+                        .header("Authorization", format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(revoked.status(), StatusCode::OK);
+            assert_eq!(body_json(revoked).await["state"], "revoked");
+        }
+
+        let rejected = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
