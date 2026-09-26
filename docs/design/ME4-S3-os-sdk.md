@@ -1,14 +1,16 @@
 # ME4-S3 —— `agent24-os-sdk` 设计（ME4-5.1.1：从两个调用方提取）
 
-> **状态：v2（按第 1 轮对抗评审修订，待复审），2026-09-26。** v1 经 Tier-2 对抗评审（全新上下文 Opus 子代理；Codex 额度耗尽期间，记 ME4-CODEX-DEBT-8）结论 **CHANGES**：5 High / 10 Medium / 11 Low。v2 逐条处置，处置表见 §11；除 L6（删 `notify`）、M5（删 `retry_class`）两条按提取原则做了内容取舍外，全部在 §8 已拍板决策的框架内修。**仍未冻结**：按 PLAN-ME4 §一 第 2 条，复审到 APPROVE 才冻结，冻结前不写 SDK 代码。
+> **状态：v3（按第 2 轮复审修订，待再审），2026-09-26。** v1 经 Tier-2 对抗评审（全新上下文 Opus 子代理；Codex 额度耗尽期间，记 ME4-CODEX-DEBT-8）结论 **CHANGES**：5 High / 10 Medium / 11 Low，v2 逐条处置（§11.1）。v2 复审（同为 Tier-2 Opus）结论仍为 **CHANGES**：2 High / 5 Medium / 5 Low，v3 逐条处置（§11.2）。除 L6（删 `notify`）、M5（删 `retry_class`）两条按提取原则做了内容取舍外，全部在 §8 已拍板决策的框架内修。**仍未冻结**：按 PLAN-ME4 §一 第 2 条，复审到 APPROVE 才冻结，冻结前不写 SDK 代码。
 > 文件名按 PLAN-ME4 §三 ME4-5.1.1 的原文取 `ME4-S3-os-sdk.md`（S3 = PLAN §二 的「S3 `agent24-os-sdk`」；`S5` 是 T14 wire 文档那一节，不用这个编号，免得撞名）。
 >
 > **盘点基线**：
-> - Agent24 `origin/main` @ `309d525`（本 worktree `docs/me4-5.1.1-sdk-design`）。
+> - Agent24 `origin/main` @ `309d525`（v0–v2 盘点时）；v3 已 rebase 到 `bb3505a`（含 #512 ME4-4.3.1、#513 台账回填），本文引用的 agentd/proto 行号在这两个提交之间未变（#512 只加测试与探针）。
 > - Sin90 `origin/main` @ `135ddb7`（`T5.5.1 M5 real-mount acceptance`，即 ME4-M4b 门的最后一个 task）。下文 `Sin90 path:line` 一律指这个提交。
 > - Cos72：`MushroomDAO/Cos72`（本机 `~/Dev/mycelium/Cos72`）目前只有 LICENSE/README/CLAUDE.md，**没有代码**；Cos72 的需求只能从 PLAN §二 S4、ME4-5.3.x、`docs/agent/roadmap.md` M4/M5、`docs/decision.md` ADR-004/029 推。Agent24 的旧分支 `feat/me4-cos72-skeleton` 是进程内骨架（PLAN-OOP §73：「3f 之后重做成进程外样例；现在不合」），对进程外 SDK 没有参考价值，不采用。
 >
-> 文中每一段 Rust 签名都来自 scratch 工作区 `scratchpad/sdk-sketch/`（`fd/` = `agent24-os-fd` 实物、`proto/` = proto 模块侧桩、`sdk/` = SDK 草图 + example + 测试），已在 `1.98.0` 上 `cargo check / clippy -D warnings / test / fmt --check` 全过；`agent24-os-fd` 不是桩，它的校验逻辑在本机 macOS 上用真实 fd 跑过。评审提出的绕过实验在 `scratchpad/sdk-bypass/`，已用 v2 名单重跑。命令与输出见附录 A。正文里的片段是**节选**（函数体以 `{ … }` 省略），承重原文见附录 B。
+> 文中每一段 Rust 签名都来自 scratch 工作区 `scratchpad/sdk-sketch/`（`fd/` = `agent24-os-fd` 实物、`proto/` = proto 模块侧桩、`sdk/` = SDK 草图 + example + 测试），已在 `1.98.0` 上 `cargo check / clippy -D warnings / test / fmt --check` 全过；`agent24-os-fd` 不是桩，它的校验逻辑在本机 macOS 上用真实 fd 跑过，Linux 分支用 `--target x86_64-unknown-linux-gnu` 做过 clippy（编译，不运行）。评审提出的绕过实验在 `scratchpad/sdk-bypass/`，已用 v3 名单重跑。命令与输出见附录 A。正文里的片段是**节选**（函数体以 `{ … }` 省略），承重原文见附录 B。
+>
+> **v3 发现的工具链事实**：本机 `rustup run 1.98.0 cargo clippy` 实际调用的是 PATH 里 Homebrew 的 `cargo-clippy`（**clippy 0.1.95**，rustc 仍是 1.98.0）——v0–v2 附录里所有 clippy 读数都是 0.1.95 的。v3 用 `scratchpad/c98`（把 `~/.rustup/toolchains/1.98.0-*/bin` 放到 PATH 最前，`cargo clippy -V` = `clippy 0.1.98`）**重跑了全部 clippy 判据与绕过实验**，附录 A 的读数全部换成 0.1.98 的。对照重跑结果：两个版本对本文所有判据与绕过实验的读数**逐条相同**；v2 附录 A.3 里「v1 名单只报 3 条」是 b9/b10 加进实验之前的旧读数，v3 更正为 5 条（A.3）。判据命令里的 `cargo +1.98.0` 走 rustup 代理，不受这个问题影响；CI 用 `rustup toolchain install` 装的 stable，同样不受影响。
 
 ## 版本改动记录
 
@@ -17,6 +19,7 @@
 | v0 | 2026-09-26 | 初稿：盘点 + 边界 + API 草图（已编译）+ 迁移 + 判据 + 切法 + 开放问题 |
 | v1 | 2026-09-26 | jason 拍板 Q1–Q11（全部按推荐；Q3 选 (a) advise+轮询，gate 回调回推留 followup；Q4/Q1 选 (a) 五种客户端全进 v0.1.0）：§8 由「待用户拍板的开放问题」改写为「已拍板决策」，正文里 §1.2 盘点表、§2.1/2.4/2.6/2.7/2.8、§4.3、§5.2、§7 切法依赖、附录处的相关「待定/见 §8 Qx/若…则…」措辞改为确定表述；三个 followup（gate 回调回推、内核 remember 幂等键、proto kernel/module feature 拆分）登记进 `docs/agent/followups.md` FU-84~FU-86；送评审 |
 | v2 | 2026-09-26 | 第 1 轮 Tier-2 对抗评审（CHANGES）逐条修订，处置表 §11。要点：**H1** fd 接管收进 `agent24-os-fd::take_inherited_listener()`（自读 env、进程级一次、fstat/AF_UNIX/SOCK_STREAM/监听校验、CLOEXEC+非阻塞；`ModuleEnv` 不再持 fd 号；token 留在 environ 的风险写明，§4.3）；**H2** 模块侧用宽松镜像 `InitializeReply` 解析握手响应（J-S19）；**H3** `remember_once` 签名/语义/单写者约束写死（§3.5），Sin90 5.2.1 改用它（J-S18）；**H4** proto `test-util` 提供与 Sin90 `test_support.rs` 同签名 API，TS.1.0 增录入站金样，迁移验收加「测试模块 diff 0 行」（§5）；**H5** clippy 名单扩到 24 项并逐项正对照、proto 不导出宏与 socket 别名（J-S1/J-S1b，绕过实验全部被抓）；**M1–M10** J-S2 改 `cargo metadata`、J-S3 改解析 Cargo.toml、`ModuleEnv::from_vars`/`with_env`、`manifest_digest` 挪进 proto、删 `retry_class`（FU-87）、J-S7 落到各回调模块单测、J-S10(b) 用真实投递 body、PLAN 三处同步、advise 孤儿审批（§2.10）、按 SZ-1 口径重估并拆成 17 个 PR（§7）；**L1–L11** 全修（L6 删 `notify`）。发现两处平台事实：macOS 不实现 `SO_ACCEPTCONN`、rustix 0.38.44 的 `getsockname` 在 macOS 上对未命名 AF_UNIX 地址 panic（§4.3） |
+| v3 | 2026-09-26 | rebase 到 `bb3505a`（#512、#513 已合并；本分支登记的 Codex 债改号 ME4-CODEX-DEBT-8）。v2 复审（Tier-2 Opus，CHANGES：2H/5M/5L）逐条修订，处置表 §11.2。要点：**H-1** §5.2 第 3 条改为「测试模块与已提交的期望补丁逐字相等」，期望补丁只允许 `clients/model.rs` 测试模块那一行 `use crate::ai::UnavailableCause;` → `use agent24_os_sdk::UnavailableCause;`，脚本与 4 个正对照实测（A.8）；**H-2** 更正 v2 的绕过分析（实测是外部宏 b3 **被** clippy 抓、跨 crate 别名 b2 **没**被抓），名单加 `str::parse`、`core::str::FromStr::from_str` 到 26 项，J-S1b 改为「proto `module*` 与 os-fd 不许有任何 `pub type`、`pub use` 只能转出 crate 内部项」并改用 Python 脚本（缺工具时失败而非静默通过），`FatalHook` 因此从类型别名改为 newtype，`take_listener` 返回具名的 `InheritedListener`；写明名单是绊线不是沙箱、两条已知残余不防（§2.2）；**M-1** macOS 弱校验的已知缺口写进 §4.3/源码并用 `cfg(apple)` 测试钉住，`EINVAL` 映射为 `NotListening`；**M-2** a3-fd 加 `macos-latest` CI job；**M-3** 生产路径在 `connect()` 里接管监听器，`with_env` 跳过；**M-4** 串行开 PR、base 恒为 main、依赖改 DAG、b2b+b2d 合并（SZ-1 实测 209）、c1 拆 c1a/c1b，仍 17 片；**M-5** 4.3.1 回填 DONE，M4b 门按事实改 `IN_PROGRESS`；**L1–L5** 全修。另发现本机 `rustup run 1.98.0 cargo clippy` 实际是 clippy 0.1.95，全部 clippy 读数已用真 0.1.98 重跑（文首） |
 
 ---
 
@@ -28,7 +31,7 @@
 3. 公共 API 草图，已编译（§3），以及 proto / `agent24-os-fd` 为此要补的公开 API（§4）。
 4. Sin90 迁到 SDK 的步骤和「零行为变化」的验收办法（§5，ME4-5.2.1 / Sin90 TS.1.0 + TS.1.1）。
 5. 判据与 PR 切法（§6、§7，对应 ME4-5.1.2a/b/c 拆出的 17 个 PR）。
-6. 记录 jason 2026-09-26 已拍板的 Q1–Q11 决策及理由（§8），以及第 1 轮评审的逐条处置（§11）。
+6. 记录 jason 2026-09-26 已拍板的 Q1–Q11 决策及理由（§8），以及两轮评审的逐条处置（§11.1 第 1 轮 → v2，§11.2 复审 → v3）。
 
 **不解决**：
 - 内核回调面本身（调度、推理、记忆、审批的内核实现已由 ME4-S1/S2 与 ME-3e 冻结；SDK 按 PLAN「不带来任何新能力」）。
@@ -77,7 +80,7 @@
 | 23 | 连接死 → `exit(70)` | `main.rs:138-145` | **SDK 默认值**，可覆盖 | 要 | §2.7；测试入口强制非退出钩子（§3.2） |
 | 24 | outbox 泵、全量对账、退避 1s×2 上限 5min、other-bucket 20 次耗尽、按错误分类决定「继续 / 停本批 / 整个泵停」 | `reconciler.rs:136-1180` | **全部留 Sin90**（含分类表） | 各自写（Cos72 用 `is_permanent`/`is_retryable` + 穷举 match 自己分） | v1 曾把分类抽成 `ClientError::retry_class`；它与 Sin90 实际行为不一致（`Cancelled`）、Sin90 5.2.1 不用、Cos72 还没有 outbox 代码——两个调用方都不用的新语义，按 §1.1 删除；等 Cos72 outbox 落地后按两个真实调用方再提取（FU-87，§2.6） |
 | 25 | Actor keys（人 / 自动化两把钥匙） | `http/actor.rs` | **留 Sin90** | 各自 | 领域的「AI 不直接写」门 |
-| 26 | test-hooks 调试路由、假内核测试夹具 | `kernel_roundtrip.rs`、`reconciler_debug.rs`、`clients/test_support.rs` | 调试路由**留 Sin90**；假内核夹具进 **proto**（`test-util` feature，SDK 转出） | 要夹具 | SDK 自己的测试也不能开 socket（clippy 判据对 `--all-targets` 生效），只能用 proto 给的内存假内核。**函数名与签名与 Sin90 `test_support.rs` 逐一相同**，Sin90 保留一个一行 shim 即可让测试模块零改动（H4，§4.5） |
+| 26 | test-hooks 调试路由、假内核测试夹具 | `kernel_roundtrip.rs`、`reconciler_debug.rs`、`clients/test_support.rs` | 调试路由**留 Sin90**；假内核夹具进 **proto**（`test-util` feature，SDK 转出） | 要夹具 | SDK 自己的测试也不能开 socket（clippy 判据对 `--all-targets` 生效），只能用 proto 给的内存假内核。**函数名与签名与 Sin90 `test_support.rs` 逐一相同**，Sin90 保留一个一行 shim 即可让测试模块里的夹具调用零改动（H4，§4.5；`clients/model.rs` 测试模块另有一行 `use` 必须改，见 §5.2 第 3 条） |
 
 **Cos72 需要的集合**（推演结论）：1–11、13、14、15、16、20、22、23。调度（12、21）按 §8 Q4 拍板进 SDK，Cos72 是否申请由 5.3.1 定，隔离验法见 ME4-5.3.4；推理（17）Cos72 不要；24 的错误分类 Cos72 在自己的 outbox 里写（FU-87 之后再看能否提取）。
 
@@ -102,7 +105,7 @@
 
 ### 2.2 结构性判据：SDK 从不持有 socket、从不自己把字节解析成 JSON（PLAN S3-1，已在 scratch 验证）
 
-`rust/crates/agent24-os-sdk/clippy.toml`（24 项；scratch 原文）：
+`rust/crates/agent24-os-sdk/clippy.toml`（26 项；scratch 原文）：
 
 ```toml
 disallowed-types = [
@@ -132,35 +135,48 @@ disallowed-methods = [
   { path = "serde_json::Deserializer::from_reader", reason = "PLAN T13" },
   { path = "serde_json::Deserializer::new", reason = "PLAN T13 (bypass: Deserializer::new(SliceRead::new(b)))" },
   { path = "axum::Json::from_bytes", reason = "PLAN T13: use the Json extractor, which parses inside axum" },
+  { path = "str::parse", reason = "PLAN T13 (bypass: s.parse::<serde_json::Value>()); the SDK parses no text at all" },
+  { path = "core::str::FromStr::from_str", reason = "PLAN T13 (bypass: <Value as FromStr>::from_str)" },
 ]
 ```
 
-clippy 的路径名单不支持通配（`std::net::*` 写不出来），所以逐项列；`std::net` 里能建连接/监听的三个类型都在。SDK 合法需要的 JSON 操作只有两种：`serde_json::from_value`（对 proto 已解析好的 `Value` 取类型，`clients::Core`）与 axum 的 `Json` 提取器（fired body，解析发生在 axum crate 内部，不受本 crate 的 clippy 约束）；二者都不在名单里。
+clippy 的路径名单不支持通配（`std::net::*` 写不出来），所以逐项列；`std::net` 里能建连接/监听的三个类型都在。SDK 合法需要的 JSON 操作只有两种：`serde_json::from_value`（对 proto 已解析好的 `Value` 取类型，`clients::Core`）与 axum 的 `Json` 提取器（fired body，解析发生在 axum crate 内部，不受本 crate 的 clippy 约束）；二者都不在名单里。`str::parse` / `FromStr::from_str` 整个禁掉（v3，复审点名的 b11/b12）：SDK 今天没有任何文本解析（草图全量 clippy 绿），将来真要解析数字就用不经 `FromStr` 的 `u64::from_str_radix` 之类，名单不为它开例外。
 
-**v1 名单被绕过的实测与 v2 结果**（`scratchpad/sdk-bypass/sdk/src/bypass.rs`，每一行是一种绕过写法）：
+**名单是绊线，不是沙箱（v3）。** clippy 的 disallowed 名单只对本 crate 源码里**写出来的路径**生效，它挡的是「无意中/顺手」在 SDK 里自己连 socket、自己解析字节，不是一个对抗恶意 SDK 作者的隔离边界——真正的边界是评审 + 这些机械判据的组合。已知残余，**记录、不防**：
+- **b13** 手工拼一个 `axum::http::Request`（`Body::from(bytes)` + `content-type: application/json`）喂给 `Json::<Value>::from_request`——解析发生在 axum 里，与 fired 提取器走的是同一条合法路径，名单无法区分「解析内核投来的 HTTP 请求」和「把任意字节包成请求再解析」。
+- **b14** `std::fs::File::open("/dev/fd/3")`——经文件系统路径拿到继承来的 fd（Linux 上 `/proc/self/fd/3` 同理）。`File` 与 `open` 都是正当 API，禁不得。os-fd 已给 fd 3 设 CLOEXEC 并由 `Module` 独占，这条只能靠评审。
+- 两者都要求 SDK 作者**有意**写出来，评审一眼可见；为它们引入更重的机制（例如禁 `axum::Json::from_request`、禁 `std::fs`）会连带禁掉合法用法，不值。
 
-| # | 绕过写法 | v1 名单 | v2 名单 |
-|---|---|---|---|
-| b1 | `tokio::net::UnixSocket::new_stream()?.connect(p)`（从不写出 `UnixStream`）+ `serde_json::from_str` | 漏 | 抓（`UnixSocket`、`from_str`） |
-| b2 | proto 导出的别名 `agent24_os_proto::Sock::connect` | 抓（别名解析到原类型） | 抓 |
-| b3 | proto 导出的 `#[macro_export]` 宏展开出 `UnixStream::connect` | 漏 | **仍漏**——clippy 不 lint 外部 crate 宏展开的代码。由 J-S1b 在 proto/os-fd 侧封死：不导出任何宏、不导出 socket/fd 类型的别名或转出 |
-| b4 | `use tokio::net::UnixStream as Renamed` | 抓 | 抓 |
-| b5 | `serde_json::Deserializer::from_slice` / `serde_json::from_reader` | 漏 | 抓 |
-| b6 | `std::net::TcpStream::connect` | 漏 | 抓 |
-| b7 | `serde_json::Deserializer::new(serde_json::de::SliceRead::new(b))` | 漏 | 抓（`Deserializer::new`） |
-| b8 | `axum::Json::<Value>::from_bytes(b)` | 漏 | 抓 |
-| b9 | SDK 内部 `type Local = std::os::unix::net::UnixStream` | 抓 | 抓 |
-| b10 | `std::os::unix::net::UnixListener::from(OwnedFd)` | 漏 | 抓（`OwnedFd`、`UnixListener`） |
+**绕过实测：v1 / v2 / v3 三份名单**（`scratchpad/sdk-bypass/sdk/src/bypass.rs`，每一行是一种绕过写法；v3 用真 clippy 0.1.98 重跑，读数见附录 A.3）。**v2 表把 b2 与 b3 的结论标反了**（复审 H-2）：实测是**外部宏 b3 被抓**（clippy 对宏展开出的路径照样报，报错位置指向调用处 `bypass.rs:15`），**跨 crate 别名 b2 没被抓**（`bypass.rs:13` 零报错）——v2 把 `:15` 那条错误当成了 b2 的。
 
-v2 名单下 b1–b10 除 b3 外全部报 `use of a disallowed …`（13 条，附录 A.3）；b3 由 J-S1b 的 `rg` 检查在 proto 侧兜住（`sdk-bypass/proto` 里那两行被它命中，真实 proto 与 scratch proto 为空）。其余可能的通道——新增能开 socket 的依赖（`socket2`、`nix`、`libc`）——由 J-S2 的依赖集合相等挡住；`unsafe` 由 `forbid` 挡住。
+| # | 绕过写法 | v1 | v2 | v3 | 由谁挡 |
+|---|---|---|---|---|---|
+| b1 | `tokio::net::UnixSocket::new_stream()?.connect(p)`（从不写出 `UnixStream`）+ `serde_json::from_str` | 漏 | 抓 | 抓 | 名单 |
+| b2 | proto 导出的**一跳**别名 `agent24_os_proto::Sock::connect`（`pub type Sock = tokio::net::UnixStream`） | **漏** | **漏** | **漏** | **J-S1b**（proto `module*`/os-fd 不许 `pub type`；全 proto 不许 `pub type/use` 点名 socket 类型） |
+| b3 | proto 导出的 `#[macro_export]` 宏展开出 `::tokio::net::UnixStream::connect` | 抓 | 抓 | 抓 | 名单（J-S1b 另外禁 `#[macro_export]`，双保险） |
+| b4 | `use tokio::net::UnixStream as Renamed` | 抓 | 抓 | 抓 | 名单 |
+| b5 | `serde_json::Deserializer::from_slice` / `serde_json::from_reader` | 漏 | 抓 | 抓 | 名单 |
+| b6 | `std::net::TcpStream::connect` | 漏 | 抓 | 抓 | 名单 |
+| b7 | `serde_json::Deserializer::new(serde_json::de::SliceRead::new(b))` | 漏 | 抓 | 抓 | 名单 |
+| b8 | `axum::Json::<Value>::from_bytes(b)` | 漏 | 抓 | 抓 | 名单 |
+| b9 | SDK 内部 `type Local = std::os::unix::net::UnixStream` | 抓 | 抓 | 抓 | 名单（本 crate 内的别名 clippy 看得穿） |
+| b10 | `std::os::unix::net::UnixListener::from(OwnedFd)` | 半抓（只报 `UnixListener`） | 抓 | 抓 | 名单 |
+| b11 | `s.parse::<serde_json::Value>()` | 漏 | 漏 | 抓 | 名单（`str::parse`） |
+| b12 | `<serde_json::Value as FromStr>::from_str(s)` | 漏 | 漏 | 抓 | 名单（`core::str::FromStr::from_str`） |
+| b13 | 手工拼 `Request` 喂 `axum::Json::<Value>::from_request` | 漏 | 漏 | 漏 | **不防**（已知残余，见上） |
+| b14 | `std::fs::File::open("/dev/fd/3")` | 漏 | 漏 | 漏 | **不防**（已知残余，见上） |
+| b15 | proto 导出的**两跳**别名（`type Inner = UnixStream; pub type Sock2 = Inner;`） | 漏 | 漏 | 漏 | **J-S1b**（`pub type` 一律禁，不看右边写的是什么） |
+
+v3 名单下 15 条 `use of a disallowed`（附录 A.3），覆盖 b1、b3–b12；b2/b15 由 J-S1b 在 proto/os-fd 侧从源头禁止（正对照里一跳、两跳、外部 `pub use`、`#[macro_export]` 四种都被脚本命中，A.4）；b13/b14 记录不防。别名为什么要在 proto 侧禁：clippy 的 `disallowed_types` 按「源码里写出的路径」解析，跨 crate 的 `pub type` 在调用处已经是另一个路径（`agent24_os_proto::Sock`），名单里写原类型对它无效；而在 proto 里把 `Sock` 也加进 SDK 名单只能挡已知名字，挡不住下一个别名——所以规则定成结构性的「proto 模块侧不许有 `pub type`」，`FatalHook` 也因此从 `pub type FatalHook = Arc<dyn Fn()…>` 改成 newtype（§3.2、附录 B.1）。其余可能的通道——新增能开 socket 的依赖（`socket2`、`nix`、`libc`）——由 J-S2 的依赖集合相等挡住；`unsafe` 由 `forbid` 挡住。
 
 其它实测（附录 A）：
-- `Module::serve` 里 `let listener = take_listener().map_err(SdkError::Listen)?; axum::serve(listener, app)` —— 类型靠推断，源码不写 `UnixListener`，**clippy 不报**（PLAN 的假设成立）。
-- 正对照 `--features positive-control`（`src/positive_control.rs`：名单每一项恰好一行）→ clippy 退出 101，**恰好 24 条 `use of a disallowed`，去重后也是 24 种，等于 `clippy.toml` 的条目数**。CI 用三步写死：`! cargo clippy … --features positive-control`、错误条数 == 条目数、去重种类数 == 条目数（任何一项名单写错路径都会让种类数少 1）。
+- `ModuleBuilder::connect` 里 `take_listener()` 拿到的是 proto 的具名结构 `InheritedListener`（存进 `Module`），`serve` 里 `axum::serve(listener.into_tokio(), app)` —— `UnixListener` 只出现在 proto 的签名里，SDK 源码不写它，**clippy 不报**（PLAN 的假设成立；v3 因 M-3 把接管挪进 `connect()`，SDK 要把监听器存进结构体字段，而字段类型必须写出来，所以由 proto 给一个不是别名的包装类型）。
+- 正对照 `--features positive-control`（`src/positive_control.rs`：名单每一项恰好一行）→ clippy 退出 101，**恰好 26 条 `use of a disallowed`，去重后也是 26 种，等于 `clippy.toml` 的条目数**（v3，真 clippy 0.1.98）。CI 用三步写死：`! cargo clippy … --features positive-control`、错误条数 == 条目数、去重种类数 == 条目数（任何一项名单写错路径都会让种类数少 1）。
 
 ### 2.3 transport + 握手：全在 proto，SDK 只调
 
-proto 新增 `agent24_os_proto::module`（§4），承担 §1.2 的第 1、2、3、5、6、7 项；第 20 项由 `agent24-os-fd` 承担、proto 包一层。SDK 的 `ModuleBuilder::connect()` 只做三件事：
+proto 新增 `agent24_os_proto::module`（§4），承担 §1.2 的第 1、2、3、5、6、7 项；第 20 项由 `agent24-os-fd` 承担、proto 包一层。SDK 的 `ModuleBuilder::connect()` 只做三件事（v3 在最前面加了第 0 步）：
+0. **生产路径先接管监听器**（v3，M-3）：`take_listener()` → fd 3 校验、设 `FD_CLOEXEC`，得到的 `InheritedListener` 存进 `Module`，`serve` 时再交给 axum。放在最前面是为了让 CLOEXEC 在模块有机会起子进程之前就设上（v2 放在 `serve` 里，`connect()` 与 `serve()` 之间模块自己起的子进程会继承 fd 3），同时让坏 fd 在启动时就报错而不是等到 `serve`。`with_env` 测试路径**跳过**这一步（§3.2）；
 1. 取 `ModuleEnv`：生产路径 `ModuleEnv::from_env()`；测试路径是 `with_env(env, hook)` 注入的（§3.2）；
 2. 从 manifest 文本读出 `name` / `route_namespace` / `kernel_capabilities`，组 `Hello`（**不再手抄能力名**，§1.2 第 4 项），协议范围 `1..=1`（§8 Q7）；
 3. `Connection::connect_from_env(&env, &hello, on_fatal)`——proto 内部用宽松的 `InitializeReply` 解析响应、校验 id、校验 `protocol_version ∈ [min, max]`、校验缓冲区无残字节。
@@ -260,7 +276,7 @@ PLAN S3-2 与 ME4-5.1.2b 原文列的五种是 **Events / Memory / Approval / Sc
 
 ```rust
 pub use agent24_os_proto::kernel_call::{FireTrigger, FiredBody};
-pub use agent24_os_proto::module::{FatalHook, SPAWN_ENV_VARS};
+pub use agent24_os_proto::module::{FatalHook, SPAWN_ENV_VARS};   // FatalHook: newtype since v3
 pub use clients::{
     ApprovalClient, EventSink, EventSinkConfig, EventsClient, MemoryClient, ModelClient,
     RememberOnce, SchedulerClient,
@@ -291,11 +307,14 @@ impl ModuleBuilder {
     pub fn on_connection_lost(mut self, hook: FatalHook) -> Self { … }
     /// Tests only: connect with `env` instead of the process environment.
     /// The fatal hook is a REQUIRED argument, so a test can never fall back
-    /// to the default `exit(70)` (M3).
+    /// to the default `exit(70)` (M3). Does NOT take the inherited listener;
+    /// `serve` then returns `SdkError::NoListener` (v3 M-3).
     #[cfg(feature = "test-util")]
     pub fn with_env(mut self, env: ModuleEnv, hook: FatalHook) -> Self { … }
-    /// Read env, parse manifest (name / namespace / kernel_capabilities come
-    /// from it — never hand-copied), dial + `initialize`.
+    /// Production path: FIRST take over the inherited listener (fd 3,
+    /// `FD_CLOEXEC`) and keep it in the `Module`, then read env, parse
+    /// manifest (name / namespace / kernel_capabilities come from it — never
+    /// hand-copied), dial + `initialize`. Once per process.
     pub async fn connect(self) -> Result<Module, SdkError> { … }
 }
 
@@ -314,17 +333,21 @@ impl Module {
     pub fn scheduler(&self) -> Option<SchedulerClient> { … }
     pub fn model(&self) -> Option<ModelClient> { … }
     /// Nest `router` under the manifest's `route_namespace` and serve it on
-    /// the kernel-bound listener (`A24_LISTEN_FD`, taken over once per
-    /// process by `agent24-os-fd`). Returns when the server stops.
+    /// the kernel-bound listener taken in `connect()`. Returns when the
+    /// server stops.
     pub async fn serve(self, router: axum::Router) -> Result<(), SdkError> { … }
 }
 
-pub enum SdkError { Env(EnvError), Manifest(String), Connect(ConnectError), Listen(ListenError), Io(std::io::Error) }
+pub struct Module { /* env, facts, conn: Arc<Connection>, listener: Option<InheritedListener> */ }
+
+pub enum SdkError { Env(EnvError), Manifest(String), Connect(ConnectError), Listen(ListenError),
+                    NoListener /* built with `with_env` */, Io(std::io::Error) }
 ```
 
 - `manifest_yaml: impl Into<Cow<'static, str>>`（L3）：生产代码传 `&'static str`（Sin90 的 `MANIFEST_YAML` 本来就是 `include_str!` 的结果，`ai/ports.rs:122-124`；它 `main.rs:45` 的 `const MANIFEST: &[u8]` 迁移后不再需要），测试可以传运行时拼的 `String`（J-S11 的「换一份能力不同的 manifest」不用 `String::leak`）。
 - 测试入口的非退出保证是**签名上的**：注入环境的唯一途径 `with_env` 必须同时给钩子，`test-util` 提供 `testing::recording_hook()`（计数、不退出）与 `testing::noop_hook()`。没有做成「开了 `test-util` 就换默认钩子」：cargo resolver 2 在 `cargo test` 时会把 dev 依赖的 feature 合并进为集成测试构建的二进制，Sin90 真实挂载黑盒跑的正是这个二进制，默认钩子一变，退出码 70 这条 §5.2 验收就被悄悄改了。
-- `serve` 取监听器用 `agent24_os_proto::module::take_listener()`，它内部调 `agent24_os_fd::take_inherited_listener()`；一个进程只能成功接管一次（§4.3）。
+- **监听器在 `connect()` 里接管**（v3，M-3）：生产路径（没调 `with_env`）的第一步是 `agent24_os_proto::module::take_listener()`（内部调 `agent24_os_fd::take_inherited_listener()`），得到的 `InheritedListener` 存进 `Module`，`serve` 只是取出来交给 axum。`with_env` 路径不碰 fd 3、不消耗那一次机会，`serve` 返回 `SdkError::NoListener`——测试直接对 router 用 `tower::ServiceExt::oneshot`，不经 `serve`。
+- **进程级一次性的后果**（v3，M-3）：接管在一个进程里只能成功一次，而 `cargo test` 把同一个测试二进制里的所有测试放在同一个进程里跑。所以**每个测试二进制里至多一个测试可以走到 `take_inherited_listener`/`take_listener`/不带 `with_env` 的 `connect()`**：os-fd 里是 `only_one_attempt_per_process`（其余 os-fd 测试只调私有的 `validate`）；proto、SDK、Sin90、Cos72 的单测一律经 `with_env`/`fake_kernel`，不调 `take_*`；真实挂载黑盒是独立子进程，不受影响。这条写进 `take_listener` 与 `ModuleBuilder::connect` 的文档注释。
 
 ### 3.3 请求上下文
 
@@ -577,16 +600,23 @@ pub fn take_inherited_listener() -> Result<std::os::unix::net::UnixListener, Inh
 
 // crate agent24-os-proto, module `module`
 pub enum ListenError { Inherit(agent24_os_fd::InheritError), Io(std::io::Error) }
-pub fn take_listener() -> Result<tokio::net::UnixListener, ListenError>;   // os-fd + UnixListener::from_std
+/// Named struct, not an alias (J-S1b): the SDK stores it in `Module`.
+pub struct InheritedListener(tokio::net::UnixListener);
+impl InheritedListener { pub fn into_tokio(self) -> tokio::net::UnixListener; }
+pub fn take_listener() -> Result<InheritedListener, ListenError>;   // os-fd + UnixListener::from_std
 ```
 
 `take_inherited_listener()` 的步骤（scratch 实现，附录 B.2）：
 1. **进程级一次**：`static TAKEN: AtomicBool`，`swap(true)` 已为 true → `AlreadyTaken`。任何一次尝试（成功或失败）都消耗掉这一次机会——失败后不许再试，避免第二次调用在别人已经占用 fd 3 之后去接管。
 2. **自读 env**：只认 `A24_LISTEN_FD`，解析为整数且**必须等于 3**（内核 `launch.rs:42` 永远传 fd 3；`agent24-os-fd` 不能依赖 proto，所以自己重述常量，proto 里 `const _: () = assert!(agent24_os_fd::LISTEN_FD == launch::LISTEN_FD)`，env 名由 proto 单测断言相等）。调用方无法传入 fd 号——`ModuleEnv` 不持 fd，os-fd 不导出任何接受 `RawFd` 的安全函数（`adopt(fd)` 是私有的）。
-3. **先借用校验、再接管**：`BorrowedFd::borrow_raw(3)` 上做 `fstat` → `S_ISSOCK`；`getsockname` → `AF_UNIX`；`SO_TYPE` → `SOCK_STREAM`；是否在监听：Linux 用 `SO_ACCEPTCONN`；**macOS 不实现 `SO_ACCEPTCONN`**（系统头声明了常量但内核不实现，rustix 在 apple 上直接不提供 `socket_acceptconn`），改用 `getpeername` 返回 `ENOTCONN`（监听 socket 没有对端；socketpair 端与已连接流都有）。全部通过才 `OwnedFd::from_raw_fd(3)` 接管；任一失败直接返回错误，**不接管也不关闭**这个 fd（它可能是别人的）。
+3. **先借用校验、再接管**：`BorrowedFd::borrow_raw(3)` 上做 `fstat` → `S_ISSOCK`；`getsockname` → `AF_UNIX`；`SO_TYPE` → `SOCK_STREAM`；是否在监听，两个平台强度不同（v3，M-1）：
+   - **Linux（及一切非 Apple 目标）**：`SO_ACCEPTCONN`，直接判定「调用过 `listen()`」。只 `socket()`/`bind()` 未 `listen()` 的流 socket → `NotListening`（测试 `bound_but_not_listening_is_rejected`，只在非 Apple 目标编译运行）。
+   - **macOS：弱校验，已接受**。macOS 不实现 `SO_ACCEPTCONN`（系统头声明了常量，`getsockopt` 返回 `ENOPROTOOPT`，`scratchpad/h1probe/` 实测；rustix 在 apple 上直接不提供 `socket_acceptconn`），改用 `getpeername` 做间接判定「没有对端」：`ENOTCONN` → 视为监听；`Ok`（有对端：已连接流、存活的 socketpair 端）→ `NotListening`；`EINVAL`（对端已关闭的流 / socketpair 端，h1probe 实测）→ `NotListening`；其它错误 → `Io`。**已知缺口**：`socket()` 后未 `listen()`（无论是否 `bind()`）的流 socket 也回 `ENOTCONN`，**在 macOS 上会通过校验**（h1probe 实测）。接受的理由：内核传来的 fd 3 永远是 `listen()` 过的（`launch.rs:456` 起），出现这种 fd 意味着有人伪造了 spawn 环境；后果只是 `accept` 报错、模块退出，不会越权，也不会关掉别人的 fd（校验失败本来就不接管，这里是「接管了一个不能 accept 的 socket」）。缺口由 `cfg(target_vendor = "apple")` 的测试 `apple_gap_bound_but_not_listening_passes` **钉住**（断言它通过）：将来若 macOS/rustix 行为变化或有人改了判定，这条测试会变红，提醒同步本节。os-fd 源码 `is_listening` 的 apple 分支注释写明同样的内容（附录 B.2）。
+   全部通过才 `OwnedFd::from_raw_fd(3)` 接管；任一失败直接返回错误，**不接管也不关闭**这个 fd（它可能是别人的）。
 4. **接管后**：`fcntl(F_SETFD, FD_CLOEXEC)`（内核蹦床为了让 fd 3 跨 exec 存活而没设 CLOEXEC；接管后必须设上，否则模块起的子进程会继承监听 socket）；`set_nonblocking(true)`（tokio 需要）。
 5. 唯一的 `unsafe` 是私有函数 `adopt` 里的 `borrow_raw` 与 `from_raw_fd` 两个块，函数上一处 `#[allow(unsafe_code)]`；crate 级 `unsafe_code = "deny"`。J-S3 断言全工作区 `#[allow(unsafe_code)]` 恰好 1 处且在 os-fd。
-6. 校验逻辑的单测（scratch 在 macOS 上用真实 fd 跑过，5 条全过）：监听中的 Unix socket 通过；socketpair 端 → `NotListening`；`/dev/null` → `NotASocket`；TCP 监听 → `NotUnix`；第二次调用 → `AlreadyTaken`（判据 J-S20）。测试只对测试自己持有的 fd 调私有的 `validate`，从不碰 fd 3 与进程环境。
+6. 校验逻辑的单测（判据 J-S20；scratch 在 macOS 上用真实 fd 跑过，7 条全过；Linux 分支用 `--target x86_64-unknown-linux-gnu` 过了 clippy `-D warnings`，本机不能运行）：监听中的 Unix socket 通过；socketpair 端 → `NotListening`；对端已关闭的 socketpair 端 → `NotListening`（macOS 走 `EINVAL` 映射，Linux 走 `SO_ACCEPTCONN = 0`）；`/dev/null` → `NotASocket`；TCP 监听 → `NotUnix`；只 `bind` 未 `listen` → Linux `NotListening` / macOS **通过**（缺口钉子，两条测试按 `cfg` 二选一编译）；第二次调用 → `AlreadyTaken`。测试只对测试自己持有的 fd 调私有的 `validate`，从不碰 fd 3 与进程环境；`only_one_attempt_per_process` 是这个测试二进制里**唯一**调 `take_inherited_listener` 的测试（进程级一次，§3.2）。
+7. **两个平台都要在 CI 上跑**（v3，M-2）：Agent24 CI 今天只有 `ubuntu-latest`（`.github/workflows/ci.yml`），它编译并运行 Linux 分支（`SO_ACCEPTCONN` 与 `bound_but_not_listening_is_rejected`）；a3-fd 同一个 PR 在 `ci.yml` 里**新增一个 `macos-latest` job，只跑 `cargo test -p agent24-os-fd`**（装 stable、不跑全工作区，成本约一分钟），运行 apple 分支与缺口钉子。两个 job 缺一个，J-S20 就只验了一半。
 
 **handshake token 留在 environ（H1 的第二问）——接受风险，理由与边界**：
 - 不在 os-fd 里 `remove_var`：edition 2024 里 `std::env::remove_var` 是 `unsafe`，其 SAFETY 前提是「没有其它线程同时读写环境」；SDK 的 `connect()` 在 `#[tokio::main]` 的多线程运行时里执行，一个库无法证明这一点。把它塞进 os-fd 等于给唯一的 unsafe crate 加一个写不出真话的 SAFETY 注释。
@@ -597,7 +627,7 @@ pub fn take_listener() -> Result<tokio::net::UnixListener, ListenError>;   // os
 
 - `manifest::ManifestFacts { name, route_namespace, kernel_capabilities }` + `facts_from_yaml(&str) -> Result<ManifestFacts, String>`：**宽松**——不带 `deny_unknown_fields`，只读三个字段、忽略其余（L4）；`kernel_capabilities` 缺省为空。不是校验（内核在安装时校验），只是取数。实现用 proto 已有的 `agent24-domain` → `serde_yaml`。
 - `manifest::manifest_digest(bytes: &[u8]) -> String`：**从 `agent24-os-packages/src/discovery.rs:46-57` 原样挪入**（M4）；os-packages 改为 `pub use agent24_os_proto::manifest::manifest_digest;`，它自己的调用点（`discovery.rs:219`）与测试（`:324-334`、`:656`）不改；os-packages 新增对 proto 的普通依赖（方向见 §2.1，无环：proto 不依赖 os-packages）。proto 已依赖 `sha2 0.10`（审批 token 哈希用），不新增依赖。模块侧握手与内核侧 discovery 从此是同一个函数。
-- `kernel_call::FiredBody`（拥有型）+ `FireTrigger`，agentd `scheduler_deliver.rs` 改用它（§2.5）。放在 c1（与 fired 提取器同一个 PR），不放 a1。
+- `kernel_call::FiredBody`（拥有型）+ `FireTrigger`，agentd `scheduler_deliver.rs` 改用它（§2.5）。v3 单独成片 c1a（从 main 开、不依赖任何 SDK 片），fired 提取器在 c1b；不放 a1。
 
 ### 4.5 `module::testing`（`test-util` feature，H4）
 
@@ -648,9 +678,9 @@ Sin90 的 `clients/test_support.rs`（`135ddb7`）导出的 API 与签名，prot
 | `adapter_agent24/clients/{error,memory,approval,mod}.rs` | 改为转出 SDK：`pub use agent24_os_sdk::…`（`clients` 模块保留为转出层，减少调用点改动） |
 | `adapter_agent24/clients/scheduler.rs` | 转出 `ScheduleSpec as ModuleSpec`、`ScheduleState as ModuleScheduleState` 等旧名；另保留一个 newtype `SchedulerClient(agent24_os_sdk::SchedulerClient)`，其 `upsert(key, &ModuleSpec, enabled, label, request_id)` **保持 Sin90 今天的五个位置参数**、内部组 `UpsertRequest`——`reconciler.rs` 测试模块直接这样调它（`fake_kernel_rejects_an_uppercase_key`，`reconciler.rs:1437-1450`），不保留就做不到测试模块零改动。`request_id` 参数类型改为 `Option<&RequestId>`，测试里的字面量 `None` 两种类型都接受，文本不变（约 50 行） |
 | `adapter_agent24/clients/test_support.rs` | **一行 shim**：`#[cfg(test)] pub(crate) use agent24_os_sdk::testing::{fake_kernel, read_request, respond, respond_error, respond_error_with_data, FakePeer};`（§4.5） |
-| `adapter_agent24/clients/model.rs` | 保留一个 newtype `ModelClient(agent24_os_sdk::ModelClient)`：`new(&Arc<Connection>)` + 固有方法 `complete(&ModelRequest) -> Result<ModelReply, ClientError>`（`ModelRequest → CompleteRequest`、`CompleteResult → ModelReply`（含 `u64 → u32`）在这里写），`ModelPort`/`ModelCaller` 实现与 `ClientError → ModelFailure` 映射原样；`UnavailableCause` 在这里从 SDK 的转成 `crate::ai` 的。newtype 让该文件测试模块里的 `ModelClient::new(&clients)` / `client.complete(&req)` 一字不改；测试引用的 `MODEL_CALL_TIMEOUT`（`model.rs:36`）保留为 `pub(crate) const MODEL_CALL_TIMEOUT: Duration = agent24_os_sdk::clients::MODEL_RESPONSE_TIMEOUT;` |
+| `adapter_agent24/clients/model.rs` | 保留一个 newtype `ModelClient(agent24_os_sdk::ModelClient)`：`new(&Arc<Connection>)` + 固有方法 `complete(&ModelRequest) -> Result<ModelReply, ClientError>`（`ModelRequest → CompleteRequest`、`CompleteResult → ModelReply`（含 `u64 → u32`）在这里写），`ModelPort`/`ModelCaller` 实现与 `ClientError → ModelFailure` 映射原样；`UnavailableCause` 在这里从 SDK 的转成 `crate::ai` 的。newtype 让该文件测试模块里的 `ModelClient::new(&clients)` / `client.complete(&req)` 一字不改；测试引用的 `MODEL_CALL_TIMEOUT`（`model.rs:36`）保留为 `pub(crate) const MODEL_CALL_TIMEOUT: Duration = agent24_os_sdk::clients::MODEL_RESPONSE_TIMEOUT;`。**测试模块唯一要改的一行**（v3，H-1）：`use crate::ai::UnavailableCause;`（`model.rs:223`）→ `use agent24_os_sdk::UnavailableCause;`——该测试模块用它构造的是 `ClientError::Unavailable { cause, .. }`（`:471`、`:502`），而迁移后 `ClientError` 是 SDK 的类型、`cause` 是 SDK 的 `UnavailableCause`，不改这一行就类型不匹配；这一行写进期望补丁（§5.2 第 3 条） |
 | `adapter_agent24/mod.rs` | 删 `SpawnEnv`/`manifest_digest`/`connect_and_initialize`/`KernelClients`/`listener_from_fd`/`INITIALIZE_CAPABILITIES` 及其测试；留 `wire_kernel_clients`（改吃 `&Module`），`KernelEventSink` 改为包一层 SDK `EventSink` 实现 Sin90 的 `http::EventSink` trait |
-| `adapter_agent24/reconciler.rs` | 非测试部分：改类型名与三处调用签名（`upsert` 用 `UpsertRequest`、`request_id` 传 `None`）；**删 `memory_recall_finds_dedup_key`/`RecallCheck` 与两个常量的定义（改为 `use agent24_os_sdk::clients::{RECALL_PRECHECK_MAX_PAGES, …}`——测试模块经 `use super::*` 用到 `RECALL_PRECHECK_MAX_PAGES`，`reconciler.rs:3678`），`remember_review_summary` 改调 `memory.remember_once("review.summary", &desired.dedup_key, body, None)`，`Found{id}`/`Created{id,..}` → `Ok(id)`，`Inconclusive` → 原文案的 `Err(ClientError::Other(..))`**（H3）；**分类 match 原样保留**。测试模块（`#[cfg(test)] mod tests` 起到文件尾）**一行不改** |
+| `adapter_agent24/reconciler.rs` | 非测试部分：改类型名与三处调用签名（`upsert` 用 `UpsertRequest`、`request_id` 传 `None`）；**删 `memory_recall_finds_dedup_key`/`RecallCheck` 与 `RECALL_PRECHECK_MAX_PAGES`/`RECALL_PRECHECK_PAGE_SIZE` 两个常量的定义**；`remember_review_summary` 改调 `memory.remember_once("review.summary", &desired.dedup_key, body, None)`，`Found{id}`/`Created{id,..}` → `Ok(id)`，`Inconclusive` → 原文案的 `Err(ClientError::Other(..))`（H3）；**分类 match 原样保留**。测试模块经 `use super::*` 仍要用 `RECALL_PRECHECK_MAX_PAGES`（`reconciler.rs:3678`，唯一一处；`PAGE_SIZE` 测试不用），所以非测试部分补一行 **`#[cfg(test)] use agent24_os_sdk::clients::RECALL_PRECHECK_MAX_PAGES;`**——必须带 `#[cfg(test)]`：删掉预查后非测试代码不再用这个常量，不带的话非测试构建报 `unused_imports`，CI 的 `clippy -D warnings` 红（v3，L3）。测试模块（`#[cfg(test)] mod tests` 起到文件尾）与迁移前**逐字相同**（期望补丁里 reconciler 部分为空，§5.2 第 3 条）；其中两处文档注释仍以 intra-doc 链接提到已删的 `memory_recall_finds_dedup_key`/`RecallCheck::Inconclusive`（`:3574`、`:3654` 附近），`cfg(test)` 代码不进 rustdoc，不产生告警，保留不改 |
 | `adapter_agent24/kernel_roundtrip.rs` | 头读取改用 `RequestContext`（test-hooks 路由）；它构造 `RequestId` 的地方（test-hooks 专用）用 `RequestId::for_test`——test-hooks 是 Sin90 的 feature，Sin90 在 `test-hooks = ["agent24-os-sdk/test-util"]` 里转发 |
 | `main.rs` | `SpawnEnv + KernelClients::handshake + listener_from_fd + nest("/api/v1/sin90")` 换成 `Module::builder(sin90::ai::MANIFEST_YAML).on_connection_lost(同一个 exit(70) 钩子).connect()` + `module.serve(router)`；`const MANIFEST: &[u8]` 删除；test-hooks 的两个路由照旧 merge |
 | `http/mod.rs` 的 fired handler | **不动**（`http` 不许依赖 Agent24 类型，`lib.rs:3`）。可选：把 `"x-a24-fire-id"` 字面量换成 SDK 转出的 proto 常量——但这会让 `http` 依赖 SDK，违反 Sin90 自己的分层，**不做** |
@@ -659,14 +689,21 @@ Sin90 的 `clients/test_support.rs`（`135ddb7`）导出的 API 与签名，prot
 
 1. **真实挂载黑盒不变全绿**：`AGENT24_CHECKOUT=../Agent24 cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1`，先 `-- --list --ignored` 断言恰好 5 条（`sin90_mounts_under_a_real_agent24_daemon`、`kernel_clients_roundtrip`、`routine_m3_real_mount_acceptance`、`t441_finalized_review_summary_is_recallable_from_kernel_memory`、`t551_ai_v1_m5_real_mount_acceptance`，`tests/agent24_mount_blackbox.rs:908/1175/1419/1861/2158`），跑之前 `../Agent24` ff 到含 SDK tag 的 main。
 2. **线协议金样逐条相等**：TS.1.0 录的出站与入站 golden 在迁移后重跑逐条相等（迁移后用 SDK `test-util` 假内核）。**有意差异清单**（PR body 单列，不算回归）：① `initialize.params.protocol_versions.max` 1000 → 1（§8 Q7）；② 握手响应缺 `protocol_version` 或 `offer` 时由「接受」变为 `ConnectError::Protocol`（§4.1，真内核不会发这种响应）。变异：在迁移后的 Sin90 里把 `upsert` 的 `label` 改成发 `null` → 出站 golden 红；把 SDK 映射里 `"quota_exceeded"` 分支删掉 → 入站 golden 的对应行红。
-3. **测试模块零改动**（H4）：`reconciler.rs` 与 `clients/model.rs` 的测试模块在迁移前后逐字相同，并且全绿。机械检查：
-   ```sh
-   for f in src/adapter_agent24/reconciler.rs src/adapter_agent24/clients/model.rs; do
-     diff <(git show origin/main:$f | sed -n '/^#\[cfg(test)\]$/,$p') <(sed -n '/^#\[cfg(test)\]$/,$p' $f) \
-       || { echo "test module of $f changed"; exit 1; }
-   done
+3. **测试模块只改一行，且与已提交的期望补丁逐字相等**（H4；v3 按复审 H-1 修正）：v2 写的「两个测试模块 diff 0 行」做不到——`clients/model.rs` 的测试模块 `use crate::ai::UnavailableCause;`（`model.rs:223`）并用它构造 `ClientError::Unavailable { cause, .. }`，迁移后 `cause` 是 SDK 的类型，这一行必须改（§5.1 model 行）；v2 的脚本在一次正确的迁移上也会退出 1（A.8 实测）。v3 的判据：TS.1.1 同一个 PR 提交 `scripts/ts11-test-modules.expected.patch`，内容恰为
+   ```diff
+   --- a/src/adapter_agent24/clients/model.rs (tests)
+   +++ b/src/adapter_agent24/clients/model.rs (tests)
+   @@ -4,7 +4,7 @@
+        use crate::adapter_agent24::clients::test_support::{
+            fake_kernel, read_request, respond, respond_error_with_data,
+        };
+   -    use crate::ai::UnavailableCause;
+   +    use agent24_os_sdk::UnavailableCause;
+        use serde_json::{json, Map};
+    
+        fn sample_request() -> ModelRequest {
    ```
-   正对照：先在迁移分支上对其中任一测试模块做一处空白以外的改动，脚本必须退出 1。这两个测试模块覆盖了 recall 预查翻页（`reconciler.rs:3133` 起）、stateful 假内核调度（`:1239` 起）、model 的 125s 超时与 `unavailable` 映射（`model.rs:347-540`），在它们不改一行的前提下全绿，比新写的等价测试更能说明「行为没变」。
+   （`reconciler.rs` 部分为空），由 `scripts/check-test-modules.sh <迁移前 base>` 机械检查两件事：① 期望补丁里的 `+`/`-` 行**恰好**是上面那一对（补丁本身不许夹带别的改动）；② 两个文件从 `#[cfg(test)]` 到文件尾、迁移前 vs 迁移后的 `diff -u`（固定 label）与期望补丁**逐字节相等**；任一文件找不到 `#[cfg(test)]` 行即失败（不静默通过）。脚本全文见 A.8，已在 `scratchpad/h1mig/`（Sin90 `135ddb7` 的这两个文件 + 模拟迁移）实测：模拟的正确迁移 → 绿；正对照 4 条全红——reconciler 测试模块改一处、model 测试模块改一处断言、期望补丁多夹带一行、`#[cfg(test)]` 标记被改掉。两个测试模块覆盖了 recall 预查翻页（`reconciler.rs:3133` 起）、stateful 假内核调度（`:1239` 起）、model 的 125s 超时与 `unavailable` 映射（`model.rs:347-540`），在只动一行 `use` 的前提下全绿，比新写的等价测试更能说明「行为没变」。
 4. **常量同值**：一条 Sin90 单测断言 `EventSinkConfig::default()` 等于 `256/4/32/5s`、`MODEL_RESPONSE_TIMEOUT == 125s`、`agent24_os_sdk::clients::{RECALL_PRECHECK_MAX_PAGES, RECALL_PRECHECK_PAGE_SIZE, DEDUP_KEY_FIELD} == (10, 50, "dedup_key")`；连接死时退出码仍是 70（`main.rs` 的钩子原样传入）。
 5. **HTTP 面不变**：Sin90 `cargo test` 全绿（包含 `http/tests.rs` 的 fired 400 用例，因为 fired handler 没动）。
 6. **结构判据**：Sin90 仓库根新增 `clippy.toml`，内容是 SDK 名单里**Unix socket / fd 的子集**（`tokio::net::{UnixStream,UnixListener,UnixSocket,UnixDatagram}`、`std::os::unix::net::{UnixStream,UnixListener,UnixDatagram}`、`std::os::fd::OwnedFd`、`FromRawFd::from_raw_fd`），CI 现有的三条 `cargo clippy --all-targets -- -D warnings` 就是判据。**不照搬 SDK 的全表**（M7 要求「同一份」，这里有理由地收窄）：TCP 与 JSON 两部分在 Sin90 里有合法用途——standalone 模式本来就 `tokio::net::TcpListener::bind(("127.0.0.1", port))`（`main.rs:109`），黑盒测试用 `std::net::TcpStream`（`tests/agent24_mount_blackbox.rs:23,172,625-675`），领域代码到处 `serde_json::from_str` 解析库里的 JSON 列与模型输出（`store/repo.rs`、`core/types.rs`、`ai/*` 约 30 处）；它们与「经 SDK 连 Agent24」无关。**正对照已实测**（附录 A.6）：把这份子集放进迁移前的 Sin90 `135ddb7` 树跑 `cargo clippy --all-targets -- -D warnings` → 退出 101，28 条 `use of a disallowed`，**全部落在迁移会删/改掉的三个文件**（`adapter_agent24/mod.rs` 14、`transport.rs` 10、`clients/test_support.rs` 4），树里其它文件 0 条——所以迁移后变绿即证明 Sin90 不再自己碰 socket/fd。
@@ -681,27 +718,27 @@ Sin90 的 `clients/test_support.rs`（`135ddb7`）导出的 API 与签名，prot
 
 | # | 判据 | PR | 怎么验（机械） | 正对照 / 变异 | scratch |
 |---|---|---|---|---|---|
-| J-S1 | SDK 不持有 socket/fd、不自己把字节解析成 JSON | a3-skel | `cargo +1.98.0 clippy -p agent24-os-sdk --all-targets -- -D warnings` 绿（开与不开 `test-util` 各一次） | `--features positive-control`（`positive_control.rs` 名单每项一行）必须失败，且：错误条数 == 去重种类数 == `grep -c '{ path = ' clippy.toml`（今天 24）。CI 三步：`! cargo clippy … --features positive-control > log`、`grep -c 'use of a disallowed' log`、`grep -o "use of a disallowed [a-z]* \`[^\`]*\`" log \| sort -u \| wc -l` | ✅ 24/24/24，退出 101；绕过实验 b1–b10 除 b3 外全抓（A.3） |
-| J-S1b | proto / os-fd 不给 SDK 留后门：不导出宏、不导出 socket/fd 类型的别名或转出 | a3-skel | `rg -n '#\[macro_export\]\|pub\s+(type\|use)\b[^;]*\b(UnixStream\|UnixListener\|UnixSocket\|UnixDatagram\|TcpStream\|TcpListener\|TcpSocket\|UdpSocket\|OwnedFd\|RawFd\|FromRawFd)\b' rust/crates/agent24-os-proto/src rust/crates/agent24-os-fd/src` 输出为空（CI 里 `! rg …`） | 在 proto 加 `pub type Sock = tokio::net::UnixStream;` 或一个 `#[macro_export]` 宏 → 命中 → 红。真实 proto 今天为空 | ✅ 真实 proto、scratch 为空；`sdk-bypass/proto` 命中 2 行（A.4） |
+| J-S1 | SDK 不持有 socket/fd、不自己把字节解析成 JSON | a3-skel | `cargo +1.98.0 clippy -p agent24-os-sdk --all-targets -- -D warnings` 绿，外加 `cargo +1.98.0 clippy -p agent24-os-sdk --lib --features test-util -- -D warnings` 绿（v3，L1：`--all-targets` 已经经 dev 依赖打开了 `test-util`，第二次只需要确认**库本身**在开 `test-util` 时也干净——`testing` 转出、`with_env`、`RequestId::for_test` 都在库里） | `--features positive-control`（`positive_control.rs` 名单每项一行）必须失败，且：错误条数 == 去重种类数 == `grep -c '{ path = ' clippy.toml`（今天 26）。CI 三步：`! cargo clippy … --features positive-control > log`、`grep -c 'use of a disallowed' log`、`grep -o "use of a disallowed [a-z]* \`[^\`]*\`" log \| sort -u \| wc -l`。名单是绊线不是沙箱，已知残余 b13/b14 不防（§2.2） | ✅ 26/26/26，退出 101（真 clippy 0.1.98）；绕过实验 b1、b3–b12 全抓，b2/b15 归 J-S1b，b13/b14 记录不防（A.3） |
+| J-S1b | proto / os-fd 不给 SDK 留后门（v3 按 H-2 重写：clippy 看不穿跨 crate 别名） | a3-fd（proto `module*` 与 os-fd 在这一片之后才都存在） | `python3 rust/scripts/check-proto-exports.py rust/crates/agent24-os-proto rust/crates/agent24-os-fd` 退出 0。规则（只看去掉 `//` 注释后的代码）：① proto 与 os-fd 全部源码无 `#[macro_export]`；② proto 的 `src/module*`（`module.rs` 与 `module/` 目录）与 os-fd **不许有任何 `pub type`**；③ 同范围内 `pub use` 只能以 `crate::`/`self::`/`super::` 开头（只转出 crate 内部项；把私有 `use` 再 `pub use` 出去是编译错误 E0364，不需要脚本管）；④ proto 全部源码（含内核侧）不许有点名 socket/fd 类型的 `pub type`/`pub use`。用 Python 而不是 `rg`：v3 实测 `rg` 不在 `sh` 的 PATH 里时，v2 的 `! rg …` 写法会**静默通过**；脚本目录不存在时直接失败 | 在 scratch proto `module.rs` 加两跳别名（`type Inner = tokio::net::UnixStream; pub type Sock2 = Inner;`）→ 红；加 `pub use tokio::net::UnixStream as S;` → 红；在 `lib.rs` 加 `#[macro_export]` 宏 → 红；在内核侧加 `pub type K = tokio::net::UnixStream;` → 红；在 os-fd 加 `pub type L = UnixListener;` → 红；目录不存在 → 红。负对照：`pub use crate::initialize::Offer as ReOffer;` → 绿 | ✅ scratch（proto `module.rs` + os-fd）与真实 proto 今天均绿；6 条正对照全红、1 条负对照绿（A.4） |
 | J-S2 | SDK 普通依赖恰为允许集合 | a3-skel | `cargo metadata --format-version 1 --no-deps \| jq -r '.packages[] \| select(.name=="agent24-os-sdk") \| .dependencies[] \| select(.kind==null) \| .name' \| sort \| tr '\n' ' '` 等于 `agent24-os-proto axum serde serde_json thiserror tokio tracing `（v1 的 `cargo tree … \| grep '^agent24-'` 会把 SDK 自己那一行也打出来，恒为两行，M1） | 在 SDK `Cargo.toml` 临时加 `agent24-domain` → 输出多一项 → 红 | ✅ 正/负都跑过（A.5） |
-| J-S3 | 全工作区只有 os-fd 能有 `unsafe`，且只有一处 | a3-fd（脚本）、a3-skel（SDK 正对照） | ① `scripts/check-lints.py`：对 `cargo metadata --no-deps` 的每个工作区成员用 `tomllib` 读 `Cargo.toml`，断言 `lints.workspace == true`，唯一例外 `agent24-os-fd` 必须**不**继承且 `lints.rust.unsafe_code == "deny"`；② `rg -c '#\[allow\(unsafe_code\)\]' rust/` 恰 1 处且在 `agent24-os-fd/src/lib.rs` | ① 删掉 proto 的 `[lints] workspace = true` → 脚本红；② `cargo check -p agent24-os-sdk --features positive-control-unsafe`（内含 `unsafe {}`）必须编译失败（`usage of an unsafe block`） | ✅ 脚本在 scratch 与**真实 Agent24 工作区**都绿；删 lints 正对照红；unsafe 正对照编译失败（A.5） |
+| J-S3 | 全工作区只有 os-fd 能有 `unsafe`，且只有一处 | a3-skel（脚本 + SDK 正对照；a3-fd 加入 os-fd 后同一脚本自动要求恰 1 处） | `python3 rust/scripts/check-lints.py`（在 `rust/` 下跑）：① 对 `cargo metadata --no-deps` 的每个工作区成员用 `tomllib` 读 `Cargo.toml`，断言 `lints.workspace == true`，唯一例外 `agent24-os-fd` 必须**不**继承且 `lints.rust.unsafe_code == "deny"`；② **os-fd 重述的 lint 表去掉 `rust.unsafe_code` 后与 `[workspace.lints]` 去掉同一项后完全相等**（v3，L2：工作区以后加一条 lint，os-fd 忘了抄就红）；③ 扫所有成员的 `.rs`（去掉 `//` 注释），正则 `\b(allow\|expect)\s*\([^)]*\bunsafe_code\b`——覆盖 `#[allow(unsafe_code)]`、`#![allow(unsafe_code)]`、多项 `#[allow(dead_code, unsafe_code)]`、`#[expect(unsafe_code)]`、`cfg_attr(…, allow(unsafe_code))`（v3，L2）——命中恰 1 处且在 os-fd（os-fd 尚未加入时恰 0 处） | ① 删掉 proto 的 `[lints] workspace = true` → 红；② os-fd 的 `unwrap_used` 改 `warn` → 红，os-fd 多加一条 `dbg_macro` → 红；③ 在 proto 加 `#![allow(unsafe_code)]` / `#[allow(dead_code, unsafe_code)]` / `#[expect(unsafe_code)]` / `#[cfg_attr(unix, allow(unsafe_code))]` → 各自红；④ `cargo check -p agent24-os-sdk --features positive-control-unsafe`（内含 `unsafe {}`）必须编译失败（`usage of an unsafe block`） | ✅ scratch 绿（1 处）、**真实 Agent24 工作区**（`bb3505a`）绿（0 处）；上列 7 条正对照全红；unsafe 正对照编译失败（A.5） |
 | J-S4 | 错误映射覆盖内核闭集 | b1a | 测试遍历 `agent24_os_proto::rpc::ErrorKind::ALL`（18 个），每个 kind 映射到文档表里写死的变体；`-32602`、`timeout+retryable:false`、`unavailable` 缺 cause/缺 retryable/非布尔 retryable 各一例 | 删掉 `"quota_exceeded"` 分支 → 该例红；proto 新增第 19 个 kind 而 SDK 表没更新 → 遍历测试红 | |
 | J-S5 | 前缀门控 | b2a–b3b | 5 个客户端 × {`Offer` 含前缀 → `Some`，不含 → `None`} 共 10 例，用 `testing::fake_kernel` | 把某个 `new` 改成无条件 `Some` → 对应例红 | |
 | J-S6 | 缺省不发 | b2a–b3b | 每个带可选字段的方法，`None` 时假内核收到的 params **没有**该键 | 把 `set_opt` 改成写 `Value::Null` → 红 | |
 | J-S7 | 与内核 wire 对等（M6：落到各回调模块自己的单测） | b2a–b3b（每个客户端随自己的 PR） | agentd dev 依赖 SDK（`features = ["test-util"]`）。在 `events_emit.rs`、`memory_callback.rs`、`approval_callback.rs`、`scheduler_callback.rs`、`model_callback.rs` 各自的 `#[cfg(test)] mod tests` 里加 `sdk_wire_parity_*`：SDK 客户端跑在 `testing::fake_kernel` 上，假内核把收到的 params **原样**交给该模块现有的 handler 夹具 `h.call(params)`（`events_emit.rs:518-528` 的 `handler(..)`、`memory_callback.rs:348`/`:657` 的 `RememberHandler`/`RecallHandler`、`approval_callback.rs:372`/`:448` 的 `submit_handler`、`scheduler_callback.rs:1256`/`:1286` 的 `fx.upsert`/`fx.delete`、`model_callback.rs:1402` 的 `handler(..)`），再把 handler 的返回值作为响应回给 SDK，由 SDK 自己的结果类型解析。每个方法两次调用：**可选字段全填 `Some`**（`request_id` 用 `RequestId::for_test`，夹具能 admit 该 id 的就 admit——`approval_callback.rs:482` 的 `generation_with_good_params_admitted` 即此——使调用成功；不能的，断言错误不是 `-32602`，即 params 已被 `deny_unknown_fields` 类型接受）；**可选字段全 `None`** → 必须成功且 SDK 解析出结果 | 把 SDK `UpsertRequest` 的 `label` 键改名 → `fx.upsert` 返回 `-32602` → 红；把 SDK `Remembered` 的 `id` 改名 → 结果解析失败 → 红 | |
 | J-S8 | transport 语义 | a2-core、a2-cancel | Sin90 `transport.rs:686-1378` 的 16 条测试移植到 proto（第 65 个在途 `Busy`、drop 发**逐字节**正确的 cancel 帧、正常完成不发 cancel、迟到响应被丢且连接继续可用、断连 → 在途 `ConnectionLost` 且钩子恰好一次、关闭后调用 `NotSent`、超大帧在写任务前被拒、恰好 1 MiB 可过、响应超时 → `Timeout`+cancel、写超时 → 钩子一次、非 JSON 帧/超大入帧触发钩子、`slot_wait` 成功与超时）；前 8 条随 a2-core，后 8 条随 a2-cancel | 各测试原有的变异说明随迁移保留；新增：把 `CallGuard::drop` 里的 cancel 删掉 → cancel 帧测试红 | |
 | J-S9 | 超时关系 | a2-cancel（前半）、b3b（后半） | proto 编译期断言 `DEFAULT_RESPONSE_TIMEOUT > rpc::CALL_TIMEOUT`；agentd 测试断言 `agent24_os_sdk::clients::MODEL_RESPONSE_TIMEOUT > model_callback::MODEL_CALL_TIMEOUT` | 把 35 改成 30 → 编译失败；把 125 改成 120 → agentd 测试红 | ✅ 前半的 `const _: () = assert!(…)` 已写在 scratch proto 并编译 |
-| J-S10 | fired 提取器 | c1 | (a) SDK 测试：合法请求 200；缺 `X-A24-Fire-Id` 400；body 多一个字段 400；时间戳非定宽 400；`Result<FiredDelivery, FiredRejection>` 可自定义形状。(b) **内核真实发出的字节**被 SDK 接受（M7）：`scheduler_deliver.rs` 的 `deliver_on_posts_the_declared_namespace_path_and_the_fired_body_shape`（`:262-388`）在已有断言之后，把 mock 上游收到的 `head`（`x-a24-fire-id`/`x-a24-schedule-key` 头）与 `body` 字节原样组成 `axum::http::Request`，喂给 `FiredDelivery::from_request`，断言 `Ok` 且 `fire_id`/`schedule_key`/`body.key`/`body.trigger` 等于本次投递的值 | (a) 去掉 `deny_unknown_fields` → 多字段例红；(b) 把内核 `fmt_iso` 改成带毫秒、或把 `FiredBody` 某字段改名 → 该测试红（v1 自审第 5 条的耦合由它钉住） | ✅ (a) 4 条；(b) 的 SDK 半边：按 agentd 私有 `FiredBody<'a>` 逐字段复刻的序列化结果被提取器接受（`kernel_shaped_fired_body_is_accepted`） |
+| J-S10 | fired 提取器 | c1b（(b) 用到的 `FiredBody` 在 c1a 挪进 proto） | (a) SDK 测试：合法请求 200；缺 `X-A24-Fire-Id` 400；body 多一个字段 400；时间戳非定宽 400；`Result<FiredDelivery, FiredRejection>` 可自定义形状。(b) **内核真实发出的字节**被 SDK 接受（M7）：`scheduler_deliver.rs` 的 `deliver_on_posts_the_declared_namespace_path_and_the_fired_body_shape`（`:262-388`）在已有断言之后，把 mock 上游收到的 `head`（`x-a24-fire-id`/`x-a24-schedule-key` 头）与 `body` 字节原样组成 `axum::http::Request`，喂给 `FiredDelivery::from_request`，断言 `Ok` 且 `fire_id`/`schedule_key`/`body.key`/`body.trigger` 等于本次投递的值 | (a) 去掉 `deny_unknown_fields` → 多字段例红；(b) 把内核 `fmt_iso` 改成带毫秒、或把 `FiredBody` 某字段改名 → 该测试红（v1 自审第 5 条的耦合由它钉住） | ✅ (a) 4 条；(b) 的 SDK 半边：按 agentd 私有 `FiredBody<'a>` 逐字段复刻的序列化结果被提取器接受（`kernel_shaped_fired_body_is_accepted`） |
 | J-S11 | 握手内容来自 manifest，协议范围是 `{1,1}` | **a3-module**（M3：v1 放在 a1，但它测的是 `Module::connect`，a3 才有） | `testing::FakeEndpoint::bind(tmp)` 得到 `(env, ep)`；`Module::builder(manifest).with_env(env, recording_hook().0).connect()` 与 `ep.accept_initialize(reply)` 并发；断言捕获的 params：`module == manifest.name`、`capabilities == manifest.kernel_capabilities`、`protocol_versions == {"min":1,"max":1}`（L1）、`manifest_digest == manifest_digest(manifest 字节)` | 在 SDK 里硬编码 `capabilities` → 用一份能力不同的 manifest（运行时拼的 `String`，§3.2）跑 → 红；把 `PROTOCOL_MAX` 改回 1000 → 红 | ✅ 形状编译通过（`js11_shape`，scratch 的 proto 是桩，不运行） |
 | J-S12 | 握手后残字节 | a1 | proto 内部测试：本地 `UnixListener` 充当内核，在 `initialize` 响应后同一次写入里多塞一行 → `connect_from_env` 返回 `ConnectError::Protocol` | 删掉该检查 → 红 | |
 | J-S13 | example 挂载冒烟 | c2 | `rust/apps/agent24d/tests/me4_sdk_minimal_blackbox.rs`：构建 `examples/minimal`、`os install`、`os list` 为 `mounted`、经代理 GET `/api/v1/minimal/hello` 得 200 且 `bound: true`、事件流看到 `hello.seen`、一次 `run_now` 后看到 `minimal.fired`；`--list` 断言 1 条 | 把 example 的 `route_namespace` 改错 → 代理 404 → 红 | |
-| J-S14 | 发布 | c2 | `git ls-remote --tags origin agent24-os-sdk-v0.1.0` 非空；探针 `4c SDK` 为 ●；`CHANGELOG.md` 有 `0.1.0` 小节且含「最低内核版本」一行（L10） | — | |
+| J-S14 | 发布 | c2 合并**之后**的发布步骤（v3，L5：tag 只能打在已合并的 main 提交上，不是 c2 PR 里能跑的判据） | c2 PR 内：`CHANGELOG.md` 有 `0.1.0` 小节且含「最低内核版本」一行（L10）。c2 合并后：在 main 的合并提交上打 `agent24-os-sdk-v0.1.0` 并推送，`git ls-remote --tags origin agent24-os-sdk-v0.1.0` 非空且指向该提交；探针 `4c SDK` 为 ●；tasks.md 的 c2 行在这两步做完后才标 DONE | — | |
 | J-S15 | SDK ↔ wire 文档对齐（ME4-5.4.1 执行） | 5.4.1 | 抽取：`rg -o --no-filename '"(/?_a24/[a-z_/]+\|x-a24-[a-z-]+\|\$/[A-Za-z]+\|A24_[A-Z_]+)"' rust/crates/agent24-os-sdk/src rust/crates/agent24-os-proto/src/module* \| sort -u`；**先断言抽取数 ≥ 26**（M7 的正对照：11 个方法名 + 5 个前缀 + `/_a24/scheduler/fired` + `$/cancelRequest` + 4 个头 + 4 个环境变量），再逐个在 `WIRE-OOP-MODULE.md` 里 `grep -F` 命中 | 抽取数：把某个方法名 const 改成 `concat!(…)` 拼接 → 数量降到 25 → 红；对齐：在 SDK 里新增一个未入文档的方法名 → 红 | ✅ scratch 抽出 26；`concat!` 变异降为 25（A.7） |
 | J-S16 | Sin90 零行为变化 | 5.2.1 | §5.2 的 1–8 条 | 见 §5.2 | ✅ 第 6 条的正对照（迁移前 28 处全在三个待删/改文件，A.6） |
 | J-S17 | Cos72 只经 SDK | 5.3.x | Cos72 仓库放与 Sin90 相同的 Unix socket / fd 子集 `clippy.toml`（§5.2 第 6 条；Cos72 没有 standalone TCP 需求的话可以直接用 SDK 全表，由 5.3.1 定），CI `clippy -D warnings` | 在 Cos72 写 `UnixStream::connect` → 红 | |
-| J-S18 | `remember_once` 预查算法（H3） | b2d | SDK 单测，预查循环对一个脚本化的 `recall` 闭包跑（`precheck` 是私有纯函数，不需要连接）：(a) 第 3 页出现精确标记 → `Found`，恰好调用 3 次；(b) 翻完无精确标记（每页都有 `"r:10"` 这种子串近似项）→ `NotFound`；(c) 50 页都有 cursor → `Inconclusive`，恰好 10 次；边界：第 10 页命中 → `Found`，第 11 页命中 → 仍 `Inconclusive`。另加 fake_kernel 上的整合用例：`Created` 时 `remember` 的 body 含 `dedup_key`；body 自带不同 `dedup_key` → `InvalidParams` 且假内核零调用 | 把精确相等改成 `contains` → (a)(b)(c) 全红；`RECALL_PRECHECK_MAX_PAGES` 改 11 → (c) 红 | ✅ 3 条全过；两个变异分别 3 红、1 红（A.2） |
+| J-S18 | `remember_once` 预查算法（H3） | b2b（v3 与 memory 客户端合并） | SDK 单测，预查循环对一个脚本化的 `recall` 闭包跑（`precheck` 是私有纯函数，不需要连接）：(a) 第 3 页出现精确标记 → `Found`，恰好调用 3 次；(b) 翻完无精确标记（每页都有 `"r:10"` 这种子串近似项）→ `NotFound`；(c) 50 页都有 cursor → `Inconclusive`，恰好 10 次；边界：第 10 页命中 → `Found`，第 11 页命中 → 仍 `Inconclusive`。另加 fake_kernel 上的整合用例：`Created` 时 `remember` 的 body 含 `dedup_key`；body 自带不同 `dedup_key` → `InvalidParams` 且假内核零调用 | 把精确相等改成 `contains` → (a)(b)(c) 全红；`RECALL_PRECHECK_MAX_PAGES` 改 11 → (c) 红 | ✅ 3 条全过；两个变异分别 3 红、1 红（A.2） |
 | J-S19 | 握手响应宽松解析（H2） | a1 | proto 单测 `initialize_reply_is_lenient_where_the_kernel_type_is_strict`：多余字段让 `InitializeResult` 失败、`InitializeReply` 成功且值正确；`InitializeResult` 往返到 `InitializeReply` 值相同 | 给 `InitializeReply` 加 `deny_unknown_fields` → 红 | ✅（A.1） |
-| J-S20 | fd 接管校验（H1） | a3-fd | os-fd 单测（真实 fd）：监听 Unix socket 通过；socketpair 端 `NotListening`；`/dev/null` `NotASocket`；TCP 监听 `NotUnix`；第二次 `take_inherited_listener()` → `AlreadyTaken`。macOS 与 Linux CI 各跑一次（监听判定两个平台走不同分支） | 把 `is_listening` 改成恒 `true` → socketpair 例红；去掉 `TAKEN` 检查 → 第二次调用例红 | ✅ macOS 上 5 条全过（A.1） |
+| J-S20 | fd 接管校验（H1；v3 按 M-1/M-2 补全） | a3-fd | os-fd 单测（真实 fd）：监听 Unix socket 通过；socketpair 端 `NotListening`；对端已关闭的 socketpair 端 `NotListening`（macOS 经 `EINVAL` 映射）；`/dev/null` `NotASocket`；TCP 监听 `NotUnix`；只 `bind` 未 `listen`：非 Apple 目标 `bound_but_not_listening_is_rejected`（`NotListening`）/ Apple 目标 `apple_gap_bound_but_not_listening_passes`（**断言通过**，钉住 §4.3 已知缺口）；第二次 `take_inherited_listener()` → `AlreadyTaken`。CI：`ubuntu-latest`（现有 job，编译并运行 Linux 分支）+ a3-fd 新增的 `macos-latest` job（只跑 `cargo test -p agent24-os-fd`，运行 apple 分支） | 把 `is_listening` 改成恒 `true` → socketpair 例红；去掉 apple 分支的 `INVAL` 映射 → 对端已关闭例红（scratch 实测）；去掉 `TAKEN` 检查 → 第二次调用例红 | ✅ macOS 上 7 条全过；`INVAL` 变异红；Linux 分支 `--target x86_64-unknown-linux-gnu` clippy `-D warnings --all-targets` 绿（A.1、A.10） |
 
 ---
 
@@ -711,31 +748,33 @@ v1 按「非注释代码行」估算，与 PR-Daemon 的 SZ-1 口径不符（M10
 
 估算方法：scratch 各文件非测试行数（含注释）× 注释系数。Sin90 被移植代码的实测注释密度：`transport.rs` 非测试 539 行里注释 178、`error.rs` 398 行里注释 250、`reconciler.rs` 1181 行里注释 590——移植时保留 Sin90 的设计说明（评审轮次磨出来的「为什么」），所以按 1.5 左右的系数估。
 
-| 新编号 | 内容 | 仓库 | SZ-1 估算 | 判据 | 依赖 |
+| 新编号 | 内容 | 仓库 | SZ-1 估算 | 判据 | 依赖（DAG：开 PR 前这些必须已合进 main） |
 |---|---|---|---|---|---|
-| ME4-5.1.2a1 | proto `module`：`ModuleEnv`（`from_env`/`from_vars`，不持 fd）、`SPAWN_ENV_VARS`、`Hello`、`InitializeReply`、`connect_from_env` 的握手部分（先返回一个只能 `offer()` 的连接）、`manifest::{ManifestFacts, facts_from_yaml}`、`manifest_digest` 从 os-packages 挪入（os-packages 转出 + 新依赖边） | Agent24 | ~260 | J-S12、J-S19 | 5.1.1 冻结 |
+| ME4-5.1.2a1 | proto `module`：`ModuleEnv`（`from_env`/`from_vars`，不持 fd）、`SPAWN_ENV_VARS`、`Hello`、`FatalHook`（newtype）、`InitializeReply`、`connect_from_env` 的握手部分（先返回一个只能 `offer()` 的连接）、`manifest::{ManifestFacts, facts_from_yaml}`、`manifest_digest` 从 os-packages 挪入（os-packages 转出 + 新依赖边） | Agent24 | ~270 | J-S12、J-S19 | 5.1.1 冻结 |
 | ME4-5.1.2a2-core | proto `Connection` mux 核心：`RpcErrorInfo`/`CallError`、单写任务、读任务按 id 分发、pending 表、`declare_dead` 恰好一次、NotSent/ConnectionLost、64 在途 | Agent24 | ~290 | J-S8 前 8 条 | a1 |
 | ME4-5.1.2a2-cancel | `CallGuard` drop 发 cancel、响应兜底超时、写超时、`slot_wait`、`DEFAULT_RESPONSE_TIMEOUT` 编译期断言 | Agent24 | ~240 | J-S8 后 8 条、J-S9 前半 | a2-core |
-| ME4-5.1.2a2-kit | `module::testing`（`test-util`）：与 Sin90 `test_support.rs` 同签名的 5 个函数 + `FakePeer` + `noop_hook`/`recording_hook` + `FakeEndpoint` | Agent24 | ~160 | 自测：用它重写 J-S12 的一条用例 | a2-cancel |
-| ME4-5.1.2a3-fd | 新 crate `agent24-os-fd`（`take_inherited_listener`、校验、Linux/macOS 两个监听判定分支）+ proto `take_listener`/`ListenError`/常量断言 + 工作区成员 + `scripts/check-lints.py` 与其 CI 步骤 | Agent24 | ~220 | J-S3①②、J-S20 | a2-kit |
-| ME4-5.1.2a3-skel | SDK crate 骨架：`Cargo.toml`（features、`rust-version`）、`clippy.toml`、`positive_control.rs`、`positive_control_unsafe.rs`、`lib.rs`、CI 步骤（J-S1 三步、J-S1b、J-S2、1.88 check） | Agent24 | ~190 | J-S1、J-S1b、J-S2、J-S3 的 SDK 正对照 | a3-fd |
-| ME4-5.1.2a3-module | `Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env` | Agent24 | ~210 | J-S11 | a3-skel |
-| ME4-5.1.2b1a | `ClientError`、`UnavailableCause`、两路映射、`is_permanent`/`is_retryable` | Agent24 | ~260 | J-S4 | a3-module |
-| ME4-5.1.2b1b | `RequestContext`/`RequestId`（含 `for_test`）/`ApprovalToken`、客户端公共 `Core`、`set_opt`、`clients::METHODS` 骨架 | Agent24 | ~200 | 提取器单测 | b1a |
-| ME4-5.1.2b2a | Events（含 sink、按 2 的幂打日志）+ agentd `events_emit.rs` 对等测试 | Agent24 | ~210 | J-S5/J-S6/J-S7（events） | b1b |
-| ME4-5.1.2b2b | Memory（`remember`/`recall`/`recent`）+ agentd `memory_callback.rs` 对等测试 | Agent24 | ~140 | J-S5/J-S6/J-S7（memory） | b2a |
-| ME4-5.1.2b2c | Approval（含 advise 的 §2.10 文档）+ agentd `approval_callback.rs` 对等测试 | Agent24 | ~170 | J-S5/J-S6/J-S7（approval） | b2b |
-| ME4-5.1.2b2d | `remember_once`（§8 Q5 拍板） | Agent24 | ~150 | J-S18 | b2c |
-| ME4-5.1.2b3a | Scheduler + agentd `scheduler_callback.rs` 对等测试 | Agent24 | ~210 | J-S5/J-S6/J-S7（scheduler） | b2d |
-| ME4-5.1.2b3b | Model + agentd `model_callback.rs` 对等测试 | Agent24 | ~180 | J-S5/J-S6/J-S7（model）、J-S9 后半 | b3a |
-| ME4-5.1.2c1 | `FiredBody` 挪进 `kernel_call`（agentd 改用）+ fired 提取器与 `with_fired` | Agent24 | ~210 | J-S10 | b3b |
-| ME4-5.1.2c2 | `examples/minimal` + 挂载冒烟 + 探针 `4c` + `CHANGELOG.md`（含最低内核版本）+ tag `agent24-os-sdk-v0.1.0` | Agent24 | ~110 + 测试 | J-S13、J-S14 | c1 |
+| ME4-5.1.2a2-kit | `module::testing`（`test-util`）：与 Sin90 `test_support.rs` 同签名的 5 个函数 + `FakePeer` + `noop_hook`/`recording_hook` + `FakeEndpoint` | Agent24 | ~160 | 自测：用它重写 J-S12 的一条用例 | a2-core |
+| ME4-5.1.2a3-fd | 新 crate `agent24-os-fd`（`take_inherited_listener`、校验、Linux/macOS 两个监听判定分支与缺口钉子）+ proto `take_listener`/`InheritedListener`/`ListenError`/常量断言 + 工作区成员 + `scripts/check-proto-exports.py`（J-S1b）+ CI：J-S1b 步骤与新增 `macos-latest` job（只跑 `cargo test -p agent24-os-fd`，§4.3 第 7 条） | Agent24 | ~250 | J-S1b、J-S20（J-S3 ③ 由 a3-skel 的脚本在本片 CI 上自动变成「恰 1 处」） | **a1**（只需要 proto `module` 存在） |
+| ME4-5.1.2a3-skel | SDK crate 骨架：`Cargo.toml`（`rust-version`、`positive-control`/`positive-control-unsafe`；`test-util = []` 先占位，a3-module 改为转发 proto 的 `test-util`——proto 的这个 feature 在 a2-kit 才有）、`clippy.toml`（26 项）、`positive_control.rs`、`positive_control_unsafe.rs`、`lib.rs`、`scripts/check-lints.py`（J-S3）+ CI 步骤（J-S1 三步、J-S2、J-S3、1.88 check） | Agent24 | ~250 | J-S1、J-S2、J-S3 | **无**（从 main 开；只需 5.1.1 冻结） |
+| ME4-5.1.2a3-module | `Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env`，`connect()` 里接管监听器（§3.2）；`test-util` 改为转发；**不含**任何客户端访问器（`Module::events()` 等随各客户端 PR 加） | Agent24 | ~210 | J-S11 | a2-kit、a3-fd、a3-skel |
+| ME4-5.1.2b1a | `ClientError`、`UnavailableCause`、两路映射、`is_permanent`/`is_retryable` | Agent24 | ~260 | J-S4 | a2-core、a3-skel |
+| ME4-5.1.2b1b | `RequestContext`/`RequestId`（含 `for_test`）/`ApprovalToken`、客户端公共 `Core`、`set_opt`、**空的** `clients::METHODS` 骨架（`[&[&str]; 0]`，每个客户端 PR 把自己的 `METHODS` 加进去并把数组长度 +1，c2 时为 5） | Agent24 | ~200 | 提取器单测 | b1a |
+| ME4-5.1.2b2a | Events（含 sink、按 2 的幂打日志）+ `Module::events()` + `clients::METHODS` 加一项 + agentd `events_emit.rs` 对等测试 | Agent24 | ~210 | J-S5/J-S6/J-S7（events） | b1b、a2-cancel、a3-module |
+| ME4-5.1.2b2b | Memory（`remember`/`recall`/`recent`）**+ `remember_once`**（v3 把 v2 的 b2d 并进来）+ `Module::memory()` + `clients::METHODS` 加一项 + agentd `memory_callback.rs` 对等测试 | Agent24 | **实测 209**（A.9） | J-S5/J-S6/J-S7（memory）、J-S18 | b1b、a2-cancel、a3-module |
+| ME4-5.1.2b2c | Approval（含 advise 的 §2.10 文档）+ `Module::approval()` + `clients::METHODS` 加一项 + agentd `approval_callback.rs` 对等测试 | Agent24 | ~170 | J-S5/J-S6/J-S7（approval） | b1b、a2-cancel、a3-module |
+| ME4-5.1.2b3a | Scheduler + `Module::scheduler()` + `clients::METHODS` 加一项 + agentd `scheduler_callback.rs` 对等测试 | Agent24 | ~210 | J-S5/J-S6/J-S7（scheduler） | b1b、a2-cancel、a3-module |
+| ME4-5.1.2b3b | Model + `Module::model()` + `clients::METHODS` 加一项 + agentd `model_callback.rs` 对等测试 | Agent24 | ~180 | J-S5/J-S6/J-S7（model）、J-S9 后半 | b1b、a2-cancel、a3-module |
+| ME4-5.1.2c1a | `FiredBody`/`FireTrigger` 挪进 `agent24_os_proto::kernel_call`（拥有型），agentd `scheduler_deliver.rs` 改用（v3 从 c1 拆出） | Agent24 | ~60 | agentd 现有 `scheduler_deliver` 测试不变全绿 | **无**（从 main 开） |
+| ME4-5.1.2c1b | fired 提取器与 `with_fired` 注册点 | Agent24 | ~160 | J-S10 | c1a、b1b |
+| ME4-5.1.2c2 | `examples/minimal` + 挂载冒烟 + 探针 `4c` + `CHANGELOG.md`（含最低内核版本）；合并后打 tag `agent24-os-sdk-v0.1.0`（J-S14） | Agent24 | ~110 + 测试 | J-S13、J-S14 | a3-module、b2a、b2b、b2c、b3a、b3b、c1b |
 | ME4-5.2.0 / Sin90 TS.1.0（新增） | 线协议金样录制（迁移前，出站 + 入站，§5.1） | Sin90 | 测试为主 | 自身即金样 | — |
-| ME4-5.2.1 / Sin90 TS.1.1 | 迁移 | Sin90 | 净删 | J-S16 | c2、TS.1.0 |
+| ME4-5.2.1 / Sin90 TS.1.1 | 迁移（含 §5.2 第 3 条的期望补丁与检查脚本） | Sin90 | 净删 | J-S16 | c2（及其 tag）、TS.1.0 |
 
 说明：
-- 17 个 Agent24 PR，全部 stacked（按表中顺序），每个估算 ≤ 300。估算只是估算：任何一个在开 PR 前实测超 300，按表里已写好的子项再拆，不靠「原子单元」说辞过 SZ-1。
-- 对等测试（J-S7）随各自的客户端 PR 落地，而不是 v1 那样全部堆在 b3——它们在 agentd 的 `#[cfg(test)]` 区段里，不计入 SZ-1，但会让每个客户端 PR 自带「wire 形状与内核一致」的证据。
+- **17 个 Agent24 PR**（v3：b2b+b2d 合并 −1，c1 拆成 c1a/c1b +1），每个估算 ≤ 300。估算只是估算：任何一个在开 PR 前实测超 300，按表里已写好的子项再拆，不靠「原子单元」说辞过 SZ-1。b2b 合并后的读数是在 scratch 等价物上用 PR-Daemon 的 `pre-pr-check.sh` 实测的（A.9：SZ-1 = 209，另有 65 行 `#[cfg(test)]` 不计），余量 91 行留给从 Sin90 移植过来的设计注释。
+- **合并流程（v3，M-4）：一次只开一个 PR，base 一律 `main`。** 上一片合并后，下一片从最新的 `main` 起（或 rebase 到最新 `main`）再开 PR；**不用 stacked base，也从不改 base**——PR-Daemon 的约束是「合并自动删分支会连带关掉叠在它上面的 PR」「改 base 会作废已有 approve」，只要永远不叠，这两条都碰不到。依赖列是 DAG 而不是链：它只规定「开这一片之前 main 里必须已经有哪些片」。开发可以按 DAG 并行（没有未满足依赖的片可以先在本地从 main 起分支写好、跑绿），**开 PR 严格串行**。推荐的串行顺序（一个合法的拓扑序）：a1 → a2-core → a2-cancel → a2-kit → a3-fd → a3-skel → a3-module → b1a → b1b → b2a → b2b → b2c → b3a → b3b → c1a → c1b → c2；其中 a3-skel、c1a 没有前置，评审排队时可以插到任何位置。
+- `clients::METHODS` 与 `Module` 的客户端访问器**随各客户端 PR 逐步扩**（b1b 只放空骨架）：J-S15 的「抽取数 ≥ 26」在 c2 之前不作为 CI 判据（它属于 5.4.1），各客户端 PR 只需保证自己的方法名是完整的 `pub const`。
+- 对等测试（J-S7）随各自的客户端 PR 落地——它们在 agentd 的 `#[cfg(test)]` 区段里，不计入 SZ-1，但会让每个客户端 PR 自带「wire 形状与内核一致」的证据。
 - 5.1.2a1 之前**不**放 FU-86（proto feature 拆分）；若将来做，是 a1 之前的一个独立重构 PR。
 
 ---
@@ -816,10 +855,11 @@ v1 按「非注释代码行」估算，与 PR-Daemon 的 SZ-1 口径不符（M10
 4. **`Module::serve` 返回即意味着 HTTP 服务停了**，但连接可能仍活着；反之连接死了由 `FatalHook` 负责退出。两者不联动是 Sin90 现状，保留。
 5. ~~fired 时间戳校验与内核 `fmt_iso` 的耦合~~ → 由 J-S10(b) 用内核真实发出的字节钉住（§6）。
 6. ~~J-S15 漏掉拼接出来的方法名~~ → 各客户端写完整方法名 const、`Core::call` 只收 `&'static str`，J-S15 先断言抽取数 ≥ 26（§6）。
-7. **（v2 新）macOS 的监听判定是间接的。** `getpeername == ENOTCONN` 也会把「已绑定但未 `listen()` 的流 socket」判为监听中。内核传来的 fd 3 永远是 `listen()` 过的（`launch.rs:456` 起），出现这种 fd 意味着有人伪造环境，后果只是 `accept` 报错、模块退出，不会越权；Linux 上 `SO_ACCEPTCONN` 是直接判定。已在 os-fd 源码注释里写明。
+7. **（v2 新，v3 定稿）macOS 的监听判定是间接的、弱的，已接受。** `getpeername == ENOTCONN` 也会把「只 `socket()`/`bind()`、未 `listen()` 的流 socket」判为监听中（h1probe 实测）；对端已关闭的流回 `EINVAL`，映射为 `NotListening`。内核传来的 fd 3 永远是 `listen()` 过的（`launch.rs:456` 起），出现这种 fd 意味着有人伪造环境，后果只是 `accept` 报错、模块退出，不会越权；Linux 上 `SO_ACCEPTCONN` 是直接判定。缺口写进 §4.3 第 3 步与 os-fd 源码注释，由 `cfg(apple)` 测试钉住，macOS CI job 运行它（§4.3 第 7 条）。
 8. **（v2 新）rustix 版本分叉。** os-fd 用 rustix 1.1、proto 仍是 0.38（`agent24-os-proto/Cargo.toml` 的 `rustix = { version = "0.38", features = ["process"] }`）。1.1.4 已在锁文件里，不新增下载；proto 升 1.x 不在本轮。0.38.44 的 macOS panic 只在 `getsockname` 解码未命名 AF_UNIX 地址时出现，proto 今天不调它。
 9. **（v2 新）`remember_once` 超时后的残余重复。** 见 §3.5「残余风险」；与 Sin90 今天一致，FU-85 根治。
-10. **（v2 新）17 个 stacked PR 的合并成本。** 按记忆里的约束（合并自动删分支会杀掉 stacked PR、改 base 作废 approve），这条链要从底往上依次合、每合一个就把下一个 rebase 到 main 而不是改 base。开工前在 tasks.md 里把顺序写死（已写）。
+10. **（v2 新，v3 改写）17 个 PR 的合并方式。** v2 写的是「stacked、从底往上依次合、每合一个就把下一个 rebase 到 main」；v3 改为**根本不叠**：一次只开一个 PR、base 恒为 `main`、上一片合并后下一片才开（§7 说明第 2 条）。依赖改成 DAG 后，a3-skel、c1a 没有前置，a3-fd 只依赖 a1，客户端各片只依赖 b1b/a2-cancel/a3-module，串行队列里的顺序可以按评审节奏调整。代价是总工期更长（没有并行评审），换来的是永远碰不到「合并删分支关掉上层 PR」「改 base 作废 approve」。
+11. **（v3 新）本机 clippy 版本错位。** `rustup run 1.98.0 cargo clippy` 在本机调用的是 Homebrew 的 `cargo-clippy`（0.1.95），因为 `rustup run` 只替换它自己启动的那一个二进制、`cargo` 再去 PATH 里找 `cargo-clippy`。v3 用 `scratchpad/c98` 重跑了全部 clippy 读数（文首说明）；判据命令里写的是 `cargo +1.98.0 …`（rustup 代理会把整条工具链放到 PATH 前面），不受影响，但本地复现判据时不要用 `rustup run`。
 
 ---
 
@@ -829,16 +869,18 @@ v1 按「非注释代码行」估算，与 PR-Daemon 的 SZ-1 口径不符（M10
 
 - **FU-84** 审批裁决回推（§8 Q3 (b)：gate 扩展为「内核批准后回调模块」的可执行动作）。v2 补充：它也是 §2.10 孤儿审批的根治办法。
 - **FU-85** 内核 `remember` 幂等键（§8 Q5 (b)）。v2 补充：它同时消除 §3.5 的「超时后残余重复」。
-- **FU-86** proto `kernel`/`module` feature 拆分（§8 Q8）。
+- **FU-86** proto `kernel`/`module` feature 拆分（§8 Q8）。v3 补充（L4）：os-fd 用 rustix **1.x**，而 Sin90 锁文件今天只有 rustix 0.38.44（proto 与其它依赖带进来的）——Sin90 迁移后锁文件会**新增 rustix 1.x**，两个大版本并存编译；5.2.1 的冷编译时间记录要把这一项单列。拆 feature 之后模块侧仍需要 os-fd，所以拆分的判据改为「不再出现 proto 自己的 rustix 0.38」而不是「不再出现 rustix」（followups.md 同步）。
 
 **v2 新登记：**
 
 - **FU-87** `retry_class`（错误 → 重试处置的分类表）不进 SDK v0.1.0（§2.6，M5）：等 Cos72 的 outbox 落地后，按 Sin90 与 Cos72 两个真实调用方的实际分类表决定是否提取进 SDK，届时一并决定 `Cancelled` 归「结果未知」还是「普通退避」（Sin90 今天是后者，`reconciler.rs:745-752`）。
-- **ME4-CODEX-DEBT-8** 本文 v1 的第 1 轮评审是 Tier-2（Opus 子代理）；Codex 额度 2026-09-29 19:28 恢复后补一轮 Codex。
+- **ME4-CODEX-DEBT-8** 本文 v1 的第 1 轮评审与 v2 的复审都是 Tier-2（Opus 子代理）；Codex 额度 2026-09-29 19:28 恢复后对最终版补一轮 Codex。（rebase 到 `bb3505a` 后改号：origin/main 上 -7 已被 #512 占用。）
 
 ---
 
-## 11. 第 1 轮评审（Tier-2 Opus，结论 CHANGES）逐条处置
+## 11. 评审处置
+
+### 11.1 第 1 轮评审（v1，Tier-2 Opus，结论 CHANGES）逐条处置 → v2
 
 | 编号 | 问题（摘要） | 处置 | 落点 |
 |---|---|---|---|
@@ -869,30 +911,52 @@ v1 按「非注释代码行」估算，与 PR-Daemon 的 SZ-1 口径不符（M10
 | L10 | CHANGELOG 最低内核版本 | **修**，放 c2，J-S14 检查 | §2.8、§7 |
 | L11 | `with_fired` 文档写 10s / 3 次 | **修**，并补 5s/15s 退避与 64 KiB 响应上限，数值带出处 | §2.5、§3.6 |
 
+### 11.2 v2 复审（Tier-2 Opus，结论 CHANGES：2H/5M/5L）逐条处置 → v3
+
+| 编号 | 问题（摘要） | 处置 | 落点 |
+|---|---|---|---|
+| H-1 | 「`clients/model.rs` 测试模块 diff 0 行」做不到：测试 `use crate::ai::UnavailableCause` 并用它构造 `ClientError::Unavailable`，迁移后 cause 是 SDK 类型 | **修，按 (a)**。§5.2 第 3 条改为「与已提交的期望补丁逐字相等」，期望补丁只允许 `model.rs:223` 那一行改成 `use agent24_os_sdk::UnavailableCause;`（reconciler 部分为空）；脚本同时断言补丁本身只含这一对 `+/-` 行、找不到 `#[cfg(test)]` 即失败。实测：v2 脚本在正确迁移上 rc=1（问题复现）；v3 脚本绿；4 条正对照全红 | §5.1 model 行、§5.2 第 3 条、A.8 |
+| H-2 | H5 绕过分析标反：实测外部宏 b3 被抓、跨 crate 别名 b2 没被抓；`FromStr` 两条路未禁 | **修**。§2.2 表重做（b1–b15，v1/v2/v3 三列 + 「由谁挡」），附录 A.3 用真 clippy 0.1.98 重跑并按行号标注；名单加 `str::parse`、`core::str::FromStr::from_str` 到 26 项，正对照 26/26/26；J-S1b 改为「proto `module*` 与 os-fd 不许任何 `pub type`、`pub use` 只能转出 crate 内部项」+ 全 proto 无 `#[macro_export]` 与点名 socket 类型的别名，改用 Python（`rg` 缺失时 v2 写法会静默通过，实测），正对照补两跳别名，6 红 1 绿；`FatalHook` 由类型别名改 newtype、`take_listener` 返回具名 `InheritedListener`（否则 J-S1b 自己就过不了）；§2.2 写明名单是绊线不是沙箱，b13（`Json::from_request` 喂人工请求）、b14（`File::open("/dev/fd/N")`）列为已知残余、不防；PLAN S3-1 的那句「外部宏展开 clippy 不 lint」改正 | §2.2、§3.1、§4.3、J-S1、J-S1b、A.3、A.4、B.1、PLAN S3-1 |
+| M-1 | macOS 弱校验 | **接受并写明**。Linux `SO_ACCEPTCONN`；macOS `getpeername`：`ENOTCONN` → 监听、`Ok`/`EINVAL` → `NotListening`、其它 → `Io`；「`socket()`/`bind` 未 `listen` 也会通过」写进 §4.3 第 3 步与 os-fd 源码注释；新增 `cfg(apple)` 测试 `apple_gap_bound_but_not_listening_passes`（断言通过，钉住缺口）与非 Apple 的 `bound_but_not_listening_is_rejected`（断言 `NotListening`）；新增对端已关闭例覆盖 `EINVAL` 映射（去掉映射 → 红，实测）；h1probe 读数进 A.10 | §4.3、§9 第 7 条、J-S20、A.10、B.2 |
+| M-2 | J-S20 两个平台只跑了一个 | **修**。a3-fd 片的工作内容加一个 `macos-latest` CI job，只跑 `cargo test -p agent24-os-fd`；Linux 分支在现有 `ubuntu-latest` job 里编译并运行；本机另用 `--target x86_64-unknown-linux-gnu` 过了 clippy `-D warnings --all-targets` | §4.3 第 7 条、§7 a3-fd 行、J-S20、A.10 |
+| M-3 | 监听器接管时机与进程级一次性 | **修**。生产路径在 `connect()` 第一步接管（CLOEXEC 在模块能起子进程之前设上、坏 fd 启动即报错），存进 `Module`；`with_env` 路径跳过，`serve` 返回 `SdkError::NoListener`；写明「每个测试二进制至多一个测试调 `take_*`」，并写进 `take_listener` 文档注释与 os-fd 那条测试的注释 | §2.3 第 0 步、§3.2、B.1、scratch `module.rs` |
+| M-4 | 合并流程与依赖链 | **修**。一次只开一个 PR、base 恒为 `main`、不叠不改 base；依赖改 DAG：a3-fd 只依赖 a1，a3-skel 从 main 开，c1 拆出 c1a（`FiredBody` 挪进 proto + agentd 改用）从 main 开、c1b 为提取器；b2b+b2d 合并（SZ-1 实测 209）；写明 `clients::METHODS` 与 `Module` 访问器随各客户端 PR 逐步扩；J-S3 脚本随 a3-skel、J-S1b 脚本随 a3-fd（均实估 ≤ 300）。仍为 17 片 | §7、§9 第 10 条、PLAN §三、tasks.md |
+| M-5 | M4b 门状态 | **修，按事实判断**。rebase 后 origin/main 的 4.3.1 行是 `PR_OPEN #512`，而 #512 已于 2026-09-26 合并（`bb3505a`）→ 4.3.1 改 `DONE`。M4b 门的前置是「4.3.1、M3 门」：4.3.1 已 DONE，但 **M3 门（以及它的前置 M2 门）在台账上仍是 `BACKLOG`**——Sin90 `origin/main` 实际已含 T3.1.1–T3.5.1、T4.1.1–T4.4.1（`git log origin/main` 核对），只是这两行没人回填，且不在本分支的改动范围（本分支只动 M4b 门、4.3.1 与 5.x 行）。所以 M4b 门标 **`IN_PROGRESS`**，注明「Sin90 侧已满足（`135ddb7`）；待 M2/M3 门回填 DONE 后本行改 DONE」 | tasks.md |
+| L1 | 第二次 clippy 应只看库 | **修**。`cargo clippy -p agent24-os-sdk --lib --features test-util -- -D warnings` | J-S1、A.1 |
+| L2 | J-S3 正则漏 `#![allow]`/多项 allow/`expect`；os-fd 重述的 lint 可能漂移 | **修**。正则 `\b(allow\|expect)\s*\([^)]*\bunsafe_code\b`（去注释后匹配，也覆盖 `cfg_attr`）；断言 os-fd lint 表去掉 `unsafe_code` 后与 `[workspace.lints]` 相等；7 条正对照全红，真实工作区绿 | J-S3、A.5 |
+| L3 | §5.1 reconciler 行措辞 | **修**。写清删掉哪两个常量、测试模块只用到 `RECALL_PRECHECK_MAX_PAGES`（`:3678`）、补的那行必须是 `#[cfg(test)] use …`（否则非测试构建 `unused_imports`、`-D warnings` 红）、测试模块逐字不变（期望补丁 reconciler 部分为空）、测试模块里两处指向已删项的 intra-doc 链接不进 rustdoc | §5.1 reconciler 行 |
+| L4 | FU-86 漏了 rustix 1.x | **修**。Sin90 锁文件今天只有 rustix 0.38.44，迁移后新增 rustix 1.x（os-fd），冷编译记录单列；FU-86 的判据改为「不再出现 proto 自己的 rustix 0.38」 | §10、followups.md FU-86 |
+| L5 | J-S14 的 tag 不是 c2 PR 内能验的 | **修**。J-S14 拆成「c2 PR 内：CHANGELOG」与「c2 合并后：在 main 合并提交上打 tag、`ls-remote` 非空、探针 ●，然后 c2 行才标 DONE」 | J-S14、§7 c2 行 |
+| （自查） | 本机 `rustup run 1.98.0 cargo clippy` 实为 Homebrew clippy 0.1.95 | 全部 clippy 读数用真 0.1.98 重跑，读数与 0.1.95 逐条相同；判据命令 `cargo +1.98.0` 不受影响 | 文首、§9 第 11 条、附录 A |
+
 ---
 
 ## 附录 A：scratch 与命令记录
 
-位置：`scratchpad/sdk-sketch/`（工作区成员 `fd/` = `agent24-os-fd` 实物，`proto/` = proto 模块侧 API 桩，`sdk/` = SDK 草图 + `examples/minimal.rs` + `tests/sketch.rs` + `clippy.toml`）；`scratchpad/sdk-bypass/` = 评审的绕过实验（在 v1 sketch 上加 `bypass.rs` 与 proto 里的别名/宏）；`scratchpad/sin90-135ddb7/` = `git archive 135ddb7` 的 Sin90 树（只加了一个 `clippy.toml`）。工作区 lint 与 Agent24 相同：`unsafe_code = "forbid"`、`unwrap_used`/`expect_used = "deny"`，edition 2024。v1 的 `pcfd/` 小 crate 已由 os-fd 取代（os-fd 本身就是「不带 forbid 的 crate」），不再使用。
+位置：`scratchpad/sdk-sketch/`（工作区成员 `fd/` = `agent24-os-fd` 实物，`proto/` = proto 模块侧 API 桩（v3 起模块侧拆到 `proto/src/module.rs`，与真实 proto 将来的文件布局一致，J-S1b 的 `module*` 范围才有意义），`sdk/` = SDK 草图 + `examples/minimal.rs` + `tests/sketch.rs` + `clippy.toml`）；`scratchpad/sdk-bypass/` = 评审的绕过实验（v1 sketch + `bypass.rs` b1–b15 + proto 里的一跳/两跳别名与宏）；`scratchpad/sin90-135ddb7/` = `git archive 135ddb7` 的 Sin90 树（只加了一个 `clippy.toml`）；`scratchpad/h1mig/` = §5.2 第 3 条脚本的实验仓库；`scratchpad/sz1-b2b/` = b2b 合并片的 SZ-1 实测仓库；`scratchpad/h1probe/` = macOS socket 状态探针；`scratchpad/js3.py`、`js1b.py` = 将来的 `rust/scripts/check-lints.py`、`check-proto-exports.py`。工作区 lint 与 Agent24 相同：`unsafe_code = "forbid"`、`unwrap_used`/`expect_used = "deny"`，edition 2024。
 
-### A.1 四件套
+**所有 clippy 读数用 `scratchpad/c98`（v3）**：`PATH=$HOME/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin:$PATH exec cargo "$@"`。`c98 clippy -V` → `clippy 0.1.98 (88d9e12ae1 2026-08-18)`；而 `rustup run 1.98.0 cargo clippy -V` → `clippy 0.1.95`（Homebrew）。下文 `c98` 即此。
+
+### A.1 四件套（v3 重跑）
 
 ```
-$ rustup run 1.98.0 cargo check --workspace --all-targets --offline
+$ c98 check --offline --workspace --all-targets
     Finished `dev` profile [unoptimized + debuginfo] target(s)
 
-$ rustup run 1.98.0 cargo clippy --offline --workspace --all-targets -- -D warnings
+$ c98 clippy --offline --workspace --all-targets -- -D warnings
     Finished `dev` profile [unoptimized + debuginfo] target(s)
-$ rustup run 1.98.0 cargo clippy --offline --workspace --all-targets --features agent24-os-sdk/test-util -- -D warnings
+$ c98 clippy --offline -p agent24-os-sdk --lib --features test-util -- -D warnings      # L1
     Finished `dev` profile [unoptimized + debuginfo] target(s)
 
-$ rustup run 1.98.0 cargo test --offline --workspace
-test tests::a_listening_unix_socket_passes ... ok            # agent24-os-fd (J-S20, real fds, macOS)
+$ c98 test --offline --workspace
+test tests::a_listening_unix_socket_passes ... ok                      # agent24-os-fd (J-S20, real fds, macOS)
 test tests::a_socketpair_end_is_not_listening ... ok
+test tests::a_socketpair_end_with_peer_closed_is_not_listening ... ok   # v3: EINVAL -> NotListening
+test tests::apple_gap_bound_but_not_listening_passes ... ok             # v3: pins the macOS gap
 test tests::a_regular_file_is_not_a_socket ... ok
 test tests::a_tcp_listener_is_not_unix ... ok
 test tests::only_one_attempt_per_process ... ok
-test result: ok. 5 passed; 0 failed
+test result: ok. 7 passed; 0 failed
 test tests::initialize_reply_is_lenient_where_the_kernel_type_is_strict ... ok   # proto (J-S19)
 test tests::digest_format ... ok
 test result: ok. 2 passed; 0 failed
@@ -906,10 +970,10 @@ test kernel_shaped_fired_body_is_accepted ... ok
 test fired_ok_and_rejections ... ok
 test result: ok. 4 passed; 0 failed
 
-$ rustup run 1.98.0 cargo fmt --all --check      # 无输出，退出 0
+$ c98 fmt --all --check      # 无输出，退出 0
 ```
 
-os-fd 最初用 rustix 0.38（与 proto 同版）时，`a_socketpair_end_is_not_listening` 在 macOS 上 panic：`rustix-0.38.44/src/backend/libc/net/read_sockaddr.rs:320:26: called Result::unwrap() on an Err value: Os { code: 22, kind: InvalidInput }`；换 1.1 后通过（§2.1）。
+os-fd 最初用 rustix 0.38（与 proto 同版）时，`a_socketpair_end_is_not_listening` 在 macOS 上 panic：`rustix-0.38.44/src/backend/libc/net/read_sockaddr.rs:320:26: called Result::unwrap() on an Err value: Os { code: 22, kind: InvalidInput }`；换 1.1 后通过（§2.1）。`bound_but_not_listening_is_rejected` 只在非 Apple 目标编译，本机不运行（A.10）。
 
 ### A.2 J-S18 变异
 
@@ -923,71 +987,88 @@ test result: FAILED. 2 passed; 1 failed
 test result: ok. 3 passed; 0 failed
 ```
 
-### A.3 J-S1 正对照与绕过实验
+### A.3 J-S1 正对照与绕过实验（v3，真 clippy 0.1.98）
 
 ```
-$ rustup run 1.98.0 cargo clippy --offline -p agent24-os-sdk --features positive-control -- -D warnings > pc.log; echo $?
+$ c98 clippy --offline -p agent24-os-sdk --features positive-control -- -D warnings > pc3.log; echo $?
 101
-$ grep -c "use of a disallowed" pc.log                                             → 24
-$ grep -o "use of a disallowed [a-z]* \`[^\`]*\`" pc.log | sort -u | wc -l          → 24
-$ grep -c '{ path = ' sdk/clippy.toml                                              → 24
+$ grep -c "use of a disallowed" pc3.log                                            → 26
+$ grep -o "use of a disallowed [a-z]* \`[^\`]*\`" pc3.log | sort -u | wc -l         → 26
+$ grep -c '{ path = ' sdk/clippy.toml                                              → 26
 
-# sdk-bypass（v1 名单）：只报 b2、b4 两处 3 条
-error: use of a disallowed type `tokio::net::UnixStream`  --> sdk/src/bypass.rs:15:25   (b2 alias)
-error: use of a disallowed type `tokio::net::UnixStream`  --> sdk/src/bypass.rs:17:1    (b4 rename)
-error: use of a disallowed type `tokio::net::UnixStream`  --> sdk/src/bypass.rs:18:25   (b4)
+# sdk-bypass，v1 名单（6 项）：5 条（v2 附录写的 3 条是 b9/b10 加入实验前的旧读数）
+error: use of a disallowed type `tokio::net::UnixStream`          @ bypass.rs:15:25   (b3 外部宏——调用处)
+error: use of a disallowed type `tokio::net::UnixStream`          @ bypass.rs:17:1    (b4)
+error: use of a disallowed type `tokio::net::UnixStream`          @ bypass.rs:18:25   (b4)
+error: use of a disallowed type `std::os::unix::net::UnixStream`  @ bypass.rs:32:14   (b9)
+error: use of a disallowed type `std::os::unix::net::UnixListener` @ bypass.rs:35:44  (b10 半)
 
-# sdk-bypass（v2 名单）：13 条，b3（外部宏，:14）之外全部命中
-error: use of a disallowed type `tokio::net::UnixSocket`               --> bypass.rs:6:17    (b1)
-error: use of a disallowed method `serde_json::from_str`               --> bypass.rs:9:33    (b1)
-error: use of a disallowed type `tokio::net::UnixStream`               --> bypass.rs:15:25   (b2)
-error: use of a disallowed type `tokio::net::UnixStream`               --> bypass.rs:17:1    (b4)
-error: use of a disallowed type `tokio::net::UnixStream`               --> bypass.rs:18:25   (b4)
-error: use of a disallowed method `serde_json::Deserializer::from_slice` --> bypass.rs:20:27  (b5)
-error: use of a disallowed method `serde_json::from_reader`            --> bypass.rs:20:105  (b5)
-error: use of a disallowed type `std::net::TcpStream`                  --> bypass.rs:22:19   (b6)
-error: use of a disallowed method `serde_json::Deserializer::new`      --> bypass.rs:26:17   (b7)
-error: use of a disallowed method `axum::Json::from_bytes`             --> bypass.rs:30:27   (b8)
-error: use of a disallowed type `std::os::unix::net::UnixStream`       --> bypass.rs:32:14   (b9)
-error: use of a disallowed type `std::os::fd::OwnedFd`                 --> bypass.rs:35:12   (b10)
-error: use of a disallowed type `std::os::unix::net::UnixListener`     --> bypass.rs:35:44   (b10)
+# sdk-bypass，v3 名单（26 项）：15 条
+error: use of a disallowed type `tokio::net::UnixSocket`               @ bypass.rs:6:17    (b1)
+error: use of a disallowed method `serde_json::from_str`               @ bypass.rs:9:33    (b1)
+error: use of a disallowed type `tokio::net::UnixStream`               @ bypass.rs:15:25   (b3)
+error: use of a disallowed type `tokio::net::UnixStream`               @ bypass.rs:17:1    (b4)
+error: use of a disallowed type `tokio::net::UnixStream`               @ bypass.rs:18:25   (b4)
+error: use of a disallowed method `serde_json::Deserializer::from_slice` @ bypass.rs:20:27  (b5)
+error: use of a disallowed method `serde_json::from_reader`            @ bypass.rs:20:105  (b5)
+error: use of a disallowed type `std::net::TcpStream`                  @ bypass.rs:22:19   (b6)
+error: use of a disallowed method `serde_json::Deserializer::new`      @ bypass.rs:26:17   (b7)
+error: use of a disallowed method `axum::Json::from_bytes`             @ bypass.rs:30:27   (b8)
+error: use of a disallowed type `std::os::unix::net::UnixStream`       @ bypass.rs:32:14   (b9)
+error: use of a disallowed type `std::os::fd::OwnedFd`                 @ bypass.rs:35:12   (b10)
+error: use of a disallowed type `std::os::unix::net::UnixListener`     @ bypass.rs:35:44   (b10)
+error: use of a disallowed method `str::parse`                         @ bypass.rs:38:50   (b11)
+error: use of a disallowed method `core::str::FromStr::from_str`       @ bypass.rs:40:48   (b12)
+# 零报错的行：:13 b2（一跳别名 agent24_os_proto::Sock）、:42-47 b13（Json::from_request）、
+#             :49 b14（File::open("/dev/fd/3")）、:51 b15（两跳别名 agent24_os_proto::Sock2）
+# 用 Homebrew clippy 0.1.95 重跑 v1、v3 两份名单：读数与上面逐条相同
 ```
 
-### A.4 J-S1b
+### A.4 J-S1b（v3：Python 脚本，fail closed）
 
 ```
-$ P='#\[macro_export\]|pub\s+(type|use)\b[^;]*\b(UnixStream|UnixListener|UnixSocket|UnixDatagram|TcpStream|TcpListener|TcpSocket|UdpSocket|OwnedFd|RawFd|FromRawFd)\b'
-$ rg -n "$P" Agent24/rust/crates/agent24-os-proto/src            → (空) rc=1
-$ rg -n "$P" sdk-sketch/proto/src sdk-sketch/fd/src              → (空) rc=1
-$ rg -n "$P" sdk-bypass/proto/src                                → 2 行 rc=0
-sdk-bypass/proto/src/lib.rs:247:pub type Sock = tokio::net::UnixStream;
-sdk-bypass/proto/src/lib.rs:249:#[macro_export]
+$ python3 js1b.py proto fd                                          → J-S1b OK (2 module-side files scanned)   rc=0
+$ python3 js1b.py <Agent24 bb3505a>/rust/crates/agent24-os-proto fd → J-S1b OK                                  rc=0
+# 正对照（每条单独加、跑、复原）：
+module.rs 加 `type Inner = tokio::net::UnixStream; pub type Sock2 = Inner;`
+  proto/src/module.rs:363: pub type Sock2 = Inner;  [no `pub type` in proto module* / os-fd]                rc=1
+module.rs 加 `pub use tokio::net::UnixStream as S;`
+  proto/src/module.rs:361: … [`pub use` … only forwards crate-internal items] + [whole proto: … socket …]   rc=1
+lib.rs 加 `#[macro_export] macro_rules! sneaky { … }`
+  proto/src/lib.rs:161: #[macro_export]  [no #[macro_export] in proto or os-fd]                             rc=1
+lib.rs（内核侧）加 `pub type K = tokio::net::UnixStream;`
+  proto/src/lib.rs:161: pub type K = …  [whole proto: no pub alias/re-export naming a socket or fd type]    rc=1
+fd/src/lib.rs 加 `pub type L = UnixListener;`
+  fd/src/lib.rs:227: pub type L = UnixListener;  [no `pub type` in proto module* / os-fd]                  rc=1
+python3 js1b.py proto nonexist → "J-S1b: no such dir nonexist/src"                                          rc=1
+# 负对照：module.rs 加 `pub use crate::initialize::Offer as ReOffer;`                                       rc=0
+# v2 的 rg 写法为何换掉：rg 在本机是 zsh 的 shell 函数，`sh` 脚本里 `rg: command not found`，
+# 而 `! rg …` / `rg … && hit=1` 两种写法都会因此把 6 条正对照全部判绿。
 ```
 
 ### A.5 J-S2 / J-S3
 
 ```
-# v1 命令（M1 的问题）：恒两行
-$ cargo tree -p agent24-os-sdk -e normal --depth 1 --prefix none | grep '^agent24-'
-agent24-os-sdk v0.1.0 (…/sdk)
-agent24-os-proto v0.3.0 (…/proto)
-
-# v2
+# J-S2（v2 起，未变）
 $ cargo metadata --format-version 1 --no-deps --offline | jq -r '.packages[] | select(.name=="agent24-os-sdk") | .dependencies[] | select(.kind==null) | .name' | sort | tr '\n' ' '
 agent24-os-proto axum serde serde_json thiserror tokio tracing                    → PASS
 # 正对照：临时加 agent24-domain（path 依赖）
 agent24-domain agent24-os-proto axum serde serde_json thiserror tokio tracing     → FAIL（预期）
 
-$ python3 ../js3.py                         # scratch 工作区（即将来的 scripts/check-lints.py）
-J-S3 lints OK                                                                      rc=0
-$ (cd Agent24/rust && python3 …/check-lints.py)    # 真实 Agent24 工作区（只读）
-J-S3 lints OK                                                                      rc=0
-# 正对照：删掉 scratch proto 的 [lints] workspace = true
-agent24-os-proto: does not inherit [lints] workspace = true                       rc=1
-$ cargo check -p agent24-os-sdk --features positive-control-unsafe
+# J-S3（v3 脚本）
+$ python3 ../js3.py                                          → J-S3 lints OK (1 allow site(s))   rc=0
+$ (cd <Agent24 bb3505a>/rust && python3 …/js3.py)            → J-S3 lints OK (0 allow site(s))   rc=0
+# 正对照（每条单独做、跑、复原）
+proto/src/lib.rs 首行加 `#![allow(unsafe_code)]`                                            rc=1
+proto/src/lib.rs 加 `#[allow(dead_code, unsafe_code)] fn _x() {}`                           rc=1
+proto/src/lib.rs 加 `#[expect(unsafe_code)] fn _x() {}`                                     rc=1
+proto/src/lib.rs 加 `#[cfg_attr(unix, allow(unsafe_code))] fn _x() {}`                      rc=1
+fd/Cargo.toml `unwrap_used = "warn"`
+  agent24-os-fd: restated lints differ from [workspace.lints] (besides unsafe_code): … rc=1
+fd/Cargo.toml [lints.clippy] 多加 `dbg_macro = "deny"`                                      rc=1
+删掉 proto 的 `[lints] workspace = true`（v2 已有）                                          rc=1
+$ c98 check --offline -p agent24-os-sdk --features positive-control-unsafe
 error: usage of an `unsafe` block
-$ rg -c 'allow\(unsafe_code\)' fd proto sdk --glob '*.rs'
-fd/src/lib.rs:1
 ```
 
 ### A.6 Sin90 Unix socket / fd 子集 clippy 的正对照（迁移前树）
@@ -1013,17 +1094,105 @@ $ rg -o --no-filename '"(/?_a24/[a-z_/]+|x-a24-[a-z-]+|\$/[A-Za-z]+|A24_[A-Z_]+)
 26                                     → ≥ 26 PASS
 # 变异：RECENT 改成 concat!("_a24/memory/private/", "recent")
 25                                     → FAIL（预期）
+# v3（proto 模块侧拆到 module.rs、真 clippy 无关）重跑：仍为 26
 ```
 
-scratch 各文件非测试行数（含注释 / 纯代码），供 §7 估算：os-fd `lib.rs` 111/70；proto 桩 436/307（其中 `testing` 约 90）；SDK `clients/memory.rs` 195/147、`module.rs` 157/129、`error.rs` 154/143、`clients/scheduler.rs` 138/117、`clients/events.rs` 129/111、`fired.rs` 115/89、`clients/model.rs` 115/95、`clients/approval.rs` 108/81、`clients/mod.rs` 82/67、`context.rs` 65/52、`positive_control.rs` 31/28、`lib.rs` 25/21。
+### A.8 §5.2 第 3 条：测试模块期望补丁（H-1，`scratchpad/h1mig/`）
+
+实验仓库：Sin90 `135ddb7` 的 `reconciler.rs` 与 `clients/model.rs` 作为 `origin/main`；模拟迁移 = 非测试部分加一行 + model 测试模块那一行 `use` 改成 SDK 的；期望补丁用脚本同样的 `diff -u` 生成后提交（11 行，正文 §5.2 第 3 条所示）。
+
+```bash
+#!/usr/bin/env bash
+# Sin90 TS.1.1 acceptance §5.2 item 3 (ME4-S3 v3, H-1): the test modules of
+# reconciler.rs and clients/model.rs differ from the pre-migration base by
+# EXACTLY the committed expected patch, and that patch changes nothing but
+# the one allowed `use` line.
+set -euo pipefail
+base=${1:-origin/main}
+exp=scripts/ts11-test-modules.expected.patch
+allowed_minus='-    use crate::ai::UnavailableCause;'
+allowed_plus='+    use agent24_os_sdk::UnavailableCause;'
+tests_of() { sed -n '/^#\[cfg(test)\]$/,$p'; }
+out=$(mktemp); trap 'rm -f "$out"' EXIT
+for f in src/adapter_agent24/reconciler.rs src/adapter_agent24/clients/model.rs; do
+  old=$(git show "$base:$f" | tests_of); new=$(tests_of < "$f")
+  [ -n "$old" ] && [ -n "$new" ] || { echo "no #[cfg(test)] module found in $f"; exit 1; }  # fail closed
+  diff -u --label "a/$f (tests)" --label "b/$f (tests)" <(printf '%s\n' "$old") <(printf '%s\n' "$new") >> "$out" || true
+done
+# 1. the expected patch itself only swaps the one allowed line
+changed=$(grep -E '^[-+]' "$exp" | grep -vE '^(\+\+\+|---) ' || true)
+[ "$changed" = "$allowed_minus"$'\n'"$allowed_plus" ] || { echo "expected patch changes more than the allowed use line:"; echo "$changed"; exit 1; }
+# 2. the actual diff equals it byte for byte
+cmp -s "$out" "$exp" || { echo "test modules differ from the expected patch:"; diff -u "$exp" "$out" || true; exit 1; }
+echo "test modules: only the allowed use line changed"
+```
+
+```
+# v2 的「diff 0 行」脚本在这次正确迁移上：
+v2: test module of src/adapter_agent24/clients/model.rs changed                     rc=1   ← H-1 的实证
+# v3 脚本
+test modules: only the allowed use line changed                                      rc=0
+# 正对照（每条单独做、跑、复原）
+reconciler 测试模块某行末尾加 ` // touched`                                          rc=1
+model 测试模块 `UnavailableCause::NoProvider` → `RequestRejected`                     rc=1
+期望补丁多夹带一行（`use serde_json::{json, Map, Value};`）
+  expected patch changes more than the allowed use line: …                           rc=1
+model.rs 的 `#[cfg(test)]` 改成 `#[cfg(all(test))]`
+  no #[cfg(test)] module found in src/adapter_agent24/clients/model.rs                rc=1
+```
+
+### A.9 b2b（memory + `remember_once` 合并片）的 SZ-1 实测（M-4，`scratchpad/sz1-b2b/`）
+
+base 提交放 SDK 骨架（`module.rs`/`lib.rs`/`clients/mod.rs`），分支提交加上 scratch 的 `clients/memory.rs`（含 `remember_once` 与预查、3 条单测）、`Module::memory()` 访问器、`clients` 的 `mod`/`pub use`/METHODS 一行、`lib.rs` 的转出，然后跑 PR-Daemon 的检查器：
+
+```
+$ bash ~/Dev/tools/PR-Daemon/scripts/pre-pr-check.sh --base main --json-only | jq .size
+{"lines": 209, "files": 4, "inline_test_lines": 65, "test_file_lines": 0, "band": "normal",
+ "limits": {"max_lines": 300, …}}
+```
+
+agentd `memory_callback.rs` 的对等测试全在 `#[cfg(test)]` 里，不计入。209 + 移植 Sin90 预查注释的余量 < 300。
+
+### A.10 os-fd 的平台分支（M-1/M-2）
+
+```
+# macOS socket 状态探针（scratchpad/h1probe，libc getsockopt + rustix getpeername）
+listening                          getpeername=Err(ENOTCONN 57)  SO_ACCEPTCONN=err Protocol not available (42)
+fresh socket() no bind no listen   getpeername=Err(ENOTCONN 57)  SO_ACCEPTCONN=err (42)   ← 缺口
+bound, not listening               getpeername=Err(ENOTCONN 57)  SO_ACCEPTCONN=err (42)   ← 缺口
+socketpair end (peer alive)        getpeername=Ok                SO_ACCEPTCONN=err (42)
+socketpair end (peer closed)       getpeername=Err(EINVAL 22)    SO_ACCEPTCONN=err (42)
+client stream (server side closed) getpeername=Err(EINVAL 22)    SO_ACCEPTCONN=err (42)
+client stream after shutdown(Both) getpeername=Err(EINVAL 22)    SO_ACCEPTCONN=err (42)
+
+# EINVAL 映射的变异：apple 分支删掉 `| Err(rustix::io::Errno::INVAL)`
+test tests::a_socketpair_end_with_peer_closed_is_not_listening ... FAILED
+test result: FAILED. 6 passed; 1 failed
+
+# Linux 分支（编译 + clippy，本机不能运行）
+$ rustup target add x86_64-unknown-linux-gnu --toolchain 1.98.0
+$ c98 clippy --offline -p agent24-os-fd --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+```
+
+
+### A.11 scratch 行数
+
+scratch 各文件非测试行数（含注释 / 纯代码），供 §7 估算：os-fd `lib.rs` 124/80（v3）；proto 桩 `lib.rs` 118 + `module.rs` 364（v3 拆文件；`module.rs` 里 `testing` 约 95）；SDK `clients/memory.rs` 195/147、`module.rs` 181/140（v3：`connect()` 接管监听器）、`error.rs` 154/143、`clients/scheduler.rs` 138/117、`clients/events.rs` 129/111、`fired.rs` 115/89、`clients/model.rs` 115/95、`clients/approval.rs` 108/81、`clients/mod.rs` 82/67、`context.rs` 65/52、`positive_control.rs` 33/30（v3：26 项）、`lib.rs` 25/21。
 
 ## 附录 B：承重文本（签名与 scratch 逐字一致；B.1 函数体以 `{ … }` 省略、文档注释有删节，B.2、B.3 为 scratch 原文逐字摘出的完整函数）
 
 ### B.1 proto `module` 桩（5.1.2a 的目标 API）
 
 ```rust
-pub mod module {
-    pub type FatalHook = Arc<dyn Fn() + Send + Sync>;
+pub mod module {   // v3: its own file `src/module.rs` (J-S1b scans `src/module*`)
+    /// Newtype, not `pub type` (J-S1b forbids every `pub type` here, v3 H-2).
+    #[derive(Clone)]
+    pub struct FatalHook(Arc<dyn Fn() + Send + Sync>);
+    impl FatalHook {
+        pub fn new(f: impl Fn() + Send + Sync + 'static) -> Self { … }
+        pub fn fire(&self) { … }
+    }
 
     /// The spawn variables a module that starts children should
     /// `Command::env_remove` (the SDK never mutates `environ`, §4.3).
@@ -1082,7 +1251,11 @@ pub mod module {
     }
 
     pub enum ListenError { Inherit(agent24_os_fd::InheritError), Io(std::io::Error) }
-    pub fn take_listener() -> Result<tokio::net::UnixListener, ListenError> { … }
+    /// Named struct, not an alias: the SDK keeps it in `Module` (v3 M-3).
+    pub struct InheritedListener(tokio::net::UnixListener);
+    impl InheritedListener { pub fn into_tokio(self) -> tokio::net::UnixListener { … } }
+    /// Once per PROCESS: at most one test per test binary may reach this.
+    pub fn take_listener() -> Result<InheritedListener, ListenError> { … }
 
     #[cfg(feature = "test-util")]
     pub mod testing {
@@ -1170,20 +1343,32 @@ fn validate(fd: BorrowedFd<'_>) -> Result<(), InheritError> {
     Ok(())
 }
 
+/// Linux (and every non-Apple target): `SO_ACCEPTCONN` is a direct answer —
+/// true exactly when `listen()` has been called. CI compiles and tests this
+/// branch on `ubuntu-latest` (J-S20).
 #[cfg(not(target_vendor = "apple"))]
 fn is_listening(fd: BorrowedFd<'_>) -> Result<bool, InheritError> {
     rustix::net::sockopt::socket_acceptconn(fd).map_err(|e| InheritError::Io(e.into()))
 }
 
-/// Apple declares `SO_ACCEPTCONN` but does not implement it (rustix gates it
-/// off). A listening socket is the one with no peer (`ENOTCONN`); a
-/// socketpair end or an accepted/connected stream has one.
+/// Apple declares `SO_ACCEPTCONN` but does not implement it (`ENOPROTOOPT`;
+/// rustix gates it off), so this is a WEAKER, indirect check: "has no peer".
+/// `getpeername` answers `ENOTCONN` for a listening socket — and ALSO for a
+/// stream socket that was only `socket()`ed or `bind()`ed and never
+/// `listen()`ed. KNOWN GAP (accepted, ME4-S3 §4.3 step 3): on macOS such a
+/// socket passes validation; the kernel only ever hands fd 3 after
+/// `listen()` (`launch.rs`), so meeting one means a forged environment, and
+/// the failure then surfaces at `accept` (module exits), not as privilege.
+/// A connected stream or live socketpair end has a peer (`Ok`); one whose
+/// peer is gone answers `EINVAL` — both are "not listening". The test
+/// `apple_gap_bound_but_not_listening_passes` pins the gap so a change in
+/// either direction is noticed.
 #[cfg(target_vendor = "apple")]
 fn is_listening(fd: BorrowedFd<'_>) -> Result<bool, InheritError> {
     match rustix::net::getpeername(fd) {
         Err(rustix::io::Errno::NOTCONN) => Ok(true),
+        Ok(_) | Err(rustix::io::Errno::INVAL) => Ok(false),
         Err(e) => Err(InheritError::Io(e.into())),
-        Ok(_) => Ok(false),
     }
 }
 ```

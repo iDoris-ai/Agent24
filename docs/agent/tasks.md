@@ -48,28 +48,28 @@
 | ME4-4.2.2b2 | Agent24 | 授予 Models + provides + 注册 + serve 接线（CallbackDeps.models）；删 dead_code 豁免 | 4.2.2b1b, 4.2.1, 1.4.1 | `DONE` | #505 合并于 2026-09-25 |
 | ME4-4.2.3a | Agent24 | 用量迁移 + store（module_model_usage） | 4.2.2b2 | `DONE` | #506 合并于 2026-09-26 |
 | ME4-4.2.3b | Agent24 | 用量 recorder + `/api/v1/usage?module=` + serve 换 sink | 4.2.3a | `DONE` | #510（用量写者 UsageRecorder）→ #511（GET /api/v1/usage?module=）全部合并于 2026-09-26 |
-| ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `PR_OPEN` | #512（Opus 本地评审 2 轮：CHANGES → APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-7） |
-| ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `DONE` | Sin90 `origin/main` `135ddb7`（T5.5.1 M5 real-mount acceptance）；ME4-5.1.1 以此为盘点基线。本行依赖的 4.3.1 / M3 门等上游行的状态回填由 PR #513 负责，本分支不改 |
-| ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `IN_PROGRESS` | 设计 v2（`docs/design/ME4-S3-os-sdk.md`）：jason 2026-09-26 拍板 Q1–Q11；第 1 轮 Tier-2 Opus 评审 CHANGES（5H/10M/11L）已逐条修订（处置表 §11），待复审冻结；Codex 补审记 ME4-CODEX-DEBT-8 |
-| ME4-5.1.2a1 | Agent24 | proto `module`：`ModuleEnv`（`from_env`/`from_vars`，不持 fd）、`SPAWN_ENV_VARS`、`Hello`、宽松 `InitializeReply`、`connect_from_env` 握手部分（先返回只能 `offer()` 的连接）、`manifest::{ManifestFacts, facts_from_yaml}`、`manifest_digest` 从 os-packages 挪入 proto；J-S12、J-S19 | 5.1.1 | `BACKLOG` | SZ-1 估 ~260 |
+| ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `DONE` | #512 合并于 2026-09-26（`bb3505a`；Opus 本地评审 2 轮：CHANGES → APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-7） |
+| ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `IN_PROGRESS` | **Sin90 侧已满足**：Sin90 `origin/main` `135ddb7`（T5.5.1 M5 real-mount acceptance；`git log origin/main` 含 T5.0.1–T5.5.1 各 PR），ME4-5.1.1 以此为盘点基线。前置 4.3.1 已 DONE（#512，2026-09-26）；前置 **M3 门（及其前置 M2 门）台账仍为 `BACKLOG`**——Sin90 main 实际已含 T3.1.1–T3.5.1、T4.1.1–T4.4.1，但这两行的回填不在本分支范围。M2/M3 门回填 DONE 后本行改 DONE |
+| ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `IN_PROGRESS` | 设计 v3（`docs/design/ME4-S3-os-sdk.md`）：jason 2026-09-26 拍板 Q1–Q11；第 1 轮 Tier-2 Opus 评审 CHANGES（5H/10M/11L）→ v2（§11.1）；v2 复审 CHANGES（2H/5M/5L）→ v3（§11.2），待再审冻结；Codex 补审记 ME4-CODEX-DEBT-8 |
+| ME4-5.1.2a1 | Agent24 | proto `module`：`ModuleEnv`（`from_env`/`from_vars`，不持 fd）、`SPAWN_ENV_VARS`、`Hello`、`FatalHook`（newtype）、宽松 `InitializeReply`、`connect_from_env` 握手部分（先返回只能 `offer()` 的连接）、`manifest::{ManifestFacts, facts_from_yaml}`、`manifest_digest` 从 os-packages 挪入 proto；J-S12、J-S19 | 5.1.1 | `BACKLOG` | SZ-1 估 ~270。**合并流程（ME4-S3 §7）：一次只开一个 PR，base 恒为 main，上一片合并后下一片才开；依赖列是 DAG** |
 | ME4-5.1.2a2-core | Agent24 | proto `Connection` mux 核心（移植 Sin90 transport：读写任务、按 id 分发、64 在途、`declare_dead`）；J-S8 前 8 条 | 5.1.2a1 | `BACKLOG` | ~290 |
 | ME4-5.1.2a2-cancel | Agent24 | drop 取消、响应/写超时、`slot_wait`；J-S8 后 8 条、J-S9 前半 | 5.1.2a2-core | `BACKLOG` | ~240 |
-| ME4-5.1.2a2-kit | Agent24 | `module::testing`（`test-util`，与 Sin90 `test_support.rs` 同签名 + `FakeEndpoint` + `recording_hook`） | 5.1.2a2-cancel | `BACKLOG` | ~160 |
-| ME4-5.1.2a3-fd | Agent24 | 新 crate `agent24-os-fd`（`take_inherited_listener`，唯一 `unsafe`）+ proto `take_listener` + lints 检查脚本；J-S3、J-S20 | 5.1.2a2-kit | `BACKLOG` | ~220 |
-| ME4-5.1.2a3-skel | Agent24 | SDK crate 骨架（`Cargo.toml`、`clippy.toml` 24 项、两个正对照 feature、CI 含 1.88 check）；J-S1、J-S1b、J-S2 | 5.1.2a3-fd | `BACKLOG` | ~190 |
-| ME4-5.1.2a3-module | Agent24 | `Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env`；J-S11 | 5.1.2a3-skel | `BACKLOG` | ~210 |
-| ME4-5.1.2b1a | Agent24 | `ClientError`/`UnavailableCause`/映射/`is_permanent`/`is_retryable`（不含 `retry_class`，FU-87）；J-S4 | 5.1.2a3-module | `BACKLOG` | ~260 |
-| ME4-5.1.2b1b | Agent24 | `RequestContext`/`RequestId`（含 `for_test`）/`ApprovalToken`、客户端公共 `Core` | 5.1.2b1a | `BACKLOG` | ~200 |
-| ME4-5.1.2b2a | Agent24 | Events（含 sink）+ agentd `events_emit.rs` 对等测试；J-S5/J-S6/J-S7（events） | 5.1.2b1b | `BACKLOG` | ~210 |
-| ME4-5.1.2b2b | Agent24 | Memory + agentd `memory_callback.rs` 对等测试；J-S5/J-S6/J-S7（memory） | 5.1.2b2a | `BACKLOG` | ~140 |
-| ME4-5.1.2b2c | Agent24 | Approval（advise 孤儿约束写进文档，ME4-S3 §2.10）+ agentd `approval_callback.rs` 对等测试；J-S5/J-S6/J-S7（approval） | 5.1.2b2b | `BACKLOG` | ~170 |
-| ME4-5.1.2b2d | Agent24 | `MemoryClient::remember_once`（§8 Q5 拍板；Sin90 5.2.1 改用）；J-S18 | 5.1.2b2c | `BACKLOG` | ~150 |
-| ME4-5.1.2b3a | Agent24 | Scheduler + agentd `scheduler_callback.rs` 对等测试；J-S5/J-S6/J-S7（scheduler） | 5.1.2b2d | `BACKLOG` | ~210 |
-| ME4-5.1.2b3b | Agent24 | Model + agentd `model_callback.rs` 对等测试；J-S5/J-S6/J-S7（model）、J-S9 后半 | 5.1.2b3a | `BACKLOG` | ~180 |
-| ME4-5.1.2c1 | Agent24 | `FiredBody` 挪进 `kernel_call`（agentd 改用）+ fired 提取器与 `with_fired` 注册点；J-S10 | 5.1.2b3b | `BACKLOG` | ~210 |
-| ME4-5.1.2c2 | Agent24 | `examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + `CHANGELOG.md`（含最低内核版本）+ tag `agent24-os-sdk-v0.1.0`；J-S13、J-S14 | 5.1.2c1 | `BACKLOG` | ~110 + 测试 |
+| ME4-5.1.2a2-kit | Agent24 | `module::testing`（`test-util`，与 Sin90 `test_support.rs` 同签名 + `FakeEndpoint` + `recording_hook`） | 5.1.2a2-core | `BACKLOG` | ~160 |
+| ME4-5.1.2a3-fd | Agent24 | 新 crate `agent24-os-fd`（`take_inherited_listener`，唯一 `unsafe`，Linux/macOS 两分支 + macOS 缺口钉子）+ proto `take_listener`/`InheritedListener` + `scripts/check-proto-exports.py` + CI（J-S1b 步骤、新增 `macos-latest` job 只跑 `cargo test -p agent24-os-fd`）；J-S1b、J-S20 | 5.1.2a1 | `BACKLOG` | ~250 |
+| ME4-5.1.2a3-skel | Agent24 | SDK crate 骨架（`Cargo.toml`、`clippy.toml` 26 项、两个正对照 feature、`test-util` 先占位）+ `scripts/check-lints.py` + CI（J-S1 三步、J-S2、J-S3、1.88 check）；J-S1、J-S2、J-S3 | 5.1.1（从 main 开，无其它前置） | `BACKLOG` | ~250 |
+| ME4-5.1.2a3-module | Agent24 | `Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env`，`connect()` 里接管监听器；`test-util` 改为转发 proto；不含客户端访问器；J-S11 | 5.1.2a2-kit, 5.1.2a3-fd, 5.1.2a3-skel | `BACKLOG` | ~210 |
+| ME4-5.1.2b1a | Agent24 | `ClientError`/`UnavailableCause`/映射/`is_permanent`/`is_retryable`（不含 `retry_class`，FU-87）；J-S4 | 5.1.2a2-core, 5.1.2a3-skel | `BACKLOG` | ~260 |
+| ME4-5.1.2b1b | Agent24 | `RequestContext`/`RequestId`（含 `for_test`）/`ApprovalToken`、客户端公共 `Core`、空的 `clients::METHODS` 骨架（随各客户端 PR 逐个加入） | 5.1.2b1a | `BACKLOG` | ~200 |
+| ME4-5.1.2b2a | Agent24 | Events（含 sink）+ `Module::events()` + METHODS 加一项 + agentd `events_emit.rs` 对等测试；J-S5/J-S6/J-S7（events） | 5.1.2b1b, 5.1.2a2-cancel, 5.1.2a3-module | `BACKLOG` | ~210 |
+| ME4-5.1.2b2b | Agent24 | Memory + `MemoryClient::remember_once`（§8 Q5 拍板；Sin90 5.2.1 改用；v3 把 v2 的 b2d 并入）+ `Module::memory()` + METHODS 加一项 + agentd `memory_callback.rs` 对等测试；J-S5/J-S6/J-S7（memory）、J-S18 | 5.1.2b1b, 5.1.2a2-cancel, 5.1.2a3-module | `BACKLOG` | SZ-1 实测 209（ME4-S3 附录 A.9） |
+| ME4-5.1.2b2c | Agent24 | Approval（advise 孤儿约束写进文档，ME4-S3 §2.10）+ `Module::approval()` + METHODS 加一项 + agentd `approval_callback.rs` 对等测试；J-S5/J-S6/J-S7（approval） | 5.1.2b1b, 5.1.2a2-cancel, 5.1.2a3-module | `BACKLOG` | ~170 |
+| ME4-5.1.2b3a | Agent24 | Scheduler + `Module::scheduler()` + METHODS 加一项 + agentd `scheduler_callback.rs` 对等测试；J-S5/J-S6/J-S7（scheduler） | 5.1.2b1b, 5.1.2a2-cancel, 5.1.2a3-module | `BACKLOG` | ~210 |
+| ME4-5.1.2b3b | Agent24 | Model + `Module::model()` + METHODS 加一项 + agentd `model_callback.rs` 对等测试；J-S5/J-S6/J-S7（model）、J-S9 后半 | 5.1.2b1b, 5.1.2a2-cancel, 5.1.2a3-module | `BACKLOG` | ~180 |
+| ME4-5.1.2c1a | Agent24 | `FiredBody`/`FireTrigger` 挪进 `agent24_os_proto::kernel_call`，agentd `scheduler_deliver.rs` 改用 | 5.1.1（从 main 开，无其它前置） | `BACKLOG` | ~60 |
+| ME4-5.1.2c1b | Agent24 | fired 提取器与 `with_fired` 注册点；J-S10 | 5.1.2c1a, 5.1.2b1b | `BACKLOG` | ~160 |
+| ME4-5.1.2c2 | Agent24 | `examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + `CHANGELOG.md`（含最低内核版本）；J-S13。合并后在 main 上打 tag `agent24-os-sdk-v0.1.0`（J-S14），tag 推送、探针 ● 之后本行才标 DONE | 5.1.2a3-module, 5.1.2b2a, 5.1.2b2b, 5.1.2b2c, 5.1.2b3a, 5.1.2b3b, 5.1.2c1b | `BACKLOG` | ~110 + 测试 |
 | ME4-5.2.0 | Sin90 | 线协议金样（Sin90 TS.1.0，迁移前合）：出站 `(method, params)` + 入站回放（每个错误 kind → outbox 行状态/attempts 与 `ModelFailure`、宽松解析、Usage 宽度、recall 预查三态） | — | `BACKLOG` | 见 ME4-S3-os-sdk.md §5.1 |
-| ME4-5.2.1 | Sin90 | Sin90 迁到 SDK（Sin90 TS.1.1）：含改用 SDK `remember_once`、`test_support.rs` 一行 shim、`SchedulerClient`/`ModelClient` newtype 保旧签名 | 5.1.2c2, 5.2.0 | `BACKLOG` | 验收见 ME4-S3-os-sdk.md §5.2：金样逐条相等、`reconciler.rs`/`clients/model.rs` 测试模块 diff 0 行、Unix socket/fd 子集 clippy 由红转绿 |
+| ME4-5.2.1 | Sin90 | Sin90 迁到 SDK（Sin90 TS.1.1）：含改用 SDK `remember_once`、`test_support.rs` 一行 shim、`SchedulerClient`/`ModelClient` newtype 保旧签名 | 5.1.2c2, 5.2.0 | `BACKLOG` | 验收见 ME4-S3-os-sdk.md §5.2：金样逐条相等、`reconciler.rs`/`clients/model.rs` 测试模块与已提交的期望补丁逐字相等（只允许 `model.rs` 测试模块那一行 `use crate::ai::UnavailableCause` → `agent24_os_sdk::UnavailableCause`）、Unix socket/fd 子集 clippy 由红转绿 |
 | ME4-5.3.1 | Cos72 | Cos72 仓库 pilot 七件套 | 5.1.2c2 | `BACKLOG` | |
 | ME4-5.3.2 | Cos72 | 骨架（manifest + SDK 挂载 + 迁移 + 事件） | 5.3.1 | `BACKLOG` | |
 | ME4-5.3.3a | Cos72 | mytask 实体与路由 | 5.3.2 | `BACKLOG` | |
