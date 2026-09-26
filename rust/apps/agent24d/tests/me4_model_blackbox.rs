@@ -178,13 +178,25 @@ while f.readline():
 /// answers `503`, simulating a down backend for J14's negative control;
 /// `"hang"` answers nothing at all — it accepts the request, then blocks on
 /// its own `recv()` to learn whether ITS PEER (this daemon) closed the
-/// connection, for J14's real-revocation-path scenario (H1): the very
-/// instant it starts that wait it writes `hang_result.json` as
+/// connection, for J14's real-revocation-path scenario (H1): BEFORE it logs
+/// the request to `requests.json` at all, it writes `hang_result.json` as
 /// `{"phase":"waiting","closed":null}` (so a poller can tell "received the
-/// request, now genuinely blocked" from "hasn't been dialled yet"), then
-/// once `recv()` returns — empty bytes or a reset both count as "closed",
-/// a timeout (60s, just a safety net; the real bound is the Rust side's own
-/// poll deadline) counts as "not closed" — overwrites it with
+/// request, now genuinely blocked" from "hasn't been dialled yet") — that
+/// order matters (M-A): this accept loop runs concurrently with the Rust
+/// side's own polling thread, so whichever of these two writes this branch
+/// makes FIRST is the one such a poller can rely on having already landed
+/// the instant it observes the OTHER one. Writing `"waiting"` first means
+/// `requests.json` growing (the LAST thing this branch writes before
+/// blocking) can only be observed once `hang_result.json` is already
+/// durable — the other way round (the shape this test used to have) would
+/// let a poller keyed on `request_count()` see the count bump and
+/// immediately read `hang_result.json` before it exists, i.e. `None`, the
+/// flake M-A's fix closes (the Rust side now also polls `hang_status()`
+/// itself directly rather than gating on `request_count()`, but this order
+/// is the invariant that makes either approach safe). Once `recv()` returns —
+/// empty bytes or a reset both count as "closed", a timeout (60s, just a
+/// safety net; the real bound is the Rust side's own poll deadline) counts
+/// as "not closed" — it overwrites `hang_result.json` with
 /// `{"phase":"done","closed":<bool>}`.
 /// Every request is logged (mode + body) to `requests.json`
 /// (append-atomic, same rationale as the other blackbox scripts' own
@@ -251,13 +263,23 @@ while True:
                 break
             body_bytes += chunk
         mode = read_mode()
+        if mode == "hang":
+            # Written BEFORE the requests.json append below (not after) —
+            # the Rust side polls request_count()/hang_status() from a
+            # different thread than this accept loop, so whichever of these
+            # two writes lands first is the one a concurrent reader can
+            # observe as soon as it sees the OTHER one land; putting
+            # "waiting" first means "request logged" (requests.json grew)
+            # can only be observed once "waiting" is already durable,
+            # closing the race where a poller saw the count bump but read
+            # hang_result.json before it existed.
+            dump_atomic("hang_result.json", {"phase": "waiting", "closed": None})
         append_atomic("requests.json", {
             "mode": mode,
             "request_line": lines[0].decode(errors="replace") if lines else "",
             "body": body_bytes.decode(errors="replace"),
         })
         if mode == "hang":
-            dump_atomic("hang_result.json", {"phase": "waiting", "closed": None})
             conn.settimeout(60)
             try:
                 data = conn.recv(4096)
@@ -323,9 +345,10 @@ fn install(home: &Path, name: &str, kernel_capabilities: &str, extra_manifest_li
 /// single `read_to_end` sees the whole response — same shape as
 /// `me3f_blackbox.rs`'s `get`, extended with a body and method for `POST`,
 /// and a caller-chosen read timeout: H1's hang-then-disable scenario fires a
-/// call that may sit on the wire far longer than the 20s every other request
-/// in this file is happy with (the real per-module disable drain can run for
-/// tens of seconds — see [`call_model_bg`]).
+/// call that legitimately sits on the wire for the proxy's own ~10s
+/// first-byte deadline before it comes back with `504 upstream_timeout` —
+/// still worth a caller-chosen timeout with margin over that 10s rather than
+/// reusing the ordinary 20s default blind — see [`call_model_bg`].
 fn raw_request_timeout(
     port: u16,
     token: &str,
@@ -404,9 +427,15 @@ fn call_model(port: u16, token: &str, name: &str, body_overrides: &str) -> serde
 
 /// H1's own long-lived variant of [`call_model`], spawned on a background
 /// thread while the local stub is in `"hang"` mode: the successful attempt
-/// may legitimately sit on the wire for as long as the real per-module
-/// disable takes to actually cut it off (`DISABLE_REVOCATION_BOUND` below) —
-/// the ordinary [`raw_request`]'s 20s default would fire spuriously there.
+/// does NOT wait for the eventual `disable` — it comes back on its own once
+/// `agent24-os-proto/src/proxy.rs`'s own `UPSTREAM_HEAD_DEADLINE` (10s: the
+/// proxy's first-byte timeout on the module's own HTTP response) fires,
+/// which ends this call with a `504 upstream_timeout` — L-A below joins this
+/// handle and asserts exactly that, BEFORE any disable is sent. `timeout`
+/// only needs enough margin over that 10s for the read itself, never
+/// anything close to the per-module disable's own drain bound (a wrong
+/// assumption an earlier version of this test made — see
+/// `DISABLE_REVOCATION_BOUND` below for what that bound is actually for).
 /// Still retries on `module_not_ready` like [`call_model`] does (a fresh
 /// restart, `d2`, may not yet have this proxied route ready the instant
 /// `wait_mounted` returns — same race `call_model` itself documents) — every
@@ -439,13 +468,25 @@ fn call_model_bg(
     })
 }
 
+/// The `TcpStream` read timeout [`call_model_bg`] uses for H1's hang call.
+/// It only needs margin over `agent24-os-proto/src/proxy.rs`'s own
+/// `UPSTREAM_HEAD_DEADLINE` (10s — the proxy's first-byte timeout on the
+/// module's own HTTP response, which is what actually ends this call with a
+/// `504 upstream_timeout`, L-A) so the client-side read doesn't fire first
+/// and mask that response as a local timeout instead.
+const HANG_CALL_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How long H1's revocation scenario waits for the local stub to observe its
-/// connection close after the real disable is sent. `os_routes.rs`'s own
-/// `DISABLE_DRAIN` (30s) bounds how long a module's supervisor lets an
-/// in-flight, unbound (no `request_id`) call run before forcing the module's
-/// process to stop — which is what severs this connection — so this bound
-/// must clear 30s with real margin, never assume the cut is instant.
-const DISABLE_REVOCATION_BOUND: Duration = Duration::from_secs(45);
+/// connection close AFTER the real disable is sent (M-B). This is NOT
+/// `os_routes.rs`'s own `DISABLE_DRAIN` (30s) — by the time this test issues
+/// the disable, the outer call already ended on its own, via the proxy's
+/// ~10s `UPSTREAM_HEAD_DEADLINE` first-byte timeout (L-A, joined and
+/// asserted `504 upstream_timeout` before the disable is ever sent), so
+/// `DISABLE_DRAIN`'s own in-flight-request grace has nothing left to wait
+/// on and the module's process should stop — severing this connection —
+/// close to immediately. Tightened to 10s (was 45s, sized for a wrong
+/// assumption that this bound had to clear the 30s `DISABLE_DRAIN` window).
+const DISABLE_REVOCATION_BOUND: Duration = Duration::from_secs(10);
 
 /// Graceful-first shutdown, matching `me3f_blackbox.rs::Running` verbatim.
 struct Running(std::process::Child);
@@ -935,42 +976,61 @@ fn model_complete_blackbox_round_trip() {
     //    used to claim was "already proven" purely at the handler level;
     //    it was not proven end-to-end through a real disable until now). ──
     local_stub.set_mode("hang");
-    let before_hang = local_stub.request_count();
-    let hang_call = call_model_bg(d2.port, &d2.token, "m_local", DISABLE_REVOCATION_BOUND);
+    let hang_call = call_model_bg(d2.port, &d2.token, "m_local", HANG_CALL_READ_TIMEOUT);
 
     // The stub must have actually received this call — i.e. it is now
     // genuinely blocked, not merely "about to be dialled" — before either
-    // control below means anything.
-    let received_by = Instant::now() + Duration::from_secs(10);
-    while local_stub.request_count() == before_hang {
+    // control below means anything. Poll `hang_status()` itself (M-A) —
+    // NOT `request_count()` — because the stub write that flips the phase
+    // to `"waiting"` and the write that grows `requests.json` are two
+    // separate, independently timed writes (see [`STUB_SCRIPT`]'s doc
+    // comment: only their RELATIVE order is fixed, not the gap between
+    // them — `requests.json` may lag arbitrarily). Polling the phase
+    // directly is the actual bound this scenario depends on.
+    let waiting_by = Instant::now() + Duration::from_secs(10);
+    loop {
+        if local_stub
+            .hang_status()
+            .as_ref()
+            .map(|(phase, _)| phase.as_str())
+            == Some("waiting")
+        {
+            break;
+        }
         assert!(
-            Instant::now() < received_by,
+            Instant::now() < waiting_by,
             "the hang call never reached the local stub within 10s"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(
-        local_stub
-            .hang_status()
-            .as_ref()
-            .map(|(phase, _)| phase.as_str()),
-        Some("waiting"),
-        "the stub logged the request but is not (yet) blocked on it"
+
+    // **L-A**: the background call comes back on its OWN, via the proxy's
+    // own ~10s first-byte deadline (`UPSTREAM_HEAD_DEADLINE`,
+    // `agent24-os-proto/src/proxy.rs`) — long before any disable is sent.
+    // Join it now and assert exactly that: `504 upstream_timeout`. This is
+    // NOT the real revocation this scenario is proving (that is the stub's
+    // OWN connection closing, asserted below, after the real disable) —
+    // it is the client-facing leg giving up on a module that has not
+    // answered yet, a distinct mechanism this test used to conflate with
+    // `DISABLE_DRAIN`.
+    let (bg_status, bg_body) = hang_call.join().expect("the background call thread");
+    assert_eq!(bg_status, 504, "{bg_body}");
+    assert!(
+        bg_body.contains("upstream_timeout"),
+        "expected upstream_timeout, got: {bg_body}"
     );
 
-    // **Negative control**: nothing has been disabled yet — for a real
-    // window, the stub must keep reporting "waiting", never "done". If this
-    // ever saw "done" here, the close proven below would not be caused by
-    // the disable that follows.
-    let no_disable_yet_until = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < no_disable_yet_until {
-        assert_ne!(
-            local_stub.hang_status(),
-            Some(("done".to_owned(), Some(true))),
-            "the stub observed its connection close before any disable was sent"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // **Negative control** (L-B): at THIS real point in time — the outer
+    // call has already ended via the proxy's own timeout, but no disable
+    // has been sent yet — the stub must still be blocked, never `"done"`.
+    // If this ever saw `"done"` here, the close asserted below would not be
+    // caused by the disable that follows it.
+    let phase_before_disable = local_stub.hang_status().map(|(phase, _)| phase);
+    assert_ne!(
+        phase_before_disable.as_deref(),
+        Some("done"),
+        "the stub observed its connection close before any disable was sent"
+    );
 
     // The real disable: the exact REST route `agent24 os disable m_local`
     // itself calls (`os_routes.rs::patch_os`).
@@ -985,10 +1045,13 @@ fn model_complete_blackbox_round_trip() {
         "disabling m_local: {disable_status} {disable_body}"
     );
 
-    // Bounded poll — real per-module disables drain for up to
-    // `os_routes.rs`'s `DISABLE_DRAIN` (30s) before the module's process is
-    // actually stopped, which is what severs this connection; never a fixed
-    // sleep.
+    // Bounded poll, tightened to `DISABLE_REVOCATION_BOUND` (10s, was
+    // wrongly sized at 45s to clear `os_routes.rs`'s `DISABLE_DRAIN`, 30s):
+    // the in-flight call this drain would otherwise still be waiting on
+    // already ended above (L-A), via the proxy's own ~10s upstream
+    // timeout, so by the time this disable is sent the drain has nothing
+    // left to wait on and the module's process should stop — severing this
+    // connection — with no material delay; never a fixed sleep.
     let closed_by = Instant::now() + DISABLE_REVOCATION_BOUND;
     loop {
         let status = local_stub.hang_status();
@@ -1010,7 +1073,6 @@ fn model_complete_blackbox_round_trip() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = hang_call.join();
 
     stop(d2);
 }
@@ -1041,12 +1103,16 @@ fn real_omlx_smoke() {
     if let Some(m) = &default_model {
         extra_env.push(("DEFAULT_MODEL", m.as_str()));
     }
-    // `OLLAMA_URL` points at a dead port on loopback — NOT "no remote
-    // provider configured" (a router with no `OLLAMA_URL` at all falls back
-    // to its own default, `router.rs:271`, which could be a live host on
-    // this machine); pointing it at a closed port on 127.0.0.1 guarantees
-    // any accidental remote dial fails fast instead of quietly succeeding,
-    // which is what actually keeps this smoke test LocalOnly-only.
+    // `OLLAMA_URL=http://127.0.0.1:1` — plain loopback, NOT the
+    // `[::ffff:127.0.0.1]` trick this file's scenario 3 uses, so J16/§2.3
+    // judges it Local, not Remote: it is a SECOND local provider here, not
+    // a stand-in for "no remote provider configured". A router with no
+    // `OLLAMA_URL` at all falls back to its own default (`router.rs:271`),
+    // which could be a REAL Ollama actually running on this machine on its
+    // usual port; pointing it at a closed port instead means that if oMLX
+    // is down or hung, this local fallback fails fast (connection refused)
+    // instead of quietly, non-deterministically succeeding against a real
+    // local Ollama this smoke test never asked for.
     let d = start(home.path(), &omlx_url, "http://127.0.0.1:1", &extra_env);
     wait_mounted(d.port, &d.token, "m_local", || d.recent_stderr());
     let r = call_model(d.port, &d.token, "m_local", "{}");
