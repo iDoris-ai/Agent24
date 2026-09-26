@@ -1,6 +1,6 @@
 # AgentEar × Agent24 × iDoris 接入规划（ADR-032 草案）
 
-> **状态：提议中 —— §8 已记录 jason 2026-09-26 的 4 项拍板；推荐的接入方式因此从 A1 改为 A3（附着式模块）；iDoris 部分仍待 idoris 会话核对**。决策摘要登记在 [`docs/decision.md`](../decision.md) ADR-032。
+> **状态：提议中 —— §8 已记录 jason 2026-09-26 的 4 项拍板；推荐的接入方式因此从 A1 改为 A3（附着式模块）；iDoris 部分已由 idoris 会话核对并修订（§9，附录 B）**。决策摘要登记在 [`docs/decision.md`](../decision.md) ADR-032。
 > 来源：2026-09-26 Opus 只读调研 + AgentEar 会话（agentear-59）一手回复。
 
 
@@ -208,6 +208,49 @@
 
 **P0 新增**：用一个 spike 实测 A1 下 TCC 的实际归属。spike 需要在图形界面里点授权弹窗，要 jason 手动配合。如果实测 TCC 归属 AgentEar 自己，A1 仍然可用，A3 就降为可选项。
 
+
+## 9. iDoris 核对后的修订（idoris-a4，2026-09-26）
+
+以 idoris 会话的一手回复为准（附录 B）。原先 §1–§6 里从仓库推断的 iDoris 内容，凡与本节冲突的，一律以本节为准。
+
+**排期**：代码已写完，但**一行都还没合进 iDoris 的集成分支**（32 个 PR 串成 30 层的 stacked 链，全部 open）。接口契约已冻结，可以先照着写；但 **P4（iDoris provider）只有等 iDoris 链合进 `preview` 之后才能排期**。「iDoris 已可依赖」不写进任何时间表。
+
+**更正**
+- 本地编排**不用 llama-swap**，直接用 oMLX 原生的多模型 + LRU + memory-guard。
+- 「没有鉴权」**是有意为之**：Router 只消费已验明身份的 tenant_id；personal 模式靠 loopback 绑定。绑定地址写死为 127.0.0.1，与 D2（LAN 算远程）一致。
+- iDoris 侧已经拍板接法：**作为 `agent24-models` 的 OpenAI-compat provider**，要求纯加法、零回归，与 §4 B1 一致。
+
+**tier 与 locality 是两件事（iDoris 指出，采纳）**
+
+| | 静态 / 声明 | 动态 / 事实 |
+|---|---|---|
+| **授权**：准不准出本机 | `tier`：两个逻辑 provider，`idoris-local`(Local, 固定 `X-iDoris-Privacy: local_only`) / `idoris-any`(Remote, `any`) | — |
+| **记账**：实际去了哪 | — | 响应头 `X-iDoris-Served-Locality: loopback \| lan \| remote` |
+
+- iDoris 是 local-first 的。`privacy: any` 只表示**允许**出本机，大量请求其实仍由本地模型完成。所以 `idoris-any` 的用量**不能**按 tier 记成 Remote，必须按 Served-Locality 记账。只做两个逻辑 provider、不接这个头，会反过来把本地请求记错成远端。
+- `/v1/models`：同一个 URL 注册成两个 provider 后会返回两份相同的清单，Agent24 必须去重。
+- **容量按 URL 聚合，不按逻辑 provider 聚合**：`/capabilities` 返回的 `estimated_memory_gb` / `admission_status` 描述的是同一台机器、同一个 oMLX 实例。如果把两个逻辑 provider 当作各自独立的容量相加，在 24GB 的机器上会排出注定 OOM 的组合。
+
+**`X-iDoris-Served-Locality` 的语义（必须如实理解）**
+- 取值来自 dispatch **实际选中**的组件卡（`target.card.provider.locality`），而不是请求里带的 privacy，所以不是把请求回显一遍。SSE 下也能在首个事件之前发出。
+- **它能证明「路由没选错」，不能证明「字节确实没有出本机」。** `locality` 只是组件卡上的声明字段。这个头能抓住路由错误，例如 `idoris-local` 这一路选中了 locality 不是 loopback 的 provider，Agent24 遇到这种情况应当报警并按错误处理。但它抓不住一张撒谎的组件卡；那种情况要靠 iDoris 的 `allowed_egress` 强制约束和出网探针来防。**「头是 loopback」不等于「已审计」。**
+- 状态：**契约已定，实现要等 iDoris 链合并**（它落在 #25 那条分支上）。
+
+**订阅中转（spawn `claude`/`codex`，带工具的 agent 程序）**
+- 如果把它当 provider 用，就会绕过 Agent24 的审批门。现状下它**默认就接不到 Agent24 的请求**：
+  - 组件卡是 `tier: remote`，而默认链是 `{tiers:[local]}`，永远不会选中它；
+  - `privacy_class: any`，所以 `local_only` 请求结构上到达不了它；
+  - 注册需要同时满足 `deploy_mode=personal`、`IDORIS_ENABLE_SUBSCRIPTION=1`、`IDORIS_SUBSCRIPTION_SANDBOX` 三个条件。
+- **不加 `X-iDoris-Exclude` 请求头**：由调用方自带排除项，下一个调用方忘了带就会失效，是失败开放的。如果 Agent24 永远不想用到它，正确做法是**进程边界**：起第二个 Router 实例（不同端口，不装那张组件卡），Agent24 指向这个实例。进程边界就是授权边界，结构上无法绕过。
+- 防线的顺序是：**结构上不可达 → 策略上不选中 → 沙箱兜底**。沙箱只是最后一道。
+- 真缺口：personal 模式下 iDoris 没有「调用方身份」这个概念。如果将来需要同一个实例按调用方区分（例如 jason 自己聊天可以用订阅，Agent24 模块不可以），应当在 routing policy 里加规则维度并升级契约版本，不走请求头。**登记为 followup。**
+
+**隐私映射（单向，两道门同向叠加）**：manifest 没有声明 `model_access` 时发 `X-iDoris-Privacy: local_only`，声明了 `remote_allowed` 时发 `any`。iDoris 那边仍会独立做一次 fail-closed 复核，不信任上游的声明。
+
+**内存（Mac mini M4 24GB）**：常驻 9B（约 9.8GB）+ 临时 ≤14B。千问 2B/7B 可以随便加载；**27B Q4（约 15–16GB）和 9B 常驻共存会超内存（`requires_eviction`）**；35B MoE 判为 BLOCKED。调度混合模式之前先查 `/capabilities`，不要等到 OOM。
+
+**§6「→ iDoris」诉求修订**：第 1 条的鉴权和守护进程入口，改为「personal 模式下 loopback 即授权，无需鉴权」；第 2 条落点头，改为 Served-Locality 三值，契约已定，实现待链合并；第 3–5 条保留。
+
 ---
 
 ## 附录 A：AgentEar 会话（agentear-59）一手回复摘要
@@ -284,3 +327,38 @@
 - 方言 TTS 还没验收。
 - 录音中途崩溃会丢整段。
 - 没有离线首装流程。
+
+---
+
+## 附录 B：iDoris 会话（idoris-a4）一手回复摘要
+
+**排期现实**：代码已经写完，但一行都没合进集成分支。32 个 PR 串成一条 30 层的 stacked 链，全部处于 open 状态（`preview` 分支上只有文档）。接口契约已经冻结，可以照着写代码，但不要把「iDoris 已可依赖」写进时间表，要等合进 `preview` 之后。今天刚修完 #14–#17（CI 类型路径问题）、#25（跨租户幂等缓存泄漏）、#23（出网探针失明）、#32（promise 缓存污染）。
+
+## 三项能力
+- **③ 本地模型编排**：代码完成。**不装 llama-swap**，直接用 oMLX 原生的多模型、LRU、memory-guard。有引擎无关的 `LoadPolicy` 抽象和 oMLX 适配器，另有黄金一致性测试（同一组序列分别跑 mock 和 oMLX，断言结果语义等价）。
+- **① 本地订阅中转**（spawn `claude -p` / `codex exec`）：代码完成，定位是 best-effort，不作为必需的兜底。⚠️ 这两个是**带工具和工作区能力的 agent 程序**，把它们当 provider 用，等于开了一条**绕过 Agent24 审批门**的通道。所以要求它跑在无工具、无写权限的沙箱里；`deploy_mode != personal` 时启动即拒绝注册。
+- **② 外部 API**：只做了通用 OpenAI-compat 槽位和冒烟测试，故意没做选型。保真度矩阵标为 BLOCKED，等真实消费者出现。
+
+## 对外接口
+- 地址 `http://127.0.0.1:<port>/v1`。**绑定写死 loopback**（server.ts:47），端口可配置，默认 0（随机）。
+- 端点：`/v1/models`、`/v1/chat/completions`（SSE）、`/capabilities`（返回 `admission_status: ready|requires_eviction|blocked`）、`/health`。
+- 流式一旦开始吐 token 就不再重试，出错时以 SSE error 事件结束；非流式最多退避重试 2 次。
+- **Router 本身不做鉴权**：只消费已验明的 tenant_id，认证归组织侧 / AirAccount；personal 模式靠 loopback 绑定保护。
+- 用量回传：响应头 `X-iDoris-Reason` / `X-iDoris-Provider` / `X-iDoris-Cost-Minor`；另有 `GET /idoris/tenants/{id}/usage?period=`，返回里带 `billing_timezone` 和 `range_utc`。审计只存元数据，不存内容。
+
+## 路由（策略即数据，写在 `config/routing-policy.yaml`）
+- 控制面请求头：`X-iDoris-Privacy: local_only|any`（缺省 local_only）、`-Intent`、`-Complexity`、`-Capabilities`、`-Fallback`、`-Tenant`（tenant 模式下必填）。
+- `local_only` 且本地没有可用 provider 时，返回 **503 `local_only_unavailable`**，绝不外转。回归测试断言：停光本地 provider 后发 20 条请求，20 条全部 503，**且出站计数为 0**。
+- 判定顺序固定：隐私 → 预算 → 意图/能力 → admission → 降级链。
+- 组件卡的强制字段（`privacy_class` / `allowed_egress` / `fallback_policy` / `fail_closed` / `version_pin`）缺任何一个，都拒绝注册。
+
+## 接法（iDoris 侧已拍板）
+- **(a)**：Agent24 把 iDoris 当作一个 OpenAI-compat provider 接进 ModelRouter（`IDORIS_URL`），纯加法、零回归。不走 (b) OOP 模块，也不走 (c) iDoris 调 Agent24。
+- 职责分界：Agent24 做事（动作授权）｜iDoris 准入（推理资源）｜Hyphae 传话｜AgentEar 听与说。
+- **隐私映射单向**：manifest 未声明时发 `X-iDoris-Privacy: local_only`；`remote_allowed` 时发 `any`。iDoris 侧仍 fail-closed 复核一遍，两道门同向叠加。
+
+## 诉求与约束
+- 对 Agent24 的需求见 `docs/09-对Agent24的需求.md` R1–R6：接入为 provider；任务画像走 header；LocalOnly 贯穿且 fail-closed；硬件感知推荐；后端不绑定 oMLX；危险动作照走审批门。**不要求 Agent24 做破坏性改动。**
+- 凭证：iDoris 只管 provider key；DID 归 AirAccount；工具凭证归 Agent24；设备权限归 AgentEar。
+- 内存（Mac mini M4 24GB）：常驻 9B（Ornith-1.0-9B Q6_K，约 9.8GB）+ 临时模型 ≤14B。35B MoE 判为 BLOCKED。千问 2B/7B 可以随时挂载；**27B Q4 约 15–16GB，和 9B 常驻共存会超内存，属于 `requires_eviction`**。`/capabilities` 会提前告知。
+- 纯本地离线：默认策略就是 local-first 且 fail-closed；设 `IDORIS_DISABLE_SUBSCRIPTION=1` 可全绿运行；有出网启动断言。
