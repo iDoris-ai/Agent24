@@ -1331,10 +1331,15 @@ pub async fn serve(
             // module's in-flight inference lives exactly as long as its own
             // drain allows. ME4-4.2.3b: the usage sink is now the real
             // `UsageRecorder` — `serve` waits for its writer below, AFTER the
-            // supervisors have stopped, via `stop_usage_writer`.
+            // supervisors have stopped, via `stop_usage_writer`. Cloned (not
+            // moved) here: `serve` keeps its own `usage_recorder` binding
+            // alive to pass to `stop_usage_writer` later — that function
+            // itself is what drops the LAST reference, right before it
+            // awaits the writer's join (its own doc comment explains why
+            // that ordering matters).
             models: Some(crate::model_callback::ModelCallbackDeps {
                 router: state.router.clone(),
-                usage: usage_recorder,
+                usage: usage_recorder.clone(),
                 cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
                 admission: crate::model_callback::ModelAdmission::new(
                     crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
@@ -1495,7 +1500,12 @@ pub async fn serve(
     // round 4). Checked again, atomically, before the ready line below.
     if cancel.is_cancelled() {
         let _ = stopping.await;
-        crate::usage_recorder::stop_usage_writer(usage_writer, shutdown.deadlines().modules).await;
+        crate::usage_recorder::stop_usage_writer(
+            usage_recorder,
+            usage_writer,
+            shutdown.deadlines().modules,
+        )
+        .await;
         return Ok(());
     }
 
@@ -1527,7 +1537,12 @@ pub async fn serve(
             agent24_protocol::state_file::remove_if_owner(daemon_pid);
         }
         let _ = stopping.await;
-        crate::usage_recorder::stop_usage_writer(usage_writer, shutdown.deadlines().modules).await;
+        crate::usage_recorder::stop_usage_writer(
+            usage_recorder,
+            usage_writer,
+            shutdown.deadlines().modules,
+        )
+        .await;
         return Ok(());
     }
     println!(
@@ -1570,7 +1585,12 @@ pub async fn serve(
     // up to the SAME `deadlines().modules` instant its own hard stop uses.
     // Skipping this call, or not awaiting it, is exactly the bug J19 exists
     // to catch: a record queued but never written before the process exits.
-    crate::usage_recorder::stop_usage_writer(usage_writer, shutdown.deadlines().modules).await;
+    crate::usage_recorder::stop_usage_writer(
+        usage_recorder,
+        usage_writer,
+        shutdown.deadlines().modules,
+    )
+    .await;
     // Only remove our own state file — a newer daemon may have replaced it
     if !ephemeral {
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
@@ -1812,10 +1832,19 @@ pub(crate) mod tests {
     /// call's outcome (including ones the cut-off cancelled) has already
     /// either reached the recorder's channel or never will. Calling it
     /// earlier would race the very cancellations it exists to wait out; not
-    /// calling it at all is the bug this test exists to catch (mutation:
-    /// delete the call from the main path — this test turns red even though
-    /// the two early-return copies, both before this point in the source,
-    /// remain).
+    /// calling it at all is the bug this test exists to catch.
+    ///
+    /// Review, M1: two hardenings over the original version of this test —
+    /// (a) `//`-comment lines are stripped from the scanned source FIRST, so
+    /// commenting the call out (and `drop`-ping the values it would have
+    /// consumed, to keep the function compiling) does not fool a plain
+    /// substring search; (b) the match is the FULL call with its exact
+    /// arguments, not just the bare function name, so swapping in a
+    /// differently-shaped call (wrong argument, wrong order) also turns this
+    /// red. Mutation verified: replacing the real call with
+    /// `// crate::usage_recorder::stop_usage_writer(...)` plus
+    /// `drop(usage_recorder); drop(usage_writer);` turns this red; reverting
+    /// turns it green again.
     #[test]
     fn stop_usage_writer_is_called_after_the_supervisors_have_stopped() {
         let src = include_str!("server.rs");
@@ -1825,17 +1854,33 @@ pub(crate) mod tests {
             .find("\n}\n")
             .expect("function must be brace-terminated");
         let body = &body[..end];
+        // Strip `//`-comments line by line (this scans ONLY `serve`'s own
+        // source, which has no `//` inside a string literal near this area,
+        // so a naive split is safe here) — a commented-out call must be
+        // invisible to the search below.
+        let code_only: String = body
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
         // Unique to the main shutdown path — the two early-return copies
         // (during startup) never call `shutdown.request()` right before
         // their own `stopping.await`.
-        let stopping_at = body
+        let stopping_at = code_only
             .find("shutdown.request();\n    let _ = stopping.await;")
             .expect("the main shutdown path must request, then wait for stopping");
-        let after = &body[stopping_at..];
+        let after = &code_only[stopping_at..];
+        // The exact rustfmt shape of the real call (verified against the
+        // source at the time this test was written — a reformat that keeps
+        // the same call would need this literal updated too, which is the
+        // point: it is not just checking the function name).
+        let exact_call = "crate::usage_recorder::stop_usage_writer(\n        usage_recorder,\n        \
+                           usage_writer,\n        shutdown.deadlines().modules,\n    )\n    .await;";
         assert!(
-            after.contains("stop_usage_writer("),
-            "serve()'s main shutdown path must call stop_usage_writer(...) \
-             AFTER `let _ = stopping.await;` — design \
+            after.contains(exact_call),
+            "serve()'s main shutdown path must call \
+             crate::usage_recorder::stop_usage_writer(usage_recorder, usage_writer, \
+             shutdown.deadlines().modules).await AFTER `let _ = stopping.await;` — design \
              docs/design/ME4-S2-model-callback.md §6.3/v3.1 M-2"
         );
     }

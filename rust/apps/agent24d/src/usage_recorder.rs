@@ -6,7 +6,8 @@
 //!   task, so no handler ever awaits a disk write.
 //! - §6.2 — the counting table this module's `record_of` implements: which
 //!   `UsageOutcome` variant becomes which `(ServedBy, ModelUsageDelta)`.
-//! - J11 (writer half) / J19 — this file's tests.
+//! - J11 (writer half) / J19 — this file's tests (`usage_by_module_*`, so
+//!   `cargo test -p agent24d usage_by_module` finds them — review H2).
 //!
 //! **Two ways this task ends**, both by design (§6.3):
 //! - **Normal**: every [`UsageSink`]-holding sender is dropped (the
@@ -16,7 +17,9 @@
 //! - **Hard stop**: `hard_stop` resolves first (production: the shutdown
 //!   token cancelled, then `Shutdown::deadlines().modules` — cut-off plus
 //!   `CONFIRM`, §3.3/§6.3). Nothing new is written after that instant:
-//!   whatever is still queued is dropped and counted in one `warn!(lost)`.
+//!   whatever is still queued is dropped and counted — into the SAME
+//!   `dropped()` counter a full channel counts into (review, M2: from the
+//!   outside, "never made it to the store" is one fact, not two).
 //!   This never extends a shutdown past `deadlines().modules`, which already
 //!   sits ahead of `persist`/`watchdog` (`lifecycle.rs`).
 //!
@@ -24,10 +27,11 @@
 //! shutdown sequence, AFTER the out-of-process supervisors have stopped (so
 //! every in-flight call's outcome — including the ones the cut-off itself
 //! cancelled — has already reached this task's channel), it waits for the
-//! writer up to the same `deadlines().modules` instant `hard_stop` uses. Not
-//! waiting for it (J19's whole point) is exactly the bug this exists to
-//! prevent: a record that landed in the channel but never reached the store
-//! before the process exits.
+//! writer up to the same `deadlines().modules` instant `hard_stop` uses, and
+//! logs the final `dropped()` count as the shutdown's one summary line for
+//! this subsystem (review, M2). Not waiting for the writer (J19's whole
+//! point) is exactly the bug this exists to prevent: a record that landed in
+//! the channel but never reached the store before the process exits.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -47,6 +51,28 @@ use crate::model_callback::{Served, UsageOutcome, UsageSink};
 /// may run from a `Drop`).
 const CHANNEL_CAPACITY: usize = 1024;
 
+/// L3 (review): the wall clock `record_of` reads for `day`, injectable so a
+/// test can pin an exact instant instead of depending on wall-clock time and
+/// the host's timezone (the earlier wall-clock test could only catch a
+/// `chrono::Local` regression when the host's local calendar day happened to
+/// differ from UTC's at the moment the test ran). Production (`spawn`/
+/// `spawn_with_write_delay`) always wires in [`SystemUtcClock`], a one-line
+/// pass-through to `chrono::Utc::now()` — there is no longer anywhere for a
+/// Local-vs-UTC mixup to hide other than that one line.
+pub trait UtcClock: Send + Sync {
+    fn now(&self) -> chrono::DateTime<chrono::Utc>;
+}
+
+/// The production clock.
+#[derive(Debug, Default)]
+pub struct SystemUtcClock;
+
+impl UtcClock for SystemUtcClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+}
+
 fn served_by_of(served: Served) -> ServedBy {
     match served {
         Served::Local => ServedBy::Local,
@@ -64,18 +90,16 @@ struct UsageRecord {
 }
 
 /// §6.2, turned into one row's contribution. `day` is the UTC calendar day
-/// **at the moment the outcome is recorded** — not when the writer later
-/// dequeues and stores it — read fresh from `chrono::Utc::now()` every call:
-/// two recorders (or one recorder that happens to straddle midnight) must
-/// still land in the bucket the call actually happened in, in the one
-/// timezone every reader of the table shares. Using the local clock instead
-/// would put the same instant in a different bucket depending on the
-/// daemon's `TZ` — this is deliberately never `chrono::Local`.
-fn record_of(module: &str, outcome: UsageOutcome) -> UsageRecord {
-    let day = chrono::Utc::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
+/// of `now` — measured at `record`-time (not when the writer later dequeues
+/// and stores it): two recorders (or one recorder that happens to straddle
+/// midnight) must still land in the bucket the call actually happened in, in
+/// the one timezone every reader of the table shares.
+fn record_of(
+    module: &str,
+    outcome: UsageOutcome,
+    now: chrono::DateTime<chrono::Utc>,
+) -> UsageRecord {
+    let day = now.date_naive().format("%Y-%m-%d").to_string();
     let (served_by, delta) = match outcome {
         UsageOutcome::Ok {
             served,
@@ -136,12 +160,17 @@ fn record_of(module: &str, outcome: UsageOutcome) -> UsageRecord {
 /// every `ModelCallbackDeps`/`ModelGrant` clones as its `Arc<dyn UsageSink>`.
 pub struct UsageRecorder {
     tx: mpsc::Sender<UsageRecord>,
-    dropped: AtomicU64,
+    /// Shared with the writer task (`run_writer`) via `Arc`, not merely
+    /// owned here: a hard stop's lost records must land in the SAME counter
+    /// a full channel counts into (review, M2), and only the writer task's
+    /// own end-of-life code can see the former.
+    dropped: Arc<AtomicU64>,
+    clock: Arc<dyn UtcClock>,
 }
 
 impl UsageRecorder {
     /// Production entry point: no artificial delay before a dequeued record
-    /// is written.
+    /// is written, and the real wall clock ([`SystemUtcClock`]).
     #[must_use]
     pub fn spawn(
         store: Store,
@@ -153,34 +182,70 @@ impl UsageRecorder {
     /// The test seam (§6.3): `write_delay` is awaited, per record, right
     /// before the store call — long enough to make "the record is queued but
     /// not yet in the store" an observable window (J19's
-    /// `waiting_for_the_writer_is_what_lands_the_record`; §6.3's own doc
-    /// comment on this method calls it out by name). Production always calls
-    /// [`Self::spawn`], i.e. `write_delay == Duration::ZERO`.
+    /// `usage_by_module_waiting_for_the_writer_is_what_lands_the_record`;
+    /// §6.3's own doc comment on this method calls it out by name).
+    /// Production always calls [`Self::spawn`], i.e. `write_delay ==
+    /// Duration::ZERO`, and still the real wall clock.
     #[must_use]
     pub fn spawn_with_write_delay(
         store: Store,
         hard_stop: impl Future<Output = ()> + Send + 'static,
         write_delay: Duration,
     ) -> (Arc<Self>, JoinHandle<()>) {
+        Self::build(store, hard_stop, write_delay, Arc::new(SystemUtcClock))
+    }
+
+    /// L3 (review): the same, with an injectable [`UtcClock`] — test-only.
+    /// Production never calls this; it always goes through [`Self::spawn`]/
+    /// [`Self::spawn_with_write_delay`], which fix the clock to
+    /// [`SystemUtcClock`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn spawn_with_clock(
+        store: Store,
+        hard_stop: impl Future<Output = ()> + Send + 'static,
+        write_delay: Duration,
+        clock: Arc<dyn UtcClock>,
+    ) -> (Arc<Self>, JoinHandle<()>) {
+        Self::build(store, hard_stop, write_delay, clock)
+    }
+
+    fn build(
+        store: Store,
+        hard_stop: impl Future<Output = ()> + Send + 'static,
+        write_delay: Duration,
+        clock: Arc<dyn UtcClock>,
+    ) -> (Arc<Self>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
         let recorder = Arc::new(Self {
             tx,
-            dropped: AtomicU64::new(0),
+            dropped: Arc::clone(&dropped),
+            clock,
         });
-        let handle = tokio::spawn(run_writer(store, rx, hard_stop, write_delay));
+        let handle = tokio::spawn(run_writer(store, rx, hard_stop, write_delay, dropped));
         (recorder, handle)
     }
 
-    /// How many records this sink could not hand to the writer (channel full
-    /// or, after a hard stop, closed) or the writer discarded at its hard
-    /// stop. Test-only accessor (mirrors `model_callback::MemoryUsageSink::
-    /// take`'s gating) — the counter itself is always kept in production
-    /// (`record`, below), but nothing in the production path reads it back
-    /// today.
-    #[cfg(test)]
+    /// How many records never made it to the store this run: either this
+    /// sink could not hand them to the writer (channel full, or closed after
+    /// a hard stop), or the writer itself discarded them at its hard stop —
+    /// one counter for both (review, M2: "never landed" is a single fact).
+    /// Public in production (design §6.3's own signature) — `stop_usage_writer`
+    /// logs it once, as the shutdown's summary line for this subsystem.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// An independent handle to the SAME dropped-count, decoupled from this
+    /// particular `Arc<UsageRecorder>`'s lifetime — used by
+    /// [`stop_usage_writer`] so it can drop its (possibly last) `Arc`
+    /// reference to the sender BEFORE awaiting the writer's join, and still
+    /// read the final count afterward. Crate-internal: nothing outside this
+    /// module needs it, `dropped()` above is the public accessor.
+    pub(crate) fn dropped_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.dropped)
     }
 }
 
@@ -188,13 +253,28 @@ impl UsageSink for UsageRecorder {
     fn record(&self, module: &str, outcome: UsageOutcome) {
         // `try_send`: synchronous, never blocks — the sink contract (§6.3)
         // this may be called from a `Drop`. A full or closed channel counts
-        // and warns rather than panicking or awaiting.
-        if self.tx.try_send(record_of(module, outcome)).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                module,
-                "the model usage channel is full or closed; dropping a usage record"
-            );
+        // into `dropped` regardless.
+        if self
+            .tx
+            .try_send(record_of(module, outcome, self.clock.now()))
+            .is_err()
+        {
+            let already_warned = self.dropped.fetch_add(1, Ordering::Relaxed) > 0;
+            // Review, M2: rate-limited — only the FIRST drop in a sustained
+            // overload logs; the running total (via the public `dropped()`,
+            // the same accessor `stop_usage_writer`'s final summary reads)
+            // is included so the one line still says how bad it's gotten,
+            // rather than logging every single one at `warn` level for as
+            // long as the overload lasts.
+            if !already_warned {
+                tracing::warn!(
+                    module,
+                    total_dropped = self.dropped(),
+                    "the model usage channel is full or closed; dropping usage records \
+                     (further drops in this run are counted, not logged individually — \
+                     see the total in the writer's final summary)"
+                );
+            }
         }
     }
 }
@@ -210,6 +290,7 @@ async fn run_writer(
     mut rx: mpsc::Receiver<UsageRecord>,
     hard_stop: impl Future<Output = ()> + Send + 'static,
     write_delay: Duration,
+    dropped: Arc<AtomicU64>,
 ) {
     tokio::pin!(hard_stop);
     loop {
@@ -227,6 +308,7 @@ async fn run_writer(
                     lost = lost.saturating_add(1);
                 }
                 if lost > 0 {
+                    dropped.fetch_add(lost, Ordering::Relaxed);
                     tracing::warn!(
                         lost,
                         "the model usage writer hit its hard stop; dropping queued records"
@@ -258,14 +340,43 @@ async fn run_writer(
 /// out-of-process supervisors have stopped, so it is what actually lands
 /// records already queued (including any the cut-off itself produced) before
 /// the process exits — the bug J19 exists to catch is skipping this call, or
-/// not awaiting it. `writer` is the `JoinHandle` [`UsageRecorder::spawn`]
-/// returned; `deadline` is the SAME instant the recorder's own `hard_stop`
+/// not awaiting it.
+///
+/// Takes `recorder` BY VALUE (not `&UsageRecorder`) and drops it internally,
+/// before awaiting `writer` — deliberately: by the time `serve` calls this
+/// (after every out-of-process supervisor has stopped), every OTHER sender
+/// (each mounted module's `ModelGrant`) is already gone, so `recorder`'s own
+/// reference is the only thing that could still be keeping the channel open.
+/// Holding onto it across the `.await` below — e.g. by taking `&UsageRecorder`
+/// and having `serve` keep its own clone alive for the rest of the function —
+/// would make the channel's "every sender dropped" path never fire in
+/// practice, silently forcing every shutdown to wait out the full
+/// `hard_stop` deadline instead of returning as soon as the writer actually
+/// finishes. `deadline` is the SAME instant the recorder's own `hard_stop`
 /// resolves at (`Shutdown::deadlines().modules`), so this never waits past
 /// the bound the writer itself already enforces — it can only return early
 /// relative to it, never later.
-pub async fn stop_usage_writer(writer: JoinHandle<()>, deadline: Instant) {
+pub async fn stop_usage_writer(
+    recorder: Arc<UsageRecorder>,
+    writer: JoinHandle<()>,
+    deadline: Instant,
+) {
+    let dropped_handle = recorder.dropped_handle();
+    drop(recorder);
     if tokio::time::timeout_at(deadline, writer).await.is_err() {
         tracing::warn!("the model usage writer did not finish by the modules deadline");
+    }
+    // Review, M2: one summary line either way — an operator scanning logs
+    // for "did this shutdown lose anything" should find an answer here
+    // without having to know this counter exists.
+    let dropped = dropped_handle.load(Ordering::Relaxed);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "the model usage writer stopped; {dropped} record(s) were dropped this run"
+        );
+    } else {
+        tracing::info!("the model usage writer stopped; no records were dropped this run");
     }
 }
 
@@ -286,7 +397,7 @@ mod tests {
     // ── J11 (writer half) — sender 全部 drop 后写完队列并退出 ────────────────
 
     #[tokio::test]
-    async fn all_senders_dropped_drains_the_queue_and_the_task_returns() {
+    async fn usage_by_module_all_senders_dropped_drains_the_queue_and_the_task_returns() {
         let store = Store::open_memory().await.unwrap();
         let (recorder, writer) = UsageRecorder::spawn(store.clone(), std::future::pending());
         recorder.record(
@@ -316,7 +427,7 @@ mod tests {
     /// return — it does not return on its own just because the queue is
     /// momentarily empty.
     #[tokio::test]
-    async fn with_a_sender_still_alive_only_hard_stop_ends_the_writer() {
+    async fn usage_by_module_with_a_sender_still_alive_only_hard_stop_ends_the_writer() {
         let store = Store::open_memory().await.unwrap();
         let hard_stop = tokio::sync::Notify::new();
         let hard_stop = Arc::new(hard_stop);
@@ -345,7 +456,7 @@ mod tests {
     // ── §6.2 mapping — each UsageOutcome lands the row §6.2 says it should ──
 
     #[tokio::test]
-    async fn each_outcome_maps_to_its_own_table_row() {
+    async fn usage_by_module_each_outcome_maps_to_its_own_table_row() {
         let store = Store::open_memory().await.unwrap();
         let (recorder, writer) = UsageRecorder::spawn(store.clone(), std::future::pending());
         recorder.record(
@@ -397,11 +508,81 @@ mod tests {
         assert_eq!(none.prompt_tokens, 0, "none rows never carry tokens");
     }
 
-    // ── day 用 UTC，不用 Local（mutation target） ───────────────────────────
+    // ── L3 (review) — day 从可注入时钟取，固定时刻，无跨午夜竞态/时区依赖 ────
+
+    struct FixedClock(chrono::DateTime<chrono::Utc>);
+
+    impl UtcClock for FixedClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.0
+        }
+    }
 
     #[tokio::test]
-    async fn the_day_is_todays_utc_calendar_day() {
+    async fn usage_by_module_day_is_taken_from_the_injected_utc_clock() {
         let store = Store::open_memory().await.unwrap();
+        // A fixed instant, chosen with no relation to wall-clock time or any
+        // host's timezone: the point of this test is that it passes
+        // identically everywhere, always, not just when the host's local
+        // date happens to match UTC's at run time.
+        let instant = "2026-01-01T00:30:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let clock: Arc<dyn UtcClock> = Arc::new(FixedClock(instant));
+        let (recorder, writer) = UsageRecorder::spawn_with_clock(
+            store.clone(),
+            std::future::pending(),
+            Duration::ZERO,
+            clock,
+        );
+        recorder.record("m", UsageOutcome::Failed);
+        drop(recorder);
+        tokio::time::timeout(StdDuration::from_secs(5), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        let rows = all_rows(&store, "m").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].day, "2026-01-01",
+            "the stored day must be the injected clock's UTC calendar day"
+        );
+
+        // Positive control: a second fixed instant, 30 minutes before
+        // midnight UTC — guards the day boundary itself (must NOT round up
+        // to the next day).
+        let instant2 = "2026-01-01T23:59:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let clock2: Arc<dyn UtcClock> = Arc::new(FixedClock(instant2));
+        let (recorder2, writer2) = UsageRecorder::spawn_with_clock(
+            store.clone(),
+            std::future::pending(),
+            Duration::ZERO,
+            clock2,
+        );
+        recorder2.record("n", UsageOutcome::Failed);
+        drop(recorder2);
+        tokio::time::timeout(StdDuration::from_secs(5), writer2)
+            .await
+            .unwrap()
+            .unwrap();
+        let rows2 = all_rows(&store, "n").await;
+        assert_eq!(rows2[0].day, "2026-01-01");
+    }
+
+    /// Smoke test (not the UTC-day judgement itself — see the fixed-clock
+    /// test above): production `spawn`/`spawn_with_write_delay` really do
+    /// wire in the real wall clock, not a stub. A day boundary crossing
+    /// exactly between `before` and `after` is the only way this could ever
+    /// be flaky, hence the tolerant either/or assertion.
+    #[tokio::test]
+    async fn usage_by_module_spawn_wires_in_the_real_utc_clock() {
+        let store = Store::open_memory().await.unwrap();
+        let before = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
         let (recorder, writer) = UsageRecorder::spawn(store.clone(), std::future::pending());
         recorder.record("m", UsageOutcome::Failed);
         drop(recorder);
@@ -409,28 +590,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let want = chrono::Utc::now()
+        let after = chrono::Utc::now()
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
         let rows = all_rows(&store, "m").await;
-        assert_eq!(
-            rows.len(),
-            1,
-            "since_day filter ('2000-01-01') must include today's UTC row"
-        );
-        assert_eq!(
-            rows[0].day, want,
-            "the stored day must be today's UTC calendar day, not the local one \
-             (mutating record_of to chrono::Local::now() must turn this red on \
-             any host whose local date differs from UTC's right now)"
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].day == before || rows[0].day == after,
+            "production spawn() must record today's real UTC day, got {}",
+            rows[0].day
         );
     }
 
     // ── J19 (channel half) — dropped()计数 满了/关了都算 ──────────────────
 
     #[tokio::test]
-    async fn a_full_channel_is_counted_as_dropped_not_blocked() {
+    async fn usage_by_module_a_full_channel_is_counted_as_dropped_not_blocked() {
         let store = Store::open_memory().await.unwrap();
         let (recorder, writer) = UsageRecorder::spawn(store, std::future::pending());
         // `#[tokio::test]` defaults to a current-thread runtime and this loop
@@ -451,7 +627,7 @@ mod tests {
     // ── J19 — hard stop drops what's still queued and returns ───────────────
 
     #[tokio::test]
-    async fn a_hard_stop_drops_the_queue_and_returns_without_writing_it() {
+    async fn usage_by_module_a_hard_stop_drops_the_queue_and_returns_without_writing_it() {
         let store = Store::open_memory().await.unwrap();
         let hard_stop = Arc::new(tokio::sync::Notify::new());
         let fired = {
@@ -476,17 +652,79 @@ mod tests {
         drop(recorder);
     }
 
+    // ── M2 (review) — 硬停时丢的也计进同一个 dropped() ───────────────────────
+
+    #[tokio::test]
+    async fn usage_by_module_dropped_counts_records_lost_at_a_hard_stop_too() {
+        let store = Store::open_memory().await.unwrap();
+        let hard_stop = Arc::new(tokio::sync::Notify::new());
+        let fired = {
+            let hard_stop = hard_stop.clone();
+            async move { hard_stop.notified().await }
+        };
+        let (recorder, writer) =
+            UsageRecorder::spawn_with_write_delay(store.clone(), fired, StdDuration::from_secs(5));
+        recorder.record("m", UsageOutcome::Failed);
+        recorder.record("m", UsageOutcome::Failed);
+        assert_eq!(
+            recorder.dropped(),
+            0,
+            "nothing dropped yet — both records were enqueued fine, just not written"
+        );
+        hard_stop.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(5), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.dropped(),
+            2,
+            "the two records lost at the hard stop must show up in dropped(), \
+             the same counter a full channel counts into"
+        );
+    }
+
+    /// `stop_usage_writer` drops its own `Arc<UsageRecorder>` reference
+    /// BEFORE awaiting the join (so it can never be the reason "every sender
+    /// dropped" fails to fire) — this proves that ordering doesn't also lose
+    /// the hard-stop's own count: a handle obtained BEFORE the call still
+    /// reads the post-join value afterward, since both point at the same
+    /// underlying counter.
+    #[tokio::test]
+    async fn usage_by_module_stop_usage_writer_still_reports_hard_stop_losses_after_its_own_drop() {
+        let store = Store::open_memory().await.unwrap();
+        let hard_stop = Arc::new(tokio::sync::Notify::new());
+        let fired = {
+            let hard_stop = hard_stop.clone();
+            async move { hard_stop.notified().await }
+        };
+        let (recorder, writer) =
+            UsageRecorder::spawn_with_write_delay(store.clone(), fired, StdDuration::from_secs(5));
+        recorder.record("m", UsageOutcome::Failed);
+        recorder.record("m", UsageOutcome::Failed);
+        let dropped_handle = recorder.dropped_handle();
+        hard_stop.notify_one();
+        stop_usage_writer(recorder, writer, Instant::now() + StdDuration::from_secs(5)).await;
+        assert_eq!(
+            dropped_handle.load(Ordering::Relaxed),
+            2,
+            "the hard-stop losses must still be visible through an independently \
+             held handle after stop_usage_writer runs"
+        );
+    }
+
     // ── J19 (v3.1 M-2, behavior half) — 等写者才等到落盘 ─────────────────────
 
     /// The behavior test named in the design doc (§8, J19's variant 2b):
-    /// records one outcome, drops the sender (normal end, no hard stop
-    /// involved), and shows the write is NOT yet visible immediately after —
-    /// only after `stop_usage_writer` returns. Mutating `stop_usage_writer`
-    /// to return immediately (not awaiting `writer`) must turn the SECOND
+    /// records one outcome, then calls `stop_usage_writer` directly (the
+    /// same shape `serve` uses — it drops the last sender internally), and
+    /// shows the write is NOT yet visible immediately after recording — only
+    /// after `stop_usage_writer` returns. Mutating `stop_usage_writer` to
+    /// return immediately (not awaiting `writer`) must turn the SECOND
     /// assertion red every run, not just sometimes (deterministic — the
     /// write delay makes the window wide and unconditional).
     #[tokio::test]
-    async fn waiting_for_the_writer_is_what_lands_the_record() {
+    async fn usage_by_module_waiting_for_the_writer_is_what_lands_the_record() {
         for _ in 0..3 {
             let store = Store::open_memory().await.unwrap();
             let (recorder, writer) = UsageRecorder::spawn_with_write_delay(
@@ -495,13 +733,12 @@ mod tests {
                 StdDuration::from_millis(100),
             );
             recorder.record("m", UsageOutcome::Failed);
-            drop(recorder); // last sender gone: normal end, writer starts draining
             assert!(
                 all_rows(&store, "m").await.is_empty(),
-                "negative control: right after dropping the sender, the 100ms \
-                 write delay means the record has NOT reached the store yet"
+                "negative control: right after recording, the 100ms write \
+                 delay means the record has NOT reached the store yet"
             );
-            stop_usage_writer(writer, Instant::now() + StdDuration::from_secs(5)).await;
+            stop_usage_writer(recorder, writer, Instant::now() + StdDuration::from_secs(5)).await;
             assert_eq!(
                 all_rows(&store, "m").await.len(),
                 1,
@@ -511,17 +748,19 @@ mod tests {
     }
 
     /// The daemon-level J19 judgement (real `serve()`, real cut-off, module
-    /// deps wiring) belongs to `server.rs`'s own tests / the black-box suite
-    /// (4.3.1); this file only owns the recorder's half of the contract.
+    /// deps wiring, and the store re-open after exit) is
+    /// `tests/me4_model_shutdown_wiring.rs`'s
+    /// `model_shutdown_wiring_lands_the_cancelled_call_in_the_store` (review,
+    /// H2: renamed so `cargo test -p agent24d model_shutdown_wiring` finds
+    /// it); this file only owns the recorder's half of the contract.
     #[tokio::test]
-    async fn stop_usage_writer_does_not_wait_past_a_hard_stop_that_already_fired() {
+    async fn usage_by_module_stop_usage_writer_does_not_wait_past_a_hard_stop_that_already_fired() {
         let store = Store::open_memory().await.unwrap();
         // hard_stop resolves at once: the writer should end almost
         // immediately, well inside stop_usage_writer's own generous deadline.
         let (recorder, writer) = UsageRecorder::spawn(store, std::future::ready(()));
-        drop(recorder);
         let started = Instant::now();
-        stop_usage_writer(writer, started + StdDuration::from_secs(5)).await;
+        stop_usage_writer(recorder, writer, started + StdDuration::from_secs(5)).await;
         assert!(
             started.elapsed() < StdDuration::from_secs(1),
             "an already-fired hard stop must not make stop_usage_writer wait out its deadline"

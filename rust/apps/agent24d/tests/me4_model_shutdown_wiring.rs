@@ -237,8 +237,14 @@ fn start_hanging_provider() -> StubProvider {
 /// Real end-to-end coverage of "a `models`-granted module's in-flight call
 /// does not wedge a real shutdown" — see the module doc comment above for
 /// why this is NOT the authoritative test for H1's specific mutations.
+///
+/// Named with the `model_shutdown_wiring` prefix (review, H2) so the
+/// judgement's own command, `cargo test -p agent24d model_shutdown_wiring`,
+/// actually finds this file's test — before this rename, that filter only
+/// matched two unrelated `model_callback.rs` unit tests and silently ran
+/// zero tests from this file (`-- --list` showed 0 here).
 #[test]
-fn a_models_granted_module_does_not_block_a_real_shutdown() {
+fn model_shutdown_wiring_lands_the_cancelled_call_in_the_store() {
     let home = tmp_home();
     install(home.path());
     let provider = start_hanging_provider();
