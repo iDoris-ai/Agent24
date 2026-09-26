@@ -20,6 +20,7 @@ use crate::{
 /// Only the detached worker is admitted: never synchronous `OutputWriter`.
 trait GenerationSink: FrameSink {}
 impl GenerationSink for OutputWorker {}
+impl GenerationSink for &mut OutputWorker {}
 
 /// Private channel-only adapter for the host-lifetime control worker.
 trait ControlPort {
@@ -32,6 +33,14 @@ impl ControlPort for ControlWorker {
     }
     fn permit(&mut self, now: Instant) -> Result<(), ControlPermitError> {
         Self::permit(self, now)
+    }
+}
+impl ControlPort for &mut ControlWorker {
+    fn step(&mut self, now: Instant) -> Result<ControlStep, ControlWorkerError> {
+        ControlWorker::step(self, now)
+    }
+    fn permit(&mut self, now: Instant) -> Result<(), ControlPermitError> {
+        ControlWorker::permit(self, now)
     }
 }
 
@@ -263,6 +272,7 @@ mod tests {
         control_io::IngressError,
         output_io::{OutputWriteError, PutFrameError, WriteStep},
         target::{ExitObservation, TreeObservation},
+        worker_slots::WorkerSlots,
     };
     use agent24_sidecar_host_protocol::{
         Event, PROTOCOL_VERSION, Reply, decode_event, decode_reply,
@@ -271,8 +281,22 @@ mod tests {
         collections::VecDeque,
         io,
         sync::{Arc, Mutex},
+        thread,
         time::Duration,
     };
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(input);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     const L: Deadlines = Deadlines {
         launch: Duration::from_secs(2),
@@ -523,6 +547,74 @@ mod tests {
             })
             .unwrap()
     }
+
+    #[test]
+    fn driver_can_borrow_host_lifetime_control_and_output_workers() {
+        let slots = WorkerSlots::isolated();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut output = OutputWorker::new_in(
+            slots,
+            SharedWriter(Arc::clone(&written)),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let mut control = ControlWorker::new_in(
+            slots,
+            io::Cursor::new(Vec::<u8>::new()),
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap();
+        let facts = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+
+        {
+            let actor = ActorLaunchOrder::new(
+                Launch(Arc::clone(&facts), VecDeque::new()),
+                &mut output,
+                Phase::Launching(now + L.launch),
+                L,
+            );
+            let ready = Ready {
+                r: Arc::clone(&facts),
+                s: VecDeque::new(),
+                p: VecDeque::new(),
+            };
+            let _driver = GenerationDriver::new(actor, &mut control, ready, now);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match output.step(Instant::now()).unwrap() {
+                WriteStep::Complete => break,
+                WriteStep::Pending if Instant::now() < deadline => thread::yield_now(),
+                other => panic!("borrowed output worker did not finish Owned: {other:?}"),
+            }
+        }
+
+        output
+            .put(b"after-generation\n".to_vec(), Instant::now())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match output.step(Instant::now()).unwrap() {
+                WriteStep::Complete => break,
+                WriteStep::Pending if Instant::now() < deadline => thread::yield_now(),
+                other => panic!("host output worker was not reusable: {other:?}"),
+            }
+        }
+        assert!(written.lock().unwrap().ends_with(b"after-generation\n"));
+
+        control.permit(Instant::now()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match control.step(Instant::now()).unwrap() {
+                ControlStep::Complete(IngressStep::Eof) => break,
+                ControlStep::Pending if Instant::now() < deadline => thread::yield_now(),
+                other => panic!("host control worker did not survive driver drop: {other:?}"),
+            }
+        }
+    }
+
     fn counted_step(
         x: &mut GenerationDriver<Launch, Sink, Control, Ready>,
         r: &Arc<Mutex<R>>,
