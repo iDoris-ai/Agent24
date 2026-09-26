@@ -1320,7 +1320,15 @@ SPEC-MD-ME §5 的 ME-3 行写的是「经 MCP/协议」，那是立项时的猜
 - REST `/api/v1/chat` 固定走 `Privacy::Any`。
 - gate 的可执行动作还是空集。
 
-**待拍板**（设计文档 §7）：P2 是否允许先上非流式；LAN/Tailscale 节点算不算「本地」；独立模式下是否保留 MiniCPM 边车；TCC 权限归属（需要 spike 验证）；AgentEar 的开机自启和由 Agent24 拉起之间的冲突怎么处理。
+**2026-09-26 jason 拍板**（设计文档 §8）：
+- P2 可以先上非流式；
+- LAN/Tailscale 算远程；
+- AgentEar 保留自带的小模型以便独立运行，需要更强能力时接 iDoris，全部可配置；
+- TCC 权限留在 AgentEar。
+
+因为最后一条，AgentEar 的推荐接入方式从 A1「内核拉起」改为 **A3「附着式模块」**：AgentEar 自己启动，连上 Agent24 后拿到同一套 offer set。Agent24 需要为附着生命周期单独做一份设计（P2 的前置）。P0 加一个 TCC 实测 spike。
+
+**仍待拍板**（设计文档 §7）：P2 是否允许先上非流式；LAN/Tailscale 节点算不算「本地」；独立模式下是否保留 MiniCPM 边车；TCC 权限归属（需要 spike 验证）；AgentEar 的开机自启和由 Agent24 拉起之间的冲突怎么处理。
 
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
