@@ -25,6 +25,8 @@ pub mod frame;
 pub mod initialize;
 pub mod kernel_call;
 pub mod launch;
+pub mod manifest;
+pub mod module;
 pub mod proxy;
 pub mod rpc;
 pub mod stop_record;
