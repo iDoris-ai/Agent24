@@ -5,11 +5,50 @@
 
 mod approval_callback;
 mod approvals;
+// Remaining public capability primitives are staged for the next endpoints.
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "capability API is intentionally staged beyond route policy"
+)]
 mod capabilities;
 mod domain;
 mod events;
 mod events_emit;
+#[cfg(unix)]
 mod host_bootstrap;
+#[cfg(not(unix))]
+mod host_bootstrap {
+    #![allow(
+        dead_code,
+        reason = "capability bootstrap is unavailable without Unix descriptor validation"
+    )]
+
+    use std::io;
+
+    pub struct ReadyWriter(std::convert::Infallible);
+    pub struct ParentLiveness(std::convert::Infallible);
+
+    /// Capability bootstrap is unavailable without Unix descriptor validation.
+    pub fn open_stdio() -> io::Result<(ReadyWriter, ParentLiveness)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "capability bootstrap requires Unix IPC descriptor validation",
+        ))
+    }
+
+    impl ReadyWriter {
+        pub async fn send(&mut self, _: &serde_json::Value) -> io::Result<()> {
+            match self.0 {}
+        }
+    }
+
+    impl ParentLiveness {
+        pub async fn closed(self) {
+            match self.0 {}
+        }
+    }
+}
 mod lifecycle;
 mod mcp;
 mod module_approval_broker;
