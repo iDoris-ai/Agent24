@@ -1,6 +1,6 @@
 # AgentEar × Agent24 × iDoris 接入规划（ADR-032 草案）
 
-> **状态：提议中（待 jason 拍板 §7；iDoris 部分待 idoris 会话核对）**。决策摘要登记在 [`docs/decision.md`](../decision.md) ADR-032。
+> **状态：提议中 —— §8 已记录 jason 2026-09-26 的 4 项拍板；推荐的接入方式因此从 A1 改为 A3（附着式模块）；iDoris 部分仍待 idoris 会话核对**。决策摘要登记在 [`docs/decision.md`](../decision.md) ADR-032。
 > 来源：2026-09-26 Opus 只读调研 + AgentEar 会话（agentear-59）一手回复。
 
 
@@ -171,6 +171,42 @@
 | 7 | **离线降级** | iDoris 不在线 → 走 Agent24 直连 oMLX；Agent24 不在线 → AgentEar 回到独立模式，用自己的边车。**待拍板**：独立模式要不要保留 MiniCPM 边车（占 1–2GB）。 |
 | 8 | **Mac mini 部署** | 按 Agent24 的定义，非回环一律算 `Remote`，所以 LocalOnly 永远不会发到 Mac mini 上的 iDoris。**待拍板**：LAN/Tailscale 上的节点算不算「本地」。目前 ME4-S2 明确判为 Remote。 |
 | 9 | **配置归属** | 建议 AgentEar 的模型、音色、`commands.json` 仍以它自己的配置为唯一真相，Agent24 只读展示。回执留档归 Agent24。 |
+
+
+## 8. jason 拍板（2026-09-26）与修订
+
+| # | 问题 | 拍板 | 影响 |
+|---|---|---|---|
+| D1 | P2 能否先上非流式 | **可以先上非流式** | P2 不等 P3；流式 `_a24/model` 仍排在 v0.5.0 之后 |
+| D2 | LAN / Tailscale 上的节点（如 Mac mini）算不算本地 | **算远程** | 维持 ME4-S2 的判定：非回环一律 `Remote` |
+| D3 | AgentEar 独立模式是否保留自带小模型 | **保留**（例如 2B）。能独立运行，粗陋一点可以接受；需要更强能力时接 iDoris。**全部可配置** | AgentEar 的 LLM transport 做成三档可选：自带边车 / 直连 iDoris（独立模式）/ 经 Agent24 `_a24/model`（附着模式） |
+| D4 | 麦克风、辅助功能等 TCC 权限归谁 | **留在 AgentEar**。它是外置的，去掉它不影响 Agent24 原有体验（手动打字照常可用） | 见下面的 A3 |
+
+**「本地 / 远程」的含义（回答 jason 的追问）**：在 Agent24 里，这对概念划的是**隐私边界**，与模型能力无关。它只回答一个问题：这次请求的内容会不会离开当前这台电脑。端点在回环地址（127.0.0.1）上，且不走代理、不跟随重定向，就算 `Local`；其余都算 `Remote`，包括用户自己的 Mac mini。模型的强弱由另一个维度决定：每次请求带的 `complexity`（simple / complex）决定在允许的层里优先选哪一层。两个维度互相独立：`Privacy` 决定请求**能去哪**，`complexity` 决定在能去的地方**选谁**。以后如果要让自家内网节点获得中间档的信任，需要新增一个级别（例如「受信内网」），另行决策，本次不做。
+
+**AgentEar 用哪个模型的分层（回答 jason 的追问）**
+- 语音模型（ASR、TTS）**由 AgentEar 自己管**：首字延迟的瓶颈在 TTS，音频也不能离开本机。iDoris 在 §4.2 里已经排除了承接语音的方案。
+- 大模型分层：独立模式用自带的小模型；需要更强能力时，独立模式下直连 iDoris（AgentEar 已是 OpenAI-compat，改一个 URL 即可），附着到 Agent24 时经 `_a24/model`，由 Agent24 统一管隐私和用量。三种方式都通过配置切换。
+
+### A3 附着式模块（因 D4 替换 §4 推荐的 A1）
+
+由 Agent24 拉起 AgentEar（A1）时，macOS 的 TCC 按「负责进程」归属，麦克风和辅助功能权限**很可能**会算到 agent24d 头上，这与 D4 冲突。改为：
+
+| | A1 由内核拉起 | A2 外部 REST 客户端 | **A3 附着式模块（新推荐）** |
+|---|---|---|---|
+| TCC 归属 | 可能归 agent24d（待 spike 验证） | AgentEar ✅ | AgentEar ✅ |
+| 能用到的能力 | 全部 | 只有 chat 等少数几项，且 Privacy 固定为 `Any` | 全部，和 A1 相同 |
+| 独立性 | 依赖内核生命周期 | 独立 | 独立：Agent24 不在时自动回到独立模式 |
+| Agent24 需要做的改动 | 无 | 按模块的 token 和隐私设置 | **新增「附着」生命周期**：模块自行启动，用注册 token 连上 Agent24 的回调端点，握手之后拿到和 OOP 模块相同的 offer set。manifest、授权、`model_access` 规则不变 |
+
+**A3 在 Agent24 侧要先设计的内容**（作为 P2 的前置，单独出一份设计文档，走对抗评审后冻结）：
+- 注册 token 怎么发放、怎么吊销；
+- 回调端点用 Unix socket 还是 loopback HTTP，以及怎么鉴权；
+- 附着模块的 generation、draining、重连语义（和内核拉起的模块相比，「回调断开就退出」这条规则要改）；
+- 反代入站（`/api/v1/agentear/*`）怎么路由到一个不是内核拉起的进程；
+- 同一个模块不能同时以「拉起」和「附着」两种方式存在。
+
+**P0 新增**：用一个 spike 实测 A1 下 TCC 的实际归属。spike 需要在图形界面里点授权弹窗，要 jason 手动配合。如果实测 TCC 归属 AgentEar 自己，A1 仍然可用，A3 就降为可选项。
 
 ---
 
