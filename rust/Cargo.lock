@@ -116,10 +116,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-os-fd"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "agent24-os-packages"
 version = "0.3.0"
 dependencies = [
  "agent24-domain",
+ "agent24-os-proto",
  "rustix 0.38.44",
  "serde_yaml",
  "sha2",
@@ -131,6 +139,7 @@ name = "agent24-os-proto"
 version = "0.3.0"
 dependencies = [
  "agent24-domain",
+ "agent24-os-fd",
  "axum",
  "bytes",
  "close_fds",
@@ -141,6 +150,7 @@ dependencies = [
  "rustix 0.38.44",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "tempfile",
  "tokio",
