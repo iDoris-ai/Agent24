@@ -228,18 +228,17 @@ pub trait UsageSink: Send + Sync {
     fn record(&self, module: &str, outcome: UsageOutcome);
 }
 
-/// 4.2.2b1's sink (and every handler test's, once 4.2.2b1b lands): an
-/// in-memory list. 4.2.3 replaces it in production with `UsageRecorder`.
+/// 4.2.2b1's sink (and every handler test's): an in-memory list. ME4-4.2.3b
+/// replaced it in production with `UsageRecorder` (`server.rs::serve`) — this
+/// type is now test-only, gated here (rather than a blanket file-level
+/// `allow`, which 4.2.2b2 removed) for the same reason `take` below already
+/// was: nothing in the production path constructs it any more.
 #[derive(Default)]
+#[cfg(test)]
 pub struct MemoryUsageSink(Mutex<Vec<(String, UsageOutcome)>>);
 
+#[cfg(test)]
 impl MemoryUsageSink {
-    /// Test-only: production reads the sink through `UsageSink::record`
-    /// alone (4.2.3 replaces this sink entirely). Not gated at the file
-    /// level any more (4.2.2b2 removed that blanket allow, since most of
-    /// this file is now reachable from `serve()`) — gated here instead, on
-    /// the one method nothing in the production path calls.
-    #[cfg(test)]
     pub fn take(&self) -> Vec<(String, UsageOutcome)> {
         std::mem::take(
             &mut *self
@@ -250,6 +249,7 @@ impl MemoryUsageSink {
     }
 }
 
+#[cfg(test)]
 impl UsageSink for MemoryUsageSink {
     fn record(&self, module: &str, outcome: UsageOutcome) {
         self.0

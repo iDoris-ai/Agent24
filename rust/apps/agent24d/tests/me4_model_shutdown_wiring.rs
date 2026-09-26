@@ -237,8 +237,14 @@ fn start_hanging_provider() -> StubProvider {
 /// Real end-to-end coverage of "a `models`-granted module's in-flight call
 /// does not wedge a real shutdown" — see the module doc comment above for
 /// why this is NOT the authoritative test for H1's specific mutations.
+///
+/// Named with the `model_shutdown_wiring` prefix (review, H2) so the
+/// judgement's own command, `cargo test -p agent24d model_shutdown_wiring`,
+/// actually finds this file's test — before this rename, that filter only
+/// matched two unrelated `model_callback.rs` unit tests and silently ran
+/// zero tests from this file (`-- --list` showed 0 here).
 #[test]
-fn a_models_granted_module_does_not_block_a_real_shutdown() {
+fn model_shutdown_wiring_lands_the_cancelled_call_in_the_store() {
     let home = tmp_home();
     install(home.path());
     let provider = start_hanging_provider();
@@ -320,4 +326,35 @@ fn a_models_granted_module_does_not_block_a_real_shutdown() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(exited.success(), "{exited:?}");
+
+    // ME4-4.2.3b (design §6.3/v3.1 M-2, J19's full daemon-level judgement):
+    // the cut-off's cancellation is not just an HTTP-visible/socket-visible
+    // event — it must have LANDED in the store before the process exited.
+    // `stop_usage_writer` in `serve`'s shutdown sequence is exactly what
+    // makes this true; mutating it to return immediately (not awaiting the
+    // writer) is covered at the unit level by
+    // `usage_recorder::tests::waiting_for_the_writer_is_what_lands_the_record`,
+    // and this is the end-to-end proof that the real wiring does the same.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = home.path().join(".agent24/agent24.db");
+        let store = agent24_store::Store::open(&db)
+            .await
+            .unwrap_or_else(|e| panic!("reopening {}: {e}", db.display()));
+        let totals = store
+            .module_model_usage_totals("probe")
+            .await
+            .expect("reading probe's usage totals");
+        let none = totals
+            .iter()
+            .find(|r| r.served_by == "none")
+            .unwrap_or_else(|| {
+                panic!("no 'none' row for probe — got {totals:?}; the cancelled call never landed")
+            });
+        assert_eq!(
+            none.calls_cancelled, 1,
+            "the module's one cancelled call must be recorded exactly once, \
+             surviving daemon exit and reopen — got {totals:?}"
+        );
+    });
 }
