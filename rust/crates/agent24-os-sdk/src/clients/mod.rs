@@ -83,6 +83,28 @@ impl Core {
             .await
             .map_err(ClientError::from)
     }
+
+    /// Like [`Self::call`], but waits up to `slot_wait` for an in-flight
+    /// slot instead of failing fast with [`ClientError::Busy`] — Sin90's
+    /// `KernelClients::call_with_slot_wait` (`adapter_agent24/mod.rs`),
+    /// used by [`super::events::EventsClient::spawn_sink`]'s worker so a
+    /// queued event tolerates a brief wait rather than being dropped on a
+    /// short-lived slot shortage.
+    async fn call_with_slot_wait(
+        &self,
+        method: &'static str,
+        params: Value,
+        slot_wait: Duration,
+    ) -> Result<Value, ClientError> {
+        let opts = CallOptions {
+            slot_wait: Some(slot_wait),
+            ..CallOptions::default()
+        };
+        self.conn
+            .call(method, params, opts)
+            .await
+            .map_err(ClientError::from)
+    }
 }
 
 /// "Omit, don't null" (§1.2 row 10): insert `key` only when `value` is

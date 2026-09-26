@@ -86,32 +86,64 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    /// Sin90's classification, unchanged (`reconciler.rs`'s retry-vs-stop
-    /// match reads this and [`Self::is_retryable`]).
+    /// Ported verbatim from Sin90 `adapter_agent24/clients/error.rs`'s
+    /// `is_permanent` (spec.md M3): retrying the exact same request can
+    /// never turn this into success. Callers (the outbox / reconciler) flip
+    /// the row to `failed` and surface it, rather than retrying forever.
+    ///
+    /// [`Self::Unavailable`] is the one exception to "fixed per variant": it
+    /// carries the WIRE'S OWN `retryable` bool, so this reads that field
+    /// directly (`!retryable`) instead of a hardcoded verdict — exactly one
+    /// of [`Self::is_permanent`]/[`Self::is_retryable`] is true for it, same
+    /// invariant every other variant keeps.
+    ///
+    /// Every other variant not named below (`ConnectionLost`, `Revoked`,
+    /// `NotFound`, `RequestNotInFlight`, `Cancelled`, `Other`) is neither
+    /// permanent nor retryable — Sin90 does not guess for them, the caller
+    /// decides (see each variant's own doc upstream).
     #[must_use]
     pub fn is_permanent(&self) -> bool {
+        if let Self::Unavailable { retryable, .. } = self {
+            return !retryable;
+        }
         matches!(
             self,
             Self::Forbidden(_)
+                | Self::QuotaExceeded(_)
                 | Self::InvalidParams(_)
                 | Self::TokenInvalid(_)
-                | Self::NotFound(_)
-                | Self::RequestNotInFlight(_)
+                | Self::PayloadTooLarge(_)
         )
     }
 
+    /// Ported verbatim from Sin90's `is_retryable` (spec.md M3): a transient
+    /// condition — backoff and try again is the right response, PROVIDED
+    /// the call being retried is itself idempotent. This predicate does not
+    /// and cannot check that — it only says "the kernel-side or
+    /// connection-side condition that failed this call is the kind that
+    /// goes away on its own," not "it is safe for THIS caller to resend
+    /// THIS request."
+    ///
+    /// [`Self::ConnectionLost`] is deliberately `false` here (and in
+    /// [`Self::is_permanent`]): the call may have already executed
+    /// server-side before the response was lost, so the outcome is
+    /// genuinely unknown — the same posture as `Timeout` deserves a
+    /// callout for (it IS retryable, but a retry only helps if the caller's
+    /// action is idempotent).
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::RateLimited(_)
-            | Self::Busy(_)
-            | Self::Timeout(_)
-            | Self::ConnectionLost
-            | Self::NotReady(_)
-            | Self::Draining(_) => true,
-            Self::Unavailable { retryable, .. } => *retryable,
-            _ => false,
+        if let Self::Unavailable { retryable, .. } = self {
+            return *retryable;
         }
+        matches!(
+            self,
+            Self::RateLimited(_)
+                | Self::Busy(_)
+                | Self::Timeout(_)
+                | Self::NotReady(_)
+                | Self::Draining(_)
+                | Self::NotSent(_)
+        )
     }
 }
 
@@ -305,25 +337,79 @@ mod tests {
         ));
     }
 
+    /// The full classification table, one row per variant — ported from
+    /// Sin90 `adapter_agent24/clients/error.rs`'s
+    /// `classification_matches_spec_md_m3_exactly`. spec.md M3: permanent =
+    /// forbidden/quota_exceeded/invalid_params/token_invalid/
+    /// payload_too_large; retryable = rate_limited/busy/timeout/not_ready/
+    /// draining/not_sent; connection_lost/revoked/not_found/
+    /// request_not_in_flight/cancelled/other are neither. `Unavailable`
+    /// reads the wire's own `retryable` bool instead of a fixed verdict.
     #[test]
-    fn is_permanent_and_is_retryable_partition_sensibly() {
-        assert!(ClientError::Forbidden("x".into()).is_permanent());
-        assert!(!ClientError::Forbidden("x".into()).is_retryable());
-        assert!(ClientError::Busy("x".into()).is_retryable());
-        assert!(!ClientError::Busy("x".into()).is_permanent());
-        assert!(
-            ClientError::Unavailable {
-                retryable: true,
-                cause: UnavailableCause::NoProvider
-            }
-            .is_retryable()
-        );
-        assert!(
-            !ClientError::Unavailable {
-                retryable: false,
-                cause: UnavailableCause::BackendConfig
-            }
-            .is_retryable()
-        );
+    fn classification_matches_sin90_error_rs_exactly() {
+        let cases: &[(ClientError, bool, bool)] = &[
+            (ClientError::Forbidden("x".into()), true, false),
+            (ClientError::QuotaExceeded("x".into()), true, false),
+            (ClientError::InvalidParams("x".into()), true, false),
+            (ClientError::TokenInvalid("x".into()), true, false),
+            (ClientError::PayloadTooLarge("x".into()), true, false),
+            (ClientError::RateLimited("x".into()), false, true),
+            (ClientError::Busy("x".into()), false, true),
+            (ClientError::Timeout("x".into()), false, true),
+            (ClientError::NotReady("x".into()), false, true),
+            (ClientError::Draining("x".into()), false, true),
+            (ClientError::NotSent("x".into()), false, true),
+            (ClientError::ConnectionLost, false, false),
+            (ClientError::Revoked("x".into()), false, false),
+            (ClientError::NotFound("x".into()), false, false),
+            (ClientError::RequestNotInFlight("x".into()), false, false),
+            (ClientError::Other("x".into()), false, false),
+            (ClientError::Cancelled, false, false),
+            (
+                ClientError::Unavailable {
+                    retryable: false,
+                    cause: UnavailableCause::BackendConfig,
+                },
+                true,
+                false,
+            ),
+            (
+                ClientError::Unavailable {
+                    retryable: true,
+                    cause: UnavailableCause::NoProvider,
+                },
+                false,
+                true,
+            ),
+        ];
+        for (err, want_permanent, want_retryable) in cases {
+            assert_eq!(
+                err.is_permanent(),
+                *want_permanent,
+                "{err:?}.is_permanent()"
+            );
+            assert_eq!(
+                err.is_retryable(),
+                *want_retryable,
+                "{err:?}.is_retryable()"
+            );
+            // No variant is ever BOTH — the two predicates must stay
+            // mutually exclusive as the table grows.
+            assert!(
+                !(err.is_permanent() && err.is_retryable()),
+                "{err:?} is both"
+            );
+        }
+    }
+
+    /// Mutation guard ported from Sin90: if `is_retryable` accidentally
+    /// classified `quota_exceeded` as retryable (e.g. someone "fixes" a
+    /// perceived gap by adding it to the retryable `matches!` arm), this
+    /// goes red. Kept as its own test so it survives even if the table
+    /// above's shape changes later.
+    #[test]
+    fn quota_exceeded_must_never_be_retryable() {
+        assert!(!ClientError::QuotaExceeded("x".into()).is_retryable());
+        assert!(ClientError::QuotaExceeded("x".into()).is_permanent());
     }
 }

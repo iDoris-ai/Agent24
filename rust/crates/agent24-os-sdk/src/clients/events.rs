@@ -36,28 +36,32 @@ impl EventsClient {
         payload: Map<String, Value>,
         request_id: Option<&RequestId>,
     ) -> Result<(), ClientError> {
-        let mut params = Map::new();
-        params.insert("kind".to_owned(), Value::String(kind.to_owned()));
-        params.insert("payload".to_owned(), Value::Object(payload));
-        set_opt(
-            &mut params,
-            "request_id",
-            request_id.map(|id| Value::String(id.as_str().to_owned())),
-        );
-        self.0.call(EMIT, Value::Object(params)).await?;
+        self.0
+            .call(EMIT, build_emit_params(kind, payload, request_id))
+            .await?;
         Ok(())
     }
 
     /// Spawns [`EventSinkConfig::workers`] background tasks that drain a
-    /// bounded queue and call [`Self::emit`] on this client's behalf, so a
-    /// caller that does not want to `.await` every event gets a synchronous
-    /// [`EventSink::emit`] instead.
+    /// bounded queue and call `_a24/events/emit` on this client's behalf, so
+    /// a caller that does not want to `.await` every event gets a
+    /// synchronous [`EventSink::emit`] instead.
+    ///
+    /// Ported from Sin90's `KernelEventSink::new` (`adapter_agent24/mod.rs`,
+    /// N-M1/N-M2): each worker gates a dequeued event through `semaphore`
+    /// (the sub-quota, [`EventSinkConfig::sub_quota`]) before it ever
+    /// competes for the connection's own in-flight semaphore, and both
+    /// waits share ONE combined `deadline` (`now + slot_wait`) — whatever is
+    /// left of that budget after the sub-quota wait is what gets passed on
+    /// as the call's own `slot_wait`, so a queued event can wait at most
+    /// [`EventSinkConfig::slot_wait`] end to end, never that much twice.
     #[must_use]
     pub fn spawn_sink(&self, cfg: EventSinkConfig) -> EventSink {
         let (tx, rx) = mpsc::channel::<QueuedEvent>(cfg.queue_capacity);
         let rx = Arc::new(Mutex::new(rx));
         let dropped = Arc::new(AtomicU64::new(0));
         let semaphore = Arc::new(Semaphore::new(cfg.sub_quota.max(1)));
+        let slot_wait = cfg.slot_wait;
         for _ in 0..cfg.workers.max(1) {
             let rx = Arc::clone(&rx);
             let semaphore = Arc::clone(&semaphore);
@@ -66,27 +70,61 @@ impl EventsClient {
                 loop {
                     let queued = { rx.lock().await.recv().await };
                     let Some(queued) = queued else {
-                        return;
+                        return; // every `EventSink` (and its `Sender`) dropped.
                     };
-                    let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
-                        return; // semaphore closed: nothing left to gate on.
-                    };
-                    let client = client.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if let Err(e) = client.emit(&queued.kind, queued.payload, None).await {
-                            tracing::debug!(error = %e, kind = %queued.kind, "event sink: emit failed");
+                    let deadline = tokio::time::Instant::now() + slot_wait;
+                    let permit = match tokio::time::timeout_at(
+                        deadline,
+                        Arc::clone(&semaphore).acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_closed)) => return, // semaphore closed: nothing left to gate on.
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                kind = %queued.kind,
+                                "event sink: dropped — timed out waiting for the emit sub-quota"
+                            );
+                            continue;
                         }
-                    });
+                    };
+                    // Whatever's left of the combined budget, after the
+                    // sub-quota wait, is what's left to wait for a slot on
+                    // the connection's own semaphore.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let _permit = permit;
+                    let params = build_emit_params(&queued.kind, queued.payload, None);
+                    // No second `tokio::spawn` here (Sin90 N-M2): the fixed
+                    // worker pool itself is what bounds concurrency, so this
+                    // just awaits the call directly.
+                    if let Err(e) = client.0.call_with_slot_wait(EMIT, params, remaining).await {
+                        tracing::warn!(error = %e, kind = %queued.kind, "event sink: emit failed or was dropped");
+                    }
                 }
             });
         }
-        EventSink {
-            tx,
-            dropped,
-            slot_wait: cfg.slot_wait,
-        }
+        EventSink { tx, dropped }
     }
+}
+
+/// Shared by [`EventsClient::emit`] and [`EventsClient::spawn_sink`]'s
+/// worker loop, so the wire shape (`kind`/`payload`/optional `request_id`,
+/// "omit don't null") lives in exactly one place.
+fn build_emit_params(
+    kind: &str,
+    payload: Map<String, Value>,
+    request_id: Option<&RequestId>,
+) -> Value {
+    let mut params = Map::new();
+    params.insert("kind".to_owned(), Value::String(kind.to_owned()));
+    params.insert("payload".to_owned(), Value::Object(payload));
+    set_opt(
+        &mut params,
+        "request_id",
+        request_id.map(|id| Value::String(id.as_str().to_owned())),
+    );
+    Value::Object(params)
 }
 
 /// Default `256`/`4`/`32`/`5s` — the numbers Sin90's production sink used
@@ -116,51 +154,39 @@ struct QueuedEvent {
 }
 
 /// A bounded, best-effort event queue: [`Self::emit`] is synchronous and
-/// never blocks its caller. A full queue gets one bounded wait (`slot_wait`)
-/// on a background task before the event is dropped and counted.
+/// never blocks its caller. Ported from Sin90's `KernelEventSink::emit`
+/// (N-M2): a full queue means the event is dropped and counted immediately
+/// — no `tokio::spawn` per call, unlike the earlier version of this type.
 pub struct EventSink {
     tx: mpsc::Sender<QueuedEvent>,
     dropped: Arc<AtomicU64>,
-    slot_wait: Duration,
 }
 
 impl EventSink {
     /// Enqueue `kind`/`payload` for a background worker to send. Never
-    /// blocks: a full queue gets `slot_wait` on a spawned task, then is
-    /// dropped and logged (at every power-of-two drop count, so a
-    /// persistently-full sink does not spam the log once per event).
+    /// blocks and never spawns: a full (or closed) queue is dropped and
+    /// counted right here, logged at every power-of-two drop count so a
+    /// persistently-full sink does not spam the log once per event (Sin90
+    /// N-M2 / Codex 2026-09-22 review Medium #6).
     pub fn emit(&self, kind: &str, payload: Map<String, Value>) {
         let queued = QueuedEvent {
             kind: kind.to_owned(),
             payload,
         };
-        match self.tx.try_send(queued) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(queued)) => {
-                let tx = self.tx.clone();
-                let dropped = Arc::clone(&self.dropped);
-                let slot_wait = self.slot_wait;
-                tokio::spawn(async move {
-                    if tokio::time::timeout(slot_wait, tx.send(queued))
-                        .await
-                        .is_err()
-                    {
-                        let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            tracing::warn!(
-                                dropped = n,
-                                "event sink: queue stayed full; dropping events"
-                            );
-                        }
-                    }
-                });
+        if self.tx.try_send(queued).is_err() {
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    kind,
+                    dropped_total = n,
+                    "event sink: queue full, dropping event"
+                );
             }
         }
     }
 
-    /// Total events dropped so far (queue stayed full for the whole
-    /// `slot_wait`).
+    /// Total events dropped so far (the bounded queue was full, or already
+    /// closed, at `emit()` time).
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
@@ -216,5 +242,36 @@ mod tests {
     async fn without_the_offer_prefix_new_returns_none() {
         let (conn, _peer) = testing::fake_kernel(vec![]).await;
         assert!(EventsClient::new(&conn).is_none());
+    }
+
+    /// Ported from Sin90's
+    /// `kernel_event_sink_drops_and_counts_when_the_bounded_queue_is_full`:
+    /// `EventSink::emit` only ever does a non-blocking `try_send` — a full
+    /// queue means the event is dropped and counted RIGHT HERE, not queued
+    /// onto a spawned task. Filling the queue in a tight, non-yielding loop
+    /// on the (default, current-thread) `#[tokio::test]` runtime means none
+    /// of the fixed worker tasks get a chance to drain anything while we
+    /// fill it, so `dropped()` already reads the exact overflow count
+    /// immediately after the loop returns — no `.await` happens in between.
+    /// The earlier (pre-fix) implementation could not pass this: it only
+    /// incremented `dropped` inside a spawned task after `slot_wait` (a real
+    /// 5s here) elapsed, so an immediate read would have seen `0`.
+    #[tokio::test]
+    async fn emit_drops_and_counts_immediately_when_the_queue_is_full() {
+        let (conn, _peer) = testing::fake_kernel(vec![OFFER_PREFIX.to_owned()]).await;
+        let client = EventsClient::new(&conn).expect("offer covers events");
+        let cfg = EventSinkConfig {
+            queue_capacity: 8,
+            workers: 1,
+            sub_quota: 1,
+            slot_wait: Duration::from_secs(5),
+        };
+        let sink = client.spawn_sink(cfg);
+
+        let overflow = 5;
+        for i in 0..(cfg.queue_capacity + overflow) {
+            sink.emit(&format!("flood.{i}"), Map::new());
+        }
+        assert_eq!(sink.dropped(), overflow as u64);
     }
 }
