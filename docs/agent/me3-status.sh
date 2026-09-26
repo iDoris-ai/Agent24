@@ -204,8 +204,8 @@ probe_4a() {
 # ME4-4.3.1：4b 这一格和 4a 同一个理由，同一份判定——见 probe_4a 顶上的注释
 # （符号存在证明不了「真实 daemon + 真实 out-of-process Python 模块 + 真实
 # OpenAI 兼容桩真的能跑」；问 cargo `--list`，在 $REF 自己的临时检出里跑，工作
-# 树和 REF 字节不一致就降级为 ◐）。黑盒本身在 `me4_model_blackbox.rs` 顶部的
-# 判据自己连跑 10 次（J14）。
+# 树和 REF 字节不一致就降级为 ◐）。连跑 10 次是 PLAN 的人工验收步骤，不是这个
+# 探针的事——探针只判定能否列出该测试。
 probe_4b() {
   local desc="4b   推理回调" file="rust/apps/agent24d/tests/me4_model_blackbox.rs"
   local test_name="model_complete_blackbox_round_trip"

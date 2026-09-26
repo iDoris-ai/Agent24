@@ -11,8 +11,7 @@
 //! fixed sleeps, only bounded polls. `python3` missing is a hard failure of
 //! this test, never a skip (task text).**
 //!
-//! Scenarios (task text's "至少包括" list, scoped down from J14's full set —
-//! see "What this file does NOT attempt" below):
+//! Scenarios (`docs/design/ME4-S2-model-callback.md`'s own J14 entry, §8):
 //!
 //! 1. `m_local` (`kernel_capabilities: [models]`, no `model_access` →
 //!    LocalOnly) calls `_a24/model/complete` with no `request_id` → the
@@ -41,18 +40,26 @@
 //!    async, `UsageRecorder`'s own channel, design §6.3), never a fixed
 //!    sleep. A real daemon restart (same `$HOME`, no rebuild) proves the
 //!    counts are STORED, not merely in-memory (design J11/J14).
+//! 6. **The real revocation path** (design J14's own "本地桩对下一次调用挂起…"
+//!    bullet): the local stub is put into a `"hang"` mode (accepts the
+//!    request, answers nothing, then blocks on its own `recv` to learn
+//!    whether ITS PEER — this daemon — closed the connection). A background
+//!    thread starts a call against `m_local`; once the stub has actually
+//!    received that request, this test issues the real disable —
+//!    `PATCH /api/v1/os/m_local {"enabled":false}`, the exact REST route
+//!    `agent24 os disable m_local` itself calls — against the running
+//!    daemon, and the stub (not an in-process fixture) is polled for having
+//!    observed the close. **Negative control**: before that `PATCH` is ever
+//!    sent, the stub must still be sitting in its `"waiting"` phase, never
+//!    `"done"`, for a real window — proving the close asserted afterwards is
+//!    caused by the disable and not some unrelated timeout in the harness.
 //!
-//! **What this file does NOT attempt** (J14's fuller set, deliberately left
-//! to the unit-level judgements that already cover them — task text scopes
-//! the blackbox down to "至少包括" 1–4 plus usage, concurrency only "if the
-//! cost is controllable"): the hot-disable-while-in-flight revocation round
-//! trip (J7(d)/(b)'s mechanism, already proven at the handler level with a
-//! real TCP stub); the per-module concurrency/fairness ceiling (J9, already
-//! proven with a frozen clock); cross-generation rate-limit persistence
-//! (J10). Each of those already has a real-provider-or-real-TCP-stub unit
-//! test in `model_callback.rs`; re-proving them through a full daemon +
-//! Python module round trip here would multiply this file's runtime and
-//! flakiness surface for coverage that already exists.
+//! **What this file does NOT attempt**: the per-module concurrency/fairness
+//! ceiling (J9, already proven with a frozen clock) and cross-generation
+//! rate-limit persistence (J10) — each already has a real-provider-or-real-
+//! TCP-stub unit test in `model_callback.rs`; re-proving them through a full
+//! daemon + Python module round trip here would multiply this file's runtime
+//! and flakiness surface for coverage that already exists.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -168,7 +175,17 @@ while f.readline():
 /// Per-request behaviour is driven by a `mode` file in the control
 /// directory, re-read on EVERY request (never cached) — `"ok"` (default,
 /// missing file included) answers a normal completion; `"unavailable"`
-/// answers `503`, simulating a down backend for J14's negative control.
+/// answers `503`, simulating a down backend for J14's negative control;
+/// `"hang"` answers nothing at all — it accepts the request, then blocks on
+/// its own `recv()` to learn whether ITS PEER (this daemon) closed the
+/// connection, for J14's real-revocation-path scenario (H1): the very
+/// instant it starts that wait it writes `hang_result.json` as
+/// `{"phase":"waiting","closed":null}` (so a poller can tell "received the
+/// request, now genuinely blocked" from "hasn't been dialled yet"), then
+/// once `recv()` returns — empty bytes or a reset both count as "closed",
+/// a timeout (60s, just a safety net; the real bound is the Rust side's own
+/// poll deadline) counts as "not closed" — overwrites it with
+/// `{"phase":"done","closed":<bool>}`.
 /// Every request is logged (mode + body) to `requests.json`
 /// (append-atomic, same rationale as the other blackbox scripts' own
 /// `dump_atomic`: a concurrent reader must never see a torn write) — the
@@ -239,6 +256,18 @@ while True:
             "request_line": lines[0].decode(errors="replace") if lines else "",
             "body": body_bytes.decode(errors="replace"),
         })
+        if mode == "hang":
+            dump_atomic("hang_result.json", {"phase": "waiting", "closed": None})
+            conn.settimeout(60)
+            try:
+                data = conn.recv(4096)
+                closed = not data
+            except socket.timeout:
+                closed = False
+            except OSError:
+                closed = True
+            dump_atomic("hang_result.json", {"phase": "done", "closed": closed})
+            continue
         if mode == "unavailable":
             status = b"503 Service Unavailable"
             out = json.dumps({"error": {"message": "stub backend is down", "code": "server_error"}}).encode()
@@ -292,10 +321,21 @@ fn install(home: &Path, name: &str, kernel_capabilities: &str, extra_manifest_li
 
 /// One raw HTTP round trip over a plain `TcpStream`, `connection: close` so a
 /// single `read_to_end` sees the whole response — same shape as
-/// `me3f_blackbox.rs`'s `get`, extended with a body and method for `POST`.
-fn raw_request(port: u16, token: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+/// `me3f_blackbox.rs`'s `get`, extended with a body and method for `POST`,
+/// and a caller-chosen read timeout: H1's hang-then-disable scenario fires a
+/// call that may sit on the wire far longer than the 20s every other request
+/// in this file is happy with (the real per-module disable drain can run for
+/// tens of seconds — see [`call_model_bg`]).
+fn raw_request_timeout(
+    port: u16,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    timeout: Duration,
+) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect to the daemon");
-    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.set_read_timeout(Some(timeout)).unwrap();
     let mut req = format!(
         "{method} {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
          connection: close\r\ncontent-length: {}\r\n\r\n",
@@ -317,12 +357,22 @@ fn raw_request(port: u16, token: &str, method: &str, path: &str, body: &str) -> 
     (status, resp_body.to_owned())
 }
 
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn raw_request(port: u16, token: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+    raw_request_timeout(port, token, method, path, body, DEFAULT_HTTP_TIMEOUT)
+}
+
 fn get(port: u16, token: &str, path: &str) -> (u16, String) {
     raw_request(port, token, "GET", path, "")
 }
 
 fn post(port: u16, token: &str, path: &str, body: &str) -> (u16, String) {
     raw_request(port, token, "POST", path, body)
+}
+
+fn patch(port: u16, token: &str, path: &str, body: &str) -> (u16, String) {
+    raw_request(port, token, "PATCH", path, body)
 }
 
 /// Call `_a24/model/complete` through module `name`'s HTTP trigger and parse
@@ -351,6 +401,51 @@ fn call_model(port: u16, token: &str, name: &str, body_overrides: &str) -> serde
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// H1's own long-lived variant of [`call_model`], spawned on a background
+/// thread while the local stub is in `"hang"` mode: the successful attempt
+/// may legitimately sit on the wire for as long as the real per-module
+/// disable takes to actually cut it off (`DISABLE_REVOCATION_BOUND` below) —
+/// the ordinary [`raw_request`]'s 20s default would fire spuriously there.
+/// Still retries on `module_not_ready` like [`call_model`] does (a fresh
+/// restart, `d2`, may not yet have this proxied route ready the instant
+/// `wait_mounted` returns — same race `call_model` itself documents) — every
+/// attempt uses `timeout`, harmless for the fast 503 retries and necessary
+/// for the one that actually reaches the (hung) local stub.
+fn call_model_bg(
+    port: u16,
+    token: &str,
+    name: &str,
+    timeout: Duration,
+) -> std::thread::JoinHandle<(u16, String)> {
+    let token = token.to_owned();
+    let name = name.to_owned();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (status, body) = raw_request_timeout(
+                port,
+                &token,
+                "POST",
+                &format!("/api/v1/{name}/call"),
+                "{}",
+                timeout,
+            );
+            if status != 503 || !body.contains("module_not_ready") || Instant::now() >= deadline {
+                return (status, body);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })
+}
+
+/// How long H1's revocation scenario waits for the local stub to observe its
+/// connection close after the real disable is sent. `os_routes.rs`'s own
+/// `DISABLE_DRAIN` (30s) bounds how long a module's supervisor lets an
+/// in-flight, unbound (no `request_id`) call run before forcing the module's
+/// process to stop — which is what severs this connection — so this bound
+/// must clear 30s with real margin, never assume the cut is instant.
+const DISABLE_REVOCATION_BOUND: Duration = Duration::from_secs(45);
 
 /// Graceful-first shutdown, matching `me3f_blackbox.rs::Running` verbatim.
 struct Running(std::process::Child);
@@ -388,14 +483,25 @@ impl Daemon {
 /// Start the already-built `agent24d` binary against `home`, with
 /// `OMLX_URL`/`OLLAMA_URL` pointed at this test's two stubs (`ModelRouter::
 /// from_env`, `router.rs:258`, reads them once at `serve()` startup — design
-/// §2.3/J16). Same shape as `me3f_blackbox.rs::start`.
-fn start(home: &Path, omlx_url: &str, ollama_url: &str) -> Daemon {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+/// §2.3/J16). Same shape as `me3f_blackbox.rs::start`. `extra_env` is layered
+/// on top (after `OMLX_URL`/`OLLAMA_URL`, so it can override either) — empty
+/// for every caller except [`real_omlx_smoke`] (L5), which uses it to pass
+/// `OMLX_API_KEY`/`DEFAULT_MODEL` through from this test process's own
+/// environment into the spawned daemon's (`env_clear()` below would
+/// otherwise silently drop them and fall back to the built-in defaults,
+/// `agent24-models/src/router.rs:261`/`:263`, which is not what a real smoke
+/// run against the operator's own oMLX server wants).
+fn start(home: &Path, omlx_url: &str, ollama_url: &str, extra_env: &[(&str, &str)]) -> Daemon {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("OMLX_URL", omlx_url)
-        .env("OLLAMA_URL", ollama_url)
+        .env("OLLAMA_URL", ollama_url);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -534,11 +640,34 @@ impl Stub {
             .unwrap_or(0)
     }
 
+    /// The `mode` field this stub itself recorded for the MOST RECENT request
+    /// it actually received (L1) — distinct from `request_count`, which only
+    /// says how many, not what each one saw.
+    fn last_request_mode(&self) -> Option<String> {
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.control_dir.join("requests.json")).ok()?)
+                .ok()?;
+        v.as_array()?.last()?["mode"].as_str().map(str::to_owned)
+    }
+
     fn set_mode(&self, mode: &str) {
         let path = self.control_dir.join("mode");
         let tmp = self.control_dir.join("mode.tmp");
         std::fs::write(&tmp, mode).unwrap();
         std::fs::rename(&tmp, &path).unwrap();
+    }
+
+    /// `hang_result.json`, written only in `"hang"` mode — `None` before the
+    /// stub has received anything; `Some(("waiting", None))` once it has
+    /// received the request and is blocked on its own `recv`; `Some(("done",
+    /// Some(closed)))` once that `recv` returned (H1).
+    fn hang_status(&self) -> Option<(String, Option<bool>)> {
+        let v: serde_json::Value = std::fs::read(self.control_dir.join("hang_result.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())?;
+        let phase = v["phase"].as_str()?.to_owned();
+        let closed = v["closed"].as_bool();
+        Some((phase, closed))
     }
 }
 
@@ -618,7 +747,7 @@ fn model_complete_blackbox_round_trip() {
     );
     install(home.path(), "m_none", "", "");
 
-    let d1 = start(home.path(), &omlx_url, &ollama_url);
+    let d1 = start(home.path(), &omlx_url, &ollama_url, &[]);
     wait_mounted(d1.port, &d1.token, "m_local", || d1.recent_stderr());
     wait_mounted(d1.port, &d1.token, "m_remote", || d1.recent_stderr());
     wait_mounted(d1.port, &d1.token, "m_none", || d1.recent_stderr());
@@ -639,6 +768,11 @@ fn model_complete_blackbox_round_trip() {
         0,
         "a LocalOnly call must never dial the remote stub"
     );
+    assert_eq!(
+        local_stub.request_count(),
+        1,
+        "scenario 1 must be the local stub's first and only request so far: {r1}"
+    );
 
     // ── scenario 2: LocalOnly negative control (design v2 M5) — the ONLY
     //    provider a LocalOnly call may use goes down; the remote stub must
@@ -653,6 +787,17 @@ fn model_complete_blackbox_round_trip() {
         remote_stub.request_count(),
         0,
         "the negative control must not have reached the remote stub either: {r2}"
+    );
+    assert_eq!(
+        local_stub.request_count(),
+        2,
+        "the negative control must itself have dialled the local stub once more: {r2}"
+    );
+    assert_eq!(
+        local_stub.last_request_mode().as_deref(),
+        Some("unavailable"),
+        "the local stub's own record of that request must show the mode this negative \
+         control set, not a stale one from before: {r2}"
     );
     local_stub.set_mode("ok");
 
@@ -676,9 +821,21 @@ fn model_complete_blackbox_round_trip() {
     // ── scenario 4: a module that never requested `models` is forbidden —
     //    the method is registered unconditionally (design §2.4/J2), so this
     //    is NOT a missing-method 404/-32601. ─────────────────────────────
+    let (local_before_r4, remote_before_r4) =
+        (local_stub.request_count(), remote_stub.request_count());
     let r4 = call_model(d1.port, &d1.token, "m_none", "{}");
     assert!(r4.get("result").is_none(), "{r4}");
     assert_eq!(r4["error"]["data"]["kind"], "forbidden", "{r4}");
+    assert_eq!(
+        local_stub.request_count(),
+        local_before_r4,
+        "a forbidden call must never reach any provider: {r4}"
+    );
+    assert_eq!(
+        remote_stub.request_count(),
+        remote_before_r4,
+        "a forbidden call must never reach any provider: {r4}"
+    );
 
     // ── scenario 5: usage by module — bounded poll for the async writer,
     //    exact figures from scenarios 1-3, and the forbidden call in
@@ -728,7 +885,7 @@ fn model_complete_blackbox_round_trip() {
 
     // ── restart persistence: the counts are STORED, not merely
     //    in-memory (design J11/J14) — same $HOME, no rebuild. ────────────
-    let d2 = start(home.path(), &omlx_url, &ollama_url);
+    let d2 = start(home.path(), &omlx_url, &ollama_url, &[]);
     wait_mounted(d2.port, &d2.token, "m_local", || d2.recent_stderr());
     let usage_after_restart = get_usage(d2.port, &d2.token, "m_local");
     assert_eq!(
@@ -739,6 +896,122 @@ fn model_complete_blackbox_round_trip() {
         usage_after_restart["totals"]["calls_failed"], 1,
         "{usage_after_restart}"
     );
+
+    // ── L4: the OTHER two modules' usage rows persisted across the restart
+    //    exactly as well — `m_none`'s forbidden call left nothing at all
+    //    (still true after a restart, not merely before one), and
+    //    `m_remote`'s single successful remote call is still there. ───────
+    let usage_none_after_restart = get_usage(d2.port, &d2.token, "m_none");
+    assert_eq!(
+        usage_none_after_restart["totals"]["calls_ok"], 0,
+        "{usage_none_after_restart}"
+    );
+    assert_eq!(
+        usage_none_after_restart["totals"]["calls_failed"], 0,
+        "{usage_none_after_restart}"
+    );
+    assert_eq!(
+        usage_none_after_restart["totals"]["calls_cancelled"], 0,
+        "{usage_none_after_restart}"
+    );
+    let usage_remote_after_restart = get_usage(d2.port, &d2.token, "m_remote");
+    assert_eq!(
+        usage_remote_after_restart["totals"]["calls_ok"], 1,
+        "{usage_remote_after_restart}"
+    );
+    assert_eq!(
+        usage_remote_after_restart["totals"]["calls_failed"], 0,
+        "{usage_remote_after_restart}"
+    );
+    assert_eq!(
+        usage_remote_after_restart["by_served"]["remote"]["calls_ok"], 1,
+        "{usage_remote_after_restart}"
+    );
+
+    // ── H1: the real revocation path — `agent24 os disable m_local` while a
+    //    call is genuinely in flight against the real local stub, observed
+    //    from the stub's own side (design J14's own "本地桩对下一次调用
+    //    挂起…" bullet — the fuller judgement text this file's module doc
+    //    used to claim was "already proven" purely at the handler level;
+    //    it was not proven end-to-end through a real disable until now). ──
+    local_stub.set_mode("hang");
+    let before_hang = local_stub.request_count();
+    let hang_call = call_model_bg(d2.port, &d2.token, "m_local", DISABLE_REVOCATION_BOUND);
+
+    // The stub must have actually received this call — i.e. it is now
+    // genuinely blocked, not merely "about to be dialled" — before either
+    // control below means anything.
+    let received_by = Instant::now() + Duration::from_secs(10);
+    while local_stub.request_count() == before_hang {
+        assert!(
+            Instant::now() < received_by,
+            "the hang call never reached the local stub within 10s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        local_stub
+            .hang_status()
+            .as_ref()
+            .map(|(phase, _)| phase.as_str()),
+        Some("waiting"),
+        "the stub logged the request but is not (yet) blocked on it"
+    );
+
+    // **Negative control**: nothing has been disabled yet — for a real
+    // window, the stub must keep reporting "waiting", never "done". If this
+    // ever saw "done" here, the close proven below would not be caused by
+    // the disable that follows.
+    let no_disable_yet_until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < no_disable_yet_until {
+        assert_ne!(
+            local_stub.hang_status(),
+            Some(("done".to_owned(), Some(true))),
+            "the stub observed its connection close before any disable was sent"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The real disable: the exact REST route `agent24 os disable m_local`
+    // itself calls (`os_routes.rs::patch_os`).
+    let (disable_status, disable_body) = patch(
+        d2.port,
+        &d2.token,
+        "/api/v1/os/m_local",
+        r#"{"enabled":false}"#,
+    );
+    assert_eq!(
+        disable_status, 200,
+        "disabling m_local: {disable_status} {disable_body}"
+    );
+
+    // Bounded poll — real per-module disables drain for up to
+    // `os_routes.rs`'s `DISABLE_DRAIN` (30s) before the module's process is
+    // actually stopped, which is what severs this connection; never a fixed
+    // sleep.
+    let closed_by = Instant::now() + DISABLE_REVOCATION_BOUND;
+    loop {
+        let status = local_stub.hang_status();
+        if let Some((phase, closed)) = &status
+            && phase == "done"
+        {
+            assert_eq!(
+                *closed,
+                Some(true),
+                "the stub's own connection ended, but not because its peer closed it: {status:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < closed_by,
+            "the local stub never observed its connection close after disabling m_local \
+             (status: {status:?}); daemon stderr:\n{}",
+            d2.recent_stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = hang_call.join();
+
     stop(d2);
 }
 
@@ -747,16 +1020,34 @@ fn model_complete_blackbox_round_trip() {
 /// not swept in with any other `#[ignore]`d test:
 /// `cargo test -p agent24d --test me4_model_blackbox -- --exact real_omlx_smoke --ignored`.
 /// Requires a real oMLX server already listening on `OMLX_URL`
-/// (`http://127.0.0.1:8088` by default) with a model actually loaded.
+/// (`http://127.0.0.1:8088` by default) with a model actually loaded. L5:
+/// `OMLX_API_KEY`/`DEFAULT_MODEL`, if this test process itself has them set,
+/// are passed through to the spawned daemon (`start`'s `extra_env`) — the
+/// daemon's own `env_clear()` would otherwise silently fall back to the
+/// built-in defaults (`xiaobao8088`/`Qwen3-8B-4bit`), which is not what a
+/// real oMLX server configured with a different key or model wants.
 #[test]
 #[ignore = "requires a real oMLX server listening on OMLX_URL; run with --exact --ignored"]
 fn real_omlx_smoke() {
     let home = tmp_home();
     install(home.path(), "m_local", "models", "");
     let omlx_url = std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-    // A real remote provider is deliberately NOT configured — this smoke
-    // test only proves the LocalOnly path against a real backend.
-    let d = start(home.path(), &omlx_url, "http://127.0.0.1:1");
+    let omlx_key = std::env::var("OMLX_API_KEY").ok();
+    let default_model = std::env::var("DEFAULT_MODEL").ok();
+    let mut extra_env = Vec::new();
+    if let Some(k) = &omlx_key {
+        extra_env.push(("OMLX_API_KEY", k.as_str()));
+    }
+    if let Some(m) = &default_model {
+        extra_env.push(("DEFAULT_MODEL", m.as_str()));
+    }
+    // `OLLAMA_URL` points at a dead port on loopback — NOT "no remote
+    // provider configured" (a router with no `OLLAMA_URL` at all falls back
+    // to its own default, `router.rs:271`, which could be a live host on
+    // this machine); pointing it at a closed port on 127.0.0.1 guarantees
+    // any accidental remote dial fails fast instead of quietly succeeding,
+    // which is what actually keeps this smoke test LocalOnly-only.
+    let d = start(home.path(), &omlx_url, "http://127.0.0.1:1", &extra_env);
     wait_mounted(d.port, &d.token, "m_local", || d.recent_stderr());
     let r = call_model(d.port, &d.token, "m_local", "{}");
     assert!(
