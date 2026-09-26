@@ -27,28 +27,28 @@
 | ME4-0.2 | 两仓 | 合并本规划 PR（Agent24 `docs/me4-plan-2026-09-23` / Sin90 `docs/pilot-me4-plan`） | — | `DONE` | Agent24 #439 `5e1f972`、Sin90 #5 `90dd226`（2026-09-24 合并） |
 | ME4-0.3 | Sin90 | CI + 陈旧文档（Sin90 T0.2/T0.3） | 0.1 | `DONE` | Sin90 #6 `329d5ab`（CI）、#7 `8e34767`（文档）；main CI 绿 |
 | ME4-0.4 | Sin90 | Codex 补审历史改动（Sin90 T0.4） | 0.1 | `BACKLOG` | 按 Sin90 T0.4：等 Codex 额度 2026-09-29 19:28 恢复，不用 Opus 代替 |
-| ME4-1.1.1 | Agent24 | 调度回调设计冻结 + SPEC 改写 | 0.2 | `PR_OPEN` | #444（冻结 v3.1）。2026-09-24 为合 #439 把 base 改成 main，**已有的 approve 因此作废**，待重审 |
-| ME4-1.2.1 | Agent24 | schedules 存储层（owner/key/revision/暂停三态 + 并发安全 upsert + `schedule_deliveries`） | 1.1.1 | `PR_OPEN` | #453 → #454 → #455 → #456（stacked） |
-| ME4-1.2.2a | Agent24 | 协议与视图（Schedule 新字段、openapi/fixtures/api-client） | 1.2.1 | `PR_OPEN` | #462 |
-| ME4-1.2.2b | Agent24 | 触发接口与 tick（ScheduleInvocation/FireOutcome/RunTrigger、CAS 版 fire、模块臂先 Deferred） | 1.2.2a | `PR_OPEN` | #469 → #470 → #471 → #472 |
-| ME4-1.2.2c | Agent24 | REST 护栏（update CAS、suspend/resume、409、run_now 双响应、self-wake owner 过滤） | 1.2.2b | `PR_OPEN` | #478 → #479 |
-| ME4-1.2.2d | Agent24 | 桌面端（effective_enabled ?? enabled、run_id ?? fire_id，前向兼容） | 1.2.1 | `PR_OPEN` | #465 |
-| ME4-1.3.1 | Agent24 | fired 投递器（InFlight 准入 + dispatch、确定性 fire_id、重启续投、Deferred 不计失败、scheduler 挪到 mount_all 后） | 1.2.2c | `PR_OPEN` | #500 → #501 → #502（Opus 2 轮，均 APPROVE，Medium 全修；Codex 未审） |
-| ME4-1.3.2 | Agent24 | 代理保留 `/_a24/` 路径（规范化后判定） | 1.1.1 | `PR_OPEN` | #447 |
-| ME4-1.4.1 | Agent24 | `_a24/scheduler/*` handler + 授权/配额/限流（**唯一会生产模块行的调用方，必须排在 1.2.2c 之后**：模块行护栏与 self-wake 过滤就绪前不得产生模块行） | 1.2.2c | `PR_OPEN` | #487 → #488 |
-| ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `IN_PROGRESS` | 分支 `feat/me4-1.5.1-scheduler-blackbox`（叠在 #502 上并 merge 了 #447 的分支）；10/10 连跑绿；Opus 评审中 |
+| ME4-1.1.1 | Agent24 | 调度回调设计冻结 + SPEC 改写 | 0.2 | `DONE` | #444 合并于 2026-09-25（冻结 v3.1；2026-09-24 改 base 后原 approve 作废，已重审通过） |
+| ME4-1.2.1 | Agent24 | schedules 存储层（owner/key/revision/暂停三态 + 并发安全 upsert + `schedule_deliveries`） | 1.1.1 | `DONE` | #453 → #454 → #455 → #456 全部合并于 2026-09-25（stacked） |
+| ME4-1.2.2a | Agent24 | 协议与视图（Schedule 新字段、openapi/fixtures/api-client） | 1.2.1 | `DONE` | #462 合并于 2026-09-25 |
+| ME4-1.2.2b | Agent24 | 触发接口与 tick（ScheduleInvocation/FireOutcome/RunTrigger、CAS 版 fire、模块臂先 Deferred） | 1.2.2a | `DONE` | #469 → #470 → #471 → #472 全部合并于 2026-09-25 |
+| ME4-1.2.2c | Agent24 | REST 护栏（update CAS、suspend/resume、409、run_now 双响应、self-wake owner 过滤） | 1.2.2b | `DONE` | #478 → #479 全部合并于 2026-09-25 |
+| ME4-1.2.2d | Agent24 | 桌面端（effective_enabled ?? enabled、run_id ?? fire_id，前向兼容） | 1.2.1 | `DONE` | #465 合并于 2026-09-25 |
+| ME4-1.3.1 | Agent24 | fired 投递器（InFlight 准入 + dispatch、确定性 fire_id、重启续投、Deferred 不计失败、scheduler 挪到 mount_all 后） | 1.2.2c | `DONE` | #500 → #501 → #502 全部合并于 2026-09-25（Opus 2 轮，均 APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-5） |
+| ME4-1.3.2 | Agent24 | 代理保留 `/_a24/` 路径（规范化后判定） | 1.1.1 | `DONE` | #447 合并于 2026-09-25 |
+| ME4-1.4.1 | Agent24 | `_a24/scheduler/*` handler + 授权/配额/限流（**唯一会生产模块行的调用方，必须排在 1.2.2c 之后**：模块行护栏与 self-wake 过滤就绪前不得产生模块行） | 1.2.2c | `DONE` | #487 → #488 全部合并于 2026-09-25 |
+| ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `DONE` | #504 合并于 2026-09-25（10/10 连跑绿，Opus 评审通过） |
 | ME4-M2 门 | Sin90 | Sin90 M3（T3.1.1–T3.5.1）全 DONE | 1.5.1, 0.1 | `BACKLOG` | |
 | ME4-M3 门 | Sin90 | Sin90 M4（T4.1.1–T4.4.1）全 DONE | M2 门 | `BACKLOG` | |
-| ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `PR_OPEN` | #446（冻结 v3.1）。同 1.1.1：改 base 后 approve 作废，待重审 |
-| ME4-4.2.1 | Agent24 | `model_access` manifest 字段解析（只做 manifest，不授予） | 4.1.1 | `PR_OPEN` | #457 |
-| ME4-4.2.2-0 | Agent24 | rpc 按方法超时 + ErrorKind `unavailable`（17→18）+ SPEC 闭集句 | 4.1.1 | `PR_OPEN` | #451 |
-| ME4-4.2.2a | Agent24 | `agent24-models` 契约扩展（max_tokens / model_id / Rejected）+ 回环判定改 reqwest::Url + `loopback_only()` + `OLLAMA_URL` 进 PASSTHROUGH_VARS（关闭 FU-72） | 4.1.1 | `PR_OPEN` | #448（关闭 FU-72） |
-| ME4-4.2.2b1a | Agent24 | model_callback 基础（常量、UsageSink/Ticket、ModelAdmission、ModelGrant、错误映射；未注册） | 4.2.2-0, 4.2.2a | `PR_OPEN` | #461 |
-| ME4-4.2.2b1b | Agent24 | model_callback wire 类型 + handler（未注册） | 4.2.2b1a | `PR_OPEN` | #464 |
-| ME4-4.2.2b2 | Agent24 | 授予 Models + provides + 注册 + serve 接线（CallbackDeps.models）；删 dead_code 豁免 | 4.2.2b1b, 4.2.1, 1.4.1 | `BACKLOG` | |
-| ME4-4.2.3a | Agent24 | 用量迁移 + store（module_model_usage） | 4.2.2b2 | `BACKLOG` | |
-| ME4-4.2.3b | Agent24 | 用量 recorder + `/api/v1/usage?module=` + serve 换 sink | 4.2.3a | `BACKLOG` | |
-| ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `BACKLOG` | |
+| ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `DONE` | #446 合并于 2026-09-25（冻结 v3.1；同 1.1.1，改 base 后原 approve 作废，已重审通过） |
+| ME4-4.2.1 | Agent24 | `model_access` manifest 字段解析（只做 manifest，不授予） | 4.1.1 | `DONE` | #457 合并于 2026-09-25 |
+| ME4-4.2.2-0 | Agent24 | rpc 按方法超时 + ErrorKind `unavailable`（17→18）+ SPEC 闭集句 | 4.1.1 | `DONE` | #451 合并于 2026-09-25 |
+| ME4-4.2.2a | Agent24 | `agent24-models` 契约扩展（max_tokens / model_id / Rejected）+ 回环判定改 reqwest::Url + `loopback_only()` + `OLLAMA_URL` 进 PASSTHROUGH_VARS（关闭 FU-72） | 4.1.1 | `DONE` | #448 合并于 2026-09-25（关闭 FU-72） |
+| ME4-4.2.2b1a | Agent24 | model_callback 基础（常量、UsageSink/Ticket、ModelAdmission、ModelGrant、错误映射；未注册） | 4.2.2-0, 4.2.2a | `DONE` | #461 合并于 2026-09-25 |
+| ME4-4.2.2b1b | Agent24 | model_callback wire 类型 + handler（未注册） | 4.2.2b1a | `DONE` | #464 合并于 2026-09-25 |
+| ME4-4.2.2b2 | Agent24 | 授予 Models + provides + 注册 + serve 接线（CallbackDeps.models）；删 dead_code 豁免 | 4.2.2b1b, 4.2.1, 1.4.1 | `DONE` | #505 合并于 2026-09-25 |
+| ME4-4.2.3a | Agent24 | 用量迁移 + store（module_model_usage） | 4.2.2b2 | `DONE` | #506 合并于 2026-09-26 |
+| ME4-4.2.3b | Agent24 | 用量 recorder + `/api/v1/usage?module=` + serve 换 sink | 4.2.3a | `DONE` | #510（用量写者 UsageRecorder）→ #511（GET /api/v1/usage?module=）全部合并于 2026-09-26 |
+| ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `PR_OPEN` | #512（Opus 本地评审 2 轮：CHANGES → APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-7） |
 | ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `BACKLOG` | |
 | ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `BACKLOG` | |
 | ME4-5.1.2a | Agent24 | SDK transport + 握手（只经 proto）+ 结构测试 | 5.1.1 | `BACKLOG` | |
