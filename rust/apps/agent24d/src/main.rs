@@ -25,6 +25,7 @@ mod scheduler_callback;
 mod scheduler_deliver;
 mod schedules;
 mod server;
+mod usage_recorder;
 
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
