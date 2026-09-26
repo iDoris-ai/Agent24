@@ -209,17 +209,47 @@ mod tests {
     use super::*;
     use crate::testing;
 
-    fn tempdir() -> std::path::PathBuf {
+    /// A drop guard around a manually-created temp dir. `tempfile::TempDir`
+    /// appends its own random suffix on top of our prefix, and these
+    /// particular temp dirs hold a `cb.sock` AF_UNIX path — that extra
+    /// suffix was enough to blow macOS's ~104-byte `sun_path` limit ("path
+    /// must be shorter than SUN_LEN"). Building the exact, length-budgeted
+    /// name ourselves and only borrowing `tempfile`'s idea (a guard that
+    /// removes the dir on drop) keeps both properties.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// B1 (external review of #516, same root cause as #515): plain
+    /// `SystemTime::now()` nanoseconds collided under parallel `cargo test`
+    /// on macOS (clock resolution), producing `AddrInUse`/`EEXIST` for the
+    /// socket path built on top of this dir. A process-local counter makes
+    /// each call unique regardless of clock resolution; the returned guard
+    /// additionally cleans the directory up on drop instead of leaking it
+    /// into the temp dir on every test run.
+    fn tempdir() -> TempDir {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "a24sdk-module-{}-{}",
+            "a24sdk-mod-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     const MANIFEST: &str =
@@ -232,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn connect_derives_hello_from_the_manifest_and_declares_protocol_one_to_one() {
         let dir = tempdir();
-        let (env, endpoint) = testing::FakeEndpoint::bind(&dir);
+        let (env, endpoint) = testing::FakeEndpoint::bind(dir.path());
         let accept = endpoint.accept_initialize(json!({
             "protocol_version": 1,
             "offer": {"provides": ["_a24/events/"]},
@@ -251,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn with_env_never_takes_the_listener_so_serve_reports_no_listener() {
         let dir = tempdir();
-        let (env, endpoint) = testing::FakeEndpoint::bind(&dir);
+        let (env, endpoint) = testing::FakeEndpoint::bind(dir.path());
         let accept = endpoint.accept_initialize(json!({
             "protocol_version": 1,
             "offer": {"provides": []},

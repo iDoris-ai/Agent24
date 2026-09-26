@@ -754,6 +754,81 @@ mod tests {
             "the memory just written must be recallable through the same real handler"
         );
     }
+
+    /// B2 (external review of #516): against a REAL `RecallHandler` (not a
+    /// hand-rolled fake), the kernel's substring match is over
+    /// `serde_json::to_string(&item.body)` — the JSON-ESCAPED form. Before
+    /// the fix, `MemoryClient::remember_once` sent the raw `dedup_key` as
+    /// the `recall` query, so a key containing `"`, `\`, or a control
+    /// character never appeared verbatim in that escaped string; the
+    /// pre-check would then never find its own previous write and every
+    /// call would go through to `remember`, duplicating the memory. Runs
+    /// `remember_once` twice per key, driving BOTH the `remember` and
+    /// `recall` round trips through the real handlers for as many rounds as
+    /// `remember_once` needs (it may recall more than once before falling
+    /// back to `remember`).
+    #[tokio::test]
+    async fn remember_once_precheck_finds_a_prior_write_with_json_special_characters_in_the_key() {
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let entitlement = granted_entitlement(&kv, "alice", "sin90").await;
+        let remember_handler = RememberHandler {
+            generation: running_generation(),
+            entitlement: entitlement.clone(),
+        };
+        let recall_handler = RecallHandler {
+            generation: running_generation(),
+            entitlement,
+        };
+
+        let (conn, peer) =
+            agent24_os_sdk::testing::fake_kernel(vec!["_a24/memory/private/".to_owned()]).await;
+        let client = agent24_os_sdk::MemoryClient::new(&conn).expect("offer covers memory");
+
+        // Keeps answering whatever `remember`/`recall` request arrives next,
+        // for the whole test — `remember_once` decides on its own how many
+        // `recall` round trips it needs before it either finds a match or
+        // falls back to `remember`, so the driver can't be a fixed sequence
+        // of `tokio::join!` steps the way the two-call test above is.
+        let driver = tokio::spawn(async move {
+            let mut peer = peer;
+            loop {
+                let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+                let result = match req["method"].as_str() {
+                    Some("_a24/memory/private/remember") => {
+                        remember_handler.call(req["params"].clone()).await
+                    }
+                    Some("_a24/memory/private/recall") => {
+                        recall_handler.call(req["params"].clone()).await
+                    }
+                    other => panic!("unexpected method in driver loop: {other:?}"),
+                };
+                respond_rpc_result(&mut peer, &req, result).await;
+            }
+        });
+
+        for dedup_key in ["say \"hi\"", "C:\\tmp\\x", "tab\tkey"] {
+            let first = client
+                .remember_once("note", dedup_key, Map::new(), None)
+                .await
+                .expect("first remember_once must succeed against the real handlers");
+            assert!(
+                matches!(first, agent24_os_sdk::RememberOnce::Created { .. }),
+                "first remember_once for {dedup_key:?} must create a new memory, got {first:?}"
+            );
+
+            let second = client
+                .remember_once("note", dedup_key, Map::new(), None)
+                .await
+                .expect("second remember_once must succeed against the real handlers");
+            assert!(
+                matches!(second, agent24_os_sdk::RememberOnce::Found { .. }),
+                "second remember_once for {dedup_key:?} must find the first write instead of \
+                 duplicating it, got {second:?}"
+            );
+        }
+
+        driver.abort();
+    }
 }
 
 #[cfg(test)]

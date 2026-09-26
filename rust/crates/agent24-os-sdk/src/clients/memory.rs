@@ -187,11 +187,25 @@ impl MemoryClient {
             Value::String(dedup_key.to_owned()),
         );
 
+        // B2 (external review of #516): the kernel's `recall` substring-
+        // matches the query against `serde_json::to_string(&item.body)`
+        // (`agent24d/src/os_memory_page.rs::item_matches_substring`) — the
+        // JSON-escaped form of the body, not the raw field value. A
+        // `dedup_key` containing `"`, `\`, or a control character never
+        // appears verbatim in that escaped string, so the pre-check would
+        // never find its own previous write and `remember_once` would
+        // duplicate it forever. Escaping the query the same way the kernel
+        // escapes the stored body fixes that; the exact-equality check below
+        // still compares the RAW `dedup_key` against `body.dedup_key`
+        // (`Recollection::body` is already parsed JSON, not the escaped
+        // wire string), so that comparison is unaffected.
+        let recall_query = json_escaped_for_substring_match(dedup_key);
+
         let mut cursor: Option<String> = None;
         for _ in 0..RECALL_PRECHECK_MAX_PAGES {
             let page = self
                 .recall(
-                    dedup_key,
+                    &recall_query,
                     RECALL_PRECHECK_PAGE_SIZE,
                     cursor.as_deref(),
                     request_id,
@@ -217,6 +231,24 @@ impl MemoryClient {
         }
         Ok(RememberOnce::Inconclusive)
     }
+}
+
+/// `serde_json::to_string` on a `&str` always produces a quoted JSON string
+/// literal (`"..."`), so stripping exactly one leading and one trailing byte
+/// recovers just the escaped body — the same bytes that appear inside
+/// `serde_json::to_string(&item.body)` on the kernel side for this field's
+/// value. The `unwrap_or_else`/`unwrap_or` fallbacks below are unreachable
+/// in practice (`String` -> JSON string never fails, and the output of that
+/// serialization always starts and ends with `"`); they exist only so this
+/// stays panic-free without reaching for `unwrap`/`expect` (denied outside
+/// tests).
+fn json_escaped_for_substring_match(key: &str) -> String {
+    let quoted = serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""));
+    quoted
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(&quoted)
+        .to_owned()
 }
 
 #[cfg(all(test, feature = "test-util"))]
