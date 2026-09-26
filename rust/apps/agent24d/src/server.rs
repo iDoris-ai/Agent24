@@ -9,7 +9,7 @@ use agent24_protocol::state_file::AuthMode;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, Path, State};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -612,6 +612,186 @@ async fn fallback() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
 }
 
+#[derive(serde::Deserialize)]
+struct MintCreativeBody {
+    workspace_id: String,
+    #[serde(alias = "attachment_id")]
+    creative_attachment_id: String,
+    #[serde(alias = "principal_id")]
+    creative_principal_id: String,
+    #[serde(alias = "sidecar_instance_id")]
+    sidecar_generation: String,
+    #[serde(default = "default_creative_ttl")]
+    ttl_seconds: u64,
+    #[serde(default)]
+    allowed_operations: Option<Vec<String>>,
+}
+
+const fn default_creative_ttl() -> u64 {
+    300
+}
+
+fn valid_scope_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
+    use crate::capabilities::Operation;
+    match operation {
+        Operation::ModelsAdmin => "models.admin",
+        Operation::WorkspaceCreate => "workspace.create",
+        Operation::WorkspaceRelease => "workspace.release",
+        Operation::HostLease => "host.lease",
+        Operation::ApprovalDecision => "approval.decision",
+        Operation::GrantManage => "grant.manage",
+        Operation::OverrideManage => "override.manage",
+        Operation::ScheduleManage => "schedule.manage",
+        Operation::ModuleAdmin => "module.admin",
+        Operation::CapabilityMint => "capability.mint",
+        Operation::CapabilityRevoke => "capability.revoke",
+        Operation::Shutdown => "shutdown",
+        Operation::ModelsRead => "models.read",
+        Operation::WorkspaceResolve => "workspace.resolve",
+        Operation::SessionCreate => "session.create",
+        Operation::SessionRead => "session.read",
+        Operation::SessionTranscript => "session.transcript",
+        Operation::RunCreate => "run.create",
+        Operation::RunRead => "run.read",
+        Operation::RunCancel => "run.cancel",
+        Operation::EventsRead => "events.read",
+        Operation::ApprovalStatusRead => "approval.status",
+    }
+}
+
+async fn mint_creative_capability(
+    State(state): State<AppState>,
+    authorization: Option<Extension<crate::capabilities::Authorization>>,
+    Json(body): Json<MintCreativeBody>,
+) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Creative capabilities require capability auth mode",
+        );
+    };
+    let Some(Extension(authorization)) = authorization else {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Host authority required",
+        );
+    };
+    if body.ttl_seconds == 0
+        || body.ttl_seconds > crate::capabilities::MAX_CREATIVE_TTL_SECONDS
+        || !valid_scope_id(&body.workspace_id)
+        || !valid_scope_id(&body.creative_attachment_id)
+        || !valid_scope_id(&body.creative_principal_id)
+        || !valid_scope_id(&body.sidecar_generation)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_capability_scope",
+            "Invalid capability scope or TTL",
+        );
+    }
+
+    let mut request = crate::capabilities::CreativeMintRequest::new(
+        body.workspace_id,
+        body.creative_attachment_id,
+        body.creative_principal_id,
+        body.sidecar_generation,
+        Duration::from_secs(body.ttl_seconds),
+        crate::capabilities::unix_now(),
+    );
+    if let Some(actions) = body.allowed_operations {
+        let allowlist = crate::capabilities::Operation::creative_allowlist();
+        let mut operations = Vec::with_capacity(actions.len());
+        for action in actions {
+            let Some(operation) = crate::capabilities::Operation::from_action(&action) else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_capability_operation",
+                    "Unknown capability operation",
+                );
+            };
+            if !allowlist.contains(&operation) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_capability_operation",
+                    "Operation is not available to Creative runtimes",
+                );
+            }
+            operations.push(operation);
+        }
+        request = request.with_allowed_operations(operations);
+    }
+
+    let minted = match store.mint_creative_authorized(&authorization, request) {
+        Ok(minted) => minted,
+        Err(_) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Host authority required",
+            );
+        }
+    };
+    let (token, capability_id, claims) = minted.into_bearer_parts();
+    let allowed_operations = claims
+        .allowed_operations
+        .iter()
+        .copied()
+        .map(operation_name)
+        .collect::<Vec<_>>();
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "capability_id": capability_id,
+            "token": token,
+            "audience": "creative_runtime",
+            "workspace_id": claims.workspace_id,
+            "creative_attachment_id": claims.attachment_id,
+            "creative_principal_id": claims.principal_id,
+            "daemon_generation": claims.daemon_generation,
+            "host_generation": claims.host_generation,
+            "sidecar_generation": claims.sidecar_generation,
+            "created_at": claims.created_at,
+            "expires_at": claims.expires_at,
+            "allowed_operations": allowed_operations,
+        })),
+    )
+        .into_response()
+}
+
+async fn revoke_capability(
+    State(state): State<AppState>,
+    Path(capability_id): Path<String>,
+) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Capability revocation requires capability auth mode",
+        );
+    };
+    if !valid_scope_id(&capability_id) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_capability_id",
+            "Invalid capability id",
+        );
+    }
+    // Deliberately do not expose whether the ID existed or was already
+    // revoked. The endpoint is idempotent and is not a capability oracle.
+    let _ = store.revoke_by_id(&capability_id);
+    Json(serde_json::json!({
+        "capability_id": capability_id,
+        "state": "revoked",
+    }))
+    .into_response()
+}
+
 /// Bearer-token gate for everything except `GET /api/v1/health`
 /// (SPEC-002 §4: health is the only unauthenticated endpoint — method
 /// included, so a future POST on the same path never silently bypasses auth).
@@ -741,6 +921,14 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
+        .route(
+            "/api/v1/capabilities/creative",
+            post(mint_creative_capability),
+        )
+        .route(
+            "/api/v1/capabilities/{capability_id}/revoke",
+            post(revoke_capability),
+        )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/tools", get(crate::routes::get_tools))
         .route(
