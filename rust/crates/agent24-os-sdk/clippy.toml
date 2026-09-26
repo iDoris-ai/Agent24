@@ -1,0 +1,20 @@
+# ME4-S3 §2.2/§6 (J-S1) — prototype scope (v0.1.0, §0 "原型定位"): a basic
+# list, not the full 26-item name-space-clearing list the frozen design
+# sketched (positive-control/`disallowed-methods` completeness is "原型阶段
+# 可选" — recorded, not gated, this round). This crate must never own a
+# socket and must never parse protocol bytes into JSON itself — both go
+# through `agent24_os_proto::module` (§2.2).
+disallowed-types = [
+  { path = "tokio::net::UnixStream", reason = "S3-1: the SDK never owns a socket; use agent24_os_proto::module" },
+  { path = "tokio::net::UnixListener", reason = "S3-1: use agent24_os_proto::module::take_listener" },
+  { path = "tokio::net::TcpStream", reason = "S3-1" },
+  { path = "tokio::net::TcpListener", reason = "S3-1" },
+  { path = "std::os::unix::net::UnixStream", reason = "S3-1" },
+  { path = "std::os::unix::net::UnixListener", reason = "S3-1" },
+  { path = "std::net::TcpStream", reason = "S3-1" },
+  { path = "std::net::TcpListener", reason = "S3-1" },
+]
+disallowed-methods = [
+  { path = "std::os::fd::FromRawFd::from_raw_fd", reason = "S3-1: fd adoption lives in agent24-os-fd" },
+  { path = "serde_json::from_slice", reason = "PLAN T13: parsing protocol frames in the SDK means the seam is cut wrong" },
+]

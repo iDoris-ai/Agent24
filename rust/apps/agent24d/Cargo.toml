@@ -58,6 +58,10 @@ rustix = { version = "0.38", features = ["fs"] }
 [dev-dependencies]
 tempfile = "3"
 sha2 = "0.10"
+# ME4-S3 §6 (J-S7): the SDK's five clients tested against these callback
+# handlers' own `h.call` fixtures, on `agent24-os-proto`'s in-memory fake
+# kernel (forwarded through the SDK's `test-util` feature, L8).
+agent24-os-sdk = { path = "../../crates/agent24-os-sdk", features = ["test-util"] }
 # T7b/ME-3e: forces a transient `Store` error in the timeout-scan test by
 # dropping `module_approvals` out from under a live pool — there is no
 # fault-injectable `Store` trait to mock instead.

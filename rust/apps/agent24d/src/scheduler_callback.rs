@@ -1600,4 +1600,85 @@ mod tests {
             .unwrap();
         assert_eq!(res["outcome"], "absent");
     }
+
+    // ── J-S7: SDK wire parity (ME4-S3 §6) ───────────────────────────────
+    //
+    // The SDK's `SchedulerClient` runs against `agent24_os_sdk::testing::
+    // fake_kernel`; the fake kernel's peer hands the raw params straight to
+    // THIS module's real `SchedulerUpsertHandler`/`SchedulerListHandler::
+    // call` (the same `Fixture` the tests above use), and the handler's own
+    // result is fed back for the SDK to parse.
+
+    async fn respond_rpc_result(
+        peer: &mut agent24_os_sdk::testing::FakePeer,
+        req: &Value,
+        result: Result<Value, RpcError>,
+    ) {
+        match result {
+            Ok(v) => agent24_os_sdk::testing::respond(peer, req, v).await,
+            Err(e) => {
+                let mut data = e.data.clone().unwrap_or_default();
+                if let Some(kind) = e.kind {
+                    data.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+                }
+                if data.is_empty() {
+                    agent24_os_sdk::testing::respond_error(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        "",
+                        &e.message,
+                    )
+                    .await;
+                } else {
+                    agent24_os_sdk::testing::respond_error_with_data(
+                        peer,
+                        req,
+                        i64::from(e.code),
+                        &e.message,
+                        Value::Object(data),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_wire_parity_scheduler_upsert_then_list() {
+        let fx = Fixture::new().await;
+        let g = running_generation();
+        let upsert_handler = fx.upsert(&g, "sin90", granted());
+        let list_handler = fx.list(&g, "sin90", granted());
+
+        let (conn, mut peer) =
+            agent24_os_sdk::testing::fake_kernel(vec!["_a24/scheduler/".to_owned()]).await;
+        let client = agent24_os_sdk::SchedulerClient::new(&conn).expect("offer covers scheduler");
+        let spec = agent24_os_sdk::ScheduleSpec::Every { secs: 3600 };
+        let req = agent24_os_sdk::UpsertRequest {
+            key: "k1",
+            spec: &spec,
+            enabled: true,
+            label: None,
+        };
+
+        let (upserted, ()) = tokio::join!(client.upsert(&req, None), async {
+            let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+            let result = upsert_handler.call(req["params"].clone()).await;
+            respond_rpc_result(&mut peer, &req, result).await;
+        });
+        let upserted = upserted.expect("SDK upsert must succeed against the real handler");
+        assert_eq!(upserted.outcome, agent24_os_sdk::UpsertOutcome::Created);
+
+        let (listed, ()) = tokio::join!(client.list(None), async {
+            let req = agent24_os_sdk::testing::read_request(&mut peer).await;
+            let result = list_handler.call(req["params"].clone()).await;
+            respond_rpc_result(&mut peer, &req, result).await;
+        });
+        let listed = listed.expect("SDK list must succeed against the real handler");
+        assert!(
+            listed.schedules.iter().any(|s| s.key == "k1"),
+            "the schedule just upserted must appear in list through the same real handler"
+        );
+    }
 }

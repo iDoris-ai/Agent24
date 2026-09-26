@@ -1,0 +1,29 @@
+[package]
+name = "agent24-os-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ME4-S3 §7 slice ②: the out-of-process module SDK — Module/ModuleBuilder, five typed clients (Events/Memory/Approval/Scheduler/Model), and the `fired` registration point. Depends only on agent24-os-proto (J-S2): it never touches a socket or parses protocol bytes itself (J-S1)."
+
+[dependencies]
+agent24-os-proto = { path = "../agent24-os-proto" }
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+agent24-os-sdk = { path = ".", features = ["test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+# ME4-S3 §3.1/L8: forwards proto's in-memory fake kernel (`module::testing`)
+# so a downstream module's dev-dependencies only ever need to name the SDK.
+test-util = ["agent24-os-proto/test-util"]
+
+[lints]
+workspace = true

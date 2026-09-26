@@ -1,0 +1,329 @@
+//! ME4-S3 §2.6/§3.4 — the closed error set every client call returns, and
+//! its two mappings: proto's connection-level [`agent24_os_proto::module::
+//! CallError`] and the kernel's application-level `data.kind` (carried
+//! inside `CallError::Rpc`'s `RpcErrorInfo`).
+//!
+//! The 18 kernel `kind`s (`agent24_os_proto::rpc::ErrorKind::ALL`) map to a
+//! dedicated variant each, except: `auth_failed`/`manifest_mismatch`
+//! (handshake-only — a module never sees them on an ordinary call) and
+//! `invalid_lease`/`unknown_capability`/`version_mismatch` (no client here
+//! ever sends the shapes that provoke them) fall to [`ClientError::Other`].
+//! `-32602` (JSON-RPC's own invalid-params code, not a `kind`) maps to
+//! [`ClientError::InvalidParams`]. `timeout` with `data.retryable == false`
+//! is [`ClientError::RequestNotInFlight`] rather than [`ClientError::
+//! Timeout`] — "the id you gave has already ended" is a different fact than
+//! "no answer arrived in time" (§2.6).
+
+use agent24_os_proto::module::CallError;
+use serde_json::Value;
+
+/// The kernel's `data.cause` for `unavailable` (ME4-S2 decision M6), as an
+/// SDK-owned closed set (not the domain-coupled type Sin90 carried).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableCause {
+    NoProvider,
+    RequestRejected,
+    BackendConfig,
+    ResponseTooLarge,
+}
+
+impl UnavailableCause {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "no_provider" => Some(Self::NoProvider),
+            "request_rejected" => Some(Self::RequestRejected),
+            "backend_config" => Some(Self::BackendConfig),
+            "response_too_large" => Some(Self::ResponseTooLarge),
+            _ => None,
+        }
+    }
+}
+
+/// Every way a client call can fail: never `#[non_exhaustive]` (§8 Q6) — a
+/// caller that writes a wildcard-free `match` over this gets a compile error
+/// the day a new kernel `kind` is mapped in, which is the point.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ClientError {
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+    #[error("busy: {0}")]
+    Busy(String),
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
+    #[error("invalid params: {0}")]
+    InvalidParams(String),
+    #[error("timeout: {0}")]
+    Timeout(String),
+    #[error("request not in flight: {0}")]
+    RequestNotInFlight(String),
+    #[error("not ready: {0}")]
+    NotReady(String),
+    #[error("draining: {0}")]
+    Draining(String),
+    #[error("revoked: {0}")]
+    Revoked(String),
+    #[error("token invalid: {0}")]
+    TokenInvalid(String),
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("callback connection was lost; outcome unknown")]
+    ConnectionLost,
+    #[error("not sent: {0}")]
+    NotSent(String),
+    #[error("unavailable (retryable={retryable}): {cause:?}")]
+    Unavailable {
+        retryable: bool,
+        cause: UnavailableCause,
+    },
+    #[error("cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    Other(String),
+}
+
+impl ClientError {
+    /// Sin90's classification, unchanged (`reconciler.rs`'s retry-vs-stop
+    /// match reads this and [`Self::is_retryable`]).
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::Forbidden(_)
+                | Self::InvalidParams(_)
+                | Self::TokenInvalid(_)
+                | Self::NotFound(_)
+                | Self::RequestNotInFlight(_)
+        )
+    }
+
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::RateLimited(_)
+            | Self::Busy(_)
+            | Self::Timeout(_)
+            | Self::ConnectionLost
+            | Self::NotReady(_)
+            | Self::Draining(_) => true,
+            Self::Unavailable { retryable, .. } => *retryable,
+            _ => false,
+        }
+    }
+}
+
+/// `-32602`, JSON-RPC's own code (not an application `kind`).
+const INVALID_PARAMS_CODE: i64 = -32602;
+
+impl From<CallError> for ClientError {
+    fn from(e: CallError) -> Self {
+        // Computed before the match so every non-`Rpc` arm can reuse
+        // `CallError`'s own `Display` text without re-deriving it.
+        let text = e.to_string();
+        match e {
+            CallError::NotSent => Self::NotSent(text),
+            CallError::ConnectionLost => Self::ConnectionLost,
+            CallError::Busy => Self::Busy(text),
+            CallError::FrameTooLarge => Self::PayloadTooLarge(text),
+            CallError::Timeout => Self::Timeout(text),
+            CallError::IdCollision => Self::Other(text),
+            CallError::Rpc(info) => {
+                if info.code == INVALID_PARAMS_CODE {
+                    return Self::InvalidParams(info.message);
+                }
+                let retryable_false = matches!(
+                    info.data.as_ref().and_then(|d| d.get("retryable")),
+                    Some(Value::Bool(false))
+                );
+                match info.kind.as_deref() {
+                    Some("forbidden") => Self::Forbidden(info.message),
+                    Some("busy") => Self::Busy(info.message),
+                    Some("cancelled") => Self::Cancelled,
+                    Some("timeout") if retryable_false => Self::RequestNotInFlight(info.message),
+                    Some("timeout") => Self::Timeout(info.message),
+                    Some("quota_exceeded") => Self::QuotaExceeded(info.message),
+                    Some("not_ready") => Self::NotReady(info.message),
+                    Some("draining") => Self::Draining(info.message),
+                    Some("revoked") => Self::Revoked(info.message),
+                    Some("rate_limited") => Self::RateLimited(info.message),
+                    Some("payload_too_large") => Self::PayloadTooLarge(info.message),
+                    Some("token_invalid") => Self::TokenInvalid(info.message),
+                    Some("not_found") => Self::NotFound(info.message),
+                    Some("unavailable") => unavailable_from_data(&info.message, info.data.as_ref()),
+                    // `invalid_lease` / `unknown_capability` / `version_mismatch`
+                    // (no client here provokes them), `auth_failed` /
+                    // `manifest_mismatch` (handshake-only), or no kind at
+                    // all (a protocol-level JSON-RPC error): Sin90's "don't
+                    // guess" rule (L4) — anything not positively identified
+                    // falls here rather than being forced into a specific
+                    // variant.
+                    _ => Self::Other(info.message),
+                }
+            }
+        }
+    }
+}
+
+/// `unavailable` requires BOTH a legal `cause` and a boolean `retryable` —
+/// missing or malformed either falls to `Other` rather than guessing (Sin90
+/// L4).
+fn unavailable_from_data(message: &str, data: Option<&Value>) -> ClientError {
+    let cause = data
+        .and_then(|d| d.get("cause"))
+        .and_then(Value::as_str)
+        .and_then(UnavailableCause::from_str);
+    let retryable = data
+        .and_then(|d| d.get("retryable"))
+        .and_then(Value::as_bool);
+    match (cause, retryable) {
+        (Some(cause), Some(retryable)) => ClientError::Unavailable { retryable, cause },
+        _ => ClientError::Other(message.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use agent24_os_proto::module::RpcErrorInfo;
+    use serde_json::json;
+
+    fn rpc(code: i64, kind: Option<&str>, data: Option<Value>) -> CallError {
+        CallError::Rpc(RpcErrorInfo {
+            code,
+            kind: kind.map(str::to_owned),
+            message: "m".to_owned(),
+            data,
+        })
+    }
+
+    type KindCheck = (&'static str, fn(ClientError) -> bool);
+
+    // J-S4: every one of the 18 kernel kinds maps somewhere sane, plus the
+    // three non-kind special cases.
+    #[test]
+    fn all_eighteen_kernel_kinds_map_to_a_documented_variant() {
+        let cases: &[KindCheck] = &[
+            ("forbidden", |e| matches!(e, ClientError::Forbidden(_))),
+            ("busy", |e| matches!(e, ClientError::Busy(_))),
+            ("cancelled", |e| matches!(e, ClientError::Cancelled)),
+            ("timeout", |e| matches!(e, ClientError::Timeout(_))),
+            ("quota_exceeded", |e| {
+                matches!(e, ClientError::QuotaExceeded(_))
+            }),
+            ("invalid_lease", |e| matches!(e, ClientError::Other(_))),
+            ("unknown_capability", |e| matches!(e, ClientError::Other(_))),
+            ("version_mismatch", |e| matches!(e, ClientError::Other(_))),
+            ("auth_failed", |e| matches!(e, ClientError::Other(_))),
+            ("manifest_mismatch", |e| matches!(e, ClientError::Other(_))),
+            ("not_ready", |e| matches!(e, ClientError::NotReady(_))),
+            ("draining", |e| matches!(e, ClientError::Draining(_))),
+            ("revoked", |e| matches!(e, ClientError::Revoked(_))),
+            ("rate_limited", |e| matches!(e, ClientError::RateLimited(_))),
+            ("payload_too_large", |e| {
+                matches!(e, ClientError::PayloadTooLarge(_))
+            }),
+            ("token_invalid", |e| {
+                matches!(e, ClientError::TokenInvalid(_))
+            }),
+            ("not_found", |e| matches!(e, ClientError::NotFound(_))),
+        ];
+        for (kind, check) in cases {
+            let mapped = ClientError::from(rpc(-32000, Some(kind), None));
+            assert!(check(mapped.clone()), "kind {kind} mapped to {mapped:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_params_code_wins_regardless_of_kind() {
+        let mapped = ClientError::from(rpc(-32602, None, None));
+        assert!(matches!(mapped, ClientError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn timeout_with_retryable_false_is_request_not_in_flight() {
+        let mapped = ClientError::from(rpc(
+            -32000,
+            Some("timeout"),
+            Some(json!({"retryable": false})),
+        ));
+        assert!(matches!(mapped, ClientError::RequestNotInFlight(_)));
+    }
+
+    #[test]
+    fn timeout_without_retryable_false_stays_timeout() {
+        let mapped = ClientError::from(rpc(-32000, Some("timeout"), None));
+        assert!(matches!(mapped, ClientError::Timeout(_)));
+    }
+
+    #[test]
+    fn unavailable_needs_both_cause_and_retryable_else_other() {
+        let full = ClientError::from(rpc(
+            -32000,
+            Some("unavailable"),
+            Some(json!({"cause": "no_provider", "retryable": true})),
+        ));
+        assert_eq!(
+            full,
+            ClientError::Unavailable {
+                retryable: true,
+                cause: UnavailableCause::NoProvider
+            }
+        );
+
+        for bad in [
+            json!({"retryable": true}),
+            json!({"cause": "no_provider"}),
+            json!({"cause": "not_a_real_cause", "retryable": true}),
+            json!({"cause": "no_provider", "retryable": "yes"}),
+        ] {
+            let mapped = ClientError::from(rpc(-32000, Some("unavailable"), Some(bad.clone())));
+            assert!(
+                matches!(mapped, ClientError::Other(_)),
+                "{bad:?} must not be guessed at, got {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_level_errors_map_directly() {
+        assert_eq!(
+            ClientError::from(CallError::ConnectionLost),
+            ClientError::ConnectionLost
+        );
+        assert!(matches!(
+            ClientError::from(CallError::NotSent),
+            ClientError::NotSent(_)
+        ));
+        assert!(matches!(
+            ClientError::from(CallError::FrameTooLarge),
+            ClientError::PayloadTooLarge(_)
+        ));
+    }
+
+    #[test]
+    fn is_permanent_and_is_retryable_partition_sensibly() {
+        assert!(ClientError::Forbidden("x".into()).is_permanent());
+        assert!(!ClientError::Forbidden("x".into()).is_retryable());
+        assert!(ClientError::Busy("x".into()).is_retryable());
+        assert!(!ClientError::Busy("x".into()).is_permanent());
+        assert!(
+            ClientError::Unavailable {
+                retryable: true,
+                cause: UnavailableCause::NoProvider
+            }
+            .is_retryable()
+        );
+        assert!(
+            !ClientError::Unavailable {
+                retryable: false,
+                cause: UnavailableCause::BackendConfig
+            }
+            .is_retryable()
+        );
+    }
+}
