@@ -143,7 +143,14 @@ fn clamp_i64(x: u64) -> i64 {
 /// ceiling every stored row itself is held to). Capping the *sum* to the
 /// same ceiling keeps "totals across days" indistinguishable, from the
 /// caller's point of view, from "one more day that happened to be huge".
-fn saturating_add_capped(a: u64, b: u64) -> u64 {
+///
+/// `pub` (ME4-4.2.3b review, L2): `agentd`'s `GET /api/v1/usage?module=`
+/// folds this same table's rows across `served_by` tiers (`by_served` →
+/// `totals`) the exact same way — several already-`i64::MAX`-capped values
+/// summed together — so it reuses this function rather than a second copy
+/// of the same ceiling with its own chance to disagree on the cap.
+#[must_use]
+pub fn saturating_add_capped(a: u64, b: u64) -> u64 {
     let cap = u64::try_from(i64::MAX).unwrap_or(u64::MAX);
     a.saturating_add(b).min(cap)
 }

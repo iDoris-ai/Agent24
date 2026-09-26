@@ -16,7 +16,7 @@ mod module_schedules;
 mod repo;
 
 pub use audit::AuditEntry;
-pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy};
+pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
 pub use repo::*;
 

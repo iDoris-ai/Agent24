@@ -30,6 +30,15 @@ http-body-util = "0.1"
 rand = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# ME4-4.2.3b (design §6.5): `GET /api/v1/usage?module=` reads the raw query
+# string itself (via `axum::extract::RawQuery`) rather than axum's `Query`
+# extractor, so a malformed `module`-less query never turns into a 400 (v2
+# L5). `form_urlencoded::parse` (not `serde_urlencoded`, review L1): it is
+# INFALLIBLE — invalid percent-encoding decodes losslessly to U+FFFD rather
+# than erroring — so there is no error branch to (mis-)handle, and no way for
+# one malformed key/value pair to hide an unrelated, well-formed `module=`
+# key elsewhere in the same query string.
+form_urlencoded = "1"
 # T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
 # with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
 futures = { version = "0.3", default-features = false, features = ["std"] }
