@@ -8,6 +8,9 @@ description = "Agent24 domain-OS packages on disk (ME-3a): discovery and atomic 
 
 [dependencies]
 agent24-domain = { path = "../agent24-domain" }
+# ME4-S3 §4.4 (M4): `manifest_digest` moved into proto so the kernel's
+# discovery and a module's handshake compute it with the same function.
+agent24-os-proto = { path = "../agent24-os-proto" }
 serde_yaml = "0.9"
 # For `geteuid` — a SAFE wrapper over the syscall. See `effective_uid`: the
 # dependency-free alternative (create a file, ask who owns it) was attacker-

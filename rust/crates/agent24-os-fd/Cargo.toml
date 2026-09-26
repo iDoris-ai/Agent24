@@ -1,0 +1,24 @@
+[package]
+name = "agent24-os-fd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ME4-S3 §4.3/§8 Q2: the one crate that turns the kernel-inherited listen fd into a socket"
+
+[dependencies]
+# 1.x, not proto's 0.38: 0.38.44 `getsockname` panics decoding an unnamed
+# AF_UNIX address on macOS (read_sockaddr.rs:320, found by this crate's tests).
+# 1.1.4 is already in Agent24's Cargo.lock (via other deps).
+rustix = { version = "1.1", features = ["fs", "net"] }
+
+# The ONLY workspace member that does not inherit `[lints] workspace = true`
+# (J-S3): `unsafe_code` is `deny` here instead of `forbid`, so exactly one
+# `#[allow(unsafe_code)]` (on `adopt`) can exist. Every other workspace lint is
+# restated verbatim.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
