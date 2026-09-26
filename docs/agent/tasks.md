@@ -37,8 +37,8 @@
 | ME4-1.3.2 | Agent24 | 代理保留 `/_a24/` 路径（规范化后判定） | 1.1.1 | `DONE` | #447 合并于 2026-09-25 |
 | ME4-1.4.1 | Agent24 | `_a24/scheduler/*` handler + 授权/配额/限流（**唯一会生产模块行的调用方，必须排在 1.2.2c 之后**：模块行护栏与 self-wake 过滤就绪前不得产生模块行） | 1.2.2c | `DONE` | #487 → #488 全部合并于 2026-09-25 |
 | ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `DONE` | #504 合并于 2026-09-25（10/10 连跑绿，Opus 评审通过） |
-| ME4-M2 门 | Sin90 | Sin90 M3（T3.1.1–T3.5.1）全 DONE | 1.5.1, 0.1 | `BACKLOG` | |
-| ME4-M3 门 | Sin90 | Sin90 M4（T4.1.1–T4.4.1）全 DONE | M2 门 | `BACKLOG` | |
+| ME4-M2 门 | Sin90 | Sin90 M3（T3.1.1–T3.5.1）全 DONE | 1.5.1, 0.1 | `DONE` | Sin90 `origin/main` 已含 T3.1.1–T3.5.1 各 PR（2026-09-26 按 `git log` 核对）|
+| ME4-M3 门 | Sin90 | Sin90 M4（T4.1.1–T4.4.1）全 DONE | M2 门 | `DONE` | Sin90 `origin/main` 已含 T4.1.1–T4.4.1 各 PR（2026-09-26 按 `git log` 核对）|
 | ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `DONE` | #446 合并于 2026-09-25（冻结 v3.1；同 1.1.1，改 base 后原 approve 作废，已重审通过） |
 | ME4-4.2.1 | Agent24 | `model_access` manifest 字段解析（只做 manifest，不授予） | 4.1.1 | `DONE` | #457 合并于 2026-09-25 |
 | ME4-4.2.2-0 | Agent24 | rpc 按方法超时 + ErrorKind `unavailable`（17→18）+ SPEC 闭集句 | 4.1.1 | `DONE` | #451 合并于 2026-09-25 |
@@ -49,7 +49,7 @@
 | ME4-4.2.3a | Agent24 | 用量迁移 + store（module_model_usage） | 4.2.2b2 | `DONE` | #506 合并于 2026-09-26 |
 | ME4-4.2.3b | Agent24 | 用量 recorder + `/api/v1/usage?module=` + serve 换 sink | 4.2.3a | `DONE` | #510（用量写者 UsageRecorder）→ #511（GET /api/v1/usage?module=）全部合并于 2026-09-26 |
 | ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `DONE` | #512 合并于 2026-09-26（`bb3505a`；Opus 本地评审 2 轮：CHANGES → APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-7） |
-| ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `IN_PROGRESS` | **Sin90 侧已满足**：Sin90 `origin/main` `135ddb7`（T5.5.1 M5 real-mount acceptance；`git log origin/main` 含 T5.0.1–T5.5.1 各 PR），ME4-5.1.1 以此为盘点基线。前置 4.3.1 已 DONE（#512，2026-09-26）；前置 **M3 门（及其前置 M2 门）台账仍为 `BACKLOG`**——Sin90 main 实际已含 T3.1.1–T3.5.1、T4.1.1–T4.4.1，但这两行的回填不在本分支范围。M2/M3 门回填 DONE 后本行改 DONE |
+| ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `DONE` | Sin90 `origin/main` `135ddb7`（T5.5.1 M5 real-mount acceptance）含 T5.0.1–T5.5.1 各 PR；前置 4.3.1 DONE（#512）、M3 门 DONE。ME4-5.1.1 以 `135ddb7` 为盘点基线 |
 | ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `IN_PROGRESS` | 设计 v3（`docs/design/ME4-S3-os-sdk.md`）：jason 2026-09-26 拍板 Q1–Q11；第 1 轮 Tier-2 Opus 评审 CHANGES（5H/10M/11L）→ v2（§11.1）；v2 复审 CHANGES（2H/5M/5L）→ v3（§11.2），待再审冻结；Codex 补审记 ME4-CODEX-DEBT-8 |
 | ME4-5.1.2a1 | Agent24 | proto `module`：`ModuleEnv`（`from_env`/`from_vars`，不持 fd）、`SPAWN_ENV_VARS`、`Hello`、`FatalHook`（newtype）、宽松 `InitializeReply`、`connect_from_env` 握手部分（先返回只能 `offer()` 的连接）、`manifest::{ManifestFacts, facts_from_yaml}`、`manifest_digest` 从 os-packages 挪入 proto；J-S12、J-S19 | 5.1.1 | `BACKLOG` | SZ-1 估 ~270。**合并流程（ME4-S3 §7）：一次只开一个 PR，base 恒为 main，上一片合并后下一片才开；依赖列是 DAG** |
 | ME4-5.1.2a2-core | Agent24 | proto `Connection` mux 核心（移植 Sin90 transport：读写任务、按 id 分发、64 在途、`declare_dead`）；J-S8 前 8 条 | 5.1.2a1 | `BACKLOG` | ~290 |
