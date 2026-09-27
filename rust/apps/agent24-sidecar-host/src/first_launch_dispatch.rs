@@ -11,7 +11,6 @@ use crate::{
     pre_owned_cleanup::{IntoCleanupOwner, PreOwnedCleanup},
 };
 
-/// Carries either the first generation, a static rejection, or its cleanup owner.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum FirstLaunchDispatch<'host> {
     Generation(NativeGeneration<'host>),
@@ -35,7 +34,6 @@ impl FirstLaunchDispatch<'_> {
     }
 }
 
-/// Consume an accepted request; sample `clock` at each launch-budget boundary.
 pub(crate) fn dispatch<'host>(
     accepted: AcceptedLaunch,
     ports: &'host mut HostPorts,
