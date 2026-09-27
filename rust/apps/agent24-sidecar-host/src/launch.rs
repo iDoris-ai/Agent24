@@ -512,7 +512,7 @@ mod windows_tests {
         Request::Launch {
             version: 1,
             request_id: 17,
-            executable: powershell_executable().display().to_string(),
+            executable: String::from("powershell.exe"),
             cwd: cwd.display().to_string(),
             argv: vec![
                 String::from("-NoLogo"),
@@ -533,13 +533,9 @@ mod windows_tests {
     fn descendant_request(cwd: &Path) -> Request {
         let mut request = request(cwd);
         if let Request::Launch { argv, env, .. } = &mut request {
-            let child_powershell = powershell_executable()
-                .display()
-                .to_string()
-                .replace('\'', "''");
             argv[3] = String::from("-Command");
-            argv[4] = format!(
-                "$child = Start-Process '{child_powershell}' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; [Console]::Out.Write('ready'); [Console]::Out.Flush()"
+            argv[4] = String::from(
+                "$child = Start-Process \"$PSHOME\\powershell.exe\" -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; [Console]::Out.Write('ready'); [Console]::Out.Flush()",
             );
             argv.truncate(5);
             env.remove("SIDE");
@@ -582,8 +578,9 @@ mod windows_tests {
         let mut launch =
             OwnedLaunch::start(LaunchIntent::from_request(request(&cwd)).expect("intent"))
                 .expect("owned launch");
-        let request_id = launch.request_id();
-        let (stdout_pipe, stderr_pipe) = {
+        assert_eq!(launch.request_id(), 17);
+        let mut stdout = String::new();
+        let (mut stdout_pipe, mut stderr_pipe) = {
             let (_, pipes) = launch.parts_mut();
             let _ = pipes.stdin_mut().expect("stdin");
             (
@@ -591,35 +588,18 @@ mod windows_tests {
                 pipes.take_stderr().expect("stderr moves once"),
             )
         };
-        let output = tokio::time::timeout(Duration::from_secs(5), async move {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            let mut stdout_pipe = stdout_pipe.take(4096);
-            let mut stderr_pipe = stderr_pipe.take(4096);
-            let (stdout_result, stderr_result) = tokio::join!(
-                stdout_pipe.read_to_end(&mut stdout),
-                stderr_pipe.read_to_end(&mut stderr),
-            );
-            stdout_result?;
-            stderr_result?;
-            Ok::<_, io::Error>((stdout, stderr))
-        })
-        .await;
-        reap(&mut launch);
-        let (stdout, stderr) = output
-            .expect("child output deadline")
-            .expect("child output read");
-        let stdout = String::from_utf8(stdout).expect("stdout UTF-8");
-        let stderr = String::from_utf8(stderr).expect("stderr UTF-8");
+        stdout_pipe.read_to_string(&mut stdout).await.unwrap();
+        let mut stderr = String::new();
+        stderr_pipe.read_to_string(&mut stderr).await.unwrap();
         let fields: Vec<_> = stdout.split('|').collect();
-        std::fs::remove_dir_all(&cwd).expect("cleanup cwd");
-        assert_eq!(request_id, 17);
         assert_eq!(fields[0], "cwd-ok");
         assert_eq!(
             &fields[1..],
             ["env-value", "ignored-zero,argv-value", "unset"]
         );
         assert_eq!(stderr, "err");
+        reap(&mut launch);
+        std::fs::remove_dir_all(&cwd).expect("cleanup cwd");
     }
 
     #[tokio::test]
@@ -696,50 +676,39 @@ mod windows_tests {
             LaunchIntent::from_request(descendant_request(&cwd)).expect("intent"),
         )
         .expect("owned launch");
+        let mut ready = [0; 5];
         let mut stdout = launch
             .parts_mut()
             .1
             .take_stdout()
             .expect("stdout moves once");
-        let lifecycle = async {
-            let mut ready = [0; 5];
-            tokio::time::timeout(Duration::from_secs(5), stdout.read_exact(&mut ready))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ready read timed out"))??;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            let exited = loop {
-                match launch.target_mut().observe_exit()? {
-                    exited @ ExitObservation::Exited { .. } => break exited,
-                    ExitObservation::Running if tokio::time::Instant::now() < deadline => {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                    ExitObservation::Running => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "leader did not exit before deadline",
-                        ));
-                    }
-                }
-            };
-            let tree = launch.target_mut().reap_step()?;
-            Ok::<_, io::Error>((ready, exited, tree))
-        }
-        .await;
-        reap(&mut launch);
-        let (ready, leader, tree) = lifecycle.expect("bounded ready read and Job cleanup");
+        stdout.read_exact(&mut ready).await.expect("ready");
         assert_eq!(&ready, b"ready");
-        assert!(matches!(leader, ExitObservation::Exited { .. }));
-        assert_eq!(tree, TreeObservation::Present);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match launch.target_mut().observe_exit().expect("observe leader") {
+                ExitObservation::Exited { .. } => break,
+                ExitObservation::Running if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                ExitObservation::Running => panic!("leader did not exit before deadline"),
+            }
+        }
+        assert_eq!(
+            launch.target_mut().reap_step().expect("observe Job"),
+            TreeObservation::Present
+        );
+        reap(&mut launch);
     }
 
     #[test]
     fn windows_missing_executable_is_static_and_redacted() {
-        let missing = std::env::temp_dir().join("agent24-sidecar-program-that-does-not-exist.exe");
+        let missing = "agent24-sidecar-program-that-does-not-exist.exe";
         let error = OwnedLaunch::start(
             LaunchIntent::from_request(Request::Launch {
                 version: 1,
                 request_id: 19,
-                executable: missing.display().to_string(),
+                executable: missing.to_owned(),
                 cwd: std::env::temp_dir().display().to_string(),
                 argv: Vec::new(),
                 env: BTreeMap::new(),
@@ -749,6 +718,6 @@ mod windows_tests {
         .err()
         .expect("missing executable must fail");
         assert!(matches!(error, LaunchFailure::Start(_)));
-        assert!(!format!("{error:?}").contains(&missing.display().to_string()));
+        assert!(!format!("{error:?}").contains(missing));
     }
 }
