@@ -97,13 +97,28 @@ pub struct KernelResponse {
 /// fired` — moved here (owned) from `agent24d::scheduler_deliver`'s private
 /// borrowed `FiredBody<'a>` so the kernel (this module, serializing) and the
 /// SDK's `fired` extractor (deserializing) share one type instead of two
-/// independently-maintained mirrors. `deny_unknown_fields`: unlike a call
-/// RESPONSE (§2.4's "responses are lenient" rule doesn't apply here — this is
-/// the kernel-originated REQUEST body on the reverse channel), the kernel
-/// controls both ends of this shape and a drifting field should fail loudly
-/// rather than be silently dropped by an older SDK.
+/// independently-maintained mirrors.
+///
+/// E4 (pre-release): deliberately NOT `deny_unknown_fields`, reversing the
+/// original reasoning here (a drifting field should fail loudly rather than
+/// be silently dropped by an older SDK). That reasoning had it backwards for
+/// THIS direction of drift: the kernel never deserializes its own
+/// `FiredBody` — `agent24d::scheduler_deliver::deliver_on` only ever
+/// constructs and serializes one, so this struct's `Deserialize` impl runs
+/// exclusively on the SDK side, in `agent24_os_sdk::fired`'s extractor,
+/// parsing a body THIS SAME kernel produced. A future kernel adding a new
+/// field to that body would make every already-deployed module's SDK — which
+/// cannot be forced to upgrade in lockstep with the kernel — reject every
+/// single `fired` delivery with 400, and per `agent24-scheduler::deliveries`'
+/// own retry/failure accounting (see the module doc above), that is not a
+/// handler error recorded and moved on from: it is `MAX_SENT_ATTEMPTS`
+/// exhausted, silently, for every scheduled task on every old module, kernel
+/// side. Lenient parsing (unknown fields ignored) costs nothing here since
+/// nothing on the kernel side ever round-trips this struct back through
+/// `Deserialize` to validate its own output — see `scheduler_deliver`'s own
+/// wire-shape test, which asserts on the raw serialized JSON keys, not by
+/// deserializing into `FiredBody`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FiredBody {
     pub key: String,
     /// `"tick"` | `"run_now"`.
