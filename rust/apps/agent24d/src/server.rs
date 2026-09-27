@@ -111,6 +111,15 @@ pub struct AppState {
     /// shutdown cancels in-flight provider calls (run-level cancel joins in C2),
     /// and `POST /api/v1/shutdown` requests it.
     pub shutdown: Shutdown,
+    /// A3-2b: the live attach registry (`docs/design/A3-ATTACHED-MODULE.md`
+    /// §4–§5). Built here with `models: None` (no `ModelCallbackDeps` exists
+    /// yet at `AppState::new` time — see that field's own doc); `serve`
+    /// REPLACES this with a fresh one built from the real deps, hydrated from
+    /// `attached.json`, right before spawning the attach listener — the same
+    /// "start empty, replace once real data is ready" pattern `os_reports`
+    /// uses just below, and for the same reason (this reassignment happens
+    /// before `state` is ever cloned into the router).
+    pub attach_registry: Arc<crate::attach_registry::AttachRegistry>,
 }
 
 /// A shutdown request, from anything that can make one — a signal, `POST
@@ -567,6 +576,19 @@ impl AppState {
         // above (design doc "现状" 4).
         let module_approval_broker =
             crate::module_approval_broker::ModuleApprovalBroker::new(store.clone(), events.clone());
+        let attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
+            crate::attach_registry::AttachDeps {
+                scheduler: scheduler.clone(),
+                // No `ModelCallbackDeps` exists yet at this point (it needs
+                // the `UsageRecorder` `serve` spawns later) — `serve` builds
+                // the real registry once that exists and replaces this one,
+                // hydrated from `attached.json` (see this field's own doc on
+                // `AppState`).
+                models: None,
+                approval_broker: module_approval_broker.clone(),
+                events: events.clone(),
+            },
+        ));
         Self {
             risk_overrides,
             token: Arc::new(token),
@@ -603,6 +625,7 @@ impl AppState {
             scheduler,
             deliverer,
             shutdown,
+            attach_registry,
         }
     }
 }
@@ -1046,7 +1069,8 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         )
         .route(
             "/api/v1/attached/{name}",
-            axum::routing::delete(crate::attached_routes::delete_attached),
+            axum::routing::delete(crate::attached_routes::delete_attached)
+                .patch(crate::attached_routes::patch_attached),
         )
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
         .route("/api/v1/os", get(crate::os_routes::list_os))
@@ -1532,11 +1556,31 @@ pub async fn serve(
     // Handed over here, synchronously, before the task exists: from now on
     // only a summary on disk removes the marker (SHUT-1b).
     let marker = marker.map(crate::lifecycle::MarkerGuard::into_stopping);
+    // A3-2b (design §5.5, M2): the REAL attach registry (with model deps)
+    // does not exist yet at this point in `serve` — it needs the
+    // `UsageRecorder` built further down. This cell is filled in once it is,
+    // right before the attach listener starts; the `stopping` task below only
+    // ever reads it AFTER a shutdown was requested, which cannot happen
+    // before that fill (a shutdown racing in during startup finds the cell
+    // empty and has nothing to revoke — the listener that would let a module
+    // attach has not started either in that same window).
+    let attach_registry_cell: Arc<
+        std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
+    > = Arc::new(std::sync::OnceLock::new());
+    let stopping_attach_registry = Arc::clone(&attach_registry_cell);
     let stopping = tokio::spawn(async move {
         stop_shutdown.token().cancelled().await;
         // Whoever cancelled, the shutdown has begun: fixed here if nothing
         // fixed it yet (SHUT-1b).
         stop_shutdown.request();
+        // §5.5: revoke every attached module's live generation and drop its
+        // grants (the last `ModelCallbackDeps` clone with it) in the SAME
+        // phase the out-of-process supervisors' `close()` runs in, below —
+        // and, transitively, before `stop_usage_writer` (every call site of
+        // it awaits THIS task first).
+        if let Some(registry) = stopping_attach_registry.get() {
+            registry.revoke_all();
+        }
         let deadlines = stop_shutdown.deadlines();
         // The discovery state goes first, off this task: a watchdog exit later
         // must not leave a state file pointing at a daemon that is gone. (The
@@ -1638,6 +1682,22 @@ pub async fn serve(
     };
     let (usage_recorder, usage_writer) =
         crate::usage_recorder::UsageRecorder::spawn(state.store.clone(), usage_hard_stop);
+    // A3-2b (design §5.5, M2): built ONCE here — not a second, structurally
+    // equivalent copy — so the attach registry's model calls are cancelled by
+    // the EXACT SAME `modules_cut_off()` cancellation tree a mounted
+    // package's calls are ("同一棵树"), and so its `usage` sender is the same
+    // `Arc` `stop_usage_writer` waits to see dropped. Cloned (not moved) into
+    // `CallbackDeps` below — `ModelCallbackDeps` is `Clone` by design for
+    // exactly this "more than one grantor needs the same deps" case.
+    let model_deps = crate::model_callback::ModelCallbackDeps {
+        router: state.router.clone(),
+        usage: usage_recorder.clone(),
+        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
+        admission: crate::model_callback::ModelAdmission::new(
+            crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+            crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+        ),
+    };
     let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
@@ -1663,15 +1723,7 @@ pub async fn serve(
             // itself is what drops the LAST reference, right before it
             // awaits the writer's join (its own doc comment explains why
             // that ordering matters).
-            models: Some(crate::model_callback::ModelCallbackDeps {
-                router: state.router.clone(),
-                usage: usage_recorder.clone(),
-                cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
-                admission: crate::model_callback::ModelAdmission::new(
-                    crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
-                    crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
-                ),
-            }),
+            models: Some(model_deps.clone()),
         },
     )
     .await;
@@ -1818,6 +1870,50 @@ pub async fn serve(
     );
     state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
     state.shutdown_report = Arc::new(report);
+    // A3-2b (design §4/§5): the real attach registry — same "start empty,
+    // replace once real data is ready" pattern as `os_reports` above, and for
+    // the same ordering reason (this runs before `state` is cloned into the
+    // router). Hydrated from `attached.json` BEFORE the listener takes its
+    // first connection (`AttachRegistry::hydrate`'s own doc: a handshake
+    // racing an unloaded name would otherwise see a spurious `auth_failed`).
+    state.attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
+        crate::attach_registry::AttachDeps {
+            scheduler: state.scheduler.clone(),
+            models: Some(model_deps),
+            approval_broker: state.module_approval_broker.clone(),
+            events: state.events.clone(),
+        },
+    ));
+    // Review H1: an EPHEMERAL daemon (`agent24 ...` without a resident
+    // daemon, or an `os_local` helper spawning one just for one CLI call)
+    // must NOT touch `~/.agent24/attach/agent24d.sock` at all — that path is
+    // the REAL, resident daemon's. A short-lived daemon hydrating it and
+    // binding the real socket would make the resident daemon's own listener
+    // degrade (`bind`'s own "already accepting connections" check), or worse
+    // — if the resident daemon is not up yet — actually WIN the bind, so a
+    // real AgentEar connects to a process that exits moments later, silently
+    // losing every event/usage row it would have recorded. Attach support is
+    // simply not offered from an ephemeral daemon; hydration and the
+    // listener are both skipped.
+    if !ephemeral {
+        if let Some(path) = crate::attached::config_path()
+            && let Err(e) = state.attach_registry.hydrate(&path)
+        {
+            tracing::error!("could not hydrate the attach registry from {path:?}: {e}");
+        }
+        // Filled before the listener starts (see the cell's own comment
+        // above): the `stopping` task's `revoke_all` can now find it.
+        let _ = attach_registry_cell.set(Arc::clone(&state.attach_registry));
+        if let Some(path) = crate::attached::socket_path() {
+            tokio::spawn(crate::attach_listener::run(
+                Arc::clone(&state.attach_registry),
+                path,
+                shutdown.child_token(),
+            ));
+        } else {
+            tracing::error!("attach listener not started: HOME is not set, no socket path to bind");
+        }
+    }
     let router = build_router_with_modules(state, module_routes);
 
     // A shutdown that began during startup ends it here, before anything says

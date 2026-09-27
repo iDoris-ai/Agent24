@@ -5,6 +5,8 @@
 
 mod approval_callback;
 mod approvals;
+mod attach_listener;
+mod attach_registry;
 mod attached;
 mod attached_routes;
 // Remaining public capability primitives are staged for the next endpoints.

@@ -1,21 +1,27 @@
-//! `/api/v1/attached` — register, rotate, revoke and list A3 attached modules
-//! (`docs/design/A3-ATTACHED-MODULE.md` §3.2, PR slice A3-2a).
+//! `/api/v1/attached` — register, rotate, revoke, enable/disable and list A3
+//! attached modules (`docs/design/A3-ATTACHED-MODULE.md` §3.2, PR slices
+//! A3-2a/A3-2b).
 //!
-//! Storage and the A3-2a-level manifest checks live in [`crate::attached`];
-//! this file is the axum-facing translation from that module's `Result`s to
-//! the v1 error envelope. Bearer auth is the SAME layer every other kernel
-//! route sits behind (`crate::server::auth`, applied in
-//! `build_router_with_modules` after this router merges in) — nothing here
-//! re-checks it.
+//! Storage and manifest validation live in [`crate::attached`]; this file is
+//! the axum-facing translation from that module's `Result`s to the v1 error
+//! envelope, AND (A3-2b) the one place that wires `attached::register`/
+//! `revoke`/`set_disabled`'s `on_commit` hook to
+//! `crate::attach_registry::AttachRegistry::on_change` — see `Change`'s own
+//! doc comment for why that hook must run inside the file-lock critical
+//! section rather than after these handlers' calls return. Bearer auth is the
+//! SAME layer every other kernel route sits behind (`crate::server::auth`,
+//! applied in `build_router_with_modules` after this router merges in) —
+//! nothing here re-checks it.
 //!
-//! `GET /api/v1/attached` is a NEW endpoint rather than the augmentation the
-//! design doc's §3.2 table describes for the existing `GET /api/v1/os` — see
-//! `crate::attached::list`'s doc comment for why, and this PR's own report.
+//! `GET`/`PATCH /api/v1/attached/*` are NEW endpoints rather than the
+//! augmentation the design doc's §3.2 table describes for the existing
+//! `/api/v1/os` surface — see `crate::attached::list`'s doc comment for why,
+//! and this PR's own report.
 
 use std::path::Path;
 
 use agent24_domain::http::{error_response, read_body_or_response};
-use agent24_protocol::{AttachedAddRequest, AttachedList};
+use agent24_protocol::{AttachedAddRequest, AttachedList, AttachedUpdate};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
@@ -73,10 +79,15 @@ async fn post_attached_at(
     // rejects the clash then, as a fallback to this check rather than a
     // replacement for it.
     let name_taken = |name: &str| state.os_reports.iter().any(|r| r.name == name);
-    // A3-2a has no live generation to revoke on commit (module doc); A3-2b's
-    // registry wiring is the first real `on_commit` consumer (see
-    // `attached::Change`).
-    match attached::register(path, &body.manifest, body.allow_relax, name_taken, |_| {}) {
+    match attached::register(
+        path,
+        &body.manifest,
+        body.allow_relax,
+        name_taken,
+        |change| {
+            state.attach_registry.on_change(change);
+        },
+    ) {
         Ok(RegisterOutcome::Created(resp)) => (StatusCode::CREATED, Json(resp)).into_response(),
         Ok(RegisterOutcome::Rotated { response, .. }) => {
             (StatusCode::OK, Json(response)).into_response()
@@ -113,12 +124,67 @@ pub async fn delete_attached(state: State<AppState>, name: AxumPath<String>) -> 
 }
 
 async fn delete_attached_at(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
     path: &Path,
 ) -> Response {
-    match attached::revoke(path, &name, |_| {}) {
+    match attached::revoke(path, &name, |change| {
+        state.attach_registry.on_change(change)
+    }) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("no attached module named {name:?}"),
+        ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e),
+    }
+}
+
+/// `PATCH /api/v1/attached/{name}` (A3-2b, §3.2/§5.3): "对附着模块同样生
+/// 效...disable = 立即撤销并断开，之后握手被拒 `forbidden`". `enabled: false`
+/// disables (registry revokes the live generation in the same critical
+/// section, via `on_change`); `enabled: true` re-enables (a no-op if it was
+/// never disabled).
+pub async fn patch_attached(
+    state: State<AppState>,
+    name: AxumPath<String>,
+    req: Request<Body>,
+) -> Response {
+    let Some(path) = attached::config_path() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "HOME not set",
+        );
+    };
+    patch_attached_at(state, name, req, &path).await
+}
+
+async fn patch_attached_at(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    req: Request<Body>,
+    path: &Path,
+) -> Response {
+    let bytes = match read_body_or_response(req).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let body: AttachedUpdate = match serde_json::from_slice(&bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid body: {e}"),
+            );
+        }
+    };
+    match attached::set_disabled(path, &name, !body.enabled, |change| {
+        state.attach_registry.on_change(change);
+    }) {
+        Ok(true) => list_attached_at(State(state), path).await,
         Ok(false) => error_response(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -139,9 +205,19 @@ pub async fn list_attached(state: State<AppState>) -> Response {
     list_attached_at(state, &path).await
 }
 
-async fn list_attached_at(State(_state): State<AppState>, path: &Path) -> Response {
+async fn list_attached_at(State(state): State<AppState>, path: &Path) -> Response {
     match attached::list(path) {
-        Ok(modules) => Json(AttachedList { modules }).into_response(),
+        // A3-2b: overlay the live `attach_status`/`generation` from the
+        // registry — `attached::list` only knows the disk record (see its
+        // own doc comment).
+        Ok(mut modules) => {
+            for m in &mut modules {
+                let (status, generation) = state.attach_registry.status_of(&m.name);
+                m.attach_status = status.to_owned();
+                m.generation = generation;
+            }
+            Json(AttachedList { modules }).into_response()
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &e),
     }
 }
@@ -226,12 +302,23 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
     }
 
+    /// A relaxing manifest needs `models` in `kernel_capabilities` too — full
+    /// `agent24_domain::DomainOsManifest` validation (A3-2b) refuses
+    /// `model_access` without it, unlike A3-2a's lenient reader.
+    fn relaxing_manifest(name: &str) -> String {
+        format!(
+            "name: {name}\nversion: \"1\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             impl_kind: attached_process\nkernel_capabilities: [events, models]\n\
+             model_access: remote_allowed\n"
+        )
+    }
+
     #[tokio::test]
     async fn a_relaxing_registration_without_allow_relax_is_403() {
         let state = crate::server::tests::state().await;
         let path = tmp_path();
-        let mut m = manifest("agentear");
-        m.push_str("model_access: remote_allowed\n");
+        let m = relaxing_manifest("agentear");
         let r =
             post_attached_at(State(state), req(serde_json::json!({"manifest": m})), &path).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
@@ -247,8 +334,7 @@ mod tests {
     async fn the_same_relaxing_registration_with_allow_relax_succeeds() {
         let state = crate::server::tests::state().await;
         let path = tmp_path();
-        let mut m = manifest("agentear");
-        m.push_str("model_access: remote_allowed\n");
+        let m = relaxing_manifest("agentear");
         let r = post_attached_at(
             State(state),
             req(serde_json::json!({"manifest": m, "allow_relax": true})),
@@ -321,6 +407,57 @@ mod tests {
         assert_eq!(first.status(), StatusCode::NO_CONTENT);
         let second = delete_attached_at(State(state), AxumPath("agentear".to_owned()), &path).await;
         assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn patch_req(enabled: bool) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({"enabled": enabled})).unwrap(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn patch_disable_then_enable_round_trips_through_the_list_view() {
+        let state = crate::server::tests::state().await;
+        let path = tmp_path();
+        post_attached_at(
+            State(state.clone()),
+            req(serde_json::json!({"manifest": manifest("agentear")})),
+            &path,
+        )
+        .await;
+
+        let disabled = patch_attached_at(
+            State(state.clone()),
+            AxumPath("agentear".to_owned()),
+            patch_req(false),
+            &path,
+        )
+        .await;
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let body = body_json(disabled).await;
+        assert_eq!(body["modules"][0]["attach_status"], "disabled");
+
+        let enabled = patch_attached_at(
+            State(state.clone()),
+            AxumPath("agentear".to_owned()),
+            patch_req(true),
+            &path,
+        )
+        .await;
+        let body = body_json(enabled).await;
+        assert_eq!(body["modules"][0]["attach_status"], "detached");
+
+        let missing = patch_attached_at(
+            State(state),
+            AxumPath("nobody".to_owned()),
+            patch_req(true),
+            &path,
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
