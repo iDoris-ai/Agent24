@@ -202,6 +202,8 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "sessions",
     "shutdown",
     "standing-grants",
+    // ME4-desktop-model-ui: `/api/v1/timings` + `/api/v1/timings/summary`.
+    "timings",
     "tool-overrides",
     "tools",
     "usage",
@@ -1979,6 +1981,8 @@ pub(crate) mod tests {
                 crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
                 crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
             ),
+            events: crate::events::EventsHub::default(),
+            timings: std::sync::Arc::new(crate::timing_recorder::MemoryTimingSink::default()),
         });
         deps
     }

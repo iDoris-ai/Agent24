@@ -43,6 +43,11 @@ pub struct AppState {
     pub module_approval_broker: Arc<crate::module_approval_broker::ModuleApprovalBroker>,
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
+    /// ME4-desktop-model-ui: the timing writer's sink handle — built here
+    /// (spawning its background task), same as `events`/`usage` above, so
+    /// every clone of this `AppState` (including `/api/v1/chat`'s handler)
+    /// shares the SAME writer task rather than each starting its own.
+    pub timings: Arc<dyn crate::timing_recorder::TimingSink>,
     pub store: Store,
     /// What the mounter decided about each domain OS at startup (ME-2b).
     /// Held so `/api/v1/os` can report it — a mount verdict that only reached the
@@ -521,7 +526,20 @@ impl AppState {
             risk_overrides,
             packages_root,
         } = deps;
+        // ME4-desktop-model-ui: spawned here (not in `serve()`) so every
+        // `AppState` — including the one every unit test builds via this
+        // same `new()` — gets a real (if test-scale) writer task, and
+        // `/api/v1/chat` (routes.rs) can reach it as `state.timings` exactly
+        // like `state.events`/`state.usage`.
+        let (timings, _timing_writer_handle) =
+            crate::timing_recorder::TimingRecorder::spawn(store.clone());
         let events = crate::events::EventsHub::default();
+        // ME4-desktop-model-ui follow-up (review M2): a passive observer on
+        // the WS bus, recording through the SAME `timings` sink/writer as
+        // `_a24/model/complete`/`/api/v1/chat` — see `agentear_timings.rs`'s
+        // doc comment for why this is NOT wired through the RPC path.
+        let _agentear_timing_bridge_handle =
+            crate::agentear_timings::spawn_agentear_timing_bridge(events.clone(), timings.clone());
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
         let timeout = std::env::var("A24_APPROVAL_TIMEOUT_SECS")
@@ -592,6 +610,7 @@ impl AppState {
             module_approval_broker,
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
+            timings,
             store,
             // Empty until `serve` replaces it after the mount pass, which happens
             // before the router (and therefore any request handler) can clone this
@@ -736,6 +755,11 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
         .route("/api/v1/usage", get(crate::routes::get_usage))
+        .route("/api/v1/timings", get(crate::routes::get_timings))
+        .route(
+            "/api/v1/timings/summary",
+            get(crate::routes::get_timings_summary),
+        )
         .route("/api/v1/tools", get(crate::routes::get_tools))
         .route(
             "/api/v1/tool-overrides",
@@ -1393,6 +1417,8 @@ pub async fn serve(
             crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
             crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
         ),
+        events: state.events.clone(),
+        timings: state.timings.clone(),
     };
     let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,

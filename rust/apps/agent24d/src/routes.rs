@@ -8,7 +8,7 @@ use agent24_protocol::{
     ChatRequest, ChatResponse, ErrorBody, EventBody, Model, ModelDeltaPayload, RunCompletedPayload,
     RunFailedPayload, RunOutputPayload, RunStartedPayload, Usage,
 };
-use agent24_store::ModelUsageRow;
+use agent24_store::{CallTimingRow, CallTimingSummaryRow, ModelUsageRow};
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
 use axum::http::{Request, StatusCode};
@@ -48,7 +48,15 @@ impl UsageCounters {
 pub async fn get_models(State(state): State<AppState>) -> Response {
     let cancel = state.shutdown.child_token();
     let models: Vec<Model> = state.router.models(&cancel).await;
-    Json(serde_json::json!({ "models": models })).into_response()
+    // ME4-desktop-model-ui: the daemon's OWN `DEFAULT_MODEL` (router.rs
+    // `from_env`), not a client-side guess from this same list — the
+    // desktop topbar was picking `models[0]`-ish from a locally-filtered
+    // oMLX list, which could land on an OCR/VL model oMLX happens to serve
+    // first. `None` when this router was never built with one (tests, a
+    // hand-built router) — a client seeing `null` here must say "unknown",
+    // never fall back to guessing itself.
+    Json(serde_json::json!({ "models": models, "default_model": state.router.default_model() }))
+        .into_response()
 }
 
 /// One `(module, day, served_by)` row's six counters, projected into the
@@ -261,6 +269,189 @@ pub async fn get_usage(State(state): State<AppState>, RawQuery(raw): RawQuery) -
     .into_response()
 }
 
+// ── ME4-desktop-model-ui: GET /api/v1/timings[/summary] ─────────────────────
+
+/// At most one value for `key`, same at-most-one-key semantics as
+/// `module_selector` above (a repeated key is a 400, not "last one wins").
+fn single_query_value(raw: Option<&str>, key: &str) -> Result<Option<String>, ()> {
+    let mut values = form_urlencoded::parse(raw.unwrap_or("").as_bytes())
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned());
+    match (values.next(), values.next()) {
+        (None, _) => Ok(None),
+        (Some(v), None) => Ok(Some(v)),
+        (Some(_), Some(_)) => Err(()),
+    }
+}
+
+const TIMINGS_DEFAULT_LIMIT: u32 = 500;
+/// A ceiling independent of the caller's `limit` — the design ask only fixes
+/// the default; an unbounded `limit=` would otherwise let a caller force an
+/// arbitrarily large response out of a table that can hold up to 100k rows.
+const TIMINGS_MAX_LIMIT: u32 = 5_000;
+
+#[derive(Debug, Serialize)]
+struct TimingWire {
+    id: i64,
+    ts: String,
+    source: String,
+    model_id: Option<String>,
+    tier: Option<String>,
+    served_by: Option<String>,
+    ok: bool,
+    error_kind: Option<String>,
+    step: Option<String>,
+    session_id: Option<String>,
+    seq: Option<u64>,
+    first_token_ms: Option<u64>,
+    total_ms: u64,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+impl From<&CallTimingRow> for TimingWire {
+    fn from(r: &CallTimingRow) -> Self {
+        Self {
+            id: r.id,
+            ts: r.ts.clone(),
+            source: r.source.clone(),
+            model_id: r.model_id.clone(),
+            tier: r.tier.clone(),
+            served_by: r.served_by.clone(),
+            ok: r.ok,
+            error_kind: r.error_kind.clone(),
+            step: r.step.clone(),
+            session_id: r.session_id.clone(),
+            seq: r.seq,
+            first_token_ms: r.first_token_ms,
+            total_ms: r.total_ms,
+            prompt_tokens: r.prompt_tokens,
+            completion_tokens: r.completion_tokens,
+        }
+    }
+}
+
+/// `GET /api/v1/timings?source=&since=&limit=` — raw rows from
+/// `model_call_timings` (migration `0013`), newest first, `limit` capped at
+/// [`TIMINGS_MAX_LIMIT`] and defaulting to [`TIMINGS_DEFAULT_LIMIT`] when
+/// absent or not a valid non-negative integer.
+pub async fn get_timings(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let source = match single_query_value(raw.as_deref(), "source") {
+        Ok(v) => v,
+        Err(()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "at most one source parameter is allowed",
+            );
+        }
+    };
+    let since = match single_query_value(raw.as_deref(), "since") {
+        Ok(v) => v,
+        Err(()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "at most one since parameter is allowed",
+            );
+        }
+    };
+    let limit = match single_query_value(raw.as_deref(), "limit") {
+        Ok(None) => TIMINGS_DEFAULT_LIMIT,
+        Ok(Some(v)) => match v.parse::<u32>() {
+            Ok(n) => n.min(TIMINGS_MAX_LIMIT),
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "limit must be a non-negative integer",
+                );
+            }
+        },
+        Err(()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "at most one limit parameter is allowed",
+            );
+        }
+    };
+
+    match state
+        .store
+        .query_call_timings(source.as_deref(), since.as_deref(), limit)
+        .await
+    {
+        Ok(rows) => {
+            let wire: Vec<TimingWire> = rows.iter().map(TimingWire::from).collect();
+            Json(serde_json::json!({ "timings": wire })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("reading model_call_timings: {e}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "could not read timings",
+            )
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TimingSummaryWire {
+    source: String,
+    model_id: String,
+    count: u64,
+    p50_ms: u64,
+    p95_ms: u64,
+    max_ms: u64,
+}
+
+impl From<&CallTimingSummaryRow> for TimingSummaryWire {
+    fn from(r: &CallTimingSummaryRow) -> Self {
+        Self {
+            source: r.source.clone(),
+            model_id: r.model_id.clone(),
+            count: r.count,
+            p50_ms: r.p50_ms,
+            p95_ms: r.p95_ms,
+            max_ms: r.max_ms,
+        }
+    }
+}
+
+/// `GET /api/v1/timings/summary?since=` — count/p50/p95/max `total_ms`,
+/// grouped by (source, model_id).
+pub async fn get_timings_summary(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let since = match single_query_value(raw.as_deref(), "since") {
+        Ok(v) => v,
+        Err(()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "at most one since parameter is allowed",
+            );
+        }
+    };
+    match state.store.call_timing_summary(since.as_deref()).await {
+        Ok(rows) => {
+            let wire: Vec<TimingSummaryWire> = rows.iter().map(TimingSummaryWire::from).collect();
+            Json(serde_json::json!({ "summary": wire })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("summarizing model_call_timings: {e}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "could not summarize timings",
+            )
+        }
+    }
+}
+
 pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Response {
     // The third copy of this logic used to live inline here; it is byte-for-byte
     // the shared reader's behavior (413 only on a real length-limit hit, 400 for a
@@ -298,6 +489,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         tools: vec![],
         response_format: None,
         max_tokens: None,
+        disable_thinking: false,
     };
     // Transient run: session_id null, full run lifecycle events (SPEC-002 §2)
     let run_id = format!("run_{}", agent24_core::util::ulid());
@@ -312,16 +504,53 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // Child of the daemon shutdown token — shutdown cancels in-flight provider
     // calls; run-level cancellation joins this in C2
     let cancel = state.shutdown.child_token();
+    // ME4-desktop-model-ui: timed the same way `_a24/model/complete` is
+    // (model_callback.rs's `call_start`) — the desktop chat page reads this
+    // back only indirectly today (via `GET /api/v1/timings`, not this
+    // response body — see chat-latency.ts), but the DB row exists regardless
+    // of whether any client asks.
+    let call_start = std::time::Instant::now();
     // Default profile: shareable + simple → local-first tier order, so everyday
     // chat prefers the on-device model and only falls back outward (D2).
+    // `complete_served` (not the plain `complete`) so the timing row below can
+    // report WHICH TIER actually served this call, not just the provider name.
     match state
         .router
-        .complete(TaskProfile::default(), &request, &cancel)
+        .complete_served(TaskProfile::default(), &request, &cancel)
         .await
     {
-        Ok((provider, res)) => {
+        Ok(served) => {
+            let provider = served.provider;
+            let res = served.response;
+            let tier = if served.tier.is_local() {
+                "local"
+            } else {
+                "remote"
+            };
             tracing::debug!("chat served by {provider}");
             state.usage.record(&res.usage);
+            // Review M3: the SAME model_id/latency the timing ledger records
+            // is what `ChatResponse` reports below — one measurement, two
+            // consumers, never two independently-timed/filtered numbers
+            // that could disagree.
+            let latency_ms = call_start.elapsed().as_millis() as u64;
+            let reported_model_id = res
+                .model_id
+                .clone()
+                .filter(|m| m.len() <= crate::model_callback::MODEL_MAX_MODEL_ID_BYTES);
+            state
+                .timings
+                .record(crate::timing_recorder::TimingObservation {
+                    source: "chat".to_owned(),
+                    model_id: reported_model_id.clone(),
+                    tier: Some(tier.to_owned()),
+                    served_by: Some(provider.clone()),
+                    ok: true,
+                    total_ms: latency_ms,
+                    prompt_tokens: Some(res.usage.prompt_tokens),
+                    completion_tokens: Some(res.usage.completion_tokens),
+                    ..Default::default()
+                });
             let text = res.message.content.clone().unwrap_or_default();
             state
                 .events
@@ -342,10 +571,22 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     content: text,
                 },
                 usage: res.usage,
+                model_id: reported_model_id,
+                tier: Some(tier.to_owned()),
+                latency_ms: Some(latency_ms),
             })
             .into_response()
         }
         Err(err) => {
+            state
+                .timings
+                .record(crate::timing_recorder::TimingObservation {
+                    source: "chat".to_owned(),
+                    ok: false,
+                    error_kind: Some(crate::timing_recorder::timing_error_kind(&err).to_owned()),
+                    total_ms: call_start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                });
             let (status, code, message) = match err {
                 ModelError::Unavailable(msg) => (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -510,6 +751,365 @@ mod tests {
         crate::server::build_router_with_modules(state, axum::Router::new())
     }
 
+    // ── ME4-desktop-model-ui: /api/v1/chat and /api/v1/timings[/summary] ────
+
+    /// A provider that always fails — the negative control for
+    /// `post_chat_records_a_timing_row_on_failure_too`.
+    struct FailingStub;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FailingStub {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        async fn complete(
+            &self,
+            _req: &agent24_models::CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, ModelError> {
+            Err(ModelError::Unavailable("stub always fails".into()))
+        }
+        async fn models(&self, _cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    async fn state_with_failing_provider() -> AppState {
+        crate::server::AppState::new(crate::server::AppDeps {
+            token: "testtoken".to_owned(),
+            router: std::sync::Arc::new(ModelRouter::with_defaults(vec![(
+                std::sync::Arc::new(FailingStub),
+                Tier::Local,
+            )])),
+            tools: agent24_tools::ToolRegistry::new(),
+            store: agent24_store::Store::open_memory().await.unwrap(),
+            shutdown: crate::server::Shutdown::new(CancellationToken::new()),
+            guardian: None,
+            memory: None,
+            mcp_servers: Vec::new(),
+            risk_overrides: std::sync::Arc::new(
+                agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
+            ),
+            packages_root: std::sync::Arc::new(
+                tempfile::tempdir().expect("tempdir").path().to_path_buf(),
+            ),
+        })
+    }
+
+    /// Review M3: a provider that DOES report a `model_id` — `Stub` above
+    /// deliberately reports `None` (so tests using it also cover "the
+    /// provider didn't say"), so this is a separate type rather than
+    /// changing `Stub` and risking every other test that already depends on
+    /// its exact shape.
+    struct StubWithModelId;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for StubWithModelId {
+        fn name(&self) -> &str {
+            "stub-with-model"
+        }
+        async fn complete(
+            &self,
+            _req: &agent24_models::CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, ModelError> {
+            Ok(agent24_models::CompletionResponse {
+                message: agent24_models::Msg::assistant(Some("ok".into()), vec![]),
+                usage: Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                    cost_usd: 0.0,
+                },
+                model_id: Some("Qwen3.6-35B-A3B-MLX-8bit".to_owned()),
+            })
+        }
+        async fn models(&self, _cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    async fn state_with_model_id_stub() -> AppState {
+        crate::server::AppState::new(crate::server::AppDeps {
+            token: "testtoken".to_owned(),
+            router: std::sync::Arc::new(ModelRouter::with_defaults(vec![(
+                std::sync::Arc::new(StubWithModelId),
+                Tier::Local,
+            )])),
+            tools: agent24_tools::ToolRegistry::new(),
+            store: agent24_store::Store::open_memory().await.unwrap(),
+            shutdown: crate::server::Shutdown::new(CancellationToken::new()),
+            guardian: None,
+            memory: None,
+            mcp_servers: Vec::new(),
+            risk_overrides: std::sync::Arc::new(
+                agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
+            ),
+            packages_root: std::sync::Arc::new(
+                tempfile::tempdir().expect("tempdir").path().to_path_buf(),
+            ),
+        })
+    }
+
+    /// Polls `query_call_timings` until at least one row for `source`
+    /// appears — the timing writer is a background task (`timing_recorder.rs`),
+    /// same reasoning as `timing_recorder::tests::spawn_writes_every_recorded_observation_to_the_store`.
+    async fn wait_for_timing_rows(
+        store: &agent24_store::Store,
+        source: &str,
+    ) -> Vec<CallTimingRow> {
+        for _ in 0..50 {
+            let rows = store
+                .query_call_timings(Some(source), None, 10)
+                .await
+                .unwrap();
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        store
+            .query_call_timings(Some(source), None, 10)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_chat_records_a_timing_row_on_success() {
+        let state = state_with_stub().await;
+        let token = state.token.to_string();
+        let store = state.store.clone();
+        post_chat_once(router(state), &token).await;
+
+        let rows = wait_for_timing_rows(&store, "chat").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one row for this one /api/v1/chat call"
+        );
+        let row = &rows[0];
+        assert!(row.ok);
+        assert_eq!(row.tier.as_deref(), Some("local"));
+        assert_eq!(row.served_by.as_deref(), Some("stub"));
+        assert_eq!(row.prompt_tokens, Some(3));
+        assert_eq!(row.completion_tokens, Some(2));
+        assert!(row.error_kind.is_none());
+    }
+
+    /// Review M3: `ChatResponse` carries the server-measured `model_id`/
+    /// `tier`/`latency_ms` when the provider reported a model id.
+    #[tokio::test]
+    async fn post_chat_response_reports_model_id_tier_and_latency_when_the_provider_says_one() {
+        let state = state_with_model_id_stub().await;
+        let token = state.token.to_string();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["model_id"], "Qwen3.6-35B-A3B-MLX-8bit");
+        assert_eq!(body["tier"], "local");
+        assert!(body["latency_ms"].as_u64().is_some());
+    }
+
+    /// Review M3 (negative control): when the provider does NOT report a
+    /// model id, `ChatResponse.model_id` must be `null` — never a guessed
+    /// name (e.g. the daemon's own `DEFAULT_MODEL`) standing in for it.
+    #[tokio::test]
+    async fn post_chat_response_model_id_is_null_not_guessed_when_the_provider_reports_none() {
+        let state = state_with_stub().await;
+        let token = state.token.to_string();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["model_id"], serde_json::Value::Null);
+        assert_eq!(
+            body["tier"], "local",
+            "tier is still reported — only model_id is unknown"
+        );
+        assert!(body["latency_ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn post_chat_records_a_failed_timing_row_too() {
+        let state = state_with_failing_provider().await;
+        let token = state.token.to_string();
+        let store = state.store.clone();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let rows = wait_for_timing_rows(&store, "chat").await;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].ok);
+        assert_eq!(rows[0].error_kind.as_deref(), Some("unavailable"));
+        assert!(rows[0].tier.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_timings_returns_recorded_rows_filtered_by_source_and_since() {
+        let state = state_with_stub().await;
+        let token = state.token.to_string();
+        state
+            .store
+            .record_call_timing(&agent24_store::NewCallTiming {
+                ts: "2026-09-25T00:00:00Z".to_owned(),
+                source: "chat".to_owned(),
+                total_ms: 100,
+                ok: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .record_call_timing(&agent24_store::NewCallTiming {
+                ts: "2026-09-27T00:00:00Z".to_owned(),
+                source: "module:agentear".to_owned(),
+                model_id: Some("Qwen3.6-35B-A3B-MLX-8bit".to_owned()),
+                tier: Some("local".to_owned()),
+                total_ms: 842,
+                ok: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (status, body) = get(router(state), &token, "/api/v1/timings").await;
+        assert_eq!(status, StatusCode::OK);
+        let timings = body["timings"].as_array().unwrap();
+        assert_eq!(timings.len(), 2, "both rows, no filter applied");
+        // Newest (module:agentear) first.
+        assert_eq!(timings[0]["source"], "module:agentear");
+        assert_eq!(timings[0]["model_id"], "Qwen3.6-35B-A3B-MLX-8bit");
+        assert_eq!(timings[0]["total_ms"], 842);
+        // Structural privacy check: the wire shape carries ONLY these keys —
+        // never a prompt/response/transcript field.
+        let keys: std::collections::BTreeSet<&str> = timings[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "id",
+                "ts",
+                "source",
+                "model_id",
+                "tier",
+                "served_by",
+                "ok",
+                "error_kind",
+                "step",
+                "session_id",
+                "seq",
+                "first_token_ms",
+                "total_ms",
+                "prompt_tokens",
+                "completion_tokens",
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_timings_source_filter_selects_only_that_source() {
+        let state = state_with_stub().await;
+        let token = state.token.to_string();
+        for (source, ms) in [("chat", 100u64), ("module:agentear", 200), ("chat", 300)] {
+            state
+                .store
+                .record_call_timing(&agent24_store::NewCallTiming {
+                    ts: "2026-09-27T00:00:00Z".to_owned(),
+                    source: source.to_owned(),
+                    total_ms: ms,
+                    ok: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let (status, body) = get(router(state), &token, "/api/v1/timings?source=chat").await;
+        assert_eq!(status, StatusCode::OK);
+        let timings = body["timings"].as_array().unwrap();
+        assert_eq!(timings.len(), 2);
+        assert!(timings.iter().all(|t| t["source"] == "chat"));
+    }
+
+    #[tokio::test]
+    async fn get_timings_summary_groups_by_source_and_model_with_percentiles() {
+        let state = state_with_stub().await;
+        let token = state.token.to_string();
+        for ms in [100u64, 200, 300, 400, 500] {
+            state
+                .store
+                .record_call_timing(&agent24_store::NewCallTiming {
+                    ts: "2026-09-27T00:00:00Z".to_owned(),
+                    source: "chat".to_owned(),
+                    model_id: Some("m1".to_owned()),
+                    total_ms: ms,
+                    ok: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let (status, body) = get(router(state), &token, "/api/v1/timings/summary").await;
+        assert_eq!(status, StatusCode::OK);
+        let summary = body["summary"].as_array().unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0]["source"], "chat");
+        assert_eq!(summary[0]["model_id"], "m1");
+        assert_eq!(summary[0]["count"], 5);
+        assert_eq!(summary[0]["p50_ms"], 300);
+        assert_eq!(summary[0]["max_ms"], 500);
+    }
+
     async fn get(router: axum::Router, token: &str, uri: &str) -> (StatusCode, serde_json::Value) {
         let res = router
             .oneshot(
@@ -558,6 +1158,22 @@ mod tests {
             "total_tokens": 5,
             "cost_usd": 0.0
         })
+    }
+
+    /// ME4-desktop-model-ui: `default_model` rides alongside `models` so the
+    /// desktop topbar can ask the daemon "what's your real default" instead
+    /// of guessing from a client-side model list. `state_with_stub`'s router
+    /// is built with `with_defaults` (never `from_env`), so this pins the
+    /// OTHER half of the contract: a router with no configured default
+    /// reports an explicit `null`, not a missing key.
+    #[tokio::test]
+    async fn get_models_includes_the_daemons_default_model_field() {
+        let state = state_with_stub().await;
+        let token = state.token.to_string();
+        let (status, body) = get(router(state), &token, "/api/v1/models").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["models"].is_array());
+        assert_eq!(body["default_model"], serde_json::Value::Null);
     }
 
     #[tokio::test]

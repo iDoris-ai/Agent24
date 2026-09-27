@@ -3,6 +3,7 @@
 //! B2 scope: serve skeleton — `/api/v1/health`, bearer-token handshake via the
 //! stdout ready line, dynamic port, CancellationToken-driven graceful shutdown.
 
+mod agentear_timings;
 mod approval_callback;
 mod approvals;
 mod attach_commands;
@@ -30,6 +31,7 @@ mod scheduler_callback;
 mod scheduler_deliver;
 mod schedules;
 mod server;
+mod timing_recorder;
 mod usage_recorder;
 
 use clap::{Parser, Subcommand};

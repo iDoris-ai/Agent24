@@ -28,6 +28,11 @@ export type Agent24V1WebSocketEventProtocol = {
       [k: string]: unknown;
     }
   | {
+      payload: ModelCallPayload;
+      type: "model.call";
+      [k: string]: unknown;
+    }
+  | {
       payload: RunCompletedPayload;
       type: "run.completed";
       [k: string]: unknown;
@@ -139,6 +144,46 @@ export interface ModelDeltaPayload {
    * Streaming text increment
    */
   text: string;
+  [k: string]: unknown;
+}
+/**
+ * One completed `_a24/model/complete` call (ME4-desktop-model-ui). Mirrors
+ * `agent24d::model_callback::ModelCompleteResult`'s own `model_id`/`tier`
+ * plus the router's `Served::provider` and the usage sink's token counts —
+ * never the call's `text`/messages, which stay off the WS entirely.
+ */
+export interface ModelCallPayload {
+  completion_tokens: number | null;
+  latency_ms: number;
+  /**
+   * Provider-reported model id, when one was reported (mirrors
+   * `ModelCompleteResult::model_id`) — `None` when the provider didn't
+   * say, or when no provider ever answered this call.
+   */
+  model_id: string | null;
+  /**
+   * The module that placed the call (`_a24/model/complete`'s caller,
+   * e.g. `"agentear"`).
+   */
+  module: string;
+  /**
+   * Whether the RPC call itself succeeded (a provider answering but the
+   * kernel then withholding the result — oversize, the LocalOnly
+   * tripwire — counts as `false`, same as `UsageOutcome::FailedAfterServe`).
+   */
+  ok: boolean;
+  prompt_tokens: number | null;
+  /**
+   * Which provider actually served the call (`Served::provider`, e.g.
+   * `"omlx"`/`"ollama"`) — `None` for the same reason `tier` can be.
+   */
+  served_by: string | null;
+  /**
+   * Open enum, `"local" | "remote"` (matches the RPC result's own
+   * `tier`) — `None` when the call failed before any provider served it,
+   * so no tier was ever decided.
+   */
+  tier: string | null;
   [k: string]: unknown;
 }
 export interface RunCompletedPayload {

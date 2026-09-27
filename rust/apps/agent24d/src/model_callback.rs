@@ -19,6 +19,7 @@ use agent24_models::router::{Complexity, ModelRouter, Privacy, TaskProfile, Tier
 use agent24_models::{CompletionRequest, ModelError, Msg, ResponseFormat};
 use agent24_os_proto::drain::{Generation, LifecycleTimeout, bind_to_lifecycle};
 use agent24_os_proto::rpc::{CallFuture, ErrorKind, Handler, RpcError};
+use agent24_protocol::{EventBody, ModelCallPayload};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -146,6 +147,19 @@ impl ModelCompleteParams {
 
     fn into_request(self) -> (CompletionRequest, Complexity, Option<String>) {
         let max = self.max_tokens.unwrap_or(MODEL_DEFAULT_MAX_TOKENS);
+        let complexity = match self.complexity {
+            Some(WireComplexity::Complex) => Complexity::Complex,
+            Some(WireComplexity::Simple) | None => Complexity::Simple,
+        };
+        // Review M1: gated on an EXPLICIT `complexity: "simple"` in the wire
+        // params, NOT on the derived routing `complexity` above — that
+        // derivation defaults an ABSENT complexity to `Simple` for TIER
+        // PREFERENCE only (pre-existing, untouched behavior: an old caller
+        // that never mentions complexity still gets simple-task routing). A
+        // module that says nothing about complexity gets the pre-M4
+        // behavior here too: thinking is never touched, only a module that
+        // explicitly opts into `simple` does.
+        let disable_thinking = matches!(self.complexity, Some(WireComplexity::Simple));
         let request = CompletionRequest {
             messages: self
                 .messages
@@ -166,10 +180,13 @@ impl ModelCompleteParams {
                 },
             ),
             max_tokens: NonZeroU32::new(max),
-        };
-        let complexity = match self.complexity {
-            Some(WireComplexity::Complex) => Complexity::Complex,
-            Some(WireComplexity::Simple) | None => Complexity::Simple,
+            // ME4-S2-thinking: AgentEar found Qwen3-family reasoning models
+            // narrating their whole `<think>` monologue out loud in the voice
+            // scene. An explicit `complexity: "simple"` is the module's own
+            // signal that a fast, direct answer is wanted — gate on exactly
+            // that (see `disable_thinking` above), never on which module is
+            // calling, and never on an absent/defaulted complexity.
+            disable_thinking,
         };
         (request, complexity, self.request_id)
     }
@@ -412,6 +429,20 @@ pub struct ModelCallbackDeps {
     /// the module's own drain allows.
     pub cancel_root: CancellationToken,
     pub admission: Arc<ModelAdmission>,
+    /// ME4-desktop-model-ui: broadcast one `EventBody::ModelCall` per
+    /// completed `_a24/model/complete` call (ok or failed) — the kernel's
+    /// own visibility into which model/tier actually served a module's call,
+    /// with NO prompt/response content, so the desktop's "语音" panel and
+    /// any other WS client can show it without polling. `EventsHub` is
+    /// `Clone` (an `Arc`-backed broadcast sender), so this is cheap to carry
+    /// per-grant like every other field here.
+    pub events: crate::events::EventsHub,
+    /// ME4-desktop-model-ui: the same completed-call facts as `events`
+    /// above, ALSO persisted (`agent24-store`'s `model_call_timings`) for
+    /// after-the-fact "which step is slow" debugging — a WS event only ever
+    /// reaches a client that happens to be connected at that instant, while
+    /// this reaches `GET /api/v1/timings` regardless.
+    pub timings: Arc<dyn crate::timing_recorder::TimingSink>,
 }
 
 /// Mount-level: built once per mounted module (4.2.2b2's `mount_package`),
@@ -574,6 +605,74 @@ pub fn map_model_error(module: &str, e: &ModelError) -> RpcError {
     }
 }
 
+/// ME4-desktop-model-ui: build one `ModelCallPayload` for the WS broadcast at
+/// the end of a completed call. `served` is `None` when the call failed
+/// before any provider ever answered (a router-level `Err`) — there is
+/// genuinely no tier/provider to report then, unlike the RPC result's own
+/// `tier`/`model_id`, which only exist on the success path. Bounds
+/// `model_id` the same way `ModelCompleteResult` does (v3 N4) — a
+/// provider-reported id long enough to be suspicious is dropped, not
+/// truncated into naming a model that doesn't exist.
+fn model_call_payload(
+    module: &str,
+    served: Option<(Served, &str)>,
+    model_id: Option<&str>,
+    ok: bool,
+    latency_ms: u64,
+    tokens: Option<(u64, u64)>,
+) -> ModelCallPayload {
+    ModelCallPayload {
+        module: module.to_owned(),
+        model_id: model_id
+            .filter(|m| m.len() <= MODEL_MAX_MODEL_ID_BYTES)
+            .map(str::to_owned),
+        tier: served.map(|(s, _)| match s {
+            Served::Local => "local".to_owned(),
+            Served::Remote => "remote".to_owned(),
+        }),
+        served_by: served.map(|(_, provider)| provider.to_owned()),
+        ok,
+        latency_ms,
+        prompt_tokens: tokens.map(|(p, _)| p),
+        completion_tokens: tokens.map(|(_, c)| c),
+    }
+}
+
+/// The persisted-ledger counterpart of [`model_call_payload`] — same facts,
+/// same "no content, ever" guarantee, plus `error_kind` (which the WS event
+/// doesn't carry) so `GET /api/v1/timings` can distinguish WHY a call
+/// failed, not just that it did.
+fn timing_observation(
+    module: &str,
+    served: Option<(Served, &str)>,
+    model_id: Option<&str>,
+    ok: bool,
+    error_kind: Option<&str>,
+    latency_ms: u64,
+    tokens: Option<(u64, u64)>,
+) -> crate::timing_recorder::TimingObservation {
+    crate::timing_recorder::TimingObservation {
+        source: format!("module:{module}"),
+        model_id: model_id
+            .filter(|m| m.len() <= MODEL_MAX_MODEL_ID_BYTES)
+            .map(str::to_owned),
+        tier: served.map(|(s, _)| match s {
+            Served::Local => "local".to_owned(),
+            Served::Remote => "remote".to_owned(),
+        }),
+        served_by: served.map(|(_, provider)| provider.to_owned()),
+        ok,
+        error_kind: error_kind.map(str::to_owned),
+        step: None,
+        session_id: None,
+        seq: None,
+        first_token_ms: None,
+        total_ms: latency_ms,
+        prompt_tokens: tokens.map(|(p, _)| p),
+        completion_tokens: tokens.map(|(_, c)| c),
+    }
+}
+
 fn forbidden() -> RpcError {
     RpcError::application(
         ErrorKind::Forbidden,
@@ -668,6 +767,10 @@ impl Handler for ModelCompleteHandler {
             let cancel = grant.deps.cancel_root.child_token(); // v2 M1
             let _cancel_on_drop = cancel.clone().drop_guard(); // §3.3
             let ticket = UsageTicket::new(grant.deps.usage.clone(), grant.module.clone()); // §6.3
+            // ME4-desktop-model-ui: measures the router call itself, not the
+            // admission/rate-limit checks above it — this is "how long the
+            // model took", the number the desktop panel shows.
+            let call_start = std::time::Instant::now();
 
             let served = match bind_to_lifecycle(
                 lifecycle,
@@ -681,6 +784,27 @@ impl Handler for ModelCompleteHandler {
                         ModelError::Cancelled => UsageOutcome::Cancelled,
                         _ => UsageOutcome::Failed,
                     });
+                    let latency_ms = call_start.elapsed().as_millis() as u64;
+                    grant
+                        .deps
+                        .events
+                        .broadcast(EventBody::ModelCall(model_call_payload(
+                            &grant.module,
+                            None, // no provider ever answered
+                            None,
+                            false,
+                            latency_ms,
+                            None,
+                        )));
+                    grant.deps.timings.record(timing_observation(
+                        &grant.module,
+                        None,
+                        None,
+                        false,
+                        Some(crate::timing_recorder::timing_error_kind(&e)),
+                        latency_ms,
+                        None,
+                    ));
                     return Err(map_model_error(&grant.module, &e)); // §7
                 }
                 Ok(Ok(served)) => served,
@@ -701,6 +825,27 @@ impl Handler for ModelCompleteHandler {
                     prompt_tokens: p,
                     completion_tokens: c,
                 });
+                let latency_ms = call_start.elapsed().as_millis() as u64;
+                grant
+                    .deps
+                    .events
+                    .broadcast(EventBody::ModelCall(model_call_payload(
+                        &grant.module,
+                        Some((s, &served.provider)),
+                        served.response.model_id.as_deref(),
+                        false,
+                        latency_ms,
+                        Some((p, c)),
+                    )));
+                grant.deps.timings.record(timing_observation(
+                    &grant.module,
+                    Some((s, &served.provider)),
+                    served.response.model_id.as_deref(),
+                    false,
+                    Some("local_only_tripwire"),
+                    latency_ms,
+                    Some((p, c)),
+                ));
                 return Err(RpcError::internal(
                     "the kernel routed this call incorrectly; the result is withheld",
                 ));
@@ -740,6 +885,27 @@ impl Handler for ModelCompleteHandler {
                     prompt_tokens: p,
                     completion_tokens: c,
                 });
+                let latency_ms = call_start.elapsed().as_millis() as u64;
+                grant
+                    .deps
+                    .events
+                    .broadcast(EventBody::ModelCall(model_call_payload(
+                        &grant.module,
+                        Some((s, &served.provider)),
+                        result.model_id.as_deref(),
+                        false,
+                        latency_ms,
+                        Some((p, c)),
+                    )));
+                grant.deps.timings.record(timing_observation(
+                    &grant.module,
+                    Some((s, &served.provider)),
+                    result.model_id.as_deref(),
+                    false,
+                    Some("response_too_large"),
+                    latency_ms,
+                    Some((p, c)),
+                ));
                 return Err(unavailable(
                     UnavailableCause::ResponseTooLarge,
                     "the model's answer exceeds the size a callback result may carry; lower max_tokens",
@@ -750,6 +916,27 @@ impl Handler for ModelCompleteHandler {
                 prompt_tokens: p,
                 completion_tokens: c,
             });
+            let latency_ms = call_start.elapsed().as_millis() as u64;
+            grant
+                .deps
+                .events
+                .broadcast(EventBody::ModelCall(model_call_payload(
+                    &grant.module,
+                    Some((s, &served.provider)),
+                    result.model_id.as_deref(),
+                    true,
+                    latency_ms,
+                    Some((p, c)),
+                )));
+            grant.deps.timings.record(timing_observation(
+                &grant.module,
+                Some((s, &served.provider)),
+                result.model_id.as_deref(),
+                true,
+                None,
+                latency_ms,
+                Some((p, c)),
+            ));
             Ok(value)
         })
     }
@@ -1042,6 +1229,8 @@ mod tests {
                 MODEL_MAX_IN_FLIGHT_GLOBAL,
                 MODEL_MAX_IN_FLIGHT_PER_MODULE,
             ),
+            events: crate::events::EventsHub::default(),
+            timings: std::sync::Arc::new(crate::timing_recorder::MemoryTimingSink::default()),
         }
     }
 
@@ -1052,6 +1241,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         }
     }
 
@@ -1156,6 +1346,8 @@ mod tests {
             usage: sink.clone(),
             cancel_root: cancel_root.clone(),
             admission: admission.clone(),
+            events: crate::events::EventsHub::default(),
+            timings: std::sync::Arc::new(crate::timing_recorder::MemoryTimingSink::default()),
         };
         let grant = ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, deps);
         assert_eq!(grant.module, "sin90");
@@ -1255,6 +1447,47 @@ mod handler_tests {
         let mut p = ok_params();
         p["response_format"] = json!({"type": "json_object"});
         assert!(ModelCompleteParams::parse(p).is_err());
+    }
+
+    // ---- review M1: disable_thinking requires an EXPLICIT complexity: "simple" ----
+
+    #[test]
+    fn disable_thinking_requires_an_explicit_simple_complexity_not_an_absent_one() {
+        // Absent complexity: routing still defaults to Simple (untouched,
+        // pre-existing behavior — an old caller that never mentions
+        // complexity keeps today's simple-task tier preference), but
+        // disable_thinking must stay false — a module that said nothing
+        // about complexity gets the pre-M4 behavior: thinking untouched.
+        let (req, cx, _) = ModelCompleteParams::parse(ok_params())
+            .unwrap()
+            .into_request();
+        assert!(
+            !req.disable_thinking,
+            "an absent complexity must NOT disable thinking"
+        );
+        assert_eq!(
+            cx,
+            Complexity::Simple,
+            "routing default for absent complexity is unchanged"
+        );
+
+        // Explicit "simple": disables thinking.
+        let mut p = ok_params();
+        p["complexity"] = json!("simple");
+        let (req, _, _) = ModelCompleteParams::parse(p).unwrap().into_request();
+        assert!(
+            req.disable_thinking,
+            "an explicit complexity: simple must disable thinking"
+        );
+
+        // Explicit "complex": never disables thinking.
+        let mut p = ok_params();
+        p["complexity"] = json!("complex");
+        let (req, _, _) = ModelCompleteParams::parse(p).unwrap().into_request();
+        assert!(
+            !req.disable_thinking,
+            "complexity: complex must never disable thinking"
+        );
     }
 
     /// `Handler::call_timeout` reports the literal 120s (§5.2). The
@@ -1367,8 +1600,40 @@ mod handler_tests {
                     MODEL_MAX_IN_FLIGHT_GLOBAL,
                     MODEL_MAX_IN_FLIGHT_PER_MODULE,
                 ),
+                events: crate::events::EventsHub::default(),
+                timings: std::sync::Arc::new(crate::timing_recorder::MemoryTimingSink::default()),
             },
             sink,
+        )
+    }
+
+    /// Like [`deps`], but also hands back the CONCRETE timing sink — needed
+    /// only by the ME4-desktop-model-ui test that inspects recorded timing
+    /// rows (a `dyn TimingSink` trait object can't be downcast back to
+    /// `MemoryTimingSink` without this second, typed handle).
+    fn deps_with_timing_sink(
+        router: Arc<ModelRouter>,
+    ) -> (
+        ModelCallbackDeps,
+        Arc<MemoryUsageSink>,
+        Arc<crate::timing_recorder::MemoryTimingSink>,
+    ) {
+        let sink = Arc::new(MemoryUsageSink::default());
+        let timings = Arc::new(crate::timing_recorder::MemoryTimingSink::default());
+        (
+            ModelCallbackDeps {
+                router,
+                usage: sink.clone(),
+                cancel_root: CancellationToken::new(),
+                admission: ModelAdmission::new(
+                    MODEL_MAX_IN_FLIGHT_GLOBAL,
+                    MODEL_MAX_IN_FLIGHT_PER_MODULE,
+                ),
+                events: crate::events::EventsHub::default(),
+                timings: timings.clone(),
+            },
+            sink,
+            timings,
         )
     }
 
@@ -1444,6 +1709,103 @@ mod handler_tests {
         assert!(matches!(recs[0].1, UsageOutcome::Failed));
         assert!(matches!(recs[1].1, UsageOutcome::Failed));
         assert!(matches!(recs[2].1, UsageOutcome::Ok { .. }));
+    }
+
+    // ---- ME4-desktop-model-ui: one `model.call` WS event per completed call ----
+
+    #[tokio::test]
+    async fn a_successful_call_broadcasts_exactly_one_model_call_event_with_no_content() {
+        let local = stub("l", Behave::Ok);
+        let (d, _sink) = deps(router(vec![(local.clone(), Tier::Local)]));
+        let mut rx = d.events.subscribe();
+        let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
+        let v = h.call(ok_params()).await.unwrap();
+        assert_eq!(v["tier"], json!("local"));
+
+        let (_, body) = rx.try_recv().expect("one model.call event broadcast");
+        assert_eq!(body.wire_type(), "model.call");
+        let EventBody::ModelCall(payload) = body else {
+            unreachable!("wire_type() just asserted this is ModelCall");
+        };
+        assert_eq!(payload.module, "sin90");
+        assert_eq!(payload.tier.as_deref(), Some("local"));
+        assert_eq!(payload.served_by.as_deref(), Some("l"));
+        assert_eq!(payload.model_id.as_deref(), Some("stub-actual-7b"));
+        assert!(payload.ok);
+        assert_eq!(payload.prompt_tokens, Some(3));
+        assert_eq!(payload.completion_tokens, Some(2));
+
+        // Exactly one event for this one call.
+        assert!(rx.try_recv().is_err(), "no second event for a single call");
+
+        // Privacy: the wire payload carries ONLY these fields — never the
+        // call's text/messages, even though the stub's own reply ("ok") and
+        // the module's request both flowed through this same handler.
+        let json = serde_json::to_value(&payload).unwrap();
+        let keys: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "module",
+                "model_id",
+                "tier",
+                "served_by",
+                "ok",
+                "latency_ms",
+                "prompt_tokens",
+                "completion_tokens",
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    // ---- ME4-desktop-model-ui: the persisted-ledger counterpart ----
+
+    #[tokio::test]
+    async fn a_successful_call_also_records_exactly_one_timing_row() {
+        let local = stub("l", Behave::Ok);
+        let (d, _usage_sink, timings) = deps_with_timing_sink(router(vec![(local, Tier::Local)]));
+        let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
+        h.call(ok_params()).await.unwrap();
+
+        let rows = timings.take();
+        assert_eq!(rows.len(), 1, "exactly one timing row per completed call");
+        let row = &rows[0];
+        assert_eq!(row.source, "module:sin90");
+        assert_eq!(row.tier.as_deref(), Some("local"));
+        assert_eq!(row.served_by.as_deref(), Some("l"));
+        assert_eq!(row.model_id.as_deref(), Some("stub-actual-7b"));
+        assert!(row.ok);
+        assert!(row.error_kind.is_none());
+        assert_eq!(row.prompt_tokens, Some(3));
+        assert_eq!(row.completion_tokens, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_router_level_failure_records_one_failed_timing_row_with_no_tier() {
+        let remote = stub("stub-SECRET", Behave::Ok);
+        // LocalOnly against a Remote-only router: the router itself refuses
+        // (empty tier_order) before ever reaching a provider — same failure
+        // shape `local_only_never_reaches_a_remote_provider_and_remote_allowed_does`
+        // exercises for the WS event above.
+        let (d, _usage_sink, timings) = deps_with_timing_sink(router(vec![(remote, Tier::Remote)]));
+        let h = handler(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d));
+        let err = h.call(ok_params()).await.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Unavailable));
+
+        let rows = timings.take();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.source, "module:sin90");
+        assert!(row.tier.is_none(), "no provider ever answered");
+        assert!(!row.ok);
+        assert_eq!(row.error_kind.as_deref(), Some("unavailable"));
     }
 
     // ---- J7: cancellation reaches the provider; recorded on `MemoryUsageSink` ----

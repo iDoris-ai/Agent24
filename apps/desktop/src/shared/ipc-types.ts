@@ -26,6 +26,11 @@ export const IpcChannels = {
   // the main-process log's current state (main/agentear-log.ts), so
   // navigating away and back doesn't lose it. Ordinary ipcMain.handle().
   AgentEarSnapshot: 'agentear:snapshot',
+  // ME4-desktop-model-ui: push/pull pair for the kernel's `model.call` WS
+  // events (agent24d/src/model_callback.rs), mirroring AgentEarEvent /
+  // AgentEarSnapshot's shape exactly — see main/model-call-log.ts.
+  ModelCallEvent: 'model-call:event',
+  ModelCallSnapshot: 'model-call:snapshot',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
@@ -183,6 +188,23 @@ export interface AttachedView {
 
 export interface AttachedListResponse {
   modules: AttachedView[]
+}
+
+/** `model.call` WS event payload (agent24-protocol's `ModelCallPayload`,
+ * `rust/crates/agent24-protocol/src/events.rs`) — one completed
+ * `_a24/model/complete` call. Kernel-broadcast, NOT wrapped in the `module`
+ * envelope like AgentEar's own events (it's a first-party event type, not a
+ * module-namespaced one) — see main/agentear-events.ts's `parseModelCallFrame`.
+ * Deliberately carries no prompt/response content. */
+export interface ModelCallEnvelope {
+  module: string
+  model_id: string | null
+  tier: string | null
+  served_by: string | null
+  ok: boolean
+  latency_ms: number
+  prompt_tokens: number | null
+  completion_tokens: number | null
 }
 
 /** `agentear.event/1` envelope (AgentEar contracts/schema/agentear.event.v1.schema.json,

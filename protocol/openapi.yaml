@@ -1308,6 +1308,18 @@ components:
           $ref: "#/components/schemas/ChatMessage"
         usage:
           $ref: "#/components/schemas/Usage"
+        model_id:
+          type: [string, "null"]
+          description: >-
+            Provider-reported model id that actually served this call, when
+            the provider reported one; null otherwise. Clients must not
+            guess a name (e.g. the daemon's DEFAULT_MODEL) when this is null.
+        tier:
+          type: [string, "null"]
+          description: Open enum, "local" | "remote"; null when unknown.
+        latency_ms:
+          type: [integer, "null"]
+          description: Server-measured wall-clock milliseconds for this call.
 
     Session:
       type: object

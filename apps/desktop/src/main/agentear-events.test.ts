@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
   parseAgentEarFrame,
+  parseModelCallFrame,
   nextBackoffMs,
   AGENTEAR_MODULE_NAME,
   AGENTEAR_EVENT_KIND,
@@ -66,6 +67,58 @@ describe('parseAgentEarFrame', () => {
   it('returns null when payload is missing or not an object', () => {
     expect(parseAgentEarFrame(JSON.stringify({ type: 'module' }))).toBeNull()
     expect(parseAgentEarFrame(JSON.stringify({ type: 'module', payload: 'x' }))).toBeNull()
+  })
+})
+
+function modelCallFrame(overrides: Partial<{ type: string; module: string }> = {}): string {
+  return JSON.stringify({
+    v: 1,
+    seq: 0,
+    ts: '2026-09-27T00:00:00Z',
+    type: overrides.type ?? 'model.call',
+    payload: {
+      module: overrides.module ?? AGENTEAR_MODULE_NAME,
+      model_id: 'Qwen3.6-35B-A3B-MLX-8bit',
+      tier: 'local',
+      served_by: 'omlx',
+      ok: true,
+      latency_ms: 842,
+      prompt_tokens: 12,
+      completion_tokens: 8,
+    },
+  })
+}
+
+describe('parseModelCallFrame', () => {
+  it('unwraps a well-formed model.call event scoped to agentear', () => {
+    expect(parseModelCallFrame(modelCallFrame())).toEqual({
+      module: AGENTEAR_MODULE_NAME,
+      model_id: 'Qwen3.6-35B-A3B-MLX-8bit',
+      tier: 'local',
+      served_by: 'omlx',
+      ok: true,
+      latency_ms: 842,
+      prompt_tokens: 12,
+      completion_tokens: 8,
+    })
+  })
+
+  it('returns null for a model.call event from a different module', () => {
+    expect(parseModelCallFrame(modelCallFrame({ module: 'some-other-module' }))).toBeNull()
+  })
+
+  it('returns null for a non-model.call WS event (e.g. run.started)', () => {
+    const frame = JSON.stringify({ v: 1, seq: 0, ts: 't', type: 'run.started', payload: { run_id: 'r1' } })
+    expect(parseModelCallFrame(frame)).toBeNull()
+  })
+
+  it('returns null for the module-namespaced envelope (a different, unrelated wrapper)', () => {
+    expect(parseModelCallFrame(moduleFrame())).toBeNull()
+  })
+
+  it('returns null for unparseable JSON or a non-object payload', () => {
+    expect(parseModelCallFrame('{not json')).toBeNull()
+    expect(parseModelCallFrame(JSON.stringify({ type: 'model.call', payload: 'x' }))).toBeNull()
   })
 })
 
@@ -144,5 +197,42 @@ describe('AgentEarEventBridge.stop() — M4', () => {
     const openSocket = (bridge as unknown as { socket: FakeWebSocket | null }).socket
     if (openSocket) openSocket.readyState = FakeWebSocket.OPEN
     expect(() => bridge.stop()).not.toThrow()
+  })
+})
+
+describe('AgentEarEventBridge — dispatches each frame to its own callback (ME4-desktop-model-ui)', () => {
+  it('routes an agentear module frame to onEnvelope, not onModelCall', () => {
+    const onEnvelope = vi.fn()
+    const onModelCall = vi.fn()
+    const bridge = new AgentEarEventBridge(onEnvelope, onModelCall)
+    bridge.start()
+    const socket = (bridge as unknown as { socket: FakeWebSocket }).socket
+    socket.emit('message', Buffer.from(moduleFrame()))
+    expect(onEnvelope).toHaveBeenCalledWith(AGENTEAR_ENVELOPE)
+    expect(onModelCall).not.toHaveBeenCalled()
+    bridge.stop()
+  })
+
+  it('routes a model.call frame to onModelCall, not onEnvelope', () => {
+    const onEnvelope = vi.fn()
+    const onModelCall = vi.fn()
+    const bridge = new AgentEarEventBridge(onEnvelope, onModelCall)
+    bridge.start()
+    const socket = (bridge as unknown as { socket: FakeWebSocket }).socket
+    socket.emit('message', Buffer.from(modelCallFrame()))
+    expect(onModelCall).toHaveBeenCalledWith(
+      expect.objectContaining({ module: AGENTEAR_MODULE_NAME, model_id: 'Qwen3.6-35B-A3B-MLX-8bit' }),
+    )
+    expect(onEnvelope).not.toHaveBeenCalled()
+    bridge.stop()
+  })
+
+  it('is safe to omit onModelCall entirely (every pre-existing call site)', () => {
+    const onEnvelope = vi.fn()
+    const bridge = new AgentEarEventBridge(onEnvelope)
+    bridge.start()
+    const socket = (bridge as unknown as { socket: FakeWebSocket }).socket
+    expect(() => socket.emit('message', Buffer.from(modelCallFrame()))).not.toThrow()
+    bridge.stop()
   })
 })

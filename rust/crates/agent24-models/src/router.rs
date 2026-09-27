@@ -121,6 +121,14 @@ pub struct ModelRouter {
     health: Mutex<HashMap<String, Health>>,
     base_cooldown: Duration,
     max_cooldown: Duration,
+    /// ME4-desktop-model-ui: the `DEFAULT_MODEL` env var this router was
+    /// built with, for a client (desktop's topbar) to ask "what does Agent24
+    /// actually default to" instead of guessing from a locally-detected
+    /// model list. Only [`Self::from_env`] sets it — a hand-built router
+    /// (every other constructor, mostly tests and per-module
+    /// `with_separate_health()` copies) has no single "the" default model to
+    /// report, so this stays `None` there rather than a misleading guess.
+    default_model: Option<String>,
 }
 
 /// Absolute ceiling on any cooldown, independent of the caller's `max_cooldown`
@@ -217,6 +225,7 @@ impl ModelRouter {
             health: Mutex::new(HashMap::new()),
             base_cooldown,
             max_cooldown,
+            default_model: None,
         }
     }
 
@@ -241,7 +250,18 @@ impl ModelRouter {
             health: Mutex::new(HashMap::new()),
             base_cooldown: self.base_cooldown,
             max_cooldown: self.max_cooldown,
+            default_model: self.default_model.clone(),
         }
+    }
+
+    /// ME4-desktop-model-ui: the `DEFAULT_MODEL` this router was built with
+    /// ([`Self::from_env`] only) — `None` for a hand-built router (tests,
+    /// and every `with_separate_health()` copy of one that was never given
+    /// one either). Never a guess: a caller that gets `None` back has no
+    /// single "the default model" to show and must say so, not fall back to
+    /// picking one itself.
+    pub fn default_model(&self) -> Option<&str> {
+        self.default_model.as_deref()
     }
 
     /// Convenience default: 2s base, 60s cap. Same PRIVACY CONTRACT as
@@ -273,24 +293,53 @@ impl ModelRouter {
         // v3 N1: a provider labeled Local talks ONLY to its loopback address —
         // no proxy, no redirect. v3 L-e: its reported tier string is the
         // judged tier, not a hard-coded "local".
-        let build =
-            |name: &str, url: String, key: Option<String>, tier: Tier| -> Arc<dyn ModelProvider> {
-                let p = crate::OpenAiCompatProvider::new(
-                    name,
-                    url,
-                    key,
-                    tier_label(tier),
-                    default_model.clone(),
-                );
-                Arc::new(if tier.is_local() {
-                    p.loopback_only()
-                } else {
-                    p
-                })
+        // Review H2: `chat_template_kwargs` (the `enable_thinking: false`
+        // convention) is an oMLX/mlx-lm-server-specific extension — NOT part
+        // of the OpenAI-compatible contract every provider here claims to
+        // speak. Sending it to a hosted/managed OpenAI-compatible endpoint
+        // (a remote provider, or even a local one that isn't actually oMLX)
+        // risks a hard 400 from a strict server. So this is opt-in per
+        // PROVIDER INSTANCE (`allow_ctk`), not derived from `tier` — a
+        // future non-oMLX local provider must NOT inherit it just for being
+        // local.
+        let build = |name: &str,
+                     url: String,
+                     key: Option<String>,
+                     tier: Tier,
+                     allow_ctk: bool|
+         -> Arc<dyn ModelProvider> {
+            let p = crate::OpenAiCompatProvider::new(
+                name,
+                url,
+                key,
+                tier_label(tier),
+                default_model.clone(),
+            );
+            let p = if tier.is_local() {
+                p.loopback_only()
+            } else {
+                p
             };
-        let omlx = build("omlx", omlx_url, Some(omlx_key), omlx_tier);
-        let ollama = build("ollama", ollama_url, None, ollama_tier);
-        Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)])
+            let p = if allow_ctk {
+                p.supports_chat_template_kwargs()
+            } else {
+                p
+            };
+            Arc::new(p)
+        };
+        // oMLX only, and only when it actually judged as local (loopback) —
+        // a remote-pointed OMLX_URL never gets it either.
+        let omlx = build(
+            "omlx",
+            omlx_url,
+            Some(omlx_key),
+            omlx_tier,
+            omlx_tier.is_local(),
+        );
+        let ollama = build("ollama", ollama_url, None, ollama_tier, false);
+        let mut router = Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)]);
+        router.default_model = Some(default_model);
+        router
     }
 
     /// Provider indices to try, in order, for `profile` at `now`: tier
@@ -537,6 +586,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         }
     }
 
@@ -873,6 +923,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         }
     }
 
@@ -960,6 +1011,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         };
         let c = CancellationToken::new();
         let (tp, _) = thread_stub(redirect.clone());
@@ -991,6 +1043,19 @@ mod tests {
     fn from_env_reports_the_judged_tier() {
         assert_eq!(tier_label(env_local_tier("http://0.0.0.0:1")), "remote");
         assert_eq!(tier_label(env_local_tier("http://127.0.0.1:1")), "local");
+    }
+
+    /// `from_env()`'s own env-var manipulation is exercised only via the
+    /// child-process tests above (edition 2024 forbids `set_var` outside
+    /// `unsafe`, which this workspace forbids outright) — this just pins the
+    /// getter's default for every OTHER constructor, so a client asking a
+    /// hand-built or per-module router "what's the default model" gets
+    /// `None`, never a stale or made-up guess.
+    #[test]
+    fn default_model_is_none_unless_built_from_env() {
+        let r = ModelRouter::with_defaults(vec![]);
+        assert_eq!(r.default_model(), None);
+        assert_eq!(r.with_separate_health().default_model(), None);
     }
 
     #[test]

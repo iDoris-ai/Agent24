@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "seq": 7,
+  "ts": "2026-07-23T12:00:00Z",
+  "type": "model.call",
+  "payload": {
+    "module": "agentear",
+    "model_id": "Qwen3.6-35B-A3B-MLX-8bit",
+    "tier": "local",
+    "served_by": "omlx",
+    "ok": true,
+    "latency_ms": 842,
+    "prompt_tokens": 120,
+    "completion_tokens": 37
+  }
+}
