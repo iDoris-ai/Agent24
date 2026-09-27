@@ -501,15 +501,17 @@ mod tests {
 mod windows_tests {
     use super::*;
     use crate::target::{ExitObservation, TreeObservation};
-    use std::{collections::BTreeMap, path::Path, time::Duration};
-    use tokio::io::AsyncReadExt;
+    use crate::windows_test_io::{powershell_executable, read_pair_then_cleanup};
+    use std::{
+        collections::BTreeMap, io::Read as _, path::Path, sync::mpsc, thread, time::Duration,
+    };
 
     fn request(cwd: &Path) -> Request {
         let system_root = std::env::var("SystemRoot").expect("SystemRoot");
         Request::Launch {
             version: 1,
             request_id: 17,
-            executable: String::from("powershell.exe"),
+            executable: powershell_executable().display().to_string(),
             cwd: cwd.display().to_string(),
             argv: vec![
                 String::from("-NoLogo"),
@@ -530,9 +532,13 @@ mod windows_tests {
     fn descendant_request(cwd: &Path) -> Request {
         let mut request = request(cwd);
         if let Request::Launch { argv, env, .. } = &mut request {
+            let child_powershell = powershell_executable()
+                .display()
+                .to_string()
+                .replace('\'', "''");
             argv[3] = String::from("-Command");
-            argv[4] = String::from(
-                "$child = Start-Process \"$PSHOME\\powershell.exe\" -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; [Console]::Out.Write('ready'); [Console]::Out.Flush()",
+            argv[4] = format!(
+                "$child = Start-Process '{child_powershell}' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; [Console]::Out.Write('ready'); [Console]::Out.Flush(); [Console]::Error.Write('error'); [Console]::Error.Flush()"
             );
             argv.truncate(5);
             env.remove("SIDE");
@@ -557,8 +563,8 @@ mod windows_tests {
         panic!("Job tree was not reaped before deadline");
     }
 
-    #[tokio::test]
-    async fn windows_launch_preserves_request_and_all_pipes() {
+    #[test]
+    fn windows_launch_preserves_request_and_all_pipes() {
         let parent_current_dir = std::env::current_dir().expect("current cwd");
         let mut cwd = std::env::temp_dir();
         cwd.push(format!("agent24-sidecar-cwd-{}", std::process::id()));
@@ -575,9 +581,8 @@ mod windows_tests {
         let mut launch =
             OwnedLaunch::start(LaunchIntent::from_request(request(&cwd)).expect("intent"))
                 .expect("owned launch");
-        assert_eq!(launch.request_id(), 17);
-        let mut stdout = String::new();
-        let (mut stdout_pipe, mut stderr_pipe) = {
+        let request_id = launch.request_id();
+        let (stdout_pipe, stderr_pipe) = {
             let (_, pipes) = launch.parts_mut();
             let _ = pipes.stdin_mut().expect("stdin");
             (
@@ -585,42 +590,68 @@ mod windows_tests {
                 pipes.take_stderr().expect("stderr moves once"),
             )
         };
-        stdout_pipe.read_to_string(&mut stdout).await.unwrap();
-        let mut stderr = String::new();
-        stderr_pipe.read_to_string(&mut stderr).await.unwrap();
+        let stdout_pipe = std::fs::File::from(
+            stdout_pipe
+                .into_owned_handle()
+                .expect("stdout owned handle"),
+        );
+        let stderr_pipe = std::fs::File::from(
+            stderr_pipe
+                .into_owned_handle()
+                .expect("stderr owned handle"),
+        );
+        let (stdout, stderr) = read_pair_then_cleanup(
+            stdout_pipe,
+            stderr_pipe,
+            4096,
+            Duration::from_secs(5),
+            || {
+                reap(&mut launch);
+                Ok(())
+            },
+        )
+        .expect("bounded output read and launch cleanup");
+        let stdout = String::from_utf8(stdout).expect("stdout UTF-8");
+        let stderr = String::from_utf8(stderr).expect("stderr UTF-8");
         let fields: Vec<_> = stdout.split('|').collect();
+        std::fs::remove_dir_all(&cwd).expect("cleanup cwd");
+        assert_eq!(request_id, 17);
         assert_eq!(fields[0], "cwd-ok");
         assert_eq!(
             &fields[1..],
             ["env-value", "ignored-zero,argv-value", "unset"]
         );
         assert_eq!(stderr, "err");
-        reap(&mut launch);
-        std::fs::remove_dir_all(&cwd).expect("cleanup cwd");
     }
 
-    #[tokio::test]
-    async fn windows_moved_pipes_deliver_eof_and_leave_the_launch_authoritative() {
+    #[test]
+    fn windows_moved_pipes_deliver_eof_and_leave_the_launch_authoritative() {
         let cwd = std::env::temp_dir();
         let mut launch = OwnedLaunch::start(LaunchIntent::from_request(Request::Launch {
             version: 1,
             request_id: 20,
-            executable: "powershell.exe".into(),
+            executable: powershell_executable().display().to_string(),
             cwd: cwd.display().to_string(),
             argv: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
                 "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('eof-marker'); [Console]::Out.Flush(); [Console]::Error.Write('err-marker'); [Console]::Error.Flush(); Start-Sleep -Seconds 30".into()],
             env: BTreeMap::from([(String::from("SystemRoot"), std::env::var("SystemRoot").unwrap())]),
         }).unwrap()).unwrap();
-        assert_eq!(launch.request_id(), 20);
-        let (mut stdout, mut stderr) = {
+        let request_id = launch.request_id();
+        let (stdout, stderr, stdout_moved_once, stderr_moved_once, stdin_preserved) = {
             let (_, pipes) = launch.parts_mut();
             let stdout = pipes.take_stdout().expect("stdout moves once");
-            assert!(pipes.take_stdout().is_none(), "stdout moved twice");
-            assert!(pipes.stdin_mut().is_some(), "moving stdout closed stdin");
+            let stdout_moved_once = pipes.take_stdout().is_none();
+            let stdin_after_stdout_move = pipes.stdin_mut().is_some();
             let stderr = pipes.take_stderr().expect("stderr moves once");
-            assert!(pipes.take_stderr().is_none(), "stderr moved twice");
-            assert!(pipes.stdin_mut().is_some(), "moving stderr closed stdin");
-            (stdout, stderr)
+            let stderr_moved_once = pipes.take_stderr().is_none();
+            let stdin_after_stderr_move = pipes.stdin_mut().is_some();
+            (
+                stdout,
+                stderr,
+                stdout_moved_once,
+                stderr_moved_once,
+                stdin_after_stdout_move && stdin_after_stderr_move,
+            )
         };
         let stdin_unavailable = {
             let (_, pipes) = launch.parts_mut();
@@ -628,79 +659,101 @@ mod windows_tests {
             pipes.close_stdin();
             pipes.stdin_mut().is_none()
         };
-        let mut out = [0; 10];
-        let stdout_result =
-            tokio::time::timeout(Duration::from_secs(3), stdout.read_exact(&mut out)).await;
-        let mut err = [0; 10];
-        let stderr_result =
-            tokio::time::timeout(Duration::from_secs(3), stderr.read_exact(&mut err)).await;
-        assert!(matches!(
-            launch.target_mut().observe_exit().expect("observe owner"),
-            ExitObservation::Running
-        ));
-        reap(&mut launch);
+        let stdout = std::fs::File::from(stdout.into_owned_handle().expect("stdout owned handle"));
+        let stderr = std::fs::File::from(stderr.into_owned_handle().expect("stderr owned handle"));
+        let mut stdout_after_cleanup = stdout.try_clone().expect("clone moved stdout");
+        let mut observation = None;
+        let (out, err) = read_pair_then_cleanup(stdout, stderr, 10, Duration::from_secs(3), || {
+            let observed = launch.target_mut().observe_exit();
+            reap(&mut launch);
+            observation = Some(observed?);
+            Ok(())
+        })
+        .expect("bounded marker read and launch cleanup");
         drop(launch);
+        let (eof_tx, eof_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut byte = [0];
+            let _ = eof_tx.send(stdout_after_cleanup.read(&mut byte));
+        });
+        let stdout_eof = eof_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("moved stdout EOF deadline")
+            .expect("moved stdout EOF read");
+        assert_eq!(request_id, 20);
+        assert!(stdout_moved_once, "stdout moved twice");
+        assert!(stderr_moved_once, "stderr moved twice");
+        assert!(stdin_preserved, "moving a pipe closed stdin");
         assert!(stdin_unavailable, "closed stdin remained available");
-        assert!(
-            stdout_result.is_ok_and(|result| result.is_ok()),
-            "stdout EOF marker timed out or failed"
-        );
-        assert!(
-            stderr_result.is_ok_and(|result| result.is_ok()),
-            "stderr marker timed out or failed"
-        );
+        assert_eq!(observation, Some(ExitObservation::Running));
         assert_eq!(&out, b"eof-marker");
         assert_eq!(&err, b"err-marker");
-        let mut eof = [0];
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), stdout.read(&mut eof))
-                .await
-                .expect("moved stdout stays open")
-                .expect("moved stdout read"),
-            0
-        );
+        assert_eq!(stdout_eof, 0);
     }
 
-    #[tokio::test]
-    async fn windows_launch_keeps_job_authority_after_leader_exit() {
+    #[test]
+    fn windows_launch_keeps_job_authority_after_leader_exit() {
         let cwd = std::env::temp_dir();
         let mut launch = OwnedLaunch::start(
             LaunchIntent::from_request(descendant_request(&cwd)).expect("intent"),
         )
         .expect("owned launch");
-        let mut ready = [0; 5];
-        let mut stdout = launch
+        let stdout = launch
             .parts_mut()
             .1
             .take_stdout()
             .expect("stdout moves once");
-        stdout.read_exact(&mut ready).await.expect("ready");
-        assert_eq!(&ready, b"ready");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match launch.target_mut().observe_exit().expect("observe leader") {
-                ExitObservation::Exited { .. } => break,
-                ExitObservation::Running if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                ExitObservation::Running => panic!("leader did not exit before deadline"),
-            }
-        }
-        assert_eq!(
-            launch.target_mut().reap_step().expect("observe Job"),
-            TreeObservation::Present
-        );
-        reap(&mut launch);
+        let stderr = launch
+            .parts_mut()
+            .1
+            .take_stderr()
+            .expect("stderr moves once");
+        let stdout = std::fs::File::from(stdout.into_owned_handle().expect("stdout owned handle"));
+        let stderr = std::fs::File::from(stderr.into_owned_handle().expect("stderr owned handle"));
+        let mut leader = None;
+        let mut tree = None;
+        let (ready, error) =
+            read_pair_then_cleanup(stdout, stderr, 5, Duration::from_secs(10), || {
+                let lifecycle = (|| {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    let exited = loop {
+                        match launch.target_mut().observe_exit()? {
+                            exited @ ExitObservation::Exited { .. } => break exited,
+                            ExitObservation::Running if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(25));
+                            }
+                            ExitObservation::Running => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "leader did not exit before deadline",
+                                ));
+                            }
+                        }
+                    };
+                    let tree = launch.target_mut().reap_step()?;
+                    Ok((exited, tree))
+                })();
+                reap(&mut launch);
+                let (exited, observed_tree) = lifecycle?;
+                leader = Some(exited);
+                tree = Some(observed_tree);
+                Ok(())
+            })
+            .expect("bounded ready read and Job cleanup");
+        assert_eq!(ready, b"ready");
+        assert_eq!(error, b"error");
+        assert!(matches!(leader, Some(ExitObservation::Exited { .. })));
+        assert_eq!(tree, Some(TreeObservation::Present));
     }
 
     #[test]
     fn windows_missing_executable_is_static_and_redacted() {
-        let missing = "agent24-sidecar-program-that-does-not-exist.exe";
+        let missing = std::env::temp_dir().join("agent24-sidecar-program-that-does-not-exist.exe");
         let error = OwnedLaunch::start(
             LaunchIntent::from_request(Request::Launch {
                 version: 1,
                 request_id: 19,
-                executable: missing.to_owned(),
+                executable: missing.display().to_string(),
                 cwd: std::env::temp_dir().display().to_string(),
                 argv: Vec::new(),
                 env: BTreeMap::new(),
@@ -710,6 +763,6 @@ mod windows_tests {
         .err()
         .expect("missing executable must fail");
         assert!(matches!(error, LaunchFailure::Start(_)));
-        assert!(!format!("{error:?}").contains(missing));
+        assert!(!format!("{error:?}").contains(&missing.display().to_string()));
     }
 }
