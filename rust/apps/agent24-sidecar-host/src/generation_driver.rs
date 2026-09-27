@@ -167,7 +167,7 @@ where
         transport_failure: bool,
     ) -> Result<(), ActorLaunchOrderError> {
         let result = self.step_inner(now, transport_failure);
-        if result.is_err() || self.schedule_state().terminal {
+        if self.schedule_state().terminal {
             self.record_session_failure();
         }
         result
@@ -701,6 +701,45 @@ mod tests {
         let mut x = d_at(r, [], [], [], [], Phase::AwaitReady(now));
         x.step(now).unwrap();
         assert_eq!(x.session_end(), Some(SessionEnd::Failed));
+    }
+
+    #[test]
+    fn recoverable_observe_and_reap_errors_do_not_end_the_session() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut observe = d_at(
+            r,
+            [],
+            [],
+            [],
+            [
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(ExitObservation::Running),
+            ],
+            Phase::Running,
+        );
+        let now = Instant::now();
+        assert_eq!(
+            observe.step(now),
+            Err(ActorLaunchOrderError::Observe(io::ErrorKind::Interrupted))
+        );
+        assert_eq!(observe.session_end(), None);
+        assert_eq!(observe.step(now), Ok(()));
+        assert_eq!(observe.session_end(), None);
+
+        let r = Arc::new(Mutex::new(R::default()));
+        r.lock()
+            .unwrap()
+            .reap_errors
+            .push_back(io::ErrorKind::Interrupted);
+        let mut reap = d_at(r, [], [], [], [], Phase::Unconfirmed);
+        assert_eq!(
+            reap.step(now),
+            Err(ActorLaunchOrderError::Reap(io::ErrorKind::Interrupted))
+        );
+        assert_eq!(reap.session_end(), None);
+        assert_eq!(reap.step(now), Ok(()));
+        assert_eq!(reap.schedule_state().phase, Phase::Empty);
+        assert_eq!(reap.session_end(), None);
     }
 
     #[test]
