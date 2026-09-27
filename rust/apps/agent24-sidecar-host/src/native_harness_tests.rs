@@ -216,7 +216,7 @@ fn drive_until(
             WaitFor::Running => report.state.phase == Phase::Running,
             WaitFor::Empty => report.state.phase == Phase::Empty,
         };
-        if reached && (!report.state.output_pending || matches!(target, WaitFor::AwaitReady)) {
+        if reached && !report.state.output_pending {
             return report;
         }
         assert!(
@@ -300,17 +300,18 @@ impl Drop for MarkerDirectory {
     }
 }
 
-fn descendant_request(id: u64, marker: &Path, gate: &Path) -> Request {
+fn descendant_request(id: u64, marker: &Path, ready_gate: &Path, gate: &Path) -> Request {
     #[cfg(unix)]
     let (executable, cwd, argv, env) = {
         let marker = shell_quote(&marker.display().to_string());
+        let ready_gate = shell_quote(&ready_gate.display().to_string());
         let gate = shell_quote(&gate.display().to_string());
         let child = format!(
             "sleep 120 & descendant=$!; printf '%s\\n' \"$descendant\" > {marker}; wait \"$descendant\""
         );
         let ready = r#"{"type":"ready","protocol":1,"port":4312,"token":"tttttttttttttttttttttttttttttttt","version":"native-harness"}"#;
         let script = format!(
-            "/bin/sh -c {} & while [ ! -s {marker} ]; do sleep 0.01; done; printf '%s\\n' '{}'; while [ ! -e {gate} ]; do sleep 0.01; done; exit 17",
+            "/bin/sh -c {} & while [ ! -s {marker} ]; do sleep 0.01; done; while [ ! -e {ready_gate} ]; do sleep 0.01; done; printf '%s\\n' '{}'; while [ ! -e {gate} ]; do sleep 0.01; done; exit 17",
             shell_quote(&child),
             ready
         );
@@ -336,10 +337,11 @@ fn descendant_request(id: u64, marker: &Path, gate: &Path) -> Request {
             .expect("marker has a parent directory")
             .join("leader.ps1");
         let marker = powershell_quote(&marker.display().to_string());
+        let ready_gate = powershell_quote(&ready_gate.display().to_string());
         let gate = powershell_quote(&gate.display().to_string());
         let ready = r#"[Console]::Out.WriteLine('{"type":"ready","protocol":1,"port":4312,"token":"tttttttttttttttttttttttttttttttt","version":"native-harness"}'); [Console]::Out.Flush(); "#;
         let script = format!(
-            "[System.IO.File]::WriteAllText('{marker}', 'leader-started'); $child = Start-Process \"$PSHOME\\powershell.exe\" -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; [System.IO.File]::WriteAllText('{marker}', [string]$child.Id); {ready} while (-not [System.IO.File]::Exists('{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
+            "[System.IO.File]::WriteAllText('{marker}', 'leader-started'); $child = Start-Process \"$PSHOME\\powershell.exe\" -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; [System.IO.File]::WriteAllText('{marker}', [string]$child.Id); while (-not [System.IO.File]::Exists('{ready_gate}')) {{ Start-Sleep -Milliseconds 10 }}; {ready} while (-not [System.IO.File]::Exists('{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
         );
         std::fs::write(&script_path, script).expect("write Windows descendant fixture");
         let env = ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE"]
@@ -548,10 +550,11 @@ fn leader_exit_with_live_descendant_forces_tree_to_confirmed_empty() {
     const REQUEST_ID: u64 = 7404;
     let markers = MarkerDirectory::new(REQUEST_ID);
     let marker = markers.marker();
+    let ready_gate = markers.0.join("ready.emit");
     let gate = markers.gate();
     with_request_limits(
         REQUEST_ID,
-        descendant_request(REQUEST_ID, &marker, &gate),
+        descendant_request(REQUEST_ID, &marker, &ready_gate, &gate),
         DESCENDANT_LIMITS,
         |harness, bytes, _| {
             drive_until(harness, WaitFor::AwaitReady, TurnIntent::Continue, 3);
@@ -560,6 +563,7 @@ fn leader_exit_with_live_descendant_forces_tree_to_confirmed_empty() {
                 descendant_is_alive(descendant).expect("observe live descendant"),
                 "descendant must be alive before leader is released"
             );
+            std::fs::write(&ready_gate, b"ready\n").expect("release leader ready gate");
             let running = drive_until(harness, WaitFor::Running, TurnIntent::Continue, 35);
             assert_ne!(running.state.phase, Phase::Empty);
 
