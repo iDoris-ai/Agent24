@@ -95,6 +95,14 @@ process.on('unhandledRejection', (reason) => {
 })
 
 app.whenReady().then(() => {
+  // Dev-only: show the real app icon in the dock immediately, without
+  // waiting for an electron-builder packaged build (which is where mac.icon
+  // in package.json normally takes effect).
+  if (isDev && process.platform === 'darwin' && app.dock) {
+    const devIcon = nativeImage.createFromPath(path.join(__dirname, '../../assets/icon.png'))
+    if (!devIcon.isEmpty()) app.dock.setIcon(devIcon)
+  }
+
   backendManager.start()
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
