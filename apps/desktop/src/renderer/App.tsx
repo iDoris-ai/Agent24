@@ -82,6 +82,7 @@ export function App(): JSX.Element {
   const [darkMode, setDarkMode] = useState(true)
   const [modules, setModules] = useState<ModuleInfo[]>([])
   const [llmLabel, setLlmLabel] = useState('Detecting…')
+  const [backendPort, setBackendPort] = useState<number | null>(null)
   const initDone = useRef(false)
 
   useEffect(() => {
@@ -97,6 +98,8 @@ export function App(): JSX.Element {
           setBackendOk(res.ok)
           if (res.ok) {
             void window.agent24.modulesList().then(setModules)
+            // FU-93: show the daemon's real port, not a hardcoded guess.
+            void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
           }
         })
         .catch(() => setBackendOk(false))
@@ -205,7 +208,9 @@ export function App(): JSX.Element {
         <div className="sidebar-footer">
           <div className="backend-status">
             <div className={`status-dot ${backendOk === true ? 'online' : backendOk === false ? 'offline' : ''}`} />
-            {backendOk === true && <span>后端服务运行中 :8765</span>}
+            {backendOk === true && (
+              <span>后端服务运行中{backendPort !== null ? ` :${backendPort}` : ''}</span>
+            )}
             {backendOk === false && <span>后端服务离线</span>}
             {backendOk === null && <span>检测中…</span>}
           </div>

@@ -10,6 +10,7 @@ const mockGetAppVersion = vi.fn()
 const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
 const mockOmlxModels = vi.fn()
+const mockBackendEndpoint = vi.fn()
 
 const helloManifest: ModuleManifest = {
   id: '@auraaihq/example-hello',
@@ -27,6 +28,7 @@ beforeEach(() => {
   mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now() } })
   mockModulesList.mockResolvedValue([])
   mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
+  mockBackendEndpoint.mockResolvedValue({ port: 60128 })
 
   Object.defineProperty(window, 'agent24', {
     value: {
@@ -36,6 +38,7 @@ beforeEach(() => {
       omlxDetect: mockOmlxDetect,
       omlxStart: mockOmlxStart,
       omlxModels: mockOmlxModels,
+      backendEndpoint: mockBackendEndpoint,
     },
     writable: true,
     configurable: true,
@@ -55,6 +58,26 @@ describe('App', () => {
     await act(async () => { render(<App />) })
     await waitFor(() => {
       expect(screen.getByText(/后端服务运行中/)).toBeInTheDocument()
+    })
+  })
+
+  // FU-93: the sidebar used to hardcode ":8765", but agent24d is spawned with
+  // `--port 0` and actually listens on whatever port the OS handed it — the
+  // demo saw 60128. Assert the REAL port from backendEndpoint(), not a guess.
+  it('shows the daemon\'s real port, not a hardcoded one (FU-93)', async () => {
+    mockBackendEndpoint.mockResolvedValue({ port: 60128 })
+    await act(async () => { render(<App />) })
+    await waitFor(() => {
+      expect(screen.getByText('后端服务运行中 :60128')).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/:8765/)).not.toBeInTheDocument()
+  })
+
+  it('shows plain "running" text when the port is not yet known', async () => {
+    mockBackendEndpoint.mockResolvedValue(null)
+    await act(async () => { render(<App />) })
+    await waitFor(() => {
+      expect(screen.getByText('后端服务运行中')).toBeInTheDocument()
     })
   })
 
