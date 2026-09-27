@@ -275,6 +275,15 @@ mod tests {
             Err(io::ErrorKind::InvalidData.into())
         }
     }
+    struct SecretRead;
+    impl Read for SecretRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fixture-secret-from-control-reader",
+            ))
+        }
+    }
     struct PendingRead;
     impl Read for PendingRead {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
@@ -293,9 +302,10 @@ mod tests {
             Ok(())
         }
     }
-    struct Broken;
+    struct Broken(Arc<Mutex<Vec<Vec<u8>>>>);
     impl Write for Broken {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push(bytes.to_vec());
             Err(io::ErrorKind::BrokenPipe.into())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -463,20 +473,47 @@ mod tests {
             1
         );
 
-        let mut broken = HostPorts::new_in(
-            WorkerSlots::isolated(),
-            io::empty(),
-            Broken,
-            Duration::from_millis(20),
-        )
-        .unwrap();
         let (owner, calls) = cleanup(
             [
                 Ok(TreeObservation::Unconfirmed),
+                Err(io::ErrorKind::Interrupted),
                 Ok(TreeObservation::ConfirmedEmpty),
             ],
             now,
         );
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut broken = HostPorts::new_in(
+            WorkerSlots::isolated(),
+            io::empty(),
+            Broken(attempts.clone()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let frame = encode_reply(&reply(91)).unwrap();
+        let mut output_failed = false;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        {
+            let (_, output, _) = broken.borrow();
+            output.put(frame, now).unwrap();
+            while Instant::now() < deadline {
+                match output.step(Instant::now()) {
+                    Err(crate::output_io::OutputWriteError::Io(io::ErrorKind::BrokenPipe)) => {
+                        output_failed = true;
+                        break;
+                    }
+                    Ok(WriteStep::Pending) => std::thread::yield_now(),
+                    result => panic!("output did not report BrokenPipe: {result:?}"),
+                }
+            }
+        }
+        assert!(output_failed, "output failure was not observed");
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cleanup ran before failure"
+        );
+
         let result = run_rejected(
             &mut broken,
             reply(91),
@@ -484,8 +521,9 @@ mod tests {
             &mut Instant::now,
             &mut |wait| std::thread::sleep(wait),
         );
-        assert_eq!(result.unwrap_err().reason, "launch_rejected");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result.unwrap_err().reason, "rejected_cleanup_failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(attempts.lock().unwrap().len(), 1, "reply was retried");
     }
 
     #[test]
@@ -572,17 +610,29 @@ mod tests {
     }
 
     #[test]
-    fn fixed_errors_never_include_request_or_process_secrets() {
-        let error = HostSessionError::new("ingress", "control_failed");
+    fn ingress_reader_failure_redacts_secret_from_diagnostics_and_output() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut ports = HostPorts::new_in(
+            WorkerSlots::isolated(),
+            SecretRead,
+            Sink(Some(bytes.clone())),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let error = run_session(
+            &mut ports,
+            Duration::from_secs(1),
+            limits(),
+            Instant::now,
+            |_| std::thread::yield_now(),
+            || false,
+        )
+        .unwrap_err();
         let rendered = format!("{error:?} {error}");
-        for secret in [
-            "request-id-987",
-            "/private/home",
-            "argv-secret",
-            "token-secret",
-        ] {
-            assert!(!rendered.contains(secret));
-        }
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!rendered.contains("fixture-secret-from-control-reader"));
+        assert!(!output.contains("fixture-secret-from-control-reader"));
         assert!(rendered.contains("control_failed"));
+        assert!(output.is_empty());
     }
 }
