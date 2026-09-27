@@ -1302,9 +1302,9 @@ SPEC-MD-ME §5 的 ME-3 行写的是「经 MCP/协议」，那是立项时的猜
 
 ---
 
-## ADR-032：AgentEar（语音）与 iDoris（模型网关）接入 Agent24 —— 提议中
+## ADR-032：AgentEar（语音）与 iDoris（模型网关）接入 Agent24 —— 已接受
 
-**状态**：提议中（2026-09-26）。完整规划与证据见 [`docs/design/INTEGRATION-AGENTEAR-IDORIS.md`](design/INTEGRATION-AGENTEAR-IDORIS.md)；§7 待拍板项已由 §8 D1–D4 收口（见下文）；P2 的前置改为 [`A3-ATTACHED-MODULE.md`](design/A3-ATTACHED-MODULE.md) 经对抗评审后冻结。
+**状态**：已接受（2026-09-26 拍板 D1–D4；P0–P2 已于 2026-09-27 交付，#526–#534，v0.4.0 一并发布）。完整规划与证据见 [`docs/design/INTEGRATION-AGENTEAR-IDORIS.md`](design/INTEGRATION-AGENTEAR-IDORIS.md)；§7 待拍板项已由 §8 D1–D4 收口（见下文）；P2 的前置 [`A3-ATTACHED-MODULE.md`](design/A3-ATTACHED-MODULE.md) 经对抗评审后冻结并已实现（A3-1~A3-4）。P3–P5（流式、iDoris provider 接线、gate 闭集执行提案）未做，排在 v0.5.0 之后。
 
 **背景**：jason 的目标是 Agent24 当协调者，一端接 iDoris（本地 2B/7B/27B 千问 + 外部 API 的混合大脑），另一端接 AgentEar（本机语音耳朵和嘴巴）；两个仓库保持独立，只通过通用接口配合。
 

@@ -1,23 +1,25 @@
 # Agent24 实时状态 — progress
 
 > 「此刻仓库真实发生了什么」。由 `pilot run` 每一步更新。
-> 更新时间：2026-09-23
+> 更新时间：2026-09-28
 >
 > **各刀在不在 main 上，不写在这里** —— 状态由探针给出：`bash docs/agent/me3-status.sh`（ME-4 的 `4a/4b/4c` 行随交付追加）。
 > 本文件只记「现在在做哪件事、为什么、卡在哪」。
 
 ## 当前聚焦
 
-- **主线**：**ME-4 外置 OS 的内核能力面 → v0.5.0**（用户 2026-09-23 裁决，定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)）。
-  跨三个仓库：`iDoris-ai/Agent24`（内核回调 + SDK + 发布）、`iDoris-ai/Sin90`（M3/M4/M5 + 迁 SDK）、`MushroomDAO/Cos72`（mytask 最小样例）。
-- **为什么先补回调不先做 SDK**：SDK 只封装握手/帧/回调通道，不带新能力；外置模块缺的是调度与推理这两个内核回调。
+- **SDK 原型已合**：`agent24-os-sdk` 0.1.0 + `agent24-os-fd`（#514/#515/#516）2026-09-26/27 全部合并。
+- **A3（ADR-032 AgentEar 附着）P0–P2 已交付**：#524/#526/#527/#529/#532/#534，2026-09-27 合并，这是 PLAN-ME4 主线之外、jason 拍板插队的一条线，详见 `tasks.md` 「ADR-032 / A3 台账」。发版前又修了 #543（A3 握手→命令竞态 C1、FU-83 探针原子写 C2、SDK fired 宽松解析 E4）。
+- **下一步：v0.4.0 发版**（版本号 + CHANGELOG + README + 台账收尾，本次改动即此 PR），不等 Codex 补审（记 `ME4-CODEX-DEBT-9`）。
+- **发版之后**：回到 PLAN-ME4 主线 —— ME4-5.2.0（Sin90 线协议金样）→ ME4-5.2.1（Sin90 迁到 SDK）→ Cos72 5.3.x → v0.5.0。
+  跨三个仓库：`iDoris-ai/Agent24`（内核回调 + SDK + 发布）、`iDoris-ai/Sin90`（M3/M4/M5 已 DONE，待迁 SDK）、`MushroomDAO/Cos72`（mytask 最小样例，未开工）。
 - **本地路径**：Agent24 `~/Dev/auraai/Agent24`；Sin90 `~/Dev/auraai/sin90-design`；Cos72 `~/Dev/mycelium/Cos72`（remote `MushroomDAO/Cos72`）。
 
 ## 下一个 READY（按顺序挑）
 
-1. ME4-0.1 合并 Sin90 #2/#3/#4（已 APPROVED）。
-2. ME4-1.1.1 调度回调设计冻结（Codex 评审到 approve）；可并行 ME4-4.1.1 推理回调设计。
-3. ME4-0.3 / ME4-0.4 Sin90 CI 与 Codex 补审。
+1. v0.4.0 release PR：本地门（fmt/clippy/test/pnpm）+ pre-pr-check 全绿后开 PR，approve 后合并；jason 授权后打 tag `v0.4.0` + `agent24-os-sdk-v0.1.0`、创建 Release、上传 macOS arm64 二进制。
+2. ME4-5.2.0（Sin90 线协议金样，TS.1.0）。
+3. ME4-5.2.1（Sin90 迁到 SDK，TS.1.1），依赖 5.2.0 + 5.1.2b（已 DONE）。
 
 ## 2026-09-23 夜 → 09-24 凌晨：无人值守一夜的战报
 
@@ -53,6 +55,21 @@
 **合并**（按 GitHub 真实状态核对，台账已回填）：ME4-S1 调度回调线（1.1.1→1.2.1→1.2.2a/b/c/d→1.3.1→1.3.2→1.4.1→1.5.1）与 ME4-S2 推理回调线（4.1.1→4.2.1→4.2.2-0→4.2.2a→4.2.2b1a/b1b/b2→4.2.3a→4.2.3b）**全部合并**，共 30 个 PR，绝大多数于 2026-09-25 合入、最后两个（#506/#510/#511）于 2026-09-26 合入。ME4-1.3.1（#500→#501→#502）与 ME4-4.3.1 一样只经 Opus 本地评审，Codex 未审，计入 `ME4-CODEX-DEBT`。
 **进行中**：ME4-4.3.1（推理黑盒验收 J14/J19 + 探针 4b）PR #512 已于 2026-09-26 合并，Opus 本地评审 2 轮（CHANGES → APPROVE，Medium 全修），Codex 未审，计入 `ME4-CODEX-DEBT-7`。ME4-M2/M3/M4b 门同日按 Sin90 `origin/main` 回填 DONE。
 **下一步**：ME4-5.1.1 SDK 设计冻结（从调度/推理两个调用方提取公共 transport/握手），依赖 ME4-M4b 门（Sin90 M5 全 DONE，尚未开始）与本轮 4.3.1 收口。
+
+## 2026-09-26/27：SDK 原型收口 + A3（AgentEar 附着）插队线交付 + 发版前修复
+
+**SDK 原型**（ME4-5.1.x）：#514 设计冻结（v4，四轮 Opus 评审）→ #515 原型片①`agent24-os-proto` 模块侧 transport/握手 + 新 crate `agent24-os-fd`（两轮 CHANGES→APPROVE）→ #516 原型片②`agent24-os-sdk` 骨架 + 五个客户端（events/memory/approval/scheduler/model）+ fired（两轮 CHANGES→APPROVE）。全部 2026-09-26/27 合并，Codex 未审，计入 `ME4-CODEX-DEBT-9`。
+
+**A3（ADR-032 AgentEar 附着）插队线**：2026-09-27 现场演示（#523）发现 FU-89~93 后，jason 拍板先做 AgentEar 附着（P0–P2）再回 PLAN-ME4 主线。设计冻结 #524 → A3-1 os-proto 类型底座 #527 → A3-2a 注册存储/REST/CLI #526 → A3-2b 附着监听/握手接入/生命周期/关机 #529 → A3-3 反向命令 speak/stop_playback #532 → A3-4 桌面端「语音」面板 #534。FU-89~93 修复 #528 一并合并。ADR-032 与 iDoris v0.2 规范对齐、L3 轨迹格式改 ATIF v1.8：#540。全部 Codex 未审，计入 `ME4-CODEX-DEBT-9`。
+
+**发版前修复**（#543，为 v0.4.0 发版而做）：
+- **C1**：A3 握手→命令可用之间存在竞态——`attach_listener` 先把握手成功行写给模块，之后才 `attach_kernel_calls` 装好 `KernelCalls` 句柄，窗口期内收到的 `commands/*` 会误判 503 `module_not_ready`。已在 main（77b05cb）和 #541 CI 上实测触发，也很可能是 AgentEar 真机 E2E 首轮 S6 speak 503 的根因。修法：新增 `KernelCalls::enqueue_raw`，握手成功帧走同一条出站队列且在 `attach_kernel_calls` 装配之前入队，程序序保证成功行必是第一条消息；新增回归测试 30 轮循环断言。
+- **C2**（FU-83）：`domain.rs` 两处测试探针改成 `.tmp` + `os.replace` 原子写，消除 CI 偶发失败。
+- **E4**：SDK 侧 `FiredBody` 去掉 `deny_unknown_fields`，改宽松解析——避免内核以后给 fired 加字段时，所有旧 SDK 编译的模块回 400、定时任务静默失败。
+
+另有 #541（桌面端换 iDoris 像素风女孩 logo）、#544（顶栏真实默认模型 + 回复耗时后缀 + `model.call` WS 事件 + `model_call_timings` 计时表迁移 0013 + 本地 oMLX 上 `complexity: simple` 关闭思考）同期合并——不在 A3 设计范围内，但一并进入 v0.4.0。
+
+**下一步**：v0.4.0 发版（本 PR：版本号 + CHANGELOG + README + 台账），不等 Codex 补审（`ME4-CODEX-DEBT-1~9` 待额度 09-29 19:28 恢复后补审）。
 
 ## 阻塞项（BLOCKED）
 

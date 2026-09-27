@@ -5,6 +5,8 @@
 ME-3 收口、T11 交付后，用户 2026-09-23 裁决下一轮 = **ME-4 外置 OS 的内核能力面**：
 调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → `agent24-os-sdk` / Cos72 最小样例（mytask）/ wire 文档 → **v0.5.0**。
 里程碑 ME4-M0…M6 的定义与规范见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见 [`tasks.md`](tasks.md)「ME-4 台账」。
+
+**插队线已交付**：ADR-032/A3（AgentEar 嵌入，P0–P2）作为 PLAN-ME4 主线之外、jason 拍板插队的一条线已交付（2026-09-27，#524–#534），并发布为 **v0.4.0**（ME-3 全套 + ME4 S1/S2 + SDK 原型 + A3 P2 的中间发布，见 `tasks.md`「ADR-032 / A3 台账」）；v0.5.0 的原定义与范围不变，见下方 D4 注记。
 下面 M1–M6 仍是「v0.5.0 之后」的产品路线；其中 **M4/M5 的 Cos72 将建立在 ME4-M5 的 Cos72 最小样例之上**（仓库 `MushroomDAO/Cos72`）。
 
 ## ⏸️ 2026-09-19 现状说明 —— 本文档描述的不是当前在做的事
