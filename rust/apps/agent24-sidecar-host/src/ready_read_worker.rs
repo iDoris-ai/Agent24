@@ -431,15 +431,22 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn native_stdout_is_converted_before_sync_worker_reads() {
-        let mut child = tokio::process::Command::new("cmd.exe")
-            .args(["/C", "<nul set /p =native"])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child =
+            tokio::process::Command::new(crate::windows_test_io::windows_executable("cmd.exe"))
+                .args(["/C", "<nul set /p =native"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
         let stdout = child.stdout.take().unwrap();
         let mut worker = ReadyReadWorker::from_native_stdout(stdout).unwrap();
         worker.permit().unwrap();
-        assert_eq!(chunk(complete(&mut worker).unwrap()), b"native");
-        child.wait().await.unwrap();
+        let result = complete(&mut worker);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+        if status.is_err() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        let _status = status.expect("cmd.exe exit deadline").unwrap();
+        assert_eq!(chunk(result.unwrap()), b"native");
     }
 }
