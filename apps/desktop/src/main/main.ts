@@ -4,9 +4,18 @@ import { app, BrowserWindow, Menu, Tray, nativeImage, session, type MenuItemCons
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
+import { AgentEarEventBridge } from './agentear-events'
+import { IpcChannels } from '../shared/ipc-types'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
+// A3-4: forwards agentear.event/1 envelopes to whichever window is current —
+// started once in whenReady(), stopped in will-quit.
+const agentEarBridge = new AgentEarEventBridge((envelope) => {
+  if (mainWin && !mainWin.isDestroyed()) {
+    mainWin.webContents.send(IpcChannels.AgentEarEvent, envelope)
+  }
+})
 
 // Keep tray reference alive — GC would destroy it otherwise
 let tray: Tray | null = null
@@ -93,6 +102,7 @@ app.whenReady().then(() => {
 
   registerIpcHandlers()
   mainWin = createMainWindow()
+  agentEarBridge.start()
 
   // ── System tray (M2 base; F1b: live daemon status + start/stop/restart) ────
   // Empty image + setTitle works on macOS (menu-bar text); M3 will add a
@@ -157,6 +167,7 @@ app.on('before-quit', () => {
 
 app.on('will-quit', () => {
   if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
+  agentEarBridge.stop()
   backendManager.stop()
 })
 

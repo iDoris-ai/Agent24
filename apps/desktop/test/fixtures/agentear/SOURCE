@@ -1,0 +1,11 @@
+AgentEar contracts/ vendored copy — used by Agent24 desktop tests (A3-4).
+
+source_repo: github.com/iDoris-ai/AgentEar (local clone: /Users/jason/Dev/tools/AgentEar)
+source_commit: 522f9eba0f720c97b9bb0a63d059a82e33029dcb
+copied_at: 2026-09-27T07:07:37Z
+copy_method: git archive 522f9eb contracts/ | tar -x
+
+Do not hand-edit files under contracts/ here. To upgrade: re-run the archive
+command against a new pinned sha, update source_commit above in the same PR
+that updates the tests reading these fixtures, and do not float on AgentEar
+main (design doc A3-ATTACHED-MODULE.md §7.2).

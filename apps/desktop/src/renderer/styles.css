@@ -254,3 +254,15 @@ button { cursor: pointer; font-family: var(--font); }
 .page-title { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
 .page-sub { font-size: 13px; color: var(--muted); margin-bottom: 22px; }
 .tag { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 4px; background: var(--surface2); color: var(--muted); }
+
+/* ── Voice panel (A3-4) ── */
+.voice-row {
+  display: flex; align-items: baseline; gap: 8px; padding: 6px 10px;
+  border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
+}
+.voice-row-badge { flex: 0 0 auto; font-size: 10px; font-weight: 600; color: var(--muted); white-space: nowrap; }
+.voice-row-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
+.voice-row-truncated { color: var(--muted); font-size: 11px; }
+.voice-row-note { flex: 0 0 auto; font-size: 10px; color: var(--muted); }
+.voice-row-error { border-color: #e05050; }
+.voice-row-error .voice-row-badge { color: #e05050; }

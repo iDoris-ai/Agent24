@@ -50,6 +50,14 @@ const api = {
     ipcRenderer.invoke(IpcChannels.ModulesUninstall, packageName, id),
   llmStatus: (): Promise<LlmStatusResult> =>
     ipcRenderer.invoke(IpcChannels.LlmStatus),
+  // A3-4: subscribe to agentear.event/1 envelopes pushed from main
+  // (agentear-events.ts). Returns an unsubscribe function so React effects
+  // can clean up on unmount without leaking listeners across page switches.
+  onAgentEarEvent: (cb: (envelope: unknown) => void): (() => void) => {
+    const listener = (_event: unknown, envelope: unknown): void => cb(envelope)
+    ipcRenderer.on(IpcChannels.AgentEarEvent, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.AgentEarEvent, listener)
+  },
 } as const
 
 contextBridge.exposeInMainWorld('agent24', api)
