@@ -333,14 +333,9 @@ fn descendant_request(id: u64, marker: &Path, gate: &Path) -> Request {
         assert!(executable.is_file(), "Windows PowerShell is required");
         let marker = powershell_quote(&marker.display().to_string());
         let gate = powershell_quote(&gate.display().to_string());
-        let sleep = powershell_encoded("Start-Sleep -Seconds 120");
-        let child_script = format!(
-            "$grandchild = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo -NoProfile -NonInteractive -EncodedCommand {sleep}' -PassThru; Set-Content -LiteralPath '{marker}' -Value $grandchild.Id; Wait-Process -Id $grandchild.Id"
-        );
-        let child = powershell_encoded(&child_script);
         let ready = r#"[Console]::Out.WriteLine('{"type":"ready","protocol":1,"port":4312,"token":"tttttttttttttttttttttttttttttttt","version":"native-harness"}'); [Console]::Out.Flush(); "#;
         let script = format!(
-            "$null = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo -NoProfile -NonInteractive -EncodedCommand {child}'; while (-not (Test-Path -LiteralPath '{marker}')) {{ Start-Sleep -Milliseconds 10 }}; {ready} while (-not (Test-Path -LiteralPath '{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
+            "$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker}' -Value $child.Id; {ready} while (-not (Test-Path -LiteralPath '{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
         );
         let env = ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE"]
             .into_iter()
@@ -377,31 +372,6 @@ fn shell_quote(value: &str) -> String {
 #[cfg(windows)]
 fn powershell_quote(value: &str) -> String {
     value.replace('\'', "''")
-}
-
-#[cfg(windows)]
-fn powershell_encoded(script: &str) -> String {
-    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-        encoded.push(BASE64[usize::from(first >> 2)] as char);
-        encoded.push(BASE64[usize::from((first & 0b11) << 4 | second >> 4)] as char);
-        encoded.push(if chunk.len() > 1 {
-            BASE64[usize::from((second & 0b1111) << 2 | third >> 6)] as char
-        } else {
-            '='
-        });
-        encoded.push(if chunk.len() > 2 {
-            BASE64[usize::from(third & 0b0011_1111)] as char
-        } else {
-            '='
-        });
-    }
-    encoded
 }
 
 fn wait_for_descendant_pid(marker: &Path) -> u32 {
