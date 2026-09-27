@@ -131,6 +131,16 @@ where
         self.step_with_transport_failure(now, false)
     }
 
+    /// Force cancellation of this generation and keep its existing owner for
+    /// cleanup. Confirmed-empty generations are tombstones: cancellation is a
+    /// strict no-op, including no worker poll or cleanup tick.
+    pub(crate) fn force_cancel_step(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError> {
+        if matches!(self.schedule_state().phase, crate::actor::Phase::Empty) {
+            return Ok(());
+        }
+        self.step_with_transport_failure(now, true)
+    }
+
     /// Advance one turn while incorporating an external generation-local
     /// transport observation into the same owner cleanup path.
     pub(crate) fn step_with_transport_failure(
@@ -741,6 +751,123 @@ mod tests {
         let facts = r.lock().unwrap();
         assert!(facts.stops.is_empty());
         assert_eq!(facts.cleanups, 1);
+    }
+
+    #[test]
+    fn force_cancel_phase_table_upgrades_graceful_and_preserves_cleanup_phases() {
+        let now = Instant::now();
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut graceful = d_at(
+            r.clone(),
+            [],
+            [],
+            [],
+            [],
+            Phase::GracefulStopping(now + L.graceful),
+        );
+        assert_eq!(
+            graceful.force_cancel_step(now),
+            Err(ActorLaunchOrderError::CleanupRequired)
+        );
+        assert_eq!(
+            graceful.schedule_state().phase,
+            Phase::ForceStopping(now + L.force)
+        );
+        assert_eq!(r.lock().unwrap().stops, vec![true]);
+
+        for phase in [
+            Phase::ForceStopping(now + L.force),
+            Phase::Draining(now + L.drain),
+            Phase::Unconfirmed,
+        ] {
+            let r = Arc::new(Mutex::new(R::default()));
+            let mut driver = d_at(r.clone(), [], [], [], [], phase);
+            assert_eq!(
+                driver.force_cancel_step(now),
+                Err(ActorLaunchOrderError::CleanupRequired)
+            );
+            assert_eq!(driver.schedule_state().phase, phase);
+            assert_eq!(r.lock().unwrap().stops, vec![true]);
+        }
+    }
+
+    #[test]
+    fn force_cancel_preempts_pending_output_requests_ready_and_credits() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut driver = d_ready_at(r.clone(), [], [], [], [], [], [], Phase::Running);
+        driver
+            .actor
+            .queue_reply(&Reply::Result {
+                version: PROTOCOL_VERSION,
+                request_id: 40,
+            })
+            .unwrap();
+        driver.completed = Some(sig(41));
+        assert!(driver.schedule_state().output_pending);
+
+        assert_eq!(
+            driver.force_cancel_step(now),
+            Err(ActorLaunchOrderError::CleanupRequired)
+        );
+        assert_eq!(driver.completed.as_ref().map(|_| ()), Some(()));
+        assert!(r.lock().unwrap().frames.is_empty());
+        let facts = r.lock().unwrap();
+        assert_eq!((facts.polls, facts.ready_polls), (0, 0));
+        assert_eq!((facts.permits, facts.ready_permits), (0, 0));
+    }
+
+    #[test]
+    fn force_cancel_and_step_retry_force_reap_and_empty_on_the_same_owner() {
+        let r = Arc::new(Mutex::new(R::default()));
+        r.lock()
+            .unwrap()
+            .stop_errors
+            .extend([io::ErrorKind::Other, io::ErrorKind::WouldBlock]);
+        r.lock()
+            .unwrap()
+            .reap_errors
+            .push_back(io::ErrorKind::Interrupted);
+        r.lock().unwrap().trees.extend([
+            TreeObservation::Unconfirmed,
+            TreeObservation::ConfirmedEmpty,
+        ]);
+        let now = Instant::now();
+        let mut driver = d_at(r.clone(), [], [], [], [], Phase::Running);
+
+        assert_eq!(
+            driver.force_cancel_step(now),
+            Err(ActorLaunchOrderError::CleanupRequired)
+        );
+        assert_eq!(driver.step(now), Ok(())); // force retry is transient
+        assert_eq!(
+            driver.force_cancel_step(now),
+            Err(ActorLaunchOrderError::Reap(io::ErrorKind::Interrupted))
+        );
+        assert_eq!(driver.step(now), Ok(())); // same owner remains unconfirmed
+        assert_eq!(driver.force_cancel_step(now), Ok(()));
+        assert_eq!(driver.schedule_state().phase, Phase::Empty);
+
+        let facts = r.lock().unwrap();
+        assert_eq!(facts.stops, vec![true, true, true]);
+        assert_eq!(facts.cleanups, 3);
+        assert_eq!((facts.polls, facts.ready_polls), (0, 0));
+        assert_eq!((facts.permits, facts.ready_permits), (0, 0));
+    }
+
+    #[test]
+    fn force_cancel_empty_is_a_strict_noop() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut driver = d_at(r.clone(), [], [], [], [], Phase::Empty);
+
+        assert_eq!(driver.force_cancel_step(now), Ok(()));
+        let facts = r.lock().unwrap();
+        assert!(facts.stops.is_empty());
+        assert_eq!(facts.cleanups, 0);
+        assert_eq!((facts.polls, facts.ready_polls), (0, 0));
+        assert_eq!((facts.permits, facts.ready_permits), (0, 0));
+        assert!(facts.frames.is_empty());
     }
 
     #[test]
