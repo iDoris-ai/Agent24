@@ -36,7 +36,7 @@ async fn upgrade_keeps_legacy_rows_and_adds_nullable_workspace_foreign_keys() {
     let mut migrator = Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
         .await
         .unwrap();
-    migrator.migrations.to_mut().retain(|m| m.version <= 8);
+    migrator.migrations.to_mut().retain(|m| m.version <= 10);
     migrator.run(&pool).await.unwrap();
     sqlx::query("INSERT INTO sessions VALUES ('s','t','cli',?,?)")
         .bind(TS)
