@@ -254,6 +254,7 @@ mod tests {
     use super::*;
     use crate::{
         actor::Phase,
+        cleanup::CleanupStepError,
         pre_owned_cleanup::CleanupTarget,
         target::{ExitObservation, TreeObservation},
         worker_slots::WorkerSlots,
@@ -272,6 +273,12 @@ mod tests {
     impl Read for BadRead {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
             Err(io::ErrorKind::InvalidData.into())
+        }
+    }
+    struct PendingRead;
+    impl Read for PendingRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
         }
     }
     struct Sink(Option<Arc<Mutex<Vec<u8>>>>);
@@ -297,7 +304,7 @@ mod tests {
     }
 
     struct Fake {
-        results: VecDeque<TreeObservation>,
+        results: VecDeque<Result<TreeObservation, io::ErrorKind>>,
         calls: Arc<AtomicUsize>,
     }
     impl CleanupTarget for Fake {
@@ -307,17 +314,16 @@ mod tests {
         fn stop(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn reap(
-            &mut self,
-            _: &mut Phase,
-        ) -> Result<TreeObservation, crate::cleanup::CleanupStepError> {
+        fn reap(&mut self, _: &mut Phase) -> Result<TreeObservation, CleanupStepError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let tree = self.results.pop_front().expect("scripted result");
-            Ok(tree)
+            self.results
+                .pop_front()
+                .expect("scripted result")
+                .map_err(|kind| CleanupStepError::Reap(io::Error::from(kind)))
         }
     }
     fn cleanup(
-        results: impl IntoIterator<Item = TreeObservation>,
+        results: impl IntoIterator<Item = Result<TreeObservation, io::ErrorKind>>,
         now: Instant,
     ) -> (PreOwnedCleanup<Fake>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -433,8 +439,8 @@ mod tests {
         let now = Instant::now();
         let (owner, _) = cleanup(
             [
-                TreeObservation::Unconfirmed,
-                TreeObservation::ConfirmedEmpty,
+                Ok(TreeObservation::Unconfirmed),
+                Ok(TreeObservation::ConfirmedEmpty),
             ],
             now,
         );
@@ -466,8 +472,8 @@ mod tests {
         .unwrap();
         let (owner, calls) = cleanup(
             [
-                TreeObservation::Unconfirmed,
-                TreeObservation::ConfirmedEmpty,
+                Ok(TreeObservation::Unconfirmed),
+                Ok(TreeObservation::ConfirmedEmpty),
             ],
             now,
         );
@@ -485,7 +491,7 @@ mod tests {
     #[test]
     fn cleanup_dispatch_path_has_no_launch_failed_reply() {
         let now = Instant::now();
-        let (owner, calls) = cleanup([TreeObservation::ConfirmedEmpty], now);
+        let (owner, calls) = cleanup([Ok(TreeObservation::ConfirmedEmpty)], now);
         assert_eq!(
             run_cleanup(owner, &mut || now, &mut |_| {})
                 .unwrap_err()
@@ -493,5 +499,90 @@ mod tests {
             "generation_failed"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_ingress_parks_once_per_turn_and_samples_clock_once() {
+        let mut ports = HostPorts::new_in(
+            WorkerSlots::isolated(),
+            PendingRead,
+            Sink(None),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let clock_calls = std::cell::Cell::new(0);
+        let cancel_calls = std::cell::Cell::new(0);
+        let parks = std::cell::Cell::new(0);
+        let result = run_session(
+            &mut ports,
+            Duration::from_secs(1),
+            limits(),
+            || {
+                clock_calls.set(clock_calls.get() + 1);
+                Instant::now()
+            },
+            |_| parks.set(parks.get() + 1),
+            || {
+                cancel_calls.set(cancel_calls.get() + 1);
+                cancel_calls.get() == 4
+            },
+        );
+        assert_eq!(result.unwrap_err().reason, "cancelled");
+        assert_eq!(clock_calls.get(), 4);
+        assert_eq!(parks.get(), 3);
+    }
+
+    #[test]
+    fn rejected_cleanup_retries_unconfirmed_and_error_without_duplicate_reply() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut ports = ports(Some(bytes.clone()));
+        let now = Instant::now();
+        let (owner, calls) = cleanup(
+            [
+                Ok(TreeObservation::Unconfirmed),
+                Err(io::ErrorKind::Interrupted),
+                Ok(TreeObservation::ConfirmedEmpty),
+            ],
+            now,
+        );
+        let parks = std::cell::Cell::new(0);
+        let result = run_rejected(
+            &mut ports,
+            reply(123),
+            Some(owner),
+            &mut || now,
+            &mut |_| {
+                parks.set(parks.get() + 1);
+                std::thread::sleep(Duration::from_millis(1));
+            },
+        );
+        assert_eq!(result.unwrap_err().reason, "rejected_cleanup_failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(parks.get() >= 2);
+        assert_eq!(decode_reply(&bytes.lock().unwrap()).unwrap(), reply(123));
+        assert_eq!(
+            bytes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fixed_errors_never_include_request_or_process_secrets() {
+        let error = HostSessionError::new("ingress", "control_failed");
+        let rendered = format!("{error:?} {error}");
+        for secret in [
+            "request-id-987",
+            "/private/home",
+            "argv-secret",
+            "token-secret",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+        assert!(rendered.contains("control_failed"));
     }
 }
