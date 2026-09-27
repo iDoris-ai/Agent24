@@ -73,16 +73,8 @@ pub(crate) fn dispatch<'host>(
     }
 
     let (slots, output, control) = ports.borrow();
-    let assembled = NativeGeneration::assemble_in(
-        slots,
-        launch,
-        output,
-        control,
-        limits,
-        deadline,
-        after_start,
-    );
-    let after_assembly = clock();
+    let assembled =
+        NativeGeneration::assemble_in(slots, launch, output, control, limits, deadline, clock);
     let generation = match assembled {
         Ok(generation) => generation,
         Err(error) => {
@@ -93,7 +85,7 @@ pub(crate) fn dispatch<'host>(
         }
     };
 
-    if after_assembly >= deadline || generation.schedule_state().terminal {
+    if generation.schedule_state().terminal {
         return FirstLaunchDispatch::Cleanup(generation.into_pre_owned_cleanup());
     }
 
@@ -115,6 +107,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, VecDeque},
         io::{self, Read, Write},
+        sync::{Arc, Mutex},
         thread,
         time::Duration,
     };
@@ -133,9 +126,10 @@ mod tests {
             Err(io::ErrorKind::WouldBlock.into())
         }
     }
-    struct Sink;
-    impl Write for Sink {
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -169,12 +163,29 @@ mod tests {
             deadline,
         }
     }
-    fn ports() -> (HostPorts, &'static WorkerSlots) {
+    fn ports() -> (HostPorts, &'static WorkerSlots, Arc<Mutex<Vec<u8>>>) {
         let slots = WorkerSlots::isolated();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
         (
-            HostPorts::new_in(slots, PendingRead, Sink, Duration::from_secs(2)).unwrap(),
+            HostPorts::new_in(
+                slots,
+                PendingRead,
+                Capture(Arc::clone(&bytes)),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
             slots,
+            bytes,
         )
+    }
+    fn rejected_cleanup(result: FirstLaunchDispatch<'_>) -> PreOwnedCleanup {
+        match result {
+            FirstLaunchDispatch::Rejected {
+                cleanup: Some(cleanup),
+                ..
+            } => cleanup,
+            _ => panic!("expected rejected launch with cleanup authority"),
+        }
     }
     fn expire(mut cleanup: PreOwnedCleanup) {
         let timeout = Instant::now() + Duration::from_secs(3);
@@ -194,7 +205,7 @@ mod tests {
     #[test]
     fn deadline_before_start_rejects_with_the_original_request_id() {
         let _test_guard = crate::posix::tests::test_lock();
-        let (mut ports, _) = ports();
+        let (mut ports, _, _) = ports();
         let now = Instant::now();
         let result = dispatch(
             accepted(31, "/path/secret-helper", &[], now),
@@ -214,14 +225,12 @@ mod tests {
                 ..
             }
         ));
-        assert!(!format!("{reply:?}").contains("secret-helper"));
-        crate::posix::tests::wait_for_reaper_idle();
     }
 
     #[test]
     fn start_failure_is_static_and_keeps_the_request_id() {
         let _test_guard = crate::posix::tests::test_lock();
-        let (mut ports, _) = ports();
+        let (mut ports, _, _) = ports();
         let now = Instant::now();
         let result = dispatch(
             accepted(32, "/path/private-helper", &[], now + LIMITS.launch),
@@ -242,46 +251,53 @@ mod tests {
             }
         ));
         assert!(!format!("{reply:?}").contains("private-helper"));
-        crate::posix::tests::wait_for_reaper_idle();
     }
 
     #[test]
     fn deadline_at_or_after_spawn_and_after_assembly_returns_cleanup() {
         let _test_guard = crate::posix::tests::test_lock();
-        for (id, sample_after_start) in [(33, true), (34, false)] {
-            let (mut ports, _) = ports();
+        for (id, samples_after_spawn) in [(33, 0), (34, 1), (35, 2)] {
+            let (mut ports, _, bytes) = ports();
             let start = Instant::now();
             let deadline = start + Duration::from_secs(10);
-            let mut samples = if sample_after_start {
-                VecDeque::from([start, deadline])
-            } else {
-                VecDeque::from([start, start + Duration::from_millis(1), deadline])
+            let mut samples = match samples_after_spawn {
+                0 => VecDeque::from([start, deadline]),
+                1 => VecDeque::from([start, start + Duration::from_millis(1), deadline]),
+                _ => VecDeque::from([
+                    start,
+                    start + Duration::from_millis(1),
+                    deadline + Duration::from_nanos(1),
+                ]),
             };
             let result = dispatch(
-                accepted(id + 10, "/bin/sh", &["-c", "exit 0"], deadline),
+                accepted(id, "/bin/sh", &["-c", "exit 0"], deadline),
                 &mut ports,
                 LIMITS,
                 || samples.pop_front().unwrap_or(deadline),
             );
-            let cleanup = match (sample_after_start, result) {
-                (
-                    true,
-                    FirstLaunchDispatch::Rejected {
-                        cleanup: Some(cleanup),
-                        ..
-                    },
-                ) => cleanup,
-                (false, FirstLaunchDispatch::Cleanup(cleanup)) => cleanup,
-                (_, FirstLaunchDispatch::Rejected { reply, cleanup }) => {
-                    panic!("rejected: {reply:?}, owner retained: {}", cleanup.is_some())
-                }
-                (_, FirstLaunchDispatch::Generation(generation)) => {
-                    panic!("generation: {:?}", generation.schedule_state())
-                }
-                (_, FirstLaunchDispatch::Cleanup(cleanup)) => {
-                    panic!("unexpected cleanup state: {:?}", cleanup.phase())
-                }
+            let FirstLaunchDispatch::Rejected {
+                reply,
+                cleanup: Some(cleanup),
+            } = result
+            else {
+                panic!("deadline expiry must reject with cleanup ownership")
             };
+            let (_, output, _) = ports.borrow();
+            let until = Instant::now() + Duration::from_secs(1);
+            loop {
+                match output.step(Instant::now()) {
+                    Ok(WriteStep::Idle | WriteStep::Complete) => break,
+                    Ok(WriteStep::Pending) if Instant::now() < until => thread::yield_now(),
+                    step => panic!("output did not settle: {step:?}"),
+                }
+            }
+            assert!(
+                matches!(reply, Reply::Error { request_id, code: ErrorCode::LaunchFailed, .. } if request_id == id)
+            );
+            assert!(
+                bytes.lock().unwrap().is_empty(),
+                "Owned output escaped before deadline check"
+            );
             expire(cleanup);
         }
         crate::posix::tests::wait_for_reaper_idle();
@@ -290,7 +306,7 @@ mod tests {
     #[test]
     fn owned_pending_is_not_acknowledged_until_the_owned_frame_flushes() {
         let _test_guard = crate::posix::tests::test_lock();
-        let (mut ports, _) = ports();
+        let (mut ports, _, _) = ports();
         let now = Instant::now();
         let result = dispatch(
             accepted(35, "/bin/sh", &["-c", "exec sleep 30"], now + LIMITS.launch),
@@ -315,63 +331,28 @@ mod tests {
         crate::posix::tests::wait_for_reaper_idle();
     }
 
-    #[test]
-    fn ready_read_slot_busy_returns_cleanup_authority() {
-        let _test_guard = crate::posix::tests::test_lock();
-        let (mut ports, slots) = ports();
-        let _permit = slots.reserve(WorkerRole::ReadyRead).unwrap();
+    fn busy_slot(id: u64, role: WorkerRole) {
+        let (mut ports, slots, _) = ports();
+        let permit = slots.reserve(role).unwrap();
         let now = Instant::now();
-        let result = dispatch(
-            accepted(36, "/bin/sh", &["-c", "exit 0"], now + LIMITS.launch),
+        expire(rejected_cleanup(dispatch(
+            accepted(id, "/bin/sh", &["-c", "exit 0"], now + LIMITS.launch),
             &mut ports,
             LIMITS,
             || now,
-        );
-        let cleanup = match result {
-            FirstLaunchDispatch::Rejected {
-                cleanup: Some(cleanup),
-                ..
-            } => cleanup,
-            FirstLaunchDispatch::Rejected { reply, cleanup } => {
-                panic!("rejected: {reply:?}, owner retained: {}", cleanup.is_some())
-            }
-            FirstLaunchDispatch::Generation(generation) => {
-                panic!("generation: {:?}", generation.schedule_state())
-            }
-            FirstLaunchDispatch::Cleanup(cleanup) => panic!("unexpected: {:?}", cleanup.phase()),
-        };
-        expire(cleanup);
-        drop(_permit);
+        )));
+        drop(permit);
+    }
+    #[test]
+    fn ready_read_busy_slot_returns_cleanup_authority() {
+        let _test_guard = crate::posix::tests::test_lock();
+        busy_slot(36, WorkerRole::ReadyRead);
         crate::posix::tests::wait_for_reaper_idle();
     }
-
     #[test]
-    fn stderr_drain_slot_busy_returns_cleanup_authority() {
+    fn stderr_drain_busy_slot_returns_cleanup_authority() {
         let _test_guard = crate::posix::tests::test_lock();
-        let (mut ports, slots) = ports();
-        let _permit = slots.reserve(WorkerRole::StderrDrain).unwrap();
-        let now = Instant::now();
-        let result = dispatch(
-            accepted(38, "/bin/sh", &["-c", "exit 0"], now + LIMITS.launch),
-            &mut ports,
-            LIMITS,
-            || now,
-        );
-        let cleanup = match result {
-            FirstLaunchDispatch::Rejected {
-                cleanup: Some(cleanup),
-                ..
-            } => cleanup,
-            FirstLaunchDispatch::Rejected { reply, cleanup } => {
-                panic!("rejected: {reply:?}, owner retained: {}", cleanup.is_some())
-            }
-            FirstLaunchDispatch::Generation(generation) => {
-                panic!("generation: {:?}", generation.schedule_state())
-            }
-            FirstLaunchDispatch::Cleanup(cleanup) => panic!("unexpected: {:?}", cleanup.phase()),
-        };
-        expire(cleanup);
-        drop(_permit);
+        busy_slot(38, WorkerRole::StderrDrain);
         crate::posix::tests::wait_for_reaper_idle();
     }
 

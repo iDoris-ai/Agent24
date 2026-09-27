@@ -24,6 +24,7 @@ pub(crate) enum NativeGenerationBuildErrorKind {
     MissingStdout,
     MissingStderr,
     Worker(WorkerSlotError),
+    LaunchDeadlineExpired,
 }
 
 /// A failed assembly still owns the authoritative process target.
@@ -75,7 +76,7 @@ impl<'host> NativeGeneration<'host> {
         control: &'host mut ControlWorker,
         limits: Deadlines,
         launch_deadline: Instant,
-        now: Instant,
+        clock: impl FnOnce() -> Instant,
     ) -> Result<Self, NativeGenerationBuildError> {
         Self::assemble_in(
             WorkerSlots::host(),
@@ -84,7 +85,7 @@ impl<'host> NativeGeneration<'host> {
             control,
             limits,
             launch_deadline,
-            now,
+            clock,
         )
     }
 
@@ -95,7 +96,7 @@ impl<'host> NativeGeneration<'host> {
         control: &'host mut ControlWorker,
         limits: Deadlines,
         launch_deadline: Instant,
-        now: Instant,
+        clock: impl FnOnce() -> Instant,
     ) -> Result<Self, NativeGenerationBuildError> {
         let stdout = match launch.pipes_mut().take_stdout() {
             Some(stdout) => stdout,
@@ -134,6 +135,13 @@ impl<'host> NativeGeneration<'host> {
                 ));
             }
         };
+        let now = clock();
+        if now >= launch_deadline {
+            return Err(build_error(
+                NativeGenerationBuildErrorKind::LaunchDeadlineExpired,
+                launch,
+            ));
+        }
         let actor =
             ActorLaunchOrder::new(launch, output, Phase::Launching(launch_deadline), limits);
         Ok(Self {
@@ -262,7 +270,7 @@ mod tests {
             &mut control,
             LIMITS,
             now + LIMITS.launch,
-            now,
+            || now,
         )
         .unwrap();
 
@@ -323,7 +331,7 @@ mod tests {
             &mut control,
             LIMITS,
             now + LIMITS.launch,
-            now,
+            || now,
         ) {
             Ok(_) => panic!("busy ReadyRead slot unexpectedly assembled"),
             Err(error) => error,
@@ -377,7 +385,7 @@ mod tests {
             &mut control,
             LIMITS,
             now + LIMITS.launch,
-            now,
+            || now,
         ) {
             Ok(_) => panic!("missing stdout unexpectedly assembled"),
             Err(error) => error,
@@ -412,7 +420,7 @@ mod tests {
             &mut control,
             LIMITS,
             now + LIMITS.launch,
-            now,
+            || now,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
