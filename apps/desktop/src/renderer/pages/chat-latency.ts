@@ -2,13 +2,15 @@
 // · 总计 1,834 ms") — split out of Chat.tsx so it's trivial to unit test
 // without React, same reasoning as voice/display.ts.
 //
-// Today's `/api/v1/chat` (agent24-protocol's `ChatResponse`) is a single
-// blocking call with no streaming and no `model_id`/`tier`/latency fields of
-// its own (rust/crates/agent24-protocol/src/types.rs) — so in practice
-// `extractServerReported` always comes back empty and every reply falls back
-// to "frontend-timed total only, topbar's daemon default model name". Both
-// functions still accept the richer shape so a future streaming/instrumented
-// `/api/v1/chat` is picked up with no call-site change.
+// Review M3: `/api/v1/chat` (agent24-protocol's `ChatResponse`) now reports
+// the server-measured `model_id`/`tier`/`latency_ms` for the call that
+// actually served it (rust/apps/agent24d/src/routes.rs's `post_chat`) — this
+// is the ONLY source `formatReplySuffix`'s `modelName` may come from. When
+// the provider didn't report a `model_id`, `extractServerReported` returns
+// `null` and the suffix shows no model name at all — Chat.tsx must NOT
+// substitute a guess (e.g. the topbar's daemon-default model) in its place;
+// that would show a model that may not be the one that actually answered.
+// `firstTokenMs` stays `null` today (no streaming yet), so only `总计` shows.
 
 import { formatMs } from '../../shared/format-latency'
 

@@ -332,7 +332,7 @@ impl From<&CallTimingRow> for TimingWire {
 }
 
 /// `GET /api/v1/timings?source=&since=&limit=` — raw rows from
-/// `model_call_timings` (migration `0009`), newest first, `limit` capped at
+/// `model_call_timings` (migration `0013`), newest first, `limit` capped at
 /// [`TIMINGS_MAX_LIMIT`] and defaulting to [`TIMINGS_DEFAULT_LIMIT`] when
 /// absent or not a valid non-negative integer.
 pub async fn get_timings(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
@@ -529,15 +529,24 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
             };
             tracing::debug!("chat served by {provider}");
             state.usage.record(&res.usage);
+            // Review M3: the SAME model_id/latency the timing ledger records
+            // is what `ChatResponse` reports below — one measurement, two
+            // consumers, never two independently-timed/filtered numbers
+            // that could disagree.
+            let latency_ms = call_start.elapsed().as_millis() as u64;
+            let reported_model_id = res
+                .model_id
+                .clone()
+                .filter(|m| m.len() <= crate::model_callback::MODEL_MAX_MODEL_ID_BYTES);
             state
                 .timings
                 .record(crate::timing_recorder::TimingObservation {
                     source: "chat".to_owned(),
-                    model_id: res.model_id.clone().filter(|m| m.len() <= 256),
+                    model_id: reported_model_id.clone(),
                     tier: Some(tier.to_owned()),
                     served_by: Some(provider.clone()),
                     ok: true,
-                    total_ms: call_start.elapsed().as_millis() as u64,
+                    total_ms: latency_ms,
                     prompt_tokens: Some(res.usage.prompt_tokens),
                     completion_tokens: Some(res.usage.completion_tokens),
                     ..Default::default()
@@ -562,6 +571,9 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     content: text,
                 },
                 usage: res.usage,
+                model_id: reported_model_id,
+                tier: Some(tier.to_owned()),
+                latency_ms: Some(latency_ms),
             })
             .into_response()
         }
@@ -784,6 +796,61 @@ mod tests {
         })
     }
 
+    /// Review M3: a provider that DOES report a `model_id` — `Stub` above
+    /// deliberately reports `None` (so tests using it also cover "the
+    /// provider didn't say"), so this is a separate type rather than
+    /// changing `Stub` and risking every other test that already depends on
+    /// its exact shape.
+    struct StubWithModelId;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for StubWithModelId {
+        fn name(&self) -> &str {
+            "stub-with-model"
+        }
+        async fn complete(
+            &self,
+            _req: &agent24_models::CompletionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<agent24_models::CompletionResponse, ModelError> {
+            Ok(agent24_models::CompletionResponse {
+                message: agent24_models::Msg::assistant(Some("ok".into()), vec![]),
+                usage: Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                    cost_usd: 0.0,
+                },
+                model_id: Some("Qwen3.6-35B-A3B-MLX-8bit".to_owned()),
+            })
+        }
+        async fn models(&self, _cancel: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    async fn state_with_model_id_stub() -> AppState {
+        crate::server::AppState::new(crate::server::AppDeps {
+            token: "testtoken".to_owned(),
+            router: std::sync::Arc::new(ModelRouter::with_defaults(vec![(
+                std::sync::Arc::new(StubWithModelId),
+                Tier::Local,
+            )])),
+            tools: agent24_tools::ToolRegistry::new(),
+            store: agent24_store::Store::open_memory().await.unwrap(),
+            shutdown: crate::server::Shutdown::new(CancellationToken::new()),
+            guardian: None,
+            memory: None,
+            mcp_servers: Vec::new(),
+            risk_overrides: std::sync::Arc::new(
+                agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
+            ),
+            packages_root: std::sync::Arc::new(
+                tempfile::tempdir().expect("tempdir").path().to_path_buf(),
+            ),
+        })
+    }
+
     /// Polls `query_call_timings` until at least one row for `source`
     /// appears — the timing writer is a background task (`timing_recorder.rs`),
     /// same reasoning as `timing_recorder::tests::spawn_writes_every_recorded_observation_to_the_store`.
@@ -827,6 +894,70 @@ mod tests {
         assert_eq!(row.prompt_tokens, Some(3));
         assert_eq!(row.completion_tokens, Some(2));
         assert!(row.error_kind.is_none());
+    }
+
+    /// Review M3: `ChatResponse` carries the server-measured `model_id`/
+    /// `tier`/`latency_ms` when the provider reported a model id.
+    #[tokio::test]
+    async fn post_chat_response_reports_model_id_tier_and_latency_when_the_provider_says_one() {
+        let state = state_with_model_id_stub().await;
+        let token = state.token.to_string();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["model_id"], "Qwen3.6-35B-A3B-MLX-8bit");
+        assert_eq!(body["tier"], "local");
+        assert!(body["latency_ms"].as_u64().is_some());
+    }
+
+    /// Review M3 (negative control): when the provider does NOT report a
+    /// model id, `ChatResponse.model_id` must be `null` — never a guessed
+    /// name (e.g. the daemon's own `DEFAULT_MODEL`) standing in for it.
+    #[tokio::test]
+    async fn post_chat_response_model_id_is_null_not_guessed_when_the_provider_reports_none() {
+        let state = state_with_stub().await;
+        let token = state.token.to_string();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/chat")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["model_id"], serde_json::Value::Null);
+        assert_eq!(
+            body["tier"], "local",
+            "tier is still reported — only model_id is unknown"
+        );
+        assert!(body["latency_ms"].as_u64().is_some());
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! ME4-desktop-model-ui — per-call timing ledger, writer side
 //! (`agent24-store`'s `model_call_timings` table, migration
-//! `0009_model_call_timings.sql`). Mirrors `usage_recorder.rs`'s shape (a
+//! `0013_model_call_timings.sql`). Mirrors `usage_recorder.rs`'s shape (a
 //! bounded mpsc channel + one background task, so no handler ever awaits a
 //! disk write) but with a much looser contract: this ledger is a debugging
 //! aid ("慢在哪一步"), never a source of truth like the usage counters
@@ -50,9 +50,15 @@ pub struct TimingObservation {
     pub ok: bool,
     pub error_kind: Option<String>,
     /// A module's own finer-grained sub-step (AgentEar's asr/tts/…), when it
-    /// reports one. `None` from every call site today — see the migration's
-    /// own doc comment.
+    /// reports one — set by `agentear_timings.rs`, `None` from every other
+    /// call site.
     pub step: Option<String>,
+    /// AgentEar's own per-turn correlation ids (opaque identifiers, never
+    /// content) — set by `agentear_timings.rs` only; every other call site
+    /// leaves both `None` (neither `_a24/model/complete` nor `/api/v1/chat`
+    /// is turn-scoped).
+    pub session_id: Option<String>,
+    pub seq: Option<u64>,
     pub first_token_ms: Option<u64>,
     pub total_ms: u64,
     pub prompt_tokens: Option<u64>,
@@ -115,11 +121,12 @@ fn to_new_call_timing(obs: TimingObservation) -> NewCallTiming {
         ok: obs.ok,
         error_kind: obs.error_kind,
         step: obs.step,
-        // `_a24/model/complete`/`/api/v1/chat` calls aren't turn-scoped — only
-        // `agentear_timings.rs`'s bridge (a separate write path straight to
-        // the store) ever sets these.
-        session_id: None,
-        seq: None,
+        // Review M2: `agentear_timings.rs` now records THROUGH this same
+        // sink/writer (unified counting, periodic pruning, and serialized
+        // writes — no more separate direct-to-store path) — so its
+        // session_id/seq simply pass through here like every other field.
+        session_id: obs.session_id,
+        seq: obs.seq,
         first_token_ms: obs.first_token_ms,
         total_ms: obs.total_ms,
         prompt_tokens: obs.prompt_tokens,

@@ -1,5 +1,5 @@
 //! ME4-desktop-model-ui — per-call timing ledger, storage side. See
-//! `migrations/0009_model_call_timings.sql` for the schema and its own
+//! `migrations/0013_model_call_timings.sql` for the schema and its own
 //! reasoning (a raw ledger, not an aggregate like `module_model_usage.rs`;
 //! never stores content). Written by `agent24d/src/timing_recorder.rs`, read
 //! by `agent24d/src/routes.rs`'s `GET /api/v1/timings`/`.../summary`.
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn the_migration_carries_no_prompt_response_or_transcript_column() {
-        let sql = include_str!("../migrations/0009_model_call_timings.sql");
+        let sql = include_str!("../migrations/0013_model_call_timings.sql");
         // Strip `--` comments first — this file's OWN doc comments discuss
         // "content" in prose (explaining why there is none); only the actual
         // SQL (column names) must be checked, or this test would trip on its

@@ -43,18 +43,23 @@ describe('ChatPage', () => {
     )
   })
 
-  // ME4-desktop-model-ui: every successful reply gets a timing suffix. The
-  // response body here is exactly today's real `ChatResponse` shape
-  // ({message, usage}, no model_id/latency of its own), so this exercises the
-  // actual fallback path: frontend-timed total + the topbar's default model.
-  it('shows a latency suffix with the default model name under a successful reply', async () => {
+  // Review M3: `/api/v1/chat` now reports the server-measured model_id/tier
+  // for the call that actually served it — the suffix shows THAT, never a
+  // guessed/default name.
+  it('shows a latency suffix with the SERVER-reported model_id/tier under a successful reply', async () => {
     mockBackendProxy.mockResolvedValue({
       ok: true,
       status: 200,
-      data: { message: { content: 'Hello from AI!' }, usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } },
+      data: {
+        message: { content: 'Hello from AI!' },
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        model_id: 'Qwen3.6-35B-A3B-MLX-8bit',
+        tier: 'local',
+        latency_ms: 842,
+      },
     })
 
-    render(<ChatPage defaultModelName="Qwen3.6-35B-A3B-MLX-8bit" />)
+    render(<ChatPage />)
     const textarea = screen.getByPlaceholderText(/输入消息/)
     fireEvent.change(textarea, { target: { value: 'Hi there' } })
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
@@ -62,13 +67,16 @@ describe('ChatPage', () => {
     await waitFor(() => {
       expect(screen.getByText('Hello from AI!')).toBeInTheDocument()
     })
-    // Non-streaming: only 总计 (首字 would equal it and is omitted), model name
-    // present, no tier (today's ChatResponse doesn't report one).
-    expect(screen.getByText(/Qwen3\.6-35B-A3B-MLX-8bit · 总计 \d+(,\d{3})* ms/)).toBeInTheDocument()
+    // Server-reported latency_ms wins over the frontend's own timing too.
+    expect(screen.getByText('Qwen3.6-35B-A3B-MLX-8bit · 本地 · 总计 842 ms')).toBeInTheDocument()
     expect(screen.queryByText(/首字/)).not.toBeInTheDocument()
   })
 
-  it('shows just the timing, no model segment, when no default model name is known', async () => {
+  // Review M3's own negative control: the server did NOT report a model_id
+  // (still a possible shape) — the suffix must show NO model name at all,
+  // never fall back to a guess (this component doesn't even accept a
+  // default-model prop any more).
+  it('shows just the timing, no model segment, when the server reports no model_id', async () => {
     mockBackendProxy.mockResolvedValue({
       ok: true,
       status: 200,
@@ -89,7 +97,7 @@ describe('ChatPage', () => {
       status: 503,
       data: { error: { code: 'provider_unavailable', message: 'Service unavailable' } },
     })
-    render(<ChatPage defaultModelName="m" />)
+    render(<ChatPage />)
     fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: 'test' } })
     fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
 

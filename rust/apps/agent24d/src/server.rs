@@ -534,12 +534,12 @@ impl AppState {
         let (timings, _timing_writer_handle) =
             crate::timing_recorder::TimingRecorder::spawn(store.clone());
         let events = crate::events::EventsHub::default();
-        // ME4-desktop-model-ui follow-up: a passive observer on the WS bus,
-        // spawned right after both halves it needs exist — see
-        // `agentear_timings.rs`'s doc comment for why this is NOT wired
-        // through the RPC path.
+        // ME4-desktop-model-ui follow-up (review M2): a passive observer on
+        // the WS bus, recording through the SAME `timings` sink/writer as
+        // `_a24/model/complete`/`/api/v1/chat` — see `agentear_timings.rs`'s
+        // doc comment for why this is NOT wired through the RPC path.
         let _agentear_timing_bridge_handle =
-            crate::agentear_timings::spawn_agentear_timing_bridge(events.clone(), store.clone());
+            crate::agentear_timings::spawn_agentear_timing_bridge(events.clone(), timings.clone());
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
         let timeout = std::env::var("A24_APPROVAL_TIMEOUT_SECS")

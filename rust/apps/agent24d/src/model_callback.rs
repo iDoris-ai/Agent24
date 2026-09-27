@@ -151,6 +151,15 @@ impl ModelCompleteParams {
             Some(WireComplexity::Complex) => Complexity::Complex,
             Some(WireComplexity::Simple) | None => Complexity::Simple,
         };
+        // Review M1: gated on an EXPLICIT `complexity: "simple"` in the wire
+        // params, NOT on the derived routing `complexity` above — that
+        // derivation defaults an ABSENT complexity to `Simple` for TIER
+        // PREFERENCE only (pre-existing, untouched behavior: an old caller
+        // that never mentions complexity still gets simple-task routing). A
+        // module that says nothing about complexity gets the pre-M4
+        // behavior here too: thinking is never touched, only a module that
+        // explicitly opts into `simple` does.
+        let disable_thinking = matches!(self.complexity, Some(WireComplexity::Simple));
         let request = CompletionRequest {
             messages: self
                 .messages
@@ -173,11 +182,11 @@ impl ModelCompleteParams {
             max_tokens: NonZeroU32::new(max),
             // ME4-S2-thinking: AgentEar found Qwen3-family reasoning models
             // narrating their whole `<think>` monologue out loud in the voice
-            // scene. `complexity: simple` is the module's own signal that a
-            // fast, direct answer is wanted — gate on exactly that, never on
-            // which module is calling. `complex` calls are unaffected (a
-            // reasoning trace is more likely wanted there).
-            disable_thinking: matches!(complexity, Complexity::Simple),
+            // scene. An explicit `complexity: "simple"` is the module's own
+            // signal that a fast, direct answer is wanted — gate on exactly
+            // that (see `disable_thinking` above), never on which module is
+            // calling, and never on an absent/defaulted complexity.
+            disable_thinking,
         };
         (request, complexity, self.request_id)
     }
@@ -655,6 +664,8 @@ fn timing_observation(
         ok,
         error_kind: error_kind.map(str::to_owned),
         step: None,
+        session_id: None,
+        seq: None,
         first_token_ms: None,
         total_ms: latency_ms,
         prompt_tokens: tokens.map(|(p, _)| p),
@@ -1436,6 +1447,47 @@ mod handler_tests {
         let mut p = ok_params();
         p["response_format"] = json!({"type": "json_object"});
         assert!(ModelCompleteParams::parse(p).is_err());
+    }
+
+    // ---- review M1: disable_thinking requires an EXPLICIT complexity: "simple" ----
+
+    #[test]
+    fn disable_thinking_requires_an_explicit_simple_complexity_not_an_absent_one() {
+        // Absent complexity: routing still defaults to Simple (untouched,
+        // pre-existing behavior — an old caller that never mentions
+        // complexity keeps today's simple-task tier preference), but
+        // disable_thinking must stay false — a module that said nothing
+        // about complexity gets the pre-M4 behavior: thinking untouched.
+        let (req, cx, _) = ModelCompleteParams::parse(ok_params())
+            .unwrap()
+            .into_request();
+        assert!(
+            !req.disable_thinking,
+            "an absent complexity must NOT disable thinking"
+        );
+        assert_eq!(
+            cx,
+            Complexity::Simple,
+            "routing default for absent complexity is unchanged"
+        );
+
+        // Explicit "simple": disables thinking.
+        let mut p = ok_params();
+        p["complexity"] = json!("simple");
+        let (req, _, _) = ModelCompleteParams::parse(p).unwrap().into_request();
+        assert!(
+            req.disable_thinking,
+            "an explicit complexity: simple must disable thinking"
+        );
+
+        // Explicit "complex": never disables thinking.
+        let mut p = ok_params();
+        p["complexity"] = json!("complex");
+        let (req, _, _) = ModelCompleteParams::parse(p).unwrap().into_request();
+        assert!(
+            !req.disable_thinking,
+            "complexity: complex must never disable thinking"
+        );
     }
 
     /// `Handler::call_timeout` reports the literal 120s (§5.2). The

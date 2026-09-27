@@ -17,13 +17,22 @@
 //! Never reads or stores transcript/prompt/reply text: only numbers, the
 //! closed set of field names below, `session_id`/`seq` (opaque correlation
 //! ids, not content), and `model`/`tier`/`llm_via`.
+//!
+//! Review M2: this bridge no longer writes `agent24-store` directly. It
+//! builds [`crate::timing_recorder::TimingObservation`]s (the SAME type
+//! `model_callback.rs`/`routes.rs` build) and hands them to the SAME
+//! `Arc<dyn TimingSink>` writer — one channel, one writer task, so every
+//! `model_call_timings` write is serialized through it, the retention prune
+//! counter counts AgentEar's rows too, and this file has no `Store`/SQL
+//! dependency of its own any more.
 
 use agent24_protocol::EventBody;
-use agent24_store::{NewCallTiming, Store};
 use serde_json::{Map, Value};
 use tokio::task::JoinHandle;
 
 use crate::events::EventsHub;
+use crate::model_callback::MODEL_MAX_MODEL_ID_BYTES;
+use crate::timing_recorder::{TimingObservation, TimingSink};
 
 pub const AGENTEAR_MODULE: &str = "agentear";
 const AGENTEAR_EVENT_KIND: &str = "agentear.event";
@@ -51,17 +60,42 @@ fn u64_field(m: &Map<String, Value>, key: &str) -> Option<u64> {
     m.get(key).and_then(Value::as_u64)
 }
 
+/// Review M2: bounds a string field AgentEar reported (`model`/`llm_via`/
+/// `session_id`) to [`MODEL_MAX_MODEL_ID_BYTES`] — the same ceiling
+/// `model_callback.rs` already holds a provider-reported `model_id` to,
+/// reused rather than inventing a second, possibly-disagreeing limit for
+/// "an id string a module reported". An over-limit value is DROPPED
+/// (`None`), never truncated — same reasoning as `model_callback.rs`'s own
+/// `model_id` handling: a truncated id could name a turn/model/provider that
+/// doesn't exist, which is worse than reporting nothing. Logs once per drop
+/// (`field` names which one) — the closest thing to a counter this
+/// diagnostic-only path needs; a metrics counter would be more machinery
+/// than a rare malformed-event case justifies.
+fn bounded(field: &'static str, value: Option<&str>) -> Option<String> {
+    let v = value?;
+    if v.len() <= MODEL_MAX_MODEL_ID_BYTES {
+        return Some(v.to_owned());
+    }
+    tracing::warn!(
+        field,
+        len = v.len(),
+        max = MODEL_MAX_MODEL_ID_BYTES,
+        "agentear_timings: dropping an over-limit {field} rather than truncating it"
+    );
+    None
+}
+
 /// Pure extraction (no I/O, no clock) — zero rows unless `module`/`kind`
 /// match AgentEar's own event exactly, `payload.type == "turn"`,
 /// `payload.payload.phase` is `idle`/`failed`, and a `timings` object is
-/// present. `ts` on every returned row is `String::new()` — the caller
-/// (`spawn_agentear_timing_bridge`) fills it in at write time, the same
-/// "recorder assigns the clock" split `timing_recorder.rs` already uses.
+/// present. Builds [`TimingObservation`]s directly — the caller
+/// (`spawn_agentear_timing_bridge`) only ever hands them to a
+/// [`TimingSink`], never touches storage itself.
 pub fn extract_agentear_timing_rows(
     module: &str,
     kind: &str,
     payload: &Map<String, Value>,
-) -> Vec<NewCallTiming> {
+) -> Vec<TimingObservation> {
     if module != AGENTEAR_MODULE || kind != AGENTEAR_EVENT_KIND {
         return Vec::new();
     }
@@ -82,13 +116,13 @@ pub fn extract_agentear_timing_rows(
         return Vec::new();
     };
 
-    let session_id = str_field(payload, "session_id").map(str::to_owned);
+    let session_id = bounded("session_id", str_field(payload, "session_id"));
     let seq = u64_field(payload, "seq");
-    let model = str_field(inner, "model").map(str::to_owned);
+    let model = bounded("model", str_field(inner, "model"));
     let tier = str_field(inner, "tier")
         .filter(|t| *t == "local" || *t == "remote")
         .map(str::to_owned);
-    let served_by = str_field(inner, "llm_via").map(str::to_owned);
+    let served_by = bounded("llm_via", str_field(inner, "llm_via"));
     let prompt_tokens = u64_field(inner, "prompt_tokens");
     let completion_tokens = u64_field(inner, "completion_tokens");
 
@@ -97,8 +131,7 @@ pub fn extract_agentear_timing_rows(
         .filter_map(|field| {
             let ms = u64_field(timings, field)?;
             let step = field.strip_suffix("_ms").unwrap_or(field).to_owned();
-            Some(NewCallTiming {
-                ts: String::new(),
+            Some(TimingObservation {
                 source: format!("module:{AGENTEAR_MODULE}"),
                 model_id: model.clone(),
                 tier: tier.clone(),
@@ -117,12 +150,16 @@ pub fn extract_agentear_timing_rows(
         .collect()
 }
 
-/// Subscribes to `events` and writes whatever `extract_agentear_timing_rows`
-/// finds in each broadcast `EventBody::Module` event to `store`. Best-effort,
-/// same posture as `timing_recorder.rs`: a lagged/closed bus just ends this
-/// task quietly, and a write failure is logged, never propagated (nothing
-/// awaits this task's result).
-pub fn spawn_agentear_timing_bridge(events: EventsHub, store: Store) -> JoinHandle<()> {
+/// Subscribes to `events` and hands whatever `extract_agentear_timing_rows`
+/// finds in each broadcast `EventBody::Module` event to `timings` — the SAME
+/// sink `_a24/model/complete`/`/api/v1/chat` use, so writes are serialized
+/// through one writer task and periodic pruning already covers these rows
+/// too. Best-effort, same posture as `timing_recorder.rs`: a lagged/closed
+/// bus just ends this task quietly.
+pub fn spawn_agentear_timing_bridge(
+    events: EventsHub,
+    timings: std::sync::Arc<dyn TimingSink>,
+) -> JoinHandle<()> {
     // Subscribed HERE, synchronously, before this function returns — not
     // inside the spawned task. `tokio::spawn` only SCHEDULES the task; if
     // the subscribe happened inside it, a caller that broadcasts right after
@@ -139,12 +176,8 @@ pub fn spawn_agentear_timing_bridge(events: EventsHub, store: Store) -> JoinHand
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
             let EventBody::Module(m) = body else { continue };
-            let rows = extract_agentear_timing_rows(&m.module, &m.kind, &m.payload);
-            for mut row in rows {
-                row.ts = agent24_core::util::now_iso8601();
-                if let Err(e) = store.record_call_timing(&row).await {
-                    tracing::warn!("agentear_timings: write failed: {e}");
-                }
+            for obs in extract_agentear_timing_rows(&m.module, &m.kind, &m.payload) {
+                timings.record(obs);
             }
         }
     })
@@ -155,7 +188,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::timing_recorder::MemoryTimingSink;
     use serde_json::json;
+    use std::sync::Arc;
 
     /// The design ask's own fixture shape: a `turn` event, `phase: "idle"`,
     /// every field it names present.
@@ -300,11 +335,56 @@ mod tests {
         );
     }
 
+    // ── review M2: length caps (reusing MODEL_MAX_MODEL_ID_BYTES) ───────────
+
+    #[test]
+    fn an_over_limit_model_session_id_or_llm_via_is_dropped_not_truncated() {
+        let mut fixture = idle_turn_fixture();
+        let too_long = "x".repeat(MODEL_MAX_MODEL_ID_BYTES + 1);
+        fixture.insert("session_id".to_owned(), json!(too_long.clone()));
+        let inner = fixture.get_mut("payload").unwrap().as_object_mut().unwrap();
+        inner.insert("model".to_owned(), json!(too_long.clone()));
+        inner.insert("llm_via".to_owned(), json!(too_long));
+
+        let rows = extract_agentear_timing_rows(AGENTEAR_MODULE, "agentear.event", &fixture);
+        assert!(!rows.is_empty());
+        for r in &rows {
+            assert!(
+                r.session_id.is_none(),
+                "over-limit session_id must be dropped"
+            );
+            assert!(r.model_id.is_none(), "over-limit model must be dropped");
+            assert!(r.served_by.is_none(), "over-limit llm_via must be dropped");
+        }
+    }
+
+    #[test]
+    fn a_model_session_id_or_llm_via_exactly_at_the_limit_is_kept() {
+        let mut fixture = idle_turn_fixture();
+        let exactly = "x".repeat(MODEL_MAX_MODEL_ID_BYTES);
+        fixture.insert("session_id".to_owned(), json!(exactly.clone()));
+        let inner = fixture.get_mut("payload").unwrap().as_object_mut().unwrap();
+        inner.insert("model".to_owned(), json!(exactly.clone()));
+
+        let rows = extract_agentear_timing_rows(AGENTEAR_MODULE, "agentear.event", &fixture);
+        assert!(
+            rows.iter()
+                .all(|r| r.session_id.as_deref() == Some(exactly.as_str()))
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.model_id.as_deref() == Some(exactly.as_str()))
+        );
+    }
+
+    // ── review M2: the bridge now records through the SAME TimingSink ──────
+
     #[tokio::test]
-    async fn the_bridge_writes_rows_for_a_broadcast_idle_turn_event() {
-        let store = Store::open_memory().await.unwrap();
+    async fn the_bridge_records_through_the_shared_timing_sink_for_a_broadcast_idle_turn_event() {
+        let sink = Arc::new(MemoryTimingSink::default());
         let hub = EventsHub::default();
-        let _handle = spawn_agentear_timing_bridge(hub.clone(), store.clone());
+        let _handle =
+            spawn_agentear_timing_bridge(hub.clone(), sink.clone() as Arc<dyn TimingSink>);
 
         hub.broadcast(EventBody::Module(agent24_protocol::ModuleEventPayload {
             module: AGENTEAR_MODULE.to_owned(),
@@ -312,17 +392,15 @@ mod tests {
             payload: idle_turn_fixture(),
         }));
 
-        let mut rows = Vec::new();
+        let mut recorded = Vec::new();
         for _ in 0..50 {
-            rows = store
-                .query_call_timings(Some("module:agentear"), None, 20)
-                .await
-                .unwrap();
-            if rows.len() >= 8 {
+            recorded = sink.take();
+            if recorded.len() >= 8 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(rows.len(), 8);
+        assert_eq!(recorded.len(), 8);
+        assert!(recorded.iter().all(|o| o.source == "module:agentear"));
     }
 }

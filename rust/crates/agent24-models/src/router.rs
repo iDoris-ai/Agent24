@@ -293,23 +293,50 @@ impl ModelRouter {
         // v3 N1: a provider labeled Local talks ONLY to its loopback address —
         // no proxy, no redirect. v3 L-e: its reported tier string is the
         // judged tier, not a hard-coded "local".
-        let build =
-            |name: &str, url: String, key: Option<String>, tier: Tier| -> Arc<dyn ModelProvider> {
-                let p = crate::OpenAiCompatProvider::new(
-                    name,
-                    url,
-                    key,
-                    tier_label(tier),
-                    default_model.clone(),
-                );
-                Arc::new(if tier.is_local() {
-                    p.loopback_only()
-                } else {
-                    p
-                })
+        // Review H2: `chat_template_kwargs` (the `enable_thinking: false`
+        // convention) is an oMLX/mlx-lm-server-specific extension — NOT part
+        // of the OpenAI-compatible contract every provider here claims to
+        // speak. Sending it to a hosted/managed OpenAI-compatible endpoint
+        // (a remote provider, or even a local one that isn't actually oMLX)
+        // risks a hard 400 from a strict server. So this is opt-in per
+        // PROVIDER INSTANCE (`allow_ctk`), not derived from `tier` — a
+        // future non-oMLX local provider must NOT inherit it just for being
+        // local.
+        let build = |name: &str,
+                     url: String,
+                     key: Option<String>,
+                     tier: Tier,
+                     allow_ctk: bool|
+         -> Arc<dyn ModelProvider> {
+            let p = crate::OpenAiCompatProvider::new(
+                name,
+                url,
+                key,
+                tier_label(tier),
+                default_model.clone(),
+            );
+            let p = if tier.is_local() {
+                p.loopback_only()
+            } else {
+                p
             };
-        let omlx = build("omlx", omlx_url, Some(omlx_key), omlx_tier);
-        let ollama = build("ollama", ollama_url, None, ollama_tier);
+            let p = if allow_ctk {
+                p.supports_chat_template_kwargs()
+            } else {
+                p
+            };
+            Arc::new(p)
+        };
+        // oMLX only, and only when it actually judged as local (loopback) —
+        // a remote-pointed OMLX_URL never gets it either.
+        let omlx = build(
+            "omlx",
+            omlx_url,
+            Some(omlx_key),
+            omlx_tier,
+            omlx_tier.is_local(),
+        );
+        let ollama = build("ollama", ollama_url, None, ollama_tier, false);
         let mut router = Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)]);
         router.default_model = Some(default_model);
         router

@@ -275,7 +275,10 @@ export function App(): JSX.Element {
           </button>
         </div>
 
-        {page === 'chat'             && <ChatPage defaultModelName={daemonDefaultModel} />}
+        {/* Review M3: the chat suffix no longer takes a default-model prop —
+            it shows ONLY the server's own reported model_id (chat-latency.ts),
+            never the topbar's daemon-default guess standing in for it. */}
+        {page === 'chat'             && <ChatPage />}
         {page === 'workbench'        && <WorkbenchPage />}
         {page === 'runs'             && <RunsPage />}
         {page === 'schedules'        && <SchedulesPage />}

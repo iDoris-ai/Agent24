@@ -18,17 +18,7 @@ const SUGGESTIONS = [
   '翻译成英文',
 ]
 
-export interface ChatPageProps {
-  /** The topbar's resolved daemon default model name (App.tsx's
-   *  `daemonDefaultModel`) — shown in the reply suffix ONLY as a fallback,
-   *  when `/api/v1/chat`'s own response carries no `model_id` of its own
-   *  (see chat-latency.ts's module doc: today, always). `undefined`/`null`
-   *  both mean "no model name to show" — the suffix then shows just the
-   *  timing. */
-  defaultModelName?: string | null
-}
-
-export default function ChatPage({ defaultModelName = null }: ChatPageProps = {}) {
+export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -70,8 +60,13 @@ export default function ChatPage({ defaultModelName = null }: ChatPageProps = {}
       const totalMs = performance.now() - sentAt
       const reply = (res.data as { message?: { content?: string } })?.message?.content ?? '（模型未返回内容）'
       const server = extractServerReported(res.data)
+      // Review M3: ONLY the server's own reported model_id — never the
+      // topbar's daemon-default guess. `/api/v1/chat` now (post-M3) always
+      // reports the model_id the provider that actually served this call
+      // gave, or null when the provider didn't say; either way this suffix
+      // reflects what actually happened, never a name that might not be it.
       const suffix = formatReplySuffix({
-        modelName: server.modelId ?? defaultModelName,
+        modelName: server.modelId,
         tier: server.tier,
         firstTokenMs: server.firstTokenMs,
         totalMs: server.totalMs ?? totalMs,
