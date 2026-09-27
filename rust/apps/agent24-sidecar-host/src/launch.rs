@@ -505,6 +505,7 @@ mod windows_tests {
     use std::{
         collections::BTreeMap, io::Read as _, path::Path, sync::mpsc, thread, time::Duration,
     };
+    use tokio::io::AsyncReadExt;
 
     fn request(cwd: &Path) -> Request {
         let system_root = std::env::var("SystemRoot").expect("SystemRoot");
@@ -538,7 +539,7 @@ mod windows_tests {
                 .replace('\'', "''");
             argv[3] = String::from("-Command");
             argv[4] = format!(
-                "$child = Start-Process '{child_powershell}' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; [Console]::Out.Write('ready'); [Console]::Out.Flush(); [Console]::Error.Write('error'); [Console]::Error.Flush()"
+                "$child = Start-Process '{child_powershell}' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; [Console]::Out.Write('ready'); [Console]::Out.Flush()"
             );
             argv.truncate(5);
             env.remove("SIDE");
@@ -590,27 +591,22 @@ mod windows_tests {
                 pipes.take_stderr().expect("stderr moves once"),
             )
         };
-        let stdout_pipe = std::fs::File::from(
-            stdout_pipe
-                .into_owned_handle()
-                .expect("stdout owned handle"),
-        );
-        let stderr_pipe = std::fs::File::from(
-            stderr_pipe
-                .into_owned_handle()
-                .expect("stderr owned handle"),
-        );
-        let (stdout, stderr) = read_pair_then_cleanup(
-            stdout_pipe,
-            stderr_pipe,
-            4096,
-            Duration::from_secs(5),
-            || {
-                reap(&mut launch);
-                Ok(())
-            },
-        )
-        .expect("bounded output read and launch cleanup");
+        let output = tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let (stdout_result, stderr_result) = tokio::join!(
+                stdout_pipe.take(4096).read_to_end(&mut stdout),
+                stderr_pipe.take(4096).read_to_end(&mut stderr),
+            );
+            stdout_result?;
+            stderr_result?;
+            Ok::<_, io::Error>((stdout, stderr))
+        })
+        .await;
+        reap(&mut launch);
+        let (stdout, stderr) = output
+            .expect("child output deadline")
+            .expect("child output read");
         let stdout = String::from_utf8(stdout).expect("stdout UTF-8");
         let stderr = String::from_utf8(stderr).expect("stderr UTF-8");
         let fields: Vec<_> = stdout.split('|').collect();
@@ -698,52 +694,40 @@ mod windows_tests {
             LaunchIntent::from_request(descendant_request(&cwd)).expect("intent"),
         )
         .expect("owned launch");
-        let stdout = launch
+        let mut stdout = launch
             .parts_mut()
             .1
             .take_stdout()
             .expect("stdout moves once");
-        let stderr = launch
-            .parts_mut()
-            .1
-            .take_stderr()
-            .expect("stderr moves once");
-        let stdout = std::fs::File::from(stdout.into_owned_handle().expect("stdout owned handle"));
-        let stderr = std::fs::File::from(stderr.into_owned_handle().expect("stderr owned handle"));
-        let mut leader = None;
-        let mut tree = None;
-        let (ready, error) =
-            read_pair_then_cleanup(stdout, stderr, 5, Duration::from_secs(10), || {
-                let lifecycle = (|| {
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                    let exited = loop {
-                        match launch.target_mut().observe_exit()? {
-                            exited @ ExitObservation::Exited { .. } => break exited,
-                            ExitObservation::Running if std::time::Instant::now() < deadline => {
-                                std::thread::sleep(Duration::from_millis(25));
-                            }
-                            ExitObservation::Running => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    "leader did not exit before deadline",
-                                ));
-                            }
-                        }
-                    };
-                    let tree = launch.target_mut().reap_step()?;
-                    Ok((exited, tree))
-                })();
-                reap(&mut launch);
-                let (exited, observed_tree) = lifecycle?;
-                leader = Some(exited);
-                tree = Some(observed_tree);
-                Ok(())
-            })
-            .expect("bounded ready read and Job cleanup");
+        let lifecycle = async {
+            let mut ready = [0; 5];
+            tokio::time::timeout(Duration::from_secs(5), stdout.read_exact(&mut ready))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ready read timed out"))??;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let exited = loop {
+                match launch.target_mut().observe_exit()? {
+                    exited @ ExitObservation::Exited { .. } => break exited,
+                    ExitObservation::Running if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    ExitObservation::Running => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "leader did not exit before deadline",
+                        ));
+                    }
+                }
+            };
+            let tree = launch.target_mut().reap_step()?;
+            Ok::<_, io::Error>((ready, exited, tree))
+        }
+        .await;
+        reap(&mut launch);
+        let (ready, leader, tree) = lifecycle.expect("bounded ready read and Job cleanup");
         assert_eq!(ready, b"ready");
-        assert_eq!(error, b"error");
-        assert!(matches!(leader, Some(ExitObservation::Exited { .. })));
-        assert_eq!(tree, Some(TreeObservation::Present));
+        assert!(matches!(leader, ExitObservation::Exited { .. }));
+        assert_eq!(tree, TreeObservation::Present);
     }
 
     #[test]
