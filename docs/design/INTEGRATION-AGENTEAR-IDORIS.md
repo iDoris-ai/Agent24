@@ -1,6 +1,6 @@
 # AgentEar × Agent24 × iDoris 接入规划（ADR-032 草案）
 
-> **状态：提议中 —— §8 已记录 jason 2026-09-26 的 4 项拍板；推荐的接入方式因此从 A1 改为 A3（附着式模块）；iDoris 部分已由 idoris 会话核对并修订（§9，附录 B）**。决策摘要登记在 [`docs/decision.md`](../decision.md) ADR-032。
+> **状态：提议中 —— §8 已记录 jason 2026-09-26 的 4 项拍板；推荐的接入方式因此从 A1 改为 A3（附着式模块），A3 设计见 [`A3-ATTACHED-MODULE.md`](A3-ATTACHED-MODULE.md)；iDoris 部分已由 idoris 会话核对并修订（§9，附录 B）**。决策摘要登记在 [`docs/decision.md`](../decision.md) ADR-032。
 > 来源：2026-09-26 Opus 只读调研 + AgentEar 会话（agentear-59）一手回复。
 
 
@@ -25,13 +25,15 @@
 ## 2. 三方现状
 
 ### AgentEar（Rust 单二进制菜单栏 app，外加两个 Python/MLX 边车）
+> 2026-09-27 更新：AgentEar 现为 **v0.23.1**（`main@25537a2`）。与下文 v0.20.0 基线的差异：TTS 边车默认端口改为 **8796**（v0.22.0，端口被占时自动换端口拉起，不可用时用 `say` 提示）；Qwen3-ASR 可选后端已可在设置窗口下载（v0.23.0）。P0 契约（`agentear.{event,proposal,command}/1` schema + 57 个 fixtures）已合入 AgentEar `main@522f9eb`。
+
 - **热键**：CGEventTap 监听右 Command，推键式（按一下开始、再按一下停）（`src/hotkey.rs`）。
 - **ASR**：SenseVoiceSmall q8 子进程（`src/asr.rs`）；泰语走 whisper.cpp；可选 Qwen3-ASR。全部离线。
 - **LLM**：OpenAI-compat `POST /v1/chat/completions`，SSE 流式，指向 `talk_llm_url`（默认 127.0.0.1:8794，MiniCPM5-2B）。请求里**没有 `model` 字段、没有鉴权头，只发单轮**（`src/talk.rs:202-245`）。
-- **TTS**：VoxCPM2 边车 127.0.0.1:8765，`POST /speak`。按句流水线：出一句、合成一句、播一句。
+- **TTS**：VoxCPM2 边车 127.0.0.1:8796（v0.22.0 起默认；v0.20.0 时为 8765），`POST /speak`。按句流水线：出一句、合成一句、播一句。
 - **对外接口**：只有 CLI。冻结的契约是 `--match-command --json` → `agentear.proposal/1`（ADR-0008 §3），只提出、永不执行。**没有 HTTP、IPC 或事件通道**（Cargo.toml 里没有任何 server 依赖）。
 - **数据**：落盘在 `~/.agentear/`（raw/routes/kb/index），没有记忆子系统，这与 agentear-73 对齐过的边界一致。
-- **ADR-0008 §5 的 6 个问题**：全部未拍板（`docs/agent/tasks.md:726`）。
+- **ADR-0008 §5 的 6 个问题**：调研时全部未拍板（`docs/agent/tasks.md:726`）；**2026-09-27 已由 jason 答复**，记入 ADR-032。
 
 ### iDoris（TS monorepo）
 - **已实现（未合并）**：
@@ -137,7 +139,7 @@
 ## 6. 可直接转发的诉求
 
 **→ AgentEar**
-1. 做「模块模式」：从 fd 3 接入站 HTTP（可以用 SDK 的 `listener_from_env`）；**读到回调 EOF 就退出**；独立模式保持不变。
+1. 做「附着模式」（A3，取代原 A1 写法）：用户自行启动 AgentEar；经 `agent24 os attach add` 配对拿到 token（存 Keychain）后，连 Agent24 的附着 socket、用同一 `initialize` 握手，按 [`A3-ATTACHED-MODULE.md`](A3-ATTACHED-MODULE.md) §4 的 wire 规格自行实现（不依赖 Agent24 crate）；反向命令在**同一条连接**上以 `_a24/command/invoke` 下发，AgentEar 不监听任何 socket/端口；**读到 EOF 不退出**，按 B5 切换并退避重连；独立模式保持不变。
 2. 定义事件：`transcript{text, lang, content_hash}`、`proposal`（直接复用 `agentear.proposal/1`）、`turn{phase}`；定义命令：`POST /speak{text, lang, voice?}` 和 `POST /stop`。全部带 schema 版本。
 3. LLM 调用抽成可替换的 transport：独立模式走 HTTP；模块模式走 `_a24/model/complete`，并带上 `complexity`。
 4. `sidecar::probe` 现在只认 `mlx-dspark` 这个身份标识（`src/sidecar.rs:631`），接 iDoris 时要加 iDoris 的身份标识。另外请求里要补上 `model` 字段。
@@ -206,6 +208,8 @@
 - 反代入站（`/api/v1/agentear/*`）怎么路由到一个不是内核拉起的进程；
 - 同一个模块不能同时以「拉起」和「附着」两种方式存在。
 
+> 2026-09-27：上述五项已在 [`A3-ATTACHED-MODULE.md`](A3-ATTACHED-MODULE.md) 设计（反代入站一项改为：A3 不挂 `/api/v1/<ns>/*`，命令走固定内核路由 + 同一连接下发）。既然采用 A3，下面的 TCC spike **不再阻塞 P2**，只在将来想回到 A1 时才需要。
+
 **P0 新增**：用一个 spike 实测 A1 下 TCC 的实际归属。spike 需要在图形界面里点授权弹窗，要 jason 手动配合。如果实测 TCC 归属 AgentEar 自己，A1 仍然可用，A3 就降为可选项。
 
 
@@ -269,7 +273,7 @@
   - 可选 Qwen3-ASR（speech_swift）。
   - 全本地、离线。
 - **对话链路**：ASR 文本 → OpenAI-compat `/v1/chat/completions`，SSE 流式（src/talk.rs:181/:231）→ 默认 127.0.0.1:8794 上的 mlx_lm.server 跑 MiniCPM5-2B-4bit。改 `talk_llm_url` 可以接任何 OpenAI-compat 端点。回答按句子流水线：出一句、合成一句、播一句。
-- **TTS**：VoxCPM2（MLX），HTTP 边车 127.0.0.1:8765，接口 `POST /speak {text, lang: zh|en|th, voice?, style?, tone?}` → wav。播放用 afplay，兜底用 `say`。
+- **TTS**：VoxCPM2（MLX），HTTP 边车 127.0.0.1:8765（v0.20.0 时；v0.22.0 起默认 8796），接口 `POST /speak {text, lang: zh|en|th, voice?, style?, tone?}` → wav。播放用 afplay，兜底用 `say`。
 - **M2 理解层**：术语纠错和打标签（Ornith-9B），默认关闭。
 
 ## 2. 对外接口
@@ -289,6 +293,8 @@
   - 转写没有时间戳，也没有分段。
 
 ## 3. ADR-0008 §5 六个问题：全部未回答
+> 2026-09-27：已由 jason 全部答复，见 `docs/decision.md` ADR-032「ADR-0008 §5 六问的答复」。
+
 1. 事件通道：a stdout JSONL / b 本地 HTTP / c WS。倾向 a 起步、b 长期。
 2. 热键归属：两个 app 都装 CGEventTap 会冲突，必须只有一方录音。
 3. 麦克风与播放归属：打断依赖进程内的播放状态。
@@ -297,6 +303,8 @@
 6. 回执留档：AgentEar 不落库，倾向归宿主。
 
 ## 4. AgentEar 的倾向（待 jason 拍板）
+> **已被 A3 取代**（2026-09-27）：「由 Agent24 拉起并托管」这一条因 D4（TCC 留在 AgentEar）改为附着式模块，见 [`A3-ATTACHED-MODULE.md`](A3-ATTACHED-MODULE.md)。其余倾向（AgentEar 持有热键/麦克风/播放、推 transcript/proposal、收 speak/stop_playback、独立运行保持现状）不变。
+
 - AgentEar 作为 Agent24 的 OOP 模块：Agent24 拉起并托管它，通过 manifest + JSON-RPC 回调通道收事件。
 - AgentEar 继续持有热键、麦克风、播放：改动最小，打断语义不变，TCC 权限不用迁移。
 - 向宿主推 `transcript` / `proposal` 事件；接收 `speak` / `stop_playback` 命令。
