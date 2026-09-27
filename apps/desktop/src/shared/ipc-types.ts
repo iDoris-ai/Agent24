@@ -21,6 +21,10 @@ export const IpcChannels = {
   // A3-4: push channel only (main -> renderer via webContents.send). Not an
   // ipcMain.handle() target — see main/agentear-events.ts.
   AgentEarEvent: 'agentear:event',
+  // A3-4 review M5: pull channel — the panel calls this once on mount to get
+  // the main-process log's current state (main/agentear-log.ts), so
+  // navigating away and back doesn't lose it. Ordinary ipcMain.handle().
+  AgentEarSnapshot: 'agentear:snapshot',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]

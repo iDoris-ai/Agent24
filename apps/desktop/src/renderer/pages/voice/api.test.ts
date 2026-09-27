@@ -118,6 +118,103 @@ describe('sendSpeak / sendStopPlayback — wire shape (design §6: POST /api/v1/
   })
 })
 
+describe('command_id retry-reuse on unknown-result failures (design §6.3, optional)', () => {
+  it('a 504 timeout is retryable with the SAME command_id for identical content', async () => {
+    const statuses = [504, 200]
+    const ids: string[] = []
+    mockProxy((req) => {
+      ids.push((req.body as { command_id: string }).command_id)
+      const status = statuses.shift()!
+      return Promise.resolve(
+        status === 200
+          ? { ok: true, status, data: { result: { accepted: true } } }
+          : { ok: false, status, data: { error: { message: 'timeout' } } },
+      )
+    })
+    await expect(sendSpeak({ text: 'retry me', lang: 'zh-CN' })).rejects.toThrow()
+    await sendSpeak({ text: 'retry me', lang: 'zh-CN' }) // identical content, retried
+    expect(ids[0]).toBe(ids[1])
+  })
+
+  it('a 502 connection_lost is retryable with the SAME command_id', async () => {
+    let firstId = ''
+    mockProxy((req) => {
+      firstId = (req.body as { command_id: string }).command_id
+      return Promise.resolve({
+        ok: false, status: 502, data: { error: { code: 'connection_lost', message: 'connection lost' } },
+      })
+    })
+    try {
+      await sendSpeak({ text: 'x', lang: 'zh-CN' })
+    } catch { /* expected */ }
+    expect(firstId).not.toBe('')
+
+    let secondId = ''
+    mockProxy((req) => {
+      secondId = (req.body as { command_id: string }).command_id
+      return Promise.resolve({ ok: true, status: 200, data: { result: { accepted: true } } })
+    })
+    await sendSpeak({ text: 'x', lang: 'zh-CN' })
+    expect(secondId).toBe(firstId)
+  })
+
+  it('a 502 module_error (a definite, known failure) does NOT reuse the command_id', async () => {
+    let firstId = ''
+    mockProxy((req) => {
+      firstId = (req.body as { command_id: string }).command_id
+      return Promise.resolve({
+        ok: false, status: 502, data: { error: { code: 'module_error', message: 'bad response', rpc_code: -32602 } },
+      })
+    })
+    try {
+      await sendSpeak({ text: 'y', lang: 'zh-CN' })
+    } catch { /* expected */ }
+    expect(firstId).not.toBe('')
+
+    let secondId = ''
+    mockProxy((req) => {
+      secondId = (req.body as { command_id: string }).command_id
+      return Promise.resolve({ ok: true, status: 200, data: { result: { accepted: true } } })
+    })
+    await sendSpeak({ text: 'y', lang: 'zh-CN' })
+    expect(secondId).not.toBe(firstId)
+  })
+
+  it('a definite failure (e.g. 400) clears the memo — a later identical call gets a NEW id', async () => {
+    let idA = ''
+    mockProxy((req) => {
+      idA = (req.body as { command_id: string }).command_id
+      return Promise.resolve({ ok: false, status: 400, data: { error: { message: 'bad request' } } })
+    })
+    await expect(sendSpeak({ text: 'z', lang: 'zh-CN' })).rejects.toThrow()
+
+    let idB = ''
+    mockProxy((req) => {
+      idB = (req.body as { command_id: string }).command_id
+      return Promise.resolve({ ok: true, status: 200, data: { result: { accepted: true } } })
+    })
+    await sendSpeak({ text: 'z', lang: 'zh-CN' })
+    expect(idB).not.toBe(idA)
+  })
+
+  it('a successful send clears the memo — a later identical call is a fresh repeat with a NEW id', async () => {
+    let idA = ''
+    mockProxy((req) => {
+      idA = (req.body as { command_id: string }).command_id
+      return Promise.resolve({ ok: true, status: 200, data: { result: { accepted: true } } })
+    })
+    await sendSpeak({ text: 'again', lang: 'zh-CN' })
+
+    let idB = ''
+    mockProxy((req) => {
+      idB = (req.body as { command_id: string }).command_id
+      return Promise.resolve({ ok: true, status: 200, data: { result: { accepted: true } } })
+    })
+    await sendSpeak({ text: 'again', lang: 'zh-CN' })
+    expect(idB).not.toBe(idA)
+  })
+})
+
 describe('isBuiltinProposal', () => {
   const base: AgentEarEventEnvelope = {
     schema: 'agentear.event/1', event_id: 'e', session_id: 's', seq: 1, type: 'proposal', payload: {},

@@ -8,13 +8,16 @@
 // never get an action button; non-builtin proposals are shown labeled
 // "P3 前不执行" and likewise never get one.
 //
-// No persistence anywhere (§7.3/§8, Q4=a): only an in-memory ring buffer of
-// the most recent 200 delivered events, held in React state. Nothing here
-// touches localStorage/sessionStorage/IndexedDB/files — closing the window or
-// restarting Agent24 loses the log, by design.
+// No persistence anywhere (§7.3/§8, Q4=a): the log this panel shows lives
+// only in the main process's memory (main/agentear-log.ts, review M5) —
+// nothing here or there touches localStorage/sessionStorage/IndexedDB/files.
+// Closing Agent24 (not just this panel) loses it, by design. Review M5 also
+// moved the sequencer + the 200-event cap OUT of this component and into
+// main: switching to another sidebar page and back now keeps the list,
+// because it was never this component's state to lose — this component
+// just pulls a snapshot on mount and mirrors new arrivals from then on.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { AgentEarSequencer } from './agentearSequencer'
+import { useEffect, useState } from 'react'
 import { truncateForDisplay } from './display'
 import {
   getAgentEarAttachment,
@@ -27,11 +30,17 @@ import {
   type AttachedView,
   type ByServedUsage,
 } from './api'
+import { MAX_EVENTS_IN_MEMORY, pushCapped } from '../../../shared/agentearSequencer'
 
-export const MAX_EVENTS_IN_MEMORY = 200
+export { MAX_EVENTS_IN_MEMORY, pushCapped }
+
 const ATTACH_POLL_MS = 3000
 const USAGE_POLL_MS = 5000
-const GAP_TIMEOUT_CHECK_MS = 500
+/** AgentEar command schema's `speak.text` hard limit (contracts/schema/
+ *  agentear.command.v1.schema.json: maxLength 2000) — enforced client-side
+ *  too so a paste-in doesn't silently get rejected server-side with no
+ *  visible reason. */
+const SPEAK_TEXT_MAX_LENGTH = 2000
 
 const SPEAK_LANGS: { value: 'zh-CN' | 'en-US' | 'th-TH'; label: string }[] = [
   { value: 'zh-CN', label: '中文' },
@@ -56,18 +65,6 @@ const SPEECH_STATE_LABELS: Record<string, string> = {
 
 function isAttached(attach: AttachedView | null): boolean {
   return attach?.attach_status === 'attached'
-}
-
-/** Appends `items` to `prev`, keeping only the most recent MAX_EVENTS_IN_MEMORY
- *  (design §7.3: "最近 200 条"). Exported for the ring-buffer-cap test. */
-export function pushCapped(
-  prev: AgentEarEventEnvelope[],
-  items: AgentEarEventEnvelope[],
-  cap: number = MAX_EVENTS_IN_MEMORY,
-): AgentEarEventEnvelope[] {
-  if (items.length === 0) return prev
-  const merged = [...prev, ...items]
-  return merged.length > cap ? merged.slice(merged.length - cap) : merged
 }
 
 function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Element {
@@ -169,29 +166,28 @@ export default function VoicePanel(): JSX.Element {
   const [commandError, setCommandError] = useState<string | null>(null)
   const [lastCommandId, setLastCommandId] = useState<string | null>(null)
 
-  const sequencer = useRef(new AgentEarSequencer())
-
-  const appendDelivered = useCallback((delivered: AgentEarEventEnvelope[]) => {
-    if (delivered.length === 0) return
-    setEvents((prev) => pushCapped(prev, delivered))
-  }, [])
-
-  // Live events: main process pushes raw agentear.event/1 objects (already
-  // unwrapped from the WS module envelope — see main/agentear-events.ts);
-  // this sequencer call is the ONLY place they're de-duped/ordered/validated.
+  // Review M5: sequencing/de-dup/the 200-cap all happen in the main process
+  // now (main/agentear-log.ts) — this component just pulls whatever the log
+  // already holds once on mount (so switching pages and back doesn't lose
+  // it), then mirrors each NEW envelope as it's pushed, applying the same
+  // cap locally too (defense in depth for a very long-lived mount).
   useEffect(() => {
-    const unsubscribe = window.agent24.onAgentEarEvent((raw) => {
-      const { delivered } = sequencer.current.ingest(raw)
-      appendDelivered(delivered)
+    let cancelled = false
+    window.agent24.agentearSnapshot()
+      .then((initial) => {
+        if (!cancelled) setEvents(initial as AgentEarEventEnvelope[])
+      })
+      .catch(() => {
+        /* snapshot is best-effort — live events still arrive via the subscription below */
+      })
+    const unsubscribe = window.agent24.onAgentEarEvent((envelope) => {
+      setEvents((prev) => pushCapped(prev, [envelope as AgentEarEventEnvelope]))
     })
-    const gapTimer = setInterval(() => {
-      appendDelivered(sequencer.current.checkGapTimeouts())
-    }, GAP_TIMEOUT_CHECK_MS)
     return () => {
+      cancelled = true
       unsubscribe()
-      clearInterval(gapTimer)
     }
-  }, [appendDelivered])
+  }, [])
 
   // Attach status poll (GET /api/v1/attached).
   useEffect(() => {
@@ -277,7 +273,7 @@ export default function VoicePanel(): JSX.Element {
     <div className="content">
       <div className="page-title">语音（AgentEar）</div>
       <div className="page-sub">
-        实时展示 · 不持久化（最近 {MAX_EVENTS_IN_MEMORY} 条，关窗即丢）
+        实时展示 · 最近 {MAX_EVENTS_IN_MEMORY} 条 · 关闭应用即丢，不落盘
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
@@ -320,6 +316,7 @@ export default function VoicePanel(): JSX.Element {
           aria-label="让它说"
           placeholder="让 AgentEar 说一句…"
           value={speakText}
+          maxLength={SPEAK_TEXT_MAX_LENGTH}
           onChange={(e) => setSpeakText(e.target.value)}
           disabled={!attached}
           style={{

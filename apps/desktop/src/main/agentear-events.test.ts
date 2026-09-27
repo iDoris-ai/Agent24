@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest'
-import { parseAgentEarFrame, nextBackoffMs, AGENTEAR_MODULE_NAME, AGENTEAR_EVENT_KIND } from './agentear-events'
+import { describe, it, expect, vi } from 'vitest'
+import {
+  parseAgentEarFrame,
+  nextBackoffMs,
+  AGENTEAR_MODULE_NAME,
+  AGENTEAR_EVENT_KIND,
+  AgentEarEventBridge,
+} from './agentear-events'
 
 const AGENTEAR_ENVELOPE = {
   schema: 'agentear.event/1',
@@ -72,5 +78,71 @@ describe('nextBackoffMs', () => {
   it('caps at 30s', () => {
     expect(nextBackoffMs(20000)).toBe(30000)
     expect(nextBackoffMs(30000)).toBe(30000)
+  })
+})
+
+// ── M4: stop() while the socket is still CONNECTING must not throw ─────────
+// Real `ws` sockets emit a synchronous 'error' when close()d before the
+// handshake finishes. This fake reproduces exactly that behavior (and
+// nothing else) so the test exercises the real bug without a real socket.
+// Defined inside vi.hoisted() — vi.mock's factory below is hoisted above
+// this file's own statements, so a plain `class FakeWebSocket {}` declared
+// later would still be in its temporal dead zone when the factory runs.
+const FakeWebSocket = vi.hoisted(() => {
+  // node:events via require(), not the top-of-file `import` — vi.hoisted's
+  // callback runs even before this file's own import bindings are live.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { EventEmitter: EE } = require('node:events') as typeof import('node:events')
+  return class FakeWebSocket extends EE {
+    static readonly CONNECTING = 0
+    static readonly OPEN = 1
+    static readonly CLOSED = 3
+    readyState = 0
+    url: string
+    opts?: unknown
+    constructor(url: string, opts?: unknown) {
+      super()
+      this.url = url
+      this.opts = opts
+    }
+    close(): void {
+      if (this.readyState === FakeWebSocket.CONNECTING) {
+        // Mirrors real `ws`: aborting mid-handshake surfaces as an error.
+        // EventEmitter THROWS synchronously here if nothing is listening for
+        // 'error' — that's the exact crash M4 fixes.
+        this.emit('error', new Error('WebSocket was closed before the connection was established'))
+      }
+      this.readyState = FakeWebSocket.CLOSED
+      this.emit('close')
+    }
+  }
+})
+
+vi.mock('ws', () => ({ default: FakeWebSocket }))
+vi.mock('./backend-manager', () => ({
+  getBackendEndpoint: () => ({ port: 12345, token: 'test-token' }),
+}))
+
+describe('AgentEarEventBridge.stop() — M4', () => {
+  it('does not throw when the socket is still CONNECTING', () => {
+    const bridge = new AgentEarEventBridge(() => {})
+    bridge.start()
+    expect(() => bridge.stop()).not.toThrow()
+  })
+
+  it('is safe to call twice in a row', () => {
+    const bridge = new AgentEarEventBridge(() => {})
+    bridge.start()
+    bridge.stop()
+    expect(() => bridge.stop()).not.toThrow()
+  })
+
+  it('does not throw when stop() races an already-OPEN socket either', () => {
+    const bridge = new AgentEarEventBridge(() => {})
+    bridge.start()
+    // Reach into the fake to simulate a completed handshake before stopping.
+    const openSocket = (bridge as unknown as { socket: FakeWebSocket | null }).socket
+    if (openSocket) openSocket.readyState = FakeWebSocket.OPEN
+    expect(() => bridge.stop()).not.toThrow()
   })
 })

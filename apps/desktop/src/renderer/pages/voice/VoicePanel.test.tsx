@@ -10,6 +10,7 @@ type BackendRes = { ok: boolean; status: number; data: unknown }
 let posted: Array<{ path: string; body: unknown }> = []
 let onEventHandler: ((raw: unknown) => void) | null = null
 let attachModules: AttachedView[] = []
+let snapshotEvents: AgentEarEventEnvelope[] = []
 
 function mount(): void {
   posted = []
@@ -47,8 +48,13 @@ function mount(): void {
     return () => { onEventHandler = null }
   })
 
+  // Review M5: the log (sequencing + 200-cap) now lives in main
+  // (agentear-log.ts) — the panel just pulls whatever it already holds once
+  // on mount, so this mock stands in for main's `agentear:snapshot` handler.
+  const agentearSnapshot = vi.fn(() => Promise.resolve(snapshotEvents))
+
   Object.defineProperty(window, 'agent24', {
-    value: { backendProxy: proxy, onAgentEarEvent },
+    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot },
     writable: true,
     configurable: true,
   })
@@ -80,6 +86,7 @@ function transcript(session: string, seq: number, text: string): AgentEarEventEn
 
 beforeEach(() => {
   attachModules = []
+  snapshotEvents = []
 })
 
 describe('VoicePanel — attach status', () => {
@@ -110,6 +117,14 @@ describe('VoicePanel — attach status', () => {
     expect(screen.getByRole('button', { name: '停止播放' })).not.toBeDisabled()
     // speak button stays disabled until there's text
     expect(screen.getByRole('button', { name: '让它说' })).toBeDisabled()
+  })
+
+  it('caps the speak input at 2000 chars (agentear.command.v1 schema: speak.text maxLength)', async () => {
+    attachModules = [attached()]
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByText(/已附着/)).toBeInTheDocument())
+    expect(screen.getByLabelText('让它说')).toHaveAttribute('maxLength', '2000')
   })
 })
 
@@ -261,6 +276,23 @@ describe('VoicePanel — live event display', () => {
     expect(screen.queryByText('msg-5')).not.toBeInTheDocument()
     expect(screen.getByText('msg-6')).toBeInTheDocument() // oldest surviving row
     expect(document.querySelectorAll('.voice-row')).toHaveLength(MAX_EVENTS_IN_MEMORY)
+  })
+
+  it('review M5: remounting the panel (navigating away and back) does not lose the list — it comes from main\'s snapshot', async () => {
+    // Simulate main (agentear-log.ts) already holding events from BEFORE
+    // this mount — e.g. because the user was on another sidebar page while
+    // AgentEar kept talking, or simply switched to 语音 and back.
+    snapshotEvents = [transcript('ses_1', 1, '早于挂载就已经在主进程日志里')]
+    mount()
+    const { unmount } = render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByText('早于挂载就已经在主进程日志里')).toBeInTheDocument())
+
+    // Unmount (as App.tsx does when navigating to another page) and remount —
+    // the OLD architecture (sequencer + state living in this component) would
+    // show an empty panel here; the fix must not.
+    unmount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByText('早于挂载就已经在主进程日志里')).toBeInTheDocument())
   })
 })
 

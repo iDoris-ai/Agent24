@@ -89,9 +89,18 @@ export class AgentEarEventBridge {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    this.socket?.removeAllListeners()
-    this.socket?.close()
-    this.socket = null
+    if (this.socket) {
+      this.socket.removeAllListeners()
+      // Review M4: closing a socket still in CONNECTING readyState makes
+      // `ws` emit a synchronous 'error' (the aborted handshake). We just
+      // stripped every listener above (including our own real error
+      // handler), so with nothing attached that emit throws, uncaught, and
+      // crashes the main process. Reattach a no-op BEFORE close() so that
+      // error has somewhere safe to land.
+      this.socket.on('error', () => {})
+      this.socket.close()
+      this.socket = null
+    }
   }
 
   private connect(): void {

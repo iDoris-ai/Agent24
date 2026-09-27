@@ -36,6 +36,53 @@ export function genCommandId(): string {
   return `cmd_${Date.now().toString(36)}_${commandIdCounter}_${Math.random().toString(36).slice(2, 8)}`
 }
 
+// ── Retry-reuse of command_id (optional, design §6.3) ───────────────────────
+// "调用方拿到 504/502 connection_lost 时可用同一 command_id 重试" — the RESULT
+// of that specific attempt is UNKNOWN (the command may or may not have
+// reached/executed on AgentEar), so a DELIBERATE retry of the exact same
+// content should carry the SAME command_id: AgentEar's own dedupe (§6.3,
+// keeps the last 256+ command_ids) then makes a retry that actually landed a
+// no-op instead of a second execution.
+//
+// The memo is populated ONLY AFTER an attempt resolves with an unknown
+// result — never up front at call time. This matters for two back-to-back
+// calls with identical content that are NOT a retry of anything (e.g. the
+// user clicks "停止播放" twice quickly): each must get its own fresh id,
+// because neither has failed yet when the other is dispatched. Only once a
+// call has actually come back 504/502-connection_lost does the NEXT
+// identical-content call reuse that id; any other outcome (success, or a
+// definite failure like 400/403/502-module_error) clears the memo instead.
+let lastUnknownResultAttempt: { key: string; commandId: string } | null = null
+
+function resultIsUnknown(res: { status: number; data: unknown }): boolean {
+  if (res.status === 504) return true // design §6.1 table: timeout, result unknown
+  if (res.status === 502) {
+    // §6.1 table: 502 covers BOTH `connection_lost` (result unknown, retry
+    // may reuse the id) and `module_error` (a definite RPC failure — known,
+    // must NOT reuse). Only the former qualifies.
+    const code = (res.data as { error?: { code?: unknown } } | null)?.error?.code
+    return code === 'connection_lost'
+  }
+  return false
+}
+
+/** Returns the id to send with THIS attempt: the previous attempt's id if it
+ *  failed with an unknown result for this exact content, otherwise a fresh
+ *  one. Consumes the memo either way — if this new attempt ALSO comes back
+ *  unknown, `resolveAttempt` re-populates it for the next one. */
+function commandIdFor(key: string): string {
+  if (lastUnknownResultAttempt && lastUnknownResultAttempt.key === key) {
+    const id = lastUnknownResultAttempt.commandId
+    lastUnknownResultAttempt = null
+    return id
+  }
+  return genCommandId()
+}
+
+function resolveAttempt(key: string, commandId: string, res: { status: number; data: unknown }): void {
+  lastUnknownResultAttempt = resultIsUnknown(res) ? { key, commandId } : null
+}
+
 export interface SpeakPayload {
   text: string
   lang: 'zh-CN' | 'en-US' | 'th-TH'
@@ -47,12 +94,14 @@ export interface SpeakPayload {
  *  envelope (design §6). Returns the command_id used, so the caller can match
  *  it against later `speech`/`error` events carrying the same id. */
 export async function sendSpeak(payload: SpeakPayload): Promise<string> {
-  const command_id = genCommandId()
+  const key = JSON.stringify({ type: 'speak', payload })
+  const command_id = commandIdFor(key)
   const res = await window.agent24.backendProxy({
     method: 'POST',
     path: `/api/v1/os/${AGENTEAR_MODULE_NAME}/commands/speak`,
     body: { schema: AGENTEAR_COMMAND_SCHEMA, command_id, type: 'speak', payload },
   })
+  resolveAttempt(key, command_id, res)
   if (!res.ok) throw new Error(errorMessage(res))
   return command_id
 }
@@ -60,13 +109,15 @@ export async function sendSpeak(payload: SpeakPayload): Promise<string> {
 /** POST /api/v1/os/agentear/commands/stop_playback. `session_id` omitted =
  *  stop all playback (schema default). */
 export async function sendStopPlayback(sessionId?: string): Promise<string> {
-  const command_id = genCommandId()
   const payload = sessionId ? { session_id: sessionId } : {}
+  const key = JSON.stringify({ type: 'stop_playback', payload })
+  const command_id = commandIdFor(key)
   const res = await window.agent24.backendProxy({
     method: 'POST',
     path: `/api/v1/os/${AGENTEAR_MODULE_NAME}/commands/stop_playback`,
     body: { schema: AGENTEAR_COMMAND_SCHEMA, command_id, type: 'stop_playback', payload },
   })
+  resolveAttempt(key, command_id, res)
   if (!res.ok) throw new Error(errorMessage(res))
   return command_id
 }
