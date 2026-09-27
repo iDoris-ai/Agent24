@@ -197,8 +197,16 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// E4 (pre-release): `FiredBody` deliberately stopped denying unknown
+    /// fields (`agent24_os_proto::kernel_call::FiredBody`'s own doc) — a
+    /// future kernel adding a field to this body must not make every
+    /// already-deployed (and un-upgradable in lockstep) module's SDK reject
+    /// every `fired` delivery with 400. This test used to assert the
+    /// opposite (`400`); it now asserts the delivery is still accepted, and
+    /// the recognised fields still reach the handler, with the unknown one
+    /// simply ignored.
     #[tokio::test]
-    async fn an_unknown_body_field_is_rejected_400() {
+    async fn an_unknown_body_field_is_ignored_not_rejected() {
         let mut body = body_json();
         body["extra"] = json!("nope");
         let req = HttpRequest::post(FIRED_PATH)
@@ -207,7 +215,7 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

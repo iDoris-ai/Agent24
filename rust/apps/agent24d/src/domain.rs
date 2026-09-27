@@ -5055,8 +5055,12 @@ upsert_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/scheduler/upsert",
               "params": {"key": "probe.key", "spec": {"type": "every", "secs": 3600}}}
 cb.sendall((json.dumps(upsert_req) + "\n").encode())
 upsert_resp = json.loads(f.readline())
-with open("probe.json", "w") as out:
+# FU-83: write-then-rename, same as the `probe.json.tmp`/`os.replace` pattern
+# above (see its own comment, FU-78) — a plain `open(..., "w")` here let a
+# concurrent reader observe a half-written `probe.json`.
+with open("probe.json.tmp", "w") as out:
     json.dump({"offers_scheduler": offers_scheduler, "upsert_response": upsert_resp}, out)
+os.replace("probe.json.tmp", "probe.json")
 while f.readline():
     pass
 "#;
@@ -5200,8 +5204,13 @@ complete_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/model/complete",
                 "params": {"messages": [{"role": "user", "content": "hi"}]}}
 cb.sendall((json.dumps(complete_req) + "\n").encode())
 complete_resp = json.loads(f.readline())
-with open("probe.json", "w") as out:
+# FU-83: write-then-rename, same as the `probe.json.tmp`/`os.replace` pattern
+# elsewhere in this module (see the scheduler probe's own comment, FU-78) —
+# a plain `open(..., "w")` here let a concurrent reader observe a
+# half-written `probe.json`.
+with open("probe.json.tmp", "w") as out:
     json.dump({"offers_model": offers_model, "complete_response": complete_resp}, out)
+os.replace("probe.json.tmp", "probe.json")
 while f.readline():
     pass
 "#;
