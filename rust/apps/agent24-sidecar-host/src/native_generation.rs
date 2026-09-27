@@ -74,17 +74,27 @@ impl<'host> NativeGeneration<'host> {
         output: &'host mut OutputWorker,
         control: &'host mut ControlWorker,
         limits: Deadlines,
+        launch_deadline: Instant,
         now: Instant,
     ) -> Result<Self, NativeGenerationBuildError> {
-        Self::assemble_in(WorkerSlots::host(), launch, output, control, limits, now)
+        Self::assemble_in(
+            WorkerSlots::host(),
+            launch,
+            output,
+            control,
+            limits,
+            launch_deadline,
+            now,
+        )
     }
 
-    fn assemble_in(
+    pub(crate) fn assemble_in(
         slots: &'static WorkerSlots,
         mut launch: OwnedLaunch,
         output: &'host mut OutputWorker,
         control: &'host mut ControlWorker,
         limits: Deadlines,
+        launch_deadline: Instant,
         now: Instant,
     ) -> Result<Self, NativeGenerationBuildError> {
         let stdout = match launch.pipes_mut().take_stdout() {
@@ -124,12 +134,8 @@ impl<'host> NativeGeneration<'host> {
                 ));
             }
         };
-        let actor = ActorLaunchOrder::new(
-            launch,
-            output,
-            Phase::Launching(now + limits.launch),
-            limits,
-        );
+        let actor =
+            ActorLaunchOrder::new(launch, output, Phase::Launching(launch_deadline), limits);
         Ok(Self {
             driver: GenerationDriver::new(actor, control, ready, now),
             stderr,
@@ -266,6 +272,7 @@ mod tests {
             &mut output,
             &mut control,
             LIMITS,
+            now + LIMITS.launch,
             now,
         )
         .unwrap();
@@ -318,13 +325,15 @@ mod tests {
         )
         .unwrap();
         let mut control = ControlWorker::new_in(slots, PendingRead, None).unwrap();
+        let now = Instant::now();
         let error = match NativeGeneration::assemble_in(
             slots,
             launch(82),
             &mut output,
             &mut control,
             LIMITS,
-            Instant::now(),
+            now + LIMITS.launch,
+            now,
         ) {
             Ok(_) => panic!("busy ReadyRead slot unexpectedly assembled"),
             Err(error) => error,
@@ -358,6 +367,48 @@ mod tests {
     }
 
     #[test]
+    fn missing_stdout_build_error_retains_cleanup_owner() {
+        let _test_guard = crate::posix::tests::test_lock();
+        let slots = WorkerSlots::isolated();
+        let mut launch = launch(84);
+        drop(launch.pipes_mut().take_stdout());
+        let mut output = OutputWorker::new_in(
+            slots,
+            SharedWriter(Arc::new(Mutex::new(Vec::new()))),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let mut control = ControlWorker::new_in(slots, PendingRead, None).unwrap();
+        let now = Instant::now();
+        let error = match NativeGeneration::assemble_in(
+            slots,
+            launch,
+            &mut output,
+            &mut control,
+            LIMITS,
+            now + LIMITS.launch,
+            now,
+        ) {
+            Ok(_) => panic!("missing stdout unexpectedly assembled"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), NativeGenerationBuildErrorKind::MissingStdout);
+        let mut cleanup =
+            error.into_pre_owned_cleanup(Phase::Launching(now + LIMITS.launch), LIMITS);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match cleanup.step(Instant::now()).unwrap() {
+                crate::target::TreeObservation::ConfirmedEmpty => break,
+                crate::target::TreeObservation::Present if Instant::now() < deadline => {
+                    thread::yield_now()
+                }
+                tree => panic!("missing-pipe cleanup did not converge: {tree:?}"),
+            }
+        }
+        crate::posix::tests::wait_for_reaper_idle();
+    }
+
+    #[test]
     fn assembled_generation_failure_is_consumed_by_pre_owned_cleanup() {
         let _test_guard = crate::posix::tests::test_lock();
         let slots = WorkerSlots::isolated();
@@ -370,6 +421,7 @@ mod tests {
             &mut output,
             &mut control,
             LIMITS,
+            now + LIMITS.launch,
             now,
         )
         .unwrap();

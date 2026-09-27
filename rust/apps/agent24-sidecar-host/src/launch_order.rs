@@ -265,6 +265,7 @@ pub(crate) struct ScheduleState {
     pub(crate) phase: Phase,
     pub(crate) terminal: bool,
     pub(crate) output_pending: bool,
+    pub(crate) owned_acknowledged: bool,
     pub(crate) exit_retained: bool,
 }
 
@@ -331,6 +332,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
             terminal: self.terminal.is_some()
                 || self.order.stage == LaunchOrderStage::CleanupRequired,
             output_pending: self.output_pending(),
+            owned_acknowledged: self.owned_acknowledged(),
             exit_retained: self.exit_retained(),
         }
     }
@@ -537,10 +539,7 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
 
     pub(crate) fn completed_request_dispatch_allowed(&self) -> bool {
         let state = self.schedule_state();
-        !state.terminal
-            && !state.exit_retained
-            && !state.output_pending
-            && self.owned_acknowledged()
+        !state.terminal && !state.exit_retained && !state.output_pending && state.owned_acknowledged
     }
 
     pub(crate) fn ready(
