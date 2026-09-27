@@ -14,7 +14,7 @@ All notable changes to Agent24 are documented here. This project adheres to
 - RPC `ErrorKind` 从 17 种变成 18 种（新增 `unavailable`，#451）。
 
 **行为变化**
-- 模块经 `_a24/model/complete` 调用推理回调、且显式或默认带 `complexity: simple` 时，本地 oMLX 上会自动带 `chat_template_kwargs.enable_thinking=false`（Qwen3 系推理模型不再把 `<think>...</think>` 大段思考念出来）——AgentEar 语音场景的动机，但对**任何**模块的 simple 调用都生效，不按调用方区分（#544）。`complexity: complex` 不受影响。
+- 模块经 `_a24/model/complete` 调用推理回调、且**显式**传 `complexity: simple` 时，若由本地 loopback 的 oMLX 服务，会自动带 `chat_template_kwargs.enable_thinking=false`（Qwen3 系推理模型不再先输出大段思考）——AgentEar 语音场景的动机，但对**任何**显式 simple 的模块调用都生效（#544）。未传 `complexity` 与 `complex` 不受影响；非本地或非 oMLX 的 provider 从不发送该字段。
 
 **新功能**
 - **进程外领域 OS（ME-3，ADR-031）**：
