@@ -275,6 +275,43 @@ impl KernelCalls {
         self.shared.close();
     }
 
+    /// C1 (pre-release): enqueue an already-framed, newline-terminated line
+    /// (NOT a `call()` — no `id` is registered in `pending`, so no response
+    /// is ever awaited for it) onto the SAME outbound queue `call()` and
+    /// `serve_until`'s relayed answers share, via the same non-blocking
+    /// `try_send` `call()` uses (review H1's reasoning applies identically:
+    /// a kernel-originated write must not block on queue space).
+    ///
+    /// This exists for exactly one caller,
+    /// `agent24d::attach_listener::handle_connection`, and one line: the
+    /// handshake success frame. The bug it closes: writing that frame
+    /// directly to the raw connection BEFORE calling
+    /// `agent24d::attach_registry::AttachRegistry::attach_kernel_calls`
+    /// leaves a gap — the module has its handshake result and may act on it
+    /// (or a client observing attach state elsewhere may race ahead) while
+    /// the registry still has no `KernelCalls` installed for this
+    /// generation, so `POST /api/v1/os/{name}/commands/*` in that gap gets a
+    /// spurious `503 module_not_ready`. Calling this BEFORE
+    /// `attach_kernel_calls` closes it the other way around: this handle is
+    /// not reachable from anywhere else until `attach_kernel_calls` installs
+    /// it, so nothing could have enqueued a command frame ahead of `line`
+    /// here — `line` is guaranteed to be message #1 on this queue — and by
+    /// the time `attach_kernel_calls` makes this handle reachable, the
+    /// success frame is already ahead of it in program order, not behind.
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` if the outbound queue is already gone or full — treat
+    /// exactly like the old direct write timing out: the caller must not
+    /// admit this generation. A dedicated error type would carry no more
+    /// information than that (the queue's own `mpsc::error::TrySendError`
+    /// is `Full`-or-`Closed`, and this caller's one response to either is
+    /// identical), so `()` is kept rather than introduced for its own sake.
+    #[allow(clippy::result_unit_err)]
+    pub fn enqueue_raw(&self, line: Vec<u8>) -> Result<(), ()> {
+        self.out_tx.try_send(line).map_err(|_| ())
+    }
+
     /// Frames without `method` that matched no pending call: dropped, never
     /// answered, never handed to `serve_until` (§6.2, review H3).
     #[must_use]
