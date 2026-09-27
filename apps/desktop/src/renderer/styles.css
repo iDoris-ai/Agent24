@@ -60,6 +60,7 @@ button { cursor: pointer; font-family: var(--font); }
 }
 .sidebar-logo span { font-size: 11px; font-weight: 400; color: var(--muted); display: block; margin-top: 2px; }
 .sidebar-logo-text { flex: 1; white-space: nowrap; }
+.sidebar-logo-img { width: 30px; height: 30px; margin-right: 8px; flex-shrink: 0; image-rendering: pixelated; }
 
 /* Collapse button inside sidebar */
 .sidebar-collapse-btn {
@@ -159,6 +160,7 @@ button { cursor: pointer; font-family: var(--font); }
 .chat-layout { display: flex; flex-direction: column; height: 100%; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; }
 .chat-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--muted); }
+.chat-empty-logo { width: 96px; height: 96px; image-rendering: pixelated; }
 .chat-empty h2 { font-size: 20px; color: var(--text); }
 .chat-empty p { font-size: 13px; }
 .chat-suggestions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 8px; }
@@ -254,3 +256,15 @@ button { cursor: pointer; font-family: var(--font); }
 .page-title { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
 .page-sub { font-size: 13px; color: var(--muted); margin-bottom: 22px; }
 .tag { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 4px; background: var(--surface2); color: var(--muted); }
+
+/* ── Voice panel (A3-4) ── */
+.voice-row {
+  display: flex; align-items: baseline; gap: 8px; padding: 6px 10px;
+  border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
+}
+.voice-row-badge { flex: 0 0 auto; font-size: 10px; font-weight: 600; color: var(--muted); white-space: nowrap; }
+.voice-row-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
+.voice-row-truncated { color: var(--muted); font-size: 11px; }
+.voice-row-note { flex: 0 0 auto; font-size: 10px; color: var(--muted); }
+.voice-row-error { border-color: #e05050; }
+.voice-row-error .voice-row-badge { color: #e05050; }

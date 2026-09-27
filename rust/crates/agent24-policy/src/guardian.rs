@@ -225,6 +225,7 @@ impl RiskAssessor for ModelRiskAssessor {
             model: self.model.clone(),
             tools: vec![],
             response_format: None,
+            max_tokens: None,
         };
         // LocalOnly: the tool payload must never leave the device to be judged.
         let profile = TaskProfile {

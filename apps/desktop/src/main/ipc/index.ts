@@ -7,6 +7,7 @@ import { app, ipcMain, shell } from 'electron'
 import { getBackendEndpoint } from '../backend-manager'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
+  BackendEndpointResult,
   BackendProxyRequest,
   BackendProxyResponse,
   DiscoverFilter,
@@ -275,6 +276,13 @@ export function registerIpcHandlers(): void {
     if (allowed) {
       shell.openExternal(url).catch((err) => console.error('openExternal failed', err))
     }
+  })
+  // backend:endpoint — the daemon's actual port (FU-93: the sidebar used to
+  // show a hardcoded `:8765`, but agent24d is spawned with `--port 0` and
+  // gets whatever the OS hands it).
+  ipcMain.handle(IpcChannels.BackendEndpoint, (): BackendEndpointResult | null => {
+    const endpoint = getBackendEndpoint()
+    return endpoint ? { port: endpoint.port } : null
   })
   ipcMain.handle(IpcChannels.BackendProxy, (_event, req: unknown) => {
     if (!isBackendProxyRequest(req)) {

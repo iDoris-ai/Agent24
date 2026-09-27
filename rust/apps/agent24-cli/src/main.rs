@@ -5,12 +5,16 @@
 //! - Standalone: no daemon found → spawn an ephemeral agent24d for this
 //!   invocation and terminate it afterwards
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use agent24_protocol::state_file::{self, DaemonState};
-use agent24_protocol::{ChatMessage, ChatRequest, ChatResponse, Health};
+use agent24_protocol::{
+    AttachedAddRequest, AttachedAddResponse, AttachedList, ChatMessage, ChatRequest, ChatResponse,
+    Health,
+};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -111,6 +115,58 @@ enum OsAction {
     /// could not confirm the stop, `agent24 os list` shows why — that module will
     /// not restart on its own from this.
     Uninstall { name: String },
+    /// A3: manage attached modules (a user-started process registering
+    /// itself against a running daemon — `docs/design/A3-ATTACHED-MODULE.md`
+    /// §3). Unlike install/uninstall this always goes through the daemon:
+    /// the registry it writes to (`attached.json`) is daemon-owned the same
+    /// way `os.json` is.
+    Attach {
+        #[command(subcommand)]
+        action: OsAttachAction,
+    },
+}
+
+/// `agent24 os attach …` (A3-2a; §3.2/§3.6).
+#[derive(Subcommand)]
+enum OsAttachAction {
+    /// Register (first time) or rotate the token of an already-registered
+    /// attached module, from a `domain-os.yml`-shaped manifest file.
+    ///
+    /// Prints the new token on success — SAVE IT, the daemon never shows it
+    /// again (`GET`/`os attach list` never include it, §3.2/§3.3).
+    Add {
+        /// Path to the manifest file (§3.1)
+        manifest: PathBuf,
+        /// Confirm a registration that WIDENS privacy (first-time
+        /// `remote_allowed`, or a new capability, §3.5). Only takes effect
+        /// when stdin is a TTY and the prompt is answered "yes" — run
+        /// non-interactively (as AgentEar's own auto-pairing does), this
+        /// flag has no effect and a relaxing manifest is refused by the
+        /// daemon (`relax_requires_confirmation`). This is deliberate: A3
+        /// does not let an unattended process silently widen its own
+        /// privacy.
+        #[arg(long)]
+        allow_remote: bool,
+        /// Print exactly one JSON object to stdout: the same shape as the
+        /// daemon's `201`/`200` body on success, or `{"error":{...}}` on
+        /// failure (§3.6) — what AgentEar's own auto-pairing parses.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List attached modules (never shows the token, §3.2)
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke (de-register) an attached module. `revoke` is accepted as an
+    /// alias — the design doc's own CLI contract (§3.6) spells this verb
+    /// `revoke`; this project's task brief spelled it `remove`. Both work.
+    #[command(alias = "revoke")]
+    Remove {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -139,6 +195,8 @@ struct Endpoint {
     /// Ephemeral child to terminate when the CLI exits (standalone mode)
     child: Option<tokio::process::Child>,
 }
+
+const HOST_AUTHORITY_UNAVAILABLE: &str = "host authority unavailable";
 
 /// The shutdown part of `agent24 daemon status` (SHUT-1c): the budgets and
 /// the bound they give, anything rejected, the daemon before this one, and
@@ -184,11 +242,28 @@ fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
     out
 }
 
+/// Client for CLI/TUI → daemon calls, which always target `127.0.0.1` (see the
+/// `format!("http://127.0.0.1:{}", state.port)` call sites below) and carry the
+/// bearer token plus chat content.
+///
+/// FU-74: the default reqwest client reads `HTTP_PROXY`/`ALL_PROXY` and does
+/// NOT bypass loopback for them, and follows redirects — either behaviour
+/// would send the bearer token and message content somewhere other than the
+/// daemon whenever the user's shell happens to export a proxy. The daemon
+/// itself never redirects, so a 3xx means something else is impersonating it;
+/// following it would hand over the bearer token to that impersonator.
 fn client() -> reqwest::Client {
+    #[expect(
+        clippy::expect_used,
+        reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
+                  redirect-following client FU-74 exists to rule out; fail closed instead"
+    )]
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_default()
+        .expect("building the loopback-only daemon HTTP client failed")
 }
 
 async fn health_ok(base: &str, token: &str) -> bool {
@@ -202,6 +277,67 @@ async fn health_ok(base: &str, token: &str) -> bool {
         req.timeout(Duration::from_secs(3)).send().await,
         Ok(r) if r.status().is_success()
     )
+}
+
+fn discovery_health_token(state: &DaemonState) -> &str {
+    &state.token
+}
+
+/// Resolve a discovery record for an operation that needs the host bearer.
+/// Capability discovery is intentionally not upgraded into authority by
+/// treating an absent token as an anonymous request.
+fn host_token(state: &DaemonState) -> Result<&str, String> {
+    state.bearer_token().map_err(|err| match err {
+        HOST_AUTHORITY_UNAVAILABLE => HOST_AUTHORITY_UNAVAILABLE.to_owned(),
+        _ => format!("invalid daemon discovery state: {err}"),
+    })
+}
+
+fn endpoint_from_state(state: DaemonState) -> Result<Endpoint, String> {
+    let token = host_token(&state)?.to_owned();
+    Ok(Endpoint {
+        base: format!("http://127.0.0.1:{}", state.port),
+        token,
+        child: None,
+    })
+}
+
+/// Parse the ready line without ever manufacturing a host token for a
+/// capability daemon. The daemon output remains backward-compatible: missing
+/// `auth_mode` means legacy, and legacy ready lines must still carry `token`.
+fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState, String> {
+    if value["type"] != "ready" {
+        return Err("not a daemon ready line".to_owned());
+    }
+    let port = value["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
+        .ok_or_else(|| "ready line has invalid port".to_owned())?;
+    let auth_mode = value
+        .get("auth_mode")
+        .cloned()
+        .map(serde_json::from_value::<agent24_protocol::state_file::AuthMode>)
+        .transpose()
+        .map_err(|_| "ready line has unknown auth_mode".to_owned())?
+        .unwrap_or_default();
+    let token = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let state = DaemonState {
+        port,
+        token,
+        pid,
+        version: value["version"].as_str().unwrap_or("").to_owned(),
+        generation: value["generation"].as_str().unwrap_or("").to_owned(),
+        auth_mode,
+    };
+    state
+        .validate()
+        .map_err(|e| format!("invalid ready line: {e}"))?;
+    Ok(state)
 }
 
 fn agent24d_binary() -> String {
@@ -249,18 +385,9 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
         if let Ok(state) = serde_json::from_str::<serde_json::Value>(&line)
             && state["type"] == "ready"
         {
-            let port = state["port"].as_u64().unwrap_or(0) as u16;
-            let token = state["token"].as_str().unwrap_or("").to_owned();
             let pid = child.id().unwrap_or(0);
-            return Ok((
-                DaemonState {
-                    port,
-                    token,
-                    pid,
-                    version: state["version"].as_str().unwrap_or("").to_owned(),
-                },
-                child,
-            ));
+            let parsed = parse_ready_state(&state, pid)?;
+            return Ok((parsed, child));
         }
     }
 }
@@ -269,19 +396,21 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
 async fn connect() -> Result<Endpoint, String> {
     if let Some(state) = state_file::read_live() {
         let base = format!("http://127.0.0.1:{}", state.port);
-        if health_ok(&base, &state.token).await {
-            return Ok(Endpoint {
-                base,
-                token: state.token,
-                child: None,
-            });
+        if state.auth_mode.is_capabilities() {
+            // Health is deliberately anonymous, but it never grants the
+            // bearer needed by the operation that called `connect`.
+            let _ = health_ok(&base, "").await;
+            return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+        }
+        if health_ok(&base, discovery_health_token(&state)).await {
+            return endpoint_from_state(state);
         }
     }
     let (state, child) = spawn_daemon(true).await?;
     let base = format!("http://127.0.0.1:{}", state.port);
     Ok(Endpoint {
         base,
-        token: state.token,
+        token: host_token(&state)?.to_owned(),
         child: Some(child),
     })
 }
@@ -299,12 +428,14 @@ async fn finish(mut ep: Endpoint) {
 /// `None` if no live daemon is discoverable or healthy.
 async fn attach_only() -> Option<Endpoint> {
     let state = state_file::read_live()?;
+    if state.auth_mode.is_capabilities() {
+        return None;
+    }
     let base = format!("http://127.0.0.1:{}", state.port);
-    health_ok(&base, &state.token).await.then_some(Endpoint {
-        base,
-        token: state.token,
-        child: None,
-    })
+    health_ok(&base, discovery_health_token(&state))
+        .await
+        .then(|| endpoint_from_state(state).ok())
+        .flatten()
 }
 
 /// Serve agent24d as an MCP server over stdio (E4). Attaches to the running
@@ -573,6 +704,13 @@ async fn hot_disable_best_effort(name: &str) {
 /// [`cmd_uninstall`] (FU-61: it also does a best-effort hot stop, which needs
 /// the daemon call `os_local`'s shared return shape cannot carry).
 async fn cmd_os(action: OsAction) -> Result<(), String> {
+    // A3-2a: always goes through the daemon (the registry it writes,
+    // `attached.json`, is daemon-owned the same way `os.json` is) but has its
+    // own request/response shapes and its own `--json`/TTY handling, so it is
+    // its own function rather than another arm of the `req`/`out` match below.
+    if let OsAction::Attach { action } = action {
+        return cmd_os_attach(action).await;
+    }
     if let OsAction::Uninstall { name } = &action {
         return cmd_uninstall(name).await;
     }
@@ -601,6 +739,8 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     let req = match &action {
         // Handled before the daemon lookup above; see `os_local`.
         OsAction::Install { .. } | OsAction::Uninstall { .. } => unreachable!(),
+        // Handled at the top of this function, before it ever reaches here.
+        OsAction::Attach { .. } => unreachable!(),
         OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let enabled = matches!(action, OsAction::Enable { .. });
@@ -632,6 +772,285 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     out
 }
 
+/// The v1 error envelope's `error.code`/`error.message`, as a bare JSON value
+/// — `serde_json::Value::default()` reads as `null`, which is why every call
+/// site below only trusts this when `["error"]["message"]` is actually a
+/// string (same rule `daemon_error_line` already applies).
+fn error_envelope_or(status: reqwest::StatusCode, body: &serde_json::Value) -> serde_json::Value {
+    if body["error"]["message"].as_str().is_some() {
+        body.clone()
+    } else {
+        serde_json::json!({"error": {"code": "daemon_unavailable", "message": format!("daemon returned {status}")}})
+    }
+}
+
+fn daemon_unavailable_envelope(e: &str) -> serde_json::Value {
+    serde_json::json!({"error": {"code": "daemon_unavailable", "message": e}})
+}
+
+/// §3.5/§3.6: whether to send `allow_relax: true`. Only when the caller asked
+/// (`--allow-remote`) AND stdin is a TTY AND the prompt is answered "yes".
+/// Run non-interactively — exactly how AgentEar's own auto-pairing invokes
+/// this (§5.6) — this is always `false`, so a relaxing manifest is refused by
+/// the daemon rather than silently approved by an unattended process.
+fn resolve_allow_relax(allow_remote: bool) -> bool {
+    if !allow_remote || !std::io::stdin().is_terminal() {
+        return false;
+    }
+    use std::io::Write;
+    eprint!(
+        "this registration requests wider privacy (remote model access, or a new capability) — \
+         type \"yes\" to confirm: "
+    );
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim() == "yes"
+}
+
+/// `agent24 os attach …` (A3-2a). Always goes through the daemon — see
+/// `cmd_os`'s doc comment on why `Attach` is intercepted before that
+/// function's own `req`/`out` match, which has different response shapes.
+async fn cmd_os_attach(action: OsAttachAction) -> Result<(), String> {
+    match action {
+        OsAttachAction::Add {
+            manifest,
+            allow_remote,
+            json,
+        } => cmd_attach_add(&manifest, allow_remote, json).await,
+        OsAttachAction::List { json } => cmd_attach_list(json).await,
+        OsAttachAction::Remove { name, json } => cmd_attach_remove(&name, json).await,
+    }
+}
+
+async fn cmd_attach_add(
+    manifest_path: &std::path::Path,
+    allow_remote: bool,
+    json: bool,
+) -> Result<(), String> {
+    let manifest = std::fs::read_to_string(manifest_path).map_err(|e| {
+        let msg = format!("cannot read {}: {e}", manifest_path.display());
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"error": {"code": "invalid_manifest", "message": msg}})
+            );
+        }
+        msg
+    })?;
+    // Resolved BEFORE contacting the daemon: a TTY prompt after an ephemeral
+    // daemon has already been spawned would be a strange place to block.
+    let allow_relax = resolve_allow_relax(allow_remote);
+    let ep = match connect().await {
+        Ok(ep) => ep,
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e));
+            }
+            return Err(e);
+        }
+    };
+    let sent = bearer(&ep, client().post(format!("{}/api/v1/attached", ep.base)))
+        .json(&AttachedAddRequest {
+            manifest,
+            allow_relax,
+        })
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    // No `?` below: any early return here would skip `finish(ep)` (the
+    // ephemeral daemon it may have spawned would never be reaped), and under
+    // `--json` a 2xx with an unreadable/unresizable body must still print
+    // exactly one JSON object rather than nothing — the non-zero exit
+    // already comes from returning `Err` below, `main` maps that to
+    // `ExitCode::FAILURE`.
+    let out = match sent {
+        Ok(res) if res.status().is_success() => match res.json::<AttachedAddResponse>().await {
+            Ok(body) => match serde_json::to_string(&body) {
+                Ok(text) => {
+                    if json {
+                        // Exactly one JSON object on stdout (§3.6) — the same
+                        // shape the daemon's own `201`/`200` body has.
+                        println!("{text}");
+                    } else {
+                        println!("registered {} (token_id {})", body.name, body.token_id);
+                        println!("  token (shown once — save it now): {}", body.token);
+                        println!("  manifest digest: {}", body.manifest_digest);
+                        println!("  socket: {}", body.socket_path);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = format!("could not re-serialize the daemon's response: {e}");
+                    if json {
+                        println!("{}", daemon_unavailable_envelope(&msg));
+                    }
+                    Err(msg)
+                }
+            },
+            Err(e) => {
+                let msg = format!("daemon returned an unreadable response: {e}");
+                if json {
+                    println!("{}", daemon_unavailable_envelope(&msg));
+                }
+                Err(msg)
+            }
+        },
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if json {
+                println!("{}", error_envelope_or(status, &body));
+            }
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+            }
+            Err(e.to_string())
+        }
+    };
+    finish(ep).await;
+    out
+}
+
+fn print_attached(list: &AttachedList) {
+    if list.modules.is_empty() {
+        println!("(no attached module registered)");
+        return;
+    }
+    for m in &list.modules {
+        println!("{}  [{}]  token_id {}", m.name, m.attach_status, m.token_id);
+        println!(
+            "    digest {}  registered {}",
+            m.manifest_digest, m.created_at
+        );
+    }
+}
+
+async fn cmd_attach_list(json: bool) -> Result<(), String> {
+    let ep = match connect().await {
+        Ok(ep) => ep,
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e));
+            }
+            return Err(e);
+        }
+    };
+    let sent = bearer(&ep, client().get(format!("{}/api/v1/attached", ep.base)))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    // See `cmd_attach_add`'s comment: no `?` here either, for the same two
+    // reasons (must not skip `finish(ep)`; `--json` must still emit exactly
+    // one JSON object even on an unreadable/unresizable 2xx body).
+    let out = match sent {
+        Ok(res) if res.status().is_success() => match res.json::<AttachedList>().await {
+            Ok(body) => match serde_json::to_string(&body) {
+                Ok(text) => {
+                    if json {
+                        println!("{text}");
+                    } else {
+                        print_attached(&body);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = format!("could not re-serialize the daemon's response: {e}");
+                    if json {
+                        println!("{}", daemon_unavailable_envelope(&msg));
+                    }
+                    Err(msg)
+                }
+            },
+            Err(e) => {
+                let msg = format!("daemon returned an unreadable response: {e}");
+                if json {
+                    println!("{}", daemon_unavailable_envelope(&msg));
+                }
+                Err(msg)
+            }
+        },
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if json {
+                println!("{}", error_envelope_or(status, &body));
+            }
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+            }
+            Err(e.to_string())
+        }
+    };
+    finish(ep).await;
+    out
+}
+
+async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
+    let ep = match connect().await {
+        Ok(ep) => ep,
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e));
+            }
+            return Err(e);
+        }
+    };
+    let sent = bearer(
+        &ep,
+        client().delete(format!("{}/api/v1/attached/{name}", ep.base)),
+    )
+    .timeout(Duration::from_secs(10))
+    .send()
+    .await;
+    let out = match sent {
+        Ok(res) if res.status() == reqwest::StatusCode::NO_CONTENT => {
+            if json {
+                println!("{}", serde_json::json!({"removed": name}));
+            } else {
+                println!("removed {name}");
+            }
+            Ok(())
+        }
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if json {
+                println!("{}", error_envelope_or(status, &body));
+            }
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+            }
+            Err(e.to_string())
+        }
+    };
+    finish(ep).await;
+    out
+}
+
 /// What to tell a user who cannot reach the daemon.
 ///
 /// **It prints ONE ENTRY TO ADD, never a whole document.** The first version
@@ -657,6 +1076,10 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
         OsAction::Install { .. } | OsAction::Uninstall { .. } => {
             "this command does not need the daemon".to_owned()
         }
+        // Unreachable for the same reason as the `Install`/`Uninstall` arms
+        // above are commented unreachable in `cmd_os`'s own match: `Attach`
+        // returns from `cmd_os` before this function is ever called.
+        OsAction::Attach { .. } => unreachable!(),
         OsAction::List => format!("read {path} to see what is configured"),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());
@@ -771,7 +1194,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         DaemonAction::Start => {
             if let Some(state) = state_file::read_live() {
                 let base = format!("http://127.0.0.1:{}", state.port);
-                if health_ok(&base, &state.token).await {
+                if health_ok(&base, discovery_health_token(&state)).await {
                     println!(
                         "daemon already running (pid {}, port {})",
                         state.pid, state.port
@@ -789,7 +1212,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     for _ in 0..30 {
                         if let Some(state) = state_file::read_live() {
                             let base = format!("http://127.0.0.1:{}", state.port);
-                            if health_ok(&base, &state.token).await {
+                            if health_ok(&base, discovery_health_token(&state)).await {
                                 println!(
                                     "daemon already running (pid {}, port {})",
                                     state.pid, state.port
@@ -812,10 +1235,9 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         DaemonAction::Status => match state_file::read_live() {
             Some(state) => {
                 let base = format!("http://127.0.0.1:{}", state.port);
-                if health_ok(&base, &state.token).await {
+                if health_ok(&base, "").await {
                     let res = client()
                         .get(format!("{base}/api/v1/health"))
-                        .bearer_auth(&state.token)
                         .send()
                         .await
                         .map_err(|e| e.to_string())?;
@@ -831,28 +1253,32 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     // The whole exchange is bounded, not just the connect: a
                     // daemon that stalls mid-response must not hang `status`
                     // (review of SHUT-1c, round 2).
-                    match client()
-                        .get(format!("{base}/api/v1/shutdown"))
-                        .bearer_auth(&state.token)
-                        .timeout(Duration::from_secs(5))
-                        .send()
-                        .await
-                    {
-                        Ok(res) if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {}
-                        Ok(res) if res.status().is_success() => {
-                            match res.json::<agent24_protocol::ShutdownReport>().await {
-                                Ok(report) => {
-                                    for line in shutdown_lines(&report) {
-                                        println!("{line}");
+                    if state.auth_mode.is_capabilities() {
+                        println!("  shutdown report unavailable: {HOST_AUTHORITY_UNAVAILABLE}");
+                    } else {
+                        match client()
+                            .get(format!("{base}/api/v1/shutdown"))
+                            .bearer_auth(host_token(&state).map_err(|e| e.to_owned())?)
+                            .timeout(Duration::from_secs(5))
+                            .send()
+                            .await
+                        {
+                            Ok(res) if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {}
+                            Ok(res) if res.status().is_success() => {
+                                match res.json::<agent24_protocol::ShutdownReport>().await {
+                                    Ok(report) => {
+                                        for line in shutdown_lines(&report) {
+                                            println!("{line}");
+                                        }
                                     }
+                                    Err(e) => println!("  (shutdown report unreadable: {e})"),
                                 }
-                                Err(e) => println!("  (shutdown report unreadable: {e})"),
                             }
+                            Ok(res) => {
+                                println!("  (shutdown report: daemon returned {})", res.status())
+                            }
+                            Err(e) => println!("  (shutdown report unavailable: {e})"),
                         }
-                        Ok(res) => {
-                            println!("  (shutdown report: daemon returned {})", res.status())
-                        }
-                        Err(e) => println!("  (shutdown report unavailable: {e})"),
                     }
                 } else {
                     println!(
@@ -869,13 +1295,16 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         },
         DaemonAction::Stop => match state_file::read_live() {
             Some(state) => {
+                if state.auth_mode.is_capabilities() {
+                    return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+                }
                 // Authenticated shutdown: the bearer token proves this is OUR
                 // daemon — a reused pid of an unrelated process can never be
                 // hit (review B6)
                 let base = format!("http://127.0.0.1:{}", state.port);
                 let res = client()
                     .post(format!("{base}/api/v1/shutdown"))
-                    .bearer_auth(&state.token)
+                    .bearer_auth(host_token(&state).map_err(|e| e.to_owned())?)
                     .timeout(Duration::from_secs(5))
                     .send()
                     .await;
@@ -987,6 +1416,43 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn old_ready_line_requires_and_keeps_legacy_token() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "token": "legacy", "version": "v"
+        });
+        let state = parse_ready_state(&ready, 7).unwrap();
+        assert_eq!(
+            state.auth_mode,
+            agent24_protocol::state_file::AuthMode::LegacySingleToken
+        );
+        assert_eq!(host_token(&state), Ok("legacy"));
+    }
+
+    #[test]
+    fn capability_ready_line_never_mints_a_host_token() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "version": "v",
+            "auth_mode": "capabilities", "generation": "gen-1"
+        });
+        let state = parse_ready_state(&ready, 7).unwrap();
+        assert!(state.token.is_empty());
+        assert_eq!(
+            host_token(&state),
+            Err(HOST_AUTHORITY_UNAVAILABLE.to_owned())
+        );
+    }
+
+    #[test]
+    fn capability_ready_line_with_token_fails_closed() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "token": "must-not-be-here",
+            "auth_mode": "capabilities", "generation": "gen-1"
+        });
+        let err = parse_ready_state(&ready, 7).unwrap_err();
+        assert!(err.contains("must not contain a token"), "{err}");
+    }
+
     /// `daemon status` says what the shutdown report says, and names the knob
     /// for each module found too slow (SHUT-1c).
     #[test]
@@ -1087,5 +1553,124 @@ mod tests {
             !h.contains("enabled"),
             "listing must not suggest an edit: {h}"
         );
+    }
+
+    // ── FU-74: the daemon-facing `client()` must not honour HTTP_PROXY ─────
+    //
+    // Same shape as agent24-models' `from_env_local_providers_ignore_http_proxy`
+    // and agent24-worker's `http_ml_worker_ignores_http_proxy`: a child process
+    // gets HTTP_PROXY/ALL_PROXY pointed at a proxy stub and no NO_PROXY, then
+    // makes one request; the proxy stub's connection count tells us whether the
+    // client obeyed the proxy env. A positive control (plain
+    // `reqwest::Client::builder()...build()`, no `no_proxy()`) proves the env
+    // was actually in effect for the child.
+    //
+    // `apps/agent24-cli` is NOT scanned by
+    // `passthrough_list_matches_what_the_daemon_actually_reads` (that scanner
+    // only walks `apps/agent24d/src` and `crates/`), so the child's target-port
+    // env var can use an ordinary SCREAMING_SNAKE_CASE name without tripping it.
+
+    /// A blocking stub on its own thread: counts connections, answers `reply`.
+    fn thread_stub(reply: String) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut buf = [0u8; 65536];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (port, n)
+    }
+
+    fn health_ok_reply() -> String {
+        let body = r#"{"status":"ok"}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn target_port() -> u16 {
+        std::env::var("AGENT24_CLI_TEST_TARGET_PORT")
+            .expect("run_child must set AGENT24_CLI_TEST_TARGET_PORT")
+            .parse()
+            .expect("AGENT24_CLI_TEST_TARGET_PORT must be a u16")
+    }
+
+    /// Child: the production path — `client()` must be loopback-only.
+    #[tokio::test]
+    #[ignore = "child process of cli_client_ignores_http_proxy"]
+    async fn proxy_child_cli_client() {
+        let url = format!("http://127.0.0.1:{}/api/v1/health", target_port());
+        let _ = client()
+            .get(url)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    }
+
+    /// Child: positive control — the bare default client, same URL, same env.
+    #[tokio::test]
+    #[ignore = "child process of cli_client_ignores_http_proxy"]
+    async fn proxy_child_default_client() {
+        let url = format!("http://127.0.0.1:{}/api/v1/health", target_port());
+        let raw_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let _ = raw_client
+            .get(url)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    }
+
+    fn run_child(test: &str, target: u16, proxy: u16) {
+        let exe = std::env::current_exe().unwrap();
+        let proxy_url = format!("http://127.0.0.1:{proxy}");
+        let status = std::process::Command::new(exe)
+            .args(["--exact", test, "--ignored", "--nocapture"])
+            .env("AGENT24_CLI_TEST_TARGET_PORT", target.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn cli_client_ignores_http_proxy() {
+        let (tp, target) = thread_stub(health_ok_reply());
+        let (pp, proxy) = thread_stub(health_ok_reply());
+        run_child("tests::proxy_child_cli_client", tp, pp);
+        assert_eq!(
+            proxy.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the proxy saw the CLI daemon client's request"
+        );
+        assert_eq!(target.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Positive control: the default client under the same env goes through
+        // the proxy — proves HTTP_PROXY was actually live for the child.
+        let (tp2, target2) = thread_stub(health_ok_reply());
+        let (pp2, proxy2) = thread_stub(health_ok_reply());
+        run_child("tests::proxy_child_default_client", tp2, pp2);
+        assert_eq!(
+            proxy2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "measuring instrument: proxy env must take effect"
+        );
+        assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

@@ -770,6 +770,30 @@ async fn patch_os_at(
     req: Request<Body>,
     path: Option<std::path::PathBuf>,
 ) -> Response {
+    // Deviation handling (A3-2b review): a name ALSO registered as an
+    // attached module (`crate::attached`) is refused here, even if
+    // `os_reports` happens to carry an entry for it too — which it will,
+    // `Refused`, whenever a package on disk collides with an attach
+    // registration (`crate::domain::mount_all`'s own name-clash check, §5.4).
+    // Without this, `PATCH /api/v1/os/{name}` would return `200` for writing
+    // `os.json`'s enable bit on a package that never actually mounted (and
+    // never will, while the clash stands), while the REAL, running attached
+    // module — entirely unaffected by that write — keeps serving under the
+    // same name. That is exactly the "silently did nothing useful" trap this
+    // check closes: the caller is told where the real control surface is.
+    if let Some(attached_path) = crate::attached::config_path()
+        && crate::attached::list(&attached_path)
+            .is_ok_and(|views| views.iter().any(|v| v.name == name))
+    {
+        return error_response(
+            StatusCode::CONFLICT,
+            "attached_module",
+            &format!(
+                "{name:?} is a registered attached module, not a package or compiled-in \
+                 module this daemon controls — use PATCH /api/v1/attached/{name} instead"
+            ),
+        );
+    }
     // Refuse a name this daemon does not provide, BEFORE writing anything. This is
     // the reason the daemon owns the file: ME-2a can only report a typo'd entry at
     // the next start, by which point the registry is already broken.

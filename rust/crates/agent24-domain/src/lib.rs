@@ -222,6 +222,54 @@ impl Capability {
     }
 }
 
+/// ME4-4.2.1: where a module's `_a24/model/complete` calls MAY run (user
+/// decision D2, 2026-09-23). Default `LocalOnly`: an absent `model_access`
+/// can never widen what a module gets. Not `Deserialize` for the same reason
+/// [`Capability`] is not — see [`ModelAccess::parse`].
+///
+/// This type only PARSES the manifest field. It grants nothing: nothing in
+/// this crate maps it onto a privacy tier or a mount-time grant yet
+/// (ME4-4.2.2b2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAccess {
+    /// Every call is routed with `Privacy::LocalOnly` — on-device tiers only.
+    #[default]
+    LocalOnly,
+    /// Calls are routed with `Privacy::Any`; the kernel still chooses the
+    /// provider (the module only states a complexity preference).
+    RemoteAllowed,
+}
+
+impl ModelAccess {
+    pub const ALL: &'static [ModelAccess] = &[ModelAccess::LocalOnly, ModelAccess::RemoteAllowed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelAccess::LocalOnly => "local_only",
+            ModelAccess::RemoteAllowed => "remote_allowed",
+        }
+    }
+
+    /// Names the rejected string and the choices, like [`Capability::parse`].
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|a| a.as_str() == s)
+            .ok_or_else(|| {
+                format!(
+                    "model_access: {s:?} is not one of {}",
+                    Self::ALL
+                        .iter()
+                        .map(|a| a.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
 /// How a domain OS is implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,6 +280,13 @@ pub enum ImplKind {
     /// manifest can say so; the transport is later, and the in-process mounter
     /// must refuse it (see [`DomainOsManifest::is_mountable_in_process`]).
     OutOfProcessProvider,
+    /// A3 (`docs/design/A3-ATTACHED-MODULE.md`): a process the USER starts
+    /// (not the kernel), which registers over REST and then attaches on a
+    /// long-lived Unix socket. Mutually exclusive with `spawn` — the kernel
+    /// never starts one of these, so a `spawn` command on it would never run
+    /// (see [`SpawnCommand`]'s validation below). May declare `host_commands`
+    /// (A1's reverse channel is HTTP and has no equivalent field).
+    AttachedProcess,
 }
 
 /// How to start an out-of-process module.
@@ -372,11 +427,23 @@ struct RawManifest {
     /// recoverable from the message.
     #[serde(default)]
     kernel_capabilities: Vec<String>,
+    /// ME4-4.2.1. A STRING, mapped afterwards (same reason as
+    /// `kernel_capabilities`): the error must quote what the author typed.
+    #[serde(default)]
+    model_access: Option<String>,
     #[serde(default)]
     ui_entry: Option<String>,
     impl_kind: ImplKind,
     #[serde(default)]
     spawn: Option<SpawnCommand>,
+    /// A3: command names the kernel will forward to an `attached_process`
+    /// module on a reverse call (`speak`, `stop_playback`, …). Collected as
+    /// STRINGS and validated afterwards, same reason as `kernel_capabilities`
+    /// — an invalid entry must be able to quote itself. Only meaningful on
+    /// `attached_process`; declaring it on any other `impl_kind` is refused
+    /// (A1's reverse channel is HTTP and has no equivalent field).
+    #[serde(default)]
+    host_commands: Vec<String>,
     /// Declared here ONLY so `deny_unknown_fields` does not reject the very
     /// fields step one just read. Their values are consumed by
     /// [`ManifestEnvelope`]; re-reading them here would be reading the same
@@ -417,9 +484,11 @@ pub struct DomainOsManifest {
     requires_apis: Vec<String>,
     requires_deps: Vec<String>,
     kernel_capabilities: Vec<Capability>,
+    model_access: ModelAccess,
     ui_entry: Option<String>,
     impl_kind: ImplKind,
     spawn: Option<SpawnCommand>,
+    host_commands: Vec<String>,
 }
 
 /// Names that are not usable as a directory on Windows regardless of extension.
@@ -743,6 +812,24 @@ impl DomainOsManifest {
             caps.push(Capability::parse(c).map_err(|e| DomainError::Manifest(e.to_string()))?);
         }
 
+        // ME4-4.2.1: absent → LocalOnly. Present without `models` requested is a
+        // contradiction (it would read as "this module uses remote models" while
+        // the module can reach no model at all), refused like impl_kind/spawn.
+        let model_access = match raw.model_access.as_deref() {
+            None => ModelAccess::LocalOnly,
+            Some(s) => {
+                let access = ModelAccess::parse(s).map_err(DomainError::Manifest)?;
+                if !caps.contains(&Capability::Models) {
+                    return Err(DomainError::Manifest(format!(
+                        "model_access is {:?} but kernel_capabilities does not request \
+                         `models`; declare both or neither",
+                        access.as_str()
+                    )));
+                }
+                access
+            }
+        };
+
         // `spawn` and `impl_kind` must agree, in BOTH directions.
         //
         // Missing when out-of-process: the kernel would have a module it cannot
@@ -770,10 +857,41 @@ impl DomainOsManifest {
                         .to_owned(),
                 ));
             }
+            // A3: the kernel never starts an attached module — it is the USER
+            // who starts it, and it registers over REST after the fact — so a
+            // `spawn` command here would describe a launch that never happens,
+            // the same silent contradiction as the in-process case above.
+            (ImplKind::AttachedProcess, Some(_)) => {
+                return Err(DomainError::Manifest(
+                    "`spawn` is declared but impl_kind is attached_process; the kernel \
+                     never starts an attached module, so this command would never run"
+                        .to_owned(),
+                ));
+            }
             _ => {}
         }
         if let Some(spawn) = raw.spawn.as_ref() {
             spawn.validate().map_err(DomainError::Manifest)?;
+        }
+
+        // A3 §3.1: `host_commands` only means anything on an attached module —
+        // A1's reverse channel is HTTP and has no equivalent field, so
+        // declaring it elsewhere is a manifest that claims a capability this
+        // `impl_kind` cannot use.
+        if !raw.host_commands.is_empty() && raw.impl_kind != ImplKind::AttachedProcess {
+            return Err(DomainError::Manifest(format!(
+                "host_commands is declared but impl_kind is {:?}; only attached_process \
+                 modules receive reverse commands",
+                raw.impl_kind
+            )));
+        }
+        for name in &raw.host_commands {
+            if !is_valid_host_command_name(name) {
+                return Err(DomainError::Manifest(format!(
+                    "host_commands entry {name:?} is not a valid command name (expected \
+                     1-32 characters of [a-z0-9_])"
+                )));
+            }
         }
 
         Ok(Self {
@@ -783,7 +901,9 @@ impl DomainOsManifest {
             requires_apis: raw.requires_apis,
             requires_deps: raw.requires_deps,
             kernel_capabilities: caps,
+            model_access,
             ui_entry: raw.ui_entry,
+            host_commands: raw.host_commands,
             impl_kind: raw.impl_kind,
             spawn: raw.spawn,
         })
@@ -821,6 +941,12 @@ impl DomainOsManifest {
 
     pub fn kernel_capabilities(&self) -> &[Capability] {
         &self.kernel_capabilities
+    }
+
+    /// ME4-4.2.1: `LocalOnly` unless the manifest said `remote_allowed`. This
+    /// is parsed data only — nothing in this crate grants it (ME4-4.2.2b2).
+    pub fn model_access(&self) -> ModelAccess {
+        self.model_access
     }
 
     pub fn ui_entry(&self) -> Option<&str> {
@@ -868,6 +994,26 @@ impl DomainOsManifest {
     pub fn is_mountable_in_process(&self) -> bool {
         matches!(self.impl_kind, ImplKind::InProcessCrate)
     }
+
+    /// A3 §3.1: command names the kernel will forward to this module on a
+    /// reverse call. Empty for every `impl_kind` other than
+    /// `AttachedProcess` — `from_yaml` refuses a manifest that declares one
+    /// otherwise, so a caller never has to re-check `impl_kind` before using
+    /// this list.
+    pub fn host_commands(&self) -> &[String] {
+        &self.host_commands
+    }
+}
+
+/// A3 §3.1: a `host_commands` entry is a single bare name, ASCII
+/// `[a-z0-9_]{1,32}` — no dots. Unlike `Capability`'s dotted names, a command
+/// name is not a namespace.
+fn is_valid_host_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// What the kernel decided a module may use — **informational, not authority**.
@@ -1382,6 +1528,98 @@ impl_kind: in_process_crate
         }
         // Control: the parser is not simply accepting everything.
         assert!(Capability::parse("definitely-not-a-capability").is_err());
+    }
+
+    // ---------- model_access (ME4-4.2.1; SPEC J1) -----------------------------
+    //
+    // Parsing only — nothing here grants anything (ME4-4.2.2b2 wires the grant).
+    // `SIN90_YAML` requests only `[events]`, so every case that writes
+    // `model_access` here must also widen `kernel_capabilities` to include
+    // `models`, or it is testing the "field without the capability" rejection
+    // instead (see `model_access_without_the_models_capability_is_rejected`).
+
+    #[test]
+    fn model_access_defaults_to_local_only_when_absent() {
+        // `SIN90_YAML` has no `model_access` key at all.
+        assert!(!SIN90_YAML.contains("model_access"));
+        let m = DomainOsManifest::from_yaml(SIN90_YAML).unwrap();
+        assert_eq!(m.model_access(), ModelAccess::LocalOnly);
+    }
+
+    #[test]
+    fn model_access_remote_allowed_is_parsed() {
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [models]",
+        ) + "model_access: remote_allowed\n";
+        let m = DomainOsManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.model_access(), ModelAccess::RemoteAllowed);
+    }
+
+    #[test]
+    fn model_access_explicit_local_only_is_accepted() {
+        // Positive control for the case below: writing the DEFAULT value
+        // explicitly is not itself an error — only writing it without `models`
+        // requested is (see `model_access_without_the_models_capability_is_rejected`).
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [models]",
+        ) + "model_access: local_only\n";
+        let m = DomainOsManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.model_access(), ModelAccess::LocalOnly);
+    }
+
+    #[test]
+    fn model_access_rejects_a_value_that_is_not_one_of_the_two() {
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [models]",
+        ) + "model_access: remote\n";
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        // Must quote what the author typed AND name the accepted spelling —
+        // "remote" alone would not tell them it should be "remote_allowed".
+        assert!(err.contains("remote"), "{err}");
+        assert!(err.contains("remote_allowed"), "{err}");
+    }
+
+    #[test]
+    fn model_access_without_the_models_capability_is_rejected() {
+        // `SIN90_YAML` requests `[events]` only. Writing `model_access` here
+        // reads as "this module uses remote models" while the module can reach
+        // no model at all — refused like impl_kind/spawn's own two-way check.
+        let yaml = format!("{SIN90_YAML}model_access: remote_allowed\n");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("models"), "{err}");
+    }
+
+    #[test]
+    fn model_access_an_empty_capability_list_with_the_default_value_is_still_rejected() {
+        // (v2 L8) The field being PRESENT is what triggers the check, not the
+        // value it holds — `local_only` is also the default, but writing it
+        // explicitly with no `models` capability at all must still be refused.
+        let yaml = SIN90_YAML.replace("kernel_capabilities: [events]", "kernel_capabilities: []")
+            + "model_access: local_only\n";
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("models"), "{err}");
+    }
+
+    #[test]
+    fn model_access_null_is_treated_as_absent() {
+        // (v2 L8) `model_access: ~` must be accepted and default to `LocalOnly`
+        // even though `kernel_capabilities` here does not request `models` —
+        // `~` is not "present", it is YAML's null spelling of "not set".
+        let yaml = format!("{SIN90_YAML}model_access: ~\n");
+        let m = DomainOsManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.model_access(), ModelAccess::LocalOnly);
+    }
+
+    #[test]
+    fn model_access_field_typo_is_rejected_by_deny_unknown_fields() {
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [models]",
+        ) + "model_acess: remote_allowed\n";
+        assert!(DomainOsManifest::from_yaml(&yaml).is_err());
     }
 
     #[test]
@@ -2146,5 +2384,100 @@ mod spawn_tests {
         )
         .expect("odd-looking arguments are still just arguments");
         assert_eq!(m.spawn().unwrap().args, ["a b; rm -rf /", "$HOME", "*"]);
+    }
+}
+
+/// A3-1 (`docs/design/A3-ATTACHED-MODULE.md` §3.1): the `attached_process`
+/// `impl_kind` and its `host_commands` field.
+#[cfg(test)]
+mod attach_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn manifest(impl_kind: &str, extra: &str) -> Result<DomainOsManifest> {
+        DomainOsManifest::from_yaml(&format!(
+            "name: agentear\n\
+             version: \"3\"\n\
+             route_namespace: /api/v1/agentear\n\
+             event_module: agentear\n\
+             data_dir: ~/.agent24/os/agentear/\n\
+             impl_kind: {impl_kind}\n{extra}"
+        ))
+    }
+
+    /// The happy path from the design doc's §3.1 example: `attached_process`
+    /// with no `spawn` and a couple of `host_commands`.
+    #[test]
+    fn an_attached_module_declares_its_host_commands() {
+        let m = manifest(
+            "attached_process",
+            "kernel_capabilities: [events, models]\n\
+             host_commands: [speak, stop_playback]\n",
+        )
+        .expect("a well-formed attached manifest");
+        assert_eq!(m.impl_kind(), ImplKind::AttachedProcess);
+        assert_eq!(m.host_commands(), ["speak", "stop_playback"]);
+        assert_eq!(
+            m.spawn(),
+            None,
+            "the kernel never starts an attached module"
+        );
+    }
+
+    /// `host_commands` is optional — most manifests declare none.
+    #[test]
+    fn host_commands_defaults_to_empty() {
+        let m = manifest("attached_process", "").expect("no host_commands at all");
+        assert_eq!(m.host_commands(), Vec::<String>::new().as_slice());
+    }
+
+    /// `spawn` and `attached_process` are a silent contradiction exactly like
+    /// `spawn` and `in_process_crate`: the kernel never starts an attached
+    /// module, so a `spawn` command on one would never run.
+    #[test]
+    fn spawn_is_refused_on_an_attached_module() {
+        let err = manifest("attached_process", "spawn:\n  command: node\n")
+            .expect_err("spawn on an attached module");
+        assert!(err.to_string().contains("spawn"), "{err}");
+        assert!(err.to_string().contains("attached_process"), "{err}");
+        // Control: the same manifest without `spawn` is fine.
+        assert!(manifest("attached_process", "").is_ok());
+    }
+
+    /// `host_commands` only means anything on `attached_process` — declaring
+    /// it on an in-process or out-of-process manifest is a manifest claiming
+    /// a capability that `impl_kind` cannot use.
+    #[test]
+    fn host_commands_is_refused_off_an_attached_module() {
+        let err = manifest("in_process_crate", "host_commands: [speak]\n")
+            .expect_err("host_commands on an in-process module");
+        assert!(err.to_string().contains("host_commands"), "{err}");
+        // Control: the same field on an attached module is accepted.
+        assert!(manifest("attached_process", "host_commands: [speak]\n").is_ok());
+    }
+
+    /// Command name syntax (§4.4 M7's reference in §3.1: `[a-z0-9_]{1,32}`).
+    /// The offending string must be quoted back, or a typo is a scavenger
+    /// hunt (same rationale as `an_unknown_capability_names_itself...` above).
+    #[test]
+    fn a_host_command_name_must_match_the_wire_syntax() {
+        for bad in ["Speak", "speak-now", "speak.now", "", &"x".repeat(33)] {
+            let err =
+                manifest("attached_process", &format!("host_commands: [\"{bad}\"]\n")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("host_commands"), "{bad:?}: {msg}");
+        }
+        // Controls: the boundary values that MUST pass, so the loop above is
+        // not just "every string is refused".
+        assert!(manifest("attached_process", "host_commands: [\"a\"]\n").is_ok());
+        assert!(
+            manifest(
+                "attached_process",
+                &format!("host_commands: [\"{}\"]\n", "x".repeat(32))
+            )
+            .is_ok(),
+            "exactly 32 characters must be accepted"
+        );
     }
 }

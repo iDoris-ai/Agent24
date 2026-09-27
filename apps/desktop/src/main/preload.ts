@@ -5,6 +5,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import {
   IpcChannels,
+  type BackendEndpointResult,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type DiscoverFilter,
@@ -26,6 +27,8 @@ const api = {
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
   backendProxy: (req: BackendProxyRequest): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.BackendProxy, req),
+  backendEndpoint: (): Promise<BackendEndpointResult | null> =>
+    ipcRenderer.invoke(IpcChannels.BackendEndpoint),
   omlxDetect: (): Promise<OmlxDetectResult | null> =>
     ipcRenderer.invoke(IpcChannels.OmlxDetect),
   omlxModels: (url: string, apiKey: string): Promise<OmlxModelsResult> =>
@@ -50,6 +53,19 @@ const api = {
     ipcRenderer.invoke(IpcChannels.ModulesUninstall, packageName, id),
   llmStatus: (): Promise<LlmStatusResult> =>
     ipcRenderer.invoke(IpcChannels.LlmStatus),
+  // A3-4: subscribe to agentear.event/1 envelopes pushed from main
+  // (agentear-events.ts / agentear-log.ts). Returns an unsubscribe function
+  // so React effects can clean up on unmount without leaking listeners
+  // across page switches.
+  onAgentEarEvent: (cb: (envelope: unknown) => void): (() => void) => {
+    const listener = (_event: unknown, envelope: unknown): void => cb(envelope)
+    ipcRenderer.on(IpcChannels.AgentEarEvent, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.AgentEarEvent, listener)
+  },
+  // A3-4 review M5: pull the main process's current log (agentear-log.ts) on
+  // mount, so the panel doesn't start empty every time it's navigated back to.
+  agentearSnapshot: (): Promise<unknown[]> =>
+    ipcRenderer.invoke(IpcChannels.AgentEarSnapshot),
 } as const
 
 contextBridge.exposeInMainWorld('agent24', api)

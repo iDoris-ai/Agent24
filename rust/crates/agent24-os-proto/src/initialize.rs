@@ -176,6 +176,28 @@ pub enum HandshakeError {
     ManifestMismatch { expected: String, got: String },
     /// No shared protocol version, or none declared.
     VersionMismatch(VersionMismatch),
+    /// A3 (`docs/design/A3-ATTACHED-MODULE.md` §5.4, Q3=a): this module
+    /// already has a live attached generation — first-comer keeps it, a
+    /// second connection is refused rather than replacing it. Produced by
+    /// `AttachRegistry::commit` (agent24d), not by [`accept_attached`] itself
+    /// — the pure check has no registry lock to consult.
+    Busy,
+    /// A3 (§4.3): registered, but disabled via `os disable`. Also produced by
+    /// `AttachRegistry::commit`.
+    Forbidden,
+    /// A3 (§4.3, review M3): the module's `manifest_digest` does not match
+    /// the one recorded at registration — but unlike [`Self::ManifestMismatch`],
+    /// the message never echoes the registered digest. `ManifestMismatch`'s
+    /// `expected` is safe to echo because A1's digest is one the KERNEL
+    /// computed and handed to its own child at spawn — not a secret. An
+    /// attached module's digest is nothing of the kind: it is whatever the
+    /// module SUBMITTED at registration (`POST /api/v1/attached`, §3.2), so
+    /// echoing it back to an unauthenticated connection would let a party
+    /// without the real manifest content — or without the token — learn it
+    /// one probe at a time. `kind()` still reports `manifest_mismatch`: the
+    /// two failures mean the same thing to a caller, and only which fields
+    /// are safe to reveal differs.
+    AttachedDigestMismatch,
 }
 
 impl HandshakeError {
@@ -186,7 +208,12 @@ impl HandshakeError {
             Self::Parse(_) => -32700,
             Self::NotInitialize(_) => -32600,
             Self::BadParams(_) => -32602,
-            Self::AuthFailed | Self::ManifestMismatch { .. } | Self::VersionMismatch(_) => -32000,
+            Self::AuthFailed
+            | Self::ManifestMismatch { .. }
+            | Self::VersionMismatch(_)
+            | Self::Busy
+            | Self::Forbidden
+            | Self::AttachedDigestMismatch => -32000,
         }
     }
 
@@ -196,8 +223,12 @@ impl HandshakeError {
     pub fn kind(&self) -> Option<&'static str> {
         match self {
             Self::AuthFailed => Some("auth_failed"),
-            Self::ManifestMismatch { .. } => Some("manifest_mismatch"),
+            Self::ManifestMismatch { .. } | Self::AttachedDigestMismatch => {
+                Some("manifest_mismatch")
+            }
             Self::VersionMismatch(_) => Some(VersionMismatch::KIND),
+            Self::Busy => Some("busy"),
+            Self::Forbidden => Some("forbidden"),
             _ => None,
         }
     }
@@ -222,6 +253,13 @@ impl std::fmt::Display for HandshakeError {
                 "the module read a different manifest: kernel has {expected}, module reports {got}"
             ),
             Self::VersionMismatch(e) => write!(f, "{e}"),
+            Self::Busy => f.write_str("this module already has a live attached connection"),
+            Self::Forbidden => f.write_str("this module is disabled"),
+            // Deliberately says nothing about the registered digest — see the
+            // variant's own doc.
+            Self::AttachedDigestMismatch => {
+                f.write_str("the module's manifest digest does not match the registered one")
+            }
         }
     }
 }
@@ -282,6 +320,135 @@ pub fn accept(frame: &[u8], expect: &Expectation) -> Result<Accepted, HandshakeE
         result: InitializeResult {
             protocol_version: chosen,
             offer: expect.offer.clone(),
+        },
+    })
+}
+
+/// A3 §4.3: what the kernel knows about ONE registered attached module,
+/// looked up by [`accept_attached`]'s `lookup` callback. Unlike [`Expectation`]
+/// (A1: one process, spawned with a fresh one-shot token) this describes a
+/// LONG-LIVED registration: the token is valid until revoked or rotated, and
+/// only its hash is ever held — see `attached.json`'s storage note in the
+/// design doc §3.3.
+#[derive(Debug, Clone)]
+pub struct AttachedExpectation {
+    /// The digest of the `domain-os.yml` submitted at registration.
+    pub manifest_digest: String,
+    /// `sha256` of the registered token. The plaintext is never stored or
+    /// compared directly — see [`accept_attached`].
+    pub token_sha256: [u8; 32],
+    /// Identifies WHICH token this is, so a later step (`AttachRegistry::commit`,
+    /// agent24d) can re-check it was not rotated or revoked between the pure
+    /// check here and the registry lock (§4.3's two-step "①声称 ②提交").
+    pub token_id: String,
+    pub kernel_versions: VersionRange,
+    /// What this connection would be authorised to call, computed the same
+    /// way as [`Expectation::offer`] — from the module's granted
+    /// capabilities, not by this crate.
+    pub offer: Offer,
+}
+
+/// A3 §4.3: a handshake that passed the PURE checks (①) — nothing is
+/// installed yet, no lock has been taken, no `Generation` exists. The caller
+/// (`AttachRegistry::commit`, agent24d, ②) re-checks `token_id` against its
+/// locked registry before turning this into a real, `Running` generation —
+/// see the design doc's two-step split (review H2): a claim can be produced
+/// without a lock, but nothing may be INSTALLED without one.
+#[derive(Debug, Clone)]
+pub struct AttachedAccepted {
+    pub module: String,
+    pub token_id: String,
+    pub accepted: Accepted,
+}
+
+/// A3 §4.3: a fixed, valid-looking hash that no real token can ever hash to
+/// in practice (SHA-256 preimage resistance) — compared against, at the same
+/// cost as a real comparison, when `module` names no registered attached
+/// module at all. Computed once per call rather than stored as a `const`
+/// (`sha256` is not `const fn`); the cost is negligible next to a handshake.
+fn dummy_token_hash() -> [u8; 32] {
+    crate::drain::sha256(b"agent24-a3-unregistered-module-dummy-hash-v1")
+}
+
+/// A3 §4.3: parse and check one attached-module handshake frame — the SAME
+/// wire shape as [`accept`] (`initialize`, `InitializeParams`, no new fields),
+/// but a DIFFERENT check order and a different secret (a long-lived,
+/// registry-held token instead of a one-shot, spawn-time one).
+///
+/// # Order, and why it differs from [`accept`] (review H2/M3)
+///
+/// [`accept`]'s A1 order is identity-before-secret: digest first, then token
+/// — safe there because the digest is the KERNEL's own value, handed to the
+/// very child whose token is being checked, so revealing "your digest is
+/// wrong" first leaks nothing an attacker without the token doesn't already
+/// know (it spawned the child itself). A3 has no such relationship: `module`
+/// is an unauthenticated claim from a stranger on a Unix socket, and
+/// `manifest_digest` is a value ONLY someone who registered this module
+/// (i.e., already holds the token) is supposed to know. Checking digest
+/// before token would let anyone who merely guesses a registered module NAME
+/// learn, one probe at a time, whether a given digest is the registered one
+/// — a registration oracle. So here the order is **token before digest**:
+/// nothing about the digest is revealed to a caller who has not already
+/// proven the token.
+///
+/// # The lookup miss (review H2/M3)
+///
+/// `lookup(&params.module)` returning `None` (no such registration) and it
+/// returning `Some` with a wrong token must be **indistinguishable**, in both
+/// result and — as far as this function's own work is concerned — running
+/// time: both do exactly one `sha256` of the presented token and one
+/// [`crate::drain::constant_time_eq`], the second time against
+/// [`dummy_token_hash`] rather than a registered hash, and both end in
+/// [`HandshakeError::AuthFailed`]. Without this, "unregistered module" vs
+/// "wrong token" would tell a caller whether the NAME it guessed exists at
+/// all — the same oracle the ordering above closes for the digest.
+///
+/// # What this function does NOT do
+///
+/// No lock, no side effects, no registry mutation — it only produces a claim.
+/// `busy`, `forbidden` and "was the token rotated since `lookup` ran" are all
+/// decided by the registry-locked step that follows (`AttachRegistry::commit`,
+/// agent24d, not this crate) — see [`HandshakeError::Busy`] and
+/// [`HandshakeError::Forbidden`]'s own docs.
+///
+/// # Errors
+///
+/// See [`HandshakeError`]. Every one of them means the connection must be
+/// closed by the caller, same as [`accept`].
+pub fn accept_attached(
+    frame: &[u8],
+    lookup: &dyn Fn(&str) -> Option<AttachedExpectation>,
+) -> Result<AttachedAccepted, HandshakeError> {
+    let (id, params) = envelope(frame)?;
+    let params: InitializeParams =
+        serde_json::from_value(params).map_err(|e| HandshakeError::BadParams(e.to_string()))?;
+    let expectation = lookup(&params.module);
+    let presented = crate::drain::sha256(params.auth_token.as_bytes());
+    let dummy = dummy_token_hash();
+    // Computed whether or not `expectation` is `Some` — see the doc above:
+    // the two paths must do the same work before either can return.
+    let expected_hash = expectation.as_ref().map_or(&dummy, |e| &e.token_sha256);
+    let token_ok = crate::drain::constant_time_eq(&presented, expected_hash);
+    let Some(expectation) = expectation else {
+        return Err(HandshakeError::AuthFailed);
+    };
+    if !token_ok {
+        return Err(HandshakeError::AuthFailed);
+    }
+    if params.manifest_digest != expectation.manifest_digest {
+        return Err(HandshakeError::AttachedDigestMismatch);
+    }
+    let chosen = version::negotiate(params.protocol_versions, expectation.kernel_versions)
+        .map_err(HandshakeError::VersionMismatch)?;
+    Ok(AttachedAccepted {
+        module: params.module,
+        token_id: expectation.token_id,
+        accepted: Accepted {
+            id,
+            result: InitializeResult {
+                protocol_version: chosen,
+                offer: expectation.offer,
+            },
         },
     })
 }
@@ -859,5 +1026,177 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&error_line(Some("ok"), &HandshakeError::AuthFailed)).unwrap();
         assert_eq!(v["id"], "ok");
+    }
+
+    // ---- A3 §4.3: `accept_attached` ---------------------------------------
+
+    fn attached_frame() -> String {
+        r#"{"jsonrpc":"2.0","method":"initialize","id":"1","params":{
+            "protocol_versions":{"min":1,"max":1},
+            "module":"agentear","manifest_digest":"sha256:real",
+            "auth_token":"s3cret-attached","capabilities":["events","models"]}}"#
+            .to_owned()
+    }
+
+    fn attached_expectation() -> AttachedExpectation {
+        AttachedExpectation {
+            manifest_digest: "sha256:real".to_owned(),
+            token_sha256: crate::drain::sha256(b"s3cret-attached"),
+            token_id: "tok_abc12345".to_owned(),
+            kernel_versions: VersionRange::new(1, 1).unwrap(),
+            offer: Offer {
+                provides: vec!["_a24/events/".to_owned(), "_a24/model/".to_owned()],
+            },
+        }
+    }
+
+    fn lookup_agentear(
+        expectation: AttachedExpectation,
+    ) -> impl Fn(&str) -> Option<AttachedExpectation> {
+        move |name| (name == "agentear").then(|| expectation.clone())
+    }
+
+    fn no_such_module(_: &str) -> Option<AttachedExpectation> {
+        None
+    }
+
+    #[test]
+    fn a_correct_attached_handshake_is_accepted_with_its_offer_and_token_id() {
+        let lookup = lookup_agentear(attached_expectation());
+        let out = accept_attached(attached_frame().as_bytes(), &lookup)
+            .expect("valid attached handshake");
+        assert_eq!(out.module, "agentear");
+        assert_eq!(out.token_id, "tok_abc12345");
+        assert_eq!(out.accepted.id, "1", "the id comes back, to answer under");
+        assert_eq!(out.accepted.result.protocol_version, 1);
+        assert_eq!(out.accepted.result.offer, attached_expectation().offer);
+    }
+
+    /// The order review H2/M3 requires: TOKEN before DIGEST. A wrong token
+    /// must never reveal whether the digest was also wrong — proven by
+    /// showing "wrong token, wrong digest" answers exactly like "wrong
+    /// token, right digest".
+    #[test]
+    fn token_is_checked_before_digest_for_an_attached_handshake() {
+        let lookup = lookup_agentear(attached_expectation());
+
+        // Right token, wrong digest: the one case that DOES reach the digest
+        // check, and it must be the A3-specific, non-echoing variant.
+        let wrong_digest = attached_frame().replace("sha256:real", "sha256:other");
+        let err = accept_attached(wrong_digest.as_bytes(), &lookup).unwrap_err();
+        assert_eq!(err, HandshakeError::AttachedDigestMismatch, "{err}");
+        assert_eq!(err.kind(), Some("manifest_mismatch"));
+
+        // Wrong token, right digest.
+        let wrong_token = attached_frame().replace("s3cret-attached", "wrong-token");
+        let err_token_only = accept_attached(wrong_token.as_bytes(), &lookup).unwrap_err();
+        assert_eq!(err_token_only, HandshakeError::AuthFailed);
+
+        // Wrong token AND wrong digest: must answer IDENTICALLY to "wrong
+        // token only" above — if digest were checked first, this case would
+        // instead answer `AttachedDigestMismatch`, telling a caller without
+        // the token that the digest it guessed was also wrong.
+        let both_wrong = wrong_digest.replace("s3cret-attached", "wrong-token");
+        let err_both = accept_attached(both_wrong.as_bytes(), &lookup).unwrap_err();
+        assert_eq!(
+            err_both, err_token_only,
+            "a wrong token must hide the digest check entirely"
+        );
+    }
+
+    /// Review H2/M3: an unregistered module name and a registered module
+    /// with the wrong token must be indistinguishable — same error, same
+    /// code, same kind, and no leak of whether the (irrelevant, in the
+    /// unregistered case) digest would have matched.
+    #[test]
+    fn an_unregistered_module_is_indistinguishable_from_a_wrong_token() {
+        let registered = lookup_agentear(attached_expectation());
+
+        let wrong_token = attached_frame().replace("s3cret-attached", "wrong-token");
+        let err_wrong_token = accept_attached(wrong_token.as_bytes(), &registered).unwrap_err();
+
+        let unknown_module =
+            attached_frame().replace("\"module\":\"agentear\"", "\"module\":\"ghost\"");
+        let err_unknown = accept_attached(unknown_module.as_bytes(), &no_such_module).unwrap_err();
+
+        assert_eq!(err_wrong_token, HandshakeError::AuthFailed);
+        assert_eq!(err_unknown, HandshakeError::AuthFailed);
+        assert_eq!(err_wrong_token.code(), err_unknown.code());
+        assert_eq!(err_wrong_token.kind(), err_unknown.kind());
+
+        // Control: a REGISTERED module with the RIGHT token and a digest
+        // mismatch answers differently — so the two cases above collapsing
+        // to the same answer is about the token/lookup path, not about
+        // every failure looking alike.
+        let wrong_digest = attached_frame().replace("sha256:real", "sha256:other");
+        let err_digest = accept_attached(wrong_digest.as_bytes(), &registered).unwrap_err();
+        assert_ne!(err_digest, err_wrong_token);
+    }
+
+    /// M3: unlike `ManifestMismatch`, `AttachedDigestMismatch`'s message
+    /// never echoes either digest — not the registered one (a secret an
+    /// unauthenticated caller has no business learning) and not the one it
+    /// submitted either (nothing to gain by echoing it back).
+    #[test]
+    fn the_attached_digest_mismatch_never_echoes_either_digest() {
+        let lookup = lookup_agentear(attached_expectation());
+        let wrong_digest = attached_frame().replace("sha256:real", "sha256:submitted-by-caller");
+        let err = accept_attached(wrong_digest.as_bytes(), &lookup).unwrap_err();
+        let text = err.to_string();
+        for leak in [
+            "sha256:real",
+            "sha256:submitted-by-caller",
+            "real",
+            "submitted",
+        ] {
+            assert!(!text.contains(leak), "{text} leaks {leak:?}");
+        }
+        let line = error_line(id_of(wrong_digest.as_bytes()).as_deref(), &err);
+        let v: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(v["error"]["data"]["kind"], "manifest_mismatch");
+        let line_text = String::from_utf8_lossy(&line);
+        assert!(!line_text.contains("sha256:real"), "{line_text}");
+        assert!(!line_text.contains("submitted"), "{line_text}");
+    }
+
+    /// Version negotiation is the SAME shared function A1 uses — no
+    /// A3-specific behaviour to drift from it.
+    #[test]
+    fn version_mismatch_behaves_the_same_as_accept() {
+        let lookup = lookup_agentear(attached_expectation());
+        let no_overlap = attached_frame().replace(r#""min":1,"max":1"#, r#""min":7,"max":9"#);
+        let err = accept_attached(no_overlap.as_bytes(), &lookup).unwrap_err();
+        assert_eq!(err.kind(), Some("version_mismatch"));
+        assert_eq!(err.code(), -32000);
+    }
+
+    /// The envelope/params checks are the literal SAME private `envelope`
+    /// function `accept` uses — this is a smoke test that `accept_attached`
+    /// actually calls it, not a re-test of its own logic (already covered
+    /// above for `accept`).
+    #[test]
+    fn envelope_and_params_failures_are_shared_with_accept() {
+        let lookup = lookup_agentear(attached_expectation());
+        let missing_field =
+            r#"{"jsonrpc":"2.0","method":"initialize","id":"1","params":{"module":"agentear"}}"#;
+        let err = accept_attached(missing_field.as_bytes(), &lookup).unwrap_err();
+        assert_eq!(err.code(), -32602);
+
+        let not_initialize = attached_frame().replace("\"initialize\"", "\"ping\"");
+        let err = accept_attached(not_initialize.as_bytes(), &lookup).unwrap_err();
+        assert_eq!(err.code(), -32600);
+    }
+
+    /// `dummy_token_hash` must be a fixed, deterministic value — if it
+    /// varied per call, two unregistered-module handshakes would take
+    /// different code paths through `constant_time_eq` in a way a very
+    /// precise timing attack could in principle exploit, and the whole
+    /// point of the dummy is to not have to reason about that.
+    #[test]
+    fn the_dummy_token_hash_is_fixed() {
+        assert_eq!(dummy_token_hash(), dummy_token_hash());
+        // And it must not equal the real registered hash — otherwise an
+        // unregistered module's dummy comparison could accidentally succeed.
+        assert_ne!(dummy_token_hash(), attached_expectation().token_sha256);
     }
 }

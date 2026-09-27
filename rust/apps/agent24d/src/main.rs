@@ -5,12 +5,18 @@
 
 mod approval_callback;
 mod approvals;
+mod attach_commands;
+mod attach_listener;
+mod attach_registry;
+mod attached;
+mod attached_routes;
 mod domain;
 mod events;
 mod events_emit;
 mod lifecycle;
 mod mcp;
 mod memory_callback;
+mod model_callback;
 mod module_approval_broker;
 mod module_approvals;
 mod os_config;
@@ -20,8 +26,11 @@ mod os_routes;
 mod overrides;
 mod routes;
 mod runs;
+mod scheduler_callback;
+mod scheduler_deliver;
 mod schedules;
 mod server;
+mod usage_recorder;
 
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;

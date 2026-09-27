@@ -269,6 +269,11 @@ impl App {
                 self.log(&p.run_id, format!("⏰ fired by schedule {}", p.schedule_id))
             }
             EventBody::ScheduleDisabled(_) => {}
+            // ME4-1.2.2a adds the wire type; nothing emits it until the
+            // delivery pump lands (ME4-1.3.1). It carries no `run_id` (module
+            // deliveries aren't runs), so there is nothing to key a log line
+            // on yet — same non-rendering treatment as `ScheduleDisabled`.
+            EventBody::ScheduleDelivered(_) => {}
             // T7b/ME-3e: module (gate/advise) approvals are a separate REST
             // surface (`/api/v1/module-approvals`) this TUI does not render
             // — explicit variants, not a wildcard `_`, so a FUTURE new

@@ -7,8 +7,8 @@
 
 use agent24_core::check_run_transition;
 use agent24_protocol::{
-    Approval, ApprovalStatus, Decision, ErrorBody, RiskClass, Run, RunOutput, RunStatus, Schedule,
-    Session, ToolCall, ToolCallStatus, Usage,
+    Approval, ApprovalStatus, Decision, DisabledBy, ErrorBody, RiskClass, Run, RunOutput,
+    RunStatus, Schedule, ScheduleOwner, Session, ToolCall, ToolCallStatus, Usage,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -48,6 +48,40 @@ fn tool_status_str(s: ToolCallStatus) -> &'static str {
         ToolCallStatus::Failed => "failed",
         ToolCallStatus::Denied => "denied",
     }
+}
+
+/// design §8.1 (v3 L-D): the `Schedule` view's two derived fields, computed
+/// from the storage columns. Priority: `user_suspended` → `User`, then
+/// `system_disabled_reason` → `System`, then `!enabled` → `Module` for a
+/// module row / `User` for a user row; otherwise the row is currently
+/// eligible to fire (`true`, `None`).
+///
+/// Migration 0007's CHECK forbids `user_suspended`/`system_disabled_reason`
+/// from ever being set on a user row, so this same formula collapses to
+/// `effective_enabled == enabled` / `disabled_by == (!enabled).then_some(User)`
+/// for one without a special case — `is_module_row` only decides which
+/// `DisabledBy` variant a bare `!enabled` maps to.
+fn effective(
+    enabled: bool,
+    user_suspended: bool,
+    system_disabled_reason: &Option<String>,
+    is_module_row: bool,
+) -> (bool, Option<DisabledBy>) {
+    if user_suspended {
+        return (false, Some(DisabledBy::User));
+    }
+    if system_disabled_reason.is_some() {
+        return (false, Some(DisabledBy::System));
+    }
+    if !enabled {
+        let by = if is_module_row {
+            DisabledBy::Module
+        } else {
+            DisabledBy::User
+        };
+        return (false, Some(by));
+    }
+    (true, None)
 }
 
 fn row_to_run(row: &SqliteRow) -> Result<Run> {
@@ -490,8 +524,22 @@ impl Store {
 
     // ── schedules ────────────────────────────────────────────────────────────
 
-    pub async fn upsert_schedule(&self, schedule: &Schedule) -> Result<()> {
-        sqlx::query(
+    /// # Design
+    ///
+    /// docs/design/ME4-S1-scheduler-callback.md §2.2: a structural guard —
+    /// `WHERE schedules.owner_module IS NULL` — so this REST/self-wake path
+    /// cannot touch a module-owned row even if a caller forgot the check
+    /// (`rest_upsert_cannot_touch_a_module_row`); and `revision = revision +
+    /// 1` on every update, so a module-row read that raced a REST PATCH can
+    /// tell (the module path never calls this — `upsert_module_schedule`
+    /// does its own revision handling, §2.2's table).
+    ///
+    /// Review, L-2: returns whether the row was written (`false` for a
+    /// module row the guard refused) — callers that need to distinguish
+    /// "wrote" from "silently guarded off" (only `C1.8`'s test does today)
+    /// no longer have to re-query.
+    pub async fn upsert_schedule(&self, schedule: &Schedule) -> Result<bool> {
+        let result = sqlx::query(
             "INSERT INTO schedules (id, name, enabled, spec, action, delivery,
                                     last_run_at, next_run_at, consecutive_failures)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -500,7 +548,9 @@ impl Store {
                  spec = excluded.spec, action = excluded.action,
                  delivery = excluded.delivery, last_run_at = excluded.last_run_at,
                  next_run_at = excluded.next_run_at,
-                 consecutive_failures = excluded.consecutive_failures",
+                 consecutive_failures = excluded.consecutive_failures,
+                 revision = schedules.revision + 1
+             WHERE schedules.owner_module IS NULL",
         )
         .bind(&schedule.id)
         .bind(&schedule.name)
@@ -513,20 +563,31 @@ impl Store {
         .bind(schedule.consecutive_failures)
         .execute(self.pool())
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
-    /// Persist ONLY the scheduler-owned runtime columns of an existing row
-    /// (enabled / last_run_at / next_run_at / consecutive_failures). Returns
-    /// false when the row is gone. Two guarantees for the fire path (review
-    /// C5): a schedule deleted mid-tick is not resurrected (never inserts),
-    /// and a concurrent PATCH to the user-facing fields (name / spec / action
-    /// / delivery) is not clobbered — those columns are left untouched.
+    /// Persist ONLY the scheduler-owned runtime columns of an existing USER
+    /// row (enabled / last_run_at / next_run_at / consecutive_failures).
+    /// Returns false when the row is gone (or, review L-6, is module-owned —
+    /// `AND owner_module IS NULL` is a defence-in-depth guard: nothing in
+    /// this task wires a caller that would pass a module row's id here, but
+    /// the guard costs nothing and matches `upsert_schedule`'s). Two
+    /// guarantees for the fire path (review C5): a schedule deleted mid-tick
+    /// is not resurrected (never inserts), and a concurrent PATCH to the
+    /// user-facing fields (name / spec / action / delivery) is not clobbered
+    /// — those columns are left untouched.
+    ///
+    /// Superseded by [`crate::Store::update_schedule_runtime_cas`]
+    /// (ME4-1.2.1c) for new call sites: this version has no revision CAS, so
+    /// a tick's pre-advance racing a REST PATCH can still clobber it (the
+    /// pre-existing hazard `update_schedule_runtime_cas`'s doc comment
+    /// explains). ME4-1.2.2b should migrate `agent24-scheduler`'s callers to
+    /// the CAS'd version and remove this one.
     pub async fn update_schedule_runtime(&self, schedule: &Schedule) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE schedules SET
                  enabled = ?, last_run_at = ?, next_run_at = ?, consecutive_failures = ?
-             WHERE id = ?",
+             WHERE id = ? AND owner_module IS NULL",
         )
         .bind(schedule.enabled)
         .bind(&schedule.last_run_at)
@@ -558,17 +619,64 @@ impl Store {
         Ok(out)
     }
 
-    fn row_to_schedule(r: &SqliteRow) -> Result<Schedule> {
+    /// `pub(crate)` (not private) so `module_schedules.rs`'s tick read-model
+    /// ([`crate::module_schedules::ScheduleRecord`]) can build on the exact
+    /// same row → `Schedule` mapping as the strict `list_schedules`/
+    /// `get_schedule` below, rather than a second, same-shaped parser that
+    /// could drift from this one.
+    ///
+    /// design §8.1/§13: reads the ME4-1.2.1 columns (`owner_module`,
+    /// `module_key`, `user_suspended`, `system_disabled_reason`) and derives
+    /// the view fields. Before this task, a module row's sentinel `action`
+    /// column (`{"type":"module_delivery"}`, not a real `ScheduleAction`)
+    /// made THIS function return `Err` for every module row — silently
+    /// dropped by `list_schedules_lenient`'s caller and a 500 from the
+    /// strict `list_schedules`/`get_schedule` REST paths (§14 R7). `action`
+    /// is `Option<ScheduleAction>` now specifically so a module row decodes
+    /// successfully, with `action: None` rather than attempting (and
+    /// failing) to parse the sentinel.
+    pub(crate) fn row_to_schedule(r: &SqliteRow) -> Result<Schedule> {
+        let owner_module: Option<String> = r.get("owner_module");
+        let module_key: Option<String> = r.get("module_key");
+        let is_module_row = owner_module.is_some();
+        let action = if is_module_row {
+            None
+        } else {
+            Some(serde_json::from_str(&r.get::<String, _>("action"))?)
+        };
+        let enabled: bool = r.get("enabled");
+        let user_suspended: bool = r.get("user_suspended");
+        let system_disabled_reason: Option<String> = r.get("system_disabled_reason");
+        let (effective_enabled, disabled_by) = effective(
+            enabled,
+            user_suspended,
+            &system_disabled_reason,
+            is_module_row,
+        );
+        let owner = owner_module.map(|module| ScheduleOwner {
+            module,
+            // Migration 0007's CHECK ((owner_module IS NULL) = (module_key IS
+            // NULL)) guarantees `module_key` is Some whenever `owner_module`
+            // is — this default only fires if that DB-level invariant is
+            // ever violated out from under us, and an empty key is a safer
+            // failure than panicking on a read path.
+            key: module_key.unwrap_or_default(),
+        });
         Ok(Schedule {
             id: r.get("id"),
             name: r.get("name"),
-            enabled: r.get("enabled"),
+            enabled,
             spec: serde_json::from_str(&r.get::<String, _>("spec"))?,
-            action: serde_json::from_str(&r.get::<String, _>("action"))?,
+            action,
             delivery: serde_json::from_str(&r.get::<String, _>("delivery"))?,
             last_run_at: r.get("last_run_at"),
             next_run_at: r.get("next_run_at"),
             consecutive_failures: r.get("consecutive_failures"),
+            owner,
+            user_suspended,
+            system_disabled_reason,
+            effective_enabled,
+            disabled_by,
         })
     }
 

@@ -1,12 +1,33 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, nativeImage, session, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, Menu, Tray, nativeImage, session, ipcMain, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
+import { AgentEarEventBridge } from './agentear-events'
+import { AgentEarEventLog } from './agentear-log'
+import { IpcChannels } from '../shared/ipc-types'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
+// A3-4 review M5: the sequenced/capped event log lives here, in main, so it
+// survives the renderer's VoicePanel unmounting when the user switches
+// sidebar pages (design §7.2's intent — a host-side log, not a per-tab one).
+const agentEarLog = new AgentEarEventLog()
+// Forwards raw WS-unwrapped agentear.event/1 objects into the log; the log's
+// own subscribe() (wired below, in whenReady) fans newly-delivered envelopes
+// out to the renderer.
+const agentEarBridge = new AgentEarEventBridge((envelope) => agentEarLog.ingest(envelope))
+
+// FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken
+// by another project, the window silently loaded whatever else was listening
+// there. `vite.config.ts` sets `strictPort: true` so `pnpm dev:vite` now
+// fails loudly instead of picking a different port; this env var lets the
+// main process agree with a non-default vite dev server URL when one is
+// configured, while still defaulting to the same 5173 vite.config.ts uses.
+const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL ?? 'http://localhost:5173'
+const DEV_SERVER_ORIGIN = new URL(DEV_SERVER_URL).origin
+const DEV_SERVER_WS_ORIGIN = DEV_SERVER_ORIGIN.replace(/^http/, 'ws')
 
 // Keep tray reference alive — GC would destroy it otherwise
 let tray: Tray | null = null
@@ -45,7 +66,7 @@ function createMainWindow(): BrowserWindow {
   })
 
   if (isDev) {
-    void win.loadURL('http://localhost:5173')
+    void win.loadURL(DEV_SERVER_URL)
     win.webContents.openDevTools({ mode: 'detach' })
   } else {
     void win.loadFile(path.join(__dirname, '../renderer/index.html'))
@@ -74,6 +95,14 @@ process.on('unhandledRejection', (reason) => {
 })
 
 app.whenReady().then(() => {
+  // Dev-only: show the real app icon in the dock immediately, without
+  // waiting for an electron-builder packaged build (which is where mac.icon
+  // in package.json normally takes effect).
+  if (isDev && process.platform === 'darwin' && app.dock) {
+    const devIcon = nativeImage.createFromPath(path.join(__dirname, '../../assets/icon.png'))
+    if (!devIcon.isEmpty()) app.dock.setIcon(devIcon)
+  }
+
   backendManager.start()
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
@@ -81,10 +110,10 @@ app.whenReady().then(() => {
         ...details.responseHeaders,
         'Content-Security-Policy': [
           "default-src 'self'; " +
-          "script-src 'self'" + (isDev ? " 'unsafe-inline' 'unsafe-eval' http://localhost:5173" : "") + "; " +
+          "script-src 'self'" + (isDev ? ` 'unsafe-inline' 'unsafe-eval' ${DEV_SERVER_ORIGIN}` : "") + "; " +
           "style-src 'self' 'unsafe-inline'; " +
           "img-src 'self' data:; " +
-          "connect-src 'self'" + (isDev ? " http://localhost:5173 ws://localhost:5173 http://localhost:8765" : "") + "; " +
+          "connect-src 'self'" + (isDev ? ` ${DEV_SERVER_ORIGIN} ${DEV_SERVER_WS_ORIGIN} http://localhost:8765` : "") + "; " +
           "font-src 'self'",
         ],
       },
@@ -93,6 +122,17 @@ app.whenReady().then(() => {
 
   registerIpcHandlers()
   mainWin = createMainWindow()
+  agentEarBridge.start()
+
+  // A3-4 review M5: pull (snapshot on mount) + push (ongoing) for the voice
+  // panel's log. Registered once here — the log itself is process-lifetime,
+  // not per-window, so no cleanup needed on window recreation.
+  ipcMain.handle(IpcChannels.AgentEarSnapshot, () => agentEarLog.snapshot())
+  agentEarLog.subscribe((envelope) => {
+    if (mainWin && !mainWin.isDestroyed()) {
+      mainWin.webContents.send(IpcChannels.AgentEarEvent, envelope)
+    }
+  })
 
   // ── System tray (M2 base; F1b: live daemon status + start/stop/restart) ────
   // Empty image + setTitle works on macOS (menu-bar text); M3 will add a
@@ -157,6 +197,8 @@ app.on('before-quit', () => {
 
 app.on('will-quit', () => {
   if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
+  agentEarBridge.stop()
+  agentEarLog.stop()
   backendManager.stop()
 })
 

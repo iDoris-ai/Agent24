@@ -1,0 +1,18 @@
+AgentEar contracts/ vendored copy — used by Agent24 desktop tests (A3-4).
+
+source_repo: github.com/iDoris-ai/AgentEar (local clone: /Users/jason/Dev/tools/AgentEar)
+source_commit: 522f9eba0f720c97b9bb0a63d059a82e33029dcb
+copied_at: 2026-09-27T14:39:00Z
+copy_method: git archive 522f9eb contracts/schema contracts/fixtures | tar -x
+
+README intentionally not vendored (relative links into AgentEar's own docs/,
+e.g. ../docs/agent24-embedding.md, which don't exist in this repo and only
+ever resolve inside the AgentEar repo — vendoring it verbatim tripped this
+repo's own doc-link checker for no benefit; contracts/README.md's content is
+process/ownership notes for AgentEar's repo, not fixture data these tests
+read).
+
+Do not hand-edit files under contracts/ here. To upgrade: re-run the archive
+command against a new pinned sha, update source_commit above in the same PR
+that updates the tests reading these fixtures, and do not float on AgentEar
+main (design doc A3-ATTACHED-MODULE.md §7.2).

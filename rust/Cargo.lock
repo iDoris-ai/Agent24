@@ -116,10 +116,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-os-fd"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "agent24-os-packages"
 version = "0.3.0"
 dependencies = [
  "agent24-domain",
+ "agent24-os-proto",
  "rustix 0.38.44",
  "serde_yaml",
  "sha2",
@@ -131,6 +139,8 @@ name = "agent24-os-proto"
 version = "0.3.0"
 dependencies = [
  "agent24-domain",
+ "agent24-os-fd",
+ "agent24-os-proto",
  "axum",
  "bytes",
  "close_fds",
@@ -141,12 +151,28 @@ dependencies = [
  "rustix 0.38.44",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "tempfile",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "agent24-os-sdk"
+version = "0.1.0"
+dependencies = [
+ "agent24-os-proto",
+ "agent24-os-sdk",
+ "axum",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -191,7 +217,10 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "cron",
+ "hex",
  "serde_json",
+ "sha2",
+ "sqlx",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
@@ -207,47 +236,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent24-sin90"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "agent24-sin90-os"
-version = "0.3.0"
-dependencies = [
- "agent24-domain",
- "agent24-sin90",
- "agent24-sin90-store",
- "async-trait",
- "axum",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tower",
-]
-
-[[package]]
-name = "agent24-sin90-store"
-version = "0.1.0"
-dependencies = [
- "agent24-core",
- "agent24-sin90",
- "agent24-sin90-store",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "agent24-store"
 version = "0.3.0"
 dependencies = [
@@ -257,6 +245,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -306,10 +295,10 @@ dependencies = [
  "agent24-models",
  "agent24-os-packages",
  "agent24-os-proto",
+ "agent24-os-sdk",
  "agent24-policy",
  "agent24-protocol",
  "agent24-scheduler",
- "agent24-sin90-os",
  "agent24-store",
  "agent24-tools",
  "async-trait",
@@ -317,17 +306,21 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "form_urlencoded",
  "fs2",
  "futures",
  "http-body-util",
+ "libc",
  "rand 0.9.5",
  "rustix 0.38.44",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tokio-util",
  "tower",
  "tracing",

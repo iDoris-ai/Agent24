@@ -68,6 +68,10 @@ fn main() {
                     "ModuleApprovalSubmitted",
                     &["expires_at", "created_at", "decided_at"],
                 ),
+                // ME4-1.2.2a (design §5.5): `scheduled_for` is a plain
+                // `String` field (like the others above), so schemars won't
+                // infer `format: date-time` on its own.
+                ("ScheduleDeliveredPayload", &["scheduled_for"]),
             ];
             for (def_name, fields) in DATE_TIME_FIELDS {
                 if let Some(props) = defs

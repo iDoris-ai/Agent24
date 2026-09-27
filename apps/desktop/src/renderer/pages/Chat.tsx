@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import logoWelcome from '../assets/logo-welcome.png'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -68,7 +69,7 @@ export default function ChatPage() {
       <div className="chat-messages">
         {messages.length === 0 && (
           <div className="chat-empty">
-            <div style={{ fontSize: 40 }}>🤖</div>
+            <img className="chat-empty-logo" src={logoWelcome} alt="" />
             <h2>Agent24</h2>
             <p>你的本地 AI 助理，数据不离机</p>
             <div className="chat-suggestions">

@@ -16,7 +16,6 @@ agent24-memory = { path = "../../crates/agent24-memory" }
 agent24-models = { path = "../../crates/agent24-models" }
 agent24-policy = { path = "../../crates/agent24-policy" }
 agent24-scheduler = { path = "../../crates/agent24-scheduler" }
-agent24-sin90-os = { path = "../../crates/agent24-sin90-os" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 async-trait = "0.1"
 # T8.5c-P: cursor tokens are `base64(v2:<seq>:<fingerprint>)` (design §7.1).
@@ -31,6 +30,15 @@ http-body-util = "0.1"
 rand = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# ME4-4.2.3b (design §6.5): `GET /api/v1/usage?module=` reads the raw query
+# string itself (via `axum::extract::RawQuery`) rather than axum's `Query`
+# extractor, so a malformed `module`-less query never turns into a 400 (v2
+# L5). `form_urlencoded::parse` (not `serde_urlencoded`, review L1): it is
+# INFALLIBLE — invalid percent-encoding decodes losslessly to U+FFFD rather
+# than erroring — so there is no error branch to (mis-)handle, and no way for
+# one malformed key/value pair to hide an unrelated, well-formed `module=`
+# key elsewhere in the same query string.
+form_urlencoded = "1"
 # T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
 # with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
 futures = { version = "0.3", default-features = false, features = ["std"] }
@@ -44,12 +52,30 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # proxy, the supervisor — is wired in by later slices.
 agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 # SHUT-1b: open the shutdown evidence without following a link or blocking on
-# a FIFO (already in the tree through agent24-os-proto).
-rustix = { version = "0.38", features = ["fs"] }
+# a FIFO (already in the tree through agent24-os-proto). "process" is needed
+# by TWO independent callers of `geteuid()`: FU-92's fallback-directory
+# ownership check (server.rs `secure_fallback_dir`) and A3-2b's attach socket
+# same-UID peer check (`attach_listener.rs`, the same call
+# `agent24_os_proto::endpoint` already makes for A1's).
+rustix = { version = "0.38", features = ["fs", "process"] }
+# A3-2b (`attach_listener.rs`): `ENAMETOOLONG` for an actionable error when
+# `$HOME` makes the attach socket path exceed `sockaddr_un`'s limit.
+libc = "0.2"
+# A3-2a (`attached.rs`): sha256 of the token for `attached.json` (never the
+# plaintext, C1) — the daemon itself, not just its tests, needs this now.
+sha2 = "0.10"
+# A3-2a (`attached.rs`): the `model_access` field the shared, lenient
+# `agent24_os_proto::manifest::facts_from_yaml` does not read (ME4-S3 §4.4
+# only carries the three fields a MODULE needs); read directly rather than
+# adding a fourth field to that shared reader for one caller.
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
-sha2 = "0.10"
+# ME4-S3 §6 (J-S7): the SDK's five clients tested against these callback
+# handlers' own `h.call` fixtures, on `agent24-os-proto`'s in-memory fake
+# kernel (forwarded through the SDK's `test-util` feature, L8).
+agent24-os-sdk = { path = "../../crates/agent24-os-sdk", features = ["test-util"] }
 # T7b/ME-3e: forces a transient `Store` error in the timeout-scan test by
 # dropping `module_approvals` out from under a live pool — there is no
 # fault-injectable `Store` trait to mock instead.
@@ -57,6 +83,10 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tower = { version = "0.5", features = ["util"] }
 # A paused clock, for deadlines asserted exactly rather than with slack.
 tokio = { version = "1", features = ["test-util"] }
+# T9/ME-3f: the black-box test observes event forwarding at the real
+# `GET /api/v1/events` consumer boundary, not just the callback's ack — same
+# version/feature set `agent24-cli`'s TUI already uses as a client.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 
 [lints]
 workspace = true
