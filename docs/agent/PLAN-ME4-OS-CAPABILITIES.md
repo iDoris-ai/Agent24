@@ -300,32 +300,17 @@ Sin90 `F5.0 设计补丁（新 Op 先进 DESIGN §2，送对抗评审）` → `F
 
 **ME4-5.1.1 SDK 设计冻结：`docs/design/ME4-S3-os-sdk.md`** —— 从 Sin90 adapter（T3.2.0 transport + 五种客户端 + fired）与黑盒 Python 模块逐行对照提取 API（规范 S3）。依赖：ME4-M4b 门。
 
-**ME4-5.1.2a/b/c 按 ME4-S3 §7（v3，2026-09-26：按 PR-Daemon SZ-1 口径——新增+删除、含注释与配置、不含测试——估算）拆成 17 个 PR，每个估算 ≤ 300。合并流程：一次只开一个 PR，base 一律 `main`，上一片合并后下一片才开（不用 stacked base、不改 base）；「依赖」是 DAG，指开这一片之前 main 里必须已有的片：**
+**ME4-5.1.2a/b 按 ME4-S3 §7（v4，2026-09-26：用户拍板 v0.1.0 收敛为「原型版本」，从 v3 的 17 个 PR 压缩为 4 个大片）拆成两个 Agent24 大片 + Sin90 迁移 + Cos72 占位。合并流程不变：一次只开一个 PR，base 一律 `main`，上一片合并后下一片才开；单片允许超过 PR-Daemon SZ-1 默认上限 300 行，超限时在 PR body 回应即可，不强制再拆：**
 
-- **ME4-5.1.2a1** proto `module`：`ModuleEnv`（`from_env`/`from_vars`，不持 fd）、`SPAWN_ENV_VARS`、`Hello`、`FatalHook`（newtype）、宽松 `InitializeReply`、`connect_from_env` 握手部分（先返回只能 `offer()` 的连接）、`manifest::{ManifestFacts, facts_from_yaml}`、`manifest_digest` 从 `agent24-os-packages` 挪入 proto（os-packages 转出）；J-S12、J-S19。依赖：ME4-5.1.1 冻结。
-- **ME4-5.1.2a2-core** proto `Connection` mux 核心（移植 Sin90 transport：读写任务、按 id 分发、64 在途、`declare_dead`）；J-S8 前 8 条。依赖：a1。
-- **ME4-5.1.2a2-cancel** drop 取消、响应/写超时、`slot_wait`；J-S8 后 8 条、J-S9 前半。依赖：a2-core。
-- **ME4-5.1.2a2-kit** `module::testing`（`test-util`，与 Sin90 `test_support.rs` 同签名 + `FakeEndpoint` + `recording_hook`）。依赖：a2-core。
-- **ME4-5.1.2a3-fd** 新 crate `agent24-os-fd`（`take_inherited_listener`，唯一 `unsafe`）+ proto `take_listener` + `check-proto-exports.py` + CI 新增 `macos-latest` job（只跑 os-fd 测试）；J-S1b、J-S20。依赖：a1。
-- **ME4-5.1.2a3-skel** SDK crate 骨架（`Cargo.toml`、`clippy.toml`、两个正对照 feature）+ `check-lints.py` + CI；J-S1、J-S2、J-S3。依赖：无（从 main 开）。
-- **ME4-5.1.2a3-module** `Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env`（`connect()` 里接管监听器）；J-S11。依赖：a2-kit、a3-fd、a3-skel。
-- **ME4-5.1.2b1a** `ClientError`/`UnavailableCause`/映射/`is_permanent`/`is_retryable`（不含 `retry_class`，FU-87）；J-S4。依赖：a2-core、a3-skel。
-- **ME4-5.1.2b1b** `RequestContext`/`RequestId`/`ApprovalToken`、客户端公共 `Core`、空的 `clients::METHODS` 骨架（随各客户端 PR 逐步扩）。依赖：b1a。
-- **ME4-5.1.2b2a** Events（含 sink）+ agentd 对等测试；J-S5/J-S6/J-S7（events）。依赖：b1b、a2-cancel、a3-module。
-- **ME4-5.1.2b2b** Memory + `remember_once`（§8 Q5 拍板；v3 与 v2 的 b2d 合并，SZ-1 实测 209）+ agentd 对等测试；J-S5/J-S6/J-S7（memory）、J-S18。依赖：b1b、a2-cancel、a3-module。
-- **ME4-5.1.2b2c** Approval（advise 孤儿约束写进文档）+ agentd 对等测试；J-S5/J-S6/J-S7（approval）。依赖：b1b、a2-cancel、a3-module。
-- **ME4-5.1.2b3a** Scheduler + agentd 对等测试；J-S5/J-S6/J-S7（scheduler）。依赖：b1b、a2-cancel、a3-module。
-- **ME4-5.1.2b3b** Model + agentd 对等测试；J-S5/J-S6/J-S7（model）、J-S9 后半。依赖：b1b、a2-cancel、a3-module。
-- **ME4-5.1.2c1a** `FiredBody` 挪进 `kernel_call`（agentd 改用）。依赖：无（从 main 开）。
-- **ME4-5.1.2c1b** fired 提取器与 `with_fired`；J-S10。依赖：c1a、b1b。
-- **ME4-5.1.2c2** `examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + `CHANGELOG.md`（含最低内核版本）；J-S13；合并后在 main 上打 tag `agent24-os-sdk-v0.1.0`（J-S14）。依赖：a3-module、b2a、b2b、b2c、b3a、b3b、c1b。
-- 验收：`cargo +1.98.0 test -p agent24-os-sdk`；S3 第 1 条的 clippy 判据（含正对照）；`examples/minimal` 挂载冒烟通过；`git ls-remote --tags origin agent24-os-sdk-v0.1.0` 非空。
+- **ME4-5.1.2a（原型片①：proto 模块侧）** transport + 握手 + fd：`ModuleEnv`（`from_env`/`from_vars`，不持 fd）、`SPAWN_ENV_VARS`、`Hello`、`FatalHook`（newtype）、宽松 `InitializeReply`、`connect_from_env`（握手 + mux：读写任务、按 id 分发、64 在途、`declare_dead`、drop 取消、响应/写超时、`slot_wait`）、`manifest::{ManifestFacts, facts_from_yaml}`、`manifest_digest` 从 `agent24-os-packages` 挪入 proto（os-packages 转出）、`module::testing`（`test-util`）、新 crate `agent24-os-fd`（`take_inherited_listener`，唯一 `unsafe`）+ proto `take_listener`；J-S8、J-S9 前半、J-S12、J-S19；J-S1b（`check-proto-exports.py`）、J-S20 的 `macos-latest` job 为原型阶段可选（§6 判据分级）。依赖：ME4-5.1.1 冻结。细粒度组件清单（原 a1/a2-core/a2-cancel/a2-kit/a3-fd）见 ME4-S3 §7.1。
+- **ME4-5.1.2b（原型片②：SDK crate）** `agent24-os-sdk` 骨架 + 五个客户端 + fired：`clippy.toml`（26 项，正对照三步原型阶段可选）、`Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env`（`connect()` 里接管监听器）、`ClientError`/`UnavailableCause`/映射/`is_permanent`/`is_retryable`（不含 `retry_class`，FU-87）、`RequestContext`/`RequestId`/`ApprovalToken`、`clients::METHODS`、Events（含 sink）、Memory + `remember_once`（§8 Q5 拍板）、Approval（advise 孤儿约束写进文档）、Scheduler、Model，各自的 agentd 对等测试、`FiredBody` 挪进 `kernel_call`（agentd 改用）+ fired 提取器与 `with_fired`、`examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + `CHANGELOG.md`（含最低内核版本）；J-S1（主体）、J-S2、J-S4/J-S5/J-S6/**J-S7**（wire 对等，核心判据）、J-S9 后半、J-S10、J-S11、J-S13、J-S14、J-S18；J-S3 的正对照脚本、J-S15 为原型阶段可选。依赖：5.1.2a。合并后在 main 上打 tag `agent24-os-sdk-v0.1.0`（J-S14）。细粒度组件清单（原 a3-skel/a3-module/b1a/b1b/b2a/b2b/b2c/b3a/b3b/c1a/c1b/c2）见 ME4-S3 §7.1；Memory 若实测 SZ-1 超预算，内部再拆，不必单开 PR。
+- 验收：`cargo +1.98.0 test -p agent24-os-sdk`；S3 第 1 条的 clippy 判据（核心部分）；`examples/minimal` 挂载冒烟通过；`git ls-remote --tags origin agent24-os-sdk-v0.1.0` 非空。
 
 **ME4-5.2.0 Sin90 线协议金样**（Sin90 `TS.1.0`，迁移前合）—— 出站 `(method, params)` 序列 + 入站回放（每个错误 kind → outbox 行状态/attempts 与 `ModelFailure`、宽松解析、Usage 宽度、recall 预查三态），见 ME4-S3 §5.1。
 
-**ME4-5.2.1 Sin90 迁到 SDK**（Sin90 `TS.1.1`）—— `src/adapter_agent24/` 净减；Sin90 真实挂载黑盒（M3/M4/M5 全部判据）不变全绿；TS.1.0 金样逐条相等；`reconciler.rs`/`clients/model.rs` 测试模块与已提交的期望补丁逐字相等（只允许 model 测试模块一行 `use` 改指 SDK 的 `UnavailableCause`）；Sin90 改用 SDK 的 `remember_once`（ME4-S3 §5.2）。依赖：5.1.2c2、5.2.0。
+**ME4-5.2.1 Sin90 迁到 SDK（原型片③）**（Sin90 `TS.1.1`）—— `src/adapter_agent24/` 净减；Sin90 真实挂载黑盒（M3/M4/M5 全部判据）不变全绿（核心判据 J-S16）；TS.1.0 金样逐条相等；`reconciler.rs`/`clients/model.rs` 测试模块与已提交的期望补丁逐字相等（脚本 v4 改用 `#[cfg(test)]`+`mod tests {` 紧邻锚点，避免被非测试部分新增的诱饵 `#[cfg(test)]` 行截错，见 ME4-S3 §5.2 第 3 条/A.8；只允许 model 测试模块一行 `use` 改指 SDK 的 `UnavailableCause`）；Sin90 改用 SDK 的 `remember_once`（ME4-S3 §5.2）。依赖：5.1.2b、5.2.0。
 
-**ME4-5.3.x Cos72（T10，`MushroomDAO/Cos72`）**
+**ME4-5.3.x Cos72（原型片④，占位；T10，`MushroomDAO/Cos72`）**：Cos72 仓库今天没有代码，本轮不展开，依赖 5.1.2b（及其 tag）；落地时按下面既有的 5.3.1–5.3.4 拆法走：
 - ME4-5.3.1 Cos72 仓库 `.pilot.yml` + `docs/agent` 七件套（按 S4 拆 task，门镜像到本表）。
 - ME4-5.3.2 骨架：manifest + SDK 挂载 + SQLite 迁移 + 事件。
 - ME4-5.3.3a mytask 实体与路由（发布/认领/提交）。
