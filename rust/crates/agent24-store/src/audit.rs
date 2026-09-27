@@ -21,7 +21,7 @@ pub struct AuditEntry {
     pub hash: String,
 }
 
-const GENESIS: &str = "genesis";
+pub(crate) const GENESIS: &str = "genesis";
 
 /// Fully-decoded tail row and AUTOINCREMENT high-water captured in one read.
 #[derive(Clone, PartialEq, Eq)]

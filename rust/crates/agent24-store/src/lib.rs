@@ -23,10 +23,15 @@ mod allocation_retention_plan;
 mod allocation_retention_writer;
 mod allocation_types;
 mod audit;
+mod legacy_recovery;
 mod module_approvals;
 mod module_model_usage;
 mod module_schedules;
 mod repo;
+mod terminal_core;
+mod terminal_helpers;
+pub(crate) mod terminal_mutations;
+pub(crate) mod terminal_plan;
 pub mod workspace_api;
 pub mod workspace_decode;
 pub(crate) mod workspace_decode_support;
@@ -55,6 +60,9 @@ pub use allocation_types::{
 pub use audit::AuditEntry;
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
+pub use legacy_recovery::{
+    LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
+};
 pub use repo::*;
 
 use sqlx::SqlitePool;
