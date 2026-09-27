@@ -8,6 +8,16 @@ import { BackendManager, type BackendStatus } from './backend-manager'
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
 
+// FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken
+// by another project, the window silently loaded whatever else was listening
+// there. `vite.config.ts` sets `strictPort: true` so `pnpm dev:vite` now
+// fails loudly instead of picking a different port; this env var lets the
+// main process agree with a non-default vite dev server URL when one is
+// configured, while still defaulting to the same 5173 vite.config.ts uses.
+const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL ?? 'http://localhost:5173'
+const DEV_SERVER_ORIGIN = new URL(DEV_SERVER_URL).origin
+const DEV_SERVER_WS_ORIGIN = DEV_SERVER_ORIGIN.replace(/^http/, 'ws')
+
 // Keep tray reference alive — GC would destroy it otherwise
 let tray: Tray | null = null
 // Mutable reference so tray handlers always point to the current window
@@ -45,7 +55,7 @@ function createMainWindow(): BrowserWindow {
   })
 
   if (isDev) {
-    void win.loadURL('http://localhost:5173')
+    void win.loadURL(DEV_SERVER_URL)
     win.webContents.openDevTools({ mode: 'detach' })
   } else {
     void win.loadFile(path.join(__dirname, '../renderer/index.html'))
@@ -81,10 +91,10 @@ app.whenReady().then(() => {
         ...details.responseHeaders,
         'Content-Security-Policy': [
           "default-src 'self'; " +
-          "script-src 'self'" + (isDev ? " 'unsafe-inline' 'unsafe-eval' http://localhost:5173" : "") + "; " +
+          "script-src 'self'" + (isDev ? ` 'unsafe-inline' 'unsafe-eval' ${DEV_SERVER_ORIGIN}` : "") + "; " +
           "style-src 'self' 'unsafe-inline'; " +
           "img-src 'self' data:; " +
-          "connect-src 'self'" + (isDev ? " http://localhost:5173 ws://localhost:5173 http://localhost:8765" : "") + "; " +
+          "connect-src 'self'" + (isDev ? ` ${DEV_SERVER_ORIGIN} ${DEV_SERVER_WS_ORIGIN} http://localhost:8765` : "") + "; " +
           "font-src 'self'",
         ],
       },

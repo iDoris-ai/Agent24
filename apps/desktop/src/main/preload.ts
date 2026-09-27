@@ -5,6 +5,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import {
   IpcChannels,
+  type BackendEndpointResult,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type DiscoverFilter,
@@ -26,6 +27,8 @@ const api = {
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
   backendProxy: (req: BackendProxyRequest): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.BackendProxy, req),
+  backendEndpoint: (): Promise<BackendEndpointResult | null> =>
+    ipcRenderer.invoke(IpcChannels.BackendEndpoint),
   omlxDetect: (): Promise<OmlxDetectResult | null> =>
     ipcRenderer.invoke(IpcChannels.OmlxDetect),
   omlxModels: (url: string, apiKey: string): Promise<OmlxModelsResult> =>

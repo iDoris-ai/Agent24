@@ -604,3 +604,25 @@ fn a_sigterm_during_a_disables_drain_stops_the_module_in_bound() {
         "the shutdown did not wait for the disable's stop",
     );
 }
+
+/// FU-92: a long `$HOME` still lets an out-of-process module mount.
+/// `<home>/.agent24/run/<pid>/<n>.sock` alone is already past macOS's 103-byte
+/// `sun_path` limit once `home` is this long — without `server.rs`'s
+/// `callback_root` fallback to a short `/tmp` path, `process_host` fails and
+/// the package never starts (the daemon still comes up, per its own doc
+/// comment, but `/api/v1/remote/hi` would then never answer and this test
+/// would time out in `serving`).
+#[test]
+fn a_long_home_still_mounts_an_out_of_process_module() {
+    let base = tmp_home();
+    let home = base.path().join("x".repeat(120));
+    std::fs::create_dir_all(&home).unwrap();
+    assert!(
+        home.as_os_str().len() >= 120,
+        "test HOME is not actually long: {}",
+        home.display()
+    );
+    install(&home);
+    let mut d = start(&home);
+    serving(&mut d, &home);
+}
