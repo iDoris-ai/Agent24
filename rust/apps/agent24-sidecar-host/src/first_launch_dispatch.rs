@@ -1,5 +1,3 @@
-//! Dormant owner-carrying dispatch for the first accepted launch.
-
 use std::time::Instant;
 
 use agent24_sidecar_host_protocol::{ErrorCode, PROTOCOL_VERSION, Reply};
@@ -13,9 +11,8 @@ use crate::{
     pre_owned_cleanup::{IntoCleanupOwner, PreOwnedCleanup},
 };
 
-/// The dispatcher always returns the authoritative owner after a target has
-/// started. Rejected replies are static and are left for the output scheduler.
-#[allow(clippy::large_enum_variant)] // Keep the generation owner inline in the dispatch result.
+/// Carries either the first generation, a static rejection, or its cleanup owner.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum FirstLaunchDispatch<'host> {
     Generation(NativeGeneration<'host>),
     Rejected {
@@ -38,8 +35,7 @@ impl FirstLaunchDispatch<'_> {
     }
 }
 
-/// Consume an accepted request into its sole target owner and native workers.
-/// `clock` is sampled at every boundary that can consume launch budget.
+/// Consume an accepted request; sample `clock` at each launch-budget boundary.
 pub(crate) fn dispatch<'host>(
     accepted: AcceptedLaunch,
     ports: &'host mut HostPorts,
