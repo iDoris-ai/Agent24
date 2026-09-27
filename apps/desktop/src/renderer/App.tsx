@@ -17,6 +17,7 @@ import RunsPage from './pages/Runs'
 import SchedulesPage from './pages/Schedules'
 import ApprovalsPage from './pages/Approvals'
 import VoicePanel from './pages/voice/VoicePanel'
+import logoSidebar from './assets/logo-sidebar.png'
 
 // Static module route map — M2 will replace this with dynamic import()
 const MODULE_PAGES: Record<string, React.ComponentType> = {
@@ -157,6 +158,7 @@ export function App(): JSX.Element {
       {/* ── Sidebar ── */}
       <aside className={`sidebar${sidebarOpen ? '' : ' collapsed'}`}>
         <div className="sidebar-logo">
+          <img className="sidebar-logo-img" src={logoSidebar} alt="" />
           <div className="sidebar-logo-text">
             Agent24
             <span>v{version || '…'}</span>
