@@ -52,10 +52,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # proxy, the supervisor — is wired in by later slices.
 agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 # SHUT-1b: open the shutdown evidence without following a link or blocking on
-# a FIFO (already in the tree through agent24-os-proto). "process" added for
-# `geteuid()` — FU-92's fallback-directory ownership check (server.rs
-# `secure_fallback_dir`).
+# a FIFO (already in the tree through agent24-os-proto). "process" is needed
+# by TWO independent callers of `geteuid()`: FU-92's fallback-directory
+# ownership check (server.rs `secure_fallback_dir`) and A3-2b's attach socket
+# same-UID peer check (`attach_listener.rs`, the same call
+# `agent24_os_proto::endpoint` already makes for A1's).
 rustix = { version = "0.38", features = ["fs", "process"] }
+# A3-2b (`attach_listener.rs`): `ENAMETOOLONG` for an actionable error when
+# `$HOME` makes the attach socket path exceed `sockaddr_un`'s limit.
+libc = "0.2"
 # A3-2a (`attached.rs`): sha256 of the token for `attached.json` (never the
 # plaintext, C1) — the daemon itself, not just its tests, needs this now.
 sha2 = "0.10"

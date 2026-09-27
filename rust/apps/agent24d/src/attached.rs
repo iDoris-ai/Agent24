@@ -1,31 +1,26 @@
 //! `~/.agent24/attached.json` — the A3 attached-module registry record store
-//! (`docs/design/A3-ATTACHED-MODULE.md` §3.2–§3.5, PR slice A3-2a).
+//! (`docs/design/A3-ATTACHED-MODULE.md` §3.2–§3.5, PR slice A3-2a; manifest
+//! validation and the [`Change`] payload upgraded to full
+//! `agent24_domain::DomainOsManifest` validation in A3-2b, §10).
 //!
-//! **This is the STORAGE layer only.** A3-2a persists what the REST endpoints
-//! in [`crate::attached_routes`] add/rotate/revoke: the manifest text, its
+//! **This is the STORAGE layer.** It persists what the REST endpoints in
+//! [`crate::attached_routes`] add/rotate/revoke: the manifest text, its
 //! digest, and the sha256 of the handshake token — never the plaintext
-//! (§3.3, judgement C1). It wires no listening socket, no handshake, no live
-//! `Generation`/`AttachSlot`: those need types from A3-1 (`Generation::attached()`,
-//! `AttachSlot`, `accept_attached`) that do not exist on `agent24-os-proto` on
-//! this branch yet — that wiring is A3-2b (design §10). Every record this
-//! module can produce is therefore reported `attach_status: "detached"` until
-//! A3-2b adds a real registry on top of it.
+//! (§3.3, judgement C1). The listening socket, the handshake, and the live
+//! `Generation`/`AttachSlot` bookkeeping live in [`crate::attach_registry`]
+//! (A3-2b) — this module hands it the facts it needs through [`Change`],
+//! passed to `on_commit` while the file lock is still held (§5.2).
 //!
-//! # Why this does not parse with `agent24_domain::DomainOsManifest`
+//! # Manifest validation
 //!
-//! That type's `RawManifest::impl_kind` is a *closed* two-variant enum
-//! (`InProcessCrate` | `OutOfProcessProvider`, `deny_unknown_fields` on the
-//! whole struct) — a real attached manifest's `impl_kind: attached_process`
-//! (§3.1, added by A3-1, a separate in-flight branch) does not parse against
-//! it on this branch. Re-validating the rest of the schema here and then
-//! throwing it away the moment A3-1 lands would just be a second copy to keep
-//! in sync, so this reads exactly the facts A3-2a's own judgements need —
-//! `name`, `model_access`, `kernel_capabilities` — via the same *lenient*
-//! reader a module already uses on its own manifest
-//! (`agent24_os_proto::manifest::facts_from_yaml`, ME4-S3 §4.4), plus a
-//! `model_access` lookup that reader does not carry. Full manifest validation
-//! (the `impl_kind`/`host_commands`/`spawn` shape) is A3-1/A3-2b's job once
-//! the domain crate knows about `attached_process`.
+//! A3-1 added `ImplKind::AttachedProcess` and `host_commands` to
+//! `agent24_domain::DomainOsManifest`, so this module validates a submitted
+//! manifest the same way the kernel validates any other domain-OS manifest
+//! (`DomainOsManifest::from_yaml`), plus the one extra rule specific to this
+//! endpoint: `impl_kind` must actually BE `attached_process` (a manifest that
+//! validates but declares `in_process_crate`/`out_of_process_provider` is a
+//! well-formed manifest for the WRONG endpoint, not a valid attached-module
+//! registration).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -41,75 +36,54 @@ pub fn manifest_digest(bytes: &[u8]) -> String {
     agent24_os_proto::manifest::manifest_digest(bytes)
 }
 
-/// The three-ish facts A3-2a needs out of an attached manifest — see the
-/// module doc for why this is not `agent24_domain::DomainOsManifest`.
+/// The privacy-relevant facts `is_relax` compares (§3.5) — a narrower view of
+/// a [`agent24_domain::DomainOsManifest`] than the full struct, and the same
+/// shape a [`RevokedFacts`] tombstone reconstructs into.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ManifestFacts {
-    name: String,
+struct Facts {
     model_access: agent24_domain::ModelAccess,
     capabilities: Vec<agent24_domain::Capability>,
 }
 
-/// Lenient: only the field A3-2a needs beyond
-/// `agent24_os_proto::manifest::ManifestFacts`. No `deny_unknown_fields` — the
-/// full schema is validated elsewhere (see the module doc); this is a read.
-#[derive(Deserialize)]
-struct RawModelAccess {
-    #[serde(default)]
-    model_access: Option<String>,
-}
-
-fn parse_model_access(yaml: &str) -> Result<agent24_domain::ModelAccess, String> {
-    let raw: RawModelAccess = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
-    match raw.model_access.as_deref() {
-        None => Ok(agent24_domain::ModelAccess::LocalOnly),
-        Some(s) => agent24_domain::ModelAccess::parse(s),
+impl Facts {
+    fn of(manifest: &agent24_domain::DomainOsManifest) -> Self {
+        Self {
+            model_access: manifest.model_access(),
+            capabilities: manifest.kernel_capabilities().to_vec(),
+        }
     }
 }
 
-/// Parse and do the A3-2a-level checks: syntactically valid name, not a
-/// reserved kernel segment (§3.2 M7), `route_namespace` still derived from
-/// `name` (§3.1: "仍按既有规则由 name 推导并校验"), known capability strings,
-/// a legal `model_access`. Does NOT check `impl_kind`, `host_commands`,
-/// `spawn`, `event_module`, or `data_dir` — see the module doc.
-fn parse_facts(yaml: &str) -> Result<ManifestFacts, String> {
-    let facts = agent24_os_proto::manifest::facts_from_yaml(yaml)?;
-    if !agent24_domain::is_valid_module_name(&facts.name) {
+/// Parse and validate a submitted `domain-os.yml` as an ATTACHED manifest
+/// (§3.1): full `agent24_domain::DomainOsManifest` validation (A3-1 added
+/// `ImplKind::AttachedProcess`/`host_commands` to that type), plus the two
+/// checks specific to this endpoint that the domain crate cannot make on its
+/// own — `impl_kind` must actually be `attached_process` (a well-formed
+/// manifest for a DIFFERENT impl_kind is not a valid registration here), and
+/// the name must not be a reserved kernel route segment (§3.2 M7; the domain
+/// crate's own `RESERVED_KERNEL_SEGMENTS` equivalent lives in `crate::domain`
+/// and is exposed via `is_reserved_kernel_segment` for exactly this call
+/// site, which has no manifest-mount pass of its own to run it inside).
+fn parse_manifest(yaml: &str) -> Result<agent24_domain::DomainOsManifest, String> {
+    let manifest = agent24_domain::DomainOsManifest::from_yaml(yaml).map_err(|e| e.to_string())?;
+    if manifest.impl_kind() != agent24_domain::ImplKind::AttachedProcess {
         return Err(format!(
-            "invalid module name {:?}: 1-{} chars of [a-z0-9][a-z0-9_-]*, not a reserved device \
-             name",
-            facts.name,
-            agent24_domain::MAX_NAME_BYTES
+            "impl_kind must be attached_process for an attached-module registration, got {:?}",
+            manifest.impl_kind()
         ));
     }
-    if crate::domain::is_reserved_kernel_segment(&facts.name) {
+    if crate::domain::is_reserved_kernel_segment(manifest.name()) {
         return Err(format!(
             "module name {:?} is reserved for the kernel's own routes",
-            facts.name
+            manifest.name()
         ));
     }
-    let expected_ns = agent24_domain::DomainOsManifest::declared_namespace(&facts.name);
-    if facts.route_namespace != expected_ns {
-        return Err(format!(
-            "route_namespace {:?} must be exactly {:?} (derived from name)",
-            facts.route_namespace, expected_ns
-        ));
-    }
-    let mut capabilities = Vec::with_capacity(facts.kernel_capabilities.len());
-    for c in &facts.kernel_capabilities {
-        capabilities.push(agent24_domain::Capability::parse(c).map_err(|e| e.to_string())?);
-    }
-    let model_access = parse_model_access(yaml)?;
-    Ok(ManifestFacts {
-        name: facts.name,
-        model_access,
-        capabilities,
-    })
+    Ok(manifest)
 }
 
 /// §3.5: a request WIDENS privacy relative to `previous` (`None` = first-time
 /// registration).
-fn is_relax(previous: Option<&ManifestFacts>, new: &ManifestFacts) -> bool {
+fn is_relax(previous: Option<&Facts>, new: &Facts) -> bool {
     match previous {
         None => new.model_access == agent24_domain::ModelAccess::RemoteAllowed,
         Some(prev) => {
@@ -135,6 +109,13 @@ struct AttachedRecord {
     token_sha256: String,
     token_id: String,
     created_at: String,
+    /// A3-2b (§3.2/§5.3): set by `PATCH /api/v1/attached/{name}`. Absent from
+    /// any `attached.json` written before this field existed —
+    /// `#[serde(default)]` reads that as `false` (never disabled). A
+    /// register/rotate always writes a fresh record with `disabled: false`
+    /// (§3.4's re-add is a deliberate re-pairing action, not a toggle).
+    #[serde(default)]
+    disabled: bool,
 }
 
 /// A revoked module's LAST facts (§3.5 M2 / this PR's judgement): kept just
@@ -157,7 +138,7 @@ struct RevokedFacts {
 }
 
 impl RevokedFacts {
-    fn capture(facts: &ManifestFacts) -> Self {
+    fn capture(facts: &Facts) -> Self {
         Self {
             model_access: facts.model_access.as_str().to_owned(),
             capabilities: facts
@@ -168,16 +149,14 @@ impl RevokedFacts {
         }
     }
 
-    /// Reconstruct comparable [`ManifestFacts`] for `is_relax`. `name` is not
-    /// stored redundantly in the tombstone (the map key already carries it).
-    fn into_manifest_facts(self, name: String) -> Result<ManifestFacts, String> {
+    /// Reconstruct comparable [`Facts`] for `is_relax`.
+    fn into_facts(self) -> Result<Facts, String> {
         let model_access = agent24_domain::ModelAccess::parse(&self.model_access)?;
         let mut capabilities = Vec::with_capacity(self.capabilities.len());
         for c in &self.capabilities {
             capabilities.push(agent24_domain::Capability::parse(c).map_err(|e| e.to_string())?);
         }
-        Ok(ManifestFacts {
-            name,
+        Ok(Facts {
             model_access,
             capabilities,
         })
@@ -390,24 +369,35 @@ pub enum RegisterOutcome {
 }
 
 /// What `register`/`revoke` are about to commit to `attached.json`, handed to
-/// `on_commit` while the file lock is STILL HELD — the hook A3-2b's registry
-/// wiring needs to revoke a module's current live generation in the SAME
+/// `on_commit` while the file lock is STILL HELD — the hook [`crate::attach_registry`]
+/// (A3-2b) uses to revoke a module's current live generation in the SAME
 /// critical section as the record update/removal (design §3.4/§5.2: 改记录、
 /// 落盘、撤销现役代 must not be splittable by a concurrent request landing in
-/// between). A3-2a itself has no live generation to revoke yet (module doc)
-/// — its own call sites pass a no-op (`|_| {}`).
+/// between).
+///
+/// `Registered` carries everything the registry needs to install (or refresh)
+/// its in-memory entry without a second read of `attached.json` from inside
+/// the callback: the validated manifest (§3.4 — rebuilding `Grants`/`Offer`/
+/// `ModelGrant` needs it), the digest, and the token facts a later handshake's
+/// `AttachRegistry::commit` re-checks (§4.3 ②).
 #[derive(Debug, Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "A3-2a's own call sites pass a no-op `|_| {}` (no live generation to revoke yet — \
-              module doc); the fields exist for A3-2b's future consumer and this PR's own tests"
-)]
 pub enum Change<'a> {
     /// A name was created or rotated. `rotated` distinguishes the two the
     /// same way [`RegisterOutcome`] does.
-    Registered { name: &'a str, rotated: bool },
+    Registered {
+        name: &'a str,
+        rotated: bool,
+        manifest: &'a agent24_domain::DomainOsManifest,
+        manifest_digest: &'a str,
+        token_sha256_hex: &'a str,
+        token_id: &'a str,
+    },
     /// A name's record was removed.
     Revoked { name: &'a str },
+    /// A3-2b: `PATCH /api/v1/attached/{name}` toggled `disabled`. `disabled:
+    /// true` must revoke any live generation in the SAME critical section as
+    /// the flag flip (§5.3), same reasoning as `Revoked` above.
+    Disabled { name: &'a str, disabled: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,7 +431,9 @@ pub fn register(
     name_taken: impl Fn(&str) -> bool,
     on_commit: impl FnOnce(&Change),
 ) -> Result<RegisterOutcome, RegisterError> {
-    let facts = parse_facts(manifest_yaml).map_err(RegisterError::InvalidManifest)?;
+    let manifest = parse_manifest(manifest_yaml).map_err(RegisterError::InvalidManifest)?;
+    let name = manifest.name().to_owned();
+    let facts = Facts::of(&manifest);
     let digest = manifest_digest(manifest_yaml.as_bytes());
 
     let parent = path
@@ -452,40 +444,35 @@ pub fn register(
     let _guard = ConfigLock::acquire(parent).map_err(RegisterError::Io)?;
 
     let mut store = AttachedStore::load(path).map_err(RegisterError::Io)?;
-    let previous_record = store.modules.get(&facts.name);
+    let previous_record = store.modules.get(&name);
     let previous_digest = previous_record.map(|r| r.manifest_digest.clone());
     let previous_facts = match previous_record {
-        Some(r) => Some(parse_facts(&r.manifest_yaml).map_err(|e| {
-            RegisterError::Io(format!(
-                "the stored manifest for {:?} no longer parses: {e}",
-                facts.name
-            ))
-        })?),
+        Some(r) => Some(Facts::of(&parse_manifest(&r.manifest_yaml).map_err(
+            |e| {
+                RegisterError::Io(format!(
+                    "the stored manifest for {name:?} no longer parses: {e}"
+                ))
+            },
+        )?)),
         // M2: no ACTIVE record, but a tombstone left by an earlier `revoke`
         // means this name is not really "first-time" — compare against what
         // it had before, exactly like a rotation, so revoke-then-re-add
         // cannot dodge the relax confirmation a plain rotation would need
         // (§3.5). No tombstone at all is the genuine first-time case.
-        None => match store.revoked.get(&facts.name) {
-            Some(tombstone) => Some(
-                tombstone
-                    .clone()
-                    .into_manifest_facts(facts.name.clone())
-                    .map_err(|e| {
-                        RegisterError::Io(format!(
-                            "the revoked-record tombstone for {:?} no longer parses: {e}",
-                            facts.name
-                        ))
-                    })?,
-            ),
+        None => match store.revoked.get(&name) {
+            Some(tombstone) => Some(tombstone.clone().into_facts().map_err(|e| {
+                RegisterError::Io(format!(
+                    "the revoked-record tombstone for {name:?} no longer parses: {e}"
+                ))
+            })?),
             None => None,
         },
     };
 
     // §3.2 processing order: validate → name clash → privacy relax → mint →
     // store.
-    if previous_record.is_none() && name_taken(&facts.name) {
-        return Err(RegisterError::NameTaken(facts.name));
+    if previous_record.is_none() && name_taken(&name) {
+        return Err(RegisterError::NameTaken(name));
     }
     if is_relax(previous_facts.as_ref(), &facts) && !allow_relax {
         return Err(RegisterError::RelaxRequiresConfirmation);
@@ -499,29 +486,34 @@ pub fn register(
     let is_new = previous_record.is_none();
 
     store.modules.insert(
-        facts.name.clone(),
+        name.clone(),
         AttachedRecord {
             manifest_yaml: manifest_yaml.to_owned(),
             manifest_digest: digest.clone(),
-            token_sha256,
+            token_sha256: token_sha256.clone(),
             token_id: token_id.clone(),
             created_at,
+            disabled: false,
         },
     );
     // M2: a successful registration clears any tombstone for this name — it
     // has just been re-confirmed (or was never relaxing in the first place),
     // so nothing is left for a FUTURE re-add to compare against.
-    store.revoked.remove(&facts.name);
+    store.revoked.remove(&name);
     store
         .write_atomically(path, parent)
         .map_err(RegisterError::Io)?;
     on_commit(&Change::Registered {
-        name: &facts.name,
+        name: &name,
         rotated: !is_new,
+        manifest: &manifest,
+        manifest_digest: &digest,
+        token_sha256_hex: &token_sha256,
+        token_id: &token_id,
     });
 
     let response = AttachedAddResponse {
-        name: facts.name,
+        name,
         manifest_digest: digest.clone(),
         token,
         socket_path: socket_path_string().map_err(RegisterError::Io)?,
@@ -558,8 +550,9 @@ pub fn revoke(path: &Path, name: &str, on_commit: impl FnOnce(&Change)) -> Resul
         // M2: leave a tombstone of what this name's privacy/capabilities
         // WERE, so a later re-add under the same name is judged by the
         // rotation rule, not the (more permissive) first-time rule.
-        let facts = parse_facts(&record.manifest_yaml)
+        let manifest = parse_manifest(&record.manifest_yaml)
             .map_err(|e| format!("the stored manifest for {name:?} no longer parses: {e}"))?;
+        let facts = Facts::of(&manifest);
         store
             .revoked
             .insert(name.to_owned(), RevokedFacts::capture(&facts));
@@ -569,6 +562,83 @@ pub fn revoke(path: &Path, name: &str, on_commit: impl FnOnce(&Change)) -> Resul
     Ok(existed)
 }
 
+/// `PATCH /api/v1/attached/{name}` (A3-2b — a deviation from the design
+/// doc's §3.2 table for the same reason `list`/`GET` below deviates: enabling
+/// and disabling an attached module needs no `os.json`/supervisor machinery,
+/// so it gets its own endpoint on the registry this file already owns rather
+/// than teaching `os_routes.rs` about a second, unrelated store). `Ok(true)`:
+/// the record existed and its `disabled` flag is now `disabled`. `Ok(false)`:
+/// no such record — `404` at the REST layer.
+///
+/// `on_commit` runs exactly once, still inside the file lock, right after the
+/// flag flip is durably written — see [`Change`]'s doc comment. It never runs
+/// when there was nothing to flip. A no-op flip (already in that state) still
+/// runs it: a disable retried after a crash must still revoke any generation
+/// that came back up in between (§5.3).
+pub fn set_disabled(
+    path: &Path,
+    name: &str,
+    disabled: bool,
+    on_commit: impl FnOnce(&Change),
+) -> Result<bool, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let _guard = ConfigLock::acquire(parent)?;
+
+    let mut store = AttachedStore::load(path)?;
+    let Some(record) = store.modules.get_mut(name) else {
+        return Ok(false);
+    };
+    record.disabled = disabled;
+    store.write_atomically(path, parent)?;
+    on_commit(&Change::Disabled { name, disabled });
+    Ok(true)
+}
+
+/// A3-2b: everything [`crate::attach_registry::AttachRegistry`] needs to
+/// hydrate its in-memory entry for one registered module at daemon startup —
+/// before the listener has taken its first connection, so `attached.json` is
+/// the only source of truth available yet (§5.6: "daemon 重启：注册记录从
+/// `attached.json` 读回").
+pub struct StoredEntry {
+    pub manifest: agent24_domain::DomainOsManifest,
+    pub manifest_digest: String,
+    pub token_sha256_hex: String,
+    pub token_id: String,
+    pub disabled: bool,
+}
+
+/// Every registered module, in full — see [`StoredEntry`]. Unlike [`list`],
+/// this re-parses each stored manifest (needed to rebuild `Grants`/`Offer`/
+/// `ModelGrant`), so a record whose manifest no longer parses (the domain
+/// crate's validation rules changed underneath a daemon upgrade) is reported
+/// as an error for that ONE name rather than silently hydrating a registry
+/// entry with no way to serve it.
+pub fn load_all(path: &Path) -> Result<Vec<(String, StoredEntry)>, String> {
+    let store = AttachedStore::load(path)?;
+    store
+        .modules
+        .into_iter()
+        .map(|(name, r)| {
+            let manifest = parse_manifest(&r.manifest_yaml)
+                .map_err(|e| format!("the stored manifest for {name:?} no longer parses: {e}"))?;
+            Ok((
+                name,
+                StoredEntry {
+                    manifest,
+                    manifest_digest: r.manifest_digest,
+                    token_sha256_hex: r.token_sha256,
+                    token_id: r.token_id,
+                    disabled: r.disabled,
+                },
+            ))
+        })
+        .collect()
+}
+
 /// `GET /api/v1/attached` (a deviation from the design doc's §3.2 table —
 /// see `docs/design/A3-ATTACHED-MODULE.md` and this PR's own report for why:
 /// the augmentation described there for `GET /api/v1/os` needs live
@@ -576,6 +646,12 @@ pub fn revoke(path: &Path, name: &str, on_commit: impl FnOnce(&Change)) -> Resul
 /// A3-2b wires a real registry; a NEW, narrower endpoint here avoids widening
 /// `agent24_protocol::DomainOsView`/`os_routes.rs` twice). NEVER includes the
 /// token or its hash (§3.2/§3.3 C1).
+///
+/// `attach_status`/`generation` are always the disk-only default
+/// (`"detached"`/`None`) here — this function knows nothing about a live
+/// registry. [`crate::attached_routes::list_attached_at`] overlays the real
+/// values from [`crate::attach_registry::AttachRegistry::status_of`] before
+/// this is ever sent to a client.
 pub fn list(path: &Path) -> Result<Vec<AttachedView>, String> {
     let store = AttachedStore::load(path)?;
     Ok(store
@@ -586,9 +662,8 @@ pub fn list(path: &Path) -> Result<Vec<AttachedView>, String> {
             manifest_digest: r.manifest_digest,
             token_id: r.token_id,
             created_at: r.created_at,
-            // A3-2a wires no live generation (module doc); every entry it can
-            // produce is `detached` until A3-2b.
             attach_status: "detached".to_owned(),
+            generation: None,
         })
         .collect())
 }
@@ -775,11 +850,13 @@ mod tests {
             |_| false,
             |change| {
                 match change {
-                    Change::Registered { name, rotated } => {
+                    Change::Registered { name, rotated, .. } => {
                         assert_eq!(*name, "agentear");
                         assert!(!rotated);
                     }
-                    Change::Revoked { .. } => panic!("expected Registered"),
+                    Change::Revoked { .. } | Change::Disabled { .. } => {
+                        panic!("expected Registered")
+                    }
                 }
                 use fs2::FileExt;
                 let probe = std::fs::OpenOptions::new()

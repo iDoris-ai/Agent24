@@ -218,7 +218,7 @@ pub(crate) fn is_reserved_kernel_segment(name: &str) -> bool {
 /// Adapts the daemon's WS hub to the contract's transport. Only the kernel builds
 /// one of these, which is what makes a module's sink reach real subscribers —
 /// see the trust model in `agent24_domain`.
-struct HubBroadcast(crate::events::EventsHub);
+pub(crate) struct HubBroadcast(pub(crate) crate::events::EventsHub);
 
 impl EventBroadcast for HubBroadcast {
     fn send(&self, body: EventBody) {
@@ -1030,6 +1030,20 @@ pub async fn mount_all(
         }
     }
 
+    // A3-2b (`docs/design/A3-ATTACHED-MODULE.md` §5.4): "与 spawn 互斥：...
+    // `mount_all` 遇到与附着注册同名的包 → `MountOutcome::Refused`". A name is
+    // one identity, claimed by whichever form registers it first — a package
+    // discovered on disk (or compiled in) under a name `attached.json`
+    // already owns is refused here, the mirror of `POST /api/v1/attached`'s
+    // own 409 for the opposite direction (`crate::attached_routes`). Read
+    // once per pass (cheap: `attached.json` is small and local), not
+    // threaded through as a parameter — same shape as `RESERVED_KERNEL_SEGMENTS`
+    // just below, a fixed set this pass checks every catalogue entry against.
+    let attached_names: BTreeSet<String> = crate::attached::config_path()
+        .and_then(|path| crate::attached::list(&path).ok())
+        .map(|views| views.into_iter().map(|v| v.name).collect())
+        .unwrap_or_default();
+
     for entry in catalogue {
         let name = entry.name.clone();
         let version = entry.version.clone();
@@ -1103,6 +1117,10 @@ pub async fn mount_all(
                 ),
                 &mut reports,
             );
+            continue;
+        }
+        if attached_names.contains(&name) {
+            refuse("registered as an attached module".to_owned(), &mut reports);
             continue;
         }
 
@@ -1373,8 +1391,14 @@ struct MountTarget {
 /// design §5.1), never a freshly built one. `_a24/events/emit`'s own `limiter`
 /// is the deliberate contrast: built INSIDE the closure, so a restart always
 /// gets a full bucket.
+///
+/// `pub(crate)`, not private: `crate::attach_registry` (A3-2b) builds an
+/// attached module's `Methods` the same way a mounted package's are built —
+/// the closure this returns is agnostic to WHICH kind of `Generation` it is
+/// handed (`Process` or `Attached`), so there is no reason for A3 to grow a
+/// second copy.
 #[allow(clippy::too_many_arguments)]
-fn build_methods_for(
+pub(crate) fn build_methods_for(
     name: String,
     granted: Grants,
     event_sink: Option<Arc<EventSink>>,

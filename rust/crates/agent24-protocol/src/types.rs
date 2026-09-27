@@ -215,15 +215,30 @@ pub struct AttachedView {
     pub manifest_digest: String,
     pub token_id: String,
     pub created_at: String,
-    /// Open enum: `detached` | `attached` | `disabled` (§5.1). A3-2a wires no
-    /// listening socket or live generation (that is A3-2b), so every entry
-    /// this slice can produce reads `detached`.
+    /// Open enum: `detached` | `attached` | `disabled` (§5.1).
     pub attach_status: String,
+    /// A3-2b (§5.1): the current generation number while `attach_status ==
+    /// "attached"`, monotonic within this daemon's lifetime (reset to 1 on a
+    /// restart — it is a log/judgement aid, not a credential). `None` for
+    /// `detached`/`disabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AttachedList {
     pub modules: Vec<AttachedView>,
+}
+
+/// `PATCH /api/v1/attached/{name}` (A3-2b, §3.2/§5.3) — same shape as the
+/// existing `DomainOsUpdate` used for `PATCH /api/v1/os/{name}`, given its
+/// own type because the two registries (`os.json` vs `attached.json`) are
+/// unrelated stores with unrelated handlers (`crate::attached_routes`'s own
+/// doc explains why attach gets a dedicated `/api/v1/attached` surface
+/// instead of widening the `os` one).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AttachedUpdate {
+    pub enabled: bool,
 }
 
 // ── Errors (SPEC-002 §5) ─────────────────────────────────────────────────────
