@@ -280,6 +280,13 @@ pub enum ImplKind {
     /// manifest can say so; the transport is later, and the in-process mounter
     /// must refuse it (see [`DomainOsManifest::is_mountable_in_process`]).
     OutOfProcessProvider,
+    /// A3 (`docs/design/A3-ATTACHED-MODULE.md`): a process the USER starts
+    /// (not the kernel), which registers over REST and then attaches on a
+    /// long-lived Unix socket. Mutually exclusive with `spawn` — the kernel
+    /// never starts one of these, so a `spawn` command on it would never run
+    /// (see [`SpawnCommand`]'s validation below). May declare `host_commands`
+    /// (A1's reverse channel is HTTP and has no equivalent field).
+    AttachedProcess,
 }
 
 /// How to start an out-of-process module.
@@ -429,6 +436,14 @@ struct RawManifest {
     impl_kind: ImplKind,
     #[serde(default)]
     spawn: Option<SpawnCommand>,
+    /// A3: command names the kernel will forward to an `attached_process`
+    /// module on a reverse call (`speak`, `stop_playback`, …). Collected as
+    /// STRINGS and validated afterwards, same reason as `kernel_capabilities`
+    /// — an invalid entry must be able to quote itself. Only meaningful on
+    /// `attached_process`; declaring it on any other `impl_kind` is refused
+    /// (A1's reverse channel is HTTP and has no equivalent field).
+    #[serde(default)]
+    host_commands: Vec<String>,
     /// Declared here ONLY so `deny_unknown_fields` does not reject the very
     /// fields step one just read. Their values are consumed by
     /// [`ManifestEnvelope`]; re-reading them here would be reading the same
@@ -473,6 +488,7 @@ pub struct DomainOsManifest {
     ui_entry: Option<String>,
     impl_kind: ImplKind,
     spawn: Option<SpawnCommand>,
+    host_commands: Vec<String>,
 }
 
 /// Names that are not usable as a directory on Windows regardless of extension.
@@ -841,10 +857,41 @@ impl DomainOsManifest {
                         .to_owned(),
                 ));
             }
+            // A3: the kernel never starts an attached module — it is the USER
+            // who starts it, and it registers over REST after the fact — so a
+            // `spawn` command here would describe a launch that never happens,
+            // the same silent contradiction as the in-process case above.
+            (ImplKind::AttachedProcess, Some(_)) => {
+                return Err(DomainError::Manifest(
+                    "`spawn` is declared but impl_kind is attached_process; the kernel \
+                     never starts an attached module, so this command would never run"
+                        .to_owned(),
+                ));
+            }
             _ => {}
         }
         if let Some(spawn) = raw.spawn.as_ref() {
             spawn.validate().map_err(DomainError::Manifest)?;
+        }
+
+        // A3 §3.1: `host_commands` only means anything on an attached module —
+        // A1's reverse channel is HTTP and has no equivalent field, so
+        // declaring it elsewhere is a manifest that claims a capability this
+        // `impl_kind` cannot use.
+        if !raw.host_commands.is_empty() && raw.impl_kind != ImplKind::AttachedProcess {
+            return Err(DomainError::Manifest(format!(
+                "host_commands is declared but impl_kind is {:?}; only attached_process \
+                 modules receive reverse commands",
+                raw.impl_kind
+            )));
+        }
+        for name in &raw.host_commands {
+            if !is_valid_host_command_name(name) {
+                return Err(DomainError::Manifest(format!(
+                    "host_commands entry {name:?} is not a valid command name (expected \
+                     1-32 characters of [a-z0-9_])"
+                )));
+            }
         }
 
         Ok(Self {
@@ -856,6 +903,7 @@ impl DomainOsManifest {
             kernel_capabilities: caps,
             model_access,
             ui_entry: raw.ui_entry,
+            host_commands: raw.host_commands,
             impl_kind: raw.impl_kind,
             spawn: raw.spawn,
         })
@@ -946,6 +994,26 @@ impl DomainOsManifest {
     pub fn is_mountable_in_process(&self) -> bool {
         matches!(self.impl_kind, ImplKind::InProcessCrate)
     }
+
+    /// A3 §3.1: command names the kernel will forward to this module on a
+    /// reverse call. Empty for every `impl_kind` other than
+    /// `AttachedProcess` — `from_yaml` refuses a manifest that declares one
+    /// otherwise, so a caller never has to re-check `impl_kind` before using
+    /// this list.
+    pub fn host_commands(&self) -> &[String] {
+        &self.host_commands
+    }
+}
+
+/// A3 §3.1: a `host_commands` entry is a single bare name, ASCII
+/// `[a-z0-9_]{1,32}` — no dots. Unlike `Capability`'s dotted names, a command
+/// name is not a namespace.
+fn is_valid_host_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// What the kernel decided a module may use — **informational, not authority**.
@@ -2316,5 +2384,100 @@ mod spawn_tests {
         )
         .expect("odd-looking arguments are still just arguments");
         assert_eq!(m.spawn().unwrap().args, ["a b; rm -rf /", "$HOME", "*"]);
+    }
+}
+
+/// A3-1 (`docs/design/A3-ATTACHED-MODULE.md` §3.1): the `attached_process`
+/// `impl_kind` and its `host_commands` field.
+#[cfg(test)]
+mod attach_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn manifest(impl_kind: &str, extra: &str) -> Result<DomainOsManifest> {
+        DomainOsManifest::from_yaml(&format!(
+            "name: agentear\n\
+             version: \"3\"\n\
+             route_namespace: /api/v1/agentear\n\
+             event_module: agentear\n\
+             data_dir: ~/.agent24/os/agentear/\n\
+             impl_kind: {impl_kind}\n{extra}"
+        ))
+    }
+
+    /// The happy path from the design doc's §3.1 example: `attached_process`
+    /// with no `spawn` and a couple of `host_commands`.
+    #[test]
+    fn an_attached_module_declares_its_host_commands() {
+        let m = manifest(
+            "attached_process",
+            "kernel_capabilities: [events, models]\n\
+             host_commands: [speak, stop_playback]\n",
+        )
+        .expect("a well-formed attached manifest");
+        assert_eq!(m.impl_kind(), ImplKind::AttachedProcess);
+        assert_eq!(m.host_commands(), ["speak", "stop_playback"]);
+        assert_eq!(
+            m.spawn(),
+            None,
+            "the kernel never starts an attached module"
+        );
+    }
+
+    /// `host_commands` is optional — most manifests declare none.
+    #[test]
+    fn host_commands_defaults_to_empty() {
+        let m = manifest("attached_process", "").expect("no host_commands at all");
+        assert_eq!(m.host_commands(), Vec::<String>::new().as_slice());
+    }
+
+    /// `spawn` and `attached_process` are a silent contradiction exactly like
+    /// `spawn` and `in_process_crate`: the kernel never starts an attached
+    /// module, so a `spawn` command on one would never run.
+    #[test]
+    fn spawn_is_refused_on_an_attached_module() {
+        let err = manifest("attached_process", "spawn:\n  command: node\n")
+            .expect_err("spawn on an attached module");
+        assert!(err.to_string().contains("spawn"), "{err}");
+        assert!(err.to_string().contains("attached_process"), "{err}");
+        // Control: the same manifest without `spawn` is fine.
+        assert!(manifest("attached_process", "").is_ok());
+    }
+
+    /// `host_commands` only means anything on `attached_process` — declaring
+    /// it on an in-process or out-of-process manifest is a manifest claiming
+    /// a capability that `impl_kind` cannot use.
+    #[test]
+    fn host_commands_is_refused_off_an_attached_module() {
+        let err = manifest("in_process_crate", "host_commands: [speak]\n")
+            .expect_err("host_commands on an in-process module");
+        assert!(err.to_string().contains("host_commands"), "{err}");
+        // Control: the same field on an attached module is accepted.
+        assert!(manifest("attached_process", "host_commands: [speak]\n").is_ok());
+    }
+
+    /// Command name syntax (§4.4 M7's reference in §3.1: `[a-z0-9_]{1,32}`).
+    /// The offending string must be quoted back, or a typo is a scavenger
+    /// hunt (same rationale as `an_unknown_capability_names_itself...` above).
+    #[test]
+    fn a_host_command_name_must_match_the_wire_syntax() {
+        for bad in ["Speak", "speak-now", "speak.now", "", &"x".repeat(33)] {
+            let err =
+                manifest("attached_process", &format!("host_commands: [\"{bad}\"]\n")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("host_commands"), "{bad:?}: {msg}");
+        }
+        // Controls: the boundary values that MUST pass, so the loop above is
+        // not just "every string is refused".
+        assert!(manifest("attached_process", "host_commands: [\"a\"]\n").is_ok());
+        assert!(
+            manifest(
+                "attached_process",
+                &format!("host_commands: [\"{}\"]\n", "x".repeat(32))
+            )
+            .is_ok(),
+            "exactly 32 characters must be accepted"
+        );
     }
 }
