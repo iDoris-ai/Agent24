@@ -9,11 +9,10 @@ use crate::{
     host_ports::HostPorts,
     launch::LaunchIntent,
     native_generation::NativeGeneration,
-    output_io::WriteStep,
     worker_slots::WorkerSlots,
 };
 use agent24_sidecar_host_protocol::{
-    MAX_CONTROL_FRAME_BYTES, PROTOCOL_VERSION, Reply, Request, decode_event, decode_reply,
+    Event, MAX_CONTROL_FRAME_BYTES, PROTOCOL_VERSION, Reply, Request, decode_event, decode_reply,
 };
 #[cfg(unix)]
 use std::collections::BTreeMap;
@@ -76,9 +75,9 @@ fn request(id: u64, ready: bool) -> Request {
     let (executable, cwd, argv, env) = {
         let ready_line = r#"printf '{"type":"ready","protocol":1,"port":4312,"token":"tttttttttttttttttttttttttttttttt","version":"native-harness"}\n'; "#;
         let script = if ready {
-            format!("{ready_line} cat >/dev/null")
+            format!("trap '' TERM; {ready_line} cat >/dev/null; exec sleep 30")
         } else {
-            "exec sleep 30".to_owned()
+            "trap '' TERM; exec sleep 30".to_owned()
         };
         (
             "/bin/sh".to_owned(),
@@ -101,7 +100,7 @@ fn request(id: u64, ready: bool) -> Request {
             "Windows PowerShell is required: {executable:?}"
         );
         let script = if ready {
-            "[Console]::Out.WriteLine('{\"type\":\"ready\",\"protocol\":1,\"port\":4312,\"token\":\"tttttttttttttttttttttttttttttttt\",\"version\":\"native-harness\"}'); [Console]::In.ReadToEnd() | Out-Null"
+            "[Console]::Out.WriteLine('{\"type\":\"ready\",\"protocol\":1,\"port\":4312,\"token\":\"tttttttttttttttttttttttttttttttt\",\"version\":\"native-harness\"}'); [Console]::In.ReadToEnd() | Out-Null; Start-Sleep -Seconds 30"
         } else {
             "Start-Sleep -Seconds 30"
         };
@@ -169,17 +168,6 @@ fn with_generation<R>(
     let mut harness = GenerationHarness::new(generation);
     let result = run(&mut harness, &bytes, &parent_eof);
     drop(harness);
-    let (_, output, _) = ports.borrow();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        match output.step(Instant::now()) {
-            Ok(WriteStep::Idle) => break,
-            Ok(WriteStep::Complete | WriteStep::Pending) if Instant::now() < deadline => {
-                thread::yield_now()
-            }
-            state => panic!("output worker did not settle: {state:?}"),
-        }
-    }
     drop(ports);
     #[cfg(unix)]
     crate::posix::tests::wait_for_reaper_idle();
@@ -189,6 +177,7 @@ fn with_generation<R>(
 #[derive(Clone, Copy, Debug)]
 enum WaitFor {
     AwaitReady,
+    GracefulStopping,
     Running,
     Empty,
 }
@@ -202,11 +191,15 @@ fn drive_until(
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         let report = harness.turn(intent, Instant::now());
-        if match target {
+        let reached = match target {
             WaitFor::AwaitReady => matches!(report.state.phase, Phase::AwaitReady(_)),
+            WaitFor::GracefulStopping => {
+                matches!(report.state.phase, Phase::GracefulStopping(_))
+            }
             WaitFor::Running => report.state.phase == Phase::Running,
             WaitFor::Empty => report.state.phase == Phase::Empty,
-        } {
+        };
+        if reached && !report.state.output_pending {
             return;
         }
         assert!(
@@ -218,17 +211,38 @@ fn drive_until(
     }
 }
 
-fn decoded_lines(bytes: &[u8]) -> Vec<u8> {
-    let mut kinds = Vec::new();
+fn assert_frames(bytes: &[u8], request_id: u64, expected: &[u8]) {
+    let mut kinds = Vec::with_capacity(expected.len());
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-        if matches!(decode_reply(line), Ok(Reply::Owned { .. })) {
-            kinds.push(b'O');
-        }
-        if decode_event(line).is_ok() {
-            kinds.push(b'R');
+        match decode_reply(line) {
+            Ok(Reply::Owned {
+                version,
+                request_id: actual_id,
+            }) => {
+                assert_eq!(version, PROTOCOL_VERSION, "Owned version mismatch");
+                assert_eq!(actual_id, request_id, "Owned request id mismatch");
+                kinds.push(b'O');
+            }
+            Ok(_) => panic!("unexpected non-Owned reply frame"),
+            Err(_) => match decode_event(line) {
+                Ok(Event::Ready {
+                    protocol,
+                    port,
+                    token,
+                    version,
+                }) => {
+                    assert_eq!(protocol, PROTOCOL_VERSION, "Ready protocol mismatch");
+                    assert_eq!(port, 4312, "Ready port mismatch");
+                    assert!(token == "t".repeat(32), "Ready token mismatch");
+                    assert_eq!(version, "native-harness", "Ready version mismatch");
+                    kinds.push(b'R');
+                }
+                Ok(Event::Exit { .. }) => panic!("unexpected Exit event frame"),
+                Err(_) => panic!("invalid output frame"),
+            },
         }
     }
-    kinds
+    assert_eq!(kinds, expected, "output frame order/count mismatch");
 }
 
 #[test]
@@ -255,12 +269,7 @@ fn ready_force_cancel_then_continue_reaps_same_native_generation() {
             "Empty turns must not emit output"
         );
         assert!(output.len() <= OUTPUT_CAPACITY);
-        assert_eq!(
-            decoded_lines(&output),
-            b"OR",
-            "{}",
-            String::from_utf8_lossy(&output)
-        );
+        assert_frames(&output, 7401, b"OR");
     });
 }
 
@@ -277,15 +286,20 @@ fn parent_eof_after_await_ready_or_running_cleans_up() {
             parent_eof.store(true, Ordering::SeqCst);
             let eof_turn = harness.turn(TurnIntent::Continue, Instant::now());
             assert_ne!(eof_turn.state.phase, Phase::Empty);
+            drive_until(harness, WaitFor::GracefulStopping, TurnIntent::Continue, 3);
+            let graceful_deadline = match harness
+                .turn(TurnIntent::Continue, Instant::now())
+                .state
+                .phase
+            {
+                Phase::GracefulStopping(deadline) => deadline,
+                phase => panic!("parent EOF did not enter graceful cleanup: {phase:?}"),
+            };
+            harness.turn(TurnIntent::Continue, graceful_deadline);
             drive_until(harness, WaitFor::Empty, TurnIntent::Continue, 8);
             let output = bytes.lock().unwrap();
             assert!(output.len() <= OUTPUT_CAPACITY);
-            assert_eq!(
-                decoded_lines(&output),
-                expected,
-                "{}",
-                String::from_utf8_lossy(&output)
-            );
+            assert_frames(&output, id, expected);
         });
     }
 }
