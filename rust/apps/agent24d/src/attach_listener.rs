@@ -232,8 +232,15 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
             () = stop.cancelled() => {}
         }
     };
-    let (_calls, serve) =
+    let (calls, serve) =
         serve_attached(reader, writer, methods, Limits::default(), connection_stop);
+    // A3-3 (`docs/design/A3-ATTACHED-MODULE.md` §6.2): hand the registry this
+    // connection's `KernelCalls` so `POST /api/v1/os/{name}/commands/{command}`
+    // (`crate::attach_commands`) can reach it. Strictly after `commit`
+    // installed `generation` as `last_generation` above — see
+    // `AttachRegistry::attach_kernel_calls`'s own doc for why a rotation that
+    // lands in between makes this a harmless no-op rather than a race.
+    registry.attach_kernel_calls(&claim.module, &generation, calls);
     let _ended = serve.await;
     registry.release(&claim.module, &generation);
 }
