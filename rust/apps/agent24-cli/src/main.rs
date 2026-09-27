@@ -140,6 +140,8 @@ struct Endpoint {
     child: Option<tokio::process::Child>,
 }
 
+const HOST_AUTHORITY_UNAVAILABLE: &str = "host authority unavailable";
+
 /// The shutdown part of `agent24 daemon status` (SHUT-1c): the budgets and
 /// the bound they give, anything rejected, the daemon before this one, and
 /// which modules its shutdown found too slow — each with the knob to turn.
@@ -184,11 +186,28 @@ fn shutdown_lines(r: &agent24_protocol::ShutdownReport) -> Vec<String> {
     out
 }
 
+/// Client for CLI/TUI → daemon calls, which always target `127.0.0.1` (see the
+/// `format!("http://127.0.0.1:{}", state.port)` call sites below) and carry the
+/// bearer token plus chat content.
+///
+/// FU-74: the default reqwest client reads `HTTP_PROXY`/`ALL_PROXY` and does
+/// NOT bypass loopback for them, and follows redirects — either behaviour
+/// would send the bearer token and message content somewhere other than the
+/// daemon whenever the user's shell happens to export a proxy. The daemon
+/// itself never redirects, so a 3xx means something else is impersonating it;
+/// following it would hand over the bearer token to that impersonator.
 fn client() -> reqwest::Client {
+    #[expect(
+        clippy::expect_used,
+        reason = "unwrap_or_default() here would silently rebuild the proxy-reading, \
+                  redirect-following client FU-74 exists to rule out; fail closed instead"
+    )]
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_default()
+        .expect("building the loopback-only daemon HTTP client failed")
 }
 
 async fn health_ok(base: &str, token: &str) -> bool {
@@ -202,6 +221,67 @@ async fn health_ok(base: &str, token: &str) -> bool {
         req.timeout(Duration::from_secs(3)).send().await,
         Ok(r) if r.status().is_success()
     )
+}
+
+fn discovery_health_token(state: &DaemonState) -> &str {
+    &state.token
+}
+
+/// Resolve a discovery record for an operation that needs the host bearer.
+/// Capability discovery is intentionally not upgraded into authority by
+/// treating an absent token as an anonymous request.
+fn host_token(state: &DaemonState) -> Result<&str, String> {
+    state.bearer_token().map_err(|err| match err {
+        HOST_AUTHORITY_UNAVAILABLE => HOST_AUTHORITY_UNAVAILABLE.to_owned(),
+        _ => format!("invalid daemon discovery state: {err}"),
+    })
+}
+
+fn endpoint_from_state(state: DaemonState) -> Result<Endpoint, String> {
+    let token = host_token(&state)?.to_owned();
+    Ok(Endpoint {
+        base: format!("http://127.0.0.1:{}", state.port),
+        token,
+        child: None,
+    })
+}
+
+/// Parse the ready line without ever manufacturing a host token for a
+/// capability daemon. The daemon output remains backward-compatible: missing
+/// `auth_mode` means legacy, and legacy ready lines must still carry `token`.
+fn parse_ready_state(value: &serde_json::Value, pid: u32) -> Result<DaemonState, String> {
+    if value["type"] != "ready" {
+        return Err("not a daemon ready line".to_owned());
+    }
+    let port = value["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
+        .ok_or_else(|| "ready line has invalid port".to_owned())?;
+    let auth_mode = value
+        .get("auth_mode")
+        .cloned()
+        .map(serde_json::from_value::<agent24_protocol::state_file::AuthMode>)
+        .transpose()
+        .map_err(|_| "ready line has unknown auth_mode".to_owned())?
+        .unwrap_or_default();
+    let token = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let state = DaemonState {
+        port,
+        token,
+        pid,
+        version: value["version"].as_str().unwrap_or("").to_owned(),
+        generation: value["generation"].as_str().unwrap_or("").to_owned(),
+        auth_mode,
+    };
+    state
+        .validate()
+        .map_err(|e| format!("invalid ready line: {e}"))?;
+    Ok(state)
 }
 
 fn agent24d_binary() -> String {
@@ -249,18 +329,9 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
         if let Ok(state) = serde_json::from_str::<serde_json::Value>(&line)
             && state["type"] == "ready"
         {
-            let port = state["port"].as_u64().unwrap_or(0) as u16;
-            let token = state["token"].as_str().unwrap_or("").to_owned();
             let pid = child.id().unwrap_or(0);
-            return Ok((
-                DaemonState {
-                    port,
-                    token,
-                    pid,
-                    version: state["version"].as_str().unwrap_or("").to_owned(),
-                },
-                child,
-            ));
+            let parsed = parse_ready_state(&state, pid)?;
+            return Ok((parsed, child));
         }
     }
 }
@@ -269,19 +340,21 @@ async fn spawn_daemon(ephemeral: bool) -> Result<(DaemonState, tokio::process::C
 async fn connect() -> Result<Endpoint, String> {
     if let Some(state) = state_file::read_live() {
         let base = format!("http://127.0.0.1:{}", state.port);
-        if health_ok(&base, &state.token).await {
-            return Ok(Endpoint {
-                base,
-                token: state.token,
-                child: None,
-            });
+        if state.auth_mode.is_capabilities() {
+            // Health is deliberately anonymous, but it never grants the
+            // bearer needed by the operation that called `connect`.
+            let _ = health_ok(&base, "").await;
+            return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+        }
+        if health_ok(&base, discovery_health_token(&state)).await {
+            return endpoint_from_state(state);
         }
     }
     let (state, child) = spawn_daemon(true).await?;
     let base = format!("http://127.0.0.1:{}", state.port);
     Ok(Endpoint {
         base,
-        token: state.token,
+        token: host_token(&state)?.to_owned(),
         child: Some(child),
     })
 }
@@ -299,12 +372,14 @@ async fn finish(mut ep: Endpoint) {
 /// `None` if no live daemon is discoverable or healthy.
 async fn attach_only() -> Option<Endpoint> {
     let state = state_file::read_live()?;
+    if state.auth_mode.is_capabilities() {
+        return None;
+    }
     let base = format!("http://127.0.0.1:{}", state.port);
-    health_ok(&base, &state.token).await.then_some(Endpoint {
-        base,
-        token: state.token,
-        child: None,
-    })
+    health_ok(&base, discovery_health_token(&state))
+        .await
+        .then(|| endpoint_from_state(state).ok())
+        .flatten()
 }
 
 /// Serve agent24d as an MCP server over stdio (E4). Attaches to the running
@@ -771,7 +846,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         DaemonAction::Start => {
             if let Some(state) = state_file::read_live() {
                 let base = format!("http://127.0.0.1:{}", state.port);
-                if health_ok(&base, &state.token).await {
+                if health_ok(&base, discovery_health_token(&state)).await {
                     println!(
                         "daemon already running (pid {}, port {})",
                         state.pid, state.port
@@ -789,7 +864,7 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     for _ in 0..30 {
                         if let Some(state) = state_file::read_live() {
                             let base = format!("http://127.0.0.1:{}", state.port);
-                            if health_ok(&base, &state.token).await {
+                            if health_ok(&base, discovery_health_token(&state)).await {
                                 println!(
                                     "daemon already running (pid {}, port {})",
                                     state.pid, state.port
@@ -812,10 +887,9 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         DaemonAction::Status => match state_file::read_live() {
             Some(state) => {
                 let base = format!("http://127.0.0.1:{}", state.port);
-                if health_ok(&base, &state.token).await {
+                if health_ok(&base, "").await {
                     let res = client()
                         .get(format!("{base}/api/v1/health"))
-                        .bearer_auth(&state.token)
                         .send()
                         .await
                         .map_err(|e| e.to_string())?;
@@ -831,28 +905,32 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     // The whole exchange is bounded, not just the connect: a
                     // daemon that stalls mid-response must not hang `status`
                     // (review of SHUT-1c, round 2).
-                    match client()
-                        .get(format!("{base}/api/v1/shutdown"))
-                        .bearer_auth(&state.token)
-                        .timeout(Duration::from_secs(5))
-                        .send()
-                        .await
-                    {
-                        Ok(res) if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {}
-                        Ok(res) if res.status().is_success() => {
-                            match res.json::<agent24_protocol::ShutdownReport>().await {
-                                Ok(report) => {
-                                    for line in shutdown_lines(&report) {
-                                        println!("{line}");
+                    if state.auth_mode.is_capabilities() {
+                        println!("  shutdown report unavailable: {HOST_AUTHORITY_UNAVAILABLE}");
+                    } else {
+                        match client()
+                            .get(format!("{base}/api/v1/shutdown"))
+                            .bearer_auth(host_token(&state).map_err(|e| e.to_owned())?)
+                            .timeout(Duration::from_secs(5))
+                            .send()
+                            .await
+                        {
+                            Ok(res) if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {}
+                            Ok(res) if res.status().is_success() => {
+                                match res.json::<agent24_protocol::ShutdownReport>().await {
+                                    Ok(report) => {
+                                        for line in shutdown_lines(&report) {
+                                            println!("{line}");
+                                        }
                                     }
+                                    Err(e) => println!("  (shutdown report unreadable: {e})"),
                                 }
-                                Err(e) => println!("  (shutdown report unreadable: {e})"),
                             }
+                            Ok(res) => {
+                                println!("  (shutdown report: daemon returned {})", res.status())
+                            }
+                            Err(e) => println!("  (shutdown report unavailable: {e})"),
                         }
-                        Ok(res) => {
-                            println!("  (shutdown report: daemon returned {})", res.status())
-                        }
-                        Err(e) => println!("  (shutdown report unavailable: {e})"),
                     }
                 } else {
                     println!(
@@ -869,13 +947,16 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
         },
         DaemonAction::Stop => match state_file::read_live() {
             Some(state) => {
+                if state.auth_mode.is_capabilities() {
+                    return Err(HOST_AUTHORITY_UNAVAILABLE.to_owned());
+                }
                 // Authenticated shutdown: the bearer token proves this is OUR
                 // daemon — a reused pid of an unrelated process can never be
                 // hit (review B6)
                 let base = format!("http://127.0.0.1:{}", state.port);
                 let res = client()
                     .post(format!("{base}/api/v1/shutdown"))
-                    .bearer_auth(&state.token)
+                    .bearer_auth(host_token(&state).map_err(|e| e.to_owned())?)
                     .timeout(Duration::from_secs(5))
                     .send()
                     .await;
@@ -987,6 +1068,43 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn old_ready_line_requires_and_keeps_legacy_token() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "token": "legacy", "version": "v"
+        });
+        let state = parse_ready_state(&ready, 7).unwrap();
+        assert_eq!(
+            state.auth_mode,
+            agent24_protocol::state_file::AuthMode::LegacySingleToken
+        );
+        assert_eq!(host_token(&state), Ok("legacy"));
+    }
+
+    #[test]
+    fn capability_ready_line_never_mints_a_host_token() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "version": "v",
+            "auth_mode": "capabilities", "generation": "gen-1"
+        });
+        let state = parse_ready_state(&ready, 7).unwrap();
+        assert!(state.token.is_empty());
+        assert_eq!(
+            host_token(&state),
+            Err(HOST_AUTHORITY_UNAVAILABLE.to_owned())
+        );
+    }
+
+    #[test]
+    fn capability_ready_line_with_token_fails_closed() {
+        let ready = serde_json::json!({
+            "type": "ready", "port": 8080, "token": "must-not-be-here",
+            "auth_mode": "capabilities", "generation": "gen-1"
+        });
+        let err = parse_ready_state(&ready, 7).unwrap_err();
+        assert!(err.contains("must not contain a token"), "{err}");
+    }
+
     /// `daemon status` says what the shutdown report says, and names the knob
     /// for each module found too slow (SHUT-1c).
     #[test]
@@ -1087,5 +1205,124 @@ mod tests {
             !h.contains("enabled"),
             "listing must not suggest an edit: {h}"
         );
+    }
+
+    // ── FU-74: the daemon-facing `client()` must not honour HTTP_PROXY ─────
+    //
+    // Same shape as agent24-models' `from_env_local_providers_ignore_http_proxy`
+    // and agent24-worker's `http_ml_worker_ignores_http_proxy`: a child process
+    // gets HTTP_PROXY/ALL_PROXY pointed at a proxy stub and no NO_PROXY, then
+    // makes one request; the proxy stub's connection count tells us whether the
+    // client obeyed the proxy env. A positive control (plain
+    // `reqwest::Client::builder()...build()`, no `no_proxy()`) proves the env
+    // was actually in effect for the child.
+    //
+    // `apps/agent24-cli` is NOT scanned by
+    // `passthrough_list_matches_what_the_daemon_actually_reads` (that scanner
+    // only walks `apps/agent24d/src` and `crates/`), so the child's target-port
+    // env var can use an ordinary SCREAMING_SNAKE_CASE name without tripping it.
+
+    /// A blocking stub on its own thread: counts connections, answers `reply`.
+    fn thread_stub(reply: String) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut buf = [0u8; 65536];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (port, n)
+    }
+
+    fn health_ok_reply() -> String {
+        let body = r#"{"status":"ok"}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn target_port() -> u16 {
+        std::env::var("AGENT24_CLI_TEST_TARGET_PORT")
+            .expect("run_child must set AGENT24_CLI_TEST_TARGET_PORT")
+            .parse()
+            .expect("AGENT24_CLI_TEST_TARGET_PORT must be a u16")
+    }
+
+    /// Child: the production path — `client()` must be loopback-only.
+    #[tokio::test]
+    #[ignore = "child process of cli_client_ignores_http_proxy"]
+    async fn proxy_child_cli_client() {
+        let url = format!("http://127.0.0.1:{}/api/v1/health", target_port());
+        let _ = client()
+            .get(url)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    }
+
+    /// Child: positive control — the bare default client, same URL, same env.
+    #[tokio::test]
+    #[ignore = "child process of cli_client_ignores_http_proxy"]
+    async fn proxy_child_default_client() {
+        let url = format!("http://127.0.0.1:{}/api/v1/health", target_port());
+        let raw_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let _ = raw_client
+            .get(url)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    }
+
+    fn run_child(test: &str, target: u16, proxy: u16) {
+        let exe = std::env::current_exe().unwrap();
+        let proxy_url = format!("http://127.0.0.1:{proxy}");
+        let status = std::process::Command::new(exe)
+            .args(["--exact", test, "--ignored", "--nocapture"])
+            .env("AGENT24_CLI_TEST_TARGET_PORT", target.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn cli_client_ignores_http_proxy() {
+        let (tp, target) = thread_stub(health_ok_reply());
+        let (pp, proxy) = thread_stub(health_ok_reply());
+        run_child("tests::proxy_child_cli_client", tp, pp);
+        assert_eq!(
+            proxy.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the proxy saw the CLI daemon client's request"
+        );
+        assert_eq!(target.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Positive control: the default client under the same env goes through
+        // the proxy — proves HTTP_PROXY was actually live for the child.
+        let (tp2, target2) = thread_stub(health_ok_reply());
+        let (pp2, proxy2) = thread_stub(health_ok_reply());
+        run_child("tests::proxy_child_default_client", tp2, pp2);
+        assert_eq!(
+            proxy2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "measuring instrument: proxy env must take effect"
+        );
+        assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

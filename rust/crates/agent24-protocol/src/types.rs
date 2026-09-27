@@ -683,19 +683,66 @@ pub struct DeliveryTarget {
     pub extra: Map<String, Value>,
 }
 
+/// Who owns a module-delivery row (design §8.1). `Some` exactly when the row
+/// is a module row (`owner_module`/`module_key` set on the storage row);
+/// `None` for a user (AgentRun) row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleOwner {
+    pub module: String,
+    pub key: String,
+}
+
+/// Design §8.1 (v3 L-D): which layer is holding a schedule from firing.
+/// Priority: `user_suspended` → `User`, then `system_disabled_reason` →
+/// `System`, then `!enabled` → `Module` (module row) / `User` (user row).
+/// `None` means the schedule is currently eligible to fire
+/// (`effective_enabled == true`); always present on the wire as `null`
+/// rather than omitted (SPEC-002 §0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DisabledBy {
+    Module,
+    User,
+    System,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Schedule {
     pub id: String,
     pub name: String,
     pub enabled: bool,
     pub spec: ScheduleSpec,
-    pub action: ScheduleAction,
+    /// `None` exactly when `owner` is `Some` (design §8.1): module rows carry
+    /// no `AgentRun` action — the row's meaning comes entirely from `owner`.
+    /// REST-created rows always decode to `Some`: `ScheduleCreate` has no
+    /// `owner` field and `ScheduleAction` has exactly one variant, so a
+    /// client can never construct a module row through this type (S1-2).
+    /// Present on the wire as `null`, never omitted (SPEC-002 §0).
+    pub action: Option<ScheduleAction>,
     pub delivery: Vec<DeliveryTarget>,
     pub last_run_at: Option<String>,
     /// Null when disabled or one-shot already fired
     pub next_run_at: Option<String>,
     /// Auto-disables the schedule at 5 (emits schedule.disabled)
     pub consecutive_failures: u32,
+    /// `Some` for a module row, `None` for a user (AgentRun) row (§8.1).
+    pub owner: Option<ScheduleOwner>,
+    /// Only ever `true` on a module row (migration 0007's CHECK forbids it
+    /// on a user row); set by `POST .../suspend` and cleared by
+    /// `POST .../resume` (§8.2, ME4-1.2.2c).
+    pub user_suspended: bool,
+    /// Only ever `Some` on a module row (same CHECK); set when the kernel
+    /// disables a row after `MAX_CONSECUTIVE_FAILURES` (ME4-1.2.2b).
+    pub system_disabled_reason: Option<String>,
+    /// Whether this row will actually fire right now: for a user row this is
+    /// exactly `enabled`; for a module row it is `enabled && !user_suspended
+    /// && system_disabled_reason.is_none()` (§8.1).
+    pub effective_enabled: bool,
+    /// Why `effective_enabled` is `false`, or `null` when it's `true` (§8.1,
+    /// v3 L-D). Priority: `user_suspended` → `User`, then
+    /// `system_disabled_reason` → `System`, then `!enabled` → `Module` for a
+    /// module row / `User` for a user row.
+    pub disabled_by: Option<DisabledBy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -739,6 +786,104 @@ impl ScheduleUpdate {
             && self.spec.is_none()
             && self.action.is_none()
             && self.delivery.is_none()
+    }
+}
+
+#[cfg(test)]
+mod schedule_view_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn user_row() -> Schedule {
+        Schedule {
+            id: "sch_1".to_owned(),
+            name: "digest".to_owned(),
+            enabled: true,
+            spec: ScheduleSpec::Every { secs: 3600 },
+            action: Some(ScheduleAction::AgentRun {
+                prompt: "digest".to_owned(),
+                session_id: None,
+                model_override: None,
+            }),
+            delivery: vec![],
+            last_run_at: None,
+            next_run_at: Some("2026-09-24T00:00:00Z".to_owned()),
+            consecutive_failures: 0,
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
+        }
+    }
+
+    /// Design §8.1 / §13 acceptance: "用户行的 JSON 只多五个字段" — a user
+    /// row's wire shape must be exactly the pre-ME4-1.2.2a field set plus
+    /// `owner`/`user_suspended`/`system_disabled_reason`/`effective_enabled`/
+    /// `disabled_by`, and `action`'s VALUE is unchanged (still the object,
+    /// never omitted/null for a user row).
+    #[test]
+    fn user_row_json_only_gains_the_five_view_fields() {
+        const OLD_FIELDS: &[&str] = &[
+            "id",
+            "name",
+            "enabled",
+            "spec",
+            "action",
+            "delivery",
+            "last_run_at",
+            "next_run_at",
+            "consecutive_failures",
+        ];
+        const NEW_FIELDS: &[&str] = &[
+            "owner",
+            "user_suspended",
+            "system_disabled_reason",
+            "effective_enabled",
+            "disabled_by",
+        ];
+        let json = serde_json::to_value(user_row()).unwrap();
+        let obj = json.as_object().unwrap();
+        let actual: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = OLD_FIELDS.iter().chain(NEW_FIELDS).copied().collect();
+        assert_eq!(actual, expected);
+
+        // action's value is untouched (present, non-null, same shape as before)
+        assert_eq!(json["action"]["type"], "agent_run");
+        assert_eq!(json["action"]["prompt"], "digest");
+        // the five new fields on a user row
+        assert_eq!(json["owner"], Value::Null);
+        assert_eq!(json["user_suspended"], false);
+        assert_eq!(json["system_disabled_reason"], Value::Null);
+        assert_eq!(json["effective_enabled"], true);
+        assert_eq!(json["disabled_by"], Value::Null);
+    }
+
+    /// A module row's `action` is `null` on the wire (§8.1: "恰在 owner 为
+    /// Some 时为 null"), never omitted, and round-trips.
+    #[test]
+    fn module_row_action_is_null_not_omitted_and_roundtrips() {
+        let schedule = Schedule {
+            action: None,
+            owner: Some(ScheduleOwner {
+                module: "sin90".to_owned(),
+                key: "daily-digest".to_owned(),
+            }),
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
+            ..user_row()
+        };
+        let json = serde_json::to_value(&schedule).unwrap();
+        assert!(json.as_object().unwrap().contains_key("action"));
+        assert_eq!(json["action"], Value::Null);
+        assert_eq!(json["owner"]["module"], "sin90");
+        assert_eq!(json["owner"]["key"], "daily-digest");
+        let back: Schedule = serde_json::from_value(json).unwrap();
+        assert_eq!(back, schedule);
     }
 }
 

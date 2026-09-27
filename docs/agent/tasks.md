@@ -1,39 +1,118 @@
 # Agent24 任务台账 — Task
 
-## 🔴 本文件是当前唯一权威的执行状态来源（2026-09-19）
+## 🔴 本文件是当前唯一权威的执行状态来源（2026-09-19 立，2026-09-24 更新）
 
 仓库里有四份路线图/进展文档，**以谁为准只有一个答案**：
 
 | 文档 | 地位 |
 |---|---|
 | **本文件 `docs/agent/tasks.md`** | ✅ **权威**。当前在做什么、做到哪一步，以这里为准 |
-| [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀的任务定义与验收标准（§五「主链」T1–T14） |
+| [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md) | ✅ **权威**（配套，2026-09-23 起）。**ME-4 当前主线**的任务定义、技术规范（S1–S5）与验收标准 |
+| [`PLAN-OOP-OS-AND-BACKLOG.md`](PLAN-OOP-OS-AND-BACKLOG.md) | ✅ **权威**（配套）。ME-3 各刀（已收口）的任务定义与验收标准（§五「主链」T1–T14） |
 | [`me3-status.sh`](me3-status.sh) | ✅ **权威**（可执行）。`bash docs/agent/me3-status.sh` 直接读 `origin/main` 的代码回答「哪一刀已经在 main 上」 |
 | [`roadmap.md`](roadmap.md)（M1–M6 产品路线） | ⏸️ **暂停中**。是「未来要做什么」，不是「现在在做什么」；M1 等 v0.5.0 发布后再捡 |
 | [`../PLAN.md`](../PLAN.md) §六 Roadmap、[`../ROADMAP.md`](../ROADMAP.md) | ⛔ **已作废**。Rust 核心重写（ADR-026）之前的 Electron/Node.js 时代规划，仅供历史考古，**不要照它排期** |
 
-**当前执行**：ME-3（进程外领域 OS）专项，目标 v0.5.0。
+**当前执行（2026-09-23 起）**：**ME-4 —— 外置 OS 的内核能力面**（调度回调 → Sin90 M3/M4 → 推理回调 + Sin90 M5 → SDK/Cos72/wire 文档 → v0.5.0）。
+定义见 [`PLAN-ME4-OS-CAPABILITIES.md`](PLAN-ME4-OS-CAPABILITIES.md)，状态见下方「ME-4 台账」。ME-3 已于 2026-09-20 收口、T11 已于 2026-09-22 交付（下面两段是历史记录）。
+
+## ME-4 台账（2026-09-23 立；本表是 ME-4 唯一的状态来源）
+
+> 定义/验收在 PLAN-ME4 §三；Sin90 侧 task 的定义与状态在 `iDoris-ai/Sin90` 的 `docs/agent/tasks.md`，这里只记**门**。
+> 状态：BACKLOG · READY · IN_PROGRESS · BLOCKED · PR_OPEN · CHANGES_REQUESTED · APPROVED · DONE。推进时回填 PR/commit。
+
+| ID | 仓库 | 任务 | 依赖 | 状态 | 证据 |
+|---|---|---|---|---|---|
+| ME4-0.1 | Sin90 | 合并已批准的 #2/#3/#4（Sin90 T0.1） | — | `DONE` | #2 `0949d37`、#3 `bd84e9a`、#4 `f5c5443`（rebase 后重审通过，2026-09-24 合并） |
+| ME4-0.2 | 两仓 | 合并本规划 PR（Agent24 `docs/me4-plan-2026-09-23` / Sin90 `docs/pilot-me4-plan`） | — | `DONE` | Agent24 #439 `5e1f972`、Sin90 #5 `90dd226`（2026-09-24 合并） |
+| ME4-0.3 | Sin90 | CI + 陈旧文档（Sin90 T0.2/T0.3） | 0.1 | `DONE` | Sin90 #6 `329d5ab`（CI）、#7 `8e34767`（文档）；main CI 绿 |
+| ME4-0.4 | Sin90 | Codex 补审历史改动（Sin90 T0.4） | 0.1 | `BACKLOG` | 按 Sin90 T0.4：等 Codex 额度 2026-09-29 19:28 恢复，不用 Opus 代替 |
+| ME4-1.1.1 | Agent24 | 调度回调设计冻结 + SPEC 改写 | 0.2 | `DONE` | #444 合并于 2026-09-25（冻结 v3.1；2026-09-24 改 base 后原 approve 作废，已重审通过） |
+| ME4-1.2.1 | Agent24 | schedules 存储层（owner/key/revision/暂停三态 + 并发安全 upsert + `schedule_deliveries`） | 1.1.1 | `DONE` | #453 → #454 → #455 → #456 全部合并于 2026-09-25（stacked） |
+| ME4-1.2.2a | Agent24 | 协议与视图（Schedule 新字段、openapi/fixtures/api-client） | 1.2.1 | `DONE` | #462 合并于 2026-09-25 |
+| ME4-1.2.2b | Agent24 | 触发接口与 tick（ScheduleInvocation/FireOutcome/RunTrigger、CAS 版 fire、模块臂先 Deferred） | 1.2.2a | `DONE` | #469 → #470 → #471 → #472 全部合并于 2026-09-25 |
+| ME4-1.2.2c | Agent24 | REST 护栏（update CAS、suspend/resume、409、run_now 双响应、self-wake owner 过滤） | 1.2.2b | `DONE` | #478 → #479 全部合并于 2026-09-25 |
+| ME4-1.2.2d | Agent24 | 桌面端（effective_enabled ?? enabled、run_id ?? fire_id，前向兼容） | 1.2.1 | `DONE` | #465 合并于 2026-09-25 |
+| ME4-1.3.1 | Agent24 | fired 投递器（InFlight 准入 + dispatch、确定性 fire_id、重启续投、Deferred 不计失败、scheduler 挪到 mount_all 后） | 1.2.2c | `DONE` | #500 → #501 → #502 全部合并于 2026-09-25（Opus 2 轮，均 APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-5） |
+| ME4-1.3.2 | Agent24 | 代理保留 `/_a24/` 路径（规范化后判定） | 1.1.1 | `DONE` | #447 合并于 2026-09-25 |
+| ME4-1.4.1 | Agent24 | `_a24/scheduler/*` handler + 授权/配额/限流（**唯一会生产模块行的调用方，必须排在 1.2.2c 之后**：模块行护栏与 self-wake 过滤就绪前不得产生模块行） | 1.2.2c | `DONE` | #487 → #488 全部合并于 2026-09-25 |
+| ME4-1.5.1 | Agent24 | 调度黑盒验收（真实 tick）+ 探针 `4a` | 1.3.1, 1.3.2, 1.4.1 | `DONE` | #504 合并于 2026-09-25（10/10 连跑绿，Opus 评审通过） |
+| ME4-M2 门 | Sin90 | Sin90 M3（T3.1.1–T3.5.1）全 DONE | 1.5.1, 0.1 | `DONE` | Sin90 `origin/main` 已含 T3.1.1–T3.5.1 各 PR（2026-09-26 按 `git log` 核对）|
+| ME4-M3 门 | Sin90 | Sin90 M4（T4.1.1–T4.4.1）全 DONE | M2 门 | `DONE` | Sin90 `origin/main` 已含 T4.1.1–T4.4.1 各 PR（2026-09-26 按 `git log` 核对）|
+| ME4-4.1.1 | Agent24 | 推理回调设计冻结 + SPEC + manifest 字段 | 0.2 | `DONE` | #446 合并于 2026-09-25（冻结 v3.1；同 1.1.1，改 base 后原 approve 作废，已重审通过） |
+| ME4-4.2.1 | Agent24 | `model_access` manifest 字段解析（只做 manifest，不授予） | 4.1.1 | `DONE` | #457 合并于 2026-09-25 |
+| ME4-4.2.2-0 | Agent24 | rpc 按方法超时 + ErrorKind `unavailable`（17→18）+ SPEC 闭集句 | 4.1.1 | `DONE` | #451 合并于 2026-09-25 |
+| ME4-4.2.2a | Agent24 | `agent24-models` 契约扩展（max_tokens / model_id / Rejected）+ 回环判定改 reqwest::Url + `loopback_only()` + `OLLAMA_URL` 进 PASSTHROUGH_VARS（关闭 FU-72） | 4.1.1 | `DONE` | #448 合并于 2026-09-25（关闭 FU-72） |
+| ME4-4.2.2b1a | Agent24 | model_callback 基础（常量、UsageSink/Ticket、ModelAdmission、ModelGrant、错误映射；未注册） | 4.2.2-0, 4.2.2a | `DONE` | #461 合并于 2026-09-25 |
+| ME4-4.2.2b1b | Agent24 | model_callback wire 类型 + handler（未注册） | 4.2.2b1a | `DONE` | #464 合并于 2026-09-25 |
+| ME4-4.2.2b2 | Agent24 | 授予 Models + provides + 注册 + serve 接线（CallbackDeps.models）；删 dead_code 豁免 | 4.2.2b1b, 4.2.1, 1.4.1 | `DONE` | #505 合并于 2026-09-25 |
+| ME4-4.2.3a | Agent24 | 用量迁移 + store（module_model_usage） | 4.2.2b2 | `DONE` | #506 合并于 2026-09-26 |
+| ME4-4.2.3b | Agent24 | 用量 recorder + `/api/v1/usage?module=` + serve 换 sink | 4.2.3a | `DONE` | #510（用量写者 UsageRecorder）→ #511（GET /api/v1/usage?module=）全部合并于 2026-09-26 |
+| ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `DONE` | #512 合并于 2026-09-26（`bb3505a`；Opus 本地评审 2 轮：CHANGES → APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-7） |
+| ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `DONE` | Sin90 `origin/main` `135ddb7`（T5.5.1 M5 real-mount acceptance）含 T5.0.1–T5.5.1 各 PR；前置 4.3.1 DONE（#512）、M3 门 DONE。ME4-5.1.1 以 `135ddb7` 为盘点基线 |
+| ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `IN_PROGRESS` | 设计 v4 冻结（4 轮 Tier-2 Opus 评审，第 4 轮 1H 已修，按用户要求不再复审），Codex 补审记 ME4-CODEX-DEBT-8。`docs/design/ME4-S3-os-sdk.md`：jason 2026-09-26 拍板 Q1–Q11 与随后三轮评审处置（§11.1→v2、§11.2→v3、§11.3→v4）；同日追加拍板 v0.1.0 收敛为「原型版本」，§7 切法从 17 片压缩为 4 片（见下两行 + Sin90/Cos72 既有行） |
+| ME4-5.1.2a | Agent24 | **原型片①：proto 模块侧**（transport + 握手 + fd）：`ModuleEnv`/`Hello`/`InitializeReply`/`connect_from_env`、`manifest::{ManifestFacts,facts_from_yaml}`、`manifest_digest` 挪入 proto、`Connection` mux（读写任务、按 id 分发、64 在途、`declare_dead`、drop 取消、响应/写超时、`slot_wait`）、`module::testing`（`test-util`）、新 crate `agent24-os-fd`（`take_inherited_listener`，唯一 `unsafe`，两平台分支）+ proto `take_listener`/`InheritedListener`；J-S8、J-S9 前半、J-S12、J-S19；J-S1b/J-S20 的 `macos-latest` job 为原型阶段可选 | 5.1.1 | `BACKLOG` | 细粒度组件清单见 ME4-S3-os-sdk.md §7.1（原 a1/a2-core/a2-cancel/a2-kit/a3-fd）。**合并流程（ME4-S3 §7 v4）：一次只开一个 PR，base 恒为 main；单片允许超过 SZ-1 默认上限 300 行，超限在 PR body 回应即可** |
+| ME4-5.1.2b | Agent24 | **原型片②：SDK crate**（`agent24-os-sdk` 骨架 + 五个客户端 + fired）：`clippy.toml`、`Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env`、`ClientError`/`UnavailableCause`（不含 `retry_class`，FU-87）、`RequestContext`/`RequestId`/`ApprovalToken`、Events/Memory(`remember_once`)/Approval(advise 孤儿约束 §2.10)/Scheduler/Model 五个客户端 + agentd 各自对等测试、`FiredBody` 挪进 proto + fired 提取器 + `with_fired`、`examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + `CHANGELOG.md`；J-S1（核心部分）、J-S2、J-S4/J-S5/J-S6/J-S7、J-S9 后半、J-S10、J-S11、J-S13、J-S14、J-S18；J-S3 的正对照脚本、J-S15 为原型阶段可选。合并后在 main 上打 tag `agent24-os-sdk-v0.1.0`（J-S14），tag 推送、探针 ● 之后本行才标 DONE | 5.1.2a | `BACKLOG` | 细粒度组件清单见 ME4-S3-os-sdk.md §7.1（原 a3-skel/a3-module/b1a/b1b/b2a/b2b/b2c/b3a/b3b/c1a/c1b/c2）；b2b 若实测 SZ-1 超 300 内部再拆，不必单开 PR |
+| ME4-5.2.0 | Sin90 | 线协议金样（Sin90 TS.1.0，迁移前合）：出站 `(method, params)` + 入站回放（每个错误 kind → outbox 行状态/attempts 与 `ModelFailure`、宽松解析、Usage 宽度、recall 预查三态） | — | `BACKLOG` | 见 ME4-S3-os-sdk.md §5.1 |
+| ME4-5.2.1 | Sin90 | **原型片③：Sin90 迁到 SDK**（Sin90 TS.1.1）：含改用 SDK `remember_once`、`test_support.rs` 一行 shim、`SchedulerClient`/`ModelClient` newtype 保旧签名 | 5.1.2b, 5.2.0 | `BACKLOG` | 验收见 ME4-S3-os-sdk.md §5.2：金样逐条相等、真实挂载黑盒全绿（核心判据 J-S16）、`reconciler.rs`/`clients/model.rs` 测试模块与已提交的期望补丁逐字相等（脚本 v4 改用 `#[cfg(test)]`+`mod tests {` 锚点，见 §5.2 第 3 条/A.8；只允许 `model.rs` 测试模块那一行 `use crate::ai::UnavailableCause` → `agent24_os_sdk::UnavailableCause`）、Unix socket/fd 子集 clippy 由红转绿 |
+| ME4-5.3.1 | Cos72 | Cos72 仓库 pilot 七件套 | 5.1.2b | `BACKLOG` | |
+| ME4-5.3.2 | Cos72 | 骨架（manifest + SDK 挂载 + 迁移 + 事件） | 5.3.1 | `BACKLOG` | |
+| ME4-5.3.3a | Cos72 | mytask 实体与路由 | 5.3.2 | `BACKLOG` | |
+| ME4-5.3.3b | Cos72 | 审批发积分 + 账本回放 + 摘要进记忆 | 5.3.3a | `BACKLOG` | |
+| ME4-5.3.4 | Cos72 | Cos72 真实挂载黑盒（含与 Sin90 共存隔离） | 5.3.3b, 5.2.1 | `BACKLOG` | |
+| ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2b | `BACKLOG` | |
+| ME4-6.0.1 | Agent24 | 冻结 v0.5.0 专用发布清单 | 5.3.4, 5.4.1 | `BACKLOG` | |
+| ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `BACKLOG` | |
+| ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `BACKLOG` | |
+| ME4-6.1.2 | Agent24 | 发布 v0.5.0 | 6.1.1 | `BACKLOG` | |
+| ME4-6.1.3 | Mac mini | 干净机器只用发布物安装验收 | 6.1.2 | `BACKLOG` | |
+| ME4-6.1.4 | 三仓 | 最终台账收口 PR（本轮最后一个 PR） | 6.1.3 | `BACKLOG` | |
+
+**需要用户手动做**（不是 goal task）：给 `iDoris-ai/Sin90` 与 `MushroomDAO/Cos72` 的 main 开 ruleset（1 个审批 + dismiss stale）。
+
+> 台账回填规则（PLAN-ME4 §一 第 7 条）：task PR 合并后，`DONE`/证据由下一个 PR 顺带回填，或攒到 ME4-6.1.4 的最终台账收口 PR。
 
 **T8.5c-W-wire 实现已完成**（`DONE` — [#224](https://github.com/iDoris-ai/Agent24/pull/224)+[#225](https://github.com/iDoris-ai/Agent24/pull/225)，2026-09-19；语义说明 [`T8.5c-W-wire.md`](../design/T8.5c-W-wire.md) v5，5 轮设计评审冻结；代码 2 轮 Codex 代码评审——首轮 5 Medium(判据覆盖面问题，未发现生产代码缺陷)，修复后二轮 approve，另发现 1 Low(超时预算 50ms→300ms)已修复）：`Generation::admit_callback_bound`（#224，修复真实 TOCTOU 竞态，单锁内原子完成"准入+取绑定生命周期"）+ `memory_callback.rs` 的 `RememberHandler`/`RecallHandler`/`RecentHandler` 三个 Handler、`map_memory_error` 结构性 default-deny 堵住 `QuotaExceeded` 的 owner/partition key 泄露、`_a24/memory/scoped/*` 不注册产出 `-32601`（#225）。`cargo test --workspace`：1300 passed。**已知覆盖缺口**（Codex 确认风险可接受，留作后续 follow-up）：真实子进程握手验证 `Offer.provides` 包含 memory 能力这条端到端测试未覆盖，不影响生产代码正确性。
 
-至此 **T8.5c-W（mount + wire）整体交付完毕**，ME-3 专项只剩 **T9** 这一道关。
+至此 **T8.5c-W（mount + wire）整体交付完毕**。
 
-**当前正在做**：**T9（ME-3f 仓外包端到端验收）**——尚未开工。
+## 🎉 T9 已交付，ME-3 专项整体收口（2026-09-20）
 
-**ME-3 收口路径（用户 2026-09-19 拍板，按此顺序走）**：
+**T9（ME-3f 仓外包端到端验收）`DONE`** — [#262](https://github.com/iDoris-ai/Agent24/pull/262)（2026-09-19；8 轮 Codex 对抗式代码评审，第 8 轮 APPROVE 无新发现）：新增 `rust/apps/agent24d/tests/me3f_blackbox.rs`，核心测试 `a_package_from_outside_the_repo`——daemon 先以空 packages 目录起一次 → 停止 → 在跟仓库物理无关的临时目录下生成并安装一个 `impl_kind: out_of_process_provider` 的 Python 模块包 → 用同一个已编译好的二进制重启（全程无 `cargo build`）→ 真实断言五件事全部成立：挂载（`/api/v1/os` 报 `mounted`）、路由代理（真实 HTTP 经内核代理命中模块）、事件转发（真实 WS 消费者边界观测投递）、记忆读写（真实 `remember`+`recall`，精确 id/body 关联）、审批往返（代理真实注入的 request-id/approval-token，先错误 token 验证拒绝不消耗真实 token，再真实 token 验证成功）。负对照 `an_in_process_declaration_for_an_uncompiled_crate_is_still_refused` 证明挂载校验没有被意外放宽。
+
+评审过程中第 6 轮独立通读抓到一个真实资源泄漏：`stop()` 用 SIGKILL 终止 daemon，绕过了 daemon 自己负责 reap 模块子进程的正常关闭路径，导致 Python 模块进程永久孤儿化（`ps` 实测修复前累积 34 个孤儿）；改成 SIGTERM+有界等待+SIGKILL 兜底、塞进 `Running::drop()` 覆盖所有退出路径（含 panic）后归零，第 8 轮进一步把发信号换成 `rustix::process::kill_process`（daemon 自己 supervisor 同款 API），消除 shell 出去的 `kill` 命令带来的 PATH 依赖。`cargo test --workspace` 全绿，`me3f_blackbox` 单独重跑 20+ 次稳定通过。
+
+`bash docs/agent/me3-status.sh` 核对：**3a-3g 全部 14 行"已在 main"，一个不剩**——ME-3（进程外领域 OS）专项到此整体交付完毕。
+
+## 🎉 T11 已交付（2026-09-22）
+
+**T11（Sin90 迁出内核）`DONE`** — [#342](https://github.com/iDoris-ai/Agent24/pull/342)（`bb9b9d5`，2026-09-22；`clestons` APPROVED，CI 全绿后合并）：删掉编译进内核的 `agent24-sin90{,-os,-store}` 三个 crate（`agent24d`/`agent24-cli`/`agent24-protocol` 相应接线一并清理，净减 ~5000 行）。合并前已独立编译该分支二进制、跑通 Sin90 侧真实端到端挂载黑盒测试（`AGENT24_CHECKOUT` 指向该分支 → `agent24_mount_blackbox.rs --ignored`：挂载/代理/路由行为不变/事件转发 4 条判据全过）。配套的 [#343](https://github.com/iDoris-ai/Agent24/pull/343)（2026-09-20 待办快照文档）同日合并。
+
+## 🔴 2026-09-22 待办清单 —— ⛔ 已被上方「ME-4 台账」取代（2026-09-23）
+
+> 逐条去向：P0 Codex 补审 → ME4-0.4；P1 `SIN90-PET0-INTEGRATION.md` 重写 → 已由 #357 合并；T10/T12/T13/T14 → ME4-5.x / ME4-6.x。下面保留原文作历史。
+
+- **P0，Codex 额度已恢复（原定 2026-09-22 19:18，现已过点）**：`iDoris-ai/Sin90` 的 M0/M1/M2/挂载修复（commit `0d66f24`/`4032e82`/`8056ade`/`ab66b37`）目前只经过本地自审，没有真正的对抗式评审——尤其挂载修复里的 actor-key 门禁安全问题（`ab66b37`），应该优先送审。
+- **P1**：`docs/SIN90-PET0-INTEGRATION.md` 整篇假设"内核内置 Sin90"，T11 #342 已合并，这个假设已不成立，需要独立重写。
+- **P2，明确暂停中**：T10（Cos72）——`feat/me4-cos72-skeleton` 分支保留，除非用户明确说继续，不要主动捡起来。
+- **P2**：T12（发布 v0.5.0）——依赖 T10（暂停）+ T11（已 `DONE`）。
+- **P3，可并行，未开始**：T13（`agent24-os-sdk`）+ T14（wire 文档）。
+
+完整会话记忆见协调 Claude 的 `project_todo_2026-09-20` 记忆条目（本机 `~/.claude/projects/-Users-jason-Dev-auraai-Agent24/memory/`）。
+
+**收口后路径（用户 2026-09-19 拍板，T11 已完成）**：
 
 ```
-T9（ME-3f 仓外包端到端验收）  →  T10（Cos72 进程外样例）
-                             →  T11（Sin90 迁出内核）  →  T12（发布 v0.5.0）
+T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→ T12（发布 v0.5.0）
 ```
-（T13 `agent24-os-sdk` / T14 wire 文档可与 T9 之后并行。）
+（T13 `agent24-os-sdk` / T14 wire 文档可并行。）
 
 **之后**：v0.5.0 发布后回头捡 [`roadmap.md`](roadmap.md) 的 **M1（记忆成为产品）**；`../PLAN.md` / `../ROADMAP.md` 完全作废。
 
-> **探针的历史偏差记录**（`me3-status.sh` 这一行的"预言过期"已经发生过至少 4 次，这里如实记账，别指望它以后不再发生）：
+> **探针的历史偏差记录**（`me3-status.sh` 这一行的"预言过期"发生过 4 次，如实记账）：
 > `3e`/`3g` 曾因重构前的旧文件路径/旧符号名被误报"未开工"（3e = [#199](https://github.com/iDoris-ai/Agent24/pull/199)/[#201](https://github.com/iDoris-ai/Agent24/pull/201)/[#203](https://github.com/iDoris-ai/Agent24/pull/203)，2026-09-17；3g = [#196](https://github.com/iDoris-ai/Agent24/pull/196)，2026-09-16），[#222](https://github.com/iDoris-ai/Agent24/pull/222) 修正。
-> `3d` 的占位符号在 #222 里猜测会落在 `os_memory.rs`，T8.5c-W-wire 实际把它放进了新文件 `memory_callback.rs`——连实现落地都还没写完预言就已经猜错路径，[#234](https://github.com/iDoris-ai/Agent24/pull/234) 修正。
-> 修正后重跑 `bash docs/agent/me3-status.sh`：3a-3e/3g 全部正确报"已在 main"，**3f（T9）仍正确报未开工——这是 ME-3 收口前唯一剩下的真实缺口**。
+> `3d` 的占位符号在 #222 里猜测会落在 `os_memory.rs`，T8.5c-W-wire 实际把它放进了新文件 `memory_callback.rs`，[#234](https://github.com/iDoris-ai/Agent24/pull/234) 修正。
+> `3f` 的坐标（`me3f_blackbox.rs` + `a_package_from_outside_the_repo`）是唯一一次"设计探针时预留的坐标，实现落地后直接对上、不用改"——4 次偏差里唯一的例外，记一笔正对照。
 
 ---
 
@@ -160,9 +239,10 @@ T9（ME-3f 仓外包端到端验收）  →  T10（Cos72 进程外样例）
   三轮评审详情见 Codex session `01a0ae9e-79a4-76f1-93c5-b160579de7c5`（`codex resume 01a0ae9e-79a4-76f1-93c5-b160579de7c5` 可续）。
 - **T7 ME-3e 事件 + 审批** —— 设计阶段拆成三块：**T7a**（能力授予接线 + `_a24/events/emit`）`DONE` — [#199](https://github.com/iDoris-ai/Agent24/pull/199)（`147f8bf`，2026-09-17；语义说明 [`T7a-ME3e-grants-and-events.md`](../design/T7a-ME3e-grants-and-events.md) v4，写码前 4 轮设计审查，终审 0 Medium+；代码 1 轮 Codex 代码审查，修复 events 专属资源上限的度量方式）：`Offer`/`Grants`/`MethodsFor` 从「进程外模块永远拿不到能力授予」改成「按 manifest 声明真授予」，交付第一个真实回调方法 `_a24/events/emit`；`dispatch()` 新增对所有方法通用的 params 体积预算（节点数/深度/字符串字节，含 object key）。SPEC §8 的 offer set 阶梯按实际交付顺序补记（Memory 未排期，Events 独立先行）。**T7b**（`gate`/`advise`/`status` 模块审批）`DONE` — [#201](https://github.com/iDoris-ai/Agent24/pull/201)（`a37e9ef`，2026-09-17；语义说明 [`T7b-ME3e-approvals.md`](../design/T7b-ME3e-approvals.md) v6，写码前 5 轮设计审查——前 4 轮针对同步阻塞模型，第 4 轮发现该模型与现有 30 秒 RPC/代理超时冲突，架构改为异步提交+轮询后第 5 轮收敛；代码 1 轮 Codex 代码审查）：`approval_token` 与 `request_id` 同一次 `admit_request` 原子登记；提交按 `(module, request_id, kind)` 幂等去重；`gate` 命中空闭集不消耗令牌；`ModuleApproval` 单一 `decision` 维度 + 周期扫描判定超时（容忍单次存储失败、daemon 重启无需特殊清扫）；REST `/api/v1/module-approvals` + WS `module-approval.{required,resolved}`。`gate` 本轮闭集仍为空，真实执行留给 T7c。**T7c**（`gate` 第一个内核可执行动作：`schedule_callback`）`DONE` — [#203](https://github.com/iDoris-ai/Agent24/pull/203)（`5129c55`+`e0c4c12`，2026-09-17；语义说明 [`T7c-ME3e-gate-execution.md`](../design/T7c-ME3e-gate-execution.md) v3，2 轮设计审查——第 1 轮发现"接 `agent24-scheduler` 引擎"这条路有 4 个 Critical，第 2 轮确认"改成直接扩展 T7b 自己的周期扫描"消除了全部 Critical；代码 2 轮 Codex 代码审查，首轮 1 High(迁移文件未入库)+2 Medium(pre-epoch 时间戳误拒/`executed_at` 泄漏进冻结事件)+3 Low，二轮 APPROVE；合入后外部评审又独立抓到 year≥10000 时间戳字典序比较破口，同 PR 追加 `0..=9999` 年份守卫后合并）：`execute_due_schedule_callbacks` 独立 CAS 扫描；`validate_gate_action`/`canonicalize_schedule_target` 双路（wire/in-process）共用；`ModuleApprovalSubmitted` 专用 WS payload 不含 `executed_at`。T7（a/b/c）三块全部合入 main。
 - **T8 ME-3g 启用路径准入** `DONE` — [#196](https://github.com/iDoris-ai/Agent24/pull/196)（`de03b4b`，2026-09-16；语义说明 [`T8-ME3g-enable-admission-gate.md`](../design/T8-ME3g-enable-admission-gate.md) v7，写码前 6 轮设计审查，终审无 Medium+；代码 1 轮 Codex 代码审查）：`PATCH /api/v1/os/{name}` 新增准入门，只在这个名字恰好一条 `os_reports` 报告时触碰（重名维持既有的无条件放行，明确划出范围）——已经是 `Refused` 直接拒绝；`Disabled` 的进程外模块现场重扫清单（按目录匹配、先查名字防改名绕过、再查交付方式自洽性），编译进内核的 `Disabled` 模块关不上（核对需要调用 `build()`，架构本身的安全线逼出的限制，记 `FU-6x` 独立跟进）。`AppState` 新增 `packages_root`/`package_dirs`；`ErrorBody.code` 补 `admission_refused`，顺手补全 FU-64/ERR-1 时代漏掉的 `module_panicked`/`module_killed`。17 条判据全部落成确定性测试。
-- **T9 ME-3f 仓外包端到端 —— 验收**（黑盒：不改源码、不重新构建，装一个仓库之外的包，重启后挂载 → 路由代理 → 事件转发全绿）`BLOCKED on T8.5c`（T7、T8、T8.5a、T8.5b 均已 DONE）
+- **T9 ME-3f 仓外包端到端 —— 验收** `DONE` — [#262](https://github.com/iDoris-ai/Agent24/pull/262)（2026-09-19）：详见上方"T9 已交付，ME-3 专项整体收口"记录。**ME-3 专项到此全部完成。**
 - **T13 `agent24-os-sdk`** 与 **T14 wire 文档 + 非 Rust 参考实现**（可与 T9 之后并行）
-- **T10 Cos72 进程外样例**（重做暂停中的 `feat/me4-cos72-skeleton`）→ **T11 Sin90 迁出内核** → **T12 发布 v0.5.0**
+- **T11 Sin90 迁出内核** `DONE` — [#342](https://github.com/iDoris-ai/Agent24/pull/342)（2026-09-22，详见上方"T11 已交付"记录）
+- **T10 Cos72 进程外样例**（重做暂停中的 `feat/me4-cos72-skeleton`，明确暂停）→ **T12 发布 v0.5.0**
 
 **五、仓外事项**
 - **PR-Daemon 规则 S1**：状态机改动先交一页语义说明，否则 block。已提 [jhfnetboy/PR-daemon#8](https://github.com/jhfnetboy/PR-daemon/issues/8)，等 PR-Daemon 落地；落地前本仓库按上面的约定人工执行。

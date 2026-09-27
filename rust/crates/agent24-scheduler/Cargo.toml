@@ -14,13 +14,16 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = "0.10"
 cron = "0.15"
+hex = "0.4"
 serde_json = { workspace = true }
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "sync", "time", "rt"] }
 tokio-util = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]

@@ -314,15 +314,20 @@ async fn schedule_upsert_roundtrip_and_delete() {
             expr: "0 8 * * *".to_owned(),
             tz: Some("Asia/Shanghai".to_owned()),
         },
-        action: ScheduleAction::AgentRun {
+        action: Some(ScheduleAction::AgentRun {
             prompt: "digest".to_owned(),
             session_id: None,
             model_override: None,
-        },
+        }),
         delivery: vec![],
         last_run_at: None,
         next_run_at: Some(TS.to_owned()),
         consecutive_failures: 0,
+        owner: None,
+        user_suspended: false,
+        system_disabled_reason: None,
+        effective_enabled: true,
+        disabled_by: None,
     };
     store.upsert_schedule(&schedule).await.unwrap();
     assert_eq!(
@@ -352,15 +357,20 @@ async fn update_schedule_runtime_preserves_user_fields_and_needs_the_row() {
         name: "original".to_owned(),
         enabled: true,
         spec: ScheduleSpec::Every { secs: 3600 },
-        action: ScheduleAction::AgentRun {
+        action: Some(ScheduleAction::AgentRun {
             prompt: "original prompt".to_owned(),
             session_id: None,
             model_override: None,
-        },
+        }),
         delivery: vec![],
         last_run_at: None,
         next_run_at: Some(TS.to_owned()),
         consecutive_failures: 0,
+        owner: None,
+        user_suspended: false,
+        system_disabled_reason: None,
+        effective_enabled: true,
+        disabled_by: None,
     };
     store.upsert_schedule(&schedule).await.unwrap();
 
