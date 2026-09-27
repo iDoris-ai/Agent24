@@ -54,10 +54,17 @@ agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 # SHUT-1b: open the shutdown evidence without following a link or blocking on
 # a FIFO (already in the tree through agent24-os-proto).
 rustix = { version = "0.38", features = ["fs"] }
+# A3-2a (`attached.rs`): sha256 of the token for `attached.json` (never the
+# plaintext, C1) — the daemon itself, not just its tests, needs this now.
+sha2 = "0.10"
+# A3-2a (`attached.rs`): the `model_access` field the shared, lenient
+# `agent24_os_proto::manifest::facts_from_yaml` does not read (ME4-S3 §4.4
+# only carries the three fields a MODULE needs); read directly rather than
+# adding a fourth field to that shared reader for one caller.
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
-sha2 = "0.10"
 # ME4-S3 §6 (J-S7): the SDK's five clients tested against these callback
 # handlers' own `h.call` fixtures, on `agent24-os-proto`'s in-memory fake
 # kernel (forwarded through the SDK's `test-util` feature, L8).
