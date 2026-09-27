@@ -33,6 +33,8 @@ mod output_worker;
 #[allow(dead_code)]
 mod pipe_access;
 #[allow(dead_code)]
+mod pre_owned_cleanup;
+#[allow(dead_code)]
 mod ready_io;
 #[allow(dead_code)]
 mod ready_read_worker;

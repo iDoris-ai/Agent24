@@ -13,6 +13,7 @@ use crate::{
     launch::OwnedLaunch,
     launch_order::{ActorLaunchOrder, ActorLaunchOrderError, ScheduleState},
     output_worker::OutputWorker,
+    pre_owned_cleanup::{IntoCleanupOwner, PreOwnedCleanup},
     ready_read_worker::ReadyReadWorker,
     stderr_drain_worker::{StderrDrainSnapshot, StderrDrainWorker},
     worker_slots::{WorkerSlotError, WorkerSlots},
@@ -27,9 +28,7 @@ pub(crate) enum NativeGenerationBuildErrorKind {
 
 /// A failed assembly still owns the authoritative process target.
 ///
-/// Pipe handles already moved into a failed worker constructor are allowed to
-/// close. The generation must be treated as terminal; callers may recover the
-/// launch only to force/observe/reap the same target, never to retry assembly.
+/// Pipe handles already moved into failed worker constructors may close. Consume this error into cleanup; do not retry assembly.
 pub(crate) struct NativeGenerationBuildError {
     kind: NativeGenerationBuildErrorKind,
     launch: Box<OwnedLaunch>,
@@ -40,8 +39,8 @@ impl NativeGenerationBuildError {
         self.kind
     }
 
-    pub(crate) fn into_cleanup_launch(self) -> OwnedLaunch {
-        *self.launch
+    pub(crate) fn into_pre_owned_cleanup(self, phase: Phase, limits: Deadlines) -> PreOwnedCleanup {
+        PreOwnedCleanup::new((*self.launch).into_cleanup_owner(), phase, limits, false)
     }
 }
 
@@ -148,6 +147,10 @@ impl<'host> NativeGeneration<'host> {
     pub(crate) fn stderr_snapshot(&mut self) -> StderrDrainSnapshot {
         self.stderr.snapshot()
     }
+
+    pub(crate) fn into_pre_owned_cleanup(self) -> PreOwnedCleanup {
+        self.driver.into_pre_owned_cleanup()
+    }
 }
 
 fn build_error(
@@ -165,8 +168,8 @@ fn build_error(
 mod tests {
     use super::*;
     use crate::{
-        launch::LaunchIntent, launch_order::LaunchControl, output_io::WriteStep,
-        stderr_drain_worker::StderrDrainStatus, target::TreeObservation, worker_slots::WorkerRole,
+        launch::LaunchIntent, output_io::WriteStep, stderr_drain_worker::StderrDrainStatus,
+        target::TreeObservation, worker_slots::WorkerRole,
     };
     use agent24_sidecar_host_protocol::{PROTOCOL_VERSION, Reply, Request, decode_reply};
     use std::{
@@ -201,6 +204,17 @@ mod tests {
             Ok(input.len())
         }
 
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -324,12 +338,12 @@ mod tests {
             "Owned escaped failed assembly"
         );
 
-        let mut cleanup = error.into_cleanup_launch();
-        LaunchControl::stop(&mut cleanup, true).unwrap();
-        let mut phase = Phase::ForceStopping(Instant::now() + LIMITS.force);
+        let now = Instant::now();
+        let mut cleanup =
+            error.into_pre_owned_cleanup(Phase::ForceStopping(now + LIMITS.force), LIMITS);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match LaunchControl::cleanup(&mut cleanup, &mut phase).unwrap() {
+            match cleanup.step(Instant::now()).unwrap() {
                 TreeObservation::ConfirmedEmpty => break,
                 TreeObservation::Present | TreeObservation::Unconfirmed
                     if Instant::now() < deadline =>
@@ -340,6 +354,40 @@ mod tests {
             }
         }
         drop(ready_permit);
+        crate::posix::tests::wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn assembled_generation_failure_is_consumed_by_pre_owned_cleanup() {
+        let _test_guard = crate::posix::tests::test_lock();
+        let slots = WorkerSlots::isolated();
+        let mut output = OutputWorker::new_in(slots, BrokenWriter, Duration::from_secs(2)).unwrap();
+        let mut control = ControlWorker::new_in(slots, PendingRead, None).unwrap();
+        let now = Instant::now();
+        let mut generation = NativeGeneration::assemble_in(
+            slots,
+            launch(83),
+            &mut output,
+            &mut control,
+            LIMITS,
+            now,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !generation.schedule_state().terminal {
+            let _ = generation.step(Instant::now());
+            assert!(Instant::now() < deadline, "transport failure did not latch");
+            thread::yield_now();
+        }
+        let mut cleanup = generation.into_pre_owned_cleanup();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match cleanup.step(Instant::now()).unwrap() {
+                TreeObservation::ConfirmedEmpty => break,
+                TreeObservation::Present if Instant::now() < deadline => thread::yield_now(),
+                observation => panic!("generation owner did not clean up: {observation:?}"),
+            }
+        }
         crate::posix::tests::wait_for_reaper_idle();
     }
 }

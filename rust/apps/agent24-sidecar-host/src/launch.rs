@@ -5,7 +5,8 @@ use crate::{
     cleanup::{CleanupStepError, cleanup_step},
     launch_order::LaunchControl,
     pipe_access::TargetPipes,
-    target::{ExitObservation, TreeObservation},
+    pre_owned_cleanup::{CleanupOwner, PreOwnedCleanup},
+    target::TreeObservation,
 };
 use agent24_sidecar_host_protocol::Request;
 
@@ -76,16 +77,6 @@ pub(crate) enum LaunchFailure {
     },
 }
 
-pub(crate) struct CleanupOwner(OwnedTarget);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LaunchCleanupError {
-    Stop(io::ErrorKind),
-    Observe(io::ErrorKind),
-    Reap(io::ErrorKind),
-    InvalidPhase,
-}
-
 impl fmt::Debug for LaunchFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -113,45 +104,15 @@ impl PartialEq for LaunchFailure {
 impl Eq for LaunchFailure {}
 
 impl LaunchFailure {
-    /// The failed pipe transfer retains containment, but exposes only cleanup.
-    pub(crate) fn cleanup_tick(
-        &mut self,
-        phase: &mut Phase,
-    ) -> Option<Result<TreeObservation, LaunchCleanupError>> {
+    pub(crate) fn into_pre_owned_cleanup(
+        self,
+        phase: Phase,
+        limits: crate::actor::Deadlines,
+    ) -> Result<PreOwnedCleanup, Self> {
         match self {
-            Self::Pipes { cleanup, .. } => Some(cleanup.tick(phase)),
-            Self::NotLaunch | Self::Start(_) => None,
+            Self::Pipes { cleanup, .. } => Ok(PreOwnedCleanup::new(*cleanup, phase, limits, false)),
+            other => Err(other),
         }
-    }
-}
-
-impl CleanupOwner {
-    fn tick(&mut self, phase: &mut Phase) -> Result<TreeObservation, LaunchCleanupError> {
-        if matches!(phase, Phase::GracefulStopping(_)) {
-            match self
-                .0
-                .observe_exit()
-                .map_err(|error| LaunchCleanupError::Observe(error.kind()))?
-            {
-                ExitObservation::Running => return Ok(TreeObservation::Present),
-                ExitObservation::Exited { .. } => {}
-            }
-        }
-        if matches!(
-            phase,
-            Phase::GracefulStopping(_)
-                | Phase::ForceStopping(_)
-                | Phase::Draining(_)
-                | Phase::Unconfirmed
-        ) {
-            self.0
-                .request_stop(true)
-                .map_err(|error| LaunchCleanupError::Stop(error.kind()))?;
-        }
-        cleanup_step(phase, &mut self.0).map_err(|error| match error {
-            CleanupStepError::Reap(error) => LaunchCleanupError::Reap(error.kind()),
-            CleanupStepError::Phase(_) => LaunchCleanupError::InvalidPhase,
-        })
     }
 }
 
@@ -185,7 +146,7 @@ fn take_pipes(target: OwnedTarget) -> Result<(OwnedTarget, OwnedPipes), LaunchFa
         Ok((target, pipes)) => Ok((target, pipes)),
         Err((kind, target)) => Err(LaunchFailure::Pipes {
             kind,
-            cleanup: Box::new(CleanupOwner(target)),
+            cleanup: Box::new(CleanupOwner::new(target, None)),
         }),
     }
 }
@@ -225,6 +186,10 @@ impl OwnedLaunch {
 
     pub(crate) fn pipes_mut(&mut self) -> &mut TargetPipes {
         &mut self.pipes
+    }
+
+    pub(crate) fn into_cleanup_parts(self) -> (OwnedTarget, TargetPipes) {
+        (self.target, self.pipes)
     }
 }
 
@@ -285,6 +250,10 @@ impl OwnedLaunch {
 
     pub(crate) fn pipes_mut(&mut self) -> &mut TargetPipes {
         &mut self.pipes
+    }
+
+    pub(crate) fn into_cleanup_parts(self) -> (OwnedTarget, TargetPipes) {
+        (self.target, self.pipes)
     }
 }
 
@@ -485,6 +454,45 @@ mod tests {
         assert_eq!(kind, io::ErrorKind::InvalidInput);
         assert_eq!(owner.generation, 17);
         assert!(owner.attempted);
+    }
+
+    #[test]
+    fn pipe_failure_is_consumed_directly_into_pre_owned_cleanup() {
+        let _test_guard = crate::posix::tests::test_lock();
+        let owner =
+            OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("sleep 30"))
+                .expect("launch child");
+        let mut target = OwnedTarget::from_owned(owner);
+        drop(target.take_pipes().expect("first pipe transfer"));
+        let failure = match take_pipes(target) {
+            Err(failure) => failure,
+            Ok(_) => panic!("second pipe transfer unexpectedly succeeded"),
+        };
+        let now = std::time::Instant::now();
+        let limits = crate::actor::Deadlines {
+            launch: std::time::Duration::ZERO,
+            ready: std::time::Duration::ZERO,
+            graceful: std::time::Duration::ZERO,
+            force: std::time::Duration::from_secs(2),
+            drain: std::time::Duration::from_secs(2),
+        };
+        let mut cleanup = failure
+            .into_pre_owned_cleanup(Phase::ForceStopping(now + limits.force), limits)
+            .expect("Pipes failure transfers its owner");
+        let deadline = now + std::time::Duration::from_secs(2);
+        loop {
+            match cleanup
+                .step(std::time::Instant::now())
+                .expect("cleanup turn")
+            {
+                TreeObservation::ConfirmedEmpty => break,
+                TreeObservation::Present if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                result => panic!("cleanup did not confirm empty: {result:?}"),
+            }
+        }
+        crate::posix::tests::wait_for_reaper_idle();
     }
 }
 

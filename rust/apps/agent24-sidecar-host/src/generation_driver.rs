@@ -84,6 +84,17 @@ where
     C: ControlPort,
     R: ReadyPort,
 {
+    pub(crate) fn into_pre_owned_cleanup(
+        self,
+    ) -> crate::pre_owned_cleanup::PreOwnedCleanup<
+        <L as crate::pre_owned_cleanup::IntoCleanupOwner>::Owner,
+    >
+    where
+        L: crate::pre_owned_cleanup::IntoCleanupOwner,
+    {
+        self.actor.into_pre_owned_cleanup()
+    }
+
     /// Admit `Owned` before the first turn while retaining all owners for cleanup.
     pub(crate) fn new(
         mut actor: ActorLaunchOrder<L, S>,
