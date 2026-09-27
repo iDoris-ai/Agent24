@@ -1,12 +1,23 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, nativeImage, session, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, Menu, Tray, nativeImage, session, ipcMain, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
+import { AgentEarEventBridge } from './agentear-events'
+import { AgentEarEventLog } from './agentear-log'
+import { IpcChannels } from '../shared/ipc-types'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
+// A3-4 review M5: the sequenced/capped event log lives here, in main, so it
+// survives the renderer's VoicePanel unmounting when the user switches
+// sidebar pages (design §7.2's intent — a host-side log, not a per-tab one).
+const agentEarLog = new AgentEarEventLog()
+// Forwards raw WS-unwrapped agentear.event/1 objects into the log; the log's
+// own subscribe() (wired below, in whenReady) fans newly-delivered envelopes
+// out to the renderer.
+const agentEarBridge = new AgentEarEventBridge((envelope) => agentEarLog.ingest(envelope))
 
 // FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken
 // by another project, the window silently loaded whatever else was listening
@@ -103,6 +114,17 @@ app.whenReady().then(() => {
 
   registerIpcHandlers()
   mainWin = createMainWindow()
+  agentEarBridge.start()
+
+  // A3-4 review M5: pull (snapshot on mount) + push (ongoing) for the voice
+  // panel's log. Registered once here — the log itself is process-lifetime,
+  // not per-window, so no cleanup needed on window recreation.
+  ipcMain.handle(IpcChannels.AgentEarSnapshot, () => agentEarLog.snapshot())
+  agentEarLog.subscribe((envelope) => {
+    if (mainWin && !mainWin.isDestroyed()) {
+      mainWin.webContents.send(IpcChannels.AgentEarEvent, envelope)
+    }
+  })
 
   // ── System tray (M2 base; F1b: live daemon status + start/stop/restart) ────
   // Empty image + setTitle works on macOS (menu-bar text); M3 will add a
@@ -167,6 +189,8 @@ app.on('before-quit', () => {
 
 app.on('will-quit', () => {
   if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
+  agentEarBridge.stop()
+  agentEarLog.stop()
   backendManager.stop()
 })
 

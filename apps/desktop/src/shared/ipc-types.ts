@@ -19,6 +19,13 @@ export const IpcChannels = {
   ModulesInstall: 'modules:install',
   ModulesUninstall: 'modules:uninstall',
   LlmStatus: 'llm:status',
+  // A3-4: push channel only (main -> renderer via webContents.send). Not an
+  // ipcMain.handle() target — see main/agentear-events.ts.
+  AgentEarEvent: 'agentear:event',
+  // A3-4 review M5: pull channel — the panel calls this once on mount to get
+  // the main-process log's current state (main/agentear-log.ts), so
+  // navigating away and back doesn't lose it. Ordinary ipcMain.handle().
+  AgentEarSnapshot: 'agentear:snapshot',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
@@ -153,4 +160,40 @@ export interface DiscoverFilter {
   query?: string
   trustTier?: TrustTier
   installed?: boolean
+}
+
+// ── A3 attached modules (docs/design/A3-ATTACHED-MODULE.md) ────────────────────
+// MIRROR NOTICE: field names copied from the merged Rust
+// `agent24-protocol::types::{AttachedView, AttachedList}` (A3-2a,
+// rust/crates/agent24-protocol/src/types.rs). `generation` is NOT part of the
+// A3-2a struct yet — it is wired in A3-2b (not merged as of this PR) — so it
+// stays optional here and the panel must tolerate its absence.
+
+/** One row of `GET /api/v1/attached` — never carries the token or its hash. */
+export interface AttachedView {
+  name: string
+  manifest_digest: string
+  token_id: string
+  created_at: string
+  /** Open enum: `detached` | `attached` | `disabled` (design §5.1). */
+  attach_status: string
+  /** A3-2b field (design §3.2); absent against an A3-2a-only daemon. */
+  generation?: number
+}
+
+export interface AttachedListResponse {
+  modules: AttachedView[]
+}
+
+/** `agentear.event/1` envelope (AgentEar contracts/schema/agentear.event.v1.schema.json,
+ * pinned commit — see apps/desktop/test/fixtures/agentear/SOURCE). This is the
+ * payload the kernel relays verbatim inside a WS `type:"module"` event
+ * (design §7.1) — Agent24 does not interpret it beyond routing by (session_id, seq). */
+export interface AgentEarEventEnvelope {
+  schema: string
+  event_id: string
+  session_id: string
+  seq: number
+  type: 'turn' | 'transcript' | 'proposal' | 'speech' | 'error' | 'confirm_reply'
+  payload: Record<string, unknown>
 }
