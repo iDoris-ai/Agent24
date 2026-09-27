@@ -537,6 +537,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         }
     }
 
@@ -873,6 +874,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         }
     }
 
@@ -960,6 +962,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         };
         let c = CancellationToken::new();
         let (tp, _) = thread_stub(redirect.clone());

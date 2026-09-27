@@ -146,6 +146,10 @@ impl ModelCompleteParams {
 
     fn into_request(self) -> (CompletionRequest, Complexity, Option<String>) {
         let max = self.max_tokens.unwrap_or(MODEL_DEFAULT_MAX_TOKENS);
+        let complexity = match self.complexity {
+            Some(WireComplexity::Complex) => Complexity::Complex,
+            Some(WireComplexity::Simple) | None => Complexity::Simple,
+        };
         let request = CompletionRequest {
             messages: self
                 .messages
@@ -166,10 +170,13 @@ impl ModelCompleteParams {
                 },
             ),
             max_tokens: NonZeroU32::new(max),
-        };
-        let complexity = match self.complexity {
-            Some(WireComplexity::Complex) => Complexity::Complex,
-            Some(WireComplexity::Simple) | None => Complexity::Simple,
+            // ME4-S2-thinking: AgentEar found Qwen3-family reasoning models
+            // narrating their whole `<think>` monologue out loud in the voice
+            // scene. `complexity: simple` is the module's own signal that a
+            // fast, direct answer is wanted — gate on exactly that, never on
+            // which module is calling. `complex` calls are unaffected (a
+            // reasoning trace is more likely wanted there).
+            disable_thinking: matches!(complexity, Complexity::Simple),
         };
         (request, complexity, self.request_id)
     }
@@ -1052,6 +1059,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         }
     }
 

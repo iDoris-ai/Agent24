@@ -298,6 +298,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         tools: vec![],
         response_format: None,
         max_tokens: None,
+        disable_thinking: false,
     };
     // Transient run: session_id null, full run lifecycle events (SPEC-002 §2)
     let run_id = format!("run_{}", agent24_core::util::ulid());

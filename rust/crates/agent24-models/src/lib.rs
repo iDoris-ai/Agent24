@@ -106,6 +106,17 @@ pub struct CompletionRequest {
     /// `MODEL_MAX_TOKENS_CEILING`), not this crate's — the adapter forwards
     /// the value verbatim and never clamps it silently.
     pub max_tokens: Option<std::num::NonZeroU32>,
+    /// ME4-S2-thinking: ask the backend to skip a reasoning model's internal
+    /// monologue (Qwen3-style `<think>…</think>`) for THIS request. Forwarded
+    /// verbatim by [`OpenAiCompatProvider`] as the OpenAI-compat
+    /// `chat_template_kwargs: {"enable_thinking": false}` convention
+    /// (confirmed against oMLX's own `mlx_lm.server`/`omlx.server`, which
+    /// reads `chat_template_kwargs` off the request body top level and
+    /// special-cases `enable_thinking`); a provider that doesn't recognise
+    /// the field ignores it, same as any other unknown JSON key. The CALLER
+    /// decides when to set this (`_a24/model/complete`'s handler, gated on
+    /// `complexity: simple`) — this crate has no opinion on complexity.
+    pub disable_thinking: bool,
 }
 
 /// Structured-output request, mirroring the OpenAI `response_format` wire shape
@@ -575,6 +586,11 @@ impl ModelProvider for OpenAiCompatProvider {
         if let Some(n) = req.max_tokens {
             body["max_tokens"] = Value::from(n.get());
         }
+        // ME4-S2-thinking: same "only when set" rule — an unset flag keeps
+        // every existing caller's body byte-for-byte unchanged.
+        if req.disable_thinking {
+            body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
+        }
         let fut = self
             .authed(
                 self.client
@@ -875,6 +891,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         }
     }
 
@@ -953,6 +970,53 @@ mod tests {
         assert!(
             second.get("max_tokens").is_none(),
             "absent → not sent (/chat unchanged)"
+        );
+    }
+
+    // ── ME4-S2-thinking: disable_thinking → chat_template_kwargs, gated ──────
+
+    #[tokio::test]
+    async fn disable_thinking_sets_chat_template_kwargs_only_when_true() {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = vec![];
+            for _ in 0..2 {
+                let (mut s, _) = l.accept().await.unwrap();
+                bodies.push(read_request(&mut s).await);
+                let body = r#"{"model":"stub","choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let p = OpenAiCompatProvider::new("omlx", url, None, "local", "Qwen3-8B-4bit");
+        let c = CancellationToken::new();
+        let simple = CompletionRequest {
+            disable_thinking: true,
+            ..req()
+        };
+        let complex = CompletionRequest {
+            disable_thinking: false,
+            ..req()
+        };
+        let _ = p.complete(&simple, &c).await.unwrap();
+        let _ = p.complete(&complex, &c).await.unwrap();
+        let bodies = server.await.unwrap();
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(
+            first["chat_template_kwargs"],
+            serde_json::json!({ "enable_thinking": false }),
+            "simple → thinking disabled in the wire body"
+        );
+        assert!(
+            second.get("chat_template_kwargs").is_none(),
+            "complex/unset → key absent, body unchanged from before this feature"
         );
     }
 
