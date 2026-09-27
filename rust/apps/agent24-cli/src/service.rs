@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 12] = [
+pub const PASSTHROUGH_VARS: [&str; 13] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -142,6 +142,16 @@ pub const PASSTHROUGH_VARS: [&str; 12] = [
     // FU-64 §B: the idle-connection-pool age cap. Best-effort only (see the
     // design doc), but still a knob that must reach the daemon.
     "A24_MODULE_IDLE_CONN_MAX_MS",
+    // ME4-S3 §4.3: `agent24_os_fd::take_inherited_listener` reads this by
+    // its own `ENV_LISTEN_FD` constant. The daemon itself never calls that
+    // function — it MINTS this variable per spawn for the CHILD module
+    // (`launch.rs`), it does not need it from ITS OWN environment — but
+    // `agent24-os-fd` lives under `rust/crates/` and is a (transitive)
+    // dependency of the daemon, so this test's source scan finds the read
+    // regardless of whether the daemon ever reaches that code path.
+    // Harmless to pass through: a launchd-started daemon has no reason to
+    // have this set at all.
+    "A24_LISTEN_FD",
 ];
 
 /// Snapshot the environment the daemon should run with.
