@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process'
 import {
   createOwnership,
   MemoryEndpointHandoff,
@@ -19,22 +18,23 @@ export interface SidecarLaunch {
   readonly child: SidecarChild
   readonly processGroupId?: number
   readonly dedicatedProcessGroup?: boolean
-  readonly tree?: SidecarTreeRunner
+  /** Opaque, generation-bound tree control supplied by the launcher. */
+  readonly tree: SidecarTreeController
   readonly ready: Promise<SidecarReady>
 }
 /** Launch establishes child ownership synchronously; readiness remains asynchronous. */
 export interface SidecarLauncher { launch(): SidecarLaunch }
 export interface SidecarHealth { check(endpoint: SidecarReady['endpoint'], timeoutMs: number): Promise<boolean> }
-export interface SidecarTreeRunner {
-  signal(owner: SidecarOwnership, force: boolean): Promise<void>
-  isEmpty(owner: SidecarOwnership): Promise<boolean>
+export interface SidecarTreeController {
+  signal(force: boolean): Promise<void>
+  isEmpty(): Promise<boolean>
 }
 export interface SidecarLogger {
   info(event: string, fields?: Record<string, string | number>): void
   warn(event: string, fields?: Record<string, string | number>): void
 }
 export interface SidecarStopper {
-  stop(owner: SidecarOwnership, child: SidecarChild, gracefulMs: number, killAfterMs: number, tree?: SidecarTreeRunner): Promise<void>
+  stop(tree: SidecarTreeController, gracefulMs: number, killAfterMs: number): Promise<void>
 }
 export interface SidecarSpec {
   readonly sidecarId: string
@@ -47,7 +47,7 @@ export interface SidecarSpec {
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 const silentLogger: SidecarLogger = { info: () => {}, warn: () => {} }
-const treeOperations = new WeakMap<SidecarTreeRunner, Map<string, Promise<unknown>>>()
+const treeOperations = new WeakMap<SidecarTreeController, Promise<unknown>>()
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -61,96 +61,57 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
 
 function validateSpec(spec: SidecarSpec): void {
   const timeouts = [spec.readyTimeoutMs, spec.healthIntervalMs, spec.healthTimeoutMs, spec.shutdown.termGraceMs, spec.shutdown.killAfterMs]
-  if (timeouts.some((value) => !Number.isFinite(value) || value <= 0)) throw new Error('sidecar timeouts must be finite and positive')
+  if (timeouts.some((value) => !Number.isFinite(value) || value <= 0 || value > 2_147_483_647)) throw new Error('sidecar timeouts must be finite, positive, and timer-safe')
   if (!Number.isInteger(spec.maxHealthFailures) || spec.maxHealthFailures <= 0) throw new Error('sidecar health failure bound is invalid')
 }
 
-/** Signals only the manager-owned PID or the launcher-provided dedicated group. */
-export function signalOwnedTree(owner: SidecarOwnership, signal: NodeJS.Signals): Promise<void> {
-  if (!Number.isInteger(owner.pid) || owner.pid <= 0) throw new Error('sidecar pid is invalid')
-  if (owner.processGroupId !== null && (!Number.isInteger(owner.processGroupId) || owner.processGroupId <= 0)) {
-    throw new Error('sidecar process group is invalid')
-  }
-  if (process.platform === 'win32') {
-    return new Promise((resolve, reject) => {
-      const taskkill = spawn('taskkill.exe', ['/PID', String(owner.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])], { stdio: 'ignore', windowsHide: true })
-      taskkill.once('error', reject)
-      taskkill.once('close', (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with ${String(code)}`)))
-    })
-  }
-  const target = owner.processGroupId === null ? owner.pid : -owner.processGroupId
-  try { process.kill(target, signal) } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
-  }
-  return Promise.resolve()
-}
-
-const nativeTreeRunner: SidecarTreeRunner = {
-  signal: (owner, force) => signalOwnedTree(owner, force ? 'SIGKILL' : 'SIGTERM'),
-  async isEmpty(owner) {
-    if (process.platform === 'win32') throw new Error('verified Windows tree control is required')
-    // A malformed/missing group never gains group authority: inspect its PID only.
-    const target = owner.processGroupId === null ? owner.pid : -owner.processGroupId
-    try {
-      process.kill(target, 0)
-      return false
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true
-      throw error
-    }
-  },
-}
-
 function boundedTreeOperation<T>(
-  tree: SidecarTreeRunner,
-  owner: SidecarOwnership,
+  tree: SidecarTreeController,
   timeoutMs: number,
   name: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  let operations = treeOperations.get(tree)
-  if (!operations) { operations = new Map(); treeOperations.set(tree, operations) }
-  if (operations.has(owner.instanceId)) return Promise.reject(new Error('sidecar tree operation is still pending'))
+  if (treeOperations.has(tree)) return Promise.reject(new Error('sidecar tree operation is still pending'))
   const pending = Promise.resolve().then(operation)
-  operations.set(owner.instanceId, pending)
+  treeOperations.set(tree, pending)
   const release = () => {
-    if (operations?.get(owner.instanceId) === pending) operations.delete(owner.instanceId)
+    if (treeOperations.get(tree) === pending) treeOperations.delete(tree)
   }
   void pending.then(release, release)
   return Promise.race([pending, wait(Math.max(1, timeoutMs)).then(() => { throw new Error(`sidecar tree ${name} timed out`) })])
 }
 
-function boundedSignal(tree: SidecarTreeRunner, owner: SidecarOwnership, force: boolean, timeoutMs: number): Promise<void> {
-  return boundedTreeOperation(tree, owner, timeoutMs, 'signal', () => tree.signal(owner, force))
+function boundedSignal(tree: SidecarTreeController, force: boolean, timeoutMs: number): Promise<void> {
+  return boundedTreeOperation(tree, timeoutMs, 'signal', () => tree.signal(force))
 }
 
-function boundedEmpty(tree: SidecarTreeRunner, owner: SidecarOwnership, timeoutMs: number): Promise<boolean> {
-  return boundedTreeOperation(tree, owner, timeoutMs, 'emptiness check', () => tree.isEmpty(owner))
+function boundedEmpty(tree: SidecarTreeController, timeoutMs: number): Promise<boolean> {
+  return boundedTreeOperation(tree, timeoutMs, 'emptiness check', () => tree.isEmpty())
 }
 
-async function waitForEmpty(tree: SidecarTreeRunner, owner: SidecarOwnership, timeoutMs: number): Promise<boolean> {
+async function waitForEmpty(tree: SidecarTreeController, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + Math.max(0, timeoutMs)
   do {
     const remaining = Math.max(1, deadline - Date.now())
-    if (await boundedEmpty(tree, owner, remaining)) return true
+    if (await boundedEmpty(tree, remaining)) return true
     if (Date.now() >= deadline) return false
     await wait(Math.min(10, Math.max(1, deadline - Date.now())))
   } while (Date.now() < deadline)
   return false
 }
 
-async function forceTreeStop(owner: SidecarOwnership, tree: SidecarTreeRunner, timeoutMs: number): Promise<void> {
+async function forceTreeStop(tree: SidecarTreeController, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + Math.max(0, timeoutMs)
-  await boundedSignal(tree, owner, true, Math.max(1, deadline - Date.now()))
-  if (!await waitForEmpty(tree, owner, Math.max(0, deadline - Date.now()))) throw new Error('sidecar process tree did not exit')
+  await boundedSignal(tree, true, Math.max(1, deadline - Date.now()))
+  if (!await waitForEmpty(tree, Math.max(0, deadline - Date.now()))) throw new Error('sidecar process tree did not exit')
 }
 
 export const exactTreeStopper: SidecarStopper = {
-  async stop(owner, _child, gracefulMs, killAfterMs, tree = nativeTreeRunner) {
+  async stop(tree, gracefulMs, killAfterMs) {
     const deadline = Date.now() + Math.max(0, gracefulMs)
-    await boundedSignal(tree, owner, false, Math.max(1, deadline - Date.now()))
-    if (await waitForEmpty(tree, owner, Math.max(0, deadline - Date.now()))) return
-    await forceTreeStop(owner, tree, killAfterMs)
+    await boundedSignal(tree, false, Math.max(1, deadline - Date.now()))
+    if (await waitForEmpty(tree, Math.max(0, deadline - Date.now()))) return
+    await forceTreeStop(tree, killAfterMs)
   },
 }
 
@@ -179,7 +140,7 @@ type ActiveSidecar = {
   readonly token: number
   readonly owner: SidecarOwnership
   readonly child: SidecarChild
-  readonly tree?: SidecarTreeRunner
+  readonly tree: SidecarTreeController
   ready?: SidecarReady
   probing: boolean
   exited?: boolean
@@ -226,6 +187,9 @@ export class SidecarManager {
         if (!this.isStarting(token)) return this.cancelled()
         throw new Error('sidecar did not provide a pid')
       }
+      if (!launch.tree || typeof launch.tree.signal !== 'function' || typeof launch.tree.isEmpty !== 'function') {
+        throw new Error('verified tree control is required')
+      }
       attempt = { token, owner: createOwnership(this.spec.sidecarId, launch.child.pid), child: launch.child, tree: launch.tree, probing: false }
       const processGroupId = launch.processGroupId
       if (process.platform !== 'win32') {
@@ -234,7 +198,7 @@ export class SidecarManager {
           throw new Error('sidecar process group is not an owned child group')
         }
         attempt = { ...attempt, owner: createOwnership(this.spec.sidecarId, launch.child.pid, processGroupId) }
-      } else if (!launch.tree) throw new Error('verified Windows tree control is required')
+      }
       if (!this.isStarting(token)) {
         cleaningCancelledAttempt = true
         await this.stopActive(attempt)
@@ -335,10 +299,8 @@ export class SidecarManager {
     }
     const stopping = Promise.resolve().then(() =>
       force
-        ? forceTreeStop(active.owner, active.tree ?? nativeTreeRunner, this.spec.shutdown.killAfterMs)
-        : active.tree
-          ? this.stopper.stop(active.owner, active.child, this.spec.shutdown.termGraceMs, this.spec.shutdown.killAfterMs, active.tree)
-          : this.stopper.stop(active.owner, active.child, this.spec.shutdown.termGraceMs, this.spec.shutdown.killAfterMs),
+        ? forceTreeStop(active.tree, this.spec.shutdown.killAfterMs)
+        : this.stopper.stop(active.tree, this.spec.shutdown.termGraceMs, this.spec.shutdown.killAfterMs),
     ).then(
       () => {
         if (this.active === active) this.active = null
