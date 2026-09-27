@@ -2199,7 +2199,7 @@ mod tests {
     #[tokio::test]
     async fn owned_soft_stop_closes_stdin_twice_then_force_reaps_same_owner() {
         use crate::windows_test_io::{powershell_executable, read_pair_then_cleanup};
-        use std::{fs::File, time::Duration};
+        use std::time::Duration;
 
         let request = Request::Launch {
             version: PROTOCOL_VERSION,
@@ -2225,24 +2225,10 @@ mod tests {
         let first_stop = LaunchControl::stop(&mut launch, false);
         let second_stop = LaunchControl::stop(&mut launch, false);
         let stdin_closed = launch.pipes_mut().stdin_mut().is_none();
-        let native_pipes = stdout_pipe.into_owned_handle().and_then(|stdout| {
-            stderr_pipe
-                .into_owned_handle()
-                .map(|stderr| (stdout, stderr))
-        });
-        let output = match native_pipes {
-            Ok((stdout, stderr)) => read_pair_then_cleanup(
-                File::from(stdout),
-                File::from(stderr),
-                8,
-                Duration::from_secs(3),
-                || force_and_reap(&mut launch),
-            ),
-            Err(error) => {
-                let cleanup = force_and_reap(&mut launch);
-                cleanup.and(Err(error))
-            }
-        };
+        let output =
+            read_pair_then_cleanup(stdout_pipe, stderr_pipe, 8, Duration::from_secs(3), || {
+                force_and_reap(&mut launch)
+            });
         first_stop.unwrap();
         second_stop.unwrap();
         assert!(stdin_closed, "soft stop left stdin open");

@@ -1,8 +1,7 @@
 //! Bounded synchronous I/O adapters for Windows ownership tests.
 
 use std::{
-    fs::File,
-    io::{self, Read},
+    io::{self, PipeReader, PipeWriter, Read},
     path::PathBuf,
     process::Command,
     sync::mpsc,
@@ -13,9 +12,9 @@ use std::{
 use crate::owner::OwnedPipes;
 
 pub(crate) struct NativePipes {
-    pub(crate) stdin: File,
-    pub(crate) stdout: File,
-    pub(crate) stderr: File,
+    pub(crate) stdin: PipeWriter,
+    pub(crate) stdout: PipeReader,
+    pub(crate) stderr: PipeReader,
 }
 
 impl TryFrom<OwnedPipes> for NativePipes {
@@ -23,9 +22,9 @@ impl TryFrom<OwnedPipes> for NativePipes {
 
     fn try_from(pipes: OwnedPipes) -> io::Result<Self> {
         Ok(Self {
-            stdin: File::from(pipes.stdin.into_owned_handle()?),
-            stdout: File::from(pipes.stdout.into_owned_handle()?),
-            stderr: File::from(pipes.stderr.into_owned_handle()?),
+            stdin: pipes.stdin,
+            stdout: pipes.stdout,
+            stderr: pipes.stderr,
         })
     }
 }
@@ -34,8 +33,8 @@ impl TryFrom<OwnedPipes> for NativePipes {
 /// before returning results for assertions. A stalled reader triggers cleanup
 /// at the deadline so the pipe closes before its worker is joined.
 pub(crate) fn read_pair_then_cleanup<C>(
-    stdout: File,
-    stderr: File,
+    stdout: PipeReader,
+    stderr: PipeReader,
     limit: u64,
     timeout: Duration,
     cleanup: C,
@@ -117,7 +116,7 @@ where
 }
 
 fn spawn_reader(
-    file: File,
+    file: PipeReader,
     limit: u64,
     tx: mpsc::Sender<(usize, io::Result<Vec<u8>>)>,
     index: usize,

@@ -75,10 +75,7 @@ pub(crate) struct ReadyReadWorker {
 impl ReadyReadWorker {
     /// Move a native target stdout into the one synchronous reading thread.
     ///
-    /// Unix stdout is already a synchronous `Read`.  On Windows this consumes
-    /// Tokio's async handle before any `AsyncRead` poll and converts the owned
-    /// handle to a `std::fs::File`; no raw-handle clone or competing reader is
-    /// created.
+    /// Both platforms provide a synchronous pipe reader.
     #[cfg(unix)]
     pub(crate) fn from_native_stdout(stdout: NativeStdout) -> Result<Self, WorkerSlotError> {
         Self::from_native_stdout_in(WorkerSlots::host(), stdout)
@@ -102,12 +99,7 @@ impl ReadyReadWorker {
         slots: &'static WorkerSlots,
         stdout: NativeStdout,
     ) -> Result<Self, WorkerSlotError> {
-        let file = std::fs::File::from(
-            stdout
-                .into_owned_handle()
-                .map_err(|error| WorkerSlotError::Spawn(error.kind()))?,
-        );
-        Self::new_in(slots, file)
+        Self::new_in(slots, stdout)
     }
 
     pub(crate) fn new_in<R: Read + Send + 'static>(
@@ -429,24 +421,32 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[tokio::test]
-    async fn native_stdout_is_converted_before_sync_worker_reads() {
-        let mut child =
-            tokio::process::Command::new(crate::windows_test_io::windows_executable("cmd.exe"))
-                .args(["/C", "<nul set /p =native"])
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-        let stdout = child.stdout.take().unwrap();
+    #[test]
+    fn native_stdout_moves_directly_into_the_sync_worker_on_windows() {
+        let mut child = processkit::ProcessGroup::new()
+            .unwrap()
+            .spawn_isolated_piped(
+                processkit::IsolatedPipedCommand::new(crate::windows_test_io::windows_executable(
+                    "cmd.exe",
+                ))
+                .args(["/C", "<nul set /p =native"]),
+            )
+            .unwrap();
+        let stdout = child.take_pipes().unwrap().stdout;
         let mut worker = ReadyReadWorker::from_native_stdout(stdout).unwrap();
         worker.permit().unwrap();
-        let result = complete(&mut worker);
-        let status = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
-        if status.is_err() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-        let _status = status.expect("cmd.exe exit deadline").unwrap();
-        assert_eq!(chunk(result.unwrap()), b"native");
+        assert_eq!(chunk(complete(&mut worker).unwrap()), b"native");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd.exe exit deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(status.success());
     }
 }

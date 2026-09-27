@@ -21,7 +21,7 @@ use crate::{
     target::{OwnedPipes, OwnedTarget},
 };
 #[cfg(windows)]
-use tokio::process::Command;
+use processkit::IsolatedPipedCommand;
 
 pub(crate) struct LaunchIntent {
     request_id: u64,
@@ -219,8 +219,7 @@ impl OwnedLaunch {
             GenerationId::new(request_id).map_err(|error| LaunchFailure::Start(error.kind()))?;
         let owner =
             GenerationOwner::new(generation).map_err(|error| LaunchFailure::Start(error.kind()))?;
-        let mut command = Command::new(intent.executable);
-        command
+        let command = IsolatedPipedCommand::new(intent.executable)
             .current_dir(intent.cwd)
             .args(intent.argv)
             .env_clear()
@@ -590,16 +589,6 @@ mod windows_tests {
                 pipes.take_stderr().expect("stderr moves once"),
             )
         };
-        let stdout_pipe = std::fs::File::from(
-            stdout_pipe
-                .into_owned_handle()
-                .expect("stdout owned handle"),
-        );
-        let stderr_pipe = std::fs::File::from(
-            stderr_pipe
-                .into_owned_handle()
-                .expect("stderr owned handle"),
-        );
         let (stdout, stderr) = read_pair_then_cleanup(
             stdout_pipe,
             stderr_pipe,
@@ -659,33 +648,55 @@ mod windows_tests {
             pipes.close_stdin();
             pipes.stdin_mut().is_none()
         };
-        let stdout = std::fs::File::from(stdout.into_owned_handle().expect("stdout owned handle"));
-        let stderr = std::fs::File::from(stderr.into_owned_handle().expect("stderr owned handle"));
-        let mut stdout_after_cleanup = stdout.try_clone().expect("clone moved stdout");
-        let mut observation = None;
-        let (out, err) = read_pair_then_cleanup(stdout, stderr, 10, Duration::from_secs(3), || {
-            let observed = launch.target_mut().observe_exit();
-            reap(&mut launch);
-            observation = Some(observed?);
-            Ok(())
-        })
-        .expect("bounded marker read and launch cleanup");
-        drop(launch);
+        let (out_tx, out_rx) = mpsc::channel();
+        let (err_tx, err_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
         let (eof_tx, eof_rx) = mpsc::channel();
-        thread::spawn(move || {
+        let stdout_reader = thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut bytes = Vec::new();
+            let result = stdout
+                .by_ref()
+                .take(10)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = out_tx.send(result);
+            let _ = resume_rx.recv();
             let mut byte = [0];
-            let _ = eof_tx.send(stdout_after_cleanup.read(&mut byte));
+            let _ = eof_tx.send(stdout.read(&mut byte));
         });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stderr.take(10).read_to_end(&mut bytes).map(|_| bytes);
+            let _ = err_tx.send(result);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let out = out_rx
+            .recv_timeout(remaining())
+            .expect("stdout marker deadline")
+            .expect("stdout read");
+        let err = err_rx
+            .recv_timeout(remaining())
+            .expect("stderr marker deadline")
+            .expect("stderr read");
+        let observed = launch.target_mut().observe_exit();
+        reap(&mut launch);
+        let observation = observed.expect("observe child before cleanup");
+        drop(launch);
+        resume_tx.send(()).expect("resume stdout EOF check");
         let stdout_eof = eof_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("moved stdout EOF deadline")
             .expect("moved stdout EOF read");
+        stdout_reader.join().expect("stdout reader join");
+        stderr_reader.join().expect("stderr reader join");
         assert_eq!(request_id, 20);
         assert!(stdout_moved_once, "stdout moved twice");
         assert!(stderr_moved_once, "stderr moved twice");
         assert!(stdin_preserved, "moving a pipe closed stdin");
         assert!(stdin_unavailable, "closed stdin remained available");
-        assert_eq!(observation, Some(ExitObservation::Running));
+        assert_eq!(observation, ExitObservation::Running);
         assert_eq!(&out, b"eof-marker");
         assert_eq!(&err, b"err-marker");
         assert_eq!(stdout_eof, 0);
@@ -708,8 +719,6 @@ mod windows_tests {
             .1
             .take_stderr()
             .expect("stderr moves once");
-        let stdout = std::fs::File::from(stdout.into_owned_handle().expect("stdout owned handle"));
-        let stderr = std::fs::File::from(stderr.into_owned_handle().expect("stderr owned handle"));
         let mut leader = None;
         let mut tree = None;
         let (ready, error) =

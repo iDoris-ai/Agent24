@@ -3,15 +3,15 @@ use crate::target::OwnedPipes;
 #[cfg(unix)]
 pub(crate) type NativeStdin = std::process::ChildStdin;
 #[cfg(windows)]
-pub(crate) type NativeStdin = tokio::process::ChildStdin;
+pub(crate) type NativeStdin = std::io::PipeWriter;
 #[cfg(unix)]
 pub(crate) type NativeStdout = std::process::ChildStdout;
 #[cfg(windows)]
-pub(crate) type NativeStdout = tokio::process::ChildStdout;
+pub(crate) type NativeStdout = std::io::PipeReader;
 #[cfg(unix)]
 pub(crate) type NativeStderr = std::process::ChildStderr;
 #[cfg(windows)]
-pub(crate) type NativeStderr = tokio::process::ChildStderr;
+pub(crate) type NativeStderr = std::io::PipeReader;
 
 pub(crate) struct TargetPipes {
     stdin: Option<NativeStdin>,

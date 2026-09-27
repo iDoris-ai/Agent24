@@ -49,9 +49,7 @@ pub(crate) struct StderrDrainWorker {
 impl StderrDrainWorker {
     /// Move native stderr into the synchronous drain thread.
     ///
-    /// Unix stderr is already synchronous. On Windows, this consumes Tokio's
-    /// still-unpolled async handle immediately and turns its owned handle into
-    /// a `File`; it does not clone a raw handle or create a competing reader.
+    /// Both platforms provide a synchronous pipe reader.
     #[cfg(unix)]
     pub(crate) fn from_native_stderr(stderr: NativeStderr) -> Result<Self, WorkerSlotError> {
         Self::from_native_stderr_in(WorkerSlots::host(), stderr)
@@ -75,12 +73,7 @@ impl StderrDrainWorker {
         slots: &'static WorkerSlots,
         stderr: NativeStderr,
     ) -> Result<Self, WorkerSlotError> {
-        let file = std::fs::File::from(
-            stderr
-                .into_owned_handle()
-                .map_err(|error| WorkerSlotError::Spawn(error.kind()))?,
-        );
-        Self::new_in(slots, file)
+        Self::new_in(slots, stderr)
     }
 
     /// Start the one drain thread immediately.
@@ -447,23 +440,20 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[tokio::test]
-    async fn native_stderr_is_converted_before_sync_worker_reads() {
-        let mut child =
-            tokio::process::Command::new(crate::windows_test_io::windows_executable("cmd.exe"))
-                .args(["/C", "<nul 1>&2 set /p =native"])
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-        let stderr = child.stderr.take().unwrap();
+    #[test]
+    fn native_stderr_moves_directly_into_the_sync_worker_on_windows() {
+        let mut child = processkit::ProcessGroup::new()
+            .unwrap()
+            .spawn_isolated_piped(
+                processkit::IsolatedPipedCommand::new(crate::windows_test_io::windows_executable(
+                    "cmd.exe",
+                ))
+                .args(["/C", "<nul 1>&2 set /p =native"]),
+            )
+            .unwrap();
+        let stderr = child.take_pipes().unwrap().stderr;
         let mut worker = StderrDrainWorker::from_native_stderr(stderr).unwrap();
         let snapshot = terminal(&mut worker);
-        let status = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
-        if status.is_err() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-        let _status = status.expect("cmd.exe exit deadline").unwrap();
         assert_eq!(
             snapshot,
             StderrDrainSnapshot {
@@ -471,5 +461,17 @@ mod tests {
                 status: StderrDrainStatus::Eof
             }
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd.exe exit deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(status.success());
     }
 }
