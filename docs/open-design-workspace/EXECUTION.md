@@ -147,3 +147,10 @@ Luna 不独立改变已冻结架构。发现规格缺口时必须停止该工作
 - 当时尚未创建计划中的实现分支；
 - 当时尚未创建 Open Design 远端 fork；
 - 当时下一步是创建并实现 `feat/a24-capability-auth`。
+
+## 9. Upstream drift gate
+
+- 每 3 小时 fetch/check `origin/main`；每个新切片开工前和提交前也检查一次。
+- Published PR stacks 不 rebase/force-push；同步时从 root 起按依赖顺序 ordinary no-ff restack descendants。仅 unpublished local work 可 rebase。
+- 同步触发：相关文件/API 变化、main ahead 约 10 commits 或 3 天、N5/N7/N10、pre-merge。
+- 在独立 main-sync integration worktree 组合验证后，再继续对应工作线。
