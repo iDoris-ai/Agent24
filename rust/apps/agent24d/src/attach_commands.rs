@@ -42,6 +42,18 @@ use serde_json::{Map, Value, json};
 use crate::attach_registry::{CommandLookupError, CommandRefusal};
 use crate::server::AppState;
 
+/// Shared by both the step ② fail-fast pre-check and `reserve_ready`'s
+/// review-M1 re-check — same status/code/message either way, since from the
+/// caller's point of view "never declared" and "declared, then rotated away
+/// before we got to sending it" are indistinguishable.
+fn not_declared_response(name: &str, command: &str) -> Response {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        &format!("{name:?}'s manifest does not declare {command:?} in host_commands"),
+    )
+}
+
 /// §6.1: "body 是 JSON 对象且 ≤64 KiB" — independent of, and much smaller
 /// than, [`agent24_domain::http::MAX_BODY_BYTES`] (1 MiB), which
 /// [`read_body_or_response`] already enforces upstream of this check. A
@@ -58,6 +70,9 @@ pub async fn post_command(
     // Steps ①/②: an unknown module or an undeclared command must cost
     // nothing more than a map lookup, and an undeclared command must never
     // reach the module — `declared_command` never touches the connection.
+    // This is a cheap FAIL-FAST only (review M1) — `reserve_ready` below
+    // re-checks the declaration atomically with readiness, which is the
+    // check that actually matters if a rotation lands in between.
     if let Err(refusal) = state.attach_registry.declared_command(&name, &command) {
         return match refusal {
             CommandLookupError::UnknownModule => error_response(
@@ -65,11 +80,7 @@ pub async fn post_command(
                 "not_found",
                 &format!("no attached module named {name:?}"),
             ),
-            CommandLookupError::CommandNotDeclared => error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                &format!("{name:?}'s manifest does not declare {command:?} in host_commands"),
-            ),
+            CommandLookupError::CommandNotDeclared => not_declared_response(&name, &command),
         };
     }
 
@@ -103,11 +114,14 @@ pub async fn post_command(
         );
     }
 
-    // Step ④ + the in-flight cap: reserved atomically with the readiness
-    // check by `reserve_ready` (one registry-lock acquisition) — see its own
-    // doc for why that atomicity matters.
-    let slot = match state.attach_registry.reserve_ready(&name) {
+    // Step ④ + the in-flight cap (review M1): reserved atomically with a
+    // FRESH declaration check and the readiness check by `reserve_ready`
+    // (one registry-lock acquisition) — see its own doc for why that
+    // atomicity is what actually enforces §6.1 step ② against a rotation
+    // racing this request, not the pre-check above.
+    let slot = match state.attach_registry.reserve_ready(&name, &command) {
         Ok(slot) => slot,
+        Err(CommandRefusal::NotDeclared) => return not_declared_response(&name, &command),
         Err(CommandRefusal::NotReady) => {
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -150,10 +164,18 @@ pub async fn post_command(
         ),
         // §6.1: "未写出（连接已断/代已撤销）" — sent nowhere, so unlike
         // `ConnectionLost` this outcome IS known: the module never saw it.
+        // Two distinct causes collapse to the same status/code here (the
+        // wire itself gives `call()` no way to tell them apart, and neither
+        // should it need to — both mean "try again, nothing happened"):
+        // the connection/generation was already closed (registry revoke,
+        // review M2's `close()`), or the module is not draining its queue
+        // fast enough (`out_tx`'s bounded channel is full) — hence "module
+        // busy" rather than flatly claiming the connection ended.
         Err(KernelCallFailed::NotSent) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "module_not_ready",
-            "the connection ended before the command could be sent",
+            "the command was never sent — the module is busy (queue full) or the connection \
+             already ended",
         ),
         Err(KernelCallFailed::Rpc(e)) => {
             module_error_response(Some(e.code), e.kind.map(ErrorKind::as_str), &e.message)
@@ -264,6 +286,7 @@ mod tests {
                 manifest_digest: "sha256:deadbeef",
                 token_sha256_hex: &"ab".repeat(32),
                 token_id: "tok_1",
+                disabled: false,
             });
         let big = "x".repeat(MAX_COMMAND_BODY_BYTES + 1);
         let oversized = Request::builder()
@@ -299,6 +322,7 @@ mod tests {
                 manifest_digest: "sha256:deadbeef",
                 token_sha256_hex: &"ab".repeat(32),
                 token_id: "tok_1",
+                disabled: false,
             });
         let array_body = Request::builder()
             .method("POST")
@@ -333,6 +357,7 @@ mod tests {
                 manifest_digest: "sha256:deadbeef",
                 token_sha256_hex: &"ab".repeat(32),
                 token_id: "tok_1",
+                disabled: false,
             });
 
         let undeclared = post_command(
