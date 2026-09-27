@@ -218,7 +218,7 @@ pub(crate) fn is_reserved_kernel_segment(name: &str) -> bool {
 /// Adapts the daemon's WS hub to the contract's transport. Only the kernel builds
 /// one of these, which is what makes a module's sink reach real subscribers —
 /// see the trust model in `agent24_domain`.
-struct HubBroadcast(crate::events::EventsHub);
+pub(crate) struct HubBroadcast(pub(crate) crate::events::EventsHub);
 
 impl EventBroadcast for HubBroadcast {
     fn send(&self, body: EventBody) {
@@ -1030,6 +1030,42 @@ pub async fn mount_all(
         }
     }
 
+    // A3-2b (`docs/design/A3-ATTACHED-MODULE.md` §5.4): "与 spawn 互斥：...
+    // `mount_all` 遇到与附着注册同名的包 → `MountOutcome::Refused`". A name is
+    // one identity, claimed by whichever form registers it first — a package
+    // discovered on disk (or compiled in) under a name `attached.json`
+    // already owns is refused here, the mirror of `POST /api/v1/attached`'s
+    // own 409 for the opposite direction (`crate::attached_routes`). Read
+    // once per pass (cheap: `attached.json` is small and local), not
+    // threaded through as a parameter — same shape as `RESERVED_KERNEL_SEGMENTS`
+    // just below, a fixed set this pass checks every catalogue entry against.
+    // "Cannot read" and "genuinely empty" are kept apart on purpose (pre-PR
+    // review D1): a MISSING file (`config_path()` finding nothing to open,
+    // or `list()`'s own "not found" case) is the true empty registry — see
+    // `crate::attached::list`'s doc. A file that EXISTS but fails to parse is
+    // different: silently treating that as "nothing attached" would let a
+    // package steal a name this daemon actually has a live attach
+    // registration for, the exact contamination this check exists to
+    // prevent. So a read failure here is loud (an error, not silently
+    // swallowed) and conservative would-be entries are simply not exempted —
+    // `attached_names` stays whatever it already was (empty, on the first
+    // failure), which matches this pass's existing behaviour for a missing
+    // file and is no worse than A3-2b not existing at all for this one boot.
+    let attached_names: BTreeSet<String> = match crate::attached::config_path() {
+        Some(path) => match crate::attached::list(&path) {
+            Ok(views) => views.into_iter().map(|v| v.name).collect(),
+            Err(e) => {
+                tracing::error!(
+                    "could not read {path:?} to check for attached-module name clashes ({e}); \
+                     proceeding as if none are registered — a package that happens to share a \
+                     live attach registration's name will NOT be refused this boot"
+                );
+                BTreeSet::new()
+            }
+        },
+        None => BTreeSet::new(),
+    };
+
     for entry in catalogue {
         let name = entry.name.clone();
         let version = entry.version.clone();
@@ -1103,6 +1139,10 @@ pub async fn mount_all(
                 ),
                 &mut reports,
             );
+            continue;
+        }
+        if attached_names.contains(&name) {
+            refuse("registered as an attached module".to_owned(), &mut reports);
             continue;
         }
 
@@ -1373,8 +1413,14 @@ struct MountTarget {
 /// design §5.1), never a freshly built one. `_a24/events/emit`'s own `limiter`
 /// is the deliberate contrast: built INSIDE the closure, so a restart always
 /// gets a full bucket.
+///
+/// `pub(crate)`, not private: `crate::attach_registry` (A3-2b) builds an
+/// attached module's `Methods` the same way a mounted package's are built —
+/// the closure this returns is agnostic to WHICH kind of `Generation` it is
+/// handed (`Process` or `Attached`), so there is no reason for A3 to grow a
+/// second copy.
 #[allow(clippy::too_many_arguments)]
-fn build_methods_for(
+pub(crate) fn build_methods_for(
     name: String,
     granted: Grants,
     event_sink: Option<Arc<EventSink>>,

@@ -302,6 +302,7 @@ dependencies = [
  "fs2",
  "futures",
  "http-body-util",
+ "libc",
  "rand 0.9.5",
  "rustix 0.38.44",
  "serde",
