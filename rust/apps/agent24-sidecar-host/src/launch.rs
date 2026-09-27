@@ -594,9 +594,11 @@ mod windows_tests {
         let output = tokio::time::timeout(Duration::from_secs(5), async move {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
+            let mut stdout_pipe = stdout_pipe.take(4096);
+            let mut stderr_pipe = stderr_pipe.take(4096);
             let (stdout_result, stderr_result) = tokio::join!(
-                stdout_pipe.take(4096).read_to_end(&mut stdout),
-                stderr_pipe.take(4096).read_to_end(&mut stderr),
+                stdout_pipe.read_to_end(&mut stdout),
+                stderr_pipe.read_to_end(&mut stderr),
             );
             stdout_result?;
             stderr_result?;
@@ -725,7 +727,7 @@ mod windows_tests {
         .await;
         reap(&mut launch);
         let (ready, leader, tree) = lifecycle.expect("bounded ready read and Job cleanup");
-        assert_eq!(ready, b"ready");
+        assert_eq!(&ready, b"ready");
         assert!(matches!(leader, ExitObservation::Exited { .. }));
         assert_eq!(tree, TreeObservation::Present);
     }
