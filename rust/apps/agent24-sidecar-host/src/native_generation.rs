@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::{
     actor::{Deadlines, Phase},
     control_worker::ControlWorker,
-    generation_driver::GenerationDriver,
+    generation_driver::{GenerationDriver, SessionEnd},
     launch::OwnedLaunch,
     launch_order::{ActorLaunchOrder, ActorLaunchOrderError, ScheduleState},
     output_worker::OutputWorker,
@@ -162,6 +162,10 @@ impl<'host> NativeGeneration<'host> {
 
     pub(crate) fn schedule_state(&self) -> ScheduleState {
         self.driver.schedule_state()
+    }
+
+    pub(crate) const fn session_end(&self) -> Option<SessionEnd> {
+        self.driver.session_end()
     }
 
     pub(crate) fn stderr_snapshot(&mut self) -> StderrDrainSnapshot {
