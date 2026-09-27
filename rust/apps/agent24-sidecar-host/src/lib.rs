@@ -60,6 +60,9 @@ pub use owner::{GenerationId, GenerationOwner, OwnedPipes, OwnedProcess};
 #[allow(dead_code)]
 pub(crate) mod target;
 
+#[cfg(test)]
+mod native_harness_tests;
+
 /// Run the host process.
 pub fn run() -> std::io::Result<()> {
     // The stdio actor and protocol dispatch are introduced in a later slice.
