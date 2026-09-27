@@ -197,6 +197,7 @@ dependencies = [
 name = "agent24-protocol"
 version = "0.3.0"
 dependencies = [
+ "chrono",
  "fs2",
  "hex",
  "schemars",
@@ -233,6 +234,7 @@ version = "0.3.0"
 dependencies = [
  "agent24-core",
  "agent24-protocol",
+ "chrono",
  "serde",
  "serde_json",
  "sha2",
@@ -273,6 +275,14 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "agent24-workspace"
+version = "0.1.0"
+dependencies = [
+ "rustix 0.38.44",
+ "tempfile",
 ]
 
 [[package]]
