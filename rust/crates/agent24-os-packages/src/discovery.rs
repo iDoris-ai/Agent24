@@ -44,17 +44,11 @@ pub struct Discovered {
 }
 
 /// `sha256:` and the lowercase hex of `bytes`: the manifest digest format.
-#[must_use]
-pub fn manifest_digest(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(bytes);
-    let mut out = String::with_capacity(7 + 64);
-    out.push_str("sha256:");
-    for b in hash {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
+///
+/// ME4-S3 §4.4 (M4): moved into `agent24_os_proto::manifest`, so the
+/// kernel's discovery and a module's handshake share one function; this
+/// re-export keeps every existing call site in this crate unchanged.
+pub use agent24_os_proto::manifest::manifest_digest;
 
 /// Why one directory under the packages root did not become a [`Discovered`].
 ///

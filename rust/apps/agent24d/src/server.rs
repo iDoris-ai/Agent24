@@ -89,6 +89,12 @@ pub struct AppState {
     pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
+    /// ME4-1.3.1: the module deliverer `KernelTrigger`'s `Module` arm calls.
+    /// Kept here (not only inside `KernelTrigger`, which `AppState` cannot
+    /// see through its type-erased `Arc<dyn RunTrigger>`) so `serve` can call
+    /// `set_supervisors` on the SAME instance right after `mount_all` returns
+    /// (design §4.6).
+    pub deliverer: Arc<crate::scheduler_deliver::ModuleDeliverer>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
     /// McpServer kills its child process, which would silently break every tool
     /// it contributed. Never read on purpose — its job is to exist (M-E/E1b).
@@ -293,37 +299,74 @@ impl crate::domain::ModelInventory for ModelCatalog {
     }
 }
 
-/// Adapts the run manager to the scheduler's `RunTrigger` — a fired schedule
-/// becomes a background run tagged with the schedule id.
-struct RunManagerTrigger {
+/// Adapts the run manager and the module deliverer to the scheduler's
+/// `RunTrigger` (design `docs/design/ME4-S1-scheduler-callback.md` §3.3) — a
+/// fired schedule becomes either a background run tagged with the schedule
+/// id (`AgentRun`) or a real kernel request into the module's live
+/// `Generation` (`Module`, ME4-1.3.1).
+///
+/// Named `KernelTrigger` (not `RunManagerTrigger`, its ME4-1.2.2b2/b3 working
+/// name) because it now speaks for BOTH arms of the kernel's own trigger
+/// interface, not just `RunManager`: the `AgentRun` arm is the original
+/// `RunManagerTrigger` body, byte-identical, wrapped to classify into
+/// `FireOutcome` (`Ok(run_id)` -> `AgentRun`, `Err(e)` -> `Failed`). The
+/// `Module` arm delegates to `ModuleDeliverer` (`scheduler_deliver.rs`), which
+/// is `Deferred(MountPending)` for every fire until `server::serve` calls
+/// `ModuleDeliverer::set_supervisors` right after `mount_all` returns (design
+/// §4.6) — never a failure either way (§4.1: none of `DeferReason`'s variants
+/// are the module's fault). Only the DELIVERY PUMP
+/// (`agent24_scheduler::deliveries::DeliveryPump`) ever calls this arm for a
+/// module row — the tick itself never does (design §3.2).
+struct KernelTrigger {
     runs: Arc<agent24_agent::RunManager>,
+    deliverer: Arc<crate::scheduler_deliver::ModuleDeliverer>,
 }
 
 #[async_trait::async_trait]
-impl agent24_scheduler::RunTrigger for RunManagerTrigger {
+impl agent24_scheduler::RunTrigger for KernelTrigger {
     async fn trigger(
         &self,
-        action: &agent24_protocol::ScheduleAction,
-        schedule_id: &str,
-    ) -> Result<String, String> {
-        let agent24_protocol::ScheduleAction::AgentRun {
-            prompt,
-            session_id,
-            model_override,
-        } = action;
-        let create = agent24_protocol::RunCreate {
-            session_id: session_id.clone(),
-            prompt: prompt.clone(),
-            model_override: model_override.clone(),
-            // Scheduled runs are unattended — plan mode needs a human to approve
-            // the plan, so a fired schedule always runs Normal.
-            mode: agent24_protocol::RunMode::Normal,
-        };
-        self.runs
-            .start_run_with_schedule(create, Some(schedule_id.to_owned()))
-            .await
-            .map(|run| run.id)
-            .map_err(|err| err.to_string())
+        invocation: &agent24_scheduler::ScheduleInvocation,
+    ) -> agent24_scheduler::FireOutcome {
+        match &invocation.target {
+            agent24_scheduler::InvocationTarget::AgentRun(action) => {
+                let agent24_protocol::ScheduleAction::AgentRun {
+                    prompt,
+                    session_id,
+                    model_override,
+                } = action;
+                let create = agent24_protocol::RunCreate {
+                    session_id: session_id.clone(),
+                    prompt: prompt.clone(),
+                    model_override: model_override.clone(),
+                    // Scheduled runs are unattended — plan mode needs a human
+                    // to approve the plan, so a fired schedule always runs
+                    // Normal.
+                    mode: agent24_protocol::RunMode::Normal,
+                };
+                match self
+                    .runs
+                    .start_run_with_schedule(create, Some(invocation.schedule_id.clone()))
+                    .await
+                {
+                    Ok(run) => agent24_scheduler::FireOutcome::AgentRun { run_id: run.id },
+                    Err(err) => agent24_scheduler::FireOutcome::Failed {
+                        reason: err.to_string(),
+                    },
+                }
+            }
+            agent24_scheduler::InvocationTarget::Module { owner, fire_id } => {
+                self.deliverer
+                    .deliver(
+                        owner,
+                        fire_id,
+                        invocation.trigger.as_str(),
+                        &agent24_scheduler::next_fire::fmt_iso(invocation.scheduled_for),
+                        &agent24_scheduler::next_fire::fmt_iso(invocation.fired_at),
+                    )
+                    .await
+            }
+        }
     }
 }
 
@@ -501,10 +544,14 @@ impl AppState {
             memory,
         );
         let sched_hub = events.clone();
+        let deliverer = StdArc::new(crate::scheduler_deliver::ModuleDeliverer::new(
+            crate::scheduler_deliver::PRODUCTION_LIMITS,
+        ));
         let scheduler = agent24_scheduler::Scheduler::new(
             store.clone(),
-            StdArc::new(RunManagerTrigger {
+            StdArc::new(KernelTrigger {
                 runs: Arc::clone(&runs),
+                deliverer: StdArc::clone(&deliverer),
             }),
             StdArc::new(move |body| sched_hub.broadcast(body)),
         );
@@ -545,6 +592,7 @@ impl AppState {
             )),
             runs,
             scheduler,
+            deliverer,
             shutdown,
         }
     }
@@ -564,7 +612,7 @@ impl AppState {
     }
 }
 
-pub use agent24_domain::http::error_response;
+pub use agent24_domain::http::{error_response, error_response_with_hint};
 
 async fn health() -> Json<Health> {
     Json(Health {
@@ -712,6 +760,14 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route(
             "/api/v1/schedules/{id}/run_now",
             axum::routing::post(crate::schedules::run_now),
+        )
+        .route(
+            "/api/v1/schedules/{id}/suspend",
+            axum::routing::post(crate::schedules::suspend_schedule),
+        )
+        .route(
+            "/api/v1/schedules/{id}/resume",
+            axum::routing::post(crate::schedules::resume_schedule),
         )
         .route("/api/v1/events", get(crate::events::ws_events))
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
@@ -1020,21 +1076,12 @@ pub async fn serve(
         tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
     }
 
-    // Scheduler tick loop: polls due schedules and fires runs. Cadence from
-    // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
-    // minute, so a few seconds' latency is invisible).
-    let tick_secs = std::env::var("A24_SCHEDULER_TICK_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(10);
-    let scheduler = Arc::clone(&state.scheduler);
-    let sched_cancel = cancel.clone();
-    tokio::spawn(scheduler.run(
-        StdArc::new(agent24_scheduler::SystemClock),
-        Duration::from_secs(tick_secs),
-        sched_cancel,
-    ));
+    // ME4-1.3.1 (design §3.2/§4.6, S1-6): the scheduler's tick loop AND
+    // delivery pump are spawned AFTER `mount_all` returns, below — not here.
+    // Before `mount_all` there is no `ProcessHost`/`Supervisors` for a module
+    // fire to be delivered into, and no `InstalledOwners` catalogue for the
+    // tick to gate delivery-row recording on; starting either loop first
+    // would let a tick land on a module row before either exists.
 
     // T7b/ME-3e: the periodic module-approval timeout scan (design doc
     // decision 5) — a plain periodic task, not a per-row timer, on the same
@@ -1048,44 +1095,17 @@ pub async fn serve(
     // naming its components is not the coupling ADR-029 objects to. Everything
     // downstream — routing, the data directory, the event module, the capability
     // grant — is derived from the manifest, so `crate::domain` and
-    // `build_router_with_modules` still contain no Sin90-shaped branch. A second
-    // OS is another entry in the CATALOGUE below — each with its own builder, which
-    // the mounter calls only if that module is admissible and enabled, so one that
+    // `build_router_with_modules` still contain no module-shaped branch. An OS is
+    // another entry in the CATALOGUE below — each with its own builder, which the
+    // mounter calls only if that module is admissible and enabled, so one that
     // fails to construct cannot stop the others.
-    let mode = if ephemeral {
-        // Ephemeral daemons get an in-memory store and NO migration: they are
-        // private to one CLI invocation and must not touch the user's database.
-        agent24_sin90_os::StorageMode::Memory
-    } else {
-        // Pre-ME-1b daemons kept Sin90 at `~/.agent24/sin90.db`. Handing that path
-        // over as `legacy` is what stops an upgrading user from opening a
-        // brand-new empty Sin90 while their real data sits one directory up; the
-        // copy itself is a SQLite snapshot, not a file move (see
-        // `Sin90Store::open_migrating_from`).
-        agent24_sin90_os::StorageMode::Persistent {
-            legacy: Some(state_dir.join("sin90.db")),
-        }
-    };
-    // The CATALOGUE — what this build provides — comes first, and deliberately
-    // does NOT construct anything. Constructing before consulting the registry
-    // creates a trap: a module that panics or fails in its constructor takes the
-    // daemon down (or vanishes from the reports), and `agent24 os disable` cannot
-    // rescue it because the name it needs was never registered. Naming what we
-    // have, then deciding what to build, means a switched-off module is never
-    // constructed at all — which is exactly what a user reaching for `disable`
-    // needs.
-    let catalogue = vec![crate::domain::Installed {
-        name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
-        version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-        // A CLOSURE, not a constructed module: the mounter decides whether this
-        // ever runs. That is what lets a user switch off a domain OS whose
-        // constructor is the thing breaking the daemon.
-        build: crate::domain::Build::InProcess(Box::new(move || {
-            agent24_sin90_os::Sin90Module::new(mode.clone())
-                .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
-                .map_err(|e| e.to_string())
-        })),
-    }];
+    //
+    // T11: this build compiles in no domain OS at all — Sin90 (the one that used
+    // to live here as `agent24-sin90-os`) now ships from `iDoris-ai/Sin90` as an
+    // out-of-process package, discovered below by `with_discovered` like any
+    // other third-party OS, not hardcoded into this catalogue. A future
+    // compiled-in OS is still just another entry in this `Vec`.
+    let catalogue: Vec<crate::domain::Installed> = Vec::new();
 
     // ME-3a: the catalogue is no longer only what was compiled in. The merge is a
     // free function so it can be tested without standing up a daemon — see
@@ -1125,8 +1145,8 @@ pub async fn serve(
     // information, never wrong information). Neither can change what mounts.
     // A model declaration lives in a manifest, and reading a manifest means
     // constructing the module — which is exactly what the catalogue exists to
-    // avoid. So the probe is skipped: no module in this build declares one (Sin90
-    // declares none), and paying a multi-provider network sweep at every startup to
+    // avoid. So the probe is skipped: this build compiles in no domain OS at all
+    // (T11), and paying a multi-provider network sweep at every startup to
     // discover that would be worse than the `Unknown` it would avoid.
     //
     // This is a CONSTANT, not a predicate, and deliberately so — writing a
@@ -1274,6 +1294,24 @@ pub async fn serve(
             }
         }
     });
+    // ME4-4.2.3b (design §6.3): the production usage sink. `hard_stop`
+    // mirrors `modules_cut_off()`'s own shape — the shutdown token cancelled,
+    // then the SAME `deadlines().modules` instant (cut-off + `CONFIRM`) —
+    // rather than reusing `modules_cut_off()` itself: that future is a fresh
+    // "began" read the FIRST time it's polled, and this recorder's hard stop
+    // must line up with `stop_usage_writer`'s own `deadlines().modules` call
+    // below, not with whenever this particular future happens to be polled.
+    // `deadlines()` itself is idempotent (`Shutdown::began` is a `OnceLock`),
+    // so both reads agree regardless.
+    let usage_hard_stop = {
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown.token().cancelled().await;
+            tokio::time::sleep_until(shutdown.deadlines().modules).await;
+        }
+    };
+    let (usage_recorder, usage_writer) =
+        crate::usage_recorder::UsageRecorder::spawn(state.store.clone(), usage_hard_stop);
     let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
@@ -1283,8 +1321,83 @@ pub async fn serve(
         lease.as_ref(),
         host.as_ref().map_err(String::as_str),
         &state.module_approval_broker,
+        crate::domain::CallbackDeps {
+            scheduler: state.scheduler.clone(),
+            // ME4-4.2.2b2 (design §2.4/§10.1): `router` is the SAME kernel
+            // router `/api/v1/chat` uses — each grant takes its own
+            // `with_separate_health()` view of it (v2 H2), never routing
+            // through it directly. `cancel_root` fires at
+            // `modules_cut_off()`, not at the start of shutdown (§3.3): a
+            // module's in-flight inference lives exactly as long as its own
+            // drain allows. ME4-4.2.3b: the usage sink is now the real
+            // `UsageRecorder` — `serve` waits for its writer below, AFTER the
+            // supervisors have stopped, via `stop_usage_writer`. Cloned (not
+            // moved) here: `serve` keeps its own `usage_recorder` binding
+            // alive to pass to `stop_usage_writer` later — that function
+            // itself is what drops the LAST reference, right before it
+            // awaits the writer's join (its own doc comment explains why
+            // that ordering matters).
+            models: Some(crate::model_callback::ModelCallbackDeps {
+                router: state.router.clone(),
+                usage: usage_recorder.clone(),
+                cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
+                admission: crate::model_callback::ModelAdmission::new(
+                    crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+                    crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+                ),
+            }),
+        },
     )
     .await;
+
+    // ME4-1.3.1 (design §4.6): right after `mount_all` returns — before the
+    // tick loop or the delivery pump ever run — set the two handles they and
+    // `KernelTrigger`'s `Module` arm depend on.
+    //
+    // `InstalledOwners` gets every name `mount_all` was given (mounted,
+    // disabled in os.json, refused — anything the catalogue discovered), NOT
+    // only what mounted successfully (design v2, M5): a disabled entry is
+    // still "installed" and its schedules must keep pre-advancing even though
+    // no delivery row is recorded for them.
+    state
+        .scheduler
+        .installed_owners()
+        .set(catalogue.iter().map(|entry| entry.name.clone()).collect());
+    // `host` being `Err` means this daemon cannot start out-of-process
+    // modules at all (design §4.6, v2 L5): the deliverer's `OnceLock` is left
+    // unset, so every module fire stays `Deferred(MountPending)` until its
+    // 24h TTL — the tick loop below still starts unconditionally, so AgentRun
+    // rows are unaffected.
+    if let Ok(h) = &host {
+        state.deliverer.set_supervisors(h.supervisors.clone());
+    }
+
+    // Scheduler tick loop: polls due schedules, pre-advances, and fires
+    // AgentRun rows / records module deliveries. Cadence from
+    // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
+    // minute, so a few seconds' latency is invisible).
+    let tick_secs = std::env::var("A24_SCHEDULER_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(10);
+    let tick_scheduler = Arc::clone(&state.scheduler);
+    let tick_cancel = cancel.clone();
+    tokio::spawn(tick_scheduler.run(
+        StdArc::new(agent24_scheduler::SystemClock),
+        Duration::from_secs(tick_secs),
+        tick_cancel,
+    ));
+    // ME4-1.3.1 (design §5.4): the delivery pump — independent of the tick,
+    // its own cadence, driven by the same real clock. Cancelled by the SAME
+    // `CancellationToken` the tick loop uses: on shutdown, an attempt still in
+    // flight is aborted (its `JoinSet` is dropped) rather than awaited, and
+    // its delivery row is left `pending`/`deferred` for the next start
+    // (design §4.6/§5.4, judgement C4.12).
+    let pump = agent24_scheduler::deliveries::DeliveryPump::new(Arc::clone(&state.scheduler));
+    let pump_cancel = cancel.clone();
+    tokio::spawn(pump.run(StdArc::new(agent24_scheduler::SystemClock), pump_cancel));
+
     for p in partitions.partitions() {
         tracing::info!(
             "domain OS {} was lent a memory partition for user {}",
@@ -1387,6 +1500,12 @@ pub async fn serve(
     // round 4). Checked again, atomically, before the ready line below.
     if cancel.is_cancelled() {
         let _ = stopping.await;
+        crate::usage_recorder::stop_usage_writer(
+            usage_recorder,
+            usage_writer,
+            shutdown.deadlines().modules,
+        )
+        .await;
         return Ok(());
     }
 
@@ -1402,6 +1521,8 @@ pub async fn serve(
                 token: token.clone(),
                 pid: daemon_pid,
                 version: env!("CARGO_PKG_VERSION").to_owned(),
+                generation: String::new(),
+                auth_mode: agent24_protocol::state_file::AuthMode::LegacySingleToken,
             })
     {
         tracing::warn!("could not write daemon state file: {err}");
@@ -1416,6 +1537,12 @@ pub async fn serve(
             agent24_protocol::state_file::remove_if_owner(daemon_pid);
         }
         let _ = stopping.await;
+        crate::usage_recorder::stop_usage_writer(
+            usage_recorder,
+            usage_writer,
+            shutdown.deadlines().modules,
+        )
+        .await;
         return Ok(());
     }
     println!(
@@ -1451,6 +1578,19 @@ pub async fn serve(
     // either way. The wait is bounded by the task itself.
     shutdown.request();
     let _ = stopping.await;
+    // ME4-4.2.3b (design §6.3/v3.1 M-2, J19): AFTER the out-of-process
+    // supervisors have stopped — every in-flight call's outcome (including
+    // ones the cut-off itself cancelled) has by now either reached the
+    // recorder's channel or never will — wait for the writer to drain it,
+    // up to the SAME `deadlines().modules` instant its own hard stop uses.
+    // Skipping this call, or not awaiting it, is exactly the bug J19 exists
+    // to catch: a record queued but never written before the process exits.
+    crate::usage_recorder::stop_usage_writer(
+        usage_recorder,
+        usage_writer,
+        shutdown.deadlines().modules,
+    )
+    .await;
     // Only remove our own state file — a newer daemon may have replaced it
     if !ephemeral {
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
@@ -1635,6 +1775,115 @@ fn with_discovered(
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    // ---- ME4-4.2.2b2 H1 (Opus review round on top of `bb6fb0e`) -------------
+
+    /// A real end-to-end daemon test
+    /// (`apps/agent24d/tests/me4_model_shutdown_wiring.rs`) empirically
+    /// CANNOT reliably pin this one line: `Shutdown::request()` also revokes
+    /// the module's `Generation` as part of stopping it — design
+    /// §3.3's OWN "代次撤销" row, pre-existing `os-proto` machinery that
+    /// independently cancels an in-flight model call within tens of
+    /// milliseconds of the SAME `spawn_cancel_root(shutdown.modules_cut_off())`
+    /// cut-off. Measured with a real subprocess module (SIGTERM-ignoring, one
+    /// proxied request kept in flight so its own drain doesn't finish early)
+    /// and a real hung TCP provider: correct code closes the provider
+    /// connection ~630–670ms after `POST /api/v1/shutdown`; wiring the cancel
+    /// root to `CancellationToken::new()` (never fires) still closes it at
+    /// ~670–760ms via the OTHER path — overlapping ranges, not a reliable
+    /// red/green signal for CI. This structural test is the deterministic
+    /// fallback the design's own review round asked for when the daemon-level
+    /// test can't be made to pin it: it pins the EXACT call, so a mutation to
+    /// either half — the constructor (`CancellationToken::new()` instead of
+    /// `spawn_cancel_root`) or the argument (anything other than
+    /// `shutdown.modules_cut_off()`, e.g. `shutdown.token().cancelled()` to
+    /// fire at the START of shutdown instead of at cut-off) — turns it red.
+    #[test]
+    fn the_model_callback_cancel_root_is_spawned_from_modules_cut_off() {
+        // Scoped to `serve()`'s OWN body — never to the whole file, which
+        // would make this test tautological (the string above, in this
+        // test's own source, would always make a whole-file `.contains`
+        // pass regardless of what `serve()` actually does). Same technique
+        // as `module_routes_are_behind_kernel_auth`'s sibling
+        // `build_router_with_modules` scan below: find the function, cut at
+        // the first column-zero `}` (every brace inside a rustfmt'd function
+        // body is indented).
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function must be brace-terminated");
+        let body = &body[..end];
+        assert!(
+            body.contains("spawn_cancel_root(shutdown.modules_cut_off())"),
+            "serve() must build ModelCallbackDeps.cancel_root as \
+             spawn_cancel_root(shutdown.modules_cut_off()) — design \
+             docs/design/ME4-S2-model-callback.md §3.3"
+        );
+    }
+
+    // ---- ME4-4.2.3b (design §6.3/v3.1 M-2, J19 variant 2a) -------------------
+
+    /// J19's structural half: `stop_usage_writer` must be called from
+    /// `serve()`'s MAIN shutdown path (the one every real shutdown takes)
+    /// strictly AFTER `let _ = stopping.await;` — the point at which the
+    /// out-of-process supervisors have finished stopping, so every in-flight
+    /// call's outcome (including ones the cut-off cancelled) has already
+    /// either reached the recorder's channel or never will. Calling it
+    /// earlier would race the very cancellations it exists to wait out; not
+    /// calling it at all is the bug this test exists to catch.
+    ///
+    /// Review, M1: two hardenings over the original version of this test —
+    /// (a) `//`-comment lines are stripped from the scanned source FIRST, so
+    /// commenting the call out (and `drop`-ping the values it would have
+    /// consumed, to keep the function compiling) does not fool a plain
+    /// substring search; (b) the match is the FULL call with its exact
+    /// arguments, not just the bare function name, so swapping in a
+    /// differently-shaped call (wrong argument, wrong order) also turns this
+    /// red. Mutation verified: replacing the real call with
+    /// `// crate::usage_recorder::stop_usage_writer(...)` plus
+    /// `drop(usage_recorder); drop(usage_writer);` turns this red; reverting
+    /// turns it green again.
+    #[test]
+    fn stop_usage_writer_is_called_after_the_supervisors_have_stopped() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function must be brace-terminated");
+        let body = &body[..end];
+        // Strip `//`-comments line by line (this scans ONLY `serve`'s own
+        // source, which has no `//` inside a string literal near this area,
+        // so a naive split is safe here) — a commented-out call must be
+        // invisible to the search below.
+        let code_only: String = body
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Unique to the main shutdown path — the two early-return copies
+        // (during startup) never call `shutdown.request()` right before
+        // their own `stopping.await`.
+        let stopping_at = code_only
+            .find("shutdown.request();\n    let _ = stopping.await;")
+            .expect("the main shutdown path must request, then wait for stopping");
+        let after = &code_only[stopping_at..];
+        // The exact rustfmt shape of the real call (verified against the
+        // source at the time this test was written — a reformat that keeps
+        // the same call would need this literal updated too, which is the
+        // point: it is not just checking the function name).
+        let exact_call = "crate::usage_recorder::stop_usage_writer(\n        usage_recorder,\n        \
+                           usage_writer,\n        shutdown.deadlines().modules,\n    )\n    .await;";
+        assert!(
+            after.contains(exact_call),
+            "serve()'s main shutdown path must call \
+             crate::usage_recorder::stop_usage_writer(usage_recorder, usage_writer, \
+             shutdown.deadlines().modules).await AFTER `let _ = stopping.await;` — design \
+             docs/design/ME4-S2-model-callback.md §6.3/v3.1 M-2"
+        );
+    }
 
     // ---- ME-3a: the wiring itself, not just the scanner ---------------------
 
@@ -1836,54 +2085,6 @@ pub(crate) mod tests {
         state_with_guardian(None).await
     }
 
-    /// A router with Sin90 mounted AS A DOMAIN OS — through `mount_all`, exactly
-    /// like `serve` does it.
-    ///
-    /// The SPIKE-00 tests below deliberately still go over HTTP rather than
-    /// calling the store: their job is to show that moving Sin90 behind
-    /// `DomainModule` left the HEALTHY surface unchanged — same paths, same
-    /// statuses, same bodies, and `proposal.applied` still reaching the kernel's
-    /// bus with the right module and kind. What DID change is the unavailable
-    /// surface: a degraded module now answers 503 for every path and method under
-    /// its namespace, where the old inline guard produced 503 only on its own
-    /// routes and left 404/405 for the rest.
-    ///
-    /// The `TempDir` is returned so the caller can hold it. With the in-memory
-    /// store it is only the (empty) directory the mounter creates, so dropping it
-    /// would not break anything today — but a test that switches to `Persistent`
-    /// would silently lose its database the moment the handle went out of scope.
-    async fn router_with_sin90() -> (Router, tempfile::TempDir) {
-        router_with_sin90_mode(agent24_sin90_os::StorageMode::Memory).await
-    }
-
-    async fn router_with_sin90_mode(
-        mode: agent24_sin90_os::StorageMode,
-    ) -> (Router, tempfile::TempDir) {
-        let st = state().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let entry = crate::domain::Installed {
-            name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
-            version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-            build: crate::domain::Build::InProcess(Box::new(move || {
-                agent24_sin90_os::Sin90Module::new(mode.clone())
-                    .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
-                    .map_err(|e| e.to_string())
-            })),
-        };
-        let (modules, _, _) = crate::domain::mount_all(
-            &[entry],
-            tmp.path(),
-            &st.events,
-            Ok(&crate::os_config::OsConfig::default()),
-            &NoModels,
-            None,
-            Err("no process host in this test"),
-            &test_approval_broker(&st.events).await,
-        )
-        .await;
-        (build_router_with_modules(st, modules), tmp)
-    }
-
     async fn state_with_guardian(
         guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     ) -> AppState {
@@ -2035,6 +2236,10 @@ pub(crate) mod tests {
             None,
             Err("no process host in this test"),
             &test_approval_broker(&st.events).await,
+            crate::domain::CallbackDeps {
+                scheduler: st.scheduler.clone(),
+                models: None,
+            },
         )
         .await;
         assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);
@@ -2532,364 +2737,129 @@ pub(crate) mod tests {
         assert!(reg.tool_requires_approval("shell_exec"));
     }
 
-    // SPIKE-00 end-to-end through the router: create a direction + a 120-min
-    // block, complete it, and read the attention reconciliation back — the HTTP
-    // link computes 120. (The *purity* of the replay — unaffected by later edits
-    // — is proven in agent24-sin90-store's `attention_replay_is_pure_snapshot`.)
-    #[tokio::test]
-    async fn sin90_spike00_loop_over_router() {
-        let (router, _os_dir) = router_with_sin90().await;
+    // ── ME4-1.2.2b (top-level cut): KernelTrigger, review H1 ─────────────────
 
-        async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
-            router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(uri)
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
+    fn kernel_trigger_for_tests(runs: Arc<agent24_agent::RunManager>) -> KernelTrigger {
+        KernelTrigger {
+            runs,
+            // Unset `ModuleDeliverer` — every module fire this trigger sees
+            // in these tests is `Deferred(MountPending)` (design §4.6), same
+            // as before ME4-1.3.1 wired a real deliverer behind it.
+            deliverer: Arc::new(crate::scheduler_deliver::ModuleDeliverer::new(
+                crate::scheduler_deliver::PRODUCTION_LIMITS,
+            )),
         }
-
-        let dir = body_json(
-            post(
-                &router,
-                "/api/v1/sin90/directions",
-                serde_json::json!({ "title": "Coding", "target_window": "2026-08" }),
-            )
-            .await,
-        )
-        .await;
-        let dir_id = dir["id"].as_str().unwrap().to_owned();
-
-        let blk = body_json(
-            post(
-                &router,
-                "/api/v1/sin90/schedule-blocks",
-                serde_json::json!({ "direction_id": dir_id, "planned_minutes": 120 }),
-            )
-            .await,
-        )
-        .await;
-        let blk_id = blk["id"].as_str().unwrap().to_owned();
-
-        for to in ["started", "completed"] {
-            let res = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("PATCH")
-                        .uri(format!("/api/v1/sin90/schedule-blocks/{blk_id}"))
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(format!("{{\"to\":\"{to}\"}}")))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "transition to {to}");
-        }
-
-        // Wide, date-agnostic window (events stamp `at` = now).
-        let res = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sin90/attention?start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z")
-                    .header("Authorization", "Bearer testtoken")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let att = body_json(res).await;
-        let rows = att["attention"].as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["actual_min"], 120);
-        assert_eq!(rows[0]["direction_id"], dir_id);
-        assert_eq!(rows[0]["direction_title"], "Coding");
     }
 
-    // The GET list/detail reads: create through the router, then read the same
-    // rows back — and a missing proposal id is a 404, not an empty success.
+    async fn test_run_manager() -> Arc<agent24_agent::RunManager> {
+        agent24_agent::RunManager::new(
+            agent24_store::Store::open_memory().await.unwrap(),
+            Arc::new(ModelRouter::with_defaults(vec![])),
+            Arc::new(agent24_tools::ToolRegistry::new()),
+            Arc::new(crate::events::EventsHub::default()) as Arc<dyn agent24_agent::EventSink>,
+            CancellationToken::new(),
+        )
+    }
+
+    fn module_invocation(
+        schedule_id: &str,
+        trigger: agent24_scheduler::FireTrigger,
+    ) -> agent24_scheduler::ScheduleInvocation {
+        let now = chrono::Utc::now();
+        agent24_scheduler::ScheduleInvocation {
+            schedule_id: schedule_id.to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger,
+            target: agent24_scheduler::InvocationTarget::Module {
+                owner: agent24_scheduler::ModuleScheduleKey {
+                    owner_module: "mod-a".to_owned(),
+                    module_key: "k".to_owned(),
+                },
+                fire_id: agent24_scheduler::FireId::derive(trigger, schedule_id, now),
+            },
+        }
+    }
+
+    /// Review H1: `KernelTrigger`'s `Module` arm is a stub until ME4-1.3.1
+    /// wires a real `ModuleDeliverer` — every module target it is asked to
+    /// fire must come back `Deferred(MountPending)`, never a failure (design
+    /// §4.1: none of `DeferReason`'s variants are the module's fault, and a
+    /// mis-wired daemon must never burn a module's failure budget before the
+    /// real deliverer even exists).
     #[tokio::test]
-    async fn sin90_list_reads_round_trip_over_router() {
-        let (router, _os_dir) = router_with_sin90().await;
-
-        async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
-            router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(uri)
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        }
-        async fn get(router: &Router, uri: &str) -> Response {
-            router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(uri)
-                        .header("Authorization", "Bearer testtoken")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        }
-
-        let dir = body_json(
-            post(
-                &router,
-                "/api/v1/sin90/directions",
-                serde_json::json!({ "title": "Coding", "target_window": "2026-08" }),
-            )
-            .await,
-        )
-        .await;
-        let dir_id = dir["id"].as_str().unwrap().to_owned();
-        post(
-            &router,
-            "/api/v1/sin90/schedule-blocks",
-            serde_json::json!({ "direction_id": dir_id, "planned_minutes": 45 }),
-        )
-        .await;
+    async fn kernel_trigger_module_arm_is_deferred_mount_pending() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let invocation = module_invocation("sch_test", agent24_scheduler::FireTrigger::Tick);
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
         assert_eq!(
-            post(
-                &router,
-                "/api/v1/sin90/proposals",
-                serde_json::json!({
-                    "id": "p-read", "status": "pending", "source": "local_brain",
-                    "ops": [{"op":"create_direction","title":"Z","target_window":"2026-08"}],
-                    "rationale": null
-                }),
-            )
-            .await
-            .status(),
-            StatusCode::ACCEPTED
-        );
-
-        let dirs = body_json(get(&router, "/api/v1/sin90/directions").await).await;
-        assert_eq!(dirs["directions"].as_array().unwrap().len(), 1);
-        assert_eq!(dirs["directions"][0]["id"], dir_id);
-
-        let blocks = body_json(get(&router, "/api/v1/sin90/schedule-blocks").await).await;
-        assert_eq!(blocks["blocks"].as_array().unwrap().len(), 1);
-        assert_eq!(blocks["blocks"][0]["planned_minutes"], 45);
-
-        let props = body_json(get(&router, "/api/v1/sin90/proposals").await).await;
-        assert_eq!(props["proposals"].as_array().unwrap().len(), 1);
-        assert_eq!(props["proposals"][0]["id"], "p-read");
-
-        let one = get(&router, "/api/v1/sin90/proposals/p-read").await;
-        assert_eq!(one.status(), StatusCode::OK);
-        let one = body_json(one).await;
-        assert_eq!(one["status"], "pending");
-        assert_eq!(one["ops"].as_array().unwrap().len(), 1);
-
-        let missing = get(&router, "/api/v1/sin90/proposals/nope").await;
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-        assert_eq!(body_json(missing).await["error"]["code"], "not_found");
-    }
-
-    // A block referencing a nonexistent direction is a client mistake (FK
-    // violation) → 404, not the 500 a raw sqlx error would become.
-    #[tokio::test]
-    async fn sin90_bad_direction_is_404_not_500() {
-        let (router, _os_dir) = router_with_sin90().await;
-        let res = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sin90/schedule-blocks")
-                    .header("Authorization", "Bearer testtoken")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(
-                        r#"{"direction_id":"NOPE","planned_minutes":30}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        let json = body_json(res).await;
-        assert_eq!(json["error"]["code"], "not_found");
-    }
-
-    // A retried `accept` returns the same receipt but must NOT re-broadcast
-    // `proposal.applied` — the receipt is idempotent, the notification too.
-    #[tokio::test]
-    async fn sin90_retry_accept_does_not_double_emit() {
-        // Subscribe to the hub BEFORE mounting, and use the same state the module
-        // was mounted against — the whole point is that the module's events still
-        // reach the kernel's bus now that it emits through `KernelCtx`.
-        let st = state().await;
-        let mut rx = st.events.subscribe();
-        let tmp = tempfile::tempdir().unwrap();
-        let entry = crate::domain::Installed {
-            name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
-            version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-            build: crate::domain::Build::InProcess(Box::new(|| {
-                agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Memory)
-                    .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
-                    .map_err(|e| e.to_string())
-            })),
-        };
-        let (modules, _, _) = crate::domain::mount_all(
-            &[entry],
-            tmp.path(),
-            &st.events,
-            Ok(&crate::os_config::OsConfig::default()),
-            &NoModels,
-            None,
-            Err("no process host in this test"),
-            &test_approval_broker(&st.events).await,
-        )
-        .await;
-        let router = build_router_with_modules(st, modules);
-
-        let submit = |router: Router| async move {
-            router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/sin90/proposals")
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(
-                            r#"{"id":"p1","status":"pending","source":"local_brain","ops":[{"op":"create_direction","title":"X","target_window":"2026-08"}],"rationale":null}"#,
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        };
-        assert_eq!(submit(router.clone()).await.status(), StatusCode::ACCEPTED);
-
-        let accept = |router: Router| async move {
-            router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/sin90/proposals/p1/accept")
-                        .header("Authorization", "Bearer testtoken")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        };
-        assert_eq!(accept(router.clone()).await.status(), StatusCode::OK);
-        assert_eq!(accept(router).await.status(), StatusCode::OK); // retry
-
-        // Drain events; count only proposal.applied.
-        let mut applied = 0;
-        while let Ok((_, body)) = rx.try_recv() {
-            if let agent24_protocol::EventBody::Module(m) = &body
-                && m.module == "sin90"
-                && m.kind == "proposal.applied"
-            {
-                applied += 1;
+            outcome,
+            agent24_scheduler::FireOutcome::Deferred {
+                reason: agent24_scheduler::DeferReason::MountPending
             }
-        }
-        assert_eq!(
-            applied, 1,
-            "exactly one proposal.applied despite two accepts"
         );
     }
 
-    // The head-fix, now going through the real mount path: a daemon whose sin90
-    // store fails to open must serve health but 503 every sin90 route — the kernel
-    // does not depend on the module.
-    //
-    // The failure is REAL rather than injected: the module is pointed at a legacy
-    // "database" that is not one, so its migration fails and `open_store` returns
-    // Err. That exercises the whole chain — module error → `MountOutcome::Degraded`
-    // → the kernel's own 503 under the namespace — instead of a hand-set `None`.
+    /// Review H1: the `AgentRun` arm's failure path — `RunManager` refusing
+    /// the run (here: a `session_id` that was never created, which
+    /// `start_run_with_schedule` rejects with `SessionNotFound` before
+    /// anything else happens) — must classify as `FireOutcome::Failed`, not
+    /// panic or silently swallow the error.
     #[tokio::test]
-    async fn sin90_unavailable_503s_but_kernel_lives() {
-        let broken = tempfile::tempdir().unwrap();
-        let legacy = broken.path().join("not-a-database.db");
-        std::fs::write(&legacy, b"definitely not sqlite").unwrap();
-        let (router, _os_dir) = router_with_sin90_mode(agent24_sin90_os::StorageMode::Persistent {
-            legacy: Some(legacy),
-        })
-        .await;
-
-        for (method, uri) in [
-            ("POST", "/api/v1/sin90/directions"),
-            ("GET", "/api/v1/sin90/directions"),
-            ("POST", "/api/v1/sin90/schedule-blocks"),
-            ("GET", "/api/v1/sin90/schedule-blocks"),
-            ("PATCH", "/api/v1/sin90/schedule-blocks/x"),
-            ("POST", "/api/v1/sin90/proposals"),
-            ("GET", "/api/v1/sin90/proposals"),
-            ("GET", "/api/v1/sin90/proposals/x"),
-            ("POST", "/api/v1/sin90/proposals/x/accept"),
-            ("GET", "/api/v1/sin90/attention?start=a&end=b"),
-        ] {
-            let res = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from("{}"))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                res.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{method} {uri} must 503 when the module is down"
-            );
-            let json = body_json(res).await;
-            assert_eq!(json["error"]["code"], "module_unavailable");
+    async fn kernel_trigger_agent_run_failure_maps_to_failed() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let now = chrono::Utc::now();
+        let invocation = agent24_scheduler::ScheduleInvocation {
+            schedule_id: "sch_test".to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger: agent24_scheduler::FireTrigger::Tick,
+            target: agent24_scheduler::InvocationTarget::AgentRun(
+                agent24_protocol::ScheduleAction::AgentRun {
+                    prompt: "x".to_owned(),
+                    session_id: Some("sess_nonexistent".to_owned()),
+                    model_override: None,
+                },
+            ),
+        };
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
+        match outcome {
+            agent24_scheduler::FireOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("sess_nonexistent"),
+                    "expected the SessionNotFound reason to name the missing session, got: {reason}"
+                );
+            }
+            other => panic!("expected Failed for a rejected run, got {other:?}"),
         }
-
-        // The kernel is unaffected.
-        let res = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
     }
 
-    // A bare date (not the fixed-width timestamp) would drop a whole day under a
-    // lexical window compare — reject it rather than silently under-count.
+    /// Positive control for the AgentRun arm's SUCCESS path (the failure
+    /// test above only proves half of H1's classification): a run that
+    /// `RunManager` actually accepts must come back `AgentRun{run_id}`.
     #[tokio::test]
-    async fn sin90_attention_rejects_non_fixed_width_bounds() {
-        let (router, _os_dir) = router_with_sin90().await;
-        let res = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sin90/attention?start=2026-08-01&end=2026-08-11")
-                    .header("Authorization", "Bearer testtoken")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    async fn kernel_trigger_agent_run_success_maps_to_agent_run() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let now = chrono::Utc::now();
+        let invocation = agent24_scheduler::ScheduleInvocation {
+            schedule_id: "sch_test".to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger: agent24_scheduler::FireTrigger::Tick,
+            target: agent24_scheduler::InvocationTarget::AgentRun(
+                agent24_protocol::ScheduleAction::AgentRun {
+                    prompt: "x".to_owned(),
+                    session_id: None,
+                    model_override: None,
+                },
+            ),
+        };
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
+        match outcome {
+            agent24_scheduler::FireOutcome::AgentRun { run_id } => {
+                assert!(run_id.starts_with("run_"), "{run_id}");
+            }
+            other => panic!("expected AgentRun for an accepted run, got {other:?}"),
+        }
     }
 }

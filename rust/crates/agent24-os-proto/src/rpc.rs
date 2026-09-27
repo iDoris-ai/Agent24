@@ -81,6 +81,12 @@ pub const MAX_IN_FLIGHT_PER_CONNECTION: usize = 64;
 /// `admit_callback`, wired in by the first business method).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// ME4-S2 decision M2: the ceiling on a PER-METHOD timeout
+/// ([`Handler::call_timeout`]). A handler may ask for more than
+/// [`CALL_TIMEOUT`] (a local model can take minutes), never for more than
+/// this — so no method can make a call effectively unbounded.
+pub const MAX_METHOD_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// How long one response may take to be written before the connection is given
 /// up on. A module that stops reading must not be able to stall the kernel's
 /// side of the connection.
@@ -149,10 +155,16 @@ pub enum ErrorKind {
     /// different module. Deliberately ONE kind for both (decision 4): telling
     /// them apart would let a caller enumerate other modules' approval ids.
     NotFound,
+    /// ME4-S2 decision M6: `_a24/model/complete` reached the router and no
+    /// provider this module may use produced a completion. `data.retryable`
+    /// says whether the same call may succeed later (no provider reachable)
+    /// or not (a provider answered and refused). Provider names, URLs and
+    /// messages never appear — they go to the daemon log.
+    Unavailable,
 }
 
 impl ErrorKind {
-    pub const ALL: [ErrorKind; 17] = [
+    pub const ALL: [ErrorKind; 18] = [
         Self::Forbidden,
         Self::Busy,
         Self::Cancelled,
@@ -170,6 +182,7 @@ impl ErrorKind {
         Self::PayloadTooLarge,
         Self::TokenInvalid,
         Self::NotFound,
+        Self::Unavailable,
     ];
 
     /// The wire string.
@@ -193,6 +206,7 @@ impl ErrorKind {
             Self::PayloadTooLarge => "payload_too_large",
             Self::TokenInvalid => "token_invalid",
             Self::NotFound => "not_found",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -349,6 +363,21 @@ pub trait Handler: Send + Sync {
     /// Guarding against a handler that never yields needs a process boundary: a
     /// thread can isolate it, but a Rust thread cannot be safely killed.
     fn call(&self, params: Value) -> CallFuture;
+
+    /// ME4-S2 decision M2: this method's own budget, replacing
+    /// [`Limits::call_timeout`] for its calls. `None` (the default — every
+    /// method before `_a24/model/complete`) keeps the connection-level value,
+    /// so no existing method changes. Clamped to [`MAX_METHOD_CALL_TIMEOUT`].
+    /// Asked once per call, before the call's task is spawned.
+    ///
+    /// **A method that declares more than [`CALL_TIMEOUT`] must bound its own
+    /// concurrency** (ME4-S2 L7): the per-connection ceiling
+    /// ([`MAX_IN_FLIGHT_PER_CONNECTION`]) was sized with 30s calls in mind, and
+    /// 64 calls each holding a slot for minutes is a different resource
+    /// profile. `_a24/model/complete` does (2 per module, fair global cap).
+    fn call_timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// The methods a connection serves.
@@ -1220,12 +1249,23 @@ fn conn_end(end: FrameError) -> Ended {
 
 type HandlerOutcome = Result<Result<Value, RpcError>, tokio::time::error::Elapsed>;
 
+/// ME4-S2 decision M2: the budget one call gets — the method's own if it
+/// declared one (never above [`MAX_METHOD_CALL_TIMEOUT`]), else the
+/// connection-level default. Pure, so the clamp is unit-testable without
+/// waiting 300s.
+fn effective_call_timeout(declared: Option<Duration>, default: Duration) -> Duration {
+    declared.map_or(default, |t| t.min(MAX_METHOD_CALL_TIMEOUT))
+}
+
 /// The per-connection call state [`serve`] owns.
 struct Conn<'a> {
     methods: &'a Methods,
     limits: Limits,
     handlers: tokio::task::JoinSet<HandlerOutcome>,
-    by_task: HashMap<tokio::task::Id, String>,
+    /// Each task's request id AND the timeout it was given — `finished`
+    /// must report the budget that actually applied (SPEC §2.1 "上限与时限的
+    /// 文案": report the value in force, never a constant).
+    by_task: HashMap<tokio::task::Id, (String, Duration)>,
     in_flight: HashMap<String, tokio::task::AbortHandle>,
 }
 
@@ -1261,13 +1301,16 @@ impl Conn<'_> {
                         ),
                     ));
                 }
-                let timeout = self.limits.call_timeout;
+                // ME4-S2 decision M2: per-method budget, else the
+                // connection-level one. Never above the ceiling.
+                let timeout =
+                    effective_call_timeout(handler.call_timeout(), self.limits.call_timeout);
                 // `call` runs inside the task, so a handler that panics while
                 // building its future is caught too.
                 let handle = self.handlers.spawn(async move {
                     tokio::time::timeout(timeout, handler.call(params)).await
                 });
-                self.by_task.insert(handle.id(), id.clone());
+                self.by_task.insert(handle.id(), (id.clone(), timeout));
                 self.in_flight.insert(id, handle);
                 None
             }
@@ -1280,31 +1323,36 @@ impl Conn<'_> {
         joined: Result<(tokio::task::Id, HandlerOutcome), tokio::task::JoinError>,
     ) -> Option<Response> {
         let (task, outcome) = match joined {
-            Ok((task, Ok(outcome))) => (task, outcome),
-            Ok((task, Err(_elapsed))) => (
-                task,
-                Err(RpcError::application(
-                    ErrorKind::Timeout,
-                    format!(
-                        "the kernel gave up after {}ms; the call is not retried",
-                        self.limits.call_timeout.as_millis()
-                    ),
-                )),
-            ),
+            Ok((task, Ok(outcome))) => (task, Ok(outcome)),
+            Ok((task, Err(_elapsed))) => (task, Err(None)),
             Err(e) if e.is_cancelled() => (
                 e.id(),
-                Err(RpcError::application(
+                Err(Some(RpcError::application(
                     ErrorKind::Cancelled,
                     "cancelled by $/cancelRequest; any side effect already committed stays",
-                )),
+                ))),
             ),
             Err(e) => (
                 e.id(),
-                Err(RpcError::internal("the handler failed without answering")),
+                Err(Some(RpcError::internal(
+                    "the handler failed without answering",
+                ))),
             ),
         };
-        self.by_task.remove(&task).map(|id| {
+        self.by_task.remove(&task).map(|(id, timeout)| {
             self.in_flight.remove(&id);
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(Some(e)) => Err(e),
+                // The budget THIS call was given — per-method or connection-level.
+                Err(None) => Err(RpcError::application(
+                    ErrorKind::Timeout,
+                    format!(
+                        "the kernel gave up after {}ms; the call is not retried",
+                        timeout.as_millis()
+                    ),
+                )),
+            };
             Response {
                 id: Some(id),
                 outcome,
@@ -1613,6 +1661,102 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(hang.calls.load(Ordering::SeqCst), 1, "retried");
         assert!(hang.dropped.load(Ordering::SeqCst));
+    }
+
+    /// ME4-S2 decision M2 (scratch verification of the design's rpc change):
+    /// a handler that declares its own budget outlives the connection-level
+    /// one, and the timeout message names the budget that applied.
+    struct Slow {
+        delay: Duration,
+        budget: Option<Duration>,
+    }
+    impl Handler for Slow {
+        fn check_params(&self, _: &Value) -> Result<(), String> {
+            Ok(())
+        }
+        fn call(&self, _: Value) -> CallFuture {
+            let d = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(d).await;
+                Ok(json!({"slept": true}))
+            })
+        }
+        fn call_timeout(&self) -> Option<Duration> {
+            self.budget
+        }
+    }
+
+    fn slow_methods() -> Methods {
+        Methods::none()
+            .with(
+                "t/slow_with_budget",
+                Arc::new(Slow {
+                    delay: Duration::from_millis(300),
+                    budget: Some(Duration::from_millis(800)),
+                }),
+            )
+            .with(
+                "t/slow_default",
+                Arc::new(Slow {
+                    delay: Duration::from_millis(300),
+                    budget: None,
+                }),
+            )
+            .with(
+                "t/too_slow_with_budget",
+                Arc::new(Slow {
+                    delay: Duration::from_secs(5),
+                    budget: Some(Duration::from_millis(400)),
+                }),
+            )
+    }
+
+    #[test]
+    fn a_declared_budget_is_clamped_and_an_absent_one_is_the_default() {
+        let d = Duration::from_secs(30);
+        assert_eq!(effective_call_timeout(None, d), d);
+        assert_eq!(
+            effective_call_timeout(Some(Duration::from_secs(120)), d),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            effective_call_timeout(Some(Duration::from_secs(3600)), d),
+            MAX_METHOD_CALL_TIMEOUT
+        );
+        assert_eq!(
+            effective_call_timeout(Some(Duration::from_millis(5)), d),
+            Duration::from_millis(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn per_method_budget_outlives_the_connection_budget() {
+        let limits = Limits {
+            call_timeout: Duration::from_millis(100),
+            ..TEST_LIMITS
+        };
+        let mut c = connect(slow_methods(), limits);
+        c.send(req("a", "t/slow_with_budget", json!({}))).await;
+        let r = c.recv().await;
+        assert_eq!(r["id"], "a");
+        assert_eq!(r["result"]["slept"], true, "{r}");
+        // Positive control: the same handler without its own budget times out
+        // at the connection-level 100ms.
+        c.send(req("b", "t/slow_default", json!({}))).await;
+        let r = c.recv().await;
+        assert_eq!(kind(&r), Some("timeout"), "{r}");
+        assert!(
+            r["error"]["message"].as_str().unwrap().contains("100ms"),
+            "{r}"
+        );
+        // And the per-method budget is itself a bound, reported as such.
+        c.send(req("c", "t/too_slow_with_budget", json!({}))).await;
+        let r = c.recv().await;
+        assert_eq!(kind(&r), Some("timeout"), "{r}");
+        assert!(
+            r["error"]["message"].as_str().unwrap().contains("400ms"),
+            "{r}"
+        );
     }
 
     /// "params 解析失败固定返回 -32602 且不 dispatch handler" and "一条坏
@@ -1935,7 +2079,7 @@ mod tests {
     /// with that edit, not just with the enum.
     #[test]
     fn the_error_kinds_are_exactly_specs_closed_set() {
-        const SPEC: &str = "kind 是闭集（T7a/ME-3e 为 events emit 扩展了 5 个，T7b/ME-3e 又为 approval gate/advise/status 扩展了 2 个）：`forbidden` / `busy` / `cancelled` / `timeout` / `quota_exceeded` / `invalid_lease` / `unknown_capability` / `version_mismatch` / **`auth_failed`** / **`manifest_mismatch`** / `not_ready` / `draining` / `revoked` / `rate_limited` / `payload_too_large` / `token_invalid` / `not_found`";
+        const SPEC: &str = "kind 是闭集（T7a/ME-3e 为 events emit 扩展了 5 个，T7b/ME-3e 又为 approval gate/advise/status 扩展了 2 个，ME4-S2 为 model complete 扩展了 1 个）：`forbidden` / `busy` / `cancelled` / `timeout` / `quota_exceeded` / `invalid_lease` / `unknown_capability` / `version_mismatch` / **`auth_failed`** / **`manifest_mismatch`** / `not_ready` / `draining` / `revoked` / `rate_limited` / `payload_too_large` / `token_invalid` / `not_found` / `unavailable`";
         let quoted: HashSet<&str> = SPEC.split('`').skip(1).step_by(2).collect();
         let ours: HashSet<&str> = ErrorKind::ALL.iter().map(|k| k.as_str()).collect();
         assert_eq!(ours, quoted);

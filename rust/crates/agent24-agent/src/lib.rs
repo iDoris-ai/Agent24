@@ -210,6 +210,7 @@ impl Summarizer for RouterSummarizer {
             model: None,
             tools: vec![],
             response_format: None,
+            max_tokens: None,
         };
         let (_provider, res) = self
             .router
@@ -1002,6 +1003,7 @@ impl RunManager {
                 model: run.input.model_override.clone(),
                 tools: self.tool_specs_for(plan_mode),
                 response_format: None,
+                max_tokens: None,
             };
             let outcome = tokio::select! {
                 r = self.router.complete(TaskProfile::default(), &request, &cancel) => r,
@@ -1028,6 +1030,9 @@ impl RunManager {
                             format!("No provider could serve this request. {msg}"),
                         ),
                         ModelError::Provider(msg) => ("provider_error", msg.clone()),
+                        // ME4-S2 L3: same handling as `Provider` — same `Display`
+                        // text, so the agent loop's output is unchanged.
+                        ModelError::Rejected { message, .. } => ("provider_error", message.clone()),
                         ModelError::Cancelled => ("internal", err.to_string()),
                     };
                     self.finish_failed(&run_id, code, &message).await;
@@ -1658,6 +1663,7 @@ pub(crate) mod tests {
             Ok(CompletionResponse {
                 message: Msg::assistant(Some("pong".to_owned()), vec![]),
                 usage: usage_one(),
+                model_id: None,
             })
         }
         async fn models(
@@ -1688,6 +1694,7 @@ pub(crate) mod tests {
             Ok(CompletionResponse {
                 message: Msg::assistant(Some("pong".to_owned()), vec![]),
                 usage: usage_one(),
+                model_id: None,
             })
         }
         async fn models(
@@ -1755,6 +1762,7 @@ pub(crate) mod tests {
             Ok(CompletionResponse {
                 message,
                 usage: usage_one(),
+                model_id: None,
             })
         }
         async fn models(
@@ -2527,6 +2535,7 @@ pub(crate) mod tests {
                         }],
                     ),
                     usage: usage_one(),
+                    model_id: None,
                 })
             }
             async fn models(

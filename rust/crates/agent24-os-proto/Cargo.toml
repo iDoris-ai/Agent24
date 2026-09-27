@@ -8,6 +8,9 @@ description = "Agent24 kernel↔domain-OS protocol (ME-3b): version negotiation,
 
 [dependencies]
 agent24-domain = { path = "../agent24-domain" }
+# ME4-S3 §4.3: the one crate allowed to turn the kernel-inherited listen fd
+# into a socket — `module::take_listener` delegates to it.
+agent24-os-fd = { path = "../agent24-os-fd" }
 axum = { version = "0.8" }
 # 1.9 for `Bytes::from_owner` — see `PermitBytes`.
 bytes = "1.9"
@@ -41,13 +44,32 @@ tracing = "0.1"
 # /dev/urandom directly (`launch::mint_token`'s existing precedent), so no
 # separate RNG crate is added.
 sha2 = "0.10"
+# ME4-S3 §4.4: `manifest::facts_from_yaml` reads the module-side manifest
+# facts (name/route_namespace/kernel_capabilities) leniently, same crate
+# `agent24-domain` already depends on for its own (strict) manifest parsing.
+serde_yaml = "0.9"
 
 [dev-dependencies]
+# B2 (external review of #515): the `test-util`-gated handshake tests
+# (`connect_from_env_*`) never ran in CI because plain `cargo test`/`clippy
+# --all-targets` don't pass `--features test-util`. Depending on ourselves
+# with the feature turned on for dev builds only pulls it in for `#[cfg(test)]`
+# builds of this crate, so the default `cargo test -p agent24-os-proto` and
+# `cargo clippy --all-targets` now cover them without a workspace-wide
+# feature flip.
+agent24-os-proto = { path = ".", features = ["test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 # To assert the "outcome unknown" log line is actually written.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+
+[features]
+# ME4-S3 §4.5 (H4): `module::testing`'s in-memory fake kernel — an
+# in-process fixture, not a `#[cfg(test)]` item, so downstream crates (the
+# SDK, and through it Sin90/Cos72) can use it from their own dev-dependencies
+# by enabling this feature on `agent24-os-sdk` (which forwards it, L8).
+test-util = []
 
 [lints]
 workspace = true

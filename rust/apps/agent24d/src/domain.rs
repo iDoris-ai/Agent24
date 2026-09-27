@@ -5,12 +5,14 @@
 //! constructed modules — decides which of them should run, builds those, gives
 //! each a directory and a [`KernelCtx`], and nests its routes under a namespace
 //! derived from its identity. The mounting LOGIC has no module-specific branch — that is the ME-1
-//! acceptance — and the tests below mount fake modules rather than Sin90, so the
-//! property cannot quietly become "the mounter happens to work for Sin90". As of
-//! ME-1b-b this file names no module at all: Sin90 mounts through exactly this
-//! path, and the only place in the kernel that says "sin90" is `serve`, which has
-//! to name the OS it installs. (Fake modules give regression evidence, not proof
-//! that no special case exists.)
+//! acceptance — and the tests below mount fake modules, so the property cannot
+//! quietly become "the mounter happens to work for this one module". As of
+//! ME-1b-b this file names no module at all — a compiled-in OS would be named
+//! by `serve`'s catalogue, but as of T11 that catalogue is empty: Sin90 (the
+//! only module that ever exercised the in-process path) now ships from
+//! `iDoris-ai/Sin90` and mounts exclusively through `with_discovered`, like any
+//! other out-of-process package. (Fake modules give regression evidence, not
+//! proof that no special case exists.)
 //!
 //! Five rules the CONTRACT cannot enforce on its own, which therefore live here:
 //!
@@ -73,9 +75,15 @@ use axum::Router;
 const KERNEL_GRANTS: &[Capability] =
     &[Capability::Events, Capability::Memory, Capability::Approval];
 
-/// What an out-of-process module may be granted. Narrower than
+/// What an out-of-process module may be granted. A SEPARATE list from
 /// [`KERNEL_GRANTS`] on purpose — see `docs/design/T7a-ME3e-grants-and-events.md`
-/// §1 for why this list exists at all.
+/// §1 for why this list exists at all. It used to be strictly narrower than
+/// [`KERNEL_GRANTS`]; ME4-1.4.1 (`docs/design/ME4-S1-scheduler-callback.md`
+/// §6.5) broke that: `Scheduler` is now WIDER here, because out-of-process
+/// modules have a real handle (`CallbackDeps.scheduler`) that no in-process
+/// module does. Each list only ever promises what its own side can actually
+/// back with a handle — the two are independent for that reason, not because
+/// one is meant to contain the other.
 /// `Approval` joined in T7b/ME-3e, alongside the wire handlers in
 /// `crate::approval_callback` that give it a real handler.
 ///
@@ -88,8 +96,59 @@ const KERNEL_GRANTS: &[Capability] =
 /// `MemoryLease::admission()`). This list only says the kernel is WILLING to
 /// consider lending memory to an out-of-process module; whether it actually
 /// can is decided per mount.
-const KERNEL_OOP_GRANTS: &[Capability] =
-    &[Capability::Events, Capability::Approval, Capability::Memory];
+///
+/// `Scheduler` joined in ME4-1.4.1 (`docs/design/ME4-S1-scheduler-callback.md`
+/// §6.5): out-of-process modules now have a real handle
+/// (`CallbackDeps.scheduler`) and a real handler surface
+/// (`_a24/scheduler/{upsert,delete,list}`, `crate::scheduler_callback`).
+/// Deliberately **not** added to [`KERNEL_GRANTS`] — there is still no
+/// in-process scheduler handle to hand out, and this list's own doc comment
+/// above says why that matters (`a_capability_the_kernel_cannot_serve_is_not_granted`
+/// keeps that promise honest for in-process modules).
+///
+/// `Models` joined in ME4-4.2.2b2 (`docs/design/ME4-S2-model-callback.md`
+/// §2.4): out-of-process modules may now hold a real handle
+/// (`CallbackDeps.models: Option<ModelCallbackDeps>` — `Option` because a
+/// daemon that built no router still runs) and a real handler surface
+/// (`_a24/model/complete`, `crate::model_callback`). Same reasoning as
+/// `Scheduler` for why it is not in [`KERNEL_GRANTS`]: `KernelCtx` has no
+/// model handle to lend an in-process module.
+const KERNEL_OOP_GRANTS: &[Capability] = &[
+    Capability::Events,
+    Capability::Approval,
+    Capability::Memory,
+    Capability::Scheduler,
+    Capability::Models,
+];
+
+/// The daemon-level dependencies the OOP callback handlers need, threaded
+/// through [`mount_all`] **by value** and lent to each [`mount_package`] as
+/// `&CallbackDeps` (design §10.3, v3 M-B). Whatever a handler keeps for its
+/// own generation-spanning lifetime is `.clone()`d (an `Arc`) out of this
+/// struct inside `mount_package`'s `MethodsFor` closure — the struct itself
+/// is dropped the moment `mount_all` returns, which is deliberate: ME4-S2's
+/// model usage channel (`ModelCallbackDeps.usage`, the `models` field below)
+/// relies on exactly that drop to close down cleanly (design §6.3) — its
+/// sender otherwise only lives on in each mounted module's `ModelGrant`.
+/// S1 landed this with `scheduler` only; `models` is ME4-4.2.2b2, added to
+/// this SAME struct rather than as a second parameter to `mount_all`.
+///
+/// Deliberately NOT `Clone` (review round 2, L3): S2 relies on `mount_all`'s
+/// own return being the only place this struct is ever dropped, to close
+/// down its usage channel. A `Clone` impl would let a caller keep a second
+/// copy alive past that point, silently defeating it — there is no
+/// legitimate reason to copy this struct rather than pass the one value
+/// through by reference, which `mount_package` already does.
+pub struct CallbackDeps {
+    pub scheduler: Arc<agent24_scheduler::Scheduler>,
+    /// `None` when this daemon has no model deps to hand out (there is no
+    /// such daemon in production — `serve()` always builds one — but tests
+    /// that don't care about model routing pass `None` rather than wiring a
+    /// router; design §2.4/§10.3). A module requesting `models` while this
+    /// is `None` gets no grant, same outcome as not holding the capability
+    /// (invariant #134).
+    pub models: Option<crate::model_callback::ModelCallbackDeps>,
+}
 
 /// Names a module may not take, because the kernel already serves
 /// `/api/v1/<segment>` and axum PANICS on an exact route overlap:
@@ -609,6 +668,14 @@ pub enum Build {
     /// Compiled in: build it by calling this. Manifest-derived admission
     /// necessarily happens after, because the manifest does not exist until the
     /// module does.
+    ///
+    /// No production code constructs this variant as of T11 (Sin90, the one
+    /// compiled-in module this ever named, now ships out-of-process from
+    /// `iDoris-ai/Sin90`) — the tests below still do, to exercise the mounter's
+    /// in-process path with fake modules. `#[allow(dead_code)]` rather than
+    /// deleting the variant: a future compiled-in OS is still just another
+    /// catalogue entry, and this is the arm it would use.
+    #[allow(dead_code)]
     #[allow(clippy::type_complexity)]
     InProcess(Box<dyn Fn() -> std::result::Result<Arc<dyn DomainModule>, String> + Send + Sync>),
     /// A package found on disk, run as its own process (ME-3, SUP-4). Its
@@ -815,6 +882,28 @@ impl Supervisors {
         self.lock().disabled.get(name).cloned()
     }
 
+    /// design §5.1: the proxy slot of the module `name` if — and only if — it
+    /// is in the running list right now. `None` for: never started, disabled
+    /// in os.json, hot-disabled (`disable` already `swap_remove`d it),
+    /// uninstalled, refused, and every module once the shutdown has closed
+    /// the list. Read-only: clones an `Arc`, changes nothing, takes the same
+    /// short lock [`Self::statuses`] takes.
+    ///
+    /// "In the list" only means a supervisor holds it, not that it is ready:
+    /// the caller (`agent24d::scheduler_deliver::ModuleDeliverer`) still asks
+    /// its `Generation` (`current.get()`) and lets `admit_request` decide
+    /// Starting/Draining/Revoked — the same admission every proxied request
+    /// goes through.
+    #[must_use]
+    pub fn running_slot(&self, name: &str) -> Option<Arc<agent24_os_proto::drain::Current>> {
+        self.lock()
+            .running
+            .as_ref()?
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| Arc::clone(&s.current))
+    }
+
     /// Close the list and take everything in it — and the stops disables
     /// began. Later starts and disables are refused.
     pub fn close(&self) -> Closed {
@@ -875,6 +964,10 @@ pub async fn mount_all(
     // both need the SAME broker `AppState` holds, so `module-approval.*`
     // events land on the one WS hub clients are subscribed to.
     approval_broker: &Arc<crate::module_approval_broker::ModuleApprovalBroker>,
+    // ME4-1.4.1 (design §10.3, v3 M-B): by VALUE, not `&CallbackDeps` — see
+    // `CallbackDeps`'s own doc comment for why. Lent to each `mount_package`
+    // call below as `&deps`; dropped when this function returns.
+    deps: CallbackDeps,
 ) -> (Router, Vec<MountReport>, crate::os_memory::OsMemoryCatalog) {
     let mut app = Router::new();
     let mut reports = Vec::new();
@@ -1057,6 +1150,7 @@ pub async fn mount_all(
                     &mut partitions,
                     host,
                     approval_broker,
+                    &deps,
                 )
                 .await;
                 app = next;
@@ -1250,6 +1344,215 @@ struct MountTarget {
     enabled_at_start: Option<bool>,
 }
 
+/// Builds the `MethodsFor` closure `mount_package` hands to `supervise()` —
+/// called once per generation (mount, and every restart after a crash).
+/// Extracted into its own function (ME4-1.4.1, review round 2 M2) so a test
+/// can call it directly and invoke the returned closure TWICE without
+/// spawning a real subprocess or forcing a real crash-restart — the only way
+/// to actually exercise (and mutation-test) the structural property this
+/// function's own comments describe: `memory_entitlement`/`scheduler_limiter`/
+/// `scheduler`/`model_grant` are captured ONCE, outside the
+/// `move |generation| {…}` closure, and merely `.clone()`d on each
+/// invocation — so a restarted generation sees the SAME
+/// `Arc<RateLimiter>`/entitlement/scheduler handle/`ModelGrant` (which itself
+/// carries the mount-lifetime rate limiter and per-module health table, ME4-S2
+/// design §5.1), never a freshly built one. `_a24/events/emit`'s own `limiter`
+/// is the deliberate contrast: built INSIDE the closure, so a restart always
+/// gets a full bucket.
+#[allow(clippy::too_many_arguments)]
+fn build_methods_for(
+    name: String,
+    granted: Grants,
+    event_sink: Option<Arc<EventSink>>,
+    approval_broker: Arc<crate::module_approval_broker::ModuleApprovalBroker>,
+    memory_entitlement: crate::os_memory::MemoryEntitlement,
+    scheduler: Arc<agent24_scheduler::Scheduler>,
+    // ME4-4.2.2b2 (design §2.4): built once by `mount_package` via
+    // `crate::model_callback::model_grant`, `None` unless the module both
+    // requested and was granted `Capability::Models` AND this daemon has
+    // model deps configured. `_a24/model/complete` is registered
+    // UNCONDITIONALLY below regardless of which; the handler itself turns
+    // `None` into `forbidden` (same shape as the approval/events/scheduler
+    // methods above — capability gating lives inside `call()`).
+    model_grant: Option<crate::model_callback::ModelGrant>,
+) -> agent24_os_proto::supervisor::MethodsFor {
+    // ME4-1.4.1 (design §6.4, v2 M3): ONE token bucket per MOUNT — built
+    // here, outside the closure below, exactly like `memory_entitlement`
+    // (this function's own parameter, already built once by the caller) and
+    // unlike `_a24/events/emit`'s limiter (rebuilt every generation, see the
+    // comment at its own construction below). Capacity 300 / refill 1 per
+    // second, reused across every restart generation of this module: a
+    // module that reconciles all 256 keys right after a crash-restart must
+    // not find its quota already spent by the generation that just died.
+    let scheduler_limiter = Arc::new(crate::events_emit::RateLimiter::new(
+        crate::scheduler_callback::SCHEDULER_RATE_CAPACITY,
+        crate::scheduler_callback::SCHEDULER_RATE_REFILL_PER_SEC,
+    ));
+    Arc::new(
+        move |generation: &Arc<agent24_os_proto::drain::Generation>| {
+            // This inner clone itself only lives to the end of THIS
+            // `MethodsFor` call — the returned `Methods` does not carry it
+            // anywhere. What actually persists across restarts is the OUTER
+            // `memory_entitlement` parameter above: it is captured by THIS
+            // `move` closure once, and the closure itself (`Arc<dyn Fn>`) is
+            // what the supervisor loop holds for the module's whole
+            // supervised lifetime, calling it once per generation. Each of
+            // the three `_a24/memory/private/*` Handlers below reads from a
+            // clone made HERE, inside the closure body — so a restarted
+            // generation's Handlers still see the same mount-time
+            // `Arc<RateLimiter>`/`Arc<Semaphore>` (T8.5c-W-mount decision
+            // 3/4), never a freshly-built one.
+            let memory_entitlement = memory_entitlement.clone();
+            // A fresh bucket every time this closure runs — once per
+            // generation, i.e. once per (re)start. Building it outside the
+            // closure and cloning the `Arc` in would let a restarted module
+            // inherit whatever quota the previous generation had already
+            // spent (Codex round 3 Medium 2).
+            let limiter = Arc::new(crate::events_emit::RateLimiter::new(
+                crate::events_emit::EVENTS_RATE_CAPACITY,
+                crate::events_emit::EVENTS_RATE_REFILL_PER_SEC,
+            ));
+            // ME4-1.4.1: the OUTER `scheduler_limiter`/`scheduler` bindings
+            // persist across restarts (same shape as `memory_entitlement`
+            // just above) — cloned in here so each generation's Handlers
+            // still read the one mount-lifetime token bucket and the one
+            // `Arc<Scheduler>` handle.
+            let scheduler_limiter = scheduler_limiter.clone();
+            let scheduler = scheduler.clone();
+            // ME4-4.2.2b2: same shape as `scheduler` just above — the OUTER
+            // `model_grant` (built once per mount, outside this closure)
+            // persists across restarts; cloning it here (an `Option<ModelGrant>`
+            // whose fields are themselves `Arc`s) gives every generation the
+            // SAME rate limiter and per-module health table, never a fresh one
+            // (design §5: "限流桶不能被崩溃重置").
+            let model_grant = model_grant.clone();
+            let name = name.clone();
+            let granted = granted.clone();
+            let event_sink = event_sink.clone();
+            let approval_broker = approval_broker.clone();
+            // T7b/ME-3e: the three approval methods are registered
+            // UNCONDITIONALLY, exactly like `_a24/events/emit` above —
+            // capability gating happens INSIDE each handler's `call()`,
+            // not by conditionally registering the method (design doc
+            // decision 4).
+            agent24_os_proto::rpc::Methods::none()
+                .with(
+                    "_a24/events/emit",
+                    Arc::new(crate::events_emit::EventsEmitHandler {
+                        generation: generation.clone(),
+                        name: name.clone(),
+                        granted: granted.clone(),
+                        sink: event_sink.clone(),
+                        limiter,
+                    }),
+                )
+                .with(
+                    "_a24/approval/gate",
+                    Arc::new(crate::approval_callback::ApprovalSubmitHandler {
+                        generation: generation.clone(),
+                        module: name.clone(),
+                        granted: granted.clone(),
+                        kind: agent24_protocol::ModuleApprovalKind::Gate,
+                        broker: approval_broker.clone(),
+                    }),
+                )
+                .with(
+                    "_a24/approval/advise",
+                    Arc::new(crate::approval_callback::ApprovalSubmitHandler {
+                        generation: generation.clone(),
+                        module: name.clone(),
+                        granted: granted.clone(),
+                        kind: agent24_protocol::ModuleApprovalKind::Advise,
+                        broker: approval_broker.clone(),
+                    }),
+                )
+                .with(
+                    "_a24/approval/status",
+                    Arc::new(crate::approval_callback::ApprovalStatusHandler {
+                        module: name.clone(),
+                        granted: granted.clone(),
+                        broker: approval_broker.clone(),
+                    }),
+                )
+                // T8.5c-W-wire decision W4: registered UNCONDITIONALLY,
+                // exactly like `_a24/events/emit`/the three approval
+                // methods above — `entitlement.private_handle()` is
+                // checked INSIDE each handler's `call()` (mount design
+                // §2.1), not by conditionally registering the method.
+                // `_a24/memory/scoped/*` (decision W6) is deliberately
+                // NOT registered anywhere in this crate — see
+                // `memory_callback`'s module doc.
+                .with(
+                    "_a24/memory/private/remember",
+                    Arc::new(crate::memory_callback::RememberHandler {
+                        generation: generation.clone(),
+                        entitlement: memory_entitlement.clone(),
+                    }),
+                )
+                .with(
+                    "_a24/memory/private/recall",
+                    Arc::new(crate::memory_callback::RecallHandler {
+                        generation: generation.clone(),
+                        entitlement: memory_entitlement.clone(),
+                    }),
+                )
+                .with(
+                    "_a24/memory/private/recent",
+                    Arc::new(crate::memory_callback::RecentHandler {
+                        generation: generation.clone(),
+                        entitlement: memory_entitlement.clone(),
+                    }),
+                )
+                // ME4-1.4.1 (design §6.4/§6.5): registered UNCONDITIONALLY,
+                // exactly like the memory/approval/events methods above —
+                // `granted.has(Capability::Scheduler)` is checked INSIDE
+                // each handler's `call()`, not by conditionally registering
+                // the method.
+                .with(
+                    "_a24/scheduler/upsert",
+                    Arc::new(crate::scheduler_callback::SchedulerUpsertHandler {
+                        generation: generation.clone(),
+                        owner: name.clone(),
+                        granted: granted.clone(),
+                        scheduler: scheduler.clone(),
+                        limiter: scheduler_limiter.clone(),
+                    }),
+                )
+                .with(
+                    "_a24/scheduler/delete",
+                    Arc::new(crate::scheduler_callback::SchedulerDeleteHandler {
+                        generation: generation.clone(),
+                        owner: name.clone(),
+                        granted: granted.clone(),
+                        scheduler: scheduler.clone(),
+                        limiter: scheduler_limiter.clone(),
+                    }),
+                )
+                .with(
+                    "_a24/scheduler/list",
+                    Arc::new(crate::scheduler_callback::SchedulerListHandler {
+                        generation: generation.clone(),
+                        owner: name.clone(),
+                        granted: granted.clone(),
+                        scheduler: scheduler.clone(),
+                        limiter: scheduler_limiter.clone(),
+                    }),
+                )
+                // ME4-4.2.2b2 (design §2.4): registered UNCONDITIONALLY, same
+                // rule as every method above — `model_grant` is `None` for a
+                // module that does not hold `Capability::Models`, and the
+                // handler itself turns that into `forbidden` (§4.4).
+                .with(
+                    "_a24/model/complete",
+                    Arc::new(crate::model_callback::ModelCompleteHandler {
+                        generation: generation.clone(),
+                        grant: model_grant.clone(),
+                    }),
+                )
+        },
+    )
+}
+
 /// Mount one admitted, enabled package: start it under a supervisor — kept in
 /// `host.supervisors` — and put the kernel's proxy in front of it. Returns the
 /// router and the report.
@@ -1273,6 +1576,9 @@ async fn mount_package(
     partitions: &mut crate::os_memory::OsMemoryCatalog,
     host: std::result::Result<&ProcessHost, &str>,
     approval_broker: &Arc<crate::module_approval_broker::ModuleApprovalBroker>,
+    // ME4-1.4.1 (design §10.3): borrowed, never by value — `CallbackDeps`
+    // itself is only dropped when `mount_all` returns.
+    deps: &CallbackDeps,
 ) -> (Router, MountReport) {
     let MountTarget {
         name,
@@ -1387,15 +1693,27 @@ async fn mount_package(
             .map(|(scoped, _partition, admission, _lease)| (scoped.clone(), admission.clone())),
     );
     let memory_grant = crate::os_memory::memory_grant_name(&memory_entitlement);
+    // ME4-4.2.2b2 (design §2.4): `None` unless BOTH the module requested and
+    // was granted `Capability::Models` AND this daemon built model deps
+    // (`deps.models` — `None` only in tests that don't wire a router; `serve()`
+    // always builds one). Built once here, outside `build_methods_for`'s
+    // `MethodsFor` closure, same reason as `memory_entitlement` above.
+    let model_grant = crate::model_callback::model_grant(
+        &name,
+        manifest.model_access(),
+        &granted,
+        deps.models.as_ref(),
+    );
     // `granted` must name what the module ACTUALLY holds (invariant #134),
     // so a `granted.has(Capability::Memory)` that did not turn into a real
     // handle (`lend()` failed, or ephemeral has no admission) must not
     // appear here — the same rule the in-process path already applies via
-    // `scoped.is_some()`.
+    // `scoped.is_some()`. Same rule for `models` via `model_grant.is_some()`.
     let granted_names: Vec<String> = granted
         .iter()
         .map(|c| c.as_str().to_owned())
         .filter(|c| c != Capability::Memory.as_str() || memory_grant.is_some())
+        .filter(|c| c != Capability::Models.as_str() || model_grant.is_some())
         .collect();
     // T7b/ME-3e: additive, not if/else (design doc §"现状" 1) — a module
     // granted ONLY `approval` (not `events`) must still get a non-empty
@@ -1410,122 +1728,27 @@ async fn mount_package(
     if memory_grant.is_some() {
         provides.push("_a24/memory/private/".to_owned());
     }
+    // ME4-1.4.1 (design §6.5): additive, same rule as the three above — a
+    // module granted ONLY `scheduler` still gets it listed.
+    if granted.has(Capability::Scheduler) {
+        provides.push("_a24/scheduler/".to_owned());
+    }
+    // ME4-4.2.2b2 (design §2.4): additive, same rule — a module granted ONLY
+    // `models` still gets it listed. `provides` names a capability exactly
+    // when `model_grant` is `Some`, never merely because `granted.has(..)`.
+    if model_grant.is_some() {
+        provides.push("_a24/model/".to_owned());
+    }
     let offer = agent24_os_proto::initialize::Offer { provides };
-    let methods_for: agent24_os_proto::supervisor::MethodsFor = {
-        let name = name.clone();
-        let granted = granted.clone();
-        let event_sink = event_sink.clone();
-        let approval_broker = approval_broker.clone();
-        // T8.5c-W-mount decision 3: captured HERE, outside the `move`
-        // closure below, and only `.clone()`d inside it — the opposite of
-        // `_a24/events/emit`'s limiter, which is deliberately rebuilt every
-        // generation. `memory_entitlement` was already computed exactly
-        // once for this mount (above); if it were not captured into this
-        // closure at all, the `Arc<RateLimiter>`/`Arc<Semaphore>` it holds
-        // would be dropped the moment `mount_package` returns, and nothing
-        // would keep decision 3's "one limiter per mount, reused across
-        // every restart generation" promise.
-        let memory_entitlement = memory_entitlement.clone();
-        Arc::new(
-            move |generation: &Arc<agent24_os_proto::drain::Generation>| {
-                // This inner clone itself only lives to the end of THIS
-                // `MethodsFor` call — the returned `Methods` does not carry
-                // it anywhere. What actually persists across restarts is the
-                // OUTER `memory_entitlement` binding above: it is captured
-                // by THIS `move` closure once, and the closure itself
-                // (`Arc<dyn Fn>`) is what the supervisor loop holds for the
-                // module's whole supervised lifetime, calling it once per
-                // generation. Each of the three `_a24/memory/private/*`
-                // Handlers below reads from a clone made HERE, inside the
-                // closure body — so a restarted generation's Handlers still
-                // see the same mount-time `Arc<RateLimiter>`/`Arc<Semaphore>`
-                // (T8.5c-W-mount decision 3/4), never a freshly-built one.
-                let memory_entitlement = memory_entitlement.clone();
-                // A fresh bucket every time this closure runs — once per
-                // generation, i.e. once per (re)start. Building it outside the
-                // closure and cloning the `Arc` in would let a restarted module
-                // inherit whatever quota the previous generation had already
-                // spent (Codex round 3 Medium 2).
-                let limiter = Arc::new(crate::events_emit::RateLimiter::new(
-                    crate::events_emit::EVENTS_RATE_CAPACITY,
-                    crate::events_emit::EVENTS_RATE_REFILL_PER_SEC,
-                ));
-                // T7b/ME-3e: the three approval methods are registered
-                // UNCONDITIONALLY, exactly like `_a24/events/emit` above —
-                // capability gating happens INSIDE each handler's `call()`,
-                // not by conditionally registering the method (design doc
-                // decision 4).
-                agent24_os_proto::rpc::Methods::none()
-                    .with(
-                        "_a24/events/emit",
-                        Arc::new(crate::events_emit::EventsEmitHandler {
-                            generation: generation.clone(),
-                            name: name.clone(),
-                            granted: granted.clone(),
-                            sink: event_sink.clone(),
-                            limiter,
-                        }),
-                    )
-                    .with(
-                        "_a24/approval/gate",
-                        Arc::new(crate::approval_callback::ApprovalSubmitHandler {
-                            generation: generation.clone(),
-                            module: name.clone(),
-                            granted: granted.clone(),
-                            kind: agent24_protocol::ModuleApprovalKind::Gate,
-                            broker: approval_broker.clone(),
-                        }),
-                    )
-                    .with(
-                        "_a24/approval/advise",
-                        Arc::new(crate::approval_callback::ApprovalSubmitHandler {
-                            generation: generation.clone(),
-                            module: name.clone(),
-                            granted: granted.clone(),
-                            kind: agent24_protocol::ModuleApprovalKind::Advise,
-                            broker: approval_broker.clone(),
-                        }),
-                    )
-                    .with(
-                        "_a24/approval/status",
-                        Arc::new(crate::approval_callback::ApprovalStatusHandler {
-                            module: name.clone(),
-                            granted: granted.clone(),
-                            broker: approval_broker.clone(),
-                        }),
-                    )
-                    // T8.5c-W-wire decision W4: registered UNCONDITIONALLY,
-                    // exactly like `_a24/events/emit`/the three approval
-                    // methods above — `entitlement.private_handle()` is
-                    // checked INSIDE each handler's `call()` (mount design
-                    // §2.1), not by conditionally registering the method.
-                    // `_a24/memory/scoped/*` (decision W6) is deliberately
-                    // NOT registered anywhere in this crate — see
-                    // `memory_callback`'s module doc.
-                    .with(
-                        "_a24/memory/private/remember",
-                        Arc::new(crate::memory_callback::RememberHandler {
-                            generation: generation.clone(),
-                            entitlement: memory_entitlement.clone(),
-                        }),
-                    )
-                    .with(
-                        "_a24/memory/private/recall",
-                        Arc::new(crate::memory_callback::RecallHandler {
-                            generation: generation.clone(),
-                            entitlement: memory_entitlement.clone(),
-                        }),
-                    )
-                    .with(
-                        "_a24/memory/private/recent",
-                        Arc::new(crate::memory_callback::RecentHandler {
-                            generation: generation.clone(),
-                            entitlement: memory_entitlement.clone(),
-                        }),
-                    )
-            },
-        )
-    };
+    let methods_for: agent24_os_proto::supervisor::MethodsFor = build_methods_for(
+        name.clone(),
+        granted.clone(),
+        event_sink.clone(),
+        approval_broker.clone(),
+        memory_entitlement.clone(),
+        deps.scheduler.clone(),
+        model_grant,
+    );
 
     let current =
         agent24_os_proto::drain::Current::new(agent24_os_proto::drain::Generation::starting());
@@ -1621,7 +1844,7 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use agent24_domain::{DomainOsManifest, Result as DomainResult};
+    use agent24_domain::{DomainOsManifest, ModelAccess, Result as DomainResult};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -1643,6 +1866,61 @@ pub(crate) mod tests {
             agent24_store::Store::open_memory().await.unwrap(),
             hub.clone(),
         )
+    }
+
+    /// ME4-1.4.1: a throwaway `RunTrigger` for [`test_callback_deps`] — its
+    /// `Scheduler` handle only needs to exist and be minimally usable for
+    /// these `mount_all`/`mount_package` tests (none of which drive the tick
+    /// loop or a real fire), so every fire is answered the same way
+    /// `KernelTrigger` (`server.rs`) answers a module row before ME4-1.3.1
+    /// wires a real deliverer: `Deferred(MountPending)`.
+    struct NoopTrigger;
+
+    #[async_trait::async_trait]
+    impl agent24_scheduler::RunTrigger for NoopTrigger {
+        async fn trigger(
+            &self,
+            _invocation: &agent24_scheduler::ScheduleInvocation,
+        ) -> agent24_scheduler::FireOutcome {
+            agent24_scheduler::FireOutcome::Deferred {
+                reason: agent24_scheduler::DeferReason::MountPending,
+            }
+        }
+    }
+
+    /// A throwaway [`CallbackDeps`] for tests that don't care about the
+    /// scheduler handle's own behaviour — a fresh in-memory store, so it
+    /// shares nothing with whatever the test's own `hub`/store are. `models`
+    /// is `None`: these tests don't exercise model routing (a real `serve()`
+    /// always builds one — see [`test_callback_deps_with_models`] for the
+    /// tests that do care).
+    async fn test_callback_deps() -> CallbackDeps {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        CallbackDeps {
+            scheduler: agent24_scheduler::Scheduler::new(
+                store,
+                Arc::new(NoopTrigger),
+                Arc::new(|_body: EventBody| {}),
+            ),
+            models: None,
+        }
+    }
+
+    /// Same as [`test_callback_deps`], but with a real (routerless)
+    /// `ModelCallbackDeps` — for J2/J10 tests that need `granted.has(Models)`
+    /// to actually produce a grant.
+    async fn test_callback_deps_with_models() -> CallbackDeps {
+        let mut deps = test_callback_deps().await;
+        deps.models = Some(crate::model_callback::ModelCallbackDeps {
+            router: Arc::new(agent24_models::router::ModelRouter::with_defaults(vec![])),
+            usage: Arc::new(crate::model_callback::MemoryUsageSink::default()),
+            cancel_root: tokio_util::sync::CancellationToken::new(),
+            admission: crate::model_callback::ModelAdmission::new(
+                crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+                crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+            ),
+        });
+        deps
     }
 
     /// A model catalogue under the test's control.
@@ -1698,6 +1976,7 @@ pub(crate) mod tests {
             None,
             Err("no process host in this test"),
             &test_approval_broker(hub).await,
+            test_callback_deps().await,
         )
         .await;
         (app, reports)
@@ -1967,8 +2246,18 @@ emit_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/events/emit",
             "params": {"kind": "task.transitioned", "payload": {"x": 1}}}
 cb.sendall((json.dumps(emit_req) + "\n").encode())
 emit_resp = json.loads(f.readline())
-with open("probe.json", "w") as out:
+# Write-to-temp + rename is atomic on the same filesystem (POSIX rename(2)):
+# a plain `open(..., "w")` truncates the file before any bytes are written
+# (and the buffered writer may not flush until `close()`), so a concurrent
+# reader can observe an empty or partial file — this is what let
+# `granted_and_offer_and_the_real_call_agree_for_both_outcomes` fail with
+# "EOF while parsing a value" under load (FU-78). This way any concurrent
+# reader sees either the old (absent) file or the new complete one, never
+# a half-written one. See `me3f_blackbox.rs`'s `dump_atomic` for the same
+# pattern.
+with open("probe.json.tmp", "w") as out:
     json.dump({"offers_events": offers_events, "emit_response": emit_resp}, out)
+os.replace("probe.json.tmp", "probe.json")
 while f.readline():
     pass
 "#;
@@ -2072,6 +2361,7 @@ while f.readline():
             None,
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(
@@ -2133,6 +2423,7 @@ while f.readline():
             None,
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         match &reports[0].outcome {
@@ -2204,8 +2495,17 @@ status_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/approval/status",
               "params": {"approval_id": "does-not-exist"}}
 cb.sendall((json.dumps(status_req) + "\n").encode())
 status_resp = json.loads(f.readline())
-with open("probe.json", "w") as out:
+# Write-to-temp + rename is atomic on the same filesystem (POSIX rename(2)):
+# a plain `open(..., "w")` truncates the file before any bytes are written
+# (and the buffered writer may not flush until `close()`), so a concurrent
+# reader can observe an empty or partial file — this is what let this test
+# fail with "EOF while parsing a value" under load (FU-78). This way any
+# concurrent reader sees either the old (absent) file or the new complete
+# one, never a half-written one. See `me3f_blackbox.rs`'s `dump_atomic` for
+# the same pattern.
+with open("probe.json.tmp", "w") as out:
     json.dump({"offers_approval": offers_approval, "status_response": status_resp}, out)
+os.replace("probe.json.tmp", "probe.json")
 while f.readline():
     pass
 "#;
@@ -2237,6 +2537,7 @@ while f.readline():
                 None,
                 Ok(&host),
                 &test_approval_broker(&hub).await,
+                test_callback_deps().await,
             )
             .await;
             assert_eq!(
@@ -2328,6 +2629,7 @@ while f.readline():
                 None,
                 Ok(&host),
                 &test_approval_broker(&hub).await,
+                test_callback_deps().await,
             )
             .await;
             assert_eq!(
@@ -2417,6 +2719,7 @@ while f.readline():
             None,
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         let mut status = host.supervisors.statuses().remove("remote").unwrap();
@@ -2507,6 +2810,7 @@ raise SystemExit(3)
             None,
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -2595,6 +2899,7 @@ raise SystemExit(3)
             None,
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         let mut status = host.supervisors.statuses().remove("remote").unwrap();
@@ -2682,6 +2987,7 @@ raise SystemExit(3)
             None,
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         let drain = std::time::Duration::from_secs(10);
@@ -2740,6 +3046,7 @@ raise SystemExit(3)
             None,
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Disabled);
@@ -2770,6 +3077,7 @@ raise SystemExit(3)
             None,
             Err("the callback directory is not ours"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         match &reports[0].outcome {
@@ -3214,6 +3522,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &broker,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -3321,6 +3630,7 @@ raise SystemExit(3)
             Some(&lease),
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -3378,6 +3688,7 @@ raise SystemExit(3)
             Some(&lease),
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert!(m.ctx().unwrap().memory().is_none());
@@ -3412,6 +3723,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted, "it still mounts");
@@ -3471,6 +3783,7 @@ raise SystemExit(3)
             Some(&lease),
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -3646,6 +3959,7 @@ raise SystemExit(3)
             Some(&lease),
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(
@@ -3710,6 +4024,7 @@ raise SystemExit(3)
             Some(&lease),
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -3767,6 +4082,7 @@ raise SystemExit(3)
             Some(&lease),
             Ok(&host),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -3813,6 +4129,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -3874,6 +4191,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&st.events).await,
+            test_callback_deps().await,
         )
         .await;
         let app = crate::server::build_router_with_modules(st, modules);
@@ -3917,6 +4235,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -3950,6 +4269,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -4009,6 +4329,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert!(matches!(reports[0].outcome, MountOutcome::Degraded(_)));
@@ -4040,6 +4361,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(
@@ -4074,6 +4396,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(
@@ -4109,6 +4432,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -4134,6 +4458,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -4164,6 +4489,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(reports[0].outcome, MountOutcome::Mounted);
@@ -4217,6 +4543,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert!(
@@ -4271,6 +4598,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -4310,6 +4638,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -4371,6 +4700,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -4409,6 +4739,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -4523,6 +4854,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
 
@@ -4560,6 +4892,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         match &reports[0].resources {
@@ -4584,6 +4917,7 @@ raise SystemExit(3)
             None,
             Err("no process host in this test"),
             &test_approval_broker(&hub).await,
+            test_callback_deps().await,
         )
         .await;
         assert_eq!(reports[0].resources, ResourceStatus::Satisfied);
@@ -4625,6 +4959,598 @@ raise SystemExit(3)
             matches!(reports[0].outcome, MountOutcome::Refused(_)),
             "{:?}",
             reports[0]
+        );
+    }
+
+    // ── ME4-1.4.1 (design §6, §11 C5.1) ─────────────────────────────────────
+    //
+    // Named with a `scheduler_callback` substring so `cargo test -p agent24d
+    // scheduler_callback` selects it alongside `crate::scheduler_callback`'s
+    // own unit tests, even though a real handshake needs this module's own
+    // out-of-process test rig (`write_package_with`/`discovered`/`test_host`),
+    // which `scheduler_callback.rs` itself has no access to.
+
+    const SCHEDULER_PROBE_MODULE: &str = r#"import hashlib, json, os, socket, threading
+name = os.environ["A24_MODULE_NAME"]
+with open("domain-os.yml", "rb") as f:
+    digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+def serve():
+    while True:
+        conn, _ = listener.accept()
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+cb = socket.socket(socket.AF_UNIX)
+cb.connect(os.environ["A24_CALLBACK_SOCK"])
+req = {"jsonrpc": "2.0", "id": "1", "method": "initialize", "params": {
+    "protocol_versions": {"min": 1, "max": 1000}, "module": name,
+    "manifest_digest": digest, "auth_token": os.environ["A24_HANDSHAKE_TOKEN"],
+    "capabilities": []}}
+cb.sendall((json.dumps(req) + "\n").encode())
+f = cb.makefile("rb")
+init_resp = json.loads(f.readline())
+provides = init_resp.get("result", {}).get("offer", {}).get("provides", [])
+offers_scheduler = any("_a24/scheduler/upsert".startswith(p) for p in provides)
+upsert_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/scheduler/upsert",
+              "params": {"key": "probe.key", "spec": {"type": "every", "secs": 3600}}}
+cb.sendall((json.dumps(upsert_req) + "\n").encode())
+upsert_resp = json.loads(f.readline())
+with open("probe.json", "w") as out:
+    json.dump({"offers_scheduler": offers_scheduler, "upsert_response": upsert_resp}, out)
+while f.readline():
+    pass
+"#;
+
+    /// C5.1, over a REAL package process and a REAL `initialize` handshake:
+    /// a module granted `scheduler` gets `MountReport.granted == ["scheduler"]`,
+    /// its handshake's `offer.provides` includes `_a24/scheduler/upsert`, and a
+    /// real `_a24/scheduler/upsert` call over its callback socket succeeds. A
+    /// module granted SOME OTHER capability — `events`, not `scheduler`
+    /// (review round 2, M3: not "granted nothing at all", which a bug like
+    /// `if !granted.is_empty() { push(...) }` would still pass) — gets the
+    /// negative of all three: `granted == ["events"]`, no scheduler offer,
+    /// and the scheduler call comes back `forbidden` (proving the method
+    /// exists — it is NOT `-32601` — but this module cannot use it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_callback_forbidden_without_grant_and_offered_and_working_with_it() {
+        for (name, capabilities, expect_granted) in [
+            ("granted", "[scheduler]", true),
+            ("ungranted", "[events]", false),
+        ] {
+            let tmp = tempfile::Builder::new()
+                .prefix("a24")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let packages = tmp.path().join("packages");
+            write_package_with(&packages, name, capabilities, SCHEDULER_PROBE_MODULE);
+            let host = test_host(tmp.path());
+            let hub = crate::events::EventsHub::default();
+            // Review round 2, M2: kept independently of `CallbackDeps` (which
+            // is deliberately not `Clone`, L3) so the test can inspect the
+            // SAME `Scheduler`/store `mount_all` was actually given, after
+            // the real subprocess call below.
+            let deps = test_callback_deps().await;
+            let scheduler_handle = deps.scheduler.clone();
+            let (_, reports, _) = mount_all(
+                &discovered(&packages),
+                &tmp.path().join("os"),
+                &hub,
+                Ok(&all_enabled()),
+                &no_models(),
+                None,
+                Ok(&host),
+                &test_approval_broker(&hub).await,
+                deps,
+            )
+            .await;
+            assert_eq!(
+                reports[0].outcome,
+                MountOutcome::Mounted,
+                "{:?}",
+                reports[0]
+            );
+            assert_eq!(
+                reports[0].granted,
+                if expect_granted {
+                    vec!["scheduler".to_owned()]
+                } else {
+                    vec!["events".to_owned()]
+                },
+                "MountReport.granted for {name:?}"
+            );
+
+            let probe_path = packages.join(name).join("probe.json");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let probe: serde_json::Value = loop {
+                if let Ok(bytes) = std::fs::read(&probe_path) {
+                    break serde_json::from_slice(&bytes).unwrap();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the module never wrote its probe"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+
+            assert_eq!(
+                probe["offers_scheduler"].as_bool(),
+                Some(expect_granted),
+                "the real handshake's offer for {name:?} must include \
+                 `_a24/scheduler/` exactly when granted"
+            );
+            let upsert_response = &probe["upsert_response"];
+            if expect_granted {
+                assert!(
+                    upsert_response.get("error").is_none(),
+                    "a granted module's real upsert call must succeed: {upsert_response}"
+                );
+                assert_eq!(
+                    upsert_response["result"]["outcome"].as_str(),
+                    Some("created"),
+                    "{upsert_response}"
+                );
+                // Review round 2, M2: the row really landed in the STORE
+                // `mount_all` was given, under the MOUNT's own name as owner
+                // (never anything the module could claim in `params`) — the
+                // callback handler's `owner` field pinned to the mount
+                // identity, proven from outside the callback entirely.
+                let rows = scheduler_handle.list_module(name).await.unwrap();
+                assert!(
+                    rows.iter().any(|r| r.key == "probe.key"),
+                    "the real upsert must have landed under owner {name:?}: {rows:?}"
+                );
+            } else {
+                assert_eq!(
+                    upsert_response["error"]["data"]["kind"].as_str(),
+                    Some("forbidden"),
+                    "an ungranted module's real call: {upsert_response}"
+                );
+            }
+
+            for s in host.supervisors.close().running {
+                s.handle.stop().await.expect("a clean stop");
+            }
+        }
+    }
+
+    // ── ME4-4.2.2b2 (design §2.4, §8 J2) ────────────────────────────────────
+
+    const MODEL_PROBE_MODULE: &str = r#"import hashlib, json, os, socket, threading
+name = os.environ["A24_MODULE_NAME"]
+with open("domain-os.yml", "rb") as f:
+    digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+listener = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+def serve():
+    while True:
+        conn, _ = listener.accept()
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+cb = socket.socket(socket.AF_UNIX)
+cb.connect(os.environ["A24_CALLBACK_SOCK"])
+req = {"jsonrpc": "2.0", "id": "1", "method": "initialize", "params": {
+    "protocol_versions": {"min": 1, "max": 1000}, "module": name,
+    "manifest_digest": digest, "auth_token": os.environ["A24_HANDSHAKE_TOKEN"],
+    "capabilities": []}}
+cb.sendall((json.dumps(req) + "\n").encode())
+f = cb.makefile("rb")
+init_resp = json.loads(f.readline())
+provides = init_resp.get("result", {}).get("offer", {}).get("provides", [])
+offers_model = any("_a24/model/complete".startswith(p) for p in provides)
+complete_req = {"jsonrpc": "2.0", "id": "2", "method": "_a24/model/complete",
+                "params": {"messages": [{"role": "user", "content": "hi"}]}}
+cb.sendall((json.dumps(complete_req) + "\n").encode())
+complete_resp = json.loads(f.readline())
+with open("probe.json", "w") as out:
+    json.dump({"offers_model": offers_model, "complete_response": complete_resp}, out)
+while f.readline():
+    pass
+"#;
+
+    /// J2, over a REAL package process and a REAL `initialize` handshake —
+    /// same shape as `scheduler_callback_forbidden_without_grant_and_offered_and_working_with_it`
+    /// above: a module granted `models` gets `MountReport.granted ==
+    /// ["models"]`, its handshake's `offer.provides` includes
+    /// `_a24/model/complete`, and a real call over its callback socket is
+    /// NOT `forbidden` (the router has no providers in this test, so it
+    /// comes back `unavailable` — proving the method is reachable and
+    /// routes, not that it succeeds). A module granted some OTHER
+    /// capability gets the negative of all three: `granted == ["events"]`,
+    /// no model offer, and the call comes back `forbidden` (proving the
+    /// method exists — it is NOT `-32601` — but this module cannot use it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_grant_forbidden_without_it_offered_and_working_with_it() {
+        for (name, capabilities, expect_granted) in [
+            ("modelgranted", "[models]", true),
+            ("modelungranted", "[events]", false),
+        ] {
+            let tmp = tempfile::Builder::new()
+                .prefix("a24")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let packages = tmp.path().join("packages");
+            write_package_with(&packages, name, capabilities, MODEL_PROBE_MODULE);
+            let host = test_host(tmp.path());
+            let hub = crate::events::EventsHub::default();
+            let deps = test_callback_deps_with_models().await;
+            let (_, reports, _) = mount_all(
+                &discovered(&packages),
+                &tmp.path().join("os"),
+                &hub,
+                Ok(&all_enabled()),
+                &no_models(),
+                None,
+                Ok(&host),
+                &test_approval_broker(&hub).await,
+                deps,
+            )
+            .await;
+            assert_eq!(
+                reports[0].outcome,
+                MountOutcome::Mounted,
+                "{:?}",
+                reports[0]
+            );
+            assert_eq!(
+                reports[0].granted,
+                if expect_granted {
+                    vec!["models".to_owned()]
+                } else {
+                    vec!["events".to_owned()]
+                },
+                "MountReport.granted for {name:?}"
+            );
+
+            let probe_path = packages.join(name).join("probe.json");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let probe: serde_json::Value = loop {
+                if let Ok(bytes) = std::fs::read(&probe_path) {
+                    break serde_json::from_slice(&bytes).unwrap();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the module never wrote its probe"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+
+            assert_eq!(
+                probe["offers_model"].as_bool(),
+                Some(expect_granted),
+                "the real handshake's offer for {name:?} must include \
+                 `_a24/model/` exactly when granted"
+            );
+            let complete_response = &probe["complete_response"];
+            if expect_granted {
+                assert_ne!(
+                    complete_response["error"]["data"]["kind"].as_str(),
+                    Some("forbidden"),
+                    "a granted module's real call must reach the router, not be refused: \
+                     {complete_response}"
+                );
+                assert_eq!(
+                    complete_response["error"]["data"]["kind"].as_str(),
+                    Some("unavailable"),
+                    "no provider is configured in this test, so the router itself must \
+                     refuse it: {complete_response}"
+                );
+            } else {
+                assert_eq!(
+                    complete_response["error"]["data"]["kind"].as_str(),
+                    Some("forbidden"),
+                    "an ungranted module's real call: {complete_response}"
+                );
+            }
+
+            for s in host.supervisors.close().running {
+                s.handle.stop().await.expect("a clean stop");
+            }
+        }
+    }
+
+    /// M1 (Opus review round on top of `bb6fb0e`): J2's missing negative —
+    /// a module that DOES request `models` and IS granted the capability
+    /// (`granted.has(Capability::Models)` is true) must still get NOTHING if
+    /// the daemon itself has no model deps configured (`CallbackDeps.models:
+    /// None` — `test_callback_deps()`, not `_with_models()`). `model_grant`
+    /// is the AND of both halves (design §2.4): `MountReport.granted` must
+    /// not list `models`, `provides` must not include `_a24/model/`, and a
+    /// real call must come back `forbidden` — the exact same observable
+    /// shape as a module that never asked for `models` at all (invariant
+    /// #134, same rule `memory_grant.is_some()` already follows for memory).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_grant_is_none_when_the_daemon_has_no_model_deps_even_if_granted() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package_with(&packages, "modelnodeps", "[models]", MODEL_PROBE_MODULE);
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        // `models: None` — the daemon built no router at all, unlike
+        // `test_callback_deps_with_models()`.
+        let deps = test_callback_deps().await;
+        let (_, reports, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            deps,
+        )
+        .await;
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "{:?}",
+            reports[0]
+        );
+        assert_eq!(
+            reports[0].granted,
+            Vec::<String>::new(),
+            "requesting models when the daemon has no model deps must not be granted: {:?}",
+            reports[0]
+        );
+
+        let probe_path = packages.join("modelnodeps").join("probe.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let probe: serde_json::Value = loop {
+            if let Ok(bytes) = std::fs::read(&probe_path) {
+                break serde_json::from_slice(&bytes).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the module never wrote its probe"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            probe["offers_model"].as_bool(),
+            Some(false),
+            "no `_a24/model/` offer when the daemon has no model deps, even \
+             though the module was granted the capability: {probe}"
+        );
+        assert_eq!(
+            probe["complete_response"]["error"]["data"]["kind"].as_str(),
+            Some("forbidden"),
+            "{}",
+            probe["complete_response"]
+        );
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// Review round 2, M2 (second half): the ONLY way to actually exercise
+    /// (and mutation-test) "the scheduler token bucket is built OUTSIDE
+    /// `build_methods_for`'s per-generation closure, so a restart reuses it"
+    /// is to call the REAL `build_methods_for` and invoke its returned
+    /// closure TWICE — a real subprocess crash-restart would prove the same
+    /// thing, but far more slowly and with no more coverage of the actual
+    /// bug surface (which is purely: where, textually, does
+    /// `RateLimiter::new` sit?). Real `dispatch()` + real `Handler::call()`
+    /// against BOTH `Methods` values, no mocks.
+    #[tokio::test]
+    async fn scheduler_token_bucket_survives_a_restart_through_the_real_build_methods_for() {
+        let hub = crate::events::EventsHub::default();
+        let broker = test_approval_broker(&hub).await;
+        let deps = test_callback_deps().await;
+        let granted = Grants::granting(&[Capability::Scheduler], KERNEL_OOP_GRANTS);
+        let methods_for = build_methods_for(
+            "probe".to_owned(),
+            granted,
+            None,
+            broker,
+            crate::os_memory::MemoryEntitlement::NONE,
+            deps.scheduler.clone(),
+            None,
+        );
+
+        async fn call_list(
+            methods: &agent24_os_proto::rpc::Methods,
+            id: usize,
+        ) -> Result<serde_json::Value, agent24_os_proto::rpc::RpcError> {
+            let frame = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0", "id": id.to_string(), "method": "_a24/scheduler/list", "params": {},
+            }))
+            .unwrap();
+            match agent24_os_proto::rpc::dispatch(&frame, methods, &|_| false) {
+                agent24_os_proto::rpc::Dispatch::Call {
+                    handler, params, ..
+                } => handler.call(params).await,
+                agent24_os_proto::rpc::Dispatch::Respond(r) => r.outcome,
+                _ => panic!("unexpected dispatch outcome (Cancel/Ignore) for a plain call"),
+            }
+        }
+
+        // Generation 1 (the module's first start).
+        let gen1 =
+            agent24_os_proto::drain::Generation::serving_at("/tmp/does-not-need-to-exist".into());
+        assert!(gen1.ready());
+        let methods1 = methods_for(&gen1);
+        for i in 0..300 {
+            call_list(&methods1, i)
+                .await
+                .unwrap_or_else(|e| panic!("call {i} must succeed: {e:?}"));
+        }
+        let err = call_list(&methods1, 300).await.unwrap_err();
+        assert_eq!(
+            err.kind,
+            Some(agent24_os_proto::rpc::ErrorKind::RateLimited)
+        );
+
+        // "Restart": the supervisor calls `methods_for` again with a NEW
+        // `Generation` after a crash — same closure, same captured
+        // `Arc<RateLimiter>`. Still exhausted.
+        let gen2 =
+            agent24_os_proto::drain::Generation::serving_at("/tmp/does-not-need-to-exist".into());
+        assert!(gen2.ready());
+        let methods2 = methods_for(&gen2);
+        let err2 = call_list(&methods2, 0).await.unwrap_err();
+        assert_eq!(
+            err2.kind,
+            Some(agent24_os_proto::rpc::ErrorKind::RateLimited),
+            "the bucket must not reset across a restart — if this went green after \
+             moving `RateLimiter::new` for the scheduler bucket INSIDE the \
+             `move |generation| {{…}}` closure, that mutation was not caught"
+        );
+    }
+
+    /// J10 (跨代, design §8): same shape as
+    /// `scheduler_token_bucket_survives_a_restart_through_the_real_build_methods_for`
+    /// above, for `model_grant` — built ONCE by `mount_package` (here: the
+    /// test itself, standing in for it) and merely `.clone()`d inside
+    /// `build_methods_for`'s per-generation closure. A restarted generation
+    /// must see the SAME `Arc<RateLimiter>`, not a fresh one. Positive
+    /// control: a DIFFERENT module's first call is unaffected — proving the
+    /// exhaustion is per-module, not a global fluke.
+    #[tokio::test]
+    async fn model_callback_rate_survives_a_restart_through_the_real_build_methods_for() {
+        let hub = crate::events::EventsHub::default();
+        let broker = test_approval_broker(&hub).await;
+        let deps = test_callback_deps_with_models().await;
+
+        async fn call_complete(
+            methods: &agent24_os_proto::rpc::Methods,
+            id: usize,
+        ) -> Result<serde_json::Value, agent24_os_proto::rpc::RpcError> {
+            let frame = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0", "id": id.to_string(), "method": "_a24/model/complete",
+                "params": {"messages": [{"role": "user", "content": "hi"}]},
+            }))
+            .unwrap();
+            match agent24_os_proto::rpc::dispatch(&frame, methods, &|_| false) {
+                agent24_os_proto::rpc::Dispatch::Call {
+                    handler, params, ..
+                } => handler.call(params).await,
+                agent24_os_proto::rpc::Dispatch::Respond(r) => r.outcome,
+                _ => panic!("unexpected dispatch outcome (Cancel/Ignore) for a plain call"),
+            }
+        }
+
+        // L2 (Opus review round on top of `bb6fb0e`): a frozen, ADVANCEABLE
+        // clock (same shape as model_callback.rs's own
+        // `the_31st_call_is_rate_limited_and_refill_lets_the_32nd_through`)
+        // — no dependency on the wall clock actually taking 0.5 tokens/sec
+        // to refill during the loop below, and it lets a positive control
+        // advance time by exactly 2s to prove the SAME bucket refills rather
+        // than merely staying exhausted forever. Built directly via
+        // `ModelGrant::with_clock`, bypassing `crate::model_callback::model_grant`
+        // (whose granted/deps gating is already J2/M1's job, not J10's).
+        struct Movable(std::sync::Mutex<std::time::Instant>);
+        impl crate::events_emit::Clock for Movable {
+            fn now(&self) -> std::time::Instant {
+                *self.0.lock().unwrap()
+            }
+        }
+        let clock = Arc::new(Movable(std::sync::Mutex::new(std::time::Instant::now())));
+
+        let granted = Grants::granting(&[Capability::Models], KERNEL_OOP_GRANTS);
+        let model_grant = crate::model_callback::ModelGrant::with_clock(
+            "probe".to_owned(),
+            ModelAccess::LocalOnly,
+            deps.models
+                .clone()
+                .expect("test_callback_deps_with_models sets this"),
+            clock.clone(),
+        );
+        let methods_for = build_methods_for(
+            "probe".to_owned(),
+            granted,
+            None,
+            broker.clone(),
+            crate::os_memory::MemoryEntitlement::NONE,
+            deps.scheduler.clone(),
+            Some(model_grant),
+        );
+
+        // Generation 1: exhaust the 30-call burst. No provider is configured
+        // (`test_callback_deps_with_models`'s router is empty), so every call
+        // reaches the router and fails `unavailable` — admission and the
+        // token bucket are both spent BEFORE routing (§5, "busy 不花令牌" is
+        // the ONE exception), so this still exhausts the bucket.
+        let gen1 = agent24_os_proto::drain::Generation::serving_at(
+            "/tmp/me4s2b2-does-not-need-to-exist".into(),
+        );
+        assert!(gen1.ready());
+        let methods1 = methods_for(&gen1);
+        for i in 0..30 {
+            let err = call_complete(&methods1, i).await.unwrap_err();
+            assert_eq!(
+                err.kind,
+                Some(agent24_os_proto::rpc::ErrorKind::Unavailable),
+                "call {i}: {err:?}"
+            );
+        }
+        let err30 = call_complete(&methods1, 30).await.unwrap_err();
+        assert_eq!(
+            err30.kind,
+            Some(agent24_os_proto::rpc::ErrorKind::RateLimited)
+        );
+
+        // "Restart": the supervisor calls `methods_for` again with a NEW
+        // `Generation` after a crash — same closure, same captured
+        // `ModelGrant` (same `Arc<RateLimiter>`). Still exhausted.
+        let gen2 = agent24_os_proto::drain::Generation::serving_at(
+            "/tmp/me4s2b2-does-not-need-to-exist".into(),
+        );
+        assert!(gen2.ready());
+        let methods2 = methods_for(&gen2);
+        let err2 = call_complete(&methods2, 0).await.unwrap_err();
+        assert_eq!(
+            err2.kind,
+            Some(agent24_os_proto::rpc::ErrorKind::RateLimited),
+            "the bucket must not reset across a restart — if this went green after \
+             moving `model_grant` construction INSIDE the `move |generation| {{…}}` \
+             closure, that mutation was not caught"
+        );
+
+        // L2 positive control: MODEL_RATE_REFILL_PER_SEC = 0.5, so +2s on the
+        // SAME clock (still the same `Arc<RateLimiter>`, second generation)
+        // refills exactly one token — proving the bucket is a real,
+        // refilling rate limiter and not merely "always empty after any use".
+        *clock.0.lock().unwrap() += std::time::Duration::from_secs(2);
+        let err_after_refill = call_complete(&methods2, 1).await.unwrap_err();
+        assert_eq!(
+            err_after_refill.kind,
+            Some(agent24_os_proto::rpc::ErrorKind::Unavailable),
+            "one token refilled after 2s must let the call reach the (empty) \
+             router, not stay rate-limited: {err_after_refill:?}"
+        );
+
+        // Positive control: a DIFFERENT module's `ModelGrant` is a fresh
+        // bucket — proving the exhaustion above is per-module, not global
+        // (the two share the SAME `ModelAdmission`, from the same `deps`).
+        let granted_other = Grants::granting(&[Capability::Models], KERNEL_OOP_GRANTS);
+        let model_grant_other = crate::model_callback::model_grant(
+            "other",
+            ModelAccess::LocalOnly,
+            &granted_other,
+            deps.models.as_ref(),
+        );
+        let methods_for_other = build_methods_for(
+            "other".to_owned(),
+            granted_other,
+            None,
+            broker,
+            crate::os_memory::MemoryEntitlement::NONE,
+            deps.scheduler.clone(),
+            model_grant_other,
+        );
+        let gen_other = agent24_os_proto::drain::Generation::serving_at(
+            "/tmp/me4s2b2-does-not-need-to-exist".into(),
+        );
+        assert!(gen_other.ready());
+        let methods_other = methods_for_other(&gen_other);
+        let err_other = call_complete(&methods_other, 0).await.unwrap_err();
+        assert_eq!(
+            err_other.kind,
+            Some(agent24_os_proto::rpc::ErrorKind::Unavailable),
+            "a fresh module's first call must not be rate-limited: {err_other:?}"
         );
     }
 }

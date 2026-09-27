@@ -73,6 +73,11 @@ export type Agent24V1WebSocketEventProtocol = {
       [k: string]: unknown;
     }
   | {
+      payload: ScheduleDeliveredPayload;
+      type: "schedule.delivered";
+      [k: string]: unknown;
+    }
+  | {
       payload: ModuleApprovalSubmitted;
       type: "module-approval.required";
       [k: string]: unknown;
@@ -280,6 +285,21 @@ export interface ScheduleDisabledPayload {
    */
   reason: string;
   schedule_id: string;
+  [k: string]: unknown;
+}
+/**
+ * design §5.5: `{schedule_id, module, key, fire_id, scheduled_for}`, all
+ * required (no optional fields to force-require in export-schema.rs).
+ */
+export interface ScheduleDeliveredPayload {
+  fire_id: string;
+  key: string;
+  module: string;
+  schedule_id: string;
+  /**
+   * ISO-8601 UTC (fmt_iso), the slot this fire was recorded for.
+   */
+  scheduled_for: string;
   [k: string]: unknown;
 }
 /**
