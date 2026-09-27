@@ -115,17 +115,34 @@ impl AttachSlot {
     }
 
     /// Called by the connection task when ITS OWN generation ended (EOF, a
-    /// write failure, a `stop` firing — see `attach_mux.rs`). Clears the slot
-    /// ONLY if it still holds that exact generation: if a revoke-then-install
-    /// (a rotation, or a fresh connection after this one already lost the
-    /// race — though §5.4 Q3=a means a second live connection cannot exist
-    /// concurrently, a stale `release` from an already-superseded generation
-    /// can still arrive after) replaced it with a NEWER one in the meantime,
-    /// that newer generation is left alone. Comparing by identity
-    /// (`Arc::ptr_eq`), not by generation number, because the number is not
-    /// available to a caller that only has the `Arc` — and identity is the
-    /// stronger, more direct statement of "is this the same run".
+    /// write failure, a `stop` firing — see `attach_mux.rs`).
+    ///
+    /// Revokes `generation` UNCONDITIONALLY, first (review H2). Before this
+    /// fix, a stale caller (see below) skipped revocation entirely — its
+    /// generation might never have been revoked by anything else either (an
+    /// attached generation has no drain and no supervisor process to crash;
+    /// its OWN connection ending is the only signal that ever revokes it, per
+    /// the module docs), so it could be left `Running` forever. Every task
+    /// that awaits [`Generation::revoked`] on it (`attach_mux.rs`'s
+    /// stop-forwarding task, chiefly) would then leak, waiting on a
+    /// revocation that was never coming (review H2a). [`Generation::revoke`]
+    /// is one-shot and idempotent — a second call on an already-revoked
+    /// generation is a documented no-op — so calling it here every time,
+    /// whether or not this generation turns out to be the current one, is
+    /// always safe.
+    ///
+    /// Clears the SLOT only if it still holds this exact generation: if a
+    /// revoke-then-install (a rotation, or a fresh connection after this one
+    /// already lost the race — though §5.4 Q3=a means a second live
+    /// connection cannot exist concurrently, a stale `release` from an
+    /// already-superseded generation can still arrive after) replaced it with
+    /// a NEWER one in the meantime, that newer generation is left installed
+    /// untouched. Comparing by identity (`Arc::ptr_eq`), not by generation
+    /// number, because the number is not available to a caller that only has
+    /// the `Arc` — and identity is the stronger, more direct statement of "is
+    /// this the same run".
     pub fn release(&mut self, generation: &Arc<Generation>) {
+        let _ = generation.revoke();
         if self
             .current
             .as_ref()
@@ -219,6 +236,29 @@ mod tests {
         assert!(
             slot.current.is_none(),
             "the current generation's own release DOES clear it"
+        );
+    }
+
+    /// Review H2: `release` now revokes UNCONDITIONALLY, before it even
+    /// checks whether the generation handed to it is still the slot's
+    /// current one (or in the slot at all). The sharpest form of "stale" —
+    /// a generation the slot never held, so nothing else in its life would
+    /// ever call `revoke()` on it — must still end up `Revoked`. Pre-fix,
+    /// `release` skipped revocation whenever the slot didn't hold this exact
+    /// generation, which left a case exactly like this one `Running`
+    /// forever and leaked every task awaiting its `revoked()` (review H2a).
+    #[test]
+    fn release_of_a_generation_the_slot_never_held_still_revokes_it() {
+        let orphan = Generation::attached();
+        assert!(orphan.ready());
+        let mut slot = AttachSlot::new();
+
+        slot.release(&orphan);
+
+        assert_eq!(orphan.state(), crate::drain::DrainState::Revoked);
+        assert!(
+            slot.current.is_none(),
+            "an empty slot must stay empty after releasing a generation it never held"
         );
     }
 }

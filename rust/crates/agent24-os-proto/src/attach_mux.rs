@@ -31,15 +31,15 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::frame::FrameError;
+use crate::frame::{FrameError, MAX_FRAME_BYTES};
 use crate::rpc::{Ended, ErrorKind, Limits, Methods, RpcError, read_frame_async, serve_until};
 
 /// The one method a kernel-originated call uses today (§6.1).
@@ -89,28 +89,88 @@ impl std::fmt::Display for KernelCallFailed {
 
 impl std::error::Error for KernelCallFailed {}
 
+/// `pending` plus the "has this connection ended" flag, behind ONE lock
+/// (review M1). Before this both lived separately (`closed` an `AtomicBool`,
+/// `pending` its own `Mutex`), which let [`KernelCalls::call`]'s "check
+/// closed, then insert" and the finaliser's "set closed, then clear" race:
+/// `call()` could observe `closed == false`, then the finaliser could run
+/// its whole close-and-clear between that load and the insert, and `call()`
+/// would then insert a pending entry into a map nobody will ever clear again
+/// — the request already written (or about to be), its answer never
+/// resolvable, hanging until its own `timeout`. Sharing one lock makes the
+/// two operations atomic with respect to each other: whichever runs first
+/// under the lock is fully visible to the other.
+struct PendingState {
+    map: HashMap<String, oneshot::Sender<Map<String, Value>>>,
+    /// Set once the connection has ended. From here on [`KernelCalls::call`]
+    /// fails fast with `NotSent` rather than inserting into `map` — and
+    /// nothing inserts into `map` again, since only `call()`, under this
+    /// same lock, ever does.
+    closed: bool,
+}
+
 /// State shared between every clone of a [`KernelCalls`] handle and the mux
 /// loop that resolves or drops incoming frames.
 struct Shared {
-    pending: Mutex<HashMap<String, oneshot::Sender<Map<String, Value>>>>,
+    pending: Mutex<PendingState>,
     next_id: AtomicU64,
     stray_responses: AtomicU64,
-    /// Set once the connection has ended. An advisory fast path only — see
-    /// [`KernelCalls::call`] — not a second source of truth: the pending map
-    /// being cleared on connection end is what actually guarantees an
-    /// in-flight call is resolved.
-    closed: AtomicBool,
+}
+
+impl Shared {
+    /// Ends the connection from `pending`'s point of view: no further call
+    /// may be issued, and every call already waiting is dropped (waking it
+    /// with `ConnectionLost` rather than leaving it to its own timeout).
+    /// Idempotent — safe to call from both the ordinary end-of-connection
+    /// path and a guard's `Drop` (review M2), whichever runs first does the
+    /// work and the other finds nothing left to do.
+    fn close(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        pending.closed = true;
+        pending.map.clear();
+    }
 }
 
 /// Handle for kernel-originated requests on an attached connection. Cheap to
-/// clone (an `Arc` and an `mpsc::UnboundedSender` inside).
+/// clone (an `Arc` and an `mpsc::Sender` inside).
 #[derive(Clone)]
 pub struct KernelCalls {
     shared: Arc<Shared>,
     /// Raw NDJSON lines (newline included), merged with `serve_until`'s own
     /// output onto the real connection by the single writer task `serve_attached`
-    /// spawns.
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// spawns. Bounded (review H1): a kernel call that finds it full does not
+    /// wait — it fails fast with [`KernelCallFailed::NotSent`] via
+    /// [`mpsc::Sender::try_send`], the same way a closed channel already did.
+    /// [`serve_until`]'s own relayed output, in contrast, is pushed with
+    /// `.send().await` (see `serve_attached`) so that when the real module
+    /// stops reading, the resulting backpressure travels all the way back
+    /// into the pipe `serve_until` writes to — reviving ITS OWN
+    /// `queue_high_water`/`write_timeout` handling rather than buffering
+    /// unboundedly here instead.
+    out_tx: mpsc::Sender<Vec<u8>>,
+}
+
+/// Removes this call's pending entry when dropped — the one piece of cleanup
+/// code for every way [`KernelCalls::call`] can stop waiting for an answer:
+/// an ordinary return (success, timeout, send failure), OR the `call()`
+/// future itself being dropped/cancelled by its caller mid-await (review M2,
+/// "顺手做"). Removing an already-absent id (the common case: a matching
+/// response already removed it in [`route_response`]) is a harmless no-op,
+/// so this never needs to know which case it is.
+struct PendingGuard {
+    shared: Arc<Shared>,
+    id: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        let mut pending = self
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        pending.map.remove(&self.id);
+    }
 }
 
 impl KernelCalls {
@@ -126,19 +186,31 @@ impl KernelCalls {
         params: Value,
         timeout: Duration,
     ) -> Result<Map<String, Value>, KernelCallFailed> {
-        if self.shared.closed.load(Ordering::Acquire) {
-            return Err(KernelCallFailed::NotSent);
-        }
         let id = format!("k{}", self.shared.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         {
+            // review M1: the "is this connection still open" check and the
+            // pending-map insert happen under the SAME lock acquisition as
+            // the finaliser's "mark closed, clear pending" (`Shared::close`)
+            // — so either this runs entirely before `close()`, and the entry
+            // it inserts is guaranteed to be seen and dropped by `close()`,
+            // or it runs entirely after, and sees `closed == true` and never
+            // inserts at all. There is no window where an insert can land in
+            // a map `close()` already cleared and will never look at again.
             let mut pending = self
                 .shared
                 .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            pending.insert(id.clone(), tx);
+            if pending.closed {
+                return Err(KernelCallFailed::NotSent);
+            }
+            pending.map.insert(id.clone(), tx);
         }
+        let _guard = PendingGuard {
+            shared: Arc::clone(&self.shared),
+            id: id.clone(),
+        };
         let mut line = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -147,8 +219,13 @@ impl KernelCalls {
         }))
         .unwrap_or_default();
         line.push(b'\n');
-        if self.out_tx.send(line).is_err() {
-            self.forget(&id);
+        // `try_send`, not `.send().await` (review H1): a kernel-originated
+        // call must not block waiting for queue space — a full queue means
+        // the real module is not keeping up, and the caller is entitled to
+        // `NotSent` promptly rather than discovering that only after its own
+        // `timeout` elapses. `_guard` drops here on the early return and
+        // removes the entry just inserted.
+        if self.out_tx.try_send(line).is_err() {
             return Err(KernelCallFailed::NotSent);
         }
         match tokio::time::timeout(timeout, rx).await {
@@ -157,20 +234,8 @@ impl KernelCalls {
             // the connection ends (`serve_attached`'s finalizer drains and
             // drops every pending sender; see there).
             Ok(Err(_recv_error)) => Err(KernelCallFailed::ConnectionLost),
-            Err(_elapsed) => {
-                self.forget(&id);
-                Err(KernelCallFailed::Timeout)
-            }
+            Err(_elapsed) => Err(KernelCallFailed::Timeout),
         }
-    }
-
-    fn forget(&self, id: &str) {
-        let mut pending = self
-            .shared
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        pending.remove(id);
     }
 
     /// Frames without `method` that matched no pending call: dropped, never
@@ -279,7 +344,7 @@ fn route_response(mut obj: Map<String, Value>, shared: &Shared) {
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        pending.remove(&id)
+        pending.map.remove(&id)
     };
     match sender {
         // `obj` still has `id` removed above but keeps `jsonrpc`/`result`/
@@ -290,6 +355,114 @@ fn route_response(mut obj: Map<String, Value>, shared: &Shared) {
         None => {
             shared.stray_responses.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Bound on [`KernelCalls::out_tx`] (review H1). Once this many NDJSON lines
+/// are queued for the real writer and it has not caught up, two things
+/// happen: a kernel-originated [`KernelCalls::call`] finds the queue full and
+/// fails fast with `NotSent` (`try_send`, never waiting for space), and the
+/// relay task copying `serve_until`'s own output (which DOES wait for space —
+/// see where it is used) stops draining `serve_until`'s output pipe, so the
+/// backpressure travels all the way back into `serve_until`, reviving ITS OWN
+/// `queue_high_water`/`write_timeout` handling instead of this side buffering
+/// without bound.
+const OUT_QUEUE_CAPACITY: usize = 32;
+
+/// [`read_relay_line`] found a line longer than [`MAX_FRAME_BYTES`] without a
+/// `\n` — see there for why this ends the relay rather than growing its
+/// buffer further.
+struct RelayOverflow;
+
+/// Reads one `\n`-terminated line, delimiter included, from `serve_until`'s
+/// own output pipe — never fewer than a whole line, and never more than one
+/// (review C1). Relaying whole lines, instead of raw 8 KiB chunks as before,
+/// is what keeps a `serve_until` response from being split mid-write and a
+/// kernel-originated request line from landing in the MIDDLE of one: both
+/// are queued as complete entries on [`KernelCalls::out_tx`], and the real
+/// writer task writes each entry to completion before taking the next, so
+/// the two producers can never interleave a write on the wire (previously, a
+/// response longer than 8 KiB read in several chunks left a window, between
+/// two of those chunks, where a kernel call's own line could be queued and
+/// written in between — corrupting the module's NDJSON stream).
+///
+/// Capped at `MAX_FRAME_BYTES + 1` bytes — [`read_frame_async`]'s own limit.
+/// `serve_until` never writes a longer line itself (`response_line` enforces
+/// the same limit before writing), so exceeding the cap here means something
+/// unexpected is coming out of the nested connection; treated as a protocol
+/// error ([`RelayOverflow`]) rather than buffered without bound.
+///
+/// Returns `Ok(None)` at a clean EOF with no partial line left over.
+async fn read_relay_line<R: AsyncBufRead + Unpin>(
+    src: &mut R,
+) -> Result<Option<Vec<u8>>, RelayOverflow> {
+    let mut out = Vec::new();
+    loop {
+        let Some(room) = (MAX_FRAME_BYTES + 1)
+            .checked_sub(out.len())
+            .filter(|r| *r > 0)
+        else {
+            return Err(RelayOverflow);
+        };
+        // A duplex pipe's read half cannot itself fail; an `Err` here would
+        // only ever be an artefact of a future `AsyncBufRead` impl swapped
+        // in — treated the same as EOF, since there is nothing more usable
+        // to read either way.
+        let Ok(available) = src.fill_buf().await else {
+            return Ok(if out.is_empty() { None } else { Some(out) });
+        };
+        if available.is_empty() {
+            return Ok(if out.is_empty() { None } else { Some(out) });
+        }
+        let window = &available[..available.len().min(room)];
+        match window.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                out.extend_from_slice(&window[..=i]);
+                src.consume(i + 1);
+                return Ok(Some(out));
+            }
+            None => {
+                let taken = window.len();
+                out.extend_from_slice(window);
+                src.consume(taken);
+            }
+        }
+    }
+}
+
+/// Everything torn down when this connection ends — whether [`serve_attached`]'s
+/// returned future runs to completion or is dropped/cancelled before it does
+/// (review M2). Built once near the top of that future and held for its
+/// entire lifetime, so this is the ONE place the teardown happens rather than
+/// duplicating it at the future's normal exit AND hoping nothing ever drops
+/// it early instead.
+struct Teardown {
+    shared: Arc<Shared>,
+    su_handle: AbortOnDrop<Ended>,
+    _writer_handle: AbortOnDrop<()>,
+    _stop_task: AbortOnDrop<()>,
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        // No more kernel calls may be issued or answered from here on, and
+        // every one already waiting is dropped so it resolves as
+        // `ConnectionLost` rather than hanging until its own timeout —
+        // `Shared::close` is the single lock-protected operation that does
+        // both (review M1), and is idempotent, so it is harmless if the
+        // normal end-of-connection path already called it.
+        self.shared.close();
+        // `su_handle`, `writer_handle` and `_stop_task` each abort in their
+        // own `AbortOnDrop::drop` right after this method returns (review
+        // H1, H2a, M2) — including when this whole `Teardown` is dropped
+        // because `serve_attached`'s future was cancelled before reaching
+        // its own normal end, which is exactly the gap this type closes.
+        // Aborting `writer_handle` closes the real write half regardless of
+        // whether any `KernelCalls` clone — so, `out_tx` clone — is still
+        // alive elsewhere: teardown must not depend on every clone having
+        // been dropped first (review H1). Discarding whatever `writer_handle`
+        // had not yet written mirrors `serve_until`'s own documented choice
+        // to discard unwritten responses when ITS connection ends.
     }
 }
 
@@ -315,33 +488,40 @@ where
     S: Future<Output = ()> + Send + 'static,
 {
     let shared = Arc::new(Shared {
-        pending: Mutex::new(HashMap::new()),
+        pending: Mutex::new(PendingState {
+            map: HashMap::new(),
+            closed: false,
+        }),
         next_id: AtomicU64::new(0),
         stray_responses: AtomicU64::new(0),
-        closed: AtomicBool::new(false),
     });
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUT_QUEUE_CAPACITY);
     let calls = KernelCalls {
         shared: Arc::clone(&shared),
         out_tx: out_tx.clone(),
     };
+    // Carries the ONE reason either background task (the relay below, or the
+    // real writer further down) ended the connection for — a hard failure,
+    // as opposed to the ordinary EOF/shutdown paths, which report nothing
+    // here at all (review H1, C1: see where each sender is used).
+    let (out_fail_tx, mut out_fail_rx) = mpsc::channel::<Ended>(1);
 
     // One shared stop signal, fanned out to the classifier loop below AND to
     // the nested `serve_until` — `stop` itself is a one-shot, `!Clone`
     // future, so it is awaited exactly once, here, and its firing is
     // rebroadcast through a `watch`.
     let (stop_tx, stop_rx) = watch::channel(false);
-    tokio::spawn(async move {
+    let stop_task = tokio::spawn(async move {
         stop.await;
         let _ = stop_tx.send(true);
     });
 
     // Pipe #1: classified frames destined for `serve_until`, as if it were
     // reading the real connection directly.
-    const PIPE_CAPACITY: usize = crate::frame::MAX_FRAME_BYTES + 4096;
+    const PIPE_CAPACITY: usize = MAX_FRAME_BYTES + 4096;
     let (to_su_write, to_su_read) = tokio::io::duplex(PIPE_CAPACITY);
     // Pipe #2: `serve_until`'s own output, relayed onward below.
-    let (su_writer, mut su_read) = tokio::io::duplex(PIPE_CAPACITY);
+    let (su_writer, su_read) = tokio::io::duplex(PIPE_CAPACITY);
 
     let su_stop = watch_true(stop_rx.clone());
     let su_handle = tokio::spawn(serve_until(
@@ -352,19 +532,31 @@ where
         su_stop,
     ));
 
-    // Relay `serve_until`'s raw bytes onto the shared output channel. Ends
-    // when `serve_until`'s writer half is dropped (task finished) and its
-    // buffered bytes are drained — an ordinary EOF, not an error.
+    // Relay `serve_until`'s own output onto the shared output channel, one
+    // whole NDJSON line at a time (review C1 — see `read_relay_line`).
+    // `.send(..).await`, not `try_send` (review H1): when the real writer
+    // task falls behind — the module stopped reading — this wait is exactly
+    // what stops draining `su_read`, so the backpressure reaches all the way
+    // back to `serve_until`'s own writer. Ends when `serve_until`'s writer
+    // half is dropped (task finished) and its buffered bytes are drained —
+    // an ordinary EOF, not an error — or when a line comes out longer than
+    // this side ever expects (`RelayOverflow`), which is reported upward as
+    // `Ended::TooLong` rather than silently dropped.
     let relay_out_tx = out_tx.clone();
+    let relay_fail_tx = out_fail_tx.clone();
+    let mut su_read = tokio::io::BufReader::new(su_read);
     tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
         loop {
-            match su_read.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => {
-                    if relay_out_tx.send(buf[..n].to_vec()).is_err() {
+            match read_relay_line(&mut su_read).await {
+                Ok(None) => return,
+                Ok(Some(line)) => {
+                    if relay_out_tx.send(line).await.is_err() {
                         return;
                     }
+                }
+                Err(RelayOverflow) => {
+                    let _ = relay_fail_tx.try_send(Ended::TooLong);
+                    return;
                 }
             }
         }
@@ -374,17 +566,50 @@ where
     // `serve_until`'s answers and this side's kernel-originated requests —
     // is serialised through this one channel and written in the order it
     // arrives, so the two producers above can never interleave a write.
-    tokio::spawn(async move {
+    // Each write is capped at `limits.write_timeout` (review H1): without
+    // this, a module that stops reading never surfaces here at all — the
+    // write simply hangs — and this loop's caller (`serve_attached`'s
+    // returned future) has no way to learn the connection is dead. On
+    // failure or timeout the reason is reported through `out_fail_tx` so the
+    // main loop can end the connection instead of finding out only when
+    // `Teardown` eventually aborts this task anyway.
+    let write_timeout = limits.write_timeout;
+    let writer_fail_tx = out_fail_tx;
+    let writer_handle = tokio::spawn(async move {
         let mut writer = writer;
         while let Some(chunk) = out_rx.recv().await {
-            if writer.write_all(&chunk).await.is_err() {
-                return;
+            let write = async {
+                writer.write_all(&chunk).await?;
+                writer.flush().await
+            };
+            match tokio::time::timeout(write_timeout, write).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let _ = writer_fail_tx.try_send(Ended::WriteFailed(e));
+                    return;
+                }
+                Err(_elapsed) => {
+                    let _ = writer_fail_tx.try_send(Ended::WriteFailed(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "a write to the attached module took longer than {}ms",
+                            write_timeout.as_millis()
+                        ),
+                    )));
+                    return;
+                }
             }
         }
-        let _ = writer.flush().await;
     });
 
     let fut = async move {
+        let mut teardown = Teardown {
+            shared: Arc::clone(&shared),
+            su_handle: AbortOnDrop(su_handle),
+            _writer_handle: AbortOnDrop(writer_handle),
+            _stop_task: AbortOnDrop(stop_task),
+        };
+
         // A dedicated reader task, exactly like `serve_until`'s own —
         // `read_frame_async` is documented not cancel-safe, so it must never
         // be raced inside a `select!` that could drop it mid-frame while the
@@ -416,36 +641,60 @@ where
             tokio::select! {
                 biased;
                 () = &mut stop_watch => break Ended::Stopped,
+                // The real writer (or the relay ahead of it) hit a fatal
+                // condition (review H1, C1): reported here rather than only
+                // discovered when `Teardown` reaps the task at the very end,
+                // which would have left this loop running — and so the
+                // connection nominally alive — for no reason. `Some(reason)`
+                // deliberately: once every `out_fail_tx` clone drops without
+                // ever sending (the ordinary shutdown case), this future
+                // resolves to `None` and tokio's `select!` disables the
+                // branch for this call rather than treating it as ready —
+                // see the tokio docs for the `Some(x) = fut` pattern.
+                Some(reason) = out_fail_rx.recv() => break reason,
                 frame = frames_rx.recv() => match frame {
                     None => break Ended::PeerClosed,
                     Some(Err(e)) => break map_frame_error(e),
                     Some(Ok(bytes)) => {
-                        if let Some(forwarded) = route_frame(&bytes, &shared)
-                            && let Err(e) = write_frame(&mut to_su_write, forwarded).await
-                        {
-                            break e;
+                        if let Some(forwarded) = route_frame(&bytes, &shared) {
+                            // Raced against `stop` (review H1): once the
+                            // real module stops reading, `serve_until`'s own
+                            // writer can block writing into `to_su_write`'s
+                            // sibling pipe indefinitely (the bounded
+                            // `out_tx` and its `.send().await` relay above
+                            // are what let that backpressure reach here).
+                            // Without this race, a `stop` firing while that
+                            // write is stuck would never be seen, hanging
+                            // this loop instead of ending the connection. If
+                            // `stop` wins, `to_su_write` may hold a
+                            // half-written frame — harmless, since the whole
+                            // connection, `to_su_write` and the nested
+                            // `serve_until` alike, is torn down right after
+                            // (`Teardown`).
+                            tokio::select! {
+                                biased;
+                                () = &mut stop_watch => break Ended::Stopped,
+                                result = write_frame(&mut to_su_write, forwarded) => {
+                                    if let Err(e) = result {
+                                        break e;
+                                    }
+                                }
+                            }
                         }
                     }
                 },
             }
         };
 
-        // The connection is over: no more kernel calls may be issued or
-        // answered. Order matters — `closed` first (a `call()` racing this
-        // exact instant sees either the old state and enqueues into a still-
-        // open pipeline, or the new one and fails fast; either is fine), then
-        // drop every pending sender so each in-flight `call()` observes
-        // `ConnectionLost` rather than hanging until its own timeout.
-        shared.closed.store(true, Ordering::Release);
-        {
-            let mut pending = shared
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            pending.clear();
-        }
+        // Graceful path: let the nested `serve_until` see EOF and wind down
+        // on its own, rather than aborting it outright. `teardown`'s `Drop`
+        // (run when `fut` finally drops, right after this) then finds the
+        // task already finished, and its abort is a harmless no-op — but
+        // still runs unconditionally, so a `serve_until` that somehow never
+        // finishes does not keep this future from ever completing its own
+        // caller's expectations (review H1, M2).
         drop(to_su_write);
-        let _ = su_handle.await;
+        let _ = (&mut teardown.su_handle.0).await;
         ended
     };
     (calls, fut)
@@ -905,5 +1154,393 @@ mod tests {
         for h in handles {
             h.await.unwrap().expect("every call must succeed");
         }
+    }
+}
+
+/// Regression tests for review findings C1, H1, H2/H2a, M1, M2. These are the
+/// formal, in-tree versions of the review's own repro probes (previously a
+/// scratch `review_probe` module, ported and turned into real assertions
+/// here) plus additional coverage for H2, M1 and M2, which had no probe of
+/// their own.
+#[cfg(test)]
+mod review_fixes {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::rpc::{CallFuture, Handler};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader, DuplexStream};
+
+    /// Answers `{"blob": <200 KiB of "x">}` — much bigger than a single 8 KiB
+    /// relay chunk, so a response takes several reads off `serve_until`'s
+    /// output pipe to fully arrive.
+    struct Big;
+    impl Handler for Big {
+        fn check_params(&self, _p: &Value) -> Result<(), String> {
+            Ok(())
+        }
+        fn call(&self, _params: Value) -> CallFuture {
+            Box::pin(async move { Ok(serde_json::json!({ "blob": "x".repeat(200_000) })) })
+        }
+    }
+
+    fn big_methods() -> Methods {
+        Methods::none().with("big", Arc::new(Big))
+    }
+
+    async fn send_line(w: &mut (impl AsyncWrite + Unpin), line: &str) {
+        w.write_all(line.as_bytes()).await.unwrap();
+        w.write_all(b"\n").await.unwrap();
+    }
+
+    async fn recv_line(r: &mut (impl AsyncBufRead + Unpin)) -> Value {
+        let mut line = String::new();
+        let n = r.read_line(&mut line).await.unwrap();
+        assert!(n > 0, "connection closed with nothing to read");
+        serde_json::from_str(line.trim_end()).unwrap()
+    }
+
+    fn methods() -> Methods {
+        Methods::none()
+    }
+
+    fn harness(
+        methods: Methods,
+    ) -> (
+        KernelCalls,
+        impl Future<Output = Ended> + Send,
+        BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        tokio::io::WriteHalf<DuplexStream>,
+    ) {
+        let (kernel_side, module_side) = tokio::io::duplex(64 * 1024);
+        let (kernel_read, kernel_write) = tokio::io::split(kernel_side);
+        let (calls, fut) = serve_attached(
+            BufReader::new(kernel_read),
+            kernel_write,
+            methods,
+            Limits::default(),
+            std::future::pending(),
+        );
+        let (module_read, module_write) = tokio::io::split(module_side);
+        (calls, fut, BufReader::new(module_read), module_write)
+    }
+
+    /// C1 — the review's probe 1, ported: a >8 KiB `serve_until` response
+    /// (well over the old raw-chunk relay's 8 KiB read buffer) interleaved
+    /// with a storm of concurrent kernel-originated calls must never produce
+    /// a line the module can't parse as JSON, and every line the module DOES
+    /// see must be either a complete `big` response or a complete kernel
+    /// request — never a byte-level splice of the two. On the pre-fix 8
+    /// KiB-chunk relay this reliably went red: a `speak` request queued while
+    /// a `big` response was mid-relay landed inside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn big_response_and_kernel_calls_never_interleave_mid_line() {
+        let (kernel_side, module_side) = tokio::io::duplex(4 * 1024);
+        let (kr, kw) = tokio::io::split(kernel_side);
+        let (calls, fut) = serve_attached(
+            BufReader::new(kr),
+            kw,
+            big_methods(),
+            Limits::default(),
+            std::future::pending(),
+        );
+        tokio::spawn(fut);
+        let (mr, mut mw) = tokio::io::split(module_side);
+        let mut mr = BufReader::new(mr);
+
+        const BIG_CALLS: usize = 20;
+        const KERNEL_CALLS: usize = 2000;
+        for i in 0..BIG_CALLS {
+            send_line(
+                &mut mw,
+                &format!(r#"{{"jsonrpc":"2.0","id":"{i}","method":"big","params":{{}}}}"#),
+            )
+            .await;
+        }
+        let spawn_calls = calls.clone();
+        tokio::spawn(async move {
+            for _ in 0..KERNEL_CALLS {
+                let c = spawn_calls.clone();
+                tokio::spawn(async move {
+                    let _ = c
+                        .call("speak", serde_json::json!({}), Duration::from_secs(5))
+                        .await;
+                });
+                tokio::time::sleep(Duration::from_micros(50)).await;
+            }
+        });
+
+        let mut total = 0;
+        let mut unparseable = 0;
+        for _ in 0..(BIG_CALLS + KERNEL_CALLS) {
+            let mut line = String::new();
+            let read = tokio::time::timeout(Duration::from_secs(5), mr.read_line(&mut line)).await;
+            let Ok(Ok(n)) = read else { break };
+            if n == 0 {
+                break;
+            }
+            total += 1;
+            if serde_json::from_str::<Value>(line.trim_end()).is_err() {
+                unparseable += 1;
+            }
+        }
+        assert!(
+            total >= BIG_CALLS,
+            "expected at least the {BIG_CALLS} big responses, got {total} lines total"
+        );
+        assert_eq!(
+            unparseable, 0,
+            "every line the module receives must be complete, parseable JSON — a \
+             non-zero count means a response and a kernel-originated request \
+             interleaved mid-line (review C1)"
+        );
+    }
+
+    /// H1 — the review's probe 2, ported and sharpened: the module never
+    /// reads at all, so the real socket's write buffer fills. With a short
+    /// `write_timeout`, the connection must end — as `Ended::WriteFailed` —
+    /// well within it, rather than hanging until the module (never) reads.
+    #[tokio::test]
+    async fn module_never_reading_ends_the_connection_within_its_write_timeout() {
+        let (kernel_side, module_side) = tokio::io::duplex(1024);
+        let (kr, kw) = tokio::io::split(kernel_side);
+        let limits = Limits {
+            write_timeout: Duration::from_millis(100),
+            ..Limits::default()
+        };
+        let (_calls, fut) = serve_attached(
+            BufReader::new(kr),
+            kw,
+            big_methods(),
+            limits,
+            std::future::pending(),
+        );
+        let conn = tokio::spawn(fut);
+        let (_mr, mut mw) = tokio::io::split(module_side);
+        // Enough `big` requests to overflow the 1 KiB duplex buffer many
+        // times over — the module below never reads any of the responses.
+        for i in 0..5 {
+            send_line(
+                &mut mw,
+                &format!(r#"{{"jsonrpc":"2.0","id":"{i}","method":"big","params":{{}}}}"#),
+            )
+            .await;
+        }
+        let ended = tokio::time::timeout(Duration::from_secs(2), conn)
+            .await
+            .expect(
+                "the connection must end well within 2s given a 100ms write_timeout (review H1)",
+            )
+            .unwrap();
+        assert!(
+            matches!(ended, Ended::WriteFailed(_)),
+            "expected WriteFailed, got {ended:?}"
+        );
+    }
+
+    /// H1 — the real write half must close at connection end even if a
+    /// `KernelCalls` clone (as `agent24d` would hold on the module's behalf)
+    /// is kept alive well past that point: teardown must not depend on every
+    /// `out_tx` clone having been dropped first.
+    #[tokio::test]
+    async fn the_real_write_half_closes_at_teardown_even_with_a_kernel_calls_clone_still_alive() {
+        let (calls, fut, mut module_read, mut module_write) = harness(methods());
+        let conn = tokio::spawn(fut);
+
+        // End the connection the ordinary way (module hangs up) while
+        // deliberately keeping `calls` (and so an `out_tx` clone) alive.
+        module_write.shutdown().await.unwrap();
+        let ended = conn.await.unwrap();
+        assert!(matches!(ended, Ended::PeerClosed));
+
+        // `calls` is still alive here — if teardown depended on every
+        // `out_tx` clone dropping, the writer task (and the real write half
+        // it owns) would still be sitting open waiting for one more chunk.
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(Duration::from_millis(500), module_read.read(&mut buf))
+            .await
+            .expect(
+                "the module's read half must see EOF promptly once the connection ends, \
+                     regardless of a live KernelCalls clone (review H1)",
+            )
+            .unwrap();
+        assert_eq!(read, 0, "expected EOF (0 bytes), got {read}");
+
+        drop(calls);
+    }
+
+    /// H2a — the internal task that forwards `stop` into the classifier loop
+    /// and the nested `serve_until` must not outlive the connection. Modelled
+    /// with a drop-flag rather than `Arc::strong_count` on `Generation`
+    /// directly, since `attach_mux` does not depend on `drain`'s
+    /// `Generation` type — the property under test ("this task's captured
+    /// state is dropped when the connection ends") is identical either way.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stop_forwarding_task_does_not_outlive_the_connection() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        // A `stop` that never resolves on its own — the ONLY way its
+        // captured state (`guard`) is ever dropped is if whatever awaits it
+        // is torn down from the outside.
+        let stop = async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        };
+        let (kernel_side, module_side) = tokio::io::duplex(64 * 1024);
+        let (kr, kw) = tokio::io::split(kernel_side);
+        let (_calls, fut) =
+            serve_attached(BufReader::new(kr), kw, methods(), Limits::default(), stop);
+        let conn = tokio::spawn(fut);
+
+        let (_mr, mut mw) = tokio::io::split(module_side);
+        mw.shutdown().await.unwrap(); // end the connection some OTHER way than `stop`
+        let ended = conn.await.unwrap();
+        assert!(matches!(ended, Ended::PeerClosed));
+
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the stop-forwarding task must be torn down with the connection, not left \
+             waiting on a `stop` that will now never fire (review H2a)"
+        );
+    }
+
+    /// M1 — many kernel-originated calls racing the connection's end (the
+    /// module hangs up immediately) must all resolve promptly (well within
+    /// their own generous timeout), never silently insert into a pending map
+    /// the finaliser already cleared and hang until that timeout fires for
+    /// real. `call()`'s "check closed, then insert" and the finaliser's "set
+    /// closed, then clear" sharing one lock (`Shared::close`) is what
+    /// guarantees this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn calls_racing_connection_end_never_hang_past_their_own_timeout() {
+        let (calls, fut, _kernel_read, mut module_write) = harness(methods());
+        let conn = tokio::spawn(fut);
+
+        const N: usize = 200;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let calls = calls.clone();
+            handles.push(tokio::spawn(async move {
+                calls
+                    .call("speak", serde_json::json!({}), Duration::from_secs(20))
+                    .await
+            }));
+        }
+        // Hang up right away, racing every one of the calls above against
+        // the finaliser's close-and-clear.
+        module_write.shutdown().await.unwrap();
+        let _ = conn.await;
+
+        for h in handles {
+            let _ = tokio::time::timeout(Duration::from_millis(500), h)
+                .await
+                .expect(
+                    "a call racing the connection's end must resolve promptly, not hang \
+                 until its own 20s timeout (review M1)",
+                );
+        }
+    }
+
+    /// M2 — the connection task being cancelled (aborted, or dropped by a
+    /// caller racing it in a `select!`) instead of running to its own normal
+    /// completion must STILL tear everything down: an in-flight call
+    /// resolves as `ConnectionLost` promptly, and a call issued afterward
+    /// fails fast with `NotSent` — proving `closed` really got set, not just
+    /// that the one call in flight happened to be dropped along with
+    /// everything else.
+    #[tokio::test]
+    async fn cancelling_the_connection_task_still_tears_down_pending_calls() {
+        let (calls, fut, mut kernel_read, mut module_write) = harness(methods());
+        let conn = tokio::spawn(fut);
+
+        let call = tokio::spawn({
+            let calls = calls.clone();
+            async move {
+                calls
+                    .call("speak", serde_json::json!({}), Duration::from_secs(20))
+                    .await
+            }
+        });
+        let _request = recv_line(&mut kernel_read).await; // it is genuinely in flight
+
+        // Cancel the connection task instead of letting it end normally —
+        // drops its future (and so its `Teardown`) mid-flight, same as an
+        // external `select!` dropping `fut` (review M2).
+        conn.abort();
+        let _ = conn.await;
+
+        let result = tokio::time::timeout(Duration::from_millis(500), call)
+            .await
+            .expect(
+                "an in-flight call must not hang past its own timeout when the \
+                     connection task is cancelled (review M2)",
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(result, KernelCallFailed::ConnectionLost));
+
+        let after = tokio::time::timeout(
+            Duration::from_millis(200),
+            calls.call("speak", serde_json::json!({}), Duration::from_secs(20)),
+        )
+        .await
+        .expect("a call issued after cancellation must not hang either")
+        .unwrap_err();
+        assert!(matches!(after, KernelCallFailed::NotSent));
+
+        let _ = module_write.shutdown().await;
+    }
+
+    /// M2 ("顺手做") — a `call()` future that is cancelled (dropped) before
+    /// it ever gets an answer must not leave its pending entry behind
+    /// forever: a late response for the SAME id, arriving after the
+    /// cancellation, must be counted as stray rather than silently handed to
+    /// a receiver that no longer exists.
+    #[tokio::test]
+    async fn a_cancelled_call_leaves_no_pending_entry_behind() {
+        let (calls, fut, mut kernel_read, mut module_write) = harness(methods());
+        tokio::spawn(fut);
+
+        let call = tokio::spawn({
+            let calls = calls.clone();
+            async move {
+                calls
+                    .call("speak", serde_json::json!({}), Duration::from_secs(30))
+                    .await
+            }
+        });
+        let request = recv_line(&mut kernel_read).await;
+        let id = request["id"].as_str().unwrap().to_owned();
+
+        call.abort();
+        let _ = call.await;
+
+        send_line(
+            &mut module_write,
+            &format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"late":true}}}}"#),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        let mut stray = calls.stray_responses();
+        for _ in 0..50 {
+            if stray == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            stray = calls.stray_responses();
+        }
+        assert_eq!(
+            stray, 1,
+            "the cancelled call's pending entry must have been removed by its guard, \
+             so a late response for the same id is counted as stray, not silently \
+             matched (review M2)"
+        );
     }
 }
