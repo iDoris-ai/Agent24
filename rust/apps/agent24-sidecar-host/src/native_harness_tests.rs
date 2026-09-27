@@ -341,7 +341,7 @@ fn descendant_request(id: u64, marker: &Path, ready_gate: &Path, gate: &Path) ->
         let gate = powershell_quote(&gate.display().to_string());
         let ready = r#"[Console]::Out.WriteLine('{"type":"ready","protocol":1,"port":4312,"token":"tttttttttttttttttttttttttttttttt","version":"native-harness"}'); [Console]::Out.Flush(); "#;
         let script = format!(
-            "[System.IO.File]::WriteAllText('{marker}', 'leader-started'); $child = Start-Process \"$PSHOME\\powershell.exe\" -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; [System.IO.File]::WriteAllText('{marker}', [string]$child.Id); while (-not [System.IO.File]::Exists('{ready_gate}')) {{ Start-Sleep -Milliseconds 10 }}; {ready} while (-not [System.IO.File]::Exists('{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
+            "[System.IO.File]::WriteAllText('{marker}', 'leader-started'); $start = [System.Diagnostics.ProcessStartInfo]::new(); $start.FileName = \"$PSHOME\\powershell.exe\"; $start.Arguments = '-NoLogo -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 120\"'; $start.UseShellExecute = $false; $child = [System.Diagnostics.Process]::Start($start); [System.IO.File]::WriteAllText('{marker}', [string]$child.Id); while (-not [System.IO.File]::Exists('{ready_gate}')) {{ [System.Threading.Thread]::Sleep(10) }}; {ready} while (-not [System.IO.File]::Exists('{gate}')) {{ [System.Threading.Thread]::Sleep(10) }}; exit 17"
         );
         std::fs::write(&script_path, script).expect("write Windows descendant fixture");
         let env = ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE"]
