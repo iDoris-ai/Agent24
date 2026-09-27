@@ -64,10 +64,23 @@ async fn post_attached_at(
     // is the daemon's own startup catalogue snapshot — the same source
     // `os_routes.rs` already treats as authoritative for "does this daemon
     // provide a module by this name" — so this needs no new AppState field.
+    //
+    // M3 (this PR's review): this is a SNAPSHOT taken at daemon startup/last
+    // reload, not a live query — a package installed at runtime under the
+    // same name, after this snapshot, is not caught here. That gap is closed
+    // one layer up: A3-2b's mount step, when it actually attaches a module
+    // socket to a name, is the one place that sees both worlds live and
+    // rejects the clash then, as a fallback to this check rather than a
+    // replacement for it.
     let name_taken = |name: &str| state.os_reports.iter().any(|r| r.name == name);
-    match attached::register(path, &body.manifest, body.allow_relax, name_taken) {
+    // A3-2a has no live generation to revoke on commit (module doc); A3-2b's
+    // registry wiring is the first real `on_commit` consumer (see
+    // `attached::Change`).
+    match attached::register(path, &body.manifest, body.allow_relax, name_taken, |_| {}) {
         Ok(RegisterOutcome::Created(resp)) => (StatusCode::CREATED, Json(resp)).into_response(),
-        Ok(RegisterOutcome::Rotated(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(RegisterOutcome::Rotated { response, .. }) => {
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(RegisterError::InvalidManifest(msg)) => {
             error_response(StatusCode::BAD_REQUEST, "invalid_manifest", &msg)
         }
@@ -104,7 +117,7 @@ async fn delete_attached_at(
     AxumPath(name): AxumPath<String>,
     path: &Path,
 ) -> Response {
-    match attached::revoke(path, &name) {
+    match attached::revoke(path, &name, |_| {}) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error_response(
             StatusCode::NOT_FOUND,
@@ -322,8 +335,9 @@ mod tests {
         // covers the same branch at the storage layer; this one additionally
         // pins the REST status code and error `code`.
         let path = tmp_path();
-        let err = crate::attached::register(&path, &manifest("sin90"), false, |n| n == "sin90")
-            .unwrap_err();
+        let err =
+            crate::attached::register(&path, &manifest("sin90"), false, |n| n == "sin90", |_| {})
+                .unwrap_err();
         assert_eq!(
             err,
             crate::attached::RegisterError::NameTaken("sin90".to_owned())

@@ -860,25 +860,43 @@ async fn cmd_attach_add(
         .timeout(Duration::from_secs(10))
         .send()
         .await;
+    // No `?` below: any early return here would skip `finish(ep)` (the
+    // ephemeral daemon it may have spawned would never be reaped), and under
+    // `--json` a 2xx with an unreadable/unresizable body must still print
+    // exactly one JSON object rather than nothing — the non-zero exit
+    // already comes from returning `Err` below, `main` maps that to
+    // `ExitCode::FAILURE`.
     let out = match sent {
         Ok(res) if res.status().is_success() => match res.json::<AttachedAddResponse>().await {
-            Ok(body) => {
-                if json {
-                    // Exactly one JSON object on stdout (§3.6) — the same
-                    // shape the daemon's own `201`/`200` body has.
-                    println!(
-                        "{}",
-                        serde_json::to_string(&body).map_err(|e| e.to_string())?
-                    );
-                } else {
-                    println!("registered {} (token_id {})", body.name, body.token_id);
-                    println!("  token (shown once — save it now): {}", body.token);
-                    println!("  manifest digest: {}", body.manifest_digest);
-                    println!("  socket: {}", body.socket_path);
+            Ok(body) => match serde_json::to_string(&body) {
+                Ok(text) => {
+                    if json {
+                        // Exactly one JSON object on stdout (§3.6) — the same
+                        // shape the daemon's own `201`/`200` body has.
+                        println!("{text}");
+                    } else {
+                        println!("registered {} (token_id {})", body.name, body.token_id);
+                        println!("  token (shown once — save it now): {}", body.token);
+                        println!("  manifest digest: {}", body.manifest_digest);
+                        println!("  socket: {}", body.socket_path);
+                    }
+                    Ok(())
                 }
-                Ok(())
+                Err(e) => {
+                    let msg = format!("could not re-serialize the daemon's response: {e}");
+                    if json {
+                        println!("{}", daemon_unavailable_envelope(&msg));
+                    }
+                    Err(msg)
+                }
+            },
+            Err(e) => {
+                let msg = format!("daemon returned an unreadable response: {e}");
+                if json {
+                    println!("{}", daemon_unavailable_envelope(&msg));
+                }
+                Err(msg)
             }
-            Err(e) => Err(format!("daemon returned an unreadable response: {e}")),
         },
         Ok(res) => {
             let status = res.status();
@@ -931,20 +949,35 @@ async fn cmd_attach_list(json: bool) -> Result<(), String> {
         .timeout(Duration::from_secs(10))
         .send()
         .await;
+    // See `cmd_attach_add`'s comment: no `?` here either, for the same two
+    // reasons (must not skip `finish(ep)`; `--json` must still emit exactly
+    // one JSON object even on an unreadable/unresizable 2xx body).
     let out = match sent {
         Ok(res) if res.status().is_success() => match res.json::<AttachedList>().await {
-            Ok(body) => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&body).map_err(|e| e.to_string())?
-                    );
-                } else {
-                    print_attached(&body);
+            Ok(body) => match serde_json::to_string(&body) {
+                Ok(text) => {
+                    if json {
+                        println!("{text}");
+                    } else {
+                        print_attached(&body);
+                    }
+                    Ok(())
                 }
-                Ok(())
+                Err(e) => {
+                    let msg = format!("could not re-serialize the daemon's response: {e}");
+                    if json {
+                        println!("{}", daemon_unavailable_envelope(&msg));
+                    }
+                    Err(msg)
+                }
+            },
+            Err(e) => {
+                let msg = format!("daemon returned an unreadable response: {e}");
+                if json {
+                    println!("{}", daemon_unavailable_envelope(&msg));
+                }
+                Err(msg)
             }
-            Err(e) => Err(format!("daemon returned an unreadable response: {e}")),
         },
         Ok(res) => {
             let status = res.status();

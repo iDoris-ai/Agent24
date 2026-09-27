@@ -137,6 +137,53 @@ struct AttachedRecord {
     created_at: String,
 }
 
+/// A revoked module's LAST facts (§3.5 M2 / this PR's judgement): kept just
+/// long enough to stop "revoke, then re-add under the same name" from
+/// dodging the privacy-relax confirmation. Without this, a re-add of a
+/// revoked name falls into `is_relax`'s `previous == None` (first-time)
+/// branch, which only asks for confirmation on `remote_allowed` — a widened
+/// CAPABILITY set sails through unconfirmed even though, for that name, it
+/// is exactly as much a relax as a rotation would be. Cleared the instant a
+/// new registration for the name actually commits.
+///
+/// Stored as strings, not `agent24_domain::ModelAccess`/`Capability`
+/// directly: neither derives `Deserialize` (deliberately — see their doc
+/// comments), so this mirrors the same string-in/parse-back shape the
+/// manifest YAML itself uses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RevokedFacts {
+    model_access: String,
+    capabilities: Vec<String>,
+}
+
+impl RevokedFacts {
+    fn capture(facts: &ManifestFacts) -> Self {
+        Self {
+            model_access: facts.model_access.as_str().to_owned(),
+            capabilities: facts
+                .capabilities
+                .iter()
+                .map(|c| c.as_str().to_owned())
+                .collect(),
+        }
+    }
+
+    /// Reconstruct comparable [`ManifestFacts`] for `is_relax`. `name` is not
+    /// stored redundantly in the tombstone (the map key already carries it).
+    fn into_manifest_facts(self, name: String) -> Result<ManifestFacts, String> {
+        let model_access = agent24_domain::ModelAccess::parse(&self.model_access)?;
+        let mut capabilities = Vec::with_capacity(self.capabilities.len());
+        for c in &self.capabilities {
+            capabilities.push(agent24_domain::Capability::parse(c).map_err(|e| e.to_string())?);
+        }
+        Ok(ManifestFacts {
+            name,
+            model_access,
+            capabilities,
+        })
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AttachedStore {
@@ -144,6 +191,11 @@ struct AttachedStore {
     version: u32,
     #[serde(default)]
     modules: BTreeMap<String, AttachedRecord>,
+    /// Tombstones left by `revoke` — see [`RevokedFacts`]. Absent from any
+    /// `attached.json` written before this change; `#[serde(default)]` reads
+    /// that as empty rather than an error.
+    #[serde(default)]
+    revoked: BTreeMap<String, RevokedFacts>,
 }
 
 fn one() -> u32 {
@@ -321,10 +373,41 @@ fn mint_token_id() -> Result<String, String> {
 /// What a successful `POST /api/v1/attached` produced (§3.4): a fresh name,
 /// or a rotation/re-registration of one already there. The REST layer maps
 /// the two onto `201`/`200` respectively; the body shape is identical.
+///
+/// `Rotated` carries `digest_changed`: whether the resubmitted manifest's
+/// bytes differ from what was already on file. A rotation always mints a
+/// fresh token (§3.3) even when the manifest is byte-identical (that is the
+/// whole point of a bare re-add being a supported way to rotate a
+/// compromised token), so this is the only way a caller can tell "same
+/// manifest, new token" apart from "the manifest itself changed too".
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegisterOutcome {
     Created(AttachedAddResponse),
-    Rotated(AttachedAddResponse),
+    Rotated {
+        response: AttachedAddResponse,
+        digest_changed: bool,
+    },
+}
+
+/// What `register`/`revoke` are about to commit to `attached.json`, handed to
+/// `on_commit` while the file lock is STILL HELD — the hook A3-2b's registry
+/// wiring needs to revoke a module's current live generation in the SAME
+/// critical section as the record update/removal (design §3.4/§5.2: 改记录、
+/// 落盘、撤销现役代 must not be splittable by a concurrent request landing in
+/// between). A3-2a itself has no live generation to revoke yet (module doc)
+/// — its own call sites pass a no-op (`|_| {}`).
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "A3-2a's own call sites pass a no-op `|_| {}` (no live generation to revoke yet — \
+              module doc); the fields exist for A3-2b's future consumer and this PR's own tests"
+)]
+pub enum Change<'a> {
+    /// A name was created or rotated. `rotated` distinguishes the two the
+    /// same way [`RegisterOutcome`] does.
+    Registered { name: &'a str, rotated: bool },
+    /// A name's record was removed.
+    Revoked { name: &'a str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,11 +430,16 @@ pub enum RegisterError {
 /// installed package, a compiled-in module) already claims it. It is never
 /// consulted for a name that is already an attached record: re-adding one is
 /// a rotation/re-registration, not a new claim.
+///
+/// `on_commit` runs exactly once, still inside the file lock, right after the
+/// updated store is durably written — see [`Change`]'s doc comment. It never
+/// runs on any error path (nothing was committed).
 pub fn register(
     path: &Path,
     manifest_yaml: &str,
     allow_relax: bool,
     name_taken: impl Fn(&str) -> bool,
+    on_commit: impl FnOnce(&Change),
 ) -> Result<RegisterOutcome, RegisterError> {
     let facts = parse_facts(manifest_yaml).map_err(RegisterError::InvalidManifest)?;
     let digest = manifest_digest(manifest_yaml.as_bytes());
@@ -365,15 +453,34 @@ pub fn register(
 
     let mut store = AttachedStore::load(path).map_err(RegisterError::Io)?;
     let previous_record = store.modules.get(&facts.name);
-    let previous_facts = previous_record
-        .map(|r| parse_facts(&r.manifest_yaml))
-        .transpose()
-        .map_err(|e| {
+    let previous_digest = previous_record.map(|r| r.manifest_digest.clone());
+    let previous_facts = match previous_record {
+        Some(r) => Some(parse_facts(&r.manifest_yaml).map_err(|e| {
             RegisterError::Io(format!(
                 "the stored manifest for {:?} no longer parses: {e}",
                 facts.name
             ))
-        })?;
+        })?),
+        // M2: no ACTIVE record, but a tombstone left by an earlier `revoke`
+        // means this name is not really "first-time" — compare against what
+        // it had before, exactly like a rotation, so revoke-then-re-add
+        // cannot dodge the relax confirmation a plain rotation would need
+        // (§3.5). No tombstone at all is the genuine first-time case.
+        None => match store.revoked.get(&facts.name) {
+            Some(tombstone) => Some(
+                tombstone
+                    .clone()
+                    .into_manifest_facts(facts.name.clone())
+                    .map_err(|e| {
+                        RegisterError::Io(format!(
+                            "the revoked-record tombstone for {:?} no longer parses: {e}",
+                            facts.name
+                        ))
+                    })?,
+            ),
+            None => None,
+        },
+    };
 
     // §3.2 processing order: validate → name clash → privacy relax → mint →
     // store.
@@ -401,13 +508,21 @@ pub fn register(
             created_at,
         },
     );
+    // M2: a successful registration clears any tombstone for this name — it
+    // has just been re-confirmed (or was never relaxing in the first place),
+    // so nothing is left for a FUTURE re-add to compare against.
+    store.revoked.remove(&facts.name);
     store
         .write_atomically(path, parent)
         .map_err(RegisterError::Io)?;
+    on_commit(&Change::Registered {
+        name: &facts.name,
+        rotated: !is_new,
+    });
 
     let response = AttachedAddResponse {
         name: facts.name,
-        manifest_digest: digest,
+        manifest_digest: digest.clone(),
         token,
         socket_path: socket_path_string().map_err(RegisterError::Io)?,
         token_id,
@@ -415,13 +530,20 @@ pub fn register(
     Ok(if is_new {
         RegisterOutcome::Created(response)
     } else {
-        RegisterOutcome::Rotated(response)
+        RegisterOutcome::Rotated {
+            digest_changed: previous_digest.as_deref() != Some(digest.as_str()),
+            response,
+        }
     })
 }
 
 /// `DELETE /api/v1/attached/{name}` (§3.2/§3.4). `Ok(true)`: a record existed
 /// and is gone. `Ok(false)`: nothing to do — `404` at the REST layer.
-pub fn revoke(path: &Path, name: &str) -> Result<bool, String> {
+///
+/// `on_commit` runs exactly once, still inside the file lock, right after the
+/// removal is durably written — see [`Change`]'s doc comment. It never runs
+/// when there was nothing to remove.
+pub fn revoke(path: &Path, name: &str, on_commit: impl FnOnce(&Change)) -> Result<bool, String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
@@ -430,9 +552,19 @@ pub fn revoke(path: &Path, name: &str) -> Result<bool, String> {
     let _guard = ConfigLock::acquire(parent)?;
 
     let mut store = AttachedStore::load(path)?;
-    let existed = store.modules.remove(name).is_some();
-    if existed {
+    let removed = store.modules.remove(name);
+    let existed = removed.is_some();
+    if let Some(record) = removed {
+        // M2: leave a tombstone of what this name's privacy/capabilities
+        // WERE, so a later re-add under the same name is judged by the
+        // rotation rule, not the (more permissive) first-time rule.
+        let facts = parse_facts(&record.manifest_yaml)
+            .map_err(|e| format!("the stored manifest for {name:?} no longer parses: {e}"))?;
+        store
+            .revoked
+            .insert(name.to_owned(), RevokedFacts::capture(&facts));
         store.write_atomically(path, parent)?;
+        on_commit(&Change::Revoked { name });
     }
     Ok(existed)
 }
@@ -499,7 +631,7 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let m = manifest("agentear", None, &["events", "models"]);
-        let outcome = register(&path, &m, false, |_| false).unwrap();
+        let outcome = register(&path, &m, false, |_| false, |_| {}).unwrap();
         let RegisterOutcome::Created(resp) = outcome else {
             panic!("expected Created");
         };
@@ -536,7 +668,8 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let m = manifest("agentear", None, &["events"]);
-        let RegisterOutcome::Created(resp) = register(&path, &m, false, |_| false).unwrap() else {
+        let RegisterOutcome::Created(resp) = register(&path, &m, false, |_| false, |_| {}).unwrap()
+        else {
             panic!("expected Created");
         };
         let views = list(&path).unwrap();
@@ -565,10 +698,15 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let m = manifest("agentear", None, &["events"]);
-        let RegisterOutcome::Created(first) = register(&path, &m, false, |_| false).unwrap() else {
+        let RegisterOutcome::Created(first) =
+            register(&path, &m, false, |_| false, |_| {}).unwrap()
+        else {
             panic!("expected Created");
         };
-        let RegisterOutcome::Rotated(second) = register(&path, &m, false, |_| false).unwrap()
+        let RegisterOutcome::Rotated {
+            response: second,
+            digest_changed,
+        } = register(&path, &m, false, |_| false, |_| {}).unwrap()
         else {
             panic!("expected Rotated");
         };
@@ -581,6 +719,10 @@ mod tests {
             "token_id changes on every mint (§3.3)"
         );
         assert_eq!(first.manifest_digest, second.manifest_digest);
+        assert!(
+            !digest_changed,
+            "the exact same manifest bytes must report digest_changed = false"
+        );
         let old_hash = hash_token_hex(&first.token);
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -591,11 +733,78 @@ mod tests {
     }
 
     #[test]
+    fn rotating_with_a_different_manifest_reports_digest_changed() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let base = manifest("agentear", None, &["events"]);
+        register(&path, &base, false, |_| false, |_| {}).unwrap();
+        // Narrowing (not a relax) so this does not need `allow_relax`, but
+        // the bytes — and therefore the digest — are different from `base`.
+        let narrower = manifest("agentear", None, &[]);
+        let RegisterOutcome::Rotated { digest_changed, .. } =
+            register(&path, &narrower, false, |_| false, |_| {}).unwrap()
+        else {
+            panic!("expected Rotated");
+        };
+        assert!(
+            digest_changed,
+            "a different manifest must report digest_changed = true"
+        );
+    }
+
+    #[test]
+    fn on_commit_runs_inside_the_file_lock() {
+        // Deterministic, single-threaded proof rather than racing a second
+        // thread's `register` against the first's `on_commit`: from INSIDE
+        // `on_commit`, open a second file descriptor on the very same lock
+        // file and try a NON-BLOCKING exclusive lock on it. `flock`-style
+        // locks are per-open-file-description, so this must fail exactly
+        // when `register`'s own `_guard` (a different fd, same path) is
+        // still held — i.e. only while `on_commit` genuinely runs inside the
+        // critical section.
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let m = manifest("agentear", None, &["events"]);
+        let lock_path = dir.join("attached.json.lock");
+
+        let mut still_locked = false;
+        register(
+            &path,
+            &m,
+            false,
+            |_| false,
+            |change| {
+                match change {
+                    Change::Registered { name, rotated } => {
+                        assert_eq!(*name, "agentear");
+                        assert!(!rotated);
+                    }
+                    Change::Revoked { .. } => panic!("expected Registered"),
+                }
+                use fs2::FileExt;
+                let probe = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&lock_path)
+                    .unwrap();
+                still_locked = probe.try_lock_exclusive().is_err();
+            },
+        )
+        .unwrap();
+
+        assert!(
+            still_locked,
+            "on_commit must run while register's own file lock is still held"
+        );
+    }
+
+    #[test]
     fn a_relaxing_request_without_allow_relax_is_refused_and_leaves_the_record_untouched() {
         let dir = tmp();
         let path = dir.join("attached.json");
         let m = manifest("agentear", Some("remote_allowed"), &["events", "models"]);
-        let err = register(&path, &m, false, |_| false).unwrap_err();
+        let err = register(&path, &m, false, |_| false, |_| {}).unwrap_err();
         assert_eq!(err, RegisterError::RelaxRequiresConfirmation);
         assert!(
             !path.exists(),
@@ -608,7 +817,7 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let m = manifest("agentear", Some("remote_allowed"), &["events", "models"]);
-        let outcome = register(&path, &m, true, |_| false).unwrap();
+        let outcome = register(&path, &m, true, |_| false, |_| {}).unwrap();
         assert!(matches!(outcome, RegisterOutcome::Created(_)));
     }
 
@@ -617,9 +826,9 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let base = manifest("agentear", None, &["events"]);
-        register(&path, &base, false, |_| false).unwrap();
+        register(&path, &base, false, |_| false, |_| {}).unwrap();
         let wider = manifest("agentear", None, &["events", "models"]);
-        let err = register(&path, &wider, false, |_| false).unwrap_err();
+        let err = register(&path, &wider, false, |_| false, |_| {}).unwrap_err();
         assert_eq!(err, RegisterError::RelaxRequiresConfirmation);
         // Untouched: still the narrow capability set from the first add.
         let views = list(&path).unwrap();
@@ -631,10 +840,10 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let wide = manifest("agentear", Some("remote_allowed"), &["events", "models"]);
-        register(&path, &wide, true, |_| false).unwrap();
+        register(&path, &wide, true, |_| false, |_| {}).unwrap();
         let narrow = manifest("agentear", Some("local_only"), &["events", "models"]);
-        let outcome = register(&path, &narrow, false, |_| false).unwrap();
-        assert!(matches!(outcome, RegisterOutcome::Rotated(_)));
+        let outcome = register(&path, &narrow, false, |_| false, |_| {}).unwrap();
+        assert!(matches!(outcome, RegisterOutcome::Rotated { .. }));
     }
 
     #[test]
@@ -642,7 +851,7 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let m = manifest("sin90", None, &["events"]);
-        let err = register(&path, &m, false, |n| n == "sin90").unwrap_err();
+        let err = register(&path, &m, false, |n| n == "sin90", |_| {}).unwrap_err();
         assert_eq!(err, RegisterError::NameTaken("sin90".to_owned()));
         assert!(!path.exists());
     }
@@ -652,7 +861,7 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let m = manifest("attached", None, &[]);
-        let err = register(&path, &m, false, |_| false).unwrap_err();
+        let err = register(&path, &m, false, |_| false, |_| {}).unwrap_err();
         assert!(matches!(err, RegisterError::InvalidManifest(_)));
     }
 
@@ -661,11 +870,11 @@ mod tests {
         let dir = tmp();
         let path = dir.join("attached.json");
         let m = manifest("agentear", None, &["events"]);
-        register(&path, &m, false, |_| false).unwrap();
-        assert!(revoke(&path, "agentear").unwrap());
+        register(&path, &m, false, |_| false, |_| {}).unwrap();
+        assert!(revoke(&path, "agentear", |_| {}).unwrap());
         assert!(list(&path).unwrap().is_empty());
         assert!(
-            !revoke(&path, "agentear").unwrap(),
+            !revoke(&path, "agentear", |_| {}).unwrap(),
             "nothing left to remove"
         );
     }
@@ -683,7 +892,7 @@ mod tests {
         let path = dir.join("attached.json");
         std::fs::write(&path, "{ not json").unwrap();
         assert!(list(&path).is_err());
-        assert!(register(&path, &manifest("x", None, &[]), false, |_| false).is_err());
+        assert!(register(&path, &manifest("x", None, &[]), false, |_| false, |_| {}).is_err());
     }
 
     #[test]
@@ -699,7 +908,7 @@ mod tests {
                 let path = path.clone();
                 scope.spawn(move || {
                     let m = manifest(n, None, &["events"]);
-                    register(&path, &m, false, |_| false).unwrap();
+                    register(&path, &m, false, |_| false, |_| {}).unwrap();
                 });
             }
         });
@@ -709,5 +918,75 @@ mod tests {
         let mut expected = names;
         expected.sort_unstable();
         assert_eq!(got, expected);
+    }
+
+    // ── M2: revoke-then-re-add must not dodge the relax confirmation ──
+
+    #[test]
+    fn re_adding_a_revoked_name_with_wider_capabilities_still_needs_confirmation() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let narrow = manifest("agentear", None, &["events"]);
+        register(&path, &narrow, false, |_| false, |_| {}).unwrap();
+        assert!(revoke(&path, "agentear", |_| {}).unwrap());
+
+        // Without the tombstone comparison this would fall into the
+        // first-time rule, which only cares about `remote_allowed` — a wider
+        // CAPABILITY set on a first-time-looking add would sail through
+        // unconfirmed. With it, this is judged exactly like a rotation would
+        // be: `models` is new relative to what "agentear" had before it was
+        // revoked, so it is a relax.
+        let wider = manifest("agentear", None, &["events", "models"]);
+        let err = register(&path, &wider, false, |_| false, |_| {}).unwrap_err();
+        assert_eq!(err, RegisterError::RelaxRequiresConfirmation);
+        assert!(
+            list(&path).unwrap().is_empty(),
+            "a refused relax must not create a record"
+        );
+    }
+
+    #[test]
+    fn re_adding_a_revoked_name_with_wider_capabilities_and_allow_relax_succeeds() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let narrow = manifest("agentear", None, &["events"]);
+        register(&path, &narrow, false, |_| false, |_| {}).unwrap();
+        assert!(revoke(&path, "agentear", |_| {}).unwrap());
+
+        let wider = manifest("agentear", None, &["events", "models"]);
+        let outcome = register(&path, &wider, true, |_| false, |_| {}).unwrap();
+        assert!(
+            matches!(outcome, RegisterOutcome::Created(_)),
+            "a brand-new record after a revoke is a Created, not a Rotated, even though a \
+             tombstone informed the relax check"
+        );
+    }
+
+    #[test]
+    fn a_successful_registration_clears_the_revoked_tombstone() {
+        // White-box (same-module access to `AttachedStore`): a mutation that
+        // dropped the `store.revoked.remove(&facts.name)` call in `register`
+        // would leave this red, since the tombstone would still be on disk
+        // after the second registration succeeds.
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let narrow = manifest("agentear", None, &["events"]);
+        register(&path, &narrow, false, |_| false, |_| {}).unwrap();
+        assert!(revoke(&path, "agentear", |_| {}).unwrap());
+
+        let after_revoke = AttachedStore::load(&path).unwrap();
+        assert!(
+            after_revoke.revoked.contains_key("agentear"),
+            "revoke must leave a tombstone behind"
+        );
+
+        let wider = manifest("agentear", None, &["events", "models"]);
+        register(&path, &wider, true, |_| false, |_| {}).unwrap();
+
+        let after_register = AttachedStore::load(&path).unwrap();
+        assert!(
+            !after_register.revoked.contains_key("agentear"),
+            "a successful registration must clear the name's tombstone"
+        );
     }
 }
