@@ -13,6 +13,14 @@
 // schema") — this file only unwraps the envelope; agentearSequencer.ts (the
 // renderer side, §7.2) does the real de-dup/ordering/shape validation.
 //
+// CONFIRMED against a real agent24d E2E run (AgentEar session, reported to
+// this PR): the actual WS frame is exactly
+//   {"type":"module","payload":{"module":"agentear","kind":"agentear.event","payload":<agentear.event/1>}}
+// i.e. the event lives at `payload.payload`, filtered by `payload.module`
+// and `payload.kind === "agentear.event"` — precisely what parseAgentEarFrame
+// below implements. agentear-events.test.ts's `moduleFrame()` helper builds
+// this exact outer-wrapper shape.
+//
 // A3-2b/A3-3 (attach registry wiring, the commands route) are not merged as
 // of this PR, so in practice no `agentear.event/1` frames will arrive yet —
 // this bridge is inert until then, and reconnects quietly in the meantime.

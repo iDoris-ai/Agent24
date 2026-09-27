@@ -25,7 +25,12 @@ function moduleFrame(overrides: Partial<{ type: string; module: string; kind: st
 }
 
 describe('parseAgentEarFrame', () => {
-  it('unwraps a well-formed agentear module event to its inner envelope', () => {
+  // Confirmed against a real agent24d E2E run (AgentEar session): the exact
+  // outer WS wrapper is
+  //   {"type":"module","payload":{"module":"agentear","kind":"agentear.event","payload":<envelope>}}
+  // — moduleFrame() below reproduces this precise shape (not a guess from
+  // the design doc's prose alone).
+  it('unwraps a well-formed agentear module event to its inner envelope (real E2E-confirmed outer wrapper shape)', () => {
     expect(parseAgentEarFrame(moduleFrame())).toEqual(AGENTEAR_ENVELOPE)
   })
 
