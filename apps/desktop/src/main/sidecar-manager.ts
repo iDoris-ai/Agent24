@@ -22,7 +22,8 @@ export interface SidecarLaunch {
   readonly tree?: SidecarTreeRunner
   readonly ready: Promise<SidecarReady>
 }
-export interface SidecarLauncher { launch(): Promise<SidecarLaunch> }
+/** Launch establishes child ownership synchronously; readiness remains asynchronous. */
+export interface SidecarLauncher { launch(): SidecarLaunch }
 export interface SidecarHealth { check(endpoint: SidecarReady['endpoint'], timeoutMs: number): Promise<boolean> }
 export interface SidecarTreeRunner {
   signal(owner: SidecarOwnership, force: boolean): Promise<void>
@@ -47,6 +48,22 @@ export interface SidecarSpec {
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 const silentLogger: SidecarLogger = { info: () => {}, warn: () => {} }
 const treeOperations = new WeakMap<SidecarTreeRunner, Map<string, Promise<unknown>>>()
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error) => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+function validateSpec(spec: SidecarSpec): void {
+  const timeouts = [spec.readyTimeoutMs, spec.healthIntervalMs, spec.healthTimeoutMs, spec.shutdown.termGraceMs, spec.shutdown.killAfterMs]
+  if (timeouts.some((value) => !Number.isFinite(value) || value <= 0)) throw new Error('sidecar timeouts must be finite and positive')
+  if (!Number.isInteger(spec.maxHealthFailures) || spec.maxHealthFailures <= 0) throw new Error('sidecar health failure bound is invalid')
+}
 
 /** Signals only the manager-owned PID or the launcher-provided dedicated group. */
 export function signalOwnedTree(owner: SidecarOwnership, signal: NodeJS.Signals): Promise<void> {
@@ -143,6 +160,9 @@ export function validateReady(ready: SidecarReady): void {
   if (typeof endpoint?.secret !== 'string' || endpoint.secret.length === 0) {
     throw new Error('sidecar readiness secret is empty')
   }
+  if (Buffer.byteLength(endpoint.secret, 'utf8') < 32 || /[\s\p{Cc}]/u.test(endpoint.secret)) {
+    throw new Error('sidecar readiness secret is weak')
+  }
   if (typeof endpoint.origin !== 'string') throw new Error('sidecar endpoint origin is invalid')
   const url = new URL(endpoint.origin)
   if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', '[::1]'].includes(url.hostname)) {
@@ -183,7 +203,9 @@ export class SidecarManager {
     private readonly stopper: SidecarStopper = exactTreeStopper,
     private readonly handoff: SidecarEndpointHandoff = new MemoryEndpointHandoff(),
     private readonly logger: SidecarLogger = silentLogger,
-  ) {}
+  ) {
+    validateSpec(spec)
+  }
 
   status(): SidecarStatus {
     return { state: this.state, sidecarId: this.spec.sidecarId, instanceId: this.active?.owner.instanceId }
@@ -198,7 +220,7 @@ export class SidecarManager {
     let attempt: ActiveSidecar | null = null
     let cleaningCancelledAttempt = false
     try {
-      const launch = await this.launcher.launch()
+      const launch = this.launcher.launch()
       void launch.ready.catch(() => {})
       if (!Number.isInteger(launch.child.pid) || !launch.child.pid || launch.child.pid < 1) {
         if (!this.isStarting(token)) return this.cancelled()
@@ -223,18 +245,7 @@ export class SidecarManager {
       // Some adapters do not replay an exit which occurred before subscription.
       if (launch.child.exitCode !== null || launch.child.signalCode !== null) this.handleExit(attempt)
       if (attempt.exited) throw new Error('sidecar exited before readiness')
-      let readyTimeout: NodeJS.Timeout | undefined
-      let ready: SidecarReady
-      try {
-        ready = await Promise.race([
-          launch.ready,
-          new Promise<SidecarReady>((_, reject) => {
-            readyTimeout = setTimeout(() => reject(new Error('sidecar readiness timeout')), this.spec.readyTimeoutMs)
-          }),
-        ])
-      } finally {
-        if (readyTimeout) clearTimeout(readyTimeout)
-      }
+      const ready = await withTimeout(launch.ready, this.spec.readyTimeoutMs, 'sidecar readiness timeout')
       if (attempt.exited) throw new Error('sidecar exited before readiness')
       if (!this.isCurrent(token, attempt)) return this.cancelled()
       validateReady(ready)
@@ -353,7 +364,11 @@ export class SidecarManager {
     active.probing = true
     let ok = false
     try {
-      ok = await this.health.check(active.ready.endpoint, this.spec.healthTimeoutMs)
+      ok = await withTimeout(
+        Promise.resolve().then(() => this.health.check(active.ready!.endpoint, this.spec.healthTimeoutMs)),
+        this.spec.healthTimeoutMs,
+        'sidecar health timeout',
+      )
     } catch { ok = false } finally {
       active.probing = false
     }
