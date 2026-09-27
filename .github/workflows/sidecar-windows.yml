@@ -53,14 +53,8 @@ jobs:
         run: cargo check --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol
 
       - name: test
-        if: matrix.os != 'windows-latest'
         working-directory: rust
         run: cargo test --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol
-
-      - name: test (Windows serialized process fixtures)
-        if: matrix.os == 'windows-latest'
-        working-directory: rust
-        run: cargo test --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol -- --test-threads=1
 
       - name: clippy
         working-directory: rust

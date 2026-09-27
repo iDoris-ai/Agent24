@@ -337,6 +337,11 @@ fn descendant_request(id: u64, marker: &Path, gate: &Path) -> Request {
         let script = format!(
             "Set-Content -LiteralPath '{marker}' -Value 'leader-started'; $child = Start-Process \"$PSHOME\\powershell.exe\" -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker}' -Value $child.Id; {ready} while (-not (Test-Path -LiteralPath '{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
         );
+        let script_path = marker
+            .parent()
+            .expect("marker has a parent directory")
+            .join("leader.ps1");
+        std::fs::write(&script_path, script).expect("write Windows descendant fixture");
         let env = ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
@@ -348,8 +353,8 @@ fn descendant_request(id: u64, marker: &Path, gate: &Path) -> Request {
                 "-NoLogo".to_owned(),
                 "-NoProfile".to_owned(),
                 "-NonInteractive".to_owned(),
-                "-Command".to_owned(),
-                script,
+                "-File".to_owned(),
+                script_path.to_string_lossy().into_owned(),
             ],
             env,
         )
