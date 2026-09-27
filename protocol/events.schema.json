@@ -1,6 +1,3 @@
-   Compiling agent24-protocol v0.3.0 (/Users/jason/Dev/auraai/Agent24-model-ui/rust/crates/agent24-protocol)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.89s
-     Running `target/debug/export-schema`
 {
   "$id": "https://github.com/iDoris-ai/Agent24/protocol/events.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
