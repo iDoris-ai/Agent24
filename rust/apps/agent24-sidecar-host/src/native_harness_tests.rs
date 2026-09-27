@@ -18,6 +18,7 @@ use agent24_sidecar_host_protocol::{
 use std::collections::BTreeMap;
 use std::{
     io::{self, Read, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -31,6 +32,13 @@ const LIMITS: Deadlines = Deadlines {
     ready: Duration::from_secs(4),
     graceful: Duration::from_millis(100),
     force: Duration::from_secs(4),
+    drain: Duration::from_secs(2),
+};
+const DESCENDANT_LIMITS: Deadlines = Deadlines {
+    launch: Duration::from_secs(15),
+    ready: Duration::from_secs(15),
+    graceful: Duration::from_millis(100),
+    force: Duration::from_secs(8),
     drain: Duration::from_secs(2),
 };
 const OUTPUT_CAPACITY: usize = 2 * MAX_CONTROL_FRAME_BYTES;
@@ -137,6 +145,19 @@ fn with_generation<R>(
         &Arc<AtomicBool>,
     ) -> R,
 ) -> R {
+    with_request_limits(id, request(id, ready), LIMITS, run)
+}
+
+fn with_request_limits<R>(
+    id: u64,
+    request: Request,
+    limits: Deadlines,
+    run: impl FnOnce(
+        &mut GenerationHarness<NativeGeneration<'_>>,
+        &Arc<Mutex<Vec<u8>>>,
+        &Arc<AtomicBool>,
+    ) -> R,
+) -> R {
     let slots = WorkerSlots::isolated();
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let parent_eof = Arc::new(AtomicBool::new(false));
@@ -151,14 +172,13 @@ fn with_generation<R>(
     )
     .expect("host ports");
     let now = Instant::now();
-    let request = request(id, ready);
     let accepted = AcceptedLaunch {
         intent: LaunchIntent::from_request(request).expect("launch request"),
         request_id: id,
-        deadline: now + LIMITS.launch,
+        deadline: now + limits.launch,
     };
     let FirstLaunchDispatch::Generation(generation) =
-        first_launch_dispatch::dispatch(accepted, &mut ports, LIMITS, || now)
+        first_launch_dispatch::dispatch(accepted, &mut ports, limits, || now)
     else {
         panic!("test launch must dispatch to NativeGeneration")
     };
@@ -201,8 +221,10 @@ fn drive_until(
         }
         assert!(
             Instant::now() < deadline,
-            "phase did not reach {target:?}; got {:?}",
-            report.state.phase
+            "phase did not reach {target:?}; got {:?}, error={:?}, first_error={:?}",
+            report.state.phase,
+            report.error,
+            report.first_error
         );
         thread::sleep(Duration::from_millis(2));
     }
@@ -245,6 +267,239 @@ fn assert_frames(bytes: &[u8], request_id: u64, expected: &[u8], allow_exit: boo
         observed == expected || (allow_exit && observed.strip_suffix(b"X") == Some(expected)),
         "output frame order/count mismatch"
     );
+}
+
+struct MarkerDirectory(PathBuf);
+
+impl MarkerDirectory {
+    fn new(request_id: u64) -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "agent24-native-descendant-{}-{request_id}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create unique descendant marker directory");
+        Self(path)
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.0.join("descendant.pid")
+    }
+
+    fn gate(&self) -> PathBuf {
+        self.0.join("leader.exit")
+    }
+}
+
+impl Drop for MarkerDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn descendant_request(id: u64, marker: &Path, gate: &Path) -> Request {
+    #[cfg(unix)]
+    let (executable, cwd, argv, env) = {
+        let marker = shell_quote(&marker.display().to_string());
+        let gate = shell_quote(&gate.display().to_string());
+        let child = format!(
+            "sleep 120 & descendant=$!; printf '%s\\n' \"$descendant\" > {marker}; wait \"$descendant\""
+        );
+        let ready = r#"{"type":"ready","protocol":1,"port":4312,"token":"tttttttttttttttttttttttttttttttt","version":"native-harness"}"#;
+        let script = format!(
+            "/bin/sh -c {} & while [ ! -s {marker} ]; do sleep 0.01; done; printf '%s\\n' '{}'; while [ ! -e {gate} ]; do sleep 0.01; done; exit 17",
+            shell_quote(&child),
+            ready
+        );
+        (
+            "/bin/sh".to_owned(),
+            "/".to_owned(),
+            vec!["-c".to_owned(), script],
+            BTreeMap::new(),
+        )
+    };
+    #[cfg(windows)]
+    let (executable, cwd, argv, env) = {
+        let root =
+            std::env::var_os("SystemRoot").expect("SystemRoot is required for Windows smoke");
+        let executable = std::path::PathBuf::from(&root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        assert!(executable.is_file(), "Windows PowerShell is required");
+        let marker = powershell_quote(&marker.display().to_string());
+        let gate = powershell_quote(&gate.display().to_string());
+        let sleep = powershell_encoded("Start-Sleep -Seconds 120");
+        let child_script = format!(
+            "$grandchild = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo -NoProfile -NonInteractive -EncodedCommand {sleep}' -PassThru; Set-Content -LiteralPath '{marker}' -Value $grandchild.Id; Wait-Process -Id $grandchild.Id"
+        );
+        let child = powershell_encoded(&child_script);
+        let ready = r#"[Console]::Out.WriteLine('{"type":"ready","protocol":1,"port":4312,"token":"tttttttttttttttttttttttttttttttt","version":"native-harness"}'); [Console]::Out.Flush(); "#;
+        let script = format!(
+            "$null = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo -NoProfile -NonInteractive -EncodedCommand {child}'; while (-not (Test-Path -LiteralPath '{marker}')) {{ Start-Sleep -Milliseconds 10 }}; {ready} while (-not (Test-Path -LiteralPath '{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
+        );
+        let env = ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+            .collect();
+        (
+            executable.to_string_lossy().into_owned(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                script,
+            ],
+            env,
+        )
+    };
+    Request::Launch {
+        version: PROTOCOL_VERSION,
+        request_id: id,
+        executable,
+        cwd,
+        argv,
+        env,
+    }
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn powershell_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(windows)]
+fn powershell_encoded(script: &str) -> String {
+    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(BASE64[usize::from(first >> 2)] as char);
+        encoded.push(BASE64[usize::from((first & 0b11) << 4 | second >> 4)] as char);
+        encoded.push(if chunk.len() > 1 {
+            BASE64[usize::from((second & 0b1111) << 2 | third >> 6)] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            BASE64[usize::from(third & 0b0011_1111)] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+fn wait_for_descendant_pid(marker: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(marker)
+            && let Ok(pid) = raw.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "descendant PID marker was not published"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn descendant_is_alive(pid: u32) -> io::Result<bool> {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+    let pid =
+        i32::try_from(pid).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) => Ok(true),
+        Err(Errno::ESRCH) => Ok(false),
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+    }
+}
+
+#[cfg(windows)]
+fn descendant_is_alive(pid: u32) -> io::Result<bool> {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "tasklist failed with status {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
+}
+
+fn wait_until_descendant_gone(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if !descendant_is_alive(pid).expect("confirm descendant PID absence") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "descendant {pid} did not disappear"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn assert_descendant_frames(bytes: &[u8], request_id: u64) {
+    let mut kinds = Vec::new();
+    let mut exit_count = 0;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        match decode_reply(line) {
+            Ok(Reply::Owned {
+                version,
+                request_id: actual_id,
+            }) => {
+                assert_eq!(version, PROTOCOL_VERSION);
+                assert_eq!(actual_id, request_id);
+                kinds.push(b'O');
+            }
+            Ok(_) => panic!("unexpected reply frame in descendant lifecycle"),
+            Err(_) => match decode_event(line) {
+                Ok(Event::Ready {
+                    protocol,
+                    port,
+                    token,
+                    version,
+                }) => {
+                    assert_eq!(protocol, PROTOCOL_VERSION);
+                    assert_eq!(port, 4312);
+                    assert_eq!(token, "t".repeat(32));
+                    assert_eq!(version, "native-harness");
+                    kinds.push(b'R');
+                }
+                Ok(Event::Exit { protocol, code }) => {
+                    assert_eq!(protocol, PROTOCOL_VERSION);
+                    assert_eq!(code, Some(17), "leader exit code must be retained");
+                    exit_count += 1;
+                    kinds.push(b'X');
+                }
+                Err(_) => panic!("invalid output frame in descendant lifecycle"),
+            },
+        }
+    }
+    assert_eq!(kinds, b"ORX", "Owned, Ready, Exit ordering/count mismatch");
+    assert_eq!(exit_count, 1, "leader Exit must be emitted exactly once");
 }
 
 #[test]
@@ -302,4 +557,47 @@ fn parent_eof_after_await_ready_or_running_cleans_up() {
             assert_frames(&output, id, expected, true);
         });
     }
+}
+
+#[test]
+fn leader_exit_with_live_descendant_forces_tree_to_confirmed_empty() {
+    #[cfg(unix)]
+    let _guard = crate::posix::tests::test_lock();
+    const REQUEST_ID: u64 = 7404;
+    let markers = MarkerDirectory::new(REQUEST_ID);
+    let marker = markers.marker();
+    let gate = markers.gate();
+    with_request_limits(
+        REQUEST_ID,
+        descendant_request(REQUEST_ID, &marker, &gate),
+        DESCENDANT_LIMITS,
+        |harness, bytes, _| {
+            let running = drive_until(harness, WaitFor::Running, TurnIntent::Continue, 20);
+            assert_ne!(running.state.phase, Phase::Empty);
+            let descendant = wait_for_descendant_pid(&marker);
+            assert!(
+                descendant_is_alive(descendant).expect("observe live descendant"),
+                "descendant must be alive before leader is released"
+            );
+
+            std::fs::write(&gate, b"exit\n").expect("release leader exit gate");
+            let empty = drive_until(harness, WaitFor::Empty, TurnIntent::Continue, 20);
+            assert_eq!(empty.state.phase, Phase::Empty);
+            wait_until_descendant_gone(descendant);
+
+            let before_tombstone = bytes.lock().unwrap().clone();
+            assert_descendant_frames(&before_tombstone, REQUEST_ID);
+            for _ in 0..2 {
+                let tombstone = harness.turn(TurnIntent::Continue, Instant::now());
+                assert_eq!(tombstone.state.phase, Phase::Empty);
+                assert_eq!(tombstone.error, None);
+            }
+            let after_tombstone = bytes.lock().unwrap();
+            assert_eq!(
+                *after_tombstone, before_tombstone,
+                "Empty tombstone turns must not emit another Exit"
+            );
+            assert_descendant_frames(&after_tombstone, REQUEST_ID);
+        },
+    );
 }
