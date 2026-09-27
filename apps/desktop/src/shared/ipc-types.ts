@@ -6,6 +6,7 @@ export const IpcChannels = {
   AppVersion: 'app:version',
   ShellOpenExternal: 'shell:open-external',
   BackendProxy: 'backend:proxy',
+  BackendEndpoint: 'backend:endpoint',
   OmlxDetect: 'omlx:detect',
   OmlxModels: 'omlx:models',
   OmlxStart: 'omlx:start',
@@ -34,6 +35,13 @@ export interface BackendProxyResponse {
   ok: boolean
   status: number
   data: unknown
+}
+
+/** FU-93: the backend daemon's actual (dynamic) port, so the sidebar can show
+ * it instead of a hardcoded guess. `null` while the daemon has not announced
+ * its ready line yet. */
+export interface BackendEndpointResult {
+  port: number
 }
 
 export interface OmlxDetectResult {

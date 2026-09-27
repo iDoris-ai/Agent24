@@ -55,8 +55,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # proxy, the supervisor — is wired in by later slices.
 agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 # SHUT-1b: open the shutdown evidence without following a link or blocking on
-# a FIFO (already in the tree through agent24-os-proto).
-rustix = { version = "0.38", features = ["fs", "stdio"] }
+# a FIFO (already in the tree through agent24-os-proto). "process" added for
+# `geteuid()` — FU-92's fallback-directory ownership check (server.rs
+# `secure_fallback_dir`).
+rustix = { version = "0.38", features = ["fs", "process", "stdio"] }
 # A3-2a (`attached.rs`): the `model_access` field the shared, lenient
 # `agent24_os_proto::manifest::facts_from_yaml` does not read (ME4-S3 §4.4
 # only carries the three fields a MODULE needs); read directly rather than

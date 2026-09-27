@@ -1988,13 +1988,139 @@ fn validate_auth_startup(
     }
 }
 
+/// FU-92 follow-up (security hardening): verify — or, if absent, create — the
+/// top-level fallback directory [`callback_root`] names under the shared,
+/// world-writable `/tmp`. Its name is a hash of `root`, which is predictable
+/// (`root` is just `$HOME/.agent24` or similar), so any other local user could
+/// pre-create it — or plant a symlink at that name pointing anywhere — before
+/// this daemon ever starts, hijacking the callback socket that would otherwise
+/// go under it (eavesdropping on / impersonating the module handshake).
+///
+/// This check has to happen HERE, before [`agent24_os_proto::endpoint::CallbackDir::create`]
+/// touches `<fallback>/run`: that call's own directory setup uses
+/// `std::fs::DirBuilder::create` with `recursive(true)`, which walks straight
+/// through an existing symlink at an intermediate component (the same as
+/// `mkdir -p` — it treats "resolves to a directory" as "already there") rather
+/// than refusing it.
+///
+/// Fails closed: an existing entry that is not exactly a real directory, owned
+/// by this process's own euid, mode exactly `0700` (no group/other bits, no
+/// special bits) is refused with an actionable message — never silently
+/// reused, never chmod'd/fixed in place (unlike `private_dir` in
+/// `agent24-os-proto`, which tightens a loose directory of ours; here, on a
+/// shared `/tmp`, "ours" itself cannot be trusted without the check), and
+/// never retried at some OTHER path.
+///
+/// # Errors
+///
+/// A message naming the problem and telling the operator to remove the
+/// offending path and restart.
+fn secure_fallback_dir(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|e| format!("could not create {}: {e}", path.display())),
+        Err(e) => Err(format!("could not check {}: {e}", path.display())),
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "{} is a symlink — another local user may have planted it to intercept this \
+             daemon's callback socket; remove it and restart",
+            path.display()
+        )),
+        Ok(meta) if !meta.is_dir() => Err(format!(
+            "{} exists and is not a directory; remove it and restart",
+            path.display()
+        )),
+        Ok(meta) => {
+            let me = rustix::process::geteuid().as_raw();
+            if meta.uid() != me {
+                return Err(format!(
+                    "{} is owned by uid {}, not this process's {me} — another local user may \
+                     have created it to intercept this daemon's callback socket; remove it and \
+                     restart",
+                    path.display(),
+                    meta.uid()
+                ));
+            }
+            // All twelve mode bits, like `agent24-os-proto`'s `check_private`: no
+            // group/other bits AND no sticky/setuid/setgid bit either.
+            if meta.mode() & 0o7777 != 0o700 {
+                return Err(format!(
+                    "{} has mode {:04o}, not 0700 — another local user could read or replace \
+                     what goes under it; remove it and restart",
+                    path.display(),
+                    meta.mode() & 0o7777
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// FU-92: `<root>/run/<pid>/<n>.sock` must fit macOS's 103-byte `sun_path`
+/// limit ([`agent24_os_proto::endpoint::MAX_SOCKET_PATH`]). A long `$HOME` (or,
+/// for an ephemeral daemon, a long `$TMPDIR`) otherwise fails every
+/// out-of-process module's start — with a message that only said "too long",
+/// not by how much or what to do about it.
+///
+/// Rather than lose the whole out-of-process subsystem over a HOME the user
+/// did not pick for this reason, fall back to a short path under `/tmp`
+/// (a literal `/tmp`, not `$TMPDIR`, which on macOS is itself often long)
+/// when `root` would not fit — named by a hash of `root` so distinct state
+/// directories, and repeated ephemeral runs, do not collide. Only the
+/// transient callback-socket directory moves: `os.json`, `daemon.json`,
+/// packages and memory all stay under the real `root`. The fallback
+/// directory itself is checked by [`secure_fallback_dir`] before use — never
+/// blindly reused — since its name is predictable on a shared `/tmp`.
+///
+/// # Errors
+///
+/// If `root` is too long AND its fallback directory is not safe to use (see
+/// [`secure_fallback_dir`]). Does not retry at any other path.
+fn callback_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let projected = root
+        .join("run")
+        .join(std::process::id().to_string())
+        .join(format!("{}.sock", u64::MAX));
+    if projected.as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH {
+        return Ok(root.to_owned());
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    let fallback =
+        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", hasher.finish()));
+    secure_fallback_dir(&fallback).map_err(|why| {
+        format!(
+            "{} is too long for callback sockets (over the {}-byte macOS limit), and its \
+             short-path fallback {} is not safe to use: {why}",
+            root.display(),
+            agent24_os_proto::endpoint::MAX_SOCKET_PATH,
+            fallback.display(),
+        )
+    })?;
+    tracing::warn!(
+        "{} is too long for callback sockets (over the {}-byte macOS limit); using {} instead \
+         for this run. To use {} directly, point Agent24 at a shorter data directory (e.g. a \
+         shorter $HOME).",
+        root.display(),
+        agent24_os_proto::endpoint::MAX_SOCKET_PATH,
+        fallback.display(),
+        root.display(),
+    );
+    Ok(fallback)
+}
+
 /// What out-of-process modules are started with: the callback directory under
-/// `root` (stale ones cleared first, FU-56), this binary as the trampoline, and
-/// the daemon's stop grace.
+/// `root` (stale ones cleared first, FU-56; relocated by [`callback_root`] if
+/// `root` itself is too long), this binary as the trampoline, and the
+/// daemon's stop grace.
 fn process_host(
     root: &std::path::Path,
     stop_grace: Duration,
 ) -> Result<crate::domain::ProcessHost, String> {
+    let root = &callback_root(root)?;
     for gone in agent24_os_proto::endpoint::remove_stale(root) {
         tracing::info!(
             "removed the callback directory of a daemon that is gone: {}",
@@ -2006,10 +2132,15 @@ fn process_host(
     // Checked now, for the longest name a socket there can get, rather than
     // failing every module's start — and then its restarts — one by one: a long
     // `TMPDIR` (an ephemeral daemon's root) can put every socket over the limit.
+    // Should not trigger given `callback_root` above, but kept as a safety net
+    // — e.g. if `/tmp` itself were ever remapped to something long.
     let longest = callback_dir.path().join(format!("{}.sock", u64::MAX));
-    if longest.as_os_str().len() > agent24_os_proto::endpoint::MAX_SOCKET_PATH {
+    let longest_len = longest.as_os_str().len();
+    if longest_len > agent24_os_proto::endpoint::MAX_SOCKET_PATH {
         return Err(format!(
-            "callback sockets under {} would be longer than {} bytes",
+            "callback sockets under {} would be {longest_len} bytes, over the {}-byte macOS \
+             limit — point Agent24 at a shorter data directory (e.g. a shorter $HOME) and \
+             restart",
             callback_dir.path().display(),
             agent24_os_proto::endpoint::MAX_SOCKET_PATH
         ));
@@ -3507,5 +3638,117 @@ pub(crate) mod tests {
             }
             other => panic!("expected AgentRun for an accepted run, got {other:?}"),
         }
+    }
+
+    // ---- FU-92 follow-up: secure_fallback_dir / callback_root hardening ----
+    // The fallback directory `callback_root` may pick lives under the shared,
+    // world-writable `/tmp` with a PREDICTABLE name (a hash of `root`) — so
+    // another local user could race to plant something at that name before
+    // this daemon starts. These tests are for `secure_fallback_dir` itself
+    // (the pure filesystem check) and for its wiring into `callback_root`
+    // (so a mutation that drops the call is caught, not just the helper in
+    // isolation). The "normal case" — nothing planted, a real mount — is
+    // covered end to end by `daemon_modules.rs`'s long-HOME blackbox test.
+
+    /// Mirrors `callback_root`'s own hash formula, only so tests can find (and
+    /// clean up before/after) the exact path it will pick for a given `root`
+    /// — never asserted on for its OWN sake.
+    fn hashed_fallback_path(root: &std::path::Path) -> std::path::PathBuf {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        root.hash(&mut hasher);
+        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", hasher.finish()))
+    }
+
+    /// Nothing there yet: created fresh, exactly `0700`.
+    #[test]
+    fn secure_fallback_dir_creates_a_fresh_directory_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("fallback");
+        secure_fallback_dir(&path).expect("a fresh directory is fine");
+        let mode = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+    }
+
+    /// A restart re-checking its OWN directory from a previous run (still
+    /// `0700`, still ours) must not be refused — only an unsafe entry is.
+    #[test]
+    fn secure_fallback_dir_accepts_its_own_directory_again() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("fallback");
+        secure_fallback_dir(&path).unwrap();
+        secure_fallback_dir(&path).expect("our own 0700 directory is fine the second time");
+    }
+
+    /// A pre-existing directory at that name with looser permissions — as
+    /// another local user racing the predictable name could leave — is
+    /// refused, not silently tightened in place (unlike `agent24-os-proto`'s
+    /// `private_dir`, which DOES tighten a loose directory of ours: on a
+    /// shared `/tmp`, "ours" cannot be trusted here without the check first).
+    #[test]
+    fn secure_fallback_dir_refuses_a_preexisting_loose_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("fallback");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = secure_fallback_dir(&path).expect_err("a 0755 directory must be refused");
+        assert!(err.contains("0700"), "{err}");
+    }
+
+    /// A pre-existing symlink at that name — pointing anywhere, even nowhere
+    /// that exists — is refused, never followed (which is exactly what
+    /// `DirBuilder::create(..).recursive(true)` — used one layer down by
+    /// `CallbackDir::create` — would otherwise walk straight through).
+    #[test]
+    fn secure_fallback_dir_refuses_a_preexisting_symlink() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("fallback");
+        let elsewhere = base.path().join("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let err = secure_fallback_dir(&path).expect_err("a symlink must be refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !elsewhere.exists(),
+            "the symlink target must never be created"
+        );
+    }
+
+    /// Wiring check: `callback_root` itself must refuse an unsafe pre-existing
+    /// fallback directory rather than silently reusing it or trying some
+    /// other path (mutation check: dropping the `secure_fallback_dir` call
+    /// from `callback_root` turns this green when it must be red).
+    #[test]
+    fn callback_root_refuses_an_unsafe_preexisting_fallback_directory() {
+        // A root that does not exist on disk — `callback_root` never touches
+        // `root` itself in the too-long branch, only hashes it — but long
+        // enough that `<root>/run/<pid>/<u64::MAX>.sock` cannot fit, so the
+        // `/tmp` fallback branch is the one under test. Unique to this test
+        // so it cannot collide with the other `callback_root`/blackbox tests.
+        let long_root = std::path::PathBuf::from(format!(
+            "/callback-root-hardening-test-{}-{}",
+            std::process::id(),
+            "x".repeat(150)
+        ));
+        let fallback = hashed_fallback_path(&long_root);
+        let _ = std::fs::remove_dir_all(&fallback);
+        let _ = std::fs::remove_file(&fallback);
+
+        let got = callback_root(&long_root).expect("a fresh fallback directory is fine");
+        assert_eq!(got, fallback);
+
+        // Replace the now-created directory with a symlink, as a racing local
+        // user could have done between two runs of this daemon.
+        std::fs::remove_dir_all(&fallback).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-elsewhere-for-this-test", &fallback).unwrap();
+        let err = callback_root(&long_root).expect_err("a symlinked fallback must be refused");
+        assert!(err.contains("symlink"), "{err}");
+
+        let _ = std::fs::remove_file(&fallback);
     }
 }

@@ -186,3 +186,52 @@ export const decideApproval = async (id: string, decision: Decision): Promise<vo
   // 409 (already resolved) is not fatal — a concurrent resolution won
   if (!res.ok && res.status !== 409) throw new Error(errorMessage(res))
 }
+
+// ── FU-90: domain-OS modules (`GET`/`PATCH /api/v1/os`) ─────────────────────
+// These are kernel-mounted out-of-process modules (e.g. Sin90) — a different
+// thing from the npm community modules ModulesManager.tsx otherwise manages.
+// Mirrors agent24-protocol's DomainOsView/DomainOsList (rust/crates/agent24-protocol/src/types.rs).
+
+/** One domain OS, as `GET /api/v1/os` sees it. */
+export interface DomainOsView {
+  name: string
+  namespace: string
+  version: string
+  /** What os.json says right now. */
+  enabled: boolean
+  /** What the running daemon is doing with it — open enum: mounted | disabled | degraded | refused. */
+  state: string
+  detail?: string | null
+  /** Kernel capabilities the module actually got. */
+  granted: string[]
+  /** Declared models the daemon could not find. */
+  missing_models: string[]
+  /** Open enum: ok | missing | unknown | not_checked. */
+  resources: string
+  /** The config says something the running daemon has not applied yet. */
+  restart_required: boolean
+}
+
+export interface DomainOsList {
+  modules: DomainOsView[]
+  /** A problem with the registry itself, not with any one module. */
+  registry_error?: string | null
+}
+
+export const listOsModules = async (): Promise<DomainOsList> => {
+  const res = await window.agent24.backendProxy({ method: 'GET', path: '/api/v1/os' })
+  if (!res.ok) throw new Error(errorMessage(res))
+  return res.data as DomainOsList
+}
+
+// PATCH returns the whole refreshed list (server.rs `patch_os`), not just the
+// one module, so the caller sees the new `restart_required` state too.
+export const setOsModuleEnabled = async (name: string, enabled: boolean): Promise<DomainOsList> => {
+  const res = await window.agent24.backendProxy({
+    method: 'PATCH',
+    path: `/api/v1/os/${encodeURIComponent(name)}`,
+    body: { enabled },
+  })
+  if (!res.ok) throw new Error(errorMessage(res))
+  return res.data as DomainOsList
+}
