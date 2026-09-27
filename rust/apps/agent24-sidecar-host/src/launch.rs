@@ -563,8 +563,8 @@ mod windows_tests {
         panic!("Job tree was not reaped before deadline");
     }
 
-    #[test]
-    fn windows_launch_preserves_request_and_all_pipes() {
+    #[tokio::test]
+    async fn windows_launch_preserves_request_and_all_pipes() {
         let parent_current_dir = std::env::current_dir().expect("current cwd");
         let mut cwd = std::env::temp_dir();
         cwd.push(format!("agent24-sidecar-cwd-{}", std::process::id()));
@@ -624,8 +624,8 @@ mod windows_tests {
         assert_eq!(stderr, "err");
     }
 
-    #[test]
-    fn windows_moved_pipes_deliver_eof_and_leave_the_launch_authoritative() {
+    #[tokio::test]
+    async fn windows_moved_pipes_deliver_eof_and_leave_the_launch_authoritative() {
         let cwd = std::env::temp_dir();
         let mut launch = OwnedLaunch::start(LaunchIntent::from_request(Request::Launch {
             version: 1,
@@ -691,8 +691,8 @@ mod windows_tests {
         assert_eq!(stdout_eof, 0);
     }
 
-    #[test]
-    fn windows_launch_keeps_job_authority_after_leader_exit() {
+    #[tokio::test]
+    async fn windows_launch_keeps_job_authority_after_leader_exit() {
         let cwd = std::env::temp_dir();
         let mut launch = OwnedLaunch::start(
             LaunchIntent::from_request(descendant_request(&cwd)).expect("intent"),
