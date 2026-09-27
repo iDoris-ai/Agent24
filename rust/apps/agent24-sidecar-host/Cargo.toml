@@ -13,7 +13,7 @@ nix = { version = "0.31", features = ["process", "signal"] }
 rustix = { version = "1", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
-processkit = { version = "=3.3.4", features = ["stats"] }
+processkit = { git = "https://github.com/jhfnetboy/ProcessKit-rs.git", rev = "60aa827db378daa5b1ec638f3b3fdaaf9c201560", features = ["stats"] }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
 
 [lints]
