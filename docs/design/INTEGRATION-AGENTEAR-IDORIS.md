@@ -217,6 +217,8 @@
 
 以 idoris 会话的一手回复为准（附录 B）。原先 §1–§6 里从仓库推断的 iDoris 内容，凡与本节冲突的，一律以本节为准。
 
+> **2026-09-27 更新（本段下文已过期）**：据 iDoris 会话告知，iDoris 38 个 task 已全部合入其 `preview`；守护进程入口、`IDORIS_PORT`、虚拟 key、Served-Locality 均列在 iDoris M4。双方边界与接口以《iDoris × Agent24 分工边界与接口数据规范》v0.2（iDoris PR #43，jason 2026-09-27 拍板 D-1…D-7 全选 (a)）为准：模型管理全部归 iDoris；Agent24 只保留任务→角色映射、授权 tier 门与按模块用量账本；配置 `IDORIS_URL` 后不再直连 oMLX；P4 接入以 iDoris M4 四项前置（main 合并、`IDORIS_PORT`、所有响应含 Served-Locality/Record-Id、`/health` 服务身份）为门。
+
 **排期**（截至 2026-09-26）：代码已写完，但**一行都还没合进 iDoris 的集成分支**（32 个 PR 串成 30 层的 stacked 链，全部 open；其中 7 个 CHANGES_REQUESTED 已在 2026-09-26 修完，gates 由红转绿，但仍未合并）。接口契约已冻结，可以先照着写；但 **P4（iDoris provider）只有等 iDoris 链合进 `preview` 之后才能排期**。「iDoris 已可依赖」不写进任何时间表。
 
 **更正**

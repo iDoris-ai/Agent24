@@ -54,6 +54,7 @@
       "output": "release",
       "buildResources": "assets"
     },
+    "icon": "assets/icon.png",
     "files": [
       "dist/**/*",
       "package.json"
@@ -69,6 +70,7 @@
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
       "target": [
         "dmg"
       ],
