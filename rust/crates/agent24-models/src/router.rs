@@ -121,6 +121,14 @@ pub struct ModelRouter {
     health: Mutex<HashMap<String, Health>>,
     base_cooldown: Duration,
     max_cooldown: Duration,
+    /// ME4-desktop-model-ui: the `DEFAULT_MODEL` env var this router was
+    /// built with, for a client (desktop's topbar) to ask "what does Agent24
+    /// actually default to" instead of guessing from a locally-detected
+    /// model list. Only [`Self::from_env`] sets it — a hand-built router
+    /// (every other constructor, mostly tests and per-module
+    /// `with_separate_health()` copies) has no single "the" default model to
+    /// report, so this stays `None` there rather than a misleading guess.
+    default_model: Option<String>,
 }
 
 /// Absolute ceiling on any cooldown, independent of the caller's `max_cooldown`
@@ -217,6 +225,7 @@ impl ModelRouter {
             health: Mutex::new(HashMap::new()),
             base_cooldown,
             max_cooldown,
+            default_model: None,
         }
     }
 
@@ -241,7 +250,18 @@ impl ModelRouter {
             health: Mutex::new(HashMap::new()),
             base_cooldown: self.base_cooldown,
             max_cooldown: self.max_cooldown,
+            default_model: self.default_model.clone(),
         }
+    }
+
+    /// ME4-desktop-model-ui: the `DEFAULT_MODEL` this router was built with
+    /// ([`Self::from_env`] only) — `None` for a hand-built router (tests,
+    /// and every `with_separate_health()` copy of one that was never given
+    /// one either). Never a guess: a caller that gets `None` back has no
+    /// single "the default model" to show and must say so, not fall back to
+    /// picking one itself.
+    pub fn default_model(&self) -> Option<&str> {
+        self.default_model.as_deref()
     }
 
     /// Convenience default: 2s base, 60s cap. Same PRIVACY CONTRACT as
@@ -290,7 +310,9 @@ impl ModelRouter {
             };
         let omlx = build("omlx", omlx_url, Some(omlx_key), omlx_tier);
         let ollama = build("ollama", ollama_url, None, ollama_tier);
-        Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)])
+        let mut router = Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)]);
+        router.default_model = Some(default_model);
+        router
     }
 
     /// Provider indices to try, in order, for `profile` at `now`: tier
@@ -994,6 +1016,19 @@ mod tests {
     fn from_env_reports_the_judged_tier() {
         assert_eq!(tier_label(env_local_tier("http://0.0.0.0:1")), "remote");
         assert_eq!(tier_label(env_local_tier("http://127.0.0.1:1")), "local");
+    }
+
+    /// `from_env()`'s own env-var manipulation is exercised only via the
+    /// child-process tests above (edition 2024 forbids `set_var` outside
+    /// `unsafe`, which this workspace forbids outright) — this just pins the
+    /// getter's default for every OTHER constructor, so a client asking a
+    /// hand-built or per-module router "what's the default model" gets
+    /// `None`, never a stale or made-up guess.
+    #[test]
+    fn default_model_is_none_unless_built_from_env() {
+        let r = ModelRouter::with_defaults(vec![]);
+        assert_eq!(r.default_model(), None);
+        assert_eq!(r.with_separate_health().default_model(), None);
     }
 
     #[test]

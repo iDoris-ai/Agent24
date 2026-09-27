@@ -1,3 +1,6 @@
+   Compiling agent24-protocol v0.3.0 (/Users/jason/Dev/auraai/Agent24-model-ui/rust/crates/agent24-protocol)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.89s
+     Running `target/debug/export-schema`
 {
   "$id": "https://github.com/iDoris-ai/Agent24/protocol/events.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -45,6 +48,23 @@
         "type": {
           "type": "string",
           "const": "model.delta"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "description": "ME4-desktop-model-ui: kernel visibility into one completed\n`_a24/model/complete` call (agent24d/src/model_callback.rs) — which\nmodule called, which model/tier/provider actually served it, whether\nit succeeded, and how long it took. Broadcast once per call that\nreached routing (ok or failed), regardless of whether any WS client\nis listening. Deliberately carries NO prompt/response content — the\ncall itself may be `LocalOnly`, and this event is not.",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/ModelCallPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "model.call"
         }
       },
       "required": [
@@ -450,6 +470,72 @@
       "required": [
         "code",
         "message"
+      ]
+    },
+    "ModelCallPayload": {
+      "description": "One completed `_a24/model/complete` call (ME4-desktop-model-ui). Mirrors\n`agent24d::model_callback::ModelCompleteResult`'s own `model_id`/`tier`\nplus the router's `Served::provider` and the usage sink's token counts —\nnever the call's `text`/messages, which stay off the WS entirely.",
+      "type": "object",
+      "properties": {
+        "completion_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "latency_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model_id": {
+          "description": "Provider-reported model id, when one was reported (mirrors\n`ModelCompleteResult::model_id`) — `None` when the provider didn't\nsay, or when no provider ever answered this call.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "module": {
+          "description": "The module that placed the call (`_a24/model/complete`'s caller,\ne.g. `\"agentear\"`).",
+          "type": "string"
+        },
+        "ok": {
+          "description": "Whether the RPC call itself succeeded (a provider answering but the\nkernel then withholding the result — oversize, the LocalOnly\ntripwire — counts as `false`, same as `UsageOutcome::FailedAfterServe`).",
+          "type": "boolean"
+        },
+        "prompt_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "served_by": {
+          "description": "Which provider actually served the call (`Served::provider`, e.g.\n`\"omlx\"`/`\"ollama\"`) — `None` for the same reason `tier` can be.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tier": {
+          "description": "Open enum, `\"local\" | \"remote\"` (matches the RPC result's own\n`tier`) — `None` when the call failed before any provider served it,\nso no tier was ever decided.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "module",
+        "ok",
+        "latency_ms",
+        "model_id",
+        "tier",
+        "served_by",
+        "prompt_tokens",
+        "completion_tokens"
       ]
     },
     "ModelDeltaPayload": {

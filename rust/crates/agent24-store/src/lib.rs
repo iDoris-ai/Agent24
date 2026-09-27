@@ -10,12 +10,14 @@
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
 mod audit;
+mod model_call_timings;
 mod module_approvals;
 mod module_model_usage;
 mod module_schedules;
 mod repo;
 
 pub use audit::AuditEntry;
+pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
 pub use repo::*;

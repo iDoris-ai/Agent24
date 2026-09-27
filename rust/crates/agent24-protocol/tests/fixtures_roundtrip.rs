@@ -80,6 +80,7 @@ const REQUIRED_EVENT_FIXTURES: &[&str] = &[
     "run.failed.json",
     "run.cancelled.json",
     "model.delta.json",
+    "model.call.json",
     "tool.started.json",
     "tool.completed.json",
     "approval.required.json",

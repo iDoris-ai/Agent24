@@ -37,6 +37,15 @@ pub enum EventBody {
     RunStarted(RunStartedPayload),
     #[serde(rename = "model.delta")]
     ModelDelta(ModelDeltaPayload),
+    /// ME4-desktop-model-ui: kernel visibility into one completed
+    /// `_a24/model/complete` call (agent24d/src/model_callback.rs) — which
+    /// module called, which model/tier/provider actually served it, whether
+    /// it succeeded, and how long it took. Broadcast once per call that
+    /// reached routing (ok or failed), regardless of whether any WS client
+    /// is listening. Deliberately carries NO prompt/response content — the
+    /// call itself may be `LocalOnly`, and this event is not.
+    #[serde(rename = "model.call")]
+    ModelCall(ModelCallPayload),
     #[serde(rename = "run.completed")]
     RunCompleted(RunCompletedPayload),
     #[serde(rename = "run.failed")]
@@ -104,6 +113,7 @@ impl EventBody {
         match self {
             EventBody::RunStarted(_) => "run.started",
             EventBody::ModelDelta(_) => "model.delta",
+            EventBody::ModelCall(_) => "model.call",
             EventBody::RunCompleted(_) => "run.completed",
             EventBody::RunFailed(_) => "run.failed",
             EventBody::RunCancelled(_) => "run.cancelled",
@@ -153,6 +163,35 @@ pub struct ModelDeltaPayload {
     pub run_id: String,
     /// Streaming text increment
     pub text: String,
+}
+
+/// One completed `_a24/model/complete` call (ME4-desktop-model-ui). Mirrors
+/// `agent24d::model_callback::ModelCompleteResult`'s own `model_id`/`tier`
+/// plus the router's `Served::provider` and the usage sink's token counts —
+/// never the call's `text`/messages, which stay off the WS entirely.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelCallPayload {
+    /// The module that placed the call (`_a24/model/complete`'s caller,
+    /// e.g. `"agentear"`).
+    pub module: String,
+    /// Provider-reported model id, when one was reported (mirrors
+    /// `ModelCompleteResult::model_id`) — `None` when the provider didn't
+    /// say, or when no provider ever answered this call.
+    pub model_id: Option<String>,
+    /// Open enum, `"local" | "remote"` (matches the RPC result's own
+    /// `tier`) — `None` when the call failed before any provider served it,
+    /// so no tier was ever decided.
+    pub tier: Option<String>,
+    /// Which provider actually served the call (`Served::provider`, e.g.
+    /// `"omlx"`/`"ollama"`) — `None` for the same reason `tier` can be.
+    pub served_by: Option<String>,
+    /// Whether the RPC call itself succeeded (a provider answering but the
+    /// kernel then withholding the result — oversize, the LocalOnly
+    /// tripwire — counts as `false`, same as `UsageOutcome::FailedAfterServe`).
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
