@@ -58,11 +58,11 @@ pub use allocation_types::{
     AllocationFailureReason, AllocationId, AllocationPhase, AllocationValueError,
 };
 pub use audit::AuditEntry;
-pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
-pub use module_schedules::*;
 pub use legacy_recovery::{
     LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
 };
+pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
+pub use module_schedules::*;
 pub use repo::*;
 
 use sqlx::SqlitePool;
