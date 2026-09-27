@@ -140,7 +140,7 @@
 
 **→ AgentEar**
 1. 做「附着模式」（A3，取代原 A1 写法）：用户自行启动 AgentEar；经 `agent24 os attach add` 配对拿到 token（存 Keychain）后，连 Agent24 的附着 socket、用同一 `initialize` 握手，按 [`A3-ATTACHED-MODULE.md`](A3-ATTACHED-MODULE.md) §4 的 wire 规格自行实现（不依赖 Agent24 crate）；反向命令在**同一条连接**上以 `_a24/command/invoke` 下发，AgentEar 不监听任何 socket/端口；**读到 EOF 不退出**，按 B5 切换并退避重连；独立模式保持不变。
-2. 定义事件：`transcript{text, lang, content_hash}`、`proposal`（直接复用 `agentear.proposal/1`）、`turn{phase}`；定义命令：`POST /speak{text, lang, voice?}` 和 `POST /stop`。全部带 schema 版本。
+2. 定义事件：`transcript{text, lang, content_hash}`、`proposal`（直接复用 `agentear.proposal/1`）、`turn{phase}`；命令按 `agentear.command/1`（`speak`/`stop_playback`），经 [`A3-ATTACHED-MODULE.md`](A3-ATTACHED-MODULE.md) §6 在附着连接上以 `_a24/command/invoke` 下发（AgentEar 不起 HTTP 端点，原「`POST /speak`、`POST /stop`」写法作废）。全部带 schema 版本。
 3. LLM 调用抽成可替换的 transport：独立模式走 HTTP；模块模式走 `_a24/model/complete`，并带上 `complexity`。
 4. `sidecar::probe` 现在只认 `mlx-dspark` 这个身份标识（`src/sidecar.rs:631`），接 iDoris 时要加 iDoris 的身份标识。另外请求里要补上 `model` 字段。
 5. 继续不做记忆和执行。多轮上下文放进 `_a24/memory/private`，或者等 Agent24 的会话回调。
