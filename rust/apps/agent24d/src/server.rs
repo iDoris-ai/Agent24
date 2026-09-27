@@ -1035,6 +1035,19 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             axum::routing::post(crate::schedules::resume_schedule),
         )
         .route("/api/v1/events", get(crate::events::ws_events))
+        // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2): register/rotate,
+        // list and revoke attached modules. `attached` is reserved in
+        // `RESERVED_KERNEL_SEGMENTS` (domain.rs) precisely because it is a
+        // literal `/api/v1/` segment here — see that constant's own doc and
+        // `reserved_segments_match_the_kernel_routes_exactly`.
+        .route(
+            "/api/v1/attached",
+            post(crate::attached_routes::post_attached).get(crate::attached_routes::list_attached),
+        )
+        .route(
+            "/api/v1/attached/{name}",
+            axum::routing::delete(crate::attached_routes::delete_attached),
+        )
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
         .route("/api/v1/os", get(crate::os_routes::list_os))
         .route(

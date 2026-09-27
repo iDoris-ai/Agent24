@@ -5,12 +5,16 @@
 //! - Standalone: no daemon found → spawn an ephemeral agent24d for this
 //!   invocation and terminate it afterwards
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use agent24_protocol::state_file::{self, DaemonState};
-use agent24_protocol::{ChatMessage, ChatRequest, ChatResponse, Health};
+use agent24_protocol::{
+    AttachedAddRequest, AttachedAddResponse, AttachedList, ChatMessage, ChatRequest, ChatResponse,
+    Health,
+};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -111,6 +115,58 @@ enum OsAction {
     /// could not confirm the stop, `agent24 os list` shows why — that module will
     /// not restart on its own from this.
     Uninstall { name: String },
+    /// A3: manage attached modules (a user-started process registering
+    /// itself against a running daemon — `docs/design/A3-ATTACHED-MODULE.md`
+    /// §3). Unlike install/uninstall this always goes through the daemon:
+    /// the registry it writes to (`attached.json`) is daemon-owned the same
+    /// way `os.json` is.
+    Attach {
+        #[command(subcommand)]
+        action: OsAttachAction,
+    },
+}
+
+/// `agent24 os attach …` (A3-2a; §3.2/§3.6).
+#[derive(Subcommand)]
+enum OsAttachAction {
+    /// Register (first time) or rotate the token of an already-registered
+    /// attached module, from a `domain-os.yml`-shaped manifest file.
+    ///
+    /// Prints the new token on success — SAVE IT, the daemon never shows it
+    /// again (`GET`/`os attach list` never include it, §3.2/§3.3).
+    Add {
+        /// Path to the manifest file (§3.1)
+        manifest: PathBuf,
+        /// Confirm a registration that WIDENS privacy (first-time
+        /// `remote_allowed`, or a new capability, §3.5). Only takes effect
+        /// when stdin is a TTY and the prompt is answered "yes" — run
+        /// non-interactively (as AgentEar's own auto-pairing does), this
+        /// flag has no effect and a relaxing manifest is refused by the
+        /// daemon (`relax_requires_confirmation`). This is deliberate: A3
+        /// does not let an unattended process silently widen its own
+        /// privacy.
+        #[arg(long)]
+        allow_remote: bool,
+        /// Print exactly one JSON object to stdout: the same shape as the
+        /// daemon's `201`/`200` body on success, or `{"error":{...}}` on
+        /// failure (§3.6) — what AgentEar's own auto-pairing parses.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List attached modules (never shows the token, §3.2)
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke (de-register) an attached module. `revoke` is accepted as an
+    /// alias — the design doc's own CLI contract (§3.6) spells this verb
+    /// `revoke`; this project's task brief spelled it `remove`. Both work.
+    #[command(alias = "revoke")]
+    Remove {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -648,6 +704,13 @@ async fn hot_disable_best_effort(name: &str) {
 /// [`cmd_uninstall`] (FU-61: it also does a best-effort hot stop, which needs
 /// the daemon call `os_local`'s shared return shape cannot carry).
 async fn cmd_os(action: OsAction) -> Result<(), String> {
+    // A3-2a: always goes through the daemon (the registry it writes,
+    // `attached.json`, is daemon-owned the same way `os.json` is) but has its
+    // own request/response shapes and its own `--json`/TTY handling, so it is
+    // its own function rather than another arm of the `req`/`out` match below.
+    if let OsAction::Attach { action } = action {
+        return cmd_os_attach(action).await;
+    }
     if let OsAction::Uninstall { name } = &action {
         return cmd_uninstall(name).await;
     }
@@ -676,6 +739,8 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     let req = match &action {
         // Handled before the daemon lookup above; see `os_local`.
         OsAction::Install { .. } | OsAction::Uninstall { .. } => unreachable!(),
+        // Handled at the top of this function, before it ever reaches here.
+        OsAction::Attach { .. } => unreachable!(),
         OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let enabled = matches!(action, OsAction::Enable { .. });
@@ -707,6 +772,285 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     out
 }
 
+/// The v1 error envelope's `error.code`/`error.message`, as a bare JSON value
+/// — `serde_json::Value::default()` reads as `null`, which is why every call
+/// site below only trusts this when `["error"]["message"]` is actually a
+/// string (same rule `daemon_error_line` already applies).
+fn error_envelope_or(status: reqwest::StatusCode, body: &serde_json::Value) -> serde_json::Value {
+    if body["error"]["message"].as_str().is_some() {
+        body.clone()
+    } else {
+        serde_json::json!({"error": {"code": "daemon_unavailable", "message": format!("daemon returned {status}")}})
+    }
+}
+
+fn daemon_unavailable_envelope(e: &str) -> serde_json::Value {
+    serde_json::json!({"error": {"code": "daemon_unavailable", "message": e}})
+}
+
+/// §3.5/§3.6: whether to send `allow_relax: true`. Only when the caller asked
+/// (`--allow-remote`) AND stdin is a TTY AND the prompt is answered "yes".
+/// Run non-interactively — exactly how AgentEar's own auto-pairing invokes
+/// this (§5.6) — this is always `false`, so a relaxing manifest is refused by
+/// the daemon rather than silently approved by an unattended process.
+fn resolve_allow_relax(allow_remote: bool) -> bool {
+    if !allow_remote || !std::io::stdin().is_terminal() {
+        return false;
+    }
+    use std::io::Write;
+    eprint!(
+        "this registration requests wider privacy (remote model access, or a new capability) — \
+         type \"yes\" to confirm: "
+    );
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim() == "yes"
+}
+
+/// `agent24 os attach …` (A3-2a). Always goes through the daemon — see
+/// `cmd_os`'s doc comment on why `Attach` is intercepted before that
+/// function's own `req`/`out` match, which has different response shapes.
+async fn cmd_os_attach(action: OsAttachAction) -> Result<(), String> {
+    match action {
+        OsAttachAction::Add {
+            manifest,
+            allow_remote,
+            json,
+        } => cmd_attach_add(&manifest, allow_remote, json).await,
+        OsAttachAction::List { json } => cmd_attach_list(json).await,
+        OsAttachAction::Remove { name, json } => cmd_attach_remove(&name, json).await,
+    }
+}
+
+async fn cmd_attach_add(
+    manifest_path: &std::path::Path,
+    allow_remote: bool,
+    json: bool,
+) -> Result<(), String> {
+    let manifest = std::fs::read_to_string(manifest_path).map_err(|e| {
+        let msg = format!("cannot read {}: {e}", manifest_path.display());
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"error": {"code": "invalid_manifest", "message": msg}})
+            );
+        }
+        msg
+    })?;
+    // Resolved BEFORE contacting the daemon: a TTY prompt after an ephemeral
+    // daemon has already been spawned would be a strange place to block.
+    let allow_relax = resolve_allow_relax(allow_remote);
+    let ep = match connect().await {
+        Ok(ep) => ep,
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e));
+            }
+            return Err(e);
+        }
+    };
+    let sent = bearer(&ep, client().post(format!("{}/api/v1/attached", ep.base)))
+        .json(&AttachedAddRequest {
+            manifest,
+            allow_relax,
+        })
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    // No `?` below: any early return here would skip `finish(ep)` (the
+    // ephemeral daemon it may have spawned would never be reaped), and under
+    // `--json` a 2xx with an unreadable/unresizable body must still print
+    // exactly one JSON object rather than nothing — the non-zero exit
+    // already comes from returning `Err` below, `main` maps that to
+    // `ExitCode::FAILURE`.
+    let out = match sent {
+        Ok(res) if res.status().is_success() => match res.json::<AttachedAddResponse>().await {
+            Ok(body) => match serde_json::to_string(&body) {
+                Ok(text) => {
+                    if json {
+                        // Exactly one JSON object on stdout (§3.6) — the same
+                        // shape the daemon's own `201`/`200` body has.
+                        println!("{text}");
+                    } else {
+                        println!("registered {} (token_id {})", body.name, body.token_id);
+                        println!("  token (shown once — save it now): {}", body.token);
+                        println!("  manifest digest: {}", body.manifest_digest);
+                        println!("  socket: {}", body.socket_path);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = format!("could not re-serialize the daemon's response: {e}");
+                    if json {
+                        println!("{}", daemon_unavailable_envelope(&msg));
+                    }
+                    Err(msg)
+                }
+            },
+            Err(e) => {
+                let msg = format!("daemon returned an unreadable response: {e}");
+                if json {
+                    println!("{}", daemon_unavailable_envelope(&msg));
+                }
+                Err(msg)
+            }
+        },
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if json {
+                println!("{}", error_envelope_or(status, &body));
+            }
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+            }
+            Err(e.to_string())
+        }
+    };
+    finish(ep).await;
+    out
+}
+
+fn print_attached(list: &AttachedList) {
+    if list.modules.is_empty() {
+        println!("(no attached module registered)");
+        return;
+    }
+    for m in &list.modules {
+        println!("{}  [{}]  token_id {}", m.name, m.attach_status, m.token_id);
+        println!(
+            "    digest {}  registered {}",
+            m.manifest_digest, m.created_at
+        );
+    }
+}
+
+async fn cmd_attach_list(json: bool) -> Result<(), String> {
+    let ep = match connect().await {
+        Ok(ep) => ep,
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e));
+            }
+            return Err(e);
+        }
+    };
+    let sent = bearer(&ep, client().get(format!("{}/api/v1/attached", ep.base)))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    // See `cmd_attach_add`'s comment: no `?` here either, for the same two
+    // reasons (must not skip `finish(ep)`; `--json` must still emit exactly
+    // one JSON object even on an unreadable/unresizable 2xx body).
+    let out = match sent {
+        Ok(res) if res.status().is_success() => match res.json::<AttachedList>().await {
+            Ok(body) => match serde_json::to_string(&body) {
+                Ok(text) => {
+                    if json {
+                        println!("{text}");
+                    } else {
+                        print_attached(&body);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = format!("could not re-serialize the daemon's response: {e}");
+                    if json {
+                        println!("{}", daemon_unavailable_envelope(&msg));
+                    }
+                    Err(msg)
+                }
+            },
+            Err(e) => {
+                let msg = format!("daemon returned an unreadable response: {e}");
+                if json {
+                    println!("{}", daemon_unavailable_envelope(&msg));
+                }
+                Err(msg)
+            }
+        },
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if json {
+                println!("{}", error_envelope_or(status, &body));
+            }
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+            }
+            Err(e.to_string())
+        }
+    };
+    finish(ep).await;
+    out
+}
+
+async fn cmd_attach_remove(name: &str, json: bool) -> Result<(), String> {
+    let ep = match connect().await {
+        Ok(ep) => ep,
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e));
+            }
+            return Err(e);
+        }
+    };
+    let sent = bearer(
+        &ep,
+        client().delete(format!("{}/api/v1/attached/{name}", ep.base)),
+    )
+    .timeout(Duration::from_secs(10))
+    .send()
+    .await;
+    let out = match sent {
+        Ok(res) if res.status() == reqwest::StatusCode::NO_CONTENT => {
+            if json {
+                println!("{}", serde_json::json!({"removed": name}));
+            } else {
+                println!("removed {name}");
+            }
+            Ok(())
+        }
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if json {
+                println!("{}", error_envelope_or(status, &body));
+            }
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => {
+            if json {
+                println!("{}", daemon_unavailable_envelope(&e.to_string()));
+            }
+            Err(e.to_string())
+        }
+    };
+    finish(ep).await;
+    out
+}
+
 /// What to tell a user who cannot reach the daemon.
 ///
 /// **It prints ONE ENTRY TO ADD, never a whole document.** The first version
@@ -732,6 +1076,10 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
         OsAction::Install { .. } | OsAction::Uninstall { .. } => {
             "this command does not need the daemon".to_owned()
         }
+        // Unreachable for the same reason as the `Install`/`Uninstall` arms
+        // above are commented unreachable in `cmd_os`'s own match: `Attach`
+        // returns from `cmd_os` before this function is ever called.
+        OsAction::Attach { .. } => unreachable!(),
         OsAction::List => format!("read {path} to see what is configured"),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());

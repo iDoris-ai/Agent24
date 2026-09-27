@@ -5,6 +5,8 @@
 
 mod approval_callback;
 mod approvals;
+mod attached;
+mod attached_routes;
 // Remaining public capability primitives are staged for the next endpoints.
 #[allow(
     dead_code,
