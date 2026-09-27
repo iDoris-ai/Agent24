@@ -1039,10 +1039,32 @@ pub async fn mount_all(
     // once per pass (cheap: `attached.json` is small and local), not
     // threaded through as a parameter — same shape as `RESERVED_KERNEL_SEGMENTS`
     // just below, a fixed set this pass checks every catalogue entry against.
-    let attached_names: BTreeSet<String> = crate::attached::config_path()
-        .and_then(|path| crate::attached::list(&path).ok())
-        .map(|views| views.into_iter().map(|v| v.name).collect())
-        .unwrap_or_default();
+    // "Cannot read" and "genuinely empty" are kept apart on purpose (pre-PR
+    // review D1): a MISSING file (`config_path()` finding nothing to open,
+    // or `list()`'s own "not found" case) is the true empty registry — see
+    // `crate::attached::list`'s doc. A file that EXISTS but fails to parse is
+    // different: silently treating that as "nothing attached" would let a
+    // package steal a name this daemon actually has a live attach
+    // registration for, the exact contamination this check exists to
+    // prevent. So a read failure here is loud (an error, not silently
+    // swallowed) and conservative would-be entries are simply not exempted —
+    // `attached_names` stays whatever it already was (empty, on the first
+    // failure), which matches this pass's existing behaviour for a missing
+    // file and is no worse than A3-2b not existing at all for this one boot.
+    let attached_names: BTreeSet<String> = match crate::attached::config_path() {
+        Some(path) => match crate::attached::list(&path) {
+            Ok(views) => views.into_iter().map(|v| v.name).collect(),
+            Err(e) => {
+                tracing::error!(
+                    "could not read {path:?} to check for attached-module name clashes ({e}); \
+                     proceeding as if none are registered — a package that happens to share a \
+                     live attach registration's name will NOT be refused this boot"
+                );
+                BTreeSet::new()
+            }
+        },
+        None => BTreeSet::new(),
+    };
 
     for entry in catalogue {
         let name = entry.name.clone();
