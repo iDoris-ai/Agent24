@@ -986,7 +986,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2022,8 +2022,7 @@ dependencies = [
 [[package]]
 name = "processkit"
 version = "3.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1549b59abbe4fc78aa39860e36c81da89262c1278679b8f7299ef4ad7668c004"
+source = "git+https://github.com/jhfnetboy/ProcessKit-rs.git?rev=60aa827db378daa5b1ec638f3b3fdaaf9c201560#60aa827db378daa5b1ec638f3b3fdaaf9c201560"
 dependencies = [
  "async-trait",
  "encoding_rs",
@@ -2089,7 +2088,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2412,7 +2411,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3022,7 +3021,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
