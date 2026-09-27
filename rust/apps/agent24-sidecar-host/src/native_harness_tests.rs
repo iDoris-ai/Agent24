@@ -536,6 +536,10 @@ fn parent_eof_after_await_ready_or_running_cleans_up() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "runs separately on Windows to avoid process-tree timing interference"
+)]
 fn leader_exit_with_live_descendant_forces_tree_to_confirmed_empty() {
     #[cfg(unix)]
     let _guard = crate::posix::tests::test_lock();
