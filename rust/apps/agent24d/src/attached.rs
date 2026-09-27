@@ -549,6 +549,15 @@ mod tests {
         assert!(!json.contains(&resp.token));
         assert!(!json.contains("token_sha256"));
         assert!(!json.contains("\"token\""));
+        // Catches a leak under the WRONG field name too (e.g. the hash
+        // copy-pasted into `token_id` by mistake) — checking only for the
+        // literal key names above would miss that, since the VALUE would
+        // still be present just filed under a different key.
+        let hash = hash_token_hex(&resp.token);
+        assert!(
+            !json.contains(&hash),
+            "the token's hash must not appear anywhere in the list response, under any field"
+        );
     }
 
     #[test]
