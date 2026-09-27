@@ -44,7 +44,7 @@ Agent24 may activate production `run()` only after all of the following are true
 - the host stdio workers receive only owned parent endpoints;
 - the three-platform sidecar workflow and binary smoke are green.
 
-The minimum Windows proof must start with an unrelated inheritable sentinel handle, launch a target through the new API, and show that the target cannot access that sentinel. A second test must show that target stdio works and the host observes EOF after closing its parent endpoint. Rollback and assignment failures must leave no running child and no leaked pipe or Job handle.
+The minimum Windows proof must start with an unrelated inheritable sentinel handle, launch a target through the new API, and show that the target cannot access that sentinel. A second test must show that target stdio works: closing the parent's child-stdin writer gives the target EOF, and after the target closes/exits the host observes EOF on the parent-side stdout and stderr readers. Rollback and assignment failures must leave no running child and no leaked pipe or Job handle.
 
 The Agent24 binary smoke must use bounded waits and prove:
 
