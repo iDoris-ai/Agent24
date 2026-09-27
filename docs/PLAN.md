@@ -189,7 +189,7 @@ AILayer
 | L0 | 用户身份 + 当前会话上下文 | KV |
 | L1 | 重要事实（essential.md 风格） | SQLite |
 | L2 | 主题相关记忆（按需加载） | SQLite + 全文索引 |
-| L3 | ATIF 轨迹归档（DGM-style） | YAML 多文档 |
+| L3 | 轨迹：权威存储 = M-D 事件日志；**交换/导出格式 = Harbor ATIF v1.8**（按需投影，Agent24 字段放 `extra.agent24`；见 iDoris 规范 §3.8/§3.12，2026-09-27 定） | 事件日志（SQLite）→ ATIF JSON 导出 |
 | **Skill** | **从 archive 蒸馏的 skill（SkillRL/SkillClaw 风格）** | **SKILL.md + index** |
 
 跨设备同步：通过 Nostr relay 加密同步（NIP-44 + agent-speaker）。
@@ -199,7 +199,7 @@ AILayer
 借鉴 SkillClaw：
 
 ```
-ATIF Archive (results.log)
+Agent24 事件日志（权威）→ 按需投影为 ATIF v1.8
     │
     ▼
 Pattern Miner ─── 识别 N 次重复出现的行为模式
