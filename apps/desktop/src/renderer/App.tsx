@@ -52,6 +52,28 @@ const BUILTIN_TITLES: Record<BuiltinPage, string> = {
   'modules-manager': '模块管理', settings: '设置',
 }
 
+// FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
+// (see fetchOmlxModels in main/ipc/index.ts) — so a real "is this a chat
+// model" flag isn't available to filter on. Until it is, exclude known
+// non-chat model families by name so the chat page's default model is never
+// silently a text-to-image / video / ASR / TTS / embedding / rerank model
+// (FU-89 was filed because it picked `models[0]` unconditionally and that
+// happened to be a FLUX image model).
+const NON_CHAT_MODEL_PATTERNS: RegExp[] = [
+  /flux/i, /stable-?diffusion/i, /\bsdxl\b/i, /\bsd3\b/i, /kolors/i, /pixart/i, // image gen
+  /\bltx\b/i, /cogvideo/i, /hunyuan-?video/i, /\bwan-?2/i,                     // video gen
+  /whisper/i, /cosyvoice/i, /\btts\b/i, /xtts/i, /\bvits\b/i, /\bf5-tts\b/i, /\bbark\b/i, // ASR/TTS
+  /\bbge\b/i, /\bgte\b/i, /\be5\b/i, /embed/i, /rerank/i,                      // embedding/rerank
+]
+
+/** First model id that doesn't look like a known non-chat model, or
+ * `undefined` if every candidate is (FU-89). Exported for its unit test. */
+export function pickChatModel(models: string[]): string | undefined {
+  return models.find((m) => !NON_CHAT_MODEL_PATTERNS.some((re) => re.test(m)))
+}
+
+const NO_CHAT_MODEL_LABEL = '无可用对话模型（仅检测到生图/嵌入等模型）'
+
 export function App(): JSX.Element {
   const [page, setPage] = useState<Page>('chat')
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
@@ -86,23 +108,25 @@ export function App(): JSX.Element {
     void (async () => {
       const detected = await window.agent24.omlxDetect()
       if (detected) {
-        setLlmLabel(`${detected.models[0] ?? 'unknown'} · oMLX`)
-      } else {
-        // Try to start oMLX
-        const started = await window.agent24.omlxStart(8088, 'xiaobao8088')
-        if (started.ok) {
-          // Poll until ready
-          for (let i = 0; i < 5; i++) {
-            await new Promise((r) => setTimeout(r, 2000))
-            const r = await window.agent24.omlxModels(started.url, 'xiaobao8088')
-            if (r.ok && r.models.length > 0) {
-              setLlmLabel(`${r.models[0]} · oMLX`)
-              break
-            }
+        const chatModel = pickChatModel(detected.models)
+        setLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
+        return
+      }
+      // Try to start oMLX
+      const started = await window.agent24.omlxStart(8088, 'xiaobao8088')
+      if (started.ok) {
+        // Poll until ready
+        for (let i = 0; i < 5; i++) {
+          await new Promise((r) => setTimeout(r, 2000))
+          const r = await window.agent24.omlxModels(started.url, 'xiaobao8088')
+          if (r.ok && r.models.length > 0) {
+            const chatModel = pickChatModel(r.models)
+            setLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
+            if (chatModel) break
           }
-        } else {
-          setLlmLabel('No AI runtime')
         }
+      } else {
+        setLlmLabel('No AI runtime')
       }
     })()
 

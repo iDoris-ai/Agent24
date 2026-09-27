@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
-import { App } from './App'
+import { App, pickChatModel } from './App'
 import type { ModuleManifest } from '../shared/ipc-types'
 
 const mockBackendProxy = vi.fn()
@@ -62,6 +62,30 @@ describe('App', () => {
     await act(async () => { render(<App />) })
     await waitFor(() => {
       expect(screen.getByText(/Qwen3-8B-4bit/)).toBeInTheDocument()
+    })
+  })
+
+  // FU-89: a live model list whose first entry is an image-gen model must not
+  // become the chat page's default — pickChatModel should skip it. Mutation
+  // check: removing the filter (using `detected.models[0]` directly again)
+  // turns this red, since it would show the FLUX model instead.
+  it('skips a leading image-gen model and defaults to a chat model (FU-89)', async () => {
+    mockOmlxDetect.mockResolvedValue({
+      ok: true,
+      models: ['FLUX.2-klein-4B-mflux-4bit', 'Qwen3-8B-4bit'],
+    })
+    await act(async () => { render(<App />) })
+    await waitFor(() => {
+      expect(screen.getByText(/Qwen3-8B-4bit/)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/FLUX/)).not.toBeInTheDocument()
+  })
+
+  it('shows a message instead of a model when only non-chat models are available (FU-89)', async () => {
+    mockOmlxDetect.mockResolvedValue({ ok: true, models: ['FLUX.2-klein-4B-mflux-4bit', 'bge-m3'] })
+    await act(async () => { render(<App />) })
+    await waitFor(() => {
+      expect(screen.getByText(/无可用对话模型/)).toBeInTheDocument()
     })
   })
 
@@ -139,5 +163,28 @@ describe('App', () => {
     await waitFor(() => {
       expect(screen.getByText('No AI runtime')).toBeInTheDocument()
     })
+  })
+})
+
+describe('pickChatModel (FU-89)', () => {
+  it('picks the first model that is not a known non-chat family', () => {
+    expect(pickChatModel(['FLUX.2-klein-4B-mflux-4bit', 'Qwen3-8B-4bit'])).toBe('Qwen3-8B-4bit')
+    expect(pickChatModel(['Qwen3-8B-4bit', 'FLUX.2-klein-4B-mflux-4bit'])).toBe('Qwen3-8B-4bit')
+  })
+
+  it('skips image, video, ASR/TTS, embedding and rerank families', () => {
+    const nonChat = [
+      'FLUX.1-schnell', 'stable-diffusion-xl', 'LTX-2.3', 'mlx-whisper-large-v3',
+      'CosyVoice2-0.5B', 'bge-m3', 'ModernBERT-reranker',
+    ]
+    for (const m of nonChat) expect(pickChatModel([m])).toBeUndefined()
+  })
+
+  it('returns undefined when nothing looks like a chat model', () => {
+    expect(pickChatModel(['FLUX.1-schnell', 'bge-m3'])).toBeUndefined()
+  })
+
+  it('returns undefined for an empty list', () => {
+    expect(pickChatModel([])).toBeUndefined()
   })
 })
