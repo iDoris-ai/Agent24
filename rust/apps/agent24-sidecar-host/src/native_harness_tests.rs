@@ -554,6 +554,7 @@ fn leader_exit_with_live_descendant_forces_tree_to_confirmed_empty() {
         descendant_request(REQUEST_ID, &marker, &gate),
         DESCENDANT_LIMITS,
         |harness, bytes, _| {
+            drive_until(harness, WaitFor::AwaitReady, TurnIntent::Continue, 3);
             let descendant = wait_for_descendant_pid(&marker);
             assert!(
                 descendant_is_alive(descendant).expect("observe live descendant"),
