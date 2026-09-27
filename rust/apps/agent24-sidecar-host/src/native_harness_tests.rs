@@ -335,7 +335,7 @@ fn descendant_request(id: u64, marker: &Path, gate: &Path) -> Request {
         let gate = powershell_quote(&gate.display().to_string());
         let ready = r#"[Console]::Out.WriteLine('{"type":"ready","protocol":1,"port":4312,"token":"tttttttttttttttttttttttttttttttt","version":"native-harness"}'); [Console]::Out.Flush(); "#;
         let script = format!(
-            "$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker}' -Value $child.Id; {ready} while (-not (Test-Path -LiteralPath '{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
+            "$child = Start-Process \"$PSHOME\\powershell.exe\" -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker}' -Value $child.Id; {ready} while (-not (Test-Path -LiteralPath '{gate}')) {{ Start-Sleep -Milliseconds 10 }}; exit 17"
         );
         let env = ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE"]
             .into_iter()
