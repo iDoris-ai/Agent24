@@ -2,8 +2,16 @@ AgentEar contracts vendored copy (agentear.command/1 schema + fixtures only)
 source repo: github.com/iDoris-ai/AgentEar
 commit: 522f9eba0f720c97b9bb0a63d059a82e33029dcb
 copied: 2026-09-27T06:39:09Z
-paths: contracts/schema/agentear.command.v1.schema.json, contracts/fixtures/command/**
-method: git archive 522f9eba0f720c97b9bb0a63d059a82e33029dcb contracts/schema/agentear.command.v1.schema.json contracts/fixtures/command | tar -x
+paths: contracts/schema/agentear.command.v1.schema.json (this ONE file, not the whole
+  contracts/schema/ directory), contracts/fixtures/command/** -- nothing else under contracts/
+  is copied.
+copy_method: git archive 522f9eba0f720c97b9bb0a63d059a82e33029dcb \
+  contracts/schema/agentear.command.v1.schema.json contracts/fixtures/command | tar -x
+not_vendored: contracts/README.md is intentionally NOT vendored -- it carries relative links
+  into the AgentEar repo (e.g. to its own docs/), which would dangle here and trip pre-pr-check's
+  B2 (dead-link) rule against a repo this one does not contain. Nothing in this fixture set or in
+  the Rust tests that read it needs the README; if a future reader wants the human-facing schema
+  overview, read it from the AgentEar repo at the commit pinned above.
 purpose: A3-3 (docs/design/A3-ATTACHED-MODULE.md §6, §7.2 vendoring pattern) host-side reverse-command
   black-box tests use these as literal REST request bodies. The host never validates this schema
   (§6.1: "内核不解析 body 的业务 schema") -- these fixtures only prove byte-for-byte pass-through and
