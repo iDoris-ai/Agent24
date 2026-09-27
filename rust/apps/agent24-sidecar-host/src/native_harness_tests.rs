@@ -216,7 +216,7 @@ fn drive_until(
             WaitFor::Running => report.state.phase == Phase::Running,
             WaitFor::Empty => report.state.phase == Phase::Empty,
         };
-        if reached && !report.state.output_pending {
+        if reached && (!report.state.output_pending || matches!(target, WaitFor::AwaitReady)) {
             return report;
         }
         assert!(
