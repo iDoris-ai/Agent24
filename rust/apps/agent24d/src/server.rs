@@ -1571,22 +1571,35 @@ pub async fn serve(
             events: state.events.clone(),
         },
     ));
-    if let Some(path) = crate::attached::config_path()
-        && let Err(e) = state.attach_registry.hydrate(&path)
-    {
-        tracing::error!("could not hydrate the attach registry from {path:?}: {e}");
-    }
-    // Filled before the listener starts (see the cell's own comment above):
-    // the `stopping` task's `revoke_all` can now find it.
-    let _ = attach_registry_cell.set(Arc::clone(&state.attach_registry));
-    if let Some(path) = crate::attached::socket_path() {
-        tokio::spawn(crate::attach_listener::run(
-            Arc::clone(&state.attach_registry),
-            path,
-            shutdown.child_token(),
-        ));
-    } else {
-        tracing::error!("attach listener not started: HOME is not set, no socket path to bind");
+    // Review H1: an EPHEMERAL daemon (`agent24 ...` without a resident
+    // daemon, or an `os_local` helper spawning one just for one CLI call)
+    // must NOT touch `~/.agent24/attach/agent24d.sock` at all — that path is
+    // the REAL, resident daemon's. A short-lived daemon hydrating it and
+    // binding the real socket would make the resident daemon's own listener
+    // degrade (`bind`'s own "already accepting connections" check), or worse
+    // — if the resident daemon is not up yet — actually WIN the bind, so a
+    // real AgentEar connects to a process that exits moments later, silently
+    // losing every event/usage row it would have recorded. Attach support is
+    // simply not offered from an ephemeral daemon; hydration and the
+    // listener are both skipped.
+    if !ephemeral {
+        if let Some(path) = crate::attached::config_path()
+            && let Err(e) = state.attach_registry.hydrate(&path)
+        {
+            tracing::error!("could not hydrate the attach registry from {path:?}: {e}");
+        }
+        // Filled before the listener starts (see the cell's own comment
+        // above): the `stopping` task's `revoke_all` can now find it.
+        let _ = attach_registry_cell.set(Arc::clone(&state.attach_registry));
+        if let Some(path) = crate::attached::socket_path() {
+            tokio::spawn(crate::attach_listener::run(
+                Arc::clone(&state.attach_registry),
+                path,
+                shutdown.child_token(),
+            ));
+        } else {
+            tracing::error!("attach listener not started: HOME is not set, no socket path to bind");
+        }
     }
     let router = build_router_with_modules(state, module_routes);
 

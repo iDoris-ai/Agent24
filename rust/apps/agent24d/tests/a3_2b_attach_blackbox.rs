@@ -146,6 +146,52 @@ fn stop(d: Daemon) {
     drop(d);
 }
 
+/// Review H1: an ephemeral daemon (`--ephemeral`, e.g. what a plain CLI
+/// invocation spins up when no resident daemon is running) must not touch
+/// `~/.agent24/attach/agent24d.sock` at all — see `server.rs`'s own comment
+/// at the `if !ephemeral { ... }` gate around the attach hydrate/listener
+/// for why. Duplicates `start`'s body (rather than adding an `ephemeral: bool`
+/// parameter there and touching every existing call site) — this is the only
+/// test that needs it.
+fn start_ephemeral(home: &Path) -> Daemon {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .args(["serve", "--port", "0", "--ephemeral"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let run = Running(child);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let ready = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("no ready line within 30s");
+    let ready: serde_json::Value = serde_json::from_str(&ready).expect("the ready line");
+    let stderr_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = stderr_lines.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push(line);
+        }
+    });
+    Daemon {
+        run,
+        port: u16::try_from(ready["port"].as_u64().unwrap()).unwrap(),
+        token: ready["token"].as_str().unwrap().to_owned(),
+        stderr: stderr_lines,
+    }
+}
+
 /// Short path, in-process counter (task requirement): the attach socket is
 /// `<home>/.agent24/attach/agent24d.sock` and macOS's `sockaddr_un` caps a
 /// Unix socket path at 104 bytes including the NUL terminator — `/tmp/...`
@@ -540,6 +586,85 @@ fn register_ok(d: &Daemon, manifest: &str) -> serde_json::Value {
     body
 }
 
+// ───────────────────────── deviation: PATCH /api/v1/os/{name} vs attach ─────────────────────────
+
+/// Deviation handling (review): `PATCH /api/v1/os/{name}` for a name that is
+/// ALSO a registered attached module must refuse with `409`, pointing at
+/// `/api/v1/attached` — not silently write `os.json`'s enable bit for a
+/// package that (per §5.4's own name-clash rule) never actually mounted,
+/// leaving a caller who thinks they just disabled the running module
+/// staring at a `200` that did nothing to it.
+#[test]
+fn patch_os_for_an_attached_name_is_409_not_a_silent_200() {
+    let home = tmp_home();
+    let manifest = attach_manifest("agentear", &["events"], None);
+    let d = start(home.path(), &[]);
+    register_ok(&d, &manifest);
+
+    let (status, body) = patch(
+        d.port,
+        &d.token,
+        "/api/v1/os/agentear",
+        &serde_json::json!({"enabled": false}),
+    );
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["code"], "attached_module");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/api/v1/attached"),
+        "{body}"
+    );
+    stop(d);
+}
+
+// ───────────────────────── H1 ─────────────────────────
+
+/// Review H1: an ephemeral daemon must not create/bind the real attach
+/// socket. Proven two ways: (1) the socket path never appears on disk while
+/// the ephemeral daemon runs; (2) a REAL (resident) daemon started
+/// afterwards, on the SAME `$HOME`, binds that socket cleanly — proving the
+/// ephemeral daemon left no ghost listener/degraded state behind for it to
+/// trip over.
+#[test]
+fn h1_an_ephemeral_daemon_never_touches_the_attach_socket() {
+    let home = tmp_home();
+    let socket_path = home.path().join(".agent24/attach/agent24d.sock");
+
+    let ephemeral = start_ephemeral(home.path());
+    // Bounded poll rather than a fixed sleep: give the (buggy, pre-fix)
+    // listener every chance to have bound by now before asserting it did
+    // not.
+    let by = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < by {
+        assert!(
+            !socket_path.exists(),
+            "an ephemeral daemon must never create {}",
+            socket_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop(ephemeral);
+    assert!(
+        !socket_path.exists(),
+        "the attach socket must still not exist after the ephemeral daemon exits"
+    );
+
+    // A real, resident daemon on the same $HOME afterwards binds it cleanly.
+    let real = start(home.path(), &[]);
+    let by = Instant::now() + Duration::from_secs(5);
+    while !socket_path.exists() {
+        assert!(
+            Instant::now() < by,
+            "the real daemon never bound the attach socket — stderr:\n{}",
+            real.recent_stderr()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop(real);
+}
+
 // ───────────────────────── C1 ─────────────────────────
 
 /// C1: register → real handshake succeeds; re-add (rotation) mints a NEW
@@ -854,14 +979,18 @@ fn c3_delete_revokes_the_connection_within_a_second() {
 
 // ───────────────────────── C4 ─────────────────────────
 
-/// C4: two connections racing the SAME registered name — exactly one gets
-/// `result` (success), the other gets `busy`; the loser's own reconnect after
-/// the winner disconnects succeeds, with `generation` one higher; a name a
-/// real installed package already claims is refused for attach registration
-/// (`409`); installing a package under an already-attached name is refused
-/// at mount time (A3-2b's `crate::domain::mount_all` addition, §5.4).
+/// C4, the name-mutex-with-a-package half: a name a real installed package
+/// already claims is refused for attach registration (`409`); installing a
+/// package under an already-attached name is refused at mount time (A3-2b's
+/// `crate::domain::mount_all` addition, §5.4). The "exactly one concurrent
+/// handshake wins" half of C4 is
+/// [`c4_barrier_synchronized_handshakes_exactly_one_wins_per_round`] below —
+/// split out (review) because it needs a much stronger, N-threads-plus-
+/// `Barrier` proof than spawning two Python processes back to back ever
+/// gave: process scheduling alone made "back to back" a weak stand-in for
+/// "concurrent", and one round of it only ever samples the race once.
 #[test]
-fn c4_concurrent_handshake_one_wins_and_name_clashes_with_a_package() {
+fn c4_name_clashes_with_a_package_both_directions() {
     let home = tmp_home();
     let script = write_fake_agentear_script(home.path());
     let manifest_path = home.path().join("agentear.yml");
@@ -889,10 +1018,10 @@ fn c4_concurrent_handshake_one_wins_and_name_clashes_with_a_package() {
     let socket_path = reg["socket_path"].as_str().unwrap().to_owned();
     let token = reg["token"].as_str().unwrap().to_owned();
 
-    // Two connections, spawned back to back — whichever wins the registry
-    // lock first (§4.3 ②, §5.4 Q3=a) keeps the slot; the other is refused
-    // `busy` rather than replacing it.
-    let mut a = spawn_fake_agentear(
+    // One live connection — just so the setup matches a genuinely "attached"
+    // module while the package-clash checks below run; the concurrency
+    // proof itself lives in the dedicated Barrier test.
+    let mut reconnected = spawn_fake_agentear(
         &script,
         &manifest_path,
         &socket_path,
@@ -900,56 +1029,11 @@ fn c4_concurrent_handshake_one_wins_and_name_clashes_with_a_package() {
         &token,
         &["events"],
     );
-    let mut b = spawn_fake_agentear(
-        &script,
-        &manifest_path,
-        &socket_path,
-        "agentear",
-        &token,
-        &["events"],
+    assert!(
+        reconnected.handshake.get("result").is_some(),
+        "{:?}",
+        reconnected.handshake
     );
-
-    let a_ok = a.handshake.get("result").is_some();
-    let b_ok = b.handshake.get("result").is_some();
-    assert_ne!(
-        a_ok, b_ok,
-        "exactly one of the two concurrent handshakes must succeed: a={:?} b={:?}",
-        a.handshake, b.handshake
-    );
-    let (winner, loser) = if a_ok {
-        (&mut a, &mut b)
-    } else {
-        (&mut b, &mut a)
-    };
-    assert_eq!(
-        loser.handshake["error"]["data"]["kind"], "busy",
-        "the losing connection must be refused `busy`: {:?}",
-        loser.handshake
-    );
-    let first_generation = winner.handshake["result"]["offer"].clone();
-    let _ = first_generation; // offer shape already covered by C2; here we only need "it succeeded"
-
-    // The winner disconnects; the loser can now connect successfully.
-    winner.command(serde_json::json!({"op": "close"}));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut reconnected = None;
-    while Instant::now() < deadline {
-        let candidate = spawn_fake_agentear(
-            &script,
-            &manifest_path,
-            &socket_path,
-            "agentear",
-            &token,
-            &["events"],
-        );
-        if candidate.handshake.get("result").is_some() {
-            reconnected = Some(candidate);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let mut reconnected =
-        reconnected.expect("a reconnect after the winner's close must eventually succeed");
 
     // §5.4, direction 1: an attach registration under a name a REAL installed
     // package already claims is refused — `sin90` was on disk before `d`
@@ -964,7 +1048,6 @@ fn c4_concurrent_handshake_one_wins_and_name_clashes_with_a_package() {
     assert_eq!(body["error"]["code"], "name_taken");
 
     reconnected.command(serde_json::json!({"op": "close"}));
-    let _ = loser.command(serde_json::json!({"op": "close"}));
     stop(d);
 
     // §5.4, direction 2: install a SECOND package, itself named `agentear`
@@ -999,6 +1082,146 @@ fn c4_concurrent_handshake_one_wins_and_name_clashes_with_a_package() {
         "{agentear_pkg}"
     );
     stop(d2);
+}
+
+/// `sha256:` + lowercase hex — the same digest format
+/// `crate::attached::manifest_digest` computes over the exact submitted
+/// bytes, reimplemented here (not called into) so this file's own
+/// independence from the daemon's internals (module doc: "只按本文 §4 wire
+/// 规格写成") extends to its Rust-side raw-frame helpers too, not just the
+/// Python fake AgentEar.
+fn sha256_digest_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes);
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
+fn raw_initialize_frame(module: &str, digest: &str, token: &str, id: &str) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocol_versions": {"min": 1, "max": 1},
+            "module": module,
+            "manifest_digest": digest,
+            "auth_token": token,
+            "capabilities": ["events"],
+        }
+    }))
+    .unwrap();
+    line.push(b'\n');
+    line
+}
+
+/// C4, the concurrency half (review): `N` OS threads, synchronized by a
+/// [`std::sync::Barrier`] so every one of them writes its raw `initialize`
+/// frame as close to simultaneously as the OS scheduler allows — no Python
+/// process, no `spawn_fake_agentear` (that helper blocks on the CHILD
+/// PROCESS's own startup before it ever connects, which is plenty of jitter
+/// to hide a race a real concurrent load would hit) — repeated for 20
+/// rounds, each asserting EXACTLY one `result` and the rest `busy`. Between
+/// rounds, every connection from the round just finished is dropped and the
+/// test polls `GET /api/v1/attached` until the slot is genuinely `detached`
+/// again before racing the next round, so each round starts from the same
+/// "nobody holds the slot" state the design's own §5.4 Q3=a is about.
+#[test]
+fn c4_barrier_synchronized_handshakes_exactly_one_wins_per_round() {
+    use std::os::unix::net::UnixStream as RawUnixStream;
+    use std::sync::Barrier;
+
+    let home = tmp_home();
+    let manifest = attach_manifest("agentear", &["events"], None);
+    let digest = sha256_digest_hex(manifest.as_bytes());
+
+    let d = start(home.path(), &[]);
+    let reg = register_ok(&d, &manifest);
+    let socket_path = reg["socket_path"].as_str().unwrap().to_owned();
+    let token = reg["token"].as_str().unwrap().to_owned();
+
+    const THREADS: usize = 6;
+    const ROUNDS: usize = 20;
+
+    for round in 0..ROUNDS {
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let socket_path = socket_path.clone();
+                let token = token.clone();
+                let digest = digest.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> (RawUnixStream, serde_json::Value) {
+                    // Connect BEFORE the barrier: only the WRITE of the
+                    // `initialize` frame needs to line up across threads —
+                    // the connect itself racing would only add jitter ahead
+                    // of the part this test actually wants synchronized.
+                    let mut stream =
+                        RawUnixStream::connect(&socket_path).expect("connect to the attach socket");
+                    let frame =
+                        raw_initialize_frame("agentear", &digest, &token, &format!("r{round}t{i}"));
+                    barrier.wait();
+                    stream
+                        .write_all(&frame)
+                        .expect("write the initialize frame");
+                    let mut reader =
+                        BufReader::new(stream.try_clone().expect("clone the stream for reading"));
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read the handshake response");
+                    let resp: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+                        panic!("round {round} thread {i}: not JSON: {line:?}: {e}")
+                    });
+                    (stream, resp)
+                })
+            })
+            .collect();
+        let results: Vec<(RawUnixStream, serde_json::Value)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let successes = results
+            .iter()
+            .filter(|(_, r)| r.get("result").is_some())
+            .count();
+        let busies = results
+            .iter()
+            .filter(|(_, r)| r["error"]["data"]["kind"] == "busy")
+            .count();
+        let responses: Vec<&serde_json::Value> = results.iter().map(|(_, r)| r).collect();
+        assert_eq!(
+            successes, 1,
+            "round {round}: expected exactly 1 successful handshake, got responses {responses:?}"
+        );
+        assert_eq!(
+            busies,
+            THREADS - 1,
+            "round {round}: expected the rest refused `busy`, got responses {responses:?}"
+        );
+
+        // Close every connection from this round (including the winner's —
+        // the losers were already closed server-side per §4.3's refusal
+        // contract) and wait for the slot to genuinely free before racing
+        // the next round.
+        drop(results);
+        let by = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (status, list) = get(d.port, &d.token, "/api/v1/attached");
+            assert_eq!(status, 200);
+            let attach_status = list["modules"][0]["attach_status"].as_str().unwrap_or("");
+            if attach_status == "detached" {
+                break;
+            }
+            assert!(
+                Instant::now() < by,
+                "round {round}: the slot never freed after closing every connection \
+                 (attach_status stuck at {attach_status:?})"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    stop(d);
 }
 
 // ───────────────────────── stub provider (copied from me4_model_blackbox.rs) ─────────────────────────

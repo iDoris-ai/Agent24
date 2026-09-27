@@ -146,16 +146,47 @@ struct Entry {
     last_generation: Option<(u64, Arc<Generation>)>,
 }
 
+/// Review M1: everything the lock protects. `deps` moved IN HERE (from a
+/// plain field on [`AttachRegistry`]) because a plain field lives exactly as
+/// long as the `Arc<AttachRegistry>` itself does — i.e. until the whole
+/// process exits, since `AppState`/the router keep a clone. That meant an
+/// `AttachRegistry` with ZERO attached modules still held a live
+/// `ModelCallbackDeps` (via `deps.models`) for the rest of the process's
+/// life, and `stop_usage_writer` waits for every clone of that struct's
+/// `usage` sender to drop before it will finish — so every shutdown, even
+/// with nothing ever attached, blocked on the writer's hard-stop deadline
+/// (measured: ~1.5s, with `the model usage writer did not finish by the
+/// modules deadline` in the log). Putting `deps` behind the SAME lock as the
+/// entries lets [`AttachRegistry::revoke_all`] `take()` it at the exact
+/// moment it revokes everything, so the registry's own clone drops on
+/// schedule regardless of how many modules were ever attached.
+struct RegistryState {
+    entries: HashMap<String, Entry>,
+    /// `None` once [`AttachRegistry::revoke_all`] has run — see this
+    /// struct's own doc. Also the M2 ① signal: [`AttachRegistry::commit`]
+    /// refuses with [`CommitRefused::Closed`] rather than touching `entries`
+    /// once this is `None`, and [`AttachRegistry::on_change`] no-ops
+    /// entirely (the daemon is exiting; nothing further done to `entries`
+    /// would ever be observed).
+    deps: Option<AttachDeps>,
+}
+
 /// The live registry: one [`Entry`] per name in `attached.json`, guarded by
 /// one lock — see the module doc for why that lock is never held across an
 /// `await`.
 pub struct AttachRegistry {
-    inner: Mutex<HashMap<String, Entry>>,
-    deps: AttachDeps,
+    inner: Mutex<RegistryState>,
 }
 
 fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
+    // `is_ascii()` first: `str` indexing below is BYTE indexing (`hex[i*2..
+    // i*2+2]`), which panics if it lands inside a multi-byte UTF-8 sequence.
+    // A malformed `token_sha256_hex` is untrusted input to this function (it
+    // comes from `attached.json`, which this process wrote, but hydration
+    // also reads it back after a possible manual edit or a future format
+    // change) — the length check alone does not rule out non-ASCII bytes
+    // inside a 64-BYTE-but-not-64-ASCII-char string.
+    if !hex.is_ascii() || hex.len() != 64 {
         return None;
     }
     let mut out = [0u8; 32];
@@ -165,12 +196,34 @@ fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Why [`AttachRegistry::commit`] refused. Kept separate from
+/// [`HandshakeError`] (review M2 ①): a registry closed for shutdown is NOT a
+/// credential problem, and must not be answered like one.
+#[derive(Debug)]
+pub enum CommitRefused {
+    /// An ordinary handshake-level refusal — the caller writes the matching
+    /// wire error frame (`crate::attach_listener`).
+    Handshake(HandshakeError),
+    /// The registry is shutting down (`revoke_all` already ran, or is
+    /// running concurrently and won the lock first). The caller must NOT
+    /// write an error frame for this: `auth_failed` tells a module "the
+    /// credential is bad, stop retrying, re-pair" (§5.6's own table), which
+    /// is false here — the token is fine, the daemon is just going away. The
+    /// correct wire behaviour is silence: close the connection with no frame
+    /// at all, so the module sees a plain EOF and backs off/retries per its
+    /// OTHER §5.6 row (`connect` failure / EOF), exactly as it should when
+    /// it reconnects to the daemon that comes back up.
+    Closed,
+}
+
 impl AttachRegistry {
     #[must_use]
     pub fn new(deps: AttachDeps) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
-            deps,
+            inner: Mutex::new(RegistryState {
+                entries: HashMap::new(),
+                deps: Some(deps),
+            }),
         }
     }
 
@@ -178,12 +231,21 @@ impl AttachRegistry {
     /// 重启：注册记录从 `attached.json` 读回...所有模块回到 `Detached`").
     /// Must run BEFORE the attach listener takes its first connection —
     /// otherwise a handshake could race a name that has not been loaded yet
-    /// and see a spurious `auth_failed`. Best-effort per name: one record
-    /// whose manifest no longer parses is logged and skipped rather than
-    /// failing every other module's hydration.
+    /// and see a spurious `auth_failed`. Per-record best effort is
+    /// `crate::attached::load_all`'s job (review M2 ②); this only handles the
+    /// hex-decode failure `load_all` cannot see (it is a
+    /// `crate::attach_registry`-local representation).
     pub fn hydrate(&self, path: &std::path::Path) -> Result<(), String> {
         let stored = crate::attached::load_all(path)?;
-        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let RegistryState { entries, deps } = &mut *state;
+        let Some(deps) = deps.as_ref() else {
+            // Hydration only ever runs once, at startup, strictly before
+            // `revoke_all` can — this is unreachable in practice, and a loud
+            // log beats a silent no-op if it somehow is.
+            tracing::error!("attach registry hydrate() called after the registry was closed");
+            return Ok(());
+        };
         for (name, entry) in stored {
             let Some(token_sha256) = decode_hex32(&entry.token_sha256_hex) else {
                 tracing::error!(
@@ -192,8 +254,8 @@ impl AttachRegistry {
                 );
                 continue;
             };
-            let grant = build_grant(&name, &entry.manifest, &self.deps);
-            map.insert(
+            let grant = build_grant(&name, &entry.manifest, deps);
+            entries.insert(
                 name,
                 Entry {
                     manifest_digest: entry.manifest_digest,
@@ -217,8 +279,8 @@ impl AttachRegistry {
     /// `Forbidden` are produced by the locked step, not the pure one).
     #[must_use]
     pub fn expectation(&self, name: &str) -> Option<AttachedExpectation> {
-        let map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        map.get(name).map(|e| AttachedExpectation {
+        let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        state.entries.get(name).map(|e| AttachedExpectation {
             manifest_digest: e.manifest_digest.clone(),
             token_sha256: e.token_sha256,
             token_id: e.token_id.clone(),
@@ -231,32 +293,35 @@ impl AttachRegistry {
     /// against is still current (by `token_id` — catches a rotation/revoke
     /// that landed between the pure check and this call), not disabled, then
     /// install a fresh generation. Every failure here closes the connection
-    /// (same contract as [`agent24_os_proto::initialize::accept`]).
+    /// (same contract as [`agent24_os_proto::initialize::accept`]) — see
+    /// [`CommitRefused::Closed`]'s own doc for the one case that closes
+    /// WITHOUT a wire error frame.
     ///
     /// # Errors
     ///
-    /// [`HandshakeError::AuthFailed`] if the record is gone or was rotated to
-    /// a different `token_id` since the pure check; [`HandshakeError::Forbidden`]
-    /// if disabled; [`HandshakeError::Busy`] if another generation is already
-    /// live (§5.4 Q3=a: first comer keeps it).
+    /// See [`CommitRefused`].
     pub fn commit(
         &self,
         claim: &AttachedAccepted,
-    ) -> Result<(u64, Arc<Generation>, Methods), HandshakeError> {
-        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = map
+    ) -> Result<(u64, Arc<Generation>, Methods), CommitRefused> {
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.deps.is_none() {
+            return Err(CommitRefused::Closed);
+        }
+        let entry = state
+            .entries
             .get_mut(&claim.module)
-            .ok_or(HandshakeError::AuthFailed)?;
+            .ok_or(CommitRefused::Handshake(HandshakeError::AuthFailed))?;
         if entry.token_id != claim.token_id {
-            return Err(HandshakeError::AuthFailed);
+            return Err(CommitRefused::Handshake(HandshakeError::AuthFailed));
         }
         if entry.disabled {
-            return Err(HandshakeError::Forbidden);
+            return Err(CommitRefused::Handshake(HandshakeError::Forbidden));
         }
         let (number, generation) = entry
             .slot
             .install()
-            .map_err(|_slot_busy| HandshakeError::Busy)?;
+            .map_err(|_slot_busy| CommitRefused::Handshake(HandshakeError::Busy))?;
         entry.last_generation = Some((number, generation.clone()));
         let methods = (entry.grant.methods_for)(&generation);
         Ok((number, generation, methods))
@@ -275,8 +340,8 @@ impl AttachRegistry {
     /// not `AttachSlot::release` itself already revokes (A3-1 is finalizing
     /// that as this lands — see this file's own top-of-module note).
     pub fn release(&self, name: &str, generation: &Arc<Generation>) {
-        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = map.get_mut(name) {
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = state.entries.get_mut(name) {
             if entry
                 .last_generation
                 .as_ref()
@@ -292,15 +357,18 @@ impl AttachRegistry {
     /// revoke every live generation (in-flight `model/complete` calls are
     /// cancelled by the same `modules_cut_off` cancellation tree a mounted
     /// package's calls are, since `AttachDeps.models` is the SAME
-    /// `ModelCallbackDeps` clone) and then DROP every entry outright — not
-    /// merely revoke its slot. An entry's `grant` carries the one remaining
-    /// clone of `ModelCallbackDeps` (via its `ModelGrant`, if any), and that
-    /// clone's `usage` sender must actually be dropped here, not merely
-    /// quiesced, for `stop_usage_writer`'s channel to close on schedule (the
-    /// design's own reasoning for why this ordering matters).
+    /// `ModelCallbackDeps` clone), DROP every entry outright — not merely
+    /// revoke its slot, since an entry's `grant` carries its OWN
+    /// `ModelCallbackDeps` clone via `ModelGrant` — and (review M1) take the
+    /// REGISTRY's own `deps` too, so a registry that never had any attached
+    /// modules at all still drops its `ModelCallbackDeps` clone here rather
+    /// than whenever the `Arc<AttachRegistry>` itself finally does (see
+    /// [`RegistryState`]'s own doc for why that distinction is the whole
+    /// point of this review round).
     pub fn revoke_all(&self) {
-        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        for (_name, mut entry) in map.drain() {
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        state.deps = None;
+        for (_name, mut entry) in state.entries.drain() {
             entry.slot.revoke();
             // `entry` (and its `Arc<Grant>`) is dropped here.
         }
@@ -314,8 +382,8 @@ impl AttachRegistry {
     /// plain default rather than an `Option`/`panic`.
     #[must_use]
     pub fn status_of(&self, name: &str) -> (&'static str, Option<u64>) {
-        let map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(entry) = map.get(name) else {
+        let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = state.entries.get(name) else {
             return ("detached", None);
         };
         if entry.disabled {
@@ -333,8 +401,18 @@ impl AttachRegistry {
     /// `set_disabled` — see [`Change`]'s own doc comment for why this runs
     /// inside THEIR file-lock critical section rather than being called
     /// after it returns.
+    ///
+    /// Review M2 ①: a no-op once the registry is closed (`revoke_all` already
+    /// ran, or wins a race against this call for the lock) — the daemon is
+    /// exiting, no listener is left accepting handshakes for `entries` to
+    /// matter to, and building a grant from `deps` would need a `deps` that
+    /// no longer exists.
     pub fn on_change(&self, change: &Change<'_>) {
-        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let RegistryState { entries, deps } = &mut *state;
+        let Some(deps) = deps.as_ref() else {
+            return;
+        };
         match *change {
             Change::Registered {
                 name,
@@ -343,6 +421,7 @@ impl AttachRegistry {
                 manifest_digest,
                 token_sha256_hex,
                 token_id,
+                disabled,
             } => {
                 let Some(token_sha256) = decode_hex32(token_sha256_hex) else {
                     tracing::error!(
@@ -356,7 +435,7 @@ impl AttachRegistry {
                     rotated,
                     "attach registry: applying a registration change"
                 );
-                match map.entry(name.to_owned()) {
+                match entries.entry(name.to_owned()) {
                     MapEntry::Occupied(mut o) => {
                         let entry = o.get_mut();
                         // §3.4: any register on an existing name — token-only
@@ -371,37 +450,38 @@ impl AttachRegistry {
                         // REUSE the grant (rate limiter, model health table,
                         // event sink). Digest changed -> rebuild everything.
                         if entry.manifest_digest != manifest_digest {
-                            entry.grant = Arc::new(build_grant(name, manifest, &self.deps));
+                            entry.grant = Arc::new(build_grant(name, manifest, deps));
                         }
                         entry.manifest_digest = manifest_digest.to_owned();
                         entry.token_sha256 = token_sha256;
                         entry.token_id = token_id.to_owned();
-                        // A register/rotate is a deliberate re-pairing action
-                        // (`crate::attached::register`'s own doc): it always
-                        // clears `disabled`, mirroring the fresh
-                        // `AttachedRecord` it just wrote to disk.
-                        entry.disabled = false;
+                        // Review M4: mirrors what `crate::attached::register`
+                        // just wrote to disk — a rotation PRESERVES
+                        // `disabled`, it does not clear it (an AgentEar
+                        // auto-update re-running `attach add` must not
+                        // silently undo a user's `PATCH ... {"enabled":false}`).
+                        entry.disabled = disabled;
                     }
                     MapEntry::Vacant(v) => {
                         v.insert(Entry {
                             manifest_digest: manifest_digest.to_owned(),
                             token_sha256,
                             token_id: token_id.to_owned(),
-                            disabled: false,
+                            disabled,
                             slot: AttachSlot::new(),
-                            grant: Arc::new(build_grant(name, manifest, &self.deps)),
+                            grant: Arc::new(build_grant(name, manifest, deps)),
                             last_generation: None,
                         });
                     }
                 }
             }
             Change::Revoked { name } => {
-                if let Some(mut entry) = map.remove(name) {
+                if let Some(mut entry) = entries.remove(name) {
                     entry.slot.revoke();
                 }
             }
             Change::Disabled { name, disabled } => {
-                if let Some(entry) = map.get_mut(name) {
+                if let Some(entry) = entries.get_mut(name) {
                     entry.disabled = disabled;
                     if disabled {
                         entry.slot.revoke();
@@ -480,14 +560,19 @@ mod tests {
             manifest_digest: &digest,
             token_sha256_hex: &token_sha256_hex,
             token_id: &token_id,
+            disabled: false,
         });
         (digest, token_id)
     }
 
-    fn err_of<T>(r: Result<T, HandshakeError>) -> HandshakeError {
+    /// Unwraps the ordinary handshake-refusal half of [`CommitRefused`] —
+    /// every `commit()` test in this module expects that half; the `Closed`
+    /// half has its own dedicated test.
+    fn commit_err<T>(r: Result<T, CommitRefused>) -> HandshakeError {
         match r {
             Ok(_) => panic!("expected an error"),
-            Err(e) => e,
+            Err(CommitRefused::Handshake(e)) => e,
+            Err(CommitRefused::Closed) => panic!("expected a Handshake refusal, got Closed"),
         }
     }
 
@@ -535,7 +620,7 @@ mod tests {
         register(&registry, "agentear", &["events"]); // rotates, mints a new token_id
         let stale_claim = accepted("agentear", &token_id);
         assert_eq!(
-            err_of(registry.commit(&stale_claim)),
+            commit_err(registry.commit(&stale_claim)),
             HandshakeError::AuthFailed
         );
     }
@@ -546,7 +631,7 @@ mod tests {
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         let claim = accepted("agentear", &token_id);
         registry.commit(&claim).unwrap();
-        assert_eq!(err_of(registry.commit(&claim)), HandshakeError::Busy);
+        assert_eq!(commit_err(registry.commit(&claim)), HandshakeError::Busy);
     }
 
     #[tokio::test]
@@ -558,7 +643,10 @@ mod tests {
             disabled: true,
         });
         let claim = accepted("agentear", &token_id);
-        assert_eq!(err_of(registry.commit(&claim)), HandshakeError::Forbidden);
+        assert_eq!(
+            commit_err(registry.commit(&claim)),
+            HandshakeError::Forbidden
+        );
         assert_eq!(registry.status_of("agentear"), ("disabled", None));
     }
 
@@ -607,13 +695,13 @@ mod tests {
         register(&registry, "agentear", &["events"]);
         let grant_before = {
             let map = registry.inner.lock().unwrap();
-            Arc::clone(&map.get("agentear").unwrap().grant)
+            Arc::clone(&map.entries.get("agentear").unwrap().grant)
         };
         // Re-register with the SAME digest (token-only rotation).
         register(&registry, "agentear", &["events"]);
         let grant_after = {
             let map = registry.inner.lock().unwrap();
-            Arc::clone(&map.get("agentear").unwrap().grant)
+            Arc::clone(&map.entries.get("agentear").unwrap().grant)
         };
         assert!(
             Arc::ptr_eq(&grant_before, &grant_after),
@@ -633,5 +721,104 @@ mod tests {
         assert_eq!(gb.state(), DrainState::Revoked);
         assert!(registry.expectation("agentear").is_none());
         assert!(registry.expectation("other").is_none());
+    }
+
+    /// Review M1: `revoke_all` must drop the REGISTRY's own `deps` (its
+    /// `ModelCallbackDeps` clone with it) even when NO module was ever
+    /// attached — the exact scenario that used to leave `deps` alive for the
+    /// rest of the process's life (see `RegistryState`'s own doc). Proven
+    /// here structurally, by checking `deps` is gone (`commit` afterwards
+    /// answers `Closed`, which is only possible with `deps: None`); the
+    /// end-to-end "the shutdown log no longer warns" proof lives in the
+    /// blackbox suite (`c9`-adjacent).
+    #[tokio::test]
+    async fn revoke_all_drops_deps_even_with_no_attached_modules_ever() {
+        let registry = AttachRegistry::new(deps().await);
+        registry.revoke_all();
+        let claim = accepted("nobody-was-ever-attached", "tok");
+        assert!(matches!(
+            registry.commit(&claim),
+            Err(CommitRefused::Closed)
+        ));
+    }
+
+    /// Review M2 ①: a handshake commit racing (or landing after) `revoke_all`
+    /// gets `Closed`, NEVER `Handshake(AuthFailed)` — the whole point being
+    /// that `crate::attach_listener` must not write an `auth_failed` wire
+    /// frame for a perfectly good token just because the daemon happened to
+    /// be shutting down at that instant (that would tell a real AgentEar to
+    /// stop reconnecting permanently, per its own §5.6 table).
+    #[tokio::test]
+    async fn commit_after_revoke_all_is_closed_not_auth_failed() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, token_id) = register(&registry, "agentear", &["events"]);
+        registry.revoke_all();
+        let claim = accepted("agentear", &token_id);
+        assert!(matches!(
+            registry.commit(&claim),
+            Err(CommitRefused::Closed)
+        ));
+    }
+
+    /// Review M2 ①, the race window itself: a `commit` that starts BEFORE
+    /// `revoke_all` grabs the lock still completes normally (closing is not
+    /// retroactive to an in-flight commit that already holds the lock) —
+    /// this is really just restating that `commit`'s closed-check happens
+    /// once, at the top, under the one lock; included as a named regression
+    /// rather than relying on that being implied by the two tests above.
+    #[tokio::test]
+    async fn a_commit_that_already_holds_the_lock_is_unaffected_by_a_concurrent_revoke_all() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, token_id) = register(&registry, "agentear", &["events"]);
+        let claim = accepted("agentear", &token_id);
+        // `commit` and `revoke_all` both take the SAME lock, so there is no
+        // real interleaving to race here in a single-threaded test — this
+        // documents the ordering guarantee (whichever gets the lock first
+        // wins outright) rather than exercising a true data race.
+        let installed = registry.commit(&claim);
+        assert!(installed.is_ok());
+        registry.revoke_all();
+    }
+
+    /// Review M4: a token-only rotation (same digest) PRESERVES `disabled`
+    /// — the exact bug this review caught was `on_change` hardcoding
+    /// `entry.disabled = false` on every register/rotate, which would let an
+    /// AgentEar auto-update silently undo a user's `PATCH .../{"enabled":
+    /// false}`.
+    #[tokio::test]
+    async fn rotation_preserves_disabled_it_does_not_clear_it() {
+        let registry = AttachRegistry::new(deps().await);
+        register(&registry, "agentear", &["events"]);
+        registry.on_change(&Change::Disabled {
+            name: "agentear",
+            disabled: true,
+        });
+        assert_eq!(registry.status_of("agentear"), ("disabled", None));
+
+        // A rotation (`crate::attached::register`'s own behaviour: it reads
+        // back `previous_disabled` and passes it through) must NOT clear it.
+        let m = manifest("agentear", &["events"]);
+        registry.on_change(&Change::Registered {
+            name: "agentear",
+            rotated: true,
+            manifest: &m,
+            manifest_digest: "sha256:deadbeef", // same digest: token-only rotation
+            token_sha256_hex: &"cd".repeat(32),
+            token_id: "tok_rotated",
+            disabled: true, // what `crate::attached::register` would pass through
+        });
+        assert_eq!(
+            registry.status_of("agentear"),
+            ("disabled", None),
+            "a rotation must preserve `disabled`, not silently re-enable the module"
+        );
+
+        // An explicit re-enable (what `PATCH .../{"enabled":true}` drives)
+        // still works.
+        registry.on_change(&Change::Disabled {
+            name: "agentear",
+            disabled: false,
+        });
+        assert_eq!(registry.status_of("agentear"), ("detached", None));
     }
 }

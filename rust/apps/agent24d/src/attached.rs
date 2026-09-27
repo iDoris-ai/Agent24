@@ -111,9 +111,11 @@ struct AttachedRecord {
     created_at: String,
     /// A3-2b (§3.2/§5.3): set by `PATCH /api/v1/attached/{name}`. Absent from
     /// any `attached.json` written before this field existed —
-    /// `#[serde(default)]` reads that as `false` (never disabled). A
-    /// register/rotate always writes a fresh record with `disabled: false`
-    /// (§3.4's re-add is a deliberate re-pairing action, not a toggle).
+    /// `#[serde(default)]` reads that as `false` (never disabled). Review M4:
+    /// a register/rotate PRESERVES this from the previous record (see
+    /// `register`'s `previous_disabled`) — only `DELETE` (which drops the
+    /// record entirely) or an explicit `PATCH ... {"enabled":true}` clears
+    /// it. A brand-new name (no previous record) always starts `false`.
     #[serde(default)]
     disabled: bool,
 }
@@ -391,6 +393,11 @@ pub enum Change<'a> {
         manifest_digest: &'a str,
         token_sha256_hex: &'a str,
         token_id: &'a str,
+        /// Review M4: the record's `disabled` flag AFTER this register/rotate
+        /// committed — i.e. `previous_disabled` (register never flips it) —
+        /// so the registry mirrors the same "a rotation preserves disable"
+        /// rule the on-disk store now follows, instead of assuming `false`.
+        disabled: bool,
     },
     /// A name's record was removed.
     Revoked { name: &'a str },
@@ -446,6 +453,14 @@ pub fn register(
     let mut store = AttachedStore::load(path).map_err(RegisterError::Io)?;
     let previous_record = store.modules.get(&name);
     let previous_digest = previous_record.map(|r| r.manifest_digest.clone());
+    // Review M4: a rotation/re-registration must NOT clear a user's `disable`
+    // — an AgentEar auto-update that re-runs `attach add` (§5.6's automatic
+    // digest-mismatch rotation, or a plain token refresh) would otherwise
+    // silently undo a `PATCH /api/v1/attached/{name} {"enabled":false}` the
+    // user made in between. `disabled` now survives register/rotate; it is
+    // cleared only by `DELETE` (a genuinely fresh registration afterwards has
+    // no record to inherit from) or an explicit `PATCH ... {"enabled":true}`.
+    let previous_disabled = previous_record.is_some_and(|r| r.disabled);
     let previous_facts = match previous_record {
         Some(r) => Some(Facts::of(&parse_manifest(&r.manifest_yaml).map_err(
             |e| {
@@ -493,7 +508,7 @@ pub fn register(
             token_sha256: token_sha256.clone(),
             token_id: token_id.clone(),
             created_at,
-            disabled: false,
+            disabled: previous_disabled,
         },
     );
     // M2: a successful registration clears any tombstone for this name — it
@@ -510,6 +525,7 @@ pub fn register(
         manifest_digest: &digest,
         token_sha256_hex: &token_sha256,
         token_id: &token_id,
+        disabled: previous_disabled,
     });
 
     let response = AttachedAddResponse {
@@ -613,19 +629,25 @@ pub struct StoredEntry {
 
 /// Every registered module, in full — see [`StoredEntry`]. Unlike [`list`],
 /// this re-parses each stored manifest (needed to rebuild `Grants`/`Offer`/
-/// `ModelGrant`), so a record whose manifest no longer parses (the domain
-/// crate's validation rules changed underneath a daemon upgrade) is reported
-/// as an error for that ONE name rather than silently hydrating a registry
-/// entry with no way to serve it.
+/// `ModelGrant`).
+///
+/// Review M2 ②: a record whose manifest no longer parses (the domain crate's
+/// validation rules changed underneath a daemon upgrade) is logged and
+/// SKIPPED, not propagated as an error for the whole call — the first version
+/// used `.collect::<Result<Vec<_>, _>>()`, so ONE unparseable record made
+/// EVERY other registered module fail to hydrate (and therefore refuse every
+/// handshake with `auth_failed`, §4.3's `expectation` returning `None`), the
+/// exact "one bad apple" blast radius this function's own doc used to warn
+/// against without actually preventing. The file itself being unreadable or
+/// not valid JSON (`AttachedStore::load`'s error) is a different, harder
+/// failure — that one still propagates, since there is no per-record data to
+/// salvage from a file that never parsed as JSON at all.
 pub fn load_all(path: &Path) -> Result<Vec<(String, StoredEntry)>, String> {
     let store = AttachedStore::load(path)?;
-    store
-        .modules
-        .into_iter()
-        .map(|(name, r)| {
-            let manifest = parse_manifest(&r.manifest_yaml)
-                .map_err(|e| format!("the stored manifest for {name:?} no longer parses: {e}"))?;
-            Ok((
+    let mut out = Vec::with_capacity(store.modules.len());
+    for (name, r) in store.modules {
+        match parse_manifest(&r.manifest_yaml) {
+            Ok(manifest) => out.push((
                 name,
                 StoredEntry {
                     manifest,
@@ -634,9 +656,17 @@ pub fn load_all(path: &Path) -> Result<Vec<(String, StoredEntry)>, String> {
                     token_id: r.token_id,
                     disabled: r.disabled,
                 },
-            ))
-        })
-        .collect()
+            )),
+            Err(e) => {
+                tracing::error!(
+                    "the stored manifest for {name:?} no longer parses ({e}); skipping it — \
+                     every OTHER registered module still hydrates. {name:?} will not be \
+                     reachable until re-registered."
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `GET /api/v1/attached` (a deviation from the design doc's §3.2 table —
@@ -1064,6 +1094,123 @@ mod tests {
         assert!(
             !after_register.revoked.contains_key("agentear"),
             "a successful registration must clear the name's tombstone"
+        );
+    }
+
+    /// Review M4: a rotation (re-`register` of an already-registered name)
+    /// must PRESERVE `disabled` — only `DELETE` (nothing left to inherit
+    /// from) or an explicit `set_disabled(..., false, ...)` (`PATCH
+    /// .../{"enabled":true}`) may clear it. Before this fix, `register`
+    /// always wrote `disabled: false`, so an AgentEar auto-update re-running
+    /// `attach add` (§5.6's automatic digest-mismatch rotation, or a plain
+    /// token refresh) would silently re-enable a module the user had
+    /// disabled.
+    #[test]
+    fn rotating_a_disabled_module_keeps_it_disabled() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let m = manifest("agentear", None, &["events"]);
+        register(&path, &m, false, |_| false, |_| {}).unwrap();
+        assert!(set_disabled(&path, "agentear", true, |_| {}).unwrap());
+        assert!(AttachedStore::load(&path).unwrap().modules["agentear"].disabled);
+
+        // A rotation (re-add, same manifest — a token-only rotation) must
+        // NOT clear it.
+        register(&path, &m, false, |_| false, |_| {}).unwrap();
+        assert!(
+            AttachedStore::load(&path).unwrap().modules["agentear"].disabled,
+            "a rotation must preserve `disabled`, not silently re-enable the module"
+        );
+
+        // DELETE then a fresh add DOES start enabled — there is no record
+        // left to inherit `disabled` from.
+        assert!(revoke(&path, "agentear", |_| {}).unwrap());
+        register(&path, &m, false, |_| false, |_| {}).unwrap();
+        assert!(!AttachedStore::load(&path).unwrap().modules["agentear"].disabled);
+
+        // An explicit re-enable clears it, same as always.
+        assert!(set_disabled(&path, "agentear", true, |_| {}).unwrap());
+        assert!(set_disabled(&path, "agentear", false, |_| {}).unwrap());
+        assert!(!AttachedStore::load(&path).unwrap().modules["agentear"].disabled);
+    }
+
+    /// Review M4, the digest-CHANGED half: a full re-registration (not just a
+    /// token-only rotation) must also preserve `disabled` — narrowing
+    /// capabilities is not a relax (§3.5), so this does not need
+    /// `allow_relax` and isolates the `digest_changed` branch of `register`
+    /// from the tombstone-relax interaction the token-only-rotation test
+    /// above does not exercise.
+    #[test]
+    fn a_full_reregistration_with_a_different_digest_also_preserves_disabled() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let wide = manifest("agentear", None, &["events", "models"]);
+        register(&path, &wide, false, |_| false, |_| {}).unwrap();
+        assert!(set_disabled(&path, "agentear", true, |_| {}).unwrap());
+
+        let narrower = manifest("agentear", None, &["events"]);
+        let RegisterOutcome::Rotated { digest_changed, .. } =
+            register(&path, &narrower, false, |_| false, |_| {}).unwrap()
+        else {
+            panic!("expected Rotated");
+        };
+        assert!(
+            digest_changed,
+            "different capability lists must be different bytes"
+        );
+        assert!(
+            AttachedStore::load(&path).unwrap().modules["agentear"].disabled,
+            "a full re-registration (digest changed) must also preserve `disabled`"
+        );
+    }
+
+    /// Review M2 ②: one record whose manifest no longer parses must not take
+    /// every OTHER registered module down with it. The first version used
+    /// `.collect::<Result<Vec<_>, _>>()`, so a single bad record made
+    /// `load_all` return `Err` wholesale — and `AttachRegistry::hydrate`
+    /// propagates that `Err`, which meant EVERY module (not just the broken
+    /// one) would fail every future handshake with `auth_failed`
+    /// (`AttachRegistry::expectation` finding nothing at all).
+    #[test]
+    fn load_all_skips_one_unparseable_record_and_still_loads_the_rest() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        register(
+            &path,
+            &manifest("good1", None, &["events"]),
+            false,
+            |_| false,
+            |_| {},
+        )
+        .unwrap();
+        register(
+            &path,
+            &manifest("good2", None, &["events"]),
+            false,
+            |_| false,
+            |_| {},
+        )
+        .unwrap();
+
+        // Corrupt "good2" in place: white-box edit of the stored manifest
+        // text so it no longer parses as `attached_process` (simulates a
+        // domain-crate validation rule tightening underneath a daemon
+        // upgrade — not something `register` itself could ever produce).
+        let mut store = AttachedStore::load(&path).unwrap();
+        store.modules.get_mut("good2").unwrap().manifest_yaml =
+            "name: good2\nversion: \"1\"\nimpl_kind: not_a_real_impl_kind\n".to_owned();
+        let parent = path.parent().unwrap();
+        let _guard = ConfigLock::acquire(parent).unwrap();
+        store.write_atomically(&path, parent).unwrap();
+        drop(_guard);
+
+        let loaded = load_all(&path).unwrap();
+        let names: Vec<&str> = loaded.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["good1"],
+            "the unparseable record must be skipped, not turn the whole call into Err — and \
+             the still-good record must still load"
         );
     }
 }
