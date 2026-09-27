@@ -28,16 +28,118 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use agent24_domain::{Capability, DomainOsManifest, EventBroadcast, EventSink, Grants};
 use agent24_os_proto::attach::AttachSlot;
+use agent24_os_proto::attach_mux::{KernelCalls, MAX_KERNEL_CALLS_IN_FLIGHT};
 use agent24_os_proto::drain::{DrainState, Generation};
 use agent24_os_proto::initialize::{AttachedAccepted, AttachedExpectation, HandshakeError, Offer};
 use agent24_os_proto::rpc::Methods;
 use agent24_os_proto::supervisor::MethodsFor;
 
 use crate::attached::Change;
+
+/// A3-3 (`docs/design/A3-ATTACHED-MODULE.md` §6.1): why a reverse command
+/// could not be sent once it has already passed the cheap step ①/② pre-check
+/// ([`CommandLookupError`]) — returned by [`AttachRegistry::reserve_ready`].
+///
+/// Review M1: `NotDeclared` exists because the pre-check and the actual
+/// reserve-and-send are two separate lock acquisitions, with the request
+/// body read (and, in production, real time) in between — long enough for a
+/// rotation to swap in a manifest that no longer declares this command.
+/// `reserve_ready` re-checks `host_commands` itself, atomically with the
+/// readiness/busy check, so THIS is the check that actually closes the gap;
+/// the REST handler's earlier `declared_command` call is purely a cheap
+/// fail-fast (avoid reading/validating a body for a command that was never
+/// going anywhere), not the enforcement point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandRefusal {
+    /// Re-checked at reserve time and no longer declared (§6.1 step ②,
+    /// re-verified) — REST `403`, zero frames sent. Also covers `name` having
+    /// disappeared from the registry entirely between the pre-check and here
+    /// (`Revoked` removes the whole entry) — indistinguishable from "not
+    /// declared" from the caller's point of view, and the same status either
+    /// way.
+    NotDeclared,
+    /// No live generation for this module right now (never attached, the
+    /// connection ended, or it was just closed out from under a reservation
+    /// that already happened — review M2) — §6.1 step ④, REST
+    /// `503 module_not_ready`.
+    NotReady,
+    /// §6.1's in-flight cap ([`MAX_KERNEL_CALLS_IN_FLIGHT`]) is already
+    /// reached on this connection — REST `429 busy`, zero frames sent.
+    Busy,
+}
+
+/// Whether `name`/`command` even gets as far as being SENT — §6.1 steps ①/②,
+/// checked by the REST handler before it reads/validates the request body
+/// (so an unknown module or an undeclared command never pays for a body
+/// read). This is a fail-fast convenience only: [`AttachRegistry::reserve_ready`]
+/// re-checks the declaration atomically with readiness (review M1) and is
+/// the check that actually matters for correctness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandLookupError {
+    /// §6.1 step ①: this name is not a registered attached module at all —
+    /// REST `404`.
+    UnknownModule,
+    /// §6.1 step ②: registered, but this manifest's `host_commands` does not
+    /// list `command` — REST `403`, zero frames sent.
+    CommandNotDeclared,
+}
+
+/// A reservation against the in-flight cap for one command call, holding the
+/// [`KernelCalls`] handle to actually send it. Dropping this (on any path —
+/// success, error, or the caller's future itself being cancelled) releases
+/// the reservation, so the REST handler needs no explicit cleanup code for
+/// any of its many exit points.
+pub struct CommandSlot {
+    calls: KernelCalls,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl CommandSlot {
+    #[must_use]
+    pub fn calls(&self) -> &KernelCalls {
+        &self.calls
+    }
+}
+
+// `KernelCalls` itself is not `Debug` (attach_mux.rs never needed it to be),
+// so this is written by hand rather than derived — needed only so tests can
+// `unwrap_err()` a `Result<CommandSlot, _>`.
+impl std::fmt::Debug for CommandSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandSlot").finish_non_exhaustive()
+    }
+}
+
+impl Drop for CommandSlot {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The live [`KernelCalls`] handle for one module's CURRENT generation, plus
+/// the per-connection in-flight counter §6.1's `429 busy` cap is measured
+/// against. Reset (a fresh counter) every time a new generation installs its
+/// calls handle ([`AttachRegistry::attach_kernel_calls`]) — an in-flight
+/// count from a connection that has already ended is meaningless.
+///
+/// Review M2: every place this registry stops considering a generation live
+/// (rotation, disable, `release`, `revoke_all`) calls `calls.close()` WHILE
+/// STILL HOLDING the registry lock, before or as it drops this — see
+/// [`KernelCalls::close`]'s own doc for why that ordering is the actual fix,
+/// not merely tidy-up: it closes the window between "the registry decided
+/// this connection is gone" and "the wire itself finishes tearing down",
+/// during which a `CommandSlot` reserved just before the decision could
+/// otherwise still get its frame onto the wire.
+struct LiveCalls {
+    generation: Arc<Generation>,
+    calls: KernelCalls,
+    in_flight: Arc<AtomicUsize>,
+}
 
 /// A3 P2 (design §1 "本期只用 `events`、`models`"): the only two capabilities
 /// an attached module may be granted. Deliberately narrower than
@@ -136,6 +238,12 @@ struct Entry {
     disabled: bool,
     slot: AttachSlot,
     grant: Arc<Grant>,
+    /// A3-3 (§3.1, §6.1 step ②): the manifest's declared `host_commands`,
+    /// kept alongside the other per-registration facts so
+    /// [`AttachRegistry::declared_command`]/[`AttachRegistry::reserve_ready`]
+    /// need no second lookup into storage. Rebuilt from the manifest on
+    /// every register/rotate/hydrate, same lifetime as `grant`/`manifest_digest`.
+    host_commands: Vec<String>,
     /// The most recent generation this slot ever installed — kept after it
     /// ends (unlike `AttachSlot`, which clears its own `current` on
     /// `release`/`revoke`) purely so `GET /api/v1/attached` can report a
@@ -144,6 +252,16 @@ struct Entry {
     /// `Running` once it leaves it (§5.3: no drain, no resume), so
     /// `DrainState::Running` is exactly "this is the current connection".
     last_generation: Option<(u64, Arc<Generation>)>,
+    /// A3-3: the current connection's [`KernelCalls`] handle, installed by
+    /// [`AttachRegistry::attach_kernel_calls`] once `serve_attached` has
+    /// actually built one (strictly after `commit` installs `last_generation`
+    /// — see that method's own doc for why the two cannot be one step).
+    /// `None` whenever there is no live connection, OR a live connection
+    /// exists but has not yet reached the point of installing its handle (a
+    /// vanishingly short window right after `commit` returns) — either way
+    /// §6.1 step ④ ("现役一代且 Ready") is unmet and a command gets
+    /// `503 module_not_ready`, never a panic or a send into nothing.
+    live_calls: Option<LiveCalls>,
 }
 
 /// Review M1: everything the lock protects. `deps` moved IN HERE (from a
@@ -255,6 +373,7 @@ impl AttachRegistry {
                 continue;
             };
             let grant = build_grant(&name, &entry.manifest, deps);
+            let host_commands = entry.manifest.host_commands().to_vec();
             entries.insert(
                 name,
                 Entry {
@@ -264,7 +383,9 @@ impl AttachRegistry {
                     disabled: entry.disabled,
                     slot: AttachSlot::new(),
                     grant: Arc::new(grant),
+                    host_commands,
                     last_generation: None,
+                    live_calls: None,
                 },
             );
         }
@@ -349,8 +470,123 @@ impl AttachRegistry {
             {
                 entry.slot.revoke();
             }
+            // A3-3 (review M2): a `live_calls` handle is only ever meaningful
+            // for the generation it was installed against
+            // (`attach_kernel_calls` checks the same identity going in) —
+            // clear it here on the SAME identity check, and `close()` it
+            // FIRST, still under this lock, so a `CommandSlot` reserved just
+            // before this call (holding a clone of the same `KernelCalls`)
+            // can never enqueue a frame after this point — see
+            // `KernelCalls::close`'s own doc.
+            if let Some(live) = &entry.live_calls
+                && Arc::ptr_eq(&live.generation, generation)
+            {
+                live.calls.close();
+                entry.live_calls = None;
+            }
             entry.slot.release(generation);
         }
+    }
+
+    /// A3-3 (review M2): install this connection's [`KernelCalls`] handle
+    /// once `crate::attach_listener` has one (strictly after [`Self::commit`]
+    /// returns — `serve_attached` is what MANUFACTURES a `KernelCalls`, and
+    /// it needs the `Methods` `commit` just built, so the two cannot be one
+    /// step). Guarded by the same `Arc::ptr_eq(&last_generation.1,
+    /// generation)` identity check [`Self::release`] uses: if a
+    /// rotation/revoke/disable landed on this name between `commit`
+    /// returning and this call (replacing or clearing `last_generation`
+    /// under this same lock), this is a no-op — the caller's connection is
+    /// already being torn down by whatever won that race, and installing a
+    /// calls handle for a generation nothing points at any more would only
+    /// leak it (or, worse, clobber a NEWER connection's already-installed
+    /// handle) until the connection's own `release` call arrives and finds
+    /// no match to clear either.
+    pub fn attach_kernel_calls(
+        &self,
+        name: &str,
+        generation: &Arc<Generation>,
+        calls: KernelCalls,
+    ) {
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = state.entries.get_mut(name)
+            && entry
+                .last_generation
+                .as_ref()
+                .is_some_and(|(_, live)| Arc::ptr_eq(live, generation))
+        {
+            entry.live_calls = Some(LiveCalls {
+                generation: Arc::clone(generation),
+                calls,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+            });
+        }
+    }
+
+    /// A3-3 (§6.1 steps ①/②): does `name` exist at all, and if so, does its
+    /// manifest declare `command`? This is a cheap, FAIL-FAST pre-check the
+    /// REST handler runs before it reads/validates the request body — see
+    /// [`CommandLookupError`]'s own doc for why [`Self::reserve_ready`], not
+    /// this method, is the one that actually enforces the declaration.
+    ///
+    /// # Errors
+    ///
+    /// See [`CommandLookupError`].
+    pub fn declared_command(&self, name: &str, command: &str) -> Result<(), CommandLookupError> {
+        let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = state
+            .entries
+            .get(name)
+            .ok_or(CommandLookupError::UnknownModule)?;
+        if entry.host_commands.iter().any(|c| c == command) {
+            Ok(())
+        } else {
+            Err(CommandLookupError::CommandNotDeclared)
+        }
+    }
+
+    /// A3-3 (§6.1 steps ②/④/the in-flight cap; review M1): reserve one slot
+    /// to actually SEND `command` on `name`'s current connection. THREE
+    /// things are checked/mutated under this ONE lock acquisition — the
+    /// declaration is still current, there IS a live connection, and the
+    /// in-flight cap is not yet reached — so a rotation, a disable, or a
+    /// concurrent reservation cannot land in the middle and make this
+    /// caller's decision stale by the time it acts on it. In particular
+    /// (review M1's own scenario): a command that passed
+    /// [`Self::declared_command`] against the manifest in effect at request
+    /// time, but whose module has since been ROTATED to a manifest that no
+    /// longer declares it, is refused HERE — the two lookups are the same
+    /// `entry.host_commands`, but only this one runs at the moment the
+    /// command would actually be sent.
+    ///
+    /// The returned [`CommandSlot`] releases the in-flight reservation when
+    /// dropped, whatever the caller does with it.
+    ///
+    /// # Errors
+    ///
+    /// See [`CommandRefusal`].
+    pub fn reserve_ready(&self, name: &str, command: &str) -> Result<CommandSlot, CommandRefusal> {
+        let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        // An entry that vanished entirely (e.g. `Revoked` since the
+        // pre-check) has, by definition, no declared commands any more
+        // either — same refusal as "no longer declared".
+        let entry = state.entries.get(name).ok_or(CommandRefusal::NotDeclared)?;
+        if !entry.host_commands.iter().any(|c| c == command) {
+            return Err(CommandRefusal::NotDeclared);
+        }
+        let live = entry
+            .live_calls
+            .as_ref()
+            .filter(|live| live.generation.state() == DrainState::Running)
+            .ok_or(CommandRefusal::NotReady)?;
+        if live.in_flight.load(Ordering::Relaxed) >= MAX_KERNEL_CALLS_IN_FLIGHT {
+            return Err(CommandRefusal::Busy);
+        }
+        live.in_flight.fetch_add(1, Ordering::Relaxed);
+        Ok(CommandSlot {
+            calls: live.calls.clone(),
+            in_flight: Arc::clone(&live.in_flight),
+        })
     }
 
     /// §5.5 (M2), called from the `stopping` task BEFORE `stop_usage_writer`:
@@ -370,6 +606,14 @@ impl AttachRegistry {
         state.deps = None;
         for (_name, mut entry) in state.entries.drain() {
             entry.slot.revoke();
+            // A3-3 (review M2): close BEFORE the entry (and its `live_calls`)
+            // is dropped below, same reasoning as `release` — a `CommandSlot`
+            // some caller is still holding a clone of must see `closed` the
+            // instant shutdown decided this generation is gone, not merely
+            // whenever the wire itself later notices.
+            if let Some(live) = entry.live_calls.take() {
+                live.calls.close();
+            }
             // `entry` (and its `Arc<Grant>`) is dropped here.
         }
     }
@@ -446,6 +690,15 @@ impl AttachRegistry {
                         // regardless, but the CONNECTION itself must not be
                         // left running on stale grants.
                         entry.slot.revoke();
+                        // A3-3 (review M2): the connection this entry's
+                        // `live_calls` (if any) belonged to is being revoked
+                        // above — `close()` it FIRST, still under this lock,
+                        // so a `CommandSlot` reserved just before this
+                        // rotation landed can never enqueue a frame after
+                        // this point (see `KernelCalls::close`'s own doc).
+                        if let Some(live) = entry.live_calls.take() {
+                            live.calls.close();
+                        }
                         // §3.4: digest unchanged -> token-only rotation,
                         // REUSE the grant (rate limiter, model health table,
                         // event sink). Digest changed -> rebuild everything.
@@ -455,6 +708,7 @@ impl AttachRegistry {
                         entry.manifest_digest = manifest_digest.to_owned();
                         entry.token_sha256 = token_sha256;
                         entry.token_id = token_id.to_owned();
+                        entry.host_commands = manifest.host_commands().to_vec();
                         // Review M4: mirrors what `crate::attached::register`
                         // just wrote to disk — a rotation PRESERVES
                         // `disabled`, it does not clear it (an AgentEar
@@ -470,7 +724,9 @@ impl AttachRegistry {
                             disabled,
                             slot: AttachSlot::new(),
                             grant: Arc::new(build_grant(name, manifest, deps)),
+                            host_commands: manifest.host_commands().to_vec(),
                             last_generation: None,
+                            live_calls: None,
                         });
                     }
                 }
@@ -478,6 +734,11 @@ impl AttachRegistry {
             Change::Revoked { name } => {
                 if let Some(mut entry) = entries.remove(name) {
                     entry.slot.revoke();
+                    // A3-3 (review M2): close before the removed entry (and
+                    // its `live_calls`) is dropped at the end of this arm.
+                    if let Some(live) = entry.live_calls.take() {
+                        live.calls.close();
+                    }
                 }
             }
             Change::Disabled { name, disabled } => {
@@ -485,6 +746,11 @@ impl AttachRegistry {
                     entry.disabled = disabled;
                     if disabled {
                         entry.slot.revoke();
+                        // A3-3 (review M2): same close-before-clear as the
+                        // rotation arm above.
+                        if let Some(live) = entry.live_calls.take() {
+                            live.calls.close();
+                        }
                     }
                 }
             }
@@ -820,5 +1086,353 @@ mod tests {
             disabled: false,
         });
         assert_eq!(registry.status_of("agentear"), ("detached", None));
+    }
+
+    // ───────────────────────── A3-3: reverse commands ─────────────────────────
+
+    fn manifest_with_commands(
+        name: &str,
+        caps: &[&str],
+        commands: &[&str],
+    ) -> agent24_domain::DomainOsManifest {
+        agent24_domain::DomainOsManifest::from_yaml(&format!(
+            "name: {name}\nversion: \"1\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             impl_kind: attached_process\nkernel_capabilities: [{}]\nhost_commands: [{}]\n",
+            caps.join(", "),
+            commands.join(", ")
+        ))
+        .unwrap()
+    }
+
+    fn register_with_commands(
+        registry: &AttachRegistry,
+        name: &str,
+        caps: &[&str],
+        commands: &[&str],
+    ) -> (String, String) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let m = manifest_with_commands(name, caps, commands);
+        let digest = "sha256:deadbeef".to_owned();
+        let token_sha256_hex = "ab".repeat(32);
+        let token_id = format!("tok_{name}_{n}");
+        registry.on_change(&Change::Registered {
+            name,
+            rotated: false,
+            manifest: &m,
+            manifest_digest: &digest,
+            token_sha256_hex: &token_sha256_hex,
+            token_id: &token_id,
+            disabled: false,
+        });
+        (digest, token_id)
+    }
+
+    /// A genuine [`KernelCalls`] handle, built the same way
+    /// `crate::attach_listener::handle_connection` builds one — just enough
+    /// wire underneath it for these registry-level tests, which exercise
+    /// [`AttachRegistry::reserve_ready`]'s bookkeeping (readiness, the
+    /// in-flight cap, stale-generation rejection, M2's `close()`) rather than
+    /// the wire itself (that is `agent24_os_proto::attach_mux`'s own test
+    /// suite, and the real round trip is covered end-to-end by this crate's
+    /// `tests/a3_3_host_commands_blackbox.rs`). The module side of the duplex
+    /// is returned too so a test can assert nothing ever arrived on it.
+    fn spawn_real_kernel_calls_with_module_side(
+        methods: Methods,
+    ) -> (KernelCalls, tokio::io::ReadHalf<tokio::io::DuplexStream>) {
+        let (kernel_side, module_side) = tokio::io::duplex(64 * 1024);
+        let (kernel_read, kernel_write) = tokio::io::split(kernel_side);
+        let (calls, fut) = agent24_os_proto::attach_mux::serve_attached(
+            tokio::io::BufReader::new(kernel_read),
+            kernel_write,
+            methods,
+            agent24_os_proto::rpc::Limits::default(),
+            std::future::pending(),
+        );
+        tokio::spawn(fut);
+        let (module_read, _module_write) = tokio::io::split(module_side);
+        (calls, module_read)
+    }
+
+    fn spawn_real_kernel_calls(methods: Methods) -> KernelCalls {
+        spawn_real_kernel_calls_with_module_side(methods).0
+    }
+
+    #[tokio::test]
+    async fn declared_command_checks_existence_then_declaration() {
+        let registry = AttachRegistry::new(deps().await);
+        assert_eq!(
+            registry.declared_command("nobody", "speak").unwrap_err(),
+            CommandLookupError::UnknownModule
+        );
+        register_with_commands(
+            &registry,
+            "agentear",
+            &["events"],
+            &["speak", "stop_playback"],
+        );
+        assert_eq!(
+            registry.declared_command("agentear", "record").unwrap_err(),
+            CommandLookupError::CommandNotDeclared
+        );
+        assert!(registry.declared_command("agentear", "speak").is_ok());
+        assert!(
+            registry
+                .declared_command("agentear", "stop_playback")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_ready_is_not_ready_before_a_connection_and_after_it_ends() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
+        assert_eq!(
+            registry.reserve_ready("agentear", "speak").unwrap_err(),
+            CommandRefusal::NotReady,
+            "no handshake has ever committed yet"
+        );
+
+        let claim = accepted("agentear", &token_id);
+        let (_, generation, methods) = registry.commit(&claim).unwrap();
+        assert_eq!(
+            registry.reserve_ready("agentear", "speak").unwrap_err(),
+            CommandRefusal::NotReady,
+            "commit() alone, before attach_kernel_calls, must not be usable"
+        );
+
+        registry.attach_kernel_calls("agentear", &generation, spawn_real_kernel_calls(methods));
+        let slot = registry
+            .reserve_ready("agentear", "speak")
+            .expect("now ready");
+        drop(slot);
+
+        registry.release("agentear", &generation);
+        assert_eq!(
+            registry.reserve_ready("agentear", "speak").unwrap_err(),
+            CommandRefusal::NotReady,
+            "after release() the calls handle must be gone, not merely idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_ready_enforces_the_in_flight_cap_and_releases_on_drop() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
+        let claim = accepted("agentear", &token_id);
+        let (_, generation, methods) = registry.commit(&claim).unwrap();
+        registry.attach_kernel_calls("agentear", &generation, spawn_real_kernel_calls(methods));
+
+        let mut slots = Vec::new();
+        for _ in 0..MAX_KERNEL_CALLS_IN_FLIGHT {
+            slots.push(
+                registry
+                    .reserve_ready("agentear", "speak")
+                    .expect("under the cap must succeed"),
+            );
+        }
+        assert_eq!(
+            registry.reserve_ready("agentear", "speak").unwrap_err(),
+            CommandRefusal::Busy,
+            "the {MAX_KERNEL_CALLS_IN_FLIGHT}th reservation must be refused with zero frames sent"
+        );
+
+        // Dropping ONE reservation frees exactly one slot back up.
+        slots.pop();
+        let one_more = registry.reserve_ready("agentear", "speak");
+        assert!(one_more.is_ok(), "releasing one slot must free exactly one");
+        assert_eq!(
+            registry.reserve_ready("agentear", "speak").unwrap_err(),
+            CommandRefusal::Busy,
+            "the cap must be exactly {MAX_KERNEL_CALLS_IN_FLIGHT}, not one looser"
+        );
+    }
+
+    /// Review-worthy race (`AttachRegistry::attach_kernel_calls`'s own doc):
+    /// a rotation lands between a connection's `commit()` and the point
+    /// where its task gets around to installing its `KernelCalls` handle.
+    ///
+    /// Merely asserting `reserve_ready` still says `NotReady` after the late
+    /// install is a WEAK check here — `stale_generation` is itself `Revoked`
+    /// by the rotation, so `reserve_ready`'s OWN `DrainState::Running` filter
+    /// would mask a missing identity check too (a first version of this test
+    /// made exactly that mistake and passed against a mutant with the guard
+    /// deleted). The identity check earns its keep in a DIFFERENT failure
+    /// mode: a late stale install landing AFTER the fresh connection has
+    /// ALREADY installed its own (good, live) calls handle must not
+    /// CLOBBER it — that is what this test pins, by installing the fresh
+    /// handle FIRST and confirming it is still the one `reserve_ready` hands
+    /// out afterwards.
+    #[tokio::test]
+    async fn a_late_stale_install_never_clobbers_an_already_installed_fresh_one() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
+        let claim = accepted("agentear", &token_id);
+        let (_, stale_generation, stale_methods) = registry.commit(&claim).unwrap();
+
+        // Rotate: revokes `stale_generation`, mints a fresh token, and a
+        // fresh handshake installs a DIFFERENT generation as
+        // `last_generation` — exactly as if the stale connection's task
+        // simply hasn't gotten around to calling `attach_kernel_calls` yet.
+        let (_, new_token_id) =
+            register_with_commands(&registry, "agentear", &["events"], &["speak"]);
+        let fresh_claim = accepted("agentear", &new_token_id);
+        let (_, fresh_generation, fresh_methods) = registry.commit(&fresh_claim).unwrap();
+        assert!(!Arc::ptr_eq(&stale_generation, &fresh_generation));
+
+        // The FRESH connection's task wins the race and installs first.
+        registry.attach_kernel_calls(
+            "agentear",
+            &fresh_generation,
+            spawn_real_kernel_calls(fresh_methods),
+        );
+        assert!(
+            registry.reserve_ready("agentear", "speak").is_ok(),
+            "the fresh generation's calls handle must be usable once installed"
+        );
+
+        // The STALE connection's task now (late, after losing the race)
+        // tries to install ITS calls handle — must be a no-op: it must NOT
+        // overwrite the fresh entry that is genuinely live and ready.
+        registry.attach_kernel_calls(
+            "agentear",
+            &stale_generation,
+            spawn_real_kernel_calls(stale_methods),
+        );
+        assert!(
+            registry.reserve_ready("agentear", "speak").is_ok(),
+            "a late stale install must not clobber the already-installed fresh calls handle"
+        );
+    }
+
+    /// Review M1: `declared_command` (the REST handler's cheap pre-check)
+    /// passes against the manifest in effect at request time; the module is
+    /// then ROTATED (still holding a live connection under the new manifest)
+    /// to one that no longer declares the command; `reserve_ready` — which
+    /// runs AFTER the pre-check, once the body has been read — must catch
+    /// this and refuse `NotDeclared`, not fall through to sending a command
+    /// the current manifest disowns.
+    #[tokio::test]
+    async fn reserve_ready_rejects_a_command_the_current_manifest_no_longer_declares() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
+
+        // The REST handler's step ② pre-check, at request time: passes.
+        assert!(registry.declared_command("agentear", "speak").is_ok());
+
+        // A handshake commits and installs a live connection under the
+        // ORIGINAL manifest (so `reserve_ready` has a live generation to
+        // find — otherwise `NotReady` would mask the declaration check this
+        // test is pinning, same pitfall the stale-install test's own doc
+        // describes).
+        let claim = accepted("agentear", &token_id);
+        let (_, generation, methods) = registry.commit(&claim).unwrap();
+        registry.attach_kernel_calls("agentear", &generation, spawn_real_kernel_calls(methods));
+        assert!(
+            registry.reserve_ready("agentear", "speak").is_ok(),
+            "sanity: still declared and ready before the rotation"
+        );
+
+        // Rotate to a manifest that no longer declares "speak" — a REAL
+        // registration change, same call `crate::attached::register` makes.
+        let m = manifest_with_commands("agentear", &["events"], &["stop_playback"]);
+        registry.on_change(&Change::Registered {
+            name: "agentear",
+            rotated: true,
+            manifest: &m,
+            manifest_digest: "sha256:deadbeef-v2",
+            token_sha256_hex: &"ef".repeat(32),
+            token_id: "tok_rotated_no_speak",
+            disabled: false,
+        });
+
+        // The pre-check, run again NOW, already reflects the new manifest —
+        // demonstrating this is a REAL rotation, not a stale read.
+        assert_eq!(
+            registry.declared_command("agentear", "speak").unwrap_err(),
+            CommandLookupError::CommandNotDeclared
+        );
+        // The actual enforcement point: reserve_ready refuses it too, even
+        // if a caller's `declared_command` pre-check had already run before
+        // the rotation landed.
+        assert_eq!(
+            registry.reserve_ready("agentear", "speak").unwrap_err(),
+            CommandRefusal::NotDeclared,
+            "reserve_ready must re-check the declaration against the CURRENT manifest"
+        );
+        // The still-declared command works fine against the new connection
+        // once one is established (not pinned further here — the rotation's
+        // own revoke/reconnect story is covered elsewhere).
+        assert_eq!(
+            registry
+                .reserve_ready("agentear", "stop_playback")
+                .unwrap_err(),
+            CommandRefusal::NotReady,
+            "declared under the new manifest, but the OLD generation was revoked by the \
+             rotation and no new connection has attached yet"
+        );
+    }
+
+    /// Review M2: a `CommandSlot` reserved successfully, then the module is
+    /// revoked (here: `PATCH .../{"enabled":false}`'s registry-side
+    /// counterpart, `Change::Disabled`) BEFORE the reserved slot's `.call()`
+    /// ever runs. The call must resolve `NotSent` — and, the part a weaker
+    /// fix could still get wrong, the module's side of the wire must
+    /// receive ZERO bytes: the revoke must win the race against the
+    /// already-reserved slot actually enqueueing its frame.
+    #[tokio::test]
+    async fn revoking_after_reserve_prevents_the_frame_from_ever_being_sent() {
+        use tokio::io::AsyncReadExt;
+
+        let registry = AttachRegistry::new(deps().await);
+        let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
+        let claim = accepted("agentear", &token_id);
+        let (_, generation, methods) = registry.commit(&claim).unwrap();
+        let (calls, mut module_read) = spawn_real_kernel_calls_with_module_side(methods);
+        registry.attach_kernel_calls("agentear", &generation, calls);
+
+        let slot = registry
+            .reserve_ready("agentear", "speak")
+            .expect("reserve must succeed before the revoke below");
+
+        // Revoke NOW — via disable, the same path `PATCH .../{"enabled":
+        // false}` drives — strictly AFTER the reservation above, strictly
+        // BEFORE the reserved slot ever calls `.call()`.
+        registry.on_change(&Change::Disabled {
+            name: "agentear",
+            disabled: true,
+        });
+
+        let outcome = slot
+            .calls()
+            .call(
+                agent24_os_proto::attach_mux::COMMAND_METHOD,
+                serde_json::json!({"name": "speak", "body": {}}),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(agent24_os_proto::attach_mux::KernelCallFailed::NotSent)
+            ),
+            "expected NotSent, got {outcome:?}"
+        );
+
+        // The decisive part: nothing was ever written to the module's side
+        // of the wire — the revoke's `close()` won the race BEFORE `call()`
+        // could `try_send`, not merely after.
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            module_read.read(&mut buf),
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "no bytes should ever have reached the module, got {read:?}"
+        );
     }
 }

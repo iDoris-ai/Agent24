@@ -819,6 +819,15 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/os/{name}/stop",
             axum::routing::post(crate::os_routes::stop_now_os),
         )
+        // A3-3 (`docs/design/A3-ATTACHED-MODULE.md` §6): reverse commands to
+        // an attached module, on the SAME connection it registered over —
+        // see `crate::attach_commands`. Attached modules never mount routes
+        // of their own (§2's table: "入站 REST 反代...无"), so this literal
+        // segment can never collide with a module's own surface.
+        .route(
+            "/api/v1/os/{name}/commands/{command}",
+            axum::routing::post(crate::attach_commands::post_command),
+        )
         .route(
             "/api/v1/shutdown",
             axum::routing::post(shutdown_handler).get(shutdown_report),

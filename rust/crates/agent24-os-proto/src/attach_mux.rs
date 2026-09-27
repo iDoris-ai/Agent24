@@ -188,29 +188,6 @@ impl KernelCalls {
     ) -> Result<Map<String, Value>, KernelCallFailed> {
         let id = format!("k{}", self.shared.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
-        {
-            // review M1: the "is this connection still open" check and the
-            // pending-map insert happen under the SAME lock acquisition as
-            // the finaliser's "mark closed, clear pending" (`Shared::close`)
-            // — so either this runs entirely before `close()`, and the entry
-            // it inserts is guaranteed to be seen and dropped by `close()`,
-            // or it runs entirely after, and sees `closed == true` and never
-            // inserts at all. There is no window where an insert can land in
-            // a map `close()` already cleared and will never look at again.
-            let mut pending = self
-                .shared
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if pending.closed {
-                return Err(KernelCallFailed::NotSent);
-            }
-            pending.map.insert(id.clone(), tx);
-        }
-        let _guard = PendingGuard {
-            shared: Arc::clone(&self.shared),
-            id: id.clone(),
-        };
         let mut line = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -219,23 +196,83 @@ impl KernelCalls {
         }))
         .unwrap_or_default();
         line.push(b'\n');
-        // `try_send`, not `.send().await` (review H1): a kernel-originated
-        // call must not block waiting for queue space — a full queue means
-        // the real module is not keeping up, and the caller is entitled to
-        // `NotSent` promptly rather than discovering that only after its own
-        // `timeout` elapses. `_guard` drops here on the early return and
-        // removes the entry just inserted.
-        if self.out_tx.try_send(line).is_err() {
-            return Err(KernelCallFailed::NotSent);
+        {
+            // review M1 (original) / A3-3 review M2 (widened): the "is this
+            // connection still open" check, the (non-blocking) enqueue onto
+            // the real writer, AND the pending-map insert now ALL happen
+            // under this ONE lock acquisition — the same lock `close()`
+            // takes to flip `closed` and clear `map`. That makes "decide
+            // this connection is closed" and "enqueue a new frame for it"
+            // mutually exclusive: whichever gets the lock first is fully
+            // visible to the other.
+            //
+            // M2's own gap: `close()` can be called from OUTSIDE this
+            // connection's wire teardown — `agent24d::attach_registry` calls
+            // it under ITS OWN lock the instant it decides a generation is
+            // no longer live (rotation, disable, `release`, `revoke_all`),
+            // which can run well before `serve_attached`'s finalizer would
+            // ever notice. Previously `try_send` ran OUTSIDE any lock, so a
+            // `call()` that had already passed the (then separate)
+            // closed-check could still successfully queue a frame onto
+            // `out_tx` AFTER the registry had already decided this
+            // connection was gone and told it so via `close()` — the queued
+            // frame would reach a module the registry no longer considers
+            // reachable. Folding `try_send` into the SAME critical section
+            // `close()` uses closes that window: if `close()` already ran,
+            // `pending.closed` is observed `true` and `try_send` is never
+            // even attempted; if this call's critical section runs first,
+            // it completes atomically (check, send, insert) before `close()`
+            // can start.
+            let mut pending = self
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if pending.closed {
+                return Err(KernelCallFailed::NotSent);
+            }
+            // `try_send`, not `.send().await` (review H1): non-blocking, so
+            // safe to call while holding this synchronous `Mutex` — a
+            // kernel-originated call must not block waiting for queue space
+            // either way. A full queue means the real module is not keeping
+            // up, and the caller is entitled to `NotSent` promptly rather
+            // than discovering that only after its own `timeout` elapses.
+            if self.out_tx.try_send(line).is_err() {
+                return Err(KernelCallFailed::NotSent);
+            }
+            pending.map.insert(id.clone(), tx);
         }
+        let _guard = PendingGuard {
+            shared: Arc::clone(&self.shared),
+            id: id.clone(),
+        };
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(obj)) => interpret_kernel_response(obj),
-            // The sender was dropped without ever sending — only happens when
-            // the connection ends (`serve_attached`'s finalizer drains and
-            // drops every pending sender; see there).
+            // The sender was dropped without ever sending — happens when the
+            // connection ends on its own (`serve_attached`'s finalizer
+            // drains and drops every pending sender) OR when `close()` is
+            // called externally while this call's answer was still pending
+            // (`agent24d::attach_registry`, review M2) — either way the
+            // frame WAS sent and the module's fate for it is unknown.
             Ok(Err(_recv_error)) => Err(KernelCallFailed::ConnectionLost),
             Err(_elapsed) => Err(KernelCallFailed::Timeout),
         }
+    }
+
+    /// A3-3 review M2: externally mark this connection "closed" for the
+    /// purpose of `call()` — sets the SAME `pending.closed` flag (and clears
+    /// `pending.map`, dropping every already-pending call's sender so its
+    /// `call()` wakes with [`KernelCallFailed::ConnectionLost`]) that the
+    /// wire's own EOF/write-failure path already used internally
+    /// ([`Shared::close`]). Exposed so `agent24d::attach_registry` can call
+    /// it the INSTANT it decides (under its own lock) that a generation is
+    /// no longer live — rotation, disable, `release`, `revoke_all` — rather
+    /// than waiting for the wire itself to notice, which can lag behind that
+    /// decision by one or more async ticks (see `call()`'s own doc for the
+    /// race this closes). Idempotent, and safe to call even if the
+    /// connection has already ended on its own.
+    pub fn close(&self) {
+        self.shared.close();
     }
 
     /// Frames without `method` that matched no pending call: dropped, never
