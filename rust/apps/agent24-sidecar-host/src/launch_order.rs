@@ -92,6 +92,10 @@ impl<L: LaunchIdentity, S: FrameSink> LaunchOrder<L, S> {
         }
     }
 
+    pub(crate) fn into_launch(self) -> L {
+        self.launch
+    }
+
     pub(crate) fn queue_owned(&mut self, now: Instant) -> Result<(), LaunchOrderStage> {
         if self.stage != LaunchOrderStage::Contained {
             return self.fail();
@@ -295,6 +299,23 @@ impl<L: LaunchIdentity + LaunchControl, S: FrameSink> ActorLaunchOrder<L, S> {
 
     pub(crate) const fn phase(&self) -> Phase {
         self.phase
+    }
+
+    pub(crate) fn into_pre_owned_cleanup(
+        self,
+    ) -> crate::pre_owned_cleanup::PreOwnedCleanup<
+        <L as crate::pre_owned_cleanup::IntoCleanupOwner>::Owner,
+    >
+    where
+        L: crate::pre_owned_cleanup::IntoCleanupOwner,
+    {
+        let owner = self.order.into_launch().into_cleanup_owner();
+        crate::pre_owned_cleanup::PreOwnedCleanup::new(
+            owner,
+            self.phase,
+            self.limits,
+            self.force_ok,
+        )
     }
 
     /// Reset the driver's per-turn force guard before it invokes any actor
@@ -945,6 +966,25 @@ mod tests {
         }
     }
 
+    impl crate::pre_owned_cleanup::CleanupTarget for ScriptLaunch {
+        fn observe_exit(&mut self) -> io::Result<ExitObservation> {
+            LaunchControl::observe_exit(self)
+        }
+        fn stop(&mut self) -> io::Result<()> {
+            LaunchControl::stop(self, true)
+        }
+        fn reap(&mut self, phase: &mut Phase) -> Result<TreeObservation, CleanupStepError> {
+            LaunchControl::cleanup(self, phase)
+        }
+    }
+
+    impl crate::pre_owned_cleanup::IntoCleanupOwner for ScriptLaunch {
+        type Owner = Self;
+        fn into_cleanup_owner(self) -> Self::Owner {
+            self
+        }
+    }
+
     const LIMITS: Deadlines = Deadlines {
         launch: std::time::Duration::from_secs(2),
         ready: std::time::Duration::from_secs(4),
@@ -993,6 +1033,28 @@ mod tests {
     fn queue_ready(actor: &mut ActorLaunchOrder<ScriptLaunch, FakeSink>, now: Instant) {
         actor.queue_owned(now).unwrap();
         assert_eq!(actor.ready(now, ready()), Ok(None));
+    }
+
+    #[test]
+    fn actor_transfer_preserves_force_success_and_does_not_repeat_native_force() {
+        let now = Instant::now();
+        let mut actor = actor(
+            [Ok(())],
+            [
+                Ok(TreeObservation::Present),
+                Ok(TreeObservation::ConfirmedEmpty),
+            ],
+            vec![],
+        );
+        actor.phase = Phase::Running;
+        actor.stop(true, now).unwrap();
+        let phase = actor.phase;
+        let mut cleanup = actor.into_pre_owned_cleanup();
+        assert_eq!(cleanup.phase(), phase);
+        assert_eq!(cleanup.step(now), Ok(TreeObservation::Present));
+        assert_eq!(cleanup.step(now), Ok(TreeObservation::ConfirmedEmpty));
+        assert_eq!(cleanup.owner().forces, vec![true]);
+        assert_eq!(cleanup.owner().observed, 0);
     }
 
     fn dispatcher(
