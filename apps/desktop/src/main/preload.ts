@@ -14,6 +14,7 @@ import {
   type ModuleInfo,
   type ModuleInstallResult,
   type ModuleUninstallResult,
+  type ModelCallEnvelope,
   type OmlxDetectResult,
   type OmlxModelsResult,
   type OmlxStartResult,
@@ -66,6 +67,15 @@ const api = {
   // mount, so the panel doesn't start empty every time it's navigated back to.
   agentearSnapshot: (): Promise<unknown[]> =>
     ipcRenderer.invoke(IpcChannels.AgentEarSnapshot),
+  // ME4-desktop-model-ui: same push/pull pair, for the kernel's `model.call`
+  // WS events (main/model-call-log.ts) — mirrors onAgentEarEvent/agentearSnapshot.
+  onModelCallEvent: (cb: (call: ModelCallEnvelope) => void): (() => void) => {
+    const listener = (_event: unknown, call: ModelCallEnvelope): void => cb(call)
+    ipcRenderer.on(IpcChannels.ModelCallEvent, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.ModelCallEvent, listener)
+  },
+  modelCallSnapshot: (): Promise<ModelCallEnvelope[]> =>
+    ipcRenderer.invoke(IpcChannels.ModelCallSnapshot),
 } as const
 
 contextBridge.exposeInMainWorld('agent24', api)

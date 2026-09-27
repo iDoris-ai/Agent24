@@ -30,7 +30,14 @@ import {
   type AttachedView,
   type ByServedUsage,
 } from './api'
+import type { ModelCallEnvelope } from '../../../shared/ipc-types'
+import { formatMs } from '../../../shared/format-latency'
 import { MAX_EVENTS_IN_MEMORY, pushCapped } from '../../../shared/agentearSequencer'
+
+/** Mirrors main/model-call-log.ts's own cap — the main process never sends
+ *  more than this many anyway, but a defensive local cap keeps this
+ *  component's own state bounded too if that ever changes. */
+const MAX_MODEL_CALLS_SHOWN = 5
 
 export { MAX_EVENTS_IN_MEMORY, pushCapped }
 
@@ -67,6 +74,20 @@ function isAttached(attach: AttachedView | null): boolean {
   return attach?.attach_status === 'attached'
 }
 
+const TIER_LABELS: Record<string, string> = { local: '本地', remote: '远端' }
+
+/** ME4-desktop-model-ui: the one line shown for EACH of AgentEar's recent
+ * `_a24/model/complete` calls — which model, local/remote, how long it took
+ * (shared `formatMs` rule: "1,234 ms" once >= 1000, never rounded to
+ * seconds), and a failure marker when the call itself didn't succeed.
+ * Exported for its unit test. */
+export function formatModelCall(call: ModelCallEnvelope): string {
+  const model = call.model_id ?? '未知模型'
+  const tier = call.tier ? (TIER_LABELS[call.tier] ?? call.tier) : '未知位置'
+  const status = call.ok ? '' : ' · 失败'
+  return `${model} · ${tier} · ${formatMs(call.latency_ms)}${status}`
+}
+
 function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Element {
   const { type, payload } = envelope
 
@@ -91,10 +112,20 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
 
   if (type === 'turn') {
     const phase = String((payload as { phase?: unknown }).phase ?? '')
+    // AgentEar PR #102 / agent-speaker v0.26.0: an idle/failed turn may carry
+    // a `timings` object — `to_first_audio_ms` ("说完到听到") is the one
+    // number worth surfacing right here, next to the turn itself; the fuller
+    // per-step breakdown lands in the timing ledger (GET /api/v1/timings),
+    // not this row.
+    const toFirstAudioMs = (payload as { timings?: { to_first_audio_ms?: unknown } }).timings
+      ?.to_first_audio_ms
     return (
       <div className="voice-row voice-row-turn">
         <span className="voice-row-badge">轮次</span>
-        <span className="voice-row-text">{TURN_PHASE_LABELS[phase] ?? phase}</span>
+        <span className="voice-row-text">
+          {TURN_PHASE_LABELS[phase] ?? phase}
+          {typeof toFirstAudioMs === 'number' && ` · 说完到听到 ${formatMs(toFirstAudioMs)}`}
+        </span>
       </div>
     )
   }
@@ -161,6 +192,7 @@ export default function VoicePanel(): JSX.Element {
   const [attachError, setAttachError] = useState<string | null>(null)
   const [usage, setUsage] = useState<ByServedUsage | null>(null)
   const [events, setEvents] = useState<AgentEarEventEnvelope[]>([])
+  const [modelCalls, setModelCalls] = useState<ModelCallEnvelope[]>([])
   const [speakText, setSpeakText] = useState('')
   const [speakLang, setSpeakLang] = useState<'zh-CN' | 'en-US' | 'th-TH'>('zh-CN')
   const [commandError, setCommandError] = useState<string | null>(null)
@@ -182,6 +214,28 @@ export default function VoicePanel(): JSX.Element {
       })
     const unsubscribe = window.agent24.onAgentEarEvent((envelope) => {
       setEvents((prev) => pushCapped(prev, [envelope as AgentEarEventEnvelope]))
+    })
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
+  }, [])
+
+  // ME4-desktop-model-ui: same pull(snapshot)+push(ongoing) shape as the
+  // AgentEar event log above, for main/model-call-log.ts's ring buffer — each
+  // recent call is shown (not just the latest), oldest first, capped the
+  // same way the main-process log already is.
+  useEffect(() => {
+    let cancelled = false
+    window.agent24.modelCallSnapshot()
+      .then((calls) => {
+        if (!cancelled) setModelCalls(calls.slice(-MAX_MODEL_CALLS_SHOWN))
+      })
+      .catch(() => {
+        /* best-effort, same as the AgentEar snapshot above */
+      })
+    const unsubscribe = window.agent24.onModelCallEvent((call) => {
+      setModelCalls((prev) => [...prev, call].slice(-MAX_MODEL_CALLS_SHOWN))
     })
     return () => {
       cancelled = true
@@ -290,6 +344,17 @@ export default function VoicePanel(): JSX.Element {
           </span>
         )}
       </div>
+
+      {modelCalls.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 2 }}>最近模型调用</div>
+          {[...modelCalls].reverse().map((c, i) => (
+            <div key={i} style={{ fontSize: 11, color: 'var(--muted)' }}>
+              {formatModelCall(c)}
+            </div>
+          ))}
+        </div>
+      )}
 
       {attachError && (
         <div style={{ color: 'var(--muted)', fontSize: 12, marginBottom: 8 }}>

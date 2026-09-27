@@ -1,20 +1,23 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import VoicePanel, { MAX_EVENTS_IN_MEMORY, pushCapped } from './VoicePanel'
-import type { AgentEarEventEnvelope, AttachedView } from '../../../shared/ipc-types'
+import VoicePanel, { MAX_EVENTS_IN_MEMORY, pushCapped, formatModelCall } from './VoicePanel'
+import type { AgentEarEventEnvelope, AttachedView, ModelCallEnvelope } from '../../../shared/ipc-types'
 
 type BackendReq = { method: string; path: string; body?: unknown }
 type BackendRes = { ok: boolean; status: number; data: unknown }
 
 let posted: Array<{ path: string; body: unknown }> = []
 let onEventHandler: ((raw: unknown) => void) | null = null
+let onModelCallHandler: ((call: ModelCallEnvelope) => void) | null = null
 let attachModules: AttachedView[] = []
 let snapshotEvents: AgentEarEventEnvelope[] = []
+let modelCallSnapshotCalls: ModelCallEnvelope[] = []
 
 function mount(): void {
   posted = []
   onEventHandler = null
+  onModelCallHandler = null
   const proxy = vi.fn((req: BackendReq): Promise<BackendRes> => {
     if (req.method === 'GET' && req.path === '/api/v1/attached') {
       return Promise.resolve({ ok: true, status: 200, data: { modules: attachModules } })
@@ -53,8 +56,15 @@ function mount(): void {
   // on mount, so this mock stands in for main's `agentear:snapshot` handler.
   const agentearSnapshot = vi.fn(() => Promise.resolve(snapshotEvents))
 
+  // ME4-desktop-model-ui: same shape, for the kernel's `model.call` events.
+  const onModelCallEvent = vi.fn((cb: (call: ModelCallEnvelope) => void) => {
+    onModelCallHandler = cb
+    return () => { onModelCallHandler = null }
+  })
+  const modelCallSnapshot = vi.fn(() => Promise.resolve(modelCallSnapshotCalls))
+
   Object.defineProperty(window, 'agent24', {
-    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot },
+    value: { backendProxy: proxy, onAgentEarEvent, agentearSnapshot, onModelCallEvent, modelCallSnapshot },
     writable: true,
     configurable: true,
   })
@@ -80,9 +90,24 @@ function transcript(session: string, seq: number, text: string): AgentEarEventEn
   return { schema: 'agentear.event/1', event_id: `evt_${session}_${seq}`, session_id: session, seq, type: 'transcript', payload: { text, lang: 'zh-CN', final: true } }
 }
 
+function modelCall(overrides: Partial<ModelCallEnvelope> = {}): ModelCallEnvelope {
+  return {
+    module: 'agentear',
+    model_id: 'Qwen3.6-35B-A3B-MLX-8bit',
+    tier: 'local',
+    served_by: 'omlx',
+    ok: true,
+    latency_ms: 842,
+    prompt_tokens: 12,
+    completion_tokens: 8,
+    ...overrides,
+  }
+}
+
 beforeEach(() => {
   attachModules = []
   snapshotEvents = []
+  modelCallSnapshotCalls = []
 })
 
 describe('VoicePanel — attach status', () => {
@@ -182,6 +207,37 @@ describe('VoicePanel — live event display', () => {
     emit(transcript('ses_1', 1, '今天天气怎么样？'))
     await waitFor(() => expect(screen.getByText('今天天气怎么样？')).toBeInTheDocument())
     expect(screen.getByText(/转写 · zh-CN/)).toBeInTheDocument()
+  })
+
+  it('shows to_first_audio_ms next to an idle turn that carries a timings object', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onEventHandler).not.toBeNull())
+    emit({
+      schema: 'agentear.event/1',
+      event_id: 'evt_turn_1',
+      session_id: 'ses_1',
+      seq: 7,
+      type: 'turn',
+      payload: { phase: 'idle', timings: { to_first_audio_ms: 1400, total_ms: 3500 } },
+    })
+    await waitFor(() => expect(screen.getByText(/说完到听到 1,400 ms/)).toBeInTheDocument())
+  })
+
+  it('shows a plain turn row with no timing suffix when there is no timings object', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onEventHandler).not.toBeNull())
+    emit({
+      schema: 'agentear.event/1',
+      event_id: 'evt_turn_2',
+      session_id: 'ses_1',
+      seq: 1,
+      type: 'turn',
+      payload: { phase: 'listening' },
+    })
+    await waitFor(() => expect(screen.getByText('聆听中')).toBeInTheDocument())
+    expect(screen.queryByText(/说完到听到/)).not.toBeInTheDocument()
   })
 
   it('shows a truncation annotation for a transcript longer than the display limit', async () => {
@@ -289,6 +345,78 @@ describe('VoicePanel — live event display', () => {
     unmount()
     render(<VoicePanel />)
     await waitFor(() => expect(screen.getByText('早于挂载就已经在主进程日志里')).toBeInTheDocument())
+  })
+})
+
+describe('VoicePanel — recent model calls (ME4-desktop-model-ui)', () => {
+  it('shows the main-process snapshot\'s model calls on mount, with a thousands-separated latency', async () => {
+    modelCallSnapshotCalls = [modelCall({ model_id: 'Qwen3-8B-4bit', tier: 'remote', latency_ms: 1500 })]
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => {
+      expect(screen.getByText('Qwen3-8B-4bit · 远端 · 1,500 ms')).toBeInTheDocument()
+    })
+  })
+
+  it('shows nothing yet when no model call has happened', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(screen.getByText(/未附着/)).toBeInTheDocument())
+    expect(screen.queryByText(/最近模型调用/)).not.toBeInTheDocument()
+  })
+
+  it('shows EACH new model.call event as it arrives, most recent first, not just the latest', async () => {
+    mount()
+    const { container } = render(<VoicePanel />)
+    await waitFor(() => expect(onModelCallHandler).not.toBeNull())
+    onModelCallHandler!(modelCall({ model_id: 'first-model' }))
+    await waitFor(() => expect(screen.getByText(/first-model/)).toBeInTheDocument())
+    onModelCallHandler!(modelCall({ model_id: 'second-model' }))
+    await waitFor(() => expect(screen.getByText(/second-model/)).toBeInTheDocument())
+    // Both survive — this is a small feed, not a single "latest" slot.
+    expect(screen.getByText(/first-model/)).toBeInTheDocument()
+    // Most recent (second-model) rendered first.
+    const text = container.textContent ?? ''
+    expect(text.indexOf('second-model')).toBeLessThan(text.indexOf('first-model'))
+  })
+
+  it('caps the shown list at MAX_MODEL_CALLS_SHOWN, dropping the oldest', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onModelCallHandler).not.toBeNull())
+    for (let i = 1; i <= 8; i++) onModelCallHandler!(modelCall({ model_id: `m${i}` }))
+    await waitFor(() => expect(screen.getByText(/m8/)).toBeInTheDocument())
+    expect(screen.queryByText(/^m1 ·/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/^m3 ·/)).not.toBeInTheDocument()
+    expect(screen.getByText(/^m4 ·/)).toBeInTheDocument() // oldest surviving
+  })
+
+  it('marks a failed call distinctly', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onModelCallHandler).not.toBeNull())
+    onModelCallHandler!(modelCall({ ok: false, model_id: null, tier: null }))
+    await waitFor(() => expect(screen.getByText(/失败/)).toBeInTheDocument())
+    expect(screen.getByText(/未知模型/)).toBeInTheDocument()
+  })
+})
+
+describe('formatModelCall', () => {
+  it('renders model id, a Chinese tier label, and latency (plain ms below 1000)', () => {
+    expect(formatModelCall(modelCall({ model_id: 'm', tier: 'local', latency_ms: 10 }))).toBe('m · 本地 · 10 ms')
+    expect(formatModelCall(modelCall({ model_id: 'm', tier: 'remote', latency_ms: 20 }))).toBe('m · 远端 · 20 ms')
+  })
+
+  it('thousands-separates latency at/above 1000ms', () => {
+    expect(formatModelCall(modelCall({ model_id: 'm', tier: 'local', latency_ms: 1834 }))).toBe(
+      'm · 本地 · 1,834 ms',
+    )
+  })
+
+  it('falls back for a missing model id / tier, and marks a failed call', () => {
+    expect(formatModelCall(modelCall({ model_id: null, tier: null, latency_ms: 5, ok: false }))).toBe(
+      '未知模型 · 未知位置 · 5 ms · 失败',
+    )
   })
 })
 

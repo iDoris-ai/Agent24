@@ -6,6 +6,7 @@ import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
 import { AgentEarEventBridge } from './agentear-events'
 import { AgentEarEventLog } from './agentear-log'
+import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
 
 const isDev = process.env.NODE_ENV === 'development'
@@ -14,10 +15,18 @@ const backendManager = new BackendManager()
 // survives the renderer's VoicePanel unmounting when the user switches
 // sidebar pages (design §7.2's intent — a host-side log, not a per-tab one).
 const agentEarLog = new AgentEarEventLog()
+// ME4-desktop-model-ui: same "log lives in main, survives the panel
+// unmounting" reasoning as agentEarLog above, for the kernel's `model.call`
+// WS events instead of AgentEar's own transcript.
+const modelCallLog = new ModelCallLog()
 // Forwards raw WS-unwrapped agentear.event/1 objects into the log; the log's
 // own subscribe() (wired below, in whenReady) fans newly-delivered envelopes
-// out to the renderer.
-const agentEarBridge = new AgentEarEventBridge((envelope) => agentEarLog.ingest(envelope))
+// out to the renderer. The second callback does the same for `model.call`
+// events scoped to AgentEar (agentear-events.ts's `parseModelCallFrame`).
+const agentEarBridge = new AgentEarEventBridge(
+  (envelope) => agentEarLog.ingest(envelope),
+  (call) => modelCallLog.ingest(call),
+)
 
 // FU-91: was hardcoded to 'http://localhost:5173' — if that port were taken
 // by another project, the window silently loaded whatever else was listening
@@ -131,6 +140,14 @@ app.whenReady().then(() => {
   agentEarLog.subscribe((envelope) => {
     if (mainWin && !mainWin.isDestroyed()) {
       mainWin.webContents.send(IpcChannels.AgentEarEvent, envelope)
+    }
+  })
+
+  // ME4-desktop-model-ui: same pull+push pair, for model-call-log.ts.
+  ipcMain.handle(IpcChannels.ModelCallSnapshot, () => modelCallLog.snapshot())
+  modelCallLog.subscribe((call) => {
+    if (mainWin && !mainWin.isDestroyed()) {
+      mainWin.webContents.send(IpcChannels.ModelCallEvent, call)
     }
   })
 

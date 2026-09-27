@@ -27,6 +27,7 @@
 
 import WebSocket from 'ws'
 import { getBackendEndpoint } from './backend-manager'
+import type { ModelCallEnvelope } from '../shared/ipc-types'
 
 export const AGENTEAR_MODULE_NAME = 'agentear'
 export const AGENTEAR_EVENT_KIND = 'agentear.event'
@@ -65,6 +66,29 @@ export function parseAgentEarFrame(raw: string): unknown | null {
   return outer['payload'] ?? null
 }
 
+/** ME4-desktop-model-ui: unwraps one WS text frame to a `ModelCallEnvelope`,
+ * or null if this frame isn't a `model.call` event for AgentEar specifically.
+ * Unlike `parseAgentEarFrame`, this is a FIRST-PARTY kernel event (dotted
+ * `type`, not the `module` namespace wrapper) — agent24-protocol's
+ * `EventBody::ModelCall` (`rust/crates/agent24-protocol/src/events.rs`) —
+ * so it's unwrapped directly off `msg.payload`, one level shallower. Filtered
+ * to `payload.module === "agentear"` here (not left to the caller) because
+ * this whole file's job is bridging AgentEar-specific state to the desktop;
+ * another module's model calls are simply not this bridge's concern. */
+export function parseModelCallFrame(raw: string): ModelCallEnvelope | null {
+  let msg: unknown
+  try {
+    msg = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isPlainObject(msg) || msg['type'] !== 'model.call') return null
+  const payload = msg['payload']
+  if (!isPlainObject(payload)) return null
+  if (payload['module'] !== AGENTEAR_MODULE_NAME) return null
+  return payload as unknown as ModelCallEnvelope
+}
+
 /** Reconnecting WS client. Kept deliberately dumb: no queueing, no
  *  persistence (design §7.3/Q4 — Agent24 never persists transcript, and
  *  losing in-flight events across a reconnect is acceptable for this P2
@@ -75,7 +99,12 @@ export class AgentEarEventBridge {
   private backoffMs = INITIAL_BACKOFF_MS
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
-  constructor(private readonly onEnvelope: (envelope: unknown) => void) {}
+  constructor(
+    private readonly onEnvelope: (envelope: unknown) => void,
+    // ME4-desktop-model-ui: optional so every existing call site (tests
+    // included) keeps compiling unchanged.
+    private readonly onModelCall?: (call: ModelCallEnvelope) => void,
+  ) {}
 
   start(): void {
     if (!this.stopped) return
@@ -119,8 +148,11 @@ export class AgentEarEventBridge {
       this.backoffMs = INITIAL_BACKOFF_MS
     })
     socket.on('message', (data: WebSocket.RawData) => {
-      const envelope = parseAgentEarFrame(data.toString())
+      const raw = data.toString()
+      const envelope = parseAgentEarFrame(raw)
       if (envelope !== null) this.onEnvelope(envelope)
+      const modelCall = parseModelCallFrame(raw)
+      if (modelCall !== null) this.onModelCall?.(modelCall)
     })
     socket.on('close', () => {
       if (this.socket === socket) this.socket = null
