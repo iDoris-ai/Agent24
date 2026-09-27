@@ -174,8 +174,8 @@ fn build_error(
 mod tests {
     use super::*;
     use crate::{
-        launch::LaunchIntent, output_io::WriteStep, stderr_drain_worker::StderrDrainStatus,
-        target::TreeObservation, worker_slots::WorkerRole,
+        launch::LaunchIntent, stderr_drain_worker::StderrDrainStatus, target::TreeObservation,
+        worker_slots::WorkerRole,
     };
     use agent24_sidecar_host_protocol::{PROTOCOL_VERSION, Reply, Request, decode_reply};
     use std::{
@@ -242,17 +242,6 @@ mod tests {
         OwnedLaunch::start(LaunchIntent::from_request(request).unwrap()).unwrap()
     }
 
-    fn wait_output(output: &mut OutputWorker, now: Instant) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match output.step(now).unwrap() {
-                WriteStep::Complete => return,
-                WriteStep::Pending if Instant::now() < deadline => thread::yield_now(),
-                other => panic!("output did not complete: {other:?}"),
-            }
-        }
-    }
-
     #[test]
     fn native_assembly_moves_generation_pipes_and_reaches_ready() {
         let _test_guard = crate::posix::tests::test_lock();
@@ -299,7 +288,8 @@ mod tests {
         );
         drop(generation);
 
-        wait_output(&mut output, Instant::now());
+        // Reaching Running means the driver observed the Owned reply flush.
+        // The worker may already be back in Idle by the time this test polls it.
         let frames = written.lock().unwrap().clone();
         let first = frames
             .split_inclusive(|byte| *byte == b'\n')

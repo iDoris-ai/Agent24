@@ -122,6 +122,7 @@ impl<L: CleanupTarget> PreOwnedCleanup<L> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::target::TreeObservation::{ConfirmedEmpty, Present, Unconfirmed};
     use std::{
         collections::VecDeque,
         time::{Duration, Instant},
@@ -162,7 +163,7 @@ mod tests {
     fn active(phase: Phase) -> PreOwnedCleanup<Fake> {
         let mut owner = Fake::default();
         owner.stops.push_back(Ok(()));
-        owner.trees.push_back(Ok(TreeObservation::ConfirmedEmpty));
+        owner.trees.push_back(Ok(ConfirmedEmpty));
         PreOwnedCleanup::new(owner, phase, LIMITS, false)
     }
     macro_rules! expect_error {
@@ -173,13 +174,6 @@ mod tests {
             );
         };
     }
-    fn expect_tree<L: CleanupTarget>(
-        cleanup: &mut PreOwnedCleanup<L>,
-        now: Instant,
-        tree: TreeObservation,
-    ) {
-        assert_eq!(cleanup.step(now), Ok(tree));
-    }
     #[test]
     fn force_retries_errors_and_success_preserve_deadline_until_success() {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -189,24 +183,21 @@ mod tests {
             Err(io::ErrorKind::PermissionDenied.into()),
             Ok(()),
         ]);
-        owner.trees.push_back(Ok(TreeObservation::Present));
+        owner.trees.push_back(Ok(Present));
         let mut cleanup =
             PreOwnedCleanup::new(owner, Phase::ForceStopping(deadline), LIMITS, false);
         expect_error!(&mut cleanup, Stop, WouldBlock);
         expect_error!(&mut cleanup, Stop, PermissionDenied);
-        assert_eq!(cleanup.step(Instant::now()), Ok(TreeObservation::Present));
+        assert_eq!(cleanup.step(Instant::now()), Ok(Present));
         assert_eq!(cleanup.phase(), Phase::ForceStopping(deadline));
         let mut active = active(Phase::AwaitReady(deadline));
         let now = Instant::now();
-        assert_eq!(active.step(now), Ok(TreeObservation::ConfirmedEmpty));
+        assert_eq!(active.step(now), Ok(ConfirmedEmpty));
         active.phase = Phase::Running;
         active.force_ok = false;
         active.owner.stops.push_back(Ok(()));
-        active
-            .owner
-            .trees
-            .push_back(Ok(TreeObservation::ConfirmedEmpty));
-        assert_eq!(active.step(now), Ok(TreeObservation::ConfirmedEmpty));
+        active.owner.trees.push_back(Ok(ConfirmedEmpty));
+        assert_eq!(active.step(now), Ok(ConfirmedEmpty));
     }
     #[test]
     fn reap_retries_preserve_owner_until_idempotent_confirmed_empty() {
@@ -218,9 +209,9 @@ mod tests {
         owner.stops.push_back(Ok(()));
         owner.trees.extend([
             Err(io::ErrorKind::Other.into()),
-            Ok(TreeObservation::Present),
-            Ok(TreeObservation::Unconfirmed),
-            Ok(TreeObservation::ConfirmedEmpty),
+            Ok(Present),
+            Ok(Unconfirmed),
+            Ok(ConfirmedEmpty),
         ]);
         let mut cleanup =
             PreOwnedCleanup::new(owner, Phase::GracefulStopping(deadline), LIMITS, false);
@@ -228,22 +219,10 @@ mod tests {
         assert_eq!(cleanup.phase(), Phase::GracefulStopping(deadline));
         cleanup.phase = Phase::ForceStopping(deadline);
         expect_error!(&mut cleanup, Reap, Other);
-        expect_tree(&mut cleanup, deadline, TreeObservation::Present);
-        expect_tree(
-            &mut cleanup,
-            deadline + LIMITS.drain,
-            TreeObservation::Unconfirmed,
-        );
+        assert_eq!(cleanup.step(deadline), Ok(Present));
+        assert_eq!(cleanup.step(deadline + LIMITS.drain), Ok(Unconfirmed));
         assert_eq!(cleanup.phase(), Phase::Unconfirmed);
-        expect_tree(
-            &mut cleanup,
-            deadline + LIMITS.drain,
-            TreeObservation::ConfirmedEmpty,
-        );
-        expect_tree(
-            &mut cleanup,
-            deadline + LIMITS.drain,
-            TreeObservation::ConfirmedEmpty,
-        );
+        assert_eq!(cleanup.step(deadline + LIMITS.drain), Ok(ConfirmedEmpty));
+        assert_eq!(cleanup.step(deadline + LIMITS.drain), Ok(ConfirmedEmpty));
     }
 }
