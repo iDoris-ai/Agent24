@@ -5,6 +5,8 @@
 
 mod approval_callback;
 mod approvals;
+mod attached;
+mod attached_routes;
 mod domain;
 mod events;
 mod events_emit;

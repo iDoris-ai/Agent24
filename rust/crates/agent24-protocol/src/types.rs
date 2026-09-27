@@ -171,6 +171,61 @@ pub struct DomainOsUpdate {
     pub enabled: bool,
 }
 
+// ── Attached modules (A3-2a, `docs/design/A3-ATTACHED-MODULE.md` §3) ───────────
+
+/// Body of `POST /api/v1/attached`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AttachedAddRequest {
+    /// The exact `domain-os.yml` text (§3.1) — stored verbatim, hashed for
+    /// `manifest_digest`, and re-parsed for the facts a re-registration needs
+    /// to compare against (§3.4/§3.5).
+    pub manifest: String,
+    /// Required to be `true` whenever this request would WIDEN the module's
+    /// privacy relative to what it holds today (§3.5) — a first-time
+    /// `remote_allowed` registration, a `local_only` → `remote_allowed`
+    /// change, or a new capability. Absent/`false` otherwise.
+    #[serde(default)]
+    pub allow_relax: bool,
+}
+
+/// `201`/`200` response of `POST /api/v1/attached`, byte-for-byte the same
+/// shape `agent24 os attach add --json` prints to stdout (§3.6) — the plain
+/// text of the token appears here and NOWHERE else the daemon ever answers
+/// (§3.3 C1): not in `GET /api/v1/attached`, not in `attached.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AttachedAddResponse {
+    pub name: String,
+    /// `sha256:<hex>` of the exact submitted manifest bytes.
+    pub manifest_digest: String,
+    /// The plaintext handshake token. Save it now — it is never shown again.
+    pub token: String,
+    /// The attach socket's absolute path (expanded), so a module never
+    /// hardcodes it (§4.1).
+    pub socket_path: String,
+    /// Identifies WHICH token this is, for logs/`GET /api/v1/attached` — never
+    /// enough to reconstruct the token itself.
+    pub token_id: String,
+}
+
+/// One registered attached module, as `GET /api/v1/attached` reports it —
+/// NEVER the token or its hash (§3.2/§3.3 C1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AttachedView {
+    pub name: String,
+    pub manifest_digest: String,
+    pub token_id: String,
+    pub created_at: String,
+    /// Open enum: `detached` | `attached` | `disabled` (§5.1). A3-2a wires no
+    /// listening socket or live generation (that is A3-2b), so every entry
+    /// this slice can produce reads `detached`.
+    pub attach_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AttachedList {
+    pub modules: Vec<AttachedView>,
+}
+
 // ── Errors (SPEC-002 §5) ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

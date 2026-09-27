@@ -179,6 +179,12 @@ pub struct CallbackDeps {
 /// better shape, but the namespace is fixed by ADR-029 / SPEC-MD-ME §2, so it is
 /// raised there rather than changed here.
 const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
+    // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2 M7): the attached-module
+    // registry lives at `/api/v1/attached`, so no domain OS may be named
+    // `attached` — same reservation mechanism as every other kernel segment
+    // below, and `reserved_segments_match_the_kernel_routes_exactly` pins it
+    // against `crate::server::build_router_with_modules` the same way.
+    "attached",
     "approvals",
     "chat",
     "events",
@@ -200,6 +206,14 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "tools",
     "usage",
 ];
+
+/// Whether `name` is a kernel route segment no module (mounted OR attached,
+/// A3-2a) may claim. Exposed for [`crate::attached`], which has no manifest
+/// mount pass of its own to run this check inside — it validates a name at
+/// `POST /api/v1/attached` time, before ever touching the registry file.
+pub(crate) fn is_reserved_kernel_segment(name: &str) -> bool {
+    RESERVED_KERNEL_SEGMENTS.contains(&name)
+}
 
 /// Adapts the daemon's WS hub to the contract's transport. Only the kernel builds
 /// one of these, which is what makes a module's sink reach real subscribers —
