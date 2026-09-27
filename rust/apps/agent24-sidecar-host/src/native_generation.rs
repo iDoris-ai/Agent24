@@ -15,7 +15,7 @@ use crate::{
     output_worker::OutputWorker,
     pre_owned_cleanup::{IntoCleanupOwner, PreOwnedCleanup},
     ready_read_worker::ReadyReadWorker,
-    stderr_drain_worker::{StderrDrainSnapshot, StderrDrainWorker},
+    stderr_drain_worker::{StderrDrainSnapshot, StderrDrainStatus, StderrDrainWorker},
     worker_slots::{WorkerSlotError, WorkerSlots},
 };
 
@@ -151,7 +151,9 @@ impl<'host> NativeGeneration<'host> {
     }
 
     pub(crate) fn step(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError> {
-        self.driver.step(now)
+        let stderr = self.stderr.snapshot();
+        self.driver
+            .step_with_transport_failure(now, stderr_transport_failed(stderr.status))
     }
 
     pub(crate) fn schedule_state(&self) -> ScheduleState {
@@ -165,6 +167,10 @@ impl<'host> NativeGeneration<'host> {
     pub(crate) fn into_pre_owned_cleanup(self) -> PreOwnedCleanup {
         self.driver.into_pre_owned_cleanup()
     }
+}
+
+fn stderr_transport_failed(status: StderrDrainStatus) -> bool {
+    matches!(status, StderrDrainStatus::Io(_) | StderrDrainStatus::Closed)
 }
 
 fn build_error(
@@ -193,6 +199,16 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn stderr_terminal_status_maps_only_io_and_closed_to_transport_failure() {
+        assert!(stderr_transport_failed(StderrDrainStatus::Io(
+            io::ErrorKind::Other
+        )));
+        assert!(stderr_transport_failed(StderrDrainStatus::Closed));
+        assert!(!stderr_transport_failed(StderrDrainStatus::Eof));
+        assert!(!stderr_transport_failed(StderrDrainStatus::Running));
+    }
 
     const LIMITS: Deadlines = Deadlines {
         launch: Duration::from_secs(2),
