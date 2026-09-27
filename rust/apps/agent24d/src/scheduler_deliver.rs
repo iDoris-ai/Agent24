@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use agent24_os_proto::drain::{Abandoned, RequestRefused};
 use agent24_os_proto::kernel_call::{
-    FIRE_ID_HEADER, KernelCallError, KernelLimits, KernelRequest, KernelRequestIds, KernelResponse,
-    SCHEDULE_KEY_HEADER, send_kernel_request,
+    FIRE_ID_HEADER, FiredBody, KernelCallError, KernelLimits, KernelRequest, KernelRequestIds,
+    KernelResponse, SCHEDULE_KEY_HEADER, send_kernel_request,
 };
 use agent24_scheduler::{DeferReason, FireId, FireOutcome, ModuleScheduleKey};
 use axum::http::{HeaderName, HeaderValue};
@@ -128,10 +128,10 @@ impl ModuleDeliverer {
         let namespace = agent24_domain::DomainOsManifest::declared_namespace(&owner.owner_module);
         let path = format!("{namespace}/_a24/scheduler/fired");
         let body = FiredBody {
-            key: &owner.module_key,
-            trigger,
-            scheduled_for,
-            fired_at,
+            key: owner.module_key.clone(),
+            trigger: trigger.to_owned(),
+            scheduled_for: scheduled_for.to_owned(),
+            fired_at: fired_at.to_owned(),
         };
         let body_bytes = match serde_json::to_vec(&body) {
             Ok(b) => b,
@@ -168,19 +168,6 @@ impl ModuleDeliverer {
         let result = send_kernel_request(generation, &self.ids, request, self.limits, None).await;
         classify(fire_id, result)
     }
-}
-
-/// design §5.3: the body of `POST /api/v1/<ns>/_a24/scheduler/fired`. Stable
-/// across retries — every field is read back off the delivery row by the
-/// caller (`agent24_scheduler::deliveries::run_attempt`), never re-taken at
-/// send time.
-#[derive(Debug, serde::Serialize)]
-struct FiredBody<'a> {
-    key: &'a str,
-    /// `"tick"` | `"run_now"`.
-    trigger: &'a str,
-    scheduled_for: &'a str,
-    fired_at: &'a str,
 }
 
 /// design §5.3's classification table: one attempt's transport result → the
