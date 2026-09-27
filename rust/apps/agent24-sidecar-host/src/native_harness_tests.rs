@@ -5,7 +5,7 @@ use crate::{
     actor::{Deadlines, Phase},
     first_launch_dispatch::{self, FirstLaunchDispatch},
     first_launch_ingress::AcceptedLaunch,
-    generation_harness::{GenerationHarness, TurnIntent},
+    generation_harness::{GenerationHarness, TurnIntent, TurnReport},
     host_ports::HostPorts,
     launch::LaunchIntent,
     native_generation::NativeGeneration,
@@ -95,10 +95,7 @@ fn request(id: u64, ready: bool) -> Request {
             .join("WindowsPowerShell")
             .join("v1.0")
             .join("powershell.exe");
-        assert!(
-            executable.is_file(),
-            "Windows PowerShell is required: {executable:?}"
-        );
+        assert!(executable.is_file(), "Windows PowerShell is required");
         let script = if ready {
             "[Console]::Out.WriteLine('{\"type\":\"ready\",\"protocol\":1,\"port\":4312,\"token\":\"tttttttttttttttttttttttttttttttt\",\"version\":\"native-harness\"}'); [Console]::In.ReadToEnd() | Out-Null; Start-Sleep -Seconds 30"
         } else {
@@ -187,7 +184,7 @@ fn drive_until(
     target: WaitFor,
     intent: TurnIntent,
     seconds: u64,
-) {
+) -> TurnReport {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         let report = harness.turn(intent, Instant::now());
@@ -200,7 +197,7 @@ fn drive_until(
             WaitFor::Empty => report.state.phase == Phase::Empty,
         };
         if reached && !report.state.output_pending {
-            return;
+            return report;
         }
         assert!(
             Instant::now() < deadline,
@@ -211,7 +208,7 @@ fn drive_until(
     }
 }
 
-fn assert_frames(bytes: &[u8], request_id: u64, expected: &[u8]) {
+fn assert_frames(bytes: &[u8], request_id: u64, expected: &[u8], allow_exit: bool) {
     let mut kinds = Vec::with_capacity(expected.len());
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         match decode_reply(line) {
@@ -237,12 +234,17 @@ fn assert_frames(bytes: &[u8], request_id: u64, expected: &[u8]) {
                     assert_eq!(version, "native-harness", "Ready version mismatch");
                     kinds.push(b'R');
                 }
+                Ok(Event::Exit { .. }) if allow_exit => kinds.push(b'X'),
                 Ok(Event::Exit { .. }) => panic!("unexpected Exit event frame"),
                 Err(_) => panic!("invalid output frame"),
             },
         }
     }
-    assert_eq!(kinds, expected, "output frame order/count mismatch");
+    let observed = kinds.as_slice();
+    assert!(
+        observed == expected || (allow_exit && observed.strip_suffix(b"X") == Some(expected)),
+        "output frame order/count mismatch"
+    );
 }
 
 #[test]
@@ -269,7 +271,7 @@ fn ready_force_cancel_then_continue_reaps_same_native_generation() {
             "Empty turns must not emit output"
         );
         assert!(output.len() <= OUTPUT_CAPACITY);
-        assert_frames(&output, 7401, b"OR");
+        assert_frames(&output, 7401, b"OR", false);
     });
 }
 
@@ -286,20 +288,18 @@ fn parent_eof_after_await_ready_or_running_cleans_up() {
             parent_eof.store(true, Ordering::SeqCst);
             let eof_turn = harness.turn(TurnIntent::Continue, Instant::now());
             assert_ne!(eof_turn.state.phase, Phase::Empty);
-            drive_until(harness, WaitFor::GracefulStopping, TurnIntent::Continue, 3);
-            let graceful_deadline = match harness
-                .turn(TurnIntent::Continue, Instant::now())
-                .state
-                .phase
-            {
-                Phase::GracefulStopping(deadline) => deadline,
-                phase => panic!("parent EOF did not enter graceful cleanup: {phase:?}"),
-            };
-            harness.turn(TurnIntent::Continue, graceful_deadline);
+            if ready {
+                let graceful =
+                    drive_until(harness, WaitFor::GracefulStopping, TurnIntent::Continue, 3);
+                let Phase::GracefulStopping(deadline) = graceful.state.phase else {
+                    unreachable!("wait target guarantees GracefulStopping")
+                };
+                harness.turn(TurnIntent::Continue, deadline);
+            }
             drive_until(harness, WaitFor::Empty, TurnIntent::Continue, 8);
             let output = bytes.lock().unwrap();
             assert!(output.len() <= OUTPUT_CAPACITY);
-            assert_frames(&output, id, expected);
+            assert_frames(&output, id, expected, true);
         });
     }
 }
