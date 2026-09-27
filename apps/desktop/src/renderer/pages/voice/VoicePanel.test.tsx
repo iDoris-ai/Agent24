@@ -76,10 +76,6 @@ function emit(ev: AgentEarEventEnvelope): void {
   onEventHandler!(ev)
 }
 
-function turn(session: string, seq: number, phase = 'listening'): AgentEarEventEnvelope {
-  return { schema: 'agentear.event/1', event_id: `evt_${session}_${seq}`, session_id: session, seq, type: 'turn', payload: { phase } }
-}
-
 function transcript(session: string, seq: number, text: string): AgentEarEventEnvelope {
   return { schema: 'agentear.event/1', event_id: `evt_${session}_${seq}`, session_id: session, seq, type: 'transcript', payload: { text, lang: 'zh-CN', final: true } }
 }
