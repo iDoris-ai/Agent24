@@ -39,10 +39,12 @@ serde_json = { workspace = true }
 # one malformed key/value pair to hide an unrelated, well-formed `module=`
 # key elsewhere in the same query string.
 form_urlencoded = "1"
+# Capability token hashing is used by the production capability service.
+sha2 = "0.10"
 # T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
 # with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
 futures = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync", "fs", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -53,11 +55,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 agent24-os-proto = { path = "../../crates/agent24-os-proto" }
 # SHUT-1b: open the shutdown evidence without following a link or blocking on
 # a FIFO (already in the tree through agent24-os-proto).
-rustix = { version = "0.38", features = ["fs"] }
+rustix = { version = "0.38", features = ["fs", "stdio"] }
 
 [dev-dependencies]
 tempfile = "3"
-sha2 = "0.10"
 # ME4-S3 §6 (J-S7): the SDK's five clients tested against these callback
 # handlers' own `h.call` fixtures, on `agent24-os-proto`'s in-memory fake
 # kernel (forwarded through the SDK's `test-util` feature, L8).
