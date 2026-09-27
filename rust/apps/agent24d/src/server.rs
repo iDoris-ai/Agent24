@@ -1611,13 +1611,53 @@ pub async fn serve(
     result
 }
 
+/// FU-92: `<root>/run/<pid>/<n>.sock` must fit macOS's 103-byte `sun_path`
+/// limit ([`agent24_os_proto::endpoint::MAX_SOCKET_PATH`]). A long `$HOME` (or,
+/// for an ephemeral daemon, a long `$TMPDIR`) otherwise fails every
+/// out-of-process module's start — with a message that only said "too long",
+/// not by how much or what to do about it.
+///
+/// Rather than lose the whole out-of-process subsystem over a HOME the user
+/// did not pick for this reason, fall back to a short path under `/tmp`
+/// (a literal `/tmp`, not `$TMPDIR`, which on macOS is itself often long)
+/// when `root` would not fit — named by a hash of `root` so distinct state
+/// directories, and repeated ephemeral runs, do not collide. Only the
+/// transient callback-socket directory moves: `os.json`, `daemon.json`,
+/// packages and memory all stay under the real `root`.
+fn callback_root(root: &std::path::Path) -> std::path::PathBuf {
+    let projected = root
+        .join("run")
+        .join(std::process::id().to_string())
+        .join(format!("{}.sock", u64::MAX));
+    if projected.as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH {
+        return root.to_owned();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    let fallback =
+        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", hasher.finish()));
+    tracing::warn!(
+        "{} is too long for callback sockets (over the {}-byte macOS limit); using {} instead \
+         for this run. To use {} directly, point Agent24 at a shorter data directory (e.g. a \
+         shorter $HOME).",
+        root.display(),
+        agent24_os_proto::endpoint::MAX_SOCKET_PATH,
+        fallback.display(),
+        root.display(),
+    );
+    fallback
+}
+
 /// What out-of-process modules are started with: the callback directory under
-/// `root` (stale ones cleared first, FU-56), this binary as the trampoline, and
-/// the daemon's stop grace.
+/// `root` (stale ones cleared first, FU-56; relocated by [`callback_root`] if
+/// `root` itself is too long), this binary as the trampoline, and the
+/// daemon's stop grace.
 fn process_host(
     root: &std::path::Path,
     stop_grace: Duration,
 ) -> Result<crate::domain::ProcessHost, String> {
+    let root = &callback_root(root);
     for gone in agent24_os_proto::endpoint::remove_stale(root) {
         tracing::info!(
             "removed the callback directory of a daemon that is gone: {}",
@@ -1629,10 +1669,15 @@ fn process_host(
     // Checked now, for the longest name a socket there can get, rather than
     // failing every module's start — and then its restarts — one by one: a long
     // `TMPDIR` (an ephemeral daemon's root) can put every socket over the limit.
+    // Should not trigger given `callback_root` above, but kept as a safety net
+    // — e.g. if `/tmp` itself were ever remapped to something long.
     let longest = callback_dir.path().join(format!("{}.sock", u64::MAX));
-    if longest.as_os_str().len() > agent24_os_proto::endpoint::MAX_SOCKET_PATH {
+    let longest_len = longest.as_os_str().len();
+    if longest_len > agent24_os_proto::endpoint::MAX_SOCKET_PATH {
         return Err(format!(
-            "callback sockets under {} would be longer than {} bytes",
+            "callback sockets under {} would be {longest_len} bytes, over the {}-byte macOS \
+             limit — point Agent24 at a shorter data directory (e.g. a shorter $HOME) and \
+             restart",
             callback_dir.path().display(),
             agent24_os_proto::endpoint::MAX_SOCKET_PATH
         ));
