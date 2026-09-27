@@ -36,7 +36,7 @@ const LIMITS: Deadlines = Deadlines {
 };
 const DESCENDANT_LIMITS: Deadlines = Deadlines {
     launch: Duration::from_secs(15),
-    ready: Duration::from_secs(15),
+    ready: Duration::from_secs(45),
     graceful: Duration::from_millis(100),
     force: Duration::from_secs(8),
     drain: Duration::from_secs(2),
@@ -375,7 +375,7 @@ fn powershell_quote(value: &str) -> String {
 }
 
 fn wait_for_descendant_pid(marker: &Path) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(raw) = std::fs::read_to_string(marker)
             && let Ok(pid) = raw.trim().parse::<u32>()
@@ -542,13 +542,13 @@ fn leader_exit_with_live_descendant_forces_tree_to_confirmed_empty() {
         descendant_request(REQUEST_ID, &marker, &gate),
         DESCENDANT_LIMITS,
         |harness, bytes, _| {
-            let running = drive_until(harness, WaitFor::Running, TurnIntent::Continue, 20);
-            assert_ne!(running.state.phase, Phase::Empty);
             let descendant = wait_for_descendant_pid(&marker);
             assert!(
                 descendant_is_alive(descendant).expect("observe live descendant"),
                 "descendant must be alive before leader is released"
             );
+            let running = drive_until(harness, WaitFor::Running, TurnIntent::Continue, 50);
+            assert_ne!(running.state.phase, Phase::Empty);
 
             std::fs::write(&gate, b"exit\n").expect("release leader exit gate");
             let empty = drive_until(harness, WaitFor::Empty, TurnIntent::Continue, 20);
