@@ -304,7 +304,6 @@ mod tests {
         let initial = generation.schedule_state();
         assert!(matches!(initial.phase, Phase::AwaitReady(_)));
         assert!(!initial.owned_acknowledged);
-
         let deadline = Instant::now() + Duration::from_secs(2);
         while !generation.schedule_state().owned_acknowledged {
             let _ = generation.step(Instant::now());
