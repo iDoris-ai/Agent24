@@ -581,14 +581,16 @@ mod windows_tests {
             OwnedLaunch::start(LaunchIntent::from_request(request(&cwd)).expect("intent"))
                 .expect("owned launch");
         let request_id = launch.request_id();
-        let (stdout_pipe, stderr_pipe) = {
+        let (stdout_pipe, stderr_pipe, stdin_preserved) = {
             let (_, pipes) = launch.parts_mut();
-            let _ = pipes.stdin_mut().expect("stdin");
             (
                 pipes.take_stdout().expect("stdout moves once"),
                 pipes.take_stderr().expect("stderr moves once"),
+                pipes.stdin_mut().is_some(),
             )
         };
+        assert!(stdin_preserved, "moving output pipes closed stdin");
+        launch.parts_mut().1.close_stdin();
         let output = read_pair_then_cleanup(
             stdout_pipe,
             stderr_pipe,
