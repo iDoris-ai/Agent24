@@ -54,7 +54,7 @@ jobs:
 
       - name: test
         working-directory: rust
-        run: cargo test --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol
+        run: cargo test --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }}
 
       - name: Windows descendant lifecycle test (isolated)
         if: runner.os == 'Windows'
