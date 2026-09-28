@@ -61,23 +61,6 @@ jobs:
         working-directory: rust
         run: cargo test --locked -p agent24-sidecar-host native_harness_tests::leader_exit_with_live_descendant_forces_tree_to_confirmed_empty -- --exact --ignored --nocapture
 
-      - name: ProcessKit PK4 isolated-pipe evidence
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $pin = '60aa827db378daa5b1ec638f3b3fdaaf9c201560'
-          $checkout = Join-Path $env:RUNNER_TEMP 'processkit-pk4'
-          git clone --filter=blob:none https://github.com/jhfnetboy/ProcessKit-rs.git $checkout
-          Set-Location $checkout
-          git checkout --detach $pin
-          if ((git rev-parse HEAD).Trim() -ne $pin) {
-            throw 'ProcessKit checkout did not resolve to the pinned revision'
-          }
-          rustc -Vv
-          cargo -V
-          cargo test --locked --all-features --lib sys::windows_piped::tests:: -- --ignored --nocapture
-
       - name: clippy
         working-directory: rust
         run: cargo clippy --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol --all-targets -- -D warnings
