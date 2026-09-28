@@ -1891,7 +1891,7 @@ pub(crate) mod tests {
         let error = manager
             .start_run(RunCreate {
                 session_id: None,
-                workspace_id: Some(workspace_id),
+                workspace_id: Some(workspace_id.clone()),
                 prompt: "identity only".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -1902,6 +1902,34 @@ pub(crate) mod tests {
             error,
             AgentError::Store(StoreError::Conflict(message))
                 if message == "explicit workspace runs require atomic admission"
+        ));
+        assert!(store.list_runs(None).await.unwrap().is_empty());
+
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound".into(),
+                title: "bound".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id),
+                created_at: "2026-09-19T00:00:00.000Z".into(),
+                updated_at: "2026-09-19T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        let error = manager
+            .start_run(RunCreate {
+                session_id: Some("bound".into()),
+                workspace_id: None,
+                prompt: "must not downgrade".into(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Store(StoreError::Conflict(message))
+                if message == "workspace-bound sessions require atomic admission"
         ));
         assert!(store.list_runs(None).await.unwrap().is_empty());
     }
