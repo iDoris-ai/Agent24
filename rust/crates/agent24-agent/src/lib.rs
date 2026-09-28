@@ -1882,28 +1882,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn start_run_preserves_explicit_workspace_identity_without_granting_authority() {
+    async fn start_run_fails_closed_until_workspace_admission_is_wired() {
         const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
         let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
         seed_workspace(&store, WORKSPACE_ID).await;
         let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
 
-        let run = manager
+        let error = manager
             .start_run(RunCreate {
                 session_id: None,
-                workspace_id: Some(workspace_id.clone()),
+                workspace_id: Some(workspace_id),
                 prompt: "identity only".into(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             })
             .await
-            .unwrap();
-        assert_eq!(run.workspace_id.as_ref(), Some(&workspace_id));
-        assert_eq!(run.input.workspace_id.as_ref(), Some(&workspace_id));
-
-        let persisted = store.get_run(&run.id).await.unwrap().unwrap();
-        assert_eq!(persisted.workspace_id.as_ref(), Some(&workspace_id));
-        assert_eq!(persisted.input.workspace_id.as_ref(), Some(&workspace_id));
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Store(StoreError::Conflict(message))
+                if message == "explicit workspace runs require atomic admission"
+        ));
+        assert!(store.list_runs(None).await.unwrap().is_empty());
     }
 
     /// Run one prompt in a session and wait for it to reach a terminal state.

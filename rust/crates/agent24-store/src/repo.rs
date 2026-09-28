@@ -28,6 +28,34 @@ pub(crate) fn status_str(s: RunStatus) -> &'static str {
     }
 }
 
+pub(crate) async fn insert_run_tx(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()> {
+    if run.workspace_id != run.input.workspace_id {
+        return Err(StoreError::Conflict(
+            "run workspace identity mismatch".to_owned(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO runs (id, session_id, workspace_id, status, input, output, error, usage,
+                           schedule_id, created_at, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&run.id)
+    .bind(&run.session_id)
+    .bind(run.workspace_id.as_ref().map(|id| id.as_str()))
+    .bind(status_str(run.status))
+    .bind(serde_json::to_string(&run.input)?)
+    .bind(run.output.as_ref().map(serde_json::to_string).transpose()?)
+    .bind(run.error.as_ref().map(serde_json::to_string).transpose()?)
+    .bind(serde_json::to_string(&run.usage)?)
+    .bind(&run.schedule_id)
+    .bind(&run.created_at)
+    .bind(&run.started_at)
+    .bind(&run.ended_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 fn parse_status(s: &str) -> Result<RunStatus> {
     serde_json::from_value(serde_json::Value::String(s.to_owned())).map_err(StoreError::from)
 }
@@ -85,7 +113,7 @@ fn effective(
     (true, None)
 }
 
-fn row_to_run(row: &SqliteRow) -> Result<Run> {
+pub(crate) fn row_to_run(row: &SqliteRow) -> Result<Run> {
     let workspace_id = row
         .get::<Option<String>, _>("workspace_id")
         .map(agent24_protocol::WorkspaceId::parse)
@@ -266,25 +294,14 @@ impl Store {
                 "run workspace identity mismatch".to_owned(),
             ));
         }
-        sqlx::query(
-            "INSERT INTO runs (id, session_id, workspace_id, status, input, output, error, usage,
-                               schedule_id, created_at, started_at, ended_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&run.id)
-        .bind(&run.session_id)
-        .bind(run.workspace_id.as_ref().map(|id| id.as_str()))
-        .bind(status_str(run.status))
-        .bind(serde_json::to_string(&run.input)?)
-        .bind(run.output.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(run.error.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(serde_json::to_string(&run.usage)?)
-        .bind(&run.schedule_id)
-        .bind(&run.created_at)
-        .bind(&run.started_at)
-        .bind(&run.ended_at)
-        .execute(self.pool())
-        .await?;
+        if run.workspace_id.is_some() {
+            return Err(StoreError::Conflict(
+                "explicit workspace runs require atomic admission".to_owned(),
+            ));
+        }
+        let mut tx = self.pool().begin().await?;
+        insert_run_tx(&mut tx, run).await?;
+        tx.commit().await?;
         Ok(())
     }
 
