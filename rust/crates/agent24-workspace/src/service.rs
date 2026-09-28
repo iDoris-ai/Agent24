@@ -296,11 +296,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn delete_recreate_cannot_reuse_persisted_root_identity() {
+        async fn locator_replacement_cannot_reuse_persisted_root_identity() {
             let (_state, service) = fixture(None).await;
             let id = WorkspaceId::parse(ID).unwrap();
             let root = service.roots_path.join(format!("{ID}.{GENERATION}"));
-            std::fs::remove_dir(&root).unwrap();
+            let displaced = service.roots_path.join("displaced-old-root");
+            std::fs::rename(&root, &displaced).unwrap();
             std::fs::create_dir(&root).unwrap();
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(matches!(
