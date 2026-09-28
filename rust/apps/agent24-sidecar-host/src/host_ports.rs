@@ -1,4 +1,4 @@
-//! Dormant host-lifetime control and output ports.
+//! Host-lifetime control and output ports used by the production session.
 
 use std::{
     fmt,
