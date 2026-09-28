@@ -300,8 +300,12 @@ dependencies = [
 name = "agent24-workspace"
 version = "0.1.0"
 dependencies = [
+ "agent24-protocol",
+ "agent24-store",
  "rustix 0.38.44",
+ "sqlx",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

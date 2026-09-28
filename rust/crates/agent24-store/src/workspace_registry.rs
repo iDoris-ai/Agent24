@@ -1,11 +1,11 @@
 use agent24_protocol::{Workspace, WorkspaceId};
 use sqlx::{Sqlite, Transaction};
 
-use crate::{AllocationId, AllocationRecord};
+use crate::{AllocationId, AllocationPhase, AllocationRecord};
 use crate::{
-    LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, WorkspaceInstant,
-    WorkspaceListCursor, WorkspaceListQuery, WorkspacePage, WorkspaceResult, WorkspaceRow,
-    WorkspaceStoreError,
+    LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, WorkspaceInstant, WorkspaceKind,
+    WorkspaceListCursor, WorkspaceListQuery, WorkspacePage, WorkspaceResult, WorkspaceRootSnapshot,
+    WorkspaceRow, WorkspaceStoreError,
 };
 
 const LIST_ALL: &str = "SELECT * FROM workspaces
@@ -219,6 +219,60 @@ impl Store {
         .map_err(|_| WorkspaceStoreError::Database)?
         .ok_or(WorkspaceStoreError::NotFound)?;
         AllocationRecord::decode(&row)
+    }
+
+    /// Read the exact committed allocation/registry evidence needed to reopen a
+    /// service-managed root. This does not establish lifecycle or lease admission.
+    #[doc(hidden)]
+    pub async fn get_workspace_root_snapshot(
+        &self,
+        id: &WorkspaceId,
+    ) -> WorkspaceResult<WorkspaceRootSnapshot> {
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        let workspace = sqlx::query("SELECT * FROM workspaces WHERE id = ? COLLATE BINARY LIMIT 1")
+            .bind(id.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?
+            .ok_or(WorkspaceStoreError::NotFound)
+            .and_then(|row| WorkspaceRow::decode(&row))?;
+        let allocation = sqlx::query(
+            "SELECT * FROM workspace_allocations
+             WHERE workspace_id = ? COLLATE BINARY LIMIT 1",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?
+        .ok_or(WorkspaceStoreError::NotFound)
+        .and_then(|row| AllocationRecord::decode(&row))?;
+
+        if workspace.id != *id
+            || workspace.kind != WorkspaceKind::OrchestratorScratch
+            || allocation.workspace_id() != id
+            || allocation.phase() != AllocationPhase::Committed
+            || allocation.root_generation() != workspace.root.root_generation()
+            || allocation.root_identity() != Some(workspace.root.identity())
+        {
+            return Err(WorkspaceStoreError::CorruptRow {
+                table: "workspace_allocations",
+                field: "root_binding",
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+
+        Ok(WorkspaceRootSnapshot::new(
+            workspace.id,
+            allocation.relative_name().to_owned(),
+            allocation.parent_identity(),
+            workspace.root,
+        ))
     }
 
     /// Read one page directly from the pool without applying lifecycle policy.

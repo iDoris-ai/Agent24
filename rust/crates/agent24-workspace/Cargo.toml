@@ -9,8 +9,14 @@ description = "Workspace service boundary and typed creation specifications"
 [lints]
 workspace = true
 
+[dependencies]
+agent24-protocol = { path = "../agent24-protocol" }
+agent24-store = { path = "../agent24-store" }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "0.38", features = ["fs"] }
 
 [dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
