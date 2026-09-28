@@ -4,8 +4,9 @@ use agent24_sidecar_host_protocol::{
     Event, PROTOCOL_VERSION, Reply, Request, RequestSequence, decode_event, decode_reply,
     encode_request,
 };
+#[cfg(unix)]
+use std::collections::BTreeMap;
 use std::{
-    collections::BTreeMap,
     io::{self, BufRead, BufReader, Read, Write},
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::mpsc,
