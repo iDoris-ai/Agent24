@@ -1,7 +1,7 @@
 //! Safe, independently owned copies of the host process standard streams.
 //!
-//! Acquisition is deliberately dormant: callers must acquire the complete pair
-//! before starting any workers, and `run()` does not use this module.
+//! Callers acquire the complete pair before starting any workers so a partial
+//! bootstrap cannot leave one host stream owned by a detached worker.
 
 use std::{fmt, fs::File, io};
 

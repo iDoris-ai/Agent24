@@ -49,7 +49,7 @@ impl fmt::Display for HostSessionError {
 
 impl std::error::Error for HostSessionError {}
 
-/// Run one dormant session. Native spawn remains synchronous.
+/// Run one host session. Native spawn remains synchronous.
 pub(crate) fn run_session(
     ports: &mut HostPorts,
     launch_budget: Duration,
