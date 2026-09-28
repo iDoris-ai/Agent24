@@ -571,7 +571,7 @@ mod windows_tests {
         std::fs::write(cwd.join("cwd-sentinel"), b"").expect("sentinel");
         std::fs::write(
             cwd.join("launch.ps1"),
-            b"param($first,$second)\n$inherited = if ($env:PATH) {$env:PATH} else {'unset'}\n$cwd=if(Test-Path -LiteralPath 'cwd-sentinel') {'cwd-ok'} else {'cwd-bad'}\n$args=\"$first,$second\"\n$out=('{0,-6}|{1,-9}|{2,-23}|{3,-5}' -f $cwd,$env:SIDE,$args,$inherited)\n[Console]::Out.Write($out)\n[Console]::Out.Flush()\n[Console]::Error.Write('err')\n[Console]::Error.Flush()",
+            b"param($first,$second)\nSet-Content -LiteralPath 'script-started' -Value 'started'\n$inherited = if ($env:PATH) {$env:PATH} else {'unset'}\n$cwd=if(Test-Path -LiteralPath 'cwd-sentinel') {'cwd-ok'} else {'cwd-bad'}\n$args=\"$first,$second\"\n$out=('{0,-6}|{1,-9}|{2,-23}|{3,-5}' -f $cwd,$env:SIDE,$args,$inherited)\n[Console]::Out.Write($out)\n[Console]::Out.Flush()\n[Console]::Error.Write('err')\n[Console]::Error.Flush()",
         )
         .expect("script");
         assert_ne!(cwd, parent_current_dir);
@@ -589,7 +589,7 @@ mod windows_tests {
                 pipes.take_stderr().expect("stderr moves once"),
             )
         };
-        let (stdout, stderr) = read_pair_then_cleanup(
+        let output = read_pair_then_cleanup(
             stdout_pipe,
             stderr_pipe,
             46,
@@ -599,8 +599,15 @@ mod windows_tests {
                 reap(&mut launch);
                 Ok(())
             },
-        )
-        .expect("bounded output read and launch cleanup");
+        );
+        let script_started = cwd.join("script-started").exists();
+        let (stdout, stderr) = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&cwd);
+                panic!("bounded output read and launch cleanup: {error}; script_started={script_started}");
+            }
+        };
         let stdout = String::from_utf8(stdout).expect("stdout UTF-8");
         let stderr = String::from_utf8(stderr).expect("stderr UTF-8");
         let fields: Vec<_> = stdout.split('|').collect();
