@@ -287,7 +287,7 @@ mod tests {
         stdin.write_all(b"hello\n").expect("write stdin");
         drop(stdin);
         let (stdout, stderr) =
-            read_pair_then_cleanup(stdout, stderr, 64, Duration::from_secs(10), || {
+            read_pair_then_cleanup(stdout, stderr, 64, 64, Duration::from_secs(10), || {
                 process.force_kill()
             })
             .expect("bounded pipe roundtrip");

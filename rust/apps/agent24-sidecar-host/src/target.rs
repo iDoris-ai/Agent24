@@ -331,7 +331,7 @@ mod tests {
         drop(stdin);
         let mut soft_stop_observation = None;
         let (stdout, stderr) =
-            read_pair_then_cleanup(stdout, stderr, 9, Duration::from_secs(10), || {
+            read_pair_then_cleanup(stdout, stderr, 9, 9, Duration::from_secs(10), || {
                 target.request_stop(false)?;
                 soft_stop_observation = Some(target.owner.observe_exit()?);
                 target.request_stop(true)

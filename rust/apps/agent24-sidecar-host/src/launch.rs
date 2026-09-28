@@ -537,7 +537,7 @@ mod windows_tests {
                 .replace('\'', "''");
             argv[3] = String::from("-Command");
             argv[4] = format!(
-                "$child = Start-Process '{child_powershell}' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; [Console]::Out.Write('ready'); [Console]::Out.Flush(); [Console]::Error.Write('error'); [Console]::Error.Flush()"
+                "$start = [System.Diagnostics.ProcessStartInfo]::new(); $start.FileName = '{child_powershell}'; $start.Arguments = '-NoLogo -NoProfile -NonInteractive -Command \"[System.Threading.Thread]::Sleep(30000)\"'; $start.UseShellExecute = $false; $child = [System.Diagnostics.Process]::Start($start); [Console]::Out.Write('ready'); [Console]::Out.Flush(); [Console]::Error.Write('error'); [Console]::Error.Flush(); exit 0"
             );
             argv.truncate(5);
             env.remove("SIDE");
@@ -592,7 +592,8 @@ mod windows_tests {
         let (stdout, stderr) = read_pair_then_cleanup(
             stdout_pipe,
             stderr_pipe,
-            4096,
+            46,
+            3,
             Duration::from_secs(5),
             || {
                 reap(&mut launch);
@@ -722,7 +723,7 @@ mod windows_tests {
         let mut leader = None;
         let mut tree = None;
         let (ready, error) =
-            read_pair_then_cleanup(stdout, stderr, 5, Duration::from_secs(10), || {
+            read_pair_then_cleanup(stdout, stderr, 5, 5, Duration::from_secs(10), || {
                 let lifecycle = (|| {
                     let deadline = std::time::Instant::now() + Duration::from_secs(10);
                     let exited = loop {

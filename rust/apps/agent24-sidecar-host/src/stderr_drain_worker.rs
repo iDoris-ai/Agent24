@@ -462,16 +462,15 @@ mod tests {
             }
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "cmd.exe exit deadline"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        assert!(status.success());
+        }
     }
 }

@@ -2225,10 +2225,14 @@ mod tests {
         let first_stop = LaunchControl::stop(&mut launch, false);
         let second_stop = LaunchControl::stop(&mut launch, false);
         let stdin_closed = launch.pipes_mut().stdin_mut().is_none();
-        let output =
-            read_pair_then_cleanup(stdout_pipe, stderr_pipe, 8, Duration::from_secs(3), || {
-                force_and_reap(&mut launch)
-            });
+        let output = read_pair_then_cleanup(
+            stdout_pipe,
+            stderr_pipe,
+            8,
+            8,
+            Duration::from_secs(3),
+            || force_and_reap(&mut launch),
+        );
         first_stop.unwrap();
         second_stop.unwrap();
         assert!(stdin_closed, "soft stop left stdin open");
