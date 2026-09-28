@@ -61,6 +61,20 @@ jobs:
         working-directory: rust
         run: cargo test --locked -p agent24-sidecar-host native_harness_tests::leader_exit_with_live_descendant_forces_tree_to_confirmed_empty -- --exact --ignored --nocapture
 
+      - name: Checkout pinned ProcessKit PK4
+        if: runner.os == 'Windows'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          repository: jhfnetboy/ProcessKit-rs
+          ref: 60aa827db378daa5b1ec638f3b3fdaaf9c201560
+          path: processkit-pk4
+          persist-credentials: false
+
+      - name: ProcessKit PK4 native Windows ignored tests
+        if: runner.os == 'Windows'
+        working-directory: processkit-pk4
+        run: cargo test --locked --all-features --lib "sys::windows_piped::tests::" -- --ignored --nocapture
+
       - name: clippy
         working-directory: rust
         run: cargo clippy --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol --all-targets -- -D warnings
