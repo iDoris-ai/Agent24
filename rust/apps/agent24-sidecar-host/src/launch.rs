@@ -605,7 +605,9 @@ mod windows_tests {
             Ok(output) => output,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&cwd);
-                panic!("bounded output read and launch cleanup: {error}; script_started={script_started}");
+                panic!(
+                    "bounded output read and launch cleanup: {error}; script_started={script_started}"
+                );
             }
         };
         let stdout = String::from_utf8(stdout).expect("stdout UTF-8");
