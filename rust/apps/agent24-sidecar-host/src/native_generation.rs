@@ -1,8 +1,8 @@
 //! Native assembly for one already-owned sidecar generation.
 //!
-//! Production host stdio reaches this seam only after the launch has acquired
-//! one concrete native owner; assembly borrows the host-lifetime workers and
-//! does not create a second lifecycle authority.
+//! Production host stdio reaches this seam through first-launch dispatch.
+//! Assembly receives the already-owned launch and borrowed host-lifetime
+//! workers.
 
 use std::time::Instant;
 
