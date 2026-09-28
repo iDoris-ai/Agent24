@@ -507,6 +507,11 @@ mod windows_tests {
 
     fn request(cwd: &Path) -> Request {
         let system_root = std::env::var("SystemRoot").expect("SystemRoot");
+        let script = cwd
+            .join("launch.ps1")
+            .display()
+            .to_string()
+            .replace('\'', "''");
         Request::Launch {
             version: 1,
             request_id: 17,
@@ -516,10 +521,8 @@ mod windows_tests {
                 String::from("-NoLogo"),
                 String::from("-NoProfile"),
                 String::from("-NonInteractive"),
-                String::from("-File"),
-                cwd.join("launch.ps1").display().to_string(),
-                String::from("ignored-zero"),
-                String::from("argv-value"),
+                String::from("-Command"),
+                format!("& '{script}' 'ignored-zero' 'argv-value'"),
             ],
             env: BTreeMap::from([
                 (String::from("SIDE"), String::from("env-value")),
@@ -590,7 +593,6 @@ mod windows_tests {
             )
         };
         assert!(stdin_preserved, "moving output pipes closed stdin");
-        launch.parts_mut().1.close_stdin();
         let output = read_pair_then_cleanup(
             stdout_pipe,
             stderr_pipe,
