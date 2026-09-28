@@ -299,8 +299,36 @@ impl Store {
                 "explicit workspace runs require atomic admission".to_owned(),
             ));
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let expected_session_workspace = if let Some(session_id) = run.session_id.as_deref() {
+            let row = sqlx::query("SELECT workspace_id FROM sessions WHERE id = ? COLLATE BINARY")
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
+            let workspace_id = row.get::<Option<String>, _>("workspace_id");
+            if workspace_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "workspace-bound sessions require atomic admission".to_owned(),
+                ));
+            }
+            Some(workspace_id)
+        } else {
+            None
+        };
         insert_run_tx(&mut tx, run).await?;
+        if let Some(session_id) = run.session_id.as_deref() {
+            let actual_session_workspace =
+                sqlx::query("SELECT workspace_id FROM sessions WHERE id = ? COLLATE BINARY")
+                    .bind(session_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or_else(|| StoreError::Conflict("run session changed".to_owned()))?
+                    .get::<Option<String>, _>("workspace_id");
+            if Some(actual_session_workspace) != expected_session_workspace {
+                return Err(StoreError::Conflict("run session changed".to_owned()));
+            }
+        }
         tx.commit().await?;
         Ok(())
     }

@@ -1,4 +1,4 @@
-use agent24_protocol::{Run, WorkspaceId};
+use agent24_protocol::{Run, RunStatus, WorkspaceId};
 use sqlx::{Row, Sqlite, Transaction};
 
 use crate::{
@@ -127,6 +127,14 @@ impl Store {
                 field: "workspace_id",
             });
         }
+        if run.status != RunStatus::Queued
+            || run.output.is_some()
+            || run.error.is_some()
+            || run.started_at.is_some()
+            || run.ended_at.is_some()
+        {
+            return Err(WorkspaceStoreError::InvalidValue { field: "run" });
+        }
         if run.created_at != acquired_at.as_str() {
             return Err(WorkspaceStoreError::InvalidValue {
                 field: "acquired_at",
@@ -157,6 +165,12 @@ impl Store {
                 return Err(WorkspaceStoreError::CorruptRow {
                     table: "runs",
                     field: "row",
+                });
+            }
+            if session_scope_tx(&mut tx, run).await? != session {
+                return Err(WorkspaceStoreError::CorruptRow {
+                    table: "sessions",
+                    field: "workspace_id",
                 });
             }
             tx.commit()
@@ -239,6 +253,7 @@ impl Store {
             .await?
             .ok_or(WorkspaceStoreError::NotFound)?;
         let lease = WorkspaceLeaseRow::decode(&lease_row)?;
+        let after_session = session_scope_tx(&mut tx, run).await?;
         let expected_lease = WorkspaceLeaseRecord {
             id: lease_id.clone(),
             workspace_id: workspace_id.clone(),
@@ -253,6 +268,7 @@ impl Store {
             released_at: None,
         };
         if row_to_run(&run_row).map_err(|_| WorkspaceStoreError::Database)? != *run
+            || after_session != session
             || after_workspace != workspace
             || after_allocation != allocation
             || lease.record != expected_lease
@@ -291,7 +307,7 @@ mod tests {
 
     #[tokio::test] async fn atomic_success_and_public_bypass(){let st=Store::open_memory().await.unwrap();let w=seed(&st).await;sess(&st,"s",Some(w.clone())).await;let r=run("r",Some("s"),Some(w));assert!(st.insert_run(&r).await.is_err());assert!(matches!(st.insert_run_with_workspace_admission(&r,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6")),&WorkspaceInstant::parse(TS).unwrap()).await.unwrap(),RunAdmission::Admitted{lease_id:Some(_)}));assert_eq!(counts(&st).await,(1,1));}
 
-    #[tokio::test] async fn binding_legacy_and_clock(){let st=Store::open_memory().await.unwrap();let w=seed(&st).await;sess(&st,"b",Some(w.clone())).await;sess(&st,"u",None).await;let now=WorkspaceInstant::parse(TS).unwrap();for r in [run("a",None,Some(w.clone())),run("b",Some("u"),Some(w.clone())),run("c",Some("b"),None)]{assert_eq!(st.insert_run_with_workspace_admission(&r,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7")),&now).await.unwrap(),RunAdmission::Denied(RunAdmissionDenial::BindingConflict));}let mut old=run("old",Some("b"),Some(w));old.created_at="2026-09-18T23:59:59.000Z".into();assert_eq!(st.insert_run_with_workspace_admission(&old,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7")),&WorkspaceInstant::parse(&old.created_at).unwrap()).await.unwrap(),RunAdmission::Denied(RunAdmissionDenial::WorkspaceUnavailable));let l=run("legacy",None,None);assert!(matches!(st.insert_run_with_workspace_admission(&l,None,&now).await.unwrap(),RunAdmission::Admitted{lease_id:None}));}
+    #[tokio::test] async fn binding_legacy_and_clock(){let st=Store::open_memory().await.unwrap();let w=seed(&st).await;sess(&st,"b",Some(w.clone())).await;sess(&st,"u",None).await;let now=WorkspaceInstant::parse(TS).unwrap();for r in [run("a",None,Some(w.clone())),run("b",Some("u"),Some(w.clone())),run("c",Some("b"),None)]{assert_eq!(st.insert_run_with_workspace_admission(&r,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7")),&now).await.unwrap(),RunAdmission::Denied(RunAdmissionDenial::BindingConflict));}let mut terminal=run("terminal",Some("b"),Some(w.clone()));terminal.status=RunStatus::Completed;assert!(matches!(st.insert_run_with_workspace_admission(&terminal,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7")),&now).await,Err(WorkspaceStoreError::InvalidValue{field:"run"})));let mut old=run("old",Some("b"),Some(w));old.created_at="2026-09-18T23:59:59.000Z".into();assert_eq!(st.insert_run_with_workspace_admission(&old,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7")),&WorkspaceInstant::parse(&old.created_at).unwrap()).await.unwrap(),RunAdmission::Denied(RunAdmissionDenial::WorkspaceUnavailable));let l=run("legacy",None,None);assert!(matches!(st.insert_run_with_workspace_admission(&l,None,&now).await.unwrap(),RunAdmission::Admitted{lease_id:None}));}
 
     #[tokio::test] async fn expiry_and_serial_busy(){let st=Store::open_memory().await.unwrap();let w=seed(&st).await;sess(&st,"s",Some(w.clone())).await;let mut e=run("e",Some("s"),Some(w.clone()));e.created_at=EXP.into();assert_eq!(st.insert_run_with_workspace_admission(&e,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X8")),&WorkspaceInstant::parse(EXP).unwrap()).await.unwrap(),RunAdmission::Denied(RunAdmissionDenial::WorkspaceExpired));assert_eq!(counts(&st).await,(0,0));assert_eq!(st.get_workspace(&w).await.unwrap().state,"expired");let st=Store::open_memory().await.unwrap();let w=seed(&st).await;sess(&st,"s",Some(w.clone())).await;let now=WorkspaceInstant::parse(TS).unwrap();let a=run("a",Some("s"),Some(w.clone()));st.insert_run_with_workspace_admission(&a,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X9")),&now).await.unwrap();let b=run("b",Some("s"),Some(w));assert_eq!(st.insert_run_with_workspace_admission(&b,Some(lid("wl_01J5M4Q2Y7N8P9R0S1T2V3W4XA")),&now).await.unwrap(),RunAdmission::Denied(RunAdmissionDenial::WorkspaceBusy));assert_eq!(counts(&st).await,(1,1));}
 
