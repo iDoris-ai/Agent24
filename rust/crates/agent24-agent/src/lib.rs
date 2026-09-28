@@ -508,9 +508,11 @@ impl RunManager {
         let run = Run {
             id: format!("run_{}", ulid()),
             session_id: create.session_id.clone(),
+            workspace_id: create.workspace_id.clone(),
             status: RunStatus::Queued,
             input: RunInput {
                 prompt: create.prompt,
+                workspace_id: create.workspace_id,
                 model_override: create.model_override,
                 mode: create.mode,
             },
@@ -1847,11 +1849,61 @@ pub(crate) mod tests {
                 id: id.to_owned(),
                 title: "t".to_owned(),
                 channel: "cli".to_owned(),
+                workspace_id: None,
                 created_at: now.clone(),
                 updated_at: now,
             })
             .await
             .unwrap();
+    }
+
+    async fn seed_workspace(store: &Store, id: &str) {
+        let owner = agent24_store::LifecycleOwnerRef::parse("orchestrator-test".into()).unwrap();
+        let input = agent24_store::NewScratchWorkspace::new(
+            agent24_protocol::WorkspaceId::parse(id).unwrap(),
+            agent24_store::TrustedRootRegistration::new(
+                "/test/workspace".into(),
+                "generation-1".into(),
+                agent24_store::RootIdentity::unix(&[1; 8], &[2; 8]).unwrap(),
+            )
+            .unwrap(),
+            agent24_store::WorkspaceProvenanceInput::new("test".into(), None, None).unwrap(),
+            owner.clone(),
+            agent24_store::WorkspaceTtl::new(60_000).unwrap(),
+        );
+        store
+            .create_workspace(
+                &input,
+                &owner,
+                &agent24_store::WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_run_preserves_explicit_workspace_identity_without_granting_authority() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+
+        let run = manager
+            .start_run(RunCreate {
+                session_id: None,
+                workspace_id: Some(workspace_id.clone()),
+                prompt: "identity only".into(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        assert_eq!(run.workspace_id.as_ref(), Some(&workspace_id));
+        assert_eq!(run.input.workspace_id.as_ref(), Some(&workspace_id));
+
+        let persisted = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(persisted.workspace_id.as_ref(), Some(&workspace_id));
+        assert_eq!(persisted.input.workspace_id.as_ref(), Some(&workspace_id));
     }
 
     /// Run one prompt in a session and wait for it to reach a terminal state.
@@ -1864,6 +1916,7 @@ pub(crate) mod tests {
         let run = manager
             .start_run(RunCreate {
                 session_id: Some(session_id.to_owned()),
+                workspace_id: None,
                 prompt: prompt.to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -1928,6 +1981,7 @@ pub(crate) mod tests {
             let run = manager
                 .start_run(RunCreate {
                     session_id: Some("sess_race".to_owned()),
+                    workspace_id: None,
                     prompt: prompt.to_owned(),
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
@@ -2071,6 +2125,7 @@ pub(crate) mod tests {
         let run = manager
             .start_run(RunCreate {
                 session_id: Some("sess_cancel".to_owned()),
+                workspace_id: None,
                 prompt: "hi".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -2143,6 +2198,7 @@ pub(crate) mod tests {
         let run_a = manager
             .start_run(RunCreate {
                 session_id: Some("sess_lockwait".to_owned()),
+                workspace_id: None,
                 prompt: "a".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -2157,6 +2213,7 @@ pub(crate) mod tests {
         let run_b = manager
             .start_run(RunCreate {
                 session_id: Some("sess_lockwait".to_owned()),
+                workspace_id: None,
                 prompt: "b".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -2205,6 +2262,7 @@ pub(crate) mod tests {
     pub(crate) fn create() -> RunCreate {
         RunCreate {
             session_id: None,
+            workspace_id: None,
             prompt: "hi".to_owned(),
             model_override: None,
             mode: agent24_protocol::RunMode::Normal,
@@ -2271,6 +2329,7 @@ pub(crate) mod tests {
         let err = manager
             .start_run(RunCreate {
                 session_id: Some("sess_nope".to_owned()),
+                workspace_id: None,
                 prompt: "hi".to_owned(),
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
@@ -2688,6 +2747,7 @@ mod approval_tests {
     fn create_plan() -> RunCreate {
         RunCreate {
             session_id: None,
+            workspace_id: None,
             prompt: "do the thing".to_owned(),
             model_override: None,
             mode: RunMode::Plan,
@@ -2943,9 +3003,11 @@ mod approval_tests {
         let run = Run {
             id: "run_1".to_owned(),
             session_id: None,
+            workspace_id: None,
             status: RunStatus::AwaitingApproval,
             input: RunInput {
                 prompt: "run echo".to_owned(),
+                workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             },
@@ -3032,9 +3094,11 @@ mod approval_tests {
         let run = Run {
             id: "run_1".to_owned(),
             session_id: None,
+            workspace_id: None,
             status: RunStatus::AwaitingApproval,
             input: RunInput {
                 prompt: "run echo".to_owned(),
+                workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             },
@@ -3109,9 +3173,11 @@ mod approval_tests {
         Run {
             id: id.to_owned(),
             session_id: None,
+            workspace_id: None,
             status,
             input: RunInput {
                 prompt: "go".to_owned(),
+                workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             },

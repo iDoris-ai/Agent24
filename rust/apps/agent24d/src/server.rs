@@ -358,6 +358,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                 } = action;
                 let create = agent24_protocol::RunCreate {
                     session_id: session_id.clone(),
+                    workspace_id: None,
                     prompt: prompt.clone(),
                     model_override: model_override.clone(),
                     // Scheduled runs are unattended — plan mode needs a human
@@ -3451,9 +3452,11 @@ pub(crate) mod tests {
             .insert_run(&agent24_protocol::Run {
                 id: id.to_owned(),
                 session_id: None,
+                workspace_id: None,
                 status: agent24_protocol::RunStatus::Running,
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
+                    workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                 },

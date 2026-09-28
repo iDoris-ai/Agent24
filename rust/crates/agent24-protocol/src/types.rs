@@ -315,6 +315,9 @@ pub struct Session {
     pub title: String,
     /// Open enum: desktop | cli | tui | schedule | wechat | nostr
     pub channel: String,
+    /// Opaque workspace identity when this session is explicitly bound.
+    #[serde(default)]
+    pub workspace_id: Option<crate::WorkspaceId>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -325,6 +328,9 @@ pub struct SessionCreate {
     pub title: String,
     #[serde(default = "default_channel")]
     pub channel: String,
+    /// Omit/null for a legacy-compatible unbound session.
+    #[serde(default)]
+    pub workspace_id: Option<crate::WorkspaceId>,
 }
 
 fn default_channel() -> String {
@@ -364,6 +370,10 @@ pub enum RunMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunInput {
     pub prompt: String,
+    /// Explicit workspace identity copied from the run request. This slice does
+    /// not establish admission or filesystem authority.
+    #[serde(default)]
+    pub workspace_id: Option<crate::WorkspaceId>,
     #[serde(default)]
     pub model_override: Option<String>,
     #[serde(default)]
@@ -380,6 +390,9 @@ pub struct Run {
     pub id: String,
     /// Null for transient runs (e.g. created by /chat)
     pub session_id: Option<String>,
+    /// Opaque workspace identity; filesystem roots stay outside this public type.
+    #[serde(default)]
+    pub workspace_id: Option<crate::WorkspaceId>,
     pub status: RunStatus,
     pub input: RunInput,
     /// Present (non-null) when status=completed
@@ -399,6 +412,9 @@ pub struct RunCreate {
     /// Omit/null to create a transient run
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Omit/null for legacy-compatible runs. Admission is a later slice.
+    #[serde(default)]
+    pub workspace_id: Option<crate::WorkspaceId>,
     pub prompt: String,
     #[serde(default)]
     pub model_override: Option<String>,

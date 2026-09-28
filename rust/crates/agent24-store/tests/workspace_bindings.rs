@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use agent24_protocol::{Run, RunInput, RunMode, RunStatus, Session, Usage, WorkspaceId};
 use agent24_store::{StandingGrant, Store, test_hooks};
 use sha2::{Digest, Sha256};
 use sqlx::migrate::Migrator;
@@ -8,6 +9,17 @@ use std::{path::Path, str::FromStr};
 
 const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
 const TS: &str = "2026-09-19T00:00:00.000Z";
+
+async fn insert_workspace(store: &Store) {
+    sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?, '2026-09-20T00:00:00.000Z',1,'/tmp/ws','g1','unix',?,?)")
+        .bind(WS)
+        .bind(TS)
+        .bind([0u8; 8].as_slice())
+        .bind([1u8; 8].as_slice())
+        .execute(test_hooks::pool(store))
+        .await
+        .unwrap();
+}
 
 fn audit_hash(prev: &str, ts: &str, actor: &str, action: &str, detail: &str) -> String {
     let mut h = Sha256::new();
@@ -142,4 +154,120 @@ async fn upgrade_keeps_legacy_rows_and_adds_nullable_workspace_foreign_keys() {
         .await
         .unwrap();
     store.verify_audit_chain().await.unwrap();
+}
+
+#[tokio::test]
+async fn public_session_and_run_repositories_roundtrip_workspace_identity_and_legacy_nulls() {
+    let store = Store::open_memory().await.unwrap();
+    insert_workspace(&store).await;
+    let workspace_id = WorkspaceId::parse(WS).unwrap();
+
+    let bound_session = Session {
+        id: "sess_bound".into(),
+        title: "bound".into(),
+        channel: "desktop".into(),
+        workspace_id: Some(workspace_id.clone()),
+        created_at: TS.into(),
+        updated_at: TS.into(),
+    };
+    let legacy_session = Session {
+        id: "sess_legacy".into(),
+        title: "legacy".into(),
+        channel: "cli".into(),
+        workspace_id: None,
+        created_at: TS.into(),
+        updated_at: TS.into(),
+    };
+    store.insert_session(&bound_session).await.unwrap();
+    store.insert_session(&legacy_session).await.unwrap();
+    assert_eq!(
+        store.get_session("sess_bound").await.unwrap(),
+        Some(bound_session.clone())
+    );
+    assert!(
+        store
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|session| session == &bound_session)
+    );
+    assert_eq!(
+        store
+            .get_session("sess_legacy")
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace_id,
+        None
+    );
+
+    let bound_run = Run {
+        id: "run_bound".into(),
+        session_id: Some(bound_session.id.clone()),
+        workspace_id: Some(workspace_id.clone()),
+        status: RunStatus::Queued,
+        input: RunInput {
+            prompt: "hello".into(),
+            workspace_id: Some(workspace_id.clone()),
+            model_override: None,
+            mode: RunMode::Normal,
+        },
+        output: None,
+        error: None,
+        usage: Usage::default(),
+        schedule_id: None,
+        created_at: TS.into(),
+        started_at: None,
+        ended_at: None,
+    };
+    store.insert_run(&bound_run).await.unwrap();
+    assert_eq!(
+        store.get_run("run_bound").await.unwrap(),
+        Some(bound_run.clone())
+    );
+    assert!(
+        store
+            .list_runs(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run == &bound_run)
+    );
+
+    let mut mismatched = bound_run.clone();
+    mismatched.id = "run_mismatch".into();
+    mismatched.input.workspace_id = None;
+    assert!(matches!(
+        store.insert_run(&mismatched).await,
+        Err(agent24_store::StoreError::Conflict(_))
+    ));
+
+    let tampered_input = serde_json::to_string(&RunInput {
+        prompt: "tampered".into(),
+        workspace_id: None,
+        model_override: None,
+        mode: RunMode::Normal,
+    })
+    .unwrap();
+    sqlx::query("UPDATE runs SET input = ? WHERE id = 'run_bound'")
+        .bind(tampered_input)
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.get_run("run_bound").await,
+        Err(agent24_store::StoreError::Conflict(_))
+    ));
+
+    let missing = WorkspaceId::parse("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6").unwrap();
+    let missing_session = Session {
+        id: "sess_missing".into(),
+        title: "missing".into(),
+        channel: "desktop".into(),
+        workspace_id: Some(missing),
+        created_at: TS.into(),
+        updated_at: TS.into(),
+    };
+    assert!(store.insert_session(&missing_session).await.is_err());
 }

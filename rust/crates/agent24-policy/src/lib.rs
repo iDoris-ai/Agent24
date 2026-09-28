@@ -980,6 +980,7 @@ mod tests {
                 status: agent24_protocol::RunStatus::Running,
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
+                    workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                 },

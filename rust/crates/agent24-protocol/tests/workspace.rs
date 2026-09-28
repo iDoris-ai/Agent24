@@ -1,6 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use agent24_protocol::{LifecycleOwner, Workspace, WorkspaceId, WorkspaceProvenance};
+use agent24_protocol::{
+    LifecycleOwner, RunCreate, RunInput, RunMode, SessionCreate, Workspace, WorkspaceId,
+    WorkspaceProvenance,
+};
 
 fn valid_workspace() -> Workspace {
     Workspace {
@@ -101,4 +104,75 @@ fn invalid_in_memory_values_cannot_serialize() {
     workspace = valid_workspace();
     workspace.created_at = "not-a-timestamp".into();
     assert!(serde_json::to_value(&workspace).is_err());
+}
+
+#[test]
+fn session_and_run_workspace_identity_is_strict_nullable_and_backward_compatible() {
+    let id = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+
+    let session: SessionCreate = serde_json::from_value(serde_json::json!({
+        "title": "bound",
+        "channel": "desktop",
+        "workspace_id": id
+    }))
+    .unwrap();
+    assert_eq!(
+        session.workspace_id.as_ref().map(WorkspaceId::as_str),
+        Some(id)
+    );
+    assert!(
+        serde_json::from_value::<SessionCreate>(serde_json::json!({
+            "title": "legacy"
+        }))
+        .unwrap()
+        .workspace_id
+        .is_none()
+    );
+    assert!(
+        serde_json::from_value::<SessionCreate>(serde_json::json!({
+            "workspace_id": null
+        }))
+        .unwrap()
+        .workspace_id
+        .is_none()
+    );
+
+    let create: RunCreate = serde_json::from_value(serde_json::json!({
+        "prompt": "hello",
+        "workspace_id": id
+    }))
+    .unwrap();
+    assert_eq!(
+        create.workspace_id.as_ref().map(WorkspaceId::as_str),
+        Some(id)
+    );
+    let input = RunInput {
+        prompt: "hello".into(),
+        workspace_id: create.workspace_id,
+        model_override: None,
+        mode: RunMode::Normal,
+    };
+    let roundtrip: RunInput =
+        serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+    assert_eq!(roundtrip.workspace_id, input.workspace_id);
+
+    for invalid in [
+        "/tmp/workspace",
+        "ws_lowercase",
+        "ws_Z1J5M4Q2Y7N8P9R0S1T2V3W4X5",
+    ] {
+        assert!(
+            serde_json::from_value::<SessionCreate>(serde_json::json!({
+                "workspace_id": invalid
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RunCreate>(serde_json::json!({
+                "prompt": "hello",
+                "workspace_id": invalid
+            }))
+            .is_err()
+        );
+    }
 }
