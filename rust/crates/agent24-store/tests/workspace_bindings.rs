@@ -56,7 +56,19 @@ async fn upgrade_keeps_legacy_rows_and_adds_nullable_workspace_foreign_keys() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO runs (id,session_id,status,input,usage,created_at) VALUES ('r','s','queued','{}','{}',?)").bind(TS).execute(&pool).await.unwrap();
+    sqlx::query(
+        r#"INSERT INTO runs (id,session_id,status,input,usage,created_at)
+         VALUES (
+             'r','s','queued',
+             '{"prompt":"legacy","model_override":null,"mode":"normal"}',
+             '{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}',
+             ?
+         )"#,
+    )
+    .bind(TS)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO approvals (id,run_id,tool_call_id,kind,summary,payload,available_decisions,status,expires_at,created_at) VALUES ('a','r','tc','exec','x','{}','[]','pending',?,?)").bind(TS).bind(TS).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO tool_calls (id,run_id,tool,input,status,started_at) VALUES ('tc','r','x','{}','running',?)").bind(TS).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO standing_grants VALUES ('g','session','s','x','target',?)")
@@ -81,6 +93,10 @@ async fn upgrade_keeps_legacy_rows_and_adds_nullable_workspace_foreign_keys() {
     pool.close().await;
 
     let store = Store::open(&path).await.unwrap();
+    let legacy_run = store.get_run("r").await.unwrap().unwrap();
+    assert_eq!(legacy_run.workspace_id, None);
+    assert_eq!(legacy_run.input.workspace_id, None);
+    assert_eq!(legacy_run.input.prompt, "legacy");
     let pool = test_hooks::pool(&store);
     sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?, '2026-09-20T00:00:00.000Z',1,'/tmp/ws','g1','unix',?,?)")
         .bind(WS).bind(TS).bind([0u8; 8].as_slice()).bind([1u8; 8].as_slice()).execute(pool).await.unwrap();
