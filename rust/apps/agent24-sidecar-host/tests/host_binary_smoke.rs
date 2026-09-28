@@ -105,57 +105,161 @@ fn recv_reply(
     }
 }
 
-fn ready_request(request_id: u64) -> Request {
-    let ready = format!(
-        "{{\"type\":\"ready\",\"protocol\":1,\"port\":4312,\"token\":\"{READY_TOKEN}\",\"version\":\"binary-smoke\"}}"
-    );
-    #[cfg(unix)]
-    let (executable, cwd, argv, env) = (
-        "/bin/sh".to_owned(),
-        "/".to_owned(),
-        vec![
-            "-c".to_owned(),
-            format!(
-                "printf '%s\\n' '{ready}'; trap '' TERM; /bin/cat >/dev/null; exec /bin/sleep 30"
-            ),
-        ],
-        BTreeMap::new(),
-    );
-    #[cfg(windows)]
-    let (executable, cwd, argv, env) = {
+#[cfg(unix)]
+fn script_request(request_id: u64, script: String) -> Request {
+    Request::Launch {
+        version: PROTOCOL_VERSION,
+        request_id,
+        executable: "/bin/sh".to_owned(),
+        cwd: "/".to_owned(),
+        argv: vec!["-c".to_owned(), script],
+        env: BTreeMap::new(),
+    }
+}
+
+#[cfg(windows)]
+fn script_request(request_id: u64, script: String) -> Request {
+    let (executable, env) = {
         let root = std::env::var_os("SystemRoot").expect("SystemRoot");
         let executable = std::path::PathBuf::from(&root)
             .join("System32")
             .join("WindowsPowerShell")
             .join("v1.0")
             .join("powershell.exe");
-        let script = format!(
-            "[Console]::Out.WriteLine('{ready}'); [Console]::Out.Flush(); $null = [Console]::In.ReadToEnd(); [System.Threading.Thread]::Sleep(30000)"
-        );
         let env = ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP", "USERPROFILE"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
             .collect();
-        (
-            executable.to_string_lossy().into_owned(),
-            std::env::temp_dir().to_string_lossy().into_owned(),
-            vec![
-                "-NoLogo".to_owned(),
-                "-NoProfile".to_owned(),
-                "-NonInteractive".to_owned(),
-                "-Command".to_owned(),
-                script,
-            ],
-            env,
-        )
+        (executable, env)
     };
     Request::Launch {
         version: PROTOCOL_VERSION,
         request_id,
-        executable,
-        cwd,
-        argv,
+        executable: executable.to_string_lossy().into_owned(),
+        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        argv: vec![
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script,
+        ],
         env,
+    }
+}
+
+fn ready_frame(version: &str) -> String {
+    format!(
+        "{{\"type\":\"ready\",\"protocol\":1,\"port\":4312,\"token\":\"{READY_TOKEN}\",\"version\":\"{version}\"}}"
+    )
+}
+
+fn ready_request(request_id: u64) -> Request {
+    let ready = ready_frame("binary-smoke");
+    #[cfg(unix)]
+    let script =
+        format!("printf '%s\\n' '{ready}'; trap '' TERM; /bin/cat >/dev/null; exec /bin/sleep 30");
+    #[cfg(windows)]
+    let script = format!(
+        "[Console]::Out.WriteLine('{ready}'); [Console]::Out.Flush(); $null = [Console]::In.ReadToEnd(); [System.Threading.Thread]::Sleep(30000)"
+    );
+    script_request(request_id, script)
+}
+
+fn with_env(mut request: Request, key: &str, value: String) -> Request {
+    let Request::Launch { env, .. } = &mut request else {
+        unreachable!("fixture requests are always Launch");
+    };
+    env.insert(key.to_owned(), value);
+    request
+}
+
+fn read_stderr(child: &mut Child) -> String {
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("host stderr")
+        .read_to_string(&mut stderr)
+        .expect("read host stderr");
+    stderr
+}
+
+fn assert_protocol_only(frames: impl IntoIterator<Item = Vec<u8>>) -> bool {
+    let mut saw_exit = false;
+    for frame in frames {
+        if decode_reply(&frame).is_ok() {
+            continue;
+        }
+        match decode_event(&frame).expect("host output must stay protocol-framed") {
+            Event::Exit { .. } => saw_exit = true,
+            Event::Ready { .. } => {}
+        }
+    }
+    saw_exit
+}
+
+fn unique_marker_dir(label: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "agent24-sidecar-{label}-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).expect("create marker directory");
+    path
+}
+
+fn wait_for_pid(path: &std::path::Path) -> u32 {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(path)
+            && let Ok(pid) = raw.trim().parse()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "descendant pid marker deadline");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    Command::new("/bin/sh")
+        .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+        .status()
+        .expect("probe descendant")
+        .success()
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+    let output = Command::new(
+        std::path::PathBuf::from(root)
+            .join("System32")
+            .join("tasklist.exe"),
+    )
+    .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+    .output()
+    .expect("probe descendant");
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+fn wait_until_gone(pid: u32) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if !process_is_alive(pid) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "descendant {pid} survived host cleanup"
+        );
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -304,4 +408,221 @@ fn owned_precedes_ready_and_force_stop_reaches_confirmed_empty() {
         .expect("read host stderr");
     assert!(status.success(), "host status: {status}; stderr={stderr}");
     assert!(stderr.is_empty(), "successful lifecycle must be silent");
+}
+
+#[test]
+fn active_parent_eof_cleans_generation_before_host_exit() {
+    let markers = unique_marker_dir("binary-parent-eof");
+    let marker = markers.join("leader.pid");
+    let ready = ready_frame("binary-parent-eof");
+    #[cfg(unix)]
+    let script = format!(
+        "printf '%s' \"$$\" > \"$MARKER\"; printf '%s\\n' '{ready}'; trap '' TERM; /bin/cat >/dev/null; exec /bin/sleep 30"
+    );
+    #[cfg(windows)]
+    let script = format!(
+        "[System.IO.File]::WriteAllText($env:MARKER,$PID.ToString()); [Console]::Out.WriteLine('{ready}'); [Console]::Out.Flush(); $null = [Console]::In.ReadToEnd(); [System.Threading.Thread]::Sleep(30000)"
+    );
+    let request = with_env(
+        script_request(11, script),
+        "MARKER",
+        marker.to_string_lossy().into_owned(),
+    );
+    let mut child = spawn_host();
+    let mut stdin = child.stdin.take().expect("host stdin");
+    let stdout = child.stdout.take().expect("host stdout");
+    let (rx, reader) = output_reader(stdout);
+    let deadline = Instant::now() + WAIT;
+    let mut sequence = RequestSequence::new();
+
+    send(&mut stdin, &mut sequence, &request);
+    assert!(matches!(
+        decode_reply(&recv_frame(&rx, deadline)),
+        Ok(Reply::Owned { request_id: 11, .. })
+    ));
+    assert!(matches!(
+        decode_event(&recv_frame(&rx, deadline)),
+        Ok(Event::Ready { .. })
+    ));
+    let target = wait_for_pid(&marker);
+    assert!(
+        process_is_alive(target),
+        "target must be live before parent EOF"
+    );
+
+    drop(stdin);
+    let status = wait_bounded(&mut child);
+    reader.join().expect("stdout reader");
+    let frames: Vec<_> = rx
+        .try_iter()
+        .map(|frame| frame.map_err(io::Error::from).expect("read trailing frame"))
+        .collect();
+    assert_protocol_only(frames);
+    wait_until_gone(target);
+    let stderr = read_stderr(&mut child);
+    let _ = std::fs::remove_dir_all(&markers);
+    assert!(status.success(), "host status: {status}; stderr={stderr}");
+    assert!(stderr.is_empty(), "normal parent EOF must be silent");
+}
+
+#[test]
+fn broken_parent_output_forces_cleanup_without_leaking_launch_data() {
+    const SECRET: &str = "binary-broken-output-secret";
+    let mut child = spawn_host();
+    let mut stdin = child.stdin.take().expect("host stdin");
+    drop(child.stdout.take().expect("host stdout"));
+    let mut sequence = RequestSequence::new();
+    let request = with_env(ready_request(21), "FIXTURE_SECRET", SECRET.to_owned());
+
+    send(&mut stdin, &mut sequence, &request);
+    let status = wait_bounded(&mut child);
+    drop(stdin);
+    let stderr = read_stderr(&mut child);
+    assert!(
+        !status.success(),
+        "broken host output unexpectedly succeeded"
+    );
+    assert!(
+        stderr.contains("generation_failed") || stderr.contains("session_failed"),
+        "static cleanup failure stage missing: {stderr}"
+    );
+    assert!(!stderr.contains(SECRET), "stderr leaked launch data");
+}
+
+#[test]
+fn malformed_and_polluted_ready_fail_closed_without_echoing_child_bytes() {
+    const SECRET: &str = "binary-ready-secret";
+    for (request_id, polluted) in [(31, false), (32, true)] {
+        let ready = ready_frame("binary-adversarial");
+        #[cfg(unix)]
+        let script = if polluted {
+            format!("printf '%s\\n%s\\n' '{ready}' '{SECRET}-pollution'; exec /bin/sleep 30")
+        } else {
+            format!("printf '%s\\n' '{SECRET}-not-json'; exec /bin/sleep 30")
+        };
+        #[cfg(windows)]
+        let script = if polluted {
+            format!(
+                "[Console]::Out.WriteLine('{ready}'); [Console]::Out.WriteLine('{SECRET}-pollution'); [Console]::Out.Flush(); [System.Threading.Thread]::Sleep(30000)"
+            )
+        } else {
+            format!(
+                "[Console]::Out.WriteLine('{SECRET}-not-json'); [Console]::Out.Flush(); [System.Threading.Thread]::Sleep(30000)"
+            )
+        };
+
+        let mut child = spawn_host();
+        let mut stdin = child.stdin.take().expect("host stdin");
+        let stdout = child.stdout.take().expect("host stdout");
+        let (rx, reader) = output_reader(stdout);
+        let deadline = Instant::now() + WAIT;
+        let mut sequence = RequestSequence::new();
+        send(
+            &mut stdin,
+            &mut sequence,
+            &script_request(request_id, script),
+        );
+        assert!(matches!(
+            decode_reply(&recv_frame(&rx, deadline)),
+            Ok(Reply::Owned {
+                request_id: actual,
+                ..
+            }) if actual == request_id
+        ));
+
+        let status = wait_bounded(&mut child);
+        drop(stdin);
+        reader.join().expect("stdout reader");
+        let frames: Vec<_> = rx
+            .try_iter()
+            .map(|frame| frame.map_err(io::Error::from).expect("read trailing frame"))
+            .collect();
+        let rendered = frames
+            .iter()
+            .flat_map(|frame| frame.iter().copied())
+            .collect::<Vec<_>>();
+        assert_protocol_only(frames);
+        let stderr = read_stderr(&mut child);
+        assert!(!status.success(), "invalid Ready unexpectedly succeeded");
+        assert!(
+            stderr.contains("session_failed"),
+            "static generation failure missing: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&rendered).contains(SECRET) && !stderr.contains(SECRET),
+            "invalid child stdout leaked through host diagnostics"
+        );
+    }
+}
+
+fn descendant_request(
+    request_id: u64,
+    marker: &std::path::Path,
+    gate: &std::path::Path,
+) -> Request {
+    let ready = ready_frame("binary-descendant");
+    #[cfg(unix)]
+    let script = format!(
+        "/bin/sleep 30 & descendant=$!; printf '%s' \"$descendant\" > \"$MARKER\"; printf '%s\\n' '{ready}'; while [ ! -f \"$GATE\" ]; do :; done; exit 17"
+    );
+    #[cfg(windows)]
+    let script = format!(
+        "$start = [System.Diagnostics.ProcessStartInfo]::new(); $start.FileName = [System.IO.Path]::Combine($PSHOME,'powershell.exe'); $start.Arguments = '-NoLogo -NoProfile -NonInteractive -Command \"[System.Threading.Thread]::Sleep(30000)\"'; $start.UseShellExecute = $false; $child = [System.Diagnostics.Process]::Start($start); [System.IO.File]::WriteAllText($env:MARKER,$child.Id.ToString()); [Console]::Out.WriteLine('{ready}'); [Console]::Out.Flush(); while (-not [System.IO.File]::Exists($env:GATE)) {{ [System.Threading.Thread]::Sleep(20) }}; exit 17"
+    );
+    let request = script_request(request_id, script);
+    let request = with_env(request, "MARKER", marker.to_string_lossy().into_owned());
+    with_env(request, "GATE", gate.to_string_lossy().into_owned())
+}
+
+#[test]
+fn leader_exit_with_live_descendant_cleans_tree_before_parent_eof() {
+    let markers = unique_marker_dir("binary-descendant");
+    let marker = markers.join("descendant.pid");
+    let gate = markers.join("leader.exit");
+    let mut child = spawn_host();
+    let mut stdin = child.stdin.take().expect("host stdin");
+    let stdout = child.stdout.take().expect("host stdout");
+    let (rx, reader) = output_reader(stdout);
+    let deadline = Instant::now() + WAIT;
+    let mut sequence = RequestSequence::new();
+
+    send(
+        &mut stdin,
+        &mut sequence,
+        &descendant_request(41, &marker, &gate),
+    );
+    assert!(matches!(
+        decode_reply(&recv_frame(&rx, deadline)),
+        Ok(Reply::Owned { request_id: 41, .. })
+    ));
+    assert!(matches!(
+        decode_event(&recv_frame(&rx, deadline)),
+        Ok(Event::Ready {
+            ref version, ..
+        }) if version == "binary-descendant"
+    ));
+    let descendant = wait_for_pid(&marker);
+    assert!(
+        process_is_alive(descendant),
+        "descendant must be live before leader exit"
+    );
+
+    std::fs::write(&gate, b"exit\n").expect("release leader exit gate");
+    let exit = loop {
+        let frame = recv_frame(&rx, deadline);
+        if let Ok(Event::Exit { protocol, code }) = decode_event(&frame) {
+            break (protocol, code);
+        }
+        assert!(decode_reply(&frame).is_ok(), "unexpected host output frame");
+    };
+    assert_eq!(exit, (PROTOCOL_VERSION, Some(17)));
+    wait_until_gone(descendant);
+
+    drop(stdin);
+    let status = wait_bounded(&mut child);
+    reader.join().expect("stdout reader");
+    let stderr = read_stderr(&mut child);
+    let _ = std::fs::remove_dir_all(&markers);
+    assert!(status.success(), "host status: {status}; stderr={stderr}");
+    assert!(stderr.is_empty(), "descendant cleanup must be silent");
 }
