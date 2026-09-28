@@ -507,11 +507,6 @@ mod windows_tests {
 
     fn request(cwd: &Path) -> Request {
         let system_root = std::env::var("SystemRoot").expect("SystemRoot");
-        let script = cwd
-            .join("launch.ps1")
-            .display()
-            .to_string()
-            .replace('\'', "''");
         Request::Launch {
             version: 1,
             request_id: 17,
@@ -521,8 +516,10 @@ mod windows_tests {
                 String::from("-NoLogo"),
                 String::from("-NoProfile"),
                 String::from("-NonInteractive"),
-                String::from("-Command"),
-                format!("& '{script}' 'ignored-zero' 'argv-value'"),
+                String::from("-File"),
+                cwd.join("launch.ps1").display().to_string(),
+                String::from("ignored-zero"),
+                String::from("argv-value"),
             ],
             env: BTreeMap::from([
                 (String::from("SIDE"), String::from("env-value")),
@@ -574,7 +571,7 @@ mod windows_tests {
         std::fs::write(cwd.join("cwd-sentinel"), b"").expect("sentinel");
         std::fs::write(
             cwd.join("launch.ps1"),
-            b"param($first,$second)\n[System.IO.File]::WriteAllText('script-started','started')\n$inherited = if ($env:PATH) {$env:PATH} else {'unset'}\n$cwd=if(Test-Path -LiteralPath 'cwd-sentinel') {'cwd-ok'} else {'cwd-bad'}\n$args=\"$first,$second\"\n$out=('{0,-6}|{1,-9}|{2,-23}|{3,-5}' -f $cwd,$env:SIDE,$args,$inherited)\n[Console]::Out.Write($out)\n[Console]::Out.Flush()\n[Console]::Error.Write('err')\n[Console]::Error.Flush()",
+            b"param($first,$second)\n[System.IO.File]::WriteAllText('script-started','started')\n$inherited = if ($env:PATH) {$env:PATH} else {'unset'}\n$cwd=if([System.IO.File]::Exists('cwd-sentinel')) {'cwd-ok'} else {'cwd-bad'}\n$args=\"$first,$second\"\n$out=('{0,-6}|{1,-9}|{2,-23}|{3,-5}' -f $cwd,$env:SIDE,$args,$inherited)\n[Console]::Out.Write($out)\n[Console]::Out.Flush()\n[Console]::Error.Write('err')\n[Console]::Error.Flush()",
         )
         .expect("script");
         assert_ne!(cwd, parent_current_dir);
