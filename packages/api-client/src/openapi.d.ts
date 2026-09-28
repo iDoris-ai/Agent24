@@ -697,6 +697,12 @@ export interface components {
         ChatResponse: {
             message: components["schemas"]["ChatMessage"];
             usage: components["schemas"]["Usage"];
+            /** @description Provider-reported model id that actually served this call, when the provider reported one; null otherwise. Clients must not guess a name (e.g. the daemon's DEFAULT_MODEL) when this is null. */
+            model_id?: string | null;
+            /** @description Open enum, "local" | "remote"; null when unknown. */
+            tier?: string | null;
+            /** @description Server-measured wall-clock milliseconds for this call. */
+            latency_ms?: number | null;
         };
         Session: {
             id: string;

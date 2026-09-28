@@ -226,6 +226,7 @@ impl RiskAssessor for ModelRiskAssessor {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         };
         // LocalOnly: the tool payload must never leave the device to be judged.
         let profile = TaskProfile {

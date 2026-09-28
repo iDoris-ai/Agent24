@@ -35,6 +35,10 @@
 //!   well-formed JSON-RPC error, and three malformed shapes (`result` not an
 //!   object, neither `result` nor `error`, a non-object `error`) all land on
 //!   `502 module_error`, the well-formed one carrying `rpc_code`.
+//! - [`c5_command_posted_the_instant_handshake_arrives_is_200`] — C1
+//!   (pre-release) regression: a command posted the instant the module has
+//!   its handshake result must never see `503 module_not_ready`, looped over
+//!   many independent attach cycles.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -578,6 +582,102 @@ fn c5_a_registered_but_never_attached_module_is_503() {
     let (status, body) = post_command(&d, "agentear", "speak", &serde_json::json!({}));
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["error"]["code"], "module_not_ready");
+    stop(d);
+}
+
+/// C1 (pre-release) regression: a `POST /api/v1/os/{name}/commands/*` sent
+/// the INSTANT the module has its handshake result must succeed — never a
+/// spurious `503 module_not_ready`. The bug this guards against was a gap
+/// in `agent24d::attach_listener::handle_connection`: the OLD code wrote the
+/// handshake success line directly to the module BEFORE calling
+/// `AttachRegistry::attach_kernel_calls`, so a command landing in that gap
+/// found the registry with no live `KernelCalls` for a generation the module
+/// already believes is attached. Confirmed flaky on `main@77b05cb` and PR
+/// #541's CI (`c5_a_dropped_connection_after_the_frame_was_sent_is_502_connection_lost`
+/// below), and the likely cause of AgentEar's real-machine E2E S6 `speak`
+/// 503 on its first round.
+///
+/// Loops many independent attach cycles against ONE daemon (a fresh module
+/// name each time, so no rotation/generation subtlety is in play) — the
+/// window this closes was narrow enough to be merely "偶发" (occasional) in
+/// CI, not "always", so a single iteration proves little either way.
+/// Confirmed red against the pre-fix ordering (reproduced locally by
+/// widening the gap between the two steps with an explicit delay in a
+/// throwaway build — every iteration then observed `503`); green,
+/// unmodified, against the shipped fix (`KernelCalls::enqueue_raw` called
+/// BEFORE `attach_kernel_calls`, closing the gap structurally rather than by
+/// timing) for every iteration below.
+#[test]
+fn c5_command_posted_the_instant_handshake_arrives_is_200() {
+    let home = tmp_home();
+    let d = start(home.path());
+    let script = write_fake_agentear_script(home.path());
+
+    for i in 0..30 {
+        let name = format!("agentear{i}");
+        let manifest_path = home.path().join(format!("{name}.yml"));
+        let manifest = attach_manifest(&name, &["events"], &["speak"]);
+        std::fs::write(&manifest_path, &manifest).unwrap();
+
+        let reg = register_ok(&d, &manifest);
+        let socket_path = reg["socket_path"].as_str().unwrap().to_owned();
+        let token = reg["token"].as_str().unwrap().to_owned();
+
+        let mut fae = spawn_fake_agentear(
+            &script,
+            &manifest_path,
+            &socket_path,
+            &name,
+            &token,
+            &["events"],
+        );
+        assert!(
+            fae.handshake.get("result").is_some(),
+            "iteration {i}: handshake must succeed: {:?} — daemon stderr:\n{}",
+            fae.handshake,
+            d.recent_stderr()
+        );
+
+        // The instant `fae` (this test's stand-in for the module) has
+        // observed the handshake result, issue the command — no sleep, no
+        // retry, nothing to give a slow scheduler time to paper over the
+        // race this test exists to catch.
+        let port = d.port;
+        let post_token = d.token.clone();
+        let name_for_thread = name.clone();
+        let handle = std::thread::spawn(move || {
+            post(
+                port,
+                &post_token,
+                &format!("/api/v1/os/{name_for_thread}/commands/speak"),
+                &serde_json::json!({"schema": "x"}),
+            )
+        });
+
+        let received = fae.recv_line(10);
+        let line = received["line"].as_str().unwrap_or_else(|| {
+            panic!("iteration {i}: no frame arrived at the module: {received:?}")
+        });
+        let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(frame["method"], "_a24/command/invoke");
+        fae.send_raw(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": frame["id"].clone(),
+            "result": {"accepted": true},
+        }));
+
+        let (status, body) = handle.join().unwrap();
+        assert_eq!(
+            status,
+            200,
+            "iteration {i}: a command posted right after handshake success must not see \
+             503 module_not_ready — {body} — daemon stderr:\n{}",
+            d.recent_stderr()
+        );
+
+        fae.close();
+    }
+
     stop(d);
 }
 

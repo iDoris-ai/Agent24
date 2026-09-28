@@ -283,6 +283,12 @@ impl App {
             // Module events are namespaced to a loadable module (e.g. sin90);
             // the generic CLI TUI has nothing to render for them.
             EventBody::Module(_) => {}
+            // ME4-desktop-model-ui: kernel visibility into one
+            // `_a24/model/complete` call, built for the desktop's "语音"
+            // panel. It carries no `run_id` (module model calls aren't
+            // runs), so — same as `ScheduleDelivered` above — there is
+            // nothing to key a log line on in this generic CLI TUI.
+            EventBody::ModelCall(_) => {}
         }
     }
 

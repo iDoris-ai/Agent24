@@ -68,6 +68,10 @@ const NON_CHAT_MODEL_PATTERNS: RegExp[] = [
   /\bltx\b/i, /cogvideo/i, /hunyuan-?video/i, /\bwan-?2/i,                     // video gen
   /whisper/i, /cosyvoice/i, /\btts\b/i, /xtts/i, /\bvits\b/i, /\bf5-tts\b/i, /\bbark\b/i, // ASR/TTS
   /\bbge\b/i, /\bgte\b/i, /\be5\b/i, /embed/i, /rerank/i,                      // embedding/rerank
+  // FU-89 follow-up: a real demo picked GLM-OCR-bf16 as the "chat" model —
+  // OCR/vision-language models answer with layout/caption text, not
+  // conversation, and must be excluded the same way image-gen models are.
+  /ocr/i, /-vl\b/i, /\bvl-/i, /paddleocr/i, /mage-vl/i,                        // OCR / vision-language
 ]
 
 /** First model id that doesn't look like a known non-chat model, or
@@ -78,6 +82,18 @@ export function pickChatModel(models: string[]): string | undefined {
 
 const NO_CHAT_MODEL_LABEL = '无可用对话模型（仅检测到生图/嵌入等模型）'
 
+/** ME4-desktop-model-ui: `GET /api/v1/models`'s `default_model` field
+ * (`rust/apps/agent24d/src/routes.rs`) — the daemon's own `DEFAULT_MODEL`
+ * (`agent24-models::router::ModelRouter::from_env`), not a client-side guess.
+ * `null`/missing/non-string all mean "the daemon has none to report" —
+ * exported for its unit test. */
+export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): string | null {
+  if (!res.ok) return null
+  const data = res.data as { default_model?: unknown } | null
+  const dm = data?.default_model
+  return typeof dm === 'string' && dm.trim() !== '' ? dm : null
+}
+
 export function App(): JSX.Element {
   const [page, setPage] = useState<Page>('chat')
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
@@ -85,9 +101,21 @@ export function App(): JSX.Element {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
   const [modules, setModules] = useState<ModuleInfo[]>([])
-  const [llmLabel, setLlmLabel] = useState('Detecting…')
+  // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
+  // used when the daemon has no `default_model` to report. The topbar's
+  // actual displayed label is the `llmLabel` derived value below.
+  const [fallbackLlmLabel, setFallbackLlmLabel] = useState('Detecting…')
+  const [daemonDefaultModel, setDaemonDefaultModel] = useState<string | null>(null)
   const [backendPort, setBackendPort] = useState<number | null>(null)
   const initDone = useRef(false)
+
+  // ME4-desktop-model-ui: the daemon's OWN default model always wins over a
+  // client-side guess from a locally-detected oMLX model list — that guess
+  // is what let an OCR/VL model reach the topbar in the first place (see the
+  // NON_CHAT_MODEL_PATTERNS comment above). Falls back to the oMLX-derived
+  // label only when the daemon has none to report (e.g. an older daemon
+  // build, or the router was never built via `from_env`).
+  const llmLabel = daemonDefaultModel ? `${daemonDefaultModel} · Agent24 默认` : fallbackLlmLabel
 
   useEffect(() => {
     if (initDone.current) return
@@ -104,6 +132,15 @@ export function App(): JSX.Element {
             void window.agent24.modulesList().then(setModules)
             // FU-93: show the daemon's real port, not a hardcoded guess.
             void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
+            // ME4-desktop-model-ui: ask the daemon what its OWN default
+            // model is, rather than only ever guessing from a locally
+            // detected oMLX list (see `llmLabel` above).
+            void window.agent24.backendProxy({ method: 'GET', path: '/api/v1/models' })
+              .then((r) => {
+                const dm = extractDaemonDefaultModel(r)
+                if (dm) setDaemonDefaultModel(dm)
+              })
+              .catch(() => { /* fall back to the oMLX-derived label */ })
           }
         })
         .catch(() => setBackendOk(false))
@@ -116,7 +153,7 @@ export function App(): JSX.Element {
       const detected = await window.agent24.omlxDetect()
       if (detected) {
         const chatModel = pickChatModel(detected.models)
-        setLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
+        setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
         return
       }
       // Try to start oMLX
@@ -128,12 +165,12 @@ export function App(): JSX.Element {
           const r = await window.agent24.omlxModels(started.url, 'xiaobao8088')
           if (r.ok && r.models.length > 0) {
             const chatModel = pickChatModel(r.models)
-            setLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
+            setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
             if (chatModel) break
           }
         }
       } else {
-        setLlmLabel('No AI runtime')
+        setFallbackLlmLabel('No AI runtime')
       }
     })()
 
@@ -238,6 +275,9 @@ export function App(): JSX.Element {
           </button>
         </div>
 
+        {/* Review M3: the chat suffix no longer takes a default-model prop —
+            it shows ONLY the server's own reported model_id (chat-latency.ts),
+            never the topbar's daemon-default guess standing in for it. */}
         {page === 'chat'             && <ChatPage />}
         {page === 'workbench'        && <WorkbenchPage />}
         {page === 'runs'             && <RunsPage />}

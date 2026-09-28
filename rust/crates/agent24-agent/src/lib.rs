@@ -211,6 +211,7 @@ impl Summarizer for RouterSummarizer {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         };
         let (_provider, res) = self
             .router
@@ -1004,6 +1005,7 @@ impl RunManager {
                 tools: self.tool_specs_for(plan_mode),
                 response_format: None,
                 max_tokens: None,
+                disable_thinking: false,
             };
             let outcome = tokio::select! {
                 r = self.router.complete(TaskProfile::default(), &request, &cancel) => r,

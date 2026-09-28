@@ -209,16 +209,6 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
         }
     };
 
-    let line = success_line(&claim.accepted);
-    if write_within(&mut writer, &line, deadline).await.is_err() {
-        // The success line did not make it out in time — fail closed, same
-        // rule `agent24_os_proto::endpoint::handshake` documents for A1: a
-        // module that never received the agreed version must not be
-        // admitted, whatever `commit` already installed.
-        registry.release(&claim.module, &generation);
-        return;
-    }
-
     // §5.3: no drain for an attached generation — its own revocation (by
     // `DELETE`, `disable`, a rotation, or `revoke_all` at shutdown) is this
     // connection's only stop signal, ORed with the daemon-wide `stop` this
@@ -234,6 +224,34 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
     };
     let (calls, serve) =
         serve_attached(reader, writer, methods, Limits::default(), connection_stop);
+
+    // C1 (pre-release): the handshake success line is now enqueued through
+    // `calls` (`KernelCalls::enqueue_raw`) INSTEAD OF being written directly
+    // to `writer` here, and — critically — BEFORE `attach_kernel_calls`
+    // installs `calls` into the registry, not after. The old order (write
+    // the success line to the raw connection, THEN install `calls`) left a
+    // window where the module already has its handshake result but
+    // `POST /api/v1/os/{name}/commands/*` still gets a spurious
+    // `503 module_not_ready`, because the registry has no `KernelCalls` for
+    // this generation yet — confirmed flaky on `main@77b05cb` and PR #541's
+    // CI (`a3_3_host_commands_blackbox`'s
+    // `c5_a_dropped_connection_after_the_frame_was_sent_is_502_connection_lost`),
+    // and the likely cause of AgentEar's real-machine E2E S6 `speak` 503 on
+    // its first round. Enqueuing first closes it: nothing else has a handle
+    // on `calls` until the very next line installs it, so `line` cannot help
+    // but be message #1 on `calls`' own outbound queue — see
+    // `KernelCalls::enqueue_raw`'s own doc for the full argument.
+    let line = success_line(&claim.accepted);
+    if calls.enqueue_raw(line).is_err() {
+        // The outbound queue is already gone (or, impossibly for a queue
+        // this fresh, momentarily full) — fail closed, same rule
+        // `agent24_os_proto::endpoint::handshake` documents for A1: a module
+        // that never received the agreed version must not be admitted.
+        // `calls` (and so `serve`'s background tasks) is simply dropped
+        // here, never installed and never awaited.
+        registry.release(&claim.module, &generation);
+        return;
+    }
     // A3-3 (`docs/design/A3-ATTACHED-MODULE.md` §6.2): hand the registry this
     // connection's `KernelCalls` so `POST /api/v1/os/{name}/commands/{command}`
     // (`crate::attach_commands`) can reach it. Strictly after `commit`

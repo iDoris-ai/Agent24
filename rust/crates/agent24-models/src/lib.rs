@@ -106,6 +106,17 @@ pub struct CompletionRequest {
     /// `MODEL_MAX_TOKENS_CEILING`), not this crate's — the adapter forwards
     /// the value verbatim and never clamps it silently.
     pub max_tokens: Option<std::num::NonZeroU32>,
+    /// ME4-S2-thinking: ask the backend to skip a reasoning model's internal
+    /// monologue (Qwen3-style `<think>…</think>`) for THIS request. Forwarded
+    /// verbatim by [`OpenAiCompatProvider`] as the OpenAI-compat
+    /// `chat_template_kwargs: {"enable_thinking": false}` convention
+    /// (confirmed against oMLX's own `mlx_lm.server`/`omlx.server`, which
+    /// reads `chat_template_kwargs` off the request body top level and
+    /// special-cases `enable_thinking`); a provider that doesn't recognise
+    /// the field ignores it, same as any other unknown JSON key. The CALLER
+    /// decides when to set this (`_a24/model/complete`'s handler, gated on
+    /// `complexity: simple`) — this crate has no opinion on complexity.
+    pub disable_thinking: bool,
 }
 
 /// Structured-output request, mirroring the OpenAI `response_format` wire shape
@@ -200,6 +211,15 @@ pub struct OpenAiCompatProvider {
     chat_timeout: Duration,
     /// Full-request budget for cheap calls like /models
     quick_timeout: Duration,
+    /// Review H2: whether THIS provider instance may be sent the
+    /// oMLX/mlx-lm-server-specific `chat_template_kwargs` extension (the
+    /// `enable_thinking: false` convention `disable_thinking` uses) — not
+    /// part of the OpenAI-compatible contract every provider here claims to
+    /// speak, so a hosted/managed OpenAI-compatible endpoint must never see
+    /// it. `false` unless [`Self::supports_chat_template_kwargs`] was
+    /// called — `new` never turns it on itself, and it is NOT derived from
+    /// `tier`: being local does not imply being oMLX.
+    supports_chat_template_kwargs: bool,
 }
 
 /// v3.1 L-3: the settings every provider client shares; `new` and
@@ -230,7 +250,19 @@ impl OpenAiCompatProvider {
             client: base_client_builder().build().unwrap_or_default(),
             chat_timeout: Duration::from_secs(120),
             quick_timeout: Duration::from_secs(5),
+            supports_chat_template_kwargs: false,
         }
+    }
+
+    /// Review H2: opt this SPECIFIC provider instance into the
+    /// oMLX/mlx-lm-server `chat_template_kwargs` extension. Callers must
+    /// only do this for a provider they know is actually oMLX (or an
+    /// mlx-lm-compatible server) — `router.rs::from_env` calls it on the
+    /// `omlx`-named provider only, and only when it judged local (loopback).
+    #[must_use]
+    pub fn supports_chat_template_kwargs(mut self) -> Self {
+        self.supports_chat_template_kwargs = true;
+        self
     }
 
     /// ME4-S2 v3 N1: make "the address judged" and "the address connected
@@ -575,6 +607,16 @@ impl ModelProvider for OpenAiCompatProvider {
         if let Some(n) = req.max_tokens {
             body["max_tokens"] = Value::from(n.get());
         }
+        // ME4-S2-thinking / review H2: same "only when set" rule — an unset
+        // flag, OR a provider that never opted into this oMLX-specific
+        // extension, keeps the body byte-for-byte unchanged. Gating on
+        // `self.supports_chat_template_kwargs` (not `self.tier`) means a
+        // hosted/managed OpenAI-compatible endpoint — even one some future
+        // config mislabels `local` — never receives a field outside the
+        // OpenAI contract it actually speaks.
+        if req.disable_thinking && self.supports_chat_template_kwargs {
+            body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
+        }
         let fut = self
             .authed(
                 self.client
@@ -875,6 +917,7 @@ mod tests {
             tools: vec![],
             response_format: None,
             max_tokens: None,
+            disable_thinking: false,
         }
     }
 
@@ -953,6 +996,95 @@ mod tests {
         assert!(
             second.get("max_tokens").is_none(),
             "absent → not sent (/chat unchanged)"
+        );
+    }
+
+    // ── ME4-S2-thinking: disable_thinking → chat_template_kwargs, gated ──────
+
+    #[tokio::test]
+    async fn disable_thinking_sets_chat_template_kwargs_only_when_true() {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = vec![];
+            for _ in 0..2 {
+                let (mut s, _) = l.accept().await.unwrap();
+                bodies.push(read_request(&mut s).await);
+                let body = r#"{"model":"stub","choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let p = OpenAiCompatProvider::new("omlx", url, None, "local", "Qwen3-8B-4bit")
+            .supports_chat_template_kwargs();
+        let c = CancellationToken::new();
+        let simple = CompletionRequest {
+            disable_thinking: true,
+            ..req()
+        };
+        let complex = CompletionRequest {
+            disable_thinking: false,
+            ..req()
+        };
+        let _ = p.complete(&simple, &c).await.unwrap();
+        let _ = p.complete(&complex, &c).await.unwrap();
+        let bodies = server.await.unwrap();
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(
+            first["chat_template_kwargs"],
+            serde_json::json!({ "enable_thinking": false }),
+            "simple → thinking disabled in the wire body"
+        );
+        assert!(
+            second.get("chat_template_kwargs").is_none(),
+            "complex/unset → key absent, body unchanged from before this feature"
+        );
+    }
+
+    /// Review H2: `chat_template_kwargs` is an oMLX/mlx-lm-server extension,
+    /// not part of the OpenAI-compatible contract every provider here claims
+    /// to speak. A provider that never opted in (a hosted/managed remote
+    /// endpoint, or even a local one that isn't actually oMLX) must NEVER
+    /// receive it, no matter what `disable_thinking` says — this is the
+    /// negative control `disable_thinking_sets_chat_template_kwargs_only_when_true`
+    /// doesn't cover (that test's provider always opts in).
+    #[tokio::test]
+    async fn a_provider_that_never_opted_in_never_sends_chat_template_kwargs_even_with_disable_thinking()
+     {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let body = read_request(&mut s).await;
+            let resp_body = r#"{"model":"stub","choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+            body
+        });
+        // Deliberately NOT `.supports_chat_template_kwargs()` — this is the
+        // default every remote/hosted provider (and Ollama) gets from
+        // `router.rs::from_env`.
+        let p = OpenAiCompatProvider::new("openrouter", url, None, "remote", "gpt-x");
+        let c = CancellationToken::new();
+        let simple = CompletionRequest {
+            disable_thinking: true,
+            ..req()
+        };
+        let _ = p.complete(&simple, &c).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "a provider that never opted in must never see this field, even when disable_thinking is true"
         );
     }
 

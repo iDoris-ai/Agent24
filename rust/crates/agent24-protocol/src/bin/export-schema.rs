@@ -22,6 +22,16 @@ const FORCE_REQUIRED: &[(&str, &[&str])] = &[
     // a frozen submission-time snapshot that deliberately has NO `executed_at`
     // field at all — do not add it here.
     ("ModuleApprovalSubmitted", &["target", "decided_at"]),
+    (
+        "ModelCallPayload",
+        &[
+            "model_id",
+            "tier",
+            "served_by",
+            "prompt_tokens",
+            "completion_tokens",
+        ],
+    ),
 ];
 
 fn main() {

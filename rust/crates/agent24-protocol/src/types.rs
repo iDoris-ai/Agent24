@@ -289,6 +289,22 @@ pub struct ChatRequest {
 pub struct ChatResponse {
     pub message: ChatMessage,
     pub usage: Usage,
+    /// Review M3: the provider-reported model id that actually served this
+    /// call (mirrors `_a24/model/complete`'s own `model_id`, ME4-S2 §4.3) —
+    /// `None` when the provider didn't report one. A client must NOT fall
+    /// back to guessing a name (e.g. the daemon's own `DEFAULT_MODEL`) when
+    /// this is `None` — that would show a model that may not be the one
+    /// that actually answered.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// Open enum: `"local" | "remote"`; `None` when unknown.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Server-measured wall-clock milliseconds for this call (admission to a
+    /// complete reply). The desktop's chat suffix prefers this over its own
+    /// client-side timing when present.
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
 }
 
 // ── Session ──────────────────────────────────────────────────────────────────
