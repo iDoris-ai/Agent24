@@ -316,7 +316,7 @@ pub struct Session {
     /// Open enum: desktop | cli | tui | schedule | wechat | nostr
     pub channel: String,
     /// Opaque workspace identity when this session is explicitly bound.
-    #[serde(default)]
+    #[schemars(required)]
     pub workspace_id: Option<crate::WorkspaceId>,
     pub created_at: String,
     pub updated_at: String,
@@ -372,7 +372,7 @@ pub struct RunInput {
     pub prompt: String,
     /// Explicit workspace identity copied from the run request. This slice does
     /// not establish admission or filesystem authority.
-    #[serde(default)]
+    #[schemars(required)]
     pub workspace_id: Option<crate::WorkspaceId>,
     #[serde(default)]
     pub model_override: Option<String>,
@@ -391,7 +391,7 @@ pub struct Run {
     /// Null for transient runs (e.g. created by /chat)
     pub session_id: Option<String>,
     /// Opaque workspace identity; filesystem roots stay outside this public type.
-    #[serde(default)]
+    #[schemars(required)]
     pub workspace_id: Option<crate::WorkspaceId>,
     pub status: RunStatus,
     pub input: RunInput,

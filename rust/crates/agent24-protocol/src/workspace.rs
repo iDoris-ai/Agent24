@@ -21,7 +21,9 @@ pub enum WorkspaceValidationError {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, JsonSchema)]
 #[schemars(transparent)]
-pub struct WorkspaceId(String);
+pub struct WorkspaceId(
+    #[schemars(regex(pattern = r"^ws_[0-7][0-9ABCDEFGHJKMNPQRSTVWXYZ]{25}$"))] String,
+);
 impl WorkspaceId {
     pub fn parse(value: impl Into<String>) -> Result<Self, WorkspaceValidationError> {
         let value = value.into();

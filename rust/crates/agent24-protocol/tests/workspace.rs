@@ -1,8 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use agent24_protocol::{
-    LifecycleOwner, RunCreate, RunInput, RunMode, SessionCreate, Workspace, WorkspaceId,
-    WorkspaceProvenance,
+    LifecycleOwner, Run, RunCreate, RunInput, RunMode, Session, SessionCreate, Workspace,
+    WorkspaceId, WorkspaceProvenance,
 };
 
 fn valid_workspace() -> Workspace {
@@ -173,6 +173,27 @@ fn session_and_run_workspace_identity_is_strict_nullable_and_backward_compatible
                 "workspace_id": invalid
             }))
             .is_err()
+        );
+    }
+}
+
+#[test]
+fn rust_json_schema_matches_workspace_id_and_response_requiredness() {
+    let id_schema = serde_json::to_value(schemars::schema_for!(WorkspaceId)).unwrap();
+    assert_eq!(
+        id_schema["pattern"],
+        "^ws_[0-7][0-9ABCDEFGHJKMNPQRSTVWXYZ]{25}$"
+    );
+
+    for schema in [
+        serde_json::to_value(schemars::schema_for!(Session)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(RunInput)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(Run)).unwrap(),
+    ] {
+        let required = schema["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|field| field == "workspace_id"),
+            "workspace_id must be required-but-nullable in response schemas: {schema}"
         );
     }
 }
