@@ -574,7 +574,7 @@ mod windows_tests {
         std::fs::write(cwd.join("cwd-sentinel"), b"").expect("sentinel");
         std::fs::write(
             cwd.join("launch.ps1"),
-            b"param($first,$second)\nSet-Content -LiteralPath 'script-started' -Value 'started'\n$inherited = if ($env:PATH) {$env:PATH} else {'unset'}\n$cwd=if(Test-Path -LiteralPath 'cwd-sentinel') {'cwd-ok'} else {'cwd-bad'}\n$args=\"$first,$second\"\n$out=('{0,-6}|{1,-9}|{2,-23}|{3,-5}' -f $cwd,$env:SIDE,$args,$inherited)\n[Console]::Out.Write($out)\n[Console]::Out.Flush()\n[Console]::Error.Write('err')\n[Console]::Error.Flush()",
+            b"param($first,$second)\n[System.IO.File]::WriteAllText('script-started','started')\n$inherited = if ($env:PATH) {$env:PATH} else {'unset'}\n$cwd=if(Test-Path -LiteralPath 'cwd-sentinel') {'cwd-ok'} else {'cwd-bad'}\n$args=\"$first,$second\"\n$out=('{0,-6}|{1,-9}|{2,-23}|{3,-5}' -f $cwd,$env:SIDE,$args,$inherited)\n[Console]::Out.Write($out)\n[Console]::Out.Flush()\n[Console]::Error.Write('err')\n[Console]::Error.Flush()",
         )
         .expect("script");
         assert_ne!(cwd, parent_current_dir);
