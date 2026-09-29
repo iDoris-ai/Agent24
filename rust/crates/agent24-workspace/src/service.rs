@@ -2,9 +2,7 @@
 
 #![allow(dead_code)] // Dormant until the host admission/lease slice wires the service.
 
-use agent24_store::{
-    RunWorkspaceAuthoritySnapshot, Store, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
-};
+use agent24_store::{Store, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError};
 use std::path::Path;
 
 use crate::WorkspaceError;
@@ -17,6 +15,8 @@ use crate::root::{ManagedParent, RootIdentity, WORKSPACE_ROOTS};
 use agent24_protocol::WorkspaceId;
 #[cfg(unix)]
 use agent24_store::RootIdentity as StoreRootIdentity;
+#[cfg(unix)]
+use agent24_store::RunWorkspaceAuthoritySnapshot;
 #[cfg(unix)]
 use std::{fs::File, path::PathBuf};
 
