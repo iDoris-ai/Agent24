@@ -408,7 +408,13 @@ impl RunManager {
         let tool_call_id = tool_call_id.into();
         let lease_id = self.store.active_workspace_run_lease_id(&run.id).await?;
         let Some(_) = run.workspace_id.as_ref() else {
-            debug_assert!(lease_id.is_none());
+            if lease_id.is_some() {
+                return Err(WorkspaceStoreError::CorruptRow {
+                    table: "runs",
+                    field: "workspace_id",
+                }
+                .into());
+            }
             return Ok(ToolContext::legacy(
                 run.id.clone(),
                 run.session_id.clone(),
@@ -2078,7 +2084,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_tool_context_rejects_run_lease_history() {
+    async fn stale_legacy_tool_context_rejects_current_bound_run() {
         const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
         let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
         seed_workspace(&store, WORKSPACE_ID).await;
@@ -2103,6 +2109,16 @@ pub(crate) mod tests {
             ended_at: None,
         };
         store.insert_run(&run).await.unwrap();
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        let mut bound_input = run.input.clone();
+        bound_input.workspace_id = Some(workspace_id.clone());
+        sqlx::query("UPDATE runs SET workspace_id=?, input=? WHERE id=?")
+            .bind(workspace_id.as_str())
+            .bind(serde_json::to_string(&bound_input).unwrap())
+            .bind(&run.id)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,?,?,'run',?)")
             .bind(format!("wl_{}", ulid())).bind(WORKSPACE_ID).bind("generation-1")
             .bind(&run.id).bind(&created_at)
@@ -2111,8 +2127,8 @@ pub(crate) mod tests {
         assert!(matches!(
             manager.tool_context_for(&run, "tc").await,
             Err(AgentError::Workspace(WorkspaceStoreError::CorruptRow {
-                table: "workspace_leases",
-                field: "row"
+                table: "runs",
+                field: "workspace_id"
             }))
         ));
     }
