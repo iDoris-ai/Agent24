@@ -152,11 +152,18 @@ impl Store {
         let rows = sqlx::query(
             "SELECT * FROM runs
              WHERE workspace_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM workspace_leases host
+                   WHERE host.workspace_id=runs.workspace_id COLLATE BINARY
+                     AND host.kind='host' COLLATE BINARY
+                     AND host.released_at IS NULL
+                     AND host.expires_at > ? COLLATE BINARY)
                AND (status IN ('queued','running')
                     OR (status='awaiting_approval' AND id NOT IN
                         (SELECT run_id FROM approvals WHERE status='pending')))
              ORDER BY id COLLATE BINARY",
         )
+        .bind(ended_at.as_str())
         .fetch_all(&mut *tx)
         .await
         .map_err(|_| WorkspaceStoreError::Database)?;
@@ -195,10 +202,17 @@ impl Store {
         let remaining: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM runs
              WHERE workspace_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM workspace_leases host
+                   WHERE host.workspace_id=runs.workspace_id COLLATE BINARY
+                     AND host.kind='host' COLLATE BINARY
+                     AND host.released_at IS NULL
+                     AND host.expires_at > ? COLLATE BINARY)
                AND (status IN ('queued','running')
                     OR (status='awaiting_approval' AND id NOT IN
                         (SELECT run_id FROM approvals WHERE status='pending')))",
         )
+        .bind(ended_at.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| WorkspaceStoreError::Database)?;
@@ -267,5 +281,24 @@ mod tests {
         let input=serde_json::to_string(&RunInput{prompt:"go".into(),workspace_id:Some(WorkspaceId::parse(WS).unwrap()),model_override:None,mode:RunMode::Normal}).unwrap(); let usage=serde_json::to_string(&Usage::default()).unwrap();
         sqlx::query("INSERT INTO runs (id,workspace_id,status,input,usage,created_at) VALUES ('bad',?,'running',?,?,?)").bind(WS).bind(&input).bind(&usage).bind(TS).execute(st.pool()).await.unwrap(); sqlx::query("INSERT INTO approvals (id,run_id,tool_call_id,kind,summary,payload,available_decisions,status,expires_at,created_at) VALUES ('a-bad','bad','t','exec','s','{}','[]','pending','2026-09-19T00:02:00.000Z',?)").bind(TS).execute(st.pool()).await.unwrap();
         assert!(matches!(st.sweep_workspace_orphan_runs(&WorkspaceInstant::parse(END).unwrap()).await,Err(WorkspaceStoreError::CorruptRow{table:"approvals",field:"status"}))); assert_eq!(st.get_run("bad").await.unwrap().unwrap().status,RunStatus::Running); let released:Option<String>=sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE owner_id='bad'").fetch_one(st.pool()).await.unwrap(); assert_eq!(released,None);
+    }
+    #[tokio::test]
+    async fn live_host_lease_spares_workspace_run() {
+        let st = Store::open_memory().await.unwrap();
+        sqlx::raw_sql("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES ('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','orchestrator_scratch','active','test','external','orchestrator','owner','serial','2026-09-19T00:00:00.000Z','2026-09-19T00:01:00.000Z',1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')").execute(st.pool()).await.unwrap();
+        let input = serde_json::to_string(&RunInput { prompt: "go".into(), workspace_id: Some(WorkspaceId::parse(WS).unwrap()), model_override: None, mode: RunMode::Normal }).unwrap();
+        let usage = serde_json::to_string(&Usage::default()).unwrap();
+        sqlx::query("INSERT INTO runs (id,workspace_id,status,input,usage,created_at) VALUES ('live',?,'running',?,?,?)")
+            .bind(WS).bind(&input).bind(&usage).bind(TS).execute(st.pool()).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','live','run',?)")
+            .bind(LEASE).bind(WS).bind(TS).execute(st.pool()).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,daemon_generation,host_instance_id,acquired_at,expires_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7',?,'g1','host-live','host','daemon-live','host-live',?,'2026-09-19T00:00:30.000Z')")
+            .bind(WS).bind(TS).execute(st.pool()).await.unwrap();
+
+        assert_eq!(st.sweep_workspace_orphan_runs(&WorkspaceInstant::parse(END).unwrap()).await.unwrap(), WorkspaceOrphanSweep { released_leases: 0 });
+        assert_eq!(st.get_run("live").await.unwrap().unwrap().status, RunStatus::Running);
+        let released: Option<String> = sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?")
+            .bind(LEASE).fetch_one(st.pool()).await.unwrap();
+        assert_eq!(released, None);
     }
 }
