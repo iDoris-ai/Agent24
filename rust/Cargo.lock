@@ -13,6 +13,7 @@ dependencies = [
  "agent24-protocol",
  "agent24-store",
  "agent24-tools",
+ "agent24-workspace",
  "async-trait",
  "serde_json",
  "sqlx",
@@ -270,6 +271,7 @@ name = "agent24-tools"
 version = "0.3.0"
 dependencies = [
  "agent24-protocol",
+ "agent24-workspace",
  "async-trait",
  "cap-std",
  "reqwest",
@@ -328,6 +330,7 @@ dependencies = [
  "agent24-scheduler",
  "agent24-store",
  "agent24-tools",
+ "agent24-workspace",
  "async-trait",
  "axum",
  "base64 0.22.1",

@@ -737,6 +737,7 @@ mod tests {
             shutdown: crate::server::Shutdown::new(CancellationToken::new()),
             guardian: None,
             memory: None,
+            workspace_service: None,
             mcp_servers: Vec::new(),
             risk_overrides: std::sync::Arc::new(
                 agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
@@ -786,6 +787,7 @@ mod tests {
             shutdown: crate::server::Shutdown::new(CancellationToken::new()),
             guardian: None,
             memory: None,
+            workspace_service: None,
             mcp_servers: Vec::new(),
             risk_overrides: std::sync::Arc::new(
                 agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),
@@ -841,6 +843,7 @@ mod tests {
             shutdown: crate::server::Shutdown::new(CancellationToken::new()),
             guardian: None,
             memory: None,
+            workspace_service: None,
             mcp_servers: Vec::new(),
             risk_overrides: std::sync::Arc::new(
                 agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new()),

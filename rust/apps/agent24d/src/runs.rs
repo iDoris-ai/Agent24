@@ -22,6 +22,13 @@ fn map_agent_error(err: AgentError) -> Response {
         AgentError::Store(err) => map_store_error(err),
         AgentError::Workspace(err) => map_workspace_error(err),
         AgentError::WorkspaceAdmission(denial) => map_workspace_admission_denial(denial),
+        AgentError::WorkspaceService(_) | AgentError::WorkspaceServiceUnavailable => {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "workspace_unavailable",
+                "workspace authority unavailable",
+            )
+        }
     }
 }
 

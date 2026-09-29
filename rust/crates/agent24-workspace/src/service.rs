@@ -4,6 +4,7 @@
 
 use agent24_store::{Store, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::WorkspaceError;
 
@@ -46,6 +47,19 @@ pub struct WorkspaceHandle {
     _private: (),
 }
 
+/// Process-local reference to one run's workspace authority binding.
+///
+/// The reference deliberately stores no path/root material. Callers that need
+/// filesystem authority must ask for a fresh handle, which revalidates the
+/// persisted run/lease/workspace facts instead of treating an old pin as a
+/// permanent capability.
+#[doc(hidden)]
+pub struct WorkspaceRunAuthority {
+    service: Arc<WorkspaceService>,
+    run_id: String,
+    lease_id: WorkspaceLeaseId,
+}
+
 /// Filesystem proof for one registered workspace root.
 ///
 /// This value is crate-private and deliberately is not an admission token or a
@@ -62,7 +76,8 @@ pub(crate) struct ResolvedHostWorkspaceRoot {
 impl WorkspaceService {
     /// Compose the dormant service from a trusted, absolute Agent24 state dir.
     #[cfg(unix)]
-    pub(crate) fn compose(store: Store, state_dir: &Path) -> Result<Self> {
+    #[doc(hidden)]
+    pub fn compose(store: Store, state_dir: &Path) -> Result<Self> {
         if !state_dir.is_absolute() {
             return Err(WorkspaceError::InvalidSpec { field: "state_dir" });
         }
@@ -136,6 +151,22 @@ impl WorkspaceService {
             .await
     }
 
+    /// Bind an immutable run/lease identity only after validating it once.
+    #[doc(hidden)]
+    #[cfg(unix)]
+    pub async fn bind_run_authority(
+        self: &Arc<Self>,
+        run_id: &str,
+        lease_id: &WorkspaceLeaseId,
+    ) -> Result<Arc<WorkspaceRunAuthority>> {
+        let _ = self.open_run_handle(run_id, lease_id).await?;
+        Ok(Arc::new(WorkspaceRunAuthority {
+            service: Arc::clone(self),
+            run_id: run_id.to_owned(),
+            lease_id: lease_id.clone(),
+        }))
+    }
+
     #[cfg(unix)]
     async fn open_run_handle_inner<N, F, Fut>(
         &self,
@@ -204,6 +235,26 @@ impl WorkspaceService {
     #[cfg(not(unix))]
     pub async fn open_run_handle(&self, _: &str, _: &WorkspaceLeaseId) -> Result<WorkspaceHandle> {
         Err(WorkspaceError::UnsupportedPlatform)
+    }
+
+    #[doc(hidden)]
+    #[cfg(not(unix))]
+    pub async fn bind_run_authority(
+        self: &Arc<Self>,
+        _: &str,
+        _: &WorkspaceLeaseId,
+    ) -> Result<Arc<WorkspaceRunAuthority>> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
+}
+
+impl WorkspaceRunAuthority {
+    /// Revalidate the fixed run/lease binding and return a fresh pinned handle.
+    #[doc(hidden)]
+    pub async fn fresh_handle(&self) -> Result<WorkspaceHandle> {
+        self.service
+            .open_run_handle(&self.run_id, &self.lease_id)
+            .await
     }
 }
 
@@ -473,6 +524,22 @@ mod tests {
             let (_state, service) = fixture(None).await;
             let lease = seed_run_authority(&service).await;
             assert!(service.open_run_handle("r", &lease).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn run_authority_revalidates_before_each_fresh_handle() {
+            let (_state, service) = fixture(None).await;
+            let service = Arc::new(service);
+            let lease = seed_run_authority(&service).await;
+            let authority = service.bind_run_authority("r", &lease).await.unwrap();
+            assert!(authority.fresh_handle().await.is_ok());
+
+            query("UPDATE workspace_leases SET released_at=? WHERE owner_id='r'")
+                .bind(store_now().unwrap().as_str())
+                .execute(test_hooks::pool(&service.store))
+                .await
+                .unwrap();
+            assert!(authority.fresh_handle().await.is_err());
         }
 
         #[tokio::test]

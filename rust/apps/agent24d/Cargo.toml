@@ -22,6 +22,7 @@ async-trait = "0.1"
 base64 = "0.22"
 agent24-store = { path = "../../crates/agent24-store" }
 agent24-tools = { path = "../../crates/agent24-tools" }
+agent24-workspace = { path = "../../crates/agent24-workspace" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }

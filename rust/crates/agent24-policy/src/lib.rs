@@ -846,10 +846,10 @@ impl ApprovalGate for BrokerGate {
             .broker
             .request(
                 ApprovalRequest {
-                    run_id: &ctx.run_id,
-                    session_id: ctx.session_id.as_deref(),
-                    schedule_id: ctx.schedule_id.as_deref(),
-                    tool_call_id: &ctx.tool_call_id,
+                    run_id: ctx.run_id(),
+                    session_id: ctx.session_id(),
+                    schedule_id: ctx.schedule_id(),
+                    tool_call_id: ctx.tool_call_id(),
                     tool: &info.name,
                     kind,
                     // `info` is the EFFECTIVE ToolInfo the registry built, so
@@ -977,6 +977,7 @@ mod tests {
             .insert_run(&agent24_protocol::Run {
                 id: id.to_owned(),
                 session_id: None,
+                workspace_id: None,
                 status: agent24_protocol::RunStatus::Running,
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
