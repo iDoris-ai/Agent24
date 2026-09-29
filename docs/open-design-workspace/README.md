@@ -9,7 +9,8 @@
 - 已包含当前 `origin/main@32072b02a3c7`；当前 integration 相对 main 只有 Open Design 历史增量，没有漏同步的 main commit。
 - 当前有效 A24-OD-02 栈：**#555 → #556 → #558 → #559 → #560 → #561 → #562**；#557 为独立文档台账。
 - 状态：**P0 / P1 已完成；A24-OD-00 authority 基础已进入主线；P2 workspace contract 正在完成 run admission、terminal lease release 与 restart orphan reconciliation，仍未激活 Creative/ACP/runtime。**
-- 最新执行台账：[PROGRESS-2026-09-28.md](PROGRESS-2026-09-28.md)
+- 最新 Prototype-First 执行台账：[PROGRESS-2026-09-29.md](PROGRESS-2026-09-29.md)
+- 前一日 workspace authority 台账：[PROGRESS-2026-09-28.md](PROGRESS-2026-09-28.md)
 - 历史与长期门禁：[STATUS.md](STATUS.md)
 
 ## 文档
