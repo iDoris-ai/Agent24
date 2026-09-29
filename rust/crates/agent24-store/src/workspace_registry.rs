@@ -1,11 +1,11 @@
 use agent24_protocol::{Workspace, WorkspaceId};
 use sqlx::{Sqlite, Transaction};
 
-use crate::{AllocationId, AllocationRecord};
+use crate::{AllocationId, AllocationPhase, AllocationRecord};
 use crate::{
-    LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, WorkspaceInstant,
-    WorkspaceListCursor, WorkspaceListQuery, WorkspacePage, WorkspaceResult, WorkspaceRow,
-    WorkspaceStoreError,
+    LifecycleOwnerRef, NewScratchWorkspace, RootIdentity, Store, WorkspaceInstant, WorkspaceKind,
+    WorkspaceListCursor, WorkspaceListQuery, WorkspacePage, WorkspaceResult, WorkspaceRootSnapshot,
+    WorkspaceRow, WorkspaceStoreError,
 };
 
 const LIST_ALL: &str = "SELECT * FROM workspaces
@@ -221,6 +221,60 @@ impl Store {
         AllocationRecord::decode(&row)
     }
 
+    /// Read the exact committed allocation/registry evidence needed to reopen a
+    /// service-managed root. This does not establish lifecycle or lease admission.
+    #[doc(hidden)]
+    pub async fn get_workspace_root_snapshot(
+        &self,
+        id: &WorkspaceId,
+    ) -> WorkspaceResult<WorkspaceRootSnapshot> {
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+        let workspace = sqlx::query("SELECT * FROM workspaces WHERE id = ? COLLATE BINARY LIMIT 1")
+            .bind(id.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?
+            .ok_or(WorkspaceStoreError::NotFound)
+            .and_then(|row| WorkspaceRow::decode(&row))?;
+        let allocation = sqlx::query(
+            "SELECT * FROM workspace_allocations
+             WHERE workspace_id = ? COLLATE BINARY LIMIT 1",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| WorkspaceStoreError::Database)?
+        .ok_or(WorkspaceStoreError::NotFound)
+        .and_then(|row| AllocationRecord::decode(&row))?;
+
+        if workspace.id != *id
+            || workspace.kind != WorkspaceKind::OrchestratorScratch
+            || allocation.workspace_id() != id
+            || allocation.phase() != AllocationPhase::Committed
+            || allocation.root_generation() != workspace.root.root_generation()
+            || allocation.root_identity() != Some(workspace.root.identity())
+        {
+            return Err(WorkspaceStoreError::CorruptRow {
+                table: "workspace_allocations",
+                field: "root_binding",
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|_| WorkspaceStoreError::Database)?;
+
+        Ok(WorkspaceRootSnapshot::new(
+            workspace.id,
+            allocation.relative_name().to_owned(),
+            allocation.parent_identity(),
+            workspace.root,
+        ))
+    }
+
     /// Read one page directly from the pool without applying lifecycle policy.
     pub async fn list_workspaces(
         &self,
@@ -353,5 +407,37 @@ impl Store {
             .await
             .map_err(|_| WorkspaceStoreError::Database)?;
         Ok(workspace)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::test_hooks;
+
+    #[tokio::test]
+    async fn root_snapshot_rejects_registry_allocation_binding_drift() {
+        const ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let store = Store::open_memory().await.unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial','2026-09-19T00:00:00.000Z','2026-09-19T00:01:00.000Z',1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(ID)
+            .execute(test_hooks::pool(&store))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g2','root','unix',X'0303030303030303',X'0404040404040404','unix',X'0101010101010101',X'0202020202020202','committed','2026-09-19T00:00:00.000Z')")
+            .bind(ID)
+            .execute(test_hooks::pool(&store))
+            .await
+            .unwrap();
+
+        let id = WorkspaceId::parse(ID).unwrap();
+        assert_eq!(
+            store.get_workspace_root_snapshot(&id).await,
+            Err(WorkspaceStoreError::CorruptRow {
+                table: "workspace_allocations",
+                field: "root_binding",
+            })
+        );
     }
 }

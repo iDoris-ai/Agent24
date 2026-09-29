@@ -50,7 +50,8 @@ pub use workspaces::{
     HostLeaseTtl, LeaseKind, LifecycleOwnerRef, NewScratchWorkspace, RootIdentity,
     TrustedRootRegistration, WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceConflict,
     WorkspaceInstant, WorkspaceKind, WorkspaceLeaseId, WorkspaceLeaseRecord,
-    WorkspaceProvenanceInput, WorkspaceResult, WorkspaceState, WorkspaceStoreError, WorkspaceTtl,
+    WorkspaceProvenanceInput, WorkspaceResult, WorkspaceRootSnapshot, WorkspaceState,
+    WorkspaceStoreError, WorkspaceTtl,
 };
 
 pub use allocation_intent::AllocationIntent;

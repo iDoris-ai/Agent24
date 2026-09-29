@@ -373,6 +373,51 @@ impl NewScratchWorkspace {
     }
 }
 
+/// Trusted persistence evidence for reopening one service-managed workspace root.
+///
+/// This is an internal Rust composition surface, not a protocol model or an
+/// admission result. Callers must still apply lifecycle/lease policy before use.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRootSnapshot {
+    workspace_id: WorkspaceId,
+    relative_name: String,
+    parent_identity: RootIdentity,
+    root: TrustedRootRegistration,
+}
+
+impl WorkspaceRootSnapshot {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        relative_name: String,
+        parent_identity: RootIdentity,
+        root: TrustedRootRegistration,
+    ) -> Self {
+        Self {
+            workspace_id,
+            relative_name,
+            parent_identity,
+            root,
+        }
+    }
+
+    pub fn workspace_id(&self) -> &WorkspaceId {
+        &self.workspace_id
+    }
+
+    pub fn relative_name(&self) -> &str {
+        &self.relative_name
+    }
+
+    pub fn parent_identity(&self) -> RootIdentity {
+        self.parent_identity
+    }
+
+    pub fn root(&self) -> &TrustedRootRegistration {
+        &self.root
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceAuthority {
     pub(crate) provenance_source: String,

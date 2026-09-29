@@ -10,7 +10,7 @@ use rustix::fs::{self, FileType, Mode, OFlags};
 
 // `state_dir` is caller-trusted; same-UID concurrent mutation is out of scope.
 // POSIX mkdirat→openat is intentionally not atomic create-and-pin in this slice.
-const WORKSPACE_ROOTS: &str = "workspace-roots";
+pub(crate) const WORKSPACE_ROOTS: &str = "workspace-roots";
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
