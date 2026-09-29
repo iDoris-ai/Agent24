@@ -3250,6 +3250,82 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn attached_routes_are_host_only_in_capability_mode() {
+        let (state, host, creative) = capability_state().await;
+        let router = Router::new()
+            .fallback(|| async { StatusCode::NO_CONTENT })
+            .layer(middleware::from_fn_with_state(state, auth));
+
+        for (method, path) in [
+            (Method::GET, "/api/v1/attached"),
+            (Method::POST, "/api/v1/attached"),
+            (Method::PATCH, "/api/v1/attached/agentear"),
+            (Method::DELETE, "/api/v1/attached/agentear"),
+        ] {
+            let unauthenticated = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                unauthenticated.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+            assert_eq!(
+                body_json(unauthenticated).await["error"]["code"],
+                "unauthorized"
+            );
+
+            let creative_denied = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {creative}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                creative_denied.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
+            assert_eq!(
+                body_json(creative_denied).await["error"]["code"],
+                "forbidden"
+            );
+
+            let host_allowed = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                host_allowed.status(),
+                StatusCode::NO_CONTENT,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn host_can_mint_and_idempotently_revoke_creative_authority() {
         let (state, host, existing_creative) = capability_state().await;
         let router = build_router(state);
