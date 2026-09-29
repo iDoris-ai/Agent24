@@ -16,27 +16,136 @@ pub use local::{FsReadTool, FsWriteTool, ShellExecTool};
 pub use net::HttpFetchTool;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_protocol::{RiskClass, ToolInfo};
+use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 /// Per-call execution context.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
-    pub run_id: String,
+    run_id: String,
     /// The session the run belongs to (scopes approve_for_session grants)
-    pub session_id: Option<String>,
+    session_id: Option<String>,
     /// The schedule that fired this run, when one did. A standing grant minted
     /// here belongs to the SCHEDULE rather than the session (H4): an unattended
     /// automation is the thing the user was consenting to, so revoking or
     /// deleting that automation must take its grants with it.
-    pub schedule_id: Option<String>,
+    schedule_id: Option<String>,
     /// The persisted tool-call row this execution belongs to
-    pub tool_call_id: String,
+    tool_call_id: String,
+    workspace: WorkspaceAuthority,
+}
+
+#[derive(Clone)]
+enum WorkspaceAuthority {
+    Legacy,
+    Bound(Arc<WorkspaceRunAuthority>),
+}
+
+impl ToolContext {
+    #[must_use]
+    pub fn legacy(
+        run_id: impl Into<String>,
+        session_id: Option<String>,
+        schedule_id: Option<String>,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            session_id,
+            schedule_id,
+            tool_call_id: tool_call_id.into(),
+            workspace: WorkspaceAuthority::Legacy,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn workspace_bound(
+        run_id: impl Into<String>,
+        session_id: Option<String>,
+        schedule_id: Option<String>,
+        tool_call_id: impl Into<String>,
+        authority: Arc<WorkspaceRunAuthority>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            session_id,
+            schedule_id,
+            tool_call_id: tool_call_id.into(),
+            workspace: WorkspaceAuthority::Bound(authority),
+        }
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn schedule_id(&self) -> Option<&str> {
+        self.schedule_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn workspace_authority(&self) -> Option<&Arc<WorkspaceRunAuthority>> {
+        match &self.workspace {
+            WorkspaceAuthority::Legacy => None,
+            WorkspaceAuthority::Bound(authority) => Some(authority),
+        }
+    }
+
+    /// Derive a child call context while preserving workspace authority.
+    #[must_use]
+    pub fn derived(
+        &self,
+        session_id: Option<String>,
+        schedule_id: Option<String>,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: self.run_id.clone(),
+            session_id,
+            schedule_id,
+            tool_call_id: tool_call_id.into(),
+            workspace: self.workspace.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("run_id", &self.run_id)
+            .field("session_id", &self.session_id)
+            .field("schedule_id", &self.schedule_id)
+            .field("tool_call_id", &self.tool_call_id)
+            .field(
+                "workspace",
+                &match self.workspace {
+                    WorkspaceAuthority::Legacy => "legacy",
+                    WorkspaceAuthority::Bound(_) => "bound",
+                },
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -573,12 +682,7 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        ToolContext {
-            run_id: "run_test".to_owned(),
-            session_id: None,
-            schedule_id: None,
-            tool_call_id: "tc_test".to_owned(),
-        }
+        ToolContext::legacy("run_test", None, None, "tc_test")
     }
 
     #[tokio::test]

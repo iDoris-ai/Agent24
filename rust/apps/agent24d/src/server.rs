@@ -505,6 +505,7 @@ pub struct AppDeps {
     pub shutdown: Shutdown,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
+    pub workspace_service: Option<StdArc<agent24_workspace::WorkspaceService>>,
     pub mcp_servers: Vec<Arc<agent24_mcp::McpServer>>,
     /// Pre-loaded user overrides (H2). Injected rather than loaded here so
     /// tests can wire an empty or hand-built set.
@@ -530,6 +531,7 @@ impl AppState {
             shutdown,
             guardian,
             memory,
+            workspace_service,
             mcp_servers,
             risk_overrides,
             packages_root,
@@ -570,13 +572,14 @@ impl AppState {
                     &broker,
                 )))),
         );
-        let runs = agent24_agent::RunManager::with_memory(
+        let runs = agent24_agent::RunManager::with_memory_and_workspace(
             store.clone(),
             Arc::clone(&router),
             Arc::clone(&tools),
             StdArc::new(events.clone()),
             shutdown.token().clone(),
             memory,
+            workspace_service,
         );
         let sched_hub = events.clone();
         let deliverer = StdArc::new(crate::scheduler_deliver::ModuleDeliverer::new(
@@ -1424,6 +1427,17 @@ pub async fn serve(
     let state_dir = agent24_protocol::state_file::state_dir()
         .ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
+    #[cfg(unix)]
+    let workspace_service = if ephemeral {
+        None
+    } else {
+        Some(StdArc::new(
+            agent24_workspace::WorkspaceService::compose(store.clone(), &state_dir)
+                .map_err(std::io::Error::other)?,
+        ))
+    };
+    #[cfg(not(unix))]
+    let workspace_service = None;
     let mut state = AppState::new(AppDeps {
         token: token.clone(),
         router,
@@ -1433,6 +1447,7 @@ pub async fn serve(
         shutdown: shutdown.clone(),
         guardian,
         memory,
+        workspace_service,
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
@@ -2771,6 +2786,7 @@ pub(crate) mod tests {
             shutdown: Shutdown::new(CancellationToken::new()),
             guardian,
             memory: None,
+            workspace_service: None,
             mcp_servers: Vec::new(),
             risk_overrides: StdArc::new(agent24_policy::overrides::RiskOverrideStore::from_rows(
                 Vec::new(),

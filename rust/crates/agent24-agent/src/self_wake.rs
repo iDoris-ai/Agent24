@@ -210,7 +210,7 @@ impl Tool for SelfWakeTool {
                 prompt,
                 // Deliver into THIS session so the woken run continues the
                 // conversation (its prior context is reloaded on run).
-                session_id: ctx.session_id.clone(),
+                session_id: ctx.session_id().map(str::to_owned),
                 model_override: None,
             }),
             delivery: vec![],
@@ -245,12 +245,7 @@ mod tests {
     use agent24_store::ModuleScheduleDesired;
 
     fn ctx(session: Option<&str>) -> ToolContext {
-        ToolContext {
-            run_id: "run_1".to_owned(),
-            session_id: session.map(str::to_owned),
-            schedule_id: None,
-            tool_call_id: "tc_1".to_owned(),
-        }
+        ToolContext::legacy("run_1", session.map(str::to_owned), None, "tc_1")
     }
 
     async fn tool() -> (SelfWakeTool, Store) {

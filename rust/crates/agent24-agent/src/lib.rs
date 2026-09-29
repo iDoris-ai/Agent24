@@ -39,6 +39,7 @@ use agent24_store::{
 use agent24_tools::{
     GateDecision, ToolContext, ToolError, ToolRegistry, summarize_input, truncate,
 };
+use agent24_workspace::WorkspaceService;
 use tokio_util::sync::CancellationToken;
 
 /// Completion→tools round trips per run before the run is failed. A model
@@ -237,6 +238,10 @@ pub enum AgentError {
     Workspace(#[from] WorkspaceStoreError),
     #[error("workspace run admission denied: {0:?}")]
     WorkspaceAdmission(RunAdmissionDenial),
+    #[error(transparent)]
+    WorkspaceService(#[from] agent24_workspace::WorkspaceError),
+    #[error("workspace authority service unavailable")]
+    WorkspaceServiceUnavailable,
     #[error("session not found: {0}")]
     SessionNotFound(String),
 }
@@ -315,6 +320,7 @@ pub struct RunManager {
     store: Store,
     router: Arc<ModelRouter>,
     tools: Arc<ToolRegistry>,
+    workspace: Option<Arc<WorkspaceService>>,
     sink: Arc<dyn EventSink>,
     /// Optional per-session conversation memory (D1). `None` = runs start from
     /// the bare prompt, exactly as before.
@@ -357,7 +363,7 @@ impl RunManager {
         sink: Arc<dyn EventSink>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
-        Self::with_memory(store, router, tools, sink, shutdown, None)
+        Self::with_memory_and_workspace(store, router, tools, sink, shutdown, None, None)
     }
 
     /// Build with optional per-session conversation memory (D1).
@@ -369,15 +375,69 @@ impl RunManager {
         shutdown: CancellationToken,
         memory: Option<SessionMemory>,
     ) -> Arc<Self> {
+        Self::with_memory_and_workspace(store, router, tools, sink, shutdown, memory, None)
+    }
+
+    /// Build with optional session memory and workspace authority service.
+    pub fn with_memory_and_workspace(
+        store: Store,
+        router: Arc<ModelRouter>,
+        tools: Arc<ToolRegistry>,
+        sink: Arc<dyn EventSink>,
+        shutdown: CancellationToken,
+        memory: Option<SessionMemory>,
+        workspace: Option<Arc<WorkspaceService>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             router,
             tools,
+            workspace,
             sink,
             memory,
             shutdown,
             cancels: Mutex::new(HashMap::new()),
         })
+    }
+
+    async fn tool_context_for(
+        &self,
+        run: &Run,
+        tool_call_id: impl Into<String>,
+    ) -> Result<ToolContext, AgentError> {
+        let tool_call_id = tool_call_id.into();
+        let lease_id = self.store.active_workspace_run_lease_id(&run.id).await?;
+        let Some(_) = run.workspace_id.as_ref() else {
+            if lease_id.is_some() {
+                return Err(WorkspaceStoreError::CorruptRow {
+                    table: "runs",
+                    field: "workspace_id",
+                }
+                .into());
+            }
+            return Ok(ToolContext::legacy(
+                run.id.clone(),
+                run.session_id.clone(),
+                run.schedule_id.clone(),
+                tool_call_id,
+            ));
+        };
+        let lease_id = lease_id.ok_or(WorkspaceStoreError::CorruptRow {
+            table: "workspace_leases",
+            field: "row",
+        })?;
+        let service = self
+            .workspace
+            .as_ref()
+            .ok_or(AgentError::WorkspaceServiceUnavailable)?;
+        let authority = service.bind_run_authority(&run.id, &lease_id).await?;
+        Ok(ToolContext::workspace_bound(
+            run.id.clone(),
+            run.session_id.clone(),
+            run.schedule_id.clone(),
+            tool_call_id,
+            authority,
+        ))
     }
 
     /// Create a run (202 semantics: persisted queued, executed in background).
@@ -871,16 +931,7 @@ impl RunManager {
                     }
                 }
             } else {
-                match self
-                    .run_tool_call(
-                        &run_id,
-                        run.session_id.as_deref(),
-                        run.schedule_id.as_deref(),
-                        &call,
-                        &cancel,
-                    )
-                    .await
-                {
+                match self.run_tool_call(&run, &call, &cancel).await {
                     Ok(content) => content,
                     Err(()) => {
                         self.finish_cancelled(&run_id).await;
@@ -925,11 +976,13 @@ impl RunManager {
         });
         match decision.kind.as_str() {
             "approve" | "approve_for_session" | "approve_for_target" => {
-                let ctx = ToolContext {
-                    run_id: run.id.clone(),
-                    session_id: run.session_id.clone(),
-                    schedule_id: run.schedule_id.clone(),
-                    tool_call_id: call.id.clone(),
+                let ctx = match self.tool_context_for(run, call.id.clone()).await {
+                    Ok(ctx) => ctx,
+                    Err(err) => {
+                        return Ok(format!(
+                            "tool error: workspace authority unavailable: {err}"
+                        ));
+                    }
                 };
                 // Run EXACTLY what was approved — the payload the human signed
                 // off (assess_restore already proved it equals the thread's
@@ -1229,16 +1282,7 @@ impl RunManager {
                     messages.push(denied);
                     continue;
                 }
-                match self
-                    .run_tool_call(
-                        &run_id,
-                        run.session_id.as_deref(),
-                        run.schedule_id.as_deref(),
-                        call,
-                        &cancel,
-                    )
-                    .await
-                {
+                match self.run_tool_call(&run, call, &cancel).await {
                     Ok(content) => {
                         let result = Msg::tool_result(call.id.clone(), content);
                         self.persist_message(&run_id, &result).await;
@@ -1266,17 +1310,13 @@ impl RunManager {
     /// persist running → dispatch → persist terminal + event (+ audit on
     /// policy denial). Returns the content handed back to the model, or
     /// `Err(())` when the run was cancelled mid-call.
-    #[allow(clippy::too_many_arguments)]
     async fn run_tool_call(
         &self,
-        run_id: &str,
-        session_id: Option<&str>,
-        // Set when a schedule fired this run — owns any standing grant the
-        // user mints from its approval (H4).
-        schedule_id: Option<&str>,
+        run: &Run,
         call: &agent24_models::ToolCallRequest,
         cancel: &CancellationToken,
     ) -> Result<String, ()> {
+        let run_id = run.id.as_str();
         let (input, parse_error) = if call.arguments.trim().is_empty() {
             (serde_json::Map::new(), None)
         } else {
@@ -1336,15 +1376,12 @@ impl RunManager {
 
         let outcome = match parse_error {
             Some(msg) => Err(ToolError::Invalid(msg)),
-            None => {
-                let ctx = ToolContext {
-                    run_id: run_id.to_owned(),
-                    session_id: session_id.map(str::to_owned),
-                    schedule_id: schedule_id.map(str::to_owned),
-                    tool_call_id: tc.id.clone(),
-                };
-                self.tools.dispatch(&call.name, &ctx, &input, cancel).await
-            }
+            None => match self.tool_context_for(run, tc.id.clone()).await {
+                Ok(ctx) => self.tools.dispatch(&call.name, &ctx, &input, cancel).await,
+                Err(err) => Err(ToolError::Denied(format!(
+                    "workspace authority unavailable: {err}"
+                ))),
+            },
         };
 
         // Back to running unless the run is about to land cancelled (the
@@ -1997,6 +2034,102 @@ pub(crate) mod tests {
             error,
             AgentError::Store(StoreError::Conflict(message))
                 if message == "workspace-bound sessions require atomic admission"
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_bound_tool_call_never_downgrades_without_authority_service() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let tools = ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(true)));
+        let provider = ScriptedProvider::new(vec![tool_call_turn(
+            "http_fetch",
+            serde_json::json!({ "url": "http://127.0.0.1:9/" }).to_string(),
+        )]);
+        let (manager, _sink, store) = manager_with_tools(Arc::new(provider), tools).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound-tool".into(),
+                title: "bound-tool".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now_iso8601(),
+                updated_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+        let run = manager
+            .start_run(RunCreate {
+                session_id: Some("bound-tool".into()),
+                workspace_id: Some(workspace_id),
+                prompt: "try a tool".into(),
+                model_override: None,
+                mode: RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        assert!(
+            done.output
+                .unwrap()
+                .text
+                .contains("workspace authority unavailable")
+        );
+        assert_eq!(
+            store.list_tool_calls(&run.id).await.unwrap()[0].status,
+            ToolCallStatus::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_legacy_tool_context_rejects_current_bound_run() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let created_at = workspace_timestamp(now_iso8601());
+        let run = Run {
+            id: format!("run_{}", ulid()),
+            session_id: None,
+            workspace_id: None,
+            status: RunStatus::Running,
+            input: RunInput {
+                prompt: "legacy".into(),
+                workspace_id: None,
+                model_override: None,
+                mode: RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: created_at.clone(),
+            started_at: Some(created_at.clone()),
+            ended_at: None,
+        };
+        store.insert_run(&run).await.unwrap();
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        let mut bound_input = run.input.clone();
+        bound_input.workspace_id = Some(workspace_id.clone());
+        sqlx::query("UPDATE runs SET workspace_id=?, input=? WHERE id=?")
+            .bind(workspace_id.as_str())
+            .bind(serde_json::to_string(&bound_input).unwrap())
+            .bind(&run.id)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,?,?,'run',?)")
+            .bind(format!("wl_{}", ulid())).bind(WORKSPACE_ID).bind("generation-1")
+            .bind(&run.id).bind(&created_at)
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+
+        assert!(matches!(
+            manager.tool_context_for(&run, "tc").await,
+            Err(AgentError::Workspace(WorkspaceStoreError::CorruptRow {
+                table: "runs",
+                field: "workspace_id"
+            }))
         ));
     }
 
