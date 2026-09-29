@@ -234,6 +234,23 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 换机续接时以 GitHub PR/remote head 为 authority；本机保留的 superseded dirty worktree 仅作为历史草稿，不代表未上传工作。当前有效新施工点为 #517 → #519，文档 checkpoint 为 #518。
 - dependency roots 与产品完成度没有变化；没有越序 main merge，P2/P9 继续 `IN PROGRESS`。
 
+## 2026-09-29 Wave 20 — A24-OD-02 run authority checkpoint
+
+- 当前有效 Open Design 产品栈为 #555 → #556 → #558 → #559 → #560 → #561 → #562；#557 为独立 docs 台账。integration `d62f65a` 已包含当前 `origin/main@32072b0`，因此当前没有未同步的 main commit 阻塞该栈。
+- #555 冻结 attached route authority；#556 将 nullable typed `workspace_id` 贯穿 Session/Run 持久化与 protocol/OpenAPI/TS；#558 增加 trusted host root resolve seam，继续不公开 canonical root。
+- #559（`0ef62e0`）完成 dormant one-`BEGIN IMMEDIATE` run admission：Session/workspace exact binding、committed allocation/root consistency、lazy expiry、serial run lease、strict reread，并堵住 direct explicit-workspace `insert_run` bypass；两次 independent final-head review PASS。
+- #560（`8e361a7`）是 test-only adversarial follow-up，覆盖 lease-id collision 与 trigger mutation rollback；final exact-head review PASS。
+- #561（`a88ca66`）将 workspace-bound Completed/Failed/Cancelled 与 exact run-lease release 放进同一写事务，并让旧 bulk orphan sweep 不再触碰 bound Run；仍未接 RunManager。
+- #562 初始 `e7d5193` 的 “no lease history compatibility” 被重新判定过宽。2026-09-29 修复 head `f6f809c` 改为 fail closed：workspace-bound orphan 必须拥有唯一、可验证的 exact run-lease history；缺失 history 视为 corruption，不再猜测历史兼容。修复后 focused 1/1、store lib 216/216、strict clippy、fmt、diff-check 全绿；PR 总 diff 为 2 files / 212 additions。
+- runtime activation 仍被明确冻结：在 #561/#562 final review 完成、RunManager admission wiring 与 startup ordering 合同冻结前，不接 ToolContext、WorkspaceHandle、ACP、Creative route 或 production `run()`。
+
+## 2026-09-29 本机施工现场清理
+
+- 已删除 9 个 Wave19 已确认 superseded 的 dirty G1/G4 worktree；这些草稿没有 unique unfinished 内容，正式远端栈已经覆盖其功能。
+- 对仍 OPEN 的 #440/#445/#458，仅删除 superseded dirty worktree，保留本地 branch ref 与远端 PR；没有删除 published PR branch。
+- 已删除 12 个对应已 MERGED PR（#523/#524/#526/#527/#528/#529/#532/#534/#540/#541/#543/#544）的 clean worktree/本地 branch，并删除两个已进入 integration ancestry、upstream 已 gone 的临时 propagation worktree/branch。
+- 同时执行 `git worktree prune` 清掉失效的 `/private/tmp/agent24-workspace-restack-wave4` 元数据。当前 worktree 数降至 45；现存 Open Design #555～#562 worktree 全部保留。
+
 ## A24-OD-00 小 PR 栈
 
 安全实现拆成 15 个可独立 review 的堆叠 PR；每个 PR 的总 changed lines 均小于 200：
