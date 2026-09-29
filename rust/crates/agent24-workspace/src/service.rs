@@ -132,24 +132,26 @@ impl WorkspaceService {
         run_id: &str,
         lease_id: &WorkspaceLeaseId,
     ) -> Result<WorkspaceHandle> {
-        self.open_run_handle_inner(run_id, lease_id, || async {})
+        self.open_run_handle_inner(run_id, lease_id, store_now, || async {})
             .await
     }
 
     #[cfg(unix)]
-    async fn open_run_handle_inner<F, Fut>(
+    async fn open_run_handle_inner<N, F, Fut>(
         &self,
         run_id: &str,
         lease_id: &WorkspaceLeaseId,
+        mut now: N,
         between: F,
     ) -> Result<WorkspaceHandle>
     where
+        N: FnMut() -> Result<WorkspaceInstant>,
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         let s1 = self
             .store
-            .run_workspace_authority_snapshot(run_id, lease_id, &store_now()?)
+            .run_workspace_authority_snapshot(run_id, lease_id, &now()?)
             .await
             .map_err(map_store_error)?;
         let generation = s1.root_generation();
@@ -180,7 +182,7 @@ impl WorkspaceService {
         between().await;
         let s2 = self
             .store
-            .run_workspace_authority_snapshot(run_id, lease_id, &store_now()?)
+            .run_workspace_authority_snapshot(run_id, lease_id, &now()?)
             .await
             .map_err(map_store_error)?;
         if s1 != s2 {
@@ -206,10 +208,22 @@ impl WorkspaceService {
 }
 
 fn store_now() -> Result<WorkspaceInstant> {
-    let raw = agent24_core::util::now_iso8601();
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })?
+        .as_millis();
+    let millis =
+        u64::try_from(millis).map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })?;
+    store_instant_from_epoch_millis(millis)
+}
+
+fn store_instant_from_epoch_millis(millis: u64) -> Result<WorkspaceInstant> {
+    let seconds = millis / 1000;
+    let fraction = millis % 1000;
+    let raw = agent24_core::util::iso8601_from_epoch_secs(seconds);
     let text = raw
         .strip_suffix('Z')
-        .map(|prefix| format!("{prefix}.000Z"))
+        .map(|prefix| format!("{prefix}.{fraction:03}Z"))
         .ok_or(WorkspaceError::RootUnavailable { reason: "clock" })?;
     WorkspaceInstant::parse(&text).map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })
 }
@@ -489,7 +503,7 @@ mod tests {
                 let lease = seed_run_authority(&service).await;
                 let store = service.store.clone();
                 let result = service
-                    .open_run_handle_inner("r", &lease, || async move {
+                    .open_run_handle_inner("r", &lease, store_now, || async move {
                         let mut connection = test_hooks::pool(&store).acquire().await.unwrap();
                         if generation_change {
                             sqlx::query("PRAGMA foreign_keys=OFF")
@@ -528,6 +542,69 @@ mod tests {
                     })
                 ));
             }
+        }
+
+        #[tokio::test]
+        async fn fresh_s2_rejects_fractional_second_expiry() {
+            let (_state, service) = fixture(None).await;
+            let lease = seed_run_authority(&service).await;
+            let s1 = WorkspaceInstant::parse("2026-09-19T00:00:00.100Z").unwrap();
+            let expires = WorkspaceInstant::parse("2026-09-19T00:00:00.500Z").unwrap();
+            let s2 = WorkspaceInstant::parse("2026-09-19T00:00:00.900Z").unwrap();
+
+            query("UPDATE workspaces SET created_at=?, expires_at=?, renewed_at=NULL WHERE id=?")
+                .bind(s1.as_str())
+                .bind(expires.as_str())
+                .bind(ID)
+                .execute(test_hooks::pool(&service.store))
+                .await
+                .unwrap();
+            query("UPDATE workspace_allocations SET created_at=? WHERE workspace_id=?")
+                .bind(s1.as_str())
+                .bind(ID)
+                .execute(test_hooks::pool(&service.store))
+                .await
+                .unwrap();
+            query("UPDATE sessions SET created_at=?, updated_at=? WHERE id='s'")
+                .bind(s1.as_str())
+                .bind(s1.as_str())
+                .execute(test_hooks::pool(&service.store))
+                .await
+                .unwrap();
+            query("UPDATE runs SET created_at=? WHERE id='r'")
+                .bind(s1.as_str())
+                .execute(test_hooks::pool(&service.store))
+                .await
+                .unwrap();
+            query("UPDATE workspace_leases SET acquired_at=? WHERE owner_id='r'")
+                .bind(s1.as_str())
+                .execute(test_hooks::pool(&service.store))
+                .await
+                .unwrap();
+
+            let mut times = [s1, s2].into_iter();
+            let result = service
+                .open_run_handle_inner(
+                    "r",
+                    &lease,
+                    || Ok(times.next().expect("S1 and S2 clock reads")),
+                    || async {},
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(WorkspaceError::RootUnavailable {
+                    reason: "workspace_registry"
+                })
+            ));
+        }
+
+        #[test]
+        fn epoch_millis_clock_keeps_fractional_precision() {
+            assert_eq!(
+                store_instant_from_epoch_millis(123).unwrap().as_str(),
+                "1970-01-01T00:00:00.123Z"
+            );
         }
     }
 }
