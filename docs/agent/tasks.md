@@ -60,7 +60,7 @@
 | ME4-5.3.3a | Cos72 | mytask 实体与路由 | 5.3.2 | `BACKLOG` | |
 | ME4-5.3.3b | Cos72 | 审批发积分 + 账本回放 + 摘要进记忆 | 5.3.3a | `BACKLOG` | |
 | ME4-5.3.4 | Cos72 | Cos72 真实挂载黑盒（含与 Sin90 共存隔离） | 5.3.3b, 5.2.1 | `BACKLOG` | |
-| ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2b | `BACKLOG` | |
+| ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2b | `BACKLOG` | 分支 `docs/me4-5.4.1-wire-and-node-ref` 已推送：`docs/specs/WIRE-OOP-MODULE.md`（逐方法 params/result/错误闭集，每条事实带 file:line）+ `examples/node-module/`（纯 Node 标准库，未引用本仓 Rust crate，仅声明 `events`/`memory`）+ `rust/apps/agent24d/tests/me4_node_module_blackbox.rs`（真实黑盒：挂载→代理→事件→记忆，10/10 连跑绿；无 node 则 SKIP 并打印原因，不 panic）。范围收窄：只覆盖 events/memory 往返，scheduler upsert/fired 与 model/approval 只有文档、无参考实现演示，记 followups.md FU-104。状态由用户核实后改 |
 | ME4-6.0.1 | Agent24 | 冻结 v0.5.0 专用发布清单 | 5.3.4, 5.4.1 | `BACKLOG` | |
 | ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `BACKLOG` | |
 | ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `BACKLOG` | |
