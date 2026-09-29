@@ -73,6 +73,20 @@ is not equivalent to the current `main` history. Merging those published stack
 branches directly can therefore pull unrelated integration ancestry into a
 main PR even when the Open Design patch itself is small.
 
+At the time this strategy was written:
+
+- `main` was `bb1945d6f538c897311bca504623f2191a2e6c48`;
+- `integration/open-design-main-sync-wave20` was
+  `d62f65ad97c2c68a9ed8aff99407685b5046b28d`;
+- their merge-base was `32072b02a3c71d50b7b841ad538e3c14073878d3`;
+- the integration branch was about 321 commits ahead and 1 commit behind
+  `main`;
+- the whole integration-to-main tree diff was roughly 38k lines across 133
+  files.
+
+That is useful staging history, but it is not an acceptable unit of review for
+main landing.
+
 The published branches remain valuable as the reviewed source of truth. They
 should not be rebased or force-rewritten merely to make main landing prettier.
 Instead, construct separate landing branches.
@@ -125,6 +139,13 @@ two only if the final diff is genuinely tiny and review remains clear), not one
 combined M4 PR.
 
 ### Workspace authority foundation / M5
+
+Before #555 can land to `main`, audit and land the required **pre-#555
+foundation** from wave20 as its own original atomic slices. In particular this
+includes the capability authority/policy substrate, workspace
+schema/allocation/registry/service substrate, and required sidecar/runtime
+foundation that #555–#558 assume already exists. Do not hide this prerequisite
+inside the #555 landing PR.
 
 4. #555 — attached-route authority matrix, if the landing dependency audit
    confirms it is required by #556 on current `main`
@@ -219,8 +240,13 @@ This creates a conveyor belt rather than a final big-bang merge.
    permanent integration branch is established.
 2. Fix the current Creative loading regression on the preview branch and prove
    the real packaged path again.
-3. Create/refresh `integration/open-design-product` from current `main` and add
-   reviewed Open Design slices to it without importing unrelated ancestry.
-4. Start main landing with the smallest dependency-ready M4 slice.
-5. Continue M6.1b development in parallel.
-
+3. Establish one stable staging branch (prefer `integration/open-design` or
+   `integration/open-design-product`) and merge current `main` into it with a
+   normal merge; do not rebase/force published stacks.
+4. Audit the pre-#555 wave20 foundation and turn its required pieces into a
+   concrete main-landing queue of small PRs.
+5. Start main landing with the smallest dependency-ready M4 slice while the
+   foundation queue is prepared in parallel.
+6. After each main landing tranche, merge the new `main` back into staging and
+   rerun cross-stack CI.
+7. Continue M6.1b development in parallel.
