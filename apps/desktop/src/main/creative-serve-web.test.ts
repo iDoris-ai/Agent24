@@ -26,8 +26,10 @@ function checkout(): string {
   tempDirs.push(root)
   fs.mkdirSync(path.join(root, 'apps/daemon/bin'), { recursive: true })
   fs.mkdirSync(path.join(root, 'apps/daemon/dist'), { recursive: true })
+  fs.mkdirSync(path.join(root, 'apps/web/out'), { recursive: true })
   fs.writeFileSync(path.join(root, 'apps/daemon/bin/od.mjs'), '')
   fs.writeFileSync(path.join(root, 'apps/daemon/dist/cli.js'), '')
+  fs.writeFileSync(path.join(root, 'apps/web/out/index.html'), '<!doctype html>')
   return root
 }
 
@@ -101,6 +103,17 @@ describe('CreativeServeWeb', () => {
     await expect(service.start()).resolves.toEqual({
       state: 'failed',
       error: 'Open Design daemon is not built; run pnpm --filter @open-design/daemon build',
+    })
+  })
+
+  it('fails clearly when the web bundle is missing', async () => {
+    const root = checkout()
+    fs.rmSync(path.join(root, 'apps/web/out/index.html'))
+    const service = new CreativeServeWeb({ checkoutDir: root })
+
+    await expect(service.start()).resolves.toEqual({
+      state: 'failed',
+      error: 'Open Design web bundle is not built; run pnpm --filter @open-design/web build',
     })
   })
 })
