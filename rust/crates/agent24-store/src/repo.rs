@@ -373,7 +373,12 @@ impl Store {
             return Err(StoreError::NotFound(format!("run {id}")));
         };
         let workspace_id = current.get::<Option<String>, _>("workspace_id");
-        if workspace_id.is_some() {
+        if workspace_id.is_some()
+            && matches!(
+                to,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            )
+        {
             return Err(StoreError::Conflict(
                 "workspace-bound runs require workspace-aware transitions".to_owned(),
             ));
