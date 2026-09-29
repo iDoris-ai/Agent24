@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[cfg(test)]
+use crate::run_workspace_terminal::read_lease_tx;
+pub(crate) use crate::run_workspace_terminal::{TerminalMutation, release_exact_terminal_lease_tx};
 use crate::{
     LegacyRecoveryHold, RecoveryState, Store, WorkspaceInstant, WorkspaceLeaseId,
     WorkspaceLeaseRow, WorkspaceResult, WorkspaceStoreError,
@@ -10,11 +13,6 @@ use crate::{
 };
 use agent24_protocol::RunStatus;
 use sqlx::{Sqlite, Transaction};
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum TerminalMutation<T> {
-    Applied(T),
-    Conflict,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TerminalAuditInput {
@@ -80,47 +78,6 @@ pub(crate) async fn abort_all_pending_terminal_approvals_tx(
     (read_all_approvals_tx(tx, run_id).await? == expected)
         .then_some(expected)
         .ok_or_else(|| bad("approvals", "row"))
-}
-async fn read_lease_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    id: &WorkspaceLeaseId,
-) -> WorkspaceResult<Option<WorkspaceLeaseRow>> {
-    sqlx::query("SELECT * FROM workspace_leases WHERE lease_id=? COLLATE BINARY")
-        .bind(id.as_str())
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|_| WorkspaceStoreError::Database)?
-        .map(|row| WorkspaceLeaseRow::decode(&row))
-        .transpose()
-}
-pub(crate) async fn release_exact_terminal_lease_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    lease: &WorkspaceLeaseRow,
-    ended_at: &WorkspaceInstant,
-) -> WorkspaceResult<TerminalMutation<WorkspaceLeaseRow>> {
-    let r = &lease.record;
-    let changed = sqlx::query(
-        "UPDATE workspace_leases SET released_at=? WHERE lease_id=? COLLATE BINARY
-         AND workspace_id=? COLLATE BINARY AND root_generation=? COLLATE BINARY
-         AND owner_id=? COLLATE BINARY AND kind='run' COLLATE BINARY AND released_at IS NULL",
-    )
-    .bind(ended_at.as_str())
-    .bind(r.id.as_str())
-    .bind(r.workspace_id.as_str())
-    .bind(&r.root_generation)
-    .bind(&r.owner_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(|_| WorkspaceStoreError::Database)?;
-    if changed.rows_affected() != 1 {
-        return Ok(TerminalMutation::Conflict);
-    }
-    let mut expected = lease.clone();
-    expected.record.released_at = Some(ended_at.clone());
-    match read_lease_tx(tx, &r.id).await? {
-        Some(actual) if actual == expected => Ok(TerminalMutation::Applied(expected)),
-        _ => Err(bad("workspace_leases", "row")),
-    }
 }
 pub(crate) async fn append_terminal_audit_tx(
     tx: &mut Transaction<'_, Sqlite>,

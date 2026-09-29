@@ -30,6 +30,7 @@ mod module_model_usage;
 mod module_schedules;
 mod repo;
 mod run_workspace_admission;
+mod run_workspace_terminal;
 mod terminal_core;
 mod terminal_helpers;
 pub(crate) mod terminal_mutations;
@@ -69,6 +70,7 @@ pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturatin
 pub use module_schedules::*;
 pub use repo::*;
 pub use run_workspace_admission::{RunAdmission, RunAdmissionDenial};
+pub use run_workspace_terminal::RunTerminalTransition;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

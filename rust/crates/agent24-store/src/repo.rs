@@ -365,15 +365,26 @@ impl Store {
     pub async fn transition_run(&self, id: &str, to: RunStatus, patch: RunPatch) -> Result<Run> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
 
-        let current = sqlx::query("SELECT status FROM runs WHERE id = ?")
+        let current = sqlx::query("SELECT status, workspace_id FROM runs WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)
-            .await?
-            .map(|r| r.get::<String, _>("status"));
+            .await?;
         let Some(current) = current else {
             return Err(StoreError::NotFound(format!("run {id}")));
         };
-        check_run_transition(parse_status(&current)?, to)?;
+        let workspace_id = current.get::<Option<String>, _>("workspace_id");
+        if workspace_id.is_some()
+            && matches!(
+                to,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            )
+        {
+            return Err(StoreError::Conflict(
+                "workspace-bound runs require workspace-aware transitions".to_owned(),
+            ));
+        }
+        let current_status = current.get::<String, _>("status");
+        check_run_transition(parse_status(&current_status)?, to)?;
 
         let row = sqlx::query(
             "UPDATE runs SET status = ?,
@@ -429,9 +440,10 @@ impl Store {
     pub async fn sweep_orphan_runs(&self, ended_at: &str) -> Result<u64> {
         let result = sqlx::query(
             "UPDATE runs SET status = 'cancelled', ended_at = ?
-             WHERE status IN ('queued', 'running')
-                OR (status = 'awaiting_approval'
-                    AND id NOT IN (SELECT run_id FROM approvals WHERE status = 'pending'))",
+             WHERE workspace_id IS NULL
+               AND (status IN ('queued', 'running')
+                    OR (status = 'awaiting_approval'
+                        AND id NOT IN (SELECT run_id FROM approvals WHERE status = 'pending')))",
         )
         .bind(ended_at)
         .execute(self.pool())
