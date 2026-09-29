@@ -18,6 +18,7 @@ use agent24_protocol::{
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod acp;
 mod service;
 mod tui;
 
@@ -65,6 +66,9 @@ enum Command {
     /// (Claude Desktop, another agent) can run tasks on it and introspect it.
     /// Risky actions are still approved on THIS host, never by the caller (E4).
     Mcp,
+    /// Serve Agent24 as an ACP agent over newline-delimited JSON-RPC on stdio.
+    /// Open Design uses this bridge for its Creative runtime.
+    Acp,
 }
 
 #[derive(Subcommand)]
@@ -447,6 +451,16 @@ async fn cmd_mcp() -> Result<(), String> {
         .serve_stdio()
         .await
         .map_err(|e| e.to_string());
+    finish(ep).await;
+    result
+}
+
+/// Serve the running daemon through the Agent Client Protocol over stdio.
+/// Prototype-first: the bridge reuses the daemon's existing run/session/event
+/// APIs; richer ACP capabilities are added only after the M4 product path runs.
+async fn cmd_acp() -> Result<(), String> {
+    let ep = connect().await?;
+    let result = acp::serve(&ep).await;
     finish(ep).await;
     result
 }
@@ -1399,6 +1413,7 @@ async fn main() -> std::process::ExitCode {
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
         Command::Mcp => cmd_mcp().await,
+        Command::Acp => cmd_acp().await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
