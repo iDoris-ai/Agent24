@@ -15,6 +15,7 @@ dependencies = [
  "agent24-tools",
  "async-trait",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

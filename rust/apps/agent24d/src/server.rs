@@ -1445,19 +1445,41 @@ pub async fn serve(
     // pending) so their runs survive to be resumed when answered, and abort the
     // rest fail-closed. The orphan sweep then cancels every still-non-terminal
     // run whose approval did NOT survive — so the restore MUST come first.
-    let (restored, aborted) = state.runs.restore_pending_approvals().await;
+    let (restored, aborted) = state
+        .runs
+        .restore_pending_approvals()
+        .await
+        .map_err(std::io::Error::other)?;
     if restored > 0 || aborted > 0 {
         tracing::info!(
             "durable resume: {restored} approval(s) restored, {aborted} aborted from a previous process"
         );
     }
+    let now = agent24_core::util::now_iso8601();
     let orphans = state
         .store
-        .sweep_orphan_runs(&agent24_core::util::now_iso8601())
+        .sweep_orphan_runs(&now)
         .await
         .map_err(std::io::Error::other)?;
     if orphans > 0 {
         tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
+    }
+    let workspace_now_text = now
+        .strip_suffix('Z')
+        .map(|prefix| format!("{prefix}.000Z"))
+        .unwrap_or_else(|| now.clone());
+    let workspace_now = agent24_store::WorkspaceInstant::parse(&workspace_now_text)
+        .map_err(std::io::Error::other)?;
+    let workspace_orphans = state
+        .store
+        .sweep_workspace_orphan_runs(&workspace_now)
+        .await
+        .map_err(std::io::Error::other)?;
+    if workspace_orphans.released_leases > 0 {
+        tracing::warn!(
+            "cancelled {} workspace-bound orphan run(s) from a previous process",
+            workspace_orphans.released_leases
+        );
     }
 
     // ME4-1.3.1 (design §3.2/§4.6, S1-6): the scheduler's tick loop AND
