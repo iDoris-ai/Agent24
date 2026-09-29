@@ -249,6 +249,7 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - 已删除 9 个 Wave19 已确认 superseded 的 dirty G1/G4 worktree；这些草稿没有 unique unfinished 内容，正式远端栈已经覆盖其功能。
 - 对仍 OPEN 的 #440/#445/#458，仅删除 superseded dirty worktree，保留本地 branch ref 与远端 PR；没有删除 published PR branch。
 - 已删除 12 个对应已 MERGED PR（#523/#524/#526/#527/#528/#529/#532/#534/#540/#541/#543/#544）的 clean worktree/本地 branch，并删除两个已进入 integration ancestry、upstream 已 gone 的临时 propagation worktree/branch。
+- 另外删除已 MERGED #228/#260/#261 的三个 upstream-gone 本地 branch；`local/preview-v040` 仍绑定专用 preview worktree，因此暂不清理。
 - 同时执行 `git worktree prune` 清掉失效的 `/private/tmp/agent24-workspace-restack-wave4` 元数据。当前 worktree 数降至 45；现存 Open Design #555～#562 worktree 全部保留。
 
 ## A24-OD-00 小 PR 栈
