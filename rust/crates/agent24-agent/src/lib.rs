@@ -32,7 +32,10 @@ use agent24_protocol::{
     RunOutputPayload, RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
     ToolCompletedStatus, ToolStartedPayload, Usage,
 };
-use agent24_store::{RunMessage, RunPatch, Store, StoreError};
+use agent24_store::{
+    RunAdmission, RunAdmissionDenial, RunMessage, RunPatch, RunTerminalTransition, Store,
+    StoreError, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError,
+};
 use agent24_tools::{
     GateDecision, ToolContext, ToolError, ToolRegistry, summarize_input, truncate,
 };
@@ -230,6 +233,10 @@ impl Summarizer for RouterSummarizer {
 pub enum AgentError {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceStoreError),
+    #[error("workspace run admission denied: {0:?}")]
+    WorkspaceAdmission(RunAdmissionDenial),
     #[error("session not found: {0}")]
     SessionNotFound(String),
 }
@@ -240,6 +247,16 @@ fn zero_usage() -> Usage {
         completion_tokens: 0,
         total_tokens: 0,
         cost_usd: 0.0,
+    }
+}
+
+fn workspace_timestamp(raw: String) -> String {
+    if raw.len() == 20 {
+        raw.strip_suffix('Z')
+            .map(|prefix| format!("{prefix}.000Z"))
+            .unwrap_or(raw)
+    } else {
+        raw
     }
 }
 
@@ -505,6 +522,11 @@ impl RunManager {
             return Err(AgentError::SessionNotFound(session_id.clone()));
         }
 
+        let created_at = if create.workspace_id.is_some() {
+            workspace_timestamp(now_iso8601())
+        } else {
+            now_iso8601()
+        };
         let run = Run {
             id: format!("run_{}", ulid()),
             session_id: create.session_id.clone(),
@@ -520,7 +542,7 @@ impl RunManager {
             error: None,
             usage: zero_usage(),
             schedule_id,
-            created_at: now_iso8601(),
+            created_at,
             started_at: None,
             ended_at: None,
         };
@@ -531,9 +553,29 @@ impl RunManager {
             .lock()
             .await
             .insert(run.id.clone(), token.clone());
-        if let Err(err) = self.store.insert_run(&run).await {
+        let persist = if run.workspace_id.is_some() {
+            let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid()))?;
+            let acquired_at = WorkspaceInstant::parse(&run.created_at)?;
+            match self
+                .store
+                .insert_run_with_workspace_admission(&run, Some(lease_id), &acquired_at)
+                .await?
+            {
+                RunAdmission::Admitted { lease_id: Some(_) } => Ok(()),
+                RunAdmission::Admitted { lease_id: None } => {
+                    Err(AgentError::Workspace(WorkspaceStoreError::CorruptRow {
+                        table: "workspace_leases",
+                        field: "row",
+                    }))
+                }
+                RunAdmission::Denied(denial) => Err(AgentError::WorkspaceAdmission(denial)),
+            }
+        } else {
+            self.store.insert_run(&run).await.map_err(AgentError::from)
+        };
+        if let Err(err) = persist {
             self.cancels.lock().await.remove(&run.id);
-            return Err(err.into());
+            return Err(err);
         }
 
         // Supervised execution: execute() runs in its OWN task whose join
@@ -604,31 +646,20 @@ impl RunManager {
     /// gone, payload drift, past the resume TTL, or a vanished run) is aborted
     /// fail-closed — its now-approval-less run is then cancelled by the orphan
     /// sweep, which is why THIS must run first. Returns `(restored, aborted)`.
-    pub async fn restore_pending_approvals(&self) -> (u64, u64) {
-        let pending = match self
+    pub async fn restore_pending_approvals(&self) -> Result<(u64, u64), AgentError> {
+        let pending = self
             .store
             .list_approvals(Some(ApprovalStatus::Pending))
-            .await
-        {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::error!("restore sweep: listing pending approvals failed: {err}");
-                return (0, 0);
-            }
-        };
+            .await?;
         let cutoff = agent24_core::util::iso8601_before(RESUME_TTL);
         let (mut restored, mut aborted) = (0u64, 0u64);
         for approval in pending {
-            let thread = self
-                .store
-                .list_run_messages(&approval.run_id)
-                .await
-                .unwrap_or_default();
-            let run_status = match self.store.get_run(&approval.run_id).await {
-                Ok(Some(run)) => run.status,
-                // The run row is gone or unreadable — there is nothing to resume.
-                _ => {
-                    self.abort_one_approval(&approval).await;
+            let thread = self.store.list_run_messages(&approval.run_id).await?;
+            let run_status = match self.store.get_run(&approval.run_id).await? {
+                Some(run) => run.status,
+                // The run row is gone — there is nothing to resume.
+                None => {
+                    self.abort_one_approval(&approval).await?;
                     aborted += 1;
                     continue;
                 }
@@ -655,25 +686,19 @@ impl RunManager {
                         "restore sweep: aborting approval {} — {reason}",
                         approval.id
                     );
-                    self.abort_one_approval(&approval).await;
+                    self.abort_one_approval(&approval).await?;
                     aborted += 1;
                 }
             }
         }
-        (restored, aborted)
+        Ok((restored, aborted))
     }
 
-    async fn abort_one_approval(&self, approval: &Approval) {
-        if let Err(err) = self
-            .store
+    async fn abort_one_approval(&self, approval: &Approval) -> Result<(), AgentError> {
+        self.store
             .resolve_approval(&approval.id, ApprovalStatus::Aborted, None, now_iso8601())
-            .await
-        {
-            tracing::error!(
-                "restore sweep: aborting approval {} failed: {err}",
-                approval.id
-            );
-        }
+            .await?;
+        Ok(())
     }
 
     /// Resume a run parked awaiting approval whose in-memory task is gone — the
@@ -1097,17 +1122,18 @@ impl RunManager {
                     self.finish_cancelled(&run_id).await;
                     return;
                 }
+                let ended_at = now_iso8601();
                 match self
-                    .store
-                    .transition_run(
+                    .transition_terminal(
                         &run_id,
                         RunStatus::Completed,
                         RunPatch {
                             output: Some(agent24_protocol::RunOutput { text: text.clone() }),
                             usage: Some(usage_total.clone()),
-                            ended_at: Some(now_iso8601()),
+                            ended_at: Some(ended_at.clone()),
                             ..Default::default()
                         },
+                        &ended_at,
                     )
                     .await
                 {
@@ -1540,11 +1566,38 @@ impl RunManager {
         outcome
     }
 
+    async fn transition_terminal(
+        &self,
+        run_id: &str,
+        to: RunStatus,
+        mut patch: RunPatch,
+        ended_at: &str,
+    ) -> Result<Run, AgentError> {
+        match self.store.active_workspace_run_lease_id(run_id).await? {
+            None => Ok(self.store.transition_run(run_id, to, patch).await?),
+            Some(lease_id) => {
+                let ended_at = workspace_timestamp(ended_at.to_owned());
+                patch.ended_at = Some(ended_at.clone());
+                let ended_at = WorkspaceInstant::parse(&ended_at)?;
+                match self
+                    .store
+                    .transition_workspace_run_terminal(run_id, to, patch, &lease_id, &ended_at)
+                    .await?
+                {
+                    RunTerminalTransition::Applied(run) => Ok(*run),
+                    RunTerminalTransition::Conflict => Err(AgentError::Store(
+                        StoreError::Conflict("workspace run terminal transition".to_owned()),
+                    )),
+                }
+            }
+        }
+    }
+
     /// Land the completed terminal state + event with the given output text.
     async fn finish_completed(&self, run_id: &str, text: &str, usage: Usage) {
+        let ended_at = now_iso8601();
         match self
-            .store
-            .transition_run(
+            .transition_terminal(
                 run_id,
                 RunStatus::Completed,
                 RunPatch {
@@ -1552,9 +1605,10 @@ impl RunManager {
                         text: text.to_owned(),
                     }),
                     usage: Some(usage.clone()),
-                    ended_at: Some(now_iso8601()),
+                    ended_at: Some(ended_at.clone()),
                     ..Default::default()
                 },
+                &ended_at,
             )
             .await
         {
@@ -1577,16 +1631,17 @@ impl RunManager {
             hint: None,
             details: None,
         };
+        let ended_at = now_iso8601();
         match self
-            .store
-            .transition_run(
+            .transition_terminal(
                 run_id,
                 RunStatus::Failed,
                 RunPatch {
                     error: Some(body.clone()),
-                    ended_at: Some(now_iso8601()),
+                    ended_at: Some(ended_at.clone()),
                     ..Default::default()
                 },
+                &ended_at,
             )
             .await
         {
@@ -1602,15 +1657,16 @@ impl RunManager {
     /// runs) — a raced double-write loses in the store's IMMEDIATE tx and is
     /// logged, never duplicated.
     async fn finish_cancelled(&self, run_id: &str) {
+        let ended_at = now_iso8601();
         match self
-            .store
-            .transition_run(
+            .transition_terminal(
                 run_id,
                 RunStatus::Cancelled,
                 RunPatch {
-                    ended_at: Some(now_iso8601()),
+                    ended_at: Some(ended_at.clone()),
                     ..Default::default()
                 },
+                &ended_at,
             )
             .await
         {
@@ -1858,64 +1914,66 @@ pub(crate) mod tests {
     }
 
     async fn seed_workspace(store: &Store, id: &str) {
-        let owner = agent24_store::LifecycleOwnerRef::parse("orchestrator-test".into()).unwrap();
-        let input = agent24_store::NewScratchWorkspace::new(
-            agent24_protocol::WorkspaceId::parse(id).unwrap(),
-            agent24_store::TrustedRootRegistration::new(
-                "/test/workspace".into(),
-                "generation-1".into(),
-                agent24_store::RootIdentity::unix(&[1; 8], &[2; 8]).unwrap(),
-            )
-            .unwrap(),
-            agent24_store::WorkspaceProvenanceInput::new("test".into(), None, None).unwrap(),
-            owner.clone(),
-            agent24_store::WorkspaceTtl::new(60_000).unwrap(),
-        );
-        store
-            .create_workspace(
-                &input,
-                &owner,
-                &agent24_store::WorkspaceInstant::parse("2026-09-19T00:00:00.000Z").unwrap(),
-            )
-            .await
-            .unwrap();
+        let now = "2026-09-29T00:00:00.000Z";
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,'2026-10-05T23:00:00.000Z',1,'/test/workspace','generation-1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(id).bind(now).execute(agent24_store::test_hooks::pool(store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'generation-1','root','unix',X'0303030303030303',X'0404040404040404','unix',X'0101010101010101',X'0202020202020202','committed',?)")
+            .bind(id).bind(now).execute(agent24_store::test_hooks::pool(store)).await.unwrap();
     }
 
     #[tokio::test]
-    async fn start_run_fails_closed_until_workspace_admission_is_wired() {
+    async fn workspace_run_admission_and_terminal_release_are_active() {
         const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
         let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
         seed_workspace(&store, WORKSPACE_ID).await;
         let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
-
-        let error = manager
-            .start_run(RunCreate {
-                session_id: None,
-                workspace_id: Some(workspace_id.clone()),
-                prompt: "identity only".into(),
-                model_override: None,
-                mode: agent24_protocol::RunMode::Normal,
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            AgentError::Store(StoreError::Conflict(message))
-                if message == "explicit workspace runs require atomic admission"
-        ));
-        assert!(store.list_runs(None).await.unwrap().is_empty());
-
         store
             .insert_session(&agent24_protocol::Session {
                 id: "bound".into(),
                 title: "bound".into(),
                 channel: "desktop".into(),
-                workspace_id: Some(workspace_id),
+                workspace_id: Some(workspace_id.clone()),
                 created_at: "2026-09-19T00:00:00.000Z".into(),
                 updated_at: "2026-09-19T00:00:00.000Z".into(),
             })
             .await
             .unwrap();
+        let first = manager
+            .start_run(RunCreate {
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id.clone()),
+                prompt: "workspace run".into(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &first.id).await;
+        assert_eq!(done.status, RunStatus::Completed);
+        let first_release: Option<String> = sqlx::query_scalar(
+            "SELECT released_at FROM workspace_leases WHERE owner_id=? AND kind='run'",
+        )
+        .bind(&first.id)
+        .fetch_one(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert!(first_release.is_some());
+
+        let second = manager
+            .start_run(RunCreate {
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id),
+                prompt: "workspace run two".into(),
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_terminal(&store, &second.id).await.status,
+            RunStatus::Completed
+        );
+
         let error = manager
             .start_run(RunCreate {
                 session_id: Some("bound".into()),
@@ -1931,7 +1989,130 @@ pub(crate) mod tests {
             AgentError::Store(StoreError::Conflict(message))
                 if message == "workspace-bound sessions require atomic admission"
         ));
-        assert!(store.list_runs(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_terminal_fails_closed_when_exact_lease_is_missing() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound".into(),
+                title: "bound".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: "2026-09-29T00:00:00.000Z".into(),
+                updated_at: "2026-09-29T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        let created_at = workspace_timestamp(now_iso8601());
+        let run = Run {
+            id: format!("run_{}", ulid()),
+            session_id: Some("bound".into()),
+            workspace_id: Some(workspace_id.clone()),
+            status: RunStatus::Queued,
+            input: RunInput {
+                prompt: "go".into(),
+                workspace_id: Some(workspace_id),
+                model_override: None,
+                mode: RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: created_at.clone(),
+            started_at: None,
+            ended_at: None,
+        };
+        let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid())).unwrap();
+        assert!(matches!(
+            store
+                .insert_run_with_workspace_admission(
+                    &run,
+                    Some(lease_id.clone()),
+                    &WorkspaceInstant::parse(&created_at).unwrap(),
+                )
+                .await
+                .unwrap(),
+            RunAdmission::Admitted { lease_id: Some(_) }
+        ));
+        store
+            .transition_run(
+                &run.id,
+                RunStatus::Running,
+                RunPatch {
+                    started_at: Some(created_at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?")
+            .bind(lease_id.as_str())
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+
+        manager.finish_cancelled(&run.id).await;
+
+        assert_eq!(
+            store.get_run(&run.id).await.unwrap().unwrap().status,
+            RunStatus::Running
+        );
+        assert!(
+            !sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "run.cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_workspace_run_releases_exact_lease() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(HangingProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound".into(),
+                title: "bound".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: "2026-09-29T00:00:00.000Z".into(),
+                updated_at: "2026-09-29T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        let run = manager
+            .start_run(RunCreate {
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id),
+                prompt: "hang".into(),
+                model_override: None,
+                mode: RunMode::Normal,
+            })
+            .await
+            .unwrap();
+        manager.cancel_run(&run.id).await.unwrap();
+        assert_eq!(
+            wait_terminal(&store, &run.id).await.status,
+            RunStatus::Cancelled
+        );
+        let released: Option<String> = sqlx::query_scalar(
+            "SELECT released_at FROM workspace_leases WHERE owner_id=? AND kind='run'",
+        )
+        .bind(&run.id)
+        .fetch_one(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert!(released.is_some());
     }
 
     /// Run one prompt in a session and wait for it to reach a terminal state.
@@ -3301,7 +3482,7 @@ mod approval_tests {
             .await
             .unwrap();
 
-        let (restored, aborted) = h.manager.restore_pending_approvals().await;
+        let (restored, aborted) = h.manager.restore_pending_approvals().await.unwrap();
         assert_eq!((restored, aborted), (1, 1));
         // The restorable one is still pending and was re-announced.
         assert_eq!(
@@ -3329,6 +3510,20 @@ mod approval_tests {
                 .status,
             ApprovalStatus::Aborted
         );
+    }
+
+    #[tokio::test]
+    async fn restore_sweep_propagates_storage_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        sqlx::query("DROP TABLE approvals")
+            .execute(agent24_store::test_hooks::pool(&h.store))
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.manager.restore_pending_approvals().await,
+            Err(AgentError::Store(_))
+        ));
     }
 
     #[tokio::test]

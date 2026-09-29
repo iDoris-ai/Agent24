@@ -3,7 +3,7 @@
 use agent24_agent::AgentError;
 use agent24_core::util::{now_iso8601, ulid};
 use agent24_protocol::{RunCreate, RunStatus, Session, SessionCreate};
-use agent24_store::StoreError;
+use agent24_store::{RunAdmissionDenial, StoreError, WorkspaceStoreError};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -20,6 +20,59 @@ fn map_agent_error(err: AgentError) -> Response {
             error_response(StatusCode::NOT_FOUND, "not_found", &format!("session {id}"))
         }
         AgentError::Store(err) => map_store_error(err),
+        AgentError::Workspace(err) => map_workspace_error(err),
+        AgentError::WorkspaceAdmission(denial) => map_workspace_admission_denial(denial),
+    }
+}
+
+fn map_workspace_admission_denial(denial: RunAdmissionDenial) -> Response {
+    match denial {
+        RunAdmissionDenial::SessionNotFound | RunAdmissionDenial::WorkspaceNotFound => {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "workspace admission target not found",
+            )
+        }
+        RunAdmissionDenial::WorkspaceUnavailable => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_unavailable",
+            "workspace unavailable",
+        ),
+        RunAdmissionDenial::BindingConflict
+        | RunAdmissionDenial::WorkspaceExpired
+        | RunAdmissionDenial::WorkspaceReleased
+        | RunAdmissionDenial::WorkspaceBusy => error_response(
+            StatusCode::CONFLICT,
+            "conflict",
+            "workspace run admission denied",
+        ),
+    }
+}
+
+fn map_workspace_error(err: WorkspaceStoreError) -> Response {
+    match err {
+        WorkspaceStoreError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "workspace state not found",
+        ),
+        WorkspaceStoreError::InvalidValue { .. } => error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid workspace value",
+        ),
+        WorkspaceStoreError::Conflict(_) => {
+            error_response(StatusCode::CONFLICT, "conflict", "workspace conflict")
+        }
+        WorkspaceStoreError::CorruptRow { .. } | WorkspaceStoreError::Database => {
+            tracing::error!("workspace store error: {err}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "workspace storage error",
+            )
+        }
     }
 }
 
