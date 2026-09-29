@@ -328,6 +328,28 @@ pub struct RunManager {
 }
 
 impl RunManager {
+    async fn persist_new_run(&self, run: &Run) -> Result<(), AgentError> {
+        let Some(_) = run.workspace_id.as_ref() else {
+            self.store.insert_run(run).await?;
+            return Ok(());
+        };
+        let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid()))?;
+        let acquired_at = WorkspaceInstant::parse(&run.created_at)?;
+        match self
+            .store
+            .insert_run_with_workspace_admission(run, Some(lease_id), &acquired_at)
+            .await?
+        {
+            RunAdmission::Admitted { lease_id: Some(_) } => Ok(()),
+            RunAdmission::Admitted { lease_id: None } => Err(WorkspaceStoreError::CorruptRow {
+                table: "workspace_leases",
+                field: "row",
+            }
+            .into()),
+            RunAdmission::Denied(denial) => Err(AgentError::WorkspaceAdmission(denial)),
+        }
+    }
+
     pub fn new(
         store: Store,
         router: Arc<ModelRouter>,
@@ -553,26 +575,7 @@ impl RunManager {
             .lock()
             .await
             .insert(run.id.clone(), token.clone());
-        let persist = if run.workspace_id.is_some() {
-            let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid()))?;
-            let acquired_at = WorkspaceInstant::parse(&run.created_at)?;
-            match self
-                .store
-                .insert_run_with_workspace_admission(&run, Some(lease_id), &acquired_at)
-                .await?
-            {
-                RunAdmission::Admitted { lease_id: Some(_) } => Ok(()),
-                RunAdmission::Admitted { lease_id: None } => {
-                    Err(AgentError::Workspace(WorkspaceStoreError::CorruptRow {
-                        table: "workspace_leases",
-                        field: "row",
-                    }))
-                }
-                RunAdmission::Denied(denial) => Err(AgentError::WorkspaceAdmission(denial)),
-            }
-        } else {
-            self.store.insert_run(&run).await.map_err(AgentError::from)
-        };
+        let persist = self.persist_new_run(&run).await;
         if let Err(err) = persist {
             self.cancels.lock().await.remove(&run.id);
             return Err(err);
@@ -1995,6 +1998,43 @@ pub(crate) mod tests {
             AgentError::Store(StoreError::Conflict(message))
                 if message == "workspace-bound sessions require atomic admission"
         ));
+    }
+
+    #[tokio::test]
+    async fn workspace_admission_error_cleans_cancel_token() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: "bound".into(),
+                title: "bound".into(),
+                channel: "desktop".into(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now_iso8601(),
+                updated_at: now_iso8601(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE workspace_allocations")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .start_run(RunCreate {
+                    session_id: Some("bound".into()),
+                    workspace_id: Some(workspace_id),
+                    prompt: "fail admission".into(),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                })
+                .await,
+            Err(AgentError::Workspace(WorkspaceStoreError::Database))
+        ));
+        assert!(manager.cancels.lock().await.is_empty());
+        assert!(store.list_runs(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]
