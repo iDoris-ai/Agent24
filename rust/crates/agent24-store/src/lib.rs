@@ -29,6 +29,7 @@ mod module_approvals;
 mod module_model_usage;
 mod module_schedules;
 mod repo;
+mod run_workspace_admission;
 mod terminal_core;
 mod terminal_helpers;
 pub(crate) mod terminal_mutations;
@@ -67,6 +68,7 @@ pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming}
 pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
 pub use module_schedules::*;
 pub use repo::*;
+pub use run_workspace_admission::{RunAdmission, RunAdmissionDenial};
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

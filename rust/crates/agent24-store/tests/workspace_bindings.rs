@@ -1,7 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent24_protocol::{Run, RunInput, RunMode, RunStatus, Session, Usage, WorkspaceId};
-use agent24_store::{StandingGrant, Store, test_hooks};
+use agent24_store::{
+    RunAdmission, StandingGrant, Store, WorkspaceInstant, WorkspaceLeaseId, test_hooks,
+};
 use sha2::{Digest, Sha256};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -16,6 +18,16 @@ async fn insert_workspace(store: &Store) {
         .bind(TS)
         .bind([0u8; 8].as_slice())
         .bind([1u8; 8].as_slice())
+        .execute(test_hooks::pool(store))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1','root','unix',?,?, 'unix',?,?, 'committed',?)")
+        .bind(WS)
+        .bind([2u8; 8].as_slice())
+        .bind([3u8; 8].as_slice())
+        .bind([0u8; 8].as_slice())
+        .bind([1u8; 8].as_slice())
+        .bind(TS)
         .execute(test_hooks::pool(store))
         .await
         .unwrap();
@@ -237,7 +249,18 @@ async fn public_session_and_run_repositories_roundtrip_workspace_identity_and_le
         started_at: None,
         ended_at: None,
     };
-    store.insert_run(&bound_run).await.unwrap();
+    assert!(store.insert_run(&bound_run).await.is_err());
+    assert!(matches!(
+        store
+            .insert_run_with_workspace_admission(
+                &bound_run,
+                Some(WorkspaceLeaseId::parse("wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6").unwrap()),
+                &WorkspaceInstant::parse(TS).unwrap(),
+            )
+            .await
+            .unwrap(),
+        RunAdmission::Admitted { lease_id: Some(_) }
+    ));
     assert_eq!(
         store.get_run("run_bound").await.unwrap(),
         Some(bound_run.clone())
