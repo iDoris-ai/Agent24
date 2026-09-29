@@ -1914,11 +1914,17 @@ pub(crate) mod tests {
     }
 
     async fn seed_workspace(store: &Store, id: &str) {
-        let now = "2026-09-29T00:00:00.000Z";
-        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,'2026-10-05T23:00:00.000Z',1,'/test/workspace','generation-1','unix',X'0101010101010101',X'0202020202020202')")
-            .bind(id).bind(now).execute(agent24_store::test_hooks::pool(store)).await.unwrap();
+        let now = workspace_timestamp(now_iso8601());
+        let expires_at = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(
+                agent24_store::WorkspaceTtl::new(6 * 24 * 60 * 60 * 1000).unwrap(),
+            )
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/test/workspace','generation-1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(id).bind(&now).bind(expires_at.as_str()).execute(agent24_store::test_hooks::pool(store)).await.unwrap();
         sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'generation-1','root','unix',X'0303030303030303',X'0404040404040404','unix',X'0101010101010101',X'0202020202020202','committed',?)")
-            .bind(id).bind(now).execute(agent24_store::test_hooks::pool(store)).await.unwrap();
+            .bind(id).bind(&now).execute(agent24_store::test_hooks::pool(store)).await.unwrap();
     }
 
     #[tokio::test]
