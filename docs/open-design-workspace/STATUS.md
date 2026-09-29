@@ -1,5 +1,7 @@
 # Agent24 × Open Design 执行状态
 
+> 2026-09-29 路线修正：长期完整产品化目标不变；短期执行切换为 Prototype-First。暂停把完整 authority / recovery hardening 作为 Creative 正向链路的前置条件，优先使用 Open Design 现有 `od daemon start --serve-web` 嵌入面、现有 `acp-json-rpc` engine 和薄 `RuntimeAgentDef` 打通可演示 E2E。详见 [PROTOTYPE-FIRST-PLAN.md](PROTOTYPE-FIRST-PLAN.md)。
+
 > 更新：2026-09-23（Asia/Bangkok）
 
 ## 阶段门禁
