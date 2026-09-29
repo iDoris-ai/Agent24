@@ -18,6 +18,30 @@ The integration work has two different needs:
 
 Those needs should be handled by different branch roles.
 
+## Current milestone reality
+
+The prototype milestones are complete as development/integration work, but they
+are **not yet all landed in Agent24 `main`**.
+
+- **M1** (embedded Creative shell) is implemented by Agent24 PRs **#563** and
+  **#564**. Both are still OPEN.
+- **M2** (minimal `agent24 acp`) is implemented by Agent24 PR **#565**. It is
+  still OPEN.
+- **M3** is the thin Agent24 runtime registration in the Open Design fork. It
+  is a fork-side change, not an Agent24-main landing PR.
+- **M4** is the first complete product acceptance gate: Agent24 Desktop ->
+  embedded Open Design -> Agent24 ACP -> real Session / Run -> artifact /
+  preview -> second-turn edit continuity. M4 therefore depends on M1-M3; it is
+  not a substitute for landing them.
+- **M5** authority activation is development-complete but its Agent24 PR chain
+  is still OPEN.
+- **M6** is in progress; #568 is the reviewed authority-snapshot slice and the
+  pinned `WorkspaceHandle` slice follows it.
+
+Therefore the main-landing plan must start with the **M1/M2 Agent24 code and
+their required foundation**, not with a fictional "M4-only" code PR. M4 is the
+acceptance gate used to prove those slices together.
+
 ## Decision
 
 Use two tracks in parallel.
@@ -127,16 +151,20 @@ No force-push / rebase is required for already-published stacks.
 The exact order can be adjusted when a dependency audit proves a slice is
 independent, but the default order is:
 
-### Product proof / M4
+### M1-M4 prototype train
 
-1. #563 — Creative `serve-web` launcher
-2. #564 — embedded Creative `WebContentsView`
-3. #565 — minimal Agent24 ACP bridge
+1. #563 — **M1** Creative `serve-web` launcher
+2. #564 — **M1** embedded Creative `WebContentsView`
+3. #565 — **M2** minimal Agent24 ACP bridge
+4. M3 fork-side runtime adapter — verify the pinned Open Design fork revision
+   used by the integration branch; this is not an Agent24-main PR
+5. M4 acceptance — rerun the packaged end-to-end prototype after #563-#565
+   landing equivalents are green on current `main`
 
 These three should first be proven together on the integration branch and by a
 real packaged preview. Their main landing should still be three small PRs (or
 two only if the final diff is genuinely tiny and review remains clear), not one
-combined M4 PR.
+combined prototype PR.
 
 ### Workspace authority foundation / M5
 
@@ -147,16 +175,16 @@ schema/allocation/registry/service substrate, and required sidecar/runtime
 foundation that #555–#558 assume already exists. Do not hide this prerequisite
 inside the #555 landing PR.
 
-4. #555 — attached-route authority matrix, if the landing dependency audit
+6. #555 — attached-route authority matrix, if the landing dependency audit
    confirms it is required by #556 on current `main`
-5. #556 — Run / Session workspace identity contract
-6. #558 — trusted workspace host resolve seam
-7. #559 — atomic workspace run admission
-8. #560 — adversarial admission coverage
-9. #561 — workspace-aware terminal transition + exact lease release
-10. #562 — startup orphan reconciliation
-11. #566 — active run-lease lookup / rehydration
-12. #567 — runtime workspace authority activation
+7. #556 — Run / Session workspace identity contract
+8. #558 — trusted workspace host resolve seam
+9. #559 — atomic workspace run admission
+10. #560 — adversarial admission coverage
+11. #561 — workspace-aware terminal transition + exact lease release
+12. #562 — startup orphan reconciliation
+13. #566 — active run-lease lookup / rehydration
+14. #567 — runtime workspace authority activation
 
 The M5 development milestone is considered complete when these behaviors are
 green on the integration branch. Main landing remains incremental in the order
@@ -164,9 +192,9 @@ above.
 
 ### M6
 
-13. #568 — atomic `RunWorkspaceAuthoritySnapshot`
-14. M6.1b — pinned opaque `WorkspaceHandle`
-15. later M6 slices — ToolContext authority binding and use-time validation
+15. #568 — atomic `RunWorkspaceAuthoritySnapshot`
+16. M6.1b — pinned opaque `WorkspaceHandle`
+17. later M6 slices — ToolContext authority binding and use-time validation
 
 M6 should continue development on top of the reviewed M5/M6 stack even while
 the earlier landing PRs are being reviewed for `main`.
@@ -221,6 +249,85 @@ retain the existing rule of two independent exact-head reviews.
 8. Repeat from the updated `main`.
 
 This creates a conveyor belt rather than a final big-bang merge.
+
+## PLDM / main-reviewer execution checklist
+
+This section is the operational instruction for the person reviewing and
+merging Open Design work into Agent24 `main`.
+
+### Phase 0 — approve the process
+
+1. Review this document PR first.
+2. Confirm the two-lane policy: staging/integration is for composition and
+   product testing; `main` receives only small landing PRs.
+3. Do **not** merge `integration/open-design-main-sync-wave20` or the current
+   preview branch wholesale into `main`.
+4. Do **not** ask the existing published stacks to be rebased/force-pushed.
+
+### Phase 1 — inventory the missing foundation
+
+1. Compare current `main` with the merge-base of the Open Design stack.
+2. Identify only the pre-#555 capability/workspace/runtime slices that are
+   actually required by #555/#556/#558.
+3. For each required foundation slice, create or reuse a small landing PR from
+   latest `main` and review it independently.
+4. Merge those foundation PRs before attempting the dependent M5 authority
+   train.
+
+### Phase 2 — land the prototype train first
+
+For #563, #564, and #565, in that order:
+
+1. Create `land/open-design-<slice>` from the latest `main`.
+2. Apply only that reviewed slice's delta.
+3. Verify patch/tree equivalence against the reviewed development PR.
+4. If adaptation to current `main` is needed, call it out explicitly and review
+   the adapted landing head as new code.
+5. Run the slice's focused tests plus the relevant full desktop/CLI/daemon
+   validation.
+6. Merge the small PR to `main` only after CI/review is green.
+7. Create the next landing branch from the newly updated `main`.
+
+After #563-#565 are landed, rerun the M4 packaged E2E gate on `main` plus the
+pinned Open Design fork revision. This proves that the prototype still works
+after clean main landing.
+
+### Phase 3 — land M5 bottom-up
+
+Once the required pre-#555 foundation is in `main`, process:
+
+`#555 -> #556 -> #558 -> #559 -> #560 -> #561 -> #562 -> #566 -> #567`
+
+For every item, use the same clean `land/open-design-*` procedure rather than
+merging the old stacked branch directly.
+
+### Phase 4 — land M6 and later slices continuously
+
+After #567 is in `main`, continue the same conveyor belt:
+
+`#568 -> M6.1b WorkspaceHandle -> later M6 slices -> M7 -> M8 -> M9 -> M10`
+
+Do not wait for M10 and then create one final large PR.
+
+### After every landing tranche
+
+1. Merge the new `main` back into the long-lived Open Design staging branch by
+   a normal merge commit.
+2. Rebuild the packaged preview and rerun the relevant cross-stack E2E path.
+3. Continue development from the staging/development stack while the next
+   small landing PR is under human review.
+
+### Stop conditions
+
+PLDM should stop the landing train at the current slice if any of these occurs:
+
+- the landing diff contains unrelated wave20 history;
+- patch-equivalence cannot be demonstrated and the adaptation is not separately
+  reviewed;
+- required parent/foundation behavior is absent from current `main`;
+- focused or required platform CI is red;
+- the landing PR is growing into a multi-slice change that no longer has a
+  narrow rollback boundary.
 
 ## What not to do
 
