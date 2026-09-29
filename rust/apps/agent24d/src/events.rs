@@ -68,12 +68,16 @@ pub async fn ws_events(
             "Browser-originated WebSocket upgrades are not allowed",
         );
     }
-    let hub = state.events.clone();
-    upgrade.on_upgrade(move |socket| client_loop(socket, hub))
+    // Subscribe before returning the upgrade response. A client can finish the
+    // WebSocket handshake before `on_upgrade` begins polling its callback; if
+    // the receiver were created inside `client_loop`, a run started immediately
+    // after that handshake could broadcast its first (or terminal) event into
+    // the gap and the connection would never be able to recover it.
+    let rx = state.events.subscribe();
+    upgrade.on_upgrade(move |socket| client_loop(socket, rx))
 }
 
-async fn client_loop(mut socket: WebSocket, hub: EventsHub) {
-    let mut rx = hub.subscribe();
+async fn client_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<(String, EventBody)>) {
     let mut seq: u64 = 0;
     loop {
         tokio::select! {
@@ -132,5 +136,32 @@ mod tests {
         let (ts, body) = rx.recv().await.unwrap();
         assert!(ts.ends_with('Z'));
         assert_eq!(body.wire_type(), "run.cancelled");
+    }
+
+    #[tokio::test]
+    async fn pre_upgrade_callback_subscription_keeps_event_until_client_loop_receives() {
+        let hub = EventsHub::default();
+        // Mirrors `ws_events`: subscribe while handling the HTTP upgrade,
+        // before the `on_upgrade` future is allowed to start `client_loop`.
+        let mut rx = hub.subscribe();
+
+        // A very fast run may finish after the client handshake but before the
+        // upgrade callback is polled. The receiver must already own this event.
+        hub.broadcast(EventBody::RunCancelled(
+            agent24_protocol::RunCancelledPayload {
+                run_id: "run_before_client_loop".to_owned(),
+            },
+        ));
+
+        let (_ts, body) = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("pre-client-loop event should remain queued")
+            .expect("events hub should remain open");
+        assert_eq!(
+            body,
+            EventBody::RunCancelled(agent24_protocol::RunCancelledPayload {
+                run_id: "run_before_client_loop".to_owned(),
+            })
+        );
     }
 }
