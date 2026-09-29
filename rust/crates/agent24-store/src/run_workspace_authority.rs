@@ -1,27 +1,41 @@
 use agent24_protocol::{RunStatus, WorkspaceId};
 
 use crate::{
-    AllocationPhase, AllocationRecord, LeaseKind, Store, WorkspaceInstant, WorkspaceKind,
-    WorkspaceLeaseId, WorkspaceLeaseRow, WorkspaceResult, WorkspaceRootSnapshot, WorkspaceRow,
-    WorkspaceState, WorkspaceStoreError, repo::row_to_run,
+    AllocationPhase, AllocationRecord, LeaseKind, RootIdentity, Store, WorkspaceInstant,
+    WorkspaceKind, WorkspaceLeaseId, WorkspaceLeaseRow, WorkspaceResult, WorkspaceRootSnapshot,
+    WorkspaceRow, WorkspaceState, WorkspaceStoreError, repo::row_to_run,
 };
 
+/// Point-in-time persistence evidence for later workspace authority minting.
+#[doc(hidden)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct RunWorkspaceAuthoritySnapshot {
-    run_id: String,
-    lease_id: WorkspaceLeaseId,
     root: WorkspaceRootSnapshot,
 }
 
 impl RunWorkspaceAuthoritySnapshot {
-    pub fn run_id(&self) -> &str {
-        &self.run_id
+    pub fn workspace_id(&self) -> &WorkspaceId {
+        self.root.workspace_id()
     }
-    pub fn lease_id(&self) -> &WorkspaceLeaseId {
-        &self.lease_id
+
+    pub fn root_generation(&self) -> &str {
+        self.root.root().root_generation()
     }
-    pub fn root(&self) -> &WorkspaceRootSnapshot {
-        &self.root
+
+    pub fn relative_name(&self) -> &str {
+        self.root.relative_name()
+    }
+
+    pub fn parent_identity(&self) -> RootIdentity {
+        self.root.parent_identity()
+    }
+
+    pub fn root_identity(&self) -> RootIdentity {
+        self.root.root().identity()
+    }
+
+    pub fn canonical_root_matches(&self, candidate: &str) -> bool {
+        self.root.root().canonical_root() == candidate
     }
 }
 
@@ -32,6 +46,7 @@ fn corrupt(table: &'static str, field: &'static str) -> WorkspaceStoreError {
 impl Store {
     /// Read the complete persisted authority evidence for one live workspace run
     /// from one SQLite snapshot. No authority is minted here.
+    #[doc(hidden)]
     pub async fn run_workspace_authority_snapshot(
         &self,
         run_id: &str,
@@ -144,8 +159,6 @@ impl Store {
         }
 
         let snapshot = RunWorkspaceAuthoritySnapshot {
-            run_id: run.id,
-            lease_id: lease.id.clone(),
             root: WorkspaceRootSnapshot::new(
                 workspace_id.clone(),
                 allocation.relative_name().to_owned(),
@@ -161,17 +174,216 @@ impl Store {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    const WS:&str="ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5"; const WS2:&str="ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7"; const LEASE:&str="wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6"; const OTHER:&str="wl_01J5M4Q2Y7N8P9R0S1T2V3W4X8"; const TS:&str="2026-09-19T00:00:00.000Z"; const NOW:&str="2026-09-19T00:00:01.000Z";
-    async fn seed()->Store{let s=Store::open_memory().await.unwrap();sqlx::raw_sql("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES ('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','orchestrator_scratch','active','test','external','orchestrator','owner','serial','2026-09-19T00:00:00.000Z','2026-09-19T00:01:00.000Z',1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202'); INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','root','unix',X'0303030303030303',X'0404040404040404','unix',X'0101010101010101',X'0202020202020202','committed','2026-09-19T00:00:00.000Z'); INSERT INTO sessions (id,title,channel,workspace_id,created_at,updated_at) VALUES ('s','s','desktop','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','2026-09-19T00:00:00.000Z','2026-09-19T00:00:00.000Z'); INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at) VALUES ('r','s','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','running','{\"prompt\":\"go\",\"workspace_id\":\"ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5\",\"model_override\":null,\"mode\":\"normal\"}','{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"cost_usd\":0.0}','2026-09-19T00:00:00.000Z'); INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','r','run','2026-09-19T00:00:00.000Z');").execute(s.pool()).await.unwrap();s}
-    fn lid(v:&str)->WorkspaceLeaseId{WorkspaceLeaseId::parse(v).unwrap()} fn now()->WorkspaceInstant{WorkspaceInstant::parse(NOW).unwrap()} async fn fails(s:&Store,id:&WorkspaceLeaseId,at:&WorkspaceInstant){assert!(s.run_workspace_authority_snapshot("r",id,at).await.is_err());}
-    #[tokio::test] async fn valid_snapshot(){let s=seed().await;let snap=s.run_workspace_authority_snapshot("r",&lid(LEASE),&now()).await.unwrap();assert_eq!(snap.run_id(),"r");assert_eq!(snap.lease_id().as_str(),LEASE);assert_eq!(snap.root().workspace_id().as_str(),WS);assert_eq!(snap.root().root().root_generation(),"g1");}
-    #[tokio::test] async fn wrong_released_and_duplicate_lease_fail(){for mode in 0..3{let s=seed().await;if mode==1{sqlx::query("UPDATE workspace_leases SET released_at=?").bind(NOW).execute(s.pool()).await.unwrap();}else if mode==2{sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES (?,?,?,'r','run',?,?)").bind(OTHER).bind(WS).bind("g1").bind(TS).bind(NOW).execute(s.pool()).await.unwrap();}let id=if mode==0{lid(OTHER)}else{lid(LEASE)};fails(&s,&id,&now()).await;}}
-    #[tokio::test] async fn run_binding_and_liveness_fail_closed(){for sql in [format!("UPDATE runs SET input=json_set(input,'$.workspace_id','{WS2}') WHERE id='r'"),"UPDATE runs SET status='completed' WHERE id='r'".into(),format!("UPDATE runs SET ended_at='{NOW}' WHERE id='r'")]{let s=seed().await;sqlx::query(&sql).execute(s.pool()).await.unwrap();fails(&s,&lid(LEASE),&now()).await;}}
-    #[tokio::test] async fn session_binding_is_required(){for mode in 0..3{let s=seed().await;if mode==0{sqlx::query("UPDATE sessions SET workspace_id=NULL WHERE id='s'").execute(s.pool()).await.unwrap();}else{let mut c=s.pool().acquire().await.unwrap();sqlx::query("PRAGMA foreign_keys=OFF").execute(&mut *c).await.unwrap();if mode==1{sqlx::query("UPDATE sessions SET workspace_id=? WHERE id='s'").bind(WS2).execute(&mut *c).await.unwrap();}else{sqlx::query("DELETE FROM sessions WHERE id='s'").execute(&mut *c).await.unwrap();}sqlx::query("PRAGMA foreign_keys=ON").execute(&mut *c).await.unwrap();}fails(&s,&lid(LEASE),&now()).await;}}
-    #[tokio::test] async fn inactive_or_invalid_clock_workspace_fails(){let s=seed().await;sqlx::query("UPDATE workspaces SET state='expired'").execute(s.pool()).await.unwrap();fails(&s,&lid(LEASE),&now()).await;let s=seed().await;let late=WorkspaceInstant::parse("2026-09-19T00:01:00.000Z").unwrap();fails(&s,&lid(LEASE),&late).await;for sql in ["UPDATE workspaces SET created_at='2026-09-19T00:00:02.000Z'","UPDATE workspaces SET renewed_at='2026-09-19T00:00:02.000Z'","UPDATE workspace_leases SET acquired_at='2026-09-19T00:00:02.000Z'"]{let s=seed().await;sqlx::query(sql).execute(s.pool()).await.unwrap();fails(&s,&lid(LEASE),&now()).await;}}
-    #[tokio::test] async fn generation_allocation_and_identity_drift_fail(){for mode in 0..4{let s=seed().await;if mode==0{let mut c=s.pool().acquire().await.unwrap();sqlx::query("PRAGMA foreign_keys=OFF").execute(&mut *c).await.unwrap();sqlx::query("UPDATE workspace_leases SET root_generation='g2'").execute(&mut *c).await.unwrap();sqlx::query("PRAGMA foreign_keys=ON").execute(&mut *c).await.unwrap();}else if mode==1{sqlx::query("DELETE FROM workspace_allocations").execute(s.pool()).await.unwrap();}else if mode==2{sqlx::query("UPDATE workspace_allocations SET phase='retained',failure_reason='other'").execute(s.pool()).await.unwrap();}else{sqlx::query("UPDATE workspace_allocations SET root_unix_inode=X'0909090909090909'").execute(s.pool()).await.unwrap();}fails(&s,&lid(LEASE),&now()).await;}}
+    const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+    const WS2: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7";
+    const LEASE: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+    const OTHER: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X8";
+    const TS: &str = "2026-09-19T00:00:00.000Z";
+    const NOW: &str = "2026-09-19T00:00:01.000Z";
+    async fn seed() -> Store {
+        let s = Store::open_memory().await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO workspaces
+                (id, kind, state, provenance_source, writeback_policy, lifecycle_owner_kind,
+                 lifecycle_owner_ref, concurrency_policy, created_at, expires_at, revision,
+                 canonical_root, root_generation, root_identity_kind, unix_device, unix_inode)
+            VALUES
+                ('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5', 'orchestrator_scratch', 'active', 'test',
+                 'external', 'orchestrator', 'owner', 'serial', '2026-09-19T00:00:00.000Z',
+                 '2026-09-19T00:01:00.000Z', 1, '/scratch', 'g1', 'unix',
+                 X'0101010101010101', X'0202020202020202');
+
+            INSERT INTO workspace_allocations
+                (allocation_id, workspace_id, root_generation, relative_name, parent_identity_kind,
+                 parent_unix_device, parent_unix_inode, root_identity_kind, root_unix_device,
+                 root_unix_inode, phase, created_at)
+            VALUES
+                ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5', 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5', 'g1',
+                 'root', 'unix', X'0303030303030303', X'0404040404040404', 'unix',
+                 X'0101010101010101', X'0202020202020202', 'committed',
+                 '2026-09-19T00:00:00.000Z');
+
+            INSERT INTO sessions (id, title, channel, workspace_id, created_at, updated_at)
+            VALUES ('s', 's', 'desktop', 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5',
+                    '2026-09-19T00:00:00.000Z', '2026-09-19T00:00:00.000Z');
+
+            INSERT INTO runs (id, session_id, workspace_id, status, input, usage, created_at)
+            VALUES ('r', 's', 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5', 'running',
+                    '{"prompt":"go","workspace_id":"ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5","model_override":null,"mode":"normal"}',
+                    '{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"cost_usd":0.0}',
+                    '2026-09-19T00:00:00.000Z');
+
+            INSERT INTO workspace_leases
+                (lease_id, workspace_id, root_generation, owner_id, kind, acquired_at)
+            VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6', 'ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5',
+                    'g1', 'r', 'run', '2026-09-19T00:00:00.000Z');
+            "#,
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+        s
+    }
+    fn lid(v: &str) -> WorkspaceLeaseId {
+        WorkspaceLeaseId::parse(v).unwrap()
+    }
+    fn now() -> WorkspaceInstant {
+        WorkspaceInstant::parse(NOW).unwrap()
+    }
+    async fn fails(s: &Store, id: &WorkspaceLeaseId, at: &WorkspaceInstant) {
+        assert!(
+            s.run_workspace_authority_snapshot("r", id, at)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn valid_snapshot() {
+        let s = seed().await;
+        let snap = s
+            .run_workspace_authority_snapshot("r", &lid(LEASE), &now())
+            .await
+            .unwrap();
+        assert_eq!(snap.workspace_id().as_str(), WS);
+        assert_eq!(snap.root_generation(), "g1");
+        assert_eq!(snap.relative_name(), "root");
+        assert_eq!(
+            snap.parent_identity(),
+            RootIdentity::unix(&[3; 8], &[4; 8]).unwrap()
+        );
+        assert_eq!(
+            snap.root_identity(),
+            RootIdentity::unix(&[1; 8], &[2; 8]).unwrap()
+        );
+        assert!(snap.canonical_root_matches("/scratch"));
+        assert!(!snap.canonical_root_matches("/other"));
+    }
+    #[tokio::test]
+    async fn wrong_released_and_duplicate_lease_fail() {
+        for mode in 0..3 {
+            let s = seed().await;
+            if mode == 1 {
+                sqlx::query("UPDATE workspace_leases SET released_at=?")
+                    .bind(NOW)
+                    .execute(s.pool())
+                    .await
+                    .unwrap();
+            } else if mode == 2 {
+                sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES (?,?,?,'r','run',?,?)").bind(OTHER).bind(WS).bind("g1").bind(TS).bind(NOW).execute(s.pool()).await.unwrap();
+            }
+            let id = if mode == 0 { lid(OTHER) } else { lid(LEASE) };
+            fails(&s, &id, &now()).await;
+        }
+    }
+    #[tokio::test]
+    async fn run_binding_and_liveness_fail_closed() {
+        for sql in [
+            format!("UPDATE runs SET input=json_set(input,'$.workspace_id','{WS2}') WHERE id='r'"),
+            "UPDATE runs SET status='completed' WHERE id='r'".into(),
+            format!("UPDATE runs SET ended_at='{NOW}' WHERE id='r'"),
+        ] {
+            let s = seed().await;
+            sqlx::query(&sql).execute(s.pool()).await.unwrap();
+            fails(&s, &lid(LEASE), &now()).await;
+        }
+    }
+    #[tokio::test]
+    async fn session_binding_is_required() {
+        for mode in 0..3 {
+            let s = seed().await;
+            if mode == 0 {
+                sqlx::query("UPDATE sessions SET workspace_id=NULL WHERE id='s'")
+                    .execute(s.pool())
+                    .await
+                    .unwrap();
+            } else {
+                let mut c = s.pool().acquire().await.unwrap();
+                sqlx::query("PRAGMA foreign_keys=OFF")
+                    .execute(&mut *c)
+                    .await
+                    .unwrap();
+                if mode == 1 {
+                    sqlx::query("UPDATE sessions SET workspace_id=? WHERE id='s'")
+                        .bind(WS2)
+                        .execute(&mut *c)
+                        .await
+                        .unwrap();
+                } else {
+                    sqlx::query("DELETE FROM sessions WHERE id='s'")
+                        .execute(&mut *c)
+                        .await
+                        .unwrap();
+                }
+                sqlx::query("PRAGMA foreign_keys=ON")
+                    .execute(&mut *c)
+                    .await
+                    .unwrap();
+            }
+            fails(&s, &lid(LEASE), &now()).await;
+        }
+    }
+    #[tokio::test]
+    async fn inactive_or_invalid_clock_workspace_fails() {
+        let s = seed().await;
+        sqlx::query("UPDATE workspaces SET state='expired'")
+            .execute(s.pool())
+            .await
+            .unwrap();
+        fails(&s, &lid(LEASE), &now()).await;
+        let s = seed().await;
+        let late = WorkspaceInstant::parse("2026-09-19T00:01:00.000Z").unwrap();
+        fails(&s, &lid(LEASE), &late).await;
+        for sql in [
+            "UPDATE workspaces SET created_at='2026-09-19T00:00:02.000Z'",
+            "UPDATE workspaces SET renewed_at='2026-09-19T00:00:02.000Z'",
+            "UPDATE workspace_leases SET acquired_at='2026-09-19T00:00:02.000Z'",
+        ] {
+            let s = seed().await;
+            sqlx::query(sql).execute(s.pool()).await.unwrap();
+            fails(&s, &lid(LEASE), &now()).await;
+        }
+    }
+    #[tokio::test]
+    async fn generation_allocation_and_identity_drift_fail() {
+        for mode in 0..4 {
+            let s = seed().await;
+            if mode == 0 {
+                let mut c = s.pool().acquire().await.unwrap();
+                sqlx::query("PRAGMA foreign_keys=OFF")
+                    .execute(&mut *c)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE workspace_leases SET root_generation='g2'")
+                    .execute(&mut *c)
+                    .await
+                    .unwrap();
+                sqlx::query("PRAGMA foreign_keys=ON")
+                    .execute(&mut *c)
+                    .await
+                    .unwrap();
+            } else if mode == 1 {
+                sqlx::query("DELETE FROM workspace_allocations")
+                    .execute(s.pool())
+                    .await
+                    .unwrap();
+            } else if mode == 2 {
+                sqlx::query(
+                    "UPDATE workspace_allocations SET phase='retained',failure_reason='other'",
+                )
+                .execute(s.pool())
+                .await
+                .unwrap();
+            } else {
+                sqlx::query("UPDATE workspace_allocations SET root_unix_inode=X'0909090909090909'")
+                    .execute(s.pool())
+                    .await
+                    .unwrap();
+            }
+            fails(&s, &lid(LEASE), &now()).await;
+        }
+    }
 }
