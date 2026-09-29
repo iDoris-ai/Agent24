@@ -796,6 +796,11 @@ impl RunManager {
             .ok_or_else(|| {
                 AgentError::Store(StoreError::NotFound(format!("approval {approval_id}")))
             })?;
+        if approval.run_id != run.id {
+            return Err(AgentError::Store(StoreError::Conflict(
+                "approval does not belong to run".to_owned(),
+            )));
+        }
         let thread = self.store.list_run_messages(&run_id).await?;
 
         // Register the cancel token BEFORE spawning, and refuse if one already
@@ -3700,6 +3705,35 @@ mod approval_tests {
             created_at: now_iso8601(),
             decided_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_approval_owned_by_another_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        h.store
+            .insert_run(&run_in("run_a", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        h.store
+            .insert_run(&run_in("run_b", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        let approval = seed_approval("apr_a", "run_a", "tc_a", serde_json::Map::new());
+        h.store.insert_approval(&approval).await.unwrap();
+
+        assert!(matches!(
+            h.manager
+                .resume_run("run_b".to_owned(), "apr_a".to_owned())
+                .await,
+            Err(AgentError::Store(StoreError::Conflict(message)))
+                if message == "approval does not belong to run"
+        ));
+        assert_eq!(
+            h.store.get_run("run_b").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        assert!(!h.manager.cancels.lock().await.contains_key("run_b"));
     }
 
     /// Startup restore sweep (H3): a restorable pending approval is re-broadcast
