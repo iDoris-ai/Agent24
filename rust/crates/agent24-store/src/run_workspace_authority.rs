@@ -3,7 +3,7 @@ use agent24_protocol::{RunStatus, WorkspaceId};
 use crate::{
     AllocationPhase, AllocationRecord, LeaseKind, RootIdentity, Store, WorkspaceInstant,
     WorkspaceKind, WorkspaceLeaseId, WorkspaceLeaseRow, WorkspaceResult, WorkspaceRootSnapshot,
-    WorkspaceRow, WorkspaceState, WorkspaceStoreError, repo::row_to_run,
+    WorkspaceRow, WorkspaceState, WorkspaceStoreError, terminal_helpers::decode_run,
 };
 
 /// Point-in-time persistence evidence for later workspace authority minting.
@@ -64,12 +64,13 @@ impl Store {
             .await
             .map_err(|_| WorkspaceStoreError::Database)?
             .ok_or(WorkspaceStoreError::NotFound)?;
-        let run = row_to_run(&row).map_err(|_| corrupt("runs", "row"))?;
-        let workspace_id = run
-            .workspace_id
-            .as_ref()
-            .filter(|id| run.input.workspace_id.as_ref() == Some(*id))
-            .ok_or_else(|| corrupt("runs", "workspace_id"))?;
+        let facts = decode_run(&row)?;
+        let created_at = facts.created_at.clone();
+        let run = facts.run;
+        let workspace_id = facts.workspace_id;
+        if run.input.workspace_id.as_ref() != Some(&workspace_id) {
+            return Err(corrupt("runs", "workspace_id"));
+        }
         if !matches!(
             run.status,
             RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingApproval
@@ -92,12 +93,10 @@ impl Store {
         .ok_or_else(|| corrupt("sessions", "workspace_id"))?;
         if WorkspaceId::parse(&session_workspace)
             .map_err(|_| corrupt("sessions", "workspace_id"))?
-            != *workspace_id
+            != workspace_id
         {
             return Err(corrupt("sessions", "workspace_id"));
         }
-        let created_at =
-            WorkspaceInstant::parse(&run.created_at).map_err(|_| corrupt("runs", "created_at"))?;
         if now < &created_at {
             return Err(corrupt("runs", "created_at"));
         }
@@ -116,7 +115,7 @@ impl Store {
             || lease.released_at.is_some()
             || lease.kind != LeaseKind::Run
             || lease.owner_id != run.id
-            || lease.workspace_id != *workspace_id
+            || lease.workspace_id != workspace_id
             || lease.acquired_at < created_at
             || now < &lease.acquired_at
         {
@@ -151,7 +150,7 @@ impl Store {
         .ok_or_else(|| corrupt("workspace_allocations", "workspace_id"))?;
         let allocation = AllocationRecord::decode(&allocation_row)?;
         if allocation.phase() != AllocationPhase::Committed
-            || allocation.workspace_id() != workspace_id
+            || allocation.workspace_id() != &workspace_id
             || allocation.root_generation() != workspace.root.root_generation()
             || allocation.root_identity() != Some(workspace.root.identity())
         {
@@ -160,7 +159,7 @@ impl Store {
 
         let snapshot = RunWorkspaceAuthoritySnapshot {
             root: WorkspaceRootSnapshot::new(
-                workspace_id.clone(),
+                workspace_id,
                 allocation.relative_name().to_owned(),
                 allocation.parent_identity(),
                 workspace.root.clone(),
@@ -383,6 +382,19 @@ mod tests {
                     .await
                     .unwrap();
             }
+            fails(&s, &lid(LEASE), &now()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_sqlite_run_field_types_fail_closed() {
+        for sql in [
+            "UPDATE runs SET created_at=X'07' WHERE id='r'",
+            "UPDATE runs SET input=X'07' WHERE id='r'",
+            "UPDATE runs SET usage=X'07' WHERE id='r'",
+        ] {
+            let s = seed().await;
+            sqlx::query(sql).execute(s.pool()).await.unwrap();
             fails(&s, &lid(LEASE), &now()).await;
         }
     }

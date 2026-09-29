@@ -71,7 +71,7 @@ pub(crate) struct TerminalRunFacts {
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) created_at: WorkspaceInstant,
 }
-fn decode_run(row: &SqliteRow) -> WorkspaceResult<TerminalRunFacts> {
+pub(crate) fn decode_run(row: &SqliteRow) -> WorkspaceResult<TerminalRunFacts> {
     let created_at = instant(row, "runs", "created_at")?;
     let started_at = opt_instant(row, "runs", "started_at")?;
     let ended_at = opt_instant(row, "runs", "ended_at")?;
