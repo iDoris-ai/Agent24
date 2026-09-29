@@ -1,6 +1,7 @@
 # A3 —— 附着式进程模块（Attached Process Module）设计
 
 > **状态：v2 冻结**（2026-09-27，agent24-13）。v2 = jason 拍板（§11）+ Tier-2 对抗评审修订（4H/7M 全部落入）+ AgentEar 会话（agentear-59）对齐六点。按用户控制范围要求：**设计只评审一轮，v2 即冻结，不再复审**；实现阶段每个 PR 各评审一轮。本文是 AgentEar 嵌入的 **P0 契约冻结的 Agent24 一侧**，冻结即解除 P2 联调阻塞。
+> **实现**：A3-1 #527 / A3-2a #526 / A3-2b #529 / A3-3 #532 / A3-4 #534 已合并（2026-09-27），随 v0.4.0 发布；AgentEar 侧 v0.25.1 真 agentd E2E 5 次里 4 次通过（第 5 次的首轮失败很可能已由发版前修复 #543 的 C1 解决，见 `docs/agent/followups.md` FU-99，待复验）。
 > 关联：ADR-032、[`INTEGRATION-AGENTEAR-IDORIS.md`](INTEGRATION-AGENTEAR-IDORIS.md) §8「A3」；AgentEar `docs/agent24-embedding.md`、AgentEar `contracts/`（已合入 AgentEar `main@522f9eb`，见 §7.2）；[`SPEC-ME3-OUT-OF-PROCESS.md`](../specs/SPEC-ME3-OUT-OF-PROCESS.md)（A1）、[`ME4-S2`](ME4-S2-model-callback.md)、[`ME4-S3`](ME4-S3-os-sdk.md)。
 > 基线：Agent24 `main@f504ae0`；文中行号、常量均按此提交核对。Rust 签名已在 scratch crate（依赖真实 `agent24-os-proto`/`agent24-domain`）`cargo check` 通过，见附录 A。
 
@@ -419,7 +420,7 @@ A3-2 超过 300 行门槛，按层拆为 **A3-2a「存储 + 注册表 + REST + C
 | # | 问题 | 决定 | 落点 |
 |---|---|---|---|
 | Q1 | P2 桌面端要不要显示**模型回复文本** | **a）P2 不显示**，只显示 transcript + tier；回复展示与留档一起放 P3，不为展示先改 `agentear.event/1` | §7.3 |
-| Q2 | 配对 UX：谁调 `agent24 os attach add` | **b）AgentEar 设置里一键配对**：代跑本机 `agent24` CLI，token 存 Keychain；失败时退回终端手动；放宽隐私不能静默（M4） | §3.5、§3.6、§5.6 |
+| Q2 | 配对 UX：谁调 `agent24 os attach add` | **b）AgentEar 设置里一键配对**：代跑本机 `agent24` CLI，token 存储；失败时退回终端手动；放宽隐私不能静默（M4）。**更新（v0.4.0）**：token 存储位置从 macOS Keychain 改为 `~/.agentear/agent24/token`（0600），需要 AgentEar ≥ v0.25.2，推荐 v0.26.1——升级后不再弹钥匙串授权提示；同 UID 威胁模型下（模块与内核同 UID、无沙箱，见 §0）文件权限 0600 与 Keychain 提供等价的机密性 | §3.5、§3.6、§5.6 |
 | Q3 | 现役代存在时来了第二条合法连接 | **a）先到者保留，后到者 `busy`** | §4.3、§5.4 |
 | Q4 | 是否让 Agent24 持久化 transcript | **a）不持久化**。转写记录的归属方是 AgentEar（它默认已保存）；Agent24 只在桌面面板实时显示，不写数据库、不写日志 | §7.3、§8、C7、C10 |
 
