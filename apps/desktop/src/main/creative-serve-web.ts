@@ -82,10 +82,18 @@ export class CreativeServeWeb {
 
     const entry = path.join(checkoutDir, 'apps/daemon/bin/od.mjs')
     const distEntry = path.join(checkoutDir, 'apps/daemon/dist/cli.js')
+    const webEntry = path.join(checkoutDir, 'apps/web/out/index.html')
     if (!fs.existsSync(entry) || !fs.existsSync(distEntry)) {
       this.current = {
         state: 'failed',
         error: 'Open Design daemon is not built; run pnpm --filter @open-design/daemon build',
+      }
+      return this.status()
+    }
+    if (!fs.existsSync(webEntry)) {
+      this.current = {
+        state: 'failed',
+        error: 'Open Design web bundle is not built; run pnpm --filter @open-design/web build',
       }
       return this.status()
     }
