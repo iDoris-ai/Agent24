@@ -54,6 +54,10 @@ impl EventsHub {
     }
 }
 
+fn pre_upgrade_receiver(hub: &EventsHub) -> broadcast::Receiver<(String, EventBody)> {
+    hub.subscribe()
+}
+
 pub async fn ws_events(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -73,7 +77,7 @@ pub async fn ws_events(
     // the receiver were created inside `client_loop`, a run started immediately
     // after that handshake could broadcast its first (or terminal) event into
     // the gap and the connection would never be able to recover it.
-    let rx = state.events.subscribe();
+    let rx = pre_upgrade_receiver(&state.events);
     upgrade.on_upgrade(move |socket| client_loop(socket, rx))
 }
 
@@ -141,9 +145,9 @@ mod tests {
     #[tokio::test]
     async fn pre_upgrade_callback_subscription_keeps_event_until_client_loop_receives() {
         let hub = EventsHub::default();
-        // Mirrors `ws_events`: subscribe while handling the HTTP upgrade,
-        // before the `on_upgrade` future is allowed to start `client_loop`.
-        let mut rx = hub.subscribe();
+        // Exercise the exact production seam used by `ws_events` before
+        // `on_upgrade` is returned.
+        let mut rx = pre_upgrade_receiver(&hub);
 
         // A very fast run may finish after the client handshake but before the
         // upgrade callback is polled. The receiver must already own this event.
