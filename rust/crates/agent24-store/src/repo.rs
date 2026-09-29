@@ -86,11 +86,23 @@ fn effective(
 }
 
 fn row_to_run(row: &SqliteRow) -> Result<Run> {
+    let workspace_id = row
+        .get::<Option<String>, _>("workspace_id")
+        .map(agent24_protocol::WorkspaceId::parse)
+        .transpose()
+        .map_err(|_| StoreError::Conflict("invalid run workspace_id".to_owned()))?;
+    let input: agent24_protocol::RunInput = serde_json::from_str(&row.get::<String, _>("input"))?;
+    if input.workspace_id != workspace_id {
+        return Err(StoreError::Conflict(
+            "run workspace identity mismatch".to_owned(),
+        ));
+    }
     Ok(Run {
         id: row.get("id"),
         session_id: row.get("session_id"),
+        workspace_id,
         status: parse_status(&row.get::<String, _>("status"))?,
-        input: serde_json::from_str(&row.get::<String, _>("input"))?,
+        input,
         output: row
             .get::<Option<String>, _>("output")
             .map(|s| serde_json::from_str::<RunOutput>(&s))
@@ -170,12 +182,13 @@ impl Store {
 
     pub async fn insert_session(&self, session: &Session) -> Result<()> {
         sqlx::query(
-            "INSERT INTO sessions (id, title, channel, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, title, channel, workspace_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&session.id)
         .bind(&session.title)
         .bind(&session.channel)
+        .bind(session.workspace_id.as_ref().map(|id| id.as_str()))
         .bind(&session.created_at)
         .bind(&session.updated_at)
         .execute(self.pool())
@@ -188,13 +201,21 @@ impl Store {
             .bind(id)
             .fetch_optional(self.pool())
             .await?;
-        Ok(row.map(|r| Session {
-            id: r.get("id"),
-            title: r.get("title"),
-            channel: r.get("channel"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        }))
+        row.map(|r| {
+            Ok(Session {
+                id: r.get("id"),
+                title: r.get("title"),
+                channel: r.get("channel"),
+                workspace_id: r
+                    .get::<Option<String>, _>("workspace_id")
+                    .map(agent24_protocol::WorkspaceId::parse)
+                    .transpose()
+                    .map_err(|_| StoreError::Conflict("invalid session workspace_id".to_owned()))?,
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+        })
+        .transpose()
     }
 
     /// # Ordering
@@ -217,28 +238,42 @@ impl Store {
         let rows = sqlx::query("SELECT * FROM sessions ORDER BY created_at DESC, id DESC")
             .fetch_all(self.pool())
             .await?;
-        Ok(rows
-            .iter()
-            .map(|r| Session {
-                id: r.get("id"),
-                title: r.get("title"),
-                channel: r.get("channel"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
+        rows.iter()
+            .map(|r| {
+                Ok(Session {
+                    id: r.get("id"),
+                    title: r.get("title"),
+                    channel: r.get("channel"),
+                    workspace_id: r
+                        .get::<Option<String>, _>("workspace_id")
+                        .map(agent24_protocol::WorkspaceId::parse)
+                        .transpose()
+                        .map_err(|_| {
+                            StoreError::Conflict("invalid session workspace_id".to_owned())
+                        })?,
+                    created_at: r.get("created_at"),
+                    updated_at: r.get("updated_at"),
+                })
             })
-            .collect())
+            .collect()
     }
 
     // ── runs ─────────────────────────────────────────────────────────────────
 
     pub async fn insert_run(&self, run: &Run) -> Result<()> {
+        if run.workspace_id != run.input.workspace_id {
+            return Err(StoreError::Conflict(
+                "run workspace identity mismatch".to_owned(),
+            ));
+        }
         sqlx::query(
-            "INSERT INTO runs (id, session_id, status, input, output, error, usage,
+            "INSERT INTO runs (id, session_id, workspace_id, status, input, output, error, usage,
                                schedule_id, created_at, started_at, ended_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&run.id)
         .bind(&run.session_id)
+        .bind(run.workspace_id.as_ref().map(|id| id.as_str()))
         .bind(status_str(run.status))
         .bind(serde_json::to_string(&run.input)?)
         .bind(run.output.as_ref().map(serde_json::to_string).transpose()?)

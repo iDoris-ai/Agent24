@@ -1,4 +1,5 @@
 use chrono::{DateTime, Duration, FixedOffset};
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 
 pub const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -18,8 +19,11 @@ pub enum WorkspaceValidationError {
     #[error("workspace timestamps have invalid chronology")]
     InvalidChronology,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct WorkspaceId(String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, JsonSchema)]
+#[schemars(transparent)]
+pub struct WorkspaceId(
+    #[schemars(regex(pattern = r"^ws_[0-7][0-9ABCDEFGHJKMNPQRSTVWXYZ]{25}$"))] String,
+);
 impl WorkspaceId {
     pub fn parse(value: impl Into<String>) -> Result<Self, WorkspaceValidationError> {
         let value = value.into();

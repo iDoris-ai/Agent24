@@ -54,6 +54,7 @@ pub async fn create_session(State(state): State<AppState>, req: Request<Body>) -
         SessionCreate {
             title: String::new(),
             channel: "desktop".to_owned(),
+            workspace_id: None,
         }
     } else {
         match serde_json::from_slice(&body) {
@@ -72,6 +73,7 @@ pub async fn create_session(State(state): State<AppState>, req: Request<Body>) -
         id: format!("sess_{}", ulid()),
         title: create.title,
         channel: create.channel,
+        workspace_id: create.workspace_id,
         created_at: now.clone(),
         updated_at: now,
     };

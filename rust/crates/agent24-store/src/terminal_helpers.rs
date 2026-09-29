@@ -87,6 +87,7 @@ fn decode_run(row: &SqliteRow) -> WorkspaceResult<TerminalRunFacts> {
     let run = Run {
         id: text(row, "runs", "id")?,
         session_id: opt_text(row, "runs", "session_id")?,
+        workspace_id: None,
         status: run_status(row)?,
         input: json::<RunInput>(row, "runs", "input")?,
         output: optional_json::<RunOutput>(row, "runs", "output")?,
