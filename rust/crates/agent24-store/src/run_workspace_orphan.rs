@@ -150,6 +150,19 @@ impl Store {
                 table: "runs",
                 field: "row",
             })?;
+            if run.status == RunStatus::AwaitingApproval {
+                let pending: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM approvals
+                     WHERE run_id=? COLLATE BINARY AND status='pending' COLLATE BINARY)",
+                )
+                .bind(&run.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| WorkspaceStoreError::Database)?;
+                if pending {
+                    continue;
+                }
+            }
             let history = run_lease_history_tx(&mut tx, &run.id).await?;
             if history.is_empty() {
                 return Err(WorkspaceStoreError::CorruptRow {
@@ -206,5 +219,24 @@ mod tests {
         assert_eq!(st.sweep_workspace_orphan_runs(&WorkspaceInstant::parse(END).unwrap()).await.unwrap(),WorkspaceOrphanSweep{released_leases:1});
         assert_eq!(st.get_run("leased").await.unwrap().unwrap().status,RunStatus::Cancelled); assert_eq!(st.get_run("parked").await.unwrap().unwrap().status,RunStatus::AwaitingApproval);
         let released:Option<String>=sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?").bind(LEASE).fetch_one(st.pool()).await.unwrap(); assert_eq!(released.as_deref(),Some(END));
+    }
+    #[tokio::test] async fn trigger_created_pending_approval_spares_later_candidate(){
+        let st=Store::open_memory().await.unwrap();
+        let ws2="ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        sqlx::raw_sql("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES ('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','orchestrator_scratch','active','test','external','orchestrator','owner-a','serial','2026-09-19T00:00:00.000Z','2026-09-19T00:01:00.000Z',1,'/scratch/a','g1','unix',X'0101010101010101',X'0202020202020202'),('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6','orchestrator_scratch','active','test','external','orchestrator','owner-b','serial','2026-09-19T00:00:00.000Z','2026-09-19T00:01:00.000Z',1,'/scratch/b','g2','unix',X'0303030303030303',X'0404040404040404')").execute(st.pool()).await.unwrap();
+        let input_a=serde_json::to_string(&RunInput{prompt:"go".into(),workspace_id:Some(WorkspaceId::parse(WS).unwrap()),model_override:None,mode:RunMode::Normal}).unwrap(); let input_b=serde_json::to_string(&RunInput{prompt:"go".into(),workspace_id:Some(WorkspaceId::parse(ws2).unwrap()),model_override:None,mode:RunMode::Normal}).unwrap(); let usage=serde_json::to_string(&Usage::default()).unwrap();
+        sqlx::query("INSERT INTO runs (id,workspace_id,status,input,usage,created_at) VALUES ('a-running',?,'running',?,?,?),('b-parked',?,'awaiting_approval',?,?,?)").bind(WS).bind(&input_a).bind(&usage).bind(TS).bind(ws2).bind(&input_b).bind(&usage).bind(TS).execute(st.pool()).await.unwrap();
+        sqlx::raw_sql("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','g1','a-running','run','2026-09-19T00:00:00.000Z'),('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7','ws_01J5M4Q2Y7N8P9R0S1T2V3W4X6','g2','b-parked','run','2026-09-19T00:00:00.000Z'); CREATE TRIGGER park_later AFTER UPDATE OF released_at ON workspace_leases WHEN NEW.owner_id='a-running' BEGIN INSERT INTO approvals (id,run_id,tool_call_id,kind,summary,payload,available_decisions,status,expires_at,created_at) VALUES ('a-late','b-parked','t','exec','s','{}','[]','pending','2026-09-19T00:02:00.000Z','2026-09-19T00:00:00.000Z'); END;").execute(st.pool()).await.unwrap();
+        assert_eq!(st.sweep_workspace_orphan_runs(&WorkspaceInstant::parse(END).unwrap()).await.unwrap(),WorkspaceOrphanSweep{released_leases:1});
+        assert_eq!(st.get_run("a-running").await.unwrap().unwrap().status,RunStatus::Cancelled); assert_eq!(st.get_run("b-parked").await.unwrap().unwrap().status,RunStatus::AwaitingApproval);
+        let leases:Vec<(String,Option<String>)>=sqlx::query_as("SELECT owner_id,released_at FROM workspace_leases ORDER BY owner_id").fetch_all(st.pool()).await.unwrap(); assert_eq!(leases,vec![("a-running".into(),Some(END.into())),("b-parked".into(),None)]);
+        let status:String=sqlx::query_scalar("SELECT status FROM approvals WHERE id='a-late'").fetch_one(st.pool()).await.unwrap(); assert_eq!(status,"pending");
+    }
+    #[tokio::test] async fn missing_history_still_fails_closed(){
+        let st=Store::open_memory().await.unwrap();
+        sqlx::raw_sql("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES ('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','orchestrator_scratch','active','test','external','orchestrator','owner','serial','2026-09-19T00:00:00.000Z','2026-09-19T00:01:00.000Z',1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')").execute(st.pool()).await.unwrap();
+        let input=serde_json::to_string(&RunInput{prompt:"go".into(),workspace_id:Some(WorkspaceId::parse(WS).unwrap()),model_override:None,mode:RunMode::Normal}).unwrap(); let usage=serde_json::to_string(&Usage::default()).unwrap();
+        sqlx::query("INSERT INTO runs (id,workspace_id,status,input,usage,created_at) VALUES ('missing',?,'running',?,?,?)").bind(WS).bind(&input).bind(&usage).bind(TS).execute(st.pool()).await.unwrap();
+        assert!(matches!(st.sweep_workspace_orphan_runs(&WorkspaceInstant::parse(END).unwrap()).await,Err(WorkspaceStoreError::CorruptRow{table:"workspace_leases",field:"row"}))); assert_eq!(st.get_run("missing").await.unwrap().unwrap().status,RunStatus::Running);
     }
 }
