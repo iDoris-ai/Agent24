@@ -3,7 +3,8 @@ use agent24_protocol::{RunStatus, WorkspaceId};
 use crate::{
     AllocationPhase, AllocationRecord, LeaseKind, RootIdentity, Store, WorkspaceInstant,
     WorkspaceKind, WorkspaceLeaseId, WorkspaceLeaseRow, WorkspaceResult, WorkspaceRootSnapshot,
-    WorkspaceRow, WorkspaceState, WorkspaceStoreError, terminal_helpers::decode_run,
+    WorkspaceRow, WorkspaceState, WorkspaceStoreError,
+    run_workspace_terminal::select_current_run_lease, terminal_helpers::decode_run,
 };
 
 /// Point-in-time persistence evidence for later workspace authority minting.
@@ -107,12 +108,8 @@ impl Store {
             .iter()
             .map(WorkspaceLeaseRow::decode)
             .collect::<WorkspaceResult<Vec<_>>>()?;
-        if leases.len() != 1 {
-            return Err(corrupt("workspace_leases", "row"));
-        }
-        let lease = &leases[0].record;
+        let lease = &select_current_run_lease(&leases)?.record;
         if &lease.id != lease_id
-            || lease.released_at.is_some()
             || lease.kind != LeaseKind::Run
             || lease.owner_id != run.id
             || lease.workspace_id != workspace_id
@@ -262,8 +259,8 @@ mod tests {
         assert!(!snap.canonical_root_matches("/other"));
     }
     #[tokio::test]
-    async fn wrong_released_and_duplicate_lease_fail() {
-        for mode in 0..3 {
+    async fn wrong_and_released_current_lease_fail() {
+        for mode in 0..2 {
             let s = seed().await;
             if mode == 1 {
                 sqlx::query("UPDATE workspace_leases SET released_at=?")
@@ -271,12 +268,21 @@ mod tests {
                     .execute(s.pool())
                     .await
                     .unwrap();
-            } else if mode == 2 {
-                sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES (?,?,?,'r','run',?,?)").bind(OTHER).bind(WS).bind("g1").bind(TS).bind(NOW).execute(s.pool()).await.unwrap();
             }
             let id = if mode == 0 { lid(OTHER) } else { lid(LEASE) };
             fails(&s, &id, &now()).await;
         }
+    }
+    #[tokio::test]
+    async fn released_history_with_one_current_lease_is_valid() {
+        let s = seed().await;
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES (?,?,?,'r','run',?,?)")
+            .bind(OTHER).bind(WS).bind("g1").bind(TS).bind(NOW).execute(s.pool()).await.unwrap();
+        assert!(
+            s.run_workspace_authority_snapshot("r", &lid(LEASE), &now())
+                .await
+                .is_ok()
+        );
     }
     #[tokio::test]
     async fn run_binding_and_liveness_fail_closed() {
