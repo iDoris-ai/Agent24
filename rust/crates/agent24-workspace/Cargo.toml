@@ -13,9 +13,10 @@ workspace = true
 agent24-core = { path = "../agent24-core" }
 agent24-protocol = { path = "../agent24-protocol" }
 agent24-store = { path = "../agent24-store" }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["process", "rt"] }
 
 [target.'cfg(unix)'.dependencies]
+agent24-os-cwd = { path = "../agent24-os-cwd" }
 cap-std = "3"
 rustix = { version = "0.38", features = ["fs"] }
 

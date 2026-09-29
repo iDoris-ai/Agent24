@@ -275,6 +275,22 @@ impl WorkspaceRunAuthority {
             .await
             .map_err(|_| unavailable("workspace_write_task"))?
     }
+
+    /// Install a freshly revalidated, descriptor-pinned cwd on a child command.
+    #[doc(hidden)]
+    #[cfg(unix)]
+    pub async fn configure_command_cwd(&self, command: &mut tokio::process::Command) -> Result<()> {
+        let handle = self.fresh_handle().await?;
+        let fd = handle._pinned.try_clone_file()?.into();
+        agent24_os_cwd::install_current_dir_fd(command, fd);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    #[cfg(not(unix))]
+    pub async fn configure_command_cwd(&self, _: &mut tokio::process::Command) -> Result<()> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
 }
 
 impl WorkspaceHandle {
@@ -677,6 +693,29 @@ mod tests {
             );
             assert!(handle.read_file("relative.txt", 16).is_err());
             assert!(handle.read_file("/definitely/outside.txt", 16).is_err());
+        }
+
+        #[tokio::test]
+        async fn run_authority_child_cwd_stays_pinned_after_locator_replacement() {
+            let (_state, service) = fixture(None).await;
+            let service = Arc::new(service);
+            let lease = seed_run_authority(&service).await;
+            let authority = service.bind_run_authority("r", &lease).await.unwrap();
+            let root = service.roots_path.join(format!("{ID}.{GENERATION}"));
+            let displaced = service.roots_path.join("displaced-shell-root");
+            let mut command = tokio::process::Command::new("/bin/pwd");
+            authority.configure_command_cwd(&mut command).await.unwrap();
+
+            std::fs::rename(&root, &displaced).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let output = command.output().await.unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                Path::new(String::from_utf8_lossy(&output.stdout).trim()),
+                displaced.canonicalize().unwrap()
+            );
         }
 
         #[tokio::test]

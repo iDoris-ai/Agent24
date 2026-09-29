@@ -2151,6 +2151,19 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+        let shell = agent24_tools::ShellExecTool::new(legacy.path().to_path_buf());
+        let mut shell_input = serde_json::Map::new();
+        shell_input.insert("argv".into(), serde_json::json!(["/bin/pwd"]));
+        let shell_out =
+            agent24_tools::Tool::call(&shell, &ctx, &shell_input, &CancellationToken::new())
+                .await
+                .unwrap();
+        let shell_json: serde_json::Value = serde_json::from_str(&shell_out).unwrap();
+        assert_eq!(shell_json["exit_code"], 0);
+        assert_eq!(
+            std::path::Path::new(shell_json["stdout"].as_str().unwrap().trim()),
+            root.canonicalize().unwrap()
+        );
         sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?")
             .bind(workspace_timestamp(now_iso8601()))
             .bind(LEASE)
@@ -2159,6 +2172,11 @@ pub(crate) mod tests {
             .unwrap();
         assert!(
             agent24_tools::Tool::call(&read, &ctx, &input, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            agent24_tools::Tool::call(&shell, &ctx, &shell_input, &CancellationToken::new(),)
                 .await
                 .is_err()
         );
