@@ -3,7 +3,7 @@
 #![allow(dead_code)] // Dormant until the host admission/lease slice wires the service.
 
 use agent24_store::{Store, WorkspaceInstant, WorkspaceLeaseId, WorkspaceStoreError};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::WorkspaceError;
@@ -19,7 +19,7 @@ use agent24_store::RootIdentity as StoreRootIdentity;
 #[cfg(unix)]
 use agent24_store::RunWorkspaceAuthoritySnapshot;
 #[cfg(unix)]
-use std::{fs::File, path::PathBuf};
+use std::fs::File;
 
 type Result<T> = std::result::Result<T, WorkspaceError>;
 
@@ -43,6 +43,8 @@ pub struct WorkspaceHandle {
     _pinned: PinnedAllocationRoot,
     #[cfg(unix)]
     _evidence: RunWorkspaceAuthoritySnapshot,
+    #[cfg(unix)]
+    canonical_root: PathBuf,
     #[cfg(not(unix))]
     _private: (),
 }
@@ -223,6 +225,7 @@ impl WorkspaceService {
         Ok(WorkspaceHandle {
             _pinned: pinned,
             _evidence: s2,
+            canonical_root: candidate.into(),
         })
     }
 
@@ -256,6 +259,103 @@ impl WorkspaceRunAuthority {
             .open_run_handle(&self.run_id, &self.lease_id)
             .await
     }
+
+    #[doc(hidden)]
+    pub async fn read_file(&self, raw: String, max_bytes: usize) -> Result<Vec<u8>> {
+        let handle = self.fresh_handle().await?;
+        tokio::task::spawn_blocking(move || handle.read_file(&raw, max_bytes))
+            .await
+            .map_err(|_| unavailable("workspace_read_task"))?
+    }
+
+    #[doc(hidden)]
+    pub async fn write_file(&self, raw: String, bytes: Vec<u8>) -> Result<usize> {
+        let handle = self.fresh_handle().await?;
+        tokio::task::spawn_blocking(move || handle.write_file(&raw, &bytes))
+            .await
+            .map_err(|_| unavailable("workspace_write_task"))?
+    }
+}
+
+impl WorkspaceHandle {
+    #[cfg(unix)]
+    fn read_file(&self, raw: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        use std::io::Read as _;
+
+        let rel = self.relative_path(raw)?;
+        let dir = cap_std::fs::Dir::from_std_file(self._pinned.try_clone_file()?);
+        let file = dir.open(&rel).map_err(|_| unavailable("workspace_read"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| unavailable("workspace_read_metadata"))?;
+        if !metadata.is_file() {
+            return Err(WorkspaceError::InvalidSpec { field: "path" });
+        }
+        let mut bytes = Vec::new();
+        file.take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| unavailable("workspace_read"))?;
+        Ok(bytes)
+    }
+
+    #[cfg(unix)]
+    fn write_file(&self, raw: &str, bytes: &[u8]) -> Result<usize> {
+        use std::io::Write as _;
+
+        let rel = self.relative_path(raw)?;
+        let dir = cap_std::fs::Dir::from_std_file(self._pinned.try_clone_file()?);
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        let mut file = dir
+            .open_with(&rel, &options)
+            .map_err(|_| unavailable("workspace_write"))?;
+        file.write_all(bytes)
+            .map_err(|_| unavailable("workspace_write"))?;
+        Ok(bytes.len())
+    }
+
+    #[cfg(unix)]
+    fn relative_path(&self, raw: &str) -> Result<PathBuf> {
+        let path = Path::new(raw);
+        if !path.is_absolute() {
+            return Err(WorkspaceError::InvalidSpec { field: "path" });
+        }
+        let normalized =
+            lexical_normalize(path).ok_or(WorkspaceError::InvalidSpec { field: "path" })?;
+        let relative = normalized
+            .strip_prefix(&self.canonical_root)
+            .map_err(|_| WorkspaceError::InvalidSpec { field: "path" })?;
+        if relative.as_os_str().is_empty() {
+            return Err(WorkspaceError::InvalidSpec { field: "path" });
+        }
+        Ok(relative.to_path_buf())
+    }
+
+    #[cfg(not(unix))]
+    fn read_file(&self, _: &str, _: usize) -> Result<Vec<u8>> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    fn write_file(&self, _: &str, _: &[u8]) -> Result<usize> {
+        Err(WorkspaceError::UnsupportedPlatform)
+    }
+}
+
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 fn store_now() -> Result<WorkspaceInstant> {
@@ -540,6 +640,43 @@ mod tests {
                 .await
                 .unwrap();
             assert!(authority.fresh_handle().await.is_err());
+        }
+
+        #[tokio::test]
+        async fn run_handle_io_stays_on_pinned_root_after_locator_replacement() {
+            let (_state, service) = fixture(None).await;
+            let lease = seed_run_authority(&service).await;
+            let root = service.roots_path.join(format!("{ID}.{GENERATION}"));
+            let file = root.join("note.txt");
+            std::fs::write(&file, "old").unwrap();
+            let handle = service.open_run_handle("r", &lease).await.unwrap();
+
+            let displaced = service.roots_path.join("displaced-live-root");
+            std::fs::rename(&root, &displaced).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(root.join("note.txt"), "replacement").unwrap();
+
+            assert_eq!(
+                handle.read_file(file.to_str().unwrap(), 16).unwrap(),
+                b"old"
+            );
+            assert_eq!(
+                handle
+                    .write_file(file.to_str().unwrap(), b"pinned")
+                    .unwrap(),
+                6
+            );
+            assert_eq!(
+                std::fs::read(displaced.join("note.txt")).unwrap(),
+                b"pinned"
+            );
+            assert_eq!(
+                std::fs::read(root.join("note.txt")).unwrap(),
+                b"replacement"
+            );
+            assert!(handle.read_file("relative.txt", 16).is_err());
+            assert!(handle.read_file("/definitely/outside.txt", 16).is_err());
         }
 
         #[tokio::test]

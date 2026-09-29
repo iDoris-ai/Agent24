@@ -2083,6 +2083,87 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_bound_fs_uses_fresh_pinned_root_not_legacy_root() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        const LEASE: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let store = Store::open_memory().await.unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let service = Arc::new(WorkspaceService::compose(store.clone(), state.path()).unwrap());
+        let locator = format!("{WS}.g1");
+        let parent = state.path().join("workspace-roots");
+        let root = parent.join(&locator);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent_meta = std::fs::metadata(&parent).unwrap();
+        let root_meta = std::fs::metadata(&root).unwrap();
+        let now = workspace_timestamp(now_iso8601());
+        let expires = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,?,'g1','unix',?,?)")
+            .bind(WS).bind(&now).bind(expires.as_str()).bind(root.to_str().unwrap())
+            .bind(root_meta.dev().to_le_bytes().to_vec()).bind(root_meta.ino().to_le_bytes().to_vec())
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_allocations (allocation_id,workspace_id,root_generation,relative_name,parent_identity_kind,parent_unix_device,parent_unix_inode,root_identity_kind,root_unix_device,root_unix_inode,phase,created_at) VALUES ('wa_01J5M4Q2Y7N8P9R0S1T2V3W4X5',?,'g1',?,'unix',?,?,'unix',?,?,'committed',?)")
+            .bind(WS).bind(&locator).bind(parent_meta.dev().to_le_bytes().to_vec())
+            .bind(parent_meta.ino().to_le_bytes().to_vec()).bind(root_meta.dev().to_le_bytes().to_vec())
+            .bind(root_meta.ino().to_le_bytes().to_vec()).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,channel,workspace_id,created_at,updated_at) VALUES ('s','s','desktop',?,?,?)")
+            .bind(WS).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at) VALUES ('r','s',?,'running',?,?,?)")
+            .bind(WS).bind(format!(r#"{{"prompt":"go","workspace_id":"{WS}","model_override":null,"mode":"normal"}}"#))
+            .bind(r#"{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"cost_usd":0.0}"#).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','r','run',?)")
+            .bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+        let authority = service
+            .bind_run_authority("r", &WorkspaceLeaseId::parse(LEASE).unwrap())
+            .await
+            .unwrap();
+        let ctx = ToolContext::workspace_bound("r", Some("s".into()), None, "tc", authority);
+        let legacy = tempfile::tempdir().unwrap();
+        let read = agent24_tools::FsReadTool::new(vec![legacy.path().to_path_buf()]);
+        let write = agent24_tools::FsWriteTool::new(vec![legacy.path().to_path_buf()]);
+        let path = root.join("bound.txt");
+        std::fs::write(&path, "bound").unwrap();
+        let mut input = serde_json::Map::new();
+        input.insert(
+            "path".into(),
+            serde_json::Value::String(path.to_string_lossy().into()),
+        );
+        assert_eq!(
+            agent24_tools::Tool::call(&read, &ctx, &input, &CancellationToken::new())
+                .await
+                .unwrap(),
+            "bound"
+        );
+        input.insert(
+            "content".into(),
+            serde_json::Value::String("updated".into()),
+        );
+        agent24_tools::Tool::call(&write, &ctx, &input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+        sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?")
+            .bind(workspace_timestamp(now_iso8601()))
+            .bind(LEASE)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert!(
+            agent24_tools::Tool::call(&read, &ctx, &input, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn stale_legacy_tool_context_rejects_current_bound_run() {
         const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";

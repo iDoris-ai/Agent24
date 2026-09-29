@@ -306,6 +306,7 @@ dependencies = [
  "agent24-core",
  "agent24-protocol",
  "agent24-store",
+ "cap-std",
  "rustix 0.38.44",
  "sqlx",
  "tempfile",
