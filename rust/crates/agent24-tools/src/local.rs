@@ -160,12 +160,19 @@ impl Tool for FsReadTool {
 
     async fn call(
         &self,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         input: &Map<String, Value>,
         _cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
         let raw =
             str_arg(input, "path").ok_or_else(|| ToolError::Invalid("path is required".into()))?;
+        if let Some(authority) = ctx.workspace_authority() {
+            let bytes = authority
+                .read_file(raw.to_owned(), MAX_READ_BYTES)
+                .await
+                .map_err(|e| ToolError::Denied(format!("workspace authority unavailable: {e}")))?;
+            return Ok(truncate(&String::from_utf8_lossy(&bytes), MAX_READ_BYTES));
+        }
         let (root, rel) = resolve_in_roots(raw, &self.roots)?;
         // Everything below happens through the pinned dirfd: beneath-only
         // traversal (parent swaps and escaping symlinks fail at open), type
@@ -234,7 +241,7 @@ impl Tool for FsWriteTool {
 
     async fn call(
         &self,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         input: &Map<String, Value>,
         _cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
@@ -242,6 +249,13 @@ impl Tool for FsWriteTool {
             str_arg(input, "path").ok_or_else(|| ToolError::Invalid("path is required".into()))?;
         let content = str_arg(input, "content")
             .ok_or_else(|| ToolError::Invalid("content is required".into()))?;
+        if let Some(authority) = ctx.workspace_authority() {
+            let written = authority
+                .write_file(raw.to_owned(), content.as_bytes().to_vec())
+                .await
+                .map_err(|e| ToolError::Denied(format!("workspace authority unavailable: {e}")))?;
+            return Ok(format!("wrote {written} bytes to {raw}"));
+        }
         let (root, rel) = resolve_in_roots(raw, &self.roots)?;
         // Beneath-only traversal from the pinned dirfd — parent swaps and
         // symlinks escaping the workspace fail at open, atomically with it.

@@ -119,6 +119,13 @@ impl PinnedAllocationRoot {
     pub(crate) fn identity(&self) -> RootIdentity {
         self.identity
     }
+
+    #[cfg(unix)]
+    pub(crate) fn try_clone_file(&self) -> Result<File> {
+        self.file
+            .try_clone()
+            .map_err(|_| unavailable("allocation_root_clone"))
+    }
 }
 
 fn validate_locator(locator: &str) -> Result<()> {
