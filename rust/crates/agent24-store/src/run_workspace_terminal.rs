@@ -60,6 +60,25 @@ pub(crate) async fn release_exact_terminal_lease_tx(
     }
 }
 
+pub(crate) fn select_current_run_lease(
+    leases: &[WorkspaceLeaseRow],
+) -> WorkspaceResult<&WorkspaceLeaseRow> {
+    let mut current = leases
+        .iter()
+        .filter(|lease| lease.record.released_at.is_none());
+    let lease = current.next().ok_or(WorkspaceStoreError::CorruptRow {
+        table: "workspace_leases",
+        field: "row",
+    })?;
+    if current.next().is_some() {
+        return Err(WorkspaceStoreError::CorruptRow {
+            table: "workspace_leases",
+            field: "row",
+        });
+    }
+    Ok(lease)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunTerminalTransition {
     Applied(Box<Run>),
@@ -123,13 +142,7 @@ impl Store {
                 })
             };
         };
-        if leases.len() != 1 {
-            return Err(WorkspaceStoreError::CorruptRow {
-                table: "workspace_leases",
-                field: "row",
-            });
-        }
-        let lease = &leases[0];
+        let lease = select_current_run_lease(&leases)?;
         let created_at = WorkspaceInstant::parse(&run.created_at).map_err(|_| {
             WorkspaceStoreError::CorruptRow {
                 table: "runs",
@@ -151,7 +164,6 @@ impl Store {
             || lease.record.owner_id != run.id
             || lease.record.workspace_id != *workspace_id
             || lease.record.root_generation != root_generation
-            || lease.record.released_at.is_some()
             || lease.record.acquired_at < created_at
         {
             return Err(WorkspaceStoreError::CorruptRow {
@@ -306,7 +318,8 @@ mod tests {
 
     #[tokio::test] async fn active_run_lease_lookup_handles_bound_and_legacy(){let st=Store::open_memory().await.unwrap();let legacy=run("legacy",RunStatus::Running,false);st.insert_run(&legacy).await.unwrap();assert_eq!(st.active_workspace_run_lease_id("legacy").await.unwrap(),None);seed_bound(&st,RunStatus::Running).await;assert_eq!(st.active_workspace_run_lease_id("r").await.unwrap().as_ref().map(WorkspaceLeaseId::as_str),Some(LEASE));}
     #[tokio::test] async fn active_run_lease_lookup_fails_closed_on_missing_or_released(){for mode in 0..2{let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::Running).await;if mode==0{sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?").bind(LEASE).execute(st.pool()).await.unwrap();}else{sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?").bind(END).bind(LEASE).execute(st.pool()).await.unwrap();}assert!(matches!(st.active_workspace_run_lease_id("r").await,Err(WorkspaceStoreError::CorruptRow{table:"workspace_leases",field:"row"})));}}
-    #[tokio::test] async fn active_run_lease_lookup_fails_closed_on_duplicate_history(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::Running).await;sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X8',?,'g1','r','run',?,?)").bind(WS).bind(TS).bind(END).execute(st.pool()).await.unwrap();assert!(matches!(st.active_workspace_run_lease_id("r").await,Err(WorkspaceStoreError::CorruptRow{table:"workspace_leases",field:"row"})));}
+    #[tokio::test] async fn active_run_lease_lookup_allows_released_history(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::Running).await;sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X8',?,'g1','r','run',?,?)").bind(WS).bind(TS).bind(END).execute(st.pool()).await.unwrap();assert_eq!(st.active_workspace_run_lease_id("r").await.unwrap().as_ref().map(WorkspaceLeaseId::as_str),Some(LEASE));}
+    #[tokio::test] async fn current_run_lease_selector_rejects_duplicate_active(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::Running).await;let row=sqlx::query("SELECT * FROM workspace_leases WHERE lease_id=?").bind(LEASE).fetch_one(st.pool()).await.unwrap();let lease=WorkspaceLeaseRow::decode(&row).unwrap();assert!(matches!(select_current_run_lease(&[lease.clone(),lease]),Err(WorkspaceStoreError::CorruptRow{table:"workspace_leases",field:"row"})));}
     #[tokio::test] async fn active_run_lease_lookup_fails_closed_on_binding_owner_kind_and_time(){for mode in 0..4{let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::Running).await;match mode{0=>{sqlx::query("UPDATE runs SET input=json_set(input,'$.workspace_id',?) WHERE id='r'").bind(WS2).execute(st.pool()).await.unwrap();},1=>{seed_workspace_row(&st,WS2).await;sqlx::query("UPDATE workspace_leases SET workspace_id=? WHERE lease_id=?").bind(WS2).bind(LEASE).execute(st.pool()).await.unwrap();},2=>{sqlx::query("UPDATE workspace_leases SET owner_id='other' WHERE lease_id=?").bind(LEASE).execute(st.pool()).await.unwrap();},3=>{sqlx::query("UPDATE workspace_leases SET kind='host',owner_id='h',daemon_generation='d',host_instance_id='h',expires_at='2026-09-19T00:00:30.000Z' WHERE lease_id=?").bind(LEASE).execute(st.pool()).await.unwrap();},_=>unreachable!()}let result=st.active_workspace_run_lease_id("r").await;assert!(matches!(result,Err(WorkspaceStoreError::CorruptRow{..})));}let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::Running).await;sqlx::query("UPDATE workspace_leases SET acquired_at='2026-09-18T23:59:59.999Z' WHERE lease_id=?").bind(LEASE).execute(st.pool()).await.unwrap();assert!(matches!(st.active_workspace_run_lease_id("r").await,Err(WorkspaceStoreError::CorruptRow{table:"workspace_leases",..})));}
     #[tokio::test] async fn active_run_lease_lookup_rejects_active_lease_owned_by_unbound_run(){let st=Store::open_memory().await.unwrap();seed_workspace_row(&st,WS2).await;let legacy=run("legacy",RunStatus::Running,false);st.insert_run(&legacy).await.unwrap();sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7',?,'g1','legacy','run',?)").bind(WS2).bind(TS).execute(st.pool()).await.unwrap();assert!(matches!(st.active_workspace_run_lease_id("legacy").await,Err(WorkspaceStoreError::CorruptRow{table:"workspace_leases",..})));}
     #[tokio::test] async fn active_run_lease_lookup_missing_run_is_not_found(){let st=Store::open_memory().await.unwrap();assert_eq!(st.active_workspace_run_lease_id("missing").await.unwrap_err(),WorkspaceStoreError::NotFound);}
