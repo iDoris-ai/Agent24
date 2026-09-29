@@ -3,6 +3,8 @@
 > 2026-09-29 路线修正：长期完整产品化目标不变；短期执行切换为 Prototype-First。暂停把完整 authority / recovery hardening 作为 Creative 正向链路的前置条件，优先使用 Open Design 现有 `od daemon start --serve-web` 嵌入面、现有 `acp-json-rpc` engine 和薄 `RuntimeAgentDef` 打通可演示 E2E。详见 [PROTOTYPE-FIRST-PLAN.md](PROTOTYPE-FIRST-PLAN.md)。
 >
 > 当日逐任务执行台账见 [PROGRESS-2026-09-29.md](PROGRESS-2026-09-29.md)。当前 M1-1 已完成：真实 `--serve-web`、health、Web UI root、graceful shutdown 均已本机正向验证。
+>
+> **2026-09-29 Prototype checkpoint:** M1–M4 happy path 已闭环，M4 当前状态为 `PROTOTYPE ACCEPTANCE GATE READY`。真实 Agent24 Desktop 已嵌入 Open Design、选择 `Agent24 0.3.0` runtime，并在 Desktop 启动的同一 OD daemon 中完成两轮同 artifact v1→v2 更新。长期 M5–M10 authority/security/recovery/release 工作等待用户完成 M4 验收后继续。
 
 > 更新：2026-09-23（Asia/Bangkok）
 
