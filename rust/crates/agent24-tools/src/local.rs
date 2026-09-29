@@ -337,7 +337,7 @@ impl Tool for ShellExecTool {
 
     async fn call(
         &self,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         input: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
@@ -358,13 +358,20 @@ impl Tool for ShellExecTool {
 
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args)
-            .current_dir(&self.workdir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // kill_on_drop: a timeout or cancellation drops the child future —
             // the process must die with it, never linger
             .kill_on_drop(true);
+        if let Some(authority) = ctx.workspace_authority() {
+            authority
+                .configure_command_cwd(&mut cmd)
+                .await
+                .map_err(|e| ToolError::Denied(format!("workspace authority unavailable: {e}")))?;
+        } else {
+            cmd.current_dir(&self.workdir);
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| ToolError::Failed(format!("spawn {program}: {e}")))?;
