@@ -57,7 +57,7 @@ describe('CreativeServeWeb', () => {
 
     await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
     expect(spawnFn).toHaveBeenCalledWith(
-      process.execPath,
+      'node',
       expect.arrayContaining(['daemon', 'start', '--serve-web', '--no-open', '--port', '17456']),
       expect.objectContaining({ cwd: root }),
     )

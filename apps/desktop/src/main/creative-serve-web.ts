@@ -13,6 +13,7 @@ export interface CreativeServeWebStatus {
 
 export interface CreativeServeWebOptions {
   checkoutDir?: string
+  nodeBinary?: string
   port?: number
   readyTimeoutMs?: number
 }
@@ -91,11 +92,12 @@ export class CreativeServeWeb {
 
     const envPort = Number(process.env.A24_OPEN_DESIGN_PORT)
     const port = this.options.port ?? (Number.isInteger(envPort) && envPort > 0 ? envPort : DEFAULT_PORT)
+    const nodeBinary = this.options.nodeBinary ?? (process.env.A24_OPEN_DESIGN_NODE?.trim() || 'node')
     const readyTimeoutMs = this.options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS
     this.current = { state: 'starting' }
 
     const child = this.spawnFn(
-      process.execPath,
+      nodeBinary,
       [entry, 'daemon', 'start', '--serve-web', '--no-open', '--host', '127.0.0.1', '--port', String(port)],
       { cwd: checkoutDir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] },
     ) as CreativeChild
