@@ -4,7 +4,7 @@
 >
 > 当日逐任务执行台账见 [PROGRESS-2026-09-29.md](PROGRESS-2026-09-29.md)。当前 M1-1 已完成：真实 `--serve-web`、health、Web UI root、graceful shutdown 均已本机正向验证。
 >
-> **2026-09-29 Prototype checkpoint:** M1–M4 happy path 已闭环，M4 当前状态为 `PROTOTYPE ACCEPTANCE GATE READY`。真实 Agent24 Desktop 已嵌入 Open Design、选择 `Agent24 0.3.0` runtime，并在 Desktop 启动的同一 OD daemon 中完成两轮同 artifact v1→v2 更新。长期 M5–M10 authority/security/recovery/release 工作等待用户完成 M4 验收后继续。
+> **2026-09-29 Prototype checkpoint:** M1–M4 happy path 已闭环并完成工程 exact-head closure；#565 WS fast-run subscription race 已在 `8f69683` 修复，并由 `fe4ae95` 补上 production-coupled regression，两次独立 exact-head review 与三平台 CI 均通过。真实 Agent24 Desktop 已嵌入 Open Design、选择 `Agent24 0.3.0` runtime，并在 Desktop 启动的同一 OD daemon 中完成两轮同 artifact v1→v2 更新。用户已授权继续 Prototype-First 的 M5–M10。
 
 > 更新：2026-09-23（Asia/Bangkok）
 
@@ -248,7 +248,7 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - #560（`8e361a7`）是 test-only adversarial follow-up，覆盖 lease-id collision 与 trigger mutation rollback；final exact-head review PASS。
 - #561（`a88ca66`）将 workspace-bound Completed/Failed/Cancelled 与 exact run-lease release 放进同一写事务，并让旧 bulk orphan sweep 不再触碰 bound Run；仍未接 RunManager。
 - #562 初始 `e7d5193` 的 “no lease history compatibility” 被重新判定过宽。2026-09-29 修复 head `f6f809c` 改为 fail closed：workspace-bound orphan 必须拥有唯一、可验证的 exact run-lease history；缺失 history 视为 corruption，不再猜测历史兼容。修复后 focused 1/1、store lib 216/216、strict clippy、fmt、diff-check 全绿；PR 总 diff 为 2 files / 212 additions。
-- runtime activation 仍被明确冻结：在 #561/#562 final review 完成、RunManager admission wiring 与 startup ordering 合同冻结前，不接 ToolContext、WorkspaceHandle、ACP、Creative route 或 production `run()`。
+- runtime activation 已在后续 #566/#567 完成：#566 `0f553345` 增加 strict active run-lease rehydration；#567 `87b7630` 接入 explicit workspace atomic admission、exact terminal lease release 与 fail-closed startup restore/sweep。#567 exact diff 496 lines，已完成两次独立 exact-head FINAL PASS，CLA + Sidecar/Workspace-root 三平台 CI 全绿。M5 至此 COMPLETE；下一阶段 M6 才开始 WorkspaceHandle / ToolContext / fs-shell-explorer-subagent / approval-grant-event-audit isolation，仍禁止把 raw/canonical root 作为公共 authority。
 
 ## 2026-09-29 本机施工现场清理
 
