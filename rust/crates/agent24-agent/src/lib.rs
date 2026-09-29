@@ -406,7 +406,9 @@ impl RunManager {
         tool_call_id: impl Into<String>,
     ) -> Result<ToolContext, AgentError> {
         let tool_call_id = tool_call_id.into();
+        let lease_id = self.store.active_workspace_run_lease_id(&run.id).await?;
         let Some(_) = run.workspace_id.as_ref() else {
+            debug_assert!(lease_id.is_none());
             return Ok(ToolContext::legacy(
                 run.id.clone(),
                 run.session_id.clone(),
@@ -414,14 +416,10 @@ impl RunManager {
                 tool_call_id,
             ));
         };
-        let lease_id = self
-            .store
-            .active_workspace_run_lease_id(&run.id)
-            .await?
-            .ok_or(WorkspaceStoreError::CorruptRow {
-                table: "workspace_leases",
-                field: "row",
-            })?;
+        let lease_id = lease_id.ok_or(WorkspaceStoreError::CorruptRow {
+            table: "workspace_leases",
+            field: "row",
+        })?;
         let service = self
             .workspace
             .as_ref()
@@ -2077,6 +2075,46 @@ pub(crate) mod tests {
             store.list_tool_calls(&run.id).await.unwrap()[0].status,
             ToolCallStatus::Denied
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_tool_context_rejects_run_lease_history() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_workspace(&store, WORKSPACE_ID).await;
+        let created_at = workspace_timestamp(now_iso8601());
+        let run = Run {
+            id: format!("run_{}", ulid()),
+            session_id: None,
+            workspace_id: None,
+            status: RunStatus::Running,
+            input: RunInput {
+                prompt: "legacy".into(),
+                workspace_id: None,
+                model_override: None,
+                mode: RunMode::Normal,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: created_at.clone(),
+            started_at: Some(created_at.clone()),
+            ended_at: None,
+        };
+        store.insert_run(&run).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,?,?,'run',?)")
+            .bind(format!("wl_{}", ulid())).bind(WORKSPACE_ID).bind("generation-1")
+            .bind(&run.id).bind(&created_at)
+            .execute(agent24_store::test_hooks::pool(&store)).await.unwrap();
+
+        assert!(matches!(
+            manager.tool_context_for(&run, "tc").await,
+            Err(AgentError::Workspace(WorkspaceStoreError::CorruptRow {
+                table: "workspace_leases",
+                field: "row"
+            }))
+        ));
     }
 
     #[tokio::test]
