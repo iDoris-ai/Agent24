@@ -67,6 +67,30 @@ describe('CreativeServeWeb', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGTERM')
   })
 
+  it('shares one in-flight launch across concurrent start calls', async () => {
+    const root = checkout()
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      { checkoutDir: root, port: 17456, readyTimeoutMs: 500 },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const first = service.start()
+    const second = service.start()
+    expect(spawnFn).toHaveBeenCalledTimes(1)
+
+    child.stdout.write('[od] listening on http://127.0.0.1:17456 (headless)\n')
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { state: 'ready', origin: 'http://127.0.0.1:17456' },
+      { state: 'ready', origin: 'http://127.0.0.1:17456' },
+    ])
+    expect(spawnFn).toHaveBeenCalledTimes(1)
+    await service.stop()
+  })
+
   it('fails clearly when the daemon build is missing', async () => {
     const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-'))
     tempDirs.push(root)

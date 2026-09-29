@@ -43,6 +43,7 @@ export function resolveOpenDesignCheckout(
 export class CreativeServeWeb {
   private child: CreativeChild | null = null
   private current: CreativeServeWebStatus = { state: 'stopped' }
+  private starting: Promise<CreativeServeWebStatus> | null = null
 
   constructor(
     private readonly options: CreativeServeWebOptions = {},
@@ -54,9 +55,20 @@ export class CreativeServeWeb {
     return { ...this.current }
   }
 
-  async start(): Promise<CreativeServeWebStatus> {
-    if (this.current.state === 'ready' && this.child) return this.status()
-    if (this.current.state === 'starting') throw new Error('Open Design is already starting')
+  start(): Promise<CreativeServeWebStatus> {
+    if (this.current.state === 'ready' && this.child) return Promise.resolve(this.status())
+    if (this.starting) return this.starting
+
+    const pending = this.startOnce()
+    this.starting = pending
+    pending.then(
+      () => { if (this.starting === pending) this.starting = null },
+      () => { if (this.starting === pending) this.starting = null },
+    )
+    return pending
+  }
+
+  private async startOnce(): Promise<CreativeServeWebStatus> {
 
     const checkoutDir = this.options.checkoutDir ?? resolveOpenDesignCheckout()
     if (!checkoutDir) {
