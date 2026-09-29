@@ -84,7 +84,7 @@ async function showCreativeView(bounds: CreativeViewBounds): Promise<CreativeVie
     })
     win.contentView.addChildView(creativeView)
     creativeView.webContents.setWindowOpenHandler(({ url }) => {
-      void shell.openExternal(url)
+      if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url)
       return { action: 'deny' }
     })
   }
