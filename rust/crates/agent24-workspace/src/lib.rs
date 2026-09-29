@@ -7,5 +7,5 @@ mod service;
 mod spec;
 
 pub use error::WorkspaceError;
-pub use service::WorkspaceService;
+pub use service::{WorkspaceHandle, WorkspaceService};
 pub use spec::ScratchCreateSpec;

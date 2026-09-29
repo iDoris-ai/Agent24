@@ -10,6 +10,7 @@ description = "Workspace service boundary and typed creation specifications"
 workspace = true
 
 [dependencies]
+agent24-core = { path = "../agent24-core" }
 agent24-protocol = { path = "../agent24-protocol" }
 agent24-store = { path = "../agent24-store" }
 
