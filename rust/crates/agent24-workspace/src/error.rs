@@ -3,6 +3,7 @@
 pub enum WorkspaceError {
     InvalidSpec { field: &'static str },
     UnsupportedPlatform,
+    InfrastructureUnavailable { reason: &'static str },
     RootUnavailable { reason: &'static str },
     RootConflict { reason: &'static str },
 }
@@ -13,6 +14,9 @@ impl std::fmt::Display for WorkspaceError {
             Self::InvalidSpec { field } => write!(formatter, "invalid workspace spec: {field}"),
             Self::UnsupportedPlatform => {
                 write!(formatter, "workspace roots unsupported on this platform")
+            }
+            Self::InfrastructureUnavailable { reason } => {
+                write!(formatter, "workspace infrastructure unavailable: {reason}")
             }
             Self::RootUnavailable { reason } => {
                 write!(formatter, "workspace root unavailable: {reason}")
