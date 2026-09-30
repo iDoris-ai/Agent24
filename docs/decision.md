@@ -1122,6 +1122,14 @@ Sin90 是 Agent24 **默认搭载**的 Personal-OS，但它应可**关闭 / 清�
 
 于是三种玩法都成立且都是**干净、一次性、可回退**的动作：**用默认 Sin90** / **基于 Sin90 定制** / **`os install cos72 && os activate cos72` 清掉 Sin90 换 Cos72**。取代今天 `AppState.sin90` 具体字段 + 硬编码 `/sin90/*` 路由。
 
+> **修订记录（2026-09-10）**：本节「诚实的进程模型取舍」里"第一方进程内 OS（我们自己写的
+> Sin90/Cos72）都编进 `agent24d`"这一支已被推翻，改为**进程外模块**（T11，
+> [#342](https://github.com/iDoris-ai/Agent24/pull/342)，2026-09-22 合并）——Sin90 与
+> Cos72 均不再编译进内核二进制，而是各自独立仓库的进程外二进制，经 ADR-031 定义的进程外
+> 协议（manifest + 握手 + 回调 socket + 受约束代理）挂载。原文保留不改，仅在此追加
+> 记录；详见 ADR-031、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`、
+> `docs/agent/PLAN-ME4-OS-CAPABILITIES.md`。
+
 ### 与记忆（ADR-028）的关系
 
 记忆层保持**领域 OS 无关**：内核提供通用记忆（L0–L4），领域 OS **用但不拥有**它；领域态（Sin90 的 direction/proposal…）留在领域 OS 自己的 DB。换 OS 不动内核记忆。

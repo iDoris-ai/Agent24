@@ -3,6 +3,83 @@
 All notable changes to Agent24 are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-09-30
+
+**ME-3 完整收口 + 调度/推理回调 + 模块 SDK 正式落地 + Sin90/Cos72 独立可装**。自 0.4.0
+起主要是 ME4-M5（SDK → Sin90 迁移 → Cos72 落地 → wire 文档）与发版前 Codex 补审修复；
+v0.4.0 已交付的 ME-3/ME-4/A3 主体本版不再重复列出。
+
+**破坏性变更 / 升级须知**
+- **`shell_exec` 与外部 MCP server 子进程不再继承 daemon 的全部环境变量**（ADR-032 J-6，
+  FU-103，#571）：改为显式白名单 `CHILD_ENV_WHITELIST`（`PATH`/`HOME`/`USER`/
+  `LANG`/`LC_ALL`/`LC_CTYPE`/`TMPDIR`/`SHELL`/`TERM`），不放行任何 `*_KEY`/`*_TOKEN`/
+  `*_SECRET`/`A24_*`/`OMLX_*`/`IDORIS_*`。依赖 daemon 环境变量透传的 `shell_exec` 命令或
+  MCP server，**升级后可能拿不到之前隐式可见的变量**——需要的变量要么已在白名单内，要么
+  在 `~/.agent24/mcp.json` 对应 server 的 `env` 字段里显式声明（该字段此前被静默丢弃，
+  本版起生效，只注入给声明它的那个 server，不再进程级共享）。
+
+**新功能**
+- **模块 SDK 正式迁移落地**（ME4-M5）：
+  - Sin90（独立仓库）线协议金样 `TS.1.0`（出站 `(method,params)` 序列 + 入站回放，Sin90 #73）
+    与迁移到 `agent24-os-sdk` v0.1.0 `TS.1.1`（`src/adapter_agent24/` 手写握手客户端替换为
+    SDK，真实挂载黑盒零行为变化，Sin90 #74）。
+  - **Cos72 最小样例模块首次落地**（独立新仓库 `MushroomDAO/Cos72`，ME4-5.3.x）：
+    pilot 规划七件套（Cos72 #3）→ 骨架（manifest + SDK 挂载 + SQLite 迁移 + 事件，Cos72 #4）
+    → `mytask` 实体与路由（发布/认领/提交，Cos72 #5）→ 审批发积分（advise + 模块轮询
+    `status`，幂等入账，Cos72 #6）与积分账本回放 → 任务完成摘要经 `remember_once`
+    写入内核私有记忆（outbox 对账，Cos72 #7）→ 真实挂载黑盒，含与 Sin90 同时挂载时
+    互相读不到对方记忆与 schedules 的隔离验证（Cos72 #8）。
+- **进程外模块 wire 规范 + Node.js 参考实现**（ME4-5.4.1 / T14，#585）：
+  `docs/specs/WIRE-OOP-MODULE.md` 逐方法记录 params/result/18 个错误闭集，每条事实标注
+  file:line；`examples/node-module/`（零 npm 依赖的纯 Node 标准库参考模块，接管 fd 3、
+  UDS 握手、events/memory 往返）；`rust/apps/agent24d/tests/me4_node_module_blackbox.rs`
+  真实黑盒（挂载→代理→事件→记忆，10/10 连跑绿，无 node 时 SKIP 不 panic）。**范围收窄**：
+  参考模块只演示 events/memory，scheduler upsert/fired 与 model/approval 只有文档、无参考
+  实现，记 FU-104。
+
+**安全修复**
+- **ADR-032 J-6 子进程环境变量白名单**（见上「破坏性变更」，#571）：新增
+  `agent24-tools::env_whitelist`；`shell_exec` 改为 `env_clear()` + 白名单；外部 MCP
+  server 子进程同一白名单，按 server 隔离 `env` 声明。变异验证（删掉 `env_clear`）
+  →两条测试变红，失败输出真实打印出本机 shell 里的 token，印证漏洞存在。
+
+**修复（Codex 补审 ADR-032/A3，ME4-CODEX-DEBT-9 收口）**
+- **A3 附着模块原子写顺序**（#588）：`attached.rs::write_atomically` 改为先 chmod 0600 →
+  写入 → fsync → 再 rename；rename 后目录 fsync 失败只 warn 并返回 `Ok`（rename 已对外
+  可见，不能让调用方误以为未提交而跳过 `on_commit`，此前的顺序会导致 DELETE/rotate/
+  disable 之后旧 token 在活注册表里仍然有效）。
+- **A3 空文件 fail-closed**（#588）：`attached.rs::AttachedStore::load` 遇到存在但为空的
+  `attached.json` 现按 malformed 处理返回错误，不再静默当成全新空注册表。
+- **A3 关机期间握手竞态**（#588）：`AttachRegistry` 新增 `is_closed()`；关机期间的握手回
+  新增的 `HandshakeError::ShuttingDown`（复用既有 `unavailable` ErrorKind，未新增闭集
+  条目），不再误判 `auth_failed` 导致模块停止重连。
+- **A3 启动/关机竞态**（#588）：`server.rs` 里 `attach_registry_cell` 填好之后立即重查一次
+  `cancel.is_cancelled()`，命中就立刻 `revoke_all()`，覆盖「stopping 任务先查到空
+  registry 从而跳过撤销」的交错顺序。
+- **A3 `serve_attached` 任务泄漏**（#588）：三个 `tokio::spawn` 的 `Teardown`（负责
+  AbortOnDrop）改为紧跟 spawn 之后、在 `async move` 块构造之前建好再整体 move 进
+  future，future 首次 poll 之前被丢弃时三个任务不再泄漏；#543 钉住的 wire 顺序语义不变。
+- **桌面语音面板 AgentEar payload 校验**（#587）：`VoicePanel.tsx` 对 `payload.phase` /
+  `speech.state` / `transcript.text` 加类型守卫，恶意/畸形 payload（如
+  `{"phase":"__proto__"}`）不再让 React 因非法子节点抛错导致整个桌面 UI 卸载；新增
+  面板级 `VoicePanelErrorBoundary`，崩溃只降级本面板。
+
+**已知限制（如实列出）**
+- FU-105（C 级，#588 范围排除）：`attach_listener.rs::handle_connection` 里握手成功帧
+  `enqueue_raw` 入队与 `attach_kernel_calls` 装配 `KernelCalls` 之间仍有一个极窄窗口，
+  该窗口内并发调用 `commands/*` 可能拿到 `503 module_not_ready`——修复需要改
+  `AttachRegistry::attach_kernel_calls` 签名且跨两个调用点，本轮范围排除，留作后续。
+- 本轮 Codex 补审只覆盖 A3 的 5 个实现 PR（#526/#527/#529/#532/#534），发现的 Medium
+  及以上问题均由 #587/#588 修复合并。#515/#523/#528/#543/#544 仍未经 Codex 补审
+  （ME4-CODEX-DEBT-10），按 v0.4.0 先例不阻塞发版。
+- 其余延续自 v0.4.0 的已知限制（流式未支持、A3 仅 P2、FU-71/73/75/77 等）不变，
+  见 `[0.4.0]` 一节，本版未处理。
+
+**其他**
+- `docs(open-design)`：叠加 PR 评审 playbook 文档（#572），不属本轮主线，随 main 一并带入。
+
+---
+
 ## [0.4.0] — 2026-09-28
 
 **进程外领域 OS + 内核回调面 + AgentEar 附着**。自 0.3.0 起约 150 个合并（约六成是 ME-3 进程外领域 OS 全套，含 T11 破坏性变更）；最后一周补上内核回调面（ME-4 S1/S2）、模块 SDK 原型、AgentEar 附着（ADR-032/A3）与发版前修复。
