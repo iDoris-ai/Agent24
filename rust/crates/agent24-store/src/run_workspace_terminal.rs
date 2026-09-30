@@ -95,6 +95,15 @@ async fn run_lease_history_tx(
     rows.iter().map(WorkspaceLeaseRow::decode).collect()
 }
 
+async fn peer_lease_snapshot_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+) -> WorkspaceResult<Vec<WorkspaceLeaseRow>> {
+    let rows = sqlx::query("SELECT * FROM workspace_leases WHERE owner_id<>? COLLATE BINARY ORDER BY lease_id COLLATE BINARY")
+        .bind(run_id).fetch_all(&mut **tx).await.map_err(|_| WorkspaceStoreError::Database)?;
+    rows.iter().map(WorkspaceLeaseRow::decode).collect()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunTerminalTransition {
     Applied(Box<Run>),
@@ -387,6 +396,7 @@ impl Store {
             table: "workspaces",
             field: "id",
         })?;
+        let peer_leases = peer_lease_snapshot_tx(&mut tx, id).await?;
         let mut history = run_lease_history_tx(&mut tx, id).await?;
         for lease in &history {
             if lease.record.kind != LeaseKind::Run
@@ -482,9 +492,14 @@ impl Store {
                 field: "root_generation",
             });
         }
-        if after != expected || after_history != history {
+        let after_peer_leases = peer_lease_snapshot_tx(&mut tx, id).await?;
+        if after != expected || after_history != history || after_peer_leases != peer_leases {
             return Err(WorkspaceStoreError::CorruptRow {
-                table: "runs",
+                table: if after_peer_leases != peer_leases {
+                    "workspace_leases"
+                } else {
+                    "runs"
+                },
                 field: "row",
             });
         }
@@ -522,6 +537,7 @@ mod tests {
     #[tokio::test] async fn recovery_cancel_rejects_ended_at_before_created_at_without_history(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::AwaitingApproval).await;sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?").bind(LEASE).execute(st.pool()).await.unwrap();let early=WorkspaceInstant::parse("2026-09-18T23:59:59.999Z").unwrap();assert!(matches!(st.cancel_workspace_run_recovery("r",&early).await,Err(WorkspaceStoreError::CorruptRow{table:"runs",field:"ended_at"})));assert_eq!(st.get_run("r").await.unwrap().unwrap().status,RunStatus::AwaitingApproval);}
     #[tokio::test] async fn recovery_cancel_rolls_back_session_binding_trigger(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::AwaitingApproval).await;seed_workspace_row(&st,WS2).await;sqlx::query("INSERT INTO sessions (id,title,channel,workspace_id,created_at,updated_at) VALUES ('s','s','desktop',?,?,?)").bind(WS).bind(TS).bind(TS).execute(st.pool()).await.unwrap();sqlx::query("UPDATE runs SET session_id='s' WHERE id='r'").execute(st.pool()).await.unwrap();sqlx::raw_sql("CREATE TRIGGER twist_recovery_session AFTER UPDATE OF status ON runs WHEN NEW.id='r' BEGIN UPDATE sessions SET workspace_id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7' WHERE id='s'; END;").execute(st.pool()).await.unwrap();assert!(matches!(st.cancel_workspace_run_recovery("r",&WorkspaceInstant::parse(END).unwrap()).await,Err(WorkspaceStoreError::CorruptRow{table:"sessions",field:"workspace_id"})));assert_eq!(st.get_run("r").await.unwrap().unwrap().status,RunStatus::AwaitingApproval);let session_workspace:Option<String>=sqlx::query_scalar("SELECT workspace_id FROM sessions WHERE id='s'").fetch_one(st.pool()).await.unwrap();assert_eq!(session_workspace.as_deref(),Some(WS));assert_eq!(lease_released(&st).await,None);}
     #[tokio::test] async fn recovery_cancel_rolls_back_root_generation_trigger_without_history(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::AwaitingApproval).await;sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?").bind(LEASE).execute(st.pool()).await.unwrap();sqlx::raw_sql("CREATE TRIGGER twist_recovery_root AFTER UPDATE OF status ON runs WHEN NEW.id='r' BEGIN UPDATE workspaces SET root_generation='g2' WHERE id='ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5'; END;").execute(st.pool()).await.unwrap();assert!(matches!(st.cancel_workspace_run_recovery("r",&WorkspaceInstant::parse(END).unwrap()).await,Err(WorkspaceStoreError::CorruptRow{table:"workspaces",field:"root_generation"})));assert_eq!(st.get_run("r").await.unwrap().unwrap().status,RunStatus::AwaitingApproval);let generation:String=sqlx::query_scalar("SELECT root_generation FROM workspaces WHERE id=?").bind(WS).fetch_one(st.pool()).await.unwrap();assert_eq!(generation,"g1");}
+    #[tokio::test] async fn recovery_cancel_rolls_back_peer_lease_trigger(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::AwaitingApproval).await;let peer="wl_01J5M4Q2Y7N8P9R0S1T2V3W4X8";let before="2026-09-19T00:00:00.500Z";sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at,released_at) VALUES (?,?,'g1','peer','run',?,?)").bind(peer).bind(WS).bind(TS).bind(before).execute(st.pool()).await.unwrap();sqlx::raw_sql("CREATE TRIGGER twist_recovery_peer AFTER UPDATE OF released_at ON workspace_leases WHEN NEW.lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6' BEGIN UPDATE workspace_leases SET released_at='2026-09-19T00:00:00.750Z' WHERE lease_id='wl_01J5M4Q2Y7N8P9R0S1T2V3W4X8'; END;").execute(st.pool()).await.unwrap();assert!(matches!(st.cancel_workspace_run_recovery("r",&WorkspaceInstant::parse(END).unwrap()).await,Err(WorkspaceStoreError::CorruptRow{table:"workspace_leases",field:"row"})));assert_eq!(st.get_run("r").await.unwrap().unwrap().status,RunStatus::AwaitingApproval);assert_eq!(lease_released(&st).await,None);let peer_after:Option<String>=sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?").bind(peer).fetch_one(st.pool()).await.unwrap();assert_eq!(peer_after.as_deref(),Some(before));}
     #[tokio::test] async fn trigger_mutation_rolls_back_run_and_lease(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::Running).await;sqlx::raw_sql("CREATE TRIGGER twist_terminal_lease AFTER UPDATE OF released_at ON workspace_leases BEGIN UPDATE workspace_leases SET acquired_at='2026-09-19T00:00:00.001Z' WHERE lease_id=NEW.lease_id; END;").execute(st.pool()).await.unwrap();assert!(matches!(st.transition_workspace_run_terminal("r",RunStatus::Cancelled,RunPatch{ended_at:Some(END.into()),..Default::default()},&WorkspaceLeaseId::parse(LEASE).unwrap(),&WorkspaceInstant::parse(END).unwrap()).await,Err(WorkspaceStoreError::CorruptRow{table:"workspace_leases",..})));assert_eq!(st.get_run("r").await.unwrap().unwrap().status,RunStatus::Running);assert_eq!(lease_released(&st).await,None);}
     #[tokio::test] async fn legacy_direct_transition_remains_available(){let st=Store::open_memory().await.unwrap();st.insert_run(&run("legacy",RunStatus::Queued,false)).await.unwrap();st.transition_run("legacy",RunStatus::Running,RunPatch::default()).await.unwrap();let done=st.transition_run("legacy",RunStatus::Cancelled,RunPatch{ended_at:Some(END.into()),..Default::default()}).await.unwrap();assert_eq!(done.status,RunStatus::Cancelled);}
     #[tokio::test] async fn public_bypass_and_orphan_sweep_spare_bound_run(){let st=Store::open_memory().await.unwrap();seed_bound(&st,RunStatus::Queued).await;let running=st.transition_run("r",RunStatus::Running,RunPatch{started_at:Some(TS.into()),..Default::default()}).await.unwrap();assert_eq!(running.status,RunStatus::Running);assert!(matches!(st.transition_run("r",RunStatus::Cancelled,RunPatch{ended_at:Some(END.into()),..Default::default()}).await,Err(crate::StoreError::Conflict(_))));assert_eq!(st.sweep_orphan_runs(END).await.unwrap(),0);assert_eq!(st.get_run("r").await.unwrap().unwrap().status,RunStatus::Running);assert_eq!(lease_released(&st).await,None);}

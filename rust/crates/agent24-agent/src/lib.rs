@@ -989,9 +989,9 @@ impl RunManager {
                     }
                 }
             } else {
-                match self.run_tool_call(&run, &call, &cancel).await {
+                match self.run_tool_call(&run, &call, &cancel, true).await {
                     Ok(content) => content,
-                    Err(()) => {
+                    Err(_) => {
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
@@ -1361,18 +1361,19 @@ impl RunManager {
                     messages.push(denied);
                     continue;
                 }
-                match self.run_tool_call(&run, call, &cancel).await {
+                match self.run_tool_call(&run, call, &cancel, false).await {
                     Ok(content) => {
                         let result = Msg::tool_result(call.id.clone(), content);
                         self.persist_message(&run_id, &result).await;
                         messages.push(result);
                     }
-                    Err(()) => {
+                    Err(ParkedCallStop::CancelRun) => {
                         // Cancelled mid-tool, or the user chose abort on an
                         // approval — either way the run lands cancelled
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
+                    Err(ParkedCallStop::RecoveryStopped) => return,
                 }
             }
         }
@@ -1394,7 +1395,8 @@ impl RunManager {
         run: &Run,
         call: &agent24_models::ToolCallRequest,
         cancel: &CancellationToken,
-    ) -> Result<String, ()> {
+        recovery_resume: bool,
+    ) -> Result<String, ParkedCallStop> {
         let run_id = run.id.as_str();
         let (input, parse_error) = if call.arguments.trim().is_empty() {
             (serde_json::Map::new(), None)
@@ -1428,6 +1430,21 @@ impl RunManager {
             started_at: now_iso8601(),
             ended_at: None,
         };
+        let recovery_ctx = if recovery_resume && run.workspace_id.is_some() && parse_error.is_none()
+        {
+            match self.tool_context_for(run, tc.id.clone()).await {
+                Ok(ctx) => Some(ctx),
+                Err(err) => {
+                    tracing::warn!(
+                        "run {run_id}: resumed tool workspace authority unavailable — {err}"
+                    );
+                    self.cancel_workspace_resume_recovery(run_id).await;
+                    return Err(ParkedCallStop::RecoveryStopped);
+                }
+            }
+        } else {
+            None
+        };
         if let Err(err) = self.store.insert_tool_call(&tc).await {
             tracing::error!("tool call persist failed: {err}");
             return Ok("tool error: internal persistence failure".to_owned());
@@ -1455,11 +1472,14 @@ impl RunManager {
 
         let outcome = match parse_error {
             Some(msg) => Err(ToolError::Invalid(msg)),
-            None => match self.tool_context_for(run, tc.id.clone()).await {
-                Ok(ctx) => self.tools.dispatch(&call.name, &ctx, &input, cancel).await,
-                Err(err) => Err(ToolError::Denied(format!(
-                    "workspace authority unavailable: {err}"
-                ))),
+            None => match recovery_ctx {
+                Some(ctx) => self.tools.dispatch(&call.name, &ctx, &input, cancel).await,
+                None => match self.tool_context_for(run, tc.id.clone()).await {
+                    Ok(ctx) => self.tools.dispatch(&call.name, &ctx, &input, cancel).await,
+                    Err(err) => Err(ToolError::Denied(format!(
+                        "workspace authority unavailable: {err}"
+                    ))),
+                },
             },
         };
 
@@ -1540,7 +1560,10 @@ impl RunManager {
             Err(err) => tracing::error!("tool call finish persist failed: {err}"),
         }
 
-        if cancelled { Err(()) } else { Ok(content) }
+        if cancelled {
+            return Err(ParkedCallStop::CancelRun);
+        }
+        Ok(content)
     }
 
     /// The tool specs advertised this turn: the full advert set normally, or the
@@ -3575,6 +3598,8 @@ mod approval_tests {
         }
     }
 
+    #[rustfmt::skip]
+    async fn assert_bound_recovery_followup_stops(h:&Harness,run:&Run,call:&agent24_models::ToolCallRequest,lease:&str){assert!(matches!(h.manager.run_tool_call(run,call,&CancellationToken::new(),true).await,Err(ParkedCallStop::RecoveryStopped)));let tool_calls:i64=sqlx::query_scalar("SELECT count(*) FROM tool_calls WHERE run_id='run_1'").fetch_one(agent24_store::test_hooks::pool(&h.store)).await.unwrap();assert_eq!(tool_calls,0);sqlx::query("UPDATE runs SET status='running',ended_at=NULL WHERE id='run_1'").execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();sqlx::query("UPDATE workspace_leases SET released_at=NULL WHERE lease_id=?").bind(lease).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();}
     /// End-to-end crash recovery (H3): a run parked awaiting approval, its task
     /// gone, is resumed once a human answers the restored approval — the parked
     /// tool runs and the run completes, all reconstructed from the persisted
@@ -3826,6 +3851,7 @@ mod approval_tests {
             arguments: serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] }).to_string(),
         };
 
+        assert_bound_recovery_followup_stops(&h, &run, &call, LEASE).await;
         assert!(matches!(
             h.manager
                 .settle_parked_call(&run, &approval, &call, &CancellationToken::new())
