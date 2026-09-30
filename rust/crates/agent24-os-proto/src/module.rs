@@ -447,6 +447,7 @@ impl Connection {
         ))
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn spawn(stream: UnixStream, offer: Offer, on_fatal: FatalHook) -> Self {
         Self::spawn_with_write_timeout(stream, Vec::new(), offer, on_fatal, WRITE_TIMEOUT)
     }

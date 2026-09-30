@@ -98,7 +98,7 @@ async fn opening_a_real_v6_database_applies_workspace_migrations_and_preserves_i
         .fetch_one(test_hooks::pool(&store))
         .await
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     drop(store);
     let reopened = Store::open(&path).await.unwrap();
     assert_eq!(
