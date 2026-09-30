@@ -2355,6 +2355,17 @@ fn secure_fallback_dir(path: &std::path::Path) -> Result<(), String> {
 /// directory itself is checked by [`secure_fallback_dir`] before use — never
 /// blindly reused — since its name is predictable on a shared `/tmp`.
 ///
+/// Codex ME4-CODEX-DEBT-10 (#528 High): the hash used to name that directory
+/// must be [`fallback_dir_hash`], NOT `std::collections::hash_map::DefaultHasher`
+/// — its own doc explicitly does not promise the same algorithm across Rust
+/// versions (nor even across runs of the same binary — it is randomly seeded
+/// unless a `Hasher` is built directly, which this WAS doing, keeping the
+/// algorithm fixed but not its stability guarantee), so a toolchain upgrade
+/// could silently rename every existing user's fallback directory. That
+/// rename is itself harmless (see [`fallback_dir_hash`]'s own doc for why),
+/// but there is no reason to accept it when a fixed algorithm is one call
+/// away.
+///
 /// # Errors
 ///
 /// If `root` is too long AND its fallback directory is not safe to use (see
@@ -2367,11 +2378,8 @@ fn callback_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
     if projected.as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH {
         return Ok(root.to_owned());
     }
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut hasher);
     let fallback =
-        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", hasher.finish()));
+        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", fallback_dir_hash(root)));
     secure_fallback_dir(&fallback).map_err(|why| {
         format!(
             "{} is too long for callback sockets (over the {}-byte macOS limit), and its \
@@ -2391,6 +2399,32 @@ fn callback_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
         root.display(),
     );
     Ok(fallback)
+}
+
+/// A stable (across Rust versions, and across runs of the same binary — see
+/// [`callback_root`]'s own doc for why `DefaultHasher` is not either) hash of
+/// `root`, folded to 64 bits: the first 8 bytes of its sha256 digest, read as
+/// a big-endian `u64`. Only used to NAME the `/tmp` fallback directory
+/// [`callback_root`] picks when `root` itself is too long for a socket path
+/// — this only has to be stable and collision-resistant enough that two
+/// different `root`s (almost) never land on the same fallback name; it is
+/// not a security boundary itself ([`secure_fallback_dir`] is what actually
+/// keeps another local user out of a name they might guess or collide with).
+///
+/// A directory named by the OLD `DefaultHasher`-based scheme is simply
+/// abandoned by a build using this function instead (its contents are the
+/// transient callback-socket directory only — `run/<pid>/<n>.sock` files a
+/// live daemon recreates from scratch on every start, per [`callback_root`]'s
+/// own doc — so nothing is lost, and [`agent24_os_proto::endpoint::remove_stale`]
+/// cleans up anything left behind under the old name once no process holds
+/// it open).
+#[must_use]
+fn fallback_dir_hash(root: &std::path::Path) -> u64 {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(root.as_os_str().as_encoded_bytes());
+    let mut first8 = [0u8; 8];
+    first8.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first8)
 }
 
 /// What out-of-process modules are started with: the callback directory under
@@ -4103,10 +4137,24 @@ pub(crate) mod tests {
     /// clean up before/after) the exact path it will pick for a given `root`
     /// — never asserted on for its OWN sake.
     fn hashed_fallback_path(root: &std::path::Path) -> std::path::PathBuf {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        root.hash(&mut hasher);
-        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", hasher.finish()))
+        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", fallback_dir_hash(root)))
+    }
+
+    /// Codex ME4-CODEX-DEBT-10 (#528 High): golden value locking
+    /// [`fallback_dir_hash`] to sha256, not `std::collections::hash_map::DefaultHasher`
+    /// (whose own doc does not promise this algorithm across Rust versions).
+    /// A fixed input's fallback directory name must never silently change
+    /// again — if this test ever needs updating, that is a deliberate,
+    /// visible break, not a toolchain upgrade nobody noticed.
+    #[test]
+    fn fallback_dir_hash_is_a_stable_golden_value() {
+        let root = std::path::Path::new("/home/test/very/long/path/for/golden/hash/test");
+        assert_eq!(
+            format!("{:016x}", fallback_dir_hash(root)),
+            "2ffb6c3d38a488a3",
+            "fallback_dir_hash's output for a fixed input must never change — if it did, \
+             every existing user's fallback directory name would silently change with it"
+        );
     }
 
     /// Nothing there yet: created fresh, exactly `0700`.

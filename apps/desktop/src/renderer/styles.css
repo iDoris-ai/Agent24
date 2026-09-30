@@ -217,7 +217,12 @@ button { cursor: pointer; font-family: var(--font); }
 .capability-card h3 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
 .capability-card p { font-size: 12px; color: var(--muted); line-height: 1.5; }
 .capability-card .cap-status { font-size: 11px; margin-top: 10px; color: var(--muted); }
-.capability-card .cap-status.ready { color: #4caf50; }
+/* AUDIT-3: none of these cards has an onClick — they are a roadmap
+   preview, not clickable actions. Grey them out and swap the pointer
+   cursor for not-allowed so the UI doesn't promise an interaction that
+   doesn't exist. */
+.capability-card[aria-disabled='true'] { opacity: 0.55; cursor: not-allowed; }
+.capability-card[aria-disabled='true']:hover { border-color: var(--border); }
 
 /* ── Models page ── */
 .models-list { display: flex; flex-direction: column; gap: 10px; }

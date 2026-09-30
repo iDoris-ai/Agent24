@@ -514,27 +514,61 @@ impl AttachRegistry {
         }
     }
 
-    /// A3-3 (review M2): install this connection's [`KernelCalls`] handle
-    /// once `crate::attach_listener` has one (strictly after [`Self::commit`]
+    /// A3-3 (review M2) + FU-105 (Codex ME4-CODEX-DEBT-10, #543 follow-up):
+    /// install this connection's [`KernelCalls`] handle once
+    /// `crate::attach_listener` has one (strictly after [`Self::commit`]
     /// returns — `serve_attached` is what MANUFACTURES a `KernelCalls`, and
     /// it needs the `Methods` `commit` just built, so the two cannot be one
-    /// step). Guarded by the same `Arc::ptr_eq(&last_generation.1,
+    /// step) — AND enqueue the handshake success frame onto it, both under
+    /// this ONE lock acquisition.
+    ///
+    /// Before FU-105, `crate::attach_listener::handle_connection` called
+    /// [`KernelCalls::enqueue_raw`] directly, then, as a SEPARATE later call,
+    /// this method — leaving a window between the two in which the success
+    /// frame was already on the wire (the module may already believe it is
+    /// attached) but this registry had no live `KernelCalls` for it yet, so
+    /// a `POST /api/v1/os/{name}/commands/*` landing in that gap got a
+    /// spurious `503 module_not_ready` ([`CommandRefusal::NotReady`] from
+    /// [`Self::reserve_ready`]). [`Self::reserve_ready`] takes this SAME
+    /// lock, so folding the two steps into one critical section makes them
+    /// atomic from any caller's point of view: a `reserve_ready` that
+    /// acquires the lock before this call still correctly sees `NotReady`
+    /// (nothing was sent yet); one that acquires it after sees the frame
+    /// enqueued AND `live_calls` installed — never one without the other.
+    /// [`KernelCalls::enqueue_raw`] is a plain non-blocking `try_send` (see
+    /// its own doc), so calling it while holding this synchronous `Mutex`
+    /// cannot block the lock.
+    ///
+    /// Guarded by the same `Arc::ptr_eq(&last_generation.1,
     /// generation)` identity check [`Self::release`] uses: if a
     /// rotation/revoke/disable landed on this name between `commit`
     /// returning and this call (replacing or clearing `last_generation`
-    /// under this same lock), this is a no-op — the caller's connection is
-    /// already being torn down by whatever won that race, and installing a
-    /// calls handle for a generation nothing points at any more would only
-    /// leak it (or, worse, clobber a NEWER connection's already-installed
-    /// handle) until the connection's own `release` call arrives and finds
-    /// no match to clear either.
+    /// under this same lock), the INSTALL is a no-op — the caller's
+    /// connection is already being torn down by whatever won that race, and
+    /// installing a calls handle for a generation nothing points at any more
+    /// would only leak it (or, worse, clobber a NEWER connection's
+    /// already-installed handle) until the connection's own `release` call
+    /// arrives and finds no match to clear either. The success frame is
+    /// still enqueued in that case, same as the pre-FU-105 behaviour: the
+    /// connection is being drained, not severed instantly, so the module
+    /// still gets its handshake answer.
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` if `success_line` could not be enqueued (the outbound queue
+    /// is already gone, or — impossible for a queue this fresh — full); the
+    /// caller must not admit this generation, same contract a direct
+    /// `enqueue_raw` failure had before FU-105.
+    #[allow(clippy::result_unit_err)]
     pub fn attach_kernel_calls(
         &self,
         name: &str,
         generation: &Arc<Generation>,
         calls: KernelCalls,
-    ) {
+        success_line: Vec<u8>,
+    ) -> Result<(), ()> {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        calls.enqueue_raw(success_line)?;
         if let Some(entry) = state.entries.get_mut(name)
             && entry
                 .last_generation
@@ -547,6 +581,7 @@ impl AttachRegistry {
                 in_flight: Arc::new(AtomicUsize::new(0)),
             });
         }
+        Ok(())
     }
 
     /// A3-3 (§6.1 steps ①/②): does `name` exist at all, and if so, does its
@@ -1251,7 +1286,14 @@ mod tests {
             "commit() alone, before attach_kernel_calls, must not be usable"
         );
 
-        registry.attach_kernel_calls("agentear", &generation, spawn_real_kernel_calls(methods));
+        registry
+            .attach_kernel_calls(
+                "agentear",
+                &generation,
+                spawn_real_kernel_calls(methods),
+                b"ok\n".to_vec(),
+            )
+            .unwrap();
         let slot = registry
             .reserve_ready("agentear", "speak")
             .expect("now ready");
@@ -1271,7 +1313,14 @@ mod tests {
         let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
         let claim = accepted("agentear", &token_id);
         let (_, generation, methods) = registry.commit(&claim).unwrap();
-        registry.attach_kernel_calls("agentear", &generation, spawn_real_kernel_calls(methods));
+        registry
+            .attach_kernel_calls(
+                "agentear",
+                &generation,
+                spawn_real_kernel_calls(methods),
+                b"ok\n".to_vec(),
+            )
+            .unwrap();
 
         let mut slots = Vec::new();
         for _ in 0..MAX_KERNEL_CALLS_IN_FLIGHT {
@@ -1331,11 +1380,14 @@ mod tests {
         assert!(!Arc::ptr_eq(&stale_generation, &fresh_generation));
 
         // The FRESH connection's task wins the race and installs first.
-        registry.attach_kernel_calls(
-            "agentear",
-            &fresh_generation,
-            spawn_real_kernel_calls(fresh_methods),
-        );
+        registry
+            .attach_kernel_calls(
+                "agentear",
+                &fresh_generation,
+                spawn_real_kernel_calls(fresh_methods),
+                b"ok\n".to_vec(),
+            )
+            .unwrap();
         assert!(
             registry.reserve_ready("agentear", "speak").is_ok(),
             "the fresh generation's calls handle must be usable once installed"
@@ -1344,11 +1396,14 @@ mod tests {
         // The STALE connection's task now (late, after losing the race)
         // tries to install ITS calls handle — must be a no-op: it must NOT
         // overwrite the fresh entry that is genuinely live and ready.
-        registry.attach_kernel_calls(
-            "agentear",
-            &stale_generation,
-            spawn_real_kernel_calls(stale_methods),
-        );
+        registry
+            .attach_kernel_calls(
+                "agentear",
+                &stale_generation,
+                spawn_real_kernel_calls(stale_methods),
+                b"ok\n".to_vec(),
+            )
+            .unwrap();
         assert!(
             registry.reserve_ready("agentear", "speak").is_ok(),
             "a late stale install must not clobber the already-installed fresh calls handle"
@@ -1377,7 +1432,14 @@ mod tests {
         // describes).
         let claim = accepted("agentear", &token_id);
         let (_, generation, methods) = registry.commit(&claim).unwrap();
-        registry.attach_kernel_calls("agentear", &generation, spawn_real_kernel_calls(methods));
+        registry
+            .attach_kernel_calls(
+                "agentear",
+                &generation,
+                spawn_real_kernel_calls(methods),
+                b"ok\n".to_vec(),
+            )
+            .unwrap();
         assert!(
             registry.reserve_ready("agentear", "speak").is_ok(),
             "sanity: still declared and ready before the rotation"
@@ -1439,7 +1501,15 @@ mod tests {
         let claim = accepted("agentear", &token_id);
         let (_, generation, methods) = registry.commit(&claim).unwrap();
         let (calls, mut module_read) = spawn_real_kernel_calls_with_module_side(methods);
-        registry.attach_kernel_calls("agentear", &generation, calls);
+        registry
+            .attach_kernel_calls("agentear", &generation, calls, b"ok\n".to_vec())
+            .unwrap();
+        // Drain the handshake success frame FU-105 now enqueues here (that
+        // is exactly what this test's fix is about) so the "nothing arrives
+        // after the revoke" check below is not confused by it.
+        let mut hello = [0u8; 3];
+        module_read.read_exact(&mut hello).await.unwrap();
+        assert_eq!(&hello, b"ok\n");
 
         let slot = registry
             .reserve_ready("agentear", "speak")
@@ -1481,6 +1551,51 @@ mod tests {
         assert!(
             read.is_err(),
             "no bytes should ever have reached the module, got {read:?}"
+        );
+    }
+
+    /// FU-105 (Codex ME4-CODEX-DEBT-10, #543 follow-up). Before this fix,
+    /// `attach_listener::handle_connection` called `KernelCalls::enqueue_raw`
+    /// directly to send the handshake success frame, and only THEN, as a
+    /// SEPARATE later call, installed that `calls` handle into this registry
+    /// via `attach_kernel_calls` — leaving a window between the two steps in
+    /// which a `reserve_ready` call would deterministically see `NotReady`
+    /// even though the success frame (and so the module's belief that it is
+    /// attached) was already on the wire. This was not a probabilistic
+    /// window that needed 30 racing iterations to catch (contrast
+    /// `a3_3_host_commands_blackbox.rs`'s `c5_command_posted_the_instant_*`
+    /// test): a test that reproduced the two-step call sequence directly and
+    /// checked `reserve_ready` in between the two calls hit it on every run
+    /// — confirmed red against the pre-fix two-argument-call-sequence version
+    /// of this test (`Err(NotReady)` every time).
+    ///
+    /// `attach_kernel_calls` now does both steps itself, atomically, under
+    /// its own lock (see its own doc) — the seam this test used to exploit
+    /// no longer exists at the call-site level, so this test now exercises
+    /// the single atomic call and confirms `reserve_ready` is usable
+    /// immediately afterwards, with no window left to land in.
+    #[tokio::test]
+    async fn fu_105_no_notready_window_between_success_frame_and_registry_install() {
+        let registry = AttachRegistry::new(deps().await);
+        let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
+        let claim = accepted("agentear", &token_id);
+        let (_, generation, methods) = registry.commit(&claim).unwrap();
+        let calls = spawn_real_kernel_calls(methods);
+
+        // The single atomic call `attach_listener::handle_connection` now
+        // makes: enqueue the success frame AND install the calls handle
+        // under one lock acquisition.
+        registry
+            .attach_kernel_calls("agentear", &generation, calls, b"success\n".to_vec())
+            .expect("a fresh queue has room");
+
+        // Immediately after that one call returns, a command must already be
+        // servable — there is no intermediate state to observe from outside.
+        let result = registry.reserve_ready("agentear", "speak");
+        assert!(
+            !matches!(result, Err(CommandRefusal::NotReady)),
+            "FU-105: a command landing right after attach_kernel_calls returns \
+             must not see NotReady, got {result:?}"
         );
     }
 }

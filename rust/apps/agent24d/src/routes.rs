@@ -401,6 +401,14 @@ pub async fn get_timings(State(state): State<AppState>, RawQuery(raw): RawQuery)
 struct TimingSummaryWire {
     source: String,
     model_id: String,
+    /// Review (ME4-CODEX-DEBT-10 #2): new, additive field — `""` for a real
+    /// model call (`_a24/model/complete`/`/api/v1/chat`), or AgentEar's own
+    /// sub-step name (`"asr"`, `"llm"`, `"total"`, …) for its per-turn
+    /// breakdown rows. Existing fields/keys are unchanged, so an old caller
+    /// that only reads `p50_ms`/`p95_ms`/`max_ms`/`count` still works; it
+    /// just now sees more (correctly separated) groups instead of a few
+    /// blended ones. See `CallTimingSummaryRow`'s doc comment.
+    step: String,
     count: u64,
     p50_ms: u64,
     p95_ms: u64,
@@ -412,6 +420,7 @@ impl From<&CallTimingSummaryRow> for TimingSummaryWire {
         Self {
             source: r.source.clone(),
             model_id: r.model_id.clone(),
+            step: r.step.clone(),
             count: r.count,
             p50_ms: r.p50_ms,
             p95_ms: r.p95_ms,
@@ -421,7 +430,8 @@ impl From<&CallTimingSummaryRow> for TimingSummaryWire {
 }
 
 /// `GET /api/v1/timings/summary?since=` — count/p50/p95/max `total_ms`,
-/// grouped by (source, model_id).
+/// grouped by (source, model_id, step) (review ME4-CODEX-DEBT-10 #2 — see
+/// `CallTimingSummaryRow`'s doc comment for why `step` joined the key).
 pub async fn get_timings_summary(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,

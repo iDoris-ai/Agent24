@@ -21,13 +21,15 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::UnixStream;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -435,21 +437,36 @@ impl Connection {
         let stream = UnixStream::connect(&env.callback_sock)
             .await
             .map_err(ConnectError::Io)?;
-        let (offer, stream) = handshake(stream, env, hello).await?;
-        Ok(Self::spawn(stream, offer, on_fatal))
+        let (offer, stream, leftover) = handshake(stream, env, hello).await?;
+        Ok(Self::spawn_with_write_timeout(
+            stream,
+            leftover,
+            offer,
+            on_fatal,
+            WRITE_TIMEOUT,
+        ))
     }
 
     fn spawn(stream: UnixStream, offer: Offer, on_fatal: FatalHook) -> Self {
-        Self::spawn_with_write_timeout(stream, offer, on_fatal, WRITE_TIMEOUT)
+        Self::spawn_with_write_timeout(stream, Vec::new(), offer, on_fatal, WRITE_TIMEOUT)
     }
 
+    /// `leftover` is any bytes the handshake's `BufReader` had already
+    /// buffered beyond the `initialize` response — the kernel may write that
+    /// response and the first real mux frame in a single `write()` (nothing
+    /// in the transport stops that), so the module's one `read()` can pick up
+    /// both at once. Those bytes belong to the mux, not the handshake: they
+    /// are replayed to the reader task via [`PrefixedReader`] before it reads
+    /// anything else off the socket (Codex ME4-CODEX-DEBT-10 #1).
     fn spawn_with_write_timeout(
         stream: UnixStream,
+        leftover: Vec<u8>,
         offer: Offer,
         on_fatal: FatalHook,
         write_timeout: Duration,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
+        let read_half = PrefixedReader::new(leftover, read_half);
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE_CAPACITY);
         let pending: Pending = Arc::new(StdMutex::new(PendingState {
             closed: false,
@@ -700,13 +717,15 @@ impl std::fmt::Debug for Connection {
     }
 }
 
-/// Dial, run `initialize`, and hand back the granted `Offer` plus the raw
-/// stream (past the handshake, ready for [`Connection::spawn`]).
+/// Dial, run `initialize`, and hand back the granted `Offer`, the raw stream
+/// (past the handshake, ready for [`Connection::spawn_with_write_timeout`]),
+/// and any bytes the handshake's `BufReader` had already buffered beyond the
+/// `initialize` response.
 async fn handshake(
     stream: UnixStream,
     env: &ModuleEnv,
     hello: &Hello<'_>,
-) -> Result<(Offer, UnixStream), ConnectError> {
+) -> Result<(Offer, UnixStream, Vec<u8>), ConnectError> {
     let mut reader = BufReader::new(stream);
 
     let id = "1".to_owned();
@@ -772,19 +791,64 @@ async fn handshake(
         )));
     }
 
-    // Nothing should have arrived on the socket beyond this one handshake
-    // response. If the `BufReader` nonetheless has unconsumed bytes
-    // buffered, handing back only `reader.into_inner()` would silently drop
-    // them, so that case is treated as a protocol violation rather than
-    // risking lost bytes on the connection `Connection::spawn` is about to
-    // take over (J-S12).
-    if !reader.buffer().is_empty() {
-        return Err(ConnectError::Protocol(
-            "kernel sent unexpected extra bytes immediately after the initialize response"
-                .to_owned(),
-        ));
+    // The kernel may write the `initialize` response and the first real mux
+    // frame in a single `write()` — nothing in the transport stops that, and
+    // a compliant kernel that has something ready to send the moment this
+    // generation starts has no reason to hold it back. The module's own
+    // `read()`/`fill_buf()` then sees both at once, and any bytes beyond the
+    // handshake response line end up sitting in this `BufReader`'s internal
+    // buffer. Treating that as a protocol violation (as this used to)
+    // misclassifies a compliant kernel as a broken one; instead the leftover
+    // bytes are captured here and handed to `Connection::spawn`'s reader task
+    // as a prefix, so the frame reader that runs after the handshake picks
+    // them straight up (Codex ME4-CODEX-DEBT-10 #1). Losing them silently
+    // would be just as wrong, which is why `reader.into_inner()` alone was
+    // never enough (J-S12).
+    let leftover = reader.buffer().to_vec();
+    Ok((reply.offer, reader.into_inner(), leftover))
+}
+
+/// An `AsyncRead` that first replays `prefix`, then delegates to `inner`.
+/// Exists to hand [`Connection`]'s reader task any bytes [`handshake`]'s
+/// `BufReader` had already buffered beyond the `initialize` response, so
+/// those bytes reach the frame reader instead of being discarded (or, as
+/// before this existed, mistaken for a protocol violation).
+struct PrefixedReader<R> {
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+    inner: R,
+}
+
+impl<R> PrefixedReader<R> {
+    fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Self {
+            prefix,
+            prefix_pos: 0,
+            inner,
+        }
     }
-    Ok((reply.offer, reader.into_inner()))
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.prefix_pos < this.prefix.len() {
+            let remaining = &this.prefix[this.prefix_pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            this.prefix_pos += n;
+            // `this.inner` is untouched: none of `prefix` came from it, so
+            // there is nothing to poll there yet. A prefix-only read still
+            // reports `Ready` — an empty `prefix` (the common case, no
+            // leftover bytes) falls straight through to `inner` below.
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
 }
 
 #[derive(Debug)]
@@ -1203,7 +1267,17 @@ mod tests {
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn connect_from_env_rejects_residual_bytes_after_the_handshake() {
+    async fn connect_from_env_hands_non_json_residual_bytes_to_the_mux_reader() {
+        // Before #1's fix, ANY bytes left in the handshake `BufReader`'s
+        // buffer — compliant or not — made `connect_from_env` itself fail
+        // with `ConnectError::Protocol`. That misclassified a compliant
+        // kernel that writes its `initialize` reply and the first real mux
+        // frame in one `write()`. This test pins the new split: the
+        // handshake must succeed regardless of what is in the leftover
+        // bytes, and it is the MUX's own framing/JSON checks — not the
+        // handshake's — that catch bytes that turn out to be garbage
+        // (mirrors `on_fatal_is_triggered_by_a_non_json_frame_from_the_kernel`
+        // for bytes that arrive after the handshake instead of within it).
         let dir = tempdir();
         let sock_path = dir.path().join("cb.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
@@ -1232,14 +1306,88 @@ mod tests {
             let resp = json!({"jsonrpc":"2.0","id":req["id"],"result":{"protocol_version":1,"offer":{"provides":[]}}});
             let mut bytes = serde_json::to_vec(&resp).unwrap();
             bytes.push(b'\n');
-            bytes.extend_from_slice(b"garbage-after-handshake");
+            bytes.extend_from_slice(b"garbage-after-handshake\n");
             writer.write_all(&bytes).await.unwrap();
+            // Keep the connection open long enough for the reader task to
+            // actually run past the handshake and hit the garbage line.
+            tokio::time::sleep(Duration::from_millis(200)).await;
         });
-        let result = Connection::connect_from_env(&env, &hello, testing::noop_hook()).await;
-        assert!(
-            matches!(result, Err(ConnectError::Protocol(_))),
-            "got {result:?}"
+        let conn = Connection::connect_from_env(&env, &hello, testing::noop_hook())
+            .await
+            .expect("the handshake must succeed: the extra bytes are the mux's problem");
+        wait_until(|| !conn.is_alive(), Duration::from_secs(2)).await;
+        server.await.unwrap();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn connect_from_env_delivers_a_reply_and_first_frame_written_in_one_chunk() {
+        // H-1 (Codex ME4-CODEX-DEBT-10 #1): a compliant kernel may write the
+        // `initialize` reply and the response to the module's very first
+        // call in a SINGLE `write()` — nothing in the transport stops it,
+        // and a kernel with an answer ready the moment this generation
+        // starts has no reason to hold it back. Before the fix, the
+        // handshake's residual-bytes check treated that second frame as a
+        // protocol violation and killed a perfectly compliant connection.
+        let dir = tempdir();
+        let sock_path = dir.path().join("cb.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let env = ModuleEnv::from_vars(|k| {
+            Some(match k {
+                "A24_CALLBACK_SOCK" => sock_path.clone().into_os_string(),
+                "A24_HANDSHAKE_TOKEN" => "tok".into(),
+                _ => dir.path().as_os_str().to_owned(),
+            })
+        })
+        .unwrap();
+        let hello = Hello {
+            module: "m",
+            manifest_bytes: b"x",
+            capabilities: &[],
+            protocol_min: 1,
+            protocol_max: 1,
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut buf = Vec::new();
+            reader.read_until(b'\n', &mut buf).await.unwrap();
+            let req: Value = serde_json::from_slice(&buf).unwrap();
+            let handshake_resp = json!({
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {"protocol_version": 1, "offer": {"provides": []}},
+            });
+            // The mux hands out ids as `c-1`, `c-2`, … starting from the
+            // connection's very first `call()` — see `Connection::spawn`'s
+            // `next_id: AtomicU64::new(1)`. This is the response to that
+            // first call, pre-written before the module has even issued it.
+            let call_resp = json!({"jsonrpc": "2.0", "id": "c-1", "result": {"probe": true}});
+            let mut bytes = serde_json::to_vec(&handshake_resp).unwrap();
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&serde_json::to_vec(&call_resp).unwrap());
+            bytes.push(b'\n');
+            // ONE write, both frames — this is the scenario #1 covers.
+            writer.write_all(&bytes).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let conn = Connection::connect_from_env(&env, &hello, testing::noop_hook())
+            .await
+            .expect("handshake must succeed despite trailing bytes in the same read");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            conn.call("probe", json!({}), CallOptions::default()),
+        )
+        .await
+        .expect(
+            "must not time out: the response was already buffered from the handshake's read, \
+             so it must be delivered to the reader task rather than dropped or misread as an error",
         );
+        assert_eq!(result.unwrap(), json!({"probe": true}));
+
         server.await.unwrap();
     }
 
@@ -1646,6 +1794,7 @@ mod tests {
         let (hook, count) = counting_hook();
         let conn = Arc::new(Connection::spawn_with_write_timeout(
             client,
+            Vec::new(),
             Offer::none(),
             hook,
             Duration::from_millis(50),

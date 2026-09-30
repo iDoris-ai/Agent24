@@ -96,3 +96,22 @@
 1. 每条新回归测试都要变异验证（`docs/agent/mutate.sh`）。
 2. 不许出现比机制更强的措辞（模块与 daemon 同 UID，§0 威胁模型）。
 3. 判据本身要先被验过 —— 每条判据带正对照。
+
+## 2026-09-30 —— v0.5.0 发布（ME4 本轮收口）
+
+**发布**：Agent24 v0.5.0（#589，tag 于 f46194a）、Sin90 v0.5.0（#75）、Cos72 v0.1.0（#9，首个发布）。发版前 A3 Codex 补审（PR-Daemon 在 Mac mini 执行）修复 #587/#588 合并；其余未补审 PR 记 `ME4-CODEX-DEBT-10`，按 v0.4.0 先例不阻塞。
+
+**干净机器验收（ME4-6.1.3）**：Mac mini（无 agent24、无源码），隔离 `HOME=/tmp/a24rel/home`，只用三个 GitHub Release 资产：
+
+```
+agent24-0.5.0-macos-arm64.tar.gz: OK      agent24 0.5.0
+sin90-0.5.0-macos-arm64.tar.gz: OK
+cos72-0.1.0-macos-arm64.tar.gz: OK
+installed .../packages/sin90   installed .../packages/cos72
+daemon started
+cos72  0.1.0  [mounted]  grants: events,memory,approval
+sin90  0.5.0  [mounted]  grants: events,models,scheduler,memory,approval
+/api/v1/sin90/today -> 200     /api/v1/os -> 200
+```
+
+**遗留**：`ME4-CODEX-DEBT-10`（#515/#523/#528/#543/#544 待 Codex 补审）、FU-104（Node 参考模块补 scheduler/model/approval 演示）、FU-105（A3 `enqueue_raw`→`attach_kernel_calls` 可见性窗口）。

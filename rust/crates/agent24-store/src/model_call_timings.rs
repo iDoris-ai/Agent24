@@ -54,14 +54,25 @@ pub struct CallTimingRow {
     pub completion_tokens: Option<u64>,
 }
 
-/// One (source, model_id) group's summary — `GET /api/v1/timings/summary`.
-/// `model_id` is `""` for the group of rows that reported none (SQLite
-/// `GROUP BY` already treats every `NULL` as one group; this just gives that
-/// group a printable key alongside the real model ids).
+/// One (source, model_id, step) group's summary — `GET /api/v1/timings/summary`.
+/// `model_id`/`step` are `""` for the group of rows that reported none
+/// (SQLite `GROUP BY` already treats every `NULL` as one group; this just
+/// gives that group a printable key alongside the real values).
+///
+/// Review (ME4-CODEX-DEBT-10 #2): `step` joined the group key so this can no
+/// longer blend unrelated quantities together — a real model-answer call
+/// (`step == ""`, from `_a24/model/complete`/`/api/v1/chat`) versus
+/// AgentEar's own per-turn breakdown steps (`"asr"`, `"llm"`, `"total"`, …,
+/// from `agentear_timings.rs`), which previously shared a group purely by
+/// having the same `(source, model_id)` — e.g. a turn's ~900ms `llm` step
+/// and its ~3500ms `total` (whole turn incl. audio playback) used to land in
+/// the SAME p50/p95, making "the model is slow" indistinguishable from "the
+/// speaker is still talking".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallTimingSummaryRow {
     pub source: String,
     pub model_id: String,
+    pub step: String,
     pub count: u64,
     pub p50_ms: u64,
     pub p95_ms: u64,
@@ -196,10 +207,16 @@ impl Store {
         Ok(rows.iter().map(row_from).collect())
     }
 
-    /// `count`/p50/p95/max `total_ms`, grouped by (source, model_id).
+    /// `count`/p50/p95/max `total_ms`, grouped by (source, model_id, step).
     /// Computed in Rust over the filtered rows (a nearest-rank percentile has
     /// no single-statement SQLite equivalent) — fine at this table's scale
     /// (retention caps it at 100k rows; `since` narrows it further).
+    ///
+    /// Review (ME4-CODEX-DEBT-10 #2): `step` joined the group key — see
+    /// [`CallTimingSummaryRow`]'s doc comment for why grouping by
+    /// `(source, model_id)` alone silently blended a real model call's
+    /// latency together with AgentEar's own unrelated per-turn sub-steps
+    /// that happen to share the same source/model.
     ///
     /// # Errors
     /// Storage.
@@ -207,8 +224,9 @@ impl Store {
         &self,
         since: Option<&str>,
     ) -> Result<Vec<CallTimingSummaryRow>> {
-        let mut sql =
-            String::from("SELECT source, model_id, total_ms FROM model_call_timings WHERE 1 = 1");
+        let mut sql = String::from(
+            "SELECT source, model_id, step, total_ms FROM model_call_timings WHERE 1 = 1",
+        );
         if since.is_some() {
             sql.push_str(" AND ts >= ?");
         }
@@ -218,24 +236,30 @@ impl Store {
         }
         let rows = q.fetch_all(self.pool()).await?;
 
-        let mut groups: std::collections::BTreeMap<(String, String), Vec<u64>> =
+        let mut groups: std::collections::BTreeMap<(String, String, String), Vec<u64>> =
             std::collections::BTreeMap::new();
         for r in &rows {
             let source: String = r.get("source");
             let model_id: Option<String> = r.get("model_id");
+            let step: Option<String> = r.get("step");
             let total_ms = nonneg_u64(r.get("total_ms"));
             groups
-                .entry((source, model_id.unwrap_or_default()))
+                .entry((
+                    source,
+                    model_id.unwrap_or_default(),
+                    step.unwrap_or_default(),
+                ))
                 .or_default()
                 .push(total_ms);
         }
 
         let mut out = Vec::with_capacity(groups.len());
-        for ((source, model_id), mut ms) in groups {
+        for ((source, model_id, step), mut ms) in groups {
             ms.sort_unstable();
             out.push(CallTimingSummaryRow {
                 source,
                 model_id,
+                step,
                 count: ms.len() as u64,
                 p50_ms: percentile_of_sorted(&ms, 0.50),
                 p95_ms: percentile_of_sorted(&ms, 0.95),
@@ -250,6 +274,26 @@ impl Store {
     /// whatever remains at the newest `max_rows` — "whichever bound is hit
     /// first" (design ask). Returns the total rows deleted.
     ///
+    /// Review (ME4-CODEX-DEBT-10 #1): the count-based cap runs every
+    /// `PRUNE_EVERY` writes (`agent24d/src/timing_recorder.rs`), so it must
+    /// never full-table-scan while holding the writer lock. The obvious
+    /// `id NOT IN (SELECT id FROM … ORDER BY id DESC LIMIT ?)` form forces
+    /// SQLite to materialize the subquery into a Bloom filter and then scan
+    /// every row of the table to test membership — ~26ms at 100k rows
+    /// (confirmed via `EXPLAIN QUERY PLAN` and a timed benchmark during
+    /// review). `id` is this table's own `INTEGER PRIMARY KEY` (the SQLite
+    /// rowid), strictly increasing and never reused, so "keep the newest
+    /// `max_rows` rows" can instead be phrased as "delete every row whose id
+    /// is more than `max_rows` below the current max id" — `MAX(id)` is a
+    /// single rightmost-leaf index lookup (not a scan) and the delete is an
+    /// indexed PK range scan, both confirmed `SEARCH` (never `SCAN`) by
+    /// `EXPLAIN QUERY PLAN` in `count_based_prune_never_full_table_scans`
+    /// below (~1ms at 100k rows in the same benchmark, and a true no-op —
+    /// no rows touched — once the table is already at/under the cap). Prior
+    /// prunes can leave gaps in `id` (rows deleted by age), so this can keep
+    /// slightly FEWER than `max_rows` rows when that happens; it can never
+    /// keep more, which is all "cap" requires.
+    ///
     /// # Errors
     /// Storage.
     pub async fn prune_call_timings(&self, cutoff_ts: &str, max_rows: u32) -> Result<u64> {
@@ -258,17 +302,24 @@ impl Store {
             .execute(self.pool())
             .await?
             .rows_affected();
-        let by_count = sqlx::query(
-            "DELETE FROM model_call_timings WHERE id NOT IN \
-                (SELECT id FROM model_call_timings ORDER BY id DESC LIMIT ?)",
-        )
-        .bind(i64::from(max_rows))
-        .execute(self.pool())
-        .await?
-        .rows_affected();
+        let by_count = sqlx::query(COUNT_CAP_DELETE_SQL)
+            .bind(i64::from(max_rows))
+            .execute(self.pool())
+            .await?
+            .rows_affected();
         Ok(by_age + by_count)
     }
 }
+
+/// The exact DELETE `prune_call_timings` issues for its count-based cap —
+/// pulled out to a constant so the regression test below
+/// (`count_based_prune_never_full_table_scans`) can run
+/// `EXPLAIN QUERY PLAN` on the SAME statement the production code path
+/// executes, not a copy that could drift out of sync with it. `NULL - ?`
+/// (an empty table) makes the whole `WHERE` clause `NULL`/false, so this is
+/// also a safe no-op on an empty table without a separate branch.
+const COUNT_CAP_DELETE_SQL: &str = "DELETE FROM model_call_timings WHERE id <= \
+    (SELECT MAX(id) FROM model_call_timings) - ?";
 
 #[cfg(test)]
 mod tests {
@@ -478,6 +529,108 @@ mod tests {
         assert_eq!(
             remaining[0].ts, "2026-09-24T00:00:00Z",
             "the two newest survive"
+        );
+    }
+
+    /// Review (ME4-CODEX-DEBT-10 #1): `prune_call_timings`'s count-based cap
+    /// runs on EVERY `PRUNE_EVERY` (200) writes — at 100k rows that must
+    /// never degrade into a full-table scan (it holds the writer lock while
+    /// it runs). `EXPLAIN QUERY PLAN` on the exact DELETE this method issues
+    /// must show an indexed `SEARCH`, never a `SCAN`, of
+    /// `model_call_timings`.
+    /// Review (ME4-CODEX-DEBT-10 #2): AgentEar's own per-turn breakdown
+    /// (`agentear_timings.rs`) writes ONE row per `*_ms` field of a turn —
+    /// `step: Some("llm")` for the actual model-answer latency (~900ms in
+    /// this fixture) and `step: Some("total")` for the WHOLE turn including
+    /// record/ASR/TTS/playback (~3500ms) — all sharing the same
+    /// `(source, model_id)`. Grouping only by `(source, model_id)` blends
+    /// these unrelated quantities into one p95, so a summary reader cannot
+    /// tell "the model was slow" from "the speaker was still talking".
+    #[tokio::test]
+    async fn summary_does_not_blend_agentear_llm_latency_with_its_own_turn_total() {
+        let store = Store::open_memory().await.unwrap();
+        let source = "module:agentear".to_owned();
+        let model_id = Some("Qwen3.6-35B-A3B-MLX-8bit".to_owned());
+        // Five turns' worth of the REAL model-answer latency (the `llm_ms`
+        // step) — this is the number a reader asking "how slow is the model"
+        // actually wants.
+        for ms in [800u64, 850, 900, 950, 1000] {
+            store
+                .record_call_timing(&NewCallTiming {
+                    ts: "2026-09-27T00:00:00Z".to_owned(),
+                    source: source.clone(),
+                    model_id: model_id.clone(),
+                    ok: true,
+                    step: Some("llm".to_owned()),
+                    total_ms: ms,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        // The SAME five turns' whole-turn total (record+asr+llm+tts+play) —
+        // a much larger, unrelated number that must not leak into the `llm`
+        // step's percentiles above.
+        for ms in [3000u64, 3200, 3400, 3500, 3600] {
+            store
+                .record_call_timing(&NewCallTiming {
+                    ts: "2026-09-27T00:00:00Z".to_owned(),
+                    source: source.clone(),
+                    model_id: model_id.clone(),
+                    ok: true,
+                    step: Some("total".to_owned()),
+                    total_ms: ms,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let summary = store.call_timing_summary(None).await.unwrap();
+        let llm_group = summary
+            .iter()
+            .find(|r| {
+                r.source == source && r.model_id == model_id.clone().unwrap() && r.step == "llm"
+            })
+            .expect("an `llm` step group, distinct from `total`, must exist");
+        assert_eq!(
+            llm_group.count, 5,
+            "only the 5 `llm` rows, not the 5 `total` rows too"
+        );
+        assert_eq!(llm_group.p50_ms, 900, "median of the llm-only latencies");
+        assert!(
+            llm_group.p95_ms <= 1000,
+            "the real model latency's p95 must not be inflated by the turn's `total` rows \
+             (got {}, which would only be possible if `total` rows leaked in)",
+            llm_group.p95_ms
+        );
+
+        let total_group = summary
+            .iter()
+            .find(|r| {
+                r.source == source && r.model_id == model_id.clone().unwrap() && r.step == "total"
+            })
+            .expect("a `total` step group, distinct from `llm`, must exist");
+        assert_eq!(total_group.count, 5);
+        assert_eq!(total_group.p50_ms, 3400);
+    }
+
+    #[tokio::test]
+    async fn count_based_prune_never_full_table_scans() {
+        let store = Store::open_memory().await.unwrap();
+        let p = crate::test_hooks::pool(&store);
+        let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {COUNT_CAP_DELETE_SQL}"))
+            .fetch_all(p)
+            .await
+            .unwrap();
+        let plan: String = plan_rows
+            .iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            !plan.to_uppercase().contains("SCAN"),
+            "count-based prune must not full-table-scan model_call_timings; plan was: {plan}"
         );
     }
 

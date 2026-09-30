@@ -687,6 +687,19 @@ fn busy() -> RpcError {
     )
 }
 
+/// Review (ME4-CODEX-DEBT-10 #3): `error_kind` for a call that never reached
+/// the router at all because `bind_to_lifecycle` gave up first — distinct
+/// strings for the two [`LifecycleTimeout`] variants, same reasoning as
+/// `timing_recorder::timing_error_kind`'s per-`ModelError` breakdown (a
+/// reader of `GET /api/v1/timings` can tell "this request's own budget ran
+/// out" from "the caller had already ended the request").
+fn lifecycle_timeout_error_kind(e: LifecycleTimeout) -> &'static str {
+    match e {
+        LifecycleTimeout::BudgetExhausted => "timeout_budget_exhausted",
+        LifecycleTimeout::RequestEnded => "timeout_request_ended",
+    }
+}
+
 fn lifecycle_error(e: LifecycleTimeout) -> RpcError {
     match e {
         LifecycleTimeout::BudgetExhausted => RpcError::application(
@@ -778,7 +791,41 @@ impl Handler for ModelCompleteHandler {
             )
             .await
             {
-                Err(lt) => return Err(lifecycle_error(lt)), // ticket drops → Cancelled
+                Err(lt) => {
+                    // Review (ME4-CODEX-DEBT-10 #3): this used to `return`
+                    // right here with NO timing row and NO `model.call`
+                    // event — a call that lost the lifecycle race (its own
+                    // budget expired, or the bound request ended first)
+                    // simply vanished from both the timeline and the
+                    // recent-call feed, even though real wall-clock time was
+                    // spent on it. No provider was ever reached (this branch
+                    // is `bind_to_lifecycle` itself giving up, before
+                    // `grant.router.complete_served` could resolve either
+                    // way), so — like the router-level-failure branch below
+                    // — `served`/`model_id`/tokens are all `None`.
+                    let latency_ms = call_start.elapsed().as_millis() as u64;
+                    grant
+                        .deps
+                        .events
+                        .broadcast(EventBody::ModelCall(model_call_payload(
+                            &grant.module,
+                            None,
+                            None,
+                            false,
+                            latency_ms,
+                            None,
+                        )));
+                    grant.deps.timings.record(timing_observation(
+                        &grant.module,
+                        None,
+                        None,
+                        false,
+                        Some(lifecycle_timeout_error_kind(lt)),
+                        latency_ms,
+                        None,
+                    ));
+                    return Err(lifecycle_error(lt)); // ticket drops → Cancelled
+                }
                 Ok(Err(e)) => {
                     ticket.finish(match e {
                         ModelError::Cancelled => UsageOutcome::Cancelled,
@@ -1806,6 +1853,67 @@ mod handler_tests {
         assert!(row.tier.is_none(), "no provider ever answered");
         assert!(!row.ok);
         assert_eq!(row.error_kind.as_deref(), Some("unavailable"));
+    }
+
+    // ---- review (ME4-CODEX-DEBT-10 #3): a lifecycle timeout must still be
+    // recorded, not silently vanish ----
+
+    #[tokio::test]
+    async fn a_lifecycle_budget_timeout_still_records_a_timing_row_and_a_model_call_event() {
+        // `Behave::Hang` never resolves on its own — the ONLY way this call
+        // ends is `bind_to_lifecycle` losing patience once the request's own
+        // 20ms budget elapses (`LifecycleTimeout::BudgetExhausted`), exactly
+        // the path that used to `return Err(...)` before ever touching
+        // `grant.deps.timings`/`grant.deps.events`.
+        let local = stub("l", Behave::Hang);
+        let (d, _usage_sink, timings) = deps_with_timing_sink(router(vec![(local, Tier::Local)]));
+        let mut rx = d.events.subscribe();
+        let generation = running();
+        // Admitted but never `finish()`ed — the lifecycle only ends via its
+        // own budget, not via `RequestEnded`.
+        let _in_flight = generation
+            .admit_request(
+                "req_budget_timeout".into(),
+                [0u8; 32],
+                std::time::Instant::now(),
+                Duration::from_millis(20),
+            )
+            .unwrap();
+        let h = Arc::new(ModelCompleteHandler {
+            generation,
+            grant: Some(ModelGrant::new("sin90".into(), ModelAccess::LocalOnly, d)),
+        });
+        let mut p = ok_params();
+        p["request_id"] = json!("req_budget_timeout");
+        let err = tokio::time::timeout(Duration::from_secs(2), h.call(p))
+            .await
+            .expect("bind_to_lifecycle must resolve once the 20ms budget elapses")
+            .unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Timeout));
+
+        let rows = timings.take();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a lifecycle timeout must still leave one row in the recent-call feed"
+        );
+        assert_eq!(rows[0].source, "module:sin90");
+        assert!(!rows[0].ok);
+        assert!(
+            rows[0].error_kind.is_some(),
+            "must carry an error/timeout status, not just ok=false"
+        );
+
+        let (_, body) = rx
+            .try_recv()
+            .expect("a model.call event must still be broadcast onto the timeline");
+        assert_eq!(body.wire_type(), "model.call");
+        let EventBody::ModelCall(payload) = body else {
+            unreachable!("wire_type() just asserted this is ModelCall");
+        };
+        assert!(!payload.ok);
+        assert_eq!(payload.module, "sin90");
+        assert!(payload.model_id.is_none(), "no provider ever answered");
     }
 
     // ---- J7: cancellation reaches the provider; recorded on `MemoryUsageSink` ----
