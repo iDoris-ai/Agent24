@@ -205,6 +205,14 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
     let claim = match accept_attached(&frame, &|name| registry.expectation(name)) {
         Ok(claim) => claim,
         Err(refusal) => {
+            // Re-checked after the lookup too: `revoke_all` can land between
+            // the `is_closed` check above and `expectation`, and the refusal
+            // it then causes must not reach the module as `auth_failed`.
+            let refusal = if registry.is_closed() {
+                HandshakeError::ShuttingDown
+            } else {
+                refusal
+            };
             let line = error_line(id_of(&frame).as_deref(), &refusal);
             let _ = write_within(&mut writer, &line, deadline).await;
             return;
