@@ -457,14 +457,16 @@ impl RunManager {
     }
 
     async fn cancel_workspace_resume_recovery(&self, run_id: &str) {
-        let ended_at = workspace_timestamp(now_iso8601());
-        let cancelled = match WorkspaceInstant::parse(&ended_at) {
-            Ok(ended_at) => self
-                .store
-                .cancel_workspace_run_recovery(run_id, &ended_at)
-                .await
-                .map_err(AgentError::from),
-            Err(err) => Err(AgentError::from(err)),
+        let cancelled = match workspace_now() {
+            Ok(ended_at) => match WorkspaceInstant::parse(&ended_at) {
+                Ok(ended_at) => self
+                    .store
+                    .cancel_workspace_run_recovery(run_id, &ended_at)
+                    .await
+                    .map_err(AgentError::from),
+                Err(err) => Err(AgentError::from(err)),
+            },
+            Err(err) => Err(err),
         };
         match cancelled {
             Ok(RunTerminalTransition::Applied(_)) => {
