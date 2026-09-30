@@ -276,6 +276,16 @@ fn workspace_now() -> Result<String, AgentError> {
     workspace_now_at(std::time::SystemTime::now())
 }
 
+fn restore_authority_error_must_propagate(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Workspace(WorkspaceStoreError::Database)
+            | AgentError::WorkspaceService(
+                agent24_workspace::WorkspaceError::InfrastructureUnavailable { .. }
+            )
+    )
+}
+
 fn add_usage(mut total: Usage, delta: &Usage) -> Usage {
     total.prompt_tokens = total.prompt_tokens.saturating_add(delta.prompt_tokens);
     total.completion_tokens = total
@@ -783,6 +793,9 @@ impl RunManager {
                     if run.workspace_id.is_some()
                         && let Err(err) = self.tool_context_for(&run, tool_call_id).await
                     {
+                        if restore_authority_error_must_propagate(&err) {
+                            return Err(err);
+                        }
                         tracing::warn!(
                             "restore sweep: aborting approval {} — workspace authority unavailable: {err}",
                             approval.id
@@ -4285,6 +4298,69 @@ mod approval_tests {
             h.manager.restore_pending_approvals().await,
             Err(AgentError::Store(_))
         ));
+
+        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let now = workspace_timestamp(now_iso8601());
+        let expires = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
+            .unwrap();
+        let input = RunInput {
+            prompt: "go".into(),
+            workspace_id: Some(agent24_protocol::WorkspaceId::parse(WS).unwrap()),
+            model_override: None,
+            mode: RunMode::Normal,
+        };
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(WS).bind(&now).bind(expires.as_str()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO runs (id,workspace_id,status,input,usage,created_at) VALUES ('run_db',?,'awaiting_approval',?,?,?)")
+            .bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_db",
+                "user",
+                Some("go"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let args = serde_json::json!({"argv":["/bin/echo","hi"]});
+        let calls = serde_json::json!([{"id":"call_provider_1","name":"shell_exec","arguments":args.to_string()}]);
+        h.store
+            .append_run_message("run_db", "assistant", None, &calls, None, &now_iso8601())
+            .await
+            .unwrap();
+        h.store
+            .insert_approval(&seed_approval(
+                "apr_db",
+                "run_db",
+                "tc_internal_1",
+                args.as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE workspace_leases")
+            .execute(agent24_store::test_hooks::pool(&h.store))
+            .await
+            .unwrap();
+        assert!(matches!(
+            h.manager.restore_pending_approvals().await,
+            Err(AgentError::Workspace(WorkspaceStoreError::Database))
+        ));
+        assert_eq!(
+            h.store
+                .get_approval("apr_db")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::Pending
+        );
     }
 
     #[tokio::test]
