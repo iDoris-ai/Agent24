@@ -991,10 +991,11 @@ impl RunManager {
             } else {
                 match self.run_tool_call(&run, &call, &cancel, true).await {
                     Ok(content) => content,
-                    Err(_) => {
+                    Err(ParkedCallStop::CancelRun) => {
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
+                    Err(ParkedCallStop::RecoveryStopped) => return,
                 }
             };
             let result = Msg::tool_result(call.id.clone(), content);
