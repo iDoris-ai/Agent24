@@ -375,23 +375,13 @@ fn lexical_normalize(path: &Path) -> Option<PathBuf> {
 }
 
 fn store_now() -> Result<WorkspaceInstant> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })?
-        .as_millis();
-    let millis =
-        u64::try_from(millis).map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })?;
-    store_instant_from_epoch_millis(millis)
+    let now = agent24_core::util::now_iso8601_millis()
+        .map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })?;
+    WorkspaceInstant::parse(&now).map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })
 }
 
 fn store_instant_from_epoch_millis(millis: u64) -> Result<WorkspaceInstant> {
-    let seconds = millis / 1000;
-    let fraction = millis % 1000;
-    let raw = agent24_core::util::iso8601_from_epoch_secs(seconds);
-    let text = raw
-        .strip_suffix('Z')
-        .map(|prefix| format!("{prefix}.{fraction:03}Z"))
-        .ok_or(WorkspaceError::RootUnavailable { reason: "clock" })?;
+    let text = agent24_core::util::iso8601_from_epoch_millis(millis);
     WorkspaceInstant::parse(&text).map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })
 }
 
