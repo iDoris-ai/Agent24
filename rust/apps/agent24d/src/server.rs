@@ -1479,12 +1479,9 @@ pub async fn serve(
     if orphans > 0 {
         tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
     }
-    let workspace_now_text = now
-        .strip_suffix('Z')
-        .map(|prefix| format!("{prefix}.000Z"))
-        .unwrap_or_else(|| now.clone());
-    let workspace_now = agent24_store::WorkspaceInstant::parse(&workspace_now_text)
-        .map_err(std::io::Error::other)?;
+    let workspace_now =
+        agent24_store::WorkspaceInstant::parse(&agent24_core::util::now_iso8601_millis())
+            .map_err(std::io::Error::other)?;
     let workspace_orphans = state
         .store
         .sweep_workspace_orphan_runs(&workspace_now)

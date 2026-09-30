@@ -29,6 +29,15 @@ pub fn now_iso8601() -> String {
     iso8601_at(epoch_secs())
 }
 
+/// ISO 8601 UTC, millisecond precision.
+pub fn now_iso8601_millis() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    iso8601_from_epoch_millis(millis)
+}
+
 /// ISO 8601 UTC timestamp `after` from now (e.g. approval expires_at).
 pub fn iso8601_after(after: std::time::Duration) -> String {
     iso8601_at(epoch_secs().saturating_add(after.as_secs()))
@@ -48,6 +57,15 @@ pub fn iso8601_before(before: std::time::Duration) -> String {
 /// without duplicating it or exposing the private `iso8601_at` directly.)
 pub fn iso8601_from_epoch_secs(secs: u64) -> String {
     iso8601_at(secs)
+}
+
+/// ISO 8601 UTC timestamp for an arbitrary epoch-millisecond value.
+pub fn iso8601_from_epoch_millis(millis: u64) -> String {
+    let secs = millis / 1000;
+    let fraction = millis % 1000;
+    let raw = iso8601_at(secs);
+    let prefix = raw.strip_suffix('Z').unwrap_or(&raw);
+    format!("{prefix}.{fraction:03}Z")
 }
 
 fn epoch_secs() -> u64 {
@@ -98,6 +116,14 @@ mod tests {
         assert_eq!(ts.len(), 20);
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[10..11], "T");
+    }
+
+    #[test]
+    fn iso8601_millis_preserves_fractional_precision() {
+        assert_eq!(iso8601_from_epoch_millis(123), "1970-01-01T00:00:00.123Z");
+        let ts = now_iso8601_millis();
+        assert_eq!(ts.len(), 24);
+        assert!(ts.ends_with('Z'));
     }
 
     #[test]
