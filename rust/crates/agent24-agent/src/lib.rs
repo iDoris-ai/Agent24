@@ -751,6 +751,76 @@ impl RunManager {
             .ok_or_else(|| AgentError::Store(StoreError::NotFound(format!("run {id}"))))
     }
 
+    /// Recover runs that are still parked after their durable approval row was
+    /// timed out by the daemon sweep. Live executors keep their existing
+    /// in-memory timeout behavior; only token-less parked runs are landed
+    /// cancelled here. A failed cancellation leaves the durable candidate in
+    /// place, so the next scan retries it.
+    pub async fn recover_timed_out_approval_runs(&self) -> Result<u64, AgentError> {
+        let run_ids = self.store.timed_out_approval_recovery_run_ids().await?;
+        let mut cancelled = 0u64;
+        for run_id in run_ids {
+            if self.cancels.lock().await.contains_key(&run_id) {
+                continue;
+            }
+            let Some(run) = self.store.get_run(&run_id).await? else {
+                continue;
+            };
+            if run.status != RunStatus::AwaitingApproval {
+                continue;
+            }
+
+            let result = if run.workspace_id.is_some() {
+                let ended_at = workspace_now()
+                    .and_then(|raw| WorkspaceInstant::parse(&raw).map_err(AgentError::from));
+                match ended_at {
+                    Ok(ended_at) => self
+                        .store
+                        .cancel_workspace_run_recovery(&run_id, &ended_at)
+                        .await
+                        .map_err(AgentError::from)
+                        .map(|outcome| match outcome {
+                            RunTerminalTransition::Applied(_) => true,
+                            RunTerminalTransition::Conflict => false,
+                        }),
+                    Err(err) => Err(err),
+                }
+            } else {
+                let ended_at = now_iso8601();
+                self.store
+                    .transition_run(
+                        &run_id,
+                        RunStatus::Cancelled,
+                        RunPatch {
+                            ended_at: Some(ended_at),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| true)
+                    .map_err(AgentError::from)
+            };
+
+            match result {
+                Ok(true) => {
+                    self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
+                        run_id: run_id.clone(),
+                    }));
+                    cancelled += 1;
+                }
+                Ok(false) => {
+                    tracing::debug!("run {run_id}: timed-out approval recovery already settled");
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "run {run_id}: timed-out approval recovery cancel failed; will retry: {err}"
+                    );
+                }
+            }
+        }
+        Ok(cancelled)
+    }
+
     /// Startup durable-resume sweep (H3): decide every approval left `pending` by
     /// a previous process, in place of the old abort-everything sweep.
     ///
@@ -4194,6 +4264,107 @@ mod approval_tests {
                 .unwrap()
                 .status,
             ApprovalStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_recovery_cancels_only_tokenless_parked_runs_without_start_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        for id in ["run_tokenless", "run_live"] {
+            h.store
+                .insert_run(&run_in(id, RunStatus::AwaitingApproval))
+                .await
+                .unwrap();
+            let mut approval = seed_approval(
+                &format!("apr_{id}"),
+                id,
+                &format!("tc_{id}"),
+                serde_json::Map::new(),
+            );
+            approval.status = ApprovalStatus::TimedOut;
+            approval.decided_at = Some(now_iso8601());
+            h.store.insert_approval(&approval).await.unwrap();
+        }
+        h.manager
+            .cancels
+            .lock()
+            .await
+            .insert("run_live".to_owned(), CancellationToken::new());
+
+        assert_eq!(
+            h.manager.recover_timed_out_approval_runs().await.unwrap(),
+            1
+        );
+        assert_eq!(
+            h.store
+                .get_run("run_tokenless")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            h.store.get_run("run_live").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        let seen = h.events.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter()
+                .filter(|event| event.as_str() == "run.cancelled")
+                .count(),
+            1
+        );
+        assert!(!seen.iter().any(|event| event.as_str() == "run.started"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_recovery_retries_a_failed_cancel_on_the_next_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        h.store
+            .insert_run(&run_in("run_retry", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        let mut approval =
+            seed_approval("apr_retry", "run_retry", "tc_retry", serde_json::Map::new());
+        approval.status = ApprovalStatus::TimedOut;
+        approval.decided_at = Some(now_iso8601());
+        h.store.insert_approval(&approval).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TRIGGER block_retry_cancel BEFORE UPDATE OF status ON runs
+             WHEN OLD.id='run_retry' AND NEW.status='cancelled'
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&h.store))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            h.manager.recover_timed_out_approval_runs().await.unwrap(),
+            0
+        );
+        assert_eq!(
+            h.store.get_run("run_retry").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        assert_eq!(
+            h.store.timed_out_approval_recovery_run_ids().await.unwrap(),
+            vec!["run_retry".to_owned()]
+        );
+
+        sqlx::query("DROP TRIGGER block_retry_cancel")
+            .execute(agent24_store::test_hooks::pool(&h.store))
+            .await
+            .unwrap();
+        assert_eq!(
+            h.manager.recover_timed_out_approval_runs().await.unwrap(),
+            1
+        );
+        assert_eq!(
+            h.store.get_run("run_retry").await.unwrap().unwrap().status,
+            RunStatus::Cancelled
         );
     }
 
