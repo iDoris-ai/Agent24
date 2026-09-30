@@ -815,6 +815,19 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn run_handle_relative_path_rejects_absolute_sibling_root() {
+            let (_state, service) = fixture(None).await;
+            let lease = seed_run_authority(&service).await;
+            let handle = service.open_run_handle("r", &lease).await.unwrap();
+            let sibling = service.roots_path.join("not-this-workspace/file.txt");
+
+            assert!(matches!(
+                handle.relative_path(sibling.to_str().unwrap()),
+                Err(WorkspaceError::InvalidSpec { field: "path" })
+            ));
+        }
+
+        #[tokio::test]
         async fn run_authority_child_cwd_stays_pinned_after_locator_replacement() {
             let (_state, service) = fixture(None).await;
             let service = Arc::new(service);
