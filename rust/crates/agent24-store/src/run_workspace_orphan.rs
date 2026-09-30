@@ -301,4 +301,16 @@ mod tests {
             .bind(LEASE).fetch_one(st.pool()).await.unwrap();
         assert_eq!(released, None);
     }
+    #[tokio::test]
+    async fn fractional_host_lease_expiry_stops_sparing_orphan() {
+        let st = Store::open_memory().await.unwrap();
+        sqlx::raw_sql("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES ('ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5','orchestrator_scratch','active','test','external','orchestrator','owner','serial','2026-09-19T00:00:00.000Z','2026-09-19T00:01:00.000Z',1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')").execute(st.pool()).await.unwrap();
+        let input = serde_json::to_string(&RunInput { prompt: "go".into(), workspace_id: Some(WorkspaceId::parse(WS).unwrap()), model_override: None, mode: RunMode::Normal }).unwrap(); let usage = serde_json::to_string(&Usage::default()).unwrap();
+        sqlx::query("INSERT INTO runs (id,workspace_id,status,input,usage,created_at) VALUES ('fractional',?,'running',?,?,?)").bind(WS).bind(&input).bind(&usage).bind(TS).execute(st.pool()).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','fractional','run',?)").bind(LEASE).bind(WS).bind(TS).execute(st.pool()).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,daemon_generation,host_instance_id,acquired_at,expires_at) VALUES ('wl_01J5M4Q2Y7N8P9R0S1T2V3W4X7',?,'g1','host-live','host','daemon-live','host-live',?,'2026-09-19T00:00:01.500Z')").bind(WS).bind(TS).execute(st.pool()).await.unwrap();
+        assert_eq!(st.sweep_workspace_orphan_runs(&WorkspaceInstant::parse("2026-09-19T00:00:01.000Z").unwrap()).await.unwrap(), WorkspaceOrphanSweep { released_leases: 0 });
+        assert_eq!(st.sweep_workspace_orphan_runs(&WorkspaceInstant::parse("2026-09-19T00:00:01.900Z").unwrap()).await.unwrap(), WorkspaceOrphanSweep { released_leases: 1 });
+        assert_eq!(st.get_run("fractional").await.unwrap().unwrap().status, RunStatus::Cancelled);
+    }
 }
