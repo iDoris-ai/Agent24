@@ -751,6 +751,18 @@ impl ApprovalBroker {
         tracing::info!("approval {approval_id} resolved: {resolution}");
     }
 
+    /// Durable expiry sweep used at daemon startup and by the periodic
+    /// recovery loop.  The store CAS chooses the winners; only those rows are
+    /// announced and audited here, so repeated scans are side-effect free.
+    pub async fn timeout_expired(&self, now: &str) -> Result<u64, StoreError> {
+        let expired = self.store.timeout_expired_approvals(now).await?;
+        for (approval_id, run_id) in &expired {
+            self.broadcast_resolution(approval_id, run_id, "timed_out")
+                .await;
+        }
+        Ok(expired.len() as u64)
+    }
+
     /// Apply a client decision (REST `POST /api/v1/approvals/{id}`).
     /// Store-first: the pending-only UPDATE is the single arbiter, so a
     /// duplicate/late decision surfaces as 409 and is discarded.
@@ -1266,6 +1278,84 @@ mod tests {
                 .filter(|event| event.as_str() == "approval.resolved")
                 .count(),
             resolved_before
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_expiry_sweep_emits_and_audits_only_cas_winners() {
+        let (broker, events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        store
+            .insert_approval(&Approval {
+                id: "apr_expired".to_owned(),
+                run_id: "run_1".to_owned(),
+                tool_call_id: "tc_1".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "s".to_owned(),
+                payload: Map::new(),
+                available_decisions: vec!["approve".to_owned()],
+                standing_target: None,
+                status: ApprovalStatus::Pending,
+                decision: None,
+                expires_at: "2026-09-30T00:00:00Z".to_owned(),
+                created_at: "2026-09-29T23:59:00Z".to_owned(),
+                decided_at: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            broker
+                .timeout_expired("2026-09-30T00:00:01Z")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_approval("apr_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::TimedOut
+        );
+        let resolved_events = || {
+            events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.as_str() == "approval.resolved")
+                .count()
+        };
+        assert_eq!(resolved_events(), 1);
+        let resolved_audits = store
+            .list_audit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "approval.resolved")
+            .count();
+        assert_eq!(resolved_audits, 1);
+
+        assert_eq!(
+            broker
+                .timeout_expired("2026-09-30T00:00:02Z")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(resolved_events(), 1);
+        assert_eq!(
+            store
+                .list_audit()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.action == "approval.resolved")
+                .count(),
+            1
         );
     }
 
