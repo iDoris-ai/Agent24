@@ -3790,91 +3790,21 @@ mod approval_tests {
     }
 
     #[tokio::test]
+    #[rustfmt::skip]
     async fn bound_settle_authority_loss_after_running_cancels_recovery() {
-        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
-        const LEASE: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
-        let dir = tempfile::tempdir().unwrap();
-        let h = resume_harness(dir.path().to_path_buf()).await;
-        let workspace_id = agent24_protocol::WorkspaceId::parse(WS).unwrap();
-        let now = workspace_timestamp(now_iso8601());
-        let expires = WorkspaceInstant::parse(&now)
-            .unwrap()
-            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
-            .unwrap();
-        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
-            .bind(WS).bind(&now).bind(expires.as_str())
-            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        h.store
-            .insert_session(&agent24_protocol::Session {
-                id: "sess_1".to_owned(),
-                title: "session".to_owned(),
-                channel: "desktop".to_owned(),
-                workspace_id: Some(workspace_id.clone()),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .await
-            .unwrap();
-        let input = RunInput {
-            prompt: "run echo".to_owned(),
-            workspace_id: Some(workspace_id.clone()),
-            model_override: None,
-            mode: RunMode::Normal,
-        };
-        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'running',?,?,?,?)")
-            .bind(WS)
-            .bind(serde_json::to_string(&input).unwrap())
-            .bind(serde_json::to_string(&zero_usage()).unwrap())
-            .bind(&now)
-            .bind(&now)
-            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)")
-            .bind(LEASE).bind(WS).bind(&now)
-            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
-
-        let run = h.store.get_run("run_1").await.unwrap().unwrap();
-        let mut approval = seed_approval(
-            "apr_1",
-            "run_1",
-            "tc_internal_1",
-            serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] })
-                .as_object()
-                .unwrap()
-                .clone(),
-        );
-        approval.status = ApprovalStatus::Approved;
-        approval.decision = Some(decision("approve", None));
-        approval.decided_at = Some(now_iso8601());
-        let call = agent24_models::ToolCallRequest {
-            id: "call_provider_1".to_owned(),
-            name: "shell_exec".to_owned(),
-            arguments: serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] }).to_string(),
-        };
-
-        assert_bound_recovery_followup_stops(&h, &run, &call, LEASE).await;
-        assert!(matches!(
-            h.manager
-                .settle_parked_call(&run, &approval, &call, &CancellationToken::new())
-                .await,
-            Err(ParkedCallStop::RecoveryStopped)
-        ));
-        assert_eq!(
-            h.store.get_run("run_1").await.unwrap().unwrap().status,
-            RunStatus::Cancelled
-        );
-        let released: Option<String> =
-            sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?")
-                .bind(LEASE)
-                .fetch_one(agent24_store::test_hooks::pool(&h.store))
-                .await
-                .unwrap();
-        assert!(released.is_some());
-        assert!(
-            h.events
-                .lock()
-                .unwrap()
-                .contains(&"run.cancelled".to_owned())
-        );
+        const WS:&str="ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5"; const LEASE:&str="wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let dir=tempfile::tempdir().unwrap(); let h=resume_harness(dir.path().to_path_buf()).await; let workspace_id=agent24_protocol::WorkspaceId::parse(WS).unwrap(); let now=workspace_timestamp(now_iso8601()); let expires=WorkspaceInstant::parse(&now).unwrap().checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap()).unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')").bind(WS).bind(&now).bind(expires.as_str()).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store.insert_session(&agent24_protocol::Session{id:"sess_1".into(),title:"session".into(),channel:"desktop".into(),workspace_id:Some(workspace_id.clone()),created_at:now.clone(),updated_at:now.clone()}).await.unwrap();
+        let input=RunInput{prompt:"run echo".into(),workspace_id:Some(workspace_id),model_override:None,mode:RunMode::Normal};
+        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'running',?,?,?,?)").bind(WS).bind(serde_json::to_string(&input).unwrap()).bind(serde_json::to_string(&zero_usage()).unwrap()).bind(&now).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)").bind(LEASE).bind(WS).bind(&now).execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        let run=h.store.get_run("run_1").await.unwrap().unwrap(); let payload=serde_json::json!({"argv":["/bin/echo","must-not-run"]}); let mut approval=seed_approval("apr_1","run_1","tc_internal_1",payload.as_object().unwrap().clone()); approval.status=ApprovalStatus::Approved; approval.decision=Some(decision("approve",None)); approval.decided_at=Some(now_iso8601());
+        let call=agent24_models::ToolCallRequest{id:"call_provider_1".into(),name:"shell_exec".into(),arguments:payload.to_string()};
+        assert_bound_recovery_followup_stops(&h,&run,&call,LEASE).await;
+        assert!(matches!(h.manager.settle_parked_call(&run,&approval,&call,&CancellationToken::new()).await,Err(ParkedCallStop::RecoveryStopped)));
+        assert_eq!(h.store.get_run("run_1").await.unwrap().unwrap().status,RunStatus::Cancelled);
+        let released:Option<String>=sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?").bind(LEASE).fetch_one(agent24_store::test_hooks::pool(&h.store)).await.unwrap(); assert!(released.is_some()); assert!(h.events.lock().unwrap().contains(&"run.cancelled".to_owned()));
     }
 
     #[tokio::test]
