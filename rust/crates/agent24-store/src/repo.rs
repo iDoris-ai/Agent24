@@ -673,6 +673,49 @@ impl Store {
         Ok(approval)
     }
 
+    /// Resolve a human/client decision only while the approval is still pending
+    /// and not past its persisted expiry. The equality boundary belongs to the
+    /// client decision path; startup/timeout recovery owns strictly later times.
+    pub async fn resolve_approval_client_decision(
+        &self,
+        id: &str,
+        to: ApprovalStatus,
+        decision: &Decision,
+        now: &str,
+    ) -> Result<Approval> {
+        agent24_core::check_approval_transition(ApprovalStatus::Pending, to)?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query(
+            "UPDATE approvals SET status = ?, decision = ?, decided_at = ?
+             WHERE id = ? AND status = 'pending' AND expires_at >= ?",
+        )
+        .bind(approval_status_str(to))
+        .bind(serde_json::to_string(decision)?)
+        .bind(now)
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() == 0 {
+            let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("approval {id}")))?;
+            Self::row_to_approval(&row)?;
+            return Err(StoreError::Conflict(format!(
+                "approval {id} already resolved or expired"
+            )));
+        }
+        let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let approval = Self::row_to_approval(&row)?;
+        tx.commit().await?;
+        Ok(approval)
+    }
+
     /// Fail-closed startup sweep: abort every approval left pending by a
     /// previous daemon process (TASKS C4 acceptance: kill + restart ⇒ aborted).
     pub async fn abort_lingering_approvals(&self, decided_at: &str) -> Result<u64> {
@@ -1312,5 +1355,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Serde(_)));
+    }
+
+    #[tokio::test]
+    async fn client_decision_expiry_boundary_is_store_atomic() {
+        let store = approval_store("{}").await;
+        let decision = Decision {
+            kind: "approve".to_owned(),
+            reason: None,
+            extra: serde_json::Map::new(),
+        };
+        assert_eq!(
+            store
+                .resolve_approval_client_decision(
+                    "apr_1",
+                    ApprovalStatus::Approved,
+                    &decision,
+                    "2026-07-24T00:05:00Z",
+                )
+                .await
+                .unwrap()
+                .status,
+            ApprovalStatus::Approved
+        );
+
+        let store = approval_store("{}").await;
+        assert!(matches!(
+            store
+                .resolve_approval_client_decision(
+                    "apr_1",
+                    ApprovalStatus::Approved,
+                    &decision,
+                    "2026-07-24T00:05:01Z",
+                )
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store.get_approval("apr_1").await.unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
     }
 }

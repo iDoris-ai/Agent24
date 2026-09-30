@@ -3687,7 +3687,7 @@ mod approval_tests {
             standing_target: None,
             status: ApprovalStatus::Pending,
             decision: None,
-            expires_at: now_iso8601(),
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
             created_at: now_iso8601(),
             decided_at: None,
         };
@@ -3987,7 +3987,7 @@ mod approval_tests {
             standing_target: None,
             status: ApprovalStatus::Pending,
             decision: None,
-            expires_at: now_iso8601(),
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
             created_at: now_iso8601(),
             decided_at: None,
         };
@@ -4058,7 +4058,7 @@ mod approval_tests {
             standing_target: None,
             status: ApprovalStatus::Pending,
             decision: None,
-            expires_at: now_iso8601(),
+            expires_at: agent24_core::util::iso8601_after(Duration::from_secs(30)),
             created_at: now_iso8601(),
             decided_at: None,
         }
