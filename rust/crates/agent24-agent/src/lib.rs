@@ -875,6 +875,17 @@ impl RunManager {
             }
         };
 
+        // A bound run must still have fresh workspace authority before restart
+        // recovery may make it live again. The parked approval may have waited
+        // long enough for its workspace/lease authority to become unavailable.
+        if run.workspace_id.is_some()
+            && let Err(err) = self.tool_context_for(&run, tool_call_id.clone()).await
+        {
+            tracing::warn!("run {run_id}: resume workspace authority unavailable — {err}");
+            self.finish_cancelled(&run_id).await;
+            return;
+        }
+
         // 3. Reconstruct the conversation and return the run to Running.
         let mut messages = thread_to_messages(&thread);
         if let Err(err) = self
@@ -3578,6 +3589,96 @@ mod approval_tests {
                 .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
             "no tool result was recorded for the resumed call"
         );
+    }
+
+    #[tokio::test]
+    async fn bound_resume_without_fresh_authority_cancels_before_running() {
+        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        const LEASE: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WS).unwrap();
+        let now = workspace_timestamp(now_iso8601());
+        let expires = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(WS).bind(&now).bind(expires.as_str())
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .insert_session(&agent24_protocol::Session {
+                id: "sess_1".to_owned(),
+                title: "session".to_owned(),
+                channel: "desktop".to_owned(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .await
+            .unwrap();
+        let input = RunInput {
+            prompt: "run echo".to_owned(),
+            workspace_id: Some(workspace_id.clone()),
+            model_override: None,
+            mode: RunMode::Normal,
+        };
+        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)")
+            .bind(WS)
+            .bind(serde_json::to_string(&input).unwrap())
+            .bind(serde_json::to_string(&zero_usage()).unwrap())
+            .bind(&now)
+            .bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)")
+            .bind(LEASE).bind(WS).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] });
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        let approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            args.as_object().unwrap().clone(),
+        );
+        h.store.insert_approval(&approval).await.unwrap();
+        h.broker
+            .resolve("apr_1", decision("approve", None))
+            .await
+            .unwrap();
+
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wait_terminal(&h.store, "run_1").await.status,
+            RunStatus::Cancelled
+        );
+        assert!(!h.events.lock().unwrap().contains(&"run.started".to_owned()));
+        let released: Option<String> =
+            sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?")
+                .bind(LEASE)
+                .fetch_one(agent24_store::test_hooks::pool(&h.store))
+                .await
+                .unwrap();
+        assert!(released.is_some());
     }
 
     #[tokio::test]
