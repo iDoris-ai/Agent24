@@ -30,14 +30,14 @@ was first drafted:
 - **M6** workspace-bound execution/authority hardening is complete, including
   opaque pinned workspace authority, fresh revalidation, filesystem/shell
   isolation, approval/run ownership, and multi-workspace isolation.
-- **M7 Recovery & Reliability is active now.** The durable approval/recovery
-  train is being landed bottom-up; #579, #580, #581, #582, #583, #584, and
-  #586 are already merged into the integration branch, while later M7 slices
-  continue through exact-head review and development.
+- **M7 Recovery & Reliability is complete on the integration branch.** The
+  durable approval/recovery train was landed bottom-up: #579-#584, #586,
+  #592, #593, #595, and #596 are merged into the integration branch. The
+  branch was then normal-merged with current `main` and is 0 commits behind it.
 
 The development PRs listed in the older M1-M6 sections below are therefore no
 longer "waiting to be reviewed" development work: the relevant slices through
-#584 plus #586 have been merged into
+#596 have been merged into
 `integration/open-design-main-sync-wave20`. They are **not** thereby landed
 wholesale into Agent24 `main`.
 
@@ -213,11 +213,12 @@ performed as reviewed atomic landing slices rather than as one combined M6 PR.
 
 ### M7 Recovery & Reliability
 
-Continue the same conveyor-belt policy for recovery slices. The current M7
-development sequence includes the recovery clock and durable approval/recovery
-work (#579 onward). At the latest 2026-09-30 refresh, #579-#584 and #586 are
-merged into the integration branch; later recovery slices remain under active
-review and development.
+Continue the same conveyor-belt policy for recovery slices. The M7 development
+sequence includes the recovery clock and durable approval/recovery work (#579
+onward). At the latest 2026-09-30 refresh, #579-#584, #586, #592, #593, #595,
+and #596 are merged into the integration branch. The final integration sync is
+at `6d0b8b6` and is 0 commits behind current `main`; M7 has no remaining active
+code slice on this branch.
 
 Do not encode a stale "approved/blocked" label for each M7 PR into this
 strategy. The operational source of truth is the exact current base/head plus
