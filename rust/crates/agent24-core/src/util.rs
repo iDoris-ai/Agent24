@@ -51,7 +51,7 @@ pub fn now_iso8601_millis() -> Result<String, ClockError> {
     iso8601_millis_at(std::time::SystemTime::now())
 }
 
-fn iso8601_millis_at(time: std::time::SystemTime) -> Result<String, ClockError> {
+pub fn iso8601_millis_at(time: std::time::SystemTime) -> Result<String, ClockError> {
     let millis = time
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| ClockError::BeforeUnixEpoch)?
