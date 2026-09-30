@@ -1,8 +1,8 @@
 # Open Design Integration and Main-Landing Strategy
 
-Status: proposed for adoption
+Status: adopted; refreshed for current execution
 
-Date: 2026-09-29
+Date: 2026-09-30
 
 ## Goal
 
@@ -20,27 +20,37 @@ Those needs should be handled by different branch roles.
 
 ## Current milestone reality
 
-The prototype milestones are complete as development/integration work, but they
-are **not yet all landed in Agent24 `main`**.
+The integration/product track has advanced substantially since this strategy
+was first drafted:
 
-- **M1** (embedded Creative shell) is implemented by Agent24 PRs **#563** and
-  **#564**. Both are still OPEN.
-- **M2** (minimal `agent24 acp`) is implemented by Agent24 PR **#565**. It is
-  still OPEN.
-- **M3** is the thin Agent24 runtime registration in the Open Design fork. It
-  is a fork-side change, not an Agent24-main landing PR.
-- **M4** is the first complete product acceptance gate: Agent24 Desktop ->
-  embedded Open Design -> Agent24 ACP -> real Session / Run -> artifact /
-  preview -> second-turn edit continuity. M4 therefore depends on M1-M3; it is
-  not a substitute for landing them.
-- **M5** authority activation is development-complete but its Agent24 PR chain
-  is still OPEN.
-- **M6** is in progress; #568 is the reviewed authority-snapshot slice and the
-  pinned `WorkspaceHandle` slice follows it.
+- **M1-M4** prototype integration is complete. The embedded Creative shell,
+  minimal ACP bridge, runtime adapter, and packaged positive-path acceptance
+  were proven together before hardening continued.
+- **M5** workspace authority activation is complete on the integration branch.
+- **M6** workspace-bound execution/authority hardening is complete, including
+  opaque pinned workspace authority, fresh revalidation, filesystem/shell
+  isolation, approval/run ownership, and multi-workspace isolation.
+- **M7 Recovery & Reliability is active now.** The durable approval/recovery
+  train is being landed bottom-up; #579, #580, #581, and #582 are already
+  merged into the integration branch, while later M7 slices continue through
+  exact-head review.
 
-Therefore the main-landing plan must start with the **M1/M2 Agent24 code and
-their required foundation**, not with a fictional "M4-only" code PR. M4 is the
-acceptance gate used to prove those slices together.
+The development PRs listed in the older M1-M6 sections below are therefore no
+longer "waiting to be reviewed" development work: the relevant slices through
+#582 have been merged into
+`integration/open-design-main-sync-wave20`. They are **not** thereby landed
+wholesale into Agent24 `main`.
+
+This distinction is important: development/recovery completion on the
+integration branch and controlled landing into `main` are separate tracks.
+The main-landing plan still starts with the smallest dependency-ready
+prototype/foundation slices and preserves patch/tree equivalence; it must not
+merge the long-lived integration branch wholesale.
+
+Current status claims in this document are snapshots, not merge authorization.
+Before acting on any numbered PR, verify its exact current base/head, CI, and
+latest review verdict according to
+`docs/design/OPEN-DESIGN-PR-REVIEW-PLAYBOOK.md`.
 
 ## Decision
 
@@ -48,12 +58,14 @@ Use two tracks in parallel.
 
 ### Track A — Integration / product validation
 
-Maintain one long-lived branch for real product integration and test builds:
+Maintain one long-lived branch for real product integration and test builds.
+The current active branch is:
 
-`integration/open-design-product`
+`integration/open-design-main-sync-wave20`
 
-The current temporary preview branch may continue to be used while this branch
-is prepared, but it is not itself the preferred main-landing vehicle.
+It remains a staging/development composition branch, not the preferred
+main-landing vehicle. A future rename or replacement with a cleaner permanent
+integration branch does not change this two-track policy.
 
 This branch is allowed to contain multiple already-reviewed Open Design slices
 at once so that we can continuously verify:
@@ -136,7 +148,7 @@ landing head rather than claiming it is identical to the old reviewed head.
 ## Merge policy for stacked development PRs
 
 Development PRs may continue to use stacked bases because that keeps each
-review small while M6+ is being built.
+review small while M7+ is being built.
 
 Review and close a stack bottom-up. Do not merge a child slice before its base
 slice has either:
@@ -161,8 +173,8 @@ independent, but the default order is:
 5. M4 acceptance — rerun the packaged end-to-end prototype after #563-#565
    landing equivalents are green on current `main`
 
-These three should first be proven together on the integration branch and by a
-real packaged preview. Their main landing should still be three small PRs (or
+These three have already been proven together on the integration branch and by
+the product prototype. Their main landing should still be three small PRs (or
 two only if the final diff is genuinely tiny and review remains clear), not one
 combined prototype PR.
 
@@ -186,18 +198,30 @@ inside the #555 landing PR.
 13. #566 — active run-lease lookup / rehydration
 14. #567 — runtime workspace authority activation
 
-The M5 development milestone is considered complete when these behaviors are
-green on the integration branch. Main landing remains incremental in the order
-above.
+The M5 development milestone is complete on the integration branch. Main
+landing remains incremental in the order above.
 
 ### M6
 
 15. #568 — atomic `RunWorkspaceAuthoritySnapshot`
 16. M6.1b — pinned opaque `WorkspaceHandle`
-17. later M6 slices — ToolContext authority binding and use-time validation
+17. later M6 slices — ToolContext authority binding, use-time revalidation,
+    workspace filesystem/shell enforcement, approval ownership, and isolation
 
-M6 should continue development on top of the reviewed M5/M6 stack even while
-the earlier landing PRs are being reviewed for `main`.
+M6 is complete on the integration branch. Its main landing should still be
+performed as reviewed atomic landing slices rather than as one combined M6 PR.
+
+### M7 Recovery & Reliability
+
+Continue the same conveyor-belt policy for recovery slices. The current M7
+development sequence includes the recovery clock and durable approval/recovery
+work (#579 onward). At the 2026-09-30 refresh, #579-#582 are merged into the
+integration branch and the next recovery slices are still being reviewed and
+developed.
+
+Do not encode a stale "approved/blocked" label for each M7 PR into this
+strategy. The operational source of truth is the exact current base/head plus
+the latest exact-head review required by the PR review playbook.
 
 ## Integration branch acceptance gate
 
@@ -239,9 +263,9 @@ retain the existing rule of two independent exact-head reviews.
 1. Develop the next small slice on a stacked feature branch.
 2. Run focused + full relevant validation.
 3. Obtain required exact-head review(s).
-4. Merge that reviewed slice into `integration/open-design-product` with a
+4. Merge that reviewed slice into the active integration/staging branch with a
    normal merge and produce/update the runnable preview.
-5. Continue immediately with the next M6+ slice; integration development does
+5. Continue immediately with the next M7+ slice; integration development does
    not wait for main landing.
 6. In parallel, take the oldest fully reviewed dependency-ready slice and make
    a clean `land/open-design-*` branch from latest `main`.
@@ -338,22 +362,22 @@ PLDM should stop the landing train at the current slice if any of these occurs:
   unrelated history.
 - Do not bypass exact-head review merely because the patch was already tested
   on the integration branch.
-- Do not stop M6 development while older M4/M5 landing PRs wait for human
+- Do not stop M7+ development while older M4/M5/M6 landing PRs wait for human
   review.
 
 ## Immediate adoption steps
 
-1. Keep the current runnable preview branch for product validation while the
-   permanent integration branch is established.
-2. Fix the current Creative loading regression on the preview branch and prove
-   the real packaged path again.
-3. Establish one stable staging branch (prefer `integration/open-design` or
-   `integration/open-design-product`) and merge current `main` into it with a
-   normal merge; do not rebase/force published stacks.
+1. Keep `integration/open-design-main-sync-wave20` as the current composition
+   branch while controlled main landing proceeds.
+2. Preserve the proven packaged M4 positive path as a regression gate while
+   recovery/productization work continues.
+3. Merge current `main` into the integration/staging branch only with normal
+   merge commits when needed; do not rebase/force published stacks.
 4. Audit the pre-#555 wave20 foundation and turn its required pieces into a
    concrete main-landing queue of small PRs.
 5. Start main landing with the smallest dependency-ready M4 slice while the
    foundation queue is prepared in parallel.
 6. After each main landing tranche, merge the new `main` back into staging and
    rerun cross-stack CI.
-7. Continue M6.1b development in parallel.
+7. Continue M7 Recovery & Reliability in parallel, then M8-M10
+   productization/release work.
