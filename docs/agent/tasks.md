@@ -62,7 +62,7 @@
 | ME4-5.3.4 | Cos72 | Cos72 真实挂载黑盒（含与 Sin90 共存隔离） | 5.3.3b, 5.2.1 | `DONE` | Cos72 #8 合并于 2026-09-30 |
 | ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2b | `DONE` | #585 合并于 2026-09-30：`docs/specs/WIRE-OOP-MODULE.md`（逐方法 params/result/错误闭集，每条事实带 file:line）+ `examples/node-module/`（纯 Node 标准库，未引用本仓 Rust crate，仅声明 `events`/`memory`）+ `rust/apps/agent24d/tests/me4_node_module_blackbox.rs`（真实黑盒：挂载→代理→事件→记忆，10/10 连跑绿；无 node 则 SKIP 并打印原因，不 panic）。范围收窄：只覆盖 events/memory 往返，scheduler upsert/fired 与 model/approval 只有文档、无参考实现演示，记 followups.md FU-104 |
 | ME4-6.0.1 | Agent24 | 冻结 v0.5.0 专用发布清单 | 5.3.4, 5.4.1 | `IN_PROGRESS` | 本 PR：`docs/RELEASE-CHECKLIST-v0.5.0.md` |
-| ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `BACKLOG` | 各自仓库的 `scripts/package.sh` 尚未落地，不在本 PR 范围（本 PR 只改 Agent24 一个仓库） |
+| ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `IN_PROGRESS` | 打包脚本：Sin90 #75、Cos72 #9；Release 在其合并后发布 |
 | ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `IN_PROGRESS` | 本 PR |
 | ME4-6.1.2 | Agent24 | 发布 v0.5.0 | 6.1.1 | `BACKLOG` | |
 | ME4-6.1.3 | Mac mini | 干净机器只用发布物安装验收 | 6.1.2 | `BACKLOG` | |
