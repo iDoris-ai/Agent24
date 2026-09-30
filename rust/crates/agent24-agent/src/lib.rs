@@ -718,8 +718,8 @@ impl RunManager {
         let (mut restored, mut aborted) = (0u64, 0u64);
         for approval in pending {
             let thread = self.store.list_run_messages(&approval.run_id).await?;
-            let run_status = match self.store.get_run(&approval.run_id).await? {
-                Some(run) => run.status,
+            let run = match self.store.get_run(&approval.run_id).await? {
+                Some(run) => run,
                 // The run row is gone — there is nothing to resume.
                 None => {
                     self.abort_one_approval(&approval).await?;
@@ -733,12 +733,23 @@ impl RunManager {
             match crate::resume::assess_restore(
                 &approval.payload,
                 &approval.created_at,
-                run_status,
+                run.status,
                 &thread,
                 |name| self.tools.tool_risk_class(name).is_some(),
                 &cutoff,
             ) {
-                crate::resume::RestoreDecision::Restore { .. } => {
+                crate::resume::RestoreDecision::Restore { tool_call_id } => {
+                    if run.workspace_id.is_some()
+                        && let Err(err) = self.tool_context_for(&run, tool_call_id).await
+                    {
+                        tracing::warn!(
+                            "restore sweep: aborting approval {} — workspace authority unavailable: {err}",
+                            approval.id
+                        );
+                        self.abort_one_approval(&approval).await?;
+                        aborted += 1;
+                        continue;
+                    }
                     // Re-announce the queued item; the row stays pending.
                     self.sink
                         .emit(EventBody::ApprovalRequired(Box::new(approval.clone())));
@@ -4054,6 +4065,110 @@ mod approval_tests {
                 .status,
             ApprovalStatus::Aborted
         );
+    }
+
+    #[tokio::test]
+    async fn restore_sweep_aborts_bound_approval_without_fresh_authority() {
+        const WS: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        const LEASE: &str = "wl_01J5M4Q2Y7N8P9R0S1T2V3W4X6";
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let workspace_id = agent24_protocol::WorkspaceId::parse(WS).unwrap();
+        let now = workspace_timestamp(now_iso8601());
+        let expires = WorkspaceInstant::parse(&now)
+            .unwrap()
+            .checked_add_workspace_ttl(agent24_store::WorkspaceTtl::new(60_000).unwrap())
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id,kind,state,provenance_source,writeback_policy,lifecycle_owner_kind,lifecycle_owner_ref,concurrency_policy,created_at,expires_at,revision,canonical_root,root_generation,root_identity_kind,unix_device,unix_inode) VALUES (?,'orchestrator_scratch','active','test','external','orchestrator','owner','serial',?,?,1,'/scratch','g1','unix',X'0101010101010101',X'0202020202020202')")
+            .bind(WS).bind(&now).bind(expires.as_str())
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .insert_session(&agent24_protocol::Session {
+                id: "sess_1".to_owned(),
+                title: "session".to_owned(),
+                channel: "desktop".to_owned(),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .await
+            .unwrap();
+        let input = RunInput {
+            prompt: "run echo".to_owned(),
+            workspace_id: Some(workspace_id),
+            model_override: None,
+            mode: RunMode::Normal,
+        };
+        sqlx::query("INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at,started_at) VALUES ('run_1','sess_1',?,'awaiting_approval',?,?,?,?)")
+            .bind(WS).bind(serde_json::to_string(&input).unwrap())
+            .bind(serde_json::to_string(&zero_usage()).unwrap())
+            .bind(&now).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at) VALUES (?,?,'g1','run_1','run',?)")
+            .bind(LEASE).bind(WS).bind(&now)
+            .execute(agent24_store::test_hooks::pool(&h.store)).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] });
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        h.store
+            .insert_approval(&seed_approval(
+                "apr_1",
+                "run_1",
+                "tc_internal_1",
+                args.as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (0, 1));
+        assert_eq!(
+            h.store.get_approval("apr_1").await.unwrap().unwrap().status,
+            ApprovalStatus::Aborted
+        );
+        assert_eq!(
+            h.store.get_run("run_1").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+        assert!(
+            !h.events
+                .lock()
+                .unwrap()
+                .contains(&"approval.required".to_owned())
+        );
+
+        let ended_at = WorkspaceInstant::parse(&workspace_timestamp(now_iso8601())).unwrap();
+        assert_eq!(
+            h.store
+                .sweep_workspace_orphan_runs(&ended_at)
+                .await
+                .unwrap(),
+            agent24_store::WorkspaceOrphanSweep { released_leases: 1 }
+        );
+        assert_eq!(
+            h.store.get_run("run_1").await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        let released: Option<String> =
+            sqlx::query_scalar("SELECT released_at FROM workspace_leases WHERE lease_id=?")
+                .bind(LEASE)
+                .fetch_one(agent24_store::test_hooks::pool(&h.store))
+                .await
+                .unwrap();
+        assert!(released.is_some());
     }
 
     #[tokio::test]
