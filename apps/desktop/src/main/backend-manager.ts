@@ -203,6 +203,14 @@ export class BackendManager {
   // lifecycle action that would otherwise kill a process we don't own.
   private isExternal = false
   private externalPid: number | null = null
+  // Reentrancy guard for tick(): setInterval doesn't wait for a previous
+  // callback to resolve before scheduling the next one, and the failure-
+  // threshold branch below now awaits a second health probe (tryReuseExternal)
+  // on top of the one every tick already does — together those can approach
+  // or exceed HEALTH_INTERVAL_MS. Without this guard an overlapping tick()
+  // could double-count failures or spawn a second child while the first
+  // tick is still mid-recovery (PR #602 review).
+  private tickInFlight = false
 
   constructor(deps: BackendManagerDeps = {}) {
     this.external = deps.external ?? defaultExternalDaemonSource
@@ -369,46 +377,68 @@ export class BackendManager {
   }
 
   private async tick(): Promise<void> {
-    // A deliberate stop suspends supervision entirely — don't probe, don't
-    // count failures, and above all don't auto-respawn (F1b).
-    if (this.userStopped) {
-      this.lastHealthy = false
-      return
-    }
-
-    const alive = await this.external.checkHealth(currentEndpoint)
-    this.lastHealthy = alive
-    if (alive) {
-      this.failureCount = 0
-      return
-    }
-
-    this.failureCount += 1
-    console.warn(`[backend:${this.kind}] health check failed (${this.failureCount}/${MAX_HEALTH_FAILURES})`)
-
-    if (this.failureCount >= MAX_HEALTH_FAILURES) {
-      // DEP-A5 decision — what happens when a *reused external* daemon dies:
-      // chose "re-detect, then fall back to spawning our own" over "prompt the
-      // user". Rationale: this branch already exists (it's the same
-      // failure-threshold respawn path used for a daemon we spawned
-      // ourselves), so reusing it for the external case is the smallest
-      // change — no new state machine, no new UI surface for a blocking
-      // prompt from a background timer tick. The cost is a silent handoff:
-      // the user isn't told their external daemon died. That's judged
-      // acceptable because the tray's status/tooltip (main.ts's
-      // refreshTray()) already flips from "运行中（外部）" to a plain
-      // spawned-daemon state within one health-poll interval, so the demotion
-      // is visible on next glance, just not interrupt-driven.
-      if (this.isExternal) {
-        console.warn(
-          `[backend:${this.kind}] external daemon (pid ${this.externalPid ?? '?'}) stopped responding — ` +
-          'falling back to a self-managed daemon',
-        )
+    // Guard against overlapping invocations (see `tickInFlight` field doc):
+    // skip this fire entirely rather than run a second tick concurrently
+    // with one still in flight.
+    if (this.tickInFlight) return
+    this.tickInFlight = true
+    try {
+      // A deliberate stop suspends supervision entirely — don't probe, don't
+      // count failures, and above all don't auto-respawn (F1b).
+      if (this.userStopped) {
+        this.lastHealthy = false
+        return
       }
-      console.warn(`[backend:${this.kind}] restarting after consecutive failures`)
-      this.killChild()
-      this.failureCount = 0
-      this.spawnChild()
+
+      const alive = await this.external.checkHealth(currentEndpoint)
+      this.lastHealthy = alive
+      if (alive) {
+        this.failureCount = 0
+        return
+      }
+
+      this.failureCount += 1
+      console.warn(`[backend:${this.kind}] health check failed (${this.failureCount}/${MAX_HEALTH_FAILURES})`)
+
+      if (this.failureCount >= MAX_HEALTH_FAILURES) {
+        // DEP-A5 decision — what happens when a *reused external* daemon dies:
+        // chose "re-detect, then fall back to spawning our own" over "prompt the
+        // user". Rationale: this branch already exists (it's the same
+        // failure-threshold respawn path used for a daemon we spawned
+        // ourselves), so reusing it for the external case is the smallest
+        // change — no new state machine, no new UI surface for a blocking
+        // prompt from a background timer tick. The cost is a silent handoff:
+        // the user isn't told their external daemon died. That's judged
+        // acceptable because the tray's status/tooltip (main.ts's
+        // refreshTray()) already flips from "运行中（外部）" to a plain
+        // spawned-daemon state within one health-poll interval, so the demotion
+        // is visible on next glance, just not interrupt-driven.
+        if (this.isExternal) {
+          console.warn(
+            `[backend:${this.kind}] external daemon (pid ${this.externalPid ?? '?'}) stopped responding — ` +
+            'falling back to a self-managed daemon',
+          )
+        }
+        console.warn(`[backend:${this.kind}] restarting after consecutive failures`)
+        this.killChild()
+        this.failureCount = 0
+        // PR #602 review (Medium): re-probe for an external daemon before
+        // respawning our own. A near-simultaneous CLI + desktop startup can
+        // make the very first tryReuseExternal() (in start()) miss a
+        // daemon.json that simply hadn't been written yet — this manager
+        // then spawns its own child, which loses the Rust singleton lock and
+        // never binds a port, so it never reports healthy either. Without
+        // this re-check, that self-spawned child would just get killed and
+        // re-spawned forever every MAX_HEALTH_FAILURES ticks, even once the
+        // real (CLI-owned) daemon is up and healthy. Only fall back to
+        // spawning our own when the external daemon is still not reachable.
+        const reused = await this.tryReuseExternal()
+        if (!reused) {
+          this.spawnChild()
+        }
+      }
+    } finally {
+      this.tickInFlight = false
     }
   }
 
