@@ -2632,7 +2632,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn tokenless_workspace_cancel_recovers_active_released_and_missing_lease() {
         const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
-        for mode in 0..3 {
+        for mode in 0..4 {
             let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
             seed_workspace(&store, WORKSPACE_ID).await;
             let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
@@ -2703,6 +2703,33 @@ pub(crate) mod tests {
                     .execute(agent24_store::test_hooks::pool(&store))
                     .await
                     .unwrap();
+            } else if mode == 3 {
+                sqlx::query("UPDATE runs SET input=json_set(input,'$.workspace_id',?) WHERE id=?")
+                    .bind("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7")
+                    .bind(&run.id)
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    manager.cancel_run(&run.id).await,
+                    Err(AgentError::Store(StoreError::Conflict(message)))
+                        if message == "run workspace identity mismatch"
+                ));
+                let raw_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id=?")
+                    .bind(&run.id)
+                    .fetch_one(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+                assert_eq!(raw_status, "running");
+                assert!(
+                    !sink
+                        .0
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|event| event.as_str() == "run.cancelled")
+                );
+                continue;
             }
 
             assert_eq!(
