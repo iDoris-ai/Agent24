@@ -18,6 +18,13 @@ use rand::RngCore;
 use std::sync::Arc as StdArc;
 use tokio_util::sync::CancellationToken;
 
+fn workspace_recovery_instant_at(
+    time: std::time::SystemTime,
+) -> std::io::Result<agent24_store::WorkspaceInstant> {
+    let text = agent24_core::util::iso8601_millis_at(time).map_err(std::io::Error::other)?;
+    agent24_store::WorkspaceInstant::parse(&text).map_err(std::io::Error::other)
+}
+
 // A shutdown's budgets and deadlines — the HTTP drain's fixed 1.5s, the
 // out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
 // `A24_MODULE_STOP_GRACE_MS`), the time to put the summary on disk, and the
@@ -1479,12 +1486,7 @@ pub async fn serve(
     if orphans > 0 {
         tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
     }
-    let workspace_now_text = now
-        .strip_suffix('Z')
-        .map(|prefix| format!("{prefix}.000Z"))
-        .unwrap_or_else(|| now.clone());
-    let workspace_now = agent24_store::WorkspaceInstant::parse(&workspace_now_text)
-        .map_err(std::io::Error::other)?;
+    let workspace_now = workspace_recovery_instant_at(std::time::SystemTime::now())?;
     let workspace_orphans = state
         .store
         .sweep_workspace_orphan_runs(&workspace_now)
@@ -2465,6 +2467,13 @@ fn with_discovered(
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn workspace_recovery_clock_preserves_fractional_millis() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_900);
+        let instant = super::workspace_recovery_instant_at(now).unwrap();
+        assert_eq!(instant.as_str(), "1970-01-01T00:00:01.900Z");
+    }
 
     // ---- ME4-4.2.2b2 H1 (Opus review round on top of `bb6fb0e`) -------------
 

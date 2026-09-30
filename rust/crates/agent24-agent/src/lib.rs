@@ -255,6 +255,7 @@ fn zero_usage() -> Usage {
     }
 }
 
+#[cfg(test)]
 fn workspace_timestamp(raw: String) -> String {
     if raw.len() == 20 {
         raw.strip_suffix('Z')
@@ -263,6 +264,16 @@ fn workspace_timestamp(raw: String) -> String {
     } else {
         raw
     }
+}
+
+fn workspace_now_at(time: std::time::SystemTime) -> Result<String, AgentError> {
+    agent24_core::util::iso8601_millis_at(time).map_err(|_| {
+        AgentError::Workspace(WorkspaceStoreError::InvalidValue { field: "timestamp" })
+    })
+}
+
+fn workspace_now() -> Result<String, AgentError> {
+    workspace_now_at(std::time::SystemTime::now())
 }
 
 fn add_usage(mut total: Usage, delta: &Usage) -> Usage {
@@ -605,7 +616,7 @@ impl RunManager {
         }
 
         let created_at = if create.workspace_id.is_some() {
-            workspace_timestamp(now_iso8601())
+            workspace_now()?
         } else {
             now_iso8601()
         };
@@ -1627,12 +1638,12 @@ impl RunManager {
         run_id: &str,
         to: RunStatus,
         mut patch: RunPatch,
-        ended_at: &str,
+        _ended_at: &str,
     ) -> Result<Run, AgentError> {
         match self.store.active_workspace_run_lease_id(run_id).await? {
             None => Ok(self.store.transition_run(run_id, to, patch).await?),
             Some(lease_id) => {
-                let ended_at = workspace_timestamp(ended_at.to_owned());
+                let ended_at = workspace_now()?;
                 patch.ended_at = Some(ended_at.clone());
                 let ended_at = WorkspaceInstant::parse(&ended_at)?;
                 match self
@@ -1762,6 +1773,12 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+
+    #[test]
+    fn workspace_agent_clock_preserves_fractional_millis() {
+        let now = std::time::UNIX_EPOCH + Duration::from_millis(605);
+        assert_eq!(workspace_now_at(now).unwrap(), "1970-01-01T00:00:00.605Z");
+    }
 
     struct RecordingSink(StdMutex<Vec<String>>);
 
