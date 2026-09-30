@@ -31,13 +31,13 @@ was first drafted:
   opaque pinned workspace authority, fresh revalidation, filesystem/shell
   isolation, approval/run ownership, and multi-workspace isolation.
 - **M7 Recovery & Reliability is active now.** The durable approval/recovery
-  train is being landed bottom-up; #579, #580, #581, and #582 are already
-  merged into the integration branch, while later M7 slices continue through
-  exact-head review.
+  train is being landed bottom-up; #579, #580, #581, #582, #583, #584, and
+  #586 are already merged into the integration branch, while later M7 slices
+  continue through exact-head review and development.
 
 The development PRs listed in the older M1-M6 sections below are therefore no
 longer "waiting to be reviewed" development work: the relevant slices through
-#582 have been merged into
+#584 plus #586 have been merged into
 `integration/open-design-main-sync-wave20`. They are **not** thereby landed
 wholesale into Agent24 `main`.
 
@@ -215,9 +215,9 @@ performed as reviewed atomic landing slices rather than as one combined M6 PR.
 
 Continue the same conveyor-belt policy for recovery slices. The current M7
 development sequence includes the recovery clock and durable approval/recovery
-work (#579 onward). At the 2026-09-30 refresh, #579-#582 are merged into the
-integration branch and the next recovery slices are still being reviewed and
-developed.
+work (#579 onward). At the latest 2026-09-30 refresh, #579-#584 and #586 are
+merged into the integration branch; later recovery slices remain under active
+review and development.
 
 Do not encode a stale "approved/blocked" label for each M7 PR into this
 strategy. The operational source of truth is the exact current base/head plus
