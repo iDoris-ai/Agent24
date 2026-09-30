@@ -61,12 +61,12 @@
 | ME4-5.3.3b | Cos72 | 审批发积分 + 账本回放 + 摘要进记忆 | 5.3.3a | `DONE` | Cos72 #6（审批发积分 + 账本回放）、#7（完成摘要进内核记忆）全部合并于 2026-09-30 |
 | ME4-5.3.4 | Cos72 | Cos72 真实挂载黑盒（含与 Sin90 共存隔离） | 5.3.3b, 5.2.1 | `DONE` | Cos72 #8 合并于 2026-09-30 |
 | ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2b | `DONE` | #585 合并于 2026-09-30：`docs/specs/WIRE-OOP-MODULE.md`（逐方法 params/result/错误闭集，每条事实带 file:line）+ `examples/node-module/`（纯 Node 标准库，未引用本仓 Rust crate，仅声明 `events`/`memory`）+ `rust/apps/agent24d/tests/me4_node_module_blackbox.rs`（真实黑盒：挂载→代理→事件→记忆，10/10 连跑绿；无 node 则 SKIP 并打印原因，不 panic）。范围收窄：只覆盖 events/memory 往返，scheduler upsert/fired 与 model/approval 只有文档、无参考实现演示，记 followups.md FU-104 |
-| ME4-6.0.1 | Agent24 | 冻结 v0.5.0 专用发布清单 | 5.3.4, 5.4.1 | `IN_PROGRESS` | 本 PR：`docs/RELEASE-CHECKLIST-v0.5.0.md` |
-| ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `IN_PROGRESS` | 打包脚本：Sin90 #75、Cos72 #9；Release 在其合并后发布 |
-| ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `IN_PROGRESS` | 本 PR |
-| ME4-6.1.2 | Agent24 | 发布 v0.5.0 | 6.1.1 | `BACKLOG` | |
-| ME4-6.1.3 | Mac mini | 干净机器只用发布物安装验收 | 6.1.2 | `BACKLOG` | |
-| ME4-6.1.4 | 三仓 | 最终台账收口 PR（本轮最后一个 PR） | 6.1.3 | `BACKLOG` | |
+| ME4-6.0.1 | Agent24 | 冻结 v0.5.0 专用发布清单 | 5.3.4, 5.4.1 | `DONE` | #589：`docs/RELEASE-CHECKLIST-v0.5.0.md` |
+| ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `DONE` | 打包脚本 Sin90 #75、Cos72 #9；Release [Sin90 v0.5.0](https://github.com/iDoris-ai/Sin90/releases/tag/v0.5.0)（6d8d04d，sha256 a0b9630a…）、[Cos72 v0.1.0](https://github.com/MushroomDAO/Cos72/releases/tag/v0.1.0)（39a05d8，sha256 148547dd…） |
+| ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `DONE` | #589 |
+| ME4-6.1.2 | Agent24 | 发布 v0.5.0 | 6.1.1 | `DONE` | [v0.5.0](https://github.com/iDoris-ai/Agent24/releases/tag/v0.5.0)，tag 于 f46194a（#589 合并提交），`agent24-0.5.0-macos-arm64.tar.gz` + `SHA256SUMS` |
+| ME4-6.1.3 | Mac mini | 干净机器只用发布物安装验收 | 6.1.2 | `DONE` | 2026-09-30 Mac mini 隔离 HOME：三包下载 + `shasum -c` 全 OK → `os install` ×2 → `daemon start` → `os list` 两者 `[mounted]`，15s 后稳态、`/api/v1/sin90/today` 200（输出见 progress.md） |
+| ME4-6.1.4 | 三仓 | 最终台账收口 PR（本轮最后一个 PR） | 6.1.3 | `IN_PROGRESS` | 本 PR + Cos72 T2.1.1 回填 |
 
 ## ADR-032 / A3 台账（2026-09-26/27 立；jason 拍板插队线，不在 PLAN-ME4 主链上）
 
