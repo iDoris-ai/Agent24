@@ -392,12 +392,38 @@ impl AttachRegistry {
         Ok(())
     }
 
+    /// Review (Codex A3 follow-up, §5.5): has [`Self::revoke_all`] run (or
+    /// started running — the two share the same lock, so this can never
+    /// observe a half-applied close)? `crate::attach_listener` checks this
+    /// BEFORE calling [`agent24_os_proto::initialize::accept_attached`] at
+    /// all: once this is `true`, [`Self::expectation`] returns `None` for
+    /// EVERY name (its backing map was drained), which — fed through
+    /// `accept_attached`'s own lookup-miss handling — would otherwise be
+    /// indistinguishable from "no such module" and get answered
+    /// `auth_failed`. That is the wrong answer for a legitimately registered
+    /// module caught by a shutdown mid-handshake: `auth_failed` tells it the
+    /// credential is bad, so it stops reconnecting and demands a fresh
+    /// pairing, when the token was fine all along and it only needed to
+    /// retry once the daemon comes back. See
+    /// `agent24_os_proto::initialize::HandshakeError::ShuttingDown`'s own doc
+    /// for the answer `attach_listener` sends instead.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        state.deps.is_none()
+    }
+
     /// The pure-check `lookup` callback for
     /// [`agent24_os_proto::initialize::accept_attached`] (§4.3 ①) — a quick
     /// lock-and-clone, released before any token comparison. Returns `Some`
     /// for ANY registered name, disabled or not: whether it is disabled is a
     /// [`Self::commit`]-time question (§4.3's own note on why `Busy`/
     /// `Forbidden` are produced by the locked step, not the pure one).
+    ///
+    /// Returns `None` for every name once [`Self::revoke_all`] has run (its
+    /// backing map is drained) — a caller who needs to tell that apart from
+    /// "no such module" must check [`Self::is_closed`] FIRST, before relying
+    /// on this at all; see that method's own doc.
     #[must_use]
     pub fn expectation(&self, name: &str) -> Option<AttachedExpectation> {
         let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1006,6 +1032,28 @@ mod tests {
             registry.commit(&claim),
             Err(CommitRefused::Closed)
         ));
+    }
+
+    /// Review (Codex A3 follow-up, §5.5): [`AttachRegistry::is_closed`] is
+    /// what `crate::attach_listener` checks BEFORE even calling
+    /// `accept_attached` — see that method's own doc for why `expectation`
+    /// alone (which returns `None` for every name once `revoke_all` has
+    /// drained the map) cannot be relied on to tell "closed" apart from "no
+    /// such module".
+    #[tokio::test]
+    async fn is_closed_starts_false_and_flips_permanently_on_revoke_all() {
+        let registry = AttachRegistry::new(deps().await);
+        assert!(!registry.is_closed());
+        register(&registry, "agentear", &["events"]);
+        assert!(
+            !registry.is_closed(),
+            "registering a module must not, by itself, close the registry"
+        );
+        registry.revoke_all();
+        assert!(registry.is_closed());
+        // Idempotent, like `revoke_all` itself.
+        registry.revoke_all();
+        assert!(registry.is_closed());
     }
 
     /// Review M2 ①: a handshake commit racing (or landing after) `revoke_all`

@@ -40,6 +40,7 @@ Sin90 M5 同时依赖 M4a 与 Sin90 M4。）
 | D2 | 模块经内核调模型能不能用远端 | **默认强制 LocalOnly**；manifest 显式声明才放开远端，且按模块限流、记用量 |
 | D3 | Sin90 仓库流程 | **跟 Agent24 一样：PR + clestons 评审**；建 pilot 七件套；已 APPROVED 的 #2/#3/#4 先合 |
 | D4 | 本轮终点 | **五步全做完再发 v0.5.0**（M6 Life Packs 留下一轮） |
+| D4 注记（2026-09-2x，jason 拍板） | 与 v0.5.0 定义的关系 | 用户决定先发一个中间版本 **v0.4.0**（ME-3 全套 + ME4 S1/S2 + SDK 原型 + ADR-032/A3 P0–P2，A3 是插队线不在本轮五步范围内），**v0.5.0 的定义与本表 D4 不变**——仍是「五步全做完」才发 |
 | D5 | Cos72 放哪 | **`MushroomDAO/Cos72`**（当前只有 License/README 的空仓） |
 | D6 | Cos72 做多大 | **最小真实闭环：mytask 任务 + 积分**（用到事件 + 记忆 + 审批）；myshop/myvote 留给 roadmap M5 |
 

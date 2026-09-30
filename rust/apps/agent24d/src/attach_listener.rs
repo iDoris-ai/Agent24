@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_os_proto::attach_mux::serve_attached;
-use agent24_os_proto::initialize::{accept_attached, error_line, id_of, success_line};
+use agent24_os_proto::initialize::{
+    HandshakeError, accept_attached, error_line, id_of, success_line,
+};
 use agent24_os_proto::rpc::{Limits, read_frame_async};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -185,9 +187,32 @@ async fn handle_connection(stream: UnixStream, registry: &AttachRegistry, stop: 
         }
     };
 
+    // Review (Codex A3 follow-up, §5.5): checked BEFORE `accept_attached` at
+    // all, and independently of `name` — once the registry is closed for
+    // shutdown, `AttachRegistry::expectation` returns `None` for EVERY name
+    // (its map was drained by `revoke_all`), which `accept_attached` cannot
+    // tell apart from "no such module" and would answer `auth_failed`. That
+    // is the wrong answer for a module that was legitimately registered and
+    // just lost a race with shutdown — see `AttachRegistry::is_closed`'s own
+    // doc, and `HandshakeError::ShuttingDown`'s, for why this is a distinct
+    // wire error rather than reusing `auth_failed`.
+    if registry.is_closed() {
+        let line = error_line(id_of(&frame).as_deref(), &HandshakeError::ShuttingDown);
+        let _ = write_within(&mut writer, &line, deadline).await;
+        return;
+    }
+
     let claim = match accept_attached(&frame, &|name| registry.expectation(name)) {
         Ok(claim) => claim,
         Err(refusal) => {
+            // Re-checked after the lookup too: `revoke_all` can land between
+            // the `is_closed` check above and `expectation`, and the refusal
+            // it then causes must not reach the module as `auth_failed`.
+            let refusal = if registry.is_closed() {
+                HandshakeError::ShuttingDown
+            } else {
+                refusal
+            };
             let line = error_line(id_of(&frame).as_deref(), &refusal);
             let _ = write_within(&mut writer, &line, deadline).await;
             return;
@@ -350,5 +375,121 @@ mod tests {
         );
         std::fs::remove_file(&link).unwrap();
         std::fs::remove_dir_all(&real_dir).unwrap();
+    }
+
+    // ── Review (Codex A3 follow-up, §5.5): a handshake racing shutdown ──
+
+    /// A `RunTrigger` that never fires — this test only needs a `Scheduler`
+    /// to exist so `AttachDeps` can be built without wiring a real one. Same
+    /// shape as `crate::attach_registry::tests::NoopTrigger` (duplicated
+    /// rather than shared: that one lives in a private `mod tests` in a
+    /// different file).
+    struct NoopTrigger;
+
+    #[async_trait::async_trait]
+    impl agent24_scheduler::RunTrigger for NoopTrigger {
+        async fn trigger(
+            &self,
+            _invocation: &agent24_scheduler::ScheduleInvocation,
+        ) -> agent24_scheduler::FireOutcome {
+            agent24_scheduler::FireOutcome::Deferred {
+                reason: agent24_scheduler::DeferReason::MountPending,
+            }
+        }
+    }
+
+    async fn test_attach_deps() -> crate::attach_registry::AttachDeps {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        crate::attach_registry::AttachDeps {
+            scheduler: agent24_scheduler::Scheduler::new(
+                store.clone(),
+                std::sync::Arc::new(NoopTrigger),
+                std::sync::Arc::new(|_| {}),
+            ),
+            models: None,
+            approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
+                store,
+                crate::events::EventsHub::default(),
+            ),
+            events: crate::events::EventsHub::default(),
+        }
+    }
+
+    /// Review (Codex A3 follow-up): before this fix, `handle_connection`
+    /// handed `registry.expectation(name)` straight to `accept_attached`
+    /// with no way to tell "no such module" apart from "the registry is
+    /// closed for shutdown" — `revoke_all()` drains the registry's entire
+    /// map, so a handshake for a name that WAS legitimately registered a
+    /// moment ago gets exactly the same `None` a truly unknown name would,
+    /// and `accept_attached` answers both with `auth_failed`. A real
+    /// AgentEar reading `auth_failed` stops reconnecting and demands a fresh
+    /// pairing (§5.6's own table) — the wrong response to "the daemon is
+    /// just restarting".
+    ///
+    /// This drives the REAL `handle_connection` over a real (in-process)
+    /// Unix socket pair, with a REAL registered module (minted through
+    /// `crate::attached::register`, so `resp.token` is a real plaintext
+    /// token whose hash genuinely matches what the registry holds) — not a
+    /// mock of either. `revoke_all()` runs before the connection is ever
+    /// handled, simulating shutdown having won the race.
+    #[tokio::test]
+    async fn a_handshake_racing_shutdown_gets_unavailable_not_auth_failed() {
+        use tokio::io::AsyncBufReadExt;
+
+        let registry = crate::attach_registry::AttachRegistry::new(test_attach_deps().await);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attached.json");
+        let yaml = "name: agentear\nversion: \"1\"\nroute_namespace: /api/v1/agentear\n\
+                     event_module: agentear\ndata_dir: ~/.agent24/os/agentear/\n\
+                     impl_kind: attached_process\nkernel_capabilities: [events]\n";
+        let outcome = crate::attached::register(
+            &path,
+            yaml,
+            false,
+            |_| false,
+            |change| {
+                registry.on_change(change);
+            },
+        )
+        .unwrap();
+        let crate::attached::RegisterOutcome::Created(resp) = outcome else {
+            panic!("expected Created");
+        };
+
+        // The daemon decided to shut down before this (otherwise perfectly
+        // legitimate) connection was handled.
+        registry.revoke_all();
+
+        let (kernel_side, module_side) = UnixStream::pair().unwrap();
+        let mut frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "initialize",
+            "params": {
+                "protocol_versions": {"min": 1, "max": 1},
+                "module": "agentear",
+                "manifest_digest": resp.manifest_digest,
+                "auth_token": resp.token,
+                "capabilities": ["events"],
+            }
+        }))
+        .unwrap();
+        frame.push(b'\n');
+        let mut module_side = module_side;
+        module_side.write_all(&frame).await.unwrap();
+
+        handle_connection(kernel_side, &registry, CancellationToken::new()).await;
+
+        let mut reader = BufReader::new(module_side);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            v["error"]["data"]["kind"], "unavailable",
+            "a handshake that lost the race with shutdown must get `unavailable`, not \
+             `auth_failed` — the presented token was perfectly valid: {v}"
+        );
+        assert_ne!(v["error"]["data"]["kind"], "auth_failed");
     }
 }
