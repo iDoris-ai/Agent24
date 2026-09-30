@@ -171,9 +171,15 @@ pub fn handshake(e: &HandshakeFailed) -> RunFailure {
             // — see `initialize.rs`), but `HandshakeError` is one closed type
             // shared by both, so this match must still be exhaustive. Same
             // bucket as every other application-level refusal above.
+            //
+            // `ShuttingDown` likewise never reaches this path — it is
+            // produced by `agent24d::attach_listener` itself, before
+            // `accept_attached` is even called (see its own doc) — but for
+            // the same "one closed type, must stay exhaustive" reason.
             | HandshakeError::Busy
             | HandshakeError::Forbidden
-            | HandshakeError::AttachedDigestMismatch => FailureKind::Refused,
+            | HandshakeError::AttachedDigestMismatch
+            | HandshakeError::ShuttingDown => FailureKind::Refused,
         },
         HandshakeFailed::Frame(frame) => match frame {
             FrameError::TooLong { .. } => FailureKind::Refused,
