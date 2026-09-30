@@ -1196,6 +1196,53 @@ fn fill_attach_registry_and_recheck(
     }
 }
 
+const APPROVAL_RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(10);
+
+fn spawn_approval_recovery_scan(
+    broker: Arc<agent24_policy::ApprovalBroker>,
+    runs: Arc<agent24_agent::RunManager>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    spawn_approval_recovery_scan_every(broker, runs, APPROVAL_RECOVERY_SCAN_INTERVAL, cancel)
+}
+
+fn spawn_approval_recovery_scan_every(
+    broker: Arc<agent24_policy::ApprovalBroker>,
+    runs: Arc<agent24_agent::RunManager>,
+    interval: Duration,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+            }
+            let now = agent24_core::util::now_iso8601();
+            match broker.timeout_expired(&now).await {
+                Ok(expired) if expired > 0 => {
+                    tracing::warn!("timed out {expired} expired approval(s)");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!("expired approval scan failed; will retry: {err}");
+                }
+            }
+            match runs.recover_timed_out_approval_runs().await {
+                Ok(cancelled) if cancelled > 0 => {
+                    tracing::warn!(
+                        "cancelled {cancelled} token-less run(s) after approval timeout"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!("timed-out run recovery scan failed; will retry: {err}");
+                }
+            }
+        }
+    })
+}
+
 pub async fn serve(
     port: u16,
     ephemeral: bool,
@@ -1500,6 +1547,19 @@ pub async fn serve(
         state.enable_capability_auth(capability_store);
     }
 
+    // M7 durable expiry recovery runs before durable-resume: a stale approval
+    // must become timed_out before anything can re-broadcast it or preflight its
+    // authority. The orphan sweeps below then own cancellation of its parked run.
+    let approval_now = agent24_core::util::now_iso8601();
+    let expired = state
+        .broker
+        .timeout_expired(&approval_now)
+        .await
+        .map_err(std::io::Error::other)?;
+    if expired > 0 {
+        tracing::warn!("timed out {expired} expired approval(s) during startup recovery");
+    }
+
     // H3 durable-resume startup, BEFORE accepting any request and BEFORE the
     // orphan sweep: restore restorable parked approvals (re-broadcast + keep
     // pending) so their runs survive to be resumed when answered, and abort the
@@ -1536,6 +1596,16 @@ pub async fn serve(
             workspace_orphans.released_leases
         );
     }
+
+    // M7: approvals can outlive the task that originally armed their in-memory
+    // timeout. Keep durable expiry/recovery active for the daemon lifetime; a
+    // shutdown child token stops the loop cleanly, and each interval is also the
+    // retry mechanism for transient store or recovery-cancel failures.
+    spawn_approval_recovery_scan(
+        Arc::clone(&state.broker),
+        Arc::clone(&state.runs),
+        cancel.child_token(),
+    );
 
     // ME4-1.3.1 (design §3.2/§4.6, S1-6): the scheduler's tick loop AND
     // delivery pump are spawned AFTER `mount_all` returns, below — not here.
@@ -3513,6 +3583,88 @@ pub(crate) mod tests {
         assert!(guardian_enabled(Some("true")));
         assert!(guardian_enabled(Some("TRUE")));
         assert!(guardian_enabled(Some(" 1 ")));
+    }
+
+    #[tokio::test]
+    async fn approval_recovery_scan_expires_tokenless_run_and_stops_with_shutdown() {
+        let state = state().await;
+        seed_run(&state.store, "run_expired").await;
+        sqlx::query("UPDATE runs SET status='awaiting_approval' WHERE id='run_expired'")
+            .execute(agent24_store::test_hooks::pool(&state.store))
+            .await
+            .unwrap();
+        state
+            .store
+            .insert_approval(&agent24_protocol::Approval {
+                id: "apr_expired".to_owned(),
+                run_id: "run_expired".to_owned(),
+                tool_call_id: "tc_expired".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "expired".to_owned(),
+                payload: serde_json::Map::new(),
+                available_decisions: vec!["approve".to_owned()],
+                standing_target: None,
+                status: agent24_protocol::ApprovalStatus::Pending,
+                decision: None,
+                expires_at: "2020-01-01T00:00:00Z".to_owned(),
+                created_at: "2019-12-31T23:59:00Z".to_owned(),
+                decided_at: None,
+            })
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let task = spawn_approval_recovery_scan_every(
+            Arc::clone(&state.broker),
+            Arc::clone(&state.runs),
+            Duration::from_millis(10),
+            cancel.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .store
+                    .get_run("run_expired")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == agent24_protocol::RunStatus::Cancelled
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recovery scan should cancel the parked run");
+
+        assert_eq!(
+            state
+                .store
+                .get_approval("apr_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            agent24_protocol::ApprovalStatus::TimedOut
+        );
+        assert_eq!(
+            state
+                .store
+                .get_run("run_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            agent24_protocol::RunStatus::Cancelled
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown should stop the recovery scan")
+            .unwrap();
     }
 
     #[test]
