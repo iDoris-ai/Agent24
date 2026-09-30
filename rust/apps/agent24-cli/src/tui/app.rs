@@ -526,6 +526,7 @@ mod tests {
         Run {
             id: id.to_owned(),
             session_id: None,
+            workspace_id: None,
             status,
             input: RunInput {
                 prompt: "hi".to_owned(),
