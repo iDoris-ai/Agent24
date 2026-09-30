@@ -361,6 +361,36 @@ local-first、可离线。这条与 Sin90 迁出内核无关，Sin90 本身也�
 
 ---
 
+## 9.1 v0.5.0 新增能力（2026-09-30 追记）
+
+自本文件 v0.3（T11 迁出）之后，Agent24 内核给进程外模块新增了一整套回调能力，且
+Sin90 已经用上其中一部分；Pet0 集成时可以依赖这些能力，不必自己再实现一遍：
+
+- **调度回调**（`_a24/scheduler/*`）：模块可以向内核 upsert/delete/list 自己的定时
+  任务（cron），到点由内核经回调连接投递 `fired`（确定性 `fire_id`、崩溃后同一
+  `fire_id` 续投、REST 侧用户暂停/恢复三态）。Sin90 的 Routine/Rhythm 走这条路，
+  不再自己起后台线程轮询时间。
+- **推理回调**（`_a24/model/complete`）：模块经内核代理调用本地/远端模型，manifest
+  声明 `model_access`（缺省 `local_only`），按模块计量用量（`GET /api/v1/usage?module=`）。
+- **审批回调**（`_a24/approval/{gate,advise,status}`）：需要人工确认的动作走
+  `advise` 提交 + 模块轮询 `status`；`gate` 目前只接受内核能直接执行的闭集动作
+  （不含"发积分"这类模块自定义动作，Cos72 走 advise+轮询，见 FU-84）。
+- **记忆回调**（`_a24/memory/private/*`）：`remember`/`recall`/`recent`，作用域固定
+  在调用模块自己的分区，模块之间互相读不到（Cos72 与 Sin90 同时挂载时已验证过这一点，
+  Cos72 `T1.4.1` 共存隔离黑盒）。
+- **`agent24-os-sdk` 0.1.0**：上面四类回调（外加 events）都有对应的 Rust 客户端
+  （`SchedulerClient`/`ModelClient`/`ApprovalClient`/`MemoryClient`/`EventsClient`），
+  Sin90 已经从手写的 `src/adapter_agent24`（约 200 行握手客户端）迁移到这个 SDK
+  （TS.1.1，零行为变化）；`MemoryClient::remember_once` 提供幂等写入语义（靠预查
+  dedup 标记，非内核原生幂等键，见 FU-85）。SDK 仍是原型阶段（v0.1.0），接口可能变。
+- **Cos72 首次落地**：`MushroomDAO/Cos72` 作为第二个进程外领域模块验证了上述能力的
+  可复用性——`mytask` 最小闭环（发布/认领/提交 → 审批发积分 → 积分账本回放 →
+  完成摘要经 `remember_once` 写入内核记忆），细节见该仓库自己的设计文档，Pet0
+  不需要关心 Cos72 的业务语义，只作为"内核能力面确实能撑起第二个领域模块"的参考。
+
+以上均不改变 §5 描述的 Sin90 API 面本身；Pet0 仍然只经 `agent24d` 的
+`/api/v1/sin90/*` 消费 Sin90，这里只是说明 Sin90 内部现在有更多内核能力可用。
+
 ## 10. 待确认(Open Questions)
 
 1. Pet0 壳最终选 Tauri 还是复用 Electron？（不阻塞本约定，但影响分发与复用估算）
