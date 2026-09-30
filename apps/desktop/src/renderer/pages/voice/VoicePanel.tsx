@@ -17,7 +17,7 @@
 // because it was never this component's state to lose — this component
 // just pulls a snapshot on mount and mirrors new arrivals from then on.
 
-import { useEffect, useState } from 'react'
+import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from 'react'
 import { truncateForDisplay } from './display'
 import {
   getAgentEarAttachment,
@@ -74,6 +74,49 @@ function isAttached(attach: AttachedView | null): boolean {
   return attach?.attach_status === 'attached'
 }
 
+// ── AgentEar event payload guards ───────────────────────────────────────────
+// `AgentEarEventEnvelope.payload` is `Record<string, unknown>` — it comes
+// straight off the wire from AgentEar (a separate, untrusted process; the
+// kernel relays it verbatim, see ipc-types.ts) and is never schema-validated
+// before it reaches this panel. Two failure modes guarded here (Codex
+// follow-up review, ME4/A3-4):
+//
+// 1. A malicious/malformed field value that isn't actually a string (e.g.
+//    `phase: {}` or `text: 123`) must never be blindly coerced with
+//    `String(x)` — coercion can produce misleading output, and more
+//    generally any non-string must fail closed to a safe fallback rather
+//    than being displayed as if it were real data.
+// 2. A string value that collides with a JS Object.prototype member name —
+//    `"__proto__"`, `"constructor"`, `"toString"`, ... — used as a lookup key
+//    into a plain object label table (`TABLE[key]`) resolves to the
+//    INHERITED prototype member, not `undefined`. For `"__proto__"` that's
+//    `Object.prototype` itself: an object, which React then throws
+//    rendering as a child ("Objects are not valid as a React child"),
+//    unmounting this panel's whole subtree (and, absent an error boundary,
+//    the rest of the desktop UI with it). `Object.hasOwn` restricts a hit to
+//    keys this file itself put in the table.
+function isPlainRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/** Only ever returns an actual string from the field, never a coerced one. */
+function safeString(v: unknown): string | null {
+  return typeof v === 'string' ? v : null
+}
+
+/** Label-table lookup for an untrusted enum-like field. `raw` must be an own
+ *  string key of `table` to resolve to its label; anything else (wrong type,
+ *  or a string that only resolves via the prototype chain, like
+ *  `"__proto__"`) falls back to `unknownLabel` — never to the raw payload
+ *  text (source of truth for the fallback is the caller-supplied label, not
+ *  attacker-controlled input), and the lookup itself never returns anything
+ *  but a string this file defined. */
+function labelFor(table: Record<string, string>, raw: unknown, unknownLabel: string): string {
+  const key = safeString(raw)
+  if (key !== null && Object.hasOwn(table, key)) return table[key]!
+  return unknownLabel
+}
+
 const TIER_LABELS: Record<string, string> = { local: '本地', remote: '远端' }
 
 /** ME4-desktop-model-ui: the one line shown for EACH of AgentEar's recent
@@ -89,11 +132,17 @@ export function formatModelCall(call: ModelCallEnvelope): string {
 }
 
 function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Element {
-  const { type, payload } = envelope
+  const { type } = envelope
+  // Guard against `payload` itself not even being an object (null, an
+  // array, a primitive) — a malformed envelope from off the wire, not just
+  // a malformed field inside an otherwise-normal payload object. Reading a
+  // property off `null`/`undefined` throws before any of the per-field
+  // guards below would ever run.
+  const payload = isPlainRecord(envelope.payload) ? envelope.payload : {}
 
   if (type === 'transcript') {
-    const text = String((payload as { text?: unknown }).text ?? '')
-    const lang = String((payload as { lang?: unknown }).lang ?? 'und')
+    const text = safeString(payload.text) ?? ''
+    const lang = safeString(payload.lang) ?? 'und'
     const { shown, truncated, fullLength } = truncateForDisplay(text)
     return (
       <div className="voice-row voice-row-transcript">
@@ -111,19 +160,19 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   }
 
   if (type === 'turn') {
-    const phase = String((payload as { phase?: unknown }).phase ?? '')
+    const phaseLabel = labelFor(TURN_PHASE_LABELS, payload.phase, '未知阶段')
     // AgentEar PR #102 / agent-speaker v0.26.0: an idle/failed turn may carry
     // a `timings` object — `to_first_audio_ms` ("说完到听到") is the one
     // number worth surfacing right here, next to the turn itself; the fuller
     // per-step breakdown lands in the timing ledger (GET /api/v1/timings),
     // not this row.
-    const toFirstAudioMs = (payload as { timings?: { to_first_audio_ms?: unknown } }).timings
-      ?.to_first_audio_ms
+    const timings = payload.timings
+    const toFirstAudioMs = isPlainRecord(timings) ? timings.to_first_audio_ms : undefined
     return (
       <div className="voice-row voice-row-turn">
         <span className="voice-row-badge">轮次</span>
         <span className="voice-row-text">
-          {TURN_PHASE_LABELS[phase] ?? phase}
+          {phaseLabel}
           {typeof toFirstAudioMs === 'number' && ` · 说完到听到 ${formatMs(toFirstAudioMs)}`}
         </span>
       </div>
@@ -131,22 +180,22 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   }
 
   if (type === 'speech') {
-    const state = String((payload as { state?: unknown }).state ?? '')
-    const reason = (payload as { reason?: unknown }).reason
+    const stateLabel = labelFor(SPEECH_STATE_LABELS, payload.state, '未知状态')
+    const reason = safeString(payload.reason)
     return (
       <div className="voice-row voice-row-speech">
         <span className="voice-row-badge">播报</span>
         <span className="voice-row-text">
-          {SPEECH_STATE_LABELS[state] ?? state}
-          {typeof reason === 'string' && reason && ` · ${reason}`}
+          {stateLabel}
+          {reason && ` · ${reason}`}
         </span>
       </div>
     )
   }
 
   if (type === 'error') {
-    const code = String((payload as { code?: unknown }).code ?? '')
-    const message = String((payload as { message?: unknown }).message ?? '')
+    const code = safeString(payload.code) ?? '未知错误码'
+    const message = safeString(payload.message) ?? ''
     return (
       <div className="voice-row voice-row-error">
         <span className="voice-row-badge">错误 · {code}</span>
@@ -156,7 +205,7 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   }
 
   if (type === 'proposal') {
-    const text = String((payload as { text?: unknown }).text ?? '')
+    const text = safeString(payload.text) ?? ''
     const builtin = isBuiltinProposal(envelope)
     return (
       <div className="voice-row voice-row-proposal">
@@ -170,7 +219,7 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   }
 
   if (type === 'confirm_reply') {
-    const reply = String((payload as { reply?: unknown }).reply ?? '')
+    const reply = safeString(payload.reply) ?? ''
     return (
       <div className="voice-row voice-row-confirm">
         <span className="voice-row-badge">确认</span>
@@ -186,7 +235,59 @@ function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Elemen
   )
 }
 
+// ── Panel-level error boundary ──────────────────────────────────────────────
+// Codex follow-up review: AgentEar payloads are untrusted (see the guards
+// above), and until this fix a bad payload could throw during render with no
+// boundary anywhere above this panel — React then unmounts the WHOLE
+// desktop UI, not just 语音. This boundary is local to VoicePanel on
+// purpose (§ task scope): a crash inside this panel's subtree now degrades
+// to a fallback message inside 语音's own page, leaving every other sidebar
+// page untouched. There's no repo-wide ErrorBoundary component to reuse yet
+// (checked: no `componentDidCatch`/`getDerivedStateFromError` elsewhere in
+// apps/desktop/src), so it's implemented right here, scoped to this panel.
+interface VoicePanelBoundaryState {
+  error: Error | null
+}
+
+class VoicePanelErrorBoundary extends Component<{ children: ReactNode }, VoicePanelBoundaryState> {
+  constructor(props: { children: ReactNode }) {
+    super(props)
+    this.state = { error: null }
+  }
+
+  static getDerivedStateFromError(error: Error): VoicePanelBoundaryState {
+    return { error }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo): void {
+    // eslint-disable-next-line no-console -- best-effort diagnostics only; no telemetry pipeline here
+    console.error('[VoicePanel] render error, panel degraded:', error, info.componentStack)
+  }
+
+  render(): ReactNode {
+    if (this.state.error) {
+      return (
+        <div className="content">
+          <div className="page-title">语音（AgentEar）</div>
+          <div style={{ fontSize: 12, color: '#e05050', padding: '8px 0' }}>
+            语音面板遇到异常数据，已停止渲染以避免影响其他页面。请重新打开本页或稍后重试。
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 export default function VoicePanel(): JSX.Element {
+  return (
+    <VoicePanelErrorBoundary>
+      <VoicePanelInner />
+    </VoicePanelErrorBoundary>
+  )
+}
+
+function VoicePanelInner(): JSX.Element {
   const [attach, setAttach] = useState<AttachedView | null>(null)
   const [attachChecked, setAttachChecked] = useState(false)
   const [attachError, setAttachError] = useState<string | null>(null)

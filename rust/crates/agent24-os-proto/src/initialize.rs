@@ -198,6 +198,24 @@ pub enum HandshakeError {
     /// two failures mean the same thing to a caller, and only which fields
     /// are safe to reveal differs.
     AttachedDigestMismatch,
+    /// A3 (§5.5, review: Codex A3 follow-up): the kernel is shutting down —
+    /// `AttachRegistry::revoke_all` has run, or a handshake landed while it
+    /// was racing to. This is produced by `agent24d::attach_listener`
+    /// itself, NOT by [`accept_attached`] (which has no registry lock to
+    /// consult) — it is checked BEFORE `accept_attached` is even called, so
+    /// every connection sees it uniformly regardless of which module name it
+    /// claims (no new oracle: unlike the token/digest checks `accept_attached`
+    /// itself makes, this does not depend on anything the caller presented).
+    /// Deliberately NOT [`Self::AuthFailed`]: the token is still correct, and
+    /// a module that reads `auth_failed` here would stop reconnecting and
+    /// demand a fresh pairing (§5.6's own table) when all it actually needs
+    /// to do is retry once the daemon comes back up — the exact same "just
+    /// go away quietly" case `agent24d`'s own `attach_registry::CommitRefused::Closed`
+    /// documents for the step right after this one. `kind()` reuses the
+    /// existing `unavailable` kind (the same one `_a24/model/complete`
+    /// returns for "no provider reachable right now, try again") rather than
+    /// adding a new entry to the closed [`crate::rpc::ErrorKind`] set.
+    ShuttingDown,
 }
 
 impl HandshakeError {
@@ -213,7 +231,8 @@ impl HandshakeError {
             | Self::VersionMismatch(_)
             | Self::Busy
             | Self::Forbidden
-            | Self::AttachedDigestMismatch => -32000,
+            | Self::AttachedDigestMismatch
+            | Self::ShuttingDown => -32000,
         }
     }
 
@@ -229,6 +248,9 @@ impl HandshakeError {
             Self::VersionMismatch(_) => Some(VersionMismatch::KIND),
             Self::Busy => Some("busy"),
             Self::Forbidden => Some("forbidden"),
+            // Reuses the existing `unavailable` kind — see the variant's own
+            // doc for why this is not a new entry in the closed set.
+            Self::ShuttingDown => Some("unavailable"),
             _ => None,
         }
     }
@@ -260,6 +282,7 @@ impl std::fmt::Display for HandshakeError {
             Self::AttachedDigestMismatch => {
                 f.write_str("the module's manifest digest does not match the registered one")
             }
+            Self::ShuttingDown => f.write_str("the kernel is shutting down"),
         }
     }
 }

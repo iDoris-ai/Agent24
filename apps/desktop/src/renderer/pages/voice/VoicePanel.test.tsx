@@ -348,6 +348,124 @@ describe('VoicePanel — live event display', () => {
   })
 })
 
+describe('VoicePanel — malformed AgentEar payloads (Codex follow-up)', () => {
+  // AgentEarEventEnvelope.payload is `Record<string, unknown>` off the wire
+  // from a separate, untrusted process (main/preload.ts's onAgentEarEvent
+  // callback is typed `(envelope: unknown) => void` — nothing validates the
+  // shape before it reaches this panel). Before this fix, a lookup like
+  // `TURN_PHASE_LABELS[phase]` with `phase: "__proto__"` resolved to
+  // `Object.prototype` itself (an inherited property, not `undefined`), and
+  // React throws rendering an object as a child — unmounting this panel
+  // (and, with no boundary above it, the whole desktop UI).
+  beforeEach(() => {
+    attachModules = [attached()]
+  })
+
+  it('falls back safely for a turn phase colliding with Object.prototype ("__proto__"), instead of crashing', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onEventHandler).not.toBeNull())
+    emit({
+      schema: 'agentear.event/1',
+      event_id: 'evt_proto',
+      session_id: 'ses_1',
+      seq: 1,
+      type: 'turn',
+      payload: { phase: '__proto__' },
+    })
+    await waitFor(() => expect(screen.getByText('未知阶段')).toBeInTheDocument())
+    // A crash here would have replaced the whole panel with the boundary's fallback message.
+    expect(screen.queryByText(/语音面板遇到异常数据/)).not.toBeInTheDocument()
+  })
+
+  it('falls back safely for a turn phase that is an object, not a string', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onEventHandler).not.toBeNull())
+    emit({
+      schema: 'agentear.event/1',
+      event_id: 'evt_obj_phase',
+      session_id: 'ses_1',
+      seq: 1,
+      type: 'turn',
+      payload: { phase: {} as unknown as string },
+    })
+    await waitFor(() => expect(screen.getByText('未知阶段')).toBeInTheDocument())
+    expect(screen.queryByText(/语音面板遇到异常数据/)).not.toBeInTheDocument()
+  })
+
+  it('falls back safely for a speech state colliding with Object.prototype ("__proto__")', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onEventHandler).not.toBeNull())
+    emit({
+      schema: 'agentear.event/1',
+      event_id: 'evt_speech_proto',
+      session_id: 'ses_1',
+      seq: 1,
+      type: 'speech',
+      payload: { state: '__proto__' },
+    })
+    await waitFor(() => expect(screen.getByText('未知状态')).toBeInTheDocument())
+    expect(screen.queryByText(/语音面板遇到异常数据/)).not.toBeInTheDocument()
+  })
+
+  it('falls back safely for a transcript text that is a number, not a string', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onEventHandler).not.toBeNull())
+    emit({
+      schema: 'agentear.event/1',
+      event_id: 'evt_num_text',
+      session_id: 'ses_1',
+      seq: 1,
+      type: 'transcript',
+      payload: { text: 123 as unknown as string, lang: 'zh-CN' },
+    })
+    await waitFor(() => expect(screen.getByText(/转写 · zh-CN/)).toBeInTheDocument())
+    expect(screen.queryByText('123')).not.toBeInTheDocument()
+    expect(screen.queryByText(/语音面板遇到异常数据/)).not.toBeInTheDocument()
+  })
+
+  it('falls back safely when the whole payload is not an object (null)', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onEventHandler).not.toBeNull())
+    emit({
+      schema: 'agentear.event/1',
+      event_id: 'evt_null_payload',
+      session_id: 'ses_1',
+      seq: 1,
+      type: 'turn',
+      payload: null as unknown as Record<string, unknown>,
+    })
+    await waitFor(() => expect(screen.getByText('未知阶段')).toBeInTheDocument())
+    expect(screen.queryByText(/语音面板遇到异常数据/)).not.toBeInTheDocument()
+  })
+
+  it('the panel-level error boundary catches a render crash and degrades only this panel, without throwing out of the test', async () => {
+    mount()
+    render(<VoicePanel />)
+    await waitFor(() => expect(onEventHandler).not.toBeNull())
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    emit({
+      schema: 'agentear.event/1',
+      event_id: 'evt_bad_type',
+      session_id: 'ses_1',
+      seq: 1,
+      // Not one of the 6 known event kinds, and not even a string — falls
+      // through every `type === '...'` branch to the last row, which
+      // renders `{type}` directly. An object there is exactly the class of
+      // bug this fix addresses; the boundary is the backstop for any field
+      // this file doesn't (or can't yet) individually validate.
+      type: {} as unknown as AgentEarEventEnvelope['type'],
+      payload: {},
+    })
+    await waitFor(() => expect(screen.getByText(/语音面板遇到异常数据/)).toBeInTheDocument())
+    consoleErrorSpy.mockRestore()
+  })
+})
+
 describe('VoicePanel — recent model calls (ME4-desktop-model-ui)', () => {
   it('shows the main-process snapshot\'s model calls on mount, with a thousands-separated latency', async () => {
     modelCallSnapshotCalls = [modelCall({ model_id: 'Qwen3-8B-4bit', tier: 'remote', latency_ms: 1500 })]

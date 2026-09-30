@@ -9,6 +9,7 @@
 //! `fs_read` run automatically in C3. Callers are expected to audit-log every
 //! denial (the agent loop does).
 
+pub mod env_whitelist;
 mod local;
 mod net;
 

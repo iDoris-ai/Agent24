@@ -1,6 +1,6 @@
 # AgentEar × Agent24 × iDoris 接入规划（ADR-032 草案）
 
-> **状态：提议中 —— §8 已记录 jason 2026-09-26 的 4 项拍板；推荐的接入方式因此从 A1 改为 A3（附着式模块），A3 设计见 [`A3-ATTACHED-MODULE.md`](A3-ATTACHED-MODULE.md)；iDoris 部分已由 idoris 会话核对并修订（§9，附录 B）**。决策摘要登记在 [`docs/decision.md`](../decision.md) ADR-032。
+> **状态：已接受 —— §8 已记录 jason 2026-09-26 的 4 项拍板；推荐的接入方式因此从 A1 改为 A3（附着式模块），A3 设计见 [`A3-ATTACHED-MODULE.md`](A3-ATTACHED-MODULE.md)，P0–P2 已于 2026-09-27 实现（#526–#534）并随 v0.4.0 发布；iDoris 部分已由 idoris 会话核对并修订（§9，附录 B）**。决策摘要登记在 [`docs/decision.md`](../decision.md) ADR-032。P3–P5 未做，排在 v0.5.0 之后。
 > 来源：2026-09-26 Opus 只读调研 + AgentEar 会话（agentear-59）一手回复。
 
 

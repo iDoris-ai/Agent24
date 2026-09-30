@@ -676,14 +676,34 @@ where
         }
     });
 
-    let fut = async move {
-        let mut teardown = Teardown {
-            shared: Arc::clone(&shared),
-            su_handle: AbortOnDrop(su_handle),
-            _writer_handle: AbortOnDrop(writer_handle),
-            _stop_task: AbortOnDrop(stop_task),
-        };
+    // Review (Codex A3 follow-up): built HERE, synchronously, right after
+    // the three spawns above and BEFORE the `async move` block below is even
+    // constructed — not as the first statement INSIDE that block, which is
+    // where it used to live. An `async move { ... }` block's captures are
+    // moved in the instant the block VALUE is created (this line, still
+    // inside `serve_attached`'s own synchronous body), regardless of whether
+    // the resulting future is ever polled — but a STATEMENT inside that
+    // block only runs once the future is actually polled for the first
+    // time. The old code built `Teardown` (and so wrapped `su_handle`/
+    // `writer_handle`/`stop_task` in `AbortOnDrop`) as such a statement, so a
+    // caller that dropped the returned future before ever polling it (e.g.
+    // a `select!` branch that lost a race before this arm was reached) never
+    // ran that statement at all — the THREE JoinHandles were still captured
+    // into the future's environment, but as plain, un-wrapped `JoinHandle`s,
+    // and dropping a `JoinHandle` WITHOUT calling `.abort()` first just
+    // detaches it — the task keeps running, leaked, forever. Building
+    // `Teardown` out here closes the gap: it is moved into the future's
+    // environment at construction time either way, so dropping an un-polled
+    // future now runs `Teardown`'s `Drop` (and so every `AbortOnDrop`'s)
+    // exactly as if the future HAD run to its normal end.
+    let mut teardown = Teardown {
+        shared: Arc::clone(&shared),
+        su_handle: AbortOnDrop(su_handle),
+        _writer_handle: AbortOnDrop(writer_handle),
+        _stop_task: AbortOnDrop(stop_task),
+    };
 
+    let fut = async move {
         // A dedicated reader task, exactly like `serve_until`'s own —
         // `read_frame_async` is documented not cancel-safe, so it must never
         // be raced inside a `select!` that could drop it mid-frame while the
@@ -1615,6 +1635,54 @@ mod review_fixes {
             "the cancelled call's pending entry must have been removed by its guard, \
              so a late response for the same id is counted as stray, not silently \
              matched (review M2)"
+        );
+    }
+
+    /// Review (Codex A3 follow-up): before the fix, `Teardown` (and so every
+    /// `AbortOnDrop` wrapping `su_handle`/`writer_handle`/`stop_task`) was
+    /// built as the FIRST STATEMENT inside the `async move { ... }` block
+    /// `serve_attached` returns — which only ever runs once that future is
+    /// actually polled. A caller that drops the returned future before its
+    /// first poll (e.g. a `select!` arm that lost a race before ever
+    /// reaching this one) never executes that statement, so the three
+    /// `tokio::spawn`s from just above it — all of which happen
+    /// unconditionally, inside `serve_attached`'s own synchronous body, well
+    /// before the future is even constructed — are never wrapped in
+    /// `AbortOnDrop` at all. Dropping a bare `JoinHandle` (without calling
+    /// `.abort()` first) only DETACHES it; the task keeps running, leaked,
+    /// for good.
+    ///
+    /// This proves it on the `writer_handle` task specifically: it owns the
+    /// sole `Receiver` half of `KernelCalls::out_tx`'s channel, so as long as
+    /// that task is alive, `enqueue_raw` (a plain `try_send`) keeps
+    /// succeeding — a full round trip through a live, un-aborted task,
+    /// exactly what "leaked" means here. Fixed, dropping the future before
+    /// polling it must abort `writer_handle` (via `Teardown`'s `Drop`) and so
+    /// drop its `Receiver`, which makes every subsequent `try_send` fail.
+    #[tokio::test]
+    async fn dropping_the_future_before_its_first_poll_still_tears_down_the_background_tasks() {
+        let (calls, fut, _kernel_read, _module_write) = harness(methods());
+
+        // Never spawned, never `.await`ed — dropped with zero polls, the
+        // exact case `Teardown`'s in-block construction used to miss.
+        drop(fut);
+
+        // `JoinHandle::abort()` only REQUESTS cancellation; the task's own
+        // drop glue (including dropping `writer_handle`'s `out_rx`) runs on
+        // a later poll of the runtime, not synchronously here.
+        let mut leaked = true;
+        for _ in 0..200 {
+            if calls.enqueue_raw(b"probe\n".to_vec()).is_err() {
+                leaked = false;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !leaked,
+            "the writer task must have been aborted (dropping its out_rx) even though the \
+             returned future was dropped before its first poll — otherwise it (and the other \
+             two background tasks) leak forever"
         );
     }
 }

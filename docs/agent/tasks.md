@@ -1,6 +1,6 @@
 # Agent24 任务台账 — Task
 
-## 🔴 本文件是当前唯一权威的执行状态来源（2026-09-19 立，2026-09-24 更新）
+## 🔴 本文件是当前唯一权威的执行状态来源（2026-09-19 立，2026-09-28 更新）
 
 仓库里有四份路线图/进展文档，**以谁为准只有一个答案**：
 
@@ -50,9 +50,9 @@
 | ME4-4.2.3b | Agent24 | 用量 recorder + `/api/v1/usage?module=` + serve 换 sink | 4.2.3a | `DONE` | #510（用量写者 UsageRecorder）→ #511（GET /api/v1/usage?module=）全部合并于 2026-09-26 |
 | ME4-4.3.1 | Agent24 | 推理黑盒验收（J14/J19）+ 探针 `4b` | 4.2.3b | `DONE` | #512 合并于 2026-09-26（`bb3505a`；Opus 本地评审 2 轮：CHANGES → APPROVE，Medium 全修；Codex 未审，计入 ME4-CODEX-DEBT-7） |
 | ME4-M4b 门 | Sin90 | Sin90 M5（T5.0.1–T5.5.1）全 DONE | 4.3.1, M3 门 | `DONE` | Sin90 `origin/main` `135ddb7`（T5.5.1 M5 real-mount acceptance）含 T5.0.1–T5.5.1 各 PR；前置 4.3.1 DONE（#512）、M3 门 DONE。ME4-5.1.1 以 `135ddb7` 为盘点基线 |
-| ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `IN_PROGRESS` | 设计 v4 冻结（4 轮 Tier-2 Opus 评审，第 4 轮 1H 已修，按用户要求不再复审），Codex 补审记 ME4-CODEX-DEBT-8。`docs/design/ME4-S3-os-sdk.md`：jason 2026-09-26 拍板 Q1–Q11 与随后三轮评审处置（§11.1→v2、§11.2→v3、§11.3→v4）；同日追加拍板 v0.1.0 收敛为「原型版本」，§7 切法从 17 片压缩为 4 片（见下两行 + Sin90/Cos72 既有行） |
-| ME4-5.1.2a | Agent24 | **原型片①：proto 模块侧**（transport + 握手 + fd）：`ModuleEnv`/`Hello`/`InitializeReply`/`connect_from_env`、`manifest::{ManifestFacts,facts_from_yaml}`、`manifest_digest` 挪入 proto、`Connection` mux（读写任务、按 id 分发、64 在途、`declare_dead`、drop 取消、响应/写超时、`slot_wait`）、`module::testing`（`test-util`）、新 crate `agent24-os-fd`（`take_inherited_listener`，唯一 `unsafe`，两平台分支）+ proto `take_listener`/`InheritedListener`；J-S8、J-S9 前半、J-S12、J-S19；J-S1b/J-S20 的 `macos-latest` job 为原型阶段可选 | 5.1.1 | `BACKLOG` | 细粒度组件清单见 ME4-S3-os-sdk.md §7.1（原 a1/a2-core/a2-cancel/a2-kit/a3-fd）。**合并流程（ME4-S3 §7 v4）：一次只开一个 PR，base 恒为 main；单片允许超过 SZ-1 默认上限 300 行，超限在 PR body 回应即可** |
-| ME4-5.1.2b | Agent24 | **原型片②：SDK crate**（`agent24-os-sdk` 骨架 + 五个客户端 + fired）：`clippy.toml`、`Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env`、`ClientError`/`UnavailableCause`（不含 `retry_class`，FU-87）、`RequestContext`/`RequestId`/`ApprovalToken`、Events/Memory(`remember_once`)/Approval(advise 孤儿约束 §2.10)/Scheduler/Model 五个客户端 + agentd 各自对等测试、`FiredBody` 挪进 proto + fired 提取器 + `with_fired`、`examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + `CHANGELOG.md`；J-S1（核心部分）、J-S2、J-S4/J-S5/J-S6/J-S7、J-S9 后半、J-S10、J-S11、J-S13、J-S14、J-S18；J-S3 的正对照脚本、J-S15 为原型阶段可选。合并后在 main 上打 tag `agent24-os-sdk-v0.1.0`（J-S14），tag 推送、探针 ● 之后本行才标 DONE | 5.1.2a | `BACKLOG` | 细粒度组件清单见 ME4-S3-os-sdk.md §7.1（原 a3-skel/a3-module/b1a/b1b/b2a/b2b/b2c/b3a/b3b/c1a/c1b/c2）；b2b 若实测 SZ-1 超 300 内部再拆，不必单开 PR |
+| ME4-5.1.1 | Agent24 | SDK 设计冻结（从两个调用方提取） | M4b 门 | `DONE` | #514（`6e717aa`，合并于 2026-09-26/27）。设计 v4 冻结（4 轮 Tier-2 Opus 评审，第 4 轮 1H 已修，按用户要求不再复审），Codex 补审记 ME4-CODEX-DEBT-8。`docs/design/ME4-S3-os-sdk.md`：jason 2026-09-26 拍板 Q1–Q11 与随后三轮评审处置（§11.1→v2、§11.2→v3、§11.3→v4）；同日追加拍板 v0.1.0 收敛为「原型版本」，§7 切法从 17 片压缩为 4 片（见下两行 + Sin90/Cos72 既有行） |
+| ME4-5.1.2a | Agent24 | **原型片①：proto 模块侧**（transport + 握手 + fd）：`ModuleEnv`/`Hello`/`InitializeReply`/`connect_from_env`、`manifest::{ManifestFacts,facts_from_yaml}`、`manifest_digest` 挪入 proto、`Connection` mux（读写任务、按 id 分发、64 在途、`declare_dead`、drop 取消、响应/写超时、`slot_wait`）、`module::testing`（`test-util`）、新 crate `agent24-os-fd`（`take_inherited_listener`，唯一 `unsafe`，两平台分支）+ proto `take_listener`/`InheritedListener`；J-S8、J-S9 前半、J-S12、J-S19；J-S1b/J-S20 的 `macos-latest` job 为原型阶段可选 | 5.1.1 | `DONE` | #515（`e9a90f1`，合并于 2026-09-26/27；PR-Daemon 两轮 CHANGES→APPROVE，Codex 未审计入 ME4-CODEX-DEBT-9）。细粒度组件清单见 ME4-S3-os-sdk.md §7.1（原 a1/a2-core/a2-cancel/a2-kit/a3-fd）。**合并流程（ME4-S3 §7 v4）：一次只开一个 PR，base 恒为 main；单片允许超过 SZ-1 默认上限 300 行，超限在 PR body 回应即可** |
+| ME4-5.1.2b | Agent24 | **原型片②：SDK crate**（`agent24-os-sdk` 骨架 + 五个客户端 + fired）：`clippy.toml`、`Module`/`ModuleBuilder`/`SdkError`/`serve`/`with_env`、`ClientError`/`UnavailableCause`（不含 `retry_class`，FU-87）、`RequestContext`/`RequestId`/`ApprovalToken`、Events/Memory(`remember_once`)/Approval(advise 孤儿约束 §2.10)/Scheduler/Model 五个客户端 + agentd 各自对等测试、`FiredBody` 挪进 proto + fired 提取器 + `with_fired`、`examples/minimal` + 挂载冒烟 + 探针 `4c SDK` + `CHANGELOG.md`；J-S1（核心部分）、J-S2、J-S4/J-S5/J-S6/J-S7、J-S9 后半、J-S10、J-S11、J-S13、J-S14、J-S18；J-S3 的正对照脚本、J-S15 为原型阶段可选。合并后在 main 上打 tag `agent24-os-sdk-v0.1.0`（J-S14），tag 推送、探针 ● 之后本行才标 DONE | 5.1.2a | `DONE`（tag 待随 v0.4.0 一并打） | #516（`f504ae0`，合并于 2026-09-26/27；PR-Daemon 两轮 CHANGES→APPROVE，Codex 未审计入 ME4-CODEX-DEBT-9）。`agent24-os-sdk/CHANGELOG.md` 已随本次 v0.4.0 发版一并补上（J-S14）。细粒度组件清单见 ME4-S3-os-sdk.md §7.1（原 a3-skel/a3-module/b1a/b1b/b2a/b2b/b2c/b3a/b3b/c1a/c1b/c2）；b2b 若实测 SZ-1 超 300 内部再拆，不必单开 PR |
 | ME4-5.2.0 | Sin90 | 线协议金样（Sin90 TS.1.0，迁移前合）：出站 `(method, params)` + 入站回放（每个错误 kind → outbox 行状态/attempts 与 `ModelFailure`、宽松解析、Usage 宽度、recall 预查三态） | — | `BACKLOG` | 见 ME4-S3-os-sdk.md §5.1 |
 | ME4-5.2.1 | Sin90 | **原型片③：Sin90 迁到 SDK**（Sin90 TS.1.1）：含改用 SDK `remember_once`、`test_support.rs` 一行 shim、`SchedulerClient`/`ModelClient` newtype 保旧签名 | 5.1.2b, 5.2.0 | `BACKLOG` | 验收见 ME4-S3-os-sdk.md §5.2：金样逐条相等、真实挂载黑盒全绿（核心判据 J-S16）、`reconciler.rs`/`clients/model.rs` 测试模块与已提交的期望补丁逐字相等（脚本 v4 改用 `#[cfg(test)]`+`mod tests {` 锚点，见 §5.2 第 3 条/A.8；只允许 `model.rs` 测试模块那一行 `use crate::ai::UnavailableCause` → `agent24_os_sdk::UnavailableCause`）、Unix socket/fd 子集 clippy 由红转绿 |
 | ME4-5.3.1 | Cos72 | Cos72 仓库 pilot 七件套 | 5.1.2b | `BACKLOG` | |
@@ -60,13 +60,33 @@
 | ME4-5.3.3a | Cos72 | mytask 实体与路由 | 5.3.2 | `BACKLOG` | |
 | ME4-5.3.3b | Cos72 | 审批发积分 + 账本回放 + 摘要进记忆 | 5.3.3a | `BACKLOG` | |
 | ME4-5.3.4 | Cos72 | Cos72 真实挂载黑盒（含与 Sin90 共存隔离） | 5.3.3b, 5.2.1 | `BACKLOG` | |
-| ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2b | `BACKLOG` | |
+| ME4-5.4.1 | Agent24 | wire 文档 + Node.js 参考模块（T14） | 5.1.2b | `BACKLOG` | 分支 `docs/me4-5.4.1-wire-and-node-ref` 已推送：`docs/specs/WIRE-OOP-MODULE.md`（逐方法 params/result/错误闭集，每条事实带 file:line）+ `examples/node-module/`（纯 Node 标准库，未引用本仓 Rust crate，仅声明 `events`/`memory`）+ `rust/apps/agent24d/tests/me4_node_module_blackbox.rs`（真实黑盒：挂载→代理→事件→记忆，10/10 连跑绿；无 node 则 SKIP 并打印原因，不 panic）。范围收窄：只覆盖 events/memory 往返，scheduler upsert/fired 与 model/approval 只有文档、无参考实现演示，记 followups.md FU-104。状态由用户核实后改 |
 | ME4-6.0.1 | Agent24 | 冻结 v0.5.0 专用发布清单 | 5.3.4, 5.4.1 | `BACKLOG` | |
 | ME4-6.0.2 | Sin90+Cos72 | 模块发布物（tar.gz + SHA256SUMS + Release） | 6.0.1 | `BACKLOG` | |
 | ME4-6.1.1 | Agent24 | 发布前收口（ADR 修订/CHANGELOG/版本/回填台账） | 6.0.2 | `BACKLOG` | |
 | ME4-6.1.2 | Agent24 | 发布 v0.5.0 | 6.1.1 | `BACKLOG` | |
 | ME4-6.1.3 | Mac mini | 干净机器只用发布物安装验收 | 6.1.2 | `BACKLOG` | |
 | ME4-6.1.4 | 三仓 | 最终台账收口 PR（本轮最后一个 PR） | 6.1.3 | `BACKLOG` | |
+
+## ADR-032 / A3 台账（2026-09-26/27 立；jason 拍板插队线，不在 PLAN-ME4 主链上）
+
+> AgentEar 附着式模块（P0–P2），设计见 [`../design/A3-ATTACHED-MODULE.md`](../design/A3-ATTACHED-MODULE.md)、ADR 见 [`../decision.md`](../decision.md) ADR-032。演示记录 #523，FU-89~93 修复 #528。
+
+| # | 任务 | 状态 | 证据 |
+|---|---|---|---|
+| A3-演示 | 2026-09-27 现场演示（Agent24 + Sin90） | `DONE` | #523（`28b94d1`），发现 FU-89~93 |
+| A3-设计 | ADR-032 A3 附着式模块设计冻结（AgentEar 接入 P0–P2） | `DONE` | #524（`940ac71`） |
+| A3-1 | os-proto 附着模块类型底座（握手/代际/帧分拣） | `DONE` | #527（`84357af`） |
+| A3-2a | agent24d 附着模块注册存储 + REST + CLI | `DONE` | #526（`a35ae82`） |
+| A3-2b | agent24d 附着监听 + 握手接入 + 生命周期 + 关机 | `DONE` | #529（`4581587`） |
+| A3-3 | agent24d 附着模块反向命令（speak/stop_playback） | `DONE` | #532（`604e198`） |
+| A3-4 | 桌面端「语音」面板（AgentEar 附着） | `DONE` | #534（`77b05cb`） |
+| FU-89~93 | ME4 演示发现的问题（默认模型/OS 模块视图/dev 端口/长 HOME socket/侧栏端口） | `DONE` | #528（`0d865e9`） |
+| ADR-032 对齐 | L3 轨迹改 ATIF v1.8 交换格式 + INTEGRATION §9 标注 iDoris 已合 preview、边界以 iDoris 规范 v0.2 为准 | `DONE` | #540（`b0f8baf`） |
+| 发版前修复 | C1 A3 握手→命令竞态、FU-83 探针原子写、SDK fired 宽松解析 | `DONE` | #543（`a53e8c1`） |
+| 桌面 logo | 替换 Agent24 桌面端 logo 为 iDoris 像素风女孩 | `DONE` | #541（`32480fc`） |
+| 顶栏模型/耗时 | 顶栏真实默认模型 + 回复耗时后缀 + `model.call` 事件 + `model_call_timings` 计时表 + simple 调用关闭思考 | `DONE` | #544（`32072b0`） |
+| v0.4.0 发版 | 版本号 + CHANGELOG + README + 台账收尾 | `IN_PROGRESS` | 本 PR |
 
 **需要用户手动做**（不是 goal task）：给 `iDoris-ai/Sin90` 与 `MushroomDAO/Cos72` 的 main 开 ruleset（1 个审批 + dismiss stale）。
 
@@ -170,7 +190,7 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 - **证据**：
 
 ### ME3-T6 3c 回调通道其余部分（SPEC §3 + §8 ME-3c 格）  `DONE` — [#176](https://github.com/iDoris-ai/Agent24/pull/176)（`c75e919`，2026-09-12）
-- **优先级**：high（T1–T6 齐了即可发 v0.4.0 握手层）
+- **优先级**：high（T1–T6 齐了即可发 v0.4.0 握手层。**⚠️ 作废**：v0.4.0 实际于 2026-09-2x 发布，内容 = ME-3 全套 + ME4 S1/S2 + SDK 原型 + A3，与本行原定义无关，见上方「ADR-032 / A3 台账」与 `PLAN-ME4-OS-CAPABILITIES.md` §一 D4 后的注记）
 - **依赖**：3b-1 framing、3b-2b `initialize`（均已在 main）。**不依赖** #175（3b-5）：本刀 offer set 为空，没有任何业务方法，「draining 期间回调准入」要等第一个业务方法（3d/3e）才有落点
 - **目标**：握手之后那条回调连接上的一切协议行为定死，实现者不需要猜并发、取消与错误分类
 - **开发范围**（`agent24-os-proto/src/rpc.rs`，探针预言符号 `pub fn dispatch`）：
