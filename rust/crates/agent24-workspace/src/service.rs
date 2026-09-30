@@ -457,6 +457,15 @@ mod tests {
         const GENERATION: &str = "g1";
         const CREATED: &str = "2026-09-19T00:00:00.000Z";
 
+        struct AuthoritySeed<'a> {
+            workspace_id: &'a str,
+            allocation_id: &'a str,
+            generation: &'a str,
+            session_id: &'a str,
+            run_id: &'a str,
+            lease_id: &'a str,
+        }
+
         fn store_identity(identity: RootIdentity) -> StoreRootIdentity {
             StoreRootIdentity::unix(&identity.dev_le, &identity.ino_le).unwrap()
         }
@@ -571,6 +580,116 @@ mod tests {
                 .await
                 .unwrap();
             WorkspaceLeaseId::parse(LEASE).unwrap()
+        }
+
+        async fn seed_independent_run_authority(
+            service: &Arc<WorkspaceService>,
+            seed: AuthoritySeed<'_>,
+        ) -> (PathBuf, Arc<WorkspaceRunAuthority>) {
+            let workspace_id = WorkspaceId::parse(seed.workspace_id).unwrap();
+            let locator = format!("{}.{}", seed.workspace_id, seed.generation);
+            let pinned = service.roots.create_root(&locator).unwrap();
+            let root_identity = store_identity(pinned.identity());
+            let parent_identity = store_identity(service.roots.identity());
+            let canonical_root = service.roots_path.join(&locator);
+            let owner = LifecycleOwnerRef::parse(format!("owner-{}", seed.run_id)).unwrap();
+            let now = store_now().unwrap();
+            let input = NewScratchWorkspace::new(
+                workspace_id.clone(),
+                TrustedRootRegistration::new(
+                    canonical_root.to_str().unwrap().to_owned(),
+                    seed.generation.to_owned(),
+                    root_identity,
+                )
+                .unwrap(),
+                WorkspaceProvenanceInput::new("test".into(), None, None).unwrap(),
+                owner.clone(),
+                WorkspaceTtl::new(86_400_000).unwrap(),
+            );
+            service
+                .store
+                .create_workspace(&input, &owner, &now)
+                .await
+                .unwrap();
+            let (parent_kind, parent_device, parent_inode) = match parent_identity {
+                StoreRootIdentity::Unix { device, inode } => ("unix", device, inode),
+                StoreRootIdentity::Windows { .. } => unreachable!(),
+            };
+            let (root_kind, root_device, root_inode) = match root_identity {
+                StoreRootIdentity::Unix { device, inode } => ("unix", device, inode),
+                StoreRootIdentity::Windows { .. } => unreachable!(),
+            };
+            query(
+                "INSERT INTO workspace_allocations
+                 (allocation_id, workspace_id, root_generation, relative_name,
+                  parent_identity_kind, parent_unix_device, parent_unix_inode,
+                  root_identity_kind, root_unix_device, root_unix_inode,
+                  phase, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'committed', ?)",
+            )
+            .bind(AllocationId::parse(seed.allocation_id).unwrap().as_str())
+            .bind(seed.workspace_id)
+            .bind(seed.generation)
+            .bind(&locator)
+            .bind(parent_kind)
+            .bind(parent_device.to_vec())
+            .bind(parent_inode.to_vec())
+            .bind(root_kind)
+            .bind(root_device.to_vec())
+            .bind(root_inode.to_vec())
+            .bind(now.as_str())
+            .execute(test_hooks::pool(&service.store))
+            .await
+            .unwrap();
+            query(
+                "INSERT INTO sessions (id,title,channel,workspace_id,created_at,updated_at)
+                 VALUES (?,?, 'desktop',?,?,?)",
+            )
+            .bind(seed.session_id)
+            .bind(seed.session_id)
+            .bind(seed.workspace_id)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(test_hooks::pool(&service.store))
+            .await
+            .unwrap();
+            query(
+                "INSERT INTO runs (id,session_id,workspace_id,status,input,usage,created_at)
+                 VALUES (?,?,?,'running',?,?,?)",
+            )
+            .bind(seed.run_id)
+            .bind(seed.session_id)
+            .bind(seed.workspace_id)
+            .bind(format!(
+                r#"{{"prompt":"go","workspace_id":"{}","model_override":null,"mode":"normal"}}"#,
+                seed.workspace_id
+            ))
+            .bind(r#"{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"cost_usd":0.0}"#)
+            .bind(now.as_str())
+            .execute(test_hooks::pool(&service.store))
+            .await
+            .unwrap();
+            query(
+                "INSERT INTO workspace_leases
+                 (lease_id,workspace_id,root_generation,owner_id,kind,acquired_at)
+                 VALUES (?,?,?,?,'run',?)",
+            )
+            .bind(seed.lease_id)
+            .bind(seed.workspace_id)
+            .bind(seed.generation)
+            .bind(seed.run_id)
+            .bind(now.as_str())
+            .execute(test_hooks::pool(&service.store))
+            .await
+            .unwrap();
+            drop(pinned);
+
+            let lease = WorkspaceLeaseId::parse(seed.lease_id).unwrap();
+            let authority = service
+                .bind_run_authority(seed.run_id, &lease)
+                .await
+                .unwrap();
+            (canonical_root, authority)
         }
 
         #[tokio::test]
@@ -716,6 +835,96 @@ mod tests {
                 Path::new(String::from_utf8_lossy(&output.stdout).trim()),
                 displaced.canonicalize().unwrap()
             );
+        }
+
+        #[tokio::test]
+        async fn independent_workspace_authorities_cannot_cross_filesystem_boundaries() {
+            let state = tempfile::tempdir().unwrap();
+            let service = Arc::new(
+                WorkspaceService::compose(Store::open_memory().await.unwrap(), state.path())
+                    .unwrap(),
+            );
+            let (root_a, authority_a) = seed_independent_run_authority(
+                &service,
+                AuthoritySeed {
+                    workspace_id: "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XA",
+                    allocation_id: "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XA",
+                    generation: "ga",
+                    session_id: "session-a",
+                    run_id: "run-a",
+                    lease_id: "wl_01J5M4Q2Y7N8P9R0S1T2V3W4XA",
+                },
+            )
+            .await;
+            let (root_b, authority_b) = seed_independent_run_authority(
+                &service,
+                AuthoritySeed {
+                    workspace_id: "ws_01J5M4Q2Y7N8P9R0S1T2V3W4XB",
+                    allocation_id: "wa_01J5M4Q2Y7N8P9R0S1T2V3W4XB",
+                    generation: "gb",
+                    session_id: "session-b",
+                    run_id: "run-b",
+                    lease_id: "wl_01J5M4Q2Y7N8P9R0S1T2V3W4XB",
+                },
+            )
+            .await;
+
+            let file_a = root_a.join("a.txt");
+            let file_b = root_b.join("b.txt");
+            std::fs::write(&file_a, b"alpha").unwrap();
+            std::fs::write(&file_b, b"bravo").unwrap();
+
+            assert_eq!(
+                authority_a
+                    .read_file(file_a.to_str().unwrap().to_owned(), 16)
+                    .await
+                    .unwrap(),
+                b"alpha"
+            );
+            assert_eq!(
+                authority_b
+                    .read_file(file_b.to_str().unwrap().to_owned(), 16)
+                    .await
+                    .unwrap(),
+                b"bravo"
+            );
+            assert!(
+                authority_a
+                    .read_file(file_b.to_str().unwrap().to_owned(), 16)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                authority_b
+                    .read_file(file_a.to_str().unwrap().to_owned(), 16)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                authority_a
+                    .write_file(file_b.to_str().unwrap().to_owned(), b"cross-a".to_vec())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                authority_b
+                    .write_file(file_a.to_str().unwrap().to_owned(), b"cross-b".to_vec())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&file_a).unwrap(), b"alpha");
+            assert_eq!(std::fs::read(&file_b).unwrap(), b"bravo");
+
+            for (authority, expected_root) in [(&authority_a, &root_a), (&authority_b, &root_b)] {
+                let mut command = tokio::process::Command::new("/bin/pwd");
+                authority.configure_command_cwd(&mut command).await.unwrap();
+                let output = command.output().await.unwrap();
+                assert!(output.status.success());
+                assert_eq!(
+                    Path::new(String::from_utf8_lossy(&output.stdout).trim()),
+                    expected_root.canonicalize().unwrap()
+                );
+            }
         }
 
         #[tokio::test]
