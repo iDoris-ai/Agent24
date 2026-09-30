@@ -716,6 +716,53 @@ impl Store {
         Ok(approval)
     }
 
+    /// Atomically time out every still-pending approval whose persisted
+    /// deadline is strictly before `now`.  The strict boundary complements
+    /// [`Self::resolve_approval_client_decision`], whose client-decision CAS
+    /// accepts `expires_at == now`.
+    pub async fn timeout_expired_approvals(&self, now: &str) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "UPDATE approvals SET status = 'timed_out', decided_at = ?
+             WHERE status = 'pending' AND expires_at < ?
+             RETURNING id, run_id",
+        )
+        .bind(now)
+        .bind(now)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("run_id")?)))
+            .collect()
+    }
+
+    /// Runs still parked after an approval timed out and with no newer pending
+    /// approval need token-less recovery.  Keeping this query durable makes a
+    /// failed recovery cancellation naturally retry on the next scan (and after
+    /// a daemon restart) without keeping an in-memory retry queue.
+    pub async fn timed_out_approval_recovery_run_ids(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT a.run_id
+             FROM approvals a
+             JOIN runs r ON r.id = a.run_id
+             WHERE a.status = 'timed_out'
+               AND r.status = 'awaiting_approval'
+               AND a.rowid = (
+                   SELECT max(latest.rowid) FROM approvals latest
+                   WHERE latest.run_id = a.run_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM approvals p
+                   WHERE p.run_id = a.run_id AND p.status = 'pending'
+               )
+             ORDER BY a.run_id ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| row.try_get("run_id").map_err(StoreError::from))
+            .collect()
+    }
+
     /// Fail-closed startup sweep: abort every approval left pending by a
     /// previous daemon process (TASKS C4 acceptance: kill + restart ⇒ aborted).
     pub async fn abort_lingering_approvals(&self, decided_at: &str) -> Result<u64> {
@@ -1394,6 +1441,100 @@ mod tests {
         assert_eq!(
             store.get_approval("apr_1").await.unwrap().unwrap().status,
             ApprovalStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_approval_timeout_is_strict_atomic_and_idempotent() {
+        let store = approval_store("{}").await;
+        assert!(
+            store
+                .timeout_expired_approvals("2026-07-24T00:05:00Z")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.get_approval("apr_1").await.unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
+
+        assert_eq!(
+            store
+                .timeout_expired_approvals("2026-07-24T00:05:01Z")
+                .await
+                .unwrap(),
+            vec![("apr_1".to_owned(), "run_1".to_owned())]
+        );
+        let timed_out = store.get_approval("apr_1").await.unwrap().unwrap();
+        assert_eq!(timed_out.status, ApprovalStatus::TimedOut);
+        assert_eq!(
+            timed_out.decided_at.as_deref(),
+            Some("2026-07-24T00:05:01Z")
+        );
+        assert!(
+            store
+                .timeout_expired_approvals("2026-07-24T00:05:02Z")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_recovery_candidates_require_parked_run_without_new_pending() {
+        let store = approval_store("{}").await;
+        sqlx::query("UPDATE runs SET status = 'awaiting_approval' WHERE id = 'run_1'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .timeout_expired_approvals("2026-07-24T00:05:01Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.timed_out_approval_recovery_run_ids().await.unwrap(),
+            vec!["run_1".to_owned()]
+        );
+
+        sqlx::query(
+            "INSERT INTO approvals
+                (id, run_id, tool_call_id, kind, summary, payload,
+                 available_decisions, status, expires_at, created_at)
+             VALUES ('apr_2', 'run_1', 'tc_2', 'exec', 'new', '{}',
+                     '[]', 'pending', '2026-07-24T00:10:00Z',
+                     '2026-07-24T00:06:00Z')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            store
+                .timed_out_approval_recovery_run_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        sqlx::query("UPDATE approvals SET status = 'approved' WHERE id = 'apr_2'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .timed_out_approval_recovery_run_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        sqlx::query("DELETE FROM approvals WHERE id = 'apr_2'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.timed_out_approval_recovery_run_ids().await.unwrap(),
+            vec!["run_1".to_owned()]
         );
     }
 }
