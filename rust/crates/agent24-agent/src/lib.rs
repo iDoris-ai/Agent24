@@ -984,6 +984,13 @@ impl RunManager {
             reason: Some("no decision was recorded".to_owned()),
             extra: serde_json::Map::new(),
         });
+        if !restored_decision_is_consistent(approval, &decision) {
+            tracing::warn!(
+                "approval {}: restored decision/status provenance is inconsistent",
+                approval.id
+            );
+            return Err(());
+        }
         match decision.kind.as_str() {
             "approve" | "approve_for_session" | "approve_for_target" => {
                 let ctx = match self.tool_context_for(run, call.id.clone()).await {
@@ -1736,6 +1743,24 @@ impl RunManager {
             Err(err) => tracing::debug!("run cancel persist skipped: {err}"),
         }
     }
+}
+
+fn restored_decision_is_consistent(approval: &Approval, decision: &Decision) -> bool {
+    if !approval
+        .available_decisions
+        .iter()
+        .any(|offered| offered == &decision.kind)
+    {
+        return false;
+    }
+    matches!(
+        (approval.status, decision.kind.as_str()),
+        (
+            ApprovalStatus::Approved,
+            "approve" | "approve_for_session" | "approve_for_target"
+        ) | (ApprovalStatus::Denied, "deny")
+            | (ApprovalStatus::Aborted, "abort")
+    )
 }
 
 #[cfg(test)]
@@ -3896,6 +3921,22 @@ mod approval_tests {
             created_at: now_iso8601(),
             decided_at: None,
         }
+    }
+
+    #[test]
+    fn restored_decision_requires_offered_kind_and_matching_status() {
+        let mut approval = seed_approval("apr", "run", "tc", serde_json::Map::new());
+        approval.status = ApprovalStatus::Approved;
+        let session = decision("approve_for_session", None);
+        assert!(!restored_decision_is_consistent(&approval, &session));
+
+        approval
+            .available_decisions
+            .push("approve_for_session".to_owned());
+        assert!(restored_decision_is_consistent(&approval, &session));
+
+        approval.status = ApprovalStatus::Denied;
+        assert!(!restored_decision_is_consistent(&approval, &session));
     }
 
     #[tokio::test]
