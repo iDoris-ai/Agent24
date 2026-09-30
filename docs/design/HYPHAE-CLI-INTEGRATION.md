@@ -2,23 +2,26 @@
 
 状态：跨仓协作提案，待 Agent24 确认；不代表已实现接口，也不冻结 T01 协议。记录时间：2026-09-30。
 
-## 固定依据
+## 源码与验收快照（2026-09-30）
 
-- Agent24 main：[`4c236bcc`](https://github.com/iDoris-ai/Agent24/commit/4c236bcc162b52d2a4d82f258295034f08682336)。Rust CLI [main.rs](https://github.com/iDoris-ai/Agent24/blob/4c236bcc162b52d2a4d82f258295034f08682336/rust/apps/agent24-cli/src/main.rs) 目前没有统一身份、联系人、relay、消息或 outbox 通信子命令。Nostr bridge 仍经子进程调用 CLI，`A24_SPEAKER_BIN` 默认 `agent-speaker`，配置与调用见 [config.ts](https://github.com/iDoris-ai/Agent24/blob/4c236bcc162b52d2a4d82f258295034f08682336/packages/nostr-bridge/src/config.ts) 和 [speaker.ts](https://github.com/iDoris-ai/Agent24/blob/4c236bcc162b52d2a4d82f258295034f08682336/packages/nostr-bridge/src/speaker.ts)。#594 触及桌面 UI，但未增加上述通信管理接线；本提案仅记录身份/联系人/relay/消息/历史/待发管理尚未接通，不评述模型页或其他 UI。
-- Hyphae 已验收 main：[`1948aadc`](https://github.com/iDoris-ai/Hyphae/commit/1948aadc551e360176711f9c50172ed6edccd253)。Go 模块声明最低版本 1.26；本机 macOS arm64 二进制以 Go 1.27.1 构建，SHA-256 `a7bb4a83b5d6be0a939a4cd92a853a2672f97012c48d704a9a3a718b9e6d806b`。它未安装到生产环境；其他平台要分别构建并记录 hash。
-- 固定 main 的默认测试、integration、vet、build 和 smoke 已通过；CI [36729070274](https://github.com/iDoris-ai/Hyphae/actions/runs/36729070274) 通过。真实 CLI + 本地 relay 测试覆盖 125 条离线积压及同库 daemon 重启后零重复新消息效果。以固定源码、测试和 CI 为行为证据；Hyphae 的待审文档不是冻结协议。
+本文记录两仓在该日的源码和验收快照，不将其定义为首个或永久版本锁；COMM-0 设计评审需由双方确认首个集成锁清单，随后每个实现 PR 都回填双方 commit SHA、所用平台 binary SHA-256 和验收结果。
+
+- Agent24 main 快照：[`bf3322cf`](https://github.com/iDoris-ai/Agent24/commit/bf3322cfc7674c1c57bd20eb159efdb2a42eb28a)。该版本 Rust CLI [main.rs](https://github.com/iDoris-ai/Agent24/blob/bf3322cfc7674c1c57bd20eb159efdb2a42eb28a/rust/apps/agent24-cli/src/main.rs) 仍没有身份、联系人、relay、消息或 outbox 通信子命令。Nostr bridge 仍通过子进程调用旧命名的 `agent-speaker`，`A24_SPEAKER_BIN` 默认值仍为 `agent-speaker`；见 [config.ts](https://github.com/iDoris-ai/Agent24/blob/bf3322cfc7674c1c57bd20eb159efdb2a42eb28a/packages/nostr-bridge/src/config.ts) 和 [speaker.ts](https://github.com/iDoris-ai/Agent24/blob/bf3322cfc7674c1c57bd20eb159efdb2a42eb28a/packages/nostr-bridge/src/speaker.ts)。
+- Hyphae CLI 联调候选快照：[`a4aa606e`](https://github.com/iDoris-ai/Hyphae/commit/a4aa606eb81d5c040d94c51cdf94553e646d8674)，Go 模块最低版本 1.26；本机 macOS arm64 以 Go 1.27.1 构建的验收 binary SHA-256 为 `bc30dcf7bcf8b5c1865a3e995518c2bdab224bd8d6a3a064c4d7fc780de5e2b7`，本机验收路径 `/Users/jason/.local/share/hyphae-pr-monitor/state/validation-artifacts/cli-integration-a4aa606/macos-arm64/hyphae`，其 `manifest.json` 记录来源、平台和 hash。该文件仅供这台机器联调，未安装到生产环境，也不是 release；Agent24 不应硬编码此路径，其他平台须分别构建并校验 hash。此候选可用于启动 CLI 联调，不表示双方已确认正式版本锁，也不冻结 T01 协议。
+- `a4aa606e` 的默认 Go tests、integration tests、vet 和 build 均已通过；CI [36738033201](https://github.com/iDoris-ai/Hyphae/actions/runs/36738033201) 在 Linux 与 macOS 成功。该快照的真实 CLI + relay 测试导入 125 条有效积压事件，首次产生 125 个新消息效果；daemon 重启后产生 0 个新效果。此证据验收的是 Hyphae 候选，不代替 Agent24 跨仓接线验收。
+- 加密 `profile publish --password-stdin` 已在 Hyphae [`6bd9e437`](https://github.com/iDoris-ai/Hyphae/commit/6bd9e4376bc1e76a47132d2a97fdd8faceaa1091) 合并（[#90](https://github.com/iDoris-ai/Hyphae/pull/90)）。任何使用此能力的 Agent24 实现 PR 都应锁定包含该提交的 Hyphae 版本并单独验收。
 
 ## 接线原则
 
 1. Agent24 建一个共享通信服务，让 CLI、bridge 和 UI 共用身份、配置、outbox 与 history；UI 不复制 Nostr、加密或重试实现。
-2. 第一阶段复用 Hyphae CLI，以参数数组启动固定路径的二进制，不拼 shell 字符串。兼容 `A24_SPEAKER_BIN`，新增设置应固定 binary 路径和版本，不能依赖 PATH 中偶然同名的程序。
-3. 产品运行时使用 Agent24 持有并显式指定的应用专用 HOME，不默认读取登录用户的全局 `~/.hyphae`。迁移既有用户身份须单独取得明确授权，不自动复制或复用。所有验收始终用临时 HOME 与合成身份，不访问生产身份。密码只通过独立 stdin 管道传 `--password-stdin` 并及时关闭；最多 4096 字节，只移除末尾一组 LF/CRLF，保留密码空格，不放 argv、日志或持久配置。
+2. 参考架构提案：通信服务放在 `agent24d`，提供 `/api/v1/comm/*` REST；`agent24 comm ...` CLI 和桌面 UI 共用该 REST。由 `agent24d` 作为子进程监管 Hyphae daemon。COMM-0 评审后再冻结架构。当前旧 bridge 使用 `agent-speaker` / `A24_SPEAKER_BIN`；迁移时改用 Hyphae 命名并保留旧变量兼容。调用以参数数组执行固定 binary 路径，不拼 shell 字符串或依赖 PATH 偶然同名程序；通过 SHA-256 校验 binary。
+3. Agent24 拟使用专用 HOME：`<state_dir>/comm/hyphae-home/`；旧 `~/.hyphae` 身份只经用户明确确认的显式 import 复制。生产密码由平台凭据库保管（macOS 钥匙串及其他平台对应凭据存储），只经独立 stdin 管道传 `--password-stdin` 并及时关闭；最多 4096 字节，只移除末尾一组 LF/CRLF，保留密码空格，不放 argv、日志或持久配置。所有验收始终用临时 HOME 与合成身份，不访问生产身份。
 4. JSON 成功从 stdout 读单一 `{"ok":true,"data":...}`；错误从 stderr 读 envelope 并保留退出码。即使发送非零退出，也解析错误 envelope 内的 `data`，因为事件可能已经入队或被 relay 接受。
 5. 状态分层显示：本地保存/待发、relay 接受、对端确认、执行结果不是同一状态。没有对端回执时不显示“已送达”；普通入站或旧消息不能因此触发 Agent run。
 
-## Hyphae 已有命令接口
+## Hyphae 命令接口快照
 
-以下是固定 main 的参数现状，属于 Hyphae 侧已有能力；不是 Agent24 现有命令。Agent24 的统一外层命令名需先讨论确认。
+以下是 Hyphae `a4aa606e` 的参数现状，属于 Hyphae 侧已有能力，不是 Agent24 当前命令。Agent24 外层命令名和 REST 路由需经 COMM-0 评审。
 
 | 能力 | Hyphae 参数与结果 |
 |---|---|
@@ -28,37 +31,37 @@
 | 发送 | `agent msg --from ID --to NPUB --content TEXT --json`；加密库追加 `--password-stdin`。结果包含 `event_id`、`published_to`、`queued_for_retry`、`history_stored` 等字段。 |
 | 收件/历史 | `agent inbox --as ID --limit N --json` 是有上限的单次 relay 查询；`history inbox --as ID --limit N --json` 读本地持久历史。一次 inbox 不是完整同步证明。 |
 | 待发队列 | `storage outbox list --json`、`storage outbox retry --id EVENT_ID --json`、`storage outbox clear --failed --yes --json`。clear 删除本地待发项，不撤回 relay 已接受事件；UI 清理前展示范围并确认。 |
-| Daemon | `daemon --identity ID --password-stdin --json` 是长驻进程；`--json` 仅用于结构化启动错误，运行期间 stdout/stderr 输出日志，没有 JSON 消息流或健康状态 API。Agent24 管理进程和日志；消息状态从 history/outbox 查询。 |
+| Daemon | `daemon --identity ID --password-stdin --notify=false --json` 是长驻进程；`--notify` 默认 `true`，Agent24 监管时须显式设为 `false`。`--json` 仅用于结构化启动错误，运行期间 stdout/stderr 输出日志，没有 JSON 消息流或健康状态 API。`hyphae --version` 当前输出 `hyphae version dev`，不能作为版本校验；用 binary SHA-256 校验。Agent24 管理进程和日志；消息状态从 history/outbox 查询。Hyphae release 可考虑用 ldflags 注入可追溯版本。 |
 
-源码入口：[身份/联系人](https://github.com/iDoris-ai/Hyphae/blob/1948aadc551e360176711f9c50172ed6edccd253/internal/identity/commands.go)、[relay](https://github.com/iDoris-ai/Hyphae/blob/1948aadc551e360176711f9c50172ed6edccd253/internal/nostr/relay.go)、[消息](https://github.com/iDoris-ai/Hyphae/blob/1948aadc551e360176711f9c50172ed6edccd253/internal/messaging/agent.go)、[history](https://github.com/iDoris-ai/Hyphae/blob/1948aadc551e360176711f9c50172ed6edccd253/internal/messaging/commands.go)、[outbox](https://github.com/iDoris-ai/Hyphae/blob/1948aadc551e360176711f9c50172ed6edccd253/internal/messaging/outbox_commands.go)、[daemon](https://github.com/iDoris-ai/Hyphae/blob/1948aadc551e360176711f9c50172ed6edccd253/internal/daemon/daemon.go)。
+源码入口：[身份/联系人](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/identity/commands.go)、[relay](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/nostr/relay.go)、[消息](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/messaging/agent.go)、[history](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/messaging/commands.go)、[outbox](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/messaging/outbox_commands.go)、[daemon](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/daemon/daemon.go)。
 
 发送或重试失败也可能带部分结果。需检查 `event_id`、`published_to`、`queued_for_retry`、`history_stored`、`superseded`、`queue_state_unknown`。relay 已接受而本地记账失败时，按原 `event_id` 核对，不创建新事件重发。重试用原签名 event ID；并发冲突或队列未知时先重新读取 outbox。
 
 Relay 配置和默认身份在命令/daemon 启动时读取。修改后由统一通信服务重启对应 daemon；不假设运行进程自动重配，也不改写旧待发事件记录的 relay。进程存活、relay 探测成功、历史补收完成分别表达。
 
-**Headless 注册限制：**Hyphae 固定验收 SHA `1948aadc` 和其 binary 中，`profile publish` 没有 `--password-stdin`。后续 PR [#90](https://github.com/iDoris-ai/Hyphae/pull/90) 已合并，但这不改变旧 SHA/binary 的能力。Agent24 若需要加密身份非交互注册，应固定包含 #90 的新 Hyphae SHA/binary 并单独验收后再承诺；不能为绕过旧版缺口创建未加密生产身份。
+**Headless 注册：**`profile publish --password-stdin` 已在 `6bd9e437` 合并。需要此能力的实现 PR 必须锁定包含它的 Hyphae SHA/binary，并对加密注册和密码 stdin 做独立验收。
 
 ## 分阶段交付建议
 
-下列 Agent24 命令只是候选名，待该仓确认后再冻结；目前 Rust CLI 没有这些通信命令。
+先单独评审并冻结 Agent24 COMM-0 架构与首个双方锁清单。下表 T20-A/T20-B/T21/T22 是 Hyphae 侧工作编号；Agent24 的 `COMM-*` 对应编号待 COMM-0 确认，不在本文猜测具体编号。每个实现 PR 与本文都应双向标注两套编号。以下外层命令仅为候选名；快照中的 Rust CLI 尚无这些通信命令。
 
-| 阶段 | 交付 | 通过条件 |
-|---|---|---|
-| T20-A | 固定 binary/config 与输出 envelope；身份、联系人、relay 管理。候选 `agent24 comm identity|contact|relay ...`。 | 实际子进程调用；公开 JSON 可解析；密码仅经 stdin；专用 HOME；配置可被后续命令读取；binary 缺失/版本不符有诊断。 |
-| T20-B | 发信、history、outbox、daemon 生命周期。候选 `agent24 comm send|inbox|history|outbox ...`。 | 本地真实 relay；断线重试使用同一 event ID/签名；保留部分错误结果；同 HOME 重启后历史稳定且无重复新消息效果；daemon 可停止。 |
-| T21 | 身份、联系人、relay 管理 UI。 | 复用 T20 通信服务、配置与状态；未连接时不伪装为健康。 |
-| T22 | 消息、history、待发及重试 UI。 | 区分本地入队、relay 接受和对端确认；队列未知/并发冲突先核对，不创建新事件重发。 |
+| Hyphae 编号 | Agent24 编号 | 交付 | 通过条件 |
+|---|---|---|---|
+| T20-A | COMM-*（待 COMM-0 确认） | 固定 binary/config 与输出 envelope；身份、联系人、relay 管理。候选 `agent24 comm identity|contact|relay ...`。 | 实际子进程调用；公开 JSON 可解析；密码仅经 stdin；专用 HOME；配置可被后续命令读取；binary 缺失或 SHA-256 校验失败时拒绝启动；`--version` 的 `dev` 输出不能替代 hash 校验。 |
+| T20-B | COMM-*（待 COMM-0 确认） | 发信、history、outbox、daemon 生命周期。候选 `agent24 comm send|inbox|history|outbox ...`。 | 本地真实 relay；断线重试使用同一 event ID/签名；保留部分错误结果；同 HOME 重启后历史稳定且无重复新消息效果；daemon 可停止。 |
+| T21 | COMM-*（待 COMM-0 确认） | 身份、联系人、relay 管理 UI。 | 复用 T20 通信服务、配置与状态；未连接时不伪装为健康。 |
+| T22 | COMM-*（待 COMM-0 确认） | 消息、history、待发及重试 UI。 | 区分本地入队、relay 接受和对端确认；队列未知/并发冲突先核对，不创建新事件重发。 |
 
 ## 必须独立验收的边界
 
 - 每个 T20/T21/T22 PR 固定 Agent24/Hyphae commit、binary 版本/hash、退出码和测试结果。Hyphae 验收用临时 HOME、合成身份、本地 relay；不得访问用户生产密钥、relay 数据或全局 `~/.hyphae`。
-- T20-B 至少复验真实 CLI + relay 断线重试原 event ID，以及 125 条离线积压、daemon 重启后行数不变/新消息效果为零。Agent24 侧另外用 spy/counter 证明 plain/query/F4/receipt 入站不启动 run；Hyphae 收件去重不等于 Agent24 执行去重。
-- 基础通信保持 zero-run：普通入站、旧 kind 30078 消息、query 和 response 不进入模型、模块或 run。T01-E 收口后再实施高层授权与持久化 request/run，然后进行四仓联调验收；不把这些功能混入 T20/T21/T22。
+- 首轮验收覆盖身份/contact/relay 管理、加密发送及 partial error、断线后按原 event ID 重试、history/outbox 查询、专用 HOME 下 daemon 启停，以及 125 条离线积压和重启后零重复新消息效果。Agent24 侧用 spy/counter 证明普通入站/query/receipt 不启动 run，并证明 F4b 已关闭且单一消费路径生效；Hyphae 收件去重不等于 Agent24 执行去重。
+- Agent24 现有 F4b 白名单入站 gated-run 路径由 Agent24 决定冻结：不再扩展并默认不启用；入站执行统一由 T01-E 收口后的高层授权路径承接，避免同一 `event_id` 被两条路径消费。本文记录的是方案决定，当前源码是否禁用及 single-consumer 保证仍需 Agent24 实现 PR 与 spy/counter 证据验证。基础通信保持 zero-run：普通入站、旧 kind 30078 消息、query 和 response 不进入模型、模块或 run。T01-E 收口后再实施高层授权与持久化 request/run，然后进行四仓联调验收；不把这些功能混入 T20/T21/T22。
 - iDoris 正式 provider/预算、Sin90 授权与 manifest 生命周期、AgentEar 语音各自独立推进，不属于本提案范围，也不由本提案记完成。
 
 ## 待 Agent24 确认
 
-1. 确认或调整 T20-A → T20-B → T21 → T22 拆分及外层命令名。
-2. 明确固定 Hyphae binary 的安装/更新责任、应用专用 HOME 布局和现有 `agent-speaker` bridge 的兼容迁移。
-3. 确认部分成功 envelope、daemon 生命周期及 headless 注册限制的产品呈现。
+1. 通过 COMM-0 单独评审冻结 REST/进程/HOME/凭据架构、首个双方版本锁清单，并确定 COMM-* 与 T20-A → T20-B → T21 → T22 的双向编号映射和外层命令名。
+2. 明确 Hyphae binary 的构建、跨平台 hash、安装/更新责任、应用专用 HOME、平台凭据库和 `agent-speaker` / `A24_SPEAKER_BIN` 兼容迁移。
+3. 确认部分成功 envelope、daemon 生命周期及 headless 注册的产品呈现；含 `profile publish --password-stdin` 的实现版本须独立验收。
 4. 每个实现 PR 回填双方 SHA、集成测试、CLI/UI 验收结果；分别记录 T01-E、iDoris provider、Sin90 授权和四仓状态。
