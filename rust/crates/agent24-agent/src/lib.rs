@@ -961,12 +961,6 @@ impl RunManager {
     /// content to feed the model, or `Err(())` when the decision was to abort the
     /// whole run.
     ///
-    /// KNOWN LIMITATION (fail-closed): an `approve_for_session` /
-    /// `approve_for_target` on a RESTORED approval executes this call but does
-    /// NOT re-mint the standing grant (that lives in the broker, gone with the
-    /// crashed process). The next matching call is simply asked again — safe,
-    /// just not maximally convenient. Recording it needs the broker handle wired
-    /// into the resume path, deferred.
     async fn settle_parked_call(
         &self,
         run: &Run,
@@ -989,6 +983,16 @@ impl RunManager {
                         ));
                     }
                 };
+                self.tools
+                    .settle_resumed(
+                        &call.name,
+                        &ctx,
+                        &approval.payload,
+                        &approval.id,
+                        &decision,
+                        approval.standing_target.as_deref(),
+                    )
+                    .await;
                 // Run EXACTLY what was approved — the payload the human signed
                 // off (assess_restore already proved it equals the thread's
                 // rebuilt input), so using it directly makes "run A, not B"
@@ -3117,8 +3121,8 @@ mod approval_tests {
     use super::tests::*;
     use super::*;
     use agent24_models::router::Tier;
-    use agent24_policy::{ApprovalBroker, BrokerGate};
-    use agent24_protocol::{ApprovalStatus, Decision};
+    use agent24_policy::{ApprovalBroker, ApprovalRequest, BrokerGate, Verdict};
+    use agent24_protocol::{ApprovalStatus, Decision, RiskClass};
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
@@ -3573,6 +3577,92 @@ mod approval_tests {
                 .iter()
                 .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_provider_1")),
             "no tool result was recorded for the resumed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_session_approval_replays_its_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        let now = now_iso8601();
+        h.store
+            .insert_session(&agent24_protocol::Session {
+                id: "sess_1".to_owned(),
+                title: "session".to_owned(),
+                channel: "desktop".to_owned(),
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "argv": ["/bin/echo", "resumed-output"] });
+        let mut run = run_in("run_1", RunStatus::AwaitingApproval);
+        run.session_id = Some("sess_1".to_owned());
+        h.store.insert_run(&run).await.unwrap();
+        h.store
+            .append_run_message(
+                "run_1",
+                "user",
+                Some("run echo"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let call = serde_json::json!([{ "id": "call_provider_1", "name": "shell_exec", "arguments": args.to_string() }]);
+        h.store
+            .append_run_message("run_1", "assistant", None, &call, None, &now_iso8601())
+            .await
+            .unwrap();
+        let mut approval = seed_approval(
+            "apr_1",
+            "run_1",
+            "tc_internal_1",
+            args.as_object().unwrap().clone(),
+        );
+        approval
+            .available_decisions
+            .insert(1, "approve_for_session".to_owned());
+        h.store.insert_approval(&approval).await.unwrap();
+
+        h.broker
+            .resolve("apr_1", decision("approve_for_session", None))
+            .await
+            .unwrap();
+        h.manager
+            .resume_run("run_1".to_owned(), "apr_1".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_terminal(&h.store, "run_1").await.status,
+            RunStatus::Completed
+        );
+
+        let approvals_before = h.store.list_approvals(None).await.unwrap().len();
+        let verdict = h
+            .broker
+            .request(
+                ApprovalRequest {
+                    run_id: "probe",
+                    session_id: Some("sess_1"),
+                    schedule_id: None,
+                    tool_call_id: "tc_probe",
+                    tool: "shell_exec",
+                    kind: "exec",
+                    risk: RiskClass::Exec,
+                    standing_target: None,
+                    summary: "probe".to_owned(),
+                    payload: serde_json::Map::new(),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(verdict, Verdict::Approved);
+        assert_eq!(
+            h.store.list_approvals(None).await.unwrap().len(),
+            approvals_before
         );
     }
 
