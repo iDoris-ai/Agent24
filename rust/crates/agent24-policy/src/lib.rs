@@ -787,9 +787,10 @@ impl ApprovalBroker {
             "abort" => ApprovalStatus::Aborted,
             other => return Err(ResolveError::Invalid(format!("unknown decision {other}"))),
         };
+        let now = now_iso8601();
         let resolved = self
             .store
-            .resolve_approval(id, status, Some(&decision), now_iso8601())
+            .resolve_approval_client_decision(id, status, &decision, &now)
             .await
             .map_err(|err| match err {
                 StoreError::Conflict(_) => ResolveError::AlreadyResolved(id.to_owned()),
@@ -1215,6 +1216,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ResolveError::AlreadyResolved(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn expired_pending_client_decision_is_rejected() {
+        let (broker, events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let id = "apr_expired";
+        store
+            .insert_approval(&Approval {
+                id: id.to_owned(),
+                run_id: "run_1".to_owned(),
+                tool_call_id: "tc_1".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "s".to_owned(),
+                payload: Map::new(),
+                available_decisions: vec!["approve".to_owned()],
+                standing_target: None,
+                status: ApprovalStatus::Pending,
+                decision: None,
+                expires_at: "2020-01-01T00:00:01Z".to_owned(),
+                created_at: "2020-01-01T00:00:00Z".to_owned(),
+                decided_at: None,
+            })
+            .await
+            .unwrap();
+        let resolved_before = events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "approval.resolved")
+            .count();
+        let err = broker
+            .resolve(id, decision("approve", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ResolveError::AlreadyResolved(_)), "{err}");
+        assert_eq!(
+            store.get_approval(id).await.unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
+        assert_eq!(
+            events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.as_str() == "approval.resolved")
+                .count(),
+            resolved_before
+        );
     }
 
     #[tokio::test]
