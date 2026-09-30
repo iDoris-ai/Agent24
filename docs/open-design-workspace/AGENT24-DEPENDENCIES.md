@@ -1,12 +1,12 @@
 # Agent24 主干依赖台账
 
-> 状态：P0 frozen / A24-OD-00 逐层合并（#228 等待重新批准）/ A24-OD-01 journal、registration writer 与 dormant transaction slices 进行中 / A24-OD-05 pipe、stdin-close、output worker 与 actor seam 分片进行中
+> 状态：P0 frozen / A24-OD-00 authority foundation 已进入主线 / A24-OD-01 root service 已形成 trusted resolve seam / A24-OD-02 run identity + admission + terminal/orphan authority 正在 stacked PR 中 / A24-OD-05 sidecar 栈继续独立推进
 >
-> 日期：2026-09-23
+> 日期：2026-09-29
 >
-> integration branch：`feat/open-design-workspace`
+> integration branch：`integration/open-design-main-sync-wave20@d62f65ad97c2c68a9ed8aff99407685b5046b28d`
 >
-> 已审计 Agent24 主干：`origin/main@bb6f62bad5e75fdf64a375bb4acaec50f1230683`（#253 merge）
+> 已审计 Agent24 主干：`origin/main@32072b02a3c7`；当前 integration 已包含该 head
 >
 > 2026-09-22 漂移复核：当时新增 #262/#341 仅涉及 T9/ME-3f 黑盒测试、`agent24d` 测试依赖与状态文档；未改变 workspace/store/sidecar 契约。`Cargo.lock` 的独立依赖增量需在最终 rebase 时保留。
 
@@ -83,9 +83,9 @@
 
 ### A24-OD-02 — Per-run workspace binding
 
-状态：`PLANNED`
+状态：`IN PROGRESS / IDENTITY + ADMISSION + TERMINAL RELEASE IMPLEMENTED / ORPHAN RECONCILIATION FINALIZING / RUNTIME UNWIRED`
 
-目标分支：`feat/a24-run-workspace-binding`
+当前 PR 栈：#556 → #558 → #559 → #560 → #561 → #562（#555 为前置 auth matrix）
 
 依赖：A24-OD-00、A24-OD-01
 
@@ -102,6 +102,17 @@
 - run、tool call、approval 与 workspace 可关联审计，但不向普通 UI 泄露宿主绝对路径。
 
 验收门禁：两个并行 run 使用不同 workspace 时互不可见；取消、失败和重启不会操作错误 workspace。
+
+当前实现证据：
+
+- #556 `540d64d`：Session/Run/RunInput typed nullable `workspace_id` + store/OpenAPI/TS parity；
+- #558 `f47697d`：trusted host root resolve seam，只在 host 内部返回 descriptor-pinned authority，不公开 raw root；
+- #559 `0ef62e0`：store-owned atomic admission + serial run lease + lazy expiry + strict reread；direct bypass fail closed；
+- #560 `8e361a7`：adversarial rollback proofs；
+- #561 `a88ca66`：normal terminal state + exact run-lease release 同事务；
+- #562 当前 `f6f809c`：startup workspace orphan reconciliation；no-history bound Run 改为 corruption/fail-closed。
+
+尚未满足的激活门禁：#561/#562 final review、RunManager admission wiring、startup restore/sweep ordering、不可伪造 WorkspaceHandle、ToolContext 与 fs/shell/explorer/subagent inheritance、approval/grant/event/audit workspace scoping。上述完成前不得进入 ACP/runtime product wiring。
 
 ### A24-OD-03 — `agent24 acp` bridge
 

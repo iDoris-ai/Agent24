@@ -1,5 +1,11 @@
 # Agent24 × Open Design 执行状态
 
+> 2026-09-29 路线修正：长期完整产品化目标不变；短期执行切换为 Prototype-First。暂停把完整 authority / recovery hardening 作为 Creative 正向链路的前置条件，优先使用 Open Design 现有 `od daemon start --serve-web` 嵌入面、现有 `acp-json-rpc` engine 和薄 `RuntimeAgentDef` 打通可演示 E2E。详见 [PROTOTYPE-FIRST-PLAN.md](PROTOTYPE-FIRST-PLAN.md)。
+>
+> 当日逐任务执行台账见 [PROGRESS-2026-09-29.md](PROGRESS-2026-09-29.md)。当前 M1-1 已完成：真实 `--serve-web`、health、Web UI root、graceful shutdown 均已本机正向验证。
+>
+> **2026-09-29 Prototype checkpoint:** M1–M4 happy path 已闭环并完成工程 exact-head closure；#565 WS fast-run subscription race 已在 `8f69683` 修复，并由 `fe4ae95` 补上 production-coupled regression，两次独立 exact-head review 与三平台 CI 均通过。真实 Agent24 Desktop 已嵌入 Open Design、选择 `Agent24 0.3.0` runtime，并在 Desktop 启动的同一 OD daemon 中完成两轮同 artifact v1→v2 更新。用户已授权继续 Prototype-First 的 M5–M10。
+
 > 更新：2026-09-23（Asia/Bangkok）
 
 ## 阶段门禁
@@ -233,6 +239,24 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - G1 六个 dirty allocation/retention worktree 同样全部 superseded：registration 三份 staged 草稿会重新公开 raw reservation API，已被 `460daae` 明确撤销；retention store/writer/plan 草稿已由 #467→#475→#480→#481→#484→#495/#497 的更强实现覆盖。当前 G1/G4 没有 unique-unfinished 本地改动需要补 PR。
 - 换机续接时以 GitHub PR/remote head 为 authority；本机保留的 superseded dirty worktree 仅作为历史草稿，不代表未上传工作。当前有效新施工点为 #517 → #519，文档 checkpoint 为 #518。
 - dependency roots 与产品完成度没有变化；没有越序 main merge，P2/P9 继续 `IN PROGRESS`。
+
+## 2026-09-29 Wave 20 — A24-OD-02 run authority checkpoint
+
+- 当前有效 Open Design 产品栈为 #555 → #556 → #558 → #559 → #560 → #561 → #562；#557 为独立 docs 台账。integration `d62f65a` 已包含当前 `origin/main@32072b0`，因此当前没有未同步的 main commit 阻塞该栈。
+- #555 冻结 attached route authority；#556 将 nullable typed `workspace_id` 贯穿 Session/Run 持久化与 protocol/OpenAPI/TS；#558 增加 trusted host root resolve seam，继续不公开 canonical root。
+- #559（`0ef62e0`）完成 dormant one-`BEGIN IMMEDIATE` run admission：Session/workspace exact binding、committed allocation/root consistency、lazy expiry、serial run lease、strict reread，并堵住 direct explicit-workspace `insert_run` bypass；两次 independent final-head review PASS。
+- #560（`8e361a7`）是 test-only adversarial follow-up，覆盖 lease-id collision 与 trigger mutation rollback；final exact-head review PASS。
+- #561（`a88ca66`）将 workspace-bound Completed/Failed/Cancelled 与 exact run-lease release 放进同一写事务，并让旧 bulk orphan sweep 不再触碰 bound Run；仍未接 RunManager。
+- #562 初始 `e7d5193` 的 “no lease history compatibility” 被重新判定过宽。2026-09-29 修复 head `f6f809c` 改为 fail closed：workspace-bound orphan 必须拥有唯一、可验证的 exact run-lease history；缺失 history 视为 corruption，不再猜测历史兼容。修复后 focused 1/1、store lib 216/216、strict clippy、fmt、diff-check 全绿；PR 总 diff 为 2 files / 212 additions。
+- runtime activation 已在后续 #566/#567 完成：#566 `0f553345` 增加 strict active run-lease rehydration；#567 `87b7630` 接入 explicit workspace atomic admission、exact terminal lease release 与 fail-closed startup restore/sweep。#567 exact diff 496 lines，已完成两次独立 exact-head FINAL PASS，CLA + Sidecar/Workspace-root 三平台 CI 全绿。M5 至此 COMPLETE；下一阶段 M6 才开始 WorkspaceHandle / ToolContext / fs-shell-explorer-subagent / approval-grant-event-audit isolation，仍禁止把 raw/canonical root 作为公共 authority。
+
+## 2026-09-29 本机施工现场清理
+
+- 已删除 9 个 Wave19 已确认 superseded 的 dirty G1/G4 worktree；这些草稿没有 unique unfinished 内容，正式远端栈已经覆盖其功能。
+- 对仍 OPEN 的 #440/#445/#458，仅删除 superseded dirty worktree，保留本地 branch ref 与远端 PR；没有删除 published PR branch。
+- 已删除 12 个对应已 MERGED PR（#523/#524/#526/#527/#528/#529/#532/#534/#540/#541/#543/#544）的 clean worktree/本地 branch，并删除两个已进入 integration ancestry、upstream 已 gone 的临时 propagation worktree/branch。
+- 另外删除已 MERGED #228/#260/#261 的三个 upstream-gone 本地 branch；`local/preview-v040` 仍绑定专用 preview worktree，因此暂不清理。
+- 同时执行 `git worktree prune` 清掉失效的 `/private/tmp/agent24-workspace-restack-wave4` 元数据。当前 worktree 数降至 45；现存 Open Design #555～#562 worktree 全部保留。
 
 ## A24-OD-00 小 PR 栈
 

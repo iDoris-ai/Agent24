@@ -1,5 +1,7 @@
 # Agent24 × Open Design 实施计划（已批准，执行中）
 
+> **2026-09-29 执行顺序修订：** 长期 P0–P9 架构目标保持不变，但实现改为 Prototype-First。先完成可演示的 Embedded Creative + `agent24 acp` + Open Design runtime adapter + workspace 正向 E2E，再逐步接入完整 authority / recovery / security。当前执行里程碑见 [PROTOTYPE-FIRST-PLAN.md](PROTOTYPE-FIRST-PLAN.md)。本文件继续作为长期产品化目标与最终验收标准。
+
 > 状态：Approved / P0 + A24-OD-00 + P1 gates passed / P2 in progress
 >
 > 日期：2026-09-19
