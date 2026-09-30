@@ -1,9 +1,14 @@
 import { useState, useEffect } from 'react'
 
+// Shape of one entry in `GET /api/v1/models`'s `models` array
+// (`agent24_protocol::Model`, `rust/crates/agent24-protocol/src/types.rs`):
+// `{ id, provider, tier, loaded }`. Mirrors how `App.tsx`'s
+// `extractDaemonDefaultModel` reads the same endpoint's `default_model`.
 interface OmlxModel {
   id: string
-  engine?: string
-  status?: string
+  provider?: string
+  tier?: string
+  loaded?: boolean
 }
 
 const STATIC_MODELS = [
@@ -19,7 +24,7 @@ const STATIC_MODELS = [
 ]
 
 function statusDot(model: OmlxModel) {
-  const loaded = model.engine === 'loaded' || model.status === 'loaded'
+  const loaded = model.loaded === true
   const color = loaded ? '#4caf50' : '#888'
   const title = loaded ? '已加载' : '未加载'
   return <span title={title} style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: color, marginRight: 6 }} />
@@ -30,9 +35,15 @@ export default function ModelsPage() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    void window.agent24.backendProxy({ method: 'GET', path: '/api/llm/models' })
+    // AUDIT-1: the daemon's real route is `/api/v1/models`, returning
+    // `{ models: Model[], default_model: string | null }` (`routes.rs`
+    // `get_models`) — not a bare array at `/api/llm/models` (404, doesn't
+    // exist). Same endpoint the topbar (`App.tsx`) already polls.
+    void window.agent24.backendProxy({ method: 'GET', path: '/api/v1/models' })
       .then((res) => {
-        if (res.ok && Array.isArray(res.data)) setLiveModels(res.data as OmlxModel[])
+        if (!res.ok) return
+        const data = res.data as { models?: unknown } | null
+        if (Array.isArray(data?.models)) setLiveModels(data.models as OmlxModel[])
       })
       .catch(() => {/* oMLX not running */})
       .finally(() => setLoading(false))
@@ -60,7 +71,7 @@ export default function ModelsPage() {
                 {statusDot(m)}
                 <span style={{ fontFamily: 'monospace', fontSize: 11 }}>{m.id}</span>
                 <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--muted)' }}>
-                  {m.engine === 'loaded' || m.status === 'loaded' ? '已加载' : '未加载'}
+                  {m.loaded === true ? '已加载' : '未加载'}
                 </span>
               </div>
             ))}
