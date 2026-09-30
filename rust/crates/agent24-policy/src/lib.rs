@@ -136,6 +136,30 @@ fn grant_scope<'a>(
     session_id.map(|id| ("session", id))
 }
 
+fn grant_ctx(
+    run_id: &str,
+    session_id: Option<&str>,
+    schedule_id: Option<&str>,
+    tool: &str,
+    risk: RiskClass,
+    standing_target: Option<&str>,
+) -> GrantCtx {
+    let scope = session_id.unwrap_or(run_id).to_owned();
+    let durable_scope = grant_scope(session_id, schedule_id);
+    let target = risk
+        .standing_grant_eligible()
+        .then_some(standing_target)
+        .flatten()
+        .filter(|_| durable_scope.is_some());
+    GrantCtx {
+        scope,
+        tool: tool.to_owned(),
+        scope_kind: durable_scope.map(|(kind, _)| kind),
+        scope_id: durable_scope.map(|(_, id)| id.to_owned()),
+        target: target.map(str::to_owned),
+    }
+}
+
 pub struct ApprovalBroker {
     store: Store,
     emit: Arc<dyn Fn(EventBody) + Send + Sync>,
@@ -229,24 +253,14 @@ impl ApprovalBroker {
             summary,
             payload,
         } = req;
-        let scope = session_id.unwrap_or(run_id).to_owned();
         // A target-scoped grant is only offerable when there is something
         // durable to hang it on. A transient run's id never recurs, so a grant
         // scoped to it could never match again — offering it would be a button
         // that silently does nothing.
+        let grant_ctx = grant_ctx(run_id, session_id, schedule_id, tool, risk, standing_target);
+        let scope = grant_ctx.scope.clone();
         let grant_scope = grant_scope(session_id, schedule_id);
-        let offer_target = risk
-            .standing_grant_eligible()
-            .then_some(standing_target)
-            .flatten()
-            .filter(|_| grant_scope.is_some());
-        let grant_ctx = GrantCtx {
-            scope: scope.clone(),
-            tool: tool.to_owned(),
-            scope_kind: grant_scope.map(|(k, _)| k),
-            scope_id: grant_scope.map(|(_, id)| id.to_owned()),
-            target: offer_target.map(str::to_owned),
-        };
+        let offer_target = grant_ctx.target.as_deref();
 
         // Standing grant (H4): persistent, and matched on the EXACT target.
         if let (Some((kind_s, id)), Some(target)) = (grant_scope, offer_target) {
@@ -807,6 +821,38 @@ impl BrokerGate {
 
 #[async_trait]
 impl ApprovalGate for BrokerGate {
+    async fn settle_resumed(
+        &self,
+        approval_id: &str,
+        decision: &Decision,
+        info: &agent24_protocol::ToolInfo,
+        ctx: &ToolContext,
+        standing_target: Option<&str>,
+    ) {
+        let eligible = match decision.kind.as_str() {
+            "approve_for_session" => !info.risk_class.standing_grant_eligible(),
+            "approve_for_target" => {
+                info.risk_class.standing_grant_eligible() && standing_target.is_some()
+            }
+            _ => false,
+        };
+        if !eligible {
+            return;
+        }
+        let grant_ctx = grant_ctx(
+            ctx.run_id(),
+            ctx.session_id(),
+            ctx.schedule_id(),
+            &info.name,
+            info.risk_class,
+            standing_target,
+        );
+        let _ = self
+            .broker
+            .apply_decision(approval_id, &grant_ctx, decision.clone())
+            .await;
+    }
+
     async fn check_plan(
         &self,
         run_id: &str,
@@ -1699,6 +1745,35 @@ mod tests {
             .unwrap();
         assert_eq!(approval.status, ApprovalStatus::Approved);
         assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+        assert!(
+            store
+                .standing_grant_exists("schedule", "sch_1", "mcp_slack_post", "#ops")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_target_decision_replays_the_exact_grant() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        let gate = BrokerGate::new(Arc::clone(&broker));
+        let ctx = ToolContext::legacy("run_1", None, Some("sch_1".to_owned()), "tc_1");
+        let info = agent24_protocol::ToolInfo::new(
+            "mcp_slack_post".to_owned(),
+            "mcp".to_owned(),
+            "post".to_owned(),
+            RiskClass::External,
+        );
+
+        gate.settle_resumed(
+            "apr_1",
+            &decision("approve_for_target", None),
+            &info,
+            &ctx,
+            Some("#ops"),
+        )
+        .await;
+
         assert!(
             store
                 .standing_grant_exists("schedule", "sch_1", "mcp_slack_post", "#ops")
