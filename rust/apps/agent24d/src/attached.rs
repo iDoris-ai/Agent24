@@ -331,8 +331,7 @@ impl AttachedStore {
         // this function then has to decide whether to report as failed.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            if let Err(e) = chmod_hook(&tmp) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(format!("cannot chmod {}: {e}", tmp.display()));
             }
@@ -381,6 +380,34 @@ impl AttachedStore {
         }
         Ok(())
     }
+}
+
+/// Chmods the temp file to `0600` in [`AttachedStore::write_atomically`],
+/// strictly BEFORE the rename — this step landing an `Err` must leave the OLD
+/// record at `path` untouched (see that function's doc comment). A separate
+/// function only so a test can force this exact step to fail without needing
+/// a real permission-denied filesystem — in a non-test build this is exactly
+/// `std::fs::set_permissions`.
+#[cfg(unix)]
+fn chmod_hook(tmp: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        // Keyed off the directory NAME, same mechanism (and same reason —
+        // no shared mutable flag racing other tests' parallel
+        // `write_atomically` calls) as [`dir_fsync_hook`] below.
+        if tmp
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("inject-chmod-failure"))
+        {
+            return Err(std::io::Error::other(
+                "injected failure for a_chmod_failure_before_rename_leaves_old_content_on_disk",
+            ));
+        }
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600))
 }
 
 /// Opens `parent` for the post-rename directory fsync in [`AttachedStore::write_atomically`].
@@ -1374,5 +1401,72 @@ mod tests {
         // directory must behave the same way — not a one-shot fluke.
         let rotated = register(&path, &m, false, |_| false, |_| {});
         assert!(rotated.is_ok(), "{rotated:?}");
+    }
+
+    /// Review: Codex A3 follow-up's reverse mutation — moving the chmod back
+    /// to AFTER the rename (the OLD, buggy order this file's own doc comment
+    /// on `write_atomically` describes) made none of this file's 23 tests
+    /// fail, because nothing exercised the chmod step specifically. This
+    /// test forces THAT exact step to fail (via [`chmod_hook`]'s test-only
+    /// injection point, keyed off the directory name, same mechanism as
+    /// [`dir_fsync_hook`]) and asserts the fixed behaviour: the write
+    /// reports `Err`, and — because chmod runs on the TEMP file strictly
+    /// BEFORE the rename — the OLD content at `path` is completely
+    /// untouched (the rename that would have published the new content
+    /// never ran). Confirmed red under the reverse mutation (chmod moved
+    /// back to after the rename): `path` then held the NEW content instead
+    /// of the old one this test asserts stays in place.
+    #[test]
+    fn a_chmod_failure_before_rename_leaves_old_content_in_place() {
+        static COUNTER3: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER3.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "a24-attached-test-inject-chmod-failure-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("attached.json");
+
+        // Seed the "old content" directly on disk — `write_atomically` in
+        // THIS directory always fails at the injected chmod step below, so
+        // the seed has to land without going through it.
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            "agentear".to_owned(),
+            AttachedRecord {
+                manifest_yaml: manifest("agentear", None, &["events"]),
+                manifest_digest: "sha256:seed".to_owned(),
+                token_sha256: "seedhash".to_owned(),
+                token_id: "tok_seed0000".to_owned(),
+                created_at: "2020-01-01T00:00:00Z".to_owned(),
+                disabled: false,
+            },
+        );
+        let seed = AttachedStore {
+            version: 1,
+            modules,
+            revoked: BTreeMap::new(),
+        };
+        let old_body = serde_json::to_string_pretty(&seed).unwrap() + "\n";
+        std::fs::write(&path, &old_body).unwrap();
+
+        // Same manifest facts as the seed (no relax) — this must reach
+        // `write_atomically` rather than bailing out earlier on
+        // `RelaxRequiresConfirmation`.
+        let m = manifest("agentear", None, &["events"]);
+        let outcome = register(&path, &m, false, |_| false, |_| {});
+        assert!(
+            outcome.is_err(),
+            "a chmod failure on the temp file, strictly BEFORE the rename, must fail the \
+             whole write: {outcome:?}"
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, old_body,
+            "chmod runs on the TEMP file before the rename — a failure there must leave the \
+             OLD content at `path` completely untouched, since the rename that would publish \
+             the new content never ran"
+        );
     }
 }

@@ -882,6 +882,44 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A3-2b / Codex A3 follow-up (design §5.5): fills `cell` with `registry`,
+/// then immediately re-checks `cancel`, revoking every live generation if a
+/// shutdown raced ahead of the fill.
+///
+/// `serve`'s `stopping` task checks `cell` (a `OnceLock<Arc<AttachRegistry>>`)
+/// exactly ONCE, the instant shutdown is requested, and only calls
+/// `revoke_all()` if it finds the cell already filled. If shutdown instead
+/// races ahead of the fill — `stopping`'s single check runs, finds the cell
+/// empty, and gives up — nothing else would ever call `revoke_all()` for
+/// that daemon: the fill that follows a moment later would be the LAST thing
+/// to ever touch the registry, leaving its live generations/tokens (none
+/// yet, this early, but hydration just before the fill may already have
+/// populated `entries` with disk-registered modules) "live" forever, and the
+/// attach listener started just after would keep accepting/handshaking
+/// connections for a daemon that is meant to be going away. Re-checking
+/// `cancel` immediately after the fill catches exactly that ordering.
+/// `revoke_all()` is idempotent (see its own doc), so calling it here is a
+/// harmless no-op on the OTHER ordering, where `stopping`'s own check
+/// already found the cell filled and revoked everything itself — between the
+/// two checks, every interleaving of "shutdown requested" vs "cell filled"
+/// is covered by exactly one of them.
+///
+/// A free function — not inlined into `serve` — so the two
+/// `stopping`-task-races-the-fill regression tests in this file's `tests`
+/// module call this SAME code, instead of re-describing the logic next to
+/// it (a reverse mutation removing the re-check below must turn those tests
+/// red; see their doc comments).
+fn fill_attach_registry_and_recheck(
+    cell: &std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
+    registry: &Arc<crate::attach_registry::AttachRegistry>,
+    cancel: &CancellationToken,
+) {
+    let _ = cell.set(Arc::clone(registry));
+    if cancel.is_cancelled() {
+        registry.revoke_all();
+    }
+}
+
 pub async fn serve(
     port: u16,
     ephemeral: bool,
@@ -1624,27 +1662,10 @@ pub async fn serve(
             tracing::error!("could not hydrate the attach registry from {path:?}: {e}");
         }
         // Filled before the listener starts (see the cell's own comment
-        // above): the `stopping` task's `revoke_all` can now find it.
-        let _ = attach_registry_cell.set(Arc::clone(&state.attach_registry));
-        // Review (Codex A3 follow-up): the `stopping` task (spawned way
-        // above, before this cell existed) checks this `OnceLock` EXACTLY
-        // ONCE, the instant `cancel` fires. If a shutdown request raced
-        // ahead of this point in startup — `stopping` already ran its single
-        // check and found the cell empty, so it skipped `revoke_all()` — the
-        // fill above is the LAST thing that will ever touch this registry:
-        // nothing else calls `revoke_all()`, so its live generations/tokens
-        // (none yet, this early, but hydration above may already have
-        // populated `entries` with disk-registered modules) would stay
-        // "live" forever from the registry's point of view, and the attach
-        // listener started just below would keep accepting/handshaking
-        // connections for a daemon that is meant to be going away. Re-check
-        // `cancel` immediately after the fill and catch that ordering here —
-        // `revoke_all()` is idempotent (see its own doc), so this is a
-        // harmless no-op on the OTHER ordering, where `stopping`'s own check
-        // already found the cell filled and revoked everything itself.
-        if cancel.is_cancelled() {
-            state.attach_registry.revoke_all();
-        }
+        // above): the `stopping` task's `revoke_all` can now find it. See
+        // [`fill_attach_registry_and_recheck`]'s own doc comment for why the
+        // fill is immediately followed by a re-check of `cancel`.
+        fill_attach_registry_and_recheck(&attach_registry_cell, &state.attach_registry, &cancel);
         if let Some(path) = crate::attached::socket_path() {
             tokio::spawn(crate::attach_listener::run(
                 Arc::clone(&state.attach_registry),
@@ -3274,21 +3295,25 @@ pub(crate) mod tests {
     // `serve`'s `stopping` task checks `attach_registry_cell` (a
     // `OnceLock<Arc<AttachRegistry>>`) exactly ONCE, the instant shutdown is
     // requested, and only calls `revoke_all()` if it finds the cell already
-    // filled. If shutdown races ahead of the fill (`stopping`'s check runs,
-    // finds the cell empty, and gives up), NOTHING ELSE in the old code ever
-    // called `revoke_all()` for that daemon — the fill that follows a moment
-    // later was the last thing to ever touch the registry. The fix adds a
-    // second check, right after the fill, that catches exactly this
-    // ordering (see that call site's own comment for the full argument).
-    // Both tests below reproduce the two-step pattern verbatim against a
-    // REAL `AttachRegistry` (via `state()`) — driving the entire `serve()`
-    // startup through this precise interleaving would need to win an actual
-    // OS-scheduling race, which cannot be made deterministic for CI.
+    // filled. `serve` itself fills the cell and re-checks `cancel` right
+    // after via [`fill_attach_registry_and_recheck`] — both tests below call
+    // THAT function directly (not a re-implementation of it) against a REAL
+    // `AttachRegistry` (via `state()`), driving it through both possible
+    // interleavings with `stopping`'s own one-shot check. Driving the entire
+    // `serve()` startup through this precise interleaving would need to win
+    // an actual OS-scheduling race, which cannot be made deterministic for
+    // CI; calling the extracted function directly is what makes a reverse
+    // mutation of it (deleting the re-check) turn these tests red — see
+    // each test's own doc comment.
 
     /// The bug: shutdown requested before the registry is ever filled into
     /// the cell. Without the fix, `registry.is_closed()` would stay `false`
     /// forever — the attach listener would keep accepting and handshaking
-    /// connections for a daemon that is meant to be going away.
+    /// connections for a daemon that is meant to be going away. Confirmed
+    /// red under the reverse mutation (deleting the `if cancel.is_cancelled()
+    /// { registry.revoke_all(); }` re-check inside
+    /// `fill_attach_registry_and_recheck`): `registry.is_closed()` stayed
+    /// `false` at the final assertion.
     #[tokio::test]
     async fn a_shutdown_that_races_ahead_of_the_registry_fill_is_still_revoked() {
         let state = state().await;
@@ -3308,11 +3333,9 @@ pub(crate) mod tests {
             "sanity check on the test itself: the premature check must find nothing to revoke"
         );
 
-        // The startup fill, immediately followed by the FIXED re-check.
-        let _ = cell.set(Arc::clone(&registry));
-        if cancel.is_cancelled() {
-            registry.revoke_all();
-        }
+        // The startup fill, immediately followed by the FIXED re-check —
+        // the actual production function, not a copy of its body.
+        fill_attach_registry_and_recheck(&cell, &registry, &cancel);
 
         assert!(
             registry.is_closed(),
@@ -3321,10 +3344,10 @@ pub(crate) mod tests {
     }
 
     /// The ordinary ordering, as a control: the fill happens first, well
-    /// before any shutdown, and `stopping`'s own check (not the new
-    /// re-check) is what revokes it. The re-check the fix adds is then a
-    /// harmless no-op — `revoke_all` is idempotent, and `cancel` is not yet
-    /// cancelled at the point the re-check runs.
+    /// before any shutdown, and `stopping`'s own check (not the re-check
+    /// inside `fill_attach_registry_and_recheck`) is what revokes it. That
+    /// re-check is then a harmless no-op — `revoke_all` is idempotent, and
+    /// `cancel` is not yet cancelled at the point the re-check runs.
     #[tokio::test]
     async fn the_ordinary_ordering_the_stopping_tasks_own_check_still_revokes() {
         let state = state().await;
@@ -3333,11 +3356,8 @@ pub(crate) mod tests {
         let cell: std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>> =
             std::sync::OnceLock::new();
 
-        let _ = cell.set(Arc::clone(&registry));
         assert!(!cancel.is_cancelled());
-        if cancel.is_cancelled() {
-            registry.revoke_all();
-        }
+        fill_attach_registry_and_recheck(&cell, &registry, &cancel);
         assert!(
             !registry.is_closed(),
             "no shutdown requested yet — the re-check must not revoke early"
