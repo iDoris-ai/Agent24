@@ -243,15 +243,46 @@ impl AttachedStore {
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
         if raw.trim().is_empty() {
-            return Ok(Self::default());
+            // A malformed-file error, not the missing-file default (review:
+            // Codex A3 follow-up): an EMPTY-but-present `attached.json` is
+            // exactly as dangerous to read as `{ not json` — both are almost
+            // certainly a truncated or half-written file (a crash mid-write
+            // that landed before `write_atomically`'s `rename` ever
+            // published new content at this path, or an external `> file`
+            // truncation) — never a daemon-written "no registrations" state:
+            // this module never writes an empty file on purpose (`register`
+            // always writes a full store; nothing else ever creates this
+            // path). Defaulting here would silently treat every currently
+            // registered module as gone.
+            return Err(format!(
+                "{} exists but is empty — refusing to treat that as an empty registry (a \
+                 truncated or half-written file could otherwise silently drop every \
+                 registration)",
+                path.display()
+            ));
         }
         serde_json::from_str(&raw).map_err(|e| format!("{} is not valid: {e}", path.display()))
     }
 
     /// Caller must hold [`ConfigLock`]. Same temp-file-plus-rename shape as
-    /// `os_config::OsConfig::write_atomically`, with one addition: the temp
+    /// `os_config::OsConfig::write_atomically`, with two additions: the temp
     /// file (and therefore the file it is renamed onto) is created `0600` —
-    /// this file holds token hashes, `os.json` holds none (§3.3).
+    /// this file holds token hashes, `os.json` holds none (§3.3) — and the
+    /// permission fixup runs on the TEMP file, BEFORE the rename, not after
+    /// (review: Codex A3 follow-up). The old order was `rename` → chmod →
+    /// fsync(dir): once `rename` lands, the new record is already the live,
+    /// externally-visible one — but if the chmod or the directory fsync that
+    /// followed it then failed, this function still returned `Err`, and
+    /// every caller (`register`/`revoke`/`set_disabled`) treats an `Err` as
+    /// "nothing committed" and skips `on_commit` — which is what tells
+    /// `crate::attach_registry` to revoke the old live generation/token. The
+    /// result: a `DELETE`, rotate, or `disable` whose write hit that failure
+    /// window left the OLD token still accepted by the live registry forever
+    /// (retrying the request does not help — the SAME write already
+    /// succeeded on disk, so a retry just repeats the same post-rename
+    /// failure). Doing the chmod on the temp file, before the rename, removes
+    /// one whole failure class from the post-rename window entirely; the
+    /// directory fsync that is left is downgraded to best-effort below.
     fn write_atomically(&self, path: &Path, parent: &Path) -> Result<(), String> {
         use std::io::Write;
 
@@ -289,34 +320,94 @@ impl AttachedStore {
             return Err(format!("cannot write {}: {e}", tmp.display()));
         }
 
+        // Belt-and-braces against a permissive umask, on the TEMP file and
+        // BEFORE the rename: `create_new` above already asked for 0600, but
+        // the mode passed to `open` is masked by the process umask before the
+        // OS applies it, so a umask like 0022 would otherwise leave the file
+        // group/world readable. Fixing it here — before anything is visible
+        // at `path` — means a failure at this step leaves the OLD record at
+        // `path` completely untouched (just an orphaned, still-0600 temp
+        // file to clean up), instead of a successfully-replaced record that
+        // this function then has to decide whether to report as failed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("cannot chmod {}: {e}", tmp.display()));
+            }
+        }
+
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(format!("cannot replace {}: {e}", path.display()));
         }
-        // Belt-and-braces against a permissive umask: `create_new` above
-        // already asked for 0600, but the mode passed to `open` is masked by
-        // the process umask before the OS applies it, so a umask like 0022
-        // still leaves the file group/world readable unless it is set again
-        // explicitly here.
+        // Past this point the new record is already durable-enough and
+        // externally visible — `rename` is atomic, and any reader (including
+        // this same process's own next `load`) now sees the NEW content. A
+        // directory-fsync failure from here on must not be reported as `Err`:
+        // a caller that saw `Err` would assume the OLD record/token is still
+        // the live one and skip its own `on_commit` (see this function's own
+        // doc), which is now WRONG — the replacement already happened. Best
+        // effort only: log and return `Ok`. The residual risk this accepts
+        // (a crash between the `rename` and the next fsync of this directory
+        // could still lose the directory entry pointing at the new inode on
+        // some filesystems/power-loss scenarios) is the same one every
+        // temp-file-plus-rename scheme already accepts between an
+        // application-level "success" and the next `fsync`; it is not made
+        // any worse by reporting success here instead of a misleading error.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("written, but cannot chmod {}: {e}", path.display()))?;
-        }
-        #[cfg(unix)]
-        {
-            let dir = std::fs::File::open(parent).map_err(|e| {
-                format!(
-                    "written, but cannot open {} to fsync it: {e}",
-                    parent.display()
-                )
-            })?;
-            dir.sync_all()
-                .map_err(|e| format!("written, but fsync of {} failed: {e}", parent.display()))?;
+            match dir_fsync_hook(parent) {
+                Ok(dir) => {
+                    if let Err(e) = dir.sync_all() {
+                        tracing::warn!(
+                            "wrote {} (already live), but fsync of {} failed: {e} — a crash \
+                             before the next fsync of that directory could still lose the \
+                             directory entry",
+                            path.display(),
+                            parent.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "wrote {} (already live), but cannot open {} to fsync it: {e}",
+                        path.display(),
+                        parent.display()
+                    );
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Opens `parent` for the post-rename directory fsync in [`AttachedStore::write_atomically`].
+/// A separate function only so a test can force the fsync step to fail
+/// without needing a real read-only/unwritable directory (which `sync_all`
+/// on an already-open, read-only-opened `File` does not reliably fail on
+/// every platform/filesystem) — in a non-test build this is exactly
+/// `std::fs::File::open`.
+#[cfg(unix)]
+fn dir_fsync_hook(parent: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(test)]
+    {
+        // Keyed off the directory NAME rather than a global/thread-local flag
+        // (review: a shared mutable flag would race other tests' parallel
+        // `write_atomically` calls in the same process) — see the regression
+        // test using it for the full argument.
+        if parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("inject-dir-fsync-failure"))
+        {
+            return Err(std::io::Error::other(
+                "injected failure for a_directory_fsync_failure_after_rename_is_not_fatal",
+            ));
+        }
+    }
+    std::fs::File::open(parent)
 }
 
 fn hash_token_hex(token: &str) -> String {
@@ -1002,6 +1093,33 @@ mod tests {
         assert!(register(&path, &manifest("x", None, &[]), false, |_| false, |_| {}).is_err());
     }
 
+    /// Review: Codex A3 follow-up — an EMPTY (but present) `attached.json`
+    /// used to be read back as `Self::default()`, the same as a genuinely
+    /// missing file (`a_missing_file_is_an_empty_registry` above). Nothing in
+    /// this module ever writes an empty file on purpose, so a present-but-
+    /// empty file can only mean a crash or truncation caught it mid-write —
+    /// exactly the "never silently lose a registration" case
+    /// `AttachedStore::load`'s own doc already promises for a malformed file,
+    /// which this test extends to the empty case specifically (it used to be
+    /// the ONE case handled differently from `{ not json`, above).
+    #[test]
+    fn an_empty_but_present_file_is_an_error_not_a_silent_empty_registry() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        std::fs::write(&path, "").unwrap();
+        assert!(
+            list(&path).is_err(),
+            "an empty file must be refused, exactly like a malformed one — never silently read \
+             back as an empty registry"
+        );
+        assert!(register(&path, &manifest("x", None, &[]), false, |_| false, |_| {}).is_err());
+
+        // Whitespace-only must be refused the same way — `load`'s check is
+        // `raw.trim().is_empty()`, not a literal zero-byte-file check.
+        std::fs::write(&path, "   \n\t\n").unwrap();
+        assert!(list(&path).is_err());
+    }
+
     #[test]
     fn concurrent_registrations_do_not_lose_an_update() {
         // Same property `os_config.rs` proves for `os.json`: without the file
@@ -1212,5 +1330,49 @@ mod tests {
             "the unparseable record must be skipped, not turn the whole call into Err — and \
              the still-good record must still load"
         );
+    }
+
+    /// Review: Codex A3 follow-up. Before the fix, `write_atomically` ran
+    /// `rename` FIRST and the directory fsync AFTER — and propagated a
+    /// failure from that fsync as `Err`, even though the `rename` had
+    /// already made the new record the live one on disk. A caller
+    /// (`register`/`revoke`/`set_disabled`) that sees `Err` skips its own
+    /// `on_commit`, which is what tells `crate::attach_registry` to revoke
+    /// the module's old live generation/token — so a directory-fsync hiccup
+    /// during a `DELETE`, rotate, or `disable` left the OLD token still
+    /// accepted by the live (in-memory) registry forever, with no way for a
+    /// retry to fix it (the retry hits the exact same already-succeeded
+    /// write). This test forces that exact fsync to fail (via
+    /// [`dir_fsync_hook`]'s test-only injection point, keyed off the
+    /// directory name) and asserts the fixed behaviour: the write still
+    /// reports `Ok`, and the new record is the one on disk — a directory
+    /// fsync is best-effort once the rename has already published the
+    /// content.
+    #[test]
+    fn a_directory_fsync_failure_after_rename_is_not_fatal() {
+        static COUNTER2: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER2.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "a24-attached-test-inject-dir-fsync-failure-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("attached.json");
+
+        let m = manifest("agentear", None, &["events"]);
+        let outcome = register(&path, &m, false, |_| false, |_| {});
+        assert!(
+            outcome.is_ok(),
+            "a directory-fsync failure strictly AFTER the rename must not fail the whole \
+             write — the new record is already live on disk by then: {outcome:?}"
+        );
+        let views = list(&path).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].name, "agentear");
+
+        // A second write (rotate) on the same always-injected-failure
+        // directory must behave the same way — not a one-shot fluke.
+        let rotated = register(&path, &m, false, |_| false, |_| {});
+        assert!(rotated.is_ok(), "{rotated:?}");
     }
 }
