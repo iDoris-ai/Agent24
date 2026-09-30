@@ -84,7 +84,7 @@ merge commits. Do not rebase or force-push published Open Design branches.
 ### Track B — Small landing PRs into `main`
 
 Do **not** wait until the complete Open Design program is finished and then
-open one large `integration/open-design-product -> main` PR.
+open one large integration-branch-to-`main` PR.
 
 Instead, once a slice has passed its exact-head review and CI, create a clean
 landing branch from the latest `main`, bring over only that slice's reviewed
