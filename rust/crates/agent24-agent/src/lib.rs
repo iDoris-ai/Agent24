@@ -742,7 +742,22 @@ impl RunManager {
                 // The executor lands the transition asynchronously (<1s)
             }
             None => {
-                self.finish_cancelled(id).await;
+                if run.workspace_id.is_some() {
+                    let ended_at = workspace_now()?;
+                    let ended_at = WorkspaceInstant::parse(&ended_at)?;
+                    if matches!(
+                        self.store
+                            .cancel_workspace_run_recovery(id, &ended_at)
+                            .await?,
+                        RunTerminalTransition::Applied(_)
+                    ) {
+                        self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
+                            run_id: id.to_owned(),
+                        }));
+                    }
+                } else {
+                    self.finish_cancelled(id).await;
+                }
             }
         }
         self.store
@@ -2612,6 +2627,133 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert!(released.is_some());
+    }
+
+    #[tokio::test]
+    async fn tokenless_workspace_cancel_recovers_active_released_and_missing_lease() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        for mode in 0..4 {
+            let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
+            seed_workspace(&store, WORKSPACE_ID).await;
+            let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+            store
+                .insert_session(&agent24_protocol::Session {
+                    id: "bound".into(),
+                    title: "bound".into(),
+                    channel: "desktop".into(),
+                    workspace_id: Some(workspace_id.clone()),
+                    created_at: "2026-09-29T00:00:00.000Z".into(),
+                    updated_at: "2026-09-29T00:00:00.000Z".into(),
+                })
+                .await
+                .unwrap();
+            let created_at = workspace_timestamp(now_iso8601());
+            let run = Run {
+                id: format!("run_{}", ulid()),
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id.clone()),
+                status: RunStatus::Queued,
+                input: RunInput {
+                    prompt: "stale".into(),
+                    workspace_id: Some(workspace_id),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: created_at.clone(),
+                started_at: None,
+                ended_at: None,
+            };
+            let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid())).unwrap();
+            assert!(matches!(
+                store
+                    .insert_run_with_workspace_admission(
+                        &run,
+                        Some(lease_id.clone()),
+                        &WorkspaceInstant::parse(&created_at).unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                RunAdmission::Admitted { lease_id: Some(_) }
+            ));
+            store
+                .transition_run(
+                    &run.id,
+                    RunStatus::Running,
+                    RunPatch {
+                        started_at: Some(created_at.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            if mode == 1 {
+                sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?")
+                    .bind(&created_at)
+                    .bind(lease_id.as_str())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            } else if mode == 2 {
+                sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?")
+                    .bind(lease_id.as_str())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            } else if mode == 3 {
+                sqlx::query("UPDATE runs SET input=json_set(input,'$.workspace_id',?) WHERE id=?")
+                    .bind("ws_01J5M4Q2Y7N8P9R0S1T2V3W4X7")
+                    .bind(&run.id)
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    manager.cancel_run(&run.id).await,
+                    Err(AgentError::Store(StoreError::Conflict(message)))
+                        if message == "run workspace identity mismatch"
+                ));
+                let raw_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id=?")
+                    .bind(&run.id)
+                    .fetch_one(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+                assert_eq!(raw_status, "running");
+                assert!(
+                    !sink
+                        .0
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|event| event.as_str() == "run.cancelled")
+                );
+                continue;
+            }
+
+            assert_eq!(
+                manager.cancel_run(&run.id).await.unwrap().status,
+                RunStatus::Cancelled
+            );
+            let active: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM workspace_leases WHERE owner_id=? AND kind='run' AND released_at IS NULL",
+            )
+            .bind(&run.id)
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+            assert_eq!(active, 0);
+            assert_eq!(
+                sink.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.as_str() == "run.cancelled")
+                    .count(),
+                1
+            );
+        }
     }
 
     /// Run one prompt in a session and wait for it to reach a terminal state.
