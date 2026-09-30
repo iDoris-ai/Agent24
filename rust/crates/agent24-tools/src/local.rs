@@ -343,6 +343,11 @@ impl Tool for ShellExecTool {
             .ok_or_else(|| ToolError::Invalid("argv must not be empty".into()))?;
 
         let mut cmd = tokio::process::Command::new(program);
+        // FU-103/J-6: never hand the LLM's shell command the daemon's full
+        // environment (every *_KEY/*_TOKEN/*_SECRET and A24_*/OMLX_* var it
+        // holds) — only the fixed, minimal set a process needs to actually
+        // run. See `crate::env_whitelist` for the full rationale.
+        crate::env_whitelist::clear_and_whitelist(&mut cmd);
         cmd.args(args)
             .current_dir(&self.workdir)
             .stdin(std::process::Stdio::null())
@@ -594,6 +599,61 @@ mod tests {
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["exit_code"], 0);
         assert_eq!(parsed["stdout"], "$HOME two words\n");
+    }
+
+    /// FU-103/J-6, end-to-end through `ShellExecTool::call` (not just the
+    /// `env_whitelist` unit — this proves the tool actually wires it in).
+    /// Re-execs the test binary with a real ambient `secret_test_key` set on
+    /// the CHILD process (via `Command::env` on the re-exec, which becomes
+    /// genuine environment for that process — not just a Command-builder
+    /// override), then asserts from the outside that the re-exec'd probe
+    /// (which runs `shell_exec` against `printenv`) passed. `std::env::set_var`
+    /// is deliberately avoided: edition 2024 forbids it outside `unsafe`
+    /// (workspace-wide policy — see `agent24-models::router` tests), and it
+    /// would mutate this whole test binary's process env, racing every other
+    /// test in the binary.
+    #[tokio::test]
+    async fn shell_exec_does_not_leak_ambient_daemon_secrets() {
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "local::tests::shell_exec_probe_ambient_secret_is_invisible_to_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("secret_test_key", "leaked-if-this-appears-in-child-stdout")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// Only runs re-exec'd by the test above, where `secret_test_key` is real
+    /// ambient environment for THIS process.
+    #[tokio::test]
+    #[ignore]
+    async fn shell_exec_probe_ambient_secret_is_invisible_to_child() {
+        assert_eq!(
+            std::env::var("secret_test_key").as_deref(),
+            Ok("leaked-if-this-appears-in-child-stdout"),
+            "test setup broken: the ambient var must actually be set here"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellExecTool::new(dir.path().to_path_buf());
+        let cancel = CancellationToken::new();
+        let mut input = Map::new();
+        input.insert("argv".to_owned(), serde_json::json!(["printenv"]));
+        let out = tool.call(&ctx(), &input, &cancel).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert!(
+            !stdout.contains("secret_test_key"),
+            "secret leaked into shell_exec's child:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("PATH="),
+            "PATH must still reach shell_exec's child:\n{stdout}"
+        );
     }
 
     #[tokio::test]
