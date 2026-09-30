@@ -375,8 +375,9 @@ fn lexical_normalize(path: &Path) -> Option<PathBuf> {
 }
 
 fn store_now() -> Result<WorkspaceInstant> {
-    WorkspaceInstant::parse(&agent24_core::util::now_iso8601_millis())
-        .map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })
+    let now = agent24_core::util::now_iso8601_millis()
+        .map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })?;
+    WorkspaceInstant::parse(&now).map_err(|_| WorkspaceError::RootUnavailable { reason: "clock" })
 }
 
 fn store_instant_from_epoch_millis(millis: u64) -> Result<WorkspaceInstant> {
