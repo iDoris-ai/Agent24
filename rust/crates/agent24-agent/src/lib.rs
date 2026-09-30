@@ -882,7 +882,28 @@ impl RunManager {
             && let Err(err) = self.tool_context_for(&run, tool_call_id.clone()).await
         {
             tracing::warn!("run {run_id}: resume workspace authority unavailable — {err}");
-            self.finish_cancelled(&run_id).await;
+            let ended_at = workspace_timestamp(now_iso8601());
+            let cancelled = match WorkspaceInstant::parse(&ended_at) {
+                Ok(ended_at) => self
+                    .store
+                    .cancel_workspace_run_recovery(&run_id, &ended_at)
+                    .await
+                    .map_err(AgentError::from),
+                Err(err) => Err(AgentError::from(err)),
+            };
+            match cancelled {
+                Ok(RunTerminalTransition::Applied(_)) => {
+                    self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
+                        run_id: run_id.clone(),
+                    }));
+                }
+                Ok(RunTerminalTransition::Conflict) => {
+                    tracing::warn!("run {run_id}: recovery cancel conflicted");
+                }
+                Err(cancel_err) => {
+                    tracing::error!("run {run_id}: recovery cancel failed: {cancel_err}");
+                }
+            }
             return;
         }
 
