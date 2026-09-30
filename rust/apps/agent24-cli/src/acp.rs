@@ -136,6 +136,7 @@ async fn create_session(ep: &Endpoint, params: &Value) -> Result<Session, String
     let create = SessionCreate {
         title,
         channel: "creative".to_owned(),
+        workspace_id: None,
     };
     let response = bearer(
         ep,
@@ -175,6 +176,7 @@ async fn run_prompt(
     let create = RunCreate {
         session_id: Some(session_id.to_owned()),
         prompt,
+        workspace_id: None,
         model_override: None,
         mode: RunMode::Normal,
     };
