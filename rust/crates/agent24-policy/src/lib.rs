@@ -768,7 +768,7 @@ impl ApprovalBroker {
             ));
         }
         let status = match decision.kind.as_str() {
-            "approve" | "approve_for_session" => ApprovalStatus::Approved,
+            "approve" | "approve_for_session" | "approve_for_target" => ApprovalStatus::Approved,
             "deny" => ApprovalStatus::Denied,
             "abort" => ApprovalStatus::Aborted,
             other => return Err(ResolveError::Invalid(format!("unknown decision {other}"))),
@@ -1677,6 +1677,34 @@ mod tests {
             )
             .await;
         assert!(matches!(miss, Verdict::Denied(_)), "{miss:?}");
+    }
+
+    #[tokio::test]
+    async fn approve_for_target_resolves_and_records_the_exact_grant() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let waiter = tokio::spawn(async move {
+            b.request(
+                external_req("run_1", None, Some("sch_1"), Some("#ops")),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+
+        let approval = broker
+            .resolve(&id, decision("approve_for_target", None))
+            .await
+            .unwrap();
+        assert_eq!(approval.status, ApprovalStatus::Approved);
+        assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+        assert!(
+            store
+                .standing_grant_exists("schedule", "sch_1", "mcp_slack_post", "#ops")
+                .await
+                .unwrap()
+        );
     }
 
     /// A grant belongs to ONE scope. The same tool and target under a different
