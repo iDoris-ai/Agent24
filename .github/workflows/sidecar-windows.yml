@@ -61,6 +61,11 @@ jobs:
         working-directory: rust
         run: cargo test --locked -p agent24-sidecar-host native_harness_tests::leader_exit_with_live_descendant_forces_tree_to_confirmed_empty -- --exact --ignored --nocapture
 
+      - name: Windows launch cold-start probe (cmdlet, minimal vs profile env)
+        if: runner.os == 'Windows'
+        working-directory: rust
+        run: cargo test --locked -p agent24-sidecar-host windows_launch_cold_start_with_cmdlet_probe -- --nocapture
+
       - name: clippy
         working-directory: rust
         run: cargo clippy --locked -p agent24-sidecar-host -p agent24-sidecar-host-protocol --all-targets -- -D warnings

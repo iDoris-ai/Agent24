@@ -305,14 +305,13 @@ mod tests {
     #[tokio::test]
     async fn windows_contract_transfers_pipes_once_and_stops_the_same_owner() {
         use crate::windows_test_io::{NativePipes, powershell_executable, read_pair_then_cleanup};
+        use processkit::IsolatedPipedCommand;
         use std::io::Write;
         use std::time::Duration;
-        use tokio::process::Command;
 
         let generation = crate::owner::GenerationId::new(7).expect("generation");
         let owner = crate::owner::GenerationOwner::new(generation).expect("Job Object");
-        let mut command = Command::new(powershell_executable());
-        command.args([
+        let command = IsolatedPipedCommand::new(powershell_executable()).args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
@@ -332,7 +331,7 @@ mod tests {
         drop(stdin);
         let mut soft_stop_observation = None;
         let (stdout, stderr) =
-            read_pair_then_cleanup(stdout, stderr, 9, Duration::from_secs(10), || {
+            read_pair_then_cleanup(stdout, stderr, 9, 9, Duration::from_secs(10), || {
                 target.request_stop(false)?;
                 soft_stop_observation = Some(target.owner.observe_exit()?);
                 target.request_stop(true)
@@ -373,15 +372,16 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_contract_reaps_through_the_common_owner_boundary() {
+        use processkit::IsolatedPipedCommand;
         use std::time::{Duration, Instant};
-        use tokio::process::Command;
 
         let owner = crate::owner::GenerationOwner::new(
             crate::owner::GenerationId::new(8).expect("generation"),
         )
         .expect("Job Object");
-        let mut command = Command::new(crate::windows_test_io::windows_executable("cmd.exe"));
-        command.args(["/C", "exit", "0"]);
+        let command =
+            IsolatedPipedCommand::new(crate::windows_test_io::windows_executable("cmd.exe"))
+                .args(["/C", "exit", "0"]);
         let process = owner.spawn(command).expect("spawn process");
         let mut target = OwnedTarget::from_owned(process);
         let deadline = Instant::now() + Duration::from_secs(10);

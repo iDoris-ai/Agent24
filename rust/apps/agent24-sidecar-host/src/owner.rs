@@ -1,10 +1,18 @@
 //! Windows lifecycle ownership backed by a processkit Job Object.
 
-use std::{io, process::Stdio};
+use std::io::{self, PipeReader, PipeWriter};
 
 use crate::target::TreeObservation;
-use processkit::ProcessGroup;
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use processkit::{ErrorReason, IsolatedPipedChild, IsolatedPipedCommand, ProcessGroup};
+
+fn processkit_error(error: processkit::Error) -> io::Error {
+    let kind = match error.reason() {
+        ErrorReason::Io(source) | ErrorReason::Spawn { source, .. } => source.kind(),
+        ErrorReason::NotFound { .. } => io::ErrorKind::NotFound,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, error)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GenerationId(u64);
@@ -27,37 +35,31 @@ impl GenerationOwner {
     pub fn new(generation: GenerationId) -> io::Result<Self> {
         ProcessGroup::new()
             .map(|group| Self { generation, group })
-            .map_err(io::Error::other)
+            .map_err(processkit_error)
     }
 
-    pub fn spawn(self, mut command: Command) -> io::Result<OwnedProcess> {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+    pub fn spawn(self, command: IsolatedPipedCommand) -> io::Result<OwnedProcess> {
         let generation = self.generation;
-        let child = self.group.spawn(command).map_err(io::Error::other)?;
-        Ok(OwnedProcess {
-            generation,
-            child,
-            owner: self,
-        })
+        let child = self
+            .group
+            .spawn_isolated_piped(command)
+            .map_err(processkit_error)?;
+        Ok(OwnedProcess { generation, child })
     }
 }
 
 /// The only handles through which the actor may communicate with its child.
 #[derive(Debug)]
 pub struct OwnedPipes {
-    pub stdin: ChildStdin,
-    pub stdout: ChildStdout,
-    pub stderr: ChildStderr,
+    pub stdin: PipeWriter,
+    pub stdout: PipeReader,
+    pub stderr: PipeReader,
 }
 
 #[derive(Debug)]
 pub struct OwnedProcess {
     generation: GenerationId,
-    child: Child,
-    owner: GenerationOwner,
+    child: IsolatedPipedChild,
 }
 
 impl OwnedProcess {
@@ -67,17 +69,13 @@ impl OwnedProcess {
 
     /// Transfers all three child pipes exactly once.
     pub fn take_pipes(&mut self) -> io::Result<OwnedPipes> {
-        match (
-            self.child.stdin.take(),
-            self.child.stdout.take(),
-            self.child.stderr.take(),
-        ) {
-            (Some(stdin), Some(stdout), Some(stderr)) => Ok(OwnedPipes {
-                stdin,
-                stdout,
-                stderr,
+        match self.child.take_pipes() {
+            Some(pipes) => Ok(OwnedPipes {
+                stdin: pipes.stdin,
+                stdout: pipes.stdout,
+                stderr: pipes.stderr,
             }),
-            _ => Err(io::Error::new(
+            None => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "child pipes have already been taken",
             )),
@@ -86,25 +84,24 @@ impl OwnedProcess {
 
     /// Observes exit without consuming this process or releasing its Job.
     pub fn observe_exit(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait()
+        self.child.try_wait().map_err(processkit_error)
     }
 
     /// Uses the Job Object's bounded counter, never a PID snapshot.
     pub fn tree_is_empty(&self) -> io::Result<bool> {
-        self.owner
-            .group
-            .stats()
-            .map(|stats| stats.active_process_count == 0)
-            .map_err(io::Error::other)
+        self.child.tree_is_empty().map_err(processkit_error)
     }
 
     pub(crate) fn reap_step(&mut self) -> io::Result<TreeObservation> {
-        self.reap_step_with(|child| child.try_wait(), |process| process.tree_is_empty())
+        self.reap_step_with(
+            |child| child.try_wait().map_err(processkit_error),
+            |process| process.tree_is_empty(),
+        )
     }
 
     fn reap_step_with<W, P>(&mut self, wait: W, probe: P) -> io::Result<TreeObservation>
     where
-        W: FnOnce(&mut Child) -> io::Result<Option<std::process::ExitStatus>>,
+        W: FnOnce(&mut IsolatedPipedChild) -> io::Result<Option<std::process::ExitStatus>>,
         P: FnOnce(&OwnedProcess) -> io::Result<bool>,
     {
         match wait(&mut self.child)? {
@@ -119,7 +116,7 @@ impl OwnedProcess {
 
     /// Force-kills exactly this owned Job tree. Repeated calls are safe.
     pub fn force_kill(&mut self) -> io::Result<()> {
-        self.owner.group.kill_all().map_err(io::Error::other)
+        self.child.kill_all().map_err(processkit_error)
     }
 }
 
@@ -135,16 +132,14 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    fn powershell(script: &str) -> Command {
-        let mut command = Command::new(powershell_executable());
-        command.args([
+    fn powershell(script: &str) -> IsolatedPipedCommand {
+        IsolatedPipedCommand::new(powershell_executable()).args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             script,
-        ]);
-        command
+        ])
     }
 
     fn powershell_literal() -> String {
@@ -247,7 +242,7 @@ mod tests {
         let generation = GenerationId::new(1).expect("non-zero generation");
         let owner = GenerationOwner::new(generation).expect("Job Object");
         let error = owner
-            .spawn(Command::new(
+            .spawn(IsolatedPipedCommand::new(
                 std::env::temp_dir().join("agent24-sidecar-program-that-does-not-exist.exe"),
             ))
             .expect_err("missing executable must fail before returning a child");
@@ -257,14 +252,15 @@ mod tests {
                 .is_some_and(|source| source.is::<processkit::Error>()),
             "the processkit error must remain available as the source"
         );
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[tokio::test]
     async fn processkit_spawn_returns_a_generation_owned_process() {
         let generation = GenerationId::new(1).expect("non-zero generation");
         let owner = GenerationOwner::new(generation).expect("Job Object");
-        let mut command = Command::new(windows_executable("cmd.exe"));
-        command.args(["/C", "exit", "0"]);
+        let command =
+            IsolatedPipedCommand::new(windows_executable("cmd.exe")).args(["/C", "exit", "0"]);
         let mut process = owner
             .spawn(command)
             .expect("suspended spawn and assignment");
@@ -291,7 +287,7 @@ mod tests {
         stdin.write_all(b"hello\n").expect("write stdin");
         drop(stdin);
         let (stdout, stderr) =
-            read_pair_then_cleanup(stdout, stderr, 64, Duration::from_secs(10), || {
+            read_pair_then_cleanup(stdout, stderr, 64, 64, Duration::from_secs(10), || {
                 process.force_kill()
             })
             .expect("bounded pipe roundtrip");
