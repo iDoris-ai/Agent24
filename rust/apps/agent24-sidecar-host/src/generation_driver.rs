@@ -65,6 +65,14 @@ enum FailureState {
     LatchedTransport,
 }
 
+/// Observed end of the parent control session. This is a fact only; callers
+/// decide separately whether pending output or retained Exit permits exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionEnd {
+    ParentEof,
+    Failed,
+}
+
 /// One actor, one control port, and exactly one completed request slot.
 pub(crate) struct GenerationDriver<L, S, C, R> {
     actor: ActorLaunchOrder<L, S>,
@@ -74,6 +82,7 @@ pub(crate) struct GenerationDriver<L, S, C, R> {
     control_eof: bool,
     ready_eof: bool,
     failure: FailureState,
+    session_end: Option<SessionEnd>,
 }
 
 #[allow(private_bounds)]
@@ -117,11 +126,20 @@ where
             control_eof: false,
             ready_eof: false,
             failure,
+            session_end: if failure == FailureState::LatchedTransport {
+                Some(SessionEnd::Failed)
+            } else {
+                None
+            },
         }
     }
 
     pub(crate) fn schedule_state(&self) -> ScheduleState {
         self.actor.schedule_state()
+    }
+
+    pub(crate) const fn session_end(&self) -> Option<SessionEnd> {
+        self.session_end
     }
 
     /// One turn: control poll/EOF; one lifecycle path; a Ready poll only for
@@ -148,8 +166,21 @@ where
         now: Instant,
         transport_failure: bool,
     ) -> Result<(), ActorLaunchOrderError> {
+        let result = self.step_inner(now, transport_failure);
+        if self.schedule_state().terminal {
+            self.record_session_failure();
+        }
+        result
+    }
+
+    fn step_inner(
+        &mut self,
+        now: Instant,
+        transport_failure: bool,
+    ) -> Result<(), ActorLaunchOrderError> {
         self.actor.begin_turn();
         if self.failure == FailureState::LatchedTransport || self.schedule_state().terminal {
+            self.record_session_failure();
             return self.actor.cleanup_tick(now).map(|_| ());
         }
         // `ScheduleState::terminal` covers latched launch-order failures, not
@@ -158,8 +189,16 @@ where
         if matches!(self.schedule_state().phase, crate::actor::Phase::Empty) {
             self.failure = FailureState::None;
         } else if transport_failure || self.failure == FailureState::DeferredTransport {
+            self.record_session_failure();
             self.latch_transport(now);
             return Err(ActorLaunchOrderError::CleanupRequired);
+        }
+
+        if matches!(
+            self.schedule_state().phase,
+            crate::actor::Phase::AwaitReady(deadline) if now >= deadline
+        ) {
+            self.record_session_failure();
         }
 
         let mut eof_shutdown = false;
@@ -169,6 +208,7 @@ where
                 | Ok(ControlStep::Complete(IngressStep::Pending)) => {}
                 Ok(ControlStep::Complete(IngressStep::Eof)) => {
                     self.control_eof = true;
+                    self.record_parent_eof();
                     eof_shutdown = true;
                 }
                 Ok(ControlStep::Complete(IngressStep::Request(request))) => {
@@ -181,6 +221,7 @@ where
                 }
                 Err(_) => {
                     self.control_eof = true;
+                    self.record_session_failure();
                     self.latch_transport(now);
                     if self.failure == FailureState::LatchedTransport {
                         return Err(ActorLaunchOrderError::CleanupRequired);
@@ -225,6 +266,7 @@ where
                 }
                 Err(_) => {
                     self.ready_eof = true;
+                    self.record_session_failure();
                     self.latch_transport(now);
                     return Err(ActorLaunchOrderError::CleanupRequired);
                 }
@@ -268,6 +310,7 @@ where
                 Err(ReadyReadPermitError::Closed) => {
                     self.ready_eof = true;
                     self.failure = FailureState::DeferredTransport;
+                    self.record_session_failure();
                     return Ok(());
                 }
             }
@@ -279,6 +322,7 @@ where
             Ok(()) | Err(ControlPermitError::Busy) => Ok(()),
             Err(ControlPermitError::Closed) => {
                 self.control_eof = true;
+                self.record_session_failure();
                 if !matches!(self.schedule_state().phase, crate::actor::Phase::Empty) {
                     self.failure = FailureState::DeferredTransport;
                 }
@@ -288,6 +332,7 @@ where
     }
 
     fn latch_transport(&mut self, now: Instant) {
+        self.record_session_failure();
         if self.failure == FailureState::LatchedTransport
             || matches!(self.schedule_state().phase, crate::actor::Phase::Empty)
         {
@@ -295,6 +340,16 @@ where
         }
         self.failure = FailureState::LatchedTransport;
         let _ = self.actor.fail_transport(now);
+    }
+
+    fn record_parent_eof(&mut self) {
+        if self.session_end.is_none() {
+            self.session_end = Some(SessionEnd::ParentEof);
+        }
+    }
+
+    fn record_session_failure(&mut self) {
+        self.session_end = Some(SessionEnd::Failed);
     }
 }
 
@@ -479,6 +534,7 @@ mod tests {
                 control_eof: false,
                 ready_eof: false,
                 failure: FailureState::None,
+                session_end: None,
             }
         }
     }
@@ -545,6 +601,7 @@ mod tests {
             control_eof: false,
             ready_eof: false,
             failure: FailureState::None,
+            session_end: None,
         }
     }
     fn sig(id: u64) -> Request {
@@ -582,6 +639,167 @@ mod tests {
                 request_id: id,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn session_end_is_absent_for_empty_without_control_eof() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut x = d(r.clone(), [], [], [], []);
+        empty(&mut x, &r, Instant::now());
+        assert_eq!(x.schedule_state().phase, Phase::Empty);
+        assert_eq!(x.session_end(), None);
+    }
+
+    #[test]
+    fn empty_followed_by_control_eof_records_parent_eof() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut x = d(
+            r.clone(),
+            [Ok(ControlStep::Complete(IngressStep::Eof))],
+            [],
+            [],
+            [],
+        );
+        empty(&mut x, &r, Instant::now());
+        x.step(Instant::now()).unwrap();
+        assert_eq!(x.session_end(), Some(SessionEnd::ParentEof));
+    }
+
+    #[test]
+    fn malformed_control_after_empty_records_failed() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut x = d(r.clone(), [Err(ControlWorkerError::Closed)], [], [], []);
+        empty(&mut x, &r, Instant::now());
+        let _ = x.step(Instant::now());
+        assert_eq!(x.session_end(), Some(SessionEnd::Failed));
+        assert_eq!(x.schedule_state().phase, Phase::Empty);
+    }
+
+    #[test]
+    fn failure_escalates_parent_eof_and_is_sticky() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut x = d_at(
+            r.clone(),
+            [Ok(ControlStep::Complete(IngressStep::Eof))],
+            [],
+            [],
+            [],
+            Phase::Unconfirmed,
+        );
+        x.step(Instant::now()).unwrap();
+        assert_eq!(x.session_end(), Some(SessionEnd::ParentEof));
+        x.latch_transport(Instant::now());
+        assert_eq!(x.session_end(), Some(SessionEnd::Failed));
+        x.record_parent_eof();
+        assert_eq!(x.session_end(), Some(SessionEnd::Failed));
+    }
+
+    #[test]
+    fn ready_exact_deadline_records_failed() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_at(r, [], [], [], [], Phase::AwaitReady(now));
+        x.step(now).unwrap();
+        assert_eq!(x.session_end(), Some(SessionEnd::Failed));
+    }
+
+    #[test]
+    fn recoverable_observe_and_reap_errors_do_not_end_the_session() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut observe = d_at(
+            r,
+            [],
+            [],
+            [],
+            [
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(ExitObservation::Running),
+            ],
+            Phase::Running,
+        );
+        let now = Instant::now();
+        assert_eq!(
+            observe.step(now),
+            Err(ActorLaunchOrderError::Observe(io::ErrorKind::Interrupted))
+        );
+        assert_eq!(observe.session_end(), None);
+        assert_eq!(observe.step(now), Ok(()));
+        assert_eq!(observe.session_end(), None);
+
+        let r = Arc::new(Mutex::new(R::default()));
+        r.lock()
+            .unwrap()
+            .reap_errors
+            .push_back(io::ErrorKind::Interrupted);
+        let mut reap = d_at(r, [], [], [], [], Phase::Unconfirmed);
+        assert_eq!(
+            reap.step(now),
+            Err(ActorLaunchOrderError::Reap(io::ErrorKind::Interrupted))
+        );
+        assert_eq!(reap.session_end(), None);
+        assert_eq!(reap.step(now), Ok(()));
+        assert_eq!(reap.schedule_state().phase, Phase::Empty);
+        assert_eq!(reap.session_end(), None);
+    }
+
+    #[test]
+    fn output_barriers_do_not_change_session_end_fact() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_at(
+            r.clone(),
+            [],
+            [],
+            [Ok(WriteStep::Pending)],
+            [],
+            Phase::Empty,
+        );
+        reply(&mut x, 17);
+        x.step(now).unwrap();
+        assert!(x.schedule_state().output_pending);
+        assert_eq!(x.session_end(), None);
+
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut x = d(
+            r.clone(),
+            [Ok(ControlStep::Complete(IngressStep::Eof))],
+            [],
+            [Ok(WriteStep::Pending)],
+            [],
+        );
+        empty(&mut x, &r, now);
+        reply(&mut x, 18);
+        x.step(now).unwrap();
+        assert!(x.schedule_state().output_pending);
+        assert_eq!(x.session_end(), Some(SessionEnd::ParentEof));
+
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut x = d_at(
+            r,
+            [
+                Ok(ControlStep::Idle),
+                Ok(ControlStep::Complete(IngressStep::Eof)),
+            ],
+            [],
+            [Ok(WriteStep::Pending), Ok(WriteStep::Pending)],
+            [Ok(ExitObservation::Exited { code: Some(0) })],
+            Phase::Running,
+        );
+        x.step(now).unwrap();
+        assert!(x.schedule_state().exit_retained);
+        x.step(now).unwrap();
+        assert!(x.schedule_state().exit_retained);
+        assert_eq!(x.session_end(), Some(SessionEnd::ParentEof));
+    }
+
+    #[test]
+    fn unconfirmed_never_becomes_session_completion() {
+        let r = Arc::new(Mutex::new(R::default()));
+        r.lock().unwrap().trees.push_back(TreeObservation::Present);
+        let mut x = d_at(r, [], [], [], [], Phase::Unconfirmed);
+        x.step(Instant::now()).unwrap();
+        assert_eq!(x.schedule_state().phase, Phase::Unconfirmed);
+        assert_eq!(x.session_end(), None);
     }
 
     #[test]

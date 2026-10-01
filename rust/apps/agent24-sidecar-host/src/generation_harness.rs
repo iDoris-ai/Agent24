@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use crate::{
+    generation_driver::SessionEnd,
     launch_order::{ActorLaunchOrderError, ScheduleState},
     native_generation::NativeGeneration,
 };
@@ -20,6 +21,7 @@ pub(crate) enum TurnIntent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TurnReport {
     pub(crate) state: ScheduleState,
+    pub(crate) session_end: Option<SessionEnd>,
     pub(crate) error: Option<ActorLaunchOrderError>,
     pub(crate) first_error: Option<ActorLaunchOrderError>,
 }
@@ -28,6 +30,7 @@ trait GenerationTurn {
     fn step(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError>;
     fn force_cancel_step(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError>;
     fn schedule_state(&self) -> ScheduleState;
+    fn session_end(&self) -> Option<SessionEnd>;
 }
 
 impl GenerationTurn for NativeGeneration<'_> {
@@ -41,6 +44,10 @@ impl GenerationTurn for NativeGeneration<'_> {
 
     fn schedule_state(&self) -> ScheduleState {
         NativeGeneration::schedule_state(self)
+    }
+
+    fn session_end(&self) -> Option<SessionEnd> {
+        NativeGeneration::session_end(self)
     }
 }
 
@@ -77,6 +84,7 @@ impl<G: GenerationTurn> GenerationHarness<G> {
         }
         TurnReport {
             state: self.generation.schedule_state(),
+            session_end: self.generation.session_end(),
             error,
             first_error: self.first_error,
         }
@@ -98,6 +106,7 @@ mod tests {
         identity: usize,
         state: Option<Phase>,
         errors: Vec<Option<ActorLaunchOrderError>>,
+        session_end: Option<SessionEnd>,
     }
 
     struct Fake(Arc<Mutex<Calls>>);
@@ -137,6 +146,10 @@ mod tests {
                 exit_retained: false,
             }
         }
+
+        fn session_end(&self) -> Option<SessionEnd> {
+            self.0.lock().unwrap().session_end
+        }
     }
 
     fn fake() -> (Fake, Arc<Mutex<Calls>>) {
@@ -159,6 +172,15 @@ mod tests {
         assert_eq!(calls.identity, identity);
         assert_eq!(calls.drops, 0);
         assert_eq!(report.error, None);
+    }
+
+    #[test]
+    fn turn_report_forwards_session_end_fact() {
+        let (fake, calls) = fake();
+        calls.lock().unwrap().session_end = Some(SessionEnd::ParentEof);
+        let mut harness = GenerationHarness::new(fake);
+        let report = harness.turn(TurnIntent::Continue, Instant::now());
+        assert_eq!(report.session_end, Some(SessionEnd::ParentEof));
     }
 
     #[test]
