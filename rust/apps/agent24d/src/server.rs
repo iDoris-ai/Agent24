@@ -1676,7 +1676,13 @@ pub async fn serve(
             tracing::error!("attach listener not started: HOME is not set, no socket path to bind");
         }
     }
-    let router = build_router_with_modules(state, module_routes);
+    // COMM-2a: `/api/v1/comm/*` — merged into `module_routes` (not a literal
+    // route inside `build_router_with_modules` itself) so this stays behind
+    // kernel auth exactly like every other module route, and so the wiring
+    // itself lives in its own file (`comm_routes.rs`); see that file's own
+    // doc comment for the `RESERVED_KERNEL_SEGMENTS` gap this leaves.
+    let comm_router = crate::comm_routes::build(&state_dir).await;
+    let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
     // this daemon is ready: its modules are stopped, and no state file or

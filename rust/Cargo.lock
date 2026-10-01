@@ -58,9 +58,11 @@ version = "0.5.1"
 dependencies = [
  "agent24-comm",
  "async-trait",
+ "axum",
  "base64",
  "hex",
  "keyring",
+ "rand 0.9.5",
  "rustix 0.38.44",
  "serde",
  "serde_json",
@@ -68,6 +70,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tower",
  "tracing",
  "zeroize",
 ]
@@ -311,6 +314,7 @@ name = "agent24d"
 version = "0.5.1"
 dependencies = [
  "agent24-agent",
+ "agent24-comm",
  "agent24-core",
  "agent24-domain",
  "agent24-mcp",

@@ -187,6 +187,15 @@ const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "attached",
     "approvals",
     "chat",
+    // COMM-2a: `/api/v1/comm/*` (`crate::comm_routes::build`) is kernel code,
+    // merged into `module_routes` by `server::serve` itself rather than
+    // registered as a literal route inside `build_router_with_modules` — so
+    // it does NOT show up in `reserved_segments_match_the_kernel_routes_exactly`'s
+    // scan of that function's source, and that test's `EXTRA_RESERVED` list
+    // (below) carries it instead. Reserved here regardless, so a domain-OS
+    // package cannot claim `name: comm` and collide with (or, depending on
+    // merge order, shadow) the real mount.
+    "comm",
     "events",
     "health",
     // T7b/ME-3e: `/api/v1/module-approvals`.
@@ -3273,6 +3282,29 @@ raise SystemExit(3)
         );
     }
 
+    /// COMM-2a reservation: a domain-OS package declaring `name: comm` (and
+    /// therefore, by `DomainOsManifest::validate`'s own rule, `route_namespace:
+    /// /api/v1/comm`) must be REFUSED by the mounter, not mounted — `/api/v1/comm`
+    /// is `comm_routes.rs`'s real mount, merged into `module_routes` outside
+    /// this mounter entirely. Without this refusal such a package would either
+    /// panic the daemon at merge time (an "Overlapping method route" panic,
+    /// same failure mode as `a_name_that_collides_with_a_kernel_route_is_refused_not_panicked`)
+    /// or — depending on merge order — silently shadow the real comm routes.
+    #[tokio::test]
+    async fn a_module_named_comm_is_refused_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let m = FakeModule::new("comm");
+        let (_, reports) = mount(&[entry(m)], tmp.path(), &hub).await;
+        match &reports[0].outcome {
+            MountOutcome::Refused(why) => assert!(
+                why.contains("kernel route segment"),
+                "expected the reserved-segment refusal, got {why:?}"
+            ),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
     /// Pin `RESERVED_KERNEL_SEGMENTS` against the kernel router's own source, in
     /// BOTH directions.
     ///
@@ -3318,6 +3350,14 @@ raise SystemExit(3)
             }
         }
         let reserved: BTreeSet<&str> = RESERVED_KERNEL_SEGMENTS.iter().copied().collect();
+        // COMM-2a: `/api/v1/comm/*` is mounted by `server::serve` itself
+        // (`module_routes.merge(crate::comm_routes::build(..).await)`), not
+        // as a literal route inside `build_router_with_modules` — so this
+        // source-string scan can never see it. Reserved deliberately
+        // (`RESERVED_KERNEL_SEGMENTS`'s own doc comment), just not through
+        // this heuristic; excluded from the "stale" side only, so a REAL
+        // stale entry elsewhere is still caught.
+        const EXTRA_RESERVED_NOT_IN_BUILD_ROUTER: &[&str] = &["comm"];
 
         // Checked FIRST: if the scan broke, every reservation would otherwise be
         // reported as stale and bury the real cause.
@@ -3334,7 +3374,10 @@ raise SystemExit(3)
             "kernel route segments NOT reserved — a module could claim one and \
              panic the daemon at startup: {missing:?}"
         );
-        let stale: Vec<_> = reserved.difference(&seen).collect();
+        let stale: Vec<_> = reserved
+            .difference(&seen)
+            .filter(|seg| !EXTRA_RESERVED_NOT_IN_BUILD_ROUTER.contains(seg))
+            .collect();
         assert!(
             stale.is_empty(),
             "reserved segments the kernel no longer routes — these now REFUSE a \

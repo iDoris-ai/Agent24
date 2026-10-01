@@ -151,6 +151,17 @@ impl MemoryPasswordStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Test-only: a sorted snapshot of every account key currently stored.
+    /// Used by `router.rs`'s `KeystoreWriteLock` coverage test to assert no
+    /// `Pending` account survives a promoted first identity (PR #622
+    /// Medium).
+    #[cfg(test)]
+    pub(crate) async fn snapshot_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.entries.lock().await.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
 }
 
 #[async_trait::async_trait]

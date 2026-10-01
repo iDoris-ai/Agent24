@@ -61,6 +61,13 @@ enum Command {
         #[command(subcommand)]
         action: OsAction,
     },
+    /// Manage the embedded Hyphae-based agent communication layer:
+    /// identities, contacts, and relays (COMM-HYPHAE.md §4). A REST client
+    /// of `/api/v1/comm/*`, same shape as `agent24 os`.
+    Comm {
+        #[command(subcommand)]
+        action: CommAction,
+    },
     /// Serve agent24d as an MCP server over stdio, so an external MCP client
     /// (Claude Desktop, another agent) can run tasks on it and introspect it.
     /// Risky actions are still approved on THIS host, never by the caller (E4).
@@ -167,6 +174,70 @@ enum OsAttachAction {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// `agent24 comm …` (COMM-2a; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
+#[derive(Subcommand)]
+enum CommAction {
+    /// Manage Hyphae identities
+    Identity {
+        #[command(subcommand)]
+        action: CommIdentityAction,
+    },
+    /// Manage Hyphae contacts
+    Contact {
+        #[command(subcommand)]
+        action: CommContactAction,
+    },
+    /// Manage Hyphae relays
+    Relay {
+        #[command(subcommand)]
+        action: CommRelayAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CommIdentityAction {
+    /// List every identity
+    List,
+    /// Create a new identity (the very first one encrypts the keystore and
+    /// generates its password automatically — see COMM-HYPHAE.md §6.4)
+    Create {
+        nickname: String,
+        /// Make this the default identity
+        #[arg(long)]
+        default: bool,
+    },
+    /// Switch the default identity
+    Use { nickname: String },
+}
+
+#[derive(Subcommand)]
+enum CommContactAction {
+    /// List every contact
+    List,
+    /// Add a contact
+    Add {
+        nickname: String,
+        npub: String,
+        #[arg(long)]
+        role: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CommRelayAction {
+    /// Show the configured relays and whether they were actually configured
+    /// (vs. Hyphae's own built-in default, COMM-HYPHAE.md §9 R1)
+    List,
+    /// Replace the relay set — one call, full replace, not an incremental add
+    Set {
+        /// One or more `ws://`/`wss://` relay urls (1..=8)
+        #[arg(required = true)]
+        relays: Vec<String>,
+    },
+    /// Probe a relay (or every configured one) for connectivity
+    Probe { url: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -765,6 +836,92 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
             } else {
                 format!("daemon returned {status}")
             })
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    finish(ep).await;
+    out
+}
+
+/// `agent24 comm …`: a REST client of `/api/v1/comm/*`
+/// (COMM-HYPHAE.md §4) — one method/path/body per leaf subcommand, sent with
+/// the same bearer/timeout/error-reporting shape as `cmd_os`. Unlike `cmd_os`
+/// there is no local/offline path: every comm operation needs a running
+/// daemon (it is the only thing holding the Hyphae runner).
+async fn cmd_comm(action: CommAction) -> Result<(), String> {
+    let (method, path, body) = match action {
+        CommAction::Identity { action } => match action {
+            CommIdentityAction::List => (
+                reqwest::Method::GET,
+                "/api/v1/comm/identity".to_owned(),
+                None,
+            ),
+            CommIdentityAction::Create { nickname, default } => (
+                reqwest::Method::POST,
+                "/api/v1/comm/identity".to_owned(),
+                Some(serde_json::json!({"nickname": nickname, "default": default})),
+            ),
+            CommIdentityAction::Use { nickname } => (
+                reqwest::Method::POST,
+                "/api/v1/comm/identity/default".to_owned(),
+                Some(serde_json::json!({"nickname": nickname})),
+            ),
+        },
+        CommAction::Contact { action } => match action {
+            CommContactAction::List => (
+                reqwest::Method::GET,
+                "/api/v1/comm/contact".to_owned(),
+                None,
+            ),
+            CommContactAction::Add {
+                nickname,
+                npub,
+                role,
+            } => (
+                reqwest::Method::POST,
+                "/api/v1/comm/contact".to_owned(),
+                Some(serde_json::json!({"nickname": nickname, "npub": npub, "role": role})),
+            ),
+        },
+        CommAction::Relay { action } => match action {
+            CommRelayAction::List => (reqwest::Method::GET, "/api/v1/comm/relay".to_owned(), None),
+            CommRelayAction::Set { relays } => (
+                reqwest::Method::PUT,
+                "/api/v1/comm/relay".to_owned(),
+                Some(serde_json::json!({"relays": relays})),
+            ),
+            CommRelayAction::Probe { url } => (
+                reqwest::Method::POST,
+                "/api/v1/comm/relay/probe".to_owned(),
+                Some(serde_json::json!({"url": url})),
+            ),
+        },
+    };
+
+    let ep = connect().await.map_err(|e| {
+        format!("{e}\n  `agent24 comm` always goes through the daemon — there is no offline path")
+    })?;
+    let mut req = bearer(&ep, client().request(method, format!("{}{path}", ep.base)));
+    if let Some(body) = &body {
+        req = req.json(body);
+    }
+    let out = match req.timeout(Duration::from_secs(15)).send().await {
+        Ok(res) => {
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if status.is_success() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&body["data"]).unwrap_or_default()
+                );
+                Ok(())
+            } else {
+                Err(format!(
+                    "comm: {} — {}",
+                    body["error"].as_str().unwrap_or("error"),
+                    body["message"].as_str().unwrap_or_default()
+                ))
+            }
         }
         Err(e) => Err(e.to_string()),
     };
@@ -1398,6 +1555,7 @@ async fn main() -> std::process::ExitCode {
         Command::Service { action } => cmd_service(action),
         Command::Tui => cmd_tui().await,
         Command::Os { action } => cmd_os(action).await,
+        Command::Comm { action } => cmd_comm(action).await,
         Command::Mcp => cmd_mcp().await,
     };
     match result {

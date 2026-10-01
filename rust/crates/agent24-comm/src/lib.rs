@@ -11,22 +11,31 @@
 //! COMM-1b adds `keystore_lock` (`KeystoreWriteLock`, serializing every
 //! Hyphae invocation that writes `keystore.json`) and `password_store`
 //! (`PasswordStore`, the keychain/in-memory backends that hold the keystore
-//! password between agent24d restarts). REST routes, daemon supervision, and
-//! `~/.hyphae` import are later tasks (COMM-2a onward) and are intentionally
-//! not implemented here.
+//! password between agent24d restarts). COMM-2a adds `error` (the REST
+//! layer's closed error set, §4), `npub` (bech32 validity, G6), and `router`
+//! (`CommState` + `router(CommState) -> axum::Router`: identity / contact /
+//! relay). `~/.hyphae` import, send/history/outbox, and daemon supervision
+//! are later tasks (COMM-2b onward) and are intentionally not implemented
+//! here.
 
 pub mod binary;
+pub mod error;
 pub mod keystore_lock;
+pub mod npub;
 pub mod password;
 pub mod password_store;
+pub mod router;
 pub mod runner;
 
 pub use binary::{BinaryError, HyphaeLock, Sha256Digest, VerifiedBinary, current_platform};
+pub use error::CommError;
 pub use keystore_lock::{KeystoreGuard, KeystoreWriteLock};
+pub use npub::is_valid_npub;
 pub use password::{PASSWORD_MAX, Password};
 pub use password_store::{
     Account, KEYRING_SERVICE, KeyringPasswordStore, MemoryPasswordStore, PasswordStore, StoreError,
 };
+pub use router::{CommState, router};
 pub use runner::{
     ENV_ALLOW, Envelope, ExitClass, HyphaeRunner, Invocation, OUTPUT_CAP, RunnerError,
     parse_envelope,
