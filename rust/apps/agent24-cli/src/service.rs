@@ -490,6 +490,20 @@ mod tests {
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
+                // Cargo's `tests/` directories hold integration-test binaries, never
+                // daemon production code; the daemon (a LaunchAgent) can't run
+                // anything under them. A test fixture's own config knob (e.g.
+                // `HYPHAE_TEST_BIN`, which points an opt-in test at a local binary)
+                // reads an env var there without the daemon ever needing it
+                // forwarded — scanning `tests/` would demand `PASSTHROUGH_VARS`
+                // carry test-only knobs the real LaunchAgent never touches.
+                // Positive control: `A24_OS_PACKAGES` (read from
+                // `agent24-os-packages/src/lib.rs`, not under any `tests/` dir)
+                // still gets caught below, so skipping `tests/` doesn't blind the
+                // scanner to a real daemon read.
+                if p.file_name().is_some_and(|n| n == "tests") {
+                    continue;
+                }
                 walk_rs(&p, f);
             } else if p.extension().is_some_and(|x| x == "rs") {
                 f(&p);

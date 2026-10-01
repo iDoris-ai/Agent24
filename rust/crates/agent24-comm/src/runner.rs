@@ -570,8 +570,24 @@ mod tests {
         let home = tmp.path().join("hyphae-home");
         tokio::fs::create_dir_all(&home).await.unwrap();
         let marker = tmp.path().join("marker");
+        // The direct child ("sh") must itself block past the timeout (`sleep 5`
+        // in the foreground) so the command doesn't just exit normally before
+        // the timeout fires. Separately, a BACKGROUNDED grandchild
+        // (`( sleep 1; touch ... ) &`) is what actually exercises group-wide
+        // killing: it is not sh's foreground child, so killing only the direct
+        // `sh` process (e.g. via `kill_on_drop`'s default single-pid SIGKILL)
+        // leaves it running free to finish its own `sleep 1` and touch the
+        // marker — only killing the whole process group reaches it too. A
+        // foreground-only `sleep; touch` (the previous fixture) can't tell the
+        // two apart: the script interpreter itself dies either way, so `touch`
+        // never runs regardless of whether the kill was group-wide.
+        //
+        // Verified by mutation: temporarily removing both `cmd.process_group(0)`
+        // (runner.rs) and the `kill_process_group_best_effort` call in the
+        // timeout branch makes this test fail with `marker` present (the
+        // grandchild's `touch` ran); restoring either one makes it pass again.
         let script = format!(
-            "#!/bin/sh\nsleep 2\ntouch \"{}\"\necho '{{\"ok\":true,\"data\":{{}}}}'\n",
+            "#!/bin/sh\n( sleep 1; touch \"{}\" ) &\nsleep 5\n",
             marker.display()
         );
         let bin = install_fixture(tmp.path(), "slow.sh", &script, &tmp.path().join("bin")).await;
@@ -580,19 +596,21 @@ mod tests {
         let inv = Invocation {
             args: vec![],
             password: None,
-            timeout: Some(Duration::from_millis(200)),
+            timeout: Some(Duration::from_millis(500)),
         };
         let start = std::time::Instant::now();
         let err = runner.run(inv).await.unwrap_err();
         assert!(matches!(err, RunnerError::Timeout(_)));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_secs(2));
 
-        // Give the (correctly killed) sleep plenty of room to have finished
-        // and run `touch` if it hadn't actually been killed.
-        tokio::time::sleep(Duration::from_millis(1800)).await;
+        // Give the grandchild's own `sleep 1` plenty of room (well past its own
+        // 1s sleep, with slack for scheduling jitter) to have finished and run
+        // `touch` if it (and not just its parent `sh`) hadn't actually been
+        // killed.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
         assert!(
             !marker.exists(),
-            "process group was not killed before the backgrounded sleep completed"
+            "process group was not killed before the backgrounded grandchild completed"
         );
     }
 
