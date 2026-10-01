@@ -5,11 +5,62 @@ All notable changes to Agent24 are documented here. This project adheres to
 
 ## [Unreleased]
 
-**行为变化**
-- **F4b 入站执行默认冻结**（COMM-5a）：即使配置了 `A24_NOSTR_ALLOWED_NPUBS`,Nostr 入站消息
-  也不再自动触发 `agent24d` run——`pollOnce` 仍然轮询、仍然喂给 FU-32 的活性探针
-  （`liveness.observe`),只是不再对消息调用 `bridge.handle` / `runToCompletion`。设置
-  `A24_NOSTR_F4B_INBOUND=1` 可临时恢复旧行为;后续按入站执行将改走 T01-E 的高层授权。
+## [0.5.1] — 2026-10-01
+
+**DEP-A「现在就能做」阶段收口：CLI 四平台发布流水线 + 桌面端 Linux 包**。自 0.5.0 起主要是
+Deployment 多平台发布基础设施（DEP-A1/A3/A5/A6）、DEBT-10 补审修复、桌面端验收修复，以及
+COMM 线（Hyphae 基础通信）设计冻结与首个落地 crate。
+
+**行为变化 / 迁移说明**
+- **F4b 入站执行默认冻结**（COMM-5a，#613，收口见 #618）：即使配置了
+  `A24_NOSTR_ALLOWED_NPUBS`，Nostr 入站消息也不再自动触发 `agent24d` run——`pollOnce`
+  仍然轮询、仍然喂给 FU-32 的活性探针（`liveness.observe`），只是不再对消息调用
+  `bridge.handle` / `runToCompletion`。#618 把这个冻结从「行为上恰好不触发」收口成
+  **结构性保证**，同时修正了冻结状态下的日志措辞（不再暗示仍在处理），并补上解冻后
+  不重放积压消息的防护。**迁移**：依赖旧的「配置白名单即自动执行」行为的部署，升级后
+  入站消息不会再被执行；需要临时恢复可设置 `A24_NOSTR_F4B_INBOUND=1`，但这只是过渡开关，
+  后续入站执行将改走 T01-E 的高层授权，不建议长期依赖该环境变量。
+
+**新功能**
+- **Deployment 多平台发布基础设施（DEP-A，v0.5.1 范围：CLI macOS/Linux 四平台 + 桌面端
+  Linux）**：
+  - DEP-A1：CI 新增 `macos-latest` 上的 Rust fmt/clippy/test job，与 sidecar 线的
+    `sidecar-windows.yml` 不重复（#607）。
+  - DEP-A3：手写 CLI 发布流水线 `release.yml`，只在 `v[0-9]+.[0-9]+.[0-9]+` tag 上触发，
+    4 个目标（macOS arm64/x64、Linux x64/arm64）各自在原生 runner 上构建，产出
+    `agent24-<ver>-<os>-<arch>.tar.gz` + `SHA256SUMS`，由本流水线创建 GitHub Release
+    （#608）；随后补齐 tag 与 crate 版本一致性校验、daemon health 上报版本（#609），
+    并进一步收紧发布条件为显式要求 tag ref + 事件类型，防止 `workflow_dispatch` 配合
+    同名分支绕过版本校验（#619）。
+  - DEP-A5：桌面端启动时复用已在运行的 `agent24d`（先读 `daemon.json` 并检查 health），
+    托盘「停止」只作用于桌面端自己拉起的 daemon，不再误杀外部已运行的 daemon（#602）。
+  - DEP-A6：新增 `release-desktop.yml`，在 `ubuntu-22.04` 上构建 AppImage + deb 并追加
+    到 DEP-A3 创建的同一个 Release（不自行创建 Release）；xvfb 冒烟测试验证 sidecar
+    `/health` 返回 200，并检查 AppImage 注入的 `LD_LIBRARY_PATH` 是否污染 sidecar 环境；
+    deb 在 `ubuntu-22.04` 上验证可 `dpkg -i` 安装（#617）。
+  - 调研与任务拆分：`docs/Deployment/RESEARCH.md` + `docs/Deployment/TASKS.md`，三阶段
+    规划（A 现在可做 → B Apple 签名后 → C 依赖其他条件），经 1 轮 Opus 评审后冻结（#599）。
+- **COMM 线（Hyphae 基础通信）起步**：
+  - COMM-0：`docs/design/COMM-HYPHAE.md` 设计文档，经评审后冻结（#612）。
+  - COMM-1a：新增 crate `agent24-comm`，落地 `HyphaeRunner`——单次调用 Hyphae CLI，
+    含 sha256 校验内嵌二进制哈希、子进程环境变量白名单、口令只走 stdin（不经参数/环境
+    变量）、envelope 解析（#614）。
+- **DEP-A7 Windows 移植设计**：`docs/design/WINDOWS-PORT.md`（命名管道传输，W1–W9 分片），
+  经评审后冻结（#611）；配套 W0 摸底 workflow，在 `windows-latest` 上跑
+  `cargo check --workspace --keep-going` 并按 crate 对错误分类（只产日志、不判红）（#610）。
+
+**修复（ME4-CODEX-DEBT-10 补审）**
+- `agent24d` 稳定哈希 + FU-105 握手竞态收口，补审 #528/#543（#600）。
+- `model-timings` 保留期清理改为非全表扫描、修正 summary 混算、修正超时丢记录、修正演示
+  脚本误杀（#598）。
+- `os-proto` 握手残留字节不再误杀同一帧的首帧，补审 #515（#597）。
+
+**修复（v0.5.0 验收发现）**
+- 修复桌面端 3 处验收发现的问题（#594）。
+
+**其他**
+- `docs(open-design)`：M7 收口、main 落地策略刷新、叠加 PR 评审 playbook 等一批不属本轮
+  主线的文档提交，随 main 一并带入，不在此逐条列出。
 
 ## [0.5.0] — 2026-09-30
 

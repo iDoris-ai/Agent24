@@ -1,7 +1,7 @@
 {
   "name": "@agent24/desktop",
   "homepage": "https://github.com/iDoris-ai/Agent24",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "Agent24 Electron desktop shell",
   "author": {
