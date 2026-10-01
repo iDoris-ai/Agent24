@@ -128,13 +128,28 @@ where
     /// an active generation; output barrier; at most one dispatch; then at
     /// most one Ready credit followed by one control credit.
     pub(crate) fn step(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError> {
+        self.step_with_transport_failure(now, false)
+    }
+
+    /// Advance one turn while incorporating an external generation-local
+    /// transport observation into the same owner cleanup path.
+    pub(crate) fn step_with_transport_failure(
+        &mut self,
+        now: Instant,
+        transport_failure: bool,
+    ) -> Result<(), ActorLaunchOrderError> {
         self.actor.begin_turn();
-        if self.failure == FailureState::DeferredTransport {
-            self.latch_transport(now);
-            return Err(ActorLaunchOrderError::CleanupRequired);
-        }
         if self.failure == FailureState::LatchedTransport || self.schedule_state().terminal {
             return self.actor.cleanup_tick(now).map(|_| ());
+        }
+        // `ScheduleState::terminal` covers latched launch-order failures, not
+        // the Empty phase tombstone. Ignore stale worker failure observations
+        // once this generation has already been confirmed empty.
+        if matches!(self.schedule_state().phase, crate::actor::Phase::Empty) {
+            self.failure = FailureState::None;
+        } else if transport_failure || self.failure == FailureState::DeferredTransport {
+            self.latch_transport(now);
+            return Err(ActorLaunchOrderError::CleanupRequired);
         }
 
         let mut eof_shutdown = false;
@@ -690,6 +705,64 @@ mod tests {
     #[rustfmt::skip] #[test] fn eof_stops_running_and_closed_empty_drains(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Ok(ControlStep::Complete(IngressStep::Eof))],[],[Ok(WriteStep::Complete)],[Ok(ExitObservation::Running)]);prime(&mut x,n);x.actor.ready(n,ready()).unwrap();x.step(n).unwrap();assert_eq!(r.lock().unwrap().stops,vec![false]);let r=Arc::new(Mutex::new(R::default()));let mut x=d(r.clone(),[Err(ControlWorkerError::Closed)],[],[Ok(WriteStep::Complete)],[]);empty(&mut x,&r,n);reply(&mut x,8);x.step(n).unwrap();x.step(n).unwrap();let s=r.lock().unwrap();assert!(s.stops.is_empty());assert_eq!((s.polls,s.frames.len()),(1,2));}
     #[rustfmt::skip] #[test] fn maintenance_errors_and_transport_cleanup_retry_without_starvation(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Err(ControlWorkerError::Closed)],[],[],[]);assert_eq!(x.step(n),Err(ActorLaunchOrderError::CleanupRequired));r.lock().unwrap().reap_errors.push_back(io::ErrorKind::Interrupted);assert_eq!(x.step(n),Err(ActorLaunchOrderError::Reap(io::ErrorKind::Interrupted)));x.step(n).unwrap();let s=r.lock().unwrap();assert_eq!((s.cleanups,s.stops.clone()),(2,vec![true]));drop(s);let r=Arc::new(Mutex::new(R::default()));let mut x=d(r.clone(),[],[],[Ok(WriteStep::Complete)],[Err(io::Error::from(io::ErrorKind::Interrupted)),Err(io::Error::from(io::ErrorKind::Interrupted))]);prime(&mut x,n);reply(&mut x,9);for _ in 0..2{assert_eq!(x.step(n),Err(ActorLaunchOrderError::Observe(io::ErrorKind::Interrupted)))}assert_eq!(r.lock().unwrap().frames.len(),2);}
     #[rustfmt::skip] #[test] fn closed_permit_and_empty_output_failure_do_not_force_empty(){let r=Arc::new(Mutex::new(R::default()));let n=Instant::now();let mut x=d(r.clone(),[Ok(ControlStep::Idle)],[Err(ControlPermitError::Closed)],[],[]);x.step(n).unwrap();assert_eq!(x.step(n),Err(ActorLaunchOrderError::CleanupRequired));assert_eq!(r.lock().unwrap().stops,vec![true]);let r=Arc::new(Mutex::new(R::default()));let mut x=d_at(r.clone(),[],[],[Err(OutputWriteError::Closed)],[],Phase::Empty);reply(&mut x,10);x.step(n).unwrap();assert_eq!(x.step(n),Err(ActorLaunchOrderError::CleanupRequired));assert_eq!(x.schedule_state().phase,Phase::Empty);assert!(r.lock().unwrap().stops.is_empty());}
+
+    #[test]
+    fn external_transport_failure_forces_once_and_repeated_failure_keeps_reaping() {
+        let r = Arc::new(Mutex::new(R::default()));
+        r.lock().unwrap().trees.extend([
+            TreeObservation::Unconfirmed,
+            TreeObservation::ConfirmedEmpty,
+        ]);
+        let now = Instant::now();
+        let mut x = d_at(r.clone(), [], [], [], [], Phase::Running);
+
+        assert_eq!(
+            x.step_with_transport_failure(now, true),
+            Err(ActorLaunchOrderError::CleanupRequired)
+        );
+        assert_eq!(r.lock().unwrap().stops, vec![true]);
+        x.step_with_transport_failure(now, true).unwrap();
+        x.step_with_transport_failure(now, true).unwrap();
+
+        let facts = r.lock().unwrap();
+        assert_eq!(facts.stops, vec![true]);
+        assert_eq!(facts.cleanups, 2);
+        assert_eq!(x.schedule_state().phase, Phase::Empty);
+    }
+
+    #[test]
+    fn external_transport_failure_arriving_after_empty_is_ignored() {
+        let r = Arc::new(Mutex::new(R::default()));
+        let now = Instant::now();
+        let mut x = d_at(r.clone(), [], [], [], [], Phase::Empty);
+
+        x.step_with_transport_failure(now, true).unwrap();
+
+        let facts = r.lock().unwrap();
+        assert!(facts.stops.is_empty());
+        assert_eq!(facts.cleanups, 1);
+    }
+
+    #[test]
+    fn false_external_failure_preserves_running_and_eof_paths() {
+        let now = Instant::now();
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut running = d_at(r.clone(), [], [], [], [], Phase::Running);
+        running.step_with_transport_failure(now, false).unwrap();
+        assert!(r.lock().unwrap().stops.is_empty());
+
+        let r = Arc::new(Mutex::new(R::default()));
+        let mut eof = d_at(
+            r.clone(),
+            [Ok(ControlStep::Complete(IngressStep::Eof))],
+            [],
+            [],
+            [],
+            Phase::Running,
+        );
+        eof.step_with_transport_failure(now, false).unwrap();
+        assert_eq!(r.lock().unwrap().stops, vec![false]);
+    }
 
     #[test]
     fn eof_unconfirmed_continues_maintenance_without_a_new_stop() {

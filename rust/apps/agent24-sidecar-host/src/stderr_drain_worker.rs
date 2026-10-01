@@ -335,6 +335,58 @@ mod tests {
         assert_eq!(bytes.load(Ordering::Acquire), u64::MAX);
     }
 
+    struct FloodRead {
+        remaining: usize,
+        buffer_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Read for FloodRead {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.buffer_sizes.lock().unwrap().push(output.len());
+            let len = self.remaining.min(output.len());
+            output[..len].fill(b'x');
+            self.remaining -= len;
+            Ok(len)
+        }
+    }
+
+    #[test]
+    fn stderr_flood_is_discarded_with_fixed_buffer_and_saturating_count() {
+        let byte_count = 4 * 1024 * 1024 + 17;
+        let buffer_sizes = Arc::new(Mutex::new(Vec::new()));
+        let input = FloodRead {
+            remaining: byte_count,
+            buffer_sizes: Arc::clone(&buffer_sizes),
+        };
+        let mut worker = StderrDrainWorker::new(input).unwrap();
+
+        let snapshot = terminal(&mut worker);
+
+        assert_eq!(snapshot.bytes_drained, byte_count as u64);
+        assert_eq!(snapshot.status, StderrDrainStatus::Eof);
+        let sizes = buffer_sizes.lock().unwrap();
+        assert!(sizes.len() > 100);
+        assert!(sizes.iter().all(|&size| size == STDERR_DRAIN_BUFFER_BYTES));
+    }
+
+    #[test]
+    fn stderr_io_status_retains_kind_without_error_message() {
+        struct SecretErrorRead;
+        impl Read for SecretErrorRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other(
+                    "secret diagnostic text must not be retained",
+                ))
+            }
+        }
+
+        let mut worker = StderrDrainWorker::new(SecretErrorRead).unwrap();
+        let snapshot = terminal(&mut worker);
+
+        assert_eq!(snapshot.status, StderrDrainStatus::Io(ErrorKind::Other));
+        assert!(!format!("{snapshot:?}").contains("secret diagnostic text"));
+    }
+
     #[test]
     fn disconnected_terminal_channel_is_closed() {
         let (input, _) = reader(vec![Err(ErrorKind::WouldBlock)]);
