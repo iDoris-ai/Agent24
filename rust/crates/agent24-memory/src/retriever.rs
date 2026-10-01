@@ -16,7 +16,7 @@
 //! deterministically from the ledger, so it can be dropped and rebuilt.
 
 use async_trait::async_trait;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::Result;
 use crate::assertion::{Assertion, AssertionLedger};
@@ -57,15 +57,74 @@ impl FtsRetriever {
         sqlx::query("DELETE FROM mem_assertions_fts")
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "INSERT INTO mem_assertions_fts (id, scope_owner, subject, predicate, object)
-             SELECT id, scope_owner, subject, predicate, object FROM mem_assertions",
+        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT id, scope_owner, subject, predicate, object FROM mem_assertions ORDER BY id",
         )
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        for (id, owner, subject, predicate, object) in rows {
+            Self::index_tx(&mut tx, &id, &owner, &subject, &predicate, &object).await?;
+        }
+        sqlx::query("DELETE FROM mem_fts_state WHERE k = 'needs_rebuild'")
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
+
+    pub(crate) async fn index_tx(
+        conn: &mut SqliteConnection,
+        id: &str,
+        owner: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<()> {
+        let cjk = cjk_bigrams(&format!("{subject} {predicate} {object}"));
+        sqlx::query(
+            "INSERT INTO mem_assertions_fts (id, scope_owner, subject, predicate, object, cjk)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(subject)
+        .bind(predicate)
+        .bind(object)
+        .bind(cjk)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Search matching any token in the query.
+    pub async fn search_any(
+        &self,
+        query: &str,
+        owner: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        self.search_mode(query, owner, limit, " OR ").await
+    }
+}
+
+/// Overlapping bigrams of contiguous Han text; retain single-character runs.
+pub(crate) fn cjk_bigrams(text: &str) -> String {
+    text.split(|ch| !is_han(ch))
+        .filter(|run| !run.is_empty())
+        .flat_map(|run| {
+            let chars: Vec<char> = run.chars().collect();
+            if chars.len() == 1 {
+                vec![chars[0].to_string()]
+            } else {
+                chars.windows(2).map(|pair| pair.iter().collect()).collect()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn is_han(ch: char) -> bool {
+    matches!(ch as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F)
 }
 
 /// Turn free text into a safe FTS5 MATCH expression: SPLIT the input on every
@@ -86,22 +145,40 @@ pub(crate) fn is_searchable_query(query: &str) -> bool {
 }
 
 fn to_match_query(query: &str) -> Option<String> {
+    to_match_query_with(query, " ")
+}
+
+fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
+    let cjk = cjk_bigrams(query);
     let terms: Vec<String> = query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\""))
+        .split(|ch: char| !ch.is_alphanumeric() || is_han(ch))
+        .filter(|term| !term.is_empty())
+        .chain(cjk.split_whitespace())
+        .map(|term| format!("\"{term}\""))
         .collect();
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" "))
+        Some(terms.join(joiner))
     }
 }
 
 #[async_trait]
 impl Retriever for FtsRetriever {
     async fn search(&self, query: &str, owner: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let Some(match_expr) = to_match_query(query) else {
+        self.search_mode(query, owner, limit, " ").await
+    }
+}
+
+impl FtsRetriever {
+    async fn search_mode(
+        &self,
+        query: &str,
+        owner: &str,
+        limit: usize,
+        joiner: &str,
+    ) -> Result<Vec<SearchHit>> {
+        let Some(match_expr) = to_match_query_with(query, joiner) else {
             return Ok(Vec::new());
         };
         // Join the FTS hit back to the ledger to enforce scope + current + qualified.
@@ -146,6 +223,8 @@ mod tests {
     use crate::KvStore;
     use crate::assertion::{Assertion, AssertionStore};
     use crate::event::Scope;
+    use crate::event::{Origin, Trust};
+    use crate::writer::{Candidate, MemoryWriter};
     use serde_json::json;
 
     async fn fixture() -> (KvStore, FtsRetriever) {
@@ -178,6 +257,14 @@ mod tests {
         let hits = r.search("color", "u1", 10).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].assertion.id, "a1");
+        assert!(
+            r.search("color missing", "u1", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let any = r.search_any("color missing", "u1", 10).await.unwrap();
+        assert_eq!(any, hits);
     }
 
     #[tokio::test]
@@ -227,6 +314,7 @@ mod tests {
             .await
             .unwrap();
         assert!(r.search("mood", "u1", 10).await.unwrap().is_empty());
+        assert!(r.search_any("mood", "u1", 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -237,6 +325,7 @@ mod tests {
         cand.qualified = false;
         l.assert(&cand).await.unwrap();
         assert!(r.search("guess", "u1", 10).await.unwrap().is_empty());
+        assert!(r.search_any("guess", "u1", 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -342,6 +431,116 @@ mod tests {
         assert!(r.search("legacy", "u1", 10).await.unwrap().is_empty());
         r.rebuild().await.unwrap(); // == 0005's backfill statement
         assert_eq!(r.search("legacy", "u1", 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cjk_search_matches_terms_and_full_question() {
+        let (kv, r) = fixture().await;
+        let l = kv.assertions();
+        l.assert(&a("peanut", "u1", "user", json!("我对花生过敏")))
+            .await
+            .unwrap();
+        l.assert(&a("duck", "u1", "user", json!("我喜欢北京烤鸭")))
+            .await
+            .unwrap();
+        for q in ["花生", "过敏"] {
+            assert_eq!(
+                r.search(q, "u1", 10).await.unwrap()[0].assertion.id,
+                "peanut"
+            );
+            assert_eq!(
+                r.search_any(q, "u1", 10).await.unwrap()[0].assertion.id,
+                "peanut"
+            );
+        }
+        let q = "我对什么过敏？";
+        assert!(r.search(q, "u1", 10).await.unwrap().is_empty());
+        assert!(r.search_any(q, "other", 10).await.unwrap().is_empty());
+        let hits = r.search_any(q, "u1", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].assertion.id, "peanut");
+        assert_eq!(r.search_any(q, "u1", 1).await.unwrap(), hits);
+    }
+
+    #[tokio::test]
+    async fn write_gate_cjk_is_searchable_and_rebuildable() {
+        let (kv, r) = fixture().await;
+        let candidate = Candidate::new(
+            "new-cn",
+            Scope::owner("u2"),
+            "user",
+            "said",
+            json!("我对花生过敏"),
+            Origin {
+                source: "test".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+        .with_evidence(vec!["event-1".into()])
+        .remember();
+        kv.write_gate().propose(vec![candidate]).await.unwrap();
+        assert_eq!(
+            r.search_any("花生", "u2", 10).await.unwrap()[0]
+                .assertion
+                .id,
+            "new-cn"
+        );
+        let q = "我对什么过敏？";
+        let hits = r.search_any(q, "u2", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        sqlx::query("DELETE FROM mem_assertions_fts")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        assert!(r.search_any(q, "u2", 10).await.unwrap().is_empty());
+        r.rebuild().await.unwrap();
+        assert_eq!(r.search_any(q, "u2", 10).await.unwrap(), hits);
+    }
+
+    #[tokio::test]
+    async fn rebuild_failure_rolls_back_index_and_keeps_rebuild_marker() {
+        let (kv, r) = fixture().await;
+        let l = kv.assertions();
+        l.assert(&a("a1", "u1", "alpha", json!("one")))
+            .await
+            .unwrap();
+        l.assert(&a("a2", "u1", "beta", json!("two")))
+            .await
+            .unwrap();
+        let before: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, subject FROM mem_assertions_fts ORDER BY id")
+                .fetch_all(&r.pool)
+                .await
+                .unwrap();
+        let before_search = r.search("alpha", "u1", 10).await.unwrap();
+        sqlx::query("INSERT OR REPLACE INTO mem_fts_state VALUES ('needs_rebuild','1')")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER fail_rebuild BEFORE INSERT ON mem_assertions_fts_content WHEN new.c0='a2' BEGIN SELECT RAISE(ABORT, 'injected rebuild failure'); END")
+            .execute(&r.pool).await.unwrap();
+        assert!(r.rebuild().await.is_err());
+        let after: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, subject FROM mem_assertions_fts ORDER BY id")
+                .fetch_all(&r.pool)
+                .await
+                .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(r.search("alpha", "u1", 10).await.unwrap(), before_search);
+        let marker: String =
+            sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k='needs_rebuild'")
+                .fetch_one(&r.pool)
+                .await
+                .unwrap();
+        assert_eq!(marker, "1");
+    }
+
+    #[test]
+    fn cjk_bigram_rules_cover_runs_single_chars_and_non_cjk() {
+        assert_eq!(cjk_bigrams("中文测试 A词"), "中文 文测 测试 词");
+        assert_eq!(cjk_bigrams("a中b"), "中");
+        assert_eq!(cjk_bigrams("abc 123"), "");
+        assert_eq!(cjk_bigrams("中文，测试"), "中文 测试");
     }
 
     #[test]

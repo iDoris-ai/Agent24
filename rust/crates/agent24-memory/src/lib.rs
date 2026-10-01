@@ -287,6 +287,7 @@ impl KvStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        Self::rebuild_fts_if_needed(&pool).await?;
         Ok(Self {
             pool,
             oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
@@ -311,6 +312,7 @@ impl KvStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        Self::rebuild_fts_if_needed(&pool).await?;
         // T8.5c-W-mount decision 4: this pool's one connection is already
         // needed by the in-process path, so there is no headroom to lend an
         // out-of-process caller — `oop_admission` stays `None`, not
@@ -321,6 +323,17 @@ impl KvStore {
             pool,
             oop_admission: None,
         })
+    }
+
+    async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
+                .fetch_optional(pool)
+                .await?;
+        if marker.as_deref() == Some("1") {
+            retriever::FtsRetriever::new(pool.clone()).rebuild().await?;
+        }
+        Ok(())
     }
 
     /// T8.5c-W-mount decision 4: the daemon-level connection-admission
@@ -1431,6 +1444,49 @@ mod tests {
             "a historical non-null last_seen_at must not be wiped to NULL by the rebuild — \
              the migration only changes what a NEW insert writes, not existing rows"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_0017_rebuilds_cjk_fts_for_existing_assertions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let pool = pool_migrated_up_to(&path, 17).await;
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 15);
+        sqlx::query(
+            "INSERT INTO mem_assertions
+                 (id, scope_owner, scope, subject, predicate, object, valid_from,
+                  recorded_from, evidence, confidence, modality, writer_version, qualified)
+             VALUES ('cjk', 'alice', '{\"owner\":\"alice\"}', 'user', 'said',
+                     '\"我对花生过敏\"', '2026-01-01', '2026-01-01', '[]', 1.0,
+                     'said', 'test', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        for _ in 0..2 {
+            let kv = KvStore::open(&path).await.unwrap();
+            assert_eq!(
+                kv.retriever()
+                    .search_any("我对什么过敏？", "alice", 5)
+                    .await
+                    .unwrap()[0]
+                    .assertion
+                    .id,
+                "cjk"
+            );
+            let marker: Option<String> =
+                sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
+                    .fetch_optional(&kv.pool)
+                    .await
+                    .unwrap();
+            assert_ne!(marker.as_deref(), Some("1"));
+        }
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);
