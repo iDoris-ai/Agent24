@@ -37,10 +37,6 @@ pub enum CommError {
     #[error("invalid: {0}")]
     Invalid(String),
     #[error("not_found: {0}")]
-    #[allow(
-        dead_code,
-        reason = "no COMM-2a route looks an id up before acting (that is COMM-2b/3's import/outbox work); kept so this closed set matches §4 exactly"
-    )]
     NotFound(String),
     #[error("confirm_required")]
     ConfirmRequired,
