@@ -25,6 +25,7 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -620,21 +621,44 @@ async fn read_list(ctx: &Ctx, args: &[&str]) -> Result<Value, DaemonStartError> 
 /// Opens the daemon's log file for one spawn: truncated if it has grown
 /// past [`LOG_TRUNCATE_CAP`], mode 0600, stdout and stderr both pointed at
 /// it (COMM-HYPHAE.md §6.3).
-fn open_log_pair(path: &Path) -> io::Result<(Stdio, Stdio)> {
+///
+/// Codex COMM-4b review, round 2, Low: whether to truncate is decided from
+/// the metadata of the SAME already-open file handle, never a path-based
+/// `std::fs::metadata` call taken before `open()` — a `metadata()` →
+/// `open()` gap could have the file replaced in between (new inode, same
+/// path), making the truncate decision about a file whose size was never
+/// actually the one just opened. Opening with `append(true)` up front
+/// (rather than choosing `append` vs. `write+truncate` ahead of time) and
+/// then calling `set_len(0)` on that same handle when it turns out to be
+/// too large works just as well as a separate `O_TRUNC` open: `O_APPEND`
+/// always writes at the current end-of-file regardless of this handle's
+/// seek position, so truncating it to 0 here still leaves every subsequent
+/// write landing at the (now empty) end, exactly like a from-scratch
+/// `O_TRUNC` open would.
+fn open_log_pair(path: &Path, truncate_generation: &AtomicU64) -> io::Result<(Stdio, Stdio)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let truncate = std::fs::metadata(path)
-        .map(|m| m.len() > LOG_TRUNCATE_CAP)
-        .unwrap_or(false);
-    let mut opts = OpenOptions::new();
-    opts.create(true).mode(0o600);
-    if truncate {
-        opts.write(true).truncate(true);
-    } else {
-        opts.append(true);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    if file.metadata()?.len() > LOG_TRUNCATE_CAP {
+        file.set_len(0)?;
+        // Codex COMM-4b review, round 2, Medium: this is the ONE place the
+        // log is ever truncated in place (same inode, same path) — bump the
+        // shared counter so `catch_up_from_log`'s scan cache can tell "this
+        // exact inode was just truncated" apart from "nothing happened to
+        // it", which a bare `len < guard.offset` comparison cannot: if the
+        // daemon writes enough new bytes before the next `catch_up()` poll
+        // ever runs, the truncated-then-regrown file's current length can
+        // already be >= the stale cached offset by the time anyone looks,
+        // making the truncation invisible to that comparison and silently
+        // skipping everything in the first `offset` bytes of the new
+        // content forever.
+        truncate_generation.fetch_add(1, Ordering::SeqCst);
     }
-    let file = opts.open(path)?;
     let file2 = file.try_clone()?;
     Ok((Stdio::from(file), Stdio::from(file2)))
 }
@@ -664,6 +688,7 @@ struct Spawned {
 async fn try_start(
     ctx: &Ctx,
     shutdown_deadline: &OnceLock<Instant>,
+    log_truncate_generation: &AtomicU64,
 ) -> Result<Spawned, DaemonStartError> {
     let identities = read_list(ctx, &["identity", "list"]).await?;
     let nickname = identities
@@ -740,8 +765,8 @@ async fn try_start(
     cmd.current_dir(&ctx.home);
     cmd.process_group(0);
     cmd.stdin(Stdio::piped());
-    let (stdout, stderr) =
-        open_log_pair(&ctx.log_path).map_err(|e| DaemonStartError::Failed(e.to_string()))?;
+    let (stdout, stderr) = open_log_pair(&ctx.log_path, log_truncate_generation)
+        .map_err(|e| DaemonStartError::Failed(e.to_string()))?;
     cmd.stdout(stdout);
     cmd.stderr(stderr);
 
@@ -910,12 +935,27 @@ struct CatchUpScanState {
     /// when it's checked.
     tail: Vec<u8>,
     /// Whether the byte immediately preceding `tail[0]` in the file is a
-    /// newline (or `tail` is empty at file offset 0 — the start of the
-    /// file counts as a line start too). [`line_starts_with_incomplete_marker`]
-    /// only ever applies at a true line start, and a candidate match
-    /// beginning at `tail[0]` needs to know this without re-reading
-    /// anything already scanned.
-    tail_preceded_by_newline: bool,
+    /// line boundary — `\n`, OR `\r` (Codex COMM-4b review, round 2, Medium:
+    /// Hyphae's own `fmt.Printf("[%s] Watching... (no new messages)\r", …)`,
+    /// `internal/daemon/daemon.go:344`, locked source, ends that line with a
+    /// bare `\r` and no `\n` at all — the very next thing written to the log
+    /// can be a marker line starting immediately after that `\r`, with no
+    /// newline anywhere in between) — or `tail` is empty at file offset 0
+    /// (the start of the file counts as a line start too).
+    /// [`line_starts_with_incomplete_marker`] only ever applies at a true
+    /// line start, and a candidate match beginning at `tail[0]` needs to
+    /// know this without re-reading anything already scanned.
+    tail_preceded_by_line_boundary: bool,
+    /// The [`open_log_pair`] truncate-generation counter's value the last
+    /// time this cache was (re)built from byte 0 (Codex COMM-4b review,
+    /// round 2, Medium). When the CURRENT counter value no longer matches
+    /// this, the log was truncated in place since this cache was last
+    /// trusted — even if `file_id` is unchanged (truncating never changes
+    /// the inode) and even if the file has since regrown past `offset`
+    /// (which alone would make `len < offset` look like "nothing happened"
+    /// too) — so the scan must restart from byte 0 regardless of what `len`
+    /// vs. `offset` says.
+    truncate_generation: u64,
     /// Whether an incomplete-scan line has EVER been recognized for this
     /// file identity. Once true, `catch_up`'s `state` stays `"incomplete"`
     /// — nothing un-sets it short of the log being truncated or replaced
@@ -936,7 +976,11 @@ struct CatchUpScanState {
 /// ever read. A missing or unreadable log (e.g. before the daemon has ever
 /// started) reports whatever `scan` already knows — `"unknown"` before the
 /// first successful scan — never an error.
-async fn catch_up_from_log(log_path: &Path, scan: &AsyncMutex<CatchUpScanState>) -> CatchUpStatus {
+async fn catch_up_from_log(
+    log_path: &Path,
+    scan: &AsyncMutex<CatchUpScanState>,
+    truncate_generation: &AtomicU64,
+) -> CatchUpStatus {
     fn status_from(guard: &CatchUpScanState) -> CatchUpStatus {
         CatchUpStatus {
             state: if guard.found_incomplete {
@@ -955,16 +999,24 @@ async fn catch_up_from_log(log_path: &Path, scan: &AsyncMutex<CatchUpScanState>)
     };
     let file_id = (meta.dev(), meta.ino());
     let len = meta.len();
+    let current_truncate_generation = truncate_generation.load(Ordering::SeqCst);
 
-    // A different inode/device, or a file now SHORTER than what was
-    // already scanned, means the log was truncated or replaced (COMM-4a's
-    // own `LOG_TRUNCATE_CAP` truncation at spawn, or any future rotation)
-    // — start over from byte 0 rather than mixing scan state across two
-    // different underlying files that happen to share a path.
-    if guard.file_id != Some(file_id) || len < guard.offset {
+    // A different inode/device, a file now SHORTER than what was already
+    // scanned, OR the shared truncate-generation counter having moved on
+    // (Codex COMM-4b review, round 2, Medium) means the log was truncated
+    // or replaced (COMM-4a's own `LOG_TRUNCATE_CAP` truncation at spawn, or
+    // any future rotation) — start over from byte 0 rather than mixing scan
+    // state across two different underlying files that happen to share a
+    // path, or across a truncate-then-regrow that `len < offset` alone
+    // cannot see if enough new data landed before this scan ever ran.
+    if guard.file_id != Some(file_id)
+        || len < guard.offset
+        || guard.truncate_generation != current_truncate_generation
+    {
         *guard = CatchUpScanState {
             file_id: Some(file_id),
-            tail_preceded_by_newline: true,
+            tail_preceded_by_line_boundary: true,
+            truncate_generation: current_truncate_generation,
             ..Default::default()
         };
     }
@@ -998,9 +1050,13 @@ async fn catch_up_from_log(log_path: &Path, scan: &AsyncMutex<CatchUpScanState>)
 
                 for i in 0..window.len() {
                     let is_line_start = if i == 0 {
-                        guard.tail_preceded_by_newline
+                        guard.tail_preceded_by_line_boundary
                     } else {
-                        window[i - 1] == b'\n'
+                        // `\r` counts too (Codex COMM-4b review, round 2,
+                        // Medium) — see `tail_preceded_by_line_boundary`'s
+                        // doc comment for why a bare `\r` with no `\n` can
+                        // immediately precede a real marker line.
+                        matches!(window[i - 1], b'\n' | b'\r')
                     };
                     if is_line_start && line_starts_with_incomplete_marker(&window[i..]) {
                         matched_new_bytes = true;
@@ -1010,11 +1066,12 @@ async fn catch_up_from_log(log_path: &Path, scan: &AsyncMutex<CatchUpScanState>)
                 let keep = (MARKER_LINE_LEN.saturating_sub(1)).min(window.len());
                 let discarded = window.len() - keep;
                 if discarded > 0 {
-                    guard.tail_preceded_by_newline = window[discarded - 1] == b'\n';
+                    guard.tail_preceded_by_line_boundary =
+                        matches!(window[discarded - 1], b'\n' | b'\r');
                 }
                 // else: nothing dropped from the front, so the byte
                 // preceding the (unchanged) tail start is still whatever
-                // it was before this chunk — `tail_preceded_by_newline`
+                // it was before this chunk — `tail_preceded_by_line_boundary`
                 // stays as-is.
                 guard.tail = window[discarded..].to_vec();
                 guard.offset += n as u64;
@@ -1107,6 +1164,12 @@ pub struct HyphaeDaemonSupervisor {
     /// identity, carried tail bytes, and the sticky `found_incomplete`/
     /// `last_incomplete_at_ms` facts) — see [`CatchUpScanState`].
     catch_up_scan: Arc<AsyncMutex<CatchUpScanState>>,
+    /// Codex COMM-4b review, round 2, Medium: bumped by [`open_log_pair`]
+    /// every time it truncates the log in place for a fresh spawn, and
+    /// checked by [`catch_up_from_log`] alongside its own `(file_id,
+    /// offset)` comparison — see [`open_log_pair`]'s doc comment for why
+    /// `len < offset` alone cannot always detect a truncate-then-regrow.
+    log_truncate_generation: Arc<AtomicU64>,
     /// COMM-4b: the most recent manual `POST /comm/relay/probe` result, if
     /// any. Written by the `/relay/probe` route via
     /// [`Self::record_relay_probe`] — this actor never touches it.
@@ -1153,10 +1216,12 @@ impl HyphaeDaemonSupervisor {
         let shutdown_deadline = Arc::new(OnceLock::new());
         let log_path = Arc::new(ctx.log_path.clone());
         let catch_up_scan = Arc::new(AsyncMutex::new(CatchUpScanState::default()));
+        let log_truncate_generation = Arc::new(AtomicU64::new(0));
         let relay_probe = Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_actor(
             ctx,
+            Arc::clone(&log_truncate_generation),
             cmd_rx,
             Arc::clone(&status),
             Arc::clone(&shutdown_deadline),
@@ -1167,6 +1232,7 @@ impl HyphaeDaemonSupervisor {
             shutdown_deadline,
             log_path,
             catch_up_scan,
+            log_truncate_generation,
             relay_probe,
         }
     }
@@ -1192,7 +1258,12 @@ impl HyphaeDaemonSupervisor {
     /// daemon's own log file (COMM-HYPHAE.md §5.2) — only the bytes
     /// appended since the previous call are ever read.
     pub async fn catch_up(&self) -> CatchUpStatus {
-        catch_up_from_log(&self.log_path, &self.catch_up_scan).await
+        catch_up_from_log(
+            &self.log_path,
+            &self.catch_up_scan,
+            &self.log_truncate_generation,
+        )
+        .await
     }
 
     #[must_use]
@@ -1297,12 +1368,13 @@ async fn stop_phase(
 
 async fn spawn_and_record(
     ctx: &Ctx,
+    log_truncate_generation: &AtomicU64,
     generation: &mut u64,
     status: &Mutex<DaemonStatus>,
     failures: u32,
     shutdown_deadline: &OnceLock<Instant>,
 ) -> Result<Phase, DaemonStartError> {
-    match try_start(ctx, shutdown_deadline).await {
+    match try_start(ctx, shutdown_deadline, log_truncate_generation).await {
         Ok(mut spawned) => {
             // PR #642 review round 3, High #1: the three call sites below
             // only check `shutdown_deadline` BEFORE this function is even
@@ -1493,6 +1565,7 @@ async fn classify_exit(
 
 async fn run_actor(
     ctx: Ctx,
+    log_truncate_generation: Arc<AtomicU64>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     status: Arc<Mutex<DaemonStatus>>,
     shutdown_deadline: Arc<OnceLock<Instant>>,
@@ -1565,7 +1638,7 @@ async fn run_actor(
                             // the policy exactly as it was; only THIS path
                             // resets it.
                             policy = RestartPolicy::new();
-                            match spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline).await {
+                            match spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline).await {
                                 Ok(p) => {
                                     phase = p;
                                     // PR #626 review, Medium #3: NOT
@@ -1610,7 +1683,7 @@ async fn run_actor(
                             // chase a SECOND generation this restart would
                             // otherwise have just spawned.
                             phase = if shutdown_deadline.get().is_none() {
-                                spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
+                                spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
                                     .await
                                     .unwrap_or(Phase::Idle)
                             } else {
@@ -1698,7 +1771,7 @@ async fn run_actor(
             () = tokio::time::sleep_until(backoff_deadline.unwrap_or_else(tokio::time::Instant::now)), if backoff_deadline.is_some() => {
                 // PR #626 review, High #2: "关机开始后禁止再 spawn".
                 phase = if shutdown_deadline.get().is_none() {
-                    spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
+                    spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
                         .await
                         .unwrap_or(Phase::Idle)
                 } else {
@@ -1963,10 +2036,24 @@ mod tests {
         AsyncMutex::new(CatchUpScanState::default())
     }
 
+    /// A fresh `log_truncate_generation` counter at `0` — every direct
+    /// `catch_up_from_log` call below that isn't exercising
+    /// [`open_log_pair`]'s truncation itself wants its own, never-bumped
+    /// counter (equivalent to a supervisor whose log has never been
+    /// truncated in place).
+    fn fresh_truncate_gen() -> AtomicU64 {
+        AtomicU64::new(0)
+    }
+
     #[tokio::test]
     async fn catch_up_is_unknown_when_the_log_does_not_exist_yet() {
         let tmp = tempfile::tempdir().unwrap();
-        let status = catch_up_from_log(&tmp.path().join("no-such-log"), &fresh_scan()).await;
+        let status = catch_up_from_log(
+            &tmp.path().join("no-such-log"),
+            &fresh_scan(),
+            &fresh_truncate_gen(),
+        )
+        .await;
         assert_eq!(status.state, "unknown");
         assert_eq!(status.last_incomplete_at_ms, None);
     }
@@ -1983,7 +2070,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let status = catch_up_from_log(&log, &fresh_scan()).await;
+        let status = catch_up_from_log(&log, &fresh_scan(), &fresh_truncate_gen()).await;
         assert_eq!(status.state, "incomplete");
         assert!(
             status.last_incomplete_at_ms.is_some_and(|ms| ms > 0),
@@ -2011,7 +2098,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let log = tmp.path().join("hyphae-daemon.log");
             tokio::fs::write(&log, sample).await.unwrap();
-            let status = catch_up_from_log(&log, &fresh_scan()).await;
+            let status = catch_up_from_log(&log, &fresh_scan(), &fresh_truncate_gen()).await;
             assert_ne!(
                 status.state, "complete",
                 "sample {sample:?} must never produce \"complete\""
@@ -2044,7 +2131,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let status = catch_up_from_log(&log, &fresh_scan()).await;
+        let status = catch_up_from_log(&log, &fresh_scan(), &fresh_truncate_gen()).await;
         assert_eq!(
             status.state, "unknown",
             "a message body merely mentioning the phrase must never be mistaken for \
@@ -2072,7 +2159,8 @@ mod tests {
         tokio::fs::write(&log, &content).await.unwrap();
 
         let scan = fresh_scan();
-        let status = catch_up_from_log(&log, &scan).await;
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
         assert_eq!(status.state, "incomplete", "{status:?}");
     }
 
@@ -2094,7 +2182,8 @@ mod tests {
         tokio::fs::write(&log, &content).await.unwrap();
 
         let scan = fresh_scan();
-        let status = catch_up_from_log(&log, &scan).await;
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
         assert_eq!(
             status.state, "incomplete",
             "a marker line split across two scan chunks must still be found: {status:?}"
@@ -2159,7 +2248,11 @@ mod tests {
         .await
         .unwrap();
         let scan = fresh_scan();
-        assert_eq!(catch_up_from_log(&log, &scan).await.state, "unknown");
+        let truncate_gen = fresh_truncate_gen();
+        assert_eq!(
+            catch_up_from_log(&log, &scan, &truncate_gen).await.state,
+            "unknown"
+        );
 
         // Truncate and replace with fresh, shorter content whose own
         // marker line sits right at the new file's start.
@@ -2169,11 +2262,147 @@ mod tests {
         )
         .await
         .unwrap();
-        let status = catch_up_from_log(&log, &scan).await;
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
         assert_eq!(
             status.state, "incomplete",
             "a truncated-and-replaced log must be rescanned from byte 0, not skipped \
              because its new length is shorter than the old offset: {status:?}"
+        );
+    }
+
+    /// Codex COMM-4b review, round 2, Medium: [`open_log_pair`] truncating
+    /// the SAME inode in place at a fresh spawn must bump the shared
+    /// `truncate_generation` counter exactly when (and only when) it
+    /// actually truncates — never on a brand-new log, never on a log that
+    /// never grew past [`LOG_TRUNCATE_CAP`], and never a second time on a
+    /// log that's already back under the cap. This is the production
+    /// wiring the two `catch_up_rescans_after_a_truncate_whose_new_length_*`
+    /// tests below simulate with a manual `fetch_add` (to keep those tests'
+    /// file sizes small and fast) — this test proves the real call site
+    /// actually performs that bump.
+    #[tokio::test]
+    async fn open_log_pair_bumps_the_truncate_generation_exactly_when_it_truncates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let truncate_gen = AtomicU64::new(0);
+
+        // A brand-new log: nothing to truncate.
+        drop(open_log_pair(&log, &truncate_gen).unwrap());
+        assert_eq!(
+            truncate_gen.load(Ordering::SeqCst),
+            0,
+            "opening a brand-new log must never bump the truncate generation"
+        );
+
+        // Grow it past LOG_TRUNCATE_CAP.
+        tokio::fs::write(&log, vec![b'z'; (LOG_TRUNCATE_CAP + 1) as usize])
+            .await
+            .unwrap();
+        drop(open_log_pair(&log, &truncate_gen).unwrap());
+        assert_eq!(
+            truncate_gen.load(Ordering::SeqCst),
+            1,
+            "truncating an oversized log must bump the shared generation counter"
+        );
+
+        // It's back under the cap (truncated to 0 by the call above) — a
+        // further open must not bump it again.
+        drop(open_log_pair(&log, &truncate_gen).unwrap());
+        assert_eq!(
+            truncate_gen.load(Ordering::SeqCst),
+            1,
+            "opening a log that's already under the cap must not bump the \
+             generation a second time"
+        );
+    }
+
+    /// Codex COMM-4b review, round 2, Medium: the scenario the bug report
+    /// names explicitly — the log is truncated in place (same inode, COMM-
+    /// 4a's own spawn-time behavior), then regrows to a new length that
+    /// lands EXACTLY on the stale cached `offset` before `catch_up()` is
+    /// ever polled again. `len < guard.offset` alone sees `len == offset`
+    /// (neither "shorter" nor obviously different) and would otherwise skip
+    /// rescanning entirely, silently losing whatever marker line sits in
+    /// the regrown content's first `offset` bytes forever. The
+    /// `truncate_generation` bump is what catches this when the length
+    /// comparison cannot.
+    ///
+    /// The truncation itself is driven by plain `tokio::fs::write` (not
+    /// `open_log_pair`) so this test can pick the exact resulting length
+    /// without a multi-megabyte file; `truncate_gen.fetch_add` stands in
+    /// for what `open_log_pair` does at the real truncation call site (see
+    /// `open_log_pair_bumps_the_truncate_generation_exactly_when_it_truncates`
+    /// for proof that it really does).
+    #[tokio::test]
+    async fn catch_up_rescans_after_a_truncate_whose_new_length_exactly_equals_the_old_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let preamble = "a very long preamble that is definitely not a marker line here\n";
+        tokio::fs::write(&log, preamble).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = AtomicU64::new(0);
+        let before = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(before.state, "unknown", "{before:?}");
+        let old_offset = scan.lock().await.offset;
+        assert_eq!(old_offset, preamble.len() as u64, "test setup");
+
+        // Truncate the same inode and regrow it to EXACTLY `old_offset`
+        // bytes, with the marker line's first byte right at the new file's
+        // very start.
+        let marker_line = "[00:00:01] \u{26A0}\u{FE0F}  Inbox scan incomplete: reset\n";
+        let mut regrown = marker_line.as_bytes().to_vec();
+        assert!(
+            (regrown.len() as u64) < old_offset,
+            "test setup: the marker line alone must be shorter than old_offset so \
+             padding below actually pads"
+        );
+        regrown.resize(old_offset as usize, b'z');
+        tokio::fs::write(&log, &regrown).await.unwrap();
+        truncate_gen.fetch_add(1, Ordering::SeqCst);
+
+        let after = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            after.state, "incomplete",
+            "a truncate-then-regrow whose new length lands EXACTLY on the old \
+             cached offset must still be rescanned from byte 0 via the \
+             truncate-generation bump: {after:?}"
+        );
+    }
+
+    /// Same scenario as the "exactly equals" test above, except the regrown
+    /// file's new length EXCEEDS the old cached offset — `len < guard.offset`
+    /// is unambiguously false here too (`len` is now the larger number), so
+    /// only the truncate-generation bump can catch it.
+    #[tokio::test]
+    async fn catch_up_rescans_after_a_truncate_whose_new_length_exceeds_the_old_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let preamble = "a very long preamble that is definitely not a marker line here\n";
+        tokio::fs::write(&log, preamble).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = AtomicU64::new(0);
+        let before = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(before.state, "unknown", "{before:?}");
+        let old_offset = scan.lock().await.offset;
+
+        // Truncate the same inode and regrow it to well PAST `old_offset`
+        // bytes — the marker line sits at the start, with plenty of
+        // ordinary trailing content after it.
+        let marker_line = "[00:00:01] \u{26A0}\u{FE0F}  Inbox scan incomplete: reset\n";
+        let mut regrown = marker_line.as_bytes().to_vec();
+        regrown.extend(std::iter::repeat_n(b'z', old_offset as usize + 200));
+        assert!(regrown.len() as u64 > old_offset, "test setup");
+        tokio::fs::write(&log, &regrown).await.unwrap();
+        truncate_gen.fetch_add(1, Ordering::SeqCst);
+
+        let after = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            after.state, "incomplete",
+            "a truncate-then-regrow whose new length EXCEEDS the old cached offset \
+             must still be rescanned from byte 0 via the truncate-generation bump, \
+             not skipped as if the file had simply grown normally: {after:?}"
         );
     }
 
@@ -2194,8 +2423,111 @@ mod tests {
         tokio::fs::write(&log, &content).await.unwrap();
 
         let scan = fresh_scan();
-        let status = catch_up_from_log(&log, &scan).await;
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
         assert_eq!(status.state, "incomplete", "{status:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // Codex COMM-4b review, round 2, Medium: a marker line starting right
+    // after a bare `\r` (no `\n`) — Hyphae's own
+    // `fmt.Printf("[%s] Watching... (no new messages)\r", …)`
+    // (`internal/daemon/daemon.go:344`, locked source) ends that status
+    // line with `\r` alone, so the very next thing printed (including a
+    // marker line, if the following watch tick fails) can start right
+    // after it with no newline anywhere in between.
+    // -------------------------------------------------------------------
+
+    /// The marker line and its preceding `\r` both land in the SAME scan
+    /// (small log, one chunk) — the baseline case the within-window
+    /// `window[i - 1]` check must recognize.
+    #[tokio::test]
+    async fn catch_up_detects_a_marker_line_immediately_after_a_bare_cr_with_no_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let mut content = b"[10:00:00] Watching... (no new messages)\r".to_vec();
+        content.extend_from_slice(
+            b"[10:00:05] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: dial tcp refused\n",
+        );
+        tokio::fs::write(&log, &content).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            status.state, "incomplete",
+            "a marker line starting right after a bare `\\r` (no `\\n`) must still be \
+             recognized: {status:?}"
+        );
+    }
+
+    /// The `\r` and the marker line it immediately precedes are split across
+    /// two [`CATCH_UP_SCAN_CHUNK_BYTES`] chunks of the SAME scan — proving
+    /// the carried `tail`/`tail_preceded_by_line_boundary` state (not just
+    /// the in-window check) recognizes a `\r` boundary, the same way the
+    /// `\n` sibling test above proves it for a newline.
+    #[tokio::test]
+    async fn catch_up_detects_a_marker_line_split_by_a_bare_cr_exactly_across_two_scan_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let marker_line = "[08:30:00] \u{26A0}\u{FE0F}  Inbox scan incomplete: timeout\n";
+        // Same padding math as `catch_up_detects_a_marker_line_split_exactly_across_two_scan_chunks`
+        // above, just with a bare `\r` in place of `\n` as the line boundary
+        // immediately before the marker.
+        let pad_len = CATCH_UP_SCAN_CHUNK_BYTES - 5;
+        let mut content = "a".repeat(pad_len);
+        content.push('\r');
+        content.push_str(marker_line);
+        tokio::fs::write(&log, &content).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            status.state, "incomplete",
+            "a marker line immediately preceded by a bare `\\r` (no `\\n`), split \
+             across two scan chunks, must still be found: {status:?}"
+        );
+    }
+
+    /// The `\r` is the very last byte scanned in one `catch_up_from_log`
+    /// CALL, and the marker line is only appended (and scanned) in a LATER,
+    /// separate call — proving the persisted scan cache carries the `\r`
+    /// boundary fact across calls, not just across chunks within one call.
+    #[tokio::test]
+    async fn catch_up_detects_a_marker_line_after_a_bare_cr_carried_across_two_separate_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        tokio::fs::write(
+            &log,
+            "🚀 Starting daemon for 'alice'\n[10:00:00] Watching... (no new messages)\r",
+        )
+        .await
+        .unwrap();
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let first = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(first.state, "unknown", "{first:?}");
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .await
+            .unwrap();
+        file.write_all(
+            b"[10:00:05] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: dial tcp refused\n",
+        )
+        .await
+        .unwrap();
+        file.flush().await.unwrap();
+
+        let second = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            second.state, "incomplete",
+            "a marker line appended right after a bare `\\r` left over from a \
+             PREVIOUS catch_up() call must still be recognized once scanned in a \
+             later call: {second:?}"
+        );
     }
 
     /// Codex COMM-4b review, High: concurrent `catch_up()` calls against

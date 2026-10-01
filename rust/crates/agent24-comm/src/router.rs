@@ -780,13 +780,23 @@ struct RelayProbeReq {
 /// dialed. Resolving it here means `probe_relay` always has an address to
 /// pass explicitly to `relay info` and to record, on either outcome.
 ///
+/// Codex COMM-4b review, round 2, Low: an explicit-but-empty `requested`
+/// (`{"url": ""}`) is treated exactly like `None`, not like a real target —
+/// Hyphae's own `relayInfo` (`internal/nostr/relay.go:70`, locked source:
+/// `url := relayInfoURLArg; if url == "" { … resolve the default … }`) falls
+/// through to its own config resolution when the CLI arg is empty, rather
+/// than treating `""` as an address to dial. Before this fix, `Some("")`
+/// matched the `if let Some(url) = requested` arm just like any other
+/// non-empty string, short-circuiting straight past the `relay list`
+/// fallback below and sending a literal empty string on to `relay info`.
+///
 /// Best-effort: if this auxiliary `relay list` call itself fails for any
 /// reason, this returns `None` and `probe_relay` falls back to its old
 /// behavior of leaving the explicit arg off `relay info`, letting Hyphae
 /// resolve it internally — a failure here is not reason to fail the probe
 /// itself.
 async fn effective_probe_target(runner: &HyphaeRunner, requested: Option<&str>) -> Option<String> {
-    if let Some(url) = requested {
+    if let Some(url) = requested.filter(|url| !url.is_empty()) {
         return Some(url.to_owned());
     }
     let envelope = runner.run(read_invocation(&["relay", "list"])).await.ok()?;
@@ -2194,6 +2204,76 @@ echo '{"ok":true,"data":{"relays":["wss://a","wss://b"],"source":"config"}}'
         assert!(
             body.get("data").is_none() || body["data"].get("connected").is_none(),
             "a non-network failure must never report connected:false: {body:?}"
+        );
+    }
+
+    // ---- COMM-4b review round 2, Low: `{"url": ""}` == no `url` at all ---
+
+    /// Codex COMM-4b review, round 2, Low: an explicit-but-empty `url`
+    /// (`{"url": ""}`) must resolve the configured default, exactly like
+    /// omitting `url` entirely — matching Hyphae's own `relayInfo`, which
+    /// treats an empty CLI arg as "no override" (`internal/nostr/relay.go:70`,
+    /// locked source). Before the fix, `effective_probe_target` matched
+    /// `Some("")` as if it were a real target, so this never called `relay
+    /// list` at all and sent `relay info ""` straight through — proven here
+    /// by asserting on the exact argv each invocation of the fake binary
+    /// received, not just the final JSON response.
+    #[tokio::test]
+    async fn relay_probe_with_an_explicit_empty_url_resolves_the_default_like_hyphae_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let argv_log = tmp.path().join("argv.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"{log}\"; done\n\
+             printf -- '---\\n' >> \"{log}\"\n\
+             case \"$1 $2\" in\n\
+             'relay list')\n\
+             echo '{{\"ok\":true,\"data\":{{\"source\":\"config\",\"relays\":[\"wss://relay.example\"]}}}}'\n\
+             ;;\n\
+             'relay info')\n\
+             echo '{{\"ok\":true,\"data\":{{\"url\":\"wss://relay.example\",\"connected\":true}}}}'\n\
+             ;;\n\
+             esac\n",
+            log = argv_log.display(),
+        );
+        let state = ready_state_with_script(tmp.path(), &script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/relay/probe",
+            Some(json!({"url": ""})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["url"], "wss://relay.example", "{body:?}");
+
+        let log = tokio::fs::read_to_string(&argv_log).await.unwrap();
+        let invocations: Vec<Vec<&str>> = log
+            .split("---\n")
+            .map(|chunk| chunk.lines().collect::<Vec<_>>())
+            .filter(|args| !args.is_empty())
+            .collect();
+        assert!(
+            invocations
+                .iter()
+                .any(|args| args.as_slice() == ["relay", "list"]),
+            "an empty `url` must still trigger the `relay list` default-resolution \
+             fallback (the pre-fix short-circuit skipped this entirely): {invocations:?}"
+        );
+        assert!(
+            invocations.iter().any(|args| args.as_slice()
+                == ["relay", "info", "wss://relay.example", "--timeout", "5"]),
+            "the resolved default address must be passed explicitly to `relay info`: \
+             {invocations:?}"
+        );
+        assert!(
+            !invocations.iter().any(|args| {
+                args.first() == Some(&"relay")
+                    && args.get(1) == Some(&"info")
+                    && args.get(2) == Some(&"")
+            }),
+            "`relay info` must never receive a literal empty-string url argument: \
+             {invocations:?}"
         );
     }
 }
