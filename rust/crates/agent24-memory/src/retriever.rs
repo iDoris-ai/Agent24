@@ -81,6 +81,12 @@ impl FtsRetriever {
         object: &str,
     ) -> Result<()> {
         let cjk = cjk_bigrams(&format!("{subject} {predicate} {object}"));
+        // unicode61 indexes a mixed Han/Latin token such as `我喜欢Rust编程`
+        // as one token. Keep the original text intact for complete-token
+        // matches, and append its non-Han runs so OR queries can find them.
+        let subject = append_mixed_non_han_terms(subject);
+        let predicate = append_mixed_non_han_terms(predicate);
+        let object = append_mixed_non_han_terms(object);
         sqlx::query(
             "INSERT INTO mem_assertions_fts (id, scope_owner, subject, predicate, object, cjk)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -122,6 +128,25 @@ pub(crate) fn cjk_bigrams(text: &str) -> String {
         })
         .collect::<Vec<String>>()
         .join(" ")
+}
+
+/// Append non-Han runs from mixed alphanumeric terms to an indexed column.
+/// Pure Han and pure non-Han terms produce no extra projection.
+fn append_mixed_non_han_terms(text: &str) -> String {
+    let terms = mixed_non_han_terms(text);
+    if terms.is_empty() {
+        text.to_owned()
+    } else {
+        format!("{text} {}", terms.join(" "))
+    }
+}
+
+fn mixed_non_han_terms(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| term.chars().any(is_han))
+        .flat_map(|term| term.split(is_han).filter(|run| !run.is_empty()))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn is_han(ch: char) -> bool {
@@ -522,6 +547,22 @@ mod tests {
         }
     }
 
+    async fn assert_mixed_query_recall(r: &FtsRetriever) {
+        for (query, id) in [("你用Rust吗", "rust"), ("你吃B12吗", "vitamin")] {
+            let hits = r.search_any(query, "u1", 10).await.unwrap();
+            assert_eq!(hits.len(), 1, "search_any: {query}");
+            assert_eq!(hits[0].assertion.id, id, "search_any: {query}");
+            assert!(
+                r.search(query, "u1", 10).await.unwrap().is_empty(),
+                "AND search must not expand mixed query terms: {query}"
+            );
+            assert!(
+                r.search_any(query, "other", 10).await.unwrap().is_empty(),
+                "other owners must not see mixed query matches: {query}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn mixed_questions_recall_non_han_words_from_english_assertions() {
         let (kv, r) = fixture().await;
@@ -561,6 +602,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn index_projection_extracts_only_non_han_runs_from_mixed_terms() {
+        assert_eq!(
+            mixed_non_han_terms("我喜欢Rust编程 维生素B12"),
+            ["Rust", "B12"]
+        );
+        assert!(mixed_non_han_terms("Rust B12").is_empty());
+        assert_eq!(append_mixed_non_han_terms("Rust B12"), "Rust B12");
+    }
+
     #[tokio::test]
     async fn mixed_cjk_and_latin_terms_survive_new_writes() {
         let (kv, r) = fixture().await;
@@ -583,6 +634,10 @@ mod tests {
         .remember();
         kv.write_gate().propose(vec![rust]).await.unwrap();
         assert_mixed_text_searches(&r).await;
+
+        // Query contains the Latin run but shares no Han bigram with the
+        // assertion. Both ledger writes and WriteGate indexing must project it.
+        assert_mixed_query_recall(&r).await;
     }
 
     #[tokio::test]
@@ -610,6 +665,24 @@ mod tests {
 
         r.rebuild().await.unwrap();
         assert_mixed_text_searches(&r).await;
+        assert_mixed_query_recall(&r).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_query_recall_projects_predicate_and_object_columns() {
+        let (kv, r) = fixture().await;
+        let mut predicate = a("predicate", "u1", "tool", json!(true));
+        predicate.predicate = "使用Rust".into();
+        kv.assertions().assert(&predicate).await.unwrap();
+
+        let object = a("object", "u1", "favorite", json!("B12补充"));
+        kv.assertions().assert(&object).await.unwrap();
+
+        for (query, id) in [("你用Rust吗", "predicate"), ("你吃B12吗", "object")] {
+            let hits = r.search_any(query, "u1", 10).await.unwrap();
+            assert_eq!(hits.len(), 1, "search_any: {query}");
+            assert_eq!(hits[0].assertion.id, id, "search_any: {query}");
+        }
     }
 
     #[tokio::test]

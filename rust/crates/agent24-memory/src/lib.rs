@@ -1537,6 +1537,11 @@ mod tests {
                 "cjk"
             );
             let retriever = kv.retriever();
+            for (query, id) in [("你用Rust吗", "rust"), ("Should I take B12?", "vitamin")] {
+                let hits = retriever.search_any(query, "alice", 5).await.unwrap();
+                assert_eq!(hits.len(), 1, "mixed query should uniquely find {id}");
+                assert_eq!(hits[0].assertion.id, id, "mixed query: {query}");
+            }
             for (query, id) in [("维生素B12", "vitamin"), ("我喜欢Rust编程", "rust")] {
                 assert_eq!(
                     retriever.search(query, "alice", 5).await.unwrap()[0]
@@ -2503,15 +2508,53 @@ mod forget_tests {
     #[tokio::test]
     async fn forgotten_assertion_stays_out_of_search_after_rebuild() {
         let kv = setup("alice").await;
+        kv.assertions()
+            .assert(&Assertion::new(
+                "a2",
+                Scope::owner("alice"),
+                "favorite_color",
+                "is",
+                serde_json::json!("green"),
+                vec![],
+            ))
+            .await
+            .unwrap();
         let retriever = kv.retriever();
         assert_eq!(
             retriever.search("blue", "alice", 10).await.unwrap().len(),
             1
         );
-        kv.forget("alice", "a1", "t2").await.unwrap();
+        let before = retriever
+            .search_any("blue missing", "alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].assertion.id, "a1");
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
         assert!(
             retriever
                 .search("blue", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            retriever
+                .search_any("blue missing", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        sqlx::query("DELETE FROM mem_assertions_fts")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert!(
+            retriever
+                .search("green", "alice", 10)
                 .await
                 .unwrap()
                 .is_empty()
@@ -2524,7 +2567,19 @@ mod forget_tests {
                 .unwrap()
                 .is_empty()
         );
-        // TODO: T09/T07a integration in docs/agent/M1-PLAN-v2.md adds `search_any` coverage.
+        assert!(
+            retriever
+                .search_any("blue missing", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let live = retriever
+            .search_any("green missing", "alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].assertion.id, "a2");
     }
 
     #[tokio::test]
