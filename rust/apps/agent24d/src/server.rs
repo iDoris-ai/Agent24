@@ -1326,13 +1326,18 @@ pub async fn serve(
         std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
     > = Arc::new(std::sync::OnceLock::new());
     let stopping_attach_registry = Arc::clone(&attach_registry_cell);
-    // COMM-4a: the Hyphae daemon supervisor (if comm_routes managed to build
-    // one) is, like the attach registry above, only known once `comm_routes::
-    // build` runs — AFTER this task is spawned — so it is handed over the
-    // same way: a cell filled in later, read only after a shutdown began.
-    let comm_daemon_cell: Arc<std::sync::OnceLock<Arc<agent24_comm::HyphaeDaemonSupervisor>>> =
-        Arc::new(std::sync::OnceLock::new());
-    let stopping_comm_daemon = Arc::clone(&comm_daemon_cell);
+    // COMM-4a: the Hyphae daemon supervisor (if comm_routes manages to
+    // build one) is, like the attach registry above, only known once
+    // `comm_routes::build` runs — AFTER this task is spawned. PR #626
+    // review, High #1: unlike the attach registry's plain `OnceLock`, this
+    // is a `CommDaemonSlot` — a lock `comm_routes::build_ready_state`
+    // registers into BEFORE any autostart attempt, synchronized with this
+    // same task's own `close()` below, so a shutdown that begins mid-`build`
+    // can never let an autostart spawn a Hyphae daemon nothing will ever be
+    // told to stop. See `comm_routes::CommDaemonSlot`'s own doc comment.
+    let comm_daemon_slot: Arc<crate::comm_routes::CommDaemonSlot> =
+        Arc::new(crate::comm_routes::CommDaemonSlot::new());
+    let stopping_comm_daemon = Arc::clone(&comm_daemon_slot);
     let stopping = tokio::spawn(async move {
         stop_shutdown.token().cancelled().await;
         // Whoever cancelled, the shutdown has begun: fixed here if nothing
@@ -1398,8 +1403,16 @@ pub async fn serve(
         // its own schedule regardless of whether anything here is still
         // waiting on its result.
         let comm_shutdown = async {
-            match stopping_comm_daemon.get() {
-                Some(daemon) => Some(daemon.shutdown().await),
+            // PR #626 review, High #1: `close()`, not a plain read — see
+            // `CommDaemonSlot`'s doc comment; this is the one call that may
+            // ever close this slot. High #2: `deadlines.modules` is the
+            // SAME absolute instant the `timeout_at` below races this
+            // against, handed straight into the actor (not just this
+            // await) so an in-flight config-change restart's own stop of
+            // an OLD generation picks it up on its very next grace-loop
+            // poll, and nothing may spawn past it from here on.
+            match stopping_comm_daemon.close() {
+                Some(daemon) => Some(daemon.shutdown(deadlines.modules).await),
                 None => None,
             }
         };
@@ -1787,13 +1800,13 @@ pub async fn serve(
     // kernel auth exactly like every other module route, and so the wiring
     // itself lives in its own file (`comm_routes.rs`); see that file's own
     // doc comment for the `RESERVED_KERNEL_SEGMENTS` gap this leaves.
-    let (comm_router, comm_daemon) = crate::comm_routes::build(&state_dir, params.stop_grace).await;
-    if let Some(handle) = comm_daemon {
-        // Best-effort: only `None` if this `set` races a shutdown that has
-        // already read the cell, in which case the daemon this build() just
-        // started is instead cleaned up by the NEXT start's orphan reap.
-        let _ = comm_daemon_cell.set(handle);
-    }
+    // PR #626 review, High #1: `build` now registers the supervisor it
+    // creates into `comm_daemon_slot` ITSELF, synchronized with the
+    // `stopping` task's own `close()` — no more racing a `set()` here
+    // after the fact against a shutdown that may have already decided
+    // there was nothing to stop.
+    let comm_router =
+        crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
