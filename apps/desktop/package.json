@@ -94,9 +94,11 @@
     },
     "linux": {
       "target": [
-        "AppImage"
+        "AppImage",
+        "deb"
       ],
       "category": "Utility",
+      "maintainer": "iDoris.ai <firsttorch66@gmail.com>",
       "extraResources": [
         {
           "from": "../../rust/target/release/agent24d",
