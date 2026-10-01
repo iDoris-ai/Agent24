@@ -1,0 +1,39 @@
+[package]
+name = "agent24-comm"
+version = "0.5.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "COMM-1a: HyphaeRunner — single-shot invocation of the Hyphae CLI (hash-verified binary, stdin-only password, envelope parsing)"
+
+[dependencies]
+hex = "0.4"
+rustix = { version = "0.38", features = ["process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["process", "rt", "time", "io-util", "macros"] }
+tracing = "0.1"
+# Zero-on-drop storage for the Hyphae keystore password (COMM-HYPHAE.md §3:
+# `Password(/* Zeroizing<Vec<u8>> */)`). Not a direct workspace dependency
+# elsewhere, but already resolved in Cargo.lock (1.9.0, transitive).
+zeroize = "1"
+
+[dev-dependencies]
+# Mirrors agent24-os-proto's `test-util` pattern: depending on ourselves with
+# the feature on means `cargo test -p agent24-comm` (no extra flags) already
+# runs the lock-override-gated tests.
+agent24-comm = { path = ".", features = ["test-lock-override"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+
+[features]
+# Lets tests substitute the embedded hyphae.lock.json's expected hash for a
+# locally-built fake binary or an unreproducible reference binary. Compiled
+# in automatically under `cfg(test)` too; the feature exists so integration
+# tests (tests/*.rs, a separate crate) can opt in without `--features`.
+test-lock-override = []
+
+[lints]
+workspace = true
