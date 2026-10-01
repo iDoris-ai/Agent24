@@ -110,7 +110,7 @@
 - #559 `0ef62e0`：store-owned atomic admission + serial run lease + lazy expiry + strict reread；direct bypass fail closed；
 - #560 `8e361a7`：adversarial rollback proofs；
 - #561 `a88ca66`：normal terminal state + exact run-lease release 同事务；
-- #562 当前 `f6f809c`：startup workspace orphan reconciliation；no-history bound Run 改为 corruption/fail-closed。
+- #562 最终 head `49f3892`：startup workspace orphan reconciliation；no-history bound Run 改为 corruption/fail-closed，并追加修复存活 host 的心跳租约被误判为孤儿的问题。
 
 尚未满足的激活门禁：#561/#562 final review、RunManager admission wiring、startup restore/sweep ordering、不可伪造 WorkspaceHandle、ToolContext 与 fs/shell/explorer/subagent inheritance、approval/grant/event/audit workspace scoping。上述完成前不得进入 ACP/runtime product wiring。
 

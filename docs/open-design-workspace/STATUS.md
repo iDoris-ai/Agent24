@@ -18,6 +18,8 @@
 | P2 workspace contract | IN PROGRESS | DB registry/lifecycle/renew 与 allocation journal schema/约束通过 SOL；安全 root allocator/host lease/run binding 未完成 |
 | A24-OD-05 sidecar foundation | IN PROGRESS（未接线） | #253 合入 desktop sidecar ownership/endpoint-handoff contract；manager 由 #254 承担，#429 controlled pipes、#431 graceful stdin close、#435 soft-stop seam、#436 dormant grace primitive 与 #438 fixed stdout worker 推进中；host `run()`/产品路由仍未接线 |
 
+> 此表冻结于 2026-09-23，#228/#254 现状见下方新增段落（例如「2026-09-29 Wave 20」checkpoint）。
+
 当前 PR 监控结论（2026-09-23 Wave 10）：3 小时完整 monitor 未发现 eligible Open Design
 root。#253 已合入；其他已批准后代仍堆叠等待 #228/#254 与各自前沿，不得越序合并。#254 五项
 CI 全绿但旧 change request 等待新的 approval；#228 等待基线后的重新批准，其后代继续 dependency-blocked。
@@ -247,7 +249,7 @@ P1 的 upstream daemon suite 不是绿色：固定 pin 可重复出现一个
 - #559（`0ef62e0`）完成 dormant one-`BEGIN IMMEDIATE` run admission：Session/workspace exact binding、committed allocation/root consistency、lazy expiry、serial run lease、strict reread，并堵住 direct explicit-workspace `insert_run` bypass；两次 independent final-head review PASS。
 - #560（`8e361a7`）是 test-only adversarial follow-up，覆盖 lease-id collision 与 trigger mutation rollback；final exact-head review PASS。
 - #561（`a88ca66`）将 workspace-bound Completed/Failed/Cancelled 与 exact run-lease release 放进同一写事务，并让旧 bulk orphan sweep 不再触碰 bound Run；仍未接 RunManager。
-- #562 初始 `e7d5193` 的 “no lease history compatibility” 被重新判定过宽。2026-09-29 修复 head `f6f809c` 改为 fail closed：workspace-bound orphan 必须拥有唯一、可验证的 exact run-lease history；缺失 history 视为 corruption，不再猜测历史兼容。修复后 focused 1/1、store lib 216/216、strict clippy、fmt、diff-check 全绿；PR 总 diff 为 2 files / 212 additions。
+- #562 初始 `e7d5193` 的 “no lease history compatibility” 被重新判定过宽。2026-09-29 中间修复 head `f6f809c` 改为 fail closed：workspace-bound orphan 必须拥有唯一、可验证的 exact run-lease history；缺失 history 视为 corruption，不再猜测历史兼容。`f6f809c` 之后又追加修复存活 host 的心跳租约被误判为孤儿的问题（commit `49f3892` “fix(workspace): spare runs owned by live hosts”：`run_workspace_orphan.rs` 在判定 orphan 前先排除仍被存活 host 持有心跳的 Run，避免正常运行中的 Run 被误回收）。#562 最终 head 为 `49f3892f9f84aab52226e492126a42bde15d2f3a`；focused 1/1、store lib 216/216、strict clippy、fmt、diff-check 全绿；PR 总 diff 为 2 files / 306 additions（`lib.rs` +2、`run_workspace_orphan.rs` +304）。
 - runtime activation 已在后续 #566/#567 完成：#566 `0f553345` 增加 strict active run-lease rehydration；#567 `87b7630` 接入 explicit workspace atomic admission、exact terminal lease release 与 fail-closed startup restore/sweep。#567 exact diff 496 lines，已完成两次独立 exact-head FINAL PASS，CLA + Sidecar/Workspace-root 三平台 CI 全绿。M5 至此 COMPLETE；下一阶段 M6 才开始 WorkspaceHandle / ToolContext / fs-shell-explorer-subagent / approval-grant-event-audit isolation，仍禁止把 raw/canonical root 作为公共 authority。
 
 ## 2026-09-29 本机施工现场清理
