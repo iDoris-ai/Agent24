@@ -501,7 +501,10 @@ mod tests {
 mod windows_tests {
     use super::*;
     use crate::target::{ExitObservation, TreeObservation};
-    use std::{collections::BTreeMap, path::Path, time::Duration};
+    use crate::windows_test_io::{powershell_executable, read_pair_then_cleanup};
+    use std::{
+        collections::BTreeMap, io::Read as _, path::Path, sync::mpsc, thread, time::Duration,
+    };
     use tokio::io::AsyncReadExt;
 
     fn request(cwd: &Path) -> Request {
@@ -605,22 +608,28 @@ mod windows_tests {
         let mut launch = OwnedLaunch::start(LaunchIntent::from_request(Request::Launch {
             version: 1,
             request_id: 20,
-            executable: "powershell.exe".into(),
+            executable: powershell_executable().display().to_string(),
             cwd: cwd.display().to_string(),
             argv: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
                 "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('eof-marker'); [Console]::Out.Flush(); [Console]::Error.Write('err-marker'); [Console]::Error.Flush(); Start-Sleep -Seconds 30".into()],
             env: BTreeMap::from([(String::from("SystemRoot"), std::env::var("SystemRoot").unwrap())]),
         }).unwrap()).unwrap();
-        assert_eq!(launch.request_id(), 20);
-        let (mut stdout, mut stderr) = {
+        let request_id = launch.request_id();
+        let (stdout, stderr, stdout_moved_once, stderr_moved_once, stdin_preserved) = {
             let (_, pipes) = launch.parts_mut();
             let stdout = pipes.take_stdout().expect("stdout moves once");
-            assert!(pipes.take_stdout().is_none(), "stdout moved twice");
-            assert!(pipes.stdin_mut().is_some(), "moving stdout closed stdin");
+            let stdout_moved_once = pipes.take_stdout().is_none();
+            let stdin_after_stdout_move = pipes.stdin_mut().is_some();
             let stderr = pipes.take_stderr().expect("stderr moves once");
-            assert!(pipes.take_stderr().is_none(), "stderr moved twice");
-            assert!(pipes.stdin_mut().is_some(), "moving stderr closed stdin");
-            (stdout, stderr)
+            let stderr_moved_once = pipes.take_stderr().is_none();
+            let stdin_after_stderr_move = pipes.stdin_mut().is_some();
+            (
+                stdout,
+                stderr,
+                stdout_moved_once,
+                stderr_moved_once,
+                stdin_after_stdout_move && stdin_after_stderr_move,
+            )
         };
         let stdin_unavailable = {
             let (_, pipes) = launch.parts_mut();
@@ -628,37 +637,36 @@ mod windows_tests {
             pipes.close_stdin();
             pipes.stdin_mut().is_none()
         };
-        let mut out = [0; 10];
-        let stdout_result =
-            tokio::time::timeout(Duration::from_secs(3), stdout.read_exact(&mut out)).await;
-        let mut err = [0; 10];
-        let stderr_result =
-            tokio::time::timeout(Duration::from_secs(3), stderr.read_exact(&mut err)).await;
-        assert!(matches!(
-            launch.target_mut().observe_exit().expect("observe owner"),
-            ExitObservation::Running
-        ));
-        reap(&mut launch);
+        let stdout = std::fs::File::from(stdout.into_owned_handle().expect("stdout owned handle"));
+        let stderr = std::fs::File::from(stderr.into_owned_handle().expect("stderr owned handle"));
+        let mut stdout_after_cleanup = stdout.try_clone().expect("clone moved stdout");
+        let mut observation = None;
+        let (out, err) = read_pair_then_cleanup(stdout, stderr, 10, Duration::from_secs(3), || {
+            let observed = launch.target_mut().observe_exit();
+            reap(&mut launch);
+            observation = Some(observed?);
+            Ok(())
+        })
+        .expect("bounded marker read and launch cleanup");
         drop(launch);
+        let (eof_tx, eof_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut byte = [0];
+            let _ = eof_tx.send(stdout_after_cleanup.read(&mut byte));
+        });
+        let stdout_eof = eof_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("moved stdout EOF deadline")
+            .expect("moved stdout EOF read");
+        assert_eq!(request_id, 20);
+        assert!(stdout_moved_once, "stdout moved twice");
+        assert!(stderr_moved_once, "stderr moved twice");
+        assert!(stdin_preserved, "moving a pipe closed stdin");
         assert!(stdin_unavailable, "closed stdin remained available");
-        assert!(
-            stdout_result.is_ok_and(|result| result.is_ok()),
-            "stdout EOF marker timed out or failed"
-        );
-        assert!(
-            stderr_result.is_ok_and(|result| result.is_ok()),
-            "stderr marker timed out or failed"
-        );
+        assert_eq!(observation, Some(ExitObservation::Running));
         assert_eq!(&out, b"eof-marker");
         assert_eq!(&err, b"err-marker");
-        let mut eof = [0];
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), stdout.read(&mut eof))
-                .await
-                .expect("moved stdout stays open")
-                .expect("moved stdout read"),
-            0
-        );
+        assert_eq!(stdout_eof, 0);
     }
 
     #[tokio::test]
