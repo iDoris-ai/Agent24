@@ -2738,7 +2738,13 @@ sys.exit(0)
             matches!(s, Status::Backoff { failures: 1, .. })
         })
         .await;
-        let (pid, _) = starts(f.data.path())[0].clone();
+        // The spawn that earned this `Backoff` is real, but the child writing
+        // its own pid to `starts` is a second, unrelated process racing the
+        // parent's deadline clock — under CPU oversubscription the child may
+        // not have been scheduled yet even though `Backoff` already fired.
+        // Wait it out (bounded) instead of assuming the write already landed
+        // (FU-79).
+        let (pid, _) = started(f.data.path(), 1).await[0].clone();
         assert!(
             gone(pid).await,
             "the silent module outlived its startup deadline"

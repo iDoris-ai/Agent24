@@ -84,10 +84,25 @@
 
 **「机器可验证」的底线**：`cargo +1.98.0 test --workspace` 全绿 + `cargo fmt --check` + `cargo +1.98.0 clippy --workspace --all-targets -- -D warnings` 零输出。
 
+## ME-4 数据模型变更（2026-09-23，细节以冻结的设计文档为准；约束下限见 PLAN-ME4 §二）
+
+- `schedules`（`agent24-store`）：增 `owner_module TEXT NULL`、`module_key TEXT NULL`（CHECK 同空同非空）、
+  `UNIQUE(owner_module, module_key) WHERE owner_module IS NOT NULL`、`revision INTEGER NOT NULL DEFAULT 0`、
+  `user_suspended INTEGER NOT NULL DEFAULT 0`、`system_disabled_reason TEXT NULL`。迁移单事务，既有行 owner 为 NULL。
+- 模块 upsert：`BEGIN IMMEDIATE` 读—比较—写，outcome `created|updated|unchanged`，`revision += 1`；tick 的 runtime 回写对 revision 做 CAS。
+- `schedule_deliveries(fire_id PK, schedule_id, scheduled_for, attempts, status pending|delivered|deferred|failed, next_attempt_at, last_error)`：与 pre-advance 同事务写入；重启后续投未完成行，沿用同一 `fire_id`。
+- 触发：`ScheduleInvocation{schedule_id, owner_module, module_key, scheduled_for, fired_at, fire_id}` → `FireOutcome::{AgentRun{run_id}, ModuleDelivered{fire_id}, Deferred{reason}, Failed{reason}}`。
+- fired 投递：`POST /api/v1/<ns>/_a24/scheduler/fired`，头 `X-A24-Schedule-Key` / `X-A24-Fire-Id` / `X-A24-Request-Id`（取自持有的 `InFlight`），
+  body `{key, scheduled_for, fired_at}`；**至少一次**，`fire_id` 由 `(schedule_id, scheduled_for)` 确定性派生，模块按它去重。
+- 回调：`_a24/scheduler/{upsert,delete,list}`、`_a24/model/complete`；错误走 `-32000` + 闭集 `kind`。
+- manifest：`kernel_capabilities` 可含 `scheduler` / `models`；新增 `model_access: local_only | remote_allowed`（缺省 local_only）。
+- `agent24-models`：`CompletionRequest.max_tokens`、`CompletionResponse.model_id`。
+- 用量：按模块持久化（重启不清零），`GET /api/v1/usage?module=`。
+
 ## 本轮明确不做
 
 - 不引入 grants / groups / workspace 持久化（ADR-030：等第二个真实用户）。
 - 不 bump `KEY_VERSION`。
 - 不碰 `mem_kv` 的 namespace 模型（F5a 已单独登记）。
-- 不做配额（F7）。
+- 不做 F7 的通用存储/记忆配额。**ME-4 明确列出的调度行数配额、模型并发/速率限制与按模块用量计量不受此条限制，仍在范围内。**
 - 不改 `/api/v1/<name>` 路径（F3 属 M2）。

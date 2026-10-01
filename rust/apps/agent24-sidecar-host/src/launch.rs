@@ -782,4 +782,110 @@ mod windows_tests {
         assert!(matches!(error, LaunchFailure::Start(_)));
         assert!(!format!("{error:?}").contains(&missing.display().to_string()));
     }
+
+    /// Review follow-up (REQUEST_CHANGES 2026-09-29, item 1): the earlier
+    /// fixture swapped `Test-Path -LiteralPath` for `[System.IO.File]::Exists`
+    /// to stop a Windows CI timeout, without determining *why* the
+    /// cmdlet-based script was slow under the real `OwnedLaunch::start`
+    /// `env_clear()` path used in production. This probe restores the
+    /// cmdlet, keeps stdin open (no `close_stdin`), and uses a generous
+    /// timeout so the real duration — not just pass/fail — is observable.
+    /// It is run twice: once against the bare minimal environment, and once
+    /// with common user-profile variables restored, to separate "PowerShell
+    /// cold start under a cleared environment is just slow" from "the
+    /// isolated pipe path has a real defect".
+    fn windows_launch_cold_start_cmdlet_probe(extra_env: &[(String, String)]) {
+        let parent_current_dir = std::env::current_dir().expect("current cwd");
+        let mut cwd = std::env::temp_dir();
+        cwd.push(format!(
+            "agent24-sidecar-cmdlet-probe-{}-{}",
+            std::process::id(),
+            extra_env.len()
+        ));
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::write(cwd.join("cwd-sentinel"), b"").expect("sentinel");
+        std::fs::write(
+            cwd.join("launch.ps1"),
+            b"param($first,$second)\n$inherited = if ($env:PATH) {$env:PATH} else {'unset'}\n$cwd=if(Test-Path -LiteralPath 'cwd-sentinel') {'cwd-ok'} else {'cwd-bad'}\n$argpair=\"$first,$second\"\n$out=('{0,-6}|{1,-9}|{2,-23}|{3,-5}' -f $cwd,$env:SIDE,$argpair,$inherited)\n[Console]::Out.Write($out)\n[Console]::Out.Flush()\n[Console]::Error.Write('err')\n[Console]::Error.Flush()",
+        )
+        .expect("script");
+        assert_ne!(cwd, parent_current_dir);
+        assert!(!parent_current_dir.join("cwd-sentinel").exists());
+
+        let mut launch_request = request(&cwd);
+        if let Request::Launch { env, .. } = &mut launch_request {
+            for (key, value) in extra_env {
+                env.insert(key.clone(), value.clone());
+            }
+        }
+
+        let mut launch =
+            OwnedLaunch::start(LaunchIntent::from_request(launch_request).expect("intent"))
+                .expect("owned launch");
+        let request_id = launch.request_id();
+        let (stdout_pipe, stderr_pipe, stdin_preserved) = {
+            let (_, pipes) = launch.parts_mut();
+            (
+                pipes.take_stdout().expect("stdout moves once"),
+                pipes.take_stderr().expect("stderr moves once"),
+                pipes.stdin_mut().is_some(),
+            )
+        };
+        assert!(stdin_preserved, "moving output pipes closed stdin");
+
+        let started = std::time::Instant::now();
+        let output = read_pair_then_cleanup(
+            stdout_pipe,
+            stderr_pipe,
+            46,
+            3,
+            Duration::from_secs(30),
+            || {
+                reap(&mut launch);
+                Ok(())
+            },
+        );
+        let elapsed = started.elapsed();
+        println!(
+            "windows_launch_cold_start_cmdlet_probe extra_env_count={} elapsed={elapsed:?}",
+            extra_env.len()
+        );
+
+        let (stdout, stderr) = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&cwd);
+                panic!(
+                    "bounded output read and launch cleanup timed out after {elapsed:?} \
+                     (extra_env_count={}): {error}",
+                    extra_env.len()
+                );
+            }
+        };
+        let stdout = String::from_utf8(stdout).expect("stdout UTF-8");
+        let stderr = String::from_utf8(stderr).expect("stderr UTF-8");
+        let fields: Vec<_> = stdout.split('|').collect();
+        std::fs::remove_dir_all(&cwd).expect("cleanup cwd");
+        assert_eq!(request_id, 17);
+        assert_eq!(fields[0], "cwd-ok");
+        assert_eq!(
+            &fields[1..],
+            ["env-value", "ignored-zero,argv-value", "unset"]
+        );
+        assert_eq!(stderr, "err");
+    }
+
+    #[test]
+    fn windows_launch_cold_start_with_cmdlet_probe_minimal_env() {
+        windows_launch_cold_start_cmdlet_probe(&[]);
+    }
+
+    #[test]
+    fn windows_launch_cold_start_with_cmdlet_probe_user_profile_env() {
+        let extra: Vec<(String, String)> = ["PSModulePath", "LOCALAPPDATA", "TEMP"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+            .collect();
+        windows_launch_cold_start_cmdlet_probe(&extra);
+    }
 }

@@ -300,6 +300,8 @@ E1/E1b 落地后内核已能接整个 MCP 生态（文件系统、git、搜索�
 
 ## M-F 24/7 化 + 渠道（v0.4.0）
 
+**⚠️ 作废**：本节标题的 v0.4.0 是旧定义，M-F 实际已随 v0.3.0 发布（2026-09-02）。真正的 v0.4.0（2026-09-2x）= ME-3 全套 + ME4 S1/S2 + SDK 原型 + ADR-032/A3，见 [`docs/agent/tasks.md`](../agent/tasks.md)（权威状态源）。
+
 | ID | 任务 | 依赖 | 状态 |
 |---|---|---|---|
 | F1a | headless 开机自启：`agent24 service install/uninstall/status`（macOS LaunchAgent） | M-D | **done** #51 |

@@ -1,0 +1,10 @@
+name: node-ref
+version: "0.1.0"
+route_namespace: /api/v1/node-ref
+event_module: node-ref
+data_dir: ~/.agent24/os/node-ref/
+kernel_capabilities: [events, memory]
+impl_kind: out_of_process_provider
+spawn:
+  command: node
+  args: ["index.js"]
