@@ -11,6 +11,10 @@
 - 当前里程碑的任务定义与验收标准只认集成分支上的计划文档（任务 prompt 会指明路径）。prompt 与计划冲突时以计划为准，并在 PR body 里指出冲突。
 - 计划里标了「本地模型」的任务不在 B 上做（需要 oMLX/本地推理的留给笔记本）。
 
+## 构建缓存（B 盘空间有限，必须遵守）
+- **所有 cargo 命令前先** `export CARGO_TARGET_DIR=$HOME/Dev/iDoris/.target-agent24`（所有 Agent24 task 共用一个 target 目录；并发构建时 cargo 会自动排队等锁，正常）。**不要**在 worktree 里生成独立的 `rust/target`（每个 5GB+，曾把 B 盘写满导致所有任务失败）。
+- 若 worktree 里已有 `rust/target`，先删掉再构建。
+
 ## 门禁（提交前必须全部通过，PR body 贴结果摘要）
 Rust（在 `rust/` 下）：
 ```
