@@ -604,3 +604,98 @@ fn a_sigterm_during_a_disables_drain_stops_the_module_in_bound() {
         "the shutdown did not wait for the disable's stop",
     );
 }
+
+/// Waits for `server.rs::callback_root`'s own "too long for callback
+/// sockets... using <path> instead" warning and returns the exact fallback
+/// path it names — so a test can go on to assert the daemon actually PUT
+/// something there, not merely that it logged an intent to.
+///
+/// Codex ME4-CODEX-DEBT-10 (#528 Medium): `a_long_home_still_mounts_an_out_of_process_module`
+/// used to only assert the package mounted successfully — that is consistent
+/// with the fallback path having been used, but equally consistent with the
+/// length check being silently miscalibrated and the daemon having mounted
+/// the package some OTHER way (or, in a hypothetically broken future
+/// refactor, against a fallback path that does not match what was logged).
+/// This makes the fallback path itself an assertable fact.
+fn fallback_dir_from_log(d: &Daemon) -> std::path::PathBuf {
+    let needle = "is too long for callback sockets";
+    let by = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = by.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "the callback_root fallback-path warning never appeared in the daemon's log"
+        );
+        let line = d
+            .log
+            .recv_timeout(left)
+            .expect("the callback_root fallback-path warning never appeared in the daemon's log");
+        if !line.contains(needle) {
+            continue;
+        }
+        let after_using = line
+            .split_once("using ")
+            .unwrap_or_else(|| panic!("log line did not have the expected shape: {line}"))
+            .1;
+        let path = after_using
+            .split_once(" instead")
+            .unwrap_or_else(|| panic!("log line did not have the expected shape: {line}"))
+            .0;
+        return std::path::PathBuf::from(path);
+    }
+}
+
+/// FU-92: a long `$HOME` still lets an out-of-process module mount.
+/// `<home>/.agent24/run/<pid>/<n>.sock` alone is already past macOS's 103-byte
+/// `sun_path` limit once `home` is this long — without `server.rs`'s
+/// `callback_root` fallback to a short `/tmp` path, `process_host` fails and
+/// the package never starts (the daemon still comes up, per its own doc
+/// comment, but `/api/v1/remote/hi` would then never answer and this test
+/// would time out in `serving`).
+#[test]
+fn a_long_home_still_mounts_an_out_of_process_module() {
+    let base = tmp_home();
+    let home = base.path().join("x".repeat(120));
+    std::fs::create_dir_all(&home).unwrap();
+    assert!(
+        home.as_os_str().len() >= 120,
+        "test HOME is not actually long: {}",
+        home.display()
+    );
+    install(&home);
+    let mut d = start(&home);
+    let fallback = fallback_dir_from_log(&d);
+    let daemon_pid = d.run.daemon.id();
+    serving(&mut d, &home);
+
+    // Codex ME4-CODEX-DEBT-10 (#528 Medium): the earlier version of this test
+    // stopped at "the package answered", which is consistent with the
+    // fallback path having been used but does not actually PROVE it — assert
+    // the daemon's own per-generation sockets really are sitting under the
+    // logged fallback directory (`<fallback>/run/<daemon pid>/`, per
+    // `agent24_os_proto::endpoint::CallbackDir::create`'s own doc), not under
+    // `home` (which is far too long for a socket path to begin with).
+    assert!(
+        !fallback.starts_with(&home),
+        "the fallback directory must not be under the too-long HOME: {}",
+        fallback.display()
+    );
+    let sockets_dir = fallback.join("run").join(daemon_pid.to_string());
+    let entries: Vec<_> = std::fs::read_dir(&sockets_dir)
+        .unwrap_or_else(|e| panic!("{} does not exist: {e}", sockets_dir.display()))
+        .map(|e| e.unwrap().path())
+        .collect();
+    // The callback socket itself (`<n>.sock`) is accept-once and unlinked the
+    // instant the module connects (`CallbackListener::accept_one`'s own
+    // "close and unlink before anything else can connect"), so by the time
+    // `serving` above has returned it is already long gone — `<n>.l`, the
+    // module's inbound HTTP listener (`GenerationSockets`'s own doc), is what
+    // reliably remains for as long as the package stays mounted.
+    assert!(
+        entries
+            .iter()
+            .any(|p| p.extension().is_some_and(|ext| ext == "l")),
+        "expected at least one *.l file under {}, found {entries:?}",
+        sockets_dir.display()
+    );
+}

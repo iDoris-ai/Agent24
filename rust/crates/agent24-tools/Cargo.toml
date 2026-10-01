@@ -1,6 +1,6 @@
 [package]
 name = "agent24-tools"
-version = "0.3.0"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,6 +8,7 @@ description = "Agent24 tool trait + registry + builtin tools (C3 scope: http_fet
 
 [dependencies]
 agent24-protocol = { path = "../agent24-protocol" }
+agent24-workspace = { path = "../agent24-workspace" }
 async-trait = "0.1"
 cap-std = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

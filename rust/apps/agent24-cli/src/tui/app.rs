@@ -269,6 +269,11 @@ impl App {
                 self.log(&p.run_id, format!("⏰ fired by schedule {}", p.schedule_id))
             }
             EventBody::ScheduleDisabled(_) => {}
+            // ME4-1.2.2a adds the wire type; nothing emits it until the
+            // delivery pump lands (ME4-1.3.1). It carries no `run_id` (module
+            // deliveries aren't runs), so there is nothing to key a log line
+            // on yet — same non-rendering treatment as `ScheduleDisabled`.
+            EventBody::ScheduleDelivered(_) => {}
             // T7b/ME-3e: module (gate/advise) approvals are a separate REST
             // surface (`/api/v1/module-approvals`) this TUI does not render
             // — explicit variants, not a wildcard `_`, so a FUTURE new
@@ -278,6 +283,12 @@ impl App {
             // Module events are namespaced to a loadable module (e.g. sin90);
             // the generic CLI TUI has nothing to render for them.
             EventBody::Module(_) => {}
+            // ME4-desktop-model-ui: kernel visibility into one
+            // `_a24/model/complete` call, built for the desktop's "语音"
+            // panel. It carries no `run_id` (module model calls aren't
+            // runs), so — same as `ScheduleDelivered` above — there is
+            // nothing to key a log line on in this generic CLI TUI.
+            EventBody::ModelCall(_) => {}
         }
     }
 
@@ -515,9 +526,11 @@ mod tests {
         Run {
             id: id.to_owned(),
             session_id: None,
+            workspace_id: None,
             status,
             input: RunInput {
                 prompt: "hi".to_owned(),
+                workspace_id: None,
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
             },

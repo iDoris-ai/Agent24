@@ -9,12 +9,72 @@
 //! compile-time-checked macros + committed `.sqlx` offline data is planned
 //! once the query surface stabilizes at the end of C2 (recorded deviation).
 
+mod allocation_commitment;
+mod allocation_intent;
+mod allocation_materialization;
+mod allocation_record;
+mod allocation_registration;
+// The authorized service slice has not wired this internal journal primitive yet.
+#[allow(dead_code)]
+mod allocation_reservation;
+mod allocation_retention_evidence;
+mod allocation_retention_expectation;
+mod allocation_retention_plan;
+mod allocation_retention_writer;
+mod allocation_types;
 mod audit;
+mod legacy_recovery;
+mod model_call_timings;
 mod module_approvals;
+mod module_model_usage;
+mod module_schedules;
 mod repo;
+mod run_workspace_admission;
+mod run_workspace_authority;
+mod run_workspace_orphan;
+mod run_workspace_terminal;
+mod terminal_core;
+mod terminal_helpers;
+pub(crate) mod terminal_mutations;
+pub(crate) mod terminal_plan;
+pub mod workspace_api;
+pub mod workspace_decode;
+pub(crate) mod workspace_decode_support;
+pub mod workspace_lease_decode;
+mod workspace_lifecycle;
+mod workspace_registry;
+pub(crate) mod workspace_tx;
+pub mod workspaces;
+pub use workspace_api::{
+    WorkspaceListCursor, WorkspaceListLimit, WorkspaceListQuery, WorkspacePage,
+};
+pub use workspace_decode::WorkspaceRow;
+pub use workspace_lease_decode::WorkspaceLeaseRow;
+pub use workspaces::{
+    HostLeaseTtl, LeaseKind, LifecycleOwnerRef, NewScratchWorkspace, RootIdentity,
+    TrustedRootRegistration, WorkspaceAuthority, WorkspaceCleanupRecord, WorkspaceConflict,
+    WorkspaceInstant, WorkspaceKind, WorkspaceLeaseId, WorkspaceLeaseRecord,
+    WorkspaceProvenanceInput, WorkspaceResult, WorkspaceRootSnapshot, WorkspaceState,
+    WorkspaceStoreError, WorkspaceTtl,
+};
 
+pub use allocation_intent::AllocationIntent;
+pub use allocation_record::AllocationRecord;
+pub use allocation_types::{
+    AllocationFailureReason, AllocationId, AllocationPhase, AllocationValueError,
+};
 pub use audit::AuditEntry;
+pub use legacy_recovery::{
+    LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
+};
+pub use model_call_timings::{CallTimingRow, CallTimingSummaryRow, NewCallTiming};
+pub use module_model_usage::{ModelUsageDelta, ModelUsageRow, ServedBy, saturating_add_capped};
+pub use module_schedules::*;
 pub use repo::*;
+pub use run_workspace_admission::{RunAdmission, RunAdmissionDenial};
+pub use run_workspace_authority::RunWorkspaceAuthoritySnapshot;
+pub use run_workspace_orphan::WorkspaceOrphanSweep;
+pub use run_workspace_terminal::RunTerminalTransition;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -35,10 +95,26 @@ pub enum StoreError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// ME4-1.2.1 / design §6.2, §6.4: a module's `_a24/scheduler/upsert` for
+    /// a brand-new key when it already owns 256 rows. Counted inside the
+    /// `BEGIN IMMEDIATE` transaction that would have inserted the row, so
+    /// nothing is written and two concurrent upserts cannot jointly cross
+    /// the line.
+    #[error("module schedule quota reached")]
+    QuotaExceeded,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Persistence boundary for trusted, internally authorized workflow code.
+///
+/// `Store` validates and journals persistence data; it does not establish
+/// caller authorization, filesystem authority, or lifecycle ownership. Public
+/// workspace operations belong to the authorized `WorkspaceService` layer.
+///
+/// ```compile_fail
+/// let _ = agent24_store::Store::reserve_workspace_allocation;
+/// ```
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -88,6 +164,19 @@ impl Store {
 pub mod test_hooks {
     pub fn pool(store: &super::Store) -> &sqlx::SqlitePool {
         store.pool()
+    }
+
+    /// Build a `Store` around an already-migrated pool a test built by hand
+    /// (a WAL file with a chosen connection count, or a migrator truncated to
+    /// an older version) — `Store::open`/`open_memory` hardcode their own
+    /// pool options and always run every migration. ME4-1.2.1a note: this
+    /// moved here (rather than the tick-read-model cut where it was first
+    /// sketched) because C1.2's own concurrency test — in THIS cut — already
+    /// needs a WAL file at `max_connections(2)`, which only this hook can
+    /// build.
+    #[must_use]
+    pub fn from_pool(pool: sqlx::SqlitePool) -> super::Store {
+        super::Store { pool }
     }
 
     /// Insert a schedule row with arbitrary (possibly invalid) JSON columns —

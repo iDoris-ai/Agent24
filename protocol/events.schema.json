@@ -53,6 +53,23 @@
       ]
     },
     {
+      "description": "ME4-desktop-model-ui: kernel visibility into one completed\n`_a24/model/complete` call (agent24d/src/model_callback.rs) — which\nmodule called, which model/tier/provider actually served it, whether\nit succeeded, and how long it took. Broadcast once per call that\nreached routing (ok or failed), regardless of whether any WS client\nis listening. Deliberately carries NO prompt/response content — the\ncall itself may be `LocalOnly`, and this event is not.",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/ModelCallPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "model.call"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "payload": {
@@ -190,6 +207,23 @@
         "type": {
           "type": "string",
           "const": "schedule.disabled"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "description": "Module-delivery counterpart of `schedule.fired` (design\n`docs/design/ME4-S1-scheduler-callback.md` §5.5): emitted once the\ndelivery pump's T2 transition (a 2xx from the module's\n`_a24/scheduler/fired` handler) lands in `schedule_deliveries`. Does\nNOT carry a `run_id` — module deliveries have none; only AgentRun rows\nemit `schedule.fired`. Wired up by ME4-1.3.1's delivery pump; this\ntask (ME4-1.2.2a) only adds the wire type.",
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/ScheduleDeliveredPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "schedule.delivered"
         }
       },
       "required": [
@@ -435,6 +469,72 @@
         "message"
       ]
     },
+    "ModelCallPayload": {
+      "description": "One completed `_a24/model/complete` call (ME4-desktop-model-ui). Mirrors\n`agent24d::model_callback::ModelCompleteResult`'s own `model_id`/`tier`\nplus the router's `Served::provider` and the usage sink's token counts —\nnever the call's `text`/messages, which stay off the WS entirely.",
+      "type": "object",
+      "properties": {
+        "completion_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "latency_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model_id": {
+          "description": "Provider-reported model id, when one was reported (mirrors\n`ModelCompleteResult::model_id`) — `None` when the provider didn't\nsay, or when no provider ever answered this call.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "module": {
+          "description": "The module that placed the call (`_a24/model/complete`'s caller,\ne.g. `\"agentear\"`).",
+          "type": "string"
+        },
+        "ok": {
+          "description": "Whether the RPC call itself succeeded (a provider answering but the\nkernel then withholding the result — oversize, the LocalOnly\ntripwire — counts as `false`, same as `UsageOutcome::FailedAfterServe`).",
+          "type": "boolean"
+        },
+        "prompt_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "served_by": {
+          "description": "Which provider actually served the call (`Served::provider`, e.g.\n`\"omlx\"`/`\"ollama\"`) — `None` for the same reason `tier` can be.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tier": {
+          "description": "Open enum, `\"local\" | \"remote\"` (matches the RPC result's own\n`tier`) — `None` when the call failed before any provider served it,\nso no tier was ever decided.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "module",
+        "ok",
+        "latency_ms",
+        "model_id",
+        "tier",
+        "served_by",
+        "prompt_tokens",
+        "completion_tokens"
+      ]
+    },
     "ModelDeltaPayload": {
       "type": "object",
       "properties": {
@@ -657,6 +757,36 @@
         "run_id",
         "session_id",
         "schedule_id"
+      ]
+    },
+    "ScheduleDeliveredPayload": {
+      "description": "design §5.5: `{schedule_id, module, key, fire_id, scheduled_for}`, all\nrequired (no optional fields to force-require in export-schema.rs).",
+      "type": "object",
+      "properties": {
+        "fire_id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "module": {
+          "type": "string"
+        },
+        "schedule_id": {
+          "type": "string"
+        },
+        "scheduled_for": {
+          "description": "ISO-8601 UTC (fmt_iso), the slot this fire was recorded for.",
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "schedule_id",
+        "module",
+        "key",
+        "fire_id",
+        "scheduled_for"
       ]
     },
     "ScheduleDisabledPayload": {
