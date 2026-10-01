@@ -58,6 +58,16 @@ async function main(): Promise<void> {
     )
   } else {
     console.log(`[nostr] 已授权 ${CONFIG.ALLOWED_NPUBS.size} 个对端 agent`)
+    if (!CONFIG.F4B_INBOUND_ENABLED) {
+      // COMM-5a: jason 已决定冻结 F4b——配了白名单不再意味着入站会触发 run。
+      // 这条要足够醒目,因为旧行为(配白名单=会执行)悄悄变了。
+      console.warn(
+        '[nostr] ⚠️  F4b 入站执行已冻结(COMM-5a):即使对端在 A24_NOSTR_ALLOWED_NPUBS 白名单内,' +
+          '入站消息也不会再触发 agent24d run(只轮询/去重/记日志)。\n' +
+          '    如需临时恢复旧行为,设置 A24_NOSTR_F4B_INBOUND=1。\n' +
+          '    之后按入站执行将改走 T01-E 的高层授权,而不是这个开关。',
+      )
+    }
   }
   const inbound = new InboundBridge(agent, speaker, CONFIG.IDENTITY, CONFIG.ALLOWED_NPUBS)
 
@@ -112,7 +122,7 @@ async function main(): Promise<void> {
   const tick = async (): Promise<void> => {
     if (stopped) return
     try {
-      await pollOnce(speaker, inbound, liveness)
+      await pollOnce(speaker, inbound, liveness, { dispatchEnabled: CONFIG.F4B_INBOUND_ENABLED })
       if (consecutiveFailures > 0) {
         console.log(`[nostr] 入站轮询已恢复(此前连续失败 ${consecutiveFailures} 次)`)
         consecutiveFailures = 0

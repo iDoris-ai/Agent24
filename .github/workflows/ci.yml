@@ -95,6 +95,39 @@ jobs:
           manifest-path: rust/Cargo.toml
           command: check licenses bans sources
 
+  rust-macos:
+    name: Rust macOS (clippy + test)
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Rust toolchain
+        # fmt is platform-independent and already enforced by the `rust` job on
+        # ubuntu-latest, so this job only needs the clippy component.
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+
+      - name: clippy
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        working-directory: rust
+        run: cargo test --workspace
+
   contract:
     name: Contract Tests + Codegen Drift
     runs-on: ubuntu-latest

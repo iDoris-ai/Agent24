@@ -12,6 +12,8 @@ import {
   runScheduleNow,
   listPendingApprovals,
   decideApproval,
+  listOsModules,
+  setOsModuleEnabled,
 } from './api'
 
 function setProxy(fn: (req: { method: string; path: string; body?: unknown }) => unknown) {
@@ -65,6 +67,14 @@ describe('agent api', () => {
     ])
   })
 
+  it('run_now on a module row returns the fire_id, not run_id (design §8.2)', async () => {
+    setProxy((req) => {
+      if (req.path.endsWith('/run_now')) return { ok: true, status: 202, data: { fire_id: 'fire_abc123' } }
+      return { ok: true, status: 200, data: {} }
+    })
+    expect(await runScheduleNow('sch_mod')).toBe('fire_abc123')
+  })
+
   it('schedule mutations surface errors', async () => {
     setProxy(() => ({ ok: false, status: 400, data: { error: { message: 'bad spec' } } }))
     await expect(
@@ -95,5 +105,28 @@ describe('agent api', () => {
 
   it('errorMessage handles a string-shaped error (IPC fallback)', () => {
     expect(errorMessage({ status: 502, data: { error: 'proxy refused' } })).toBe('proxy refused')
+  })
+
+  it('FU-90: listOsModules / setOsModuleEnabled hit the right endpoints', async () => {
+    const seen: { method: string; path: string; body?: unknown }[] = []
+    const sin90: { modules: unknown[] } = {
+      modules: [{ name: 'sin90', namespace: '/api/v1/sin90', version: '0.5.0', enabled: true, state: 'mounted', granted: ['events'], missing_models: [], resources: 'ok', restart_required: false }],
+    }
+    setProxy((req) => {
+      seen.push(req)
+      return { ok: true, status: 200, data: sin90 }
+    })
+    expect(await listOsModules()).toEqual(sin90)
+    expect(await setOsModuleEnabled('sin90', false)).toEqual(sin90)
+    expect(seen).toEqual([
+      { method: 'GET', path: '/api/v1/os' },
+      { method: 'PATCH', path: '/api/v1/os/sin90', body: { enabled: false } },
+    ])
+  })
+
+  it('FU-90: a failed os-module call throws the envelope message', async () => {
+    setProxy(() => ({ ok: false, status: 404, data: { error: { message: 'no domain OS named "x"' } } }))
+    await expect(listOsModules()).rejects.toThrow('no domain OS named "x"')
+    await expect(setOsModuleEnabled('x', true)).rejects.toThrow('no domain OS named "x"')
   })
 })

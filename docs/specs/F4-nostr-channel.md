@@ -236,5 +236,7 @@ publish:
 
 - **F4a**:`packages/nostr-bridge`——出站(register/post/search/answer)驱动 agent-speaker CLI + 一键默认注册 + `agent-profile.yml` 能力抽象生成;配 **FakeNostr harness**(复用 H11 的 hermetic 假服务模式,假 agent-speaker + 假 daemon)自动测。
 - **F4b**:入站——daemon 集成 + npub 白名单 + gated run + 按 npub session;7×24 可跑(接 F5 泡测)。
+  **自 COMM-5a 起冻结**:默认不再因白名单消息触发 run,需显式设 `A24_NOSTR_F4B_INBOUND=1`
+  才恢复;后续入站执行改走 T01-E 的高层授权。
 
 阶段二(R1 落地后):bridge 从 subprocess 切到本地接口。

@@ -1,0 +1,76 @@
+# DEP-A7 摸底：在 windows-latest 上 `cargo check --workspace --keep-going`，按 crate 分类错误。
+# 该 job 永不因编译错误失败——日志与分类结果就是产物（docs/design/WINDOWS-PORT.md §9）。
+name: Windows check (survey)
+
+on:
+  workflow_dispatch:
+    inputs:
+      all_targets:
+        description: "also check tests/benches (--all-targets)"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - ".github/workflows/windows-check.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-wincheck-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: cargo check --keep-going (never fails the job; the log is the product)
+        run: |
+          set +e
+          extra=""
+          if [ "${{ inputs.all_targets }}" = "true" ]; then extra="--all-targets"; fi
+          cargo check --locked --workspace $extra --keep-going --message-format short 2>&1 | tee check.log
+          echo "cargo exit: ${PIPESTATUS[0]}" | tee -a check.log
+          exit 0
+
+      - name: Classify errors by crate
+        if: always()
+        run: |
+          {
+            echo "## errors by crate"
+            grep -oE '^(crates|apps)[\\/][^\\/:]+' check.log | sort | uniq -c | sort -rn || true
+            echo "## dependency build failures"
+            grep -E 'could not compile|failed to run custom build' check.log | sort -u || true
+          } | tee summary.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1（与 release.yml 一致）
+        with:
+          name: windows-check
+          path: |
+            rust/check.log
+            rust/summary.txt

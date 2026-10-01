@@ -66,6 +66,14 @@ pub struct ServerEntry {
     /// names here are the server's own (unqualified) names.
     #[serde(default, rename = "targetArgs")]
     pub target_args: BTreeMap<String, String>,
+    /// FU-103/J-6: this server's own environment variables (Claude Desktop's
+    /// `env` shape: `{"command","args","env":{...}}`). The server's child
+    /// process no longer inherits the daemon's ambient environment at all —
+    /// a credential it genuinely needs (its own API token, say) must be
+    /// given here, explicitly, by the user, and reaches ONLY this server's
+    /// child process, never any other server's or `shell_exec`'s.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -100,6 +108,7 @@ impl McpConfig {
             .map(|(name, e)| {
                 McpServerSpec::new(name.clone(), e.command.clone(), e.args.clone())
                     .with_target_args(e.target_args.clone())
+                    .with_env(e.env.clone())
             })
             .collect()
     }
@@ -293,5 +302,51 @@ mod tests {
     fn a_server_without_target_args_is_never_grant_eligible() {
         let cfg = parse_config(r#"{"mcpServers":{"fs":{"command":"x"}}}"#).unwrap();
         assert!(cfg.specs()[0].target_args.is_empty());
+    }
+
+    /// FU-103/J-6: `mcp.json`'s Claude-Desktop-standard `env` block is parsed
+    /// and reaches that server's own spec — it used to be silently dropped
+    /// (no `env` field on `ServerEntry` at all), which meant a server that
+    /// legitimately needed a token had no way to get one now that the daemon
+    /// stopped handing child processes its own ambient environment.
+    #[test]
+    fn a_servers_env_block_is_parsed_onto_its_own_spec() {
+        let cfg = parse_config(
+            r#"{"mcpServers":{"slack":{"command":"x","env":{"SLACK_TOKEN":"xoxb-123"}}}}"#,
+        )
+        .unwrap();
+        let spec = &cfg.specs()[0];
+        assert_eq!(
+            spec.env.get("SLACK_TOKEN").map(String::as_str),
+            Some("xoxb-123")
+        );
+    }
+
+    /// Server A's `env` block must never bleed into server B's spec — each
+    /// server's env is scoped to its own entry in the config.
+    #[test]
+    fn each_servers_env_block_stays_scoped_to_that_server() {
+        let cfg = parse_config(
+            r#"{"mcpServers":{
+                "a":{"command":"x","env":{"A_TOKEN":"a-secret"}},
+                "b":{"command":"y","env":{"B_TOKEN":"b-secret"}}
+            }}"#,
+        )
+        .unwrap();
+        let specs = cfg.specs();
+        let a = specs.iter().find(|s| s.name == "a").unwrap();
+        let b = specs.iter().find(|s| s.name == "b").unwrap();
+        assert_eq!(a.env.get("A_TOKEN").map(String::as_str), Some("a-secret"));
+        assert!(!a.env.contains_key("B_TOKEN"));
+        assert_eq!(b.env.get("B_TOKEN").map(String::as_str), Some("b-secret"));
+        assert!(!b.env.contains_key("A_TOKEN"));
+    }
+
+    /// An entry with no `env` block at all parses fine and grants nothing
+    /// beyond the fixed child-process whitelist.
+    #[test]
+    fn a_server_without_an_env_block_gets_an_empty_env() {
+        let cfg = parse_config(r#"{"mcpServers":{"fs":{"command":"x"}}}"#).unwrap();
+        assert!(cfg.specs()[0].env.is_empty());
     }
 }

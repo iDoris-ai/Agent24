@@ -7,6 +7,7 @@ import {
   runScheduleNow,
   type Schedule,
   type ScheduleSpec,
+  type DisabledBy,
 } from './agent/api'
 import { previewNextFire, formatPreview, type ScheduleSpecInput } from './schedule/cronPreview'
 
@@ -102,7 +103,11 @@ export default function SchedulesPage() {
 
   const onToggle = async (s: Schedule) => {
     try {
-      await updateSchedule(s.id, { enabled: !s.enabled })
+      // `effective_enabled` reflects module suspend/system-disable on top of
+      // `enabled`; older daemons never send it, so `?? enabled` keeps this
+      // desktop build working against them (design §8.2/§13 1.2.2d).
+      const eff = s.effective_enabled ?? s.enabled
+      await updateSchedule(s.id, { enabled: !eff })
       refresh()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -120,8 +125,13 @@ export default function SchedulesPage() {
 
   const onRunNow = async (id: string) => {
     try {
-      const runId = await runScheduleNow(id)
-      setNotice(`已触发运行 ${runId}`)
+      // A module row's run_now returns a fire_id (delivered to the module,
+      // no AgentRun happens), not a run_id — tell them apart by prefix
+      // (design §8.2) so the notice never reads "已触发运行 undefined".
+      const outcome = await runScheduleNow(id)
+      setNotice(
+        outcome.startsWith('fire_') ? `已投递给模块（fire_id ${outcome}）` : `已触发运行 ${outcome}`,
+      )
       refresh()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -230,45 +240,80 @@ export default function SchedulesPage() {
         {schedules.length === 0 && (
           <div style={{ fontSize: 12, color: 'var(--muted)' }}>暂无调度</div>
         )}
-        {schedules.map((s) => (
-          <div
-            key={s.id}
-            style={{
-              border: '1px solid var(--border)',
-              borderRadius: 8,
-              padding: 12,
-              opacity: s.enabled ? 1 : 0.55,
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <strong style={{ fontSize: 13 }}>{s.name}</strong>
-              <span style={{ fontSize: 10, color: 'var(--muted)' }}>{specSummary(s.spec)}</span>
-              {s.consecutive_failures > 0 && (
-                <span style={{ fontSize: 10, color: '#e0a020' }}>
-                  连续失败 {s.consecutive_failures}
-                </span>
-              )}
-              <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-                <button className="btn" style={{ fontSize: 11 }} onClick={() => onRunNow(s.id)}>
-                  立即运行
-                </button>
-                <button className="btn" style={{ fontSize: 11 }} onClick={() => onToggle(s)}>
-                  {s.enabled ? '禁用' : '启用'}
-                </button>
-                <button className="btn" style={{ fontSize: 11 }} onClick={() => onDelete(s.id)}>
-                  删除
-                </button>
+        {schedules.map((s) => {
+          // `?? enabled` is the load-bearing forward-compat fallback (design
+          // §8.2): an older daemon never sends `effective_enabled`, so this
+          // desktop build must keep reading plain `enabled` for it.
+          const eff = s.effective_enabled ?? s.enabled
+          const reason = s.owner ? disabledReasonText(s.disabled_by) : null
+          return (
+            <div
+              key={s.id}
+              style={{
+                border: '1px solid var(--border)',
+                borderRadius: 8,
+                padding: 12,
+                opacity: eff ? 1 : 0.55,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <strong style={{ fontSize: 13 }}>{s.name}</strong>
+                <span style={{ fontSize: 10, color: 'var(--muted)' }}>{specSummary(s.spec)}</span>
+                {s.owner && (
+                  <span style={{ fontSize: 10, color: 'var(--muted)' }}>
+                    来自模块 {s.owner.module}
+                  </span>
+                )}
+                {reason && (
+                  <span style={{ fontSize: 10, color: '#e0a020' }}>{reason}</span>
+                )}
+                {s.consecutive_failures > 0 && (
+                  <span style={{ fontSize: 10, color: '#e0a020' }}>
+                    连续失败 {s.consecutive_failures}
+                  </span>
+                )}
+                <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                  <button className="btn" style={{ fontSize: 11 }} onClick={() => onRunNow(s.id)}>
+                    立即运行
+                  </button>
+                  <button className="btn" style={{ fontSize: 11 }} onClick={() => onToggle(s)}>
+                    {eff ? '禁用' : '启用'}
+                  </button>
+                  <button className="btn" style={{ fontSize: 11 }} onClick={() => onDelete(s.id)}>
+                    删除
+                  </button>
+                </div>
               </div>
+              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                {s.next_run_at ? `下次 ${s.next_run_at}` : '（无后续触发）'}
+                {s.last_run_at && ` · 上次 ${s.last_run_at}`}
+              </div>
+              {/* `action` is null exactly when `owner` is set (design §8.1) —
+                  a module row has no AgentRun prompt to show, ever. */}
+              {s.action === null && (
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
+                  由模块 {s.owner?.module ?? '未知模块'} 处理
+                </div>
+              )}
             </div>
-            <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
-              {s.next_run_at ? `下次 ${s.next_run_at}` : '（无后续触发）'}
-              {s.last_run_at && ` · 上次 ${s.last_run_at}`}
-            </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )
+}
+
+function disabledReasonText(by: DisabledBy | undefined): string | null {
+  switch (by) {
+    case 'user':
+      return '已被你暂停'
+    case 'system':
+      return '系统因连续失败禁用'
+    case 'module':
+      return '模块自己停用'
+    default:
+      return null
+  }
 }
 
 function specSummary(spec: ScheduleSpec): string {
