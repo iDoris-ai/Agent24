@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 13] = [
+pub const PASSTHROUGH_VARS: [&str; 15] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -152,6 +152,11 @@ pub const PASSTHROUGH_VARS: [&str; 13] = [
     // Harmless to pass through: a launchd-started daemon has no reason to
     // have this set at all.
     "A24_LISTEN_FD",
+    // COMM-2a: which Hyphae binary `comm_routes::build` installs and runs
+    // (COMM-HYPHAE.md §3). `A24_SPEAKER_BIN` is the deprecated fallback name
+    // (D8) — both are read literally in `apps/agent24d/src/comm_routes.rs`.
+    "A24_HYPHAE_BIN",
+    "A24_SPEAKER_BIN",
 ];
 
 /// Snapshot the environment the daemon should run with.
