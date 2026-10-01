@@ -1326,6 +1326,13 @@ pub async fn serve(
         std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
     > = Arc::new(std::sync::OnceLock::new());
     let stopping_attach_registry = Arc::clone(&attach_registry_cell);
+    // COMM-4a: the Hyphae daemon supervisor (if comm_routes managed to build
+    // one) is, like the attach registry above, only known once `comm_routes::
+    // build` runs — AFTER this task is spawned — so it is handed over the
+    // same way: a cell filled in later, read only after a shutdown began.
+    let comm_daemon_cell: Arc<std::sync::OnceLock<Arc<agent24_comm::HyphaeDaemonSupervisor>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let stopping_comm_daemon = Arc::clone(&comm_daemon_cell);
     let stopping = tokio::spawn(async move {
         stop_shutdown.token().cancelled().await;
         // Whoever cancelled, the shutdown has begun: fixed here if nothing
@@ -1385,10 +1392,52 @@ pub async fn serve(
                  were dropped (SIGKILL attempted, exit unconfirmed)"
             );
         }
-        let records: Vec<_> = tracked
+        let mut records: Vec<_> = tracked
             .iter()
             .map(|(name, reason, record)| (name.clone(), *reason, record.snapshot()))
             .collect();
+        // COMM-4a §6.2: comm's stop is folded into this same module-stop
+        // phase, recorded as `comm.hyphae` in `last-shutdown.json`'s
+        // `records[]`. `agent24-comm` never depends on
+        // `agent24-os-proto` (COMM-HYPHAE.md §7's zero-run boundary), so the
+        // translation from its own neutral `DaemonShutdownOutcome` into this
+        // crate's `StopRecord` happens here, not there.
+        if let Some(daemon) = stopping_comm_daemon.get() {
+            let outcome = daemon.shutdown().await;
+            let leader = outcome.leader.map(|l| match l {
+                agent24_comm::ShutdownLeader::GoneBeforeTerm => {
+                    agent24_os_proto::stop_record::Leader::GoneBeforeTerm
+                }
+                agent24_comm::ShutdownLeader::ExitedInGrace => {
+                    agent24_os_proto::stop_record::Leader::ExitedInGrace
+                }
+                agent24_comm::ShutdownLeader::KilledAfterGrace => {
+                    agent24_os_proto::stop_record::Leader::KilledAfterGrace
+                }
+            });
+            // `StopRecord` has two private fields (`drain_began`,
+            // `abandoning`) not meant for a caller outside `agent24-os-proto`
+            // to set, so `..Default::default()` is unavailable here — plain
+            // field assignment on a `Default::default()` value only touches
+            // the public ones this comm translation actually has an opinion
+            // about.
+            let mut record = agent24_os_proto::stop_record::StopRecord::default();
+            record.process = Some(if outcome.had_process {
+                agent24_os_proto::stop_record::ProcessAtStop::Running
+            } else {
+                agent24_os_proto::stop_record::ProcessAtStop::None
+            });
+            record.leader = leader;
+            record.group = outcome
+                .had_process
+                .then_some(agent24_os_proto::stop_record::GroupEnd::Gone);
+            record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped);
+            records.push((
+                "comm.hyphae".to_owned(),
+                crate::lifecycle::Reason::Shutdown,
+                record,
+            ));
+        }
         let summary = crate::lifecycle::Summary::new(
             marker
                 .as_ref()
@@ -1681,7 +1730,13 @@ pub async fn serve(
     // kernel auth exactly like every other module route, and so the wiring
     // itself lives in its own file (`comm_routes.rs`); see that file's own
     // doc comment for the `RESERVED_KERNEL_SEGMENTS` gap this leaves.
-    let comm_router = crate::comm_routes::build(&state_dir).await;
+    let (comm_router, comm_daemon) = crate::comm_routes::build(&state_dir).await;
+    if let Some(handle) = comm_daemon {
+        // Best-effort: only `None` if this `set` races a shutdown that has
+        // already read the cell, in which case the daemon this build() just
+        // started is instead cleaned up by the NEXT start's orphan reap.
+        let _ = comm_daemon_cell.set(handle);
+    }
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
