@@ -18,12 +18,17 @@
 //! implementation, which makes it the one part of ME-3b whose expected answers
 //! are not decided by whoever writes the code.
 
+pub mod attach;
+pub mod attach_mux;
 pub mod drain;
 pub mod endpoint;
 pub mod failure;
 pub mod frame;
 pub mod initialize;
+pub mod kernel_call;
 pub mod launch;
+pub mod manifest;
+pub mod module;
 pub mod proxy;
 pub mod rpc;
 pub mod stop_record;

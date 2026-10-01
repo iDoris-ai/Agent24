@@ -136,6 +136,30 @@ fn grant_scope<'a>(
     session_id.map(|id| ("session", id))
 }
 
+fn grant_ctx(
+    run_id: &str,
+    session_id: Option<&str>,
+    schedule_id: Option<&str>,
+    tool: &str,
+    risk: RiskClass,
+    standing_target: Option<&str>,
+) -> GrantCtx {
+    let scope = session_id.unwrap_or(run_id).to_owned();
+    let durable_scope = grant_scope(session_id, schedule_id);
+    let target = risk
+        .standing_grant_eligible()
+        .then_some(standing_target)
+        .flatten()
+        .filter(|_| durable_scope.is_some());
+    GrantCtx {
+        scope,
+        tool: tool.to_owned(),
+        scope_kind: durable_scope.map(|(kind, _)| kind),
+        scope_id: durable_scope.map(|(_, id)| id.to_owned()),
+        target: target.map(str::to_owned),
+    }
+}
+
 pub struct ApprovalBroker {
     store: Store,
     emit: Arc<dyn Fn(EventBody) + Send + Sync>,
@@ -229,24 +253,14 @@ impl ApprovalBroker {
             summary,
             payload,
         } = req;
-        let scope = session_id.unwrap_or(run_id).to_owned();
         // A target-scoped grant is only offerable when there is something
         // durable to hang it on. A transient run's id never recurs, so a grant
         // scoped to it could never match again — offering it would be a button
         // that silently does nothing.
+        let grant_ctx = grant_ctx(run_id, session_id, schedule_id, tool, risk, standing_target);
+        let scope = grant_ctx.scope.clone();
         let grant_scope = grant_scope(session_id, schedule_id);
-        let offer_target = risk
-            .standing_grant_eligible()
-            .then_some(standing_target)
-            .flatten()
-            .filter(|_| grant_scope.is_some());
-        let grant_ctx = GrantCtx {
-            scope: scope.clone(),
-            tool: tool.to_owned(),
-            scope_kind: grant_scope.map(|(k, _)| k),
-            scope_id: grant_scope.map(|(_, id)| id.to_owned()),
-            target: offer_target.map(str::to_owned),
-        };
+        let offer_target = grant_ctx.target.as_deref();
 
         // Standing grant (H4): persistent, and matched on the EXACT target.
         if let (Some((kind_s, id)), Some(target)) = (grant_scope, offer_target) {
@@ -737,6 +751,18 @@ impl ApprovalBroker {
         tracing::info!("approval {approval_id} resolved: {resolution}");
     }
 
+    /// Durable expiry sweep used at daemon startup and by the periodic
+    /// recovery loop.  The store CAS chooses the winners; only those rows are
+    /// announced and audited here, so repeated scans are side-effect free.
+    pub async fn timeout_expired(&self, now: &str) -> Result<u64, StoreError> {
+        let expired = self.store.timeout_expired_approvals(now).await?;
+        for (approval_id, run_id) in &expired {
+            self.broadcast_resolution(approval_id, run_id, "timed_out")
+                .await;
+        }
+        Ok(expired.len() as u64)
+    }
+
     /// Apply a client decision (REST `POST /api/v1/approvals/{id}`).
     /// Store-first: the pending-only UPDATE is the single arbiter, so a
     /// duplicate/late decision surfaces as 409 and is discarded.
@@ -768,14 +794,15 @@ impl ApprovalBroker {
             ));
         }
         let status = match decision.kind.as_str() {
-            "approve" | "approve_for_session" => ApprovalStatus::Approved,
+            "approve" | "approve_for_session" | "approve_for_target" => ApprovalStatus::Approved,
             "deny" => ApprovalStatus::Denied,
             "abort" => ApprovalStatus::Aborted,
             other => return Err(ResolveError::Invalid(format!("unknown decision {other}"))),
         };
+        let now = now_iso8601();
         let resolved = self
             .store
-            .resolve_approval(id, status, Some(&decision), now_iso8601())
+            .resolve_approval_client_decision(id, status, &decision, &now)
             .await
             .map_err(|err| match err {
                 StoreError::Conflict(_) => ResolveError::AlreadyResolved(id.to_owned()),
@@ -807,6 +834,38 @@ impl BrokerGate {
 
 #[async_trait]
 impl ApprovalGate for BrokerGate {
+    async fn settle_resumed(
+        &self,
+        approval_id: &str,
+        decision: &Decision,
+        info: &agent24_protocol::ToolInfo,
+        ctx: &ToolContext,
+        standing_target: Option<&str>,
+    ) {
+        let eligible = match decision.kind.as_str() {
+            "approve_for_session" => !info.risk_class.standing_grant_eligible(),
+            "approve_for_target" => {
+                info.risk_class.standing_grant_eligible() && standing_target.is_some()
+            }
+            _ => false,
+        };
+        if !eligible {
+            return;
+        }
+        let grant_ctx = grant_ctx(
+            ctx.run_id(),
+            ctx.session_id(),
+            ctx.schedule_id(),
+            &info.name,
+            info.risk_class,
+            standing_target,
+        );
+        let _ = self
+            .broker
+            .apply_decision(approval_id, &grant_ctx, decision.clone())
+            .await;
+    }
+
     async fn check_plan(
         &self,
         run_id: &str,
@@ -846,10 +905,10 @@ impl ApprovalGate for BrokerGate {
             .broker
             .request(
                 ApprovalRequest {
-                    run_id: &ctx.run_id,
-                    session_id: ctx.session_id.as_deref(),
-                    schedule_id: ctx.schedule_id.as_deref(),
-                    tool_call_id: &ctx.tool_call_id,
+                    run_id: ctx.run_id(),
+                    session_id: ctx.session_id(),
+                    schedule_id: ctx.schedule_id(),
+                    tool_call_id: ctx.tool_call_id(),
                     tool: &info.name,
                     kind,
                     // `info` is the EFFECTIVE ToolInfo the registry built, so
@@ -977,9 +1036,11 @@ mod tests {
             .insert_run(&agent24_protocol::Run {
                 id: id.to_owned(),
                 session_id: None,
+                workspace_id: None,
                 status: agent24_protocol::RunStatus::Running,
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
+                    workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                 },
@@ -1167,6 +1228,135 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ResolveError::AlreadyResolved(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn expired_pending_client_decision_is_rejected() {
+        let (broker, events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let id = "apr_expired";
+        store
+            .insert_approval(&Approval {
+                id: id.to_owned(),
+                run_id: "run_1".to_owned(),
+                tool_call_id: "tc_1".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "s".to_owned(),
+                payload: Map::new(),
+                available_decisions: vec!["approve".to_owned()],
+                standing_target: None,
+                status: ApprovalStatus::Pending,
+                decision: None,
+                expires_at: "2020-01-01T00:00:01Z".to_owned(),
+                created_at: "2020-01-01T00:00:00Z".to_owned(),
+                decided_at: None,
+            })
+            .await
+            .unwrap();
+        let resolved_before = events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "approval.resolved")
+            .count();
+        let err = broker
+            .resolve(id, decision("approve", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ResolveError::AlreadyResolved(_)), "{err}");
+        assert_eq!(
+            store.get_approval(id).await.unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
+        assert_eq!(
+            events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.as_str() == "approval.resolved")
+                .count(),
+            resolved_before
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_expiry_sweep_emits_and_audits_only_cas_winners() {
+        let (broker, events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        store
+            .insert_approval(&Approval {
+                id: "apr_expired".to_owned(),
+                run_id: "run_1".to_owned(),
+                tool_call_id: "tc_1".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "s".to_owned(),
+                payload: Map::new(),
+                available_decisions: vec!["approve".to_owned()],
+                standing_target: None,
+                status: ApprovalStatus::Pending,
+                decision: None,
+                expires_at: "2026-09-30T00:00:00Z".to_owned(),
+                created_at: "2026-09-29T23:59:00Z".to_owned(),
+                decided_at: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            broker
+                .timeout_expired("2026-09-30T00:00:01Z")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_approval("apr_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::TimedOut
+        );
+        let resolved_events = || {
+            events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.as_str() == "approval.resolved")
+                .count()
+        };
+        assert_eq!(resolved_events(), 1);
+        let resolved_audits = store
+            .list_audit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "approval.resolved")
+            .count();
+        assert_eq!(resolved_audits, 1);
+
+        assert_eq!(
+            broker
+                .timeout_expired("2026-09-30T00:00:02Z")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(resolved_events(), 1);
+        assert_eq!(
+            store
+                .list_audit()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.action == "approval.resolved")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1677,6 +1867,63 @@ mod tests {
         assert!(matches!(miss, Verdict::Denied(_)), "{miss:?}");
     }
 
+    #[tokio::test]
+    async fn approve_for_target_resolves_and_records_the_exact_grant() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        seed_run(&store, "run_1").await;
+        let b = Arc::clone(&broker);
+        let waiter = tokio::spawn(async move {
+            b.request(
+                external_req("run_1", None, Some("sch_1"), Some("#ops")),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let id = wait_for_pending(&store).await;
+
+        let approval = broker
+            .resolve(&id, decision("approve_for_target", None))
+            .await
+            .unwrap();
+        assert_eq!(approval.status, ApprovalStatus::Approved);
+        assert_eq!(waiter.await.unwrap(), Verdict::Approved);
+        assert!(
+            store
+                .standing_grant_exists("schedule", "sch_1", "mcp_slack_post", "#ops")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_target_decision_replays_the_exact_grant() {
+        let (broker, _events, store) = broker_with_timeout(Duration::from_secs(30)).await;
+        let gate = BrokerGate::new(Arc::clone(&broker));
+        let ctx = ToolContext::legacy("run_1", None, Some("sch_1".to_owned()), "tc_1");
+        let info = agent24_protocol::ToolInfo::new(
+            "mcp_slack_post".to_owned(),
+            "mcp".to_owned(),
+            "post".to_owned(),
+            RiskClass::External,
+        );
+
+        gate.settle_resumed(
+            "apr_1",
+            &decision("approve_for_target", None),
+            &info,
+            &ctx,
+            Some("#ops"),
+        )
+        .await;
+
+        assert!(
+            store
+                .standing_grant_exists("schedule", "sch_1", "mcp_slack_post", "#ops")
+                .await
+                .unwrap()
+        );
+    }
+
     /// A grant belongs to ONE scope. The same tool and target under a different
     /// schedule is a separate decision the user has not made.
     #[tokio::test]
@@ -1730,15 +1977,20 @@ mod tests {
             name: "nightly".to_owned(),
             enabled: true,
             spec: agent24_protocol::ScheduleSpec::Every { secs: 60 },
-            action: agent24_protocol::ScheduleAction::AgentRun {
+            action: Some(agent24_protocol::ScheduleAction::AgentRun {
                 prompt: "go".to_owned(),
                 session_id: None,
                 model_override: None,
-            },
+            }),
             delivery: vec![],
             last_run_at: None,
             next_run_at: None,
             consecutive_failures: 0,
+            owner: None,
+            user_suspended: false,
+            system_disabled_reason: None,
+            effective_enabled: true,
+            disabled_by: None,
         };
         store.upsert_schedule(&schedule).await.unwrap();
         store

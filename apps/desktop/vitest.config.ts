@@ -25,6 +25,11 @@ export default defineConfig({
         'src/main/preload.ts',
         'src/main/ipc/index.ts',
         'src/main/backend-manager.ts',
+        // A3-4: the AgentEarEventBridge class needs a real `ws` socket +
+        // Electron webContents; its pure helpers (parseAgentEarFrame,
+        // nextBackoffMs) ARE unit tested (agentear-events.test.ts) same as
+        // backend-manager.ts's deriveStatus above.
+        'src/main/agentear-events.ts',
         // React DOM entry point — no testable logic
         'src/renderer/main.tsx',
       ],

@@ -16,15 +16,23 @@ describe('WorkbenchPage', () => {
     expect(screen.getByText('RAG 知识库')).toBeInTheDocument()
   })
 
-  it('shows ready status for translation', () => {
+  // AUDIT-3: no card is clickable (none has an onClick), so none may claim
+  // "✓ 可用" — every card, including 翻译, is a disabled "即将推出" preview.
+  it('never shows a misleading "ready" status', () => {
     render(<WorkbenchPage />)
-    const readyItems = screen.getAllByText('✓ 可用')
-    expect(readyItems.length).toBeGreaterThan(0)
+    expect(screen.queryByText('✓ 可用')).not.toBeInTheDocument()
+    expect(screen.queryByText(/可用/)).not.toBeInTheDocument()
   })
 
-  it('shows coming-soon status for most capabilities', () => {
+  it('shows coming-soon status for every capability, marked disabled', () => {
     render(<WorkbenchPage />)
-    const coming = screen.getAllByText('开发中')
-    expect(coming.length).toBeGreaterThan(0)
+    const coming = screen.getAllByText('即将推出')
+    expect(coming.length).toBe(9)
+
+    const cards = document.querySelectorAll('.capability-card')
+    expect(cards.length).toBe(9)
+    cards.forEach((card) => {
+      expect(card.getAttribute('aria-disabled')).toBe('true')
+    })
   })
 })

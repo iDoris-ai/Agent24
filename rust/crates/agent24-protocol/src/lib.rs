@@ -14,6 +14,8 @@
 pub mod events;
 pub mod state_file;
 pub mod types;
+pub mod workspace;
 
 pub use events::*;
 pub use types::*;
+pub use workspace::*;

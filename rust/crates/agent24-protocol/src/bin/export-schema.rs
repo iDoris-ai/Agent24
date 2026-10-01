@@ -22,6 +22,16 @@ const FORCE_REQUIRED: &[(&str, &[&str])] = &[
     // a frozen submission-time snapshot that deliberately has NO `executed_at`
     // field at all — do not add it here.
     ("ModuleApprovalSubmitted", &["target", "decided_at"]),
+    (
+        "ModelCallPayload",
+        &[
+            "model_id",
+            "tier",
+            "served_by",
+            "prompt_tokens",
+            "completion_tokens",
+        ],
+    ),
 ];
 
 fn main() {
@@ -68,6 +78,10 @@ fn main() {
                     "ModuleApprovalSubmitted",
                     &["expires_at", "created_at", "decided_at"],
                 ),
+                // ME4-1.2.2a (design §5.5): `scheduled_for` is a plain
+                // `String` field (like the others above), so schemars won't
+                // infer `format: date-time` on its own.
+                ("ScheduleDeliveredPayload", &["scheduled_for"]),
             ];
             for (def_name, fields) in DATE_TIME_FIELDS {
                 if let Some(props) = defs
