@@ -194,6 +194,21 @@ enum CommAction {
         #[command(subcommand)]
         action: CommRelayAction,
     },
+    /// Manage the Hyphae daemon `agent24d` supervises (COMM-4a)
+    Daemon {
+        #[command(subcommand)]
+        action: CommDaemonAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CommDaemonAction {
+    /// Show the supervised Hyphae daemon's state
+    Status,
+    /// Start the Hyphae daemon
+    Start,
+    /// Stop the Hyphae daemon
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -894,6 +909,21 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 reqwest::Method::POST,
                 "/api/v1/comm/relay/probe".to_owned(),
                 Some(serde_json::json!({"url": url})),
+            ),
+        },
+        CommAction::Daemon { action } => match action {
+            CommDaemonAction::Status => {
+                (reqwest::Method::GET, "/api/v1/comm/daemon".to_owned(), None)
+            }
+            CommDaemonAction::Start => (
+                reqwest::Method::POST,
+                "/api/v1/comm/daemon/start".to_owned(),
+                None,
+            ),
+            CommDaemonAction::Stop => (
+                reqwest::Method::POST,
+                "/api/v1/comm/daemon/stop".to_owned(),
+                None,
             ),
         },
     };
