@@ -624,6 +624,15 @@ mod windows_tests {
     #[test]
     fn windows_moved_pipes_deliver_eof_and_leave_the_launch_authoritative() {
         let cwd = std::env::temp_dir();
+        let mut env = BTreeMap::from([(
+            String::from("SystemRoot"),
+            std::env::var("SystemRoot").unwrap(),
+        )]);
+        for key in ["PSModulePath", "LOCALAPPDATA", "TEMP"] {
+            if let Ok(value) = std::env::var(key) {
+                env.insert(key.to_owned(), value);
+            }
+        }
         let mut launch = OwnedLaunch::start(LaunchIntent::from_request(Request::Launch {
             version: 1,
             request_id: 20,
@@ -631,7 +640,7 @@ mod windows_tests {
             cwd: cwd.display().to_string(),
             argv: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
                 "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('eof-marker'); [Console]::Out.Flush(); [Console]::Error.Write('err-marker'); [Console]::Error.Flush(); Start-Sleep -Seconds 30".into()],
-            env: BTreeMap::from([(String::from("SystemRoot"), std::env::var("SystemRoot").unwrap())]),
+            env,
         }).unwrap()).unwrap();
         let request_id = launch.request_id();
         let (stdout, stderr, stdout_moved_once, stderr_moved_once, stdin_preserved) = {
