@@ -59,9 +59,9 @@ export function classifyCreativeUrl(candidate: string, allowedOrigin: string): C
   } catch {
     return 'blocked'
   }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return 'blocked'
   if (url.origin === allowed.origin) return 'same-origin'
-  if (url.protocol === 'http:' || url.protocol === 'https:') return 'external-http'
-  return 'blocked'
+  return 'external-http'
 }
 
 export function resolveOpenDesignCheckout(

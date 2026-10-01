@@ -68,6 +68,7 @@ describe('CreativeServeWeb', () => {
     expect(classifyCreativeUrl('http://127.0.0.1:17457/project', origin)).toBe('external-http')
     expect(classifyCreativeUrl('https://127.0.0.1:17456/project', origin)).toBe('external-http')
     expect(classifyCreativeUrl('http://127.0.0.1.evil.example:17456/project', origin)).toBe('external-http')
+    expect(classifyCreativeUrl('blob:http://127.0.0.1:17456/preview', origin)).toBe('blocked')
     expect(classifyCreativeUrl('javascript:alert(1)', origin)).toBe('blocked')
     expect(classifyCreativeUrl('file:///tmp/secret', origin)).toBe('blocked')
     expect(classifyCreativeUrl('not a url', origin)).toBe('blocked')

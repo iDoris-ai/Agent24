@@ -105,7 +105,8 @@ async function showCreativeView(bounds: CreativeViewBounds): Promise<CreativeVie
       event.preventDefault()
       if (disposition === 'external-http') void shell.openExternal(url)
     })
-    creativeView.webContents.on('will-redirect', (event, url) => {
+    creativeView.webContents.on('will-redirect', (event, url, _isInPlace, isMainFrame) => {
+      if (!isMainFrame) return
       const disposition = creativeOrigin ? classifyCreativeUrl(url, creativeOrigin) : 'blocked'
       if (disposition !== 'same-origin') event.preventDefault()
     })
