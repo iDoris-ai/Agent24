@@ -42,7 +42,10 @@ keyring = { version = "3.6", default-features = false, features = [
     "tokio",
     "crypto-rust",
 ] }
-rustix = { version = "0.38", features = ["process"] }
+# COMM-2b's import flow (`import.rs`) non-blockingly `flock`s the source
+# `outbox.json.lock` for the duration of the file copy (COMM-HYPHAE.md
+# §4.1 step 2) — `fs` is rustix's gate for `rustix::fs::flock`.
+rustix = { version = "0.38", features = ["process", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
