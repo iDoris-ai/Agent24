@@ -17,3 +17,13 @@ pub mod types;
 
 pub use events::*;
 pub use types::*;
+
+// DEP-A1 反向验证临时测试：只在 macOS 上失败，确认 rust-macos job 会变红；验证后立即删除。
+#[cfg(test)]
+mod dep_a1_reverse_check {
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dep_a1_force_fail_on_macos() {
+        panic!("DEP-A1 reverse check: rust-macos job must turn red");
+    }
+}
