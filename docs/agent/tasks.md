@@ -269,7 +269,30 @@ T11（Sin90 迁出内核，DONE）→ T10（Cos72 进程外样例，暂停）→
 
 ---
 
+## M1 v2 台账（2026-10-01 冻结；本表是 M1 唯一的状态来源）
+
+> 定义/验收见 [`M1-PLAN-v2.md`](M1-PLAN-v2.md)（已冻结 2026-10-01）。执行：B（Mac mini ab-codex）在集成分支 `ab/m1-memory` 上做，A（笔记本）派活与验收；[笔记本] 标注的需要本地模型。入队顺序见 M1-PLAN-v2 §2「依赖图与 B 上入队顺序」。
+
+| ID | 任务 | 依赖 | 状态 | 证据 |
+|---|---|---|---|---|
+| M1-T01 | `Authorizer` 契约 + 接进 `lend` | — | `IN_PROGRESS`（B） | 分支 `ab/m1-memory-01-authz` |
+| M1-T02 | `SpaceId::personal` + 目录登记（迁移 0016） | — | `IN_PROGRESS`（B） | 分支 `ab/m1-memory-02-personal-space` |
+| M1-T03 | `SessionLog` 存储接口（事务/幂等/视图/导入） | — | `READY` |  |
+| M1-T04 | agent loop 切换到 `SessionLog` | T03 | `BACKLOG` |  |
+| M1-T05 | agentd 接线 + 真实路径崩溃重放 | T02, T04 | `BACKLOG` |  |
+| M1-T06 | Retain：显式「记住」写入断言账本 | T05 | `BACKLOG` |  |
+| M1-T06b | LLM 抽取（笔记本，可选） | T06, T08 | `BACKLOG` |  |
+| M1-T07a | 中文可检索：FTS 接缝下移 + CJK 二元组 + `search_any`（迁移 0017） | — | `READY` |  |
+| M1-T07 | Recall：run 前召回注入 | T05, T06, T07a | `BACKLOG` |  |
+| M1-T07b | 向量召回（笔记本，可选） | T07 | `BACKLOG` |  |
+| M1-T08 | 召回评测基线 | T07 | `BACKLOG` |  |
+| M1-T09 | 存储层同事务撤回 `forget` | — | `READY` |  |
+| M1-T10 | 记忆 REST：列出/搜索/撤回 | T07, T09 | `BACKLOG` |  |
+| M1-T11 | 桌面端「记忆」页 | T10 | `BACKLOG` |  |
+
 ## M1 —— 记忆成为产品（2026-08-23 规划；状态未改动，未重排）
+
+> ⛔ **本节（v1，2026-08-23）已被 [`M1-PLAN-v2.md`](M1-PLAN-v2.md) 取代**，仅供历史参考，不要照它派活。状态以上方「M1 v2 台账」为准。
 
 ## F1.1 — 判定接缝（原 F8b）
 
