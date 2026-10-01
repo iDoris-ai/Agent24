@@ -3,6 +3,14 @@
 All notable changes to Agent24 are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**行为变化**
+- **F4b 入站执行默认冻结**（COMM-5a）：即使配置了 `A24_NOSTR_ALLOWED_NPUBS`,Nostr 入站消息
+  也不再自动触发 `agent24d` run——`pollOnce` 仍然轮询、仍然喂给 FU-32 的活性探针
+  （`liveness.observe`),只是不再对消息调用 `bridge.handle` / `runToCompletion`。设置
+  `A24_NOSTR_F4B_INBOUND=1` 可临时恢复旧行为;后续按入站执行将改走 T01-E 的高层授权。
+
 ## [0.5.0] — 2026-09-30
 
 **ME-3 完整收口 + 调度/推理回调 + 模块 SDK 正式落地 + Sin90/Cos72 独立可装**。自 0.4.0
