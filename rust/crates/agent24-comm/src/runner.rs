@@ -11,7 +11,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -208,7 +208,7 @@ fn parse_json_object(
 /// tested against a synthetic environment without ever mutating the real
 /// process environment — `std::env::set_var` is `unsafe` and this crate
 /// forbids unsafe code everywhere, including in tests.
-fn filtered_env<I>(source: I) -> Vec<(String, String)>
+pub(crate) fn filtered_env<I>(source: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
@@ -271,6 +271,22 @@ impl HyphaeRunner {
             default_timeout: self.default_timeout,
             keystore_lock: KeystoreWriteLock::default(),
         }
+    }
+
+    /// The verified Hyphae binary's path. COMM-4a's daemon supervisor
+    /// spawns a long-running `hyphae daemon` child itself (not via
+    /// [`Self::run`], which is built around a single invocation whose
+    /// stdout/stderr are captured in full for envelope parsing) but must
+    /// exec the exact same verified copy.
+    pub fn bin_path(&self) -> &Path {
+        self.bin.path()
+    }
+
+    /// The verified binary's sha256, hex-encoded — recorded in the daemon
+    /// pid file (COMM-HYPHAE.md §2) so a future `agent24d` can at least log
+    /// which binary an orphaned daemon was running.
+    pub fn bin_sha256_hex(&self) -> String {
+        self.bin.sha256().to_hex()
     }
 
     /// Builds (but does not spawn) the child command for `inv`: absolute

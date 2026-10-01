@@ -58,6 +58,12 @@ enum Backend {
 #[derive(Clone)]
 pub struct CommState {
     backend: Backend,
+    /// COMM-4a: the Hyphae daemon supervisor, when one has been wired up by
+    /// `agent24d` (`comm_routes.rs`). `None` on every test/`Unconfigured`/
+    /// `BinaryRejected` state that never calls [`CommState::with_daemon`] —
+    /// the `/comm/daemon*` routes then answer `not_configured` same as any
+    /// other route on those backends.
+    daemon: Option<Arc<crate::daemon::HyphaeDaemonSupervisor>>,
 }
 
 impl CommState {
@@ -79,7 +85,17 @@ impl CommState {
                 password_store,
                 home: Arc::new(home),
             },
+            daemon: None,
         }
+    }
+
+    /// Wires in the COMM-4a daemon supervisor. `agent24d` calls this right
+    /// after `ready` whenever it was able to build one; tests that only
+    /// exercise identity/contact/relay routes have no reason to.
+    #[must_use]
+    pub fn with_daemon(mut self, daemon: Arc<crate::daemon::HyphaeDaemonSupervisor>) -> Self {
+        self.daemon = Some(daemon);
+        self
     }
 
     /// Every route answers `not_configured`, message `reason` — no binary
@@ -90,6 +106,7 @@ impl CommState {
             backend: Backend::Unconfigured {
                 reason: Arc::new(reason.into()),
             },
+            daemon: None,
         }
     }
 
@@ -101,6 +118,7 @@ impl CommState {
             backend: Backend::BinaryRejected {
                 reason: Arc::new(reason.into()),
             },
+            daemon: None,
         }
     }
 
@@ -117,6 +135,16 @@ impl CommState {
             }
         }
     }
+
+    /// COMM-4a: the daemon supervisor, or `not_configured` if none was ever
+    /// wired (an `Unconfigured`/`BinaryRejected` backend, per
+    /// `require_ready`, or a `Ready` test state built without
+    /// `with_daemon`).
+    fn require_daemon(&self) -> Result<&crate::daemon::HyphaeDaemonSupervisor, CommError> {
+        self.daemon.as_deref().ok_or_else(|| {
+            CommError::NotConfigured("the hyphae daemon supervisor is not wired up".to_owned())
+        })
+    }
 }
 
 /// The comm router, relative to wherever the caller nests it (`agent24d`
@@ -132,7 +160,47 @@ pub fn router(state: CommState) -> Router {
         .route("/relay", get(list_relay).put(set_relay))
         .route("/relay/probe", post(probe_relay))
         .route("/import", post(import))
+        .route("/daemon", get(daemon_status))
+        .route("/daemon/start", post(daemon_start))
+        .route("/daemon/stop", post(daemon_stop))
         .with_state(state)
+}
+
+// ---------------------------------------------------------------------
+// daemon (COMM-4a; COMM-HYPHAE.md §4, §5.2 trimmed to what this task tracks)
+// ---------------------------------------------------------------------
+
+fn daemon_status_json(s: crate::daemon::DaemonStatus) -> Value {
+    json!({"ok": true, "data": {"process": {
+        "state": s.state,
+        "generation": s.generation,
+        "consecutive_failures": s.consecutive_failures,
+        "reason": s.reason,
+    }}})
+}
+
+async fn daemon_status(State(state): State<CommState>) -> CommResult {
+    state.require_ready()?;
+    let daemon = state.require_daemon()?;
+    Ok(Json(daemon_status_json(daemon.status())))
+}
+
+async fn daemon_start(State(state): State<CommState>) -> CommResult {
+    state.require_ready()?;
+    let daemon = state.require_daemon()?;
+    daemon.start().await.map_err(|e| match e {
+        crate::daemon::DaemonStartError::NotConfigured(m) => CommError::NotConfigured(m),
+        crate::daemon::DaemonStartError::Locked(m) => CommError::Locked(m),
+        crate::daemon::DaemonStartError::Failed(m) => CommError::Upstream(m),
+    })?;
+    Ok(Json(daemon_status_json(daemon.status())))
+}
+
+async fn daemon_stop(State(state): State<CommState>) -> CommResult {
+    state.require_ready()?;
+    let daemon = state.require_daemon()?;
+    daemon.stop().await;
+    Ok(Json(daemon_status_json(daemon.status())))
 }
 
 fn args(parts: &[&str]) -> Vec<OsString> {
@@ -216,7 +284,10 @@ async fn read_keystore_salt(home: &Path) -> Result<Option<String>, CommError> {
     Ok(value.get("salt").and_then(Value::as_str).map(str::to_owned))
 }
 
-async fn resolve_account(home: &Path) -> Result<Option<Account>, CommError> {
+/// `pub(crate)`, not private: COMM-4a's daemon supervisor (`daemon.rs`)
+/// needs the same "which keyring account does this HOME's keystore use"
+/// lookup to retrieve the daemon's own password before spawning.
+pub(crate) async fn resolve_account(home: &Path) -> Result<Option<Account>, CommError> {
     Ok(read_keystore_salt(home)
         .await?
         .map(|salt| Account::from_salt(&salt)))
@@ -311,6 +382,18 @@ async fn create_identity(
                 promote_first_identity_password(home, password_store, &account).await;
             }
             drop(guard);
+            // COMM-4a (COMM-HYPHAE.md §6.3): creating a new DEFAULT identity
+            // changes what `daemon --identity` would use, same as
+            // `/identity/default` below — restart it if it's running. Done
+            // after the keystore write lock is released (PR #622 Medium
+            // only needs the lock held through the Pending->Salt rename
+            // above; daemon supervision is unrelated to that critical
+            // section).
+            if req.default
+                && let Some(daemon) = state.daemon.clone()
+            {
+                daemon.on_config_changed().await;
+            }
             Ok(Json(json!({"ok": true, "data": data})))
         }
         Ok(Envelope::Failed {
@@ -498,6 +581,13 @@ async fn use_identity(
         ]))
         .await
         .map_err(map_runner_error)?;
+    // COMM-4a: the default identity just changed — restart the daemon if
+    // it's running (COMM-HYPHAE.md §6.3), without touching its failure count.
+    if matches!(envelope, Envelope::Ok { .. })
+        && let Some(daemon) = state.daemon.clone()
+    {
+        daemon.on_config_changed().await;
+    }
     envelope_response(envelope)
 }
 
@@ -633,6 +723,13 @@ async fn set_relay(State(state): State<CommState>, Json(req): Json<RelaySetReq>)
         })
         .await
         .map_err(map_runner_error)?;
+    // COMM-4a: the relay set just changed — restart the daemon if it's
+    // running (COMM-HYPHAE.md §6.3), without touching its failure count.
+    if matches!(envelope, Envelope::Ok { .. })
+        && let Some(daemon) = state.daemon.clone()
+    {
+        daemon.on_config_changed().await;
+    }
     relay_envelope_response(envelope)
 }
 
