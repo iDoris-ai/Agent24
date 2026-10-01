@@ -7,6 +7,7 @@
 //! writes its bytes straight to a child's stdin pipe and closes it
 //! immediately.
 
+use base64::Engine;
 use zeroize::Zeroizing;
 
 use crate::runner::RunnerError;
@@ -25,6 +26,19 @@ impl Password {
             return Err(RunnerError::PasswordLength(bytes.len()));
         }
         Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    /// A freshly generated password: `random32` base64url-(no padding)
+    /// encoded, 43 ASCII characters — always well inside [`PASSWORD_MAX`]
+    /// (COMM-HYPHAE.md §3: "自动生成的口令本身就是" base64url text). Used
+    /// for the very first identity a keystore gets, before anyone has typed
+    /// a password of their own (§6.4) — the caller supplies the random
+    /// bytes so this stays a pure function, with the entropy source
+    /// (`rand::rng().fill_bytes`, COMM-2a's `router.rs`) kept out of this
+    /// crate's one place for zero-on-drop password storage.
+    pub fn generate(random32: [u8; 32]) -> Self {
+        let text = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random32);
+        Self(Zeroizing::new(text.into_bytes()))
     }
 
     /// Only visible within the crate: the runner writes this straight to a
@@ -69,6 +83,25 @@ mod tests {
             Password::new(bytes),
             Err(RunnerError::PasswordLength(n)) if n == PASSWORD_MAX + 1
         ));
+    }
+
+    #[test]
+    fn generate_is_43_char_base64url_text_with_no_padding() {
+        let password = Password::generate([7u8; 32]);
+        let text = std::str::from_utf8(password.as_bytes()).unwrap();
+        assert_eq!(text.len(), 43);
+        assert!(!text.contains('+'));
+        assert!(!text.contains('/'));
+        assert!(!text.contains('='));
+    }
+
+    #[test]
+    fn generate_is_deterministic_in_its_input() {
+        // Pure function: same bytes in, same password out — the actual
+        // randomness lives in the caller's `random32` argument, not here.
+        let a = Password::generate([1u8; 32]);
+        let b = Password::generate([1u8; 32]);
+        assert_eq!(a.as_bytes(), b.as_bytes());
     }
 
     #[test]
