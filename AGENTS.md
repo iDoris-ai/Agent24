@@ -2,7 +2,7 @@
 
 ## 分支规则
 - 集成分支：`ab/<里程碑>`（例如 `ab/m1-memory`）。**每个 task PR 的 base 必须是对应的 `ab/*` 集成分支**，绝不能是 `main`。
-- task 分支：`ab/<里程碑>-NN-<短名>`，每个 task 一个 git worktree，放在 `~/Dev/auraai/` 下。
+- task 分支：`ab/<里程碑>-NN-<短名>`，每个 task 一个 git worktree，放在 `~/Dev/iDoris/` 下（B 上 Agent24 主 checkout 是 `~/Dev/iDoris/Agent24`）。
 - task PR ≤ 300 行（不含锁文件/生成文件），超了就拆。
 - **不许碰**：`main`、任何 `feat/*`、`ci/*`、`test/*`、`docs/*`、`build/*` 分支及其 PR（那些由笔记本 + PR-Daemon 管）。不许 force-push 别人的分支。
 - 集成分支 → `main` 的 release PR 永远由人开、人审，worker 不开。
