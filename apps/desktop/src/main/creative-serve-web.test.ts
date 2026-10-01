@@ -26,9 +26,7 @@ class FakeChild extends EventEmitter {
 
 const tempDirs: string[] = []
 
-function checkout(): string {
-  const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-'))
-  tempDirs.push(root)
+function materializeCheckout(root: string): string {
   fs.mkdirSync(path.join(root, 'apps/daemon/bin'), { recursive: true })
   fs.mkdirSync(path.join(root, 'apps/daemon/dist'), { recursive: true })
   fs.mkdirSync(path.join(root, 'apps/web/out'), { recursive: true })
@@ -36,6 +34,12 @@ function checkout(): string {
   fs.writeFileSync(path.join(root, 'apps/daemon/dist/cli.js'), '')
   fs.writeFileSync(path.join(root, 'apps/web/out/index.html'), '<!doctype html>')
   return root
+}
+
+function checkout(): string {
+  const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-'))
+  tempDirs.push(root)
+  return materializeCheckout(root)
 }
 
 afterEach(() => {
@@ -77,6 +81,23 @@ describe('CreativeServeWeb', () => {
   it('uses the explicit Open Design checkout when it contains the od entry', () => {
     const root = checkout()
     expect(resolveOpenDesignCheckout('/unused', { A24_OPEN_DESIGN_DIR: root })).toBe(root)
+  })
+
+  it('discovers the packaged Open Design runtime under Electron resources', () => {
+    const resources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-resources-'))
+    tempDirs.push(resources)
+    const packaged = materializeCheckout(path.join(resources, 'open-design'))
+
+    expect(resolveOpenDesignCheckout('/unused', {}, resources)).toBe(packaged)
+  })
+
+  it('keeps the explicit checkout override ahead of packaged resources', () => {
+    const explicit = checkout()
+    const resources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-resources-'))
+    tempDirs.push(resources)
+    materializeCheckout(path.join(resources, 'open-design'))
+
+    expect(resolveOpenDesignCheckout('/unused', { A24_OPEN_DESIGN_DIR: explicit }, resources)).toBe(explicit)
   })
 
   it('launches serve-web, waits for /api/ready, and stops with SIGTERM', async () => {
