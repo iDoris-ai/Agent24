@@ -12,8 +12,28 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+/// Kills and reaps the wrapped `agent24d` child on drop, including when a
+/// test `panic!`s/`assert!`-fails partway through — a bare `daemon.kill()`
+/// placed after the assertions never runs in that case, which is exactly how
+/// a previous version of this test leaked an orphaned `agent24d` that ran
+/// for nearly two hours. The `$HOME` tempdir is held alongside the child so
+/// it outlives the daemon using it and is cleaned up only once the daemon is
+/// actually dead (field drop order: `child` first via our own `kill`/`wait`,
+/// then `_home` via its own `Drop`).
+struct DaemonGuard {
+    child: Child,
+    _home: tempfile::TempDir,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 fn get(port: u16, token: &str, path: &str) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -33,18 +53,34 @@ fn get(port: u16, token: &str, path: &str) -> (u16, String) {
     (status, body)
 }
 
-#[test]
-fn comm_routes_are_mounted_and_report_not_configured_without_a_binary() {
+/// Spawns `agent24d serve --port 0` with a fresh `$HOME` and `env_clear`'d
+/// otherwise, plus whatever `extra_env` adds on top. Returns the guard (kill
+/// it by dropping it), the bound port, the bearer token, and a background
+/// handle that accumulates every stderr line so a test can assert on log
+/// output without racing the daemon for it.
+fn spawn_daemon(
+    extra_env: &[(&str, &str)],
+) -> (
+    DaemonGuard,
+    u16,
+    String,
+    std::sync::Arc<std::sync::Mutex<String>>,
+) {
     let home = tempfile::Builder::new()
         .prefix("a24-comm-smoke")
         .tempdir_in("/tmp")
         .unwrap();
-    // `env_clear` is the point: no `A24_HYPHAE_BIN`/`A24_SPEAKER_BIN`, the
-    // same shape a real operator who has never set up comm would run in.
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    // `env_clear` is the point: no `A24_HYPHAE_BIN`/`A24_SPEAKER_BIN` unless
+    // `extra_env` adds them back, the same shape a real operator who has
+    // never set up comm would run in.
+    cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", home.path())
+        .env("HOME", home.path());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut daemon = cmd
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -59,12 +95,41 @@ fn comm_routes_are_mounted_and_report_not_configured_without_a_binary() {
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
     });
+
+    let stderr = daemon.stderr.take().unwrap();
+    let stderr_log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_log_writer = stderr_log.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(mut buf) = stderr_log_writer.lock() {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+    });
+
     let ready = rx
         .recv_timeout(Duration::from_secs(30))
         .expect("no ready line within 30s");
     let ready: serde_json::Value = serde_json::from_str(&ready).expect("the ready line is json");
     let port = u16::try_from(ready["port"].as_u64().unwrap()).unwrap();
     let token = ready["token"].as_str().unwrap().to_owned();
+
+    (
+        DaemonGuard {
+            child: daemon,
+            _home: home,
+        },
+        port,
+        token,
+        stderr_log,
+    )
+}
+
+#[test]
+fn comm_routes_are_mounted_and_report_not_configured_without_a_binary() {
+    let (_daemon, port, token, _stderr) = spawn_daemon(&[]);
 
     // The daemon itself must be healthy — comm being unconfigured must not
     // take the rest of the daemon down with it.
@@ -74,7 +139,61 @@ fn comm_routes_are_mounted_and_report_not_configured_without_a_binary() {
     let (status, body) = get(port, &token, "/api/v1/comm/identity");
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("not_configured"), "{body}");
+}
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+/// `A24_COMM_PASSWORD_STORE=memory`: the daemon stays healthy, comm still
+/// mounts (routes past the backend, even though it's `not_configured` here
+/// for the unrelated reason that no Hyphae binary was named), and the
+/// startup warn about the in-memory, non-persistent password store is
+/// printed. This does not need to inspect the real keychain to prove memory
+/// mode never touches it — `comm_routes::select_password_store` never
+/// constructs a `KeyringPasswordStore` on this branch at all (see its unit
+/// tests in `comm_routes.rs`).
+#[test]
+fn memory_password_store_warns_and_still_mounts_comm() {
+    let (_daemon, port, token, stderr) = spawn_daemon(&[("A24_COMM_PASSWORD_STORE", "memory")]);
+
+    let (status, _) = get(port, &token, "/api/v1/health");
+    assert_eq!(status, 200, "the daemon must be healthy under memory mode");
+
+    let (status, body) = get(port, &token, "/api/v1/comm/identity");
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("not_configured"), "{body}");
+
+    // Give the stderr-draining thread a moment to catch up with startup.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = stderr.lock().unwrap().clone();
+        if log.contains("A24_COMM_PASSWORD_STORE=memory") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no memory-password-store warning in stderr within 10s; log so far:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// An unrecognized `A24_COMM_PASSWORD_STORE` value must not be silently
+/// treated as `keyring` or `memory`: the daemon stays healthy, and comm
+/// reports a configuration error carrying the bad value as its reason.
+#[test]
+fn invalid_password_store_value_reports_a_configuration_error() {
+    let (_daemon, port, token, _stderr) =
+        spawn_daemon(&[("A24_COMM_PASSWORD_STORE", "not-a-real-backend")]);
+
+    let (status, _) = get(port, &token, "/api/v1/health");
+    assert_eq!(
+        status, 200,
+        "the daemon must be healthy even with a bad password-store value"
+    );
+
+    let (status, body) = get(port, &token, "/api/v1/comm/identity");
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("not_configured"), "{body}");
+    assert!(
+        body.contains("not-a-real-backend"),
+        "the error should name the offending value: {body}"
+    );
 }

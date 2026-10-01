@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_comm::{
-    CommState, HyphaeLock, HyphaeRunner, KeyringPasswordStore, PasswordStore, VerifiedBinary,
-    current_platform,
+    CommState, HyphaeLock, HyphaeRunner, KeyringPasswordStore, MemoryPasswordStore, PasswordStore,
+    VerifiedBinary, current_platform,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -56,6 +56,7 @@ async fn build_ready_state(
     source: &Path,
     home: &Path,
     install_dir: &Path,
+    password_store: Arc<dyn PasswordStore>,
 ) -> Result<CommState, String> {
     let source = source
         .canonicalize()
@@ -72,30 +73,83 @@ async fn build_ready_state(
         .await
         .map_err(|e| format!("Hyphae binary verification failed: {e}"))?;
     let runner = Arc::new(HyphaeRunner::new(bin, home.to_path_buf(), DEFAULT_TIMEOUT));
-    // Production always uses the OS keychain (COMM-HYPHAE.md §6.4 L0):
-    // `MemoryPasswordStore` is a test/explicit-degradation-only choice this
-    // crate never makes on its own.
-    let password_store: Arc<dyn PasswordStore> = Arc::new(KeyringPasswordStore::new());
     Ok(CommState::ready(runner, password_store, home.to_path_buf()))
 }
 
+/// Which `PasswordStore` backend `A24_COMM_PASSWORD_STORE` selects
+/// (COMM-HYPHAE.md §6.4). `Keyring` is the default — both when the variable
+/// is unset and when it is set to `"keyring"` explicitly. An unrecognized
+/// value is kept distinguishable from both real choices so `build` can
+/// refuse it outright rather than silently falling back to either one.
+#[derive(Debug, PartialEq, Eq)]
+enum PasswordStoreChoice {
+    Keyring,
+    Memory,
+    Invalid(String),
+}
+
+/// Pure classifier, independent of `std::env`, so a test can exercise every
+/// branch without mutating process-global environment state (which would
+/// race against every other `#[test]` in this binary).
+fn classify_password_store_choice(raw: Option<&std::ffi::OsStr>) -> PasswordStoreChoice {
+    let Some(raw) = raw else {
+        return PasswordStoreChoice::Keyring;
+    };
+    match raw.to_str() {
+        Some("keyring") => PasswordStoreChoice::Keyring,
+        Some("memory") => PasswordStoreChoice::Memory,
+        Some(other) => PasswordStoreChoice::Invalid(other.to_owned()),
+        None => PasswordStoreChoice::Invalid(raw.to_string_lossy().into_owned()),
+    }
+}
+
+/// Reads `A24_COMM_PASSWORD_STORE` and builds the matching store, or returns
+/// the reason it couldn't (an unrecognized value — never silently keyring or
+/// memory, COMM-HYPHAE.md §6.4).
+fn select_password_store() -> Result<Arc<dyn PasswordStore>, String> {
+    match classify_password_store_choice(std::env::var_os("A24_COMM_PASSWORD_STORE").as_deref()) {
+        PasswordStoreChoice::Keyring => Ok(Arc::new(KeyringPasswordStore::new())),
+        PasswordStoreChoice::Memory => {
+            tracing::warn!(
+                "comm: A24_COMM_PASSWORD_STORE=memory — the Hyphae keystore password is kept \
+                 in memory only and will be lost on every daemon restart; this is for tests or \
+                 ad-hoc joint debugging ONLY, never for production (COMM-HYPHAE.md §6.4)"
+            );
+            Ok(Arc::new(MemoryPasswordStore::new()))
+        }
+        PasswordStoreChoice::Invalid(value) => Err(format!(
+            "A24_COMM_PASSWORD_STORE={value:?} is not a recognized password store backend \
+             (expected \"keyring\" or \"memory\", COMM-HYPHAE.md §6.4)"
+        )),
+    }
+}
+
 /// Builds the comm router. Never fails and never stops `agent24d` from
-/// starting: an unresolvable or unverifiable binary degrades to a state
-/// whose every route reports `not_configured`/`binary_rejected` instead
-/// (COMM-2a's own brief — "不能让 daemon 起不来").
+/// starting: an unresolvable or unverifiable binary, or a misconfigured
+/// `A24_COMM_PASSWORD_STORE`, degrades to a state whose every route reports
+/// `not_configured`/`binary_rejected` instead (COMM-2a's own brief —
+/// "不能让 daemon 起不来").
 pub async fn build(state_dir: &Path) -> axum::Router {
     let comm_dir = state_dir.join("comm");
     let home = comm_dir.join("hyphae-home");
     let install_dir = comm_dir.join("bin");
-    let state = match resolve_source_path() {
-        None => CommState::unconfigured(
-            "no Hyphae binary is configured; set A24_HYPHAE_BIN (COMM-HYPHAE.md §3)".to_owned(),
-        ),
-        Some(source) => match build_ready_state(&source, &home, &install_dir).await {
-            Ok(state) => state,
-            Err(reason) => {
-                tracing::warn!("comm: {reason}");
-                CommState::binary_rejected(reason)
+    let state = match select_password_store() {
+        Err(reason) => {
+            tracing::warn!("comm: {reason}");
+            CommState::unconfigured(reason)
+        }
+        Ok(password_store) => match resolve_source_path() {
+            None => CommState::unconfigured(
+                "no Hyphae binary is configured; set A24_HYPHAE_BIN (COMM-HYPHAE.md §3)".to_owned(),
+            ),
+            Some(source) => {
+                match build_ready_state(&source, &home, &install_dir, password_store).await {
+                    Ok(state) => state,
+                    Err(reason) => {
+                        tracing::warn!("comm: {reason}");
+                        CommState::binary_rejected(reason)
+                    }
+                }
             }
         },
     };
@@ -104,4 +158,41 @@ pub async fn build(state_dir: &Path) -> axum::Router {
     // them at `/api/v1/comm/*`, not `merge` (which would leave them at
     // their bare, un-prefixed paths and collide with nothing — silently).
     axum::Router::new().nest("/api/v1/comm", agent24_comm::router(state))
+}
+
+#[cfg(test)]
+mod password_store_choice_tests {
+    use super::*;
+
+    #[test]
+    fn unset_defaults_to_keyring() {
+        assert_eq!(
+            classify_password_store_choice(None),
+            PasswordStoreChoice::Keyring
+        );
+    }
+
+    #[test]
+    fn explicit_keyring_selects_keyring() {
+        assert_eq!(
+            classify_password_store_choice(Some(std::ffi::OsStr::new("keyring"))),
+            PasswordStoreChoice::Keyring
+        );
+    }
+
+    #[test]
+    fn memory_selects_memory() {
+        assert_eq!(
+            classify_password_store_choice(Some(std::ffi::OsStr::new("memory"))),
+            PasswordStoreChoice::Memory
+        );
+    }
+
+    #[test]
+    fn unrecognized_value_is_invalid_not_a_silent_fallback() {
+        assert_eq!(
+            classify_password_store_choice(Some(std::ffi::OsStr::new("bogus"))),
+            PasswordStoreChoice::Invalid("bogus".to_owned())
+        );
+    }
 }
