@@ -58,8 +58,8 @@
 //!   day old. So "everything is space-owned" is NOT true yet, and the agent
 //!   loop's memory is the exception.
 //! - **There is no `mem_spaces` registry**, because nothing could read one. No
-//!   path creates a space that is not a module's own, since nothing can grant
-//!   access to one — a space that cannot be granted does not exist yet.
+//!   grant path exists for shared spaces; module and personal spaces are
+//!   registered directly in the partition catalog.
 //! - **There are no roles, policies or permissions.** The org has members and
 //!   nothing else. Whether an accessor MAY reach a space is not asked anywhere;
 //!   isolation is still "your key or nothing", which is a partition, not a
@@ -204,11 +204,8 @@ impl OrgId {
 /// The user's examples are the shape to hold in mind: Team Shared, Finance
 /// Private, Customer A. A person is an accessor of one, not the owner of it.
 ///
-/// Today exactly one kind is constructible, [`Self::module_private`], which
-/// reproduces F1's isolation exactly: one partition per module. Shared spaces
-/// are deliberately not constructible, because nothing can grant access to one
-/// — a space that cannot be granted does not exist, and a constructor for it
-/// would be an API promising a capability the kernel does not have.
+/// Module-private and user-personal spaces are constructible. Shared spaces
+/// remain deliberately unavailable because the kernel has no grant capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceId(String);
 
@@ -220,6 +217,10 @@ impl SpaceId {
     /// places is how they drift.
     pub fn module_private(module: &str) -> Self {
         Self(format!("os:{module}"))
+    }
+    /// The agent loop's private space for one user.
+    pub fn personal(user: &str) -> Self {
+        Self(format!("usr:{user}"))
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -369,6 +370,30 @@ impl OsMemoryCatalog {
         .await
         .map_err(|e| e.to_string())?;
         Ok(p)
+    }
+
+    /// Record the agent loop's personal partition in the durable catalog.
+    /// T05 connects this method to the run/session path.
+    #[allow(dead_code)] // T05 connects personal partitions to the agent loop.
+    pub async fn ensure_personal_recorded(
+        &self,
+        org: &OrgId,
+        user: &str,
+        kv: &agent24_memory::KvStore,
+    ) -> Result<String, String> {
+        let space = SpaceId::personal(user);
+        let key = partition_key(org, &space);
+        kv.record_personal_partition(agent24_memory::OsPartitionIdentity {
+            owner_key: &key,
+            key_version: KEY_VERSION,
+            org_id: org.as_str(),
+            space_id: space.as_str(),
+            user,
+            module: "@agent",
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(key)
     }
 
     /// Confirm that `partition`'s module really did mount successfully this
@@ -1556,6 +1581,80 @@ mod tests {
         // migrated partition a space id the kernel never derives — its key is
         // then never recomputed and its history silently disappears.
         assert_eq!(SpaceId::module_private("sin90").as_str(), "os:sin90");
+    }
+
+    #[test]
+    fn personal_spaces_are_disjoint_from_module_spaces() {
+        let users = ["", "a", "ab", "a\u{0}b", "os:sin90", "usr:x", "用户", "🙂"];
+        let modules = ["", "a", "ab", "os:x", "usr:x", "用户", "🙂"];
+        let mut seen = std::collections::HashSet::new();
+        for user in users {
+            let personal = SpaceId::personal(user);
+            assert_eq!(personal.as_str(), format!("usr:{user}"));
+            for module in modules {
+                let private = SpaceId::module_private(module);
+                assert_ne!(personal, private, "user={user:?} module={module:?}");
+                assert_ne!(
+                    partition_key(&OrgId::from_store("org"), &personal),
+                    partition_key(&OrgId::from_store("org"), &private),
+                );
+            }
+            assert!(seen.insert(personal.as_str().to_owned()));
+        }
+        assert_eq!(seen.len(), users.len());
+    }
+
+    #[tokio::test]
+    async fn personal_space_registration_is_idempotent_and_coexists_with_modules() {
+        let org_a = OrgId::from_store("org_a");
+        let org_b = OrgId::from_store("org_b");
+        assert_ne!(
+            partition_key(&org_a, &SpaceId::personal("alice")),
+            partition_key(&org_b, &SpaceId::personal("alice")),
+        );
+        assert_ne!(
+            partition_key(&org_a, &SpaceId::personal("alice")),
+            partition_key(&org_a, &SpaceId::personal("bob")),
+        );
+
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let cat = OsMemoryCatalog::default();
+        let alice_org = org_of(&kv, "alice").await;
+        let bob_org = org_of(&kv, "bob").await;
+        let alice_key = cat
+            .ensure_personal_recorded(&alice_org, "alice", &kv)
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.ensure_personal_recorded(&alice_org, "alice", &kv)
+                .await
+                .unwrap(),
+            alice_key
+        );
+        let bob_key = cat
+            .ensure_personal_recorded(&bob_org, "bob", &kv)
+            .await
+            .unwrap();
+        assert_ne!(alice_key, bob_key);
+
+        let module = cat
+            .ensure_recorded(&alice_org, "alice", &manifest("sin90"), &kv)
+            .await
+            .unwrap();
+        assert_ne!(alice_key, module.key);
+        let rows = OsMemoryCatalog::durable_for_org(&kv, &alice_org)
+            .await
+            .unwrap();
+        let personal = rows.iter().find(|row| row.owner_key == alice_key).unwrap();
+        assert_eq!(personal.space_kind, "personal");
+        assert_eq!(personal.module_name, "@agent");
+        assert_eq!(
+            rows.iter().filter(|row| row.owner_key == alice_key).count(),
+            1
+        );
+        let module_row = rows.iter().find(|row| row.owner_key == module.key).unwrap();
+        assert_eq!(module_row.space_kind, "module");
+        assert_eq!(module_row.module_name, "sin90");
     }
 
     #[tokio::test]
