@@ -51,6 +51,10 @@ jobs:
             os: macos
             arch: x64
           - target: x86_64-unknown-linux-gnu
+            # ubuntu-22.04 chosen for its lower glibc baseline. Note: GitHub put
+            # this image into deprecation brownouts from 2026-09-17 and retires
+            # it on 2027-04-17 -- migrate (e.g. to ubuntu-24.04, or a glibc-pinned
+            # build) before then. Tracked in docs/agent/followups.md.
             runner: ubuntu-22.04
             os: linux
             arch: x64
@@ -78,6 +82,21 @@ jobs:
           else
             echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Check tag matches crate version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VER="${{ steps.ver.outputs.version }}"
+          for toml in rust/apps/agent24-cli/Cargo.toml rust/apps/agent24d/Cargo.toml; do
+            CRATE_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$toml" | head -1)"
+            echo "$toml: $CRATE_VER (tag: $TAG_VER)"
+            if [ "$CRATE_VER" != "$TAG_VER" ]; then
+              echo "::error::tag v$TAG_VER does not match $toml version $CRATE_VER"
+              exit 1
+            fi
+          done
 
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal
@@ -144,12 +163,21 @@ jobs:
           export HOME="$WORKDIR/home"
           "$BIN/agent24" daemon start
           PORT="$(jq -r '.port' "$HOME/.agent24/daemon.json")"
-          STATUS="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/health")"
-          echo "health status: $STATUS"
+          BODY="$WORKDIR/health.json"
+          STATUS="$(curl -s -o "$BODY" -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/health")"
+          echo "health status: $STATUS body: $(cat "$BODY")"
           if [ "$STATUS" != "200" ]; then
             echo "::error::health check returned $STATUS instead of 200"
             "$BIN/agent24" daemon stop || true
             exit 1
+          fi
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            GOT="$(jq -r '.version' "$BODY")"
+            if [ "$GOT" != "${{ steps.ver.outputs.version }}" ]; then
+              echo "::error::daemon reports version $GOT, expected ${{ steps.ver.outputs.version }}"
+              "$BIN/agent24" daemon stop || true
+              exit 1
+            fi
           fi
           "$BIN/agent24" daemon stop
 
