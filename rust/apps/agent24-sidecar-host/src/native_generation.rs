@@ -156,6 +156,10 @@ impl<'host> NativeGeneration<'host> {
             .step_with_transport_failure(now, stderr_transport_failed(stderr.status))
     }
 
+    pub(crate) fn force_cancel_step(&mut self, now: Instant) -> Result<(), ActorLaunchOrderError> {
+        self.driver.force_cancel_step(now)
+    }
+
     pub(crate) fn schedule_state(&self) -> ScheduleState {
         self.driver.schedule_state()
     }
@@ -454,6 +458,48 @@ mod tests {
                 observation => panic!("generation owner did not clean up: {observation:?}"),
             }
         }
+        crate::posix::tests::wait_for_reaper_idle();
+    }
+
+    #[test]
+    fn native_force_cancel_reaches_confirmed_empty_through_the_owned_driver() {
+        let _test_guard = crate::posix::tests::test_lock();
+        let slots = WorkerSlots::isolated();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut output = OutputWorker::new_in(
+            slots,
+            SharedWriter(Arc::clone(&written)),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let mut control = ControlWorker::new_in(slots, PendingRead, None).unwrap();
+        let now = Instant::now();
+        let mut generation = NativeGeneration::assemble_in(
+            slots,
+            launch(85),
+            &mut output,
+            &mut control,
+            LIMITS,
+            now + LIMITS.launch,
+            || now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            generation.force_cancel_step(now),
+            Err(ActorLaunchOrderError::CleanupRequired)
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(generation.schedule_state().phase, Phase::Empty) {
+            let _ = generation.step(Instant::now());
+            assert!(
+                Instant::now() < deadline,
+                "native force cancellation did not confirm an empty tree"
+            );
+            thread::yield_now();
+        }
+        drop(generation);
+        drop(output);
         crate::posix::tests::wait_for_reaper_idle();
     }
 }
