@@ -112,7 +112,11 @@ app.whenReady().then(() => {
     if (!devIcon.isEmpty()) app.dock.setIcon(devIcon)
   }
 
-  backendManager.start()
+  // DEP-A5: async (it probes daemon.json + does one health check before
+  // deciding to reuse vs. spawn) — nothing here awaits it; tray/IPC callers
+  // read `backendManager.status()` / `getBackendEndpoint()` live, so this
+  // resolving a beat later than the old synchronous spawn is harmless.
+  void backendManager.start()
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
@@ -178,20 +182,32 @@ const STATUS_META: Record<BackendStatus, { title: string; label: string }> = {
 function refreshTray(): void {
   if (!tray) return
   const status = backendManager.status()
+  const external = backendManager.isExternalDaemon()
   const meta = STATUS_META[status]
+  // DEP-A5: an external daemon (reused from `agent24 daemon start`, not
+  // spawned by this app) gets a visibly different label — the whole point of
+  // requirement #2 is that the user can tell them apart before hitting stop.
+  const label = external ? `${meta.label}（外部 daemon · pid ${backendManager.externalDaemonPid() ?? '?'}）` : meta.label
   if (process.platform === 'darwin') tray.setTitle(meta.title)
-  tray.setToolTip(`Agent24 — ${meta.label.replace(/^[●○✕]\s*/, '')}（${backendManager.backendKind()}）`)
+  tray.setToolTip(`Agent24 — ${label.replace(/^[●○✕]\s*/, '')}（${backendManager.backendKind()}）`)
 
+  // DEP-A5 requirement #2: stop/restart must only ever act on a daemon this
+  // app spawned. BackendManager.stopDaemon()/restart() already guard against
+  // killing an external daemon at the method level (see backend-manager.ts),
+  // but the external case also gets its own menu wording here — "断开" instead
+  // of "停止/重启" — so the tray itself never implies a kill that won't happen.
   const daemonItems: MenuItemConstructorOptions[] =
     status === 'stopped'
       ? [{ label: '启动 daemon', click: () => { backendManager.startDaemon(); refreshTray() } }]
-      : [
-          { label: '重启 daemon', click: () => { backendManager.restart(); refreshTray() } },
-          { label: '停止 daemon', click: () => { backendManager.stopDaemon(); refreshTray() } },
-        ]
+      : external
+        ? [{ label: '断开外部 daemon（不会终止它）', click: () => { backendManager.stopDaemon(); refreshTray() } }]
+        : [
+            { label: '重启 daemon', click: () => { backendManager.restart(); refreshTray() } },
+            { label: '停止 daemon', click: () => { backendManager.stopDaemon(); refreshTray() } },
+          ]
 
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: meta.label, enabled: false },
+    { label, enabled: false },
     { type: 'separator' },
     { label: '显示窗口', click: () => showOrCreateWindow() },
     { type: 'separator' },
