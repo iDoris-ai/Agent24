@@ -2285,6 +2285,9 @@ mod tests {
             home,
             pid_path: dir.join("hyphae-daemon.pid"),
             log_path: dir.join("logs").join("hyphae-daemon.log"),
+            autostart_path: dir.join("daemon-autostart.json"),
+            grace: Duration::from_millis(500),
+            ready_after: Duration::from_millis(200),
         }
     }
 

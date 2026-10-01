@@ -107,6 +107,9 @@ async fn app_with_daemon(dir: &Path) -> (Router, std::path::PathBuf) {
         home: home.clone(),
         pid_path: dir.join("hyphae-daemon.pid"),
         log_path: log_path.clone(),
+        autostart_path: dir.join("daemon-autostart.json"),
+        grace: Duration::from_millis(500),
+        ready_after: Duration::from_millis(200),
     }));
     let state = CommState::ready(runner, store, home).with_daemon(daemon);
     (router(state), log_path)
