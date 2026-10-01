@@ -144,19 +144,20 @@ Release Notes 里必须明确标注「x64（Intel）未实机验证，仅 CI run
   `A24_NOSTR_ALLOWED_NPUBS`；需要临时恢复旧行为可设置 `A24_NOSTR_F4B_INBOUND=1`，但这是
   过渡开关，后续入站执行将改走 T01-E 的高层授权。
 
-## 5. Sin90 / Cos72 —— 待 jason 决定，本 PR 不改这两个仓库
+## 5. Sin90 / Cos72 —— jason 2026-10-01 已定：同步发多平台包
 
-Deployment 计划的 DEP-A4（Sin90 / Cos72 多平台包）目前仍是 `BACKLOG`，**尚未实现**：两个
-仓库的 `scripts/package.sh` 还没有去掉 `Darwin arm64` 限制、也没有新增 tag 触发的发布 CI。
-是否要在 v0.5.1 这次一并升级模块版本号，留给 jason 决定，列出两个选项：
+DEP-A4 已完成：Sin90 #76、Cos72 #11（`package.sh --target` + tag 触发的四平台 release workflow），发布条件 tag 门禁跟进见 Cos72 #12；Sin90 锁文件跟进 #77。jason 决定随 v0.5.1 同步升级模块版本：
 
-- **选项 A（推荐，若 DEP-A4 未就绪）**：本次只发布 Agent24 v0.5.1（CLI + 桌面 Linux），
-  Sin90 / Cos72 版本号与发布节奏保持不变，等 DEP-A4 落地后再一起发多平台包。
-- **选项 B**：同步升级 Sin90 → `0.5.1`、Cos72 → `0.1.1`，但要先完成 DEP-A4（`package.sh`
-  加 `--target`、各自新增发布 CI），否则这两个仓库仍然只能产出 `Darwin arm64` 单一目标，
-  版本号升级不带来实际的多平台能力。
+| 仓库 | 版本 | 版本号 PR | tag | 产物 |
+|---|---|---|---|---|
+| Sin90（iDoris-ai/Sin90） | 0.5.0 → **0.5.1** | 待 #77 合并后提 | `v0.5.1` | `sin90-0.5.1-{macos,linux}-{arm64,x64}.tar.gz` + `SHA256SUMS` |
+| Cos72（MushroomDAO/Cos72） | 0.1.0 → **0.1.1** | #13 | `v0.1.1` | `cos72-0.1.1-{macos,linux}-{arm64,x64}.tar.gz` + `SHA256SUMS` |
 
-无论选哪个选项，**本 PR（Agent24 v0.5.1 发布 PR）不修改 Sin90 / Cos72 仓库**。
+- [ ] 两个仓库的版本号 PR 合并后各自打 tag；各仓库 release workflow 全绿
+- [ ] 每个模块包 `tar -tzf` 恰为 `<name>/domain-os.yml` 与 `<name>/bin/<name>`；`shasum -a 256 -c SHA256SUMS` 通过
+- [ ] 干净机验收时，CLI 装好后用同一平台的模块包 `agent24 os install <目录>`，`agent24 os list` 两者 `[mounted]`
+
+本 PR（Agent24 v0.5.1 发布 PR）不修改 Sin90 / Cos72 仓库。
 
 ## 6. 回滚
 
