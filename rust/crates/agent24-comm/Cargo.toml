@@ -4,16 +4,48 @@ version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "COMM-1a: HyphaeRunner — single-shot invocation of the Hyphae CLI (hash-verified binary, stdin-only password, envelope parsing)"
+description = "COMM-1a/1b: Hyphae CLI invocation (hash-verified binary, stdin-only password, envelope parsing), keystore write serialization, and the keychain-backed PasswordStore"
 
 [dependencies]
+# COMM-1b `PasswordStore` trait (`get`/`put`/`rename`/`delete` are all
+# `async fn`s on a `dyn`-safe-via-vtable trait object); matches the
+# `async-trait` version already used by agent24-agent/-domain/-tools.
+async-trait = "0.1"
+base64 = "0.22"
 hex = "0.4"
+# COMM-1b keychain-backed `PasswordStore` (COMM-HYPHAE.md §6.4 L0): macOS
+# Keychain via `apple-native`, Linux via the freedesktop Secret Service via
+# `async-secret-service`. Deliberately *not* `sync-secret-service`: that
+# backend links `dbus-secret-service` -> `dbus` -> system libdbus, which the
+# ubuntu-latest CI image doesn't have headers for; `async-secret-service`
+# instead pulls in `secret-service`/`zbus`, a pure-Rust D-Bus client with no
+# system library dependency, so it builds (and, absent a session bus, simply
+# reports `Unavailable` at runtime rather than failing to compile). `tokio`
+# picks zbus's tokio-integrated executor (this crate is already tokio-based);
+# `crypto-rust` keeps the Secret Service session cipher in pure Rust instead
+# of requiring OpenSSL. Windows is out of scope (COMM-HYPHAE.md §9 R2), so no
+# `windows-native` feature. All keyring calls are wrapped in
+# `tokio::task::spawn_blocking` (see `password_store.rs`) since `Entry`'s API
+# is synchronous regardless of backend.
+keyring = { version = "3.6", default-features = false, features = [
+    "apple-native",
+    "async-secret-service",
+    "tokio",
+    "crypto-rust",
+] }
 rustix = { version = "0.38", features = ["process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["process", "rt", "time", "io-util", "macros"] }
+tokio = { version = "1", features = [
+    "process",
+    "rt",
+    "sync",
+    "time",
+    "io-util",
+    "macros",
+] }
 tracing = "0.1"
 # Zero-on-drop storage for the Hyphae keystore password (COMM-HYPHAE.md §3:
 # `Password(/* Zeroizing<Vec<u8>> */)`). Not a direct workspace dependency
