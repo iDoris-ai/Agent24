@@ -12,7 +12,8 @@ use std::time::Duration;
 use agent24_comm::binary::sha256_of;
 use agent24_comm::{
     Account, DaemonCtx, DaemonStartError, HyphaeDaemonSupervisor, HyphaeRunner,
-    MemoryPasswordStore, OrphanOutcome, Password, PasswordStore, VerifiedBinary, reap_orphan,
+    MemoryPasswordStore, OrphanOutcome, Password, PasswordStore, ShutdownLeader, VerifiedBinary,
+    reap_orphan,
 };
 
 /// `identity list` / `relay list` answer fixed, valid data; `daemon ...`
@@ -116,6 +117,29 @@ case "$1" in
     cat > /dev/null
     sleep 0.3
     exit 7
+    ;;
+esac
+"#;
+
+/// Same `identity`/`relay` answers; the `daemon` leader explicitly ignores
+/// SIGTERM and loops forever — only a SIGKILL ends it. For proving a
+/// config-change restart's own stop of the OLD generation can be preempted
+/// by a `shutdown()` deadline tighter than its `grace` (PR #626 review round
+/// 2, High #2).
+const DAEMON_SCRIPT_IGNORES_TERM: &str = r#"#!/bin/sh
+case "$1" in
+  identity)
+    echo '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    echo '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    trap '' TERM
+    while : ; do sleep 0.05 ; done
     ;;
 esac
 "#;
@@ -435,7 +459,9 @@ async fn shutdown_stops_the_whole_group_and_clears_the_pid_file() {
     assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
     let pid = read_pid(&pid_path).await;
 
-    let outcome = sup.shutdown().await;
+    let outcome = sup
+        .shutdown(tokio::time::Instant::now() + TEST_GRACE * 4)
+        .await;
     assert!(outcome.had_process);
     assert!(outcome.leader.is_some());
     assert!(!pid_path.exists());
@@ -585,7 +611,9 @@ async fn shutdown_kills_a_helper_the_leader_left_behind_in_its_group() {
         "the fixture's helper never started"
     );
 
-    let outcome = sup.shutdown().await;
+    let outcome = sup
+        .shutdown(tokio::time::Instant::now() + TEST_GRACE * 4)
+        .await;
     assert!(outcome.had_process);
     assert!(
         marker_stopped_advancing(&marker).await,
@@ -772,6 +800,11 @@ async fn manual_start_persists_autostart_true_and_stop_persists_false() {
     );
 
     sup.start().await.unwrap();
+    // PR #626 review round 2, Medium #3: persistence is deferred until the
+    // start is actually confirmed (`running`), not merely accepted — see
+    // `manual_start_that_fails_before_running_does_not_persist_autostart`
+    // for the case where it never gets there.
+    assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
     assert!(
         agent24_comm::read_autostart(&autostart_path).await,
         "a successful manual start must persist autostart=true (COMM-HYPHAE.md §6.2)"
@@ -781,5 +814,148 @@ async fn manual_start_persists_autostart_true_and_stop_persists_false() {
     assert!(
         !agent24_comm::read_autostart(&autostart_path).await,
         "a manual stop must persist autostart=false (COMM-HYPHAE.md §6.2)"
+    );
+}
+
+/// PR #626 review round 2, Medium #3: a manual start that is accepted but
+/// fails fast — before ever reaching `running` — must not leave
+/// `daemon.autostart=true` behind for every future `agent24d` to retry
+/// forever.
+#[tokio::test]
+async fn manual_start_that_fails_before_running_does_not_persist_autostart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(tmp.path()).await;
+    tokio::fs::write(ctx.home.join(".hyphae").join("exit_code"), b"3")
+        .await
+        .unwrap();
+    let autostart_path = ctx.autostart_path.clone();
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert!(wait_until(|| sup.status().state == "locked", Duration::from_secs(2)).await);
+    assert!(
+        !agent24_comm::read_autostart(&autostart_path).await,
+        "a start that fails before `running` (wrong password, exit code 3) must not persist \
+         autostart=true"
+    );
+}
+
+// ---------------------------------------------------------------------
+// PR #626 review round 2 (Codex challenge, B 端 gpt-6-astra)
+// ---------------------------------------------------------------------
+
+/// Medium #1: the leader is deliberately kept unreaped through the whole
+/// grace loop (so its pid still pins the group id for every real signal);
+/// on Linux an unreaped zombie still answers a process-group signal-0 probe
+/// as a live member. Gating `ExitedInGrace` on that probe (as opposed to on
+/// the leader's own exit) therefore misreported a leader that died almost
+/// instantly on TERM as `KilledAfterGrace` — which `server.rs` then turns
+/// into a `degraded` shutdown summary for nothing, and made a clean natural
+/// exit wait out the entire grace for no reason.
+#[tokio::test]
+async fn leader_exiting_promptly_on_term_is_exited_in_grace_not_killed_after_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Long enough that a wrongly-exhausted wait is obvious (and would make
+    // this test slow) if the bug is present; `sleep` (this fixture's leader,
+    // via `DAEMON_SCRIPT`'s `exec sleep 9999`) terminates on a plain SIGTERM
+    // with no trap of its own, so a fix should return almost immediately.
+    let grace = Duration::from_secs(2);
+    let mut ctx = make_ctx(tmp.path()).await;
+    ctx.grace = grace;
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
+
+    let began = std::time::Instant::now();
+    let outcome = sup.shutdown(tokio::time::Instant::now() + grace * 4).await;
+    let took = began.elapsed();
+
+    assert_eq!(
+        outcome.leader,
+        Some(ShutdownLeader::ExitedInGrace),
+        "a leader that exits almost instantly on TERM must be recorded as `ExitedInGrace`, \
+         not `KilledAfterGrace`"
+    );
+    assert!(
+        took < grace / 2,
+        "shutdown must not wait out the whole grace for a leader that already exited: took \
+         {took:?}, grace {grace:?}"
+    );
+}
+
+// PR #626 review round 2, Medium #2: before promoting `starting` ->
+// `running`, the leader's exit is peeked (never reaped) one more time — the
+// leader may have exited after the `exit_result` branch's last poll, or its
+// exit and this 3s timer may have become ready in the very same `select!`
+// poll (the arm `select!` picks among several simultaneously-ready ones is
+// unspecified).
+//
+// A black-box, real-timing reproduction of the exact tie at the boundary is
+// deliberately NOT attempted here: driving the leader's exit and
+// `ready_after` close enough together to provoke it makes any check of "was
+// the pid actually alive" racy in the OPPOSITE direction too — by the time a
+// test observes `running` and then goes to check liveness (an
+// out-of-process `kill -0`, or a disk read of the pid file), the leader may
+// have legitimately exited in between, for a `running` that was perfectly
+// correct when it was set. The primitive the fix actually depends on —
+// `peek_child_exited` seeing an exit without reaping it — is proven
+// directly, deterministically, in `daemon.rs`'s own `#[cfg(test)]` module
+// instead; `an_exit_before_ready_after_is_classified_but_never_reported_as_running`
+// above already covers the non-racy "exit comfortably before `ready_after`"
+// case end-to-end.
+
+/// High #2: a config-change restart's own stop of the OLD generation must
+/// not be allowed to run past agent24d's absolute shutdown deadline, and
+/// once that deadline exists, nothing may spawn a new generation on its
+/// behalf. Fixture: the leader ignores SIGTERM, so stopping it would
+/// otherwise always burn the full `grace` before SIGKILL.
+#[tokio::test]
+async fn shutdown_preempts_an_in_flight_config_restart_and_forbids_a_new_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let grace = Duration::from_secs(2);
+    let mut ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_IGNORES_TERM).await;
+    ctx.grace = grace;
+    let pid_path = ctx.pid_path.clone();
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
+    let first_pid = read_pid(&pid_path).await;
+    let first_generation = sup.status().generation;
+
+    let sup_for_restart = sup.clone();
+    let restart = tokio::spawn(async move {
+        sup_for_restart.on_config_changed().await;
+    });
+    // Give the restart a moment to begin stopping the old generation —
+    // comfortably inside the 2s grace it would otherwise wait out in full.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let began = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    let _outcome = sup.shutdown(deadline).await;
+    let took = began.elapsed();
+
+    restart.await.unwrap();
+
+    assert!(
+        took < Duration::from_secs(1),
+        "shutdown must preempt the in-flight config restart's own grace wait rather than \
+         queue behind a full extra grace: took {took:?}"
+    );
+    assert!(
+        !is_alive(first_pid),
+        "the old generation must be dead once shutdown returns"
+    );
+    assert!(
+        !pid_path.exists(),
+        "no new generation may be spawned once shutdown has begun"
+    );
+    assert_eq!(
+        sup.status().generation,
+        first_generation,
+        "the config-change restart must not have spawned a second generation after shutdown \
+         began"
     );
 }
