@@ -58,6 +58,8 @@ pub use posix::{LaunchSpec, OwnedGeneration, OwnedPipes, StopError};
 
 #[cfg(windows)]
 mod owner;
+#[cfg(all(windows, test))]
+mod windows_test_io;
 #[cfg(windows)]
 pub use owner::{GenerationId, GenerationOwner, OwnedPipes, OwnedProcess};
 

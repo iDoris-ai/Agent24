@@ -304,13 +304,14 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_contract_transfers_pipes_once_and_stops_the_same_owner() {
+        use crate::windows_test_io::{NativePipes, powershell_executable, read_pair_then_cleanup};
+        use std::io::Write;
         use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::process::Command;
 
         let generation = crate::owner::GenerationId::new(7).expect("generation");
         let owner = crate::owner::GenerationOwner::new(generation).expect("Job Object");
-        let mut command = Command::new("powershell.exe");
+        let mut command = Command::new(powershell_executable());
         command.args([
             "-NoLogo",
             "-NoProfile",
@@ -322,43 +323,51 @@ mod tests {
         let mut target = OwnedTarget::from_owned(process);
         let pipes = target.take_pipes().expect("owned pipes");
         assert!(target.take_pipes().is_err());
-        let OwnedPipes {
+        let NativePipes {
             mut stdin,
             stdout,
             stderr,
-        } = pipes;
-        let (stdout_text, stderr_text) = tokio::time::timeout(Duration::from_secs(10), async {
-            stdin.write_all(b"hello\n").await.expect("write stdin");
-            drop(stdin);
-            let mut stdout_text = String::new();
-            let mut stderr_text = String::new();
-            stdout
-                .take(9)
-                .read_to_string(&mut stdout_text)
-                .await
-                .expect("read stdout");
-            stderr
-                .take(9)
-                .read_to_string(&mut stderr_text)
-                .await
-                .expect("read stderr");
-            (stdout_text, stderr_text)
-        })
-        .await
-        .expect("pipe roundtrip deadline");
-        assert_eq!(stdout_text, "out:hello");
-        assert_eq!(stderr_text, "err:hello");
-        target.request_stop(false).expect("graceful stop");
-        assert!(
-            target
-                .owner
-                .observe_exit()
-                .expect("observe process")
-                .is_none(),
+        } = NativePipes::try_from(pipes).expect("convert unpolled owned pipes");
+        stdin.write_all(b"hello\n").expect("write stdin");
+        drop(stdin);
+        let mut soft_stop_observation = None;
+        let (stdout, stderr) =
+            read_pair_then_cleanup(stdout, stderr, 9, Duration::from_secs(10), || {
+                target.request_stop(false)?;
+                soft_stop_observation = Some(target.owner.observe_exit()?);
+                target.request_stop(true)
+            })
+            .expect("bounded pipe roundtrip and target cleanup");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut stopped_status = None;
+        while tokio::time::Instant::now() < deadline {
+            match target.owner.observe_exit() {
+                Ok(Some(status)) => {
+                    stopped_status = Some(status);
+                    break;
+                }
+                Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(_) => break,
+            }
+        }
+        drop(target);
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout UTF-8"),
+            "out:hello"
+        );
+        assert_eq!(
+            String::from_utf8(stderr).expect("stderr UTF-8"),
+            "err:hello"
+        );
+        assert_eq!(
+            soft_stop_observation,
+            Some(None),
             "Windows soft stop must not kill the target"
         );
-        target.request_stop(true).expect("force stop");
-        drop(target);
+        assert!(
+            stopped_status.is_some(),
+            "force stop must terminate the target"
+        );
     }
 
     #[cfg(windows)]
@@ -371,7 +380,7 @@ mod tests {
             crate::owner::GenerationId::new(8).expect("generation"),
         )
         .expect("Job Object");
-        let mut command = Command::new("cmd.exe");
+        let mut command = Command::new(crate::windows_test_io::windows_executable("cmd.exe"));
         command.args(["/C", "exit", "0"]);
         let process = owner.spawn(command).expect("spawn process");
         let mut target = OwnedTarget::from_owned(process);
