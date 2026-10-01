@@ -3722,12 +3722,21 @@ pub(crate) mod tests {
         let recovery = body
             .find(".recover_timed_out_approval_runs()")
             .expect("startup must recover token-less timed-out runs");
+        let restore = body
+            .find(".restore_pending_approvals()")
+            .expect("startup must restore durable pending approvals");
+        let legacy_orphans = body
+            .find(".sweep_orphan_runs(&now)")
+            .expect("startup must sweep legacy orphans");
         let workspace_orphans = body
             .find(".sweep_workspace_orphan_runs(&workspace_now)")
             .expect("startup must sweep workspace orphans");
         assert!(
-            timeout < recovery && recovery < workspace_orphans,
-            "startup order must be timeout -> timed-out run recovery -> strict workspace orphan sweep"
+            timeout < recovery
+                && recovery < restore
+                && restore < legacy_orphans
+                && legacy_orphans < workspace_orphans,
+            "startup order must be timeout -> timed-out recovery -> durable restore -> legacy orphan -> workspace orphan"
         );
     }
 

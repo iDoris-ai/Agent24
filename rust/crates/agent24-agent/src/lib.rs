@@ -4411,15 +4411,47 @@ mod approval_tests {
             .insert_run(&run_in("run_expired", RunStatus::AwaitingApproval))
             .await
             .unwrap();
+        let args = serde_json::json!({ "argv": ["/bin/echo", "must-not-run"] });
+        h.store
+            .append_run_message(
+                "run_expired",
+                "user",
+                Some("go"),
+                &serde_json::json!([]),
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
+        let calls = serde_json::json!([{
+            "id": "call_provider_expired",
+            "name": "shell_exec",
+            "arguments": args.to_string()
+        }]);
+        h.store
+            .append_run_message(
+                "run_expired",
+                "assistant",
+                None,
+                &calls,
+                None,
+                &now_iso8601(),
+            )
+            .await
+            .unwrap();
         let mut approval = seed_approval(
             "apr_expired",
             "run_expired",
             "tc_expired",
-            serde_json::Map::new(),
+            args.as_object().unwrap().clone(),
         );
         approval.expires_at = "2020-01-01T00:00:00Z".to_owned();
-        approval.created_at = "2019-12-31T23:59:00Z".to_owned();
         h.store.insert_approval(&approval).await.unwrap();
+
+        // Prove this fixture would be re-broadcast if startup restore ran
+        // before expiry reconciliation; otherwise the regression is vacuous.
+        assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (1, 0));
+        h.events.lock().unwrap().clear();
 
         assert_eq!(
             h.broker
