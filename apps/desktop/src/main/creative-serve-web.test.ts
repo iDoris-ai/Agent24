@@ -23,6 +23,7 @@ class FakeChild extends EventEmitter {
   stderr = new PassThrough()
   stdin = new PassThrough()
   exitCode: number | null = null
+  signalCode: NodeJS.Signals | null = null
   kill = vi.fn((_signal?: NodeJS.Signals | number) => {
     this.exitCode = 0
     queueMicrotask(() => this.emit('exit', 0, null))
@@ -297,7 +298,7 @@ describe('CreativeServeWeb', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGTERM')
   })
 
-  it('supersedes a packaged start cleanly when restart stops it during readiness', async () => {
+  it('allows restart after the packaged owner exits by signal during readiness', async () => {
     const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
     const first = new FakeChild()
     const second = new FakeChild()
@@ -313,8 +314,10 @@ describe('CreativeServeWeb', () => {
     )
 
     const staleStart = service.start()
-    await service.stop()
-    await expect(staleStart).resolves.toEqual({ state: 'stopped' })
+    first.signalCode = 'SIGTERM'
+    first.emit('exit', null, 'SIGTERM')
+    await expect(staleStart).resolves.toMatchObject({ state: 'failed', error: expect.stringContaining('exited before ready') })
+    expect(first.kill).not.toHaveBeenCalled()
     const restarted = service.start()
     second.stdout.write(`${JSON.stringify(headlessReady(second.pid, 17458, 17459, 'creative-2'))}\n`)
     await expect(restarted).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17458' })

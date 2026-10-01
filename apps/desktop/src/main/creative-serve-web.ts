@@ -409,10 +409,7 @@ export class CreativeServeWeb {
     const kind = this.childKind ?? 'checkout'
     this.child = null
     this.childKind = null
-    // A stopped generation must not keep deduplicating a later restart onto
-    // its stale readiness promise. The old promise is still safely observed by
-    // start()'s attached handlers, and its child-identity checks prevent it from
-    // mutating the replacement generation.
+    // Do not deduplicate a later restart onto this generation's stale promise.
     this.starting = null
     this.current = { state: 'stopped' }
     if (!child) {
@@ -435,7 +432,7 @@ export class CreativeServeWeb {
   private terminateOwnedChild(child: CreativeChild, kind: 'checkout' | 'headless'): Promise<boolean> {
     const timeoutMs = kind === 'headless' ? HEADLESS_STOP_TIMEOUT_MS : CHECKOUT_STOP_TIMEOUT_MS
     return new Promise((resolve) => {
-      if (child.exitCode != null) return resolve(true)
+      if (child.exitCode != null || child.signalCode != null) return resolve(true)
       let settled = false
       const finish = (stopped: boolean): void => {
         if (settled) return
