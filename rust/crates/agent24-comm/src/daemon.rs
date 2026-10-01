@@ -26,7 +26,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::process::{
     Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
@@ -781,6 +781,84 @@ pub struct DaemonStatus {
     pub reason: Option<String>,
 }
 
+// ---------------------------------------------------------------------
+// COMM-4b: the three-state model's other two legs — manual relay probe
+// and log-scraped catch_up (COMM-HYPHAE.md §5.2, §6.3's "日志").
+// ---------------------------------------------------------------------
+
+/// `GET /comm/daemon`'s `relay_probe` object: the result of the most recent
+/// *manual* `POST /comm/relay/probe` — comm never probes on a timer (M12).
+/// `None` (at the call site, via [`HyphaeDaemonSupervisor::relay_probe_status`])
+/// until the first probe ever runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayProbeStatus {
+    pub url: Option<String>,
+    pub connected: bool,
+    pub at_ms: u64,
+    pub error: Option<String>,
+}
+
+/// `GET /comm/daemon`'s `catch_up` object. The baseline Hyphae daemon has no
+/// structured catch-up progress (COMM-HYPHAE.md §5.2 G2) — this can only
+/// ever report `"unknown"` or `"incomplete"`, **never** `"complete"` —
+/// there is no log line this crate would accept as proof the inbox is
+/// caught up.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatchUpStatus {
+    pub state: &'static str,
+    pub last_incomplete_at_ms: Option<u64>,
+}
+
+/// The literal substring Hyphae's own daemon prints
+/// (`internal/daemon/daemon.go`: `fmt.Printf("[%s] ⚠️  Inbox scan
+/// incomplete: %v\n", ...)`) whenever one scan of the inbox fails. Matched
+/// as a plain substring, not a regex — the `[HH:MM:SS]` prefix and the emoji
+/// are not part of what COMM-HYPHAE.md §5.2 asks comm to detect, and
+/// matching only this exact phrase (never a looser "incomplete" or
+/// "complete") is what keeps this from ever producing a `"complete"` state.
+const CATCH_UP_INCOMPLETE_MARKER: &str = "Inbox scan incomplete";
+
+/// Current wall-clock time in Unix milliseconds. `0` on a clock that reports
+/// before the epoch (never happens outside a misconfigured test rig) rather
+/// than a panic — this is a status timestamp, not a correctness-critical
+/// value.
+pub(crate) fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Scrapes `log_path` for [`CATCH_UP_INCOMPLETE_MARKER`]. A missing or
+/// unreadable log (e.g. before the daemon has ever started) is `"unknown"`,
+/// never an error. `last_incomplete_at_ms` is the log FILE's own mtime, not
+/// a timestamp parsed out of Hyphae's `[HH:MM:SS]` prefix — that prefix
+/// carries no date and cannot be turned into an absolute Unix timestamp.
+async fn catch_up_from_log(log_path: &Path) -> CatchUpStatus {
+    let Ok(bytes) = tokio::fs::read(log_path).await else {
+        return CatchUpStatus {
+            state: "unknown",
+            last_incomplete_at_ms: None,
+        };
+    };
+    if !String::from_utf8_lossy(&bytes).contains(CATCH_UP_INCOMPLETE_MARKER) {
+        return CatchUpStatus {
+            state: "unknown",
+            last_incomplete_at_ms: None,
+        };
+    }
+    let at_ms = tokio::fs::metadata(log_path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    CatchUpStatus {
+        state: "incomplete",
+        last_incomplete_at_ms: at_ms,
+    }
+}
+
 fn initial_status() -> DaemonStatus {
     DaemonStatus {
         state: "stopped",
@@ -850,6 +928,14 @@ pub struct HyphaeDaemonSupervisor {
     /// in-flight stop" signal `kill_group_gracefully` re-reads on every
     /// poll.
     shutdown_deadline: Arc<OnceLock<Instant>>,
+    /// COMM-4b: the daemon's own log file (`Ctx::log_path`), re-read fresh
+    /// on every [`Self::catch_up`] call — no periodic tailing, same
+    /// on-demand posture `relay_probe` has (M12 cut periodic probing).
+    log_path: Arc<PathBuf>,
+    /// COMM-4b: the most recent manual `POST /comm/relay/probe` result, if
+    /// any. Written by the `/relay/probe` route via
+    /// [`Self::record_relay_probe`] — this actor never touches it.
+    relay_probe: Arc<Mutex<Option<RelayProbeStatus>>>,
 }
 
 fn set_status(
@@ -890,6 +976,8 @@ impl HyphaeDaemonSupervisor {
     pub fn spawn(ctx: Ctx) -> Self {
         let status = Arc::new(Mutex::new(initial_status()));
         let shutdown_deadline = Arc::new(OnceLock::new());
+        let log_path = Arc::new(ctx.log_path.clone());
+        let relay_probe = Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_actor(
             ctx,
@@ -901,7 +989,32 @@ impl HyphaeDaemonSupervisor {
             cmd_tx,
             status,
             shutdown_deadline,
+            log_path,
+            relay_probe,
         }
+    }
+
+    /// COMM-4b: the result of the most recent manual relay probe, or `None`
+    /// if `POST /comm/relay/probe` has never run against this supervisor.
+    #[must_use]
+    pub fn relay_probe_status(&self) -> Option<RelayProbeStatus> {
+        self.relay_probe.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// COMM-4b: records a manual relay probe's result, for a later
+    /// [`Self::relay_probe_status`] (and so `GET /comm/daemon`) to report.
+    /// Called by the `/relay/probe` route — never by this actor, which knows
+    /// nothing about relay probing.
+    pub fn record_relay_probe(&self, probe: RelayProbeStatus) {
+        if let Ok(mut guard) = self.relay_probe.lock() {
+            *guard = Some(probe);
+        }
+    }
+
+    /// COMM-4b: `catch_up` as of right now, scraped fresh from the daemon's
+    /// own log file (COMM-HYPHAE.md §5.2).
+    pub async fn catch_up(&self) -> CatchUpStatus {
+        catch_up_from_log(&self.log_path).await
     }
 
     #[must_use]
@@ -1658,5 +1771,135 @@ mod tests {
         );
 
         let _ = child.kill().await;
+    }
+
+    // -------------------------------------------------------------------
+    // COMM-4b: catch_up log scraping (COMM-HYPHAE.md §5.2, task table row
+    // "日志中出现 incomplete 行后，状态变为 incomplete" / "任何输入都不会
+    // 产生 complete 状态").
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn catch_up_is_unknown_when_the_log_does_not_exist_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = catch_up_from_log(&tmp.path().join("no-such-log")).await;
+        assert_eq!(status.state, "unknown");
+        assert_eq!(status.last_incomplete_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn catch_up_becomes_incomplete_once_the_marker_line_appears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        // The real line, verbatim from `internal/daemon/daemon.go`.
+        tokio::fs::write(
+            &log,
+            "🚀 Starting daemon for 'alice'\n\
+             [10:00:00] ⚠️  Inbox scan incomplete: dial tcp 127.0.0.1:4: connect: connection refused\n",
+        )
+        .await
+        .unwrap();
+        let status = catch_up_from_log(&log).await;
+        assert_eq!(status.state, "incomplete");
+        assert!(
+            status.last_incomplete_at_ms.is_some_and(|ms| ms > 0),
+            "{status:?}"
+        );
+    }
+
+    /// G2 / COMM-4b's third acceptance line: no input ever produces
+    /// `"complete"`. Includes adversarial content that textually contains
+    /// "complete" (every "incomplete" line does too, as a substring) to
+    /// prove the match is on the exact marker, not a loose "complete"/
+    /// "incomplete" keyword search that could flip either way.
+    #[tokio::test]
+    async fn catch_up_state_is_never_literally_complete_for_any_log_content() {
+        let samples: &[&[u8]] = &[
+            b"",
+            b"Inbox scan incomplete: timeout",
+            b"[10:00:00] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: dial tcp refused\n",
+            b"Catch-up complete\n",
+            b"inbox scan complete, 0 incomplete\n", // different case + "complete" present
+            b"complete complete complete",
+            b"\x00\x01\xffrandom non-utf8 noise\xfe",
+        ];
+        for sample in samples {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("hyphae-daemon.log");
+            tokio::fs::write(&log, sample).await.unwrap();
+            let status = catch_up_from_log(&log).await;
+            assert_ne!(
+                status.state, "complete",
+                "sample {sample:?} must never produce \"complete\""
+            );
+            assert!(
+                matches!(status.state, "unknown" | "incomplete"),
+                "sample {sample:?} -> unexpected catch_up state {:?}",
+                status.state
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // COMM-4b: manual relay probe result storage.
+    // -------------------------------------------------------------------
+
+    /// A minimal [`Ctx`] whose binary is never actually invoked — the
+    /// supervisor starts `Idle` and spawns nothing until `start()` is
+    /// called, which this test never does.
+    async fn idle_ctx(dir: &Path) -> Ctx {
+        let source = dir.join("hyphae-fake.sh");
+        tokio::fs::write(&source, "#!/bin/sh\nexit 0\n")
+            .await
+            .unwrap();
+        let bytes = tokio::fs::read(&source).await.unwrap();
+        let expected = crate::binary::sha256_of(&bytes);
+        let bin = crate::binary::VerifiedBinary::install(&source, expected, &dir.join("bin"))
+            .await
+            .unwrap();
+        let home = dir.join("home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let runner = Arc::new(crate::runner::HyphaeRunner::new(
+            bin,
+            home.clone(),
+            Duration::from_secs(5),
+        ));
+        Ctx {
+            runner,
+            password_store: Arc::new(crate::password_store::MemoryPasswordStore::new()),
+            home,
+            pid_path: dir.join("hyphae-daemon.pid"),
+            log_path: dir.join("logs").join("hyphae-daemon.log"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_probe_status_round_trips_through_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = HyphaeDaemonSupervisor::spawn(idle_ctx(tmp.path()).await);
+        assert!(sup.relay_probe_status().is_none(), "no probe has run yet");
+
+        sup.record_relay_probe(RelayProbeStatus {
+            url: Some("wss://relay.example".to_owned()),
+            connected: true,
+            at_ms: 123,
+            error: None,
+        });
+        let probe = sup.relay_probe_status().expect("just recorded");
+        assert!(probe.connected);
+        assert_eq!(probe.url.as_deref(), Some("wss://relay.example"));
+        assert_eq!(probe.error, None);
+
+        sup.record_relay_probe(RelayProbeStatus {
+            url: Some("wss://relay.example".to_owned()),
+            connected: false,
+            at_ms: 456,
+            error: Some("dial tcp: connection refused".to_owned()),
+        });
+        let probe = sup.relay_probe_status().expect("just recorded");
+        assert!(
+            !probe.connected,
+            "the latest probe replaces the previous one"
+        );
     }
 }

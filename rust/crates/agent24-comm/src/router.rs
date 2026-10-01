@@ -26,11 +26,12 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::daemon::RelayProbeStatus;
 use crate::error::{CommError, map_envelope_failure, map_runner_error, map_store_error};
 use crate::npub::is_valid_npub;
 use crate::password::Password;
 use crate::password_store::{Account, PasswordStore};
-use crate::runner::{Envelope, HyphaeRunner, Invocation};
+use crate::runner::{Envelope, ExitClass, HyphaeRunner, Invocation};
 
 type CommResult = Result<Json<Value>, CommError>;
 
@@ -176,19 +177,39 @@ pub fn router(state: CommState) -> Router {
 // daemon (COMM-4a; COMM-HYPHAE.md §4, §5.2 trimmed to what this task tracks)
 // ---------------------------------------------------------------------
 
-fn daemon_status_json(s: crate::daemon::DaemonStatus) -> Value {
-    json!({"ok": true, "data": {"process": {
-        "state": s.state,
-        "generation": s.generation,
-        "consecutive_failures": s.consecutive_failures,
-        "reason": s.reason,
-    }}})
+/// COMM-4b: the full three-state object (COMM-HYPHAE.md §5.2) — `process`
+/// (COMM-4a), plus `relay_probe` and `catch_up`, which this task adds.
+/// `catch_up` is read fresh from the log file on every call: no route here
+/// ever caches it across requests, matching `relay_probe`'s own "only on
+/// demand" posture (M12 cut periodic probing/tailing).
+async fn daemon_status_json(daemon: &crate::daemon::HyphaeDaemonSupervisor) -> Value {
+    let s = daemon.status();
+    let relay_probe = daemon.relay_probe_status();
+    let catch_up = daemon.catch_up().await;
+    json!({"ok": true, "data": {
+        "process": {
+            "state": s.state,
+            "generation": s.generation,
+            "consecutive_failures": s.consecutive_failures,
+            "reason": s.reason,
+        },
+        "relay_probe": relay_probe.map(|p| json!({
+            "url": p.url,
+            "connected": p.connected,
+            "at_ms": p.at_ms,
+            "error": p.error,
+        })),
+        "catch_up": {
+            "state": catch_up.state,
+            "last_incomplete_at_ms": catch_up.last_incomplete_at_ms,
+        },
+    }})
 }
 
 async fn daemon_status(State(state): State<CommState>) -> CommResult {
     state.require_ready()?;
     let daemon = state.require_daemon()?;
-    Ok(Json(daemon_status_json(daemon.status())))
+    Ok(Json(daemon_status_json(daemon).await))
 }
 
 async fn daemon_start(State(state): State<CommState>) -> CommResult {
@@ -199,14 +220,14 @@ async fn daemon_start(State(state): State<CommState>) -> CommResult {
         crate::daemon::DaemonStartError::Locked(m) => CommError::Locked(m),
         crate::daemon::DaemonStartError::Failed(m) => CommError::Upstream(m),
     })?;
-    Ok(Json(daemon_status_json(daemon.status())))
+    Ok(Json(daemon_status_json(daemon).await))
 }
 
 async fn daemon_stop(State(state): State<CommState>) -> CommResult {
     state.require_ready()?;
     let daemon = state.require_daemon()?;
     daemon.stop().await;
-    Ok(Json(daemon_status_json(daemon.status())))
+    Ok(Json(daemon_status_json(daemon).await))
 }
 
 fn args(parts: &[&str]) -> Vec<OsString> {
@@ -747,6 +768,18 @@ struct RelayProbeReq {
 /// `POST /comm/relay/probe` → `relay info [U] --timeout 5`, run only when a
 /// caller explicitly asks (§4, §5.2: comm does not probe periodically —
 /// that was cut, M12). Always expects a JSON body (`{}` when no `url`).
+///
+/// COMM-4b: a relay actually being down must not surface as an HTTP error —
+/// Hyphae's own `relay info` contract (`docs/agent/cli-communication-contract.md`:
+/// "失败走网络错误信封和退出码 2") is itself the probe's *negative result*,
+/// not a failure of the probe operation. Only that specific `network_error`
+/// exit is folded into `{connected:false}`; every other failure (bad args,
+/// auth, an unresponsive/timing-out child, …) still surfaces as the matching
+/// `CommError`, same as every other route. The result — success or
+/// network-down — is always written into the daemon's `relay_probe` state
+/// (COMM-HYPHAE.md §5.2) when a daemon supervisor is wired up; it is skipped
+/// (not an error) on a `Ready` state built without one, same as
+/// `set_relay`'s `on_config_changed` call.
 async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeReq>) -> CommResult {
     let (runner, ..) = state.require_ready()?;
     let mut argv: Vec<OsString> = vec!["relay".into(), "info".into()];
@@ -763,7 +796,47 @@ async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeR
         })
         .await
         .map_err(map_runner_error)?;
-    envelope_response(envelope)
+
+    let at_ms = crate::daemon::wall_clock_ms();
+    let probe = match envelope {
+        Envelope::Ok { data } => RelayProbeStatus {
+            url: data
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| req.url.clone()),
+            connected: data
+                .get("connected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            at_ms,
+            error: None,
+        },
+        Envelope::Failed {
+            exit: ExitClass::NetworkError,
+            message,
+            ..
+        } => RelayProbeStatus {
+            url: req.url.clone(),
+            connected: false,
+            at_ms,
+            error: Some(message),
+        },
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => return Err(map_envelope_failure(&error, &message, data)),
+    };
+
+    if let Some(daemon) = state.daemon.clone() {
+        daemon.record_relay_probe(probe.clone());
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "data": {"url": probe.url, "connected": probe.connected, "error": probe.error},
+    })))
 }
 
 // ---------------------------------------------------------------------
