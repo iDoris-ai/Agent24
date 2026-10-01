@@ -119,8 +119,9 @@ At the time this strategy was written:
 - their merge-base was `32072b02a3c71d50b7b841ad538e3c14073878d3`;
 - the integration branch was about 321 commits ahead and 1 commit behind
   `main`;
-- the whole integration-to-main tree diff was roughly 38k lines across 133
-  files.
+- the integration branch's delta from that merge-base was roughly 38.9k lines
+  across 133 files; the direct `main`-to-integration tree comparison at those
+  named heads spanned 167 files.
 
 That is useful staging history, but it is not an acceptable unit of review for
 main landing.
