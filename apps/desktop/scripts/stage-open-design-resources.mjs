@@ -3,6 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const OPEN_DESIGN_PIN_VERSION = '0.22.2'
+const RESOURCE_TREES = ['app', 'open-design', 'open-design-web-standalone']
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const stageRoot = path.resolve(scriptDir, '../.open-design-resources')
 const rawSource = process.env.A24_OPEN_DESIGN_RESOURCES_DIR?.trim()
@@ -49,6 +50,29 @@ function verifyContract(sourceRoot) {
   requireDirectory(sourceRoot, 'open-design-web-standalone')
 }
 
+function isInsideResourceTrees(sourceRoot, target) {
+  return RESOURCE_TREES.some((tree) => {
+    const root = path.join(sourceRoot, tree)
+    return target === root || target.startsWith(`${root}${path.sep}`)
+  })
+}
+
+function verifySymlinks(sourceRoot, directory) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const fullPath = path.join(directory, entry.name)
+    if (entry.isSymbolicLink()) {
+      const link = fs.readlinkSync(fullPath)
+      if (path.isAbsolute(link)) throw new Error(`Open Design packaged resource has an absolute symlink: ${fullPath}`)
+      const resolved = fs.realpathSync(fullPath)
+      if (!isInsideResourceTrees(sourceRoot, resolved)) {
+        throw new Error(`Open Design packaged resource symlink escapes staged trees: ${fullPath}`)
+      }
+      continue
+    }
+    if (entry.isDirectory()) verifySymlinks(sourceRoot, fullPath)
+  }
+}
+
 resetStage()
 
 if (!rawSource) {
@@ -61,12 +85,14 @@ if (!path.isAbsolute(rawSource)) {
 
 const sourceRoot = fs.realpathSync(rawSource)
 verifyContract(sourceRoot)
+for (const relative of RESOURCE_TREES) verifySymlinks(sourceRoot, path.join(sourceRoot, relative))
 
-for (const relative of ['app', 'open-design', 'open-design-web-standalone']) {
+for (const relative of RESOURCE_TREES) {
   fs.cpSync(path.join(sourceRoot, relative), path.join(stageRoot, relative), {
     recursive: true,
     force: false,
     errorOnExist: true,
+    verbatimSymlinks: true,
   })
 }
 
