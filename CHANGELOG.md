@@ -11,6 +11,10 @@ All notable changes to Agent24 are documented here. This project adheres to
 Deployment 多平台发布基础设施（DEP-A1/A3/A5/A6）、DEBT-10 补审修复、桌面端验收修复，以及
 COMM 线（Hyphae 基础通信）设计冻结与首个落地 crate。
 
+**补记（CHANGELOG 撰写时尚未合并、但已包含在 `v0.5.1` tag 中）**
+- COMM-1b（#621）：`agent24-comm` 新增 `PasswordStore`（macOS 钥匙串 / Linux Secret Service / 内存）、`KeystoreWriteLock`（串行化 Hyphae keystore 写入，修复并发创建身份时后写覆盖前写导致私钥丢失）、`hyphae-lock-verify` CI。新增依赖 `keyring` 3.6（纯 Rust 后端）。
+- COMM 第一轮联调记录与 harness（#620）：`docs/comm/JOINT-ROUND1.md`。
+
 **行为变化 / 迁移说明**
 - **F4b 入站执行默认冻结**（COMM-5a，#613，收口见 #618）：即使配置了
   `A24_NOSTR_ALLOWED_NPUBS`，Nostr 入站消息也不再自动触发 `agent24d` run——`pollOnce`
