@@ -2,6 +2,20 @@
 
 状态：跨仓协作提案，待 Agent24 确认；不代表已实现接口，也不冻结 T01 协议。记录时间：2026-09-30。
 
+## 2026-10-01：Hyphae 第一轮独立复测与接口确认
+
+下文 2026-09-30 的源码/构建快照保留为历史记录。COMM-0 与 Agent24 第一轮记录分别见 [#612](https://github.com/iDoris-ai/Agent24/pull/612) 和 [JOINT-ROUND1](../comm/JOINT-ROUND1.md)；新实现状态按各自 PR 和实际 main 判断，不沿用历史“没有通信子命令”的结论。
+
+本轮固定 Hyphae source `a4aa606eb81d5c040d94c51cdf94553e646d8674`，采用生产 [hyphae.lock.json](../../rust/crates/agent24-comm/hyphae.lock.json) 的 Go 1.26.4、CGO_ENABLED=0、`-trimpath -buildvcs=false -ldflags='-buildid='` 配方。macOS arm64 CLI SHA-256 为 `f53c29b31d8ca5eb0124ced246bcff6610f048f18bc8dcc2de27f685dad8b221`；relay 为 `a012d86e549cbeb564d5a5932c54f9b3511c2434203846537096420c89f36aef`。它们与 Agent24 第一轮制品一致；旧 Go 1.27.1 的 `bc30dcf7…` 不用于本轮。
+
+Hyphae 用两个临时 HOME、合成加密身份及本地 relay 独立运行一次，exit 0。实际断言覆盖：双方加密身份、互加联系人、显式 relay、拉取前本地 history 为空、A→B 与 B→A 的事件 ID/明文/加密标记对应、断线入队、重启 relay 后原 event_id 重试、outbox 清空和重复拉取后历史恰一条。错误断言为错口令 exit 3/auth_error、非法 contact 公钥 exit 4/other_error、发送给不存在联系人 exit 1/user_error；最后一项不冒充 Agent24 的“非法 npub 发送”测试。所有 CLI 调用均为独立进程；本轮没有启动 Agent24 的生产入口，也不验收 Agent24 daemon 重启、模型/模块计数或基础 UI。
+
+原始阶段日志 SHA-256 为 `2ce0224d333a543774af7b8b05dbebcfd7a4066c2db6db725762f29ef1327d20`，精确无口令命令 SHA-256 为 `ea17291b21f53675ab30432bf31c5546910afdfb89c23db2610c94918b24eac9`。本地证据保存于 Hyphae `build/agent-handoff/20261001/real-a4-go1264/round1-unblocked/`；该目录是本机生成物，不是公开下载地址。可复现制品构建工具正在 [Hyphae #102](https://github.com/iDoris-ai/Hyphae/pull/102) 评审，固定 Release 及直接下载 URL 尚待真实 CI/下载验收后交付。
+
+确认 `history inbox` 只读本地数据库：新消息须先经 `agent inbox --as ID --password-stdin` 拉取，或由已解锁的托管 daemon 直接查询、解密及保存后才可见；`--decrypt` 不必显式传 true。daemon 不启动 inbox 子进程；默认 watch interval 为 30s，启动先扫描再按间隔扫描，不保证错误/取消/分页未完成时在 30s 内补齐。进程存活、一次扫描完成和永久同步分别判断。
+
+第二轮按 [JOINT-ROUND2](../comm/JOINT-ROUND2.md) 的候选证据继续：COMM-4a [#626](https://github.com/iDoris-ai/Agent24/pull/626) 在 `ba30f104…` 已获新的外部批准、CI 通过；COMM-3 [#627](https://github.com/iDoris-ai/Agent24/pull/627) 仍是依赖草稿。前置合入后，由 Agent24 在最终实际 main 提供托管/收发、持久凭据重启、125 条积压与重启零新增、run/model/module 三类计数及同量具有效正对照。候选组合的 0→0 记录不能代替这些出口；T21/T22 UI、T01-E 和四仓闭环仍未验收。
+
 ## 源码与验收快照（2026-09-30）
 
 本文记录两仓在该日的源码和验收快照，不将其定义为首个或永久版本锁；COMM-0 设计评审需由双方确认首个集成锁清单，随后每个实现 PR 都回填双方 commit SHA、所用平台 binary SHA-256 和验收结果。
@@ -28,10 +42,10 @@
 | 身份 | `identity list --json`、`identity create --nickname NAME [--default] --json`、`identity use --nickname NAME --json`；JSON 只输出公开字段。只有创建/追加加密身份时使用 `--password-stdin`；list/use 不需要也不加此 flag。 |
 | 联系人 | `contact list --json`、`contact add --nickname NAME --npub NPUB [--role ROLE] --json`；不需要也不加密码 flag。 |
 | Relay | `relay list --json`、重复 `relay set --relay URL --json`（完整替换）、`relay info [URL] --timeout 5 --json`。`connected=true` 只说明一次 WebSocket 握手，不说明持续在线、已订阅或已送达。 |
-| 发送 | `agent msg --from ID --to NPUB --content TEXT --json`；加密库追加 `--password-stdin`。结果包含 `event_id`、`published_to`、`queued_for_retry`、`history_stored` 等字段。 |
-| 收件/历史 | `agent inbox --as ID --limit N --json` 是有上限的单次 relay 查询；`history inbox --as ID --limit N --json` 读本地持久历史。一次 inbox 不是完整同步证明。 |
+| 发送 | `agent msg --from ID --to CONTACT_OR_NPUB --content TEXT --json`；加密库追加 `--password-stdin`。结果包含 `event_id`、`published_to`、`queued_for_retry`、`history_stored` 等字段。`ok:true`/exit 0 可仅表示可靠入队，检查 `published_to > 0` 才能判 relay 已接受；没有对端回执时不判送达。 |
+| 收件/历史 | `agent inbox --as ID --limit N --json` 是有上限的单次 relay 查询，加密库解密补收时追加 `--password-stdin`；`history inbox --as ID --limit N --json` 只读本地持久历史，无密码 flag。新消息经 inbox 或托管 daemon 补收后才可见；一次 inbox 不是完整同步证明。 |
 | 待发队列 | `storage outbox list --json`、`storage outbox retry --id EVENT_ID --json`、`storage outbox clear --failed --yes --json`。clear 删除本地待发项，不撤回 relay 已接受事件；UI 清理前展示范围并确认。 |
-| Daemon | `daemon --identity ID --password-stdin --notify=false --json` 是长驻进程；`--notify` 默认 `true`，Agent24 监管时须显式设为 `false`。`--json` 仅用于结构化启动错误，运行期间 stdout/stderr 输出日志，没有 JSON 消息流或健康状态 API。`hyphae --version` 当前输出 `hyphae version dev`，不能作为版本校验；用 binary SHA-256 校验。Agent24 管理进程和日志；消息状态从 history/outbox 查询。Hyphae release 可考虑用 ldflags 注入可追溯版本。 |
+| Daemon | `daemon --identity ID --password-stdin --notify=false --auto-reply=false --relay URL --json` 是长驻进程；`--notify` 默认 `true`，Agent24 监管时须显式设为 `false`。`--json` 在 a4 快照仅用于结构化启动错误，运行期间 stdout/stderr 输出日志，没有 JSON 消息流或健康状态 API。`hyphae --version` 输出 `hyphae version dev`，不能作为版本校验；用 binary SHA-256 校验。Agent24 管理进程和日志；消息状态从 history/outbox 查询。第一轮配方不注入版本 ldflags，以保持生产 lock 摘要。 |
 
 源码入口：[身份/联系人](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/identity/commands.go)、[relay](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/nostr/relay.go)、[消息](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/messaging/agent.go)、[history](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/messaging/commands.go)、[outbox](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/messaging/outbox_commands.go)、[daemon](https://github.com/iDoris-ai/Hyphae/blob/a4aa606eb81d5c040d94c51cdf94553e646d8674/internal/daemon/daemon.go)。
 
