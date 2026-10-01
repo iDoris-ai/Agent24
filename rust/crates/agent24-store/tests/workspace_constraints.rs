@@ -40,6 +40,11 @@ async fn lease(
     expires: Option<&str>,
     renewed: Option<&str>,
 ) -> sqlx::Result<()> {
+    assert_eq!(
+        id.len(),
+        29,
+        "lease fixture ids must pass the id-length check before field-shape assertions"
+    );
     sqlx::query(
         "INSERT INTO workspace_leases
          (lease_id, workspace_id, root_generation, owner_id, kind,
@@ -67,7 +72,7 @@ async fn lease_kind_fields_and_host_time_order_are_checked() {
     assert!(
         lease(
             &store,
-            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y1",
+            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y1AA",
             "run-1",
             "run",
             Some("d1"),
@@ -81,7 +86,7 @@ async fn lease_kind_fields_and_host_time_order_are_checked() {
     assert!(
         lease(
             &store,
-            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y2",
+            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y2AA",
             "host-1",
             "host",
             None,
@@ -95,7 +100,7 @@ async fn lease_kind_fields_and_host_time_order_are_checked() {
     assert!(
         lease(
             &store,
-            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y7",
+            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y7AA",
             "host-1",
             "host",
             Some(" "),
@@ -109,7 +114,7 @@ async fn lease_kind_fields_and_host_time_order_are_checked() {
     assert!(
         lease(
             &store,
-            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y3",
+            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y3AA",
             "not-host",
             "host",
             Some("d1"),
@@ -123,7 +128,7 @@ async fn lease_kind_fields_and_host_time_order_are_checked() {
     assert!(
         lease(
             &store,
-            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y4",
+            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y4AA",
             "host-1",
             "host",
             Some("d1"),
@@ -137,7 +142,7 @@ async fn lease_kind_fields_and_host_time_order_are_checked() {
     assert!(
         lease(
             &store,
-            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y5",
+            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y5AA",
             "host-1",
             "host",
             Some("d1"),
@@ -147,5 +152,19 @@ async fn lease_kind_fields_and_host_time_order_are_checked() {
         )
         .await
         .is_err()
+    );
+    assert!(
+        lease(
+            &store,
+            "wl_01J5M4Q2Y7N8P9R0S1T2V3Y6AA",
+            "host-1",
+            "host",
+            Some("d1"),
+            Some("host-1"),
+            Some(HOST_EXPIRES),
+            None
+        )
+        .await
+        .is_ok()
     );
 }
