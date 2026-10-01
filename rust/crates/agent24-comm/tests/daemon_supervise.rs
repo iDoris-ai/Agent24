@@ -402,7 +402,17 @@ async fn reap_orphan_kills_a_live_pid_whose_start_time_matches() {
         .unwrap();
     let pid = child.id();
     tokio::time::sleep(Duration::from_millis(100)).await; // let `ps` observe it
+    // Must match `ps_lstart`'s own normalization (PR #626 review, blocking
+    // Medium: `env_clear` + `LC_ALL=C`/`TZ=UTC`) — otherwise this test's own
+    // locale/timezone would just as easily fail to match what `reap_orphan`
+    // computes, for the exact same reason the bug existed in the first
+    // place. `daemon::tests::ps_lstart_marker_is_stable_across_different_caller_environments`
+    // covers the normalization itself; this test only needs a marker that
+    // genuinely matches what the real implementation would record.
     let out = std::process::Command::new("ps")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .unwrap();

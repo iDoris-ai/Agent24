@@ -1428,9 +1428,20 @@ pub async fn serve(
                 agent24_os_proto::stop_record::ProcessAtStop::None
             });
             record.leader = leader;
-            record.group = outcome
-                .had_process
-                .then_some(agent24_os_proto::stop_record::GroupEnd::Gone);
+            // `KilledAfterGrace` means `kill_group_gracefully` sent SIGKILL
+            // after the grace ran out but never re-confirmed the group was
+            // actually empty afterwards — recording `Gone` (= "confirmed
+            // empty") there would misreport a daemon possibly still stuck
+            // through SIGKILL as a clean shutdown (PR #626 review, Low).
+            // `GoneBeforeTerm`/`ExitedInGrace` both come from a loop that did
+            // observe the group disappear, so `Gone` is still correct there.
+            record.group = outcome.had_process.then(|| {
+                if leader == Some(agent24_os_proto::stop_record::Leader::KilledAfterGrace) {
+                    agent24_os_proto::stop_record::GroupEnd::KillAttempted
+                } else {
+                    agent24_os_proto::stop_record::GroupEnd::Gone
+                }
+            });
             record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped);
             records.push((
                 "comm.hyphae".to_owned(),

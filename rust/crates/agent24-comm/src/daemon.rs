@@ -93,19 +93,63 @@ async fn remove_pid_file(path: &Path) {
     let _ = tokio::fs::remove_file(path).await;
 }
 
+/// Absolute path to `ps`, resolved once. Pinning it to an absolute path is
+/// half of what makes [`ps_lstart`]'s marker caller-independent — a
+/// `PATH`-relative lookup would otherwise let a different `agent24d`
+/// environment (launchd's minimal `PATH` vs. an interactive shell's) resolve
+/// to a different `ps` binary entirely.
+fn ps_binary() -> &'static str {
+    static PATH: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        ["/bin/ps", "/usr/bin/ps"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap_or("ps")
+    })
+}
+
 /// `ps -o lstart= -p <pid>`, trimmed. `None` if `ps` could not find the pid
 /// (already gone) or failed to run at all.
-async fn ps_lstart(pid: u32) -> Option<String> {
-    let out = Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .await
-        .ok()?;
+///
+/// Run with a cleared, pinned environment (`LC_ALL=C`, `TZ=UTC`) and an
+/// absolute `ps` path, so the marker for a given pid never depends on
+/// whatever locale/timezone/`PATH` the calling `agent24d` process happens to
+/// be running under. Without this, the same pid produces a different marker
+/// string depending on the caller's environment (confirmed: `ps -o lstart=`
+/// under `LC_ALL=zh_CN.UTF-8` or a different `TZ` renders a different
+/// string for the exact same process) — and since `agent24d` can restart
+/// under launchd's minimal environment or an interactive shell's at
+/// different times, [`reap_orphan`]'s exact-string comparison across a
+/// restart would otherwise silently stop matching, the previous instance's
+/// orphan would never be killed, and the next spawn would overwrite the pid
+/// file on top of it: two live `hyphae daemon` processes against the same
+/// keystore (PR #626 review, blocking Medium).
+///
+/// `caller_env` exists only so `tests` can prove the normalization works
+/// without mutating this process's own environment, which `forbid(unsafe_code)`
+/// rules out (`std::env::set_var` is `unsafe` since Rust 2024). It is applied
+/// first and then unconditionally overridden by `LC_ALL`/`TZ` below, so it
+/// can never actually influence the result — exactly the property under
+/// test.
+async fn ps_lstart_with_caller_env(pid: u32, caller_env: &[(&str, &str)]) -> Option<String> {
+    let mut cmd = Command::new(ps_binary());
+    cmd.env_clear();
+    for (key, value) in caller_env {
+        cmd.env(key, value);
+    }
+    cmd.env("LC_ALL", "C");
+    cmd.env("TZ", "UTC");
+    cmd.args(["-o", "lstart=", "-p", &pid.to_string()]);
+    let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (!s.is_empty()).then_some(s)
+}
+
+async fn ps_lstart(pid: u32) -> Option<String> {
+    ps_lstart_with_caller_env(pid, &[]).await
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -127,7 +171,18 @@ pub enum ShutdownLeader {
 /// SIGTERM the group, poll for it to empty for `grace`, then SIGKILL.
 /// `pgid` is the process group id, which — since every spawn here uses
 /// `process_group(0)` — is the leader's own pid.
-async fn kill_group_gracefully(pgid: u32, grace: Duration) -> ShutdownLeader {
+///
+/// `leader` is our own `Child` handle when we spawned the group (`None` for
+/// an orphan from a previous `agent24d`). It is held until every signal has
+/// been sent — dropping it earlier hands the pid to tokio's orphan reaper,
+/// after which a signal could hit a reused id (the invariant
+/// `agent24-os-proto`'s `supervise.rs` asserts) — and `try_wait`-reaped on
+/// each poll so a zombie leader never keeps the group looking non-empty.
+async fn kill_group_gracefully(
+    pgid: u32,
+    grace: Duration,
+    mut leader: Option<&mut Child>,
+) -> ShutdownLeader {
     let Some(pid) = i32::try_from(pgid).ok().and_then(Pid::from_raw) else {
         return ShutdownLeader::GoneBeforeTerm;
     };
@@ -137,6 +192,9 @@ async fn kill_group_gracefully(pgid: u32, grace: Duration) -> ShutdownLeader {
     }
     let deadline = Instant::now() + grace;
     loop {
+        if let Some(child) = leader.as_deref_mut() {
+            let _ = child.try_wait();
+        }
         if test_kill_process_group(pid).is_err() {
             return ShutdownLeader::ExitedInGrace;
         }
@@ -146,6 +204,9 @@ async fn kill_group_gracefully(pgid: u32, grace: Duration) -> ShutdownLeader {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let _ = kill_process_group(pid, Signal::Kill);
+    if let Some(child) = leader {
+        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    }
     ShutdownLeader::KilledAfterGrace
 }
 
@@ -186,6 +247,8 @@ pub async fn reap_orphan(pid_path: &Path, grace: Duration) -> OrphanOutcome {
     if current_marker.as_deref() != Some(recorded.start_marker.as_str()) {
         tracing::warn!(
             pid = recorded.pid,
+            recorded_marker = recorded.start_marker.as_str(),
+            current_marker = current_marker.as_deref().unwrap_or("<none>"),
             "comm: a pid file names a live pid whose start time no longer matches \
              the recorded one; leaving it alone (not treated as our own orphan)"
         );
@@ -196,7 +259,7 @@ pub async fn reap_orphan(pid_path: &Path, grace: Duration) -> OrphanOutcome {
         pgid = recorded.pgid,
         "comm: killing an orphaned hyphae daemon left by a previous agent24d"
     );
-    kill_group_gracefully(recorded.pgid, grace).await;
+    kill_group_gracefully(recorded.pgid, grace, None).await;
     remove_pid_file(pid_path).await;
     OrphanOutcome::Killed
 }
@@ -545,9 +608,12 @@ impl HyphaeDaemonSupervisor {
 }
 
 async fn stop_phase(phase: &mut Phase, pid_path: &Path, grace: Duration) -> Option<ShutdownLeader> {
-    if let Phase::Running { child, pgid, .. } = std::mem::replace(phase, Phase::Idle) {
+    if let Phase::Running {
+        mut child, pgid, ..
+    } = std::mem::replace(phase, Phase::Idle)
+    {
+        let leader = kill_group_gracefully(pgid, grace, Some(&mut child)).await;
         drop(child);
-        let leader = kill_group_gracefully(pgid, grace).await;
         remove_pid_file(pid_path).await;
         return Some(leader);
     }
@@ -564,18 +630,36 @@ async fn spawn_and_record(
     match try_start(ctx).await {
         Ok(spawned) => {
             *generation += 1;
-            if let Some(marker) = ps_lstart(spawned.pid).await {
-                let _ = write_pid_file(
-                    &ctx.pid_path,
-                    &DaemonPidFile {
-                        pid: spawned.pid,
-                        pgid: spawned.pgid,
-                        start_marker: marker,
-                        generation: *generation,
-                        bin_sha256: ctx.runner.bin_sha256_hex(),
-                    },
-                )
-                .await;
+            match ps_lstart(spawned.pid).await {
+                Some(marker) => {
+                    if let Err(e) = write_pid_file(
+                        &ctx.pid_path,
+                        &DaemonPidFile {
+                            pid: spawned.pid,
+                            pgid: spawned.pgid,
+                            start_marker: marker,
+                            generation: *generation,
+                            bin_sha256: ctx.runner.bin_sha256_hex(),
+                        },
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            pid = spawned.pid,
+                            error = %e,
+                            "comm: failed to write hyphae-daemon.pid; this spawn will not \
+                             be reap-orphan-tracked by a future agent24d"
+                        );
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        pid = spawned.pid,
+                        "comm: could not read the just-spawned daemon's start time via \
+                         `ps`; skipping hyphae-daemon.pid — this spawn will not be \
+                         reap-orphan-tracked by a future agent24d"
+                    );
+                }
             }
             set_status(status, "running", *generation, failures, None);
             Ok(Phase::Running {
@@ -684,5 +768,63 @@ async fn run_actor(
                     .unwrap_or(Phase::Idle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// PR #626 review, blocking Medium: `ps_lstart`'s marker must not depend
+    /// on whatever locale/timezone the *calling* `agent24d` process happens
+    /// to have inherited — launchd's minimal environment and an
+    /// interactive-shell-started one are both normal ways this desktop app
+    /// gets launched, and genuinely differ. Before the fix, the same pid
+    /// produced a different `ps -o lstart=` string under a different
+    /// `LC_ALL`/`TZ` (verified by the review three separate times on a real
+    /// machine), which made `reap_orphan`'s exact-string comparison across
+    /// an `agent24d` restart silently stop matching.
+    ///
+    /// Can't mutate this process's own environment to prove it
+    /// (`forbid(unsafe_code)` rules out the now-`unsafe`
+    /// `std::env::set_var`), so the "different caller environment" is
+    /// simulated via `ps_lstart_with_caller_env`'s explicit parameter —
+    /// exactly the lever a real caller-environment difference would pull,
+    /// which `reap_orphan`/`spawn_and_record` (both of which only ever call
+    /// the zero-arg `ps_lstart`) never get to touch, which is the whole
+    /// point of normalizing it internally.
+    ///
+    /// The existing `tests/daemon_supervise.rs` orphan tests all compute
+    /// their comparison marker via a plain `ps` call made in the *same*
+    /// process environment `reap_orphan` runs in, so they are structurally
+    /// unable to catch this — this test closes that gap.
+    #[tokio::test]
+    async fn ps_lstart_marker_is_stable_across_different_caller_environments() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("9999")
+            .spawn()
+            .expect("spawn a long-lived process to query");
+        let pid = child.id();
+
+        let marker_a = ps_lstart_with_caller_env(pid, &[("TZ", "UTC"), ("LC_ALL", "C")])
+            .await
+            .expect("ps should find the live pid");
+        let marker_b =
+            ps_lstart_with_caller_env(pid, &[("TZ", "Asia/Shanghai"), ("LC_ALL", "zh_CN.UTF-8")])
+                .await
+                .expect("ps should find the live pid");
+
+        assert_eq!(
+            marker_a, marker_b,
+            "the same pid must produce the same start-time marker no matter what \
+             locale/timezone the caller process happens to be running under, or an \
+             orphan from a previous agent24d restart under a different environment \
+             will never be recognized as our own"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
