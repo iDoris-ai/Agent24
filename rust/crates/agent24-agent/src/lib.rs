@@ -2756,6 +2756,117 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn timed_out_recovery_handles_released_and_missing_workspace_lease_history() {
+        const WORKSPACE_ID: &str = "ws_01J5M4Q2Y7N8P9R0S1T2V3W4X5";
+        for missing in [false, true] {
+            let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
+            seed_workspace(&store, WORKSPACE_ID).await;
+            let workspace_id = agent24_protocol::WorkspaceId::parse(WORKSPACE_ID).unwrap();
+            store
+                .insert_session(&agent24_protocol::Session {
+                    id: "bound".into(),
+                    title: "bound".into(),
+                    channel: "desktop".into(),
+                    workspace_id: Some(workspace_id.clone()),
+                    created_at: "2026-09-29T00:00:00.000Z".into(),
+                    updated_at: "2026-09-29T00:00:00.000Z".into(),
+                })
+                .await
+                .unwrap();
+            let created_at = workspace_timestamp(now_iso8601());
+            let run = Run {
+                id: format!("run_{}", ulid()),
+                session_id: Some("bound".into()),
+                workspace_id: Some(workspace_id.clone()),
+                status: RunStatus::Queued,
+                input: RunInput {
+                    prompt: "stale approval".into(),
+                    workspace_id: Some(workspace_id),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: created_at.clone(),
+                started_at: None,
+                ended_at: None,
+            };
+            let lease_id = WorkspaceLeaseId::parse(&format!("wl_{}", ulid())).unwrap();
+            assert!(matches!(
+                store
+                    .insert_run_with_workspace_admission(
+                        &run,
+                        Some(lease_id.clone()),
+                        &WorkspaceInstant::parse(&created_at).unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                RunAdmission::Admitted { lease_id: Some(_) }
+            ));
+            sqlx::query("UPDATE runs SET status='awaiting_approval', started_at=? WHERE id=?")
+                .bind(&created_at)
+                .bind(&run.id)
+                .execute(agent24_store::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            let approval = Approval {
+                id: format!("apr_{}", ulid()),
+                run_id: run.id.clone(),
+                tool_call_id: format!("tc_{}", ulid()),
+                kind: "exec".into(),
+                summary: "expired".into(),
+                payload: serde_json::Map::new(),
+                available_decisions: vec!["approve".into(), "deny".into(), "abort".into()],
+                standing_target: None,
+                status: ApprovalStatus::TimedOut,
+                decision: None,
+                expires_at: created_at.clone(),
+                created_at: created_at.clone(),
+                decided_at: Some(created_at.clone()),
+            };
+            store.insert_approval(&approval).await.unwrap();
+            if missing {
+                sqlx::query("DELETE FROM workspace_leases WHERE lease_id=?")
+                    .bind(lease_id.as_str())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query("UPDATE workspace_leases SET released_at=? WHERE lease_id=?")
+                    .bind(&created_at)
+                    .bind(lease_id.as_str())
+                    .execute(agent24_store::test_hooks::pool(&store))
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(manager.recover_timed_out_approval_runs().await.unwrap(), 1);
+            assert_eq!(
+                store.get_run(&run.id).await.unwrap().unwrap().status,
+                RunStatus::Cancelled
+            );
+            let active: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM workspace_leases WHERE owner_id=? AND kind='run' AND released_at IS NULL",
+            )
+            .bind(&run.id)
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+            assert_eq!(active, 0);
+            let seen = sink.0.lock().unwrap().clone();
+            assert_eq!(
+                seen.iter()
+                    .filter(|event| event.as_str() == "run.cancelled")
+                    .count(),
+                1
+            );
+            assert!(!seen.iter().any(|event| event.as_str() == "run.started"));
+        }
+    }
+
     /// Run one prompt in a session and wait for it to reach a terminal state.
     async fn run_in_session(
         manager: &Arc<RunManager>,
@@ -4290,6 +4401,46 @@ mod approval_tests {
 
         approval.status = ApprovalStatus::Denied;
         assert!(!restored_decision_is_consistent(&approval, &session));
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_prevents_expired_approval_rebroadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        h.store
+            .insert_run(&run_in("run_expired", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        let mut approval = seed_approval(
+            "apr_expired",
+            "run_expired",
+            "tc_expired",
+            serde_json::Map::new(),
+        );
+        approval.expires_at = "2020-01-01T00:00:00Z".to_owned();
+        approval.created_at = "2019-12-31T23:59:00Z".to_owned();
+        h.store.insert_approval(&approval).await.unwrap();
+
+        assert_eq!(
+            h.broker
+                .timeout_expired("2026-10-01T00:00:00Z")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(h.manager.restore_pending_approvals().await.unwrap(), (0, 0));
+        assert_eq!(
+            h.store
+                .get_approval("apr_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ApprovalStatus::TimedOut
+        );
+        let seen = h.events.lock().unwrap().clone();
+        assert!(seen.iter().any(|event| event == "approval.resolved"));
+        assert!(!seen.iter().any(|event| event == "approval.required"));
     }
 
     #[tokio::test]

@@ -1559,6 +1559,16 @@ pub async fn serve(
     if expired > 0 {
         tracing::warn!("timed out {expired} expired approval(s) during startup recovery");
     }
+    let recovered_timeouts = state
+        .runs
+        .recover_timed_out_approval_runs()
+        .await
+        .map_err(std::io::Error::other)?;
+    if recovered_timeouts > 0 {
+        tracing::warn!(
+            "cancelled {recovered_timeouts} token-less run(s) after startup approval timeout"
+        );
+    }
 
     // H3 durable-resume startup, BEFORE accepting any request and BEFORE the
     // orphan sweep: restore restorable parked approvals (re-broadcast + keep
@@ -3699,6 +3709,26 @@ pub(crate) mod tests {
             .await
             .expect("shutdown should stop the recovery scan")
             .unwrap();
+    }
+
+    #[test]
+    fn startup_recovers_timed_out_runs_before_strict_workspace_orphan_sweep() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let timeout = body
+            .find(".timeout_expired(&approval_now)")
+            .expect("startup must time out expired approvals");
+        let recovery = body
+            .find(".recover_timed_out_approval_runs()")
+            .expect("startup must recover token-less timed-out runs");
+        let workspace_orphans = body
+            .find(".sweep_workspace_orphan_runs(&workspace_now)")
+            .expect("startup must sweep workspace orphans");
+        assert!(
+            timeout < recovery && recovery < workspace_orphans,
+            "startup order must be timeout -> timed-out run recovery -> strict workspace orphan sweep"
+        );
     }
 
     #[test]
