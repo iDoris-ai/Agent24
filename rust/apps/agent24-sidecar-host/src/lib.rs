@@ -23,6 +23,8 @@ mod generation_harness;
 #[allow(dead_code)]
 mod host_ports;
 #[allow(dead_code)]
+mod host_session;
+#[allow(dead_code)]
 mod launch;
 #[allow(dead_code)]
 mod launch_order;
