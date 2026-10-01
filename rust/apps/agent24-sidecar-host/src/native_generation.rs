@@ -1,8 +1,8 @@
 //! Native assembly for one already-owned sidecar generation.
 //!
-//! This remains dormant: host stdio bootstrap and `run()` wiring are later
-//! slices. The purpose here is to establish one concrete ownership boundary
-//! before that wiring exists.
+//! Production host stdio reaches this seam through first-launch dispatch.
+//! Assembly receives the already-owned launch and borrowed host-lifetime
+//! workers.
 
 use std::time::Instant;
 

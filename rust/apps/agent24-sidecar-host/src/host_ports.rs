@@ -1,6 +1,7 @@
-//! Dormant host-lifetime control and output ports.
+//! Host-lifetime control and output ports used by the production session.
 
 use std::{
+    fmt,
     io::{Read, Write},
     time::Duration,
 };
@@ -17,6 +18,17 @@ pub(crate) enum HostPortsBuildError {
     Output(WorkerSlotError),
     Control(WorkerSlotError),
 }
+
+impl fmt::Display for HostPortsBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Output(error) => write!(formatter, "host output worker: {error}"),
+            Self::Control(error) => write!(formatter, "host control worker: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for HostPortsBuildError {}
 
 /// The host-lifetime workers and their `WorkerSlots` provenance.
 pub(crate) struct HostPorts {

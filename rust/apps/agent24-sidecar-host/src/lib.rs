@@ -4,6 +4,8 @@
 //! Platform lifecycle code lives here so the executable remains a thin entry
 //! point and cannot grow a second protocol implementation.
 
+use std::time::{Duration, Instant};
+
 #[allow(dead_code)]
 pub(crate) mod actor;
 #[allow(dead_code)]
@@ -20,11 +22,8 @@ mod first_launch_ingress;
 mod generation_driver;
 #[allow(dead_code)]
 mod generation_harness;
-#[allow(dead_code)]
 mod host_ports;
-#[allow(dead_code)]
 mod host_session;
-#[allow(dead_code)]
 mod host_stdio;
 #[allow(dead_code)]
 mod launch;
@@ -69,10 +68,33 @@ pub(crate) mod target;
 #[cfg(test)]
 mod native_harness_tests;
 
-/// Run the host process.
+const HOST_LAUNCH_BUDGET: Duration = Duration::from_secs(10);
+const HOST_OUTPUT_BUDGET: Duration = Duration::from_secs(2);
+const HOST_LIMITS: actor::Deadlines = actor::Deadlines {
+    launch: HOST_LAUNCH_BUDGET,
+    ready: Duration::from_secs(30),
+    graceful: Duration::from_secs(5),
+    force: Duration::from_secs(10),
+    drain: Duration::from_secs(10),
+};
+
+/// Run one host session over independently owned copies of process stdio.
 pub fn run() -> std::io::Result<()> {
-    // The stdio actor and protocol dispatch are introduced in a later slice.
-    // Keeping this entry point inert makes the package independently buildable
-    // while the ownership primitive is reviewed in isolation.
-    Ok(())
+    let stdio = host_stdio::acquire().map_err(std::io::Error::other)?;
+    let mut ports = host_ports::HostPorts::new_in(
+        worker_slots::WorkerSlots::host(),
+        stdio.stdin,
+        stdio.stdout,
+        HOST_OUTPUT_BUDGET,
+    )
+    .map_err(std::io::Error::other)?;
+    host_session::run_session(
+        &mut ports,
+        HOST_LAUNCH_BUDGET,
+        HOST_LIMITS,
+        Instant::now,
+        std::thread::sleep,
+        || false,
+    )
+    .map_err(std::io::Error::other)
 }

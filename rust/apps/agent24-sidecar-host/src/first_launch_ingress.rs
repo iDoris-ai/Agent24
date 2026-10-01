@@ -1,4 +1,4 @@
-//! Dormant admission of the sidecar's first control request.
+//! Admission of the sidecar's first production control request.
 //!
 //! This seam only borrows the host-lifetime worker.  It never creates another
 //! reader or sequence, starts a target, assembles a generation, or writes a
