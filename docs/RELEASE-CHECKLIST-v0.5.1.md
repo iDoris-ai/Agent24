@@ -172,3 +172,14 @@ git push --delete origin v0.5.1
 用户下载了 v0.5.1 的 CLI 包并执行过 `agent24 os install`，注意 F4b 行为变化（见第 4
 节）不会随回滚自动撤销——回滚只影响能下载到的制品，不影响已经升级过的本地状态；需要让
 用户知晓的，走 Release Notes 的更新说明，而不是依赖回滚。
+
+## 7. 发布记录（2026-10-01）
+
+- **tag**：Agent24 `v0.5.1` @ `4fb5a89`（#624 合并提交）；Sin90 `v0.5.1` @ `030ae09`（#78）；Cos72 `v0.1.1` @ `51187da`（#13）。四条 release workflow 全绿（Agent24 CLI run 36822473922、desktop 36822473867；Sin90 36822490692；Cos72 36822504118）。
+- **断言**：Agent24 Release 资产恰为 4 个 CLI 包 + `Agent24-0.5.1.AppImage` + `agent24-desktop_0.5.1_amd64.deb` + `SHA256SUMS` + `SHA256SUMS-desktop`；**无 `.dmg`/`.zip`**；两份 `shasum -c` 全 OK；每个 CLI 包恰为 `agent24`/`agent24d`。Sin90/Cos72 各 4 包 + `SHA256SUMS`，`shasum -c` OK，包内恰为 `domain-os.yml` + `bin/<name>`。
+- **注意**：#621（COMM-1b）早于 #624 合入 main，故 tag 包含 COMM-1b 而原 CHANGELOG 未列；已在 Release Notes 与本次 CHANGELOG 补记。
+- **干净机验收**：
+  - Mac mini（arm64）**curl 下载**：三包 `shasum -c` OK → `os install` ×2 → `daemon start` → `os list`：`sin90 0.5.1 [mounted]`、`cos72 0.1.1 [mounted]`；`/api/v1/health` → `{"version":"0.5.1"}`。✅
+  - Mac mini **模拟浏览器下载**（手动加 `com.apple.quarantine`）：未签名二进制被 Gatekeeper 拒绝（`spctl` rejected，首次启动挂起等待 GUI 确认）——符合预期。按 Release Notes 执行 `xattr -dr com.apple.quarantine` 后，在**无 GUI 的 ssh 会话**中启动仍挂起（推测是首次拦截的系统对话框仍待确认），**该路径在无头环境下未能完成验证**，需在有 GUI 的 Mac 上人工复核一次。v0.5.2 签名公证后此问题消失。⚠️
+  - Linux x64（`ubuntu:22.04` 容器，amd64）：CLI + Sin90 + Cos72 `shasum -c` OK → 非 root 用户 `os install` ×2 → `daemon start` → 两者 `[mounted]`，health `0.5.1` ✅；deb `apt-get install ./agent24-desktop_0.5.1_amd64.deb` 成功，含 `/opt/Agent24/resources/backend/agent24d` ✅。
+  - Intel macOS：仅 CI runner 冒烟（daemon 起、health 200），Release Notes 已标注「x64 未实机验证」。
