@@ -1,0 +1,213 @@
+name: Release
+
+# DEP-A3: hand-written CLI release pipeline (cargo-dist deferred — see
+# docs/Deployment/RESEARCH.md §3.1). Only fires on real `vX.Y.Z` tags; the
+# repo also has `agent24-os-sdk-v*` and `v0.4.0-m4`-style tags that must NOT
+# trigger this. The tag filter below is GitHub's documented filter-pattern
+# syntax (not regex) — `v[0-9]+.[0-9]+.[0-9]+` is the exact pattern GitHub's
+# own "filter pattern cheat sheet" uses as the semver example, and it only
+# matches the whole ref name, so `agent24-os-sdk-v9.9.9` and `v0.4.0-m4`
+# both fail to match (verified by manual dry run — see PR description).
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true: 只构建并上传 artifact，不创建 GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            os: macos
+            arch: arm64
+          - target: x86_64-apple-darwin
+            # `macos-13` (the last plain Intel runner) has been retired.
+            # Current standard (free-minutes) Intel macOS runner, per
+            # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+            # (fetched 2026-10-01): "macOS, 4 CPU, Intel -> macos-15-intel,
+            # macos-26-intel". Picking the non-"-latest" one (`macos-15-intel`)
+            # so the label doesn't silently move out from under us.
+            runner: macos-15-intel
+            os: macos
+            arch: x64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os: linux
+            arch: x64
+          - target: aarch64-unknown-linux-gnu
+            # Current standard arm64 Linux runners (same doc page, fetched
+            # 2026-10-01): "Linux, arm64 -> ubuntu-24.04-arm, ubuntu-22.04-arm,
+            # ubuntu-26.04-arm". Using 22.04 to match the x64 job's lower
+            # glibc baseline.
+            runner: ubuntu-22.04-arm
+            os: linux
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build
+        working-directory: rust
+        run: cargo build --release --bin agent24 --bin agent24d
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          NAME="agent24-${VER}-${{ matrix.os }}-${{ matrix.arch }}"
+          STAGE="$RUNNER_TEMP/pkg"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/$NAME"
+          cp rust/target/release/agent24 rust/target/release/agent24d "$STAGE/$NAME/"
+          ARCHIVE="$NAME.tar.gz"
+          ( cd "$STAGE" && tar -czf "$ARCHIVE" "$NAME" )
+          mv "$STAGE/$ARCHIVE" "$ARCHIVE"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Self-check — binary architecture (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in rust/target/release/agent24 rust/target/release/agent24d; do
+            file "$bin"
+            archs="$(lipo -archs "$bin")"
+            echo "archs: $archs"
+            case "${{ matrix.arch }}" in
+              arm64) echo "$archs" | grep -qw arm64 ;;
+              x64)   echo "$archs" | grep -qw x86_64 ;;
+            esac
+          done
+
+      - name: Self-check — binary architecture (Linux)
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in rust/target/release/agent24 rust/target/release/agent24d; do
+            file "$bin"
+            case "${{ matrix.arch }}" in
+              arm64) file "$bin" | grep -qi "aarch64" ;;
+              x64)   file "$bin" | grep -Eqi "x86-64|x86_64" ;;
+            esac
+          done
+
+      - name: Self-check — daemon start / health / stop
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKDIR="$RUNNER_TEMP/smoke"
+          rm -rf "$WORKDIR"
+          mkdir -p "$WORKDIR/home" "$WORKDIR/extract"
+          tar -xzf "${{ steps.pkg.outputs.archive }}" -C "$WORKDIR/extract"
+          BIN="$WORKDIR/extract/${{ steps.pkg.outputs.name }}"
+          chmod +x "$BIN/agent24" "$BIN/agent24d"
+          export HOME="$WORKDIR/home"
+          "$BIN/agent24" daemon start
+          PORT="$(jq -r '.port' "$HOME/.agent24/daemon.json")"
+          STATUS="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/health")"
+          echo "health status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::health check returned $STATUS instead of 200"
+            "$BIN/agent24" daemon stop || true
+            exit 1
+          fi
+          "$BIN/agent24" daemon stop
+
+      - name: Self-check — archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.pkg.outputs.name }}"
+          ACTUAL="$(tar -tzf "${{ steps.pkg.outputs.archive }}" | sort)"
+          EXPECTED="$(printf '%s/\n%s/agent24\n%s/agent24d\n' "$NAME" "$NAME" "$NAME" | sort)"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::archive contents mismatch for ${{ steps.pkg.outputs.archive }}"
+            echo "expected:"; echo "$EXPECTED"
+            echo "actual:"; echo "$ACTUAL"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Collect + Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          shasum -a 256 -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Create Release
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "Agent24 $TAG" \
+            --notes "占位：正式发布说明在发布时人工补充。" \
+            dist/*.tar.gz dist/SHA256SUMS
