@@ -19,6 +19,12 @@ on:
         description: 'true: 只构建并冒烟测试，不追加到 GitHub Release'
         type: boolean
         default: true
+  # Builds + smoke-tests on a PR that touches this file, so the pipeline is
+  # proven before merge (workflow_dispatch only sees the default branch).
+  # The publish job never runs on pull_request (see its `if:`).
+  pull_request:
+    paths:
+      - '.github/workflows/release-desktop.yml'
 
 permissions:
   contents: read
@@ -179,7 +185,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    if: ${{ inputs.dry_run != true }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
     permissions:
       contents: write
     steps:
