@@ -227,7 +227,14 @@ async fn resolve_account(home: &Path) -> Result<Option<Account>, CommError> {
 ///   `KeystoreWriteLock` for the whole spawn-to-exit span, then — still
 ///   under that same lock, so no second "first identity" racer can land in
 ///   between — read the new keystore's salt and rename `Pending` to `Salt`.
-///   A failed create deletes the `Pending` entry.
+///   A failure never blindly deletes the `Pending` entry: Hyphae's own
+///   keystore write is an atomic rename partway through `identity create`'s
+///   execution (COMM-HYPHAE.md §6.4), so a failure reported *after* that
+///   rename has landed — a timeout, a signal, an oversized output stream,
+///   or Hyphae itself failing a later step such as `--default` — does not
+///   mean nothing happened. [`resolve_first_identity_failure`] re-checks
+///   `keystore.json` (still under the lock) before ever deleting anything;
+///   see its own doc comment (PR #622 High).
 /// - **Every later identity**: the keystore (and its account) already
 ///   exists; fetch its password and reuse it.
 async fn create_identity(
@@ -292,34 +299,17 @@ async fn create_identity(
 
     match result {
         Ok(Envelope::Ok { data }) => {
+            // The promotion itself is real keychain I/O under production's
+            // `KeyringPasswordStore` (every op there runs through
+            // `spawn_blocking`, `password_store.rs`), so the guard is kept
+            // until it finishes (PR #622 Medium) — otherwise a second
+            // request parked on this lock can wake up, see the keystore
+            // already written, and look its password up on the `Salt`
+            // account before `rename`'s own write has landed there.
             if is_first_identity {
-                match read_keystore_salt(home).await {
-                    Ok(Some(salt)) => {
-                        let salt_account = Account::from_salt(&salt);
-                        drop(guard);
-                        if let Err(e) = password_store.rename(&account, &salt_account).await {
-                            tracing::warn!(
-                                "identity create succeeded but promoting the pending comm \
-                                 keystore password failed ({e}); it stays under the pending \
-                                 account until the next successful create or restart"
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        drop(guard);
-                        tracing::warn!(
-                            "identity create succeeded but keystore.json has no salt field; \
-                             leaving the pending password entry in place"
-                        );
-                    }
-                    Err(e) => {
-                        drop(guard);
-                        tracing::warn!("could not read the new keystore's salt: {e}");
-                    }
-                }
-            } else {
-                drop(guard);
+                promote_first_identity_password(home, password_store, &account).await;
             }
+            drop(guard);
             Ok(Json(json!({"ok": true, "data": data})))
         }
         Ok(Envelope::Failed {
@@ -328,19 +318,160 @@ async fn create_identity(
             data,
             ..
         }) => {
+            let outcome = if is_first_identity {
+                Some(resolve_first_identity_failure(home, password_store, &account).await)
+            } else {
+                None
+            };
             drop(guard);
-            if is_first_identity {
-                let _ = password_store.delete(&account).await;
-            }
-            Err(map_envelope_failure(&error, &message, data))
+            Err(first_identity_failure_error(
+                outcome,
+                map_envelope_failure(&error, &message, data),
+            ))
         }
         Err(e) => {
+            let outcome = if is_first_identity {
+                Some(resolve_first_identity_failure(home, password_store, &account).await)
+            } else {
+                None
+            };
             drop(guard);
-            if is_first_identity {
-                let _ = password_store.delete(&account).await;
-            }
-            Err(map_runner_error(e))
+            Err(first_identity_failure_error(outcome, map_runner_error(e)))
         }
+    }
+}
+
+/// First-identity success path: promote the `Pending` password onto its new
+/// `Salt` account. Called while [`create_identity`] still holds
+/// `KeystoreWriteLock` (PR #622 Medium — see the call site's comment).
+async fn promote_first_identity_password(
+    home: &Path,
+    password_store: &dyn PasswordStore,
+    account: &Account,
+) {
+    match read_keystore_salt(home).await {
+        Ok(Some(salt)) => {
+            let salt_account = Account::from_salt(&salt);
+            if let Err(e) = password_store.rename(account, &salt_account).await {
+                tracing::warn!(
+                    "identity create succeeded but promoting the pending comm keystore \
+                     password failed ({e}); it stays under the pending account until the \
+                     next successful create or restart"
+                );
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "identity create succeeded but keystore.json has no salt field; leaving the \
+                 pending password entry in place"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("could not read the new keystore's salt: {e}");
+        }
+    }
+}
+
+/// What happened to the first identity's `Pending` password when `identity
+/// create` finished with a failure — independent of *why* it failed (a bad
+/// envelope, a timeout, a signal, an oversized output stream: see
+/// [`create_identity`]'s doc comment, PR #622 High). Hyphae's own keystore
+/// write is an atomic rename partway through its execution, so a failure
+/// reported after that rename has landed does not mean nothing happened:
+/// deleting the password unconditionally in that case permanently locks the
+/// keystore, because the `None => mint a new password` branch above is only
+/// reachable while no keystore exists yet, which is no longer true once one
+/// has been written. This resolves the only reliable ground truth available
+/// without spawning Hyphae again: `keystore.json` itself, via the same
+/// `read_keystore_salt` the success path already uses.
+enum FirstIdentityFailureOutcome {
+    /// `keystore.json` confirmed absent: the create genuinely never wrote
+    /// anything. Deleting `Pending` is safe — nothing is being lost.
+    NotWritten,
+    /// `keystore.json` has a salt: the keystore WAS written despite the
+    /// reported failure. The password was promoted onto its `Salt` account
+    /// and must never be deleted.
+    Promoted,
+    /// Either the keystore was confirmed written but promoting the password
+    /// itself failed (a keyring hiccup), or the keystore's state could not
+    /// be determined at all (e.g. an unreadable/corrupt `keystore.json`).
+    /// Both are treated the same way — never delete — because doing so
+    /// risks deleting the password for a keystore that does in fact exist.
+    Preserved,
+}
+
+/// Resolves and acts on [`FirstIdentityFailureOutcome`] for the first
+/// identity's `Pending` account. Run while [`create_identity`] still holds
+/// `KeystoreWriteLock`, so no concurrent request can observe (or race) a
+/// half-decided password.
+async fn resolve_first_identity_failure(
+    home: &Path,
+    password_store: &dyn PasswordStore,
+    account: &Account,
+) -> FirstIdentityFailureOutcome {
+    match read_keystore_salt(home).await {
+        Ok(None) => {
+            // Confirmed: no keystore was ever written. Safe to delete.
+            let _ = password_store.delete(account).await;
+            FirstIdentityFailureOutcome::NotWritten
+        }
+        Ok(Some(salt)) => {
+            // The keystore WAS written despite the reported failure.
+            // Promote exactly like the success path would; never delete.
+            let salt_account = Account::from_salt(&salt);
+            match password_store.rename(account, &salt_account).await {
+                Ok(()) => {
+                    tracing::warn!(
+                        "identity create reported a failure, but keystore.json was already \
+                         written; the pending comm keystore password has been promoted onto \
+                         its salt account rather than deleted"
+                    );
+                    FirstIdentityFailureOutcome::Promoted
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "identity create reported a failure and keystore.json was already \
+                         written, but promoting the pending comm keystore password failed \
+                         ({e}); keeping it under the pending account rather than risk \
+                         deleting the only copy of a working keystore's password"
+                    );
+                    FirstIdentityFailureOutcome::Preserved
+                }
+            }
+        }
+        Err(e) => {
+            // Could not determine whether the keystore was written (e.g.
+            // keystore.json exists but is not valid json). Treat this the
+            // same as "written": never delete on an unproven guess.
+            tracing::warn!(
+                "identity create reported a failure and keystore.json's state could not be \
+                 read ({e}); keeping the pending comm keystore password rather than risk \
+                 deleting the only copy of a working keystore's password"
+            );
+            FirstIdentityFailureOutcome::Preserved
+        }
+    }
+}
+
+/// Builds the response for a failed `identity create` on the first-identity
+/// path. When the `Pending` password was preserved rather than confirmed
+/// deleted, the original failure is reported as `partial` (COMM-HYPHAE.md
+/// §4's partial/upstream class) with an explicit `password_preserved` note,
+/// so a caller does not read a generic error and assume the password is
+/// gone (PR #622 High). When nothing needed preserving (not a first
+/// identity, or the keystore was confirmed never written), the original
+/// error is returned unchanged.
+fn first_identity_failure_error(
+    outcome: Option<FirstIdentityFailureOutcome>,
+    original: CommError,
+) -> CommError {
+    match outcome {
+        None | Some(FirstIdentityFailureOutcome::NotWritten) => original,
+        Some(FirstIdentityFailureOutcome::Promoted)
+        | Some(FirstIdentityFailureOutcome::Preserved) => CommError::Partial(json!({
+            "password_preserved": true,
+            "original_error": original.to_string(),
+        })),
     }
 }
 
@@ -543,7 +674,7 @@ mod tests {
 
     use super::*;
     use crate::binary::{VerifiedBinary, sha256_of};
-    use crate::password_store::MemoryPasswordStore;
+    use crate::password_store::{MemoryPasswordStore, StoreError};
 
     async fn install_fixture(dir: &Path, name: &str, script: &str) -> VerifiedBinary {
         let source_dir = dir.join("src");
@@ -759,6 +890,191 @@ mod tests {
         assert!(
             store.get(&salt_account).await.is_ok(),
             "the generated password must have been renamed onto the Salt account"
+        );
+    }
+
+    // ---- identity create: a failure AFTER the keystore write must never --
+    // ---- delete the only copy of its password (PR #622 High) -------------
+
+    #[tokio::test]
+    async fn first_identity_create_timeout_after_keystore_write_preserves_the_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        tokio::fs::create_dir_all(home.join(".hyphae"))
+            .await
+            .unwrap();
+        // Writes keystore.json immediately (Hyphae's own atomic rename has
+        // already landed), THEN sleeps well past the runner's timeout —
+        // reproducing `RunnerError::Timeout` AFTER the write, exactly the
+        // ordinary operational event (a slow child, `kill_process_group`
+        // landing late) the High finding describes, not an exotic attack.
+        // The keystore write happens BEFORE the process ever reads stdin, so
+        // it lands as early as possible after spawn — the test's own
+        // timeout budget must only cover process startup, not stdin
+        // round-trip latency.
+        let script = format!(
+            "#!/bin/sh\necho '{{\"salt\":\"c2FsdA==\"}}' > \"{}\"\ncat > /dev/null\nsleep 30\n",
+            home.join(".hyphae").join("keystore.json").display()
+        );
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &script).await;
+        // A generous timeout (this test only waits for the KILL, not the
+        // sleep): under a loaded `cargo test --workspace` run, several
+        // seconds of scheduler contention for the fork/exec itself is not
+        // unusual, and the point under test is "a timeout AFTER the write
+        // lands", not how fast that happens.
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(3)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        let state = CommState::ready(runner, store.clone(), home);
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/identity",
+            Some(json!({"nickname": "alice"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["data"]["password_preserved"], true, "{body:?}");
+
+        let salt_account = Account::from_salt("c2FsdA==");
+        assert!(
+            store.get(&salt_account).await.is_ok(),
+            "keystore.json was already written before the timeout; its password must have \
+             been promoted onto the Salt account, not deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_identity_create_failure_after_keystore_write_preserves_the_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        tokio::fs::create_dir_all(home.join(".hyphae"))
+            .await
+            .unwrap();
+        // Writes keystore.json, THEN reports a failure envelope on a
+        // non-zero exit — reproducing Hyphae itself failing a LATER step
+        // (e.g. `--default`'s SetDefault) after its own keystore write has
+        // already landed.
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\necho '{{\"salt\":\"c2FsdA==\"}}' > \"{}\"\n\
+             echo '{{\"ok\":false,\"error\":\"other_error\",\"message\":\"set default failed \
+             after write\"}}' >&2\nexit 4\n",
+            home.join(".hyphae").join("keystore.json").display()
+        );
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &script).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let store = Arc::new(MemoryPasswordStore::new());
+        let state = CommState::ready(runner, store.clone(), home);
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/identity",
+            Some(json!({"nickname": "alice", "default": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["data"]["password_preserved"], true, "{body:?}");
+
+        let salt_account = Account::from_salt("c2FsdA==");
+        assert!(
+            store.get(&salt_account).await.is_ok(),
+            "keystore.json was already written before the reported failure; its password \
+             must have been promoted onto the Salt account, not deleted"
+        );
+    }
+
+    // ---- identity create: KeystoreWriteLock must cover the Pending->Salt --
+    // ---- rename, not just the Hyphae spawn (PR #622 Medium) ---------------
+
+    /// Stands in for `KeyringPasswordStore`'s real `spawn_blocking` keychain
+    /// I/O (every op there runs on the blocking pool, `password_store.rs`'s
+    /// `run_blocking`) with an artificial, deterministic delay — long
+    /// enough that, without the Medium fix (holding `KeystoreWriteLock`
+    /// through the Pending->Salt `rename`, not just the Hyphae spawn), a
+    /// second identity-create request that was parked on the lock wakes up
+    /// right after the first drops its guard, reads the just-written salt,
+    /// and looks its password up on the `Salt` account before the first
+    /// request's own `rename` has finished writing it there.
+    struct DelayedPasswordStore {
+        inner: MemoryPasswordStore,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl PasswordStore for DelayedPasswordStore {
+        async fn get(&self, account: &Account) -> Result<Password, StoreError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.get(account).await
+        }
+
+        async fn put(&self, account: &Account, password: &Password) -> Result<(), StoreError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.put(account, password).await
+        }
+
+        async fn delete(&self, account: &Account) -> Result<(), StoreError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.delete(account).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn keystore_write_lock_covers_the_pending_to_salt_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        tokio::fs::create_dir_all(home.join(".hyphae"))
+            .await
+            .unwrap();
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\necho '{{\"salt\":\"c2FsdA==\"}}' > \"{}\"\n\
+             echo '{{\"ok\":true,\"data\":{{\"nickname\":\"ignored\"}}}}'\n",
+            home.join(".hyphae").join("keystore.json").display()
+        );
+        let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &script).await;
+        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
+        let delayed = Arc::new(DelayedPasswordStore {
+            inner: MemoryPasswordStore::new(),
+            delay: Duration::from_millis(150),
+        });
+        let state = CommState::ready(runner, delayed.clone(), home);
+        let app = router(state);
+
+        // Both requests are issued at once: whichever loses the race to
+        // `KeystoreWriteLock` is parked on it until the winner's guard
+        // drops. Without the fix, the winner drops its guard BEFORE its own
+        // `rename` finishes, so the loser wakes up, sees the keystore
+        // (already written), and looks its password up on the `Salt`
+        // account before `rename`'s `put` has landed there.
+        let first = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                call(app, "POST", "/identity", Some(json!({"nickname": "alice"}))).await
+            })
+        };
+        let second = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                call(app, "POST", "/identity", Some(json!({"nickname": "bob"}))).await
+            })
+        };
+        let (status_a, body_a) = first.await.unwrap();
+        let (status_b, body_b) = second.await.unwrap();
+        assert_eq!(status_a, StatusCode::OK, "{body_a:?}");
+        assert_eq!(status_b, StatusCode::OK, "{body_b:?}");
+
+        let keys = delayed.inner.snapshot_keys().await;
+        assert_eq!(
+            keys.len(),
+            1,
+            "expected exactly one surviving account (the promoted Salt account), found {keys:?}"
+        );
+        assert!(
+            !keys[0].starts_with("pending-"),
+            "no Pending account should survive: {keys:?}"
         );
     }
 }
