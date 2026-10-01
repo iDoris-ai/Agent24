@@ -1,7 +1,7 @@
 //! Rule based extraction for explicit user requests to remember something.
 
 use agent24_memory::{
-    KvStore, MemoryError,
+    KvStore,
     artifact::checksum,
     event::{EventId, Origin, Scope, Trust},
     writer::{Candidate, MemoryWriter},
@@ -46,19 +46,8 @@ pub(super) async fn persist(
     .with_evidence(vec![evidence])
     .remember();
 
-    match kv.write_gate().propose(vec![candidate]).await {
-        Ok(_) => Ok(()),
-        Err(MemoryError::Sqlx(error))
-            if error
-                .as_database_error()
-                .is_some_and(|database| database.is_unique_violation()) =>
-        {
-            // Same owner + object produces the same id. The write gate uses a
-            // transaction, so a duplicate leaves the original assertion intact.
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    kv.write_gate().propose(vec![candidate]).await?;
+    Ok(())
 }
 
 #[cfg(test)]

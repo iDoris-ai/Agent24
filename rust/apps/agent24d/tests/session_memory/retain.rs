@@ -72,6 +72,127 @@ async fn repeating_same_explicit_remember_keeps_one_ledger_row() {
 }
 
 #[tokio::test]
+async fn audit_id_conflict_does_not_report_a_failed_remember_as_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider).await;
+    let owner = personal_owner(&kv).await;
+    let object = "我对花生过敏";
+    let candidate_id = agent24_memory::artifact::checksum(&format!("{owner}{object}"));
+    let evidence = agent24_memory::artifact::checksum(
+        &serde_json::to_string(&(owner.as_str(), SESSION, 0u64, "user")).unwrap(),
+    );
+    let canonical = format!(
+        "commit|{candidate_id}|user|said_to_remember|{}|{:?}",
+        json!(object),
+        vec![evidence]
+    );
+    let occupied_id = format!(
+        "audit-{candidate_id}-{}",
+        &agent24_memory::artifact::checksum(&canonical)[..16]
+    );
+    let occupied = agent24_memory::event::MemEvent::new(
+        occupied_id.clone(),
+        Scope::owner(&owner),
+        "test.audit_id_reservation",
+        json!({"reservation": "preserve me"}),
+        Origin {
+            source: "test".into(),
+            trust: Trust::System,
+        },
+    );
+    kv.events().append(&occupied).await.unwrap();
+    let mut events = state.events.subscribe();
+
+    run(&state, "记住我对花生过敏").await;
+
+    assert!(beliefs(&kv, &owner, true).await.is_empty());
+    let stored = kv.events().scan(&EventQuery::owner(&owner)).await.unwrap();
+    assert_eq!(
+        stored.iter().filter(|e| e.event.kind == "message").count(),
+        2,
+        "append_turn must commit both messages even when the audit transaction fails"
+    );
+    let still_occupied = stored.iter().find(|e| e.event.id == occupied_id).unwrap();
+    assert_eq!(still_occupied.event.kind, occupied.kind);
+    assert_eq!(still_occupied.event.body, occupied.body);
+    let memory_write_failed = std::iter::from_fn(|| events.try_recv().ok())
+        .any(|(_, body)| matches!(body, EventBody::MemoryWriteFailed(_)));
+    assert!(memory_write_failed, "audit collision must be observable");
+}
+
+#[tokio::test]
+async fn repeating_a_withdrawn_remember_is_observable_and_does_not_revive_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("memory.db");
+    let kv = KvStore::open(&db).await.unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db.display()))
+        .await
+        .unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = app(kv.clone(), dir.path(), provider).await;
+    let owner = personal_owner(&kv).await;
+    let mut events = state.events.subscribe();
+
+    run(&state, "记住我对花生过敏").await;
+    let original = beliefs(&kv, &owner, false).await;
+    assert_eq!(original.len(), 1);
+    let id = original[0].id.clone();
+    assert_eq!(
+        kv.forget(&owner, &id, &original[0].recorded_from)
+            .await
+            .unwrap(),
+        agent24_memory::assertion::Forget::Forgotten
+    );
+    assert!(beliefs(&kv, &owner, false).await.is_empty());
+    let before = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT evidence, recorded_to FROM mem_assertions WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(before.1.is_some(), "forget must retain a closed ledger row");
+
+    run(&state, "记住我对花生过敏").await;
+
+    let after = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT evidence, recorded_to FROM mem_assertions WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_assertions WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "retry must preserve withdrawn row and evidence"
+    );
+    assert_eq!(rows, 1, "retry must not create another ledger row");
+    assert!(beliefs(&kv, &owner, true).await.is_empty());
+    let retractions = kv.events().scan(&EventQuery::owner(&owner)).await.unwrap();
+    assert_eq!(
+        retractions
+            .iter()
+            .filter(|e| e.event.kind == "assertion.retracted")
+            .count(),
+        1,
+        "the original assertion remains represented by its retraction event"
+    );
+    let memory_write_failed = std::iter::from_fn(|| events.try_recv().ok())
+        .any(|(_, body)| matches!(body, EventBody::MemoryWriteFailed(_)));
+    assert!(
+        memory_write_failed,
+        "withdrawn duplicate must be observable"
+    );
+}
+
+#[tokio::test]
 async fn remember_phrase_in_model_answer_does_not_create_candidate() {
     let dir = tempfile::tempdir().unwrap();
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();

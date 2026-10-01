@@ -36,13 +36,14 @@
 //! sits after it) and BULK ROLLBACK (a follow-up). Documented boundaries, not
 //! silent omissions.
 
+use agent24_core::util::now_iso8601;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::Result;
 use crate::artifact::checksum;
 use crate::assertion::{Assertion, AssertionId, AssertionLedger, Modality};
 use crate::event::{EventLog, MemEvent, Origin, Scope, Trust};
+use crate::{MemoryError, Result};
 
 /// A proposed assertion, before the gate decides. Its trust-bearing fields are
 /// PRIVATE: construct via [`Candidate::new`] (which requires an [`Origin`]) and
@@ -123,7 +124,9 @@ enum Outcome {
 pub trait MemoryWriter: Send + Sync {
     /// Decide + persist + audit each candidate, in order. Commit/Hold write the
     /// assertion and its audit event ATOMICALLY; Reject audits only. Returns one
-    /// [`WriteDecision`] per candidate.
+    /// [`WriteDecision`] per candidate. Explicit `UserSaid` remembers may reuse
+    /// an identical current qualified assertion; retries preserve its original
+    /// evidence and audit. Other ID collisions remain errors.
     async fn propose(&self, candidates: Vec<Candidate>) -> Result<Vec<WriteDecision>>;
     /// Decide WITHOUT any side effects: no persistence, no audit.
     async fn dry_run(&self, candidates: &[Candidate]) -> Result<Vec<WriteDecision>>;
@@ -225,6 +228,49 @@ impl WriteGate {
         let assertion = Self::to_assertion(c, qualified);
         let audit = Self::audit_event(c, verdict, None);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        // Explicit user remembers reuse a deterministic id. Treat that as
+        // idempotent only while the exact qualified assertion is still current.
+        // Do this under the write lock so a concurrent withdrawal cannot race
+        // the check; every other primary-key collision remains an error.
+        if verdict == "commit" && c.origin.trust == Trust::UserSaid && c.explicit_remember {
+            let existing = sqlx::query(
+                "SELECT scope_owner, scope, subject, predicate, object, qualified,
+                        valid_from, valid_to, recorded_from, recorded_to
+                 FROM mem_assertions WHERE id = ?",
+            )
+            .bind(&c.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some(row) = existing {
+                use sqlx::Row;
+                let now = now_iso8601();
+                let expected_scope = serde_json::to_string(&c.scope)?;
+                let expected_object = serde_json::to_string(&c.object)?;
+                let matching = row.get::<String, _>("scope_owner") == c.scope.owner
+                    && row.get::<String, _>("scope") == expected_scope
+                    && row.get::<String, _>("subject") == c.subject
+                    && row.get::<String, _>("predicate") == c.predicate
+                    && row.get::<String, _>("object") == expected_object
+                    && row.get::<i64, _>("qualified") == 1
+                    && row.get::<String, _>("valid_from") <= now
+                    && row
+                        .get::<Option<String>, _>("valid_to")
+                        .is_none_or(|end| now < end)
+                    && row.get::<String, _>("recorded_from") <= now
+                    && row.get::<Option<String>, _>("recorded_to").is_none();
+                if matching {
+                    tx.commit().await?;
+                    return Ok(());
+                }
+                return Err(MemoryError::Conflict(format!(
+                    "assertion id {:?} already exists and is not the same current qualified remember",
+                    c.id
+                )));
+            }
+        }
+
         AssertionLedger::insert_tx(&mut tx, &assertion).await?;
         EventLog::append_tx(&mut tx, &audit).await?;
         tx.commit().await?;
