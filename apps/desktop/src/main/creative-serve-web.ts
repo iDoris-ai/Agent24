@@ -13,6 +13,7 @@ export interface CreativeServeWebStatus {
 
 export interface CreativeServeWebOptions {
   checkoutDir?: string
+  resourcesPath?: string
   nodeBinary?: string
   port?: number
   readyTimeoutMs?: number
@@ -67,10 +68,12 @@ export function classifyCreativeUrl(candidate: string, allowedOrigin: string): C
 export function resolveOpenDesignCheckout(
   cwd = process.cwd(),
   env: NodeJS.ProcessEnv = process.env,
+  resourcesPath?: string,
 ): string | null {
   const explicit = env.A24_OPEN_DESIGN_DIR?.trim()
   const candidates = [
     explicit || null,
+    resourcesPath ? path.join(resourcesPath, 'open-design') : null,
     path.resolve(cwd, '../../../open-design-agent24'),
     path.resolve(cwd, '../open-design-agent24'),
   ].filter((candidate): candidate is string => Boolean(candidate))
@@ -110,11 +113,12 @@ export class CreativeServeWeb {
 
   private async startOnce(): Promise<CreativeServeWebStatus> {
 
-    const checkoutDir = this.options.checkoutDir ?? resolveOpenDesignCheckout()
+    const checkoutDir = this.options.checkoutDir
+      ?? resolveOpenDesignCheckout(process.cwd(), process.env, this.options.resourcesPath)
     if (!checkoutDir) {
       this.current = {
         state: 'failed',
-        error: 'Open Design checkout not found; set A24_OPEN_DESIGN_DIR',
+        error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design',
       }
       return this.status()
     }

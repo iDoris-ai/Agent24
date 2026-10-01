@@ -52,7 +52,7 @@ let mainWin: BrowserWindow | null = null
 let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
-const creativeServeWeb = new CreativeServeWeb()
+const creativeServeWeb = new CreativeServeWeb({ resourcesPath: process.resourcesPath })
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 
