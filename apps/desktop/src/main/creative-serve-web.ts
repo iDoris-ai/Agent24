@@ -30,6 +30,30 @@ export const CREATIVE_SESSION_PARTITION = 'persist:agent24-creative'
 
 export type CreativeUrlDisposition = 'same-origin' | 'external-http' | 'blocked'
 
+export class CreativeViewRequestFence {
+  private generation = 0
+  private desiredVisible = false
+
+  begin(): number {
+    this.desiredVisible = true
+    this.generation += 1
+    return this.generation
+  }
+
+  invalidate(): void {
+    this.desiredVisible = false
+    this.generation += 1
+  }
+
+  isCurrent(generation: number): boolean {
+    return this.desiredVisible && this.generation === generation
+  }
+
+  wantsVisible(): boolean {
+    return this.desiredVisible
+  }
+}
+
 export function canonicalCreativeOrigin(raw: string, expectedPort: number): string {
   let url: URL
   try {
