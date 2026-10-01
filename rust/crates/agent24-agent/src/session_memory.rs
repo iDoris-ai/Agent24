@@ -56,6 +56,12 @@ impl SessionMemory {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_session_log(mut self, log: SessionLog) -> Self {
+        self.log = log;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_commit_probe(mut self, probe: Arc<CommitAcknowledgementProbe>) -> Self {
         self.commit_probe = Some(probe);
         self
@@ -169,36 +175,54 @@ impl SessionMemory {
                 ));
             }
         };
-        let append = async {
-            self.log
-                .append_turn(
-                    &self.owner,
-                    sid,
+        // Once append starts, its transaction must outlive cancellation of the
+        // caller. Keep both the append future and this session guard in a task;
+        // the next writer cannot allocate a turn number until the transaction
+        // has a confirmed outcome.
+        let log = self.log.clone();
+        let owner = self.owner.clone();
+        let sid_owned = sid.to_owned();
+        let prompt_owned = prompt.to_owned();
+        let answer_owned = answer.to_owned();
+        #[cfg(test)]
+        let commit_probe = self.commit_probe.clone();
+        let mut append_task = tokio::spawn(async move {
+            let append_result = async {
+                log.append_turn(
+                    &owner,
+                    &sid_owned,
                     turn_no,
-                    &Msg::user(prompt.to_owned()),
+                    &Msg::user(prompt_owned),
                     Origin {
                         source: "agent_loop".into(),
                         trust: Trust::UserSaid,
                     },
-                    &Msg::assistant(Some(answer.to_owned()), vec![]),
+                    &Msg::assistant(Some(answer_owned), vec![]),
                     Origin {
                         source: "agent_loop".into(),
                         trust: Trust::Model,
                     },
                 )
                 .await?;
-            #[cfg(test)]
-            if let Some(probe) = &self.commit_probe
-                && probe.armed.swap(false, Ordering::AcqRel)
-            {
-                probe.committed.notify_one();
-                probe.release.notified().await;
+                #[cfg(test)]
+                if let Some(probe) = &commit_probe
+                    && probe.armed.swap(false, Ordering::AcqRel)
+                {
+                    probe.committed.notify_one();
+                    probe.release.notified().await;
+                }
+                Ok::<_, MemoryError>(())
             }
-            Ok::<_, MemoryError>(())
-        };
-        tokio::pin!(append);
-        match tokio::time::timeout_at(deadline, &mut append).await {
-            Ok(result) => result?,
+            .await;
+            if let Err(err) = &append_result {
+                // This task can finish after remember() was cancelled, in which
+                // case no caller remains to report the append failure.
+                tracing::error!(session_id = %sid_owned, error = %err, "session memory append failed");
+            }
+            (append_result, guard)
+        });
+        let joined = match tokio::time::timeout_at(deadline, &mut append_task).await {
+            Ok(result) => result,
             Err(_) => {
                 tracing::warn!(
                     "session {sid} memory write budget expired; waiting for append transaction outcome"
@@ -207,9 +231,12 @@ impl SessionMemory {
                 if let Some(probe) = &self.commit_probe {
                     probe.deadline_elapsed.notify_one();
                 }
-                append.await?;
+                append_task.await
             }
-        }
+        };
+        let (append_result, guard) = joined
+            .map_err(|err| MemoryError::Io(format!("session memory append task failed: {err}")))?;
+        append_result?;
         // append_turn is the durable boundary. Any compaction error or timeout
         // is best-effort and leaves every source message in the event log.
         // If confirmation consumed the budget, do not start database work only

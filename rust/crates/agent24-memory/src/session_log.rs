@@ -58,7 +58,8 @@ fn system_origin(source: &str) -> Origin {
 }
 
 impl SessionLog {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    /// Uses a pool connected to a database already migrated by `KvStore`.
+    pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
             #[cfg(test)]

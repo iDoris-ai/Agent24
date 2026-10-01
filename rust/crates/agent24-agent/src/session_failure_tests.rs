@@ -451,3 +451,260 @@ async fn summarizer_timeout_keeps_durable_originals_without_write_failed_event()
         "summary timeout must not report failure after original messages were committed"
     );
 }
+
+struct TwoPhaseProvider {
+    b_entered: Arc<tokio::sync::Notify>,
+    b_release: Arc<tokio::sync::Notify>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ModelProvider for TwoPhaseProvider {
+    fn name(&self) -> &str {
+        "two-phase"
+    }
+
+    async fn complete(
+        &self,
+        _request: &CompletionRequest,
+        _cancel: &CancellationToken,
+    ) -> Result<CompletionResponse, ModelError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            self.b_entered.notify_one();
+            self.b_release.notified().await;
+        }
+        let answer = if call == 0 { "B answer" } else { "A answer" };
+        Ok(CompletionResponse {
+            message: Msg::assistant(Some(answer.to_owned()), vec![]),
+            usage: usage_one(),
+            model_id: None,
+        })
+    }
+
+    async fn models(
+        &self,
+        _cancel: &CancellationToken,
+    ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+        Ok(vec![])
+    }
+}
+
+struct CommitHookRelease(std::sync::mpsc::SyncSender<()>);
+impl Drop for CommitHookRelease {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+#[tokio::test]
+async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit_finishes() {
+    use agent24_memory::event::EventStore;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("memory.sqlite");
+    let kv = KvStore::open(&db_path).await.unwrap();
+    let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = Arc::new(StdMutex::new(release_rx));
+    let armed = Arc::new(AtomicBool::new(false));
+    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))
+        .unwrap()
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
+    let hook_rx = release_rx.clone();
+    let hook_tx = commit_tx.clone();
+    let hook_armed = armed.clone();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .after_connect(move |conn, _| {
+            let rx = hook_rx.clone();
+            let tx = hook_tx.clone();
+            let armed = hook_armed.clone();
+            Box::pin(async move {
+                let mut handle = conn.lock_handle().await?;
+                handle.set_commit_hook(move || {
+                    if armed.swap(false, Ordering::SeqCst) {
+                        let _ = tx.send(());
+                        let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+                    }
+                    true
+                });
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await
+        .unwrap();
+    let _hook_cleanup = CommitHookRelease(release_tx);
+    let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(journal.to_ascii_lowercase(), "wal");
+
+    let sink = Arc::new(FailureRecordingSink(StdMutex::new(Vec::new())));
+    let store = Store::open_memory().await.unwrap();
+    let b_entered = Arc::new(tokio::sync::Notify::new());
+    let b_release = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(TwoPhaseProvider {
+        b_entered: b_entered.clone(),
+        b_release: b_release.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let memory = SessionMemory::new(kv.clone(), Arc::new(UnusedSummarizer))
+        .with_session_log(agent24_memory::session_log::SessionLog::new(pool.clone()))
+        .with_owner("m1-test-owner".to_owned());
+    let manager = RunManager::with_memory(
+        store.clone(),
+        Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)])),
+        Arc::new(ToolRegistry::new()),
+        sink.clone(),
+        CancellationToken::new(),
+        Some(memory),
+    );
+    seed_session(&store, "commit-cancel-race").await;
+
+    // B reaches the provider and pauses after obtaining its read-side session lock.
+    let b = manager
+        .start_run(RunCreate {
+            session_id: Some("commit-cancel-race".into()),
+            prompt: "B question".into(),
+            model_override: None,
+            mode: RunMode::Normal,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), b_entered.notified())
+        .await
+        .expect("B provider entered");
+    // A writes first and pauses inside SQLite's real worker-thread commit hook.
+    armed.store(true, Ordering::SeqCst);
+    let a = manager
+        .start_run(RunCreate {
+            session_id: Some("commit-cancel-race".into()),
+            prompt: "A question".into(),
+            model_override: None,
+            mode: RunMode::Normal,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::task::spawn_blocking(move || commit_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap()
+    })
+    .await
+    .expect("A reached SQLite COMMIT hook");
+
+    let lock = manager
+        .memory
+        .as_ref()
+        .unwrap()
+        .session_lock("commit-cancel-race")
+        .await;
+    assert!(
+        lock.try_lock().is_err(),
+        "A must retain the session lock while COMMIT is paused"
+    );
+    let before = kv
+        .events()
+        .scan(
+            &agent24_memory::event::EventQuery::owner("m1-test-owner")
+                .session("commit-cancel-race"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        before.is_empty(),
+        "another WAL connection must see the pre-commit snapshot"
+    );
+    // Queue this probe before B, so B cannot hide an early release by taking
+    // the lock itself. Keep the same future queued across the timeout.
+    let mut lock_probe = Box::pin(lock.lock());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut lock_probe)
+            .await
+            .is_err(),
+        "A must still own the per-session lock before cancellation"
+    );
+    b_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store
+                .list_run_messages(&b.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.role == "assistant")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("B must have answered before A is cancelled");
+
+    let started = std::time::Instant::now();
+    let _ = manager.cancel_run(&a.id).await;
+    let a_done = tokio::time::timeout(Duration::from_secs(1), wait_terminal(&store, &a.id))
+        .await
+        .expect("A cancellation must complete promptly");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "A cancellation took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(a_done.status, RunStatus::Cancelled);
+    let still_waiting = tokio::time::timeout(Duration::from_millis(100), &mut lock_probe)
+        .await
+        .is_err();
+    drop(lock_probe);
+    // In the broken implementation B can now count the old WAL snapshot and
+    // block in BEGIN IMMEDIATE. A correct implementation keeps B on the lock.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Keep the worker alive until the waiter check completes, including on panic.
+    drop(_hook_cleanup);
+    let b_done = wait_terminal(&store, &b.id).await;
+    assert_eq!(b_done.status, RunStatus::Completed);
+    let view = kv
+        .session_log()
+        .load_view("m1-test-owner", "commit-cancel-race")
+        .await
+        .unwrap();
+    let messages = view
+        .tail
+        .iter()
+        .map(|(_, message)| message.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [
+            Msg::user("A question"),
+            Msg::assistant(Some("A answer".to_owned()), vec![]),
+            Msg::user("B question"),
+            Msg::assistant(Some("B answer".to_owned()), vec![]),
+        ],
+        "both complete exchanges must be durable in order"
+    );
+    assert!(
+        still_waiting,
+        "session lock was released before SQLite COMMIT finished"
+    );
+    let failures = sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| serde_json::to_value(body).unwrap())
+        .filter(|json| json["type"] == "memory.write_failed")
+        .collect::<Vec<_>>();
+    assert!(failures.is_empty(), "memory write failures: {failures:?}");
+    pool.close().await;
+}

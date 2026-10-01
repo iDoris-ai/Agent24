@@ -942,8 +942,9 @@ impl RunManager {
                 //
                 // This widens the window in which the run is still non-terminal,
                 // so it MUST stay cancellable: `cancel works in any non-terminal
-                // state` is the C2 contract, and a 30s uncancellable finalization
-                // would break it (review D5b).
+                // state` is the C2 contract. If cancellation drops this waiter
+                // after append starts, SessionMemory's detached transaction task
+                // keeps the session lock until SQLx confirms the append outcome.
                 tokio::select! {
                     () = self.remember_exchange(run.session_id.as_deref(), &run.input.prompt, &text) => {},
                     () = cancel.cancelled() => {
