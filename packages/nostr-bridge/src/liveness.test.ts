@@ -521,7 +521,7 @@ describe('InboundLiveness — 探针不能污染业务路径', () => {
       new Set([SELF, 'npub1peer']),
     )
 
-    await pollOnce(h.speaker, bridge, h.liveness)
+    await pollOnce(h.speaker, bridge, h.liveness, { dispatchEnabled: true })
 
     expect(prompts).toEqual(['hello'])
     expect(prompts.some((p) => p.includes(CANARY_PREFIX))).toBe(false)
