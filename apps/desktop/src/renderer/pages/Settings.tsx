@@ -329,31 +329,15 @@ export default function SettingsPage() {
         )}
       </div>
 
-      {/* ── Backend Daemon ── */}
-      <div className="settings-section">
-        <h3>Backend Daemon</h3>
-        <div className="setting-row">
-          <div><label>Daemon Port</label><p>Agent24 internal service port</p></div>
-          <input type="text" defaultValue="8765" style={{ width: 80 }} />
-        </div>
-      </div>
-
-      {/* ── Appearance ── */}
-      <div className="settings-section">
-        <h3>Appearance</h3>
-        <div className="setting-row">
-          <div><label>Language</label><p>UI display language</p></div>
-          <select defaultValue="zh">
-            <option value="zh">中文</option>
-            <option value="en">English</option>
-          </select>
-        </div>
-      </div>
-
-      <div style={{ marginTop: 8 }}>
-        <button className="btn btn-primary">Save Settings</button>
-        <button className="btn btn-ghost" style={{ marginLeft: 8 }}>Reset Defaults</button>
-      </div>
+      {/*
+       * AUDIT-2: "Backend Daemon" (Daemon Port), "Appearance" (Language) and
+       * the Save Settings / Reset Defaults buttons were removed — none of
+       * these four controls had an onChange/onClick handler, so editing or
+       * clicking them silently did nothing and reset on next visit (a
+       * "looks saved but wasn't" trap). Only the AI Model Service section
+       * above is wired to real state/persistence; hidden until these get
+       * real logic rather than shipping dead controls.
+       */}
     </div>
   )
 }

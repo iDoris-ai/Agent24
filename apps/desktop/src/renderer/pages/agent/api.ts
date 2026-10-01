@@ -36,16 +36,37 @@ export interface ScheduleAction {
   model_override?: string | null
 }
 
+export interface ScheduleOwner {
+  module: string
+  key: string
+}
+
+/** Which layer is holding a schedule from firing, or `null` when
+ *  `effective_enabled` is true (ME4-S1-scheduler-callback §8.1). */
+export type DisabledBy = 'module' | 'user' | 'system' | null
+
 export interface Schedule {
   id: string
   name: string
   enabled: boolean
   spec: ScheduleSpec
-  action: ScheduleAction
+  // `null` exactly when `owner` is non-null: module rows carry no AgentRun
+  // action (design §8.1). Older daemons never send `owner`, so this stays a
+  // real `ScheduleAction` for them.
+  action: ScheduleAction | null
   delivery: unknown[]
   last_run_at: string | null
   next_run_at: string | null
   consecutive_failures: number
+  // The next five fields are new in daemon protocol v3 (ME4-1.2.2). They are
+  // optional here — not because the current daemon omits them, but so this
+  // desktop build keeps working against an older daemon that predates them
+  // (design §13 1.2.2d: "?? enabled" / "?? fire_id" forward compat).
+  owner?: ScheduleOwner | null
+  user_suspended?: boolean
+  system_disabled_reason?: string | null
+  effective_enabled?: boolean
+  disabled_by?: DisabledBy
 }
 
 export interface Approval {
@@ -134,13 +155,17 @@ export const updateSchedule = async (
   return res.data as Schedule
 }
 
+// Module rows get `202 {"fire_id": "fire_…"}` instead of `{"run_id"}` (design
+// §4.7/§8.2). The caller tells them apart by the `fire_` prefix (design
+// §8.2's exact contract) to pick the right notice text.
 export const runScheduleNow = async (id: string): Promise<string> => {
   const res = await window.agent24.backendProxy({
     method: 'POST',
     path: `/api/v1/schedules/${id}/run_now`,
   })
   if (!res.ok) throw new Error(errorMessage(res))
-  return (res.data as { run_id: string }).run_id
+  const data = res.data as { run_id?: string; fire_id?: string }
+  return data.run_id ?? data.fire_id ?? ''
 }
 
 export const listPendingApprovals = (): Promise<Approval[]> =>
@@ -160,4 +185,53 @@ export const decideApproval = async (id: string, decision: Decision): Promise<vo
   })
   // 409 (already resolved) is not fatal — a concurrent resolution won
   if (!res.ok && res.status !== 409) throw new Error(errorMessage(res))
+}
+
+// ── FU-90: domain-OS modules (`GET`/`PATCH /api/v1/os`) ─────────────────────
+// These are kernel-mounted out-of-process modules (e.g. Sin90) — a different
+// thing from the npm community modules ModulesManager.tsx otherwise manages.
+// Mirrors agent24-protocol's DomainOsView/DomainOsList (rust/crates/agent24-protocol/src/types.rs).
+
+/** One domain OS, as `GET /api/v1/os` sees it. */
+export interface DomainOsView {
+  name: string
+  namespace: string
+  version: string
+  /** What os.json says right now. */
+  enabled: boolean
+  /** What the running daemon is doing with it — open enum: mounted | disabled | degraded | refused. */
+  state: string
+  detail?: string | null
+  /** Kernel capabilities the module actually got. */
+  granted: string[]
+  /** Declared models the daemon could not find. */
+  missing_models: string[]
+  /** Open enum: ok | missing | unknown | not_checked. */
+  resources: string
+  /** The config says something the running daemon has not applied yet. */
+  restart_required: boolean
+}
+
+export interface DomainOsList {
+  modules: DomainOsView[]
+  /** A problem with the registry itself, not with any one module. */
+  registry_error?: string | null
+}
+
+export const listOsModules = async (): Promise<DomainOsList> => {
+  const res = await window.agent24.backendProxy({ method: 'GET', path: '/api/v1/os' })
+  if (!res.ok) throw new Error(errorMessage(res))
+  return res.data as DomainOsList
+}
+
+// PATCH returns the whole refreshed list (server.rs `patch_os`), not just the
+// one module, so the caller sees the new `restart_required` state too.
+export const setOsModuleEnabled = async (name: string, enabled: boolean): Promise<DomainOsList> => {
+  const res = await window.agent24.backendProxy({
+    method: 'PATCH',
+    path: `/api/v1/os/${encodeURIComponent(name)}`,
+    body: { enabled },
+  })
+  if (!res.ok) throw new Error(errorMessage(res))
+  return res.data as DomainOsList
 }

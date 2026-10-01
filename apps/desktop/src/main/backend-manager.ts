@@ -8,6 +8,7 @@
 // proxy layer, so the renderer never cares which backend is running.
 
 import { fork, spawn, type ChildProcess } from 'node:child_process'
+import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
 import readline from 'node:readline'
@@ -83,6 +84,64 @@ function resolveRustBinary(): string {
   return path.join(process.resourcesPath, 'backend', exe)
 }
 
+// ── DEP-A5: reuse an already-running `agent24 daemon start` instead of always
+// spawning a second one (that second one would fail: non-ephemeral agent24d
+// holds a lifetime singleton lock — see `server.rs`'s `try_acquire_singleton`
+// — so the CLI-then-desktop ordering used to leave the desktop app stuck in a
+// spawn/health-fail/respawn loop, and desktop-then-CLI made `daemon start`
+// fail outright). ────────────────────────────────────────────────────────
+
+/** What `readExternalDaemonState` recovers from the daemon's discovery file. */
+export interface ExternalDaemonState {
+  port: number
+  token: string
+  pid: number
+}
+
+/** Mirrors `agent24_protocol::state_file::state_path()` (Rust):
+ * `$HOME/.agent24/daemon.json`. Reads `HOME` directly (not `os.homedir()`) so
+ * this stays in lockstep with where the daemon itself looks, and so tests can
+ * point it at an isolated HOME without touching the real one. */
+function daemonStatePath(): string | null {
+  const home = process.env['HOME']
+  if (!home) return null
+  return path.join(home, '.agent24', 'daemon.json')
+}
+
+/** Read + parse `daemon.json`. Absent, unreadable, or malformed all mean the
+ * same thing here — "nothing to reuse" — never a hard error; the caller falls
+ * back to spawning its own daemon exactly as before this file's dep on it. */
+export function readExternalDaemonState(): ExternalDaemonState | null {
+  const statePath = daemonStatePath()
+  if (!statePath) return null
+  try {
+    const raw = fs.readFileSync(statePath, 'utf8')
+    const parsed = JSON.parse(raw) as { port?: unknown; token?: unknown; pid?: unknown }
+    if (typeof parsed.port !== 'number' || typeof parsed.pid !== 'number') return null
+    const token = typeof parsed.token === 'string' ? parsed.token : ''
+    return { port: parsed.port, token, pid: parsed.pid }
+  } catch {
+    return null
+  }
+}
+
+/** Discovery + health-probing, factored out so tests can inject both without
+ * touching the real filesystem or making a real HTTP call. */
+export interface ExternalDaemonSource {
+  read(): ExternalDaemonState | null
+  checkHealth(endpoint: BackendEndpoint | null): Promise<boolean>
+}
+
+/** Constructor-injectable seams. Both default to the real implementations —
+ * only tests pass overrides. */
+export interface BackendManagerDeps {
+  external?: ExternalDaemonSource
+  /** Spawns/forks the backend child process. Defaulted to the real
+   * spawn/fork call below; tests inject a fake so `spawnChild()` never
+   * touches a real binary. */
+  spawnProcess?: (kind: BackendKind) => ChildProcess
+}
+
 function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
   if (!endpoint) return Promise.resolve(false)
   return new Promise((resolve) => {
@@ -106,20 +165,92 @@ function checkHealth(endpoint: BackendEndpoint | null): Promise<boolean> {
   })
 }
 
+function defaultSpawnProcess(kind: BackendKind): ChildProcess {
+  if (kind === 'rust') {
+    const bin = resolveRustBinary()
+    return spawn(bin, ['serve', '--port', '0'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env },
+    })
+  }
+  const entry = resolveNodeEntry()
+  return fork(entry, [], {
+    // piped (not inherited) so the ready line can be scanned
+    silent: true,
+    env: { ...process.env, NODE_ENV: process.env['NODE_ENV'] ?? 'production' },
+  })
+}
+
+const defaultExternalDaemonSource: ExternalDaemonSource = {
+  read: readExternalDaemonState,
+  checkHealth,
+}
+
 export class BackendManager {
   private child: ChildProcess | null = null
   private healthTimer: NodeJS.Timeout | null = null
   private failureCount = 0
   private readonly kind: BackendKind = selectedBackend()
+  private readonly external: ExternalDaemonSource
+  private readonly spawnProcess: (kind: BackendKind) => ChildProcess
   // F1b: last observed health (drives the tray status), and whether the user
   // deliberately stopped the daemon — while true, the health loop must NOT
   // auto-respawn it (that would defeat a manual stop).
   private lastHealthy = false
   private userStopped = false
+  // DEP-A5: true while `currentEndpoint` points at a daemon this manager
+  // discovered (via daemon.json) rather than spawned itself. Gates every
+  // lifecycle action that would otherwise kill a process we don't own.
+  private isExternal = false
+  private externalPid: number | null = null
+  // Reentrancy guard for tick(): setInterval doesn't wait for a previous
+  // callback to resolve before scheduling the next one, and the failure-
+  // threshold branch below now awaits a second health probe (tryReuseExternal)
+  // on top of the one every tick already does — together those can approach
+  // or exceed HEALTH_INTERVAL_MS. Without this guard an overlapping tick()
+  // could double-count failures or spawn a second child while the first
+  // tick is still mid-recovery (PR #602 review).
+  private tickInFlight = false
 
-  start(): void {
-    this.spawnChild()
+  constructor(deps: BackendManagerDeps = {}) {
+    this.external = deps.external ?? defaultExternalDaemonSource
+    this.spawnProcess = deps.spawnProcess ?? defaultSpawnProcess
+  }
+
+  async start(): Promise<void> {
+    const reused = await this.tryReuseExternal()
+    if (!reused) this.spawnChild()
     this.healthTimer = setInterval(() => { void this.tick() }, HEALTH_INTERVAL_MS)
+  }
+
+  /** DEP-A5 step 1: before spawning anything, check whether a daemon started
+   * outside this app (typically `agent24 daemon start`) is already up and
+   * healthy — if so, point at it instead of racing it for the singleton lock. */
+  private async tryReuseExternal(): Promise<boolean> {
+    const state = this.external.read()
+    if (!state) return false
+    const endpoint: BackendEndpoint = { port: state.port, token: state.token }
+    const healthy = await this.external.checkHealth(endpoint)
+    if (!healthy) return false
+    this.isExternal = true
+    this.externalPid = state.pid
+    currentEndpoint = endpoint
+    this.lastHealthy = true
+    console.log(
+      `[backend:${this.kind}] reusing external daemon (pid ${state.pid}, port ${state.port}) — not spawning our own`,
+    )
+    return true
+  }
+
+  /** True while the current endpoint is a daemon this manager discovered
+   * rather than spawned (surfaced by the tray so the UI can say so). */
+  isExternalDaemon(): boolean {
+    return this.isExternal
+  }
+
+  /** pid of the reused external daemon, for tray labels; null when not external. */
+  externalDaemonPid(): number | null {
+    return this.externalPid
   }
 
   /** Current lifecycle status for the tray (F1b). */
@@ -140,43 +271,57 @@ export class BackendManager {
   startDaemon(): void {
     this.userStopped = false
     this.failureCount = 0
-    if (!this.child) this.spawnChild()
+    if (!this.child && !this.isExternal) this.spawnChild()
   }
 
-  /** Tray "停止 daemon": kill the child and keep it down (no auto-respawn). */
+  /** Tray "停止 daemon": for a daemon this manager spawned, kill the child and
+   * keep it down (no auto-respawn) — unchanged from before DEP-A5.
+   * For a reused *external* daemon (DEP-A5 requirement #2), "stop" must never
+   * kill it — it belongs to `agent24 daemon start` (or another owner), not to
+   * this app. Instead this only forgets the connection: `userStopped` still
+   * pins the tray to "stopped" and suspends the health loop, exactly as a
+   * real stop would, but the external process itself is left untouched. */
   stopDaemon(): void {
     this.userStopped = true
     this.lastHealthy = false
+    if (this.isExternal) {
+      this.disconnectExternal()
+      return
+    }
     this.killChild()
   }
 
-  /** Tray "重启 daemon": kill + respawn regardless of prior state. */
+  /** Tray "重启 daemon": for a spawned child, kill + respawn as before.
+   * For a reused external daemon, killing it is off the table for the same
+   * reason as stopDaemon() above — "restart" here means "stop reusing it and
+   * bring up a desktop-managed one instead". */
   restart(): void {
     this.userStopped = false
     this.failureCount = 0
     this.lastHealthy = false
-    this.killChild()
+    if (this.isExternal) {
+      this.disconnectExternal()
+    } else {
+      this.killChild()
+    }
     this.spawnChild()
+  }
+
+  /** Forget a reused external daemon without touching the process itself. */
+  private disconnectExternal(): void {
+    this.isExternal = false
+    this.externalPid = null
+    currentEndpoint = null
   }
 
   private spawnChild(): void {
     currentEndpoint = null
+    // Any spawn (initial, respawn-after-failure, or an explicit restart)
+    // always produces a desktop-owned child — never external past this point.
+    this.isExternal = false
+    this.externalPid = null
 
-    if (this.kind === 'rust') {
-      const bin = resolveRustBinary()
-      this.child = spawn(bin, ['serve', '--port', '0'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env },
-      })
-    } else {
-      const entry = resolveNodeEntry()
-      this.child = fork(entry, [], {
-        // piped (not inherited) so the ready line can be scanned
-        silent: true,
-        env: { ...process.env, NODE_ENV: process.env['NODE_ENV'] ?? 'production' },
-      })
-    }
-
+    this.child = this.spawnProcess(this.kind)
     this.wireChild(this.child)
     console.log(`[backend:${this.kind}] spawned pid`, this.child.pid)
   }
@@ -232,28 +377,68 @@ export class BackendManager {
   }
 
   private async tick(): Promise<void> {
-    // A deliberate stop suspends supervision entirely — don't probe, don't
-    // count failures, and above all don't auto-respawn (F1b).
-    if (this.userStopped) {
-      this.lastHealthy = false
-      return
-    }
+    // Guard against overlapping invocations (see `tickInFlight` field doc):
+    // skip this fire entirely rather than run a second tick concurrently
+    // with one still in flight.
+    if (this.tickInFlight) return
+    this.tickInFlight = true
+    try {
+      // A deliberate stop suspends supervision entirely — don't probe, don't
+      // count failures, and above all don't auto-respawn (F1b).
+      if (this.userStopped) {
+        this.lastHealthy = false
+        return
+      }
 
-    const alive = await checkHealth(currentEndpoint)
-    this.lastHealthy = alive
-    if (alive) {
-      this.failureCount = 0
-      return
-    }
+      const alive = await this.external.checkHealth(currentEndpoint)
+      this.lastHealthy = alive
+      if (alive) {
+        this.failureCount = 0
+        return
+      }
 
-    this.failureCount += 1
-    console.warn(`[backend:${this.kind}] health check failed (${this.failureCount}/${MAX_HEALTH_FAILURES})`)
+      this.failureCount += 1
+      console.warn(`[backend:${this.kind}] health check failed (${this.failureCount}/${MAX_HEALTH_FAILURES})`)
 
-    if (this.failureCount >= MAX_HEALTH_FAILURES) {
-      console.warn(`[backend:${this.kind}] restarting after consecutive failures`)
-      this.killChild()
-      this.failureCount = 0
-      this.spawnChild()
+      if (this.failureCount >= MAX_HEALTH_FAILURES) {
+        // DEP-A5 decision — what happens when a *reused external* daemon dies:
+        // chose "re-detect, then fall back to spawning our own" over "prompt the
+        // user". Rationale: this branch already exists (it's the same
+        // failure-threshold respawn path used for a daemon we spawned
+        // ourselves), so reusing it for the external case is the smallest
+        // change — no new state machine, no new UI surface for a blocking
+        // prompt from a background timer tick. The cost is a silent handoff:
+        // the user isn't told their external daemon died. That's judged
+        // acceptable because the tray's status/tooltip (main.ts's
+        // refreshTray()) already flips from "运行中（外部）" to a plain
+        // spawned-daemon state within one health-poll interval, so the demotion
+        // is visible on next glance, just not interrupt-driven.
+        if (this.isExternal) {
+          console.warn(
+            `[backend:${this.kind}] external daemon (pid ${this.externalPid ?? '?'}) stopped responding — ` +
+            'falling back to a self-managed daemon',
+          )
+        }
+        console.warn(`[backend:${this.kind}] restarting after consecutive failures`)
+        this.killChild()
+        this.failureCount = 0
+        // PR #602 review (Medium): re-probe for an external daemon before
+        // respawning our own. A near-simultaneous CLI + desktop startup can
+        // make the very first tryReuseExternal() (in start()) miss a
+        // daemon.json that simply hadn't been written yet — this manager
+        // then spawns its own child, which loses the Rust singleton lock and
+        // never binds a port, so it never reports healthy either. Without
+        // this re-check, that self-spawned child would just get killed and
+        // re-spawned forever every MAX_HEALTH_FAILURES ticks, even once the
+        // real (CLI-owned) daemon is up and healthy. Only fall back to
+        // spawning our own when the external daemon is still not reachable.
+        const reused = await this.tryReuseExternal()
+        if (!reused) {
+          this.spawnChild()
+        }
+      }
+    } finally {
+      this.tickInFlight = false
     }
   }
 
@@ -275,6 +460,12 @@ export class BackendManager {
     if (this.healthTimer) {
       clearInterval(this.healthTimer)
       this.healthTimer = null
+    }
+    // App exit must never kill a daemon this manager didn't spawn (DEP-A5
+    // requirement #2) — just stop watching it and let it keep running.
+    if (this.isExternal) {
+      this.disconnectExternal()
+      return
     }
     this.killChild()
   }
