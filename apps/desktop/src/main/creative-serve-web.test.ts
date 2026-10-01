@@ -10,6 +10,7 @@ import {
   CreativeViewRequestFence,
   canonicalCreativeOrigin,
   classifyCreativeUrl,
+  creativeChildEnvironment,
   resolveOpenDesignCheckout,
 } from './creative-serve-web'
 
@@ -115,13 +116,53 @@ describe('CreativeServeWeb', () => {
     expect(resolveOpenDesignCheckout('/unused', { A24_OPEN_DESIGN_DIR: explicit }, resources)).toBe(explicit)
   })
 
+  it('removes Agent24 host variables from the Creative child environment', () => {
+    const childEnv = creativeChildEnvironment({
+      PATH: '/usr/bin',
+      OPENAI_API_KEY: 'provider-secret',
+      A24_HANDSHAKE_TOKEN: 'host-secret',
+      a24_host_bootstrap: 'also-secret',
+    })
+    expect(childEnv).toEqual({
+      PATH: '/usr/bin',
+      OPENAI_API_KEY: 'provider-secret',
+    })
+    expect(Object.getPrototypeOf(childEnv)).toBeNull()
+  })
+
+  it('does not reintroduce inherited A24 variables when spawn enumerates the env', () => {
+    Object.defineProperty(Object.prototype, 'a24_polluted_host_secret', {
+      configurable: true,
+      enumerable: true,
+      value: 'leaked-if-enumerated',
+      writable: true,
+    })
+    try {
+      const childEnv = creativeChildEnvironment({ PATH: '/usr/bin' })
+      const enumerated = [] as string[]
+      for (const key in childEnv) enumerated.push(key)
+      expect(enumerated).toEqual(['PATH'])
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).a24_polluted_host_secret
+    }
+  })
+
   it('launches serve-web, waits for /api/ready, and stops with SIGTERM', async () => {
     const root = checkout()
     const child = new FakeChild()
     const spawnFn = vi.fn(() => child as unknown as ChildProcess)
     const fetchFn = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }))
     const service = new CreativeServeWeb(
-      { checkoutDir: root, port: 17456, readyTimeoutMs: 500 },
+      {
+        checkoutDir: root,
+        environment: {
+          PATH: '/usr/bin',
+          OPENAI_API_KEY: 'provider-secret',
+          A24_HANDSHAKE_TOKEN: 'host-secret',
+        },
+        port: 17456,
+        readyTimeoutMs: 500,
+      },
       spawnFn as never,
       fetchFn,
     )
@@ -133,7 +174,13 @@ describe('CreativeServeWeb', () => {
     expect(spawnFn).toHaveBeenCalledWith(
       'node',
       expect.arrayContaining(['daemon', 'start', '--serve-web', '--no-open', '--port', '17456']),
-      expect.objectContaining({ cwd: root }),
+      expect.objectContaining({
+        cwd: root,
+        env: {
+          PATH: '/usr/bin',
+          OPENAI_API_KEY: 'provider-secret',
+        },
+      }),
     )
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:17456/api/ready')
 
