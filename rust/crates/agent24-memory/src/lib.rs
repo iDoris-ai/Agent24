@@ -19,6 +19,7 @@ pub mod reconcile;
 pub mod replay;
 pub mod retriever;
 pub mod session;
+pub mod session_log;
 pub mod trace;
 pub mod vector;
 pub mod writer;
@@ -339,6 +340,11 @@ impl KvStore {
     /// cross-store transaction seam is MD-2b work.)
     pub fn events(&self) -> event::EventLog {
         event::EventLog::new(self.pool.clone())
+    }
+
+    /// A session event-log writer over this store's database.
+    pub fn session_log(&self) -> session_log::SessionLog {
+        session_log::SessionLog::new(self.pool.clone())
     }
 
     /// An [`artifact::ArtifactCas`] over the SAME database file — MD-2b's
@@ -2083,5 +2089,233 @@ mod tests {
             (0, 0),
             "a refused rekey must not create a usage row for the never-realized new owner"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_log_tests {
+    use super::*;
+    use agent24_models::Msg;
+    use event::{EventQuery, EventStore, MemEvent, Origin, Scope, Trust};
+    use session::CanonicalSession;
+    use session_log::ImportOutcome;
+
+    fn origin(trust: Trust) -> Origin {
+        Origin {
+            source: "test".into(),
+            trust,
+        }
+    }
+    fn assistant(s: &str) -> Msg {
+        Msg::assistant(Some(s.into()), vec![])
+    }
+    async fn events(kv: &KvStore, owner: &str, sid: &str) -> Result<Vec<event::StoredEvent>> {
+        kv.events()
+            .scan(&EventQuery::owner(owner).session(sid))
+            .await
+    }
+    async fn turn(log: &session_log::SessionLog, sid: &str, u: &str, a: &str) -> Result<()> {
+        append(log, "o", sid, u, a).await?;
+        Ok(())
+    }
+    async fn append(
+        log: &session_log::SessionLog,
+        o: &str,
+        s: &str,
+        u: &str,
+        a: &str,
+    ) -> Result<session_log::TurnIds> {
+        log.append_turn(
+            o,
+            s,
+            &Msg::user(u),
+            origin(Trust::UserSaid),
+            &assistant(a),
+            origin(Trust::Model),
+        )
+        .await
+    }
+    async fn quota(kv: &KvStore, owner: &str, rows: i64) -> Result<()> {
+        sqlx::query("INSERT INTO mem_owner_quota(owner,max_rows,max_bytes) VALUES(?,?,268435456)")
+            .bind(owner)
+            .bind(rows)
+            .execute(&kv.pool)
+            .await?;
+        Ok(())
+    }
+    fn turn_id(o: &str, s: &str, n: usize, role: &str) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(o, s, n, role))?)
+        ))
+    }
+    fn contents(view: &session_log::SessionView) -> Vec<&str> {
+        view.tail
+            .iter()
+            .map(|(_, m)| m.content.as_deref().unwrap_or("<missing>"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn turn_is_atomic_idempotent_and_conflict_checked() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let (o, s) = ("owner", "s");
+        let a = assistant("answer");
+        let occupied = MemEvent::new(
+            turn_id(o, s, 0, "assistant")?,
+            Scope::owner(o).with_session(s),
+            "message",
+            serde_json::to_value(&a)?,
+            origin(Trust::Model),
+        );
+        kv.events().append(&occupied).await?;
+        let log = kv.session_log();
+        assert!(append(&log, o, s, "question", "answer").await.is_err());
+        assert!(
+            events(&kv, o, s)
+                .await?
+                .iter()
+                .all(|e| e.event.body["role"] != "user")
+        );
+        sqlx::query("DELETE FROM mem_events WHERE id=?")
+            .bind(&occupied.id)
+            .execute(&kv.pool)
+            .await?;
+        let first = append(&log, o, s, "question", "answer").await?;
+        let retry = append(&log, o, s, "question", "answer").await?;
+        assert_eq!((first.user, first.assistant), (retry.user, retry.assistant));
+        assert_eq!(events(&kv, o, s).await?.len(), 2);
+        assert!(append(&log, o, s, "question", "changed").await.is_err());
+        let different_source = log
+            .append_turn(
+                o,
+                s,
+                &Msg::user("question"),
+                Origin {
+                    source: "another-source".into(),
+                    trust: Trust::UserSaid,
+                },
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        assert!(
+            different_source.is_err(),
+            "same IDs with different provenance must conflict"
+        );
+        append(
+            &log,
+            "other-owner",
+            s,
+            "separate question",
+            "separate answer",
+        )
+        .await?;
+        assert_eq!(events(&kv, "other-owner", s).await?.len(), 2);
+        assert_eq!(
+            contents(&log.load_view(o, s).await?),
+            ["question", "answer"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quota_zero_and_one_roll_back_turn() -> Result<()> {
+        for rows in [0, 1] {
+            let kv = KvStore::open_memory().await?;
+            quota(&kv, "q", rows).await?;
+            assert!(append(&kv.session_log(), "q", "s", "u", "a").await.is_err());
+            assert!(events(&kv, "q", "s").await?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_is_atomic_marked_idempotent_and_replayable() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let mut old = CanonicalSession::new("legacy");
+        old.summary = Some("older context".into());
+        old.recent = vec![Msg::user("old question"), assistant("old answer")];
+        let log = kv.session_log();
+        assert!(matches!(
+            log.import_legacy("o", &old).await?,
+            ImportOutcome::Imported { events: 4 }
+        ));
+        assert!(matches!(
+            log.import_legacy("o", &old).await?,
+            ImportOutcome::AlreadyImported
+        ));
+        let stored = events(&kv, "o", "legacy").await?;
+        assert_eq!(stored.len(), 4);
+        assert_eq!(stored[0].event.kind, "session.summary");
+        assert_eq!(stored[0].event.body["covered_through_seq"], 0);
+        assert_eq!(stored[1].event.origin.source, "migration");
+        assert_eq!(stored[3].event.kind, "session.imported");
+        assert_eq!(
+            stored[3].event.body,
+            serde_json::json!({"from":"kv","messages":2,"had_summary":true})
+        );
+        let replay = replay::replayed_from_events(&stored)?;
+        assert_eq!(replay.messages, old.recent);
+        assert_eq!(
+            replay
+                .provenance
+                .iter()
+                .map(|p| p.trust)
+                .collect::<Vec<_>>(),
+            [Trust::UserSaid, Trust::Model]
+        );
+        assert!(matches!(
+            log.import_legacy("o", &CanonicalSession::new("empty"))
+                .await?,
+            ImportOutcome::NothingToImport
+        ));
+        let failed = KvStore::open_memory().await?;
+        quota(&failed, "q", 1).await?;
+        assert!(failed.session_log().import_legacy("q", &old).await.is_err());
+        assert!(events(&failed, "q", "legacy").await?.is_empty());
+
+        let next = append(&log, "o", "legacy", "new question", "new answer").await?;
+        assert_eq!(
+            next,
+            append(&log, "o", "legacy", "new question", "new answer").await?
+        );
+        assert_eq!(
+            contents(&log.load_view("o", "legacy").await?),
+            ["old question", "old answer", "new question", "new answer"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn summaries_follow_session_message_sequences() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        turn(&log, "s", "one", "two").await?;
+        turn(&log, "other", "interleave", "x").await?;
+        turn(&log, "s", "three", "four").await?;
+        let first_summary_seq = log.append_summary("o", "s", "summary one", 2).await?;
+        assert!(
+            events(&kv, "o", "s").await?.iter().any(
+                |event| event.seq == first_summary_seq && event.event.kind == "session.summary"
+            )
+        );
+        assert_eq!(contents(&log.load_view("o", "s").await?), ["three", "four"]);
+        turn(&log, "other", "interleave two", "y").await?;
+        turn(&log, "s", "five", "six").await?;
+        let second_summary_seq = log.append_summary("o", "s", "summary two", 6).await?;
+        assert!(
+            events(&kv, "o", "s")
+                .await?
+                .iter()
+                .any(|event| event.seq == second_summary_seq
+                    && event.event.kind == "session.summary")
+        );
+        let view = log.load_view("o", "s").await?;
+        assert_eq!(view.summary.as_deref(), Some("summary two"));
+        assert_eq!(view.covered_through_seq, 6);
+        assert_eq!(contents(&view), ["five", "six"]);
+        Ok(())
     }
 }
