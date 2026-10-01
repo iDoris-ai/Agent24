@@ -19,6 +19,8 @@ mod first_launch_ingress;
 #[allow(dead_code)]
 mod generation_driver;
 #[allow(dead_code)]
+mod generation_harness;
+#[allow(dead_code)]
 mod host_ports;
 #[allow(dead_code)]
 mod launch;
