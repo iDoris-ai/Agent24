@@ -38,6 +38,11 @@ export type Agent24V1WebSocketEventProtocol = {
       [k: string]: unknown;
     }
   | {
+      payload: MemoryWriteFailedPayload;
+      type: "memory.write_failed";
+      [k: string]: unknown;
+    }
+  | {
       payload: RunFailedPayload;
       type: "run.failed";
       [k: string]: unknown;
@@ -201,6 +206,14 @@ export interface Usage {
   cost_usd?: number;
   prompt_tokens: number;
   total_tokens: number;
+  [k: string]: unknown;
+}
+/**
+ * The answer completed, but its session exchange could not be recorded.
+ */
+export interface MemoryWriteFailedPayload {
+  reason: string;
+  session_id: string;
   [k: string]: unknown;
 }
 export interface RunFailedPayload {

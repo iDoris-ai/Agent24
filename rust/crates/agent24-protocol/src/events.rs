@@ -48,6 +48,8 @@ pub enum EventBody {
     ModelCall(ModelCallPayload),
     #[serde(rename = "run.completed")]
     RunCompleted(RunCompletedPayload),
+    #[serde(rename = "memory.write_failed")]
+    MemoryWriteFailed(MemoryWriteFailedPayload),
     #[serde(rename = "run.failed")]
     RunFailed(RunFailedPayload),
     #[serde(rename = "run.cancelled")]
@@ -116,6 +118,7 @@ impl EventBody {
             EventBody::ModelCall(_) => "model.call",
             EventBody::RunCompleted(_) => "run.completed",
             EventBody::RunFailed(_) => "run.failed",
+            EventBody::MemoryWriteFailed(_) => "memory.write_failed",
             EventBody::RunCancelled(_) => "run.cancelled",
             EventBody::ToolStarted(_) => "tool.started",
             EventBody::ToolCompleted(_) => "tool.completed",
@@ -204,6 +207,13 @@ pub struct RunCompletedPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunOutputPayload {
     pub text: String,
+}
+
+/// The answer completed, but its session exchange could not be recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryWriteFailedPayload {
+    pub session_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
