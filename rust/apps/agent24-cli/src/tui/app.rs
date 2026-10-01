@@ -289,6 +289,8 @@ impl App {
             // runs), so — same as `ScheduleDelivered` above — there is
             // nothing to key a log line on in this generic CLI TUI.
             EventBody::ModelCall(_) => {}
+            // Session-scoped memory failures have no run id for this run log.
+            EventBody::MemoryWriteFailed(_) => {}
         }
     }
 

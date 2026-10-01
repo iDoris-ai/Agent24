@@ -23,6 +23,7 @@ tracing = "0.1"
 [dev-dependencies]
 agent24-policy = { path = "../agent24-policy" }
 tempfile = "3"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]

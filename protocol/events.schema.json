@@ -89,6 +89,22 @@
       "type": "object",
       "properties": {
         "payload": {
+          "$ref": "#/$defs/MemoryWriteFailedPayload"
+        },
+        "type": {
+          "type": "string",
+          "const": "memory.write_failed"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
           "$ref": "#/$defs/RunFailedPayload"
         },
         "type": {
@@ -467,6 +483,22 @@
       "required": [
         "code",
         "message"
+      ]
+    },
+    "MemoryWriteFailedPayload": {
+      "description": "The answer completed, but its session exchange could not be recorded.",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "reason"
       ]
     },
     "ModelCallPayload": {

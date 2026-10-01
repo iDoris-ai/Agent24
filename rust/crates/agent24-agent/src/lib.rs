@@ -14,7 +14,9 @@
 
 pub mod resume;
 pub mod self_wake;
+mod session_memory;
 pub mod subagent;
+pub use session_memory::SessionMemory;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,8 +24,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use agent24_core::util::{now_iso8601, ulid};
-use agent24_memory::KvStore;
-use agent24_memory::session::{CanonicalSession, CompactionPolicy, Summarizer};
+use agent24_memory::session::Summarizer;
 use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
 use agent24_protocol::{
@@ -72,31 +73,6 @@ pub trait EventSink: Send + Sync + 'static {
     fn emit(&self, body: EventBody);
 }
 
-/// Per-session conversation memory (D1 made live): a KV-backed
-/// [`CanonicalSession`] plus the summarizer that compacts it.
-///
-/// Without this a run starts from the bare prompt, so a "session" carries no
-/// conversation memory at all. With it, each run in a session is preceded by the
-/// session's context, and the exchange is appended back — with threshold
-/// compaction keeping an unbounded conversation a bounded prompt.
-pub struct SessionMemory {
-    kv: KvStore,
-    summarizer: Arc<dyn Summarizer>,
-    policy: CompactionPolicy,
-    /// Per-session write locks. D1 requires a single writer per session, but
-    /// runs execute concurrently (schedules fire them in background tasks), so
-    /// `load → append → save` MUST be serialized per session or a later save
-    /// silently clobbers an earlier run's turn (review D5b).
-    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-}
-
-/// Absolute ceiling on the verbatim tail, as a multiple of `max_recent`. If
-/// compaction keeps failing (e.g. the summarizer's provider is down) the tail
-/// would otherwise grow forever and blow the context window; past this the
-/// OLDEST messages are dropped. Trimming rather than refusing to record keeps
-/// the session live, so a recovered summarizer can compact it again.
-const RECENT_HARD_CEILING_FACTOR: usize = 4;
-
 /// Ceiling on the post-completion memory write. Ordering demands it happen
 /// before `run.completed`, so it must be bounded — a stuck summarizer must never
 /// hang a finished run.
@@ -107,34 +83,6 @@ const MEMORY_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// has likely moved on — so `assess_restore` aborts it. Generous: an overnight
 /// scheduled run must still be answerable the next morning.
 pub const RESUME_TTL: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
-
-impl SessionMemory {
-    pub fn new(kv: KvStore, summarizer: Arc<dyn Summarizer>) -> Self {
-        Self {
-            kv,
-            summarizer,
-            policy: CompactionPolicy::default(),
-            locks: Mutex::new(HashMap::new()),
-        }
-    }
-
-    #[must_use]
-    pub fn with_policy(mut self, policy: CompactionPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    /// The per-session write lock, created on first use. Unreferenced entries
-    /// are swept so the map can't grow without bound; sweeping only removes
-    /// locks nobody holds (`strong_count == 1`), so mutual exclusion is safe.
-    async fn session_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
-        let mut locks = self.locks.lock().await;
-        if locks.len() > 1024 {
-            locks.retain(|_, l| Arc::strong_count(l) > 1);
-        }
-        Arc::clone(locks.entry(session_id.to_owned()).or_default())
-    }
-}
 
 /// A [`Summarizer`] backed by the model router.
 ///
@@ -149,9 +97,9 @@ pub struct RouterSummarizer {
     shutdown: CancellationToken,
 }
 
-/// Per-message budget in the summarization transcript. Generous, because
-/// whatever the summarizer doesn't SEE is dropped for good once the fold
-/// commits; elision is marked so the summarizer knows content was cut.
+/// Per-message budget in the summarization transcript. Elision is marked
+/// so the summarizer knows content was cut. Full originals
+/// remain in the session event log.
 const SUMMARY_MSG_MAX_CHARS: usize = 8000;
 /// Whole-transcript budget, so a huge fold can't build an unbounded prompt.
 const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 32_000;
@@ -175,8 +123,7 @@ impl Summarizer for RouterSummarizer {
             if content.is_empty() {
                 continue;
             }
-            // Mark elision explicitly: anything the summarizer can't see is lost
-            // once the fold commits, so it must at least know it was cut.
+            // Mark elision explicitly; originals remain in the event log.
             let (body, elided) = if content.chars().count() > SUMMARY_MSG_MAX_CHARS {
                 let kept: String = content.chars().take(SUMMARY_MSG_MAX_CHARS).collect();
                 (kept, true)
@@ -362,20 +309,13 @@ impl RunManager {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
             return Some(Vec::new());
         };
-        // Take the same per-session lock as the writer so a read can never
-        // observe a half-written session (a concurrent run's load→append→save).
-        let load = async {
-            let lock = memory.session_lock(sid).await;
-            let _guard = lock.lock().await;
-            CanonicalSession::load(&memory.kv, sid).await
-        };
+        let load = memory.context(sid);
         let loaded = tokio::select! {
             result = load => result,
             () = cancel.cancelled() => return None,
         };
         match loaded {
-            Ok(Some(session)) => Some(session.context()),
-            Ok(None) => Some(Vec::new()),
+            Ok(context) => Some(context),
             Err(err) => {
                 tracing::warn!("session {sid} memory load failed: {err}");
                 Some(Vec::new())
@@ -383,81 +323,21 @@ impl RunManager {
         }
     }
 
-    /// Append this exchange to the session and persist it. Best-effort — an
-    /// already-successful run must never fail because memory did.
-    ///
-    /// Note the save happens even when compaction errors: `append` deliberately
-    /// leaves the message in `recent` on summarizer failure (D1's no-loss
-    /// guarantee), so persisting keeps the turn and lets the next append retry
-    /// the fold. Skipping the save is what would lose it.
+    /// Commit the original exchange before best-effort compaction. Memory
+    /// failures are observable but never fail an already-answered run.
     async fn remember_exchange(&self, session_id: Option<&str>, prompt: &str, answer: &str) {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
             return;
         };
-        // Serialize the read-modify-write per session: concurrent runs in the
-        // same session would otherwise both load the old state and the later
-        // save would drop the earlier run's turn (review D5b).
-        let lock = memory.session_lock(sid).await;
-        let _guard = lock.lock().await;
-
-        let mut session = match CanonicalSession::load(&memory.kv, sid).await {
-            Ok(Some(session)) => session,
-            Ok(None) => CanonicalSession::new(sid),
-            Err(err) => {
-                tracing::warn!("session {sid} memory load failed, not persisting turn: {err}");
-                return;
-            }
-        };
-        // ALWAYS append — `append` is also where compaction is retried, so
-        // returning early here would freeze a session forever once it grew
-        // (it could never compact again, even after the summarizer recovered).
-        for msg in [
-            Msg::user(prompt.to_owned()),
-            Msg::assistant(Some(answer.to_owned()), vec![]),
-        ] {
-            if let Err(err) = session
-                .append(msg, memory.policy, memory.summarizer.as_ref())
-                .await
-            {
-                // Compaction failed; the message is still in `recent` (D1's
-                // no-loss guarantee), so saving keeps the turn and the next
-                // append retries the fold.
-                tracing::warn!("session {sid} compaction failed (turn kept verbatim): {err}");
-            }
-        }
-        // Boundedness backstop: with compaction persistently failing the tail
-        // would grow every run and be fed back in full. Trim the OLDEST verbatim
-        // messages back to the policy's keep window — losing the oldest history
-        // beats an unusable prompt, and unlike refusing to record it leaves the
-        // session live so a recovered summarizer heals it.
-        // Normalize max_recent the same way CanonicalSession::append does: a
-        // custom max_recent of 0 would make the ceiling 0, which `keep >= 1` can
-        // never satisfy — the "hard" ceiling would be unenforceable.
-        let ceiling = memory
-            .policy
-            .max_recent
-            .max(1)
-            .saturating_mul(RECENT_HARD_CEILING_FACTOR);
-        if session.recent.len() > ceiling {
-            // Clamp against the ceiling: a degenerate custom policy (e.g.
-            // keep_recent > ceiling) would otherwise compute drop_n == 0 and
-            // silently fail to enforce the bound at all.
-            let keep = memory
-                .policy
-                .keep_recent
-                .min(ceiling.saturating_sub(1))
-                .max(1);
-            let drop_n = session.recent.len().saturating_sub(keep);
-            tracing::error!(
-                "session {sid} verbatim tail ({}) exceeded the hard ceiling ({ceiling}); dropping \
-                 the {drop_n} oldest messages — compaction is failing, check the summarizer's \
-                 provider",
-                session.recent.len()
-            );
-            session.recent.drain(0..drop_n);
-        }
-        if let Err(err) = session.save(&memory.kv).await {
-            tracing::warn!("session {sid} memory save failed: {err}");
+        if let Err(err) = memory.remember(sid, prompt, answer).await {
+            let reason = err.to_string();
+            tracing::error!(session_id = sid, %reason, "session memory write failed");
+            self.sink.emit(EventBody::MemoryWriteFailed(
+                agent24_protocol::MemoryWriteFailedPayload {
+                    session_id: sid.to_owned(),
+                    reason,
+                },
+            ));
         }
     }
 
@@ -1065,21 +945,12 @@ impl RunManager {
                 // so it MUST stay cancellable: `cancel works in any non-terminal
                 // state` is the C2 contract, and a 30s uncancellable finalization
                 // would break it (review D5b).
-                let memory_write = tokio::time::timeout(
-                    MEMORY_WRITE_BUDGET,
-                    self.remember_exchange(run.session_id.as_deref(), &run.input.prompt, &text),
-                );
-                let timed_out = tokio::select! {
-                    r = memory_write => r.is_err(),
+                tokio::select! {
+                    () = self.remember_exchange(run.session_id.as_deref(), &run.input.prompt, &text) => {},
                     () = cancel.cancelled() => {
                         self.finish_cancelled(&run_id).await;
                         return;
                     }
-                };
-                if timed_out {
-                    tracing::warn!(
-                        "run {run_id} session memory write exceeded {MEMORY_WRITE_BUDGET:?}; completing without recording the turn"
-                    );
                 }
                 // Re-check: a cancel that landed just as the write finished must
                 // still win rather than be overwritten by Completed.
@@ -1624,7 +1495,15 @@ impl RunManager {
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    mod session_memory_tests {
+        include!("session_memory_tests.rs");
+    }
+    mod session_failure_tests {
+        include!("session_failure_tests.rs");
+    }
+
     use super::*;
+    use agent24_memory::{KvStore, session::CompactionPolicy};
     use agent24_models::router::Tier;
     use agent24_models::{CompletionResponse, ModelProvider, ToolCallRequest};
     use async_trait::async_trait;
@@ -1834,7 +1713,7 @@ pub(crate) mod tests {
             Arc::new(ToolRegistry::new()),
             sink,
             CancellationToken::new(),
-            Some(SessionMemory::new(kv.clone(), summarizer)),
+            Some(SessionMemory::new(kv.clone(), summarizer).with_owner("test-owner".into())),
         );
         (manager, store, kv)
     }
@@ -1913,7 +1792,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn concurrent_runs_in_one_session_keep_both_turns() {
-        // Codex (High): remember_exchange is load→append→save, and runs execute
+        // remember_exchange appends a numbered turn, and runs execute
         // in background tasks. Without a per-session lock two runs finishing
         // together both load the old state and the later save drops the other's
         // turn. Both exchanges must survive.
@@ -1939,33 +1818,27 @@ pub(crate) mod tests {
         for id in &ids {
             wait_terminal(&store, id).await;
         }
-        // The memory write happens just after run.completed, so give the
-        // best-effort persist a moment to land.
-        let mut session = None;
-        for _ in 0..200 {
-            let loaded = CanonicalSession::load(&kv, "sess_race").await.unwrap();
-            if loaded.as_ref().is_some_and(|s| s.recent.len() >= 4) {
-                session = loaded;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let session = session.expect("both turns should have been recorded");
+        // Memory is committed before completion becomes visible.
+        let session = kv
+            .session_log()
+            .load_view("test-owner", "sess_race")
+            .await
+            .unwrap();
         let texts: Vec<&str> = session
-            .recent
+            .tail
             .iter()
-            .filter_map(|m| m.content.as_deref())
+            .filter_map(|(_, m)| m.content.as_deref())
             .collect();
         assert!(texts.contains(&"alpha"), "lost a turn: {texts:?}");
         assert!(texts.contains(&"beta"), "lost a turn: {texts:?}");
-        assert_eq!(session.recent.len(), 4, "{texts:?}");
+        assert_eq!(session.tail.len(), 4, "{texts:?}");
     }
 
     #[tokio::test]
     async fn many_concurrent_writers_on_one_session_lose_nothing() {
         // Codex (low): the two-run test can pass even unlocked if tokio happens
         // to serialize. Drive remember_exchange directly from many tasks at once
-        // — an unlocked load→append→save loses turns here with high probability.
+        // so turn number allocation and append must hold the same lock.
         let provider = Arc::new(RecordingProvider {
             seen: StdMutex::new(vec![]),
         });
@@ -1985,14 +1858,15 @@ pub(crate) mod tests {
             t.await.unwrap();
         }
 
-        let session = CanonicalSession::load(&kv, "sess_many")
+        let session = kv
+            .session_log()
+            .load_view("test-owner", "sess_many")
             .await
-            .unwrap()
-            .expect("session should exist");
+            .unwrap();
         let texts: Vec<&str> = session
-            .recent
+            .tail
             .iter()
-            .filter_map(|m| m.content.as_deref())
+            .filter_map(|(_, m)| m.content.as_deref())
             .collect();
         // Every writer's prompt AND answer must have survived.
         for i in 0..WRITERS {
@@ -2005,7 +1879,7 @@ pub(crate) mod tests {
                 "lost a{i}: {texts:?}"
             );
         }
-        assert_eq!(session.recent.len(), WRITERS * 2, "{texts:?}");
+        assert_eq!(session.tail.len(), WRITERS * 2, "{texts:?}");
     }
 
     /// A summarizer that signals when it is entered and then blocks, so a test
@@ -2064,6 +1938,7 @@ pub(crate) mod tests {
                         entered: Arc::clone(&entered),
                     }),
                 )
+                .with_owner("test-owner".into())
                 .with_policy(policy),
             ),
         );
@@ -2134,6 +2009,7 @@ pub(crate) mod tests {
                         entered: Arc::clone(&entered),
                     }),
                 )
+                .with_owner("test-owner".into())
                 .with_policy(policy),
             ),
         );
