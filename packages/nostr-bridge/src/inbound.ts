@@ -46,10 +46,17 @@ export class InboundBridge {
     private readonly allowedNpubs: ReadonlySet<string>,
   ) {}
 
+  /** Fail-closed authorization check — the single source of truth for "is this
+   * sender allowed to drive a run", shared by `handle()` and `pollOnce`'s
+   * frozen-dispatch log so the two never disagree about who's on the list. */
+  isAllowed(npub: string): boolean {
+    return this.allowedNpubs.has(npub)
+  }
+
   /** Entry point for one inbound message. Authorizes, dedups, then serializes
    * per sender. */
   async handle(msg: InboundMessage): Promise<void> {
-    if (!this.allowedNpubs.has(msg.from)) {
+    if (!this.isAllowed(msg.from)) {
       console.warn(`[nostr] 忽略未授权 agent ${msg.from} 的消息;如需授权加入 A24_NOSTR_ALLOWED_NPUBS`)
       return
     }
@@ -164,14 +171,24 @@ export class InboundBridge {
 const frozenLogged = new Set<string>()
 
 export interface PollOnceOptions {
-  /** COMM-5a: F4b inbound execution is frozen by default (`A24_NOSTR_F4B_INBOUND`
-   * unset in `main.ts`) — a whitelisted message is still polled, deduped and
-   * logged, but is no longer dispatched into `bridge.handle` (and therefore
-   * never reaches `runToCompletion`). Defaults to `true` so direct callers of
-   * `pollOnce` (tests, and any future caller that doesn't opt into the freeze)
-   * keep the pre-freeze dispatch behavior; `main.ts` is the one call site that
-   * threads the config flag through and defaults it to `false`. */
+  /** COMM-5a: F4b inbound execution is frozen by default — a whitelisted
+   * message is still polled, deduped and logged, but is no longer dispatched
+   * into `bridge.handle` (and therefore never reaches `runToCompletion`).
+   *
+   * Defaults to `false` (frozen). This is a structural guarantee, not a
+   * convention `main.ts` happens to uphold: a caller that omits `options`
+   * entirely — a future verb, a test, anything — gets the frozen behavior
+   * too. Anyone who actually wants dispatch (tests included) must say so
+   * explicitly with `{ dispatchEnabled: true }`. */
   dispatchEnabled?: boolean
+  /** COMM-5a replay guard: when unfreezing (`dispatchEnabled: true`), only
+   * messages whose `created_at` (unix seconds) is at or after this timestamp
+   * are dispatched; earlier ones — the backlog that accumulated while frozen —
+   * are logged and skipped instead of being replayed as fresh commands on
+   * restart. `main.ts` sets this to the moment the process observed the flag
+   * as enabled. A message with no `created_at` (legacy/synthesized rows) has
+   * nothing to compare against and is dispatched as before. */
+  dispatchSinceSec?: number
 }
 
 /** Poll the inbox once and feed each message to the bridge. A caller loops this
@@ -186,7 +203,7 @@ export async function pollOnce(
   liveness?: Pick<InboundLiveness, 'observe' | 'ready'>,
   options?: PollOnceOptions,
 ): Promise<void> {
-  const dispatchEnabled = options?.dispatchEnabled ?? true
+  const dispatchEnabled = options?.dispatchEnabled ?? false
   const rows = await speaker.inbox()
   const msgs = liveness ? liveness.observe(rows) : rows
   // FAIL CLOSED while the probe does not know our own npub: `observe()`
@@ -202,6 +219,17 @@ export async function pollOnce(
   for (const msg of msgs) {
     if (!msg.from) continue
     if (!dispatchEnabled) {
+      // A sender not on the allowlist was never going to run regardless of the
+      // freeze — it's `handle()`'s own fail-closed rejection, not an F4b
+      // freeze skip. Route it through `handle()` (the single authorization
+      // path) instead of re-deriving the allowlist check here: for an
+      // unauthorized sender `handle()` returns immediately after its warning,
+      // with no dedup/session/run side effects, so this is a no-op plus the
+      // correct log line, not a duplicated gate.
+      if (!bridge.isAllowed(msg.from)) {
+        await bridge.handle(msg)
+        continue
+      }
       // F4b frozen (COMM-5a): the message is read and the liveness canary above
       // already observed it — it just does not become a run. Logged once per
       // event_id (the inbox window is re-read every poll, so logging per poll
@@ -214,6 +242,20 @@ export async function pollOnce(
           `[nostr] F4b 入站执行已冻结(A24_NOSTR_F4B_INBOUND 未设置):跳过来自 ${msg.from} 的消息,未触发 run`,
         )
       }
+      continue
+    }
+    // COMM-5a replay guard: a message that arrived while frozen and is older
+    // than the unfreeze moment is backlog, not a fresh command — log it, don't
+    // run it. No `dispatchSinceSec` (or no `created_at` to compare) means
+    // there's nothing to guard against, so it dispatches as before.
+    if (
+      options?.dispatchSinceSec !== undefined &&
+      typeof msg.created_at === 'number' &&
+      msg.created_at < options.dispatchSinceSec
+    ) {
+      console.log(
+        `[nostr] 跳过解冻前积压的消息(来自 ${msg.from},created_at=${msg.created_at} 早于解冻时刻 ${options.dispatchSinceSec}):未触发 run`,
+      )
       continue
     }
     await bridge.handle(msg)

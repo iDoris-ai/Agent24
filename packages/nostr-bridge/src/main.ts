@@ -52,6 +52,11 @@ async function main(): Promise<void> {
   }
 
   // ── inbound: authorized peer messages → gated runs ──
+  // COMM-5a replay guard: when F4b dispatch is enabled, only messages that
+  // arrive from this moment on are dispatched — anything already sitting in
+  // the inbox window (accumulated while frozen, or just old) is backlog, not
+  // a fresh command, and is logged/skipped instead of replayed on restart.
+  const dispatchSinceSec = CONFIG.F4B_INBOUND_ENABLED ? Math.floor(Date.now() / 1000) : undefined
   if (CONFIG.ALLOWED_NPUBS.size === 0) {
     console.warn(
       '[nostr] ⚠️  未配置 A24_NOSTR_ALLOWED_NPUBS:将拒绝所有入站消息(fail-closed)。把授权对端的 npub 设进环境变量。',
@@ -66,6 +71,17 @@ async function main(): Promise<void> {
           '入站消息也不会再触发 agent24d run(只轮询/去重/记日志)。\n' +
           '    如需临时恢复旧行为,设置 A24_NOSTR_F4B_INBOUND=1。\n' +
           '    之后按入站执行将改走 T01-E 的高层授权,而不是这个开关。',
+      )
+    } else {
+      // R2 finding #2 on #613: re-enabling replays the inbox's last-N-row
+      // window, and rows that arrived while frozen never entered `seen` — they
+      // would otherwise execute as if freshly arrived. `dispatchSinceSec`
+      // guards against that for any row that carries a `created_at`; this line
+      // tells the operator the boundary, for the (rare, legacy-row) case that
+      // doesn't.
+      console.warn(
+        `[nostr] ⚠️  F4b 入站执行已启用(A24_NOSTR_F4B_INBOUND=1):只分派 created_at ≥ ${dispatchSinceSec} ` +
+          '(本次启动时刻)的消息;冻结期间积压的旧消息只记日志不执行。无 created_at 的消息(极少见的旧版行)仍会照常分派。',
       )
     }
   }
@@ -122,7 +138,10 @@ async function main(): Promise<void> {
   const tick = async (): Promise<void> => {
     if (stopped) return
     try {
-      await pollOnce(speaker, inbound, liveness, { dispatchEnabled: CONFIG.F4B_INBOUND_ENABLED })
+      await pollOnce(speaker, inbound, liveness, {
+        dispatchEnabled: CONFIG.F4B_INBOUND_ENABLED,
+        dispatchSinceSec,
+      })
       if (consecutiveFailures > 0) {
         console.log(`[nostr] 入站轮询已恢复(此前连续失败 ${consecutiveFailures} 次)`)
         consecutiveFailures = 0
