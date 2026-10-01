@@ -185,7 +185,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+    if: ${{ github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)) }}
     permissions:
       contents: write
     steps:
