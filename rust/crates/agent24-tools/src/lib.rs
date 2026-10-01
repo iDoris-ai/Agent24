@@ -9,6 +9,7 @@
 //! `fs_read` run automatically in C3. Callers are expected to audit-log every
 //! denial (the agent loop does).
 
+pub mod env_whitelist;
 mod local;
 mod net;
 
@@ -16,27 +17,136 @@ pub use local::{FsReadTool, FsWriteTool, ShellExecTool};
 pub use net::HttpFetchTool;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent24_protocol::{RiskClass, ToolInfo};
+use agent24_protocol::{Decision, RiskClass, ToolInfo};
+use agent24_workspace::WorkspaceRunAuthority;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 /// Per-call execution context.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
-    pub run_id: String,
+    run_id: String,
     /// The session the run belongs to (scopes approve_for_session grants)
-    pub session_id: Option<String>,
+    session_id: Option<String>,
     /// The schedule that fired this run, when one did. A standing grant minted
     /// here belongs to the SCHEDULE rather than the session (H4): an unattended
     /// automation is the thing the user was consenting to, so revoking or
     /// deleting that automation must take its grants with it.
-    pub schedule_id: Option<String>,
+    schedule_id: Option<String>,
     /// The persisted tool-call row this execution belongs to
-    pub tool_call_id: String,
+    tool_call_id: String,
+    workspace: WorkspaceAuthority,
+}
+
+#[derive(Clone)]
+enum WorkspaceAuthority {
+    Legacy,
+    Bound(Arc<WorkspaceRunAuthority>),
+}
+
+impl ToolContext {
+    #[must_use]
+    pub fn legacy(
+        run_id: impl Into<String>,
+        session_id: Option<String>,
+        schedule_id: Option<String>,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            session_id,
+            schedule_id,
+            tool_call_id: tool_call_id.into(),
+            workspace: WorkspaceAuthority::Legacy,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn workspace_bound(
+        run_id: impl Into<String>,
+        session_id: Option<String>,
+        schedule_id: Option<String>,
+        tool_call_id: impl Into<String>,
+        authority: Arc<WorkspaceRunAuthority>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            session_id,
+            schedule_id,
+            tool_call_id: tool_call_id.into(),
+            workspace: WorkspaceAuthority::Bound(authority),
+        }
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn schedule_id(&self) -> Option<&str> {
+        self.schedule_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn workspace_authority(&self) -> Option<&Arc<WorkspaceRunAuthority>> {
+        match &self.workspace {
+            WorkspaceAuthority::Legacy => None,
+            WorkspaceAuthority::Bound(authority) => Some(authority),
+        }
+    }
+
+    /// Derive a child call context while preserving workspace authority.
+    #[must_use]
+    pub fn derived(
+        &self,
+        session_id: Option<String>,
+        schedule_id: Option<String>,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: self.run_id.clone(),
+            session_id,
+            schedule_id,
+            tool_call_id: tool_call_id.into(),
+            workspace: self.workspace.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("run_id", &self.run_id)
+            .field("session_id", &self.session_id)
+            .field("schedule_id", &self.schedule_id)
+            .field("tool_call_id", &self.tool_call_id)
+            .field(
+                "workspace",
+                &match self.workspace {
+                    WorkspaceAuthority::Legacy => "legacy",
+                    WorkspaceAuthority::Bound(_) => "bound",
+                },
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +211,18 @@ pub trait ApprovalGate: Send + Sync {
         GateDecision::Deny(
             "plan mode requires an interactive approval channel (fail-closed)".to_owned(),
         )
+    }
+
+    /// Re-apply only the grant side-effect of a durable approval after restart.
+    /// The one approved call is executed separately by `execute_preapproved`.
+    async fn settle_resumed(
+        &self,
+        _approval_id: &str,
+        _decision: &Decision,
+        _info: &ToolInfo,
+        _ctx: &ToolContext,
+        _standing_target: Option<&str>,
+    ) {
     }
 }
 
@@ -496,6 +618,54 @@ impl ToolRegistry {
         Self::run_budgeted(tool, ctx, input, cancel).await
     }
 
+    /// Restore grant side-effects for a durable approval without asking again.
+    /// Current tool/risk policy is re-applied; if it no longer permits the
+    /// recorded grant, the grant is simply not restored and the next call asks.
+    pub async fn settle_resumed(
+        &self,
+        name: &str,
+        ctx: &ToolContext,
+        input: &Map<String, Value>,
+        approval_id: &str,
+        decision: &Decision,
+        recorded_target: Option<&str>,
+    ) {
+        let name = name.trim();
+        let Some(tool) = self.tools.get(name) else {
+            return;
+        };
+        if !self.allowed.contains(name) {
+            return;
+        }
+        let declared = tool.info();
+        let effective = self.effective_risk(&declared);
+        if !effective.requires_approval() {
+            return;
+        }
+        let info = ToolInfo::new(
+            declared.name,
+            declared.source,
+            declared.description,
+            effective,
+        );
+        let standing_target = tool
+            .target_arg()
+            .and_then(|arg| input.get(&arg).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|target| !target.is_empty());
+        if (decision.kind == "approve_for_session" && recorded_target.is_some())
+            || (decision.kind == "approve_for_target" && recorded_target != standing_target)
+        {
+            tracing::warn!(
+                "approval {approval_id}: recorded target no longer matches approved payload; not restoring grant"
+            );
+            return;
+        }
+        self.gate
+            .settle_resumed(approval_id, decision, &info, ctx, standing_target)
+            .await;
+    }
+
     /// Step 4 of both dispatch paths: run the tool under its timeout budget,
     /// cancellable at any point.
     async fn run_budgeted(
@@ -573,12 +743,7 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        ToolContext {
-            run_id: "run_test".to_owned(),
-            session_id: None,
-            schedule_id: None,
-            tool_call_id: "tc_test".to_owned(),
-        }
+        ToolContext::legacy("run_test", None, None, "tc_test")
     }
 
     #[tokio::test]
@@ -697,6 +862,80 @@ mod tests {
             }
         }
         Arc::new(Remote)
+    }
+
+    fn targeted_external_tool() -> Arc<dyn Tool> {
+        struct Remote;
+        #[async_trait]
+        impl Tool for Remote {
+            fn info(&self) -> ToolInfo {
+                ToolInfo::new("mcp_post", "mcp", "post", RiskClass::External)
+            }
+            fn parameters(&self) -> Value {
+                serde_json::json!({"type":"object"})
+            }
+            fn target_arg(&self) -> Option<String> {
+                Some("channel".to_owned())
+            }
+            async fn call(
+                &self,
+                _ctx: &ToolContext,
+                _input: &Map<String, Value>,
+                _cancel: &CancellationToken,
+            ) -> Result<String, ToolError> {
+                Ok("ran".to_owned())
+            }
+        }
+        Arc::new(Remote)
+    }
+
+    struct CountingReplayGate(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl ApprovalGate for CountingReplayGate {
+        async fn check(
+            &self,
+            _info: &ToolInfo,
+            _ctx: &ToolContext,
+            _input: &Map<String, Value>,
+            _standing_target: Option<&str>,
+            _cancel: &CancellationToken,
+        ) -> GateDecision {
+            GateDecision::Allow
+        }
+        async fn settle_resumed(
+            &self,
+            _approval_id: &str,
+            _decision: &Decision,
+            _info: &ToolInfo,
+            _ctx: &ToolContext,
+            _standing_target: Option<&str>,
+        ) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_target_grant_requires_recorded_target_to_match_payload() {
+        let gate = Arc::new(CountingReplayGate(std::sync::atomic::AtomicUsize::new(0)));
+        let reg = ToolRegistry::new()
+            .with(targeted_external_tool())
+            .with_gate(gate.clone());
+        let input = serde_json::json!({"channel":"#ops"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let decision = Decision {
+            kind: "approve_for_target".to_owned(),
+            reason: None,
+            extra: Map::new(),
+        };
+
+        reg.settle_resumed("mcp_post", &ctx(), &input, "apr", &decision, Some("#other"))
+            .await;
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        reg.settle_resumed("mcp_post", &ctx(), &input, "apr", &decision, Some("#ops"))
+            .await;
+        assert_eq!(gate.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

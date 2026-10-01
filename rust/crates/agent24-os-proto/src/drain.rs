@@ -282,6 +282,29 @@ struct Inner {
     drain_deadline: Option<Instant>,
 }
 
+/// Where a generation's requests would be sent, if it had any to send.
+///
+/// A1's original shape was `Option<PathBuf>`: `None` meant "placeholder, never
+/// becomes `Running`". A3 (`docs/design/A3-ATTACHED-MODULE.md` §5.1, review
+/// H1) needs a SECOND kind of `None` — a user-started process attached over
+/// `~/.agent24/attach/agent24d.sock` has no per-generation socket to proxy to,
+/// but unlike a placeholder it DOES become `Running`: attaching this way is
+/// exactly what makes it ready. Collapsing the two into one `Option` would
+/// make `attached()` either wrongly proxyable (if it reused `serving_at`'s
+/// `Some`) or wrongly stuck in `Starting` forever (if it reused `starting`'s
+/// `None`) — hence the third state, checked explicitly wherever the
+/// difference matters ([`Generation::ready`], [`Generation::admit_request`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Upstream {
+    /// A1: a spawned process listening at this path.
+    Process(std::path::PathBuf),
+    /// A3: a user-started process on the attach socket. There is nothing to
+    /// proxy to, but the generation is real and can become `Running`.
+    Attached,
+    /// `Generation::starting()`: never becomes `Running` (see `ready`).
+    Placeholder,
+}
+
 /// One run of one module process. Shared (`Arc`) between the proxy, the callback
 /// channel and whoever stops the module.
 #[derive(Debug)]
@@ -293,9 +316,9 @@ pub struct Generation {
     revoked: tokio::sync::watch::Sender<bool>,
     /// Where this run's process listens for proxied requests: its own Unix
     /// domain socket path (D4, FU-60), so a request admitted into this
-    /// generation reaches this process and no other. `None` for a
-    /// placeholder, which never becomes `Running`.
-    upstream: Option<std::path::PathBuf>,
+    /// generation reaches this process and no other — or, since A3, that
+    /// there is no such process at all. See [`Upstream`].
+    upstream: Upstream,
 }
 
 /// A request admitted into a generation. Leaves the in-flight set when dropped,
@@ -315,17 +338,29 @@ impl Generation {
     /// process to send a request to.
     #[must_use]
     pub fn starting() -> Arc<Self> {
-        Self::new(None)
+        Self::new(Upstream::Placeholder)
     }
 
     /// A freshly spawned module listening at `upstream`, before `initialize`.
     /// Requests admitted into it are sent there and nowhere else (SUP-3b).
     #[must_use]
     pub fn serving_at(upstream: std::path::PathBuf) -> Arc<Self> {
-        Self::new(Some(upstream))
+        Self::new(Upstream::Process(upstream))
     }
 
-    fn new(upstream: Option<std::path::PathBuf>) -> Arc<Self> {
+    /// A3 (`docs/design/A3-ATTACHED-MODULE.md` §5.1, review H1): a
+    /// user-started process that just passed the attach handshake. Unlike
+    /// [`Self::starting`] this generation DOES become `Running` — see
+    /// [`Self::ready`] — but like a placeholder it has no per-generation
+    /// socket: [`Self::upstream`] stays `None`, and [`Self::admit_request`]
+    /// refuses unconditionally, because an attached module is never proxied
+    /// to (there is no `/api/v1/<ns>/*` route for it — §5.1's third point).
+    #[must_use]
+    pub fn attached() -> Arc<Self> {
+        Self::new(Upstream::Attached)
+    }
+
+    fn new(upstream: Upstream) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 state: DrainState::Starting,
@@ -338,13 +373,21 @@ impl Generation {
         })
     }
 
-    /// Where this run's process listens; `None` for a placeholder. Every
-    /// `Running` generation has one (see [`Generation::ready`]). Borrowed, not
-    /// `Copy` like the `SocketAddr` this replaced (FU-60) — a caller that
-    /// needs to own it clones explicitly.
+    /// Where this run's process listens; `None` for a placeholder AND for an
+    /// attached generation (A3) — the latter is `Running`-capable but has no
+    /// per-generation socket to proxy to. Every `Running` generation spawned
+    /// the A1 way has one (see [`Generation::ready`]); an attached one never
+    /// does, by construction, which is what keeps it out of the proxy path
+    /// (§5.1's three-fold guarantee — see `proxy.rs`/`kernel_call.rs`, which
+    /// already refuse a `None` upstream). Borrowed, not `Copy` like the
+    /// `SocketAddr` this replaced (FU-60) — a caller that needs to own it
+    /// clones explicitly.
     #[must_use]
     pub fn upstream(&self) -> Option<&std::path::Path> {
-        self.upstream.as_deref()
+        match &self.upstream {
+            Upstream::Process(path) => Some(path.as_path()),
+            Upstream::Attached | Upstream::Placeholder => None,
+        }
     }
 
     // A poisoned lock means another thread panicked while holding it. The state
@@ -371,13 +414,18 @@ impl Generation {
     }
 
     /// `initialize` succeeded. Only from `Starting`, and only for a generation
-    /// with a process behind it; returns `false` otherwise (a generation that
-    /// was revoked while starting stays revoked, and a placeholder stays a
-    /// placeholder). So a `Running` generation always has an
-    /// [`upstream`](Generation::upstream).
+    /// that COULD have a process behind it; returns `false` otherwise (a
+    /// generation that was revoked while starting stays revoked, and a
+    /// placeholder stays a placeholder — it never becomes `Running`, by
+    /// construction, because it has no process and never will). So a
+    /// `Running` generation spawned the A1 way always has an
+    /// [`upstream`](Generation::upstream) — but since A3 (review H1),
+    /// `Running` no longer implies that on its own: an [`Upstream::Attached`]
+    /// generation is also `Running`-capable and still has none. Only
+    /// [`Upstream::Placeholder`] is refused here.
     #[must_use]
     pub fn ready(&self) -> bool {
-        if self.upstream.is_none() {
+        if matches!(self.upstream, Upstream::Placeholder) {
             return false;
         }
         let mut inner = self.lock();
@@ -412,7 +460,15 @@ impl Generation {
     ///
     /// # Errors
     ///
-    /// Anything but `Running` refuses, each state with its own reason.
+    /// Anything but `Running` refuses, each state with its own reason. An
+    /// [`Upstream::Attached`] generation (A3, review H1) refuses
+    /// UNCONDITIONALLY with [`RequestRefused::NotReady`], whatever its
+    /// [`DrainState`] — there is no route that proxies to an attached module
+    /// (§5.1's three-fold guarantee: no route is mounted for it, this check,
+    /// and `upstream() == None` refusing again even if the first two were
+    /// somehow bypassed), so a request reaching here at all is already a bug
+    /// upstream of this function; the answer is the same one a placeholder
+    /// gives, not a new kind of refusal.
     pub fn admit_request(
         self: &Arc<Self>,
         id: String,
@@ -420,6 +476,9 @@ impl Generation {
         now: Instant,
         budget: Duration,
     ) -> Result<InFlight, RequestRefused> {
+        if matches!(self.upstream, Upstream::Attached) {
+            return Err(RequestRefused::NotReady);
+        }
         let mut inner = self.lock();
         match inner.state {
             DrainState::Starting => Err(RequestRefused::NotReady),
@@ -1031,7 +1090,12 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// other, so the one function is duplicated rather than the dependency
 /// added). Length is checked first — a length mismatch is not the secret
 /// being timed, so this branch not being constant-time gives nothing away.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// `pub(crate)`: A3's `initialize::accept_attached` (§4.3, review M3) reuses
+/// this SAME function to compare a presented token's hash against both a
+/// registered one and, when the module name is not registered at all, a fixed
+/// dummy hash — so the two paths cannot diverge on how "equal" is decided.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -2025,5 +2089,83 @@ mod tests {
     async fn bind_to_lifecycle_with_no_lifecycle_just_awaits() {
         let result = bind_to_lifecycle(None, std::future::ready(42)).await;
         assert_eq!(result, Ok(42));
+    }
+
+    // ---- A3 §5.1 (review H1): the third `Upstream` state ------------------
+
+    /// The property v1 of the design doc got wrong: an attached generation is
+    /// NOT a placeholder wearing a different name. It has no address (like a
+    /// placeholder) but DOES become `Running` (like a spawned one) — the two
+    /// facts a placeholder cannot have both at once, which is exactly why
+    /// `Upstream` needed a third case instead of reusing `starting()`.
+    #[test]
+    fn an_attached_generation_becomes_running_with_no_upstream() {
+        let g = Generation::attached();
+        assert_eq!(g.upstream(), None, "an attached module has no proxy socket");
+        assert_eq!(g.state(), DrainState::Starting, "not ready until admitted");
+        assert!(
+            g.ready(),
+            "attaching IS what makes it ready — unlike a placeholder"
+        );
+        assert_eq!(g.state(), DrainState::Running);
+        // Second call: `ready()` is one-shot from `Starting`, same as A1.
+        assert!(!g.ready());
+
+        // Control, so the assertion above is about `Attached` specifically
+        // and not "everything is now always ready": a placeholder still
+        // never becomes `Running` (regression guard for the case this type
+        // exists to keep separate).
+        let placeholder = Generation::starting();
+        assert!(!placeholder.ready());
+        assert_eq!(placeholder.state(), DrainState::Starting);
+    }
+
+    /// §5.1's second guarantee against proxying to an attached module:
+    /// `admit_request` refuses unconditionally, in EVERY `DrainState` — not
+    /// just before `ready()`. A spawned generation is the control: the same
+    /// call succeeds on it once `Running`.
+    #[test]
+    fn admit_request_always_refuses_an_attached_generation() {
+        let g = Generation::attached();
+        assert!(g.ready());
+        assert_eq!(g.state(), DrainState::Running);
+        let admit = |g: &Arc<Generation>, id: &str| {
+            g.admit_request(
+                id.to_owned(),
+                [0u8; 32],
+                Instant::now(),
+                Duration::from_secs(30),
+            )
+        };
+        assert_eq!(admit(&g, "a").unwrap_err(), RequestRefused::NotReady);
+
+        // Still refused after draining begins (it must have been Running for
+        // `begin_drain` to accept — proving the refusal is not just "not
+        // Running yet").
+        assert!(g.begin_drain(Instant::now(), GRACE));
+        assert_eq!(g.state(), DrainState::Draining);
+        assert_eq!(admit(&g, "b").unwrap_err(), RequestRefused::NotReady);
+
+        // Still refused once revoked.
+        let _ = g.revoke();
+        assert_eq!(g.state(), DrainState::Revoked);
+        assert_eq!(admit(&g, "c").unwrap_err(), RequestRefused::NotReady);
+
+        // Control: a spawned, Running generation admits normally — the
+        // refusal above is about `Attached`, not about every generation.
+        let spawned = running();
+        assert!(admit(&spawned, "a").is_ok());
+    }
+
+    /// `admit_callback`/`admit_callback_bound` are UNCHANGED for `Attached`
+    /// (§5.1: "回调准入 admit_callback* 对 Attached 与 Process 代行为相同") —
+    /// only `admit_request` singles it out. Regression guard: without this,
+    /// a future "simplification" that made `Attached` refuse everything
+    /// would also break `_a24/events/emit` on attached modules.
+    #[test]
+    fn admit_callback_is_unaffected_by_being_attached() {
+        let g = Generation::attached();
+        assert!(g.ready());
+        assert_eq!(g.admit_callback(None), Ok(()));
     }
 }

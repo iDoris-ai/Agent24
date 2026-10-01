@@ -1122,6 +1122,14 @@ Sin90 是 Agent24 **默认搭载**的 Personal-OS，但它应可**关闭 / 清�
 
 于是三种玩法都成立且都是**干净、一次性、可回退**的动作：**用默认 Sin90** / **基于 Sin90 定制** / **`os install cos72 && os activate cos72` 清掉 Sin90 换 Cos72**。取代今天 `AppState.sin90` 具体字段 + 硬编码 `/sin90/*` 路由。
 
+> **修订记录（2026-09-10）**：本节「诚实的进程模型取舍」里"第一方进程内 OS（我们自己写的
+> Sin90/Cos72）都编进 `agent24d`"这一支已被推翻，改为**进程外模块**（T11，
+> [#342](https://github.com/iDoris-ai/Agent24/pull/342)，2026-09-22 合并）——Sin90 与
+> Cos72 均不再编译进内核二进制，而是各自独立仓库的进程外二进制，经 ADR-031 定义的进程外
+> 协议（manifest + 握手 + 回调 socket + 受约束代理）挂载。原文保留不改，仅在此追加
+> 记录；详见 ADR-031、`docs/specs/SPEC-ME3-OUT-OF-PROCESS.md`、
+> `docs/agent/PLAN-ME4-OS-CAPABILITIES.md`。
+
 ### 与记忆（ADR-028）的关系
 
 记忆层保持**领域 OS 无关**：内核提供通用记忆（L0–L4），领域 OS **用但不拥有**它；领域态（Sin90 的 direction/proposal…）留在领域 OS 自己的 DB。换 OS 不动内核记忆。
@@ -1301,6 +1309,53 @@ SPEC-MD-ME §5 的 ME-3 行写的是「经 MCP/协议」，那是立项时的猜
 本 ADR 只裁决**协议选型**。它**不**声称进程外模块是被隔离的——模块与内核同 UID、无沙箱，设计文档 §0 有完整的威胁模型。选型不提供安全性。
 
 ---
+
+## ADR-032：AgentEar（语音）与 iDoris（模型网关）接入 Agent24 —— 已接受
+
+**状态**：已接受（2026-09-26 拍板 D1–D4；P0–P2 已于 2026-09-27 交付，#526–#534，v0.4.0 一并发布）。完整规划与证据见 [`docs/design/INTEGRATION-AGENTEAR-IDORIS.md`](design/INTEGRATION-AGENTEAR-IDORIS.md)；§7 待拍板项已由 §8 D1–D4 收口（见下文）；P2 的前置 [`A3-ATTACHED-MODULE.md`](design/A3-ATTACHED-MODULE.md) 经对抗评审后冻结并已实现（A3-1~A3-4）。P3–P5（流式、iDoris provider 接线、gate 闭集执行提案）未做，排在 v0.5.0 之后。
+
+**背景**：jason 的目标是 Agent24 当协调者，一端接 iDoris（本地 2B/7B/27B 千问 + 外部 API 的混合大脑），另一端接 AgentEar（本机语音耳朵和嘴巴）；两个仓库保持独立，只通过通用接口配合。
+
+**提议的决策**
+1. **AgentEar 以 A3 附着式模块接入**（设计见 [`docs/design/A3-ATTACHED-MODULE.md`](design/A3-ATTACHED-MODULE.md)；原提议的 A1「内核拉起的 OOP 模块」因 D4 被取代）：AgentEar 由用户自行启动，用注册 token 连上 Agent24 的附着 socket，握手后拿到与 A1 相同的 offer set；反向命令在同一条连接上下发。同时保留独立运行模式。热键、麦克风、会话状态机、打断、TTS 播放都留在 AgentEar，不搬走。Agent24 的角色是**能力提供方 + 执行方**（推理、事件、审批、私有记忆、提案执行），**不做逐轮中继**。
+2. **iDoris 以 `agent24-models` 的 OpenAI-compat provider 接入**，不做成 OOP 模块。拆成两个逻辑 provider：`idoris-local`（Local 层，强制 `X-iDoris-Privacy: local_only`）和 `idoris-any`（Remote 层）。iDoris 需要回报实际落点，用来关闭 ME4-S2 R13 的缺口（回环端点背后可能转发到外部）。
+3. **隐私分四层**：音频和原始转写不出本机 → manifest 的 `model_access` 决定 Privacy → 调 iDoris 时强制带 local_only 头 → iDoris 在没有本地候选时 fail-closed。
+4. **分阶段**：P0 拍板 ADR-0008 §5 的六问 → P1 AgentEar 直连 iDoris（零代码）→ P2 AgentEar 以 A3 附着（非流式、单轮；前置是 A3 设计冻结）→ P3 推理回调流式（排在 v0.5.0 之后，目标首字 ≤3s）→ P4 接入 iDoris provider → P5 gate 闭集执行提案。
+
+**已知缺口**
+- 推理回调和反向代理都不支持流式：非流式首字 4.86s，直连流式 2.80s。
+- `IDORIS_URL` 没有接线。
+- REST `/api/v1/chat` 固定走 `Privacy::Any`。
+- gate 的可执行动作还是空集。
+
+**2026-09-26 jason 拍板**（设计文档 §8）：
+- P2 可以先上非流式；
+- LAN/Tailscale 算远程；
+- AgentEar 保留自带的小模型以便独立运行，需要更强能力时接 iDoris，全部可配置；
+- TCC 权限留在 AgentEar。
+
+因为最后一条，AgentEar 的推荐接入方式从 A1「内核拉起」改为 **A3「附着式模块」**：AgentEar 自己启动，连上 Agent24 后拿到同一套 offer set。Agent24 需要为附着生命周期单独做一份设计（P2 的前置）。P0 加一个 TCC 实测 spike。
+
+**原「仍待拍板」五项的收口**（2026-09-27，按设计文档 §8 D1–D4）：
+1. P2 是否允许先上非流式 → **已决（D1）**：可以。
+2. LAN/Tailscale 节点算不算「本地」→ **已决（D2）**：算远程。
+3. 独立模式下是否保留自带小模型边车 → **已决（D3）**：保留，推理路径三档可配置。
+4. TCC 权限归属 → **已决（D4）**：留在 AgentEar；因此改走 A3，A1 的 TCC spike 不再阻塞 P2。
+5. AgentEar 开机自启与「由 Agent24 拉起」的冲突 → **A3 下不存在**：Agent24 不拉起 AgentEar，自启只由 AgentEar 自己的 LaunchAgent 负责；双实例由 AgentEar 单实例锁 + A3「每模块同时最多一代」（第二条连接 `busy`）两道防住。
+
+**ADR-0008 §5 六问的答复**（jason，2026-09-27）：
+| # | 问题 | 答复 |
+|---|---|---|
+| 1 | 事件通道 | A3 下经 SDK 回调 `_a24/events/emit`（`kind: agentear.event`，payload 为 `agentear.event/1`）；不走 stdout JSONL / 本地 HTTP / WS |
+| 2 | 热键归属 | AgentEar |
+| 3 | 麦克风与播放归属 | AgentEar（打断依赖其进程内播放状态） |
+| 4 | 模型、音色、`commands.json` 的配置归属 | AgentEar 自管，是唯一真相；Agent24 只读展示 |
+| 5 | TCC | AgentEar（同 D4） |
+| 6 | 回执留档 | Agent24（P3 设计） |
+
+**B5 已决**（jason，2026-09-27）：AgentEar 与 Agent24 断连后，若独立模式推理走本机边车则自动回到独立模式，否则停止监听并提示；设置可改。任何情况下不得把附着时受 `local_only` 约束的请求改发远端。
+
+**仍开放**：见 A3 设计 §11（Q1 桌面端是否显示回复文本、Q2 配对 UX、Q3 第二条连接策略、Q4 P2 是否持久化 transcript）。
 
 ## 附：决策中我（Claude）犯的错误（用于改进）
 

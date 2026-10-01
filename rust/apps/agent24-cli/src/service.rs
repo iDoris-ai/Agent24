@@ -117,10 +117,14 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 11] = [
+pub const PASSTHROUGH_VARS: [&str; 16] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
+    // ME4-S2 v3 N2 / ME4-4.2.2a: `ModelRouter::from_env` reads this (was
+    // hard-coded) so the Ollama endpoint can be pointed off the default port
+    // too; a launchd-started daemon must see it or it silently falls back.
+    "OLLAMA_URL",
     "A24_GUARDIAN",
     "A24_GUARDIAN_ALWAYS_REVIEW",
     "A24_APPROVAL_TIMEOUT_SECS",
@@ -138,6 +142,25 @@ pub const PASSTHROUGH_VARS: [&str; 11] = [
     // FU-64 §B: the idle-connection-pool age cap. Best-effort only (see the
     // design doc), but still a knob that must reach the daemon.
     "A24_MODULE_IDLE_CONN_MAX_MS",
+    // ME4-S3 §4.3: `agent24_os_fd::take_inherited_listener` reads this by
+    // its own `ENV_LISTEN_FD` constant. The daemon itself never calls that
+    // function — it MINTS this variable per spawn for the CHILD module
+    // (`launch.rs`), it does not need it from ITS OWN environment — but
+    // `agent24-os-fd` lives under `rust/crates/` and is a (transitive)
+    // dependency of the daemon, so this test's source scan finds the read
+    // regardless of whether the daemon ever reaches that code path.
+    // Harmless to pass through: a launchd-started daemon has no reason to
+    // have this set at all.
+    "A24_LISTEN_FD",
+    // COMM-2a: which Hyphae binary `comm_routes::build` installs and runs
+    // (COMM-HYPHAE.md §3). `A24_SPEAKER_BIN` is the deprecated fallback name
+    // (D8) — both are read literally in `apps/agent24d/src/comm_routes.rs`.
+    "A24_HYPHAE_BIN",
+    "A24_SPEAKER_BIN",
+    // COMM-HYPHAE.md §6.4: which `PasswordStore` backend `comm_routes::build`
+    // constructs (`keyring` default, or `memory` for isolated test/joint-
+    // debug environments that must never touch the real OS keychain).
+    "A24_COMM_PASSWORD_STORE",
 ];
 
 /// Snapshot the environment the daemon should run with.
@@ -476,6 +499,20 @@ mod tests {
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
+                // Cargo's `tests/` directories hold integration-test binaries, never
+                // daemon production code; the daemon (a LaunchAgent) can't run
+                // anything under them. A test fixture's own config knob (e.g.
+                // `HYPHAE_TEST_BIN`, which points an opt-in test at a local binary)
+                // reads an env var there without the daemon ever needing it
+                // forwarded — scanning `tests/` would demand `PASSTHROUGH_VARS`
+                // carry test-only knobs the real LaunchAgent never touches.
+                // Positive control: `A24_OS_PACKAGES` (read from
+                // `agent24-os-packages/src/lib.rs`, not under any `tests/` dir)
+                // still gets caught below, so skipping `tests/` doesn't blind the
+                // scanner to a real daemon read.
+                if p.file_name().is_some_and(|n| n == "tests") {
+                    continue;
+                }
                 walk_rs(&p, f);
             } else if p.extension().is_some_and(|x| x == "rs") {
                 f(&p);

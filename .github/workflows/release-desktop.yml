@@ -1,0 +1,238 @@
+name: Release Desktop (Linux)
+
+# DEP-A6: desktop Linux packages (AppImage + deb), built on top of DEP-A3's
+# CLI release pipeline (release.yml, #608/#609). This workflow never creates
+# the GitHub Release itself (M5 in docs/Deployment/TASKS.md — A3 owns Release
+# creation, A6 only appends assets to the same tag) and never touches the
+# SHA256SUMS file A3 produces (writes its own SHA256SUMS-desktop instead).
+#
+# Same tag filter as release.yml — see that file's header comment for why
+# `v[0-9]+.[0-9]+.[0-9]+` doesn't match `agent24-os-sdk-v9.9.9` / `v0.4.0-m4`.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true: 只构建并冒烟测试，不追加到 GitHub Release'
+        type: boolean
+        default: true
+  # Builds + smoke-tests on a PR that touches this file, so the pipeline is
+  # proven before merge (workflow_dispatch only sees the default branch).
+  # The publish job never runs on pull_request (see its `if:`).
+  pull_request:
+    paths:
+      - '.github/workflows/release-desktop.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + smoke test (linux x64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa  # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      # Deliberately NOT setting ELECTRON_SKIP_BINARY_DOWNLOAD here (unlike
+      # ci.yml) — electron-builder needs the real Electron binary to package
+      # the AppImage/deb.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-desktop-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+
+      - name: Build agent24d (release)
+        working-directory: rust
+        run: cargo build --release --bin agent24d
+
+      - name: Build node-daemon
+        run: pnpm --filter @agent24/node-daemon build
+
+      - name: Build desktop renderer + electron main
+        run: pnpm --filter @agent24/desktop build
+
+      - name: 'electron-builder (Linux: AppImage + deb)'
+        run: pnpm --filter @agent24/desktop exec electron-builder --linux AppImage deb
+
+      - name: List packaged artifacts
+        working-directory: apps/desktop/release
+        run: ls -la
+
+      - name: Install xvfb (for the AppImage smoke test)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends xvfb
+
+      - name: Smoke test — AppImage boots sidecar, /health is 200
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPIMAGE="$(ls release/*.AppImage)"
+          chmod +x "$APPIMAGE"
+
+          SMOKE_HOME="$RUNNER_TEMP/a6-smoke-home"
+          rm -rf "$SMOKE_HOME"
+          mkdir -p "$SMOKE_HOME"
+          export HOME="$SMOKE_HOME"
+
+          xvfb-run -a "$APPIMAGE" --appimage-extract-and-run --no-sandbox \
+            > "$RUNNER_TEMP/appimage.log" 2>&1 &
+          LAUNCHER_PID=$!
+          echo "launcher pid: $LAUNCHER_PID"
+
+          STATE="$SMOKE_HOME/.agent24/daemon.json"
+          for _ in $(seq 1 60); do
+            [ -f "$STATE" ] && break
+            sleep 1
+          done
+          if [ ! -f "$STATE" ]; then
+            echo "::error::daemon.json did not appear under \$HOME/.agent24 within 60s"
+            cat "$RUNNER_TEMP/appimage.log" || true
+            kill "$LAUNCHER_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "daemon.json:"; cat "$STATE"
+
+          PORT="$(jq -r '.port' "$STATE")"
+          SIDECAR_PID="$(jq -r '.pid' "$STATE")"
+
+          BODY="$RUNNER_TEMP/health.json"
+          STATUS="$(curl -s -o "$BODY" -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/health")"
+          echo "health status: $STATUS body: $(cat "$BODY")"
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::health check returned $STATUS instead of 200"
+            kill "$SIDECAR_PID" "$LAUNCHER_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          # RESEARCH.md §4 risk: AppRun may inject LD_LIBRARY_PATH into every
+          # child it spawns, including the agent24d sidecar (and whatever it
+          # spawns in turn, e.g. shell_exec / modules). Flag it as a warning
+          # and document it in the PR — fixing it is explicitly out of scope
+          # for DEP-A6.
+          if [ -r "/proc/$SIDECAR_PID/environ" ] && \
+             tr '\0' '\n' < "/proc/$SIDECAR_PID/environ" | grep -q '^LD_LIBRARY_PATH='; then
+            echo "::warning::AppImage-injected LD_LIBRARY_PATH leaked into the agent24d sidecar (pid $SIDECAR_PID) — not fixed in DEP-A6, see docs/Deployment/RESEARCH.md §4"
+            tr '\0' '\n' < "/proc/$SIDECAR_PID/environ" | grep '^LD_LIBRARY_PATH=' || true
+          else
+            echo "no LD_LIBRARY_PATH leak observed in the sidecar environment"
+          fi
+
+          kill "$SIDECAR_PID" 2>/dev/null || true
+          kill "$LAUNCHER_PID" 2>/dev/null || true
+
+      - name: Smoke test — deb installs and contains agent24d
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEB="$(ls release/*.deb)"
+          PKG="$(dpkg-deb -f "$DEB" Package)"
+          echo "package name: $PKG"
+
+          sudo apt-get update -qq && sudo apt-get install -y "$(realpath "$DEB")"  # apt resolves declared deps (e.g. libnotify4), as users would
+          dpkg -L "$PKG" | tee "$RUNNER_TEMP/deb-contents.txt"
+          if ! grep -q 'agent24d$' "$RUNNER_TEMP/deb-contents.txt"; then
+            echo "::error::agent24d binary not found in installed deb contents"
+            sudo dpkg -r "$PKG" || true
+            exit 1
+          fi
+          sudo dpkg -r "$PKG"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: desktop-linux-x64
+          path: |
+            apps/desktop/release/*.AppImage
+            apps/desktop/release/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Append to Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    if: ${{ github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)) }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: desktop-linux-x64
+          path: dist
+
+      - name: Checksums (separate file — A3 owns SHA256SUMS)
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          shasum -a 256 -- *.AppImage *.deb > SHA256SUMS-desktop
+          cat SHA256SUMS-desktop
+          shasum -a 256 -c SHA256SUMS-desktop
+
+      # M5 in docs/Deployment/TASKS.md: release.yml (A3) creates the Release
+      # on the same tag; the two workflows run in parallel off the same push,
+      # so this one may reach here before A3's "release" job has created it.
+      # Poll instead of failing immediately: up to 30 minutes, every 30s.
+      - name: Wait for the A3 Release to exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          echo "waiting for release $TAG (created by release.yml / DEP-A3)..."
+          for i in $(seq 1 60); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "release $TAG found after $(( (i - 1) * 30 ))s"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::release $TAG was not created within 30 minutes — release.yml (DEP-A3) may have failed or not run"
+          exit 1
+
+      - name: Upload desktop assets to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release upload "$TAG" \
+            dist/*.AppImage dist/*.deb dist/SHA256SUMS-desktop \
+            --clobber

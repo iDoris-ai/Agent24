@@ -6,6 +6,11 @@ export const IpcChannels = {
   AppVersion: 'app:version',
   ShellOpenExternal: 'shell:open-external',
   BackendProxy: 'backend:proxy',
+  BackendEndpoint: 'backend:endpoint',
+  CreativeShow: 'creative:show',
+  CreativeRestart: 'creative:restart',
+  CreativeBounds: 'creative:bounds',
+  CreativeHide: 'creative:hide',
   OmlxDetect: 'omlx:detect',
   OmlxModels: 'omlx:models',
   OmlxStart: 'omlx:start',
@@ -18,6 +23,18 @@ export const IpcChannels = {
   ModulesInstall: 'modules:install',
   ModulesUninstall: 'modules:uninstall',
   LlmStatus: 'llm:status',
+  // A3-4: push channel only (main -> renderer via webContents.send). Not an
+  // ipcMain.handle() target — see main/agentear-events.ts.
+  AgentEarEvent: 'agentear:event',
+  // A3-4 review M5: pull channel — the panel calls this once on mount to get
+  // the main-process log's current state (main/agentear-log.ts), so
+  // navigating away and back doesn't lose it. Ordinary ipcMain.handle().
+  AgentEarSnapshot: 'agentear:snapshot',
+  // ME4-desktop-model-ui: push/pull pair for the kernel's `model.call` WS
+  // events (agent24d/src/model_callback.rs), mirroring AgentEarEvent /
+  // AgentEarSnapshot's shape exactly — see main/model-call-log.ts.
+  ModelCallEvent: 'model-call:event',
+  ModelCallSnapshot: 'model-call:snapshot',
 } as const
 
 export type IpcChannel = typeof IpcChannels[keyof typeof IpcChannels]
@@ -34,6 +51,26 @@ export interface BackendProxyResponse {
   ok: boolean
   status: number
   data: unknown
+}
+
+/** FU-93: the backend daemon's actual (dynamic) port, so the sidebar can show
+ * it instead of a hardcoded guess. `null` while the daemon has not announced
+ * its ready line yet. */
+export interface BackendEndpointResult {
+  port: number
+}
+
+export interface CreativeViewBounds {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface CreativeViewResult {
+  ok: boolean
+  origin?: string
+  error?: string
 }
 
 export interface OmlxDetectResult {
@@ -145,4 +182,57 @@ export interface DiscoverFilter {
   query?: string
   trustTier?: TrustTier
   installed?: boolean
+}
+
+// ── A3 attached modules (docs/design/A3-ATTACHED-MODULE.md) ────────────────────
+// MIRROR NOTICE: field names copied from the merged Rust
+// `agent24-protocol::types::{AttachedView, AttachedList}` (A3-2a,
+// rust/crates/agent24-protocol/src/types.rs). `generation` is NOT part of the
+// A3-2a struct yet — it is wired in A3-2b (not merged as of this PR) — so it
+// stays optional here and the panel must tolerate its absence.
+
+/** One row of `GET /api/v1/attached` — never carries the token or its hash. */
+export interface AttachedView {
+  name: string
+  manifest_digest: string
+  token_id: string
+  created_at: string
+  /** Open enum: `detached` | `attached` | `disabled` (design §5.1). */
+  attach_status: string
+  /** A3-2b field (design §3.2); absent against an A3-2a-only daemon. */
+  generation?: number
+}
+
+export interface AttachedListResponse {
+  modules: AttachedView[]
+}
+
+/** `model.call` WS event payload (agent24-protocol's `ModelCallPayload`,
+ * `rust/crates/agent24-protocol/src/events.rs`) — one completed
+ * `_a24/model/complete` call. Kernel-broadcast, NOT wrapped in the `module`
+ * envelope like AgentEar's own events (it's a first-party event type, not a
+ * module-namespaced one) — see main/agentear-events.ts's `parseModelCallFrame`.
+ * Deliberately carries no prompt/response content. */
+export interface ModelCallEnvelope {
+  module: string
+  model_id: string | null
+  tier: string | null
+  served_by: string | null
+  ok: boolean
+  latency_ms: number
+  prompt_tokens: number | null
+  completion_tokens: number | null
+}
+
+/** `agentear.event/1` envelope (AgentEar contracts/schema/agentear.event.v1.schema.json,
+ * pinned commit — see apps/desktop/test/fixtures/agentear/SOURCE). This is the
+ * payload the kernel relays verbatim inside a WS `type:"module"` event
+ * (design §7.1) — Agent24 does not interpret it beyond routing by (session_id, seq). */
+export interface AgentEarEventEnvelope {
+  schema: string
+  event_id: string
+  session_id: string
+  seq: number
+  type: 'turn' | 'transcript' | 'proposal' | 'speech' | 'error' | 'confirm_reply'
+  payload: Record<string, unknown>
 }

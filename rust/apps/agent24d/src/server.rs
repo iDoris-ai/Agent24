@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use agent24_models::router::ModelRouter;
 use agent24_protocol::Health;
+use agent24_protocol::state_file::AuthMode;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, Path, State};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -16,6 +17,13 @@ use axum::routing::{get, post};
 use rand::RngCore;
 use std::sync::Arc as StdArc;
 use tokio_util::sync::CancellationToken;
+
+fn workspace_recovery_instant_at(
+    time: std::time::SystemTime,
+) -> std::io::Result<agent24_store::WorkspaceInstant> {
+    let text = agent24_core::util::iso8601_millis_at(time).map_err(std::io::Error::other)?;
+    agent24_store::WorkspaceInstant::parse(&text).map_err(std::io::Error::other)
+}
 
 // A shutdown's budgets and deadlines — the HTTP drain's fixed 1.5s, the
 // out-of-process modules' drain and stop grace (tunable: `A24_MODULE_DRAIN_MS`,
@@ -26,6 +34,12 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct AppState {
     pub token: Arc<String>,
+    /// Legacy and capability authority are mutually exclusive. Tests and
+    /// existing callers continue to construct legacy state through
+    /// [`AppState::new`]; production capability mode replaces it before the
+    /// router is built.
+    pub auth_mode: AuthMode,
+    pub capabilities: Option<crate::capabilities::CapabilityStore>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -43,6 +57,11 @@ pub struct AppState {
     pub module_approval_broker: Arc<crate::module_approval_broker::ModuleApprovalBroker>,
     pub usage: Arc<crate::routes::UsageCounters>,
     pub events: crate::events::EventsHub,
+    /// ME4-desktop-model-ui: the timing writer's sink handle — built here
+    /// (spawning its background task), same as `events`/`usage` above, so
+    /// every clone of this `AppState` (including `/api/v1/chat`'s handler)
+    /// shares the SAME writer task rather than each starting its own.
+    pub timings: Arc<dyn crate::timing_recorder::TimingSink>,
     pub store: Store,
     /// What the mounter decided about each domain OS at startup (ME-2b).
     /// Held so `/api/v1/os` can report it — a mount verdict that only reached the
@@ -89,6 +108,12 @@ pub struct AppState {
     pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
     pub runs: Arc<agent24_agent::RunManager>,
     pub scheduler: Arc<agent24_scheduler::Scheduler>,
+    /// ME4-1.3.1: the module deliverer `KernelTrigger`'s `Module` arm calls.
+    /// Kept here (not only inside `KernelTrigger`, which `AppState` cannot
+    /// see through its type-erased `Arc<dyn RunTrigger>`) so `serve` can call
+    /// `set_supervisors` on the SAME instance right after `mount_all` returns
+    /// (design §4.6).
+    pub deliverer: Arc<crate::scheduler_deliver::ModuleDeliverer>,
     /// Live MCP server handles. This is an RAII guard, not data: dropping an
     /// McpServer kills its child process, which would silently break every tool
     /// it contributed. Never read on purpose — its job is to exist (M-E/E1b).
@@ -98,6 +123,15 @@ pub struct AppState {
     /// shutdown cancels in-flight provider calls (run-level cancel joins in C2),
     /// and `POST /api/v1/shutdown` requests it.
     pub shutdown: Shutdown,
+    /// A3-2b: the live attach registry (`docs/design/A3-ATTACHED-MODULE.md`
+    /// §4–§5). Built here with `models: None` (no `ModelCallbackDeps` exists
+    /// yet at `AppState::new` time — see that field's own doc); `serve`
+    /// REPLACES this with a fresh one built from the real deps, hydrated from
+    /// `attached.json`, right before spawning the attach listener — the same
+    /// "start empty, replace once real data is ready" pattern `os_reports`
+    /// uses just below, and for the same reason (this reassignment happens
+    /// before `state` is ever cloned into the router).
+    pub attach_registry: Arc<crate::attach_registry::AttachRegistry>,
 }
 
 /// A shutdown request, from anything that can make one — a signal, `POST
@@ -293,37 +327,75 @@ impl crate::domain::ModelInventory for ModelCatalog {
     }
 }
 
-/// Adapts the run manager to the scheduler's `RunTrigger` — a fired schedule
-/// becomes a background run tagged with the schedule id.
-struct RunManagerTrigger {
+/// Adapts the run manager and the module deliverer to the scheduler's
+/// `RunTrigger` (design `docs/design/ME4-S1-scheduler-callback.md` §3.3) — a
+/// fired schedule becomes either a background run tagged with the schedule
+/// id (`AgentRun`) or a real kernel request into the module's live
+/// `Generation` (`Module`, ME4-1.3.1).
+///
+/// Named `KernelTrigger` (not `RunManagerTrigger`, its ME4-1.2.2b2/b3 working
+/// name) because it now speaks for BOTH arms of the kernel's own trigger
+/// interface, not just `RunManager`: the `AgentRun` arm is the original
+/// `RunManagerTrigger` body, byte-identical, wrapped to classify into
+/// `FireOutcome` (`Ok(run_id)` -> `AgentRun`, `Err(e)` -> `Failed`). The
+/// `Module` arm delegates to `ModuleDeliverer` (`scheduler_deliver.rs`), which
+/// is `Deferred(MountPending)` for every fire until `server::serve` calls
+/// `ModuleDeliverer::set_supervisors` right after `mount_all` returns (design
+/// §4.6) — never a failure either way (§4.1: none of `DeferReason`'s variants
+/// are the module's fault). Only the DELIVERY PUMP
+/// (`agent24_scheduler::deliveries::DeliveryPump`) ever calls this arm for a
+/// module row — the tick itself never does (design §3.2).
+struct KernelTrigger {
     runs: Arc<agent24_agent::RunManager>,
+    deliverer: Arc<crate::scheduler_deliver::ModuleDeliverer>,
 }
 
 #[async_trait::async_trait]
-impl agent24_scheduler::RunTrigger for RunManagerTrigger {
+impl agent24_scheduler::RunTrigger for KernelTrigger {
     async fn trigger(
         &self,
-        action: &agent24_protocol::ScheduleAction,
-        schedule_id: &str,
-    ) -> Result<String, String> {
-        let agent24_protocol::ScheduleAction::AgentRun {
-            prompt,
-            session_id,
-            model_override,
-        } = action;
-        let create = agent24_protocol::RunCreate {
-            session_id: session_id.clone(),
-            prompt: prompt.clone(),
-            model_override: model_override.clone(),
-            // Scheduled runs are unattended — plan mode needs a human to approve
-            // the plan, so a fired schedule always runs Normal.
-            mode: agent24_protocol::RunMode::Normal,
-        };
-        self.runs
-            .start_run_with_schedule(create, Some(schedule_id.to_owned()))
-            .await
-            .map(|run| run.id)
-            .map_err(|err| err.to_string())
+        invocation: &agent24_scheduler::ScheduleInvocation,
+    ) -> agent24_scheduler::FireOutcome {
+        match &invocation.target {
+            agent24_scheduler::InvocationTarget::AgentRun(action) => {
+                let agent24_protocol::ScheduleAction::AgentRun {
+                    prompt,
+                    session_id,
+                    model_override,
+                } = action;
+                let create = agent24_protocol::RunCreate {
+                    session_id: session_id.clone(),
+                    workspace_id: None,
+                    prompt: prompt.clone(),
+                    model_override: model_override.clone(),
+                    // Scheduled runs are unattended — plan mode needs a human
+                    // to approve the plan, so a fired schedule always runs
+                    // Normal.
+                    mode: agent24_protocol::RunMode::Normal,
+                };
+                match self
+                    .runs
+                    .start_run_with_schedule(create, Some(invocation.schedule_id.clone()))
+                    .await
+                {
+                    Ok(run) => agent24_scheduler::FireOutcome::AgentRun { run_id: run.id },
+                    Err(err) => agent24_scheduler::FireOutcome::Failed {
+                        reason: err.to_string(),
+                    },
+                }
+            }
+            agent24_scheduler::InvocationTarget::Module { owner, fire_id } => {
+                self.deliverer
+                    .deliver(
+                        owner,
+                        fire_id,
+                        invocation.trigger.as_str(),
+                        &agent24_scheduler::next_fire::fmt_iso(invocation.scheduled_for),
+                        &agent24_scheduler::next_fire::fmt_iso(invocation.fired_at),
+                    )
+                    .await
+            }
+        }
     }
 }
 
@@ -440,6 +512,7 @@ pub struct AppDeps {
     pub shutdown: Shutdown,
     pub guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     pub memory: Option<agent24_agent::SessionMemory>,
+    pub workspace_service: Option<StdArc<agent24_workspace::WorkspaceService>>,
     pub mcp_servers: Vec<Arc<agent24_mcp::McpServer>>,
     /// Pre-loaded user overrides (H2). Injected rather than loaded here so
     /// tests can wire an empty or hand-built set.
@@ -465,11 +538,25 @@ impl AppState {
             shutdown,
             guardian,
             memory,
+            workspace_service,
             mcp_servers,
             risk_overrides,
             packages_root,
         } = deps;
+        // ME4-desktop-model-ui: spawned here (not in `serve()`) so every
+        // `AppState` — including the one every unit test builds via this
+        // same `new()` — gets a real (if test-scale) writer task, and
+        // `/api/v1/chat` (routes.rs) can reach it as `state.timings` exactly
+        // like `state.events`/`state.usage`.
+        let (timings, _timing_writer_handle) =
+            crate::timing_recorder::TimingRecorder::spawn(store.clone());
         let events = crate::events::EventsHub::default();
+        // ME4-desktop-model-ui follow-up (review M2): a passive observer on
+        // the WS bus, recording through the SAME `timings` sink/writer as
+        // `_a24/model/complete`/`/api/v1/chat` — see `agentear_timings.rs`'s
+        // doc comment for why this is NOT wired through the RPC path.
+        let _agentear_timing_bridge_handle =
+            crate::agentear_timings::spawn_agentear_timing_bridge(events.clone(), timings.clone());
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
         let timeout = std::env::var("A24_APPROVAL_TIMEOUT_SECS")
@@ -492,19 +579,24 @@ impl AppState {
                     &broker,
                 )))),
         );
-        let runs = agent24_agent::RunManager::with_memory(
+        let runs = agent24_agent::RunManager::with_memory_and_workspace(
             store.clone(),
             Arc::clone(&router),
             Arc::clone(&tools),
             StdArc::new(events.clone()),
             shutdown.token().clone(),
             memory,
+            workspace_service,
         );
         let sched_hub = events.clone();
+        let deliverer = StdArc::new(crate::scheduler_deliver::ModuleDeliverer::new(
+            crate::scheduler_deliver::PRODUCTION_LIMITS,
+        ));
         let scheduler = agent24_scheduler::Scheduler::new(
             store.clone(),
-            StdArc::new(RunManagerTrigger {
+            StdArc::new(KernelTrigger {
                 runs: Arc::clone(&runs),
+                deliverer: StdArc::clone(&deliverer),
             }),
             StdArc::new(move |body| sched_hub.broadcast(body)),
         );
@@ -513,9 +605,24 @@ impl AppState {
         // above (design doc "现状" 4).
         let module_approval_broker =
             crate::module_approval_broker::ModuleApprovalBroker::new(store.clone(), events.clone());
+        let attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
+            crate::attach_registry::AttachDeps {
+                scheduler: scheduler.clone(),
+                // No `ModelCallbackDeps` exists yet at this point (it needs
+                // the `UsageRecorder` `serve` spawns later) — `serve` builds
+                // the real registry once that exists and replaces this one,
+                // hydrated from `attached.json` (see this field's own doc on
+                // `AppState`).
+                models: None,
+                approval_broker: module_approval_broker.clone(),
+                events: events.clone(),
+            },
+        ));
         Self {
             risk_overrides,
             token: Arc::new(token),
+            auth_mode: AuthMode::LegacySingleToken,
+            capabilities: None,
             mcp_servers: Arc::new(mcp_servers),
             router,
             tools,
@@ -523,6 +630,7 @@ impl AppState {
             module_approval_broker,
             usage: Arc::new(crate::routes::UsageCounters::default()),
             events,
+            timings,
             store,
             // Empty until `serve` replaces it after the mount pass, which happens
             // before the router (and therefore any request handler) can clone this
@@ -545,12 +653,20 @@ impl AppState {
             )),
             runs,
             scheduler,
+            deliverer,
             shutdown,
+            attach_registry,
         }
     }
 }
 
 impl AppState {
+    fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
+        self.token = Arc::new(String::new());
+        self.auth_mode = AuthMode::Capabilities;
+        self.capabilities = Some(store);
+    }
+
     /// Re-read the override set after the user changed it.
     ///
     /// A failed reload leaves the previous snapshot in place rather than
@@ -564,7 +680,7 @@ impl AppState {
     }
 }
 
-pub use agent24_domain::http::error_response;
+pub use agent24_domain::http::{error_response, error_response_with_hint};
 
 async fn health() -> Json<Health> {
     Json(Health {
@@ -597,6 +713,186 @@ async fn fallback() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
 }
 
+#[derive(serde::Deserialize)]
+struct MintCreativeBody {
+    workspace_id: String,
+    #[serde(alias = "attachment_id")]
+    creative_attachment_id: String,
+    #[serde(alias = "principal_id")]
+    creative_principal_id: String,
+    #[serde(alias = "sidecar_instance_id")]
+    sidecar_generation: String,
+    #[serde(default = "default_creative_ttl")]
+    ttl_seconds: u64,
+    #[serde(default)]
+    allowed_operations: Option<Vec<String>>,
+}
+
+const fn default_creative_ttl() -> u64 {
+    300
+}
+
+fn valid_scope_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
+    use crate::capabilities::Operation;
+    match operation {
+        Operation::ModelsAdmin => "models.admin",
+        Operation::WorkspaceCreate => "workspace.create",
+        Operation::WorkspaceRelease => "workspace.release",
+        Operation::HostLease => "host.lease",
+        Operation::ApprovalDecision => "approval.decision",
+        Operation::GrantManage => "grant.manage",
+        Operation::OverrideManage => "override.manage",
+        Operation::ScheduleManage => "schedule.manage",
+        Operation::ModuleAdmin => "module.admin",
+        Operation::CapabilityMint => "capability.mint",
+        Operation::CapabilityRevoke => "capability.revoke",
+        Operation::Shutdown => "shutdown",
+        Operation::ModelsRead => "models.read",
+        Operation::WorkspaceResolve => "workspace.resolve",
+        Operation::SessionCreate => "session.create",
+        Operation::SessionRead => "session.read",
+        Operation::SessionTranscript => "session.transcript",
+        Operation::RunCreate => "run.create",
+        Operation::RunRead => "run.read",
+        Operation::RunCancel => "run.cancel",
+        Operation::EventsRead => "events.read",
+        Operation::ApprovalStatusRead => "approval.status",
+    }
+}
+
+async fn mint_creative_capability(
+    State(state): State<AppState>,
+    authorization: Option<Extension<crate::capabilities::Authorization>>,
+    Json(body): Json<MintCreativeBody>,
+) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Creative capabilities require capability auth mode",
+        );
+    };
+    let Some(Extension(authorization)) = authorization else {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Host authority required",
+        );
+    };
+    if body.ttl_seconds == 0
+        || body.ttl_seconds > crate::capabilities::MAX_CREATIVE_TTL_SECONDS
+        || !valid_scope_id(&body.workspace_id)
+        || !valid_scope_id(&body.creative_attachment_id)
+        || !valid_scope_id(&body.creative_principal_id)
+        || !valid_scope_id(&body.sidecar_generation)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_capability_scope",
+            "Invalid capability scope or TTL",
+        );
+    }
+
+    let mut request = crate::capabilities::CreativeMintRequest::new(
+        body.workspace_id,
+        body.creative_attachment_id,
+        body.creative_principal_id,
+        body.sidecar_generation,
+        Duration::from_secs(body.ttl_seconds),
+        crate::capabilities::unix_now(),
+    );
+    if let Some(actions) = body.allowed_operations {
+        let allowlist = crate::capabilities::Operation::creative_allowlist();
+        let mut operations = Vec::with_capacity(actions.len());
+        for action in actions {
+            let Some(operation) = crate::capabilities::Operation::from_action(&action) else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_capability_operation",
+                    "Unknown capability operation",
+                );
+            };
+            if !allowlist.contains(&operation) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_capability_operation",
+                    "Operation is not available to Creative runtimes",
+                );
+            }
+            operations.push(operation);
+        }
+        request = request.with_allowed_operations(operations);
+    }
+
+    let minted = match store.mint_creative_authorized(&authorization, request) {
+        Ok(minted) => minted,
+        Err(_) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Host authority required",
+            );
+        }
+    };
+    let (token, capability_id, claims) = minted.into_bearer_parts();
+    let allowed_operations = claims
+        .allowed_operations
+        .iter()
+        .copied()
+        .map(operation_name)
+        .collect::<Vec<_>>();
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "capability_id": capability_id,
+            "token": token,
+            "audience": "creative_runtime",
+            "workspace_id": claims.workspace_id,
+            "creative_attachment_id": claims.attachment_id,
+            "creative_principal_id": claims.principal_id,
+            "daemon_generation": claims.daemon_generation,
+            "host_generation": claims.host_generation,
+            "sidecar_generation": claims.sidecar_generation,
+            "created_at": claims.created_at,
+            "expires_at": claims.expires_at,
+            "allowed_operations": allowed_operations,
+        })),
+    )
+        .into_response()
+}
+
+async fn revoke_capability(
+    State(state): State<AppState>,
+    Path(capability_id): Path<String>,
+) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Capability revocation requires capability auth mode",
+        );
+    };
+    if !valid_scope_id(&capability_id) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_capability_id",
+            "Invalid capability id",
+        );
+    }
+    // Deliberately do not expose whether the ID existed or was already
+    // revoked. The endpoint is idempotent and is not a capability oracle.
+    let _ = store.revoke_by_id(&capability_id);
+    Json(serde_json::json!({
+        "capability_id": capability_id,
+        "state": "revoked",
+    }))
+    .into_response()
+}
+
 /// Bearer-token gate for everything except `GET /api/v1/health`
 /// (SPEC-002 §4: health is the only unauthenticated endpoint — method
 /// included, so a future POST on the same path never silently bypasses auth).
@@ -613,24 +909,86 @@ async fn fallback() -> Response {
 /// This note lives beside the auth middleware rather than beside the proxy
 /// because the person adding such a header is reading this file
 /// (SPEC-ME3-OUT-OF-PROCESS §2.1).
-async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
+async fn auth(State(state): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
         return next.run(req).await;
     }
-    let authorized = req
+    let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()));
-    if authorized {
-        next.run(req).await
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match state.auth_mode {
+        AuthMode::LegacySingleToken => {
+            if bearer.is_some_and(|presented| {
+                constant_time_eq(presented.as_bytes(), state.token.as_bytes())
+            }) {
+                next.run(req).await
+            } else {
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                )
+            }
+        }
+        AuthMode::Capabilities => {
+            let Some(store) = state.capabilities.as_ref() else {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "host_authority_unavailable",
+                    "Capability authority unavailable",
+                );
+            };
+            let Some(bearer) = bearer else {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                );
+            };
+            let operation = required_operation(req.method(), req.uri().path());
+            match store.validate_bearer(
+                bearer,
+                operation,
+                &crate::capabilities::Resource::global(),
+                crate::capabilities::unix_now(),
+            ) {
+                Ok(authorization) => {
+                    req.extensions_mut().insert(authorization);
+                    next.run(req).await
+                }
+                Err(
+                    crate::capabilities::CapabilityError::OperationDenied
+                    | crate::capabilities::CapabilityError::ResourceDenied
+                    | crate::capabilities::CapabilityError::HostRequired,
+                ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
+                Err(_) => error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                ),
+            }
+        }
+    }
+}
+
+/// Capability policy is deliberately closed. Until durable workspace/session
+/// ownership lands, Creative can use only the global model catalogue. Every
+/// other existing or future route maps to a host-only operation by default.
+fn required_operation(method: &Method, path: &str) -> crate::capabilities::Operation {
+    use crate::capabilities::Operation;
+    if method == Method::GET && path == "/api/v1/models" {
+        Operation::ModelsRead
+    } else if method == Method::POST && path == "/api/v1/capabilities/creative" {
+        Operation::CapabilityMint
+    } else if method == Method::POST
+        && path.starts_with("/api/v1/capabilities/")
+        && path.ends_with("/revoke")
+    {
+        Operation::CapabilityRevoke
     } else {
-        error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        )
+        Operation::ModelsAdmin
     }
 }
 
@@ -664,7 +1022,20 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
+        .route(
+            "/api/v1/capabilities/creative",
+            post(mint_creative_capability),
+        )
+        .route(
+            "/api/v1/capabilities/{capability_id}/revoke",
+            post(revoke_capability),
+        )
         .route("/api/v1/usage", get(crate::routes::get_usage))
+        .route("/api/v1/timings", get(crate::routes::get_timings))
+        .route(
+            "/api/v1/timings/summary",
+            get(crate::routes::get_timings_summary),
+        )
         .route("/api/v1/tools", get(crate::routes::get_tools))
         .route(
             "/api/v1/tool-overrides",
@@ -713,7 +1084,29 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/schedules/{id}/run_now",
             axum::routing::post(crate::schedules::run_now),
         )
+        .route(
+            "/api/v1/schedules/{id}/suspend",
+            axum::routing::post(crate::schedules::suspend_schedule),
+        )
+        .route(
+            "/api/v1/schedules/{id}/resume",
+            axum::routing::post(crate::schedules::resume_schedule),
+        )
         .route("/api/v1/events", get(crate::events::ws_events))
+        // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2): register/rotate,
+        // list and revoke attached modules. `attached` is reserved in
+        // `RESERVED_KERNEL_SEGMENTS` (domain.rs) precisely because it is a
+        // literal `/api/v1/` segment here — see that constant's own doc and
+        // `reserved_segments_match_the_kernel_routes_exactly`.
+        .route(
+            "/api/v1/attached",
+            post(crate::attached_routes::post_attached).get(crate::attached_routes::list_attached),
+        )
+        .route(
+            "/api/v1/attached/{name}",
+            axum::routing::delete(crate::attached_routes::delete_attached)
+                .patch(crate::attached_routes::patch_attached),
+        )
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
         .route("/api/v1/os", get(crate::os_routes::list_os))
         .route(
@@ -725,6 +1118,15 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route(
             "/api/v1/os/{name}/stop",
             axum::routing::post(crate::os_routes::stop_now_os),
+        )
+        // A3-3 (`docs/design/A3-ATTACHED-MODULE.md` §6): reverse commands to
+        // an attached module, on the SAME connection it registered over —
+        // see `crate::attach_commands`. Attached modules never mount routes
+        // of their own (§2's table: "入站 REST 反代...无"), so this literal
+        // segment can never collide with a module's own surface.
+        .route(
+            "/api/v1/os/{name}/commands/{command}",
+            axum::routing::post(crate::attach_commands::post_command),
         )
         .route(
             "/api/v1/shutdown",
@@ -756,11 +1158,118 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A3-2b / Codex A3 follow-up (design §5.5): fills `cell` with `registry`,
+/// then immediately re-checks `cancel`, revoking every live generation if a
+/// shutdown raced ahead of the fill.
+///
+/// `serve`'s `stopping` task checks `cell` (a `OnceLock<Arc<AttachRegistry>>`)
+/// exactly ONCE, the instant shutdown is requested, and only calls
+/// `revoke_all()` if it finds the cell already filled. If shutdown instead
+/// races ahead of the fill — `stopping`'s single check runs, finds the cell
+/// empty, and gives up — nothing else would ever call `revoke_all()` for
+/// that daemon: the fill that follows a moment later would be the LAST thing
+/// to ever touch the registry, leaving its live generations/tokens (none
+/// yet, this early, but hydration just before the fill may already have
+/// populated `entries` with disk-registered modules) "live" forever, and the
+/// attach listener started just after would keep accepting/handshaking
+/// connections for a daemon that is meant to be going away. Re-checking
+/// `cancel` immediately after the fill catches exactly that ordering.
+/// `revoke_all()` is idempotent (see its own doc), so calling it here is a
+/// harmless no-op on the OTHER ordering, where `stopping`'s own check
+/// already found the cell filled and revoked everything itself — between the
+/// two checks, every interleaving of "shutdown requested" vs "cell filled"
+/// is covered by exactly one of them.
+///
+/// A free function — not inlined into `serve` — so the two
+/// `stopping`-task-races-the-fill regression tests in this file's `tests`
+/// module call this SAME code, instead of re-describing the logic next to
+/// it (a reverse mutation removing the re-check below must turn those tests
+/// red; see their doc comments).
+fn fill_attach_registry_and_recheck(
+    cell: &std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
+    registry: &Arc<crate::attach_registry::AttachRegistry>,
+    cancel: &CancellationToken,
+) {
+    let _ = cell.set(Arc::clone(registry));
+    if cancel.is_cancelled() {
+        registry.revoke_all();
+    }
+}
+
+const APPROVAL_RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(10);
+
+fn spawn_approval_recovery_scan(
+    broker: Arc<agent24_policy::ApprovalBroker>,
+    runs: Arc<agent24_agent::RunManager>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    spawn_approval_recovery_scan_every(broker, runs, APPROVAL_RECOVERY_SCAN_INTERVAL, cancel)
+}
+
+fn spawn_approval_recovery_scan_every(
+    broker: Arc<agent24_policy::ApprovalBroker>,
+    runs: Arc<agent24_agent::RunManager>,
+    interval: Duration,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+            }
+            let now = agent24_core::util::now_iso8601();
+            match broker.timeout_expired(&now).await {
+                Ok(expired) if expired > 0 => {
+                    tracing::warn!("timed out {expired} expired approval(s)");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!("expired approval scan failed; will retry: {err}");
+                }
+            }
+            match runs.recover_timed_out_approval_runs().await {
+                Ok(cancelled) if cancelled > 0 => {
+                    tracing::warn!(
+                        "cancelled {cancelled} token-less run(s) after approval timeout"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!("timed-out run recovery scan failed; will retry: {err}");
+                }
+            }
+        }
+    })
+}
+
 pub async fn serve(
     port: u16,
     ephemeral: bool,
+    auth_mode: AuthMode,
+    host_bootstrap_stdio: bool,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    validate_auth_startup(auth_mode, host_bootstrap_stdio)?;
+    let (mut host_ready, parent_liveness) = match (auth_mode, host_bootstrap_stdio) {
+        (AuthMode::Capabilities, true) => {
+            let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
+            (Some(writer), Some(liveness))
+        }
+        (AuthMode::Capabilities, false) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "capability mode requires trusted host bootstrap stdio",
+            ));
+        }
+        (AuthMode::LegacySingleToken, false) => (None, None),
+        (AuthMode::LegacySingleToken, true) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host bootstrap stdio is valid only in capability mode",
+            ));
+        }
+    };
     // The shutdown controller, and the signals that request it, before
     // anything else: a SIGTERM during startup — which can take seconds (the
     // store, MCP servers, model probing) — runs this bounded shutdown rather
@@ -771,6 +1280,14 @@ pub async fn serve(
     let (params, config_warnings) = crate::lifecycle::Params::from_process_env();
     let mut config_warnings = config_warnings;
     let shutdown = Shutdown::with_params(cancel.clone(), params);
+    if let Some(parent_liveness) = parent_liveness {
+        let parent_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            parent_liveness.closed().await;
+            parent_shutdown.request();
+            tracing::info!("trusted host bootstrap closed; shutting down capability daemon");
+        });
+    }
     // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
     // Registered HERE — before any module process can be started — and
     // synchronously: a SIGTERM arriving while packages start must run this
@@ -887,7 +1404,22 @@ pub async fn serve(
         })
     };
 
-    let token = generate_token();
+    let daemon_generation = generate_token();
+    let (token, capability_store, product_host_token) = match auth_mode {
+        AuthMode::LegacySingleToken => (generate_token(), None, None),
+        AuthMode::Capabilities => {
+            let store = crate::capabilities::CapabilityStore::new(daemon_generation.clone());
+            let minted = store
+                .mint_product_host(
+                    generate_token(),
+                    Duration::from_secs(u64::MAX),
+                    crate::capabilities::unix_now(),
+                )
+                .map_err(std::io::Error::other)?;
+            let (bearer, _, _) = minted.into_bearer_parts();
+            (String::new(), Some(store), Some(bearer))
+        }
+    };
     // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
     let store = if ephemeral {
         Store::open_memory().await.map_err(std::io::Error::other)?
@@ -987,6 +1519,17 @@ pub async fn serve(
     let state_dir = agent24_protocol::state_file::state_dir()
         .ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
+    #[cfg(unix)]
+    let workspace_service = if ephemeral {
+        None
+    } else {
+        Some(StdArc::new(
+            agent24_workspace::WorkspaceService::compose(store.clone(), &state_dir)
+                .map_err(std::io::Error::other)?,
+        ))
+    };
+    #[cfg(not(unix))]
+    let workspace_service = None;
     let mut state = AppState::new(AppDeps {
         token: token.clone(),
         router,
@@ -996,45 +1539,90 @@ pub async fn serve(
         shutdown: shutdown.clone(),
         guardian,
         memory,
+        workspace_service,
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    if let Some(capability_store) = capability_store {
+        state.enable_capability_auth(capability_store);
+    }
+
+    // M7 durable expiry recovery runs before durable-resume: a stale approval
+    // must become timed_out before anything can re-broadcast it or preflight its
+    // authority. The orphan sweeps below then own cancellation of its parked run.
+    let approval_now = agent24_core::util::now_iso8601();
+    let expired = state
+        .broker
+        .timeout_expired(&approval_now)
+        .await
+        .map_err(std::io::Error::other)?;
+    if expired > 0 {
+        tracing::warn!("timed out {expired} expired approval(s) during startup recovery");
+    }
+    let recovered_timeouts = state
+        .runs
+        .recover_timed_out_approval_runs()
+        .await
+        .map_err(std::io::Error::other)?;
+    if recovered_timeouts > 0 {
+        tracing::warn!(
+            "cancelled {recovered_timeouts} token-less run(s) after startup approval timeout"
+        );
+    }
 
     // H3 durable-resume startup, BEFORE accepting any request and BEFORE the
     // orphan sweep: restore restorable parked approvals (re-broadcast + keep
     // pending) so their runs survive to be resumed when answered, and abort the
     // rest fail-closed. The orphan sweep then cancels every still-non-terminal
     // run whose approval did NOT survive — so the restore MUST come first.
-    let (restored, aborted) = state.runs.restore_pending_approvals().await;
+    let (restored, aborted) = state
+        .runs
+        .restore_pending_approvals()
+        .await
+        .map_err(std::io::Error::other)?;
     if restored > 0 || aborted > 0 {
         tracing::info!(
             "durable resume: {restored} approval(s) restored, {aborted} aborted from a previous process"
         );
     }
+    let now = agent24_core::util::now_iso8601();
     let orphans = state
         .store
-        .sweep_orphan_runs(&agent24_core::util::now_iso8601())
+        .sweep_orphan_runs(&now)
         .await
         .map_err(std::io::Error::other)?;
     if orphans > 0 {
         tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
     }
+    let workspace_now = workspace_recovery_instant_at(std::time::SystemTime::now())?;
+    let workspace_orphans = state
+        .store
+        .sweep_workspace_orphan_runs(&workspace_now)
+        .await
+        .map_err(std::io::Error::other)?;
+    if workspace_orphans.released_leases > 0 {
+        tracing::warn!(
+            "cancelled {} workspace-bound orphan run(s) from a previous process",
+            workspace_orphans.released_leases
+        );
+    }
 
-    // Scheduler tick loop: polls due schedules and fires runs. Cadence from
-    // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
-    // minute, so a few seconds' latency is invisible).
-    let tick_secs = std::env::var("A24_SCHEDULER_TICK_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(10);
-    let scheduler = Arc::clone(&state.scheduler);
-    let sched_cancel = cancel.clone();
-    tokio::spawn(scheduler.run(
-        StdArc::new(agent24_scheduler::SystemClock),
-        Duration::from_secs(tick_secs),
-        sched_cancel,
-    ));
+    // M7: approvals can outlive the task that originally armed their in-memory
+    // timeout. Keep durable expiry/recovery active for the daemon lifetime; a
+    // shutdown child token stops the loop cleanly, and each interval is also the
+    // retry mechanism for transient store or recovery-cancel failures.
+    spawn_approval_recovery_scan(
+        Arc::clone(&state.broker),
+        Arc::clone(&state.runs),
+        cancel.child_token(),
+    );
+
+    // ME4-1.3.1 (design §3.2/§4.6, S1-6): the scheduler's tick loop AND
+    // delivery pump are spawned AFTER `mount_all` returns, below — not here.
+    // Before `mount_all` there is no `ProcessHost`/`Supervisors` for a module
+    // fire to be delivered into, and no `InstalledOwners` catalogue for the
+    // tick to gate delivery-row recording on; starting either loop first
+    // would let a tick land on a module row before either exists.
 
     // T7b/ME-3e: the periodic module-approval timeout scan (design doc
     // decision 5) — a plain periodic task, not a per-row timer, on the same
@@ -1048,44 +1636,17 @@ pub async fn serve(
     // naming its components is not the coupling ADR-029 objects to. Everything
     // downstream — routing, the data directory, the event module, the capability
     // grant — is derived from the manifest, so `crate::domain` and
-    // `build_router_with_modules` still contain no Sin90-shaped branch. A second
-    // OS is another entry in the CATALOGUE below — each with its own builder, which
-    // the mounter calls only if that module is admissible and enabled, so one that
+    // `build_router_with_modules` still contain no module-shaped branch. An OS is
+    // another entry in the CATALOGUE below — each with its own builder, which the
+    // mounter calls only if that module is admissible and enabled, so one that
     // fails to construct cannot stop the others.
-    let mode = if ephemeral {
-        // Ephemeral daemons get an in-memory store and NO migration: they are
-        // private to one CLI invocation and must not touch the user's database.
-        agent24_sin90_os::StorageMode::Memory
-    } else {
-        // Pre-ME-1b daemons kept Sin90 at `~/.agent24/sin90.db`. Handing that path
-        // over as `legacy` is what stops an upgrading user from opening a
-        // brand-new empty Sin90 while their real data sits one directory up; the
-        // copy itself is a SQLite snapshot, not a file move (see
-        // `Sin90Store::open_migrating_from`).
-        agent24_sin90_os::StorageMode::Persistent {
-            legacy: Some(state_dir.join("sin90.db")),
-        }
-    };
-    // The CATALOGUE — what this build provides — comes first, and deliberately
-    // does NOT construct anything. Constructing before consulting the registry
-    // creates a trap: a module that panics or fails in its constructor takes the
-    // daemon down (or vanishes from the reports), and `agent24 os disable` cannot
-    // rescue it because the name it needs was never registered. Naming what we
-    // have, then deciding what to build, means a switched-off module is never
-    // constructed at all — which is exactly what a user reaching for `disable`
-    // needs.
-    let catalogue = vec![crate::domain::Installed {
-        name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
-        version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-        // A CLOSURE, not a constructed module: the mounter decides whether this
-        // ever runs. That is what lets a user switch off a domain OS whose
-        // constructor is the thing breaking the daemon.
-        build: crate::domain::Build::InProcess(Box::new(move || {
-            agent24_sin90_os::Sin90Module::new(mode.clone())
-                .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
-                .map_err(|e| e.to_string())
-        })),
-    }];
+    //
+    // T11: this build compiles in no domain OS at all — Sin90 (the one that used
+    // to live here as `agent24-sin90-os`) now ships from `iDoris-ai/Sin90` as an
+    // out-of-process package, discovered below by `with_discovered` like any
+    // other third-party OS, not hardcoded into this catalogue. A future
+    // compiled-in OS is still just another entry in this `Vec`.
+    let catalogue: Vec<crate::domain::Installed> = Vec::new();
 
     // ME-3a: the catalogue is no longer only what was compiled in. The merge is a
     // free function so it can be tested without standing up a daemon — see
@@ -1125,8 +1686,8 @@ pub async fn serve(
     // information, never wrong information). Neither can change what mounts.
     // A model declaration lives in a manifest, and reading a manifest means
     // constructing the module — which is exactly what the catalogue exists to
-    // avoid. So the probe is skipped: no module in this build declares one (Sin90
-    // declares none), and paying a multi-provider network sweep at every startup to
+    // avoid. So the probe is skipped: this build compiles in no domain OS at all
+    // (T11), and paying a multi-provider network sweep at every startup to
     // discover that would be worse than the `Unknown` it would avoid.
     //
     // This is a CONSTANT, not a predicate, and deliberately so — writing a
@@ -1186,11 +1747,38 @@ pub async fn serve(
     // Handed over here, synchronously, before the task exists: from now on
     // only a summary on disk removes the marker (SHUT-1b).
     let marker = marker.map(crate::lifecycle::MarkerGuard::into_stopping);
+    // A3-2b (design §5.5, M2): the REAL attach registry (with model deps)
+    // does not exist yet at this point in `serve` — it needs the
+    // `UsageRecorder` built further down. This cell is filled in once it is,
+    // right before the attach listener starts; the `stopping` task below only
+    // ever reads it AFTER a shutdown was requested, which cannot happen
+    // before that fill (a shutdown racing in during startup finds the cell
+    // empty and has nothing to revoke — the listener that would let a module
+    // attach has not started either in that same window).
+    let attach_registry_cell: Arc<
+        std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
+    > = Arc::new(std::sync::OnceLock::new());
+    let stopping_attach_registry = Arc::clone(&attach_registry_cell);
+    // COMM-4a: the Hyphae daemon supervisor (if comm_routes managed to build
+    // one) is, like the attach registry above, only known once `comm_routes::
+    // build` runs — AFTER this task is spawned — so it is handed over the
+    // same way: a cell filled in later, read only after a shutdown began.
+    let comm_daemon_cell: Arc<std::sync::OnceLock<Arc<agent24_comm::HyphaeDaemonSupervisor>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let stopping_comm_daemon = Arc::clone(&comm_daemon_cell);
     let stopping = tokio::spawn(async move {
         stop_shutdown.token().cancelled().await;
         // Whoever cancelled, the shutdown has begun: fixed here if nothing
         // fixed it yet (SHUT-1b).
         stop_shutdown.request();
+        // §5.5: revoke every attached module's live generation and drop its
+        // grants (the last `ModelCallbackDeps` clone with it) in the SAME
+        // phase the out-of-process supervisors' `close()` runs in, below —
+        // and, transitively, before `stop_usage_writer` (every call site of
+        // it awaits THIS task first).
+        if let Some(registry) = stopping_attach_registry.get() {
+            registry.revoke_all();
+        }
         let deadlines = stop_shutdown.deadlines();
         // The discovery state goes first, off this task: a watchdog exit later
         // must not leave a state file pointing at a daemon that is gone. (The
@@ -1228,19 +1816,118 @@ pub async fn serve(
             }))
             .collect();
         let params = stop_shutdown.params();
-        if tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain))
-            .await
-            .is_err()
-        {
+        // COMM-4a §6.2 / PR #626 review, High #2: comm's stop shares the
+        // SAME absolute deadline every other out-of-process module's stop
+        // does, and runs CONCURRENTLY with them — it used to run
+        // sequentially, AFTER this `timeout_at` had already elapsed, under
+        // its own unvalidated ~5s-default grace (vs. SHUT-1b's validated
+        // 500ms default): a Hyphae daemon that ignored SIGTERM could then
+        // have `agent24d` hit the watchdog and exit before Hyphae was ever
+        // sent SIGKILL or a shutdown record was written for it.
+        // `HyphaeDaemonSupervisor::shutdown` queues its `Cmd::Shutdown`
+        // (channel `send`) before this `.await` ever starts waiting on the
+        // reply, so if the shared deadline is hit below, the actor task
+        // keeps running the stop (TERM, grace, KILL, reap) to completion on
+        // its own schedule regardless of whether anything here is still
+        // waiting on its result.
+        let comm_shutdown = async {
+            match stopping_comm_daemon.get() {
+                Some(daemon) => Some(daemon.shutdown().await),
+                None => None,
+            }
+        };
+        let (supervisors_result, comm_result) = tokio::join!(
+            tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain)),
+            tokio::time::timeout_at(deadlines.modules, comm_shutdown),
+        );
+        if supervisors_result.is_err() {
             tracing::warn!(
                 "out-of-process modules were still stopping at the deadline; their supervisors \
                  were dropped (SIGKILL attempted, exit unconfirmed)"
             );
         }
-        let records: Vec<_> = tracked
+        let mut records: Vec<_> = tracked
             .iter()
             .map(|(name, reason, record)| (name.clone(), *reason, record.snapshot()))
             .collect();
+        // COMM-4a §6.2: comm's stop is folded into this same module-stop
+        // phase, recorded as `comm.hyphae` in `last-shutdown.json`'s
+        // `records[]`. `agent24-comm` never depends on
+        // `agent24-os-proto` (COMM-HYPHAE.md §7's zero-run boundary), so the
+        // translation from its own neutral `DaemonShutdownOutcome` into this
+        // crate's `StopRecord` happens here, not there.
+        match comm_result {
+            Ok(None) => {}
+            Ok(Some(outcome)) => {
+                let leader = outcome.leader.map(|l| match l {
+                    agent24_comm::ShutdownLeader::GoneBeforeTerm => {
+                        agent24_os_proto::stop_record::Leader::GoneBeforeTerm
+                    }
+                    agent24_comm::ShutdownLeader::ExitedInGrace => {
+                        agent24_os_proto::stop_record::Leader::ExitedInGrace
+                    }
+                    agent24_comm::ShutdownLeader::KilledAfterGrace => {
+                        agent24_os_proto::stop_record::Leader::KilledAfterGrace
+                    }
+                });
+                // `StopRecord` has two private fields (`drain_began`,
+                // `abandoning`) not meant for a caller outside
+                // `agent24-os-proto` to set, so `..Default::default()` is
+                // unavailable here — plain field assignment on a
+                // `Default::default()` value only touches the public ones
+                // this comm translation actually has an opinion about.
+                let mut record = agent24_os_proto::stop_record::StopRecord::default();
+                record.process = Some(if outcome.had_process {
+                    agent24_os_proto::stop_record::ProcessAtStop::Running
+                } else {
+                    agent24_os_proto::stop_record::ProcessAtStop::None
+                });
+                record.leader = leader;
+                // `KilledAfterGrace` means `kill_group_gracefully` sent
+                // SIGKILL after the grace ran out but never re-confirmed the
+                // group was actually empty afterwards — recording `Gone`
+                // (= "confirmed empty") there would misreport a daemon
+                // possibly still stuck through SIGKILL as a clean shutdown
+                // (PR #626 review, Low). `GoneBeforeTerm`/`ExitedInGrace`
+                // both come from a loop that did observe the group
+                // disappear, so `Gone` is still correct there.
+                record.group = outcome.had_process.then(|| {
+                    if leader == Some(agent24_os_proto::stop_record::Leader::KilledAfterGrace) {
+                        agent24_os_proto::stop_record::GroupEnd::KillAttempted
+                    } else {
+                        agent24_os_proto::stop_record::GroupEnd::Gone
+                    }
+                });
+                record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped);
+                records.push((
+                    "comm.hyphae".to_owned(),
+                    crate::lifecycle::Reason::Shutdown,
+                    record,
+                ));
+            }
+            Err(_) => {
+                // The shared deadline was hit before comm's own stop
+                // replied. Its process group is still being cleaned up on
+                // the actor's own task either way (see the comment above) —
+                // this only means the OUTCOME could not be confirmed in
+                // time to record accurately, so the record says exactly
+                // that rather than guessing `Gone`.
+                tracing::warn!(
+                    "comm: the hyphae daemon's stop did not complete by the shared modules \
+                     deadline; its process group is still being cleaned up on the \
+                     supervisor's own task, but the outcome could not be confirmed in time \
+                     to record"
+                );
+                let mut record = agent24_os_proto::stop_record::StopRecord::default();
+                record.process = Some(agent24_os_proto::stop_record::ProcessAtStop::Running);
+                record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::CutOff);
+                records.push((
+                    "comm.hyphae".to_owned(),
+                    crate::lifecycle::Reason::Shutdown,
+                    record,
+                ));
+            }
+        }
         let summary = crate::lifecycle::Summary::new(
             marker
                 .as_ref()
@@ -1274,6 +1961,42 @@ pub async fn serve(
             }
         }
     });
+    // ME4-4.2.3b (design §6.3): the production usage sink. `hard_stop`
+    // mirrors `modules_cut_off()`'s own shape — the shutdown token cancelled,
+    // then the SAME `deadlines().modules` instant (cut-off + `CONFIRM`) —
+    // rather than reusing `modules_cut_off()` itself: that future is a fresh
+    // "began" read the FIRST time it's polled, and this recorder's hard stop
+    // must line up with `stop_usage_writer`'s own `deadlines().modules` call
+    // below, not with whenever this particular future happens to be polled.
+    // `deadlines()` itself is idempotent (`Shutdown::began` is a `OnceLock`),
+    // so both reads agree regardless.
+    let usage_hard_stop = {
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown.token().cancelled().await;
+            tokio::time::sleep_until(shutdown.deadlines().modules).await;
+        }
+    };
+    let (usage_recorder, usage_writer) =
+        crate::usage_recorder::UsageRecorder::spawn(state.store.clone(), usage_hard_stop);
+    // A3-2b (design §5.5, M2): built ONCE here — not a second, structurally
+    // equivalent copy — so the attach registry's model calls are cancelled by
+    // the EXACT SAME `modules_cut_off()` cancellation tree a mounted
+    // package's calls are ("同一棵树"), and so its `usage` sender is the same
+    // `Arc` `stop_usage_writer` waits to see dropped. Cloned (not moved) into
+    // `CallbackDeps` below — `ModelCallbackDeps` is `Clone` by design for
+    // exactly this "more than one grantor needs the same deps" case.
+    let model_deps = crate::model_callback::ModelCallbackDeps {
+        router: state.router.clone(),
+        usage: usage_recorder.clone(),
+        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.modules_cut_off()),
+        admission: crate::model_callback::ModelAdmission::new(
+            crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+            crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+        ),
+        events: state.events.clone(),
+        timings: state.timings.clone(),
+    };
     let (module_routes, reports, partitions) = crate::domain::mount_all(
         &catalogue,
         &os_root,
@@ -1283,8 +2006,75 @@ pub async fn serve(
         lease.as_ref(),
         host.as_ref().map_err(String::as_str),
         &state.module_approval_broker,
+        crate::domain::CallbackDeps {
+            scheduler: state.scheduler.clone(),
+            // ME4-4.2.2b2 (design §2.4/§10.1): `router` is the SAME kernel
+            // router `/api/v1/chat` uses — each grant takes its own
+            // `with_separate_health()` view of it (v2 H2), never routing
+            // through it directly. `cancel_root` fires at
+            // `modules_cut_off()`, not at the start of shutdown (§3.3): a
+            // module's in-flight inference lives exactly as long as its own
+            // drain allows. ME4-4.2.3b: the usage sink is now the real
+            // `UsageRecorder` — `serve` waits for its writer below, AFTER the
+            // supervisors have stopped, via `stop_usage_writer`. Cloned (not
+            // moved) here: `serve` keeps its own `usage_recorder` binding
+            // alive to pass to `stop_usage_writer` later — that function
+            // itself is what drops the LAST reference, right before it
+            // awaits the writer's join (its own doc comment explains why
+            // that ordering matters).
+            models: Some(model_deps.clone()),
+        },
     )
     .await;
+
+    // ME4-1.3.1 (design §4.6): right after `mount_all` returns — before the
+    // tick loop or the delivery pump ever run — set the two handles they and
+    // `KernelTrigger`'s `Module` arm depend on.
+    //
+    // `InstalledOwners` gets every name `mount_all` was given (mounted,
+    // disabled in os.json, refused — anything the catalogue discovered), NOT
+    // only what mounted successfully (design v2, M5): a disabled entry is
+    // still "installed" and its schedules must keep pre-advancing even though
+    // no delivery row is recorded for them.
+    state
+        .scheduler
+        .installed_owners()
+        .set(catalogue.iter().map(|entry| entry.name.clone()).collect());
+    // `host` being `Err` means this daemon cannot start out-of-process
+    // modules at all (design §4.6, v2 L5): the deliverer's `OnceLock` is left
+    // unset, so every module fire stays `Deferred(MountPending)` until its
+    // 24h TTL — the tick loop below still starts unconditionally, so AgentRun
+    // rows are unaffected.
+    if let Ok(h) = &host {
+        state.deliverer.set_supervisors(h.supervisors.clone());
+    }
+
+    // Scheduler tick loop: polls due schedules, pre-advances, and fires
+    // AgentRun rows / records module deliveries. Cadence from
+    // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
+    // minute, so a few seconds' latency is invisible).
+    let tick_secs = std::env::var("A24_SCHEDULER_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(10);
+    let tick_scheduler = Arc::clone(&state.scheduler);
+    let tick_cancel = cancel.clone();
+    tokio::spawn(tick_scheduler.run(
+        StdArc::new(agent24_scheduler::SystemClock),
+        Duration::from_secs(tick_secs),
+        tick_cancel,
+    ));
+    // ME4-1.3.1 (design §5.4): the delivery pump — independent of the tick,
+    // its own cadence, driven by the same real clock. Cancelled by the SAME
+    // `CancellationToken` the tick loop uses: on shutdown, an attempt still in
+    // flight is aborted (its `JoinSet` is dropped) rather than awaited, and
+    // its delivery row is left `pending`/`deferred` for the next start
+    // (design §4.6/§5.4, judgement C4.12).
+    let pump = agent24_scheduler::deliveries::DeliveryPump::new(Arc::clone(&state.scheduler));
+    let pump_cancel = cancel.clone();
+    tokio::spawn(pump.run(StdArc::new(agent24_scheduler::SystemClock), pump_cancel));
+
     for p in partitions.partitions() {
         tracing::info!(
             "domain OS {} was lent a memory partition for user {}",
@@ -1379,7 +2169,65 @@ pub async fn serve(
     );
     state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
     state.shutdown_report = Arc::new(report);
-    let router = build_router_with_modules(state, module_routes);
+    // A3-2b (design §4/§5): the real attach registry — same "start empty,
+    // replace once real data is ready" pattern as `os_reports` above, and for
+    // the same ordering reason (this runs before `state` is cloned into the
+    // router). Hydrated from `attached.json` BEFORE the listener takes its
+    // first connection (`AttachRegistry::hydrate`'s own doc: a handshake
+    // racing an unloaded name would otherwise see a spurious `auth_failed`).
+    state.attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
+        crate::attach_registry::AttachDeps {
+            scheduler: state.scheduler.clone(),
+            models: Some(model_deps),
+            approval_broker: state.module_approval_broker.clone(),
+            events: state.events.clone(),
+        },
+    ));
+    // Review H1: an EPHEMERAL daemon (`agent24 ...` without a resident
+    // daemon, or an `os_local` helper spawning one just for one CLI call)
+    // must NOT touch `~/.agent24/attach/agent24d.sock` at all — that path is
+    // the REAL, resident daemon's. A short-lived daemon hydrating it and
+    // binding the real socket would make the resident daemon's own listener
+    // degrade (`bind`'s own "already accepting connections" check), or worse
+    // — if the resident daemon is not up yet — actually WIN the bind, so a
+    // real AgentEar connects to a process that exits moments later, silently
+    // losing every event/usage row it would have recorded. Attach support is
+    // simply not offered from an ephemeral daemon; hydration and the
+    // listener are both skipped.
+    if !ephemeral {
+        if let Some(path) = crate::attached::config_path()
+            && let Err(e) = state.attach_registry.hydrate(&path)
+        {
+            tracing::error!("could not hydrate the attach registry from {path:?}: {e}");
+        }
+        // Filled before the listener starts (see the cell's own comment
+        // above): the `stopping` task's `revoke_all` can now find it. See
+        // [`fill_attach_registry_and_recheck`]'s own doc comment for why the
+        // fill is immediately followed by a re-check of `cancel`.
+        fill_attach_registry_and_recheck(&attach_registry_cell, &state.attach_registry, &cancel);
+        if let Some(path) = crate::attached::socket_path() {
+            tokio::spawn(crate::attach_listener::run(
+                Arc::clone(&state.attach_registry),
+                path,
+                shutdown.child_token(),
+            ));
+        } else {
+            tracing::error!("attach listener not started: HOME is not set, no socket path to bind");
+        }
+    }
+    // COMM-2a: `/api/v1/comm/*` — merged into `module_routes` (not a literal
+    // route inside `build_router_with_modules` itself) so this stays behind
+    // kernel auth exactly like every other module route, and so the wiring
+    // itself lives in its own file (`comm_routes.rs`); see that file's own
+    // doc comment for the `RESERVED_KERNEL_SEGMENTS` gap this leaves.
+    let (comm_router, comm_daemon) = crate::comm_routes::build(&state_dir, params.stop_grace).await;
+    if let Some(handle) = comm_daemon {
+        // Best-effort: only `None` if this `set` races a shutdown that has
+        // already read the cell, in which case the daemon this build() just
+        // started is instead cleaned up by the NEXT start's orphan reap.
+        let _ = comm_daemon_cell.set(handle);
+    }
+    let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
     // this daemon is ready: its modules are stopped, and no state file or
@@ -1387,24 +2235,41 @@ pub async fn serve(
     // round 4). Checked again, atomically, before the ready line below.
     if cancel.is_cancelled() {
         let _ = stopping.await;
+        crate::usage_recorder::stop_usage_writer(
+            usage_recorder,
+            usage_writer,
+            shutdown.deadlines().modules,
+        )
+        .await;
         return Ok(());
     }
 
-    // SPEC-002 §4 ready line: parsers scan stdout for the first type=="ready"
-    // JSON line. stdout carries nothing else (logs go to stderr).
+    // SPEC-002 §4 ready line: legacy parsers scan stdout; capability mode first
+    // proves stdin/stdout are parent-owned pipes and binds lifetime to stdin.
+    // stdout carries nothing else in either mode (logs go to stderr).
     // Discovery state file BEFORE the ready line: a CLI that has seen the
     // ready line may immediately rely on attached-mode discovery.
     let daemon_pid = std::process::id();
-    if !ephemeral
-        && let Err(err) =
-            agent24_protocol::state_file::write(&agent24_protocol::state_file::DaemonState {
-                port: local.port(),
-                token: token.clone(),
-                pid: daemon_pid,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-            })
-    {
-        tracing::warn!("could not write daemon state file: {err}");
+    if !ephemeral {
+        let discovery = match auth_mode {
+            AuthMode::LegacySingleToken => agent24_protocol::state_file::DaemonState::new_legacy(
+                local.port(),
+                token.clone(),
+                daemon_pid,
+                env!("CARGO_PKG_VERSION"),
+                daemon_generation.clone(),
+            ),
+            AuthMode::Capabilities => agent24_protocol::state_file::DaemonState::new_capabilities(
+                local.port(),
+                daemon_pid,
+                env!("CARGO_PKG_VERSION"),
+                daemon_generation.clone(),
+            ),
+        }
+        .map_err(std::io::Error::other)?;
+        if let Err(err) = agent24_protocol::state_file::write(&discovery) {
+            tracing::warn!("could not write daemon state file: {err}");
+        }
     }
 
     // The state file is written; now readiness and a shutdown request race
@@ -1416,17 +2281,58 @@ pub async fn serve(
             agent24_protocol::state_file::remove_if_owner(daemon_pid);
         }
         let _ = stopping.await;
+        crate::usage_recorder::stop_usage_writer(
+            usage_recorder,
+            usage_writer,
+            shutdown.deadlines().modules,
+        )
+        .await;
         return Ok(());
     }
-    println!(
-        "{}",
-        serde_json::json!({
+    let ready = match auth_mode {
+        AuthMode::LegacySingleToken => serde_json::json!({
             "type": "ready",
             "port": local.port(),
             "token": token,
+            "auth_mode": "legacy_single_token",
+            "generation": daemon_generation,
             "version": env!("CARGO_PKG_VERSION"),
-        })
-    );
+        }),
+        AuthMode::Capabilities => {
+            let product_host_token = product_host_token.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "capability startup lost its host credential",
+                )
+            })?;
+            serde_json::json!({
+                "type": "ready",
+                "port": local.port(),
+                // This secret crosses only the inherited ready pipe to the
+                // spawning trusted host. It is never written to daemon.json.
+                "product_host_token": product_host_token,
+                "auth_mode": "capabilities",
+                "generation": daemon_generation,
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+        }
+    };
+    match auth_mode {
+        AuthMode::LegacySingleToken => println!("{ready}"),
+        AuthMode::Capabilities => {
+            let host_ready = host_ready.as_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "capability startup lost its private ready pipe",
+                )
+            })?;
+            host_ready.send(&ready).await?;
+        }
+    }
+    // In capability mode `ready` is the only temporary owner of the raw host
+    // bearer after the private write completes. Do not retain it for daemon
+    // lifetime; the authority store keeps only its digest.
+    drop(ready);
 
     let graceful_cancel = cancel.clone();
     let server = axum::serve(listener, router)
@@ -1451,6 +2357,19 @@ pub async fn serve(
     // either way. The wait is bounded by the task itself.
     shutdown.request();
     let _ = stopping.await;
+    // ME4-4.2.3b (design §6.3/v3.1 M-2, J19): AFTER the out-of-process
+    // supervisors have stopped — every in-flight call's outcome (including
+    // ones the cut-off itself cancelled) has by now either reached the
+    // recorder's channel or never will — wait for the writer to drain it,
+    // up to the SAME `deadlines().modules` instant its own hard stop uses.
+    // Skipping this call, or not awaiting it, is exactly the bug J19 exists
+    // to catch: a record queued but never written before the process exits.
+    crate::usage_recorder::stop_usage_writer(
+        usage_recorder,
+        usage_writer,
+        shutdown.deadlines().modules,
+    )
+    .await;
     // Only remove our own state file — a newer daemon may have replaced it
     if !ephemeral {
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
@@ -1458,13 +2377,193 @@ pub async fn serve(
     result
 }
 
+/// Capability mode requires the trusted host-bootstrap transport; the route
+/// middleware maps every request before accepting its bearer.
+fn validate_auth_startup(
+    auth_mode: AuthMode,
+    host_bootstrap_stdio: bool,
+) -> Result<(), std::io::Error> {
+    match (auth_mode, host_bootstrap_stdio) {
+        (AuthMode::Capabilities, true) => Ok(()),
+        (AuthMode::Capabilities, false) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "capability mode requires trusted host bootstrap stdio",
+        )),
+        (AuthMode::LegacySingleToken, true) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "host bootstrap stdio is valid only in capability mode",
+        )),
+        (AuthMode::LegacySingleToken, false) => Ok(()),
+    }
+}
+
+/// FU-92 follow-up (security hardening): verify — or, if absent, create — the
+/// top-level fallback directory [`callback_root`] names under the shared,
+/// world-writable `/tmp`. Its name is a hash of `root`, which is predictable
+/// (`root` is just `$HOME/.agent24` or similar), so any other local user could
+/// pre-create it — or plant a symlink at that name pointing anywhere — before
+/// this daemon ever starts, hijacking the callback socket that would otherwise
+/// go under it (eavesdropping on / impersonating the module handshake).
+///
+/// This check has to happen HERE, before [`agent24_os_proto::endpoint::CallbackDir::create`]
+/// touches `<fallback>/run`: that call's own directory setup uses
+/// `std::fs::DirBuilder::create` with `recursive(true)`, which walks straight
+/// through an existing symlink at an intermediate component (the same as
+/// `mkdir -p` — it treats "resolves to a directory" as "already there") rather
+/// than refusing it.
+///
+/// Fails closed: an existing entry that is not exactly a real directory, owned
+/// by this process's own euid, mode exactly `0700` (no group/other bits, no
+/// special bits) is refused with an actionable message — never silently
+/// reused, never chmod'd/fixed in place (unlike `private_dir` in
+/// `agent24-os-proto`, which tightens a loose directory of ours; here, on a
+/// shared `/tmp`, "ours" itself cannot be trusted without the check), and
+/// never retried at some OTHER path.
+///
+/// # Errors
+///
+/// A message naming the problem and telling the operator to remove the
+/// offending path and restart.
+fn secure_fallback_dir(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|e| format!("could not create {}: {e}", path.display())),
+        Err(e) => Err(format!("could not check {}: {e}", path.display())),
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "{} is a symlink — another local user may have planted it to intercept this \
+             daemon's callback socket; remove it and restart",
+            path.display()
+        )),
+        Ok(meta) if !meta.is_dir() => Err(format!(
+            "{} exists and is not a directory; remove it and restart",
+            path.display()
+        )),
+        Ok(meta) => {
+            let me = rustix::process::geteuid().as_raw();
+            if meta.uid() != me {
+                return Err(format!(
+                    "{} is owned by uid {}, not this process's {me} — another local user may \
+                     have created it to intercept this daemon's callback socket; remove it and \
+                     restart",
+                    path.display(),
+                    meta.uid()
+                ));
+            }
+            // All twelve mode bits, like `agent24-os-proto`'s `check_private`: no
+            // group/other bits AND no sticky/setuid/setgid bit either.
+            if meta.mode() & 0o7777 != 0o700 {
+                return Err(format!(
+                    "{} has mode {:04o}, not 0700 — another local user could read or replace \
+                     what goes under it; remove it and restart",
+                    path.display(),
+                    meta.mode() & 0o7777
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// FU-92: `<root>/run/<pid>/<n>.sock` must fit macOS's 103-byte `sun_path`
+/// limit ([`agent24_os_proto::endpoint::MAX_SOCKET_PATH`]). A long `$HOME` (or,
+/// for an ephemeral daemon, a long `$TMPDIR`) otherwise fails every
+/// out-of-process module's start — with a message that only said "too long",
+/// not by how much or what to do about it.
+///
+/// Rather than lose the whole out-of-process subsystem over a HOME the user
+/// did not pick for this reason, fall back to a short path under `/tmp`
+/// (a literal `/tmp`, not `$TMPDIR`, which on macOS is itself often long)
+/// when `root` would not fit — named by a hash of `root` so distinct state
+/// directories, and repeated ephemeral runs, do not collide. Only the
+/// transient callback-socket directory moves: `os.json`, `daemon.json`,
+/// packages and memory all stay under the real `root`. The fallback
+/// directory itself is checked by [`secure_fallback_dir`] before use — never
+/// blindly reused — since its name is predictable on a shared `/tmp`.
+///
+/// Codex ME4-CODEX-DEBT-10 (#528 High): the hash used to name that directory
+/// must be [`fallback_dir_hash`], NOT `std::collections::hash_map::DefaultHasher`
+/// — its own doc explicitly does not promise the same algorithm across Rust
+/// versions (nor even across runs of the same binary — it is randomly seeded
+/// unless a `Hasher` is built directly, which this WAS doing, keeping the
+/// algorithm fixed but not its stability guarantee), so a toolchain upgrade
+/// could silently rename every existing user's fallback directory. That
+/// rename is itself harmless (see [`fallback_dir_hash`]'s own doc for why),
+/// but there is no reason to accept it when a fixed algorithm is one call
+/// away.
+///
+/// # Errors
+///
+/// If `root` is too long AND its fallback directory is not safe to use (see
+/// [`secure_fallback_dir`]). Does not retry at any other path.
+fn callback_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let projected = root
+        .join("run")
+        .join(std::process::id().to_string())
+        .join(format!("{}.sock", u64::MAX));
+    if projected.as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH {
+        return Ok(root.to_owned());
+    }
+    let fallback =
+        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", fallback_dir_hash(root)));
+    secure_fallback_dir(&fallback).map_err(|why| {
+        format!(
+            "{} is too long for callback sockets (over the {}-byte macOS limit), and its \
+             short-path fallback {} is not safe to use: {why}",
+            root.display(),
+            agent24_os_proto::endpoint::MAX_SOCKET_PATH,
+            fallback.display(),
+        )
+    })?;
+    tracing::warn!(
+        "{} is too long for callback sockets (over the {}-byte macOS limit); using {} instead \
+         for this run. To use {} directly, point Agent24 at a shorter data directory (e.g. a \
+         shorter $HOME).",
+        root.display(),
+        agent24_os_proto::endpoint::MAX_SOCKET_PATH,
+        fallback.display(),
+        root.display(),
+    );
+    Ok(fallback)
+}
+
+/// A stable (across Rust versions, and across runs of the same binary — see
+/// [`callback_root`]'s own doc for why `DefaultHasher` is not either) hash of
+/// `root`, folded to 64 bits: the first 8 bytes of its sha256 digest, read as
+/// a big-endian `u64`. Only used to NAME the `/tmp` fallback directory
+/// [`callback_root`] picks when `root` itself is too long for a socket path
+/// — this only has to be stable and collision-resistant enough that two
+/// different `root`s (almost) never land on the same fallback name; it is
+/// not a security boundary itself ([`secure_fallback_dir`] is what actually
+/// keeps another local user out of a name they might guess or collide with).
+///
+/// A directory named by the OLD `DefaultHasher`-based scheme is simply
+/// abandoned by a build using this function instead (its contents are the
+/// transient callback-socket directory only — `run/<pid>/<n>.sock` files a
+/// live daemon recreates from scratch on every start, per [`callback_root`]'s
+/// own doc — so nothing is lost, and [`agent24_os_proto::endpoint::remove_stale`]
+/// cleans up anything left behind under the old name once no process holds
+/// it open).
+#[must_use]
+fn fallback_dir_hash(root: &std::path::Path) -> u64 {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(root.as_os_str().as_encoded_bytes());
+    let mut first8 = [0u8; 8];
+    first8.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first8)
+}
+
 /// What out-of-process modules are started with: the callback directory under
-/// `root` (stale ones cleared first, FU-56), this binary as the trampoline, and
-/// the daemon's stop grace.
+/// `root` (stale ones cleared first, FU-56; relocated by [`callback_root`] if
+/// `root` itself is too long), this binary as the trampoline, and the
+/// daemon's stop grace.
 fn process_host(
     root: &std::path::Path,
     stop_grace: Duration,
 ) -> Result<crate::domain::ProcessHost, String> {
+    let root = &callback_root(root)?;
     for gone in agent24_os_proto::endpoint::remove_stale(root) {
         tracing::info!(
             "removed the callback directory of a daemon that is gone: {}",
@@ -1476,10 +2575,15 @@ fn process_host(
     // Checked now, for the longest name a socket there can get, rather than
     // failing every module's start — and then its restarts — one by one: a long
     // `TMPDIR` (an ephemeral daemon's root) can put every socket over the limit.
+    // Should not trigger given `callback_root` above, but kept as a safety net
+    // — e.g. if `/tmp` itself were ever remapped to something long.
     let longest = callback_dir.path().join(format!("{}.sock", u64::MAX));
-    if longest.as_os_str().len() > agent24_os_proto::endpoint::MAX_SOCKET_PATH {
+    let longest_len = longest.as_os_str().len();
+    if longest_len > agent24_os_proto::endpoint::MAX_SOCKET_PATH {
         return Err(format!(
-            "callback sockets under {} would be longer than {} bytes",
+            "callback sockets under {} would be {longest_len} bytes, over the {}-byte macOS \
+             limit — point Agent24 at a shorter data directory (e.g. a shorter $HOME) and \
+             restart",
             callback_dir.path().display(),
             agent24_os_proto::endpoint::MAX_SOCKET_PATH
         ));
@@ -1635,6 +2739,122 @@ fn with_discovered(
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn workspace_recovery_clock_preserves_fractional_millis() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_900);
+        let instant = super::workspace_recovery_instant_at(now).unwrap();
+        assert_eq!(instant.as_str(), "1970-01-01T00:00:01.900Z");
+    }
+
+    // ---- ME4-4.2.2b2 H1 (Opus review round on top of `bb6fb0e`) -------------
+
+    /// A real end-to-end daemon test
+    /// (`apps/agent24d/tests/me4_model_shutdown_wiring.rs`) empirically
+    /// CANNOT reliably pin this one line: `Shutdown::request()` also revokes
+    /// the module's `Generation` as part of stopping it — design
+    /// §3.3's OWN "代次撤销" row, pre-existing `os-proto` machinery that
+    /// independently cancels an in-flight model call within tens of
+    /// milliseconds of the SAME `spawn_cancel_root(shutdown.modules_cut_off())`
+    /// cut-off. Measured with a real subprocess module (SIGTERM-ignoring, one
+    /// proxied request kept in flight so its own drain doesn't finish early)
+    /// and a real hung TCP provider: correct code closes the provider
+    /// connection ~630–670ms after `POST /api/v1/shutdown`; wiring the cancel
+    /// root to `CancellationToken::new()` (never fires) still closes it at
+    /// ~670–760ms via the OTHER path — overlapping ranges, not a reliable
+    /// red/green signal for CI. This structural test is the deterministic
+    /// fallback the design's own review round asked for when the daemon-level
+    /// test can't be made to pin it: it pins the EXACT call, so a mutation to
+    /// either half — the constructor (`CancellationToken::new()` instead of
+    /// `spawn_cancel_root`) or the argument (anything other than
+    /// `shutdown.modules_cut_off()`, e.g. `shutdown.token().cancelled()` to
+    /// fire at the START of shutdown instead of at cut-off) — turns it red.
+    #[test]
+    fn the_model_callback_cancel_root_is_spawned_from_modules_cut_off() {
+        // Scoped to `serve()`'s OWN body — never to the whole file, which
+        // would make this test tautological (the string above, in this
+        // test's own source, would always make a whole-file `.contains`
+        // pass regardless of what `serve()` actually does). Same technique
+        // as `module_routes_are_behind_kernel_auth`'s sibling
+        // `build_router_with_modules` scan below: find the function, cut at
+        // the first column-zero `}` (every brace inside a rustfmt'd function
+        // body is indented).
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function must be brace-terminated");
+        let body = &body[..end];
+        assert!(
+            body.contains("spawn_cancel_root(shutdown.modules_cut_off())"),
+            "serve() must build ModelCallbackDeps.cancel_root as \
+             spawn_cancel_root(shutdown.modules_cut_off()) — design \
+             docs/design/ME4-S2-model-callback.md §3.3"
+        );
+    }
+
+    // ---- ME4-4.2.3b (design §6.3/v3.1 M-2, J19 variant 2a) -------------------
+
+    /// J19's structural half: `stop_usage_writer` must be called from
+    /// `serve()`'s MAIN shutdown path (the one every real shutdown takes)
+    /// strictly AFTER `let _ = stopping.await;` — the point at which the
+    /// out-of-process supervisors have finished stopping, so every in-flight
+    /// call's outcome (including ones the cut-off cancelled) has already
+    /// either reached the recorder's channel or never will. Calling it
+    /// earlier would race the very cancellations it exists to wait out; not
+    /// calling it at all is the bug this test exists to catch.
+    ///
+    /// Review, M1: two hardenings over the original version of this test —
+    /// (a) `//`-comment lines are stripped from the scanned source FIRST, so
+    /// commenting the call out (and `drop`-ping the values it would have
+    /// consumed, to keep the function compiling) does not fool a plain
+    /// substring search; (b) the match is the FULL call with its exact
+    /// arguments, not just the bare function name, so swapping in a
+    /// differently-shaped call (wrong argument, wrong order) also turns this
+    /// red. Mutation verified: replacing the real call with
+    /// `// crate::usage_recorder::stop_usage_writer(...)` plus
+    /// `drop(usage_recorder); drop(usage_writer);` turns this red; reverting
+    /// turns it green again.
+    #[test]
+    fn stop_usage_writer_is_called_after_the_supervisors_have_stopped() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("function must be brace-terminated");
+        let body = &body[..end];
+        // Strip `//`-comments line by line (this scans ONLY `serve`'s own
+        // source, which has no `//` inside a string literal near this area,
+        // so a naive split is safe here) — a commented-out call must be
+        // invisible to the search below.
+        let code_only: String = body
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Unique to the main shutdown path — the two early-return copies
+        // (during startup) never call `shutdown.request()` right before
+        // their own `stopping.await`.
+        let stopping_at = code_only
+            .find("shutdown.request();\n    let _ = stopping.await;")
+            .expect("the main shutdown path must request, then wait for stopping");
+        let after = &code_only[stopping_at..];
+        // The exact rustfmt shape of the real call (verified against the
+        // source at the time this test was written — a reformat that keeps
+        // the same call would need this literal updated too, which is the
+        // point: it is not just checking the function name).
+        let exact_call = "crate::usage_recorder::stop_usage_writer(\n        usage_recorder,\n        \
+                           usage_writer,\n        shutdown.deadlines().modules,\n    )\n    .await;";
+        assert!(
+            after.contains(exact_call),
+            "serve()'s main shutdown path must call \
+             crate::usage_recorder::stop_usage_writer(usage_recorder, usage_writer, \
+             shutdown.deadlines().modules).await AFTER `let _ = stopping.await;` — design \
+             docs/design/ME4-S2-model-callback.md §6.3/v3.1 M-2"
+        );
+    }
 
     // ---- ME-3a: the wiring itself, not just the scanner ---------------------
 
@@ -1836,54 +3056,6 @@ pub(crate) mod tests {
         state_with_guardian(None).await
     }
 
-    /// A router with Sin90 mounted AS A DOMAIN OS — through `mount_all`, exactly
-    /// like `serve` does it.
-    ///
-    /// The SPIKE-00 tests below deliberately still go over HTTP rather than
-    /// calling the store: their job is to show that moving Sin90 behind
-    /// `DomainModule` left the HEALTHY surface unchanged — same paths, same
-    /// statuses, same bodies, and `proposal.applied` still reaching the kernel's
-    /// bus with the right module and kind. What DID change is the unavailable
-    /// surface: a degraded module now answers 503 for every path and method under
-    /// its namespace, where the old inline guard produced 503 only on its own
-    /// routes and left 404/405 for the rest.
-    ///
-    /// The `TempDir` is returned so the caller can hold it. With the in-memory
-    /// store it is only the (empty) directory the mounter creates, so dropping it
-    /// would not break anything today — but a test that switches to `Persistent`
-    /// would silently lose its database the moment the handle went out of scope.
-    async fn router_with_sin90() -> (Router, tempfile::TempDir) {
-        router_with_sin90_mode(agent24_sin90_os::StorageMode::Memory).await
-    }
-
-    async fn router_with_sin90_mode(
-        mode: agent24_sin90_os::StorageMode,
-    ) -> (Router, tempfile::TempDir) {
-        let st = state().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let entry = crate::domain::Installed {
-            name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
-            version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-            build: crate::domain::Build::InProcess(Box::new(move || {
-                agent24_sin90_os::Sin90Module::new(mode.clone())
-                    .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
-                    .map_err(|e| e.to_string())
-            })),
-        };
-        let (modules, _, _) = crate::domain::mount_all(
-            &[entry],
-            tmp.path(),
-            &st.events,
-            Ok(&crate::os_config::OsConfig::default()),
-            &NoModels,
-            None,
-            Err("no process host in this test"),
-            &test_approval_broker(&st.events).await,
-        )
-        .await;
-        (build_router_with_modules(st, modules), tmp)
-    }
-
     async fn state_with_guardian(
         guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     ) -> AppState {
@@ -1895,6 +3067,7 @@ pub(crate) mod tests {
             shutdown: Shutdown::new(CancellationToken::new()),
             guardian,
             memory: None,
+            workspace_service: None,
             mcp_servers: Vec::new(),
             risk_overrides: StdArc::new(agent24_policy::overrides::RiskOverrideStore::from_rows(
                 Vec::new(),
@@ -1941,6 +3114,40 @@ pub(crate) mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn capability_state() -> (AppState, String, String) {
+        let mut state = state().await;
+        let now = crate::capabilities::unix_now();
+        let store = crate::capabilities::CapabilityStore::new("daemon-test");
+        let host = store
+            .mint_product_host("host-test", Duration::from_secs(3_600), now)
+            .unwrap();
+        let (host_bearer, _, _) = host.into_bearer_parts();
+        let host_authorization = store
+            .validate_bearer(
+                &host_bearer,
+                crate::capabilities::Operation::ModelsRead,
+                &crate::capabilities::Resource::global(),
+                now,
+            )
+            .unwrap();
+        let creative = store
+            .mint_creative_authorized(
+                &host_authorization,
+                crate::capabilities::CreativeMintRequest::new(
+                    "workspace-test",
+                    "attachment-test",
+                    "principal-test",
+                    "sidecar-test",
+                    Duration::from_secs(300),
+                    now,
+                ),
+            )
+            .unwrap();
+        let (creative_bearer, _, _) = creative.into_bearer_parts();
+        state.enable_capability_auth(store);
+        (state, host_bearer, creative_bearer)
+    }
+
     #[tokio::test]
     async fn health_needs_no_token() {
         let res = build_router(state().await)
@@ -1957,6 +3164,107 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["backend"], "rust");
         assert!(json["version"].as_str().is_some());
+    }
+
+    #[test]
+    fn capability_startup_requires_the_trusted_host_bootstrap_transport() {
+        assert!(validate_auth_startup(AuthMode::Capabilities, true).is_ok());
+        let err = validate_auth_startup(AuthMode::Capabilities, false)
+            .expect_err("capability startup without private host pipes");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn capability_state_does_not_accept_the_empty_legacy_sentinel() {
+        let mut capability_state = state().await;
+        capability_state.enable_capability_auth(crate::capabilities::CapabilityStore::new(
+            "capability-generation".to_owned(),
+        ));
+
+        let res = build_router(capability_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(res).await["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn creative_bearer_can_read_models_but_not_the_closed_default_route() {
+        let store = crate::capabilities::CapabilityStore::new("capability-generation");
+        let host = store
+            .mint_product_host(
+                "host-generation",
+                Duration::from_secs(60),
+                crate::capabilities::unix_now(),
+            )
+            .unwrap();
+        let creative = store
+            .mint_creative(
+                host.token(),
+                crate::capabilities::CreativeMintRequest::new(
+                    "workspace",
+                    "attachment",
+                    "principal",
+                    "sidecar-generation",
+                    Duration::from_secs(60),
+                    crate::capabilities::unix_now(),
+                ),
+            )
+            .unwrap();
+        let (creative_bearer, _, _) = creative.into_bearer_parts();
+        let mut capability_state = state().await;
+        capability_state.enable_capability_auth(store);
+        let router = build_router(capability_state);
+
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+
+        let default_route = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, format!("Bearer {creative_bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_route.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(default_route).await["error"]["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn legacy_state_still_accepts_its_bearer_token() {
+        let res = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .header(header::AUTHORIZATION, "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2035,6 +3343,10 @@ pub(crate) mod tests {
             None,
             Err("no process host in this test"),
             &test_approval_broker(&st.events).await,
+            crate::domain::CallbackDeps {
+                scheduler: st.scheduler.clone(),
+                models: None,
+            },
         )
         .await;
         assert_eq!(reports[0].outcome, crate::domain::MountOutcome::Mounted);
@@ -2214,6 +3526,203 @@ pub(crate) mod tests {
         assert_eq!(json["error"]["code"], "not_found");
     }
 
+    #[tokio::test]
+    async fn creative_is_default_denied_except_for_models() {
+        let (state, _, creative) = capability_state().await;
+        let router = build_router(state);
+        let models = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header("Authorization", format!("Bearer {creative}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+
+        for (method, path) in [
+            ("POST", "/api/v1/chat"),
+            ("GET", "/api/v1/sessions"),
+            ("POST", "/api/v1/runs"),
+            ("GET", "/api/v1/events"),
+            ("GET", "/api/v1/approvals"),
+            ("GET", "/api/v1/tools"),
+            ("POST", "/api/v1/shutdown"),
+            ("GET", "/api/v1/future-unregistered-route"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {creative}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_routes_are_host_only_in_capability_mode() {
+        let (state, host, creative) = capability_state().await;
+        let router = Router::new()
+            .fallback(|| async { StatusCode::NO_CONTENT })
+            .layer(middleware::from_fn_with_state(state, auth));
+
+        for (method, path) in [
+            (Method::GET, "/api/v1/attached"),
+            (Method::POST, "/api/v1/attached"),
+            (Method::PATCH, "/api/v1/attached/agentear"),
+            (Method::DELETE, "/api/v1/attached/agentear"),
+        ] {
+            let unauthenticated = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                unauthenticated.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+            assert_eq!(
+                body_json(unauthenticated).await["error"]["code"],
+                "unauthorized"
+            );
+
+            let creative_denied = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {creative}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                creative_denied.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
+            assert_eq!(
+                body_json(creative_denied).await["error"]["code"],
+                "forbidden"
+            );
+
+            let host_allowed = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header("Authorization", format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                host_allowed.status(),
+                StatusCode::NO_CONTENT,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_can_mint_and_idempotently_revoke_creative_authority() {
+        let (state, host, existing_creative) = capability_state().await;
+        let router = build_router(state);
+
+        let creative_mint_attempt = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/capabilities/creative")
+                    .header("Authorization", format!("Bearer {existing_creative}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(creative_mint_attempt.status(), StatusCode::FORBIDDEN);
+
+        let minted = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/capabilities/creative")
+                    .header("Authorization", format!("Bearer {host}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspace_id": "workspace-new",
+                            "creative_attachment_id": "attachment-new",
+                            "creative_principal_id": "principal-new",
+                            "sidecar_generation": "sidecar-new",
+                            "ttl_seconds": 60,
+                            "allowed_operations": ["models.read"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(minted.status(), StatusCode::CREATED);
+        let minted = body_json(minted).await;
+        let id = minted["capability_id"].as_str().unwrap();
+        let token = minted["token"].as_str().unwrap();
+
+        for _ in 0..2 {
+            let revoked = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/capabilities/{id}/revoke"))
+                        .header("Authorization", format!("Bearer {host}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(revoked.status(), StatusCode::OK);
+            assert_eq!(body_json(revoked).await["state"], "revoked");
+        }
+
+        let rejected = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/models")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn token_is_32_bytes_hex_and_unique() {
         let a = generate_token();
@@ -2236,6 +3745,117 @@ pub(crate) mod tests {
         assert!(guardian_enabled(Some("true")));
         assert!(guardian_enabled(Some("TRUE")));
         assert!(guardian_enabled(Some(" 1 ")));
+    }
+
+    #[tokio::test]
+    async fn approval_recovery_scan_expires_tokenless_run_and_stops_with_shutdown() {
+        let state = state().await;
+        seed_run(&state.store, "run_expired").await;
+        sqlx::query("UPDATE runs SET status='awaiting_approval' WHERE id='run_expired'")
+            .execute(agent24_store::test_hooks::pool(&state.store))
+            .await
+            .unwrap();
+        state
+            .store
+            .insert_approval(&agent24_protocol::Approval {
+                id: "apr_expired".to_owned(),
+                run_id: "run_expired".to_owned(),
+                tool_call_id: "tc_expired".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "expired".to_owned(),
+                payload: serde_json::Map::new(),
+                available_decisions: vec!["approve".to_owned()],
+                standing_target: None,
+                status: agent24_protocol::ApprovalStatus::Pending,
+                decision: None,
+                expires_at: "2020-01-01T00:00:00Z".to_owned(),
+                created_at: "2019-12-31T23:59:00Z".to_owned(),
+                decided_at: None,
+            })
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let task = spawn_approval_recovery_scan_every(
+            Arc::clone(&state.broker),
+            Arc::clone(&state.runs),
+            Duration::from_millis(10),
+            cancel.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .store
+                    .get_run("run_expired")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == agent24_protocol::RunStatus::Cancelled
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recovery scan should cancel the parked run");
+
+        assert_eq!(
+            state
+                .store
+                .get_approval("apr_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            agent24_protocol::ApprovalStatus::TimedOut
+        );
+        assert_eq!(
+            state
+                .store
+                .get_run("run_expired")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            agent24_protocol::RunStatus::Cancelled
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown should stop the recovery scan")
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_recovers_timed_out_runs_before_strict_workspace_orphan_sweep() {
+        let src = include_str!("server.rs");
+        let start = src.find("pub async fn serve(").expect("serve must exist");
+        let body = &src[start..];
+        let timeout = body
+            .find(".timeout_expired(&approval_now)")
+            .expect("startup must time out expired approvals");
+        let recovery = body
+            .find(".recover_timed_out_approval_runs()")
+            .expect("startup must recover token-less timed-out runs");
+        let restore = body
+            .find(".restore_pending_approvals()")
+            .expect("startup must restore durable pending approvals");
+        let legacy_orphans = body
+            .find(".sweep_orphan_runs(&now)")
+            .expect("startup must sweep legacy orphans");
+        let workspace_orphans = body
+            .find(".sweep_workspace_orphan_runs(&workspace_now)")
+            .expect("startup must sweep workspace orphans");
+        assert!(
+            timeout < recovery
+                && recovery < restore
+                && restore < legacy_orphans
+                && legacy_orphans < workspace_orphans,
+            "startup order must be timeout -> timed-out recovery -> durable restore -> legacy orphan -> workspace orphan"
+        );
     }
 
     #[test]
@@ -2262,9 +3882,11 @@ pub(crate) mod tests {
             .insert_run(&agent24_protocol::Run {
                 id: id.to_owned(),
                 session_id: None,
+                workspace_id: None,
                 status: agent24_protocol::RunStatus::Running,
                 input: agent24_protocol::RunInput {
                     prompt: "p".to_owned(),
+                    workspace_id: None,
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                 },
@@ -2532,364 +4154,335 @@ pub(crate) mod tests {
         assert!(reg.tool_requires_approval("shell_exec"));
     }
 
-    // SPIKE-00 end-to-end through the router: create a direction + a 120-min
-    // block, complete it, and read the attention reconciliation back — the HTTP
-    // link computes 120. (The *purity* of the replay — unaffected by later edits
-    // — is proven in agent24-sin90-store's `attention_replay_is_pure_snapshot`.)
-    #[tokio::test]
-    async fn sin90_spike00_loop_over_router() {
-        let (router, _os_dir) = router_with_sin90().await;
+    // ── ME4-1.2.2b (top-level cut): KernelTrigger, review H1 ─────────────────
 
-        async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
-            router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(uri)
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
+    fn kernel_trigger_for_tests(runs: Arc<agent24_agent::RunManager>) -> KernelTrigger {
+        KernelTrigger {
+            runs,
+            // Unset `ModuleDeliverer` — every module fire this trigger sees
+            // in these tests is `Deferred(MountPending)` (design §4.6), same
+            // as before ME4-1.3.1 wired a real deliverer behind it.
+            deliverer: Arc::new(crate::scheduler_deliver::ModuleDeliverer::new(
+                crate::scheduler_deliver::PRODUCTION_LIMITS,
+            )),
         }
-
-        let dir = body_json(
-            post(
-                &router,
-                "/api/v1/sin90/directions",
-                serde_json::json!({ "title": "Coding", "target_window": "2026-08" }),
-            )
-            .await,
-        )
-        .await;
-        let dir_id = dir["id"].as_str().unwrap().to_owned();
-
-        let blk = body_json(
-            post(
-                &router,
-                "/api/v1/sin90/schedule-blocks",
-                serde_json::json!({ "direction_id": dir_id, "planned_minutes": 120 }),
-            )
-            .await,
-        )
-        .await;
-        let blk_id = blk["id"].as_str().unwrap().to_owned();
-
-        for to in ["started", "completed"] {
-            let res = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("PATCH")
-                        .uri(format!("/api/v1/sin90/schedule-blocks/{blk_id}"))
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(format!("{{\"to\":\"{to}\"}}")))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "transition to {to}");
-        }
-
-        // Wide, date-agnostic window (events stamp `at` = now).
-        let res = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sin90/attention?start=2000-01-01T00:00:00Z&end=2100-01-01T00:00:00Z")
-                    .header("Authorization", "Bearer testtoken")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let att = body_json(res).await;
-        let rows = att["attention"].as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["actual_min"], 120);
-        assert_eq!(rows[0]["direction_id"], dir_id);
-        assert_eq!(rows[0]["direction_title"], "Coding");
     }
 
-    // The GET list/detail reads: create through the router, then read the same
-    // rows back — and a missing proposal id is a 404, not an empty success.
+    async fn test_run_manager() -> Arc<agent24_agent::RunManager> {
+        agent24_agent::RunManager::new(
+            agent24_store::Store::open_memory().await.unwrap(),
+            Arc::new(ModelRouter::with_defaults(vec![])),
+            Arc::new(agent24_tools::ToolRegistry::new()),
+            Arc::new(crate::events::EventsHub::default()) as Arc<dyn agent24_agent::EventSink>,
+            CancellationToken::new(),
+        )
+    }
+
+    fn module_invocation(
+        schedule_id: &str,
+        trigger: agent24_scheduler::FireTrigger,
+    ) -> agent24_scheduler::ScheduleInvocation {
+        let now = chrono::Utc::now();
+        agent24_scheduler::ScheduleInvocation {
+            schedule_id: schedule_id.to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger,
+            target: agent24_scheduler::InvocationTarget::Module {
+                owner: agent24_scheduler::ModuleScheduleKey {
+                    owner_module: "mod-a".to_owned(),
+                    module_key: "k".to_owned(),
+                },
+                fire_id: agent24_scheduler::FireId::derive(trigger, schedule_id, now),
+            },
+        }
+    }
+
+    /// Review H1: `KernelTrigger`'s `Module` arm is a stub until ME4-1.3.1
+    /// wires a real `ModuleDeliverer` — every module target it is asked to
+    /// fire must come back `Deferred(MountPending)`, never a failure (design
+    /// §4.1: none of `DeferReason`'s variants are the module's fault, and a
+    /// mis-wired daemon must never burn a module's failure budget before the
+    /// real deliverer even exists).
     #[tokio::test]
-    async fn sin90_list_reads_round_trip_over_router() {
-        let (router, _os_dir) = router_with_sin90().await;
-
-        async fn post(router: &Router, uri: &str, body: serde_json::Value) -> Response {
-            router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(uri)
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        }
-        async fn get(router: &Router, uri: &str) -> Response {
-            router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(uri)
-                        .header("Authorization", "Bearer testtoken")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        }
-
-        let dir = body_json(
-            post(
-                &router,
-                "/api/v1/sin90/directions",
-                serde_json::json!({ "title": "Coding", "target_window": "2026-08" }),
-            )
-            .await,
-        )
-        .await;
-        let dir_id = dir["id"].as_str().unwrap().to_owned();
-        post(
-            &router,
-            "/api/v1/sin90/schedule-blocks",
-            serde_json::json!({ "direction_id": dir_id, "planned_minutes": 45 }),
-        )
-        .await;
+    async fn kernel_trigger_module_arm_is_deferred_mount_pending() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let invocation = module_invocation("sch_test", agent24_scheduler::FireTrigger::Tick);
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
         assert_eq!(
-            post(
-                &router,
-                "/api/v1/sin90/proposals",
-                serde_json::json!({
-                    "id": "p-read", "status": "pending", "source": "local_brain",
-                    "ops": [{"op":"create_direction","title":"Z","target_window":"2026-08"}],
-                    "rationale": null
-                }),
-            )
-            .await
-            .status(),
-            StatusCode::ACCEPTED
-        );
-
-        let dirs = body_json(get(&router, "/api/v1/sin90/directions").await).await;
-        assert_eq!(dirs["directions"].as_array().unwrap().len(), 1);
-        assert_eq!(dirs["directions"][0]["id"], dir_id);
-
-        let blocks = body_json(get(&router, "/api/v1/sin90/schedule-blocks").await).await;
-        assert_eq!(blocks["blocks"].as_array().unwrap().len(), 1);
-        assert_eq!(blocks["blocks"][0]["planned_minutes"], 45);
-
-        let props = body_json(get(&router, "/api/v1/sin90/proposals").await).await;
-        assert_eq!(props["proposals"].as_array().unwrap().len(), 1);
-        assert_eq!(props["proposals"][0]["id"], "p-read");
-
-        let one = get(&router, "/api/v1/sin90/proposals/p-read").await;
-        assert_eq!(one.status(), StatusCode::OK);
-        let one = body_json(one).await;
-        assert_eq!(one["status"], "pending");
-        assert_eq!(one["ops"].as_array().unwrap().len(), 1);
-
-        let missing = get(&router, "/api/v1/sin90/proposals/nope").await;
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-        assert_eq!(body_json(missing).await["error"]["code"], "not_found");
-    }
-
-    // A block referencing a nonexistent direction is a client mistake (FK
-    // violation) → 404, not the 500 a raw sqlx error would become.
-    #[tokio::test]
-    async fn sin90_bad_direction_is_404_not_500() {
-        let (router, _os_dir) = router_with_sin90().await;
-        let res = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sin90/schedule-blocks")
-                    .header("Authorization", "Bearer testtoken")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(
-                        r#"{"direction_id":"NOPE","planned_minutes":30}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        let json = body_json(res).await;
-        assert_eq!(json["error"]["code"], "not_found");
-    }
-
-    // A retried `accept` returns the same receipt but must NOT re-broadcast
-    // `proposal.applied` — the receipt is idempotent, the notification too.
-    #[tokio::test]
-    async fn sin90_retry_accept_does_not_double_emit() {
-        // Subscribe to the hub BEFORE mounting, and use the same state the module
-        // was mounted against — the whole point is that the module's events still
-        // reach the kernel's bus now that it emits through `KernelCtx`.
-        let st = state().await;
-        let mut rx = st.events.subscribe();
-        let tmp = tempfile::tempdir().unwrap();
-        let entry = crate::domain::Installed {
-            name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
-            version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-            build: crate::domain::Build::InProcess(Box::new(|| {
-                agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Memory)
-                    .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
-                    .map_err(|e| e.to_string())
-            })),
-        };
-        let (modules, _, _) = crate::domain::mount_all(
-            &[entry],
-            tmp.path(),
-            &st.events,
-            Ok(&crate::os_config::OsConfig::default()),
-            &NoModels,
-            None,
-            Err("no process host in this test"),
-            &test_approval_broker(&st.events).await,
-        )
-        .await;
-        let router = build_router_with_modules(st, modules);
-
-        let submit = |router: Router| async move {
-            router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/sin90/proposals")
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(
-                            r#"{"id":"p1","status":"pending","source":"local_brain","ops":[{"op":"create_direction","title":"X","target_window":"2026-08"}],"rationale":null}"#,
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        };
-        assert_eq!(submit(router.clone()).await.status(), StatusCode::ACCEPTED);
-
-        let accept = |router: Router| async move {
-            router
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/sin90/proposals/p1/accept")
-                        .header("Authorization", "Bearer testtoken")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        };
-        assert_eq!(accept(router.clone()).await.status(), StatusCode::OK);
-        assert_eq!(accept(router).await.status(), StatusCode::OK); // retry
-
-        // Drain events; count only proposal.applied.
-        let mut applied = 0;
-        while let Ok((_, body)) = rx.try_recv() {
-            if let agent24_protocol::EventBody::Module(m) = &body
-                && m.module == "sin90"
-                && m.kind == "proposal.applied"
-            {
-                applied += 1;
+            outcome,
+            agent24_scheduler::FireOutcome::Deferred {
+                reason: agent24_scheduler::DeferReason::MountPending
             }
-        }
-        assert_eq!(
-            applied, 1,
-            "exactly one proposal.applied despite two accepts"
         );
     }
 
-    // The head-fix, now going through the real mount path: a daemon whose sin90
-    // store fails to open must serve health but 503 every sin90 route — the kernel
-    // does not depend on the module.
-    //
-    // The failure is REAL rather than injected: the module is pointed at a legacy
-    // "database" that is not one, so its migration fails and `open_store` returns
-    // Err. That exercises the whole chain — module error → `MountOutcome::Degraded`
-    // → the kernel's own 503 under the namespace — instead of a hand-set `None`.
+    /// Review H1: the `AgentRun` arm's failure path — `RunManager` refusing
+    /// the run (here: a `session_id` that was never created, which
+    /// `start_run_with_schedule` rejects with `SessionNotFound` before
+    /// anything else happens) — must classify as `FireOutcome::Failed`, not
+    /// panic or silently swallow the error.
     #[tokio::test]
-    async fn sin90_unavailable_503s_but_kernel_lives() {
-        let broken = tempfile::tempdir().unwrap();
-        let legacy = broken.path().join("not-a-database.db");
-        std::fs::write(&legacy, b"definitely not sqlite").unwrap();
-        let (router, _os_dir) = router_with_sin90_mode(agent24_sin90_os::StorageMode::Persistent {
-            legacy: Some(legacy),
-        })
-        .await;
-
-        for (method, uri) in [
-            ("POST", "/api/v1/sin90/directions"),
-            ("GET", "/api/v1/sin90/directions"),
-            ("POST", "/api/v1/sin90/schedule-blocks"),
-            ("GET", "/api/v1/sin90/schedule-blocks"),
-            ("PATCH", "/api/v1/sin90/schedule-blocks/x"),
-            ("POST", "/api/v1/sin90/proposals"),
-            ("GET", "/api/v1/sin90/proposals"),
-            ("GET", "/api/v1/sin90/proposals/x"),
-            ("POST", "/api/v1/sin90/proposals/x/accept"),
-            ("GET", "/api/v1/sin90/attention?start=a&end=b"),
-        ] {
-            let res = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header("Authorization", "Bearer testtoken")
-                        .header("Content-Type", "application/json")
-                        .body(Body::from("{}"))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                res.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{method} {uri} must 503 when the module is down"
-            );
-            let json = body_json(res).await;
-            assert_eq!(json["error"]["code"], "module_unavailable");
+    async fn kernel_trigger_agent_run_failure_maps_to_failed() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let now = chrono::Utc::now();
+        let invocation = agent24_scheduler::ScheduleInvocation {
+            schedule_id: "sch_test".to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger: agent24_scheduler::FireTrigger::Tick,
+            target: agent24_scheduler::InvocationTarget::AgentRun(
+                agent24_protocol::ScheduleAction::AgentRun {
+                    prompt: "x".to_owned(),
+                    session_id: Some("sess_nonexistent".to_owned()),
+                    model_override: None,
+                },
+            ),
+        };
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
+        match outcome {
+            agent24_scheduler::FireOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("sess_nonexistent"),
+                    "expected the SessionNotFound reason to name the missing session, got: {reason}"
+                );
+            }
+            other => panic!("expected Failed for a rejected run, got {other:?}"),
         }
-
-        // The kernel is unaffected.
-        let res = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
     }
 
-    // A bare date (not the fixed-width timestamp) would drop a whole day under a
-    // lexical window compare — reject it rather than silently under-count.
+    /// Positive control for the AgentRun arm's SUCCESS path (the failure
+    /// test above only proves half of H1's classification): a run that
+    /// `RunManager` actually accepts must come back `AgentRun{run_id}`.
     #[tokio::test]
-    async fn sin90_attention_rejects_non_fixed_width_bounds() {
-        let (router, _os_dir) = router_with_sin90().await;
-        let res = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sin90/attention?start=2026-08-01&end=2026-08-11")
-                    .header("Authorization", "Bearer testtoken")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    async fn kernel_trigger_agent_run_success_maps_to_agent_run() {
+        let trigger = kernel_trigger_for_tests(test_run_manager().await);
+        let now = chrono::Utc::now();
+        let invocation = agent24_scheduler::ScheduleInvocation {
+            schedule_id: "sch_test".to_owned(),
+            scheduled_for: now,
+            fired_at: now,
+            trigger: agent24_scheduler::FireTrigger::Tick,
+            target: agent24_scheduler::InvocationTarget::AgentRun(
+                agent24_protocol::ScheduleAction::AgentRun {
+                    prompt: "x".to_owned(),
+                    session_id: None,
+                    model_override: None,
+                },
+            ),
+        };
+        let outcome = agent24_scheduler::RunTrigger::trigger(&trigger, &invocation).await;
+        match outcome {
+            agent24_scheduler::FireOutcome::AgentRun { run_id } => {
+                assert!(run_id.starts_with("run_"), "{run_id}");
+            }
+            other => panic!("expected AgentRun for an accepted run, got {other:?}"),
+        }
+    }
+
+    // ---- FU-92 follow-up: secure_fallback_dir / callback_root hardening ----
+    // The fallback directory `callback_root` may pick lives under the shared,
+    // world-writable `/tmp` with a PREDICTABLE name (a hash of `root`) — so
+    // another local user could race to plant something at that name before
+    // this daemon starts. These tests are for `secure_fallback_dir` itself
+    // (the pure filesystem check) and for its wiring into `callback_root`
+    // (so a mutation that drops the call is caught, not just the helper in
+    // isolation). The "normal case" — nothing planted, a real mount — is
+    // covered end to end by `daemon_modules.rs`'s long-HOME blackbox test.
+
+    /// Mirrors `callback_root`'s own hash formula, only so tests can find (and
+    /// clean up before/after) the exact path it will pick for a given `root`
+    /// — never asserted on for its OWN sake.
+    fn hashed_fallback_path(root: &std::path::Path) -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp").join(format!("a24-run-{:016x}", fallback_dir_hash(root)))
+    }
+
+    /// Codex ME4-CODEX-DEBT-10 (#528 High): golden value locking
+    /// [`fallback_dir_hash`] to sha256, not `std::collections::hash_map::DefaultHasher`
+    /// (whose own doc does not promise this algorithm across Rust versions).
+    /// A fixed input's fallback directory name must never silently change
+    /// again — if this test ever needs updating, that is a deliberate,
+    /// visible break, not a toolchain upgrade nobody noticed.
+    #[test]
+    fn fallback_dir_hash_is_a_stable_golden_value() {
+        let root = std::path::Path::new("/home/test/very/long/path/for/golden/hash/test");
+        assert_eq!(
+            format!("{:016x}", fallback_dir_hash(root)),
+            "2ffb6c3d38a488a3",
+            "fallback_dir_hash's output for a fixed input must never change — if it did, \
+             every existing user's fallback directory name would silently change with it"
+        );
+    }
+
+    /// Nothing there yet: created fresh, exactly `0700`.
+    #[test]
+    fn secure_fallback_dir_creates_a_fresh_directory_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("fallback");
+        secure_fallback_dir(&path).expect("a fresh directory is fine");
+        let mode = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+    }
+
+    /// A restart re-checking its OWN directory from a previous run (still
+    /// `0700`, still ours) must not be refused — only an unsafe entry is.
+    #[test]
+    fn secure_fallback_dir_accepts_its_own_directory_again() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("fallback");
+        secure_fallback_dir(&path).unwrap();
+        secure_fallback_dir(&path).expect("our own 0700 directory is fine the second time");
+    }
+
+    /// A pre-existing directory at that name with looser permissions — as
+    /// another local user racing the predictable name could leave — is
+    /// refused, not silently tightened in place (unlike `agent24-os-proto`'s
+    /// `private_dir`, which DOES tighten a loose directory of ours: on a
+    /// shared `/tmp`, "ours" cannot be trusted here without the check first).
+    #[test]
+    fn secure_fallback_dir_refuses_a_preexisting_loose_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("fallback");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = secure_fallback_dir(&path).expect_err("a 0755 directory must be refused");
+        assert!(err.contains("0700"), "{err}");
+    }
+
+    /// A pre-existing symlink at that name — pointing anywhere, even nowhere
+    /// that exists — is refused, never followed (which is exactly what
+    /// `DirBuilder::create(..).recursive(true)` — used one layer down by
+    /// `CallbackDir::create` — would otherwise walk straight through).
+    #[test]
+    fn secure_fallback_dir_refuses_a_preexisting_symlink() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("fallback");
+        let elsewhere = base.path().join("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let err = secure_fallback_dir(&path).expect_err("a symlink must be refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !elsewhere.exists(),
+            "the symlink target must never be created"
+        );
+    }
+
+    /// Wiring check: `callback_root` itself must refuse an unsafe pre-existing
+    /// fallback directory rather than silently reusing it or trying some
+    /// other path (mutation check: dropping the `secure_fallback_dir` call
+    /// from `callback_root` turns this green when it must be red).
+    #[test]
+    fn callback_root_refuses_an_unsafe_preexisting_fallback_directory() {
+        // A root that does not exist on disk — `callback_root` never touches
+        // `root` itself in the too-long branch, only hashes it — but long
+        // enough that `<root>/run/<pid>/<u64::MAX>.sock` cannot fit, so the
+        // `/tmp` fallback branch is the one under test. Unique to this test
+        // so it cannot collide with the other `callback_root`/blackbox tests.
+        let long_root = std::path::PathBuf::from(format!(
+            "/callback-root-hardening-test-{}-{}",
+            std::process::id(),
+            "x".repeat(150)
+        ));
+        let fallback = hashed_fallback_path(&long_root);
+        let _ = std::fs::remove_dir_all(&fallback);
+        let _ = std::fs::remove_file(&fallback);
+
+        let got = callback_root(&long_root).expect("a fresh fallback directory is fine");
+        assert_eq!(got, fallback);
+
+        // Replace the now-created directory with a symlink, as a racing local
+        // user could have done between two runs of this daemon.
+        std::fs::remove_dir_all(&fallback).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-elsewhere-for-this-test", &fallback).unwrap();
+        let err = callback_root(&long_root).expect_err("a symlinked fallback must be refused");
+        assert!(err.contains("symlink"), "{err}");
+
+        let _ = std::fs::remove_file(&fallback);
+    }
+
+    // ── Review (Codex A3 follow-up, §5.5): the `attach_registry_cell` race ──
+    //
+    // `serve`'s `stopping` task checks `attach_registry_cell` (a
+    // `OnceLock<Arc<AttachRegistry>>`) exactly ONCE, the instant shutdown is
+    // requested, and only calls `revoke_all()` if it finds the cell already
+    // filled. `serve` itself fills the cell and re-checks `cancel` right
+    // after via [`fill_attach_registry_and_recheck`] — both tests below call
+    // THAT function directly (not a re-implementation of it) against a REAL
+    // `AttachRegistry` (via `state()`), driving it through both possible
+    // interleavings with `stopping`'s own one-shot check. Driving the entire
+    // `serve()` startup through this precise interleaving would need to win
+    // an actual OS-scheduling race, which cannot be made deterministic for
+    // CI; calling the extracted function directly is what makes a reverse
+    // mutation of it (deleting the re-check) turn these tests red — see
+    // each test's own doc comment.
+
+    /// The bug: shutdown requested before the registry is ever filled into
+    /// the cell. Without the fix, `registry.is_closed()` would stay `false`
+    /// forever — the attach listener would keep accepting and handshaking
+    /// connections for a daemon that is meant to be going away. Confirmed
+    /// red under the reverse mutation (deleting the `if cancel.is_cancelled()
+    /// { registry.revoke_all(); }` re-check inside
+    /// `fill_attach_registry_and_recheck`): `registry.is_closed()` stayed
+    /// `false` at the final assertion.
+    #[tokio::test]
+    async fn a_shutdown_that_races_ahead_of_the_registry_fill_is_still_revoked() {
+        let state = state().await;
+        let registry = Arc::clone(&state.attach_registry);
+        let cancel = CancellationToken::new();
+        let cell: std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>> =
+            std::sync::OnceLock::new();
+
+        // `stopping`'s own one-shot check, landing before the fill: shutdown
+        // is already requested, but the cell is still empty.
+        cancel.cancel();
+        if let Some(r) = cell.get() {
+            r.revoke_all();
+        }
+        assert!(
+            !registry.is_closed(),
+            "sanity check on the test itself: the premature check must find nothing to revoke"
+        );
+
+        // The startup fill, immediately followed by the FIXED re-check —
+        // the actual production function, not a copy of its body.
+        fill_attach_registry_and_recheck(&cell, &registry, &cancel);
+
+        assert!(
+            registry.is_closed(),
+            "a shutdown that raced ahead of the registry fill must still end up revoked"
+        );
+    }
+
+    /// The ordinary ordering, as a control: the fill happens first, well
+    /// before any shutdown, and `stopping`'s own check (not the re-check
+    /// inside `fill_attach_registry_and_recheck`) is what revokes it. That
+    /// re-check is then a harmless no-op — `revoke_all` is idempotent, and
+    /// `cancel` is not yet cancelled at the point the re-check runs.
+    #[tokio::test]
+    async fn the_ordinary_ordering_the_stopping_tasks_own_check_still_revokes() {
+        let state = state().await;
+        let registry = Arc::clone(&state.attach_registry);
+        let cancel = CancellationToken::new();
+        let cell: std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>> =
+            std::sync::OnceLock::new();
+
+        assert!(!cancel.is_cancelled());
+        fill_attach_registry_and_recheck(&cell, &registry, &cancel);
+        assert!(
+            !registry.is_closed(),
+            "no shutdown requested yet — the re-check must not revoke early"
+        );
+
+        cancel.cancel();
+        if let Some(r) = cell.get() {
+            r.revoke_all();
+        }
+        assert!(registry.is_closed());
     }
 }

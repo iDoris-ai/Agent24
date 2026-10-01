@@ -37,4 +37,6 @@ M-E  模块生态桥接（node-host / MCP / PGL）→  v0.3.0
 M-F  24/7 化 + 渠道（微信/Nostr）  →  v0.4.0
 ```
 
+**⚠️ 作废**：M-F 实际已随 v0.3.0 发布（2026-09-02，见 `CHANGELOG.md` [0.3.0] 的「渠道」与「F4 Nostr 收官」）。真正的 **v0.4.0**（2026-09-2x）内容是 ME-3 进程外领域 OS 全套 + ME4 S1/S2 内核回调 + SDK 原型 + ADR-032/A3（AgentEar 附着），与本表 M-F→v0.4.0 的旧定义无关。权威状态源见 [`docs/agent/tasks.md`](../agent/tasks.md)。
+
 详细任务见 `TASKS.md`。每个任务 = 一个 PR = 一次完整的「实现 → 自我 review → Codex review → 提 PR」循环（见 SPEC-001 §3）。
