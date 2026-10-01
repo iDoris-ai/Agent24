@@ -160,6 +160,17 @@ export class InboundBridge {
   }
 }
 
+export interface PollOnceOptions {
+  /** COMM-5a: F4b inbound execution is frozen by default (`A24_NOSTR_F4B_INBOUND`
+   * unset in `main.ts`) — a whitelisted message is still polled, deduped and
+   * logged, but is no longer dispatched into `bridge.handle` (and therefore
+   * never reaches `runToCompletion`). Defaults to `true` so direct callers of
+   * `pollOnce` (tests, and any future caller that doesn't opt into the freeze)
+   * keep the pre-freeze dispatch behavior; `main.ts` is the one call site that
+   * threads the config flag through and defaults it to `false`. */
+  dispatchEnabled?: boolean
+}
+
 /** Poll the inbox once and feed each message to the bridge. A caller loops this
  * on an interval (the `listen` verb); errors on one poll don't kill the loop.
  *
@@ -170,7 +181,9 @@ export async function pollOnce(
   speaker: SpeakerClient,
   bridge: InboundBridge,
   liveness?: Pick<InboundLiveness, 'observe' | 'ready'>,
+  options?: PollOnceOptions,
 ): Promise<void> {
+  const dispatchEnabled = options?.dispatchEnabled ?? true
   const rows = await speaker.inbox()
   const msgs = liveness ? liveness.observe(rows) : rows
   // FAIL CLOSED while the probe does not know our own npub: `observe()`
@@ -184,6 +197,17 @@ export async function pollOnce(
   // every tick.
   if (liveness && !liveness.ready) return
   for (const msg of msgs) {
-    if (msg.from) await bridge.handle(msg)
+    if (!msg.from) continue
+    if (!dispatchEnabled) {
+      // F4b frozen (COMM-5a): the message is read and the liveness canary above
+      // already observed it — it just does not become a run. Logged (not
+      // silently dropped) so an operator watching the log can see inbound
+      // traffic arriving while dispatch stays off.
+      console.log(
+        `[nostr] F4b 入站执行已冻结(A24_NOSTR_F4B_INBOUND 未设置):跳过来自 ${msg.from} 的消息,未触发 run`,
+      )
+      continue
+    }
+    await bridge.handle(msg)
   }
 }

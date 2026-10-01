@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { InboundBridge, envelopeToPrompt, pollOnce } from './inbound.js'
 import { SpeakerClient, type InboundMessage } from './speaker.js'
 import { Agent24Client, type RunResult } from './agent24.js'
@@ -179,5 +179,35 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
     ]
     const [msg] = await new SpeakerClient(fake.runner).inbox()
     expect(msg?.event_id).toBe(hexId) // real id, not the sha1 synth fallback
+  })
+
+  // COMM-5a: F4b is frozen by default — inbound dispatch into a gated run is
+  // held unless A24_NOSTR_F4B_INBOUND=1. pollOnce must still poll and still
+  // feed `liveness.observe()` (FU-32's canary depends on it), it just must not
+  // call through to `runToCompletion` for a whitelisted sender's message.
+  describe('COMM-5a: F4b inbound dispatch freeze', () => {
+    it('flag unset (default): liveness still observes the poll, but the whitelisted message does NOT trigger a run', async () => {
+      const fake = new FakeSpeaker()
+      fake.inboxRows = [{ sender_npub: 'npub1alice', plaintext: 'hi', id: 'e1', is_incoming: true }]
+      const { b, calls } = bridge(fake, ['npub1alice'])
+      const observeSpy = vi.fn((rows: InboundMessage[]) => rows)
+      const liveness = { observe: observeSpy, ready: true }
+      // dispatchEnabled: false is what main.ts passes when A24_NOSTR_F4B_INBOUND
+      // is unset — this is the production default (COMM-5a).
+      await pollOnce(new SpeakerClient(fake.runner), b, liveness, { dispatchEnabled: false })
+      expect(observeSpy).toHaveBeenCalledTimes(1) // canary liveness probe still confirmed
+      expect(calls.prompts).toHaveLength(0) // but no run was dispatched
+    })
+
+    it('A24_NOSTR_F4B_INBOUND=1 (legacy): the same instrumentation now counts exactly one run', async () => {
+      const fake = new FakeSpeaker()
+      fake.inboxRows = [{ sender_npub: 'npub1alice', plaintext: 'hi', id: 'e1', is_incoming: true }]
+      const { b, calls } = bridge(fake, ['npub1alice'])
+      const observeSpy = vi.fn((rows: InboundMessage[]) => rows)
+      const liveness = { observe: observeSpy, ready: true }
+      await pollOnce(new SpeakerClient(fake.runner), b, liveness, { dispatchEnabled: true })
+      expect(observeSpy).toHaveBeenCalledTimes(1)
+      expect(calls.prompts).toHaveLength(1)
+    })
   })
 })
