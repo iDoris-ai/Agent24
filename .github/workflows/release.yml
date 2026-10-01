@@ -227,7 +227,7 @@ jobs:
           shasum -a 256 -c SHA256SUMS
 
       - name: Create Release
-        if: ${{ inputs.dry_run != true }}
+        if: ${{ github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}

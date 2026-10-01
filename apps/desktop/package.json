@@ -1,6 +1,7 @@
 {
   "name": "@agent24/desktop",
-  "version": "0.5.0",
+  "homepage": "https://github.com/iDoris-ai/Agent24",
+  "version": "0.5.1",
   "private": true,
   "description": "Agent24 Electron desktop shell",
   "author": {
@@ -103,15 +104,21 @@
     },
     "linux": {
       "target": [
-        "AppImage"
+        "AppImage",
+        "deb"
       ],
       "category": "Utility",
+      "maintainer": "iDoris.ai <firsttorch66@gmail.com>",
+      "executableName": "agent24-desktop",
       "extraResources": [
         {
           "from": "../../rust/target/release/agent24d",
           "to": "backend/agent24d"
         }
       ]
+    },
+    "deb": {
+      "artifactName": "agent24-desktop_${version}_${arch}.${ext}"
     }
   }
 }

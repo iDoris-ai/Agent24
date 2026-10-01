@@ -16,13 +16,13 @@ v0.5.1 的范围：CLI 覆盖 macOS arm64/x64、Linux x64/arm64；桌面端只�
 
 | ID | 任务 | 依赖 | 执行 | 规模 | 状态 |
 |---|---|---|---|---|---|
-| DEP-A1 | CI 增加 macOS：Rust 的 fmt/clippy/test 扩成 `ubuntu-latest` + `macos-latest` 矩阵；不与 sidecar 线的 `sidecar-windows.yml` 重复 | — | Sonnet | S | `READY` |
-| DEP-A3 | CLI 发布流水线：手写 `.github/workflows/release.yml`，**只在 `v[0-9]+.[0-9]+.[0-9]+` tag 上触发**；4 个目标在各自的原生 runner 上构建（Linux 用 `ubuntu-22.04` 与 arm runner，Intel mac 用现行 Intel runner 标签）；包的布局和命名沿用 v0.5.0：`agent24-<ver>-<os>-<arch>.tar.gz`，内含 `agent24` 与 `agent24d`；产出 `SHA256SUMS`；**由本流水线创建 Release**。cargo-dist 已推迟，见 C7 | — | Sonnet | M | `READY` |
-| DEP-A4 | Sin90 / Cos72 多平台包（跨仓库，2 个 PR）：`package.sh` 去掉只允许 `Darwin arm64` 的限制，加 `--target`；各自新增 tag 触发的发布 CI，布局不变 | A3（命名） | Sonnet ×2 | M | `BACKLOG` |
-| DEP-A5 | CLI daemon 与桌面端 sidecar 复用：桌面端启动时先读 `daemon.json` 并检查 health，有 daemon 就直接连；托盘的停止/重启只作用于桌面端自己拉起的 daemon；最小改动，不与 sidecar-host 设计分叉 | — | Sonnet | M | `READY` |
-| DEP-A6 | 桌面端 Linux 构建：新增 `release-desktop.yml`，在 `ubuntu-22.04` 上出 AppImage + deb，**把附件追加到 A3 创建的 Release 上**（不自行创建 Release）；冒烟测试用 xvfb 加 `--appimage-extract-and-run`，并检查 sidecar 的 `LD_LIBRARY_PATH` 污染；同时补 deb 目标配置 | — | Sonnet | M | `READY` |
-| DEP-A7 | Windows 移植设计：`docs/design/WINDOWS-PORT.md`。候选方案对比：Windows AF_UNIX + 句柄继承 / 命名管道 / 回环 + token；复用 sidecar-host ProcessKit；给出所有 Unix 专有代码的处置清单（20 个文件 + proxy.rs + `state_dir` 的 HOME + `command-fds`/`close_fds` + `same_device`）；分阶段计划。摸底用 **`windows-latest` 上 `workflow_dispatch` 触发的 `cargo check --workspace --keep-going`** | — | Opus 设计 + Sonnet 摸底 | M | `READY` |
-| DEP-A8 | v0.5.1 清单与发布：`docs/RELEASE-CHECKLIST-v0.5.1.md` 冻结命名；打 tag 触发 A3/A6；干净机器验收 | A1, A3–A6 | Opus 清单 + Sonnet | M | `BACKLOG` |
+| DEP-A1 | CI 增加 macOS：Rust 的 fmt/clippy/test 扩成 `ubuntu-latest` + `macos-latest` 矩阵；不与 sidecar 线的 `sidecar-windows.yml` 重复 | — | Sonnet | S | `DONE`（#607） |
+| DEP-A3 | CLI 发布流水线：手写 `.github/workflows/release.yml`，**只在 `v[0-9]+.[0-9]+.[0-9]+` tag 上触发**；4 个目标在各自的原生 runner 上构建（Linux 用 `ubuntu-22.04` 与 arm runner，Intel mac 用现行 Intel runner 标签）；包的布局和命名沿用 v0.5.0：`agent24-<ver>-<os>-<arch>.tar.gz`，内含 `agent24` 与 `agent24d`；产出 `SHA256SUMS`；**由本流水线创建 Release**。cargo-dist 已推迟，见 C7 | — | Sonnet | M | `DONE`（#608、#609、#619） |
+| DEP-A4 | Sin90 / Cos72 多平台包（跨仓库，2 个 PR）：`package.sh` 去掉只允许 `Darwin arm64` 的限制，加 `--target`；各自新增 tag 触发的发布 CI，布局不变 | A3（命名） | Sonnet ×2 | M | `DONE`（Sin90 #76 + #77 锁文件；Cos72 #11 + #12 tag 门禁） |
+| DEP-A5 | CLI daemon 与桌面端 sidecar 复用：桌面端启动时先读 `daemon.json` 并检查 health，有 daemon 就直接连；托盘的停止/重启只作用于桌面端自己拉起的 daemon；最小改动，不与 sidecar-host 设计分叉 | — | Sonnet | M | `DONE`（#602） |
+| DEP-A6 | 桌面端 Linux 构建：新增 `release-desktop.yml`，在 `ubuntu-22.04` 上出 AppImage + deb，**把附件追加到 A3 创建的 Release 上**（不自行创建 Release）；冒烟测试用 xvfb 加 `--appimage-extract-and-run`，并检查 sidecar 的 `LD_LIBRARY_PATH` 污染；同时补 deb 目标配置 | — | Sonnet | M | `DONE`（#617） |
+| DEP-A7 | Windows 移植设计：`docs/design/WINDOWS-PORT.md`。候选方案对比：Windows AF_UNIX + 句柄继承 / 命名管道 / 回环 + token；复用 sidecar-host ProcessKit；给出所有 Unix 专有代码的处置清单（20 个文件 + proxy.rs + `state_dir` 的 HOME + `command-fds`/`close_fds` + `same_device`）；分阶段计划。摸底用 **`windows-latest` 上 `workflow_dispatch` 触发的 `cargo check --workspace --keep-going`** | — | Opus 设计 + Sonnet 摸底 | M | `DONE`（#610、#611） |
+| DEP-A8 | v0.5.1 清单与发布：`docs/RELEASE-CHECKLIST-v0.5.1.md` 冻结命名；打 tag 触发 A3/A6；干净机器验收 | A1, A3–A6 | Opus 清单 + Sonnet | M | `DONE`（#624；tag `v0.5.1`@4fb5a89，Sin90 `v0.5.1`@030ae09，Cos72 `v0.1.1`@51187da；验收见 `docs/RELEASE-CHECKLIST-v0.5.1.md` 末节） |
 
 原来的 DEP-A2（Linux 黑盒）**已删除**：`a3_2b` / `a3_3` 黑盒没有标 `#[ignore]`，现有 ubuntu CI 每次都在跑，重做一遍证伪不了任何东西。真正的新内容是「Sin90/Cos72 真实二进制在 Linux 上挂载」，已并入 A4 和 A8 的验收。
 

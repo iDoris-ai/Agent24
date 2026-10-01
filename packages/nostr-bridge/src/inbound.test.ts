@@ -129,7 +129,7 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
       { sender_npub: 'npub1alice', plaintext: 'mine', id: 'c', is_incoming: false }, // outbound, skipped
     ]
     const { b, calls } = bridge(fake, ['npub1alice'])
-    await pollOnce(new SpeakerClient(fake.runner), b)
+    await pollOnce(new SpeakerClient(fake.runner), b, undefined, { dispatchEnabled: true })
     expect(calls.prompts).toEqual(['one'])
   })
 
@@ -144,8 +144,8 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
     ]
     const { b, calls } = bridge(fake, ['npub1alice'])
     const speaker = new SpeakerClient(fake.runner)
-    await pollOnce(speaker, b)
-    await pollOnce(speaker, b) // same last-N window again — must NOT re-run
+    await pollOnce(speaker, b, undefined, { dispatchEnabled: true })
+    await pollOnce(speaker, b, undefined, { dispatchEnabled: true }) // same last-N window again — must NOT re-run
     expect(calls.prompts).toEqual(['hi'])
   })
 
@@ -208,6 +208,69 @@ describe('InboundBridge (gated run + reply, fail-closed allowlist)', () => {
       await pollOnce(new SpeakerClient(fake.runner), b, liveness, { dispatchEnabled: true })
       expect(observeSpy).toHaveBeenCalledTimes(1)
       expect(calls.prompts).toHaveLength(1)
+    })
+
+    // R2's design concern on #613: `dispatchEnabled` used to default to `true`
+    // inside `pollOnce`'s own signature, so "frozen by default" held only
+    // because `main.ts` happened to thread the flag through — a caller that
+    // omitted the 4th argument entirely (no options object at all) silently
+    // got the pre-freeze dispatch-every-message behavior, and nothing asserted
+    // the production default. This is the structural guarantee: no options
+    // (not even an empty `{}`) must still freeze dispatch.
+    it('structural guarantee: calling pollOnce with NO options object at all still freezes dispatch', async () => {
+      const fake = new FakeSpeaker()
+      fake.inboxRows = [{ sender_npub: 'npub1alice', plaintext: 'hi', id: 'e1', is_incoming: true }]
+      const { b, calls } = bridge(fake, ['npub1alice'])
+      await pollOnce(new SpeakerClient(fake.runner), b) // no liveness, no options
+      expect(calls.prompts).toHaveLength(0)
+    })
+
+    // R2 finding #1 on #613: while frozen, a message from a sender NOT on the
+    // allowlist was never going to dispatch anyway — that's `handle()`'s own
+    // fail-closed rejection, not an "F4b frozen" skip, and it must not log as
+    // one.
+    it('while frozen, an unauthorized sender gets the unauthorized warning, not the frozen-skip log', async () => {
+      const fake = new FakeSpeaker()
+      fake.inboxRows = [{ sender_npub: 'npub1mallory', plaintext: 'hi', id: 'e1', is_incoming: true }]
+      const { b, calls } = bridge(fake, ['npub1alice']) // mallory is NOT allowlisted
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      try {
+        await pollOnce(new SpeakerClient(fake.runner), b, undefined, { dispatchEnabled: false })
+        expect(calls.prompts).toHaveLength(0)
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('忽略未授权'))
+        expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining('F4b 入站执行已冻结'))
+      } finally {
+        warnSpy.mockRestore()
+        logSpy.mockRestore()
+      }
+    })
+
+    // Item 3: unfreezing must not replay the backlog that piled up while
+    // frozen as if it were fresh traffic.
+    it('unfreezing (dispatchSinceSec set): a message older than the unfreeze moment is skipped, a newer one dispatches', async () => {
+      const fake = new FakeSpeaker()
+      const unfrozenAt = 1_700_000_000
+      fake.inboxRows = [
+        { sender_npub: 'npub1alice', plaintext: 'old-backlog', id: 'old1', created_at: unfrozenAt - 3600, is_incoming: true },
+        { sender_npub: 'npub1alice', plaintext: 'fresh', id: 'new1', created_at: unfrozenAt + 5, is_incoming: true },
+      ]
+      const { b, calls } = bridge(fake, ['npub1alice'])
+      await pollOnce(new SpeakerClient(fake.runner), b, undefined, {
+        dispatchEnabled: true,
+        dispatchSinceSec: unfrozenAt,
+      })
+      expect(calls.prompts).toEqual(['fresh'])
+    })
+
+    it('unfreezing without dispatchSinceSec dispatches everything as before (no guard requested)', async () => {
+      const fake = new FakeSpeaker()
+      fake.inboxRows = [
+        { sender_npub: 'npub1alice', plaintext: 'old-backlog', id: 'old1', created_at: 1, is_incoming: true },
+      ]
+      const { b, calls } = bridge(fake, ['npub1alice'])
+      await pollOnce(new SpeakerClient(fake.runner), b, undefined, { dispatchEnabled: true })
+      expect(calls.prompts).toEqual(['old-backlog'])
     })
   })
 })

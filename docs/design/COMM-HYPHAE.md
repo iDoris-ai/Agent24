@@ -323,6 +323,7 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
   - agent24d 启动时，残留的 Pending 条目只记日志、不使用。
 - **L2 仅内存**：钥匙串不可用时状态为 `locked{keychain_unavailable}`。用户执行 `agent24 comm unlock` 交出口令，口令只保存在 `Zeroizing` 内存中；agent24d 重启后回到 `locked`。加 `--remember` 时写入或替换钥匙串条目，用于钥匙串恢复之后，或修改过口令之后。
 - **不提供**：systemd 凭据（M12 砍掉）、明文口令文件、通过环境变量或 config 传口令。降级不会自动发生。
+- **显式降级开关**：`A24_COMM_PASSWORD_STORE` 环境变量可选 `keyring`（默认，未设置时也是这个）或 `memory`（改用纯内存的 `MemoryPasswordStore`，口令不持久、daemon 重启即丢，仅用于隔离环境下的测试/联调，启动时打 warn）；其他值不会被悄悄当作 `keyring` 或 `memory`，daemon 照常启动但 comm 路由一律答 `not_configured`，data 里带上具体原因。
 
 ### 6.5 与 Deployment A5 的关系
 - A5（#602）之后，桌面端会复用已在运行的 agent24d，所以**持有 Hyphae daemon 的始终是唯一那一个 agent24d**。
@@ -373,8 +374,8 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
 | 编号 | Hyphae | 交付 | 依赖 | 规模 | 可证伪验收 |
 |---|---|---|---|---|---|
 | COMM-5a | T20-B（前置） | F4b 冻结：只拦截 `handle` 的分派；迁移 warn；CHANGELOG、SOAK-F5、F4 spec；nostr-bridge 支持 `A24_HYPHAE_BIN`，优先级高于 `A24_SPEAKER_BIN` | 无，**最先做** | S | 默认 spy=0，开 flag 后 spy=1；默认配置下 canary 仍从 `pending` 变为 `confirmed`；配了 ALLOWED_NPUBS 但无 flag 时，启动日志中出现该 warn；只设 `A24_SPEAKER_BIN` 时行为不变 |
-| COMM-1a | T20-A | `agent24-comm` crate：lock 与配方、`VerifiedBinary::install`、runner、`parse_envelope`、KeystoreWriteLock、T1；CI job：按 lock 构建 linux-x64 并比对 hash | COMM-0 冻结 | M | 改动二进制 1 个字节必报 HashMismatch；用相对路径报 NotAbsolute；副本已存在且被篡改时报 HashMismatch；退出码 0–5、7、ok 字段与退出码矛盾、两段 JSON，各一个表驱动用例；部分成功能取出 event_id；子进程环境中看不到哨兵变量；4097 字节口令被拒；CI 构建出的 hash 与 lock 不一致时 job 失败 |
-| COMM-1b | T20-A | `PasswordStore`：keyring 与内存两种实现、Account 改名流程、base64url 编码 | COMM-1a | S | 首个身份走完 Pending→Salt，钥匙串中只剩 Salt 条目；create 失败后 Pending 条目被删；模拟钥匙串不可用时进入 `locked{keychain_unavailable}`；`unlock --remember` 能替换已有条目 |
+| COMM-1a | T20-A | `agent24-comm` crate：lock 与配方、`VerifiedBinary::install`、runner、`parse_envelope`、T1 | COMM-0 冻结 | M | 改动二进制 1 个字节必报 HashMismatch；用相对路径报 NotAbsolute；副本已存在且被篡改时报 HashMismatch；退出码 0–5、7、ok 字段与退出码矛盾、两段 JSON，各一个表驱动用例；部分成功能取出 event_id；子进程环境中看不到哨兵变量；4097 字节口令被拒 |
+| COMM-1b | T20-A | `PasswordStore`：keyring 与内存两种实现、Account 改名流程、base64url 编码；`KeystoreWriteLock`（H3，COMM-1a 未做，归并到此）；CI job：按 lock 构建 linux-x64 并比对 hash（同样归并到此） | COMM-1a | S | 首个身份走完 Pending→Salt，钥匙串中只剩 Salt 条目；create 失败后 Pending 条目被删；模拟钥匙串不可用时进入 `locked{keychain_unavailable}`；`unlock --remember` 能替换已有条目；不加锁并发 10 次 `identity create` 会丢身份（先证），加锁后 10 个都在（后修）；CI 构建出的 hash 与 lock 不一致时 job 失败 |
 | COMM-2a | T20-A | 路由与 CLI：identity、contact、relay；错误闭集 | COMM-1b | M | 用真实二进制和临时 HOME 走通 create→list→use→contact add→relay set→list；`source=default` 时 send 返回 `not_configured`；**并发 10 个 `POST /comm/identity` 后，`identity list` 中 10 个身份都在**，且每个都能被 `daemon --identity` 解锁（H3） |
 | COMM-2b | T20-A | import（§4.1） | COMM-2a | M | 不带 confirm 返回 `confirm_required`；源目录 6 个文件的 hash 和 mtime 在导入前后不变；**导入前后 outbox 条目数一致**（H2）；身份数、联系人数一致；源目录是符号链接或属主不对时被拒；测试中先持有 `outbox.json.lock` 再导入，返回 `conflict{source_in_use}`；明文 keystore 被拒，提示语包含 `change-password`；口令错误时钥匙串中没有新条目 |
 | COMM-3 | T20-B | send、history、outbox 的路由与 CLI；§5.1 分层与 §5.3 呈现字段 | COMM-2a | M | relay 不可达时 send 返回 ok，层级为 L1，`published_to==0`；retry 返回的 event_id 与原 event_id 相等；注入 data `{published_to:1,history_stored:false}` 得到 `partial`，接口中没有重发入口；clear 不带 confirm 被拒 |
@@ -408,7 +409,7 @@ COMM-3 + COMM-6 → 7
     "darwin-x64": null, "linux-arm64": null } }
 ```
 
-- **候选 hash 的来源**：上面两个值是本机 go1.26.4 按配方构建所得。darwin-arm64 构建两次，hash 一致；linux-x64 只构建过一次。两者都**尚未经过 CI 复现**，以 COMM-1a 的 CI job 为准。
+- **候选 hash 的来源**：上面两个值是本机 go1.26.4 按配方构建所得。darwin-arm64 构建两次，hash 一致；linux-x64 在 COMM-1b 里又按配方本机重新构建一次（同一台机器，go1.26.4，`hyphae-src` 工作区锁定在 `source_sha`），两次结果与 lock 中记录的值逐字节一致。CI job（`.github/workflows/hyphae-lock-verify.yml`，COMM-1b 新增）会在 CI 环境里重复这个构建并比对 hash；由于本次改动不经 push/PR 落地，这个 job 本身**尚未在 GitHub Actions 里实际跑过**——如实记录：本地复现已确认，CI 复现待这次改动被推送开 PR 后首次运行确认。
 - **null 的含义**：表示该平台尚未验证，comm 在该平台报 `binary_rejected`。
 - **`hyphae-relay`**：联调用的 relay 用同一配方构建 `./cmd/hyphae-relay`，hash 只记在 PR 描述里，不进 lock，因为运行期不会用到它。
 - **验证记录不进 lock**：每个 COMM PR 的描述里写明 Agent24 head SHA、Hyphae SHA、各平台 sha256、Go 版本，以及测试和联调结果。

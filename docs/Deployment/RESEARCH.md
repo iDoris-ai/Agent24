@@ -72,7 +72,14 @@ Rust 中直接使用 `std::os::unix` 的非测试文件共 **20 个**：
 
 ### 1.7 正在进行的 sidecar-host 线（Open Design，尚未合入 main）
 
-约 40 个开放 PR（#291、#517–#554 等）正在做 `rust/apps/agent24-sidecar-host`：由 Rust 负责桌面 sidecar 的生命周期边界，用 ProcessKit 实现 Windows Job Object 和 pipes，#553 已经在 `windows-latest` 上编译并测试。它和本计划有三处重叠：
+实测约 253 个开放 PR（2026-10-01，`gh pr list --state open --limit 400 | wc -l`），其中
+211 个的 head 已经是 `origin/integration/open-design-main-sync-wave20`（Open Design 的
+长期集成分支，见 `docs/design/OPEN-DESIGN-INTEGRATION-LANDING-STRATEGY.md`）的祖先
+（`git merge-base --is-ancestor <head> origin/integration/open-design-main-sync-wave20`
+逐条验证），也就是说这些 PR 对应的变更已经落到集成分支上，只是还没有单独、受控地
+落到 `main`。这批 PR 多数在做 `rust/apps/agent24-sidecar-host`（#291、#517–#554 等）：
+由 Rust 负责桌面 sidecar 的生命周期边界，用 ProcessKit 实现 Windows Job Object 和
+pipes，#553 已经在 `windows-latest` 上编译并测试。它和本计划有三处重叠：
 - 桌面端 daemon 生命周期（A5）；
 - 安装包里的二进制组成（A6）；
 - Windows 的进程与管道机制（A7、C2）。

@@ -238,5 +238,10 @@ publish:
 - **F4b**:入站——daemon 集成 + npub 白名单 + gated run + 按 npub session;7×24 可跑(接 F5 泡测)。
   **自 COMM-5a 起冻结**:默认不再因白名单消息触发 run,需显式设 `A24_NOSTR_F4B_INBOUND=1`
   才恢复;后续入站执行改走 T01-E 的高层授权。
+  **解冻重放边界**(#613 评审遗留):重新设 `A24_NOSTR_F4B_INBOUND=1` 并重启后,`pollOnce`
+  只分派 `created_at`(unix 秒)晚于本次启动时刻的消息——冻结期间积压的旧消息只记日志、
+  不会被当成新消息执行。但极少数没有 `created_at` 的旧版行(agent-speaker 版本偏差)没有
+  可比较的时间戳,仍会被当作新消息分派;生产路径(`history inbox --json`)下 `created_at`
+  总是有值,这个口子目前只影响理论上的旧版行。
 
 阶段二(R1 落地后):bridge 从 subprocess 切到本地接口。

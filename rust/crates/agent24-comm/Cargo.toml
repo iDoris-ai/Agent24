@@ -1,0 +1,86 @@
+[package]
+name = "agent24-comm"
+version = "0.5.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "COMM-1a/1b: Hyphae CLI invocation (hash-verified binary, stdin-only password, envelope parsing), keystore write serialization, and the keychain-backed PasswordStore"
+
+[dependencies]
+# COMM-1b `PasswordStore` trait (`get`/`put`/`rename`/`delete` are all
+# `async fn`s on a `dyn`-safe-via-vtable trait object); matches the
+# `async-trait` version already used by agent24-agent/-domain/-tools.
+async-trait = "0.1"
+# COMM-2a: `router(CommState) -> axum::Router` (COMM-HYPHAE.md §3/§4). Same
+# minimal feature set as agent24-domain's own axum dependency — routing +
+# `Json` only, no `ws`/`multipart`/server-runtime features this crate never
+# uses (agent24d owns the actual `axum::serve`).
+axum = { version = "0.8", default-features = false, features = ["json"] }
+base64 = "0.22"
+hex = "0.4"
+# COMM-2a: the very first identity's auto-generated password
+# (`Password::generate`, COMM-HYPHAE.md §6.4) — same version already used by
+# agent24d/agent24-cli.
+rand = "0.9"
+# COMM-1b keychain-backed `PasswordStore` (COMM-HYPHAE.md §6.4 L0): macOS
+# Keychain via `apple-native`, Linux via the freedesktop Secret Service via
+# `async-secret-service`. Deliberately *not* `sync-secret-service`: that
+# backend links `dbus-secret-service` -> `dbus` -> system libdbus, which the
+# ubuntu-latest CI image doesn't have headers for; `async-secret-service`
+# instead pulls in `secret-service`/`zbus`, a pure-Rust D-Bus client with no
+# system library dependency, so it builds (and, absent a session bus, simply
+# reports `Unavailable` at runtime rather than failing to compile). `tokio`
+# picks zbus's tokio-integrated executor (this crate is already tokio-based);
+# `crypto-rust` keeps the Secret Service session cipher in pure Rust instead
+# of requiring OpenSSL. Windows is out of scope (COMM-HYPHAE.md §9 R2), so no
+# `windows-native` feature. All keyring calls are wrapped in
+# `tokio::task::spawn_blocking` (see `password_store.rs`) since `Entry`'s API
+# is synchronous regardless of backend.
+keyring = { version = "3.6", default-features = false, features = [
+    "apple-native",
+    "async-secret-service",
+    "tokio",
+    "crypto-rust",
+] }
+rustix = { version = "0.38", features = ["process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "process",
+    "rt",
+    "sync",
+    "time",
+    "io-util",
+    "macros",
+    # COMM-2a: `read_keystore_salt` peeks `keystore.json`'s `salt` field
+    # directly (router.rs's own doc comment explains why).
+    "fs",
+] }
+tracing = "0.1"
+# Zero-on-drop storage for the Hyphae keystore password (COMM-HYPHAE.md §3:
+# `Password(/* Zeroizing<Vec<u8>> */)`). Not a direct workspace dependency
+# elsewhere, but already resolved in Cargo.lock (1.9.0, transitive).
+zeroize = "1"
+
+[dev-dependencies]
+# Mirrors agent24-os-proto's `test-util` pattern: depending on ourselves with
+# the feature on means `cargo test -p agent24-comm` (no extra flags) already
+# runs the lock-override-gated tests.
+agent24-comm = { path = ".", features = ["test-lock-override"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+# COMM-2a router tests: drives `router()` in-process via
+# `tower::ServiceExt::oneshot`, same pattern as agent24-os-sdk's router tests.
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+# Lets tests substitute the embedded hyphae.lock.json's expected hash for a
+# locally-built fake binary or an unreproducible reference binary. Compiled
+# in automatically under `cfg(test)` too; the feature exists so integration
+# tests (tests/*.rs, a separate crate) can opt in without `--features`.
+test-lock-override = []
+
+[lints]
+workspace = true

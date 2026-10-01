@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/agent24-agent",
+    "crates/agent24-comm",
     "crates/agent24-core",
     "crates/agent24-domain",
     "crates/agent24-os-fd",

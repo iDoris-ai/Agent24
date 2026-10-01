@@ -18,6 +18,7 @@ mod attached_routes;
     reason = "capability API is intentionally staged beyond route policy"
 )]
 mod capabilities;
+mod comm_routes;
 mod domain;
 mod events;
 mod events_emit;
