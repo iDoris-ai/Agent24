@@ -22,6 +22,14 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+**Codex 沙箱已知失败（白名单）**：沙箱禁止 `ps`/跨进程信号，下面 4 个既有测试在 B 上必然失败，与你的改动无关：
+`agent24-protocol state_file::tests::current_pid_is_alive`、`agent24-os-proto launch::tests::the_child_gets_its_own_process_group`、
+`agent24-cli` 的 `uninstall_hot_stops_a_running_module_and_leaves_no_tombstone` 与 `daemon_stop_waits_for_the_lock_before_reporting_success`。
+**只有这 4 个失败时视为门禁通过**：照常提交、推送、开 PR，在 PR body 写明「仅白名单沙箱失败」并列出 workspace 测试计数；最终以 PR 上 GitHub CI（完整 `cargo test --workspace`）为准。出现白名单外的任何失败都不算通过。
+跑测试前先 `ulimit -n 4096`。
+
+**PR 体积**：≤300 行是默认上限；单片确实不可再拆（拆开后中间版本不可用）时允许超出，在 PR body 说明为什么不拆。
+
 TypeScript（只在改了 `apps/` 或 `packages/` 时跑，在仓库根）：
 ```
 pnpm install --frozen-lockfile
