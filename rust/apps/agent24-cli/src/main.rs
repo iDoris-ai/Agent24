@@ -176,7 +176,7 @@ enum OsAttachAction {
     },
 }
 
-/// `agent24 comm …` (COMM-2a; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
+/// `agent24 comm …` (COMM-2a/2b; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
 #[derive(Subcommand)]
 enum CommAction {
     /// Manage Hyphae identities
@@ -193,6 +193,25 @@ enum CommAction {
     Relay {
         #[command(subcommand)]
         action: CommRelayAction,
+    },
+    /// Import an existing, unmanaged `~/.hyphae` HOME (COMM-HYPHAE.md §4.1,
+    /// D3). The source is only ever read — nothing is deleted, moved, or
+    /// modified there (a non-blocking probe of `outbox.json.lock` aside).
+    Import {
+        /// The old Hyphae HOME to import — the directory that used to be
+        /// `$HOME` when `hyphae` ran unmanaged (i.e. the parent of its own
+        /// `.hyphae/`, not `.hyphae` itself).
+        from: PathBuf,
+        /// Confirm the import. Required even with `--dry-run` — import
+        /// always needs an explicit confirmation (COMM-HYPHAE.md §4's
+        /// `confirm_required` row).
+        #[arg(long)]
+        yes: bool,
+        /// Only validate the source and report identity/contact/outbox
+        /// counts; never writes a password or touches the real Hyphae
+        /// HOME.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -849,7 +868,33 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// there is no local/offline path: every comm operation needs a running
 /// daemon (it is the only thing holding the Hyphae runner).
 async fn cmd_comm(action: CommAction) -> Result<(), String> {
+    // Import's server-side work (copy + verify + a Hyphae-side password
+    // check) is real file and subprocess I/O, not a quick REST round trip —
+    // give it a much longer client-side timeout than every other comm
+    // action's 15s.
+    let timeout = if matches!(action, CommAction::Import { .. }) {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(15)
+    };
     let (method, path, body) = match action {
+        CommAction::Import { from, yes, dry_run } => {
+            let password = if dry_run {
+                None
+            } else {
+                Some(read_password_from_stdin()?)
+            };
+            (
+                reqwest::Method::POST,
+                "/api/v1/comm/import".to_owned(),
+                Some(serde_json::json!({
+                    "from": from.to_string_lossy(),
+                    "confirm": yes,
+                    "password": password,
+                    "dry_run": dry_run,
+                })),
+            )
+        }
         CommAction::Identity { action } => match action {
             CommIdentityAction::List => (
                 reqwest::Method::GET,
@@ -905,7 +950,7 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     if let Some(body) = &body {
         req = req.json(body);
     }
-    let out = match req.timeout(Duration::from_secs(15)).send().await {
+    let out = match req.timeout(timeout).send().await {
         Ok(res) => {
             let status = res.status();
             let body: serde_json::Value = res.json().await.unwrap_or_default();
@@ -927,6 +972,36 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     };
     finish(ep).await;
     out
+}
+
+/// Reads the Hyphae keystore password for `agent24 comm import` from
+/// stdin — never from a `--password`-style CLI flag, which would put the
+/// plaintext on argv, visible to any other user on the same host via `ps`
+/// (COMM-HYPHAE.md §3's rule for Hyphae's own `--password-stdin`, applied
+/// here too). Prompts on stderr only when stdin is a TTY; reads one line
+/// and strips exactly one trailing `\n`/`\r\n` (keeping any other
+/// whitespace the password itself might contain, same rule the design doc
+/// uses for message content).
+fn read_password_from_stdin() -> Result<String, String> {
+    use std::io::Write;
+    if std::io::stdin().is_terminal() {
+        eprint!("Hyphae keystore password (read from stdin, not echo-suppressed): ");
+        let _ = std::io::stderr().flush();
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("reading password from stdin: {e}"))?;
+    let trimmed = line.strip_suffix('\n').unwrap_or(&line);
+    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return Err(
+            "no password was read from stdin; pipe the Hyphae keystore password in, e.g. \
+             `echo \"$PASSWORD\" | agent24 comm import <from> --yes`"
+                .to_owned(),
+        );
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// The v1 error envelope's `error.code`/`error.message`, as a bare JSON value

@@ -131,6 +131,7 @@ pub fn router(state: CommState) -> Router {
         .route("/contact", get(list_contact).post(add_contact))
         .route("/relay", get(list_relay).put(set_relay))
         .route("/relay/probe", post(probe_relay))
+        .route("/import", post(import))
         .with_state(state)
 }
 
@@ -662,6 +663,59 @@ async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeR
     envelope_response(envelope)
 }
 
+// ---------------------------------------------------------------------
+// import (COMM-2b, COMM-HYPHAE.md §4.1)
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImportReq {
+    from: String,
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /comm/import` → `crate::import::import` (§4.1). The confirm check
+/// and the password-string-to-[`Password`] decode both happen here, before
+/// the real work starts, same as every other route's own request
+/// validation (`invalid_if_blank`, the npub check in `add_contact`, …) —
+/// [`crate::import::import`] itself also checks `confirm` (defense in depth
+/// for its other, non-HTTP callers), but a bad password length should read
+/// as `invalid`, not bubble up from deep inside the import flow.
+async fn import(State(state): State<CommState>, Json(req): Json<ImportReq>) -> CommResult {
+    let (runner, password_store, home) = state.require_ready()?;
+    if !req.confirm {
+        return Err(CommError::ConfirmRequired);
+    }
+    let password = match req.password {
+        Some(s) => {
+            Some(Password::new(s.into_bytes()).map_err(|e| CommError::Invalid(e.to_string()))?)
+        }
+        None => None,
+    };
+    let report = crate::import::import(
+        runner,
+        password_store,
+        home,
+        crate::import::ImportRequest {
+            from: PathBuf::from(req.from),
+            confirm: req.confirm,
+            password,
+            dry_run: req.dry_run,
+        },
+    )
+    .await?;
+    Ok(Json(json!({"ok": true, "data": {
+        "identities": report.identities,
+        "contacts": report.contacts,
+        "outbox": report.outbox,
+        "db_files": report.db_files,
+    }})))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1076,5 +1130,45 @@ mod tests {
             !keys[0].starts_with("pending-"),
             "no Pending account should survive: {keys:?}"
         );
+    }
+
+    // ---- import (COMM-2b): HTTP-level status/error mapping ---------------
+
+    #[tokio::test]
+    async fn import_without_confirm_is_bad_request_before_any_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Would fail the test if ever invoked.
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/import",
+            Some(json!({"from": "/nonexistent", "confirm": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "confirm_required");
+    }
+
+    #[tokio::test]
+    async fn import_rejects_a_missing_source_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let missing = tmp.path().join("does-not-exist");
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/import",
+            Some(json!({
+                "from": missing.to_string_lossy(),
+                "confirm": true,
+                "dry_run": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid");
     }
 }
