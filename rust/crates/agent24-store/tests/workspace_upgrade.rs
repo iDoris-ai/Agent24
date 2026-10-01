@@ -98,7 +98,14 @@ async fn opening_a_real_v6_database_applies_workspace_migrations_and_preserves_i
         .fetch_one(test_hooks::pool(&store))
         .await
         .unwrap();
-    assert_eq!(version, 12);
+    let latest = Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
+        .await
+        .unwrap()
+        .migrations
+        .last()
+        .expect("at least one migration")
+        .version;
+    assert_eq!(version, latest);
     drop(store);
     let reopened = Store::open(&path).await.unwrap();
     assert_eq!(
