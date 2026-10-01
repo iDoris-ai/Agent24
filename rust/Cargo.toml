@@ -40,6 +40,10 @@ schemars = "1"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
+# Rust 1.99 起 clippy 对 `#[async_trait]` 宏展开出的 `#[must_use]` 报 double_must_use
+# （宏给生成的 fn 加了 must_use，而返回的 Pin<Box<Future>> 本身已 must_use）。
+# 触发点全在 async-trait 0.1.91 的生成代码里，不是手写属性；CI 装最新 stable，不放行会让所有 PR 红。
+double_must_use = "allow"
 # SPEC-001 §5: no unwrap/expect outside tests
 unwrap_used = "deny"
 expect_used = "deny"
