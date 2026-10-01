@@ -254,8 +254,6 @@ async fn joint_round1() {
         home: home_b.clone(),
     };
 
-    let mut findings: Vec<String> = Vec::new();
-
     let port = free_port();
     let relay_child = spawn_relay(&relay_path, port, &relay_data);
     wait_for_port(port, Duration::from_secs(5));
@@ -451,20 +449,17 @@ async fn joint_round1() {
         &envelope,
     );
     assert_eq!(code, 0);
-    let before_pull_empty = envelope_data(&envelope)
+    let before_pull_data = envelope_data(&envelope).cloned();
+    let before_pull_empty = before_pull_data
+        .as_ref()
         .and_then(Value::as_array)
         .is_some_and(|a| a.is_empty());
-    if !before_pull_empty {
-        findings.push(
-            "B's `history inbox` was already non-empty before any `agent inbox` pull \
-             (expected empty: history is populated by pulling, not pushed automatically)"
-                .to_string(),
-        );
-    } else {
-        println!(
-            "confirmed: B's history inbox is empty before pulling (pull-based, not push-based)"
-        );
-    }
+    assert!(
+        before_pull_empty,
+        "B's `history inbox` should be empty before any `agent inbox` pull (history is \
+         populated by pulling, not pushed automatically), got data = {before_pull_data:?}"
+    );
+    println!("confirmed: B's history inbox is empty before pulling (pull-based, not push-based)");
 
     let (code, envelope) = b.run(&["agent", "inbox", "--as", "b"], Some(PASSWORD_B));
     log_step("B", &["agent", "inbox", "--as", "b"], true, &envelope);
@@ -738,19 +733,20 @@ async fn joint_round1() {
         true,
         &envelope,
     );
-    match classify(&envelope) {
-        Some((ExitClass::UserError, ref error)) if error == "user_error" => {
-            println!(
-                "confirmed: `agent msg --to <invalid npub>` returns user_error (exit 1), \
-                 matching Hyphae's documented claim (distinct from contact add's other_error)"
-            );
-        }
-        Some((exit, error)) => findings.push(format!(
-            "`agent msg --to <invalid npub>` returned exit_class={exit:?} error={error:?}, \
-             NOT the user_error Hyphae's docs claim for the send path"
-        )),
-        None => panic!("expected a Failed envelope for an invalid --to npub, got Ok: {envelope:?}"),
-    }
+    let (exit, error) = classify(&envelope).unwrap_or_else(|| {
+        panic!("expected a Failed envelope for an invalid --to npub, got Ok: {envelope:?}")
+    });
+    assert_eq!(
+        exit,
+        ExitClass::UserError,
+        "`agent msg --to <invalid npub>` should be user_error (exit 1), matching Hyphae's \
+         documented claim for the send path (distinct from contact add's other_error)"
+    );
+    assert_eq!(error, "user_error");
+    println!(
+        "confirmed: `agent msg --to <invalid npub>` returns user_error (exit 1), \
+         matching Hyphae's documented claim (distinct from contact add's other_error)"
+    );
 
     // ======================================================================
     // Cleanup: stop the relay by its own pid (never pkill -f), then let
@@ -758,14 +754,7 @@ async fn joint_round1() {
     // ======================================================================
     stop_child(relay_child);
 
-    println!("==== FINDINGS ====");
-    if findings.is_empty() {
-        println!("(none — every step matched the expected behavior)");
-    } else {
-        for finding in &findings {
-            println!("- {finding}");
-        }
-    }
+    println!("==== all findings are asserted above; every step matched the expected behavior ====");
 
     drop(tmp);
 }

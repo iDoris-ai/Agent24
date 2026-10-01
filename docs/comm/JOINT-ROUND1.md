@@ -30,7 +30,7 @@
 - B 侧：裸 `std::process::Command` 调同一个二进制，独立临时 `HOME`，口令经 stdin pipe 写入后立即关闭；用 `agent24_comm::parse_envelope`（crate 导出的纯函数）解析 envelope，确保两侧校验的是同一套 envelope 契约。
 - 两套 HOME、relay 的 `data-dir`、A 的 verified-binary 安装目录全部在一个 `tempfile::TempDir` 下，退出时自动删除；全程未触碰真实 `~/.hyphae`。
 - relay 端口：绑定 `127.0.0.1:0` 取系统分配的空闲端口。
-- 口令：`joint-round1-a-synthetic-9f2c`、`joint-round1-b-synthetic-7ae1`（均为本轮合成的测试夹具值，非真实口令）。
+- 口令：均为本轮合成的测试夹具值，非真实口令，原文不进文档——见 `joint_round1.rs` 里的 `PASSWORD_A`/`PASSWORD_B` 常量。
 - 本记录中的 npub 保留原文；未涉及 nsec（`identity export` 不在本轮范围内）。
 
 ## 2. 实测结果
