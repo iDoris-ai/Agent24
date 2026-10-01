@@ -196,7 +196,14 @@ enum CommAction {
     },
     /// Import an existing, unmanaged `~/.hyphae` HOME (COMM-HYPHAE.md §4.1,
     /// D3). The source is only ever read — nothing is deleted, moved, or
-    /// modified there (a non-blocking probe of `outbox.json.lock` aside).
+    /// modified there (non-blocking probes of `outbox.json.lock` and, when
+    /// present, `daemon.lock` aside).
+    ///
+    /// STOP the `hyphae` daemon using `from` before running this. The
+    /// server-side probes catch a daemon mid-outbox-operation, and — only
+    /// on a Hyphae build that ships `daemon.lock` (Hyphae#104+) — an idle
+    /// one too, but neither can prove every daemon touching this HOME has
+    /// actually stopped.
     Import {
         /// The old Hyphae HOME to import — the directory that used to be
         /// `$HOME` when `hyphae` ran unmanaged (i.e. the parent of its own
@@ -204,7 +211,9 @@ enum CommAction {
         from: PathBuf,
         /// Confirm the import. Required even with `--dry-run` — import
         /// always needs an explicit confirmation (COMM-HYPHAE.md §4's
-        /// `confirm_required` row).
+        /// `confirm_required` row). Make sure the `hyphae` daemon using
+        /// `from` is stopped before passing this — see the command's own
+        /// help text above.
         #[arg(long)]
         yes: bool,
         /// Only validate the source and report identity/contact/outbox

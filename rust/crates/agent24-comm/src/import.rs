@@ -12,6 +12,26 @@
 //! (mirroring Hyphae's own lazy creation of that file), which never touches
 //! any of the six files whose bytes/mtimes this task's acceptance criteria
 //! pin as unchanged.
+//!
+//! **Known limitation (PR #635 R4, 挂账待 Hyphae 版本升级)**: step 2 also
+//! probes `daemon.lock` (see [`try_lock_daemon`]) — Hyphae's own
+//! lifetime-of-the-process single-instance lock
+//! (`internal/daemon/lock_unix.go`'s `acquireDaemonHomeLock`), as opposed to
+//! `outbox.json.lock`, which Hyphae only holds for the duration of a single
+//! outbox read/write and therefore cannot prove an otherwise-idle daemon
+//! isn't still running. `daemon.lock` shipped in Hyphae
+//! [#104](https://github.com/iDoris-ai/Hyphae/pull/104) (merged into
+//! Hyphae's own `main` on 2026-10-01), but this crate is still pinned
+//! (`hyphae.lock.json`) to source `a4aa606`, four commits BEHIND that merge
+//! — a source HOME last touched by a Hyphae build that old has no
+//! `daemon.lock` to find, so a currently-running old-Hyphae daemon on that
+//! HOME is undetectable until the pin is upgraded past #104. Unlike the
+//! outbox probe, `try_lock_daemon` never creates the file (no `O_CREAT`) —
+//! a missing `daemon.lock` is treated as "nothing to probe", not an error,
+//! precisely to stay compatible with every Hyphae HOME predating #104.
+//! `ImportRequest`'s and the CLI's own docs tell the caller to stop the
+//! source HOME's `hyphae` daemon before importing regardless — that's the
+//! only defense against this gap until the pin moves.
 
 use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -64,7 +84,16 @@ pub struct ImportRequest {
     /// Must be `true`, checked first, before anything else runs (§4's
     /// `confirm_required` row: import is always a confirm-required
     /// operation, `dry_run` or not — a caller previewing counts still has
-    /// to explicitly ask for the preview to run).
+    /// to explicitly ask for the preview to run). **Before setting this,
+    /// stop the `hyphae` daemon that is using `from` as its HOME** (or
+    /// confirm nothing else is running against it): step 2's occupation
+    /// probes catch a daemon that is actively mid-operation on
+    /// `outbox.json`, and — when `from` was last touched by a Hyphae build
+    /// that ships `daemon.lock` (Hyphae #104 or later; this crate's own
+    /// pinned source predates it, see the module doc's "known limitation"
+    /// note) — an idle-but-running one too, but neither can prove a daemon
+    /// mid-operation on `messages.db`/`keystore.json` outside those two
+    /// files has fully stopped.
     pub confirm: bool,
     /// The imported keystore's own password. Required unless `dry_run`
     /// (step 5 never runs for a dry run, so there is nothing to verify it
@@ -190,8 +219,19 @@ async fn run_import(
     drop(open_source_dir(&source_hyphae).await?);
     ensure_target_empty(home).await?;
 
-    // ---- step 2: occupation probe + flock, held across the copy --------
-    let lock_file = try_lock_outbox(source_hyphae.join("outbox.json.lock")).await?;
+    // ---- step 2: occupation probes + flocks, held across the copy -------
+    // Two independent probes, both held until the copy (and its retry, if
+    // any) is done:
+    //   - `outbox.json.lock`: proves no Hyphae command is mid-outbox-op
+    //     right now. Hyphae only holds this for the duration of a single
+    //     outbox read/write, so it does NOT prove an idle daemon isn't
+    //     running (R4 of PR #635's review).
+    //   - `daemon.lock` (see `try_lock_daemon`'s doc): Hyphae's own
+    //     lifetime-of-the-process single-instance lock, which DOES catch an
+    //     idle daemon — but only on a Hyphae HOME last touched by a build
+    //     that ships it (module doc's "known limitation").
+    let outbox_lock = try_lock_outbox(source_hyphae.join("outbox.json.lock")).await?;
+    let daemon_lock = try_lock_daemon(&source_hyphae).await?;
     let staging_hyphae = staging_home.join(".hyphae");
     let mut before = fingerprint_all(&source_hyphae).await?;
     let mut db_files = copy_import_files(&source_hyphae, &staging_hyphae).await?;
@@ -208,7 +248,8 @@ async fn run_import(
         db_files = copy_import_files(&source_hyphae, &staging_hyphae).await?;
         after = fingerprint_all(&source_hyphae).await?;
         if after != before {
-            drop(lock_file);
+            drop(outbox_lock);
+            drop(daemon_lock);
             return Err(CommError::Conflict(
                 "source_changed: the source .hyphae directory changed while it was being \
                  imported; nothing was committed, try again once nothing else is using it"
@@ -220,10 +261,11 @@ async fn run_import(
     // 照，而不是等到锁释放、验证阶段才去读 —— 这样比较的才是刚刚复制进
     // staging 的那份字节，不是锁放开之后源目录可能已经变化的内容。
     let expected_outbox_entries = count_source_outbox_entries(&source_hyphae).await?;
-    // Copy is done: release the source's outbox lock now, not held through
+    // Copy is done: release both source locks now, not held through
     // verification/commit below (COMM-HYPHAE.md §4.1 step 2: "成功则一直持
     // 有到复制结束").
-    drop(lock_file);
+    drop(outbox_lock);
+    drop(daemon_lock);
 
     // ---- step 4: verify against the staging HOME ------------------------
     let staging_runner = runner.with_home(staging_home.to_path_buf());
@@ -581,7 +623,7 @@ fn open_source_file(dir_fd: &OwnedFd, name: &str) -> Result<Option<std::fs::File
 }
 
 // ---------------------------------------------------------------------
-// occupation probe
+// occupation probes
 // ---------------------------------------------------------------------
 
 /// Non-blockingly `flock`s `lock_path` (creating it with `O_CREAT` if it
@@ -609,6 +651,51 @@ async fn try_lock_outbox(lock_path: PathBuf) -> Result<OwnedFd, CommError> {
             Err(rustix::io::Errno::WOULDBLOCK) => Err(CommError::Conflict(format!(
                 "source_in_use: {lock_path:?} is already locked by another process; stop \
                      using that hyphae HOME before importing it"
+            ))),
+            Err(e) => Err(CommError::Upstream(format!("flock {lock_path:?}: {e}"))),
+        }
+    })
+    .await
+    .map_err(|e| CommError::Upstream(format!("lock task panicked: {e}")))?
+}
+
+/// Best-effort probe for a still-running Hyphae daemon: a non-blocking
+/// `flock(LOCK_EX)` on `daemon.lock`, mirroring Hyphae's own single-instance
+/// lock (`internal/daemon/lock_unix.go`'s `acquireDaemonHomeLock`, confirmed
+/// against Hyphae #104 — merged into Hyphae's own `main` 2026-10-01). Unlike
+/// `try_lock_outbox`, this is held for the daemon's ENTIRE lifetime, not
+/// just a single outbox op, so a successful lock here really does prove no
+/// daemon is running against `source_hyphae` right now — PR #635's review
+/// R4 pointed out `outbox.json.lock` alone cannot prove that for an
+/// otherwise-idle daemon.
+///
+/// Deliberately never creates `daemon.lock` (no `O_CREAT`, unlike
+/// `try_lock_outbox`'s lazy creation of `outbox.json.lock`): an old Hyphae
+/// HOME that predates #104 simply has no such file, and this importer has
+/// no business manufacturing Hyphae's own lock file inside someone else's
+/// HOME. A missing file is `Ok(None)` — "nothing to probe, skip" — not an
+/// error, which is exactly what keeps this compatible with every
+/// pre-#104 Hyphae HOME (the module doc's "known limitation": this crate's
+/// own pinned source, `a4aa606`, is itself one of those, so this probe
+/// currently never actually fires against it). Reuses
+/// `open_source_dir_blocking` and `open_source_file` for the same
+/// `O_NOFOLLOW`/`O_NONBLOCK`/owner/regular-file checks every other atomic
+/// open in this module makes (Codex 挑战 High #2 / Medium #5): a FIFO or
+/// symlink planted at `daemon.lock` is rejected the same way, not blocked
+/// on or followed.
+async fn try_lock_daemon(source_hyphae: &Path) -> Result<Option<std::fs::File>, CommError> {
+    let source_hyphae = source_hyphae.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let dir_fd = open_source_dir_blocking(&source_hyphae)?;
+        let Some(file) = open_source_file(&dir_fd, "daemon.lock")? else {
+            return Ok(None);
+        };
+        let lock_path = source_hyphae.join("daemon.lock");
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Some(file)),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(CommError::Conflict(format!(
+                "source_in_use: {lock_path:?} is held — a hyphae daemon appears to still be \
+                 running against this HOME; stop it before importing"
             ))),
             Err(e) => Err(CommError::Upstream(format!("flock {lock_path:?}: {e}"))),
         }
@@ -1536,6 +1623,191 @@ esac
         );
     }
 
+    // ---- PR #635 R4 阻塞项 1: the SAME retry mechanism, exercised through --
+    // ---- `import()`'s own control flow (not hand-composed in the test) ----
+    //
+    // The unit test above proves `copy_import_files` + a staging wipe is
+    // enough; these two prove `run_import`'s own `if after != before { .. }`
+    // branch actually calls that wipe before retrying, and actually takes
+    // the `source_changed` branch when a second mismatch happens too — the
+    // exact two gaps R4 flagged as untested. Both drive a REAL race against
+    // `import()`'s live fingerprint/copy sequence (not a replay of it),
+    // synchronized by polling for `staging_hyphae` — `copy_import_files`'s
+    // very first action is creating it, well before it even reaches
+    // `messages.db-wal`/`-shm` (5th/6th of 6 files) — so the mutation below
+    // always lands before `run_import`'s own post-copy fingerprint, not
+    // racing blind against wall-clock time.
+
+    /// Polls (no sleep — a tight `yield_now` loop; cheap and short-lived)
+    /// until `path`'s existence matches `want_present`, or panics after
+    /// `timeout`. Used to synchronize a background mutator against
+    /// `run_import`'s internal copy steps without any hook in production
+    /// code — `path` is always `staging_hyphae`, whose creation/removal is
+    /// itself a side effect those steps already produce.
+    async fn wait_for_presence(path: &Path, want_present: bool, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let present = tokio::fs::try_exists(path).await.unwrap_or(false);
+            if present == want_present {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {path:?} to {}exist",
+                if want_present { "" } else { "not " }
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn import_retries_once_when_the_source_wal_and_shm_vanish_mid_copy_and_excludes_them_from_the_result()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("old-home");
+        write_source_fixture(&from, 1).await;
+        let source_hyphae = from.join(".hyphae");
+
+        let script = fake_hyphae_script(true, "correct-pass", 1);
+        let runner = build_runner(tmp.path(), &script).await;
+        let store = MemoryPasswordStore::new();
+        let comm_dir = tmp.path().join("comm");
+        let home = comm_dir.join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let staging_hyphae = comm_dir.join("hyphae-home.staging").join(".hyphae");
+
+        // Simulates a WAL checkpoint landing mid-copy: as soon as the first
+        // copy attempt starts (staging's `.hyphae` appears), delete the
+        // source's wal/shm — exactly the scenario R4 says must not leak a
+        // stale WAL into the committed `messages.db`.
+        let mutator_source = source_hyphae.clone();
+        let mutator_staging = staging_hyphae.clone();
+        let mutator = tokio::spawn(async move {
+            wait_for_presence(&mutator_staging, true, Duration::from_secs(5)).await;
+            tokio::fs::remove_file(mutator_source.join("messages.db-wal"))
+                .await
+                .unwrap();
+            tokio::fs::remove_file(mutator_source.join("messages.db-shm"))
+                .await
+                .unwrap();
+        });
+
+        let report = import(
+            &runner,
+            &store,
+            &home,
+            ImportRequest {
+                from: from.clone(),
+                confirm: true,
+                password: Some(Password::new(b"correct-pass".to_vec()).unwrap()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+        mutator.await.unwrap();
+
+        assert!(
+            !report
+                .db_files
+                .iter()
+                .any(|n| n == "messages.db-wal" || n == "messages.db-shm"),
+            "a wal/shm that vanished mid-copy must not be reported as imported: {report:?}"
+        );
+        let home_hyphae = home.join(".hyphae");
+        assert!(
+            !tokio::fs::try_exists(home_hyphae.join("messages.db-wal"))
+                .await
+                .unwrap_or(false),
+            "nor actually committed into the final home"
+        );
+        assert!(
+            !tokio::fs::try_exists(home_hyphae.join("messages.db-shm"))
+                .await
+                .unwrap_or(false)
+        );
+        assert!(
+            tokio::fs::try_exists(home_hyphae.join("messages.db"))
+                .await
+                .unwrap_or(false),
+            "messages.db itself (which never vanished) must still have been committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_reports_source_changed_when_the_source_keeps_changing_across_the_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("old-home");
+        write_source_fixture(&from, 0).await;
+        let source_hyphae = from.join(".hyphae");
+
+        let script = fake_hyphae_script(true, "correct-pass", 0);
+        let runner = build_runner(tmp.path(), &script).await;
+        let store = MemoryPasswordStore::new();
+        let comm_dir = tmp.path().join("comm");
+        let home = comm_dir.join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let staging_hyphae = comm_dir.join("hyphae-home.staging").join(".hyphae");
+
+        // Mutates the source TWICE: once while the first copy is in
+        // flight (forces the first retry), then again while the retry's
+        // own copy is in flight (forces the "still doesn't match" branch).
+        // The second mutation is a content change to `messages.db` rather
+        // than another deletion, since the wal/shm are already gone for
+        // good after the first mutation — any detectable (size/mtime)
+        // change works, this is just a second, independent one.
+        let mutator_source = source_hyphae.clone();
+        let mutator_staging = staging_hyphae.clone();
+        let mutator = tokio::spawn(async move {
+            wait_for_presence(&mutator_staging, true, Duration::from_secs(5)).await;
+            tokio::fs::remove_file(mutator_source.join("messages.db-wal"))
+                .await
+                .unwrap();
+            tokio::fs::remove_file(mutator_source.join("messages.db-shm"))
+                .await
+                .unwrap();
+
+            // Round 1's mismatch triggers `run_import`'s own
+            // `remove_dir_all(staging_home)` before it retries —
+            // `staging_hyphae` disappears, then `copy_import_files`
+            // recreates it for the retry's copy. That reappearance is the
+            // signal that the retry is now in flight.
+            wait_for_presence(&mutator_staging, false, Duration::from_secs(5)).await;
+            wait_for_presence(&mutator_staging, true, Duration::from_secs(5)).await;
+
+            let path = mutator_source.join("messages.db");
+            let mut content = tokio::fs::read(&path).await.unwrap();
+            content.extend_from_slice(b"-changed-again");
+            tokio::fs::write(&path, &content).await.unwrap();
+        });
+
+        let err = import(
+            &runner,
+            &store,
+            &home,
+            ImportRequest {
+                from: from.clone(),
+                confirm: true,
+                password: Some(Password::new(b"correct-pass".to_vec()).unwrap()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        mutator.await.unwrap();
+
+        assert!(
+            matches!(err, CommError::Conflict(ref m) if m.contains("source_changed")),
+            "{err:?}"
+        );
+        assert!(
+            !tokio::fs::try_exists(home.join(".hyphae"))
+                .await
+                .unwrap_or(false),
+            "nothing must be committed when the retry itself also sees a mismatch"
+        );
+    }
+
     // ---- Codex 挑战 Medium #4: outbox.json's real `{"entries": [...]}` ---
     // ---- shape, parsed strictly (not silently skipped) -------------------
 
@@ -1666,6 +1938,101 @@ esac
         let result = tokio::time::timeout(Duration::from_secs(5), try_lock_outbox(lock_path))
             .await
             .expect("try_lock_outbox must not block on a FIFO");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, CommError::Invalid(ref m) if m.contains("FIFO") || m.contains("not a regular file")),
+            "{err:?}"
+        );
+    }
+
+    // ---- PR #635 R4 阻塞项 2: `daemon.lock` probe --------------------------
+
+    #[tokio::test]
+    async fn try_lock_daemon_skips_silently_when_the_source_has_no_daemon_lock_file() {
+        // The compatibility case this probe exists to preserve: every
+        // Hyphae HOME predating #104 (including the source this crate is
+        // currently pinned to, `a4aa606`) has no `daemon.lock` at all —
+        // `try_lock_daemon` must treat that as "nothing to probe", not an
+        // error, and critically must NOT create the file itself (checked
+        // below).
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("old-home");
+        write_source_fixture(&from, 0).await;
+        let source_hyphae = from.join(".hyphae");
+
+        let locked = try_lock_daemon(&source_hyphae).await.unwrap();
+        assert!(locked.is_none());
+        assert!(
+            !tokio::fs::try_exists(source_hyphae.join("daemon.lock"))
+                .await
+                .unwrap_or(false),
+            "the probe must never manufacture daemon.lock inside the source HOME"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_reports_source_in_use_when_the_source_daemon_lock_is_already_held() {
+        // Simulates a currently-running Hyphae daemon (built against a
+        // Hyphae source that DOES ship `daemon.lock`, i.e. #104+): hold a
+        // non-blocking exclusive flock on the source's `daemon.lock` from a
+        // separate open file description, exactly like the existing
+        // `outbox.json.lock` conflict test above, and confirm `import`
+        // reports `source_in_use` instead of silently proceeding.
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("old-home");
+        write_source_fixture(&from, 0).await;
+        let lock_path = from.join(".hyphae").join("daemon.lock");
+
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+
+        let script = fake_hyphae_script(true, "correct-pass", 0);
+        let runner = build_runner(tmp.path(), &script).await;
+        let store = MemoryPasswordStore::new();
+        let home = tmp.path().join("comm").join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+
+        let err = import(
+            &runner,
+            &store,
+            &home,
+            ImportRequest {
+                from,
+                confirm: true,
+                password: Some(Password::new(b"correct-pass".to_vec()).unwrap()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CommError::Conflict(ref m) if m.contains("source_in_use")),
+            "{err:?}"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn try_lock_daemon_rejects_a_fifo_at_the_lock_path_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("old-home");
+        write_source_fixture(&from, 0).await;
+        let source_hyphae = from.join(".hyphae");
+        let lock_path = source_hyphae.join("daemon.lock");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&lock_path)
+            .status()
+            .expect("mkfifo must be available on darwin/linux CI");
+        assert!(status.success(), "mkfifo failed");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), try_lock_daemon(&source_hyphae))
+            .await
+            .expect("try_lock_daemon must not block on a FIFO");
         let err = result.unwrap_err();
         assert!(
             matches!(err, CommError::Invalid(ref m) if m.contains("FIFO") || m.contains("not a regular file")),

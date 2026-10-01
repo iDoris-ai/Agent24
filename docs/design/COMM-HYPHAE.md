@@ -221,10 +221,11 @@ Agent24 现有的 token 鉴权照常适用。响应格式与 Hyphae 一致：`{o
    - 目标 `hyphae-home/.hyphae` 必须不存在或为空，否则返回 `conflict`。
 2. **占用探测**：
    - 对 `outbox.json.lock` 尝试非阻塞的 `flock(LOCK_EX|LOCK_NB)`：失败返回 `conflict{source_in_use}`；成功则**一直持有到复制结束**，保证复制期间 outbox 不被改写。
-   - 不足之处：Hyphae 只在每次 outbox 操作期间持有这把锁，所以拿到锁并不能证明源目录上没有 daemon 在跑。补充两道防线：
+   - 不足之处：Hyphae 只在每次 outbox 操作期间持有这把锁，所以拿到锁并不能证明源目录上没有 daemon 在跑。补充三道防线：
+     - **（PR #635 R4 新增）** 同时对 `daemon.lock`（存在时）尝试非阻塞 `flock`——这把锁贯穿 daemon 整个进程生命周期，能抓到一个空闲但仍在跑的 daemon；文件不存在就跳过（兼容 Hyphae #104 之前的旧 HOME，见 G3）；
      - CLI 确认文案要求用户确认「已停止使用该目录的 hyphae」；
-     - 复制前后比较 6 个文件的 (size, mtime)，有变化就重试一次，仍有变化就返回 `conflict{source_changed}`。
-   - 根治办法见 G3：daemon 在整个生命周期内持有一把锁。
+     - 复制前后比较 6 个文件的 (size, mtime)，有变化就重试一次（重试前先清空 staging 重建，不清空会让第一趟复制留下的过期文件随 rename 混进提交结果），仍有变化就返回 `conflict{source_changed}`。
+   - 根治办法见 G3：daemon 在整个生命周期内持有一把锁——Hyphae #104 已实现，但本 crate 的 lock 还没跟进。
 3. **复制**：上述 6 个文件按原样复制到 `hyphae-home.staging/.hyphae/`，文件不存在就跳过（`outbox.json` 在首次入队时才会生成），复制后的文件设为 0600。**不引入 rusqlite**：WAL 回放交给 Hyphae 在 staging HOME 中首次打开数据库时自行完成。
 4. **校验**（runner 的 HOME 指向 staging）：
    - `identity list`：必须全部 `encrypted:true`。如有明文 keystore，返回 `not_configured`，提示语为：「源 keystore 未加密。请先在源目录用终端执行 `HOME=<源 HOME> hyphae identity change-password` 设置口令，再重新导入」（M3）。
@@ -446,7 +447,7 @@ COMM-3 + COMM-6 → 7
 | R6 | 构建配方的 hash 依赖 Go 的补丁版本 | 配方固定 `GOTOOLCHAIN`；升级 Go 视为修改 lock |
 | G1 | 没有只读的口令验证命令；`change-password` 在 JSON 模式下不接受 stdin | 暂用 `identity create __verify`，放在一次性 HOME 中执行（§4.1）。请 Hyphae 提供 `keystore verify --password-stdin` |
 | G2 | daemon 没有结构化的健康和补收进度 | 暂时显示 `unknown`/`incomplete`。请 Hyphae 提供 JSON-lines 状态 |
-| G3 | daemon 没有按 HOME 的生命周期锁 | 依赖 agent24d 单例。请 Hyphae 在 daemon 运行期间持有 `.hyphae/daemon.lock`，import 也可以改为探测这把锁 |
+| G3 | daemon 没有按 HOME 的生命周期锁 | **部分解决（PR #635 R4，2026-10-01）**：Hyphae [#104](https://github.com/iDoris-ai/Hyphae/pull/104) 已合并进 `main`，daemon 运行期间持有 `.hyphae/daemon.lock`；import 的 §4.1 步骤 2 已改为同时探测这把锁（非阻塞 flock，文件不存在就跳过，兼容旧版）。但本 crate 的 `hyphae.lock.json` 仍锁定在 `#104` 之前的 `a4aa606`，所以**对一个正在运行但空闲的旧版 Hyphae 守护进程仍检测不到**——这是待办：升级 lock 到 #104 之后的版本 |
 | G4 | history 不带对端回执 | L3 等 T01 |
 | G5 | `--version` 输出 `dev` | 以 sha256 为准；建议 Hyphae release 用 ldflags 注入版本号 |
 | G6 | 非法 npub 返回 `other_error`（退出码 4） | comm 在调用前自行校验 |
