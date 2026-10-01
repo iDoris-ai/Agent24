@@ -19,15 +19,21 @@
 //! here.
 
 pub mod binary;
+pub mod daemon;
 pub mod error;
 pub mod keystore_lock;
 pub mod npub;
 pub mod password;
 pub mod password_store;
+mod restart_policy;
 pub mod router;
 pub mod runner;
 
 pub use binary::{BinaryError, HyphaeLock, Sha256Digest, VerifiedBinary, current_platform};
+pub use daemon::{
+    Ctx as DaemonCtx, DaemonShutdownOutcome, DaemonStartError, DaemonStatus,
+    HyphaeDaemonSupervisor, OrphanOutcome, ShutdownLeader, reap_orphan, stop_grace,
+};
 pub use error::CommError;
 pub use keystore_lock::{KeystoreGuard, KeystoreWriteLock};
 pub use npub::is_valid_npub;
