@@ -967,6 +967,26 @@ fn qs_encode(s: &str) -> String {
 /// the same bearer/timeout/error-reporting shape as `cmd_os`. Unlike `cmd_os`
 /// there is no local/offline path: every comm operation needs a running
 /// daemon (it is the only thing holding the Hyphae runner).
+/// Codex 挑战（B 端 gpt-6-astra）Medium：`send`/`outbox retry` 的
+/// `partial`/`conflict` 错误带着 `data`（`event_id`、relay 接受情况
+/// `published_to`、记账异常 `audit_error`，或 retry 的
+/// `sent`/`superseded`），而旧实现只打印 `error`/`message` 两个字段，这些
+/// data 在 CLI 上直接丢了，用户拿不到可用来查 outbox/history 的
+/// event_id。这里直接把完整 envelope（而不只是 `data`）打到错误行里——
+/// `error`/`message` 不带 data 的路由（identity/contact/relay/…）行为不变，
+/// 因为它们的 `body["data"]` 本就是 `null`。
+fn format_comm_error(body: &serde_json::Value) -> String {
+    let error = body["error"].as_str().unwrap_or("error");
+    let message = body["message"].as_str().unwrap_or_default();
+    let mut out = format!("comm: {error} — {message}");
+    if let Some(data) = body.get("data").filter(|d| !d.is_null())
+        && let Ok(pretty) = serde_json::to_string_pretty(data)
+    {
+        out.push_str(&format!("\n  data: {pretty}"));
+    }
+    out
+}
+
 async fn cmd_comm(action: CommAction) -> Result<(), String> {
     // Import's server-side work (copy + verify + a Hyphae-side password
     // check) is real file and subprocess I/O, not a quick REST round trip —
@@ -1143,11 +1163,7 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 );
                 Ok(())
             } else {
-                Err(format!(
-                    "comm: {} — {}",
-                    body["error"].as_str().unwrap_or("error"),
-                    body["message"].as_str().unwrap_or_default()
-                ))
+                Err(format_comm_error(&body))
             }
         }
         Err(e) => Err(e.to_string()),
@@ -1899,6 +1915,58 @@ mod tests {
             agent24_protocol::state_file::AuthMode::LegacySingleToken
         );
         assert_eq!(host_token(&state), Ok("legacy"));
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：`send` 返回 502 partial 时，CLI
+    /// 必须把 event_id、relay 接受情况（`published_to`）和记账异常
+    /// （`audit_error`）打出来，不能只剩 `error`/`message` 两行字。
+    #[test]
+    fn format_comm_error_includes_partial_event_id_and_audit_error() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "partial",
+            "message": "hyphae reported a partial result",
+            "data": {
+                "event_id": "e9",
+                "published_to": 1,
+                "history_stored": true,
+                "audit_error": "permission denied"
+            }
+        });
+        let out = format_comm_error(&body);
+        assert!(out.contains("partial"), "{out}");
+        assert!(out.contains("e9"), "{out}");
+        assert!(out.contains("published_to"), "{out}");
+        assert!(out.contains("permission denied"), "{out}");
+    }
+
+    /// Same bug, `outbox retry`'s `write_conflict`: `sent`/`superseded` and
+    /// the retried event_id must show up too.
+    #[test]
+    fn format_comm_error_includes_conflict_sent_and_superseded() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "conflict",
+            "message": "queue entry superseded",
+            "data": {"event_id": "e2", "sent": true, "superseded": true}
+        });
+        let out = format_comm_error(&body);
+        assert!(out.contains("e2"), "{out}");
+        assert!(out.contains("\"sent\": true"), "{out}");
+        assert!(out.contains("\"superseded\": true"), "{out}");
+    }
+
+    /// Routes with no `data` (identity/contact/relay/…) must keep the exact
+    /// old one-line shape — no empty `data:` section appended.
+    #[test]
+    fn format_comm_error_without_data_is_unchanged() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "not_configured",
+            "message": "no default identity"
+        });
+        let out = format_comm_error(&body);
+        assert_eq!(out, "comm: not_configured — no default identity");
     }
 
     #[test]

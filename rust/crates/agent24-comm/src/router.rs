@@ -923,7 +923,17 @@ fn classify_send_result(data: Value) -> Result<Value, CommError> {
     let history_stored_false = data.get("history_stored").and_then(Value::as_bool) == Some(false);
     let queue_state_unknown =
         data.get("queue_state_unknown").and_then(Value::as_bool) == Some(true);
-    let audit_error = data.get("audit_error").and_then(Value::as_bool) == Some(true);
+    // Hyphae's real `audit_error` field is a string (Go `AuditError string
+    // `json:"audit_error,omitempty"``), not a bool — set to the underlying
+    // error's message when `audit.LogAction` fails, and omitted entirely
+    // otherwise. A failed audit log does not make Hyphae's own exit code
+    // non-zero (it only prints a stderr warning outside `--json` mode), so
+    // this is the only signal distinguishing "sent cleanly" from "sent, but
+    // local bookkeeping may be wrong" (§5.3).
+    let audit_error = data
+        .get("audit_error")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
     if published_to > 0 && (history_stored_false || queue_state_unknown || audit_error) {
         return Err(CommError::Partial(data));
     }
@@ -1006,8 +1016,12 @@ struct HistoryQuery {
 /// Pull-based, not push-based (JOINT-ROUND1 F1): a caller that wants fresh
 /// inbound messages reflected here must call `POST /comm/inbox/pull` first
 /// when no daemon is polling on its behalf.
-async fn get_history(State(state): State<CommState>, Query(q): Query<HistoryQuery>) -> CommResult {
+async fn get_history(
+    State(state): State<CommState>,
+    query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> CommResult {
     let (runner, ..) = state.require_ready()?;
+    let Query(q) = query.map_err(|e| CommError::Invalid(e.body_text()))?;
     if let Some(limit) = q.limit
         && !(1..=200).contains(&limit)
     {
@@ -1079,8 +1093,12 @@ struct OutboxQuery {
 }
 
 /// `GET /comm/outbox?failed_only=` → `storage outbox list [--failed-only]`.
-async fn list_outbox(State(state): State<CommState>, Query(q): Query<OutboxQuery>) -> CommResult {
+async fn list_outbox(
+    State(state): State<CommState>,
+    query: Result<Query<OutboxQuery>, axum::extract::rejection::QueryRejection>,
+) -> CommResult {
     let (runner, ..) = state.require_ready()?;
+    let Query(q) = query.map_err(|e| CommError::Invalid(e.body_text()))?;
     if q.failed_only == Some(true) {
         run_read(runner, &["storage", "outbox", "list", "--failed-only"]).await
     } else {
@@ -1089,8 +1107,10 @@ async fn list_outbox(State(state): State<CommState>, Query(q): Query<OutboxQuery
 }
 
 /// Looks an outbox entry up by id before acting on it (§4's `not_found` row:
-/// "outbox 条目不存在（comm 在调用前查证）").
-async fn find_outbox_entry(runner: &HyphaeRunner, event_id: &str) -> Result<(), CommError> {
+/// "outbox 条目不存在（comm 在调用前查证）"), and hands the matching entry
+/// back — not just a boolean — so the caller can read its own `relays`
+/// (Go's `types.OutboxEntry.Relays`) rather than only confirming existence.
+async fn find_outbox_entry(runner: &HyphaeRunner, event_id: &str) -> Result<Value, CommError> {
     let envelope = runner
         .run(read_invocation(&["storage", "outbox", "list"]))
         .await
@@ -1104,17 +1124,27 @@ async fn find_outbox_entry(runner: &HyphaeRunner, event_id: &str) -> Result<(), 
             ..
         } => return Err(map_envelope_failure(&error, &message, data)),
     };
-    let found = data.as_array().is_some_and(|entries| {
+    let found = data.as_array().and_then(|entries| {
         entries
             .iter()
-            .any(|e| e.get("id").and_then(Value::as_str) == Some(event_id))
+            .find(|e| e.get("id").and_then(Value::as_str) == Some(event_id))
+            .cloned()
     });
-    if found {
-        Ok(())
-    } else {
-        Err(CommError::NotFound(format!(
-            "no outbox entry with id {event_id:?}"
-        )))
+    found.ok_or_else(|| CommError::NotFound(format!("no outbox entry with id {event_id:?}")))
+}
+
+/// §5.1/§3's retry timeout rule ("`5s × relay 数 + 10s`") is defined in
+/// terms of how many relays THIS attempt will actually dial — and Hyphae's
+/// own `storage outbox retry` (`internal/messaging/outbox_commands.go`)
+/// prefers the entry's own queued `relays` over whatever `relay list`
+/// reports right now, falling back to the current config only when the
+/// entry has none of its own. Computing the timeout from the current
+/// config instead would silently under- or over-estimate it after the
+/// caller reconfigures relays between enqueue and retry.
+async fn relay_count_for_retry(runner: &HyphaeRunner, entry: &Value) -> usize {
+    match entry.get("relays").and_then(Value::as_array) {
+        Some(relays) if !relays.is_empty() => relays.len(),
+        _ => relay_count_best_effort(runner).await,
     }
 }
 
@@ -1140,8 +1170,8 @@ async fn retry_outbox(
 ) -> CommResult {
     let (runner, ..) = state.require_ready()?;
     invalid_if_blank("event_id", &event_id)?;
-    find_outbox_entry(runner, &event_id).await?;
-    let relay_count = relay_count_best_effort(runner).await;
+    let entry = find_outbox_entry(runner, &event_id).await?;
+    let relay_count = relay_count_for_retry(runner, &entry).await;
     let envelope = runner
         .run(Invocation {
             args: vec![
@@ -1803,6 +1833,35 @@ esac
         assert_eq!(body["data"]["sent"], true);
     }
 
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：并发 `outbox clear`/daemon 把条目
+    /// 移除时，Hyphae 的 `storage outbox retry` 返回 `write_conflict` 且带
+    /// `data`（`{"sent":true,"superseded":true}` 这种「已经拿到 ACK，但条目
+    /// 被并发移除」的情形，见 `internal/messaging/outbox_commands.go`）。路由
+    /// 必须把这份 data 原样带回去，而不是只剩一句 message——`with_event_id`
+    /// 补写的 event_id 也要留在里面。
+    #[tokio::test]
+    async fn outbox_retry_write_conflict_keeps_data_and_injected_event_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+case "$*" in
+  "storage outbox list") echo '{"ok":true,"data":[{"id":"e2","relays":["wss://r"]}]}' ;;
+  "storage outbox retry --id e2") echo '{"ok":false,"error":"write_conflict","message":"queue entry superseded","data":{"sent":true,"superseded":true}}' >&2; exit 1 ;;
+  *) echo "{\"ok\":false,\"error\":\"other_error\",\"message\":\"unexpected: $*\"}" >&2; exit 4 ;;
+esac
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(router(state), "POST", "/outbox/e2/retry", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["error"], "conflict");
+        assert_eq!(body["data"]["sent"], true, "{body:?}");
+        assert_eq!(body["data"]["superseded"], true, "{body:?}");
+        assert_eq!(
+            body["data"]["event_id"], "e2",
+            "with_event_id's injected id must survive into conflict's data: {body:?}"
+        );
+    }
+
     /// §4/§8: retrying an id absent from `storage outbox list` is
     /// `not_found`, checked before ever invoking `outbox retry`.
     #[tokio::test]
@@ -1871,6 +1930,80 @@ esac
         }
     }
 
+    /// Codex 挑战（B 端 gpt-6-astra）High：Hyphae 真实返回的 `audit_error` 是
+    /// 非空字符串（`internal/messaging/agent.go` 的 `AuditError string
+    /// \`json:"audit_error,omitempty"\`` ），不是布尔值；审计失败时 Hyphae 的
+    /// 退出码仍可能是 0（只在非 json 模式打一行 stderr warning，`sendErr`
+    /// 不受影响）。字符串形态的 `audit_error` 必须被 `classify_send_result`
+    /// 识别为「本地记账异常」，走 §5.3 的 `partial`，而不是被静默当成
+    /// `Some(true)`（布尔读取下恒为 `None`）比较失败从而放行成功。
+    #[tokio::test]
+    async fn send_with_string_audit_error_is_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+case "$*" in
+  "relay list") echo '{"ok":true,"data":{"relays":["wss://r"],"source":"config"}}' ;;
+  *) echo '{"ok":true,"data":{"published_to":1,"history_stored":true,"audit_error":"permission denied","event_id":"e7"}}' ;;
+esac
+"#;
+        let state = ready_state_with_identity(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/send",
+            Some(json!({"to": "npub1bob", "content": "hi", "from": "alice"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["error"], "partial");
+        assert_eq!(body["data"]["audit_error"], "permission denied");
+        assert_eq!(body["data"]["event_id"], "e7");
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：retry 的超时要按「这次实际会用
+    /// 哪些 relay」算，而真实 Hyphae 的 `storage outbox retry`
+    /// （`internal/messaging/outbox_commands.go`）优先用 outbox 条目自己入队
+    /// 时保存的 `relays`，只在条目没有自己的 relay 时才落回当前 `relay
+    /// list`。配置变更之后重试（条目保存的 relay 数与当前配置不同）必须按
+    /// 条目自己的数量算超时，不能看当前配置。
+    #[tokio::test]
+    async fn retry_relay_count_prefers_the_entrys_own_relays_over_current_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Current config has drifted to a single relay — if the fix didn't
+        // land, this is what gets used for every retry regardless of what
+        // the entry itself queued against.
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"ok":true,"data":{"relays":["wss://only-now"],"source":"config"}}'
+"#;
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (runner, ..) = state.require_ready().unwrap();
+        let entry = json!({"id": "e1", "relays": ["wss://a", "wss://b", "wss://c"]});
+        assert_eq!(
+            relay_count_for_retry(runner, &entry).await,
+            3,
+            "must use the entry's own 3 queued relays, not the current config's 1"
+        );
+    }
+
+    /// Same helper, the fallback half: an entry with no relays of its own
+    /// (e.g. a legacy entry, or `ResolveRelays` having filled nothing in)
+    /// falls back to whatever is currently configured, same as before this
+    /// fix for every other route.
+    #[tokio::test]
+    async fn retry_relay_count_falls_back_to_current_config_when_entry_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"ok":true,"data":{"relays":["wss://a","wss://b"],"source":"config"}}'
+"#;
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (runner, ..) = state.require_ready().unwrap();
+        let entry = json!({"id": "e1", "relays": []});
+        assert_eq!(relay_count_for_retry(runner, &entry).await, 2);
+    }
+
     #[tokio::test]
     async fn history_rejects_an_out_of_range_limit() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1882,5 +2015,47 @@ esac
         let (status, body) = call(router(state), "GET", "/history?limit=0&as=alice", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
         assert_eq!(body["error"], "invalid");
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：`?limit=abc` 这种连类型都不对的
+    /// 查询参数，在 Axum 的 `Query<T>` extractor 阶段就失败了，比
+    /// `get_history` 函数体里 `1..=200` 的范围检查还早——这个失败必须也走
+    /// §4 统一的 `{ok:false,error:"invalid",...}` JSON envelope，不能是
+    /// Axum 默认的纯文本 400。
+    #[tokio::test]
+    async fn history_with_non_numeric_limit_is_invalid_json_not_plain_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "GET", "/history?limit=abc", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid", "{body:?}");
+        assert_eq!(body["ok"], false, "{body:?}");
+    }
+
+    /// Same bug, `limit=-1`: still a `QueryRejection` (`u32` cannot hold a
+    /// negative number) before `get_history`'s own `1..=200` range check
+    /// ever runs.
+    #[tokio::test]
+    async fn history_with_negative_limit_is_invalid_json_not_plain_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "GET", "/history?limit=-1", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid", "{body:?}");
+    }
+
+    /// Same bug, `list_outbox`'s `?failed_only=abc` (`bool` extractor
+    /// failure).
+    #[tokio::test]
+    async fn outbox_list_with_non_bool_failed_only_is_invalid_json_not_plain_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho 'should never run' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "GET", "/outbox?failed_only=abc", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid", "{body:?}");
+        assert_eq!(body["ok"], false, "{body:?}");
     }
 }
