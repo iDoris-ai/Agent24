@@ -1902,4 +1902,61 @@ mod tests {
             "the latest probe replaces the previous one"
         );
     }
+
+    /// pre-pr-check C2: `relay_probe` is a new concurrency primitive
+    /// (`Arc<Mutex<Option<RelayProbeStatus>>>`), written by `record_relay_probe`
+    /// unconditionally (it is a plain replace, not a check-then-act on the
+    /// PREVIOUS value, so there is no TOCTOU window C1 would ask about) and
+    /// read by `relay_probe_status`. The property that actually needs a real
+    /// concurrent test is that the `Mutex` serializes the whole struct
+    /// replace: a reader must never observe a torn mix of one writer's `url`
+    /// with another writer's `at_ms`. Each of 64 concurrent writers records a
+    /// probe whose three fields are all derived from the same index, so any
+    /// mismatch among them in the end state proves a torn write.
+    #[tokio::test]
+    async fn concurrent_relay_probe_writes_never_tear_the_recorded_struct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = Arc::new(HyphaeDaemonSupervisor::spawn(idle_ctx(tmp.path()).await));
+
+        let mut tasks = Vec::new();
+        for i in 0..64u64 {
+            let sup = Arc::clone(&sup);
+            tasks.push(tokio::spawn(async move {
+                sup.record_relay_probe(RelayProbeStatus {
+                    url: Some(format!("wss://relay-{i}.example")),
+                    connected: i.is_multiple_of(2),
+                    at_ms: i,
+                    error: if i.is_multiple_of(2) {
+                        None
+                    } else {
+                        Some(format!("down-{i}"))
+                    },
+                });
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let probe = sup
+            .relay_probe_status()
+            .expect("64 writers ran; something must be recorded");
+        // Every field must come from the SAME writer `i`, not a mix.
+        let i = probe.at_ms;
+        assert_eq!(
+            probe.url.as_deref(),
+            Some(format!("wss://relay-{i}.example").as_str())
+        );
+        assert_eq!(
+            probe.connected,
+            i.is_multiple_of(2),
+            "torn write: {probe:?}"
+        );
+        let expected_error = if i.is_multiple_of(2) {
+            None
+        } else {
+            Some(format!("down-{i}"))
+        };
+        assert_eq!(probe.error, expected_error, "torn write: {probe:?}");
+    }
 }

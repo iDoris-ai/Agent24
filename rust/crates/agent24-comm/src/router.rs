@@ -2131,4 +2131,31 @@ echo '{"ok":true,"data":{"relays":["wss://a","wss://b"],"source":"config"}}'
         assert_eq!(body["error"], "invalid", "{body:?}");
         assert_eq!(body["ok"], false, "{body:?}");
     }
+
+    // ---- COMM-4b: relay probe only folds `network_error` into ------------
+    // ---- `connected:false`; every other failure still errors (T2) -------
+
+    /// pre-pr-check T2: without the third match arm in `probe_relay`
+    /// (`Envelope::Failed { error, message, data, .. } => return
+    /// Err(...)`), this test goes red — a non-network failure (here
+    /// `other_error`, Hyphae's own exit 4) would otherwise be silently
+    /// folded into `{connected:false}` the same as a real network-down
+    /// probe, hiding a different failure mode (bad `--timeout`, a crashed
+    /// Hyphae, …) behind the "relay is down" result. S3: this is checked at
+    /// the one and only place the invocation's result is interpreted — the
+    /// match in `probe_relay` itself — not at an earlier entry/validation
+    /// step that a later code path could bypass.
+    #[tokio::test]
+    async fn relay_probe_of_a_non_network_failure_is_still_an_http_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho '{\"ok\":false,\"error\":\"other_error\",\"message\":\"boom\"}' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "POST", "/relay/probe", Some(json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["error"], "upstream", "{body:?}");
+        assert!(
+            body.get("data").is_none() || body["data"].get("connected").is_none(),
+            "a non-network failure must never report connected:false: {body:?}"
+        );
+    }
 }
