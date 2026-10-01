@@ -14,6 +14,7 @@ export interface CreativeServeWebStatus {
 export interface CreativeServeWebOptions {
   checkoutDir?: string
   resourcesPath?: string
+  environment?: NodeJS.ProcessEnv
   nodeBinary?: string
   port?: number
   readyTimeoutMs?: number
@@ -107,6 +108,17 @@ export function resolveOpenDesignCheckout(
   ) ?? null
 }
 
+export function creativeChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  // A24_* belongs to the Agent24 host authority/bootstrap namespace. The
+  // desktop may consume A24_OPEN_DESIGN_* to choose how to launch Creative,
+  // but the less-trusted Open Design child must never inherit host secrets.
+  // Keep the rest of the environment intact so Open Design's own provider,
+  // media, proxy, locale, and toolchain configuration continues to work.
+  return Object.fromEntries(
+    Object.entries(env).filter(([key]) => !key.toUpperCase().startsWith('A24_')),
+  )
+}
+
 export class CreativeServeWeb {
   private child: CreativeChild | null = null
   private current: CreativeServeWebStatus = { state: 'stopped' }
@@ -136,9 +148,9 @@ export class CreativeServeWeb {
   }
 
   private async startOnce(): Promise<CreativeServeWebStatus> {
-
+    const environment = this.options.environment ?? process.env
     const checkoutDir = this.options.checkoutDir
-      ?? resolveOpenDesignCheckout(process.cwd(), process.env, this.options.resourcesPath)
+      ?? resolveOpenDesignCheckout(process.cwd(), environment, this.options.resourcesPath)
     if (!checkoutDir) {
       this.current = {
         state: 'failed',
@@ -165,16 +177,16 @@ export class CreativeServeWeb {
       return this.status()
     }
 
-    const envPort = Number(process.env.A24_OPEN_DESIGN_PORT)
+    const envPort = Number(environment.A24_OPEN_DESIGN_PORT)
     const port = this.options.port ?? (Number.isInteger(envPort) && envPort > 0 ? envPort : DEFAULT_PORT)
-    const nodeBinary = this.options.nodeBinary ?? (process.env.A24_OPEN_DESIGN_NODE?.trim() || 'node')
+    const nodeBinary = this.options.nodeBinary ?? (environment.A24_OPEN_DESIGN_NODE?.trim() || 'node')
     const readyTimeoutMs = this.options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS
     this.current = { state: 'starting' }
 
     const child = this.spawnFn(
       nodeBinary,
       [entry, 'daemon', 'start', '--serve-web', '--no-open', '--host', '127.0.0.1', '--port', String(port)],
-      { cwd: checkoutDir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] },
+      { cwd: checkoutDir, env: creativeChildEnvironment(environment), stdio: ['ignore', 'pipe', 'pipe'] },
     ) as CreativeChild
     this.child = child
 
