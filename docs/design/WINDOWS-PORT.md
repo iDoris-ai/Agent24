@@ -1,6 +1,6 @@
 # DEP-A7 —— Windows 移植设计
 
-> 状态：**v2，已处置第 1 轮评审（CHANGES，3 High），待 §1 回填 W0 结果后冻结**（`docs/Deployment/TASKS.md` DEP-A7）。只写设计，不含实现。
+> 状态：**v2 冻结**（第 1 轮评审 CHANGES，3 High 已处置；§1 已回填 W0 结果；W7 门槛 jason 选 (a)，2026-10-01）（`docs/Deployment/TASKS.md` DEP-A7）。只写设计，不含实现。
 > 依据：`docs/Deployment/RESEARCH.md` §1.4 / §1.7 / §2 / §4；`TASKS.md` 的 A7、C2、C3；ADR-031（进程外模块）、
 > ADR-032 / `A3-ATTACHED-MODULE.md`（附着模块）、`docs/specs/WIRE-OOP-MODULE.md`；仓库实查（基线 `bf3322c`）；
 > sidecar-host 线只读查看（`origin/integration/open-design-main-sync-wave20`、#549、#553）。
@@ -46,7 +46,11 @@ RESEARCH 列出的 `proxy.rs` `UnixStream`、`state_dir` 只读 HOME、`command-
 
 这份预览**不能代替** W0。
 
-**W0 结果（windows-latest，按 crate 分类）**：〔占位——`windows-check.yml` 的小 PR 合并并跑过之后回填，然后冻结本文〕
+**W0 结果（windows-latest，PR #610 的 run 36805308213，2026-10-01）**：`cargo check --workspace --keep-going` 退出码 101。
+- **直接报错（3 个，都在模块传输链上）**：`agent24-os-fd`（9 处错误，`std::os::unix` 的 fd/listener API）、依赖 crate `close_fds`（11 处）、`command-fds`（12 处）。后两者是纯 Unix crate，被 `agent24-os-proto` 无条件依赖。
+- **check 通过（12 个）**：`agent24-agent`、`-core`、`-domain`、`-mcp`、`-memory`、`-models`、`-policy`、`-protocol`、`-scheduler`、`-store`、`-tools`、`-worker`。
+- **未被检查（依赖已失败，`--keep-going` 也不会继续）**：`agent24-os-proto`、`agent24-os-packages`、`agent24-os-sdk`、`agent24d`、`agent24-cli`。这些 crate 的错误面只有在 W2/W3 把 `command-fds`/`close_fds`/`os-fd` 移进 `cfg(unix)` 之后才会暴露，届时再跑一次 W0 回填。
+- 结论与 §3/§6 的判断一致：第一道门就是模块传输层；其余 crate 在 Windows 上已能编译，§6 处置表里属于这些 crate 的条目（`state_dir`、`/dev/urandom`、权限位等）是运行期问题，不是编译期问题。
 
 ## 2. 模块传输选型
 
@@ -223,7 +227,7 @@ W4 开头先评估 `interprocess` crate；如果能免掉自写 FFI，就不新�
 - **不复用**：sidecar 是 stdio NDJSON 一对一，没有 UDS，也没有 fd 继承；§2–§5 的模块传输与它没有重叠。
 - **目标**：不重复造轮子。W7 之前，Windows 上的 `launch` 返回 `LaunchError::Unsupported`（模块显示 `unsupported_platform`，daemon 照常运行），**不自己写一套 Job Object**。
   W7 只在 `agent24-os-proto` 的 `[target.'cfg(windows)'.dependencies]` 里引用 processkit，不改 sidecar 的任何文件。
-- **W7 门槛（可判定，二选一，由 jason 选）**：
+- **W7 门槛（可判定；jason 2026-10-01 选定 (a)）**：
   - **(a)** main 的 `deny.toml` 已经通过 `[sources] allow-git` 放行 `https://github.com/jhfnetboy/ProcessKit-rs.git`，
     且 main 的 `Cargo.lock` 里能看到 rev `60aa827db378daa5b1ec638f3b3fdaaf9c201560`（或之后由 sidecar 线写明的新 rev）。
     满足后 W7 直接引用这个来源和 rev。判定方法：`git show origin/main:rust/deny.toml` 加上 `grep 60aa827d rust/Cargo.lock`。
