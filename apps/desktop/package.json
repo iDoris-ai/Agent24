@@ -15,9 +15,11 @@
     "build": "vite build && tsc -p tsconfig.electron.json",
     "build:rust:debug": "cargo build -p agent24d --manifest-path ../../rust/Cargo.toml",
     "build:rust": "cargo build --release -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
-    "build:mac": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --mac",
-    "build:win": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --win",
-    "build:linux": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && electron-builder --linux",
+    "stage:open-design": "node scripts/stage-open-design-resources.mjs",
+    "test:stage-open-design": "node --test scripts/stage-open-design-resources.test.mjs",
+    "build:mac": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && electron-builder --mac",
+    "build:win": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && electron-builder --win",
+    "build:linux": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && electron-builder --linux",
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -63,6 +65,13 @@
       {
         "from": "../../packages/node-daemon/dist",
         "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": ".open-design-resources",
+        "to": ".",
         "filter": [
           "**/*"
         ]
