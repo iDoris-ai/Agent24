@@ -1,15 +1,15 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeAll } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, screen, waitFor } from '@testing-library/react'
 import ModelsPage from './Models'
 
-beforeAll(() => {
-  window.agent24 = {
-    backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: [] }),
-  } as never
-})
-
 describe('ModelsPage', () => {
+  beforeEach(() => {
+    window.agent24 = {
+      backendProxy: vi.fn().mockResolvedValue({ ok: false, status: 503, data: null }),
+    } as never
+  })
+
   it('renders model list title', () => {
     render(<ModelsPage />)
     expect(screen.getByText('模型管理')).toBeInTheDocument()
@@ -33,5 +33,40 @@ describe('ModelsPage', () => {
     expect(badges.length).toBeGreaterThan(0)
     const ondemand = screen.getAllByText('按需')
     expect(ondemand.length).toBeGreaterThan(0)
+  })
+
+  // AUDIT-1: requests must hit the daemon's real route, `/api/v1/models`
+  // (`rust/apps/agent24d/src/routes.rs` `get_models`) — not the nonexistent
+  // `/api/llm/models` that always 404'd and made this page claim "oMLX 未运行"
+  // even while oMLX was running.
+  it('requests /api/v1/models, not /api/llm/models', () => {
+    render(<ModelsPage />)
+    expect(window.agent24.backendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/models' })
+  })
+
+  it('renders the live oMLX model list from the { models: [...] } envelope', async () => {
+    window.agent24 = {
+      backendProxy: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        data: {
+          models: [
+            { id: 'Qwen3-8B-4bit', provider: 'omlx', tier: 'local', loaded: true },
+            { id: 'Qwen3-0.6B-4bit', provider: 'omlx', tier: 'local', loaded: false },
+          ],
+          default_model: 'Qwen3-8B-4bit',
+        },
+      }),
+    } as never
+
+    render(<ModelsPage />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Qwen3-8B-4bit')).toBeInTheDocument()
+    })
+    expect(screen.getByText('Qwen3-0.6B-4bit')).toBeInTheDocument()
+    expect(screen.getByText('已加载')).toBeInTheDocument()
+    expect(screen.getByText('未加载')).toBeInTheDocument()
+    expect(screen.queryByText('oMLX 未运行 — 启动后此处显示实时模型状态')).not.toBeInTheDocument()
   })
 })

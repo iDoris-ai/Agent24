@@ -127,12 +127,16 @@ impl OwnedProcess {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::windows_test_io::{
+        NativePipes, powershell_executable, process_is_alive, read_pair_then_cleanup,
+        windows_executable,
+    };
+    use std::io::Write;
     use std::path::Path;
     use std::time::{Duration, Instant};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn powershell(script: &str) -> Command {
-        let mut command = Command::new("powershell.exe");
+        let mut command = Command::new(powershell_executable());
         command.args([
             "-NoLogo",
             "-NoProfile",
@@ -141,6 +145,13 @@ mod tests {
             script,
         ]);
         command
+    }
+
+    fn powershell_literal() -> String {
+        powershell_executable()
+            .display()
+            .to_string()
+            .replace('\'', "''")
     }
 
     fn marker_path(name: &str) -> std::path::PathBuf {
@@ -174,19 +185,6 @@ mod tests {
         Err(last_error.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::TimedOut, "child pid marker was not readable")
         }))
-    }
-
-    fn process_is_alive(pid: u32) -> io::Result<bool> {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()?;
-        if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "tasklist failed with status {}",
-                output.status
-            )));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
     }
 
     fn wait_until_gone(pid: u32) -> io::Result<()> {
@@ -250,7 +248,7 @@ mod tests {
         let owner = GenerationOwner::new(generation).expect("Job Object");
         let error = owner
             .spawn(Command::new(
-                "agent24-sidecar-program-that-does-not-exist.exe",
+                std::env::temp_dir().join("agent24-sidecar-program-that-does-not-exist.exe"),
             ))
             .expect_err("missing executable must fail before returning a child");
         assert!(
@@ -265,7 +263,7 @@ mod tests {
     async fn processkit_spawn_returns_a_generation_owned_process() {
         let generation = GenerationId::new(1).expect("non-zero generation");
         let owner = GenerationOwner::new(generation).expect("Job Object");
-        let mut command = Command::new("cmd.exe");
+        let mut command = Command::new(windows_executable("cmd.exe"));
         command.args(["/C", "exit", "0"]);
         let mut process = owner
             .spawn(command)
@@ -285,36 +283,30 @@ mod tests {
             .expect("suspended spawn and assignment");
         let pipes = process.take_pipes().expect("owned pipes");
         assert!(process.take_pipes().is_err());
-        let OwnedPipes {
+        let NativePipes {
             mut stdin,
-            mut stdout,
-            mut stderr,
-        } = pipes;
-        let (stdout_text, stderr_text, status) =
-            tokio::time::timeout(Duration::from_secs(10), async {
-                stdin.write_all(b"hello\n").await.expect("write stdin");
-                drop(stdin);
-                let mut stdout_text = String::new();
-                let mut stderr_text = String::new();
-                stdout
-                    .read_to_string(&mut stdout_text)
-                    .await
-                    .expect("read stdout");
-                stderr
-                    .read_to_string(&mut stderr_text)
-                    .await
-                    .expect("read stderr");
-                let status = wait_until_exit(&mut process).await;
-                (stdout_text, stderr_text, status)
+            stdout,
+            stderr,
+        } = NativePipes::try_from(pipes).expect("convert unpolled owned pipes");
+        stdin.write_all(b"hello\n").expect("write stdin");
+        drop(stdin);
+        let (stdout, stderr) =
+            read_pair_then_cleanup(stdout, stderr, 64, Duration::from_secs(10), || {
+                process.force_kill()
             })
-            .await
-            .expect("pipe roundtrip deadline");
+            .expect("bounded pipe roundtrip");
+        let status = wait_until_exit(&mut process).await;
+        wait_until_confirmed_empty(&mut process).await;
+        let observed = process.observe_exit().expect("repeat observe");
+        assert_eq!(observed, Some(status));
         assert_eq!(
-            process.observe_exit().expect("repeat observe"),
-            Some(status)
+            String::from_utf8(stdout).expect("stdout UTF-8"),
+            "out:hello"
         );
-        assert_eq!(stdout_text, "out:hello");
-        assert_eq!(stderr_text, "err:hello");
+        assert_eq!(
+            String::from_utf8(stderr).expect("stderr UTF-8"),
+            "err:hello"
+        );
         assert!(process.tree_is_empty().expect("Job stats"));
     }
 
@@ -322,8 +314,9 @@ mod tests {
     async fn exited_leader_does_not_hide_descendant_from_force_or_empty() {
         let marker = marker_path("exit-descendant");
         let marker_text = marker.display().to_string().replace('\'', "''");
+        let powershell_path = powershell_literal();
         let script = format!(
-            "$child = Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker_text}' -Value $child.Id"
+            "$child = Start-Process '{powershell_path}' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker_text}' -Value $child.Id"
         );
         let owner =
             GenerationOwner::new(GenerationId::new(5).expect("generation")).expect("Job Object");
@@ -331,23 +324,23 @@ mod tests {
             .spawn(powershell(&script))
             .expect("spawn process tree");
         let descendant = read_pid(&marker).expect("child must publish a readable pid");
-        assert!(wait_until_exit(&mut process).await.success());
-        assert_eq!(
-            process.reap_step().expect("leader-exit reap step"),
-            TreeObservation::Present,
-            "leader exit must not be mistaken for an empty Job tree"
-        );
+        let status = wait_until_exit(&mut process).await;
+        let leader_reap = process.reap_step().expect("leader-exit reap step");
         process.force_kill().expect("force Job tree");
         process.force_kill().expect("repeat force Job tree");
         wait_until_confirmed_empty(&mut process).await;
-        assert_eq!(
-            process
-                .reap_step()
-                .expect("repeat confirmed-empty reap step"),
-            TreeObservation::ConfirmedEmpty
-        );
+        let empty_reap = process
+            .reap_step()
+            .expect("repeat confirmed-empty reap step");
         wait_until_gone(descendant).expect("descendant teardown");
         let _ = std::fs::remove_file(marker);
+        assert!(status.success());
+        assert_eq!(
+            leader_reap,
+            TreeObservation::Present,
+            "leader exit must not be mistaken for an empty Job tree"
+        );
+        assert_eq!(empty_reap, TreeObservation::ConfirmedEmpty);
     }
 
     #[test]
@@ -447,8 +440,9 @@ mod tests {
     async fn dropping_owned_process_kills_the_job_tree() {
         let marker = marker_path("drop-tree");
         let marker_text = marker.display().to_string().replace('\'', "''");
+        let powershell_path = powershell_literal();
         let script = format!(
-            "$child = Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker_text}' -Value $child.Id; Wait-Process -Id $child.Id"
+            "$child = Start-Process '{powershell_path}' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath '{marker_text}' -Value $child.Id; Wait-Process -Id $child.Id"
         );
         let generation = GenerationId::new(2).expect("non-zero generation");
         let owner = GenerationOwner::new(generation).expect("Job Object");
