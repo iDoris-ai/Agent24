@@ -180,30 +180,33 @@ impl SessionMemory {
         // the next writer cannot allocate a turn number until the transaction
         // has a confirmed outcome.
         let log = self.log.clone();
+        let kv = self.kv.clone();
         let owner = self.owner.clone();
         let sid_owned = sid.to_owned();
         let prompt_owned = prompt.to_owned();
+        let retain_prompt = prompt_owned.clone();
         let answer_owned = answer.to_owned();
         #[cfg(test)]
         let commit_probe = self.commit_probe.clone();
         let mut append_task = tokio::spawn(async move {
             let append_result = async {
-                log.append_turn(
-                    &owner,
-                    &sid_owned,
-                    turn_no,
-                    &Msg::user(prompt_owned),
-                    Origin {
-                        source: "agent_loop".into(),
-                        trust: Trust::UserSaid,
-                    },
-                    &Msg::assistant(Some(answer_owned), vec![]),
-                    Origin {
-                        source: "agent_loop".into(),
-                        trust: Trust::Model,
-                    },
-                )
-                .await?;
+                let ids = log
+                    .append_turn(
+                        &owner,
+                        &sid_owned,
+                        turn_no,
+                        &Msg::user(prompt_owned),
+                        Origin {
+                            source: "agent_loop".into(),
+                            trust: Trust::UserSaid,
+                        },
+                        &Msg::assistant(Some(answer_owned), vec![]),
+                        Origin {
+                            source: "agent_loop".into(),
+                            trust: Trust::Model,
+                        },
+                    )
+                    .await?;
                 #[cfg(test)]
                 if let Some(probe) = &commit_probe
                     && probe.armed.swap(false, Ordering::AcqRel)
@@ -211,13 +214,16 @@ impl SessionMemory {
                     probe.committed.notify_one();
                     probe.release.notified().await;
                 }
+                if let Some(object) = super::retain::explicit_remember(&retain_prompt) {
+                    super::retain::persist(&kv, &owner, object, ids.user).await?;
+                }
                 Ok::<_, MemoryError>(())
             }
             .await;
             if let Err(err) = &append_result {
                 // This task can finish after remember() was cancelled, in which
                 // case no caller remains to report the append failure.
-                tracing::error!(session_id = %sid_owned, error = %err, "session memory append failed");
+                tracing::error!(session_id = %sid_owned, error = %err, "session memory write failed");
             }
             (append_result, guard)
         });

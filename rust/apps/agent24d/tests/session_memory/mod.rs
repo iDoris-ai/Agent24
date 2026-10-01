@@ -23,6 +23,7 @@ struct Provider {
     received: Mutex<Vec<Vec<Msg>>>,
     summaries: Mutex<usize>,
     fail_summaries: bool,
+    answer: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -56,7 +57,9 @@ impl ModelProvider for Provider {
         } else {
             let mut received = self.received.lock().unwrap();
             received.push(req.messages.clone());
-            format!("answer-{}", received.len())
+            self.answer
+                .clone()
+                .unwrap_or_else(|| format!("answer-{}", received.len()))
         };
         Ok(CompletionResponse {
             message: Msg::assistant(Some(content), vec![]),
@@ -268,6 +271,9 @@ async fn restart_and_replay(fail_summaries: bool) {
     ]);
     assert_history(&kv, &owner, &original).await;
 }
+
+#[path = "retain.rs"]
+mod retain;
 
 #[tokio::test]
 async fn successful_compaction_replays_every_original_message_after_daemon_restart() {

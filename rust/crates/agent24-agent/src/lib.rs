@@ -13,6 +13,7 @@
 //! tool call is persisted, evented, and — when denied by policy — audited.
 
 pub mod resume;
+mod retain;
 pub mod self_wake;
 mod session_memory;
 pub mod subagent;
