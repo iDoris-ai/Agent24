@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, m1-*, m2-*, m3-*, "ab/**"]
+    # ab/** 只走 pull_request（跑「task 分支 + 集成分支」的合并结果）；push 触发会对 task 分支本身单跑，
+    # 集成分支后来补的修复（如 Rust 1.99 clippy）不在其中，留下一条永远红的检查，挡住 postreview 合并。
+    branches: [main, m1-*, m2-*, m3-*]
   pull_request:
     branches: [main, m1-*, m2-*, m3-*, "ab/**"]
 
