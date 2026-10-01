@@ -73,9 +73,9 @@ pub trait EventSink: Send + Sync + 'static {
     fn emit(&self, body: EventBody);
 }
 
-/// Ceiling on the post-completion memory write. Ordering demands it happen
-/// before `run.completed`, so it must be bounded — a stuck summarizer must never
-/// hang a finished run.
+/// Budget for preparing and compacting the post-completion memory write.
+/// Ordering demands it happen before `run.completed`; append transaction
+/// confirmation can exceed this budget because its outcome must be observed.
 const MEMORY_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a parked approval remains resumable (H3). A restored approval older
@@ -296,11 +296,11 @@ impl RunManager {
     /// then finish it cancelled rather than proceed with an empty context.
     ///
     /// CANCEL-AWARE by necessity: this takes the per-session lock, and another
-    /// run in the same session can hold that lock for up to MEMORY_WRITE_BUDGET
-    /// while it compacts. A run parked here hasn't even reached its model call
-    /// yet, so blocking it uncancellably would break the C2 contract that cancel
-    /// works in ANY non-terminal state — the same reason the model call and the
-    /// memory write are raced against the token (review D5b).
+    /// run can hold that lock beyond MEMORY_WRITE_BUDGET while transaction
+    /// confirmation completes. Compaction is budgeted. A run parked here has
+    /// not reached its model call, so blocking it uncancellably would break the
+    /// C2 contract that cancel works in ANY non-terminal state — the same reason
+    /// the model call and the memory write race the token (review D5b).
     async fn session_context(
         &self,
         session_id: Option<&str>,
@@ -937,9 +937,8 @@ impl RunManager {
                 // — through the STORE ROW as well as the event. A client polling
                 // get_run/list_runs could otherwise see `completed`, start the
                 // next run in this session, win the session lock and read stale
-                // memory (review D5b). Bounded by MEMORY_WRITE_BUDGET (and the
-                // daemon shutdown token inside the summarizer) so a stuck
-                // provider can never hang a finished run.
+                // memory (review D5b). Preparation and compaction are budgeted
+                // by MEMORY_WRITE_BUDGET; append confirmation can exceed it.
                 //
                 // This widens the window in which the run is still non-terminal,
                 // so it MUST stay cancellable: `cancel works in any non-terminal

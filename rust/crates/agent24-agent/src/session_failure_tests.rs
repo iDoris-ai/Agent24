@@ -1,4 +1,5 @@
 use super::*;
+use crate::session_memory::CommitAcknowledgementProbe;
 
 struct FailureRecordingSink(StdMutex<Vec<EventBody>>);
 
@@ -249,6 +250,135 @@ async fn lock_timeout_keeps_run_completed_and_reports_failed_memory_write() {
             .contains("timed out")
     );
     drop(guard);
+}
+
+#[tokio::test]
+async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round() {
+    let kv = KvStore::open_memory().await.unwrap();
+    let sink = Arc::new(FailureRecordingSink(StdMutex::new(Vec::new())));
+    let store = Store::open_memory().await.unwrap();
+    let provider = Arc::new(RecordingProvider {
+        seen: StdMutex::new(Vec::new()),
+    });
+    let probe = Arc::new(CommitAcknowledgementProbe {
+        committed: tokio::sync::Notify::new(),
+        deadline_elapsed: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let manager = RunManager::with_memory(
+        store.clone(),
+        Arc::new(ModelRouter::with_defaults(vec![(
+            provider.clone(),
+            Tier::Local,
+        )])),
+        Arc::new(ToolRegistry::new()),
+        sink.clone(),
+        CancellationToken::new(),
+        Some(
+            SessionMemory::new(kv.clone(), Arc::new(UnusedSummarizer))
+                .with_owner("m1-test-owner".to_owned())
+                .with_commit_probe(probe.clone()),
+        ),
+    );
+    seed_session(&store, "commit-ack-session").await;
+
+    let first = manager
+        .start_run(RunCreate {
+            session_id: Some("commit-ack-session".to_owned()),
+            prompt: "first committed prompt".to_owned(),
+            model_override: None,
+            mode: RunMode::Normal,
+        })
+        .await
+        .unwrap();
+
+    // This notification is emitted only after the real append_turn transaction
+    // returned success, while remember is still waiting for its wrapper ack.
+    tokio::time::timeout(super::MEMORY_WRITE_BUDGET, probe.committed.notified())
+        .await
+        .expect("append_turn should commit");
+    let committed = kv
+        .session_log()
+        .load_view("m1-test-owner", "commit-ack-session")
+        .await
+        .unwrap();
+    let committed_messages = committed
+        .tail
+        .iter()
+        .map(|(_, message)| message.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed_messages,
+        [
+            Msg::user("first committed prompt"),
+            Msg::assistant(Some("pong".to_owned()), vec![])
+        ],
+        "probe must pause after the complete exchange is durable"
+    );
+    tokio::time::timeout(
+        super::MEMORY_WRITE_BUDGET + Duration::from_secs(5),
+        probe.deadline_elapsed.notified(),
+    )
+    .await
+    .expect("memory write deadline should expire at the gated ack");
+
+    // Give the awakened run task a turn to expose an erroneous failure event
+    // before we release the acknowledgement gate.
+    tokio::task::yield_now().await;
+    let pending = store.get_run(&first.id).await.unwrap().unwrap();
+    assert_eq!(pending.status, RunStatus::Running);
+    assert!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|body| serde_json::to_value(body).unwrap()["type"] != "memory.write_failed"),
+        "a committed transaction must not be reported as a failed write"
+    );
+
+    probe.release.notify_one();
+    assert_eq!(
+        wait_terminal(&store, &first.id).await.status,
+        RunStatus::Completed
+    );
+    assert!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|body| serde_json::to_value(body).unwrap()["type"] != "memory.write_failed")
+    );
+    let second = manager
+        .start_run(RunCreate {
+            session_id: Some("commit-ack-session".to_owned()),
+            prompt: "second prompt".to_owned(),
+            model_override: None,
+            mode: RunMode::Normal,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_terminal(&store, &second.id).await.status,
+        RunStatus::Completed
+    );
+    let calls = provider.seen.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let context = calls[1]
+        .iter()
+        .filter(|message| message.role != "system")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        context
+            == [
+                Msg::user("first committed prompt"),
+                Msg::assistant(Some("pong".to_owned()), vec![]),
+                Msg::user("second prompt")
+            ],
+        "next round must receive the complete prior exchange before its prompt: {context:?}"
+    );
+    drop(calls);
 }
 
 #[tokio::test]

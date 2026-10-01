@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, sync::Arc};
 
 use agent24_memory::{
@@ -8,6 +10,8 @@ use agent24_memory::{
 };
 use agent24_models::Msg;
 use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 const RECENT_HARD_CEILING_FACTOR: usize = 4;
 const SCAN_PAGE: i64 = 500;
@@ -22,6 +26,17 @@ pub struct SessionMemory {
     summarizer: Arc<dyn Summarizer>,
     policy: CompactionPolicy,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    #[cfg(test)]
+    commit_probe: Option<Arc<CommitAcknowledgementProbe>>,
+}
+
+/// Test-only pause between a successful append and its acknowledgement to remember.
+#[cfg(test)]
+pub(crate) struct CommitAcknowledgementProbe {
+    pub(crate) armed: AtomicBool,
+    pub(crate) committed: Notify,
+    pub(crate) deadline_elapsed: Notify,
+    pub(crate) release: Notify,
 }
 
 impl SessionMemory {
@@ -35,7 +50,15 @@ impl SessionMemory {
             summarizer,
             policy: CompactionPolicy::default(),
             locks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            commit_probe: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_commit_probe(mut self, probe: Arc<CommitAcknowledgementProbe>) -> Self {
+        self.commit_probe = Some(probe);
+        self
     }
 
     #[must_use]
@@ -128,10 +151,25 @@ impl SessionMemory {
     ) -> agent24_memory::Result<()> {
         self.check_owner()?;
         let deadline = tokio::time::Instant::now() + super::MEMORY_WRITE_BUDGET;
-        let guard = match tokio::time::timeout_at(deadline, async {
+        // This budget bounds lock acquisition and the work needed to prepare a
+        // turn. Once append_turn starts, its outcome must be observed: dropping
+        // that future after COMMIT was sent cannot establish that it rolled back.
+        let (guard, turn_no) = match tokio::time::timeout_at(deadline, async {
             let guard = self.session_lock(sid).await.lock_owned().await;
             self.ensure_imported(sid).await?;
             let turn_no = self.count_user_messages(sid).await? as u64;
+            Ok::<_, MemoryError>((guard, turn_no))
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(MemoryError::Io(
+                    "session memory preparation timed out".into(),
+                ));
+            }
+        };
+        let append = async {
             self.log
                 .append_turn(
                     &self.owner,
@@ -149,15 +187,36 @@ impl SessionMemory {
                     },
                 )
                 .await?;
-            Ok::<_, MemoryError>(guard)
-        })
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => return Err(MemoryError::Io("session memory write timed out".into())),
+            #[cfg(test)]
+            if let Some(probe) = &self.commit_probe
+                && probe.armed.swap(false, Ordering::AcqRel)
+            {
+                probe.committed.notify_one();
+                probe.release.notified().await;
+            }
+            Ok::<_, MemoryError>(())
         };
+        tokio::pin!(append);
+        match tokio::time::timeout_at(deadline, &mut append).await {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::warn!(
+                    "session {sid} memory write budget expired; waiting for append transaction outcome"
+                );
+                #[cfg(test)]
+                if let Some(probe) = &self.commit_probe {
+                    probe.deadline_elapsed.notify_one();
+                }
+                append.await?;
+            }
+        }
         // append_turn is the durable boundary. Any compaction error or timeout
         // is best-effort and leaves every source message in the event log.
+        // If confirmation consumed the budget, do not start database work only
+        // to cancel its connection acquisition immediately.
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
         match tokio::time::timeout_at(deadline, self.compact(sid)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
