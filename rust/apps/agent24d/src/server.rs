@@ -471,19 +471,35 @@ async fn open_memory_base(ephemeral: bool) -> Option<agent24_memory::KvStore> {
     }
 }
 
+#[cfg(test)]
+#[path = "../tests/session_memory/mod.rs"]
+mod session_memory_tests;
+
 /// Pair the memory base with a router-backed summarizer for D1 session memory.
-fn session_memory(
+/// The session owner is the durable personal partition recorded by the OS
+/// memory catalog, so replay and module memory use the same org identity.
+async fn session_memory(
     kv: agent24_memory::KvStore,
     router: &Arc<ModelRouter>,
     shutdown: &CancellationToken,
-) -> agent24_agent::SessionMemory {
-    agent24_agent::SessionMemory::new(
+) -> Result<agent24_agent::SessionMemory, String> {
+    let org = crate::os_memory::OrgId::from_store(
+        kv.ensure_org_for_user(LOCAL_USER)
+            .await
+            .map_err(|err| err.to_string())?,
+    );
+    let owner = crate::os_memory::OsMemoryCatalog::default()
+        .ensure_personal_recorded(&org, LOCAL_USER, &kv)
+        .await?;
+
+    Ok(agent24_agent::SessionMemory::new(
         kv,
         StdArc::new(agent24_agent::RouterSummarizer::new(
             Arc::clone(router),
             shutdown.clone(),
         )),
     )
+    .with_owner(owner))
 }
 
 /// Everything [`AppState::new`] needs. The guardian and session memory are
@@ -1076,9 +1092,19 @@ pub async fn serve(
     // an in-memory one). A failure here degrades to no memory rather than
     // refusing to start — sessions simply don't remember, as before.
     let memory_base = open_memory_base(ephemeral).await;
-    let memory = memory_base
-        .clone()
-        .map(|kv| session_memory(kv, &router, &cancel));
+    let memory = match memory_base.clone() {
+        Some(kv) => match session_memory(kv, &router, &cancel).await {
+            Ok(memory) => Some(memory),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not initialize the personal session memory partition; sessions will not remember"
+                );
+                None
+            }
+        },
+        None => None,
+    };
 
     // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
     // their tools. Registered with `with()` so they are dispatchable, while
