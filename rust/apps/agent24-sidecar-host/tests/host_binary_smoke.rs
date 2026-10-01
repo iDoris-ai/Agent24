@@ -263,6 +263,17 @@ fn wait_until_gone(pid: u32) {
     }
 }
 
+fn wait_for_marker(path: &std::path::Path, label: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if path.exists() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{label} marker deadline");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn immediate_parent_eof_exits_successfully_without_output() {
     let mut child = spawn_host();
@@ -411,22 +422,32 @@ fn owned_precedes_ready_and_force_stop_reaches_confirmed_empty() {
 }
 
 #[test]
-fn active_parent_eof_cleans_generation_before_host_exit() {
+fn active_parent_eof_starts_cleanup_before_host_exit_and_leaves_no_target() {
     let markers = unique_marker_dir("binary-parent-eof");
     let marker = markers.join("leader.pid");
+    let cleanup = markers.join("cleanup.started");
+    let exit_gate = markers.join("target.exit");
     let ready = ready_frame("binary-parent-eof");
     #[cfg(unix)]
     let script = format!(
-        "printf '%s' \"$$\" > \"$MARKER\"; printf '%s\\n' '{ready}'; trap '' TERM; /bin/cat >/dev/null; exec /bin/sleep 30"
+        "printf '%s' \"$$\" > \"$MARKER\"; trap 'printf %s cleanup > \"$CLEANUP\"; while [ ! -f \"$EXIT_GATE\" ]; do :; done; exit 0' TERM; printf '%s\\n' '{ready}'; while :; do /bin/sleep 1; done"
     );
     #[cfg(windows)]
     let script = format!(
-        "[System.IO.File]::WriteAllText($env:MARKER,$PID.ToString()); [Console]::Out.WriteLine('{ready}'); [Console]::Out.Flush(); $null = [Console]::In.ReadToEnd(); [System.Threading.Thread]::Sleep(30000)"
+        "[System.IO.File]::WriteAllText($env:MARKER,$PID.ToString()); [Console]::Out.WriteLine('{ready}'); [Console]::Out.Flush(); $null = [Console]::In.ReadToEnd(); [System.IO.File]::WriteAllText($env:CLEANUP,'cleanup'); while (-not [System.IO.File]::Exists($env:EXIT_GATE)) {{ [System.Threading.Thread]::Sleep(20) }}; exit 0"
     );
     let request = with_env(
-        script_request(11, script),
-        "MARKER",
-        marker.to_string_lossy().into_owned(),
+        with_env(
+            with_env(
+                script_request(11, script),
+                "MARKER",
+                marker.to_string_lossy().into_owned(),
+            ),
+            "CLEANUP",
+            cleanup.to_string_lossy().into_owned(),
+        ),
+        "EXIT_GATE",
+        exit_gate.to_string_lossy().into_owned(),
     );
     let mut child = spawn_host();
     let mut stdin = child.stdin.take().expect("host stdin");
@@ -451,14 +472,27 @@ fn active_parent_eof_cleans_generation_before_host_exit() {
     );
 
     drop(stdin);
+    wait_for_marker(&cleanup, "parent EOF cleanup");
+    assert!(
+        child
+            .try_wait()
+            .expect("poll host after cleanup witness")
+            .is_none(),
+        "host exited before target cleanup witness was observed"
+    );
+    assert!(
+        process_is_alive(target),
+        "target must still be live behind the exit gate after cleanup starts"
+    );
+    std::fs::write(&exit_gate, b"exit\n").expect("release target exit gate");
     let status = wait_bounded(&mut child);
+    wait_until_gone(target);
     reader.join().expect("stdout reader");
     let frames: Vec<_> = rx
         .try_iter()
         .map(|frame| frame.map_err(io::Error::from).expect("read trailing frame"))
         .collect();
     assert_protocol_only(frames);
-    wait_until_gone(target);
     let stderr = read_stderr(&mut child);
     let _ = std::fs::remove_dir_all(&markers);
     assert!(status.success(), "host status: {status}; stderr={stderr}");
@@ -466,18 +500,60 @@ fn active_parent_eof_cleans_generation_before_host_exit() {
 }
 
 #[test]
-fn broken_parent_output_forces_cleanup_without_leaking_launch_data() {
+fn broken_parent_output_fails_redacted_and_leaves_no_target() {
     const SECRET: &str = "binary-broken-output-secret";
+    let markers = unique_marker_dir("binary-broken-output");
+    let marker = markers.join("leader.pid");
+    let ready_gate = markers.join("emit-ready");
+    let ready = ready_frame("binary-broken-output");
+    #[cfg(unix)]
+    let script = format!(
+        "printf '%s' \"$$\" > \"$MARKER\"; while [ ! -f \"$READY_GATE\" ]; do :; done; printf '%s\\n' '{ready}'; trap '' TERM; exec /bin/sleep 30"
+    );
+    #[cfg(windows)]
+    let script = format!(
+        "[System.IO.File]::WriteAllText($env:MARKER,$PID.ToString()); while (-not [System.IO.File]::Exists($env:READY_GATE)) {{ [System.Threading.Thread]::Sleep(20) }}; [Console]::Out.WriteLine('{ready}'); [Console]::Out.Flush(); [System.Threading.Thread]::Sleep(30000)"
+    );
+    let request = with_env(
+        with_env(
+            with_env(
+                script_request(21, script),
+                "MARKER",
+                marker.to_string_lossy().into_owned(),
+            ),
+            "READY_GATE",
+            ready_gate.to_string_lossy().into_owned(),
+        ),
+        "FIXTURE_SECRET",
+        SECRET.to_owned(),
+    );
     let mut child = spawn_host();
     let mut stdin = child.stdin.take().expect("host stdin");
-    drop(child.stdout.take().expect("host stdout"));
+    let mut stdout = BufReader::new(child.stdout.take().expect("host stdout"));
     let mut sequence = RequestSequence::new();
-    let request = with_env(ready_request(21), "FIXTURE_SECRET", SECRET.to_owned());
 
     send(&mut stdin, &mut sequence, &request);
+    let mut owned = Vec::new();
+    stdout
+        .read_until(b'\n', &mut owned)
+        .expect("read Owned before breaking parent output");
+    assert!(matches!(
+        decode_reply(&owned),
+        Ok(Reply::Owned { request_id: 21, .. })
+    ));
+    let target = wait_for_pid(&marker);
+    assert!(
+        process_is_alive(target),
+        "target must be live before parent output is broken"
+    );
+
+    drop(stdout);
+    std::fs::write(&ready_gate, b"emit\n").expect("release Ready gate");
     let status = wait_bounded(&mut child);
     drop(stdin);
+    wait_until_gone(target);
     let stderr = read_stderr(&mut child);
+    let _ = std::fs::remove_dir_all(&markers);
     assert!(
         !status.success(),
         "broken host output unexpectedly succeeded"
