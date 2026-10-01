@@ -1,6 +1,6 @@
 # COMM-0：Hyphae 基础通信接入 Agent24
 
-状态：设计稿 r2（处理 COMM-0 评审 CHANGES，见 §10）· 2026-10-01 · 不含实现
+状态：**r2 冻结**（1 轮 Opus 对抗评审 CHANGES 5 High 已处置，见 §10）· 2026-10-01 · 不含实现
 依据：Hyphae 提案 [#601 `67ddbce`](https://github.com/iDoris-ai/Agent24/pull/601) `docs/design/HYPHAE-CLI-INTEGRATION.md`；已定决策见 §0。
 基线：Agent24 `bf3322c`（含 DEP-A5 #602）；Hyphae `a4aa606eb81d5c040d94c51cdf94553e646d8674`。提案里的验收二进制（sha256 `bc30dcf7…5e2b7`，Go 1.27.1）**没有固定构建配方**，因此不进 lock；lock 的 hash 改由 §8.1 的配方复现。`--version` 输出 `hyphae version dev`，不作校验依据。
 命名：本文统一称 **Hyphae**（原名 agent-speaker）。Hyphae 侧编号 T20-A / T20-B / T21 / T22，Agent24 侧编号 COMM-*，对应关系见 §8。
