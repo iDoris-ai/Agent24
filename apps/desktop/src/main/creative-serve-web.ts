@@ -14,6 +14,9 @@ export interface CreativeServeWebStatus {
 export interface CreativeServeWebOptions {
   checkoutDir?: string
   resourcesPath?: string
+  stateRoot?: string
+  runtimeExecutable?: string
+  pinVersion?: string
   environment?: NodeJS.ProcessEnv
   nodeBinary?: string
   port?: number
@@ -26,6 +29,10 @@ type CreativeChild = ChildProcess & { stdout: Readable; stderr: Readable }
 
 const DEFAULT_PORT = 7456
 const DEFAULT_READY_TIMEOUT_MS = 15_000
+const CHECKOUT_STOP_TIMEOUT_MS = 5_000
+const HEADLESS_STOP_TIMEOUT_MS = 60_000
+export const OPEN_DESIGN_PIN_VERSION = '0.22.2'
+const AGENT24_HEADLESS_PROTOCOL = 1
 
 export const CREATIVE_SESSION_PARTITION = 'persist:agent24-creative'
 
@@ -76,6 +83,69 @@ export function canonicalCreativeOrigin(raw: string, expectedPort: number): stri
   return url.origin
 }
 
+function canonicalHeadlessOrigin(raw: unknown, field: string): string {
+  if (typeof raw !== 'string') throw new Error(`Open Design ${field} is invalid`)
+  const url = new URL(raw)
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port) {
+    throw new Error(`Open Design ${field} must use an exact 127.0.0.1 HTTP origin`)
+  }
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error(`Open Design ${field} must be an origin without credentials or path data`)
+  }
+  return url.origin
+}
+
+export interface Agent24HeadlessReady {
+  type: 'ready'
+  protocol: 1
+  instanceId: string
+  pinVersion: string
+  webOrigin: string
+  daemonOrigin: string
+  ownership: { ownerPid: number; kind: 'process-tree' }
+}
+
+export function parseAgent24HeadlessReady(
+  value: unknown,
+  expectedPinVersion: string,
+  expectedOwnerPid: number,
+): Agent24HeadlessReady {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Open Design headless readiness must be an object')
+  }
+  const raw = value as Record<string, unknown>
+  const allowed = new Set(['type', 'protocol', 'instanceId', 'pinVersion', 'webOrigin', 'daemonOrigin', 'ownership'])
+  const unknown = Object.keys(raw).find((key) => !allowed.has(key))
+  if (unknown) throw new Error(`Open Design headless readiness contains unsupported field: ${unknown}`)
+  if (raw.type !== 'ready' || raw.protocol !== AGENT24_HEADLESS_PROTOCOL) {
+    throw new Error('Open Design headless readiness protocol mismatch')
+  }
+  if (raw.pinVersion !== expectedPinVersion) throw new Error('Open Design headless pin version mismatch')
+  if (typeof raw.instanceId !== 'string' || !raw.instanceId.trim() || /\s/u.test(raw.instanceId)) {
+    throw new Error('Open Design headless instance id is invalid')
+  }
+  if (raw.ownership == null || typeof raw.ownership !== 'object' || Array.isArray(raw.ownership)) {
+    throw new Error('Open Design headless ownership is invalid')
+  }
+  const ownership = raw.ownership as Record<string, unknown>
+  const unknownOwnership = Object.keys(ownership).find((key) => key !== 'ownerPid' && key !== 'kind')
+  if (unknownOwnership) {
+    throw new Error(`Open Design headless ownership contains unsupported field: ${unknownOwnership}`)
+  }
+  if (ownership.kind !== 'process-tree' || ownership.ownerPid !== expectedOwnerPid) {
+    throw new Error('Open Design headless ownership does not match the launched process')
+  }
+  return {
+    type: 'ready',
+    protocol: AGENT24_HEADLESS_PROTOCOL,
+    instanceId: raw.instanceId,
+    pinVersion: expectedPinVersion,
+    webOrigin: canonicalHeadlessOrigin(raw.webOrigin, 'web origin'),
+    daemonOrigin: canonicalHeadlessOrigin(raw.daemonOrigin, 'daemon origin'),
+    ownership: { ownerPid: expectedOwnerPid, kind: 'process-tree' },
+  }
+}
+
 export function classifyCreativeUrl(candidate: string, allowedOrigin: string): CreativeUrlDisposition {
   let url: URL
   let allowed: URL
@@ -108,6 +178,12 @@ export function resolveOpenDesignCheckout(
   ) ?? null
 }
 
+export function resolveAgent24HeadlessLauncher(resourcesPath?: string): string | null {
+  if (!resourcesPath) return null
+  const entry = path.join(resourcesPath, 'app', 'prebundled', 'agent24-headless.cjs')
+  return fs.existsSync(entry) ? entry : null
+}
+
 export function creativeChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // A24_* belongs to the Agent24 host authority/bootstrap namespace. The
   // desktop may consume A24_OPEN_DESIGN_* to choose how to launch Creative,
@@ -123,8 +199,10 @@ export function creativeChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.Process
 
 export class CreativeServeWeb {
   private child: CreativeChild | null = null
+  private childKind: 'checkout' | 'headless' | null = null
   private current: CreativeServeWebStatus = { state: 'stopped' }
   private starting: Promise<CreativeServeWebStatus> | null = null
+  private stopping: Promise<CreativeServeWebStatus> | null = null
 
   constructor(
     private readonly options: CreativeServeWebOptions = {},
@@ -137,8 +215,9 @@ export class CreativeServeWeb {
   }
 
   start(): Promise<CreativeServeWebStatus> {
-    if (this.current.state === 'ready' && this.child) return Promise.resolve(this.status())
+    if (this.stopping) return this.stopping.then(() => this.start())
     if (this.starting) return this.starting
+    if (this.child) return Promise.resolve(this.status())
 
     const pending = this.startOnce()
     this.starting = pending
@@ -151,7 +230,13 @@ export class CreativeServeWeb {
 
   private async startOnce(): Promise<CreativeServeWebStatus> {
     const environment = this.options.environment ?? process.env
-    const checkoutDir = this.options.checkoutDir
+    const explicitCheckout = this.options.checkoutDir ?? environment.A24_OPEN_DESIGN_DIR?.trim()
+    const headlessEntry = explicitCheckout
+      ? null
+      : resolveAgent24HeadlessLauncher(this.options.resourcesPath)
+    if (headlessEntry) return this.startPackagedHeadless(headlessEntry, environment)
+
+    const checkoutDir = explicitCheckout
       ?? resolveOpenDesignCheckout(process.cwd(), environment, this.options.resourcesPath)
     if (!checkoutDir) {
       this.current = {
@@ -191,6 +276,7 @@ export class CreativeServeWeb {
       { cwd: checkoutDir, env: creativeChildEnvironment(environment), stdio: ['ignore', 'pipe', 'pipe'] },
     ) as CreativeChild
     this.child = child
+    this.childKind = 'checkout'
 
     try {
       const origin = await this.waitForOrigin(child, readyTimeoutMs, port)
@@ -200,13 +286,104 @@ export class CreativeServeWeb {
       child.once('exit', () => {
         if (this.child !== child) return
         this.child = null
+        this.childKind = null
         this.current = { state: 'stopped' }
       })
       return this.status()
     } catch (error) {
-      if (this.child === child) {
-        child.kill('SIGTERM')
+      if (this.child !== child) return this.status()
+      const stopped = await this.terminateOwnedChild(child, 'checkout')
+      if (this.child !== child) return this.status()
+      if (stopped) {
         this.child = null
+        this.childKind = null
+      }
+      this.current = {
+        state: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+      }
+      return this.status()
+    }
+  }
+
+  private async startPackagedHeadless(
+    headlessEntry: string,
+    environment: NodeJS.ProcessEnv,
+  ): Promise<CreativeServeWebStatus> {
+    const resourcesPath = this.options.resourcesPath
+    const stateRoot = this.options.stateRoot
+    const runtimeExecutable = this.options.runtimeExecutable
+    const pinVersion = this.options.pinVersion ?? OPEN_DESIGN_PIN_VERSION
+    if (!resourcesPath || !path.isAbsolute(resourcesPath)) {
+      this.current = { state: 'failed', error: 'Open Design packaged resources path is unavailable' }
+      return this.status()
+    }
+    if (!stateRoot || !path.isAbsolute(stateRoot)) {
+      this.current = { state: 'failed', error: 'Open Design packaged state root is unavailable' }
+      return this.status()
+    }
+    if (!runtimeExecutable || !path.isAbsolute(runtimeExecutable)) {
+      this.current = { state: 'failed', error: 'Open Design packaged runtime executable is unavailable' }
+      return this.status()
+    }
+
+    const resourceRoot = path.join(resourcesPath, 'open-design')
+    const dataRoot = path.join(stateRoot, 'data')
+    const runtimeRoot = path.join(stateRoot, 'runtime')
+    const configPath = path.join(stateRoot, 'agent24-headless.json')
+    fs.mkdirSync(dataRoot, { recursive: true })
+    fs.mkdirSync(runtimeRoot, { recursive: true })
+    fs.writeFileSync(configPath, `${JSON.stringify({
+      protocol: AGENT24_HEADLESS_PROTOCOL,
+      pinVersion,
+      resourceRoot,
+      dataRoot,
+      runtimeRoot,
+      runtimeExecutable,
+    })}\n`, { encoding: 'utf8', mode: 0o600 })
+    fs.chmodSync(configPath, 0o600)
+
+    this.current = { state: 'starting' }
+    const childEnv = creativeChildEnvironment(environment)
+    childEnv.ELECTRON_RUN_AS_NODE = '1'
+    const child = this.spawnFn(
+      runtimeExecutable,
+      [headlessEntry, '--config', configPath],
+      { cwd: resourcesPath, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] },
+    ) as CreativeChild
+    this.child = child
+    this.childKind = 'headless'
+
+    try {
+      if (!Number.isInteger(child.pid) || !child.pid || child.pid < 1) {
+        throw new Error('Open Design headless launcher did not provide a pid')
+      }
+      const readyTimeoutMs = this.options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS
+      const ready = await this.waitForHeadlessReady(child, readyTimeoutMs, pinVersion, child.pid)
+      await this.waitUntilReady(ready.webOrigin, readyTimeoutMs)
+      if (this.child !== child) throw new Error('Open Design launch was superseded')
+      this.current = { state: 'ready', origin: ready.webOrigin }
+      child.once('exit', () => {
+        if (this.child !== child) return
+        this.child = null
+        this.childKind = null
+        this.current = { state: 'stopped' }
+      })
+      return this.status()
+    } catch (error) {
+      if (this.child !== child) return this.status()
+      const stopped = await this.terminateOwnedChild(child, 'headless')
+      if (this.child !== child) return this.status()
+      if (stopped) {
+        this.child = null
+        this.childKind = null
+      } else {
+        this.current = {
+          state: 'failed',
+          error: `Open Design headless launcher did not stop within ${HEADLESS_STOP_TIMEOUT_MS}ms; refusing an owner-only force kill`,
+        }
+        this.observeRetainedOwner(child)
+        return this.status()
       }
       this.current = {
         state: 'failed',
@@ -217,28 +394,75 @@ export class CreativeServeWeb {
   }
 
   async stop(): Promise<CreativeServeWebStatus> {
+    if (this.stopping) return this.stopping
+    const pending = this.stopOnce()
+    this.stopping = pending
+    pending.then(
+      () => { if (this.stopping === pending) this.stopping = null },
+      () => { if (this.stopping === pending) this.stopping = null },
+    )
+    return pending
+  }
+
+  private async stopOnce(): Promise<CreativeServeWebStatus> {
     const child = this.child
+    const kind = this.childKind ?? 'checkout'
     this.child = null
+    this.childKind = null
+    // Do not deduplicate a later restart onto this generation's stale promise.
+    this.starting = null
+    this.current = { state: 'stopped' }
     if (!child) {
-      this.current = { state: 'stopped' }
       return this.status()
     }
 
-    await new Promise<void>((resolve) => {
-      if (child.exitCode != null) return resolve()
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL')
-        resolve()
-      }, 5_000)
-      timer.unref?.()
-      child.once('exit', () => {
+    const stopped = await this.terminateOwnedChild(child, kind)
+    if (!stopped && kind === 'headless') {
+      this.child = child
+      this.childKind = kind
+      this.current = {
+        state: 'failed',
+        error: `Open Design headless launcher did not stop within ${HEADLESS_STOP_TIMEOUT_MS}ms; refusing an owner-only force kill`,
+      }
+      this.observeRetainedOwner(child)
+    }
+    return this.status()
+  }
+
+  private terminateOwnedChild(child: CreativeChild, kind: 'checkout' | 'headless'): Promise<boolean> {
+    const timeoutMs = kind === 'headless' ? HEADLESS_STOP_TIMEOUT_MS : CHECKOUT_STOP_TIMEOUT_MS
+    return new Promise((resolve) => {
+      if (child.exitCode != null || child.signalCode != null) return resolve(true)
+      let settled = false
+      const finish = (stopped: boolean): void => {
+        if (settled) return
+        settled = true
         clearTimeout(timer)
-        resolve()
-      })
+        child.off('exit', onExit)
+        resolve(stopped)
+      }
+      const onExit = (): void => finish(true)
+      const timer = setTimeout(() => {
+        if (kind === 'checkout') {
+          child.kill('SIGKILL')
+          finish(true)
+          return
+        }
+        finish(false)
+      }, timeoutMs)
+      timer.unref?.()
+      child.once('exit', onExit)
       child.kill('SIGTERM')
     })
-    this.current = { state: 'stopped' }
-    return this.status()
+  }
+
+  private observeRetainedOwner(child: CreativeChild): void {
+    child.once('exit', () => {
+      if (this.child !== child) return
+      this.child = null
+      this.childKind = null
+      this.current = { state: 'stopped' }
+    })
   }
 
   private waitForOrigin(child: CreativeChild, timeoutMs: number, expectedPort: number): Promise<string> {
@@ -276,6 +500,55 @@ export class CreativeServeWeb {
       const onExit = (code: number | null): void =>
         done(new Error(`Open Design exited before ready (${code ?? 'signal'})${stderr ? `: ${stderr.trim()}` : ''}`))
 
+      child.stdout.on('data', onStdout)
+      child.stderr.on('data', onStderr)
+      child.once('error', onError)
+      child.once('exit', onExit)
+    })
+  }
+
+  private waitForHeadlessReady(
+    child: CreativeChild,
+    timeoutMs: number,
+    expectedPinVersion: string,
+    expectedOwnerPid: number,
+  ): Promise<Agent24HeadlessReady> {
+    return new Promise((resolve, reject) => {
+      let stdout = ''
+      let stderr = ''
+      const timeout = setTimeout(() => done(new Error('Open Design headless readiness output timed out')), timeoutMs)
+      timeout.unref?.()
+      const done = (value: Error | Agent24HeadlessReady): void => {
+        clearTimeout(timeout)
+        child.stdout.off('data', onStdout)
+        child.stderr.off('data', onStderr)
+        child.off('error', onError)
+        child.off('exit', onExit)
+        value instanceof Error ? reject(value) : resolve(value)
+      }
+      const inspect = (): void => {
+        if (Buffer.byteLength(stdout, 'utf8') > 16_384) {
+          done(new Error('Open Design headless readiness output exceeded the host limit'))
+          return
+        }
+        const newline = stdout.indexOf('\n')
+        if (newline < 0) return
+        const line = stdout.slice(0, newline).trim()
+        if (!line) {
+          done(new Error('Open Design headless readiness line is empty'))
+          return
+        }
+        try {
+          done(parseAgent24HeadlessReady(JSON.parse(line), expectedPinVersion, expectedOwnerPid))
+        } catch (error) {
+          done(error instanceof Error ? error : new Error(String(error)))
+        }
+      }
+      const onStdout = (chunk: Buffer | string): void => { stdout += chunk.toString(); inspect() }
+      const onStderr = (chunk: Buffer | string): void => { stderr = (stderr + chunk.toString()).slice(-2_000) }
+      const onError = (error: Error): void => done(error)
+      const onExit = (code: number | null): void =>
+        done(new Error(`Open Design headless launcher exited before ready (${code ?? 'signal'})${stderr ? `: ${stderr.trim()}` : ''}`))
       child.stdout.on('data', onStdout)
       child.stderr.on('data', onStderr)
       child.once('error', onError)

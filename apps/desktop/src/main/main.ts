@@ -11,6 +11,7 @@ import { IpcChannels } from '../shared/ipc-types'
 import type { CreativeViewBounds, CreativeViewResult } from '../shared/ipc-types'
 import {
   CREATIVE_SESSION_PARTITION,
+  OPEN_DESIGN_PIN_VERSION,
   CreativeServeWeb,
   CreativeViewRequestFence,
   classifyCreativeUrl,
@@ -53,7 +54,7 @@ let mainWin: BrowserWindow | null = null
 let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
-const creativeServeWeb = new CreativeServeWeb({ resourcesPath: process.resourcesPath })
+let creativeServeWeb: CreativeServeWeb | null = null
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
 const creativeViewFence = new CreativeViewRequestFence()
@@ -83,7 +84,9 @@ async function showCreativeView(
   if (!win || win.isDestroyed()) return { ok: false, error: 'Agent24 window is unavailable' }
   if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
 
-  const status = await creativeServeWeb.start()
+  const service = creativeServeWeb
+  if (!service) return { ok: false, error: 'Open Design host is unavailable' }
+  const status = await service.start()
   if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
@@ -132,7 +135,9 @@ async function showCreativeView(
 
 async function restartCreativeView(bounds: CreativeViewBounds): Promise<CreativeViewResult> {
   const requestGeneration = creativeViewFence.begin()
-  await creativeServeWeb.stop()
+  const service = creativeServeWeb
+  if (!service) return { ok: false, error: 'Open Design host is unavailable' }
+  await service.stop()
   creativeOrigin = null
   return showCreativeView(bounds, true, requestGeneration)
 }
@@ -194,6 +199,12 @@ process.on('unhandledRejection', (reason) => {
 })
 
 app.whenReady().then(() => {
+  creativeServeWeb = new CreativeServeWeb({
+    resourcesPath: process.resourcesPath,
+    stateRoot: path.join(app.getPath('userData'), 'creative', 'open-design'),
+    runtimeExecutable: process.execPath,
+    pinVersion: OPEN_DESIGN_PIN_VERSION,
+  })
   // Dev-only: show the real app icon in the dock immediately, without
   // waiting for an electron-builder packaged build (which is where mac.icon
   // in package.json normally takes effect).
@@ -331,7 +342,7 @@ app.on('will-quit', () => {
   agentEarBridge.stop()
   agentEarLog.stop()
   backendManager.stop()
-  void creativeServeWeb.stop()
+  void creativeServeWeb?.stop()
 })
 
 // window-all-closed fires only if tray is null (i.e., user chose Quit from
