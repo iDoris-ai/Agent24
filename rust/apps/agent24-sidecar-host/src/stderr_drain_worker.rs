@@ -165,7 +165,7 @@ fn drain_loop<R: Read>(
 
 fn saturating_add(bytes: &AtomicU64, len: usize) {
     let increment = u64::try_from(len).unwrap_or(u64::MAX);
-    let _ = bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = bytes.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(increment))
     });
 }
