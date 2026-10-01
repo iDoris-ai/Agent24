@@ -323,6 +323,7 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
   - agent24d 启动时，残留的 Pending 条目只记日志、不使用。
 - **L2 仅内存**：钥匙串不可用时状态为 `locked{keychain_unavailable}`。用户执行 `agent24 comm unlock` 交出口令，口令只保存在 `Zeroizing` 内存中；agent24d 重启后回到 `locked`。加 `--remember` 时写入或替换钥匙串条目，用于钥匙串恢复之后，或修改过口令之后。
 - **不提供**：systemd 凭据（M12 砍掉）、明文口令文件、通过环境变量或 config 传口令。降级不会自动发生。
+- **显式降级开关**：`A24_COMM_PASSWORD_STORE` 环境变量可选 `keyring`（默认，未设置时也是这个）或 `memory`（改用纯内存的 `MemoryPasswordStore`，口令不持久、daemon 重启即丢，仅用于隔离环境下的测试/联调，启动时打 warn）；其他值不会被悄悄当作 `keyring` 或 `memory`，daemon 照常启动但 comm 路由一律答 `not_configured`，data 里带上具体原因。
 
 ### 6.5 与 Deployment A5 的关系
 - A5（#602）之后，桌面端会复用已在运行的 agent24d，所以**持有 Hyphae daemon 的始终是唯一那一个 agent24d**。

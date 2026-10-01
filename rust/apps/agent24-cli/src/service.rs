@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 15] = [
+pub const PASSTHROUGH_VARS: [&str; 16] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -157,6 +157,10 @@ pub const PASSTHROUGH_VARS: [&str; 15] = [
     // (D8) — both are read literally in `apps/agent24d/src/comm_routes.rs`.
     "A24_HYPHAE_BIN",
     "A24_SPEAKER_BIN",
+    // COMM-HYPHAE.md §6.4: which `PasswordStore` backend `comm_routes::build`
+    // constructs (`keyring` default, or `memory` for isolated test/joint-
+    // debug environments that must never touch the real OS keychain).
+    "A24_COMM_PASSWORD_STORE",
 ];
 
 /// Snapshot the environment the daemon should run with.
