@@ -127,15 +127,12 @@ fn is_han(ch: char) -> bool {
     matches!(ch as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F)
 }
 
-/// Turn free text into a safe FTS5 MATCH expression: SPLIT the input on every
-/// non-alphanumeric character and quote each resulting term as a literal phrase,
-/// AND-ing them. Splitting (not stripping) MATCHES the `unicode61` tokenizer used
-/// by the index — the tokenizer breaks `e-mail` into `e`/`mail`, so the query
-/// must too, or the literal text from the ledger would never match (review #120
-/// B2). Quoting each term neutralizes FTS5 operators (`"`, `*`, `:`, `(`, `AND`,
-/// `NEAR`, …), so arbitrary user input can never be a syntax error or an injected
-/// query. Returns `None` if there is no searchable term (empty / all-punctuation),
-/// so the caller returns no hits.
+/// Turn free text into a safe FTS5 MATCH expression. Split on punctuation as the
+/// `unicode61` tokenizer does, preserve each term containing non-Han text (so a
+/// mixed term such as `维生素B12` still matches the original text column), and
+/// add Han bigrams for CJK partial matching. Quoting each term neutralizes FTS5
+/// operators (`"`, `*`, `:`, `(`, `AND`, `NEAR`, …), so arbitrary user input
+/// cannot become query syntax. Returns `None` when there is no searchable term.
 /// Whether a query has any searchable term. The SHARED predicate both retrievers
 /// use so a degenerate (empty / all-punctuation) query returns nothing rather
 /// than erroring, in BOTH the FTS and vector implementations of the same trait
@@ -151,8 +148,8 @@ fn to_match_query(query: &str) -> Option<String> {
 fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
     let cjk = cjk_bigrams(query);
     let terms: Vec<String> = query
-        .split(|ch: char| !ch.is_alphanumeric() || is_han(ch))
-        .filter(|term| !term.is_empty())
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| !term.is_empty() && term.chars().any(|ch| !is_han(ch)))
         .chain(cjk.split_whitespace())
         .map(|term| format!("\"{term}\""))
         .collect();
@@ -495,6 +492,75 @@ mod tests {
         assert!(r.search_any(q, "u2", 10).await.unwrap().is_empty());
         r.rebuild().await.unwrap();
         assert_eq!(r.search_any(q, "u2", 10).await.unwrap(), hits);
+    }
+
+    async fn assert_mixed_text_searches(r: &FtsRetriever) {
+        for (query, id) in [("维生素B12", "vitamin"), ("我喜欢Rust编程", "rust")] {
+            let hits = r.search(query, "u1", 10).await.unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert_eq!(hits[0].assertion.id, id, "{query}");
+            assert!(
+                r.search(&format!("{query} missingtoken"), "u1", 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "search ANDs the query with missing terms: {query}"
+            );
+            let any = r.search_any(query, "u1", 10).await.unwrap();
+            assert_eq!(any.len(), 1, "search_any: {query}");
+            assert_eq!(any[0].assertion.id, id, "search_any: {query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_cjk_and_latin_terms_survive_new_writes() {
+        let (kv, r) = fixture().await;
+        kv.assertions()
+            .assert(&a("vitamin", "u1", "维生素B12", json!("daily")))
+            .await
+            .unwrap();
+        let rust = Candidate::new(
+            "rust",
+            Scope::owner("u1"),
+            "我喜欢Rust编程",
+            "is",
+            json!(true),
+            Origin {
+                source: "test".into(),
+                trust: Trust::UserSaid,
+            },
+        )
+        .with_evidence(vec!["event-rust".into()])
+        .remember();
+        kv.write_gate().propose(vec![rust]).await.unwrap();
+        assert_mixed_text_searches(&r).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_cjk_and_latin_terms_survive_rebuild() {
+        let (kv, r) = fixture().await;
+        kv.assertions()
+            .assert(&a("vitamin", "u1", "维生素B12", json!("daily")))
+            .await
+            .unwrap();
+        kv.assertions()
+            .assert(&a("rust", "u1", "我喜欢Rust编程", json!(true)))
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM mem_assertions_fts")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        for query in ["维生素B12", "我喜欢Rust编程"] {
+            assert!(
+                r.search(query, "u1", 10).await.unwrap().is_empty(),
+                "{query}"
+            );
+        }
+
+        r.rebuild().await.unwrap();
+        assert_mixed_text_searches(&r).await;
     }
 
     #[tokio::test]

@@ -1055,6 +1055,7 @@ mod tests {
 
     use super::*;
     use crate::event::EventStore as _;
+    use crate::retriever::Retriever as _;
     use serde::Deserialize;
 
     #[tokio::test]
@@ -1456,17 +1457,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, 15);
-        sqlx::query(
-            "INSERT INTO mem_assertions
-                 (id, scope_owner, scope, subject, predicate, object, valid_from,
-                  recorded_from, evidence, confidence, modality, writer_version, qualified)
-             VALUES ('cjk', 'alice', '{\"owner\":\"alice\"}', 'user', 'said',
-                     '\"我对花生过敏\"', '2026-01-01', '2026-01-01', '[]', 1.0,
-                     'said', 'test', 1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        for (id, text) in [
+            ("cjk", "我对花生过敏"),
+            ("vitamin", "维生素B12"),
+            ("rust", "我喜欢Rust编程"),
+        ] {
+            sqlx::query(
+                "INSERT INTO mem_assertions
+                     (id, scope_owner, scope, subject, predicate, object, valid_from,
+                      recorded_from, evidence, confidence, modality, writer_version, qualified)
+                 VALUES (?, 'alice', '{\"owner\":\"alice\"}', 'user', 'said',
+                         ?, '2026-01-01', '2026-01-01', '[]', 1.0, 'said', 'test', 1)",
+            )
+            .bind(id)
+            .bind(serde_json::to_string(text).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Before 0017, the legacy trigger indexes each mixed string as one
+        // unicode61 token, so complete-string MATCH remains supported.
+        for (token, id) in [("维生素B12", "vitamin"), ("我喜欢Rust编程", "rust")] {
+            let hits: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM mem_assertions_fts WHERE mem_assertions_fts MATCH ? AND id = ?",
+            )
+            .bind(format!("\"{token}\""))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(hits, 1, "legacy index should retain {token} as a token");
+        }
         pool.close().await;
 
         for _ in 0..2 {
@@ -1480,6 +1502,31 @@ mod tests {
                     .id,
                 "cjk"
             );
+            let retriever = kv.retriever();
+            for (query, id) in [("维生素B12", "vitamin"), ("我喜欢Rust编程", "rust")] {
+                assert_eq!(
+                    retriever.search(query, "alice", 5).await.unwrap()[0]
+                        .assertion
+                        .id,
+                    id,
+                    "AND search should retain full-token matching for {query}"
+                );
+                assert_eq!(
+                    retriever.search_any(query, "alice", 5).await.unwrap()[0]
+                        .assertion
+                        .id,
+                    id,
+                    "OR search should retain full-token matching for {query}"
+                );
+                assert!(
+                    retriever
+                        .search(&format!("{query} missing"), "alice", 5)
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "search must keep its AND semantics"
+                );
+            }
             let marker: Option<String> =
                 sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
                     .fetch_optional(&kv.pool)
