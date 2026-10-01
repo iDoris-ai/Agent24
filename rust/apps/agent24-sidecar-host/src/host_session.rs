@@ -254,6 +254,7 @@ mod tests {
     use super::*;
     use crate::{
         actor::Phase,
+        cleanup::CleanupStepError,
         pre_owned_cleanup::CleanupTarget,
         target::{ExitObservation, TreeObservation},
         worker_slots::WorkerSlots,
@@ -274,6 +275,21 @@ mod tests {
             Err(io::ErrorKind::InvalidData.into())
         }
     }
+    struct SecretRead;
+    impl Read for SecretRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fixture-secret-from-control-reader",
+            ))
+        }
+    }
+    struct PendingRead;
+    impl Read for PendingRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+    }
     struct Sink(Option<Arc<Mutex<Vec<u8>>>>);
     impl Write for Sink {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -286,9 +302,10 @@ mod tests {
             Ok(())
         }
     }
-    struct Broken;
+    struct Broken(Arc<Mutex<Vec<Vec<u8>>>>);
     impl Write for Broken {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push(bytes.to_vec());
             Err(io::ErrorKind::BrokenPipe.into())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -297,7 +314,7 @@ mod tests {
     }
 
     struct Fake {
-        results: VecDeque<TreeObservation>,
+        results: VecDeque<Result<TreeObservation, io::ErrorKind>>,
         calls: Arc<AtomicUsize>,
     }
     impl CleanupTarget for Fake {
@@ -307,17 +324,16 @@ mod tests {
         fn stop(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn reap(
-            &mut self,
-            _: &mut Phase,
-        ) -> Result<TreeObservation, crate::cleanup::CleanupStepError> {
+        fn reap(&mut self, _: &mut Phase) -> Result<TreeObservation, CleanupStepError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let tree = self.results.pop_front().expect("scripted result");
-            Ok(tree)
+            self.results
+                .pop_front()
+                .expect("scripted result")
+                .map_err(|kind| CleanupStepError::Reap(io::Error::from(kind)))
         }
     }
     fn cleanup(
-        results: impl IntoIterator<Item = TreeObservation>,
+        results: impl IntoIterator<Item = Result<TreeObservation, io::ErrorKind>>,
         now: Instant,
     ) -> (PreOwnedCleanup<Fake>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -433,8 +449,8 @@ mod tests {
         let now = Instant::now();
         let (owner, _) = cleanup(
             [
-                TreeObservation::Unconfirmed,
-                TreeObservation::ConfirmedEmpty,
+                Ok(TreeObservation::Unconfirmed),
+                Ok(TreeObservation::ConfirmedEmpty),
             ],
             now,
         );
@@ -457,20 +473,47 @@ mod tests {
             1
         );
 
-        let mut broken = HostPorts::new_in(
-            WorkerSlots::isolated(),
-            io::empty(),
-            Broken,
-            Duration::from_millis(20),
-        )
-        .unwrap();
         let (owner, calls) = cleanup(
             [
-                TreeObservation::Unconfirmed,
-                TreeObservation::ConfirmedEmpty,
+                Ok(TreeObservation::Unconfirmed),
+                Err(io::ErrorKind::Interrupted),
+                Ok(TreeObservation::ConfirmedEmpty),
             ],
             now,
         );
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut broken = HostPorts::new_in(
+            WorkerSlots::isolated(),
+            io::empty(),
+            Broken(attempts.clone()),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let frame = encode_reply(&reply(91)).unwrap();
+        let mut output_failed = false;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        {
+            let (_, output, _) = broken.borrow();
+            output.put(frame, now).unwrap();
+            while Instant::now() < deadline {
+                match output.step(Instant::now()) {
+                    Err(crate::output_io::OutputWriteError::Io(io::ErrorKind::BrokenPipe)) => {
+                        output_failed = true;
+                        break;
+                    }
+                    Ok(WriteStep::Pending) => std::thread::yield_now(),
+                    result => panic!("output did not report BrokenPipe: {result:?}"),
+                }
+            }
+        }
+        assert!(output_failed, "output failure was not observed");
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cleanup ran before failure"
+        );
+
         let result = run_rejected(
             &mut broken,
             reply(91),
@@ -478,14 +521,15 @@ mod tests {
             &mut Instant::now,
             &mut |wait| std::thread::sleep(wait),
         );
-        assert_eq!(result.unwrap_err().reason, "launch_rejected");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result.unwrap_err().reason, "rejected_cleanup_failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(attempts.lock().unwrap().len(), 1, "reply was retried");
     }
 
     #[test]
     fn cleanup_dispatch_path_has_no_launch_failed_reply() {
         let now = Instant::now();
-        let (owner, calls) = cleanup([TreeObservation::ConfirmedEmpty], now);
+        let (owner, calls) = cleanup([Ok(TreeObservation::ConfirmedEmpty)], now);
         assert_eq!(
             run_cleanup(owner, &mut || now, &mut |_| {})
                 .unwrap_err()
@@ -493,5 +537,102 @@ mod tests {
             "generation_failed"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_ingress_parks_once_per_turn_and_samples_clock_once() {
+        let mut ports = HostPorts::new_in(
+            WorkerSlots::isolated(),
+            PendingRead,
+            Sink(None),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let clock_calls = std::cell::Cell::new(0);
+        let cancel_calls = std::cell::Cell::new(0);
+        let parks = std::cell::Cell::new(0);
+        let result = run_session(
+            &mut ports,
+            Duration::from_secs(1),
+            limits(),
+            || {
+                clock_calls.set(clock_calls.get() + 1);
+                Instant::now()
+            },
+            |_| parks.set(parks.get() + 1),
+            || {
+                cancel_calls.set(cancel_calls.get() + 1);
+                cancel_calls.get() == 4
+            },
+        );
+        assert_eq!(result.unwrap_err().reason, "cancelled");
+        assert_eq!(clock_calls.get(), 4);
+        assert_eq!(parks.get(), 3);
+    }
+
+    #[test]
+    fn rejected_cleanup_retries_unconfirmed_and_error_without_duplicate_reply() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut ports = ports(Some(bytes.clone()));
+        let now = Instant::now();
+        let (owner, calls) = cleanup(
+            [
+                Ok(TreeObservation::Unconfirmed),
+                Err(io::ErrorKind::Interrupted),
+                Ok(TreeObservation::ConfirmedEmpty),
+            ],
+            now,
+        );
+        let parks = std::cell::Cell::new(0);
+        let result = run_rejected(
+            &mut ports,
+            reply(123),
+            Some(owner),
+            &mut || now,
+            &mut |_| {
+                parks.set(parks.get() + 1);
+                std::thread::sleep(Duration::from_millis(1));
+            },
+        );
+        assert_eq!(result.unwrap_err().reason, "rejected_cleanup_failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(parks.get() >= 2);
+        assert_eq!(decode_reply(&bytes.lock().unwrap()).unwrap(), reply(123));
+        assert_eq!(
+            bytes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ingress_reader_failure_redacts_secret_from_diagnostics_and_output() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut ports = HostPorts::new_in(
+            WorkerSlots::isolated(),
+            SecretRead,
+            Sink(Some(bytes.clone())),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let error = run_session(
+            &mut ports,
+            Duration::from_secs(1),
+            limits(),
+            Instant::now,
+            |_| std::thread::yield_now(),
+            || false,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:?} {error}");
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!rendered.contains("fixture-secret-from-control-reader"));
+        assert!(!output.contains("fixture-secret-from-control-reader"));
+        assert!(rendered.contains("control_failed"));
+        assert!(output.is_empty());
     }
 }
