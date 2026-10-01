@@ -11,6 +11,7 @@ mod attach_listener;
 mod attach_registry;
 mod attached;
 mod attached_routes;
+mod authz;
 mod comm_routes;
 mod domain;
 mod events;

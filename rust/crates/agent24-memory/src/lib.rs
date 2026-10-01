@@ -163,6 +163,8 @@ pub struct OsPartitionRow {
     /// (`touch_os_partition_last_seen`) — T8.5c-W-mount decision 5. Migration
     /// 0015 made the column nullable for exactly this state.
     pub last_seen_at: Option<String>,
+    /// Distinguishes module-local spaces from the agent's personal space.
+    pub space_kind: String,
 }
 
 /// The identity of a partition, as the kernel states it when recording one.
@@ -238,6 +240,7 @@ fn os_partition_row(r: &sqlx::sqlite::SqliteRow) -> OsPartitionRow {
         module_name: r.get("module_name"),
         first_seen_at: r.get("first_seen_at"),
         last_seen_at: r.get::<Option<String>, _>("last_seen_at"),
+        space_kind: r.get("space_kind"),
     }
 }
 
@@ -359,6 +362,11 @@ impl KvStore {
         assertion::AssertionLedger::new(self.pool.clone())
     }
 
+    /// Retract an assertion and append its event in the same transaction.
+    pub async fn forget(&self, owner: &str, id: &str, at: &str) -> Result<assertion::Forget> {
+        assertion::forget(&self.pool, owner, id, at).await
+    }
+
     /// An [`retriever::FtsRetriever`] over the SAME database file — MD-3b's
     /// full-text projection over the assertion ledger.
     pub fn retriever(&self) -> retriever::FtsRetriever {
@@ -440,6 +448,21 @@ impl KvStore {
     /// The identity a key encodes is `(org_id, space_id)`. Who walked up to it
     /// is not part of it.
     pub async fn record_os_partition(&self, id: OsPartitionIdentity<'_>) -> Result<()> {
+        self.record_partition(id, "module").await
+    }
+
+    /// Record the authenticated user's personal partition. Its reserved module
+    /// name is intentionally outside the manifest-name grammar.
+    pub async fn record_personal_partition(&self, id: OsPartitionIdentity<'_>) -> Result<()> {
+        if id.module != "@agent" {
+            return Err(MemoryError::Conflict(
+                "personal partition module must be @agent".into(),
+            ));
+        }
+        self.record_partition(id, "personal").await
+    }
+
+    async fn record_partition(&self, id: OsPartitionIdentity<'_>, kind: &str) -> Result<()> {
         // Dropping `logical_user` from the guard let a non-member be recorded as
         // a partition's creator, which review caught: the kernel's own path
         // resolves the org by membership first, so it could not happen there —
@@ -474,13 +497,14 @@ impl KvStore {
         let res = sqlx::query(
             "INSERT INTO mem_os_partitions
                  (owner_key, key_version, org_id, space_id, logical_user,
-                  module_name, first_seen_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                  module_name, first_seen_at, last_seen_at, space_kind)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
              ON CONFLICT(owner_key) DO UPDATE SET first_seen_at = first_seen_at
                WHERE key_version = excluded.key_version
                  AND org_id = excluded.org_id
                  AND space_id = excluded.space_id
-                 AND module_name = excluded.module_name",
+                 AND module_name = excluded.module_name
+                 AND space_kind = excluded.space_kind",
         )
         .bind(id.owner_key)
         .bind(id.key_version)
@@ -489,6 +513,7 @@ impl KvStore {
         .bind(id.user)
         .bind(id.module)
         .bind(&now)
+        .bind(kind)
         .execute(&self.pool)
         .await?;
         if res.rows_affected() == 0 {
@@ -737,7 +762,7 @@ impl KvStore {
     ) -> Result<Vec<OsPartitionRow>> {
         let rows = sqlx::query(
             "SELECT owner_key, key_version, org_id, space_id, logical_user,
-                    module_name, first_seen_at, last_seen_at
+                    module_name, first_seen_at, last_seen_at, space_kind
              FROM mem_os_partitions WHERE key_version = ?
              ORDER BY first_seen_at ASC, owner_key ASC",
         )
@@ -950,7 +975,7 @@ impl KvStore {
     async fn os_partitions_where(&self, column: &str, value: &str) -> Result<Vec<OsPartitionRow>> {
         let rows = sqlx::query(&format!(
             "SELECT owner_key, key_version, org_id, space_id, logical_user,
-                    module_name, first_seen_at, last_seen_at
+                    module_name, first_seen_at, last_seen_at, space_kind
              FROM mem_os_partitions WHERE {column} = ?
              ORDER BY first_seen_at ASC, owner_key ASC"
         ))
@@ -1237,7 +1262,10 @@ mod tests {
     #[tokio::test]
     async fn migration_0015_keeps_the_0013_schema_and_only_makes_last_seen_at_nullable() {
         let dir = tempfile::tempdir().unwrap();
-        let kv = KvStore::open(&dir.path().join("m.db")).await.unwrap();
+        let kv = KvStore {
+            pool: pool_migrated_up_to(&dir.path().join("m.db"), 16).await,
+            oop_admission: None,
+        };
 
         let columns = sqlx::query("PRAGMA table_info(mem_os_partitions)")
             .fetch_all(&kv.pool)
@@ -1437,6 +1465,150 @@ mod tests {
             "a historical non-null last_seen_at must not be wiped to NULL by the rebuild — \
              the migration only changes what a NEW insert writes, not existing rows"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_0016_preserves_rows_and_adds_personal_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let pool = pool_migrated_up_to(&path, 16).await;
+        let version: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 15);
+        sqlx::query(
+            "INSERT INTO mem_orgs (org_id, display_name, created_at) VALUES ('o', 'O', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO mem_os_partitions (owner_key,key_version,org_id,space_id,logical_user,module_name,first_seen_at,last_seen_at) VALUES ('a','v2','o','os:a','u','a','first-a',NULL),('b','v2','o','os:b','u','b','first-b','last-b')")
+            .execute(&pool).await.unwrap();
+        pool.close().await;
+
+        let kv = KvStore::open(&path).await.unwrap();
+        let rows = kv.os_partitions_for("u").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].owner_key, "a");
+        assert_eq!(rows[0].key_version, "v2");
+        assert_eq!(rows[0].org_id, "o");
+        assert_eq!(rows[0].space_id, "os:a");
+        assert_eq!(rows[0].logical_user, "u");
+        assert_eq!(rows[0].module_name, "a");
+        assert_eq!(rows[0].first_seen_at, "first-a");
+        assert_eq!(rows[0].last_seen_at, None);
+        assert_eq!(rows[1].owner_key, "b");
+        assert_eq!(rows[1].key_version, "v2");
+        assert_eq!(rows[1].org_id, "o");
+        assert_eq!(rows[1].space_id, "os:b");
+        assert_eq!(rows[1].logical_user, "u");
+        assert_eq!(rows[1].module_name, "b");
+        assert_eq!(rows[1].first_seen_at, "first-b");
+        assert_eq!(rows[1].last_seen_at.as_deref(), Some("last-b"));
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT space_kind FROM mem_os_partitions ORDER BY owner_key")
+                .fetch_all(&kv.pool)
+                .await
+                .unwrap();
+        assert_eq!(kinds, ["module", "module"]);
+        let nullable: i64 = sqlx::query_scalar("SELECT \"notnull\" FROM pragma_table_info('mem_os_partitions') WHERE name='space_kind'")
+            .fetch_one(&kv.pool).await.unwrap();
+        assert_eq!(nullable, 1);
+        let duplicate = sqlx::query("INSERT INTO mem_os_partitions (owner_key,key_version,org_id,space_id,logical_user,module_name,first_seen_at,last_seen_at) VALUES ('c','v2','o','os:a','u','c','t',NULL)")
+            .execute(&kv.pool).await;
+        assert!(matches!(duplicate.unwrap_err(), sqlx::Error::Database(e)
+            if e.code().as_deref() == Some("2067")));
+        let fk = sqlx::query("INSERT INTO mem_os_partitions (owner_key,key_version,org_id,space_id,logical_user,module_name,first_seen_at,last_seen_at) VALUES ('c','v2','missing','os:c','u','c','t',NULL)")
+            .execute(&kv.pool).await;
+        assert!(matches!(fk.unwrap_err(), sqlx::Error::Database(e)
+            if e.code().as_deref() == Some("787")));
+        for invalid in [Some("other"), Some(""), None] {
+            let result = sqlx::query("INSERT INTO mem_os_partitions (owner_key,key_version,org_id,space_id,logical_user,module_name,first_seen_at,last_seen_at,space_kind) VALUES ('c','v2','o','os:c','u','c','t',NULL,?)")
+                .bind(invalid).execute(&kv.pool).await;
+            assert!(result.is_err(), "invalid space_kind {invalid:?} accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_0016_records_personal_partition_idempotently() {
+        let kv = KvStore::open_memory().await.unwrap();
+        let org = kv.ensure_org_for_user("alice").await.unwrap();
+        let key = "usr:alice";
+        let id = OsPartitionIdentity {
+            owner_key: key,
+            key_version: "v2",
+            org_id: &org,
+            space_id: key,
+            user: "alice",
+            module: "@agent",
+        };
+        kv.record_personal_partition(id).await.unwrap();
+        kv.record_personal_partition(id).await.unwrap();
+        assert!(
+            kv.record_os_partition(id).await.is_err(),
+            "module upsert must not reinterpret a personal row"
+        );
+        let wrong_module = OsPartitionIdentity {
+            module: "ordinary-module",
+            ..id
+        };
+        assert!(kv.record_personal_partition(wrong_module).await.is_err());
+        let rows = kv.os_partitions_for("alice").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].module_name, "@agent");
+        assert_eq!(rows[0].space_kind, "personal");
+    }
+
+    #[tokio::test]
+    async fn migration_0016_failure_rolls_back_and_reopens_at_0015() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback.db");
+        let pool = pool_migrated_up_to(&path, 16).await;
+        let mut migrator = sqlx::migrate!("./migrations");
+        let migrations = migrator.migrations.to_mut();
+        migrations.retain(|m| m.version <= 16);
+        let failing = migrations.iter_mut().find(|m| m.version == 16).unwrap();
+        failing
+            .sql
+            .to_mut()
+            .push_str("\nSELECT * FROM table_that_does_not_exist;");
+        assert!(migrator.run(&pool).await.is_err());
+        pool.close().await;
+
+        let reopened = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                    .unwrap()
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        let version: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        assert_eq!(version, 15);
+        let columns = sqlx::query("PRAGMA table_info(mem_os_partitions)")
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+        assert!(
+            !columns
+                .iter()
+                .any(|r| r.get::<String, _>("name") == "space_kind")
+        );
+        reopened.close().await;
+        let upgraded = KvStore::open(&path).await.unwrap();
+        let version: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&upgraded.pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 16);
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);
@@ -2093,6 +2265,226 @@ mod tests {
 }
 
 #[cfg(test)]
+mod forget_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::assertion::{Assertion, AssertionStore, Forget};
+    use crate::event::{EventQuery, EventStore, Scope};
+    use crate::retriever::Retriever;
+    use sha2::{Digest, Sha256};
+
+    async fn setup(owner: &str) -> KvStore {
+        let kv = KvStore::open_memory().await.unwrap();
+        kv.assertions()
+            .assert(&Assertion::new(
+                "a1",
+                Scope::owner(owner),
+                "favorite_color",
+                "is",
+                serde_json::json!("blue"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        kv
+    }
+
+    async fn events(kv: &KvStore, owner: &str) -> Vec<event::StoredEvent> {
+        kv.events().scan(&EventQuery::owner(owner)).await.unwrap()
+    }
+
+    fn retract_id(owner: &str, id: &str) -> String {
+        let input = serde_json::to_string(&["retract", owner, id]).unwrap();
+        let hash = Sha256::digest(input.as_bytes());
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn forget_records_timestamp_and_one_correct_retraction_event() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("recorded_to").as_deref(),
+            Some("t2")
+        );
+        let events = events(&kv, "alice").await;
+        assert_eq!(events.len(), 1);
+        let e = &events[0].event;
+        assert_eq!(e.id, retract_id("alice", "a1"));
+        assert_eq!(e.kind, "assertion.retracted");
+        assert_eq!(e.scope.owner, "alice");
+        assert_eq!(e.body["assertion_id"], "a1");
+        assert_eq!(e.at, "t2");
+    }
+
+    #[tokio::test]
+    async fn forget_repeat_keeps_original_timestamp_and_one_event() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
+        assert_eq!(
+            kv.forget("alice", "a1", "t3").await.unwrap(),
+            Forget::AlreadyForgotten
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("recorded_to").as_deref(),
+            Some("t2")
+        );
+        let ev = events(&kv, "alice").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].event.at, "t2");
+    }
+
+    #[tokio::test]
+    async fn forget_foreign_owner_and_missing_id_are_not_found_without_side_effects() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("bob", "a1", "t4").await.unwrap(),
+            Forget::NotFound
+        );
+        assert_eq!(
+            kv.forget("alice", "missing", "t4").await.unwrap(),
+            Forget::NotFound
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("recorded_to"), None);
+        assert!(events(&kv, "alice").await.is_empty());
+        assert!(events(&kv, "bob").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_quota_failure_keeps_assertion_live_and_can_retry() {
+        let kv = setup("alice").await;
+        sqlx::query("UPDATE mem_owner_quota SET max_rows=0 WHERE owner='*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            kv.forget("alice", "a1", "t2").await,
+            Err(MemoryError::QuotaExceeded { .. })
+        ));
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("recorded_to"), None);
+        assert!(events(&kv, "alice").await.is_empty());
+        sqlx::query("UPDATE mem_owner_quota SET max_rows=100 WHERE owner='*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.forget("alice", "a1", "t3").await.unwrap(),
+            Forget::Forgotten
+        );
+        assert_eq!(events(&kv, "alice").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forgotten_assertion_stays_out_of_search_after_rebuild() {
+        let kv = setup("alice").await;
+        let retriever = kv.retriever();
+        assert_eq!(
+            retriever.search("blue", "alice", 10).await.unwrap().len(),
+            1
+        );
+        kv.forget("alice", "a1", "t2").await.unwrap();
+        assert!(
+            retriever
+                .search("blue", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        retriever.rebuild().await.unwrap();
+        assert!(
+            retriever
+                .search("blue", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // TODO: T09/T07a integration in docs/agent/M1-PLAN-v2.md adds `search_any` coverage.
+    }
+
+    #[tokio::test]
+    async fn forget_retraction_ids_do_not_collide_across_owner_and_assertion_id() {
+        let kv = KvStore::open_memory().await.unwrap();
+        let store = kv.assertions();
+        for (owner, id) in [("alice", "xa1"), ("alicex", "a1")] {
+            store
+                .assert(&Assertion::new(
+                    id,
+                    Scope::owner(owner),
+                    "favorite_color",
+                    "is",
+                    serde_json::json!("blue"),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let retriever = kv.retriever();
+        for owner in ["alice", "alicex"] {
+            assert_eq!(retriever.search("blue", owner, 10).await.unwrap().len(), 1);
+        }
+        for (owner, id) in [("alice", "xa1"), ("alicex", "a1")] {
+            assert_eq!(kv.forget(owner, id, "t2").await.unwrap(), Forget::Forgotten);
+            assert_eq!(
+                kv.forget(owner, id, "t3").await.unwrap(),
+                Forget::AlreadyForgotten
+            );
+        }
+        for owner in ["alice", "alicex"] {
+            let events = events(&kv, owner).await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.kind, "assertion.retracted");
+        }
+        assert_ne!(
+            events(&kv, "alice").await[0].event.id,
+            events(&kv, "alicex").await[0].event.id
+        );
+        for owner in ["alice", "alicex"] {
+            assert!(
+                retriever
+                    .search("blue", owner, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        retriever.rebuild().await.unwrap();
+        for owner in ["alice", "alicex"] {
+            assert!(
+                retriever
+                    .search("blue", owner, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod session_log_tests {
     use super::*;
     use agent24_models::Msg;
@@ -2166,21 +2558,22 @@ mod session_log_tests {
     }
 
     #[tokio::test]
-    async fn turn_is_atomic_idempotent_and_conflict_checked() -> Result<()> {
+    async fn turn_rejects_incomplete_event_pair() -> Result<()> {
         let kv = KvStore::open_memory().await?;
         let (o, s) = ("owner", "s");
-        let a = assistant("answer");
+        let assistant = assistant("answer");
         let occupied = MemEvent::new(
             turn_id(o, s, 1, "assistant")?,
             Scope::owner(o).with_session(s),
             "message",
-            serde_json::to_value(&a)?,
+            serde_json::to_value(&assistant)?,
             origin(Trust::Model),
         );
         kv.events().append(&occupied).await?;
-        let log = kv.session_log();
+
+        // This only checks the pre-write conflict check; it does not prove transaction rollback.
         assert!(matches!(
-            append(&log, o, s, 1, "question", "answer").await,
+            append(&kv.session_log(), o, s, 1, "question", "answer").await,
             Err(MemoryError::Conflict(_))
         ));
         assert!(
@@ -2189,10 +2582,14 @@ mod session_log_tests {
                 .iter()
                 .all(|e| e.event.body["role"] != "user")
         );
-        sqlx::query("DELETE FROM mem_events WHERE id=?")
-            .bind(&occupied.id)
-            .execute(&kv.pool)
-            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_is_idempotent_and_conflict_checked() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let (o, s) = ("owner", "s");
+        let log = kv.session_log();
         let first = append(&log, o, s, 1, "question", "answer").await?;
         let retry = append(&log, o, s, 1, "question", "answer").await?;
         assert_eq!((first.user, first.assistant), (retry.user, retry.assistant));
@@ -2334,12 +2731,15 @@ mod session_log_tests {
         for rows in [0, 1] {
             let kv = KvStore::open_memory().await?;
             quota(&kv, "q", rows).await?;
+            // quota=1 rejects the second event write, so it verifies transaction rollback.
+            assert!(matches!(
+                append(&kv.session_log(), "q", "s", 1, "u", "a").await,
+                Err(MemoryError::QuotaExceeded { owner, dimension: "rows" }) if owner == "q"
+            ));
             assert!(
-                append(&kv.session_log(), "q", "s", 1, "u", "a")
-                    .await
-                    .is_err()
+                events(&kv, "q", "s").await?.is_empty(),
+                "quota={rows} must leave no partial turn"
             );
-            assert!(events(&kv, "q", "s").await?.is_empty());
         }
         Ok(())
     }

@@ -328,6 +328,7 @@ pub struct MemoryLease {
     /// two mounts would hand two modules keys from different orgs in one run.
     pub org: crate::os_memory::OrgId,
     pub kv: agent24_memory::KvStore,
+    authorizer: Arc<dyn crate::authz::Authorizer>,
 }
 
 impl MemoryLease {
@@ -362,6 +363,7 @@ impl MemoryLease {
             user: user.to_owned(),
             org,
             kv,
+            authorizer: Arc::new(crate::authz::ModulePrivateOnly),
         })
     }
     /// T8.5c-W-mount decision 4: the daemon-level OOP connection-admission
@@ -395,6 +397,23 @@ impl MemoryLease {
         Arc<crate::os_memory::OsScopedMemory>,
         crate::os_memory::OsMemoryPartition,
     )> {
+        let space = crate::os_memory::SpaceId::module_private(manifest.name());
+        let decision = self.authorizer.decide(&crate::authz::AccessRequest {
+            actor: crate::authz::Actor::User(&self.user),
+            module: manifest.name(),
+            space: &space,
+            // Lending gives a read/write handle, so request write access.
+            op: crate::authz::Op::Write,
+            scope: None,
+        });
+        if !decision.allow {
+            tracing::warn!(
+                module = manifest.name(),
+                reason = decision.reason,
+                "withholding the module's memory capability"
+            );
+            return None;
+        }
         match catalogue
             .ensure_recorded(&self.org, &self.user, manifest, &self.kv)
             .await
@@ -3705,6 +3724,128 @@ raise SystemExit(3)
     }
 
     // ---------- F1: memory partitions handed out by the MOUNTER ----------
+
+    struct DenyMemory;
+    impl crate::authz::Authorizer for DenyMemory {
+        fn decide(&self, req: &crate::authz::AccessRequest<'_>) -> crate::authz::Decision {
+            assert!(matches!(req.actor, crate::authz::Actor::User("alice")));
+            assert!(req.module.starts_with("denied"));
+            assert_eq!(
+                req.space,
+                &crate::os_memory::SpaceId::module_private(req.module)
+            );
+            assert!(matches!(req.op, crate::authz::Op::Write));
+            assert!(req.scope.is_none());
+            crate::authz::Decision {
+                allow: false,
+                reason: "test denial",
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authz_deny_withholds_in_process_memory_before_recording() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = crate::events::EventsHub::default();
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let mut lease = MemoryLease::open("alice", kv).await.unwrap();
+        lease.authorizer = Arc::new(DenyMemory);
+        let yaml = manifest_yaml("denied", "in_process_crate").replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [memory]",
+        );
+        let module = FakeModule::from_yaml(&yaml, false);
+        let (_, reports, partitions) = mount_all(
+            &[entry(module.clone())],
+            tmp.path(),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            Some(&lease),
+            Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Mounted);
+        assert!(module.ctx().unwrap().memory().is_none());
+        assert!(!reports[0].granted.contains(&"memory".to_owned()));
+        assert!(partitions.partitions().is_empty());
+        assert!(
+            crate::os_memory::OsMemoryCatalog::durable_for_org(&lease.kv, &lease.org)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authz_deny_withholds_oop_memory_before_recording_or_offering() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        let probe_module = PACKAGE_MODULE.replace(
+            "f.readline()\nwhile f.readline():\n    pass",
+            "init_resp = json.loads(f.readline())\nwith open('probe.json.tmp', 'w') as out: json.dump(init_resp.get('result', {}).get('offer', {}), out)\nos.replace('probe.json.tmp', 'probe.json')\nwhile f.readline():\n    pass",
+        );
+        write_package_with(&packages, "denied-oop", "[memory]", &probe_module);
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let kv = agent24_memory::KvStore::open(&tmp.path().join("mem.db"))
+            .await
+            .unwrap();
+        let mut lease = MemoryLease::open("alice", kv).await.unwrap();
+        lease.authorizer = Arc::new(DenyMemory);
+        let (_, reports, partitions) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            Some(&lease),
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "{:?}",
+            reports[0]
+        );
+        let probe_path = packages.join("denied-oop").join("probe.json");
+        let offer: serde_json::Value =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Ok(bytes) = std::fs::read(&probe_path) {
+                        break serde_json::from_slice(&bytes).unwrap();
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("OOP module writes initialize offer probe");
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+        let memory_was_offered = offer["provides"]
+            .as_array()
+            .expect("initialize offer contains a provides array")
+            .iter()
+            .any(|p| p.as_str().unwrap().starts_with("_a24/memory/"));
+        assert!(!memory_was_offered, "OOP offer: {offer}");
+        assert!(!reports[0].granted.contains(&"memory".to_owned()));
+        assert!(partitions.partitions().is_empty());
+        assert!(
+            crate::os_memory::OsMemoryCatalog::durable_for_org(&lease.kv, &lease.org)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn the_mounter_lends_each_module_its_own_memory_partition() {
