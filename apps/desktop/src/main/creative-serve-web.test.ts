@@ -8,13 +8,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CreativeServeWeb,
   CreativeViewRequestFence,
+  OPEN_DESIGN_PIN_VERSION,
   canonicalCreativeOrigin,
   classifyCreativeUrl,
   creativeChildEnvironment,
+  parseAgent24HeadlessReady,
+  resolveAgent24HeadlessLauncher,
   resolveOpenDesignCheckout,
 } from './creative-serve-web'
 
 class FakeChild extends EventEmitter {
+  pid = 4321
   stdout = new PassThrough()
   stderr = new PassThrough()
   stdin = new PassThrough()
@@ -42,6 +46,27 @@ function checkout(): string {
   const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-'))
   tempDirs.push(root)
   return materializeCheckout(root)
+}
+
+function packagedHeadlessRuntime(): { resources: string; stateRoot: string; runtimeExecutable: string } {
+  const root = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-headless-'))
+  tempDirs.push(root)
+  const resources = path.join(root, 'resources')
+  const stateRoot = path.join(root, 'state')
+  const runtimeExecutable = path.join(root, 'Agent24')
+  fs.mkdirSync(path.join(resources, 'app', 'prebundled'), { recursive: true })
+  fs.mkdirSync(path.join(resources, 'open-design'), { recursive: true })
+  fs.writeFileSync(path.join(resources, 'app', 'prebundled', 'agent24-headless.cjs'), '')
+  fs.writeFileSync(runtimeExecutable, '')
+  return { resources, stateRoot, runtimeExecutable }
+}
+
+function headlessReady(ownerPid: number, webPort: number, daemonPort: number, instanceId = 'creative-1') {
+  return {
+    type: 'ready', protocol: 1, instanceId, pinVersion: OPEN_DESIGN_PIN_VERSION,
+    webOrigin: `http://127.0.0.1:${webPort}`, daemonOrigin: `http://127.0.0.1:${daemonPort}`,
+    ownership: { ownerPid, kind: 'process-tree' },
+  }
 }
 
 afterEach(() => {
@@ -116,6 +141,23 @@ describe('CreativeServeWeb', () => {
     expect(resolveOpenDesignCheckout('/unused', { A24_OPEN_DESIGN_DIR: explicit }, resources)).toBe(explicit)
   })
 
+  it('discovers only the stable packaged Agent24 headless launcher path', () => {
+    const { resources } = packagedHeadlessRuntime()
+    expect(resolveAgent24HeadlessLauncher(resources)).toBe(
+      path.join(resources, 'app', 'prebundled', 'agent24-headless.cjs'),
+    )
+    expect(resolveAgent24HeadlessLauncher(path.join(resources, 'missing'))).toBeNull()
+  })
+
+  it('validates the exact headless readiness contract', () => {
+    const ready = headlessReady(4321, 17456, 17457)
+    expect(parseAgent24HeadlessReady(ready, OPEN_DESIGN_PIN_VERSION, 4321)).toEqual(ready)
+    expect(() => parseAgent24HeadlessReady({ ...ready, pinVersion: 'other' }, OPEN_DESIGN_PIN_VERSION, 4321)).toThrow('pin version')
+    expect(() => parseAgent24HeadlessReady({ ...ready, ownership: { ...ready.ownership, ownerPid: 999 } }, OPEN_DESIGN_PIN_VERSION, 4321)).toThrow('ownership')
+    expect(() => parseAgent24HeadlessReady({ ...ready, webOrigin: 'http://example.com:17456' }, OPEN_DESIGN_PIN_VERSION, 4321)).toThrow('127.0.0.1')
+    expect(() => parseAgent24HeadlessReady({ ...ready, secret: 'must-not-exist' }, OPEN_DESIGN_PIN_VERSION, 4321)).toThrow('unsupported field')
+  })
+
   it('removes Agent24 host variables from the Creative child environment', () => {
     const childEnv = creativeChildEnvironment({
       PATH: '/usr/bin',
@@ -186,6 +228,136 @@ describe('CreativeServeWeb', () => {
 
     await expect(service.stop()).resolves.toEqual({ state: 'stopped' })
     expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('launches the packaged headless adapter with host-managed roots and a sanitized environment', async () => {
+    const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      {
+        resourcesPath: resources,
+        stateRoot,
+        runtimeExecutable,
+        environment: {
+          PATH: '/usr/bin',
+          OPENAI_API_KEY: 'provider-secret',
+          A24_HANDSHAKE_TOKEN: 'host-secret',
+        },
+        readyTimeoutMs: 500,
+      },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17456, 17457))}\n`)
+
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17456' })
+    const configPath = path.join(stateRoot, 'agent24-headless.json')
+    expect(spawnFn).toHaveBeenCalledWith(
+      runtimeExecutable,
+      [path.join(resources, 'app', 'prebundled', 'agent24-headless.cjs'), '--config', configPath],
+      expect.objectContaining({
+        cwd: resources,
+        env: {
+          PATH: '/usr/bin',
+          OPENAI_API_KEY: 'provider-secret',
+          ELECTRON_RUN_AS_NODE: '1',
+        },
+      }),
+    )
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual({
+      protocol: 1,
+      pinVersion: OPEN_DESIGN_PIN_VERSION,
+      resourceRoot: path.join(resources, 'open-design'),
+      dataRoot: path.join(stateRoot, 'data'),
+      runtimeRoot: path.join(stateRoot, 'runtime'),
+      runtimeExecutable,
+    })
+    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:17456/api/ready')
+    await service.stop()
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('fails closed on an invalid packaged ready line before probing the web origin', async () => {
+    const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      { resourcesPath: resources, stateRoot, runtimeExecutable, readyTimeoutMs: 500 },
+      vi.fn(() => child as unknown as ChildProcess) as never,
+      fetchFn,
+    )
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify({ ...headlessReady(child.pid, 17456, 17457), webOrigin: 'http://example.com:17456' })}\n`)
+    await expect(starting).resolves.toMatchObject({ state: 'failed', error: expect.stringContaining('127.0.0.1') })
+    expect(fetchFn).not.toHaveBeenCalled()
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('supersedes a packaged start cleanly when restart stops it during readiness', async () => {
+    const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const first = new FakeChild()
+    const second = new FakeChild()
+    second.pid = 4322
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(first as unknown as ChildProcess)
+      .mockReturnValueOnce(second as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      { resourcesPath: resources, stateRoot, runtimeExecutable, readyTimeoutMs: 500 },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const staleStart = service.start()
+    await service.stop()
+    await expect(staleStart).resolves.toEqual({ state: 'stopped' })
+    const restarted = service.start()
+    second.stdout.write(`${JSON.stringify(headlessReady(second.pid, 17458, 17459, 'creative-2'))}\n`)
+    await expect(restarted).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17458' })
+    expect(spawnFn).toHaveBeenCalledTimes(2)
+    await service.stop()
+  })
+
+  it('serializes starts behind a slow packaged stop and never force-kills only the owner', async () => {
+    const { resources, stateRoot, runtimeExecutable } = packagedHeadlessRuntime()
+    const child = new FakeChild()
+    child.kill = vi.fn(() => true)
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const service = new CreativeServeWeb(
+      { resourcesPath: resources, stateRoot, runtimeExecutable, readyTimeoutMs: 500 },
+      spawnFn as never,
+      vi.fn(async () => new Response('{}', { status: 200 })),
+    )
+    const starting = service.start()
+    child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17460, 17461, 'creative-slow'))}\n`)
+    await expect(starting).resolves.toEqual({ state: 'ready', origin: 'http://127.0.0.1:17460' })
+
+    vi.useFakeTimers()
+    try {
+      const stopping = service.stop()
+      const concurrentStart = service.start()
+      expect(spawnFn).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(60_000)
+      const failed = {
+        state: 'failed',
+        error: 'Open Design headless launcher did not stop within 60000ms; refusing an owner-only force kill',
+      }
+      await expect(stopping).resolves.toEqual(failed)
+      await expect(concurrentStart).resolves.toEqual(failed)
+      expect(spawnFn).toHaveBeenCalledTimes(1)
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+      expect(child.kill).not.toHaveBeenCalledWith('SIGKILL')
+
+      child.exitCode = 0
+      child.emit('exit', 0, null)
+      expect(service.status()).toEqual({ state: 'stopped' })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('shares one in-flight launch across concurrent start calls', async () => {
