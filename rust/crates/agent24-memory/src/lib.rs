@@ -291,6 +291,7 @@ impl KvStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        Self::rebuild_fts_if_needed(&pool).await?;
         Ok(Self {
             pool,
             oop_admission: Some(Arc::new(tokio::sync::Semaphore::new(
@@ -315,6 +316,7 @@ impl KvStore {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        Self::rebuild_fts_if_needed(&pool).await?;
         // T8.5c-W-mount decision 4: this pool's one connection is already
         // needed by the in-process path, so there is no headroom to lend an
         // out-of-process caller — `oop_admission` stays `None`, not
@@ -325,6 +327,17 @@ impl KvStore {
             pool,
             oop_admission: None,
         })
+    }
+
+    async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
+                .fetch_optional(pool)
+                .await?;
+        if marker.as_deref() == Some("1") {
+            retriever::FtsRetriever::new(pool.clone()).rebuild().await?;
+        }
+        Ok(())
     }
 
     /// T8.5c-W-mount decision 4: the daemon-level connection-admission
@@ -1073,6 +1086,7 @@ mod tests {
 
     use super::*;
     use crate::event::EventStore as _;
+    use crate::retriever::Retriever as _;
     use serde::Deserialize;
 
     #[tokio::test]
@@ -1468,6 +1482,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_0017_rebuilds_cjk_fts_for_existing_assertions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let pool = pool_migrated_up_to(&path, 17).await;
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 16);
+        for (id, text) in [
+            ("cjk", "我对花生过敏"),
+            ("vitamin", "维生素B12"),
+            ("rust", "我喜欢Rust编程"),
+        ] {
+            sqlx::query(
+                "INSERT INTO mem_assertions
+                     (id, scope_owner, scope, subject, predicate, object, valid_from,
+                      recorded_from, evidence, confidence, modality, writer_version, qualified)
+                 VALUES (?, 'alice', '{\"owner\":\"alice\"}', 'user', 'said',
+                         ?, '2026-01-01', '2026-01-01', '[]', 1.0, 'said', 'test', 1)",
+            )
+            .bind(id)
+            .bind(serde_json::to_string(text).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Before 0017, the legacy trigger indexes each mixed string as one
+        // unicode61 token, so complete-string MATCH remains supported.
+        for (token, id) in [("维生素B12", "vitamin"), ("我喜欢Rust编程", "rust")] {
+            let hits: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM mem_assertions_fts WHERE mem_assertions_fts MATCH ? AND id = ?",
+            )
+            .bind(format!("\"{token}\""))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(hits, 1, "legacy index should retain {token} as a token");
+        }
+        pool.close().await;
+
+        for _ in 0..2 {
+            let kv = KvStore::open(&path).await.unwrap();
+            assert_eq!(
+                kv.retriever()
+                    .search_any("我对什么过敏？", "alice", 5)
+                    .await
+                    .unwrap()[0]
+                    .assertion
+                    .id,
+                "cjk"
+            );
+            let retriever = kv.retriever();
+            for (query, id) in [("你用Rust吗", "rust"), ("Should I take B12?", "vitamin")] {
+                let hits = retriever.search_any(query, "alice", 5).await.unwrap();
+                assert_eq!(hits.len(), 1, "mixed query should uniquely find {id}");
+                assert_eq!(hits[0].assertion.id, id, "mixed query: {query}");
+            }
+            for (query, id) in [("维生素B12", "vitamin"), ("我喜欢Rust编程", "rust")] {
+                assert_eq!(
+                    retriever.search(query, "alice", 5).await.unwrap()[0]
+                        .assertion
+                        .id,
+                    id,
+                    "AND search should retain full-token matching for {query}"
+                );
+                assert_eq!(
+                    retriever.search_any(query, "alice", 5).await.unwrap()[0]
+                        .assertion
+                        .id,
+                    id,
+                    "OR search should retain full-token matching for {query}"
+                );
+                assert!(
+                    retriever
+                        .search(&format!("{query} missing"), "alice", 5)
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "search must keep its AND semantics"
+                );
+            }
+            let marker: Option<String> =
+                sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
+                    .fetch_optional(&kv.pool)
+                    .await
+                    .unwrap();
+            assert_ne!(marker.as_deref(), Some("1"));
+        }
+    }
+
+    #[tokio::test]
     async fn migration_0016_preserves_rows_and_adds_personal_kind() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.db");
@@ -1608,7 +1716,7 @@ mod tests {
                 .fetch_one(&upgraded.pool)
                 .await
                 .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
     }
 
     struct FrozenClock(std::sync::atomic::AtomicU64);
@@ -2400,15 +2508,53 @@ mod forget_tests {
     #[tokio::test]
     async fn forgotten_assertion_stays_out_of_search_after_rebuild() {
         let kv = setup("alice").await;
+        kv.assertions()
+            .assert(&Assertion::new(
+                "a2",
+                Scope::owner("alice"),
+                "favorite_color",
+                "is",
+                serde_json::json!("green"),
+                vec![],
+            ))
+            .await
+            .unwrap();
         let retriever = kv.retriever();
         assert_eq!(
             retriever.search("blue", "alice", 10).await.unwrap().len(),
             1
         );
-        kv.forget("alice", "a1", "t2").await.unwrap();
+        let before = retriever
+            .search_any("blue missing", "alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].assertion.id, "a1");
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
         assert!(
             retriever
                 .search("blue", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            retriever
+                .search_any("blue missing", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        sqlx::query("DELETE FROM mem_assertions_fts")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert!(
+            retriever
+                .search("green", "alice", 10)
                 .await
                 .unwrap()
                 .is_empty()
@@ -2421,7 +2567,19 @@ mod forget_tests {
                 .unwrap()
                 .is_empty()
         );
-        // TODO: T09/T07a integration in docs/agent/M1-PLAN-v2.md adds `search_any` coverage.
+        assert!(
+            retriever
+                .search_any("blue missing", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let live = retriever
+            .search_any("green missing", "alice", 10)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].assertion.id, "a2");
     }
 
     #[tokio::test]

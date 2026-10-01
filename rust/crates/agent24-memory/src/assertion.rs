@@ -283,6 +283,15 @@ impl AssertionLedger {
         .bind(i64::from(a.qualified))
         .execute(&mut *conn)
         .await?;
+        crate::retriever::FtsRetriever::index_tx(
+            conn,
+            &a.id,
+            &a.scope.owner,
+            &a.subject,
+            &a.predicate,
+            &object,
+        )
+        .await?;
         Ok(())
     }
 
