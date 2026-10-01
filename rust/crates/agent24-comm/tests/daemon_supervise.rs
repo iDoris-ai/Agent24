@@ -41,6 +41,93 @@ case "$1" in
 esac
 "#;
 
+/// Same `identity`/`relay` answers as [`DAEMON_SCRIPT`], but the `daemon`
+/// leader forks a helper that **ignores SIGTERM** and keeps touching a
+/// marker file, then itself `exec`s into `sleep 9999` and stays up — for
+/// proving a `stop`/`shutdown` cleans up the whole process group, not just
+/// the leader (PR #626 review, High #1: reaping the leader before every
+/// real signal has gone out could free its pid for reuse and let the final
+/// SIGKILL miss this group entirely).
+const DAEMON_SCRIPT_HELPER_STAYS: &str = r#"#!/bin/sh
+case "$1" in
+  identity)
+    echo '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    echo '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    ( trap '' TERM ; while : ; do touch "$HOME/.hyphae/helper-alive" ; sleep 0.05 ; done ) &
+    exec sleep 9999
+    ;;
+esac
+"#;
+
+/// Same helper as [`DAEMON_SCRIPT_HELPER_STAYS`], but the leader does NOT
+/// stay up: it exits on its own (not killed by us) a third of a second in —
+/// for proving a descendant is cleaned up on a NATURAL leader exit too, not
+/// only on an explicit `stop` (PR #626 review, Medium #3: the previous
+/// version reaped the leader as the very mechanism used to detect this exit
+/// and went straight to backoff, leaving the helper unsupervised).
+///
+/// Exits 1 (`gave_up`, never retried, COMM-HYPHAE.md §6.1), deliberately:
+/// an exit code that DID retry would spawn a SECOND generation — with its
+/// own helper touching the exact same marker file — within roughly
+/// `grace + BASE_BACKOFF` of the first, which raced the test's own
+/// "did it stay dead" check against a brand new, unrelated helper.
+const DAEMON_SCRIPT_HELPER_THEN_EXIT: &str = r#"#!/bin/sh
+case "$1" in
+  identity)
+    echo '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    echo '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    ( trap '' TERM ; while : ; do touch "$HOME/.hyphae/helper-alive" ; sleep 0.05 ; done ) &
+    sleep 0.3
+    exit 1
+    ;;
+esac
+"#;
+
+/// Same `identity`/`relay` answers again; the `daemon` leader sleeps for a
+/// third of a second — comfortably longer than a shortened `ready_after` —
+/// and then exits with a code that is neither 1 nor 3, for proving an exit
+/// during `starting` is classified exactly like one during `running`, and
+/// that `running` is never reported first (PR #626 review, Medium #6).
+const DAEMON_SCRIPT_SLOW_DEATH: &str = r#"#!/bin/sh
+case "$1" in
+  identity)
+    echo '{"ok":true,"data":[{"nickname":"alice","npub":"npub1x","default":true,"encrypted":true}]}'
+    exit 0
+    ;;
+  relay)
+    echo '{"ok":true,"data":{"relays":["wss://relay.example"],"source":"config"}}'
+    exit 0
+    ;;
+  daemon)
+    cat > /dev/null
+    sleep 0.3
+    exit 7
+    ;;
+esac
+"#;
+
+/// Short enough that `wait_until(.., Duration::from_secs(2))` below still has
+/// margin after the `starting` -> `running` promotion (COMM-HYPHAE.md §6.1's
+/// real 3s would blow every existing timeout in this file).
+const TEST_READY_AFTER: Duration = Duration::from_millis(150);
+/// Short SIGTERM-to-SIGKILL grace for these fixtures: none of them ignore
+/// TERM, so this only bounds how long a stop/shutdown call can take.
+const TEST_GRACE: Duration = Duration::from_millis(500);
+
 async fn install(dir: &Path, script: &str) -> VerifiedBinary {
     let source = dir.join("hyphae-fake.sh");
     tokio::fs::write(&source, script).await.unwrap();
@@ -52,6 +139,10 @@ async fn install(dir: &Path, script: &str) -> VerifiedBinary {
 }
 
 async fn make_ctx(dir: &Path) -> DaemonCtx {
+    make_ctx_with_script(dir, DAEMON_SCRIPT).await
+}
+
+async fn make_ctx_with_script(dir: &Path, script: &str) -> DaemonCtx {
     let home = dir.join("hyphae-home");
     tokio::fs::create_dir_all(home.join(".hyphae"))
         .await
@@ -62,7 +153,7 @@ async fn make_ctx(dir: &Path) -> DaemonCtx {
     )
     .await
     .unwrap();
-    let bin = install(dir, DAEMON_SCRIPT).await;
+    let bin = install(dir, script).await;
     let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(5)));
     let store = Arc::new(MemoryPasswordStore::new());
     store
@@ -78,6 +169,9 @@ async fn make_ctx(dir: &Path) -> DaemonCtx {
         home,
         pid_path: dir.join("hyphae-daemon.pid"),
         log_path: dir.join("logs").join("hyphae-daemon.log"),
+        autostart_path: dir.join("daemon-autostart.json"),
+        grace: TEST_GRACE,
+        ready_after: TEST_READY_AFTER,
     }
 }
 
@@ -85,6 +179,19 @@ async fn read_pid(path: &Path) -> u32 {
     let bytes = tokio::fs::read(path).await.unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     value["pid"].as_u64().unwrap() as u32
+}
+
+/// The helper fixtures above stop touching their marker file — measured as
+/// "the mtime stops advancing", since the file itself remains. Same shape as
+/// `agent24-os-proto`'s `supervise.rs` test helper of the same purpose.
+async fn marker_stopped_advancing(path: &Path) -> bool {
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let settle = std::time::SystemTime::now();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    !std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t > settle)
+        .unwrap_or(true)
 }
 
 async fn wait_until<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
@@ -187,6 +294,9 @@ esac
         home,
         pid_path: dir.join("hyphae-daemon.pid"),
         log_path: dir.join("logs").join("hyphae-daemon.log"),
+        autostart_path: dir.join("daemon-autostart.json"),
+        grace: TEST_GRACE,
+        ready_after: TEST_READY_AFTER,
     };
     let pid_path = dir.join("hyphae-daemon.pid");
     let sup = HyphaeDaemonSupervisor::spawn(ctx);
@@ -226,7 +336,9 @@ async fn config_change_bumps_generation_without_touching_failures() {
         0,
         "a config-change restart must not count as a failure"
     );
-    assert_eq!(sup.status().state, "running");
+    // COMM-HYPHAE.md §6.1: the restart re-enters `starting` first, same as
+    // any other spawn; it only reaches `running` after `ready_after`.
+    assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
     let second_pid = read_pid(&pid_path).await;
     assert_ne!(
         first_pid, second_pid,
@@ -430,4 +542,244 @@ async fn reap_orphan_kills_a_live_pid_whose_start_time_matches() {
     let _ = child.wait();
     assert!(!is_alive(pid));
     assert!(!pid_path.exists());
+}
+
+// ---------------------------------------------------------------------
+// PR #626 review, High #1: stop/shutdown must clean up the WHOLE group,
+// never reaping the leader before every real signal has gone out.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn stop_kills_a_helper_the_leader_left_behind_in_its_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_HELPER_STAYS).await;
+    let marker = ctx.home.join(".hyphae").join("helper-alive");
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| marker.exists(), Duration::from_secs(2)).await,
+        "the fixture's helper never started"
+    );
+
+    sup.stop().await;
+    assert_eq!(sup.status().state, "stopped");
+    assert!(
+        marker_stopped_advancing(&marker).await,
+        "a helper that ignores SIGTERM must not outlive `stop`: reaping the leader before \
+         every real signal has gone out could let its pid be reused and the final SIGKILL \
+         miss this group entirely (PR #626 review, High #1)"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_kills_a_helper_the_leader_left_behind_in_its_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_HELPER_STAYS).await;
+    let marker = ctx.home.join(".hyphae").join("helper-alive");
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| marker.exists(), Duration::from_secs(2)).await,
+        "the fixture's helper never started"
+    );
+
+    let outcome = sup.shutdown().await;
+    assert!(outcome.had_process);
+    assert!(
+        marker_stopped_advancing(&marker).await,
+        "agent24d's SHUT-1b shutdown path must clean up a straggling helper too, same as a \
+         plain `stop` (PR #626 review, High #1)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// PR #626 review, Medium #3: a NATURAL leader exit must clean up whatever
+// the leader left running in its group before the restart loop proceeds.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_natural_leader_exit_still_cleans_up_a_descendant_it_left_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_HELPER_THEN_EXIT).await;
+    let pid_path = ctx.pid_path.clone();
+    let marker = ctx.home.join(".hyphae").join("helper-alive");
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert!(
+        wait_until(|| marker.exists(), Duration::from_secs(2)).await,
+        "the fixture's helper never started"
+    );
+
+    // The leader exits ON ITS OWN, ~0.3s in — nobody here signals it. Exit
+    // code 1 is never retried (COMM-HYPHAE.md §6.1), so no second
+    // generation's helper can start touching the same marker while this
+    // test is still checking the first one (see the fixture's own comment).
+    assert!(
+        wait_until(|| sup.status().state == "gave_up", Duration::from_secs(3)).await,
+        "the supervisor never noticed the leader's natural exit"
+    );
+    assert!(
+        marker_stopped_advancing(&marker).await,
+        "a descendant the leader left running must not survive its NATURAL exit either — \
+         left unsupervised, it collides with the next restart's generation (PR #626 review, \
+         Medium #3)"
+    );
+    assert!(
+        !pid_path.exists(),
+        "the pid file must be cleared once the leader's exit (and group cleanup) is handled"
+    );
+}
+
+// ---------------------------------------------------------------------
+// PR #626 review, Medium #6: `starting` must last at least `ready_after`,
+// and an exit before that must never be reported as `running`.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_exit_before_ready_after_is_classified_but_never_reported_as_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = make_ctx_with_script(tmp.path(), DAEMON_SCRIPT_SLOW_DEATH).await;
+    // Comfortably longer than the fixture's 0.3s sleep: the exit must land
+    // well inside `starting`.
+    ctx.ready_after = Duration::from_millis(1500);
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert_eq!(
+        sup.status().state,
+        "starting",
+        "a freshly spawned daemon must answer `starting`, not `running`, before it has \
+         survived `ready_after`"
+    );
+
+    let mut saw_running = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match sup.status().state {
+            "running" => saw_running = true,
+            "backoff" | "gave_up" => break,
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !saw_running,
+        "an exit before `ready_after` must never have been reported as `running` in between"
+    );
+    assert_eq!(
+        sup.status().state,
+        "backoff",
+        "exit code 7 (neither 1 nor 3) during `starting` must be classified exactly like \
+         one during `running`"
+    );
+}
+
+#[tokio::test]
+async fn surviving_ready_after_promotes_starting_to_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(tmp.path()).await;
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert_eq!(sup.status().state, "starting");
+    assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
+}
+
+// ---------------------------------------------------------------------
+// PR #626 review, Medium #4: a manual `start` resets the breaker.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn manual_start_resets_the_breaker_after_it_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(tmp.path()).await;
+    let pid_path = ctx.pid_path.clone();
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    sup.start().await.unwrap();
+    assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
+
+    for failures in 1..=4u32 {
+        let pid = read_pid(&pid_path).await;
+        kill_minus_9(pid);
+        // Wait for `backoff` FIRST: `running` is also this loop's starting
+        // state, so waiting only for `running | gave_up` could return
+        // immediately on the stale pre-kill status before the supervisor
+        // has even noticed the kill.
+        assert!(
+            wait_until(
+                || sup.status().state == "backoff" && sup.status().consecutive_failures == failures,
+                Duration::from_secs(2)
+            )
+            .await
+        );
+        assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(10)).await);
+    }
+    let pid = read_pid(&pid_path).await;
+    kill_minus_9(pid);
+    assert!(wait_until(|| sup.status().state == "gave_up", Duration::from_secs(2)).await);
+    assert_eq!(sup.status().consecutive_failures, 5);
+
+    // A manual start after the breaker trips.
+    sup.start().await.unwrap();
+    assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
+    assert_eq!(
+        sup.status().consecutive_failures,
+        0,
+        "a manual start must reset the breaker, not inherit a count tripped by an earlier, \
+         unrelated crash loop (PR #626 review, Medium #4)"
+    );
+
+    // One failure after the reset must back off ~500ms like a fresh policy
+    // would, not immediately re-trip the breaker as it would if the count
+    // from before the reset had carried over (it was already at 5).
+    let pid = read_pid(&pid_path).await;
+    let since_failure = std::time::Instant::now();
+    kill_minus_9(pid);
+    assert!(wait_until(|| sup.status().state == "backoff", Duration::from_secs(2)).await);
+    assert_eq!(sup.status().consecutive_failures, 1);
+    assert!(
+        wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await,
+        "expected a restart after the single post-reset failure"
+    );
+    assert!(
+        since_failure.elapsed() >= Duration::from_millis(350),
+        "{:?}",
+        since_failure.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------------
+// PR #626 review, Medium #5: `daemon.autostart` persistence (COMM-HYPHAE.md
+// §6.2). `comm_routes.rs` (agent24d) is what actually reads this file again
+// on the NEXT `agent24d` launch and decides whether to auto-start; this
+// crate owns writing it on manual start/stop, which is what is tested here.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn manual_start_persists_autostart_true_and_stop_persists_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(tmp.path()).await;
+    let autostart_path = ctx.autostart_path.clone();
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    assert!(
+        !agent24_comm::read_autostart(&autostart_path).await,
+        "nothing has started yet; autostart must default to false"
+    );
+
+    sup.start().await.unwrap();
+    assert!(
+        agent24_comm::read_autostart(&autostart_path).await,
+        "a successful manual start must persist autostart=true (COMM-HYPHAE.md §6.2)"
+    );
+
+    sup.stop().await;
+    assert!(
+        !agent24_comm::read_autostart(&autostart_path).await,
+        "a manual stop must persist autostart=false (COMM-HYPHAE.md §6.2)"
+    );
 }

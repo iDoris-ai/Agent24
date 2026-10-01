@@ -1383,10 +1383,31 @@ pub async fn serve(
             }))
             .collect();
         let params = stop_shutdown.params();
-        if tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain))
-            .await
-            .is_err()
-        {
+        // COMM-4a §6.2 / PR #626 review, High #2: comm's stop shares the
+        // SAME absolute deadline every other out-of-process module's stop
+        // does, and runs CONCURRENTLY with them — it used to run
+        // sequentially, AFTER this `timeout_at` had already elapsed, under
+        // its own unvalidated ~5s-default grace (vs. SHUT-1b's validated
+        // 500ms default): a Hyphae daemon that ignored SIGTERM could then
+        // have `agent24d` hit the watchdog and exit before Hyphae was ever
+        // sent SIGKILL or a shutdown record was written for it.
+        // `HyphaeDaemonSupervisor::shutdown` queues its `Cmd::Shutdown`
+        // (channel `send`) before this `.await` ever starts waiting on the
+        // reply, so if the shared deadline is hit below, the actor task
+        // keeps running the stop (TERM, grace, KILL, reap) to completion on
+        // its own schedule regardless of whether anything here is still
+        // waiting on its result.
+        let comm_shutdown = async {
+            match stopping_comm_daemon.get() {
+                Some(daemon) => Some(daemon.shutdown().await),
+                None => None,
+            }
+        };
+        let (supervisors_result, comm_result) = tokio::join!(
+            tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain)),
+            tokio::time::timeout_at(deadlines.modules, comm_shutdown),
+        );
+        if supervisors_result.is_err() {
             tracing::warn!(
                 "out-of-process modules were still stopping at the deadline; their supervisors \
                  were dropped (SIGKILL attempted, exit unconfirmed)"
@@ -1402,52 +1423,77 @@ pub async fn serve(
         // `agent24-os-proto` (COMM-HYPHAE.md §7's zero-run boundary), so the
         // translation from its own neutral `DaemonShutdownOutcome` into this
         // crate's `StopRecord` happens here, not there.
-        if let Some(daemon) = stopping_comm_daemon.get() {
-            let outcome = daemon.shutdown().await;
-            let leader = outcome.leader.map(|l| match l {
-                agent24_comm::ShutdownLeader::GoneBeforeTerm => {
-                    agent24_os_proto::stop_record::Leader::GoneBeforeTerm
-                }
-                agent24_comm::ShutdownLeader::ExitedInGrace => {
-                    agent24_os_proto::stop_record::Leader::ExitedInGrace
-                }
-                agent24_comm::ShutdownLeader::KilledAfterGrace => {
-                    agent24_os_proto::stop_record::Leader::KilledAfterGrace
-                }
-            });
-            // `StopRecord` has two private fields (`drain_began`,
-            // `abandoning`) not meant for a caller outside `agent24-os-proto`
-            // to set, so `..Default::default()` is unavailable here — plain
-            // field assignment on a `Default::default()` value only touches
-            // the public ones this comm translation actually has an opinion
-            // about.
-            let mut record = agent24_os_proto::stop_record::StopRecord::default();
-            record.process = Some(if outcome.had_process {
-                agent24_os_proto::stop_record::ProcessAtStop::Running
-            } else {
-                agent24_os_proto::stop_record::ProcessAtStop::None
-            });
-            record.leader = leader;
-            // `KilledAfterGrace` means `kill_group_gracefully` sent SIGKILL
-            // after the grace ran out but never re-confirmed the group was
-            // actually empty afterwards — recording `Gone` (= "confirmed
-            // empty") there would misreport a daemon possibly still stuck
-            // through SIGKILL as a clean shutdown (PR #626 review, Low).
-            // `GoneBeforeTerm`/`ExitedInGrace` both come from a loop that did
-            // observe the group disappear, so `Gone` is still correct there.
-            record.group = outcome.had_process.then(|| {
-                if leader == Some(agent24_os_proto::stop_record::Leader::KilledAfterGrace) {
-                    agent24_os_proto::stop_record::GroupEnd::KillAttempted
+        match comm_result {
+            Ok(None) => {}
+            Ok(Some(outcome)) => {
+                let leader = outcome.leader.map(|l| match l {
+                    agent24_comm::ShutdownLeader::GoneBeforeTerm => {
+                        agent24_os_proto::stop_record::Leader::GoneBeforeTerm
+                    }
+                    agent24_comm::ShutdownLeader::ExitedInGrace => {
+                        agent24_os_proto::stop_record::Leader::ExitedInGrace
+                    }
+                    agent24_comm::ShutdownLeader::KilledAfterGrace => {
+                        agent24_os_proto::stop_record::Leader::KilledAfterGrace
+                    }
+                });
+                // `StopRecord` has two private fields (`drain_began`,
+                // `abandoning`) not meant for a caller outside
+                // `agent24-os-proto` to set, so `..Default::default()` is
+                // unavailable here — plain field assignment on a
+                // `Default::default()` value only touches the public ones
+                // this comm translation actually has an opinion about.
+                let mut record = agent24_os_proto::stop_record::StopRecord::default();
+                record.process = Some(if outcome.had_process {
+                    agent24_os_proto::stop_record::ProcessAtStop::Running
                 } else {
-                    agent24_os_proto::stop_record::GroupEnd::Gone
-                }
-            });
-            record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped);
-            records.push((
-                "comm.hyphae".to_owned(),
-                crate::lifecycle::Reason::Shutdown,
-                record,
-            ));
+                    agent24_os_proto::stop_record::ProcessAtStop::None
+                });
+                record.leader = leader;
+                // `KilledAfterGrace` means `kill_group_gracefully` sent
+                // SIGKILL after the grace ran out but never re-confirmed the
+                // group was actually empty afterwards — recording `Gone`
+                // (= "confirmed empty") there would misreport a daemon
+                // possibly still stuck through SIGKILL as a clean shutdown
+                // (PR #626 review, Low). `GoneBeforeTerm`/`ExitedInGrace`
+                // both come from a loop that did observe the group
+                // disappear, so `Gone` is still correct there.
+                record.group = outcome.had_process.then(|| {
+                    if leader == Some(agent24_os_proto::stop_record::Leader::KilledAfterGrace) {
+                        agent24_os_proto::stop_record::GroupEnd::KillAttempted
+                    } else {
+                        agent24_os_proto::stop_record::GroupEnd::Gone
+                    }
+                });
+                record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped);
+                records.push((
+                    "comm.hyphae".to_owned(),
+                    crate::lifecycle::Reason::Shutdown,
+                    record,
+                ));
+            }
+            Err(_) => {
+                // The shared deadline was hit before comm's own stop
+                // replied. Its process group is still being cleaned up on
+                // the actor's own task either way (see the comment above) —
+                // this only means the OUTCOME could not be confirmed in
+                // time to record accurately, so the record says exactly
+                // that rather than guessing `Gone`.
+                tracing::warn!(
+                    "comm: the hyphae daemon's stop did not complete by the shared modules \
+                     deadline; its process group is still being cleaned up on the \
+                     supervisor's own task, but the outcome could not be confirmed in time \
+                     to record"
+                );
+                let mut record = agent24_os_proto::stop_record::StopRecord::default();
+                record.process = Some(agent24_os_proto::stop_record::ProcessAtStop::Running);
+                record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::CutOff);
+                records.push((
+                    "comm.hyphae".to_owned(),
+                    crate::lifecycle::Reason::Shutdown,
+                    record,
+                ));
+            }
         }
         let summary = crate::lifecycle::Summary::new(
             marker
@@ -1741,7 +1787,7 @@ pub async fn serve(
     // kernel auth exactly like every other module route, and so the wiring
     // itself lives in its own file (`comm_routes.rs`); see that file's own
     // doc comment for the `RESERVED_KERNEL_SEGMENTS` gap this leaves.
-    let (comm_router, comm_daemon) = crate::comm_routes::build(&state_dir).await;
+    let (comm_router, comm_daemon) = crate::comm_routes::build(&state_dir, params.stop_grace).await;
     if let Some(handle) = comm_daemon {
         // Best-effort: only `None` if this `set` races a shutdown that has
         // already read the cell, in which case the daemon this build() just

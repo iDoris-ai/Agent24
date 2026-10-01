@@ -202,6 +202,13 @@ async fn daemon_start_receives_a_real_message_then_stops() {
         home: home_a.clone(),
         pid_path: pid_path.clone(),
         log_path,
+        autostart_path: tmp.path().join("daemon-autostart.json"),
+        grace: Duration::from_secs(5),
+        // Shortened from the real `READY_AFTER_DEFAULT` (3s) so this test
+        // does not pay that on every round trip to a real binary; it is not
+        // exercising the readiness timer itself (`daemon_supervise.rs`
+        // covers that against the fake binary, deterministically).
+        ready_after: Duration::from_millis(150),
     }));
     let state = CommState::ready(runner.clone(), password_store, home_a.clone())
         .with_daemon(daemon.clone());
@@ -256,14 +263,29 @@ async fn daemon_start_receives_a_real_message_then_stops() {
     // ---- start A's daemon THROUGH THE ROUTE ----
     let (status, body) = call(&app, "POST", "/daemon/start", json!({})).await;
     assert_eq!(status, StatusCode::OK, "daemon start failed: {body:?}");
-    assert_eq!(body["data"]["process"]["state"], "running", "{body:?}");
-
-    let (status, body) = get(&app, "/daemon").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body["data"]["process"]["state"], "running",
-        "GET /comm/daemon should show running: {body:?}"
+    // COMM-HYPHAE.md §6.1: freshly spawned, this answers `starting` until it
+    // has stayed up for `ready_after` (shortened above so this test does
+    // not have to burn the real 3s on a round trip to a real binary).
+    assert!(
+        matches!(
+            body["data"]["process"]["state"].as_str(),
+            Some("starting" | "running")
+        ),
+        "{body:?}"
     );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut running = false;
+    while std::time::Instant::now() < deadline {
+        let (status, body) = get(&app, "/daemon").await;
+        assert_eq!(status, StatusCode::OK);
+        if body["data"]["process"]["state"] == "running" {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(running, "GET /comm/daemon never reported running");
 
     // ---- B sends a message to A ----
     let content = "daemon-joint-hello";

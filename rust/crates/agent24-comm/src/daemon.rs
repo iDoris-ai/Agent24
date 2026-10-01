@@ -45,9 +45,27 @@ use crate::runner::{Envelope, HyphaeRunner, Invocation, filtered_env};
 /// grows past this (COMM-HYPHAE.md §6.3; no rotation, M12).
 const LOG_TRUNCATE_CAP: u64 = 5 * 1024 * 1024;
 
-/// How long `kill_group_gracefully` waits after SIGTERM before SIGKILL.
-/// Named after the same env var the rest of `agent24d` already uses for
-/// module stop grace (COMM-HYPHAE.md §6.2).
+/// How long a freshly spawned daemon must stay up before it is promoted from
+/// `starting` to `running` (COMM-HYPHAE.md §6.1 "就绪判定": "存活满 3 s 记为
+/// running"). [`Ctx::ready_after`] lets a test shrink this; production
+/// callers (`comm_routes.rs`) use this constant.
+pub const READY_AFTER_DEFAULT: Duration = Duration::from_secs(3);
+
+/// How long `kill_group_gracefully` waits after SIGTERM before SIGKILL, as a
+/// **fallback default only** — `agent24d` passes the already-validated
+/// `agent24d::lifecycle::Params::stop_grace` into [`Ctx::grace`] instead of
+/// calling this.
+///
+/// Kept only for callers outside `agent24d` (and as the orphan-reap grace
+/// before a [`Ctx`] exists at all): it used to be the ONE grace this whole
+/// crate read, via its own raw, unvalidated parse of
+/// `A24_MODULE_STOP_GRACE_MS` with a 5s default — while `agent24d`'s own
+/// `lifecycle::Params` reads the exact same variable with a 500ms default
+/// and a 100ms..=5000ms clamp. Two different numbers under one variable name
+/// meant a running daemon's actual stop grace silently disagreed with the
+/// SHUT-1b deadline computed from the OTHER number (PR #626 review, High
+/// #2): `agent24d`'s shutdown could reach its watchdog before Hyphae had
+/// even been sent SIGKILL.
 #[must_use]
 pub fn stop_grace() -> Duration {
     std::env::var("A24_MODULE_STOP_GRACE_MS")
@@ -91,6 +109,57 @@ async fn write_pid_file(path: &Path, f: &DaemonPidFile) -> io::Result<()> {
 
 async fn remove_pid_file(path: &Path) {
     let _ = tokio::fs::remove_file(path).await;
+}
+
+// ---------------------------------------------------------------------
+// autostart persistence (COMM-HYPHAE.md §6.2)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct AutostartFile {
+    autostart: bool,
+}
+
+/// Persists `daemon.autostart` (COMM-HYPHAE.md §6.2: true after the first
+/// successful manual start, false after a manual stop), atomically — same
+/// write-to-tmp-then-rename shape as [`write_pid_file`]. Best effort: a
+/// failure here only means the NEXT `agent24d` start will not auto-start
+/// (or will, if it should not have); it must never fail the start/stop
+/// request that triggered it.
+async fn write_autostart(path: &Path, value: bool) {
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::warn!(error = %e, "comm: could not create the daemon-autostart directory");
+        return;
+    }
+    let bytes = match serde_json::to_vec(&AutostartFile { autostart: value }) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "comm: could not serialize daemon-autostart state");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = tokio::fs::write(&tmp, &bytes).await {
+        tracing::warn!(error = %e, "comm: could not write daemon-autostart state");
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        tracing::warn!(error = %e, "comm: could not persist daemon-autostart state");
+    }
+}
+
+/// Reads `daemon.autostart`; `false` on anything short of a clean `true` —
+/// missing file, unreadable, not valid JSON. A daemon that was never told to
+/// autostart, or whose record is unreadable, must not start on its own.
+pub async fn read_autostart(path: &Path) -> bool {
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return false;
+    };
+    serde_json::from_slice::<AutostartFile>(&bytes)
+        .map(|f| f.autostart)
+        .unwrap_or(false)
 }
 
 /// Absolute path to `ps`, resolved once. Pinning it to an absolute path is
@@ -168,16 +237,54 @@ pub enum ShutdownLeader {
     KilledAfterGrace,
 }
 
-/// SIGTERM the group, poll for it to empty for `grace`, then SIGKILL.
+/// Has `child`'s leader exited, asked **without reaping it** (`waitid`
+/// `WNOWAIT`), so its pid still keeps the process-group id until every real
+/// signal this stop sends has gone out?
+///
+/// PR #626 review, blocking High #1: the previous version called
+/// `child.try_wait()` on every poll of the grace loop below — which DOES
+/// reap, immediately, the moment the leader exits. If the leader was the
+/// group's only remaining member at that instant, its pid was free for the
+/// kernel to hand to an unrelated process before the loop ever reached the
+/// unconditional `SIGKILL` that used to follow — which would then land on
+/// whatever reused that number, not on this group (exactly the hazard
+/// `agent24-os-proto`'s `supervise.rs` names at length on `ModuleProcess`:
+/// "the leader is NOT reaped until the group is dealt with").
+///
+/// `None` if `child.id()` is already `None` — it has been reaped by someone
+/// else, which here only ever means a previous call of this same loop
+/// already did the one real reap at the end of [`kill_group_gracefully`];
+/// treated as "exited" since that is always true by then.
+fn peek_child_exited(child: &mut Child) -> bool {
+    let Some(raw_pid) = child.id() else {
+        return true;
+    };
+    let Some(pid) = i32::try_from(raw_pid).ok().and_then(Pid::from_raw) else {
+        return true;
+    };
+    use rustix::process::{WaitId, WaitidOptions, waitid};
+    matches!(
+        waitid(
+            WaitId::Pid(pid),
+            WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
+        ),
+        Ok(Some(_))
+    )
+}
+
+/// SIGTERM the group, poll for it to empty for `grace`, then SIGKILL; reap
+/// the leader only once every signal this call will ever send has gone out.
 /// `pgid` is the process group id, which — since every spawn here uses
 /// `process_group(0)` — is the leader's own pid.
 ///
 /// `leader` is our own `Child` handle when we spawned the group (`None` for
-/// an orphan from a previous `agent24d`). It is held until every signal has
-/// been sent — dropping it earlier hands the pid to tokio's orphan reaper,
-/// after which a signal could hit a reused id (the invariant
-/// `agent24-os-proto`'s `supervise.rs` asserts) — and `try_wait`-reaped on
-/// each poll so a zombie leader never keeps the group looking non-empty.
+/// an orphan from a previous `agent24d`, or a leader whose exit was already
+/// observed without reaping it — see the call sites in `run_actor`). Its
+/// exit is peeked (never reaped) throughout the grace loop
+/// ([`peek_child_exited`]); an orphan's exit is probed by plain liveness
+/// (`pid_alive`) instead, since it was never ours to reap either way, and
+/// there is no reap-before-last-signal race to create for a pid we never
+/// hold a `Child` for.
 async fn kill_group_gracefully(
     pgid: u32,
     grace: Duration,
@@ -191,23 +298,32 @@ async fn kill_group_gracefully(
         return ShutdownLeader::GoneBeforeTerm;
     }
     let deadline = Instant::now() + grace;
-    loop {
-        if let Some(child) = leader.as_deref_mut() {
-            let _ = child.try_wait();
-        }
-        if test_kill_process_group(pid).is_err() {
-            return ShutdownLeader::ExitedInGrace;
+    let exited_in_grace = loop {
+        let leader_gone = match leader.as_deref_mut() {
+            Some(child) => peek_child_exited(child),
+            None => !pid_alive(pgid),
+        };
+        if leader_gone && test_kill_process_group(pid).is_err() {
+            break true;
         }
         if Instant::now() >= deadline {
-            break;
+            break false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    if !exited_in_grace {
+        let _ = kill_process_group(pid, Signal::Kill);
     }
-    let _ = kill_process_group(pid, Signal::Kill);
+    // The one real reap, now that TERM (and, if needed, KILL) have both
+    // already gone out — never earlier (see `peek_child_exited`).
     if let Some(child) = leader {
         let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
     }
-    ShutdownLeader::KilledAfterGrace
+    if exited_in_grace {
+        ShutdownLeader::ExitedInGrace
+    } else {
+        ShutdownLeader::KilledAfterGrace
+    }
 }
 
 /// What was found and done about a possibly-orphaned pid file, for logging
@@ -298,6 +414,18 @@ pub struct Ctx {
     pub home: PathBuf,
     pub pid_path: PathBuf,
     pub log_path: PathBuf,
+    /// Where `daemon.autostart` is persisted (COMM-HYPHAE.md §6.2).
+    pub autostart_path: PathBuf,
+    /// SIGTERM-to-SIGKILL grace for this daemon's own stop/shutdown.
+    /// `agent24d` passes the SAME already-validated
+    /// `lifecycle::Params::stop_grace` every other out-of-process module
+    /// stop uses (PR #626 review, High #2) — this `Ctx` never reads
+    /// `A24_MODULE_STOP_GRACE_MS` itself.
+    pub grace: Duration,
+    /// How long a freshly spawned daemon must stay up before `starting`
+    /// becomes `running` (COMM-HYPHAE.md §6.1). [`READY_AFTER_DEFAULT`] in
+    /// production; tests shrink it so they do not have to sleep 3s.
+    pub ready_after: Duration,
 }
 
 async fn read_list(ctx: &Ctx, args: &[&str]) -> Result<Value, DaemonStartError> {
@@ -484,6 +612,17 @@ enum Cmd {
 
 enum Phase {
     Idle,
+    /// Spawned, but not yet confirmed alive long enough to be `running`
+    /// (COMM-HYPHAE.md §6.1's "存活满 3s 记为 running"; PR #626 review,
+    /// Medium #6). An exit from here is classified exactly like an exit
+    /// from [`Phase::Running`] — only the status string differs while it
+    /// lasts.
+    Starting {
+        child: Child,
+        started_at: Instant,
+        pgid: u32,
+        ready_at: tokio::time::Instant,
+    },
     Running {
         child: Child,
         started_at: Instant,
@@ -608,17 +747,22 @@ impl HyphaeDaemonSupervisor {
 }
 
 async fn stop_phase(phase: &mut Phase, pid_path: &Path, grace: Duration) -> Option<ShutdownLeader> {
-    if let Phase::Running {
-        mut child, pgid, ..
-    } = std::mem::replace(phase, Phase::Idle)
-    {
-        let leader = kill_group_gracefully(pgid, grace, Some(&mut child)).await;
-        drop(child);
-        remove_pid_file(pid_path).await;
-        return Some(leader);
+    match std::mem::replace(phase, Phase::Idle) {
+        Phase::Running {
+            mut child, pgid, ..
+        }
+        | Phase::Starting {
+            mut child, pgid, ..
+        } => {
+            let leader = kill_group_gracefully(pgid, grace, Some(&mut child)).await;
+            drop(child);
+            remove_pid_file(pid_path).await;
+            Some(leader)
+        }
+        // Idle or Backoff: already replaced with Idle above (a stop cancels
+        // a pending restart too).
+        _ => None,
     }
-    *phase = Phase::Idle;
-    None
 }
 
 async fn spawn_and_record(
@@ -661,16 +805,44 @@ async fn spawn_and_record(
                     );
                 }
             }
-            set_status(status, "running", *generation, failures, None);
-            Ok(Phase::Running {
+            set_status(status, "starting", *generation, failures, None);
+            Ok(Phase::Starting {
                 child: spawned.child,
                 started_at: Instant::now(),
                 pgid: spawned.pgid,
+                ready_at: tokio::time::Instant::now() + ctx.ready_after,
             })
         }
         Err(e) => {
             status_for_start_error(status, &e, *generation, failures);
             Err(e)
+        }
+    }
+}
+
+/// Waits for the leader at `pid` to exit **without reaping it** — the same
+/// `waitid` `WNOWAIT` discipline as [`peek_child_exited`], for the same
+/// reason: a natural exit (crash, or being killed by something other than
+/// our own `stop`) must not free the pid for reuse before
+/// `kill_group_gracefully` has had a chance to clean up whatever
+/// process-group members the leader may have left running (PR #626 review,
+/// Medium #3 — previously `child.wait().await` reaped the leader as the
+/// very mechanism used to detect the exit, before any such cleanup ran, and
+/// any descendant was simply left unsupervised).
+///
+/// # Errors
+///
+/// The OS failed to report the leader's state.
+async fn wait_leader_exit_unreaped(pid: Pid) -> io::Result<()> {
+    use rustix::process::{WaitId, WaitidOptions, waitid};
+    loop {
+        match waitid(
+            WaitId::Pid(pid),
+            WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
+        ) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -683,26 +855,55 @@ async fn run_actor(
     let mut policy = RestartPolicy::new();
     let mut generation: u64 = 0;
     let mut phase = Phase::Idle;
-    let grace = stop_grace();
+    // PR #626 review, High #2: the SAME already-validated grace every other
+    // out-of-process module's stop uses, handed in by `agent24d` — never
+    // this crate's own unvalidated `stop_grace()` read of the raw env var.
+    let grace = ctx.grace;
 
     loop {
         let backoff_deadline = match &phase {
             Phase::Backoff { deadline } => Some(*deadline),
             _ => None,
         };
-        let running = matches!(phase, Phase::Running { .. });
+        let ready_deadline = match &phase {
+            Phase::Starting { ready_at, .. } => Some(*ready_at),
+            _ => None,
+        };
+        // The leader's pid, while there is one to watch for an exit —
+        // captured by value (not a borrow of `phase`) so the `exit_result`
+        // branch below needs no access to `phase` until it actually fires.
+        let exit_target: Option<Pid> = match &phase {
+            Phase::Running { pgid, .. } | Phase::Starting { pgid, .. } => {
+                i32::try_from(*pgid).ok().and_then(Pid::from_raw)
+            }
+            _ => None,
+        };
+        let has_child = exit_target.is_some();
 
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return };
                 match cmd {
                     Cmd::Start(reply) => {
-                        if running {
+                        if has_child {
+                            write_autostart(&ctx.autostart_path, true).await;
                             let _ = reply.send(Ok(()));
                         } else {
+                            // PR #626 review, Medium #4: an explicit manual
+                            // start is a fresh vote of confidence from
+                            // whoever called it — it must not inherit a
+                            // breaker tripped by an earlier, unrelated
+                            // crash loop. Automatic restarts (the backoff
+                            // timer, below) and config-change restarts keep
+                            // the policy exactly as it was; only THIS path
+                            // resets it.
+                            policy = RestartPolicy::new();
                             match spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures()).await {
                                 Ok(p) => {
                                     phase = p;
+                                    // COMM-HYPHAE.md §6.2: a successful
+                                    // manual start persists autostart=true.
+                                    write_autostart(&ctx.autostart_path, true).await;
                                     let _ = reply.send(Ok(()));
                                 }
                                 Err(e) => {
@@ -715,10 +916,13 @@ async fn run_actor(
                     Cmd::Stop(reply) => {
                         stop_phase(&mut phase, &ctx.pid_path, grace).await;
                         set_status(&status, "stopped", generation, policy.consecutive_failures(), None);
+                        // COMM-HYPHAE.md §6.2: a manual stop persists
+                        // autostart=false, unconditionally.
+                        write_autostart(&ctx.autostart_path, false).await;
                         let _ = reply.send(());
                     }
                     Cmd::ConfigChanged(reply) => {
-                        if running || backoff_deadline.is_some() {
+                        if has_child || backoff_deadline.is_some() {
                             stop_phase(&mut phase, &ctx.pid_path, grace).await;
                             phase = spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures())
                                 .await
@@ -727,7 +931,7 @@ async fn run_actor(
                         let _ = reply.send(());
                     }
                     Cmd::Shutdown(reply) => {
-                        let had_process = running;
+                        let had_process = has_child;
                         let leader = stop_phase(&mut phase, &ctx.pid_path, grace).await;
                         let _ = reply.send(DaemonShutdownOutcome { had_process, leader });
                         return;
@@ -735,18 +939,42 @@ async fn run_actor(
                 }
             }
 
-            exit = async {
-                match &mut phase {
-                    Phase::Running { child, .. } => child.wait().await,
-                    _ => std::future::pending().await,
+            () = tokio::time::sleep_until(ready_deadline.unwrap_or_else(tokio::time::Instant::now)), if ready_deadline.is_some() => {
+                if let Phase::Starting { child, started_at, pgid, .. } = std::mem::replace(&mut phase, Phase::Idle) {
+                    phase = Phase::Running { child, started_at, pgid };
+                    set_status(&status, "running", generation, policy.consecutive_failures(), None);
                 }
-            }, if running => {
-                let Phase::Running { started_at, .. } = std::mem::replace(&mut phase, Phase::Idle) else {
-                    unreachable!("guarded by `running`")
+            }
+
+            exit_result = async {
+                match exit_target {
+                    Some(pid) => wait_leader_exit_unreaped(pid).await,
+                    None => std::future::pending().await,
+                }
+            }, if has_child => {
+                let (mut child, started_at, pgid) = match std::mem::replace(&mut phase, Phase::Idle) {
+                    Phase::Running { child, started_at, pgid } => (child, started_at, pgid),
+                    Phase::Starting { child, started_at, pgid, .. } => (child, started_at, pgid),
+                    _ => unreachable!("guarded by `has_child`"),
                 };
+                if let Err(e) = exit_result {
+                    tracing::warn!(
+                        error = %e,
+                        "comm: could not confirm the hyphae daemon leader's exit; cleaning \
+                         up its process group regardless"
+                    );
+                }
+                // PR #626 review, Medium #3: whatever the leader left
+                // running in its process group (it may have forked
+                // helpers) is cleaned up here, through the exact same path
+                // `stop`/`shutdown` use, BEFORE the generation is allowed
+                // to restart — otherwise an unsupervised descendant
+                // outlives the restart and collides with the new
+                // generation.
+                let _ = kill_group_gracefully(pgid, grace, Some(&mut child)).await;
+                let code = child.try_wait().ok().flatten().and_then(|s| s.code());
                 remove_pid_file(&ctx.pid_path).await;
                 policy.ran(started_at, Instant::now());
-                let code = exit.ok().and_then(|s| s.code());
                 match code {
                     Some(3) => set_status(&status, "locked", generation, policy.consecutive_failures(), Some("password_rejected".to_owned())),
                     Some(1) => set_status(&status, "gave_up", generation, policy.consecutive_failures(), Some("misconfigured".to_owned())),

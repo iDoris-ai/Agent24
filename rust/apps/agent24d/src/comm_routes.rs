@@ -52,14 +52,34 @@ fn resolve_source_path() -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
+/// Every on-disk path `build_ready_state` needs, bundled so the function
+/// itself stays under clippy's argument-count lint.
+struct CommPaths<'a> {
+    home: &'a Path,
+    install_dir: &'a Path,
+    pid_path: &'a Path,
+    log_path: &'a Path,
+    autostart_path: &'a Path,
+}
+
 async fn build_ready_state(
     source: &Path,
-    home: &Path,
-    install_dir: &Path,
+    paths: &CommPaths<'_>,
     password_store: Arc<dyn PasswordStore>,
-    pid_path: &Path,
-    log_path: &Path,
+    // PR #626 review, High #2: the SAME already-validated grace every other
+    // out-of-process module's stop uses (`lifecycle::Params::stop_grace`,
+    // read ONCE in `server::serve`) — never this function's own read of the
+    // raw env var, which used to disagree with SHUT-1b's own clamped
+    // default (500ms vs. this crate's unvalidated 5s).
+    grace: Duration,
 ) -> Result<(CommState, Arc<agent24_comm::HyphaeDaemonSupervisor>), String> {
+    let CommPaths {
+        home,
+        install_dir,
+        pid_path,
+        log_path,
+        autostart_path,
+    } = *paths;
     let source = source
         .canonicalize()
         .map_err(|e| format!("Hyphae binary {source:?} is not readable: {e}"))?;
@@ -79,7 +99,7 @@ async fn build_ready_state(
     // daemon of its own, clean up one left behind by a previous `agent24d`
     // that crashed or was SIGKILLed — pid alive AND start time unchanged,
     // never by name.
-    agent24_comm::reap_orphan(pid_path, agent24_comm::stop_grace()).await;
+    agent24_comm::reap_orphan(pid_path, grace).await;
 
     let daemon = Arc::new(agent24_comm::HyphaeDaemonSupervisor::spawn(
         agent24_comm::DaemonCtx {
@@ -88,8 +108,20 @@ async fn build_ready_state(
             home: home.to_path_buf(),
             pid_path: pid_path.to_path_buf(),
             log_path: log_path.to_path_buf(),
+            autostart_path: autostart_path.to_path_buf(),
+            grace,
+            ready_after: agent24_comm::READY_AFTER_DEFAULT,
         },
     ));
+    // COMM-HYPHAE.md §6.2: "agent24d 启动时，autostart=true 就自动拉起" — a
+    // best-effort attempt; a failure here (e.g. the keystore password is
+    // not currently retrievable) is logged, not fatal, same as every other
+    // comm degrade-gracefully path in this file.
+    if agent24_comm::read_autostart(autostart_path).await
+        && let Err(e) = daemon.start().await
+    {
+        tracing::warn!("comm: autostart failed to start the hyphae daemon: {e}");
+    }
     let state =
         CommState::ready(runner, password_store, home.to_path_buf()).with_daemon(daemon.clone());
     Ok((state, daemon))
@@ -153,6 +185,10 @@ fn select_password_store() -> Result<Arc<dyn PasswordStore>, String> {
 /// part of SHUT-1b.
 pub async fn build(
     state_dir: &Path,
+    // PR #626 review, High #2: `server::serve`'s own already-validated
+    // `lifecycle::Params::stop_grace` — see `build_ready_state`'s doc
+    // comment on the parameter of the same name.
+    grace: Duration,
 ) -> (
     axum::Router,
     Option<Arc<agent24_comm::HyphaeDaemonSupervisor>>,
@@ -162,6 +198,7 @@ pub async fn build(
     let install_dir = comm_dir.join("bin");
     let pid_path = comm_dir.join("hyphae-daemon.pid");
     let log_path = comm_dir.join("logs").join("hyphae-daemon.log");
+    let autostart_path = comm_dir.join("daemon-autostart.json");
     let (state, daemon) = match select_password_store() {
         Err(reason) => {
             tracing::warn!("comm: {reason}");
@@ -176,16 +213,14 @@ pub async fn build(
                 None,
             ),
             Some(source) => {
-                match build_ready_state(
-                    &source,
-                    &home,
-                    &install_dir,
-                    password_store,
-                    &pid_path,
-                    &log_path,
-                )
-                .await
-                {
+                let paths = CommPaths {
+                    home: &home,
+                    install_dir: &install_dir,
+                    pid_path: &pid_path,
+                    log_path: &log_path,
+                    autostart_path: &autostart_path,
+                };
+                match build_ready_state(&source, &paths, password_store, grace).await {
                     Ok((state, daemon)) => (state, Some(daemon)),
                     Err(reason) => {
                         tracing::warn!("comm: {reason}");
