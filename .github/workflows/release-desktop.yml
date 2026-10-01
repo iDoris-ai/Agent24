@@ -161,7 +161,7 @@ jobs:
           PKG="$(dpkg-deb -f "$DEB" Package)"
           echo "package name: $PKG"
 
-          sudo dpkg -i "$DEB"
+          sudo apt-get update -qq && sudo apt-get install -y "$(realpath "$DEB")"  # apt resolves declared deps (e.g. libnotify4), as users would
           dpkg -L "$PKG" | tee "$RUNNER_TEMP/deb-contents.txt"
           if ! grep -q 'agent24d$' "$RUNNER_TEMP/deb-contents.txt"; then
             echo "::error::agent24d binary not found in installed deb contents"
