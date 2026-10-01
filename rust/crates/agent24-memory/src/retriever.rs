@@ -96,7 +96,8 @@ impl FtsRetriever {
         Ok(())
     }
 
-    /// Search matching any token in the query.
+    /// Search matching any token in the query, including non-Han words inside
+    /// mixed terms and Han bigrams.
     pub async fn search_any(
         &self,
         query: &str,
@@ -150,6 +151,15 @@ fn to_match_query_with(query: &str, joiner: &str) -> Option<String> {
     let terms: Vec<String> = query
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|term| !term.is_empty() && term.chars().any(|ch| !is_han(ch)))
+        .flat_map(|term| {
+            // Keep the full mixed token for unicode61 matches. Only OR recall
+            // also extracts words like Rust from 你用Rust吗; AND stays unchanged.
+            let expand_mixed = joiner == " OR " && term.chars().any(is_han);
+            std::iter::once(term).chain(
+                term.split(is_han)
+                    .filter(move |word| expand_mixed && !word.is_empty()),
+            )
+        })
         .chain(cjk.split_whitespace())
         .map(|term| format!("\"{term}\""))
         .collect();
@@ -510,6 +520,45 @@ mod tests {
             assert_eq!(any.len(), 1, "search_any: {query}");
             assert_eq!(any[0].assertion.id, id, "search_any: {query}");
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_questions_recall_non_han_words_from_english_assertions() {
+        let (kv, r) = fixture().await;
+        for (id, text) in [
+            ("rust", "I use Rust daily"),
+            ("vitamin", "I take B12 daily"),
+            ("unrelated", "I like swimming"),
+        ] {
+            kv.assertions()
+                .assert(&a(id, "u1", "user", json!(text)))
+                .await
+                .unwrap();
+        }
+
+        for (query, id) in [("你用Rust吗", "rust"), ("你吃B12吗", "vitamin")] {
+            let hits = r.search_any(query, "u1", 10).await.unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert_eq!(hits[0].assertion.id, id, "{query}");
+            assert!(r.search(query, "u1", 10).await.unwrap().is_empty());
+            assert!(r.search_any(query, "other", 10).await.unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn only_or_queries_extract_non_han_words_from_mixed_terms() {
+        assert_eq!(
+            to_match_query_with("你用Rust吗", " OR "),
+            Some("\"你用Rust吗\" OR \"Rust\" OR \"你用\" OR \"吗\"".into())
+        );
+        assert_eq!(
+            to_match_query("你用Rust吗"),
+            Some("\"你用Rust吗\" \"你用\" \"吗\"".into())
+        );
+        assert_eq!(
+            to_match_query_with("Rust B12", " OR "),
+            Some("\"Rust\" OR \"B12\"".into())
+        );
     }
 
     #[tokio::test]
