@@ -45,6 +45,7 @@ dependencies = [
  "futures-util",
  "ratatui",
  "reqwest",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "tempfile",

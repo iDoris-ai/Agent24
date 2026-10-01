@@ -176,7 +176,7 @@ enum OsAttachAction {
     },
 }
 
-/// `agent24 comm …` (COMM-2a; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
+/// `agent24 comm …` (COMM-2a/2b; COMM-HYPHAE.md §4's CLI/REST 1:1 mapping).
 #[derive(Subcommand)]
 enum CommAction {
     /// Manage Hyphae identities
@@ -193,6 +193,34 @@ enum CommAction {
     Relay {
         #[command(subcommand)]
         action: CommRelayAction,
+    },
+    /// Import an existing, unmanaged `~/.hyphae` HOME (COMM-HYPHAE.md §4.1,
+    /// D3). The source is only ever read — nothing is deleted, moved, or
+    /// modified there (non-blocking probes of `outbox.json.lock` and, when
+    /// present, `daemon.lock` aside).
+    ///
+    /// STOP the `hyphae` daemon using `from` before running this. The
+    /// server-side probes catch a daemon mid-outbox-operation, and — only
+    /// on a Hyphae build that ships `daemon.lock` (Hyphae#104+) — an idle
+    /// one too, but neither can prove every daemon touching this HOME has
+    /// actually stopped.
+    Import {
+        /// The old Hyphae HOME to import — the directory that used to be
+        /// `$HOME` when `hyphae` ran unmanaged (i.e. the parent of its own
+        /// `.hyphae/`, not `.hyphae` itself).
+        from: PathBuf,
+        /// Confirm the import. Required even with `--dry-run` — import
+        /// always needs an explicit confirmation (COMM-HYPHAE.md §4's
+        /// `confirm_required` row). Make sure the `hyphae` daemon using
+        /// `from` is stopped before passing this — see the command's own
+        /// help text above.
+        #[arg(long)]
+        yes: bool,
+        /// Only validate the source and report identity/contact/outbox
+        /// counts; never writes a password or touches the real Hyphae
+        /// HOME.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Manage the Hyphae daemon `agent24d` supervises (COMM-4a)
     Daemon {
@@ -864,7 +892,33 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// there is no local/offline path: every comm operation needs a running
 /// daemon (it is the only thing holding the Hyphae runner).
 async fn cmd_comm(action: CommAction) -> Result<(), String> {
+    // Import's server-side work (copy + verify + a Hyphae-side password
+    // check) is real file and subprocess I/O, not a quick REST round trip —
+    // give it a much longer client-side timeout than every other comm
+    // action's 15s.
+    let timeout = if matches!(action, CommAction::Import { .. }) {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(15)
+    };
     let (method, path, body) = match action {
+        CommAction::Import { from, yes, dry_run } => {
+            let password = if dry_run {
+                None
+            } else {
+                Some(read_password_from_stdin()?)
+            };
+            (
+                reqwest::Method::POST,
+                "/api/v1/comm/import".to_owned(),
+                Some(serde_json::json!({
+                    "from": from.to_string_lossy(),
+                    "confirm": yes,
+                    "password": password,
+                    "dry_run": dry_run,
+                })),
+            )
+        }
         CommAction::Identity { action } => match action {
             CommIdentityAction::List => (
                 reqwest::Method::GET,
@@ -935,7 +989,7 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     if let Some(body) = &body {
         req = req.json(body);
     }
-    let out = match req.timeout(Duration::from_secs(15)).send().await {
+    let out = match req.timeout(timeout).send().await {
         Ok(res) => {
             let status = res.status();
             let body: serde_json::Value = res.json().await.unwrap_or_default();
@@ -957,6 +1011,93 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
     };
     finish(ep).await;
     out
+}
+
+/// Disables local terminal echo on stdin for the lifetime of the guard,
+/// restoring the original termios settings on drop — including on an
+/// early return or a panic unwind (Codex 挑战 Medium #6: "异常退出时也要
+/// 恢复"). Only ever constructed when stdin is actually a TTY; a non-TTY
+/// pipe has no termios to touch and `disable` simply isn't called for it.
+struct EchoGuard {
+    original: rustix::termios::Termios,
+}
+
+impl EchoGuard {
+    /// Returns `None` (leaving the terminal untouched) if `tcgetattr`
+    /// itself fails — a best-effort feature, not something worth failing
+    /// the whole password read over.
+    fn disable() -> Option<Self> {
+        let stdin = std::io::stdin();
+        let original = rustix::termios::tcgetattr(&stdin).ok()?;
+        let mut silenced = original.clone();
+        silenced
+            .local_modes
+            .remove(rustix::termios::LocalModes::ECHO);
+        rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &silenced)
+            .ok()?;
+        Some(Self { original })
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        // Best-effort restore: if this fails, the user's shell is left
+        // with echo off until they run `stty sane`/open a new shell —
+        // there is no better fallback at this point, and panicking out of
+        // a `Drop` would only make things worse.
+        let stdin = std::io::stdin();
+        let _ = rustix::termios::tcsetattr(
+            &stdin,
+            rustix::termios::OptionalActions::Now,
+            &self.original,
+        );
+    }
+}
+
+/// Reads the Hyphae keystore password for `agent24 comm import` from
+/// stdin — never from a `--password`-style CLI flag, which would put the
+/// plaintext on argv, visible to any other user on the same host via `ps`
+/// (COMM-HYPHAE.md §3's rule for Hyphae's own `--password-stdin`, applied
+/// here too). When stdin is a TTY, local echo is turned off for the
+/// duration of the read (Codex 挑战 Medium #6) and always restored before
+/// returning, including on an error path — a non-TTY pipe (the normal
+/// `echo "$PASSWORD" | agent24 comm import ...` usage) is left completely
+/// untouched. Reads one line and strips exactly one trailing `\n`/`\r\n`
+/// (keeping any other whitespace the password itself might contain, same
+/// rule the design doc uses for message content).
+fn read_password_from_stdin() -> Result<String, String> {
+    use std::io::Write;
+    let is_tty = std::io::stdin().is_terminal();
+    let _echo_guard = if is_tty {
+        eprint!("Hyphae keystore password (input hidden): ");
+        let _ = std::io::stderr().flush();
+        EchoGuard::disable()
+    } else {
+        None
+    };
+
+    let mut line = String::new();
+    let read_result = std::io::stdin().read_line(&mut line);
+    if is_tty {
+        // With echo off, the Enter key the user pressed never printed a
+        // newline on the terminal — print one ourselves so whatever comes
+        // next doesn't start on the same line as the prompt.
+        eprintln!();
+    }
+    // `_echo_guard` drops here (echo restored) regardless of which path
+    // below returns — including the two error returns.
+    read_result.map_err(|e| format!("reading password from stdin: {e}"))?;
+
+    let trimmed = line.strip_suffix('\n').unwrap_or(&line);
+    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return Err(
+            "no password was read from stdin; pipe the Hyphae keystore password in, e.g. \
+             `echo \"$PASSWORD\" | agent24 comm import <from> --yes`"
+                .to_owned(),
+        );
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// The v1 error envelope's `error.code`/`error.message`, as a bare JSON value

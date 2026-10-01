@@ -43,10 +43,6 @@ pub enum CommError {
     )]
     NotFound(String),
     #[error("confirm_required")]
-    #[allow(
-        dead_code,
-        reason = "no COMM-2a route is destructive (import/outbox clear are COMM-2b/3); kept for the same reason as NotFound"
-    )]
     ConfirmRequired,
     #[error("conflict: {0}")]
     Conflict(String),
