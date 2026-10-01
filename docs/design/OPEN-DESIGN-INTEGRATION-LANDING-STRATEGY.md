@@ -1,8 +1,8 @@
 # Open Design Integration and Main-Landing Strategy
 
-Status: adopted; refreshed for current execution
+Status: adopted; M7 closed, M8 execution active
 
-Date: 2026-09-30
+Date: 2026-10-01
 
 ## Goal
 
@@ -32,8 +32,10 @@ was first drafted:
   isolation, approval/run ownership, and multi-workspace isolation.
 - **M7 Recovery & Reliability is complete on the integration branch.** The
   durable approval/recovery train was landed bottom-up: #579-#584, #586,
-  #592, #593, #595, and #596 are merged into the integration branch. The
-  branch was then normal-merged with current `main` and is 0 commits behind it.
+  #592, #593, #595, and #596 are merged into the integration branch. ACP/TUI
+  legacy-unbound workspace defaults were also repaired in #591 and #603. The
+  branch has been normal-merged with current `main` and is maintained at 0
+  commits behind it before the next development slice starts.
 
 The development PRs listed in the older M1-M6 sections below are therefore no
 longer "waiting to be reviewed" development work: the relevant slices through
@@ -148,7 +150,7 @@ landing head rather than claiming it is identical to the old reviewed head.
 ## Merge policy for stacked development PRs
 
 Development PRs may continue to use stacked bases because that keeps each
-review small while M7+ is being built.
+review small while M8+ is being built.
 
 Review and close a stack bottom-up. Do not merge a child slice before its base
 slice has either:
@@ -215,10 +217,19 @@ performed as reviewed atomic landing slices rather than as one combined M6 PR.
 
 Continue the same conveyor-belt policy for recovery slices. The M7 development
 sequence includes the recovery clock and durable approval/recovery work (#579
-onward). At the latest 2026-09-30 refresh, #579-#584, #586, #592, #593, #595,
-and #596 are merged into the integration branch. The final integration sync is
-at `6d0b8b6` and is 0 commits behind current `main`; M7 has no remaining active
-code slice on this branch.
+onward). At the 2026-10-01 refresh, #579-#584, #586, #592, #593, #595,
+and #596 are merged into the integration branch; #591 and #603 close the ACP
+and TUI legacy-unbound workspace-identity compile/compatibility gaps exposed by
+that train. The 2026-10-01 milestone audit re-ran the recovery/authority paths
+and found no remaining M7 feature slice. A stale migration-version assertion
+discovered by the full-workspace audit is tracked separately as test hygiene,
+not as unfinished recovery behavior.
+
+M7 is therefore **closed** on the integration branch. Continue with **M8
+Desktop productization**: isolate the embedded Creative surface, harden its
+navigation/session boundary, wire the sidecar lifecycle into the desktop host,
+discover packaged Open Design resources, and provide degraded/restart UX before
+the later M9 cross-platform/security and M10 mainline/release gates.
 
 Do not encode a stale "approved/blocked" label for each M7 PR into this
 strategy. The operational source of truth is the exact current base/head plus
@@ -266,7 +277,7 @@ retain the existing rule of two independent exact-head reviews.
 3. Obtain required exact-head review(s).
 4. Merge that reviewed slice into the active integration/staging branch with a
    normal merge and produce/update the runnable preview.
-5. Continue immediately with the next M7+ slice; integration development does
+5. Continue immediately with the next M8+ slice; integration development does
    not wait for main landing.
 6. In parallel, take the oldest fully reviewed dependency-ready slice and make
    a clean `land/open-design-*` branch from latest `main`.
@@ -363,7 +374,7 @@ PLDM should stop the landing train at the current slice if any of these occurs:
   unrelated history.
 - Do not bypass exact-head review merely because the patch was already tested
   on the integration branch.
-- Do not stop M7+ development while older M4/M5/M6 landing PRs wait for human
+- Do not stop M8+ development while older M4/M5/M6 landing PRs wait for human
   review.
 
 ## Immediate adoption steps
@@ -380,5 +391,5 @@ PLDM should stop the landing train at the current slice if any of these occurs:
    foundation queue is prepared in parallel.
 6. After each main landing tranche, merge the new `main` back into staging and
    rerun cross-stack CI.
-7. Continue M7 Recovery & Reliability in parallel, then M8-M10
-   productization/release work.
+7. M7 Recovery & Reliability is closed. Continue M8 Desktop productization,
+   then M9 cross-platform/security hardening and M10 mainline/release work.
