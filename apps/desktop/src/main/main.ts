@@ -12,6 +12,7 @@ import type { CreativeViewBounds, CreativeViewResult } from '../shared/ipc-types
 import {
   CREATIVE_SESSION_PARTITION,
   CreativeServeWeb,
+  CreativeViewRequestFence,
   classifyCreativeUrl,
 } from './creative-serve-web'
 
@@ -55,6 +56,7 @@ let trayTimer: NodeJS.Timeout | null = null
 const creativeServeWeb = new CreativeServeWeb({ resourcesPath: process.resourcesPath })
 let creativeView: WebContentsView | null = null
 let creativeOrigin: string | null = null
+const creativeViewFence = new CreativeViewRequestFence()
 
 function normalizedBounds(bounds: CreativeViewBounds): Electron.Rectangle {
   return {
@@ -66,6 +68,8 @@ function normalizedBounds(bounds: CreativeViewBounds): Electron.Rectangle {
 }
 
 function hideCreativeView(): void {
+  creativeViewFence.invalidate()
+  creativeOrigin = null
   if (!creativeView) return
   creativeView.setBounds({ x: 0, y: 0, width: 1, height: 1 })
 }
@@ -73,11 +77,14 @@ function hideCreativeView(): void {
 async function showCreativeView(
   bounds: CreativeViewBounds,
   forceReload = false,
+  requestGeneration = creativeViewFence.begin(),
 ): Promise<CreativeViewResult> {
   const win = mainWin
   if (!win || win.isDestroyed()) return { ok: false, error: 'Agent24 window is unavailable' }
+  if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
 
   const status = await creativeServeWeb.start()
+  if (!creativeViewFence.isCurrent(requestGeneration)) return { ok: false, error: 'Creative view request superseded' }
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
   }
@@ -124,9 +131,10 @@ async function showCreativeView(
 }
 
 async function restartCreativeView(bounds: CreativeViewBounds): Promise<CreativeViewResult> {
+  const requestGeneration = creativeViewFence.begin()
   await creativeServeWeb.stop()
   creativeOrigin = null
-  return showCreativeView(bounds, true)
+  return showCreativeView(bounds, true, requestGeneration)
 }
 
 function createMainWindow(): BrowserWindow {
@@ -220,7 +228,9 @@ app.whenReady().then(() => {
   ipcMain.handle(IpcChannels.CreativeShow, (_event, bounds: CreativeViewBounds) => showCreativeView(bounds))
   ipcMain.handle(IpcChannels.CreativeRestart, (_event, bounds: CreativeViewBounds) => restartCreativeView(bounds))
   ipcMain.handle(IpcChannels.CreativeBounds, (_event, bounds: CreativeViewBounds) => {
-    if (creativeView && !creativeView.webContents.isDestroyed()) creativeView.setBounds(normalizedBounds(bounds))
+    if (creativeViewFence.wantsVisible() && creativeOrigin && creativeView && !creativeView.webContents.isDestroyed()) {
+      creativeView.setBounds(normalizedBounds(bounds))
+    }
   })
   ipcMain.handle(IpcChannels.CreativeHide, () => hideCreativeView())
   agentEarBridge.start()

@@ -61,4 +61,12 @@ describe('CreativePage', () => {
     await waitFor(() => expect(creativeRestart).toHaveBeenCalledWith({ x: 220, y: 50, width: 900, height: 650 }))
     await waitFor(() => expect(queryByText(/daemon unavailable/)).toBeNull())
   })
+
+  it('shows retry UI when the initial Creative IPC rejects', async () => {
+    creativeShow.mockRejectedValueOnce(new Error('launch IPC failed'))
+    const { queryByText, getByRole } = render(<CreativePage />)
+
+    await waitFor(() => expect(queryByText(/launch IPC failed/)).not.toBeNull())
+    expect(getByRole('button', { name: 'Retry Open Design' })).toBeTruthy()
+  })
 })

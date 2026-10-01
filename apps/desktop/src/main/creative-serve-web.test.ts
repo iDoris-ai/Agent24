@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   CreativeServeWeb,
+  CreativeViewRequestFence,
   canonicalCreativeOrigin,
   classifyCreativeUrl,
   resolveOpenDesignCheckout,
@@ -47,6 +48,20 @@ afterEach(() => {
 })
 
 describe('CreativeServeWeb', () => {
+  it('invalidates an in-flight view request when the view is hidden', () => {
+    const fence = new CreativeViewRequestFence()
+    const first = fence.begin()
+    expect(fence.isCurrent(first)).toBe(true)
+
+    fence.invalidate()
+    expect(fence.isCurrent(first)).toBe(false)
+    expect(fence.wantsVisible()).toBe(false)
+
+    const second = fence.begin()
+    expect(fence.isCurrent(second)).toBe(true)
+    expect(fence.isCurrent(first)).toBe(false)
+  })
+
   it('canonicalizes only the launched loopback origin', () => {
     expect(canonicalCreativeOrigin('http://127.0.0.1:17456/', 17456)).toBe('http://127.0.0.1:17456')
     expect(canonicalCreativeOrigin('https://127.0.0.1:17456', 17456)).toBe('https://127.0.0.1:17456')

@@ -21,9 +21,14 @@ export default function CreativePage(): JSX.Element {
     const observer = new ResizeObserver(syncBounds)
     observer.observe(host)
 
-    void window.agent24.creativeShow(rectOf(host)).then((result) => {
-      if (!cancelled && !result.ok) setError(result.error ?? 'Open Design failed to start')
-    })
+    void window.agent24.creativeShow(rectOf(host)).then(
+      (result) => {
+        if (!cancelled && !result.ok) setError(result.error ?? 'Open Design failed to start')
+      },
+      (reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : 'Open Design failed to start')
+      },
+    )
 
     window.addEventListener('resize', syncBounds)
     return () => {
