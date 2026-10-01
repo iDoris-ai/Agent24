@@ -294,6 +294,15 @@ export interface paths {
          * Partially update a schedule
          * @description Any subset of name/enabled/spec/action/delivery. Changing `spec`
          *     recomputes `next_run_at` immediately.
+         *
+         *     On a module-owned row (design
+         *     docs/design/ME4-S1-scheduler-callback.md §8.2), the ONLY accepted
+         *     shape is exactly `{"enabled": ...}` — mapped onto suspend/resume
+         *     (`false`→suspend, `true`→resume). Any other field present, or
+         *     `enabled` together with anything else, is `409
+         *     module_owned_schedule`. The write-back on a USER row is CAS'd
+         *     (§2.4); a concurrent tick/PATCH that keeps losing the race for 3
+         *     retries is `409 schedule_conflict`.
          */
         patch: operations["updateSchedule"];
         trace?: never;
@@ -307,8 +316,69 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Trigger one run immediately (does not change next_run_at) */
+        /**
+         * Trigger one run immediately (does not change next_run_at)
+         * @description Design §4.7: a user (AgentRun) row answers `{run_id}`, same as
+         *     always; a module-owned row answers `{fire_id}` — it records a fire
+         *     (own `fire_id`, `fire_trigger=run_now`) for the delivery pump to
+         *     pick up, without touching `next_run_at` or disturbing the tick
+         *     source's own outstanding fire. Neither arm looks at `enabled` /
+         *     `user_suspended` / `system_disabled_reason` — this is an explicit
+         *     "try it now" the user asked for.
+         */
         post: operations["runScheduleNow"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/schedules/{id}/suspend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Suspend a module-owned schedule (design §8.2)
+         * @description Module rows only. Idempotent: suspending an already-suspended row
+         *     is a no-op that still answers `200` with the current view. Clears
+         *     `next_run_at` and, in the same transaction, retires the schedule's
+         *     outstanding (pending/deferred) deliveries. A user (AgentRun) row —
+         *     use `PATCH {"enabled": false}` instead — answers `409
+         *     not_a_module_schedule`.
+         */
+        post: operations["suspendSchedule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/schedules/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resume a module-owned schedule (design §8.2)
+         * @description Module rows only. Idempotent: resuming a row that is neither
+         *     suspended nor system-disabled is a no-op — 0 rows affected, still
+         *     `200` with the current view (a module's own `enabled=false` shows
+         *     up as `disabled_by="module"` and is unaffected by resume). Also
+         *     clears a kernel `system_disabled_reason` (v2 M2) and, when the row
+         *     is enabled, recomputes `next_run_at` from the current spec
+         *     (skip-missed). A user (AgentRun) row answers `409
+         *     not_a_module_schedule`.
+         */
+        post: operations["resumeSchedule"];
         delete?: never;
         options?: never;
         head?: never;
@@ -627,6 +697,12 @@ export interface components {
         ChatResponse: {
             message: components["schemas"]["ChatMessage"];
             usage: components["schemas"]["Usage"];
+            /** @description Provider-reported model id that actually served this call, when the provider reported one; null otherwise. Clients must not guess a name (e.g. the daemon's DEFAULT_MODEL) when this is null. */
+            model_id?: string | null;
+            /** @description Open enum, "local" | "remote"; null when unknown. */
+            tier?: string | null;
+            /** @description Server-measured wall-clock milliseconds for this call. */
+            latency_ms?: number | null;
         };
         Session: {
             id: string;
@@ -641,6 +717,8 @@ export interface components {
              * @example nostr
              */
             channel: string;
+            /** @description Opaque workspace identity; null when unbound. */
+            workspace_id: string | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -651,6 +729,8 @@ export interface components {
             title: string;
             /** @default desktop */
             channel: string;
+            /** @description Omit/null for a legacy-compatible unbound session. */
+            workspace_id?: string | null;
         };
         /**
          * @description State machine (only legal transitions):
@@ -668,6 +748,8 @@ export interface components {
         RunMode: "normal" | "plan";
         RunInput: {
             prompt: string;
+            /** @description Explicit opaque workspace identity copied from the run request. */
+            workspace_id: string | null;
             model_override?: string | null;
             mode?: components["schemas"]["RunMode"];
         };
@@ -678,6 +760,8 @@ export interface components {
             id: string;
             /** @description Null for transient runs (e.g. created by /chat) */
             session_id: string | null;
+            /** @description Opaque workspace identity; filesystem roots stay outside this public schema. */
+            workspace_id: string | null;
             status: components["schemas"]["RunStatus"];
             input: components["schemas"]["RunInput"];
             /** @description Present when status=completed */
@@ -697,6 +781,8 @@ export interface components {
         RunCreate: {
             /** @description Omit/null to create a transient run */
             session_id?: string | null;
+            /** @description Omit/null for legacy-compatible runs; admission is separate. */
+            workspace_id?: string | null;
             prompt: string;
             model_override?: string | null;
             mode?: components["schemas"]["RunMode"];
@@ -895,12 +981,35 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /**
+         * @description Which module owns this row, and its key with that module — `null`
+         *     exactly when this is a plain user (AgentRun) row (design
+         *     docs/design/ME4-S1-scheduler-callback.md §8.1).
+         */
+        ScheduleOwner: {
+            module: string;
+            key: string;
+        };
+        /**
+         * @description Which layer is holding a schedule from firing, or `null` when
+         *     `effective_enabled` is `true`. Priority: `user_suspended` → `user`,
+         *     then `system_disabled_reason` → `system`, then `!enabled` → `module`
+         *     (module row) / `user` (user row) (§8.1, v3 L-D).
+         * @enum {string|null}
+         */
+        DisabledBy: "module" | "user" | "system" | null;
         Schedule: {
             id: string;
             name: string;
             enabled: boolean;
             spec: components["schemas"]["ScheduleSpec"];
-            action: components["schemas"]["ScheduleAction"];
+            /**
+             * @description `null` exactly when `owner` is non-null: module rows carry no
+             *     AgentRun action (§8.1). A client can never create a module row
+             *     through `POST /schedules` — `ScheduleCreate` has no `owner`
+             *     field and `ScheduleAction` has exactly one variant (S1-2).
+             */
+            action: components["schemas"]["ScheduleAction"] | null;
             delivery: components["schemas"]["DeliveryTarget"][];
             /** Format: date-time */
             last_run_at: string | null;
@@ -911,6 +1020,19 @@ export interface components {
             next_run_at: string | null;
             /** @description Auto-disables the schedule at 5 (emits schedule.disabled) */
             consecutive_failures: number;
+            /** @description Non-null exactly for a module row (§8.1). */
+            owner: components["schemas"]["ScheduleOwner"] | null;
+            /** @description Only ever true on a module row (migration 0007's CHECK). */
+            user_suspended: boolean;
+            /** @description Only ever non-null on a module row (same CHECK). */
+            system_disabled_reason: string | null;
+            /**
+             * @description Whether this row will actually fire right now: for a user row,
+             *     equals `enabled`; for a module row, `enabled && !user_suspended
+             *     && system_disabled_reason == null`.
+             */
+            effective_enabled: boolean;
+            disabled_by: components["schemas"]["DisabledBy"];
         };
         ScheduleCreate: {
             name: string;
@@ -1017,7 +1139,8 @@ export interface components {
              * @description Open enum: invalid_request, unauthorized, not_found, conflict,
              *     approval_already_resolved, provider_unavailable,
              *     run_not_cancellable (reserved), internal,
-             *     admission_refused, module_panicked, module_killed
+             *     admission_refused, module_panicked, module_killed,
+             *     module_owned_schedule, not_a_module_schedule, schedule_conflict
              */
             code: string;
             message: string;
@@ -1717,6 +1840,19 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description Module-owned row rejected a field other than a lone `enabled`
+             *     (`module_owned_schedule`), or the CAS write-back never landed
+             *     after 3 retries (`schedule_conflict`).
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     runScheduleNow: {
@@ -1730,7 +1866,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Run started */
+            /** @description Run queued (user row) or fire recorded (module row) */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -1738,10 +1874,85 @@ export interface operations {
                 content: {
                     "application/json": {
                         run_id: string;
+                    } | {
+                        fire_id: string;
                     };
                 };
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    suspendSchedule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Suspended (or already was) — the current view */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Not a module-owned schedule */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "not_a_module_schedule",
+                     *         "message": "schedule sch_01H… is not a module-owned schedule",
+                     *         "hint": "use PATCH {\"enabled\": true|false} on a user-owned schedule"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    resumeSchedule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Resumed (or already was) — the current view */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Not a module-owned schedule, or a concurrent module upsert raced the resume 3 times */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getShutdownReport: {

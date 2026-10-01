@@ -52,6 +52,15 @@ pub struct McpServerSpec {
     /// Per-tool target argument (H4), keyed by the server's own tool name.
     /// Absent = that tool can never hold a target-scoped standing grant.
     pub target_args: std::collections::BTreeMap<String, String>,
+    /// FU-103/J-6: extra environment variables for THIS server only, from its
+    /// own `env` block in `mcp.json` (Claude Desktop's own config shape). The
+    /// server's child process no longer inherits the daemon's ambient
+    /// environment at all (see [`crate::env_whitelist`] via `agent24-tools`)
+    /// — a credential the server genuinely needs (its own API token, say)
+    /// must be declared here by the user, explicitly, and is injected only
+    /// into this one server's child, never into any other server's or into
+    /// `shell_exec`.
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl McpServerSpec {
@@ -61,6 +70,7 @@ impl McpServerSpec {
             command: command.into(),
             args,
             target_args: std::collections::BTreeMap::new(),
+            env: std::collections::BTreeMap::new(),
         }
     }
 
@@ -72,6 +82,31 @@ impl McpServerSpec {
         self.target_args = target_args;
         self
     }
+
+    #[must_use]
+    pub fn with_env(mut self, env: std::collections::BTreeMap<String, String>) -> Self {
+        self.env = env;
+        self
+    }
+}
+
+/// Build the (not-yet-spawned) child process command for `spec`.
+///
+/// FU-103/J-6: a third-party MCP server binary must not read the daemon's
+/// ambient environment (every `*_KEY`/`*_TOKEN`/`*_SECRET` and
+/// `A24_*`/`OMLX_*` var it holds) just by inheriting it — only the fixed
+/// minimal set a process needs to run (see `agent24_tools::env_whitelist`),
+/// plus whatever THIS server's own `env` block in `mcp.json` explicitly
+/// grants it. Extracted from [`McpServer::connect`] so it can be unit tested
+/// without a real MCP handshake.
+fn build_command(spec: &McpServerSpec) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(&spec.command);
+    cmd.args(&spec.args);
+    agent24_tools::env_whitelist::clear_whitelist_and_extend(
+        &mut cmd,
+        spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    cmd
 }
 
 /// A connected MCP server. Dropping it tears down the child process.
@@ -92,8 +127,7 @@ impl McpServer {
         spec: &McpServerSpec,
         cancel: CancellationToken,
     ) -> Result<Self, McpError> {
-        let mut cmd = tokio::process::Command::new(&spec.command);
-        cmd.args(&spec.args);
+        let cmd = build_command(spec);
         let transport = TokioChildProcess::new(cmd)
             .map_err(|e| McpError::Spawn(spec.name.clone(), e.to_string()))?;
         let service = ()
@@ -348,5 +382,119 @@ mod tests {
         let mut result = CallToolResult::success(vec![]);
         result.structured_content = Some(serde_json::json!({"ok": true}));
         assert!(render_result(&result).contains("\"ok\""));
+    }
+
+    /// A server's own declared env (from `mcp.json`) reaches its child
+    /// alongside the fixed whitelist (PATH etc). Building the `Command` fresh
+    /// via `build_command` means it never carried an ambient secret to begin
+    /// with — the "does the DAEMON's ambient environment leak in" property is
+    /// covered end-to-end by the re-exec test below, and at the primitive
+    /// level by `agent24-tools::env_whitelist`'s tests (which pre-inject a
+    /// stand-in secret before calling the shared clearing function — not
+    /// possible here since `build_command` owns `Command::new` internally).
+    #[tokio::test]
+    async fn mcp_server_child_gets_its_own_declared_env_plus_whitelist() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("SERVER_A_TOKEN".to_owned(), "a-secret".to_owned());
+        let spec = McpServerSpec::new("printenv-probe", "printenv", vec![]).with_env(env);
+        let out = build_command(&spec).output().await.expect("spawn printenv");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("SERVER_A_TOKEN=a-secret"),
+            "server's own declared env must reach its child:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("PATH="),
+            "PATH must still reach the child:\n{stdout}"
+        );
+    }
+
+    /// End-to-end through `build_command` (the exact function `McpServer::
+    /// connect` calls): re-execs the test binary with a REAL ambient
+    /// `secret_test_key` set on the child process (via `Command::env` on the
+    /// re-exec — genuine environment there, not just a builder override),
+    /// then asserts from the outside that the re-exec'd probe (which builds
+    /// an MCP server command via `build_command` and runs it against
+    /// `printenv`) passed. `std::env::set_var` is deliberately avoided —
+    /// edition 2024 forbids it outside `unsafe` (workspace-wide policy, see
+    /// `agent24-models::router` tests) — and would race every other test in
+    /// this binary.
+    #[tokio::test]
+    async fn mcp_server_child_does_not_leak_ambient_daemon_secrets() {
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::mcp_probe_ambient_secret_is_invisible_to_server_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("secret_test_key", "leaked-if-this-appears-in-child-stdout")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// Only runs re-exec'd by the test above, where `secret_test_key` is real
+    /// ambient environment for THIS process.
+    #[tokio::test]
+    #[ignore]
+    async fn mcp_probe_ambient_secret_is_invisible_to_server_child() {
+        assert_eq!(
+            std::env::var("secret_test_key").as_deref(),
+            Ok("leaked-if-this-appears-in-child-stdout"),
+            "test setup broken: the ambient var must actually be set here"
+        );
+        let spec = McpServerSpec::new("printenv-probe", "printenv", vec![]);
+        let out = build_command(&spec).output().await.expect("spawn printenv");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("secret_test_key"),
+            "ambient daemon secret leaked into MCP server child:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("PATH="),
+            "PATH must still reach the child:\n{stdout}"
+        );
+    }
+
+    /// Server B's declared env must never leak into server A's child — each
+    /// server's `Command` is built independently from its own spec.
+    #[tokio::test]
+    async fn one_servers_declared_env_does_not_reach_another_servers_child() {
+        let mut env_a = std::collections::BTreeMap::new();
+        env_a.insert("SERVER_A_TOKEN".to_owned(), "a-secret".to_owned());
+        let spec_a = McpServerSpec::new("a", "printenv", vec![]).with_env(env_a);
+
+        let mut env_b = std::collections::BTreeMap::new();
+        env_b.insert("SERVER_B_TOKEN".to_owned(), "b-secret".to_owned());
+        let spec_b = McpServerSpec::new("b", "printenv", vec![]).with_env(env_b);
+
+        let out_a = build_command(&spec_a).output().await.expect("spawn a");
+        let stdout_a = String::from_utf8_lossy(&out_a.stdout);
+        assert!(stdout_a.contains("SERVER_A_TOKEN=a-secret"));
+        assert!(!stdout_a.contains("SERVER_B_TOKEN"));
+
+        let out_b = build_command(&spec_b).output().await.expect("spawn b");
+        let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+        assert!(stdout_b.contains("SERVER_B_TOKEN=b-secret"));
+        assert!(!stdout_b.contains("SERVER_A_TOKEN"));
+    }
+
+    /// Mutation guard: without whitelisting, `Command` inherits the full
+    /// ambient/override environment by default. Pins that baseline so the
+    /// test above is proven to exercise `env_clear()` specifically — if
+    /// `build_command` stops calling `env_whitelist::clear_whitelist_and_extend`,
+    /// the PREVIOUS test starts behaving like this one and goes red.
+    #[tokio::test]
+    async fn without_whitelisting_the_secret_would_have_leaked() {
+        let mut cmd = tokio::process::Command::new("printenv");
+        cmd.env("secret_test_key", "leaked-if-this-appears");
+        let out = cmd.output().await.expect("spawn printenv");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("secret_test_key=leaked-if-this-appears"),
+            "test baseline assumption broke: Command should inherit by default:\n{stdout}"
+        );
     }
 }

@@ -34,6 +34,15 @@ export function parseNpubs(raw: string | undefined): Set<string> {
   )
 }
 
+/** COMM-5a: F4b inbound execution is frozen by default — pulled out as a pure
+ * function (rather than inlined into the `CONFIG` object literal, which reads
+ * `process.env` once at module load) so the "unset ⇒ frozen, '1' ⇒ enabled"
+ * mapping itself has a regression test, independent of when/whether the
+ * module is imported. */
+export function parseF4bInboundEnabled(raw: string | undefined): boolean {
+  return raw === '1'
+}
+
 export const CONFIG = {
   /** The agent-speaker binary (build result). Override for a non-PATH install. */
   SPEAKER_BIN: process.env.A24_SPEAKER_BIN || 'agent-speaker',
@@ -48,6 +57,11 @@ export const CONFIG = {
     process.env.A24_NOSTR_PROFILE || path.join(HOME, '.agent24', 'agent-profile.yml'),
   /** Inbound authorization — fail-closed (SECURITY, same as F3). */
   ALLOWED_NPUBS: parseNpubs(process.env.A24_NOSTR_ALLOWED_NPUBS),
+  /** COMM-5a: F4b inbound execution is frozen by default — an allowlisted
+   * sender's message is still polled and liveness-observed, but no longer
+   * dispatched into a gated agent24d run. Set to `1` to restore the pre-freeze
+   * F4b behavior while T01-E's higher-level inbound authorization is pending. */
+  F4B_INBOUND_ENABLED: parseF4bInboundEnabled(process.env.A24_NOSTR_F4B_INBOUND),
   /** How often to poll the inbox for new peer messages. */
   POLL_INTERVAL_MS: durationMs(process.env.A24_NOSTR_POLL_MS, 5_000, 250),
   /** Hard wall-clock cap on one `agent-speaker` invocation.
