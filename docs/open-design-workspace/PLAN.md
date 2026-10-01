@@ -1,5 +1,7 @@
 # Agent24 × Open Design 实施计划（已批准，执行中）
 
+> **2026-09-29 执行顺序修订：** 长期 P0–P9 架构目标保持不变，但实现改为 Prototype-First。先完成可演示的 Embedded Creative + `agent24 acp` + Open Design runtime adapter + workspace 正向 E2E，再逐步接入完整 authority / recovery / security。当前执行里程碑见 [PROTOTYPE-FIRST-PLAN.md](PROTOTYPE-FIRST-PLAN.md)。本文件继续作为长期产品化目标与最终验收标准。
+
 > 状态：Approved / P0 + A24-OD-00 + P1 gates passed / P2 in progress
 >
 > 日期：2026-09-19
@@ -341,7 +343,7 @@ Agent24 Electron main process
 
 - `feat/open-design-workspace` 是本工作的 integration branch。
 - Agent24 主干硬依赖使用独立 feature branches 实现并分别进入 `main`，不长期只存在于 integration branch；权威清单见 [AGENT24-DEPENDENCIES.md](AGENT24-DEPENDENCIES.md)。
-- 实现按单一 feature/职责聚类为短分支和小 PR：默认目标不超过 190 个变更行，尽量不超过 200 行；达到上限先拆分，禁止积攒千行级 PR。不可分割的生成物或机械变更须显式说明例外。
+- 实现按单一 feature/职责聚类为短分支和小 PR：日常目标 200–300 个变更行，500 行为硬上限；只有不可合理拆分的原子事务、状态机或实现与必要负向测试可到 301–500 行，并须两次独立 SOL exact-head review。超过 500 行必须拆分，禁止积攒千行级 PR 或聚合无关改动。
 - `main` 更新后：先 `fetch`，查看差异和测试状态，再显式 merge `origin/main`。
 - integration branch 一旦共享，不 force-push、不重写别人已基于的历史。
 - 不触碰其他 worktree 中的未提交文件。

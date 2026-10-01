@@ -1,6 +1,8 @@
 # ADR-006：Legacy Recovery Holds
 
-> 状态：Proposed / G4 implementation blocked until accepted
+> 状态：Accepted / frozen for incremental G4 implementation
+>
+> 接受依据：项目 owner 已批准 P0–P9 计划与阶段门禁后的自动推进；后续切片不得偏离本 ADR，重大设计变化仍需重新确认。
 >
 > 覆盖：A24-OD-02 历史 Run 迁移、恢复与 serial admission
 >
@@ -131,7 +133,7 @@ lease identity，也不把“approval 已批准”表述为“工具已执行”
 
 ## 8. 实现与未来改变成本
 
-按 `<=200 changed lines` 逐层交付：ADR/fixtures、nullable bindings、cohort/hold schema、
+按 [执行门禁](../EXECUTION.md) 逐层交付：ADR/fixtures、nullable bindings、cohort/hold schema、
 typed store、legacy root seam、cohort snapshot、approval/tool/grant 回填、marker/invariants、
 classification、sweep protection、decision+intent、ready query、promotion、terminal release、
 RunManager/restart reconcile、projection、scheduler、启动屏障与 E2E。

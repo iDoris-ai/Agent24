@@ -4,12 +4,14 @@
 
 ## 当前状态
 
-- Git 分支：`feat/open-design-workspace`
-- 独立 worktree：`/Users/jason/Dev/auraai/Agent24-open-design-workspace`
-- 初始基线提交：`04ccd3a0f6271e2a5b54c4668e83cac1636127ae`
-- 已审计 Agent24 主干至：`9ab5b6ee112e7e601758cb04c9aafac4c94680c7`
-- 状态：**P0、A24-OD-00 安全门禁与 P1 基线门禁均 PASS；P2 workspace contract 执行中**
-- 实时台账：[STATUS.md](STATUS.md)
+- 当前 integration 分支：`integration/open-design-main-sync-wave20`
+- integration head：`d62f65ad97c2c68a9ed8aff99407685b5046b28d`
+- 已包含当前 `origin/main@32072b02a3c7`；当前 integration 相对 main 只有 Open Design 历史增量，没有漏同步的 main commit。
+- 当前有效 A24-OD-02 栈：**#555 → #556 → #558 → #559 → #560 → #561 → #562**；#557 为独立文档台账。
+- 状态：**P0 / P1 已完成；A24-OD-00 authority 基础已进入主线；P2 workspace contract 正在完成 run admission、terminal lease release 与 restart orphan reconciliation，仍未激活 Creative/ACP/runtime。**
+- 最新 Prototype-First 执行台账：[PROGRESS-2026-09-29.md](PROGRESS-2026-09-29.md)
+- 前一日 workspace authority 台账：[PROGRESS-2026-09-28.md](PROGRESS-2026-09-28.md)
+- 历史与长期门禁：[STATUS.md](STATUS.md)
 
 ## 文档
 
@@ -19,6 +21,7 @@
 - [Agent24 主干依赖台账](AGENT24-DEPENDENCIES.md)
 - [执行状态、PR 栈与门禁证据](STATUS.md)
 - [2026-09-22 阶段进展与 Workspace 概念模型](PROGRESS-2026-09-22.md)
+- [2026-09-28～29 A24-OD-02 小步执行台账](PROGRESS-2026-09-28.md)
 
 ## 原始会话完整性
 
@@ -35,4 +38,4 @@
 
 ## 协作约定
 
-原始 `Agent24` worktree 保持在 `main`，供当前其他工作继续使用；本工作只在独立 worktree 上进行。若 `main` 有新变化，本分支先审计差异，再采用显式 merge 同步，不对已共享的集成分支做强制 rebase，也不覆盖其他 worktree 的未提交内容。
+原始 `Agent24` worktree 保持在 `main`，供当前其他工作继续使用；Open Design 工作继续使用独立 worktree/stack。若 `main` 有新变化，先在 integration 分支审计并采用 ordinary merge 同步；已发布 PR 栈禁止 rebase/force-push。已明确 superseded 或已合并且 clean 的旧 worktree 可以清理，但不得覆盖仍有 unique unfinished 内容或仍承担 OPEN PR 的施工分支。
