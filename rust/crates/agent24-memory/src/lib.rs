@@ -2122,7 +2122,8 @@ mod forget_tests {
     }
 
     fn retract_id(owner: &str, id: &str) -> String {
-        let hash = Sha256::digest(format!("retract{owner}{id}").as_bytes());
+        let input = serde_json::to_string(&["retract", owner, id]).unwrap();
+        let hash = Sha256::digest(input.as_bytes());
         hash.iter().map(|b| format!("{b:02x}")).collect()
     }
 
@@ -2247,6 +2248,65 @@ mod forget_tests {
                 .unwrap()
                 .is_empty()
         );
-        // `search_any` is not present in this crate yet; its acceptance remains uncovered.
+        // TODO: T09/T07a integration in docs/agent/M1-PLAN-v2.md adds `search_any` coverage.
+    }
+
+    #[tokio::test]
+    async fn forget_retraction_ids_do_not_collide_across_owner_and_assertion_id() {
+        let kv = KvStore::open_memory().await.unwrap();
+        let store = kv.assertions();
+        for (owner, id) in [("alice", "xa1"), ("alicex", "a1")] {
+            store
+                .assert(&Assertion::new(
+                    id,
+                    Scope::owner(owner),
+                    "favorite_color",
+                    "is",
+                    serde_json::json!("blue"),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let retriever = kv.retriever();
+        for owner in ["alice", "alicex"] {
+            assert_eq!(retriever.search("blue", owner, 10).await.unwrap().len(), 1);
+        }
+        for (owner, id) in [("alice", "xa1"), ("alicex", "a1")] {
+            assert_eq!(kv.forget(owner, id, "t2").await.unwrap(), Forget::Forgotten);
+            assert_eq!(
+                kv.forget(owner, id, "t3").await.unwrap(),
+                Forget::AlreadyForgotten
+            );
+        }
+        for owner in ["alice", "alicex"] {
+            let events = events(&kv, owner).await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.kind, "assertion.retracted");
+        }
+        assert_ne!(
+            events(&kv, "alice").await[0].event.id,
+            events(&kv, "alicex").await[0].event.id
+        );
+        for owner in ["alice", "alicex"] {
+            assert!(
+                retriever
+                    .search("blue", owner, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        retriever.rebuild().await.unwrap();
+        for owner in ["alice", "alicex"] {
+            assert!(
+                retriever
+                    .search("blue", owner, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }

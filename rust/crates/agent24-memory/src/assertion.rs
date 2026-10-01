@@ -66,8 +66,10 @@ pub async fn forget(pool: &SqlitePool, owner: &str, id: &str, at: &str) -> Resul
         });
     }
 
+    // Preserve field boundaries so distinct owner/id pairs cannot alias.
+    let event_key = serde_json::to_string(&["retract", owner, id])?;
     let mut event = MemEvent::new(
-        crate::artifact::checksum(&format!("retract{owner}{id}")),
+        crate::artifact::checksum(&event_key),
         Scope::owner(owner),
         "assertion.retracted",
         serde_json::json!({ "assertion_id": id }),

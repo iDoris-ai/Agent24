@@ -148,8 +148,8 @@
 ### F4 查看、搜索、撤回
 
 **M1-T09 存储层同事务撤回 `forget`** [B] · 依赖：无 · ≈150 行 · **现在可入队**
-- 范围：`agent24-memory`：`pub async fn forget(pool, owner, id, at) -> Result<Forget>`（`enum Forget { Forgotten, AlreadyForgotten, NotFound }`，签名已编译验证），一个事务里：`UPDATE mem_assertions SET recorded_to=? WHERE id=? AND scope_owner=? AND recorded_to IS NULL` + `append_tx` 一条 `assertion.retracted` 事件（id = `sha256("retract" ‖ owner ‖ assertion_id)`）。挂在 `KvStore` 上暴露。
-- 验收：`cargo test -p agent24-memory forget`：成功 → 断言失效 + 1 条撤回事件；再调 → `AlreadyForgotten`、无新事件；他人 owner → `NotFound`；**配额 0 时**（事件写不进）→ Err 且断言仍有效（同成同败；反面对照：拆成两次独立写必红）；撤回后 `search`/`search_any`/`rebuild` 之后都不再返回它。
+- 范围：`agent24-memory`：`pub async fn forget(pool, owner, id, at) -> Result<Forget>`（`enum Forget { Forgotten, AlreadyForgotten, NotFound }`，签名已编译验证），一个事务里：`UPDATE mem_assertions SET recorded_to=? WHERE id=? AND scope_owner=? AND recorded_to IS NULL` + `append_tx` 一条 `assertion.retracted` 事件（id = 对 `serde_json::to_string(&["retract", owner, assertion_id])` 得到的紧凑 JSON 数组字符串取 UTF-8 字节后求 sha256）。挂在 `KvStore` 上暴露。
+- 验收：`cargo test -p agent24-memory forget`：成功 → 断言失效 + 1 条撤回事件；再调 → `AlreadyForgotten`、无新事件；他人 owner → `NotFound`；**配额 0 时**（事件写不进）→ Err 且断言仍有效（同成同败；反面对照：拆成两次独立写必红）；`(owner="alice", assertion_id="xa1")` 与 `(owner="alicex", assertion_id="a1")` 各自独立撤回，且事件 ID 不同。`search` 撤回前命中、撤回后及 `rebuild` 后均不再返回它；**待 T09 与 T07a 集成时补齐**：验证 `search_any` 在撤回前命中、撤回后不命中，且 `rebuild` 后仍不命中（当前 `ab/m1-memory` 尚无 `search_any`，因此此项未验收）。
 - 文件：`agent24-memory/src/{assertion.rs,lib.rs}`
 
 **M1-T10 记忆 REST：列出 / 搜索 / 撤回** [B] · 依赖：T07、T09 · ≈300 行
