@@ -21,6 +21,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::binary::VerifiedBinary;
+use crate::keystore_lock::KeystoreWriteLock;
 use crate::password::Password;
 
 /// Cap on stdout/stderr size, applied independently to each stream.
@@ -230,6 +231,7 @@ pub struct HyphaeRunner {
     bin: VerifiedBinary,
     home: PathBuf,
     default_timeout: Duration,
+    keystore_lock: KeystoreWriteLock,
 }
 
 impl HyphaeRunner {
@@ -238,7 +240,16 @@ impl HyphaeRunner {
             bin,
             home,
             default_timeout,
+            keystore_lock: KeystoreWriteLock::default(),
         }
+    }
+
+    /// The lock every keystore-writing Hyphae invocation must hold for its
+    /// full lifetime (COMM-HYPHAE.md §3, H3/G8; see `keystore_lock.rs`).
+    /// Exposed so a multi-step flow like `import` (COMM-HYPHAE.md §4.1) can
+    /// hold it across several invocations, not just one.
+    pub fn keystore_lock(&self) -> &KeystoreWriteLock {
+        &self.keystore_lock
     }
 
     /// Builds (but does not spawn) the child command for `inv`: absolute
@@ -345,6 +356,19 @@ impl HyphaeRunner {
         tracing::debug!(subcommand = %subcommand, exit = code, "hyphae run finished");
 
         parse_envelope(code, &output.stdout, &output.stderr)
+    }
+
+    /// Like [`Self::run`], but holds [`Self::keystore_lock`] for the entire
+    /// invocation — spawn through exit — so no second keystore-writing
+    /// invocation can start (and race `SaveKeyStore`'s unsynchronized
+    /// read-modify-write) until this one has fully finished and its process
+    /// has exited. Callers must use this, never `run`, for any Hyphae
+    /// subcommand that writes `keystore.json`: `identity create`,
+    /// `identity use`, `contact add`, and every step of `import`
+    /// (COMM-HYPHAE.md §3).
+    pub async fn run_keystore_write(&self, inv: Invocation) -> Result<Envelope, RunnerError> {
+        let _guard = self.keystore_lock.acquire().await;
+        self.run(inv).await
     }
 }
 

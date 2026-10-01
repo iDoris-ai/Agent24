@@ -1,0 +1,116 @@
+name: Hyphae lock verify
+
+# COMM-1a/COMM-1b (docs/design/COMM-HYPHAE.md §8.1): `hyphae.lock.json`
+# records a sha256 per platform, produced by a documented, supposedly
+# reproducible build recipe (`GOTOOLCHAIN=... CGO_ENABLED=0 GOOS=<os>
+# GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid='`).
+# This job is the thing that actually proves that for linux-x64: it checks
+# out Hyphae at the lock's `source_sha`, builds linux-x64 with the lock's own
+# recipe (verbatim, with `<os>`/`<arch>` substituted — so a recipe edit is
+# honored automatically, not just a hash edit), and fails if the result
+# doesn't match `hyphae.lock.json`'s `linux-x64` entry byte-for-byte.
+#
+# Triggered on changes to the lock file itself, and also on changes to this
+# workflow file — the latter so that the job actually *runs* (and so proves
+# itself) the first time this workflow is introduced, rather than sitting
+# dormant until some future, unrelated lock edit.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rust/crates/agent24-comm/hyphae.lock.json'
+      - '.github/workflows/hyphae-lock-verify.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/crates/agent24-comm/hyphae.lock.json'
+      - '.github/workflows/hyphae-lock-verify.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: hyphae-lock-verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-linux-x64:
+    name: Reproduce Hyphae linux-x64 and compare to lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Agent24 (for hyphae.lock.json)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          path: agent24
+          submodules: false
+
+      - name: Read hyphae.lock.json
+        id: lock
+        run: |
+          set -euo pipefail
+          LOCK=agent24/rust/crates/agent24-comm/hyphae.lock.json
+          SOURCE_SHA=$(jq -r '.source_sha' "$LOCK")
+          EXPECTED=$(jq -r '.binaries["linux-x64"]' "$LOCK")
+          RECIPE=$(jq -r '.recipe' "$LOCK")
+          if [ -z "$SOURCE_SHA" ] || [ "$SOURCE_SHA" = "null" ]; then
+            echo "::error::hyphae.lock.json has no source_sha"
+            exit 1
+          fi
+          {
+            echo "source_sha=$SOURCE_SHA"
+            echo "expected=$EXPECTED"
+            echo "recipe<<HYPHAE_RECIPE_EOF"
+            echo "$RECIPE"
+            echo "HYPHAE_RECIPE_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "locked source_sha=$SOURCE_SHA expected linux-x64=$EXPECTED"
+
+      - name: Checkout Hyphae at the locked source_sha
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          repository: iDoris-ai/Hyphae
+          ref: ${{ steps.lock.outputs.source_sha }}
+          path: hyphae-src
+          submodules: false
+
+      # Bootstrap toolchain only: the recipe's own `GOTOOLCHAIN=...` prefix
+      # pins and auto-fetches the exact Go version the lock requires.
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version: 'stable'
+
+      - name: Build linux-x64 per the locked recipe
+        working-directory: hyphae-src
+        env:
+          HYPHAE_RECIPE: ${{ steps.lock.outputs.recipe }}
+        run: |
+          set -euo pipefail
+          # Substitute the recipe's own <os>/<arch> placeholders for this
+          # one platform; everything else in the recipe string (including
+          # its own GOTOOLCHAIN=... prefix) runs exactly as the lock wrote
+          # it, so a future recipe edit is honored without touching this
+          # workflow.
+          cmd=$(printf '%s' "$HYPHAE_RECIPE" | sed -e 's/<os>/linux/g' -e 's/<arch>/amd64/g')
+          echo "+ $cmd"
+          sh -c "$cmd"
+          test -f hyphae || { echo "::error::recipe did not produce ./hyphae"; exit 1; }
+
+      - name: Compare sha256 to hyphae.lock.json
+        env:
+          EXPECTED: ${{ steps.lock.outputs.expected }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" = "null" ]; then
+            echo "::error::hyphae.lock.json has no recorded linux-x64 hash to verify against"
+            exit 1
+          fi
+          actual=$(sha256sum hyphae-src/hyphae | awk '{print $1}')
+          echo "expected=$EXPECTED"
+          echo "actual=$actual"
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::linux-x64 build (sha256 $actual) does not match hyphae.lock.json's recorded hash ($EXPECTED)"
+            exit 1
+          fi
+          echo "linux-x64 reproducible build matches hyphae.lock.json ($actual)"
