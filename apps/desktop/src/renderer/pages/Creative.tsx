@@ -8,6 +8,7 @@ function rectOf(el: HTMLElement): { x: number; y: number; width: number; height:
 export default function CreativePage(): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const [error, setError] = useState<string | null>(null)
+  const [restarting, setRestarting] = useState(false)
 
   useEffect(() => {
     const host = hostRef.current
@@ -33,9 +34,30 @@ export default function CreativePage(): JSX.Element {
     }
   }, [])
 
+  const restart = async (): Promise<void> => {
+    const host = hostRef.current
+    if (!host || restarting) return
+    setRestarting(true)
+    try {
+      const result = await window.agent24.creativeRestart(rectOf(host))
+      setError(result.ok ? null : (result.error ?? 'Open Design failed to restart'))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Open Design failed to restart')
+    } finally {
+      setRestarting(false)
+    }
+  }
+
   return (
     <div ref={hostRef} className="creative-host">
-      {error && <div className="creative-error">Open Design unavailable: {error}</div>}
+      {error && (
+        <div className="creative-error">
+          <div>Open Design unavailable: {error}</div>
+          <button className="btn btn-primary" type="button" disabled={restarting} onClick={() => void restart()}>
+            {restarting ? 'Restarting…' : 'Retry Open Design'}
+          </button>
+        </div>
+      )}
     </div>
   )
 }

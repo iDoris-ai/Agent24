@@ -34,6 +34,8 @@ const api = {
     ipcRenderer.invoke(IpcChannels.BackendEndpoint),
   creativeShow: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>
     ipcRenderer.invoke(IpcChannels.CreativeShow, bounds),
+  creativeRestart: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>
+    ipcRenderer.invoke(IpcChannels.CreativeRestart, bounds),
   creativeBounds: (bounds: CreativeViewBounds): Promise<void> =>
     ipcRenderer.invoke(IpcChannels.CreativeBounds, bounds),
   creativeHide: (): Promise<void> =>

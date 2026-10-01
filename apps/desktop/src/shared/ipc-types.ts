@@ -8,6 +8,7 @@ export const IpcChannels = {
   BackendProxy: 'backend:proxy',
   BackendEndpoint: 'backend:endpoint',
   CreativeShow: 'creative:show',
+  CreativeRestart: 'creative:restart',
   CreativeBounds: 'creative:bounds',
   CreativeHide: 'creative:hide',
   OmlxDetect: 'omlx:detect',

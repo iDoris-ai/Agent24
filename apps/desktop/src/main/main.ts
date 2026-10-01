@@ -70,7 +70,10 @@ function hideCreativeView(): void {
   creativeView.setBounds({ x: 0, y: 0, width: 1, height: 1 })
 }
 
-async function showCreativeView(bounds: CreativeViewBounds): Promise<CreativeViewResult> {
+async function showCreativeView(
+  bounds: CreativeViewBounds,
+  forceReload = false,
+): Promise<CreativeViewResult> {
   const win = mainWin
   if (!win || win.isDestroyed()) return { ok: false, error: 'Agent24 window is unavailable' }
 
@@ -114,10 +117,16 @@ async function showCreativeView(bounds: CreativeViewBounds): Promise<CreativeVie
 
   creativeView.setBounds(normalizedBounds(bounds))
   const current = creativeView.webContents.getURL()
-  if (classifyCreativeUrl(current, status.origin) !== 'same-origin') {
+  if (forceReload || classifyCreativeUrl(current, status.origin) !== 'same-origin') {
     await creativeView.webContents.loadURL(status.origin)
   }
   return { ok: true, origin: status.origin }
+}
+
+async function restartCreativeView(bounds: CreativeViewBounds): Promise<CreativeViewResult> {
+  await creativeServeWeb.stop()
+  creativeOrigin = null
+  return showCreativeView(bounds, true)
 }
 
 function createMainWindow(): BrowserWindow {
@@ -209,6 +218,7 @@ app.whenReady().then(() => {
   registerIpcHandlers()
   mainWin = createMainWindow()
   ipcMain.handle(IpcChannels.CreativeShow, (_event, bounds: CreativeViewBounds) => showCreativeView(bounds))
+  ipcMain.handle(IpcChannels.CreativeRestart, (_event, bounds: CreativeViewBounds) => restartCreativeView(bounds))
   ipcMain.handle(IpcChannels.CreativeBounds, (_event, bounds: CreativeViewBounds) => {
     if (creativeView && !creativeView.webContents.isDestroyed()) creativeView.setBounds(normalizedBounds(bounds))
   })
