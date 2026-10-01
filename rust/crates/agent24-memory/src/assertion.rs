@@ -24,9 +24,63 @@ use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
 use crate::Result;
-use crate::event::{EventId, Scope};
+use crate::event::{EventId, EventLog, MemEvent, Origin, Scope, Trust};
 
 pub type AssertionId = String;
+
+/// Outcome of an owner-scoped withdrawal; the assertion row is always retained.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Forget {
+    Forgotten,
+    AlreadyForgotten,
+    /// Missing or owned by somebody else, without disclosing which.
+    NotFound,
+}
+
+/// Close a belief and append its retraction event atomically. Repeated calls
+/// preserve the first withdrawal time and do not append another event.
+pub async fn forget(pool: &SqlitePool, owner: &str, id: &str, at: &str) -> Result<Forget> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let updated = sqlx::query(
+        "UPDATE mem_assertions SET recorded_to = ?
+         WHERE id = ? AND scope_owner = ? AND recorded_to IS NULL",
+    )
+    .bind(at)
+    .bind(id)
+    .bind(owner)
+    .execute(&mut *tx)
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM mem_assertions WHERE id = ? AND scope_owner = ?")
+                .bind(id)
+                .bind(owner)
+                .fetch_optional(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        return Ok(if exists.is_some() {
+            Forget::AlreadyForgotten
+        } else {
+            Forget::NotFound
+        });
+    }
+
+    let mut event = MemEvent::new(
+        crate::artifact::checksum(&format!("retract{owner}{id}")),
+        Scope::owner(owner),
+        "assertion.retracted",
+        serde_json::json!({ "assertion_id": id }),
+        Origin {
+            source: "memory.forget".to_owned(),
+            trust: Trust::UserSaid,
+        },
+    );
+    event.at = at.to_owned();
+    EventLog::append_tx(&mut tx, &event).await?;
+    tx.commit().await?;
+    Ok(Forget::Forgotten)
+}
 
 /// How a belief was acquired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
