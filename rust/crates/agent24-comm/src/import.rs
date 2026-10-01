@@ -14,11 +14,12 @@
 //! pin as unchanged.
 
 use std::ffi::OsString;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rustix::fs::{FlockOperation, flock};
+use rustix::fd::OwnedFd;
+use rustix::fs::{FlockOperation, Mode, OFlags, flock};
 use serde_json::Value;
 
 use crate::error::{CommError, map_envelope_failure, map_runner_error};
@@ -113,8 +114,46 @@ pub async fn import(
     // this path at a time.
     let staging_home = comm_dir.join("hyphae-home.staging");
 
+    // ---- step 1a: validate `from` before ANYTHING below touches
+    // `staging_home` --------------------------------------------------
+    // The symlink/owner check on `from` itself MUST run on the path as
+    // given, before `canonicalize` — canonicalize resolves away every
+    // symlink in the path, including a symlinked final component, which
+    // would make "the source directory is a symlink" unreachable if lstat
+    // only ever saw the already-resolved result (COMM-2b's own acceptance
+    // criterion requires this rejection to actually fire).
+    //
+    // Codex 挑战 High #1: this whole block runs here, in `import()`,
+    // BEFORE the lock is acquired and before `run_import` is ever called
+    // — not only before `run_import`'s own stale-staging wipe, but also
+    // before THIS function's own `result.is_err()` cleanup below, which
+    // would otherwise still wipe `staging_home` whenever `run_import`
+    // fails for any reason at all, including "because `from` pointed at
+    // `staging_home` itself". Once this passes, `source_root` is handed
+    // to `run_import` as an already-resolved path — `run_import` and the
+    // fd-pinned opens inside it never trust this check's result for
+    // anything past this point, though (Codex High #2): they each
+    // independently reopen and re-validate `source_hyphae` and its files.
+    check_not_symlink_and_owned(&req.from).await?;
+    let source_root = tokio::fs::canonicalize(&req.from).await.map_err(|e| {
+        CommError::Invalid(format!(
+            "from {:?} is not a readable directory: {e}",
+            req.from
+        ))
+    })?;
+    reject_source_overlapping_comm_dir(&source_root, &comm_dir).await?;
+
     let _guard = runner.keystore_lock().acquire().await;
-    let result = run_import(runner, password_store, home, &comm_dir, &staging_home, req).await;
+    let result = run_import(
+        runner,
+        password_store,
+        home,
+        &comm_dir,
+        &staging_home,
+        &source_root,
+        req,
+    )
+    .await;
     if result.is_err() {
         let _ = tokio::fs::remove_dir_all(&staging_home).await;
     }
@@ -127,6 +166,7 @@ async fn run_import(
     home: &Path,
     comm_dir: &Path,
     staging_home: &Path,
+    source_root: &Path,
     req: ImportRequest,
 ) -> Result<ImportReport, CommError> {
     // A stale `hyphae-home.staging` can only survive here if a PREVIOUS
@@ -137,31 +177,17 @@ async fn run_import(
     // the new source doesn't have (so a stale leftover, e.g. an
     // `outbox.json` from a crashed run whose source legitimately had one,
     // would otherwise silently survive into THIS import's result even
-    // though the current source doesn't have one at all).
+    // though the current source doesn't have one at all). Safe to run now
+    // that `from` is confirmed not to overlap `comm_dir`.
     let _ = tokio::fs::remove_dir_all(staging_home).await;
 
-    // ---- step 1: path validation ---------------------------------------
-    // The symlink/owner check on `from` itself MUST run on the path as
-    // given, before `canonicalize` — canonicalize resolves away every
-    // symlink in the path, including a symlinked final component, which
-    // would make "the source directory is a symlink" unreachable if lstat
-    // only ever saw the already-resolved result (COMM-2b's own acceptance
-    // criterion requires this rejection to actually fire).
-    check_not_symlink_and_owned(&req.from).await?;
-    let source_root = tokio::fs::canonicalize(&req.from).await.map_err(|e| {
-        CommError::Invalid(format!(
-            "from {:?} is not a readable directory: {e}",
-            req.from
-        ))
-    })?;
     let source_hyphae = source_root.join(".hyphae");
-    check_not_symlink_and_owned(&source_hyphae).await?;
-    for name in IMPORT_FILES {
-        let p = source_hyphae.join(name);
-        if path_exists(&p).await {
-            check_not_symlink_and_owned(&p).await?;
-        }
-    }
+    // Codex 挑战 High #2: 这里的检查结果不会被后面任何一步「信任」——
+    // `fingerprint_all`/`copy_import_files` 各自独立地用
+    // `O_NOFOLLOW`+`fstat` 重新打开 `source_hyphae` 和六个文件，而不是
+    // 「现在 stat 一下路径，后面再按同一个路径重新 open」。这里只是为了
+    // 在拿锁、复制之前给出一个干净的早失败。
+    drop(open_source_dir(&source_hyphae).await?);
     ensure_target_empty(home).await?;
 
     // ---- step 2: occupation probe + flock, held across the copy --------
@@ -172,6 +198,13 @@ async fn run_import(
     let mut after = fingerprint_all(&source_hyphae).await?;
     if after != before {
         before = after;
+        // Codex 挑战 Medium #3: 不清空直接重试，`copy_import_files` 只会
+        // 跳过源里已经消失的文件（它从不删除目标里的旧文件），于是第一
+        // 趟复制留下的过期文件（例如已被 checkpoint 掉的
+        // messages.db-wal）会原样留在 staging 里，最终随 rename 混进提
+        // 交结果。重试前整个清空 staging，让下面的 `copy_import_files`
+        // 从零重建。
+        let _ = tokio::fs::remove_dir_all(staging_home).await;
         db_files = copy_import_files(&source_hyphae, &staging_hyphae).await?;
         after = fingerprint_all(&source_hyphae).await?;
         if after != before {
@@ -183,6 +216,10 @@ async fn run_import(
             ));
         }
     }
+    // Codex 挑战 Medium #4: 在锁还持有的时候就记录源 outbox 的条目数快
+    // 照，而不是等到锁释放、验证阶段才去读 —— 这样比较的才是刚刚复制进
+    // staging 的那份字节，不是锁放开之后源目录可能已经变化的内容。
+    let expected_outbox_entries = count_source_outbox_entries(&source_hyphae).await?;
     // Copy is done: release the source's outbox lock now, not held through
     // verification/commit below (COMM-HYPHAE.md §4.1 step 2: "成功则一直持
     // 有到复制结束").
@@ -209,12 +246,10 @@ async fn run_import(
     let contacts = run_list(&staging_runner, &["contact", "list"]).await?;
     let outbox = run_list(&staging_runner, &["storage", "outbox", "list"]).await?;
 
-    if let Some(expected) = count_source_outbox_entries(&source_hyphae).await?
-        && expected != outbox.len()
-    {
+    if expected_outbox_entries != outbox.len() {
         return Err(CommError::Upstream(format!(
-            "outbox entry count mismatch after import: source outbox.json has {expected} \
-             entries, hyphae reports {}",
+            "outbox entry count mismatch after import: source outbox.json has \
+             {expected_outbox_entries} entries, hyphae reports {}",
             outbox.len()
         )));
     }
@@ -354,14 +389,11 @@ async fn verify_password(
 // path validation
 // ---------------------------------------------------------------------
 
-async fn path_exists(path: &Path) -> bool {
-    tokio::fs::symlink_metadata(path).await.is_ok()
-}
-
 /// Rejects a symlink or a path not owned by the current process's uid.
-/// Called only on paths that are confirmed to exist — a missing optional
-/// file (e.g. `outbox.json` before anything has ever been queued) is simply
-/// skipped by the caller.
+/// Only ever called on `req.from` itself — the path as given by the
+/// caller, before `canonicalize` — never again on any path derived from
+/// it; everything below this point re-validates for itself on the actual
+/// fd it is about to use (Codex 挑战 High #2).
 async fn check_not_symlink_and_owned(path: &Path) -> Result<(), CommError> {
     let meta = tokio::fs::symlink_metadata(path)
         .await
@@ -375,6 +407,37 @@ async fn check_not_symlink_and_owned(path: &Path) -> Result<(), CommError> {
     if meta.uid() != current_uid {
         return Err(CommError::Invalid(format!(
             "{path:?} is not owned by the current user (uid {current_uid}); refusing to import"
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a `from` whose canonical path coincides with, lies inside, or
+/// contains `comm_dir` — the directory holding both this module's
+/// well-known staging path (`hyphae-home.staging`) and the real `home`
+/// itself. Codex 挑战 High #1: this MUST run before anything deletes
+/// `staging_home` — a `from` that pointed at it (or anywhere else under
+/// `comm_dir`) would otherwise have its own data wiped by the
+/// stale-staging cleanup, before `from` had even been looked at.
+/// `comm_dir` is canonicalized fresh here (never trusted from an earlier
+/// call) and compared against the already-canonical `source_root` with
+/// `Path::starts_with`, which only inspects components both sides already
+/// resolved — no additional TOCTOU window.
+async fn reject_source_overlapping_comm_dir(
+    source_root: &Path,
+    comm_dir: &Path,
+) -> Result<(), CommError> {
+    let comm_dir_canon = tokio::fs::canonicalize(comm_dir)
+        .await
+        .map_err(|e| CommError::Upstream(format!("canonicalizing {comm_dir:?}: {e}")))?;
+    if source_root == comm_dir_canon
+        || source_root.starts_with(&comm_dir_canon)
+        || comm_dir_canon.starts_with(source_root)
+    {
+        return Err(CommError::Invalid(format!(
+            "from {source_root:?} overlaps with comm's own state directory {comm_dir_canon:?} \
+             (which holds both the real hyphae-home and this import's own staging area); \
+             refusing to import from inside or above it"
         )));
     }
     Ok(())
@@ -402,23 +465,144 @@ async fn ensure_target_empty(home: &Path) -> Result<(), CommError> {
 }
 
 // ---------------------------------------------------------------------
+// atomic, fd-pinned opens (Codex 挑战 High #2 / Medium #5)
+//
+// Every open below resolves its path exactly once and validates the exact
+// fd it got back (via `fstat` on that fd, never a separate `stat()` on a
+// path followed by a later, independently-resolved open) — closing the
+// window where the source directory or one of its files could be swapped
+// out between "check" and "use". `O_NOFOLLOW` turns a symlinked
+// component into an open-time `ELOOP` instead of silently following it;
+// `O_NONBLOCK` on the per-file opens means a FIFO planted at one of
+// `IMPORT_FILES` (or at `outbox.json.lock`) makes `open()` fail outright
+// instead of blocking forever and starving `KeystoreWriteLock` (Medium
+// #5) — the `fstat` right after still re-confirms it is a regular file,
+// since a non-blocking open of a FIFO *can* succeed immediately when a
+// reader/writer is already present on the other end.
+// ---------------------------------------------------------------------
+
+/// Maps an `open`/`openat` errno to the `CommError` it should surface as.
+/// Shared by every atomic open below — `NOENT` is handled by each caller
+/// individually (it means "missing", not an error, for every optional
+/// `IMPORT_FILES` entry).
+fn open_errno_to_comm_error(e: rustix::io::Errno, path: &Path) -> CommError {
+    match e {
+        rustix::io::Errno::LOOP => CommError::Invalid(format!(
+            "{path:?} is a symlink; refusing to import through one"
+        )),
+        rustix::io::Errno::NOTDIR => CommError::Invalid(format!("{path:?} is not a directory")),
+        rustix::io::Errno::NOENT => CommError::Invalid(format!("{path:?} does not exist")),
+        // `ENXIO`: opening a FIFO `O_WRONLY | O_NONBLOCK` with no reader on
+        // the other end fails immediately instead of blocking (POSIX) —
+        // exactly the FIFO case `try_lock_outbox` guards against (Codex
+        // 挑战 Medium #5); a read-only open of the same FIFO would instead
+        // succeed and get caught by the regular-file `fstat` check below.
+        rustix::io::Errno::NXIO => CommError::Invalid(format!(
+            "{path:?} is a FIFO with no reader; refusing to import"
+        )),
+        _ => CommError::Upstream(format!("opening {path:?}: {e}")),
+    }
+}
+
+/// `fstat`s `fd` (not a path) and rejects unless it is owned by the
+/// current uid.
+fn reject_unless_owned(fd: &OwnedFd, path_for_error: &Path) -> Result<(), CommError> {
+    let stat = rustix::fs::fstat(fd)
+        .map_err(|e| CommError::Upstream(format!("fstat {path_for_error:?}: {e}")))?;
+    let current_uid = rustix::process::getuid().as_raw();
+    if stat.st_uid != current_uid {
+        return Err(CommError::Invalid(format!(
+            "{path_for_error:?} is not owned by the current user (uid {current_uid}); refusing \
+             to import"
+        )));
+    }
+    Ok(())
+}
+
+/// `fstat`s `fd` (not a path) and rejects unless it is a regular file —
+/// in particular, not a FIFO (Codex 挑战 Medium #5).
+fn reject_unless_regular_file(fd: &OwnedFd, path_for_error: &Path) -> Result<(), CommError> {
+    let stat = rustix::fs::fstat(fd)
+        .map_err(|e| CommError::Upstream(format!("fstat {path_for_error:?}: {e}")))?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(CommError::Invalid(format!(
+            "{path_for_error:?} is not a regular file (e.g. a FIFO); refusing to import"
+        )));
+    }
+    Ok(())
+}
+
+/// Opens `source_hyphae` with `O_DIRECTORY | O_NOFOLLOW` (so a non-dir or
+/// a symlink to one fails the open itself, atomically) and confirms via
+/// `fstat` on the resulting fd that it is owned by the current uid.
+fn open_source_dir_blocking(source_hyphae: &Path) -> Result<OwnedFd, CommError> {
+    let fd = rustix::fs::open(
+        source_hyphae,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| open_errno_to_comm_error(e, source_hyphae))?;
+    reject_unless_owned(&fd, source_hyphae)?;
+    Ok(fd)
+}
+
+/// Async wrapper around [`open_source_dir_blocking`] for callers that just
+/// want the early, fail-fast validation (step 1) — the fd is dropped
+/// immediately by the caller.
+async fn open_source_dir(source_hyphae: &Path) -> Result<OwnedFd, CommError> {
+    let source_hyphae = source_hyphae.to_path_buf();
+    tokio::task::spawn_blocking(move || open_source_dir_blocking(&source_hyphae))
+        .await
+        .map_err(|e| CommError::Upstream(format!("open task panicked: {e}")))?
+}
+
+/// Opens `name` inside the directory `dir_fd` already points at, with
+/// `O_NOFOLLOW | O_NONBLOCK`, and confirms via `fstat` on the resulting fd
+/// that it is owned by the current uid and a regular file. Returns `None`
+/// only for a genuinely missing file (the normal case for e.g.
+/// `outbox.json` before anything has ever been queued) — every other
+/// rejection is an error.
+fn open_source_file(dir_fd: &OwnedFd, name: &str) -> Result<Option<std::fs::File>, CommError> {
+    let name_path = Path::new(name);
+    match rustix::fs::openat(
+        dir_fd,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            reject_unless_owned(&fd, name_path)?;
+            reject_unless_regular_file(&fd, name_path)?;
+            Ok(Some(std::fs::File::from(fd)))
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(e) => Err(open_errno_to_comm_error(e, name_path)),
+    }
+}
+
+// ---------------------------------------------------------------------
 // occupation probe
 // ---------------------------------------------------------------------
 
 /// Non-blockingly `flock`s `lock_path` (creating it with `O_CREAT` if it
 /// does not exist yet, mirroring Hyphae's own lazy creation of
-/// `outbox.json.lock`). Returns the open file — hold it for as long as the
-/// lock must be held; dropping it releases the lock when the fd closes.
-async fn try_lock_outbox(lock_path: PathBuf) -> Result<std::fs::File, CommError> {
+/// `outbox.json.lock`). `O_NOFOLLOW` rejects a symlinked lock path;
+/// `O_NONBLOCK` plus the `fstat`-based regular-file check right after
+/// (Codex 挑战 Medium #5) means a FIFO planted at this path can't block
+/// this open forever and starve `KeystoreWriteLock`. Returns the open fd —
+/// hold it for as long as the lock must be held; dropping it releases the
+/// lock when the fd closes.
+async fn try_lock_outbox(lock_path: PathBuf) -> Result<OwnedFd, CommError> {
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| CommError::Upstream(format!("opening {lock_path:?}: {e}")))?;
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(file),
+        let fd = rustix::fs::open(
+            &lock_path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|e| open_errno_to_comm_error(e, &lock_path))?;
+        reject_unless_regular_file(&fd, &lock_path)?;
+        match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(fd),
             // `WOULDBLOCK` and `AGAIN` are the same errno value on every
             // platform this crate targets (macOS, Linux) — matching only one
             // avoids an unreachable-pattern warning.
@@ -443,21 +627,37 @@ struct Fingerprint {
     mtime: Option<SystemTime>,
 }
 
+/// Fingerprints every entry in [`IMPORT_FILES`] by opening the source
+/// directory and each file atomically (see the "atomic, fd-pinned opens"
+/// section above) rather than `stat()`-ing a path — each call here is a
+/// fresh, independently-validated snapshot, which is what lets the
+/// before/after comparison in `run_import` actually detect a directory or
+/// file swapped out between the two calls, rather than trusting a check
+/// made long before.
 async fn fingerprint_all(source_hyphae: &Path) -> Result<Vec<Option<Fingerprint>>, CommError> {
-    let mut out = Vec::with_capacity(IMPORT_FILES.len());
-    for name in IMPORT_FILES {
-        let p = source_hyphae.join(name);
-        let fp = match tokio::fs::metadata(&p).await {
-            Ok(m) => Some(Fingerprint {
-                size: m.len(),
-                mtime: m.modified().ok(),
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(CommError::Upstream(format!("stat {p:?}: {e}"))),
-        };
-        out.push(fp);
-    }
-    Ok(out)
+    let source_hyphae = source_hyphae.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let dir_fd = open_source_dir_blocking(&source_hyphae)?;
+        let mut out = Vec::with_capacity(IMPORT_FILES.len());
+        for name in IMPORT_FILES {
+            let fp = match open_source_file(&dir_fd, name)? {
+                Some(file) => {
+                    let meta = file.metadata().map_err(|e| {
+                        CommError::Upstream(format!("fstat (metadata) {name}: {e}"))
+                    })?;
+                    Some(Fingerprint {
+                        size: meta.len(),
+                        mtime: meta.modified().ok(),
+                    })
+                }
+                None => None,
+            };
+            out.push(fp);
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| CommError::Upstream(format!("fingerprint task panicked: {e}")))?
 }
 
 /// Copies every present file in [`IMPORT_FILES`] from `source_hyphae` into
@@ -465,51 +665,80 @@ async fn fingerprint_all(source_hyphae: &Path) -> Result<Vec<Option<Fingerprint>
 /// file to mode 0600. Returns the names that were actually present and
 /// copied (missing source files — e.g. `outbox.json` before anything has
 /// ever been queued — are skipped, not an error).
+///
+/// `dest_hyphae` is expected to be empty before this runs — `run_import`
+/// guarantees that by wiping `staging_home` wholesale before the first
+/// call, and again before any retry (Codex 挑战 Medium #3) — this
+/// function itself only ever adds files, never removes one, so calling it
+/// twice against a destination that already has stale content from a
+/// previous pass would let that stale content survive uncopied-over.
 async fn copy_import_files(
     source_hyphae: &Path,
     dest_hyphae: &Path,
 ) -> Result<Vec<String>, CommError> {
-    tokio::fs::create_dir_all(dest_hyphae)
-        .await
-        .map_err(|e| CommError::Upstream(format!("creating {dest_hyphae:?}: {e}")))?;
-    tokio::fs::set_permissions(dest_hyphae, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|e| CommError::Upstream(format!("chmod {dest_hyphae:?}: {e}")))?;
+    let source_hyphae = source_hyphae.to_path_buf();
+    let dest_hyphae = dest_hyphae.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Vec<String>, CommError> {
+        std::fs::create_dir_all(&dest_hyphae)
+            .map_err(|e| CommError::Upstream(format!("creating {dest_hyphae:?}: {e}")))?;
+        std::fs::set_permissions(&dest_hyphae, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| CommError::Upstream(format!("chmod {dest_hyphae:?}: {e}")))?;
 
-    let mut copied = Vec::new();
-    for name in IMPORT_FILES {
-        let src = source_hyphae.join(name);
-        let dst = dest_hyphae.join(name);
-        match tokio::fs::copy(&src, &dst).await {
-            Ok(_) => {
-                tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))
-                    .await
-                    .map_err(|e| CommError::Upstream(format!("chmod {dst:?}: {e}")))?;
-                copied.push((*name).to_owned());
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(CommError::Upstream(format!("copying {src:?}: {e}"))),
+        let dir_fd = open_source_dir_blocking(&source_hyphae)?;
+        let mut copied = Vec::new();
+        for name in IMPORT_FILES {
+            let Some(mut src_file) = open_source_file(&dir_fd, name)? else {
+                continue;
+            };
+            let dst_path = dest_hyphae.join(name);
+            let mut dst_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&dst_path)
+                .map_err(|e| CommError::Upstream(format!("creating {dst_path:?}: {e}")))?;
+            std::io::copy(&mut src_file, &mut dst_file)
+                .map_err(|e| CommError::Upstream(format!("copying {name}: {e}")))?;
+            copied.push((*name).to_owned());
         }
-    }
-    Ok(copied)
+        Ok(copied)
+    })
+    .await
+    .map_err(|e| CommError::Upstream(format!("copy task panicked: {e}")))?
 }
 
 /// Parses the source's own `outbox.json` directly (independent of whatever
 /// Hyphae itself reports) so the two can be cross-checked (H2's own
-/// acceptance criterion: "导入前后 outbox 条目数一致"). `None` means the
-/// file's shape couldn't be read as a plain JSON array — the cross-check is
-/// then skipped rather than guessed at. A missing file counts as zero
-/// entries (never queued, the normal case for a never-used Hyphae HOME).
-async fn count_source_outbox_entries(source_hyphae: &Path) -> Result<Option<usize>, CommError> {
+/// acceptance criterion: "导入前后 outbox 条目数一致"). The real on-disk
+/// shape (`internal/messaging/outbox.go`'s `types.Outbox`, confirmed
+/// against the locked Hyphae source, commit `a4aa606`) is a top-level
+/// object, `{"entries": [...]}` — Codex 挑战 Medium #4: the previous
+/// version only accepted a bare top-level array, which no real
+/// `outbox.json` has ever been, so this cross-check silently no-op'd
+/// (returned `None`, "skip") against every real file. Any other shape —
+/// including the legacy bare-array shape, which is not what Hyphae
+/// actually writes — is now a hard error rather than a silent skip. A
+/// missing file counts as zero entries (never queued, the normal case for
+/// a never-used Hyphae HOME).
+async fn count_source_outbox_entries(source_hyphae: &Path) -> Result<usize, CommError> {
     let path = source_hyphae.join("outbox.json");
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(CommError::Upstream(format!("reading {path:?}: {e}"))),
     };
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|e| CommError::Upstream(format!("{path:?} is not valid json: {e}")))?;
-    Ok(value.as_array().map(Vec::len))
+    value
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| {
+            CommError::Upstream(format!(
+                "{path:?} does not have the expected {{\"entries\": [...]}} shape"
+            ))
+        })
 }
 
 /// `keystore.json`'s `salt` field, read directly from the (already copied)
@@ -661,12 +890,15 @@ esac
         )
         .await
         .unwrap();
+        // Real shape, confirmed against the locked Hyphae source
+        // (`internal/messaging/outbox.go`'s `types.Outbox`): a top-level
+        // object, `{"entries": [...]}`, never a bare array.
         let outbox_items: Vec<String> = (0..outbox_len)
-            .map(|i| format!("{{\"event_id\":\"e{i}\"}}"))
+            .map(|i| format!("{{\"queue_id\":\"q{i}\",\"id\":\"e{i}\",\"status\":\"pending\"}}"))
             .collect();
         tokio::fs::write(
             hyphae_dir.join("outbox.json"),
-            format!("[{}]", outbox_items.join(",")),
+            format!("{{\"entries\":[{}]}}", outbox_items.join(",")),
         )
         .await
         .unwrap();
@@ -1103,6 +1335,341 @@ esac
                 .await
                 .unwrap_or(false),
             "a stale outbox.json from a previous crashed import leaked into this one"
+        );
+    }
+
+    // ---- Codex 挑战 High #1: `from` overlapping comm's own staging/home --
+
+    #[tokio::test]
+    async fn import_from_the_staging_directory_itself_is_rejected_without_wiping_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let comm_dir = tmp.path().join("comm");
+        let home = comm_dir.join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        // A caller who (by mistake, or malice) points `from` at comm's own
+        // well-known staging path — pre-populate it with data that MUST
+        // survive the rejection untouched.
+        let staging_home = comm_dir.join("hyphae-home.staging");
+        write_source_fixture(&staging_home, 1).await;
+        let before = fingerprint_hashes(&staging_home.join(".hyphae")).await;
+
+        let runner = build_runner(tmp.path(), NEVER_RUN_SCRIPT).await;
+        let store = MemoryPasswordStore::new();
+
+        let err = import(
+            &runner,
+            &store,
+            &home,
+            ImportRequest {
+                from: staging_home.clone(),
+                confirm: true,
+                password: Some(Password::new(b"irrelevant".to_vec()).unwrap()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CommError::Invalid(ref m) if m.contains("overlaps")),
+            "{err:?}"
+        );
+
+        // The whole point of the fix: nothing got wiped before the
+        // rejection fired — without it, `run_import`'s unconditional
+        // stale-staging cleanup (and/or `import()`'s own
+        // cleanup-on-error) would have deleted this directory's contents
+        // even though the error has nothing to do with staleness.
+        let after = fingerprint_hashes(&staging_home.join(".hyphae")).await;
+        assert_eq!(
+            before, after,
+            "from == staging_home must not have its data wiped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_also_rejects_from_overlapping_comm_dir_without_wiping_it() {
+        // The bug this guards against fired for dry_run too (the task's
+        // own wording: "dry_run 也会触发") — the cleanup path doesn't care
+        // whether a commit was ever going to happen.
+        let tmp = tempfile::tempdir().unwrap();
+        let comm_dir = tmp.path().join("comm");
+        let home = comm_dir.join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let staging_home = comm_dir.join("hyphae-home.staging");
+        write_source_fixture(&staging_home, 0).await;
+        let before = fingerprint_hashes(&staging_home.join(".hyphae")).await;
+
+        let runner = build_runner(tmp.path(), NEVER_RUN_SCRIPT).await;
+        let store = MemoryPasswordStore::new();
+
+        let err = import(
+            &runner,
+            &store,
+            &home,
+            ImportRequest {
+                from: staging_home.clone(),
+                confirm: true,
+                password: None,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CommError::Invalid(ref m) if m.contains("overlaps")),
+            "{err:?}"
+        );
+        let after = fingerprint_hashes(&staging_home.join(".hyphae")).await;
+        assert_eq!(before, after);
+    }
+
+    // ---- Codex 挑战 High #2: no stale check trusted past the point where --
+    // ---- the source could have been swapped ------------------------------
+
+    #[tokio::test]
+    async fn a_source_directory_swapped_for_a_symlink_after_the_early_check_is_still_caught() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("old-home");
+        write_source_fixture(&from, 0).await;
+        let source_hyphae = from.join(".hyphae");
+
+        // The early, fail-fast check `run_import` does right after
+        // resolving `source_root` passes against the real directory.
+        drop(open_source_dir(&source_hyphae).await.unwrap());
+
+        // Swap it for a symlink elsewhere — exactly the kind of
+        // substitution a one-time, never-re-checked validation would
+        // miss.
+        let elsewhere = tmp.path().join("elsewhere");
+        tokio::fs::create_dir_all(&elsewhere).await.unwrap();
+        tokio::fs::remove_dir_all(&source_hyphae).await.unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &source_hyphae).unwrap();
+
+        // `fingerprint_all` (used for both the pre- and post-copy
+        // snapshot in `run_import`) independently reopens `source_hyphae`
+        // from scratch and must reject it fresh, rather than trusting the
+        // earlier, now-stale successful check.
+        let err = fingerprint_all(&source_hyphae).await.unwrap_err();
+        // `O_NOFOLLOW | O_DIRECTORY` on a symlink rejects it atomically
+        // either way — the exact errno (`ELOOP` vs. `ENOTDIR`) is
+        // platform-dependent (observed `ENOTDIR` on this macOS host),
+        // but both map to a hard `Invalid` rejection, never a silent
+        // follow-through.
+        assert!(
+            matches!(err, CommError::Invalid(ref m) if m.contains("symlink") || m.contains("not a directory")),
+            "{err:?}"
+        );
+    }
+
+    // ---- Codex 挑战 Medium #3: a retry must rebuild staging from scratch -
+
+    #[tokio::test]
+    async fn retry_without_clearing_staging_leaves_a_removed_source_file_behind_but_clearing_fixes_it()
+     {
+        // Directly exercises the mechanism `run_import`'s retry branch
+        // relies on: `copy_import_files` only ever ADDS files, it never
+        // removes one the source no longer has. Calling it twice against
+        // a destination that already holds the FIRST pass's output is
+        // not a safe "retry" once the source changed in between — the
+        // fix is for the caller to wipe the staging directory before
+        // calling this again.
+        let tmp = tempfile::tempdir().unwrap();
+        let source_hyphae = tmp.path().join("source").join(".hyphae");
+        let staging_dir = tmp.path().join("staging");
+        let dest_hyphae = staging_dir.join(".hyphae");
+        tokio::fs::create_dir_all(&source_hyphae).await.unwrap();
+        tokio::fs::write(source_hyphae.join("keystore.json"), b"keystore-bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(source_hyphae.join("messages.db-wal"), b"wal-bytes")
+            .await
+            .unwrap();
+
+        // Pass 1: the wal is present and gets copied.
+        let copied1 = copy_import_files(&source_hyphae, &dest_hyphae)
+            .await
+            .unwrap();
+        assert!(copied1.iter().any(|n| n == "messages.db-wal"));
+        assert!(
+            tokio::fs::try_exists(dest_hyphae.join("messages.db-wal"))
+                .await
+                .unwrap()
+        );
+
+        // The source's wal disappears between pass 1 and the retry (e.g.
+        // a WAL checkpoint) — exactly what the before/after fingerprint
+        // comparison in `run_import` is designed to notice and retry on.
+        tokio::fs::remove_file(source_hyphae.join("messages.db-wal"))
+            .await
+            .unwrap();
+
+        // Bug reproduction: WITHOUT wiping staging first, the stale wal
+        // from pass 1 survives even though `copied2` correctly omits it
+        // from the report.
+        let copied2_without_the_fix = copy_import_files(&source_hyphae, &dest_hyphae)
+            .await
+            .unwrap();
+        assert!(
+            !copied2_without_the_fix
+                .iter()
+                .any(|n| n == "messages.db-wal")
+        );
+        assert!(
+            tokio::fs::try_exists(dest_hyphae.join("messages.db-wal"))
+                .await
+                .unwrap(),
+            "bug reproduction: the stale wal should still be sitting in staging here"
+        );
+
+        // The fix `run_import` actually applies: wipe staging, then
+        // recopy. The stale file is gone.
+        tokio::fs::remove_dir_all(&staging_dir).await.unwrap();
+        let copied3_with_the_fix = copy_import_files(&source_hyphae, &dest_hyphae)
+            .await
+            .unwrap();
+        assert!(!copied3_with_the_fix.iter().any(|n| n == "messages.db-wal"));
+        assert!(
+            !tokio::fs::try_exists(dest_hyphae.join("messages.db-wal"))
+                .await
+                .unwrap(),
+            "after clearing staging and recopying, no stale wal must remain"
+        );
+    }
+
+    // ---- Codex 挑战 Medium #4: outbox.json's real `{"entries": [...]}` ---
+    // ---- shape, parsed strictly (not silently skipped) -------------------
+
+    #[tokio::test]
+    async fn count_source_outbox_entries_rejects_the_legacy_bare_array_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hyphae_dir = tmp.path().join(".hyphae");
+        tokio::fs::create_dir_all(&hyphae_dir).await.unwrap();
+        // The shape this module used to (wrongly) accept — no real Hyphae
+        // `outbox.json` has ever looked like this; confirmed against the
+        // locked Hyphae source (`internal/messaging/outbox.go`'s
+        // `types.Outbox{ Entries []OutboxEntry `json:"entries"` }`,
+        // commit a4aa606).
+        tokio::fs::write(hyphae_dir.join("outbox.json"), br#"[{"event_id":"e0"}]"#)
+            .await
+            .unwrap();
+        let err = count_source_outbox_entries(&hyphae_dir).await.unwrap_err();
+        assert!(
+            matches!(err, CommError::Upstream(ref m) if m.contains("entries")),
+            "a bare array must be a hard error now, not a silently-skipped None: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_source_outbox_entries_parses_the_real_entries_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hyphae_dir = tmp.path().join(".hyphae");
+        tokio::fs::create_dir_all(&hyphae_dir).await.unwrap();
+        tokio::fs::write(
+            hyphae_dir.join("outbox.json"),
+            br#"{"entries":[{"id":"a"},{"id":"b"}]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_source_outbox_entries(&hyphae_dir).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn import_fails_when_hyphae_reports_fewer_outbox_entries_than_the_source_file_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("old-home");
+        // Source outbox.json really has 3 entries (real
+        // `{"entries":[...]}` shape, via `write_source_fixture`).
+        write_source_fixture(&from, 3).await;
+
+        // The fake hyphae CLI only reports 2 — the real mismatch this
+        // cross-check exists to catch (H2's acceptance criterion: "导入
+        // 前后 outbox 条目数一致"). Before the format fix, this check
+        // silently no-op'd against every real `outbox.json` (bare-array
+        // parsing never matched, so the comparison was skipped
+        // entirely) — this test would NOT have caught a real mismatch
+        // under the old code.
+        let script = fake_hyphae_script(true, "correct-pass", 2);
+        let runner = build_runner(tmp.path(), &script).await;
+        let store = MemoryPasswordStore::new();
+        let home = tmp.path().join("comm").join("hyphae-home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+
+        let err = import(
+            &runner,
+            &store,
+            &home,
+            ImportRequest {
+                from,
+                confirm: true,
+                password: Some(Password::new(b"correct-pass".to_vec()).unwrap()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CommError::Upstream(ref m) if m.contains("outbox entry count mismatch")),
+            "{err:?}"
+        );
+    }
+
+    // ---- Codex 挑战 Medium #5: a FIFO must be rejected, never block -------
+
+    #[tokio::test]
+    async fn fingerprint_rejects_a_fifo_in_place_of_a_tracked_source_file_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("old-home");
+        write_source_fixture(&from, 0).await;
+        let source_hyphae = from.join(".hyphae");
+
+        let relays_path = source_hyphae.join("relays.json");
+        tokio::fs::remove_file(&relays_path).await.unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&relays_path)
+            .status()
+            .expect("mkfifo must be available on darwin/linux CI");
+        assert!(status.success(), "mkfifo failed");
+
+        // Bounded by a timeout: before the fix, opening a FIFO for
+        // reading without `O_NONBLOCK` is fine (a read-only open of a
+        // FIFO never blocks on its own), but the OLD code's separate
+        // `check_not_symlink_and_owned`+later-`tokio::fs::copy`/`metadata`
+        // pattern never checked the file TYPE at all, so a FIFO sailed
+        // through fingerprinting; this test pins the new, strict
+        // behavior with a hard timeout as a safety net regardless.
+        let result = tokio::time::timeout(Duration::from_secs(5), fingerprint_all(&source_hyphae))
+            .await
+            .expect("fingerprint_all must not block on a FIFO");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, CommError::Invalid(ref m) if m.contains("not a regular file")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_lock_outbox_rejects_a_fifo_instead_of_blocking_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("outbox.json.lock");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&lock_path)
+            .status()
+            .expect("mkfifo must be available on darwin/linux CI");
+        assert!(status.success(), "mkfifo failed");
+
+        // Opening a FIFO `O_WRONLY` with no reader on the other end would
+        // block forever without `O_NONBLOCK` — and since this call holds
+        // `KeystoreWriteLock` for its whole duration in `run_import`, a
+        // hang here would starve every other comm operation, not just
+        // this one import. Bounded by a timeout as a safety net
+        // regardless.
+        let result = tokio::time::timeout(Duration::from_secs(5), try_lock_outbox(lock_path))
+            .await
+            .expect("try_lock_outbox must not block on a FIFO");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, CommError::Invalid(ref m) if m.contains("FIFO") || m.contains("not a regular file")),
+            "{err:?}"
         );
     }
 }

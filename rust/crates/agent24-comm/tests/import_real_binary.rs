@@ -101,6 +101,70 @@ async fn importing_a_real_old_home_round_trips_identities_and_outbox() {
         }
     }
 
+    // Codex 挑战 Medium #4 real-binary coverage: seed a contact and a
+    // genuinely non-empty outbox in the old home too, so the
+    // `{"entries": [...]}`-shaped `outbox.json` the real `hyphae` binary
+    // actually writes gets exercised end to end by this test, not just by
+    // the fake-script-driven unit tests in `src/import.rs`. `bob`'s npub
+    // below is a real, checksum-valid bech32 npub (generated once with
+    // `hyphae identity create` against a throwaway second HOME while
+    // writing this test) — any well-formed npub works for `contact add`,
+    // it never has to resolve to a live identity.
+    let envelope = old_home_runner
+        .run(Invocation {
+            args: vec![
+                OsString::from("contact"),
+                OsString::from("add"),
+                OsString::from("--nickname"),
+                OsString::from("bob"),
+                OsString::from("--npub"),
+                OsString::from("npub1kckqfw8hyqz0rgew5nq66k7uthcfskefzt3g305kgl5y89me5pxsajp9r3"),
+            ],
+            password: None,
+            timeout: None,
+        })
+        .await
+        .expect("contact add against the old home should succeed");
+    match envelope {
+        agent24_comm::Envelope::Ok { .. } => {}
+        agent24_comm::Envelope::Failed { error, message, .. } => {
+            panic!("seeding the old home's contact failed: {error}: {message}")
+        }
+    }
+
+    // `agent msg` against a relay URL nothing is listening on fails the
+    // publish immediately (connection refused) and queues the message for
+    // retry — the real, fast way to get a genuinely non-empty
+    // `outbox.json` out of the real binary without any network
+    // dependency (confirmed against the locked Hyphae source: `agent msg`
+    // always calls `AddToOutbox` before attempting to publish).
+    let msg_password = Password::new(b"comm-2b-real-bin-test-password".to_vec()).unwrap();
+    let envelope = old_home_runner
+        .run(Invocation {
+            args: vec![
+                OsString::from("agent"),
+                OsString::from("msg"),
+                OsString::from("--from"),
+                OsString::from("old-primary"),
+                OsString::from("--to"),
+                OsString::from("bob"),
+                OsString::from("--content"),
+                OsString::from("hello from COMM-2b's real-binary test"),
+                OsString::from("--relay"),
+                OsString::from("ws://127.0.0.1:1"),
+            ],
+            password: Some(msg_password),
+            timeout: None,
+        })
+        .await
+        .expect("agent msg against the old home should succeed (and queue for retry)");
+    match envelope {
+        agent24_comm::Envelope::Ok { .. } => {}
+        agent24_comm::Envelope::Failed { error, message, .. } => {
+            panic!("seeding the old home's outbox failed: {error}: {message}")
+        }
+    }
+
     // Now import it into a fresh, comm-managed home.
     let comm_dir = tmp.path().join("comm");
     let new_home = comm_dir.join("hyphae-home");
@@ -134,8 +198,16 @@ async fn importing_a_real_old_home_round_trips_identities_and_outbox() {
     .expect("import against a freshly-seeded real old home should succeed");
 
     assert_eq!(report.identities, 1, "{report:?}");
-    assert_eq!(report.contacts, 0, "{report:?}");
-    assert_eq!(report.outbox, 0, "{report:?}");
+    // Codex 挑战 Medium #4: now genuinely non-empty — this is what
+    // exercises the real `{"entries": [...]}`-shaped `outbox.json` the
+    // real binary writes against `count_source_outbox_entries`'s
+    // cross-check end to end. A `report.outbox == 0` fixture (the
+    // original version of this test) would never have caught the format
+    // bug: a top-level object with zero "visible" entries and "not an
+    // array at all" both happen to compare equal to Hyphae's own
+    // (correctly empty) `storage outbox list` count by sheer coincidence.
+    assert_eq!(report.contacts, 1, "{report:?}");
+    assert_eq!(report.outbox, 1, "{report:?}");
 
     // The imported identity must be usable from the new home too.
     let new_home_runner = HyphaeRunner::new(bin, new_home.clone(), Duration::from_secs(15));
@@ -156,6 +228,52 @@ async fn importing_a_real_old_home_round_trips_identities_and_outbox() {
         }
         agent24_comm::Envelope::Failed { error, message, .. } => {
             panic!("identity list against the imported home failed: {error}: {message}")
+        }
+    }
+
+    // And the imported contact + outbox entry must both be visible from
+    // the new, comm-managed home — not just counted in the report.
+    let envelope = new_home_runner
+        .run(Invocation {
+            args: vec![OsString::from("contact"), OsString::from("list")],
+            password: None,
+            timeout: None,
+        })
+        .await
+        .expect("contact list against the imported home should succeed");
+    match envelope {
+        agent24_comm::Envelope::Ok { data } => {
+            let contacts = data.as_array().expect("contact list is an array");
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert_eq!(contacts[0]["nickname"], "bob");
+        }
+        agent24_comm::Envelope::Failed { error, message, .. } => {
+            panic!("contact list against the imported home failed: {error}: {message}")
+        }
+    }
+    let envelope = new_home_runner
+        .run(Invocation {
+            args: vec![
+                OsString::from("storage"),
+                OsString::from("outbox"),
+                OsString::from("list"),
+            ],
+            password: None,
+            timeout: None,
+        })
+        .await
+        .expect("storage outbox list against the imported home should succeed");
+    match envelope {
+        agent24_comm::Envelope::Ok { data } => {
+            let outbox = data.as_array().expect("storage outbox list is an array");
+            assert_eq!(outbox.len(), 1, "{outbox:?}");
+            assert_eq!(
+                outbox[0]["recipient_npub"],
+                "npub1kckqfw8hyqz0rgew5nq66k7uthcfskefzt3g305kgl5y89me5pxsajp9r3"
+            );
+        }
+        agent24_comm::Envelope::Failed { error, message, .. } => {
+            panic!("storage outbox list against the imported home failed: {error}: {message}")
         }
     }
 
