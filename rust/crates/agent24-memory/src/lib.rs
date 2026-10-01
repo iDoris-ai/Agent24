@@ -356,6 +356,11 @@ impl KvStore {
         assertion::AssertionLedger::new(self.pool.clone())
     }
 
+    /// Retract an assertion and append its event in the same transaction.
+    pub async fn forget(&self, owner: &str, id: &str, at: &str) -> Result<assertion::Forget> {
+        assertion::forget(&self.pool, owner, id, at).await
+    }
+
     /// An [`retriever::FtsRetriever`] over the SAME database file — MD-3b's
     /// full-text projection over the assertion ledger.
     pub fn retriever(&self) -> retriever::FtsRetriever {
@@ -2250,5 +2255,225 @@ mod tests {
             (0, 0),
             "a refused rekey must not create a usage row for the never-realized new owner"
         );
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::assertion::{Assertion, AssertionStore, Forget};
+    use crate::event::{EventQuery, EventStore, Scope};
+    use crate::retriever::Retriever;
+    use sha2::{Digest, Sha256};
+
+    async fn setup(owner: &str) -> KvStore {
+        let kv = KvStore::open_memory().await.unwrap();
+        kv.assertions()
+            .assert(&Assertion::new(
+                "a1",
+                Scope::owner(owner),
+                "favorite_color",
+                "is",
+                serde_json::json!("blue"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        kv
+    }
+
+    async fn events(kv: &KvStore, owner: &str) -> Vec<event::StoredEvent> {
+        kv.events().scan(&EventQuery::owner(owner)).await.unwrap()
+    }
+
+    fn retract_id(owner: &str, id: &str) -> String {
+        let input = serde_json::to_string(&["retract", owner, id]).unwrap();
+        let hash = Sha256::digest(input.as_bytes());
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn forget_records_timestamp_and_one_correct_retraction_event() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("recorded_to").as_deref(),
+            Some("t2")
+        );
+        let events = events(&kv, "alice").await;
+        assert_eq!(events.len(), 1);
+        let e = &events[0].event;
+        assert_eq!(e.id, retract_id("alice", "a1"));
+        assert_eq!(e.kind, "assertion.retracted");
+        assert_eq!(e.scope.owner, "alice");
+        assert_eq!(e.body["assertion_id"], "a1");
+        assert_eq!(e.at, "t2");
+    }
+
+    #[tokio::test]
+    async fn forget_repeat_keeps_original_timestamp_and_one_event() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("alice", "a1", "t2").await.unwrap(),
+            Forget::Forgotten
+        );
+        assert_eq!(
+            kv.forget("alice", "a1", "t3").await.unwrap(),
+            Forget::AlreadyForgotten
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("recorded_to").as_deref(),
+            Some("t2")
+        );
+        let ev = events(&kv, "alice").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].event.at, "t2");
+    }
+
+    #[tokio::test]
+    async fn forget_foreign_owner_and_missing_id_are_not_found_without_side_effects() {
+        let kv = setup("alice").await;
+        assert_eq!(
+            kv.forget("bob", "a1", "t4").await.unwrap(),
+            Forget::NotFound
+        );
+        assert_eq!(
+            kv.forget("alice", "missing", "t4").await.unwrap(),
+            Forget::NotFound
+        );
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("recorded_to"), None);
+        assert!(events(&kv, "alice").await.is_empty());
+        assert!(events(&kv, "bob").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_quota_failure_keeps_assertion_live_and_can_retry() {
+        let kv = setup("alice").await;
+        sqlx::query("UPDATE mem_owner_quota SET max_rows=0 WHERE owner='*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            kv.forget("alice", "a1", "t2").await,
+            Err(MemoryError::QuotaExceeded { .. })
+        ));
+        let row = sqlx::query("SELECT recorded_to FROM mem_assertions WHERE id='a1'")
+            .fetch_one(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("recorded_to"), None);
+        assert!(events(&kv, "alice").await.is_empty());
+        sqlx::query("UPDATE mem_owner_quota SET max_rows=100 WHERE owner='*'")
+            .execute(&kv.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.forget("alice", "a1", "t3").await.unwrap(),
+            Forget::Forgotten
+        );
+        assert_eq!(events(&kv, "alice").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forgotten_assertion_stays_out_of_search_after_rebuild() {
+        let kv = setup("alice").await;
+        let retriever = kv.retriever();
+        assert_eq!(
+            retriever.search("blue", "alice", 10).await.unwrap().len(),
+            1
+        );
+        kv.forget("alice", "a1", "t2").await.unwrap();
+        assert!(
+            retriever
+                .search("blue", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        retriever.rebuild().await.unwrap();
+        assert!(
+            retriever
+                .search("blue", "alice", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // TODO: T09/T07a integration in docs/agent/M1-PLAN-v2.md adds `search_any` coverage.
+    }
+
+    #[tokio::test]
+    async fn forget_retraction_ids_do_not_collide_across_owner_and_assertion_id() {
+        let kv = KvStore::open_memory().await.unwrap();
+        let store = kv.assertions();
+        for (owner, id) in [("alice", "xa1"), ("alicex", "a1")] {
+            store
+                .assert(&Assertion::new(
+                    id,
+                    Scope::owner(owner),
+                    "favorite_color",
+                    "is",
+                    serde_json::json!("blue"),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let retriever = kv.retriever();
+        for owner in ["alice", "alicex"] {
+            assert_eq!(retriever.search("blue", owner, 10).await.unwrap().len(), 1);
+        }
+        for (owner, id) in [("alice", "xa1"), ("alicex", "a1")] {
+            assert_eq!(kv.forget(owner, id, "t2").await.unwrap(), Forget::Forgotten);
+            assert_eq!(
+                kv.forget(owner, id, "t3").await.unwrap(),
+                Forget::AlreadyForgotten
+            );
+        }
+        for owner in ["alice", "alicex"] {
+            let events = events(&kv, owner).await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.kind, "assertion.retracted");
+        }
+        assert_ne!(
+            events(&kv, "alice").await[0].event.id,
+            events(&kv, "alicex").await[0].event.id
+        );
+        for owner in ["alice", "alicex"] {
+            assert!(
+                retriever
+                    .search("blue", owner, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        retriever.rebuild().await.unwrap();
+        for owner in ["alice", "alicex"] {
+            assert!(
+                retriever
+                    .search("blue", owner, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }
