@@ -165,7 +165,7 @@ fn drain_loop<R: Read>(
 
 fn saturating_add(bytes: &AtomicU64, len: usize) {
     let increment = u64::try_from(len).unwrap_or(u64::MAX);
-    let _ = bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = bytes.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(increment))
     });
 }
@@ -449,20 +449,27 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn native_stderr_is_converted_before_sync_worker_reads() {
-        let mut child = tokio::process::Command::new("cmd.exe")
-            .args(["/C", "<nul 1>&2 set /p =native"])
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child =
+            tokio::process::Command::new(crate::windows_test_io::windows_executable("cmd.exe"))
+                .args(["/C", "<nul 1>&2 set /p =native"])
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
         let stderr = child.stderr.take().unwrap();
         let mut worker = StderrDrainWorker::from_native_stderr(stderr).unwrap();
+        let snapshot = terminal(&mut worker);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+        if status.is_err() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        let _status = status.expect("cmd.exe exit deadline").unwrap();
         assert_eq!(
-            terminal(&mut worker),
+            snapshot,
             StderrDrainSnapshot {
                 bytes_drained: 6,
                 status: StderrDrainStatus::Eof
             }
         );
-        child.wait().await.unwrap();
     }
 }

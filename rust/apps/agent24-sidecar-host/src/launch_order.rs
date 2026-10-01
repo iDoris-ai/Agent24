@@ -2198,13 +2198,13 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn owned_soft_stop_closes_stdin_twice_then_force_reaps_same_owner() {
-        use std::time::Duration;
-        use tokio::io::AsyncReadExt;
+        use crate::windows_test_io::{powershell_executable, read_pair_then_cleanup};
+        use std::{fs::File, time::Duration};
 
         let request = Request::Launch {
             version: PROTOCOL_VERSION,
             request_id: 72,
-            executable: "powershell.exe".into(),
+            executable: powershell_executable().display().to_string(),
             cwd: std::env::temp_dir().display().to_string(),
             argv: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('out-eof!'); [Console]::Out.Flush(); [Console]::Error.Write('err-eof!'); [Console]::Error.Flush(); Start-Sleep -Seconds 30".into()],
             env: BTreeMap::from([(String::from("SystemRoot"), std::env::var("SystemRoot").unwrap())]),
@@ -2212,7 +2212,7 @@ mod tests {
         let mut launch =
             OwnedLaunch::start(crate::launch::LaunchIntent::from_request(request).unwrap())
                 .unwrap();
-        let (mut stdout_pipe, mut stderr_pipe) = {
+        let (stdout_pipe, stderr_pipe) = {
             let pipes = launch.pipes_mut();
             let Some(stdout) = pipes.take_stdout() else {
                 panic!("stdout moves once");
@@ -2225,22 +2225,29 @@ mod tests {
         let first_stop = LaunchControl::stop(&mut launch, false);
         let second_stop = LaunchControl::stop(&mut launch, false);
         let stdin_closed = launch.pipes_mut().stdin_mut().is_none();
-        let mut out = [0; 8];
-        let stdout = tokio::time::timeout(Duration::from_secs(3), stdout_pipe.read_exact(&mut out))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child stdout deadline expired"))
-            .and_then(|result| result.map(|_| out));
-        let mut err = [0; 8];
-        let stderr = tokio::time::timeout(Duration::from_secs(3), stderr_pipe.read_exact(&mut err))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child stderr deadline expired"))
-            .and_then(|result| result.map(|_| err));
-        let cleanup = force_and_reap(&mut launch);
-        cleanup.unwrap();
+        let native_pipes = stdout_pipe.into_owned_handle().and_then(|stdout| {
+            stderr_pipe
+                .into_owned_handle()
+                .map(|stderr| (stdout, stderr))
+        });
+        let output = match native_pipes {
+            Ok((stdout, stderr)) => read_pair_then_cleanup(
+                File::from(stdout),
+                File::from(stderr),
+                8,
+                Duration::from_secs(3),
+                || force_and_reap(&mut launch),
+            ),
+            Err(error) => {
+                let cleanup = force_and_reap(&mut launch);
+                cleanup.and(Err(error))
+            }
+        };
         first_stop.unwrap();
         second_stop.unwrap();
         assert!(stdin_closed, "soft stop left stdin open");
-        assert_eq!(&stdout.unwrap(), b"out-eof!");
-        assert_eq!(&stderr.unwrap(), b"err-eof!");
+        let (stdout, stderr) = output.unwrap();
+        assert_eq!(&stdout, b"out-eof!");
+        assert_eq!(&stderr, b"err-eof!");
     }
 }
