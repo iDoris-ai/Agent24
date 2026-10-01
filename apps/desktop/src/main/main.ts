@@ -9,7 +9,11 @@ import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
 import type { CreativeViewBounds, CreativeViewResult } from '../shared/ipc-types'
-import { CreativeServeWeb } from './creative-serve-web'
+import {
+  CREATIVE_SESSION_PARTITION,
+  CreativeServeWeb,
+  classifyCreativeUrl,
+} from './creative-serve-web'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
@@ -50,6 +54,7 @@ let isQuitting = false
 let trayTimer: NodeJS.Timeout | null = null
 const creativeServeWeb = new CreativeServeWeb()
 let creativeView: WebContentsView | null = null
+let creativeOrigin: string | null = null
 
 function normalizedBounds(bounds: CreativeViewBounds): Electron.Rectangle {
   return {
@@ -73,6 +78,7 @@ async function showCreativeView(bounds: CreativeViewBounds): Promise<CreativeVie
   if (status.state !== 'ready' || !status.origin) {
     return { ok: false, error: status.error ?? 'Open Design did not become ready' }
   }
+  creativeOrigin = status.origin
 
   if (!creativeView || creativeView.webContents.isDestroyed()) {
     creativeView = new WebContentsView({
@@ -80,18 +86,36 @@ async function showCreativeView(bounds: CreativeViewBounds): Promise<CreativeVie
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
+        partition: CREATIVE_SESSION_PARTITION,
       },
     })
     win.contentView.addChildView(creativeView)
     creativeView.webContents.setWindowOpenHandler(({ url }) => {
-      if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url)
+      const disposition = creativeOrigin ? classifyCreativeUrl(url, creativeOrigin) : 'blocked'
+      // Preserve Open Design's existing desktop behavior: every HTTP(S)
+      // target=_blank/window.open goes to the system browser, including
+      // same-origin live-artifact preview URLs. Electron never gets a child
+      // window for this surface.
+      if (disposition === 'same-origin' || disposition === 'external-http') void shell.openExternal(url)
       return { action: 'deny' }
+    })
+    creativeView.webContents.on('will-navigate', (event, url) => {
+      const disposition = creativeOrigin ? classifyCreativeUrl(url, creativeOrigin) : 'blocked'
+      if (disposition === 'same-origin') return
+      event.preventDefault()
+      if (disposition === 'external-http') void shell.openExternal(url)
+    })
+    creativeView.webContents.on('will-redirect', (event, url) => {
+      const disposition = creativeOrigin ? classifyCreativeUrl(url, creativeOrigin) : 'blocked'
+      if (disposition !== 'same-origin') event.preventDefault()
     })
   }
 
   creativeView.setBounds(normalizedBounds(bounds))
   const current = creativeView.webContents.getURL()
-  if (!current.startsWith(status.origin)) await creativeView.webContents.loadURL(status.origin)
+  if (classifyCreativeUrl(current, status.origin) !== 'same-origin') {
+    await creativeView.webContents.loadURL(status.origin)
+  }
   return { ok: true, origin: status.origin }
 }
 

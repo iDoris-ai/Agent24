@@ -25,6 +25,45 @@ type CreativeChild = ChildProcess & { stdout: Readable; stderr: Readable }
 const DEFAULT_PORT = 7456
 const DEFAULT_READY_TIMEOUT_MS = 15_000
 
+export const CREATIVE_SESSION_PARTITION = 'persist:agent24-creative'
+
+export type CreativeUrlDisposition = 'same-origin' | 'external-http' | 'blocked'
+
+export function canonicalCreativeOrigin(raw: string, expectedPort: number): string {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new Error('Open Design reported an invalid origin')
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('Open Design origin must use HTTP(S)')
+  }
+  if (url.hostname !== '127.0.0.1') {
+    throw new Error('Open Design origin must use 127.0.0.1')
+  }
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('Open Design origin must not include credentials, a path, query, or fragment')
+  }
+  const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80))
+  if (port !== expectedPort) throw new Error('Open Design origin port does not match the launched port')
+  return url.origin
+}
+
+export function classifyCreativeUrl(candidate: string, allowedOrigin: string): CreativeUrlDisposition {
+  let url: URL
+  let allowed: URL
+  try {
+    url = new URL(candidate)
+    allowed = new URL(allowedOrigin)
+  } catch {
+    return 'blocked'
+  }
+  if (url.origin === allowed.origin) return 'same-origin'
+  if (url.protocol === 'http:' || url.protocol === 'https:') return 'external-http'
+  return 'blocked'
+}
+
 export function resolveOpenDesignCheckout(
   cwd = process.cwd(),
   env: NodeJS.ProcessEnv = process.env,
@@ -112,7 +151,7 @@ export class CreativeServeWeb {
     this.child = child
 
     try {
-      const origin = await this.waitForOrigin(child, readyTimeoutMs)
+      const origin = await this.waitForOrigin(child, readyTimeoutMs, port)
       await this.waitUntilReady(origin, readyTimeoutMs)
       if (this.child !== child) throw new Error('Open Design launch was superseded')
       this.current = { state: 'ready', origin }
@@ -160,7 +199,7 @@ export class CreativeServeWeb {
     return this.status()
   }
 
-  private waitForOrigin(child: CreativeChild, timeoutMs: number): Promise<string> {
+  private waitForOrigin(child: CreativeChild, timeoutMs: number, expectedPort: number): Promise<string> {
     return new Promise((resolve, reject) => {
       let stdout = ''
       let stderr = ''
@@ -177,7 +216,12 @@ export class CreativeServeWeb {
       }
       const inspect = (): void => {
         const match = stdout.match(/\[od\] listening on (https?:\/\/[^\s]+)(?: \([^)]*\))?\s*$/m)
-        if (match?.[1]) done(match[1])
+        if (!match?.[1]) return
+        try {
+          done(canonicalCreativeOrigin(match[1], expectedPort))
+        } catch (error) {
+          done(error instanceof Error ? error : new Error(String(error)))
+        }
       }
       const onStdout = (chunk: Buffer | string): void => {
         stdout += chunk.toString()

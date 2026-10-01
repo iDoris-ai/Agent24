@@ -5,7 +5,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { CreativeServeWeb, resolveOpenDesignCheckout } from './creative-serve-web'
+import {
+  CreativeServeWeb,
+  canonicalCreativeOrigin,
+  classifyCreativeUrl,
+  resolveOpenDesignCheckout,
+} from './creative-serve-web'
 
 class FakeChild extends EventEmitter {
   stdout = new PassThrough()
@@ -38,6 +43,36 @@ afterEach(() => {
 })
 
 describe('CreativeServeWeb', () => {
+  it('canonicalizes only the launched loopback origin', () => {
+    expect(canonicalCreativeOrigin('http://127.0.0.1:17456/', 17456)).toBe('http://127.0.0.1:17456')
+    expect(canonicalCreativeOrigin('https://127.0.0.1:17456', 17456)).toBe('https://127.0.0.1:17456')
+
+    for (const raw of [
+      'http://example.com:17456',
+      'http://localhost:17456',
+      'http://user@127.0.0.1:17456',
+      'http://127.0.0.1:17456/path',
+      'http://127.0.0.1:17456/?query=1',
+      'http://127.0.0.1:17456/#fragment',
+      'http://127.0.0.1:17457',
+      'file:///tmp/open-design',
+    ]) {
+      expect(() => canonicalCreativeOrigin(raw, 17456), raw).toThrow()
+    }
+  })
+
+  it('classifies exact-origin navigation without prefix trust', () => {
+    const origin = 'http://127.0.0.1:17456'
+    expect(classifyCreativeUrl(`${origin}/project/1?tab=files#active`, origin)).toBe('same-origin')
+    expect(classifyCreativeUrl('https://example.com/docs', origin)).toBe('external-http')
+    expect(classifyCreativeUrl('http://127.0.0.1:17457/project', origin)).toBe('external-http')
+    expect(classifyCreativeUrl('https://127.0.0.1:17456/project', origin)).toBe('external-http')
+    expect(classifyCreativeUrl('http://127.0.0.1.evil.example:17456/project', origin)).toBe('external-http')
+    expect(classifyCreativeUrl('javascript:alert(1)', origin)).toBe('blocked')
+    expect(classifyCreativeUrl('file:///tmp/secret', origin)).toBe('blocked')
+    expect(classifyCreativeUrl('not a url', origin)).toBe('blocked')
+  })
+
   it('uses the explicit Open Design checkout when it contains the od entry', () => {
     const root = checkout()
     expect(resolveOpenDesignCheckout('/unused', { A24_OPEN_DESIGN_DIR: root })).toBe(root)
@@ -91,6 +126,28 @@ describe('CreativeServeWeb', () => {
     ])
     expect(spawnFn).toHaveBeenCalledTimes(1)
     await service.stop()
+  })
+
+  it('rejects an untrusted readiness origin before any host fetch', async () => {
+    const root = checkout()
+    const child = new FakeChild()
+    const spawnFn = vi.fn(() => child as unknown as ChildProcess)
+    const fetchFn = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = new CreativeServeWeb(
+      { checkoutDir: root, port: 17456, readyTimeoutMs: 500 },
+      spawnFn as never,
+      fetchFn,
+    )
+
+    const starting = service.start()
+    child.stdout.write('[od] listening on https://example.com:17456 (headless)\n')
+
+    await expect(starting).resolves.toEqual({
+      state: 'failed',
+      error: 'Open Design origin must use 127.0.0.1',
+    })
+    expect(fetchFn).not.toHaveBeenCalled()
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM')
   })
 
   it('fails clearly when the daemon build is missing', async () => {
