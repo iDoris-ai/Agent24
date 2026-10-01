@@ -12,6 +12,8 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 #[derive(Clone)]
 pub struct SessionLog {
     pool: SqlitePool,
+    #[cfg(test)]
+    probe: Option<std::sync::Arc<regression_tests::Probe>>,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct TurnIds {
@@ -31,24 +33,7 @@ pub struct SessionView {
     #[serde(skip)]
     pub tail: Vec<(i64, Msg)>,
 }
-struct Entry {
-    seq: i64,
-    id: String,
-    kind: String,
-    scope: Scope,
-    body: Value,
-    origin: Origin,
-}
-async fn entries(conn: &mut SqliteConnection, scope: &Scope) -> Result<Vec<Entry>> {
-    sqlx::query("SELECT seq,id,kind,scope,payload AS body,json_object('source',origin_source,'trust',origin_trust) AS origin FROM mem_events WHERE scope_owner=? AND scope_session=? ORDER BY seq")
-        .bind(&scope.owner).bind(&scope.session).fetch_all(conn).await?
-        .into_iter().map(|row| Ok(Entry {
-            seq: row.get("seq"), id: row.get("id"), kind: row.get("kind"),
-            scope: serde_json::from_str(row.get("scope"))?,
-            body: serde_json::from_str(row.get("body"))?,
-            origin: serde_json::from_str(row.get("origin"))?,
-        })).collect()
-}
+
 fn id(value: impl serde::Serialize) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&value)?)))
 }
@@ -71,78 +56,126 @@ fn system_origin(source: &str) -> Origin {
         trust: Trust::System,
     }
 }
+
 impl SessionLog {
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(test)]
+            probe: None,
+        }
     }
-    /// With no caller turn token, the same latest user means retry: identical
-    /// assistant/origins return the old IDs; different assistant/origins conflict.
-    /// Consequently consecutive identical exchanges cannot represent new turns.
+
+    /// The caller's stable turn number distinguishes repeated identical user
+    /// messages across turns while making retries of one turn idempotent.
+    /// Allocate a new number per (owner, session) turn; retries must reuse the
+    /// original number, including after a restart.
+    #[allow(clippy::too_many_arguments)]
     pub async fn append_turn(
         &self,
         owner: &str,
         session: &str,
+        turn_no: u64,
         user: &Msg,
         user_origin: Origin,
         assistant: &Msg,
         assistant_origin: Origin,
     ) -> Result<TurnIds> {
         let scope = Scope::owner(owner).with_session(session);
-        let mut tx = self.pool.begin().await?;
-        let stored = entries(&mut tx, &scope).await?;
-        let users: Vec<_> = stored
-            .iter()
-            .filter(|e| e.kind == "message" && e.body["role"] == "user")
-            .collect();
-        let body = serde_json::to_value(user)?;
-        let mut turn = users.len();
-        let retry = if let Some(last) = users.last() {
-            last.id == id((owner, session, turn - 1, "user"))? && last.body == body
-        } else {
-            false
-        };
-        if retry {
-            turn -= 1;
-        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ids = TurnIds {
-            user: id((owner, session, turn, "user"))?,
-            assistant: id((owner, session, turn, "assistant"))?,
+            user: id((owner, session, turn_no, "user"))?,
+            assistant: id((owner, session, turn_no, "assistant"))?,
         };
-        for (key, body, origin) in [
-            (&ids.user, body, user_origin),
-            (
-                &ids.assistant,
-                serde_json::to_value(assistant)?,
-                assistant_origin,
-            ),
-        ] {
-            if retry {
-                if !stored.iter().any(|e| {
-                    e.id == *key
-                        && e.kind == "message"
-                        && e.scope == scope
-                        && e.body == body
-                        && e.origin == origin
-                }) {
-                    return Err(MemoryError::Conflict(format!(
-                        "session event {key} differs"
-                    )));
+        let stored = sqlx::query(
+            "SELECT id,kind,scope,payload AS body,json_object('source',origin_source,'trust',origin_trust) AS origin FROM mem_events WHERE id IN (?,?)",
+        )
+        .bind(&ids.user)
+        .bind(&ids.assistant)
+        .fetch_all(&mut *tx)
+        .await?;
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.observe(stored.len()).await;
+        }
+
+        match stored.len() {
+            0 => {
+                write(
+                    &mut tx,
+                    &scope,
+                    ids.user.clone(),
+                    "message",
+                    serde_json::to_value(user)?,
+                    user_origin,
+                )
+                .await?;
+                write(
+                    &mut tx,
+                    &scope,
+                    ids.assistant.clone(),
+                    "message",
+                    serde_json::to_value(assistant)?,
+                    assistant_origin,
+                )
+                .await?;
+            }
+            2 => {
+                let expected = [
+                    (&ids.user, user, &user_origin),
+                    (&ids.assistant, assistant, &assistant_origin),
+                ];
+                for (key, message, origin) in expected {
+                    let row = stored
+                        .iter()
+                        .find(|row| row.get::<String, _>("id") == *key)
+                        .ok_or_else(|| {
+                            MemoryError::Conflict(format!("session event {key} is missing"))
+                        })?;
+                    let row_scope: Scope = serde_json::from_str(row.get("scope"))?;
+                    let row_body: Value = serde_json::from_str(row.get("body"))?;
+                    let row_origin: Origin = serde_json::from_str(row.get("origin"))?;
+                    if row.get::<String, _>("kind") != "message"
+                        || row_scope != scope
+                        || row_body != serde_json::to_value(message)?
+                        || row_origin != *origin
+                    {
+                        return Err(MemoryError::Conflict(format!(
+                            "session event {key} differs"
+                        )));
+                    }
                 }
-            } else {
-                write(&mut tx, &scope, key.clone(), "message", body, origin).await?;
+            }
+            _ => {
+                return Err(MemoryError::Conflict(format!(
+                    "session turn {} has an incomplete or unexpected event pair",
+                    turn_no
+                )));
             }
         }
         tx.commit().await?;
         Ok(ids)
     }
+
     pub async fn import_legacy(
         &self,
         owner: &str,
         legacy: &CanonicalSession,
     ) -> Result<ImportOutcome> {
         let scope = Scope::owner(owner).with_session(&legacy.session_id);
-        let mut tx = self.pool.begin().await?;
-        if !entries(&mut tx, &scope).await?.is_empty() {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM mem_events WHERE scope_owner=? AND scope_session=?)",
+        )
+        .bind(owner)
+        .bind(&legacy.session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.observe(1).await;
+        }
+        if exists {
             return Ok(ImportOutcome::AlreadyImported);
         }
         if legacy.summary.is_none() && legacy.recent.is_empty() {
@@ -165,7 +198,11 @@ impl SessionLog {
             };
             pending.push(("message", serde_json::to_value(msg)?, trust));
         }
-        pending.push(("session.imported", json!({"from":"kv","messages":legacy.recent.len(),"had_summary":legacy.summary.is_some()}), Trust::System));
+        pending.push((
+            "session.imported",
+            json!({"from":"kv","messages":legacy.recent.len(),"had_summary":legacy.summary.is_some()}),
+            Trust::System,
+        ));
         for (index, (kind, body, trust)) in pending.iter().enumerate() {
             let key = id(("import", &scope, index))?;
             let origin = Origin {
@@ -179,6 +216,7 @@ impl SessionLog {
             events: pending.len(),
         })
     }
+
     pub async fn append_summary(
         &self,
         owner: &str,
@@ -187,10 +225,14 @@ impl SessionLog {
         covered_through_seq: i64,
     ) -> Result<i64> {
         let scope = Scope::owner(owner).with_session(session);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let nonce: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM mem_events")
             .fetch_one(&mut *tx)
             .await?;
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.observe(1).await;
+        }
         let body = json!({"summary":summary,"covered_through_seq":covered_through_seq});
         let key = id(("summary", &scope, nonce))?;
         let seq = write(
@@ -205,19 +247,46 @@ impl SessionLog {
         tx.commit().await?;
         Ok(seq)
     }
+
     pub async fn load_view(&self, owner: &str, session: &str) -> Result<SessionView> {
         let scope = Scope::owner(owner).with_session(session);
-        let stored = entries(&mut *self.pool.acquire().await?, &scope).await?;
-        let mut view = SessionView::default();
-        if let Some(latest) = stored.iter().rev().find(|e| e.kind == "session.summary") {
-            view = serde_json::from_value(latest.body.clone())?;
+        let mut tx = self.pool.begin().await?;
+        let summary = sqlx::query(
+            "SELECT payload AS body FROM mem_events WHERE scope_owner=? AND scope_session=? AND kind='session.summary' ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(owner)
+        .bind(session)
+        .fetch_optional(&mut *tx)
+        .await?;
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.observe(usize::from(summary.is_some())).await;
         }
-        for e in stored
-            .into_iter()
-            .filter(|e| e.kind == "message" && e.seq > view.covered_through_seq)
-        {
-            view.tail.push((e.seq, serde_json::from_value(e.body)?));
+        let mut view = match summary {
+            Some(row) => serde_json::from_str(row.get("body"))?,
+            None => SessionView::default(),
+        };
+        let tail = sqlx::query(
+            "SELECT seq,payload AS body FROM mem_events WHERE scope_owner=? AND scope_session=? AND kind='message' AND seq>? ORDER BY seq",
+        )
+        .bind(&scope.owner)
+        .bind(session)
+        .bind(view.covered_through_seq)
+        .fetch_all(&mut *tx)
+        .await?;
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.observe(tail.len()).await;
         }
+        for row in tail {
+            view.tail
+                .push((row.get("seq"), serde_json::from_str(row.get("body"))?));
+        }
+        tx.commit().await?;
         Ok(view)
     }
 }
+
+#[cfg(test)]
+#[path = "session_log_regression_tests.rs"]
+mod regression_tests;

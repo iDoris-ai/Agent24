@@ -2114,20 +2114,28 @@ mod session_log_tests {
             .scan(&EventQuery::owner(owner).session(sid))
             .await
     }
-    async fn turn(log: &session_log::SessionLog, sid: &str, u: &str, a: &str) -> Result<()> {
-        append(log, "o", sid, u, a).await?;
+    async fn turn(
+        log: &session_log::SessionLog,
+        sid: &str,
+        turn_no: u64,
+        u: &str,
+        a: &str,
+    ) -> Result<()> {
+        append(log, "o", sid, turn_no, u, a).await?;
         Ok(())
     }
     async fn append(
         log: &session_log::SessionLog,
         o: &str,
         s: &str,
+        turn_no: u64,
         u: &str,
         a: &str,
     ) -> Result<session_log::TurnIds> {
         log.append_turn(
             o,
             s,
+            turn_no,
             &Msg::user(u),
             origin(Trust::UserSaid),
             &assistant(a),
@@ -2143,7 +2151,7 @@ mod session_log_tests {
             .await?;
         Ok(())
     }
-    fn turn_id(o: &str, s: &str, n: usize, role: &str) -> Result<String> {
+    fn turn_id(o: &str, s: &str, n: u64, role: &str) -> Result<String> {
         use sha2::{Digest, Sha256};
         Ok(format!(
             "{:x}",
@@ -2163,7 +2171,7 @@ mod session_log_tests {
         let (o, s) = ("owner", "s");
         let a = assistant("answer");
         let occupied = MemEvent::new(
-            turn_id(o, s, 0, "assistant")?,
+            turn_id(o, s, 1, "assistant")?,
             Scope::owner(o).with_session(s),
             "message",
             serde_json::to_value(&a)?,
@@ -2171,7 +2179,10 @@ mod session_log_tests {
         );
         kv.events().append(&occupied).await?;
         let log = kv.session_log();
-        assert!(append(&log, o, s, "question", "answer").await.is_err());
+        assert!(matches!(
+            append(&log, o, s, 1, "question", "answer").await,
+            Err(MemoryError::Conflict(_))
+        ));
         assert!(
             events(&kv, o, s)
                 .await?
@@ -2182,15 +2193,74 @@ mod session_log_tests {
             .bind(&occupied.id)
             .execute(&kv.pool)
             .await?;
-        let first = append(&log, o, s, "question", "answer").await?;
-        let retry = append(&log, o, s, "question", "answer").await?;
+        let first = append(&log, o, s, 1, "question", "answer").await?;
+        let retry = append(&log, o, s, 1, "question", "answer").await?;
         assert_eq!((first.user, first.assistant), (retry.user, retry.assistant));
         assert_eq!(events(&kv, o, s).await?.len(), 2);
-        assert!(append(&log, o, s, "question", "changed").await.is_err());
+        assert!(matches!(
+            append(&log, o, s, 1, "question", "changed").await,
+            Err(MemoryError::Conflict(_))
+        ));
+        let changed_user = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("changed question"),
+                origin(Trust::UserSaid),
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_assistant = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::UserSaid),
+                &assistant("changed"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_user_trust = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::Model),
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_assistant_trust = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::UserSaid),
+                &assistant("answer"),
+                origin(Trust::UserSaid),
+            )
+            .await;
+        for err in [
+            changed_user,
+            changed_assistant,
+            changed_user_trust,
+            changed_assistant_trust,
+        ] {
+            assert!(
+                matches!(err, Err(MemoryError::Conflict(_))),
+                "expected conflicting turn identity: {err:?}"
+            );
+        }
         let different_source = log
             .append_turn(
                 o,
                 s,
+                1,
                 &Msg::user("question"),
                 Origin {
                     source: "another-source".into(),
@@ -2201,13 +2271,14 @@ mod session_log_tests {
             )
             .await;
         assert!(
-            different_source.is_err(),
+            matches!(different_source, Err(MemoryError::Conflict(_))),
             "same IDs with different provenance must conflict"
         );
         append(
             &log,
             "other-owner",
             s,
+            1,
             "separate question",
             "separate answer",
         )
@@ -2217,6 +2288,44 @@ mod session_log_tests {
             contents(&log.load_view(o, s).await?),
             ["question", "answer"]
         );
+        assert_eq!(
+            events(&kv, o, s).await?.len(),
+            2,
+            "conflicts must leave history unchanged"
+        );
+        append(&log, o, "another-session", 1, "session isolated", "answer").await?;
+        assert_eq!(events(&kv, o, "another-session").await?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_user_text_in_distinct_turns_is_preserved() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+
+        let first = append(&log, "o", "s", 1, "继续", "第一轮回答").await?;
+        let second = append(&log, "o", "s", 2, "继续", "第二轮回答").await?;
+        assert_eq!(
+            append(&log, "o", "s", 1, "继续", "第一轮回答").await?,
+            first
+        );
+        assert_eq!(
+            append(&log, "o", "s", 2, "继续", "第二轮回答").await?,
+            second
+        );
+        assert_eq!(events(&kv, "o", "s").await?.len(), 4);
+        assert_eq!(
+            contents(&log.load_view("o", "s").await?),
+            ["继续", "第一轮回答", "继续", "第二轮回答"]
+        );
+
+        append(&log, "o", "same-answer", 1, "继续", "相同回答").await?;
+        append(&log, "o", "same-answer", 2, "继续", "相同回答").await?;
+        assert_eq!(events(&kv, "o", "same-answer").await?.len(), 4);
+        assert_eq!(
+            contents(&log.load_view("o", "same-answer").await?),
+            ["继续", "相同回答", "继续", "相同回答"]
+        );
         Ok(())
     }
 
@@ -2225,7 +2334,11 @@ mod session_log_tests {
         for rows in [0, 1] {
             let kv = KvStore::open_memory().await?;
             quota(&kv, "q", rows).await?;
-            assert!(append(&kv.session_log(), "q", "s", "u", "a").await.is_err());
+            assert!(
+                append(&kv.session_log(), "q", "s", 1, "u", "a")
+                    .await
+                    .is_err()
+            );
             assert!(events(&kv, "q", "s").await?.is_empty());
         }
         Ok(())
@@ -2276,10 +2389,10 @@ mod session_log_tests {
         assert!(failed.session_log().import_legacy("q", &old).await.is_err());
         assert!(events(&failed, "q", "legacy").await?.is_empty());
 
-        let next = append(&log, "o", "legacy", "new question", "new answer").await?;
+        let next = append(&log, "o", "legacy", 1, "new question", "new answer").await?;
         assert_eq!(
             next,
-            append(&log, "o", "legacy", "new question", "new answer").await?
+            append(&log, "o", "legacy", 1, "new question", "new answer").await?
         );
         assert_eq!(
             contents(&log.load_view("o", "legacy").await?),
@@ -2292,9 +2405,9 @@ mod session_log_tests {
     async fn summaries_follow_session_message_sequences() -> Result<()> {
         let kv = KvStore::open_memory().await?;
         let log = kv.session_log();
-        turn(&log, "s", "one", "two").await?;
-        turn(&log, "other", "interleave", "x").await?;
-        turn(&log, "s", "three", "four").await?;
+        turn(&log, "s", 1, "one", "two").await?;
+        turn(&log, "other", 1, "interleave", "x").await?;
+        turn(&log, "s", 2, "three", "four").await?;
         let first_summary_seq = log.append_summary("o", "s", "summary one", 2).await?;
         assert!(
             events(&kv, "o", "s").await?.iter().any(
@@ -2302,8 +2415,8 @@ mod session_log_tests {
             )
         );
         assert_eq!(contents(&log.load_view("o", "s").await?), ["three", "four"]);
-        turn(&log, "other", "interleave two", "y").await?;
-        turn(&log, "s", "five", "six").await?;
+        turn(&log, "other", 2, "interleave two", "y").await?;
+        turn(&log, "s", 3, "five", "six").await?;
         let second_summary_seq = log.append_summary("o", "s", "summary two", 6).await?;
         assert!(
             events(&kv, "o", "s")
