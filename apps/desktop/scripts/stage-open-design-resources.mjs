@@ -27,6 +27,18 @@ function requireDirectory(root, relative) {
   return target
 }
 
+function requireResourceTreeRoot(sourceRoot, relative) {
+  const target = path.join(sourceRoot, relative)
+  const stat = fs.lstatSync(target, { throwIfNoEntry: false })
+  if (stat?.isSymbolicLink()) {
+    throw new Error(`Open Design packaged resource tree root must not be a symlink: ${relative}`)
+  }
+  if (!stat?.isDirectory()) {
+    throw new Error(`Open Design packaged resource directory is missing: ${relative}`)
+  }
+  return target
+}
+
 function verifyVersion(sourceRoot) {
   const packagePath = requireFile(sourceRoot, 'app/package.json')
   const manifest = JSON.parse(fs.readFileSync(packagePath, 'utf8'))
@@ -38,6 +50,7 @@ function verifyVersion(sourceRoot) {
 }
 
 function verifyContract(sourceRoot) {
+  for (const relative of RESOURCE_TREES) requireResourceTreeRoot(sourceRoot, relative)
   verifyVersion(sourceRoot)
   for (const relative of [
     'app/prebundled/agent24-headless.cjs',
@@ -63,9 +76,16 @@ function verifySymlinks(sourceRoot, directory) {
     if (entry.isSymbolicLink()) {
       const link = fs.readlinkSync(fullPath)
       if (path.isAbsolute(link)) throw new Error(`Open Design packaged resource has an absolute symlink: ${fullPath}`)
+      const literalTarget = path.resolve(path.dirname(fullPath), link)
+      if (!isInsideResourceTrees(sourceRoot, literalTarget)) {
+        throw new Error(`Open Design packaged resource symlink text escapes staged trees: ${fullPath}`)
+      }
       const resolved = fs.realpathSync(fullPath)
       if (!isInsideResourceTrees(sourceRoot, resolved)) {
         throw new Error(`Open Design packaged resource symlink escapes staged trees: ${fullPath}`)
+      }
+      if (literalTarget !== resolved) {
+        throw new Error(`Open Design packaged resource symlink crosses another symlink: ${fullPath}`)
       }
       continue
     }

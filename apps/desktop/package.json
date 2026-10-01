@@ -16,6 +16,7 @@
     "build:rust:debug": "cargo build -p agent24d --manifest-path ../../rust/Cargo.toml",
     "build:rust": "cargo build --release -p agent24d -p agent24-cli --manifest-path ../../rust/Cargo.toml",
     "stage:open-design": "node scripts/stage-open-design-resources.mjs",
+    "test:stage-open-design": "node --test scripts/stage-open-design-resources.test.mjs",
     "build:mac": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && electron-builder --mac",
     "build:win": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && electron-builder --win",
     "build:linux": "pnpm build:rust && pnpm --filter @agent24/node-daemon build && pnpm build && pnpm stage:open-design && electron-builder --linux",
