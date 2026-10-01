@@ -160,6 +160,9 @@ export class InboundBridge {
   }
 }
 
+/** event_ids already logged as skipped while F4b is frozen (bounded like `seen`). */
+const frozenLogged = new Set<string>()
+
 export interface PollOnceOptions {
   /** COMM-5a: F4b inbound execution is frozen by default (`A24_NOSTR_F4B_INBOUND`
    * unset in `main.ts`) — a whitelisted message is still polled, deduped and
@@ -200,12 +203,17 @@ export async function pollOnce(
     if (!msg.from) continue
     if (!dispatchEnabled) {
       // F4b frozen (COMM-5a): the message is read and the liveness canary above
-      // already observed it — it just does not become a run. Logged (not
-      // silently dropped) so an operator watching the log can see inbound
-      // traffic arriving while dispatch stays off.
-      console.log(
-        `[nostr] F4b 入站执行已冻结(A24_NOSTR_F4B_INBOUND 未设置):跳过来自 ${msg.from} 的消息,未触发 run`,
-      )
+      // already observed it — it just does not become a run. Logged once per
+      // event_id (the inbox window is re-read every poll, so logging per poll
+      // would repeat the same line every tick).
+      const key = msg.event_id ?? `${msg.from}:${msg.content ?? ''}`
+      if (!frozenLogged.has(key)) {
+        frozenLogged.add(key)
+        if (frozenLogged.size > MAX_SEEN) frozenLogged.delete(frozenLogged.values().next().value as string)
+        console.log(
+          `[nostr] F4b 入站执行已冻结(A24_NOSTR_F4B_INBOUND 未设置):跳过来自 ${msg.from} 的消息,未触发 run`,
+        )
+      }
       continue
     }
     await bridge.handle(msg)
