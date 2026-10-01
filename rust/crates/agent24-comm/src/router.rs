@@ -765,9 +765,46 @@ struct RelayProbeReq {
     url: Option<String>,
 }
 
-/// `POST /comm/relay/probe` → `relay info [U] --timeout 5`, run only when a
+/// Resolves the address `probe_relay` is about to probe when the caller
+/// didn't name one explicitly, mirroring Hyphae's OWN `relay info`/`relay
+/// list` resolution precedence (explicit > config > built-in default,
+/// `internal/relayconfig`'s `Resolver::Resolve`, `internal/nostr/relay.go`'s
+/// `relayInfo`: `result.Relays[0]` of that same resolution) by asking `relay
+/// list` and taking its first address.
+///
+/// Codex COMM-4b review, Medium #4: without this, a probe with no explicit
+/// `url` left the target entirely implicit — fine on success (Hyphae's own
+/// success envelope echoes back the `url` it actually used), but a
+/// `network_error` failure's envelope carries no `url` at all, so the
+/// recorded probe ended up with `url: null` even though a real address was
+/// dialed. Resolving it here means `probe_relay` always has an address to
+/// pass explicitly to `relay info` and to record, on either outcome.
+///
+/// Best-effort: if this auxiliary `relay list` call itself fails for any
+/// reason, this returns `None` and `probe_relay` falls back to its old
+/// behavior of leaving the explicit arg off `relay info`, letting Hyphae
+/// resolve it internally — a failure here is not reason to fail the probe
+/// itself.
+async fn effective_probe_target(runner: &HyphaeRunner, requested: Option<&str>) -> Option<String> {
+    if let Some(url) = requested {
+        return Some(url.to_owned());
+    }
+    let envelope = runner.run(read_invocation(&["relay", "list"])).await.ok()?;
+    let Envelope::Ok { data } = envelope else {
+        return None;
+    };
+    data.get("relays")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// `POST /comm/relay/probe` → `relay info <U> --timeout 5`, run only when a
 /// caller explicitly asks (§4, §5.2: comm does not probe periodically —
 /// that was cut, M12). Always expects a JSON body (`{}` when no `url`).
+/// `<U>` is always passed explicitly now (via [`effective_probe_target`]),
+/// even when the caller didn't name one — see that function's doc comment.
 ///
 /// COMM-4b: a relay actually being down must not surface as an HTTP error —
 /// Hyphae's own `relay info` contract (`docs/agent/cli-communication-contract.md`:
@@ -782,8 +819,9 @@ struct RelayProbeReq {
 /// `set_relay`'s `on_config_changed` call.
 async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeReq>) -> CommResult {
     let (runner, ..) = state.require_ready()?;
+    let target = effective_probe_target(runner, req.url.as_deref()).await;
     let mut argv: Vec<OsString> = vec!["relay".into(), "info".into()];
-    if let Some(url) = &req.url {
+    if let Some(url) = &target {
         argv.push(url.clone().into());
     }
     argv.push("--timeout".into());
@@ -804,7 +842,7 @@ async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeR
                 .get("url")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .or_else(|| req.url.clone()),
+                .or_else(|| target.clone()),
             connected: data
                 .get("connected")
                 .and_then(Value::as_bool)
@@ -817,7 +855,7 @@ async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeR
             message,
             ..
         } => RelayProbeStatus {
-            url: req.url.clone(),
+            url: target.clone(),
             connected: false,
             at_ms,
             error: Some(message),

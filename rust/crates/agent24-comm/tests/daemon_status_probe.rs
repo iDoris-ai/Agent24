@@ -159,11 +159,25 @@ async fn relay_probe_reports_connected_false_when_relay_is_down_and_records_it()
         body["data"]["error"].as_str().is_some(),
         "the network failure's message should still be visible: {body:?}"
     );
+    // Codex COMM-4b review, Medium #4: a `network_error` envelope from
+    // Hyphae carries no `url` field at all, so the probe target must come
+    // from comm's OWN resolution (mirroring `relay list`'s explicit >
+    // config > default precedence) when the caller didn't name one — not
+    // be left `null` just because the request body omitted it.
+    assert_eq!(
+        body["data"]["url"], "wss://relay.example",
+        "a default-target probe failure must still report which address was \
+         actually probed: {body:?}"
+    );
 
     // §5.2: the result must also land in GET /comm/daemon's relay_probe.
     let (status, body) = get(&app, "/daemon").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["data"]["relay_probe"]["connected"], false, "{body:?}");
+    assert_eq!(
+        body["data"]["relay_probe"]["url"], "wss://relay.example",
+        "{body:?}"
+    );
     assert!(
         body["data"]["relay_probe"]["at_ms"]
             .as_u64()
