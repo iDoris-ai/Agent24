@@ -19,6 +19,7 @@ pub mod reconcile;
 pub mod replay;
 pub mod retriever;
 pub mod session;
+pub mod session_log;
 pub mod trace;
 pub mod vector;
 pub mod writer;
@@ -342,6 +343,11 @@ impl KvStore {
     /// cross-store transaction seam is MD-2b work.)
     pub fn events(&self) -> event::EventLog {
         event::EventLog::new(self.pool.clone())
+    }
+
+    /// A session event-log writer over this store's database.
+    pub fn session_log(&self) -> session_log::SessionLog {
+        session_log::SessionLog::new(self.pool.clone())
     }
 
     /// An [`artifact::ArtifactCas`] over the SAME database file — MD-2b's
@@ -2475,5 +2481,354 @@ mod forget_tests {
                     .is_empty()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod session_log_tests {
+    use super::*;
+    use agent24_models::Msg;
+    use event::{EventQuery, EventStore, MemEvent, Origin, Scope, Trust};
+    use session::CanonicalSession;
+    use session_log::ImportOutcome;
+
+    fn origin(trust: Trust) -> Origin {
+        Origin {
+            source: "test".into(),
+            trust,
+        }
+    }
+    fn assistant(s: &str) -> Msg {
+        Msg::assistant(Some(s.into()), vec![])
+    }
+    async fn events(kv: &KvStore, owner: &str, sid: &str) -> Result<Vec<event::StoredEvent>> {
+        kv.events()
+            .scan(&EventQuery::owner(owner).session(sid))
+            .await
+    }
+    async fn turn(
+        log: &session_log::SessionLog,
+        sid: &str,
+        turn_no: u64,
+        u: &str,
+        a: &str,
+    ) -> Result<()> {
+        append(log, "o", sid, turn_no, u, a).await?;
+        Ok(())
+    }
+    async fn append(
+        log: &session_log::SessionLog,
+        o: &str,
+        s: &str,
+        turn_no: u64,
+        u: &str,
+        a: &str,
+    ) -> Result<session_log::TurnIds> {
+        log.append_turn(
+            o,
+            s,
+            turn_no,
+            &Msg::user(u),
+            origin(Trust::UserSaid),
+            &assistant(a),
+            origin(Trust::Model),
+        )
+        .await
+    }
+    async fn quota(kv: &KvStore, owner: &str, rows: i64) -> Result<()> {
+        sqlx::query("INSERT INTO mem_owner_quota(owner,max_rows,max_bytes) VALUES(?,?,268435456)")
+            .bind(owner)
+            .bind(rows)
+            .execute(&kv.pool)
+            .await?;
+        Ok(())
+    }
+    fn turn_id(o: &str, s: &str, n: u64, role: &str) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(o, s, n, role))?)
+        ))
+    }
+    fn contents(view: &session_log::SessionView) -> Vec<&str> {
+        view.tail
+            .iter()
+            .map(|(_, m)| m.content.as_deref().unwrap_or("<missing>"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn turn_rejects_incomplete_event_pair() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let (o, s) = ("owner", "s");
+        let assistant = assistant("answer");
+        let occupied = MemEvent::new(
+            turn_id(o, s, 1, "assistant")?,
+            Scope::owner(o).with_session(s),
+            "message",
+            serde_json::to_value(&assistant)?,
+            origin(Trust::Model),
+        );
+        kv.events().append(&occupied).await?;
+
+        // This only checks the pre-write conflict check; it does not prove transaction rollback.
+        assert!(matches!(
+            append(&kv.session_log(), o, s, 1, "question", "answer").await,
+            Err(MemoryError::Conflict(_))
+        ));
+        assert!(
+            events(&kv, o, s)
+                .await?
+                .iter()
+                .all(|e| e.event.body["role"] != "user")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_is_idempotent_and_conflict_checked() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let (o, s) = ("owner", "s");
+        let log = kv.session_log();
+        let first = append(&log, o, s, 1, "question", "answer").await?;
+        let retry = append(&log, o, s, 1, "question", "answer").await?;
+        assert_eq!((first.user, first.assistant), (retry.user, retry.assistant));
+        assert_eq!(events(&kv, o, s).await?.len(), 2);
+        assert!(matches!(
+            append(&log, o, s, 1, "question", "changed").await,
+            Err(MemoryError::Conflict(_))
+        ));
+        let changed_user = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("changed question"),
+                origin(Trust::UserSaid),
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_assistant = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::UserSaid),
+                &assistant("changed"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_user_trust = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::Model),
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        let changed_assistant_trust = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                origin(Trust::UserSaid),
+                &assistant("answer"),
+                origin(Trust::UserSaid),
+            )
+            .await;
+        for err in [
+            changed_user,
+            changed_assistant,
+            changed_user_trust,
+            changed_assistant_trust,
+        ] {
+            assert!(
+                matches!(err, Err(MemoryError::Conflict(_))),
+                "expected conflicting turn identity: {err:?}"
+            );
+        }
+        let different_source = log
+            .append_turn(
+                o,
+                s,
+                1,
+                &Msg::user("question"),
+                Origin {
+                    source: "another-source".into(),
+                    trust: Trust::UserSaid,
+                },
+                &assistant("answer"),
+                origin(Trust::Model),
+            )
+            .await;
+        assert!(
+            matches!(different_source, Err(MemoryError::Conflict(_))),
+            "same IDs with different provenance must conflict"
+        );
+        append(
+            &log,
+            "other-owner",
+            s,
+            1,
+            "separate question",
+            "separate answer",
+        )
+        .await?;
+        assert_eq!(events(&kv, "other-owner", s).await?.len(), 2);
+        assert_eq!(
+            contents(&log.load_view(o, s).await?),
+            ["question", "answer"]
+        );
+        assert_eq!(
+            events(&kv, o, s).await?.len(),
+            2,
+            "conflicts must leave history unchanged"
+        );
+        append(&log, o, "another-session", 1, "session isolated", "answer").await?;
+        assert_eq!(events(&kv, o, "another-session").await?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_user_text_in_distinct_turns_is_preserved() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+
+        let first = append(&log, "o", "s", 1, "继续", "第一轮回答").await?;
+        let second = append(&log, "o", "s", 2, "继续", "第二轮回答").await?;
+        assert_eq!(
+            append(&log, "o", "s", 1, "继续", "第一轮回答").await?,
+            first
+        );
+        assert_eq!(
+            append(&log, "o", "s", 2, "继续", "第二轮回答").await?,
+            second
+        );
+        assert_eq!(events(&kv, "o", "s").await?.len(), 4);
+        assert_eq!(
+            contents(&log.load_view("o", "s").await?),
+            ["继续", "第一轮回答", "继续", "第二轮回答"]
+        );
+
+        append(&log, "o", "same-answer", 1, "继续", "相同回答").await?;
+        append(&log, "o", "same-answer", 2, "继续", "相同回答").await?;
+        assert_eq!(events(&kv, "o", "same-answer").await?.len(), 4);
+        assert_eq!(
+            contents(&log.load_view("o", "same-answer").await?),
+            ["继续", "相同回答", "继续", "相同回答"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quota_zero_and_one_roll_back_turn() -> Result<()> {
+        for rows in [0, 1] {
+            let kv = KvStore::open_memory().await?;
+            quota(&kv, "q", rows).await?;
+            // quota=1 rejects the second event write, so it verifies transaction rollback.
+            assert!(matches!(
+                append(&kv.session_log(), "q", "s", 1, "u", "a").await,
+                Err(MemoryError::QuotaExceeded { owner, dimension: "rows" }) if owner == "q"
+            ));
+            assert!(
+                events(&kv, "q", "s").await?.is_empty(),
+                "quota={rows} must leave no partial turn"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_is_atomic_marked_idempotent_and_replayable() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let mut old = CanonicalSession::new("legacy");
+        old.summary = Some("older context".into());
+        old.recent = vec![Msg::user("old question"), assistant("old answer")];
+        let log = kv.session_log();
+        assert!(matches!(
+            log.import_legacy("o", &old).await?,
+            ImportOutcome::Imported { events: 4 }
+        ));
+        assert!(matches!(
+            log.import_legacy("o", &old).await?,
+            ImportOutcome::AlreadyImported
+        ));
+        let stored = events(&kv, "o", "legacy").await?;
+        assert_eq!(stored.len(), 4);
+        assert_eq!(stored[0].event.kind, "session.summary");
+        assert_eq!(stored[0].event.body["covered_through_seq"], 0);
+        assert_eq!(stored[1].event.origin.source, "migration");
+        assert_eq!(stored[3].event.kind, "session.imported");
+        assert_eq!(
+            stored[3].event.body,
+            serde_json::json!({"from":"kv","messages":2,"had_summary":true})
+        );
+        let replay = replay::replayed_from_events(&stored)?;
+        assert_eq!(replay.messages, old.recent);
+        assert_eq!(
+            replay
+                .provenance
+                .iter()
+                .map(|p| p.trust)
+                .collect::<Vec<_>>(),
+            [Trust::UserSaid, Trust::Model]
+        );
+        assert!(matches!(
+            log.import_legacy("o", &CanonicalSession::new("empty"))
+                .await?,
+            ImportOutcome::NothingToImport
+        ));
+        let failed = KvStore::open_memory().await?;
+        quota(&failed, "q", 1).await?;
+        assert!(failed.session_log().import_legacy("q", &old).await.is_err());
+        assert!(events(&failed, "q", "legacy").await?.is_empty());
+
+        let next = append(&log, "o", "legacy", 1, "new question", "new answer").await?;
+        assert_eq!(
+            next,
+            append(&log, "o", "legacy", 1, "new question", "new answer").await?
+        );
+        assert_eq!(
+            contents(&log.load_view("o", "legacy").await?),
+            ["old question", "old answer", "new question", "new answer"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn summaries_follow_session_message_sequences() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        turn(&log, "s", 1, "one", "two").await?;
+        turn(&log, "other", 1, "interleave", "x").await?;
+        turn(&log, "s", 2, "three", "four").await?;
+        let first_summary_seq = log.append_summary("o", "s", "summary one", 2).await?;
+        assert!(
+            events(&kv, "o", "s").await?.iter().any(
+                |event| event.seq == first_summary_seq && event.event.kind == "session.summary"
+            )
+        );
+        assert_eq!(contents(&log.load_view("o", "s").await?), ["three", "four"]);
+        turn(&log, "other", 2, "interleave two", "y").await?;
+        turn(&log, "s", 3, "five", "six").await?;
+        let second_summary_seq = log.append_summary("o", "s", "summary two", 6).await?;
+        assert!(
+            events(&kv, "o", "s")
+                .await?
+                .iter()
+                .any(|event| event.seq == second_summary_seq
+                    && event.event.kind == "session.summary")
+        );
+        let view = log.load_view("o", "s").await?;
+        assert_eq!(view.summary.as_deref(), Some("summary two"));
+        assert_eq!(view.covered_through_seq, 6);
+        assert_eq!(contents(&view), ["five", "six"]);
+        Ok(())
     }
 }
