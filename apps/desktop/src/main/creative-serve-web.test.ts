@@ -117,15 +117,34 @@ describe('CreativeServeWeb', () => {
   })
 
   it('removes Agent24 host variables from the Creative child environment', () => {
-    expect(creativeChildEnvironment({
+    const childEnv = creativeChildEnvironment({
       PATH: '/usr/bin',
       OPENAI_API_KEY: 'provider-secret',
       A24_HANDSHAKE_TOKEN: 'host-secret',
       a24_host_bootstrap: 'also-secret',
-    })).toEqual({
+    })
+    expect(childEnv).toEqual({
       PATH: '/usr/bin',
       OPENAI_API_KEY: 'provider-secret',
     })
+    expect(Object.getPrototypeOf(childEnv)).toBeNull()
+  })
+
+  it('does not reintroduce inherited A24 variables when spawn enumerates the env', () => {
+    Object.defineProperty(Object.prototype, 'a24_polluted_host_secret', {
+      configurable: true,
+      enumerable: true,
+      value: 'leaked-if-enumerated',
+      writable: true,
+    })
+    try {
+      const childEnv = creativeChildEnvironment({ PATH: '/usr/bin' })
+      const enumerated = [] as string[]
+      for (const key in childEnv) enumerated.push(key)
+      expect(enumerated).toEqual(['PATH'])
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).a24_polluted_host_secret
+    }
   })
 
   it('launches serve-web, waits for /api/ready, and stops with SIGTERM', async () => {

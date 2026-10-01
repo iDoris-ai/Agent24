@@ -114,9 +114,11 @@ export function creativeChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.Process
   // but the less-trusted Open Design child must never inherit host secrets.
   // Keep the rest of the environment intact so Open Design's own provider,
   // media, proxy, locale, and toolchain configuration continues to work.
-  return Object.fromEntries(
-    Object.entries(env).filter(([key]) => !key.toUpperCase().startsWith('A24_')),
-  )
+  const childEnv = Object.create(null) as NodeJS.ProcessEnv
+  for (const [key, value] of Object.entries(env)) {
+    if (!key.toUpperCase().startsWith('A24_')) childEnv[key] = value
+  }
+  return childEnv
 }
 
 export class CreativeServeWeb {
