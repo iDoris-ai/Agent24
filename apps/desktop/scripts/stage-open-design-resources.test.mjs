@@ -49,9 +49,10 @@ test('rejects a symlink whose text leaves the staged resource trees', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'a24-od-stage-lexical-'))
   try {
     seedValidSource(tmp)
-    fs.mkdirSync(path.join(tmp, 'shortcut'))
-    fs.writeFileSync(path.join(tmp, 'shortcut/target.txt'), 'outside')
-    fs.symlinkSync('../../shortcut/target.txt', path.join(tmp, 'app/prebundled/escaped'))
+    fs.mkdirSync(path.join(tmp, 'open-design/lib'))
+    fs.writeFileSync(path.join(tmp, 'open-design/lib/target.txt'), 'inside')
+    fs.symlinkSync('open-design/lib', path.join(tmp, 'shortcut'))
+    fs.symlinkSync('../shortcut/target.txt', path.join(tmp, 'app/escaped'))
     assert.throws(() => runStage(tmp), /symlink text escapes staged trees/)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
