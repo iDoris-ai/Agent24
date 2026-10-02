@@ -1834,6 +1834,13 @@ mod pump_tests {
             scheduler_with(store.clone(), trigger.clone() as Arc<dyn RunTrigger>);
         let now0 = utc("2026-08-01T00:00:00Z");
         let schedule_id = seed_module_fire(&scheduler, &store, "mod-p", "k", now0).await;
+        let fire_id = store.list_module_schedules("mod-p").await.unwrap()[0]
+            .last_fire
+            .tick
+            .as_ref()
+            .unwrap()
+            .fire_id
+            .clone();
         let clock = TestClock::at(now0 + chrono::Duration::seconds(65));
         let cancel = CancellationToken::new();
         let pump = DeliveryPump::new(Arc::clone(&scheduler));
@@ -1845,30 +1852,20 @@ mod pump_tests {
         // of `run`'s `select!` observed the panic) using whatever the clock
         // holds AT THAT MOMENT — freeze it between rounds and only advance
         // once this test has proof the previous round already landed.
-        async fn wait_for_last_error(store: &Store, owner: &str, expected: &str) {
+        // The call count advances before outcome persistence, and every panic
+        // shares the same last_error, so persisted attempts is the progress signal.
+        async fn wait_for_attempts(store: &Store, fire_id: &str, expected: i64) {
             wait_until(
-                || async {
-                    let states = store.list_module_schedules(owner).await.unwrap();
-                    states[0]
-                        .last_fire
-                        .tick
-                        .as_ref()
-                        .and_then(|f| f.last_error.as_deref())
-                        == Some(expected)
-                },
-                &format!("last_error never became {expected:?}"),
+                || async { fetch_attempts_and_updated_at(store, fire_id).await.0 == expected },
+                &format!("attempts never reached {expected}"),
             )
             .await;
         }
 
-        wait_for_last_error(&store, "mod-p", "kernel bug: attempt panicked").await;
+        wait_for_attempts(&store, &fire_id, 1).await;
         let t1 = clock.now();
         clock.set(t1 + chrono::Duration::seconds(6)); // past the 5s backoff
-        wait_until(
-            || async { trigger.calls() >= 2 },
-            "the second attempt never happened",
-        )
-        .await;
+        wait_for_attempts(&store, &fire_id, 2).await;
         let t2 = clock.now();
         clock.set(t2 + chrono::Duration::seconds(16)); // past the 15s backoff
         wait_until(
