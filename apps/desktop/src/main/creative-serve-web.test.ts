@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { CreativeServeWeb, resolveOpenDesignCheckout } from './creative-serve-web'
+import { CreativeServeWeb, CreativeViewRequestFence, resolveOpenDesignCheckout } from './creative-serve-web'
 
 class FakeChild extends EventEmitter {
   stdout = new PassThrough()
@@ -38,6 +38,24 @@ afterEach(() => {
 })
 
 describe('CreativeServeWeb', () => {
+  it('invalidates an in-flight view request when the view is hidden', async () => {
+    const fence = new CreativeViewRequestFence()
+    const first = fence.begin()
+    let releaseStartup!: () => void
+    const startup = new Promise<void>((resolve) => { releaseStartup = resolve })
+    const completesVisible = startup.then(() => fence.isCurrent(first))
+
+    fence.invalidate()
+    releaseStartup()
+
+    await expect(completesVisible).resolves.toBe(false)
+    expect(fence.wantsVisible()).toBe(false)
+
+    const second = fence.begin()
+    expect(fence.isCurrent(second)).toBe(true)
+    expect(fence.isCurrent(first)).toBe(false)
+  })
+
   it('uses the explicit Open Design checkout when it contains the od entry', () => {
     const root = checkout()
     expect(resolveOpenDesignCheckout('/unused', { A24_OPEN_DESIGN_DIR: root })).toBe(root)

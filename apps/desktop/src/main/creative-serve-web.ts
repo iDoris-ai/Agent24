@@ -18,6 +18,34 @@ export interface CreativeServeWebOptions {
   readyTimeoutMs?: number
 }
 
+// Reused from the later reviewed Creative lifecycle hardening (#616): a hide
+// must invalidate a show that is still waiting for serve-web startup, otherwise
+// that stale request can create a native view after the renderer has navigated
+// away from Creative.
+export class CreativeViewRequestFence {
+  private generation = 0
+  private desiredVisible = false
+
+  begin(): number {
+    this.desiredVisible = true
+    this.generation += 1
+    return this.generation
+  }
+
+  invalidate(): void {
+    this.desiredVisible = false
+    this.generation += 1
+  }
+
+  isCurrent(generation: number): boolean {
+    return this.desiredVisible && this.generation === generation
+  }
+
+  wantsVisible(): boolean {
+    return this.desiredVisible
+  }
+}
+
 type SpawnFn = typeof spawn
 type FetchFn = typeof fetch
 type CreativeChild = ChildProcess & { stdout: Readable; stderr: Readable }
