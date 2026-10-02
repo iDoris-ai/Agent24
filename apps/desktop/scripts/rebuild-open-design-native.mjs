@@ -46,8 +46,16 @@ export async function rebuildOpenDesignNativeModules() {
   requireFile(sqliteManifest, 'staged Open Design better-sqlite3 manifest')
   const sqliteRoot = path.dirname(sqliteManifest)
   const sqlitePackage = JSON.parse(fs.readFileSync(sqliteManifest, 'utf8'))
-  if (sqlitePackage.scripts?.['build-release'] !== 'node-gyp rebuild --release') {
+  if (sqlitePackage.name !== 'better-sqlite3') {
+    throw new Error('staged Open Design better-sqlite3 package identity changed')
+  }
+  const buildRelease = sqlitePackage.scripts?.['build-release']
+  const hasPackagedScripts = sqlitePackage.scripts != null
+  if (hasPackagedScripts && buildRelease !== 'node-gyp rebuild --release') {
     throw new Error('staged Open Design better-sqlite3 build-release contract changed')
+  }
+  if (!hasPackagedScripts) {
+    requireFile(path.join(sqliteRoot, 'binding.gyp'), 'staged Open Design better-sqlite3 binding.gyp')
   }
 
   const { executable, version } = resolveElectronRuntime()
@@ -64,13 +72,11 @@ export async function rebuildOpenDesignNativeModules() {
     npm_config_build_from_source: 'true',
   }
 
+  const npmArgs = hasPackagedScripts ? ['run', 'build-release'] : ['rebuild', '--foreground-scripts']
   if (process.platform === 'win32') {
-    await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', 'run', 'build-release'], {
-      cwd: sqliteRoot,
-      env: rebuildEnv,
-    })
+    await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', ...npmArgs], { cwd: sqliteRoot, env: rebuildEnv })
   } else {
-    await run('npm', ['run', 'build-release'], { cwd: sqliteRoot, env: rebuildEnv })
+    await run('npm', npmArgs, { cwd: sqliteRoot, env: rebuildEnv })
   }
 
   const probe = [
