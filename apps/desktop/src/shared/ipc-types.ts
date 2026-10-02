@@ -7,6 +7,9 @@ export const IpcChannels = {
   ShellOpenExternal: 'shell:open-external',
   BackendProxy: 'backend:proxy',
   BackendEndpoint: 'backend:endpoint',
+  CreativeShow: 'creative:show',
+  CreativeBounds: 'creative:bounds',
+  CreativeHide: 'creative:hide',
   OmlxDetect: 'omlx:detect',
   OmlxModels: 'omlx:models',
   OmlxStart: 'omlx:start',
@@ -54,6 +57,19 @@ export interface BackendProxyResponse {
  * its ready line yet. */
 export interface BackendEndpointResult {
   port: number
+}
+
+export interface CreativeViewBounds {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface CreativeViewResult {
+  ok: boolean
+  origin?: string
+  error?: string
 }
 
 export interface OmlxDetectResult {

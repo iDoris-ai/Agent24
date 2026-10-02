@@ -1,6 +1,6 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
-import { app, BrowserWindow, Menu, Tray, nativeImage, session, ipcMain, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, Menu, Tray, WebContentsView, nativeImage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { BackendManager, type BackendStatus } from './backend-manager'
@@ -8,6 +8,8 @@ import { AgentEarEventBridge } from './agentear-events'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
+import type { CreativeViewBounds, CreativeViewResult } from '../shared/ipc-types'
+import { CreativeServeWeb } from './creative-serve-web'
 
 const isDev = process.env.NODE_ENV === 'development'
 const backendManager = new BackendManager()
@@ -46,6 +48,52 @@ let mainWin: BrowserWindow | null = null
 let isQuitting = false
 // F1b: periodic tray refresh so the menu-bar reflects live daemon status
 let trayTimer: NodeJS.Timeout | null = null
+const creativeServeWeb = new CreativeServeWeb()
+let creativeView: WebContentsView | null = null
+
+function normalizedBounds(bounds: CreativeViewBounds): Electron.Rectangle {
+  return {
+    x: Math.max(0, Math.round(bounds.x)),
+    y: Math.max(0, Math.round(bounds.y)),
+    width: Math.max(1, Math.round(bounds.width)),
+    height: Math.max(1, Math.round(bounds.height)),
+  }
+}
+
+function hideCreativeView(): void {
+  if (!creativeView) return
+  creativeView.setBounds({ x: 0, y: 0, width: 1, height: 1 })
+}
+
+async function showCreativeView(bounds: CreativeViewBounds): Promise<CreativeViewResult> {
+  const win = mainWin
+  if (!win || win.isDestroyed()) return { ok: false, error: 'Agent24 window is unavailable' }
+
+  const status = await creativeServeWeb.start()
+  if (status.state !== 'ready' || !status.origin) {
+    return { ok: false, error: status.error ?? 'Open Design did not become ready' }
+  }
+
+  if (!creativeView || creativeView.webContents.isDestroyed()) {
+    creativeView = new WebContentsView({
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    })
+    win.contentView.addChildView(creativeView)
+    creativeView.webContents.setWindowOpenHandler(({ url }) => {
+      if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url)
+      return { action: 'deny' }
+    })
+  }
+
+  creativeView.setBounds(normalizedBounds(bounds))
+  const current = creativeView.webContents.getURL()
+  if (!current.startsWith(status.origin)) await creativeView.webContents.loadURL(status.origin)
+  return { ok: true, origin: status.origin }
+}
 
 function createMainWindow(): BrowserWindow {
   const win = new BrowserWindow({
@@ -135,6 +183,11 @@ app.whenReady().then(() => {
 
   registerIpcHandlers()
   mainWin = createMainWindow()
+  ipcMain.handle(IpcChannels.CreativeShow, (_event, bounds: CreativeViewBounds) => showCreativeView(bounds))
+  ipcMain.handle(IpcChannels.CreativeBounds, (_event, bounds: CreativeViewBounds) => {
+    if (creativeView && !creativeView.webContents.isDestroyed()) creativeView.setBounds(normalizedBounds(bounds))
+  })
+  ipcMain.handle(IpcChannels.CreativeHide, () => hideCreativeView())
   agentEarBridge.start()
 
   // A3-4 review M5: pull (snapshot on mount) + push (ongoing) for the voice
@@ -233,6 +286,7 @@ app.on('will-quit', () => {
   agentEarBridge.stop()
   agentEarLog.stop()
   backendManager.stop()
+  void creativeServeWeb.stop()
 })
 
 // window-all-closed fires only if tray is null (i.e., user chose Quit from

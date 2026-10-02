@@ -8,6 +8,8 @@ import {
   type BackendEndpointResult,
   type BackendProxyRequest,
   type BackendProxyResponse,
+  type CreativeViewBounds,
+  type CreativeViewResult,
   type DiscoverFilter,
   type DiscoveredModule,
   type LlmStatusResult,
@@ -30,6 +32,12 @@ const api = {
     ipcRenderer.invoke(IpcChannels.BackendProxy, req),
   backendEndpoint: (): Promise<BackendEndpointResult | null> =>
     ipcRenderer.invoke(IpcChannels.BackendEndpoint),
+  creativeShow: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>
+    ipcRenderer.invoke(IpcChannels.CreativeShow, bounds),
+  creativeBounds: (bounds: CreativeViewBounds): Promise<void> =>
+    ipcRenderer.invoke(IpcChannels.CreativeBounds, bounds),
+  creativeHide: (): Promise<void> =>
+    ipcRenderer.invoke(IpcChannels.CreativeHide),
   omlxDetect: (): Promise<OmlxDetectResult | null> =>
     ipcRenderer.invoke(IpcChannels.OmlxDetect),
   omlxModels: (url: string, apiKey: string): Promise<OmlxModelsResult> =>
