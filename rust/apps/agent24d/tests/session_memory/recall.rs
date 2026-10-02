@@ -4,7 +4,12 @@ use agent24_memory::{
     event::{Origin, Scope, Trust},
     writer::{Candidate, MemoryWriter},
 };
+use agent24_models::{
+    CompletionRequest, CompletionResponse, ModelError, ModelProvider, ToolCallRequest,
+};
+use agent24_protocol::{ApprovalStatus, RunCreate, RunMode};
 use serde_json::json;
+use std::{path::Path, sync::Mutex as StdMutex, time::Duration};
 
 const RECALL_SESSION: &str = "m1-t07-recall-session";
 const MODULE: &str = "recall_probe";
@@ -37,6 +42,66 @@ fn recalled_text(messages: &[Msg]) -> Vec<&str> {
         .filter_map(|message| message.content.as_deref())
         .filter(|content| content.starts_with("你记得关于用户的这些事："))
         .collect()
+}
+
+struct ApprovalProvider {
+    response: Msg,
+    received: Arc<StdMutex<Vec<Vec<Msg>>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for ApprovalProvider {
+    fn name(&self) -> &str {
+        "recall-resume-test"
+    }
+
+    async fn complete(
+        &self,
+        req: &CompletionRequest,
+        _: &CancellationToken,
+    ) -> Result<CompletionResponse, ModelError> {
+        self.received.lock().unwrap().push(req.messages.clone());
+        Ok(CompletionResponse {
+            message: self.response.clone(),
+            usage: Usage::default(),
+            model_id: Some("mock".into()),
+        })
+    }
+
+    async fn models(&self, _: &CancellationToken) -> Result<Vec<Model>, ModelError> {
+        Ok(vec![])
+    }
+}
+
+async fn approval_app(
+    kv: KvStore,
+    path: &Path,
+    provider: Arc<ApprovalProvider>,
+    recall_budget: Option<usize>,
+) -> AppState {
+    let router = Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)]));
+    let cancel = CancellationToken::new();
+    let mut memory = session_memory(kv, &router, &cancel).await.unwrap();
+    if let Some(budget) = recall_budget {
+        memory = memory.with_recall_budget(budget);
+    }
+    let store = Store::open(&path.join("agent24.db")).await.unwrap();
+    let state = AppState::new(AppDeps {
+        token: "test".into(),
+        router,
+        tools: agent24_tools::ToolRegistry::builtin(path.to_path_buf()),
+        store,
+        shutdown: Shutdown::new(cancel),
+        guardian: None,
+        memory: Some(memory),
+        mcp_servers: vec![],
+        risk_overrides: StdArc::new(agent24_policy::overrides::RiskOverrideStore::from_rows(
+            vec![],
+        )),
+        packages_root: Arc::new(path.to_path_buf()),
+    });
+    ensure_session(&state, RECALL_SESSION).await;
+    state
 }
 
 #[tokio::test]
@@ -108,6 +173,123 @@ async fn unrelated_question_does_not_inject_memory() {
         std::iter::from_fn(|| events.try_recv().ok())
             .all(|(_, body)| { serde_json::to_value(body).unwrap()["type"] != "memory.recalled" })
     );
+}
+
+#[test]
+fn recalled_context_survives_approval_wait_and_daemon_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let received = Arc::new(StdMutex::new(Vec::new()));
+    let (run_id, approval_id, recalled_message) = {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let kv = KvStore::open(&path.join("memory.db")).await.unwrap();
+            let fact_state = app(kv.clone(), &path, Arc::new(Provider::default())).await;
+            run(&fact_state, "记住我对花生过敏").await;
+            drop(fact_state);
+            let provider = Arc::new(ApprovalProvider {
+                response: Msg::assistant(
+                    None,
+                    vec![ToolCallRequest {
+                        id: "resume-call".into(),
+                        name: "shell_exec".into(),
+                        arguments: json!({"argv": ["/bin/echo", "resume-ok"]}).to_string(),
+                    }],
+                ),
+                received: Arc::clone(&received),
+            });
+            let state = approval_app(kv, &path, provider, None).await;
+            let run = state
+                .runs
+                .start_run(RunCreate {
+                    session_id: Some(RECALL_SESSION.into()),
+                    prompt: "我对什么过敏？".into(),
+                    model_override: None,
+                    mode: RunMode::Normal,
+                })
+                .await
+                .unwrap();
+            let approval_id = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let run_row = state.store.get_run(&run.id).await.unwrap().unwrap();
+                    let approvals = state
+                        .store
+                        .list_approvals(Some(ApprovalStatus::Pending))
+                        .await
+                        .unwrap();
+                    if run_row.status == RunStatus::AwaitingApproval && !approvals.is_empty() {
+                        break approvals[0].id.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("run should park on a real pending approval");
+            let first = received.lock().unwrap()[0].clone();
+            let recalled = recalled_text(&first);
+            assert_eq!(recalled, vec!["你记得关于用户的这些事：\n- 我对花生过敏"]);
+            (run.id, approval_id, recalled[0].to_owned())
+        })
+        // Dropping this runtime simulates daemon termination while the run is
+        // parked. Runtime shutdown aborts the task without a cancellation transition.
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let kv = KvStore::open(&path.join("memory.db")).await.unwrap();
+        let provider = Arc::new(ApprovalProvider {
+            response: Msg::assistant(Some("resumed".into()), vec![]),
+            received: Arc::clone(&received),
+        });
+        // Disable fresh recall: only the durable snapshot can supply the facts.
+        let state = approval_app(kv, &path, provider, Some(0)).await;
+        let restored = state.runs.restore_pending_approvals().await;
+        assert_eq!(restored, (1, 0));
+        let response = crate::approvals::decide_approval(
+            State(state.clone()),
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/approvals/{approval_id}"))
+                .body(Body::from(r#"{"type":"approve"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let run = state.store.get_run(&run_id).await.unwrap().unwrap();
+                if run.status == RunStatus::Completed {
+                    break;
+                }
+                assert!(!matches!(
+                    run.status,
+                    RunStatus::Failed | RunStatus::Cancelled
+                ));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restored run should complete after approval");
+    });
+
+    let calls = received.lock().unwrap();
+    assert_eq!(calls.len(), 2, "one provider call before and after restart");
+    let resumed = &calls[1];
+    let recalled = recalled_text(resumed);
+    assert_eq!(recalled, vec![recalled_message.as_str()]);
+    assert_eq!(resumed.len(), 4);
+    assert_eq!(resumed[0], Msg::system(recalled_message));
+    assert_eq!(resumed[1], Msg::user("我对什么过敏？"));
+    assert_eq!(resumed[2].role, "assistant");
+    assert_eq!(resumed[2].tool_calls[0].id, "resume-call");
+    assert_eq!(resumed[3].role, "tool");
+    assert_eq!(resumed[3].tool_call_id.as_deref(), Some("resume-call"));
+    assert!(resumed[3].content.as_deref().unwrap().contains("resume-ok"));
 }
 
 #[tokio::test]

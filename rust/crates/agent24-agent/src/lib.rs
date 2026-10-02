@@ -903,12 +903,15 @@ impl RunManager {
                     run_id: run_id.clone(),
                     ids,
                 }));
+            // Keep the exact recalled context in the durable run thread so an
+            // approval resume reconstructs it without issuing another recall.
+            self.persist_message(&run_id, &recalled).await;
             messages.push(recalled);
         }
         messages.extend(prior_context);
         // Persist this run's opening user turn to the durable thread (H3). Prior
-        // (compacted) context stays in session memory and is reloaded from there
-        // on resume, so only the per-run tail is recorded here.
+        // session context is not copied into the run thread; the recall snapshot
+        // above and this run's own tail are persisted for approval resume.
         let user_msg = Msg::user(run.input.prompt.clone());
         self.persist_message(&run_id, &user_msg).await;
         messages.push(user_msg);
