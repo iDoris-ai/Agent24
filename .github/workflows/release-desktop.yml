@@ -130,6 +130,9 @@ jobs:
       - name: Stage exact Open Design Creative resources
         run: pnpm --filter @agent24/desktop stage:open-design
 
+      - name: Rebuild Open Design native modules for Agent24 Electron
+        run: pnpm --filter @agent24/desktop rebuild:open-design-native
+
       - name: 'electron-builder (Linux: AppImage + deb)'
         run: pnpm --filter @agent24/desktop exec electron-builder --linux AppImage deb
 
