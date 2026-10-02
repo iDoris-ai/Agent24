@@ -1,7 +1,7 @@
 # Open Design M10 Main-Landing Guide
 
-Status: active M10 execution guide  
-Date: 2026-10-02  
+Status: active M10 execution guide
+Date: 2026-10-02
 Target branch: `main`
 
 This document is the operational companion to
