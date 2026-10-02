@@ -22,20 +22,21 @@
 use std::ffi::OsString;
 use std::fs::{OpenOptions, Permissions};
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::process::{
     Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use crate::password_store::{Account, PasswordStore};
 use crate::restart_policy::{Decision, RestartPolicy};
@@ -620,21 +621,44 @@ async fn read_list(ctx: &Ctx, args: &[&str]) -> Result<Value, DaemonStartError> 
 /// Opens the daemon's log file for one spawn: truncated if it has grown
 /// past [`LOG_TRUNCATE_CAP`], mode 0600, stdout and stderr both pointed at
 /// it (COMM-HYPHAE.md §6.3).
-fn open_log_pair(path: &Path) -> io::Result<(Stdio, Stdio)> {
+///
+/// Codex COMM-4b review, round 2, Low: whether to truncate is decided from
+/// the metadata of the SAME already-open file handle, never a path-based
+/// `std::fs::metadata` call taken before `open()` — a `metadata()` →
+/// `open()` gap could have the file replaced in between (new inode, same
+/// path), making the truncate decision about a file whose size was never
+/// actually the one just opened. Opening with `append(true)` up front
+/// (rather than choosing `append` vs. `write+truncate` ahead of time) and
+/// then calling `set_len(0)` on that same handle when it turns out to be
+/// too large works just as well as a separate `O_TRUNC` open: `O_APPEND`
+/// always writes at the current end-of-file regardless of this handle's
+/// seek position, so truncating it to 0 here still leaves every subsequent
+/// write landing at the (now empty) end, exactly like a from-scratch
+/// `O_TRUNC` open would.
+fn open_log_pair(path: &Path, truncate_generation: &AtomicU64) -> io::Result<(Stdio, Stdio)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let truncate = std::fs::metadata(path)
-        .map(|m| m.len() > LOG_TRUNCATE_CAP)
-        .unwrap_or(false);
-    let mut opts = OpenOptions::new();
-    opts.create(true).mode(0o600);
-    if truncate {
-        opts.write(true).truncate(true);
-    } else {
-        opts.append(true);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    if file.metadata()?.len() > LOG_TRUNCATE_CAP {
+        file.set_len(0)?;
+        // Codex COMM-4b review, round 2, Medium: this is the ONE place the
+        // log is ever truncated in place (same inode, same path) — bump the
+        // shared counter so `catch_up_from_log`'s scan cache can tell "this
+        // exact inode was just truncated" apart from "nothing happened to
+        // it", which a bare `len < guard.offset` comparison cannot: if the
+        // daemon writes enough new bytes before the next `catch_up()` poll
+        // ever runs, the truncated-then-regrown file's current length can
+        // already be >= the stale cached offset by the time anyone looks,
+        // making the truncation invisible to that comparison and silently
+        // skipping everything in the first `offset` bytes of the new
+        // content forever.
+        truncate_generation.fetch_add(1, Ordering::SeqCst);
     }
-    let file = opts.open(path)?;
     let file2 = file.try_clone()?;
     Ok((Stdio::from(file), Stdio::from(file2)))
 }
@@ -664,6 +688,7 @@ struct Spawned {
 async fn try_start(
     ctx: &Ctx,
     shutdown_deadline: &OnceLock<Instant>,
+    log_truncate_generation: &AtomicU64,
 ) -> Result<Spawned, DaemonStartError> {
     let identities = read_list(ctx, &["identity", "list"]).await?;
     let nickname = identities
@@ -740,8 +765,8 @@ async fn try_start(
     cmd.current_dir(&ctx.home);
     cmd.process_group(0);
     cmd.stdin(Stdio::piped());
-    let (stdout, stderr) =
-        open_log_pair(&ctx.log_path).map_err(|e| DaemonStartError::Failed(e.to_string()))?;
+    let (stdout, stderr) = open_log_pair(&ctx.log_path, log_truncate_generation)
+        .map_err(|e| DaemonStartError::Failed(e.to_string()))?;
     cmd.stdout(stdout);
     cmd.stderr(stderr);
 
@@ -779,6 +804,286 @@ pub struct DaemonStatus {
     pub generation: u64,
     pub consecutive_failures: u32,
     pub reason: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// COMM-4b: the three-state model's other two legs — manual relay probe
+// and log-scraped catch_up (COMM-HYPHAE.md §5.2, §6.3's "日志").
+// ---------------------------------------------------------------------
+
+/// `GET /comm/daemon`'s `relay_probe` object: the result of the most recent
+/// *manual* `POST /comm/relay/probe` — comm never probes on a timer (M12).
+/// `None` (at the call site, via [`HyphaeDaemonSupervisor::relay_probe_status`])
+/// until the first probe ever runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayProbeStatus {
+    pub url: Option<String>,
+    pub connected: bool,
+    pub at_ms: u64,
+    pub error: Option<String>,
+}
+
+/// `GET /comm/daemon`'s `catch_up` object. The baseline Hyphae daemon has no
+/// structured catch-up progress (COMM-HYPHAE.md §5.2 G2) — this can only
+/// ever report `"unknown"` or `"incomplete"`, **never** `"complete"` —
+/// there is no log line this crate would accept as proof the inbox is
+/// caught up.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatchUpStatus {
+    pub state: &'static str,
+    pub last_incomplete_at_ms: Option<u64>,
+}
+
+/// Current wall-clock time in Unix milliseconds. `0` on a clock that reports
+/// before the epoch (never happens outside a misconfigured test rig) rather
+/// than a panic — this is a status timestamp, not a correctness-critical
+/// value.
+pub(crate) fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How many new bytes [`catch_up_from_log`] reads from the log file in one
+/// `read()` call while draining everything appended since the previous
+/// [`HyphaeDaemonSupervisor::catch_up`] call. Bounds the synchronous cost of
+/// any single chunk no matter how much the log grew between two status
+/// calls — [`catch_up_from_log`]'s outer loop still drains all of the new
+/// data (so a caller never sees a stale `catch_up`), it just never holds
+/// more than one chunk's worth of bytes in memory at a time, and the
+/// already-scanned prefix is never re-read (Codex COMM-4b review, High: the
+/// pre-fix implementation `tokio::fs::read`-ed the ENTIRE log, unbounded,
+/// on every single `GET /comm/daemon`/`start`/`stop` call).
+const CATCH_UP_SCAN_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Everything in Hyphae's own diagnostic line after the six `HH:MM:SS`
+/// digits: `] ` + the warning emoji (U+26A0 U+FE0F) + two spaces +
+/// `Inbox scan incomplete:` (`internal/daemon/daemon.go:178,191`,
+/// byte-exact — verified against the checked-out Hyphae source). Written as
+/// explicit `\u{...}` escapes rather than the literal glyph so the exact
+/// codepoints survive any editor/encoding round-trip.
+const MARKER_SUFFIX: &[u8] = "] \u{26A0}\u{FE0F}  Inbox scan incomplete:".as_bytes();
+
+/// `"[HH:MM:SS]"` (9 bytes) + [`MARKER_SUFFIX`] — the full fixed length of
+/// Hyphae's diagnostic line prefix that [`line_starts_with_incomplete_marker`]
+/// checks.
+const MARKER_LINE_LEN: usize = 9 + MARKER_SUFFIX.len();
+
+/// True iff `from_here` (the rest of the scan buffer from some candidate
+/// line-start position onward; may run well past the end of the actual log
+/// line) begins with Hyphae's own diagnostic line format —
+/// `[HH:MM:SS] ⚠️  Inbox scan incomplete:` — byte-for-byte.
+///
+/// Codex COMM-4b review, Medium #2: anchoring to this full format (and only
+/// ever at a true line start — see [`catch_up_from_log`]), rather than a
+/// loose `contains("Inbox scan incomplete")` substring search, is what
+/// keeps an inbound message *body* that merely happens to mention this
+/// phrase from flipping `catch_up` to `"incomplete"` — Hyphae only ever
+/// emits this exact line at the start of a line it printed itself.
+///
+/// KNOWN LIMITATION (documented here, not fixed — needs Hyphae to change):
+/// a message body containing a literal `\n` can still forge a fake line
+/// start inside the log (this scraper has no way to tell a newline
+/// Hyphae's own `fmt.Printf` wrote from one sitting inside a logged
+/// message's content), so a sufficiently crafted body followed by a forged
+/// `[HH:MM:SS] ⚠️  Inbox scan incomplete:` line could still trip a false
+/// positive. The blast radius is bounded: this crate has no code path that
+/// ever produces `"complete"` at all, so a forged line can only push the
+/// reported state towards the more conservative `"incomplete"`, never
+/// towards a false `"complete"`. Closing this gap for real needs Hyphae to
+/// emit a structured, un-forgeable catch_up signal (COMM-HYPHAE.md §5.2
+/// G2) — out of scope for this crate.
+fn line_starts_with_incomplete_marker(from_here: &[u8]) -> bool {
+    if from_here.len() < MARKER_LINE_LEN {
+        return false;
+    }
+    let digit = |b: u8| b.is_ascii_digit();
+    from_here[0] == b'['
+        && digit(from_here[1])
+        && digit(from_here[2])
+        && from_here[3] == b':'
+        && digit(from_here[4])
+        && digit(from_here[5])
+        && from_here[6] == b':'
+        && digit(from_here[7])
+        && digit(from_here[8])
+        && &from_here[9..MARKER_LINE_LEN] == MARKER_SUFFIX
+}
+
+/// [`catch_up_from_log`]'s cache across calls (Codex COMM-4b review, High):
+/// without this, every call re-read and re-scanned the entire log file from
+/// byte 0, unbounded, no matter how little of it was new. Guarded by a
+/// [`tokio::sync::Mutex`] (not [`std::sync::Mutex`]) because the scan holds
+/// this lock across the file I/O's `.await` points, to serialize concurrent
+/// `catch_up()` calls against the SAME offset/tail state rather than racing
+/// two scans against it.
+#[derive(Default)]
+struct CatchUpScanState {
+    /// `(st_dev, st_ino)` of the log file this cache's `offset`/`tail`
+    /// apply to. `None` only before the very first scan ever runs.
+    file_id: Option<(u64, u64)>,
+    /// Byte offset already scanned; the next scan reads from here, not
+    /// from the start of the file.
+    offset: u64,
+    /// The last `MARKER_LINE_LEN - 1` bytes scanned so far (or fewer, if
+    /// fewer than that have ever been scanned), carried into the next scan
+    /// so a marker line split across two scans' chunk boundary is never
+    /// missed — a full match can never fit entirely inside `tail` alone
+    /// (it is one byte short of `MARKER_LINE_LEN`), so it always needs at
+    /// least one byte of newly read data to complete, which is exactly
+    /// when it's checked.
+    tail: Vec<u8>,
+    /// Whether the byte immediately preceding `tail[0]` in the file is a
+    /// line boundary — `\n`, OR `\r` (Codex COMM-4b review, round 2, Medium:
+    /// Hyphae's own `fmt.Printf("[%s] Watching... (no new messages)\r", …)`,
+    /// `internal/daemon/daemon.go:344`, locked source, ends that line with a
+    /// bare `\r` and no `\n` at all — the very next thing written to the log
+    /// can be a marker line starting immediately after that `\r`, with no
+    /// newline anywhere in between) — or `tail` is empty at file offset 0
+    /// (the start of the file counts as a line start too).
+    /// [`line_starts_with_incomplete_marker`] only ever applies at a true
+    /// line start, and a candidate match beginning at `tail[0]` needs to
+    /// know this without re-reading anything already scanned.
+    tail_preceded_by_line_boundary: bool,
+    /// The [`open_log_pair`] truncate-generation counter's value the last
+    /// time this cache was (re)built from byte 0 (Codex COMM-4b review,
+    /// round 2, Medium). When the CURRENT counter value no longer matches
+    /// this, the log was truncated in place since this cache was last
+    /// trusted — even if `file_id` is unchanged (truncating never changes
+    /// the inode) and even if the file has since regrown past `offset`
+    /// (which alone would make `len < offset` look like "nothing happened"
+    /// too) — so the scan must restart from byte 0 regardless of what `len`
+    /// vs. `offset` says.
+    truncate_generation: u64,
+    /// Whether an incomplete-scan line has EVER been recognized for this
+    /// file identity. Once true, `catch_up`'s `state` stays `"incomplete"`
+    /// — nothing un-sets it short of the log being truncated or replaced
+    /// (a new `file_id`), same as the pre-fix whole-file-contains check.
+    found_incomplete: bool,
+    /// The wall-clock time (not the log file's mtime — Codex COMM-4b
+    /// review, Medium #3) `catch_up_from_log` was running in when it most
+    /// recently scanned NEW bytes containing an incomplete-scan line.
+    /// Unchanged by a scan whose new bytes contain no marker line, even if
+    /// the file's mtime moved — appending ordinary log output must never
+    /// push this forward.
+    last_incomplete_at_ms: Option<u64>,
+}
+
+/// Scrapes `log_path` for Hyphae's own diagnostic line
+/// (`internal/daemon/daemon.go:178,191`) using `scan`'s cached
+/// offset/identity so only the bytes appended since the previous call are
+/// ever read. A missing or unreadable log (e.g. before the daemon has ever
+/// started) reports whatever `scan` already knows — `"unknown"` before the
+/// first successful scan — never an error.
+async fn catch_up_from_log(
+    log_path: &Path,
+    scan: &AsyncMutex<CatchUpScanState>,
+    truncate_generation: &AtomicU64,
+) -> CatchUpStatus {
+    fn status_from(guard: &CatchUpScanState) -> CatchUpStatus {
+        CatchUpStatus {
+            state: if guard.found_incomplete {
+                "incomplete"
+            } else {
+                "unknown"
+            },
+            last_incomplete_at_ms: guard.last_incomplete_at_ms,
+        }
+    }
+
+    let mut guard = scan.lock().await;
+
+    let Ok(meta) = tokio::fs::metadata(log_path).await else {
+        return status_from(&guard);
+    };
+    let file_id = (meta.dev(), meta.ino());
+    let len = meta.len();
+    let current_truncate_generation = truncate_generation.load(Ordering::SeqCst);
+
+    // A different inode/device, a file now SHORTER than what was already
+    // scanned, OR the shared truncate-generation counter having moved on
+    // (Codex COMM-4b review, round 2, Medium) means the log was truncated
+    // or replaced (COMM-4a's own `LOG_TRUNCATE_CAP` truncation at spawn, or
+    // any future rotation) — start over from byte 0 rather than mixing scan
+    // state across two different underlying files that happen to share a
+    // path, or across a truncate-then-regrow that `len < offset` alone
+    // cannot see if enough new data landed before this scan ever ran.
+    if guard.file_id != Some(file_id)
+        || len < guard.offset
+        || guard.truncate_generation != current_truncate_generation
+    {
+        *guard = CatchUpScanState {
+            file_id: Some(file_id),
+            tail_preceded_by_line_boundary: true,
+            truncate_generation: current_truncate_generation,
+            ..Default::default()
+        };
+    }
+
+    if len > guard.offset {
+        let Ok(mut file) = tokio::fs::File::open(log_path).await else {
+            return status_from(&guard);
+        };
+        if file
+            .seek(std::io::SeekFrom::Start(guard.offset))
+            .await
+            .is_ok()
+        {
+            let mut buf = vec![0u8; CATCH_UP_SCAN_CHUNK_BYTES];
+            let mut matched_new_bytes = false;
+            loop {
+                let remaining = len.saturating_sub(guard.offset);
+                if remaining == 0 {
+                    break;
+                }
+                let want = remaining.min(CATCH_UP_SCAN_CHUNK_BYTES as u64) as usize;
+                let Ok(n) = file.read(&mut buf[..want]).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+
+                let mut window = std::mem::take(&mut guard.tail);
+                window.extend_from_slice(&buf[..n]);
+
+                for i in 0..window.len() {
+                    let is_line_start = if i == 0 {
+                        guard.tail_preceded_by_line_boundary
+                    } else {
+                        // `\r` counts too (Codex COMM-4b review, round 2,
+                        // Medium) — see `tail_preceded_by_line_boundary`'s
+                        // doc comment for why a bare `\r` with no `\n` can
+                        // immediately precede a real marker line.
+                        matches!(window[i - 1], b'\n' | b'\r')
+                    };
+                    if is_line_start && line_starts_with_incomplete_marker(&window[i..]) {
+                        matched_new_bytes = true;
+                    }
+                }
+
+                let keep = (MARKER_LINE_LEN.saturating_sub(1)).min(window.len());
+                let discarded = window.len() - keep;
+                if discarded > 0 {
+                    guard.tail_preceded_by_line_boundary =
+                        matches!(window[discarded - 1], b'\n' | b'\r');
+                }
+                // else: nothing dropped from the front, so the byte
+                // preceding the (unchanged) tail start is still whatever
+                // it was before this chunk — `tail_preceded_by_line_boundary`
+                // stays as-is.
+                guard.tail = window[discarded..].to_vec();
+                guard.offset += n as u64;
+            }
+            if matched_new_bytes {
+                guard.found_incomplete = true;
+                guard.last_incomplete_at_ms = Some(wall_clock_ms());
+            }
+        }
+    }
+
+    status_from(&guard)
 }
 
 fn initial_status() -> DaemonStatus {
@@ -850,6 +1155,25 @@ pub struct HyphaeDaemonSupervisor {
     /// in-flight stop" signal `kill_group_gracefully` re-reads on every
     /// poll.
     shutdown_deadline: Arc<OnceLock<Instant>>,
+    /// COMM-4b: the daemon's own log file (`Ctx::log_path`) — [`Self::catch_up`]
+    /// reads only what's new since the previous call (via `catch_up_scan`'s
+    /// cached offset), not the whole file; no periodic tailing, same
+    /// on-demand posture `relay_probe` has (M12 cut periodic probing).
+    log_path: Arc<PathBuf>,
+    /// COMM-4b: [`Self::catch_up`]'s incremental-scan cache (offset, file
+    /// identity, carried tail bytes, and the sticky `found_incomplete`/
+    /// `last_incomplete_at_ms` facts) — see [`CatchUpScanState`].
+    catch_up_scan: Arc<AsyncMutex<CatchUpScanState>>,
+    /// Codex COMM-4b review, round 2, Medium: bumped by [`open_log_pair`]
+    /// every time it truncates the log in place for a fresh spawn, and
+    /// checked by [`catch_up_from_log`] alongside its own `(file_id,
+    /// offset)` comparison — see [`open_log_pair`]'s doc comment for why
+    /// `len < offset` alone cannot always detect a truncate-then-regrow.
+    log_truncate_generation: Arc<AtomicU64>,
+    /// COMM-4b: the most recent manual `POST /comm/relay/probe` result, if
+    /// any. Written by the `/relay/probe` route via
+    /// [`Self::record_relay_probe`] — this actor never touches it.
+    relay_probe: Arc<Mutex<Option<RelayProbeStatus>>>,
 }
 
 fn set_status(
@@ -890,9 +1214,14 @@ impl HyphaeDaemonSupervisor {
     pub fn spawn(ctx: Ctx) -> Self {
         let status = Arc::new(Mutex::new(initial_status()));
         let shutdown_deadline = Arc::new(OnceLock::new());
+        let log_path = Arc::new(ctx.log_path.clone());
+        let catch_up_scan = Arc::new(AsyncMutex::new(CatchUpScanState::default()));
+        let log_truncate_generation = Arc::new(AtomicU64::new(0));
+        let relay_probe = Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_actor(
             ctx,
+            Arc::clone(&log_truncate_generation),
             cmd_rx,
             Arc::clone(&status),
             Arc::clone(&shutdown_deadline),
@@ -901,7 +1230,40 @@ impl HyphaeDaemonSupervisor {
             cmd_tx,
             status,
             shutdown_deadline,
+            log_path,
+            catch_up_scan,
+            log_truncate_generation,
+            relay_probe,
         }
+    }
+
+    /// COMM-4b: the result of the most recent manual relay probe, or `None`
+    /// if `POST /comm/relay/probe` has never run against this supervisor.
+    #[must_use]
+    pub fn relay_probe_status(&self) -> Option<RelayProbeStatus> {
+        self.relay_probe.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// COMM-4b: records a manual relay probe's result, for a later
+    /// [`Self::relay_probe_status`] (and so `GET /comm/daemon`) to report.
+    /// Called by the `/relay/probe` route — never by this actor, which knows
+    /// nothing about relay probing.
+    pub fn record_relay_probe(&self, probe: RelayProbeStatus) {
+        if let Ok(mut guard) = self.relay_probe.lock() {
+            *guard = Some(probe);
+        }
+    }
+
+    /// COMM-4b: `catch_up` as of right now, scraped incrementally from the
+    /// daemon's own log file (COMM-HYPHAE.md §5.2) — only the bytes
+    /// appended since the previous call are ever read.
+    pub async fn catch_up(&self) -> CatchUpStatus {
+        catch_up_from_log(
+            &self.log_path,
+            &self.catch_up_scan,
+            &self.log_truncate_generation,
+        )
+        .await
     }
 
     #[must_use]
@@ -1006,12 +1368,13 @@ async fn stop_phase(
 
 async fn spawn_and_record(
     ctx: &Ctx,
+    log_truncate_generation: &AtomicU64,
     generation: &mut u64,
     status: &Mutex<DaemonStatus>,
     failures: u32,
     shutdown_deadline: &OnceLock<Instant>,
 ) -> Result<Phase, DaemonStartError> {
-    match try_start(ctx, shutdown_deadline).await {
+    match try_start(ctx, shutdown_deadline, log_truncate_generation).await {
         Ok(mut spawned) => {
             // PR #642 review round 3, High #1: the three call sites below
             // only check `shutdown_deadline` BEFORE this function is even
@@ -1202,6 +1565,7 @@ async fn classify_exit(
 
 async fn run_actor(
     ctx: Ctx,
+    log_truncate_generation: Arc<AtomicU64>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     status: Arc<Mutex<DaemonStatus>>,
     shutdown_deadline: Arc<OnceLock<Instant>>,
@@ -1274,7 +1638,7 @@ async fn run_actor(
                             // the policy exactly as it was; only THIS path
                             // resets it.
                             policy = RestartPolicy::new();
-                            match spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline).await {
+                            match spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline).await {
                                 Ok(p) => {
                                     phase = p;
                                     // PR #626 review, Medium #3: NOT
@@ -1319,7 +1683,7 @@ async fn run_actor(
                             // chase a SECOND generation this restart would
                             // otherwise have just spawned.
                             phase = if shutdown_deadline.get().is_none() {
-                                spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
+                                spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
                                     .await
                                     .unwrap_or(Phase::Idle)
                             } else {
@@ -1407,7 +1771,7 @@ async fn run_actor(
             () = tokio::time::sleep_until(backoff_deadline.unwrap_or_else(tokio::time::Instant::now)), if backoff_deadline.is_some() => {
                 // PR #626 review, High #2: "关机开始后禁止再 spawn".
                 phase = if shutdown_deadline.get().is_none() {
-                    spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
+                    spawn_and_record(&ctx, &log_truncate_generation, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
                         .await
                         .unwrap_or(Phase::Idle)
                 } else {
@@ -1658,5 +2022,818 @@ mod tests {
         );
 
         let _ = child.kill().await;
+    }
+
+    // -------------------------------------------------------------------
+    // COMM-4b: catch_up log scraping (COMM-HYPHAE.md §5.2, task table row
+    // "日志中出现 incomplete 行后，状态变为 incomplete" / "任何输入都不会
+    // 产生 complete 状态").
+    // -------------------------------------------------------------------
+
+    /// A fresh, empty scan cache — every `catch_up_from_log` call below
+    /// wants its own, not one shared/left over from another test.
+    fn fresh_scan() -> AsyncMutex<CatchUpScanState> {
+        AsyncMutex::new(CatchUpScanState::default())
+    }
+
+    /// A fresh `log_truncate_generation` counter at `0` — every direct
+    /// `catch_up_from_log` call below that isn't exercising
+    /// [`open_log_pair`]'s truncation itself wants its own, never-bumped
+    /// counter (equivalent to a supervisor whose log has never been
+    /// truncated in place).
+    fn fresh_truncate_gen() -> AtomicU64 {
+        AtomicU64::new(0)
+    }
+
+    #[tokio::test]
+    async fn catch_up_is_unknown_when_the_log_does_not_exist_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = catch_up_from_log(
+            &tmp.path().join("no-such-log"),
+            &fresh_scan(),
+            &fresh_truncate_gen(),
+        )
+        .await;
+        assert_eq!(status.state, "unknown");
+        assert_eq!(status.last_incomplete_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn catch_up_becomes_incomplete_once_the_marker_line_appears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        // The real line, verbatim from `internal/daemon/daemon.go`.
+        tokio::fs::write(
+            &log,
+            "🚀 Starting daemon for 'alice'\n\
+             [10:00:00] ⚠️  Inbox scan incomplete: dial tcp 127.0.0.1:4: connect: connection refused\n",
+        )
+        .await
+        .unwrap();
+        let status = catch_up_from_log(&log, &fresh_scan(), &fresh_truncate_gen()).await;
+        assert_eq!(status.state, "incomplete");
+        assert!(
+            status.last_incomplete_at_ms.is_some_and(|ms| ms > 0),
+            "{status:?}"
+        );
+    }
+
+    /// G2 / COMM-4b's third acceptance line: no input ever produces
+    /// `"complete"`. Includes adversarial content that textually contains
+    /// "complete" (every "incomplete" line does too, as a substring) to
+    /// prove the match is on the exact marker, not a loose "complete"/
+    /// "incomplete" keyword search that could flip either way.
+    #[tokio::test]
+    async fn catch_up_state_is_never_literally_complete_for_any_log_content() {
+        let samples: &[&[u8]] = &[
+            b"",
+            b"Inbox scan incomplete: timeout",
+            b"[10:00:00] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: dial tcp refused\n",
+            b"Catch-up complete\n",
+            b"inbox scan complete, 0 incomplete\n", // different case + "complete" present
+            b"complete complete complete",
+            b"\x00\x01\xffrandom non-utf8 noise\xfe",
+        ];
+        for sample in samples {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("hyphae-daemon.log");
+            tokio::fs::write(&log, sample).await.unwrap();
+            let status = catch_up_from_log(&log, &fresh_scan(), &fresh_truncate_gen()).await;
+            assert_ne!(
+                status.state, "complete",
+                "sample {sample:?} must never produce \"complete\""
+            );
+            assert!(
+                matches!(status.state, "unknown" | "incomplete"),
+                "sample {sample:?} -> unexpected catch_up state {:?}",
+                status.state
+            );
+        }
+    }
+
+    /// Codex COMM-4b review, Medium #2: a plain `contains("Inbox scan
+    /// incomplete")` substring search (the pre-fix implementation) is
+    /// forgeable by any inbound message whose *body* happens to mention
+    /// that exact phrase — comm's own daemon log interleaves Hyphae's own
+    /// diagnostic lines with whatever a peer sent. The match must be
+    /// anchored to Hyphae's full diagnostic line format (`[HH:MM:SS] ⚠️
+    /// Inbox scan incomplete:` at the start of a line,
+    /// `internal/daemon/daemon.go:178,191`), not merely the phrase
+    /// anywhere in the file.
+    #[tokio::test]
+    async fn catch_up_ignores_the_marker_phrase_inside_an_ordinary_message_body_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        tokio::fs::write(
+            &log,
+            "🚀 Starting daemon for 'alice'\n\
+             📨 bob → alice: don't worry about that 'Inbox scan incomplete' thing, it's fine\n",
+        )
+        .await
+        .unwrap();
+        let status = catch_up_from_log(&log, &fresh_scan(), &fresh_truncate_gen()).await;
+        assert_eq!(
+            status.state, "unknown",
+            "a message body merely mentioning the phrase must never be mistaken for \
+             Hyphae's own diagnostic line: {status:?}"
+        );
+    }
+
+    /// Codex COMM-4b review, High: a log file many times larger than
+    /// [`CATCH_UP_SCAN_CHUNK_BYTES`], with the marker line only at the very
+    /// end, must still be detected correctly by the chunked scan (not just
+    /// "doesn't crash") — proving the chunk loop actually drains every
+    /// chunk up to the current length rather than stopping after the
+    /// first one.
+    #[tokio::test]
+    async fn catch_up_detects_a_marker_line_at_the_end_of_a_log_far_larger_than_one_scan_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let mut content =
+            "👋 padding\n".repeat((CATCH_UP_SCAN_CHUNK_BYTES * 5) / "👋 padding\n".len() + 1);
+        content.push_str("[23:59:59] ⚠️  Inbox scan incomplete: dial tcp refused\n");
+        assert!(
+            content.len() > CATCH_UP_SCAN_CHUNK_BYTES * 4,
+            "test setup: content must actually exceed several scan chunks"
+        );
+        tokio::fs::write(&log, &content).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(status.state, "incomplete", "{status:?}");
+    }
+
+    /// Codex COMM-4b review, High: a marker line split exactly across two
+    /// [`CATCH_UP_SCAN_CHUNK_BYTES`]-sized chunks of the SAME scan must
+    /// still be recognized — proving the in-scan `tail` carry (not just
+    /// the cross-CALL carry the other tests exercise) actually works.
+    #[tokio::test]
+    async fn catch_up_detects_a_marker_line_split_exactly_across_two_scan_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let marker_line = "[08:30:00] \u{26A0}\u{FE0F}  Inbox scan incomplete: timeout\n";
+        // Padding sized so the marker line's START lands a few bytes before
+        // the first chunk boundary, forcing the split.
+        let pad_len = CATCH_UP_SCAN_CHUNK_BYTES - 5;
+        let mut content = "a".repeat(pad_len);
+        content.push('\n');
+        content.push_str(marker_line);
+        tokio::fs::write(&log, &content).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            status.state, "incomplete",
+            "a marker line split across two scan chunks must still be found: {status:?}"
+        );
+    }
+
+    /// Codex COMM-4b review, High: incremental re-scans (cached offset)
+    /// must behave identically to a from-scratch scan — writing the log in
+    /// several separate pieces, with a `catch_up()` call after each piece,
+    /// must end up in the same state as writing it all at once.
+    #[tokio::test]
+    async fn catch_up_incremental_scans_across_several_calls_agree_with_one_full_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = idle_ctx(tmp.path()).await;
+        let log_path = ctx.log_path.clone();
+        if let Some(parent) = log_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+        tokio::fs::write(&log_path, "🚀 Starting daemon for 'alice'\n")
+            .await
+            .unwrap();
+        assert_eq!(sup.catch_up().await.state, "unknown");
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .await
+            .unwrap();
+        file.write_all(b"retry ticker: processed outbox\n")
+            .await
+            .unwrap();
+        file.flush().await.unwrap();
+        assert_eq!(sup.catch_up().await.state, "unknown");
+
+        file.write_all(b"[12:00:00] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: timeout\n")
+            .await
+            .unwrap();
+        file.flush().await.unwrap();
+        assert_eq!(sup.catch_up().await.state, "incomplete");
+
+        // Further plain appends after the marker must stay "incomplete",
+        // never fall back to "unknown".
+        file.write_all(b"cleanup ticker fired\n").await.unwrap();
+        file.flush().await.unwrap();
+        assert_eq!(sup.catch_up().await.state, "incomplete");
+    }
+
+    /// Codex COMM-4b review, High: truncating/replacing the log mid-stream
+    /// (exactly what COMM-4a's own spawn-time truncation, or a future
+    /// rotation, does) must reset the scan from byte 0 rather than
+    /// computing nonsense against a now-shorter or now-different file.
+    #[tokio::test]
+    async fn catch_up_rescans_from_scratch_when_the_log_is_truncated_and_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        tokio::fs::write(
+            &log,
+            "🚀 a very long preamble that is definitely not a marker line\n",
+        )
+        .await
+        .unwrap();
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        assert_eq!(
+            catch_up_from_log(&log, &scan, &truncate_gen).await.state,
+            "unknown"
+        );
+
+        // Truncate and replace with fresh, shorter content whose own
+        // marker line sits right at the new file's start.
+        tokio::fs::write(
+            &log,
+            b"[00:00:01] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: reset\n",
+        )
+        .await
+        .unwrap();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            status.state, "incomplete",
+            "a truncated-and-replaced log must be rescanned from byte 0, not skipped \
+             because its new length is shorter than the old offset: {status:?}"
+        );
+    }
+
+    /// Codex COMM-4b review, round 2, Medium: [`open_log_pair`] truncating
+    /// the SAME inode in place at a fresh spawn must bump the shared
+    /// `truncate_generation` counter exactly when (and only when) it
+    /// actually truncates — never on a brand-new log, never on a log that
+    /// never grew past [`LOG_TRUNCATE_CAP`], and never a second time on a
+    /// log that's already back under the cap. This is the production
+    /// wiring the two `catch_up_rescans_after_a_truncate_whose_new_length_*`
+    /// tests below simulate with a manual `fetch_add` (to keep those tests'
+    /// file sizes small and fast) — this test proves the real call site
+    /// actually performs that bump.
+    #[tokio::test]
+    async fn open_log_pair_bumps_the_truncate_generation_exactly_when_it_truncates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let truncate_gen = AtomicU64::new(0);
+
+        // A brand-new log: nothing to truncate.
+        drop(open_log_pair(&log, &truncate_gen).unwrap());
+        assert_eq!(
+            truncate_gen.load(Ordering::SeqCst),
+            0,
+            "opening a brand-new log must never bump the truncate generation"
+        );
+
+        // Grow it past LOG_TRUNCATE_CAP.
+        tokio::fs::write(&log, vec![b'z'; (LOG_TRUNCATE_CAP + 1) as usize])
+            .await
+            .unwrap();
+        drop(open_log_pair(&log, &truncate_gen).unwrap());
+        assert_eq!(
+            truncate_gen.load(Ordering::SeqCst),
+            1,
+            "truncating an oversized log must bump the shared generation counter"
+        );
+
+        // It's back under the cap (truncated to 0 by the call above) — a
+        // further open must not bump it again.
+        drop(open_log_pair(&log, &truncate_gen).unwrap());
+        assert_eq!(
+            truncate_gen.load(Ordering::SeqCst),
+            1,
+            "opening a log that's already under the cap must not bump the \
+             generation a second time"
+        );
+    }
+
+    /// Codex COMM-4b review, round 2, Medium: the scenario the bug report
+    /// names explicitly — the log is truncated in place (same inode, COMM-
+    /// 4a's own spawn-time behavior), then regrows to a new length that
+    /// lands EXACTLY on the stale cached `offset` before `catch_up()` is
+    /// ever polled again. `len < guard.offset` alone sees `len == offset`
+    /// (neither "shorter" nor obviously different) and would otherwise skip
+    /// rescanning entirely, silently losing whatever marker line sits in
+    /// the regrown content's first `offset` bytes forever. The
+    /// `truncate_generation` bump is what catches this when the length
+    /// comparison cannot.
+    ///
+    /// The truncation itself is driven by plain `tokio::fs::write` (not
+    /// `open_log_pair`) so this test can pick the exact resulting length
+    /// without a multi-megabyte file; `truncate_gen.fetch_add` stands in
+    /// for what `open_log_pair` does at the real truncation call site (see
+    /// `open_log_pair_bumps_the_truncate_generation_exactly_when_it_truncates`
+    /// for proof that it really does).
+    #[tokio::test]
+    async fn catch_up_rescans_after_a_truncate_whose_new_length_exactly_equals_the_old_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let preamble = "a very long preamble that is definitely not a marker line here\n";
+        tokio::fs::write(&log, preamble).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = AtomicU64::new(0);
+        let before = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(before.state, "unknown", "{before:?}");
+        let old_offset = scan.lock().await.offset;
+        assert_eq!(old_offset, preamble.len() as u64, "test setup");
+
+        // Truncate the same inode and regrow it to EXACTLY `old_offset`
+        // bytes, with the marker line's first byte right at the new file's
+        // very start.
+        let marker_line = "[00:00:01] \u{26A0}\u{FE0F}  Inbox scan incomplete: reset\n";
+        let mut regrown = marker_line.as_bytes().to_vec();
+        assert!(
+            (regrown.len() as u64) < old_offset,
+            "test setup: the marker line alone must be shorter than old_offset so \
+             padding below actually pads"
+        );
+        regrown.resize(old_offset as usize, b'z');
+        tokio::fs::write(&log, &regrown).await.unwrap();
+        truncate_gen.fetch_add(1, Ordering::SeqCst);
+
+        let after = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            after.state, "incomplete",
+            "a truncate-then-regrow whose new length lands EXACTLY on the old \
+             cached offset must still be rescanned from byte 0 via the \
+             truncate-generation bump: {after:?}"
+        );
+    }
+
+    /// Same scenario as the "exactly equals" test above, except the regrown
+    /// file's new length EXCEEDS the old cached offset — `len < guard.offset`
+    /// is unambiguously false here too (`len` is now the larger number), so
+    /// only the truncate-generation bump can catch it.
+    #[tokio::test]
+    async fn catch_up_rescans_after_a_truncate_whose_new_length_exceeds_the_old_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let preamble = "a very long preamble that is definitely not a marker line here\n";
+        tokio::fs::write(&log, preamble).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = AtomicU64::new(0);
+        let before = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(before.state, "unknown", "{before:?}");
+        let old_offset = scan.lock().await.offset;
+
+        // Truncate the same inode and regrow it to well PAST `old_offset`
+        // bytes — the marker line sits at the start, with plenty of
+        // ordinary trailing content after it.
+        let marker_line = "[00:00:01] \u{26A0}\u{FE0F}  Inbox scan incomplete: reset\n";
+        let mut regrown = marker_line.as_bytes().to_vec();
+        regrown.extend(std::iter::repeat_n(b'z', old_offset as usize + 200));
+        assert!(regrown.len() as u64 > old_offset, "test setup");
+        tokio::fs::write(&log, &regrown).await.unwrap();
+        truncate_gen.fetch_add(1, Ordering::SeqCst);
+
+        let after = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            after.state, "incomplete",
+            "a truncate-then-regrow whose new length EXCEEDS the old cached offset \
+             must still be rescanned from byte 0 via the truncate-generation bump, \
+             not skipped as if the file had simply grown normally: {after:?}"
+        );
+    }
+
+    /// Codex COMM-4b review, High: non-UTF-8 bytes immediately adjacent to
+    /// (not just far away from) a real marker line must neither panic nor
+    /// corrupt the byte-level match — this crate does pure `[u8]`
+    /// comparison, never a `String::from_utf8_lossy` decode, specifically
+    /// to avoid lossy-decoding artifacts shifting byte offsets near a
+    /// match.
+    #[tokio::test]
+    async fn catch_up_matches_byte_exact_even_with_invalid_utf8_immediately_around_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let mut content: Vec<u8> = b"\xff\xfe garbage before \xc0\xc1\n".to_vec();
+        content.extend_from_slice(
+            b"[01:02:03] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: \xfe\xff more garbage\n",
+        );
+        tokio::fs::write(&log, &content).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(status.state, "incomplete", "{status:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // Codex COMM-4b review, round 2, Medium: a marker line starting right
+    // after a bare `\r` (no `\n`) — Hyphae's own
+    // `fmt.Printf("[%s] Watching... (no new messages)\r", …)`
+    // (`internal/daemon/daemon.go:344`, locked source) ends that status
+    // line with `\r` alone, so the very next thing printed (including a
+    // marker line, if the following watch tick fails) can start right
+    // after it with no newline anywhere in between.
+    // -------------------------------------------------------------------
+
+    /// The marker line and its preceding `\r` both land in the SAME scan
+    /// (small log, one chunk) — the baseline case the within-window
+    /// `window[i - 1]` check must recognize.
+    #[tokio::test]
+    async fn catch_up_detects_a_marker_line_immediately_after_a_bare_cr_with_no_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let mut content = b"[10:00:00] Watching... (no new messages)\r".to_vec();
+        content.extend_from_slice(
+            b"[10:00:05] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: dial tcp refused\n",
+        );
+        tokio::fs::write(&log, &content).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            status.state, "incomplete",
+            "a marker line starting right after a bare `\\r` (no `\\n`) must still be \
+             recognized: {status:?}"
+        );
+    }
+
+    /// The `\r` and the marker line it immediately precedes are split across
+    /// two [`CATCH_UP_SCAN_CHUNK_BYTES`] chunks of the SAME scan — proving
+    /// the carried `tail`/`tail_preceded_by_line_boundary` state (not just
+    /// the in-window check) recognizes a `\r` boundary, the same way the
+    /// `\n` sibling test above proves it for a newline.
+    #[tokio::test]
+    async fn catch_up_detects_a_marker_line_split_by_a_bare_cr_exactly_across_two_scan_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        let marker_line = "[08:30:00] \u{26A0}\u{FE0F}  Inbox scan incomplete: timeout\n";
+        // Same padding math as `catch_up_detects_a_marker_line_split_exactly_across_two_scan_chunks`
+        // above, just with a bare `\r` in place of `\n` as the line boundary
+        // immediately before the marker.
+        let pad_len = CATCH_UP_SCAN_CHUNK_BYTES - 5;
+        let mut content = "a".repeat(pad_len);
+        content.push('\r');
+        content.push_str(marker_line);
+        tokio::fs::write(&log, &content).await.unwrap();
+
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let status = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            status.state, "incomplete",
+            "a marker line immediately preceded by a bare `\\r` (no `\\n`), split \
+             across two scan chunks, must still be found: {status:?}"
+        );
+    }
+
+    /// The `\r` is the very last byte scanned in one `catch_up_from_log`
+    /// CALL, and the marker line is only appended (and scanned) in a LATER,
+    /// separate call — proving the persisted scan cache carries the `\r`
+    /// boundary fact across calls, not just across chunks within one call.
+    #[tokio::test]
+    async fn catch_up_detects_a_marker_line_after_a_bare_cr_carried_across_two_separate_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("hyphae-daemon.log");
+        tokio::fs::write(
+            &log,
+            "🚀 Starting daemon for 'alice'\n[10:00:00] Watching... (no new messages)\r",
+        )
+        .await
+        .unwrap();
+        let scan = fresh_scan();
+        let truncate_gen = fresh_truncate_gen();
+        let first = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(first.state, "unknown", "{first:?}");
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .await
+            .unwrap();
+        file.write_all(
+            b"[10:00:05] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: dial tcp refused\n",
+        )
+        .await
+        .unwrap();
+        file.flush().await.unwrap();
+
+        let second = catch_up_from_log(&log, &scan, &truncate_gen).await;
+        assert_eq!(
+            second.state, "incomplete",
+            "a marker line appended right after a bare `\\r` left over from a \
+             PREVIOUS catch_up() call must still be recognized once scanned in a \
+             later call: {second:?}"
+        );
+    }
+
+    /// Codex COMM-4b review, High: concurrent `catch_up()` calls against
+    /// the SAME supervisor (as real concurrent `GET /comm/daemon`/`start`/
+    /// `stop` requests would produce) must never panic or deadlock, and
+    /// must all agree on the final state once the writer is done — proving
+    /// the `tokio::sync::Mutex` around the scan cache actually serializes
+    /// concurrent scans against the same offset/tail state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_catch_up_calls_never_panic_and_agree_on_the_final_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = idle_ctx(tmp.path()).await;
+        let log_path = ctx.log_path.clone();
+        if let Some(parent) = log_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(&log_path, b"").await.unwrap();
+        let sup = Arc::new(HyphaeDaemonSupervisor::spawn(ctx));
+
+        let writer_log = log_path.clone();
+        let writer = tokio::spawn(async move {
+            let mut file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&writer_log)
+                .await
+                .unwrap();
+            for i in 0..200u32 {
+                file.write_all(format!("padding line {i}\n").as_bytes())
+                    .await
+                    .unwrap();
+                file.flush().await.unwrap();
+            }
+            file.write_all(b"[11:22:33] \xe2\x9a\xa0\xef\xb8\x8f  Inbox scan incomplete: done\n")
+                .await
+                .unwrap();
+            file.flush().await.unwrap();
+        });
+
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let sup = Arc::clone(&sup);
+            readers.push(tokio::spawn(async move { sup.catch_up().await }));
+        }
+
+        writer.await.unwrap();
+        for r in readers {
+            // Any intermediate state ("unknown" before the marker line was
+            // written, "incomplete" after) is fine; a panic or a hang is not.
+            let status = r.await.unwrap();
+            assert!(
+                matches!(status.state, "unknown" | "incomplete"),
+                "{status:?}"
+            );
+        }
+
+        let final_status = sup.catch_up().await;
+        assert_eq!(final_status.state, "incomplete", "{final_status:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // COMM-4b: manual relay probe result storage.
+    // -------------------------------------------------------------------
+
+    /// A minimal [`Ctx`] whose binary is never actually invoked — the
+    /// supervisor starts `Idle` and spawns nothing until `start()` is
+    /// called, which this test never does.
+    async fn idle_ctx(dir: &Path) -> Ctx {
+        let source = dir.join("hyphae-fake.sh");
+        tokio::fs::write(&source, "#!/bin/sh\nexit 0\n")
+            .await
+            .unwrap();
+        let bytes = tokio::fs::read(&source).await.unwrap();
+        let expected = crate::binary::sha256_of(&bytes);
+        let bin = crate::binary::VerifiedBinary::install(&source, expected, &dir.join("bin"))
+            .await
+            .unwrap();
+        let home = dir.join("home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let runner = Arc::new(crate::runner::HyphaeRunner::new(
+            bin,
+            home.clone(),
+            Duration::from_secs(5),
+        ));
+        Ctx {
+            runner,
+            password_store: Arc::new(crate::password_store::MemoryPasswordStore::new()),
+            home,
+            pid_path: dir.join("hyphae-daemon.pid"),
+            log_path: dir.join("logs").join("hyphae-daemon.log"),
+            autostart_path: dir.join("daemon-autostart.json"),
+            grace: Duration::from_millis(500),
+            ready_after: Duration::from_millis(200),
+        }
+    }
+
+    /// Codex COMM-4b review, Medium #3: `last_incomplete_at_ms` must only
+    /// move when the incremental scan NEWLY recognizes an incomplete line
+    /// — not every time `catch_up()` happens to run after the log file's
+    /// mtime changed for some unrelated reason (e.g. the daemon appending
+    /// ordinary, non-marker output). The pre-fix implementation read the
+    /// log FILE's mtime on every call, so any later write — marker or
+    /// not — pushed the timestamp forward.
+    #[tokio::test]
+    async fn catch_up_last_incomplete_at_ms_does_not_move_when_only_plain_lines_are_appended_afterward()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = idle_ctx(tmp.path()).await;
+        let log_path = ctx.log_path.clone();
+        if let Some(parent) = log_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+        tokio::fs::write(
+            &log_path,
+            "[10:00:00] ⚠️  Inbox scan incomplete: dial tcp refused\n",
+        )
+        .await
+        .unwrap();
+        let first = sup.catch_up().await;
+        assert_eq!(first.state, "incomplete", "{first:?}");
+        let first_ms = first
+            .last_incomplete_at_ms
+            .expect("a just-recognized incomplete line must carry a timestamp");
+
+        // Give the filesystem clock room to tick forward, then append a
+        // perfectly ordinary line (no marker) — this used to bump the
+        // log's mtime and, with it, the reported `last_incomplete_at_ms`.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .await
+            .unwrap();
+        file.write_all(b"retry ticker: processed outbox, nothing pending\n")
+            .await
+            .unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let second = sup.catch_up().await;
+        assert_eq!(second.state, "incomplete", "{second:?}");
+        assert_eq!(
+            second.last_incomplete_at_ms,
+            Some(first_ms),
+            "appending a plain, non-marker line must never move the fault timestamp: \
+             first={first:?} second={second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_probe_status_round_trips_through_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = HyphaeDaemonSupervisor::spawn(idle_ctx(tmp.path()).await);
+        assert!(sup.relay_probe_status().is_none(), "no probe has run yet");
+
+        sup.record_relay_probe(RelayProbeStatus {
+            url: Some("wss://relay.example".to_owned()),
+            connected: true,
+            at_ms: 123,
+            error: None,
+        });
+        let probe = sup.relay_probe_status().expect("just recorded");
+        assert!(probe.connected);
+        assert_eq!(probe.url.as_deref(), Some("wss://relay.example"));
+        assert_eq!(probe.error, None);
+
+        sup.record_relay_probe(RelayProbeStatus {
+            url: Some("wss://relay.example".to_owned()),
+            connected: false,
+            at_ms: 456,
+            error: Some("dial tcp: connection refused".to_owned()),
+        });
+        let probe = sup.relay_probe_status().expect("just recorded");
+        assert!(
+            !probe.connected,
+            "the latest probe replaces the previous one"
+        );
+    }
+
+    /// pre-pr-check C2: `relay_probe` is a new concurrency primitive
+    /// (`Arc<Mutex<Option<RelayProbeStatus>>>`), written by `record_relay_probe`
+    /// unconditionally (it is a plain replace, not a check-then-act on the
+    /// PREVIOUS value, so there is no TOCTOU window C1 would ask about) and
+    /// read by `relay_probe_status`. The property that actually needs a real
+    /// concurrent test is that the `Mutex` serializes the whole struct
+    /// replace: a reader must never observe a torn mix of one writer's `url`
+    /// with another writer's `at_ms`. Each of 64 concurrent writers records a
+    /// probe whose three fields are all derived from the same index, so any
+    /// mismatch among them in the end state proves a torn write.
+    ///
+    /// Codex COMM-4b review, Low: the earlier version of this test ran on
+    /// the DEFAULT (single-threaded) `#[tokio::test]` runtime, so its 64
+    /// "concurrent" writer tasks only ever interleaved cooperatively on one
+    /// OS thread, never truly in parallel; and it joined every writer
+    /// BEFORE reading even once, so no reader ever actually ran while a
+    /// writer was still in flight. This version runs on a multi-thread
+    /// runtime, uses a [`tokio::sync::Barrier`] so every writer and reader
+    /// starts its critical section at the same instant, and keeps reader
+    /// tasks spinning on `relay_probe_status()` for as long as writers are
+    /// still running, so a torn struct — if the `Mutex` ever let one
+    /// through — has an actual chance to be observed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_relay_probe_writes_never_tear_the_recorded_struct() {
+        const WRITERS: usize = 64;
+        const READERS: usize = 8;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = Arc::new(HyphaeDaemonSupervisor::spawn(idle_ctx(tmp.path()).await));
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS + READERS));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut writer_tasks = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS as u64 {
+            let sup = Arc::clone(&sup);
+            let barrier = Arc::clone(&barrier);
+            writer_tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                sup.record_relay_probe(RelayProbeStatus {
+                    url: Some(format!("wss://relay-{i}.example")),
+                    connected: i.is_multiple_of(2),
+                    at_ms: i,
+                    error: if i.is_multiple_of(2) {
+                        None
+                    } else {
+                        Some(format!("down-{i}"))
+                    },
+                });
+            }));
+        }
+
+        let mut reader_tasks = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let sup = Arc::clone(&sup);
+            let barrier = Arc::clone(&barrier);
+            let done = Arc::clone(&done);
+            reader_tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut reads = 0u64;
+                // Keep reading, concurrently with the writers above (real
+                // OS-thread parallelism under the multi_thread flavor),
+                // until every writer has been joined. `yield_now` matters
+                // here: without an `.await` point, this loop would never
+                // hand its worker thread back to the scheduler, and could
+                // starve the very writer tasks it's supposed to race
+                // against.
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Some(probe) = sup.relay_probe_status() {
+                        let i = probe.at_ms;
+                        assert_eq!(
+                            probe.url.as_deref(),
+                            Some(format!("wss://relay-{i}.example").as_str()),
+                            "torn write: {probe:?}"
+                        );
+                        assert_eq!(
+                            probe.connected,
+                            i.is_multiple_of(2),
+                            "torn write: {probe:?}"
+                        );
+                        let expected_error = if i.is_multiple_of(2) {
+                            None
+                        } else {
+                            Some(format!("down-{i}"))
+                        };
+                        assert_eq!(probe.error, expected_error, "torn write: {probe:?}");
+                    }
+                    reads += 1;
+                    tokio::task::yield_now().await;
+                }
+                reads
+            }));
+        }
+
+        for w in writer_tasks {
+            w.await.unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+
+        let mut total_reads = 0u64;
+        for r in reader_tasks {
+            total_reads += r.await.unwrap();
+        }
+        assert!(
+            total_reads > 0,
+            "readers never got a chance to run concurrently with writers"
+        );
+
+        let probe = sup
+            .relay_probe_status()
+            .expect("64 writers ran; something must be recorded");
+        // Every field must come from the SAME writer `i`, not a mix.
+        let i = probe.at_ms;
+        assert_eq!(
+            probe.url.as_deref(),
+            Some(format!("wss://relay-{i}.example").as_str())
+        );
+        assert_eq!(
+            probe.connected,
+            i.is_multiple_of(2),
+            "torn write: {probe:?}"
+        );
+        let expected_error = if i.is_multiple_of(2) {
+            None
+        } else {
+            Some(format!("down-{i}"))
+        };
+        assert_eq!(probe.error, expected_error, "torn write: {probe:?}");
     }
 }

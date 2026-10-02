@@ -26,11 +26,12 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::daemon::RelayProbeStatus;
 use crate::error::{CommError, map_envelope_failure, map_runner_error, map_store_error};
 use crate::npub::is_valid_npub;
 use crate::password::Password;
 use crate::password_store::{Account, PasswordStore};
-use crate::runner::{Envelope, HyphaeRunner, Invocation};
+use crate::runner::{Envelope, ExitClass, HyphaeRunner, Invocation};
 
 type CommResult = Result<Json<Value>, CommError>;
 
@@ -176,19 +177,39 @@ pub fn router(state: CommState) -> Router {
 // daemon (COMM-4a; COMM-HYPHAE.md §4, §5.2 trimmed to what this task tracks)
 // ---------------------------------------------------------------------
 
-fn daemon_status_json(s: crate::daemon::DaemonStatus) -> Value {
-    json!({"ok": true, "data": {"process": {
-        "state": s.state,
-        "generation": s.generation,
-        "consecutive_failures": s.consecutive_failures,
-        "reason": s.reason,
-    }}})
+/// COMM-4b: the full three-state object (COMM-HYPHAE.md §5.2) — `process`
+/// (COMM-4a), plus `relay_probe` and `catch_up`, which this task adds.
+/// `catch_up` is read fresh from the log file on every call: no route here
+/// ever caches it across requests, matching `relay_probe`'s own "only on
+/// demand" posture (M12 cut periodic probing/tailing).
+async fn daemon_status_json(daemon: &crate::daemon::HyphaeDaemonSupervisor) -> Value {
+    let s = daemon.status();
+    let relay_probe = daemon.relay_probe_status();
+    let catch_up = daemon.catch_up().await;
+    json!({"ok": true, "data": {
+        "process": {
+            "state": s.state,
+            "generation": s.generation,
+            "consecutive_failures": s.consecutive_failures,
+            "reason": s.reason,
+        },
+        "relay_probe": relay_probe.map(|p| json!({
+            "url": p.url,
+            "connected": p.connected,
+            "at_ms": p.at_ms,
+            "error": p.error,
+        })),
+        "catch_up": {
+            "state": catch_up.state,
+            "last_incomplete_at_ms": catch_up.last_incomplete_at_ms,
+        },
+    }})
 }
 
 async fn daemon_status(State(state): State<CommState>) -> CommResult {
     state.require_ready()?;
     let daemon = state.require_daemon()?;
-    Ok(Json(daemon_status_json(daemon.status())))
+    Ok(Json(daemon_status_json(daemon).await))
 }
 
 async fn daemon_start(State(state): State<CommState>) -> CommResult {
@@ -199,14 +220,14 @@ async fn daemon_start(State(state): State<CommState>) -> CommResult {
         crate::daemon::DaemonStartError::Locked(m) => CommError::Locked(m),
         crate::daemon::DaemonStartError::Failed(m) => CommError::Upstream(m),
     })?;
-    Ok(Json(daemon_status_json(daemon.status())))
+    Ok(Json(daemon_status_json(daemon).await))
 }
 
 async fn daemon_stop(State(state): State<CommState>) -> CommResult {
     state.require_ready()?;
     let daemon = state.require_daemon()?;
     daemon.stop().await;
-    Ok(Json(daemon_status_json(daemon.status())))
+    Ok(Json(daemon_status_json(daemon).await))
 }
 
 fn args(parts: &[&str]) -> Vec<OsString> {
@@ -744,13 +765,73 @@ struct RelayProbeReq {
     url: Option<String>,
 }
 
-/// `POST /comm/relay/probe` → `relay info [U] --timeout 5`, run only when a
+/// Resolves the address `probe_relay` is about to probe when the caller
+/// didn't name one explicitly, mirroring Hyphae's OWN `relay info`/`relay
+/// list` resolution precedence (explicit > config > built-in default,
+/// `internal/relayconfig`'s `Resolver::Resolve`, `internal/nostr/relay.go`'s
+/// `relayInfo`: `result.Relays[0]` of that same resolution) by asking `relay
+/// list` and taking its first address.
+///
+/// Codex COMM-4b review, Medium #4: without this, a probe with no explicit
+/// `url` left the target entirely implicit — fine on success (Hyphae's own
+/// success envelope echoes back the `url` it actually used), but a
+/// `network_error` failure's envelope carries no `url` at all, so the
+/// recorded probe ended up with `url: null` even though a real address was
+/// dialed. Resolving it here means `probe_relay` always has an address to
+/// pass explicitly to `relay info` and to record, on either outcome.
+///
+/// Codex COMM-4b review, round 2, Low: an explicit-but-empty `requested`
+/// (`{"url": ""}`) is treated exactly like `None`, not like a real target —
+/// Hyphae's own `relayInfo` (`internal/nostr/relay.go:70`, locked source:
+/// `url := relayInfoURLArg; if url == "" { … resolve the default … }`) falls
+/// through to its own config resolution when the CLI arg is empty, rather
+/// than treating `""` as an address to dial. Before this fix, `Some("")`
+/// matched the `if let Some(url) = requested` arm just like any other
+/// non-empty string, short-circuiting straight past the `relay list`
+/// fallback below and sending a literal empty string on to `relay info`.
+///
+/// Best-effort: if this auxiliary `relay list` call itself fails for any
+/// reason, this returns `None` and `probe_relay` falls back to its old
+/// behavior of leaving the explicit arg off `relay info`, letting Hyphae
+/// resolve it internally — a failure here is not reason to fail the probe
+/// itself.
+async fn effective_probe_target(runner: &HyphaeRunner, requested: Option<&str>) -> Option<String> {
+    if let Some(url) = requested.filter(|url| !url.is_empty()) {
+        return Some(url.to_owned());
+    }
+    let envelope = runner.run(read_invocation(&["relay", "list"])).await.ok()?;
+    let Envelope::Ok { data } = envelope else {
+        return None;
+    };
+    data.get("relays")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// `POST /comm/relay/probe` → `relay info <U> --timeout 5`, run only when a
 /// caller explicitly asks (§4, §5.2: comm does not probe periodically —
 /// that was cut, M12). Always expects a JSON body (`{}` when no `url`).
+/// `<U>` is always passed explicitly now (via [`effective_probe_target`]),
+/// even when the caller didn't name one — see that function's doc comment.
+///
+/// COMM-4b: a relay actually being down must not surface as an HTTP error —
+/// Hyphae's own `relay info` contract (`docs/agent/cli-communication-contract.md`:
+/// "失败走网络错误信封和退出码 2") is itself the probe's *negative result*,
+/// not a failure of the probe operation. Only that specific `network_error`
+/// exit is folded into `{connected:false}`; every other failure (bad args,
+/// auth, an unresponsive/timing-out child, …) still surfaces as the matching
+/// `CommError`, same as every other route. The result — success or
+/// network-down — is always written into the daemon's `relay_probe` state
+/// (COMM-HYPHAE.md §5.2) when a daemon supervisor is wired up; it is skipped
+/// (not an error) on a `Ready` state built without one, same as
+/// `set_relay`'s `on_config_changed` call.
 async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeReq>) -> CommResult {
     let (runner, ..) = state.require_ready()?;
+    let target = effective_probe_target(runner, req.url.as_deref()).await;
     let mut argv: Vec<OsString> = vec!["relay".into(), "info".into()];
-    if let Some(url) = &req.url {
+    if let Some(url) = &target {
         argv.push(url.clone().into());
     }
     argv.push("--timeout".into());
@@ -763,7 +844,47 @@ async fn probe_relay(State(state): State<CommState>, Json(req): Json<RelayProbeR
         })
         .await
         .map_err(map_runner_error)?;
-    envelope_response(envelope)
+
+    let at_ms = crate::daemon::wall_clock_ms();
+    let probe = match envelope {
+        Envelope::Ok { data } => RelayProbeStatus {
+            url: data
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| target.clone()),
+            connected: data
+                .get("connected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            at_ms,
+            error: None,
+        },
+        Envelope::Failed {
+            exit: ExitClass::NetworkError,
+            message,
+            ..
+        } => RelayProbeStatus {
+            url: target.clone(),
+            connected: false,
+            at_ms,
+            error: Some(message),
+        },
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } => return Err(map_envelope_failure(&error, &message, data)),
+    };
+
+    if let Some(daemon) = state.daemon.clone() {
+        daemon.record_relay_probe(probe.clone());
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "data": {"url": probe.url, "connected": probe.connected, "error": probe.error},
+    })))
 }
 
 // ---------------------------------------------------------------------
@@ -2057,5 +2178,102 @@ echo '{"ok":true,"data":{"relays":["wss://a","wss://b"],"source":"config"}}'
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
         assert_eq!(body["error"], "invalid", "{body:?}");
         assert_eq!(body["ok"], false, "{body:?}");
+    }
+
+    // ---- COMM-4b: relay probe only folds `network_error` into ------------
+    // ---- `connected:false`; every other failure still errors (T2) -------
+
+    /// pre-pr-check T2: without the third match arm in `probe_relay`
+    /// (`Envelope::Failed { error, message, data, .. } => return
+    /// Err(...)`), this test goes red — a non-network failure (here
+    /// `other_error`, Hyphae's own exit 4) would otherwise be silently
+    /// folded into `{connected:false}` the same as a real network-down
+    /// probe, hiding a different failure mode (bad `--timeout`, a crashed
+    /// Hyphae, …) behind the "relay is down" result. S3: this is checked at
+    /// the one and only place the invocation's result is interpreted — the
+    /// match in `probe_relay` itself — not at an earlier entry/validation
+    /// step that a later code path could bypass.
+    #[tokio::test]
+    async fn relay_probe_of_a_non_network_failure_is_still_an_http_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\necho '{\"ok\":false,\"error\":\"other_error\",\"message\":\"boom\"}' >&2\nexit 4\n";
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(router(state), "POST", "/relay/probe", Some(json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+        assert_eq!(body["error"], "upstream", "{body:?}");
+        assert!(
+            body.get("data").is_none() || body["data"].get("connected").is_none(),
+            "a non-network failure must never report connected:false: {body:?}"
+        );
+    }
+
+    // ---- COMM-4b review round 2, Low: `{"url": ""}` == no `url` at all ---
+
+    /// Codex COMM-4b review, round 2, Low: an explicit-but-empty `url`
+    /// (`{"url": ""}`) must resolve the configured default, exactly like
+    /// omitting `url` entirely — matching Hyphae's own `relayInfo`, which
+    /// treats an empty CLI arg as "no override" (`internal/nostr/relay.go:70`,
+    /// locked source). Before the fix, `effective_probe_target` matched
+    /// `Some("")` as if it were a real target, so this never called `relay
+    /// list` at all and sent `relay info ""` straight through — proven here
+    /// by asserting on the exact argv each invocation of the fake binary
+    /// received, not just the final JSON response.
+    #[tokio::test]
+    async fn relay_probe_with_an_explicit_empty_url_resolves_the_default_like_hyphae_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let argv_log = tmp.path().join("argv.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"{log}\"; done\n\
+             printf -- '---\\n' >> \"{log}\"\n\
+             case \"$1 $2\" in\n\
+             'relay list')\n\
+             echo '{{\"ok\":true,\"data\":{{\"source\":\"config\",\"relays\":[\"wss://relay.example\"]}}}}'\n\
+             ;;\n\
+             'relay info')\n\
+             echo '{{\"ok\":true,\"data\":{{\"url\":\"wss://relay.example\",\"connected\":true}}}}'\n\
+             ;;\n\
+             esac\n",
+            log = argv_log.display(),
+        );
+        let state = ready_state_with_script(tmp.path(), &script).await;
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/relay/probe",
+            Some(json!({"url": ""})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["data"]["url"], "wss://relay.example", "{body:?}");
+
+        let log = tokio::fs::read_to_string(&argv_log).await.unwrap();
+        let invocations: Vec<Vec<&str>> = log
+            .split("---\n")
+            .map(|chunk| chunk.lines().collect::<Vec<_>>())
+            .filter(|args| !args.is_empty())
+            .collect();
+        assert!(
+            invocations
+                .iter()
+                .any(|args| args.as_slice() == ["relay", "list"]),
+            "an empty `url` must still trigger the `relay list` default-resolution \
+             fallback (the pre-fix short-circuit skipped this entirely): {invocations:?}"
+        );
+        assert!(
+            invocations.iter().any(|args| args.as_slice()
+                == ["relay", "info", "wss://relay.example", "--timeout", "5"]),
+            "the resolved default address must be passed explicitly to `relay info`: \
+             {invocations:?}"
+        );
+        assert!(
+            !invocations.iter().any(|args| {
+                args.first() == Some(&"relay")
+                    && args.get(1) == Some(&"info")
+                    && args.get(2) == Some(&"")
+            }),
+            "`relay info` must never receive a literal empty-string url argument: \
+             {invocations:?}"
+        );
     }
 }
