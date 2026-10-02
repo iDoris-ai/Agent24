@@ -237,6 +237,25 @@ pub enum ShutdownLeader {
     KilledAfterGrace,
 }
 
+/// What [`kill_group_gracefully`] found, split into the two questions it
+/// used to conflate (PR #642 review round 3, Medium #1): how the LEADER
+/// itself ended (TERM vs KILL) says nothing about whether the final
+/// post-KILL probe actually observed the whole group gone (`ESRCH`) or gave
+/// up after the probe deadline with it still reporting `Ok`/`EPERM` — a
+/// helper that outlives the leader's own SIGKILL (stuck in an
+/// uninterruptible state, or simply not yet reaped by its new parent) used
+/// to be indistinguishable from a group that was genuinely confirmed empty,
+/// as long as the leader itself had exited within its own grace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KillOutcome {
+    pub leader: ShutdownLeader,
+    /// `true` only if the final post-KILL probe actually observed `ESRCH`.
+    /// `false` means it gave up at its own deadline with the group still
+    /// reporting `Ok` (alive) or `EPERM` (alive under another uid) — the
+    /// stop was NOT confirmed, regardless of what the leader did.
+    pub group_confirmed_gone: bool,
+}
+
 /// Has `child`'s leader exited, asked **without reaping it** (`waitid`
 /// `WNOWAIT`), so its pid still keeps the process-group id until every real
 /// signal this stop sends has gone out?
@@ -300,13 +319,19 @@ async fn kill_group_gracefully(
     grace: Duration,
     mut leader: Option<&mut Child>,
     shutdown_deadline: &OnceLock<Instant>,
-) -> ShutdownLeader {
+) -> KillOutcome {
     let Some(pid) = i32::try_from(pgid).ok().and_then(Pid::from_raw) else {
-        return ShutdownLeader::GoneBeforeTerm;
+        return KillOutcome {
+            leader: ShutdownLeader::GoneBeforeTerm,
+            group_confirmed_gone: true,
+        };
     };
     if kill_process_group(pid, Signal::Term).is_err() {
         // ESRCH (or any other failure): nothing to wait for.
-        return ShutdownLeader::GoneBeforeTerm;
+        return KillOutcome {
+            leader: ShutdownLeader::GoneBeforeTerm,
+            group_confirmed_gone: true,
+        };
     }
     let mut deadline = Instant::now() + grace;
     // PR #626 review, Medium #1: ONLY the leader's own exit decides
@@ -357,18 +382,46 @@ async fn kill_group_gracefully(
     // (`Ok`/`EPERM`) — the same split `agent24-os-proto`'s `supervise.rs`
     // (`ModuleProcess::group_empties_within`) uses. Bounded, not open-ended:
     // a member stuck in an uninterruptible state must not hang this call.
-    let probe_deadline = Instant::now() + Duration::from_millis(500);
+    //
+    // PR #642 review round 3, Medium #1: this probe's own result (confirmed
+    // `ESRCH` vs. gave-up-at-`Ok`/`EPERM`) is now carried all the way out as
+    // `group_confirmed_gone`, instead of being folded into `exited_in_grace`
+    // (which only ever answered "how did the LEADER end", not "is the group
+    // actually gone").
+    let group_confirmed_gone = confirm_group_gone(
+        || test_kill_process_group(pid),
+        Instant::now() + Duration::from_millis(500),
+    )
+    .await;
+    KillOutcome {
+        leader: if exited_in_grace {
+            ShutdownLeader::ExitedInGrace
+        } else {
+            ShutdownLeader::KilledAfterGrace
+        },
+        group_confirmed_gone,
+    }
+}
+
+/// Polls `probe` (a process/group signal-0 test) until it reports `ESRCH`
+/// (confirmed gone: `true`) or `deadline` passes with it still reporting
+/// `Ok`/any other `Errno` (not confirmed: `false`) — the exact decision
+/// [`kill_group_gracefully`]'s and [`reap_orphan_group_gracefully`]'s own
+/// post-signal probes make, pulled out so a test can drive it with a fake
+/// `probe` that always answers `EPERM`/`Ok` (PR #642 review round 3, Medium
+/// #1's "注入 EPERM/一直存在的测试" — a real member stuck in that state
+/// forever cannot be constructed in a test; the decision this makes from
+/// such a sequence can).
+async fn confirm_group_gone(
+    mut probe: impl FnMut() -> Result<(), rustix::io::Errno>,
+    deadline: Instant,
+) -> bool {
     loop {
-        match test_kill_process_group(pid) {
-            Err(rustix::io::Errno::SRCH) => break,
-            _ if Instant::now() >= probe_deadline => break,
+        match probe() {
+            Err(rustix::io::Errno::SRCH) => return true,
+            _ if Instant::now() >= deadline => return false,
             _ => tokio::time::sleep(Duration::from_millis(20)).await,
         }
-    }
-    if exited_in_grace {
-        ShutdownLeader::ExitedInGrace
-    } else {
-        ShutdownLeader::KilledAfterGrace
     }
 }
 
@@ -387,6 +440,75 @@ pub enum OrphanOutcome {
     /// The pid is alive and its start time matches: our own orphaned
     /// daemon from a previous `agent24d`. Killed.
     Killed,
+}
+
+/// Orphan-specific twin of [`kill_group_gracefully`] (PR #642 review round
+/// 3, High #2 — a regression `reap_orphan` itself introduced in the
+/// previous round). Unlike a child this `agent24d` spawned and still holds
+/// a `Child` handle for (never reaped until every real signal has gone out
+/// — [`peek_child_exited`]'s doc comment explains why that is safe), an
+/// ORPHAN's leader can be reaped by `init`/launchd at any moment this
+/// process is not watching, which frees its pid for the kernel to hand to a
+/// brand-new, unrelated process. Every spawn in this crate uses
+/// `process_group(0)`, so that pid IS the group's pgid too: an
+/// unconditional SIGKILL to that same numeric pgid, sent without
+/// re-checking anything, could land on whatever reused it.
+///
+/// Two differences from [`kill_group_gracefully`] close that:
+/// - the grace loop polls the GROUP itself (via [`confirm_group_gone`]), and
+///   returns the moment it observes `ESRCH` — confirmed empty is the signal
+///   to STOP, never the signal to send one more signal. A KILL is never
+///   sent once the group is confirmed gone.
+/// - if the grace elapses with the group still reporting `Ok`/`EPERM`
+///   (still alive, or alive under another uid), the pid's identity is
+///   reverified against the ORIGINAL `ps -o lstart=` marker recorded at
+///   spawn time, before any KILL goes out. A mismatch (the number may
+///   already have been handed to an unrelated process) sends no signal at
+///   all and logs a warning instead.
+///
+/// `on_kill_attempt` fires immediately before the one KILL this function may
+/// send, so a test can observe whether a KILL actually went out — sending
+/// KILL to an already-dead group is a silent no-op from the outside, so
+/// process survival alone cannot prove this discipline held.
+async fn reap_orphan_group_gracefully(
+    pid: Pid,
+    grace: Duration,
+    recorded_pid: u32,
+    recorded_start_marker: &str,
+    mut on_kill_attempt: impl FnMut(),
+) {
+    if kill_process_group(pid, Signal::Term).is_err() {
+        return; // ESRCH (or any other failure): nothing to wait for.
+    }
+    let group_gone_in_grace =
+        confirm_group_gone(|| test_kill_process_group(pid), Instant::now() + grace).await;
+    if group_gone_in_grace {
+        return; // Confirmed empty on its own — never escalate to KILL.
+    }
+    // Still reporting alive (or EPERM) after the full grace: before sending
+    // a signal that could hit an unrelated process group, make sure this is
+    // still OUR orphan.
+    let current_marker = ps_lstart(recorded_pid).await;
+    if current_marker.as_deref() != Some(recorded_start_marker) {
+        tracing::warn!(
+            pid = recorded_pid,
+            recorded_marker = recorded_start_marker,
+            current_marker = current_marker.as_deref().unwrap_or("<none>"),
+            "comm: an orphaned hyphae daemon's identity could not be reverified before \
+             escalating to SIGKILL (its pid may already have been reused by an unrelated \
+             process); leaving it alone rather than risk killing the wrong process group"
+        );
+        return;
+    }
+    on_kill_attempt();
+    let _ = kill_process_group(pid, Signal::Kill);
+    // Best-effort confirmation only; there is nothing more this call can do
+    // either way once the identity-checked KILL has gone out.
+    let _ = confirm_group_gone(
+        || test_kill_process_group(pid),
+        Instant::now() + Duration::from_millis(500),
+    )
+    .await;
 }
 
 /// Run once, early, before `agent24d` ever spawns a Hyphae daemon of its
@@ -421,12 +543,13 @@ pub async fn reap_orphan(pid_path: &Path, grace: Duration) -> OrphanOutcome {
         pgid = recorded.pgid,
         "comm: killing an orphaned hyphae daemon left by a previous agent24d"
     );
-    // No `agent24d` shutdown is underway yet at this point in startup (this
-    // runs before a `Ctx`, and so before the actor that would ever learn of
-    // one, exists at all) — an always-empty `OnceLock` behaves exactly like
-    // the unconditional `grace` this call used before `shutdown_deadline`
-    // existed.
-    kill_group_gracefully(recorded.pgid, grace, None, &OnceLock::new()).await;
+    // PR #642 review round 3, High #2: an orphan is never cleaned up through
+    // `kill_group_gracefully` any more — see `reap_orphan_group_gracefully`'s
+    // doc comment for why an unconditional KILL is unsafe specifically for a
+    // pid/pgid we do not hold a `Child` handle for.
+    if let Some(pid) = i32::try_from(recorded.pgid).ok().and_then(Pid::from_raw) {
+        reap_orphan_group_gracefully(pid, grace, recorded.pid, &recorded.start_marker, || {}).await;
+    }
     remove_pid_file(pid_path).await;
     OrphanOutcome::Killed
 }
@@ -527,7 +650,21 @@ struct Spawned {
 /// process group, `env_clear` + [`crate::runner::ENV_ALLOW`], `HOME`/cwd
 /// pinned to the Hyphae home, password on stdin, stdout/stderr to the log
 /// file.
-async fn try_start(ctx: &Ctx) -> Result<Spawned, DaemonStartError> {
+///
+/// `shutdown_deadline` is rechecked right before the actual `cmd.spawn()`
+/// below (PR #642 review round 3, High #1): every await above it —
+/// `identity list`, `relay list`, `resolve_account`, the password store's
+/// own `get` — can take long enough for `agent24d`'s shutdown to land in
+/// between. This is the cheap half of the fix: it stops the common case
+/// from ever spawning a process that would just have to be killed again a
+/// moment later. It cannot close the window entirely (`shutdown` could still
+/// land between this check and the real `spawn()`, which is why
+/// [`spawn_and_record`] re-checks once more, AFTER the process actually
+/// exists, and cleans it up there if so).
+async fn try_start(
+    ctx: &Ctx,
+    shutdown_deadline: &OnceLock<Instant>,
+) -> Result<Spawned, DaemonStartError> {
     let identities = read_list(ctx, &["identity", "list"]).await?;
     let nickname = identities
         .as_array()
@@ -569,6 +706,15 @@ async fn try_start(ctx: &Ctx) -> Result<Spawned, DaemonStartError> {
         .get(&account)
         .await
         .map_err(|e| DaemonStartError::Locked(e.to_string()))?;
+
+    // PR #642 review round 3, High #1: the last point before the real
+    // `cmd.spawn()` below where giving up costs nothing — every await above
+    // this line could have let a shutdown land in the meantime.
+    if shutdown_deadline.get().is_some() {
+        return Err(DaemonStartError::Failed(
+            "agent24d is shutting down".to_owned(),
+        ));
+    }
 
     let mut args: Vec<OsString> = vec![
         "daemon".into(),
@@ -652,6 +798,12 @@ fn initial_status() -> DaemonStatus {
 pub struct DaemonShutdownOutcome {
     pub had_process: bool,
     pub leader: Option<ShutdownLeader>,
+    /// `None` iff `had_process` is `false` (nothing to confirm). Otherwise
+    /// [`KillOutcome::group_confirmed_gone`] — PR #642 review round 3,
+    /// Medium #1: kept separate from `leader` so `server.rs` can record
+    /// `GroupEnd::Gone` only when this is actually confirmed, instead of
+    /// inferring it from how the leader alone ended.
+    pub group_confirmed_gone: Option<bool>,
 }
 
 enum Cmd {
@@ -822,6 +974,7 @@ impl HyphaeDaemonSupervisor {
         DaemonShutdownOutcome {
             had_process: false,
             leader: None,
+            group_confirmed_gone: None,
         }
     }
 }
@@ -831,7 +984,7 @@ async fn stop_phase(
     pid_path: &Path,
     grace: Duration,
     shutdown_deadline: &OnceLock<Instant>,
-) -> Option<ShutdownLeader> {
+) -> Option<KillOutcome> {
     match std::mem::replace(phase, Phase::Idle) {
         Phase::Running {
             mut child, pgid, ..
@@ -839,11 +992,11 @@ async fn stop_phase(
         | Phase::Starting {
             mut child, pgid, ..
         } => {
-            let leader =
+            let outcome =
                 kill_group_gracefully(pgid, grace, Some(&mut child), shutdown_deadline).await;
             drop(child);
             remove_pid_file(pid_path).await;
-            Some(leader)
+            Some(outcome)
         }
         // Idle or Backoff: already replaced with Idle above (a stop cancels
         // a pending restart too).
@@ -856,9 +1009,37 @@ async fn spawn_and_record(
     generation: &mut u64,
     status: &Mutex<DaemonStatus>,
     failures: u32,
+    shutdown_deadline: &OnceLock<Instant>,
 ) -> Result<Phase, DaemonStartError> {
-    match try_start(ctx).await {
-        Ok(spawned) => {
+    match try_start(ctx, shutdown_deadline).await {
+        Ok(mut spawned) => {
+            // PR #642 review round 3, High #1: the three call sites below
+            // only check `shutdown_deadline` BEFORE this function is even
+            // called, and `try_start`'s own pre-spawn check above closes
+            // most of the window but not all of it — `spawn()` itself and
+            // the password-stdin write that follows it are real awaits too.
+            // This is the one point that can still see a shutdown that
+            // landed anywhere in between, now that the process genuinely
+            // exists: discard it (bounded by the same shared deadline
+            // `kill_group_gracefully` already re-reads on every poll)
+            // instead of ever recording or promoting it.
+            if shutdown_deadline.get().is_some() {
+                tracing::warn!(
+                    pid = spawned.pid,
+                    "comm: agent24d began shutting down while this hyphae daemon spawn was \
+                     still starting up; cleaning it up instead of recording it"
+                );
+                let _ = kill_group_gracefully(
+                    spawned.pgid,
+                    ctx.grace,
+                    Some(&mut spawned.child),
+                    shutdown_deadline,
+                )
+                .await;
+                return Err(DaemonStartError::Failed(
+                    "agent24d is shutting down (spawn aborted mid-start)".to_owned(),
+                ));
+            }
             *generation += 1;
             match ps_lstart(spawned.pid).await {
                 Some(marker) => {
@@ -1093,7 +1274,7 @@ async fn run_actor(
                             // the policy exactly as it was; only THIS path
                             // resets it.
                             policy = RestartPolicy::new();
-                            match spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures()).await {
+                            match spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline).await {
                                 Ok(p) => {
                                     phase = p;
                                     // PR #626 review, Medium #3: NOT
@@ -1138,7 +1319,7 @@ async fn run_actor(
                             // chase a SECOND generation this restart would
                             // otherwise have just spawned.
                             phase = if shutdown_deadline.get().is_none() {
-                                spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures())
+                                spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
                                     .await
                                     .unwrap_or(Phase::Idle)
                             } else {
@@ -1149,8 +1330,12 @@ async fn run_actor(
                     }
                     Cmd::Shutdown(reply) => {
                         let had_process = has_child;
-                        let leader = stop_phase(&mut phase, &ctx.pid_path, grace, &shutdown_deadline).await;
-                        let _ = reply.send(DaemonShutdownOutcome { had_process, leader });
+                        let outcome = stop_phase(&mut phase, &ctx.pid_path, grace, &shutdown_deadline).await;
+                        let _ = reply.send(DaemonShutdownOutcome {
+                            had_process,
+                            leader: outcome.map(|o| o.leader),
+                            group_confirmed_gone: outcome.map(|o| o.group_confirmed_gone),
+                        });
                         return;
                     }
                 }
@@ -1222,7 +1407,7 @@ async fn run_actor(
             () = tokio::time::sleep_until(backoff_deadline.unwrap_or_else(tokio::time::Instant::now)), if backoff_deadline.is_some() => {
                 // PR #626 review, High #2: "关机开始后禁止再 spawn".
                 phase = if shutdown_deadline.get().is_none() {
-                    spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures())
+                    spawn_and_record(&ctx, &mut generation, &status, policy.consecutive_failures(), &shutdown_deadline)
                         .await
                         .unwrap_or(Phase::Idle)
                 } else {
@@ -1319,5 +1504,159 @@ mod tests {
             child.try_wait().ok().flatten().is_some(),
             "an exit status must still be collectible after peek_child_exited reported it"
         );
+    }
+
+    /// PR #642 review round 3, Medium #1: a fake `probe` that always
+    /// answers `EPERM` (standing in for a group member that is alive but
+    /// running under another uid — or, just as well, one simply stuck `Ok`
+    /// forever) must make [`confirm_group_gone`] give up at its own
+    /// deadline and report `false`, bounded, not hang. A real process that
+    /// outlives SIGKILL forever cannot be constructed in a test; the
+    /// decision this function makes from that sequence can.
+    #[tokio::test]
+    async fn confirm_group_gone_gives_up_bounded_on_persistent_eperm() {
+        let began = Instant::now();
+        let gone = confirm_group_gone(
+            || Err(rustix::io::Errno::PERM),
+            Instant::now() + Duration::from_millis(80),
+        )
+        .await;
+        assert!(
+            !gone,
+            "a probe that never reports ESRCH must never be read as `group_confirmed_gone`"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "must give up at its own deadline, not hang: took {:?}",
+            began.elapsed()
+        );
+    }
+
+    /// Same fixture, a probe that always reports `Ok` (the group genuinely
+    /// still alive) — the other half of M1's "组一直存在或 EPERM" wording.
+    #[tokio::test]
+    async fn confirm_group_gone_gives_up_bounded_on_persistent_alive() {
+        let gone = confirm_group_gone(|| Ok(()), Instant::now() + Duration::from_millis(80)).await;
+        assert!(!gone);
+    }
+
+    /// `ESRCH` must still be read as confirmed-gone, immediately — the
+    /// positive counterpart the two tests above are contrasted against.
+    #[tokio::test]
+    async fn confirm_group_gone_reports_true_on_esrch() {
+        let began = Instant::now();
+        let gone = confirm_group_gone(
+            || Err(rustix::io::Errno::SRCH),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert!(gone);
+        assert!(
+            began.elapsed() < Duration::from_millis(500),
+            "ESRCH must return immediately, not wait out the deadline"
+        );
+    }
+
+    /// PR #642 review round 3, High #2 (a regression the previous round
+    /// introduced): once an orphan's process group is confirmed gone, no
+    /// SIGKILL may ever be sent — sending one unconditionally, as the
+    /// previous version did, risks hitting an unrelated process that has
+    /// since reused this exact pid/pgid number (the orphan's leader can be
+    /// reaped by `init`/launchd at any moment this process is not
+    /// watching).
+    ///
+    /// The existing black-box `tests/daemon_supervise.rs::reap_orphan_kills_a_live_pid_whose_start_time_matches`
+    /// cannot catch this: its test process stays the real parent and never
+    /// calls `wait()` until after `reap_orphan` returns, so the fixture
+    /// stays a zombie — never actually `ESRCH` — for the whole call,
+    /// masking exactly the window this test is for. Here, a background task
+    /// reaps the fixture itself, the moment it exits, to simulate
+    /// `init`/launchd having already done so — and a KILL actually going
+    /// out is observed directly via `on_kill_attempt`, since sending KILL
+    /// to an already-dead group is a silent no-op from the outside.
+    #[tokio::test]
+    async fn reap_orphan_group_gracefully_never_kills_once_the_group_is_confirmed_gone() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 9999")
+            .process_group(0)
+            .spawn()
+            .expect("spawn the orphan fixture");
+        let raw_pid = child.id().expect("freshly spawned child has a pid");
+        let pid = i32::try_from(raw_pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .expect("a real pid fits `Pid`");
+        // Simulates `init`/launchd reaping an orphan the instant it exits —
+        // this task is the one place in the test that ever calls `wait()`,
+        // never `reap_orphan_group_gracefully` itself (an orphan's cleanup
+        // never holds a `Child` for it either).
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        // Let the fixture actually start before signalling it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let kill_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&kill_attempts);
+        reap_orphan_group_gracefully(
+            pid,
+            Duration::from_secs(2),
+            raw_pid,
+            "never-checked-unless-escalating",
+            move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(
+            kill_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the group was confirmed gone (ESRCH) within the grace — escalating to SIGKILL \
+             after that point is exactly the pid-reuse hazard this fix closes"
+        );
+    }
+
+    /// The identity-reverification half of the same fix: if the group is
+    /// STILL alive after the full grace (so escalating is even considered),
+    /// a `start_marker` that no longer matches must suppress the KILL
+    /// entirely rather than risk hitting a process that has reused this
+    /// pid/pgid number.
+    #[tokio::test]
+    async fn reap_orphan_group_gracefully_skips_kill_when_identity_no_longer_matches() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; exec sleep 9999")
+            .process_group(0)
+            .spawn()
+            .expect("spawn a TERM-ignoring fixture");
+        let raw_pid = child.id().expect("freshly spawned child has a pid");
+        let pid = i32::try_from(raw_pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .expect("a real pid fits `Pid`");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let kill_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&kill_attempts);
+        reap_orphan_group_gracefully(
+            pid,
+            Duration::from_millis(100),
+            raw_pid,
+            "this will never match a real `ps -o lstart=` marker",
+            move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(
+            kill_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a mismatched identity must suppress the KILL, not just warn and send it anyway"
+        );
+
+        let _ = child.kill().await;
     }
 }
