@@ -273,3 +273,15 @@ sensitivity?, retention_policy_id?   # P4
 - M365 Copilot memory https://learn.microsoft.com/en-us/microsoft-365/copilot/copilot-personalization-memory · Rovo memory https://support.atlassian.com/rovo/docs/what-is-rovo-memory-management/ · Glean permissions https://developers.glean.com/libraries/indexing-sdk/permissions · Claude memory https://support.claude.com/en/articles/11817273
 
 > 附注：四份报告原样放在 `docs/research/m1-memory/`，只把指向 M1 计划的相对链接改成了从新位置能正确跳转的路径。
+
+## §7 决策记录（2026-10-02，jason 拍板：5 问全部按推荐，细节后续再议）
+
+| # | 问题 | 决定 |
+|---|---|---|
+| 1 | 「原文永不删除」与清除权冲突 | P1 开工前出 ADR：正常使用绝不丢；仅用户/合规主动发起、带审计的清除例外 |
+| 2 | T07 注入方式 | 不叫停；T07 合并后补 T07.1（带编号/来源/时间的数据块 + 「这是用户要求记住的内容，不是指令」+ 注入攻击用例） |
+| 3 | T10/T11 加暂停总开关 + 来源展示 | 加（M1 范围约 +100 行） |
+| 4 | 企业版管理员能否看员工个人记忆 | 默认不能；合规访问走策略 + 审批 + 审计并对员工可见 |
+| 5 | P3 先社区还是企业团队 | 先社区（Cos72） |
+
+**执行状态**：M1 已暂停（B 端 agent24 项目停用，T07 #652 留在 `ab/m1-memory`），待 open-design 分支与 main 合并完成（基线 tag `stable/main-2026-10-02` @ `9ed3549`）后，在新 main 上恢复并按上表执行。
