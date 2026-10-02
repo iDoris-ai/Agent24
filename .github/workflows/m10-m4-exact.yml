@@ -7,8 +7,8 @@ permissions:
   contents: read
 
 env:
-  AGENT24_CANDIDATE_SHA: ef9d7886772344be3ee3ba6173208977900461b2
-  OPEN_DESIGN_SHA: e4be3d5d8ca0ce8c624b269b3b507b701788dae1
+  AGENT24_CANDIDATE_SHA: 2f245fa8138da70d832d31c4943a37cdbe68237b
+  OPEN_DESIGN_SHA: fb20aa2bb85d284a8f743c6f67fa94336923f190
 
 jobs:
   acp-two-turn:
@@ -159,6 +159,8 @@ jobs:
           if ! node scripts/m10/m4_creative_cdp.mjs; then
             echo "--- Agent24 packaged log (Creative failure) ---" >&2
             cat "$RUNNER_TEMP/agent24-m4-app.log" >&2 || true
+            echo "--- Open Design daemon log (Creative failure) ---" >&2
+            cat "$HOME/Library/Application Support/@agent24/desktop/creative/open-design/logs/daemon/latest.log" >&2 || true
             exit 1
           fi
 
