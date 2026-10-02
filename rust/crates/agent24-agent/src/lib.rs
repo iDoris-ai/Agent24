@@ -30,10 +30,10 @@ use agent24_memory::session::Summarizer;
 use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
 use agent24_protocol::{
-    Approval, ApprovalStatus, Decision, ErrorBody, EventBody, ModelDeltaPayload, RiskClass, Run,
-    RunCancelledPayload, RunCompletedPayload, RunCreate, RunFailedPayload, RunInput, RunMode,
-    RunOutputPayload, RunStartedPayload, RunStatus, ToolCall, ToolCallStatus, ToolCompletedPayload,
-    ToolCompletedStatus, ToolStartedPayload, Usage,
+    Approval, ApprovalStatus, Decision, ErrorBody, EventBody, MemoryRecalledPayload,
+    ModelDeltaPayload, RiskClass, Run, RunCancelledPayload, RunCompletedPayload, RunCreate,
+    RunFailedPayload, RunInput, RunMode, RunOutputPayload, RunStartedPayload, RunStatus, ToolCall,
+    ToolCallStatus, ToolCompletedPayload, ToolCompletedStatus, ToolStartedPayload, Usage,
 };
 use agent24_store::{RunMessage, RunPatch, Store, StoreError};
 use agent24_tools::{
@@ -862,6 +862,28 @@ impl RunManager {
             schedule_id: run.schedule_id.clone(),
         }));
 
+        // Assertion recall is fresh-run context. Keep the audit ids tied to the
+        // exact facts that made it into this message; a recall failure must not
+        // prevent an otherwise valid run from reaching its provider.
+        let recall = if let Some(memory) = self.memory.as_ref() {
+            let load = memory.recall(&run.input.prompt);
+            tokio::select! {
+                result = load => match result {
+                    Ok(recall) => recall,
+                    Err(err) => {
+                        tracing::warn!(run_id = %run_id, error = %err, "memory recall failed");
+                        None
+                    }
+                },
+                () = cancel.cancelled() => {
+                    self.finish_cancelled(&run_id).await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // D1: a session's prior (compacted) context precedes this turn, so a
         // session actually remembers. Empty when memory is off or session-less.
         // A cancel while waiting on a concurrent run's session lock ends the run
@@ -873,7 +895,17 @@ impl RunManager {
             self.finish_cancelled(&run_id).await;
             return;
         };
-        let mut messages = prior_context;
+        let mut messages = Vec::with_capacity(prior_context.len() + 2);
+        if let Some((recalled, ids)) = recall {
+            tracing::info!(run_id = %run_id, ids = ?ids, "memory recalled");
+            self.sink
+                .emit(EventBody::MemoryRecalled(MemoryRecalledPayload {
+                    run_id: run_id.clone(),
+                    ids,
+                }));
+            messages.push(recalled);
+        }
+        messages.extend(prior_context);
         // Persist this run's opening user turn to the durable thread (H3). Prior
         // (compacted) context stays in session memory and is reloaded from there
         // on resume, so only the per-run tail is recorded here.

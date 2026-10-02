@@ -15,6 +15,10 @@ use tokio::sync::Notify;
 
 const RECENT_HARD_CEILING_FACTOR: usize = 4;
 const SCAN_PAGE: i64 = 500;
+const DEFAULT_RECALL_BUDGET: usize = 512;
+pub(crate) const DEFAULT_RECALL_TOP_K: usize = 5;
+const RECALL_MESSAGE_FRAMING_BYTES: usize = 4;
+const RECALL_PREFIX: &str = "你记得关于用户的这些事：";
 
 /// Append-only session memory. Callers inject the personal partition key with
 /// `with_owner`; the daemon catalogue wiring belongs to M1-T05. Legacy blobs
@@ -25,6 +29,7 @@ pub struct SessionMemory {
     owner: String,
     summarizer: Arc<dyn Summarizer>,
     policy: CompactionPolicy,
+    recall_budget: usize,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     #[cfg(test)]
     commit_probe: Option<Arc<CommitAcknowledgementProbe>>,
@@ -49,6 +54,7 @@ impl SessionMemory {
             owner: String::new(),
             summarizer,
             policy: CompactionPolicy::default(),
+            recall_budget: DEFAULT_RECALL_BUDGET,
             locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             commit_probe: None,
@@ -77,6 +83,60 @@ impl SessionMemory {
     pub fn with_policy(mut self, policy: CompactionPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Sets the estimated token budget for recalled facts. UTF-8 bytes plus
+    /// framing are used as a conservative estimate, not an exact tokenizer.
+    #[must_use]
+    pub fn with_recall_budget(mut self, budget: usize) -> Self {
+        self.recall_budget = budget;
+        self
+    }
+
+    /// Search only this instance's personal owner partition and render the
+    /// highest-ranked complete facts that fit. UTF-8 bytes plus a small fixed
+    /// framing allowance is a conservative estimate, not an exact tokenizer.
+    pub(crate) async fn recall(
+        &self,
+        prompt: &str,
+    ) -> agent24_memory::Result<Option<(Msg, Vec<String>)>> {
+        self.check_owner()?;
+        if self.recall_budget == 0 {
+            return Ok(None);
+        }
+
+        let hits = self
+            .kv
+            .retriever()
+            .search_any(prompt, &self.owner, DEFAULT_RECALL_TOP_K)
+            .await?;
+        let mut content = String::from(RECALL_PREFIX);
+        let mut used = content.len().saturating_add(RECALL_MESSAGE_FRAMING_BYTES);
+        if used > self.recall_budget {
+            return Ok(None);
+        }
+        let mut ids = Vec::new();
+        for hit in hits {
+            let fact = hit
+                .assertion
+                .object
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| hit.assertion.object.to_string());
+            let line = format!("\n- {fact}");
+            let line_cost = line.len();
+            if used.saturating_add(line_cost) > self.recall_budget {
+                continue;
+            }
+            content.push_str(&line);
+            used = used.saturating_add(line_cost);
+            ids.push(hit.assertion.id.to_string());
+        }
+        if ids.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((Msg::system(content), ids)))
+        }
     }
 
     pub(crate) async fn session_lock(&self, sid: &str) -> Arc<Mutex<()>> {

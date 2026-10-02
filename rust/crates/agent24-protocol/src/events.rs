@@ -50,6 +50,8 @@ pub enum EventBody {
     RunCompleted(RunCompletedPayload),
     #[serde(rename = "memory.write_failed")]
     MemoryWriteFailed(MemoryWriteFailedPayload),
+    #[serde(rename = "memory.recalled")]
+    MemoryRecalled(MemoryRecalledPayload),
     #[serde(rename = "run.failed")]
     RunFailed(RunFailedPayload),
     #[serde(rename = "run.cancelled")]
@@ -119,6 +121,7 @@ impl EventBody {
             EventBody::RunCompleted(_) => "run.completed",
             EventBody::RunFailed(_) => "run.failed",
             EventBody::MemoryWriteFailed(_) => "memory.write_failed",
+            EventBody::MemoryRecalled(_) => "memory.recalled",
             EventBody::RunCancelled(_) => "run.cancelled",
             EventBody::ToolStarted(_) => "tool.started",
             EventBody::ToolCompleted(_) => "tool.completed",
@@ -214,6 +217,13 @@ pub struct RunOutputPayload {
 pub struct MemoryWriteFailedPayload {
     pub session_id: String,
     pub reason: String,
+}
+
+/// Assertion ids that were actually included in a run's recalled context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryRecalledPayload {
+    pub run_id: String,
+    pub ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

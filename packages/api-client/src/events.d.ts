@@ -43,6 +43,11 @@ export type Agent24V1WebSocketEventProtocol = {
       [k: string]: unknown;
     }
   | {
+      payload: MemoryRecalledPayload;
+      type: "memory.recalled";
+      [k: string]: unknown;
+    }
+  | {
       payload: RunFailedPayload;
       type: "run.failed";
       [k: string]: unknown;
@@ -214,6 +219,14 @@ export interface Usage {
 export interface MemoryWriteFailedPayload {
   reason: string;
   session_id: string;
+  [k: string]: unknown;
+}
+/**
+ * Assertion ids that were actually included in a run's recalled context.
+ */
+export interface MemoryRecalledPayload {
+  ids: string[];
+  run_id: string;
   [k: string]: unknown;
 }
 export interface RunFailedPayload {
