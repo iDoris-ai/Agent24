@@ -131,7 +131,7 @@ async fn repeating_a_withdrawn_remember_is_observable_and_does_not_revive_it() {
         .await
         .unwrap();
     let provider = Arc::new(Provider::default());
-    let state = app(kv.clone(), dir.path(), provider).await;
+    let state = app(kv.clone(), dir.path(), provider.clone()).await;
     let owner = personal_owner(&kv).await;
     let mut events = state.events.subscribe();
 
@@ -190,6 +190,22 @@ async fn repeating_a_withdrawn_remember_is_observable_and_does_not_revive_it() {
         memory_write_failed,
         "withdrawn duplicate must be observable"
     );
+    let messages = kv
+        .events()
+        .scan(&EventQuery::owner(&owner).session(SESSION))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event.kind == "message")
+        .count();
+    assert_eq!(messages, 4, "both turns must remain in the event log");
+    assert_eq!(
+        *provider.summaries.lock().unwrap(),
+        1,
+        "the retry turn must still run healthy compaction after Retain fails"
+    );
+    let view = kv.session_log().load_view(&owner, SESSION).await.unwrap();
+    assert_eq!(view.summary.as_deref(), Some("summary-1"));
 }
 
 #[tokio::test]

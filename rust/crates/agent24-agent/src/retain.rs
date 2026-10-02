@@ -30,7 +30,14 @@ pub(super) async fn persist(
     owner: &str,
     object: &str,
     evidence: EventId,
+    origin: Origin,
 ) -> agent24_memory::Result<()> {
+    // Only a direct user run can authorize a qualified personal assertion.
+    // Validate the propagated origin here so future callers cannot
+    // accidentally turn model or scheduled content into user memory.
+    if origin.trust != Trust::UserSaid {
+        return Ok(());
+    }
     let id = checksum(&format!("{owner}{object}"));
     let candidate = Candidate::new(
         id,
@@ -38,10 +45,7 @@ pub(super) async fn persist(
         "user",
         "said_to_remember",
         json!(object),
-        Origin {
-            source: "explicit_remember".into(),
-            trust: Trust::UserSaid,
-        },
+        origin,
     )
     .with_evidence(vec![evidence])
     .remember();
@@ -52,7 +56,15 @@ pub(super) async fn persist(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::explicit_remember;
+    use super::persist;
+    use agent24_memory::event::{Origin, Trust};
+    use agent24_memory::{
+        KvStore,
+        assertion::{AssertionStore, BeliefQuery},
+    };
 
     #[test]
     fn recognizes_only_the_supported_leading_forms() {
@@ -76,5 +88,29 @@ mod tests {
         for (prompt, expected) in cases {
             assert_eq!(explicit_remember(prompt), expected, "prompt: {prompt:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn model_origin_cannot_persist_a_qualified_remember_assertion() {
+        let kv = KvStore::open_memory().await.unwrap();
+        persist(
+            &kv,
+            "owner",
+            "I am allergic to peanuts",
+            "event-1".into(),
+            Origin {
+                source: "scheduler".into(),
+                trust: Trust::Model,
+            },
+        )
+        .await
+        .unwrap();
+
+        let beliefs = kv
+            .assertions()
+            .beliefs_as_of(&BeliefQuery::owner("owner"))
+            .await
+            .unwrap();
+        assert!(beliefs.is_empty());
     }
 }

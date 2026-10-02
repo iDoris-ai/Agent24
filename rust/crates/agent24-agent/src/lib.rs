@@ -25,6 +25,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use agent24_core::util::{now_iso8601, ulid};
+use agent24_memory::event::{Origin, Trust};
 use agent24_memory::session::Summarizer;
 use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
@@ -84,6 +85,23 @@ const MEMORY_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// has likely moved on — so `assess_restore` aborts it. Generous: an overnight
 /// scheduled run must still be answerable the next morning.
 pub const RESUME_TTL: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
+
+/// Derive prompt provenance only from durable run metadata. Scheduled runs are
+/// conservative: self-wake prompts ultimately originate in model output and
+/// cannot authorize qualified personal memory.
+fn run_prompt_origin(run: &Run) -> Origin {
+    if run.schedule_id.is_some() {
+        Origin {
+            source: "scheduler".into(),
+            trust: Trust::Model,
+        }
+    } else {
+        Origin {
+            source: "agent_loop".into(),
+            trust: Trust::UserSaid,
+        }
+    }
+}
 
 /// A [`Summarizer`] backed by the model router.
 ///
@@ -326,11 +344,17 @@ impl RunManager {
 
     /// Commit the original exchange before best-effort compaction. Memory
     /// failures are observable but never fail an already-answered run.
-    async fn remember_exchange(&self, session_id: Option<&str>, prompt: &str, answer: &str) {
+    async fn remember_exchange(
+        &self,
+        session_id: Option<&str>,
+        prompt: &str,
+        answer: &str,
+        prompt_origin: Origin,
+    ) {
         let (Some(memory), Some(sid)) = (self.memory.as_ref(), session_id) else {
             return;
         };
-        if let Err(err) = memory.remember(sid, prompt, answer).await {
+        if let Err(err) = memory.remember(sid, prompt, answer, prompt_origin).await {
             let reason = err.to_string();
             tracing::error!(session_id = sid, %reason, "session memory write failed");
             self.sink.emit(EventBody::MemoryWriteFailed(
@@ -947,7 +971,12 @@ impl RunManager {
                 // after append starts, SessionMemory's detached transaction task
                 // keeps the session lock until SQLx confirms the append outcome.
                 tokio::select! {
-                    () = self.remember_exchange(run.session_id.as_deref(), &run.input.prompt, &text) => {},
+                    () = self.remember_exchange(
+                        run.session_id.as_deref(),
+                        &run.input.prompt,
+                        &text,
+                        run_prompt_origin(&run),
+                    ) => {},
                     () = cancel.cancelled() => {
                         self.finish_cancelled(&run_id).await;
                         return;
@@ -1851,8 +1880,16 @@ pub(crate) mod tests {
         for i in 0..WRITERS {
             let m = Arc::clone(&manager);
             tasks.push(tokio::spawn(async move {
-                m.remember_exchange(Some("sess_many"), &format!("q{i}"), &format!("a{i}"))
-                    .await;
+                m.remember_exchange(
+                    Some("sess_many"),
+                    &format!("q{i}"),
+                    &format!("a{i}"),
+                    Origin {
+                        source: "agent_loop".into(),
+                        trust: Trust::UserSaid,
+                    },
+                )
+                .await;
             }));
         }
         for t in tasks {
