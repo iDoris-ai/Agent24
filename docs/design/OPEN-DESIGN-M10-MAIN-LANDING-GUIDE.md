@@ -10,7 +10,8 @@ The strategy document defines *why* Agent24 uses separate integration and
 main-landing tracks. For the current M10 closeout, the operator-selected merge
 procedure is:
 
-1. merge the latest `main` **into** the Open Design integration branch first;
+1. merge the operator-selected exact stable `main` point **into** the Open
+   Design integration branch first;
 2. resolve and validate all conflicts on the integration side;
 3. prove that the resulting integration candidate contains the exact latest
    `main` as an ancestor;
@@ -26,8 +27,9 @@ M10 is **not complete** when one prototype PR reaches `main`.
 
 M10 is complete only when all of the following are true:
 
-1. the integration candidate has absorbed the latest `main` and all merge
-   conflicts are resolved and reviewed on the integration side;
+1. the integration candidate has absorbed the operator-selected exact `main`
+   point and all merge conflicts are resolved and reviewed on the integration
+   side;
 2. the M4 packaged E2E path is re-proven against the candidate plus the pinned
    Open Design fork;
 3. the required capability/workspace/runtime and M5-M9 reviewed product slices
@@ -203,10 +205,12 @@ old local worktree in #643.
 
 Source slice: embedded Creative `WebContentsView`.
 
-Current landing PR: #651. Exact-head landing review found two historical
-lifecycle races around delayed first startup / replacement startup; the current
-landing carries the narrow generation fence + ready-origin bounds guard derived
-from later reviewed #616 rather than pulling the rest of #616 forward.
+Historical landing PR: #651. Exact-head landing review found two historical
+lifecycle races around delayed first startup / replacement startup; that
+landing carried the narrow generation fence + ready-origin bounds guard derived
+from later reviewed #616 rather than pulling the rest of #616 forward. For the
+final M10 handoff, #651 is superseded by the validated integration candidate;
+keep this subsection only as a repair/reconstruction reference.
 
 Use the **historical PR net patch**, not only commit `5209c77`.
 The historical slice contains propagated ancestry; cherry-picking only its final
@@ -254,8 +258,12 @@ actually exists in `main`.
 
 ## 6. Phase B — rerun the M4 packaged E2E gate
 
-After the #563/#564/#565 landing equivalents are all green in `main`, prove
-the real product path again using the pinned Open Design fork revision:
+For the historical incremental-conveyor route, this gate followed the
+#563/#564/#565 landing equivalents. For the operator-selected final M10 route,
+prove the real product path against the **final validated integration
+candidate** before the main operator attempts the merge, then repeat the
+release-critical validation on the temporary post-merge candidate. In both
+cases use the pinned Open Design fork revision:
 
 The Open Design compatibility contract is version `0.22.2`, but the integration
 tracking branch `integration/agent24-open-design-v0.22.2` is mutable. Do **not**
