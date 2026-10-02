@@ -156,7 +156,11 @@ jobs:
           test -s "$RUNNER_TEMP/cdp.json"
           cat "$RUNNER_TEMP/cdp.json"
 
-          node scripts/m10/m4_creative_cdp.mjs
+          if ! node scripts/m10/m4_creative_cdp.mjs; then
+            echo "--- Agent24 packaged log (Creative failure) ---" >&2
+            cat "$RUNNER_TEMP/agent24-m4-app.log" >&2 || true
+            exit 1
+          fi
 
           STATE="$HOME/.agent24/daemon.json"
           test -f "$STATE"

@@ -42,11 +42,14 @@ const shell = targets.find((target) =>
 )
 if (!shell) throw new Error('Agent24 shell target not found: ' + JSON.stringify(targets))
 
-const clicked = await evaluate(
+const showResultJson = await evaluate(
   shell,
-  "(() => { const nodes = [...document.querySelectorAll('button, [role=button], a')]; const node = nodes.find(el => (el.textContent || '').trim().includes('Creative')); if (!node) return false; node.click(); return true })()",
+  "JSON.stringify(await window.agent24.creativeShow({ x: 24, y: 96, width: 900, height: 640 }))",
 )
-if (!clicked) throw new Error('Creative navigation control not found')
+const showResult = JSON.parse(showResultJson)
+if (!showResult?.ok) {
+  throw new Error('Creative show failed: ' + JSON.stringify(showResult))
+}
 
 let creative
 for (let attempt = 0; attempt < 120; attempt += 1) {
@@ -72,6 +75,7 @@ if (!['interactive', 'complete'].includes(documentState)) {
 }
 
 console.log(JSON.stringify({
+  showResult,
   creativeUrl: creative.url,
   origin,
   readyBody,
