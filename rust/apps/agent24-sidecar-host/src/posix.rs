@@ -742,6 +742,23 @@ pub(crate) mod tests {
         }
     }
 
+    fn force_kill_eventually(generation: &mut OwnedGeneration) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match generation.force_kill() {
+                Ok(()) => return,
+                Err(error)
+                    if cfg!(target_os = "macos")
+                        && error.kind() == io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(EXIT_POLL);
+                }
+                Err(error) => panic!("force kill was not accepted: {error}"),
+            }
+        }
+    }
+
     fn sleeping_generation() -> OwnedGeneration {
         match OwnedGeneration::launch(LaunchSpec::new("/bin/sh", "/").arg("-c").arg("sleep 30")) {
             Ok(generation) => generation,
@@ -814,7 +831,7 @@ pub(crate) mod tests {
         assert!(generation.reap_after_stop().is_err());
         assert!(generation.terminate().is_ok());
         assert!(generation.reap_after_stop().is_err());
-        assert!(generation.force_kill().is_ok());
+        force_kill_eventually(&mut generation);
         let status = match generation.reap_after_stop() {
             Ok(status) => status,
             Err(error) => panic!("reap leader: {error}"),
@@ -890,20 +907,7 @@ pub(crate) mod tests {
         let mut generation = sleeping_generation();
         assert!(generation.terminate().is_ok());
         assert!(generation.terminate().is_ok());
-        let force_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            match generation.force_kill() {
-                Ok(()) => break,
-                Err(error)
-                    if cfg!(target_os = "macos")
-                        && error.kind() == io::ErrorKind::WouldBlock
-                        && Instant::now() < force_deadline =>
-                {
-                    thread::sleep(EXIT_POLL);
-                }
-                Err(error) => panic!("force kill was not accepted: {error}"),
-            }
-        }
+        force_kill_eventually(&mut generation);
         assert!(generation.force_kill().is_ok());
         // A force-kill request is terminal for signalling; terminate must not
         // regress it or send SIGTERM after SIGKILL.
