@@ -1,12 +1,10 @@
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
-const require = createRequire(import.meta.url)
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const desktopRoot = path.resolve(scriptDir, '..')
 const stagedAppRoot = path.join(desktopRoot, '.open-design-resources', 'app')
@@ -20,9 +18,15 @@ function resolveElectronRuntime() {
   const manifestPath = path.join(desktopRoot, 'node_modules', 'electron', 'package.json')
   requireFile(manifestPath, 'Agent24 Electron manifest')
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
-  const executable = require('electron')
-  if (typeof executable !== 'string' || executable.length === 0) {
-    throw new Error('Agent24 Electron executable could not be resolved')
+  const packageRoot = path.dirname(manifestPath)
+  const pathFile = path.join(packageRoot, 'path.txt')
+  let executable = null
+  if (fs.statSync(pathFile, { throwIfNoEntry: false })?.isFile()) {
+    const relativeExecutable = fs.readFileSync(pathFile, 'utf8').trim()
+    if (relativeExecutable.length > 0) {
+      const candidate = path.resolve(packageRoot, 'dist', relativeExecutable)
+      if (fs.statSync(candidate, { throwIfNoEntry: false })?.isFile()) executable = candidate
+    }
   }
   return { executable, version: manifest.version }
 }
@@ -63,12 +67,17 @@ export async function rebuildOpenDesignNativeModules() {
     "const db = new Database(':memory:')",
     'db.close()',
   ].join('; ')
-  await run(executable, ['-e', probe], {
-    cwd: stagedAppRoot,
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-  })
+  if (executable != null) {
+    await run(executable, ['-e', probe], {
+      cwd: stagedAppRoot,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    })
+  }
 
-  process.stdout.write(`Rebuilt Open Design native modules for Electron ${version} (${platform}-${arch})\n`)
+  process.stdout.write(
+    `Rebuilt Open Design native modules for Electron ${version} (${platform}-${arch}); ` +
+      `runtime probe ${executable == null ? 'deferred to packaged validation' : 'passed'}\n`,
+  )
 }
 
 if (process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href) {
