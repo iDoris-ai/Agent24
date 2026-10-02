@@ -44,6 +44,11 @@ export async function rebuildOpenDesignNativeModules() {
   const sqliteManifest = path.join(stagedAppRoot, 'node_modules', 'better-sqlite3', 'package.json')
   requireFile(packagePath, 'staged Open Design package manifest')
   requireFile(sqliteManifest, 'staged Open Design better-sqlite3 manifest')
+  const sqliteRoot = path.dirname(sqliteManifest)
+  const sqlitePackage = JSON.parse(fs.readFileSync(sqliteManifest, 'utf8'))
+  if (sqlitePackage.scripts?.['build-release'] !== 'node-gyp rebuild --release') {
+    throw new Error('staged Open Design better-sqlite3 build-release contract changed')
+  }
 
   const { executable, version } = resolveElectronRuntime()
   const arch = process.env.A24_ELECTRON_ARCH?.trim() || process.arch
@@ -60,12 +65,12 @@ export async function rebuildOpenDesignNativeModules() {
   }
 
   if (process.platform === 'win32') {
-    await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', 'rebuild', 'better-sqlite3'], {
-      cwd: stagedAppRoot,
+    await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', 'run', 'build-release'], {
+      cwd: sqliteRoot,
       env: rebuildEnv,
     })
   } else {
-    await run('npm', ['rebuild', 'better-sqlite3'], { cwd: stagedAppRoot, env: rebuildEnv })
+    await run('npm', ['run', 'build-release'], { cwd: sqliteRoot, env: rebuildEnv })
   }
 
   const probe = [
