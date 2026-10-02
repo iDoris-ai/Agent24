@@ -55,7 +55,8 @@ export async function rebuildOpenDesignNativeModules() {
     npm_config_build_from_source: 'true',
   }
 
-  await run('npm', ['rebuild', 'better-sqlite3'], { cwd: stagedAppRoot, env: rebuildEnv })
+  const npmExecutable = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+  await run(npmExecutable, ['rebuild', 'better-sqlite3'], { cwd: stagedAppRoot, env: rebuildEnv })
 
   const probe = [
     "const Database = require('better-sqlite3')",
