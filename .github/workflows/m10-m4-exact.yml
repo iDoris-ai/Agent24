@@ -87,7 +87,7 @@ jobs:
           (
             cd open-design
             pnpm install --frozen-lockfile
-            if ! pnpm --silent --filter @open-design/tools-pack dev -- mac build --to app --portable --namespace agent24-m10-m4 --dir "$RUNNER_TEMP/open-design-pack" --json > "$RUNNER_TEMP/open-design-pack.json" 2> "$RUNNER_TEMP/open-design-pack.stderr"; then
+            if ! pnpm --silent exec tsx tools/pack/src/index.ts mac build --to app --portable --namespace agent24-m10-m4 --dir "$RUNNER_TEMP/open-design-pack" --json > "$RUNNER_TEMP/open-design-pack.json" 2> "$RUNNER_TEMP/open-design-pack.stderr"; then
               cat "$RUNNER_TEMP/open-design-pack.json" || true
               cat "$RUNNER_TEMP/open-design-pack.stderr" >&2 || true
               exit 1
