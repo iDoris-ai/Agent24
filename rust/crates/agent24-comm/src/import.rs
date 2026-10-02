@@ -307,6 +307,7 @@ async fn run_import(
                 "source_changed: the source .hyphae directory changed while it was being \
                  imported; nothing was committed, try again once nothing else is using it"
                     .to_owned(),
+                None,
             ));
         }
     }
@@ -548,9 +549,10 @@ async fn ensure_target_empty(home: &Path) -> Result<(), CommError> {
                 .map_err(|e| CommError::Upstream(format!("reading {target:?}: {e}")))?
                 .is_some();
             if has_entry {
-                return Err(CommError::Conflict(format!(
-                    "{target:?} already exists and is not empty"
-                )));
+                return Err(CommError::Conflict(
+                    format!("{target:?} already exists and is not empty"),
+                    None,
+                ));
             }
             Ok(())
         }
@@ -701,10 +703,13 @@ async fn try_lock_outbox(lock_path: PathBuf) -> Result<OwnedFd, CommError> {
             // `WOULDBLOCK` and `AGAIN` are the same errno value on every
             // platform this crate targets (macOS, Linux) — matching only one
             // avoids an unreachable-pattern warning.
-            Err(rustix::io::Errno::WOULDBLOCK) => Err(CommError::Conflict(format!(
-                "source_in_use: {lock_path:?} is already locked by another process; stop \
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(CommError::Conflict(
+                format!(
+                    "source_in_use: {lock_path:?} is already locked by another process; stop \
                      using that hyphae HOME before importing it"
-            ))),
+                ),
+                None,
+            )),
             Err(e) => Err(CommError::Upstream(format!("flock {lock_path:?}: {e}"))),
         }
     })
@@ -746,10 +751,13 @@ async fn try_lock_daemon(source_hyphae: &Path) -> Result<Option<std::fs::File>, 
         let lock_path = source_hyphae.join("daemon.lock");
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(Some(file)),
-            Err(rustix::io::Errno::WOULDBLOCK) => Err(CommError::Conflict(format!(
-                "source_in_use: {lock_path:?} is held — a hyphae daemon appears to still be \
-                 running against this HOME; stop it before importing"
-            ))),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(CommError::Conflict(
+                format!(
+                    "source_in_use: {lock_path:?} is held — a hyphae daemon appears to still be \
+                     running against this HOME; stop it before importing"
+                ),
+                None,
+            )),
             Err(e) => Err(CommError::Upstream(format!("flock {lock_path:?}: {e}"))),
         }
     })
@@ -1361,7 +1369,7 @@ esac
         .await
         .unwrap_err();
         assert!(
-            matches!(err, CommError::Conflict(ref m) if m.contains("source_in_use")),
+            matches!(err, CommError::Conflict(ref m, _) if m.contains("source_in_use")),
             "{err:?}"
         );
         drop(held);
@@ -1398,7 +1406,7 @@ esac
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, CommError::Conflict(_)), "{err:?}");
+        assert!(matches!(err, CommError::Conflict(..)), "{err:?}");
     }
 
     // ---- a stale leftover staging dir (crashed previous import) must ------
@@ -1798,7 +1806,7 @@ esac
         let err = result.unwrap_err();
 
         assert!(
-            matches!(err, CommError::Conflict(ref m) if m.contains("source_changed")),
+            matches!(err, CommError::Conflict(ref m, _) if m.contains("source_changed")),
             "{err:?}"
         );
         assert!(
@@ -2012,7 +2020,7 @@ esac
         .await
         .unwrap_err();
         assert!(
-            matches!(err, CommError::Conflict(ref m) if m.contains("source_in_use")),
+            matches!(err, CommError::Conflict(ref m, _) if m.contains("source_in_use")),
             "{err:?}"
         );
         drop(held);

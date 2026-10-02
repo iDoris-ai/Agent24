@@ -37,15 +37,18 @@ pub enum CommError {
     #[error("invalid: {0}")]
     Invalid(String),
     #[error("not_found: {0}")]
-    #[allow(
-        dead_code,
-        reason = "no COMM-2a route looks an id up before acting (that is COMM-2b/3's import/outbox work); kept so this closed set matches §4 exactly"
-    )]
     NotFound(String),
     #[error("confirm_required")]
     ConfirmRequired,
+    /// `data` is kept alongside the message because a real `write_conflict`
+    /// from `storage outbox retry` carries a result shape of its own (e.g.
+    /// `{"sent":true,"superseded":true,...}`, see
+    /// `internal/messaging/outbox_commands.go`'s `outboxRetryResult`) that a
+    /// caller needs exactly as much as `partial`'s data — losing it here
+    /// would also lose the `with_event_id`-injected `event_id` that
+    /// `retry_outbox` already wrote into it before this ever runs.
     #[error("conflict: {0}")]
-    Conflict(String),
+    Conflict(String, Option<Value>),
     #[error("network: {0}")]
     Network(String),
     #[error("partial: {0}")]
@@ -83,7 +86,9 @@ impl CommError {
                 "this operation requires confirm:true".to_owned(),
                 None,
             ),
-            CommError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone(), None),
+            CommError::Conflict(m, data) => {
+                (StatusCode::CONFLICT, "conflict", m.clone(), data.clone())
+            }
             CommError::Network(m) => (StatusCode::BAD_GATEWAY, "network", m.clone(), None),
             CommError::Partial(data) => (
                 StatusCode::BAD_GATEWAY,
@@ -126,7 +131,7 @@ pub fn map_envelope_failure(error: &str, message: &str, data: Option<Value>) -> 
     match error {
         "auth_error" => return CommError::Locked(message.to_owned()),
         "user_error" => return CommError::Invalid(message.to_owned()),
-        "write_conflict" => return CommError::Conflict(message.to_owned()),
+        "write_conflict" => return CommError::Conflict(message.to_owned(), data),
         _ => {}
     }
     if let Some(data) = data {
@@ -197,7 +202,19 @@ mod tests {
     #[test]
     fn write_conflict_is_conflict() {
         let err = map_envelope_failure("write_conflict", "raced", None);
-        assert!(matches!(err, CommError::Conflict(_)));
+        assert!(matches!(err, CommError::Conflict(..)));
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：真实 Hyphae 的 `write_conflict`
+    /// 带着结果 data（例如 retry 在并发 clear 下返回的
+    /// `{"sent":true,"superseded":true,"event_id":"e2"}`，见
+    /// `internal/messaging/outbox_commands.go`），不该被当作「conflict 这类
+    /// 错误名不带 data」一概丢弃——`partial` 原样透传 data，`conflict` 也要。
+    #[test]
+    fn write_conflict_keeps_its_data() {
+        let data = json!({"sent": true, "superseded": true, "event_id": "e2"});
+        let err = map_envelope_failure("write_conflict", "raced", Some(data.clone()));
+        assert!(matches!(err, CommError::Conflict(_, Some(d)) if d == data));
     }
 
     #[test]
@@ -229,7 +246,7 @@ mod tests {
             (CommError::Invalid("x".into()), 400),
             (CommError::NotFound("x".into()), 404),
             (CommError::ConfirmRequired, 400),
-            (CommError::Conflict("x".into()), 409),
+            (CommError::Conflict("x".into(), None), 409),
             (CommError::Network("x".into()), 502),
             (CommError::Partial(json!({})), 502),
             (CommError::Timeout, 504),

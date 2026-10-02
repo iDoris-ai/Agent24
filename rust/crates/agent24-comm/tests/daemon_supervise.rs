@@ -231,6 +231,25 @@ async fn wait_until<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
     }
 }
 
+/// Same shape as [`wait_until`], but for an async condition — PR #642
+/// review round 3, Low #1: `running` is published BEFORE the autostart
+/// file's write+rename that it triggers completes (`daemon.rs`'s ready-timer
+/// branch sets the status, then only afterwards awaits
+/// `write_autostart`), so a caller must not treat having seen `running` as
+/// a barrier for that write having landed on disk.
+async fn wait_until_autostart_is(path: &Path, expected: bool, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if agent24_comm::read_autostart(path).await == expected {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn kill_minus_9(pid: u32) {
     let _ = std::process::Command::new("kill")
         .args(["-9", &pid.to_string()])
@@ -805,8 +824,12 @@ async fn manual_start_persists_autostart_true_and_stop_persists_false() {
     // `manual_start_that_fails_before_running_does_not_persist_autostart`
     // for the case where it never gets there.
     assert!(wait_until(|| sup.status().state == "running", Duration::from_secs(2)).await);
+    // PR #642 review round 3, Low #1: `running` is published and THEN the
+    // write+rename it triggers is awaited — seeing `running` is not a
+    // barrier for that write having actually landed, so this must be a
+    // bounded wait on the file itself, not a single read right after.
     assert!(
-        agent24_comm::read_autostart(&autostart_path).await,
+        wait_until_autostart_is(&autostart_path, true, Duration::from_secs(2)).await,
         "a successful manual start must persist autostart=true (COMM-HYPHAE.md §6.2)"
     );
 
@@ -957,5 +980,113 @@ async fn shutdown_preempts_an_in_flight_config_restart_and_forbids_a_new_spawn()
         first_generation,
         "the config-change restart must not have spawned a second generation after shutdown \
          began"
+    );
+}
+
+// ---------------------------------------------------------------------
+// PR #642 review round 3 (Codex challenge, B 端 gpt-6-astra)
+// ---------------------------------------------------------------------
+
+/// Wraps a [`MemoryPasswordStore`] but `get` blocks on `release` until the
+/// test signals it — the one controllable point inside `try_start`'s own
+/// await chain (identity/relay/password, every one of them BEFORE the real
+/// `spawn()`) that proves High #1: the three call sites that decide whether
+/// to spawn at all only ever checked `shutdown_deadline` BEFORE
+/// `spawn_and_record` was called, so a shutdown landing while this `get` is
+/// still pending used to be invisible to the spawn that resumes once it
+/// returns.
+struct BlockingPasswordStore {
+    inner: MemoryPasswordStore,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl PasswordStore for BlockingPasswordStore {
+    async fn get(&self, account: &Account) -> Result<Password, agent24_comm::StoreError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.inner.get(account).await
+    }
+
+    async fn put(
+        &self,
+        account: &Account,
+        password: &Password,
+    ) -> Result<(), agent24_comm::StoreError> {
+        self.inner.put(account, password).await
+    }
+
+    async fn delete(&self, account: &Account) -> Result<(), agent24_comm::StoreError> {
+        self.inner.delete(account).await
+    }
+}
+
+/// High #1: a shutdown that lands WHILE a start is still blocked inside one
+/// of `try_start`'s own precondition awaits (identity/relay/password — all
+/// before the real `spawn()`) must neither leave a process running nor ever
+/// report `running`, once the block is released and that spawn is free to
+/// resume.
+#[tokio::test]
+async fn shutdown_during_a_blocked_start_leaves_no_process_and_never_reports_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ctx = make_ctx(tmp.path()).await;
+    let pid_path = ctx.pid_path.clone();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let inner = MemoryPasswordStore::new();
+    inner
+        .put(
+            &Account::from_salt("dGVzdHNhbHQ="),
+            &Password::new(b"testpass".to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
+    ctx.password_store = Arc::new(BlockingPasswordStore {
+        inner,
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let sup = HyphaeDaemonSupervisor::spawn(ctx);
+
+    let sup_for_start = sup.clone();
+    let start = tokio::spawn(async move { sup_for_start.start().await });
+    // Wait until the start is genuinely blocked inside `try_start`'s own
+    // `password_store.get`, not merely "a `Start` command was sent".
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the blocked start never reached the password store");
+
+    // Shutdown lands WHILE the start is still blocked — exactly the window
+    // the three call sites' own pre-checks (all evaluated before
+    // `spawn_and_record` was ever invoked) could not see.
+    let sup_for_shutdown = sup.clone();
+    let shutdown = tokio::spawn(async move {
+        sup_for_shutdown
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    // `shutdown()` records its deadline synchronously before its first
+    // `.await`, but the task still has to actually get scheduled — give it
+    // a comfortable moment before releasing the block.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.notify_one();
+
+    let start_result = start.await.unwrap();
+    assert!(
+        start_result.is_err(),
+        "a start that raced a shutdown to completion must not report success"
+    );
+    let _ = shutdown.await.unwrap();
+
+    // Give any cleanup the discarded spawn kicked off a moment to finish.
+    assert!(
+        wait_until(|| sup.status().state != "running", Duration::from_secs(2)).await,
+        "a spawn that lost the race with shutdown must never be promoted to `running`"
+    );
+    assert!(
+        !pid_path.exists(),
+        "a spawn that lost the race with shutdown must never be recorded in the pid file"
     );
 }
