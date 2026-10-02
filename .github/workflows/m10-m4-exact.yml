@@ -75,7 +75,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
-          node-version: '22'
+          node-version: '24'
           package-manager-cache: false
 
       - name: Build exact Open Design packaged resource tree
@@ -87,8 +87,13 @@ jobs:
           (
             cd open-design
             pnpm install --frozen-lockfile
-            pnpm --silent --filter @open-design/tools-pack dev -- mac build --to app --portable --namespace agent24-m10-m4 --dir "$RUNNER_TEMP/open-design-pack" --json > "$RUNNER_TEMP/open-design-pack.json"
+            if ! pnpm --silent --filter @open-design/tools-pack dev -- mac build --to app --portable --namespace agent24-m10-m4 --dir "$RUNNER_TEMP/open-design-pack" --json > "$RUNNER_TEMP/open-design-pack.json" 2> "$RUNNER_TEMP/open-design-pack.stderr"; then
+              cat "$RUNNER_TEMP/open-design-pack.json" || true
+              cat "$RUNNER_TEMP/open-design-pack.stderr" >&2 || true
+              exit 1
+            fi
           )
+          cat "$RUNNER_TEMP/open-design-pack.stderr" >&2 || true
           cat "$RUNNER_TEMP/open-design-pack.json"
           APP_PATH="$(jq -r '.appPath' "$RUNNER_TEMP/open-design-pack.json")"
           RESOURCE_DIR="$APP_PATH/Contents/Resources"
