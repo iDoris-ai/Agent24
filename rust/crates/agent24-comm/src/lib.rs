@@ -35,9 +35,9 @@ pub mod runner;
 
 pub use binary::{BinaryError, HyphaeLock, Sha256Digest, VerifiedBinary, current_platform};
 pub use daemon::{
-    Ctx as DaemonCtx, DaemonShutdownOutcome, DaemonStartError, DaemonStatus,
-    HyphaeDaemonSupervisor, OrphanOutcome, READY_AFTER_DEFAULT, ShutdownLeader, read_autostart,
-    reap_orphan, stop_grace,
+    CatchUpStatus, Ctx as DaemonCtx, DaemonShutdownOutcome, DaemonStartError, DaemonStatus,
+    HyphaeDaemonSupervisor, OrphanOutcome, READY_AFTER_DEFAULT, RelayProbeStatus, ShutdownLeader,
+    read_autostart, reap_orphan, stop_grace,
 };
 pub use error::CommError;
 pub use import::{ImportReport, ImportRequest, import};
