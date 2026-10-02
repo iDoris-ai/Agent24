@@ -50,15 +50,15 @@ As of 2026-10-02:
 | Item | State | Exact checkpoint |
 | --- | --- | --- |
 | Main CI race baseline | merged | #647 -> `4f79adfd505f9196f2eb196efc54df4e9e59a330` |
-| #563 clean landing | active | #643 head `3006ca29e65e86b9b9e1ef0c93fc11837aa081e1` |
-| #564 clean landing | not opened yet | historical reviewed head `5209c7767a3234e6b4d4aefe63e4e840bb2be7ff` |
-| #565 clean landing | not opened yet | historical reviewed head `fe4ae95dffcf0096168289ba4189415f3693a54a` |
+| #563 clean landing | merged | #643 -> `0b88049d48fc1de7c1319cf9118e84a62584a659` |
+| #564 clean landing | active | #651 head `e55f920127d81b3d4ab0f9ea1a7cc81151eb9f09`, based on `main@af5862141d3d6a2658be7ea70f34ef43d055f430` |
+| #565 clean landing | preflight only | historical reviewed head `fe4ae95dffcf0096168289ba4189415f3693a54a`; rerun the probe after #651's final main refresh before opening the landing PR |
 | pre-#555 foundation inventory | complete | use F1-F6 below |
 | M5+ main landing | not started | must wait for required foundation |
 
-#643 was refreshed after #647 by a normal merge from current `main`. Its net
-feature diff remains exactly two files / +334 lines, and the two historical
-#563 blobs remain:
+#643 was refreshed after #647 by a normal merge from current `main`, passed
+fresh CI/review, and merged. Its net feature diff was exactly two files / +334
+lines, and the two historical #563 blobs were:
 
 - `creative-serve-web.ts`: `2676af28b8746c985f2916fb77c7ff7e8a957c6f`
 - `creative-serve-web.test.ts`: `784073733ec1136f435ce1efec411294788e85c7`
@@ -91,6 +91,11 @@ not silently grow into a multi-feature PR.
 
 Source slice: Creative serve-web launcher.
 
+**Checkpoint: completed.** #643 merged as
+`0b88049d48fc1de7c1319cf9118e84a62584a659`. Keep the checklist below as the
+evidence standard for any future refresh/revert rather than reopening this
+slice without a concrete regression.
+
 Merge only when the refreshed #643 head has:
 
 - exact two-file / +334 net diff against current `main`;
@@ -104,6 +109,11 @@ old local worktree in #643.
 ### A2. Land historical #564
 
 Source slice: embedded Creative `WebContentsView`.
+
+Current landing PR: #651. Exact-head landing review found two historical
+lifecycle races around delayed first startup / replacement startup; the current
+landing carries the narrow generation fence + ready-origin bounds guard derived
+from later reviewed #616 rather than pulling the rest of #616 forward.
 
 Use the **historical PR net patch**, not only commit `5209c77`.
 The historical slice contains propagated ancestry; cherry-picking only its final
@@ -153,6 +163,13 @@ actually exists in `main`.
 
 After the #563/#564/#565 landing equivalents are all green in `main`, prove
 the real product path again using the pinned Open Design fork revision:
+
+The Open Design compatibility contract is version `0.22.2`, but the integration
+tracking branch `integration/agent24-open-design-v0.22.2` is mutable. Do **not**
+treat the branch name or a developer's local checkout HEAD as an immutable pin.
+Before running the M4 gate, fetch the fork, choose the exact reviewed commit,
+record its full SHA in the validation evidence, and run the whole gate against
+that SHA. If the exact fork SHA is not recorded, the M4 gate is incomplete.
 
 1. build the production/packageable desktop;
 2. start a real Agent24 daemon;
