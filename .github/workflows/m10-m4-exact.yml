@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 env:
-  AGENT24_CANDIDATE_SHA: fa8ab8b448a0def0ad5e59052b30dd3d7c5d45e8
+  AGENT24_CANDIDATE_SHA: ef9d7886772344be3ee3ba6173208977900461b2
   OPEN_DESIGN_SHA: e4be3d5d8ca0ce8c624b269b3b507b701788dae1
 
 jobs:

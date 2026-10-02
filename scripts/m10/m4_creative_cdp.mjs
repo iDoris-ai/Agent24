@@ -31,6 +31,9 @@ async function evaluate(target, expression) {
   })
   ws.close()
   if (result.error) throw new Error(JSON.stringify(result.error))
+  if (result.result?.exceptionDetails) {
+    throw new Error('CDP evaluation failed: ' + JSON.stringify(result.result.exceptionDetails))
+  }
   return result.result?.result?.value
 }
 
@@ -42,11 +45,10 @@ const shell = targets.find((target) =>
 )
 if (!shell) throw new Error('Agent24 shell target not found: ' + JSON.stringify(targets))
 
-const showResultJson = await evaluate(
+const showResult = await evaluate(
   shell,
-  "JSON.stringify(await window.agent24.creativeShow({ x: 24, y: 96, width: 900, height: 640 }))",
+  'window.agent24.creativeShow({ x: 24, y: 96, width: 900, height: 640 })',
 )
-const showResult = JSON.parse(showResultJson)
 if (!showResult?.ok) {
   throw new Error('Creative show failed: ' + JSON.stringify(showResult))
 }
