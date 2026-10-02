@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
@@ -69,6 +70,9 @@ async function resolveNativeSource() {
   if (manifest.scripts?.['build-release'] !== 'node-gyp rebuild --release') {
     throw new Error('Open Design source better-sqlite3 build-release contract changed')
   }
+  if (manifest.scripts?.['prebuild-release'] != null || manifest.scripts?.['postbuild-release'] != null) {
+    throw new Error('Open Design source better-sqlite3 build-release lifecycle changed')
+  }
   return packageRoot
 }
 
@@ -98,20 +102,28 @@ export async function rebuildOpenDesignNativeModules() {
     npm_config_build_from_source: 'true',
   }
 
-  if (process.platform === 'win32') {
-    await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', 'run', 'build-release'], {
-      cwd: nativeSource,
-      env: rebuildEnv,
-    })
-  } else {
-    await run('npm', ['run', 'build-release'], { cwd: nativeSource, env: rebuildEnv })
-  }
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent24-od-native-'))
+  const buildSource = path.join(tempRoot, 'better-sqlite3')
+  try {
+    fs.cpSync(nativeSource, buildSource, { recursive: true, dereference: true })
+    fs.rmSync(path.join(buildSource, 'build'), { recursive: true, force: true })
+    if (process.platform === 'win32') {
+      await run('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', 'run', 'build-release'], {
+        cwd: buildSource,
+        env: rebuildEnv,
+      })
+    } else {
+      await run('npm', ['run', 'build-release'], { cwd: buildSource, env: rebuildEnv })
+    }
 
-  const builtModule = path.join(nativeSource, 'build', 'Release', 'better_sqlite3.node')
-  requireFile(builtModule, 'rebuilt Open Design better-sqlite3 native module')
-  const stagedModule = path.join(sqliteRoot, 'build', 'Release', 'better_sqlite3.node')
-  fs.mkdirSync(path.dirname(stagedModule), { recursive: true })
-  fs.copyFileSync(builtModule, stagedModule)
+    const builtModule = path.join(buildSource, 'build', 'Release', 'better_sqlite3.node')
+    requireFile(builtModule, 'rebuilt Open Design better-sqlite3 native module')
+    const stagedModule = path.join(sqliteRoot, 'build', 'Release', 'better_sqlite3.node')
+    fs.mkdirSync(path.dirname(stagedModule), { recursive: true })
+    fs.copyFileSync(builtModule, stagedModule)
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
 
   const probe = [
     "const Database = require('better-sqlite3')",
