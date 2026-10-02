@@ -191,6 +191,7 @@ Agent24 现有的 token 鉴权照常适用。响应格式与 Hyphae 一致：`{o
 | `POST /comm/relay/probe` | `{url?}` | `{url,connected}`，写入 daemon 状态的 `relay_probe` | `relay info [U] --timeout 5`，只在手动触发时执行 |
 | `POST /comm/send` | `{to, content, from?, encrypt=true}` | §5.1 | `agent msg --from F --to T --content C [--encrypt=false]` ⚿ |
 | `GET /comm/history?as=&limit=` | limit 1..=200 | 收件历史 | `history inbox --as A --limit N` |
+| `POST /comm/inbox/pull`（COMM-3 新增，原表没有） | `{as?}` | 透传 `agent inbox` 的返回值 | `agent inbox --as A --password-stdin` ⚿ |
 | `GET /comm/outbox?failed_only=` | — | outbox 条目 | `storage outbox list [--failed-only]` |
 | `POST /comm/outbox/{event_id}/retry` | — | `{event_id,attempted,sent,queued,…}` | `storage outbox retry --id E`：沿用原签名事件 |
 | `POST /comm/outbox/clear` | `{confirm:true, min_failures?}` | 清掉的条目 | `storage outbox clear --failed --yes [--min-failures]`：只删本地记录，不撤回 relay 已接受的事件 |
@@ -201,12 +202,21 @@ Agent24 现有的 token 鉴权照常适用。响应格式与 Hyphae 一致：`{o
 
 - `from` / `as` 缺省时，取 `identity list` 中 `default:true` 的那一项。
 - **已删除的路由**：`GET /comm/inbox`（M12）、`GET /comm/history?with=`。删后者是因为 `history conversation` 在基线版本不输出 JSON（H1、G7）。
+- **`POST /comm/inbox/pull`（COMM-3 补充，不在本文最初的路由表里）**：联调记录
+  `docs/comm/JOINT-ROUND1.md` F1 发现 `history inbox` 是纯拉取式（pull-based），
+  不是推送式——对加密 keystore，必须先成功执行一次 `agent inbox --as
+  <nick> --password-stdin`，新收到的消息才会出现在 `history inbox` 里；不带
+  `--password-stdin` 对加密 keystore 直接是 `auth_error`/退出码 3。COMM-4a
+  的 daemon 会通过 `--watch-interval` 定期自动调用 `agent inbox`，但 COMM-3
+  落地时 daemon 监管还没完成，且总会有「没有 daemon 在跑」的场景（例如只用
+  CLI、或 daemon 处于 `locked`/`gave_up`），这两种情况下没有任何路由能让新消息
+  进 `history inbox`。因此这里补一个路由，仅用于手动/无 daemon 场景；一旦
+  COMM-4a 的 daemon 稳定轮询，调用方通常不再需要它。
 - CLI 与 REST 一一对应：
   - `agent24 comm identity list|create|use`
   - `agent24 comm contact list|add`
   - `agent24 comm relay list|set|probe`
-  - `agent24 comm send` / `history`
-  - `agent24 comm outbox list|retry|clear`
+  - `agent24 comm send` / `history` / `pull` / `outbox list|retry|clear`
   - `agent24 comm daemon status|start|stop`
   - `agent24 comm import` / `unlock [--remember]`
   - 风格沿用 `agent24 os`。加 `--json` 时原样输出 REST 的 envelope。

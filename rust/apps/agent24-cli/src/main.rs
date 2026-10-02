@@ -227,6 +227,44 @@ enum CommAction {
         #[command(subcommand)]
         action: CommDaemonAction,
     },
+    /// Send a message (COMM-3; COMM-HYPHAE.md §4/§5.1). There is no "resend"
+    /// anywhere under `comm` — `outbox retry` is the only way to retry an
+    /// already-sent message, and it reuses the original event_id.
+    Send {
+        /// Recipient nickname or npub
+        to: String,
+        /// Message content (COMM-HYPHAE.md §3 M7: this goes to Hyphae via
+        /// argv, so it is visible to `ps` run by other users on this host)
+        content: String,
+        /// Sender identity nickname (defaults to the default identity)
+        #[arg(long)]
+        from: Option<String>,
+        /// Send unencrypted (encrypted is the default)
+        #[arg(long)]
+        no_encrypt: bool,
+    },
+    /// Read received message history — pull-based, not push-based (see
+    /// `pull`): a daemon normally keeps this current; without one, run
+    /// `pull` first to see new messages here.
+    History {
+        /// Identity nickname to read as (defaults to the default identity)
+        #[arg(long = "as")]
+        as_: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Manually pull new inbound messages once. The daemon's own relay
+    /// polling normally does this automatically (COMM-4a); use this only
+    /// when no daemon is managing the relay connection for you.
+    Pull {
+        #[arg(long = "as")]
+        as_: Option<String>,
+    },
+    /// Manage the outbox (queued/failed sends)
+    Outbox {
+        #[command(subcommand)]
+        action: CommOutboxAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -281,6 +319,28 @@ enum CommRelayAction {
     },
     /// Probe a relay (or every configured one) for connectivity
     Probe { url: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum CommOutboxAction {
+    /// List outbox entries
+    List {
+        /// Only entries that have failed at least once
+        #[arg(long)]
+        failed_only: bool,
+    },
+    /// Retry a queued/failed outbox entry — reuses its original event_id,
+    /// never mints a new one
+    Retry { event_id: String },
+    /// Clear local outbox bookkeeping (never un-sends an event a relay
+    /// already accepted)
+    Clear {
+        /// Required: this is a destructive, local-only operation
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        min_failures: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -886,18 +946,66 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     out
 }
 
+/// Minimal query-string/path-segment percent-encoding (no new dependency):
+/// everything but unreserved characters is escaped, which is always safe
+/// even though most nicknames/event_ids here never actually need it.
+fn qs_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// `agent24 comm …`: a REST client of `/api/v1/comm/*`
 /// (COMM-HYPHAE.md §4) — one method/path/body per leaf subcommand, sent with
 /// the same bearer/timeout/error-reporting shape as `cmd_os`. Unlike `cmd_os`
 /// there is no local/offline path: every comm operation needs a running
 /// daemon (it is the only thing holding the Hyphae runner).
+/// Codex 挑战（B 端 gpt-6-astra）Medium：`send`/`outbox retry` 的
+/// `partial`/`conflict` 错误带着 `data`（`event_id`、relay 接受情况
+/// `published_to`、记账异常 `audit_error`，或 retry 的
+/// `sent`/`superseded`），而旧实现只打印 `error`/`message` 两个字段，这些
+/// data 在 CLI 上直接丢了，用户拿不到可用来查 outbox/history 的
+/// event_id。这里直接把完整 envelope（而不只是 `data`）打到错误行里——
+/// `error`/`message` 不带 data 的路由（identity/contact/relay/…）行为不变，
+/// 因为它们的 `body["data"]` 本就是 `null`。
+fn format_comm_error(body: &serde_json::Value) -> String {
+    let error = body["error"].as_str().unwrap_or("error");
+    let message = body["message"].as_str().unwrap_or_default();
+    let mut out = format!("comm: {error} — {message}");
+    if let Some(data) = body.get("data").filter(|d| !d.is_null())
+        && let Ok(pretty) = serde_json::to_string_pretty(data)
+    {
+        out.push_str(&format!("\n  data: {pretty}"));
+    }
+    out
+}
+
 async fn cmd_comm(action: CommAction) -> Result<(), String> {
     // Import's server-side work (copy + verify + a Hyphae-side password
     // check) is real file and subprocess I/O, not a quick REST round trip —
     // give it a much longer client-side timeout than every other comm
     // action's 15s.
+    //
+    // `send`/`outbox retry` can take up to `5s × 8 relays + 10s = 50s`
+    // server-side (COMM-HYPHAE.md §3); give those two a generous timeout too
+    // rather than the default 15s.
     let timeout = if matches!(action, CommAction::Import { .. }) {
         Duration::from_secs(120)
+    } else if matches!(
+        action,
+        CommAction::Send { .. }
+            | CommAction::Outbox {
+                action: CommOutboxAction::Retry { .. },
+            }
+    ) {
+        Duration::from_secs(65)
     } else {
         Duration::from_secs(15)
     };
@@ -980,6 +1088,61 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 None,
             ),
         },
+        CommAction::Send {
+            to,
+            content,
+            from,
+            no_encrypt,
+        } => (
+            reqwest::Method::POST,
+            "/api/v1/comm/send".to_owned(),
+            Some(serde_json::json!({
+                "to": to, "content": content, "from": from, "encrypt": !no_encrypt
+            })),
+        ),
+        CommAction::History { as_, limit } => {
+            let mut qs: Vec<String> = Vec::new();
+            if let Some(a) = &as_ {
+                qs.push(format!("as={}", qs_encode(a)));
+            }
+            if let Some(l) = limit {
+                qs.push(format!("limit={l}"));
+            }
+            let path = if qs.is_empty() {
+                "/api/v1/comm/history".to_owned()
+            } else {
+                format!("/api/v1/comm/history?{}", qs.join("&"))
+            };
+            (reqwest::Method::GET, path, None)
+        }
+        CommAction::Pull { as_ } => (
+            reqwest::Method::POST,
+            "/api/v1/comm/inbox/pull".to_owned(),
+            Some(serde_json::json!({"as": as_})),
+        ),
+        CommAction::Outbox { action } => match action {
+            CommOutboxAction::List { failed_only } => {
+                let path = if failed_only {
+                    "/api/v1/comm/outbox?failed_only=true".to_owned()
+                } else {
+                    "/api/v1/comm/outbox".to_owned()
+                };
+                (reqwest::Method::GET, path, None)
+            }
+            CommOutboxAction::Retry { event_id } => (
+                reqwest::Method::POST,
+                format!("/api/v1/comm/outbox/{}/retry", qs_encode(&event_id)),
+                None,
+            ),
+            CommOutboxAction::Clear {
+                confirm,
+                min_failures,
+            } => (
+                reqwest::Method::POST,
+                "/api/v1/comm/outbox/clear".to_owned(),
+                Some(serde_json::json!({"confirm": confirm, "min_failures": min_failures})),
+            ),
+        },
     };
 
     let ep = connect().await.map_err(|e| {
@@ -1000,11 +1163,7 @@ async fn cmd_comm(action: CommAction) -> Result<(), String> {
                 );
                 Ok(())
             } else {
-                Err(format!(
-                    "comm: {} — {}",
-                    body["error"].as_str().unwrap_or("error"),
-                    body["message"].as_str().unwrap_or_default()
-                ))
+                Err(format_comm_error(&body))
             }
         }
         Err(e) => Err(e.to_string()),
@@ -1756,6 +1915,58 @@ mod tests {
             agent24_protocol::state_file::AuthMode::LegacySingleToken
         );
         assert_eq!(host_token(&state), Ok("legacy"));
+    }
+
+    /// Codex 挑战（B 端 gpt-6-astra）Medium：`send` 返回 502 partial 时，CLI
+    /// 必须把 event_id、relay 接受情况（`published_to`）和记账异常
+    /// （`audit_error`）打出来，不能只剩 `error`/`message` 两行字。
+    #[test]
+    fn format_comm_error_includes_partial_event_id_and_audit_error() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "partial",
+            "message": "hyphae reported a partial result",
+            "data": {
+                "event_id": "e9",
+                "published_to": 1,
+                "history_stored": true,
+                "audit_error": "permission denied"
+            }
+        });
+        let out = format_comm_error(&body);
+        assert!(out.contains("partial"), "{out}");
+        assert!(out.contains("e9"), "{out}");
+        assert!(out.contains("published_to"), "{out}");
+        assert!(out.contains("permission denied"), "{out}");
+    }
+
+    /// Same bug, `outbox retry`'s `write_conflict`: `sent`/`superseded` and
+    /// the retried event_id must show up too.
+    #[test]
+    fn format_comm_error_includes_conflict_sent_and_superseded() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "conflict",
+            "message": "queue entry superseded",
+            "data": {"event_id": "e2", "sent": true, "superseded": true}
+        });
+        let out = format_comm_error(&body);
+        assert!(out.contains("e2"), "{out}");
+        assert!(out.contains("\"sent\": true"), "{out}");
+        assert!(out.contains("\"superseded\": true"), "{out}");
+    }
+
+    /// Routes with no `data` (identity/contact/relay/…) must keep the exact
+    /// old one-line shape — no empty `data:` section appended.
+    #[test]
+    fn format_comm_error_without_data_is_unchanged() {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "not_configured",
+            "message": "no default identity"
+        });
+        let out = format_comm_error(&body);
+        assert_eq!(out, "comm: not_configured — no default identity");
     }
 
     #[test]

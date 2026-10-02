@@ -1463,19 +1463,26 @@ pub async fn serve(
                     agent24_os_proto::stop_record::ProcessAtStop::None
                 });
                 record.leader = leader;
-                // `KilledAfterGrace` means `kill_group_gracefully` sent
-                // SIGKILL after the grace ran out but never re-confirmed the
-                // group was actually empty afterwards — recording `Gone`
-                // (= "confirmed empty") there would misreport a daemon
-                // possibly still stuck through SIGKILL as a clean shutdown
-                // (PR #626 review, Low). `GoneBeforeTerm`/`ExitedInGrace`
-                // both come from a loop that did observe the group
-                // disappear, so `Gone` is still correct there.
-                record.group = outcome.had_process.then(|| {
-                    if leader == Some(agent24_os_proto::stop_record::Leader::KilledAfterGrace) {
-                        agent24_os_proto::stop_record::GroupEnd::KillAttempted
-                    } else {
+                // PR #642 review round 3, Medium #1: `group` now comes
+                // straight from `kill_group_gracefully`'s own final
+                // post-KILL probe (`group_confirmed_gone`), not from
+                // inferring it off how the LEADER alone ended. The previous
+                // version recorded `Gone` for ANY leader outcome other than
+                // `KilledAfterGrace` — including `ExitedInGrace`, where the
+                // leader exiting on TERM says nothing about whether a
+                // helper the leader left behind (still `Ok`/`EPERM` after
+                // its own SIGKILL and the bounded post-KILL probe) was ever
+                // actually confirmed gone. `Failed` (not `KillAttempted`,
+                // which `stop_record.rs` reserves for a stop that was
+                // dropped/cut off before ever reaching this probe) is the
+                // correct fact here: this call always ran to completion and
+                // always sent the KILL — it just could not confirm the
+                // group empty afterwards.
+                record.group = outcome.group_confirmed_gone.map(|confirmed| {
+                    if confirmed {
                         agent24_os_proto::stop_record::GroupEnd::Gone
+                    } else {
+                        agent24_os_proto::stop_record::GroupEnd::Failed
                     }
                 });
                 record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped);
