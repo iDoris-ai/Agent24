@@ -10,7 +10,8 @@ The strategy document defines *why* Agent24 uses separate integration and
 main-landing tracks. For the current M10 closeout, the operator-selected merge
 procedure is:
 
-1. merge the latest `main` **into** the Open Design integration branch first;
+1. merge the operator-selected exact stable `main` point **into** the Open
+   Design integration branch first;
 2. resolve and validate all conflicts on the integration side;
 3. prove that the resulting integration candidate contains the exact latest
    `main` as an ancestor;
@@ -26,8 +27,9 @@ M10 is **not complete** when one prototype PR reaches `main`.
 
 M10 is complete only when all of the following are true:
 
-1. the integration candidate has absorbed the latest `main` and all merge
-   conflicts are resolved and reviewed on the integration side;
+1. the integration candidate has absorbed the operator-selected exact `main`
+   point and all merge conflicts are resolved and reviewed on the integration
+   side;
 2. the M4 packaged E2E path is re-proven against the candidate plus the pinned
    Open Design fork;
 3. the required capability/workspace/runtime and M5-M9 reviewed product slices
@@ -60,71 +62,83 @@ As of 2026-10-02:
 
 | Item | State | Exact checkpoint |
 | --- | --- | --- |
-| Main CI race baseline | merged | #647 -> `4f79adfd505f9196f2eb196efc54df4e9e59a330` |
-| #563 clean landing | merged | #643 -> `0b88049d48fc1de7c1319cf9118e84a62584a659` |
-| #564 clean landing | active | #651 head `e55f920127d81b3d4ab0f9ea1a7cc81151eb9f09`, based on `main@af5862141d3d6a2658be7ea70f34ef43d055f430` |
-| #565 clean landing | preflight only | historical reviewed head `fe4ae95dffcf0096168289ba4189415f3693a54a`; rerun the probe after #651's final main refresh before opening the landing PR |
-| pre-#555 foundation inventory | complete | use F1-F6 below |
-| M5+ main landing | not started | must wait for required foundation |
-| main -> integration rehearsal | completed locally | latest `main@fb511e4b92af9b2941f55fedd427b3203263a1a6` merged into integration as `7061e2db696f294fd9904c7871cb04d10a8caf4f`; two add/add conflicts resolved as documented below |
+| Locked stable `main` | frozen for M10 handoff | tag `stable/main-2026-10-02` -> `9ed354963fd3a48e99b7de7cb853503658fc5906` |
+| Locked `main` -> integration | merged | `ef9d7886772344be3ee3ba6173208977900461b2`; first parent `fa8ab8b448a0def0ad5e59052b30dd3d7c5d45e8`, second parent exact locked `main` |
+| Final integration candidate | frozen for final validation | `79179dfb906f8813d9b038dfe5b276fc9594e802`; normal merge of #657 on top of #658/#656 and the locked-main refresh |
+| COMM timeout evidence flake | fixed | deterministic test-only barrier reviewed at `d5387f1fe525963d5df165b33207486075a9872b`, merged through `d2dd2215d35bc4de5cbbe7ef1ff84058d6b6117b` |
+| Rust 1.99 capability-token lint | fixed | `90e19a8313f860c5b9d8402f7530dd015197322e` |
+| Darwin sidecar pending-force coverage | fixed | integration carries the reviewed bounded retry/coverage through `fa8ab8b448a0def0ad5e59052b30dd3d7c5d45e8` |
+| macOS sidecar cross-test owner flake | fixed | #658 -> `d8ecbf9b123a5e1bdc40ad09cdba81271e1172cf`; test-only idle-boundary fix, three-platform sidecar CI green |
+| Linux Creative release resources | fixed | #656 -> `e30758752c2e2c2946d2c9827f3bf6160f4235b0`; exact reviewed Open Design resources are built/staged fail-closed before desktop packaging |
+| Open Design fork pin | frozen for M10 validation | `327de2887fcd8d6f71a3598e921c0f12521d37d7`, version contract `0.22.2` |
+| Native Creative ABI alignment | fixed; final candidate contains it | #657 merge `79179dfb906f8813d9b038dfe5b276fc9594e802`, feature head `439442b42204cc8d09698b4b89c8e0f92f1ee209`; rebuilds exact pinned `better-sqlite3` source for Agent24 Electron in an isolated temporary copy and probes the staged runtime before packaging |
+| M4 ACP two-turn | green on final integration SHA | run `37028448533`, job `Real daemon + ACP two-turn`, pins `79179dfb906f8813d9b038dfe5b276fc9594e802`; real daemon + ACP `initialize` / `session/new` / two `session/prompt` runs in one session passed |
+| M4 packaged Creative | green on final integration SHA | run `37028448533`, job `Exact Open Design package + Agent24 Creative`, pins Agent24 `79179dfb906f8813d9b038dfe5b276fc9594e802` + Open Design `327de2887fcd8d6f71a3598e921c0f12521d37d7`; Electron 34.5.8 native runtime probe passed, `creativeShow` returned a ready origin, `/api/ready` reported Open Design `0.22.2`, document state was `complete`, and packaged Agent24 daemon health reported Rust backend `0.5.1` |
+| Final CI | green | run `37028371570` on `79179dfb906f8813d9b038dfe5b276fc9594e802`: TypeScript tests/typecheck, contract/codegen drift, Rust Linux and macOS fmt/clippy/test passed |
+| Sidecar cross-platform | green | run `37028371232` on `79179dfb906f8813d9b038dfe5b276fc9594e802` passed |
+| Workspace-root authority | green | run `37028370911` on `79179dfb906f8813d9b038dfe5b276fc9594e802` passed |
+| Hyphae lock reproduction | green | run `37028569552` on `79179dfb906f8813d9b038dfe5b276fc9594e802` reproduced and matched the locked artifact |
+| Release dry-run | green | run `37028564943` on `79179dfb906f8813d9b038dfe5b276fc9594e802` passed all four macOS/Linux architecture build, package, daemon-health, archive and artifact checks |
+| Linux desktop release package | green | run `37028371170` on `79179dfb906f8813d9b038dfe5b276fc9594e802` built exact Open Design resources, staged them fail-closed, rebuilt the native module for Agent24 Electron, produced AppImage + deb, verified Creative resources inside both artifacts, booted the AppImage to `/health` 200, and verified the deb contains `agent24d` |
 
-#643 was refreshed after #647 by a normal merge from current `main`, passed
-fresh CI/review, and merged. Its net feature diff was exactly two files / +334
-lines, and the two historical #563 blobs were:
+Historical #651/#565 conveyor states are superseded by the final validated
+integration-candidate procedure selected for M10. #651 remains a reviewed
+historical landing artifact; it is not the final authority for what the main
+operator should merge. Do not reconstruct the final candidate by replaying that
+old stack.
 
-- `creative-serve-web.ts`: `2676af28b8746c985f2916fb77c7ff7e8a957c6f`
-- `creative-serve-web.test.ts`: `784073733ec1136f435ce1efec411294788e85c7`
+The `agent24-store` migration sequence on the integration candidate is
+continuous: `0001`-`0008` from the earlier main line, Open Design workspace and
+legacy-recovery migrations `0009`-`0012`, then main's `0013`. The paused M1
+memory work uses separate `agent24-memory` migrations `0016`/`0017` and is not
+part of this M10 merge.
 
 Treat this table as a checkpoint, not permanent merge authorization. Before
 every merge, re-read the PR exact head, CI, and review verdict.
 
-### 3.1 Current main -> integration rehearsal result
+### 3.1 Locked main -> integration result
 
-The 2026-10-02 rehearsal merged:
+The final integration refresh for the operator-selected stable main point
+merged:
 
 - integration pre-merge head:
-  `708afb91986985725772bc15a8ea8c0a24006480`;
-- main head:
-  `fb511e4b92af9b2941f55fedd427b3203263a1a6`;
-- local integration merge commit:
-  `7061e2db696f294fd9904c7871cb04d10a8caf4f`.
+  `fa8ab8b448a0def0ad5e59052b30dd3d7c5d45e8`;
+- locked stable main:
+  `9ed354963fd3a48e99b7de7cb853503658fc5906`;
+- integration merge commit:
+  `ef9d7886772344be3ee3ba6173208977900461b2`.
 
-There were exactly two textual conflicts:
+This exact stable point, rather than a later moving `origin/main`, is the M10
+handoff base unless the main operator explicitly reports that main has moved
+and requests another integration refresh. The locked SHA remains an ancestor of
+the final integration candidate
+`79179dfb906f8813d9b038dfe5b276fc9594e802` after the subsequent M10 fixes.
 
-- `apps/desktop/src/main/creative-serve-web.ts`;
-- `apps/desktop/src/main/creative-serve-web.test.ts`.
+A final throwaway merge rehearsal was also run from detached locked main
+`9ed354963fd3a48e99b7de7cb853503658fc5906` using `git merge --no-ff
+--no-commit 79179dfb906f8813d9b038dfe5b276fc9594e802`. Git reported an automatic,
+conflict-free merge. The rehearsal was immediately aborted and the temporary
+worktree removed; it did not move or mutate the protected `main` branch.
 
-Both were add/add conflicts because `main` had just landed the historical #563
-prototype via #643 while integration already contained the later reviewed
-Creative lifecycle, packaged/headless launcher, origin validation, child-env
-isolation, and session-hardening evolution. The correct resolution was to keep
-the integration versions of those two files rather than overwrite the later
-reviewed behavior with the older #643 prototype blobs.
+The earlier rehearsal against `main@fb511e4b92af9b2941f55fedd427b3203263a1a6`
+did expose the two expected add/add conflicts in
+`creative-serve-web.ts` / `creative-serve-web.test.ts`; they were resolved on
+integration by retaining the later reviewed Creative lifecycle/headless
+implementation. The final stable-main merge therefore did not move conflict
+resolution onto protected `main`.
 
-All other latest-main changes merged automatically. After resolution:
+For the final candidate, verify the invariant with the exact locked SHA:
 
 ```
-git rev-list --left-right --count origin/main...HEAD
-0 603
+git merge-base --is-ancestor \
+  9ed354963fd3a48e99b7de7cb853503658fc5906 HEAD
+git rev-list --left-right --count \
+  9ed354963fd3a48e99b7de7cb853503658fc5906...HEAD
 ```
 
-The zero on the left is the important invariant: the candidate contains the
-exact latest `main` as an ancestor.
-
-Validation evidence from the rehearsal:
-
-- `git diff --check`: green;
-- `cargo clippy --locked -p agent24-comm --all-targets -- -D warnings`: green;
-- `cargo fmt --all --check`: green;
-- the known COMM timeout test passes when run alone/serially;
-- full `agent24-comm --lib`: 126/127 with the already-known parallel
-  `first_identity_create_timeout_after_keystore_write_preserves_the_password`
-  502/504 flake as the sole failure;
-- local Node runtime was unavailable in this harness, so desktop TypeScript
-  tests/typecheck must be supplied by CI or another Node-capable reviewer.
-
-Do not hide that known flake in final release evidence; either prove it remains
-baseline-only under CI or fix it as a separate small PR.
+The left count must be `0`. The previously documented COMM 502/504 test flake
+is no longer an accepted baseline exception; it was fixed deterministically as
+listed in the checkpoint table and must remain green in final CI.
 
 ### 3.2 Main-repository final merge procedure
 
@@ -134,25 +148,31 @@ integration candidate and first verify:
 
 ```
 git fetch origin main integration/open-design-main-sync-wave20
-git merge-base --is-ancestor origin/main origin/integration/open-design-main-sync-wave20
-git rev-list --left-right --count origin/main...origin/integration/open-design-main-sync-wave20
+git merge-base --is-ancestor \
+  9ed354963fd3a48e99b7de7cb853503658fc5906 \
+  origin/integration/open-design-main-sync-wave20
+git rev-list --left-right --count \
+  9ed354963fd3a48e99b7de7cb853503658fc5906...origin/integration/open-design-main-sync-wave20
 ```
 
 The first command must succeed and the left count must be `0`. Then create a
-throwaway merge/release-candidate branch from the exact current `main` and
+throwaway merge/release-candidate branch from the exact locked stable `main` and
 attempt a normal merge:
 
 ```
-git switch -c merge/open-design-m10-candidate origin/main
+git switch -c merge/open-design-m10-candidate \
+  9ed354963fd3a48e99b7de7cb853503658fc5906
 git merge --no-ff origin/integration/open-design-main-sync-wave20
 ```
 
 If that merge is conflict-free, run the full M4/release validation before
 allowing the repository operator to merge it into protected `main`.
 
-If new conflicts appear because `main` moved after the rehearsal, stop the
-final merge. Merge the new `main` into integration again, resolve and validate
-there, push the refreshed integration candidate, and repeat this procedure.
+Immediately before the protected landing, the main operator must confirm that
+the repository's intended main point is still the locked stable SHA. If main has
+moved and that movement must be included, stop the final merge; send the new
+exact main SHA back to the integration side, merge it into integration, resolve
+and validate there, push the refreshed candidate, and repeat this procedure.
 Never resolve new integration conflicts directly on protected `main`.
 
 ## 4. Non-negotiable landing policy
@@ -199,10 +219,12 @@ old local worktree in #643.
 
 Source slice: embedded Creative `WebContentsView`.
 
-Current landing PR: #651. Exact-head landing review found two historical
-lifecycle races around delayed first startup / replacement startup; the current
-landing carries the narrow generation fence + ready-origin bounds guard derived
-from later reviewed #616 rather than pulling the rest of #616 forward.
+Historical landing PR: #651. Exact-head landing review found two historical
+lifecycle races around delayed first startup / replacement startup; that
+landing carried the narrow generation fence + ready-origin bounds guard derived
+from later reviewed #616 rather than pulling the rest of #616 forward. For the
+final M10 handoff, #651 is superseded by the validated integration candidate;
+keep this subsection only as a repair/reconstruction reference.
 
 Use the **historical PR net patch**, not only commit `5209c77`.
 The historical slice contains propagated ancestry; cherry-picking only its final
@@ -250,8 +272,12 @@ actually exists in `main`.
 
 ## 6. Phase B — rerun the M4 packaged E2E gate
 
-After the #563/#564/#565 landing equivalents are all green in `main`, prove
-the real product path again using the pinned Open Design fork revision:
+For the historical incremental-conveyor route, this gate followed the
+#563/#564/#565 landing equivalents. For the operator-selected final M10 route,
+prove the real product path against the **final validated integration
+candidate** before the main operator attempts the merge, then repeat the
+release-critical validation on the temporary post-merge candidate. In both
+cases use the pinned Open Design fork revision:
 
 The Open Design compatibility contract is version `0.22.2`, but the integration
 tracking branch `integration/agent24-open-design-v0.22.2` is mutable. Do **not**
@@ -518,4 +544,10 @@ M10 can be closed only after a final current-main validation records:
   blockers for signed/distributable artifacts;
 - no unresolved release-blocking CI/review finding.
 
-Only then mark the Open Design integration roadmap's M10 milestone complete.
+The integration-side candidate `79179dfb906f8813d9b038dfe5b276fc9594e802`
+has satisfied the pre-landing gates above and its locked-main merge rehearsal is
+conflict-free. It is therefore ready for the main-repository/operator handoff.
+This does **not** by itself close the roadmap milestone: the operator-selected
+boundary still requires the protected-main landing from the locked base and the
+post-merge validation described in §3.2. Only after those main-side steps pass
+should the Open Design integration roadmap's M10 milestone be marked complete.
