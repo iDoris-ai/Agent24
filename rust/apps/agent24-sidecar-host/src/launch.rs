@@ -276,7 +276,7 @@ mod tests {
             cwd: cwd.to_owned(),
             argv: vec![
                 "-c".to_owned(),
-                "printf \"$PWD|$SIDE|$1|${HOME-unset}\"; sleep 30".to_owned(),
+                "printf \"$PWD|$SIDE|$1|${HOME-unset}\"; exec sleep 30".to_owned(),
                 "ignored-zero".to_owned(),
                 "argv-value".to_owned(),
             ],
