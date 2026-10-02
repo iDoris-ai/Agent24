@@ -9,8 +9,8 @@ async function listTargets() {
 async function evaluate(target, expression) {
   const ws = new WebSocket(target.webSocketDebuggerUrl)
   await new Promise((resolve, reject) => {
-    ws.once('open', resolve)
-    ws.once('error', reject)
+    ws.addEventListener('open', resolve, { once: true })
+    ws.addEventListener('error', reject, { once: true })
   })
   const id = 1
   ws.send(JSON.stringify({
@@ -20,14 +20,14 @@ async function evaluate(target, expression) {
   }))
   const result = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('CDP evaluate timeout')), 15_000)
-    ws.on('message', (raw) => {
-      const message = JSON.parse(String(raw))
+    ws.addEventListener('message', (event) => {
+      const message = JSON.parse(String(event.data))
       if (message.id === id) {
         clearTimeout(timer)
         resolve(message)
       }
     })
-    ws.once('error', reject)
+    ws.addEventListener('error', reject, { once: true })
   })
   ws.close()
   if (result.error) throw new Error(JSON.stringify(result.error))
