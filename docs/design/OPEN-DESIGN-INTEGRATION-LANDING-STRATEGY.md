@@ -1,6 +1,6 @@
 # Open Design Integration and Main-Landing Strategy
 
-Status: adopted; M7 closed, M8 execution active
+Status: adopted; M9 closed, M10 mainline/release execution active
 
 Date: 2026-10-01
 
@@ -221,16 +221,17 @@ sequence includes the recovery clock and durable approval/recovery work (#579
 onward). At the 2026-10-01 refresh, #579-#584, #586, #592, #593, #595,
 and #596 are merged into the integration branch; #591 and #603 close the ACP
 and TUI legacy-unbound workspace-identity compile/compatibility gaps exposed by
-that train. The 2026-10-01 milestone audit re-ran the recovery/authority paths
-and found no remaining M7 feature slice. A stale migration-version assertion
-discovered by the full-workspace audit is tracked separately as test hygiene,
-not as unfinished recovery behavior.
+that train. Later M7 consolidation/fix #631 is also part of the reviewed source
+history; #605 is migration-test hygiene rather than recovery feature scope. The
+milestone audit re-ran the recovery/authority paths and found no remaining M7
+feature slice.
 
-M7 is therefore **closed** on the integration branch. Continue with **M8
-Desktop productization**: isolate the embedded Creative surface, harden its
-navigation/session boundary, wire the sidecar lifecycle into the desktop host,
-discover packaged Open Design resources, and provide degraded/restart UX before
-the later M9 cross-platform/security and M10 mainline/release gates.
+M7 is therefore **closed** on the integration branch. **M8 Desktop
+productization and M9 cross-platform/security hardening are also closed on the
+integration branch. M10 mainline/release execution is now active.** The work in
+M10 is to land the already-reviewed product slices into `main` incrementally,
+rerun packaged/cross-platform release gates from current `main`, and avoid a
+wholesale integration-branch merge.
 
 Do not encode a stale "approved/blocked" label for each M7 PR into this
 strategy. The operational source of truth is the exact current base/head plus
@@ -392,5 +393,5 @@ PLDM should stop the landing train at the current slice if any of these occurs:
    foundation queue is prepared in parallel.
 6. After each main landing tranche, merge the new `main` back into staging and
    rerun cross-stack CI.
-7. M7 Recovery & Reliability is closed. Continue M8 Desktop productization,
-   then M9 cross-platform/security hardening and M10 mainline/release work.
+7. M7, M8, and M9 are closed on the integration branch. Execute M10 by
+   continuing the controlled main-landing conveyor and final release gates.
