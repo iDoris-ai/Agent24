@@ -167,10 +167,14 @@ the real product path again using the pinned Open Design fork revision:
 A failure here is fixed in a small reviewable slice first. Do not patch around
 it directly in an unrelated later landing.
 
-## 7. Phase C — minimal pre-#555 foundation
+## 7. Phase C — minimal pre-#555 foundation dependency groups
 
 The historical pre-#555 integration history is much larger than the actual
-dependency set. Do **not** copy that history wholesale.
+dependency set. Do **not** copy that history wholesale. F1-F6 below are
+**dependency groups, not six large PRs**. Preserve the listed small historical
+slices where possible. Keep the normal <=300-line target; 301-500-line adapted
+slices require two independent exact-head reviews, and >500-line landings should
+be split unless a documented exception preserves a narrow rollback boundary.
 
 ### F1. Capability authority core
 
@@ -193,9 +197,11 @@ This supplies private host bootstrap transport, safe capability startup/AuthMode
 and the closed required-operation route policy required by the attached-route
 authority matrix.
 
-#241's mint/revoke HTTP API is not required for #555. #242 is only needed if
-the landing chooses to preserve its exact reusable test helper rather than
-adapting that helper locally with fresh review.
+#241's mint/revoke HTTP API and #242's broader isolation-test slice are not part
+of the minimum #555 dependency set unless a fresh current-main dependency audit
+proves otherwise. If #555 needs only the historical reusable test helper, adapt
+that helper locally and review the adaptation rather than importing unrelated
+route/API scope.
 
 ### F3. Workspace contract and persistence skeleton
 
@@ -263,7 +269,39 @@ Important dependency notes:
 ## 9. Phase E — M6 through M9 clean landings
 
 After #567, continue the same procedure for the reviewed M6, M7, M8, and M9
-slices.
+slices. The lists below are **historical source trains for clean current-main
+equivalents**, not instructions to merge old stack branches directly.
+
+### M6 source train
+
+`#568 -> #570 -> #573 -> #574 -> #575 -> #576 -> #577 -> #578`
+
+### M7 source train
+
+Start from the exact-parent order of #579/#580, then continue through the
+recovery/reliability chain:
+
+`#581 -> #582 -> #583 -> #584 -> #586`
+
+Compatibility/default repairs include #591 and #603. The later recovery chain
+continues:
+
+`#592 -> #593 -> #595 -> #596 -> #631`
+
+#605 is migration-test hygiene, not a feature milestone. Re-audit exact parents
+before turning this list into landing branches.
+
+### M8 source train
+
+`#606 -> #615 -> #616 -> #623 -> #629 -> #632`
+
+#604 is validation-baseline hygiene rather than the productization feature train.
+
+### M9 source train
+
+`#530 -> #531 -> #533 -> #535 -> #536 -> #537 -> #538 -> #539 -> #542 -> #545 -> #546 -> #547 -> #548 -> #549 -> #551 -> #553 -> #552 -> #554`
+
+#644 is test-evidence repair, not a feature milestone.
 
 Do not compress a whole milestone into one landing PR just because that
 milestone is already closed on the integration branch.
@@ -279,7 +317,11 @@ For each slice:
 - merge from the new `main` before preparing the next dependent slice.
 
 M9 ProcessKit/Windows work remains frozen to the reviewed pin unless a later
-main adaptation proves a concrete reason to change it.
+main adaptation proves a concrete reason to change it. ProcessKit/Windows CI is
+evidence for those reviewed paths; it is **not by itself proof of complete
+Windows product/distribution readiness**. Final release claims must also match
+the current Deployment document, signed-artifact availability, and explicitly
+supported release platforms.
 
 ## 10. Per-PR operator checklist
 
@@ -361,11 +403,13 @@ M10 can be closed only after a final current-main validation records:
 - Creative render/navigation/session isolation;
 - ACP Session/Run + second-turn E2E;
 - workspace admission/lease/recovery/security paths;
-- M9 cross-platform/Windows and ProcessKit gates where required;
+- M9 cross-platform/Windows and ProcessKit gates where required for the
+  explicitly supported artifact/platform set;
 - no hidden Creative host/admin authority;
 - no public `canonical_root` authority leak;
 - no raw untrusted path -> `ToolContext` construction;
-- release packaging/checklist passes;
+- release packaging/checklist passes, including any still-open Deployment
+  blockers for signed/distributable artifacts;
 - no unresolved release-blocking CI/review finding.
 
 Only then mark the Open Design integration roadmap's M10 milestone complete.

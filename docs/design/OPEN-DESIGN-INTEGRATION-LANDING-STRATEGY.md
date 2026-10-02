@@ -221,10 +221,10 @@ sequence includes the recovery clock and durable approval/recovery work (#579
 onward). At the 2026-10-01 refresh, #579-#584, #586, #592, #593, #595,
 and #596 are merged into the integration branch; #591 and #603 close the ACP
 and TUI legacy-unbound workspace-identity compile/compatibility gaps exposed by
-that train. The 2026-10-01 milestone audit re-ran the recovery/authority paths
-and found no remaining M7 feature slice. A stale migration-version assertion
-discovered by the full-workspace audit is tracked separately as test hygiene,
-not as unfinished recovery behavior.
+that train. Later M7 consolidation/fix #631 is also part of the reviewed source
+history; #605 is migration-test hygiene rather than recovery feature scope. The
+milestone audit re-ran the recovery/authority paths and found no remaining M7
+feature slice.
 
 M7 is therefore **closed** on the integration branch. **M8 Desktop
 productization and M9 cross-platform/security hardening are also closed on the
