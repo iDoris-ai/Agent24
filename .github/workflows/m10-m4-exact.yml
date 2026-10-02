@@ -1,0 +1,161 @@
+name: M10 M4 exact-SHA E2E
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  AGENT24_CANDIDATE_SHA: d2dd2215d35bc4de5cbbe7ef1ff84058d6b6117b
+  OPEN_DESIGN_SHA: e3c37fc14f0492f13a570e6b978861845121ac29
+
+jobs:
+  acp-two-turn:
+    name: Real daemon + ACP two-turn
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout validation harness
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Checkout exact Agent24 candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ env.AGENT24_CANDIDATE_SHA }}
+          path: candidate
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build real daemon and ACP CLI
+        working-directory: candidate/rust
+        run: cargo build --locked --release -p agent24d -p agent24-cli
+
+      - name: Exercise one ACP session for two real runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AGENT24_BIN="$PWD/candidate/rust/target/release/agent24"
+          export AGENT24D_BIN="$PWD/candidate/rust/target/release/agent24d"
+          python3 scripts/m10/m4_acp_e2e.py
+
+  packaged-creative-mac:
+    name: Exact Open Design package + Agent24 Creative
+    runs-on: macos-latest
+    timeout-minutes: 70
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Checkout validation harness
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Checkout exact Agent24 candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ env.AGENT24_CANDIDATE_SHA }}
+          path: candidate
+
+      - name: Checkout exact reviewed Open Design fork
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: iDoris-ai/open-design-agent24
+          ref: ${{ env.OPEN_DESIGN_SHA }}
+          path: open-design
+
+      - name: Verify exact source SHAs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" = "$AGENT24_CANDIDATE_SHA"
+          test "$(git -C open-design rev-parse HEAD)" = "$OPEN_DESIGN_SHA"
+          echo "Agent24=$AGENT24_CANDIDATE_SHA"
+          echo "OpenDesign=$OPEN_DESIGN_SHA"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '22'
+
+      - name: Build exact Open Design packaged resource tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@10.33.2 --activate
+          (
+            cd open-design
+            pnpm install --frozen-lockfile
+            pnpm --filter @open-design/tools-pack dev -- mac build --to app --portable --namespace agent24-m10-m4 --dir "$RUNNER_TEMP/open-design-pack" --json > "$RUNNER_TEMP/open-design-pack.json"
+          )
+          cat "$RUNNER_TEMP/open-design-pack.json"
+          APP_PATH="$(jq -r '.appPath' "$RUNNER_TEMP/open-design-pack.json")"
+          RESOURCE_DIR="$APP_PATH/Contents/Resources"
+          test -d "$RESOURCE_DIR/app"
+          test -d "$RESOURCE_DIR/open-design"
+          test -d "$RESOURCE_DIR/open-design-web-standalone"
+          test -f "$RESOURCE_DIR/app/prebundled/agent24-headless.cjs"
+          test -f "$RESOURCE_DIR/app/prebundled/agent24-headless.mjs"
+          test "$(jq -r '.version' "$RESOURCE_DIR/app/package.json")" = "0.22.2"
+          echo "A24_OPEN_DESIGN_RESOURCES_DIR=$RESOURCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Setup Agent24 toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack prepare pnpm@9.12.0 --activate
+          (cd candidate && pnpm install --frozen-lockfile)
+          rustup toolchain install stable --profile minimal
+
+      - name: Build and stage Agent24 package
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd candidate/rust
+            cargo build --locked --release -p agent24d -p agent24-cli
+          )
+          (
+            cd candidate
+            pnpm --filter @agent24/node-daemon build
+            pnpm --filter @agent24/desktop build
+            pnpm --filter @agent24/desktop stage:open-design
+            pnpm --filter @agent24/desktop exec electron-builder --mac dir
+          )
+
+          APP="$(find candidate/apps/desktop/release -maxdepth 3 -type d -name 'Agent24.app' -print -quit)"
+          test -n "$APP"
+          test -x "$APP/Contents/MacOS/Agent24"
+          test -f "$APP/Contents/Resources/app/prebundled/agent24-headless.cjs"
+          test -d "$APP/Contents/Resources/open-design-web-standalone"
+          echo "AGENT24_APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Launch packaged Agent24 and render real Creative surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/agent24-m4-home"
+          mkdir -p "$HOME"
+
+          "$AGENT24_APP/Contents/MacOS/Agent24" --remote-debugging-port=9222 > "$RUNNER_TEMP/agent24-m4-app.log" 2>&1 &
+          APP_PID=$!
+          trap 'kill "$APP_PID" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:9222/json/list > "$RUNNER_TEMP/cdp.json" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          test -s "$RUNNER_TEMP/cdp.json"
+          cat "$RUNNER_TEMP/cdp.json"
+
+          node scripts/m10/m4_creative_cdp.mjs
+
+          STATE="$HOME/.agent24/daemon.json"
+          test -f "$STATE"
+          PORT="$(jq -r '.port' "$STATE")"
+          curl -fsS "http://127.0.0.1:$PORT/api/v1/health"
+
+          echo "--- Agent24 packaged log ---"
+          tail -200 "$RUNNER_TEMP/agent24-m4-app.log" || true
