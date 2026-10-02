@@ -1488,36 +1488,46 @@ mod tests {
         tokio::fs::create_dir_all(home.join(".hyphae"))
             .await
             .unwrap();
-        // Writes keystore.json immediately (Hyphae's own atomic rename has
-        // already landed), THEN sleeps well past the runner's timeout —
-        // reproducing `RunnerError::Timeout` AFTER the write, exactly the
-        // ordinary operational event (a slow child, `kill_process_group`
-        // landing late) the High finding describes, not an exotic attack.
-        // The keystore write happens BEFORE the process ever reads stdin, so
-        // it lands as early as possible after spawn — the test's own
-        // timeout budget must only cover process startup, not stdin
-        // round-trip latency.
+        // Writes keystore.json before reading stdin, then sleeps. A test-only
+        // runner barrier below pauses *after spawn but before the timeout is
+        // armed*, so the observer can prove this write has actually landed
+        // before allowing the real timeout path to proceed. That ordering is
+        // the fact under test; relying on the shell child merely being
+        // scheduled within a few seconds flakes under a parallel full suite.
         let script = format!(
             "#!/bin/sh\necho '{{\"salt\":\"c2FsdA==\"}}' > \"{}\"\ncat > /dev/null\nsleep 30\n",
             home.join(".hyphae").join("keystore.json").display()
         );
         let bin = install_fixture(tmp.path(), "hyphae-fake.sh", &script).await;
-        // A generous timeout (this test only waits for the KILL, not the
-        // sleep): under a loaded `cargo test --workspace` run, several
-        // seconds of scheduler contention for the fork/exec itself is not
-        // unusual, and the point under test is "a timeout AFTER the write
-        // lands", not how fast that happens.
-        let runner = Arc::new(HyphaeRunner::new(bin, home.clone(), Duration::from_secs(3)));
+        let runner = Arc::new(HyphaeRunner::new(
+            bin,
+            home.clone(),
+            Duration::from_millis(100),
+        ));
+        let (spawned_before_timeout, arm_timeout) =
+            crate::runner::timeout_test_hook::install(runner.bin_path());
         let store = Arc::new(MemoryPasswordStore::new());
-        let state = CommState::ready(runner, store.clone(), home);
+        let state = CommState::ready(runner, store.clone(), home.clone());
+        let keystore = home.join(".hyphae").join("keystore.json");
 
-        let (status, body) = call(
+        let request = call(
             router(state),
             "POST",
             "/identity",
             Some(json!({"nickname": "alice"})),
-        )
-        .await;
+        );
+        let prove_write_then_arm_timeout = async {
+            spawned_before_timeout.notified().await;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !keystore.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fixture child never wrote keystore.json");
+            arm_timeout.notify_one();
+        };
+        let ((status, body), ()) = tokio::join!(request, prove_write_then_arm_timeout);
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
         assert_eq!(body["data"]["password_preserved"], true, "{body:?}");
 
