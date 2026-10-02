@@ -46,6 +46,13 @@ export class CreativeViewRequestFence {
   }
 }
 
+export function shouldApplyCreativeBounds(
+  fence: CreativeViewRequestFence,
+  readyOrigin: string | null,
+): boolean {
+  return fence.wantsVisible() && Boolean(readyOrigin)
+}
+
 type SpawnFn = typeof spawn
 type FetchFn = typeof fetch
 type CreativeChild = ChildProcess & { stdout: Readable; stderr: Readable }

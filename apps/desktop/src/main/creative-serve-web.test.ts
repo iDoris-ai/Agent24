@@ -5,7 +5,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { CreativeServeWeb, CreativeViewRequestFence, resolveOpenDesignCheckout } from './creative-serve-web'
+import {
+  CreativeServeWeb,
+  CreativeViewRequestFence,
+  resolveOpenDesignCheckout,
+  shouldApplyCreativeBounds,
+} from './creative-serve-web'
 
 class FakeChild extends EventEmitter {
   stdout = new PassThrough()
@@ -54,6 +59,29 @@ describe('CreativeServeWeb', () => {
     const second = fence.begin()
     expect(fence.isCurrent(second)).toBe(true)
     expect(fence.isCurrent(first)).toBe(false)
+  })
+
+  it('keeps a hidden existing view ineligible for bounds until replacement startup is ready', async () => {
+    const fence = new CreativeViewRequestFence()
+    let readyOrigin: string | null = 'http://127.0.0.1:7456'
+    fence.begin()
+    expect(shouldApplyCreativeBounds(fence, readyOrigin)).toBe(true)
+
+    fence.invalidate()
+    readyOrigin = null
+    const replacement = fence.begin()
+    expect(shouldApplyCreativeBounds(fence, readyOrigin)).toBe(false)
+
+    let releaseStartup!: () => void
+    const startup = new Promise<void>((resolve) => { releaseStartup = resolve })
+    const becomingReady = startup.then(() => {
+      if (fence.isCurrent(replacement)) readyOrigin = 'http://127.0.0.1:7456'
+    })
+
+    expect(shouldApplyCreativeBounds(fence, readyOrigin)).toBe(false)
+    releaseStartup()
+    await becomingReady
+    expect(shouldApplyCreativeBounds(fence, readyOrigin)).toBe(true)
   })
 
   it('uses the explicit Open Design checkout when it contains the od entry', () => {
