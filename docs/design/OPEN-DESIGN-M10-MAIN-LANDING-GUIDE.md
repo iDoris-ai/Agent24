@@ -7,8 +7,18 @@ Target branch: `main`
 This document is the operational companion to
 `docs/design/OPEN-DESIGN-INTEGRATION-LANDING-STRATEGY.md`.
 The strategy document defines *why* Agent24 uses separate integration and
-main-landing tracks. This guide defines *how to finish M10* without turning the
-already-reviewed Open Design history into one large merge.
+main-landing tracks. For the current M10 closeout, the operator-selected merge
+procedure is:
+
+1. merge the latest `main` **into** the Open Design integration branch first;
+2. resolve and validate all conflicts on the integration side;
+3. prove that the resulting integration candidate contains the exact latest
+   `main` as an ancestor;
+4. only then hand that candidate to the main-branch repository/operator to
+   attempt the final integration-branch merge using this guide.
+
+The historical small-PR conveyor remains the preferred repair/rollback tool if
+the final candidate exposes a blocker. Do not bypass review or force history.
 
 ## 1. M10 completion rule
 
@@ -16,15 +26,16 @@ M10 is **not complete** when one prototype PR reaches `main`.
 
 M10 is complete only when all of the following are true:
 
-1. the prototype landing train is in `main` as small reviewed PRs;
-2. the M4 packaged E2E path is re-proven on `main` plus the pinned Open Design fork;
-3. the minimum pre-#555 capability/workspace/runtime foundation is in `main`;
-4. the M5 authority train is in `main` bottom-up;
-5. the reviewed M6, M7, M8, and M9 slices needed by the shipped product are landed
-   incrementally;
-6. release packaging and cross-platform/security gates pass from current `main`;
-7. no wholesale merge of
-   `integration/open-design-main-sync-wave20` was used.
+1. the integration candidate has absorbed the latest `main` and all merge
+   conflicts are resolved and reviewed on the integration side;
+2. the M4 packaged E2E path is re-proven against the candidate plus the pinned
+   Open Design fork;
+3. the required capability/workspace/runtime and M5-M9 reviewed product slices
+   are present in the candidate;
+4. release packaging and cross-platform/security gates pass from the candidate;
+5. the main-branch repository/operator successfully merges the validated
+   integration candidate without force/rebase or unresolved conflict;
+6. post-merge release gates pass from the resulting `main`.
 
 ## 2. Frozen architecture constraints
 
@@ -55,6 +66,7 @@ As of 2026-10-02:
 | #565 clean landing | preflight only | historical reviewed head `fe4ae95dffcf0096168289ba4189415f3693a54a`; rerun the probe after #651's final main refresh before opening the landing PR |
 | pre-#555 foundation inventory | complete | use F1-F6 below |
 | M5+ main landing | not started | must wait for required foundation |
+| main -> integration rehearsal | completed locally | latest `main@fb511e4b92af9b2941f55fedd427b3203263a1a6` merged into integration as `7061e2db696f294fd9904c7871cb04d10a8caf4f`; two add/add conflicts resolved as documented below |
 
 #643 was refreshed after #647 by a normal merge from current `main`, passed
 fresh CI/review, and merged. Its net feature diff was exactly two files / +334
@@ -65,6 +77,83 @@ lines, and the two historical #563 blobs were:
 
 Treat this table as a checkpoint, not permanent merge authorization. Before
 every merge, re-read the PR exact head, CI, and review verdict.
+
+### 3.1 Current main -> integration rehearsal result
+
+The 2026-10-02 rehearsal merged:
+
+- integration pre-merge head:
+  `708afb91986985725772bc15a8ea8c0a24006480`;
+- main head:
+  `fb511e4b92af9b2941f55fedd427b3203263a1a6`;
+- local integration merge commit:
+  `7061e2db696f294fd9904c7871cb04d10a8caf4f`.
+
+There were exactly two textual conflicts:
+
+- `apps/desktop/src/main/creative-serve-web.ts`;
+- `apps/desktop/src/main/creative-serve-web.test.ts`.
+
+Both were add/add conflicts because `main` had just landed the historical #563
+prototype via #643 while integration already contained the later reviewed
+Creative lifecycle, packaged/headless launcher, origin validation, child-env
+isolation, and session-hardening evolution. The correct resolution was to keep
+the integration versions of those two files rather than overwrite the later
+reviewed behavior with the older #643 prototype blobs.
+
+All other latest-main changes merged automatically. After resolution:
+
+```
+git rev-list --left-right --count origin/main...HEAD
+0 603
+```
+
+The zero on the left is the important invariant: the candidate contains the
+exact latest `main` as an ancestor.
+
+Validation evidence from the rehearsal:
+
+- `git diff --check`: green;
+- `cargo clippy --locked -p agent24-comm --all-targets -- -D warnings`: green;
+- `cargo fmt --all --check`: green;
+- the known COMM timeout test passes when run alone/serially;
+- full `agent24-comm --lib`: 126/127 with the already-known parallel
+  `first_identity_create_timeout_after_keystore_write_preserves_the_password`
+  502/504 flake as the sole failure;
+- local Node runtime was unavailable in this harness, so desktop TypeScript
+  tests/typecheck must be supplied by CI or another Node-capable reviewer.
+
+Do not hide that known flake in final release evidence; either prove it remains
+baseline-only under CI or fix it as a separate small PR.
+
+### 3.2 Main-repository final merge procedure
+
+The main-branch repository/operator should **not** reconstruct M10 by blindly
+cherry-picking hundreds of historical commits. It should fetch the final
+integration candidate and first verify:
+
+```
+git fetch origin main integration/open-design-main-sync-wave20
+git merge-base --is-ancestor origin/main origin/integration/open-design-main-sync-wave20
+git rev-list --left-right --count origin/main...origin/integration/open-design-main-sync-wave20
+```
+
+The first command must succeed and the left count must be `0`. Then create a
+throwaway merge/release-candidate branch from the exact current `main` and
+attempt a normal merge:
+
+```
+git switch -c merge/open-design-m10-candidate origin/main
+git merge --no-ff origin/integration/open-design-main-sync-wave20
+```
+
+If that merge is conflict-free, run the full M4/release validation before
+allowing the repository operator to merge it into protected `main`.
+
+If new conflicts appear because `main` moved after the rehearsal, stop the
+final merge. Merge the new `main` into integration again, resolve and validate
+there, push the refreshed integration candidate, and repeat this procedure.
+Never resolve new integration conflicts directly on protected `main`.
 
 ## 4. Non-negotiable landing policy
 
