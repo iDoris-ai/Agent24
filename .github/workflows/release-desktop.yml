@@ -25,9 +25,14 @@ on:
   pull_request:
     paths:
       - '.github/workflows/release-desktop.yml'
+      - 'apps/desktop/scripts/prepare-open-design-linux-resources.mjs'
+      - 'apps/desktop/scripts/stage-open-design-resources.mjs'
 
 permissions:
   contents: read
+
+env:
+  OPEN_DESIGN_SHA: 327de2887fcd8d6f71a3598e921c0f12521d37d7
 
 concurrency:
   group: release-desktop-${{ github.workflow }}-${{ github.ref }}
@@ -37,17 +42,58 @@ jobs:
   build:
     name: Build + smoke test (linux x64)
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           submodules: false
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa  # v4
+      - name: Checkout exact reviewed Open Design fork
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          repository: iDoris-ai/open-design-agent24
+          ref: ${{ env.OPEN_DESIGN_SHA }}
+          path: open-design
 
-      - name: Setup Node.js
+      - name: Setup Node.js for Open Design
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Build exact Open Design Linux resource base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C open-design rev-parse HEAD)" = "$OPEN_DESIGN_SHA"
+          corepack enable
+          corepack prepare pnpm@10.33.2 --activate
+          (
+            cd open-design
+            pnpm install --frozen-lockfile
+            pnpm --filter @open-design/tools-pack dev linux build \
+              --to dir \
+              --portable \
+              --namespace agent24-release \
+              --dir "$RUNNER_TEMP/open-design-pack" \
+              --json > "$RUNNER_TEMP/open-design-pack.json"
+          )
+          cat "$RUNNER_TEMP/open-design-pack.json"
+          RESOURCE_PACKAGE="$(find "$RUNNER_TEMP/open-design-pack" -type f -path '*/resources/app/package.json' -print -quit)"
+          test -n "$RESOURCE_PACKAGE"
+          RESOURCE_DIR="$(dirname "$(dirname "$RESOURCE_PACKAGE")")"
+          node apps/desktop/scripts/prepare-open-design-linux-resources.mjs \
+            "$PWD/open-design" \
+            "$RESOURCE_DIR"
+          echo "A24_OPEN_DESIGN_RESOURCES_DIR=$RESOURCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Setup Agent24 pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa  # v4
+        with:
+          version: 9.12.0
+
+      - name: Setup Node.js for Agent24
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: '22'
@@ -81,8 +127,50 @@ jobs:
       - name: Build desktop renderer + electron main
         run: pnpm --filter @agent24/desktop build
 
+      - name: Stage exact Open Design Creative resources
+        run: pnpm --filter @agent24/desktop stage:open-design
+
       - name: 'electron-builder (Linux: AppImage + deb)'
         run: pnpm --filter @agent24/desktop exec electron-builder --linux AppImage deb
+
+      - name: Verify packaged Creative resources in AppImage + deb
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPIMAGE="$(realpath "$(ls release/*.AppImage)")"
+          DEB="$(realpath "$(ls release/*.deb)")"
+          VERIFY_ROOT="$RUNNER_TEMP/desktop-package-verify"
+          rm -rf "$VERIFY_ROOT"
+          mkdir -p "$VERIFY_ROOT/appimage" "$VERIFY_ROOT/deb"
+
+          (
+            cd "$VERIFY_ROOT/appimage"
+            chmod +x "$APPIMAGE"
+            "$APPIMAGE" --appimage-extract >/dev/null
+          )
+          dpkg-deb -x "$DEB" "$VERIFY_ROOT/deb"
+
+          verify_creative_resources() {
+            local package_root="$1"
+            local package_json
+            package_json="$(find "$package_root" -type f -path '*/resources/app/package.json' -print -quit)"
+            test -n "$package_json"
+            local resources
+            resources="$(dirname "$(dirname "$package_json")")"
+            test "$(jq -r '.version' "$package_json")" = "0.22.2"
+            test -f "$resources/app/prebundled/agent24-headless.cjs"
+            test -f "$resources/app/prebundled/agent24-headless.mjs"
+            test -f "$resources/app/prebundled/daemon/daemon-cli.mjs"
+            test -f "$resources/app/prebundled/daemon/daemon-sidecar.mjs"
+            test -f "$resources/app/prebundled/web-sidecar.mjs"
+            test -d "$resources/open-design"
+            test -f "$resources/open-design-web-standalone/apps/web/server.js" || \
+              test -f "$resources/open-design-web-standalone/server.js"
+          }
+
+          verify_creative_resources "$VERIFY_ROOT/appimage/squashfs-root"
+          verify_creative_resources "$VERIFY_ROOT/deb"
 
       - name: List packaged artifacts
         working-directory: apps/desktop/release
